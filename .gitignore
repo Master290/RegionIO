@@ -1,0 +1,31 @@
+# Compiled binaries
+/regionio
+/regionio.exe
+*.exe
+*.test
+
+# Mojang server distribution (not redistributable; obtain separately)
+/server.jar
+/libraries/
+/versions/
+
+# Build output
+/dist/
+
+# Vanilla data-generator output (regenerated from server.jar --reports).
+# All build-time embeds live under internal/; generated/ is not needed to build.
+/generated/
+
+# Logs and runtime artefacts
+/logs/
+*.log
+
+# Editor / tool local config
+/.claude/
+/.vscode/
+/.idea/
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db
