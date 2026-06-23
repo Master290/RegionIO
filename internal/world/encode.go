@@ -35,12 +35,25 @@ const BiomePlains uint16 = 40
 // direct-palette bit width.
 const totalBlockStates = 29873
 
-// Chunk is a 16xWorldHeightx16 column of block states with a single biome.
-// A nil section is entirely air.
+// Biome-cell geometry for the overworld. A biome cell is biomeCellSize³ blocks
+// (4×4×4), so each 16-block chunk section holds biomeCellsPerSection biome
+// cells. totalBiomes is the size of the synchronized biome registry and sets
+// the biome direct-palette bit width.
+const (
+	biomeCellSize        = 4
+	biomeCellsXZ         = 16 / biomeCellSize // 4
+	biomeCellsPerSection = biomeCellsXZ * biomeCellsXZ * biomeCellsXZ // 64
+	totalBiomes          = 65 // synced minecraft:worldgen/biome registry size
+)
+
+// Chunk is a 16xWorldHeightx16 column of block states. Each section may carry a
+// per-cell biome array (4×4×4); when biomes[si] is nil the section falls back to
+// the column-wide biome field (used by flat/simple generators).
 type Chunk struct {
 	X, Z     int32
 	sections [SectionCount]*[sectionVol]uint16
-	biome    uint16
+	biomes   [SectionCount]*[biomeCellsPerSection]uint16
+	biome    uint16 // fallback uniform biome when biomes[si] is nil
 }
 
 // NewChunk returns an empty (all-air) chunk at (x, z) with the given biome.
@@ -80,6 +93,32 @@ func (c *Chunk) SetBlock(lx, y, lz int, state uint16) {
 		return
 	}
 	c.section(si)[blockIndex(lx, y, lz)] = state
+}
+
+// biomeIndex maps a block within a section to its YZX-ordered 4×4×4 biome cell.
+// Coordinates are folded into 0..15 (block coords) then divided to cell coords.
+func biomeIndex(lx, ly, lz int) int {
+	bx := (lx & 15) / biomeCellSize
+	by := (ly & 15) / biomeCellSize
+	bz := (lz & 15) / biomeCellSize
+	return by<<(biomeCellsXZBits*2) | bz<<biomeCellsXZBits | bx
+}
+
+// biomeCellsXZBits is log2(biomeCellsXZ) for the YZX index assembly.
+const biomeCellsXZBits = 2 // biomeCellsXZ=4 → 2 bits
+
+// SetBiome sets the biome for the 4×4×4 cell containing block (lx, y, lz). The
+// section's per-cell biome array is allocated lazily on first write. Any block
+// in the cell shares its biome, matching the 4-block resolution vanilla uses.
+func (c *Chunk) SetBiome(lx, y, lz int, biome uint16) {
+	si := (y - MinY) >> 4
+	if si < 0 || si >= SectionCount {
+		return
+	}
+	if c.biomes[si] == nil {
+		c.biomes[si] = new([biomeCellsPerSection]uint16)
+	}
+	c.biomes[si][biomeIndex(lx, y, lz)] = biome
 }
 
 // Encode serializes the level_chunk_with_light body for this chunk.
@@ -157,7 +196,8 @@ func packHeightmap(h [256]uint16) []uint64 {
 }
 
 // writeSection emits one chunk section: block count, block paletted container,
-// then the (single-value) biome paletted container.
+// then the biome paletted container (per-cell 4×4×4, or single-valued for legacy
+// generators that only set a column-wide biome).
 func (c *Chunk) writeSection(w *protocol.Writer, i int) {
 	s := c.sections[i]
 	if s == nil {
@@ -169,8 +209,12 @@ func (c *Chunk) writeSection(w *protocol.Writer, i int) {
 		w.Uint16(0) // reserved 2-byte field
 		writeBlockPalette(w, s)
 	}
-	// Biomes: a single value covers the whole section for now.
-	writeSingleValued(w, uint32(c.biome))
+	// Biome container: per-cell palette when present, else the uniform fallback.
+	if b := c.biomes[i]; b != nil {
+		writeBiomePalette(w, b)
+	} else {
+		writeSingleValued(w, uint32(c.biome))
+	}
 }
 
 func nonAirCount(s *[sectionVol]uint16) int {
@@ -192,7 +236,7 @@ func writeSingleValued(w *protocol.Writer, value uint32) {
 // writeBlockPalette writes a block-state paletted container, choosing the
 // single-valued, indirect, or direct encoding as appropriate.
 func writeBlockPalette(w *protocol.Writer, s *[sectionVol]uint16) {
-	palette, indexOf := buildPalette(s)
+	palette, indexOf := buildPalette(s[:])
 	if len(palette) == 1 {
 		writeSingleValued(w, uint32(palette[0]))
 		return
@@ -214,6 +258,47 @@ func writeBlockPalette(w *protocol.Writer, s *[sectionVol]uint16) {
 	}
 	writePackedIndices(w, bpe, sectionVol, func(i int) uint32 {
 		return uint32(indexOf[s[i]])
+	})
+}
+
+// writeBiomePalette writes a biome paletted container over the 64 cells of a
+// section. It mirrors writeBlockPalette but with biome-specific thresholds: the
+// indirect palette allows a minimum of 1 bit per entry (vs 4 for blocks), and
+// the direct form is used once the palette bit width exceeds the biome
+// registry width.
+func writeBiomePalette(w *protocol.Writer, s *[biomeCellsPerSection]uint16) {
+	palette, indexOf := buildPalette(s[:])
+	if len(palette) == 1 {
+		writeSingleValued(w, uint32(palette[0]))
+		return
+	}
+
+	bpe := bitsFor(len(palette))
+	if bpe < 1 {
+		bpe = 1 // minimum for the indirect biome format
+	}
+	if bpe > bitsFor(totalBiomes) {
+		writeBiomeDirect(w, s)
+		return
+	}
+
+	w.Byte(byte(bpe))
+	w.VarInt(int32(len(palette)))
+	for _, st := range palette {
+		w.VarInt(int32(st))
+	}
+	writePackedIndices(w, bpe, biomeCellsPerSection, func(i int) uint32 {
+		return uint32(indexOf[s[i]])
+	})
+}
+
+// writeBiomeDirect writes a direct (palette-less) biome container of registry
+// IDs, sized to the full biome registry width.
+func writeBiomeDirect(w *protocol.Writer, s *[biomeCellsPerSection]uint16) {
+	bpe := bitsFor(totalBiomes)
+	w.Byte(byte(bpe))
+	writePackedIndices(w, bpe, biomeCellsPerSection, func(i int) uint32 {
+		return uint32(s[i])
 	})
 }
 
@@ -247,8 +332,10 @@ func writePackedIndices(w *protocol.Writer, bpe, count int, value func(i int) ui
 	}
 }
 
-// buildPalette returns the distinct block states in s and a value->index map.
-func buildPalette(s *[sectionVol]uint16) ([]uint16, map[uint16]int) {
+// buildPalette returns the distinct values in s and a value->index map. It
+// takes a slice so the same routine serves block sections (sectionVol entries)
+// and biome cells (biomeCellsPerSection entries); callers pass array[:] in.
+func buildPalette(s []uint16) ([]uint16, map[uint16]int) {
 	indexOf := make(map[uint16]int)
 	var palette []uint16
 	for _, v := range s {

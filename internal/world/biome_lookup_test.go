@@ -29,7 +29,7 @@ func TestBiomeAtDeterministic(t *testing.T) {
 // biomeName is a test helper exposing the resolved biome name at (wx, wz).
 func biomeName(od *worldgen.OverworldDensity, wx, wz int) string {
 	point := worldgen.SampleColumn(od, SeaLevel, wx, wz)
-	return loadSurfaceTable().FindBiome(point)
+	return loadBiomeTable().FindBiome(point)
 }
 
 // TestBiomeAtVaryingAcrossWorld confirms different regions of the world map to
@@ -52,22 +52,41 @@ func TestBiomeAtVaryingAcrossWorld(t *testing.T) {
 	t.Logf("found %d distinct biomes across 16x16 chunks", len(seen))
 }
 
-// TestVanillaChunkHasBiome confirms generateVanilla threads the per-column biome
-// into the chunk (regression guard for the NewChunk call site in vanilla.go).
+// TestVanillaChunkHasBiomes confirms generateVanilla fills per-cell 3D biomes
+// (regression guard for the fillBiomes3D call in vanilla.go). It checks that at
+// least one section has a populated biome container and that a surface cell
+// matches what BiomeAt3D returns at the chunk centre.
 func TestVanillaChunkHasBiome(t *testing.T) {
 	gen := NewVanillaGenerator(12345)
 	ch := gen(10, -3)
 	if ch == nil {
 		t.Fatal("nil chunk")
 	}
-	// biome is unexported; verify via the registry by re-deriving it. The chunk's
-	// biome must match what BiomeAt returns at the chunk centre.
+
+	// At least one section must carry per-cell biomes (otherwise fillBiomes3D
+	// never ran and the chunk fell back to the uniform plains default).
+	hasCells := false
+	for si := 0; si < SectionCount; si++ {
+		if ch.biomes[si] != nil {
+			hasCells = true
+			break
+		}
+	}
+	if !hasCells {
+		t.Fatal("no per-cell biome sections; fillBiomes3D did not run")
+	}
+
+	// A surface cell at the chunk centre should match BiomeAt3D with depth at
+	// that Y. Surface is the section containing sea level.
 	od, err := worldgen.LoadOverworldFinalDensity(12345)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	want := BiomeAt(od, 10*16+8, -3*16+8)
-	if uint16(ch.biome) != want {
-		t.Errorf("chunk biome = %d, want %d", ch.biome, want)
+	lx, lz := 8, 8
+	s2D := worldgen.SampleColumn2D(od, SeaLevel, 10*16+lx, -3*16+lz)
+	want := BiomeAt3D(od, s2D, 10*16+lx, SeaLevel, -3*16+lz)
+	got := ch.biomes[(SeaLevel-MinY)>>4][biomeIndex(lx, SeaLevel, lz)]
+	if got != want {
+		t.Errorf("centre surface biome = %d, want %d", got, want)
 	}
 }

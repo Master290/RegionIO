@@ -34,11 +34,7 @@ func NewVanillaGenerator(seed int64) Generator {
 }
 
 func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *Chunk {
-	// Surface biome is sampled at the chunk centre column. Climate noises are
-	// 2D at this stage (depth fixed to surface), so one sample per chunk is
-	// representative; the per-cell milestone will sample the 4×4×4 grid.
-	biome := BiomeAt(od, int(cx)*16+8, int(cz)*16+8)
-	c := NewChunk(cx, cz, biome)
+	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
 	grids := make([]cornerGrid, len(od.Interpolated))
@@ -86,8 +82,52 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 			}
 		}
 	}
+	fillBiomes3D(c, od, baseX, baseZ)
 	decorate(c, cx, cz, seed, &surfTop, &grass)
 	return c
+}
+
+// fillBiomes3D assigns a per-cell 4×4×4 biome to every section of the chunk.
+// The five 2D climate axes are sampled once per column (256 calls) and reused
+// across Y; the 3D depth axis is evaluated per cell (1536 calls, but each is a
+// single density-function compute). The biome columns are processed in parallel
+// to keep generation fast.
+func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, baseX, baseZ int) {
+	var s2D [16][16]worldgen.Sample2D
+	var wg sync.WaitGroup
+	for lx := 0; lx < 16; lx++ {
+		wg.Add(1)
+		go func(lx int) {
+			defer wg.Done()
+			for lz := 0; lz < 16; lz++ {
+				s2D[lx][lz] = worldgen.SampleColumn2D(od, SeaLevel, baseX+lx, baseZ+lz)
+			}
+		}(lx)
+	}
+	wg.Wait()
+
+	// One biome per 4×4×4 cell. Sampling at the cell corner (bx*4, bz*4) is
+	// representative because the 2D climate noises vary slowly relative to a
+	// 4-block cell; depth carries the vertical variation.
+	for bx := 0; bx < biomeCellsXZ; bx++ {
+		wg.Add(1)
+		go func(bx int) {
+			defer wg.Done()
+			lx := bx * biomeCellSize
+			for bz := 0; bz < biomeCellsXZ; bz++ {
+				lz := bz * biomeCellSize
+				col2D := s2D[lx][lz]
+				for si := 0; si < SectionCount; si++ {
+					for by := 0; by < biomeCellsXZ; by++ {
+						wy := MinY + si*16 + by*biomeCellSize
+						biome := BiomeAt3D(od, col2D, baseX+lx, wy, baseZ+lz)
+						c.SetBiome(lx, wy, lz, biome)
+					}
+				}
+			}
+		}(bx)
+	}
+	wg.Wait()
 }
 
 // fillVanillaColumn lays the blocks for one column and returns the top solid
