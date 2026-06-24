@@ -124,6 +124,14 @@ func BiomeAt(od *worldgen.OverworldDensity, wx, wz int) uint16 {
 	return biomeID(loadBiomeTable().FindBiome(point))
 }
 
+// BiomeNameAt returns the resolved surface biome NAME at block (wx, wz), for
+// surface-rule biome tests which match on name. It mirrors BiomeAt but skips
+// the name→ID→name round-trip the ID path would require.
+func BiomeNameAt(od *worldgen.OverworldDensity, wx, wz int) string {
+	point := worldgen.SampleColumn(od, SeaLevel, wx, wz)
+	return loadBiomeTable().FindBiome(point)
+}
+
 // BiomeAt3D returns the network biome ID for the biome cell containing block
 // (wx, wy, wz). s2D carries the five precomputed 2D climate axes for the column
 // (sampled once via SampleColumn2D); the 3D depth axis is evaluated at wy inside

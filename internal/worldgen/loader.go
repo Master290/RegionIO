@@ -31,6 +31,13 @@ type OverworldDensity struct {
 	Temperature, Humidity, Continentalness, Erosion, Weirdness, Depth DensityFunction
 }
 
+// SurfaceRule returns the overworld surface rule tree, loading it on first use.
+// It does not depend on the seed. A nil rule (on error) is non-fatal: the
+// generator falls back to its default surface heuristics.
+func (od *OverworldDensity) SurfaceRule() (SurfaceRule, error) {
+	return LoadOverworldSurfaceRule()
+}
+
 // LoadOverworldFinalDensity builds the overworld final_density function for the
 // given world seed.
 func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {

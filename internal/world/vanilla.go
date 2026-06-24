@@ -1,6 +1,7 @@
 package world
 
 import (
+	"math/rand"
 	"sync"
 
 	"regionio/internal/worldgen"
@@ -57,6 +58,29 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 	}
 	wg.Wait()
 
+	// Surface biomes and 2D climate are needed before column fill so the surface
+	// rule tree can pick biome-specific blocks. They are also reused by
+	// fillBiomes3D below, so compute them once here.
+	var s2D [16][16]worldgen.Sample2D
+	var biomeName [16][16]string
+	for lx := 0; lx < 16; lx++ {
+		wg.Add(1)
+		go func(lx int) {
+			defer wg.Done()
+			for lz := 0; lz < 16; lz++ {
+				s2D[lx][lz] = worldgen.SampleColumn2D(od, SeaLevel, baseX+lx, baseZ+lz)
+				biomeName[lx][lz] = loadBiomeTable().FindBiome(
+					worldgen.NewTargetPoint(s2D[lx][lz].Temperature, s2D[lx][lz].Humidity,
+						s2D[lx][lz].Continentalness, s2D[lx][lz].Erosion, s2D[lx][lz].Weirdness, 0))
+			}
+		}(lx)
+	}
+	wg.Wait()
+
+	// The surface rule tree is seed-independent; load once (cached). If it fails
+	// to parse, surface fill falls back to the biome-blind heuristics.
+	surfaceRule, ruleErr := od.SurfaceRule()
+
 	var columns [16][16][WorldHeight]uint16
 	var surfTop [16][16]int  // top solid index, -1 if none
 	var grass [16][16]bool   // grassy land surface (tree-plantable)
@@ -66,7 +90,11 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 			defer wg.Done()
 			interp := make([]float64, len(od.Interpolated))
 			for lz := 0; lz < 16; lz++ {
-				surfTop[lx][lz], grass[lx][lz] = fillVanillaColumn(od, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz, seed)
+				var rule worldgen.SurfaceRule
+				if ruleErr == nil {
+					rule = surfaceRule
+				}
+				surfTop[lx][lz], grass[lx][lz] = fillVanillaColumn(od, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz, seed, rule, biomeName[lx][lz])
 			}
 		}(lx)
 	}
@@ -82,30 +110,18 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 			}
 		}
 	}
-	fillBiomes3D(c, od, baseX, baseZ)
+	fillBiomes3D(c, od, s2D, baseX, baseZ)
 	decorate(c, cx, cz, seed, &surfTop, &grass)
 	return c
 }
 
 // fillBiomes3D assigns a per-cell 4×4×4 biome to every section of the chunk.
-// The five 2D climate axes are sampled once per column (256 calls) and reused
-// across Y; the 3D depth axis is evaluated per cell (1536 calls, but each is a
-// single density-function compute). The biome columns are processed in parallel
-// to keep generation fast.
-func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, baseX, baseZ int) {
-	var s2D [16][16]worldgen.Sample2D
+// It receives the precomputed 2D climate grid (s2D, already sampled per column
+// for the surface pass) and evaluates only the 3D depth axis per cell, keeping
+// per-cell cost to a single density-function compute. The biome columns are
+// processed in parallel to keep generation fast.
+func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.Sample2D, baseX, baseZ int) {
 	var wg sync.WaitGroup
-	for lx := 0; lx < 16; lx++ {
-		wg.Add(1)
-		go func(lx int) {
-			defer wg.Done()
-			for lz := 0; lz < 16; lz++ {
-				s2D[lx][lz] = worldgen.SampleColumn2D(od, SeaLevel, baseX+lx, baseZ+lz)
-			}
-		}(lx)
-	}
-	wg.Wait()
-
 	// One biome per 4×4×4 cell. Sampling at the cell corner (bx*4, bz*4) is
 	// representative because the 2D climate noises vary slowly relative to a
 	// 4-block cell; depth carries the vertical variation.
@@ -131,10 +147,11 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, baseX, baseZ int) {
 }
 
 // fillVanillaColumn lays the blocks for one column and returns the top solid
-// index and whether the surface is grassy land (suitable for trees). Beaches
-// (sand) form a narrow ring around the waterline; deep water floors use gravel;
-// the bottom is a vanilla-style randomised bedrock layer.
-func fillVanillaColumn(od *worldgen.OverworldDensity, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int, seed int64) (int, bool) {
+// index and whether the surface is grassy land (suitable for trees). When a
+// surface rule tree is provided, surface blocks are decided by it (vanilla
+// behaviour: biome/depth/steepness/water/y-driven); otherwise the legacy
+// beach/grass/dirt heuristics are used as a fallback.
+func fillVanillaColumn(od *worldgen.OverworldDensity, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int, seed int64, rule worldgen.SurfaceRule, biomeName string) (int, bool) {
 	cx0 := lx / cellWidth
 	cz0 := lz / cellWidth
 	fx := float64(lx%cellWidth) / cellWidth
@@ -162,10 +179,76 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, grids []cornerGrid, interp
 	beach := top >= 0 && topY >= SeaLevel-beachBand && topY <= SeaLevel+1
 	deepWater := top >= 0 && topY < SeaLevel-beachBand
 
-	// Randomised bedrock floor: solid at MinY, decaying chance up to MinY+4, like
-	// the vanilla overworld floor (each layer drops the probability by ~1/4).
+	// Per-column RNG for the bedrock floor and the bandlands/gradient rules.
 	rng := newColumnRand(wx, wz, int(seed))
 
+	if rule != nil {
+		applySurfaceRule(out, solid, top, wx, wz, SeaLevel, MinY, biomeName, rule, rng)
+	} else {
+		fillLegacySurface(out, solid, top, beach, deepWater, topY, rng)
+	}
+	// Water fills air below sea level regardless of rule path.
+	for i := 0; i < WorldHeight; i++ {
+		if out[i] == StateAir && MinY+i < SeaLevel {
+			out[i] = StateWater
+		}
+	}
+	return top, top >= 0 && !beach && !deepWater && topY >= SeaLevel
+}
+
+// applySurfaceRule walks the column top-to-surface applying the rule tree. For
+// each solid block it builds a SurfaceContext and lets the rule decide; the
+// stone depth counts how far below the surface the block sits. Air blocks
+// above the surface are left for the water fill.
+//
+// One *rand.Rand is created per column (not per block) — bandlands/gradient
+// consume from it sequentially, which is correct because vanilla seeds those
+// per-column too. This avoids ~98k rand.New allocations per chunk.
+func applySurfaceRule(out *[WorldHeight]uint16, solid [WorldHeight]bool, top int, wx, wz, seaLevel, minY int, biomeName string, rule worldgen.SurfaceRule, rng chunkRand) {
+	if top < 0 {
+		return
+	}
+	// One per-column RNG for all surface rules in this column.
+	colRng := rng.toRand()
+	// Surface noise sample (the "minecraft:surface" noise used by noise_threshold
+	// conditions). Cheap deterministic value derived from the column so the
+	// rule's coarse_dirt/terracotta bands vary per column.
+	surfaceNoise := colRng.Float64()*2 - 1 // [-1, 1]
+	// Reuse one context across the column (mutated per block) to avoid ~98k
+	// heap allocations per chunk; the fields that vary per block are set inside
+	// the loop, the rest are column-constant.
+	sctx := &worldgen.SurfaceContext{
+		X:                  wx,
+		Z:                  wz,
+		SeaLevel:           seaLevel,
+		BiomeName:          biomeName,
+		MinY:               minY,
+		SurfaceNoise:       surfaceNoise,
+		SurfaceDepth:       0,
+		PreliminarySurface: minY + top,
+		Rng:                colRng,
+	}
+	for i := top; i >= 0; i-- {
+		if !solid[i] {
+			continue
+		}
+		sctx.Y = minY + i
+		sctx.StoneDepthAbove = top - i
+		// Solid blocks default to stone; the rule tree overrides only the
+		// surface layers it matches (grass/sand/terracotta/etc). Blocks where
+		// the rule does not match (depth > surface band) keep stone, matching
+		// vanilla: surface rules replace only the top few blocks, the column is
+		// otherwise stone down to bedrock.
+		out[i] = StateStone
+		if state, ok := rule.Apply(sctx); ok && state != 0 {
+			out[i] = state
+		}
+	}
+}
+
+// fillLegacySurface is the biome-blind heuristic used when no surface rule is
+// available (parse failure). It mirrors the pre-surface-rule block switch.
+func fillLegacySurface(out *[WorldHeight]uint16, solid [WorldHeight]bool, top int, beach, deepWater bool, topY int, rng chunkRand) {
 	for i := 0; i < WorldHeight; i++ {
 		y := MinY + i
 		switch {
@@ -190,7 +273,6 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, grids []cornerGrid, interp
 			out[i] = StateWater
 		}
 	}
-	return top, top >= 0 && !beach && !deepWater && topY >= SeaLevel
 }
 
 // bedrockAt reports whether a block at layer d (1..4 above the floor) should be
@@ -292,6 +374,13 @@ func (r *chunkRand) next() uint32 {
 	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
 	z = z ^ (z >> 31)
 	return uint32(z >> 32)
+}
+
+// toRand returns a *rand.Rand seeded from this column's state, for surface
+// rules (vertical_gradient/bandlands) that consume a stdlib-style RNG. It draws
+// once to advance state so repeated calls differ within a column.
+func (r *chunkRand) toRand() *rand.Rand {
+	return rand.New(rand.NewSource(int64(r.next())))
 }
 
 func trilerp(c *cornerGrid, x0, y0, z0 int, fx, fy, fz float64) float64 {

@@ -15,6 +15,8 @@ const (
 )
 
 // Common block-state network IDs (from the generated block report).
+// Surface-rule-relevant blocks are included so tests and parity checks can
+// reference them by name; the full name→ID table lives in worldgen/blockids.go.
 const (
 	StateAir     uint16 = 0
 	StateStone   uint16 = 1
@@ -26,6 +28,20 @@ const (
 	StateGravel  uint16 = 124
 	StateOakLog  uint16 = 137
 	StateOakLeaf uint16 = 279
+
+	// Surface-rule blocks (IDs captured from blocks.json 26.1.2).
+	StateCoarseDirt   uint16 = 11
+	StatePodzol       uint16 = 13
+	StateRedSand      uint16 = 123
+	StateSandstone    uint16 = 578
+	StateSnow         uint16 = 6919 // snow, layers=1
+	StateSnowBlock    uint16 = 6928
+	StateIce          uint16 = 6927
+	StateMycelium     uint16 = 8919
+	StateTerracotta   uint16 = 12912
+	StateRedSandstone uint16 = 13247
+	StateCalcite      uint16 = 24687
+	StatePowderSnow   uint16 = 24689
 )
 
 // BiomePlains is the network ID (registry index) of minecraft:plains.
