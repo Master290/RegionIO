@@ -20,6 +20,10 @@ type Config struct {
 	CompressionThreshold int
 	// WorldSeed seeds terrain generation.
 	WorldSeed int64
+	// WorldDir is the on-disk world directory. When non-empty, chunks are
+	// read from and written to <WorldDir>/region/*.mca and player edits
+	// survive restarts. Empty disables persistence (in-memory only).
+	WorldDir string
 }
 
 // DefaultConfig returns sensible defaults matching vanilla expectations.
@@ -33,6 +37,9 @@ func DefaultConfig() Config {
 		// WorldSeed defaults to 0 for backward compatibility; operators override
 		// it via the REGIONIO_SEED env var or the -seed flag.
 		WorldSeed: 0,
+		// WorldDir defaults to "world" so the world persists by default;
+		// set to "" for a throwaway in-memory world.
+		WorldDir: "world",
 	}
 }
 
@@ -40,14 +47,26 @@ func DefaultConfig() Config {
 type Server struct {
 	cfg    Config
 	chunks *world.Cache
+	store  *world.Store // nil when persistence is disabled
 }
 
-// New constructs a Server from cfg.
-func New(cfg Config) *Server {
+// New constructs a Server from cfg. When cfg.WorldDir is set, the world is
+// backed by an on-disk store under that directory; otherwise it is in-memory
+// only. A returned error (e.g. the world dir cannot be created) is fatal.
+func New(cfg Config) (*Server, error) {
+	gen := world.NewVanillaGenerator(cfg.WorldSeed)
+	if cfg.WorldDir == "" {
+		return &Server{cfg: cfg, chunks: world.NewCache(int32(cfg.CompressionThreshold), gen)}, nil
+	}
+	store, err := world.NewStore(cfg.WorldDir)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		cfg:    cfg,
-		chunks: world.NewCache(int32(cfg.CompressionThreshold), world.NewVanillaGenerator(cfg.WorldSeed)),
-	}
+		chunks: world.NewCacheWithStore(int32(cfg.CompressionThreshold), gen, store),
+		store:  store,
+	}, nil
 }
 
 // Config returns the active configuration.
@@ -55,6 +74,9 @@ func (s *Server) Config() Config { return s.cfg }
 
 // Chunks returns the shared chunk cache.
 func (s *Server) Chunks() *world.Cache { return s.chunks }
+
+// Store returns the on-disk world store, or nil if persistence is disabled.
+func (s *Server) Store() *world.Store { return s.store }
 
 // statusResponse mirrors the JSON shape the client expects for the server-list
 // ping. Field names and nesting are part of the protocol contract.

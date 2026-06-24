@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"regionio/internal/network"
 	"regionio/internal/server"
@@ -26,20 +27,36 @@ func main() {
 	// fatal — a wrong seed silently generates a different world than intended.
 	seedFlag := flag.Int64("seed", parseSeedEnv(os.Getenv("REGIONIO_SEED"), cfg.WorldSeed, log),
 		"world seed (overrides REGIONIO_SEED)")
+	worldDir := flag.String("world", cfg.WorldDir, "world directory (empty = in-memory only)")
 	flag.Parse()
 	cfg.WorldSeed = *seedFlag
-	log.Info("using world seed", "seed", cfg.WorldSeed)
+	cfg.WorldDir = *worldDir
+	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir)
 
-	srv := server.New(cfg)
+	srv, err := server.New(cfg)
+	if err != nil {
+		log.Error("failed to create server", "err", err)
+		os.Exit(1)
+	}
+
+	// Start the chunk autosave loop. It flushes dirty chunks every 30s and does
+	// a final SaveAll when the context (cancelled by signal) ends.
+	saveCtx, saveStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	autosaveDone := srv.Chunks().StartAutosave(saveCtx, log, 30*time.Second)
+
 	ln := network.NewListener(srv, log)
 
-	// Cancel the context on SIGINT/SIGTERM for a graceful shutdown.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	if err := ln.ListenAndServe(ctx); err != nil {
+	// ListenAndServe blocks until the listener stops (on the same signals).
+	// The autosave context is separate so the final flush runs after the
+	// listener exits; stop it here to trigger that final SaveAll, then wait for
+	// the saver to finish before releasing the store file handles.
+	if err := ln.ListenAndServe(saveCtx); err != nil {
 		log.Error("server stopped", "err", err)
-		os.Exit(1)
+	}
+	saveStop()
+	<-autosaveDone
+	if srv.Store() != nil {
+		srv.Store().Close()
 	}
 }
 

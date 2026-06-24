@@ -102,6 +102,21 @@ func (c *Chunk) GetBlock(lx, y, lz int) uint16 {
 	return s[blockIndex(lx, y, lz)]
 }
 
+// GetBiome returns the biome of the 4×4×4 cell containing block (lx, y, lz). It
+// mirrors GetBlock: the per-section biome array if present, else the column's
+// uniform fallback biome. Needed for on-disk chunk serialization.
+func (c *Chunk) GetBiome(lx, y, lz int) uint16 {
+	si := (y - MinY) >> 4
+	if si < 0 || si >= SectionCount {
+		return c.biome
+	}
+	b := c.biomes[si]
+	if b == nil {
+		return c.biome
+	}
+	return b[biomeIndex(lx, y, lz)]
+}
+
 // SetBlock sets the block at local (lx, lz) and absolute world height y.
 func (c *Chunk) SetBlock(lx, y, lz int, state uint16) {
 	si := (y - MinY) >> 4
