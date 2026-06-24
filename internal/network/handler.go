@@ -1,6 +1,7 @@
 package network
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -11,27 +12,37 @@ import (
 )
 
 // handler drives one connection through its state machine until it closes.
-// It is owned by a single goroutine (the read loop), so the play fields below
-// need no synchronization.
+// It is owned by a single goroutine (the read loop); play-phase chunk streaming
+// is delegated to a background streamer goroutine.
 type handler struct {
 	conn *Conn
 	srv  *server.Server
 	log  *slog.Logger
 
-	// Play-phase chunk streaming state.
-	loaded    map[[2]int32]bool // chunks currently sent to the client
-	centerX   int32
-	centerZ   int32
-	hasCenter bool
+	// ctx is the connection lifetime context, set in serve(). It cancels when
+	// the read loop ends, stopping the streamer and any derived work.
+	ctx context.Context
+
+	// Background chunk streamer (Play phase). requestRecenter pushes here.
+	streamer *streamer
+	// viewDistance is the client's requested view distance (from
+	// client_information), clamped; used to size the streamer.
+	viewDistance int
 
 	// Creative inventory state for block placement.
 	heldSlot int32     // selected hotbar index (0-8)
 	hotbar   [9]int32  // item network IDs per hotbar slot (-1 = empty)
 }
 
-// serve runs the read/dispatch loop for a single connection.
+// serve runs the read/dispatch loop for a single connection. It owns the
+// streamer's lifecycle: the streamer context is cancelled when this loop exits,
+// stopping generation and sending so no goroutine outlives the connection.
 func (h *handler) serve() {
 	defer h.conn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // stops the streamer when the read loop ends
+	h.ctx = ctx
 
 	for {
 		pkt, err := h.conn.ReadPacket()
@@ -49,7 +60,8 @@ func (h *handler) serve() {
 	}
 }
 
-// dispatch routes a packet to the handler for the current state.
+// dispatch routes a packet to the handler for the current state. The Play
+// handler reads h.ctx (the connection lifetime context) to launch the streamer.
 func (h *handler) dispatch(pkt protocol.Packet) error {
 	switch h.conn.State() {
 	case protocol.StateHandshaking:

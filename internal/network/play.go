@@ -18,13 +18,9 @@ const (
 	spawnZ = 8.5
 )
 
-// chunkRadius is how many chunks around the player we send (a square of side
-// 2*radius+1). Kept modest until streaming by view distance exists.
-const chunkRadius = 4
-
 // beginPlay sends the join sequence once the client enters the Play phase and
-// starts the keep-alive loop. In milestone 4a no chunks are sent, so the client
-// reaches the "loading terrain" screen and waits.
+// hands chunk streaming off to the background streamer. The streamer stops when
+// h.ctx (the connection lifetime context) is cancelled.
 func (h *handler) beginPlay() error {
 	for i := range h.hotbar {
 		h.hotbar[i] = -1 // empty
@@ -40,56 +36,24 @@ func (h *handler) beginPlay() error {
 	if err := h.sendPlayerPosition(1); err != nil {
 		return err
 	}
-	if err := h.streamAround(0, 0); err != nil {
-		return err
-	}
+	// Launch the background chunk streamer. It owns generation + sending so the
+	// read loop stays free; requestRecenter is a non-blocking push.
+	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.viewDistance)
+	go h.streamer.run(h.ctx)
+	h.streamer.requestRecenter(0, 0)
 	go h.keepAliveLoop()
 	return nil
 }
 
-// streamAround recenters the client's chunk cache on (centerX, centerZ) and
-// sends the chunks newly in range. Chunks that fall out of range are dropped by
-// the client automatically once it receives the new cache center, so we only
-// send the difference and track the currently-loaded set.
-func (h *handler) streamAround(centerX, centerZ int32) error {
-	cc := protocol.NewWriter(8)
-	cc.VarInt(centerX)
-	cc.VarInt(centerZ)
-	if err := h.conn.SendWriter(protocol.PlayChunkCacheCenter, cc); err != nil {
-		return err
-	}
-
-	cache := h.srv.Chunks()
-	next := make(map[[2]int32]bool, (2*chunkRadius+1)*(2*chunkRadius+1))
-	sent := 0
-	for cx := centerX - chunkRadius; cx <= centerX+chunkRadius; cx++ {
-		for cz := centerZ - chunkRadius; cz <= centerZ+chunkRadius; cz++ {
-			key := [2]int32{cx, cz}
-			next[key] = true
-			if h.loaded[key] {
-				continue
-			}
-			if err := h.conn.SendFramed(cache.Frame(cx, cz)); err != nil {
-				return err
-			}
-			sent++
-		}
-	}
-	h.loaded = next
-	h.centerX, h.centerZ, h.hasCenter = centerX, centerZ, true
-	h.log.Debug("streamed chunks", "center_x", centerX, "center_z", centerZ, "new", sent)
-	return nil
-}
-
-// onPlayerMove recenters chunk streaming when the player crosses into a new
-// chunk. X and Z are the player's block-precise coordinates.
+// onPlayerMove recenters the streamer when the player crosses into a new chunk.
+// It is a non-blocking push; the read loop never waits on generation.
 func (h *handler) onPlayerMove(x, z float64) error {
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
-	if h.hasCenter && cx == h.centerX && cz == h.centerZ {
-		return nil
+	if h.streamer != nil {
+		h.streamer.requestRecenter(cx, cz)
 	}
-	return h.streamAround(cx, cz)
+	return nil
 }
 
 // sendPlayLogin writes the clientbound play "login" packet. Field layout was

@@ -106,8 +106,20 @@ func (h *handler) handleClientInformation(pkt protocol.Packet) error {
 		return err
 	}
 
+	// view_distance drives the chunk streamer radius. The client sends 2..32;
+	// clamp into a sane server range so a huge view distance doesn't trigger a
+	// generation explosion.
+	vdInt := int(int8(vd))
+	if vdInt < 2 {
+		vdInt = 2
+	}
+	if vdInt > 16 {
+		vdInt = 16
+	}
+	h.viewDistance = vdInt
+
 	h.log.Info("client information",
-		"locale", locale, "view_distance", int8(vd),
+		"locale", locale, "view_distance", vdInt,
 		"chat_mode", chatMode, "main_hand", mainHand)
 	return nil
 }
