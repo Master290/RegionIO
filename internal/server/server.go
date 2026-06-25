@@ -24,6 +24,9 @@ type Config struct {
 	// read from and written to <WorldDir>/region/*.mca and player edits
 	// survive restarts. Empty disables persistence (in-memory only).
 	WorldDir string
+	// MaxCachedChunks bounds the in-memory chunk+frame cache (LRU). 0 means
+	// unbounded (use only for tests/flat worlds). At ~200KiB/chunk, 1024 ≈ 200MB.
+	MaxCachedChunks int
 }
 
 // DefaultConfig returns sensible defaults matching vanilla expectations.
@@ -40,6 +43,9 @@ func DefaultConfig() Config {
 		// WorldDir defaults to "world" so the world persists by default;
 		// set to "" for a throwaway in-memory world.
 		WorldDir: "world",
+		// MaxCachedChunks keeps the live cache near 200MB at the default; the
+		// streamer's pre-gen ring and player view distance comfortably fit.
+		MaxCachedChunks: 1024,
 	}
 }
 
@@ -56,6 +62,8 @@ type Server struct {
 func New(cfg Config) (*Server, error) {
 	gen := world.NewVanillaGenerator(cfg.WorldSeed)
 	if cfg.WorldDir == "" {
+		// No persistence; keep eviction off too (flat/test worlds expect full
+		// presence). Real servers set WorldDir and MaxCachedChunks together.
 		return &Server{cfg: cfg, chunks: world.NewCache(int32(cfg.CompressionThreshold), gen)}, nil
 	}
 	store, err := world.NewStore(cfg.WorldDir)
@@ -64,7 +72,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	return &Server{
 		cfg:    cfg,
-		chunks: world.NewCacheWithStore(int32(cfg.CompressionThreshold), gen, store),
+		chunks: world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks),
 		store:  store,
 	}, nil
 }

@@ -28,10 +28,12 @@ func main() {
 	seedFlag := flag.Int64("seed", parseSeedEnv(os.Getenv("REGIONIO_SEED"), cfg.WorldSeed, log),
 		"world seed (overrides REGIONIO_SEED)")
 	worldDir := flag.String("world", cfg.WorldDir, "world directory (empty = in-memory only)")
+	maxCache := flag.Int("maxcache", cfg.MaxCachedChunks, "max cached chunks, LRU eviction (0 = unbounded)")
 	flag.Parse()
 	cfg.WorldSeed = *seedFlag
 	cfg.WorldDir = *worldDir
-	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir)
+	cfg.MaxCachedChunks = *maxCache
+	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir, "maxcache", cfg.MaxCachedChunks)
 
 	srv, err := server.New(cfg)
 	if err != nil {

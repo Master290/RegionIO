@@ -1,6 +1,7 @@
 package world
 
 import (
+	"container/list"
 	"context"
 	"log/slog"
 	"sync"
@@ -17,43 +18,107 @@ type Generator func(cx, cz int32) *Chunk
 // mutates the chunk and invalidates its cached frame so the next request
 // re-encodes it.
 //
-// When a Store is attached (NewCacheWithStore), the cache is read-through — a
-// chunk miss first tries disk, then generation — and edits mark chunks dirty
-// for the background autosave. Frames are built for a fixed compression
-// threshold shared by all play connections, so one frame is valid for every
-// client.
+// When a Store is attached (NewCacheWithStore / NewCacheWithLimit), the cache is
+// read-through — a chunk miss first tries disk, then generation — and edits mark
+// chunks dirty for the background autosave. Frames are built for a fixed
+// compression threshold shared by all play connections, so one frame is valid
+// for every client.
+//
+// When maxChunks > 0, the cache evicts least-recently-used chunks to keep memory
+// bounded (LRU via a doubly-linked list + index map, O(1) touch/evict). Dirty
+// chunks are never evicted until the autosave flushes them, so no edit is lost.
 //
 // Generation can be expensive; it runs outside the lock to avoid blocking other
-// chunk requests. An eviction policy belongs here once worlds stream far.
+// chunk requests.
 type Cache struct {
 	threshold int32
 	gen       Generator
 	store     *Store // nil = in-memory only (tests, flat worlds)
+	maxChunks int    // LRU capacity; 0 = unbounded
 
 	mu     sync.Mutex
 	chunks map[[2]int32]*Chunk
 	frames map[[2]int32][]byte
 	dirty  map[[2]int32]struct{}
+	// LRU bookkeeping: order is MRU(front)→LRU(back); index gives O(1) lookup.
+	order *list.List                    // elements are *[2]int32; nil when maxChunks==0
+	index map[[2]int32]*list.Element
 }
 
 // NewCache returns a world cache that frames packets at the given compression
-// threshold using gen to produce missing chunks. It has no persistence.
+// threshold using gen to produce missing chunks. It has no persistence and no
+// eviction limit (unbounded; for tests/flat worlds).
 func NewCache(threshold int32, gen Generator) *Cache {
-	return &Cache{
+	c := &Cache{
 		threshold: threshold,
 		gen:       gen,
 		chunks:    make(map[[2]int32]*Chunk),
 		frames:    make(map[[2]int32][]byte),
 		dirty:     make(map[[2]int32]struct{}),
 	}
+	return c
 }
 
 // NewCacheWithStore returns a cache backed by store: chunk misses load from disk
 // first (then fall back to gen), and edits are persisted by the autosave loop.
+// The cache is unbounded.
 func NewCacheWithStore(threshold int32, gen Generator, store *Store) *Cache {
 	c := NewCache(threshold, gen)
 	c.store = store
 	return c
+}
+
+// NewCacheWithLimit is the full constructor: persistence (store may be nil) and
+// an LRU cap of maxChunks chunks (0 = unbounded). When bounded, the cache evicts
+// least-recently-used chunks on miss, keeping memory near maxChunks×(chunk+frame)
+// ≈ maxChunks×200KiB.
+func NewCacheWithLimit(threshold int32, gen Generator, store *Store, maxChunks int) *Cache {
+	c := NewCacheWithStore(threshold, gen, store)
+	c.maxChunks = maxChunks
+	if maxChunks > 0 {
+		c.order = list.New()
+		c.index = make(map[[2]int32]*list.Element)
+	}
+	return c
+}
+
+// touch marks key as most-recently-used. Must be called under c.mu.
+func (c *Cache) touch(key [2]int32) {
+	if c.maxChunks == 0 {
+		return
+	}
+	if e, ok := c.index[key]; ok {
+		c.order.MoveToFront(e)
+	} else {
+		c.index[key] = c.order.PushFront(&key)
+	}
+}
+
+// evictIfNeeded drops least-recently-used chunks until len(chunks) <= maxChunks.
+// Dirty chunks are skipped (moved back to MRU and the eviction halts) so the
+// autosave can persist them first. Must be called under c.mu.
+func (c *Cache) evictIfNeeded() {
+	if c.maxChunks == 0 {
+		return
+	}
+	for len(c.chunks) > c.maxChunks {
+		back := c.order.Back()
+		if back == nil {
+			return
+		}
+		key := *back.Value.(*[2]int32)
+		// Never drop a dirty chunk: it has unsaved edits. Bump it to MRU and
+		// stop evicting this cycle; the autosave flush will clear it and the
+		// next eviction pass can reclaim it.
+		if _, dirty := c.dirty[key]; dirty && c.store != nil {
+			c.order.MoveToFront(back)
+			break
+		}
+		delete(c.chunks, key)
+		delete(c.frames, key)
+		c.order.Remove(back)
+		delete(c.index, key)
+	}
 }
 
 // chunkAt returns the chunk at (cx, cz). Resolution order: in-memory cache →
@@ -64,6 +129,7 @@ func (c *Cache) chunkAt(cx, cz int32) *Chunk {
 
 	c.mu.Lock()
 	if ch, ok := c.chunks[key]; ok {
+		c.touch(key)
 		c.mu.Unlock()
 		return ch
 	}
@@ -83,9 +149,12 @@ func (c *Cache) chunkAt(cx, cz int32) *Chunk {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.chunks[key]; ok {
+		c.touch(key)
 		return existing // another goroutine won the race
 	}
 	c.chunks[key] = ch
+	c.touch(key)
+	c.evictIfNeeded()
 	return ch
 }
 
@@ -97,6 +166,7 @@ func (c *Cache) Frame(cx, cz int32) []byte {
 
 	c.mu.Lock()
 	if f, ok := c.frames[key]; ok {
+		c.touch(key)
 		c.mu.Unlock()
 		return f
 	}
@@ -108,9 +178,12 @@ func (c *Cache) Frame(cx, cz int32) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.frames[key]; ok {
+		c.touch(key)
 		return existing
 	}
 	c.frames[key] = frame
+	c.touch(key)
+	c.evictIfNeeded()
 	return frame
 }
 
@@ -133,6 +206,7 @@ func (c *Cache) SetBlock(x, y, z int, state uint16) bool {
 	if c.store != nil {
 		c.dirty[key] = struct{}{}
 	}
+	c.touch(key) // edited chunk is most-recently-used
 	c.mu.Unlock()
 	return true
 }
