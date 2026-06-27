@@ -51,9 +51,10 @@ func DefaultConfig() Config {
 
 // Server is the top-level core shared across all connections.
 type Server struct {
-	cfg    Config
-	chunks *world.Cache
-	store  *world.Store // nil when persistence is disabled
+	cfg      Config
+	chunks   *world.Cache
+	store    *world.Store // nil when persistence is disabled
+	entities *world.EntityManager
 }
 
 // New constructs a Server from cfg. When cfg.WorldDir is set, the world is
@@ -61,19 +62,21 @@ type Server struct {
 // only. A returned error (e.g. the world dir cannot be created) is fatal.
 func New(cfg Config) (*Server, error) {
 	gen := world.NewVanillaGenerator(cfg.WorldSeed)
+	em := world.NewEntityManager()
 	if cfg.WorldDir == "" {
 		// No persistence; keep eviction off too (flat/test worlds expect full
 		// presence). Real servers set WorldDir and MaxCachedChunks together.
-		return &Server{cfg: cfg, chunks: world.NewCache(int32(cfg.CompressionThreshold), gen)}, nil
+		return &Server{cfg: cfg, chunks: world.NewCache(int32(cfg.CompressionThreshold), gen), entities: em}, nil
 	}
 	store, err := world.NewStore(cfg.WorldDir)
 	if err != nil {
 		return nil, err
 	}
 	return &Server{
-		cfg:    cfg,
-		chunks: world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks),
-		store:  store,
+		cfg:      cfg,
+		chunks:   world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks),
+		store:    store,
+		entities: em,
 	}, nil
 }
 
@@ -82,6 +85,9 @@ func (s *Server) Config() Config { return s.cfg }
 
 // Chunks returns the shared chunk cache.
 func (s *Server) Chunks() *world.Cache { return s.chunks }
+
+// Entities returns the shared entity manager.
+func (s *Server) Entities() *world.EntityManager { return s.entities }
 
 // Store returns the on-disk world store, or nil if persistence is disabled.
 func (s *Server) Store() *world.Store { return s.store }

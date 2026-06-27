@@ -80,6 +80,17 @@ const (
 	PlayBlockUpdate      = 0x08
 	PlayBlockChangedAck  = 0x04
 	PlaySystemChat       = 0x79
+
+	// Entity packets
+	PlayAddEntity        = 0x01
+	PlayTeleportEntity   = 0x7D
+	PlayMoveEntityPos    = 0x35
+	PlayMoveEntityPosRot = 0x36
+	PlayMoveEntityRot    = 0x38
+	PlaySetEntityMotion  = 0x65
+	PlayRemoveEntities   = 0x4D
+	PlaySetEntityData    = 0x63
+	PlaySetEquipment     = 0x66
 )
 
 // Play, serverbound (protocol 775).

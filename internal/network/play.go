@@ -42,6 +42,7 @@ func (h *handler) beginPlay() error {
 	go h.streamer.run(h.ctx)
 	h.streamer.requestRecenter(0, 0)
 	go h.keepAliveLoop()
+	go h.entitySyncLoop()
 	return nil
 }
 
@@ -131,6 +132,74 @@ func (h *handler) keepAliveLoop() {
 			return
 		}
 	}
+}
+
+// entitySyncLoop periodically sends all entities in the world to the client.
+// In a real server this would track which entities the player can see and send updates.
+func (h *handler) entitySyncLoop() {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	known := make(map[int32]bool)
+
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-ticker.C:
+			all := h.srv.Entities().All()
+			current := make(map[int32]bool)
+			for _, e := range all {
+				current[e.ID] = true
+				if !known[e.ID] {
+					h.sendAddEntity(e)
+					known[e.ID] = true
+				} else {
+					h.sendEntityTeleport(e)
+				}
+			}
+			// remove entities that disappeared
+			for id := range known {
+				if !current[id] {
+					h.sendRemoveEntity(id)
+					delete(known, id)
+				}
+			}
+		}
+	}
+}
+
+// sendAddEntity sends the minecraft:add_entity packet.
+func (h *handler) sendAddEntity(e *world.Entity) error {
+	w := protocol.NewWriter(64)
+	w.VarInt(e.ID)
+	w.UUID(e.UUID)
+	w.VarInt(int32(e.TypeID))
+	w.Float64(e.X).Float64(e.Y).Float64(e.Z)
+	w.Byte(byte(e.Pitch * 256.0 / 360.0))
+	w.Byte(byte(e.Yaw * 256.0 / 360.0))
+	w.Byte(byte(e.HeadYaw * 256.0 / 360.0))
+	w.VarInt(0) // Data
+	w.Uint16(uint16(e.VelocityX))
+	w.Uint16(uint16(e.VelocityY))
+	w.Uint16(uint16(e.VelocityZ))
+	return h.conn.SendWriter(protocol.PlayAddEntity, w)
+}
+
+func (h *handler) sendEntityTeleport(e *world.Entity) error {
+	w := protocol.NewWriter(64)
+	w.VarInt(e.ID)
+	w.Float64(e.X).Float64(e.Y).Float64(e.Z)
+	w.Byte(byte(e.Yaw * 256.0 / 360.0))
+	w.Byte(byte(e.Pitch * 256.0 / 360.0))
+	w.Bool(true) // On ground
+	return h.conn.SendWriter(protocol.PlayTeleportEntity, w)
+}
+
+func (h *handler) sendRemoveEntity(id int32) error {
+	w := protocol.NewWriter(16)
+	w.VarInt(1) // count
+	w.VarInt(id)
+	return h.conn.SendWriter(protocol.PlayRemoveEntities, w)
 }
 
 // handlePlay dispatches serverbound play packets. Most are tolerated for now;
