@@ -153,10 +153,11 @@ func (t *Template) Place(cw ChunkWriter, cx, cz int32, originX, originY, originZ
 		if wx >= minX && wx <= maxX && wz >= minZ && wz <= maxZ {
 			lx := wx - minX
 			lz := wz - minZ
-			// Only place if not air, or if you want structures to hollow out space, place air too.
-			// Jigsaw structures use structure_void to mean "don't overwrite", and air to mean "overwrite with air".
-			// Since we fallback to 0 for unknown blocks, we need to be careful.
-			// For now, place everything.
+			// 14851 = minecraft:structure_void
+			// 21736 = minecraft:jigsaw
+			if b.State == 14851 || b.State == 21736 {
+				continue
+			}
 			cw.SetBlock(lx, wy, lz, b.State)
 		}
 	}
