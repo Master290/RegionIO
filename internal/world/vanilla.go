@@ -111,7 +111,7 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 		}
 	}
 	fillBiomes3D(c, od, s2D, baseX, baseZ)
-	decorate(c, cx, cz, seed, &surfTop, &grass)
+	decorate(c, cx, cz, seed, &surfTop, &grass, &biomeName)
 	return c
 }
 
@@ -300,8 +300,14 @@ func bedrockAt(rng chunkRand, d int) bool {
 // decorate places simple oak trees on grassy columns. Trunks are kept two
 // blocks inside the chunk so the radius-2 canopy never crosses into a neighbour
 // (avoiding cross-chunk coordination); placement is deterministic per chunk.
-func decorate(c *Chunk, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool) {
+func decorate(c *Chunk, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
 	r := newChunkRand(cx, cz, seed)
+
+	placeOres(c, &r)
+	placeFlora(c, &r, surfTop, grass, biomeName)
+	placeDesertFeatures(c, &r, surfTop, biomeName)
+	placeRocks(c, &r, surfTop, grass, biomeName)
+
 	const attempts = 8
 	for a := 0; a < attempts; a++ {
 		lx := 2 + int(r.next()%12)
@@ -374,6 +380,10 @@ func (r *chunkRand) next() uint32 {
 	z = (z ^ (z >> 27)) * 0x94D049BB133111EB
 	z = z ^ (z >> 31)
 	return uint32(z >> 32)
+}
+
+func (r *chunkRand) nextFloat() float64 {
+	return float64(r.next()) / float64(1<<32)
 }
 
 // toRand returns a *rand.Rand seeded from this column's state, for surface
