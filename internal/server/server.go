@@ -4,6 +4,7 @@ package server
 
 import (
 	"encoding/json"
+	"sync"
 
 	"regionio/internal/protocol"
 	"regionio/internal/world"
@@ -55,6 +56,9 @@ type Server struct {
 	chunks   *world.Cache
 	store    *world.Store // nil when persistence is disabled
 	entities *world.EntityManager
+
+	// playerPos tracks the last known position of each player by name.
+	playerPos sync.Map // map[string][3]float64
 }
 
 // New constructs a Server from cfg. When cfg.WorldDir is set, the world is
@@ -88,6 +92,33 @@ func (s *Server) Chunks() *world.Cache { return s.chunks }
 
 // Entities returns the shared entity manager.
 func (s *Server) Entities() *world.EntityManager { return s.entities }
+
+// SetPlayerPosition updates the tracked position of a player.
+func (s *Server) SetPlayerPosition(name string, x, y, z float64) {
+	s.playerPos.Store(name, [3]float64{x, y, z})
+}
+
+// RemovePlayerPosition removes a player from tracking.
+func (s *Server) RemovePlayerPosition(name string) {
+	s.playerPos.Delete(name)
+}
+
+// NearestPlayer returns the position of the nearest player to (x, y, z).
+// Returns false if no players are online.
+func (s *Server) NearestPlayer(x, y, z float64) (pos [3]float64, ok bool) {
+	minDist := float64(-1)
+	s.playerPos.Range(func(key, value any) bool {
+		p := value.([3]float64)
+		dist := (p[0]-x)*(p[0]-x) + (p[1]-y)*(p[1]-y) + (p[2]-z)*(p[2]-z)
+		if minDist < 0 || dist < minDist {
+			minDist = dist
+			pos = p
+			ok = true
+		}
+		return true
+	})
+	return
+}
 
 // Store returns the on-disk world store, or nil if persistence is disabled.
 func (s *Server) Store() *world.Store { return s.store }

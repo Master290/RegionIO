@@ -1,6 +1,7 @@
 package server
 
 import (
+	"math"
 	"math/rand"
 	"time"
 
@@ -20,10 +21,44 @@ func (s *Server) entityTickLoop() {
 	for range ticker.C {
 		all := s.entities.All()
 		for _, e := range all {
-			// Basic random wandering
-			e.X += (rand.Float64() - 0.5) * 0.2
-			e.Z += (rand.Float64() - 0.5) * 0.2
-			e.Yaw += float32((rand.Float64() - 0.5) * 10.0)
+			// Apply gravity
+			yBelow := int(e.Y - 0.1) // slightly below the entity
+			blockBelow := s.chunks.GetBlock(int(e.X), yBelow, int(e.Z))
+			
+			if blockBelow == world.StateAir || blockBelow == world.StateWater { // Air or Water
+				e.VelocityY -= 80 // gravity acceleration
+				if e.VelocityY < -3000 {
+					e.VelocityY = -3000 // terminal velocity
+				}
+			} else {
+				e.VelocityY = 0
+				e.Y = float64(yBelow + 1)
+				
+				// Basic random wandering or player tracking when on ground
+				pos, ok := s.NearestPlayer(e.X, e.Y, e.Z)
+				
+				if ok && e.TypeName == "minecraft:zombie" {
+					// Zombies move towards the player
+					dx := pos[0] - e.X
+					dz := pos[2] - e.Z
+					dist := math.Sqrt(dx*dx + dz*dz)
+					if dist > 1.0 && dist < 32.0 {
+						e.X += (dx / dist) * 0.15
+						e.Z += (dz / dist) * 0.15
+						// Simple yaw calculation
+						e.Yaw = float32(math.Atan2(-dx, dz) * (180 / math.Pi))
+					}
+				} else {
+					// Random wander
+					e.X += (rand.Float64() - 0.5) * 0.2
+					e.Z += (rand.Float64() - 0.5) * 0.2
+					e.Yaw += float32((rand.Float64() - 0.5) * 10.0)
+				}
+			}
+			
+			if e.VelocityY != 0 {
+				e.Y += float64(e.VelocityY) / 8000.0
+			}
 		}
 	}
 }

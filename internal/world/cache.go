@@ -187,6 +187,18 @@ func (c *Cache) Frame(cx, cz int32) []byte {
 	return frame
 }
 
+// GetBlock returns the block state at world coordinates (x, y, z).
+// It loads or generates the chunk if necessary.
+func (c *Cache) GetBlock(x, y, z int) uint16 {
+	if y < MinY || y >= MinY+WorldHeight {
+		return 0 // StateAir
+	}
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	ch := c.chunkAt(cx, cz)
+	return ch.GetBlock(x, y, z)
+}
+
 // SetBlock changes the block at world coordinates (x, y, z), invalidating the
 // affected chunk's cached frame and marking it dirty for autosave. It reports
 // whether a chunk was actually touched (false if y is out of range).

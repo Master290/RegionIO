@@ -48,7 +48,8 @@ func (h *handler) beginPlay() error {
 
 // onPlayerMove recenters the streamer when the player crosses into a new chunk.
 // It is a non-blocking push; the read loop never waits on generation.
-func (h *handler) onPlayerMove(x, z float64) error {
+func (h *handler) onPlayerMove(x, y, z float64) error {
+	h.srv.SetPlayerPosition(h.conn.Profile.Name, x, y, z)
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 	if h.streamer != nil {
@@ -230,14 +231,15 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		if err != nil {
 			return err
 		}
-		if _, err := r.Float64(); err != nil { // feet Y, unused for streaming
+		y, err := r.Float64() // feet Y
+		if err != nil {
 			return err
 		}
 		z, err := r.Float64()
 		if err != nil {
 			return err
 		}
-		return h.onPlayerMove(x, z)
+		return h.onPlayerMove(x, y, z)
 
 	case protocol.PlayPlayerAction:
 		return h.handlePlayerAction(pkt)

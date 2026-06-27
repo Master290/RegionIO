@@ -44,6 +44,8 @@ func (h *handler) serve() {
 	defer cancel() // stops the streamer when the read loop ends
 	h.ctx = ctx
 
+	defer h.srv.RemovePlayerPosition(h.conn.Profile.Name)
+
 	for {
 		pkt, err := h.conn.ReadPacket()
 		if err != nil {
