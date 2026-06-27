@@ -111,7 +111,7 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 		}
 	}
 	fillBiomes3D(c, od, s2D, baseX, baseZ)
-	decorate(c, cx, cz, seed, &surfTop, &grass, &biomeName)
+	decorate(c, od, cx, cz, seed, &surfTop, &grass, &biomeName)
 	return c
 }
 
@@ -300,7 +300,7 @@ func bedrockAt(rng chunkRand, d int) bool {
 // decorate places simple oak trees on grassy columns. Trunks are kept two
 // blocks inside the chunk so the radius-2 canopy never crosses into a neighbour
 // (avoiding cross-chunk coordination); placement is deterministic per chunk.
-func decorate(c *Chunk, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
+func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
 	r := newChunkRand(cx, cz, seed)
 
 	placeOres(c, &r)
@@ -318,6 +318,9 @@ func decorate(c *Chunk, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[
 		baseY := MinY + surfTop[lx][lz] + 1
 		placeOak(c, lx, baseY, lz, &r)
 	}
+
+	// Place large structures like villages and strongholds
+	worldgen.PlaceStructures(c, od, cx, cz, seed, surfTop, biomeName)
 }
 
 func placeOak(c *Chunk, lx, baseY, lz int, r *chunkRand) {
