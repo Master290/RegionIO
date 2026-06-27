@@ -40,17 +40,25 @@ func parsePalettedContainer(t *testing.T, r *protocol.Reader, maxBits, entryCoun
 	}
 }
 
-func skipBitSet(t *testing.T, r *protocol.Reader) {
+func parseBitSet(t *testing.T, r *protocol.Reader) int {
 	t.Helper()
 	n, err := r.VarInt()
 	if err != nil || n < 0 {
 		t.Fatalf("bitset len: %v", err)
 	}
+	bits := 0
 	for i := int32(0); i < n; i++ {
-		if _, err := r.Int64(); err != nil {
+		val, err := r.Int64()
+		if err != nil {
 			t.Fatalf("bitset long: %v", err)
 		}
+		// Count set bits
+		for val > 0 {
+			bits += int(val & 1)
+			val >>= 1
+		}
 	}
+	return bits
 }
 
 // TestFlatChunkEncodesCleanly fully parses an encoded flat chunk and asserts
@@ -117,13 +125,13 @@ func TestFlatChunkEncodesCleanly(t *testing.T) {
 	}
 
 	// Light: four bitsets, then sky arrays, then block arrays.
-	skipBitSet(t, r) // sky mask
-	skipBitSet(t, r) // block mask
-	skipBitSet(t, r) // empty sky mask
-	skipBitSet(t, r) // empty block mask
+	expectedSkyArrays := parseBitSet(t, r) // sky mask
+	expectedBlockArrays := parseBitSet(t, r) // block mask
+	parseBitSet(t, r) // empty sky mask
+	parseBitSet(t, r) // empty block mask
 	skyArrays, err := r.VarInt()
-	if err != nil || skyArrays != lightSections {
-		t.Fatalf("sky arrays = %d (err %v), want %d", skyArrays, err, lightSections)
+	if err != nil || skyArrays != int32(expectedSkyArrays) {
+		t.Fatalf("sky arrays = %d (err %v), want %d", skyArrays, err, expectedSkyArrays)
 	}
 	for i := int32(0); i < skyArrays; i++ {
 		n, err := r.VarInt()
@@ -136,8 +144,20 @@ func TestFlatChunkEncodesCleanly(t *testing.T) {
 			}
 		}
 	}
-	if blockArrays, err := r.VarInt(); err != nil || blockArrays != 0 {
-		t.Fatalf("block arrays = %d (err %v), want 0", blockArrays, err)
+	blockArrays, err := r.VarInt()
+	if err != nil || blockArrays != int32(expectedBlockArrays) {
+		t.Fatalf("block arrays = %d (err %v), want %d", blockArrays, err, expectedBlockArrays)
+	}
+	for i := int32(0); i < blockArrays; i++ {
+		n, err := r.VarInt()
+		if err != nil || n != 2048 {
+			t.Fatalf("block array len = %d (err %v), want 2048", n, err)
+		}
+		for j := int32(0); j < n; j++ {
+			if _, err := r.ReadByte(); err != nil {
+				t.Fatalf("block byte: %v", err)
+			}
+		}
 	}
 
 	if rem := r.Remaining(); rem != 0 {

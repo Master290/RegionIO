@@ -6,29 +6,104 @@ import "regionio/internal/protocol"
 // above, plus one per block section.
 const lightSections = SectionCount + 2
 
-// writeLight emits a fully-lit sky: every light section carries sky light 15,
-// and block light is reported as uniformly empty. This avoids a black world
-// without implementing real light propagation (deferred).
+// writeLight computes and emits simple lighting data. It does a vertical pass
+// for sky light (sunlight propagating downward) and a single-block pass for
+// block light (emissive blocks), without horizontal flood-fill.
 func (c *Chunk) writeLight(w *protocol.Writer) {
-	full := allSectionsMask()
+	skyLight := make([]*[2048]byte, lightSections)
+	blockLight := make([]*[2048]byte, lightSections)
 
-	writeBitSet(w, full)              // sky light mask: all sections present
-	writeBitSet(w, nil)               // block light mask: none present
-	writeBitSet(w, nil)               // empty sky light mask: none empty
-	writeBitSet(w, full)              // empty block light mask: all empty
-
-	// Sky light arrays: one 2048-byte (4096 nibbles) array of 0x0F per section.
-	bright := make([]byte, 2048)
-	for i := range bright {
-		bright[i] = 0xFF // two nibbles of 15
+	// Section lightSections-1 is above the world, fully lit by the sky.
+	skyLight[lightSections-1] = new([2048]byte)
+	for i := range skyLight[lightSections-1] {
+		skyLight[lightSections-1][i] = 0xFF
 	}
-	w.VarInt(lightSections)
+
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			// Sky light pass
+			currentSky := byte(15)
+			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
+				block := c.GetBlock(lx, y, lz)
+				op := blockOpacity[block]
+				if op >= currentSky {
+					currentSky = 0
+				} else {
+					currentSky -= op
+				}
+
+				if currentSky > 0 {
+					si := (y - MinY) >> 4
+					lsi := si + 1
+					if skyLight[lsi] == nil {
+						skyLight[lsi] = new([2048]byte)
+					}
+					idx := blockIndex(lx, y, lz)
+					if idx%2 == 0 {
+						skyLight[lsi][idx/2] |= currentSky
+					} else {
+						skyLight[lsi][idx/2] |= currentSky << 4
+					}
+				}
+
+				// Block light pass
+				em := blockEmission[block]
+				if em > 0 {
+					si := (y - MinY) >> 4
+					lsi := si + 1
+					if blockLight[lsi] == nil {
+						blockLight[lsi] = new([2048]byte)
+					}
+					idx := blockIndex(lx, y, lz)
+					if idx%2 == 0 {
+						blockLight[lsi][idx/2] |= em
+					} else {
+						blockLight[lsi][idx/2] |= em << 4
+					}
+				}
+			}
+		}
+	}
+
+	var skyMask, blockMask, emptySkyMask, emptyBlockMask uint64
+	var skyCount, blockCount int
+
 	for i := 0; i < lightSections; i++ {
-		w.VarInt(2048)
-		w.Raw(bright)
+		if skyLight[i] != nil {
+			skyMask |= 1 << i
+			skyCount++
+		} else {
+			emptySkyMask |= 1 << i
+		}
+
+		if blockLight[i] != nil {
+			blockMask |= 1 << i
+			blockCount++
+		} else {
+			emptyBlockMask |= 1 << i
+		}
 	}
 
-	w.VarInt(0) // no block light arrays
+	writeBitSet(w, []uint64{skyMask})
+	writeBitSet(w, []uint64{blockMask})
+	writeBitSet(w, []uint64{emptySkyMask})
+	writeBitSet(w, []uint64{emptyBlockMask})
+
+	w.VarInt(int32(skyCount))
+	for i := 0; i < lightSections; i++ {
+		if skyLight[i] != nil {
+			w.VarInt(2048)
+			w.Raw(skyLight[i][:])
+		}
+	}
+
+	w.VarInt(int32(blockCount))
+	for i := 0; i < lightSections; i++ {
+		if blockLight[i] != nil {
+			w.VarInt(2048)
+			w.Raw(blockLight[i][:])
+		}
+	}
 }
 
 // allSectionsMask returns a bitset (as longs) with the low lightSections bits set.
