@@ -72,8 +72,12 @@ func (h *handler) sendChunkCacheCenter(cx, cz int32) error {
 }
 
 func (h *handler) sendDefaultSpawnPosition() error {
-	w := protocol.NewWriter(12)
+	// 26.1.2 wraps the spawn in LevelData.RespawnData: GlobalPos followed by
+	// yaw and pitch. GlobalPos starts with the dimension resource key.
+	w := protocol.NewWriter(40)
+	w.String("minecraft:overworld")
 	w.Position(8, 100, 8)
+	w.Float32(0.0)
 	w.Float32(0.0)
 	return h.conn.SendWriter(protocol.PlayDefaultSpawnPos, w)
 }
