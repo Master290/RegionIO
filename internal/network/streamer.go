@@ -41,6 +41,12 @@ type streamer struct {
 	centerZ   int32
 	hasCenter bool
 
+	// resident is the cross-goroutine view of chunks whose level_chunk packet
+	// has reached the connection. Entity sync uses it to avoid exposing mobs or
+	// players before the terrain under them exists client-side.
+	residentMu sync.RWMutex
+	resident   map[[2]int32]bool
+
 	viewRadius int // chunks within this Chebyshev radius are sent to the client
 	genRadius  int // viewRadius + 1: pre-generated but not sent (predictive ring)
 	poolSize   int // parallel generation workers
@@ -75,6 +81,7 @@ func newStreamer(cache *world.Cache, conn *Conn, log *slog.Logger, viewDistance 
 		log:        log,
 		recenter:   make(chan recenterReq, 4),
 		loaded:     make(map[[2]int32]bool),
+		resident:   make(map[[2]int32]bool),
 		viewRadius: viewDistance,
 		genRadius:  viewDistance + 1,
 		poolSize:   pool,
@@ -173,6 +180,7 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterR
 	// only server-side by tickets and never left loaded on the client.
 	for key := range s.loaded {
 		if !view[key] {
+			s.setResident(key, false)
 			s.sendForgetLevelChunk(key[0], key[1])
 			delete(s.loaded, key)
 		}
@@ -344,7 +352,25 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 			}
 		}
 		s.loaded[[2]int32{j.cx, j.cz}] = true
+		s.setResident([2]int32{j.cx, j.cz}, true)
 	}
+}
+
+func (s *streamer) setResident(key [2]int32, present bool) {
+	s.residentMu.Lock()
+	if present {
+		s.resident[key] = true
+	} else {
+		delete(s.resident, key)
+	}
+	s.residentMu.Unlock()
+}
+
+func (s *streamer) isResident(cx, cz int32) bool {
+	s.residentMu.RLock()
+	present := s.resident[[2]int32{cx, cz}]
+	s.residentMu.RUnlock()
+	return present
 }
 
 // parallelPreload warms terrain for the given chunks without calculating light,

@@ -261,7 +261,8 @@ func (h *handler) syncVisibleEntities() error {
 
 	currentEntities := make(map[int32]visibleEntity)
 	for _, player := range players {
-		if player.EntityID == viewer.EntityID || !playerVisible(viewer, player, h.visibilityRadius()) {
+		if player.EntityID == viewer.EntityID || !playerVisible(viewer, player, h.visibilityRadius()) ||
+			!h.entityChunkResident(player.X, player.Z) {
 			continue
 		}
 		currentEntities[player.EntityID] = visibleEntity{
@@ -275,7 +276,7 @@ func (h *handler) syncVisibleEntities() error {
 		}
 	}
 	for _, entity := range h.srv.Entities().All() {
-		if entityVisible(viewer, entity, h.visibilityRadius()) {
+		if entityVisible(viewer, entity, h.visibilityRadius()) && h.entityChunkResident(entity.X, entity.Z) {
 			currentEntities[entity.ID] = visibleEntity{entity: entity, onGround: true}
 		}
 	}
@@ -312,6 +313,15 @@ func (h *handler) syncVisibleEntities() error {
 		}
 	}
 	return nil
+}
+
+func (h *handler) entityChunkResident(x, z float64) bool {
+	if h.streamer == nil {
+		return true
+	}
+	cx := int32(int64(math.Floor(x)) >> 4)
+	cz := int32(int64(math.Floor(z)) >> 4)
+	return h.streamer.isResident(cx, cz)
 }
 
 func playerVisible(viewer, target server.PlayerSnapshot, radius int) bool {

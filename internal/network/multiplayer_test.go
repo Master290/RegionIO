@@ -270,6 +270,47 @@ func TestIntegrationFourClientsVisibilityMovementLeaveAndLight(t *testing.T) {
 	srv.Entities().Remove(mobID)
 }
 
+func TestEntityVisibilityWaitsForResidentChunk(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := server.NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &recordingConn{}
+	h := &handler{conn: NewConn(recorder), srv: srv, log: slog.Default(), viewDistance: 2}
+	h.conn.Profile = server.Profile{Name: "Alice", UUID: server.OfflineUUID("Alice")}
+	h.session, err = srv.RegisterPlayer(h.conn.Profile, h.conn.Send)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.UnregisterPlayer(h.session)
+	srv.SetPlayerTransform(h.session, 8, 80, 8, 0, 0, true)
+	h.streamer = &streamer{resident: make(map[[2]int32]bool)}
+	srv.Entities().Add(&world.Entity{
+		TypeID: 100, TypeName: "minecraft:pig", X: 24, Y: 80, Z: 8,
+	})
+
+	if err := h.syncVisibleEntities(); err != nil {
+		t.Fatal(err)
+	}
+	if got := countPackets(recorder.take(t), protocol.PlayAddEntity); got != 0 {
+		t.Fatalf("add-entity packets before chunk = %d, want 0", got)
+	}
+
+	h.streamer.setResident([2]int32{1, 0}, true)
+	if err := h.syncVisibleEntities(); err != nil {
+		t.Fatal(err)
+	}
+	assertPacketIDs(t, recorder.take(t), protocol.PlayAddEntity)
+
+	h.streamer.setResident([2]int32{1, 0}, false)
+	if err := h.syncVisibleEntities(); err != nil {
+		t.Fatal(err)
+	}
+	assertPacketIDs(t, recorder.take(t), protocol.PlayRemoveEntities)
+}
+
 func countPackets(packets []protocol.Packet, id int32) int {
 	count := 0
 	for _, packet := range packets {
