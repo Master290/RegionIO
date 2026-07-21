@@ -18,7 +18,7 @@ func (c *Cache) ensureLight(chunk *Chunk) error {
 func (c *Cache) ensureLightLocked(chunk *Chunk) error {
 	for {
 		center, revision := chunk.snapshot()
-		if center.lightReady {
+		if center.lightReady && center.lightValidated {
 			return nil
 		}
 
@@ -48,11 +48,18 @@ func (c *Cache) ensureLightLocked(chunk *Chunk) error {
 			chunk.mu.Unlock()
 			continue
 		}
-		chunk.installLight(volume)
+		changed := chunk.installLight(volume)
+		if center.lightReady && changed {
+			revision = chunk.revision.Add(1)
+		}
 		chunk.mu.Unlock()
 
 		c.mu.Lock()
-		delete(c.frames, [2]int32{chunk.X, chunk.Z})
+		key := [2]int32{chunk.X, chunk.Z}
+		delete(c.frames, key)
+		if c.store != nil && center.lightReady && changed {
+			c.dirty[key] = revision
+		}
 		c.mu.Unlock()
 		return nil
 	}

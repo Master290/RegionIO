@@ -53,6 +53,25 @@ func (c *recordingConn) take(t *testing.T) []protocol.Packet {
 	return packets
 }
 
+func (c *recordingConn) countPacketID(id int32) int {
+	c.mu.Lock()
+	raw := append([]byte(nil), c.buf.Bytes()...)
+	c.mu.Unlock()
+	reader := bytes.NewReader(raw)
+	br := bufio.NewReader(reader)
+	count := 0
+	for br.Buffered() > 0 || reader.Len() > 0 {
+		packet, err := protocol.ReadPacket(br, -1)
+		if err != nil {
+			return count
+		}
+		if packet.ID == id {
+			count++
+		}
+	}
+	return count
+}
+
 type testAddr string
 
 func (a testAddr) Network() string { return "test" }

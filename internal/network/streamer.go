@@ -13,10 +13,9 @@ import (
 // streamer.go is the per-connection background chunk streamer. The read loop
 // no longer generates or sends chunks inline; it pushes recenter requests here
 // and stays free to handle the player's packets (movement, chat, keep-alive
-// acks). The streamer generates chunks in a worker pool (Cache.Frame is
-// goroutine-safe), pre-generates a ring beyond the view distance so movement
-// doesn't pop in, and sends finished frames serially under the conn's write
-// mutex.
+// acks). The streamer holds cache tickets for the view and one predictive ring,
+// admits work in distance-priority batches, and sends finished frames serially
+// under the conn's write mutex.
 //
 // Ownership:
 //   - read loop: calls requestRecenter (non-blocking), owns nothing else here.
@@ -45,6 +44,7 @@ type streamer struct {
 	viewRadius int // chunks within this Chebyshev radius are sent to the client
 	genRadius  int // viewRadius + 1: pre-generated but not sent (predictive ring)
 	poolSize   int // parallel generation workers
+	tickets    *world.TicketSet
 }
 
 // defaultViewRadius is used when the client hasn't sent client_information or
@@ -68,7 +68,7 @@ func newStreamer(cache *world.Cache, conn *Conn, log *slog.Logger, viewDistance 
 	if pool < 2 {
 		pool = 2
 	}
-	return &streamer{
+	s := &streamer{
 		cache:      cache,
 		conn:       conn,
 		log:        log,
@@ -78,6 +78,10 @@ func newStreamer(cache *world.Cache, conn *Conn, log *slog.Logger, viewDistance 
 		genRadius:  viewDistance + 1,
 		poolSize:   pool,
 	}
+	if cache != nil {
+		s.tickets = cache.NewTicketSet()
+	}
+	return s
 }
 
 // requestRecenter asks the streamer to recenter on (cx, cz). Non-blocking: if
@@ -105,41 +109,30 @@ func (s *streamer) requestRecenter(cx, cz int32) {
 // connection close). On each recenter it generates+sends the newly-in-range
 // chunks in spiral order (nearest first) and pre-generates the outer ring.
 func (s *streamer) run(ctx context.Context) {
-	var (
-		// latest holds the most recent recenter request; processed when the
-		// previous batch finishes or on arrival if idle.
-		pending bool
-		next    recenterReq
-	)
+	if s.tickets != nil {
+		defer s.tickets.Close()
+	}
 	for {
-		// If we have a pending recenter, process it; otherwise block waiting.
-		if pending {
-			select {
-			case <-ctx.Done():
-				return
-			case req := <-s.recenter:
-				next = req // newer request supersedes the pending one
-			default:
-				// No newer request; process the one we have.
-				pending = false
-				s.processRecenter(ctx, next.cx, next.cz)
+		var req recenterReq
+		select {
+		case <-ctx.Done():
+			return
+		case req = <-s.recenter:
+		}
+		for {
+			next, superseded := s.processRecenter(ctx, req.cx, req.cz)
+			if !superseded {
+				break
 			}
-		} else {
-			select {
-			case <-ctx.Done():
-				return
-			case req := <-s.recenter:
-				pending = true
-				next = req
-			}
+			req = next
 		}
 	}
 }
 
 // processRecenter generates and sends the chunks newly in range of (cx, cz),
-// pre-generates the predictive ring, and drops chunks that left the gen radius.
+// pre-generates the predictive ring, and drops chunks that left client view.
 // It is the only place `loaded`/`centerX`/`centerZ` are mutated.
-func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) {
+func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterReq, bool) {
 	s.centerX, s.centerZ, s.hasCenter = cx, cz, true
 
 	s.sendChunkCacheCenter(cx, cz)
@@ -147,43 +140,97 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) {
 	// Build the desired set: everything within genRadius (the union of what we
 	// send + the pre-gen ring). Sent = within viewRadius; pre-gen = the ring.
 	order := spiralOrder(cx, cz, s.genRadius)
-	desired := make(map[[2]int32]bool, len(order))
+	view := make(map[[2]int32]bool, (2*s.viewRadius+1)*(2*s.viewRadius+1))
 
 	// Split into "to send" (within viewRadius) and "pre-gen only" (the ring).
 	var toSend [][2]int32
 	var toPreGen [][2]int32
+	var viewTickets []world.ChunkPos
+	var prefetchTickets []world.ChunkPos
 	for _, key := range order {
-		desired[key] = true
-		dx := key[0] - cx
-		if dx < 0 {
-			dx = -dx
-		}
-		dz := key[1] - cz
-		if dz < 0 {
-			dz = -dz
-		}
-		if dx <= int32(s.viewRadius) && dz <= int32(s.viewRadius) {
+		if chunkDistanceFrom(cx, cz, key) <= int32(s.viewRadius) {
+			view[key] = true
 			toSend = append(toSend, key)
+			viewTickets = append(viewTickets, world.ChunkPos{X: key[0], Z: key[1]})
 		} else {
 			toPreGen = append(toPreGen, key)
+			prefetchTickets = append(prefetchTickets, world.ChunkPos{X: key[0], Z: key[1]})
+		}
+	}
+	if s.tickets != nil {
+		s.tickets.Replace(viewTickets, prefetchTickets)
+	}
+
+	// Client residency follows viewRadius exactly. The prefetch ring is retained
+	// only server-side by tickets and never left loaded on the client.
+	for key := range s.loaded {
+		if !view[key] {
+			s.sendForgetLevelChunk(key[0], key[1])
+			delete(s.loaded, key)
 		}
 	}
 
-	// Generate the send set in parallel, sending each frame as it completes.
-	// The pool guarantees `poolSize` concurrent cache.Frame calls; a single
-	// sender drains results and writes to the conn (serialized by writeMu).
-	s.parallelSend(ctx, toSend)
+	// Work is admitted in strict distance order. Each batch is at most poolSize,
+	// so a new recenter only waits for currently-running frames, not a full ring.
+	if next, superseded := s.streamPriority(ctx, cx, cz, toSend, true); superseded {
+		return next, true
+	}
 	// Pre-generate the ring so the next recenter finds frames warm in the cache.
-	// Errors are irrelevant here (we don't send anything), so no sender.
-	s.parallelGenerate(ctx, toPreGen)
+	if next, superseded := s.streamPriority(ctx, cx, cz, toPreGen, false); superseded {
+		return next, true
+	}
+	return recenterReq{}, false
+}
 
-	// Forget chunks that left the gen radius. The client drops them itself once
-	// it gets the new chunk-cache-center, but trimming our set keeps memory
-	// bounded and avoids re-sending.
-	for key := range s.loaded {
-		if !desired[key] {
-			s.sendForgetLevelChunk(key[0], key[1])
-			delete(s.loaded, key)
+func chunkDistanceFrom(cx, cz int32, key [2]int32) int32 {
+	dx := key[0] - cx
+	if dx < 0 {
+		dx = -dx
+	}
+	dz := key[1] - cz
+	if dz < 0 {
+		dz = -dz
+	}
+	if dz > dx {
+		return dz
+	}
+	return dx
+}
+
+func (s *streamer) streamPriority(ctx context.Context, cx, cz int32, keys [][2]int32, send bool) (recenterReq, bool) {
+	for start := 0; start < len(keys); {
+		ring := chunkDistanceFrom(cx, cz, keys[start])
+		end := start
+		for end < len(keys) && end-start < s.poolSize && chunkDistanceFrom(cx, cz, keys[end]) == ring {
+			end++
+		}
+		if send {
+			s.parallelSend(ctx, keys[start:end])
+		} else {
+			s.parallelGenerate(ctx, keys[start:end])
+		}
+		if next, ok := s.latestRecenter(); ok {
+			return next, true
+		}
+		select {
+		case <-ctx.Done():
+			return recenterReq{}, false
+		default:
+		}
+		start = end
+	}
+	return recenterReq{}, false
+}
+
+func (s *streamer) latestRecenter() (recenterReq, bool) {
+	var latest recenterReq
+	found := false
+	for {
+		select {
+		case latest = <-s.recenter:
+			found = true
+		default:
+			return latest, found
 		}
 	}
 }
@@ -261,8 +308,18 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 		if r.err != nil {
 			// Send failed — the connection is likely closing. Bail out; the
 			// serve loop will tear us down via ctx cancel.
-			s.log.Debug("streamer send failed", "cx", r.cx, "cz", r.cz, "err", r.err)
+			if s.log != nil {
+				s.log.Debug("streamer frame failed", "cx", r.cx, "cz", r.cz, "err", r.err)
+			}
 			return
+		}
+		if s.conn != nil {
+			if err := s.conn.SendFramed(r.frame); err != nil {
+				if s.log != nil {
+					s.log.Debug("streamer send failed", "cx", r.cx, "cz", r.cz, "err", err)
+				}
+				return
+			}
 		}
 		s.loaded[[2]int32{r.cx, r.cz}] = true
 	}
@@ -298,7 +355,7 @@ func (s *streamer) parallelGenerate(ctx context.Context, keys [][2]int32) {
 					return
 				default:
 				}
-				_, _ = s.cache.FrameErr(j.cx, j.cz) // warm the cache; discard the frame
+				_, _ = s.cache.FrameErrContext(ctx, j.cx, j.cz) // warm cache; discard frame
 			}
 		}()
 	}
@@ -320,6 +377,7 @@ type frameJob struct{ cx, cz int32 }
 // frameResult is a generated chunk frame plus any send error.
 type frameResult struct {
 	cx, cz int32
+	frame  []byte
 	err    error
 }
 
@@ -332,7 +390,7 @@ func (s *streamer) generateWorker(ctx context.Context, jobs <-chan frameJob, res
 			return
 		default:
 		}
-		frame, err := s.cache.FrameErr(j.cx, j.cz)
+		frame, err := s.cache.FrameErrContext(ctx, j.cx, j.cz)
 		if err != nil {
 			select {
 			case results <- frameResult{cx: j.cx, cz: j.cz, err: err}:
@@ -340,15 +398,8 @@ func (s *streamer) generateWorker(ctx context.Context, jobs <-chan frameJob, res
 			}
 			return
 		}
-		if err := s.conn.SendFramed(frame); err != nil {
-			select {
-			case results <- frameResult{cx: j.cx, cz: j.cz, err: err}:
-			case <-ctx.Done():
-			}
-			return
-		}
 		select {
-		case results <- frameResult{cx: j.cx, cz: j.cz}:
+		case results <- frameResult{cx: j.cx, cz: j.cz, frame: frame}:
 		case <-ctx.Done():
 			return
 		}

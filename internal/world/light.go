@@ -331,6 +331,7 @@ func (c *Chunk) installLight(v *lightVolume) bool {
 	c.skyLight = sky
 	c.blockLight = block
 	c.lightReady = true
+	c.lightValidated = true
 	return changed
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"time"
 
@@ -38,11 +39,16 @@ type Cache struct {
 	store     *Store // nil = in-memory only (tests, flat worlds)
 	maxChunks int    // LRU capacity; 0 = unbounded
 
-	mu      sync.Mutex
-	lightMu sync.Mutex
-	chunks  map[[2]int32]*Chunk
-	frames  map[[2]int32][]byte
-	dirty   map[[2]int32]uint64
+	mu       sync.Mutex
+	lightMu  sync.Mutex
+	chunks   map[[2]int32]*Chunk
+	frames   map[[2]int32][]byte
+	dirty    map[[2]int32]uint64
+	tickets  map[[2]int32]int
+	inflight map[[2]int32]int
+	// frameSlots bounds expensive load/light/encode work across all players.
+	// Streamers may have their own workers, but they share this admission gate.
+	frameSlots chan struct{}
 	// LRU bookkeeping: order is MRU(front)→LRU(back); index gives O(1) lookup.
 	order *list.List // elements are *[2]int32; nil when maxChunks==0
 	index map[[2]int32]*list.Element
@@ -61,13 +67,23 @@ type chunkLoad struct {
 // threshold using gen to produce missing chunks. It has no persistence and no
 // eviction limit (unbounded; for tests/flat worlds).
 func NewCache(threshold int32, gen Generator) *Cache {
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 2 {
+		workers = 2
+	}
 	c := &Cache{
-		threshold: threshold,
-		gen:       gen,
-		chunks:    make(map[[2]int32]*Chunk),
-		frames:    make(map[[2]int32][]byte),
-		dirty:     make(map[[2]int32]uint64),
-		loads:     make(map[[2]int32]*chunkLoad),
+		threshold:  threshold,
+		gen:        gen,
+		chunks:     make(map[[2]int32]*Chunk),
+		frames:     make(map[[2]int32][]byte),
+		dirty:      make(map[[2]int32]uint64),
+		tickets:    make(map[[2]int32]int),
+		inflight:   make(map[[2]int32]int),
+		loads:      make(map[[2]int32]*chunkLoad),
+		frameSlots: make(chan struct{}, workers),
 	}
 	return c
 }
@@ -124,6 +140,11 @@ func (c *Cache) evictIfNeeded() {
 			return
 		}
 		key := *back.Value.(*[2]int32)
+		if c.tickets[key] > 0 || c.inflight[key] > 0 {
+			c.order.MoveToFront(back)
+			checked++
+			continue
+		}
 		// Never drop a dirty chunk: it has unsaved edits. Bump it to MRU and
 		// stop evicting this cycle; the autosave flush will clear it and the
 		// next eviction pass can reclaim it.
@@ -209,6 +230,25 @@ func (c *Cache) Frame(cx, cz int32) []byte {
 // FrameErr returns a framed chunk packet while preserving storage failures.
 // Callers serving clients should prefer it to Frame so corruption is observable.
 func (c *Cache) FrameErr(cx, cz int32) ([]byte, error) {
+	return c.FrameErrContext(context.Background(), cx, cz)
+}
+
+// FrameErrContext is FrameErr with cancellable admission to the shared frame
+// worker budget. Cancellation prevents obsolete streamer jobs from starting;
+// an operation already admitted completes so cache state is never half-built.
+func (c *Cache) FrameErrContext(ctx context.Context, cx, cz int32) ([]byte, error) {
+	select {
+	case c.frameSlots <- struct{}{}:
+		defer func() { <-c.frameSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	release := c.beginUse([2]int32{cx, cz})
+	defer release()
+	return c.frameErr(cx, cz)
+}
+
+func (c *Cache) frameErr(cx, cz int32) ([]byte, error) {
 	key := [2]int32{cx, cz}
 
 	for {
@@ -258,6 +298,8 @@ func (c *Cache) GetBlock(x, y, z int) uint16 {
 	}
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
+	release := c.beginUse([2]int32{cx, cz})
+	defer release()
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return StateAir
@@ -267,6 +309,8 @@ func (c *Cache) GetBlock(x, y, z int) uint16 {
 
 // LightUpdate returns the standalone light_update body for a loaded chunk.
 func (c *Cache) LightUpdate(cx, cz int32) ([]byte, error) {
+	release := c.beginUse([2]int32{cx, cz})
+	defer release()
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return nil, err
@@ -298,6 +342,8 @@ func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) 
 	}
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
+	release := c.beginUse([2]int32{cx, cz})
+	defer release()
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return false, nil
@@ -321,6 +367,7 @@ func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) 
 		// its light from the authoritative blocks.
 		ch.mu.Lock()
 		ch.lightReady = false
+		ch.lightValidated = false
 		ch.mu.Unlock()
 		lightChanged = []ChunkPos{{X: cx, Z: cz}}
 	}

@@ -185,6 +185,85 @@ func TestStoreLightRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCacheReconcilesPersistedLightWithLoadedNeighbor(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	glowstone := nameToStateID("minecraft:glowstone", nil)
+	left := NewChunk(0, 0, BiomePlains)
+	left.SetBlock(15, 100, 8, glowstone)
+	if err := store.SaveChunk(left); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a chunk saved before its unloaded neighbor gained a light source.
+	right := NewChunk(1, 0, BiomePlains)
+	right.lightReady = true
+	if err := store.SaveChunk(right); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cache := NewCacheWithLimit(-1, func(cx, cz int32) *Chunk {
+		return NewChunk(cx, cz, BiomePlains)
+	}, store, 1)
+	tickets := cache.NewTicketSet()
+	tickets.Replace([]ChunkPos{{X: 1, Z: 0}}, nil)
+	loaded, err := cache.chunkAtErr(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, block, ready := loaded.LightAt(0, 100, 8); !ready || block != 0 {
+		t.Fatalf("persisted pre-reconcile light = %d ready=%v, want stale zero", block, ready)
+	}
+	if _, err := cache.FrameErr(1, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, block, ready := loaded.LightAt(0, 100, 8); !ready || block != 14 {
+		t.Fatalf("reconciled border light = %d ready=%v, want 14", block, ready)
+	}
+	if err := cache.SaveAll(); err != nil {
+		t.Fatal(err)
+	}
+	tickets.Close()
+	if _, err := cache.FrameErr(10, 0); err != nil {
+		t.Fatal(err)
+	}
+	if hasChunk(cache, 1, 0) {
+		t.Fatal("released light chunk remained resident after LRU replacement")
+	}
+	reloadedAfterEviction, err := cache.chunkAtErr(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, block, ready := reloadedAfterEviction.LightAt(0, 100, 8); !ready || block != 14 {
+		t.Fatalf("light after ticket unload/reload = %d ready=%v, want 14", block, ready)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	reloaded, err := store.LoadChunk(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, block, ready := reloaded.LightAt(0, 100, 8); !ready || block != 14 {
+		t.Fatalf("persisted reconciled light = %d ready=%v, want 14", block, ready)
+	}
+}
+
 // TestStoreSaveLoadIntegration is the end-to-end "world survives restart" test:
 // generate a chunk via a store-backed cache, edit a block, SaveAll, then open a
 // fresh cache over the same store and confirm the edit is present.

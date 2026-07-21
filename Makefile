@@ -5,6 +5,6 @@ test:
 
 test-race:
 	go test -race ./internal/network ./internal/server ./internal/world \
-		-run 'Test(Integration|BoundaryEdit|PlayerInfo|PlayerRegistry|Concurrent|Incremental|EncodeLight|Cache|Store|Eviction|Region)'
+		-run 'Test(Integration|BoundaryEdit|PlayerInfo|PlayerRegistry|Concurrent|Incremental|EncodeLight|Cache|Store|Eviction|Region|Ticket|Streamer|LoadSixteen)'
 
 verify: test test-race

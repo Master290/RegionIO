@@ -77,7 +77,10 @@ type Chunk struct {
 	skyLight   [SectionCount]*[2048]byte
 	blockLight [SectionCount]*[2048]byte
 	lightReady bool
-	biome      uint16 // fallback uniform biome when biomes[si] is nil
+	// lightValidated is runtime-only. Persisted arrays are ready to read but are
+	// reconciled with current neighbor blocks once after entering a live cache.
+	lightValidated bool
+	biome          uint16 // fallback uniform biome when biomes[si] is nil
 }
 
 // NewChunk returns an empty (all-air) chunk at (x, z) with the given biome.
@@ -140,6 +143,7 @@ func (c *Chunk) SetBlock(lx, y, lz int, state uint16) {
 	if changed {
 		c.mu.Lock()
 		c.lightReady = false
+		c.lightValidated = false
 		c.mu.Unlock()
 	}
 }
@@ -243,6 +247,7 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 		}
 	}
 	clone.lightReady = c.lightReady
+	clone.lightValidated = c.lightValidated
 	return clone, revision
 }
 

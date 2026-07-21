@@ -13,8 +13,8 @@ block editing, persistent worlds, and an overworld generator built on the real
 - **Registries**: 28 synchronized registries + tags, captured verbatim from the
   26.1.2 vanilla server and sent during configuration.
 - **World**: revisioned, concurrency-safe chunk snapshots; memoized
-  `level_chunk_with_light` frames; bounded LRU cache; Anvil `.mca` persistence
-  with autosave and seed metadata.
+  `level_chunk_with_light` frames; ticket-aware bounded LRU cache; shared frame
+  admission limit; Anvil `.mca` persistence with autosave and seed metadata.
 - **Generation**: vanilla-derived overworld terrain from the embedded datapack
   (`ImprovedNoise`/`PerlinNoise`/`BlendedNoise`/`NormalNoise` + the density
   function interpreter), 3D multi-noise biomes, surface-rule interpretation,
@@ -24,7 +24,11 @@ block editing, persistent worlds, and an overworld generator built on the real
   creative block place/break; broadcast chat; and hotbar item→block mapping.
 - **Lighting**: stored vanilla nibble arrays for sky and block light; horizontal
   and cross-chunk propagation; incremental updates after edits; persisted
-  `SkyLight`/`BlockLight`; and chunk-scoped `light_update` broadcasts.
+  `SkyLight`/`BlockLight`; load-time border reconciliation; and chunk-scoped
+  `light_update` broadcasts.
+- **Chunk lifecycle**: per-client view and prefetch tickets, strict near-first
+  ring streaming, stale-recenter cutoff, explicit client unload packets, and
+  eviction only after the final owner releases a chunk.
 - **Safety**: duplicate chunk generation is coalesced; corrupt stored chunks are
   not silently regenerated or overwritten; a world cannot reopen with another
   seed.
@@ -45,7 +49,7 @@ Changing the seed for an existing world directory is rejected.
 ```
 go test ./...
 go test -race ./internal/network ./internal/server ./internal/world \
-  -run 'Test(Integration|BoundaryEdit|PlayerInfo|PlayerRegistry|Concurrent|Incremental|EncodeLight|Cache|Store|Eviction|Region)'
+  -run 'Test(Integration|BoundaryEdit|PlayerInfo|PlayerRegistry|Concurrent|Incremental|EncodeLight|Cache|Store|Eviction|Region|Ticket|Streamer|LoadSixteen)'
 # or run both gates:
 make verify
 ```
@@ -54,23 +58,27 @@ The integration suite exercises four clients across two visibility regions:
 join, movement, leaving, mob visibility, and local block/light updates. A
 two-client scenario separately covers shared block edits and chat. Concurrency
 tests cover simultaneous frame encoding, editing, autosave, cache misses, and
-session movement/broadcasts. Lighting tests compare the initial flat chunk and a
-31x31x31 glowstone propagation volume against fixtures captured from the
-official vanilla 26.1.2 server. Optional terrain parity diagnostics compare
-surface heights against `/tmp/vanilla_ground.json` when that capture is present.
+session movement/broadcasts. A 16-client lifecycle test exercises overlapping
+ticket ownership, bounded global frame work, packet output, and cleanup after
+disconnect. Lighting tests compare the initial flat chunk and a 31x31x31
+glowstone propagation volume against fixtures captured from the official
+vanilla 26.1.2 server. Optional terrain parity diagnostics compare surface
+heights against `/tmp/vanilla_ground.json` when that capture is present.
 
-## v0.3 scope
+## v0.4 scope
 
-RegionIO v0.3 is a small creative multiplayer server core, not a complete
+RegionIO v0.4 is a small creative multiplayer server core, not a complete
 vanilla gameplay implementation. Player and mob visibility is chunk-scoped,
 but there is no interest prioritization or delta-movement compression yet.
 Lighting matches vanilla's block-state dampening, emission, and face-occlusion
-properties and propagates across loaded chunk boundaries. Chunks outside the
-live cache are recalculated exactly when loaded rather than retained as active
-light-engine state. Structures, placed features, mob AI, authentication,
-inventory, and survival mechanics remain intentionally partial. The density
-router is vanilla-derived, while biome/surface/decoration layers still contain
-approximations and require stricter parity fixtures.
+properties and reconciles persisted borders when chunks re-enter the live
+cache. Streaming prioritizes Chebyshev rings and abandons unstarted stale work;
+an already admitted frame calculation completes atomically rather than being
+interrupted halfway. Unowned clean chunks remain as an LRU warm cache until
+capacity pressure evicts them. Structures, placed features, mob AI,
+authentication, inventory, and survival mechanics remain intentionally partial.
+The density router is vanilla-derived, while biome/surface/decoration layers
+still contain approximations and require stricter parity fixtures.
 
 ## Project layout
 
