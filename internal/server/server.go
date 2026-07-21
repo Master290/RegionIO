@@ -32,6 +32,10 @@ type Config struct {
 	// MaxCachedChunks bounds the in-memory chunk+frame cache (LRU). 0 means
 	// unbounded (use only for tests/flat worlds). At ~200KiB/chunk, 1024 ≈ 200MB.
 	MaxCachedChunks int
+	// MaxViewDistance caps the client-requested chunk radius. Generation is much
+	// more expensive than vanilla's pregenerated worlds, so the server owns the
+	// upper bound instead of accepting the client's render distance verbatim.
+	MaxViewDistance int
 }
 
 // DefaultConfig returns sensible defaults matching vanilla expectations.
@@ -51,6 +55,7 @@ func DefaultConfig() Config {
 		// MaxCachedChunks keeps the live cache near 200MB at the default; the
 		// streamer's pre-gen ring and player view distance comfortably fit.
 		MaxCachedChunks: 1024,
+		MaxViewDistance: 2,
 	}
 }
 
@@ -142,6 +147,9 @@ func validateConfig(cfg Config) error {
 	}
 	if cfg.MaxCachedChunks < 0 {
 		return fmt.Errorf("server: max cached chunks must not be negative")
+	}
+	if cfg.MaxViewDistance < 2 || cfg.MaxViewDistance > 16 {
+		return fmt.Errorf("server: max view distance must be between 2 and 16")
 	}
 	return nil
 }

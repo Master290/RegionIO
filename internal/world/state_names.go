@@ -3,6 +3,7 @@ package world
 import (
 	_ "embed"
 	"encoding/json"
+	"strings"
 	"sync"
 
 	"regionio/internal/nbt"
@@ -37,6 +38,41 @@ func stateByID(id uint16) (stateName, bool) {
 	stateByIDOnce.Do(buildStateTable)
 	s, ok := stateByIDImpl[id]
 	return s, ok
+}
+
+// supportsEntitySpawn distinguishes collision floors from decorative blocks.
+// Light opacity is not sufficient here: stairs and slabs can have opacity zero
+// while still supporting an entity.
+func supportsEntitySpawn(id uint16) bool {
+	if id == StateAir || id == StateWater {
+		return false
+	}
+	if lightOpacity(id) > 0 {
+		return true
+	}
+	state, ok := stateByID(id)
+	if !ok {
+		return false
+	}
+	name := state.Name
+	for _, suffix := range []string{
+		"_sapling", "_flower", "_tulip", "_mushroom", "_torch",
+		"_rail", "_button", "_pressure_plate", "_carpet", "_banner",
+		"_sign", "_hanging_sign",
+	} {
+		if strings.HasSuffix(name, suffix) {
+			return false
+		}
+	}
+	switch name {
+	case "minecraft:short_grass", "minecraft:tall_grass", "minecraft:fern",
+		"minecraft:large_fern", "minecraft:dead_bush", "minecraft:dandelion",
+		"minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet",
+		"minecraft:oxeye_daisy", "minecraft:cornflower",
+		"minecraft:lily_of_the_valley", "minecraft:sunflower":
+		return false
+	}
+	return true
 }
 
 func buildStateTable() {

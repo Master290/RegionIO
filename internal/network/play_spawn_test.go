@@ -1,14 +1,17 @@
 package network
 
 import (
+	"log/slog"
 	"testing"
 
 	"regionio/internal/protocol"
+	"regionio/internal/server"
+	"regionio/internal/world"
 )
 
 func TestSendDefaultSpawnPositionLayout(t *testing.T) {
 	recorder := &recordingConn{}
-	h := &handler{conn: NewConn(recorder)}
+	h := &handler{conn: NewConn(recorder), spawnY: 100}
 
 	if err := h.sendDefaultSpawnPosition(); err != nil {
 		t.Fatal(err)
@@ -36,5 +39,19 @@ func TestSendDefaultSpawnPositionLayout(t *testing.T) {
 	}
 	if remaining := r.Remaining(); remaining != 0 {
 		t.Fatalf("remaining bytes = %d, want 0", remaining)
+	}
+}
+
+func TestVisibilityRadiusUsesServerLimit(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	cfg.MaxViewDistance = 2
+	srv, err := server.NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &handler{srv: srv, log: slog.Default(), viewDistance: 16}
+	if got := h.visibilityRadius(); got != 2 {
+		t.Fatalf("visibility radius = %d, want server limit 2", got)
 	}
 }

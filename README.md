@@ -37,12 +37,15 @@ block editing, persistent worlds, and an overworld generator built on the real
 
 ```
 go build ./...
-go run ./cmd/regionio -seed 12345
+go run ./cmd/regionio -seed 12345 -port 25565 -viewdistance 2
 ```
 
 The world seed defaults to `0`; override it with the `-seed` flag or the
 `REGIONIO_SEED` environment variable. The server listens on `0.0.0.0:25565`.
-Changing the seed for an existing world directory is rejected.
+Changing the seed for an existing world directory is rejected. The server caps
+the client-requested chunk radius at `2` by default because cold density-based
+generation is expensive; raise it with `-viewdistance 3` after the surrounding
+world has been generated and cached.
 
 ## Testing
 

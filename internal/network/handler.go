@@ -31,6 +31,7 @@ type handler struct {
 	session       *server.PlayerSession
 	knownPlayers  map[[16]byte]bool
 	knownEntities map[int32]visibleEntity
+	spawnY        float64
 
 	// Creative inventory state for block placement.
 	heldSlot int32    // selected hotbar index (0-8)

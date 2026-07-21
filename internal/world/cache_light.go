@@ -10,8 +10,8 @@ import (
 // neighborhood. Light attenuates to zero within 15 blocks, so chunks outside
 // that neighborhood cannot affect the center chunk.
 func (c *Cache) ensureLight(chunk *Chunk) error {
-	c.lightMu.Lock()
-	defer c.lightMu.Unlock()
+	c.lightMu.RLock()
+	defer c.lightMu.RUnlock()
 	return c.ensureLightLocked(chunk)
 }
 
@@ -65,44 +65,57 @@ func (c *Cache) ensureLightLocked(chunk *Chunk) error {
 	}
 }
 
-// lightInputSnapshot returns blocks for a neighboring chunk without inserting
-// a cache miss into the LRU. This keeps lighting correct even for very small
-// cache limits and avoids an eight-chunk eviction cascade per frame.
+// lightInputSnapshot returns a stable neighbor snapshot. Cache misses are kept
+// in the LRU so adjacent frames reuse the same expensive terrain instead of
+// regenerating up to eight neighbors for every lighting calculation.
 func (c *Cache) lightInputSnapshot(cx, cz int32) (*Chunk, error) {
 	key := [2]int32{cx, cz}
-	c.mu.Lock()
-	if chunk := c.chunks[key]; chunk != nil {
-		c.touch(key)
-		c.mu.Unlock()
-		snapshot, _ := chunk.snapshot()
-		return snapshot, nil
-	}
-	if pending := c.loads[key]; pending != nil {
-		c.mu.Unlock()
-		<-pending.done
-		if pending.err != nil {
-			return nil, pending.err
-		}
-		snapshot, _ := pending.ch.snapshot()
-		return snapshot, nil
-	}
-	c.mu.Unlock()
-
-	if c.store != nil {
-		loaded, err := c.store.LoadChunk(cx, cz)
-		if err == nil {
-			snapshot, _ := loaded.snapshot()
+	// A cache smaller than the required 3x3 neighborhood cannot retain these
+	// inputs usefully. Keep misses detached to avoid evicting the requested
+	// center chunk and churning the LRU on every frame.
+	if c.maxChunks > 0 && c.maxChunks < 9 {
+		c.mu.Lock()
+		if chunk := c.chunks[key]; chunk != nil {
+			c.touch(key)
+			c.mu.Unlock()
+			snapshot, _ := chunk.snapshot()
 			return snapshot, nil
 		}
-		if !errors.Is(err, ErrChunkNotFound) {
-			return nil, fmt.Errorf("world: load light neighbor (%d,%d): %w", cx, cz, err)
+		if pending := c.loads[key]; pending != nil {
+			c.mu.Unlock()
+			<-pending.done
+			if pending.err != nil {
+				return nil, pending.err
+			}
+			snapshot, _ := pending.ch.snapshot()
+			return snapshot, nil
 		}
+		c.mu.Unlock()
+		if c.store != nil {
+			loaded, err := c.store.LoadChunk(cx, cz)
+			if err == nil {
+				snapshot, _ := loaded.snapshot()
+				return snapshot, nil
+			}
+			if !errors.Is(err, ErrChunkNotFound) {
+				return nil, fmt.Errorf("world: load light neighbor (%d,%d): %w", cx, cz, err)
+			}
+		}
+		generated := c.gen(cx, cz)
+		if generated == nil {
+			return nil, fmt.Errorf("world: generator returned nil light neighbor (%d,%d)", cx, cz)
+		}
+		snapshot, _ := generated.snapshot()
+		return snapshot, nil
 	}
-	generated := c.gen(cx, cz)
-	if generated == nil {
-		return nil, fmt.Errorf("world: generator returned nil light neighbor (%d,%d)", cx, cz)
+
+	release := c.beginUse(key)
+	defer release()
+	chunk, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return nil, fmt.Errorf("world: load light neighbor (%d,%d): %w", cx, cz, err)
 	}
-	snapshot, _ := generated.snapshot()
+	snapshot, _ := chunk.snapshot()
 	return snapshot, nil
 }
 

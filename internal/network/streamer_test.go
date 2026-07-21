@@ -69,6 +69,28 @@ func TestSpiralOrderRingStructure(t *testing.T) {
 	}
 }
 
+func TestSpiralOrderWalksEachRingContiguously(t *testing.T) {
+	order := spiralOrder(0, 0, 4)
+	for i := 1; i < len(order); i++ {
+		previousRing := chunkDistanceFrom(0, 0, order[i-1])
+		currentRing := chunkDistanceFrom(0, 0, order[i])
+		if previousRing != currentRing {
+			continue
+		}
+		dx := order[i][0] - order[i-1][0]
+		if dx < 0 {
+			dx = -dx
+		}
+		dz := order[i][1] - order[i-1][1]
+		if dz < 0 {
+			dz = -dz
+		}
+		if dx+dz != 1 {
+			t.Fatalf("ring %d jumps from %v to %v", currentRing, order[i-1], order[i])
+		}
+	}
+}
+
 // TestRequestRecenterNonBlocking confirms requestRecenter never blocks the
 // caller even when many requests are pushed rapidly (the streamer drains stale
 // ones). This is the property the read loop relies on to stay responsive.
@@ -104,6 +126,7 @@ func TestStreamerSendsStrictlyNearFirst(t *testing.T) {
 
 	lastDistance := int32(-1)
 	chunks := 0
+	wantOrder := spiralOrder(7, -3, 2)
 	for _, packet := range recorder.take(t) {
 		if packet.ID != protocol.PlayLevelChunk {
 			continue
@@ -122,6 +145,9 @@ func TestStreamerSendsStrictlyNearFirst(t *testing.T) {
 			t.Fatalf("chunk (%d,%d) at distance %d arrived after distance %d", x, z, distance, lastDistance)
 		}
 		lastDistance = distance
+		if want := wantOrder[chunks]; x != want[0] || z != want[1] {
+			t.Fatalf("chunk[%d] = (%d,%d), want %v", chunks, x, z, want)
+		}
 		chunks++
 	}
 	if chunks != 25 {

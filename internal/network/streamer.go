@@ -48,8 +48,9 @@ type streamer struct {
 }
 
 // defaultViewRadius is used when the client hasn't sent client_information or
-// sent an implausible value. Matches the legacy chunkRadius.
-const defaultViewRadius = 4
+// sent an implausible value. Vanilla generation is expensive, so keep the cold
+// start bounded until nearby terrain has warmed in the cache.
+const defaultViewRadius = 2
 
 // newStreamer constructs a streamer for the given cache/conn. viewDistance comes
 // from the client's client_information (clamped to a safe range); genRadius is
@@ -161,6 +162,13 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterR
 		s.tickets.Replace(viewTickets, prefetchTickets)
 	}
 
+	// The center frame needs a 3x3 terrain neighborhood for lighting. Preload
+	// those chunks concurrently so the first visible chunk is not delayed by
+	// eight sequential generator calls inside the lighting pass.
+	if !s.loaded[[2]int32{cx, cz}] {
+		s.parallelPreload(ctx, spiralOrder(cx, cz, 1))
+	}
+
 	// Client residency follows viewRadius exactly. The prefetch ring is retained
 	// only server-side by tickets and never left loaded on the client.
 	for key := range s.loaded {
@@ -175,7 +183,8 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterR
 	if next, superseded := s.streamPriority(ctx, cx, cz, toSend, true); superseded {
 		return next, true
 	}
-	// Pre-generate the ring so the next recenter finds frames warm in the cache.
+	// Preload terrain only. Building full frames here would calculate lighting
+	// for off-screen chunks and recursively generate yet another outer ring.
 	if next, superseded := s.streamPriority(ctx, cx, cz, toPreGen, false); superseded {
 		return next, true
 	}
@@ -207,7 +216,7 @@ func (s *streamer) streamPriority(ctx context.Context, cx, cz int32, keys [][2]i
 		if send {
 			s.parallelSend(ctx, keys[start:end])
 		} else {
-			s.parallelGenerate(ctx, keys[start:end])
+			s.parallelPreload(ctx, keys[start:end])
 		}
 		if next, ok := s.latestRecenter(); ok {
 			return next, true
@@ -255,8 +264,8 @@ func (s *streamer) sendForgetLevelChunk(cx, cz int32) {
 	_ = s.conn.SendWriter(protocol.PlayForgetLevelChunk, w)
 }
 
-// parallelSend generates the given chunks across the worker pool and sends each
-// frame as soon as it is ready (order is best-effort; the client reassembles).
+// parallelSend generates the given chunks across the worker pool, then sends
+// them in caller order so the client receives a contiguous near-first view.
 // Already-loaded chunks are skipped. Returns when all are sent or ctx cancels.
 func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 	var pending []frameJob
@@ -304,13 +313,26 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 		wg.Wait()
 		close(results)
 	}()
+	generated := make(map[[2]int32]frameResult, len(pending))
+	failed := false
 	for r := range results {
 		if r.err != nil {
-			// Send failed — the connection is likely closing. Bail out; the
-			// serve loop will tear us down via ctx cancel.
 			if s.log != nil {
 				s.log.Debug("streamer frame failed", "cx", r.cx, "cz", r.cz, "err", r.err)
 			}
+			failed = true
+			continue
+		}
+		generated[[2]int32{r.cx, r.cz}] = r
+	}
+	if failed {
+		return
+	}
+	// Generation completes out of order, but client presentation should not.
+	// Emit the contiguous spiral order supplied by the caller.
+	for _, j := range pending {
+		r, ok := generated[[2]int32{j.cx, j.cz}]
+		if !ok {
 			return
 		}
 		if s.conn != nil {
@@ -321,13 +343,13 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 				return
 			}
 		}
-		s.loaded[[2]int32{r.cx, r.cz}] = true
+		s.loaded[[2]int32{j.cx, j.cz}] = true
 	}
 }
 
-// parallelGenerate warms the cache for the given chunks without sending them
-// (used for the predictive ring). Errors are ignored.
-func (s *streamer) parallelGenerate(ctx context.Context, keys [][2]int32) {
+// parallelPreload warms terrain for the given chunks without calculating light,
+// encoding frames, or sending packets. Errors are ignored.
+func (s *streamer) parallelPreload(ctx context.Context, keys [][2]int32) {
 	var pending []frameJob
 	for _, k := range keys {
 		if s.loaded[k] {
@@ -355,7 +377,7 @@ func (s *streamer) parallelGenerate(ctx context.Context, keys [][2]int32) {
 					return
 				default:
 				}
-				_, _ = s.cache.FrameErrContext(ctx, j.cx, j.cz) // warm cache; discard frame
+				_ = s.cache.PreloadErrContext(ctx, j.cx, j.cz)
 			}
 		}()
 	}
@@ -381,8 +403,8 @@ type frameResult struct {
 	err    error
 }
 
-// generateWorker reads jobs, generates+frames the chunk via the (thread-safe)
-// cache, and sends the frame to the conn. It exits when jobs closes.
+// generateWorker reads jobs and generates+frames chunks via the thread-safe
+// cache. It exits when jobs closes.
 func (s *streamer) generateWorker(ctx context.Context, jobs <-chan frameJob, results chan<- frameResult) {
 	for j := range jobs {
 		select {
@@ -407,9 +429,7 @@ func (s *streamer) generateWorker(ctx context.Context, jobs <-chan frameJob, res
 }
 
 // spiralOrder returns chunk coordinates in a square of side (2*radius+1) around
-// (cx, cz), ordered from the centre outward (Chebyshev rings). The centre is
-// first, then ring 1, ring 2, … ring `radius`. Within a ring the order is
-// deterministic but not otherwise constrained — nearest-first is what matters.
+// (cx, cz), ordered from the centre outward in contiguous Chebyshev rings.
 func spiralOrder(cx, cz int32, radius int) [][2]int32 {
 	if radius < 0 {
 		radius = 0
@@ -417,14 +437,18 @@ func spiralOrder(cx, cz int32, radius int) [][2]int32 {
 	out := make([][2]int32, 0, (2*radius+1)*(2*radius+1))
 	out = append(out, [2]int32{cx, cz})
 	for r := 1; r <= radius; r++ {
-		// Walk the perimeter of the ring at Chebyshev distance r.
-		for d := -r; d <= r; d++ {
-			out = append(out, [2]int32{cx + int32(d), cz - int32(r)}) // top edge
-			out = append(out, [2]int32{cx + int32(d), cz + int32(r)}) // bottom edge
+		// Walk one continuous perimeter: top, right, bottom, left.
+		for x := -r; x <= r; x++ {
+			out = append(out, [2]int32{cx + int32(x), cz - int32(r)})
 		}
-		for d := -r + 1; d <= r-1; d++ {
-			out = append(out, [2]int32{cx - int32(r), cz + int32(d)}) // left edge
-			out = append(out, [2]int32{cx + int32(r), cz + int32(d)}) // right edge
+		for z := -r + 1; z <= r; z++ {
+			out = append(out, [2]int32{cx + int32(r), cz + int32(z)})
+		}
+		for x := r - 1; x >= -r; x-- {
+			out = append(out, [2]int32{cx + int32(x), cz + int32(r)})
+		}
+		for z := r - 1; z >= -r+1; z-- {
+			out = append(out, [2]int32{cx - int32(r), cz + int32(z)})
 		}
 	}
 	return out

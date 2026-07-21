@@ -12,11 +12,10 @@ import (
 	"regionio/internal/world"
 )
 
-// Spawn coordinates. Y sits above the maximum terrain height so the player
-// drops onto the generated surface rather than spawning inside it.
+// Spawn column. The feet-level Y is resolved from the generated surface when
+// the player enters the play phase.
 const (
 	spawnX = 8.5
-	spawnY = 200.0
 	spawnZ = 8.5
 )
 
@@ -29,7 +28,12 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	h.session = session
-	h.srv.SetPlayerTransform(session, spawnX, spawnY, spawnZ, 0, 0, true)
+	spawnY, ok := h.srv.Chunks().SafeSpawnY(int(math.Floor(spawnX)), int(math.Floor(spawnZ)))
+	if !ok {
+		spawnY = world.SeaLevel + 1
+	}
+	h.spawnY = float64(spawnY)
+	h.srv.SetPlayerTransform(session, spawnX, h.spawnY, spawnZ, 0, 0, true)
 	h.srv.SetPlayerViewDistance(session, h.visibilityRadius())
 	for i := range h.hotbar {
 		h.hotbar[i] = -1 // empty
@@ -56,7 +60,7 @@ func (h *handler) beginPlay() error {
 	}
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
-	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.viewDistance)
+	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.visibilityRadius())
 	go h.streamer.run(h.ctx)
 	h.streamer.requestRecenter(0, 0)
 	go h.keepAliveLoop()
@@ -76,7 +80,7 @@ func (h *handler) sendDefaultSpawnPosition() error {
 	// yaw and pitch. GlobalPos starts with the dimension resource key.
 	w := protocol.NewWriter(40)
 	w.String("minecraft:overworld")
-	w.Position(8, 100, 8)
+	w.Position(8, int(math.Floor(h.spawnY)), 8)
 	w.Float32(0.0)
 	w.Float32(0.0)
 	return h.conn.SendWriter(protocol.PlayDefaultSpawnPos, w)
@@ -109,13 +113,14 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 }
 
 func (h *handler) visibilityRadius() int {
-	if h.viewDistance < 2 {
-		return defaultViewRadius
+	distance := h.viewDistance
+	if distance < 2 {
+		distance = defaultViewRadius
 	}
-	if h.viewDistance > 16 {
-		return 16
+	if max := h.srv.Config().MaxViewDistance; distance > max {
+		distance = max
 	}
-	return h.viewDistance
+	return distance
 }
 
 // sendPlayLogin writes the clientbound play "login" packet. Field layout was
@@ -176,11 +181,11 @@ func (h *handler) sendGameEvent(event byte, value float32) error {
 func (h *handler) sendPlayerPosition(teleportID int32) error {
 	w := protocol.NewWriter(64)
 	w.VarInt(teleportID)
-	w.Float64(spawnX).Float64(spawnY).Float64(spawnZ) // position
-	w.Float64(0).Float64(0).Float64(0)                // velocity
-	w.Float32(0)                                      // yaw
-	w.Float32(0)                                      // pitch
-	w.Int32(0)                                        // relative flags
+	w.Float64(spawnX).Float64(h.spawnY).Float64(spawnZ) // position
+	w.Float64(0).Float64(0).Float64(0)                  // velocity
+	w.Float32(0)                                        // yaw
+	w.Float32(0)                                        // pitch
+	w.Int32(0)                                          // relative flags
 	return h.conn.SendWriter(protocol.PlayPlayerPosition, w)
 }
 

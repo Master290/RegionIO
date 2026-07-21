@@ -98,15 +98,15 @@ func (h *handler) handleClientInformation(pkt protocol.Packet) error {
 		return err
 	}
 
-	// view_distance drives the chunk streamer radius. The client sends 2..32;
-	// clamp into a sane server range so a huge view distance doesn't trigger a
-	// generation explosion.
+	// view_distance drives the chunk streamer radius. The server owns the upper
+	// bound because accepting the client's render distance can multiply cold
+	// generation work into hundreds of chunks.
 	vdInt := int(int8(vd))
 	if vdInt < 2 {
 		vdInt = 2
 	}
-	if vdInt > 16 {
-		vdInt = 16
+	if max := h.srv.Config().MaxViewDistance; vdInt > max {
+		vdInt = max
 	}
 	h.viewDistance = vdInt
 

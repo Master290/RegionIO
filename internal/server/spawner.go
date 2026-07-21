@@ -19,6 +19,7 @@ func (s *Server) StartSpawning(ctx context.Context) {
 func (s *Server) entityTickLoop(ctx context.Context) {
 	ticker := time.NewTicker(50 * time.Millisecond) // 20 TPS
 	defer ticker.Stop()
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for {
 		select {
 		case <-ctx.Done():
@@ -55,9 +56,9 @@ func (s *Server) entityTickLoop(ctx context.Context) {
 							}
 						} else {
 							// Random wander
-							e.X += (rand.Float64() - 0.5) * 0.2
-							e.Z += (rand.Float64() - 0.5) * 0.2
-							e.Yaw += float32((rand.Float64() - 0.5) * 10.0)
+							e.X += (rng.Float64() - 0.5) * 0.2
+							e.Z += (rng.Float64() - 0.5) * 0.2
+							e.Yaw += float32((rng.Float64() - 0.5) * 10.0)
 						}
 					}
 
@@ -73,6 +74,7 @@ func (s *Server) entityTickLoop(ctx context.Context) {
 func (s *Server) mobSpawnLoop(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	pigType := registry.EntityTypeIndex("minecraft:pig")
 	zombieType := registry.EntityTypeIndex("minecraft:zombie")
@@ -85,28 +87,41 @@ func (s *Server) mobSpawnLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if s.PlayerCount() == 0 || s.entities.Count() >= 50 {
-				continue // limit to 50 entities
+			if s.PlayerCount() == 0 || s.entities.Count() >= 20 {
+				continue
 			}
-
-			// Spawn near the spawn point (8.5, 200, 8.5)
-			x := (rand.Float64() - 0.5) * 30.0
-			z := (rand.Float64() - 0.5) * 30.0
-
-			t := pigType
-			name := "minecraft:pig"
-			if rand.Float32() < 0.5 {
-				t = zombieType
-				name = "minecraft:zombie"
-			}
-
-			s.entities.Add(&world.Entity{
-				TypeID:   t,
-				TypeName: name,
-				X:        x + 8.5,
-				Y:        200.0,
-				Z:        z + 8.5,
-			})
+			s.spawnMobNearPlayer(rng, pigType, zombieType)
 		}
 	}
+}
+
+func (s *Server) spawnMobNearPlayer(rng *rand.Rand, pigType, zombieType int) bool {
+	players := s.PlayerSnapshots()
+	if len(players) == 0 {
+		return false
+	}
+	player := players[rng.Intn(len(players))]
+	angle := rng.Float64() * 2 * math.Pi
+	distance := 16.0 + rng.Float64()*16.0
+	x := int(math.Floor(player.X + math.Cos(angle)*distance))
+	z := int(math.Floor(player.Z + math.Sin(angle)*distance))
+	y, ok := s.chunks.SafeSpawnY(x, z)
+	if !ok {
+		return false
+	}
+
+	typeID := pigType
+	typeName := "minecraft:pig"
+	if rng.Float32() < 0.5 {
+		typeID = zombieType
+		typeName = "minecraft:zombie"
+	}
+	s.entities.Add(&world.Entity{
+		TypeID:   typeID,
+		TypeName: typeName,
+		X:        float64(x) + 0.5,
+		Y:        float64(y),
+		Z:        float64(z) + 0.5,
+	})
+	return true
 }

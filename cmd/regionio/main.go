@@ -27,13 +27,18 @@ func main() {
 	// fatal — a wrong seed silently generates a different world than intended.
 	seedFlag := flag.Int64("seed", parseSeedEnv(os.Getenv("REGIONIO_SEED"), cfg.WorldSeed, log),
 		"world seed (overrides REGIONIO_SEED)")
+	port := flag.Int("port", cfg.Port, "TCP listen port")
 	worldDir := flag.String("world", cfg.WorldDir, "world directory (empty = in-memory only)")
 	maxCache := flag.Int("maxcache", cfg.MaxCachedChunks, "max cached chunks, LRU eviction (0 = unbounded)")
+	viewDistance := flag.Int("viewdistance", cfg.MaxViewDistance, "maximum client chunk view radius (2-16)")
 	flag.Parse()
 	cfg.WorldSeed = *seedFlag
+	cfg.Port = *port
 	cfg.WorldDir = *worldDir
 	cfg.MaxCachedChunks = *maxCache
-	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir, "maxcache", cfg.MaxCachedChunks)
+	cfg.MaxViewDistance = *viewDistance
+	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir,
+		"maxcache", cfg.MaxCachedChunks, "viewdistance", cfg.MaxViewDistance)
 
 	srv, err := server.New(cfg)
 	if err != nil {

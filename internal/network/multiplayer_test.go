@@ -150,11 +150,13 @@ func TestBoundaryEditBroadcastsEveryChangedLightChunk(t *testing.T) {
 	srv.SetPlayerViewDistance(h.session, 2)
 
 	valid, lightChunks := cache.SetBlockWithLight(15, 100, 8, world.StateGlowstone)
-	if !valid || len(lightChunks) != 2 {
-		t.Fatalf("boundary edit valid=%v light chunks=%v; want two", valid, lightChunks)
+	if !valid || len(lightChunks) != 6 {
+		t.Fatalf("boundary edit valid=%v light chunks=%v; want six cached neighbors", valid, lightChunks)
 	}
 	h.broadcastBlockUpdate(15, 100, 8, world.StateGlowstone, lightChunks)
-	assertPacketIDs(t, recorder.take(t), protocol.PlayBlockUpdate, protocol.PlayLightUpdate, protocol.PlayLightUpdate)
+	assertPacketIDs(t, recorder.take(t), protocol.PlayBlockUpdate,
+		protocol.PlayLightUpdate, protocol.PlayLightUpdate, protocol.PlayLightUpdate,
+		protocol.PlayLightUpdate, protocol.PlayLightUpdate, protocol.PlayLightUpdate)
 }
 
 func TestIntegrationFourClientsVisibilityMovementLeaveAndLight(t *testing.T) {

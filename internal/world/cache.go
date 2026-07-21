@@ -40,7 +40,7 @@ type Cache struct {
 	maxChunks int    // LRU capacity; 0 = unbounded
 
 	mu       sync.Mutex
-	lightMu  sync.Mutex
+	lightMu  sync.RWMutex
 	chunks   map[[2]int32]*Chunk
 	frames   map[[2]int32][]byte
 	dirty    map[[2]int32]uint64
@@ -248,6 +248,22 @@ func (c *Cache) FrameErrContext(ctx context.Context, cx, cz int32) ([]byte, erro
 	return c.frameErr(cx, cz)
 }
 
+// PreloadErrContext loads or generates a chunk without calculating lighting or
+// encoding a network frame. Streamers use it for predictive terrain work so a
+// prefetch ring does not recursively expand through lighting neighborhoods.
+func (c *Cache) PreloadErrContext(ctx context.Context, cx, cz int32) error {
+	select {
+	case c.frameSlots <- struct{}{}:
+		defer func() { <-c.frameSlots }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	release := c.beginUse([2]int32{cx, cz})
+	defer release()
+	_, err := c.chunkAtErr(cx, cz)
+	return err
+}
+
 func (c *Cache) frameErr(cx, cz int32) ([]byte, error) {
 	key := [2]int32{cx, cz}
 
@@ -305,6 +321,33 @@ func (c *Cache) GetBlock(x, y, z int) uint16 {
 		return StateAir
 	}
 	return ch.GetBlock(x, y, z)
+}
+
+// SafeSpawnY returns a feet-level Y with a supporting floor and two air blocks
+// above it. Water columns and decorative plants are skipped rather than
+// spawning an entity inside them. Loading happens once for the whole column.
+func (c *Cache) SafeSpawnY(x, z int) (int, bool) {
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	release := c.beginUse([2]int32{cx, cz})
+	defer release()
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return 0, false
+	}
+
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	for y := MinY + WorldHeight - 3; y >= MinY; y-- {
+		floor := ch.getBlock(x, y, z)
+		if !supportsEntitySpawn(floor) {
+			continue
+		}
+		if ch.getBlock(x, y+1, z) == StateAir && ch.getBlock(x, y+2, z) == StateAir {
+			return y + 1, true
+		}
+	}
+	return 0, false
 }
 
 // LightUpdate returns the standalone light_update body for a loaded chunk.
