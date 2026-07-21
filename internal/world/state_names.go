@@ -23,8 +23,9 @@ type stateName struct {
 }
 
 var (
-	stateByIDOnce   sync.Once
-	stateByIDImpl   map[uint16]stateName
+	stateByIDOnce sync.Once
+	stateByIDImpl map[uint16]stateName
+	idsByName     map[string][]uint16
 )
 
 // stateByID returns the named form of a block-state ID, building the lookup
@@ -49,12 +50,15 @@ func buildStateTable() {
 		panic("world: parsing embedded blocks.json: " + err.Error())
 	}
 	stateByIDImpl = make(map[uint16]stateName, 30000)
+	idsByName = make(map[string][]uint16, len(blocks))
 	for name, b := range blocks {
 		for _, s := range b.States {
 			if s.ID < 0 || s.ID > 65535 {
 				continue
 			}
-			stateByIDImpl[uint16(s.ID)] = stateName{Name: name, Properties: s.Properties}
+			id := uint16(s.ID)
+			stateByIDImpl[id] = stateName{Name: name, Properties: s.Properties}
+			idsByName[name] = append(idsByName[name], id)
 		}
 	}
 }
@@ -89,19 +93,14 @@ type paletteEntryKey struct {
 // Chunk. Unknown names/properties map to air (0).
 func nameToStateID(name string, props map[string]string) uint16 {
 	stateByIDOnce.Do(buildStateTable)
-	for id, s := range stateByIDImpl {
-		if s.Name != name {
-			continue
-		}
-		if propsMatch(s.Properties, props) {
+	ids := idsByName[name]
+	for _, id := range ids {
+		if propsMatch(stateByIDImpl[id].Properties, props) {
 			return id
 		}
 	}
-	// Fall back to any state of that block if properties don't match exactly.
-	for id, s := range stateByIDImpl {
-		if s.Name == name {
-			return id
-		}
+	if len(ids) > 0 {
+		return ids[0]
 	}
 	return StateAir
 }

@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"net"
 	"sync"
+	"time"
 
 	"regionio/internal/protocol"
 	"regionio/internal/server"
@@ -56,7 +57,12 @@ func (c *Conn) RemoteAddr() net.Addr { return c.raw.RemoteAddr() }
 
 // ReadPacket reads the next frame using the current compression settings.
 func (c *Conn) ReadPacket() (protocol.Packet, error) {
-	return protocol.ReadPacket(c.br, c.compressionThreshold)
+	if err := c.raw.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		return protocol.Packet{}, err
+	}
+	pkt, err := protocol.ReadPacket(c.br, c.compressionThreshold)
+	_ = c.raw.SetReadDeadline(time.Time{})
+	return pkt, err
 }
 
 // Send writes a packet with the given ID and pre-encoded body. Safe for

@@ -7,14 +7,6 @@ import (
 	"regionio/internal/registry"
 )
 
-// ClientSettings holds the subset of client_information we currently track.
-type ClientSettings struct {
-	Locale       string
-	ViewDistance int8
-	ChatMode     int32
-	MainHand     int32
-}
-
 // beginConfiguration is called on entering the configuration phase. It mirrors
 // the vanilla opening sequence: server brand, enabled feature flags, then the
 // known-packs negotiation. The client's known-packs reply triggers the registry

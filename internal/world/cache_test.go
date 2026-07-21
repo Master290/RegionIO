@@ -1,7 +1,13 @@
 package world
 
 import (
+	"bytes"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"regionio/internal/protocol"
 )
 
 // flatGen returns a generator that produces distinct chunks keyed by coordinate,
@@ -171,5 +177,74 @@ func TestEvictionReloadPreservesEdits(t *testing.T) {
 	ch := c.chunkAt(9, 9)
 	if got := ch.GetBlock(9*16+0, SeaLevel, 9*16+0); got != StateBedrock {
 		t.Errorf("after eviction+reload, edited block = %d, want bedrock %d", got, StateBedrock)
+	}
+}
+
+func TestConcurrentMissGeneratesChunkOnce(t *testing.T) {
+	var targetCalls atomic.Int32
+	gen := func(cx, cz int32) *Chunk {
+		if cx == 4 && cz == -7 {
+			targetCalls.Add(1)
+		}
+		time.Sleep(10 * time.Millisecond)
+		return NewChunk(cx, cz, BiomePlains)
+	}
+	c := NewCache(256, gen)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if frame, err := c.FrameErr(4, -7); err != nil || len(frame) == 0 {
+				t.Errorf("FrameErr = %d bytes, %v", len(frame), err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := targetCalls.Load(); got != 1 {
+		t.Fatalf("target generator calls = %d, want 1", got)
+	}
+}
+
+func TestConcurrentFrameAndBlockEdits(t *testing.T) {
+	c := NewCache(256, flatGen())
+	if len(c.Frame(0, 0)) == 0 {
+		t.Fatal("initial frame is empty")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 250; i++ {
+			state := StateStone
+			if i%2 == 0 {
+				state = StateBedrock
+			}
+			c.SetBlock(3, SeaLevel, 3, state)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			if len(c.Frame(0, 0)) == 0 {
+				t.Error("frame became empty")
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	c.SetBlock(3, SeaLevel, 3, StateBedrock)
+	if got := c.GetBlock(3, SeaLevel, 3); got != StateBedrock {
+		t.Fatalf("final block = %d, want %d", got, StateBedrock)
+	}
+	finalFrame := c.Frame(0, 0)
+	if len(finalFrame) == 0 {
+		t.Fatal("final frame is empty")
+	}
+	snapshot, _ := c.chunkAt(0, 0).snapshot()
+	wantFrame := protocol.AppendPacket(nil, 256, protocol.PlayLevelChunk, snapshot.encode())
+	if !bytes.Equal(finalFrame, wantFrame) {
+		t.Fatal("cached frame does not represent the final chunk revision")
 	}
 }

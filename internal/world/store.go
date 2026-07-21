@@ -1,6 +1,7 @@
 package world
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,11 +63,82 @@ type Store struct {
 	regions map[[2]int]*RegionFile
 }
 
+const worldMetadataFile = "regionio-world.json"
+
+type worldMetadata struct {
+	Format int   `json:"format"`
+	Seed   int64 `json:"seed"`
+}
+
 // NewStore opens (or creates) the world directory at dir, ensuring region/
 // exists. Chunks are loaded/saved relative to dir/region.
 func NewStore(dir string) (*Store, error) {
+	return newStore(dir, nil)
+}
+
+// NewStoreForSeed opens a persistent world and records its generation seed.
+// Reopening the same directory with another seed is rejected to prevent seams
+// between previously stored chunks and newly generated terrain.
+func NewStoreForSeed(dir string, seed int64) (*Store, error) {
+	return newStore(dir, &seed)
+}
+
+func newStore(dir string, seed *int64) (*Store, error) {
 	regionDir := filepath.Join(dir, "region")
-	return &Store{dir: dir, regions: make(map[[2]int]*RegionFile)}, mkdirAll(regionDir)
+	if err := mkdirAll(regionDir); err != nil {
+		return nil, err
+	}
+	if seed != nil {
+		if err := validateWorldMetadata(dir, *seed); err != nil {
+			return nil, err
+		}
+	}
+	return &Store{dir: dir, regions: make(map[[2]int]*RegionFile)}, nil
+}
+
+func validateWorldMetadata(dir string, seed int64) error {
+	path := filepath.Join(dir, worldMetadataFile)
+	raw, err := os.ReadFile(path)
+	if err == nil {
+		var meta worldMetadata
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return fmt.Errorf("world: decode %s: %w", path, err)
+		}
+		if meta.Format != 1 {
+			return fmt.Errorf("world: unsupported metadata format %d", meta.Format)
+		}
+		if meta.Seed != seed {
+			return fmt.Errorf("world: seed mismatch for %s: stored %d, configured %d", dir, meta.Seed, seed)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+
+	raw, err = json.MarshalIndent(worldMetadata{Format: 1, Seed: seed}, "", "  ")
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	tmp, err := os.CreateTemp(dir, ".regionio-world-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(raw); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // regionFor returns the cached RegionFile for the chunk's region, opening it on
@@ -122,6 +194,12 @@ func (s *Store) LoadChunk(cx, cz int32) (*Chunk, error) {
 
 // SaveChunk encodes the chunk and writes it to its region file.
 func (s *Store) SaveChunk(c *Chunk) error {
+	snapshot, _ := c.snapshot()
+	return s.saveSnapshot(snapshot)
+}
+
+// saveSnapshot writes a detached chunk snapshot without copying it again.
+func (s *Store) saveSnapshot(c *Chunk) error {
 	rf, err := s.regionFor(c.X, c.Z)
 	if err != nil {
 		return err
@@ -156,6 +234,9 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 		Set("Status", nbt.String("minecraft:full")).
 		Set("LastUpdate", nbt.Long(0)).
 		Set("InhabitedTime", nbt.Long(0))
+	if c.lightReady {
+		level.Set("isLightOn", nbt.Byte(1))
+	}
 
 	// Sections: one compound per vertical section, including empty ones so the
 	// section Y range is contiguous (vanilla expects all sections present for
@@ -238,6 +319,14 @@ func sectionToNBT(c *Chunk, si int) *nbt.Compound {
 		biomes.Set("data", packIndices(c.biomes[si][:], biomeIndexOf))
 	}
 	sec.Set("biomes", biomes)
+	if c.lightReady {
+		if sky := c.skyLight[si]; sky != nil {
+			sec.Set("SkyLight", nbt.ByteArray(append([]byte(nil), sky[:]...)))
+		}
+		if block := c.blockLight[si]; block != nil {
+			sec.Set("BlockLight", nbt.ByteArray(append([]byte(nil), block[:]...)))
+		}
+	}
 
 	return sec
 }
@@ -287,7 +376,7 @@ func topNonAirY(c *Chunk, x, z int) int {
 // for the palette size, mirroring the network paletted-container packing (no
 // value spans a long boundary in vanilla's chunk NBT).
 func packIndices(ids []uint16, indexOf map[uint16]int) nbt.LongArray {
-	bits := bitsNeeded(len(indexOf))
+	bits := bitsFor(len(indexOf))
 	if bits < 1 {
 		bits = 1
 	}
@@ -306,21 +395,10 @@ func packIndices(ids []uint16, indexOf map[uint16]int) nbt.LongArray {
 	return longs
 }
 
-// bitsNeeded returns ceil(log2(n)) for n>1, or 0 for n<=1.
-func bitsNeeded(n int) int {
-	bits := 0
-	v := n - 1
-	for v > 0 {
-		v >>= 1
-		bits++
-	}
-	return bits
-}
-
 // nbtToChunk decodes the Level-nested chunk NBT back into a Chunk. The chunk's
 // absolute coordinates are derived from the on-disk xPos/zPos (authoritative);
 // the region/local coords passed in are used only to validate.
-func nbtToChunk(root *nbt.Compound, regionX, regionZ, _, _ int) (*Chunk, error) {
+func nbtToChunk(root *nbt.Compound, regionX, regionZ, localX, localZ int) (*Chunk, error) {
 	levelTag, ok := root.Get("Level")
 	if !ok {
 		return nil, fmt.Errorf("world: chunk NBT missing Level")
@@ -331,8 +409,18 @@ func nbtToChunk(root *nbt.Compound, regionX, regionZ, _, _ int) (*Chunk, error) 
 	}
 	cx := int32(nbtAsInt(level, "xPos"))
 	cz := int32(nbtAsInt(level, "zPos"))
+	wantX := int32(regionX*32 + localX)
+	wantZ := int32(regionZ*32 + localZ)
+	if cx != wantX || cz != wantZ {
+		return nil, fmt.Errorf("world: chunk coordinates (%d,%d) do not match region slot (%d,%d)", cx, cz, wantX, wantZ)
+	}
 
 	c := &Chunk{X: cx, Z: cz, biome: BiomePlains}
+	if lightTag, ok := level.Get("isLightOn"); ok {
+		if enabled, ok := lightTag.(nbt.Byte); ok && enabled != 0 {
+			c.lightReady = true
+		}
+	}
 
 	// Sections.
 	if secTag, ok := level.Get("sections"); ok {
@@ -349,10 +437,30 @@ func nbtToChunk(root *nbt.Compound, regionX, regionZ, _, _ int) (*Chunk, error) 
 				}
 				readBlockStates(c, si, sc)
 				readBiomes(c, si, sc)
+				readLightSection(c, si, sc)
 			}
 		}
 	}
 	return c, nil
+}
+
+func readLightSection(c *Chunk, si int, sc *nbt.Compound) {
+	read := func(name string) *[2048]byte {
+		tag, ok := sc.Get(name)
+		if !ok {
+			return nil
+		}
+		data, ok := tag.(nbt.ByteArray)
+		if !ok || len(data) != 2048 {
+			c.lightReady = false
+			return nil
+		}
+		out := new([2048]byte)
+		copy(out[:], data)
+		return out
+	}
+	c.skyLight[si] = read("SkyLight")
+	c.blockLight[si] = read("BlockLight")
 }
 
 // readBlockStates decodes a section's block_states {palette, data?} into the
@@ -427,9 +535,11 @@ func readBiomes(c *Chunk, si int, sc *nbt.Compound) {
 		ids[i] = biomeIDByName(string(e.(nbt.String)))
 	}
 	if len(ids) == 1 {
-		// Uniform biome for the section: keep the per-cell array nil and set the
-		// column fallback when this is the only biome source.
-		c.biome = ids[0]
+		cells := new([biomeCellsPerSection]uint16)
+		for i := range cells {
+			cells[i] = ids[0]
+		}
+		c.biomes[si] = cells
 		return
 	}
 	if dataTag, ok := bc.Get("data"); ok {
@@ -481,7 +591,7 @@ func nbtAsString(c *nbt.Compound, name string) nbt.String {
 // unpackIndices reverses packIndices: fills dst with palette IDs using the
 // packed long array.
 func unpackIndices(dst []uint16, ids []uint16, data nbt.LongArray) {
-	bits := bitsNeeded(len(ids))
+	bits := bitsFor(len(ids))
 	if bits < 1 {
 		bits = 1
 	}

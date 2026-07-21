@@ -3,22 +3,21 @@ package world
 import (
 	"crypto/rand"
 	"sync"
-	"sync/atomic"
 )
 
 // Entity represents an in-game movable entity (mob, animal, etc).
 type Entity struct {
 	ID       int32
 	UUID     [16]byte
-	TypeID   int   // Network ID from the minecraft:entity_type registry
+	TypeID   int // Network ID from the built-in minecraft:entity_type registry
 	TypeName string
 
-	X, Y, Z       float64
-	Pitch, Yaw    float32
-	HeadYaw       float32
-	VelocityX     int16
-	VelocityY     int16
-	VelocityZ     int16
+	X, Y, Z    float64
+	Pitch, Yaw float32
+	HeadYaw    float32
+	VelocityX  int16
+	VelocityY  int16
+	VelocityZ  int16
 }
 
 // EntityManager tracks active entities in the server and manages thread-safe access.
@@ -40,7 +39,8 @@ func NewEntityManager() *EntityManager {
 func (em *EntityManager) Add(e *Entity) int32 {
 	em.mu.Lock()
 	defer em.mu.Unlock()
-	e.ID = atomic.AddInt32(&em.nextID, 1)
+	em.nextID++
+	e.ID = em.nextID
 	if e.UUID == [16]byte{} {
 		rand.Read(e.UUID[:])
 		// Version 4 UUID
@@ -58,20 +58,41 @@ func (em *EntityManager) Remove(id int32) {
 	delete(em.entities, id)
 }
 
-// Get retrieves an entity by ID, or nil if not found.
+// Get retrieves a snapshot of an entity by ID, or nil if not found.
 func (em *EntityManager) Get(id int32) *Entity {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
-	return em.entities[id]
+	e := em.entities[id]
+	if e == nil {
+		return nil
+	}
+	copy := *e
+	return &copy
+}
+
+// Update executes a function on an entity under a write lock.
+func (em *EntityManager) Update(id int32, fn func(*Entity)) {
+	em.mu.Lock()
+	defer em.mu.Unlock()
+	if e, ok := em.entities[id]; ok {
+		fn(e)
+	}
 }
 
 // All returns a snapshot slice of all active entities.
-func (em *EntityManager) All() []*Entity {
+func (em *EntityManager) All() []Entity {
 	em.mu.RLock()
 	defer em.mu.RUnlock()
-	list := make([]*Entity, 0, len(em.entities))
+	list := make([]Entity, 0, len(em.entities))
 	for _, e := range em.entities {
-		list = append(list, e)
+		list = append(list, *e)
 	}
 	return list
+}
+
+// Count returns the number of active entities.
+func (em *EntityManager) Count() int {
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	return len(em.entities)
 }

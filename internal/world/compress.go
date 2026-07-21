@@ -10,12 +10,16 @@ import (
 // default compression for Anvil .mca chunk records (compression type 2).
 
 // zlibDeflate compresses src into a new byte slice.
-func zlibDeflate(src []byte) []byte {
+func zlibDeflate(src []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	w := zlib.NewWriter(&buf)
-	_, _ = w.Write(src)
-	_ = w.Close()
-	return buf.Bytes()
+	if _, err := w.Write(src); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // zlibInflate decompresses src (a zlib stream). It returns an error if src is

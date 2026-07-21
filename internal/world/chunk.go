@@ -13,10 +13,10 @@ func GenerateFlat(cx, cz int32) *Chunk {
 	c := NewChunk(cx, cz, BiomePlains)
 	for lx := 0; lx < 16; lx++ {
 		for lz := 0; lz < 16; lz++ {
-			c.SetBlock(lx, MinY+0, lz, StateBedrock)
-			c.SetBlock(lx, MinY+1, lz, StateDirt)
-			c.SetBlock(lx, MinY+2, lz, StateDirt)
-			c.SetBlock(lx, FlatSurfaceY, lz, StateGrass)
+			c.setBlockRaw(lx, MinY+0, lz, StateBedrock)
+			c.setBlockRaw(lx, MinY+1, lz, StateDirt)
+			c.setBlockRaw(lx, MinY+2, lz, StateDirt)
+			c.setBlockRaw(lx, FlatSurfaceY, lz, StateGrass)
 		}
 	}
 	return c

@@ -47,7 +47,7 @@ func generateFromDensity(d worldgen.DensityFunction, cx, cz int32) *Chunk {
 			col := &columns[lx][lz]
 			for i := 0; i < WorldHeight; i++ {
 				if s := col[i]; s != StateAir {
-					c.SetBlock(lx, MinY+i, lz, s)
+					c.setBlockRaw(lx, MinY+i, lz, s)
 				}
 			}
 		}

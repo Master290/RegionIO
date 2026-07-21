@@ -1,12 +1,14 @@
 package network
 
 import (
+	"errors"
 	"math"
 	"time"
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
+	"regionio/internal/server"
 	"regionio/internal/world"
 )
 
@@ -22,6 +24,13 @@ const (
 // hands chunk streaming off to the background streamer. The streamer stops when
 // h.ctx (the connection lifetime context) is cancelled.
 func (h *handler) beginPlay() error {
+	session, err := h.srv.RegisterPlayer(h.conn.Profile, h.conn.Send)
+	if err != nil {
+		return err
+	}
+	h.session = session
+	h.srv.SetPlayerTransform(session, spawnX, spawnY, spawnZ, 0, 0, true)
+	h.srv.SetPlayerViewDistance(session, h.visibilityRadius())
 	for i := range h.hotbar {
 		h.hotbar[i] = -1 // empty
 	}
@@ -36,6 +45,15 @@ func (h *handler) beginPlay() error {
 	if err := h.sendPlayerPosition(1); err != nil {
 		return err
 	}
+	if err := h.sendChunkCacheCenter(0, 0); err != nil {
+		return err
+	}
+	if err := h.sendDefaultSpawnPosition(); err != nil {
+		return err
+	}
+	if err := h.sendPlayerAbilities(); err != nil {
+		return err
+	}
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
 	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.viewDistance)
@@ -46,16 +64,54 @@ func (h *handler) beginPlay() error {
 	return nil
 }
 
+func (h *handler) sendChunkCacheCenter(cx, cz int32) error {
+	w := protocol.NewWriter(8)
+	w.VarInt(cx)
+	w.VarInt(cz)
+	return h.conn.SendWriter(protocol.PlayChunkCacheCenter, w)
+}
+
+func (h *handler) sendDefaultSpawnPosition() error {
+	w := protocol.NewWriter(12)
+	w.Position(8, 100, 8)
+	w.Float32(0.0)
+	return h.conn.SendWriter(protocol.PlayDefaultSpawnPos, w)
+}
+
+func (h *handler) sendPlayerAbilities() error {
+	w := protocol.NewWriter(9)
+	w.Byte(0x0F)
+	w.Float32(0.05)
+	w.Float32(0.1)
+	return h.conn.SendWriter(protocol.PlayAbilities, w)
+}
+
 // onPlayerMove recenters the streamer when the player crosses into a new chunk.
 // It is a non-blocking push; the read loop never waits on generation.
-func (h *handler) onPlayerMove(x, y, z float64) error {
-	h.srv.SetPlayerPosition(h.conn.Profile.Name, x, y, z)
+func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround bool) error {
+	if math.IsNaN(x) || math.IsNaN(y) || math.IsNaN(z) ||
+		math.IsInf(x, 0) || math.IsInf(y, 0) || math.IsInf(z, 0) ||
+		math.IsNaN(float64(yaw)) || math.IsNaN(float64(pitch)) ||
+		math.IsInf(float64(yaw), 0) || math.IsInf(float64(pitch), 0) {
+		return errors.New("invalid player position")
+	}
+	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 	if h.streamer != nil {
 		h.streamer.requestRecenter(cx, cz)
 	}
 	return nil
+}
+
+func (h *handler) visibilityRadius() int {
+	if h.viewDistance < 2 {
+		return defaultViewRadius
+	}
+	if h.viewDistance > 16 {
+		return 16
+	}
+	return h.viewDistance
 }
 
 // sendPlayLogin writes the clientbound play "login" packet. Field layout was
@@ -67,8 +123,12 @@ func (h *handler) sendPlayLogin() error {
 	}
 
 	w := protocol.NewWriter(128)
-	w.Int32(1)    // entity ID
-	w.Bool(false) // is hardcore
+	entityID := int32(1)
+	if h.session != nil {
+		entityID = h.session.EntityID
+	}
+	w.Int32(entityID) // entity ID
+	w.Bool(false)     // is hardcore
 
 	// Dimension names: the worlds available on this server.
 	dims := []string{"minecraft:overworld", "minecraft:the_end", "minecraft:the_nether"}
@@ -78,23 +138,23 @@ func (h *handler) sendPlayLogin() error {
 	}
 
 	w.VarInt(int32(h.srv.Config().MaxPlayers)) // max players (legacy)
-	w.VarInt(10)                               // view distance
-	w.VarInt(10)                               // simulation distance
+	w.VarInt(int32(h.visibilityRadius()))      // view distance
+	w.VarInt(int32(h.visibilityRadius()))      // simulation distance
 	w.Bool(false)                              // reduced debug info
 	w.Bool(true)                               // enable respawn screen
 	w.Bool(false)                              // do limited crafting
 
-	w.VarInt(int32(dimTypeIdx))   // dimension type (registry index)
+	w.VarInt(int32(dimTypeIdx))     // dimension type (registry index)
 	w.String("minecraft:overworld") // dimension name (this world)
-	w.Int64(0)                    // hashed seed
-	w.Byte(1)                     // game mode: creative (instant break, creative inventory)
-	w.Byte(0xFF)                  // previous game mode: -1 (none)
-	w.Bool(false)                 // is debug
-	w.Bool(false)                 // is flat
-	w.Bool(false)                 // has death location
-	w.VarInt(0)                   // portal cooldown
-	w.VarInt(63)                  // sea level (overworld)
-	w.Bool(false)                 // enforces secure chat
+	w.Int64(0)                      // hashed seed
+	w.Byte(1)                       // game mode: creative (instant break, creative inventory)
+	w.Byte(0xFF)                    // previous game mode: -1 (none)
+	w.Bool(false)                   // is debug
+	w.Bool(false)                   // is flat
+	w.Bool(false)                   // has death location
+	w.VarInt(0)                     // portal cooldown
+	w.VarInt(63)                    // sea level (overworld)
+	w.Bool(false)                   // enforces secure chat
 
 	return h.conn.SendWriter(protocol.PlayLogin, w)
 }
@@ -125,48 +185,172 @@ func (h *handler) sendPlayerPosition(teleportID int32) error {
 func (h *handler) keepAliveLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		id := time.Now().UnixMilli()
-		w := protocol.NewWriter(8)
-		w.Int64(id)
-		if err := h.conn.SendWriter(protocol.PlayKeepAliveCB, w); err != nil {
+	for {
+		select {
+		case <-h.ctx.Done():
 			return
+		case <-ticker.C:
+			id := time.Now().UnixMilli()
+			w := protocol.NewWriter(8)
+			w.Int64(id)
+			if err := h.conn.SendWriter(protocol.PlayKeepAliveCB, w); err != nil {
+				return
+			}
 		}
 	}
 }
 
-// entitySyncLoop periodically sends all entities in the world to the client.
-// In a real server this would track which entities the player can see and send updates.
+// visibleEntity is the comparable state retained by one client's visibility
+// tracker. OnGround is separate because mobs currently always use true.
+type visibleEntity struct {
+	entity   world.Entity
+	onGround bool
+}
+
+// entitySyncLoop maintains tab-list membership and chunk-scoped entity state.
 func (h *handler) entitySyncLoop() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
-	known := make(map[int32]bool)
 
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
-			all := h.srv.Entities().All()
-			current := make(map[int32]bool)
-			for _, e := range all {
-				current[e.ID] = true
-				if !known[e.ID] {
-					h.sendAddEntity(e)
-					known[e.ID] = true
-				} else {
-					h.sendEntityTeleport(e)
-				}
-			}
-			// remove entities that disappeared
-			for id := range known {
-				if !current[id] {
-					h.sendRemoveEntity(id)
-					delete(known, id)
-				}
+			if err := h.syncVisibleEntities(); err != nil {
+				return
 			}
 		}
 	}
+}
+
+// syncVisibleEntities performs one deterministic visibility pass. Keeping it
+// separate from the ticker makes the four-client workflow integration-testable.
+func (h *handler) syncVisibleEntities() error {
+	if h.session == nil {
+		return nil
+	}
+	if h.knownPlayers == nil {
+		h.knownPlayers = make(map[[16]byte]bool)
+	}
+	if h.knownEntities == nil {
+		h.knownEntities = make(map[int32]visibleEntity)
+	}
+
+	viewer := h.session.Snapshot()
+	players := h.srv.PlayerSnapshots()
+	currentPlayers := make(map[[16]byte]bool, len(players))
+	for _, player := range players {
+		currentPlayers[player.Profile.UUID] = true
+		if !h.knownPlayers[player.Profile.UUID] {
+			if err := h.sendPlayerInfoAdd(player.Profile); err != nil {
+				return err
+			}
+			h.knownPlayers[player.Profile.UUID] = true
+		}
+	}
+
+	currentEntities := make(map[int32]visibleEntity)
+	for _, player := range players {
+		if player.EntityID == viewer.EntityID || !playerVisible(viewer, player, h.visibilityRadius()) {
+			continue
+		}
+		currentEntities[player.EntityID] = visibleEntity{
+			entity: world.Entity{
+				ID: player.EntityID, UUID: player.Profile.UUID,
+				TypeID: registry.EntityTypeIndex("minecraft:player"), TypeName: "minecraft:player",
+				X: player.X, Y: player.Y, Z: player.Z,
+				Yaw: player.Yaw, Pitch: player.Pitch, HeadYaw: player.Yaw,
+			},
+			onGround: player.OnGround,
+		}
+	}
+	for _, entity := range h.srv.Entities().All() {
+		if entityVisible(viewer, entity, h.visibilityRadius()) {
+			currentEntities[entity.ID] = visibleEntity{entity: entity, onGround: true}
+		}
+	}
+
+	for id, current := range currentEntities {
+		known, exists := h.knownEntities[id]
+		if !exists {
+			entity := current.entity
+			if err := h.sendAddEntity(&entity); err != nil {
+				return err
+			}
+		} else if known != current {
+			entity := current.entity
+			if err := h.sendEntityTeleportState(&entity, current.onGround); err != nil {
+				return err
+			}
+		}
+	}
+	for id := range h.knownEntities {
+		if _, visible := currentEntities[id]; !visible {
+			if err := h.sendRemoveEntity(id); err != nil {
+				return err
+			}
+		}
+	}
+	h.knownEntities = currentEntities
+
+	for uuid := range h.knownPlayers {
+		if !currentPlayers[uuid] {
+			if err := h.sendPlayerInfoRemove(uuid); err != nil {
+				return err
+			}
+			delete(h.knownPlayers, uuid)
+		}
+	}
+	return nil
+}
+
+func playerVisible(viewer, target server.PlayerSnapshot, radius int) bool {
+	return chunksWithin(viewer.X, viewer.Z, target.X, target.Z, radius)
+}
+
+func entityVisible(viewer server.PlayerSnapshot, target world.Entity, radius int) bool {
+	return chunksWithin(viewer.X, viewer.Z, target.X, target.Z, radius)
+}
+
+func chunksWithin(ax, az, bx, bz float64, radius int) bool {
+	acx := int32(int64(math.Floor(ax)) >> 4)
+	acz := int32(int64(math.Floor(az)) >> 4)
+	bcx := int32(int64(math.Floor(bx)) >> 4)
+	bcz := int32(int64(math.Floor(bz)) >> 4)
+	dx := acx - bcx
+	if dx < 0 {
+		dx = -dx
+	}
+	dz := acz - bcz
+	if dz < 0 {
+		dz = -dz
+	}
+	return dx <= int32(radius) && dz <= int32(radius)
+}
+
+func (h *handler) sendPlayerInfoAdd(profile server.Profile) error {
+	w := protocol.NewWriter(64)
+	w.Byte(0xff) // All eight initialization actions, fixed 8-bit EnumSet.
+	w.VarInt(1)
+	w.UUID(profile.UUID)
+	w.String(profile.Name)
+	w.VarInt(0)   // profile properties
+	w.Bool(false) // no signed chat session
+	w.VarInt(1)   // creative game mode
+	w.Bool(true)  // listed
+	w.VarInt(0)   // latency
+	w.Bool(false) // no custom display name
+	w.VarInt(0)   // list order
+	w.Bool(true)  // show hat
+	return h.conn.SendWriter(protocol.PlayPlayerInfoUpdate, w)
+}
+
+func (h *handler) sendPlayerInfoRemove(uuid [16]byte) error {
+	w := protocol.NewWriter(20)
+	w.VarInt(1)
+	w.UUID(uuid)
+	return h.conn.SendWriter(protocol.PlayPlayerInfoRemove, w)
 }
 
 // sendAddEntity sends the minecraft:add_entity packet.
@@ -187,12 +371,21 @@ func (h *handler) sendAddEntity(e *world.Entity) error {
 }
 
 func (h *handler) sendEntityTeleport(e *world.Entity) error {
+	return h.sendEntityTeleportState(e, true)
+}
+
+func (h *handler) sendEntityTeleportState(e *world.Entity, onGround bool) error {
 	w := protocol.NewWriter(64)
 	w.VarInt(e.ID)
+	// PositionMoveRotation: position, deltaMovement, yRot, xRot.
 	w.Float64(e.X).Float64(e.Y).Float64(e.Z)
-	w.Byte(byte(e.Yaw * 256.0 / 360.0))
-	w.Byte(byte(e.Pitch * 256.0 / 360.0))
-	w.Bool(true) // On ground
+	w.Float64(float64(e.VelocityX) / 8000.0)
+	w.Float64(float64(e.VelocityY) / 8000.0)
+	w.Float64(float64(e.VelocityZ) / 8000.0)
+	w.Float32(e.Yaw)
+	w.Float32(e.Pitch)
+	w.Int32(0) // Relative.SET_STREAM_CODEC uses ByteBufCodecs.INT; no relative flags.
+	w.Bool(onGround)
 	return h.conn.SendWriter(protocol.PlayTeleportEntity, w)
 }
 
@@ -225,7 +418,6 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		return nil
 
 	case protocol.PlayMovePos, protocol.PlayMovePosRot:
-		// Both packets begin with the absolute X, Y, Z position.
 		r := pkt.Body()
 		x, err := r.Float64()
 		if err != nil {
@@ -239,7 +431,48 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		if err != nil {
 			return err
 		}
-		return h.onPlayerMove(x, y, z)
+		snapshot := h.session.Snapshot()
+		yaw, pitch := snapshot.Yaw, snapshot.Pitch
+		if pkt.ID == protocol.PlayMovePosRot {
+			yaw, err = r.Float32()
+			if err != nil {
+				return err
+			}
+			pitch, err = r.Float32()
+			if err != nil {
+				return err
+			}
+		}
+		flags, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		return h.onPlayerMove(x, y, z, yaw, pitch, flags&1 != 0)
+
+	case protocol.PlayMoveRot:
+		r := pkt.Body()
+		yaw, err := r.Float32()
+		if err != nil {
+			return err
+		}
+		pitch, err := r.Float32()
+		if err != nil {
+			return err
+		}
+		flags, err := r.ReadByte()
+		if err != nil {
+			return err
+		}
+		snapshot := h.session.Snapshot()
+		return h.onPlayerMove(snapshot.X, snapshot.Y, snapshot.Z, yaw, pitch, flags&1 != 0)
+
+	case protocol.PlayMoveStatusOnly:
+		flags, err := pkt.Body().ReadByte()
+		if err != nil {
+			return err
+		}
+		snapshot := h.session.Snapshot()
+		return h.onPlayerMove(snapshot.X, snapshot.Y, snapshot.Z, snapshot.Yaw, snapshot.Pitch, flags&1 != 0)
 
 	case protocol.PlayPlayerAction:
 		return h.handlePlayerAction(pkt)
@@ -279,16 +512,15 @@ func (h *handler) handleChat(pkt protocol.Packet) error {
 	}
 	line := "<" + h.conn.Profile.Name + "> " + msg
 	h.log.Info("chat", "msg", line)
-	return h.sendSystemChat(line)
+	return h.broadcastSystemChat(line)
 }
 
-// sendSystemChat sends a plain-text system chat message. The text component is
-// network NBT; a bare string tag is the shorthand for {"text": ...}.
-func (h *handler) sendSystemChat(text string) error {
+func (h *handler) broadcastSystemChat(text string) error {
 	w := protocol.NewWriter(len(text) + 8)
 	w.Raw(nbt.Marshal(nbt.String(text)))
-	w.Bool(false) // not an action-bar overlay
-	return h.conn.SendWriter(protocol.PlaySystemChat, w)
+	w.Bool(false)
+	h.srv.Broadcast(protocol.PlaySystemChat, w.Bytes())
+	return nil
 }
 
 // handlePlayerAction processes digging. In creative the client sends
@@ -315,10 +547,8 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 
 	const startDig, finishDig = 0, 2
 	if status == startDig || status == finishDig {
-		if h.srv.Chunks().SetBlock(x, y, z, world.StateAir) {
-			if err := h.sendBlockUpdate(x, y, z, world.StateAir); err != nil {
-				return err
-			}
+		if valid, lightChunks := h.srv.Chunks().SetBlockWithLight(x, y, z, world.StateAir); valid {
+			h.broadcastBlockUpdate(x, y, z, world.StateAir, lightChunks)
 			h.log.Debug("block broken", "x", x, "y", y, "z", z)
 		}
 	}
@@ -401,10 +631,8 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		if state, ok := h.heldBlock(); ok {
 			off := faceOffsets[face]
 			px, py, pz := x+off[0], y+off[1], z+off[2]
-			if h.srv.Chunks().SetBlock(px, py, pz, state) {
-				if err := h.sendBlockUpdate(px, py, pz, state); err != nil {
-					return err
-				}
+			if valid, lightChunks := h.srv.Chunks().SetBlockWithLight(px, py, pz, state); valid {
+				h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
 				h.log.Debug("block placed", "x", px, "y", py, "z", pz, "state", state)
 			}
 		}
@@ -422,12 +650,18 @@ func (h *handler) heldBlock() (uint16, bool) {
 	return world.ItemToBlock(itemID)
 }
 
-// sendBlockUpdate notifies the client of a single block change.
-func (h *handler) sendBlockUpdate(x, y, z int, state uint16) error {
+func (h *handler) broadcastBlockUpdate(x, y, z int, state uint16, lightChunks []world.ChunkPos) {
 	w := protocol.NewWriter(12)
 	w.Position(x, y, z)
 	w.VarInt(int32(state))
-	return h.conn.SendWriter(protocol.PlayBlockUpdate, w)
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	h.srv.BroadcastChunk(cx, cz, protocol.PlayBlockUpdate, w.Bytes())
+	for _, chunk := range lightChunks {
+		if light, err := h.srv.Chunks().LightUpdate(chunk.X, chunk.Z); err == nil {
+			h.srv.BroadcastChunk(chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
+		}
+	}
 }
 
 // sendBlockChangedAck confirms a block-action sequence so the client does not

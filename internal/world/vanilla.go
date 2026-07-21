@@ -15,7 +15,7 @@ import (
 const (
 	cellWidth  = 4
 	cellHeight = 8
-	cellsXZ    = 16 / cellWidth          // 4
+	cellsXZ    = 16 / cellWidth           // 4
 	cellsY     = WorldHeight / cellHeight // 48
 )
 
@@ -82,8 +82,8 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 	surfaceRule, ruleErr := od.SurfaceRule()
 
 	var columns [16][16][WorldHeight]uint16
-	var surfTop [16][16]int  // top solid index, -1 if none
-	var grass [16][16]bool   // grassy land surface (tree-plantable)
+	var surfTop [16][16]int // top solid index, -1 if none
+	var grass [16][16]bool  // grassy land surface (tree-plantable)
 	for lx := 0; lx < 16; lx++ {
 		wg.Add(1)
 		go func(lx int) {
@@ -105,7 +105,7 @@ func generateVanilla(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *C
 			col := &columns[lx][lz]
 			for i := 0; i < WorldHeight; i++ {
 				if s := col[i]; s != StateAir {
-					c.SetBlock(lx, MinY+i, lz, s)
+					c.setBlockRaw(lx, MinY+i, lz, s)
 				}
 			}
 		}

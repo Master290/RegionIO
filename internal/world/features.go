@@ -28,7 +28,7 @@ var oreSpecs = []oreSpec{
 	{"minecraft:gold_ore", MinY, MinY + 32, 4, 4, 0.25},
 	{"minecraft:redstone_ore", MinY, MinY + 16, 4, 4, 0.3},
 	{"minecraft:lapis_ore", MinY, MinY + 32, 3, 4, 0.25},
-	{"minecraft:diamond_ore", MinY, MinY - 16 + 16, 3, 3, 0.2}, // -64..-16-ish
+	{"minecraft:diamond_ore", MinY, MinY + 16, 3, 3, 0.2}, // -64..-48
 	{"minecraft:emerald_ore", MinY + 16, MinY + 48, 1, 1, 0.15},
 }
 

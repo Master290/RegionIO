@@ -39,10 +39,18 @@ type Registry struct {
 
 // synced is the parsed, ordered list loaded once at init.
 var synced []Registry
+var syncedLookup map[string]map[string]int
 
 func init() {
 	if err := json.Unmarshal(syncedJSON, &synced); err != nil {
 		panic(fmt.Sprintf("registry: parsing embedded synced_registries.json: %v", err))
+	}
+	syncedLookup = make(map[string]map[string]int)
+	for _, reg := range synced {
+		syncedLookup[reg.Name] = make(map[string]int)
+		for i, e := range reg.Entries {
+			syncedLookup[reg.Name][e] = i
+		}
 	}
 }
 
@@ -54,14 +62,9 @@ func Synced() []Registry { return synced }
 // which is the numeric (network) ID the client assigns it. It returns -1 if
 // the registry or entry is unknown.
 func Index(registryName, entry string) int {
-	for _, reg := range synced {
-		if reg.Name != registryName {
-			continue
-		}
-		for i, e := range reg.Entries {
-			if e == entry {
-				return i
-			}
+	if regMap, ok := syncedLookup[registryName]; ok {
+		if idx, ok := regMap[entry]; ok {
+			return idx
 		}
 	}
 	return -1
@@ -77,3 +80,23 @@ type KnownPack struct {
 // CorePack is the vanilla built-in pack. Advertising it lets a matching client
 // supply registry contents from its own copy.
 var CorePack = KnownPack{Namespace: "minecraft", ID: "core", Version: "26.1.2"}
+
+// builtinEntityTypes contains the vanilla 26.1.2 BuiltInRegistries.ENTITY_TYPE
+// network IDs needed by gameplay packets. This is intentionally separate from
+// the synchronized registries above: minecraft:entity_type is a built-in
+// registry in this protocol data set and is not sent in registry_data during
+// configuration.
+var builtinEntityTypes = map[string]int{
+	"minecraft:pig":    100,
+	"minecraft:player": 155,
+	"minecraft:zombie": 150,
+}
+
+// EntityTypeIndex returns the vanilla numeric ID for a built-in entity type, or
+// -1 if it is not in the embedded table.
+func EntityTypeIndex(name string) int {
+	if idx, ok := builtinEntityTypes[name]; ok {
+		return idx
+	}
+	return -1
+}

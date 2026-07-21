@@ -1,10 +1,13 @@
 package world
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,7 +103,8 @@ func TestStoreChunkRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("root not compound")
 	}
-	decoded, err := nbtToChunk(root, 0, 0, 0, 0)
+	rx, rz, lx, lz := regionIndex(original.X, original.Z)
+	decoded, err := nbtToChunk(root, rx, rz, lx, lz)
 	if err != nil {
 		t.Fatalf("nbtToChunk: %v", err)
 	}
@@ -116,6 +120,68 @@ func TestStoreChunkRoundTrip(t *testing.T) {
 	}
 	if decoded.X != 10 || decoded.Z != -5 {
 		t.Errorf("coords = (%d,%d), want (10,-5)", decoded.X, decoded.Z)
+	}
+	if decoded.lightReady {
+		t.Error("legacy chunk without isLightOn loaded as light-ready")
+	}
+}
+
+func TestStoreLightRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := NewCacheWithStore(-1, func(cx, cz int32) *Chunk {
+		return NewChunk(cx, cz, BiomePlains)
+	}, store)
+	left := cache.chunkAt(0, 0)
+	right := cache.chunkAt(1, 0)
+	if _, err := cache.FrameErr(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.FrameErr(1, 0); err != nil {
+		t.Fatal(err)
+	}
+	glowstone := nameToStateID("minecraft:glowstone", nil)
+	if valid, _ := cache.SetBlockWithLight(15, 0, 8, glowstone); !valid {
+		t.Fatal("glowstone edit rejected")
+	}
+	wantLeftSky, wantLeftBlock, ready := left.LightAt(15, 0, 8)
+	if !ready || wantLeftBlock != 15 {
+		t.Fatalf("pre-save source light = sky %d block %d ready %v", wantLeftSky, wantLeftBlock, ready)
+	}
+	wantRightSky, wantRightBlock, ready := right.LightAt(0, 0, 8)
+	if !ready || wantRightBlock != 14 {
+		t.Fatalf("pre-save neighbor light = sky %d block %d ready %v", wantRightSky, wantRightBlock, ready)
+	}
+	if err := cache.SaveAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	loadedLeft, err := store.LoadChunk(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSky, gotBlock, gotReady := loadedLeft.LightAt(15, 0, 8)
+	if !gotReady || gotSky != wantLeftSky || gotBlock != wantLeftBlock {
+		t.Fatalf("loaded source light = sky %d block %d ready %v; want sky %d block %d ready", gotSky, gotBlock, gotReady, wantLeftSky, wantLeftBlock)
+	}
+	loadedRight, err := store.LoadChunk(1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSky, gotBlock, gotReady = loadedRight.LightAt(0, 0, 8)
+	if !gotReady || gotSky != wantRightSky || gotBlock != wantRightBlock {
+		t.Fatalf("loaded neighbor light = sky %d block %d ready %v; want sky %d block %d ready", gotSky, gotBlock, gotReady, wantRightSky, wantRightBlock)
 	}
 }
 
@@ -207,8 +273,8 @@ func TestCacheAutosavePersistsEdits(t *testing.T) {
 
 	// Wait for at least one autosave cycle.
 	time.Sleep(250 * time.Millisecond)
-	cancel()            // stop the autosave loop so it releases the store
-	<-autosaveDone      // wait for the goroutine to fully exit
+	cancel()       // stop the autosave loop so it releases the store
+	<-autosaveDone // wait for the goroutine to fully exit
 	store.Close()
 
 	// Fresh cache over the same store should see the edit without SaveAll.
@@ -221,5 +287,132 @@ func TestCacheAutosavePersistsEdits(t *testing.T) {
 	loaded := cache2.chunkAt(0, 0)
 	if got := loaded.GetBlock(8, SeaLevel, 8); got != StateBedrock {
 		t.Errorf("autosaved block = %d, want bedrock %d", got, StateBedrock)
+	}
+}
+
+func TestStoreRejectsSeedMismatch(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStoreForSeed(dir, 12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewStoreForSeed(dir, 12345)
+	if err != nil {
+		t.Fatalf("reopen with matching seed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewStoreForSeed(dir, 54321); err == nil {
+		t.Fatal("opening a world with a different seed succeeded")
+	}
+}
+
+func TestCacheDoesNotRegenerateCorruptStoredChunk(t *testing.T) {
+	dir := t.TempDir()
+	regionDir := filepath.Join(dir, "region")
+	rf, err := OpenRegion(regionDir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt := []byte("not an nbt document")
+	if err := rf.WriteChunk(0, 0, corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := rf.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var generated atomic.Bool
+	cache := NewCacheWithStore(256, func(cx, cz int32) *Chunk {
+		generated.Store(true)
+		return NewChunk(cx, cz, BiomePlains)
+	}, store)
+	if _, err := cache.FrameErr(0, 0); err == nil {
+		t.Fatal("FrameErr succeeded for corrupt stored chunk")
+	}
+	if generated.Load() {
+		t.Fatal("generator ran after a stored chunk read error")
+	}
+	if cache.SetBlock(0, SeaLevel, 0, StateBedrock) {
+		t.Fatal("SetBlock accepted an edit over a corrupt stored chunk")
+	}
+	if err := cache.SaveAll(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, lx, lz := regionIndex(0, 0)
+	rf = store.regions[[2]int{0, 0}]
+	raw, err := rf.ReadChunk(lx, lz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, corrupt) {
+		t.Fatalf("stored corrupt payload was overwritten: %q", raw)
+	}
+}
+
+func TestConcurrentAutosavePreservesLatestEdit(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := NewCacheWithStore(256, flatGen(), store)
+	cache.chunkAt(0, 0)
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			state := StateStone
+			if i%2 == 0 {
+				state = StateDirt
+			}
+			cache.SetBlock(5, SeaLevel, 5, state)
+		}
+		close(done)
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				_ = cache.flushDirty()
+			}
+		}
+	}()
+	wg.Wait()
+	cache.SetBlock(5, SeaLevel, 5, StateBedrock)
+	if err := cache.SaveAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	loaded, err := store.LoadChunk(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.GetBlock(5, SeaLevel, 5); got != StateBedrock {
+		t.Fatalf("persisted final block = %d, want %d", got, StateBedrock)
 	}
 }

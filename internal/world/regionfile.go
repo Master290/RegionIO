@@ -86,6 +86,13 @@ func locationIndex(localX, localZ int) int { return (localZ << 5) | localX }
 // ReadChunk returns the decompressed NBT payload for the chunk, or
 // ErrChunkNotFound when the chunk is absent.
 func (r *RegionFile) ReadChunk(localX, localZ int) ([]byte, error) {
+	if localX < 0 || localX > 31 || localZ < 0 || localZ > 31 {
+		return nil, fmt.Errorf("world: local coordinates out of bounds")
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	loc := r.offsets[locationIndex(localX, localZ)]
 	if loc == 0 {
 		return nil, ErrChunkNotFound
@@ -95,9 +102,6 @@ func (r *RegionFile) ReadChunk(localX, localZ int) ([]byte, error) {
 	if sectorOffset < headerSectors {
 		return nil, fmt.Errorf("world: invalid sector offset %d", sectorOffset)
 	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// 4-byte length then payload (compression byte + compressed data).
 	var lenBuf [4]byte
@@ -124,7 +128,14 @@ func (r *RegionFile) ReadChunk(localX, localZ int) ([]byte, error) {
 // WriteChunk stores the NBT payload for the chunk, allocating (or reusing)
 // sectors and updating the offset + timestamp tables.
 func (r *RegionFile) WriteChunk(localX, localZ int, nbt []byte) error {
-	compressed := append([]byte{compressionZlib}, zlibDeflate(nbt)...)
+	if localX < 0 || localX > 31 || localZ < 0 || localZ > 31 {
+		return fmt.Errorf("world: local coordinates out of bounds")
+	}
+	deflated, err := zlibDeflate(nbt)
+	if err != nil {
+		return err
+	}
+	compressed := append([]byte{compressionZlib}, deflated...)
 	// +4 for the length prefix; sectors needed to hold everything.
 	totalLen := 4 + len(compressed)
 	sectorsNeeded := (totalLen + sectorSize - 1) / sectorSize

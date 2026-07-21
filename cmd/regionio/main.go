@@ -46,7 +46,7 @@ func main() {
 	saveCtx, saveStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	autosaveDone := srv.Chunks().StartAutosave(saveCtx, log, 30*time.Second)
 
-	srv.StartSpawning()
+	srv.StartSpawning(saveCtx)
 
 	ln := network.NewListener(srv, log)
 

@@ -70,6 +70,15 @@ func (r *Reader) Uint16() (uint16, error) {
 	return binary.BigEndian.Uint16(b), nil
 }
 
+// Int32 reads a big-endian signed int.
+func (r *Reader) Int32() (int32, error) {
+	b, err := r.readN(4)
+	if err != nil {
+		return 0, err
+	}
+	return int32(binary.BigEndian.Uint32(b)), nil
+}
+
 // Int64 reads a big-endian signed long.
 func (r *Reader) Int64() (int64, error) {
 	b, err := r.readN(8)
@@ -119,9 +128,9 @@ func (r *Reader) Position() (x, y, z int, err error) {
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	x = int(v >> 38)        // top 26 bits, sign-extended
-	y = int(v << 52 >> 52)  // low 12 bits, sign-extended
-	z = int(v << 26 >> 38)  // middle 26 bits, sign-extended
+	x = int(v >> 38)       // top 26 bits, sign-extended
+	y = int(v << 52 >> 52) // low 12 bits, sign-extended
+	z = int(v << 26 >> 38) // middle 26 bits, sign-extended
 	return x, y, z, nil
 }
 

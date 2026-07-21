@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 
+	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
 
@@ -141,6 +142,8 @@ func (s *streamer) run(ctx context.Context) {
 func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) {
 	s.centerX, s.centerZ, s.hasCenter = cx, cz, true
 
+	s.sendChunkCacheCenter(cx, cz)
+
 	// Build the desired set: everything within genRadius (the union of what we
 	// send + the pre-gen ring). Sent = within viewRadius; pre-gen = the ring.
 	order := spiralOrder(cx, cz, s.genRadius)
@@ -179,9 +182,30 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) {
 	// bounded and avoids re-sending.
 	for key := range s.loaded {
 		if !desired[key] {
+			s.sendForgetLevelChunk(key[0], key[1])
 			delete(s.loaded, key)
 		}
 	}
+}
+
+func (s *streamer) sendChunkCacheCenter(cx, cz int32) {
+	if s.conn == nil {
+		return
+	}
+	w := protocol.NewWriter(8)
+	w.VarInt(cx)
+	w.VarInt(cz)
+	_ = s.conn.SendWriter(protocol.PlayChunkCacheCenter, w)
+}
+
+func (s *streamer) sendForgetLevelChunk(cx, cz int32) {
+	if s.conn == nil {
+		return
+	}
+	w := protocol.NewWriter(8)
+	w.Int32(cz)
+	w.Int32(cx)
+	_ = s.conn.SendWriter(protocol.PlayForgetLevelChunk, w)
 }
 
 // parallelSend generates the given chunks across the worker pool and sends each
@@ -274,14 +298,15 @@ func (s *streamer) parallelGenerate(ctx context.Context, keys [][2]int32) {
 					return
 				default:
 				}
-				_ = s.cache.Frame(j.cx, j.cz) // warm the cache; discard the frame
+				_, _ = s.cache.FrameErr(j.cx, j.cz) // warm the cache; discard the frame
 			}
 		}()
 	}
+Loop:
 	for _, j := range pending {
 		select {
 		case <-ctx.Done():
-			break
+			break Loop
 		case jobs <- j:
 		}
 	}
@@ -307,7 +332,14 @@ func (s *streamer) generateWorker(ctx context.Context, jobs <-chan frameJob, res
 			return
 		default:
 		}
-		frame := s.cache.Frame(j.cx, j.cz)
+		frame, err := s.cache.FrameErr(j.cx, j.cz)
+		if err != nil {
+			select {
+			case results <- frameResult{cx: j.cx, cz: j.cz, err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
 		if err := s.conn.SendFramed(frame); err != nil {
 			select {
 			case results <- frameResult{cx: j.cx, cz: j.cz, err: err}:

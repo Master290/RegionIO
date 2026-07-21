@@ -3,6 +3,8 @@ package world
 import (
 	"container/list"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -36,13 +38,23 @@ type Cache struct {
 	store     *Store // nil = in-memory only (tests, flat worlds)
 	maxChunks int    // LRU capacity; 0 = unbounded
 
-	mu     sync.Mutex
-	chunks map[[2]int32]*Chunk
-	frames map[[2]int32][]byte
-	dirty  map[[2]int32]struct{}
+	mu      sync.Mutex
+	lightMu sync.Mutex
+	chunks  map[[2]int32]*Chunk
+	frames  map[[2]int32][]byte
+	dirty   map[[2]int32]uint64
 	// LRU bookkeeping: order is MRU(front)→LRU(back); index gives O(1) lookup.
-	order *list.List                    // elements are *[2]int32; nil when maxChunks==0
+	order *list.List // elements are *[2]int32; nil when maxChunks==0
 	index map[[2]int32]*list.Element
+	loads map[[2]int32]*chunkLoad
+}
+
+// chunkLoad coordinates concurrent misses for the same coordinate. The first
+// caller performs disk I/O or generation; all others wait for that exact result.
+type chunkLoad struct {
+	done chan struct{}
+	ch   *Chunk
+	err  error
 }
 
 // NewCache returns a world cache that frames packets at the given compression
@@ -54,7 +66,8 @@ func NewCache(threshold int32, gen Generator) *Cache {
 		gen:       gen,
 		chunks:    make(map[[2]int32]*Chunk),
 		frames:    make(map[[2]int32][]byte),
-		dirty:     make(map[[2]int32]struct{}),
+		dirty:     make(map[[2]int32]uint64),
+		loads:     make(map[[2]int32]*chunkLoad),
 	}
 	return c
 }
@@ -74,6 +87,9 @@ func NewCacheWithStore(threshold int32, gen Generator, store *Store) *Cache {
 // ≈ maxChunks×200KiB.
 func NewCacheWithLimit(threshold int32, gen Generator, store *Store, maxChunks int) *Cache {
 	c := NewCacheWithStore(threshold, gen, store)
+	if maxChunks < 0 {
+		maxChunks = 0
+	}
 	c.maxChunks = maxChunks
 	if maxChunks > 0 {
 		c.order = list.New()
@@ -84,7 +100,7 @@ func NewCacheWithLimit(threshold int32, gen Generator, store *Store, maxChunks i
 
 // touch marks key as most-recently-used. Must be called under c.mu.
 func (c *Cache) touch(key [2]int32) {
-	if c.maxChunks == 0 {
+	if c.maxChunks <= 0 {
 		return
 	}
 	if e, ok := c.index[key]; ok {
@@ -98,10 +114,11 @@ func (c *Cache) touch(key [2]int32) {
 // Dirty chunks are skipped (moved back to MRU and the eviction halts) so the
 // autosave can persist them first. Must be called under c.mu.
 func (c *Cache) evictIfNeeded() {
-	if c.maxChunks == 0 {
+	if c.maxChunks <= 0 {
 		return
 	}
-	for len(c.chunks) > c.maxChunks {
+	checked := 0
+	for len(c.chunks) > c.maxChunks && checked < len(c.chunks) {
 		back := c.order.Back()
 		if back == nil {
 			return
@@ -112,12 +129,14 @@ func (c *Cache) evictIfNeeded() {
 		// next eviction pass can reclaim it.
 		if _, dirty := c.dirty[key]; dirty && c.store != nil {
 			c.order.MoveToFront(back)
-			break
+			checked++
+			continue
 		}
 		delete(c.chunks, key)
 		delete(c.frames, key)
 		c.order.Remove(back)
 		delete(c.index, key)
+		checked = 0
 	}
 }
 
@@ -125,66 +144,110 @@ func (c *Cache) evictIfNeeded() {
 // disk (if a store is attached) → generation. Generation and disk reads run
 // outside the lock.
 func (c *Cache) chunkAt(cx, cz int32) *Chunk {
+	ch, _ := c.chunkAtErr(cx, cz)
+	return ch
+}
+
+// chunkAtErr is the error-preserving form used by network and mutation paths.
+// A corrupt or unreadable stored chunk is never replaced by generated terrain.
+func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	key := [2]int32{cx, cz}
 
 	c.mu.Lock()
 	if ch, ok := c.chunks[key]; ok {
 		c.touch(key)
 		c.mu.Unlock()
-		return ch
+		return ch, nil
 	}
+	if pending, ok := c.loads[key]; ok {
+		c.mu.Unlock()
+		<-pending.done
+		return pending.ch, pending.err
+	}
+	pending := &chunkLoad{done: make(chan struct{})}
+	c.loads[key] = pending
 	c.mu.Unlock()
 
 	// Try disk before generation so saved edits survive restarts.
 	var ch *Chunk
+	var loadErr error
 	if c.store != nil {
 		if loaded, err := c.store.LoadChunk(cx, cz); err == nil {
 			ch = loaded
+		} else if !errors.Is(err, ErrChunkNotFound) {
+			loadErr = fmt.Errorf("world: load chunk (%d,%d): %w", cx, cz, err)
 		}
 	}
-	if ch == nil {
+	if ch == nil && loadErr == nil {
 		ch = c.gen(cx, cz) // generate outside the lock
+		if ch == nil {
+			loadErr = fmt.Errorf("world: generator returned nil chunk (%d,%d)", cx, cz)
+		}
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if existing, ok := c.chunks[key]; ok {
+	if loadErr == nil {
+		c.chunks[key] = ch
 		c.touch(key)
-		return existing // another goroutine won the race
+		c.evictIfNeeded()
 	}
-	c.chunks[key] = ch
-	c.touch(key)
-	c.evictIfNeeded()
-	return ch
+	pending.ch, pending.err = ch, loadErr
+	delete(c.loads, key)
+	close(pending.done)
+	c.mu.Unlock()
+	return ch, loadErr
 }
 
 // Frame returns the prebuilt level_chunk packet for (cx, cz), building it on
 // first request and caching until the chunk is edited. The slice must not be
 // mutated.
 func (c *Cache) Frame(cx, cz int32) []byte {
+	frame, _ := c.FrameErr(cx, cz)
+	return frame
+}
+
+// FrameErr returns a framed chunk packet while preserving storage failures.
+// Callers serving clients should prefer it to Frame so corruption is observable.
+func (c *Cache) FrameErr(cx, cz int32) ([]byte, error) {
 	key := [2]int32{cx, cz}
 
-	c.mu.Lock()
-	if f, ok := c.frames[key]; ok {
-		c.touch(key)
+	for {
+		c.mu.Lock()
+		if f, ok := c.frames[key]; ok {
+			c.touch(key)
+			c.mu.Unlock()
+			return f, nil
+		}
 		c.mu.Unlock()
-		return f
-	}
-	c.mu.Unlock()
 
-	ch := c.chunkAt(cx, cz)
-	frame := protocol.AppendPacket(nil, c.threshold, protocol.PlayLevelChunk, ch.Encode())
+		ch, err := c.chunkAtErr(cx, cz)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.ensureLight(ch); err != nil {
+			return nil, err
+		}
+		snapshot, revision := ch.snapshot()
+		frame := protocol.AppendPacket(nil, c.threshold, protocol.PlayLevelChunk, snapshot.encode())
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if existing, ok := c.frames[key]; ok {
+		c.mu.Lock()
+		if existing, ok := c.frames[key]; ok {
+			c.touch(key)
+			c.mu.Unlock()
+			return existing, nil
+		}
+		// An edit or eviction while the frame was being built makes it stale.
+		// Retry from a fresh snapshot instead of publishing old bytes forever.
+		if c.chunks[key] != ch || ch.currentRevision() != revision {
+			c.mu.Unlock()
+			continue
+		}
+		c.frames[key] = frame
 		c.touch(key)
-		return existing
+		c.evictIfNeeded()
+		c.mu.Unlock()
+		return frame, nil
 	}
-	c.frames[key] = frame
-	c.touch(key)
-	c.evictIfNeeded()
-	return frame
 }
 
 // GetBlock returns the block state at world coordinates (x, y, z).
@@ -195,32 +258,82 @@ func (c *Cache) GetBlock(x, y, z int) uint16 {
 	}
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	ch := c.chunkAt(cx, cz)
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return StateAir
+	}
 	return ch.GetBlock(x, y, z)
 }
 
-// SetBlock changes the block at world coordinates (x, y, z), invalidating the
-// affected chunk's cached frame and marking it dirty for autosave. It reports
-// whether a chunk was actually touched (false if y is out of range).
+// LightUpdate returns the standalone light_update body for a loaded chunk.
+func (c *Cache) LightUpdate(cx, cz int32) ([]byte, error) {
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.ensureLight(ch); err != nil {
+		return nil, err
+	}
+	return ch.EncodeLightUpdate(), nil
+}
+
+// SetBlock changes a block and incrementally updates lighting. Callers that need
+// to broadcast every affected light chunk should use SetBlockWithLight.
 func (c *Cache) SetBlock(x, y, z int, state uint16) bool {
+	valid, _ := c.SetBlockWithLight(x, y, z, state)
+	return valid
+}
+
+// ChunkPos identifies a chunk changed by a lighting update.
+type ChunkPos struct {
+	X, Z int32
+}
+
+// SetBlockWithLight changes a block and returns the loaded chunks whose stored
+// light changed. Lighting operations are serialized so concurrent edits cannot
+// publish mutually stale propagation results.
+func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) {
 	if y < MinY || y >= MinY+WorldHeight {
-		return false
+		return false, nil
 	}
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	ch := c.chunkAt(cx, cz)
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return false, nil
+	}
 
-	ch.SetBlock(x, y, z, state)
+	c.lightMu.Lock()
+	defer c.lightMu.Unlock()
+	live := c.cachedLightNeighborhood(cx, cz)
+	for _, neighbor := range live {
+		if err := c.ensureLightLocked(neighbor); err != nil {
+			return false, nil
+		}
+	}
+	_, changed := ch.setBlock(x, y, z, state)
+	if !changed {
+		return true, nil
+	}
+	lightChanged, err := c.updateLightAfterBlockLocked(x, y, z, live)
+	if err != nil {
+		// The block edit is still valid and dirty; a later Frame call will rebuild
+		// its light from the authoritative blocks.
+		ch.mu.Lock()
+		ch.lightReady = false
+		ch.mu.Unlock()
+		lightChanged = []ChunkPos{{X: cx, Z: cz}}
+	}
 
 	c.mu.Lock()
 	key := [2]int32{cx, cz}
 	delete(c.frames, key)
 	if c.store != nil {
-		c.dirty[key] = struct{}{}
+		c.dirty[key] = ch.currentRevision()
 	}
 	c.touch(key) // edited chunk is most-recently-used
 	c.mu.Unlock()
-	return true
+	return true, lightChanged
 }
 
 // markDirty flags the chunk at (cx, cz) for the next autosave. Public so tests
@@ -230,7 +343,10 @@ func (c *Cache) markDirty(cx, cz int32) {
 		return
 	}
 	c.mu.Lock()
-	c.dirty[[2]int32{cx, cz}] = struct{}{}
+	key := [2]int32{cx, cz}
+	if ch := c.chunks[key]; ch != nil {
+		c.dirty[key] = ch.currentRevision()
+	}
 	c.mu.Unlock()
 }
 
@@ -277,22 +393,32 @@ func (c *Cache) flushDirty() error {
 	for _, k := range keys {
 		chunks[k] = c.chunks[k]
 	}
-	c.dirty = make(map[[2]int32]struct{})
 	c.mu.Unlock()
 
+	var firstErr error
 	for _, k := range keys {
 		ch := chunks[k]
 		if ch == nil {
+			c.mu.Lock()
+			delete(c.dirty, k)
+			c.mu.Unlock()
 			continue
 		}
-		if err := c.store.SaveChunk(ch); err != nil {
-			c.mu.Lock()
-			c.dirty[k] = struct{}{} // re-mark; retry next cycle
-			c.mu.Unlock()
-			return err
+		snapshot, savedRevision := ch.snapshot()
+		if err := c.store.saveSnapshot(snapshot); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
 		}
+		c.mu.Lock()
+		if dirtyRevision, ok := c.dirty[k]; ok && dirtyRevision <= savedRevision {
+			delete(c.dirty, k)
+		}
+		c.evictIfNeeded()
+		c.mu.Unlock()
 	}
-	return nil
+	return firstErr
 }
 
 // SaveAll synchronously persists every chunk currently in memory. Used at
@@ -301,24 +427,5 @@ func (c *Cache) SaveAll() error {
 	if c.store == nil {
 		return nil
 	}
-	c.mu.Lock()
-	keys := make([][2]int32, 0, len(c.chunks))
-	for k := range c.chunks {
-		keys = append(keys, k)
-	}
-	chunks := make(map[[2]int32]*Chunk, len(keys))
-	for _, k := range keys {
-		chunks[k] = c.chunks[k]
-	}
-	c.mu.Unlock()
-
-	var firstErr error
-	for _, k := range keys {
-		if ch := chunks[k]; ch != nil {
-			if err := c.store.SaveChunk(ch); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
+	return c.flushDirty()
 }

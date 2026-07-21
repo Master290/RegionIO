@@ -2,6 +2,8 @@ package world
 
 import (
 	"math/bits"
+	"sync"
+	"sync/atomic"
 
 	"regionio/internal/protocol"
 )
@@ -37,6 +39,7 @@ const (
 	StateSnow         uint16 = 6919 // snow, layers=1
 	StateSnowBlock    uint16 = 6928
 	StateIce          uint16 = 6927
+	StateGlowstone    uint16 = 7016
 	StateMycelium     uint16 = 8919
 	StateTerracotta   uint16 = 12912
 	StateRedSandstone uint16 = 13247
@@ -57,19 +60,24 @@ const totalBlockStates = 29873
 // the biome direct-palette bit width.
 const (
 	biomeCellSize        = 4
-	biomeCellsXZ         = 16 / biomeCellSize // 4
+	biomeCellsXZ         = 16 / biomeCellSize                         // 4
 	biomeCellsPerSection = biomeCellsXZ * biomeCellsXZ * biomeCellsXZ // 64
-	totalBiomes          = 65 // synced minecraft:worldgen/biome registry size
+	totalBiomes          = 65                                         // synced minecraft:worldgen/biome registry size
 )
 
 // Chunk is a 16xWorldHeightx16 column of block states. Each section may carry a
 // per-cell biome array (4×4×4); when biomes[si] is nil the section falls back to
 // the column-wide biome field (used by flat/simple generators).
 type Chunk struct {
-	X, Z     int32
-	sections [SectionCount]*[sectionVol]uint16
-	biomes   [SectionCount]*[biomeCellsPerSection]uint16
-	biome    uint16 // fallback uniform biome when biomes[si] is nil
+	mu         sync.RWMutex
+	revision   atomic.Uint64
+	X, Z       int32
+	sections   [SectionCount]*[sectionVol]uint16
+	biomes     [SectionCount]*[biomeCellsPerSection]uint16
+	skyLight   [SectionCount]*[2048]byte
+	blockLight [SectionCount]*[2048]byte
+	lightReady bool
+	biome      uint16 // fallback uniform biome when biomes[si] is nil
 }
 
 // NewChunk returns an empty (all-air) chunk at (x, z) with the given biome.
@@ -91,6 +99,13 @@ func (c *Chunk) section(i int) *[sectionVol]uint16 {
 // GetBlock returns the block state at local (lx, lz) and world height y, or
 // StateAir if the section is empty or y is out of range.
 func (c *Chunk) GetBlock(lx, y, lz int) uint16 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.getBlock(lx, y, lz)
+}
+
+// getBlock is the lock-free form used while operating on a private snapshot.
+func (c *Chunk) getBlock(lx, y, lz int) uint16 {
 	si := (y - MinY) >> 4
 	if si < 0 || si >= SectionCount {
 		return StateAir
@@ -106,6 +121,8 @@ func (c *Chunk) GetBlock(lx, y, lz int) uint16 {
 // mirrors GetBlock: the per-section biome array if present, else the column's
 // uniform fallback biome. Needed for on-disk chunk serialization.
 func (c *Chunk) GetBiome(lx, y, lz int) uint16 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	si := (y - MinY) >> 4
 	if si < 0 || si >= SectionCount {
 		return c.biome
@@ -119,11 +136,41 @@ func (c *Chunk) GetBiome(lx, y, lz int) uint16 {
 
 // SetBlock sets the block at local (lx, lz) and absolute world height y.
 func (c *Chunk) SetBlock(lx, y, lz int, state uint16) {
+	_, changed := c.setBlock(lx, y, lz, state)
+	if changed {
+		c.mu.Lock()
+		c.lightReady = false
+		c.mu.Unlock()
+	}
+}
+
+// setBlockRaw writes to an unpublished chunk during generation. Generators call
+// it only after their parallel sampling phases have joined and before the chunk
+// enters Cache, avoiding a mutex operation for every solid terrain block.
+func (c *Chunk) setBlockRaw(lx, y, lz int, state uint16) {
 	si := (y - MinY) >> 4
 	if si < 0 || si >= SectionCount {
 		return
 	}
 	c.section(si)[blockIndex(lx, y, lz)] = state
+}
+
+// setBlock changes a block and returns the resulting revision. The changed flag
+// lets the cache avoid dirtying a chunk for a no-op client prediction.
+func (c *Chunk) setBlock(lx, y, lz int, state uint16) (revision uint64, changed bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	si := (y - MinY) >> 4
+	if si < 0 || si >= SectionCount {
+		return c.revision.Load(), false
+	}
+	idx := blockIndex(lx, y, lz)
+	s := c.section(si)
+	if s[idx] == state {
+		return c.revision.Load(), false
+	}
+	s[idx] = state
+	return c.revision.Add(1), true
 }
 
 // biomeIndex maps a block within a section to its YZX-ordered 4×4×4 biome cell.
@@ -142,18 +189,70 @@ const biomeCellsXZBits = 2 // biomeCellsXZ=4 → 2 bits
 // section's per-cell biome array is allocated lazily on first write. Any block
 // in the cell shares its biome, matching the 4-block resolution vanilla uses.
 func (c *Chunk) SetBiome(lx, y, lz int, biome uint16) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	si := (y - MinY) >> 4
 	if si < 0 || si >= SectionCount {
 		return
 	}
 	if c.biomes[si] == nil {
-		c.biomes[si] = new([biomeCellsPerSection]uint16)
+		cells := new([biomeCellsPerSection]uint16)
+		for i := range cells {
+			cells[i] = c.biome
+		}
+		c.biomes[si] = cells
 	}
-	c.biomes[si][biomeIndex(lx, y, lz)] = biome
+	idx := biomeIndex(lx, y, lz)
+	if c.biomes[si][idx] != biome {
+		c.biomes[si][idx] = biome
+		c.revision.Add(1)
+	}
 }
 
 // Encode serializes the level_chunk_with_light body for this chunk.
 func (c *Chunk) Encode() []byte {
+	snapshot, _ := c.snapshot()
+	return snapshot.encode()
+}
+
+// snapshot returns a detached, immutable copy and the revision it represents.
+// Section arrays are copied so encoding and persistence never race block edits.
+func (c *Chunk) snapshot() (*Chunk, uint64) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	revision := c.revision.Load()
+	clone := &Chunk{X: c.X, Z: c.Z, biome: c.biome}
+	clone.revision.Store(revision)
+	for i := 0; i < SectionCount; i++ {
+		if c.sections[i] != nil {
+			section := *c.sections[i]
+			clone.sections[i] = &section
+		}
+		if c.biomes[i] != nil {
+			biomes := *c.biomes[i]
+			clone.biomes[i] = &biomes
+		}
+		if c.skyLight[i] != nil {
+			light := *c.skyLight[i]
+			clone.skyLight[i] = &light
+		}
+		if c.blockLight[i] != nil {
+			light := *c.blockLight[i]
+			clone.blockLight[i] = &light
+		}
+	}
+	clone.lightReady = c.lightReady
+	return clone, revision
+}
+
+// currentRevision returns the latest mutation revision.
+func (c *Chunk) currentRevision() uint64 {
+	return c.revision.Load()
+}
+
+// encode serializes a detached snapshot.
+func (c *Chunk) encode() []byte {
 	w := protocol.NewWriter(8192)
 	w.Int32(c.X).Int32(c.Z)
 	c.writeHeightmaps(w)
@@ -173,8 +272,8 @@ func (c *Chunk) Encode() []byte {
 
 // Heightmap.Types ordinals sent to the client.
 const (
-	hmWorldSurface          = 1
-	hmMotionBlocking        = 4
+	hmWorldSurface           = 1
+	hmMotionBlocking         = 4
 	hmMotionBlockingNoLeaves = 5
 )
 
@@ -232,8 +331,8 @@ func packHeightmap(h [256]uint16) []uint64 {
 func (c *Chunk) writeSection(w *protocol.Writer, i int) {
 	s := c.sections[i]
 	if s == nil {
-		w.Uint16(0)            // non-air block count
-		w.Uint16(0)            // reserved 2-byte field (always 0 in vanilla)
+		w.Uint16(0) // non-air block count
+		w.Uint16(0) // reserved 2-byte field (always 0 in vanilla)
 		writeSingleValued(w, uint32(StateAir))
 	} else {
 		w.Uint16(uint16(nonAirCount(s)))

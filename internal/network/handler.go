@@ -27,11 +27,14 @@ type handler struct {
 	streamer *streamer
 	// viewDistance is the client's requested view distance (from
 	// client_information), clamped; used to size the streamer.
-	viewDistance int
+	viewDistance  int
+	session       *server.PlayerSession
+	knownPlayers  map[[16]byte]bool
+	knownEntities map[int32]visibleEntity
 
 	// Creative inventory state for block placement.
-	heldSlot int32     // selected hotbar index (0-8)
-	hotbar   [9]int32  // item network IDs per hotbar slot (-1 = empty)
+	heldSlot int32    // selected hotbar index (0-8)
+	hotbar   [9]int32 // item network IDs per hotbar slot (-1 = empty)
 }
 
 // serve runs the read/dispatch loop for a single connection. It owns the
@@ -44,7 +47,7 @@ func (h *handler) serve() {
 	defer cancel() // stops the streamer when the read loop ends
 	h.ctx = ctx
 
-	defer h.srv.RemovePlayerPosition(h.conn.Profile.Name)
+	defer func() { h.srv.UnregisterPlayer(h.session) }()
 
 	for {
 		pkt, err := h.conn.ReadPacket()
@@ -123,7 +126,7 @@ func (h *handler) handleHandshake(pkt protocol.Packet) error {
 func (h *handler) handleStatus(pkt protocol.Packet) error {
 	switch pkt.ID {
 	case protocol.StatusRequestID:
-		jsonBytes, err := h.srv.StatusJSON(0)
+		jsonBytes, err := h.srv.StatusJSON(h.srv.PlayerCount())
 		if err != nil {
 			return err
 		}

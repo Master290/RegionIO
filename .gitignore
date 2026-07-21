@@ -19,6 +19,7 @@
 # Logs and runtime artefacts
 /logs/
 *.log
+/world/regionio-world.json
 
 # Editor / tool local config
 /.claude/

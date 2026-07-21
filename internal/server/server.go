@@ -4,6 +4,10 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -57,31 +61,96 @@ type Server struct {
 	store    *world.Store // nil when persistence is disabled
 	entities *world.EntityManager
 
-	// playerPos tracks the last known position of each player by name.
-	playerPos sync.Map // map[string][3]float64
+	playersMu    sync.RWMutex
+	players      map[[16]byte]*PlayerSession
+	playerNames  map[string][16]byte
+	nextPlayerID int32
 }
+
+// PacketSender is the connection capability retained by the session registry.
+// The network package supplies Conn.Send without introducing an import cycle.
+type PacketSender func(id int32, body []byte) error
+
+// PlayerSession is one active play-state client. Position is guarded separately
+// so entity ticks can inspect players without holding the server registry lock.
+type PlayerSession struct {
+	EntityID int32
+	Profile  Profile
+	send     PacketSender
+	mu       sync.RWMutex
+	position [3]float64
+	yaw      float32
+	pitch    float32
+	onGround bool
+	viewDist int
+}
+
+// PlayerSnapshot is an immutable view of one play-state session.
+type PlayerSnapshot struct {
+	EntityID     int32
+	Profile      Profile
+	X, Y, Z      float64
+	Yaw, Pitch   float32
+	OnGround     bool
+	ViewDistance int
+}
+
+var (
+	ErrServerFull      = errors.New("server: player limit reached")
+	ErrDuplicatePlayer = errors.New("server: player is already connected")
+)
 
 // New constructs a Server from cfg. When cfg.WorldDir is set, the world is
 // backed by an on-disk store under that directory; otherwise it is in-memory
 // only. A returned error (e.g. the world dir cannot be created) is fatal.
 func New(cfg Config) (*Server, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
 	gen := world.NewVanillaGenerator(cfg.WorldSeed)
 	em := world.NewEntityManager()
 	if cfg.WorldDir == "" {
-		// No persistence; keep eviction off too (flat/test worlds expect full
-		// presence). Real servers set WorldDir and MaxCachedChunks together.
-		return &Server{cfg: cfg, chunks: world.NewCache(int32(cfg.CompressionThreshold), gen), entities: em}, nil
+		return newServerState(cfg,
+			world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, nil, cfg.MaxCachedChunks), nil, em), nil
 	}
-	store, err := world.NewStore(cfg.WorldDir)
+	store, err := world.NewStoreForSeed(cfg.WorldDir, cfg.WorldSeed)
 	if err != nil {
 		return nil, err
 	}
+	return newServerState(cfg,
+		world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks), store, em), nil
+}
+
+// NewWithCache constructs a server around an existing cache. It is useful for
+// embedding and integration tests that provide a specialized world generator.
+func NewWithCache(cfg Config, chunks *world.Cache) (*Server, error) {
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+	if chunks == nil {
+		return nil, errors.New("server: nil chunk cache")
+	}
+	return newServerState(cfg, chunks, nil, world.NewEntityManager()), nil
+}
+
+func validateConfig(cfg Config) error {
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("server: port %d out of range", cfg.Port)
+	}
+	if cfg.MaxPlayers < 1 {
+		return fmt.Errorf("server: max players must be positive")
+	}
+	if cfg.MaxCachedChunks < 0 {
+		return fmt.Errorf("server: max cached chunks must not be negative")
+	}
+	return nil
+}
+
+func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entities *world.EntityManager) *Server {
 	return &Server{
-		cfg:      cfg,
-		chunks:   world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks),
-		store:    store,
-		entities: em,
-	}, nil
+		cfg: cfg, chunks: chunks, store: store, entities: entities,
+		players: make(map[[16]byte]*PlayerSession), playerNames: make(map[string][16]byte),
+	}
 }
 
 // Config returns the active configuration.
@@ -93,30 +162,202 @@ func (s *Server) Chunks() *world.Cache { return s.chunks }
 // Entities returns the shared entity manager.
 func (s *Server) Entities() *world.EntityManager { return s.entities }
 
-// SetPlayerPosition updates the tracked position of a player.
-func (s *Server) SetPlayerPosition(name string, x, y, z float64) {
-	s.playerPos.Store(name, [3]float64{x, y, z})
+// RegisterPlayer adds a profile to the active play-state registry.
+func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSession, error) {
+	s.playersMu.Lock()
+	defer s.playersMu.Unlock()
+	nameKey := strings.ToLower(profile.Name)
+	if _, exists := s.players[profile.UUID]; exists {
+		return nil, ErrDuplicatePlayer
+	}
+	if _, exists := s.playerNames[nameKey]; exists {
+		return nil, ErrDuplicatePlayer
+	}
+	if s.cfg.MaxPlayers > 0 && len(s.players) >= s.cfg.MaxPlayers {
+		return nil, ErrServerFull
+	}
+	s.nextPlayerID++
+	session := &PlayerSession{
+		EntityID: s.nextPlayerID,
+		Profile:  profile,
+		send:     send,
+		onGround: true,
+		viewDist: 4,
+	}
+	s.players[profile.UUID] = session
+	s.playerNames[nameKey] = profile.UUID
+	return session, nil
 }
 
-// RemovePlayerPosition removes a player from tracking.
-func (s *Server) RemovePlayerPosition(name string) {
-	s.playerPos.Delete(name)
+// UnregisterPlayer removes exactly the supplied session. Pointer identity keeps
+// a delayed disconnect from removing a future session with the same profile.
+func (s *Server) UnregisterPlayer(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	s.playersMu.Lock()
+	defer s.playersMu.Unlock()
+	if current := s.players[session.Profile.UUID]; current == session {
+		delete(s.players, session.Profile.UUID)
+		delete(s.playerNames, strings.ToLower(session.Profile.Name))
+	}
+}
+
+// SetPlayerPosition updates a session's authoritative position snapshot.
+func (s *Server) SetPlayerPosition(session *PlayerSession, x, y, z float64) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	session.position = [3]float64{x, y, z}
+	session.mu.Unlock()
+}
+
+// SetPlayerTransform updates all movement fields received from the client.
+func (s *Server) SetPlayerTransform(session *PlayerSession, x, y, z float64, yaw, pitch float32, onGround bool) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	session.position = [3]float64{x, y, z}
+	session.yaw = yaw
+	session.pitch = pitch
+	session.onGround = onGround
+	session.mu.Unlock()
+}
+
+// SetPlayerViewDistance records the clamped chunk radius used for visibility.
+func (s *Server) SetPlayerViewDistance(session *PlayerSession, distance int) {
+	if session == nil {
+		return
+	}
+	if distance < 2 {
+		distance = 4
+	}
+	if distance > 16 {
+		distance = 16
+	}
+	session.mu.Lock()
+	session.viewDist = distance
+	session.mu.Unlock()
+}
+
+// Snapshot returns a consistent copy of this session's gameplay state.
+func (session *PlayerSession) Snapshot() PlayerSnapshot {
+	if session == nil {
+		return PlayerSnapshot{}
+	}
+	session.mu.RLock()
+	snapshot := PlayerSnapshot{
+		EntityID:     session.EntityID,
+		Profile:      session.Profile,
+		X:            session.position[0],
+		Y:            session.position[1],
+		Z:            session.position[2],
+		Yaw:          session.yaw,
+		Pitch:        session.pitch,
+		OnGround:     session.onGround,
+		ViewDistance: session.viewDist,
+	}
+	session.mu.RUnlock()
+	return snapshot
+}
+
+// PlayerSnapshots returns consistent copies of all active play sessions.
+func (s *Server) PlayerSnapshots() []PlayerSnapshot {
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, player := range s.players {
+		players = append(players, player)
+	}
+	s.playersMu.RUnlock()
+
+	snapshots := make([]PlayerSnapshot, 0, len(players))
+	for _, player := range players {
+		snapshots = append(snapshots, player.Snapshot())
+	}
+	return snapshots
+}
+
+// PlayerCount returns the number of tracked players.
+func (s *Server) PlayerCount() int {
+	s.playersMu.RLock()
+	defer s.playersMu.RUnlock()
+	return len(s.players)
+}
+
+// Broadcast sends one already-encoded packet body to every active player. A
+// failed recipient cannot make another player's gameplay handler fail.
+func (s *Server) Broadcast(id int32, body []byte) {
+	s.playersMu.RLock()
+	senders := make([]PacketSender, 0, len(s.players))
+	for _, player := range s.players {
+		senders = append(senders, player.send)
+	}
+	s.playersMu.RUnlock()
+	for _, send := range senders {
+		if send != nil {
+			_ = send(id, body)
+		}
+	}
+}
+
+// BroadcastChunk sends a packet only to players whose chunk view contains the
+// target chunk. It is used for block and light changes.
+func (s *Server) BroadcastChunk(cx, cz int32, id int32, body []byte) {
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, player := range s.players {
+		players = append(players, player)
+	}
+	s.playersMu.RUnlock()
+
+	for _, player := range players {
+		snapshot := player.Snapshot()
+		pcx := int32(int64(math.Floor(snapshot.X)) >> 4)
+		pcz := int32(int64(math.Floor(snapshot.Z)) >> 4)
+		if chunkDistance(pcx, pcz, cx, cz) <= int32(snapshot.ViewDistance) && player.send != nil {
+			_ = player.send(id, body)
+		}
+	}
+}
+
+func chunkDistance(ax, az, bx, bz int32) int32 {
+	dx := ax - bx
+	if dx < 0 {
+		dx = -dx
+	}
+	dz := az - bz
+	if dz < 0 {
+		dz = -dz
+	}
+	if dz > dx {
+		return dz
+	}
+	return dx
 }
 
 // NearestPlayer returns the position of the nearest player to (x, y, z).
 // Returns false if no players are online.
 func (s *Server) NearestPlayer(x, y, z float64) (pos [3]float64, ok bool) {
 	minDist := float64(-1)
-	s.playerPos.Range(func(key, value any) bool {
-		p := value.([3]float64)
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, player := range s.players {
+		players = append(players, player)
+	}
+	s.playersMu.RUnlock()
+	for _, player := range players {
+		player.mu.RLock()
+		p := player.position
+		player.mu.RUnlock()
 		dist := (p[0]-x)*(p[0]-x) + (p[1]-y)*(p[1]-y) + (p[2]-z)*(p[2]-z)
 		if minDist < 0 || dist < minDist {
 			minDist = dist
 			pos = p
 			ok = true
 		}
-		return true
-	})
+	}
 	return
 }
 
