@@ -364,13 +364,15 @@ func (h *handler) sendAddEntity(e *world.Entity) error {
 	w.UUID(e.UUID)
 	w.VarInt(int32(e.TypeID))
 	w.Float64(e.X).Float64(e.Y).Float64(e.Z)
+	w.LPVec3(
+		float64(e.VelocityX)/8000.0,
+		float64(e.VelocityY)/8000.0,
+		float64(e.VelocityZ)/8000.0,
+	)
 	w.Byte(byte(e.Pitch * 256.0 / 360.0))
 	w.Byte(byte(e.Yaw * 256.0 / 360.0))
 	w.Byte(byte(e.HeadYaw * 256.0 / 360.0))
 	w.VarInt(0) // Data
-	w.Uint16(uint16(e.VelocityX))
-	w.Uint16(uint16(e.VelocityY))
-	w.Uint16(uint16(e.VelocityZ))
 	return h.conn.SendWriter(protocol.PlayAddEntity, w)
 }
 

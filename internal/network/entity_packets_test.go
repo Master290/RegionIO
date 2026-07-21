@@ -3,6 +3,7 @@ package network
 import (
 	"bufio"
 	"bytes"
+	"math"
 	"net"
 	"testing"
 
@@ -112,18 +113,15 @@ func TestSendAddEntityLayout(t *testing.T) {
 	uuid := [16]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
 	h := &handler{conn: NewConn(serverSide)}
 	ent := &world.Entity{
-		ID:        43,
-		UUID:      uuid,
-		TypeID:    77,
-		X:         10.5,
-		Y:         66.25,
-		Z:         -20.75,
-		Pitch:     45,
-		Yaw:       180,
-		HeadYaw:   90,
-		VelocityX: 123,
-		VelocityY: -456,
-		VelocityZ: 789,
+		ID:      43,
+		UUID:    uuid,
+		TypeID:  77,
+		X:       10.5,
+		Y:       66.25,
+		Z:       -20.75,
+		Pitch:   45,
+		Yaw:     180,
+		HeadYaw: 90,
 	}
 
 	errc := make(chan error, 1)
@@ -161,6 +159,20 @@ func TestSendAddEntityLayout(t *testing.T) {
 			t.Fatalf("%s = %v, %v; want %v", tc.name, got, err, tc.want)
 		}
 	}
+	vx, vy, vz, err := r.LPVec3()
+	if err != nil {
+		t.Fatalf("velocity: %v", err)
+	}
+	wantVelocity := []float64{
+		float64(ent.VelocityX) / 8000.0,
+		float64(ent.VelocityY) / 8000.0,
+		float64(ent.VelocityZ) / 8000.0,
+	}
+	for i, got := range []float64{vx, vy, vz} {
+		if math.Abs(got-wantVelocity[i]) > 1.0/16383.0 {
+			t.Fatalf("velocity[%d] = %v, want %v", i, got, wantVelocity[i])
+		}
+	}
 	angles := []struct {
 		name string
 		want byte
@@ -177,20 +189,6 @@ func TestSendAddEntityLayout(t *testing.T) {
 	}
 	if data, err := r.VarInt(); err != nil || data != 0 {
 		t.Fatalf("data = %d, %v; want 0", data, err)
-	}
-	encodedVelocities := []struct {
-		name string
-		want uint16
-	}{
-		{"velocityX", uint16(ent.VelocityX)},
-		{"velocityY", uint16(ent.VelocityY)},
-		{"velocityZ", uint16(ent.VelocityZ)},
-	}
-	for _, tc := range encodedVelocities {
-		got, err := r.Uint16()
-		if err != nil || got != tc.want {
-			t.Fatalf("%s = %d, %v; want %d", tc.name, got, err, tc.want)
-		}
 	}
 	if rem := r.Remaining(); rem != 0 {
 		t.Fatalf("remaining bytes = %d, want 0", rem)
