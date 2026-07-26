@@ -61,6 +61,17 @@ type RandomSource interface {
 type PositionalRandomFactory interface {
 	// FromHashOf seeds a child source from the MD5 hash of name.
 	FromHashOf(name string) RandomSource
+	// At seeds a child source from a block position, mirroring
+	// PositionalRandomFactory.at (used by the aquifer and ore veins).
+	At(x, y, z int) RandomSource
+}
+
+// positionSeed is Mth.getSeed: a scrambled hash of a block position, used to
+// seed positional random factories.
+func positionSeed(x, y, z int) int64 {
+	l := int64(int32(x)*3129871) ^ int64(z)*116129781 ^ int64(y)
+	l = l*l*42317861 + l*11
+	return l >> 16
 }
 
 // --- Xoroshiro128++ ---
@@ -142,6 +153,12 @@ func (f *xoroshiroPositional) FromHashOf(name string) RandomSource {
 	return newXoroshiroFrom(lo^f.seedLo, hi^f.seedHi)
 }
 
+// At mirrors XoroshiroPositionalRandomFactory.at: the position hash XORed into
+// the low half of the factory seed, the high half kept as is.
+func (f *xoroshiroPositional) At(x, y, z int) RandomSource {
+	return newXoroshiroFrom(uint64(positionSeed(x, y, z))^f.seedLo, f.seedHi)
+}
+
 // --- Legacy LCG (java.util.Random) ---
 
 const (
@@ -209,6 +226,11 @@ type legacyPositional struct{ seed uint64 }
 // Java String.hashCode of name XORed with the factory seed.
 func (f *legacyPositional) FromHashOf(name string) RandomSource {
 	return NewLegacy(int64(int32(javaStringHashCode(name))) ^ int64(f.seed))
+}
+
+// At mirrors LegacyPositionalRandomFactory.at.
+func (f *legacyPositional) At(x, y, z int) RandomSource {
+	return NewLegacy(positionSeed(x, y, z) ^ int64(f.seed))
 }
 
 func javaStringHashCode(s string) int32 {

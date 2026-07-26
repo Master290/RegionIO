@@ -126,6 +126,12 @@ func QuarterNegative(a DensityFunction) DensityFunction {
 		return x * 0.25
 	}}
 }
+// Invert is the reciprocal transform (DensityFunctions.Mapped.Type.INVERT):
+// 1/x, not negation. The overworld's preliminary_surface_level upper bound is
+// the only place it appears.
+func Invert(a DensityFunction) DensityFunction {
+	return unaryOp{a, func(x float64) float64 { return 1.0 / x }}
+}
 func Squeeze(a DensityFunction) DensityFunction {
 	return unaryOp{a, func(x float64) float64 {
 		d := clamp(x, -1, 1)

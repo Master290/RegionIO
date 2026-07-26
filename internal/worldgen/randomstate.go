@@ -7,15 +7,31 @@ package worldgen
 type RandomState struct {
 	factory PositionalRandomFactory
 	noises  map[string]*NormalNoise
+	// aquifer and ore are the positional factories vanilla derives up front for
+	// the aquifer cell centres and the ore-vein placement, each a forked
+	// positional factory seeded from a named hash of the root factory.
+	aquifer PositionalRandomFactory
+	ore     PositionalRandomFactory
 }
 
 // NewRandomState builds the seeding context for the given world seed.
 func NewRandomState(seed int64) *RandomState {
+	root := NewXoroshiro(seed).ForkPositional()
 	return &RandomState{
-		factory: NewXoroshiro(seed).ForkPositional(),
+		factory: root,
 		noises:  make(map[string]*NormalNoise),
+		aquifer: root.FromHashOf("minecraft:aquifer").ForkPositional(),
+		ore:     root.FromHashOf("minecraft:ore").ForkPositional(),
 	}
 }
+
+// AquiferRandom returns the positional factory the aquifer uses to place its
+// cell centres (RandomState.aquiferRandom).
+func (rs *RandomState) AquiferRandom() PositionalRandomFactory { return rs.aquifer }
+
+// OreRandom returns the positional factory the ore-vein placement uses
+// (RandomState.oreRandom).
+func (rs *RandomState) OreRandom() PositionalRandomFactory { return rs.ore }
 
 // Noise returns the NormalNoise for the named noise parameters, seeded as
 // NormalNoise.create(factory.fromHashOf(name), params) and cached.

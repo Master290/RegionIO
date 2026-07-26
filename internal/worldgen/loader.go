@@ -29,6 +29,30 @@ type OverworldDensity struct {
 	// temperature→Temperature, vegetation→Humidity, continents→Continentalness,
 	// erosion→Erosion, ridges→Weirdness, depth→Depth.
 	Temperature, Humidity, Continentalness, Erosion, Weirdness, Depth DensityFunction
+	// Aquifer inputs (NoiseRouter.barrierNoise and friends). Barrier is the
+	// pressure noise that seals an aquifer off from the surrounding stone;
+	// FluidLevelFloodedness and FluidLevelSpread decide whether a cell holds
+	// fluid and at what level; Lava turns deep aquifers into lava.
+	Barrier, FluidLevelFloodedness, FluidLevelSpread, Lava DensityFunction
+	// Ore-vein inputs (unused until the OreVeinifier lands, but parsed here so
+	// the whole router is wired in one place).
+	VeinToggle, VeinRidged, VeinGap DensityFunction
+	// PreliminarySurfaceLevel is the cheap surface estimate used by the aquifer
+	// and by the above_preliminary_surface surface-rule condition. Read it
+	// through PreliminarySurfaceLevelAt, which quart-aligns and memoises.
+	PreliminarySurfaceLevel DensityFunction
+
+	// Settings read from the same noise settings file.
+	SeaLevel        int
+	MinY            int
+	Height          int
+	AquifersEnabled bool
+	OreVeinsEnabled bool
+
+	// AquiferRandom places the aquifer cell centres.
+	AquiferRandom PositionalRandomFactory
+
+	prelim *levelCache
 }
 
 // SurfaceRule returns the overworld surface rule tree, loading it on first use.
@@ -44,6 +68,13 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 	l := &Loader{rs: NewRandomState(seed), dfCache: make(map[string]DensityFunction)}
 	var settings struct {
 		NoiseRouter map[string]json.RawMessage `json:"noise_router"`
+		SeaLevel    int                        `json:"sea_level"`
+		Noise       struct {
+			MinY   int `json:"min_y"`
+			Height int `json:"height"`
+		} `json:"noise"`
+		AquifersEnabled bool `json:"aquifers_enabled"`
+		OreVeinsEnabled bool `json:"ore_veins_enabled"`
 	}
 	if err := l.readJSON("data/overworld.json", &settings); err != nil {
 		return nil, err
@@ -56,35 +87,67 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 	if err != nil {
 		return nil, err
 	}
-	od := &OverworldDensity{Final: final, Interpolated: l.interpolated}
-
-	// Parse the climate router keys used by the biome finder. Each key resolves
-	// to a density function via the same parseNode/loadRef machinery as
-	// final_density. A missing key is not fatal — the climate axis stays nil and
-	// the sampler treats it as a constant zero — but a parse error is.
-	climateKeys := map[string]*DensityFunction{
-		"temperature":  &od.Temperature,
-		"vegetation":   &od.Humidity,
-		"continents":   &od.Continentalness,
-		"erosion":      &od.Erosion,
-		"ridges":       &od.Weirdness,
-		"depth":        &od.Depth,
+	od := &OverworldDensity{
+		Final:           final,
+		SeaLevel:        settings.SeaLevel,
+		MinY:            settings.Noise.MinY,
+		Height:          settings.Noise.Height,
+		AquifersEnabled: settings.AquifersEnabled,
+		OreVeinsEnabled: settings.OreVeinsEnabled,
+		AquiferRandom:   l.rs.AquiferRandom(),
+		prelim:          newLevelCache(),
 	}
-	for key, dst := range climateKeys {
-		raw, ok := settings.NoiseRouter[key]
+
+	// Parse the remaining router keys. Each resolves to a density function via
+	// the same parseNode/loadRef machinery as final_density. A missing key is
+	// not fatal — the field stays nil and its consumer treats it as absent —
+	// but a parse error is.
+	//
+	// The climate keys feed the biome finder (temperature→Temperature,
+	// vegetation→Humidity, continents→Continentalness, erosion→Erosion,
+	// ridges→Weirdness, depth→Depth); the rest feed the aquifer, the ore veins
+	// and the preliminary surface estimate.
+	//
+	// The order is fixed rather than a map range: parsing assigns Interpolated
+	// node indices in encounter order, and those indices address the cell-corner
+	// grids the generator fills.
+	routerKeys := []struct {
+		key string
+		dst *DensityFunction
+	}{
+		{"temperature", &od.Temperature},
+		{"vegetation", &od.Humidity},
+		{"continents", &od.Continentalness},
+		{"erosion", &od.Erosion},
+		{"ridges", &od.Weirdness},
+		{"depth", &od.Depth},
+		{"barrier", &od.Barrier},
+		{"fluid_level_floodedness", &od.FluidLevelFloodedness},
+		{"fluid_level_spread", &od.FluidLevelSpread},
+		{"lava", &od.Lava},
+		{"vein_toggle", &od.VeinToggle},
+		{"vein_ridged", &od.VeinRidged},
+		{"vein_gap", &od.VeinGap},
+		{"preliminary_surface_level", &od.PreliminarySurfaceLevel},
+	}
+	for _, rk := range routerKeys {
+		raw, ok := settings.NoiseRouter[rk.key]
 		if !ok {
 			continue
 		}
 		var cn any
 		if err := json.Unmarshal(raw, &cn); err != nil {
-			return nil, fmt.Errorf("parse climate key %q: %w", key, err)
+			return nil, fmt.Errorf("parse router key %q: %w", rk.key, err)
 		}
 		df, err := l.parseNode(cn)
 		if err != nil {
-			return nil, fmt.Errorf("climate key %q: %w", key, err)
+			return nil, fmt.Errorf("router key %q: %w", rk.key, err)
 		}
-		*dst = df
+		*rk.dst = df
 	}
+	// Interpolated nodes are collected as the whole router is parsed, so the
+	// list has to be taken after the loop, not just after final_density.
+	od.Interpolated = l.interpolated
 	return od, nil
 }
 
@@ -155,12 +218,12 @@ func (l *Loader) parseObject(m map[string]any) (DensityFunction, error) {
 		default:
 			return Max(a, b), nil
 		}
-	case "abs", "square", "cube", "half_negative", "quarter_negative", "squeeze":
+	case "abs", "square", "cube", "half_negative", "quarter_negative", "invert", "squeeze":
 		a, err := arg("argument")
 		if err != nil {
 			return nil, err
 		}
-		return unaryByName(typ[10:], a), nil
+		return unaryByName(strings.TrimPrefix(typ, "minecraft:"), a), nil
 	case "clamp":
 		a, err := arg("input")
 		if err != nil {
@@ -232,6 +295,25 @@ func (l *Loader) parseObject(m map[string]any) (DensityFunction, error) {
 			rarity = SpaghettiRarity2D
 		}
 		return WeirdScaledSampler{in, n, rarity}, nil
+	case "find_top_surface":
+		density, err := arg("density")
+		if err != nil {
+			return nil, err
+		}
+		upper, err := arg("upper_bound")
+		if err != nil {
+			return nil, err
+		}
+		cellHeight := int(num("cell_height"))
+		if cellHeight <= 0 {
+			return nil, fmt.Errorf("find_top_surface: cell_height must be positive, got %d", cellHeight)
+		}
+		return FindTopSurface{
+			Density:    density,
+			UpperBound: upper,
+			LowerBound: int(num("lower_bound")),
+			CellHeight: cellHeight,
+		}, nil
 	case "spline":
 		return l.parseSpline(m["spline"])
 	case "blend_alpha":
@@ -268,6 +350,8 @@ func unaryByName(name string, a DensityFunction) DensityFunction {
 		return HalfNegative(a)
 	case "quarter_negative":
 		return QuarterNegative(a)
+	case "invert":
+		return Invert(a)
 	default: // squeeze
 		return Squeeze(a)
 	}
