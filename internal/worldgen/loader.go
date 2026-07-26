@@ -17,6 +17,7 @@ type Loader struct {
 	rs           *RandomState
 	dfCache      map[string]DensityFunction
 	interpolated []*Interpolated
+	bands        *clayBands
 }
 
 // OverworldDensity is the parsed final_density plus the set of Interpolated
@@ -445,4 +446,18 @@ func (l *Loader) parseSplineValue(v any) (DensityFunction, error) {
 		}
 	}
 	return l.parseNode(v)
+}
+
+// clayBands builds the world's badlands band table on first use. It is seeded
+// from the root positional factory hashed by name, as SurfaceSystem does.
+func (l *Loader) clayBands() (*clayBands, error) {
+	if l.bands != nil {
+		return l.bands, nil
+	}
+	offset, err := l.noiseField("minecraft:clay_bands_offset")
+	if err != nil {
+		return nil, fmt.Errorf("clay_bands_offset noise: %w", err)
+	}
+	l.bands = newClayBands(l.rs.Positional().FromHashOf("minecraft:clay_bands"), offset)
+	return l.bands, nil
 }

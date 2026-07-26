@@ -302,6 +302,48 @@ func main() {
 		fmt.Printf("  OK: %d of %d grass columns carry 2+ blocks of dirt\n", banded, allGrass)
 	}
 
+	// Badlands banding: the clay band table is 192 entries of seven terracotta
+	// colours. The stand-in it replaced cycled four, so brown, red and light
+	// grey never appeared anywhere in the world.
+	fmt.Println("\n=== Badlands clay bands (expect several terracotta colours down a column) ===")
+	terracottas := map[uint16]string{
+		12912: "terracotta", 11444: "white", 11445: "orange", 11448: "yellow",
+		11452: "light_gray", 11456: "brown", 11458: "red",
+	}
+	seenBands := map[uint16]int{}
+	badlandsCols := 0
+	for cx := int32(-300); cx < 300 && badlandsCols < 8; cx += 7 {
+		for cz := int32(-300); cz < 300 && badlandsCols < 8; cz += 7 {
+			name := world.BiomeNameAt(od, int(cx)*16+8, int(cz)*16+8)
+			if name != "minecraft:badlands" && name != "minecraft:eroded_badlands" && name != "minecraft:wooded_badlands" {
+				continue
+			}
+			ch := gen(cx, cz)
+			for lx := 0; lx < 16; lx += 4 {
+				for lz := 0; lz < 16; lz += 4 {
+					for wy := world.MinY + world.WorldHeight - 1; wy >= world.MinY; wy-- {
+						if _, isBand := terracottas[ch.GetBlock(lx, wy, lz)]; isBand {
+							seenBands[ch.GetBlock(lx, wy, lz)]++
+						}
+					}
+				}
+			}
+			badlandsCols++
+		}
+	}
+	if badlandsCols == 0 {
+		fmt.Println("  (no badlands in the scan area)")
+	} else {
+		for id, label := range terracottas {
+			fmt.Printf("  %-11s %d\n", label, seenBands[id])
+		}
+		if len(seenBands) < 6 {
+			fmt.Printf("  FAIL: only %d of 7 terracotta colours placed\n", len(seenBands))
+		} else {
+			fmt.Printf("  OK: %d of 7 terracotta colours across %d badlands chunks\n", len(seenBands), badlandsCols)
+		}
+	}
+
 	// 2) Cross-section at chunk (0,0): column x=8, over full Y, ASCII.
 	fmt.Println("\n=== Cross-section chunk(0,0) z=8, x=0..15 (side view, top 96 blocks near surface) ===")
 	c := gen(0, 0)

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
 )
 
 // surface.go implements the vanilla SurfaceRules interpreter: a rule tree that
@@ -59,10 +58,6 @@ type SurfaceContext struct {
 	// the interpolated preliminary surface level plus SurfaceDepth less 8.
 	// above_preliminary_surface tests Y against it.
 	MinSurfaceLevel int
-	// Rng is a per-column deterministic source for the bandlands rule. It is
-	// seeded by the column so results are stable across runs.
-	Rng *rand.Rand
-
 	// noiseValues holds one sample per noise the rule tree's noise_threshold
 	// conditions reference, refreshed once per column by BeginColumn. Vanilla
 	// caches these the same way, through LazyXZCondition.
@@ -107,29 +102,13 @@ func (r conditionRule) Apply(ctx *SurfaceContext) (uint16, bool) {
 	return r.then.Apply(ctx)
 }
 
-// bandlandsRule reproduces the vanilla badlands coloured-clay banding: a
-// deterministic per-column pattern of terracotta colours at certain Y bands. We
-// approximate the 8-band rotation using the column RNG; exact band geometry is
-// captured well enough to read as badlands.
-type bandlandsRule struct{}
+// bandlandsRule reads the world's clay band table at the block's height,
+// shifted horizontally by the clay_bands_offset noise. It is what stripes the
+// badlands.
+type bandlandsRule struct{ bands *clayBands }
 
-func (bandlandsRule) Apply(ctx *SurfaceContext) (uint16, bool) {
-	orange, _ := surfaceBlockID("minecraft:orange_terracotta", nil)
-	if ctx.Rng == nil {
-		return orange, true
-	}
-	// Vanilla chooses band by Y + a per-column random offset; the rotation
-	// cycles white/orange/yellow/orange terracotta. Pick from the cycle by Y.
-	white, _ := surfaceBlockID("minecraft:white_terracotta", nil)
-	yellow, _ := surfaceBlockID("minecraft:yellow_terracotta", nil)
-	switch (ctx.Y + ctx.Rng.Intn(7)) % 4 {
-	case 0:
-		return white, true
-	case 1, 3:
-		return orange, true
-	default:
-		return yellow, true
-	}
+func (r bandlandsRule) Apply(ctx *SurfaceContext) (uint16, bool) {
+	return r.bands.bandAt(ctx.X, ctx.Y, ctx.Z), true
 }
 
 // ---- Condition tests ---------------------------------------------------
@@ -188,27 +167,13 @@ func (t waterTest) Test(ctx *SurfaceContext) bool {
 	return y >= ctx.WaterHeight+t.offset+ctx.SurfaceDepth*t.surfaceDepthMul
 }
 
-// temperatureTest passes when the (column) temperature is below freezing — the
-// snow-at-height rule. We fold temperature into the biome name (snowy_*
-// biomes) rather than sampling the temperature noise, so pass for cold biomes.
+// temperatureTest passes where the biome is cold enough for snow and ice
+// rather than rain. The overworld tree uses it once, to freeze holes in a
+// frozen ocean floor.
 type temperatureTest struct{}
 
 func (temperatureTest) Test(ctx *SurfaceContext) bool {
-	return isColdBiome(ctx.BiomeName)
-}
-
-// isColdBiome reports whether the biome should receive snow cover. We use the
-// biome name rather than the temperature noise for simplicity; this matches
-// the visible result for the standard overworld biomes.
-func isColdBiome(name string) bool {
-	switch name {
-	case "minecraft:snowy_plains", "minecraft:snowy_taiga", "minecraft:snowy_beach",
-		"minecraft:snowy_slopes", "minecraft:jagged_peaks", "minecraft:frozen_peaks",
-		"minecraft:frozen_river", "minecraft:frozen_ocean", "minecraft:deep_frozen_ocean",
-		"minecraft:ice_spikes", "minecraft:grove":
-		return true
-	}
-	return false
+	return coldEnoughToSnow(ctx.BiomeName)
 }
 
 // yAboveTest passes when Y clears an anchor, with optional surface-depth and
@@ -445,7 +410,11 @@ func (p *surfaceParser) parseRule(raw json.RawMessage) (SurfaceRule, error) {
 		return conditionRule{test: test, then: then}, nil
 
 	case "minecraft:bandlands":
-		return bandlandsRule{}, nil
+		bands, err := p.loader.clayBands()
+		if err != nil {
+			return nil, err
+		}
+		return bandlandsRule{bands: bands}, nil
 	}
 	return nil, fmt.Errorf("surface: unknown rule type %q", obj.Type)
 }

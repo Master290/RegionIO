@@ -1,9 +1,6 @@
 package worldgen
 
-import (
-	"math/rand"
-	"testing"
-)
+import "testing"
 
 // loadTestRules compiles the overworld surface rule set at a fixed seed.
 func loadTestRules(t *testing.T) *SurfaceRuleSet {
@@ -47,7 +44,6 @@ func TestSurfaceRuleNoPanic(t *testing.T) {
 	ctx.SeaLevel, ctx.MinY = 63, -64
 	ctx.MinSurfaceLevel, ctx.WaterHeight = 80, NoWaterAbove
 	ctx.SurfaceDepth = 3
-	ctx.Rng = rand.New(rand.NewSource(1))
 	for _, b := range biomes {
 		ctx.BiomeName = b
 		for y := 0; y < 100; y++ {
@@ -70,7 +66,6 @@ func TestSurfaceBedrockFloor(t *testing.T) {
 	ctx.BiomeName = "minecraft:plains"
 	ctx.MinSurfaceLevel, ctx.WaterHeight = 62, NoWaterAbove
 	ctx.SurfaceDepth = 3
-	ctx.Rng = rand.New(rand.NewSource(1))
 	state, ok := rules.Apply(ctx)
 	if !ok {
 		t.Fatal("no rule matched at bedrock floor")
@@ -116,20 +111,36 @@ func TestSurfaceBlockIDResolution(t *testing.T) {
 	}
 }
 
-// TestIsColdBiome confirms the snow-cover predicate recognises cold biomes so
-// the temperature condition routes snowy biomes to snow.
-func TestIsColdBiome(t *testing.T) {
-	cold := []string{"minecraft:snowy_plains", "minecraft:frozen_peaks", "minecraft:grove"}
+// TestColdEnoughToSnow pins the temperature predicate against the biome table
+// extracted from the jar. deep_frozen_ocean is the interesting case: the name
+// reads cold but its base temperature is 0.5, so vanilla does not freeze it —
+// the hand-written list this replaced got it wrong.
+func TestColdEnoughToSnow(t *testing.T) {
+	cold := []string{
+		"minecraft:frozen_ocean", "minecraft:frozen_peaks", "minecraft:frozen_river",
+		"minecraft:grove", "minecraft:ice_spikes", "minecraft:jagged_peaks",
+		"minecraft:snowy_beach", "minecraft:snowy_plains", "minecraft:snowy_slopes",
+		"minecraft:snowy_taiga",
+	}
 	for _, b := range cold {
-		if !isColdBiome(b) {
-			t.Errorf("isColdBiome(%q) = false, want true", b)
+		if !coldEnoughToSnow(b) {
+			t.Errorf("coldEnoughToSnow(%q) = false, want true", b)
 		}
 	}
-	warm := []string{"minecraft:desert", "minecraft:plains", "minecraft:badlands"}
+	warm := []string{
+		"minecraft:desert", "minecraft:plains", "minecraft:badlands",
+		"minecraft:deep_frozen_ocean", "minecraft:taiga", "minecraft:windswept_hills",
+	}
 	for _, b := range warm {
-		if isColdBiome(b) {
-			t.Errorf("isColdBiome(%q) = true, want false", b)
+		if coldEnoughToSnow(b) {
+			t.Errorf("coldEnoughToSnow(%q) = true, want false", b)
 		}
+	}
+	if coldEnoughToSnow("minecraft:not_a_biome") {
+		t.Error("an unknown biome read as cold")
+	}
+	if len(biomeTemperature) != 65 {
+		t.Errorf("biome temperature table has %d entries, want 65", len(biomeTemperature))
 	}
 }
 

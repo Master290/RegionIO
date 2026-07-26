@@ -123,13 +123,12 @@ func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPi
 				sctx = surfaceRule.NewContext()
 			}
 			for lz := 0; lz < 16; lz++ {
-				rng := newColumnRand(baseX+lx, baseZ+lz, int(seed))
 				if ruleErr == nil {
 					applySurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
-						baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz], rng)
-				} else {
-					fillLegacySurface(&columns[lx][lz], surfTop[lx][lz], rng)
+						baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz])
+					continue
 				}
+				fillLegacySurface(&columns[lx][lz], surfTop[lx][lz], newColumnRand(baseX+lx, baseZ+lz, int(seed)))
 			}
 		}(lx)
 	}
@@ -275,7 +274,7 @@ func substance(aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, x, y, z i
 // One *rand.Rand is created per column (not per block) — bandlands/gradient
 // consume from it sequentially, which is correct because vanilla seeds those
 // per-column too. This avoids ~98k rand.New allocations per chunk.
-func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string, rng chunkRand) {
+func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string) {
 	top := -1
 	for i := WorldHeight - 1; i >= 0; i-- {
 		if out[i] != StateAir {
@@ -299,7 +298,6 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 	sctx.SurfaceDepth = surfaceDepth
 	sctx.MinSurfaceLevel = od.MinSurfaceLevelAt(wx, wz, surfaceDepth)
 	sctx.Steep = steepAt(worldSurface, lx, lz)
-	sctx.Rng = rng.toRand()
 	minY := MinY
 	stoneDepthAbove := 0
 	waterHeight := worldgen.NoWaterAbove
