@@ -34,9 +34,11 @@ func TestSurfaceRuleNoPanic(t *testing.T) {
 	for _, b := range biomes {
 		for y := 0; y < 100; y++ {
 			ctx := &SurfaceContext{
-				X: 100, Y: y, Z: 100, StoneDepthAbove: 100 - y,
+				X: 100, Y: y, Z: 100,
+				StoneDepthAbove: 100 - y, StoneDepthBelow: y + 1,
 				SeaLevel: 63, BiomeName: b, MinY: -64,
-				PreliminarySurface: 100, Rng: rand.New(rand.NewSource(1)),
+				PreliminarySurface: 100, WaterHeight: NoWaterAbove,
+				Rng: rand.New(rand.NewSource(1)),
 			}
 			rule.Apply(ctx) // must not panic
 		}
@@ -51,9 +53,10 @@ func TestSurfaceBedrockFloor(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	ctx := &SurfaceContext{
-		X: 0, Y: -64, Z: 0, StoneDepthAbove: 0,
+		X: 0, Y: -64, Z: 0, StoneDepthAbove: 1, StoneDepthBelow: 1,
 		SeaLevel: 63, BiomeName: "minecraft:plains", MinY: -64,
-		PreliminarySurface: 70, Rng: rand.New(rand.NewSource(1)),
+		PreliminarySurface: 70, WaterHeight: NoWaterAbove,
+		Rng: rand.New(rand.NewSource(1)),
 	}
 	state, ok := rule.Apply(ctx)
 	if !ok {
@@ -102,6 +105,67 @@ func TestIsColdBiome(t *testing.T) {
 	for _, b := range warm {
 		if isColdBiome(b) {
 			t.Errorf("isColdBiome(%q) = true, want false", b)
+		}
+	}
+}
+
+// TestWaterCondition pins SurfaceRules.WaterConditionSource against the
+// column's own water surface. The offsets are the three forms the overworld
+// tree actually uses: (0,0,false) for "is this block dry", (-1,0,false) for the
+// block just under the waterline, and (-6,-1,true) for the beach/shore band.
+func TestWaterCondition(t *testing.T) {
+	cases := []struct {
+		name string
+		test waterTest
+		ctx  SurfaceContext
+		want bool
+	}{
+		{
+			name: "no water above passes",
+			test: waterTest{},
+			ctx:  SurfaceContext{Y: 20, WaterHeight: NoWaterAbove},
+			want: true,
+		},
+		{
+			name: "at the waterline passes",
+			test: waterTest{},
+			ctx:  SurfaceContext{Y: 63, WaterHeight: 63},
+			want: true,
+		},
+		{
+			name: "one block under water fails",
+			test: waterTest{},
+			ctx:  SurfaceContext{Y: 62, WaterHeight: 63},
+			want: false,
+		},
+		{
+			name: "offset -1 reaches one block deeper",
+			test: waterTest{offset: -1},
+			ctx:  SurfaceContext{Y: 62, WaterHeight: 63},
+			want: true,
+		},
+		{
+			name: "an aquifer pool at y=-20 is measured against itself, not sea level",
+			test: waterTest{},
+			ctx:  SurfaceContext{Y: -25, WaterHeight: -20, SeaLevel: 63},
+			want: false,
+		},
+		{
+			name: "stone above the same pool is dry",
+			test: waterTest{},
+			ctx:  SurfaceContext{Y: -19, WaterHeight: -20, SeaLevel: 63},
+			want: true,
+		},
+		{
+			name: "add_stone_depth counts buried stone towards the threshold",
+			test: waterTest{offset: -6, surfaceDepthMul: -1, addStoneDepth: true},
+			ctx:  SurfaceContext{Y: 55, WaterHeight: 63, StoneDepthAbove: 2, SurfaceDepth: 0},
+			want: true,
+		},
+	}
+	for _, c := range cases {
+		if got := c.test.Test(&c.ctx); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
 		}
 	}
 }

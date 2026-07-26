@@ -273,18 +273,18 @@ func applySurfaceRule(out *[WorldHeight]uint16, wx, wz, seaLevel, minY int, biom
 		Rng:                colRng,
 	}
 	stoneDepthAbove := 0
-	waterHeight := math.MinInt
+	waterHeight := worldgen.NoWaterAbove
 	nextCeilingStoneY := math.MaxInt
 	for i := top; i >= 0; i-- {
 		y := minY + i
 		old := out[i]
 		if old == StateAir {
 			stoneDepthAbove = 0
-			waterHeight = math.MinInt
+			waterHeight = worldgen.NoWaterAbove
 			continue
 		}
 		if isFluidState(old) {
-			if waterHeight == math.MinInt {
+			if waterHeight == worldgen.NoWaterAbove {
 				waterHeight = y + 1
 			}
 			continue

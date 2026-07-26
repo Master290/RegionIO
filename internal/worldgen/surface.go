@@ -3,6 +3,7 @@ package worldgen
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 )
@@ -18,6 +19,11 @@ import (
 // or the special bandlands badlands-clay rule. Condition tests are the 11 types
 // present in the overworld rule tree.
 
+// NoWaterAbove is the "dry column" sentinel for SurfaceContext.WaterHeight,
+// matching the Integer.MIN_VALUE vanilla uses. A caller building a context by
+// hand must set it explicitly; the zero value would read as water at y=0.
+const NoWaterAbove = math.MinInt
+
 // SurfaceContext carries the per-block data a surface rule needs to decide.
 type SurfaceContext struct {
 	// X, Y, Z are the block's world coordinates.
@@ -30,7 +36,7 @@ type SurfaceContext struct {
 	StoneDepthAbove int
 	StoneDepthBelow int
 	// WaterHeight is one above the lowest fluid block of the run of fluid
-	// directly above Y, or math.MinInt when no fluid sits above Y with no air
+	// directly above Y, or NoWaterAbove when no fluid sits above Y with no air
 	// in between. It is what the water condition measures against.
 	WaterHeight int
 	// SeaLevel is the world sea level (63 for the overworld).
@@ -148,19 +154,29 @@ type holeTest struct{}
 
 func (holeTest) Test(ctx *SurfaceContext) bool { return false }
 
-// waterTest passes when the block is within `offset` of the water surface
-// (vanilla SurfaceRules.WATER). We treat it as "at or just below sea level" —
-// the common case for beach/shore rules.
+// waterTest passes when the block is clear of the water above it — either there
+// is none, or it sits far enough below the water's underside
+// (SurfaceRules.WaterConditionSource).
+//
+// The height compared against is the column's own water surface, not sea level.
+// Those differ wherever the aquifer put a pool at its own level: an underground
+// lake, a mountain tarn or a flooded cave sit nowhere near y=63, and measuring
+// them against sea level dressed dry stone as lakebed and lakebed as dry stone.
 type waterTest struct {
-	offset               int
-	surfaceDepthMul      int
-	addStoneDepth        bool
+	offset          int
+	surfaceDepthMul int
+	addStoneDepth   bool
 }
 
 func (t waterTest) Test(ctx *SurfaceContext) bool {
-	// Vanilla: passes when Y >= seaLevel + offset + surfaceDepth*mul (±stone).
-	threshold := ctx.SeaLevel + t.offset + ctx.SurfaceDepth*t.surfaceDepthMul
-	return ctx.Y >= threshold
+	if ctx.WaterHeight == NoWaterAbove {
+		return true
+	}
+	y := ctx.Y
+	if t.addStoneDepth {
+		y += ctx.StoneDepthAbove
+	}
+	return y >= ctx.WaterHeight+t.offset+ctx.SurfaceDepth*t.surfaceDepthMul
 }
 
 // temperatureTest passes when the (column) temperature is below freezing — the
