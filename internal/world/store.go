@@ -23,6 +23,21 @@ import (
 // from versions/.../server.jar's version.json "world_version".
 const dataVersion26 = 4790
 
+// generatorVersion identifies the output of the current chunk generator. Every
+// chunk we save carries it, and loading rejects any chunk stamped differently.
+//
+// BUMP THIS in any commit that changes what the generator produces.
+//
+// Without it a world directory silently pins whatever the generator did the
+// first time it ran: chunkAt prefers the store over the generator, so the
+// already-explored area around spawn keeps its old terrain and every later fix
+// looks like it did nothing in exactly the place you are standing.
+const generatorVersion = 1
+
+// generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
+// because it is ours, not part of the vanilla chunk format.
+const generatorVersionTag = "RegionIOGeneratorVersion"
+
 // minYSection is the on-disk "yPos": the section index at MinY (-64 → -4),
 // since sections are 16 blocks tall and the overworld is 24 sections from
 // section index -4 to 19.
@@ -254,6 +269,7 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 
 	return nbt.NewCompound().
 		Set("DataVersion", nbt.Int(dataVersion26)).
+		Set(generatorVersionTag, nbt.Int(generatorVersion)).
 		Set("Level", level)
 }
 
@@ -399,6 +415,16 @@ func packIndices(ids []uint16, indexOf map[uint16]int) nbt.LongArray {
 // absolute coordinates are derived from the on-disk xPos/zPos (authoritative);
 // the region/local coords passed in are used only to validate.
 func nbtToChunk(root *nbt.Compound, regionX, regionZ, localX, localZ int) (*Chunk, error) {
+	// Reject anything the current generator did not produce so the caller
+	// regenerates instead of serving stale terrain. Chunks written before the
+	// stamp existed have no tag and decode as 0, so they are invalidated too.
+	// This is per-chunk on purpose: the world metadata file guards the seed,
+	// which is a hard mismatch, while a generator change is routine and should
+	// quietly regenerate rather than refuse to open the world.
+	if v := nbtAsInt(root, generatorVersionTag); v != generatorVersion {
+		return nil, ErrChunkNotFound
+	}
+
 	levelTag, ok := root.Get("Level")
 	if !ok {
 		return nil, fmt.Errorf("world: chunk NBT missing Level")

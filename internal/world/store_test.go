@@ -495,3 +495,56 @@ func TestConcurrentAutosavePreservesLatestEdit(t *testing.T) {
 		t.Fatalf("persisted final block = %d, want %d", got, StateBedrock)
 	}
 }
+
+// TestGeneratorVersionStampRejectsStaleChunks covers the guard that keeps a
+// saved world from masking generator changes.
+//
+// chunkAt prefers the store over the generator, so without this check a chunk
+// saved by an older build is served forever and every later worldgen fix looks
+// like it did nothing in the already-explored area around spawn. Chunks written
+// before the stamp existed carry no tag and must be rejected the same way.
+func TestGeneratorVersionStampRejectsStaleChunks(t *testing.T) {
+	toRoot := func(t *testing.T, c *nbt.Compound) *nbt.Compound {
+		t.Helper()
+		_, tag, err := nbt.UnmarshalNamed(nbt.MarshalNamed("", c))
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		root, ok := tag.(*nbt.Compound)
+		if !ok {
+			t.Fatal("root is not a compound")
+		}
+		return root
+	}
+
+	t.Run("current version loads", func(t *testing.T) {
+		root := toRoot(t, chunkToNBT(NewChunk(0, 0, BiomePlains)))
+		if _, err := nbtToChunk(root, 0, 0, 0, 0); err != nil {
+			t.Fatalf("nbtToChunk on a freshly written chunk: %v", err)
+		}
+	})
+
+	t.Run("older version is rejected", func(t *testing.T) {
+		c := chunkToNBT(NewChunk(0, 0, BiomePlains))
+		c.Set(generatorVersionTag, nbt.Int(generatorVersion-1))
+		if _, err := nbtToChunk(toRoot(t, c), 0, 0, 0, 0); err != ErrChunkNotFound {
+			t.Errorf("err = %v, want ErrChunkNotFound so the chunk regenerates", err)
+		}
+	})
+
+	t.Run("missing stamp is rejected", func(t *testing.T) {
+		// What every chunk written before this guard existed looks like.
+		c := chunkToNBT(NewChunk(0, 0, BiomePlains))
+		stripped := nbt.NewCompound()
+		for _, name := range c.Keys() {
+			if name == generatorVersionTag {
+				continue
+			}
+			v, _ := c.Get(name)
+			stripped.Set(name, v)
+		}
+		if _, err := nbtToChunk(toRoot(t, stripped), 0, 0, 0, 0); err != ErrChunkNotFound {
+			t.Errorf("err = %v, want ErrChunkNotFound so the chunk regenerates", err)
+		}
+	})
+}

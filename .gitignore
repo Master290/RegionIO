@@ -16,10 +16,22 @@
 # All build-time embeds live under internal/; generated/ is not needed to build.
 /generated/
 
+# Decompiled vanilla sources kept locally for reference (not redistributable).
+/.refjava/
+
+# Generated world. Chunks are reproducible from the seed, and committing them is
+# actively harmful: the store takes priority over the generator, so a stale
+# region file pins old terrain around spawn and hides worldgen changes. This
+# supersedes the narrower /world/regionio-world.json rule.
+/world/
+
 # Logs and runtime artefacts
 /logs/
 *.log
-/world/regionio-world.json
+
+# Development notes and session transcripts kept locally, not source.
+/chat.md
+/20[0-9][0-9]-*.txt
 
 # Editor / tool local config
 /.claude/
