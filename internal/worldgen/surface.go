@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"sync"
 )
 
 // surface.go implements the vanilla SurfaceRules interpreter: a rule tree that
@@ -45,11 +44,8 @@ type SurfaceContext struct {
 	BiomeName string
 	// MinY is the world bottom for relative-anchor resolution.
 	MinY int
-	// SurfaceNoise is the "minecraft:surface" noise sample at (X,Z); the
-	// noise_threshold condition ranges over it.
-	SurfaceNoise float64
-	// Steep is true when the local slope exceeds the vanilla steep threshold
-	// (~1.0 surface-depth delta between neighbours).
+	// Steep is true when the column's neighbours in the chunk differ in height
+	// by four or more blocks (SurfaceRules.SteepMaterialCondition).
 	Steep bool
 	// SurfaceDepth is how thick the biome's surface layers are at this column
 	// (SurfaceSystem.getSurfaceDepth): usually 3, sometimes 0 or less, which is
@@ -63,9 +59,14 @@ type SurfaceContext struct {
 	// the interpolated preliminary surface level plus SurfaceDepth less 8.
 	// above_preliminary_surface tests Y against it.
 	MinSurfaceLevel int
-	// Rng is a per-column deterministic source for vertical_gradient and
-	// bandlands. It is seeded by the column so results are stable across runs.
+	// Rng is a per-column deterministic source for the bandlands rule. It is
+	// seeded by the column so results are stable across runs.
 	Rng *rand.Rand
+
+	// noiseValues holds one sample per noise the rule tree's noise_threshold
+	// conditions reference, refreshed once per column by BeginColumn. Vanilla
+	// caches these the same way, through LazyXZCondition.
+	noiseValues []float64
 }
 
 // SurfaceRule decides the block at a context. Apply returns ok=false when the
@@ -113,19 +114,21 @@ func (r conditionRule) Apply(ctx *SurfaceContext) (uint16, bool) {
 type bandlandsRule struct{}
 
 func (bandlandsRule) Apply(ctx *SurfaceContext) (uint16, bool) {
+	orange, _ := surfaceBlockID("minecraft:orange_terracotta", nil)
 	if ctx.Rng == nil {
-		return surfaceBlockID("minecraft:orange_terracotta", nil), true
+		return orange, true
 	}
 	// Vanilla chooses band by Y + a per-column random offset; the rotation
 	// cycles white/orange/yellow/orange terracotta. Pick from the cycle by Y.
-	band := (ctx.Y + ctx.Rng.Intn(7)) % 4
-	switch band {
+	white, _ := surfaceBlockID("minecraft:white_terracotta", nil)
+	yellow, _ := surfaceBlockID("minecraft:yellow_terracotta", nil)
+	switch (ctx.Y + ctx.Rng.Intn(7)) % 4 {
 	case 0:
-		return surfaceBlockID("minecraft:white_terracotta", nil), true
+		return white, true
 	case 1, 3:
-		return surfaceBlockID("minecraft:orange_terracotta", nil), true
+		return orange, true
 	default:
-		return surfaceBlockID("minecraft:yellow_terracotta", nil), true
+		return yellow, true
 	}
 }
 
@@ -153,12 +156,12 @@ type steepTest struct{}
 
 func (steepTest) Test(ctx *SurfaceContext) bool { return ctx.Steep }
 
-// holeTest passes in surface "holes" below the surrounding terrain — we
-// approximate as "below sea level and not the top" since true hole detection
-// needs a neighbourhood. Conservative: false (rare rule, low visual cost).
+// holeTest passes where the surface depth noise came out at or below zero — a
+// bare patch with no surface layer at all, which is how coarse dirt and gravel
+// scars appear in the middle of grass.
 type holeTest struct{}
 
-func (holeTest) Test(ctx *SurfaceContext) bool { return false }
+func (holeTest) Test(ctx *SurfaceContext) bool { return ctx.SurfaceDepth <= 0 }
 
 // waterTest passes when the block is clear of the water above it — either there
 // is none, or it sits far enough below the water's underside
@@ -208,34 +211,21 @@ func isColdBiome(name string) bool {
 	return false
 }
 
-// yAboveTest passes when Y is above an anchor (absolute, above_bottom, or
-// below_top), with optional surface-depth and stone-depth offsets.
+// yAboveTest passes when Y clears an anchor, with optional surface-depth and
+// stone-depth offsets. The anchor is resolved against the world's height bounds
+// at parse time.
 type yAboveTest struct {
-	absolute           int
-	hasAbsolute        bool
-	aboveBottom        int
-	hasAboveBottom     bool
-	belowTop           int
-	hasBelowTop        bool
-	addStoneDepth      bool
-	surfaceDepthMul    int
+	anchorY         int
+	addStoneDepth   bool
+	surfaceDepthMul int
 }
 
 func (t yAboveTest) Test(ctx *SurfaceContext) bool {
-	var anchor int
-	switch {
-	case t.hasAbsolute:
-		anchor = t.absolute
-	case t.hasAboveBottom:
-		anchor = ctx.MinY + t.aboveBottom
-	case t.hasBelowTop:
-		anchor = (ctx.MinY + 384) - 1 - t.belowTop
-	}
-	threshold := anchor + ctx.SurfaceDepth*t.surfaceDepthMul
+	y := ctx.Y
 	if t.addStoneDepth {
-		threshold += ctx.StoneDepthAbove
+		y += ctx.StoneDepthAbove
 	}
-	return ctx.Y >= threshold
+	return y >= t.anchorY+ctx.SurfaceDepth*t.surfaceDepthMul
 }
 
 // stoneDepthTest passes when the block is within `offset` of the surface it
@@ -266,19 +256,22 @@ func (t stoneDepthTest) Test(ctx *SurfaceContext) bool {
 	return depth <= 1+t.offset+surfaceDepth+secondary
 }
 
-// noiseThresholdTest passes when the named surface noise is within [min,max].
+// noiseThresholdTest passes when its noise, sampled once per column at y=0, is
+// within [min,max]. slot indexes SurfaceContext.noiseValues, which the rule set
+// refreshes per column.
+//
+// Six of the seven noises the overworld tree uses were unsupported and fell
+// through as false, so calcite on stony peaks, ice and packed ice on frozen
+// peaks, powder snow, swamp water windows and gravel patches on stony shores
+// never appeared at all.
 type noiseThresholdTest struct {
 	min, max float64
-	noise    string
+	slot     int
 }
 
 func (t noiseThresholdTest) Test(ctx *SurfaceContext) bool {
-	// Only "minecraft:surface" is sampled in SurfaceContext; other noises fall
-	// through as false (conservative).
-	if t.noise != "minecraft:surface" {
-		return false
-	}
-	return ctx.SurfaceNoise >= t.min && ctx.SurfaceNoise <= t.max
+	v := ctx.noiseValues[t.slot]
+	return v >= t.min && v <= t.max
 }
 
 // notTest inverts its inner test.
@@ -286,33 +279,30 @@ type notTest struct{ inner ConditionTest }
 
 func (t notTest) Test(ctx *SurfaceContext) bool { return !t.inner.Test(ctx) }
 
-// verticalGradientTest reproduces the bedrock-floor gradient: a deterministic
-// band from true_at_and_below to false_at_and_above where membership tapers via
-// the column RNG. Anchors are above_bottom offsets from the world floor.
+// verticalGradientTest is the scattered transition between two layers: true
+// below one anchor, false above another, and in between a per-position coin
+// flip whose bias falls linearly with height. It draws the bedrock floor and
+// the stone-to-deepslate boundary.
+//
+// The anchors are resolved once at parse time, so this needs the world's height
+// bounds; the random factory is named by the rule (bedrock_floor, deepslate)
+// and forked from the world seed, so the same y gets the same answer every
+// time the chunk regenerates.
 type verticalGradientTest struct {
-	randomName      string
-	trueAtAndBelow  int // above_bottom
-	falseAtAndAbove int // above_bottom
+	trueAtAndBelow  int
+	falseAtAndAbove int
+	random          PositionalRandomFactory
 }
 
 func (t verticalGradientTest) Test(ctx *SurfaceContext) bool {
-	loY := ctx.MinY + t.trueAtAndBelow
-	hiY := ctx.MinY + t.falseAtAndAbove
-	switch {
-	case ctx.Y <= loY:
+	if ctx.Y <= t.trueAtAndBelow {
 		return true
-	case ctx.Y >= hiY:
+	}
+	if ctx.Y >= t.falseAtAndAbove {
 		return false
 	}
-	// Taper band: probability decreases linearly. Use the per-column RNG once
-	// per Y so the floor is stable but noisy. We approximate vanilla's
-	// random-based interpolation.
-	if ctx.Rng == nil {
-		return false
-	}
-	band := hiY - loY
-	pos := ctx.Y - loY
-	return ctx.Rng.Float64() > float64(pos)/float64(band)
+	probability := mapRange(float64(ctx.Y), float64(t.trueAtAndBelow), float64(t.falseAtAndAbove), 1.0, 0.0)
+	return float64(t.random.At(ctx.X, ctx.Y, ctx.Z).NextFloat()) < probability
 }
 
 // abovePreliminarySurfaceTest gates the whole biome surface subtree: below the
@@ -325,8 +315,77 @@ func (abovePreliminarySurfaceTest) Test(ctx *SurfaceContext) bool {
 
 // ---- Parser ------------------------------------------------------------
 
-// ParseSurfaceRule parses a surface_rule JSON node into a rule tree.
-func ParseSurfaceRule(raw json.RawMessage) (SurfaceRule, error) {
+// SurfaceRuleSet is a compiled surface rule tree together with the seeded
+// noises and random factories its conditions reference.
+//
+// The tree used to be parsed once, globally, and shared by every world: the
+// conditions that need the seed simply did not work. Binding it to a
+// RandomState is what lets noise_threshold sample a real noise and
+// vertical_gradient roll a real per-position coin.
+type SurfaceRuleSet struct {
+	root   SurfaceRule
+	noises []*NormalNoise
+}
+
+// NewContext returns a SurfaceContext sized for this rule set's per-column
+// noise cache. Reuse one per goroutine; BeginColumn refreshes it.
+func (s *SurfaceRuleSet) NewContext() *SurfaceContext {
+	return &SurfaceContext{noiseValues: make([]float64, len(s.noises))}
+}
+
+// BeginColumn samples every noise the tree references at (x, z) and stores the
+// column coordinates. Vanilla samples these lazily and caches them per column;
+// sampling all of them up front costs a handful of evaluations per column and
+// keeps the tree free of hidden state.
+func (s *SurfaceRuleSet) BeginColumn(ctx *SurfaceContext, x, z int) {
+	ctx.X, ctx.Z = x, z
+	for i, n := range s.noises {
+		ctx.noiseValues[i] = n.GetValue(float64(x), 0, float64(z))
+	}
+}
+
+// Apply runs the tree at the context's current position.
+func (s *SurfaceRuleSet) Apply(ctx *SurfaceContext) (uint16, bool) { return s.root.Apply(ctx) }
+
+// surfaceParser carries the seed-dependent state a rule tree needs while it is
+// being built: where to get noises and random factories, and the world's height
+// bounds for resolving vertical anchors.
+type surfaceParser struct {
+	loader       *Loader
+	minY, height int
+	noises       []*NormalNoise
+	noiseSlots   map[string]int
+}
+
+// noiseSlot returns the per-column cache index for a named noise, loading and
+// seeding it on first use.
+func (p *surfaceParser) noiseSlot(name string) (int, error) {
+	if slot, ok := p.noiseSlots[name]; ok {
+		return slot, nil
+	}
+	n, err := p.loader.noiseField(name)
+	if err != nil {
+		return 0, err
+	}
+	slot := len(p.noises)
+	p.noises = append(p.noises, n)
+	p.noiseSlots[name] = slot
+	return slot, nil
+}
+
+// resolveAnchor is VerticalAnchor.resolveY.
+func (p *surfaceParser) resolveAnchor(a anchorJSON) int {
+	switch a.kind {
+	case anchorAboveBottom:
+		return p.minY + a.value
+	case anchorBelowTop:
+		return p.minY + p.height - 1 - a.value
+	default:
+		return a.value
+	}
+}
+
+func (p *surfaceParser) parseRule(raw json.RawMessage) (SurfaceRule, error) {
 	var obj struct {
 		Type string `json:"type"`
 	}
@@ -344,7 +403,11 @@ func ParseSurfaceRule(raw json.RawMessage) (SurfaceRule, error) {
 		if err := json.Unmarshal(raw, &b); err != nil {
 			return nil, err
 		}
-		return blockRule{state: surfaceBlockID(b.Result.Name, b.Result.Properties)}, nil
+		state, ok := surfaceBlockID(b.Result.Name, b.Result.Properties)
+		if !ok {
+			return nil, fmt.Errorf("surface: no block-state ID for %q %v", b.Result.Name, b.Result.Properties)
+		}
+		return blockRule{state: state}, nil
 
 	case "minecraft:sequence":
 		var s struct {
@@ -355,7 +418,7 @@ func ParseSurfaceRule(raw json.RawMessage) (SurfaceRule, error) {
 		}
 		rules := make([]SurfaceRule, 0, len(s.Sequence))
 		for _, child := range s.Sequence {
-			r, err := ParseSurfaceRule(child)
+			r, err := p.parseRule(child)
 			if err != nil {
 				return nil, err
 			}
@@ -371,11 +434,11 @@ func ParseSurfaceRule(raw json.RawMessage) (SurfaceRule, error) {
 		if err := json.Unmarshal(raw, &c); err != nil {
 			return nil, err
 		}
-		test, err := parseCondition(c.IfTrue)
+		test, err := p.parseCondition(c.IfTrue)
 		if err != nil {
 			return nil, err
 		}
-		then, err := ParseSurfaceRule(c.Then)
+		then, err := p.parseRule(c.Then)
 		if err != nil {
 			return nil, err
 		}
@@ -388,7 +451,7 @@ func ParseSurfaceRule(raw json.RawMessage) (SurfaceRule, error) {
 }
 
 // parseCondition parses an if_true condition node into a ConditionTest.
-func parseCondition(raw json.RawMessage) (ConditionTest, error) {
+func (p *surfaceParser) parseCondition(raw json.RawMessage) (ConditionTest, error) {
 	var obj struct {
 		Type string `json:"type"`
 	}
@@ -413,9 +476,9 @@ func parseCondition(raw json.RawMessage) (ConditionTest, error) {
 
 	case "minecraft:water":
 		var w struct {
-			Offset               int  `json:"offset"`
-			SurfaceDepthMul      int  `json:"surface_depth_multiplier"`
-			AddStoneDepth        bool `json:"add_stone_depth"`
+			Offset          int  `json:"offset"`
+			SurfaceDepthMul int  `json:"surface_depth_multiplier"`
+			AddStoneDepth   bool `json:"add_stone_depth"`
 		}
 		if err := json.Unmarshal(raw, &w); err != nil {
 			return nil, err
@@ -446,32 +509,26 @@ func parseCondition(raw json.RawMessage) (ConditionTest, error) {
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, err
 		}
-		return noiseThresholdTest{min: n.Min, max: n.Max, noise: n.Noise}, nil
+		slot, err := p.noiseSlot(n.Noise)
+		if err != nil {
+			return nil, fmt.Errorf("noise_threshold %q: %w", n.Noise, err)
+		}
+		return noiseThresholdTest{min: n.Min, max: n.Max, slot: slot}, nil
 
 	case "minecraft:y_above":
 		var y struct {
-			AddStoneDepth   bool `json:"add_stone_depth"`
-			SurfaceDepthMul int  `json:"surface_depth_multiplier"`
-			Anchor          struct {
-				Absolute    *int `json:"absolute"`
-				AboveBottom *int `json:"above_bottom"`
-				BelowTop    *int `json:"below_top"`
-			} `json:"anchor"`
+			AddStoneDepth   bool       `json:"add_stone_depth"`
+			SurfaceDepthMul int        `json:"surface_depth_multiplier"`
+			Anchor          anchorJSON `json:"anchor"`
 		}
 		if err := json.Unmarshal(raw, &y); err != nil {
 			return nil, err
 		}
-		t := yAboveTest{addStoneDepth: y.AddStoneDepth, surfaceDepthMul: y.SurfaceDepthMul}
-		if y.Anchor.Absolute != nil {
-			t.hasAbsolute, t.absolute = true, *y.Anchor.Absolute
-		}
-		if y.Anchor.AboveBottom != nil {
-			t.hasAboveBottom, t.aboveBottom = true, *y.Anchor.AboveBottom
-		}
-		if y.Anchor.BelowTop != nil {
-			t.hasBelowTop, t.belowTop = true, *y.Anchor.BelowTop
-		}
-		return t, nil
+		return yAboveTest{
+			anchorY:         p.resolveAnchor(y.Anchor),
+			addStoneDepth:   y.AddStoneDepth,
+			surfaceDepthMul: y.SurfaceDepthMul,
+		}, nil
 
 	case "minecraft:not":
 		var n struct {
@@ -480,7 +537,7 @@ func parseCondition(raw json.RawMessage) (ConditionTest, error) {
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, err
 		}
-		inner, err := parseCondition(n.Invert)
+		inner, err := p.parseCondition(n.Invert)
 		if err != nil {
 			return nil, err
 		}
@@ -488,15 +545,20 @@ func parseCondition(raw json.RawMessage) (ConditionTest, error) {
 
 	case "minecraft:vertical_gradient":
 		var v struct {
+			RandomName      string     `json:"random_name"`
 			TrueAtAndBelow  anchorJSON `json:"true_at_and_below"`
 			FalseAtAndAbove anchorJSON `json:"false_at_and_above"`
 		}
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, err
 		}
+		if v.RandomName == "" {
+			return nil, fmt.Errorf("vertical_gradient: missing random_name")
+		}
 		return verticalGradientTest{
-			trueAtAndBelow:  v.TrueAtAndBelow.aboveBottom,
-			falseAtAndAbove: v.FalseAtAndAbove.aboveBottom,
+			trueAtAndBelow:  p.resolveAnchor(v.TrueAtAndBelow),
+			falseAtAndAbove: p.resolveAnchor(v.FalseAtAndAbove),
+			random:          p.loader.rs.Positional().FromHashOf(v.RandomName).ForkPositional(),
 		}, nil
 
 	case "minecraft:above_preliminary_surface":
@@ -505,49 +567,56 @@ func parseCondition(raw json.RawMessage) (ConditionTest, error) {
 	return nil, fmt.Errorf("surface: unknown condition type %q", obj.Type)
 }
 
-// anchorJSON decodes a {above_bottom|below_top|absolute: N} surface anchor.
+// anchorJSON decodes a VerticalAnchor: exactly one of absolute, above_bottom or
+// below_top. Which one it was matters — reading the value without the kind made
+// every absolute anchor resolve as an offset from the world floor, which is why
+// the deepslate rule (absolute 0 to 8) collapsed onto y=-64 and never fired.
 type anchorJSON struct {
-	absolute    int
-	aboveBottom int
-	belowTop    int
+	kind  anchorKind
+	value int
 }
+
+type anchorKind int
+
+const (
+	anchorAbsolute anchorKind = iota
+	anchorAboveBottom
+	anchorBelowTop
+)
 
 func (a *anchorJSON) UnmarshalJSON(data []byte) error {
 	var m map[string]int
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
-	a.aboveBottom = m["above_bottom"]
-	a.belowTop = m["below_top"]
-	a.absolute = m["absolute"]
-	return nil
+	for key, kind := range map[string]anchorKind{
+		"absolute":     anchorAbsolute,
+		"above_bottom": anchorAboveBottom,
+		"below_top":    anchorBelowTop,
+	} {
+		if v, ok := m[key]; ok {
+			a.kind, a.value = kind, v
+			return nil
+		}
+	}
+	return fmt.Errorf("surface: anchor has none of absolute/above_bottom/below_top")
 }
 
 // ---- Loader ------------------------------------------------------------
 
-var (
-	surfaceRuleOnce sync.Once
-	surfaceRule     SurfaceRule
-	surfaceRuleErr  error
-)
-
-// LoadOverworldSurfaceRule parses and caches the overworld surface_rule tree.
-// The rule tree does not depend on the world seed, so it is loaded once.
-func LoadOverworldSurfaceRule() (SurfaceRule, error) {
-	surfaceRuleOnce.Do(func() {
-		raw, err := dataFS.ReadFile("data/overworld.json")
-		if err != nil {
-			surfaceRuleErr = err
-			return
-		}
-		var doc struct {
-			SurfaceRule json.RawMessage `json:"surface_rule"`
-		}
-		if err := json.Unmarshal(raw, &doc); err != nil {
-			surfaceRuleErr = err
-			return
-		}
-		surfaceRule, surfaceRuleErr = ParseSurfaceRule(doc.SurfaceRule)
-	})
-	return surfaceRule, surfaceRuleErr
+// loadSurfaceRuleSet parses the overworld surface_rule tree, binding its
+// conditions to this loader's seeded RandomState.
+func (l *Loader) loadSurfaceRuleSet(minY, height int) (*SurfaceRuleSet, error) {
+	var doc struct {
+		SurfaceRule json.RawMessage `json:"surface_rule"`
+	}
+	if err := l.readJSON("data/overworld.json", &doc); err != nil {
+		return nil, err
+	}
+	p := &surfaceParser{loader: l, minY: minY, height: height, noiseSlots: map[string]int{}}
+	root, err := p.parseRule(doc.SurfaceRule)
+	if err != nil {
+		return nil, err
+	}
+	return &SurfaceRuleSet{root: root, noises: p.noises}, nil
 }

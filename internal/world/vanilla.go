@@ -79,8 +79,9 @@ func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPi
 	}
 	wg.Wait()
 
-	// The surface rule tree is seed-independent; load once (cached). If it fails
-	// to parse, surface fill falls back to the biome-blind heuristics.
+	// The surface rule set is compiled against the world seed at load time. If
+	// it failed to parse, the surface pass falls back to biome-blind heuristics
+	// rather than leaving the terrain bare.
 	surfaceRule, ruleErr := od.SurfaceRule()
 
 	// The aquifer decides fluid per position while the column is laid down. Its
@@ -92,19 +93,43 @@ func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPi
 	}
 
 	var columns [16][16][WorldHeight]uint16
-	var surfTop [16][16]int // top solid index, -1 if none
-	var grass [16][16]bool  // grassy land surface (tree-plantable)
+	var surfTop [16][16]int      // top solid index, -1 if none
+	var worldSurface [16][16]int // topmost non-air Y, the WORLD_SURFACE_WG heightmap
+	var grass [16][16]bool       // grassy land surface (tree-plantable)
+
+	// Terrain and fluids first, for the whole chunk. The surface pass has to
+	// wait for all of it: the "steep" condition reads the heights of the
+	// column's neighbours, which vanilla takes from the heightmap that doFill
+	// finishes before buildSurface starts.
 	for lx := 0; lx < 16; lx++ {
 		wg.Add(1)
 		go func(lx int) {
 			defer wg.Done()
 			interp := make([]float64, len(od.Interpolated))
 			for lz := 0; lz < 16; lz++ {
-				var rule worldgen.SurfaceRule
+				surfTop[lx][lz], worldSurface[lx][lz], grass[lx][lz] =
+					fillVanillaColumn(od, aq, fluidPicker, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
+			}
+		}(lx)
+	}
+	wg.Wait()
+
+	for lx := 0; lx < 16; lx++ {
+		wg.Add(1)
+		go func(lx int) {
+			defer wg.Done()
+			var sctx *worldgen.SurfaceContext
+			if ruleErr == nil {
+				sctx = surfaceRule.NewContext()
+			}
+			for lz := 0; lz < 16; lz++ {
+				rng := newColumnRand(baseX+lx, baseZ+lz, int(seed))
 				if ruleErr == nil {
-					rule = surfaceRule
+					applySurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
+						baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz], rng)
+				} else {
+					fillLegacySurface(&columns[lx][lz], surfTop[lx][lz], rng)
 				}
-				surfTop[lx][lz], grass[lx][lz] = fillVanillaColumn(od, aq, fluidPicker, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz, seed, rule, biomeName[lx][lz])
 			}
 		}(lx)
 	}
@@ -165,13 +190,13 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.
 // then does the surface rule tree walk the finished column. Doing it the other
 // way round is what forced the old unconditional "flood everything under sea
 // level" pass, which left every cave below y=63 underwater.
-func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int, seed int64, rule worldgen.SurfaceRule, biomeName string) (int, bool) {
+func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int, grass bool) {
 	cx0 := lx / cellWidth
 	cz0 := lz / cellWidth
 	fx := float64(lx%cellWidth) / cellWidth
 	fz := float64(lz%cellWidth) / cellWidth
 
-	top := -1
+	top, worldSurface = -1, MinY-1
 	for i := 0; i < WorldHeight; i++ {
 		cy0 := i / cellHeight
 		fy := float64(i%cellHeight) / cellHeight
@@ -186,6 +211,9 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 		if isDefaultBlock {
 			top = i
 		}
+		if state != StateAir {
+			worldSurface = y
+		}
 	}
 
 	topY := MinY + top
@@ -194,16 +222,22 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 	const beachBand = 3
 	beach := top >= 0 && topY >= SeaLevel-beachBand && topY <= SeaLevel+1
 	deepWater := top >= 0 && topY < SeaLevel-beachBand
+	return top, worldSurface, top >= 0 && !beach && !deepWater && topY >= SeaLevel
+}
 
-	// Per-column RNG for the bedrock floor and the bandlands/gradient rules.
-	rng := newColumnRand(wx, wz, int(seed))
-
-	if rule != nil {
-		applySurfaceRule(od, out, wx, wz, SeaLevel, MinY, biomeName, rule, rng)
-	} else {
-		fillLegacySurface(out, top, beach, deepWater, rng)
+// steepAt is SurfaceRules.SteepMaterialCondition: true where the column's
+// neighbours inside the chunk differ in height by four blocks or more. The
+// neighbour indices are clamped to the chunk, as vanilla's are — the condition
+// deliberately does not look at the chunk next door.
+func steepAt(worldSurface *[16][16]int, lx, lz int) bool {
+	north := max(lz-1, 0)
+	south := min(lz+1, 15)
+	if worldSurface[lx][south] >= worldSurface[lx][north]+4 {
+		return true
 	}
-	return top, top >= 0 && !beach && !deepWater && topY >= SeaLevel
+	west := max(lx-1, 0)
+	east := min(lx+1, 15)
+	return worldSurface[west][lz] >= worldSurface[east][lz]+4
 }
 
 // substance resolves one position to the block the terrain pass leaves behind:
@@ -241,7 +275,7 @@ func substance(aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, x, y, z i
 // One *rand.Rand is created per column (not per block) — bandlands/gradient
 // consume from it sequentially, which is correct because vanilla seeds those
 // per-column too. This avoids ~98k rand.New allocations per chunk.
-func applySurfaceRule(od *worldgen.OverworldDensity, out *[WorldHeight]uint16, wx, wz, seaLevel, minY int, biomeName string, rule worldgen.SurfaceRule, rng chunkRand) {
+func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string, rng chunkRand) {
 	top := -1
 	for i := WorldHeight - 1; i >= 0; i-- {
 		if out[i] != StateAir {
@@ -252,26 +286,21 @@ func applySurfaceRule(od *worldgen.OverworldDensity, out *[WorldHeight]uint16, w
 	if top < 0 {
 		return
 	}
-	// One per-column RNG for all surface rules in this column.
-	colRng := rng.toRand()
-	// Column-constant surface quantities, computed once per column exactly as
-	// SurfaceRules.Context.updateXZ does.
+	// Column-constant surface quantities, refreshed once per column exactly as
+	// SurfaceRules.Context.updateXZ does. The context itself is reused across
+	// the whole 16-column strip to avoid ~98k allocations per chunk; the fields
+	// that vary per block are set inside the loop below.
+	rules.BeginColumn(sctx, wx, wz)
 	surfaceDepth := od.Surface.SurfaceDepth(wx, wz)
-	// Reuse one context across the column (mutated per block) to avoid ~98k
-	// heap allocations per chunk; the fields that vary per block are set inside
-	// the loop, the rest are column-constant.
-	sctx := &worldgen.SurfaceContext{
-		X:                wx,
-		Z:                wz,
-		SeaLevel:         seaLevel,
-		BiomeName:        biomeName,
-		MinY:             minY,
-		SurfaceNoise:     od.Surface.Noise(wx, wz),
-		SurfaceSecondary: od.Surface.SurfaceSecondary(wx, wz),
-		SurfaceDepth:     surfaceDepth,
-		MinSurfaceLevel:  od.MinSurfaceLevelAt(wx, wz, surfaceDepth),
-		Rng:              colRng,
-	}
+	sctx.SeaLevel = SeaLevel
+	sctx.BiomeName = biomeName
+	sctx.MinY = MinY
+	sctx.SurfaceSecondary = od.Surface.SurfaceSecondary(wx, wz)
+	sctx.SurfaceDepth = surfaceDepth
+	sctx.MinSurfaceLevel = od.MinSurfaceLevelAt(wx, wz, surfaceDepth)
+	sctx.Steep = steepAt(worldSurface, lx, lz)
+	sctx.Rng = rng.toRand()
+	minY := MinY
 	stoneDepthAbove := 0
 	waterHeight := worldgen.NoWaterAbove
 	nextCeilingStoneY := math.MaxInt
@@ -309,7 +338,10 @@ func applySurfaceRule(od *worldgen.OverworldDensity, out *[WorldHeight]uint16, w
 		if old != StateStone {
 			continue
 		}
-		if state, ok := rule.Apply(sctx); ok && state != 0 {
+		// A matched rule places its block even when that block is air: the
+		// frozen-ocean surface deliberately carves one away. Only "no rule
+		// matched" leaves the default block alone.
+		if state, ok := rules.Apply(sctx); ok {
 			out[i] = state
 		}
 	}
@@ -323,10 +355,14 @@ func isFluidState(s uint16) bool { return s == StateWater || s == StateLava }
 // isStoneState is SurfaceSystem.isStone: solid, non-fluid, non-air.
 func isStoneState(s uint16) bool { return s != StateAir && !isFluidState(s) }
 
-// fillLegacySurface is the biome-blind heuristic used when no surface rule is
-// available (parse failure). It dresses the stone the terrain and aquifer
+// fillLegacySurface is the biome-blind heuristic used when no surface rule set
+// is available (parse failure). It dresses the stone the terrain and aquifer
 // passes already laid down, leaving their air and fluids alone.
-func fillLegacySurface(out *[WorldHeight]uint16, top int, beach, deepWater bool, rng chunkRand) {
+func fillLegacySurface(out *[WorldHeight]uint16, top int, rng chunkRand) {
+	const beachBand = 3
+	topY := MinY + top
+	beach := top >= 0 && topY >= SeaLevel-beachBand && topY <= SeaLevel+1
+	deepWater := top >= 0 && topY < SeaLevel-beachBand
 	for i := 0; i < WorldHeight; i++ {
 		y := MinY + i
 		if !isStoneState(out[i]) {

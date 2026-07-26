@@ -33,7 +33,7 @@ func LoadTemplate(path string) (*Template, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// NBT files are usually gzipped.
 	var r io.Reader = bytes.NewReader(b)
 	if len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b {
@@ -81,7 +81,7 @@ func LoadTemplate(path string) (*Template, error) {
 				nameTag, _ := stateComp.Get("Name")
 				name := string(nameTag.(nbt.String))
 				props := make(map[string]string)
-				
+
 				if propTag, ok := stateComp.Get("Properties"); ok {
 					if propComp, ok := propTag.(*nbt.Compound); ok {
 						for _, k := range propComp.Keys() {
@@ -92,9 +92,11 @@ func LoadTemplate(path string) (*Template, error) {
 						}
 					}
 				}
-				id := surfaceBlockID(name, props)
-				if id == 0 && name != "minecraft:air" {
-					// Fallback to default block ID for the name
+				id, ok := surfaceBlockID(name, props)
+				if !ok {
+					// Structure templates name far more blocks than the
+					// surface rules do; fall back to the broader
+					// default-state table.
 					id = defaultBlockIDs[name]
 				}
 				tmpl.Palette = append(tmpl.Palette, id)
@@ -112,7 +114,7 @@ func LoadTemplate(path string) (*Template, error) {
 				}
 				stateTag, _ := blockComp.Get("state")
 				stateIdx := int(stateTag.(nbt.Int))
-				
+
 				var pos [3]int
 				if posTag, ok := blockComp.Get("pos"); ok {
 					if posList, ok := posTag.(nbt.List); ok && len(posList.Elems) == 3 {

@@ -111,6 +111,20 @@ func main() {
 	countAt(16, 40, "y=16..40")
 	countAt(1, 7, "y=1..7 (transition)")
 	countAt(-64, -1, "y<0 (deepslate)")
+	// The deepslate rule is a vertical_gradient over absolute anchors 0..8:
+	// everything solid below y=0 is deepslate, everything above y=8 is stone,
+	// and the band between them is a scatter. A zero here means the rule is
+	// firing but its block is being dropped, or its anchors are misread.
+	switch {
+	case deepStone["y<0 (deepslate)"] == 0:
+		fmt.Println("  FAIL: no deepslate below y=0")
+	case deepStone["y=16..40"] != 0:
+		fmt.Println("  FAIL: deepslate above the transition band")
+	case deepStone["y=1..7 (transition)"] == 0:
+		fmt.Println("  FAIL: the stone/deepslate transition band is empty")
+	default:
+		fmt.Println("  OK: deepslate below y=0, scattered through y=1..7, none above")
+	}
 
 	// Bedrock floor: y=-64 must be solid bedrock everywhere, y=-63..-59 a
 	// thinning scatter of bedrock over stone/deepslate, and NOTHING in that band

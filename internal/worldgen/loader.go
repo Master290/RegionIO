@@ -56,14 +56,17 @@ type OverworldDensity struct {
 	// rule tree runs.
 	Surface *SurfaceSampler
 
+	surfaceRule    *SurfaceRuleSet
+	surfaceRuleErr error
+
 	prelim *levelCache
 }
 
-// SurfaceRule returns the overworld surface rule tree, loading it on first use.
-// It does not depend on the seed. A nil rule (on error) is non-fatal: the
-// generator falls back to its default surface heuristics.
-func (od *OverworldDensity) SurfaceRule() (SurfaceRule, error) {
-	return LoadOverworldSurfaceRule()
+// SurfaceRule returns the overworld surface rule set, compiled against this
+// world's seed. A nil rule set (on error) is non-fatal: the generator falls
+// back to its biome-blind surface heuristics.
+func (od *OverworldDensity) SurfaceRule() (*SurfaceRuleSet, error) {
+	return od.surfaceRule, od.surfaceRuleErr
 }
 
 // LoadOverworldFinalDensity builds the overworld final_density function for the
@@ -168,6 +171,12 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 		secondaryNoise: secondaryNoise,
 		positionalRand: l.rs.Positional(),
 	}
+
+	// The rule tree is seed-bound: its noise_threshold conditions sample seeded
+	// noises and its vertical_gradient rolls against a seeded positional
+	// factory. A failure here is reported but not fatal — the generator keeps
+	// going on the fallback heuristics rather than refusing to start.
+	od.surfaceRule, od.surfaceRuleErr = l.loadSurfaceRuleSet(od.MinY, od.Height)
 	return od, nil
 }
 

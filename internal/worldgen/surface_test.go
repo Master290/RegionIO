@@ -5,16 +5,30 @@ import (
 	"testing"
 )
 
-// TestLoadSurfaceRule confirms the embedded overworld surface_rule parses into
-// a rule tree without error. This guards the parser against any rule/condition
-// type the overworld uses.
-func TestLoadSurfaceRule(t *testing.T) {
-	rule, err := LoadOverworldSurfaceRule()
+// loadTestRules compiles the overworld surface rule set at a fixed seed.
+func loadTestRules(t *testing.T) *SurfaceRuleSet {
+	t.Helper()
+	od, err := LoadOverworldFinalDensity(12345)
 	if err != nil {
-		t.Fatalf("LoadOverworldSurfaceRule: %v", err)
+		t.Fatalf("load overworld density: %v", err)
 	}
-	if rule == nil {
-		t.Fatal("nil surface rule")
+	rules, err := od.SurfaceRule()
+	if err != nil {
+		t.Fatalf("compile surface rule: %v", err)
+	}
+	if rules == nil {
+		t.Fatal("nil surface rule set")
+	}
+	return rules
+}
+
+// TestLoadSurfaceRule confirms the embedded overworld surface_rule parses into
+// a rule tree without error, and that every noise its noise_threshold
+// conditions name resolved. Six of the seven used to fall through as false.
+func TestLoadSurfaceRule(t *testing.T) {
+	rules := loadTestRules(t)
+	if len(rules.noises) != 7 {
+		t.Errorf("rule set references %d noises, want 7", len(rules.noises))
 	}
 }
 
@@ -22,25 +36,24 @@ func TestLoadSurfaceRule(t *testing.T) {
 // several biomes to confirm Apply never panics on real-world inputs. A panic
 // during generation would crash the server.
 func TestSurfaceRuleNoPanic(t *testing.T) {
-	rule, err := LoadOverworldSurfaceRule()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
+	rules := loadTestRules(t)
 	biomes := []string{
 		"minecraft:plains", "minecraft:desert", "minecraft:forest",
 		"minecraft:badlands", "minecraft:snowy_plains", "minecraft:ocean",
 		"minecraft:mushroom_fields", "minecraft:wooded_badlands",
 	}
+	ctx := rules.NewContext()
+	rules.BeginColumn(ctx, 100, 100)
+	ctx.SeaLevel, ctx.MinY = 63, -64
+	ctx.MinSurfaceLevel, ctx.WaterHeight = 80, NoWaterAbove
+	ctx.SurfaceDepth = 3
+	ctx.Rng = rand.New(rand.NewSource(1))
 	for _, b := range biomes {
+		ctx.BiomeName = b
 		for y := 0; y < 100; y++ {
-			ctx := &SurfaceContext{
-				X: 100, Y: y, Z: 100,
-				StoneDepthAbove: 100 - y, StoneDepthBelow: y + 1,
-				SeaLevel: 63, BiomeName: b, MinY: -64,
-				MinSurfaceLevel: 80, WaterHeight: NoWaterAbove,
-				Rng: rand.New(rand.NewSource(1)),
-			}
-			rule.Apply(ctx) // must not panic
+			ctx.Y = y
+			ctx.StoneDepthAbove, ctx.StoneDepthBelow = 100-y, y+1
+			rules.Apply(ctx) // must not panic
 		}
 	}
 }
@@ -48,17 +61,17 @@ func TestSurfaceRuleNoPanic(t *testing.T) {
 // TestSurfaceBedrockFloor confirms the bottom of the world resolves to bedrock
 // (the vertical_gradient bedrock_floor rule is the first rule in the tree).
 func TestSurfaceBedrockFloor(t *testing.T) {
-	rule, err := LoadOverworldSurfaceRule()
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	ctx := &SurfaceContext{
-		X: 0, Y: -64, Z: 0, StoneDepthAbove: 1, StoneDepthBelow: 1,
-		SeaLevel: 63, BiomeName: "minecraft:plains", MinY: -64,
-		MinSurfaceLevel: 62, WaterHeight: NoWaterAbove,
-		Rng: rand.New(rand.NewSource(1)),
-	}
-	state, ok := rule.Apply(ctx)
+	rules := loadTestRules(t)
+	ctx := rules.NewContext()
+	rules.BeginColumn(ctx, 0, 0)
+	ctx.Y = -64
+	ctx.StoneDepthAbove, ctx.StoneDepthBelow = 1, 1
+	ctx.SeaLevel, ctx.MinY = 63, -64
+	ctx.BiomeName = "minecraft:plains"
+	ctx.MinSurfaceLevel, ctx.WaterHeight = 62, NoWaterAbove
+	ctx.SurfaceDepth = 3
+	ctx.Rng = rand.New(rand.NewSource(1))
+	state, ok := rules.Apply(ctx)
 	if !ok {
 		t.Fatal("no rule matched at bedrock floor")
 	}
@@ -84,11 +97,22 @@ func TestSurfaceBlockIDResolution(t *testing.T) {
 		{"minecraft:red_sand", nil, 123},
 		{"minecraft:coarse_dirt", nil, 11},
 		{"minecraft:calcite", nil, 24687},
+		{"minecraft:deepslate", map[string]string{"axis": "y"}, 27924},
+		{"minecraft:mud", nil, 27922},
+		{"minecraft:air", nil, 0},
 	}
 	for _, c := range cases {
-		if got := surfaceBlockID(c.name, c.props); got != c.want {
+		got, ok := surfaceBlockID(c.name, c.props)
+		if !ok {
+			t.Errorf("surfaceBlockID(%q,%v) not in the table", c.name, c.props)
+			continue
+		}
+		if got != c.want {
 			t.Errorf("surfaceBlockID(%q,%v) = %d, want %d", c.name, c.props, got, c.want)
 		}
+	}
+	if _, ok := surfaceBlockID("minecraft:not_a_block", nil); ok {
+		t.Error("surfaceBlockID accepted an unknown name")
 	}
 }
 
