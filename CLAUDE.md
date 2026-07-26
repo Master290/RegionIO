@@ -71,7 +71,8 @@ of guess anywhere.
 ```
 cmd/regionio/     entry point (flags, listener, graceful shutdown)
 cmd/gendump/      client-free generator diagnostics — biome spread, surface blocks,
-                  subsurface banding, deep-layer composition, bedrock band, cross-section
+                  subsurface banding, deep-layer composition, bedrock band, fluid census,
+                  cross-section
 cmd/genblocks/    generates internal/worldgen/generated_blocks.go from the block report
 cmd/genlight/     legacy light-table generator, superseded by tools/VanillaLightDump.java
 tools/            Java dumpers run against the jar, plus their Go-side fixtures
@@ -81,7 +82,7 @@ internal/registry/  28 embedded synced registries + tags, verbatim from vanilla
 internal/world/     chunk model, wire encoder, cache + tickets, Anvil store, lighting,
                     the chunk generator itself (vanilla.go), decoration
 internal/worldgen/  the library: noise, density-function interpreter, surface rules,
-                    climate/biome finder, embedded datapack under data/
+                    aquifer, climate/biome finder, embedded datapack under data/
 internal/network/   per-connection state machine
 internal/server/    shared core: config, sessions, status, profiles, entity loops
 ```
@@ -97,23 +98,38 @@ Bit-exact and parity-tested — treat as settled, change only with a vanilla ref
 with trilinear interpolation, the climate/biome finder, and the chunk wire encoder
 (`TestGoldenAgainstVanilla` compares bytes against a real vanilla chunk).
 
+Ported from the decompiled source and checked by behaviour rather than by bytes — faithful as far as
+we can tell, but no vanilla capture confirms them: the aquifer (`worldgen/aquifer.go`, the whole of
+`Aquifer.NoiseBasedAquifer` bar `shouldScheduleFluidUpdate`), the surface-rule interpreter
+(`worldgen/surface.go`), and the column pass in `world/vanilla.go` that mirrors `SurfaceSystem`.
+
+The whole `noise_router` is parsed. `preliminary_surface_level` is reachable through
+`od.PreliminarySurfaceLevelAt`, which quart-aligns and memoises across chunks the way `NoiseChunk`
+does; the `vein_*` keys are parsed but nothing reads them yet.
+
 Known gaps, roughly in order of how visible they are:
 
-- **Aquifers are absent.** `vanilla.go` floods every air block below sea level with water, so every
-  cave below y=63 is solid water and there are no lava lakes. Vanilla resolves fluid per position
-  through `Aquifer.computeSubstance`; the datapack ships all four router keys (`barrier`,
-  `fluid_level_floodedness`, `fluid_level_spread`, `lava`) and they are not parsed.
 - **`above_preliminary_surface` is wrong**, so there is no subsurface banding: every land column is
   one grass block directly on stone, no dirt, no sandstone under sand. Vanilla is
-  `blockY >= preliminarySurfaceLevel + surfaceDepth - 8`; we compare against the actual top block,
-  which gates the whole biome surface subtree to a single block per column. `gendump` prints this.
+  `blockY >= preliminarySurfaceLevel + surfaceDepth - 8` with the level bilinearly interpolated from
+  the four corners of the 16-block cell; we compare against the actual top block, which gates the
+  whole biome surface subtree to a single block per column. `gendump` prints this. The router value
+  it needs is already available.
+- **`surfaceDepth` is always 0.** Vanilla is `surfaceNoise*2.75 + 3 + rand*0.25`, so the dirt band is
+  three-ish blocks deep; ours is one. This is the other half of the missing banding, and it also
+  neuters every `add_surface_depth`/`surface_depth_multiplier` term in the rule tree.
 - **Several surface-rule conditions are stubs**: `hole` is hardcoded false (vanilla is
-  `surfaceDepth <= 0`), `steep` is never assigned, `water` uses sea level instead of the column's
-  real water height, and 6 of the 7 `noise_threshold` noises are unsupported so calcite, ice, packed
-  ice, powder snow, swamp water and gravel patches never appear. `bandlands` is a 4-colour cycle
-  rather than the 192-band array.
-- **No carvers and no ore veins.** Caves come only from the density router; `configured_carver` and
-  the `vein_*` router keys are unimplemented.
+  `surfaceDepth <= 0`), `steep` is never assigned, the `minecraft:surface` noise is a per-column
+  random draw rather than the real noise, `surface_secondary` is not sampled at all (so
+  `secondary_depth_range` is ignored), and 6 of the 7 `noise_threshold` noises are unsupported so
+  calcite, ice, packed ice, powder snow, swamp water and gravel patches never appear. `bandlands` is
+  a 4-colour cycle rather than the 192-band array.
+- **`vertical_gradient` ignores absolute anchors**, reading only `above_bottom`. The bedrock floor
+  works because its anchors are `above_bottom`; the deepslate rule's are `absolute` 0..8, so both
+  collapse to y=-64 and **no deepslate is ever placed** — `gendump`'s deep-layer line reads
+  `deepslate=0` everywhere.
+- **No carvers and no ore veins.** Caves come only from the density router; `configured_carver` is
+  not extracted and the `OreVeinifier` over the parsed `vein_*` keys is not written.
 - **Decoration is hand-written heuristics**, not the vanilla feature system: oak trees only and
   without a biome check (so oaks grow in deserts), ores that cannot generate below y≈0 because they
   only replace stone and never deepslate, and no grass, flowers, lakes or springs.
@@ -122,9 +138,17 @@ Known gaps, roughly in order of how visible they are:
 
 `make verify` is the gate, but most generator defects are invisible to it — they show up as terrain
 that looks wrong. `cmd/gendump` exists for that: biome distribution, top surface blocks, subsurface
-banding, deep-layer composition, the bedrock band, and an ASCII cross-section, with no client
-involved. Add an assertion to it whenever you fix a class of defect; the bedrock-band check is the
-model — it prints per-layer counts and fails loudly on any air or water in the floor.
+banding, deep-layer composition, the bedrock band, the underground fluid census, and an ASCII
+cross-section, with no client involved. Add an assertion to it whenever you fix a class of defect;
+the bedrock-band check is the model — it prints per-layer counts and fails loudly on any air or
+water in the floor. The fluid census is the same shape: it prints water as a share of the open
+volume under inland chunks (3.8% now, 100% before the aquifer) and fails if caves flood again.
+
+Anything gendump can assert on, prefer to also assert in a test — `TestCavesAreDry` and
+`TestNoFluidUnderBedrock` in `internal/world` are gendump checks that run under `make verify`.
+
+`go test -race` needs cgo and a C toolchain; on a Windows box without gcc, `make test-race` cannot
+run at all.
 
 `internal/world/vanilla_parity_test.go` compares surface heights against a capture from the official
 server and skips when the capture is absent. Note it reads a hardcoded `/tmp` path, so on Windows it
