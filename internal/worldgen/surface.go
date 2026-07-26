@@ -22,11 +22,17 @@ import (
 type SurfaceContext struct {
 	// X, Y, Z are the block's world coordinates.
 	X, Y, Z int
-	// StoneDepthAbove counts solid blocks at or above Y in this column down to
-	// the surface; it is the vanilla "stone_depth" the stone_depth condition
-	// compares against (with offset/surface_depth adjustments applied by the
-	// test).
+	// StoneDepthAbove counts solid blocks from the top of the current stone run
+	// down to and including Y — 1 for the block directly under air or fluid.
+	// StoneDepthBelow counts the other way, 1 for the block directly above the
+	// cave roof under it. Together they are the vanilla "stone_depth" the
+	// stone_depth condition compares against, floor and ceiling respectively.
 	StoneDepthAbove int
+	StoneDepthBelow int
+	// WaterHeight is one above the lowest fluid block of the run of fluid
+	// directly above Y, or math.MinInt when no fluid sits above Y with no air
+	// in between. It is what the water condition measures against.
+	WaterHeight int
 	// SeaLevel is the world sea level (63 for the overworld).
 	SeaLevel int
 	// BiomeName is the resolved surface biome (e.g. "minecraft:desert").
@@ -210,13 +216,11 @@ func (t yAboveTest) Test(ctx *SurfaceContext) bool {
 	return ctx.Y >= threshold
 }
 
-// stoneDepthTest passes based on the block's depth relative to the surface
-// floor/ceiling. surface_type "floor" counts blocks from the surface downward
-// and passes when that depth is at or below offset (i.e. near/at the surface);
-// "ceiling" passes when the block is the surface cap — the topmost block whose
-// depth-above-surface is 0, i.e. air sits directly on it. This matches vanilla:
-// desert's "ceiling → sandstone, else sand" puts sandstone just below the sand
-// cap, not on top.
+// stoneDepthTest passes when the block is within `offset` of the surface it
+// names: "floor" measures down from the top of the stone run (the ground you
+// walk on), "ceiling" measures up from its bottom (the roof of whatever cave or
+// ocean sits underneath). The overworld tree uses ceiling with offset 0 to dress
+// cave roofs — fourteen times, more than any other stone_depth form.
 type stoneDepthTest struct {
 	surfaceType     string // "floor" or "ceiling"
 	offset          int
@@ -226,16 +230,18 @@ type stoneDepthTest struct {
 
 func (t stoneDepthTest) Test(ctx *SurfaceContext) bool {
 	depth := ctx.StoneDepthAbove
-	if t.addSurfaceDepth {
-		depth += ctx.SurfaceDepth
-	}
 	if t.surfaceType == "ceiling" {
-		// Ceiling: the surface cap. Passes when depth-above-surface equals the
-		// offset (0 for the topmost block). Used to special-case the block
-		// directly under air.
-		return depth == t.offset
+		depth = ctx.StoneDepthBelow
 	}
-	return depth <= t.offset
+	surfaceDepth := 0
+	if t.addSurfaceDepth {
+		surfaceDepth = ctx.SurfaceDepth
+	}
+	// Vanilla widens the band by map(surface_secondary noise, -1..1, 0..range).
+	// That noise is not sampled yet, so the secondary term stays 0; the two
+	// rules that use it also set add_surface_depth, and both currently reduce to
+	// the same single-block band either way.
+	return depth <= 1+t.offset+surfaceDepth
 }
 
 // noiseThresholdTest passes when the named surface noise is within [min,max].

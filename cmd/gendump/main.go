@@ -142,6 +142,75 @@ func main() {
 	}
 
 
+	// Caves are dry: the aquifer decides fluid per position, so the open volume
+	// underground is overwhelmingly air, with occasional aquifer pools and lava
+	// down low. The defect this catches is the old unconditional "flood every
+	// air block below sea level" pass, under which this number was 100%.
+	fmt.Println("\n=== Underground fluids: water fraction y=-50..40 over inland chunks, lava anywhere ===")
+	air, water, lava, solidU := 0, 0, 0, 0
+	deepLava := 0
+	inland := 0
+	for cx := int32(-12); cx <= 12; cx += 4 {
+		for cz := int32(-12); cz <= 12; cz += 4 {
+			ch := gen(cx, cz)
+			// Lava is counted everywhere; the water fraction only over land,
+			// since an ocean's water legitimately reaches its floor. Lava
+			// pockets cluster, so a narrow sample can miss them entirely.
+			land := isInland(ch)
+			if land {
+				inland++
+			}
+			for wy := world.MinY; wy <= 40; wy++ {
+				// The water fraction is measured over y=-50..40, above the band
+				// where the global fluid rule makes lava unconditional.
+				census := land && wy >= -50
+				for lx := 0; lx < 16; lx++ {
+					for lz := 0; lz < 16; lz++ {
+						switch ch.GetBlock(lx, wy, lz) {
+						case world.StateAir:
+							if census {
+								air++
+							}
+						case world.StateWater:
+							if census {
+								water++
+							}
+						case world.StateLava:
+							lava++
+							if wy < -54 {
+								deepLava++
+							}
+							if census {
+								air++ // open volume, just not water
+							}
+						default:
+							if census {
+								solidU++
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	open := air + water
+	fmt.Printf("  chunks=%d solid=%d open=%d (air+lava=%d water=%d) | lava total=%d, of it below y=-54: %d\n",
+		inland, solidU, open, air, water, lava, deepLava)
+	switch {
+	case open == 0:
+		fmt.Println("  FAIL: no open volume underground at all")
+	default:
+		frac := float64(water) / float64(open)
+		fmt.Printf("  water is %.1f%% of the open volume\n", frac*100)
+		if frac > 0.35 {
+			fmt.Println("  FAIL: caves are flooded; the aquifer is not deciding fluid")
+		} else if lava == 0 {
+			fmt.Println("  FAIL: no lava anywhere underground")
+		} else {
+			fmt.Println("  OK: caves are dry and lava exists")
+		}
+	}
+
 	// Subsurface banding: find grass-topped land columns and print the top ~8
 	// blocks (grass cap → dirt band → stone) to confirm surfaceDepth widened the
 	// dirt band beyond a single block.
@@ -188,6 +257,28 @@ func loadName(od *worldgen.OverworldDensity, s2 worldgen.Sample2D, wx, wz int) s
 	return world.BiomeNameAt(od, wx, wz)
 }
 
+// isInland reports whether most of the chunk's columns break the surface above
+// sea level. Ocean chunks are excluded from the cave-fluid census because their
+// water legitimately reaches all the way down to the sea floor.
+func isInland(c *world.Chunk) bool {
+	aboveSea := 0
+	for lx := 0; lx < 16; lx += 2 {
+		for lz := 0; lz < 16; lz += 2 {
+			for wy := world.MinY + world.WorldHeight - 1; wy >= world.MinY; wy-- {
+				b := c.GetBlock(lx, wy, lz)
+				if b == world.StateAir {
+					continue
+				}
+				if b != world.StateWater && wy >= world.SeaLevel {
+					aboveSea++
+				}
+				break
+			}
+		}
+	}
+	return aboveSea > 48 // of 64 sampled columns
+}
+
 func crossSection(c *world.Chunk) {
 	// vertical band from y=40..136
 	for wy := 130; wy >= 40; wy-- {
@@ -205,6 +296,8 @@ func glyph(b uint16) string {
 		return "."
 	case world.StateWater:
 		return "~"
+	case world.StateLava:
+		return "!"
 	case world.StateStone:
 		return "#"
 	case world.StateDirt:

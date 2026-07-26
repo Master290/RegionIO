@@ -26,6 +26,7 @@ const (
 	StateDirt    uint16 = 10
 	StateBedrock uint16 = 85
 	StateWater   uint16 = 86
+	StateLava    uint16 = 102
 	StateSand    uint16 = 118
 	StateGravel  uint16 = 124
 	StateOakLog  uint16 = 137
