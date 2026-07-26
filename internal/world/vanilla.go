@@ -254,7 +254,7 @@ func fillLegacySurface(out *[WorldHeight]uint16, solid [WorldHeight]bool, top in
 		switch {
 		case y <= MinY:
 			out[i] = StateBedrock
-		case y <= MinY+4 && solid[i] && bedrockAt(rng, y-MinY):
+		case y <= MinY+4 && solid[i] && bedrockAt(&rng, y-MinY):
 			out[i] = StateBedrock
 		case solid[i]:
 			switch {
@@ -275,26 +275,27 @@ func fillLegacySurface(out *[WorldHeight]uint16, solid [WorldHeight]bool, top in
 	}
 }
 
-// bedrockAt reports whether a block at layer d (1..4 above the floor) should be
-// bedrock, consuming randomness from rng. Vanilla's floor has probability ~1 at
-// the bottom layer dropping to 0 a few blocks up; we approximate the decay with
-// a 1/4 chance per step up from the solid floor.
-func bedrockAt(rng chunkRand, d int) bool {
-	// Probability per layer: d=1 → 50%, d=2 → 25%, d=3 → 12.5%, d=4 → 6.25%.
-	// Need (5-d) high bits from a 32-bit draw; compare against a per-step mask.
-	keep := 5 - d // 4..1
-	if keep <= 0 {
+// bedrockAt reports whether the block d layers above the world floor should be
+// bedrock, consuming one draw from rng. It mirrors the datapack's
+// vertical_gradient(minecraft:bedrock_floor, above_bottom 0 → above_bottom 5):
+// the probability ramps linearly from 1 at the floor to 0 five blocks up, and
+// vanilla tests nextFloat() < probability.
+//
+// rng is a pointer so successive layers draw successive values. Taking it by
+// value handed every layer the same number, which nested the layers into a
+// prefix condition instead of scattering them. The ramp also used to run the
+// wrong way — bedrock was likelier four blocks up than at the floor.
+//
+// Only fillLegacySurface calls this; the normal path lets the surface rule tree
+// place the floor from the same datapack rule.
+func bedrockAt(rng *chunkRand, d int) bool {
+	if d <= 0 {
+		return true
+	}
+	if d >= 5 {
 		return false
 	}
-	// Each surviving bit roughly halves the chance; draw once and check `keep`
-	// of its low bits.
-	r := rng.next()
-	for b := 0; b < keep; b++ {
-		if (r>>uint(b))&1 == 0 {
-			return false
-		}
-	}
-	return true
+	return rng.nextFloat() < 1.0-float64(d)/5.0
 }
 
 // decorate places simple oak trees on grassy columns. Trunks are kept two
