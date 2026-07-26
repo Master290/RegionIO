@@ -172,3 +172,97 @@ func readInt32(t *testing.T, b []byte) int32 {
 	}
 	return int32(uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]))
 }
+
+// readBiomeContainerAsClient consumes one biome paletted container exactly the
+// way the vanilla client does, and returns the number of bytes it used.
+//
+// The client picks the palette form from the bits-per-entry byte alone, using
+// the SECTION_BIOMES strategy: `tableswitch {0..3}` where 0 is single-valued,
+// 1-3 are linear (palette prefix present), and every other value falls through
+// to the global palette — no palette prefix, and the data re-read at the
+// registry's own bit width regardless of the byte we sent. This differs from
+// block states, which additionally have a hashmap tier for 5-8 bits.
+func readBiomeContainerAsClient(t *testing.T, buf []byte) int {
+	t.Helper()
+	r := protocol.NewReader(buf)
+	bpe, err := r.ReadByte()
+	if err != nil {
+		t.Fatalf("bits per entry: %v", err)
+	}
+	if bpe == 0 {
+		if _, err := r.VarInt(); err != nil {
+			t.Fatalf("single value: %v", err)
+		}
+		return len(buf) - r.Remaining()
+	}
+	dataBits := int(bpe)
+	if dataBits <= maxBiomeLinearBits {
+		n, err := r.VarInt()
+		if err != nil || n < 0 {
+			t.Fatalf("palette length: %v", err)
+		}
+		for i := int32(0); i < n; i++ {
+			if _, err := r.VarInt(); err != nil {
+				t.Fatalf("palette entry %d: %v", i, err)
+			}
+		}
+	} else {
+		dataBits = bitsFor(totalBiomes)
+	}
+	perLong := 64 / dataBits
+	longs := (biomeCellsPerSection + perLong - 1) / perLong
+	for i := 0; i < longs; i++ {
+		if _, err := r.Int64(); err != nil {
+			t.Fatalf("data long %d: %v", i, err)
+		}
+	}
+	return len(buf) - r.Remaining()
+}
+
+// TestBiomePaletteFormMatchesVanillaThresholds pins the SECTION_BIOMES palette
+// contract at the linear/global boundary.
+//
+// A section holding 9 or more distinct biomes needs 4 bits per entry. Written as
+// a linear palette, the client reads it as global instead: it consumes no
+// palette prefix and re-reads the long array at 7 bits, so it walks off the end
+// of the container and every following field in the chunk payload is
+// misaligned. Sections straddling the surface and the cave biomes really do
+// carry that many, so this is reachable in ordinary terrain.
+//
+// The assertion is the desync itself: decode each container the way the client
+// would and require it to consume exactly the bytes we produced.
+func TestBiomePaletteFormMatchesVanillaThresholds(t *testing.T) {
+	globalBits := bitsFor(totalBiomes)
+
+	for _, tc := range []struct {
+		name     string
+		distinct int
+		wantBits int
+	}{
+		{"one biome stays single-valued", 1, 0},
+		{"two biomes", 2, 1},
+		{"eight biomes is the widest linear palette", 8, 3},
+		{"nine biomes must switch to global", 9, globalBits},
+		{"twenty biomes", 20, globalBits},
+		{"every registry biome", totalBiomes, globalBits},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cells [biomeCellsPerSection]uint16
+			for i := range cells {
+				cells[i] = uint16(i % tc.distinct)
+			}
+
+			w := protocol.NewWriter(128)
+			writeBiomePalette(w, &cells)
+			got := w.Bytes()
+
+			if int(got[0]) != tc.wantBits {
+				t.Errorf("bits per entry = %d, want %d", got[0], tc.wantBits)
+			}
+			if used := readBiomeContainerAsClient(t, got); used != len(got) {
+				t.Errorf("client consumed %d of %d bytes; container is misframed by %d",
+					used, len(got), len(got)-used)
+			}
+		})
+	}
+}

@@ -63,6 +63,16 @@ const (
 	biomeCellsXZ         = 16 / biomeCellSize                         // 4
 	biomeCellsPerSection = biomeCellsXZ * biomeCellsXZ * biomeCellsXZ // 64
 	totalBiomes          = 65                                         // synced minecraft:worldgen/biome registry size
+
+	// maxBiomeLinearBits is the widest indirect (linear) biome palette the client
+	// will read. Vanilla's SECTION_BIOMES strategy switches on the bit count with
+	// `tableswitch {0..3}`: 0 is single-valued, 1-3 are linear, and everything
+	// else falls through to the global palette — there is no hashmap tier for
+	// biomes, unlike block states. Writing a linear palette at 4+ bits makes the
+	// client read the container as global: it consumes no palette prefix and
+	// re-reads the long array at bitsFor(totalBiomes), so the rest of the chunk
+	// payload is misaligned.
+	maxBiomeLinearBits = 3
 )
 
 // Chunk is a 16xWorldHeightx16 column of block states. Each section may carry a
@@ -412,7 +422,7 @@ func writeBiomePalette(w *protocol.Writer, s *[biomeCellsPerSection]uint16) {
 	if bpe < 1 {
 		bpe = 1 // minimum for the indirect biome format
 	}
-	if bpe > bitsFor(totalBiomes) {
+	if bpe > maxBiomeLinearBits {
 		writeBiomeDirect(w, s)
 		return
 	}
