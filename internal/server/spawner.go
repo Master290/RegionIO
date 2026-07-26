@@ -2,21 +2,25 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"math"
 	"math/rand"
 	"time"
 
+	"regionio/internal/protocol"
 	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
-// StartSpawning begins the entity tick and spawn loops.
-func (s *Server) StartSpawning(ctx context.Context) {
-	go s.entityTickLoop(ctx)
+// StartSpawning begins the entity tick and spawn loops. log matches
+// Cache.StartAutosave's convention: these are background loops that have to be
+// able to report a failure nobody is waiting on.
+func (s *Server) StartSpawning(ctx context.Context, log *slog.Logger) {
+	go s.entityTickLoop(ctx, log)
 	go s.mobSpawnLoop(ctx)
 }
 
-func (s *Server) entityTickLoop(ctx context.Context) {
+func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 	ticker := time.NewTicker(50 * time.Millisecond) // 20 TPS
 	defer ticker.Stop()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -25,6 +29,17 @@ func (s *Server) entityTickLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// The world clock rides this loop because it is the only one
+			// already running at 20 TPS. It belongs on the single authoritative
+			// tick the engine still needs.
+			if gameTime, dayTime := s.advanceWorldTime(); gameTime%timeSyncTicks == 0 {
+				s.Broadcast(protocol.PlaySetTime, encodeSetTime(gameTime, dayTime))
+				if gameTime%timePersistTicks == 0 {
+					if err := s.SaveWorldTime(); err != nil && log != nil {
+						log.Warn("saving world clock", "err", err)
+					}
+				}
+			}
 			all := s.entities.All()
 			for i := range all {
 				snapshot := all[i]

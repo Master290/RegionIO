@@ -70,6 +70,8 @@ type Server struct {
 	players      map[[16]byte]*PlayerSession
 	playerNames  map[string][16]byte
 	nextPlayerID int32
+
+	clock worldClock
 }
 
 // PacketSender is the connection capability retained by the session registry.
@@ -155,10 +157,26 @@ func validateConfig(cfg Config) error {
 }
 
 func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entities *world.EntityManager) *Server {
-	return &Server{
+	s := &Server{
 		cfg: cfg, chunks: chunks, store: store, entities: entities,
 		players: make(map[[16]byte]*PlayerSession), playerNames: make(map[string][16]byte),
 	}
+	// Resume the world clock where it was saved, so a restart does not throw
+	// the sky back to dawn.
+	if store != nil {
+		gameTime, dayTime := store.WorldTime()
+		s.SetWorldTime(gameTime, dayTime)
+	}
+	return s
+}
+
+// SaveWorldTime persists the current clock. It is a no-op without a store.
+func (s *Server) SaveWorldTime() error {
+	if s.store == nil {
+		return nil
+	}
+	gameTime, dayTime := s.WorldTime()
+	return s.store.SaveWorldTime(gameTime, dayTime)
 }
 
 // Config returns the active configuration.

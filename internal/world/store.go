@@ -76,6 +76,9 @@ type Store struct {
 	dir     string
 	mu      sync.Mutex
 	regions map[[2]int]*RegionFile
+
+	metaMu sync.Mutex
+	meta   worldMetadata
 }
 
 const worldMetadataFile = "regionio-world.json"
@@ -83,6 +86,10 @@ const worldMetadataFile = "regionio-world.json"
 type worldMetadata struct {
 	Format int   `json:"format"`
 	Seed   int64 `json:"seed"`
+	// GameTime and DayTime persist the world clock. A file written before they
+	// existed simply lacks them, and the world resumes at dawn as it used to.
+	GameTime int64 `json:"gameTime"`
+	DayTime  int64 `json:"dayTime"`
 }
 
 // NewStore opens (or creates) the world directory at dir, ensuring region/
@@ -103,35 +110,74 @@ func newStore(dir string, seed *int64) (*Store, error) {
 	if err := mkdirAll(regionDir); err != nil {
 		return nil, err
 	}
+	store := &Store{dir: dir, regions: make(map[[2]int]*RegionFile)}
 	if seed != nil {
-		if err := validateWorldMetadata(dir, *seed); err != nil {
+		meta, err := validateWorldMetadata(dir, *seed)
+		if err != nil {
 			return nil, err
 		}
+		store.meta = meta
 	}
-	return &Store{dir: dir, regions: make(map[[2]int]*RegionFile)}, nil
+	return store, nil
 }
 
-func validateWorldMetadata(dir string, seed int64) error {
+// WorldTime returns the clock stored with the world. It is zero for a world
+// opened without a seed (which skips the metadata file) or written before the
+// clock was persisted.
+func (s *Store) WorldTime() (gameTime, dayTime int64) {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	return s.meta.GameTime, s.meta.DayTime
+}
+
+// SaveWorldTime rewrites the metadata file with a new clock. It is a no-op for
+// a world with no metadata file, which has no seed to write back.
+func (s *Store) SaveWorldTime(gameTime, dayTime int64) error {
+	s.metaMu.Lock()
+	defer s.metaMu.Unlock()
+	if s.meta.Format == 0 {
+		return nil
+	}
+	if s.meta.GameTime == gameTime && s.meta.DayTime == dayTime {
+		return nil
+	}
+	meta := s.meta
+	meta.GameTime, meta.DayTime = gameTime, dayTime
+	if err := writeWorldMetadata(s.dir, meta); err != nil {
+		return err
+	}
+	s.meta = meta
+	return nil
+}
+
+func validateWorldMetadata(dir string, seed int64) (worldMetadata, error) {
 	path := filepath.Join(dir, worldMetadataFile)
 	raw, err := os.ReadFile(path)
 	if err == nil {
 		var meta worldMetadata
 		if err := json.Unmarshal(raw, &meta); err != nil {
-			return fmt.Errorf("world: decode %s: %w", path, err)
+			return worldMetadata{}, fmt.Errorf("world: decode %s: %w", path, err)
 		}
 		if meta.Format != 1 {
-			return fmt.Errorf("world: unsupported metadata format %d", meta.Format)
+			return worldMetadata{}, fmt.Errorf("world: unsupported metadata format %d", meta.Format)
 		}
 		if meta.Seed != seed {
-			return fmt.Errorf("world: seed mismatch for %s: stored %d, configured %d", dir, meta.Seed, seed)
+			return worldMetadata{}, fmt.Errorf("world: seed mismatch for %s: stored %d, configured %d", dir, meta.Seed, seed)
 		}
-		return nil
+		return meta, nil
 	}
 	if !os.IsNotExist(err) {
-		return err
+		return worldMetadata{}, err
 	}
+	meta := worldMetadata{Format: 1, Seed: seed}
+	return meta, writeWorldMetadata(dir, meta)
+}
 
-	raw, err = json.MarshalIndent(worldMetadata{Format: 1, Seed: seed}, "", "  ")
+// writeWorldMetadata replaces the metadata file atomically: write a temporary
+// beside it, fsync, then rename over the original.
+func writeWorldMetadata(dir string, meta worldMetadata) error {
+	path := filepath.Join(dir, worldMetadataFile)
+	raw, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		return err
 	}

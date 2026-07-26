@@ -84,6 +84,7 @@ const (
 	PlayLightUpdate      = 0x30
 	PlayPlayerInfoRemove = 0x45
 	PlayPlayerInfoUpdate = 0x46
+	PlaySetTime          = 0x71
 
 	// Entity packets
 	PlayAddEntity        = 0x01

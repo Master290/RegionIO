@@ -58,6 +58,10 @@ func (h *handler) beginPlay() error {
 	if err := h.sendPlayerAbilities(); err != nil {
 		return err
 	}
+	// The client's sky stays where it started until it is told the time.
+	if err := h.conn.Send(protocol.PlaySetTime, h.srv.SetTimePacket()); err != nil {
+		return err
+	}
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
 	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.visibilityRadius())

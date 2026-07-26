@@ -51,7 +51,7 @@ func main() {
 	saveCtx, saveStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	autosaveDone := srv.Chunks().StartAutosave(saveCtx, log, 30*time.Second)
 
-	srv.StartSpawning(saveCtx)
+	srv.StartSpawning(saveCtx, log)
 
 	ln := network.NewListener(srv, log)
 
@@ -64,6 +64,9 @@ func main() {
 	}
 	saveStop()
 	<-autosaveDone
+	if err := srv.SaveWorldTime(); err != nil {
+		log.Error("saving world clock", "err", err)
+	}
 	if srv.Store() != nil {
 		srv.Store().Close()
 	}
