@@ -33,6 +33,11 @@ func (rs *RandomState) AquiferRandom() PositionalRandomFactory { return rs.aquif
 // (RandomState.oreRandom).
 func (rs *RandomState) OreRandom() PositionalRandomFactory { return rs.ore }
 
+// Positional returns the root positional factory (RandomState.random). It is
+// what SurfaceSystem jitters the surface depth with and what the surface rules'
+// vertical_gradient and clay bands derive their own factories from.
+func (rs *RandomState) Positional() PositionalRandomFactory { return rs.factory }
+
 // Noise returns the NormalNoise for the named noise parameters, seeded as
 // NormalNoise.create(factory.fromHashOf(name), params) and cached.
 func (rs *RandomState) Noise(name string, firstOctave int, amplitudes []float64) *NormalNoise {

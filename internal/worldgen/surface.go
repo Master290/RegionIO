@@ -51,12 +51,18 @@ type SurfaceContext struct {
 	// Steep is true when the local slope exceeds the vanilla steep threshold
 	// (~1.0 surface-depth delta between neighbours).
 	Steep bool
-	// SurfaceDepth is the vanilla surface-depth value at this column (a small
-	// noise-driven integer 0..N) added to stone depth comparisons.
+	// SurfaceDepth is how thick the biome's surface layers are at this column
+	// (SurfaceSystem.getSurfaceDepth): usually 3, sometimes 0 or less, which is
+	// what "hole" tests for. It widens the stone_depth bands.
 	SurfaceDepth int
-	// PreliminarySurface is the top solid Y in this column; the
-	// above_preliminary_surface condition passes for blocks above it.
-	PreliminarySurface int
+	// SurfaceSecondary is the "minecraft:surface_secondary" noise at this
+	// column, which widens a stone_depth band further when the rule sets
+	// secondary_depth_range.
+	SurfaceSecondary float64
+	// MinSurfaceLevel is the lowest Y the biome surface subtree may reach:
+	// the interpolated preliminary surface level plus SurfaceDepth less 8.
+	// above_preliminary_surface tests Y against it.
+	MinSurfaceLevel int
 	// Rng is a per-column deterministic source for vertical_gradient and
 	// bandlands. It is seeded by the column so results are stable across runs.
 	Rng *rand.Rand
@@ -253,11 +259,11 @@ func (t stoneDepthTest) Test(ctx *SurfaceContext) bool {
 	if t.addSurfaceDepth {
 		surfaceDepth = ctx.SurfaceDepth
 	}
-	// Vanilla widens the band by map(surface_secondary noise, -1..1, 0..range).
-	// That noise is not sampled yet, so the secondary term stays 0; the two
-	// rules that use it also set add_surface_depth, and both currently reduce to
-	// the same single-block band either way.
-	return depth <= 1+t.offset+surfaceDepth
+	secondary := 0
+	if t.secondaryRange != 0 {
+		secondary = int(mapRange(ctx.SurfaceSecondary, -1.0, 1.0, 0.0, float64(t.secondaryRange)))
+	}
+	return depth <= 1+t.offset+surfaceDepth+secondary
 }
 
 // noiseThresholdTest passes when the named surface noise is within [min,max].
@@ -309,13 +315,12 @@ func (t verticalGradientTest) Test(ctx *SurfaceContext) bool {
 	return ctx.Rng.Float64() > float64(pos)/float64(band)
 }
 
-// abovePreliminarySurfaceTest passes for blocks at or above the column's
-// preliminary surface (the top solid Y). Vanilla gates the biome dispatch on
-// this so submerged blocks far below the surface keep stone.
+// abovePreliminarySurfaceTest gates the whole biome surface subtree: below the
+// column's minimum surface level nothing is dressed and the stone stays stone.
 type abovePreliminarySurfaceTest struct{}
 
 func (abovePreliminarySurfaceTest) Test(ctx *SurfaceContext) bool {
-	return ctx.Y >= ctx.PreliminarySurface
+	return ctx.Y >= ctx.MinSurfaceLevel
 }
 
 // ---- Parser ------------------------------------------------------------

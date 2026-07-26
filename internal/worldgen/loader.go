@@ -52,6 +52,10 @@ type OverworldDensity struct {
 	// AquiferRandom places the aquifer cell centres.
 	AquiferRandom PositionalRandomFactory
 
+	// Surface samples the noises SurfaceSystem reads per column, before the
+	// rule tree runs.
+	Surface *SurfaceSampler
+
 	prelim *levelCache
 }
 
@@ -148,6 +152,22 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 	// Interpolated nodes are collected as the whole router is parsed, so the
 	// list has to be taken after the loop, not just after final_density.
 	od.Interpolated = l.interpolated
+
+	// SurfaceSystem's own noises. They are not router keys: vanilla pulls them
+	// straight out of the noise registry when it builds the SurfaceSystem.
+	surfaceNoise, err := l.noiseField("minecraft:surface")
+	if err != nil {
+		return nil, fmt.Errorf("surface noise: %w", err)
+	}
+	secondaryNoise, err := l.noiseField("minecraft:surface_secondary")
+	if err != nil {
+		return nil, fmt.Errorf("surface_secondary noise: %w", err)
+	}
+	od.Surface = &SurfaceSampler{
+		surfaceNoise:   surfaceNoise,
+		secondaryNoise: secondaryNoise,
+		positionalRand: l.rs.Positional(),
+	}
 	return od, nil
 }
 

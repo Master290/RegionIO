@@ -199,7 +199,7 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 	rng := newColumnRand(wx, wz, int(seed))
 
 	if rule != nil {
-		applySurfaceRule(out, wx, wz, SeaLevel, MinY, biomeName, rule, rng, top)
+		applySurfaceRule(od, out, wx, wz, SeaLevel, MinY, biomeName, rule, rng)
 	} else {
 		fillLegacySurface(out, top, beach, deepWater, rng)
 	}
@@ -241,7 +241,7 @@ func substance(aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, x, y, z i
 // One *rand.Rand is created per column (not per block) — bandlands/gradient
 // consume from it sequentially, which is correct because vanilla seeds those
 // per-column too. This avoids ~98k rand.New allocations per chunk.
-func applySurfaceRule(out *[WorldHeight]uint16, wx, wz, seaLevel, minY int, biomeName string, rule worldgen.SurfaceRule, rng chunkRand, topSolid int) {
+func applySurfaceRule(od *worldgen.OverworldDensity, out *[WorldHeight]uint16, wx, wz, seaLevel, minY int, biomeName string, rule worldgen.SurfaceRule, rng chunkRand) {
 	top := -1
 	for i := WorldHeight - 1; i >= 0; i-- {
 		if out[i] != StateAir {
@@ -254,23 +254,23 @@ func applySurfaceRule(out *[WorldHeight]uint16, wx, wz, seaLevel, minY int, biom
 	}
 	// One per-column RNG for all surface rules in this column.
 	colRng := rng.toRand()
-	// Surface noise sample (the "minecraft:surface" noise used by noise_threshold
-	// conditions). Cheap deterministic value derived from the column so the
-	// rule's coarse_dirt/terracotta bands vary per column.
-	surfaceNoise := colRng.Float64()*2 - 1 // [-1, 1]
+	// Column-constant surface quantities, computed once per column exactly as
+	// SurfaceRules.Context.updateXZ does.
+	surfaceDepth := od.Surface.SurfaceDepth(wx, wz)
 	// Reuse one context across the column (mutated per block) to avoid ~98k
 	// heap allocations per chunk; the fields that vary per block are set inside
 	// the loop, the rest are column-constant.
 	sctx := &worldgen.SurfaceContext{
-		X:                  wx,
-		Z:                  wz,
-		SeaLevel:           seaLevel,
-		BiomeName:          biomeName,
-		MinY:               minY,
-		SurfaceNoise:       surfaceNoise,
-		SurfaceDepth:       0,
-		PreliminarySurface: minY + topSolid,
-		Rng:                colRng,
+		X:                wx,
+		Z:                wz,
+		SeaLevel:         seaLevel,
+		BiomeName:        biomeName,
+		MinY:             minY,
+		SurfaceNoise:     od.Surface.Noise(wx, wz),
+		SurfaceSecondary: od.Surface.SurfaceSecondary(wx, wz),
+		SurfaceDepth:     surfaceDepth,
+		MinSurfaceLevel:  od.MinSurfaceLevelAt(wx, wz, surfaceDepth),
+		Rng:              colRng,
 	}
 	stoneDepthAbove := 0
 	waterHeight := worldgen.NoWaterAbove

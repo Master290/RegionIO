@@ -37,7 +37,7 @@ func TestSurfaceRuleNoPanic(t *testing.T) {
 				X: 100, Y: y, Z: 100,
 				StoneDepthAbove: 100 - y, StoneDepthBelow: y + 1,
 				SeaLevel: 63, BiomeName: b, MinY: -64,
-				PreliminarySurface: 100, WaterHeight: NoWaterAbove,
+				MinSurfaceLevel: 80, WaterHeight: NoWaterAbove,
 				Rng: rand.New(rand.NewSource(1)),
 			}
 			rule.Apply(ctx) // must not panic
@@ -55,7 +55,7 @@ func TestSurfaceBedrockFloor(t *testing.T) {
 	ctx := &SurfaceContext{
 		X: 0, Y: -64, Z: 0, StoneDepthAbove: 1, StoneDepthBelow: 1,
 		SeaLevel: 63, BiomeName: "minecraft:plains", MinY: -64,
-		PreliminarySurface: 70, WaterHeight: NoWaterAbove,
+		MinSurfaceLevel: 62, WaterHeight: NoWaterAbove,
 		Rng: rand.New(rand.NewSource(1)),
 	}
 	state, ok := rule.Apply(ctx)

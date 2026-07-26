@@ -216,9 +216,31 @@ func main() {
 	// dirt band beyond a single block.
 	fmt.Println("\n=== Subsurface banding (grass columns: expect grass=9, dirt=10 band, stone=1) ===")
 	found := 0
+	bandDepths := map[int]int{}
 	for cx := int32(-40); cx < 40 && found < 6; cx += 3 {
 		for cz := int32(-40); cz < 40 && found < 6; cz += 3 {
 			ch := gen(cx, cz)
+			for lx := 0; lx < 16; lx++ {
+				for lz := 0; lz < 16; lz++ {
+					topY := world.MinY - 1
+					for wy := world.MinY + world.WorldHeight - 1; wy >= world.MinY; wy-- {
+						b := ch.GetBlock(lx, wy, lz)
+						if b != world.StateAir && b != world.StateWater && b != world.StateLava &&
+							b != world.StateOakLog && b != world.StateOakLeaf {
+							topY = wy
+							break
+						}
+					}
+					if topY < world.SeaLevel || ch.GetBlock(lx, topY, lz) != world.StateGrass {
+						continue
+					}
+					depth := 0
+					for wy := topY - 1; wy >= topY-6 && ch.GetBlock(lx, wy, lz) == world.StateDirt; wy-- {
+						depth++
+					}
+					bandDepths[depth]++
+				}
+			}
 			for lx := 0; lx < 16 && found < 6; lx += 5 {
 				for lz := 0; lz < 16 && found < 6; lz += 5 {
 					topY := world.MinY - 1
@@ -245,6 +267,25 @@ func main() {
 	}
 	if found == 0 {
 		fmt.Println("  (no grass columns found in scan area)")
+	}
+	// The band depth over every grass column scanned. Vanilla is 2..4; a
+	// histogram piled entirely on 0 means the biome surface subtree is gated to
+	// one block per column again.
+	banded, allGrass := 0, 0
+	for d, n := range bandDepths {
+		allGrass += n
+		if d >= 2 {
+			banded += n
+		}
+	}
+	fmt.Printf("  dirt-band depth over %d grass columns: %v\n", allGrass, bandDepths)
+	switch {
+	case allGrass == 0:
+		fmt.Println("  (no grass columns to measure)")
+	case banded*4 < allGrass*3:
+		fmt.Printf("  FAIL: only %d of %d grass columns carry 2+ blocks of dirt\n", banded, allGrass)
+	default:
+		fmt.Printf("  OK: %d of %d grass columns carry 2+ blocks of dirt\n", banded, allGrass)
 	}
 
 	// 2) Cross-section at chunk (0,0): column x=8, over full Y, ASCII.
