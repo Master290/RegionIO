@@ -340,11 +340,17 @@ func (p *surfaceParser) noiseSlot(name string) (int, error) {
 
 // resolveAnchor is VerticalAnchor.resolveY.
 func (p *surfaceParser) resolveAnchor(a anchorJSON) int {
+	return resolveAnchorY(a, p.minY, p.height)
+}
+
+// resolveAnchorY is VerticalAnchor.resolveY against explicit world bounds. The
+// carver configs use the same anchor shape as the surface rules.
+func resolveAnchorY(a anchorJSON, minY, height int) int {
 	switch a.kind {
 	case anchorAboveBottom:
-		return p.minY + a.value
+		return minY + a.value
 	case anchorBelowTop:
-		return p.minY + p.height - 1 - a.value
+		return minY + height - 1 - a.value
 	default:
 		return a.value
 	}

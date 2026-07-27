@@ -172,7 +172,28 @@ type Legacy struct{ seed uint64 }
 
 // NewLegacy seeds a Legacy source, applying Java's seed scramble.
 func NewLegacy(seed int64) *Legacy {
-	return &Legacy{seed: (uint64(seed) ^ lcgMultiplier) & lcgMask}
+	r := &Legacy{}
+	r.SetSeed(seed)
+	return r
+}
+
+// SetSeed is java.util.Random.setSeed, which worldgen reseeds in place.
+func (r *Legacy) SetSeed(seed int64) {
+	r.seed = (uint64(seed) ^ lcgMultiplier) & lcgMask
+}
+
+// SetLargeFeatureSeed is WorldgenRandom.setLargeFeatureSeed: seed from the
+// world seed, draw two longs, and reseed from those mixed with the chunk
+// coordinates.
+//
+// The two products are combined with XOR. setDecorationSeed, which looks almost
+// identical, uses addition and forces the low bit — they are different methods
+// and confusing them silently moves every carver in the world.
+func (r *Legacy) SetLargeFeatureSeed(seed int64, chunkX, chunkZ int) {
+	r.SetSeed(seed)
+	a := r.NextLong()
+	b := r.NextLong()
+	r.SetSeed(int64(chunkX)*a ^ int64(chunkZ)*b ^ seed)
 }
 
 // next returns the top `b` bits of the next LCG state.

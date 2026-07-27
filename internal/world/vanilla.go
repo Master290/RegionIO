@@ -32,12 +32,17 @@ func NewVanillaGenerator(seed int64) Generator {
 	}
 	fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
 	veins := worldgen.NewOreVeinifier(od)
+	carver, err := worldgen.NewCarver(od, seed)
+	if err != nil {
+		panic("world: loading carvers: " + err.Error())
+	}
+	initCarverReplaceable(carver.ReplaceableBlocks())
 	return func(cx, cz int32) *Chunk {
-		return generateVanilla(od, fluidPicker, veins, seed, cx, cz)
+		return generateVanilla(od, fluidPicker, veins, carver, seed, cx, cz)
 	}
 }
 
-func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, seed int64, cx, cz int32) *Chunk {
+func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) *Chunk {
 	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
@@ -135,6 +140,26 @@ func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPi
 	}
 	wg.Wait()
 
+	// Carving sits between the surface pass and decoration, as it does in
+	// vanilla: it needs the surfaced blocks to retexture a cave mouth, and
+	// decoration needs the carved heights so nothing is planted over a hole.
+	if carver != nil && ruleErr == nil {
+		view := &carveView{
+			cols: &columns, od: od, rules: surfaceRule,
+			sctx: surfaceRule.NewContext(), biomes: &biomeName,
+			worldSurface: &worldSurface, baseX: baseX, baseZ: baseZ,
+		}
+		carver.CarveChunk(view, aq, int(cx), int(cz))
+		// The heights decoration plants against are the post-carve ones.
+		// Vanilla re-primes its heightmaps at the start of the feature step for
+		// the same reason.
+		for lx := 0; lx < 16; lx++ {
+			for lz := 0; lz < 16; lz++ {
+				surfTop[lx][lz], grass[lx][lz] = classifyColumn(&columns[lx][lz])
+			}
+		}
+	}
+
 	for lx := 0; lx < 16; lx++ {
 		for lz := 0; lz < 16; lz++ {
 			col := &columns[lx][lz]
@@ -216,13 +241,31 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 		}
 	}
 
+	_, grass = classifyColumn(out)
+	return top, worldSurface, grass
+}
+
+// classifyColumn returns the top solid index and whether that surface is
+// plantable grassy land. It is recomputed after carving, because a column whose
+// top block a ravine removed is no longer the column decoration was told about.
+func classifyColumn(col *[WorldHeight]uint16) (top int, grass bool) {
+	top = -1
+	for i := WorldHeight - 1; i >= 0; i-- {
+		if isStoneState(col[i]) {
+			top = i
+			break
+		}
+	}
+	if top < 0 {
+		return top, false
+	}
 	topY := MinY + top
 	// Beach: a narrow band straddling the waterline. Dry columns well above sea
 	// level stay grass; deep water floors become gravel, not sand.
 	const beachBand = 3
-	beach := top >= 0 && topY >= SeaLevel-beachBand && topY <= SeaLevel+1
-	deepWater := top >= 0 && topY < SeaLevel-beachBand
-	return top, worldSurface, top >= 0 && !beach && !deepWater && topY >= SeaLevel
+	beach := topY >= SeaLevel-beachBand && topY <= SeaLevel+1
+	deepWater := topY < SeaLevel-beachBand
+	return top, !beach && !deepWater && topY >= SeaLevel
 }
 
 // steepAt is SurfaceRules.SteepMaterialCondition: true where the column's
