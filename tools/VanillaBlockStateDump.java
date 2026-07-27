@@ -10,20 +10,44 @@ import net.minecraft.SharedConstants;
 import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.LeavesBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
-// Dumps protocol-775 lighting properties directly from vanilla runtime state.
-// Compile/run against the unpacked 26.1.2 server classpath and redirect stdout
-// to internal/world/light_properties.bin.
-public final class VanillaLightDump {
+// Dumps the per-block-state properties the chunk pipeline needs, straight from
+// vanilla runtime state. generated/reports/blocks.json carries none of them:
+// they only exist once the block-state registry is built.
+//
+// Compile and run against the unpacked 26.1.2 server classpath and redirect
+// stdout to internal/world/block_properties.bin:
+//
+//   CP="versions/26.1.2/server-26.1.2.jar;$(find libraries -name '*.jar' | tr '\n' ';')"
+//   javac -nowarn -cp "$CP" -d <out> tools/VanillaBlockStateDump.java
+//   java -cp "<out>;$CP" VanillaBlockStateDump > internal/world/block_properties.bin
+//
+// Was VanillaLightDump: it dumped only lighting until the heightmaps needed
+// blocksMotion and the leaves test, neither of which is derivable from any
+// report or tag file.
+public final class VanillaBlockStateDump {
     private record MaskKey(byte[] data) {
         @Override public boolean equals(Object other) {
             return other instanceof MaskKey key && Arrays.equals(data, key.data);
         }
         @Override public int hashCode() { return Arrays.hashCode(data); }
     }
+
+    // Format version. Bump whenever the byte layout or the meaning of a flag
+    // bit changes; the Go decoder rejects anything it does not know.
+    private static final int FORMAT_VERSION = 2;
+
+    // Flag bits. 1..4 drive lighting, 8..32 drive the heightmaps.
+    private static final int FLAG_PROPAGATES_SKYLIGHT = 1;
+    private static final int FLAG_CAN_OCCLUDE = 2;
+    private static final int FLAG_SHAPE_FOR_OCCLUSION = 4;
+    private static final int FLAG_BLOCKS_MOTION = 8;
+    private static final int FLAG_FLUID = 16;
+    private static final int FLAG_LEAVES = 32;
 
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion();
@@ -42,9 +66,15 @@ public final class VanillaLightDump {
             dampening[id] = (byte) state.getLightDampening();
             emission[id] = (byte) state.getLightEmission();
             int stateFlags = 0;
-            if (state.propagatesSkylightDown()) stateFlags |= 1;
-            if (state.canOcclude()) stateFlags |= 2;
-            if (state.useShapeForLightOcclusion()) stateFlags |= 4;
+            if (state.propagatesSkylightDown()) stateFlags |= FLAG_PROPAGATES_SKYLIGHT;
+            if (state.canOcclude()) stateFlags |= FLAG_CAN_OCCLUDE;
+            if (state.useShapeForLightOcclusion()) stateFlags |= FLAG_SHAPE_FOR_OCCLUSION;
+            // Heightmap.Types: MOTION_BLOCKING is blocksMotion || fluid, and
+            // MOTION_BLOCKING_NO_LEAVES additionally excludes LeavesBlock --
+            // an instanceof, not the minecraft:leaves tag, so the two differ.
+            if (state.blocksMotion()) stateFlags |= FLAG_BLOCKS_MOTION;
+            if (!state.getFluidState().isEmpty()) stateFlags |= FLAG_FLUID;
+            if (state.getBlock() instanceof LeavesBlock) stateFlags |= FLAG_LEAVES;
             flags[id] = (byte) stateFlags;
 
             byte[] masks = faceMasks(state);
@@ -60,7 +90,7 @@ public final class VanillaLightDump {
 
         DataOutputStream out = new DataOutputStream(new BufferedOutputStream(System.out));
         out.writeInt(0x52494f4c); // RIOL
-        out.writeInt(1);
+        out.writeInt(FORMAT_VERSION);
         out.writeInt(count);
         out.writeInt(shapes.size());
         for (int id = 0; id < count; id++) {

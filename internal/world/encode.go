@@ -286,22 +286,36 @@ func (c *Chunk) encode() []byte {
 	return w.Bytes()
 }
 
-// Heightmap.Types ordinals sent to the client.
+// Heightmap.Types ids whose Usage is CLIENT. Vanilla sends exactly these three
+// and no others.
 const (
 	hmWorldSurface           = 1
 	hmMotionBlocking         = 4
 	hmMotionBlockingNoLeaves = 5
 )
 
-// writeHeightmaps emits the three client-relevant heightmaps. For our blocky
-// terrain (no leaves/transparency) they share the same column heights.
+// writeHeightmaps emits the three heightmaps the client is sent.
+//
+// They are not the same map, which is what this code used to assume. Each stops
+// at a different block: WORLD_SURFACE at the first thing that is not air,
+// MOTION_BLOCKING at the first thing that blocks movement or holds fluid, and
+// MOTION_BLOCKING_NO_LEAVES at the first such thing that is not leaves. A
+// flower, a torch, a sapling or a tree canopy separates them — the client uses
+// MOTION_BLOCKING to place rain and snow particles and to decide where a
+// fishing bobber lands, so a canopy reported as solid ground rains indoors.
 func (c *Chunk) writeHeightmaps(w *protocol.Writer) {
-	heights := c.columnHeights()
-	packed := packHeightmap(heights)
-
+	surface, motion, motionNoLeaves := c.heightmaps()
 	w.VarInt(3)
-	for _, t := range []int32{hmMotionBlockingNoLeaves, hmMotionBlocking, hmWorldSurface} {
-		w.VarInt(t)
+	for _, hm := range [...]struct {
+		id     int32
+		values [256]uint16
+	}{
+		{hmWorldSurface, surface},
+		{hmMotionBlocking, motion},
+		{hmMotionBlockingNoLeaves, motionNoLeaves},
+	} {
+		packed := packHeightmap(hm.values)
+		w.VarInt(hm.id)
 		w.VarInt(int32(len(packed)))
 		for _, v := range packed {
 			w.Int64(int64(v))
@@ -309,24 +323,54 @@ func (c *Chunk) writeHeightmaps(w *protocol.Writer) {
 	}
 }
 
-// columnHeights returns, per column, (highestNonAirY + 1) - MinY, clamped to 0.
-func (c *Chunk) columnHeights() [256]uint16 {
-	var h [256]uint16
+// heightmaps walks every column once from the top down, recording the first
+// block that satisfies each predicate. The stored value is one above the
+// matching block, relative to the world floor — what Heightmap.setHeight
+// writes — so 0 means the column has no matching block at all.
+func (c *Chunk) heightmaps() (surface, motion, motionNoLeaves [256]uint16) {
 	for lx := 0; lx < 16; lx++ {
 		for lz := 0; lz < 16; lz++ {
-			height := 0
-			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
-				si := (y - MinY) >> 4
+			i := lz*16 + lx
+			var haveSurface, haveMotion, haveNoLeaves bool
+			for si := SectionCount - 1; si >= 0; si-- {
 				s := c.sections[si]
-				if s != nil && s[blockIndex(lx, y, lz)] != StateAir {
-					height = y + 1 - MinY
+				if s == nil {
+					continue
+				}
+				for ly := 15; ly >= 0; ly-- {
+					y := MinY + si*16 + ly
+					state := s[blockIndex(lx, y, lz)]
+					if state == StateAir {
+						continue
+					}
+					h := uint16(y + 1 - MinY)
+					if !haveSurface {
+						surface[i], haveSurface = h, true
+					}
+					if !haveMotion && blocksMotionOrFluid(state) {
+						motion[i], haveMotion = h, true
+					}
+					if !haveNoLeaves && blocksMotionNoLeaves(state) {
+						motionNoLeaves[i], haveNoLeaves = h, true
+					}
+					if haveSurface && haveMotion && haveNoLeaves {
+						break
+					}
+				}
+				if haveSurface && haveMotion && haveNoLeaves {
 					break
 				}
 			}
-			h[lz*16+lx] = uint16(height)
 		}
 	}
-	return h
+	return surface, motion, motionNoLeaves
+}
+
+// columnHeights returns the WORLD_SURFACE heightmap on its own, for the
+// on-disk Heightmaps tag and the parity test.
+func (c *Chunk) columnHeights() [256]uint16 {
+	surface, _, _ := c.heightmaps()
+	return surface
 }
 
 // packHeightmap packs 256 column heights at 9 bits each, 7 values per long,

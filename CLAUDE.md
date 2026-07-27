@@ -60,11 +60,22 @@ threshold was pinned down: `Strategy$2` switches `{0..3}` and everything above f
 global palette, which `.refjava/` alone could not show.
 
 When a constant has to come from vanilla's *runtime* rather than its source or reports, dump it with
-a throwaway Java program run against the jar. `tools/VanillaLightDump.java` is the precedent — it
-walks the block-state registry and emits opacity, emission and voxel face shapes into
-`internal/world/light_properties.bin`. Substring-matching block names is how the light table was
-wrong before (`grass_block` matched "grass", `bedrock` matched "bed"); don't reintroduce that shape
-of guess anywhere.
+a Java program run against the jar. `tools/VanillaBlockStateDump.java` is the one that exists — it
+walks the block-state registry and emits, per state, light opacity and emission, voxel face-occlusion
+masks, and the `blocksMotion` / fluid / leaves flags the heightmaps need, into
+`internal/world/block_properties.bin`. Rebuild it with:
+
+```
+CP="versions/26.1.2/server-26.1.2.jar;$(find libraries -name '*.jar' | tr '\n' ';')"
+javac -nowarn -cp "$CP" -d <out> tools/VanillaBlockStateDump.java
+java -cp "<out>;$CP" VanillaBlockStateDump > internal/world/block_properties.bin
+```
+
+The 39 jars under `libraries/` are required; the server jar alone will not boot the registry. Bump
+the format version in both the Java and `internal/world/block_properties.go` whenever the layout or
+a flag's meaning changes. Substring-matching block names is how the light table was wrong before
+(`grass_block` matched "grass", `bedrock` matched "bed"); don't reintroduce that shape of guess
+anywhere.
 
 ## Layout
 
@@ -74,7 +85,7 @@ cmd/gendump/      client-free generator diagnostics — biome spread, surface bl
                   subsurface banding, deep-layer composition, bedrock band, fluid census,
                   cross-section
 cmd/genblocks/    generates internal/worldgen/generated_blocks.go from the block report
-cmd/genlight/     legacy light-table generator, superseded by tools/VanillaLightDump.java
+cmd/genlight/     legacy light-table generator, superseded by tools/VanillaBlockStateDump.java
 tools/            Java dumpers run against the jar, plus their Go-side fixtures
 internal/protocol/  VarInt, framing, compression, packet IDs
 internal/nbt/       NBT codec (modified UTF-8)
