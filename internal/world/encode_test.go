@@ -106,8 +106,8 @@ func TestFlatChunkEncodesCleanly(t *testing.T) {
 		if err != nil {
 			t.Fatalf("section %d count: %v", s, err)
 		}
-		if _, err := r.Uint16(); err != nil { // reserved 2-byte field
-			t.Fatalf("section %d reserved: %v", s, err)
+		if _, err := r.Uint16(); err != nil { // fluidCount
+			t.Fatalf("section %d fluid count: %v", s, err)
 		}
 		if count > 0 {
 			nonAirSections++
@@ -125,10 +125,10 @@ func TestFlatChunkEncodesCleanly(t *testing.T) {
 	}
 
 	// Light: four bitsets, then sky arrays, then block arrays.
-	expectedSkyArrays := parseBitSet(t, r) // sky mask
+	expectedSkyArrays := parseBitSet(t, r)   // sky mask
 	expectedBlockArrays := parseBitSet(t, r) // block mask
-	parseBitSet(t, r) // empty sky mask
-	parseBitSet(t, r) // empty block mask
+	parseBitSet(t, r)                        // empty sky mask
+	parseBitSet(t, r)                        // empty block mask
 	skyArrays, err := r.VarInt()
 	if err != nil || skyArrays != int32(expectedSkyArrays) {
 		t.Fatalf("sky arrays = %d (err %v), want %d", skyArrays, err, expectedSkyArrays)

@@ -391,12 +391,13 @@ func packHeightmap(h [256]uint16) []uint64 {
 func (c *Chunk) writeSection(w *protocol.Writer, i int) {
 	s := c.sections[i]
 	if s == nil {
-		w.Uint16(0) // non-air block count
-		w.Uint16(0) // reserved 2-byte field (always 0 in vanilla)
+		w.Uint16(0) // nonEmptyBlockCount
+		w.Uint16(0) // fluidCount
 		writeSingleValued(w, uint32(StateAir))
 	} else {
-		w.Uint16(uint16(nonAirCount(s)))
-		w.Uint16(0) // reserved 2-byte field
+		nonEmpty, fluid := sectionCounts(s)
+		w.Uint16(nonEmpty)
+		w.Uint16(fluid)
 		writeBlockPalette(w, s)
 	}
 	// Biome container: per-cell palette when present, else the uniform fallback.
@@ -407,14 +408,26 @@ func (c *Chunk) writeSection(w *protocol.Writer, i int) {
 	}
 }
 
-func nonAirCount(s *[sectionVol]uint16) int {
-	n := 0
+// sectionCounts is LevelChunkSection.recalcBlockCounts, restricted to the two
+// counters that go on the wire: how many blocks are not air, and how many hold
+// a fluid.
+//
+// The second one used to be written as a constant zero, with a comment calling
+// it a reserved field. It is not reserved — a client told a section has no
+// fluid skips that section when it looks for water to swim in or lava to burn
+// on, and the aquifer means almost every section below sea level has some.
+// Waterlogged blocks count, which is why the flag is per block state.
+func sectionCounts(s *[sectionVol]uint16) (nonEmpty, fluid uint16) {
 	for _, v := range s {
-		if v != StateAir {
-			n++
+		if v == StateAir {
+			continue
+		}
+		nonEmpty++
+		if stateFlags(v)&flagFluid != 0 {
+			fluid++
 		}
 	}
-	return n
+	return nonEmpty, fluid
 }
 
 // writeSingleValued writes a bits-per-entry-0 paletted container (no data).

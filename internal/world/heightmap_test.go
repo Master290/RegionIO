@@ -104,3 +104,45 @@ func TestBlockStatePredicates(t *testing.T) {
 		t.Error("dandelion blocks motion; it should not")
 	}
 }
+
+// TestSectionFluidCount checks the second short of a chunk section. It was
+// written as a constant zero under a comment calling it reserved, so every
+// client was told every section is fluid-free.
+func TestSectionFluidCount(t *testing.T) {
+	c := NewChunk(0, 0, BiomePlains)
+	const y = 20
+	// One section: stone floor, water above it, and one waterlogged block —
+	// which counts as fluid even though it is not a fluid block.
+	stairs := nameToStateID("minecraft:oak_stairs", map[string]string{
+		"facing": "north", "half": "bottom", "shape": "straight", "waterlogged": "true",
+	})
+	if stairs == StateAir {
+		t.Fatal("waterlogged oak stairs are missing from the block table")
+	}
+	if stateFlags(stairs)&flagFluid == 0 {
+		t.Fatal("waterlogged stairs do not carry the fluid flag; the dump is wrong")
+	}
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			c.SetBlock(lx, y, lz, StateStone)
+			c.SetBlock(lx, y+1, lz, StateWater)
+		}
+	}
+	c.SetBlock(0, y+2, 0, stairs)
+
+	si := (y - MinY) >> 4
+	nonEmpty, fluid := sectionCounts(c.sections[si])
+	if want := uint16(16*16*2 + 1); nonEmpty != want {
+		t.Errorf("nonEmptyBlockCount = %d, want %d", nonEmpty, want)
+	}
+	if want := uint16(16*16 + 1); fluid != want {
+		t.Errorf("fluidCount = %d, want %d (256 water + 1 waterlogged)", fluid, want)
+	}
+
+	// A section of dry stone still reports zero, and an absent section too.
+	dry := NewChunk(0, 0, BiomePlains)
+	dry.SetBlock(0, y, 0, StateStone)
+	if _, fluid := sectionCounts(dry.sections[si]); fluid != 0 {
+		t.Errorf("dry section fluidCount = %d, want 0", fluid)
+	}
+}
