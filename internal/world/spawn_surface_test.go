@@ -25,7 +25,7 @@ func TestSafeSpawnYRejectsUnderwaterColumn(t *testing.T) {
 }
 
 func TestSafeSpawnYAcceptsNonOpaqueSolidFloor(t *testing.T) {
-	stairs := nameToStateID("minecraft:oak_stairs", nil)
+	stairs, _ := nameToStateID("minecraft:oak_stairs", nil)
 	if stairs == StateAir {
 		t.Fatal("oak stairs state is unavailable")
 	}

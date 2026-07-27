@@ -143,7 +143,7 @@ func TestStoreLightRoundTrip(t *testing.T) {
 	if _, err := cache.FrameErr(1, 0); err != nil {
 		t.Fatal(err)
 	}
-	glowstone := nameToStateID("minecraft:glowstone", nil)
+	glowstone, _ := nameToStateID("minecraft:glowstone", nil)
 	if valid, _ := cache.SetBlockWithLight(15, 0, 8, glowstone); !valid {
 		t.Fatal("glowstone edit rejected")
 	}
@@ -191,7 +191,7 @@ func TestCacheReconcilesPersistedLightWithLoadedNeighbor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	glowstone := nameToStateID("minecraft:glowstone", nil)
+	glowstone, _ := nameToStateID("minecraft:glowstone", nil)
 	left := NewChunk(0, 0, BiomePlains)
 	left.SetBlock(15, 100, 8, glowstone)
 	if err := store.SaveChunk(left); err != nil {

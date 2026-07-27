@@ -14,8 +14,8 @@ func TestHeightmapsDiffer(t *testing.T) {
 	c := NewChunk(0, 0, BiomePlains)
 	const floor = 64
 
-	dandelion := nameToStateID("minecraft:dandelion", nil)
-	if dandelion == StateAir {
+	dandelion, ok := nameToStateID("minecraft:dandelion", nil)
+	if !ok {
 		t.Fatal("dandelion is missing from the block table")
 	}
 	for lx := 0; lx < 16; lx++ {
@@ -96,8 +96,8 @@ func TestBlockStatePredicates(t *testing.T) {
 		}
 	}
 	// A flower is the case that separates WORLD_SURFACE from MOTION_BLOCKING.
-	dandelion := nameToStateID("minecraft:dandelion", nil)
-	if dandelion == StateAir {
+	dandelion, ok := nameToStateID("minecraft:dandelion", nil)
+	if !ok {
 		t.Fatal("dandelion is missing from the block table")
 	}
 	if blocksMotionOrFluid(dandelion) {
@@ -113,11 +113,9 @@ func TestSectionFluidCount(t *testing.T) {
 	const y = 20
 	// One section: stone floor, water above it, and one waterlogged block —
 	// which counts as fluid even though it is not a fluid block.
-	stairs := nameToStateID("minecraft:oak_stairs", map[string]string{
-		"facing": "north", "half": "bottom", "shape": "straight", "waterlogged": "true",
-	})
-	if stairs == StateAir {
-		t.Fatal("waterlogged oak stairs are missing from the block table")
+	stairs, ok := nameToStateID("minecraft:oak_stairs", map[string]string{"waterlogged": "true"})
+	if !ok {
+		t.Fatal("oak stairs are missing from the block table")
 	}
 	if stateFlags(stairs)&flagFluid == 0 {
 		t.Fatal("waterlogged stairs do not carry the fluid flag; the dump is wrong")

@@ -26,7 +26,7 @@ func TestIncrementalBlockLightAgainstVanillaFixture(t *testing.T) {
 			cache.chunkAt(cx, cz)
 		}
 	}
-	glowstone := nameToStateID("minecraft:glowstone", nil)
+	glowstone, _ := nameToStateID("minecraft:glowstone", nil)
 	if valid, _ := cache.SetBlockWithLight(15, 100, 8, glowstone); !valid {
 		t.Fatal("glowstone edit rejected")
 	}
@@ -67,7 +67,7 @@ func TestIncrementalBlockLightCrossesChunkBoundaryAndClears(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	glowstone := nameToStateID("minecraft:glowstone", nil)
+	glowstone, _ := nameToStateID("minecraft:glowstone", nil)
 	if emission := lightEmission(glowstone); emission != 15 {
 		t.Fatalf("glowstone emission = %d, want 15", emission)
 	}

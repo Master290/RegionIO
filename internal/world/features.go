@@ -38,8 +38,8 @@ var oreSpecs = []oreSpec{
 // are untouched.
 func placeOres(c *Chunk, r *chunkRand) {
 	for _, spec := range oreSpecs {
-		ore := nameToStateID(spec.name, nil)
-		if ore == StateAir {
+		ore, ok := nameToStateID(spec.name, nil)
+		if !ok {
 			continue // unknown block name; skip defensively
 		}
 		for a := 0; a < spec.attempts; a++ {
@@ -88,12 +88,12 @@ func placeOreBlob(c *Chunk, ore uint16, n int, lx, y, lz int, r *chunkRand) {
 // biomeFlowers maps a biome name to the flower blocks that can spawn on its
 // grassy surface. Empty/absent = no flowers. Names resolve to IDs at runtime.
 var biomeFlowers = map[string][]string{
-	"minecraft:plains":          {"minecraft:dandelion", "minecraft:poppy", "minecraft:azure_bluet", "minecraft:cornflower", "minecraft:oxeye_daisy"},
+	"minecraft:plains":           {"minecraft:dandelion", "minecraft:poppy", "minecraft:azure_bluet", "minecraft:cornflower", "minecraft:oxeye_daisy"},
 	"minecraft:sunflower_plains": {"minecraft:dandelion", "minecraft:poppy", "minecraft:sunflower"},
-	"minecraft:forest":          {"minecraft:dandelion", "minecraft:poppy", "minecraft:lily_of_the_valley"},
-	"minecraft:flower_forest":   {"minecraft:dandelion", "minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet", "minecraft:red_tulip", "minecraft:white_tulip", "minecraft:oxeye_daisy", "minecraft:cornflower"},
-	"minecraft:birch_forest":    {"minecraft:dandelion", "minecraft:poppy"},
-	"minecraft:meadow":          {"minecraft:dandelion", "minecraft:poppy", "minecraft:cornflower", "minecraft:allium"},
+	"minecraft:forest":           {"minecraft:dandelion", "minecraft:poppy", "minecraft:lily_of_the_valley"},
+	"minecraft:flower_forest":    {"minecraft:dandelion", "minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet", "minecraft:red_tulip", "minecraft:white_tulip", "minecraft:oxeye_daisy", "minecraft:cornflower"},
+	"minecraft:birch_forest":     {"minecraft:dandelion", "minecraft:poppy"},
+	"minecraft:meadow":           {"minecraft:dandelion", "minecraft:poppy", "minecraft:cornflower", "minecraft:allium"},
 }
 
 // placeFlora scatters biome-appropriate small plants on grassy surface columns.
@@ -117,8 +117,7 @@ func placeFlora(c *Chunk, r *chunkRand, surfTop *[16][16]int, grass *[16][16]boo
 			if c.GetBlock(lx, y, lz) != StateAir {
 				continue
 			}
-			flower := nameToStateID(flowers[int(r.next())%len(flowers)], nil)
-			if flower != StateAir {
+			if flower, ok := nameToStateID(flowers[int(r.next())%len(flowers)], nil); ok {
 				c.SetBlock(lx, y, lz, flower)
 			}
 		}
@@ -155,8 +154,8 @@ func placeDesertFeatures(c *Chunk, r *chunkRand, surfTop *[16][16]int, biomeName
 
 // placeCactus writes a 1-3 tall cactus column on top of the surface.
 func placeCactus(c *Chunk, lx, baseY, lz int, r *chunkRand) {
-	cactus := nameToStateID("minecraft:cactus", nil)
-	if cactus == StateAir {
+	cactus, ok := nameToStateID("minecraft:cactus", nil)
+	if !ok {
 		return
 	}
 	h := 1 + int(r.next()%3)
@@ -167,8 +166,8 @@ func placeCactus(c *Chunk, lx, baseY, lz int, r *chunkRand) {
 
 // placeDeadBush writes a single dead_bush on the surface.
 func placeDeadBush(c *Chunk, lx, baseY, lz int) {
-	db := nameToStateID("minecraft:dead_bush", nil)
-	if db == StateAir {
+	db, ok := nameToStateID("minecraft:dead_bush", nil)
+	if !ok {
 		return
 	}
 	c.SetBlock(lx, baseY, lz, db)
@@ -200,8 +199,8 @@ func placeRocks(c *Chunk, r *chunkRand, surfTop *[16][16]int, grass *[16][16]boo
 // placeBoulder writes a small 2-3 block cluster of stone-family blocks.
 func placeBoulder(c *Chunk, lx, baseY, lz int, r *chunkRand) {
 	rocks := []string{"minecraft:cobblestone", "minecraft:granite", "minecraft:diorite", "minecraft:andesite"}
-	block := nameToStateID(rocks[int(r.next())%len(rocks)], nil)
-	if block == StateAir {
+	block, ok := nameToStateID(rocks[int(r.next())%len(rocks)], nil)
+	if !ok {
 		return
 	}
 	n := 2 + int(r.next()%2)

@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"math"
 	"os"
-	"strings"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -33,10 +33,18 @@ func TestVanillaParity(t *testing.T) {
 			ourY := int(oh[idx]) - 65
 			d := int(math.Abs(float64(ourY - vh[idx])))
 			total++
-			if d == 0 { exact++ }
-			if d <= 1 { within1++ }
-			if d <= 3 { within3++ }
-			if d > maxDiff { maxDiff = d }
+			if d == 0 {
+				exact++
+			}
+			if d <= 1 {
+				within1++
+			}
+			if d <= 3 {
+				within3++
+			}
+			if d > maxDiff {
+				maxDiff = d
+			}
 		}
 	}
 	pct := func(n int) float64 { return 100 * float64(n) / float64(total) }

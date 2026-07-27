@@ -32,7 +32,7 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-const generatorVersion = 7
+const generatorVersion = 8
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.
@@ -565,7 +565,9 @@ func readBlockStates(c *Chunk, si int, sc *nbt.Compound) {
 		}
 		name := string(nbtAsString(ec, "Name"))
 		props := readProps(ec)
-		ids[i] = nameToStateID(name, props)
+		// An unknown block name decodes to air rather than to a neighbour's
+		// state; that loses the block but does not corrupt the column.
+		ids[i], _ = nameToStateID(name, props)
 	}
 	c.section(si) // ensure allocated
 	s := c.sections[si]

@@ -2,8 +2,8 @@ package world
 
 import (
 	"fmt"
-	"testing"
 	"regionio/internal/worldgen"
+	"testing"
 )
 
 func TestTerrainHeightProfile(t *testing.T) {
@@ -19,8 +19,12 @@ func TestTerrainHeightProfile(t *testing.T) {
 			}
 		}
 		line += fmt.Sprintf("%d ", top)
-		if top < minH { minH = top }
-		if top > maxH { maxH = top }
+		if top < minH {
+			minH = top
+		}
+		if top > maxH {
+			maxH = top
+		}
 	}
 	t.Logf("surface heights (z=8): %s", line)
 	t.Logf("min=%d max=%d range=%d", minH, maxH, maxH-minH)

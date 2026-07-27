@@ -48,7 +48,7 @@ func centreSurfaceBlock(ch *Chunk) (uint16, bool) {
 			st := s[blockIndex(8, MinY+i*16+ly, 8)]
 			if st != StateAir && st != StateWater {
 				// Dry only if this top block is at/above sea level.
-				return st, (MinY+i*16+ly) >= SeaLevel
+				return st, (MinY + i*16 + ly) >= SeaLevel
 			}
 		}
 	}

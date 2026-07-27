@@ -49,8 +49,8 @@ func TestCaveBiomesPresent(t *testing.T) {
 
 	tbl := loadBiomeTable()
 	for _, c := range []struct {
-		name     string
-		point    worldgen.TargetPoint
+		name  string
+		point worldgen.TargetPoint
 	}{
 		{"minecraft:lush_caves", lush},
 		{"minecraft:dripstone_caves", drip},

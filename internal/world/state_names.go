@@ -3,6 +3,7 @@ package world
 import (
 	_ "embed"
 	"encoding/json"
+	"sort"
 	"strings"
 	"sync"
 
@@ -27,6 +28,7 @@ var (
 	stateByIDOnce sync.Once
 	stateByIDImpl map[uint16]stateName
 	idsByName     map[string][]uint16
+	defaultByName map[string]uint16
 )
 
 // stateByID returns the named form of a block-state ID, building the lookup
@@ -79,6 +81,7 @@ func buildStateTable() {
 	var blocks map[string]struct {
 		States []struct {
 			ID         int               `json:"id"`
+			Default    bool              `json:"default"`
 			Properties map[string]string `json:"properties"`
 		} `json:"states"`
 	}
@@ -87,6 +90,7 @@ func buildStateTable() {
 	}
 	stateByIDImpl = make(map[uint16]stateName, 30000)
 	idsByName = make(map[string][]uint16, len(blocks))
+	defaultByName = make(map[string]uint16, len(blocks))
 	for name, b := range blocks {
 		for _, s := range b.States {
 			if s.ID < 0 || s.ID > 65535 {
@@ -95,12 +99,20 @@ func buildStateTable() {
 			id := uint16(s.ID)
 			stateByIDImpl[id] = stateName{Name: name, Properties: s.Properties}
 			idsByName[name] = append(idsByName[name], id)
+			if s.Default {
+				defaultByName[name] = id
+			}
 		}
 	}
 }
 
 // blockPaletteEntry builds the NBT compound for a block-state ID: {Name,
 // Properties} (Properties omitted when empty). Unknown IDs map to air.
+//
+// Property keys are sorted. nbt.Compound preserves insertion order so that
+// encoding is deterministic, but ranging a Go map is not: the same chunk saved
+// twice produced different region-file bytes for every block with more than one
+// property, which makes a byte-level diff of two saves useless.
 func blockPaletteEntry(id uint16) *nbt.Compound {
 	s, ok := stateByID(id)
 	if !ok {
@@ -108,9 +120,14 @@ func blockPaletteEntry(id uint16) *nbt.Compound {
 	}
 	c := nbt.NewCompound().Set("Name", nbt.String(s.Name))
 	if len(s.Properties) > 0 {
+		keys := make([]string, 0, len(s.Properties))
+		for k := range s.Properties {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
 		props := nbt.NewCompound()
-		for k, v := range s.Properties {
-			props.Set(k, nbt.String(v))
+		for _, k := range keys {
+			props.Set(k, nbt.String(s.Properties[k]))
 		}
 		c.Set("Properties", props)
 	}
@@ -124,21 +141,47 @@ type paletteEntryKey struct {
 	sig  string
 }
 
-// nameToStateID returns the block-state ID for a (name, properties) pair from
-// the loaded table. It is used when decoding on-disk chunk NBT back into a
-// Chunk. Unknown names/properties map to air (0).
-func nameToStateID(name string, props map[string]string) uint16 {
+// nameToStateID resolves a block name plus any properties to a state ID,
+// mirroring how vanilla reads a palette entry: start from the block's default
+// state and apply the properties it recognises, keeping the default's value for
+// anything it does not.
+//
+// It used to return the block's *first* state — blocks.json lists states in
+// StateDefinition.getPossibleStates() order, the property cartesian product,
+// which has nothing to do with the default. For 642 of 1168 blocks those
+// differ, so every caller passing nil got a corner state: redstone ore came out
+// permanently lit, a sunflower came out as its own top half, oak stairs came out
+// upside down and waterlogged. blocks.json marks the default state and the
+// parser was dropping the flag.
+//
+// ok is false only for a name that is not a block at all.
+func nameToStateID(name string, props map[string]string) (uint16, bool) {
 	stateByIDOnce.Do(buildStateTable)
-	ids := idsByName[name]
-	for _, id := range ids {
-		if propsMatch(stateByIDImpl[id].Properties, props) {
-			return id
+	defaultID, ok := defaultByName[name]
+	if !ok {
+		return StateAir, false
+	}
+	if len(props) == 0 {
+		return defaultID, true
+	}
+	// Overlay only keys the block actually has; an unknown key or an illegal
+	// value leaves the default's value in place, which is what
+	// StateHolder.setValue's helper does after logging.
+	base := stateByIDImpl[defaultID].Properties
+	merged := make(map[string]string, len(base))
+	for k, v := range base {
+		if override, present := props[k]; present {
+			merged[k] = override
+			continue
+		}
+		merged[k] = v
+	}
+	for _, id := range idsByName[name] {
+		if propsMatch(stateByIDImpl[id].Properties, merged) {
+			return id, true
 		}
 	}
-	if len(ids) > 0 {
-		return ids[0]
-	}
-	return StateAir
+	return defaultID, true
 }
 
 func propsMatch(a, b map[string]string) bool {
