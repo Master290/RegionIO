@@ -12,8 +12,8 @@ import (
 )
 
 // store.go is the persistence layer between the in-memory Chunk model and the
-// on-disk Anvil region files. It converts a Chunk to/from the "Level"-nested
-// chunk NBT (26.1.2: per-section block_states/biomes, heightmaps, yPos) and
+// on-disk Anvil region files. It converts a Chunk to/from vanilla's chunk NBT
+// (26.1.2: flat root, per-section block_states/biomes, heightmaps, yPos) and
 // routes the compressed NBT through RegionFile.
 //
 // The store keeps one RegionFile per region (32×32 chunks), opened lazily and
@@ -32,7 +32,7 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-const generatorVersion = 8
+const generatorVersion = 9
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.
@@ -284,11 +284,19 @@ func (s *Store) Close() error {
 	return firstErr
 }
 
-// chunkToNBT builds the Level-nested on-disk NBT for a chunk. The wire Encode()
-// format is not reusable here: disk uses named palettes and the 26.1.2 Level
-// layout with per-section biomes.
+// chunkToNBT builds the on-disk NBT for a chunk. The wire Encode() format is
+// not reusable here: disk uses named palettes and per-section biomes.
+//
+// The layout is vanilla Anvil, flat at the root. It used to nest everything
+// under a "Level" compound, which is where chunk data lived until 1.18 and
+// where SerializableChunkData has not looked since — so nothing outside this
+// package could read our region files, and we could not read a world the
+// official server generated. That last part is what the surface-height parity
+// capture needs.
 func chunkToNBT(c *Chunk) *nbt.Compound {
-	level := nbt.NewCompound().
+	root := nbt.NewCompound().
+		Set("DataVersion", nbt.Int(dataVersion26)).
+		Set(generatorVersionTag, nbt.Int(generatorVersion)).
 		Set("xPos", nbt.Int(c.X)).
 		Set("zPos", nbt.Int(c.Z)).
 		Set("yPos", nbt.Int(int32(minYSection))).
@@ -296,7 +304,7 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 		Set("LastUpdate", nbt.Long(0)).
 		Set("InhabitedTime", nbt.Long(0))
 	if c.lightReady {
-		level.Set("isLightOn", nbt.Byte(1))
+		root.Set("isLightOn", nbt.Byte(1))
 	}
 
 	// Sections: one compound per vertical section, including empty ones so the
@@ -306,17 +314,14 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 	for si := 0; si < SectionCount; si++ {
 		sections.Elems = append(sections.Elems, sectionToNBT(c, si))
 	}
-	level.Set("sections", sections)
+	root.Set("sections", sections)
 
-	level.Set("Heightmaps", buildHeightmaps(c))
+	root.Set("Heightmaps", buildHeightmaps(c))
 	// Required-but-empty fields so vanilla loads the chunk without complaints.
-	level.Set("block_entities", nbt.List{ElemID: nbt.TagCompound})
-	level.Set("structures", nbt.NewCompound())
+	root.Set("block_entities", nbt.List{ElemID: nbt.TagCompound})
+	root.Set("structures", nbt.NewCompound())
 
-	return nbt.NewCompound().
-		Set("DataVersion", nbt.Int(dataVersion26)).
-		Set(generatorVersionTag, nbt.Int(generatorVersion)).
-		Set("Level", level)
+	return root
 }
 
 // sectionToNBT builds one section compound: Y + block_states + biomes. Palettes
@@ -324,7 +329,9 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 // reads as "the whole section is this one entry".
 func sectionToNBT(c *Chunk, si int) *nbt.Compound {
 	yIdx := int32(si + minYSection)
-	sec := nbt.NewCompound().Set("Y", nbt.Int(yIdx))
+	// Vanilla writes Y as a byte and reads it with getByteOr; an Int here makes
+	// every section decode as index 0 on the other side.
+	sec := nbt.NewCompound().Set("Y", nbt.Byte(int8(yIdx)))
 
 	// Block states: build a palette of distinct IDs in the section, then a packed
 	// long array of indices (only when more than one distinct value).
@@ -346,8 +353,8 @@ func sectionToNBT(c *Chunk, si int) *nbt.Compound {
 			palList.Elems = append(palList.Elems, blockPaletteEntry(id))
 		}
 		blockStates.Set("palette", palList)
-		if len(palette) > 1 {
-			blockStates.Set("data", packIndices(s[:], indexOf))
+		if bits := blockStorageBits(len(palette)); bits > 0 {
+			blockStates.Set("data", packIndices(s[:], indexOf, bits))
 		}
 	} else {
 		// Empty section → air palette, no data.
@@ -377,8 +384,8 @@ func sectionToNBT(c *Chunk, si int) *nbt.Compound {
 		biomePalList.Elems = append(biomePalList.Elems, nbt.String(biomeNameByID(id)))
 	}
 	biomes.Set("palette", biomePalList)
-	if c.biomes[si] != nil && len(biomePalette) > 1 {
-		biomes.Set("data", packIndices(c.biomes[si][:], biomeIndexOf))
+	if bits := biomeStorageBits(len(biomePalette)); c.biomes[si] != nil && bits > 0 {
+		biomes.Set("data", packIndices(c.biomes[si][:], biomeIndexOf, bits))
 	}
 	sec.Set("biomes", biomes)
 	if c.lightReady {
@@ -434,18 +441,33 @@ func topNonAirY(c *Chunk, x, z int) int {
 	return MinY - 1
 }
 
-// packIndices packs a slice of IDs into a long array using the minimum bit width
-// for the palette size, mirroring the network paletted-container packing (no
-// value spans a long boundary in vanilla's chunk NBT).
-func packIndices(ids []uint16, indexOf map[uint16]int) nbt.LongArray {
-	bits := bitsFor(len(indexOf))
+// blockStorageBits is Strategy$1.getConfigurationForPaletteSize(...).bitsInStorage()
+// for a block palette: nothing at all for a single entry, and never fewer than
+// four bits otherwise. Vanilla's tableswitch sends bit counts 1 through 4 all to
+// the same four-bit linear configuration, so a palette of 2..16 states is stored
+// four bits wide even though two would fit. Packing it tighter, as we did,
+// produces a long array of the wrong length and vanilla refuses the section.
+func blockStorageBits(paletteSize int) int {
+	bits := bitsFor(paletteSize)
+	if bits > 0 && bits < 4 {
+		return 4
+	}
+	return bits
+}
+
+// biomeStorageBits is the same for a biome palette, where Strategy$2 has no
+// floor: the width really is ceil(log2(size)), and a Global configuration above
+// three bits still stores palette indices, just at its own width.
+func biomeStorageBits(paletteSize int) int { return bitsFor(paletteSize) }
+
+// packIndices packs a slice of IDs into a long array at the given bit width,
+// with no value spanning a long boundary — vanilla's SimpleBitStorage layout.
+// A width of zero means the container carries no data array at all.
+func packIndices(ids []uint16, indexOf map[uint16]int, bits int) nbt.LongArray {
 	if bits < 1 {
-		bits = 1
+		return nil
 	}
 	perLong := 64 / bits
-	if perLong == 0 {
-		perLong = 1
-	}
 	numLongs := (len(ids) + perLong - 1) / perLong
 	longs := make(nbt.LongArray, numLongs)
 	for i, id := range ids {
@@ -471,16 +493,8 @@ func nbtToChunk(root *nbt.Compound, regionX, regionZ, localX, localZ int) (*Chun
 		return nil, ErrChunkNotFound
 	}
 
-	levelTag, ok := root.Get("Level")
-	if !ok {
-		return nil, fmt.Errorf("world: chunk NBT missing Level")
-	}
-	level, ok := levelTag.(*nbt.Compound)
-	if !ok {
-		return nil, fmt.Errorf("world: Level is not a compound")
-	}
-	cx := int32(nbtAsInt(level, "xPos"))
-	cz := int32(nbtAsInt(level, "zPos"))
+	cx := int32(nbtAsInt(root, "xPos"))
+	cz := int32(nbtAsInt(root, "zPos"))
 	wantX := int32(regionX*32 + localX)
 	wantZ := int32(regionZ*32 + localZ)
 	if cx != wantX || cz != wantZ {
@@ -488,21 +502,24 @@ func nbtToChunk(root *nbt.Compound, regionX, regionZ, localX, localZ int) (*Chun
 	}
 
 	c := &Chunk{X: cx, Z: cz, biome: BiomePlains}
-	if lightTag, ok := level.Get("isLightOn"); ok {
+	if lightTag, ok := root.Get("isLightOn"); ok {
 		if enabled, ok := lightTag.(nbt.Byte); ok && enabled != 0 {
 			c.lightReady = true
 		}
 	}
 
 	// Sections.
-	if secTag, ok := level.Get("sections"); ok {
+	if secTag, ok := root.Get("sections"); ok {
 		if secList, ok := secTag.(nbt.List); ok && secList.ElemID == nbt.TagCompound {
 			for _, st := range secList.Elems {
 				sc, ok := st.(*nbt.Compound)
 				if !ok {
 					continue
 				}
-				yIdx := int(nbtAsInt(sc, "Y"))
+				yIdx, ok := nbtAsSectionY(sc, "Y")
+				if !ok {
+					continue
+				}
 				si := yIdx - minYSection
 				if si < 0 || si >= SectionCount {
 					continue
@@ -581,7 +598,7 @@ func readBlockStates(c *Chunk, si int, sc *nbt.Compound) {
 	}
 	if dataTag, ok := bs.Get("data"); ok {
 		if data, ok := dataTag.(nbt.LongArray); ok {
-			unpackIndices(s[:], ids, data)
+			unpackIndices(s[:], ids, data, blockStorageBits(len(ids)))
 		}
 	}
 }
@@ -619,7 +636,7 @@ func readBiomes(c *Chunk, si int, sc *nbt.Compound) {
 	if dataTag, ok := bc.Get("data"); ok {
 		if data, ok := dataTag.(nbt.LongArray); ok {
 			cells := new([biomeCellsPerSection]uint16)
-			unpackIndices(cells[:], ids, data)
+			unpackIndices(cells[:], ids, data, biomeStorageBits(len(ids)))
 			c.biomes[si] = cells
 		}
 	}
@@ -653,6 +670,26 @@ func nbtAsInt(c *nbt.Compound, name string) int32 {
 	return 0
 }
 
+// nbtAsSectionY reads a section index, which vanilla writes as a byte. It also
+// accepts a short or an int so a chunk written before we matched vanilla still
+// decodes, and reports whether the tag was there at all — a section with no Y
+// is not section 0, it is malformed.
+func nbtAsSectionY(c *nbt.Compound, name string) (int, bool) {
+	t, ok := c.Get(name)
+	if !ok {
+		return 0, false
+	}
+	switch v := t.(type) {
+	case nbt.Byte:
+		return int(int8(v)), true
+	case nbt.Short:
+		return int(int16(v)), true
+	case nbt.Int:
+		return int(int32(v)), true
+	}
+	return 0, false
+}
+
 func nbtAsString(c *nbt.Compound, name string) nbt.String {
 	if t, ok := c.Get(name); ok {
 		if v, ok := t.(nbt.String); ok {
@@ -664,15 +701,11 @@ func nbtAsString(c *nbt.Compound, name string) nbt.String {
 
 // unpackIndices reverses packIndices: fills dst with palette IDs using the
 // packed long array.
-func unpackIndices(dst []uint16, ids []uint16, data nbt.LongArray) {
-	bits := bitsFor(len(ids))
+func unpackIndices(dst []uint16, ids []uint16, data nbt.LongArray, bits int) {
 	if bits < 1 {
-		bits = 1
+		return
 	}
 	perLong := 64 / bits
-	if perLong == 0 {
-		perLong = 1
-	}
 	mask := int64(1)<<uint(bits) - 1
 	for i := range dst {
 		longIdx := i / perLong

@@ -73,9 +73,16 @@ java -cp "<out>;$CP" VanillaBlockStateDump > internal/world/block_properties.bin
 
 The 39 jars under `libraries/` are required; the server jar alone will not boot the registry. Bump
 the format version in both the Java and `internal/world/block_properties.go` whenever the layout or
-a flag's meaning changes. Substring-matching block names is how the light table was wrong before
-(`grass_block` matched "grass", `bedrock` matched "bed"); don't reintroduce that shape of guess
-anywhere.
+a flag's meaning changes.
+
+The same trick verifies output, not just constants. `tools/VanillaChunkFormatCheck.java` opens a
+region file we wrote with vanilla's own `RegionFile`, `NbtIo`, `Strategy` and `SimpleBitStorage` and
+fails if the root is not flat, a section `Y` is not a byte, or a palette array is not the width
+vanilla derives from its palette size. Note the server jar is *signed*, so a helper cannot be
+declared inside a `net.minecraft.*` package — reach protected members by reflection instead.
+
+Substring-matching block names is how the light table was wrong before (`grass_block` matched
+"grass", `bedrock` matched "bed"); don't reintroduce that shape of guess anywhere.
 
 ## Layout
 
