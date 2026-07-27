@@ -31,12 +31,13 @@ func NewVanillaGenerator(seed int64) Generator {
 		panic("world: loading overworld density: " + err.Error())
 	}
 	fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
+	veins := worldgen.NewOreVeinifier(od)
 	return func(cx, cz int32) *Chunk {
-		return generateVanilla(od, fluidPicker, seed, cx, cz)
+		return generateVanilla(od, fluidPicker, veins, seed, cx, cz)
 	}
 }
 
-func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, seed int64, cx, cz int32) *Chunk {
+func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, seed int64, cx, cz int32) *Chunk {
 	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
@@ -108,7 +109,7 @@ func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPi
 			interp := make([]float64, len(od.Interpolated))
 			for lz := 0; lz < 16; lz++ {
 				surfTop[lx][lz], worldSurface[lx][lz], grass[lx][lz] =
-					fillVanillaColumn(od, aq, fluidPicker, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
+					fillVanillaColumn(od, aq, fluidPicker, veins, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
 			}
 		}(lx)
 	}
@@ -189,7 +190,7 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.
 // then does the surface rule tree walk the finished column. Doing it the other
 // way round is what forced the old unconditional "flood everything under sea
 // level" pass, which left every cave below y=63 underwater.
-func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int, grass bool) {
+func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int, grass bool) {
 	cx0 := lx / cellWidth
 	cz0 := lz / cellWidth
 	fx := float64(lx%cellWidth) / cellWidth
@@ -205,9 +206,9 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 		y := MinY + i
 		ctx := worldgen.FunctionContext{X: float64(wx), Y: float64(y), Z: float64(wz)}.WithInterp(interp)
 		density := od.Final.Compute(ctx)
-		state, isDefaultBlock := substance(aq, fluidPicker, wx, y, wz, density)
+		state, solid := substance(aq, fluidPicker, veins, ctx, wx, y, wz, density)
 		out[i] = state
-		if isDefaultBlock {
+		if solid {
 			top = i
 		}
 		if state != StateAir {
@@ -239,23 +240,35 @@ func steepAt(worldSurface *[16][16]int, lx, lz int) bool {
 	return worldSurface[west][lz] >= worldSurface[east][lz]+4
 }
 
-// substance resolves one position to the block the terrain pass leaves behind:
-// the default block where the density is solid, otherwise whatever the aquifer
-// puts there — air, water or lava. The second result says which of the two
-// happened, so the caller can track the top solid block without re-testing.
-func substance(aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, x, y, z int, density float64) (state uint16, isDefaultBlock bool) {
+// substance resolves one position to the block the terrain pass leaves behind,
+// mirroring vanilla's MaterialRuleList: the aquifer answers first and, where it
+// says the position is solid rock, the ore veinifier gets a turn before the
+// default block is used. The second result says whether the position ended up
+// solid, so the caller can track the top solid block without re-testing.
+func substance(aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, ctx worldgen.FunctionContext, x, y, z int, density float64) (state uint16, solid bool) {
 	if aq == nil {
 		// aquifers_enabled=false: Aquifer.createDisabled, the global fluid rule
 		// with no cells and no barriers.
 		if density > 0 {
-			return StateStone, true
+			return veinOrDefault(veins, ctx, x, y, z), true
 		}
 		return fluidPicker(x, y, z).At(y), false
 	}
 	if s, ok := aq.ComputeSubstance(x, y, z, density); ok {
 		return s, false
 	}
-	return StateStone, true
+	return veinOrDefault(veins, ctx, x, y, z), true
+}
+
+// veinOrDefault is the tail of the rule list: an ore vein if one reaches here,
+// otherwise the settings' default block.
+func veinOrDefault(veins *worldgen.OreVeinifier, ctx worldgen.FunctionContext, x, y, z int) uint16 {
+	if veins != nil {
+		if s, ok := veins.Calculate(ctx, x, y, z); ok {
+			return s
+		}
+	}
+	return StateStone
 }
 
 // applySurfaceRule walks the finished column from the top down, applying the

@@ -50,8 +50,10 @@ type OverworldDensity struct {
 	AquifersEnabled bool
 	OreVeinsEnabled bool
 
-	// AquiferRandom places the aquifer cell centres.
+	// AquiferRandom places the aquifer cell centres; OreRandom rolls the
+	// per-position ore-vein draws.
 	AquiferRandom PositionalRandomFactory
+	OreRandom     PositionalRandomFactory
 
 	// Surface samples the noises SurfaceSystem reads per column, before the
 	// rule tree runs.
@@ -103,6 +105,7 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 		AquifersEnabled: settings.AquifersEnabled,
 		OreVeinsEnabled: settings.OreVeinsEnabled,
 		AquiferRandom:   l.rs.AquiferRandom(),
+		OreRandom:       l.rs.OreRandom(),
 		prelim:          newLevelCache(),
 	}
 
