@@ -25,7 +25,7 @@ const (
 // hands chunk streaming off to the background streamer. The streamer stops when
 // h.ctx (the connection lifetime context) is cancelled.
 func (h *handler) beginPlay() error {
-	session, err := h.srv.RegisterPlayer(h.conn.Profile, h.conn.Send)
+	session, err := h.srv.RegisterPlayer(h.conn.Profile, h.conn.Enqueue)
 	if err != nil {
 		return err
 	}
