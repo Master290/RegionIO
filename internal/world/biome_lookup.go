@@ -102,8 +102,8 @@ func makeBiomeParameter(e rawParameter, depth worldgen.ClimateRange) worldgen.Bi
 			qr(e.Param.Humidity),
 			qr(e.Param.Continentalness),
 			qr(e.Param.Erosion),
-			qr(e.Param.Weirdness),
 			depth,
+			qr(e.Param.Weirdness),
 		},
 		Offset: worldgen.Quantize(e.Param.Offset),
 	}

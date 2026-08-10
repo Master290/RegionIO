@@ -48,6 +48,32 @@ func TestParameterTableDistanceOffsetAndTies(t *testing.T) {
 	}
 }
 
+func TestFitnessVectorsAgainstVanillaRuntime(t *testing.T) {
+	zero := [AxisCount]ClimateRange{}
+	temperatureRange := zero
+	temperatureRange[0] = ClimateRange{Min: 0, Max: 10}
+	depthWeirdness := zero
+	depthWeirdness[4] = ClimateRange{Min: 20, Max: 20}
+	depthWeirdness[5] = ClimateRange{Min: 30, Max: 30}
+	for _, vector := range []struct {
+		name   string
+		point  TargetPoint
+		ranges [AxisCount]ClimateRange
+		offset int64
+		want   int64
+	}{
+		{"inside", TargetPoint{Temperature: 5}, temperatureRange, 0, 0},
+		{"below", TargetPoint{Temperature: -3}, temperatureRange, 0, 9},
+		{"above", TargetPoint{Temperature: 14}, temperatureRange, 0, 16},
+		{"offset", TargetPoint{Temperature: 5}, temperatureRange, 7, 49},
+		{"depth-weirdness-order", TargetPoint{Depth: 23, Weirdness: 35}, depthWeirdness, 0, 34},
+	} {
+		if got := fitDistance(vector.point, vector.ranges, vector.offset); got != vector.want {
+			t.Errorf("%s fitness = %d, want vanilla runtime %d", vector.name, got, vector.want)
+		}
+	}
+}
+
 // TestFitDistanceZero confirms identical points are zero-distance and distinct
 // points are positive; the exact value is not asserted to stay robust to
 // representation choices.
@@ -75,6 +101,21 @@ func TestRangeContains(t *testing.T) {
 	}
 	if !r.contains(50) {
 		t.Error("interior should contain")
+	}
+}
+
+func TestContainsAllUsesVanillaAxisOrder(t *testing.T) {
+	var ranges [AxisCount]ClimateRange
+	for i := range ranges {
+		ranges[i] = ClimateRange{Min: 0, Max: 0}
+	}
+	ranges[4] = ClimateRange{Min: 20, Max: 20}
+	ranges[5] = ClimateRange{Min: 30, Max: 30}
+	if !containsAll(ranges, TargetPoint{Depth: 20, Weirdness: 30}) {
+		t.Fatal("depth/weirdness ranges were not matched in vanilla order")
+	}
+	if containsAll(ranges, TargetPoint{Depth: 30, Weirdness: 20}) {
+		t.Fatal("accepted swapped depth/weirdness axes")
 	}
 }
 

@@ -4,7 +4,7 @@ import "math"
 
 // This file reproduces net.minecraft.world.level.biome.Climate, the multi-noise
 // biome selector. A point in climate space is six quantized coordinates
-// (temperature, humidity, continentalness, erosion, weirdness, depth); the
+// (temperature, humidity, continentalness, erosion, depth, weirdness); the
 // finder returns the biome whose parameter range is closest to the point by the
 // vanilla fitDistance metric.
 //
@@ -23,13 +23,13 @@ func quantize(v float64) int64 {
 func Quantize(v float64) int64 { return quantize(v) }
 
 // AxisCount is the number of climate coordinates (temperature, humidity,
-// continentalness, erosion, weirdness, depth).
+// continentalness, erosion, depth, weirdness).
 const AxisCount = 6
 
 // TargetPoint is a fully-specified climate point: the value the biome finder
 // tries to match against parameter ranges. Fields are pre-quantized longs.
 type TargetPoint struct {
-	Temperature, Humidity, Continentalness, Erosion, Weirdness, Depth int64
+	Temperature, Humidity, Continentalness, Erosion, Depth, Weirdness int64
 }
 
 // NewTargetPoint quantizes six float climate coordinates into a TargetPoint.
@@ -39,15 +39,15 @@ func NewTargetPoint(temp, humid, cont, ero, weird, depth float64) TargetPoint {
 		Humidity:        quantize(humid),
 		Continentalness: quantize(cont),
 		Erosion:         quantize(ero),
-		Weirdness:       quantize(weird),
 		Depth:           quantize(depth),
+		Weirdness:       quantize(weird),
 	}
 }
 
 // fitDistance is the vanilla distance from a point to a parameter range. A
 // coordinate inside a range contributes zero; offset is applied separately.
 func fitDistance(point TargetPoint, ranges [AxisCount]ClimateRange, offset int64) int64 {
-	values := [AxisCount]int64{point.Temperature, point.Humidity, point.Continentalness, point.Erosion, point.Weirdness, point.Depth}
+	values := [AxisCount]int64{point.Temperature, point.Humidity, point.Continentalness, point.Erosion, point.Depth, point.Weirdness}
 	var total int64
 	for i, value := range values {
 		r := ranges[i]
@@ -73,7 +73,7 @@ func (r ClimateRange) contains(v int64) bool { return v >= r.Min && v <= r.Max }
 // BiomeParameter is one biome entry's full climate signature plus its name.
 type BiomeParameter struct {
 	Name string
-	// ranges[0..5] = temperature, humidity, continentalness, erosion, weirdness, depth.
+	// ranges[0..5] = temperature, humidity, continentalness, erosion, depth, weirdness.
 	Ranges [AxisCount]ClimateRange
 	Offset int64
 }
@@ -118,6 +118,6 @@ func containsAll(ranges [AxisCount]ClimateRange, p TargetPoint) bool {
 		ranges[1].contains(p.Humidity) &&
 		ranges[2].contains(p.Continentalness) &&
 		ranges[3].contains(p.Erosion) &&
-		ranges[4].contains(p.Weirdness) &&
-		ranges[5].contains(p.Depth)
+		ranges[4].contains(p.Depth) &&
+		ranges[5].contains(p.Weirdness)
 }
