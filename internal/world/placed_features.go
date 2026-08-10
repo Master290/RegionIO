@@ -106,24 +106,25 @@ func flattenBlockTag(set *worldgen.FeatureSet, tag string, visiting map[string]b
 }
 
 func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
-	angle := float64(random.NextFloat()) * math.Pi
-	extent := float64(size) / 8.0
-	x0 := float64(originX) + math.Sin(angle)*extent
-	x1 := float64(originX) - math.Sin(angle)*extent
-	z0 := float64(originZ) + math.Cos(angle)*extent
-	z1 := float64(originZ) - math.Cos(angle)*extent
+	angle := random.NextFloat() * float32(math.Pi)
+	extent := float32(size) / 8.0
+	x0 := float64(originX) + math.Sin(float64(angle))*float64(extent)
+	x1 := float64(originX) - math.Sin(float64(angle))*float64(extent)
+	z0 := float64(originZ) + math.Cos(float64(angle))*float64(extent)
+	z1 := float64(originZ) - math.Cos(float64(angle))*float64(extent)
 	y0 := float64(originY + int(random.NextIntN(3)) - 2)
 	y1 := float64(originY + int(random.NextIntN(3)) - 2)
 
 	type sphere struct{ x, y, z, radius float64 }
 	spheres := make([]sphere, size)
 	for i := 0; i < size; i++ {
-		t := float64(i) / float64(size)
-		radius := (math.Sin(math.Pi*t) + 1.0) * (float64(random.NextDouble())*float64(size)/16.0 + 1.0) / 2.0
+		t := float32(i) / float32(size)
+		randomScale := random.NextDouble() * float64(size) / 16.0
+		radius := ((float64(worldgen.MthSin(float64(float32(math.Pi)*t)))+1.0)*randomScale + 1.0) / 2.0
 		spheres[i] = sphere{
-			x:      x0 + (x1-x0)*t,
-			y:      y0 + (y1-y0)*t,
-			z:      z0 + (z1-z0)*t,
+			x:      x0 + (x1-x0)*float64(t),
+			y:      y0 + (y1-y0)*float64(t),
+			z:      z0 + (z1-z0)*float64(t),
 			radius: radius,
 		}
 	}

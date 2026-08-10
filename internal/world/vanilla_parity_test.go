@@ -129,7 +129,7 @@ func TestVanillaBlockParity(t *testing.T) {
 	// The ordinary CI profile is a regression floor while the port is still
 	// incomplete. REGIONIO_REQUIRE_PARITY upgrades the same exhaustive audit to
 	// exact equality; there is no sampled or summary-only comparison path.
-	if percent(blockExact, blockTotal) < 90 || biomeExact != biomeTotal || heightExact != heightTotal {
+	if percent(blockExact, blockTotal) < 91 || biomeExact != biomeTotal || heightExact != heightTotal {
 		t.Fatalf("vanilla parity regressed below the committed baseline")
 	}
 	if os.Getenv("REGIONIO_REQUIRE_PARITY") == "1" && (blockExact != blockTotal || biomeExact != biomeTotal || heightExact != heightTotal) {
