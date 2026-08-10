@@ -61,6 +61,44 @@ type SpringFeatureConfig struct {
 	ValidBlocks        []string   `json:"valid_blocks"`
 }
 
+type TreeFeatureConfig struct {
+	TrunkProvider struct {
+		Type  string     `json:"type"`
+		State BlockState `json:"state"`
+	} `json:"trunk_provider"`
+	FoliageProvider struct {
+		Type  string     `json:"type"`
+		State BlockState `json:"state"`
+	} `json:"foliage_provider"`
+	TrunkPlacer struct {
+		Type        string `json:"type"`
+		BaseHeight  int    `json:"base_height"`
+		HeightRandA int    `json:"height_rand_a"`
+		HeightRandB int    `json:"height_rand_b"`
+	} `json:"trunk_placer"`
+	FoliagePlacer struct {
+		Type   string `json:"type"`
+		Height int    `json:"height"`
+		Offset int    `json:"offset"`
+		Radius int    `json:"radius"`
+	} `json:"foliage_placer"`
+}
+
+type FeatureRef struct {
+	Name      string
+	Placement []PlacementModifier
+}
+
+type RandomSelectorConfig struct {
+	Default  FeatureRef
+	Features []RandomSelectorEntry
+}
+
+type RandomSelectorEntry struct {
+	Chance  float32
+	Feature FeatureRef
+}
+
 type BlockState struct {
 	Name       string            `json:"Name"`
 	Properties map[string]string `json:"Properties"`
@@ -76,6 +114,11 @@ type PlacementPlan struct {
 
 type CountProvider struct {
 	Min, Max int
+	Weighted []WeightedInt
+}
+
+type WeightedInt struct {
+	Value, Weight int
 }
 
 type HeightProvider struct {
@@ -85,6 +128,22 @@ type HeightProvider struct {
 }
 
 func (p CountProvider) Sample(r RandomSource) int {
+	if len(p.Weighted) > 0 {
+		total := 0
+		for _, entry := range p.Weighted {
+			total += entry.Weight
+		}
+		if total <= 0 {
+			return 0
+		}
+		roll := int(r.NextIntN(int32(total)))
+		for _, entry := range p.Weighted {
+			if roll < entry.Weight {
+				return entry.Value
+			}
+			roll -= entry.Weight
+		}
+	}
 	if p.Max <= p.Min {
 		return p.Min
 	}
@@ -181,6 +240,74 @@ func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
 	return config, nil
 }
 
+func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:tree" {
+		return TreeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a tree feature", name)
+	}
+	var config TreeFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return TreeFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.TrunkPlacer.Type == "" || config.FoliagePlacer.Type == "" || config.TrunkProvider.State.Name == "" || config.FoliageProvider.State.Name == "" {
+		return TreeFeatureConfig{}, fmt.Errorf("worldgen: invalid tree config %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:random_selector" {
+		return RandomSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random selector", name)
+	}
+	var raw struct {
+		Default  json.RawMessage `json:"default"`
+		Features []struct {
+			Chance  float32         `json:"chance"`
+			Feature json.RawMessage `json:"feature"`
+		} `json:"features"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return RandomSelectorConfig{}, err
+	}
+	selector := RandomSelectorConfig{Features: make([]RandomSelectorEntry, len(raw.Features))}
+	var err error
+	selector.Default, err = parseFeatureRef(raw.Default)
+	if err != nil {
+		return RandomSelectorConfig{}, err
+	}
+	for i, entry := range raw.Features {
+		selector.Features[i].Chance = entry.Chance
+		selector.Features[i].Feature, err = parseFeatureRef(entry.Feature)
+		if err != nil {
+			return RandomSelectorConfig{}, err
+		}
+	}
+	return selector, nil
+}
+
+func parseFeatureRef(raw json.RawMessage) (FeatureRef, error) {
+	var name string
+	if err := json.Unmarshal(raw, &name); err == nil {
+		return FeatureRef{Name: name}, nil
+	}
+	var inline struct {
+		Feature   string            `json:"feature"`
+		Placement []json.RawMessage `json:"placement"`
+	}
+	if err := json.Unmarshal(raw, &inline); err != nil || inline.Feature == "" {
+		return FeatureRef{}, fmt.Errorf("worldgen: invalid feature reference %s", raw)
+	}
+	ref := FeatureRef{Name: inline.Feature, Placement: make([]PlacementModifier, len(inline.Placement))}
+	for i, modifier := range inline.Placement {
+		if err := json.Unmarshal(modifier, &ref.Placement[i]); err != nil {
+			return FeatureRef{}, err
+		}
+		ref.Placement[i].Raw = modifier
+	}
+	return ref, nil
+}
+
 func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 	placed, ok := s.Placed[name]
 	if !ok {
@@ -233,7 +360,9 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 				return PlacementPlan{}, fmt.Errorf("worldgen: %s unsupported height distribution %q", name, value.Height.Type)
 			}
 			plan.HeightDistribution, plan.MinY, plan.MaxY = value.Height.Type, min, max
-		case "minecraft:in_square", "minecraft:biome":
+		case "minecraft:in_square", "minecraft:biome", "minecraft:surface_water_depth_filter",
+			"minecraft:heightmap", "minecraft:block_predicate_filter", "minecraft:noise_threshold_count",
+			"minecraft:random_offset":
 			// Coordinate spreading and biome validation are applied by the world
 			// executor. Keeping them in the parsed plan preserves their order.
 		default:
@@ -253,10 +382,26 @@ func parseIntProvider(raw json.RawMessage) (CountProvider, error) {
 		Min  int    `json:"min_inclusive"`
 		Max  int    `json:"max_inclusive"`
 	}
-	if err := json.Unmarshal(raw, &uniform); err != nil || uniform.Type != "minecraft:uniform" {
-		return CountProvider{}, fmt.Errorf("unsupported count provider %s", raw)
+	if err := json.Unmarshal(raw, &uniform); err == nil && uniform.Type == "minecraft:uniform" {
+		return CountProvider{Min: uniform.Min, Max: uniform.Max}, nil
 	}
-	return CountProvider{Min: uniform.Min, Max: uniform.Max}, nil
+	var weighted struct {
+		Type         string `json:"type"`
+		Distribution []struct {
+			Data   int `json:"data"`
+			Weight int `json:"weight"`
+		} `json:"distribution"`
+	}
+	if err := json.Unmarshal(raw, &weighted); err == nil && weighted.Type == "minecraft:weighted_list" {
+		provider := CountProvider{Weighted: make([]WeightedInt, 0, len(weighted.Distribution))}
+		for _, entry := range weighted.Distribution {
+			if entry.Weight > 0 {
+				provider.Weighted = append(provider.Weighted, WeightedInt{Value: entry.Data, Weight: entry.Weight})
+			}
+		}
+		return provider, nil
+	}
+	return CountProvider{}, fmt.Errorf("unsupported count provider %s", raw)
 }
 
 func parseFeatureHeight(raw json.RawMessage) (HeightProvider, error) {

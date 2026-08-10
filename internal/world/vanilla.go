@@ -480,48 +480,13 @@ func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64,
 
 	placeVanillaOres(c, seed, cx, cz, biomeName)
 	placeVanillaSprings(c, seed, cx, cz, biomeName)
+	placeVanillaTrees(c, seed, cx, cz, biomeName, surfTop)
 	placeFlora(c, &r, surfTop, grass, biomeName)
 	placeDesertFeatures(c, &r, surfTop, biomeName)
 	placeRocks(c, &r, surfTop, grass, biomeName)
 
-	const attempts = 8
-	for a := 0; a < attempts; a++ {
-		lx := 2 + int(r.next()%12)
-		lz := 2 + int(r.next()%12)
-		if !grass[lx][lz] {
-			continue
-		}
-		baseY := MinY + surfTop[lx][lz] + 1
-		placeOak(c, lx, baseY, lz, &r)
-	}
-
 	// Place large structures like villages and strongholds
 	worldgen.PlaceStructures(c, od, cx, cz, seed, surfTop, biomeName)
-}
-
-func placeOak(c *Chunk, lx, baseY, lz int, r *chunkRand) {
-	h := 4 + int(r.next()%3) // trunk height 4..6
-	for i := 0; i < h; i++ {
-		c.SetBlock(lx, baseY+i, lz, StateOakLog)
-	}
-	topY := baseY + h - 1
-	// Canopy: two wide layers around the top, then two narrow layers above.
-	layers := []struct {
-		dy, radius int
-	}{{-1, 2}, {0, 2}, {1, 1}, {2, 1}}
-	for _, ly := range layers {
-		y := topY + ly.dy
-		for dx := -ly.radius; dx <= ly.radius; dx++ {
-			for dz := -ly.radius; dz <= ly.radius; dz++ {
-				if ly.radius == 2 && abs(dx) == 2 && abs(dz) == 2 {
-					continue // trim the far corners for a rounder shape
-				}
-				if c.GetBlock(lx+dx, y, lz+dz) == StateAir {
-					c.SetBlock(lx+dx, y, lz+dz, StateOakLeaf)
-				}
-			}
-		}
-	}
 }
 
 func abs(v int) int {
