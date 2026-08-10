@@ -72,9 +72,8 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 			return nil, false
 		}
 		replaceables := make(map[uint16]bool)
-		for _, name := range set.BlockTags[target.Target.Tag] {
-			id, ok := nameToStateID(name, nil)
-			if ok {
+		for _, name := range flattenBlockTag(set, target.Target.Tag, nil) {
+			if id, ok := nameToStateID(name, nil); ok {
 				replaceables[id] = true
 			}
 		}
@@ -84,6 +83,26 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 		targets = append(targets, resolvedOreTarget{state: state, replaceables: replaceables})
 	}
 	return targets, true
+}
+
+func flattenBlockTag(set *worldgen.FeatureSet, tag string, visiting map[string]bool) []string {
+	if visiting == nil {
+		visiting = make(map[string]bool)
+	}
+	if visiting[tag] {
+		return nil
+	}
+	visiting[tag] = true
+	defer delete(visiting, tag)
+	var names []string
+	for _, value := range set.BlockTags[tag] {
+		if len(value) > 0 && value[0] == '#' {
+			names = append(names, flattenBlockTag(set, value[1:], visiting)...)
+		} else {
+			names = append(names, value)
+		}
+	}
+	return names
 }
 
 func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {

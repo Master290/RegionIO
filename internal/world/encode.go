@@ -94,6 +94,39 @@ type Chunk struct {
 	biome          uint16 // fallback uniform biome when biomes[si] is nil
 }
 
+// ParityHeightmaps returns the three client heightmaps as absolute top-block Y
+// values. It is used by the vanilla capture harness; wire encoding stores the
+// same predicates in packed relative form.
+func (c *Chunk) ParityHeightmaps() [3][256]int16 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var maps [3][256]int16
+	for z := 0; z < 16; z++ {
+		for x := 0; x < 16; x++ {
+			idx := z*16 + x
+			for kind := range maps {
+				maps[kind][idx] = int16(MinY - 1)
+			}
+			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
+				state := c.getBlock(x, y, z)
+				if maps[0][idx] == int16(MinY-1) && state != StateAir {
+					maps[0][idx] = int16(y)
+				}
+				if maps[1][idx] == int16(MinY-1) && blocksMotionOrFluid(state) {
+					maps[1][idx] = int16(y)
+				}
+				if maps[2][idx] == int16(MinY-1) && blocksMotionNoLeaves(state) {
+					maps[2][idx] = int16(y)
+				}
+				if maps[0][idx] != int16(MinY-1) && maps[1][idx] != int16(MinY-1) && maps[2][idx] != int16(MinY-1) {
+					break
+				}
+			}
+		}
+	}
+	return maps
+}
+
 // NewChunk returns an empty (all-air) chunk at (x, z) with the given biome.
 func NewChunk(x, z int32, biome uint16) *Chunk {
 	return &Chunk{X: x, Z: z, biome: biome}

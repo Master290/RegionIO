@@ -244,6 +244,58 @@ func (s *Store) LoadVanillaChunk(cx, cz int32) (*Chunk, error) {
 	return s.loadChunk(cx, cz, false)
 }
 
+// LoadVanillaHeightmaps reads the three packed heightmaps directly from an
+// official chunk. Unlike Chunk.ParityHeightmaps this does not recompute them
+// with RegionIO predicates, so parity reports remain independent.
+func (s *Store) LoadVanillaHeightmaps(cx, cz int32) ([3][256]int16, error) {
+	var out [3][256]int16
+	rx, rz, lx, lz := regionIndex(cx, cz)
+	rf, err := s.regionFor(cx, cz)
+	if err != nil {
+		return out, err
+	}
+	raw, err := rf.ReadChunk(lx, lz)
+	if err != nil {
+		return out, err
+	}
+	_, tag, err := nbt.UnmarshalNamed(raw)
+	if err != nil {
+		return out, err
+	}
+	root, ok := tag.(*nbt.Compound)
+	if !ok {
+		return out, errors.New("world: vanilla chunk root is not a compound")
+	}
+	if int32(nbtAsInt(root, "xPos")) != int32(rx*32+lx) || int32(nbtAsInt(root, "zPos")) != int32(rz*32+lz) {
+		return out, errors.New("world: vanilla heightmap chunk coordinates mismatch")
+	}
+	heightmaps, ok := root.Get("Heightmaps")
+	if !ok {
+		return out, errors.New("world: vanilla chunk missing Heightmaps")
+	}
+	compound, ok := heightmaps.(*nbt.Compound)
+	if !ok {
+		return out, errors.New("world: vanilla Heightmaps is not a compound")
+	}
+	for kind, name := range []string{"WORLD_SURFACE", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"} {
+		tag, ok := compound.Get(name)
+		if !ok {
+			return out, fmt.Errorf("world: vanilla Heightmaps missing %s", name)
+		}
+		longs, ok := tag.(nbt.LongArray)
+		if !ok || len(longs) != 37 {
+			return out, fmt.Errorf("world: vanilla heightmap %s has invalid length", name)
+		}
+		for index := 0; index < 256; index++ {
+			longIndex := index / 7
+			bitOffset := uint((index % 7) * 9)
+			value := (uint64(longs[longIndex]) >> bitOffset) & 0x1ff
+			out[kind][index] = int16(MinY + int(value) - 1)
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) loadChunk(cx, cz int32, requireGeneratorVersion bool) (*Chunk, error) {
 	rx, rz, lx, lz := regionIndex(cx, cz)
 	rf, err := s.regionFor(cx, cz)

@@ -174,7 +174,9 @@ run at all.
 
 `cmd/vanillacapture` runs the official bundler jar in an isolated temporary world, force-loads fixed
 chunks, reads their region files, and writes `internal/world/testdata/vanilla_overworld_12345.bin`.
-The fixture contains every block state and 4x4x4 biome cell. Java 25 is required. `make parity`
+The fixture contains every block state, 4x4x4 biome cell, and three heightmaps. Java 25 is required. `make parity`
 requires the fixture and fails when it is absent; ordinary `go test ./...` skips that one test so a
-fresh checkout remains buildable without Mojang's non-redistributable jar. The older optional
+fresh checkout remains buildable without Mojang's non-redistributable jar. Once the fixture is
+committed, ordinary CI guards the measured baseline while `make parity` requires exact equality.
+The older optional
 `/tmp/vanilla_ground.json` height report remains diagnostic only.

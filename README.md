@@ -69,8 +69,9 @@ session movement/broadcasts. A 16-client lifecycle test exercises overlapping
 ticket ownership, bounded global frame work, packet output, and cleanup after
 disconnect. Lighting tests compare the initial flat chunk and a 31x31x31
 glowstone propagation volume against fixtures captured from the official
-vanilla 26.1.2 server. Optional terrain parity diagnostics compare surface
-heights against `/tmp/vanilla_ground.json` when that capture is present.
+vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
+393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
+chunks; CI guards the current baseline and `make parity` requires exact equality.
 
 ## v0.4 scope
 

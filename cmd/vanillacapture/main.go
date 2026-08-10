@@ -20,7 +20,7 @@ import (
 	"regionio/internal/world"
 )
 
-const fixtureMagic = "RIOPAR01"
+const fixtureMagic = "RIOPAR02"
 
 type chunkPos struct{ x, z int32 }
 
@@ -63,7 +63,8 @@ func main() {
 	if err := runServer(*java, jar, work, chunks); err != nil {
 		fatal(err)
 	}
-	if err := writeFixture(filepath.Join(work, "world"), *output, *seed, chunks); err != nil {
+	overworld := filepath.Join(work, "world", "dimensions", "minecraft", "overworld")
+	if err := writeFixture(overworld, *output, *seed, chunks); err != nil {
 		fatal(err)
 	}
 	fmt.Printf("wrote %s: seed %d, %d chunks\n", *output, *seed, len(chunks))
@@ -230,6 +231,18 @@ func writeFixture(worldDir, output string, seed int64, chunks []chunkPos) error 
 					if _, err := f.Write(value[:2]); err != nil {
 						return err
 					}
+				}
+			}
+		}
+		heightmaps, err := store.LoadVanillaHeightmaps(pos.x, pos.z)
+		if err != nil {
+			return fmt.Errorf("load vanilla heightmaps (%d,%d): %w", pos.x, pos.z, err)
+		}
+		for _, heightmap := range heightmaps {
+			for _, y := range heightmap {
+				binary.BigEndian.PutUint16(value[:2], uint16(y))
+				if _, err := f.Write(value[:2]); err != nil {
+					return err
 				}
 			}
 		}
