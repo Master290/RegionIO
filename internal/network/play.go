@@ -15,8 +15,10 @@ import (
 // Spawn column. The feet-level Y is resolved from the generated surface when
 // the player enters the play phase.
 const (
-	spawnX = 8.5
-	spawnZ = 8.5
+	spawnX      = 8.5
+	spawnZ      = 8.5
+	maxPlayerXZ = 30_000_000.0
+	maxPlayerY  = 20_000_000.0
 )
 
 // beginPlay sends the join sequence once the client enters the Play phase and
@@ -106,6 +108,9 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 		math.IsNaN(float64(yaw)) || math.IsNaN(float64(pitch)) ||
 		math.IsInf(float64(yaw), 0) || math.IsInf(float64(pitch), 0) {
 		return errors.New("invalid player position")
+	}
+	if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
+		return errors.New("player position outside world bounds")
 	}
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	cx := int32(int64(math.Floor(x)) >> 4)
@@ -203,7 +208,21 @@ func (h *handler) keepAliveLoop() {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
+			h.keepAliveMu.Lock()
+			if h.keepAlivePending {
+				timedOut := time.Since(h.keepAliveSent) >= 30*time.Second
+				h.keepAliveMu.Unlock()
+				if timedOut {
+					_ = h.conn.Close()
+					return
+				}
+				continue
+			}
 			id := time.Now().UnixMilli()
+			h.keepAlivePending = true
+			h.keepAliveID = id
+			h.keepAliveSent = time.Now()
+			h.keepAliveMu.Unlock()
 			w := protocol.NewWriter(8)
 			w.Int64(id)
 			if err := h.conn.SendWriter(protocol.PlayKeepAliveCB, w); err != nil {
@@ -434,8 +453,20 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		return nil
 
 	case protocol.PlayKeepAliveServer:
-		// A response to our keep-alive; presence is enough for liveness.
-		h.log.Debug("keep-alive ack")
+		id, err := pkt.Body().Int64()
+		if err != nil {
+			return err
+		}
+		h.keepAliveMu.Lock()
+		valid := h.keepAlivePending && id == h.keepAliveID
+		if valid {
+			h.keepAlivePending = false
+		}
+		h.keepAliveMu.Unlock()
+		if !valid {
+			return errors.New("unexpected keep-alive response")
+		}
+		h.log.Debug("keep-alive ack", "id", id)
 		return nil
 
 	case protocol.PlayPlayerLoaded:

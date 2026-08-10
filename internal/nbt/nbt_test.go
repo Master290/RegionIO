@@ -2,6 +2,7 @@ package nbt
 
 import (
 	"bytes"
+	"encoding/binary"
 	"reflect"
 	"testing"
 )
@@ -29,10 +30,10 @@ func TestGoldenHelloWorld(t *testing.T) {
 func TestNetworkRootHasNoName(t *testing.T) {
 	got := Marshal(NewCompound().Set("a", Byte(1)))
 	want := []byte{
-		0x0a,                   // TAG_Compound (no name)
-		0x01, 0x00, 0x01, 'a',  // TAG_Byte, name len 1
-		0x01,                   // value 1
-		0x00,                   // TAG_End
+		0x0a,                  // TAG_Compound (no name)
+		0x01, 0x00, 0x01, 'a', // TAG_Byte, name len 1
+		0x01, // value 1
+		0x00, // TAG_End
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("network root mismatch:\n got=%x\nwant=%x", got, want)
@@ -116,4 +117,40 @@ func TestTruncatedInput(t *testing.T) {
 			t.Fatalf("expected error decoding %d/%d bytes", n, len(enc))
 		}
 	}
+}
+
+func TestDecodeRejectsOversizedArraysWithoutPanicking(t *testing.T) {
+	for _, id := range []byte{TagByteArray, TagIntArray, TagLongArray} {
+		input := []byte{id, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(input[1:], ^uint32(0))
+		if _, err := Unmarshal(input); err == nil {
+			t.Errorf("tag %d: accepted negative array length", id)
+		}
+	}
+}
+
+func TestDecodeRejectsArrayLargerThanInput(t *testing.T) {
+	input := []byte{TagLongArray, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1}
+	if _, err := Unmarshal(input); err == nil {
+		t.Fatal("accepted two-long array with one long of input")
+	}
+}
+
+func TestDecodeNestingLimit(t *testing.T) {
+	input := []byte{TagList}
+	for i := 0; i <= maxDecodeDepth; i++ {
+		input = append(input, TagList, 0, 0, 0, 1)
+	}
+	input = append(input, TagByte, 0, 0, 0, 1, 0)
+	if _, err := Unmarshal(input); err == nil {
+		t.Fatal("accepted NBT deeper than the decoder limit")
+	}
+}
+
+func FuzzUnmarshalNeverPanics(f *testing.F) {
+	f.Add(Marshal(NewCompound().Set("value", Int(42))))
+	f.Add([]byte{TagLongArray, 0xff, 0xff, 0xff, 0xff})
+	f.Fuzz(func(t *testing.T, input []byte) {
+		_, _ = Unmarshal(input)
+	})
 }

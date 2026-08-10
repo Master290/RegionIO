@@ -1,13 +1,82 @@
 package world
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"math"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
 )
+
+const vanillaParityFixture = "testdata/vanilla_overworld_12345.bin"
+
+func TestVanillaBlockParity(t *testing.T) {
+	f, err := os.Open(vanillaParityFixture)
+	if err != nil {
+		if os.Getenv("REGIONIO_REQUIRE_PARITY") == "1" {
+			t.Fatalf("required parity fixture: %v", err)
+		}
+		t.Skip("vanilla block fixture not installed; run cmd/vanillacapture with Java 25")
+	}
+	defer f.Close()
+
+	var header [24]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if string(header[:8]) != "RIOPAR01" {
+		t.Fatalf("bad parity fixture magic %q", header[:8])
+	}
+	seed := int64(binary.BigEndian.Uint64(header[8:16]))
+	count := int(binary.BigEndian.Uint32(header[16:20]))
+	if seed != 12345 || count <= 0 {
+		t.Fatalf("fixture seed=%d chunks=%d", seed, count)
+	}
+	gen := NewVanillaGenerator(seed)
+	for chunkIndex := 0; chunkIndex < count; chunkIndex++ {
+		var coords [8]byte
+		if _, err := io.ReadFull(f, coords[:]); err != nil {
+			t.Fatal(err)
+		}
+		cx := int32(binary.BigEndian.Uint32(coords[:4]))
+		cz := int32(binary.BigEndian.Uint32(coords[4:]))
+		chunk := gen(cx, cz)
+		var state [2]byte
+		for y := MinY; y < MinY+WorldHeight; y++ {
+			for z := 0; z < 16; z++ {
+				for x := 0; x < 16; x++ {
+					if _, err := io.ReadFull(f, state[:]); err != nil {
+						t.Fatal(err)
+					}
+					want := binary.BigEndian.Uint16(state[:])
+					if got := chunk.GetBlock(x, y, z); got != want {
+						t.Fatalf("chunk (%d,%d) block (%d,%d,%d): got state %d want %d", cx, cz, x, y, z, got, want)
+					}
+				}
+			}
+		}
+		for y := MinY; y < MinY+WorldHeight; y += biomeCellSize {
+			for z := 0; z < 16; z += biomeCellSize {
+				for x := 0; x < 16; x += biomeCellSize {
+					if _, err := io.ReadFull(f, state[:]); err != nil {
+						t.Fatal(err)
+					}
+					want := binary.BigEndian.Uint16(state[:])
+					if got := chunk.GetBiome(x, y, z); got != want {
+						t.Fatalf("chunk (%d,%d) biome (%d,%d,%d): got %d want %d", cx, cz, x, y, z, got, want)
+					}
+				}
+			}
+		}
+	}
+	var trailing [1]byte
+	if n, err := f.Read(trailing[:]); n != 0 || err != io.EOF {
+		t.Fatalf("fixture has trailing data or read error: n=%d err=%v", n, err)
+	}
+}
 
 // TestVanillaParity compares our generated surface heights against heights
 // captured from the official server (seed 12345, normal terrain). Requires

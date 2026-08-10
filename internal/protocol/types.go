@@ -64,8 +64,13 @@ var (
 	ErrVarIntTooBig = errors.New("protocol: varint is too big")
 	// ErrStringTooLong is returned when a string exceeds MaxStringLen.
 	ErrStringTooLong = errors.New("protocol: string too long")
+	// ErrInvalidString is returned for protocol strings that are not UTF-8.
+	ErrInvalidString = errors.New("protocol: invalid UTF-8 string")
 	// ErrPacketTooLarge is returned when a packet length exceeds MaxPacketSize.
 	ErrPacketTooLarge = errors.New("protocol: packet too large")
+	// ErrBadCompression is returned when a frame violates the negotiated
+	// compression threshold or its stream does not match the declared length.
+	ErrBadCompression = errors.New("protocol: invalid compressed packet")
 )
 
 // ReadVarInt reads a 32-bit VarInt from r, returning the value and the number

@@ -2,6 +2,7 @@ package world
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,7 +33,7 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-const generatorVersion = 11
+const generatorVersion = 12
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.
@@ -233,6 +234,17 @@ func (s *Store) regionFor(cx, cz int32) (*RegionFile, error) {
 // LoadChunk reads and decodes the chunk at (cx, cz). It returns ErrChunkNotFound
 // when the chunk is not stored.
 func (s *Store) LoadChunk(cx, cz int32) (*Chunk, error) {
+	return s.loadChunk(cx, cz, true)
+}
+
+// LoadVanillaChunk reads an official-server chunk without requiring RegionIO's
+// generator stamp. It exists for parity tooling; runtime world loading must use
+// LoadChunk so stale RegionIO terrain still regenerates.
+func (s *Store) LoadVanillaChunk(cx, cz int32) (*Chunk, error) {
+	return s.loadChunk(cx, cz, false)
+}
+
+func (s *Store) loadChunk(cx, cz int32, requireGeneratorVersion bool) (*Chunk, error) {
 	rx, rz, lx, lz := regionIndex(cx, cz)
 	rf, err := s.regionFor(cx, cz)
 	if err != nil {
@@ -250,7 +262,7 @@ func (s *Store) LoadChunk(cx, cz int32) (*Chunk, error) {
 	if !ok {
 		return nil, fmt.Errorf("world: chunk (%d,%d) root is not a compound", cx, cz)
 	}
-	return nbtToChunk(root, rx, rz, lx, lz)
+	return nbtToChunkVersioned(root, rx, rz, lx, lz, requireGeneratorVersion)
 }
 
 // SaveChunk encodes the chunk and writes it to its region file.
@@ -483,13 +495,17 @@ func packIndices(ids []uint16, indexOf map[uint16]int, bits int) nbt.LongArray {
 // absolute coordinates are derived from the on-disk xPos/zPos (authoritative);
 // the region/local coords passed in are used only to validate.
 func nbtToChunk(root *nbt.Compound, regionX, regionZ, localX, localZ int) (*Chunk, error) {
+	return nbtToChunkVersioned(root, regionX, regionZ, localX, localZ, true)
+}
+
+func nbtToChunkVersioned(root *nbt.Compound, regionX, regionZ, localX, localZ int, requireGeneratorVersion bool) (*Chunk, error) {
 	// Reject anything the current generator did not produce so the caller
 	// regenerates instead of serving stale terrain. Chunks written before the
 	// stamp existed have no tag and decode as 0, so they are invalidated too.
 	// This is per-chunk on purpose: the world metadata file guards the seed,
 	// which is a hard mismatch, while a generator change is routine and should
 	// quietly regenerate rather than refuse to open the world.
-	if v := nbtAsInt(root, generatorVersionTag); v != generatorVersion {
+	if requireGeneratorVersion && nbtAsInt(root, generatorVersionTag) != generatorVersion {
 		return nil, ErrChunkNotFound
 	}
 
@@ -508,27 +524,39 @@ func nbtToChunk(root *nbt.Compound, regionX, regionZ, localX, localZ int) (*Chun
 		}
 	}
 
-	// Sections.
-	if secTag, ok := root.Get("sections"); ok {
-		if secList, ok := secTag.(nbt.List); ok && secList.ElemID == nbt.TagCompound {
-			for _, st := range secList.Elems {
-				sc, ok := st.(*nbt.Compound)
-				if !ok {
-					continue
-				}
-				yIdx, ok := nbtAsSectionY(sc, "Y")
-				if !ok {
-					continue
-				}
-				si := yIdx - minYSection
-				if si < 0 || si >= SectionCount {
-					continue
-				}
-				readBlockStates(c, si, sc)
-				readBiomes(c, si, sc)
-				readLightSection(c, si, sc)
-			}
+	secTag, ok := root.Get("sections")
+	if !ok {
+		return nil, errors.New("world: chunk NBT missing sections")
+	}
+	secList, ok := secTag.(nbt.List)
+	if !ok || secList.ElemID != nbt.TagCompound {
+		return nil, errors.New("world: chunk sections is not a compound list")
+	}
+	seenSections := make(map[int]bool, len(secList.Elems))
+	for index, st := range secList.Elems {
+		sc, ok := st.(*nbt.Compound)
+		if !ok {
+			return nil, fmt.Errorf("world: section %d is not a compound", index)
 		}
+		yIdx, ok := nbtAsSectionY(sc, "Y")
+		if !ok {
+			return nil, fmt.Errorf("world: section %d has no valid Y", index)
+		}
+		si := yIdx - minYSection
+		if si < 0 || si >= SectionCount {
+			continue
+		}
+		if seenSections[si] {
+			return nil, fmt.Errorf("world: duplicate section Y %d", yIdx)
+		}
+		seenSections[si] = true
+		if err := readBlockStates(c, si, sc); err != nil {
+			return nil, fmt.Errorf("world: section Y %d block states: %w", yIdx, err)
+		}
+		if err := readBiomes(c, si, sc); err != nil {
+			return nil, fmt.Errorf("world: section Y %d biomes: %w", yIdx, err)
+		}
+		readLightSection(c, si, sc)
 	}
 	return c, nil
 }
@@ -555,36 +583,48 @@ func readLightSection(c *Chunk, si int, sc *nbt.Compound) {
 // readBlockStates decodes a section's block_states {palette, data?} into the
 // chunk's section array. A palette of size 1 fills the whole section; otherwise
 // the packed data array is unpacked.
-func readBlockStates(c *Chunk, si int, sc *nbt.Compound) {
+func readBlockStates(c *Chunk, si int, sc *nbt.Compound) error {
 	bsTag, ok := sc.Get("block_states")
 	if !ok {
-		return
+		return errors.New("missing block_states")
 	}
 	bs, ok := bsTag.(*nbt.Compound)
 	if !ok {
-		return
+		return errors.New("block_states is not a compound")
 	}
 	palTag, ok := bs.Get("palette")
 	if !ok {
-		return
+		return errors.New("missing palette")
 	}
 	pal, ok := palTag.(nbt.List)
 	if !ok || pal.ElemID != nbt.TagCompound {
-		return
+		return errors.New("palette is not a compound list")
+	}
+	if len(pal.Elems) == 0 || len(pal.Elems) > totalBlockStates {
+		return fmt.Errorf("palette size %d out of range", len(pal.Elems))
 	}
 	// Decode palette entries to state IDs.
 	ids := make([]uint16, len(pal.Elems))
 	for i, e := range pal.Elems {
 		ec, ok := e.(*nbt.Compound)
 		if !ok {
-			ids[i] = StateAir
-			continue
+			return fmt.Errorf("palette entry %d is not a compound", i)
 		}
-		name := string(nbtAsString(ec, "Name"))
+		nameTag, ok := ec.Get("Name")
+		if !ok {
+			return fmt.Errorf("palette entry %d has no Name", i)
+		}
+		nameValue, ok := nameTag.(nbt.String)
+		if !ok || nameValue == "" {
+			return fmt.Errorf("palette entry %d has invalid Name", i)
+		}
+		name := string(nameValue)
 		props := readProps(ec)
-		// An unknown block name decodes to air rather than to a neighbour's
-		// state; that loses the block but does not corrupt the column.
-		ids[i], _ = nameToStateID(name, props)
+		var resolved bool
+		ids[i], resolved = nameToStateID(name, props)
+		if !resolved {
+			return fmt.Errorf("unknown block state %q", name)
+		}
 	}
 	c.section(si) // ensure allocated
 	s := c.sections[si]
@@ -594,36 +634,55 @@ func readBlockStates(c *Chunk, si int, sc *nbt.Compound) {
 			fill[i] = ids[0]
 		}
 		c.sections[si] = &fill
-		return
+		return nil
 	}
-	if dataTag, ok := bs.Get("data"); ok {
-		if data, ok := dataTag.(nbt.LongArray); ok {
-			unpackIndices(s[:], ids, data, blockStorageBits(len(ids)))
-		}
+	dataTag, ok := bs.Get("data")
+	if !ok {
+		return errors.New("multi-entry palette has no data")
 	}
+	data, ok := dataTag.(nbt.LongArray)
+	if !ok {
+		return errors.New("data is not a long array")
+	}
+	bits := blockStorageBits(len(ids))
+	if err := validatePackedData(len(s), bits, data); err != nil {
+		return err
+	}
+	return unpackIndices(s[:], ids, data, bits)
 }
 
 // readBiomes decodes a section's biomes {palette, data?} into the per-cell array.
-func readBiomes(c *Chunk, si int, sc *nbt.Compound) {
+func readBiomes(c *Chunk, si int, sc *nbt.Compound) error {
 	bTag, ok := sc.Get("biomes")
 	if !ok {
-		return
+		return errors.New("missing biomes")
 	}
 	bc, ok := bTag.(*nbt.Compound)
 	if !ok {
-		return
+		return errors.New("biomes is not a compound")
 	}
 	palTag, ok := bc.Get("palette")
 	if !ok {
-		return
+		return errors.New("missing palette")
 	}
 	pal, ok := palTag.(nbt.List)
 	if !ok || pal.ElemID != nbt.TagString {
-		return
+		return errors.New("palette is not a string list")
+	}
+	if len(pal.Elems) == 0 || len(pal.Elems) > totalBiomes {
+		return fmt.Errorf("palette size %d out of range", len(pal.Elems))
 	}
 	ids := make([]uint16, len(pal.Elems))
 	for i, e := range pal.Elems {
-		ids[i] = biomeIDByName(string(e.(nbt.String)))
+		name, ok := e.(nbt.String)
+		if !ok {
+			return fmt.Errorf("palette entry %d is not a string", i)
+		}
+		id := registry.Index("minecraft:worldgen/biome", string(name))
+		if id < 0 {
+			return fmt.Errorf("unknown biome %q", name)
+		}
+		ids[i] = uint16(id)
 	}
 	if len(ids) == 1 {
 		cells := new([biomeCellsPerSection]uint16)
@@ -631,15 +690,26 @@ func readBiomes(c *Chunk, si int, sc *nbt.Compound) {
 			cells[i] = ids[0]
 		}
 		c.biomes[si] = cells
-		return
+		return nil
 	}
-	if dataTag, ok := bc.Get("data"); ok {
-		if data, ok := dataTag.(nbt.LongArray); ok {
-			cells := new([biomeCellsPerSection]uint16)
-			unpackIndices(cells[:], ids, data, biomeStorageBits(len(ids)))
-			c.biomes[si] = cells
-		}
+	dataTag, ok := bc.Get("data")
+	if !ok {
+		return errors.New("multi-entry palette has no data")
 	}
+	data, ok := dataTag.(nbt.LongArray)
+	if !ok {
+		return errors.New("data is not a long array")
+	}
+	bits := biomeStorageBits(len(ids))
+	cells := new([biomeCellsPerSection]uint16)
+	if err := validatePackedData(len(cells), bits, data); err != nil {
+		return err
+	}
+	if err := unpackIndices(cells[:], ids, data, bits); err != nil {
+		return err
+	}
+	c.biomes[si] = cells
+	return nil
 }
 
 func readProps(c *nbt.Compound) map[string]string {
@@ -701,21 +771,32 @@ func nbtAsString(c *nbt.Compound, name string) nbt.String {
 
 // unpackIndices reverses packIndices: fills dst with palette IDs using the
 // packed long array.
-func unpackIndices(dst []uint16, ids []uint16, data nbt.LongArray, bits int) {
+func validatePackedData(entries, bits int, data nbt.LongArray) error {
 	if bits < 1 {
-		return
+		return errors.New("invalid zero-bit packed data")
+	}
+	perLong := 64 / bits
+	want := (entries + perLong - 1) / perLong
+	if len(data) != want {
+		return fmt.Errorf("packed data has %d longs, want %d", len(data), want)
+	}
+	return nil
+}
+
+func unpackIndices(dst []uint16, ids []uint16, data nbt.LongArray, bits int) error {
+	if bits < 1 {
+		return errors.New("invalid zero-bit packed data")
 	}
 	perLong := 64 / bits
 	mask := int64(1)<<uint(bits) - 1
 	for i := range dst {
 		longIdx := i / perLong
 		bitOff := (i % perLong) * bits
-		if longIdx >= len(data) {
-			break
-		}
 		idx := int((data[longIdx] >> uint(bitOff)) & mask)
-		if idx >= 0 && idx < len(ids) {
-			dst[i] = ids[idx]
+		if idx < 0 || idx >= len(ids) {
+			return fmt.Errorf("palette index %d out of range %d", idx, len(ids))
 		}
+		dst[i] = ids[idx]
 	}
+	return nil
 }

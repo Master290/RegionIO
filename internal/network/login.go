@@ -2,6 +2,7 @@ package network
 
 import (
 	"errors"
+	"fmt"
 
 	"regionio/internal/protocol"
 	"regionio/internal/server"
@@ -32,12 +33,15 @@ func (h *handler) handleLogin(pkt protocol.Packet) error {
 }
 
 func (h *handler) handleLoginStart(pkt protocol.Packet) error {
+	if h.protocolVersion != protocol.ProtocolVersion {
+		return fmt.Errorf("unsupported protocol %d, want %d", h.protocolVersion, protocol.ProtocolVersion)
+	}
 	r := pkt.Body()
 	name, err := r.String()
 	if err != nil {
 		return err
 	}
-	if name == "" || len(name) > 16 {
+	if !validPlayerName(name) {
 		return errors.New("invalid login name")
 	}
 	// The client also sends a UUID, but in offline mode we derive our own so it
@@ -63,6 +67,18 @@ func (h *handler) handleLoginStart(pkt protocol.Packet) error {
 	}
 
 	return h.sendLoginSuccess()
+}
+
+func validPlayerName(name string) bool {
+	if len(name) == 0 || len(name) > 16 {
+		return false
+	}
+	for _, r := range name {
+		if r != '_' && (r < '0' || r > '9') && (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') {
+			return false
+		}
+	}
+	return true
 }
 
 // sendLoginSuccess writes the Login Success packet. For protocol 775 the body

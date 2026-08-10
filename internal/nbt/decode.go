@@ -10,12 +10,16 @@ var (
 	errTruncated   = errors.New("nbt: truncated input")
 	errBadTag      = errors.New("nbt: unknown tag id")
 	errNegativeLen = errors.New("nbt: negative length")
+	errTooDeep     = errors.New("nbt: nesting exceeds limit")
 )
+
+const maxDecodeDepth = 512
 
 // decoder walks a byte slice, tracking a cursor.
 type decoder struct {
-	b   []byte
-	pos int
+	b     []byte
+	pos   int
+	depth int
 }
 
 // Unmarshal decodes a network-format payload (unnamed root) into a Tag.
@@ -135,12 +139,13 @@ func (d *decoder) payload(id byte) (Tag, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := d.need(int(int32(n))); err != nil {
+		count, err := d.count(n, 1)
+		if err != nil {
 			return nil, err
 		}
-		out := make(ByteArray, n)
-		copy(out, d.b[d.pos:d.pos+int(n)])
-		d.pos += int(n)
+		out := make(ByteArray, count)
+		copy(out, d.b[d.pos:d.pos+count])
+		d.pos += count
 		return out, nil
 	case TagString:
 		s, err := d.str()
@@ -150,7 +155,11 @@ func (d *decoder) payload(id byte) (Tag, error) {
 		if err != nil {
 			return nil, err
 		}
-		out := make(IntArray, int32(n))
+		count, err := d.count(n, 4)
+		if err != nil {
+			return nil, err
+		}
+		out := make(IntArray, count)
 		for i := range out {
 			v, err := d.u32()
 			if err != nil {
@@ -164,7 +173,11 @@ func (d *decoder) payload(id byte) (Tag, error) {
 		if err != nil {
 			return nil, err
 		}
-		out := make(LongArray, int32(n))
+		count, err := d.count(n, 8)
+		if err != nil {
+			return nil, err
+		}
+		out := make(LongArray, count)
 		for i := range out {
 			v, err := d.u64()
 			if err != nil {
@@ -174,12 +187,32 @@ func (d *decoder) payload(id byte) (Tag, error) {
 		}
 		return out, nil
 	case TagList:
-		return d.list()
+		return d.container(d.list)
 	case TagCompound:
-		return d.compound()
+		return d.container(d.compound)
 	default:
 		return nil, errBadTag
 	}
+}
+
+func (d *decoder) count(n uint32, width int) (int, error) {
+	count := int64(int32(n))
+	if count < 0 {
+		return 0, errNegativeLen
+	}
+	if count*int64(width) > int64(len(d.b)-d.pos) {
+		return 0, errTruncated
+	}
+	return int(count), nil
+}
+
+func (d *decoder) container(decode func() (Tag, error)) (Tag, error) {
+	if d.depth >= maxDecodeDepth {
+		return nil, errTooDeep
+	}
+	d.depth++
+	defer func() { d.depth-- }()
+	return decode()
 }
 
 func (d *decoder) list() (Tag, error) {
@@ -191,9 +224,12 @@ func (d *decoder) list() (Tag, error) {
 	if err != nil {
 		return nil, err
 	}
-	count := int(int32(n))
-	if count < 0 {
-		return nil, errNegativeLen
+	count, err := d.count(n, 1) // every non-empty payload consumes at least one byte
+	if err != nil {
+		return nil, err
+	}
+	if elemID == TagEnd && count != 0 {
+		return nil, errBadTag
 	}
 	l := List{ElemID: elemID, Elems: make([]Tag, 0, count)}
 	for i := 0; i < count; i++ {

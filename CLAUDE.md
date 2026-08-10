@@ -10,12 +10,14 @@ README.md describes what the server does. This file is about how to work on it.
 ```
 go build ./... && go vet ./...
 make test          # go test ./...
-make test-race     # the race-sensitive subset
-make verify        # both
+make test-race     # go test -race ./...
+make verify        # build, vet, tests, and race tests
+make parity        # requires the committed vanilla block fixture
 
 go run ./cmd/regionio -seed 12345            # serves on 0.0.0.0:25565
 go run ./cmd/regionio -seed 12345 -world ""  # in-memory world, nothing read from or written to disk
 go run ./cmd/gendump                         # client-free generator diagnostics
+go run ./cmd/vanillacapture                  # regenerate vanilla block parity fixture (Java 25)
 ```
 
 ## Hard rules
@@ -124,7 +126,7 @@ we can tell, but no vanilla capture confirms them: the aquifer (`worldgen/aquife
 
 The whole `noise_router` is parsed. `preliminary_surface_level` is reachable through
 `od.PreliminarySurfaceLevelAt`, which quart-aligns and memoises across chunks the way `NoiseChunk`
-does; the `vein_*` keys are parsed but nothing reads them yet.
+does. The `vein_*` keys drive `OreVeinifier` during the material pass.
 
 The rule tree is **seed-bound**: `od.SurfaceRule()` returns a `*SurfaceRuleSet` compiled against the
 world's `RandomState`, because `noise_threshold` and `vertical_gradient` cannot work without it. Get
@@ -137,8 +139,9 @@ parse time).
 
 Known gaps, roughly in order of how visible they are:
 
-- **No carvers and no ore veins.** Caves come only from the density router; `configured_carver` is
-  not extracted and the `OreVeinifier` over the parsed `vein_*` keys is not written.
+- **No generic placed/configured feature system.** Configured caves, canyons, and noise-router ore
+  veins are implemented, but ordinary ores, flora, trees, and springs still use hand-written
+  decoration rather than biome generation stages and placement modifiers.
 - **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
   adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
   warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,
@@ -169,7 +172,9 @@ started as gendump checks and run under `make verify`: `TestCavesAreDry`, `TestN
 `go test -race` needs cgo and a C toolchain; on a Windows box without gcc, `make test-race` cannot
 run at all.
 
-`internal/world/vanilla_parity_test.go` compares surface heights against a capture from the official
-server and skips when the capture is absent. Note it reads a hardcoded `/tmp` path, so on Windows it
-never runs. A capture is produced by running the vanilla server headless at a known seed and reading
-its region files back with our own `regionfile.go` + `nbt`.
+`cmd/vanillacapture` runs the official bundler jar in an isolated temporary world, force-loads fixed
+chunks, reads their region files, and writes `internal/world/testdata/vanilla_overworld_12345.bin`.
+The fixture contains every block state and 4x4x4 biome cell. Java 25 is required. `make parity`
+requires the fixture and fails when it is absent; ordinary `go test ./...` skips that one test so a
+fresh checkout remains buildable without Mojang's non-redistributable jar. The older optional
+`/tmp/vanilla_ground.json` height report remains diagnostic only.

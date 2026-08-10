@@ -16,7 +16,7 @@ var biomeParametersJSON []byte
 // rawParameter mirrors one entry of biome_parameters.json: a biome name plus its
 // climate ranges. Each axis value is a [min, max] array; depth is normally a
 // scalar (0.0 surface / 1.0 underground) but a few cave entries carry a [min,
-// max] array, so it is decoded loosely (see depthScalar).
+// max] array, so it is decoded loosely (see depthRange).
 type rawParameter struct {
 	Biome string `json:"biome"`
 	Param struct {
@@ -31,21 +31,20 @@ type rawParameter struct {
 }
 
 // depthRange extracts a depth band from a raw entry. It accepts a JSON number
-// (mapped to the half-open band [v, v+1) so a scalar value matches exactly one
-// integer depth layer), a single-element [v] array (same as the scalar), or a
+// (mapped to the exact inclusive range [v,v]), a single-element [v] array, or a
 // two-element [min, max] range (used by cave biomes like lush/dripstone_caves
 // whose depth is [0.2, 0.9]). Returns ok=false only for malformed input.
 func depthRange(v any) (worldgen.ClimateRange, bool) {
 	switch d := v.(type) {
 	case float64:
 		q := worldgen.Quantize(d)
-		return worldgen.ClimateRange{Min: q, Max: q + 1}, true
+		return worldgen.ClimateRange{Min: q, Max: q}, true
 	case []any:
 		switch len(d) {
 		case 1:
 			if f, ok := d[0].(float64); ok {
 				q := worldgen.Quantize(f)
-				return worldgen.ClimateRange{Min: q, Max: q + 1}, true
+				return worldgen.ClimateRange{Min: q, Max: q}, true
 			}
 		case 2:
 			lo, ok1 := d[0].(float64)
@@ -59,8 +58,7 @@ func depthRange(v any) (worldgen.ClimateRange, bool) {
 }
 
 // biomeTable is the full biome parameter table (surface + underground twins +
-// cave biomes), built once at init. The finder's range-contains check on the
-// depth axis selects the correct layer per cell.
+// cave biomes), built once at init.
 var (
 	biomeTable     *worldgen.ParameterTable
 	biomeTableOnce sync.Once
@@ -92,7 +90,7 @@ func loadBiomeTable() *worldgen.ParameterTable {
 
 // makeBiomeParameter converts a raw JSON entry into a BiomeParameter, mapping
 // the [min,max] ranges to quantized ClimateRanges. depth is a ClimateRange
-// (half-open band for scalar depths, explicit range for cave biomes).
+// (exact range for scalar depths, explicit range for cave biomes).
 func makeBiomeParameter(e rawParameter, depth worldgen.ClimateRange) worldgen.BiomeParameter {
 	qr := func(a [2]float64) worldgen.ClimateRange {
 		return worldgen.ClimateRange{Min: worldgen.Quantize(a[0]), Max: worldgen.Quantize(a[1])}
@@ -105,7 +103,7 @@ func makeBiomeParameter(e rawParameter, depth worldgen.ClimateRange) worldgen.Bi
 			qr(e.Param.Continentalness),
 			qr(e.Param.Erosion),
 			qr(e.Param.Weirdness),
-			depth, // half-open band (scalar) or explicit range (cave biomes)
+			depth,
 		},
 		Offset: worldgen.Quantize(e.Param.Offset),
 	}

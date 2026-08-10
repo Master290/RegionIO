@@ -74,6 +74,26 @@ func TestRegionFileOverwrite(t *testing.T) {
 	}
 }
 
+func TestRegionFileOverwriteUsesCopyOnWrite(t *testing.T) {
+	dir := t.TempDir()
+	rf, err := OpenRegion(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rf.Close()
+	if err := rf.WriteChunk(1, 1, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	first := rf.offsets[locationIndex(1, 1)] >> 8
+	if err := rf.WriteChunk(1, 1, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	second := rf.offsets[locationIndex(1, 1)] >> 8
+	if second <= first {
+		t.Fatalf("overwrite reused published sector %d; new location is %d", first, second)
+	}
+}
+
 // TestStoreChunkRoundTrip encodes a chunk to NBT, decodes it back, and confirms
 // the blocks/biomes match. This validates the chunkToNBT/nbtToChunk bridge.
 func TestStoreChunkRoundTrip(t *testing.T) {
@@ -123,6 +143,44 @@ func TestStoreChunkRoundTrip(t *testing.T) {
 	}
 	if decoded.lightReady {
 		t.Error("legacy chunk without isLightOn loaded as light-ready")
+	}
+}
+
+func TestChunkNBTRejectsMissingSections(t *testing.T) {
+	root := nbt.NewCompound().
+		Set(generatorVersionTag, nbt.Int(generatorVersion)).
+		Set("xPos", nbt.Int(0)).
+		Set("zPos", nbt.Int(0))
+	if _, err := nbtToChunk(root, 0, 0, 0, 0); err == nil {
+		t.Fatal("accepted chunk without sections")
+	}
+}
+
+func TestChunkNBTRejectsMalformedPaletteData(t *testing.T) {
+	root := chunkToNBT(GenerateFlat(0, 0))
+	sectionsTag, _ := root.Get("sections")
+	sections := sectionsTag.(nbt.List)
+	section := sections.Elems[0].(*nbt.Compound)
+	blocksTag, _ := section.Get("block_states")
+	blocks := blocksTag.(*nbt.Compound)
+	blocks.Set("data", nbt.LongArray{0})
+	if _, err := nbtToChunk(root, 0, 0, 0, 0); err == nil {
+		t.Fatal("accepted packed block data with the wrong length")
+	}
+}
+
+func TestChunkNBTRejectsUnknownBlock(t *testing.T) {
+	root := chunkToNBT(NewChunk(0, 0, BiomePlains))
+	sectionsTag, _ := root.Get("sections")
+	sections := sectionsTag.(nbt.List)
+	section := sections.Elems[0].(*nbt.Compound)
+	blocksTag, _ := section.Get("block_states")
+	blocks := blocksTag.(*nbt.Compound)
+	blocks.Set("palette", nbt.List{ElemID: nbt.TagCompound, Elems: []nbt.Tag{
+		nbt.NewCompound().Set("Name", nbt.String("minecraft:not_a_block")),
+	}})
+	if _, err := nbtToChunk(root, 0, 0, 0, 0); err == nil {
+		t.Fatal("accepted unknown block palette entry")
 	}
 }
 

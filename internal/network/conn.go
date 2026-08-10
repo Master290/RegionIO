@@ -4,6 +4,7 @@ package network
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -11,6 +12,8 @@ import (
 	"regionio/internal/protocol"
 	"regionio/internal/server"
 )
+
+const networkWriteTimeout = 30 * time.Second
 
 // Conn wraps a TCP connection with buffered reads and tracks protocol state.
 type Conn struct {
@@ -70,6 +73,10 @@ func (c *Conn) ReadPacket() (protocol.Packet, error) {
 func (c *Conn) Send(id int32, body []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if err := c.raw.SetWriteDeadline(time.Now().Add(networkWriteTimeout)); err != nil {
+		return err
+	}
+	defer c.raw.SetWriteDeadline(time.Time{})
 	return protocol.WritePacket(c.raw, c.compressionThreshold, id, body)
 }
 
@@ -84,8 +91,21 @@ func (c *Conn) SendWriter(id int32, w *protocol.Writer) error {
 func (c *Conn) SendFramed(frame []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	_, err := c.raw.Write(frame)
-	return err
+	if err := c.raw.SetWriteDeadline(time.Now().Add(networkWriteTimeout)); err != nil {
+		return err
+	}
+	defer c.raw.SetWriteDeadline(time.Time{})
+	for len(frame) > 0 {
+		n, err := c.raw.Write(frame)
+		if err != nil {
+			return err
+		}
+		if n <= 0 || n > len(frame) {
+			return io.ErrShortWrite
+		}
+		frame = frame[n:]
+	}
+	return nil
 }
 
 // CompressionThreshold returns the active threshold (-1 if disabled).

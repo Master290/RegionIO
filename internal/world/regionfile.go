@@ -147,26 +147,9 @@ func (r *RegionFile) WriteChunk(localX, localZ int, nbt []byte) error {
 	defer r.mu.Unlock()
 
 	idx := locationIndex(localX, localZ)
-	old := r.offsets[idx]
-	oldSectors := 0
-	if old != 0 {
-		oldSectors = int(old & 0xFF)
-	}
-
-	// Decide where to write. Reuse the existing allocation if it still fits;
-	// otherwise append at end-of-file.
-	var offset int
-	switch {
-	case old != 0 && oldSectors == sectorsNeeded:
-		offset = int(old >> 8)
-	case old != 0 && oldSectors >= sectorsNeeded:
-		// Keep the old offset but record the smaller count (the tail of the old
-		// allocation becomes unreferenced dead space; acceptable for now).
-		offset = int(old >> 8)
-	default:
-		// Append after the last used sector.
-		offset = r.endSectorLocked()
-	}
+	// Always use copy-on-write. Reusing the published allocation would let a
+	// crash during WriteAt corrupt the only readable copy of the chunk.
+	offset := r.endSectorLocked()
 
 	// Build the on-disk record: length + compression byte + compressed data,
 	// zero-padded to a sector boundary.
@@ -177,13 +160,23 @@ func (r *RegionFile) WriteChunk(localX, localZ int, nbt []byte) error {
 	if _, err := r.f.WriteAt(rec, off); err != nil {
 		return err
 	}
-
-	// Update the offset table and timestamp, then persist both tables.
-	r.offsets[idx] = uint32(offset<<8) | uint32(sectorsNeeded)
-	if err := r.writeTablesLocked(); err != nil {
+	// Publish the new location only after the complete record is durable. A
+	// crash before this sync leaves an unreachable tail and the old slot intact.
+	if err := r.f.Sync(); err != nil {
 		return err
 	}
-	return r.f.Sync()
+
+	location := uint32(offset<<8) | uint32(sectorsNeeded)
+	var locationBytes [4]byte
+	binary.BigEndian.PutUint32(locationBytes[:], location)
+	if _, err := r.f.WriteAt(locationBytes[:], int64(idx*4)); err != nil {
+		return err
+	}
+	if err := r.f.Sync(); err != nil {
+		return err
+	}
+	r.offsets[idx] = location
+	return nil
 }
 
 // writeTablesLocked writes the offset + timestamp tables back to the header.
@@ -205,6 +198,11 @@ func (r *RegionFile) writeTablesLocked() error {
 // i.e. where new chunk data can be appended. Caller holds r.mu.
 func (r *RegionFile) endSectorLocked() int {
 	maxUsed := headerSectors
+	if info, err := r.f.Stat(); err == nil {
+		if sectors := int((info.Size() + sectorSize - 1) / sectorSize); sectors > maxUsed {
+			maxUsed = sectors
+		}
+	}
 	for _, loc := range r.offsets {
 		if loc == 0 {
 			continue

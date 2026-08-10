@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
+	"time"
 
 	"regionio/internal/protocol"
 	"regionio/internal/server"
@@ -27,11 +29,17 @@ type handler struct {
 	streamer *streamer
 	// viewDistance is the client's requested view distance (from
 	// client_information), clamped; used to size the streamer.
-	viewDistance  int
-	session       *server.PlayerSession
-	knownPlayers  map[[16]byte]bool
-	knownEntities map[int32]visibleEntity
-	spawnY        float64
+	viewDistance    int
+	session         *server.PlayerSession
+	knownPlayers    map[[16]byte]bool
+	knownEntities   map[int32]visibleEntity
+	spawnY          float64
+	protocolVersion int32
+
+	keepAliveMu      sync.Mutex
+	keepAlivePending bool
+	keepAliveID      int64
+	keepAliveSent    time.Time
 
 	// Creative inventory state for block placement.
 	heldSlot int32    // selected hotbar index (0-8)
@@ -111,6 +119,7 @@ func (h *handler) handleHandshake(pkt protocol.Packet) error {
 
 	h.log.Debug("handshake",
 		"protocol", protoVer, "addr", addr, "port", port, "next", next)
+	h.protocolVersion = protoVer
 
 	switch next {
 	case protocol.NextStateStatus:

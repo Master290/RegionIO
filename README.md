@@ -55,6 +55,10 @@ go test -race ./internal/network ./internal/server ./internal/world \
   -run 'Test(Integration|BoundaryEdit|PlayerInfo|PlayerRegistry|Concurrent|Incremental|EncodeLight|Cache|Store|Eviction|Region|Ticket|Streamer|LoadSixteen)'
 # or run both gates:
 make verify
+
+# strict block/biome comparison; requires a fixture generated with Java 25:
+go run ./cmd/vanillacapture -server server.jar
+make parity
 ```
 
 The integration suite exercises four clients across two visibility regions:
@@ -80,8 +84,9 @@ an already admitted frame calculation completes atomically rather than being
 interrupted halfway. Unowned clean chunks remain as an LRU warm cache until
 capacity pressure evicts them. Structures, placed features, mob AI,
 authentication, inventory, and survival mechanics remain intentionally partial.
-The density router is vanilla-derived, while biome/surface/decoration layers
-still contain approximations and require stricter parity fixtures.
+The density router, configured carvers, and noise-router ore veins are
+vanilla-derived. Surface and biome selection are ported but still need broader
+runtime captures; ordinary decoration and structures remain approximations.
 
 ## Project layout
 

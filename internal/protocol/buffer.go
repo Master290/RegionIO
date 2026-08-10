@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"unicode/utf8"
 )
 
 // ErrShortBuffer is returned when a read would exceed the buffer's contents.
@@ -118,6 +119,12 @@ func (r *Reader) String() (string, error) {
 	b, err := r.readN(int(n))
 	if err != nil {
 		return "", err
+	}
+	if !utf8.Valid(b) {
+		return "", ErrInvalidString
+	}
+	if utf8.RuneCount(b) > MaxStringLen {
+		return "", ErrStringTooLong
 	}
 	return string(b), nil
 }

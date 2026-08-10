@@ -15,6 +15,8 @@ func TestQuantize(t *testing.T) {
 		{1.0, 10000},
 		{-0.15, -1500},
 		{0.55, 5500},
+		{0.00005, 1},
+		{-0.00005, 0},
 	}
 	for _, c := range cases {
 		if got := quantize(c.v); got != c.want {
@@ -23,17 +25,41 @@ func TestQuantize(t *testing.T) {
 	}
 }
 
+func TestParameterTableDistanceOffsetAndTies(t *testing.T) {
+	pointRange := func(value int64) [AxisCount]ClimateRange {
+		var ranges [AxisCount]ClimateRange
+		for i := range ranges {
+			ranges[i] = ClimateRange{Min: 0, Max: 0}
+		}
+		ranges[0] = ClimateRange{Min: value, Max: value}
+		return ranges
+	}
+	point := TargetPoint{Temperature: 5}
+	table := NewParameterTable([]BiomeParameter{
+		{Name: "offset-wins", Ranges: pointRange(0), Offset: 0},         // fitness 25
+		{Name: "range-loses", Ranges: pointRange(5), Offset: 10},        // fitness 100
+		{Name: "same-fitness-later", Ranges: pointRange(10), Offset: 0}, // fitness 25
+	})
+	if got := table.FindBiome(point); got != "offset-wins" {
+		t.Fatalf("FindBiome = %q, want first minimum-fitness entry", got)
+	}
+	if got := fitDistance(point, pointRange(5), 0); got != 0 {
+		t.Fatalf("point inside exact range has fitness %d", got)
+	}
+}
+
 // TestFitDistanceZero confirms identical points are zero-distance and distinct
 // points are positive; the exact value is not asserted to stay robust to
 // representation choices.
 func TestFitDistance(t *testing.T) {
 	a := NewTargetPoint(0, 0, 0, 0, 0, 0)
-	if got := fitDistance(a, a); got != 0 {
+	ranges := [AxisCount]ClimateRange{}
+	if got := fitDistance(a, ranges, 0); got != 0 {
 		t.Errorf("fitDistance(a,a) = %d, want 0", got)
 	}
 	b := NewTargetPoint(1, 0, 0, 0, 0, 0)
 	// 10000^2 per axis of difference.
-	if got := fitDistance(a, b); got != 10000*10000 {
+	if got := fitDistance(b, ranges, 0); got != 10000*10000 {
 		t.Errorf("fitDistance for 1.0 temp diff = %d, want %d", got, int64(10000*10000))
 	}
 }
@@ -44,8 +70,8 @@ func TestRangeContains(t *testing.T) {
 	if !r.contains(0) {
 		t.Error("min should be inclusive")
 	}
-	if r.contains(100) {
-		t.Error("max should be exclusive")
+	if !r.contains(100) {
+		t.Error("max should be inclusive")
 	}
 	if !r.contains(50) {
 		t.Error("interior should contain")

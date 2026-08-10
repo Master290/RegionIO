@@ -153,6 +153,9 @@ func validateConfig(cfg Config) error {
 	if cfg.MaxViewDistance < 2 || cfg.MaxViewDistance > 16 {
 		return fmt.Errorf("server: max view distance must be between 2 and 16")
 	}
+	if cfg.CompressionThreshold < -1 || cfg.CompressionThreshold > protocol.MaxPacketSize {
+		return fmt.Errorf("server: compression threshold must be -1 or between 0 and %d", protocol.MaxPacketSize)
+	}
 	return nil
 }
 

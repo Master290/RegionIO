@@ -9,16 +9,13 @@ import "math"
 // vanilla fitDistance metric.
 //
 // Coordinates are quantized to long via Math.round(v * 10000.0) exactly as the
-// vanilla Climate.quantizeCoord does, and fitDistance is the sum of squared
-// coordinate differences (no per-axis weighting) — matching the vanilla
-// TargetPoint/ParameterPoint fitness. Range membership uses the inclusive-lower
-// / exclusive-upper half-open convention vanilla applies to each axis band.
+// vanilla Climate.quantizeCoord does. ParameterPoint fitness is the sum of the
+// squared distance to each inclusive axis range and the squared offset.
 
-// quantize converts a climate coordinate to its long representation. Vanilla's
-// Climate.quantizeCoord is Math.round(v * 10000.0); Go's math.Round halves
-// away from zero, matching Java for these inputs.
+// quantize converts a climate coordinate to its long representation. Java's
+// Math.round is floor(x+0.5), unlike Go's math.Round for negative half values.
 func quantize(v float64) int64 {
-	return int64(math.Round(v * 10000.0))
+	return int64(math.Floor(v*10000.0 + 0.5))
 }
 
 // Quantize is the exported form of quantize, for the biome table builder in the
@@ -38,39 +35,42 @@ type TargetPoint struct {
 // NewTargetPoint quantizes six float climate coordinates into a TargetPoint.
 func NewTargetPoint(temp, humid, cont, ero, weird, depth float64) TargetPoint {
 	return TargetPoint{
-		Temperature:    quantize(temp),
-		Humidity:       quantize(humid),
+		Temperature:     quantize(temp),
+		Humidity:        quantize(humid),
 		Continentalness: quantize(cont),
-		Erosion:        quantize(ero),
-		Weirdness:      quantize(weird),
-		Depth:          quantize(depth),
+		Erosion:         quantize(ero),
+		Weirdness:       quantize(weird),
+		Depth:           quantize(depth),
 	}
 }
 
-// fitDistance is the vanilla Climate.fitness metric: the sum of squared
-// differences between two points across all six axes. The squared sum is the
-// comparison key; smaller is a better match.
-func fitDistance(a, b TargetPoint) int64 {
-	dx := a.Temperature - b.Temperature
-	dh := a.Humidity - b.Humidity
-	dc := a.Continentalness - b.Continentalness
-	de := a.Erosion - b.Erosion
-	dw := a.Weirdness - b.Weirdness
-	dd := a.Depth - b.Depth
-	return dx*dx + dh*dh + dc*dc + de*de + dw*dw + dd*dd
+// fitDistance is the vanilla distance from a point to a parameter range. A
+// coordinate inside a range contributes zero; offset is applied separately.
+func fitDistance(point TargetPoint, ranges [AxisCount]ClimateRange, offset int64) int64 {
+	values := [AxisCount]int64{point.Temperature, point.Humidity, point.Continentalness, point.Erosion, point.Weirdness, point.Depth}
+	var total int64
+	for i, value := range values {
+		r := ranges[i]
+		var distance int64
+		if value < r.Min {
+			distance = r.Min - value
+		} else if value > r.Max {
+			distance = value - r.Max
+		}
+		total += distance * distance
+	}
+	return total + offset*offset
 }
 
-// ClimateRange is one axis's [min, max] half-open band on a biome parameter.
+// ClimateRange is one axis's inclusive [min, max] band on a biome parameter.
 type ClimateRange struct {
 	Min, Max int64
 }
 
-// contains reports whether the quantized coordinate v falls in [min, max).
-func (r ClimateRange) contains(v int64) bool { return v >= r.Min && v < r.Max }
+// contains reports whether the quantized coordinate v falls in [min, max].
+func (r ClimateRange) contains(v int64) bool { return v >= r.Min && v <= r.Max }
 
 // BiomeParameter is one biome entry's full climate signature plus its name.
-// Each axis is a half-open range; offset is the extra depth offset (always 0 in
-// the overworld surface table, but kept for parity/future cave biomes).
 type BiomeParameter struct {
 	Name string
 	// ranges[0..5] = temperature, humidity, continentalness, erosion, weirdness, depth.
@@ -78,73 +78,38 @@ type BiomeParameter struct {
 	Offset int64
 }
 
-// paramCentre returns the centre of the entry's climate ranges as a TargetPoint
-// (depth centre folded in). Pre-computing this once lets the finder compare by
-// distance to the centre, then verify range membership — mirroring how the
-// vanilla finder prunes by fitness then tests the band.
-func (p *BiomeParameter) centre() TargetPoint {
-	mid := func(r ClimateRange) int64 { return (r.Min + r.Max) / 2 }
-	return TargetPoint{
-		Temperature:     mid(p.Ranges[0]),
-		Humidity:        mid(p.Ranges[1]),
-		Continentalness: mid(p.Ranges[2]),
-		Erosion:         mid(p.Ranges[3]),
-		Weirdness:       mid(p.Ranges[4]),
-		Depth:           mid(p.Ranges[5]),
-	}
-}
-
 // ParameterTable is the set of biome parameters the finder searches.
 type ParameterTable struct {
 	entries []tableEntry
 }
 
-// tableEntry pairs a parameter with its precomputed centre for fast pruning.
 type tableEntry struct {
-	param   BiomeParameter
-	centre  TargetPoint
+	param BiomeParameter
 }
 
 // NewParameterTable builds a searchable table from raw biome parameters.
 func NewParameterTable(params []BiomeParameter) *ParameterTable {
 	t := &ParameterTable{entries: make([]tableEntry, len(params))}
 	for i, p := range params {
-		t.entries[i] = tableEntry{param: p, centre: p.centre()}
+		t.entries[i] = tableEntry{param: p}
 	}
 	return t
 }
 
-// FindBiome returns the name of the biome whose range best matches point, by
-// the vanilla fitDistance metric among entries whose ranges all contain point.
-// If no entry's ranges contain point (should not happen for the overworld table,
-// which tiles climate space), it falls back to the nearest centre.
+// FindBiome returns the parameter with the lowest vanilla fitness. Table order
+// is the deterministic tie breaker because equal fitness never replaces best.
 func (t *ParameterTable) FindBiome(point TargetPoint) string {
 	var best string
 	bestDist := int64(math.MaxInt64)
-	var fallback string
-	fallbackDist := int64(math.MaxInt64)
 
 	for _, e := range t.entries {
-		// Distance to centre is the pruning key (precomputed). Track it always
-		// so we have a fallback if no range contains the point.
-		d := fitDistance(point, e.centre)
-		if d < fallbackDist {
-			fallbackDist = d
-			fallback = e.param.Name
-		}
-		// Only consider entries whose ranges actually contain the point.
-		if !containsAll(e.param.Ranges, point) {
-			continue
-		}
+		d := fitDistance(point, e.param.Ranges, e.param.Offset)
 		if d < bestDist {
 			bestDist = d
 			best = e.param.Name
 		}
 	}
-	if best != "" {
-		return best
-	}
-	return fallback
+	return best
 }
 
 // containsAll reports whether every range contains its corresponding coordinate.
