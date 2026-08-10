@@ -43,6 +43,14 @@ func NewVanillaGenerator(seed int64) Generator {
 }
 
 func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) *Chunk {
+	return generateVanillaDecorated(od, fluidPicker, veins, carver, seed, cx, cz, true)
+}
+
+func generateVanillaWithoutDecoration(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) *Chunk {
+	return generateVanillaDecorated(od, fluidPicker, veins, carver, seed, cx, cz, false)
+}
+
+func generateVanillaDecorated(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32, withDecoration bool) *Chunk {
 	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
@@ -171,7 +179,9 @@ func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPi
 		}
 	}
 	fillBiomes3D(c, od, s2D, baseX, baseZ)
-	decorate(c, od, cx, cz, seed, &surfTop, &grass, &biomeName)
+	if withDecoration {
+		decorate(c, od, cx, cz, seed, &surfTop, &grass, &biomeName)
+	}
 	return c
 }
 
@@ -468,7 +478,7 @@ func bedrockAt(rng *chunkRand, d int) bool {
 func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
 	r := newChunkRand(cx, cz, seed)
 
-	placeOres(c, &r)
+	placeVanillaOres(c, seed, cx, cz, biomeName)
 	placeFlora(c, &r, surfTop, grass, biomeName)
 	placeDesertFeatures(c, &r, surfTop, biomeName)
 	placeRocks(c, &r, surfTop, grass, biomeName)

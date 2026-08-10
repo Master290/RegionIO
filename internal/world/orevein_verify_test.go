@@ -1,6 +1,10 @@
 package world
 
-import "testing"
+import (
+	"testing"
+
+	"regionio/internal/worldgen"
+)
 
 // Ore-vein block states, from OreVeinifier.VeinType. Copper's ore is the plain
 // stone variant and iron's is the deepslate one; neither switches with depth.
@@ -21,7 +25,18 @@ const (
 // the sign of the veininess noise but its window comes from the type, so a
 // single block outside a window means the guard is wrong.
 func TestOreVeins(t *testing.T) {
-	gen := NewVanillaGenerator(12345)
+	const seed = 12345
+	od, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	picker := worldgen.OverworldFluidPicker(od.SeaLevel)
+	veins := worldgen.NewOreVeinifier(od)
+	carver, err := worldgen.NewCarver(od, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initCarverReplaceable(carver.ReplaceableBlocks())
 	counts := map[uint16]int{}
 	lowest := map[uint16]int{}
 	highest := map[uint16]int{}
@@ -33,7 +48,10 @@ func TestOreVeins(t *testing.T) {
 	}
 	for cx := int32(-60); cx <= 60; cx += 20 {
 		for cz := int32(-60); cz <= 60; cz += 20 {
-			ch := gen(cx, cz)
+			// Call the terrain/material pass directly and skip decorate. Ordinary
+			// placed ores share several states with mega-veins and cannot be
+			// distinguished by block ID after decoration.
+			ch := generateVanillaWithoutDecoration(od, picker, veins, carver, seed, cx, cz)
 			for wy := MinY; wy < 60; wy++ {
 				for lx := 0; lx < 16; lx++ {
 					for lz := 0; lz < 16; lz++ {

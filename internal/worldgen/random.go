@@ -196,6 +196,23 @@ func (r *Legacy) SetLargeFeatureSeed(seed int64, chunkX, chunkZ int) {
 	r.SetSeed(int64(chunkX)*a ^ int64(chunkZ)*b ^ seed)
 }
 
+// SetDecorationSeed is WorldgenRandom.setDecorationSeed. It returns the seed
+// used for the chunk's feature stages; individual features derive their seeds
+// from this value, stage index, and feature index.
+func (r *Legacy) SetDecorationSeed(seed int64, blockX, blockZ int) int64 {
+	r.SetSeed(seed)
+	a := r.NextLong() | 1
+	b := r.NextLong() | 1
+	decorationSeed := int64(blockX)*a + int64(blockZ)*b ^ seed
+	r.SetSeed(decorationSeed)
+	return decorationSeed
+}
+
+// SetFeatureSeed selects one configured feature in one decoration stage.
+func (r *Legacy) SetFeatureSeed(decorationSeed int64, featureIndex, stage int) {
+	r.SetSeed(decorationSeed + int64(featureIndex) + int64(10000*stage))
+}
+
 // next returns the top `b` bits of the next LCG state.
 func (r *Legacy) next(b uint) int32 {
 	r.seed = (r.seed*lcgMultiplier + lcgAddend) & lcgMask
