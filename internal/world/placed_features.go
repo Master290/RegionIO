@@ -54,8 +54,8 @@ func placeVanillaOres(c *Chunk, seed int64, cx, cz int32, biomes *[16][16]string
 				}
 				attempts := plan.Count.Sample(random)
 				for attempt := 0; attempt < attempts; attempt++ {
-					x := int(random.NextIntN(16))
-					z := int(random.NextIntN(16))
+					x := int(cx)*16 + int(random.NextIntN(16))
+					z := int(cz)*16 + int(random.NextIntN(16))
 					y := plan.SampleY(random, MinY, WorldHeight)
 					placeOreEllipsoid(c, random, x, y, z, config.Size, config.DiscardAirExposure, targets)
 				}
@@ -157,7 +157,8 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 		minY, maxY := int(math.Floor(sphere.y-sphere.radius)), int(math.Floor(sphere.y+sphere.radius))
 		minZ, maxZ := int(math.Floor(sphere.z-sphere.radius)), int(math.Floor(sphere.z+sphere.radius))
 		for x := minX; x <= maxX; x++ {
-			if x < 0 || x >= 16 {
+			localX := x - int(c.X)*16
+			if localX < 0 || localX >= 16 {
 				continue
 			}
 			dx := (float64(x) + 0.5 - sphere.x) / sphere.radius
@@ -173,21 +174,22 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 					continue
 				}
 				for z := minZ; z <= maxZ; z++ {
-					if z < 0 || z >= 16 {
+					localZ := z - int(c.Z)*16
+					if localZ < 0 || localZ >= 16 {
 						continue
 					}
 					dz := (float64(z) + 0.5 - sphere.z) / sphere.radius
-					pos := [3]int{x, y, z}
+					pos := [3]int{localX, y, localZ}
 					if dx*dx+dy*dy+dz*dz >= 1 || visited[pos] {
 						continue
 					}
 					visited[pos] = true
-					current := c.GetBlock(x, y, z)
+					current := c.GetBlock(localX, y, localZ)
 					for _, target := range targets {
-						if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAir(c, x, y, z) {
+						if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAir(c, localX, y, localZ) {
 							continue
 						}
-						c.SetBlock(x, y, z, target.state)
+						c.SetBlock(localX, y, localZ, target.state)
 						break
 					}
 				}
