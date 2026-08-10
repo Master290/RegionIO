@@ -53,6 +53,19 @@ type OreTarget struct {
 	} `json:"target"`
 }
 
+type SpringFeatureConfig struct {
+	HoleCount          int        `json:"hole_count"`
+	RequiresBlockBelow bool       `json:"requires_block_below"`
+	RockCount          int        `json:"rock_count"`
+	State              BlockState `json:"state"`
+	ValidBlocks        []string   `json:"valid_blocks"`
+}
+
+type BlockState struct {
+	Name       string            `json:"Name"`
+	Properties map[string]string `json:"Properties"`
+}
+
 type PlacementPlan struct {
 	Count              CountProvider
 	RarityChance       int
@@ -102,6 +115,15 @@ func (p PlacementPlan) SampleY(r RandomSource, minY, height int) int {
 		triangle := span - plateau
 		return lo + int(r.NextIntN(int32((triangle+1)/2))) + int(r.NextIntN(int32(triangle/2+1)))
 	}
+	if p.HeightDistribution == "minecraft:very_biased_to_bottom" {
+		const inner = 8
+		outer := span - inner + 1
+		if outer <= 0 {
+			return lo
+		}
+		bound := int(r.NextIntN(int32(outer))) + inner
+		return lo + int(r.NextIntN(int32(bound)))
+	}
 	return lo + int(r.NextIntN(int32(span)))
 }
 
@@ -140,6 +162,21 @@ func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {
 	}
 	if config.Size < 1 || len(config.Targets) == 0 {
 		return OreFeatureConfig{}, fmt.Errorf("worldgen: invalid ore config %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:spring_feature" {
+		return SpringFeatureConfig{}, fmt.Errorf("worldgen: %s is not a spring feature", name)
+	}
+	var config SpringFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return SpringFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.State.Name == "" || len(config.ValidBlocks) == 0 || config.HoleCount < 0 || config.RockCount < 0 {
+		return SpringFeatureConfig{}, fmt.Errorf("worldgen: invalid spring config %s", name)
 	}
 	return config, nil
 }
@@ -191,7 +228,8 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 			if err != nil {
 				return PlacementPlan{}, err
 			}
-			if value.Height.Type != "minecraft:uniform" && value.Height.Type != "minecraft:trapezoid" {
+			if value.Height.Type != "minecraft:uniform" && value.Height.Type != "minecraft:trapezoid" &&
+				value.Height.Type != "minecraft:very_biased_to_bottom" {
 				return PlacementPlan{}, fmt.Errorf("worldgen: %s unsupported height distribution %q", name, value.Height.Type)
 			}
 			plan.HeightDistribution, plan.MinY, plan.MaxY = value.Height.Type, min, max

@@ -33,4 +33,12 @@ func TestFeatureDatapackLoadsAndLinks(t *testing.T) {
 	if err != nil || plan.Count.Min != 7 || plan.Count.Max != 7 || plan.MinY.AboveBottom == nil {
 		t.Fatalf("diamond placement = %+v, err=%v", plan, err)
 	}
+	spring, err := set.Spring("minecraft:spring_water")
+	if err != nil || spring.State.Name != "minecraft:water" || spring.RockCount != 4 || spring.HoleCount != 1 {
+		t.Fatalf("spring water = %+v, err=%v", spring, err)
+	}
+	lavaPlan, err := set.Placement("minecraft:spring_lava")
+	if err != nil || lavaPlan.HeightDistribution != "minecraft:very_biased_to_bottom" {
+		t.Fatalf("spring lava placement = %+v, err=%v", lavaPlan, err)
+	}
 }

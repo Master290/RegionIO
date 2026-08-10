@@ -479,6 +479,7 @@ func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64,
 	r := newChunkRand(cx, cz, seed)
 
 	placeVanillaOres(c, seed, cx, cz, biomeName)
+	placeVanillaSprings(c, seed, cx, cz, biomeName)
 	placeFlora(c, &r, surfTop, grass, biomeName)
 	placeDesertFeatures(c, &r, surfTop, biomeName)
 	placeRocks(c, &r, surfTop, grass, biomeName)

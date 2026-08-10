@@ -89,10 +89,10 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
 	angle := float64(random.NextFloat()) * math.Pi
 	extent := float64(size) / 8.0
-	x0 := float64(originX+8) + math.Sin(angle)*extent
-	x1 := float64(originX+8) - math.Sin(angle)*extent
-	z0 := float64(originZ+8) + math.Cos(angle)*extent
-	z1 := float64(originZ+8) - math.Cos(angle)*extent
+	x0 := float64(originX) + math.Sin(angle)*extent
+	x1 := float64(originX) - math.Sin(angle)*extent
+	z0 := float64(originZ) + math.Cos(angle)*extent
+	z1 := float64(originZ) - math.Cos(angle)*extent
 	y0 := float64(originY + int(random.NextIntN(3)) - 2)
 	y1 := float64(originY + int(random.NextIntN(3)) - 2)
 
