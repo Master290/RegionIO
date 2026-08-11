@@ -123,8 +123,10 @@ type FeaturePosition struct {
 }
 
 type PlacementContext struct {
-	MinY, Height int
-	BiomeAllows  func(FeaturePosition) bool
+	MinY, Height   int
+	BiomeAllows    func(FeaturePosition) bool
+	HeightAt       func(string, int, int) int
+	BlockPredicate func(json.RawMessage, FeaturePosition) (bool, error)
 }
 
 type CountProvider struct {
@@ -549,6 +551,75 @@ func (s *FeatureSet) PlacementPositions(name string, r RandomSource, origin Feat
 			}
 			position.Y = plan.SampleY(r, context.MinY, context.Height)
 			return next(position)
+		case "minecraft:heightmap":
+			var value struct {
+				Heightmap string `json:"heightmap"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Heightmap == "" {
+				return fmt.Errorf("worldgen: %s invalid heightmap placement", name)
+			}
+			if context.HeightAt == nil {
+				return fmt.Errorf("worldgen: %s heightmap placement requires HeightAt", name)
+			}
+			position.Y = context.HeightAt(value.Heightmap, position.X, position.Z)
+			if position.Y > context.MinY {
+				return next(position)
+			}
+			return nil
+		case "minecraft:surface_water_depth_filter":
+			var value struct {
+				MaxWaterDepth int `json:"max_water_depth"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.MaxWaterDepth < 0 {
+				return fmt.Errorf("worldgen: %s invalid surface water depth filter", name)
+			}
+			if context.HeightAt == nil {
+				return fmt.Errorf("worldgen: %s surface water depth filter requires HeightAt", name)
+			}
+			oceanFloor := context.HeightAt("OCEAN_FLOOR", position.X, position.Z)
+			worldSurface := context.HeightAt("WORLD_SURFACE", position.X, position.Z)
+			if worldSurface-oceanFloor <= value.MaxWaterDepth {
+				return next(position)
+			}
+			return nil
+		case "minecraft:random_offset":
+			var value struct {
+				XZSpread json.RawMessage `json:"xz_spread"`
+				YSpread  json.RawMessage `json:"y_spread"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
+				return err
+			}
+			xz, err := parsePlacementIntProvider(value.XZSpread)
+			if err != nil {
+				return fmt.Errorf("worldgen: %s xz spread: %w", name, err)
+			}
+			y, err := parsePlacementIntProvider(value.YSpread)
+			if err != nil {
+				return fmt.Errorf("worldgen: %s y spread: %w", name, err)
+			}
+			position.X += xz.Sample(r)
+			position.Y += y.Sample(r)
+			position.Z += xz.Sample(r)
+			return next(position)
+		case "minecraft:block_predicate_filter":
+			var value struct {
+				Predicate json.RawMessage `json:"predicate"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || len(value.Predicate) == 0 {
+				return fmt.Errorf("worldgen: %s invalid block predicate filter", name)
+			}
+			if context.BlockPredicate == nil {
+				return fmt.Errorf("worldgen: %s block predicate filter requires BlockPredicate", name)
+			}
+			ok, err := context.BlockPredicate(value.Predicate, position)
+			if err != nil {
+				return err
+			}
+			if ok {
+				return next(position)
+			}
+			return nil
 		case "minecraft:biome":
 			if context.BiomeAllows == nil || context.BiomeAllows(position) {
 				return next(position)
@@ -562,6 +633,75 @@ func (s *FeatureSet) PlacementPositions(name string, r RandomSource, origin Feat
 		return nil, err
 	}
 	return result, nil
+}
+
+type placementIntProvider struct {
+	typeName          string
+	min, max, plateau int
+	mean, deviation   float32
+}
+
+func (p placementIntProvider) Sample(r RandomSource) int {
+	switch p.typeName {
+	case "minecraft:uniform":
+		return p.min + int(r.NextIntN(int32(p.max-p.min+1)))
+	case "minecraft:trapezoid":
+		if p.plateau == 0 && p.max == -p.min {
+			return int(r.NextIntN(int32(p.max+1))) - int(r.NextIntN(int32(p.max+1)))
+		}
+		rangeSize := p.max - p.min
+		if p.plateau == rangeSize {
+			return p.min + int(r.NextIntN(int32(rangeSize+1)))
+		}
+		left := (rangeSize - p.plateau) / 2
+		right := rangeSize - left
+		return p.min + int(r.NextIntN(int32(right+1))) + int(r.NextIntN(int32(left+1)))
+	case "minecraft:clamped_normal":
+		value := float32(r.NextGaussian())*p.deviation + p.mean
+		if value < float32(p.min) {
+			value = float32(p.min)
+		} else if value > float32(p.max) {
+			value = float32(p.max)
+		}
+		return int(value)
+	default:
+		return p.min
+	}
+}
+
+func parsePlacementIntProvider(raw json.RawMessage) (placementIntProvider, error) {
+	var fixed int
+	if err := json.Unmarshal(raw, &fixed); err == nil {
+		return placementIntProvider{min: fixed, max: fixed}, nil
+	}
+	var value struct {
+		Type            string `json:"type"`
+		Min             int    `json:"min"`
+		Max             int    `json:"max"`
+		MinInclusive    int    `json:"min_inclusive"`
+		MaxInclusive    int    `json:"max_inclusive"`
+		Plateau         int    `json:"plateau"`
+		Mean, Deviation float32
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return placementIntProvider{}, err
+	}
+	provider := placementIntProvider{typeName: value.Type, plateau: value.Plateau, mean: value.Mean, deviation: value.Deviation}
+	switch value.Type {
+	case "minecraft:trapezoid":
+		provider.min, provider.max = value.Min, value.Max
+		if provider.max < provider.min || provider.plateau < 0 || provider.plateau > provider.max-provider.min {
+			return placementIntProvider{}, fmt.Errorf("invalid trapezoid provider %s", raw)
+		}
+	case "minecraft:uniform", "minecraft:clamped_normal":
+		provider.min, provider.max = value.MinInclusive, value.MaxInclusive
+		if provider.max < provider.min || value.Type == "minecraft:clamped_normal" && provider.deviation <= 0 {
+			return placementIntProvider{}, fmt.Errorf("invalid %s provider %s", value.Type, raw)
+		}
+	default:
+		return placementIntProvider{}, fmt.Errorf("unsupported int provider %s", raw)
+	}
+	return provider, nil
 }
 
 func placementHeightPlan(raw json.RawMessage) (PlacementPlan, error) {

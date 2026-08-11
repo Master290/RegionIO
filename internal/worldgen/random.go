@@ -8,6 +8,7 @@ package worldgen
 import (
 	"crypto/md5"
 	"encoding/binary"
+	"math"
 	"math/bits"
 )
 
@@ -50,6 +51,7 @@ type RandomSource interface {
 	NextDouble() float64
 	NextFloat() float32
 	NextBoolean() bool
+	NextGaussian() float64
 	// ForkPositional returns a factory for deriving deterministic child sources
 	// (used to seed noise octaves by name).
 	ForkPositional() PositionalRandomFactory
@@ -77,7 +79,11 @@ func positionSeed(x, y, z int) int64 {
 // --- Xoroshiro128++ ---
 
 // Xoroshiro is XoroshiroRandomSource backed by Xoroshiro128PlusPlus.
-type Xoroshiro struct{ lo, hi uint64 }
+type Xoroshiro struct {
+	lo, hi       uint64
+	gaussian     float64
+	haveGaussian bool
+}
 
 // NewXoroshiro seeds a Xoroshiro source from a 64-bit seed.
 func NewXoroshiro(seed int64) *Xoroshiro {
@@ -132,6 +138,25 @@ func (x *Xoroshiro) NextFloat() float32 {
 
 func (x *Xoroshiro) NextBoolean() bool { return x.nextBits()&1 != 0 }
 
+func (x *Xoroshiro) NextGaussian() float64 {
+	if x.haveGaussian {
+		x.haveGaussian = false
+		return x.gaussian
+	}
+	for {
+		u := 2*x.NextDouble() - 1
+		v := 2*x.NextDouble() - 1
+		s := u*u + v*v
+		if s == 0 || s >= 1 {
+			continue
+		}
+		factor := math.Sqrt(-2 * math.Log(s) / s)
+		x.gaussian = v * factor
+		x.haveGaussian = true
+		return u * factor
+	}
+}
+
 // ConsumeCount advances the underlying generator n times.
 func (x *Xoroshiro) ConsumeCount(n int) {
 	for i := 0; i < n; i++ {
@@ -168,7 +193,11 @@ const (
 )
 
 // Legacy is LegacyRandomSource: java.util.Random's 48-bit LCG.
-type Legacy struct{ seed uint64 }
+type Legacy struct {
+	seed         uint64
+	gaussian     float64
+	haveGaussian bool
+}
 
 // NewLegacy seeds a Legacy source, applying Java's seed scramble.
 func NewLegacy(seed int64) *Legacy {
@@ -180,6 +209,7 @@ func NewLegacy(seed int64) *Legacy {
 // SetSeed is java.util.Random.setSeed, which worldgen reseeds in place.
 func (r *Legacy) SetSeed(seed int64) {
 	r.seed = (uint64(seed) ^ lcgMultiplier) & lcgMask
+	r.haveGaussian = false
 }
 
 // SetLargeFeatureSeed is WorldgenRandom.setLargeFeatureSeed: seed from the
@@ -245,6 +275,25 @@ func (r *Legacy) NextDouble() float64 {
 
 func (r *Legacy) NextFloat() float32 { return float32(r.next(24)) * 0x1.0p-24 }
 func (r *Legacy) NextBoolean() bool  { return r.next(1) != 0 }
+
+func (r *Legacy) NextGaussian() float64 {
+	if r.haveGaussian {
+		r.haveGaussian = false
+		return r.gaussian
+	}
+	for {
+		u := 2*r.NextDouble() - 1
+		v := 2*r.NextDouble() - 1
+		s := u*u + v*v
+		if s == 0 || s >= 1 {
+			continue
+		}
+		factor := math.Sqrt(-2 * math.Log(s) / s)
+		r.gaussian = v * factor
+		r.haveGaussian = true
+		return u * factor
+	}
+}
 
 // ConsumeCount advances the LCG n times.
 func (r *Legacy) ConsumeCount(n int) {

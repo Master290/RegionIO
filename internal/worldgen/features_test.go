@@ -143,3 +143,90 @@ func TestPlacementPositionsPreservesModifierOrder(t *testing.T) {
 		t.Fatalf("positions = %v, want %v", got, want)
 	}
 }
+
+func TestPlacementPositionsWorldAwareModifiers(t *testing.T) {
+	modifier := func(raw string) PlacementModifier {
+		var value PlacementModifier
+		value.Raw = json.RawMessage(raw)
+		if err := json.Unmarshal(value.Raw, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	set := &FeatureSet{Placed: map[string]PlacedFeature{
+		"test": {Placement: []PlacementModifier{
+			modifier(`{"type":"minecraft:heightmap","heightmap":"MOTION_BLOCKING"}`),
+			modifier(`{"type":"minecraft:surface_water_depth_filter","max_water_depth":2}`),
+			modifier(`{"type":"minecraft:block_predicate_filter","predicate":{"type":"minecraft:matching_blocks","blocks":"minecraft:air"}}`),
+		}},
+	}}
+	var calls []string
+	got, err := set.PlacementPositions("test", NewLegacy(1), FeaturePosition{X: 8, Y: 0, Z: 9}, PlacementContext{
+		MinY: -64,
+		HeightAt: func(kind string, x, z int) int {
+			calls = append(calls, kind)
+			if kind == "MOTION_BLOCKING" {
+				return 42
+			}
+			if kind == "OCEAN_FLOOR" {
+				return 40
+			}
+			return 41
+		},
+		BlockPredicate: func(predicate json.RawMessage, position FeaturePosition) (bool, error) {
+			if string(predicate) != `{"type":"minecraft:matching_blocks","blocks":"minecraft:air"}` {
+				t.Fatalf("predicate = %s", predicate)
+			}
+			return position.Y == 42, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []FeaturePosition{{X: 8, Y: 42, Z: 9}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("positions = %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(calls, []string{"MOTION_BLOCKING", "OCEAN_FLOOR", "WORLD_SURFACE"}) {
+		t.Fatalf("heightmap calls = %v", calls)
+	}
+}
+
+func TestPlacementPositionsMatchesVanillaRandomOffsetVector(t *testing.T) {
+	modifier := func(raw string) PlacementModifier {
+		var value PlacementModifier
+		value.Raw = json.RawMessage(raw)
+		if err := json.Unmarshal(value.Raw, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	set := &FeatureSet{Placed: map[string]PlacedFeature{
+		"test": {Placement: []PlacementModifier{
+			modifier(`{"type":"minecraft:count","count":3}`),
+			modifier(`{"type":"minecraft:random_offset","xz_spread":{"type":"minecraft:trapezoid","max":4,"min":-4,"plateau":0},"y_spread":{"type":"minecraft:trapezoid","max":2,"min":-2,"plateau":0}}`),
+		}},
+	}}
+	got, err := set.PlacementPositions("test", NewLegacy(12345), FeaturePosition{X: 32, Y: 10, Z: -16}, PlacementContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []FeaturePosition{{33, 10, -20}, {30, 11, -16}, {31, 11, -17}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("positions = %v, want vanilla %v", got, want)
+	}
+}
+
+func TestClampedNormalIntMatchesVanillaRuntimeVector(t *testing.T) {
+	provider, err := parsePlacementIntProvider(json.RawMessage(`{"type":"minecraft:clamped_normal","mean":0.0,"deviation":3.0,"min_inclusive":-10,"max_inclusive":10}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewLegacy(12345)
+	want := []int{0, 1, 2, -1, -3, -2, -2, 6}
+	for i, value := range want {
+		if got := provider.Sample(r); got != value {
+			t.Fatalf("sample[%d] = %d, want vanilla %d", i, got, value)
+		}
+	}
+}

@@ -71,3 +71,12 @@ func TestLegacyVectors(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacySetSeedResetsGaussianCache(t *testing.T) {
+	r := NewLegacy(12345)
+	first := r.NextGaussian()
+	r.SetSeed(12345)
+	if got := r.NextGaussian(); got != first {
+		t.Fatalf("NextGaussian after SetSeed = %v, want %v", got, first)
+	}
+}
