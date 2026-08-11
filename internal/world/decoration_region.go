@@ -129,13 +129,17 @@ func (r *decorationRegion) sourceBiomes() []string {
 }
 
 func (r *decorationRegion) placementContext(biomeAllows func(worldgen.FeaturePosition) bool) worldgen.PlacementContext {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		panic("world: loading feature datapack: " + err.Error())
+	}
 	return worldgen.PlacementContext{
 		MinY:        MinY,
 		Height:      WorldHeight,
 		BiomeAllows: biomeAllows,
 		HeightAt:    r.heightAt,
 		BlockPredicate: func(predicate json.RawMessage, position worldgen.FeaturePosition) (bool, error) {
-			return false, fmt.Errorf("world: unsupported block predicate at (%d,%d,%d): %s", position.X, position.Y, position.Z, predicate)
+			return r.testBlockPredicate(set, predicate, position)
 		},
 	}
 }
