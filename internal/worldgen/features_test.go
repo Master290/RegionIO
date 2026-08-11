@@ -80,3 +80,20 @@ func TestFeatureStepsRejectsCycles(t *testing.T) {
 		t.Fatal("cyclic feature order succeeded")
 	}
 }
+
+func TestPlacementHeightDistributionsStayWithinInclusiveBounds(t *testing.T) {
+	r := NewLegacy(12345)
+	for _, distribution := range []string{"minecraft:trapezoid", "minecraft:very_biased_to_bottom", "minecraft:uniform"} {
+		plan := PlacementPlan{
+			HeightDistribution: distribution,
+			MinY:               HeightProvider{Absolute: intPtr(-20)},
+			MaxY:               HeightProvider{Absolute: intPtr(20)},
+		}
+		for i := 0; i < 1000; i++ {
+			got := plan.SampleY(r, -64, 384)
+			if got < -20 || got > 20 {
+				t.Fatalf("%s sample %d outside [-20,20]: %d", distribution, i, got)
+			}
+		}
+	}
+}

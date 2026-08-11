@@ -176,18 +176,24 @@ func (p PlacementPlan) SampleY(r RandomSource, minY, height int) int {
 	}
 	span := hi - lo + 1
 	if p.HeightDistribution == "minecraft:trapezoid" {
-		plateau := 0
-		triangle := span - plateau
-		return lo + int(r.NextIntN(int32((triangle+1)/2))) + int(r.NextIntN(int32(triangle/2+1)))
+		// Vanilla's TrapezoidHeight works with the inclusive range distance,
+		// then performs two inclusive random draws around the midpoint.
+		rangeSize := span - 1
+		if rangeSize <= 0 {
+			return lo
+		}
+		left := rangeSize / 2
+		right := rangeSize - left
+		return lo + int(r.NextIntN(int32(right+1))) + int(r.NextIntN(int32(left+1)))
 	}
 	if p.HeightDistribution == "minecraft:very_biased_to_bottom" {
 		const inner = 8
-		outer := span - inner + 1
-		if outer <= 0 {
+		if span-inner <= 0 {
 			return lo
 		}
-		bound := int(r.NextIntN(int32(outer))) + inner
-		return lo + int(r.NextIntN(int32(bound)))
+		first := lo + inner + int(r.NextIntN(int32(span-inner)))
+		second := lo + int(r.NextIntN(int32(first-lo)))
+		return lo + int(r.NextIntN(int32(second-lo+inner)))
 	}
 	return lo + int(r.NextIntN(int32(span)))
 }
