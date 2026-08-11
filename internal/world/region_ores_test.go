@@ -59,3 +59,50 @@ func TestScheduledRegionOresAreDeterministic(t *testing.T) {
 		t.Fatal("scheduled ore pass changed no blocks")
 	}
 }
+
+func TestScheduledRegionOreReplayIsDeterministic(t *testing.T) {
+	makeRegion := func() *decorationRegion {
+		var chunks []*Chunk
+		for cx := int32(-2); cx <= 2; cx++ {
+			for cz := int32(-2); cz <= 2; cz++ {
+				chunk := NewChunk(cx, cz, BiomePlains)
+				for y := MinY; y < MinY+WorldHeight; y++ {
+					for x := 0; x < 16; x++ {
+						for z := 0; z < 16; z++ {
+							chunk.setBlockRaw(x, y, z, StateStone)
+						}
+					}
+				}
+				chunks = append(chunks, chunk)
+			}
+		}
+		region, err := newDecorationRegion(chunks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return region
+	}
+
+	a, b := makeRegion(), makeRegion()
+	if err := a.replayScheduledOres(12345, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.replayScheduledOres(12345, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	for cx := int32(-2); cx <= 2; cx++ {
+		for cz := int32(-2); cz <= 2; cz++ {
+			left := a.chunks[[2]int32{cx, cz}]
+			right := b.chunks[[2]int32{cx, cz}]
+			for y := MinY; y < MinY+WorldHeight; y++ {
+				for x := 0; x < 16; x++ {
+					for z := 0; z < 16; z++ {
+						if left.GetBlock(x, y, z) != right.GetBlock(x, y, z) {
+							t.Fatalf("replay differs at chunk (%d,%d), block (%d,%d,%d)", cx, cz, x, y, z)
+						}
+					}
+				}
+			}
+		}
+	}
+}
