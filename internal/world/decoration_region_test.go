@@ -66,10 +66,14 @@ func TestDecorationRegionHeightmapsMatchPlacementSemantics(t *testing.T) {
 }
 
 func TestDecorationRegionSourceBiomesUseThreeByThreeChunks(t *testing.T) {
-	center := NewChunk(0, 0, BiomePlains)
-	east := NewChunk(1, 0, biomeIDByName("minecraft:desert"))
-	outside := NewChunk(2, 0, biomeIDByName("minecraft:forest"))
-	region, err := newDecorationRegion([]*Chunk{center, east, outside})
+	var chunks []*Chunk
+	for cx := int32(-1); cx <= 1; cx++ {
+		for cz := int32(-1); cz <= 1; cz++ {
+			chunks = append(chunks, NewChunk(cx, cz, BiomePlains))
+		}
+	}
+	chunks = append(chunks, NewChunk(2, 0, biomeIDByName("minecraft:forest")))
+	region, err := newDecorationRegion(chunks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,8 +81,49 @@ func TestDecorationRegionSourceBiomesUseThreeByThreeChunks(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := region.sourceBiomes()
-	want := []string{"minecraft:plains", "minecraft:desert"}
+	want := []string{"minecraft:plains"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("source biomes = %v, want %v", got, want)
+	}
+}
+
+func TestDecorationRegionSchedulesRealFeatureStage(t *testing.T) {
+	var chunks []*Chunk
+	for cx := int32(-1); cx <= 1; cx++ {
+		for cz := int32(-1); cz <= 1; cz++ {
+			chunks = append(chunks, NewChunk(cx, cz, BiomePlains))
+		}
+	}
+	region, err := newDecorationRegion(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.setSource(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	features, err := region.scheduledFeatures(undergroundOresStage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(features) == 0 {
+		t.Fatal("plains underground stage produced no scheduled features")
+	}
+	for i, feature := range features {
+		if i > 0 && feature.Index <= features[i-1].Index {
+			t.Fatalf("feature %s index %d is not after index %d", feature.Name, feature.Index, features[i-1].Index)
+		}
+	}
+}
+
+func TestDecorationRegionRequiresSourceBiomeNeighborhood(t *testing.T) {
+	region, err := newDecorationRegion([]*Chunk{NewChunk(0, 0, BiomePlains)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.setSource(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := region.scheduledFeatures(undergroundOresStage); err == nil {
+		t.Fatal("missing source neighborhood succeeded")
 	}
 }

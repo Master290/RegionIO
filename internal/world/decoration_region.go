@@ -128,6 +128,28 @@ func (r *decorationRegion) sourceBiomes() []string {
 	return names
 }
 
+func (r *decorationRegion) scheduledFeatures(stage int) ([]worldgen.ScheduledFeature, error) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		return nil, err
+	}
+	if err := r.ensureSourceNeighborhood(); err != nil {
+		return nil, err
+	}
+	return set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), stage)
+}
+
+func (r *decorationRegion) ensureSourceNeighborhood() error {
+	for cx := r.sourceX - 1; cx <= r.sourceX+1; cx++ {
+		for cz := r.sourceZ - 1; cz <= r.sourceZ+1; cz++ {
+			if _, ok := r.chunks[[2]int32{cx, cz}]; !ok {
+				return fmt.Errorf("world: source biome neighborhood missing (%d,%d)", cx, cz)
+			}
+		}
+	}
+	return nil
+}
+
 func (r *decorationRegion) placementContext(biomeAllows func(worldgen.FeaturePosition) bool) worldgen.PlacementContext {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
