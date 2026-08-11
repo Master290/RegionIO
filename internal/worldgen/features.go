@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -20,6 +21,11 @@ type FeatureSet struct {
 	Placed     map[string]PlacedFeature
 	Biomes     map[string]BiomeGeneration
 	BlockTags  map[string][]string
+}
+
+type IndexedFeature struct {
+	Name  string
+	Index int
 }
 
 type ConfiguredFeature struct {
@@ -208,6 +214,105 @@ var (
 func LoadFeatureSet() (*FeatureSet, error) {
 	featureSetOnce.Do(func() { featureSet, featureSetErr = loadFeatureSet(featureData) })
 	return featureSet, featureSetErr
+}
+
+// FeatureSteps mirrors FeatureSorter.buildFeaturesPerStep. biomeOrder must be
+// BiomeSource.possibleBiomes encounter order because it assigns the stable
+// identity used to break otherwise unconstrained graph ties.
+func (s *FeatureSet) FeatureSteps(biomeOrder []string) ([][]string, error) {
+	type node struct {
+		stage, identity int
+		name            string
+	}
+	identities := make(map[string]int)
+	nodes := make(map[[2]int]node)
+	edges := make(map[[2]int]map[[2]int]bool)
+	maxStages := 0
+	for _, biomeName := range biomeOrder {
+		biome, ok := s.Biomes[biomeName]
+		if !ok {
+			continue
+		}
+		if len(biome.Features) > maxStages {
+			maxStages = len(biome.Features)
+		}
+		var previous [2]int
+		hasPrevious := false
+		for stage, names := range biome.Features {
+			for _, name := range names {
+				identity, ok := identities[name]
+				if !ok {
+					identity = len(identities)
+					identities[name] = identity
+				}
+				key := [2]int{stage, identity}
+				nodes[key] = node{stage: stage, identity: identity, name: name}
+				if hasPrevious {
+					if edges[previous] == nil {
+						edges[previous] = make(map[[2]int]bool)
+					}
+					edges[previous][key] = true
+				}
+				previous, hasPrevious = key, true
+			}
+		}
+	}
+	less := func(a, b [2]int) bool {
+		return a[0] < b[0] || a[0] == b[0] && a[1] < b[1]
+	}
+	keys := make([][2]int, 0, len(nodes))
+	for key := range nodes {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool { return less(keys[i], keys[j]) })
+	visited := make(map[[2]int]bool)
+	visiting := make(map[[2]int]bool)
+	ordered := make([][2]int, 0, len(keys))
+	var visit func([2]int) error
+	visit = func(key [2]int) error {
+		if visited[key] {
+			return nil
+		}
+		if visiting[key] {
+			return fmt.Errorf("worldgen: feature order cycle")
+		}
+		visiting[key] = true
+		children := make([][2]int, 0, len(edges[key]))
+		for child := range edges[key] {
+			children = append(children, child)
+		}
+		sort.Slice(children, func(i, j int) bool { return less(children[i], children[j]) })
+		for _, child := range children {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+		delete(visiting, key)
+		visited[key] = true
+		ordered = append(ordered, key)
+		return nil
+	}
+	for _, key := range keys {
+		if err := visit(key); err != nil {
+			return nil, err
+		}
+	}
+	steps := make([][]string, maxStages)
+	for i := len(ordered) - 1; i >= 0; i-- {
+		n := nodes[ordered[i]]
+		steps[n.stage] = append(steps[n.stage], n.name)
+	}
+	return steps, nil
+}
+
+func IndexedFeatures(step []string, wanted map[string]bool) []IndexedFeature {
+	result := make([]IndexedFeature, 0, len(wanted))
+	for index, name := range step {
+		if wanted[name] {
+			result = append(result, IndexedFeature{Name: name, Index: index})
+		}
+	}
+	return result
 }
 
 func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {

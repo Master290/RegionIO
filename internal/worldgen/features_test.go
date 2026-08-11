@@ -1,6 +1,9 @@
 package worldgen
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestFeatureDatapackLoadsAndLinks(t *testing.T) {
 	set, err := LoadFeatureSet()
@@ -40,5 +43,40 @@ func TestFeatureDatapackLoadsAndLinks(t *testing.T) {
 	lavaPlan, err := set.Placement("minecraft:spring_lava")
 	if err != nil || lavaPlan.HeightDistribution != "minecraft:very_biased_to_bottom" {
 		t.Fatalf("spring lava placement = %+v, err=%v", lavaPlan, err)
+	}
+}
+
+func TestFeatureStepsAgainstVanillaRuntimeVectors(t *testing.T) {
+	set := &FeatureSet{Biomes: map[string]BiomeGeneration{
+		"a": {Features: [][]string{{"f1"}, {"f3", "f4"}}},
+		"b": {Features: [][]string{{"f2", "f1"}, {"f5", "f4"}}},
+	}}
+	for _, test := range []struct {
+		name  string
+		order []string
+		want  [][]string
+	}{
+		{"ab", []string{"a", "b"}, [][]string{{"f2", "f1"}, {"f5", "f3", "f4"}}},
+		{"ba", []string{"b", "a"}, [][]string{{"f2", "f1"}, {"f3", "f5", "f4"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := set.FeatureSteps(test.order)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("steps = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFeatureStepsRejectsCycles(t *testing.T) {
+	set := &FeatureSet{Biomes: map[string]BiomeGeneration{
+		"a": {Features: [][]string{{"f1", "f2"}}},
+		"b": {Features: [][]string{{"f2", "f1"}}},
+	}}
+	if _, err := set.FeatureSteps([]string{"a", "b"}); err == nil {
+		t.Fatal("cyclic feature order succeeded")
 	}
 }

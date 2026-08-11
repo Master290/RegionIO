@@ -62,6 +62,7 @@ func depthRange(v any) (worldgen.ClimateRange, bool) {
 var (
 	biomeTable     *worldgen.ParameterTable
 	biomeTableOnce sync.Once
+	biomeOrder     []string
 )
 
 // loadBiomeTable parses the embedded biome parameters once and returns the full
@@ -76,16 +77,26 @@ func loadBiomeTable() *worldgen.ParameterTable {
 			panic(fmt.Sprintf("world: parsing embedded biome_parameters.json: %v", err))
 		}
 		params := make([]worldgen.BiomeParameter, 0, len(raw.Biomes))
+		seen := make(map[string]bool)
 		for _, e := range raw.Biomes {
 			dp, ok := depthRange(e.Param.Depth)
 			if !ok {
 				continue // malformed depth; skip defensively
 			}
 			params = append(params, makeBiomeParameter(e, dp))
+			if !seen[e.Biome] {
+				seen[e.Biome] = true
+				biomeOrder = append(biomeOrder, e.Biome)
+			}
 		}
 		biomeTable = worldgen.NewParameterTable(params)
 	})
 	return biomeTable
+}
+
+func possibleBiomeOrder() []string {
+	loadBiomeTable()
+	return biomeOrder
 }
 
 // makeBiomeParameter converts a raw JSON entry into a BiomeParameter, mapping
