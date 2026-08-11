@@ -28,6 +28,14 @@ type IndexedFeature struct {
 	Index int
 }
 
+// ScheduledFeature is one feature selected for a decoration stage. Index is
+// the stable FeatureSorter index within that stage and must be used when
+// deriving the feature random seed; it is not the index in any one biome.
+type ScheduledFeature struct {
+	Name  string
+	Index int
+}
+
 type ConfiguredFeature struct {
 	Type   string
 	Config json.RawMessage
@@ -330,6 +338,37 @@ func IndexedFeatures(step []string, wanted map[string]bool) []IndexedFeature {
 		}
 	}
 	return result
+}
+
+// FeatureSchedule returns the features present in the union of sourceBiomes
+// for one decoration stage. allBiomeOrder is the complete BiomeSource encounter
+// order used to build FeatureSorter, not the order of the local source region.
+// The result is stable and contains each placed feature at most once.
+func (s *FeatureSet) FeatureSchedule(allBiomeOrder, sourceBiomes []string, stage int) ([]ScheduledFeature, error) {
+	steps, err := s.FeatureSteps(allBiomeOrder)
+	if err != nil {
+		return nil, err
+	}
+	if stage < 0 || stage >= len(steps) {
+		return nil, fmt.Errorf("worldgen: feature stage %d out of range", stage)
+	}
+	wanted := make(map[string]bool)
+	for _, biomeName := range sourceBiomes {
+		biome, ok := s.Biomes[biomeName]
+		if !ok || stage >= len(biome.Features) {
+			continue
+		}
+		for _, name := range biome.Features[stage] {
+			wanted[name] = true
+		}
+	}
+	result := make([]ScheduledFeature, 0, len(wanted))
+	for index, name := range steps[stage] {
+		if wanted[name] {
+			result = append(result, ScheduledFeature{Name: name, Index: index})
+		}
+	}
+	return result, nil
 }
 
 func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {

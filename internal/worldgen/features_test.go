@@ -82,6 +82,44 @@ func TestFeatureStepsRejectsCycles(t *testing.T) {
 	}
 }
 
+func TestFeatureScheduleUsesGlobalOrderAndSourceUnion(t *testing.T) {
+	set := &FeatureSet{Biomes: map[string]BiomeGeneration{
+		"a": {Features: [][]string{{"f1"}, {"f3", "f4"}}},
+		"b": {Features: [][]string{{"f2", "f1"}, {"f5", "f4"}}},
+		"c": {Features: [][]string{{"f1"}, {"f5", "f3"}}},
+	}}
+	got, err := set.FeatureSchedule([]string{"a", "b", "c"}, []string{"b", "c"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ScheduledFeature{{Name: "f5", Index: 0}, {Name: "f3", Index: 1}, {Name: "f4", Index: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("schedule = %v, want %v", got, want)
+	}
+}
+
+func TestFeatureScheduleDoesNotRenumberFilteredFeatures(t *testing.T) {
+	set := &FeatureSet{Biomes: map[string]BiomeGeneration{
+		"a": {Features: [][]string{{"f1", "f2", "f3"}}},
+		"b": {Features: [][]string{{"f3"}}},
+	}}
+	got, err := set.FeatureSchedule([]string{"a", "b"}, []string{"b"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ScheduledFeature{{Name: "f3", Index: 2}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("schedule = %v, want global index %v", got, want)
+	}
+}
+
+func TestFeatureScheduleRejectsInvalidStage(t *testing.T) {
+	set := &FeatureSet{Biomes: map[string]BiomeGeneration{"a": {Features: [][]string{{"f1"}}}}}
+	if _, err := set.FeatureSchedule([]string{"a"}, []string{"a"}, 1); err == nil {
+		t.Fatal("invalid stage succeeded")
+	}
+}
+
 func TestPlacementHeightDistributionsStayWithinInclusiveBounds(t *testing.T) {
 	r := NewLegacy(12345)
 	for _, distribution := range []string{"minecraft:trapezoid", "minecraft:very_biased_to_bottom", "minecraft:uniform"} {
