@@ -101,6 +101,23 @@ func (r *decorationRegion) getBiome(x, y, z int) (uint16, bool) {
 	return chunk.GetBiome(x&15, y, z&15), true
 }
 
+func (r *decorationRegion) biomeAllowsFeature(set *worldgen.FeatureSet, feature string, stage int, position worldgen.FeaturePosition) bool {
+	id, ok := r.getBiome(position.X, position.Y, position.Z)
+	if !ok {
+		return false
+	}
+	biome, ok := set.Biomes[biomeNameByID(id)]
+	if !ok || stage < 0 || stage >= len(biome.Features) {
+		return false
+	}
+	for _, name := range biome.Features[stage] {
+		if name == feature {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *decorationRegion) sourceBiomes() []string {
 	seen := make(map[uint16]bool)
 	var names []string
