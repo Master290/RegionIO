@@ -1,6 +1,7 @@
 package worldgen
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -95,5 +96,50 @@ func TestPlacementHeightDistributionsStayWithinInclusiveBounds(t *testing.T) {
 				t.Fatalf("%s sample %d outside [-20,20]: %d", distribution, i, got)
 			}
 		}
+	}
+}
+
+func TestPlacementPositionsPreservesModifierOrder(t *testing.T) {
+	modifier := func(raw string) PlacementModifier {
+		var value PlacementModifier
+		value.Raw = json.RawMessage(raw)
+		if err := json.Unmarshal(value.Raw, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	set := &FeatureSet{Placed: map[string]PlacedFeature{
+		"test": {Placement: []PlacementModifier{
+			modifier(`{"type":"minecraft:count","count":3}`),
+			modifier(`{"type":"minecraft:in_square"}`),
+			modifier(`{"type":"minecraft:height_range","height":{"type":"minecraft:uniform","min_inclusive":{"absolute":-2},"max_inclusive":{"absolute":2}}}`),
+			modifier(`{"type":"minecraft:biome"}`),
+		}},
+	}}
+	r := NewLegacy(12345)
+	got, err := set.PlacementPositions("test", r, FeaturePosition{X: 32, Y: -64, Z: -16}, PlacementContext{
+		MinY: -64, Height: 384,
+		BiomeAllows: func(position FeaturePosition) bool { return position.Y >= 0 },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRandom := NewLegacy(12345)
+	var want []FeaturePosition
+	for range 3 {
+		x := 32 + int(wantRandom.NextIntN(16))
+		z := -16 + int(wantRandom.NextIntN(16))
+		y := -2 + int(wantRandom.NextIntN(5))
+		position := FeaturePosition{
+			X: x,
+			Y: y,
+			Z: z,
+		}
+		if position.Y >= 0 {
+			want = append(want, position)
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("positions = %v, want %v", got, want)
 	}
 }

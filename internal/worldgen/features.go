@@ -118,6 +118,15 @@ type PlacementPlan struct {
 	MaxY               HeightProvider
 }
 
+type FeaturePosition struct {
+	X, Y, Z int
+}
+
+type PlacementContext struct {
+	MinY, Height int
+	BiomeAllows  func(FeaturePosition) bool
+}
+
 type CountProvider struct {
 	Min, Max int
 	Weighted []WeightedInt
@@ -481,6 +490,104 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 		}
 	}
 	return plan, nil
+}
+
+// PlacementPositions executes a placed feature's modifiers in declared order.
+// The recursive walk mirrors Stream.flatMap: every repeated position completes
+// the remaining chain before the next repeated position consumes random draws.
+func (s *FeatureSet) PlacementPositions(name string, r RandomSource, origin FeaturePosition, context PlacementContext) ([]FeaturePosition, error) {
+	placed, ok := s.Placed[name]
+	if !ok {
+		return nil, fmt.Errorf("worldgen: placed feature %s missing", name)
+	}
+	var result []FeaturePosition
+	var apply func(int, FeaturePosition) error
+	apply = func(index int, position FeaturePosition) error {
+		if index == len(placed.Placement) {
+			result = append(result, position)
+			return nil
+		}
+		modifier := placed.Placement[index]
+		next := func(value FeaturePosition) error { return apply(index+1, value) }
+		switch modifier.Type {
+		case "minecraft:count":
+			var value struct {
+				Count json.RawMessage `json:"count"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
+				return err
+			}
+			count, err := parseIntProvider(value.Count)
+			if err != nil {
+				return err
+			}
+			for n := count.Sample(r); n > 0; n-- {
+				if err := next(position); err != nil {
+					return err
+				}
+			}
+			return nil
+		case "minecraft:rarity_filter":
+			var value struct {
+				Chance int `json:"chance"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Chance < 1 {
+				return fmt.Errorf("worldgen: %s invalid rarity filter", name)
+			}
+			if r.NextFloat() < 1/float32(value.Chance) {
+				return next(position)
+			}
+			return nil
+		case "minecraft:in_square":
+			position.X += int(r.NextIntN(16))
+			position.Z += int(r.NextIntN(16))
+			return next(position)
+		case "minecraft:height_range":
+			plan, err := placementHeightPlan(modifier.Raw)
+			if err != nil {
+				return err
+			}
+			position.Y = plan.SampleY(r, context.MinY, context.Height)
+			return next(position)
+		case "minecraft:biome":
+			if context.BiomeAllows == nil || context.BiomeAllows(position) {
+				return next(position)
+			}
+			return nil
+		default:
+			return fmt.Errorf("worldgen: %s unsupported executable placement modifier %q", name, modifier.Type)
+		}
+	}
+	if err := apply(0, origin); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func placementHeightPlan(raw json.RawMessage) (PlacementPlan, error) {
+	var value struct {
+		Height struct {
+			Type string          `json:"type"`
+			Min  json.RawMessage `json:"min_inclusive"`
+			Max  json.RawMessage `json:"max_inclusive"`
+		} `json:"height"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return PlacementPlan{}, err
+	}
+	min, err := parseFeatureHeight(value.Height.Min)
+	if err != nil {
+		return PlacementPlan{}, err
+	}
+	max, err := parseFeatureHeight(value.Height.Max)
+	if err != nil {
+		return PlacementPlan{}, err
+	}
+	if value.Height.Type != "minecraft:uniform" && value.Height.Type != "minecraft:trapezoid" &&
+		value.Height.Type != "minecraft:very_biased_to_bottom" {
+		return PlacementPlan{}, fmt.Errorf("worldgen: unsupported height distribution %q", value.Height.Type)
+	}
+	return PlacementPlan{HeightDistribution: value.Height.Type, MinY: min, MaxY: max}, nil
 }
 
 func parseIntProvider(raw json.RawMessage) (CountProvider, error) {
