@@ -3,6 +3,10 @@ package world
 import "regionio/internal/worldgen"
 
 func (r *decorationRegion) placeScheduledOres(seed int64) error {
+	return r.placeScheduledOresAtOffset(seed, 0)
+}
+
+func (r *decorationRegion) placeScheduledOresAtOffset(seed int64, featureIndexOffset int) error {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err
@@ -27,7 +31,7 @@ func (r *decorationRegion) placeScheduledOres(seed int64) error {
 		if !ok {
 			continue
 		}
-		random.SetFeatureSeed(decorationSeed, scheduled.Index, undergroundOresStage)
+		random.SetFeatureSeed(decorationSeed, scheduled.Index+featureIndexOffset, undergroundOresStage)
 		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
 			return r.biomeAllowsFeature(set, scheduled.Name, undergroundOresStage, position)
 		})

@@ -44,10 +44,27 @@ func TestOreScheduleDiagnostic(t *testing.T) {
 		for _, feature := range schedule {
 			placed := mustFeatureSet(t).Placed[feature.Name]
 			if mustFeatureSet(t).Configured[placed.Feature].Type == "minecraft:ore" {
-				t.Logf("source (%d,%d) %s index=%d", target.X, target.Z, feature.Name, feature.Index)
+				local := localFeatureIndices(mustFeatureSet(t), region.sourceBiomes(), undergroundOresStage, feature.Name)
+				t.Logf("source (%d,%d) %s global=%d local=%v", target.X, target.Z, feature.Name, feature.Index, local)
 			}
 		}
 	}
+}
+
+func localFeatureIndices(set *worldgen.FeatureSet, biomes []string, stage int, feature string) map[string]int {
+	indices := make(map[string]int)
+	for _, biomeName := range biomes {
+		biome := set.Biomes[biomeName]
+		if stage >= len(biome.Features) {
+			continue
+		}
+		for index, name := range biome.Features[stage] {
+			if name == feature {
+				indices[biomeName] = index
+			}
+		}
+	}
+	return indices
 }
 
 func mustFeatureSet(t *testing.T) *worldgen.FeatureSet {

@@ -18,42 +18,7 @@ func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 	if os.Getenv("REGIONIO_REGION_ORE_DIAGNOSTIC") != "1" {
 		t.Skip("set REGIONIO_REGION_ORE_DIAGNOSTIC=1 to run region ore replay parity")
 	}
-	f, err := os.Open(vanillaParityFixture)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	var header [24]byte
-	if _, err := io.ReadFull(f, header[:]); err != nil {
-		t.Fatal(err)
-	}
-	seed := int64(binary.BigEndian.Uint64(header[8:16]))
-	count := int(binary.BigEndian.Uint32(header[16:20]))
-	type fixtureChunk struct {
-		x, z   int32
-		blocks []uint16
-	}
-	fixtures := make([]fixtureChunk, count)
-	var state [2]byte
-	for i := range fixtures {
-		var coords [8]byte
-		if _, err := io.ReadFull(f, coords[:]); err != nil {
-			t.Fatal(err)
-		}
-		fixtures[i].x = int32(binary.BigEndian.Uint32(coords[:4]))
-		fixtures[i].z = int32(binary.BigEndian.Uint32(coords[4:]))
-		fixtures[i].blocks = make([]uint16, 16*16*WorldHeight)
-		for index := range fixtures[i].blocks {
-			if _, err := io.ReadFull(f, state[:]); err != nil {
-				t.Fatal(err)
-			}
-			fixtures[i].blocks[index] = binary.BigEndian.Uint16(state[:])
-		}
-		remaining := SectionCount*biomeCellsPerSection + 3*256
-		if _, err := io.CopyN(io.Discard, f, int64(remaining*2)); err != nil {
-			t.Fatal(err)
-		}
-	}
+	fixtures, seed := loadOreFixtureChunks(t)
 
 	od, err := worldgen.LoadOverworldFinalDensity(seed)
 	if err != nil {
@@ -149,6 +114,104 @@ func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 	logOreDifferences(t, "region", regionByState)
 	logOreDifferences(t, "center", centerByState)
 	logOreDifferences(t, "legacy", legacyByState)
+}
+
+func TestRegionOreFeatureIndexDiagnostic(t *testing.T) {
+	if os.Getenv("REGIONIO_ORE_INDEX_DIAGNOSTIC") != "1" {
+		t.Skip("set REGIONIO_ORE_INDEX_DIAGNOSTIC=1 to scan ore feature indices")
+	}
+	fixtures, seed := loadOreFixtureChunks(t)
+	od, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
+	veins := worldgen.NewOreVeinifier(od)
+	carver, err := worldgen.NewCarver(od, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initCarverReplaceable(carver.ReplaceableBlocks())
+	for offset := -12; offset <= 12; offset++ {
+		mismatches := 0
+		for _, fixture := range fixtures {
+			var chunks []*Chunk
+			for cx := fixture.x - 1; cx <= fixture.x+1; cx++ {
+				for cz := fixture.z - 1; cz <= fixture.z+1; cz++ {
+					chunks = append(chunks, generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz))
+				}
+			}
+			region, err := newDecorationRegion(chunks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := region.setSource(fixture.x, fixture.z); err != nil {
+				t.Fatal(err)
+			}
+			if err := region.placeScheduledOresAtOffset(seed, offset); err != nil {
+				t.Fatal(err)
+			}
+			chunk := region.chunks[[2]int32{fixture.x, fixture.z}]
+			index := 0
+			for y := MinY; y < MinY+WorldHeight; y++ {
+				for z := 0; z < 16; z++ {
+					for x := 0; x < 16; x++ {
+						got, want := chunk.GetBlock(x, y, z), fixture.blocks[index]
+						index++
+						if got != want && (isOreState(got) || isOreState(want)) {
+							mismatches++
+						}
+					}
+				}
+			}
+		}
+		t.Logf("feature index offset %+d: ore mismatches %d", offset, mismatches)
+	}
+}
+
+type oreFixtureChunk struct {
+	x, z   int32
+	blocks []uint16
+}
+
+func loadOreFixtureChunks(t *testing.T) ([]oreFixtureChunk, int64) {
+	t.Helper()
+	f, err := os.Open(vanillaParityFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var header [24]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		t.Fatal(err)
+	}
+	if string(header[:8]) != "RIOPAR02" {
+		t.Fatalf("bad parity fixture magic %q", header[:8])
+	}
+	seed := int64(binary.BigEndian.Uint64(header[8:16]))
+	count := int(binary.BigEndian.Uint32(header[16:20]))
+	fixtures := make([]oreFixtureChunk, count)
+	var state [2]byte
+	for i := range fixtures {
+		var coords [8]byte
+		if _, err := io.ReadFull(f, coords[:]); err != nil {
+			t.Fatal(err)
+		}
+		fixtures[i].x = int32(binary.BigEndian.Uint32(coords[:4]))
+		fixtures[i].z = int32(binary.BigEndian.Uint32(coords[4:]))
+		fixtures[i].blocks = make([]uint16, 16*16*WorldHeight)
+		for index := range fixtures[i].blocks {
+			if _, err := io.ReadFull(f, state[:]); err != nil {
+				t.Fatal(err)
+			}
+			fixtures[i].blocks[index] = binary.BigEndian.Uint16(state[:])
+		}
+		remaining := SectionCount*biomeCellsPerSection + 3*256
+		if _, err := io.CopyN(io.Discard, f, int64(remaining*2)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return fixtures, seed
 }
 
 func countOreDifference(counts map[uint16]*oreDifference, got, want uint16) {
