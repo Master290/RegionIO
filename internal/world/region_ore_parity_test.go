@@ -169,6 +169,69 @@ func TestRegionOreFeatureIndexDiagnostic(t *testing.T) {
 	}
 }
 
+func TestRegionOreBiomeOrderDiagnostic(t *testing.T) {
+	if os.Getenv("REGIONIO_ORE_ORDER_PARITY_DIAGNOSTIC") != "1" {
+		t.Skip("set REGIONIO_ORE_ORDER_PARITY_DIAGNOSTIC=1 to compare biome orders against the fixture")
+	}
+	fixtures, seed := loadOreFixtureChunks(t)
+	od, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
+	veins := worldgen.NewOreVeinifier(od)
+	carver, err := worldgen.NewCarver(od, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initCarverReplaceable(carver.ReplaceableBlocks())
+	set := mustFeatureSet(t)
+	orders := map[string][]string{
+		"climate":  possibleBiomeOrder(),
+		"registry": registryBiomeOrder(),
+		"sorted":   sortedBiomeNames(set),
+	}
+	clayState, ok := nameToStateID("minecraft:clay", nil)
+	if !ok {
+		t.Fatal("minecraft:clay state missing")
+	}
+	for _, label := range []string{"climate", "registry", "sorted"} {
+		mismatches, clayMismatches := 0, 0
+		for _, fixture := range fixtures {
+			var chunks []*Chunk
+			for cx := fixture.x - 1; cx <= fixture.x+1; cx++ {
+				for cz := fixture.z - 1; cz <= fixture.z+1; cz++ {
+					chunks = append(chunks, generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz))
+				}
+			}
+			region, err := newDecorationRegion(chunks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := region.setSource(fixture.x, fixture.z); err != nil {
+				t.Fatal(err)
+			}
+			if err := region.placeScheduledOresWithOrder(seed, orders[label], 0); err != nil {
+				t.Fatal(err)
+			}
+			chunk := region.chunks[[2]int32{fixture.x, fixture.z}]
+			for index, want := range fixture.blocks {
+				y := MinY + index/(16*16)
+				column := index % (16 * 16)
+				z, x := column/16, column%16
+				got := chunk.GetBlock(x, y, z)
+				if got != want {
+					mismatches++
+					if got == clayState || want == clayState {
+						clayMismatches++
+					}
+				}
+			}
+		}
+		t.Logf("%s biome order: block mismatches %d, clay mismatches %d", label, mismatches, clayMismatches)
+	}
+}
+
 type oreFixtureChunk struct {
 	x, z   int32
 	blocks []uint16

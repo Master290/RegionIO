@@ -2,8 +2,10 @@ package world
 
 import (
 	"os"
+	"sort"
 	"testing"
 
+	"regionio/internal/registry"
 	"regionio/internal/worldgen"
 )
 
@@ -49,6 +51,48 @@ func TestOreScheduleDiagnostic(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestOreFeatureOrderDiagnostic(t *testing.T) {
+	if os.Getenv("REGIONIO_ORE_ORDER_DIAGNOSTIC") != "1" {
+		t.Skip("set REGIONIO_ORE_ORDER_DIAGNOSTIC=1 to compare biome orders")
+	}
+	set := mustFeatureSet(t)
+	orders := map[string][]string{
+		"climate":  append([]string(nil), possibleBiomeOrder()...),
+		"sorted":   sortedBiomeNames(set),
+		"registry": registryBiomeOrder(),
+	}
+	for _, label := range []string{"climate", "registry", "sorted"} {
+		steps, err := set.FeatureSteps(orders[label])
+		if err != nil {
+			t.Fatalf("%s order: %v", label, err)
+		}
+		for index, name := range steps[undergroundOresStage] {
+			placed := set.Placed[name]
+			if set.Configured[placed.Feature].Type == "minecraft:ore" {
+				t.Logf("%s %s=%d", label, name, index)
+			}
+		}
+	}
+}
+
+func sortedBiomeNames(set *worldgen.FeatureSet) []string {
+	names := make([]string, 0, len(set.Biomes))
+	for name := range set.Biomes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func registryBiomeOrder() []string {
+	for _, synced := range registry.Synced() {
+		if synced.Name == "minecraft:worldgen/biome" {
+			return append([]string(nil), synced.Entries...)
+		}
+	}
+	return nil
 }
 
 func localFeatureIndices(set *worldgen.FeatureSet, biomes []string, stage int, feature string) map[string]int {

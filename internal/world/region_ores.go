@@ -3,15 +3,22 @@ package world
 import "regionio/internal/worldgen"
 
 func (r *decorationRegion) placeScheduledOres(seed int64) error {
-	return r.placeScheduledOresAtOffset(seed, 0)
+	return r.placeScheduledOresWithOrder(seed, possibleBiomeOrder(), 0)
 }
 
 func (r *decorationRegion) placeScheduledOresAtOffset(seed int64, featureIndexOffset int) error {
+	return r.placeScheduledOresWithOrder(seed, possibleBiomeOrder(), featureIndexOffset)
+}
+
+func (r *decorationRegion) placeScheduledOresWithOrder(seed int64, biomeOrder []string, featureIndexOffset int) error {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err
 	}
-	schedule, err := r.scheduledFeatures(undergroundOresStage)
+	if err := r.ensureSourceNeighborhood(); err != nil {
+		return err
+	}
+	schedule, err := set.FeatureSchedule(biomeOrder, r.sourceBiomes(), undergroundOresStage)
 	if err != nil {
 		return err
 	}
