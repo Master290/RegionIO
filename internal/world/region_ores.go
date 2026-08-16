@@ -56,13 +56,12 @@ func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSou
 	y0 := float64(originY + int(random.NextIntN(3)) - 2)
 	y1 := float64(originY + int(random.NextIntN(3)) - 2)
 
-	type sphere struct{ x, y, z, radius float64 }
-	spheres := make([]sphere, size)
+	spheres := make([]oreSphere, size)
 	for i := 0; i < size; i++ {
 		t := float32(i) / float32(size)
 		randomScale := random.NextDouble() * float64(size) / 16.0
 		radius := ((float64(worldgen.MthSin(float64(float32(math.Pi)*t)))+1.0)*randomScale + 1.0) / 2.0
-		spheres[i] = sphere{
+		spheres[i] = oreSphere{
 			x: x0 + (x1-x0)*float64(t), y: y0 + (y1-y0)*float64(t),
 			z: z0 + (z1-z0)*float64(t), radius: radius,
 		}
@@ -87,46 +86,19 @@ func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSou
 			}
 		}
 	}
-	visited := make(map[[3]int]bool)
-	for _, sphere := range spheres {
-		if sphere.radius < 0 {
-			continue
+	walkOreBlocks(spheres, func(x, y, z int) {
+		if y < MinY || y >= MinY+WorldHeight {
+			return
 		}
-		minX, maxX := int(math.Floor(sphere.x-sphere.radius)), int(math.Floor(sphere.x+sphere.radius))
-		minY, maxY := int(math.Floor(sphere.y-sphere.radius)), int(math.Floor(sphere.y+sphere.radius))
-		minZ, maxZ := int(math.Floor(sphere.z-sphere.radius)), int(math.Floor(sphere.z+sphere.radius))
-		for x := minX; x <= maxX; x++ {
-			dx := (float64(x) + 0.5 - sphere.x) / sphere.radius
-			if dx*dx >= 1 {
+		current := region.getBlock(x, y, z)
+		for _, target := range targets {
+			if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAirRegion(region, x, y, z) {
 				continue
 			}
-			for y := minY; y <= maxY; y++ {
-				if y < MinY || y >= MinY+WorldHeight {
-					continue
-				}
-				dy := (float64(y) + 0.5 - sphere.y) / sphere.radius
-				if dx*dx+dy*dy >= 1 {
-					continue
-				}
-				for z := minZ; z <= maxZ; z++ {
-					dz := (float64(z) + 0.5 - sphere.z) / sphere.radius
-					pos := [3]int{x, y, z}
-					if dx*dx+dy*dy+dz*dz >= 1 || visited[pos] {
-						continue
-					}
-					visited[pos] = true
-					current := region.getBlock(x, y, z)
-					for _, target := range targets {
-						if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAirRegion(region, x, y, z) {
-							continue
-						}
-						region.setBlock(x, y, z, target.state)
-						break
-					}
-				}
-			}
+			region.setBlock(x, y, z, target.state)
+			break
 		}
-	}
+	})
 }
 
 func exposedToAirRegion(region *decorationRegion, x, y, z int) bool {

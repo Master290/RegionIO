@@ -1,6 +1,9 @@
 package world
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestPlacedOresUseStoneAndDeepslateTargets(t *testing.T) {
 	gen := NewVanillaGenerator(12345)
@@ -41,5 +44,25 @@ func TestPlacedOresAreDeterministic(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestWalkOreBlocksUsesVanillaCoordinateOrder(t *testing.T) {
+	spheres := []oreSphere{
+		{x: 0.5, y: 0.5, z: 0.5, radius: 1.1},
+		{x: 1.5, y: 0.5, z: 0.5, radius: 1.1},
+	}
+	var got [][3]int
+	walkOreBlocks(spheres, func(x, y, z int) {
+		got = append(got, [3]int{x, y, z})
+	})
+	want := [][3]int{
+		{-1, 0, 0},
+		{0, -1, 0}, {0, 0, -1}, {0, 0, 0}, {0, 0, 1}, {0, 1, 0},
+		{1, -1, 0}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1}, {1, 1, 0},
+		{2, 0, 0},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("walkOreBlocks = %v, want %v", got, want)
 	}
 }

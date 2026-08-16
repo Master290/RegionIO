@@ -13,6 +13,8 @@ type resolvedOreTarget struct {
 	replaceables map[uint16]bool
 }
 
+type oreSphere struct{ x, y, z, radius float64 }
+
 func placeVanillaOres(c *Chunk, seed int64, cx, cz int32, biomes *[16][16]string) {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
@@ -115,13 +117,12 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 	y0 := float64(originY + int(random.NextIntN(3)) - 2)
 	y1 := float64(originY + int(random.NextIntN(3)) - 2)
 
-	type sphere struct{ x, y, z, radius float64 }
-	spheres := make([]sphere, size)
+	spheres := make([]oreSphere, size)
 	for i := 0; i < size; i++ {
 		t := float32(i) / float32(size)
 		randomScale := random.NextDouble() * float64(size) / 16.0
 		radius := ((float64(worldgen.MthSin(float64(float32(math.Pi)*t)))+1.0)*randomScale + 1.0) / 2.0
-		spheres[i] = sphere{
+		spheres[i] = oreSphere{
 			x:      x0 + (x1-x0)*float64(t),
 			y:      y0 + (y1-y0)*float64(t),
 			z:      z0 + (z1-z0)*float64(t),
@@ -148,54 +149,76 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 			}
 		}
 	}
-	visited := make(map[[3]int]bool)
-	for _, sphere := range spheres {
-		if sphere.radius < 0 {
-			continue
+	walkOreBlocks(spheres, func(x, y, z int) {
+		localX := x - int(c.X)*16
+		if localX < 0 || localX >= 16 {
+			return
 		}
-		minX, maxX := int(math.Floor(sphere.x-sphere.radius)), int(math.Floor(sphere.x+sphere.radius))
-		minY, maxY := int(math.Floor(sphere.y-sphere.radius)), int(math.Floor(sphere.y+sphere.radius))
-		minZ, maxZ := int(math.Floor(sphere.z-sphere.radius)), int(math.Floor(sphere.z+sphere.radius))
-		for x := minX; x <= maxX; x++ {
-			localX := x - int(c.X)*16
-			if localX < 0 || localX >= 16 {
+		if y < MinY || y >= MinY+WorldHeight {
+			return
+		}
+		localZ := z - int(c.Z)*16
+		if localZ < 0 || localZ >= 16 {
+			return
+		}
+		current := c.GetBlock(localX, y, localZ)
+		for _, target := range targets {
+			if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAir(c, localX, y, localZ) {
 				continue
 			}
-			dx := (float64(x) + 0.5 - sphere.x) / sphere.radius
-			if dx*dx >= 1 {
-				continue
-			}
-			for y := minY; y <= maxY; y++ {
-				if y < MinY || y >= MinY+WorldHeight {
-					continue
-				}
-				dy := (float64(y) + 0.5 - sphere.y) / sphere.radius
-				if dx*dx+dy*dy >= 1 {
-					continue
-				}
-				for z := minZ; z <= maxZ; z++ {
-					localZ := z - int(c.Z)*16
-					if localZ < 0 || localZ >= 16 {
-						continue
-					}
-					dz := (float64(z) + 0.5 - sphere.z) / sphere.radius
-					pos := [3]int{localX, y, localZ}
-					if dx*dx+dy*dy+dz*dz >= 1 || visited[pos] {
-						continue
-					}
-					visited[pos] = true
-					current := c.GetBlock(localX, y, localZ)
-					for _, target := range targets {
-						if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAir(c, localX, y, localZ) {
-							continue
-						}
-						c.SetBlock(localX, y, localZ, target.state)
-						break
-					}
+			c.SetBlock(localX, y, localZ, target.state)
+			break
+		}
+	})
+}
+
+func walkOreBlocks(spheres []oreSphere, visit func(x, y, z int)) {
+	minX, maxX, minY, maxY, minZ, maxZ := oreBounds(spheres)
+	for x := minX; x <= maxX; x++ {
+		for y := minY; y <= maxY; y++ {
+			for z := minZ; z <= maxZ; z++ {
+				if oreContains(spheres, x, y, z) {
+					visit(x, y, z)
 				}
 			}
 		}
 	}
+}
+
+func oreBounds(spheres []oreSphere) (minX, maxX, minY, maxY, minZ, maxZ int) {
+	found := false
+	for _, sphere := range spheres {
+		if sphere.radius < 0 {
+			continue
+		}
+		loX, hiX := int(math.Floor(sphere.x-sphere.radius)), int(math.Floor(sphere.x+sphere.radius))
+		loY, hiY := int(math.Floor(sphere.y-sphere.radius)), int(math.Floor(sphere.y+sphere.radius))
+		loZ, hiZ := int(math.Floor(sphere.z-sphere.radius)), int(math.Floor(sphere.z+sphere.radius))
+		if !found {
+			minX, maxX, minY, maxY, minZ, maxZ = loX, hiX, loY, hiY, loZ, hiZ
+			found = true
+			continue
+		}
+		minX, maxX = min(minX, loX), max(maxX, hiX)
+		minY, maxY = min(minY, loY), max(maxY, hiY)
+		minZ, maxZ = min(minZ, loZ), max(maxZ, hiZ)
+	}
+	return
+}
+
+func oreContains(spheres []oreSphere, x, y, z int) bool {
+	for _, sphere := range spheres {
+		if sphere.radius < 0 {
+			continue
+		}
+		dx := (float64(x) + 0.5 - sphere.x) / sphere.radius
+		dy := (float64(y) + 0.5 - sphere.y) / sphere.radius
+		dz := (float64(z) + 0.5 - sphere.z) / sphere.radius
+		if dx*dx+dy*dy+dz*dz < 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func exposedToAir(c *Chunk, x, y, z int) bool {
