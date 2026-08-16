@@ -4,10 +4,15 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+	"sort"
 	"testing"
 
 	"regionio/internal/worldgen"
 )
+
+type oreDifference struct {
+	extra, missing int
+}
 
 func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 	if os.Getenv("REGIONIO_REGION_ORE_DIAGNOSTIC") != "1" {
@@ -62,6 +67,9 @@ func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 	}
 	initCarverReplaceable(carver.ReplaceableBlocks())
 	var blockTotal, regionExact, regionOreMismatch, centerExact, centerOreMismatch, legacyExact, legacyOreMismatch int
+	regionByState := make(map[uint16]*oreDifference)
+	centerByState := make(map[uint16]*oreDifference)
+	legacyByState := make(map[uint16]*oreDifference)
 	for _, fixture := range fixtures {
 		var chunks []*Chunk
 		for cx := fixture.x - 2; cx <= fixture.x+2; cx++ {
@@ -117,16 +125,19 @@ func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 						regionExact++
 					} else if isOreState(regionGot) || isOreState(want) {
 						regionOreMismatch++
+						countOreDifference(regionByState, regionGot, want)
 					}
 					if centerGot == want {
 						centerExact++
 					} else if isOreState(centerGot) || isOreState(want) {
 						centerOreMismatch++
+						countOreDifference(centerByState, centerGot, want)
 					}
 					if legacyGot == want {
 						legacyExact++
 					} else if isOreState(legacyGot) || isOreState(want) {
 						legacyOreMismatch++
+						countOreDifference(legacyByState, legacyGot, want)
 					}
 				}
 			}
@@ -135,4 +146,40 @@ func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 	t.Logf("region ore replay block exact %d/%d (%.3f%%), ore mismatches %d", regionExact, blockTotal, percent(regionExact, blockTotal), regionOreMismatch)
 	t.Logf("center-only generic block exact %d/%d (%.3f%%), ore mismatches %d", centerExact, blockTotal, percent(centerExact, blockTotal), centerOreMismatch)
 	t.Logf("legacy ore-only block exact %d/%d (%.3f%%), ore mismatches %d", legacyExact, blockTotal, percent(legacyExact, blockTotal), legacyOreMismatch)
+	logOreDifferences(t, "region", regionByState)
+	logOreDifferences(t, "center", centerByState)
+	logOreDifferences(t, "legacy", legacyByState)
+}
+
+func countOreDifference(counts map[uint16]*oreDifference, got, want uint16) {
+	if isOreState(got) {
+		entry := counts[got]
+		if entry == nil {
+			entry = &oreDifference{}
+			counts[got] = entry
+		}
+		entry.extra++
+	}
+	if isOreState(want) {
+		entry := counts[want]
+		if entry == nil {
+			entry = &oreDifference{}
+			counts[want] = entry
+		}
+		entry.missing++
+	}
+}
+
+func logOreDifferences(t *testing.T, label string, counts map[uint16]*oreDifference) {
+	t.Helper()
+	states := make([]int, 0, len(counts))
+	for state := range counts {
+		states = append(states, int(state))
+	}
+	sort.Ints(states)
+	for _, value := range states {
+		state := uint16(value)
+		entry := counts[state]
+		t.Logf("%s %s: extra=%d missing=%d", label, stateLabel(state), entry.extra, entry.missing)
+	}
 }

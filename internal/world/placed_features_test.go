@@ -47,7 +47,7 @@ func TestPlacedOresAreDeterministic(t *testing.T) {
 	}
 }
 
-func TestWalkOreBlocksUsesVanillaCoordinateOrder(t *testing.T) {
+func TestWalkOreBlocksUsesVanillaSphereOrder(t *testing.T) {
 	spheres := []oreSphere{
 		{x: 0.5, y: 0.5, z: 0.5, radius: 1.1},
 		{x: 1.5, y: 0.5, z: 0.5, radius: 1.1},
@@ -59,7 +59,8 @@ func TestWalkOreBlocksUsesVanillaCoordinateOrder(t *testing.T) {
 	want := [][3]int{
 		{-1, 0, 0},
 		{0, -1, 0}, {0, 0, -1}, {0, 0, 0}, {0, 0, 1}, {0, 1, 0},
-		{1, -1, 0}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1}, {1, 1, 0},
+		{1, 0, 0},
+		{1, -1, 0}, {1, 0, -1}, {1, 0, 1}, {1, 1, 0},
 		{2, 0, 0},
 	}
 	if !reflect.DeepEqual(got, want) {

@@ -1,10 +1,6 @@
 package world
 
-import (
-	"math"
-
-	"regionio/internal/worldgen"
-)
+import "regionio/internal/worldgen"
 
 func (r *decorationRegion) placeScheduledOres(seed int64) error {
 	set, err := worldgen.LoadFeatureSet()
@@ -47,45 +43,7 @@ func (r *decorationRegion) placeScheduledOres(seed int64) error {
 }
 
 func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
-	angle := random.NextFloat() * float32(math.Pi)
-	extent := float32(size) / 8.0
-	x0 := float64(originX) + math.Sin(float64(angle))*float64(extent)
-	x1 := float64(originX) - math.Sin(float64(angle))*float64(extent)
-	z0 := float64(originZ) + math.Cos(float64(angle))*float64(extent)
-	z1 := float64(originZ) - math.Cos(float64(angle))*float64(extent)
-	y0 := float64(originY + int(random.NextIntN(3)) - 2)
-	y1 := float64(originY + int(random.NextIntN(3)) - 2)
-
-	spheres := make([]oreSphere, size)
-	for i := 0; i < size; i++ {
-		t := float32(i) / float32(size)
-		randomScale := random.NextDouble() * float64(size) / 16.0
-		radius := ((float64(worldgen.MthSin(float64(float32(math.Pi)*t)))+1.0)*randomScale + 1.0) / 2.0
-		spheres[i] = oreSphere{
-			x: x0 + (x1-x0)*float64(t), y: y0 + (y1-y0)*float64(t),
-			z: z0 + (z1-z0)*float64(t), radius: radius,
-		}
-	}
-	for i := range spheres {
-		if spheres[i].radius < 0 {
-			continue
-		}
-		for j := i + 1; j < len(spheres); j++ {
-			if spheres[j].radius < 0 {
-				continue
-			}
-			dx, dy, dz := spheres[i].x-spheres[j].x, spheres[i].y-spheres[j].y, spheres[i].z-spheres[j].z
-			dr := spheres[i].radius - spheres[j].radius
-			if dr*dr > dx*dx+dy*dy+dz*dz {
-				if dr > 0 {
-					spheres[j].radius = -1
-				} else {
-					spheres[i].radius = -1
-					break
-				}
-			}
-		}
-	}
+	spheres := buildOreSpheres(random, originX, originY, originZ, size)
 	walkOreBlocks(spheres, func(x, y, z int) {
 		if y < MinY || y >= MinY+WorldHeight {
 			return
