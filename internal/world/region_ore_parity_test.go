@@ -232,6 +232,98 @@ func TestRegionOreBiomeOrderDiagnostic(t *testing.T) {
 	}
 }
 
+func TestRegionOreFeatureContributionDiagnostic(t *testing.T) {
+	if os.Getenv("REGIONIO_ORE_FEATURE_DIAGNOSTIC") != "1" {
+		t.Skip("set REGIONIO_ORE_FEATURE_DIAGNOSTIC=1 to measure individual ore features")
+	}
+	fixtures, seed := loadOreFixtureChunks(t)
+	od, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
+	veins := worldgen.NewOreVeinifier(od)
+	carver, err := worldgen.NewCarver(od, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initCarverReplaceable(carver.ReplaceableBlocks())
+	set := mustFeatureSet(t)
+	steps, err := set.FeatureSteps(possibleBiomeOrder())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for featureIndex, feature := range steps[undergroundOresStage] {
+		placed := set.Placed[feature]
+		if set.Configured[placed.Feature].Type != "minecraft:ore" {
+			continue
+		}
+		generated := make(map[uint16]int)
+		matching := make(map[uint16]int)
+		columnMatching := make(map[uint16]int)
+		for _, fixture := range fixtures {
+			var chunks []*Chunk
+			for cx := fixture.x - 1; cx <= fixture.x+1; cx++ {
+				for cz := fixture.z - 1; cz <= fixture.z+1; cz++ {
+					chunks = append(chunks, generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz))
+				}
+			}
+			region, err := newDecorationRegion(chunks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := region.setSource(fixture.x, fixture.z); err != nil {
+				t.Fatal(err)
+			}
+			chunk := region.chunks[[2]int32{fixture.x, fixture.z}]
+			base := make([]uint16, len(fixture.blocks))
+			for index := range base {
+				y := MinY + index/(16*16)
+				column := index % (16 * 16)
+				z, x := column/16, column%16
+				base[index] = chunk.GetBlock(x, y, z)
+			}
+			if err := region.placeScheduledOresFiltered(seed, possibleBiomeOrder(), 0, map[string]bool{feature: true}); err != nil {
+				t.Fatal(err)
+			}
+			vanillaColumns := make(map[[3]int]bool)
+			for index, state := range fixture.blocks {
+				column := index % (16 * 16)
+				z, x := column/16, column%16
+				vanillaColumns[[3]int{int(state), x, z}] = true
+			}
+			for index, want := range fixture.blocks {
+				y := MinY + index/(16*16)
+				column := index % (16 * 16)
+				z, x := column/16, column%16
+				got := chunk.GetBlock(x, y, z)
+				if got != base[index] {
+					generated[got]++
+					if got == want {
+						matching[got]++
+					}
+					if vanillaColumns[[3]int{int(got), x, z}] {
+						columnMatching[got]++
+					}
+				}
+			}
+		}
+		var total, exact, columns, oreTotal, oreExact, oreColumns int
+		for state, count := range generated {
+			total += count
+			exact += matching[state]
+			columns += columnMatching[state]
+			if isOreState(state) {
+				oreTotal += count
+				oreExact += matching[state]
+				oreColumns += columnMatching[state]
+			}
+		}
+		t.Logf("%s index=%d changed=%d exact=%d same_column=%d generated_ore=%d ore_exact=%d ore_same_column=%d",
+			feature, featureIndex, total, exact, columns, oreTotal, oreExact, oreColumns)
+	}
+}
+
 type oreFixtureChunk struct {
 	x, z   int32
 	blocks []uint16

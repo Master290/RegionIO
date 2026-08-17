@@ -11,6 +11,10 @@ func (r *decorationRegion) placeScheduledOresAtOffset(seed int64, featureIndexOf
 }
 
 func (r *decorationRegion) placeScheduledOresWithOrder(seed int64, biomeOrder []string, featureIndexOffset int) error {
+	return r.placeScheduledOresFiltered(seed, biomeOrder, featureIndexOffset, nil)
+}
+
+func (r *decorationRegion) placeScheduledOresFiltered(seed int64, biomeOrder []string, featureIndexOffset int, include map[string]bool) error {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err
@@ -25,6 +29,9 @@ func (r *decorationRegion) placeScheduledOresWithOrder(seed int64, biomeOrder []
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
 	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
 	for _, scheduled := range schedule {
+		if include != nil && !include[scheduled.Name] {
+			continue
+		}
 		placed := set.Placed[scheduled.Name]
 		configured := set.Configured[placed.Feature]
 		if configured.Type != "minecraft:ore" {
