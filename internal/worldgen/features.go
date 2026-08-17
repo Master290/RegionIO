@@ -210,9 +210,8 @@ func (p PlacementPlan) SampleY(r RandomSource, minY, height int) int {
 		if span-inner <= 0 {
 			return lo
 		}
-		first := lo + inner + int(r.NextIntN(int32(span-inner)))
-		second := lo + int(r.NextIntN(int32(first-lo)))
-		return lo + int(r.NextIntN(int32(second-lo+inner)))
+		first := int(r.NextIntN(int32(span - inner)))
+		return lo + int(r.NextIntN(int32(first+inner)))
 	}
 	return lo + int(r.NextIntN(int32(span)))
 }

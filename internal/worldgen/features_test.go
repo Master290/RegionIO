@@ -137,6 +137,26 @@ func TestPlacementHeightDistributionsStayWithinInclusiveBounds(t *testing.T) {
 	}
 }
 
+func TestVeryBiasedToBottomConsumesVanillaDraws(t *testing.T) {
+	plan := PlacementPlan{
+		HeightDistribution: "minecraft:very_biased_to_bottom",
+		MinY:               HeightProvider{Absolute: intPtr(-64)},
+		MaxY:               HeightProvider{Absolute: intPtr(320)},
+	}
+	gotRandom := NewLegacy(12345)
+	wantRandom := NewLegacy(12345)
+	for sample := 0; sample < 16; sample++ {
+		first := int(wantRandom.NextIntN(377))
+		want := -64 + int(wantRandom.NextIntN(int32(first+8)))
+		if got := plan.SampleY(gotRandom, -64, 384); got != want {
+			t.Fatalf("sample %d = %d, want %d", sample, got, want)
+		}
+	}
+	if got, want := gotRandom.NextLong(), wantRandom.NextLong(); got != want {
+		t.Fatalf("random state after samples = %d, want %d", got, want)
+	}
+}
+
 func TestPlacementPositionsPreservesModifierOrder(t *testing.T) {
 	modifier := func(raw string) PlacementModifier {
 		var value PlacementModifier
