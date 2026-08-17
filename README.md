@@ -18,7 +18,11 @@ block editing, persistent worlds, and an overworld generator built on the real
 - **Generation**: vanilla-derived overworld terrain from the embedded datapack
   (`ImprovedNoise`/`PerlinNoise`/`BlendedNoise`/`NormalNoise` + the density
   function interpreter), 3D multi-noise biomes, surface-rule interpretation,
-  deterministic decoration, and basic template structures.
+  configured carvers, aquifers, noise-router ore veins, deterministic
+  decoration, and basic template structures. The complete vanilla feature and
+  biome datapack graph is embedded; feature ordering, placement modifiers,
+  vertical anchors/providers, biome filters, and mutable region writes are
+  implemented and parity diagnostics exercise cross-chunk ore replay.
 - **Gameplay**: four-player session registry; player join/leave and movement
   synchronization; chunk-scoped visibility for players and mobs; shared
   creative block place/break; broadcast chat; and hotbar item→block mapping.
@@ -51,9 +55,8 @@ world has been generated and cached.
 
 ```
 go test ./...
-go test -race ./internal/network ./internal/server ./internal/world \
-  -run 'Test(Integration|BoundaryEdit|PlayerInfo|PlayerRegistry|Concurrent|Incremental|EncodeLight|Cache|Store|Eviction|Region|Ticket|Streamer|LoadSixteen)'
-# or run both gates:
+go test -race -timeout 20m ./...
+# or run build, vet, ordinary tests, and race tests:
 make verify
 
 # strict block/biome comparison; requires a fixture generated with Java 25:
@@ -71,7 +74,11 @@ disconnect. Lighting tests compare the initial flat chunk and a 31x31x31
 glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
-chunks; CI guards the current baseline and `make parity` requires exact equality.
+chunks. The current generator matches 91.507% of fixture blocks, all fixture
+biomes, and all fixture heightmaps; CI guards that measured baseline while
+`make parity` requires exact equality. GitHub Actions runs build/vet/tests,
+fixture regression checks, and the full race suite on every push and pull
+request.
 
 ## v0.4 scope
 
@@ -87,7 +94,20 @@ capacity pressure evicts them. Structures, placed features, mob AI,
 authentication, inventory, and survival mechanics remain intentionally partial.
 The density router, configured carvers, and noise-router ore veins are
 vanilla-derived. Surface and biome selection are ported but still need broader
-runtime captures; ordinary decoration and structures remain approximations.
+runtime captures. Ordinary decoration remains the largest fidelity gap: the
+production generator still uses a single-chunk ore/tree/spring pass, while the
+more faithful datapack-driven executor supports global `FeatureSorter` indices,
+lazy vanilla RNG interleaving, 3D biome gating, block predicates, heightmaps,
+and cross-chunk writes in diagnostics.
+
+The remaining integration boundary is chunk lifecycle, not feature parsing.
+Vanilla decorates against a mutable neighborhood and a source chunk may write
+into an adjacent target. RegionIO's cache currently coalesces and publishes one
+chunk per miss, so enabling full replay directly would either regenerate large
+overlapping neighborhoods or risk recursive cache loads. The next worldgen
+milestone is batch-oriented base-terrain generation and atomic publication of
+region decoration results; after that, the datapack executor can replace the
+legacy production decoration path.
 
 ## Project layout
 
@@ -98,7 +118,7 @@ internal/
   nbt/             NBT encoder/decoder (with modified UTF-8)
   registry/        embedded synchronized registries + tags
   world/           chunk model, level_chunk encoder, cache, generators, biomes
-  worldgen/        noise core + density-function interpreter + climate finder
+  worldgen/        noise/density core, climate finder, feature datapack runtime
   network/         per-connection state machine (handler/conn/play/login/...)
   server/          shared core: config, status response, profiles
 ```
