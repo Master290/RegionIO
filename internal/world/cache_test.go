@@ -292,6 +292,55 @@ func TestBatchGeneratorRejectsWrongTargetCoordinates(t *testing.T) {
 	}
 }
 
+func TestBatchGeneratorPrefersPersistedNeighbors(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	persisted := NewChunk(1, 0, BiomePlains)
+	persisted.SetBlock(0, SeaLevel, 0, StateBedrock)
+	if err := store.SaveChunk(persisted); err != nil {
+		t.Fatal(err)
+	}
+	c := NewCacheWithStore(-1, GenerateFlat, store)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		generatedNeighbor := NewChunk(cx+1, cz, BiomePlains)
+		generatedNeighbor.SetBlock(0, SeaLevel, 0, StateGrass)
+		return map[[2]int32]*Chunk{
+			{cx, cz}:     NewChunk(cx, cz, BiomePlains),
+			{cx + 1, cz}: generatedNeighbor,
+		}, nil
+	})
+	if got := c.chunkAt(0, 0); got == nil {
+		t.Fatal("batch target was not loaded")
+	}
+	neighbor := c.chunkAt(1, 0)
+	if got := neighbor.GetBlock(0, SeaLevel, 0); got != StateBedrock {
+		t.Fatalf("batch neighbor state = %d, want persisted bedrock %d", got, StateBedrock)
+	}
+}
+
+func TestBatchGeneratorRespectsBoundedCache(t *testing.T) {
+	c := NewCacheWithLimit(-1, GenerateFlat, nil, 2)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		return map[[2]int32]*Chunk{
+			{cx, cz}:     NewChunk(cx, cz, BiomePlains),
+			{cx + 1, cz}: NewChunk(cx+1, cz, BiomePlains),
+			{cx, cz + 1}: NewChunk(cx, cz+1, BiomePlains),
+		}, nil
+	})
+	if got := c.chunkAt(0, 0); got == nil {
+		t.Fatal("batch target was not loaded")
+	}
+	c.mu.Lock()
+	got := len(c.chunks)
+	c.mu.Unlock()
+	if got > 2 {
+		t.Fatalf("cached batch chunks = %d, want at most 2", got)
+	}
+}
+
 func TestConcurrentFrameAndBlockEdits(t *testing.T) {
 	c := NewCache(256, flatGen())
 	if len(c.Frame(0, 0)) == 0 {
