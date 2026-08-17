@@ -231,17 +231,18 @@ func TestBatchGeneratorPublishesNeighborsAtomically(t *testing.T) {
 	}
 }
 
-func TestConcurrentOverlappingBatchLoadsKeepOwnership(t *testing.T) {
+func TestConcurrentOverlappingBatchLoadsShareFirstResult(t *testing.T) {
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
 	c := NewCache(-1, GenerateFlat)
 	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
 		started <- struct{}{}
 		<-release
+		biome := uint16(cx + 10)
 		return map[[2]int32]*Chunk{
-			{cx, cz}:     NewChunk(cx, cz, BiomePlains),
-			{cx + 1, cz}: NewChunk(cx+1, cz, BiomePlains),
-			{cx - 1, cz}: NewChunk(cx-1, cz, BiomePlains),
+			{cx, cz}:     NewChunk(cx, cz, biome),
+			{cx + 1, cz}: NewChunk(cx+1, cz, biome),
+			{cx - 1, cz}: NewChunk(cx-1, cz, biome),
 		}, nil
 	})
 
@@ -261,14 +262,23 @@ func TestConcurrentOverlappingBatchLoadsKeepOwnership(t *testing.T) {
 	<-started
 	<-started
 	close(release)
+	loaded := make(map[[2]int32]*Chunk)
 	for range 2 {
 		result := <-results
 		if result.err != nil || result.chunk == nil {
 			t.Fatalf("overlapping batch load = %v, %v", result.chunk, result.err)
 		}
+		loaded[[2]int32{result.chunk.X, result.chunk.Z}] = result.chunk
 	}
-	if c.chunkAt(0, 0) == nil || c.chunkAt(1, 0) == nil {
+	left, right := c.chunkAt(0, 0), c.chunkAt(1, 0)
+	if left == nil || right == nil {
 		t.Fatal("overlapping targets were not retained")
+	}
+	if left != loaded[[2]int32{0, 0}] || right != loaded[[2]int32{1, 0}] {
+		t.Fatal("requesters did not receive the canonical cached batch results")
+	}
+	if left.GetBiome(0, MinY, 0) != right.GetBiome(0, MinY, 0) {
+		t.Fatal("overlapping chunks came from different batch results")
 	}
 }
 

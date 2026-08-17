@@ -242,17 +242,26 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	}
 
 	c.mu.Lock()
+	if c.loads[key] != pending {
+		// An overlapping batch completed this target while its own generation was
+		// running. Keep the first published result and do not close done twice.
+		ch, loadErr = pending.ch, pending.err
+		c.mu.Unlock()
+		return ch, loadErr
+	}
 	if loadErr == nil {
 		for batchKey, batchChunk := range generatedBatch {
 			if batchKey == key || batchChunk == nil || batchChunk.X != batchKey[0] || batchChunk.Z != batchKey[1] {
 				continue
 			}
-			if _, loading := c.loads[batchKey]; loading {
-				continue
-			}
 			if _, exists := c.chunks[batchKey]; !exists {
 				c.chunks[batchKey] = batchChunk
 				c.touch(batchKey)
+			}
+			if neighborLoad := c.loads[batchKey]; neighborLoad != nil {
+				neighborLoad.ch = c.chunks[batchKey]
+				delete(c.loads, batchKey)
+				close(neighborLoad.done)
 			}
 		}
 		c.chunks[key] = ch
