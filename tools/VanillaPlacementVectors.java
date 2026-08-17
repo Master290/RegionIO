@@ -8,6 +8,7 @@ import net.minecraft.util.RandomSource;
 import net.minecraft.util.valueproviders.ClampedNormalInt;
 import net.minecraft.util.valueproviders.TrapezoidInt;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
+import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.placement.CountPlacement;
 import net.minecraft.world.level.levelgen.placement.PlacementModifier;
 import net.minecraft.world.level.levelgen.placement.RandomOffsetPlacement;
@@ -39,6 +40,17 @@ public final class VanillaPlacementVectors {
             samples.append(normal.sample(normalRandom));
         }
         System.out.println("normal=" + samples);
+
+        WorldgenRandom decoration = new WorldgenRandom(new LegacyRandomSource(0L));
+        long decorationSeed = decoration.setDecorationSeed(12345L, 0, 0);
+        decoration.setFeatureSeed(decorationSeed, 10, 6);
+        System.out.println("decoration.seed=" + decorationSeed);
+        System.out.println("feature10.stage6=" + randomVector(decoration));
+    }
+
+    private static String randomVector(RandomSource random) {
+        return random.nextInt(16) + "," + random.nextInt(16) + "," + random.nextInt(65)
+                + "," + random.nextFloat() + "," + random.nextDouble();
     }
 
     private static String position(BlockPos position) {
