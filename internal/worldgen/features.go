@@ -122,6 +122,7 @@ type PlacementPlan struct {
 	Count              CountProvider
 	RarityChance       int
 	HeightDistribution string
+	HeightPlateau      int
 	MinY               HeightProvider
 	MaxY               HeightProvider
 }
@@ -195,13 +196,15 @@ func (p PlacementPlan) SampleY(r RandomSource, minY, height int) int {
 	}
 	span := hi - lo + 1
 	if p.HeightDistribution == "minecraft:trapezoid" {
-		// Vanilla's TrapezoidHeight works with the inclusive range distance,
-		// then performs two inclusive random draws around the midpoint.
 		rangeSize := span - 1
 		if rangeSize <= 0 {
 			return lo
 		}
-		left := rangeSize / 2
+		plateau := p.HeightPlateau
+		if plateau < 0 || plateau > rangeSize {
+			return lo
+		}
+		left := (rangeSize - plateau) / 2
 		right := rangeSize - left
 		return lo + int(r.NextIntN(int32(right+1))) + int(r.NextIntN(int32(left+1)))
 	}
@@ -499,9 +502,10 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 		case "minecraft:height_range":
 			var value struct {
 				Height struct {
-					Type string          `json:"type"`
-					Min  json.RawMessage `json:"min_inclusive"`
-					Max  json.RawMessage `json:"max_inclusive"`
+					Type    string          `json:"type"`
+					Plateau int             `json:"plateau"`
+					Min     json.RawMessage `json:"min_inclusive"`
+					Max     json.RawMessage `json:"max_inclusive"`
 				} `json:"height"`
 			}
 			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
@@ -519,7 +523,7 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 				value.Height.Type != "minecraft:very_biased_to_bottom" {
 				return PlacementPlan{}, fmt.Errorf("worldgen: %s unsupported height distribution %q", name, value.Height.Type)
 			}
-			plan.HeightDistribution, plan.MinY, plan.MaxY = value.Height.Type, min, max
+			plan.HeightDistribution, plan.HeightPlateau, plan.MinY, plan.MaxY = value.Height.Type, value.Height.Plateau, min, max
 		case "minecraft:in_square", "minecraft:biome", "minecraft:surface_water_depth_filter",
 			"minecraft:heightmap", "minecraft:block_predicate_filter", "minecraft:noise_threshold_count",
 			"minecraft:random_offset":
@@ -745,9 +749,10 @@ func parsePlacementIntProvider(raw json.RawMessage) (placementIntProvider, error
 func placementHeightPlan(raw json.RawMessage) (PlacementPlan, error) {
 	var value struct {
 		Height struct {
-			Type string          `json:"type"`
-			Min  json.RawMessage `json:"min_inclusive"`
-			Max  json.RawMessage `json:"max_inclusive"`
+			Type    string          `json:"type"`
+			Plateau int             `json:"plateau"`
+			Min     json.RawMessage `json:"min_inclusive"`
+			Max     json.RawMessage `json:"max_inclusive"`
 		} `json:"height"`
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
@@ -765,7 +770,7 @@ func placementHeightPlan(raw json.RawMessage) (PlacementPlan, error) {
 		value.Height.Type != "minecraft:very_biased_to_bottom" {
 		return PlacementPlan{}, fmt.Errorf("worldgen: unsupported height distribution %q", value.Height.Type)
 	}
-	return PlacementPlan{HeightDistribution: value.Height.Type, MinY: min, MaxY: max}, nil
+	return PlacementPlan{HeightDistribution: value.Height.Type, HeightPlateau: value.Height.Plateau, MinY: min, MaxY: max}, nil
 }
 
 func parseIntProvider(raw json.RawMessage) (CountProvider, error) {

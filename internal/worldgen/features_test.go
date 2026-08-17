@@ -2,9 +2,34 @@ package worldgen
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"testing"
 )
+
+func TestTrapezoidPlateauDiagnostic(t *testing.T) {
+	if os.Getenv("REGIONIO_TRAPEZOID_DIAGNOSTIC") != "1" {
+		t.Skip("set REGIONIO_TRAPEZOID_DIAGNOSTIC=1 to list non-zero height plateaus")
+	}
+	set, err := LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, placed := range set.Placed {
+		for _, modifier := range placed.Placement {
+			if modifier.Type != "minecraft:height_range" {
+				continue
+			}
+			plan, err := placementHeightPlan(modifier.Raw)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if plan.HeightDistribution == "minecraft:trapezoid" && plan.HeightPlateau != 0 {
+				t.Logf("%s plateau=%d", name, plan.HeightPlateau)
+			}
+		}
+	}
+}
 
 func TestFeatureDatapackLoadsAndLinks(t *testing.T) {
 	set, err := LoadFeatureSet()
@@ -149,6 +174,27 @@ func TestVeryBiasedToBottomConsumesVanillaDraws(t *testing.T) {
 		first := int(wantRandom.NextIntN(377))
 		want := -64 + int(wantRandom.NextIntN(int32(first+8)))
 		if got := plan.SampleY(gotRandom, -64, 384); got != want {
+			t.Fatalf("sample %d = %d, want %d", sample, got, want)
+		}
+	}
+	if got, want := gotRandom.NextLong(), wantRandom.NextLong(); got != want {
+		t.Fatalf("random state after samples = %d, want %d", got, want)
+	}
+}
+
+func TestTrapezoidHeightHonorsPlateau(t *testing.T) {
+	plan := PlacementPlan{
+		HeightDistribution: "minecraft:trapezoid",
+		HeightPlateau:      4,
+		MinY:               HeightProvider{Absolute: intPtr(0)},
+		MaxY:               HeightProvider{Absolute: intPtr(20)},
+	}
+	gotRandom := NewLegacy(12345)
+	wantRandom := NewLegacy(12345)
+	for sample := 0; sample < 16; sample++ {
+		left := (20 - 4) / 2
+		want := int(wantRandom.NextIntN(int32(20-left+1))) + int(wantRandom.NextIntN(int32(left+1)))
+		if got := plan.SampleY(gotRandom, 0, 21); got != want {
 			t.Fatalf("sample %d = %d, want %d", sample, got, want)
 		}
 	}
