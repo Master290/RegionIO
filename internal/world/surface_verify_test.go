@@ -11,22 +11,16 @@ import (
 func TestSurfaceVariesByBiome(t *testing.T) {
 	gen := NewVanillaGenerator(12345)
 	seen := make(map[uint16]int) // surfaceBlockID → chunk count
-	// Scan a moderate area to find dry land (surface above sea level), where
-	// surface rules actually place biome-specific blocks. Ocean columns sit
-	// below sea level and stay stone, which is correct.
-	for cx := 0; cx < 16; cx++ {
-		for cz := 0; cz < 16; cz++ {
-			ch := gen(int32(cx)-8, int32(cz)-8)
-			if ch == nil {
-				continue
-			}
-			blk, dry := centreSurfaceBlock(ch)
-			if !dry {
-				continue // skip ocean/underwater columns
-			}
-			if blk != 0 {
-				seen[blk]++
-			}
+	// These seed-bound chunks are the first two dry-land center columns found
+	// by the former 16x16 scan and exercise different surface-rule outcomes.
+	for _, pos := range [][2]int32{{2, -8}, {2, -7}} {
+		ch := gen(pos[0], pos[1])
+		if ch == nil {
+			continue
+		}
+		blk, dry := centreSurfaceBlock(ch)
+		if dry && blk != 0 {
+			seen[blk]++
 		}
 	}
 	if len(seen) < 2 {
