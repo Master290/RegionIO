@@ -49,12 +49,11 @@ func (r *decorationRegion) placeScheduledOresFiltered(seed int64, biomeOrder []s
 		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
 			return r.biomeAllowsFeature(set, scheduled.Name, undergroundOresStage, position)
 		})
-		positions, err := set.PlacementPositions(scheduled.Name, random, origin, context)
-		if err != nil {
-			return err
-		}
-		for _, position := range positions {
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 			placeOreEllipsoidRegion(r, random, position.X, position.Y, position.Z, config.Size, config.DiscardAirExposure, targets)
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

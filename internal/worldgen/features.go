@@ -540,16 +540,26 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 // The recursive walk mirrors Stream.flatMap: every repeated position completes
 // the remaining chain before the next repeated position consumes random draws.
 func (s *FeatureSet) PlacementPositions(name string, r RandomSource, origin FeaturePosition, context PlacementContext) ([]FeaturePosition, error) {
+	var result []FeaturePosition
+	err := s.ForEachPlacementPosition(name, r, origin, context, func(position FeaturePosition) error {
+		result = append(result, position)
+		return nil
+	})
+	return result, err
+}
+
+// ForEachPlacementPosition preserves vanilla's lazy placement stream: the
+// configured feature consumes random draws for one position before modifiers
+// produce the next repeated position.
+func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origin FeaturePosition, context PlacementContext, visit func(FeaturePosition) error) error {
 	placed, ok := s.Placed[name]
 	if !ok {
-		return nil, fmt.Errorf("worldgen: placed feature %s missing", name)
+		return fmt.Errorf("worldgen: placed feature %s missing", name)
 	}
-	var result []FeaturePosition
 	var apply func(int, FeaturePosition) error
 	apply = func(index int, position FeaturePosition) error {
 		if index == len(placed.Placement) {
-			result = append(result, position)
-			return nil
+			return visit(position)
 		}
 		modifier := placed.Placement[index]
 		next := func(value FeaturePosition) error { return apply(index+1, value) }
@@ -671,10 +681,7 @@ func (s *FeatureSet) PlacementPositions(name string, r RandomSource, origin Feat
 			return fmt.Errorf("worldgen: %s unsupported executable placement modifier %q", name, modifier.Type)
 		}
 	}
-	if err := apply(0, origin); err != nil {
-		return nil, err
-	}
-	return result, nil
+	return apply(0, origin)
 }
 
 type placementIntProvider struct {

@@ -248,6 +248,45 @@ func TestPlacementPositionsPreservesModifierOrder(t *testing.T) {
 	}
 }
 
+func TestForEachPlacementPositionInterleavesVisitorRandomDraws(t *testing.T) {
+	modifier := func(raw string) PlacementModifier {
+		var value PlacementModifier
+		value.Raw = json.RawMessage(raw)
+		if err := json.Unmarshal(value.Raw, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	set := &FeatureSet{Placed: map[string]PlacedFeature{
+		"test": {Placement: []PlacementModifier{
+			modifier(`{"type":"minecraft:count","count":3}`),
+			modifier(`{"type":"minecraft:in_square"}`),
+		}},
+	}}
+	random := NewLegacy(12345)
+	var got []FeaturePosition
+	err := set.ForEachPlacementPosition("test", random, FeaturePosition{}, PlacementContext{}, func(position FeaturePosition) error {
+		got = append(got, position)
+		random.NextLong() // configured feature draw before the next position
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRandom := NewLegacy(12345)
+	var want []FeaturePosition
+	for range 3 {
+		want = append(want, FeaturePosition{X: int(wantRandom.NextIntN(16)), Z: int(wantRandom.NextIntN(16))})
+		wantRandom.NextLong()
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("positions = %v, want interleaved %v", got, want)
+	}
+	if gotState, wantState := random.NextLong(), wantRandom.NextLong(); gotState != wantState {
+		t.Fatalf("random state = %d, want %d", gotState, wantState)
+	}
+}
+
 func TestPlacementPositionsWorldAwareModifiers(t *testing.T) {
 	modifier := func(raw string) PlacementModifier {
 		var value PlacementModifier
