@@ -16,6 +16,11 @@ import (
 // Generator produces the chunk at the given coordinate.
 type Generator func(cx, cz int32) *Chunk
 
+// BatchGenerator builds the requested chunk and may return neighboring base
+// terrain chunks in the same operation. Free coordinates are published
+// together; coordinates with an active load retain that load's ownership.
+type BatchGenerator func(cx, cz int32) (map[[2]int32]*Chunk, error)
+
 // Cache is the live world: it owns the mutable chunk data and memoizes the
 // framed, compression-ready level_chunk packet for each chunk. A block edit
 // mutates the chunk and invalidates its cached frame so the next request
@@ -36,6 +41,7 @@ type Generator func(cx, cz int32) *Chunk
 type Cache struct {
 	threshold int32
 	gen       Generator
+	batchGen  BatchGenerator
 	store     *Store // nil = in-memory only (tests, flat worlds)
 	maxChunks int    // LRU capacity; 0 = unbounded
 
@@ -53,6 +59,14 @@ type Cache struct {
 	order *list.List // elements are *[2]int32; nil when maxChunks==0
 	index map[[2]int32]*list.Element
 	loads map[[2]int32]*chunkLoad
+}
+
+// SetBatchGenerator enables optional batch generation. It must be called before
+// the cache is used; existing single-chunk generators remain the default.
+func (c *Cache) SetBatchGenerator(gen BatchGenerator) {
+	c.mu.Lock()
+	c.batchGen = gen
+	c.mu.Unlock()
 }
 
 // chunkLoad coordinates concurrent misses for the same coordinate. The first
@@ -192,6 +206,7 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	// Try disk before generation so saved edits survive restarts.
 	var ch *Chunk
 	var loadErr error
+	var generatedBatch map[[2]int32]*Chunk
 	if c.store != nil {
 		if loaded, err := c.store.LoadChunk(cx, cz); err == nil {
 			ch = loaded
@@ -200,14 +215,46 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 		}
 	}
 	if ch == nil && loadErr == nil {
-		ch = c.gen(cx, cz) // generate outside the lock
-		if ch == nil {
-			loadErr = fmt.Errorf("world: generator returned nil chunk (%d,%d)", cx, cz)
+		c.mu.Lock()
+		batchGen := c.batchGen
+		c.mu.Unlock()
+		if batchGen != nil {
+			batch, err := batchGen(cx, cz)
+			if err != nil {
+				loadErr = err
+			} else {
+				ch = batch[key]
+				if ch == nil {
+					loadErr = fmt.Errorf("world: batch generator omitted chunk (%d,%d)", cx, cz)
+				} else if ch.X != cx || ch.Z != cz {
+					loadErr = fmt.Errorf("world: batch generator returned chunk (%d,%d) for target (%d,%d)", ch.X, ch.Z, cx, cz)
+				}
+				if loadErr == nil {
+					generatedBatch, loadErr = c.reconcileBatchStore(key, batch)
+				}
+			}
+		} else {
+			ch = c.gen(cx, cz) // generate outside the lock
+			if ch == nil {
+				loadErr = fmt.Errorf("world: generator returned nil chunk (%d,%d)", cx, cz)
+			}
 		}
 	}
 
 	c.mu.Lock()
 	if loadErr == nil {
+		for batchKey, batchChunk := range generatedBatch {
+			if batchKey == key || batchChunk == nil || batchChunk.X != batchKey[0] || batchChunk.Z != batchKey[1] {
+				continue
+			}
+			if _, loading := c.loads[batchKey]; loading {
+				continue
+			}
+			if _, exists := c.chunks[batchKey]; !exists {
+				c.chunks[batchKey] = batchChunk
+				c.touch(batchKey)
+			}
+		}
 		c.chunks[key] = ch
 		c.touch(key)
 		c.evictIfNeeded()
@@ -217,6 +264,24 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	close(pending.done)
 	c.mu.Unlock()
 	return ch, loadErr
+}
+
+func (c *Cache) reconcileBatchStore(target [2]int32, batch map[[2]int32]*Chunk) (map[[2]int32]*Chunk, error) {
+	if c.store == nil {
+		return batch, nil
+	}
+	for key, chunk := range batch {
+		if key == target || chunk == nil || chunk.X != key[0] || chunk.Z != key[1] {
+			continue
+		}
+		loaded, err := c.store.LoadChunk(key[0], key[1])
+		if err == nil {
+			batch[key] = loaded
+		} else if !errors.Is(err, ErrChunkNotFound) {
+			return nil, fmt.Errorf("world: load batch neighbor (%d,%d): %w", key[0], key[1], err)
+		}
+	}
+	return batch, nil
 }
 
 // Frame returns the prebuilt level_chunk packet for (cx, cz), building it on

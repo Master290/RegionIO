@@ -206,6 +206,82 @@ func TestConcurrentMissGeneratesChunkOnce(t *testing.T) {
 	}
 }
 
+func TestBatchGeneratorPublishesNeighborsAtomically(t *testing.T) {
+	var calls atomic.Int32
+	c := NewCache(-1, GenerateFlat)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		calls.Add(1)
+		return map[[2]int32]*Chunk{
+			{cx, cz}:     NewChunk(cx, cz, BiomePlains),
+			{cx + 1, cz}: NewChunk(cx+1, cz, BiomePlains),
+			{cx, cz + 1}: NewChunk(cx, cz+1, BiomePlains),
+		}, nil
+	})
+	if got := c.chunkAt(2, 3); got == nil {
+		t.Fatal("batch target was not published")
+	}
+	if got := c.chunkAt(3, 3); got == nil {
+		t.Fatal("batch east neighbor was not published")
+	}
+	if got := c.chunkAt(2, 4); got == nil {
+		t.Fatal("batch south neighbor was not published")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("batch generator calls = %d, want 1", got)
+	}
+}
+
+func TestConcurrentOverlappingBatchLoadsKeepOwnership(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	c := NewCache(-1, GenerateFlat)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		started <- struct{}{}
+		<-release
+		return map[[2]int32]*Chunk{
+			{cx, cz}:     NewChunk(cx, cz, BiomePlains),
+			{cx + 1, cz}: NewChunk(cx+1, cz, BiomePlains),
+			{cx - 1, cz}: NewChunk(cx-1, cz, BiomePlains),
+		}, nil
+	})
+
+	type result struct {
+		chunk *Chunk
+		err   error
+	}
+	results := make(chan result, 2)
+	go func() {
+		chunk, err := c.chunkAtErr(0, 0)
+		results <- result{chunk, err}
+	}()
+	go func() {
+		chunk, err := c.chunkAtErr(1, 0)
+		results <- result{chunk, err}
+	}()
+	<-started
+	<-started
+	close(release)
+	for range 2 {
+		result := <-results
+		if result.err != nil || result.chunk == nil {
+			t.Fatalf("overlapping batch load = %v, %v", result.chunk, result.err)
+		}
+	}
+	if c.chunkAt(0, 0) == nil || c.chunkAt(1, 0) == nil {
+		t.Fatal("overlapping targets were not retained")
+	}
+}
+
+func TestBatchGeneratorRejectsWrongTargetCoordinates(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		return map[[2]int32]*Chunk{{cx, cz}: NewChunk(cx+1, cz, BiomePlains)}, nil
+	})
+	if _, err := c.chunkAtErr(2, 3); err == nil {
+		t.Fatal("batch generator with wrong target coordinates succeeded")
+	}
+}
+
 func TestConcurrentFrameAndBlockEdits(t *testing.T) {
 	c := NewCache(256, flatGen())
 	if len(c.Frame(0, 0)) == 0 {
