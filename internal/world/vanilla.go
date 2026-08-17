@@ -26,6 +26,32 @@ type cornerGrid [cellsXZ + 1][cellsY + 1][cellsXZ + 1]float64
 // final_density tree for the given seed, plus a simplified cosmetic pass
 // (beaches and trees) layered on the bit-accurate terrain.
 func NewVanillaGenerator(seed int64) Generator {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return func(cx, cz int32) *Chunk {
+		return generateVanilla(od, fluidPicker, veins, carver, seed, cx, cz)
+	}
+}
+
+// NewVanillaBaseBatchGenerator returns an opt-in batch generator for the
+// terrain stage. It builds the target and its 3x3 source neighborhood without
+// decoration; a future region decorator can then mutate that neighborhood and
+// publish the finished chunks atomically through Cache.SetBatchGenerator.
+// Production still uses NewVanillaGenerator until that publication step is
+// integrated, because this batch intentionally returns undecorated terrain.
+func NewVanillaBaseBatchGenerator(seed int64) BatchGenerator {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return func(targetX, targetZ int32) (map[[2]int32]*Chunk, error) {
+		batch := make(map[[2]int32]*Chunk, 9)
+		for cx := targetX - 1; cx <= targetX+1; cx++ {
+			for cz := targetZ - 1; cz <= targetZ+1; cz++ {
+				batch[[2]int32{cx, cz}] = generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz)
+			}
+		}
+		return batch, nil
+	}
+}
+
+func vanillaGeneratorInputs(seed int64) (*worldgen.OverworldDensity, worldgen.FluidPicker, *worldgen.OreVeinifier, *worldgen.Carver) {
 	od, err := worldgen.LoadOverworldFinalDensity(seed)
 	if err != nil {
 		panic("world: loading overworld density: " + err.Error())
@@ -37,9 +63,7 @@ func NewVanillaGenerator(seed int64) Generator {
 		panic("world: loading carvers: " + err.Error())
 	}
 	initCarverReplaceable(carver.ReplaceableBlocks())
-	return func(cx, cz int32) *Chunk {
-		return generateVanilla(od, fluidPicker, veins, carver, seed, cx, cz)
-	}
+	return od, fluidPicker, veins, carver
 }
 
 func generateVanilla(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) *Chunk {
