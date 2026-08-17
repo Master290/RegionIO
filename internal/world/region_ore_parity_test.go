@@ -2,6 +2,7 @@ package world
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -322,6 +323,118 @@ func TestRegionOreFeatureContributionDiagnostic(t *testing.T) {
 		t.Logf("%s index=%d changed=%d exact=%d same_column=%d generated_ore=%d ore_exact=%d ore_same_column=%d",
 			feature, featureIndex, total, exact, columns, oreTotal, oreExact, oreColumns)
 	}
+}
+
+func TestSingleChunkScheduledOreParityDiagnostic(t *testing.T) {
+	if os.Getenv("REGIONIO_SINGLE_CHUNK_ORE_DIAGNOSTIC") != "1" {
+		t.Skip("set REGIONIO_SINGLE_CHUNK_ORE_DIAGNOSTIC=1 to measure the transition ore path")
+	}
+	fixtures, seed := loadOreFixtureChunks(t)
+	od, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
+	veins := worldgen.NewOreVeinifier(od)
+	carver, err := worldgen.NewCarver(od, seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initCarverReplaceable(carver.ReplaceableBlocks())
+	var exact, total, oreMismatches int
+	for _, fixture := range fixtures {
+		chunk := generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, fixture.x, fixture.z)
+		if err := placeScheduledOresInChunk(chunk, seed); err != nil {
+			t.Fatal(err)
+		}
+		for index, want := range fixture.blocks {
+			y := MinY + index/(16*16)
+			column := index % (16 * 16)
+			z, x := column/16, column%16
+			got := chunk.GetBlock(x, y, z)
+			total++
+			if got == want {
+				exact++
+			} else if isOreState(got) || isOreState(want) {
+				oreMismatches++
+			}
+		}
+	}
+	t.Logf("single-chunk scheduled ore block exact %d/%d (%.3f%%), ore mismatches %d", exact, total, percent(exact, total), oreMismatches)
+}
+
+func placeScheduledOresInChunk(c *Chunk, seed int64) error {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		return err
+	}
+	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), chunkBiomeNames(c), undergroundOresStage)
+	if err != nil {
+		return err
+	}
+	random, decorationSeed := worldgen.DecorationRandom(seed, int(c.X), int(c.Z))
+	origin := worldgen.FeaturePosition{X: int(c.X) << 4, Y: MinY, Z: int(c.Z) << 4}
+	context := worldgen.PlacementContext{MinY: MinY, Height: WorldHeight}
+	for _, scheduled := range schedule {
+		placed := set.Placed[scheduled.Name]
+		if set.Configured[placed.Feature].Type != "minecraft:ore" {
+			continue
+		}
+		config, err := set.Ore(placed.Feature)
+		if err != nil {
+			return err
+		}
+		targets, ok := resolveOreTargets(set, config)
+		if !ok {
+			continue
+		}
+		random.SetFeatureSeed(decorationSeed, scheduled.Index, undergroundOresStage)
+		context.BiomeAllows = func(position worldgen.FeaturePosition) bool {
+			if int32(position.X>>4) != c.X || int32(position.Z>>4) != c.Z || position.Y < MinY || position.Y >= MinY+WorldHeight {
+				return false
+			}
+			return biomeHasFeature(set, c.GetBiome(position.X&15, position.Y, position.Z&15), undergroundOresStage, scheduled.Name)
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			placeOreEllipsoid(c, random, position.X, position.Y, position.Z, config.Size, config.DiscardAirExposure, targets)
+			return nil
+		}); err != nil {
+			return fmt.Errorf("place %s: %w", scheduled.Name, err)
+		}
+	}
+	return nil
+}
+
+func chunkBiomeNames(c *Chunk) []string {
+	seen := make(map[uint16]bool)
+	var names []string
+	for si := 0; si < SectionCount; si++ {
+		for bx := 0; bx < biomeCellsXZ; bx++ {
+			for by := 0; by < biomeCellsXZ; by++ {
+				for bz := 0; bz < biomeCellsXZ; bz++ {
+					id := c.GetBiome(bx*biomeCellSize, MinY+si*16+by*biomeCellSize, bz*biomeCellSize)
+					if !seen[id] {
+						seen[id] = true
+						names = append(names, biomeNameByID(id))
+					}
+				}
+			}
+		}
+	}
+	return names
+}
+
+func biomeHasFeature(set *worldgen.FeatureSet, biomeID uint16, stage int, feature string) bool {
+	biome, ok := set.Biomes[biomeNameByID(biomeID)]
+	if !ok || stage < 0 || stage >= len(biome.Features) {
+		return false
+	}
+	for _, name := range biome.Features[stage] {
+		if name == feature {
+			return true
+		}
+	}
+	return false
 }
 
 type oreFixtureChunk struct {
