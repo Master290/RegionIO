@@ -1,4 +1,4 @@
-# RegionIO
+# <p><img src="https://remo.su/regionio-full.svg" height="60"></p>
 
 A Minecraft Java Edition server core written in Go, targeting version
 **26.1.2** (protocol **775**). RegionIO implements the connection lifecycle
