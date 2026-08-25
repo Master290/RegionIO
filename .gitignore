@@ -5,7 +5,7 @@
 *.test
 
 # Mojang server distribution (not redistributable; obtain separately)
-/server.jar
+/server*.jar
 /libraries/
 /versions/
 
@@ -35,8 +35,10 @@
 
 # Editor / tool local config
 /.claude/
+/.opencode/
 /.vscode/
 /.idea/
+*.iml
 *.swp
 
 # OS junk
