@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: self-hosted
+    runs-on: [self-hosted, windows]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -21,19 +21,25 @@ jobs:
       - run: go test ./...
 
   race:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, windows]
+    env:
+      CGO_ENABLED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
           cache: true
+      # The runner service account carries only the machine PATH, which has no
+      # C compiler; point at the machine-wide MSYS2 mingw64 toolchain so the
+      # race detector can build its cgo runtime.
+      - run: Add-Content $env:GITHUB_PATH 'C:\msys64\mingw64\bin'
       # Density-based world tests are intentionally exhaustive and race adds
       # substantial overhead; keep the package timeout above the normal 10m.
       - run: go test -race -timeout 20m ./...
 
   parity:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, windows]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
