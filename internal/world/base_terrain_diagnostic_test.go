@@ -10,20 +10,20 @@ import (
 )
 
 // base_terrain_diagnostic_test.go splits the vanilla fixture's block
-// mismatches into classes that name the responsible subsystem, instead of
-// leaving one undifferentiated pile. The ore-replay diagnostics measure how
-// feature placement drifts; this one answers why: which cells already differ
-// before any feature runs.
+// mismatches into classes by what could have written each side. The ore-replay
+// diagnostics measure how feature placement drifts; this one attributes it.
 //
-// Every fixture cell is compared against the undecorated base chunk. A cell
-// where both sides are plain states (air family, fluids, bedrock, stone,
-// deepslate) cannot be a feature write on either side — it is a direct
-// base-terrain defect (aquifer edge, carver boundary, surface rule) and comes
-// with sample coordinates for targeted fixes. Cells where exactly one side is
-// a recognizably feature-placed state count as a flip toward that side; the
-// remaining ambiguous pairs (disk outputs such as clay or gravel look like
-// natural terrain) are bucketed separately so they cannot pollute the plain
-// signal.
+// Every fixture cell is compared against the undecorated base chunk. Plain-
+// versus-plain pairs (air family, fluids, bedrock, stone, deepslate) used to
+// be read as direct base-terrain defects, but TestVanillaBaseTerrainParity
+// settled that question: against a vanilla capture whose biomes carry no
+// features, our undecorated pipeline matches exactly. Plain pairs here are
+// therefore feature outputs wearing plain states — monster-room cave_air,
+// geode voids, lava-lake lava — and the sample coordinates point at the
+// feature, not at the noise stack. Cells where exactly one side is a
+// recognizably feature-placed state count as a flip toward that side; the
+// remaining ambiguous pairs (disk outputs such as clay look like natural
+// terrain) are bucketed separately.
 //
 // Run with REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1.
 
