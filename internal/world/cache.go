@@ -338,6 +338,15 @@ func (c *Cache) PreloadErrContext(ctx context.Context, cx, cz int32) error {
 	return err
 }
 
+// IsChunkLoaded reports whether a chunk is currently resident in the live
+// cache. It does not load, generate, touch, or retain the chunk.
+func (c *Cache) IsChunkLoaded(cx, cz int32) bool {
+	c.mu.Lock()
+	_, ok := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	return ok
+}
+
 func (c *Cache) frameErr(cx, cz int32) ([]byte, error) {
 	key := [2]int32{cx, cz}
 

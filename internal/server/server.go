@@ -114,18 +114,20 @@ func New(cfg Config) (*Server, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
-	gen := world.NewVanillaGenerator(cfg.WorldSeed)
+	gen, batchGen := world.NewVanillaRegionGenerators(cfg.WorldSeed)
 	em := world.NewEntityManager()
 	if cfg.WorldDir == "" {
-		return newServerState(cfg,
-			world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, nil, cfg.MaxCachedChunks), nil, em), nil
+		chunks := world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, nil, cfg.MaxCachedChunks)
+		chunks.SetBatchGenerator(batchGen)
+		return newServerState(cfg, chunks, nil, em), nil
 	}
 	store, err := world.NewStoreForSeed(cfg.WorldDir, cfg.WorldSeed)
 	if err != nil {
 		return nil, err
 	}
-	return newServerState(cfg,
-		world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks), store, em), nil
+	chunks := world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks)
+	chunks.SetBatchGenerator(batchGen)
+	return newServerState(cfg, chunks, store, em), nil
 }
 
 // NewWithCache constructs a server around an existing cache. It is useful for

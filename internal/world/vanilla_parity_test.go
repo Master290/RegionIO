@@ -37,8 +37,14 @@ func TestVanillaBlockParity(t *testing.T) {
 		t.Fatalf("fixture seed=%d chunks=%d", seed, count)
 	}
 	gen := NewVanillaGenerator(seed)
+	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "region" {
+		gen = NewVanillaRegionGenerator(seed)
+	}
 	type statePair struct{ got, want uint16 }
 	pairs := make(map[statePair]int)
+	wantBlocks := make(map[uint16]int)
+	wantBands := make(map[string]int)
+	wantY := make(map[uint16][2]int)
 	var blockTotal, blockExact, biomeTotal, biomeExact, heightTotal, heightExact int
 	var fluidMismatch, oreMismatch int
 	for chunkIndex := 0; chunkIndex < count; chunkIndex++ {
@@ -63,6 +69,25 @@ func TestVanillaBlockParity(t *testing.T) {
 						blockExact++
 					} else {
 						pairs[statePair{got, want}]++
+						wantBlocks[want]++
+						yRange := wantY[want]
+						if yRange[0] == 0 || y < yRange[0] {
+							yRange[0] = y
+						}
+						if y > yRange[1] {
+							yRange[1] = y
+						}
+						wantY[want] = yRange
+						band := "surface"
+						switch {
+						case y < 0:
+							band = "deep"
+						case y < SeaLevel:
+							band = "underground"
+						case y < SeaLevel+16:
+							band = "waterline"
+						}
+						wantBands[band]++
 						if isFluidState(got) || isFluidState(want) {
 							fluidMismatch++
 						}
@@ -122,6 +147,25 @@ func TestVanillaBlockParity(t *testing.T) {
 	for _, mismatch := range top {
 		t.Logf("block mismatch %d: %s (%d) -> %s (%d)", mismatch.count,
 			stateLabel(mismatch.pair.got), mismatch.pair.got, stateLabel(mismatch.pair.want), mismatch.pair.want)
+	}
+	if os.Getenv("REGIONIO_PARITY_DIAGNOSTIC") == "1" {
+		type blockCount struct {
+			id    uint16
+			count int
+		}
+		blocks := make([]blockCount, 0, len(wantBlocks))
+		for id, count := range wantBlocks {
+			blocks = append(blocks, blockCount{id, count})
+		}
+		sort.Slice(blocks, func(i, j int) bool { return blocks[i].count > blocks[j].count })
+		if len(blocks) > 20 {
+			blocks = blocks[:20]
+		}
+		for _, block := range blocks {
+			rangeY := wantY[block.id]
+			t.Logf("diagnostic wanted %d: %s (%d), y=%d..%d", block.count, stateLabel(block.id), block.id, rangeY[0], rangeY[1])
+		}
+		t.Logf("diagnostic mismatch y bands: deep=%d underground=%d waterline=%d surface=%d", wantBands["deep"], wantBands["underground"], wantBands["waterline"], wantBands["surface"])
 	}
 	t.Logf("block exact %d/%d (%.3f%%), biome exact %d/%d (%.3f%%), heightmaps exact %d/%d (%.3f%%), fluid mismatches %d, ore mismatches %d",
 		blockExact, blockTotal, percent(blockExact, blockTotal), biomeExact, biomeTotal, percent(biomeExact, biomeTotal),

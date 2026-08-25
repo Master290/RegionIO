@@ -40,13 +40,17 @@ func TestStraightBlobTreeFromDatapack(t *testing.T) {
 
 func TestBiomeTreeStageProducesTrees(t *testing.T) {
 	gen := NewVanillaGenerator(12345)
-	chunk := gen(3, -9)
 	trees := 0
-	for y := SeaLevel; y < 160; y++ {
-		for x := 0; x < 16; x++ {
-			for z := 0; z < 16; z++ {
-				if chunk.GetBlock(x, y, z) == StateOakLog {
-					trees++
+	for cx := int32(-4); cx <= 4 && trees == 0; cx++ {
+		for cz := int32(-4); cz <= 4 && trees == 0; cz++ {
+			chunk := gen(cx, cz)
+			for y := SeaLevel; y < 160; y++ {
+				for x := 0; x < 16; x++ {
+					for z := 0; z < 16; z++ {
+						if chunk.GetBlock(x, y, z) == StateOakLog {
+							trees++
+						}
+					}
 				}
 			}
 		}

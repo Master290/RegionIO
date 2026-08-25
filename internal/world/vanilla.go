@@ -27,17 +27,14 @@ type cornerGrid [cellsXZ + 1][cellsY + 1][cellsXZ + 1]float64
 // (beaches and trees) layered on the bit-accurate terrain.
 func NewVanillaGenerator(seed int64) Generator {
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
-	return func(cx, cz int32) *Chunk {
-		return generateVanilla(od, fluidPicker, veins, carver, seed, cx, cz)
-	}
+	return vanillaGeneratorFromInputs(seed, od, fluidPicker, veins, carver)
 }
 
-// NewVanillaBaseBatchGenerator returns an opt-in batch generator for the
-// terrain stage. It builds the target and its 3x3 source neighborhood without
-// decoration; a future region decorator can then mutate that neighborhood and
-// publish the finished chunks atomically through Cache.SetBatchGenerator.
-// Production still uses NewVanillaGenerator until that publication step is
-// integrated, because this batch intentionally returns undecorated terrain.
+// NewVanillaBaseBatchGenerator returns the diagnostic terrain-stage batch
+// generator. It builds the target and its 3x3 source neighborhood without
+// decoration so region replay tests can inspect the mutable base terrain.
+// Production uses NewVanillaBatchGenerator, which publishes complete
+// decorated chunks and does not expose this undecorated intermediate.
 func NewVanillaBaseBatchGenerator(seed int64) BatchGenerator {
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
 	return func(targetX, targetZ int32) (map[[2]int32]*Chunk, error) {
@@ -45,6 +42,46 @@ func NewVanillaBaseBatchGenerator(seed int64) BatchGenerator {
 		for cx := targetX - 1; cx <= targetX+1; cx++ {
 			for cz := targetZ - 1; cz <= targetZ+1; cz++ {
 				batch[[2]int32{cx, cz}] = generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz)
+			}
+		}
+		return batch, nil
+	}
+}
+
+// NewVanillaBatchGenerator returns the production-safe batch generator. It
+// publishes a complete decorated 3x3 neighborhood for every miss, while each
+// chunk is generated with the same canonical path as NewVanillaGenerator.
+// Keeping decoration per chunk here is deliberate: the datapack region replay
+// path is still diagnostic-only until its parity exceeds the legacy path.
+// This lets the cache use atomic batch publication without exposing
+// undecorated neighbors or changing generated block output.
+func NewVanillaBatchGenerator(seed int64) BatchGenerator {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return vanillaBatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver)
+}
+
+// NewVanillaGenerators constructs the canonical single-chunk and production
+// batch generators while sharing the immutable density, aquifer, vein, and
+// carver inputs. Server startup uses this form to avoid loading the datapack
+// graph twice and retaining duplicate worldgen state.
+func NewVanillaGenerators(seed int64) (Generator, BatchGenerator) {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return vanillaGeneratorFromInputs(seed, od, fluidPicker, veins, carver),
+		vanillaBatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver)
+}
+
+func vanillaGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver) Generator {
+	return func(cx, cz int32) *Chunk {
+		return generateVanilla(od, fluidPicker, veins, carver, seed, cx, cz)
+	}
+}
+
+func vanillaBatchGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver) BatchGenerator {
+	return func(targetX, targetZ int32) (map[[2]int32]*Chunk, error) {
+		batch := make(map[[2]int32]*Chunk, 9)
+		for cx := targetX - 1; cx <= targetX+1; cx++ {
+			for cz := targetZ - 1; cz <= targetZ+1; cz++ {
+				batch[[2]int32{cx, cz}] = generateVanilla(od, fluidPicker, veins, carver, seed, cx, cz)
 			}
 		}
 		return batch, nil
@@ -503,11 +540,15 @@ func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64,
 	r := newChunkRand(cx, cz, seed)
 
 	placeVanillaOres(c, seed, cx, cz, biomeName)
+	decorateNonOre(c, od, cx, cz, seed, surfTop, grass, biomeName, &r)
+}
+
+func decorateNonOre(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string, r *chunkRand) {
 	placeVanillaSprings(c, seed, cx, cz, biomeName)
 	placeVanillaTrees(c, seed, cx, cz, biomeName, surfTop)
-	placeFlora(c, &r, surfTop, grass, biomeName)
-	placeDesertFeatures(c, &r, surfTop, biomeName)
-	placeRocks(c, &r, surfTop, grass, biomeName)
+	placeFlora(c, r, surfTop, grass, biomeName)
+	placeDesertFeatures(c, r, surfTop, biomeName)
+	placeRocks(c, r, surfTop, grass, biomeName)
 
 	// Place large structures like villages and strongholds
 	worldgen.PlaceStructures(c, od, cx, cz, seed, surfTop, biomeName)

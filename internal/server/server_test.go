@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -126,5 +127,26 @@ func TestServerRejectsNegativeCacheLimit(t *testing.T) {
 	cfg.MaxCachedChunks = -1
 	if _, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat)); err == nil {
 		t.Fatal("negative cache limit was accepted")
+	}
+}
+
+func TestNewUsesProductionBatchGenerator(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	cfg.WorldSeed = 12345
+	cfg.MaxCachedChunks = 64
+	srv, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.Chunks().PreloadErrContext(context.Background(), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	for cx := int32(-1); cx <= 1; cx++ {
+		for cz := int32(-1); cz <= 1; cz++ {
+			if !srv.Chunks().IsChunkLoaded(cx, cz) {
+				t.Fatalf("production batch did not publish neighbor (%d,%d)", cx, cz)
+			}
+		}
 	}
 }
