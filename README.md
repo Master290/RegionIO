@@ -115,17 +115,17 @@ a complete decorated 3x3 neighborhood, while persisted neighbors still take
 precedence. This closes the chunk-lifecycle integration boundary without
 exposing undecorated chunks.
 
-The remaining block-parity gap is entirely underground: no surface or waterline
-cells mismatch. Parity diagnostics confirm the stage-6 feature schedule, the
-feature-index seeds, and the climate biome ordering are aligned with vanilla,
-and rare ores such as gold and redstone already match exactly. High-attempt
-features instead drift because a few hundred residual base-terrain differences
-(aquifer fluid edges and carver air boundaries) flip air-exposure discard rolls
-inside later veins; the base-terrain diagnostic measures them at 966 fixture
-cells (0.246%), concentrated in whole cave segments rather than isolated
-positions. The next worldgen milestone is to close those base-terrain
-differences and raise the 98.028% block parity toward exact equality while
-keeping cold batch generation within an acceptable latency budget.
+The remaining block-parity gap is entirely inside feature replay: a vanilla
+capture with every feature and structure set stripped out matches our
+undecorated pipeline on all 393,216 cells, so density, surface rules, carvers,
+aquifers, and noise-router veins are already bit-exact. What drifts is the
+interaction between stages — vanilla opens air pockets (monster rooms, geode
+voids, lava lakes) before the ores run, and ore ellipsoids crossing that
+pre-existing air roll air-exposure discard rounds our replay never sees, which
+is why high-attempt ore drift looks symmetric. The next worldgen milestone is
+to replay the remaining pre-ore stages, monster rooms first, and raise the
+98.028% block parity toward exact equality while keeping cold batch generation
+within an acceptable latency budget.
 
 ## Project layout
 

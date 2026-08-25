@@ -163,10 +163,16 @@ Known gaps, roughly in order of how visible they are:
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
 Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.378% through
-the single-chunk path, 98.028% through the production region replay. The remaining block gap is
-entirely underground and is driven by ~966 base-terrain cells (0.246%) where vanilla carved a cave
-segment we kept solid or an aquifer edge we sealed — those flips turn air-exposure discard rolls
-inside later veins, which is why ore drift looks symmetric (extra ≈ missing).
+the single-chunk path, 98.028% through the production region replay. A featureless vanilla capture
+(`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
+undecorated pipeline bit-exact against it — density, surface rules, carvers, aquifers, and
+noise-router veins match every one of the fixture's cells — so the residual block gap is entirely
+inside feature replay. Plain-state mismatches that once looked like base-terrain defects are
+air-writing features the replay does not cover yet: monster rooms (stage 3) open cave_air pockets,
+geodes leave voids, lava lakes fill stage-1 cavities. Vanilla runs those stages before the ores, so
+ore ellipsoids crossing that pre-existing air roll air-exposure discards our run never sees, which
+is why high-attempt ore drift looks symmetric (extra ≈ missing). The next step toward exact parity
+is replaying the remaining pre-ore stages, monster rooms first.
 
 ## Testing worldgen
 
@@ -198,8 +204,12 @@ The older optional
 Beyond the always-on tests, `internal/world` carries env-gated diagnostics for hunting the residual
 parity gap (all skip unless the variable is set): `REGIONIO_REGION_ORE_DIAGNOSTIC=1` compares the
 legacy / center-only / region-replay ore paths per state, and
-`REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1` classifies fixture mismatches into base-vs-base defects (with
-sample coordinates), feature flips per family, and an ambiguous bucket for disk-shaped outputs.
-The base-vs-base count is the number to drive toward zero: each such cell can flip air-exposure
-discard rolls inside overlapping ore ellipsoids, so one sealed cave edge shows up as dozens of
-missing and extra ore blocks.
+`REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1` classifies fixture mismatches by what could have written each
+side. `TestVanillaBaseTerrainParity` compares against `testdata/vanilla_base_12345.bin`, a capture
+of vanilla running with features and structure sets stripped out; regenerate it after any change to
+the derived-datapack logic:
+
+```
+go run ./cmd/vanillacapture -server server.jar -featureless -blocks-only \
+    -port 25585 -output internal/world/testdata/vanilla_base_12345.bin
+```
