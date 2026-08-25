@@ -22,7 +22,9 @@ block editing, persistent worlds, and an overworld generator built on the real
   decoration, and basic template structures. The complete vanilla feature and
   biome datapack graph is embedded; feature ordering, placement modifiers,
   vertical anchors/providers, biome filters, and mutable region writes are
-  implemented and parity diagnostics exercise cross-chunk ore replay.
+  implemented. Production region replay now covers cross-chunk ores, disks,
+  underwater magma, stage-2 amethyst geodes, and lush-cave moss ground patches
+  directly from their datapack configurations.
 - **Gameplay**: four-player session registry; player join/leave and movement
   synchronization; chunk-scoped visibility for players and mobs; shared
   creative block place/break; broadcast chat; and hotbar item→block mapping.
@@ -74,9 +76,10 @@ disconnect. Lighting tests compare the initial flat chunk and a 31x31x31
 glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
-chunks. The current generator matches 91.507% of fixture blocks, all fixture
-biomes, and all fixture heightmaps; CI guards that measured baseline while
-`make parity` requires exact equality. GitHub Actions runs build/vet/tests,
+chunks. The canonical single-chunk generator currently matches 95.378% of
+fixture blocks, while the production region replay path matches 97.953%; both
+match all fixture biomes and heightmaps. CI guards the 91% regression floor
+while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
 request.
 
@@ -94,20 +97,20 @@ capacity pressure evicts them. Structures, placed features, mob AI,
 authentication, inventory, and survival mechanics remain intentionally partial.
 The density router, configured carvers, and noise-router ore veins are
 vanilla-derived. Surface and biome selection are ported but still need broader
-runtime captures. Ordinary decoration remains the largest fidelity gap: the
-production generator still uses a single-chunk ore/tree/spring pass, while the
-more faithful datapack-driven executor supports global `FeatureSorter` indices,
-lazy vanilla RNG interleaving, 3D biome gating, block predicates, heightmaps,
-and cross-chunk writes in diagnostics.
+runtime captures. The production cache now uses atomic batch publication and
+the datapack-driven region replay path, with cross-chunk writes isolated per
+target. Ordinary decoration remains the largest fidelity gap: ore scheduling
+and several non-ore features still differ from vanilla. The biome parameter
+finder uses an exact spatial index and overlapping region requests share a
+bounded immutable terrain cache, keeping cold 3x3 generation near one second
+on the reference Ryzen 5 5600X development machine.
 
-The remaining integration boundary is chunk lifecycle, not feature parsing.
-Vanilla decorates against a mutable neighborhood and a source chunk may write
-into an adjacent target. RegionIO's cache currently coalesces and publishes one
-chunk per miss, so enabling full replay directly would either regenerate large
-overlapping neighborhoods or risk recursive cache loads. The next worldgen
-milestone is batch-oriented base-terrain generation and atomic publication of
-region decoration results; after that, the datapack executor can replace the
-legacy production decoration path.
+The production cache uses atomic batch publication: a miss builds and publishes
+a complete decorated 3x3 neighborhood, while persisted neighbors still take
+precedence. This closes the chunk-lifecycle integration boundary without
+exposing undecorated chunks. The next worldgen milestone is to raise the
+97.953% block parity toward exact equality while keeping cold batch generation
+within an acceptable latency budget.
 
 ## Project layout
 
