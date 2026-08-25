@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"path"
 	"sort"
 	"strings"
@@ -65,6 +66,77 @@ type OreTarget struct {
 		PredicateType string `json:"predicate_type"`
 		Tag           string `json:"tag"`
 	} `json:"target"`
+}
+
+// DiskFeatureConfig is the subset of DiskFeature used by overworld disks.
+// Radius is an inclusive uniform integer provider in the vanilla datapack.
+type DiskFeatureConfig struct {
+	HalfHeight           int
+	RadiusMin, RadiusMax int
+	State                BlockState
+	Fallback             BlockState
+	Rules                []DiskStateRule
+	Targets              []string
+}
+
+type DiskStateRule struct {
+	IfTrue json.RawMessage
+	Then   BlockState
+}
+
+type GeodeFeatureConfig struct {
+	Outer, Middle, Inner, Filling      BlockState
+	AlternateInner                     BlockState
+	InnerPlacements                    []BlockState
+	DistributionMin, DistributionMax   int
+	OuterWallMin, OuterWallMax         int
+	PointOffsetMin, PointOffsetMax     int
+	MaxGenOffset, MinGenOffset         int
+	FillingLayer, InnerLayer           float64
+	MiddleLayer, OuterLayer            float64
+	NoiseMultiplier                    float64
+	InvalidBlocksThreshold             int
+	CannotReplaceTag, InvalidBlocksTag string
+	CrackChance, BaseCrackSize         float64
+	CrackPointOffset                   int
+	UseAlternateLayerChance            float64
+	PlacementsRequireAlternate         bool
+	UsePotentialPlacementsChance       float64
+}
+
+type VegetationPatchFeatureConfig struct {
+	Surface                  string
+	DepthMin, DepthMax       int
+	XZRadiusMin, XZRadiusMax int
+	VerticalRange            int
+	ExtraBottomBlockChance   float32
+	ExtraEdgeColumnChance    float32
+	VegetationChance         float32
+	Ground                   BlockState
+	ReplaceableTag           string
+	Vegetation               FeatureRef
+}
+
+// SimpleBlockFeatureConfig is the datapack form used by simple_block. The
+// provider entries retain their vanilla weights and named block properties so
+// the feature can choose a state with the feature RNG at placement time.
+type SimpleBlockFeatureConfig struct {
+	States []WeightedBlockState
+}
+
+type WeightedBlockState struct {
+	State  BlockState
+	Weight int
+}
+
+type UnderwaterMagmaFeatureConfig struct {
+	FloorSearchRange           int     `json:"floor_search_range"`
+	PlacementProbability       float32 `json:"placement_probability_per_valid_position"`
+	PlacementRadiusAroundFloor int     `json:"placement_radius_around_floor"`
+}
+
+type ProbabilityFeatureConfig struct {
+	Probability float32
 }
 
 type SpringFeatureConfig struct {
@@ -219,8 +291,8 @@ func (p PlacementPlan) SampleY(r RandomSource, minY, height int) int {
 	return lo + int(r.NextIntN(int32(span)))
 }
 
-func DecorationRandom(seed int64, chunkX, chunkZ int) (*Legacy, int64) {
-	random := NewLegacy(0)
+func DecorationRandom(seed int64, chunkX, chunkZ int) (*WorldgenRandom, int64) {
+	random := NewWorldgenRandom(0)
 	decorationSeed := random.SetDecorationSeed(seed, chunkX<<4, chunkZ<<4)
 	return random, decorationSeed
 }
@@ -388,6 +460,290 @@ func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {
 	return config, nil
 }
 
+func (s *FeatureSet) Disk(name string) (DiskFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:disk" {
+		return DiskFeatureConfig{}, fmt.Errorf("worldgen: %s is not a disk feature", name)
+	}
+	var raw struct {
+		HalfHeight int `json:"half_height"`
+		Radius     struct {
+			Min int `json:"min_inclusive"`
+			Max int `json:"max_inclusive"`
+		} `json:"radius"`
+		StateProvider json.RawMessage `json:"state_provider"`
+		Target        struct {
+			Blocks json.RawMessage `json:"blocks"`
+		} `json:"target"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return DiskFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	var provider struct {
+		State    BlockState `json:"state"`
+		Fallback struct {
+			State BlockState `json:"state"`
+		} `json:"fallback"`
+		Rules []struct {
+			Then struct {
+				State BlockState `json:"state"`
+			} `json:"then"`
+			IfTrue json.RawMessage `json:"if_true"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(raw.StateProvider, &provider); err != nil {
+		return DiskFeatureConfig{}, fmt.Errorf("worldgen: decode %s state provider: %w", name, err)
+	}
+	config := DiskFeatureConfig{
+		HalfHeight: raw.HalfHeight, RadiusMin: raw.Radius.Min, RadiusMax: raw.Radius.Max,
+		State: provider.State, Fallback: provider.Fallback.State,
+	}
+	for _, rule := range provider.Rules {
+		if len(rule.IfTrue) != 0 && rule.Then.State.Name != "" {
+			config.Rules = append(config.Rules, DiskStateRule{IfTrue: rule.IfTrue, Then: rule.Then.State})
+		}
+	}
+	if config.State.Name == "" {
+		config.State = config.Fallback
+	}
+	if config.Fallback.Name == "" {
+		config.Fallback = config.State
+	}
+	if len(raw.Target.Blocks) == 0 {
+		return DiskFeatureConfig{}, fmt.Errorf("worldgen: invalid disk target %s", name)
+	}
+	if raw.Target.Blocks[0] == '"' {
+		var block string
+		if err := json.Unmarshal(raw.Target.Blocks, &block); err != nil {
+			return DiskFeatureConfig{}, err
+		}
+		config.Targets = []string{block}
+	} else if err := json.Unmarshal(raw.Target.Blocks, &config.Targets); err != nil {
+		return DiskFeatureConfig{}, err
+	}
+	if config.RadiusMin < 0 || config.RadiusMax < config.RadiusMin || config.State.Name == "" || len(config.Targets) == 0 {
+		return DiskFeatureConfig{}, fmt.Errorf("worldgen: invalid disk config %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) Geode(name string) (GeodeFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:geode" {
+		return GeodeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a geode feature", name)
+	}
+	var raw struct {
+		Distribution struct {
+			Min int `json:"min_inclusive"`
+			Max int `json:"max_inclusive"`
+		} `json:"distribution_points"`
+		OuterWall struct {
+			Min int `json:"min_inclusive"`
+			Max int `json:"max_inclusive"`
+		} `json:"outer_wall_distance"`
+		PointOffset struct {
+			Min int `json:"min_inclusive"`
+			Max int `json:"max_inclusive"`
+		} `json:"point_offset"`
+		MinGenOffset int `json:"min_gen_offset"`
+		MaxGenOffset int `json:"max_gen_offset"`
+		Crack        struct {
+			BaseSize    float64 `json:"base_crack_size"`
+			PointOffset int     `json:"crack_point_offset"`
+			Chance      float64 `json:"generate_crack_chance"`
+		} `json:"crack"`
+		Layers struct {
+			Filling float64 `json:"filling"`
+			Inner   float64 `json:"inner_layer"`
+			Middle  float64 `json:"middle_layer"`
+			Outer   float64 `json:"outer_layer"`
+		} `json:"layers"`
+		NoiseMultiplier              float64 `json:"noise_multiplier"`
+		InvalidBlocksThreshold       int     `json:"invalid_blocks_threshold"`
+		CannotReplace                string  `json:"cannot_replace"`
+		InvalidBlocks                string  `json:"invalid_blocks"`
+		UseAlternateLayerChance      float64 `json:"use_alternate_layer0_chance"`
+		PlacementsRequireAlternate   bool    `json:"placements_require_layer0_alternate"`
+		UsePotentialPlacementsChance float64 `json:"use_potential_placements_chance"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return GeodeFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	var wrapper struct {
+		Blocks map[string]json.RawMessage `json:"blocks"`
+	}
+	if err := json.Unmarshal(configured.Config, &wrapper); err != nil {
+		return GeodeFeatureConfig{}, err
+	}
+	blocks := wrapper.Blocks
+	stateProvider := func(key string) BlockState {
+		var provider struct {
+			State BlockState `json:"state"`
+		}
+		_ = json.Unmarshal(blocks[key], &provider)
+		return provider.State
+	}
+	stringValue := func(key string) string {
+		var value string
+		_ = json.Unmarshal(blocks[key], &value)
+		return value
+	}
+	var innerPlacements []BlockState
+	_ = json.Unmarshal(blocks["inner_placements"], &innerPlacements)
+	config := GeodeFeatureConfig{
+		Outer:           stateProvider("outer_layer_provider"),
+		Middle:          stateProvider("middle_layer_provider"),
+		Inner:           stateProvider("inner_layer_provider"),
+		Filling:         stateProvider("filling_provider"),
+		AlternateInner:  stateProvider("alternate_inner_layer_provider"),
+		InnerPlacements: innerPlacements,
+		DistributionMin: raw.Distribution.Min, DistributionMax: raw.Distribution.Max,
+		OuterWallMin: raw.OuterWall.Min, OuterWallMax: raw.OuterWall.Max,
+		PointOffsetMin: raw.PointOffset.Min, PointOffsetMax: raw.PointOffset.Max,
+		MinGenOffset: raw.MinGenOffset, MaxGenOffset: raw.MaxGenOffset,
+		FillingLayer: raw.Layers.Filling, InnerLayer: raw.Layers.Inner,
+		MiddleLayer: raw.Layers.Middle, OuterLayer: raw.Layers.Outer,
+		NoiseMultiplier: raw.NoiseMultiplier, InvalidBlocksThreshold: raw.InvalidBlocksThreshold,
+		CannotReplaceTag: stringValue("cannot_replace"), InvalidBlocksTag: stringValue("invalid_blocks"),
+		CrackChance: raw.Crack.Chance, BaseCrackSize: raw.Crack.BaseSize,
+		CrackPointOffset:             raw.Crack.PointOffset,
+		UseAlternateLayerChance:      raw.UseAlternateLayerChance,
+		PlacementsRequireAlternate:   raw.PlacementsRequireAlternate,
+		UsePotentialPlacementsChance: raw.UsePotentialPlacementsChance,
+	}
+	if config.Outer.Name == "" || config.Middle.Name == "" || config.Inner.Name == "" || config.Filling.Name == "" ||
+		config.DistributionMin < 1 || config.DistributionMax < config.DistributionMin ||
+		config.OuterWallMin < 1 || config.OuterWallMax < config.OuterWallMin ||
+		config.PointOffsetMin < 0 || config.PointOffsetMax < config.PointOffsetMin ||
+		config.MaxGenOffset < config.MinGenOffset || config.FillingLayer <= 0 || config.InnerLayer <= 0 ||
+		config.MiddleLayer <= 0 || config.OuterLayer <= 0 || config.NoiseMultiplier < 0 ||
+		config.InvalidBlocksThreshold < 0 || config.CannotReplaceTag == "" || config.InvalidBlocksTag == "" {
+		return GeodeFeatureConfig{}, fmt.Errorf("worldgen: invalid geode config %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:vegetation_patch" {
+		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a vegetation patch", name)
+	}
+	var raw struct {
+		Surface                string          `json:"surface"`
+		Depth                  json.RawMessage `json:"depth"`
+		XZRadius               json.RawMessage `json:"xz_radius"`
+		VerticalRange          int             `json:"vertical_range"`
+		ExtraBottomBlockChance float32         `json:"extra_bottom_block_chance"`
+		ExtraEdgeColumnChance  float32         `json:"extra_edge_column_chance"`
+		VegetationChance       float32         `json:"vegetation_chance"`
+		Replaceable            string          `json:"replaceable"`
+		GroundState            struct {
+			State BlockState `json:"state"`
+		} `json:"ground_state"`
+		VegetationFeature json.RawMessage `json:"vegetation_feature"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	depth, err := parseIntProvider(raw.Depth)
+	if err != nil || len(depth.Weighted) != 0 {
+		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s depth: %w", name, err)
+	}
+	radius, err := parseIntProvider(raw.XZRadius)
+	if err != nil || len(radius.Weighted) != 0 {
+		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s radius: %w", name, err)
+	}
+	vegetation, err := parseFeatureRef(raw.VegetationFeature)
+	if err != nil {
+		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s vegetation: %w", name, err)
+	}
+	config := VegetationPatchFeatureConfig{
+		Surface: raw.Surface, DepthMin: depth.Min, DepthMax: depth.Max,
+		XZRadiusMin: radius.Min, XZRadiusMax: radius.Max, VerticalRange: raw.VerticalRange,
+		ExtraBottomBlockChance: raw.ExtraBottomBlockChance, ExtraEdgeColumnChance: raw.ExtraEdgeColumnChance,
+		VegetationChance: raw.VegetationChance, Ground: raw.GroundState.State,
+		ReplaceableTag: raw.Replaceable, Vegetation: vegetation,
+	}
+	if config.Surface != "floor" && config.Surface != "ceiling" || config.DepthMin < 1 ||
+		config.DepthMax < config.DepthMin || config.XZRadiusMin < 1 || config.XZRadiusMax < config.XZRadiusMin ||
+		config.VerticalRange < 1 || config.Ground.Name == "" || config.ReplaceableTag == "" {
+		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: invalid vegetation patch %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) SimpleBlock(name string) (SimpleBlockFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:simple_block" {
+		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: %s is not a simple block feature", name)
+	}
+	var raw struct {
+		ToPlace json.RawMessage `json:"to_place"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	var provider struct {
+		Type    string     `json:"type"`
+		State   BlockState `json:"state"`
+		Entries []struct {
+			Data   BlockState `json:"data"`
+			Weight int        `json:"weight"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(raw.ToPlace, &provider); err != nil {
+		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: decode %s provider: %w", name, err)
+	}
+	config := SimpleBlockFeatureConfig{}
+	switch provider.Type {
+	case "minecraft:simple_state_provider":
+		config.States = []WeightedBlockState{{State: provider.State, Weight: 1}}
+	case "minecraft:weighted_state_provider":
+		for _, entry := range provider.Entries {
+			if entry.Weight > 0 && entry.Data.Name != "" {
+				config.States = append(config.States, WeightedBlockState{State: entry.Data, Weight: entry.Weight})
+			}
+		}
+	default:
+		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: unsupported simple block provider %q", provider.Type)
+	}
+	if len(config.States) == 0 {
+		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: invalid simple block feature %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) UnderwaterMagma(name string) (UnderwaterMagmaFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:underwater_magma" {
+		return UnderwaterMagmaFeatureConfig{}, fmt.Errorf("worldgen: %s is not underwater magma", name)
+	}
+	var config UnderwaterMagmaFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return UnderwaterMagmaFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.FloorSearchRange < 1 || config.PlacementRadiusAroundFloor < 0 ||
+		config.PlacementProbability <= 0 || config.PlacementProbability > 1 {
+		return UnderwaterMagmaFeatureConfig{}, fmt.Errorf("worldgen: invalid underwater magma config %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) Probability(name string) (ProbabilityFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:seagrass" {
+		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: %s is not seagrass", name)
+	}
+	var config ProbabilityFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.Probability < 0 || config.Probability > 1 {
+		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: invalid probability %s", name)
+	}
+	return config, nil
+}
+
 func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:spring_feature" {
@@ -526,7 +882,7 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 			plan.HeightDistribution, plan.HeightPlateau, plan.MinY, plan.MaxY = value.Height.Type, value.Height.Plateau, min, max
 		case "minecraft:in_square", "minecraft:biome", "minecraft:surface_water_depth_filter",
 			"minecraft:heightmap", "minecraft:block_predicate_filter", "minecraft:noise_threshold_count",
-			"minecraft:random_offset":
+			"minecraft:noise_based_count", "minecraft:random_offset", "minecraft:environment_scan", "minecraft:surface_relative_threshold_filter":
 			// Coordinate spreading and biome validation are applied by the world
 			// executor. Keeping them in the parsed plan preserves their order.
 		default:
@@ -564,6 +920,22 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 		modifier := placed.Placement[index]
 		next := func(value FeaturePosition) error { return apply(index+1, value) }
 		switch modifier.Type {
+		case "minecraft:noise_based_count":
+			var value struct {
+				Ratio  int     `json:"noise_to_count_ratio"`
+				Factor float64 `json:"noise_factor"`
+				Offset float64 `json:"noise_offset"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Ratio < 0 || value.Factor == 0 {
+				return fmt.Errorf("worldgen: %s invalid noise based count", name)
+			}
+			noise := BiomeInfoNoise(float64(position.X)/value.Factor, float64(position.Z)/value.Factor)
+			for count := int(math.Ceil((noise + value.Offset) * float64(value.Ratio))); count > 0; count-- {
+				if err := next(position); err != nil {
+					return err
+				}
+			}
+			return nil
 		case "minecraft:count":
 			var value struct {
 				Count json.RawMessage `json:"count"`
@@ -634,6 +1006,31 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 				return next(position)
 			}
 			return nil
+		case "minecraft:surface_relative_threshold_filter":
+			var value struct {
+				Heightmap string `json:"heightmap"`
+				Min       *int   `json:"min_inclusive"`
+				Max       *int   `json:"max_inclusive"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Heightmap == "" {
+				return fmt.Errorf("worldgen: %s invalid surface relative threshold", name)
+			}
+			if context.HeightAt == nil {
+				return fmt.Errorf("worldgen: %s surface relative threshold requires HeightAt", name)
+			}
+			minOffset, maxOffset := -int(^uint(0)>>1)-1, int(^uint(0)>>1)
+			if value.Min != nil {
+				minOffset = *value.Min
+			}
+			if value.Max != nil {
+				maxOffset = *value.Max
+			}
+			surface := context.HeightAt(value.Heightmap, position.X, position.Z)
+			positionY, surfaceY := int64(position.Y), int64(surface)
+			if positionY >= surfaceY+int64(minOffset) && positionY <= surfaceY+int64(maxOffset) {
+				return next(position)
+			}
+			return nil
 		case "minecraft:random_offset":
 			var value struct {
 				XZSpread json.RawMessage `json:"xz_spread"`
@@ -669,6 +1066,56 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 				return err
 			}
 			if ok {
+				return next(position)
+			}
+			return nil
+		case "minecraft:environment_scan":
+			var value struct {
+				Direction string          `json:"direction_of_search"`
+				Target    json.RawMessage `json:"target_condition"`
+				Allowed   json.RawMessage `json:"allowed_search_condition"`
+				MaxSteps  int             `json:"max_steps"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.MaxSteps < 1 ||
+				value.Direction != "up" && value.Direction != "down" {
+				return fmt.Errorf("worldgen: %s invalid environment scan", name)
+			}
+			if context.BlockPredicate == nil {
+				return fmt.Errorf("worldgen: %s environment scan requires BlockPredicate", name)
+			}
+			allowed, err := context.BlockPredicate(value.Allowed, position)
+			if err != nil || !allowed {
+				return err
+			}
+			dy := 1
+			if value.Direction == "down" {
+				dy = -1
+			}
+			for step := 0; step < value.MaxSteps; step++ {
+				matched, err := context.BlockPredicate(value.Target, position)
+				if err != nil {
+					return err
+				}
+				if matched {
+					return next(position)
+				}
+				position.Y += dy
+				if position.Y < context.MinY || position.Y >= context.MinY+context.Height {
+					return nil
+				}
+				allowed, err = context.BlockPredicate(value.Allowed, position)
+				if err != nil {
+					return err
+				}
+				if !allowed {
+					break
+				}
+			}
+			matched, err := context.BlockPredicate(value.Target, position)
+			if err != nil {
+				return err
+			}
+			if matched {
 				return next(position)
 			}
 			return nil

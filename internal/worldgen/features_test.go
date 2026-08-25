@@ -70,6 +70,54 @@ func TestFeatureDatapackLoadsAndLinks(t *testing.T) {
 	if err != nil || lavaPlan.HeightDistribution != "minecraft:very_biased_to_bottom" {
 		t.Fatalf("spring lava placement = %+v, err=%v", lavaPlan, err)
 	}
+	disk, err := set.Disk("minecraft:ore_clay")
+	if err == nil {
+		t.Fatalf("ore feature parsed as disk: %+v", disk)
+	}
+	disk, err = set.Disk("minecraft:disk_clay")
+	if err != nil || disk.RadiusMin != 2 || disk.RadiusMax != 3 || disk.HalfHeight != 1 || disk.State.Name != "minecraft:clay" {
+		t.Fatalf("clay disk = %+v, err=%v", disk, err)
+	}
+	sand, err := set.Disk("minecraft:disk_sand")
+	if err != nil || sand.State.Name != "minecraft:sand" || sand.Fallback.Name != "minecraft:sand" ||
+		len(sand.Rules) != 1 || sand.Rules[0].Then.Name != "minecraft:sandstone" {
+		t.Fatalf("sand disk = %+v, err=%v", sand, err)
+	}
+	grassDisk, err := set.Disk("minecraft:disk_grass")
+	if err != nil || grassDisk.State.Name != "minecraft:dirt" || grassDisk.Fallback.Name != "minecraft:dirt" ||
+		len(grassDisk.Rules) != 1 || grassDisk.Rules[0].Then.Name != "minecraft:grass_block" {
+		t.Fatalf("grass disk = %+v, err=%v", grassDisk, err)
+	}
+	geode, err := set.Geode("minecraft:amethyst_geode")
+	if err != nil || geode.Outer.Name != "minecraft:smooth_basalt" || geode.Middle.Name != "minecraft:calcite" ||
+		geode.Inner.Name != "minecraft:amethyst_block" || geode.Filling.Name != "minecraft:air" ||
+		geode.AlternateInner.Name != "minecraft:budding_amethyst" || len(geode.InnerPlacements) != 4 ||
+		geode.DistributionMin != 3 || geode.DistributionMax != 4 || geode.OuterWallMin != 4 || geode.OuterWallMax != 6 ||
+		geode.PointOffsetMin != 1 || geode.PointOffsetMax != 2 || geode.MinGenOffset != -16 || geode.MaxGenOffset != 16 ||
+		geode.FillingLayer != 1.7 || geode.InnerLayer != 2.2 || geode.MiddleLayer != 3.2 || geode.OuterLayer != 4.2 ||
+		geode.NoiseMultiplier != 0.05 || geode.InvalidBlocksThreshold != 1 ||
+		geode.CannotReplaceTag != "#minecraft:features_cannot_replace" || geode.InvalidBlocksTag != "#minecraft:geode_invalid_blocks" ||
+		geode.CrackChance != 0.95 || geode.BaseCrackSize != 2 || geode.CrackPointOffset != 2 {
+		t.Fatalf("amethyst geode = %+v, err=%v", geode, err)
+	}
+	patch, err := set.VegetationPatch("minecraft:moss_patch")
+	if err != nil || patch.Surface != "floor" || patch.DepthMin != 1 || patch.DepthMax != 1 ||
+		patch.XZRadiusMin != 4 || patch.XZRadiusMax != 7 || patch.Ground.Name != "minecraft:moss_block" ||
+		patch.ReplaceableTag != "#minecraft:moss_replaceable" || patch.Vegetation.Name != "minecraft:moss_vegetation" {
+		t.Fatalf("moss patch = %+v, err=%v", patch, err)
+	}
+	ceiling, err := set.VegetationPatch("minecraft:moss_patch_ceiling")
+	if err != nil || ceiling.Surface != "ceiling" || ceiling.VegetationChance != 0.08 {
+		t.Fatalf("ceiling moss patch = %+v, err=%v", ceiling, err)
+	}
+	magma, err := set.UnderwaterMagma("minecraft:underwater_magma")
+	if err != nil || magma.FloorSearchRange != 5 || magma.PlacementRadiusAroundFloor != 1 || magma.PlacementProbability != 0.5 {
+		t.Fatalf("underwater magma = %+v, err=%v", magma, err)
+	}
+	probability, err := set.Probability("minecraft:seagrass_tall")
+	if err != nil || probability.Probability != 0.8 {
+		t.Fatalf("seagrass probability = %+v, err=%v", probability, err)
+	}
 }
 
 func TestFeatureStepsAgainstVanillaRuntimeVectors(t *testing.T) {
