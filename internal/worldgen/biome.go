@@ -1,6 +1,9 @@
 package worldgen
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // This file reproduces net.minecraft.world.level.biome.Climate, the multi-noise
 // biome selector. A point in climate space is six quantized coordinates
@@ -81,11 +84,24 @@ type BiomeParameter struct {
 // ParameterTable is the set of biome parameters the finder searches.
 type ParameterTable struct {
 	entries []tableEntry
+	root    *biomeSearchNode
 }
 
 type tableEntry struct {
 	param BiomeParameter
 }
+
+// biomeSearchNode indexes parameter ranges by a bounding volume. Its lower
+// bound is safe for vanilla's fitDistance metric, allowing exact nearest
+// searches without scanning every climate entry for each biome cell.
+type biomeSearchNode struct {
+	min, max     [AxisCount]int64
+	minOffsetAbs int64
+	left, right  *biomeSearchNode
+	indices      []int
+}
+
+const biomeSearchLeafSize = 16
 
 // NewParameterTable builds a searchable table from raw biome parameters.
 func NewParameterTable(params []BiomeParameter) *ParameterTable {
@@ -93,23 +109,120 @@ func NewParameterTable(params []BiomeParameter) *ParameterTable {
 	for i, p := range params {
 		t.entries[i] = tableEntry{param: p}
 	}
+	indices := make([]int, len(params))
+	for i := range indices {
+		indices[i] = i
+	}
+	t.root = buildBiomeSearchTree(t.entries, indices)
 	return t
 }
 
 // FindBiome returns the parameter with the lowest vanilla fitness. Table order
 // is the deterministic tie breaker because equal fitness never replaces best.
 func (t *ParameterTable) FindBiome(point TargetPoint) string {
-	var best string
-	bestDist := int64(math.MaxInt64)
-
-	for _, e := range t.entries {
-		d := fitDistance(point, e.param.Ranges, e.param.Offset)
-		if d < bestDist {
-			bestDist = d
-			best = e.param.Name
+	bestDist, bestIndex := int64(math.MaxInt64), len(t.entries)
+	var visit func(*biomeSearchNode)
+	visit = func(node *biomeSearchNode) {
+		if node == nil || biomeNodeLowerBound(point, node) > bestDist {
+			return
+		}
+		if node.indices != nil {
+			for _, index := range node.indices {
+				d := fitDistance(point, t.entries[index].param.Ranges, t.entries[index].param.Offset)
+				if d < bestDist || d == bestDist && index < bestIndex {
+					bestDist, bestIndex = d, index
+				}
+			}
+			return
+		}
+		leftDistance := biomeNodeLowerBound(point, node.left)
+		rightDistance := biomeNodeLowerBound(point, node.right)
+		if leftDistance <= rightDistance {
+			visit(node.left)
+			visit(node.right)
+		} else {
+			visit(node.right)
+			visit(node.left)
 		}
 	}
-	return best
+	visit(t.root)
+	if bestIndex == len(t.entries) {
+		return ""
+	}
+	return t.entries[bestIndex].param.Name
+}
+
+func buildBiomeSearchTree(entries []tableEntry, indices []int) *biomeSearchNode {
+	if len(indices) == 0 {
+		return nil
+	}
+	node := &biomeSearchNode{minOffsetAbs: math.MaxInt64}
+	for axis := 0; axis < AxisCount; axis++ {
+		node.min[axis], node.max[axis] = math.MaxInt64, math.MinInt64
+	}
+	for _, index := range indices {
+		param := entries[index].param
+		if offset := absInt64(param.Offset); offset < node.minOffsetAbs {
+			node.minOffsetAbs = offset
+		}
+		for axis, r := range param.Ranges {
+			if r.Min < node.min[axis] {
+				node.min[axis] = r.Min
+			}
+			if r.Max > node.max[axis] {
+				node.max[axis] = r.Max
+			}
+		}
+	}
+	if len(indices) <= biomeSearchLeafSize {
+		node.indices = append([]int(nil), indices...)
+		return node
+	}
+	axis := 0
+	for candidate := 1; candidate < AxisCount; candidate++ {
+		if node.max[candidate]-node.min[candidate] > node.max[axis]-node.min[axis] {
+			axis = candidate
+		}
+	}
+	sort.SliceStable(indices, func(i, j int) bool {
+		left := entries[indices[i]].param.Ranges[axis]
+		right := entries[indices[j]].param.Ranges[axis]
+		leftMid := left.Min + (left.Max-left.Min)/2
+		rightMid := right.Min + (right.Max-right.Min)/2
+		if leftMid != rightMid {
+			return leftMid < rightMid
+		}
+		return indices[i] < indices[j]
+	})
+	middle := len(indices) / 2
+	node.left = buildBiomeSearchTree(entries, indices[:middle])
+	node.right = buildBiomeSearchTree(entries, indices[middle:])
+	return node
+}
+
+func biomeNodeLowerBound(point TargetPoint, node *biomeSearchNode) int64 {
+	if node == nil {
+		return math.MaxInt64
+	}
+	values := [AxisCount]int64{point.Temperature, point.Humidity, point.Continentalness, point.Erosion, point.Depth, point.Weirdness}
+	var total int64
+	for axis, value := range values {
+		var distance int64
+		if value < node.min[axis] {
+			distance = node.min[axis] - value
+		} else if value > node.max[axis] {
+			distance = value - node.max[axis]
+		}
+		total += distance * distance
+	}
+	return total + node.minOffsetAbs*node.minOffsetAbs
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 // containsAll reports whether every range contains its corresponding coordinate.

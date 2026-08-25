@@ -91,6 +91,13 @@ func NewXoroshiro(seed int64) *Xoroshiro {
 	return newXoroshiroFrom(s.lo, s.hi)
 }
 
+// SetSeed resets the source exactly like XoroshiroRandomSource.setSeed.
+func (x *Xoroshiro) SetSeed(seed int64) {
+	s := upgradeSeedTo128bit(uint64(seed))
+	x.lo, x.hi = s.lo, s.hi
+	x.haveGaussian = false
+}
+
 func newXoroshiroFrom(lo, hi uint64) *Xoroshiro {
 	if lo == 0 && hi == 0 {
 		lo, hi = goldenRatio64, silverRatio64
@@ -318,6 +325,100 @@ func (f *legacyPositional) FromHashOf(name string) RandomSource {
 // At mirrors LegacyPositionalRandomFactory.at.
 func (f *legacyPositional) At(x, y, z int) RandomSource {
 	return NewLegacy(positionSeed(x, y, z) ^ int64(f.seed))
+}
+
+// WorldgenRandom is the adapter used by ChunkGenerator.applyBiomeDecoration in
+// vanilla 26.1.2. Its public random methods retain BitRandomSource's
+// next(bits) semantics, while each bit draw is backed by one Xoroshiro long.
+// This is intentionally different from calling Xoroshiro's public methods
+// directly.
+type WorldgenRandom struct {
+	source       *Xoroshiro
+	gaussian     float64
+	haveGaussian bool
+}
+
+func NewWorldgenRandom(seed int64) *WorldgenRandom {
+	return &WorldgenRandom{source: NewXoroshiro(seed)}
+}
+
+func (r *WorldgenRandom) SetSeed(seed int64) {
+	r.source.SetSeed(seed)
+	r.haveGaussian = false
+}
+
+func (r *WorldgenRandom) SetDecorationSeed(seed int64, blockX, blockZ int) int64 {
+	r.SetSeed(seed)
+	a := r.NextLong() | 1
+	b := r.NextLong() | 1
+	decorationSeed := int64(blockX)*a + int64(blockZ)*b ^ seed
+	r.SetSeed(decorationSeed)
+	return decorationSeed
+}
+
+func (r *WorldgenRandom) SetFeatureSeed(decorationSeed int64, featureIndex, stage int) {
+	r.SetSeed(decorationSeed + int64(featureIndex) + int64(10000*stage))
+}
+
+func (r *WorldgenRandom) next(bits uint) int32 {
+	return int32(uint64(r.source.NextLong()) >> (64 - bits))
+}
+
+func (r *WorldgenRandom) NextInt() int32 { return r.next(32) }
+
+func (r *WorldgenRandom) NextIntN(bound int32) int32 {
+	if bound&-bound == bound {
+		return int32((int64(bound) * int64(r.next(31))) >> 31)
+	}
+	for {
+		j := r.next(31)
+		k := j % bound
+		if j-k+(bound-1) >= 0 {
+			return k
+		}
+	}
+}
+
+func (r *WorldgenRandom) NextLong() int64 {
+	return int64(r.next(32))<<32 + int64(r.next(32))
+}
+
+func (r *WorldgenRandom) NextDouble() float64 {
+	hi := int64(r.next(26))
+	lo := int64(r.next(27))
+	return float64(hi<<27+lo) * 0x1.0p-53
+}
+
+func (r *WorldgenRandom) NextFloat() float32 { return float32(r.next(24)) * 0x1.0p-24 }
+func (r *WorldgenRandom) NextBoolean() bool  { return r.next(1) != 0 }
+
+func (r *WorldgenRandom) NextGaussian() float64 {
+	if r.haveGaussian {
+		r.haveGaussian = false
+		return r.gaussian
+	}
+	for {
+		u := 2*r.NextDouble() - 1
+		v := 2*r.NextDouble() - 1
+		s := u*u + v*v
+		if s == 0 || s >= 1 {
+			continue
+		}
+		factor := math.Sqrt(-2 * math.Log(s) / s)
+		r.gaussian = v * factor
+		r.haveGaussian = true
+		return u * factor
+	}
+}
+
+func (r *WorldgenRandom) ConsumeCount(n int) {
+	for i := 0; i < n; i++ {
+		r.next(32)
+	}
+}
+
+func (r *WorldgenRandom) ForkPositional() PositionalRandomFactory {
+	return r.source.ForkPositional()
 }
 
 func javaStringHashCode(s string) int32 {

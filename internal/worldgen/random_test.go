@@ -120,3 +120,27 @@ func TestDecorationAndFeatureSeedVectors(t *testing.T) {
 		}
 	}
 }
+
+func TestXoroshiroWorldgenDecorationVector(t *testing.T) {
+	random := NewWorldgenRandom(0)
+	decorationSeed := random.SetDecorationSeed(12345, 0, 0)
+	if decorationSeed != 12345 {
+		t.Fatalf("decoration seed = %d, want 12345", decorationSeed)
+	}
+	random.SetFeatureSeed(decorationSeed, 10, 6)
+	if got := random.NextIntN(16); got != 3 {
+		t.Fatalf("nextInt(16) = %d, want 3", got)
+	}
+	if got := random.NextIntN(16); got != 9 {
+		t.Fatalf("second nextInt(16) = %d, want 9", got)
+	}
+	if got := random.NextIntN(65); got != 21 {
+		t.Fatalf("nextInt(65) = %d, want 21", got)
+	}
+	if got := random.NextFloat(); math.Abs(float64(got-0.4394614)) > 1e-7 {
+		t.Fatalf("nextFloat = %.9f, want 0.4394614", got)
+	}
+	if got := random.NextDouble(); math.Abs(got-0.6041286197351282) > 1e-15 {
+		t.Fatalf("nextDouble = %.17f, want 0.6041286197351282", got)
+	}
+}

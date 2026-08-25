@@ -1,6 +1,9 @@
 package worldgen
 
 import (
+	"math"
+	"math/rand"
+	"strconv"
 	"testing"
 )
 
@@ -45,6 +48,45 @@ func TestParameterTableDistanceOffsetAndTies(t *testing.T) {
 	}
 	if got := fitDistance(point, pointRange(5), 0); got != 0 {
 		t.Fatalf("point inside exact range has fitness %d", got)
+	}
+}
+
+func TestParameterTableIndexMatchesLinearSearch(t *testing.T) {
+	random := rand.New(rand.NewSource(12345))
+	params := make([]BiomeParameter, 2048)
+	for i := range params {
+		params[i].Name = "biome-" + strconv.Itoa(i)
+		for axis := 0; axis < AxisCount; axis++ {
+			lo := random.Int63n(40001) - 20000
+			hi := lo + random.Int63n(5001)
+			params[i].Ranges[axis] = ClimateRange{Min: lo, Max: hi}
+		}
+		params[i].Offset = random.Int63n(1001) - 500
+	}
+	// Duplicate an entry under a later name to exercise the original-order tie
+	// break across separate leaves of the search tree.
+	params[len(params)-1] = params[0]
+	params[len(params)-1].Name = "later duplicate"
+
+	table := NewParameterTable(params)
+	for sample := 0; sample < 5000; sample++ {
+		point := TargetPoint{
+			Temperature:     random.Int63n(50001) - 25000,
+			Humidity:        random.Int63n(50001) - 25000,
+			Continentalness: random.Int63n(50001) - 25000,
+			Erosion:         random.Int63n(50001) - 25000,
+			Depth:           random.Int63n(50001) - 25000,
+			Weirdness:       random.Int63n(50001) - 25000,
+		}
+		want, bestDist := "", int64(math.MaxInt64)
+		for _, param := range params {
+			if distance := fitDistance(point, param.Ranges, param.Offset); distance < bestDist {
+				want, bestDist = param.Name, distance
+			}
+		}
+		if got := table.FindBiome(point); got != want {
+			t.Fatalf("sample %d: indexed FindBiome = %q, linear = %q", sample, got, want)
+		}
 	}
 }
 
