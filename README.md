@@ -77,7 +77,7 @@ glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
 chunks. The canonical single-chunk generator currently matches 95.378% of
-fixture blocks, while the production region replay path matches 97.953%; both
+fixture blocks, while the production region replay path matches 98.028%; both
 match all fixture biomes and heightmaps. CI guards the 91% regression floor
 while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
@@ -108,9 +108,17 @@ on the reference Ryzen 5 5600X development machine.
 The production cache uses atomic batch publication: a miss builds and publishes
 a complete decorated 3x3 neighborhood, while persisted neighbors still take
 precedence. This closes the chunk-lifecycle integration boundary without
-exposing undecorated chunks. The next worldgen milestone is to raise the
-97.953% block parity toward exact equality while keeping cold batch generation
-within an acceptable latency budget.
+exposing undecorated chunks.
+
+The remaining block-parity gap is entirely underground: no surface or waterline
+cells mismatch. Parity diagnostics confirm the stage-6 feature schedule, the
+feature-index seeds, and the climate biome ordering are aligned with vanilla,
+and rare ores such as gold and redstone already match exactly. High-attempt
+features instead drift because a few hundred residual base-terrain differences
+(aquifer fluid edges and carver air boundaries) flip air-exposure discard rolls
+inside later veins. The next worldgen milestone is to close those base-terrain
+differences and raise the 98.028% block parity toward exact equality while
+keeping cold batch generation within an acceptable latency budget.
 
 ## Project layout
 
