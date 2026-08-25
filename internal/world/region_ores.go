@@ -2,6 +2,84 @@ package world
 
 import "regionio/internal/worldgen"
 
+// placeScheduledUndergroundOresStage executes the complete vanilla stage-6
+// schedule in one pass. Feature seeds are independent, but feature writes are
+// not: underwater magma is ordered between copper and clay, followed by the
+// disk features. Replaying by feature type silently changed the terrain seen
+// by later entries.
+func (r *decorationRegion) placeScheduledUndergroundOresStage(seed int64) error {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		return err
+	}
+	if err := r.ensureSourceNeighborhood(); err != nil {
+		return err
+	}
+	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), undergroundOresStage)
+	if err != nil {
+		return err
+	}
+	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
+	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
+	magma, magmaOK := nameToStateID("minecraft:magma_block", nil)
+	for _, scheduled := range schedule {
+		placed, ok := set.Placed[scheduled.Name]
+		if !ok {
+			continue
+		}
+		configured, ok := set.Configured[placed.Feature]
+		if !ok {
+			continue
+		}
+		random.SetFeatureSeed(decorationSeed, scheduled.Index, undergroundOresStage)
+		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
+			return r.biomeAllowsFeature(set, scheduled.Name, undergroundOresStage, position)
+		})
+		switch configured.Type {
+		case "minecraft:ore":
+			config, err := set.Ore(placed.Feature)
+			if err != nil {
+				return err
+			}
+			targets, ok := resolveOreTargets(set, config)
+			if !ok {
+				continue
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				placeOreEllipsoidRegion(r, random, position.X, position.Y, position.Z, config.Size, config.DiscardAirExposure, targets)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:underwater_magma":
+			if !magmaOK {
+				continue
+			}
+			config, err := set.UnderwaterMagma(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeUnderwaterMagma(random, position, config, magma)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:disk":
+			config, err := set.Disk(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				return r.placeDisk(set, random, position, config)
+			}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (r *decorationRegion) placeScheduledOres(seed int64) error {
 	return r.placeScheduledOresWithOrder(seed, possibleBiomeOrder(), 0)
 }

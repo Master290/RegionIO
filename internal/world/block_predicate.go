@@ -28,6 +28,9 @@ func (r *decorationRegion) testBlockPredicate(set *worldgen.FeatureSet, raw json
 	switch predicate.Type {
 	case "minecraft:true":
 		return true, nil
+	case "minecraft:solid":
+		state := r.getBlock(position.X, position.Y, position.Z)
+		return state != StateAir && stateFlags(state)&flagBlocksMotion != 0, nil
 	case "minecraft:inside_world_bounds":
 		return position.Y >= MinY && position.Y < MinY+WorldHeight, nil
 	case "minecraft:matching_blocks":

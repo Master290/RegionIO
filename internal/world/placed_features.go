@@ -135,10 +135,14 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 func buildOreSpheres(random worldgen.RandomSource, originX, originY, originZ, size int) []oreSphere {
 	angle := random.NextFloat() * float32(math.Pi)
 	extent := float32(size) / 8.0
-	x0 := float64(originX) + float64(worldgen.MthSin(float64(angle))*extent)
-	x1 := float64(originX) - float64(worldgen.MthSin(float64(angle))*extent)
-	z0 := float64(originZ) + float64(worldgen.MthCos(float64(angle))*extent)
-	z1 := float64(originZ) - float64(worldgen.MthCos(float64(angle))*extent)
+	// OreFeature.place uses java.lang.Math for the vein axis. The later radius
+	// wave uses Mth.sin, but using the lookup table here shifts every sphere.
+	xOffset := math.Sin(float64(angle)) * float64(extent)
+	zOffset := math.Cos(float64(angle)) * float64(extent)
+	x0 := float64(originX) + xOffset
+	x1 := float64(originX) - xOffset
+	z0 := float64(originZ) + zOffset
+	z1 := float64(originZ) - zOffset
 	y0 := float64(originY + int(random.NextIntN(3)) - 2)
 	y1 := float64(originY + int(random.NextIntN(3)) - 2)
 

@@ -33,8 +33,14 @@ func (r *decorationRegion) replayScheduledOres(seed int64, targetX, targetZ int3
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
 		}
-		if err := r.placeScheduledOres(seed); err != nil {
-			return fmt.Errorf("world: replay source (%d,%d): %w", source.X, source.Z, err)
+		if err := r.placeScheduledGeodes(seed); err != nil {
+			return fmt.Errorf("world: replay source geodes (%d,%d): %w", source.X, source.Z, err)
+		}
+		if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
+			return fmt.Errorf("world: replay source underground ores (%d,%d): %w", source.X, source.Z, err)
+		}
+		if err := r.placeScheduledVegetationPatches(seed); err != nil {
+			return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
 		}
 	}
 	return nil

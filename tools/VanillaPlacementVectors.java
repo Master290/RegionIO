@@ -9,6 +9,7 @@ import net.minecraft.util.valueproviders.ClampedNormalInt;
 import net.minecraft.util.valueproviders.TrapezoidInt;
 import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.WorldgenRandom;
+import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
 import net.minecraft.world.level.levelgen.placement.CountPlacement;
 import net.minecraft.world.level.levelgen.placement.PlacementModifier;
 import net.minecraft.world.level.levelgen.placement.RandomOffsetPlacement;
@@ -44,8 +45,14 @@ public final class VanillaPlacementVectors {
         WorldgenRandom decoration = new WorldgenRandom(new LegacyRandomSource(0L));
         long decorationSeed = decoration.setDecorationSeed(12345L, 0, 0);
         decoration.setFeatureSeed(decorationSeed, 10, 6);
-        System.out.println("decoration.seed=" + decorationSeed);
-        System.out.println("feature10.stage6=" + randomVector(decoration));
+        System.out.println("legacy.decoration.seed=" + decorationSeed);
+        System.out.println("legacy.feature10.stage6=" + randomVector(decoration));
+
+        WorldgenRandom xoroshiro = new WorldgenRandom(new XoroshiroRandomSource(0L));
+        long xoroshiroSeed = xoroshiro.setDecorationSeed(12345L, 0, 0);
+        xoroshiro.setFeatureSeed(xoroshiroSeed, 10, 6);
+        System.out.println("xoroshiro.decoration.seed=" + xoroshiroSeed);
+        System.out.println("xoroshiro.feature10.stage6=" + randomVector(xoroshiro));
     }
 
     private static String randomVector(RandomSource random) {
