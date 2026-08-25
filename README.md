@@ -118,14 +118,15 @@ exposing undecorated chunks.
 The remaining block-parity gap is entirely inside feature replay: a vanilla
 capture with every feature and structure set stripped out matches our
 undecorated pipeline on all 393,216 cells, so density, surface rules, carvers,
-aquifers, and noise-router veins are already bit-exact. What drifts is the
-interaction between stages — vanilla opens air pockets (monster rooms, geode
-voids, lava lakes) before the ores run, and ore ellipsoids crossing that
-pre-existing air roll air-exposure discard rounds our replay never sees, which
-is why high-attempt ore drift looks symmetric. The next worldgen milestone is
-to replay the remaining pre-ore stages, monster rooms first, and raise the
-98.028% block parity toward exact equality while keeping cold batch generation
-within an acceptable latency budget.
+aquifers, and noise-router veins are already bit-exact. Monster rooms now
+replay from their datapack configuration between the geodes and the ores, so
+the air pockets ore ellipsoids roll discards against exist where the schedule
+puts them; the committed fixture happens to contain no dungeons, leaving the
+measured parity at 98.028%. What still does not replay is the stage-1 lake
+schedule and the structure sets — ruined portal and mineshaft pieces are
+visible in the fixture — and those are the next worldgen milestones on the way
+to exact equality while keeping cold batch generation within an acceptable
+latency budget.
 
 ## Project layout
 

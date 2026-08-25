@@ -167,12 +167,13 @@ the single-chunk path, 98.028% through the production region replay. A featurele
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
 undecorated pipeline bit-exact against it — density, surface rules, carvers, aquifers, and
 noise-router veins match every one of the fixture's cells — so the residual block gap is entirely
-inside feature replay. Plain-state mismatches that once looked like base-terrain defects are
-air-writing features the replay does not cover yet: monster rooms (stage 3) open cave_air pockets,
-geodes leave voids, lava lakes fill stage-1 cavities. Vanilla runs those stages before the ores, so
-ore ellipsoids crossing that pre-existing air roll air-exposure discards our run never sees, which
-is why high-attempt ore drift looks symmetric (extra ≈ missing). The next step toward exact parity
-is replaying the remaining pre-ore stages, monster rooms first.
+inside feature replay. Monster rooms (stage 3, `world/monster_rooms.go`) now replay between geodes
+and the ores with vanilla's draw order, so the air pockets ore ellipsoids roll discards against
+exist where the schedule puts them; the fixture's four chunks contain no dungeons, so the measured
+number did not move. The unreplayed air-writing stages are lava lakes (stage 1) and the remaining
+structure sets: the fixture carries ruined-portal and mineshaft pieces (obsidian/gold/planks
+markers), and a cobblestone-and-water pocket in chunk (-1,-1) that no replayed feature explains —
+attributing it is the open lead for closing the gap further.
 
 ## Testing worldgen
 
