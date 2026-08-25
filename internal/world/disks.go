@@ -2,49 +2,10 @@ package world
 
 import "regionio/internal/worldgen"
 
-// placeScheduledDisks replays the vanilla disk features from one source
-// center into the mutable decoration region. Disks are in the underground-ore
-// feature stage (6), after the ore entries in the 26.1.2 overworld datapack.
-func (r *decorationRegion) placeScheduledDisks(seed int64) error {
-	set, err := worldgen.LoadFeatureSet()
-	if err != nil {
-		return err
-	}
-	if err := r.ensureSourceNeighborhood(); err != nil {
-		return err
-	}
-	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), undergroundOresStage)
-	if err != nil {
-		return err
-	}
-	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
-	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
-	for _, scheduled := range schedule {
-		placed, ok := set.Placed[scheduled.Name]
-		if !ok {
-			continue
-		}
-		configured, ok := set.Configured[placed.Feature]
-		if !ok || configured.Type != "minecraft:disk" {
-			continue
-		}
-		config, err := set.Disk(placed.Feature)
-		if err != nil {
-			return err
-		}
-		random.SetFeatureSeed(decorationSeed, scheduled.Index, undergroundOresStage)
-		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
-			return r.biomeAllowsFeature(set, scheduled.Name, undergroundOresStage, position)
-		})
-		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			return r.placeDisk(set, random, position, config)
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
+// placeDisk places one disk feature at position. Disks are replayed by the
+// combined stage-6 pass in region_ores.go, ordered between underwater magma
+// and the biome's remaining entries exactly as the 26.1.2 datapack schedules
+// them; this helper holds only the per-position placement.
 func (r *decorationRegion) placeDisk(set *worldgen.FeatureSet, random worldgen.RandomSource, position worldgen.FeaturePosition, config worldgen.DiskFeatureConfig) error {
 	radius := config.RadiusMin
 	if config.RadiusMax > config.RadiusMin {
