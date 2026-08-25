@@ -18,6 +18,8 @@ jobs:
 
   race:
     runs-on: [self-hosted, windows]
+    env:
+      CGO_ENABLED: 1
     steps:
       - uses: actions/checkout@v4
       # Density-based world tests are intentionally exhaustive and race adds
