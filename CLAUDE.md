@@ -17,6 +17,7 @@ make parity        # requires the committed vanilla block fixture
 go run ./cmd/regionio -seed 12345            # serves on 0.0.0.0:25565
 go run ./cmd/regionio -seed 12345 -world ""  # in-memory world, nothing read from or written to disk
 go run ./cmd/gendump                         # client-free generator diagnostics
+go run ./cmd/genfeatures                     # dumps the embedded feature/biome graph for inspection
 go run ./cmd/vanillacapture                  # regenerate vanilla block parity fixture (Java 25)
 ```
 
@@ -94,6 +95,7 @@ cmd/gendump/      client-free generator diagnostics — biome spread, surface bl
                   subsurface banding, deep-layer composition, bedrock band, fluid census,
                   cross-section
 cmd/genblocks/    generates internal/worldgen/generated_blocks.go from the block report
+cmd/genfeatures/  dumps the embedded placed/configured feature + biome graph
 cmd/genlight/     legacy light-table generator, superseded by tools/VanillaBlockStateDump.java
 tools/            Java dumpers run against the jar, plus their Go-side fixtures
 internal/protocol/  VarInt, framing, compression, packet IDs
@@ -139,9 +141,18 @@ parse time).
 
 Known gaps, roughly in order of how visible they are:
 
-- **No generic placed/configured feature system.** Configured caves, canyons, and noise-router ore
-  veins are implemented, but ordinary ores, flora, trees, and springs still use hand-written
-  decoration rather than biome generation stages and placement modifiers.
+- **Feature replay covers the underground stages, not everything.** `worldgen/features.go` parses
+  the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
+  production region replay runs it for stage-2 geodes, the whole stage-6 schedule (ores with real
+  deepslate targets, underwater magma between copper and the disks, disk features), and lush-cave
+  vegetation patches — see `world/feature_scheduler.go` and `world/region_ores.go`. Trees, flora,
+  springs, desert features, rocks, lakes, and structures are still hand-written in `world/vanilla.go`.
+- **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
+  place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
+  trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
+  into neighbours; the region infrastructure already supports that.
+- **No lakes.** Stage-1 lake features are not replayed; the base-terrain diagnostic's `air→lava`
+  and some clustered `stone→water` pairs are exactly these.
 - **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
   adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
   warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,
@@ -150,9 +161,12 @@ Known gaps, roughly in order of how visible they are:
   visible; snowy peaks come from biome selection, not from this condition.
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
-- **Decoration is hand-written heuristics**, not the vanilla feature system: oak trees only and
-  without a biome check (so oaks grow in deserts), ores that cannot generate below y≈0 because they
-  only replace stone and never deepslate, and no grass, flowers, lakes or springs.
+
+Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.378% through
+the single-chunk path, 98.028% through the production region replay. The remaining block gap is
+entirely underground and is driven by ~966 base-terrain cells (0.246%) where vanilla carved a cave
+segment we kept solid or an aquifer edge we sealed — those flips turn air-exposure discard rolls
+inside later veins, which is why ore drift looks symmetric (extra ≈ missing).
 
 ## Testing worldgen
 
@@ -180,3 +194,12 @@ fresh checkout remains buildable without Mojang's non-redistributable jar. Once 
 committed, ordinary CI guards the measured baseline while `make parity` requires exact equality.
 The older optional
 `/tmp/vanilla_ground.json` height report remains diagnostic only.
+
+Beyond the always-on tests, `internal/world` carries env-gated diagnostics for hunting the residual
+parity gap (all skip unless the variable is set): `REGIONIO_REGION_ORE_DIAGNOSTIC=1` compares the
+legacy / center-only / region-replay ore paths per state, and
+`REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1` classifies fixture mismatches into base-vs-base defects (with
+sample coordinates), feature flips per family, and an ambiguous bucket for disk-shaped outputs.
+The base-vs-base count is the number to drive toward zero: each such cell can flip air-exposure
+discard rolls inside overlapping ore ellipsoids, so one sealed cave edge shows up as dozens of
+missing and extra ore blocks.

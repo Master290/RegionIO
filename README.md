@@ -81,7 +81,9 @@ fixture blocks, while the production region replay path matches 98.028%; both
 match all fixture biomes and heightmaps. CI guards the 91% regression floor
 while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
-request.
+request. Env-gated diagnostics in `internal/world` break the remaining gap
+down per subsystem (ore paths per state, base-terrain defects with sample
+coordinates).
 
 ## v0.4 scope
 
@@ -99,8 +101,11 @@ The density router, configured carvers, and noise-router ore veins are
 vanilla-derived. Surface and biome selection are ported but still need broader
 runtime captures. The production cache now uses atomic batch publication and
 the datapack-driven region replay path, with cross-chunk writes isolated per
-target. Ordinary decoration remains the largest fidelity gap: ore scheduling
-and several non-ore features still differ from vanilla. The biome parameter
+target. Underground decoration (ores with deepslate targets, underwater magma,
+disks) runs from the vanilla stage-6 schedule; the largest remaining fidelity
+gap is surface decoration — trees, flora, springs, and lakes are still
+hand-written — plus a few hundred underground cells where our carver or aquifer
+verdict differs from vanilla. The biome parameter
 finder uses an exact spatial index and overlapping region requests share a
 bounded immutable terrain cache, keeping cold 3x3 generation near one second
 on the reference Ryzen 5 5600X development machine.
@@ -116,7 +121,9 @@ feature-index seeds, and the climate biome ordering are aligned with vanilla,
 and rare ores such as gold and redstone already match exactly. High-attempt
 features instead drift because a few hundred residual base-terrain differences
 (aquifer fluid edges and carver air boundaries) flip air-exposure discard rolls
-inside later veins. The next worldgen milestone is to close those base-terrain
+inside later veins; the base-terrain diagnostic measures them at 966 fixture
+cells (0.246%), concentrated in whole cave segments rather than isolated
+positions. The next worldgen milestone is to close those base-terrain
 differences and raise the 98.028% block parity toward exact equality while
 keeping cold batch generation within an acceptable latency budget.
 
