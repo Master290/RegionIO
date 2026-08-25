@@ -36,6 +36,12 @@ func (r *decorationRegion) replayScheduledOres(seed int64, targetX, targetZ int3
 		if err := r.placeScheduledGeodes(seed); err != nil {
 			return fmt.Errorf("world: replay source geodes (%d,%d): %w", source.X, source.Z, err)
 		}
+		// Stage 3 runs before the ores on purpose: the rooms' cave_air pockets
+		// are what vanilla's ore ellipsoids roll their air-exposure discards
+		// against.
+		if err := r.placeScheduledMonsterRooms(seed); err != nil {
+			return fmt.Errorf("world: replay source monster rooms (%d,%d): %w", source.X, source.Z, err)
+		}
 		if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
 			return fmt.Errorf("world: replay source underground ores (%d,%d): %w", source.X, source.Z, err)
 		}
