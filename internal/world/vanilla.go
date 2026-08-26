@@ -112,6 +112,28 @@ func generateVanillaWithoutDecoration(od *worldgen.OverworldDensity, fluidPicker
 }
 
 func generateVanillaDecorated(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32, withDecoration bool) *Chunk {
+	data := generateBaseTerrain(od, fluidPicker, veins, carver, seed, cx, cz)
+	c := data.c
+	surfTop, grass := data.surfTop, data.grass
+	if withDecoration {
+		decorate(c, od, cx, cz, seed, surfTop, grass, data.biomeName)
+	}
+	return c
+}
+
+// baseTerrain is everything the noise/surface/carve stages produce, kept
+// together so structure placement can read pre-carve heights exactly the way
+// vanilla's STRUCTURE_STARTS stage does.
+type baseTerrain struct {
+	c            *Chunk
+	columns      *[16][16][WorldHeight]uint16
+	worldSurface *[16][16]int // topmost non-air Y before carving
+	surfTop      *[16][16]int
+	grass        *[16][16]bool
+	biomeName    *[16][16]string
+}
+
+func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
 	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
@@ -240,10 +262,11 @@ func generateVanillaDecorated(od *worldgen.OverworldDensity, fluidPicker worldge
 		}
 	}
 	fillBiomes3D(c, od, s2D, baseX, baseZ)
-	if withDecoration {
-		decorate(c, od, cx, cz, seed, &surfTop, &grass, &biomeName)
+	return baseTerrain{
+		c: c, columns: &columns,
+		worldSurface: &worldSurface, surfTop: &surfTop,
+		grass: &grass, biomeName: &biomeName,
 	}
-	return c
 }
 
 // fillBiomes3D assigns a per-cell 4×4×4 biome to every section of the chunk.

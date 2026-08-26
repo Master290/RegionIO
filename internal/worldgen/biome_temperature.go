@@ -97,3 +97,7 @@ func coldEnoughToSnow(biome string) bool {
 	temperature, ok := biomeTemperature[biome]
 	return ok && temperature < 0.15
 }
+
+// ColdEnoughToSnow exposes the per-biome snow threshold to structure ports.
+func ColdEnoughToSnow(biome string) bool { return coldEnoughToSnow(biome) }
+

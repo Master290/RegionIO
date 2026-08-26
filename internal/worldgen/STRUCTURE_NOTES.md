@@ -55,19 +55,31 @@ Per set per chunk, in order:
 2. placement.isStructureChunk(state, x, z) must hold (the grid above).
 3. Single-entry sets go straight to tryGenerateStructure with **zero draws**.
 4. Multi-entry sets: `random = WorldgenRandom(Legacy(0));
-   random.setLargeFeatureSeed(levelSeed, chunkX, chunkZ)` (the two-long XOR
-   mix), then loop:
+   random.setLargeFeatureSeed(levelSeed, chunkX, chunkPos.z)` (the two-long
+   XOR mix) drives ONLY the weighted picks; then loop:
    - pick = random.nextInt(totalWeight over remaining entries)
    - walk entries subtracting weight; first negative wins;
    - tryGenerateStructure it; on success stop, else REMOVE the entry,
-     total -= its weight, and repeat **without reseeding** (the stream keeps
-     running).
-5. tryGenerateStructure -> Structure.generate builds its own
-   `WorldgenRandom(LegacyRandomSource(0))` seeded with
-   setLargeFeatureSeed(seed, chunkX, chunkZ) — that is the `context.random()`
-   every findGenerationPoint draw reads from. Biome check happens inside
-   generate via the structure's biomes HolderSet against the biome at the
-   generation point (position-dependent, after the stub is found).
+     total -= its weight, and repeat **without reseeding** the pick stream.
+5. tryGenerateStructure -> Structure.generate builds a GenerationContext whose
+   random comes from `GenerationContext.makeRandom(seed, chunkPos)`:
+   `new WorldgenRandom(new LegacyRandomSource(0))` +
+   `setLargeFeatureSeed(seed, chunkX, chunkZ)`. Every attempt therefore starts
+   from an identically seeded FRESH stream — attempts do NOT continue each
+   other's streams.
+6. Structure.findValidGenerationPoint runs findGenerationPoint first and filters
+   by isValidBiome AFTERWARDS: the 3D noise biome at the stub position
+   (quart-snapped coordinates) against the structure's biome set.
+
+Port status: the whole chain above plus findSuitableY live in
+world/ruined_portal.go, but nothing accepts in the ±3-chunk window around the
+fixture's portal yet — every variant lands on ocean or lush-caves biomes at
+its stub while vanilla accepted one here. Open leads, in order of suspicion:
+(a) our 3D biome sampling off the fixture's 4x4x4 lattice may diverge from
+vanilla's Climate sampler at arbitrary quart positions; (b) getBaseHeight
+semantics on water columns; (c) the settle-scan corner sampling. A Java probe
+dumping vanilla's own stub for seed 12345 chunk (1,0) would settle it
+decisively.
 
 ### findGenerationPoint, in draw order
 

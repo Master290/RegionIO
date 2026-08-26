@@ -86,12 +86,42 @@ func (p *rawPlacement) decode() (*Placement, error) {
 	}
 }
 
+// RuinedPortalSetup is one weighted entry of a ruined portal structure's
+// "setups" list.
+type RuinedPortalSetup struct {
+	Placement             string  `json:"placement"`
+	AirPocketProbability  float32 `json:"air_pocket_probability"`
+	Mossiness             float32 `json:"mossiness"`
+	Overgrown             bool    `json:"overgrown"`
+	Vines                 bool    `json:"vines"`
+	ReplaceWithBlackstone bool    `json:"replace_with_blackstone"`
+	CanBeCold             bool    `json:"can_be_cold"`
+	Weight                float32 `json:"weight"`
+}
+
 // StructureDef is one entry of data/minecraft/worldgen/structure.
 type StructureDef struct {
-	Name   string `json:"-"`
-	Type   string `json:"type"`
-	Biomes string `json:"biomes"`
-	Step   string `json:"step"`
+	Name   string              `json:"-"`
+	Type   string              `json:"type"`
+	Biomes string              `json:"biomes"`
+	Step   string              `json:"step"`
+	Setups []RuinedPortalSetup `json:"-"`
+}
+
+func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
+	var doc struct {
+		Type   string           `json:"type"`
+		Biomes string           `json:"biomes"`
+		Step   string           `json:"step"`
+		Setups []RuinedPortalSetup `json:"setups"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	return &StructureDef{
+		Name: name, Type: doc.Type, Biomes: strings.TrimPrefix(doc.Biomes, "minecraft:"),
+		Step: doc.Step, Setups: doc.Setups,
+	}, nil
 }
 
 // StructureSet is one entry of data/minecraft/worldgen/structure_set.
@@ -183,14 +213,12 @@ func loadStructureSets() (*StructureSets, error) {
 		if err != nil {
 			return nil, err
 		}
-		var def StructureDef
-		if err := json.Unmarshal(raw, &def); err != nil {
+		name := "minecraft:" + strings.TrimSuffix(baseName(path), ".json")
+		def, err := decodeStructureDef(name, raw)
+		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-		name := "minecraft:" + strings.TrimSuffix(baseName(path), ".json")
-		def.Name = name
-		def.Biomes = strings.TrimPrefix(def.Biomes, "minecraft:")
-		out.Structures[name] = &def
+		out.Structures[name] = def
 	}
 
 	setFiles, err := fs.Glob(dataFS, "data/structure_set/*.json")

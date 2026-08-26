@@ -24,10 +24,28 @@ type TemplateBlockInfo struct {
 	HasNBT bool
 }
 
-// ResolvedTemplate is a parsed .nbt structure with every palette entry mapped
-// to concrete state IDs through resolve.
+// LoadResolvedTemplate reads a template file from disk.
 func LoadResolvedTemplate(path string, resolve func(name string, props map[string]string) (uint16, bool)) ([]TemplateBlockInfo, [3]int, error) {
-	raw, err := readMaybeGzip(path)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, [3]int{}, err
+	}
+	raw, err = readMaybeGzipBytes(raw)
+	if err != nil {
+		return nil, [3]int{}, err
+	}
+	return LoadResolvedTemplateBytes(raw, resolve)
+}
+
+// EmbeddedStructureTemplate reads a template from the embedded datapack data
+// by its resource-path name, e.g. "ruined_portal/portal_1".
+func EmbeddedStructureTemplate(name string) ([]byte, error) {
+	return dataFS.ReadFile("data/structure_template/" + name + ".nbt")
+}
+
+// LoadResolvedTemplateBytes parses template NBT already in memory.
+func LoadResolvedTemplateBytes(raw []byte, resolve func(name string, props map[string]string) (uint16, bool)) ([]TemplateBlockInfo, [3]int, error) {
+	raw, err := readMaybeGzipBytes(raw)
 	if err != nil {
 		return nil, [3]int{}, err
 	}
@@ -121,11 +139,7 @@ func LoadResolvedTemplate(path string, resolve func(name string, props map[strin
 	return blocks, size, nil
 }
 
-func readMaybeGzip(path string) ([]byte, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func readMaybeGzipBytes(b []byte) ([]byte, error) {
 	if len(b) >= 2 && b[0] == 0x1f && b[1] == 0x8b {
 		gr, err := gzip.NewReader(bytes.NewReader(b))
 		if err != nil {
@@ -172,5 +186,6 @@ func MthGetSeed(x, y, z int) int64 {
 	l = l*l*42317861 + l*11
 	return l >> 16
 }
+
 
 
