@@ -47,7 +47,29 @@ Not wired yet: concentric_rings (strongholds only).
 
 ## Ruined portal (decoded, not yet ported)
 
-RuinedPortalStructure.findGenerationPoint, in draw order:
+### Seeding chain (ChunkGenerator.createStructures / lambda$createStructures$0)
+
+Per set per chunk, in order:
+
+1. Skip if any structure of the set already has a valid start here.
+2. placement.isStructureChunk(state, x, z) must hold (the grid above).
+3. Single-entry sets go straight to tryGenerateStructure with **zero draws**.
+4. Multi-entry sets: `random = WorldgenRandom(Legacy(0));
+   random.setLargeFeatureSeed(levelSeed, chunkX, chunkZ)` (the two-long XOR
+   mix), then loop:
+   - pick = random.nextInt(totalWeight over remaining entries)
+   - walk entries subtracting weight; first negative wins;
+   - tryGenerateStructure it; on success stop, else REMOVE the entry,
+     total -= its weight, and repeat **without reseeding** (the stream keeps
+     running).
+5. tryGenerateStructure -> Structure.generate builds its own
+   `WorldgenRandom(LegacyRandomSource(0))` seeded with
+   setLargeFeatureSeed(seed, chunkX, chunkZ) — that is the `context.random()`
+   every findGenerationPoint draw reads from. Biome check happens inside
+   generate via the structure's biomes HolderSet against the biome at the
+   generation point (position-dependent, after the stub is found).
+
+### findGenerationPoint, in draw order
 
 1. Setup selection — skipped entirely (zero draws) when setups.size() <= 1;
    otherwise sum weights, one nextFloat(), walk setups subtracting
@@ -99,12 +121,57 @@ accessor, randomState):
 getRandomWithinInterval(r, a, b): a >= b ? b : randomBetweenInclusive(a, b).
 randomBetweenInclusive(r, lo, hi) = lo + nextInt(hi - lo + 1).
 
-Remaining to read before coding the piece: RuinedPortalPiece.postProcess
-(mossiness block swaps, air-pocket carving bounds, lava under portal blocks,
-vine/overgrown decoration, cold cracked-cobble substitution), and
-StructureTemplate's bounding-box/palette transform math (rotation + front_back
-mirror around the pivot). The 13 ruined_portal templates are extracted under
-internal/worldgen/data/structure_template/ruined_portal/.
+Remaining to read before coding the piece: ~~RuinedPortalPiece.postProcess~~
+(decoded below), StructureTemplate.getBoundingBox is min/max of transformed
+positions, and placeInWorld writes non-air blocks first, air last.
+
+### RuinedPortalPiece.postProcess, in order
+
+1. box = template bounding box under the piece settings; skip when the chunk
+   box does not contain box.center; encapsulate otherwise.
+2. TemplateStructurePiece.postProcess = template.placeInWorld with the
+   settings below (block entities become markers only).
+3. spreadNetherrack(random, level).
+4. addNetherrackDripColumnsBelowPortal(random, level).
+5. If properties.vines || properties.overgrown: for every position of the
+   bounding box (betweenClosedStream order): vines -> maybeAddVines, overgrown
+   -> maybeAddLeavesAbove.
+
+makeSettings(mirror, rotation, placement, pos, properties):
+
+- ignore processor: airPocket ? STRUCTURE_BLOCK : STRUCTURE_AND_AIR — without
+  an air pocket template AIR cells are skipped entirely.
+- RuleProcessor rules, first match wins, each test draws from the block's own
+  positional Legacy stream (RandomSource.create(Mth.getSeed(x,y,z)), NOT the
+  shared random):
+  1. gold_block -> air with probability 0.3 (RandomBlockMatchTest:
+     state matches && nextFloat() < p)
+  2. lava rule: on_ocean_floor -> lava->magma always; cold ->
+     lava->netherrack always; otherwise lava->magma at 0.2
+  3. if !cold: netherrack -> magma at 0.07
+- BlockAgeProcessor(mossiness): stone_bricks/stone/chiseled_stone_bricks ->
+  maybeReplaceFullStoneBlock (nextFloat >= 0.5 bail; then mossiness roll picks
+  between [cracked_stone_bricks | stone_brick_stairs(random facing+half)] and
+  [mossy_stone_bricks | mossy_stone_brick_stairs]); stairs tag -> bail at
+  nextFloat >= 0.5 else mossy stairs or mossy slab roll; slabs/walls ->
+  mossy variant when nextFloat < mossiness; obsidian -> crying_obsidian at
+  0.15.
+- ProtectedBlockProcessor(FEATURES_CANNOT_REPLACE): skip placement when the
+  CURRENT world block is in the tag.
+- LavaSubmergedBlockProcessor: placed blocks sitting in lava become magma.
+- BlackstoneReplaceProcessor appended only when replaceWithBlackstone.
+
+spreadNetherrack weights (index by manhattan distance + jitter):
+[1,1,1,1,1,1,1,0.9,0.9,0.8,0.7,0.6,0.4,0.2]; jitter =
+nextInt(max(1, 8 - radius/2)) with radius = (xSpan+zSpan)/2; iterate the
+square around the box center +/- 14; for each cell draw
+nextDouble() < weight[idx], surfaceY = getHeight(type)-1 at that column, y2 =
+surfaceY when on_land_surface/on_ocean_floor else min(box.minY, surfaceY),
+require |y2 - box.minY| <= 3, replace only air/obsidian/not-in-tag/not-lava
+(not in nether), then placeNetherrackOrMagma (cold -> netherrack always;
+else nextFloat < 0.07 -> magma else netherrack); overgrown adds leaves above;
+then addNetherrackDripColumn below (up to 8 steps, each continuing while
+nextFloat < 0.5).
 
 ## Fixture markers worth remembering
 
