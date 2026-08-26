@@ -45,11 +45,11 @@ func TestLoadRuinedPortalTemplate(t *testing.T) {
 		}
 	}
 
-	// A clockwise quarter turn around the pivot must map the corner (0,z) to
-	// (px - pz + z, y, px + pz) per the bytecode formula.
+	// A clockwise quarter turn around the pivot maps (x,z) per the bytecode's
+	// target-172 formula: x' = px + pz - z, z' = pz - px + x.
 	got := TransformBlockPos([3]int{0, 5, 3}, "none", 1, pivot)
-	wantX := pivot[0] - pivot[2] + 3
-	wantZ := pivot[0] + pivot[2] - 0
+	wantX := pivot[0] + pivot[2] - 3
+	wantZ := pivot[1]*0 + pivot[2] - pivot[0] + 0
 	if got[0] != wantX || got[2] != wantZ {
 		t.Fatalf("clockwise_90 of (0,5,3) = %v, want (%d,5,%d)", got, wantX, wantZ)
 	}
