@@ -185,7 +185,44 @@ else nextFloat < 0.07 -> magma else netherrack); overgrown adds leaves above;
 then addNetherrackDripColumn below (up to 8 steps, each continuing while
 nextFloat < 0.5).
 
-## Fixture markers worth remembering
+## Ocean ruins (ground truth captured, port pending)
+
+The grid claims ocean_ruins at chunk (7,5) on seed 12345, and a fresh
+capture with -chunks "6,4;7,5;8,6;7,4" confirms vanilla agrees: its
+saved start minecraft:ocean_ruin_cold lives exactly there, with one
+child piece:
+
+    Template = underwater_ruin/brick_2
+    Rot      = COUNTERCLOCKWISE_90
+    TP       = (112, 50, 80)     (= chunk origin, y=50)
+    BB       = [112,50,75] .. [118,56,80]
+    BiomeType= COLD, IsLarge = 0, Integrity = 0.8, GD = 0, O = 2
+
+Algorithm read off OceanRuinStructure + OceanRuinPieces bytecode:
+
+- findGenerationPoint = onTopOfChunkCenter(context, OCEAN_FLOOR_WG,
+  generatePieces) — no draws; stub sits at the chunk centre on the
+  ocean floor.
+- generatePieces: base pos = (minBlockX, **90**, minBlockZ);
+  rotation = Rotation.getRandom(random) (one nextInt(4));
+  OceanRuinPieces.addPieces(...).
+- addPieces: large = nextFloat() <= largeProbability (0.3333);
+  integrity = large ? 0.9 : 0.8; addPiece(...) always runs; when
+  large, a second nextFloat() <= clusterProbability (0.1) triggers
+  addClusterRuins (several extra small pieces around the first).
+- addPiece picks the biome type cold/warm from the biome at the
+  position, then the template array: brick/cracked/mossy x8 for cold,
+  warm_1..8 for warm (large variants are big_*); template =
+  arr[nextInt(arr.length)]. The piece carries an IntegrityProcessor
+  (drops blocks at random until the integrity fraction remains) plus
+  suspicious-sand archy rules for gravel/wall targets.
+
+48 underwater_ruin templates are extracted under
+internal/worldgen/data/structure_template/underwater_ruin/. Open
+mechanics for the port: how the piece descends from pos.y=90 to the
+saved TPY=50 (ocean-floor height at some reference column), and the
+exact IntegrityProcessor draw order (ChunkPos-forked positional random,
+not the shared stream).
 
 Seed 12345, committed fixture chunks (0,0) (1,0) (0,1) (-1,-1):
 
