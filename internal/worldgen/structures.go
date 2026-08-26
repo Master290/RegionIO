@@ -270,11 +270,15 @@ func (s *StructureSets) StructuresInSet(set string) []*StructureDef {
 }
 
 // BiomesFor resolves a structure def's biome reference ("#tag" or a single
-// name) to concrete biome names with the minecraft: prefix.
+// name) to concrete biome names with the minecraft: prefix. Structure JSONs
+// reference tags through the has_structure/ namespace, but the extracted tag
+// files drop that prefix.
 func (s *StructureSets) BiomesFor(def *StructureDef) []string {
 	ref := def.Biomes
 	if strings.HasPrefix(ref, "#") {
-		return s.BiomeTags["minecraft:"+strings.TrimPrefix(ref[1:], "minecraft:")]
+		name := strings.TrimPrefix(ref[1:], "minecraft:")
+		name = strings.TrimPrefix(name, "has_structure/")
+		return s.BiomeTags["minecraft:"+name]
 	}
 	return []string{"minecraft:" + ref}
 }

@@ -199,9 +199,12 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 
 	airPocket := sampleProbability(random, setup.AirPocketProbability)
 
-	templateName := ruinedPortalTemplates[int(random.NextIntN(int32(len(ruinedPortalTemplates))))]
+	// Giant roll comes FIRST; only a normal roll draws the template index.
+	templateName := ""
 	if random.NextFloat() < 0.05 {
 		templateName = ruinedPortalGiants[int(random.NextIntN(int32(len(ruinedPortalGiants))))]
+	} else {
+		templateName = ruinedPortalTemplates[int(random.NextIntN(int32(len(ruinedPortalTemplates))))]
 	}
 	_, size, err := loadTemplateCached(templateName)
 	if err != nil {
