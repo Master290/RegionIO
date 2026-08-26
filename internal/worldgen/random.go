@@ -233,6 +233,14 @@ func (r *Legacy) SetLargeFeatureSeed(seed int64, chunkX, chunkZ int) {
 	r.SetSeed(int64(chunkX)*a ^ int64(chunkZ)*b ^ seed)
 }
 
+// SetLargeFeatureWithSalt is WorldgenRandom.setLargeFeatureWithSalt: one
+// multiply-add mix, no draws. The constants are the classic population-seed
+// multipliers and the formula is what every random-spread structure placement
+// and legacy frequency reducer reads.
+func (r *Legacy) SetLargeFeatureWithSalt(seed int64, chunkX, chunkZ, salt int) {
+	r.SetSeed(int64(chunkX)*341873128712 + int64(chunkZ)*132897987541 + seed + int64(salt))
+}
+
 // SetDecorationSeed is WorldgenRandom.setDecorationSeed. It returns the seed
 // used for the chunk's feature stages; individual features derive their seeds
 // from this value, stage index, and feature index.
