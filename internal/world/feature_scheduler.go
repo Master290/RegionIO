@@ -1,6 +1,10 @@
 package world
 
-import "fmt"
+import (
+	"fmt"
+
+	"regionio/internal/worldgen"
+)
 
 // decorationSource is a source chunk whose feature pass may inspect or write a
 // target chunk. Vanilla FEATURES has a one-chunk block-state write radius.
@@ -28,7 +32,14 @@ func decorationSources(targetX, targetZ int32) []decorationSource {
 // This is an explicit canonical order for isolated generation. It must not
 // replace the production path until parity evidence confirms that it matches
 // vanilla's chunk-status scheduling order.
-func (r *decorationRegion) replayScheduledOres(seed int64, targetX, targetZ int32) error {
+func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
+	// Structures generate before every feature stage: applyBiomeDecoration
+	// places all referenced starts first and only then walks the feature
+	// steps. Their origins reach two chunks out because a portal template can
+	// span that far.
+	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
+		return fmt.Errorf("world: structure starts (%d,%d): %w", targetX, targetZ, err)
+	}
 	for _, source := range decorationSources(targetX, targetZ) {
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
@@ -51,3 +62,28 @@ func (r *decorationRegion) replayScheduledOres(seed int64, targetX, targetZ int3
 	}
 	return nil
 }
+
+// placeScheduledStructures replays every structure start whose pieces may
+// reach the target chunk. Only the ruined_portals set is ported so far.
+func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil {
+		return err
+	}
+	for sx := targetX - 2; sx <= targetX+2; sx++ {
+		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
+			stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if stub == nil {
+				continue
+			}
+			if err := PlaceRuinedPortalPiece(r, stub); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+

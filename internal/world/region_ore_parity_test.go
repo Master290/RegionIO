@@ -47,7 +47,7 @@ func TestRegionOreReplayParityDiagnostic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := region.replayScheduledOres(seed, fixture.x, fixture.z); err != nil {
+		if err := region.replayScheduledOres(od, seed, fixture.x, fixture.z); err != nil {
 			t.Fatal(err)
 		}
 		regionChunk := region.chunks[[2]int32{fixture.x, fixture.z}]
@@ -514,3 +514,4 @@ func logOreDifferences(t *testing.T, label string, counts map[uint16]*oreDiffere
 		t.Logf("%s %s: extra=%d missing=%d", label, stateLabel(state), entry.extra, entry.missing)
 	}
 }
+

@@ -1,6 +1,10 @@
 package world
 
-import "testing"
+import (
+	"testing"
+
+	"regionio/internal/worldgen"
+)
 
 func TestScheduledRegionOresAreDeterministic(t *testing.T) {
 	makeRegion := func() *decorationRegion {
@@ -84,10 +88,14 @@ func TestScheduledRegionOreReplayIsDeterministic(t *testing.T) {
 	}
 
 	a, b := makeRegion(), makeRegion()
-	if err := a.replayScheduledOres(12345, 0, 0); err != nil {
+	od, err := worldgen.LoadOverworldFinalDensity(12345)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.replayScheduledOres(12345, 0, 0); err != nil {
+	if err := a.replayScheduledOres(od, 12345, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.replayScheduledOres(od, 12345, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	for cx := int32(-2); cx <= 2; cx++ {
@@ -106,3 +114,5 @@ func TestScheduledRegionOreReplayIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+

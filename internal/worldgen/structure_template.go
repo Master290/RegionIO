@@ -165,12 +165,12 @@ func TransformBlockPos(pos [3]int, mirror string, rotation int, pivot [3]int) [3
 	}
 	px, pz := pivot[0], pivot[2]
 	switch rotation {
-	case 1: // clockwise_90
-		return [3]int{px - pz + z, y, px + pz - x}
-	case 2: // clockwise_180
+	case 1: // clockwise_90 ($SwitchMap ordinal 1 -> bytecode target 172)
 		return [3]int{px + pz - z, y, pz - px + x}
-	case 3: // counterclockwise_90
+	case 2: // clockwise_180 (target 120)
 		return [3]int{px + px - x, y, pz + pz - z}
+	case 3: // counterclockwise_90 (target 146)
+		return [3]int{px - pz + z, y, px + pz - x}
 	}
 	return [3]int{x, y, z}
 }

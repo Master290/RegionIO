@@ -109,7 +109,7 @@ func TestMonsterRoomReplayMatchesDirectPass(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := region.replayScheduledOres(12345, 0, 0); err != nil {
+		if err := region.replayScheduledOres(od, 12345, 0, 0); err != nil {
 			t.Fatal(err)
 		}
 		return region.chunks[[2]int32{0, 0}]
@@ -125,4 +125,5 @@ func TestMonsterRoomReplayMatchesDirectPass(t *testing.T) {
 		}
 	}
 }
+
 

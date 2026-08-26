@@ -123,7 +123,7 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 		if err != nil {
 			panic("world: creating decoration region: " + err.Error())
 		}
-		if err := region.replayScheduledOres(seed, targetX, targetZ); err != nil {
+		if err := region.replayScheduledOres(od, seed, targetX, targetZ); err != nil {
 			panic("world: replaying region ores: " + err.Error())
 		}
 		target := region.chunks[[2]int32{targetX, targetZ}]
@@ -158,7 +158,7 @@ func vanillaRegionBatchGeneratorFromInputs(seed int64, od *worldgen.OverworldDen
 				if err != nil {
 					return nil, err
 				}
-				if err := region.replayScheduledOres(seed, cx, cz); err != nil {
+				if err := region.replayScheduledOres(od, seed, cx, cz); err != nil {
 					return nil, err
 				}
 				target := region.chunks[[2]int32{cx, cz}]
@@ -192,3 +192,4 @@ func classifyColumnAtSurface(c *Chunk, x, z int) (top int, grass bool) {
 	}
 	return classifyColumn(&column)
 }
+
