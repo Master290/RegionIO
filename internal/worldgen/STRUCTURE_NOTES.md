@@ -185,7 +185,7 @@ else nextFloat < 0.07 -> magma else netherrack); overgrown adds leaves above;
 then addNetherrackDripColumn below (up to 8 steps, each continuing while
 nextFloat < 0.5).
 
-## Ocean ruins (ground truth captured, port pending)
+## Ocean ruins (ported, replay matches vanilla cell-for-cell)
 
 The grid claims ocean_ruins at chunk (7,5) on seed 12345, and a fresh
 capture with -chunks "6,4;7,5;8,6;7,4" confirms vanilla agrees: its
@@ -218,11 +218,47 @@ Algorithm read off OceanRuinStructure + OceanRuinPieces bytecode:
   suspicious-sand archy rules for gravel/wall targets.
 
 48 underwater_ruin templates are extracted under
-internal/worldgen/data/structure_template/underwater_ruin/. Open
-mechanics for the port: how the piece descends from pos.y=90 to the
-saved TPY=50 (ocean-floor height at some reference column), and the
-exact IntegrityProcessor draw order (ChunkPos-forked positional random,
-not the shared stream).
+internal/worldgen/data/structure_template/underwater_ruin/.
+
+### Post-placement physics (the part that cost the most digging)
+
+The -no-features capture of the ruin chunks differs from our placement by
+exactly 16 cells: 12 bubble_column cells and 4 gravel/water swaps. Both are
+block-tick physics that run when the generated chunks take their first
+ticks (the kept vanilla world's saved chunk carries EMPTY block_ticks and
+fluid_ticks lists — they were scheduled during worldgen and consumed at
+load). `tools/VanillaRuinChunkTicksProbe.java` reads saved chunk NBT to
+verify this. The mechanism, from bytecode:
+
+- FallingBlock.updateShape calls scheduleTick on every gravity block the
+  shape pass touches — and placeInWorld's tail runs
+  Block.updateFromNeighbourShapes over EVERY placed cell, so each placed
+  gravel/sand gets a fall tick.
+- FallingBlock.isFree = air || FIRE || liquid() || canBeReplaced, where
+  liquid() is a BLOCK-level property (Properties.liquid), NOT the fluid
+  state: a waterlogged chest is NOT free, so gravel rests on the fixture's
+  waterlogged chest at (113,51,78) — go by block name (water/lava), never
+  by the fluid flag.
+- The fall lands on the first non-free cell below; the vacated cell
+  becomes the block's own fluid (air for gravel); water then flows back
+  in, and cells with >=2 horizontal source-water neighbours settle to
+  source water (the classic infinite-water rule — both fixture cells have
+  it).
+- LiquidBlock's shape update above magma schedules the fluid tick that
+  grows a downward bubble_column (drag=true) upward through source water
+  to the first non-water cell (the sea surface, y=62 at sea level 63).
+  Only magma that SURVIVES the final placement grows a column: cracked_2's
+  magma at (113,50,79) is overwritten by mossy_2's gravel and the capture
+  shows no column there — so run the bubble pass after all pieces place.
+- WorldGenRegion.updateNeighborsAt is a NO-OP default on LevelAccessor
+  during worldgen; onPlace is never called by WorldGenRegion.setBlock —
+  the shape pass is the only trigger chain.
+
+world/ocean_ruin.go implements all of this
+(applyOceanRuinPhysics); the env-gated TestOceanRuinCaptureParity
+compares the whole ruin footprint against a -no-features capture and
+reaches 0 diffs, and the committed TestOceanRuinFixture12345 pins the
+chest, the landed gravel, and the solid share on the parity seed.
 
 Seed 12345, committed fixture chunks (0,0) (1,0) (0,1) (-1,-1):
 

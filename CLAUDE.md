@@ -144,9 +144,17 @@ Known gaps, roughly in order of how visible they are:
 - **Feature replay covers the underground stages, not everything.** `worldgen/features.go` parses
   the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
   production region replay runs it for stage-2 geodes, the whole stage-6 schedule (ores with real
-  deepslate targets, underwater magma between copper and the disks, disk features), and lush-cave
-  vegetation patches — see `world/feature_scheduler.go` and `world/region_ores.go`. Trees, flora,
-  springs, desert features, rocks, lakes, and structures are still hand-written in `world/vanilla.go`.
+  deepslate targets, underwater magma between copper and the disks, disk features), lush-cave
+  vegetation patches, and stage-3 monster rooms — see `world/feature_scheduler.go`,
+  `world/region_ores.go`, and `world/monster_rooms.go`. Of the structure sets, ruined portals
+  (`world/ruined_portal.go`) and ocean ruins (`world/ocean_ruin.go`, with the post-placement
+  falling-gravel/bubble-column/water-refill physics vanilla's block ticks add) replay from their
+  datapack configurations; mineshafts do not. Trees, flora, springs, desert features, rocks, and
+  lakes are still hand-written in `world/vanilla.go`.
+- **The (-1,-1) pocket is unattributed.** The fixture's chunk (-1,-1) carries a
+  cobblestone+mossy floor at y=35 with two chests that no replayed feature explains. A Java probe
+  dumping vanilla's structure starts around that chunk (the `VanillaRuinChunkTicksProbe.java`
+  pattern) is the way to close it.
 - **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
   place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
   trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
@@ -163,17 +171,19 @@ Known gaps, roughly in order of how visible they are:
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
 Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.378% through
-the single-chunk path, 98.028% through the production region replay. A featureless vanilla capture
+the single-chunk path, 98.047% through the production region replay. A featureless vanilla capture
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
 undecorated pipeline bit-exact against it — density, surface rules, carvers, aquifers, and
 noise-router veins match every one of the fixture's cells — so the residual block gap is entirely
-inside feature replay. Monster rooms (stage 3, `world/monster_rooms.go`) now replay between geodes
-and the ores with vanilla's draw order, so the air pockets ore ellipsoids roll discards against
-exist where the schedule puts them; the fixture's four chunks contain no dungeons, so the measured
-number did not move. The unreplayed air-writing stages are lava lakes (stage 1) and the remaining
-structure sets: the fixture carries ruined-portal and mineshaft pieces (obsidian/gold/planks
-markers), and a cobblestone-and-water pocket in chunk (-1,-1) that no replayed feature explains —
-attributing it is the open lead for closing the gap further.
+inside feature replay. Monster rooms (stage 3, `world/monster_rooms.go`) replay between geodes
+and the ores with vanilla's draw order, and ocean ruins (`world/ocean_ruin.go`) replay
+cell-for-cell against a dedicated `-no-features` capture of their start — integrity rolls,
+the capped suspicious-gravel conversion, chest/drowned markers, and the post-placement physics
+(falling gravel, bubble columns, source-water refill); the fixture's four chunks contain no
+dungeons or ruins, so the measured number did not move. The unreplayed air-writing stages are
+lava lakes (stage 1) and mineshafts: the fixture carries mineshaft planks/fences markers, and a
+cobblestone-and-water pocket in chunk (-1,-1) that no replayed feature explains — attributing it
+is the open lead for closing the gap further.
 
 ## Testing worldgen
 

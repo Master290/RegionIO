@@ -23,8 +23,10 @@ block editing, persistent worlds, and an overworld generator built on the real
   biome datapack graph is embedded; feature ordering, placement modifiers,
   vertical anchors/providers, biome filters, and mutable region writes are
   implemented. Production region replay now covers cross-chunk ores, disks,
-  underwater magma, stage-2 amethyst geodes, and lush-cave moss ground patches
-  directly from their datapack configurations.
+  underwater magma, stage-2 amethyst geodes, lush-cave moss ground patches,
+  ruined portals, and ocean ruins — the latter including the post-placement
+  block-tick physics (falling gravel through water, bubble columns above
+  magma, source-water refill) — directly from their datapack configurations.
 - **Gameplay**: four-player session registry; player join/leave and movement
   synchronization; chunk-scoped visibility for players and mobs; shared
   creative block place/break; broadcast chat; and hotbar item→block mapping.
@@ -77,7 +79,7 @@ glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
 chunks. The canonical single-chunk generator currently matches 95.378% of
-fixture blocks, while the production region replay path matches 98.028%; both
+fixture blocks, while the production region replay path matches 98.047%; both
 match all fixture biomes and heightmaps. CI guards the 91% regression floor
 while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
@@ -118,13 +120,14 @@ exposing undecorated chunks.
 The remaining block-parity gap is entirely inside feature replay: a vanilla
 capture with every feature and structure set stripped out matches our
 undecorated pipeline on all 393,216 cells, so density, surface rules, carvers,
-aquifers, and noise-router veins are already bit-exact. Monster rooms now
-replay from their datapack configuration between the geodes and the ores, so
-the air pockets ore ellipsoids roll discards against exist where the schedule
-puts them; the committed fixture happens to contain no dungeons, leaving the
-measured parity at 98.028%. What still does not replay is the stage-1 lake
-schedule and the structure sets — ruined portal and mineshaft pieces are
-visible in the fixture — and those are the next worldgen milestones on the way
+aquifers, and noise-router veins are already bit-exact. Monster rooms replay
+from their datapack configuration between the geodes and the ores, and ocean
+ruins replay cell-for-cell against a dedicated `-no-features` vanilla capture
+of their area (falling gravel, bubble columns, and water refill included);
+the committed fixture happens to contain no dungeons or ruins, leaving the
+measured parity at 98.047%. What still does not replay is the stage-1 lake
+schedule and the remaining structure sets — mineshaft pieces are visible in
+the fixture — and those are the next worldgen milestones on the way
 to exact equality while keeping cold batch generation within an acceptable
 latency budget.
 
