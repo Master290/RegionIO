@@ -79,7 +79,7 @@ glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
 chunks. The canonical single-chunk generator currently matches 95.378% of
-fixture blocks, while the production region replay path matches 98.047%; both
+fixture blocks, while the production region replay path matches 98.220%; both
 match all fixture biomes and heightmaps. CI guards the 91% regression floor
 while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
@@ -122,13 +122,15 @@ capture with every feature and structure set stripped out matches our
 undecorated pipeline on all 393,216 cells, so density, surface rules, carvers,
 aquifers, and noise-router veins are already bit-exact. Stage-1 lava lakes,
 monster rooms (from their datapack configuration, between the geodes and the
-ores), and ocean ruins replay from the datapack — the latter cell-for-cell
-against a dedicated `-no-features` vanilla capture of their area (falling
-gravel, bubble columns, and water refill included). The fixture's one dungeon
-is blocked on mineshafts: its wall opening is cave air a mineshaft corridor
-carved, so porting `MineshaftPieces` (pieces reach 5-6 chunks from their
-start) is the next worldgen milestone on the way to exact equality while
-keeping cold batch generation within an acceptable latency budget.
+ores), ocean ruins (cell-for-cell against a dedicated `-no-features` vanilla
+capture of their area, falling gravel and bubble columns included), and
+mineshafts (piece-for-piece against the saved vanilla start NBT and
+cell-for-cell against a structures-only capture) replay from the datapack —
+the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
+corridor carved, now places in full. The next worldgen milestones are the
+surface decoration stages — trees, flora, and springs are still hand-written —
+on the way to exact equality while keeping cold batch generation within an
+acceptable latency budget.
 
 ## Project layout
 

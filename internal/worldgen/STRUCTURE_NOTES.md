@@ -185,13 +185,13 @@ else nextFloat < 0.07 -> magma else netherrack); overgrown adds leaves above;
 then addNetherrackDripColumn below (up to 8 steps, each continuing while
 nextFloat < 0.5).
 
-## Mineshafts (fully decoded from bytecode, port pending)
+## Mineshafts (ported, replay matches vanilla piece-for-piece and cell-for-cell)
 
 Everything below was read out of the 26.1.2 jar with javap (MineshaftStructure,
 MineshaftPieces + all four piece classes, StructurePiece, StructurePiecesBuilder).
-It is the complete implementation spec — draw-for-draw. Start chunks on seed
-12345: (4,-1), (4,2) reach chunks (-1,-2) etc. (pieces can extend ~80 blocks
-from the room, so replay must scan ±8 chunks like ChunkStatus.MAX_STRUCTURE_DISTANCE).
+The port lives in world/mineshafts.go; verification: all five seed-12345 trees
+match the saved vanilla start NBT (142/82/110/121/85 pieces), and the replay
+matches the structures-only capture of the dungeon area 147/147 writes.
 
 ### Structure start (MineshaftStructure.findGenerationPoint / generatePiecesAndAdjust)
 
@@ -527,3 +527,23 @@ line). No lake lands in the fixture area (the only placement position in
 the surrounding 5x15 source window is rejected at (-18,45,-39)), so the
 measured parity did not move; the port is verified by unit test and by
 draw-order against the bytecode, not yet by a capture.
+
+Implementation findings that cost the most digging (all in the port now):
+
+- applyBiomeDecoration RESEEDS the chunk's decoration random with
+  setFeatureSeed(decorationSeed, structureIndexInStep, step) before each
+  structure's pieces place - mineshaft is index 1 of the alphabetically
+  ordered underground_structures registry list (buried_treasure, mineshaft,
+  mineshaft_mesa, trail_ruins, trial_chambers). Without the reseed every
+  roll-based placement (rails, cobwebs, the 0.8 ceiling carve) diverges.
+- generateBox's FIRST state parameter places on the box BORDER, the second
+  in the interior. The 1-wide fence/plank columns pass the block as the
+  border state - read the parameters backwards and no support ever places.
+- The saved NBT "O" field is Direction.getHorizontalIndex (south=0, west=1,
+  north=2, east=3); the room stores -1 (no orientation, absolute coords).
+- Biome tag flattening had dropped nested references (#is_ocean etc. got a
+  double minecraft: prefix) - fixed in structures.go; four of the five
+  seed-12345 mineshaft starts were being rejected at the biome filter.
+- Chunk references decode with ChunkPos.pack (x in the LOW 32 bits) - chunk
+  (-1,-2) references starts (4,-1) and (-4,1), and only referenced starts
+  place pieces into the chunk.

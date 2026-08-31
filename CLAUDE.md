@@ -147,16 +147,12 @@ Known gaps, roughly in order of how visible they are:
   whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
   disks, disk features), lush-cave vegetation patches, and stage-3 monster rooms — see
   `world/feature_scheduler.go`, `world/region_ores.go`, and `world/monster_rooms.go`. Of the
-  structure sets, ruined portals (`world/ruined_portal.go`) and ocean ruins (`world/ocean_ruin.go`,
+  structure sets, ruined portals (`world/ruined_portal.go`), ocean ruins (`world/ocean_ruin.go`,
   with the post-placement falling-gravel/bubble-column/water-refill physics vanilla's block ticks
-  add) replay from their datapack configurations; mineshafts do not. Trees, flora, springs, desert
-  features, rocks, and lakes' surface variants are still hand-written in `world/vanilla.go`.
-- **The (-1,-1) pocket is attributed: mineshaft + monster room.** The fixture's chunk (-1,-1)
-  carries a monster room at (-6,36,-19) whose center sits in chunk (-1,-2); our replay generates
-  the exact placement position but rejects the room because its wall opening is cave air carved by
-  a mineshaft corridor from the starts at chunks (4,-1)/(4,2) — pieces reach 5-6 chunks out.
-  Mineshafts place at the underground_structures step before that step's features, so porting them
-  (`MineshaftPieces`) is the prerequisite for the dungeon and the next worldgen milestone.
+  add), and mineshafts (`world/mineshafts.go`, verified against the saved vanilla start NBT
+  piece-for-piece and against a structures-only capture cell-for-cell) replay from their datapack
+  configurations. Trees, flora, springs, desert features, rocks, and lakes' surface variants are
+  still hand-written in `world/vanilla.go`.
 - **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
   place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
   trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
@@ -173,19 +169,20 @@ Known gaps, roughly in order of how visible they are:
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
 Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.378% through
-the single-chunk path, 98.047% through the production region replay. A featureless vanilla capture
+the single-chunk path, 98.220% through the production region replay. A featureless vanilla capture
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
 undecorated pipeline bit-exact against it — density, surface rules, carvers, aquifers, and
 noise-router veins match every one of the fixture's cells — so the residual block gap is entirely
 inside feature replay. Monster rooms (stage 3, `world/monster_rooms.go`) replay between geodes
-and the ores with vanilla's draw order, and ocean ruins (`world/ocean_ruin.go`) replay
+and the ores with vanilla's draw order, ocean ruins (`world/ocean_ruin.go`) replay
 cell-for-cell against a dedicated `-no-features` capture of their start — integrity rolls,
 the capped suspicious-gravel conversion, chest/drowned markers, and the post-placement physics
-(falling gravel, bubble columns, source-water refill); the fixture's four chunks contain no
-dungeons or ruins, so the measured number did not move. The unreplayed stages are lakes' surface
-variants and mineshafts: the fixture's (-1,-1) pocket is a monster room whose wall opening a
-mineshaft corridor carved (starts at chunks (4,-1)/(4,2), pieces reaching 5-6 chunks), so porting
-mineshafts is the open lead for closing the gap further.
+(falling gravel, bubble columns, source-water refill) — and mineshafts (`world/mineshafts.go`)
+replay piece-for-piece against the saved vanilla start NBT and cell-for-cell against the
+structures-only capture of the dungeon area: the fixture's (-1,-1) pocket — a monster room whose
+wall opening a mineshaft corridor carved — now places in full (floor, both chests). The remaining
+gap is the surface decoration stages: trees, flora, and springs are still hand-written, and the
+next milestones are the vegetal/feature stages beyond the underground ones.
 
 ## Testing worldgen
 
