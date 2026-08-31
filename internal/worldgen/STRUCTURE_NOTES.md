@@ -265,7 +265,28 @@ Seed 12345, committed fixture chunks (0,0) (1,0) (0,1) (-1,-1):
 - (1,0): ruined portal — obsidian (17,13,3), crying obsidian (21,13,3),
   gold block (19,18,3), chest (17,13,2).
 - (0,0)/(1,0): mineshaft planks/fences near y=-41..-42.
-- (-1,-1): unexplained cobblestone+mossy floor at y=35 under gravel/water with
-  two chests nearby — attributed to no replayed feature yet. Candidate leads:
-  a dungeon whose placement stream we mismatch, or an ocean ruin whose pieces
-  reach across the chunk border.
+- (-1,-1): **ATTRIBUTED — mineshaft + monster room.** The pocket is a
+  monster room at origin (-6,36,-19) (a 9x9 floor of mossy/cobble with two
+  chests and a spawner whose center lies in chunk (-1,-2), so only its
+  southern two rows are inside the fixture chunk). Our monster-room replay
+  generates the exact right position but its pass-1 wall-opening validation
+  fails (0 openings where vanilla had 1-5): the opening is cave air carved
+  by a MINESHAFT corridor. A three-way capture of chunks around the room
+  (featureless / -no-features / full) proves it: the opening cells are
+  already cave_air in the structures-only capture and stone in the
+  featureless one, and chunk (-1,-2)'s saved References name
+  minecraft:mineshaft starts at chunks (4,-1) and (4,2) — mineshaft pieces
+  reach 5-6 chunks from their start. Mineshafts place at the same
+  underground_structures step as monster rooms but BEFORE the step's
+  features (applyBiomeDecoration runs all structure pieces of a step, then
+  the step's features), so porting mineshafts is a hard prerequisite for
+  the dungeon — and for every other feature whose validation reads
+  mineshaft-carved air.
+
+Also from the same dig: stage-1 lakes are now replayed (world/lakes.go,
+bytecode-faithful port of LakeFeature — blob ellipsoids, the validation
+pass, the cave-air/fluid carve, the 50%-per-cell stone rim above the fluid
+line). No lake lands in the fixture area (the only placement position in
+the surrounding 5x15 source window is rejected at (-18,45,-39)), so the
+measured parity did not move; the port is verified by unit test and by
+draw-order against the bytecode, not yet by a capture.

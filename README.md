@@ -103,11 +103,11 @@ The density router, configured carvers, and noise-router ore veins are
 vanilla-derived. Surface and biome selection are ported but still need broader
 runtime captures. The production cache now uses atomic batch publication and
 the datapack-driven region replay path, with cross-chunk writes isolated per
-target. Underground decoration (ores with deepslate targets, underwater magma,
-disks) runs from the vanilla stage-6 schedule; the largest remaining fidelity
-gap is surface decoration — trees, flora, springs, and lakes are still
-hand-written — plus a few hundred underground cells where our carver or aquifer
-verdict differs from vanilla. The biome parameter
+target. Underground decoration (stage-1 lava lakes, ores with deepslate
+targets, underwater magma, disks) runs from the vanilla schedule; the largest
+remaining fidelity gap is surface decoration — trees, flora, and springs are
+still hand-written — plus the unreplayed structure pieces (mineshafts).
+The biome parameter
 finder uses an exact spatial index and overlapping region requests share a
 bounded immutable terrain cache, keeping cold 3x3 generation near one second
 on the reference Ryzen 5 5600X development machine.
@@ -120,16 +120,15 @@ exposing undecorated chunks.
 The remaining block-parity gap is entirely inside feature replay: a vanilla
 capture with every feature and structure set stripped out matches our
 undecorated pipeline on all 393,216 cells, so density, surface rules, carvers,
-aquifers, and noise-router veins are already bit-exact. Monster rooms replay
-from their datapack configuration between the geodes and the ores, and ocean
-ruins replay cell-for-cell against a dedicated `-no-features` vanilla capture
-of their area (falling gravel, bubble columns, and water refill included);
-the committed fixture happens to contain no dungeons or ruins, leaving the
-measured parity at 98.047%. What still does not replay is the stage-1 lake
-schedule and the remaining structure sets — mineshaft pieces are visible in
-the fixture — and those are the next worldgen milestones on the way
-to exact equality while keeping cold batch generation within an acceptable
-latency budget.
+aquifers, and noise-router veins are already bit-exact. Stage-1 lava lakes,
+monster rooms (from their datapack configuration, between the geodes and the
+ores), and ocean ruins replay from the datapack — the latter cell-for-cell
+against a dedicated `-no-features` vanilla capture of their area (falling
+gravel, bubble columns, and water refill included). The fixture's one dungeon
+is blocked on mineshafts: its wall opening is cave air a mineshaft corridor
+carved, so porting `MineshaftPieces` (pieces reach 5-6 chunks from their
+start) is the next worldgen milestone on the way to exact equality while
+keeping cold batch generation within an acceptable latency budget.
 
 ## Project layout
 

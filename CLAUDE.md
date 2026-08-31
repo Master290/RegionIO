@@ -143,18 +143,20 @@ Known gaps, roughly in order of how visible they are:
 
 - **Feature replay covers the underground stages, not everything.** `worldgen/features.go` parses
   the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
-  production region replay runs it for stage-2 geodes, the whole stage-6 schedule (ores with real
-  deepslate targets, underwater magma between copper and the disks, disk features), lush-cave
-  vegetation patches, and stage-3 monster rooms — see `world/feature_scheduler.go`,
-  `world/region_ores.go`, and `world/monster_rooms.go`. Of the structure sets, ruined portals
-  (`world/ruined_portal.go`) and ocean ruins (`world/ocean_ruin.go`, with the post-placement
-  falling-gravel/bubble-column/water-refill physics vanilla's block ticks add) replay from their
-  datapack configurations; mineshafts do not. Trees, flora, springs, desert features, rocks, and
-  lakes are still hand-written in `world/vanilla.go`.
-- **The (-1,-1) pocket is unattributed.** The fixture's chunk (-1,-1) carries a
-  cobblestone+mossy floor at y=35 with two chests that no replayed feature explains. A Java probe
-  dumping vanilla's structure starts around that chunk (the `VanillaRuinChunkTicksProbe.java`
-  pattern) is the way to close it.
+  production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes, the
+  whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
+  disks, disk features), lush-cave vegetation patches, and stage-3 monster rooms — see
+  `world/feature_scheduler.go`, `world/region_ores.go`, and `world/monster_rooms.go`. Of the
+  structure sets, ruined portals (`world/ruined_portal.go`) and ocean ruins (`world/ocean_ruin.go`,
+  with the post-placement falling-gravel/bubble-column/water-refill physics vanilla's block ticks
+  add) replay from their datapack configurations; mineshafts do not. Trees, flora, springs, desert
+  features, rocks, and lakes' surface variants are still hand-written in `world/vanilla.go`.
+- **The (-1,-1) pocket is attributed: mineshaft + monster room.** The fixture's chunk (-1,-1)
+  carries a monster room at (-6,36,-19) whose center sits in chunk (-1,-2); our replay generates
+  the exact placement position but rejects the room because its wall opening is cave air carved by
+  a mineshaft corridor from the starts at chunks (4,-1)/(4,2) — pieces reach 5-6 chunks out.
+  Mineshafts place at the underground_structures step before that step's features, so porting them
+  (`MineshaftPieces`) is the prerequisite for the dungeon and the next worldgen milestone.
 - **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
   place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
   trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
@@ -180,10 +182,10 @@ and the ores with vanilla's draw order, and ocean ruins (`world/ocean_ruin.go`) 
 cell-for-cell against a dedicated `-no-features` capture of their start — integrity rolls,
 the capped suspicious-gravel conversion, chest/drowned markers, and the post-placement physics
 (falling gravel, bubble columns, source-water refill); the fixture's four chunks contain no
-dungeons or ruins, so the measured number did not move. The unreplayed air-writing stages are
-lava lakes (stage 1) and mineshafts: the fixture carries mineshaft planks/fences markers, and a
-cobblestone-and-water pocket in chunk (-1,-1) that no replayed feature explains — attributing it
-is the open lead for closing the gap further.
+dungeons or ruins, so the measured number did not move. The unreplayed stages are lakes' surface
+variants and mineshafts: the fixture's (-1,-1) pocket is a monster room whose wall opening a
+mineshaft corridor carved (starts at chunks (4,-1)/(4,2), pieces reaching 5-6 chunks), so porting
+mineshafts is the open lead for closing the gap further.
 
 ## Testing worldgen
 
