@@ -64,12 +64,18 @@ func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, se
 }
 
 // placeScheduledStructures replays every structure start whose pieces may
-// reach the target chunk. Only the ruined_portals set is ported so far.
+// reach the target chunk. Set order and the shared draw sequence follow the
+// registry order used by vanilla's structure pass: ruined portals first, then
+// ocean ruins (their chest loot seeds draw from the same structure stream, so
+// the portal replay must precede them to keep both streams aligned).
 func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
 	sets, err := worldgen.LoadStructureSets()
 	if err != nil {
 		return err
 	}
+	// Each structure start writes within one chunk of its OWN source (sx,sz)
+	// (vanilla's post-process radius), so the region's write guard is set to
+	// that chunk per start, not to the target.
 	for sx := targetX - 2; sx <= targetX+2; sx++ {
 		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
 			stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
@@ -79,7 +85,27 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			if stub == nil {
 				continue
 			}
+			if err := r.setSource(sx, sz); err != nil {
+				return err
+			}
 			if err := PlaceRuinedPortalPiece(r, stub); err != nil {
+				return err
+			}
+		}
+	}
+	for sx := targetX - 2; sx <= targetX+2; sx++ {
+		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
+			stub, random, err := OceanRuinGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if stub == nil {
+				continue
+			}
+			if err := r.setSource(sx, sz); err != nil {
+				return err
+			}
+			if err := PlaceOceanRuinPieces(r, random, stub, seed); err != nil {
 				return err
 			}
 		}

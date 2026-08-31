@@ -19,9 +19,12 @@ import (
 
 // TemplateBlockInfo is one resolved template cell.
 type TemplateBlockInfo struct {
-	Pos   [3]int
-	State uint16
+	Pos    [3]int
+	State  uint16
 	HasNBT bool
+	// Marker is the data-marker metadata string for structure_block blocks
+	// with a nested NBT compound (e.g. "chest", "drowned"), empty otherwise.
+	Marker string
 }
 
 // LoadResolvedTemplate reads a template file from disk.
@@ -129,8 +132,13 @@ func LoadResolvedTemplateBytes(raw []byte, resolve func(name string, props map[s
 					continue
 				}
 				info := TemplateBlockInfo{Pos: pos, State: palette[stateIdx].id}
-				if _, hasNBT := blockComp.Get("nbt"); hasNBT {
+				if nbtTag, hasNBT := blockComp.Get("nbt"); hasNBT {
 					info.HasNBT = true
+					if nc, isCompound := nbtTag.(*nbt.Compound); isCompound {
+						if mt, ok := nc.Get("metadata"); ok {
+							info.Marker = string(mt.(nbt.String))
+						}
+					}
 				}
 				blocks = append(blocks, info)
 			}

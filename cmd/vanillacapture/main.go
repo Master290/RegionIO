@@ -38,6 +38,7 @@ func main() {
 	output := flag.String("output", "internal/world/testdata/vanilla_overworld_12345.bin", "output fixture")
 	keep := flag.Bool("keep", false, "keep the temporary vanilla world")
 	featureless := flag.Bool("featureless", false, "install a derived datapack that empties biome features and structure sets, capturing base terrain only")
+	noFeatures := flag.Bool("no-features", false, "install a derived datapack that empties biome features but keeps structure sets, capturing base terrain plus structures")
 	blocksOnly := flag.Bool("blocks-only", false, "write a blocks-only fixture (RIOBASE1) without biome cells or heightmaps")
 	port := flag.Int("port", 25565, "server listen port; change it when 25565 is taken on this host")
 	flag.Parse()
@@ -69,6 +70,12 @@ func main() {
 	if *featureless {
 		packs := filepath.Join(work, "world", "datapacks")
 		if err := installFeaturelessDatapack(jar, packs); err != nil {
+			fatal(err)
+		}
+	}
+	if *noFeatures {
+		packs := filepath.Join(work, "world", "datapacks")
+		if err := installNoFeaturesDatapack(jar, packs); err != nil {
 			fatal(err)
 		}
 	}
@@ -354,6 +361,17 @@ func writeBaseFixture(worldDir, output string, seed int64, chunks []chunkPos) er
 // read directly, and the official bundler, which stores that same inner server
 // under META-INF/versions/.
 func installFeaturelessDatapack(jar, packsDir string) error {
+	return installDatapack(jar, packsDir, true)
+}
+
+// installNoFeaturesDatapack keeps structure sets (structures still generate,
+// including ocean ruins) but strips every biome's feature stages, so the
+// capture holds base terrain plus structures and nothing else.
+func installNoFeaturesDatapack(jar, packsDir string) error {
+	return installDatapack(jar, packsDir, false)
+}
+
+func installDatapack(jar, packsDir string, stripStructures bool) error {
 	r, err := zip.OpenReader(jar)
 	if err != nil {
 		return err
@@ -445,21 +463,27 @@ func installFeaturelessDatapack(jar, packsDir string) error {
 			return err
 		}
 	}
-	for name, raw := range sets {
-		var doc map[string]any
-		if err := json.Unmarshal(raw, &doc); err != nil {
-			return fmt.Errorf("structure set %s: %w", name, err)
-		}
-		doc["structures"] = []any{}
-		out, err := json.Marshal(doc)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(setDir, name), out, 0o644); err != nil {
-			return err
+	if stripStructures {
+		for name, raw := range sets {
+			var doc map[string]any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				return fmt.Errorf("structure set %s: %w", name, err)
+			}
+			doc["structures"] = []any{}
+			out, err := json.Marshal(doc)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(setDir, name), out, 0o644); err != nil {
+				return err
+			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "featureless datapack: %d biomes, %d structure sets\n", len(biomes), len(sets))
+	if stripStructures {
+		fmt.Fprintf(os.Stderr, "featureless datapack: %d biomes, %d structure sets\n", len(biomes), len(sets))
+	} else {
+		fmt.Fprintf(os.Stderr, "no-features datapack: %d biomes stripped, %d structure sets kept\n", len(biomes), len(sets))
+	}
 	return nil
 }
 

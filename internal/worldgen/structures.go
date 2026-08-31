@@ -105,22 +105,25 @@ type StructureDef struct {
 	Type   string              `json:"type"`
 	Biomes string              `json:"biomes"`
 	Step   string              `json:"step"`
+	// BiomeTemp is the ocean-ruin variant discriminator: "cold" | "warm".
+	BiomeTemp string              `json:"biome_temp"`
 	Setups []RuinedPortalSetup `json:"-"`
 }
 
 func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 	var doc struct {
-		Type   string           `json:"type"`
-		Biomes string           `json:"biomes"`
-		Step   string           `json:"step"`
-		Setups []RuinedPortalSetup `json:"setups"`
+		Type      string             `json:"type"`
+		Biomes    string             `json:"biomes"`
+		Step      string             `json:"step"`
+		BiomeTemp string             `json:"biome_temp"`
+		Setups    []RuinedPortalSetup `json:"setups"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
 	}
 	return &StructureDef{
 		Name: name, Type: doc.Type, Biomes: strings.TrimPrefix(doc.Biomes, "minecraft:"),
-		Step: doc.Step, Setups: doc.Setups,
+		Step: doc.Step, Setups: doc.Setups, BiomeTemp: doc.BiomeTemp,
 	}, nil
 }
 
