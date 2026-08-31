@@ -1,4 +1,4 @@
-package world
+﻿package world
 
 import (
 	"testing"
@@ -42,10 +42,10 @@ func TestVegetationPatchPlacesFloorGroundDeterministically(t *testing.T) {
 
 	a, b := makeRegion(), makeRegion()
 	origin := worldgen.FeaturePosition{X: 8, Y: 5, Z: 8}
-	if !a.placeVegetationPatch(worldgen.NewWorldgenRandom(123), origin, config, set) {
+	if !a.placeVegetationPatch(worldgen.NewWorldgenRandom(123), origin, config, set, false) {
 		t.Fatal("patch changed no blocks")
 	}
-	if !b.placeVegetationPatch(worldgen.NewWorldgenRandom(123), origin, config, set) {
+	if !b.placeVegetationPatch(worldgen.NewWorldgenRandom(123), origin, config, set, false) {
 		t.Fatal("second patch changed no blocks")
 	}
 	moss, ok := nameToStateID("minecraft:moss_block", nil)

@@ -138,7 +138,16 @@ func (r *decorationRegion) placeScheduledOresFiltered(seed int64, biomeOrder []s
 }
 
 func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
-	spheres := buildOreSpheres(random, originX, originY, originZ, size)
+	setup := drawOreVeinSetup(random, originX, originY, originZ, size)
+	// OreFeature.place's height gate: veins entirely above the ocean-floor
+	// heightmap place nothing and consume no sphere draws. The heightmap is
+	// read live, so earlier features' writes count.
+	if !oreVeinPassesHeightGate(originX, originY, originZ, size, func(x, z int) (int, bool) {
+		return region.heightAt("OCEAN_FLOOR_WG", x, z), true
+	}) {
+		return
+	}
+	spheres := buildOreSpheresFrom(random, setup)
 	walkOreBlocks(spheres, func(x, y, z int) {
 		if y < MinY || y >= MinY+WorldHeight {
 			return

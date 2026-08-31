@@ -180,6 +180,14 @@ type RandomSelectorConfig struct {
 	Features []RandomSelectorEntry
 }
 
+// RandomBooleanSelectorConfig is the random_boolean_selector feature: one
+// nextBoolean draw picks feature_true or feature_false, placed at the same
+// position with the same random.
+type RandomBooleanSelectorConfig struct {
+	FeatureTrue  FeatureRef
+	FeatureFalse FeatureRef
+}
+
 type RandomSelectorEntry struct {
 	Chance  float32
 	Feature FeatureRef
@@ -625,7 +633,7 @@ func (s *FeatureSet) Geode(name string) (GeodeFeatureConfig, error) {
 
 func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig, error) {
 	configured, ok := s.Configured[name]
-	if !ok || configured.Type != "minecraft:vegetation_patch" {
+	if !ok || configured.Type != "minecraft:vegetation_patch" && configured.Type != "minecraft:waterlogged_vegetation_patch" {
 		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a vegetation patch", name)
 	}
 	var raw struct {
@@ -801,6 +809,29 @@ func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
 		if err != nil {
 			return RandomSelectorConfig{}, err
 		}
+	}
+	return selector, nil
+}
+
+func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:random_boolean_selector" {
+		return RandomBooleanSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random boolean selector", name)
+	}
+	var raw struct {
+		FeatureTrue  json.RawMessage `json:"feature_true"`
+		FeatureFalse json.RawMessage `json:"feature_false"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return RandomBooleanSelectorConfig{}, err
+	}
+	selector := RandomBooleanSelectorConfig{}
+	var err error
+	if selector.FeatureTrue, err = parseFeatureRef(raw.FeatureTrue); err != nil {
+		return RandomBooleanSelectorConfig{}, err
+	}
+	if selector.FeatureFalse, err = parseFeatureRef(raw.FeatureFalse); err != nil {
+		return RandomBooleanSelectorConfig{}, err
 	}
 	return selector, nil
 }

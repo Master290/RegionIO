@@ -108,7 +108,22 @@ func flattenBlockTag(set *worldgen.FeatureSet, tag string, visiting map[string]b
 }
 
 func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
-	spheres := buildOreSpheres(random, originX, originY, originZ, size)
+	setup := drawOreVeinSetup(random, originX, originY, originZ, size)
+	if !oreVeinPassesHeightGate(originX, originY, originZ, size, func(x, z int) (int, bool) {
+		lx, lz := x-int(c.X)*16, z-int(c.Z)*16
+		if lx < 0 || lx >= 16 || lz < 0 || lz >= 16 {
+			return 0, false
+		}
+		for y := MinY + WorldHeight - 1; y >= MinY; y-- {
+			if stateFlags(c.GetBlock(lx, y, lz))&flagBlocksMotion != 0 {
+				return y + 1, true
+			}
+		}
+		return MinY, true
+	}) {
+		return
+	}
+	spheres := buildOreSpheresFrom(random, setup)
 	walkOreBlocks(spheres, func(x, y, z int) {
 		localX := x - int(c.X)*16
 		if localX < 0 || localX >= 16 {
@@ -132,19 +147,67 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 	})
 }
 
-func buildOreSpheres(random worldgen.RandomSource, originX, originY, originZ, size int) []oreSphere {
+// oreVeinSetup carries OreFeature.place's drawn axis parameters between the
+// setup draws and the sphere chain, so the height gate can sit between them.
+type oreVeinSetup struct {
+	x0, x1, z0, z1, y0, y1 float64
+	size                   int
+}
+
+// drawOreVeinSetup consumes OreFeature.place's three setup draws: the vein
+// angle (nextFloat) and the two vertical anchors (nextInt(3) each).
+func drawOreVeinSetup(random worldgen.RandomSource, originX, originY, originZ, size int) oreVeinSetup {
 	angle := random.NextFloat() * float32(math.Pi)
 	extent := float32(size) / 8.0
 	// OreFeature.place uses java.lang.Math for the vein axis. The later radius
 	// wave uses Mth.sin, but using the lookup table here shifts every sphere.
 	xOffset := math.Sin(float64(angle)) * float64(extent)
 	zOffset := math.Cos(float64(angle)) * float64(extent)
-	x0 := float64(originX) + xOffset
-	x1 := float64(originX) - xOffset
-	z0 := float64(originZ) + zOffset
-	z1 := float64(originZ) - zOffset
-	y0 := float64(originY + int(random.NextIntN(3)) - 2)
-	y1 := float64(originY + int(random.NextIntN(3)) - 2)
+	return oreVeinSetup{
+		x0: float64(originX) + xOffset,
+		x1: float64(originX) - xOffset,
+		z0: float64(originZ) + zOffset,
+		z1: float64(originZ) - zOffset,
+		y0: float64(originY + int(random.NextIntN(3)) - 2),
+		y1: float64(originY + int(random.NextIntN(3)) - 2),
+		size: size,
+	}
+}
+
+// oreVeinPassesHeightGate mirrors OreFeature.place's search-box scan: the vein
+// runs only when at least one column of the box reaches down to (or below)
+// the ocean-floor heightmap, evaluated live at feature time. Rejected veins
+// consume no sphere draws, which keeps later placement positions aligned.
+func oreVeinPassesHeightGate(originX, originY, originZ, size int, heightAt func(x, z int) (int, bool)) bool {
+	extent := float64(size) / 8.0
+	cols := int(math.Ceil(extent))
+	span := int(math.Ceil((float64(size)/16.0*2.0 + 1.0) / 2.0))
+	minX := originX - cols - span
+	minY := originY - 2 - span
+	minZ := originZ - cols - span
+	maxX := minX + 2*(cols+span)
+	maxZ := minZ + 2*(cols+span)
+	for x := minX; x <= maxX; x++ {
+		for z := minZ; z <= maxZ; z++ {
+			height, ok := heightAt(x, z)
+			if ok && minY <= height {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func buildOreSpheres(random worldgen.RandomSource, originX, originY, originZ, size int) []oreSphere {
+	setup := drawOreVeinSetup(random, originX, originY, originZ, size)
+	return buildOreSpheresFrom(random, setup)
+}
+
+func buildOreSpheresFrom(random worldgen.RandomSource, setup oreVeinSetup) []oreSphere {
+	size := setup.size
+	x0, x1 := setup.x0, setup.x1
+	z0, z1 := setup.z0, setup.z1
+	y0, y1 := setup.y0, setup.y1
 
 	spheres := make([]oreSphere, size)
 	for i := 0; i < size; i++ {

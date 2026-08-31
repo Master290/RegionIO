@@ -1,6 +1,7 @@
 package world
 
 import (
+	"fmt"
 	"strconv"
 
 	"regionio/internal/worldgen"
@@ -40,8 +41,33 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 				return err
 			}
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeVegetationPatch(random, position, config, set)
+				r.placeVegetationPatch(random, position, config, set, false)
 				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:waterlogged_vegetation_patch":
+			config, err := set.VegetationPatch(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeVegetationPatch(random, position, config, set, true)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:random_boolean_selector":
+			config, err := set.RandomBooleanSelector(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				ref := config.FeatureFalse
+				if random.NextBoolean() {
+					ref = config.FeatureTrue
+				}
+				return r.placeVegetationFeatureRef(random, position, ref, set)
 			}); err != nil {
 				return err
 			}
@@ -157,7 +183,38 @@ func blockTagContains(set *worldgen.FeatureSet, tag, name string) bool {
 	return false
 }
 
-func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.VegetationPatchFeatureConfig, set *worldgen.FeatureSet) bool {
+// placeVegetationFeatureRef runs an inline feature reference produced by a
+// selector feature (random_boolean_selector and friends): the reference names
+// a configured feature with an empty inline placement, so the configured
+// feature runs directly at the position.
+func (r *decorationRegion) placeVegetationFeatureRef(random worldgen.RandomSource, position worldgen.FeaturePosition, ref worldgen.FeatureRef, set *worldgen.FeatureSet) error {
+	if len(ref.Placement) != 0 {
+		return fmt.Errorf("world: vegetation selector feature %s has non-empty placement", ref.Name)
+	}
+	configured, ok := set.Configured[ref.Name]
+	if !ok {
+		return fmt.Errorf("world: vegetation selector feature %s missing", ref.Name)
+	}
+	switch configured.Type {
+	case "minecraft:vegetation_patch":
+		config, err := set.VegetationPatch(ref.Name)
+		if err != nil {
+			return err
+		}
+		r.placeVegetationPatch(random, position, config, set, false)
+	case "minecraft:waterlogged_vegetation_patch":
+		config, err := set.VegetationPatch(ref.Name)
+		if err != nil {
+			return err
+		}
+		r.placeVegetationPatch(random, position, config, set, true)
+	default:
+		return fmt.Errorf("world: vegetation selector feature %s has unsupported type %s", ref.Name, configured.Type)
+	}
+	return nil
+}
+
+func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.VegetationPatchFeatureConfig, set *worldgen.FeatureSet, waterlogged bool) bool {
 	radiusX := config.XZRadiusMin + 1
 	if config.XZRadiusMax > config.XZRadiusMin {
 		radiusX += int(random.NextIntN(int32(config.XZRadiusMax - config.XZRadiusMin + 1)))
@@ -176,7 +233,11 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 		return false
 	}
 	placed := false
-	var groundPositions [][3]int
+	// The patch set holds the GROUND positions (the top block of each placed
+	// column), matching VegetationPatchFeature.placeGroundPatch's return set;
+	// the waterlogged subclass's water fill and the vegetation roll count both
+	// key off it.
+	var patchSet [][3]int
 	for dx := -radiusX; dx <= radiusX; dx++ {
 		for dz := -radiusZ; dz <= radiusZ; dz++ {
 			onXEdge := dx == -radiusX || dx == radiusX
@@ -184,8 +245,15 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			if onXEdge && onZEdge {
 				continue
 			}
-			if (onXEdge || onZEdge) && random.NextFloat() >= config.ExtraEdgeColumnChance {
-				continue
+			// Vanilla skips edge columns without a draw when the chance is 0
+			// and keeps them when nextFloat() <= chance.
+			if onXEdge || onZEdge {
+				if config.ExtraEdgeColumnChance == 0 {
+					continue
+				}
+				if random.NextFloat() > config.ExtraEdgeColumnChance {
+					continue
+				}
 			}
 			p := origin
 			p.X += dx
@@ -208,9 +276,8 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			if r.getBlock(p.X, p.Y, p.Z) != StateAir {
 				continue
 			}
-			groundPos := p
-			groundPos.Y += direction
-			if !fullSolidState(r.getBlock(groundPos.X, groundPos.Y, groundPos.Z)) {
+			groundX, groundY, groundZ := p.X, p.Y+direction, p.Z
+			if !fullSolidState(r.getBlock(groundX, groundY, groundZ)) {
 				continue
 			}
 			depth := config.DepthMin
@@ -220,30 +287,81 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			if config.ExtraBottomBlockChance > 0 && random.NextFloat() < config.ExtraBottomBlockChance {
 				depth++
 			}
-			columnPlaced := false
+			// placeGround: a column succeeds unless the FIRST cell is neither
+			// replaceable nor already the ground block; hitting a wall deeper
+			// down still counts, and already-ground cells are skipped in place.
+			columnOK := true
 			for i := 0; i < depth; i++ {
-				gx, gy, gz := groundPos.X, groundPos.Y+direction*i, groundPos.Z
-				if !replaceable[r.getBlock(gx, gy, gz)] {
+				gx, gy, gz := groundX, groundY+direction*i, groundZ
+				current := r.getBlock(gx, gy, gz)
+				if current == ground {
+					continue
+				}
+				if !replaceable[current] {
+					columnOK = i > 0
 					break
 				}
 				if r.setBlock(gx, gy, gz, ground) {
 					placed = true
-					columnPlaced = true
 				}
 			}
-			if columnPlaced {
-				groundPositions = append(groundPositions, [3]int{p.X, p.Y, p.Z})
+			if columnOK {
+				patchSet = append(patchSet, [3]int{groundX, groundY, groundZ})
 			}
 		}
 	}
+	if waterlogged {
+		initVegetationWater()
+		// WaterloggedVegetationPatchFeature.placeGroundPatch: enclosed ground
+		// cells become water and the returned (vegetation-rolled) set is the
+		// water cells. Exposure is evaluated after the whole ground pass.
+		var waterCells [][3]int
+		for _, g := range patchSet {
+			if !r.patchColumnExposed(g) {
+				waterCells = append(waterCells, g)
+			}
+		}
+		for _, g := range waterCells {
+			r.setBlock(g[0], g[1], g[2], vegetationWaterID)
+		}
+		patchSet = waterCells
+	}
 	// Keep the confirmed RNG contract while the nested placed-feature pass is
-	// independently validated against the full fixture.
-	for range groundPositions {
+	// independently validated against the full fixture: one draw per set
+	// position whenever the vegetation chance is positive.
+	for range patchSet {
 		if config.VegetationChance > 0 {
 			random.NextFloat()
 		}
 	}
 	return placed
+}
+
+var vegetationWaterID uint16
+var vegetationWaterOnce bool
+
+func initVegetationWater() {
+	if !vegetationWaterOnce {
+		vegetationWaterOnce = true
+		stateByIDOnce.Do(buildStateTable)
+		id, ok := nameToStateID("minecraft:water", nil)
+		if !ok {
+			panic("world: missing water state for vegetation patches")
+		}
+		vegetationWaterID = id
+	}
+}
+
+// patchColumnExposed mirrors WaterloggedVegetationPatchFeature.isExposed: the
+// position is exposed when any of the four horizontal neighbours or the block
+// below does not present a sturdy face toward it.
+func (r *decorationRegion) patchColumnExposed(g [3]int) bool {
+	for _, d := range [5][3]int{{0, 0, -1}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}, {0, -1, 0}} {
+		if !fullSolidState(r.getBlock(g[0]+d[0], g[1]+d[1], g[2]+d[2])) {
+			return true
+		}
+	}
+	return false
 }
 
 // placeSimpleBlockFeature implements the simple_block feature variants used
