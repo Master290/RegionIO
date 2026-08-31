@@ -185,6 +185,243 @@ else nextFloat < 0.07 -> magma else netherrack); overgrown adds leaves above;
 then addNetherrackDripColumn below (up to 8 steps, each continuing while
 nextFloat < 0.5).
 
+## Mineshafts (fully decoded from bytecode, port pending)
+
+Everything below was read out of the 26.1.2 jar with javap (MineshaftStructure,
+MineshaftPieces + all four piece classes, StructurePiece, StructurePiecesBuilder).
+It is the complete implementation spec — draw-for-draw. Start chunks on seed
+12345: (4,-1), (4,2) reach chunks (-1,-2) etc. (pieces can extend ~80 blocks
+from the room, so replay must scan ±8 chunks like ChunkStatus.MAX_STRUCTURE_DISTANCE).
+
+### Structure start (MineshaftStructure.findGenerationPoint / generatePiecesAndAdjust)
+
+1. `random.nextDouble()` — ONE draw, discarded (parity leftover).
+2. Room piece: `new MineShaftRoom(0, random, chunk.getBlockX(2), chunk.getBlockZ(2), type)`
+   — note blockX(2)/blockZ(2) = min + 2, genDepth 0.
+3. `builder.addPiece(room); room.addChildren(room, builder, random);`
+4. Non-mesa: `deltaY = builder.moveBelowSeaLevel(seaLevel=63, minY=-64, random, 10)`:
+   - `maxAllowedY = seaLevel - 10` (=53); `newMaxY = box.ySpan + minY + 1`;
+   - if newMaxY < maxAllowedY: `newMaxY += random.nextInt(maxAllowedY - newMaxY)`
+     (bottom becomes minY+1+r, top capped at 53);
+   - `deltaY = newMaxY - box.maxY`; move ALL pieces (and entrance boxes) by deltaY.
+   Piece tree generation happens BEFORE this move — tree draws don't depend on y.
+
+### Piece tree (MineshaftPieces statics)
+
+`generateAndAddPiece(parent, accessor, random, x, y, z, dir, depth)`:
+- if depth > 8 → nil; if |x - parent.box.minX| > 80 or |z - parent.box.minZ| > 80 → nil
+- piece = createRandomShaftPiece(accessor, random, x, y, z, dir, depth+1, type)
+- if piece != nil: accessor.addPiece(piece); piece.addChildren(parent, accessor, random)
+- createRandomShaftPiece: `n = random.nextInt(100)`;
+  n >= 80 → Crossing.findCrossing (fail → nil, NO retry); 70..79 → Stairs.findStairs
+  (fail → nil); else Corridor.findCorridorSize (retry loop: n-- while n > 0).
+
+Piece order in the accessor matters for findCollisionPiece (any overlap → reject).
+
+### Room (genDepth 0)
+
+ctor: `box = BoundingBox(x, 50, z, x+7+nextInt(6), 54+nextInt(6), z+7+nextInt(6))`
+(three nextInt(6) in maxX, maxY, maxZ order). No orientation (absolute coords).
+
+addChildren (four sides in N, S, W, E order; ySpan1 = max(box.ySpan-4, 1)):
+- NORTH: `i=0; while i < xSpan: i += nextInt(xSpan); if i+3 > xSpan break;
+  p = generateAndAddPiece(this, acc, rnd, minX+i, minY+nextInt(ySpan1)+1, minZ-1, NORTH, depth);
+  if p: entrances.add(BB(p.minX, p.minY, this.minZ, p.maxX, p.maxY, this.minZ+1)); i += 4`
+- SOUTH: same loop; pos (minX+i, minY+nextInt(ySpan1)+1, maxZ+1); entrance z: this.maxZ-1..maxZ
+- WEST: over zSpan; pos (minX-1, minY+nextInt(ySpan1)+1, minZ+i); entrance x: this.minX..minX+1
+- EAST: over zSpan; pos (maxX+1, minY+nextInt(ySpan1)+1, minZ+i); entrance x: this.maxX-1..maxX
+NOTE the draw order: nextInt(xSpan) for i, then nextInt(ySpan1) per generated piece.
+
+postProcess (absolute coords, no orientation):
+- if isInInvalidLocation → skip; carve interior (minX, minY+1, minZ)-(maxX, min(minY+3, maxY), maxZ) cave air
+- carve each entrance top: (e.minX, e.maxY-2, e.minZ)-(e.maxX, e.maxY, e.maxZ) cave air
+- generateUpperHalfSphere (minX, minY+4, minZ)-(maxX, maxY, maxZ) cave air
+
+### Corridor
+
+findCorridorSize(acc, rnd, x, y, z, dir): `n = nextInt(3)+2; while n > 0:`
+len = n*5; boxes (before move(x,y,z)): N: (0,0,-(len-1))..(2,2,0); S: (0,0,0)..(2,2,len-1);
+W: (-(len-1),0,0)..(0,2,2); E: (0,0,0)..(len-1,2,2). If no collision → return box; else n--.
+
+ctor(depth, rnd, box, dir, type): setOrientation(dir);
+hasRails = nextInt(3)==0; spider = !hasRails && nextInt(23)==0 (draw only if !hasRails);
+numSections = (axis==Z ? zSpan : xSpan)/5.
+
+addChildren: `n = nextInt(4)`; switch orientation:
+- N: n<=1 → (minX, minY-1+nextInt(3), minZ-1, N); n==2 → (minX-1, minY-1+nextInt(3), minZ, W);
+  else → (maxX+1, minY-1+nextInt(3), minZ, E)
+- S: n<=1 → (minX, minY-1+nextInt(3), maxZ+1, S); n==2 → (minX-1, .., maxZ-3, W); else (maxX+1, .., maxZ-3, E)
+- W: n<=1 → (minX-1, .., minZ, W); n==2 → (minX, .., minZ-1, N); else → (minX, .., maxZ+1, S)
+- E: n<=1 → (maxX+1, .., minZ, E); n==2 → (maxX-3, .., minZ-1, N); else → (maxX-3, .., maxZ+1, S)
+(all pass genDepth, not +1). Then if depth < 8:
+- axis N/S: for z = minZ+3; z+3 <= maxZ; z += 5: r = nextInt(5);
+  r==0 → (minX-1, minY, z, W, depth+1); r==1 → (maxX+1, minY, z, E, depth+1)
+- axis W/E: for x = minX+3; x+3 <= maxX; x += 5: r = nextInt(5);
+  r==0 → (x, minY, minZ-1, N, depth+1); r==1 → (x, minY, maxZ+1, S, depth+1)
+
+postProcess (LOCAL coords mapped through orientation; see transforms below):
+- i2 = numSections*5 - 1
+- generateBox(0,0,0)-(2,1,i2) cave air (always)
+- generateMaybeBox(chance 0.8, (0,2,0)-(2,2,i2), border=CAVE_AIR, interior=CAVE_AIR, replaceAir=false, requireInterior=false) — draw per cell, `nextFloat() <= 0.8`
+- if spider: generateMaybeBox(0.6, (0,0,0)-(2,1,i2), border=COBWEB, interior=CAVE_AIR, false, true)
+  — cobwebs on the box boundary (y0/y1 are both borders → effectively everywhere),
+  requireInterior=true (isInterior check: below OCEAN_FLOOR_WG heightmap)
+- for m in 0..numSections-1: n = 2 + m*5;
+  - placeSupport(level, box, 0, 0, n, 2, 2, random) — see below (LOCAL coords)
+  - maybePlaceCobWeb ×8: (0.1, 0,2,n-1) (0.1, 2,2,n-1) (0.1, 0,2,n+1) (0.1, 2,2,n+1)
+    (0.05, 0,2,n-2) (0.05, 2,2,n-2) (0.05, 0,2,n+2) (0.05, 2,2,n+2)
+  - if nextInt(100)==0: createChest(2, 0, n-1)   [chest minecart! see below]
+  - if nextInt(100)==0: createChest(0, 0, n+1)
+  - if spider && !hasPlacedSpider: o = n-1+nextInt(3);
+    pos = world(1, 0, o); if chunkBox.isInside(pos) && isInterior(1,0,o):
+    hasPlacedSpider = true; setBlock(pos, SPAWNER) (entity cave spider — no draw)
+- floor: for x in 0..2: for z in 0..i2: setPlanksBlock(planks, x, -1, z)
+- placeDoubleLowerOrUpperSupport(0, -1, 2); if numSections > 1: also (0, -1, i2-2)
+- if hasRails: rail = RAIL[shape=north_south];
+  for z in 0..i2: below = getBlock(1, -1, z); if !below.isAir && below.isSolidRender:
+  chance = isInterior(1, 0, z) ? 0.7 : 0.9; maybeGenerateBlock(chance, 1, 0, z, rail)
+  (maybeGenerateBlock: `nextFloat() < chance`, note STRICT < vs maybeBox's <=)
+
+placeSupport(level, box, x1=0, y1=0, z=n, y2=2, x2=2, rnd) — call is always (0,0,n,2,2):
+- isSupportingBox: for x in 0..2: if getBlock(x, 3, n).isAir() → return (no support)
+  [bytecode literally checks y=x2+1=3; x range is p3..p7 = 0..2]
+- west fence column: generateBox((0,0,n)-(0,1,n), fence[west=true], border=CAVE_AIR)
+- east fence column: generateBox((2,0,n)-(2,1,n), fence[east=true], border=CAVE_AIR)
+- if nextInt(4)==0: planks caps at (0,2,n) and (2,2,n)
+- else: planks cap at (2,2,n) only; wall torches: maybeGenerateBlock(0.05, (1,2,n-1),
+  WALL_TORCH[facing=south]) and maybeGenerateBlock(0.05, (1,2,n+1), WALL_TORCH[facing=north])
+
+placeDoubleLowerOrUpperSupport(level, box, x, y, z):
+- if getBlock(x, y, z).block == planks.block: fillPillarDownOrChainUp(wood, x, y, z)
+- if getBlock(x+2, y, z).block == planks.block: fillPillarDownOrChainUp(wood, x+2, y, z)
+
+fillPillarDownOrChainUp(state, x, y, z): pos = world(x,y,z); startY = pos.y;
+down=true, up=true, i=1; while (down || up):
+- if down: pos.y = startY-i; s = getBlock(pos);
+  replaceable = isReplaceableByStructures(s) && s.block != LAVA
+  (isReplaceableByStructures = isAir || liquid || GLOW_LICHEN || SEAGRASS || TALL_SEAGRASS)
+  if !replaceable: if s.isFaceSturdy(UP): fillColumnBetween(state, startY-i+1, startY); return
+  down = (i <= 20 && replaceable && pos.y > minY+1)
+- if up: pos.y = startY+i; s = getBlock(pos); repl = isReplaceableByStructures(s)
+  if !repl: if Block.canSupportCenter(level, pos, DOWN) && s.block not FallingBlock:
+    setBlock(startY+1, fence); fillColumnBetween(IRON_CHAIN, startY+2, startY+i); return
+  up = (i <= 50 && repl && pos.y < maxY)
+- i++
+fillColumnBetween(state, y1, y2): for y in [y1, y2): setBlock.
+
+createChest(level, box, rnd, x, y, z, loot): — CHEST MINECART, not a chest block!
+- pos = world(x,y,z); if !box.isInside || !current.isAir || below.isAir → false
+- rail = RAIL[shape = nextBoolean() ? north_south : east_west] (ONE draw); placeBlock(rail)
+- minecart entity IS created during worldgen (they exist in vanilla worlds) →
+  nextLong() IS drawn (loot seed). Our replay: place rail, draw nextBoolean + nextLong.
+
+maybePlaceCobWeb(chance, x, y, z): if isInterior && nextFloat() < chance &&
+hasSturdyNeighbours(x,y,z, 2): placeBlock(COBWEB).
+hasSturdyNeighbours: iterate Direction.values() (6, decl order DOWN,UP,NORTH,SOUTH,WEST,EAST);
+count neighbours (moved once) where chunkBox.isInside && state.isFaceSturdy(dir.getOpposite());
+return true as soon as count >= required.
+
+### Crossing (no orientation — absolute coords)
+
+findCrossing: h = nextInt(4)==0 ? 6 : 2 (ONE draw);
+N: BB(-1,0,-4)-(3,h,0); S: BB(-1,0,0)-(3,h,4); W: BB(-4,0,-1)-(0,h,3); E: BB(0,0,-1)-(4,h,3);
+move(x,y,z); collision → nil (no retry).
+ctor: isTwoFloored = box.ySpan > 3.
+
+addChildren (genDepth): by `direction` field (from ctor):
+- N: (minX+1, minY, minZ-1, N), (minX-1, minY, minZ+1, W), (maxX+1, minY, minZ+1, E)
+- S: (minX+1, minY, maxZ+1, S), (minX-1, minY, minZ+1, W), (maxX+1, minY, minZ+1, E)
+- W: (minX+1, minY, minZ-1, N), (minX+1, minY, maxZ+1, S), (minX-1, minY, minZ+1, W)
+- E: (minX+1, minY, minZ-1, N), (minX+1, minY, maxZ+1, S), (maxX+1, minY, minZ+1, E)
+if isTwoFloored: four nextBoolean() draws; each true → extra piece at minY+3+1:
+N:(minX+1, minY+4, minZ-1, N); W:(minX-1, minY+4, minZ+1, W); E:(maxX+1, minY+4, minZ+1, E);
+S:(minX+1, minY+4, maxZ+1, S).
+
+postProcess (absolute): if two-floored:
+- (minX+1, minY, minZ)-(maxX-1, minY+2, maxZ) air; (minX, minY, minZ+1)-(maxX, minY+2, maxZ-1) air
+- (minX+1, maxY-2, minZ)-(maxX-1, maxY, maxZ) air; (minX, maxY-2, minZ+1)-(maxX, maxY, maxZ-1) air
+- (minX+1, minY+3, minZ+1)-(maxX-1, minY+3, maxZ-1) air  [upper floor slab]
+else: (minX+1, minY, minZ)-(maxX-1, maxY, maxZ) air; (minX, minY, minZ+1)-(maxX, maxY, maxZ-1) air.
+Then 4 pillars: placeSupportPillar at (minX+1, minY, minZ+1), (minX+1, minY, maxZ-1),
+(maxX-1, minY, minZ+1), (maxX-1, minY, maxZ-1) with top maxY:
+  if !getBlock(x, maxY+1, z).isAir(): generateBox((x,y,z)-(x,maxY,z), planks, CAVE_AIR)
+Then floor: y = minY-1; for x minX..maxX, z minZ..maxZ: setPlanksBlock(planks, x, y, z).
+
+### Stairs (setOrientation)
+
+findStairs (NO draws): N: BB(0,-5,-8)-(2,2,0); S: BB(0,-5,0)-(2,2,8); W: BB(-8,-5,0)-(0,2,2);
+E: BB(0,-5,0)-(8,2,2); move; collision → nil.
+addChildren: N:(minX, minY, minZ-1, N); S:(minX, minY, maxZ+1, S); W:(minX-1, minY, minZ, W);
+E:(maxX+1, minY, minZ, E).
+postProcess (LOCAL): generateBox(0,5,0)-(2,7,1) air; generateBox(0,0,7)-(2,2,8) air;
+for i in 0..4: generateBox(0, 5-i-(i<4?1:0), 2+i)-(2, 7-i, 2+i) air.
+
+### StructurePiece infrastructure (needed by all pieces)
+
+CRITICAL — the postProcess random and write box (from applyBiomeDecoration +
+lambda$applyBiomeDecoration$3 + getWritableArea, decoded 26.1.2):
+
+- The chunk's decoration random is `WorldgenRandom(Xoroshiro(generateUniqueSeed()))
+  → setDecorationSeed(levelSeed, sectionPos.origin().x, sectionPos.origin().z)`
+  — i.e. exactly what worldgen.DecorationRandom produces. It is passed RAW
+  (no setFeatureSeed fork) to every `StructureStart.placeInChunk` call, and the
+  SAME instance flows sequentially through ALL starts' pieces placing into that
+  chunk (order = the chunk's structure-references iteration order — for the
+  fixture's chunk (1,0) both the ruined portal and mineshaft pieces place, so
+  the portal-vs-mineshaft order must be pinned; likely registry order, the same
+  order placeScheduledStructures already assumes for portals/ruins).
+- The write box is the chunk's OWN box: BoundingBox(minBlockX, minY+1, minBlockZ,
+  minBlockX+15, maxY, minBlockZ+15). placeBlock/getBlock/isInterior/isInInvalidLocation
+  all clip against it; random draws happen for the piece's full local box regardless
+  (loops don't skip on box misses), so draw alignment is chunk-order-dependent but
+  write alignment is per-cell.
+- Feature steps fork with setFeatureSeed(decorationSeed, index, step) — a RESEED
+  from the saved decoration seed, not a continuation — so piece draws never shift
+  feature draws. But within one chunk, pieces of start B draw after pieces of
+  start A consumed their draws.
+
+Replay model implied: per target chunk, run every intersecting piece of every
+referenced start in reference order, with that chunk's fresh DecorationRandom,
+writing only cells inside the chunk box; region order across chunks does not
+matter for writes (each cell belongs to one chunk) but reads see earlier writes
+of the same chunk pass (vanilla processes pieces in list order within a start,
+and starts in reference order — earlier pieces' writes are visible to later
+pieces' isInInvalidLocation/isSupportingBox reads in the SAME chunk only... in
+vanilla actually earlier CHUNks' writes are also visible once those chunks are
+done; for the region replay, process chunk-by-chunk in a fixed order).
+
+Orientation transform (piece-local → world; setOrientation also sets mirror/rotation
+for BlockState.rotate/mirror in placeBlock — SOUTH: mirror LEFT_RIGHT; WEST: mirror
+LEFT_RIGHT + rot CW90; EAST: rot CW90; NORTH: none):
+- getWorldX(x, z): N/S: minX+x; W: maxX-z; E: minX+z
+- getWorldZ(x, z): N: maxZ-z; S: minZ+z; W/E: minZ+x
+- getWorldY(y): minY+y (orientation != null; pieces without orientation pass
+  absolute coords directly)
+- placeBlock(state, x, y, z, chunkBox): pos = world(x,y,z); if !chunkBox.isInside → skip;
+  if !canBeReplaced → skip (corridor override: skip planks/wood/fence/iron_chain blocks);
+  apply mirror+rotation to state; setBlock. (Fluid tick + postprocess marks: no block effect.)
+- generateBox(x1,y1,z1,x2,y2,z2, state, border, replaceAir): loops y outer, x middle, z inner;
+  if replaceAir && getBlock().isAir → skip; border cells (any coord on the box face) →
+  border state; interior → state.
+- generateMaybeBox(rnd, chance, box, borderState, state, replaceAir, requireInterior):
+  same loop order; per cell `nextFloat() <= chance`; skip if replaceAir && air;
+  skip if requireInterior && !isInterior; border → borderState; interior → state.
+- isInterior(x, y, z, chunkBox): world(x, y+1, z) inside chunkBox && pos.y <
+  getHeight(OCEAN_FLOOR_WG, pos.x, pos.z)  (strict <)
+- isInInvalidLocation(chunkBox): clamp piece box ±1 to chunkBox; center biome in
+  #mineshaft_blocking → invalid; then liquid() checks on the 4 face pairs:
+  (x,z rows at y0/y1), (x,y at z0/z1), (z,y at x0/x1) — any liquid BLOCK → invalid.
+- setPlanksBlock(state, x, y, z): if isInterior(x, y, z) && !current.isFaceSturdy(UP):
+  setBlock(state).
+- isSupportingBox(xFrom, xTo, y, z): for x in [xFrom, xTo]: getBlock(x, y+1, z).isAir() → false.
+
+### Blocks involved
+
+normal: planks=oak_planks, wood=oak_log (axis=y), fence=oak_fence; mesa: dark oak
+variants (mineshaft_mesa structure json). Rails (shape north_south / east_west /
+nextBoolean pick), cobweb, iron_chain (axis=y), wall_torch (facing), spawner,
+cave_air. MESA uses the same algorithm with different planks/fence/log ids.
+
 ## Ocean ruins (ported, replay matches vanilla cell-for-cell)
 
 The grid claims ocean_ruins at chunk (7,5) on seed 12345, and a fresh
