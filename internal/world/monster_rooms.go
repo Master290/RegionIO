@@ -266,6 +266,10 @@ func placeMonsterRoom(r *decorationRegion, random worldgen.RandomSource, ox, oy,
 				// Vanilla seeds the chest's loot table from one long here.
 				random.NextLong()
 			}
+			// A successful spot ends the inner retry loop (bytecode jumps
+			// to the outer attempt increment right after the loot seed),
+			// so the remaining tries draw nothing.
+			break
 		}
 	}
 

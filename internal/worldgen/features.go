@@ -1083,9 +1083,13 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 			if context.BlockPredicate == nil {
 				return fmt.Errorf("worldgen: %s environment scan requires BlockPredicate", name)
 			}
-			allowed, err := context.BlockPredicate(value.Allowed, position)
-			if err != nil || !allowed {
-				return err
+			// An absent allowed_search_condition means every block is a
+			// valid search step (vanilla's Optional<BlockPredicate>).
+			if len(value.Allowed) > 0 {
+				allowed, err := context.BlockPredicate(value.Allowed, position)
+				if err != nil || !allowed {
+					return err
+				}
 			}
 			dy := 1
 			if value.Direction == "down" {
@@ -1103,12 +1107,14 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 				if position.Y < context.MinY || position.Y >= context.MinY+context.Height {
 					return nil
 				}
-				allowed, err = context.BlockPredicate(value.Allowed, position)
-				if err != nil {
-					return err
-				}
-				if !allowed {
-					break
+				if len(value.Allowed) > 0 {
+					allowed, err := context.BlockPredicate(value.Allowed, position)
+					if err != nil {
+						return err
+					}
+					if !allowed {
+						break
+					}
 				}
 			}
 			matched, err := context.BlockPredicate(value.Target, position)

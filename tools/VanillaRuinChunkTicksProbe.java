@@ -47,6 +47,10 @@ public final class VanillaRuinChunkTicksProbe {
                 if (be != null) {
                     System.out.println("block_entities: " + be);
                 }
+                Tag structures = chunk.get("structures");
+                if (structures != null) {
+                    System.out.println("structures: " + structures);
+                }
             }
         }
     }

@@ -44,6 +44,12 @@ func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, se
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
 		}
+		// Stage order within one source: lakes (1) carve the first air, so
+		// the geodes (2) and the monster rooms (3) validate against a world
+		// that already has it.
+		if err := r.placeScheduledLakes(seed); err != nil {
+			return fmt.Errorf("world: replay source lakes (%d,%d): %w", source.X, source.Z, err)
+		}
 		if err := r.placeScheduledGeodes(seed); err != nil {
 			return fmt.Errorf("world: replay source geodes (%d,%d): %w", source.X, source.Z, err)
 		}
