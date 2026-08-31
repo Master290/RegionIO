@@ -1,8 +1,8 @@
-# <p><img src="https://remo.su/regionio-full.svg" height="60"></p>
+﻿# <p><img src="https://remo.su/regionio-full.svg" height="60"></p>
 
 A Minecraft Java Edition server core written in Go, targeting version
 **26.1.2** (protocol **775**). RegionIO implements the connection lifecycle
-(status → login → configuration → play), multiplayer chunk streaming, shared
+(status в†’ login в†’ configuration в†’ play), multiplayer chunk streaming, shared
 block editing, persistent worlds, and an overworld generator built on the real
 `noise_router` `final_density` tree.
 
@@ -24,12 +24,12 @@ block editing, persistent worlds, and an overworld generator built on the real
   vertical anchors/providers, biome filters, and mutable region writes are
   implemented. Production region replay now covers cross-chunk ores, disks,
   underwater magma, stage-2 amethyst geodes, lush-cave moss ground patches,
-  ruined portals, and ocean ruins — the latter including the post-placement
+  ruined portals, and ocean ruins вЂ” the latter including the post-placement
   block-tick physics (falling gravel through water, bubble columns above
-  magma, source-water refill) — directly from their datapack configurations.
+  magma, source-water refill) вЂ” directly from their datapack configurations.
 - **Gameplay**: four-player session registry; player join/leave and movement
   synchronization; chunk-scoped visibility for players and mobs; shared
-  creative block place/break; broadcast chat; and hotbar item→block mapping.
+  creative block place/break; broadcast chat; and hotbar itemв†’block mapping.
 - **Lighting**: stored vanilla nibble arrays for sky and block light; horizontal
   and cross-chunk propagation; incremental updates after edits; persisted
   `SkyLight`/`BlockLight`; load-time border reconciliation; and chunk-scoped
@@ -78,8 +78,8 @@ disconnect. Lighting tests compare the initial flat chunk and a 31x31x31
 glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
-chunks. The canonical single-chunk generator currently matches 95.378% of
-fixture blocks, while the production region replay path matches 98.220%; both
+chunks. The canonical single-chunk generator currently matches 95.934% of
+fixture blocks, while the production region replay path matches 99.447%; both
 match all fixture biomes and heightmaps. CI guards the 91% regression floor
 while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
@@ -105,8 +105,8 @@ runtime captures. The production cache now uses atomic batch publication and
 the datapack-driven region replay path, with cross-chunk writes isolated per
 target. Underground decoration (stage-1 lava lakes, ores with deepslate
 targets, underwater magma, disks) runs from the vanilla schedule; the largest
-remaining fidelity gap is surface decoration — trees, flora, and springs are
-still hand-written — plus the unreplayed structure pieces (mineshafts).
+remaining fidelity gap is surface decoration вЂ” trees, flora, and springs are
+still hand-written вЂ” plus the unreplayed structure pieces (mineshafts).
 The biome parameter
 finder uses an exact spatial index and overlapping region requests share a
 bounded immutable terrain cache, keeping cold 3x3 generation near one second
@@ -125,10 +125,10 @@ monster rooms (from their datapack configuration, between the geodes and the
 ores), ocean ruins (cell-for-cell against a dedicated `-no-features` vanilla
 capture of their area, falling gravel and bubble columns included), and
 mineshafts (piece-for-piece against the saved vanilla start NBT and
-cell-for-cell against a structures-only capture) replay from the datapack —
+cell-for-cell against a structures-only capture) replay from the datapack вЂ”
 the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
 corridor carved, now places in full. The next worldgen milestones are the
-surface decoration stages — trees, flora, and springs are still hand-written —
+surface decoration stages вЂ” trees, flora, and springs are still hand-written вЂ”
 on the way to exact equality while keeping cold batch generation within an
 acceptable latency budget.
 

@@ -1,4 +1,4 @@
-# RegionIO — working notes
+﻿# RegionIO вЂ” working notes
 
 A Minecraft Java Edition server core in Go, targeting **26.1.2 / protocol 775**.
 The goal is vanilla fidelity, not a lookalike: where vanilla behaviour is known, match it exactly.
@@ -24,12 +24,12 @@ go run ./cmd/vanillacapture                  # regenerate vanilla block parity f
 ## Hard rules
 
 **No third-party dependencies.** `go.mod` has none. NBT, zlib framing, MD5 seeding, noise, the
-density-function interpreter — all in-tree. Keep it that way.
+density-function interpreter вЂ” all in-tree. Keep it that way.
 
 **Bump `generatorVersion` whenever the generator's output changes.** It lives in
 `internal/world/store.go` and is stamped into every saved chunk; a mismatch makes the chunk
 regenerate. Without a bump, the chunks already on disk keep their old terrain and your change looks
-like it did nothing in exactly the area you are standing in — `chunkAt` prefers the store over the
+like it did nothing in exactly the area you are standing in вЂ” `chunkAt` prefers the store over the
 generator. `TestGeneratorVersionStampRejectsStaleChunks` covers the mechanism. For quick iteration,
 `-world ""` sidesteps persistence entirely. (The seed is guarded separately, by the world metadata
 file, and a seed mismatch is a hard error rather than a regeneration.)
@@ -48,7 +48,7 @@ None of these are redistributable, so all are gitignored. Obtain `server.jar` fr
 
 The inner jar also carries the **complete worldgen datapack**, which is the source for everything we
 still approximate: 259 `placed_feature`, 222 `configured_feature`, 66 `biome` (with per-stage
-`features` and `carvers`), 5 `configured_carver`, 35 `structure`, 1359 structure NBTs — 648 KB for
+`features` and `carvers`), 5 `configured_carver`, 35 `structure`, 1359 structure NBTs вЂ” 648 KB for
 the feature/biome/carver set.
 
 Three ways in, cheapest first:
@@ -63,7 +63,7 @@ threshold was pinned down: `Strategy$2` switches `{0..3}` and everything above f
 global palette, which `.refjava/` alone could not show.
 
 When a constant has to come from vanilla's *runtime* rather than its source or reports, dump it with
-a Java program run against the jar. `tools/VanillaBlockStateDump.java` is the one that exists — it
+a Java program run against the jar. `tools/VanillaBlockStateDump.java` is the one that exists вЂ” it
 walks the block-state registry and emits, per state, light opacity and emission, voxel face-occlusion
 masks, and the `blocksMotion` / fluid / leaves flags the heightmaps need, into
 `internal/world/block_properties.bin`. Rebuild it with:
@@ -82,7 +82,7 @@ The same trick verifies output, not just constants. `tools/VanillaChunkFormatChe
 region file we wrote with vanilla's own `RegionFile`, `NbtIo`, `Strategy` and `SimpleBitStorage` and
 fails if the root is not flat, a section `Y` is not a byte, or a palette array is not the width
 vanilla derives from its palette size. Note the server jar is *signed*, so a helper cannot be
-declared inside a `net.minecraft.*` package — reach protected members by reflection instead.
+declared inside a `net.minecraft.*` package вЂ” reach protected members by reflection instead.
 
 Substring-matching block names is how the light table was wrong before (`grass_block` matched
 "grass", `bedrock` matched "bed"); don't reintroduce that shape of guess anywhere.
@@ -91,7 +91,7 @@ Substring-matching block names is how the light table was wrong before (`grass_b
 
 ```
 cmd/regionio/     entry point (flags, listener, graceful shutdown)
-cmd/gendump/      client-free generator diagnostics — biome spread, surface blocks,
+cmd/gendump/      client-free generator diagnostics вЂ” biome spread, surface blocks,
                   subsurface banding, deep-layer composition, bedrock band, fluid census,
                   cross-section
 cmd/genblocks/    generates internal/worldgen/generated_blocks.go from the block report
@@ -114,13 +114,13 @@ it is `internal/world/vanilla.go`.
 
 ## Fidelity status
 
-Bit-exact and parity-tested — treat as settled, change only with a vanilla reference in hand:
+Bit-exact and parity-tested вЂ” treat as settled, change only with a vanilla reference in hand:
 `random.go` (Xoroshiro128++, `upgradeSeedTo128bit`, MD5 seeding), `improved_noise.go`,
-`perlin_noise.go`, `normal_noise.go`, `blended.go`, `spline.go`, `density.go`, the 4×8×4 cell grid
+`perlin_noise.go`, `normal_noise.go`, `blended.go`, `spline.go`, `density.go`, the 4Г—8Г—4 cell grid
 with trilinear interpolation, the climate/biome finder, and the chunk wire encoder
 (`TestGoldenAgainstVanilla` compares bytes against a real vanilla chunk).
 
-Ported from the decompiled source and checked by behaviour rather than by bytes — faithful as far as
+Ported from the decompiled source and checked by behaviour rather than by bytes вЂ” faithful as far as
 we can tell, but no vanilla capture confirms them: the aquifer (`worldgen/aquifer.go`, the whole of
 `Aquifer.NoiseBasedAquifer` bar `shouldScheduleFluidUpdate`), the surface-rule interpreter
 (`worldgen/surface.go`, every condition the overworld tree uses), the badlands clay bands
@@ -135,7 +135,7 @@ world's `RandomState`, because `noise_threshold` and `vertical_gradient` cannot 
 a context from `NewContext`, call `BeginColumn` per column, then `Apply` per block.
 
 Two things a surface rule cannot do silently: name a block that is not in `worldgen/blockids.go`
-(that is a parse error now — it used to resolve to 0 and get dropped, which is how deepslate went
+(that is a parse error now вЂ” it used to resolve to 0 and get dropped, which is how deepslate went
 missing from the whole world), and be added without the world's height bounds (anchors resolve at
 parse time).
 
@@ -145,7 +145,7 @@ Known gaps, roughly in order of how visible they are:
   the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
   production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes, the
   whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
-  disks, disk features), lush-cave vegetation patches, and stage-3 monster rooms — see
+  disks, disk features), lush-cave vegetation patches, and stage-3 monster rooms вЂ” see
   `world/feature_scheduler.go`, `world/region_ores.go`, and `world/monster_rooms.go`. Of the
   structure sets, ruined portals (`world/ruined_portal.go`), ocean ruins (`world/ocean_ruin.go`,
   with the post-placement falling-gravel/bubble-column/water-refill physics vanilla's block ticks
@@ -157,40 +157,40 @@ Known gaps, roughly in order of how visible they are:
   place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
   trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
   into neighbours; the region infrastructure already supports that.
-- **No lakes.** Stage-1 lake features are not replayed; the base-terrain diagnostic's `air→lava`
-  and some clustered `stone→water` pairs are exactly these.
+- **No lakes.** Stage-1 lake features are not replayed; the base-terrain diagnostic's `airв†’lava`
+  and some clustered `stoneв†’water` pairs are exactly these.
 - **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
   adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
   warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,
   extracted from the jar's 65 biome JSONs). The overworld tree reaches `minecraft:temperature` from
-  exactly one rule — whether a hole in a frozen ocean floor ices over — so neither omission is
+  exactly one rule вЂ” whether a hole in a frozen ocean floor ices over вЂ” so neither omission is
   visible; snowy peaks come from biome selection, not from this condition.
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.378% through
-the single-chunk path, 98.220% through the production region replay. A featureless vanilla capture
+Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.934% through
+the single-chunk path, 99.447% through the production region replay. A featureless vanilla capture
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
-undecorated pipeline bit-exact against it — density, surface rules, carvers, aquifers, and
-noise-router veins match every one of the fixture's cells — so the residual block gap is entirely
+undecorated pipeline bit-exact against it вЂ” density, surface rules, carvers, aquifers, and
+noise-router veins match every one of the fixture's cells вЂ” so the residual block gap is entirely
 inside feature replay. Monster rooms (stage 3, `world/monster_rooms.go`) replay between geodes
 and the ores with vanilla's draw order, ocean ruins (`world/ocean_ruin.go`) replay
-cell-for-cell against a dedicated `-no-features` capture of their start — integrity rolls,
+cell-for-cell against a dedicated `-no-features` capture of their start вЂ” integrity rolls,
 the capped suspicious-gravel conversion, chest/drowned markers, and the post-placement physics
-(falling gravel, bubble columns, source-water refill) — and mineshafts (`world/mineshafts.go`)
+(falling gravel, bubble columns, source-water refill) вЂ” and mineshafts (`world/mineshafts.go`)
 replay piece-for-piece against the saved vanilla start NBT and cell-for-cell against the
-structures-only capture of the dungeon area: the fixture's (-1,-1) pocket — a monster room whose
-wall opening a mineshaft corridor carved — now places in full (floor, both chests). The remaining
+structures-only capture of the dungeon area: the fixture's (-1,-1) pocket вЂ” a monster room whose
+wall opening a mineshaft corridor carved вЂ” now places in full (floor, both chests). The remaining
 gap is the surface decoration stages: trees, flora, and springs are still hand-written, and the
 next milestones are the vegetal/feature stages beyond the underground ones.
 
 ## Testing worldgen
 
-`make verify` is the gate, but most generator defects are invisible to it — they show up as terrain
+`make verify` is the gate, but most generator defects are invisible to it вЂ” they show up as terrain
 that looks wrong. `cmd/gendump` exists for that: biome distribution, top surface blocks, subsurface
 banding, deep-layer composition, the bedrock band, the underground fluid census, the badlands clay
 bands, and an ASCII cross-section, with no client involved. Add an assertion to it whenever you fix
-a class of defect; the bedrock-band check is the model — it prints per-layer counts and fails loudly
+a class of defect; the bedrock-band check is the model вЂ” it prints per-layer counts and fails loudly
 on any air or water in the floor. The fluid census is the same shape: it prints water as a share of
 the open volume under inland chunks (3.8% now, 100% before the aquifer) and fails if caves flood
 again.
