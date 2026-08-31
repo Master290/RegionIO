@@ -107,16 +107,19 @@ type StructureDef struct {
 	Step   string              `json:"step"`
 	// BiomeTemp is the ocean-ruin variant discriminator: "cold" | "warm".
 	BiomeTemp string              `json:"biome_temp"`
+	// MineshaftType is the mineshaft variant discriminator: "normal" | "mesa".
+	MineshaftType string          `json:"mineshaft_type"`
 	Setups []RuinedPortalSetup `json:"-"`
 }
 
 func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 	var doc struct {
-		Type      string             `json:"type"`
-		Biomes    string             `json:"biomes"`
-		Step      string             `json:"step"`
-		BiomeTemp string             `json:"biome_temp"`
-		Setups    []RuinedPortalSetup `json:"setups"`
+		Type          string             `json:"type"`
+		Biomes        string             `json:"biomes"`
+		Step          string             `json:"step"`
+		BiomeTemp     string             `json:"biome_temp"`
+		MineshaftType string             `json:"mineshaft_type"`
+		Setups        []RuinedPortalSetup `json:"setups"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
@@ -124,6 +127,7 @@ func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 	return &StructureDef{
 		Name: name, Type: doc.Type, Biomes: strings.TrimPrefix(doc.Biomes, "minecraft:"),
 		Step: doc.Step, Setups: doc.Setups, BiomeTemp: doc.BiomeTemp,
+		MineshaftType: doc.MineshaftType,
 	}, nil
 }
 
@@ -193,12 +197,12 @@ func loadStructureSets() (*StructureSets, error) {
 		seen[name] = true
 		var flat []string
 		for _, value := range rawTags[name] {
-			value = strings.TrimPrefix(value, "minecraft:")
 			if strings.HasPrefix(value, "#") {
-				flat = append(flat, flatten("minecraft:"+value[1:], seen)...)
+				ref := strings.TrimPrefix(value[1:], "minecraft:")
+				flat = append(flat, flatten("minecraft:"+ref, seen)...)
 				continue
 			}
-			flat = append(flat, "minecraft:"+value)
+			flat = append(flat, "minecraft:"+strings.TrimPrefix(value, "minecraft:"))
 		}
 		out.BiomeTags[name] = flat
 		return flat

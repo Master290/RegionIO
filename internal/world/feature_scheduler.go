@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"sort"
 
 	"regionio/internal/worldgen"
 )
@@ -113,6 +114,39 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			}
 			if err := PlaceOceanRuinPieces(r, random, stub, seed); err != nil {
 				return err
+			}
+		}
+	}
+	// Mineshafts: piece trees reach up to 80 blocks (5+ chunks) from their
+	// start, so scan starts in a ±8 window. Placement is per REGION chunk
+	// with that chunk's own decoration random and writable box, mirroring
+	// vanilla's per-chunk applyBiomeDecoration slice.
+	var mineshafts []*MineshaftStart
+	for sx := targetX - 8; sx <= targetX+8; sx++ {
+		for sz := targetZ - 8; sz <= targetZ+8; sz++ {
+			start, err := MineshaftGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if start != nil {
+				mineshafts = append(mineshafts, start)
+			}
+		}
+	}
+	if len(mineshafts) > 0 {
+		keys := make([][2]int32, 0, len(r.chunks))
+		for key := range r.chunks {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i][0] != keys[j][0] {
+				return keys[i][0] < keys[j][0]
+			}
+			return keys[i][1] < keys[j][1]
+		})
+		for _, key := range keys {
+			for _, start := range mineshafts {
+				PlaceMineshaftStart(r, start, seed, key[0], key[1])
 			}
 		}
 	}

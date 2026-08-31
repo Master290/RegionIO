@@ -70,6 +70,22 @@ func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
 	return true
 }
 
+// setBlockGlobal writes into any loaded region chunk, bypassing the ±1
+// source guard. Structure pieces write wherever their bounding boxes land
+// (mineshaft pieces reach many chunks from their start), clipped by their
+// own chunk-box logic.
+func (r *decorationRegion) setBlockGlobal(x, y, z int, state uint16) bool {
+	if y < MinY || y >= MinY+WorldHeight {
+		return false
+	}
+	chunk := r.chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
+	if chunk == nil {
+		return false
+	}
+	chunk.SetBlock(x&15, y, z&15, state)
+	return true
+}
+
 // heightAt mirrors WorldGenRegion.getHeight: one above the highest matching
 // block, or MinY when the column has no match.
 func (r *decorationRegion) heightAt(kind string, x, z int) int {
