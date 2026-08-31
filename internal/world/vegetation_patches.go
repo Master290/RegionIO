@@ -1,7 +1,8 @@
-package world
+﻿package world
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 
 	"regionio/internal/worldgen"
@@ -326,15 +327,79 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 		}
 		patchSet = waterCells
 	}
-	// Keep the confirmed RNG contract while the nested placed-feature pass is
-	// independently validated against the full fixture: one draw per set
-	// position whenever the vegetation chance is positive.
+	// distributeVegetation: one draw per set position whenever the chance is
+	// positive. The nested vegetation features are NOT replayed yet: the
+	// moss-patch ground itself still mismatches vanilla by ~300 cells (see
+	// STRUCTURE_NOTES), and placing vegetation on the wrong ground cascades
+	// into both the vegetation and the later patch columns (verified: placing
+	// moss_vegetation dropped fixture parity by ~100 cells net). The rolls
+	// are the feature's last draws, so consuming them without the nested
+	// feature draws cannot shift anything downstream. The semantics needed
+	// to finish this are pinned in STRUCTURE_NOTES.md: Java HashSet
+	// iteration order for the roll mapping (javaHashSetOrder below),
+	// SimpleBlockFeature's always-draw-then-canSurvive order, the
+	// DoublePlantBlock.placeAt both-halves path, and the waterlogged pool's
+	// vegetation placing INTO the water cells with waterlog=true.
 	for range patchSet {
 		if config.VegetationChance > 0 {
 			random.NextFloat()
 		}
 	}
 	return placed
+}
+
+// javaHashSetOrder reorders positions the way Java's HashSet<BlockPos>
+// iterates them: by table slot ((capacity-1) & spread(hash)), and within a
+// slot in insertion order. Vec3i.hashCode is (y + 31*z)*31 + x in wrapping
+// int32 arithmetic, and HashMap spreads the hash with h ^ (h >>> 16) before
+// masking. The capacity grows from 16 by doubling at a load factor of 0.75.
+func javaHashSetOrder(positions [][3]int) [][3]int {
+	if len(positions) <= 1 {
+		return positions
+	}
+	capacity := 16
+	for len(positions) > capacity*3/4 {
+		capacity *= 2
+	}
+	type entry struct {
+		slot, seq int
+		pos       [3]int
+	}
+	entries := make([]entry, len(positions))
+	for i, p := range positions {
+		h := int32(p[1]) + 31*int32(p[2])
+		h = h*31 + int32(p[0])
+		spread := uint32(h) ^ (uint32(h) >> 16)
+		entries[i] = entry{slot: int(spread & uint32(capacity-1)), seq: i, pos: p}
+	}
+	sort.SliceStable(entries, func(i, j int) bool { return entries[i].slot < entries[j].slot })
+	out := make([][3]int, len(positions))
+	for i, e := range entries {
+		out[i] = e.pos
+	}
+	return out
+}
+
+// placePatchVegetationFeature runs a patch's nested vegetation feature at the
+// given position with the patch's own random: VegetationPatchFeature
+// .placeVegetation delegates to the nested PlacedFeature with the surface
+// offset already applied by the caller.
+func (r *decorationRegion) placePatchVegetationFeature(random worldgen.RandomSource, position worldgen.FeaturePosition, ref worldgen.FeatureRef, set *worldgen.FeatureSet) {
+	if len(ref.Placement) != 0 {
+		return
+	}
+	configured, ok := set.Configured[ref.Name]
+	if !ok {
+		return
+	}
+	switch configured.Type {
+	case "minecraft:simple_block":
+		config, err := set.SimpleBlock(ref.Name)
+		if err != nil {
+			return
+		}
+		r.placeSimpleBlockFeature(random, position, config, set)
+	}
 }
 
 var vegetationWaterID uint16
@@ -365,8 +430,9 @@ func (r *decorationRegion) patchColumnExposed(g [3]int) bool {
 }
 
 // placeSimpleBlockFeature implements the simple_block feature variants used
-// by the moss vegetation patches. State-provider selection is weighted and
-// consumes the same feature RNG that the configured feature receives.
+// by the moss vegetation patches. Vanilla draws the state provider FIRST and
+// then checks canSurvive, so the draw happens even when the placement is
+// rejected - the patch's later vegetation rolls depend on that.
 func (r *decorationRegion) placeSimpleBlockFeature(random worldgen.RandomSource, position worldgen.FeaturePosition, config worldgen.SimpleBlockFeatureConfig, set *worldgen.FeatureSet) bool {
 	total := 0
 	for _, entry := range config.States {
@@ -374,7 +440,7 @@ func (r *decorationRegion) placeSimpleBlockFeature(random worldgen.RandomSource,
 			total += entry.Weight
 		}
 	}
-	if total <= 0 || r.getBlock(position.X, position.Y, position.Z) != StateAir {
+	if total <= 0 {
 		return false
 	}
 	roll := int(random.NextIntN(int32(total)))

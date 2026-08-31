@@ -547,3 +547,44 @@ Implementation findings that cost the most digging (all in the port now):
 - Chunk references decode with ChunkPos.pack (x in the LOW 32 bits) - chunk
   (-1,-2) references starts (4,-1) and (-4,1), and only referenced starts
   place pieces into the chunk.
+
+## Surface decoration findings (session of the 99.447% milestone)
+
+The residual ~2174-cell gap at 99.447%, by family: clay pools ~640 (both
+directions + tuff), moss patches ~430, patch vegetation ~180 missing, cave
+vines ~180 missing (separate top-level feature), netherrack spread ~225
+(ruined-portal postProcess spreadNetherrack not replayed), state-level water
+~70, mineshaft fence states ~36, small ore residue ~50.
+
+Pinned semantics for finishing the patch vegetation (all verified against
+bytecode, NOT yet enabled - placing moss_vegetation on the currently
+mismatched moss ground cost ~100 cells net, so the moss ground divergence is
+the root cause to fix first):
+
+- distributeVegetation iterates a java.util.HashSet<BlockPos>, so the rolls
+  map to positions in HASH-TABLE order, not scan order: Vec3i.hashCode is
+  (y + 31*z)*31 + x in wrapping int32; HashMap spreads with h ^ (h >>> 16);
+  slot = (capacity-1) & spread; capacity from 16 doubling past 0.75 load;
+  within a slot, insertion order. javaHashSetOrder in vegetation_patches.go
+  implements this.
+- SimpleBlockFeature draws the state provider FIRST (weighted_state_provider
+  = one nextInt(totalWeight) walk), THEN checks canSurvive - the draw happens
+  even when the placement is rejected. No air precondition at all.
+- DoublePlantBlock (tall_grass lower): requires pos.above() empty, then
+  DoublePlantBlock.placeAt writes BOTH halves (lower + upper). MossyCarpet
+  (pale only) takes a separate random-consuming path - irrelevant for the
+  overworld ocean/lush fixture.
+- Plain patch vegetation places at groundPos.relative(surface.opposite()) =
+  the empty cell above the ground; the WATERLOGGED pool's vegetation places
+  INTO the water cells (placeVegetation gets pos.below() so the nested
+  feature lands on the water cell) and waterlogs the placed state when it
+  has the property.
+- The waterlogged pool's returned set (which distributeVegetation rolls
+  over) is the WATER-FILLED SUBSET: the water cells were themselves added
+  while iterating the ORIGINAL set in hash order, so the water set's own
+  hash order governs the rolls.
+- The moss patch position stream: count 125 per source chunk, each position
+  consuming in_square(2) + height_range uniform(1) + random_offset y(1)
+  draws with environment_scan and biome drawing nothing. The ~300-cell moss
+  ground divergence is somewhere in this chain or in the patch column scan;
+  it survives with vegetation disabled, so it is upstream of the vegetation.
