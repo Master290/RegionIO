@@ -395,7 +395,6 @@ var (
 // structureIndexOverride lets tests pin a structure's step index when the
 // alphabetical hypothesis needs empirical verification (the mineshaft index
 // was confirmed this way). -1 disables the override.
-var structorIndexOverride = map[string]int{}
 var structureIndexOverride = map[string]int{}
 var structureStepOverride = map[string]int{}
 

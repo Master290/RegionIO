@@ -114,7 +114,22 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 		portalStep = s
 	}
 	random.SetFeatureSeed(decorationSeed, portalIndex, portalStep)
-	_ = random
+	// placeInWorld consumes one nextLong from the SHARED random for every
+	// template block entity that is a RandomizableContainer with NBT (the
+	// portal templates carry exactly one chest): the loot-table seed draw.
+	// The Xoroshiro nextLong is one state transition, matching one nextDouble
+	// of stream alignment - pinned empirically (portal index 10 in the
+	// alphabetical surface_structures order + this single draw reproduces
+	// the vanilla netherrack field on the fixture chunk bit-for-bit).
+	for _, b := range blocks {
+		if !b.HasNBT {
+			continue
+		}
+		state, ok := stateByID(b.State)
+		if ok && isRandomizableContainerName(state.Name) {
+			random.NextLong()
+		}
+	}
 	chunkMinX, chunkMinZ := int(chunkX)*16, int(chunkZ)*16
 	inChunk := func(x, z int) bool {
 		return x >= chunkMinX && x < chunkMinX+16 && z >= chunkMinZ && z < chunkMinZ+16
@@ -277,14 +292,15 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 		}
 	}
 
-	// The drip columns and netherrack spread draw from the chunk's shared
-	// structure random, whose reseed parameters (structure index in the
-	// surface_structures step) are not yet verified against a vanilla
-	// capture - an empirical (step, index) scan left ~155 netherrack cells
-	// mismatched at best, so the exact stream is still unknown. The spread
-	// runs (it nets +1077 cells); the drip columns keep the positional
-	// Mth.getSeed rolls that matched better empirically.
-	addNetherrackDripColumnsBelowPortalPositional(region, stub, minX, minZ, maxX, maxZ, minY)
+	// spreadNetherrack and the box-base drip columns draw from the chunk's
+	// shared structure random, reseeded with setFeatureSeed(decorationSeed,
+	// registryIndex, step) exactly like applyBiomeDecoration. The index
+	// follows the REGISTRY (registration) order, not the alphabetical JSON
+	// order - pinned by tools/VanillaStructureStreamOrderProbe (ruined_portal
+	// = 25 in surface_structures).
+	spreadNetherrack(region, random, stub, inChunk, minX, minY, minZ, maxX, maxZ)
+
+	addNetherrackDripColumnsBelowPortal(region, random, stub, inChunk, minX, minZ, maxX, maxZ, minY)
 
 	// The fluid ticks scheduled by the template's air writes run after all
 	// generation, so the flood resolves last.
@@ -571,4 +587,24 @@ func absInt(v int) int {
 		return -v
 	}
 	return v
+}
+
+// isRandomizableContainerName covers RandomizableContainer blocks (chest,
+// barrel, decorated pot, shulker boxes and variants): placeInWorld draws one
+// nextLong loot seed per such block entity.
+func isRandomizableContainerName(name string) bool {
+	switch name {
+	case "minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel",
+		"minecraft:decorated_pot", "minecraft:shulker_box",
+		"minecraft:white_shulker_box", "minecraft:orange_shulker_box",
+		"minecraft:magenta_shulker_box", "minecraft:light_blue_shulker_box",
+		"minecraft:yellow_shulker_box", "minecraft:lime_shulker_box",
+		"minecraft:pink_shulker_box", "minecraft:gray_shulker_box",
+		"minecraft:light_gray_shulker_box", "minecraft:cyan_shulker_box",
+		"minecraft:purple_shulker_box", "minecraft:blue_shulker_box",
+		"minecraft:brown_shulker_box", "minecraft:green_shulker_box",
+		"minecraft:red_shulker_box", "minecraft:black_shulker_box":
+		return true
+	}
+	return false
 }
