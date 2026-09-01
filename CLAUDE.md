@@ -169,7 +169,7 @@ Known gaps, roughly in order of how visible they are:
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
 Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.934% through
-the single-chunk path, 99.447% through the production region replay. A featureless vanilla capture
+the single-chunk path, 99.591% through the production region replay. A featureless vanilla capture
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
 undecorated pipeline bit-exact against it вЂ” density, surface rules, carvers, aquifers, and
 noise-router veins match every one of the fixture's cells вЂ” so the residual block gap is entirely

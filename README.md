@@ -79,7 +79,7 @@ glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
 chunks. The canonical single-chunk generator currently matches 95.934% of
-fixture blocks, while the production region replay path matches 99.447%; both
+fixture blocks, while the production region replay path matches 99.591%; both
 match all fixture biomes and heightmaps. CI guards the 91% regression floor
 while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
