@@ -68,7 +68,30 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 				if random.NextBoolean() {
 					ref = config.FeatureTrue
 				}
-				return r.placeVegetationFeatureRef(random, position, ref, set)
+				r.placeFeatureRef(random, position, ref, set)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:block_column":
+			config, err := set.BlockColumn(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeBlockColumn(random, position, config, set)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:simple_random_selector":
+			config, err := set.SimpleRandomSelector(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeSimpleRandomSelector(random, position, config, set)
+				return nil
 			}); err != nil {
 				return err
 			}
@@ -259,22 +282,25 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			p := origin
 			p.X += dx
 			p.Z += dz
+			// Both scan phases use BlockState::isAir semantics: cave_air
+			// carved by lakes, mineshafts, and monster rooms counts as air.
 			current := r.getBlock(p.X, p.Y, p.Z)
 			steps := 0
-			for current == StateAir && steps < config.VerticalRange {
+			for isAirState(current) && steps < config.VerticalRange {
 				p.Y += direction
 				current = r.getBlock(p.X, p.Y, p.Z)
 				steps++
 			}
 			steps = 0
-			for current != StateAir && steps < config.VerticalRange {
+			for !isAirState(current) && steps < config.VerticalRange {
 				p.Y -= direction
 				current = r.getBlock(p.X, p.Y, p.Z)
 				steps++
 			}
-			// Vanilla requires the candidate cell to be empty and the adjacent
-			// surface block to expose a sturdy face toward the patch.
-			if r.getBlock(p.X, p.Y, p.Z) != StateAir {
+			// Vanilla requires the candidate cell to be empty (isEmptyBlock =
+			// isAir, cave_air included) and the adjacent surface block to
+			// expose a sturdy face toward the patch.
+			if !isAirState(r.getBlock(p.X, p.Y, p.Z)) {
 				continue
 			}
 			groundX, groundY, groundZ := p.X, p.Y+direction, p.Z
@@ -328,22 +354,19 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 		patchSet = waterCells
 	}
 	// distributeVegetation: one draw per set position whenever the chance is
-	// positive. The nested vegetation features are NOT replayed yet: the
-	// moss-patch ground itself still mismatches vanilla by ~300 cells (see
-	// STRUCTURE_NOTES), and placing vegetation on the wrong ground cascades
-	// into both the vegetation and the later patch columns (verified: placing
-	// moss_vegetation dropped fixture parity by ~100 cells net). The rolls
-	// are the feature's last draws, so consuming them without the nested
-	// feature draws cannot shift anything downstream. The semantics needed
-	// to finish this are pinned in STRUCTURE_NOTES.md: Java HashSet
-	// iteration order for the roll mapping (javaHashSetOrder below),
-	// SimpleBlockFeature's always-draw-then-canSurvive order, the
-	// DoublePlantBlock.placeAt both-halves path, and the waterlogged pool's
-	// vegetation placing INTO the water cells with waterlog=true.
-	for range patchSet {
-		if config.VegetationChance > 0 {
-			random.NextFloat()
+	// positive; a passing roll runs the nested placed feature. Vanilla
+	// iterates the patch set (a HashSet<BlockPos>) in hash-table order - the
+	// plain patch's ground set or the waterlogged pool's water subset, each
+	// in its OWN hash order (the water set is a fresh HashSet).
+	for _, g := range javaHashSetOrder(patchSet) {
+		if config.VegetationChance <= 0 {
+			continue
 		}
+		if random.NextFloat() >= config.VegetationChance {
+			continue
+		}
+		origin := patchVegetationPosition(g, direction, waterlogged)
+		r.placePatchVegetationFeature(random, origin, config.Vegetation, set, waterlogged)
 	}
 	return placed
 }
@@ -378,28 +401,6 @@ func javaHashSetOrder(positions [][3]int) [][3]int {
 		out[i] = e.pos
 	}
 	return out
-}
-
-// placePatchVegetationFeature runs a patch's nested vegetation feature at the
-// given position with the patch's own random: VegetationPatchFeature
-// .placeVegetation delegates to the nested PlacedFeature with the surface
-// offset already applied by the caller.
-func (r *decorationRegion) placePatchVegetationFeature(random worldgen.RandomSource, position worldgen.FeaturePosition, ref worldgen.FeatureRef, set *worldgen.FeatureSet) {
-	if len(ref.Placement) != 0 {
-		return
-	}
-	configured, ok := set.Configured[ref.Name]
-	if !ok {
-		return
-	}
-	switch configured.Type {
-	case "minecraft:simple_block":
-		config, err := set.SimpleBlock(ref.Name)
-		if err != nil {
-			return
-		}
-		r.placeSimpleBlockFeature(random, position, config, set)
-	}
 }
 
 var vegetationWaterID uint16
@@ -456,12 +457,19 @@ func (r *decorationRegion) placeSimpleBlockFeature(random worldgen.RandomSource,
 		roll -= entry.Weight
 	}
 	state, ok := nameToStateID(chosen.Name, chosen.Properties)
-	if !ok || !r.canVegetationSurvive(position, chosen.Name, set) {
+	if !ok || !r.simpleBlockCanSurvive(position, chosen.Name, set) {
 		return false
 	}
-	if chosen.Name == "minecraft:tall_grass" && chosen.Properties["half"] == "lower" {
-		upper, upperOK := nameToStateID(chosen.Name, map[string]string{"half": "upper"})
-		if !upperOK || r.getBlock(position.X, position.Y+1, position.Z) != StateAir {
+	// DoublePlantBlock path: any lower-half state places both halves; the
+	// upper half keeps every other property (facing, waterlogged, ...).
+	if chosen.Properties["half"] == "lower" {
+		upperProps := make(map[string]string, len(chosen.Properties))
+		for k, v := range chosen.Properties {
+			upperProps[k] = v
+		}
+		upperProps["half"] = "upper"
+		upper, upperOK := nameToStateID(chosen.Name, upperProps)
+		if !upperOK || !isAirState(r.getBlock(position.X, position.Y+1, position.Z)) {
 			return false
 		}
 		if !r.setBlock(position.X, position.Y, position.Z, state) {

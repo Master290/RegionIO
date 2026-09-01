@@ -854,7 +854,7 @@ func (c *msContext) generateMaybeBox(p *msPiece, random worldgen.RandomSource, c
 				if !(random.NextFloat() <= chance) {
 					continue
 				}
-				if replaceAir && c.getBlock(p, x, y, z) == StateAir {
+				if replaceAir && isAirState(c.getBlock(p, x, y, z)) {
 					continue
 				}
 				if requireInterior && !c.isInterior(p, x, y, z) {
@@ -1024,7 +1024,7 @@ func msCrossingPostProcess(c *msContext, p *msPiece) {
 }
 
 func (c *msContext) placeSupportPillar(p *msPiece, x, y, z, top int) {
-	if c.getBlock(p, x, top+1, z) == StateAir {
+	if isAirState(c.getBlock(p, x, top+1, z)) {
 		return
 	}
 	c.generateBox(p, x, y, z, x, top, z, msPlanks[c.typeIndex()], msCaveAir)
@@ -1092,7 +1092,7 @@ func msCorridorPostProcess(c *msContext, p *msPiece, random worldgen.RandomSourc
 	if p.hasRails {
 		for z := 0; z <= i2; z++ {
 			below := c.getBlock(p, 1, -1, z)
-			if below == StateAir || !msFaceSturdy(below) {
+			if isAirState(below) || !msFaceSturdy(below) {
 				continue
 			}
 			chance := float32(0.9)
@@ -1109,7 +1109,7 @@ func (c *msContext) placeSupport(p *msPiece, random worldgen.RandomSource, x1, y
 	// isSupportingBox: row above the corridor across the width.
 	for x := x1; x <= y2; x++ {
 		state := c.getBlock(p, x, x2+1, z)
-		if state == StateAir {
+		if isAirState(state) {
 			return
 		}
 	}
@@ -1183,7 +1183,7 @@ func (c *msContext) fillColumnBetween(p *msPiece, state uint16, wx, wz, y1, y2 i
 }
 
 func msReplaceableByStructures(state uint16) bool {
-	if state == StateAir {
+	if isAirState(state) {
 		return true
 	}
 	value, ok := stateByID(state)
@@ -1221,10 +1221,10 @@ func (c *msContext) createChest(p *msPiece, random worldgen.RandomSource, x, y, 
 	if !msBoxContains(c.chunkBox, wx, wy, wz) {
 		return
 	}
-	if c.region.getBlock(wx, wy, wz) != StateAir {
+	if !isAirState(c.region.getBlock(wx, wy, wz)) {
 		return
 	}
-	if c.region.getBlock(wx, wy-1, wz) == StateAir {
+	if isAirState(c.region.getBlock(wx, wy-1, wz)) {
 		return
 	}
 	rail := msRailNS

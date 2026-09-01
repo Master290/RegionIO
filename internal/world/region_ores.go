@@ -165,7 +165,7 @@ func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSou
 
 func exposedToAirRegion(region *decorationRegion, x, y, z int) bool {
 	for _, offset := range [][3]int{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}} {
-		if region.getBlock(x+offset[0], y+offset[1], z+offset[2]) == StateAir {
+		if isAirState(region.getBlock(x+offset[0], y+offset[1], z+offset[2])) {
 			return true
 		}
 	}

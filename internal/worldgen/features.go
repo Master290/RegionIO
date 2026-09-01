@@ -1,7 +1,8 @@
-package worldgen
+﻿package worldgen
 
 import (
 	"archive/zip"
+	"hash/fnv"
 	"bytes"
 	_ "embed"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"math"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -17,11 +19,16 @@ import (
 var featureData []byte
 
 // FeatureSet is the validated vanilla datapack graph used by decoration.
+// Configured also accumulates inline configured features (datapack feature
+// references written as objects instead of names), registered lazily under
+// deterministic "inline:" keys by parseFeatureRef.
 type FeatureSet struct {
 	Configured map[string]ConfiguredFeature
 	Placed     map[string]PlacedFeature
 	Biomes     map[string]BiomeGeneration
 	BlockTags  map[string][]string
+
+	inlineMu sync.Mutex
 }
 
 type IndexedFeature struct {
@@ -129,6 +136,142 @@ type WeightedBlockState struct {
 	Weight int
 }
 
+// StateProviderSpec is the parsed form of a block-state provider: one of
+// simple, weighted, or randomized-int-over-another-provider. Sample draws
+// from the feature RNG exactly like vanilla's BlockStateProvider.getState.
+type StateProviderSpec struct {
+	Type     string
+	State    BlockState            // simple
+	Entries  []WeightedBlockState  // weighted
+	Property string                // randomized_int
+	Source   *StateProviderSpec    // randomized_int
+	Values   CountProvider         // randomized_int
+}
+
+// SampleState mirrors BlockStateProvider.getState(random): simple returns
+// without a draw, weighted draws nextInt(totalWeight) and walks the entries,
+// randomized_int draws its source then the int provider and overrides the
+// named property.
+func (p StateProviderSpec) SampleState(r RandomSource) (BlockState, bool) {
+	switch p.Type {
+	case "simple":
+		return p.State, true
+	case "weighted":
+		total := 0
+		for _, e := range p.Entries {
+			total += e.Weight
+		}
+		if total <= 0 {
+			return BlockState{}, false
+		}
+		roll := int(r.NextIntN(int32(total)))
+		for _, e := range p.Entries {
+			if roll < e.Weight {
+				return e.State, true
+			}
+			roll -= e.Weight
+		}
+		return BlockState{}, false
+	case "randomized_int":
+		if p.Source == nil {
+			return BlockState{}, false
+		}
+		base, ok := p.Source.SampleState(r)
+		if !ok {
+			return BlockState{}, false
+		}
+		value := p.Values.Sample(r)
+		out := base
+		if out.Properties == nil {
+			out.Properties = map[string]string{}
+		} else {
+			props := make(map[string]string, len(base.Properties)+1)
+			for k, v := range base.Properties {
+				props[k] = v
+			}
+			out.Properties = props
+		}
+		out.Properties[p.Property] = strconv.Itoa(value)
+		return out, true
+	}
+	return BlockState{}, false
+}
+
+// BlockColumnLayer is one layer of a block_column: a height provider and the
+// state provider for its blocks.
+type BlockColumnLayer struct {
+	Height   NestedIntProvider
+	Provider StateProviderSpec
+}
+
+// BlockColumnFeatureConfig mirrors BlockColumnConfiguration.
+type BlockColumnFeatureConfig struct {
+	Direction     string // "up" | "down"
+	Layers        []BlockColumnLayer
+	Allowed       json.RawMessage
+	PrioritizeTip bool
+}
+
+// NestedIntProvider is an int provider whose weighted-list entries may
+// themselves be providers (weighted data = uniform{...}); constant data
+// (raw int) draws nothing.
+type NestedIntProvider struct {
+	Type     string
+	Min, Max int
+	Weighted []WeightedNestedInt
+}
+
+type WeightedNestedInt struct {
+	Weight int
+	Value  NestedIntProvider
+}
+
+// Sample mirrors IntProvider.sample: uniform draws once, weighted draws the
+// entry pick then recurses into the entry, biased_to_bottom draws twice
+// (nextInt(span) then nextInt(that+1)).
+func (p NestedIntProvider) Sample(r RandomSource) int {
+	switch p.Type {
+	case "constant":
+		return p.Min
+	case "uniform":
+		span := p.Max - p.Min + 1
+		if span <= 1 {
+			return p.Min
+		}
+		return p.Min + int(r.NextIntN(int32(span)))
+	case "biased_to_bottom":
+		span := p.Max - p.Min + 1
+		if span <= 1 {
+			return p.Min
+		}
+		first := int(r.NextIntN(int32(span)))
+		return p.Min + int(r.NextIntN(int32(first+1)))
+	case "weighted":
+		total := 0
+		for _, e := range p.Weighted {
+			total += e.Weight
+		}
+		if total <= 0 {
+			return 0
+		}
+		roll := int(r.NextIntN(int32(total)))
+		for _, e := range p.Weighted {
+			if roll < e.Weight {
+				return e.Value.Sample(r)
+			}
+			roll -= e.Weight
+		}
+		return 0
+	}
+	return 0
+}
+
+// SimpleRandomSelectorConfig mirrors SimpleRandomFeatureConfiguration: one
+// nextInt(size) draw picks a feature to place at the same position.
+type SimpleRandomSelectorConfig struct {
+	Features []FeatureRef
+}
+
 type UnderwaterMagmaFeatureConfig struct {
 	FloorSearchRange           int     `json:"floor_search_range"`
 	PlacementProbability       float32 `json:"placement_probability_per_valid_position"`
@@ -221,6 +364,9 @@ type PlacementContext struct {
 type CountProvider struct {
 	Min, Max int
 	Weighted []WeightedInt
+	// ClampedTo names the clamped provider's inner source (a plain
+	// provider), clamped to [Min, Max] after its draw.
+	ClampedTo *CountProvider
 }
 
 type WeightedInt struct {
@@ -234,6 +380,17 @@ type HeightProvider struct {
 }
 
 func (p CountProvider) Sample(r RandomSource) int {
+	if p.ClampedTo != nil {
+		// ClampedInt: clamp(source.sample(r), min, max).
+		value := p.ClampedTo.Sample(r)
+		if value < p.Min {
+			return p.Min
+		}
+		if value > p.Max {
+			return p.Max
+		}
+		return value
+	}
 	if len(p.Weighted) > 0 {
 		total := 0
 		for _, entry := range p.Weighted {
@@ -661,7 +818,7 @@ func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig,
 	if err != nil || len(radius.Weighted) != 0 {
 		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s radius: %w", name, err)
 	}
-	vegetation, err := parseFeatureRef(raw.VegetationFeature)
+	vegetation, err := s.parseFeatureRef(raw.VegetationFeature)
 	if err != nil {
 		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s vegetation: %w", name, err)
 	}
@@ -799,13 +956,13 @@ func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
 	}
 	selector := RandomSelectorConfig{Features: make([]RandomSelectorEntry, len(raw.Features))}
 	var err error
-	selector.Default, err = parseFeatureRef(raw.Default)
+	selector.Default, err = s.parseFeatureRef(raw.Default)
 	if err != nil {
 		return RandomSelectorConfig{}, err
 	}
 	for i, entry := range raw.Features {
 		selector.Features[i].Chance = entry.Chance
-		selector.Features[i].Feature, err = parseFeatureRef(entry.Feature)
+		selector.Features[i].Feature, err = s.parseFeatureRef(entry.Feature)
 		if err != nil {
 			return RandomSelectorConfig{}, err
 		}
@@ -813,8 +970,187 @@ func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
 	return selector, nil
 }
 
-func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorConfig, error) {
+// BlockColumn parses the block_column configured feature: direction, layers
+// (nested height provider + state provider), the allowed-placement predicate,
+// and the tip priority.
+func (s *FeatureSet) BlockColumn(name string) (BlockColumnFeatureConfig, error) {
 	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:block_column" {
+		return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block column", name)
+	}
+	var raw struct {
+		Allowed       json.RawMessage `json:"allowed_placement"`
+		Direction     string          `json:"direction"`
+		Layers        []struct {
+			Height   json.RawMessage `json:"height"`
+			Provider json.RawMessage `json:"provider"`
+		} `json:"layers"`
+		PrioritizeTip bool `json:"prioritize_tip"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if raw.Direction != "up" && raw.Direction != "down" || len(raw.Layers) == 0 {
+		return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: invalid block column %s", name)
+	}
+	config := BlockColumnFeatureConfig{
+		Direction:     raw.Direction,
+		Allowed:       raw.Allowed,
+		PrioritizeTip: raw.PrioritizeTip,
+		Layers:        make([]BlockColumnLayer, len(raw.Layers)),
+	}
+	for i, layer := range raw.Layers {
+		height, err := parseNestedIntProvider(layer.Height)
+		if err != nil {
+			return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: %s layer %d height: %w", name, i, err)
+		}
+		provider, err := parseStateProviderSpec(layer.Provider)
+		if err != nil {
+			return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: %s layer %d provider: %w", name, i, err)
+		}
+		config.Layers[i] = BlockColumnLayer{Height: height, Provider: provider}
+	}
+	return config, nil
+}
+
+// SimpleRandomSelector parses the simple_random_selector configured feature.
+func (s *FeatureSet) SimpleRandomSelector(name string) (SimpleRandomSelectorConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:simple_random_selector" {
+		return SimpleRandomSelectorConfig{}, fmt.Errorf("worldgen: %s is not a simple random selector", name)
+	}
+	var raw struct {
+		Features []json.RawMessage `json:"features"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil || len(raw.Features) == 0 {
+		return SimpleRandomSelectorConfig{}, fmt.Errorf("worldgen: invalid simple random selector %s", name)
+	}
+	config := SimpleRandomSelectorConfig{Features: make([]FeatureRef, len(raw.Features))}
+	for i, f := range raw.Features {
+		ref, err := s.parseFeatureRef(f)
+		if err != nil {
+			return SimpleRandomSelectorConfig{}, err
+		}
+		config.Features[i] = ref
+	}
+	return config, nil
+}
+
+// parseNestedIntProvider accepts a raw int (constant, draw-free), a uniform
+// object, or a weighted_list whose data values are themselves providers.
+func parseNestedIntProvider(raw json.RawMessage) (NestedIntProvider, error) {
+	var fixed int
+	if err := json.Unmarshal(raw, &fixed); err == nil {
+		return NestedIntProvider{Type: "constant", Min: fixed, Max: fixed}, nil
+	}
+	var value struct {
+		Type         string `json:"type"`
+		Min          int    `json:"min_inclusive"`
+		Max          int    `json:"max_inclusive"`
+		Distribution []struct {
+			Data   json.RawMessage `json:"data"`
+			Weight int             `json:"weight"`
+		} `json:"distribution"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return NestedIntProvider{}, err
+	}
+	switch value.Type {
+	case "minecraft:uniform":
+		if value.Max < value.Min {
+			return NestedIntProvider{}, fmt.Errorf("invalid uniform %s", raw)
+		}
+		return NestedIntProvider{Type: "uniform", Min: value.Min, Max: value.Max}, nil
+	case "minecraft:biased_to_bottom":
+		if value.Max < value.Min {
+			return NestedIntProvider{}, fmt.Errorf("invalid biased_to_bottom %s", raw)
+		}
+		return NestedIntProvider{Type: "biased_to_bottom", Min: value.Min, Max: value.Max}, nil
+	case "minecraft:weighted_list":
+		provider := NestedIntProvider{Type: "weighted"}
+		for _, entry := range value.Distribution {
+			if entry.Weight <= 0 {
+				continue
+			}
+			inner, err := parseNestedIntProvider(entry.Data)
+			if err != nil {
+				return NestedIntProvider{}, err
+			}
+			provider.Weighted = append(provider.Weighted, WeightedNestedInt{Weight: entry.Weight, Value: inner})
+		}
+		if len(provider.Weighted) == 0 {
+			return NestedIntProvider{}, fmt.Errorf("empty weighted list %s", raw)
+		}
+		return provider, nil
+	}
+	return NestedIntProvider{}, fmt.Errorf("unsupported int provider %s", raw)
+}
+
+// parseStateProviderSpec accepts simple, weighted, and randomized-int state
+// providers.
+func parseStateProviderSpec(raw json.RawMessage) (StateProviderSpec, error) {
+	var probe struct {
+		Type     string          `json:"type"`
+		State    BlockState      `json:"state"`
+		Entries  []WeightedBlockStateRaw
+		Property string          `json:"property"`
+		Source   json.RawMessage `json:"source"`
+		Values   json.RawMessage `json:"values"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return StateProviderSpec{}, err
+	}
+	switch probe.Type {
+	case "minecraft:simple_state_provider":
+		if probe.State.Name == "" {
+			return StateProviderSpec{}, fmt.Errorf("simple provider missing state")
+		}
+		return StateProviderSpec{Type: "simple", State: probe.State}, nil
+	case "minecraft:weighted_state_provider":
+		var doc struct {
+			Entries []WeightedBlockStateRaw `json:"entries"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil || len(doc.Entries) == 0 {
+			return StateProviderSpec{}, fmt.Errorf("invalid weighted provider %s", raw)
+		}
+		spec := StateProviderSpec{Type: "weighted", Entries: make([]WeightedBlockState, len(doc.Entries))}
+		for i, e := range doc.Entries {
+			spec.Entries[i] = WeightedBlockState{State: e.Data, Weight: e.Weight}
+		}
+		return spec, nil
+	case "minecraft:randomized_int_state_provider":
+		if probe.Property == "" || len(probe.Source) == 0 || len(probe.Values) == 0 {
+			return StateProviderSpec{}, fmt.Errorf("invalid randomized int provider %s", raw)
+		}
+		source, err := parseStateProviderSpec(probe.Source)
+		if err != nil {
+			return StateProviderSpec{}, err
+		}
+		var fixed int
+		values := CountProvider{}
+		if err := json.Unmarshal(probe.Values, &fixed); err == nil {
+			values = CountProvider{Min: fixed, Max: fixed}
+		} else {
+			var uniform struct {
+				Min int `json:"min_inclusive"`
+				Max int `json:"max_inclusive"`
+			}
+			if err := json.Unmarshal(probe.Values, &uniform); err != nil || uniform.Max < uniform.Min {
+				return StateProviderSpec{}, fmt.Errorf("invalid randomized int values %s", probe.Values)
+			}
+			values = CountProvider{Min: uniform.Min, Max: uniform.Max}
+		}
+		return StateProviderSpec{Type: "randomized_int", Property: probe.Property, Source: &source, Values: values}, nil
+	}
+	return StateProviderSpec{}, fmt.Errorf("unsupported state provider %s", raw)
+}
+
+type WeightedBlockStateRaw struct {
+	Data   BlockState `json:"data"`
+	Weight int        `json:"weight"`
+}
+
+func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorConfig, error) {	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:random_boolean_selector" {
 		return RandomBooleanSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random boolean selector", name)
 	}
@@ -827,35 +1163,70 @@ func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorCo
 	}
 	selector := RandomBooleanSelectorConfig{}
 	var err error
-	if selector.FeatureTrue, err = parseFeatureRef(raw.FeatureTrue); err != nil {
+	if selector.FeatureTrue, err = s.parseFeatureRef(raw.FeatureTrue); err != nil {
 		return RandomBooleanSelectorConfig{}, err
 	}
-	if selector.FeatureFalse, err = parseFeatureRef(raw.FeatureFalse); err != nil {
+	if selector.FeatureFalse, err = s.parseFeatureRef(raw.FeatureFalse); err != nil {
 		return RandomBooleanSelectorConfig{}, err
 	}
 	return selector, nil
 }
 
-func parseFeatureRef(raw json.RawMessage) (FeatureRef, error) {
+// parseFeatureRef accepts the three datapack reference forms: a bare name
+// string, {"feature": "name", "placement": [...]}, and
+// {"feature": {inline configured feature}, "placement": [...]}. Inline
+// configured features are registered under a deterministic key derived from
+// their raw bytes so repeated parses of the same reference resolve to the
+// same entry (idempotent under the set mutex; the load itself happens once
+// but placement-time parses run on generation goroutines).
+func (s *FeatureSet) parseFeatureRef(raw json.RawMessage) (FeatureRef, error) {
 	var name string
 	if err := json.Unmarshal(raw, &name); err == nil {
 		return FeatureRef{Name: name}, nil
 	}
 	var inline struct {
-		Feature   string            `json:"feature"`
+		Feature   json.RawMessage   `json:"feature"`
 		Placement []json.RawMessage `json:"placement"`
 	}
-	if err := json.Unmarshal(raw, &inline); err != nil || inline.Feature == "" {
+	if err := json.Unmarshal(raw, &inline); err != nil || len(inline.Feature) == 0 {
 		return FeatureRef{}, fmt.Errorf("worldgen: invalid feature reference %s", raw)
 	}
-	ref := FeatureRef{Name: inline.Feature, Placement: make([]PlacementModifier, len(inline.Placement))}
+	ref := FeatureRef{Placement: make([]PlacementModifier, len(inline.Placement))}
 	for i, modifier := range inline.Placement {
 		if err := json.Unmarshal(modifier, &ref.Placement[i]); err != nil {
 			return FeatureRef{}, err
 		}
 		ref.Placement[i].Raw = modifier
 	}
+	// The nested feature is either a plain name or an inline configured
+	// feature object.
+	if err := json.Unmarshal(inline.Feature, &name); err == nil {
+		ref.Name = name
+		return ref, nil
+	}
+	var doc struct {
+		Type   string          `json:"type"`
+		Config json.RawMessage `json:"config"`
+	}
+	if err := json.Unmarshal(inline.Feature, &doc); err != nil || doc.Type == "" {
+		return FeatureRef{}, fmt.Errorf("worldgen: invalid inline feature %s", inline.Feature)
+	}
+	key := "inline:" + hashRawFeature(inline.Feature)
+	s.inlineMu.Lock()
+	if _, exists := s.Configured[key]; !exists {
+		s.Configured[key] = ConfiguredFeature{Type: doc.Type, Config: doc.Config}
+	}
+	s.inlineMu.Unlock()
+	ref.Name = key
 	return ref, nil
+}
+
+// hashRawFeature derives the deterministic synthetic name for an inline
+// configured feature from its exact bytes.
+func hashRawFeature(raw []byte) string {
+	h := fnv.New64a()
+	h.Write(raw)
+	return strconv.FormatUint(h.Sum64(), 16)
 }
 
 func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
@@ -1172,6 +1543,7 @@ type placementIntProvider struct {
 	typeName          string
 	min, max, plateau int
 	mean, deviation   float32
+	source            *placementIntProvider
 }
 
 func (p placementIntProvider) Sample(r RandomSource) int {
@@ -1197,6 +1569,19 @@ func (p placementIntProvider) Sample(r RandomSource) int {
 			value = float32(p.max)
 		}
 		return int(value)
+	case "minecraft:clamped":
+		// ClampedInt: clamp(source.sample(r), min, max); the source draws.
+		if p.source == nil {
+			return p.min
+		}
+		value := p.source.Sample(r)
+		if value < p.min {
+			return p.min
+		}
+		if value > p.max {
+			return p.max
+		}
+		return value
 	default:
 		return p.min
 	}
@@ -1208,13 +1593,14 @@ func parsePlacementIntProvider(raw json.RawMessage) (placementIntProvider, error
 		return placementIntProvider{min: fixed, max: fixed}, nil
 	}
 	var value struct {
-		Type            string `json:"type"`
-		Min             int    `json:"min"`
-		Max             int    `json:"max"`
-		MinInclusive    int    `json:"min_inclusive"`
-		MaxInclusive    int    `json:"max_inclusive"`
-		Plateau         int    `json:"plateau"`
+		Type            string          `json:"type"`
+		Min             int             `json:"min"`
+		Max             int             `json:"max"`
+		MinInclusive    int             `json:"min_inclusive"`
+		MaxInclusive    int             `json:"max_inclusive"`
+		Plateau         int             `json:"plateau"`
 		Mean, Deviation float32
+		Source          json.RawMessage `json:"source"`
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return placementIntProvider{}, err
@@ -1231,6 +1617,16 @@ func parsePlacementIntProvider(raw json.RawMessage) (placementIntProvider, error
 		if provider.max < provider.min || value.Type == "minecraft:clamped_normal" && provider.deviation <= 0 {
 			return placementIntProvider{}, fmt.Errorf("invalid %s provider %s", value.Type, raw)
 		}
+	case "minecraft:clamped":
+		provider.min, provider.max = value.MinInclusive, value.MaxInclusive
+		if provider.max < provider.min || len(value.Source) == 0 {
+			return placementIntProvider{}, fmt.Errorf("invalid clamped provider %s", raw)
+		}
+		source, err := parsePlacementIntProvider(value.Source)
+		if err != nil {
+			return placementIntProvider{}, err
+		}
+		provider.source = &source
 	default:
 		return placementIntProvider{}, fmt.Errorf("unsupported int provider %s", raw)
 	}
@@ -1268,6 +1664,22 @@ func parseIntProvider(raw json.RawMessage) (CountProvider, error) {
 	var fixed int
 	if err := json.Unmarshal(raw, &fixed); err == nil {
 		return CountProvider{Min: fixed, Max: fixed}, nil
+	}
+	var clamped struct {
+		Type          string          `json:"type"`
+		MinInclusive  int             `json:"min_inclusive"`
+		MaxInclusive  int             `json:"max_inclusive"`
+		Source        json.RawMessage `json:"source"`
+	}
+	if err := json.Unmarshal(raw, &clamped); err == nil && clamped.Type == "minecraft:clamped" {
+		if clamped.MaxInclusive < clamped.MinInclusive || len(clamped.Source) == 0 {
+			return CountProvider{}, fmt.Errorf("invalid clamped provider %s", raw)
+		}
+		source, err := parseIntProvider(clamped.Source)
+		if err != nil {
+			return CountProvider{}, err
+		}
+		return CountProvider{Min: clamped.MinInclusive, Max: clamped.MaxInclusive, ClampedTo: &source}, nil
 	}
 	var uniform struct {
 		Type string `json:"type"`

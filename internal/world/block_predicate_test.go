@@ -56,7 +56,7 @@ func TestDecorationRegionRejectsUnsupportedPredicate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := region.testBlockPredicate(set, json.RawMessage(`{"type":"minecraft:would_survive","state":{"Name":"minecraft:oak_sapling"}}`), worldgen.FeaturePosition{}); err == nil {
-		t.Fatal("unsupported would_survive succeeded")
+	if _, err := region.testBlockPredicate(set, json.RawMessage(`{"type":"minecraft:unregistered_predicate"}`), worldgen.FeaturePosition{}); err == nil {
+		t.Fatal("unsupported predicate succeeded")
 	}
 }

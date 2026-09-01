@@ -284,7 +284,7 @@ func exposedToAir(c *Chunk, x, y, z int) bool {
 		if nx < 0 || nx >= 16 || nz < 0 || nz >= 16 {
 			continue
 		}
-		if c.GetBlock(nx, ny, nz) == StateAir {
+		if isAirState(c.GetBlock(nx, ny, nz)) {
 			return true
 		}
 	}
