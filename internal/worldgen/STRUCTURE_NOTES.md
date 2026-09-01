@@ -623,3 +623,49 @@ its own decoration random and clips writes to its own 16x16 box); and the
 structure pass order now follows vanilla's step order (mineshafts' step-3
 pieces before the step-4 surface structures, ocean ruins before ruined
 portals within step 4 by registry order).
+
+## Residual gap census at 99.625% (seed 12345 fixture)
+
+Total residual: 1475 cells. Per chunk: (-1,-1)=688, (0,0)=451, (1,0)=243,
+(0,1)=93. Bands: deep(<0)=999, mid(0..43)=463, near-surface=13, surface=0.
+
+Top missing (vanilla-only): deepslate 311, air 207, water 153, moss 143,
+granite 74, tuff 72, short_grass 52, clay 49, cave_vines_plant 47.
+Top extra (ours-only): clay 268, air 189, deepslate 175, moss 173,
+netherrack 128 (portal spread overshoot into chunks vanilla leaves clean -
+the spread write-clip may span more region chunks than vanilla references),
+water 97, cave_vines_plant 80.
+
+3D cluster analysis of chunk (-1,-1) (6-neighbor connected components):
+- cluster 0 (228 cells): a SINGLE COLUMN x=6, z=4..10, y=-20..2 - the
+  cave-vine columns plus patch vegetation on top. The vine lengths differ
+  (extra cave_vines_plant 38 vs missing 41) - i.e. individual vines are one
+  to two cells longer or shorter, which points at the BlockColumnFeature
+  height sampling (weighted_list: nextInt(totalWeight) entry roll then the
+  inner uniform sample) or at the allowed-placement truncation walk reading
+  slightly different cells.
+- cluster 1 (48): clay pool at y=-7..-1 fully misplaced (ours writes clay
+  where vanilla keeps deepslate) - one waterlogged pool position diverges.
+- cluster 2 (45): moss patch at y=-42..-39 shifted - same shape as cluster
+  0 upstream: the moss patch position stream diverges by one placement.
+- cluster 3 (31): granite->andesite - an ore blob boundary (count-based ore
+  positions shift by the blob edge).
+- clusters 4/5/7: vine columns plus moss again (~60 cells total).
+
+Leading hypothesis for the vine/moss position divergence: the placement
+position streams for stage-9 features interleave with the FEATURE placement
+draws (the vine feature itself draws while producing positions of the NEXT
+count iteration) - our ForEachPlacementPosition already models this - but
+the moss_patch ceiling variant (count 125, same stream family) and cave
+vines (count 188) both run per source chunk and both scan/cancel against
+cells the clay pools may have already written, so the earlier clay-pool
+position divergence cascades into the moss and vine positions. Fixing the
+pool positions first (cluster 1) is the cheapest path since everything else
+downstream realigns.
+
+Next probes: (a) dump our clay-pool placement positions for source chunks
+around (-1,-1) and diff against the vanilla pool at cluster 1 (y=-7..-1,
+x=2..3, z=0..3 area); (b) verify the environment_scan up-walk against
+vanilla's exact step semantics (allowed-condition is checked BEFORE the
+first target test - our implementation matches the bytecode order, so the
+suspect is the position stream feeding it).
