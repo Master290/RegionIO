@@ -669,3 +669,23 @@ x=2..3, z=0..3 area); (b) verify the environment_scan up-walk against
 vanilla's exact step semantics (allowed-condition is checked BEFORE the
 first target test - our implementation matches the bytecode order, so the
 suspect is the position stream feeding it).
+
+## Clay-pool position divergence follow-up (cluster 1, chunk (-1,-1))
+
+The misplaced pool (48 cells, y=-7..-1) comes from source chunk (-1,-1)'s
+single surviving lush_caves_clay position: ours lands at (-15,-16,-13),
+vanilla's pool sits ~15 blocks higher (y=-7..-1). The placement chain is
+count(62, constant) -> in_square(2 nextInt) -> height_range uniform
+(nextInt(321), min=-64 above_bottom, max=256 absolute) -> environment_scan
+(down, max 12 steps, allowed=#air, target=solid) -> random_offset(0,-1
+constants, draw-free) -> biome. All modifiers are decoded and match vanilla
+byte-for-byte, so the divergence is the STREAM STATE feeding them: either
+(a) the scheduled.Index for lush_caves_clay in stage 9 differs from ours,
+(b) an earlier stage-9 feature on the same decoration stream consumed a
+different number of draws (glow_lichen runs first at count 104..157 - its
+position loop interleaves feature draws with placement draws), or (c) our
+setFeatureSeed decorationSeed chain differs. The next probe: replay the
+source (-1,-1) stage-9 schedule printing the draw index of every position,
+and cross-check lush_caves_clay's FeatureSchedule index against
+FeatureSorter's step data (set.FeatureSchedule builds indices per possible
+biomes; an off-by-one in the shared step list shifts every later feature).
