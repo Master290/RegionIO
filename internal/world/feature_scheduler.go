@@ -71,35 +71,50 @@ func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, se
 }
 
 // placeScheduledStructures replays every structure start whose pieces may
-// reach the target chunk. Set order and the shared draw sequence follow the
-// registry order used by vanilla's structure pass: ruined portals first, then
-// ocean ruins (their chest loot seeds draw from the same structure stream, so
-// the portal replay must precede them to keep both streams aligned).
+// reach the target chunk. Pieces place per-chunk with each chunk's own
+// decoration random reseeded by setFeatureSeed(decorationSeed,
+// structureIndexInStep, step), mirroring applyBiomeDecoration; the write
+// order across steps follows vanilla's step order (underground structures
+// before surface structures), and within the surface step the alphabetical
+// structure order (ocean ruins before ruined portals).
 func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
 	sets, err := worldgen.LoadStructureSets()
 	if err != nil {
 		return err
 	}
-	// Each structure start writes within one chunk of its OWN source (sx,sz)
-	// (vanilla's post-process radius), so the region's write guard is set to
-	// that chunk per start, not to the target.
-	for sx := targetX - 2; sx <= targetX+2; sx++ {
-		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
-			stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
+	// Step 3 (underground_structures): mineshafts. Piece trees reach up to
+	// 80 blocks from their start, so scan a ±8 window.
+	var mineshafts []*MineshaftStart
+	for sx := targetX - 8; sx <= targetX+8; sx++ {
+		for sz := targetZ - 8; sz <= targetZ+8; sz++ {
+			start, err := MineshaftGenerationPoint(od, sets, seed, sx, sz)
 			if err != nil {
 				return err
 			}
-			if stub == nil {
-				continue
-			}
-			if err := r.setSource(sx, sz); err != nil {
-				return err
-			}
-			if err := PlaceRuinedPortalPiece(r, stub); err != nil {
-				return err
+			if start != nil {
+				mineshafts = append(mineshafts, start)
 			}
 		}
 	}
+	regionChunks := make([][2]int32, 0, len(r.chunks))
+	for key := range r.chunks {
+		regionChunks = append(regionChunks, key)
+	}
+	sort.Slice(regionChunks, func(i, j int) bool {
+		if regionChunks[i][0] != regionChunks[j][0] {
+			return regionChunks[i][0] < regionChunks[j][0]
+		}
+		return regionChunks[i][1] < regionChunks[j][1]
+	})
+	if len(mineshafts) > 0 {
+		for _, key := range regionChunks {
+			for _, start := range mineshafts {
+				PlaceMineshaftStart(r, start, seed, key[0], key[1])
+			}
+		}
+	}
+	// Step 4 (surface_structures), alphabetical index order: ocean ruins
+	// (8,9) before ruined portals (10).
 	for sx := targetX - 2; sx <= targetX+2; sx++ {
 		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
 			stub, random, err := OceanRuinGenerationPoint(od, sets, seed, sx, sz)
@@ -117,36 +132,17 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			}
 		}
 	}
-	// Mineshafts: piece trees reach up to 80 blocks (5+ chunks) from their
-	// start, so scan starts in a ±8 window. Placement is per REGION chunk
-	// with that chunk's own decoration random and writable box, mirroring
-	// vanilla's per-chunk applyBiomeDecoration slice.
-	var mineshafts []*MineshaftStart
-	for sx := targetX - 8; sx <= targetX+8; sx++ {
-		for sz := targetZ - 8; sz <= targetZ+8; sz++ {
-			start, err := MineshaftGenerationPoint(od, sets, seed, sx, sz)
+	for sx := targetX - 2; sx <= targetX+2; sx++ {
+		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
+			stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
 			if err != nil {
 				return err
 			}
-			if start != nil {
-				mineshafts = append(mineshafts, start)
+			if stub == nil {
+				continue
 			}
-		}
-	}
-	if len(mineshafts) > 0 {
-		keys := make([][2]int32, 0, len(r.chunks))
-		for key := range r.chunks {
-			keys = append(keys, key)
-		}
-		sort.Slice(keys, func(i, j int) bool {
-			if keys[i][0] != keys[j][0] {
-				return keys[i][0] < keys[j][0]
-			}
-			return keys[i][1] < keys[j][1]
-		})
-		for _, key := range keys {
-			for _, start := range mineshafts {
-				PlaceMineshaftStart(r, start, seed, key[0], key[1])
+			if err := PlaceRuinedPortalPiece(r, stub, seed, targetX, targetZ); err != nil {
+				return err
 			}
 		}
 	}

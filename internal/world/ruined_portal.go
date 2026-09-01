@@ -37,6 +37,10 @@ type RuinedPortalStub struct {
 	Vines     bool
 	Cold      bool // resolved by the caller; needs the biome at the stub
 	Blackstone bool
+	// Placement is the setup's placement key (on_land_surface,
+	// on_ocean_floor, partly_buried, ...); spreadNetherrack runs only for
+	// the surface placements.
+	Placement string
 }
 
 func sampleProbability(random *worldgen.Legacy, p float32) bool {
@@ -112,14 +116,16 @@ func loadTemplateCached(name string) ([]worldgen.TemplateBlockInfo, [3]int, erro
 
 // boundingBoxOf transforms the eight corners of the template cuboid and takes
 // their min/max, matching StructureTemplate.getBoundingBox over all blocks.
-func boundingBoxOf(size [3]int, mirror string, rotation int, pivot [3]int, originX, originZ int) (minX, minY, minZ, maxX, maxY, maxZ int) {
+// originY is the piece's template-position Y (the corner (0,0,0) local maps
+// to world y = originY).
+func boundingBoxOf(size [3]int, mirror string, rotation int, pivot [3]int, originX, originY, originZ int) (minX, minY, minZ, maxX, maxY, maxZ int) {
 	minX, minY, minZ = int(^uint(0)>>1), int(^uint(0)>>1), int(^uint(0)>>1)
 	maxX, maxY, maxZ = -minX, -minY, -minZ
 	for _, cx := range [3]int{0, size[0] - 1} {
 		for _, cy := range [3]int{0, size[1] - 1} {
 			for _, cz := range [3]int{0, size[2] - 1} {
 				p := worldgen.TransformBlockPos([3]int{cx, cy, cz}, mirror, rotation, pivot)
-				x, y, z := originX+p[0], p[1], originZ+p[2]
+				x, y, z := originX+p[0], originY+p[1], originZ+p[2]
 				minX, maxX = min(minX, x), max(maxX, x)
 				minY, maxY = min(minY, y), max(maxY, y)
 				minZ, maxZ = min(minZ, z), max(maxZ, z)
@@ -218,7 +224,9 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	pivot := [3]int{size[0] / 2, 0, size[2] / 2}
 
 	originX, originZ := int(sx)*16, int(sz)*16
-	minX, minY, minZ, maxX, maxY, maxZ := boundingBoxOf(size, mirror, rotation, pivot, originX, originZ)
+	// The box corner scan runs at y=0 for the findSuitableY settle checks -
+	// the box height, not its final world y, is what those reads use.
+	minX, _, minZ, maxX, _, maxZ := boundingBoxOf(size, mirror, rotation, pivot, originX, 0, originZ)
 	centerX := minX + (maxX-minX+1)/2
 	centerZ := minZ + (maxZ-minZ+1)/2
 
@@ -249,7 +257,7 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	// surfaceY lands exactly on the topmost non-air block.
 	surfaceY := heightmapY(centerX, centerZ, oceanFloor)
 
-	ySpan := maxY - minY + 1
+	ySpan := size[1]
 	y := ruinedPortalFindSuitableY(random, setup.Placement, airPocket, surfaceY, ySpan,
 		minX, minZ, maxX, maxZ, base)
 
@@ -259,6 +267,7 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 		AirPocket: airPocket, Mossiness: setup.Mossiness,
 		Overgrown: setup.Overgrown, Vines: setup.Vines,
 		Blackstone: setup.ReplaceWithBlackstone,
+		Placement:  setup.Placement,
 		Y:          y,
 	}
 

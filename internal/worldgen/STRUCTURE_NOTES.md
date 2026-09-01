@@ -588,3 +588,38 @@ the root cause to fix first):
   draws with environment_scan and biome drawing nothing. The ~300-cell moss
   ground divergence is somewhere in this chain or in the patch column scan;
   it survives with vegetation disabled, so it is upstream of the vegetation.
+
+## Ruined portal netherrack spread (decoded; reseed parameters unresolved)
+
+spreadNetherrack is fully decoded from the RuinedPortalPiece bytecode: a +-
+14 square around BoundingBox.getCenter() (min + span/2 integer division,
+NOT (min+max)/2), weights [1,1,1,1,1,1,1,0.9,0.9,0.8,0.7,0.6,0.4,0.2] indexed
+by max(0, manhattan+jitter), jitter = nextInt(max(1, 8-radius/2)) with
+radius = (xSpan+zSpan)/2; per cell nextDouble < weight BEFORE any surface
+check; surfaceY = getHeight(WORLD_SURFACE_WG for everything except
+on_ocean_floor)-1; y = surfaceY for on_land_surface/on_ocean_floor else
+min(box.minY, surfaceY); |y-box.minY| <= 3; canBlockBeReplaced requires a
+SOLID replaceable cell (NOT air, obsidian, #features_cannot_replace, or lava
+outside the nether - so the spread replaces ground and water columns, it
+never floats in air); then placeNetherrackOrMagma (nextFloat<0.07 magma when
+!cold), optional jungle-leaves topper, and a drip column below (up to 8
+steps, each nextFloat<0.5 then a placement draw, all from the SHARED random -
+the old positional-stream drip columns were wrong).
+
+WHAT IS NOT RESOLVED: the reseed parameters for the shared random. An
+exhaustive (step 0..10 x index 0..20) scan against the fixture's chunk (1,0)
+netherrack field left ~155 mismatched cells at best (best: step=2 idx=11,
+or step=4 idx=1/8 with jitter=4, which the vanilla field's max manhattan
+radius of 9 independently requires). The vanilla field has 65 cells on y=12
+(spread) decaying geometrically down to y=3 (drip), so the SHAPE matches the
+decoded algorithm; only the draw stream does not. Next step: a Java probe
+running the real RuinedPortalPiece.postProcess against the captured pre-
+carve state, dumping every random draw in order.
+
+Also fixed en route: boundingBoxOf ignored the stub's Y (minY came out 0
+instead of 12), which had moved every drip column 12 blocks too deep; the
+portal pieces now place per-chunk like mineshafts (each chunk copy reseeds
+its own decoration random and clips writes to its own 16x16 box); and the
+structure pass order now follows vanilla's step order (mineshafts' step-3
+pieces before the step-4 surface structures, ocean ruins before ruined
+portals within step 4 by registry order).

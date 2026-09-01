@@ -1,9 +1,7 @@
-package world
+﻿package world
 
 import (
 	"fmt"
-	"sort"
-	"strings"
 	"sync"
 
 	"regionio/internal/worldgen"
@@ -596,39 +594,6 @@ func msChunkBox(cx, cz int32) msBox {
 	return msBox{x, MinY + 1, z, x + 15, MinY + WorldHeight, z + 15}
 }
 
-// msStructureIndex returns the structure's position in the alphabetically
-// ordered list of structures sharing its generation step - the counter
-// applyBiomeDecoration passes to setFeatureSeed before placing the step's
-// structure pieces.
-var msStructureIndexOnce sync.Once
-var msStructureIndexCache map[string]int
-
-func msStructureIndex(name string) int {
-	msStructureIndexOnce.Do(func() {
-		sets, err := worldgen.LoadStructureSets()
-		if err != nil {
-			return
-		}
-		byStep := map[string][]string{}
-		for defName, def := range sets.Structures {
-			byStep[def.Step] = append(byStep[def.Step], defName)
-		}
-		msStructureIndexCache = make(map[string]int, len(sets.Structures))
-		for step, names := range byStep {
-			sort.Strings(names)
-			for i, n := range names {
-				key := strings.TrimPrefix(strings.TrimPrefix(n, "minecraft:"), "structure/")
-				msStructureIndexCache[step+"/"+key] = i
-			}
-		}
-	})
-	name = strings.TrimPrefix(name, "minecraft:")
-	if i, ok := msStructureIndexCache["underground_structures/"+name]; ok {
-		return i
-	}
-	return 0
-}
-
 // PlaceMineshaftStart postProcesses every piece of the start that intersects
 // the given chunk, with that chunk's decoration random reseeded the way
 // applyBiomeDecoration does before a step's structure pieces
@@ -637,7 +602,7 @@ func msStructureIndex(name string) int {
 func PlaceMineshaftStart(region *decorationRegion, start *MineshaftStart, seed int64, chunkX, chunkZ int32) {
 	initMineshaftStates()
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
-	random.SetFeatureSeed(decorationSeed, msStructureIndex("mineshaft"), 3)
+	random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep("mineshaft"), 3)
 	chunkBox := msChunkBox(chunkX, chunkZ)
 	ctx := &msContext{region: region, chunkBox: chunkBox, mesa: start.Mesa}
 	for _, piece := range start.Pieces {

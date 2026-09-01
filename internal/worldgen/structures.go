@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -380,3 +381,75 @@ func baseName(path string) string {
 	return path
 }
 
+
+// StructureIndexInStep returns a structure's position in the alphabetically
+// ordered list of structures sharing its generation step - the counter
+// applyBiomeDecoration passes to setFeatureSeed before placing the step's
+// structure pieces. Verified empirically for mineshafts (index 1 in
+// underground_structures) and used by every per-chunk structure placement.
+var (
+	structureIndexOnce  sync.Once
+	structureIndexCache map[string]int
+)
+
+// structureIndexOverride lets tests pin a structure's step index when the
+// alphabetical hypothesis needs empirical verification (the mineshaft index
+// was confirmed this way). -1 disables the override.
+var structorIndexOverride = map[string]int{}
+var structureIndexOverride = map[string]int{}
+var structureStepOverride = map[string]int{}
+
+func SetStructureIndexOverride(name string, index int) {
+	if index < 0 {
+		delete(structureIndexOverride, name)
+		return
+	}
+	structureIndexOverride[name] = index
+}
+
+func SetStructureStepOverride(name string, step int) {
+	if step < 0 {
+		delete(structureStepOverride, name)
+		return
+	}
+	structureStepOverride[name] = step
+}
+
+// StructureStepOverride reports the pinned step for a structure when tests
+// scan the reseed parameters.
+func StructureStepOverride(name string) (int, bool) {
+	step, ok := structureStepOverride[name]
+	return step, ok
+}
+
+func StructureIndexInStep(structureName string) int {
+	if idx, ok := structureIndexOverride[structureName]; ok {
+		return idx
+	}
+	structureIndexOnce.Do(func() {
+		sets, err := LoadStructureSets()
+		if err != nil {
+			return
+		}
+		byStep := map[string][]string{}
+		for defName, def := range sets.Structures {
+			byStep[def.Step] = append(byStep[def.Step], defName)
+		}
+		structureIndexCache = make(map[string]int, len(sets.Structures))
+		for step, names := range byStep {
+			sort.Strings(names)
+			for i, n := range names {
+				key := strings.TrimPrefix(strings.TrimPrefix(n, "minecraft:"), "structure/")
+				structureIndexCache[step+"/"+key] = i
+			}
+		}
+	})
+	name := strings.TrimPrefix(structureName, "minecraft:")
+	if i, ok := structureIndexCache["surface_structures/"+name]; ok {
+		return i
+	}
+	if i, ok := structureIndexCache["underground_structures/"+name]; ok {
+		return i
+	}
+	return 0
+}
