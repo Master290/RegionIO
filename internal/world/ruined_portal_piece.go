@@ -1,4 +1,4 @@
-﻿package world
+package world
 
 import (
 	"strings"
@@ -85,23 +85,19 @@ func PlaceRuinedPortalPiece(region *decorationRegion, stub *RuinedPortalStub, se
 		mirror = "none"
 	}
 	minX, minY, minZ, maxX, maxY, maxZ := boundingBoxOf(size, mirror, stub.Rotation, pivot, stub.X, stub.Y, stub.Z)
-	// The spread and vines passes iterate the box +- 14 blocks; a chunk runs
-	// the piece when any of that reaches it.
-	spreadMinX, spreadMaxX := minX-14, maxX+14
-	spreadMinZ, spreadMaxZ := minZ-14, maxZ+14
-	for cx := targetX - 2; cx <= targetX+2; cx++ {
-		for cz := targetZ - 2; cz <= targetZ+2; cz++ {
-			chunkMinX, chunkMinZ := int(cx)*16, int(cz)*16
-			if spreadMaxX < chunkMinX || spreadMinX >= chunkMinX+16 || spreadMaxZ < chunkMinZ || spreadMinZ >= chunkMinZ+16 {
-				continue
-			}
-			if err := placeRuinedPortalChunk(region, stub, seed, cx, cz, blocks, size, mirror, pivot,
-				minX, minY, minZ, maxX, maxY, maxZ); err != nil {
-				return err
-			}
-		}
+	centerX := minX + (maxX-minX+1)/2
+	centerZ := minZ + (maxZ-minZ+1)/2
+	portalChunkX := int32(centerX >> 4)
+	portalChunkZ := int32(centerZ >> 4)
+
+	// In Vanilla RuinedPortalPiece.postProcess:
+	// if (!chunkBox.isInside(templateBox.getCenter())) return;
+	// Exactly one chunk contains templateBox.getCenter() and runs postProcess.
+	if region.chunks[[2]int32{portalChunkX, portalChunkZ}] == nil {
+		return nil
 	}
-	return nil
+	return placeRuinedPortalChunk(region, stub, seed, portalChunkX, portalChunkZ, blocks, size, mirror, pivot,
+		minX, minY, minZ, maxX, maxY, maxZ)
 }
 
 func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, seed int64, chunkX, chunkZ int32,
@@ -130,16 +126,19 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 			random.NextLong()
 		}
 	}
-	chunkMinX, chunkMinZ := int(chunkX)*16, int(chunkZ)*16
-	inChunk := func(x, z int) bool {
-		return x >= chunkMinX && x < chunkMinX+16 && z >= chunkMinZ && z < chunkMinZ+16
+	inRegion := func(x, z int) bool {
+		cx := int32(x >> 4)
+		cz := int32(z >> 4)
+		if absInt(int(cx-chunkX)) > 1 || absInt(int(cz-chunkZ)) > 1 {
+			return false
+		}
+		return region.chunks[[2]int32{cx, cz}] != nil
 	}
-	_ = chunkMinZ
 
 	placeCell := func(localPos [3]int, state uint16) bool {
 		p := worldgen.TransformBlockPos(localPos, mirror, stub.Rotation, pivot)
-		x, y, z := stub.X+p[0], stub.Y+p[1], stub.Z+p[2]
-		if !inChunk(x, z) {
+		x, y, z := stub.X + p[0], stub.Y + p[1], stub.Z + p[2]
+		if !inRegion(x, z) {
 			return false
 		}
 		if monsterCannotTable[region.getBlock(x, y, z)] {
@@ -298,9 +297,9 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 	// follows the REGISTRY (registration) order, not the alphabetical JSON
 	// order - pinned by tools/VanillaStructureStreamOrderProbe (ruined_portal
 	// = 25 in surface_structures).
-	spreadNetherrack(region, random, stub, inChunk, minX, minY, minZ, maxX, maxZ)
+	spreadNetherrack(region, random, stub, inRegion, minX, minY, minZ, maxX, maxZ)
 
-	addNetherrackDripColumnsBelowPortal(region, random, stub, inChunk, minX, minZ, maxX, maxZ, minY)
+	addNetherrackDripColumnsBelowPortal(region, random, stub, inRegion, minX, minZ, maxX, maxZ, minY)
 
 	// The fluid ticks scheduled by the template's air writes run after all
 	// generation, so the flood resolves last.
