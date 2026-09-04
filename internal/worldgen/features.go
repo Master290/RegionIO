@@ -1,4 +1,4 @@
-﻿package worldgen
+package worldgen
 
 import (
 	"archive/zip"

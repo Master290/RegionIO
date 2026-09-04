@@ -26,14 +26,14 @@ var (
 
 const (
 	blockPropertiesMagic   = 0x52494f4c // RIOL
-	blockPropertiesVersion = 2
+	blockPropertiesVersion = 3
 	lightShapeBytes        = 6 * 32 // six 16x16 face masks
 )
 
 // Per-state flag bits, as written by tools/VanillaBlockStateDump.java. The
-// first three drive lighting; the rest drive the heightmaps, and none of them
-// can be derived from blocks.json or from a tag file — they only exist once
-// vanilla's block-state registry is built.
+// first three drive lighting; the rest drive heightmaps and solid predicates,
+// and none of them can be derived from blocks.json or from a tag file — they
+// only exist once vanilla's block-state registry is built.
 const (
 	flagPropagatesSkylight = 1 << iota
 	flagCanOcclude
@@ -41,6 +41,7 @@ const (
 	flagBlocksMotion
 	flagFluid
 	flagLeaves
+	flagSolid
 )
 
 func init() {
@@ -123,6 +124,12 @@ func blocksMotionOrFluid(state uint16) bool {
 func blocksMotionNoLeaves(state uint16) bool {
 	f := stateFlags(state)
 	return f&(flagBlocksMotion|flagFluid) != 0 && f&flagLeaves == 0
+}
+
+// isSolidState mirrors BlockState.isSolid() in Vanilla (the precomputed legacySolid
+// flag). Used by SolidPredicate (minecraft:solid).
+func isSolidState(state uint16) bool {
+	return stateFlags(state)&flagSolid != 0
 }
 
 // lightShapeOccludes mirrors Shapes.faceShapeOccludes for the 1/16-resolution

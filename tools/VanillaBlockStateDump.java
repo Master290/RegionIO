@@ -39,15 +39,16 @@ public final class VanillaBlockStateDump {
 
     // Format version. Bump whenever the byte layout or the meaning of a flag
     // bit changes; the Go decoder rejects anything it does not know.
-    private static final int FORMAT_VERSION = 2;
+    private static final int FORMAT_VERSION = 3;
 
-    // Flag bits. 1..4 drive lighting, 8..32 drive the heightmaps.
+    // Flag bits. 1..4 drive lighting, 8..32 drive the heightmaps, 64 is solid.
     private static final int FLAG_PROPAGATES_SKYLIGHT = 1;
     private static final int FLAG_CAN_OCCLUDE = 2;
     private static final int FLAG_SHAPE_FOR_OCCLUSION = 4;
     private static final int FLAG_BLOCKS_MOTION = 8;
     private static final int FLAG_FLUID = 16;
     private static final int FLAG_LEAVES = 32;
+    private static final int FLAG_SOLID = 64;
 
     public static void main(String[] args) throws Exception {
         SharedConstants.tryDetectVersion();
@@ -75,6 +76,7 @@ public final class VanillaBlockStateDump {
             if (state.blocksMotion()) stateFlags |= FLAG_BLOCKS_MOTION;
             if (!state.getFluidState().isEmpty()) stateFlags |= FLAG_FLUID;
             if (state.getBlock() instanceof LeavesBlock) stateFlags |= FLAG_LEAVES;
+            if (state.isSolid()) stateFlags |= FLAG_SOLID;
             flags[id] = (byte) stateFlags;
 
             byte[] masks = faceMasks(state);

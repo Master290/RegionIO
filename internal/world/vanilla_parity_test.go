@@ -36,9 +36,9 @@ func TestVanillaBlockParity(t *testing.T) {
 	if seed != 12345 || count <= 0 {
 		t.Fatalf("fixture seed=%d chunks=%d", seed, count)
 	}
-	gen := NewVanillaGenerator(seed)
-	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "region" {
-		gen = NewVanillaRegionGenerator(seed)
+	gen := NewVanillaRegionGenerator(seed)
+	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "legacy" {
+		gen = NewVanillaGenerator(seed)
 	}
 	type statePair struct{ got, want uint16 }
 	pairs := make(map[statePair]int)
@@ -55,6 +55,7 @@ func TestVanillaBlockParity(t *testing.T) {
 		cx := int32(binary.BigEndian.Uint32(coords[:4]))
 		cz := int32(binary.BigEndian.Uint32(coords[4:]))
 		chunk := gen(cx, cz)
+		chunkBlockExact := 0
 		var state [2]byte
 		for y := MinY; y < MinY+WorldHeight; y++ {
 			for z := 0; z < 16; z++ {
@@ -67,6 +68,7 @@ func TestVanillaBlockParity(t *testing.T) {
 					blockTotal++
 					if got == want {
 						blockExact++
+						chunkBlockExact++
 					} else {
 						pairs[statePair{got, want}]++
 						wantBlocks[want]++
@@ -96,6 +98,26 @@ func TestVanillaBlockParity(t *testing.T) {
 						}
 					}
 				}
+			}
+		}
+		chunkMismatches := 98304 - chunkBlockExact
+		t.Logf("Chunk (%d,%d) exact %d/98304 (%.3f%%), mismatches: %d", cx, cz, chunkBlockExact, float64(chunkBlockExact)*100/98304, chunkMismatches)
+		if cx == 0 && cz == 0 {
+			type pC struct {
+				pair  statePair
+				count int
+			}
+			var cTop []pC
+			for p, n := range pairs {
+				cTop = append(cTop, pC{p, n})
+			}
+			sort.Slice(cTop, func(i, j int) bool { return cTop[i].count > cTop[j].count })
+			if len(cTop) > 10 {
+				cTop = cTop[:10]
+			}
+			for _, m := range cTop {
+				t.Logf("  c(0,0) mismatch %d: %s (%d) -> %s (%d)", m.count,
+					stateLabel(m.pair.got), m.pair.got, stateLabel(m.pair.want), m.pair.want)
 			}
 		}
 		for y := MinY; y < MinY+WorldHeight; y += biomeCellSize {
@@ -173,7 +195,11 @@ func TestVanillaBlockParity(t *testing.T) {
 	// The ordinary CI profile is a regression floor while the port is still
 	// incomplete. REGIONIO_REQUIRE_PARITY upgrades the same exhaustive audit to
 	// exact equality; there is no sampled or summary-only comparison path.
-	if percent(blockExact, blockTotal) < 91 || biomeExact != biomeTotal || heightExact != heightTotal {
+	minBlockPercent := 99.7
+	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "legacy" {
+		minBlockPercent = 91.0
+	}
+	if percent(blockExact, blockTotal) < minBlockPercent || biomeExact != biomeTotal || heightExact != heightTotal {
 		t.Fatalf("vanilla parity regressed below the committed baseline")
 	}
 	if os.Getenv("REGIONIO_REQUIRE_PARITY") == "1" && (blockExact != blockTotal || biomeExact != biomeTotal || heightExact != heightTotal) {

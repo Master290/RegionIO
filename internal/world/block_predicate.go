@@ -34,7 +34,7 @@ func (r *decorationRegion) testBlockPredicate(set *worldgen.FeatureSet, raw json
 		// side >= 0.729 or ysize >= 1. In the cave context that is the full
 		// opaque cubes (stone/moss/clay) and NOT the small-collision plants
 		// (moss_carpet fails both tests in vanilla but blocks motion).
-		return fullSolidState(r.getBlock(position.X, position.Y, position.Z)), nil
+		return isSolidState(r.getBlock(position.X, position.Y, position.Z)), nil
 	case "minecraft:would_survive":
 		// WouldSurvivePredicate: would the given state survive at the
 		// position. Only sugar cane reaches this in the replayed stages
