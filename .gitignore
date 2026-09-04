@@ -3,6 +3,8 @@
 /regionio.exe
 *.exe
 *.test
+*.class
+/tools/bin/
 
 # Mojang server distribution (not redistributable; obtain separately)
 /server*.jar
