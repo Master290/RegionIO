@@ -8,8 +8,9 @@ import (
 func TestDecorationSourcesCoverVanillaFeatureWriteRadius(t *testing.T) {
 	got := decorationSources(4, -7)
 	want := []decorationSource{
+		{4, -7},
 		{3, -8}, {3, -7}, {3, -6},
-		{4, -8}, {4, -7}, {4, -6},
+		{4, -8}, {4, -6},
 		{5, -8}, {5, -7}, {5, -6},
 	}
 	if !reflect.DeepEqual(got, want) {

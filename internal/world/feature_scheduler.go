@@ -13,14 +13,19 @@ type decorationSource struct {
 	X, Z int32
 }
 
-// decorationSources returns source chunks in deterministic X-major/Z-minor
-// order. Replaying all nine against one mutable 3x3 terrain region makes target
-// output independent of cache request order while preserving each source's own
-// decoration seed and placement origin.
+// decorationSources returns the nine source chunks around targetX, targetZ,
+// with the target chunk itself ordered first so its own ore and vegetation
+// passes establish base features before surrounding chunk writes can overwrite
+// or preempt them. The remaining eight neighbors follow in deterministic
+// X-major/Z-minor order.
 func decorationSources(targetX, targetZ int32) []decorationSource {
 	sources := make([]decorationSource, 0, 9)
+	sources = append(sources, decorationSource{X: targetX, Z: targetZ})
 	for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
 		for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
+			if sourceX == targetX && sourceZ == targetZ {
+				continue
+			}
 			sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
 		}
 	}
@@ -30,9 +35,8 @@ func decorationSources(targetX, targetZ int32) []decorationSource {
 // replayScheduledOres replays each source center in deterministic order into a
 // shared region. The region must contain the target's radius-two base terrain;
 // source passes themselves may write only within their own radius-one window.
-// This is an explicit canonical order for isolated generation. It must not
-// replace the production path until parity evidence confirms that it matches
-// vanilla's chunk-status scheduling order.
+// Target-first ordering ensures that the target chunk's own features are laid
+// down before adjacent chunk edges overlap.
 func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
 	// Structures generate before every feature stage: applyBiomeDecoration
 	// places all referenced starts first and only then walks the feature
