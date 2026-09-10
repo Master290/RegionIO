@@ -31,6 +31,15 @@
 /logs/
 *.log
 
+# Local debugging artefacts: scratch scripts and notes, hand-extracted datapack
+# JSONs kept for inspection (the real embed is internal/worldgen/feature_data.zip),
+# text dumps from the vanilla probes, and cave_box.txt written by the clay trace
+# test on every run. Not source.
+/scratch/
+/data/
+/tools/*.txt
+/internal/world/testdata/cave_box.txt
+
 # Development notes and session transcripts kept locally, not source.
 /chat.md
 /20[0-9][0-9]-*.txt
