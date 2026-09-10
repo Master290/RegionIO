@@ -16,7 +16,8 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 	if err := r.ensureSourceNeighborhood(); err != nil {
 		return err
 	}
-	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), vegetationStage)
+	biomes := r.sourceBiomes()
+	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), biomes, vegetationStage)
 	if err != nil {
 		return err
 	}
@@ -113,6 +114,17 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 			}); err != nil {
 				return err
 			}
+		case "minecraft:simple_block":
+			config, err := set.SimpleBlock(placed.Feature)
+			if err != nil {
+				continue
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeSimpleBlockFeature(random, position, config, set)
+				return nil
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -147,7 +159,8 @@ func (r *decorationRegion) placeKelp(random worldgen.RandomSource, position worl
 		}
 		if i > 0 {
 			belowY := y - 1
-			if r.canKelpSurvive(position.X, belowY, position.Z, set) && r.getBlock(position.X, belowY-1, position.Z) != plant {
+			belowBelowState, _ := stateByID(r.getBlock(position.X, belowY-1, position.Z))
+			if r.canKelpSurvive(position.X, belowY, position.Z, set) && belowBelowState.Name != "minecraft:kelp" {
 				age := 20 + int(random.NextIntN(4))
 				head, ok := nameToStateID("minecraft:kelp", map[string]string{"age": strconv.Itoa(age)})
 				if ok {
@@ -304,9 +317,10 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 				continue
 			}
 			groundX, groundY, groundZ := p.X, p.Y+direction, p.Z
-			if !fullSolidState(r.getBlock(groundX, groundY, groundZ)) {
+			if !isFaceSturdy(r.getBlock(groundX, groundY, groundZ)) {
 				continue
 			}
+
 			depth := config.DepthMin
 			if config.DepthMax > config.DepthMin {
 				depth += int(random.NextIntN(int32(config.DepthMax - config.DepthMin + 1)))
@@ -314,13 +328,13 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			if config.ExtraBottomBlockChance > 0 && random.NextFloat() < config.ExtraBottomBlockChance {
 				depth++
 			}
-			// placeGround: a column succeeds unless the FIRST cell is neither
-			// replaceable nor already the ground block; hitting a wall deeper
-			// down still counts, and already-ground cells are skipped in place.
+			// placeGround: in vanilla, pos ONLY moves when a block is replaced.
+			// If already the ground block, pos does not move. If not replaceable,
+			// returns i > 0.
 			columnOK := true
+			gy := groundY
 			for i := 0; i < depth; i++ {
-				gx, gy, gz := groundX, groundY+direction*i, groundZ
-				current := r.getBlock(gx, gy, gz)
+				current := r.getBlock(groundX, gy, groundZ)
 				if current == ground {
 					continue
 				}
@@ -328,15 +342,17 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 					columnOK = i > 0
 					break
 				}
-				if r.setBlock(gx, gy, gz, ground) {
+				if r.setBlock(groundX, gy, groundZ, ground) {
 					placed = true
 				}
+				gy += direction
 			}
 			if columnOK {
 				patchSet = append(patchSet, [3]int{groundX, groundY, groundZ})
 			}
 		}
 	}
+
 	if waterlogged {
 		initVegetationWater()
 		// WaterloggedVegetationPatchFeature.placeGroundPatch: enclosed ground
@@ -362,11 +378,15 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 		if config.VegetationChance <= 0 {
 			continue
 		}
-		if random.NextFloat() >= config.VegetationChance {
+		fl := random.NextFloat()
+		if fl >= config.VegetationChance {
 			continue
 		}
-		origin := patchVegetationPosition(g, direction, waterlogged)
-		r.placePatchVegetationFeature(random, origin, config.Vegetation, set, waterlogged)
+		vegPos := patchVegetationPosition(g, direction, waterlogged)
+		r.placePatchVegetationFeature(random, vegPos, config.Vegetation, set, waterlogged)
+	}
+	if origin.X == -14 && origin.Y == -11 && origin.Z == -1 {
+		fmt.Printf("GO CAND 2: radiusX=%d, radiusZ=%d, patchSet size=%d, placed=%v\n", radiusX, radiusZ, len(patchSet), placed)
 	}
 	return placed
 }
@@ -486,7 +506,7 @@ func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePositio
 	}
 	below := r.getBlock(position.X, position.Y-1, position.Z)
 	if name == "minecraft:moss_carpet" || name == "minecraft:pale_moss_carpet" {
-		return fullSolidState(below)
+		return !isAirState(below)
 	}
 	for _, supported := range flattenBlockTag(set, "minecraft:supports_vegetation", nil) {
 		if state, ok := stateByID(below); ok && state.Name == supported {

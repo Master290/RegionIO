@@ -132,6 +132,12 @@ func isSolidState(state uint16) bool {
 	return stateFlags(state)&flagSolid != 0
 }
 
+// isFaceSturdy approximates BlockState.isFaceSturdy(..., SupportType.FULL)
+// for full opaque cubes: canOcclude and opacity 15.
+func isFaceSturdy(state uint16) bool {
+	return stateFlags(state)&flagCanOcclude != 0 && lightOpacity(state) == 15
+}
+
 // lightShapeOccludes mirrors Shapes.faceShapeOccludes for the 1/16-resolution
 // face masks emitted from vanilla's VoxelShape data.
 func lightShapeOccludes(from, into uint16, direction int) bool {

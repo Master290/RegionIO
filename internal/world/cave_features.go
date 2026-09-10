@@ -202,6 +202,20 @@ func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePositi
 		}
 		return below.Name == "minecraft:clay" || below.Name == "minecraft:moss_block"
 	}
+	if name == "minecraft:spore_blossom" {
+		if position.Y >= MinY+WorldHeight-1 {
+			return false
+		}
+		above := r.getBlock(position.X, position.Y+1, position.Z)
+		return fullSolidState(above) && !isWaterState(r.getBlock(position.X, position.Y, position.Z))
+	}
+	if name == "minecraft:brown_mushroom" || name == "minecraft:red_mushroom" {
+		if position.Y <= MinY {
+			return false
+		}
+		below := r.getBlock(position.X, position.Y-1, position.Z)
+		return isSolidState(below) && !isAirState(below)
+	}
 	return r.canVegetationSurvive(position, name, set)
 }
 

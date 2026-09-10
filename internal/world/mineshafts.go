@@ -1,4 +1,4 @@
-﻿package world
+package world
 
 import (
 	"fmt"
@@ -668,58 +668,72 @@ func msTransformState(state uint16, orientation int) uint16 {
 	if !ok || len(value.Properties) == 0 {
 		return state
 	}
-	mirrorLR := orientation == 2 || orientation == 3
-	rotateCW := orientation == 3 || orientation == 4
-	dir := func(v string) string {
-		if mirrorLR {
-			switch v {
-			case "north":
-				v = "south"
-			case "south":
-				v = "north"
-			}
-		}
-		if rotateCW {
-			switch v {
-			case "north":
-				v = "east"
-			case "east":
-				v = "south"
-			case "south":
-				v = "west"
+	dir := func(d string) string {
+		switch orientation {
+		case 2: // south: mirrorLR + rot180 -> N->N, S->S, W->E, E->W
+			switch d {
 			case "west":
-				v = "north"
+				return "east"
+			case "east":
+				return "west"
+			}
+		case 3: // west: mirrorLR + rotCCW -> N->E, S->W, W->S, E->N
+			switch d {
+			case "north":
+				return "east"
+			case "south":
+				return "west"
+			case "west":
+				return "south"
+			case "east":
+				return "north"
+			}
+		case 4: // east: rotCW -> N->E, S->W, W->N, E->S
+			switch d {
+			case "north":
+				return "east"
+			case "south":
+				return "west"
+			case "west":
+				return "north"
+			case "east":
+				return "south"
 			}
 		}
-		return v
+		return d
 	}
 	props := make(map[string]string, len(value.Properties))
 	changed := false
 	for k, v := range value.Properties {
-		var nv string
 		switch k {
-		case "facing", "north", "east", "south", "west":
-			nv = dir(v)
+		case "facing":
+			nv := dir(v)
+			if nv != v {
+				changed = true
+			}
+			props[k] = nv
+		case "north", "east", "south", "west":
+			nk := dir(k)
+			if nk != k {
+				changed = true
+			}
+			props[nk] = v
 		case "shape":
-			// north_south / east_west swap only under rotation
-			if rotateCW {
+			nv := v
+			if orientation >= 3 {
 				if v == "north_south" {
 					nv = "east_west"
 				} else if v == "east_west" {
 					nv = "north_south"
-				} else {
-					nv = v
 				}
-			} else {
-				nv = v
 			}
+			if nv != v {
+				changed = true
+			}
+			props[k] = nv
 		default:
-			nv = v
+			props[k] = v
 		}
-		if nv != v {
-			changed = true
-		}
-		props[k] = nv
 	}
 	if !changed {
 		return state

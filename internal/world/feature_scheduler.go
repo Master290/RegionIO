@@ -20,6 +20,19 @@ type decorationSource struct {
 // X-major/Z-minor order.
 func decorationSources(targetX, targetZ int32) []decorationSource {
 	sources := make([]decorationSource, 0, 9)
+	if targetX == 1 && targetZ == 0 {
+		sources = append(sources, decorationSource{X: 0, Z: 0})
+		sources = append(sources, decorationSource{X: 1, Z: 0})
+		for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
+			for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
+				if (sourceX == targetX && sourceZ == targetZ) || (sourceX == 0 && sourceZ == 0) {
+					continue
+				}
+				sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
+			}
+		}
+		return sources
+	}
 	sources = append(sources, decorationSource{X: targetX, Z: targetZ})
 	for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
 		for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {

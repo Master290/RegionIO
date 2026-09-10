@@ -37,24 +37,32 @@ public final class VanillaFeatureStepIndexProbe {
         }
 
         var steps = FeatureSorter.buildFeaturesPerStep(biomes, b -> b.value().getGenerationSettings().features(), true);
-        var placedFeatures = lookup.lookupOrThrow(Registries.PLACED_FEATURE);
-
-        for (int step = 0; step < steps.size(); step++) {
-            if (step != 9) {
-                continue;
+        var biomesReg = lookup.lookupOrThrow(Registries.BIOME);
+        var lushCaves = biomesReg.getOrThrow(net.minecraft.resources.ResourceKey.create(Registries.BIOME, net.minecraft.resources.Identifier.parse("minecraft:lush_caves")));
+        var lushFeatures = lushCaves.value().getGenerationSettings().features();
+        System.out.println("LUSH CAVES STEPS:");
+        for (int step = 0; step < lushFeatures.size(); step++) {
+            var list = lushFeatures.get(step);
+            for (var h : list) {
+                System.out.printf("  Step %d: %s\n", step, h.unwrapKey().map(k -> k.identifier().toString()).orElse("?"));
             }
-            var list = steps.get(step).features();
-            for (int i = 0; i < list.size(); i++) {
-                var f = list.get(i);
-                String name = "?";
-                for (var el : placedFeatures.listElements().toList()) {
-                    if (el.value() == f) {
-                        name = el.key().identifier().toString();
-                        break;
-                    }
-                }
-                System.out.println("STEP9 " + i + " " + name);
+        }
+        System.out.println("STEP 9 GLOBAL FEATURE INDICES:");
+        var step9 = steps.get(9);
+        var pfReg = lookup.lookupOrThrow(Registries.PLACED_FEATURE);
+        var glPf = pfReg.getOrThrow(net.minecraft.resources.ResourceKey.create(Registries.PLACED_FEATURE, net.minecraft.resources.Identifier.parse("minecraft:glow_lichen"))).value();
+        for (var pm : glPf.placement()) {
+            System.out.println("  PM: " + pm.getClass().getSimpleName());
+            for (var f : pm.getClass().getDeclaredFields()) {
+                f.setAccessible(true);
+                System.out.println("    " + f.getName() + " = " + f.get(pm));
             }
+        }
+        var cfg = glPf.feature().value().config();
+        System.out.println("CFG class: " + cfg.getClass().getName());
+        for (var f : cfg.getClass().getDeclaredFields()) {
+            f.setAccessible(true);
+            System.out.println("  cfg." + f.getName() + " = " + f.get(cfg));
         }
     }
 }

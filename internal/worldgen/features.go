@@ -1322,6 +1322,26 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 		modifier := placed.Placement[index]
 		next := func(value FeaturePosition) error { return apply(index+1, value) }
 		switch modifier.Type {
+		case "minecraft:noise_threshold_count":
+			var value struct {
+				NoiseLevel float64 `json:"noise_level"`
+				BelowNoise int     `json:"below_noise"`
+				AboveNoise int     `json:"above_noise"`
+			}
+			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
+				return fmt.Errorf("worldgen: %s invalid noise threshold count", name)
+			}
+			noise := BiomeInfoNoise(float64(position.X)/200.0, float64(position.Z)/200.0)
+			count := value.AboveNoise
+			if noise < value.NoiseLevel {
+				count = value.BelowNoise
+			}
+			for ; count > 0; count-- {
+				if err := next(position); err != nil {
+					return err
+				}
+			}
+			return nil
 		case "minecraft:noise_based_count":
 			var value struct {
 				Ratio  int     `json:"noise_to_count_ratio"`

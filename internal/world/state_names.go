@@ -31,6 +31,15 @@ var (
 	defaultByName map[string]uint16
 )
 
+// stateLabel returns the block name of a state ID for diagnostics, or
+// "unknown" for IDs outside the table.
+func stateLabel(id uint16) string {
+	if state, ok := stateByID(id); ok {
+		return state.Name
+	}
+	return "unknown"
+}
+
 // stateByID returns the named form of a block-state ID, building the lookup
 // table on first use. The default state of each block (or its lowest-id state)
 // is recorded; this matches what our generator emits, where each StateXxx

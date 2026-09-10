@@ -56,6 +56,7 @@ func TestVanillaBlockParity(t *testing.T) {
 		cz := int32(binary.BigEndian.Uint32(coords[4:]))
 		chunk := gen(cx, cz)
 		chunkBlockExact := 0
+		thisChunkPairs := make(map[statePair]int)
 		var state [2]byte
 		for y := MinY; y < MinY+WorldHeight; y++ {
 			for z := 0; z < 16; z++ {
@@ -71,6 +72,7 @@ func TestVanillaBlockParity(t *testing.T) {
 						chunkBlockExact++
 					} else {
 						pairs[statePair{got, want}]++
+						thisChunkPairs[statePair{got, want}]++
 						wantBlocks[want]++
 						yRange := wantY[want]
 						if yRange[0] == 0 || y < yRange[0] {
@@ -93,32 +95,30 @@ func TestVanillaBlockParity(t *testing.T) {
 						if isFluidState(got) || isFluidState(want) {
 							fluidMismatch++
 						}
-						if isOreState(got) || isOreState(want) {
-							oreMismatch++
-						}
+						// if cx == 1 && cz == 0 && got == 86 && (want == 0 || want == 94) {
+						// 	t.Logf("c(1,0) water at (%d,%d,%d): want=%s (%d)", x, y, z, stateLabel(want), want)
+						// }
 					}
 				}
 			}
 		}
 		chunkMismatches := 98304 - chunkBlockExact
 		t.Logf("Chunk (%d,%d) exact %d/98304 (%.3f%%), mismatches: %d", cx, cz, chunkBlockExact, float64(chunkBlockExact)*100/98304, chunkMismatches)
-		if cx == 0 && cz == 0 {
-			type pC struct {
-				pair  statePair
-				count int
-			}
-			var cTop []pC
-			for p, n := range pairs {
-				cTop = append(cTop, pC{p, n})
-			}
-			sort.Slice(cTop, func(i, j int) bool { return cTop[i].count > cTop[j].count })
-			if len(cTop) > 10 {
-				cTop = cTop[:10]
-			}
-			for _, m := range cTop {
-				t.Logf("  c(0,0) mismatch %d: %s (%d) -> %s (%d)", m.count,
-					stateLabel(m.pair.got), m.pair.got, stateLabel(m.pair.want), m.pair.want)
-			}
+		type pC struct {
+			pair  statePair
+			count int
+		}
+		var cTop []pC
+		for p, n := range thisChunkPairs {
+			cTop = append(cTop, pC{p, n})
+		}
+		sort.Slice(cTop, func(i, j int) bool { return cTop[i].count > cTop[j].count })
+		if len(cTop) > 15 {
+			cTop = cTop[:15]
+		}
+		for _, m := range cTop {
+			t.Logf("  c(%d,%d) mismatch %d: %s (%d) -> %s (%d)", cx, cz, m.count,
+				stateLabel(m.pair.got), m.pair.got, stateLabel(m.pair.want), m.pair.want)
 		}
 		for y := MinY; y < MinY+WorldHeight; y += biomeCellSize {
 			for z := 0; z < 16; z += biomeCellSize {
@@ -213,13 +213,6 @@ func percent(exact, total int) float64 {
 		return 100
 	}
 	return 100 * float64(exact) / float64(total)
-}
-
-func stateLabel(id uint16) string {
-	if state, ok := stateByID(id); ok {
-		return state.Name
-	}
-	return "unknown"
 }
 
 func isOreState(id uint16) bool {

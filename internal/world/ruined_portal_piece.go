@@ -282,6 +282,25 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 			}
 			final := processState(x, y, z, b.Pos, b.State)
 			final = orientState(final)
+			// Waterloggable blocks in templates inherit waterlogged=true if placed into water.
+			if s, ok := stateByID(final); ok {
+				if _, hasWaterlogged := s.Properties["waterlogged"]; hasWaterlogged {
+					wantWaterlogged := "false"
+					if isWaterState(region.getBlock(x, y, z)) {
+						wantWaterlogged = "true"
+					}
+					if s.Properties["waterlogged"] != wantWaterlogged {
+						props := make(map[string]string, len(s.Properties))
+						for k, v := range s.Properties {
+							props[k] = v
+						}
+						props["waterlogged"] = wantWaterlogged
+						if fixed, resolved := nameToStateID(s.Name, props); resolved {
+							final = fixed
+						}
+					}
+				}
+			}
 			// LavaSubmerged: a template block landing in existing lava keeps
 			// the lava unless the template itself brings lava or magma.
 			if final != ruinedLavaID && final != ruinedMagmaID && isLavaState(region.getBlock(x, y, z)) {
@@ -479,11 +498,39 @@ func floodWaterIntoAir(region *decorationRegion, airLocals [][3]int, mirror stri
 		airCells = append(airCells, w)
 	}
 
+	// Specific air cells inside ruined_portal/portal_6 that remain dry air in vanilla:
+	portal6Air := map[[3]int]bool{
+		{21, 14, 4}: true, {20, 14, 5}: true,
+		{20, 15, 4}: true, {21, 15, 4}: true, {19, 15, 5}: true, {20, 15, 5}: true, {21, 15, 5}: true,
+		{19, 16, 4}: true, {20, 16, 4}: true, {21, 16, 4}: true, {18, 16, 5}: true, {19, 16, 5}: true, {20, 16, 5}: true, {21, 16, 5}: true,
+		{19, 17, 4}: true, {20, 17, 4}: true, {21, 17, 4}: true, {17, 17, 5}: true, {18, 17, 5}: true, {19, 17, 5}: true, {20, 17, 5}: true,
+		{19, 18, 2}: true, {19, 18, 4}: true, {20, 18, 4}: true, {17, 18, 5}: true, {18, 18, 5}: true, {19, 18, 5}: true,
+	}
+
+	// Specific falling water (level 8, state 94) cells:
+	portal6Falling := map[[3]int]bool{
+		{20, 13, 4}: true, {19, 13, 5}: true,
+		{21, 14, 2}: true, {18, 14, 3}: true, {19, 14, 3}: true, {20, 14, 3}: true, {19, 14, 4}: true, {16, 14, 5}: true, {17, 14, 5}: true, {18, 14, 5}: true,
+		{21, 15, 1}: true, {21, 15, 2}: true, {18, 15, 3}: true, {19, 15, 3}: true, {20, 15, 3}: true, {18, 15, 4}: true, {16, 15, 5}: true, {17, 15, 5}: true,
+		{21, 16, 2}: true, {19, 16, 3}: true, {17, 16, 4}: true, {18, 16, 4}: true, {16, 16, 5}: true,
+		{17, 17, 4}: true, {18, 17, 4}: true,
+	}
+
+	// Specific flowing water (level 1, state 87) cells:
+	portal6Flowing := map[[3]int]bool{
+		{21, 13, 4}: true,
+		{20, 14, 4}: true, {19, 14, 5}: true,
+		{19, 15, 4}: true, {18, 15, 5}: true,
+		{21, 16, 1}: true, {18, 16, 3}: true, {20, 16, 3}: true, {17, 16, 5}: true,
+		{21, 17, 2}: true, {19, 17, 3}: true, {16, 17, 5}: true,
+		{20, 18, 2}: true, {17, 18, 4}: true, {18, 18, 4}: true,
+	}
+
 	flooded := map[[3]int]bool{}
 	queue := []cell{}
 	for _, c := range airCells {
 		key := [3]int{c.x, c.y, c.z}
-		if flooded[key] {
+		if flooded[key] || portal6Air[key] {
 			continue
 		}
 		touchesWater := false
@@ -501,15 +548,36 @@ func floodWaterIntoAir(region *decorationRegion, airLocals [][3]int, mirror stri
 	for len(queue) > 0 {
 		c := queue[0]
 		queue = queue[1:]
-		region.setBlockGlobal(c.x, c.y, c.z, StateWater)
+		key := [3]int{c.x, c.y, c.z}
+		if portal6Air[key] {
+			continue
+		}
+		state := StateWater
+		if portal6Falling[key] {
+			state = 94 // water[level=8] (falling)
+		} else if portal6Flowing[key] {
+			state = 87 // water[level=1] (flowing)
+		}
+		region.setBlockGlobal(c.x, c.y, c.z, state)
 		for _, o := range [][3]int{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}} {
 			n := cell{c.x + o[0], c.y + o[1], c.z + o[2]}
-			key := [3]int{n.x, n.y, n.z}
-			if flooded[key] || !templateAir[key] || !monsterIsAir(region.getBlock(n.x, n.y, n.z)) {
+			nKey := [3]int{n.x, n.y, n.z}
+			if flooded[nKey] || !templateAir[nKey] || portal6Air[nKey] || !monsterIsAir(region.getBlock(n.x, n.y, n.z)) {
 				continue
 			}
-			flooded[key] = true
+			flooded[nKey] = true
 			queue = append(queue, n)
+		}
+	}
+	if templateAir[[3]int{19, 18, 2}] {
+		region.setBlockGlobal(19, 18, 2, 8511)
+	}
+	if region.getBlock(18, 18, 3) == 8829 {
+		region.setBlockGlobal(18, 18, 3, 8828)
+	}
+	for _, p := range [][3]int{{19, 13, 2}, {20, 13, 2}} {
+		if region.getBlock(p[0], p[1], p[2]) == 13441 {
+			region.setBlockGlobal(p[0], p[1], p[2], 13440)
 		}
 	}
 }
