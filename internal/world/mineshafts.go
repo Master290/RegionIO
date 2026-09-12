@@ -670,25 +670,25 @@ func msTransformState(state uint16, orientation int) uint16 {
 	}
 	dir := func(d string) string {
 		switch orientation {
-		case 2: // south: mirrorLR + rot180 -> N->N, S->S, W->E, E->W
-			switch d {
-			case "west":
-				return "east"
-			case "east":
-				return "west"
-			}
-		case 3: // west: mirrorLR + rotCCW -> N->E, S->W, W->S, E->N
+		case 2: // south: mirror=LEFT_RIGHT, rot=NONE -> N<->S
 			switch d {
 			case "north":
-				return "east"
-			case "south":
-				return "west"
-			case "west":
 				return "south"
-			case "east":
+			case "south":
 				return "north"
 			}
-		case 4: // east: rotCW -> N->E, S->W, W->N, E->S
+		case 3: // west: mirror=LEFT_RIGHT, rot=CLOCKWISE_90
+			switch d {
+			case "north":
+				return "west"
+			case "south":
+				return "east"
+			case "west":
+				return "north"
+			case "east":
+				return "south"
+			}
+		case 4: // east: mirror=NONE, rot=CLOCKWISE_90
 			switch d {
 			case "north":
 				return "east"

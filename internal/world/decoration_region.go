@@ -59,15 +59,6 @@ func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
 		return false
 	}
 	cx, cz := int32(x>>4), int32(z>>4)
-	if x == 5 && y == -27 && z == 3 {
-		fmt.Printf("SETBLOCK (5,-27,3) -> %s by source (%d,%d)\n", stateLabel(state), r.sourceX, r.sourceZ)
-	}
-	if x == 2 && y == -44 && z == 12 {
-		fmt.Printf("SETBLOCK (2,-44,12) -> %s by source (%d,%d)\n", stateLabel(state), r.sourceX, r.sourceZ)
-	}
-	if x == -9 && y == -14 && z == -7 {
-		fmt.Printf("SETBLOCK (-9,-14,-7) -> %s by source (%d,%d)\n", stateLabel(state), r.sourceX, r.sourceZ)
-	}
 	if abs32(cx-r.sourceX) > 1 || abs32(cz-r.sourceZ) > 1 {
 		return false
 	}

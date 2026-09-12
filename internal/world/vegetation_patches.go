@@ -385,9 +385,6 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 		vegPos := patchVegetationPosition(g, direction, waterlogged)
 		r.placePatchVegetationFeature(random, vegPos, config.Vegetation, set, waterlogged)
 	}
-	if origin.X == -14 && origin.Y == -11 && origin.Z == -1 {
-		fmt.Printf("GO CAND 2: radiusX=%d, radiusZ=%d, patchSet size=%d, placed=%v\n", radiusX, radiusZ, len(patchSet), placed)
-	}
 	return placed
 }
 
