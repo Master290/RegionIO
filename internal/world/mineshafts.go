@@ -71,6 +71,9 @@ type msBuilder struct {
 
 // MineshaftStart is one mineshaft start's fully generated piece tree.
 type MineshaftStart struct {
+	ChunkX int32
+	ChunkZ int32
+	Box    msBox
 	Pieces []*msPiece
 	Mesa   bool
 }
@@ -178,7 +181,13 @@ func msVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets,
 	if !allowed {
 		return nil
 	}
-	return &MineshaftStart{Pieces: builder.pieces, Mesa: mesa}
+	return &MineshaftStart{
+		ChunkX: int32(baseX / 16),
+		ChunkZ: int32(baseZ / 16),
+		Box:    msTreeBounds(builder.pieces),
+		Pieces: builder.pieces,
+		Mesa:   mesa,
+	}
 }
 
 func msTreeBounds(pieces []*msPiece) msBox {
@@ -546,6 +555,7 @@ var (
 	msFence        [2]uint16
 	msFenceWest    [2]uint16
 	msFenceEast    [2]uint16
+	msFenceByMask  [2][16]uint16
 )
 
 func msTypeIndex(mesa bool) int {
@@ -585,6 +595,22 @@ func initMineshaftStates() {
 		msFenceWest[1] = must("minecraft:dark_oak_fence", map[string]string{"west": "true"})
 		msFenceEast[0] = must("minecraft:oak_fence", map[string]string{"east": "true"})
 		msFenceEast[1] = must("minecraft:dark_oak_fence", map[string]string{"east": "true"})
+		for mesa := 0; mesa < 2; mesa++ {
+			name := "minecraft:oak_fence"
+			if mesa == 1 {
+				name = "minecraft:dark_oak_fence"
+			}
+			for mask := 0; mask < 16; mask++ {
+				props := map[string]string{
+					"north":       fmt.Sprintf("%t", mask&1 != 0),
+					"east":        fmt.Sprintf("%t", mask&2 != 0),
+					"south":       fmt.Sprintf("%t", mask&4 != 0),
+					"west":        fmt.Sprintf("%t", mask&8 != 0),
+					"waterlogged": "false",
+				}
+				msFenceByMask[mesa][mask] = must(name, props)
+			}
+		}
 	})
 }
 
@@ -594,23 +620,114 @@ func msChunkBox(cx, cz int32) msBox {
 	return msBox{x, MinY + 1, z, x + 15, MinY + WorldHeight, z + 15}
 }
 
-// PlaceMineshaftStart postProcesses every piece of the start that intersects
-// the given chunk, with that chunk's decoration random reseeded the way
-// applyBiomeDecoration does before a step's structure pieces
-// (setFeatureSeed(decorationSeed, structureIndexInStep, step)), in piece
-// order. This mirrors one chunk's slice of applyBiomeDecoration.
-func PlaceMineshaftStart(region *decorationRegion, start *MineshaftStart, seed int64, chunkX, chunkZ int32) {
+func packChunkPos(x, z int32) int64 {
+	return int64(uint32(x)) | (int64(uint32(z)) << 32)
+}
+
+// fastutilLongSet reproduces the iteration order of it.unimi.dsi.fastutil.longs.LongOpenHashSet
+// initialized with default capacity (16, load factor 0.75 -> table size 32, mask 31).
+type fastutilLongSet struct {
+	table        [32]int64
+	containsNull bool
+}
+
+func (s *fastutilLongSet) add(k int64) {
+	if k == 0 {
+		s.containsNull = true
+		return
+	}
+	h := k * -7046029254386353131
+	h ^= int64(uint64(h) >> 32)
+	h ^= int64(uint64(h) >> 16)
+	pos := int(h) & 31
+	for {
+		curr := s.table[pos]
+		if curr == 0 {
+			s.table[pos] = k
+			return
+		}
+		if curr == k {
+			return
+		}
+		pos = (pos + 1) & 31
+	}
+}
+
+func (s *fastutilLongSet) elements() []int64 {
+	out := make([]int64, 0, 4)
+	if s.containsNull {
+		out = append(out, 0)
+	}
+	for i := 31; i >= 0; i-- {
+		if s.table[i] != 0 {
+			out = append(out, s.table[i])
+		}
+	}
+	return out
+}
+
+// PlaceMineshaftsForChunk places all mineshaft starts intersecting chunk (chunkX, chunkZ)
+// in the exact order determined by vanilla's StructureManager/LongOpenHashSet,
+// sharing a single decoration random stream seeded once for step 3 (underground structures).
+func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart, seed int64, chunkX, chunkZ int32) {
+	if len(starts) == 0 {
+		return
+	}
 	initMineshaftStates()
-	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
-	random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep("mineshaft"), 3)
 	chunkBox := msChunkBox(chunkX, chunkZ)
-	ctx := &msContext{region: region, chunkBox: chunkBox, mesa: start.Mesa}
-	for _, piece := range start.Pieces {
-		if !msBoxesIntersect(piece.box, chunkBox) {
+
+	type startCandidate struct {
+		start *MineshaftStart
+		key   int64
+	}
+	var candidates []startCandidate
+	var set fastutilLongSet
+	for _, st := range starts {
+		if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, chunkBox) {
 			continue
 		}
-		msPostProcess(ctx, piece, random)
+		hasIntersectingPiece := false
+		for _, p := range st.Pieces {
+			if msBoxesIntersect(p.box, chunkBox) {
+				hasIntersectingPiece = true
+				break
+			}
+		}
+		if !hasIntersectingPiece {
+			continue
+		}
+		key := packChunkPos(st.ChunkX, st.ChunkZ)
+		set.add(key)
+		candidates = append(candidates, startCandidate{start: st, key: key})
 	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
+	random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep("mineshaft"), 3)
+
+	orderedKeys := set.elements()
+	for _, key := range orderedKeys {
+		for _, c := range candidates {
+			if c.key == key {
+				ctx := &msContext{region: region, chunkBox: chunkBox, mesa: c.start.Mesa}
+				for _, piece := range c.start.Pieces {
+					if !msBoxesIntersect(piece.box, chunkBox) {
+						continue
+					}
+					msPostProcess(ctx, piece, random)
+				}
+				break
+			}
+		}
+	}
+}
+
+// PlaceMineshaftStart postProcesses every piece of the start that intersects
+// the given chunk.
+func PlaceMineshaftStart(region *decorationRegion, start *MineshaftStart, seed int64, chunkX, chunkZ int32) {
+	PlaceMineshaftsForChunk(region, []*MineshaftStart{start}, seed, chunkX, chunkZ)
 }
 
 type msContext struct {
@@ -758,9 +875,6 @@ func (c *msContext) placeBlock(p *msPiece, state uint16, x, y, z int) {
 }
 
 func (c *msContext) canBeReplaced(p *msPiece, wx, wy, wz int) bool {
-	if p.kind != msKindCorridor {
-		return true
-	}
 	state := c.region.getBlock(wx, wy, wz)
 	if state == 0 {
 		return true
@@ -769,16 +883,16 @@ func (c *msContext) canBeReplaced(p *msPiece, wx, wy, wz int) bool {
 	if !ok {
 		return true
 	}
-	idx := c.typeIndex()
-	switch value.Name {
-	case "minecraft:oak_planks", "minecraft:dark_oak_planks":
-		return state != msPlanks[idx]
-	case "minecraft:oak_log", "minecraft:dark_oak_log":
-		return state != msLog[idx]
-	case "minecraft:oak_fence", "minecraft:dark_oak_fence":
-		return state != msFence[idx]
-	case "minecraft:iron_chain":
-		return false
+	if c.mesa {
+		switch value.Name {
+		case "minecraft:dark_oak_planks", "minecraft:dark_oak_log", "minecraft:dark_oak_fence", "minecraft:iron_chain":
+			return false
+		}
+	} else {
+		switch value.Name {
+		case "minecraft:oak_planks", "minecraft:oak_log", "minecraft:oak_fence", "minecraft:iron_chain":
+			return false
+		}
 	}
 	return true
 }
@@ -1092,11 +1206,8 @@ func (c *msContext) placeSupport(p *msPiece, random worldgen.RandomSource, x1, y
 			return
 		}
 	}
-	fence := msFence[c.typeIndex()]
-	_ = fence
-	c.generateBox(p, x1, y1, z, x1, y2-1, z, msFenceWest[c.typeIndex()], msCaveAir)
-	c.generateBox(p, y2, y1, z, y2, y2-1, z, msFenceEast[c.typeIndex()], msCaveAir)
-	_ = fence
+	c.placeSupportFence(p, x1, y1, y2-1, z)
+	c.placeSupportFence(p, y2, y1, y2-1, z)
 	if random.NextIntN(4) == 0 {
 		// Two single caps at the column tops.
 		c.generateBox(p, x1, y2, z, x1, y2, z, msPlanks[c.typeIndex()], msCaveAir)
@@ -1107,6 +1218,48 @@ func (c *msContext) placeSupport(p *msPiece, random worldgen.RandomSource, x1, y
 		c.maybeGenerateBlock(p, random, 0.05, x1+1, y2, z-1, msTorchSouth)
 		c.maybeGenerateBlock(p, random, 0.05, x1+1, y2, z+1, msTorchNorth)
 	}
+}
+
+func (c *msContext) placeSupportFence(p *msPiece, x, y1, y2, z int) {
+	for y := y1; y <= y2; y++ {
+		wx, wy, wz := p.worldX(x, z), p.worldY(y), p.worldZ(x, z)
+		if !msBoxContains(c.chunkBox, wx, wy, wz) {
+			continue
+		}
+		if !c.canBeReplaced(p, wx, wy, wz) {
+			continue
+		}
+		c.region.setBlockGlobal(wx, wy, wz, c.fenceState(wx, wy, wz))
+	}
+}
+
+func msFenceConnects(region *decorationRegion, x, y, z int) bool {
+	st := region.getBlock(x, y, z)
+	if msFaceSturdy(st) {
+		return true
+	}
+	val, ok := stateByID(st)
+	if !ok {
+		return false
+	}
+	return val.Name == "minecraft:oak_fence" || val.Name == "minecraft:dark_oak_fence"
+}
+
+func (c *msContext) fenceState(wx, wy, wz int) uint16 {
+	var mask int
+	if msFenceConnects(c.region, wx, wy, wz-1) { // north
+		mask |= 1
+	}
+	if msFenceConnects(c.region, wx+1, wy, wz) { // east
+		mask |= 2
+	}
+	if msFenceConnects(c.region, wx, wy, wz+1) { // south
+		mask |= 4
+	}
+	if msFenceConnects(c.region, wx-1, wy, wz) { // west
+		mask |= 8
+	}
+	return msFenceByMask[c.typeIndex()][mask]
 }
 
 func (c *msContext) placeDoubleLowerOrUpperSupport(p *msPiece, x, y, z int) {

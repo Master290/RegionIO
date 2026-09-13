@@ -122,9 +122,7 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	})
 	if len(mineshafts) > 0 {
 		for _, key := range regionChunks {
-			for _, start := range mineshafts {
-				PlaceMineshaftStart(r, start, seed, key[0], key[1])
-			}
+			PlaceMineshaftsForChunk(r, mineshafts, seed, key[0], key[1])
 		}
 	}
 	// Step 4 (surface_structures), alphabetical index order: ocean ruins
