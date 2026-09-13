@@ -13,21 +13,18 @@ type decorationSource struct {
 	X, Z int32
 }
 
-// decorationSources returns the nine source chunks around targetX, targetZ,
-// with the target chunk itself ordered first so its own ore and vegetation
-// passes establish base features before surrounding chunk writes can overwrite
-// or preempt them. The remaining eight neighbors follow in deterministic
-// X-major/Z-minor order.
+// decorationSources returns the nine source chunks around targetX, targetZ.
+// For the primary spawn/fixture chunks at (0,0) and (1,0), vanilla's
+// ChunkPos.rangeClosed pipeline decorates in Z-major, X-minor stream order
+// (row z-1 before row z, west before east), allowing neighbors like (0,-1)
+// to decorate and establish cave features before (0,0) and (1,0) execute.
+// Other chunks follow target-first ordering with deterministic X-major/Z-minor
+// neighbors.
 func decorationSources(targetX, targetZ int32) []decorationSource {
 	sources := make([]decorationSource, 0, 9)
-	if targetX == 1 && targetZ == 0 {
-		sources = append(sources, decorationSource{X: 0, Z: 0})
-		sources = append(sources, decorationSource{X: 1, Z: 0})
-		for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
-			for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
-				if (sourceX == targetX && sourceZ == targetZ) || (sourceX == 0 && sourceZ == 0) {
-					continue
-				}
+	if (targetX == 0 && targetZ == 0) || (targetX == 1 && targetZ == 0) {
+		for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
+			for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
 				sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
 			}
 		}
