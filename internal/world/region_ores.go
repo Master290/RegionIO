@@ -154,13 +154,35 @@ func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSou
 		}
 		current := region.getBlock(x, y, z)
 		for _, target := range targets {
-			if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAirRegion(region, x, y, z) {
+			if !canPlaceOreBlock(current, target, discard, random, func() bool {
+				return exposedToAirRegion(region, x, y, z)
+			}) {
 				continue
 			}
 			region.setBlock(x, y, z, target.state)
 			break
 		}
 	})
+}
+
+func canPlaceOreBlock(current uint16, target resolvedOreTarget, discard float64, random worldgen.RandomSource, isExposed func() bool) bool {
+	if !target.replaceables[current] {
+		return false
+	}
+	if shouldSkipAirCheck(random, discard) {
+		return true
+	}
+	return !isExposed()
+}
+
+func shouldSkipAirCheck(random worldgen.RandomSource, discard float64) bool {
+	if discard <= 0 {
+		return true
+	}
+	if discard >= 1.0 {
+		return false
+	}
+	return random.NextFloat() >= float32(discard)
 }
 
 func exposedToAirRegion(region *decorationRegion, x, y, z int) bool {

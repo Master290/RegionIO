@@ -138,7 +138,9 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 		}
 		current := c.GetBlock(localX, y, localZ)
 		for _, target := range targets {
-			if !target.replaceables[current] || discard > 0 && random.NextFloat() < float32(discard) && exposedToAir(c, localX, y, localZ) {
+			if !canPlaceOreBlock(current, target, discard, random, func() bool {
+				return exposedToAir(c, localX, y, localZ)
+			}) {
 				continue
 			}
 			c.SetBlock(localX, y, localZ, target.state)

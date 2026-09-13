@@ -14,7 +14,7 @@ func TestPlacedOresUseStoneAndDeepslateTargets(t *testing.T) {
 		5308: "deepslate diamond ore",
 	}
 	counts := make(map[uint16]int)
-	for _, pos := range [][2]int32{{-8, -8}, {4, -4}} {
+	for _, pos := range [][2]int32{{-1, -1}, {4, -4}} {
 		chunk := gen(pos[0], pos[1])
 		for y := MinY; y < 128; y++ {
 			for x := 0; x < 16; x++ {
