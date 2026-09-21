@@ -408,6 +408,57 @@ func TestPlacementPositionsMatchesVanillaRandomOffsetVector(t *testing.T) {
 	}
 }
 
+// A bare int in random_offset is a constant IntProvider, and ConstantInt.sample
+// returns its value without touching the RandomSource. Every placed feature in
+// the lush-cave chain uses that form (lush_caves_clay and lush_caves_vegetation
+// carry y_spread 1, lush_caves_ceiling_vegetation y_spread -1), so the shift
+// after environment_scan is a fixed +1 or -1 and costs the stream nothing.
+// Both halves are asserted together: the Y offset, and that the following
+// in_square still sees the draws it would have seen with no modifier at all.
+func TestPlacementRandomOffsetConstantShiftsAndDrawsNothing(t *testing.T) {
+	modifier := func(raw string) PlacementModifier {
+		var value PlacementModifier
+		value.Raw = json.RawMessage(raw)
+		if err := json.Unmarshal(value.Raw, &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	positions := func(t *testing.T, placement []PlacementModifier) []FeaturePosition {
+		t.Helper()
+		set := &FeatureSet{Placed: map[string]PlacedFeature{"test": {Placement: placement}}}
+		got, err := set.PlacementPositions("test", NewLegacy(12345), FeaturePosition{X: 32, Y: 10, Z: -16}, PlacementContext{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	count := modifier(`{"type":"minecraft:count","count":3}`)
+	inSquare := modifier(`{"type":"minecraft:in_square"}`)
+	without := positions(t, []PlacementModifier{count, inSquare})
+	for _, tc := range []struct {
+		name    string
+		raw     string
+		yOffset int
+	}{
+		{"floor", `{"type":"minecraft:random_offset","xz_spread":0,"y_spread":1}`, 1},
+		{"ceiling", `{"type":"minecraft:random_offset","xz_spread":0,"y_spread":-1}`, -1},
+	} {
+		got := positions(t, []PlacementModifier{count, modifier(tc.raw), inSquare})
+		if len(got) != len(without) {
+			t.Fatalf("%s: %d positions, want %d", tc.name, len(got), len(without))
+		}
+		for i := range got {
+			want := without[i]
+			want.Y += tc.yOffset
+			if got[i] != want {
+				t.Fatalf("%s: position %d = %v, want %v - a constant y_spread must shift Y by %d and leave x/z, and so the stream, untouched",
+					tc.name, i, got[i], want, tc.yOffset)
+			}
+		}
+	}
+}
+
 func TestClampedNormalIntMatchesVanillaRuntimeVector(t *testing.T) {
 	provider, err := parsePlacementIntProvider(json.RawMessage(`{"type":"minecraft:clamped_normal","mean":0.0,"deviation":3.0,"min_inclusive":-10,"max_inclusive":10}`))
 	if err != nil {

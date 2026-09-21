@@ -584,10 +584,18 @@ the root cause to fix first):
   while iterating the ORIGINAL set in hash order, so the water set's own
   hash order governs the rolls.
 - The moss patch position stream: count 125 per source chunk, each position
-  consuming in_square(2) + height_range uniform(1) + random_offset y(1)
-  draws with environment_scan and biome drawing nothing. The ~300-cell moss
-  ground divergence is somewhere in this chain or in the patch column scan;
-  it survives with vegetation disabled, so it is upstream of the vegetation.
+  consuming in_square(2) + height_range uniform(1) draws, with
+  `random_offset`, `environment_scan` and `biome` drawing nothing. The
+  `random_offset` claim here used to read "y(1) draw"; that was wrong, and the
+  jar settles it: a bare int in that field is a `ConstantInt`, whose
+  `sample(RandomSource)` is `return value` with no random access
+  (`lush_caves_vegetation` and `lush_caves_clay` carry `y_spread: 1`,
+  `lush_caves_ceiling_vegetation` `y_spread: -1`), so it is a fixed shift after
+  the scan - up one for the floor patches and the clay, down one for the ceiling
+  - and never a draw. `TestPlacementRandomOffsetConstantShiftsAndDrawsNothing`
+  pins both halves. The ~300-cell moss ground divergence is somewhere in this
+  chain or in the patch column scan; it survives with vegetation disabled, so it
+  is upstream of the vegetation.
 
 ## Ruined portal netherrack spread (decoded; reseed parameters unresolved)
 
