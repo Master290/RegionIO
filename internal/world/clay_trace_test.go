@@ -14,6 +14,7 @@ import (
 )
 
 func TestDumpCaveBox(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(0)
 	targetZ := int32(0)
@@ -118,6 +119,7 @@ func (w *wrappedGoRng) NextBoolean() bool {
 
 
 func TestFindClayPlacer(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(0)
 	targetZ := int32(0)
@@ -287,6 +289,7 @@ func TestFindClayPlacer(t *testing.T) {
 }
 
 func TestComparePlacementRaw(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	random, decorationSeed := worldgen.DecorationRandom(seed, 0, 0)
 	random.SetFeatureSeed(decorationSeed, 29, 9)
@@ -301,6 +304,7 @@ func TestComparePlacementRaw(t *testing.T) {
 }
 
 func TestCheckVanillaClay(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
 		t.Fatal(err)
@@ -385,6 +389,7 @@ func TestCheckVanillaClay(t *testing.T) {
 }
 
 func TestIsolateClayCause(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	run := func(withCeiling, withVines bool) {
 		seed := int64(12345)
 		targetX := int32(0)
@@ -478,6 +483,7 @@ func TestIsolateClayCause(t *testing.T) {
 }
 
 func TestClayBeforeCeiling(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(0)
 	targetZ := int32(0)
@@ -557,6 +563,7 @@ func TestClayBeforeCeiling(t *testing.T) {
 }
 
 func TestInspectCeilingVegetation(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		t.Fatal(err)
@@ -608,6 +615,7 @@ func TestInspectCeilingVegetation(t *testing.T) {
 }
 
 func TestTraceCeilingPatch(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(0)
 	targetZ := int32(0)
@@ -692,6 +700,7 @@ func TestTraceCeilingPatch(t *testing.T) {
 }
 
 func TestListLushCavesFeatures(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		t.Fatal(err)
@@ -730,6 +739,7 @@ func TestListLushCavesFeatures(t *testing.T) {
 }
 
 func TestCheckPos9_7_14(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	f, err := os.Open("testdata/vanilla_overworld_12345.bin")
 	if err != nil {
 		t.Fatal(err)
@@ -761,6 +771,7 @@ func TestCheckPos9_7_14(t *testing.T) {
 }
 
 func TestTraceCandidatesDetail(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	for _, withCeiling := range []bool{false, true} {
 		t.Logf("\n=== TESTING withCeiling=%v ===", withCeiling)
 		seed := int64(12345)
@@ -911,6 +922,7 @@ func TestTraceCandidatesDetail(t *testing.T) {
 }
 
 func TestCheckLushVegetationDraws(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(0)
 	targetZ := int32(0)
@@ -984,6 +996,7 @@ func TestCheckLushVegetationDraws(t *testing.T) {
 }
 
 func TestTraceChunk1Water(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(1)
 	targetZ := int32(0)
@@ -1151,6 +1164,7 @@ func TestTraceChunk1Water(t *testing.T) {
 }
 
 func TestDumpPortal6(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	blocks, size, err := loadTemplateCached("ruined_portal/portal_6")
 	if err != nil {
 		t.Fatal(err)
@@ -1172,6 +1186,7 @@ func TestDumpPortal6(t *testing.T) {
 }
 
 func TestDumpPortalBoxFixture(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	f, err := os.Open("testdata/vanilla_overworld_12345.bin")
 	if err != nil {
 		t.Fatal(err)
@@ -1302,6 +1317,7 @@ func TestDumpPortalBoxFixture(t *testing.T) {
 }
 
 func TestPrintAllClayMismatches(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	gen := NewVanillaRegionGenerator(12345)
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
@@ -1353,6 +1369,7 @@ func TestPrintAllClayMismatches(t *testing.T) {
 }
 
 func TestTraceMossPatchInMinusOneMinusOne(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(-1)
 	targetZ := int32(-1)
@@ -1422,6 +1439,7 @@ func TestTraceMossPatchInMinusOneMinusOne(t *testing.T) {
 }
 
 func TestCompareMinusOneMinusOneMoss(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	// Read vanilla chunk (-1, -1)
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
@@ -1472,6 +1490,7 @@ func TestCompareMinusOneMinusOneMoss(t *testing.T) {
 }
 
 func TestDebugMinusOneMinusOneGen(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(-1)
 	targetZ := int32(-1)
@@ -1548,6 +1567,7 @@ func TestDebugMinusOneMinusOneGen(t *testing.T) {
 }
 
 func TestTracePatchAtMinusSeven(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	seed := int64(12345)
 	targetX := int32(-1)
 	targetZ := int32(-1)
@@ -1737,6 +1757,7 @@ func TestTracePatchAtMinusSeven(t *testing.T) {
 }
 
 func TestInspectFixtureBlocks(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_TRACE")
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
 		t.Fatal(err)

@@ -11,10 +11,20 @@ import (
 
 // TestProbeLushClayStream reproduces the stage-9 stream for source (0,0) up
 // to and including lush_caves_clay, dumping the region state along the
-// candidate columns at feature time. It answers, with data: which raw
-// candidate produced a position, what the column looked like when the scan
-// ran, and where our pool actually landed.
+// candidate columns at feature time.
+//
+// Its position output is NOT trustworthy. It replays the schedule prefix
+// through placeScheduledFeature below, a copy of the production dispatch in
+// placeScheduledVegetationPatches that handles six of the eight configured
+// feature types - it omits minecraft:kelp and minecraft:seagrass, both of
+// which consume draws, and it discards every error the real dispatcher
+// returns. The stream therefore diverges from the server's before the probe
+// reaches lush_caves_clay, which is the one thing it claims to measure. It is
+// kept for the column dumps. Reusing it for a position question means
+// extracting the production switch into a shared seam and calling that; do not
+// fix the copy, because a second dispatcher is the defect.
 func TestProbeLushClayStream(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_LUSH_CLAY_PROBE")
 	seed := int64(12345)
 	targetX, targetZ := int32(0), int32(0)
 

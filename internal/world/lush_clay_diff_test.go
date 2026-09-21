@@ -10,9 +10,16 @@ import (
 
 // TestVanillaLushClayDiff reads the plain fixture and the capture with
 // minecraft:lush_caves_clay disabled. Cells that differ between the two are
-// exactly the blocks lush_caves_clay writes in vanilla, including which
-// source chunk's decoration stream produced each write.
+// exactly the blocks the lush_caves_clay chain writes in vanilla, including
+// which source chunk's decoration stream produced each write.
+//
+// Note the differential is the whole chain's effect - clay, the water it pools,
+// the patch vegetation on top, and whatever downstream stages did differently
+// because those cells had changed - not the clay writes alone. Judge pool
+// position against the cells the plain capture reports as clay; treat the rest
+// as cascade evidence.
 func TestVanillaLushClayDiff(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_LUSH_CLAY_DIFF")
 	type chunkData struct {
 		states []uint16
 	}

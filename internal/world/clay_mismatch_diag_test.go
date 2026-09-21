@@ -16,6 +16,7 @@ import (
 // a scan-phase error (one-Y-shifted sheets), or hash-order-only differences
 // (same cells, only the vegetation on top differs).
 func TestClayMismatchCoordinates(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_CLAY_MISMATCH_DIAG")
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
 		t.Skip("vanilla block fixture not installed")
