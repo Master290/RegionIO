@@ -887,12 +887,38 @@ cells: (0,1) 58 -> 73, total 330 -> 345, 99.916% -> 99.912%. Reverted; the numbe
 are the reason task 8 must not be closed by tuning the order.
 
 So the remaining clay family is decided by something the per-target region changes
-other than pass order. The candidate left standing is the window itself: a region
-holds ±2 base terrain around the *target*, so a source's patch reads a different
-set of neighbour chunks depending on which target pulled it into existence, and a
-read outside the window returns air (`getBlock` on a nil chunk) - which the scan
-and the exposure test then consume as draws. That is not yet measured, and the
-grouping above does not obviously fit it (chunk (0,1) is out of window for target
-(-1,-1) and in window for target (0,0), yet those two agree). What is measured is
-the useful half: order is not it, the gate is not it, and the divergence happens
-during a single feature's own execution.
+other than pass order. The window was the first candidate - a region holds ±2 base
+terrain around the *target*, and a read outside it returns air (`getBlock` on a nil
+chunk), which the scan and the exposure tests would consume as draws - but the
+grouping does not fit it: chunk (0,1) is out of window for target (-1,-1) and in
+window for target (0,0), and those two agree.
+
+What does fit, exactly and with no counterexample, is whether **source (-1,-1)
+decorated before source (0,0) inside the same region**:
+
+| target | sources before (0,0) | is (-1,-1) among them | source (0,0)'s positions |
+|---|---|---|---|
+| (0,0) | (-1,-1), (0,-1), (1,-1), (-1,0) | yes | (5,-29,12), (5,-30,13) |
+| (-1,-1) | itself, as the centre | yes | (5,-29,12), (5,-30,13), (4,-7,1) |
+| (1,0) | (0,-1), (1,-1), (2,-1) | no - it is outside that 3x3 | (5,-29,12), (2,-41,12) |
+| (0,1) | none, or (-1,0) in the reverted experiment | no | (5,-29,12), (2,-41,12) |
+
+(-1,-1) is a Chebyshev-1 neighbour of (0,0), so its stages 1-3 - lakes, geodes,
+monster rooms - may carve air *inside* (0,0) before (0,0)'s own pass reads it. That
+is the same (b') mechanism as the moss rim, now with a named predecessor and a
+specific cell of influence: (0,0)'s first pool sits at (5,-29,12) and its disc
+reaches the (0,1) anchor columns at z=16..18, y=-36..-31 sloping down with z, so
+whether (0,0) is already carved decides how many columns its first patch accepts,
+which decides how many draws it spends, which decides where its *second* pool
+goes. Group A has (-1,-1) applied; group B does not.
+
+Two consequences, both unfalsified so far. First, this is not reachable by any
+per-target order: for target (0,1), source (-1,-1) is not in the 3x3 whose
+neighbourhood the region loads, and `ensureSourceNeighborhood` *errors* rather than
+generating, so a source two chunks from the centre cannot be replayed at all
+without widening the window. Second, it says what the architecture has to be: one
+shared region per batch, each chunk decorated exactly once, in one global order -
+then every cell has one history and the question "what does source (0,0) place"
+stops having four answers. That is task 8, and the prediction to test when it is
+done is in the table above: a (0,1) built from a region whose (-1,-1) pass ran
+first should recover the (5,-30,13) pool and with it most of those 20 anchors.
