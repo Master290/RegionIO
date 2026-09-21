@@ -60,14 +60,32 @@ func TestProbeLushClayStream(t *testing.T) {
 	targetX, targetZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_TARGET", 0, 0)
 	sourceX, sourceZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_SOURCE", 0, 0)
 	skip := probeSkipSources(t)
-	if abs32(targetX-sourceX) > 1 || abs32(targetZ-sourceZ) > 1 {
-		t.Fatalf("source (%d,%d) is outside the region a (%d,%d) target loads", sourceX, sourceZ, targetX, targetZ)
+	// REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES="x,z[;x,z...]" replays sources from
+	// *outside* the target's 3x3 before the rest, widening the loaded window to
+	// reach them. It exists to test the shared-region prediction directly: the
+	// claim is that a (0,1) built without (-1,-1) and (0,-1) having decorated
+	// loses source (0,0)'s second pool, and that a (0,1) built with them recovers
+	// it. Nothing in the current architecture can express the second case, so
+	// without this knob the claim is untestable before the architecture changes.
+	extra := probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES")
+	var loadRadius int32 = 2
+	if len(extra) > 0 {
+		loadRadius = 3
+	}
+	for _, source := range extra {
+		if abs32(targetX-source[0]) > loadRadius-1 || abs32(targetZ-source[1]) > loadRadius-1 {
+			t.Fatalf("extra source (%d,%d) needs a wider window than radius %d gives",
+				source[0], source[1], loadRadius)
+		}
+	}
+	if abs32(targetX-sourceX) > loadRadius-1 || abs32(targetZ-sourceZ) > loadRadius-1 {
+		t.Fatalf("source (%d,%d) is outside the region a (%d,%d) target decorates", sourceX, sourceZ, targetX, targetZ)
 	}
 
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
-	chunks := make([]*Chunk, 0, 25)
-	for cx := targetX - 2; cx <= targetX+2; cx++ {
-		for cz := targetZ - 2; cz <= targetZ+2; cz++ {
+	chunks := make([]*Chunk, 0, int((2*loadRadius+1)*(2*loadRadius+1)))
+	for cx := targetX - loadRadius; cx <= targetX+loadRadius; cx++ {
+		for cz := targetZ - loadRadius; cz <= targetZ+loadRadius; cz++ {
 			base := generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz)
 			chunks = append(chunks, terrainClone(base))
 		}
@@ -91,7 +109,15 @@ func TestProbeLushClayStream(t *testing.T) {
 	// (state-dependent placement filters drop or move positions), and the point of
 	// this probe is to reproduce production's answer, not to invent one.
 	reachedSource := false
-	for _, source := range decorationSources(targetX, targetZ) {
+	sources := decorationSources(targetX, targetZ)
+	if len(extra) > 0 {
+		lead := make([]decorationSource, 0, len(extra))
+		for _, source := range extra {
+			lead = append(lead, decorationSource{X: source[0], Z: source[1]})
+		}
+		sources = append(lead, sources...)
+	}
+	for _, source := range sources {
 		if skip[[2]int32{source.X, source.Z}] {
 			continue
 		}
@@ -238,6 +264,14 @@ func TestProbeLushClayStream(t *testing.T) {
 		for _, column := range watch {
 			dumpCol("post-pool", column[0], column[1])
 		}
+		// REGIONIO_LUSH_CLAY_PROBE_CLAY_IN="cx,cz[;...]" counts the clay the region
+		// holds in those chunks once the feature has placed. Position agreement is
+		// the necessary check, but the question an architecture change has to
+		// answer is how many of the fixture's anchor cells a build recovers, and
+		// that is a census, not a position.
+		for _, chunk := range probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_CLAY_IN") {
+			logClayCensus(t, r, chunk[0], chunk[1])
+		}
 		return
 	}
 	t.Logf("%s not scheduled for source (%d,%d)", targetFeature, sourceX, sourceZ)
@@ -310,4 +344,30 @@ func probeSkipSources(t *testing.T) map[[2]int32]bool {
 func configFeatureRef(set *worldgen.FeatureSet, placedName string) worldgen.RandomBooleanSelectorConfig {
 	ref, _ := set.RandomBooleanSelector(placedName)
 	return ref
+}
+
+// logClayCensus lists the clay cells one chunk of the region holds, in local
+// column coordinates, so two runs of the probe can be compared cell by cell
+// rather than only by the positions their features chose.
+func logClayCensus(t *testing.T, r *decorationRegion, chunkX, chunkZ int32) {
+	t.Helper()
+	clayID, ok := nameToStateID("minecraft:clay", nil)
+	if !ok {
+		t.Fatal("clay is not in the state table")
+	}
+	var cells []worldgen.FeaturePosition
+	for z := 0; z < 16; z++ {
+		for x := 0; x < 16; x++ {
+			wx, wz := int(chunkX)*16+x, int(chunkZ)*16+z
+			for y := MinY; y < MinY+WorldHeight; y++ {
+				if r.getBlock(wx, y, wz) == clayID {
+					cells = append(cells, worldgen.FeaturePosition{X: wx, Y: y, Z: wz})
+				}
+			}
+		}
+	}
+	t.Logf("CLAY chunk (%d,%d): %d cells", chunkX, chunkZ, len(cells))
+	for _, cell := range cells {
+		t.Logf("CLAY (%d,%d,%d)", cell.X, cell.Y, cell.Z)
+	}
 }

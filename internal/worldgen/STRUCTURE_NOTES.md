@@ -1039,6 +1039,24 @@ The prediction it leaves is correspondingly concrete: replaying (0,0) for a (0,1
 target loses the second pool for the same reason as skipping (-1,-1), and fixing it
 means (0,0) seeing one world with a single history, not a window chosen per target.
 
+That prediction has now been tested, and it holds. `REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES`
+replays sources from outside the target's 3x3 first, widening the loaded window to
+reach them, which is the one thing the production path cannot do. Target (0,1),
+probed source (0,0), census of clay cells in chunk (0,1):
+
+| build | source (0,0)'s pools | clay cells in (0,1) | of the 20 anchors |
+|---|---|---|---|
+| as production does it now | (5,-29,12), (2,-41,12) | 1276 | **0** |
+| (-1,-1) and (0,-1) decorated first | (5,-29,12), (5,-30,13) | 1288 | **12** |
+
+Twelve of the twenty recovered and **nothing lost** - the diff between the two
+censuses is exactly those twelve cells, all of them at x=6..8, z=16..18, y=-33..-36,
+the cluster the (5,-30,13) pool's disc covers. The eight still missing are at
+x=14,15, z=31, the far corner of the chunk, which no pool of source (0,0)'s reaches;
+the probe stops at the probed source by design, so those belong to a later source's
+stage-9 pass that this run deliberately does not replay, and their count is a
+lower bound on the fix rather than its ceiling.
+
 Two consequences. First, this is not reachable by any per-target order: for target
 (0,1), source (-1,-1) is not in the 3x3 whose neighbourhood the region loads, and
 `ensureSourceNeighborhood` *errors* rather than generating, so a source two chunks
@@ -1049,10 +1067,12 @@ content, so `vanillaTerrainCache` and its clones are not leaking decoration betw
 requests, and the parity numbers do not depend on the order a test asks in. What is
 left is the architecture: one shared region per batch, each chunk decorated exactly
 once in one global order - then every cell has one history and "what does source
-(0,0) place" stops having four answers. That is task 8, and the prediction to test
-when it is done is in the first table: a (0,1) built from a region whose south-row
-passes ran first should recover the (5,-30,13) pool and with it most of those 20
-anchors.
+(0,0) place" stops having four answers. That is task 8, and the prediction it was
+going to be judged against is no longer pending: the extra-sources run above is
+that experiment, done on the probe instead of on the generator, and it recovers 12
+of the 20 anchors with no regression. What the production change still has to
+establish is the global order that makes this the only answer rather than one of
+four.
 
 ### The verdict, in one place
 
