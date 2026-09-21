@@ -1053,3 +1053,24 @@ once in one global order - then every cell has one history and "what does source
 when it is done is in the first table: a (0,1) built from a region whose south-row
 passes ran first should recover the (5,-30,13) pool and with it most of those 20
 anchors.
+
+### The verdict, in one place
+
+The clay investigation opened with four candidate causes. Each is now closed by
+measurement rather than elimination, and the ordering matters because three of
+them were never going to yield to reading the patch code harder.
+
+| hypothesis | status | what closed it |
+|---|---|---|
+| (a) wrong `featureIndex` | excluded | the index sweep: exactly one of 41 values reproduces vanilla's pools and it is the one `FeatureSchedule` reports; the per-biome alternative places nothing |
+| (b) cross-feature draw drift | structurally impossible | `SetFeatureSeed` is a full reseed per feature, so one feature's draw count cannot move another's stream |
+| (c) wrong decoration seed | excluded | one `DecorationRandom(seed, cx, cz)` feeds stages 1/2/3/6/9, and those reproduce vanilla across 99.9% of the fixture; a wrong seed breaks the ores first |
+| (d) a modifier's draw count or constant | excluded for this chain | `random_offset` and `environment_scan` both pinned against the disassembly and now under test; neither can be off by one cell |
+| (b') the world state the feature reads | the answer | per-target position table, predecessor-removal table, per-chunk state digest |
+
+The shape worth remembering is that (b') acted through the *draw count of one
+feature's own earlier placement*, not through the scan reading different terrain at
+the candidate. That is why it survived every pass over the patch code: the
+positions are decided by how many columns an earlier pool accepted, and that number
+is decided by neighbours writing into the source's own chunk. Any future
+"the scan must be wrong" instinct should be checked against this table first.
