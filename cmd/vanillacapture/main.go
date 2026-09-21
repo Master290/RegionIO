@@ -391,19 +391,22 @@ func installDisablePlacedDatapack(jar, packsDir, placedName string) error {
 		return err
 	}
 	defer r.Close()
-	readPlaced := func(entries []*zip.File) ([]byte, bool) {
+	readPlaced := func(entries []*zip.File) ([]byte, bool, error) {
 		for _, entry := range entries {
 			if entry.Name == "data/minecraft/worldgen/placed_feature/"+name+".json" {
 				raw, err := readZipEntry(entry)
 				if err != nil {
-					fatal(err)
+					return nil, false, err
 				}
-				return raw, true
+				return raw, true, nil
 			}
 		}
-		return nil, false
+		return nil, false, nil
 	}
-	raw, found := readPlaced(r.File)
+	raw, found, err := readPlaced(r.File)
+	if err != nil {
+		return err
+	}
 	if !found {
 		for _, entry := range r.File {
 			if !strings.HasPrefix(entry.Name, "META-INF/versions/") || !strings.HasSuffix(entry.Name, ".jar") {
@@ -417,8 +420,12 @@ func installDisablePlacedDatapack(jar, packsDir, placedName string) error {
 			if err != nil {
 				return fmt.Errorf("%s: %w", entry.Name, err)
 			}
-			if nestedRaw, ok := readPlaced(nested.File); ok {
-				raw = nestedRaw
+			nestedPlaced, ok, err := readPlaced(nested.File)
+			if err != nil {
+				return err
+			}
+			if ok {
+				raw = nestedPlaced
 				found = true
 				break
 			}
