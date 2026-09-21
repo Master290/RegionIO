@@ -154,7 +154,10 @@ Known gaps, roughly in order of how visible they are:
   configurations. Both stage-1 lava lakes replay from `world/lakes.go` — 26.1.2 has no water-lake
   configured feature left, so `LakeFeature`'s freeze pass never fires. What is still hand-written is
   the surface decoration dispatcher at `world/vanilla.go:569-574`: springs (`springs.go`), trees
-  (`trees.go`), flora, desert features and rocks (`features.go`).
+  (`trees.go`), flora, desert features and rocks (`features.go`). "Hand-written" is not "unused":
+  this is the path the shipping generator takes, reached per chunk from
+  `decorateGeneratedNonOre` at `world/region_generator.go:173` — the region replay and these
+  hand-written features are not alternative implementations of the same surface decoration.
 - **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
   place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
   trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write

@@ -46,4 +46,43 @@ jobs:
         with:
           go-version: '1.26.x'
           cache: true
+      # Deliberately without REGIONIO_REQUIRE_PARITY: exact equality is what
+      # `make parity` demands and the generator does not reach it yet, so this
+      # job is the regression floor (minBlockPercent) and not a red light.
       - run: go test ./internal/world -run TestVanillaBlockParity -count=1 -v
+
+  # The gated diagnostics are where the worldgen gaps get attributed, and a
+  # mode nothing runs rots: the lush-caves probe shipped carrying a private copy
+  # of the stage-9 dispatch that had already silently dropped two feature types.
+  # This mirrors the Makefile's diagnostics target; `make` is not on the runner.
+  diagnostics:
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      # Compile every test binary first - `go build ./...` never touches
+      # _test.go files, which is how the instrumentation broke the tree twice
+      # without any CI job noticing.
+      - run: go test -run TestNothingMatchesThis ./...
+      - env:
+          REGIONIO_CLAY_TRACE: "1"
+          REGIONIO_LUSH_CLAY_PROBE: "1"
+          REGIONIO_CLAY_MISMATCH_DIAG: "1"
+          REGIONIO_ORE_SCHEDULE_DIAGNOSTIC: "1"
+          REGIONIO_MOSS_PATCH_DIAGNOSTIC: "1"
+        run: >-
+          go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual'
+          ./internal/world -count=1
+      - env:
+          REGIONIO_LUSH_CLAY_PROBE: "1"
+          REGIONIO_LUSH_CLAY_PROBE_STATE: "1"
+        run: go test -run TestProbeLushClayStream ./internal/world -count=1
+      - env:
+          REGIONIO_LUSH_CLAY_PROBE: "1"
+          REGIONIO_LUSH_CLAY_PROBE_STATE: "1"
+          REGIONIO_LUSH_CLAY_PROBE_SKIP: "-1,-1"
+          REGIONIO_LUSH_CLAY_COLUMN: "5,13;2,12"
+        run: go test -run TestProbeLushClayStream ./internal/world -count=1
