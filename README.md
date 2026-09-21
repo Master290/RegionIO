@@ -2,7 +2,7 @@
 
 A Minecraft Java Edition server core written in Go, targeting version
 **26.1.2** (protocol **775**). RegionIO implements the connection lifecycle
-(status в†’ login в†’ configuration в†’ play), multiplayer chunk streaming, shared
+(status → login → configuration → play), multiplayer chunk streaming, shared
 block editing, persistent worlds, and an overworld generator built on the real
 `noise_router` `final_density` tree.
 
@@ -24,12 +24,12 @@ block editing, persistent worlds, and an overworld generator built on the real
   vertical anchors/providers, biome filters, and mutable region writes are
   implemented. Production region replay now covers cross-chunk ores, disks,
   underwater magma, stage-2 amethyst geodes, lush-cave moss ground patches,
-  ruined portals, and ocean ruins вЂ” the latter including the post-placement
+  ruined portals, and ocean ruins — the latter including the post-placement
   block-tick physics (falling gravel through water, bubble columns above
-  magma, source-water refill) вЂ” directly from their datapack configurations.
+  magma, source-water refill) — directly from their datapack configurations.
 - **Gameplay**: four-player session registry; player join/leave and movement
   synchronization; chunk-scoped visibility for players and mobs; shared
-  creative block place/break; broadcast chat; and hotbar itemв†’block mapping.
+  creative block place/break; broadcast chat; and hotbar item→block mapping.
 - **Lighting**: stored vanilla nibble arrays for sky and block light; horizontal
   and cross-chunk propagation; incremental updates after edits; persisted
   `SkyLight`/`BlockLight`; load-time border reconciliation; and chunk-scoped
