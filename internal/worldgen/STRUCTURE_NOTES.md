@@ -862,6 +862,25 @@ which is (0,1)'s z-min edge. So vanilla's pool there is a write from source (0,0
 into its neighbour, exactly the cross-chunk case this investigation began with,
 and it is the only unexplained clay left.
 
+The full per-chunk numbers, measured on `generatorVersion` 37 with only the
+`lush_caves_clay` chain removed from the capture - the ratchet's own output, so
+the next person does not have to re-run it to know where the budget sits:
+
+| target | block mismatches | missing | of which clay anchors | extra clay |
+|---|---|---|---|---|
+| (0,0) | 78 | 10 | 0 | 0 |
+| (1,0) | 90 | 14 | 2 | 6 |
+| (0,1) | 58 | 22 | **20** | 0 |
+| (-1,-1) | 104 | 50 | 0 | 3 |
+| total | **330** (99.916%) | 96 | 22 | 9 |
+
+Two things that table says which the totals hide. (0,1) is the only chunk whose
+missing cells are mostly *real* clay rather than cascade - 20 of its 22 - while
+the other three are almost pure cascade, so 74 of the 96 missing cells are the
+moss/vine/water consequence of a pool that moved, not a pool we failed to place.
+And (1,0) is where we place clay vanilla does not (6 of the 9 extra cells), which
+is the opposite failure and will not be fixed by the same change.
+
 Two probes were run against it, and both came back with numbers.
 
 First, `REGIONIO_SETBLOCK_TRACE` on four of those cells. Same source (0,0), same
