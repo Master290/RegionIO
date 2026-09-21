@@ -711,3 +711,53 @@ source's real stage-9 schedule and answer whether our patch, run against
 cause and `decorationSources` is the target - it models only (0,0) and (1,0) and
 every other source falls to an untuned default. If it does not, the defect is in
 the acceptance tests themselves.
+
+## The moss rim is not a world-state problem: what the follow-up probes measured
+
+`TestMossResidualPlacementContext` (`REGIONIO_MOSS_PATCH_DIAGNOSTIC=1`) ran the
+two cheap discriminations first, and both came back negative.
+
+**The terrain the patch scanned is vanilla's terrain.** For each of the 107
+mismatch cells the support cell below and above was compared on both sides, and
+the pair classified rather than merely diffed: a pair where one side is air or a
+plant is our own nested-vegetation cascade, and a pair involving moss is the same
+defect one block away, so neither counts as terrain. **One cell of 107** has a
+solid-versus-solid difference, and it is `clay` where vanilla has `deepslate` at
+(-1,-10,-5) - a known pool edge. 57 cells have identical support, 49 differ only
+in cover. So the scan found the same ground everywhere, and the ordering
+hypothesis has no terrain left to explain the moss with.
+
+**The draw sequence is faithful, line for line in the bytecode.** `place` samples
+`xzRadius` twice (offsets 34-61); the column loop skips corners with no draw
+(141-160: `onEdge`/`isCorner` booleans, `if (corner) continue` before any RNG),
+rolls `nextFloat() <= extraEdgeColumnChance` for edge-only columns and skips with
+no draw when the chance is zero (163-191); then samples `depth` once (348-357)
+and adds the bottom block when `extraBottomBlockChance > 0 && nextFloat() < chance`
+(358-386). `moss_patch`'s configured JSON ships `"depth": 1` and
+`"vertical_range": 5` as **bare integers**, which `IntProvider.CODEC` resolves to
+`ConstantInt` - draw-free - and `"extra_bottom_block_chance": 0.0`, so the only
+per-column draw in the floor variant is the edge roll. Our port matches that
+exactly, including which branches are conditional on the constant.
+
+**A uniform source order is not vanilla's rule, and that is worth recording
+because it is the obvious guess.** Applying the tuned branch (plain Z-major,
+target fifth of nine) to every target instead of only (0,0) and (1,0) leaves
+(0,0) and (1,0) unchanged, as it must, and moves (0,1) from 58 to 73 mismatches
+and (-1,-1) from 122 to 672 - total 99.909% down to 99.765%. The special case is
+therefore load-bearing for the two chunks it does not name, which means the real
+rule is something other than a fixed sweep order. It is also not a
+last-writer-wins effect: the number that swings is the *cascade* count, i.e.
+which features saw which air when they scanned.
+
+What is left, then, is the reach of a write rather than its timing. Our
+`decorationRegion.setBlock` gate is chunk-granular (`abs32(cx-sourceX) > 1`), so
+a patch centred near a source's edge can put a disc up to eight blocks into the
+neighbour; the per-chunk split is asymmetric in a way that deserves a name -
+(0,0) places 21 cells vanilla does not and misses 6, while the other three
+chunks are miss-heavy (18/10, 14/1, 33/4) and 44 of the 71 misses sit at chunk-edge
+distance <= 1 against 46% of agreed moss. So the next probe is the write gate
+itself: what 26.1.2 actually permits a placed feature to write outside its
+origin chunk, and whether a cell beyond that reach is dropped rather than
+deferred. `Biome` has no `decorate` method in this version and no
+`FeatheredBlockAccess` class exists in the jar, so this has to be read out of
+`ChunkGenerator` and whatever replaced the coordinator; it cannot be recalled.

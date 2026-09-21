@@ -23,10 +23,37 @@ type mossResidual struct {
 	ourMoss     [][3]int
 	agreed      [][3]int
 	clay        [][3]int
+
+	// Both full grids, so a probe can read the support cell under a mismatch
+	// rather than only the mismatch itself.
+	capture   fixtureCapture
+	ourChunks map[[2]int32]*Chunk
+}
+
+// vanillaAt reads a captured state at absolute coordinates. The fixture holds
+// four non-contiguous chunks, so a cell outside them is reported as missing
+// rather than as air: a probe must not mistake "not captured" for "empty".
+func (m mossResidual) vanillaAt(x, y, z int) (uint16, bool) {
+	for _, ch := range m.capture.chunks {
+		if int(ch.cx) == x>>4 && int(ch.cz) == z>>4 {
+			return ch.at(x&15, y, z&15), true
+		}
+	}
+	return 0, false
+}
+
+func (m mossResidual) ourAt(x, y, z int) (uint16, bool) {
+	chunk, ok := m.ourChunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
+	if !ok {
+		return 0, false
+	}
+	return chunk.GetBlock(x&15, y, z&15), true
 }
 
 func collectMossResidual(capture fixtureCapture, gen Generator, mossID, clayID uint16) mossResidual {
 	var out mossResidual
+	out.capture = capture
+	out.ourChunks = make(map[[2]int32]*Chunk, len(capture.chunks))
 	ours := make(map[[3]int]bool)
 	for _, ch := range capture.chunks {
 		for y := MinY; y < MinY+WorldHeight; y++ {
@@ -45,6 +72,7 @@ func collectMossResidual(capture fixtureCapture, gen Generator, mossID, clayID u
 	}
 	for _, ch := range capture.chunks {
 		chunk := gen(ch.cx, ch.cz)
+		out.ourChunks[[2]int32{ch.cx, ch.cz}] = chunk
 		for y := MinY; y < MinY+WorldHeight; y++ {
 			for z := 0; z < 16; z++ {
 				for x := 0; x < 16; x++ {
@@ -451,4 +479,142 @@ func abs3(v int) int {
 		return -v
 	}
 	return v
+}
+
+// TestMossResidualPlacementContext separates the two explanations the shape and
+// distance tables cannot: a rim cell whose support block is the same on both
+// sides was decided by a roll or a write gate, while a rim cell whose support
+// differs was decided by terrain that diverged before the patch ran. It also
+// breaks the residual down by target chunk, because decorationSources tunes the
+// source order for (0,0) and (1,0) only — if the misses concentrate in the two
+// chunks running the untuned branch, the ordering is the cause and no amount of
+// patch-code reading will find it.
+func TestMossResidualPlacementContext(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_MOSS_PATCH_DIAGNOSTIC")
+
+	capture := readFixtureCapture(t, vanillaParityFixture)
+	gen := NewVanillaRegionGenerator(capture.seed)
+	mossID, clayID := mossStateIDs(t)
+	res := collectMossResidual(capture, gen, mossID, clayID)
+
+	type perChunk struct{ vanilla, ours, agreed, missed, extra, edgeMissed int }
+	byChunk := make(map[[2]int32]*perChunk, len(capture.chunks))
+	for _, ch := range capture.chunks {
+		byChunk[[2]int32{ch.cx, ch.cz}] = &perChunk{}
+	}
+	for _, p := range res.vanillaMoss {
+		byChunk[[2]int32{int32(p[0] >> 4), int32(p[2] >> 4)}].vanilla++
+	}
+	for _, p := range res.ourMoss {
+		byChunk[[2]int32{int32(p[0] >> 4), int32(p[2] >> 4)}].ours++
+	}
+	for _, p := range res.agreed {
+		byChunk[[2]int32{int32(p[0] >> 4), int32(p[2] >> 4)}].agreed++
+	}
+	edge := make([]int, 8)
+	edgeAgreed := make([]int, 8)
+	missedTotal := 0
+	supportKind := make(map[mossResidualCell]string, len(res.cells))
+	terrainPairs := make(map[[2]string]int)
+	var examples []string
+	for _, c := range res.cells {
+		cell := byChunk[[2]int32{int32(c.x >> 4), int32(c.z >> 4)}]
+		d := chunkEdgeDistance(c.x, c.z)
+		if c.vanilla == mossID {
+			cell.missed++
+			missedTotal++
+			edge[d]++
+		} else {
+			cell.extra++
+		}
+		if c.vanilla == mossID && d <= 1 {
+			cell.edgeMissed++
+		}
+		// A floor patch rests on the cell below and a ceiling patch on the one
+		// above, so both are compared. The pair is classified rather than just
+		// diffed: a difference where one side is air or a plant is our own
+		// cascade (the nested vegetation we placed and vanilla did not), which
+		// says nothing about the terrain the patch scanned. Only a solid-versus-
+		// solid difference is a pre-existing terrain divergence, and only that
+		// would implicate the decoration source order.
+		for dy := -1; dy <= 1; dy += 2 {
+			ours, okOurs := res.ourAt(c.x, c.y+dy, c.z)
+			want, okWant := res.vanillaAt(c.x, c.y+dy, c.z)
+			// Moss in a support cell is the same defect one block away, not
+			// independent terrain: counting it as a difference would make every
+			// rim cell look like a divergence.
+			if !okOurs || !okWant || ours == want || ours == mossID || want == mossID {
+				continue
+			}
+			kind := "cover"
+			if isSolidState(ours) && isSolidState(want) {
+				kind = "terrain"
+				terrainPairs[[2]string{stateLabel(ours), stateLabel(want)}]++
+				if len(examples) < 12 {
+					examples = append(examples, fmt.Sprintf("(%d,%d,%d) y%+d: ours %s, vanilla %s",
+						c.x, c.y, c.z, dy, stateLabel(ours), stateLabel(want)))
+				}
+			}
+			if supportKind[c] == "" {
+				supportKind[c] = kind
+			}
+		}
+	}
+	terrain, cover, identical := 0, 0, 0
+	for _, c := range res.cells {
+		switch supportKind[c] {
+		case "terrain":
+			terrain++
+		case "cover":
+			cover++
+		default:
+			identical++
+		}
+	}
+	t.Logf("per target chunk, and which decorationSources branch it runs")
+	t.Logf("%-10s %-8s %8s %8s %8s %8s %8s %8s", "chunk", "sources", "vanilla", "ours", "agree", "missed", "extra", "miss@d<=1")
+	for _, ch := range capture.chunks {
+		key := [2]int32{ch.cx, ch.cz}
+		s := byChunk[key]
+		order := "default (target-first)"
+		if (key[0] == 0 && key[1] == 0) || (key[0] == 1 && key[1] == 0) {
+			order = "tuned (Z-major)"
+		}
+		t.Logf("%-10s %-8s %8d %8d %8d %8d %8d %8d",
+			fmt.Sprintf("(%d,%d)", key[0], key[1]), order,
+			s.vanilla, s.ours, s.agreed, s.missed, s.extra, s.edgeMissed)
+	}
+	t.Logf("missed cells by distance to the edge of their own chunk (0 = on the boundary column)")
+	t.Logf("%-10s %8s", "edge dist", "missed")
+	for d := 0; d < 8; d++ {
+		t.Logf("%-10d %8d", d, edge[d])
+	}
+	for _, p := range res.agreed {
+		edgeAgreed[chunkEdgeDistance(p[0], p[2])]++
+	}
+	t.Logf("control: agreed moss cells, same histogram, as a share of each set")
+	for d := 0; d < 8; d++ {
+		share := 0.0
+		if len(res.agreed) > 0 {
+			share = 100 * float64(edgeAgreed[d]) / float64(len(res.agreed))
+		}
+		missedShare := 0.0
+		if missedTotal > 0 {
+			missedShare = 100 * float64(edge[d]) / float64(missedTotal)
+		}
+		t.Logf("edge %-2d  missed %5.1f%%   agreed %5.1f%%", d, missedShare, share)
+	}
+	t.Logf("support test: of %d mismatch cells, %d have a solid-versus-solid terrain difference below or above, %d differ only in air or plants (our own cascade), %d have identical support",
+		len(res.cells), terrain, cover, identical)
+	for pair, n := range terrainPairs {
+		t.Logf("    terrain pair %s where vanilla has %s: %d", pair[0], pair[1], n)
+	}
+	for _, e := range examples {
+		t.Logf("    %s", e)
+	}
+}
+
+func chunkEdgeDistance(x, z int) int {
+	bx, bz := x&15, z&15
+	return min(min(bx, 15-bx), min(bz, 15-bz))
 }
