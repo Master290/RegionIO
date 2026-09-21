@@ -842,3 +842,57 @@ seed 12345, 99.909% -> 99.916%, `generatorVersion` 36 -> 37. Pool roll order is
 not a cosmetic detail: with ~30 water cells over a 64-slot table, ties are the
 normal case, and every draw after the first collision belongs to a different
 cell than it did for vanilla.
+
+### The last 22 clay anchors are not an ordering problem either
+
+`TestVanillaLushClayDiff` is now permanent (`d0b33ed`), with the budget
+`missing=96 / clay anchors=22 / extra clay=9` as a ratchet rather than an env-gated
+printf. Splitting the 96 into anchors (the plain capture itself reports clay) and
+cascade cells relocates the whole question: the anchors are 0 in (0,0), 0 in
+(-1,-1), 2 in (1,0) and **20 in (0,1)** - at columns x=5..8, z=16..18, y=-36..-31,
+which is (0,1)'s z-min edge. So vanilla's pool there is a write from source (0,0)
+into its neighbour, exactly the cross-chunk case this investigation began with,
+and it is the only unexplained clay left.
+
+Two probes were run against it, and both came back with numbers.
+
+First, `REGIONIO_SETBLOCK_TRACE` on four of those cells. Same source (0,0), same
+seed, same reseeded stream - yet `setBlock` is *called* for all four when the
+target being generated is (0,0) or (-1,-1), and for two of them when the target is
+(1,0) or (0,1). Nothing is rejected by the ±1-chunk gate or by an unloaded chunk;
+the calls simply are not made. Widening it, `REGIONIO_LUSH_CLAY_TRACE` prints the
+positions the `random_boolean_selector` step hands to `clay_with_dripleaves`:
+
+| target being generated | source (0,0)'s `lush_caves_clay` positions |
+|---|---|
+| (0,0) | (5,-29,12), (5,-30,13) |
+| (-1,-1) | (5,-29,12), (5,-30,13), (4,-7,1) |
+| (1,0) | (5,-29,12), (2,-41,12) |
+| (0,1) | (5,-29,12), (2,-41,12) |
+
+The first position agrees everywhere, so the reseed and the index agree; the
+stream diverges *inside* the feature. That is the mechanism the moss section
+already named - `depth` is sampled only for accepted columns and
+`distributeVegetation` rolls per accepted column - so a state difference mid-patch
+moves every later position of that same feature. It also means our model has no
+single answer for what source (0,0) places: the answer depends on which chunk
+happens to be the centre of the region we are building.
+
+Second, the ordering hypothesis that follows from that - the centre decorating
+before its neighbours scrambles the neighbour's stream - was tested directly and
+failed. Adding (0,1) to `decorationSources`' scanline branch, so source (0,0) runs
+*before* the centre instead of after it, leaves the position table byte-identical
+((5,-29,12), (2,-41,12)), leaves the anchors at exactly 20, and costs 15 parity
+cells: (0,1) 58 -> 73, total 330 -> 345, 99.916% -> 99.912%. Reverted; the numbers
+are the reason task 8 must not be closed by tuning the order.
+
+So the remaining clay family is decided by something the per-target region changes
+other than pass order. The candidate left standing is the window itself: a region
+holds ±2 base terrain around the *target*, so a source's patch reads a different
+set of neighbour chunks depending on which target pulled it into existence, and a
+read outside the window returns air (`getBlock` on a nil chunk) - which the scan
+and the exposure test then consume as draws. That is not yet measured, and the
+grouping above does not obviously fit it (chunk (0,1) is out of window for target
+(-1,-1) and in window for target (0,0), yet those two agree). What is measured is
+the useful half: order is not it, the gate is not it, and the divergence happens
+during a single feature's own execution.
