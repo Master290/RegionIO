@@ -596,6 +596,18 @@ the root cause to fix first):
   pins both halves. The ~300-cell moss ground divergence is somewhere in this
   chain or in the patch column scan; it survives with vegetation disabled, so it
   is upstream of the vegetation.
+- `environment_scan` is faithful too, and this is now tested rather than assumed
+  (`TestEnvironmentScanMatchesVanillaControlFlow`, which the disassembly of
+  `EnvironmentScanPlacement.getPositions` was read against). Two parts of it are
+  easy to get wrong and were checked specifically. The final target test is
+  reached from *both* loop exits - running out of steps and failing the allowed
+  condition - so the scan inspects `maxSteps + 1` cells and a floor exactly
+  `maxSteps` below the start is still found. And a cell that is neither the
+  allowed kind nor the target kind aborts the descent: for the lush-cave chain,
+  whose allowed condition is the `minecraft:air` tag and whose target is `solid`,
+  water stops the scan rather than being stepped over, so nothing below that
+  water is ever considered. That closes the last reading of hypothesis (d) for
+  this chain - neither offset nor scan can be off by a cell.
 
 ## Ruined portal netherrack spread (decoded; reseed parameters unresolved)
 

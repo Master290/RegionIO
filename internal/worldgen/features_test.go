@@ -2,6 +2,7 @@ package worldgen
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"testing"
@@ -456,6 +457,150 @@ func TestPlacementRandomOffsetConstantShiftsAndDrawsNothing(t *testing.T) {
 					tc.name, i, got[i], want, tc.yOffset)
 			}
 		}
+	}
+}
+
+// TestEnvironmentScanMatchesVanillaControlFlow pins the scan's control flow,
+// which had no test at all. Derived from the 26.1.2 disassembly of
+// EnvironmentScanPlacement.getPositions, whose order is not the obvious one:
+//
+//	12  allowed.test(cursor)                     // at the START position
+//	25  if false -> return empty
+//	39  for (i = 0; i < maxSteps; i++)
+//	48    target.test(cursor)                    // the start position is tested
+//	61    if true  -> return cursor
+//	70    cursor.move(direction)
+//	87    isOutsideBuildHeight(cursor.y) -> empty
+//	103   allowed.test(cursor)
+//	116   if false -> goto 128                   // leaves the loop, does NOT return
+//	128 target.test(cursor)                      // one final test, on the cell the
+//	141 if true -> return cursor                 //   allowed test just rejected
+//	150 return empty
+//
+// Two consequences the port has to keep. The last cell examined is one more than
+// maxSteps moves, so a floor exactly maxSteps steps away is still found (128 is
+// reached by exhaustion as well as by a failed allowed test). And a descent that
+// meets a cell which is neither the allowed kind nor the target kind - water in a
+// cave path whose allowed condition is "air" - aborts with no position rather than
+// stepping over it, so the feature below that water is never seen.
+//
+// The BlockPredicate callback below is a stand-in over three column kinds - air,
+// stone, water - and is not a claim about what vanilla's minecraft:air tag
+// contains. Under test is the scan's control flow, which the disassembly fixes.
+func TestEnvironmentScanMatchesVanillaControlFlow(t *testing.T) {
+	const (
+		scanMinY = -64
+		scanHgt  = 384
+	)
+	// air fills [lo, hi] inclusive with the air block; the map is keyed by absolute Y.
+	air := func(lo, hi int) map[int]string {
+		column := map[int]string{}
+		for y := lo; y <= hi; y++ {
+			column[y] = "air"
+		}
+		return column
+	}
+	withBlocks := func(column map[int]string, ys ...int) map[int]string {
+		for _, y := range ys {
+			column[y] = "stone"
+		}
+		return column
+	}
+	scan := func(t *testing.T, column map[int]string, startY, maxSteps int) []FeaturePosition {
+		t.Helper()
+		var modifier PlacementModifier
+		raw := json.RawMessage(fmt.Sprintf(
+			`{"type":"minecraft:environment_scan","direction_of_search":"down","max_steps":%d,`+
+				`"target_condition":{"type":"minecraft:solid"},`+
+				`"allowed_search_condition":{"type":"minecraft:matching_block_tag","tag":"minecraft:air"}}`, maxSteps))
+		modifier.Raw = raw
+		if err := json.Unmarshal(raw, &modifier); err != nil {
+			t.Fatal(err)
+		}
+		set := &FeatureSet{Placed: map[string]PlacedFeature{"test": {Placement: []PlacementModifier{modifier}}}}
+		got, err := set.PlacementPositions("test", NewLegacy(1), FeaturePosition{X: 3, Y: startY, Z: 5},
+			PlacementContext{MinY: scanMinY, Height: scanHgt, BlockPredicate: func(predicate json.RawMessage, position FeaturePosition) (bool, error) {
+				var value struct {
+					Type string `json:"type"`
+				}
+				if err := json.Unmarshal(predicate, &value); err != nil {
+					return false, err
+				}
+				switch value.Type {
+				case "minecraft:solid":
+					return column[int(position.Y)] == "stone", nil
+				case "minecraft:matching_block_tag":
+					return column[int(position.Y)] == "air", nil
+				}
+				return false, fmt.Errorf("unexpected predicate %s", value.Type)
+			}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	for _, tc := range []struct {
+		name     string
+		column   map[int]string
+		startY   int
+		maxSteps int
+		want     []FeaturePosition
+	}{
+		{
+			name:     "a start position that fails the allowed condition yields nothing at all",
+			column:   map[int]string{0: "stone"},
+			startY:   0, maxSteps: 12,
+			want: nil,
+		},
+		{
+			name:     "descends through air to the first solid cell",
+			column:   withBlocks(air(-10, 0), -2),
+			startY: 0, maxSteps: 12,
+			want: []FeaturePosition{{3, -2, 5}},
+		},
+		{
+			name: "a floor exactly maxSteps cells away is still found, because the loop " +
+				"exits into the same final target test a failed allowed test does",
+			column:   withBlocks(air(-10, 0), -3),
+			startY: 0, maxSteps: 3,
+			want: []FeaturePosition{{3, -3, 5}},
+		},
+		{
+			name: "water is neither allowed nor the target, so the scan aborts on it and " +
+				"never sees the solid below",
+			column: func() map[int]string {
+				column := withBlocks(air(-10, 0), -3)
+				column[-2] = "water"
+				return column
+			}(),
+			startY: 0, maxSteps: 12,
+			want: nil,
+		},
+		{
+			name:     "running out of steps with no match yields nothing",
+			column:   air(-40, 0),
+			startY: 0, maxSteps: 3,
+			want: nil,
+		},
+		{
+			name:     "stepping below the build floor yields nothing",
+			column:   air(scanMinY, 0),
+			startY:   scanMinY,
+			maxSteps: 5,
+			want:     nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scan(t, tc.column, tc.startY, tc.maxSteps)
+			if len(got) != len(tc.want) {
+				t.Fatalf("scan returned %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("scan returned %v, want %v", got, tc.want)
+				}
+			}
+		})
 	}
 }
 
