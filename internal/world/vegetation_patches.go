@@ -380,14 +380,17 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 		initVegetationWater()
 		// WaterloggedVegetationPatchFeature.placeGroundPatch: enclosed ground
 		// cells become water and the returned (vegetation-rolled) set is the
-		// water cells. Exposure is evaluated after the whole ground pass.
+		// water cells. Exposure is evaluated after the whole ground pass, in
+		// the ground HashSet's own iteration order - which therefore, not the
+		// column order, is the water set's insertion order, and insertion
+		// order decides within-bucket ties when the roll iterates it.
 		var waterCells [][3]int
-		for _, g := range patchSet {
+		for _, g := range javaHashSetOrder(patchSet) {
 			if !r.patchColumnExposed(g) {
 				waterCells = append(waterCells, g)
 			}
 		}
-		for _, g := range waterCells {
+		for _, g := range javaHashSetOrder(waterCells) {
 			r.setBlock(g[0], g[1], g[2], vegetationWaterID)
 		}
 		patchSet = waterCells
@@ -464,10 +467,13 @@ func initVegetationWater() {
 
 // patchColumnExposed mirrors WaterloggedVegetationPatchFeature.isExposed: the
 // position is exposed when any of the four horizontal neighbours or the block
-// below does not present a sturdy face toward it.
+// below does not present a sturdy face toward it. isExposedDirection calls
+// BlockState::isFaceSturdy, the same predicate the ground acceptance test
+// above uses; blocksMotion ("full solid") is a different set - farmland,
+// sculk sensors and spawners block motion without bounding a face.
 func (r *decorationRegion) patchColumnExposed(g [3]int) bool {
 	for _, d := range [5][3]int{{0, 0, -1}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}, {0, -1, 0}} {
-		if !fullSolidState(r.getBlock(g[0]+d[0], g[1]+d[1], g[2]+d[2])) {
+		if !isFaceSturdy(r.getBlock(g[0]+d[0], g[1]+d[1], g[2]+d[2])) {
 			return true
 		}
 	}
