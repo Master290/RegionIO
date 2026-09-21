@@ -24,125 +24,141 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
 	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
 	for _, scheduled := range schedule {
-		placed, ok := set.Placed[scheduled.Name]
-		if !ok {
-			continue
+		if err := r.placeScheduledVegetationFeature(set, random, scheduled, origin, decorationSeed); err != nil {
+			return err
 		}
-		configured, ok := set.Configured[placed.Feature]
-		if !ok {
-			continue
+	}
+	return nil
+}
+
+// placeScheduledVegetationFeature replays one scheduled stage-9 feature against
+// the region's current source. It is the loop body of
+// placeScheduledVegetationPatches, split out so a probe can walk a source's real
+// schedule up to a chosen feature: the whole-schedule function has no
+// interception point, and a replica of the dispatcher drifts from production. An
+// earlier replica in lush_clay_probe_test.go handled six of the eight configured
+// types here and silently dropped minecraft:kelp and minecraft:seagrass - both of
+// which consume draws - so it had diverged from the stream before reaching
+// lush_caves_clay while still reporting what the stream "really" did.
+func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.FeatureSet, random *worldgen.WorldgenRandom, scheduled worldgen.ScheduledFeature, origin worldgen.FeaturePosition, decorationSeed int64) error {
+	placed, ok := set.Placed[scheduled.Name]
+	if !ok {
+		return nil
+	}
+	configured, ok := set.Configured[placed.Feature]
+	if !ok {
+		return nil
+	}
+	random.SetFeatureSeed(decorationSeed, scheduled.Index, vegetationStage)
+	context := r.placementContext(func(position worldgen.FeaturePosition) bool {
+		return r.biomeAllowsFeature(set, scheduled.Name, vegetationStage, position)
+	})
+	switch configured.Type {
+	case "minecraft:vegetation_patch":
+		config, err := set.VegetationPatch(placed.Feature)
+		if err != nil {
+			return err
 		}
-		random.SetFeatureSeed(decorationSeed, scheduled.Index, vegetationStage)
-		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
-			return r.biomeAllowsFeature(set, scheduled.Name, vegetationStage, position)
-		})
-		switch configured.Type {
-		case "minecraft:vegetation_patch":
-			config, err := set.VegetationPatch(placed.Feature)
-			if err != nil {
-				return err
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeVegetationPatch(random, position, config, set, false)
+			if lushClayTrace() {
+				fmt.Printf("VGPATCH src=(%d,%d) feature=%s idx=%d pos=(%d,%d,%d) ground=%s\n",
+					r.sourceX, r.sourceZ, scheduled.Name, scheduled.Index, position.X, position.Y, position.Z, config.Ground.Name)
 			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeVegetationPatch(random, position, config, set, false)
-				if lushClayTrace() {
-					fmt.Printf("VGPATCH src=(%d,%d) feature=%s idx=%d pos=(%d,%d,%d) ground=%s\n",
-						r.sourceX, r.sourceZ, scheduled.Name, scheduled.Index, position.X, position.Y, position.Z, config.Ground.Name)
-				}
-				return nil
-			}); err != nil {
-				return err
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:waterlogged_vegetation_patch":
+		config, err := set.VegetationPatch(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeVegetationPatch(random, position, config, set, true)
+			if lushClayTrace() {
+				fmt.Printf("VGPATCH src=(%d,%d) feature=%s idx=%d pos=(%d,%d,%d) ground=%s waterlogged\n",
+					r.sourceX, r.sourceZ, scheduled.Name, scheduled.Index, position.X, position.Y, position.Z, config.Ground.Name)
 			}
-		case "minecraft:waterlogged_vegetation_patch":
-			config, err := set.VegetationPatch(placed.Feature)
-			if err != nil {
-				return err
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:random_boolean_selector":
+		config, err := set.RandomBooleanSelector(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			ref := config.FeatureFalse
+			if random.NextBoolean() {
+				ref = config.FeatureTrue
 			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeVegetationPatch(random, position, config, set, true)
-				if lushClayTrace() {
-					fmt.Printf("VGPATCH src=(%d,%d) feature=%s idx=%d pos=(%d,%d,%d) ground=%s waterlogged\n",
-						r.sourceX, r.sourceZ, scheduled.Name, scheduled.Index, position.X, position.Y, position.Z, config.Ground.Name)
-				}
-				return nil
-			}); err != nil {
-				return err
-			}
-		case "minecraft:random_boolean_selector":
-			config, err := set.RandomBooleanSelector(placed.Feature)
-			if err != nil {
-				return err
-			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				ref := config.FeatureFalse
-				if random.NextBoolean() {
-					ref = config.FeatureTrue
-				}
-				if lushClayTrace() && scheduled.Name == "minecraft:lush_caves_clay" {
-					fmt.Printf("LUSHCLAY src=(%d,%d) pos=(%d,%d,%d) ref=%s\n",
-						r.sourceX, r.sourceZ, position.X, position.Y, position.Z, ref.Name)
-					if traceLushClayColumn(position.X, position.Z) {
-						for y := position.Y; y >= MinY; y-- {
-							fmt.Printf("  LUSHCLAY col (%d,*,%d) y=%d: %s\n",
-								position.X, position.Z, y, stateLabel(r.getBlock(position.X, y, position.Z)))
-						}
+			if lushClayTrace() && scheduled.Name == "minecraft:lush_caves_clay" {
+				fmt.Printf("LUSHCLAY src=(%d,%d) pos=(%d,%d,%d) ref=%s\n",
+					r.sourceX, r.sourceZ, position.X, position.Y, position.Z, ref.Name)
+				if traceLushClayColumn(position.X, position.Z) {
+					for y := position.Y; y >= MinY; y-- {
+						fmt.Printf("  LUSHCLAY col (%d,*,%d) y=%d: %s\n",
+							position.X, position.Z, y, stateLabel(r.getBlock(position.X, y, position.Z)))
 					}
 				}
-				r.placeFeatureRef(random, position, ref, set)
-				return nil
-			}); err != nil {
-				return err
 			}
-		case "minecraft:block_column":
-			config, err := set.BlockColumn(placed.Feature)
-			if err != nil {
-				return err
-			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeBlockColumn(random, position, config, set)
-				return nil
-			}); err != nil {
-				return err
-			}
-		case "minecraft:simple_random_selector":
-			config, err := set.SimpleRandomSelector(placed.Feature)
-			if err != nil {
-				return err
-			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeSimpleRandomSelector(random, position, config, set)
-				return nil
-			}); err != nil {
-				return err
-			}
-		case "minecraft:kelp":
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeKelp(random, position, set)
-				return nil
-			}); err != nil {
-				return err
-			}
-		case "minecraft:seagrass":
-			config, err := set.Probability(placed.Feature)
-			if err != nil {
-				return err
-			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeSeagrass(random, position, config.Probability, set)
-				return nil
-			}); err != nil {
-				return err
-			}
-		case "minecraft:simple_block":
-			config, err := set.SimpleBlock(placed.Feature)
-			if err != nil {
-				continue
-			}
-			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-				r.placeSimpleBlockFeature(random, position, config, set)
-				return nil
-			}); err != nil {
-				return err
-			}
+			r.placeFeatureRef(random, position, ref, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:block_column":
+		config, err := set.BlockColumn(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeBlockColumn(random, position, config, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:simple_random_selector":
+		config, err := set.SimpleRandomSelector(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeSimpleRandomSelector(random, position, config, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:kelp":
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeKelp(random, position, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:seagrass":
+		config, err := set.Probability(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeSeagrass(random, position, config.Probability, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:simple_block":
+		config, err := set.SimpleBlock(placed.Feature)
+		if err != nil {
+			return nil
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeSimpleBlockFeature(random, position, config, set)
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

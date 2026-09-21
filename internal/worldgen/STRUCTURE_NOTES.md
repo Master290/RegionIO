@@ -893,32 +893,77 @@ chunk), which the scan and the exposure tests would consume as draws - but the
 grouping does not fit it: chunk (0,1) is out of window for target (-1,-1) and in
 window for target (0,0), and those two agree.
 
-What does fit, exactly and with no counterexample, is whether **source (-1,-1)
-decorated before source (0,0) inside the same region**:
+What fits that table with no counterexample is **whether the sources on (0,0)'s
+south side had already decorated in the same region**:
 
-| target | sources before (0,0) | is (-1,-1) among them | source (0,0)'s positions |
-|---|---|---|---|
-| (0,0) | (-1,-1), (0,-1), (1,-1), (-1,0) | yes | (5,-29,12), (5,-30,13) |
-| (-1,-1) | itself, as the centre | yes | (5,-29,12), (5,-30,13), (4,-7,1) |
-| (1,0) | (0,-1), (1,-1), (2,-1) | no - it is outside that 3x3 | (5,-29,12), (2,-41,12) |
-| (0,1) | none, or (-1,0) in the reverted experiment | no | (5,-29,12), (2,-41,12) |
+| target | sources before (0,0) | source (0,0)'s positions |
+|---|---|---|
+| (0,0) | (-1,-1), (0,-1), (1,-1), (-1,0) | (5,-29,12), (5,-30,13) |
+| (-1,-1) | itself, as the centre | (5,-29,12), (5,-30,13), (4,-7,1) |
+| (1,0) | (0,-1), (1,-1), (2,-1) | (5,-29,12), (2,-41,12) |
+| (0,1) | none, or (-1,0) in the reverted experiment | (5,-29,12), (2,-41,12) |
 
-(-1,-1) is a Chebyshev-1 neighbour of (0,0), so its stages 1-3 - lakes, geodes,
-monster rooms - may carve air *inside* (0,0) before (0,0)'s own pass reads it. That
-is the same (b') mechanism as the moss rim, now with a named predecessor and a
-specific cell of influence: (0,0)'s first pool sits at (5,-29,12) and its disc
-reaches the (0,1) anchor columns at z=16..18, y=-36..-31 sloping down with z, so
-whether (0,0) is already carved decides how many columns its first patch accepts,
-which decides how many draws it spends, which decides where its *second* pool
-goes. Group A has (-1,-1) applied; group B does not.
+That started as a correlation and is now a measured cause. `TestProbeLushClayStream`
+shares the production dispatch through `placeScheduledVegetationFeature` (it had a
+private copy of the switch, which is how it silently dropped `minecraft:kelp` and
+`minecraft:seagrass` and every error), and once shared it reproduces the
+generator's positions for all four targets byte for byte - in 1.3s instead of 8.7s
+and with no fixture. That makes removal possible, and removal is the difference
+between naming a correlation and naming a cause. For target (0,0), probed source
+(0,0), each predecessor's *whole* contribution removed:
 
-Two consequences, both unfalsified so far. First, this is not reachable by any
-per-target order: for target (0,1), source (-1,-1) is not in the 3x3 whose
-neighbourhood the region loads, and `ensureSourceNeighborhood` *errors* rather than
-generating, so a source two chunks from the centre cannot be replayed at all
-without widening the window. Second, it says what the architecture has to be: one
-shared region per batch, each chunk decorated exactly once, in one global order -
-then every cell has one history and the question "what does source (0,0) place"
-stops having four answers. That is task 8, and the prediction to test when it is
-done is in the table above: a (0,1) built from a region whose (-1,-1) pass ran
-first should recover the (5,-30,13) pool and with it most of those 20 anchors.
+| predecessor removed | source (0,0)'s positions |
+|---|---|
+| none | (5,-29,12), (5,-30,13) |
+| (-1,-1) | (5,-29,12), **(2,-41,12)** |
+| (0,-1) | (5,-29,12), **(2,-41,12)** |
+| (1,-1) | (5,-29,12), (5,-30,13) |
+| (-1,0) | (5,-29,12), (5,-30,13) |
+| (1,0) | (5,-29,12), (5,-30,13) |
+| (-1,-1) and (0,-1) | (5,-29,12), (2,-41,12) |
+
+So it is not (-1,-1) in particular. The two south-west sources are jointly
+required and individually required: the second pool sits at (5,-30,13) only when
+*both* have decorated, and losing either one moves it to (2,-41,12) - losing both
+moves it no further than losing one. The west, north-west and east neighbours are
+irrelevant on their own. That reading was re-measured after the seam landed, and
+the "removing both leaves the feature placing nothing" row that stood here before
+was wrong: with a working multi-entry skip list the result is the same two
+positions, (5,-29,12) and (2,-41,12).
+
+What the move is *not* is now measured too. Dumping both candidate columns - (5,*,13),
+chosen only when both neighbours ran, and (2,*,12), chosen when either is missing -
+at the moment the clay feature starts, the two runs are **byte-identical** at both
+columns. So the second pool was not displaced because its floor was at a different
+height. Between the two positions the only code that runs is the first pool's own
+placement, and `x`/`z` of a candidate come straight off the draw stream, so
+different `x`/`z` means the first pool spent a different number of draws. That is
+the depth-per-accepted-column and roll-per-accepted-column coupling the moss section
+already named, applied one feature to itself: (0,0)'s first pool at (5,-29,12) has a
+disc whose accepted columns are decided by the cave state inside (0,0) - and sources
+(-1,-1) and (0,-1) are entitled to write inside (0,0), because the feature write
+radius is one chunk - so their absence changes how many columns that disc accepts,
+hence how many draws it spends, hence where the second pool lands.
+
+This is the same (b') mechanism as the moss rim, with the geography and the
+consumer both named: the state that matters is not "what the scan walks over at the
+candidate" but "what the first pool's footprint touches", and the neighbours that
+matter are exactly the two whose Chebyshev-1 write window covers (0,0)'s south-west.
+The prediction it leaves is correspondingly concrete: replaying (0,0) for a (0,1)
+target loses the second pool for the same reason as skipping (-1,-1), and fixing it
+means (0,0) seeing one world with a single history, not a window chosen per target.
+
+Two consequences. First, this is not reachable by any per-target order: for target
+(0,1), source (-1,-1) is not in the 3x3 whose neighbourhood the region loads, and
+`ensureSourceNeighborhood` *errors* rather than generating, so a source two chunks
+from the centre cannot be replayed at all without widening the window. Second, the
+effect is entirely within one region: `TestGeneratedChunkOrderIndependence` checks
+that asking the generator for the four chunks in reverse order returns identical
+content, so `vanillaTerrainCache` and its clones are not leaking decoration between
+requests, and the parity numbers do not depend on the order a test asks in. What is
+left is the architecture: one shared region per batch, each chunk decorated exactly
+once in one global order - then every cell has one history and "what does source
+(0,0) place" stops having four answers. That is task 8, and the prediction to test
+when it is done is in the first table: a (0,1) built from a region whose south-row
+passes ran first should recover the (5,-30,13) pool and with it most of those 20
+anchors.

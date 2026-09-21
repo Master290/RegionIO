@@ -1,32 +1,60 @@
 package world
 
 import (
-	"encoding/binary"
-	"io"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 
 	"regionio/internal/worldgen"
 )
 
-// TestProbeLushClayStream reproduces the stage-9 stream for source (0,0) up
-// to and including lush_caves_clay, dumping the region state along the
-// candidate columns at feature time.
+// TestProbeLushClayStream replays one source's real stage-9 schedule against a
+// region whose earlier stages have already run, and dumps the region state along
+// the candidate columns at the moment lush_caves_clay places.
 //
-// Its position output is NOT trustworthy. It replays the schedule prefix
-// through placeScheduledFeature below, a copy of the production dispatch in
-// placeScheduledVegetationPatches that handles six of the eight configured
-// feature types - it omits minecraft:kelp and minecraft:seagrass, both of
-// which consume draws, and it discards every error the real dispatcher
-// returns. The stream therefore diverges from the server's before the probe
-// reaches lush_caves_clay, which is the one thing it claims to measure. It is
-// kept for the column dumps. Reusing it for a position question means
-// extracting the production switch into a shared seam and calling that; do not
-// fix the copy, because a second dispatcher is the defect.
+// Which chunk is the centre and which source is probed come from the environment,
+// because the question being asked is "why does the same source place differently
+// for different targets" and a probe welded to (0,0) cannot ask it:
+// REGIONIO_LUSH_CLAY_PROBE_TARGET="x,z" (default 0,0) and
+// REGIONIO_LUSH_CLAY_PROBE_SOURCE="x,z" (default 0,0, which must be a source the
+// target's region replays).
+//
+// The schedule prefix goes through placeScheduledVegetationFeature, the same code
+// the server runs. This file used to carry a private copy of that dispatch, and
+// the copy had already drifted: six of the eight configured types, silently
+// dropping minecraft:kelp and minecraft:seagrass (both of which consume draws) and
+// discarding every error.
+//
+// With the dispatch shared, the probe reproduces the generator's answer exactly:
+// source (0,0) yields positions (5,-29,12)+(5,-30,13) for target (0,0),
+// (5,-29,12)+(2,-41,12) for targets (1,0) and (0,1), and those three plus
+// (4,-7,1) for target (-1,-1) - byte-for-byte the REGIONIO_LUSH_CLAY_TRACE output
+// of the real generator, in 1.3s instead of 8.7s and without a fixture. That is
+// what makes the predecessor experiment worth running here: REGIONIO_LUSH_CLAY_PROBE_SKIP
+// removes a source's whole contribution and the flip in the answer names which
+// predecessors the feature actually reads. REGIONIO_LUSH_CLAY_COLUMN="x,z[;x,z...]"
+// adds pre-feature dumps of whole columns, which is how a displaced position is
+// attributed either to a different floor under the scan or to a different number of
+// draws spent by an earlier position of the same feature - the candidate dump only
+// shows the column a run already chose, so on its own it cannot tell those apart.
+//
+// Two traps worth recording, because both were walked into. The hand-replayed
+// target feature must call SetFeatureSeed itself - the reseed lives inside the
+// seam, so omitting it leaves the feature reading the previous one's stream and
+// placing somewhere else entirely, which looks exactly like a state effect. And
+// replaying every source's early stages before touching stage 9 is NOT the
+// generator's world: stage 9 must be interleaved per source, or the filters move
+// positions for reasons that have nothing to do with the question.
 func TestProbeLushClayStream(t *testing.T) {
 	requireDiagnostic(t, "REGIONIO_LUSH_CLAY_PROBE")
 	seed := int64(12345)
-	targetX, targetZ := int32(0), int32(0)
+	targetX, targetZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_TARGET", 0, 0)
+	sourceX, sourceZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_SOURCE", 0, 0)
+	skip := probeSkipSources(t)
+	if abs32(targetX-sourceX) > 1 || abs32(targetZ-sourceZ) > 1 {
+		t.Fatalf("source (%d,%d) is outside the region a (%d,%d) target loads", sourceX, sourceZ, targetX, targetZ)
+	}
 
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
 	chunks := make([]*Chunk, 0, 25)
@@ -47,7 +75,18 @@ func TestProbeLushClayStream(t *testing.T) {
 	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
 		t.Fatal(err)
 	}
+	// Replay exactly what replayScheduledOres would have done by the time the
+	// probed source reaches stage 9: per source, structures then lakes, geodes,
+	// monster rooms, ores, vegetation - stopping at the probed source instead of
+	// running its vegetation stage, which the schedule loop below walks entry by
+	// entry. Replaying all sources' early stages first would be a different world
+	// (state-dependent placement filters drop or move positions), and the point of
+	// this probe is to reproduce production's answer, not to invent one.
+	reachedSource := false
 	for _, source := range decorationSources(targetX, targetZ) {
+		if skip[[2]int32{source.X, source.Z}] {
+			continue
+		}
 		if err := r.setSource(source.X, source.Z); err != nil {
 			t.Fatal(err)
 		}
@@ -63,9 +102,20 @@ func TestProbeLushClayStream(t *testing.T) {
 		if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
 			t.Fatal(err)
 		}
+		if source.X == sourceX && source.Z == sourceZ {
+			reachedSource = true
+			break
+		}
+		if err := r.placeScheduledVegetationPatches(seed); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// Region state is now exactly what stage 9 for source (0,0) sees.
-	if err := r.setSource(0, 0); err != nil {
+	if !reachedSource {
+		t.Fatalf("source (%d,%d) is not one of the sources target (%d,%d) replays",
+			sourceX, sourceZ, targetX, targetZ)
+	}
+	// Region state is now exactly what stage 9 for the probed source sees.
+	if err := r.setSource(sourceX, sourceZ); err != nil {
 		t.Fatal(err)
 	}
 
@@ -78,132 +128,134 @@ func TestProbeLushClayStream(t *testing.T) {
 			}
 		}
 	}
-	dumpCol("pre-feature", 5, 12)
-	dumpCol("pre-feature", 2, 12)
-	dumpCol("pre-feature", 2, 13)
-	dumpCol("pre-feature", 5, 3)
+	const targetFeature = "minecraft:lush_caves_clay"
+
+	// Which columns to watch before the feature runs comes from the same env flag
+	// the production trace uses, so the probe can ask "what state did the scan see
+	// at the column the *other* run chose" - the candidate dump only shows the
+	// column a run already picked, which is a consequence and cannot name a cause.
+	watch := probeColumns(t, "REGIONIO_LUSH_CLAY_COLUMN")
+	for _, column := range watch {
+		dumpCol("pre-feature", column[0], column[1])
+	}
 
 	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), vegetationStage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	random, decorationSeed := worldgen.DecorationRandom(seed, 0, 0)
-	origin := worldgen.FeaturePosition{X: 0, Y: MinY, Z: 0}
+	random, decorationSeed := worldgen.DecorationRandom(seed, int(sourceX), int(sourceZ))
+	origin := worldgen.FeaturePosition{X: int(sourceX) << 4, Y: MinY, Z: int(sourceZ) << 4}
 	for _, scheduled := range schedule {
+		if scheduled.Name != targetFeature {
+			if err := r.placeScheduledVegetationFeature(set, random, scheduled, origin, decorationSeed); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
 		placed, ok := set.Placed[scheduled.Name]
 		if !ok {
-			continue
+			t.Fatalf("%s is not a placed feature", targetFeature)
 		}
-		configured, ok := set.Configured[placed.Feature]
-		if !ok {
-			continue
-		}
+		t.Logf("=== %s index=%d source (%d,%d) target (%d,%d) ===",
+			targetFeature, scheduled.Index, sourceX, sourceZ, targetX, targetZ)
+		// Only this one feature is replayed by hand, to interleave the position
+		// and column dumps with its own draws. The reseed and the choice/placement
+		// are the ones the seam would have done - SetFeatureSeed lives inside
+		// placeScheduledVegetationFeature, so skipping the call here leaves this
+		// feature reading the previous one's stream and placing somewhere else
+		// entirely.
 		random.SetFeatureSeed(decorationSeed, scheduled.Index, vegetationStage)
-		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
-			return r.biomeAllowsFeature(set, scheduled.Name, vegetationStage, position)
-		})
-		if scheduled.Name != "minecraft:lush_caves_clay" {
-			placeScheduledFeature(r, random, scheduled, placed, configured, origin, context, set)
-			continue
-		}
-		t.Logf("=== lush_caves_clay index=%d ===", scheduled.Index)
-		err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			t.Logf("POSITION (%d,%d,%d)", position.X, position.Y, position.Z)
-			dumpCol("candidate", position.X&15, position.Z&15)
-			ref, _ := set.RandomBooleanSelector(placed.Feature)
-			_ = ref
-			// Replay the boolean choice + patch manually so draws align.
-			cfgRef := configFeatureRef(set, placed.Feature)
-			chosen := cfgRef.FeatureFalse
-			if random.NextBoolean() {
-				chosen = cfgRef.FeatureTrue
-			}
-			t.Logf("chosen ref: %s", chosen.Name)
-			r.placeFeatureRef(random, position, chosen, set)
-			return nil
-		})
+		ref := configFeatureRef(set, placed.Feature)
+		err := set.ForEachPlacementPosition(scheduled.Name, random, origin,
+			r.placementContext(func(position worldgen.FeaturePosition) bool {
+				return r.biomeAllowsFeature(set, scheduled.Name, vegetationStage, position)
+			}),
+			func(position worldgen.FeaturePosition) error {
+				chosen := ref.FeatureFalse
+				if random.NextBoolean() {
+					chosen = ref.FeatureTrue
+				}
+				t.Logf("POSITION (%d,%d,%d) chosen ref: %s", position.X, position.Y, position.Z, chosen.Name)
+				dumpCol("candidate", position.X&15, position.Z&15)
+				r.placeFeatureRef(random, position, chosen, set)
+				return nil
+			})
 		if err != nil {
 			t.Fatal(err)
 		}
-		dumpCol("post-pool", 5, 12)
-		dumpCol("post-pool", 2, 12)
-		dumpCol("post-pool", 2, 13)
-		dumpCol("post-pool", 5, 3)
+		for _, column := range watch {
+			dumpCol("post-pool", column[0], column[1])
+		}
 		return
 	}
-	t.Log("lush_caves_clay not scheduled for source (0,0)")
+	t.Logf("%s not scheduled for source (%d,%d)", targetFeature, sourceX, sourceZ)
 }
 
-// placeScheduledFeature runs one scheduled feature through the same dispatch
-// as placeScheduledVegetationPatches, without the trace scaffolding.
-func placeScheduledFeature(r *decorationRegion, random worldgen.RandomSource, scheduled worldgen.ScheduledFeature, placed worldgen.PlacedFeature, configured worldgen.ConfiguredFeature, origin worldgen.FeaturePosition, context worldgen.PlacementContext, set *worldgen.FeatureSet) {
-	switch configured.Type {
-	case "minecraft:vegetation_patch":
-		config, err := set.VegetationPatch(placed.Feature)
-		if err != nil {
-			return
+// probeChunkList parses an env var of the form "x,z[;x,z...]". One parser backs
+// every coordinate the probe takes from the environment, so adding a knob cannot
+// introduce a fourth flavour of the same syntax.
+func probeChunkList(t *testing.T, name string) [][2]int32 {
+	t.Helper()
+	spec := os.Getenv(name)
+	var out [][2]int32
+	for _, entry := range strings.Split(spec, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
 		}
-		_ = set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			r.placeVegetationPatch(random, position, config, set, false)
-			return nil
-		})
-	case "minecraft:waterlogged_vegetation_patch":
-		config, err := set.VegetationPatch(placed.Feature)
-		if err != nil {
-			return
+		parts := strings.Split(entry, ",")
+		if len(parts) != 2 {
+			t.Fatalf("%s entry %q is not \"x,z\"", name, entry)
 		}
-		_ = set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			r.placeVegetationPatch(random, position, config, set, true)
-			return nil
-		})
-	case "minecraft:random_boolean_selector":
-		config, err := set.RandomBooleanSelector(placed.Feature)
-		if err != nil {
-			return
+		x, errX := strconv.Atoi(strings.TrimSpace(parts[0]))
+		z, errZ := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if errX != nil || errZ != nil {
+			t.Fatalf("%s entry %q is not \"x,z\": %v %v", name, entry, errX, errZ)
 		}
-		_ = set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			ref := config.FeatureFalse
-			if random.NextBoolean() {
-				ref = config.FeatureTrue
-			}
-			r.placeFeatureRef(random, position, ref, set)
-			return nil
-		})
-	case "minecraft:block_column":
-		config, err := set.BlockColumn(placed.Feature)
-		if err != nil {
-			return
-		}
-		_ = set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			r.placeBlockColumn(random, position, config, set)
-			return nil
-		})
-	case "minecraft:simple_random_selector":
-		config, err := set.SimpleRandomSelector(placed.Feature)
-		if err != nil {
-			return
-		}
-		_ = set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			r.placeSimpleRandomSelector(random, position, config, set)
-			return nil
-		})
-	case "minecraft:simple_block":
-		config, err := set.SimpleBlock(placed.Feature)
-		if err != nil {
-			return
-		}
-		_ = set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
-			r.placeSimpleBlockFeature(random, position, config, set)
-			return nil
-		})
+		out = append(out, [2]int32{int32(x), int32(z)})
 	}
+	return out
+}
+
+// probeChunk reads a single "x,z" from the environment, defaulting to the
+// fallback when unset.
+func probeChunk(t *testing.T, name string, defaultX, defaultZ int32) (int32, int32) {
+	t.Helper()
+	list := probeChunkList(t, name)
+	if len(list) == 0 {
+		return defaultX, defaultZ
+	}
+	if len(list) > 1 {
+		t.Fatalf("%s takes one \"x,z\", got %d entries", name, len(list))
+	}
+	return list[0][0], list[0][1]
+}
+
+// probeColumns reads a "x,z[;x,z...]" list.
+func probeColumns(t *testing.T, name string) [][2]int {
+	t.Helper()
+	var out [][2]int
+	for _, entry := range probeChunkList(t, name) {
+		out = append(out, [2]int{int(entry[0]), int(entry[1])})
+	}
+	return out
+}
+
+// probeSkipSources parses REGIONIO_LUSH_CLAY_PROBE_SKIP="x,z[;x,z...]": sources to
+// leave entirely undecorated before the probed one runs. That is what turns the
+// probe from a correlator into a causal test - removing one predecessor and
+// watching the probed feature's positions change names that predecessor as
+// decisive, which no amount of observation at a fixed order can show.
+func probeSkipSources(t *testing.T) map[[2]int32]bool {
+	t.Helper()
+	skip := map[[2]int32]bool{}
+	for _, entry := range probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_SKIP") {
+		skip[entry] = true
+	}
+	return skip
 }
 
 func configFeatureRef(set *worldgen.FeatureSet, placedName string) worldgen.RandomBooleanSelectorConfig {
 	ref, _ := set.RandomBooleanSelector(placedName)
 	return ref
 }
-
-var _ = binary.BigEndian
-var _ = io.EOF
-var _ = os.Getenv
