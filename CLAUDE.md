@@ -151,14 +151,14 @@ Known gaps, roughly in order of how visible they are:
   with the post-placement falling-gravel/bubble-column/water-refill physics vanilla's block ticks
   add), and mineshafts (`world/mineshafts.go`, verified against the saved vanilla start NBT
   piece-for-piece and against a structures-only capture cell-for-cell) replay from their datapack
-  configurations. Trees, flora, springs, desert features, rocks, and lakes' surface variants are
-  still hand-written in `world/vanilla.go`.
+  configurations. Both stage-1 lava lakes replay from `world/lakes.go` — 26.1.2 has no water-lake
+  configured feature left, so `LakeFeature`'s freeze pass never fires. What is still hand-written is
+  the surface decoration dispatcher at `world/vanilla.go:569-574`: springs (`springs.go`), trees
+  (`trees.go`), flora, desert features and rocks (`features.go`).
 - **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
   place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
   trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
   into neighbours; the region infrastructure already supports that.
-- **No lakes.** Stage-1 lake features are not replayed; the base-terrain diagnostic's `airв†’lava`
-  and some clustered `stoneв†’water` pairs are exactly these.
 - **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
   adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
   warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,
@@ -168,21 +168,49 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345): biomes and heightmaps exact everywhere; blocks 95.934% through
-the single-chunk path, 99.625% through the production region replay. A featureless vanilla capture
-(`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) proves the
-undecorated pipeline bit-exact against it вЂ” density, surface rules, carvers, aquifers, and
-noise-router veins match every one of the fixture's cells вЂ” so the residual block gap is entirely
-inside feature replay. Monster rooms (stage 3, `world/monster_rooms.go`) replay between geodes
-and the ores with vanilla's draw order, ocean ruins (`world/ocean_ruin.go`) replay
-cell-for-cell against a dedicated `-no-features` capture of their start вЂ” integrity rolls,
-the capped suspicious-gravel conversion, chest/drowned markers, and the post-placement physics
-(falling gravel, bubble columns, source-water refill) вЂ” and mineshafts (`world/mineshafts.go`)
-replay piece-for-piece against the saved vanilla start NBT and cell-for-cell against the
-structures-only capture of the dungeon area: the fixture's (-1,-1) pocket вЂ” a monster room whose
-wall opening a mineshaft corridor carved вЂ” now places in full (floor, both chests). The remaining
-gap is the surface decoration stages: trees, flora, and springs are still hand-written, and the
-next milestones are the vegetal/feature stages beyond the underground ones.
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 36): biomes and heightmaps exact
+everywhere; blocks 95.959% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
+and **99.909% through the production region replay** — 359 residual cells, 335 of them below y=0 and
+none at the surface. A featureless vanilla capture (`cmd/vanillacapture -featureless -blocks-only`,
+biomes stripped to their carvers) proves the undecorated pipeline bit-exact against it — density,
+surface rules, carvers, aquifers, and noise-router veins match every one of the fixture's cells — so
+the residual block gap is entirely inside feature replay.
+
+The underground stages are each pinned by their own capture, which is why they can be trusted while
+the surface ones cannot: monster rooms (`world/monster_rooms.go`) replay between geodes and the ores
+with vanilla's draw order; ocean ruins (`world/ocean_ruin.go`) replay cell-for-cell against a
+dedicated `-no-features` capture of their start — integrity rolls, the capped suspicious-gravel
+conversion, chest/drowned markers, and the post-placement physics (falling gravel, bubble columns,
+source-water refill); mineshafts (`world/mineshafts.go`) replay piece-for-piece against the saved
+vanilla start NBT and cell-for-cell against a structures-only capture, which is what closed the
+fixture's (-1,-1) pocket — a monster room whose wall opening a mineshaft corridor carved.
+
+The residual is now one family, not a tail: `moss_block`↔`deepslate` is 82 cells (59 where vanilla
+has moss and we have deepslate, 23 the other way), then the ground-cover shuffle
+(`short_grass`/`moss_carpet`/`tall_grass`/`air`, ~54), lush-cave clay at 22, cave vines ~21, kelp 8,
+dripleaves ~12. Net we place 36 fewer moss cells than vanilla, which reads as an extent or radius
+difference in `moss_patch` rather than a position-stream one.
+
+The lush-cave clay pools used to be the headline defect — one waterlogged pool landing fifteen blocks
+off in chunk (-1,-1), with moss and vine positions cascading from it. That is closed: `2c29024`
+aligned the decoration source ordering with vanilla's `rangeClosed` stream, and the differential
+capture below now shows clay at 22 cells against 268-extra/49-missing before. Two structural facts
+came out of the chase and are worth keeping, because they rule whole hypothesis classes out cheaply:
+
+- `SetFeatureSeed` (`worldgen/random.go:367`) fully reseeds from `decorationSeed + featureIndex +
+  10000*stage`, so an earlier feature consuming a different number of draws **cannot** shift a later
+  feature's stream. Cross-feature draw drift is impossible in this architecture; only a wrong index,
+  a wrong seed, or a changed world state can move a feature.
+- `FeatureSchedule`'s `Index` is a position in the global topological step list over the union of the
+  3×3 neighbourhood's biomes, not an offset in the decorating biome's own list — `lush_caves_clay` is
+  5th in `lush_caves` and reseeds as 29. `feature_schedule_golden_test.go` pins both numbers, so a
+  reordering of the biome parameter table now fails loudly instead of silently moving every feature.
+
+`decorationSources` (`world/feature_scheduler.go:16-43`) remains a set of special cases: only (0,0)
+and (1,0) get vanilla's Z-major/X-minor order, and every other target — including the fixture's
+(-1,-1) — falls through to a target-first, then X-major, default that nothing derived it. Do not
+assume a chunk that is not (0,0) or (1,0) has a modelled neighbour order; the next fix of this class
+should derive the order once against a multi-target capture rather than add a third `if`.
 
 ## Testing worldgen
 
@@ -210,6 +238,22 @@ fresh checkout remains buildable without Mojang's non-redistributable jar. Once 
 committed, ordinary CI guards the measured baseline while `make parity` requires exact equality.
 The older optional
 `/tmp/vanilla_ground.json` height report remains diagnostic only.
+
+`-disable-placed <feature>` captures one feature's exact ground truth. It rewrites that placed
+feature's `placement` array to prepend `{"type":"minecraft:count","count":0}` inside a throwaway
+datapack, which zeroes it while leaving every biome's feature list intact — so no other feature's
+`FeatureSorter` index or decoration stream shifts, which is precisely what `-featureless` and
+`-no-features` do. Subtracting that capture from the plain one isolates the chosen chain;
+`testdata/vanilla_no_lush_clay_12345.bin` differs from the plain fixture in 3,670 bytes, all of them
+block state, with zero biome and zero heightmap drift — the check that the override was clean.
+`TestVanillaLushClayDiff` (`REGIONIO_LUSH_CLAY_DIFF=1`) is built on that pair. Subtract only against
+cells the plain capture reports as the feature's own output: the differential is the whole chain's
+effect, including what downstream stages did differently because those cells had changed.
+
+`make diagnostics` compiles every test binary and then runs the gated probes with their variables set.
+The compile half matters more than it looks: `go build ./...` never touches `_test.go` files, and
+debug instrumentation left in `internal/world` has twice broken the package's build in a way the
+plain build could not see.
 
 Beyond the always-on tests, `internal/world` carries env-gated diagnostics for hunting the residual
 parity gap (all skip unless the variable is set): `REGIONIO_REGION_ORE_DIAGNOSTIC=1` compares the

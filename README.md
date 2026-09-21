@@ -78,14 +78,17 @@ disconnect. Lighting tests compare the initial flat chunk and a 31x31x31
 glowstone propagation volume against fixtures captured from the official
 vanilla 26.1.2 server. The committed overworld fixture exhaustively compares
 393,216 block states, 6,144 biome cells, and three heightmaps across four fixed
-chunks. The canonical single-chunk generator currently matches 95.934% of
-fixture blocks, while the production region replay path matches 99.625%; both
-match all fixture biomes and heightmaps. CI guards the 91% regression floor
-while `make parity` requires exact equality. GitHub Actions runs build/vet/tests,
+chunks. The canonical single-chunk generator currently matches 95.959% of
+fixture blocks, while the production region replay path matches 99.909% — 359
+residual cells, 335 of them below the sea and none at the surface; both match
+all fixture biomes and heightmaps. CI checks the region path against a 99.7%
+regression floor (91% for the legacy generator, which `make parity` does not
+cover), while `make parity` upgrades the same comparison to exact equality and
+so does not pass yet. GitHub Actions runs build/vet/tests,
 fixture regression checks, and the full race suite on every push and pull
 request. Env-gated diagnostics in `internal/world` break the remaining gap
 down per subsystem (ore paths per state, base-terrain defects with sample
-coordinates).
+coordinates); `make diagnostics` compiles every test binary and runs them.
 
 ## v0.4 scope
 
@@ -104,9 +107,10 @@ vanilla-derived. Surface and biome selection are ported but still need broader
 runtime captures. The production cache now uses atomic batch publication and
 the datapack-driven region replay path, with cross-chunk writes isolated per
 target. Underground decoration (stage-1 lava lakes, ores with deepslate
-targets, underwater magma, disks) runs from the vanilla schedule; the largest
-remaining fidelity gap is surface decoration вЂ” trees, flora, and springs are
-still hand-written вЂ” plus the unreplayed structure pieces (mineshafts).
+targets, underwater magma, disks) and the mineshaft, ocean ruin and ruined
+portal structure sets run from the vanilla schedule; the largest
+remaining fidelity gap is surface decoration — trees, flora, and springs are
+still hand-written.
 The biome parameter
 finder uses an exact spatial index and overlapping region requests share a
 bounded immutable terrain cache, keeping cold 3x3 generation near one second
@@ -125,12 +129,16 @@ monster rooms (from their datapack configuration, between the geodes and the
 ores), ocean ruins (cell-for-cell against a dedicated `-no-features` vanilla
 capture of their area, falling gravel and bubble columns included), and
 mineshafts (piece-for-piece against the saved vanilla start NBT and
-cell-for-cell against a structures-only capture) replay from the datapack вЂ”
+cell-for-cell against a structures-only capture) replay from the datapack —
 the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
-corridor carved, now places in full. The next worldgen milestones are the
-surface decoration stages вЂ” trees, flora, and springs are still hand-written вЂ”
-on the way to exact equality while keeping cold batch generation within an
-acceptable latency budget.
+corridor carved, now places in full. What is left in the fixture is
+underground: 335 of its 359 residual cells sit below y=0 and the surface band
+contributes none, led by moss-patch extent, then ground cover, clay, and cave
+vines. Surface decoration is the larger structural gap — trees, flora, and
+springs are still hand-written, and only straight trunks place — but a zero
+count in the surface band is evidence these four chunks barely exercise it, not
+evidence that it is correct. Closing both is the road to exact equality, while
+keeping cold batch generation within an acceptable latency budget.
 
 ## Project layout
 
