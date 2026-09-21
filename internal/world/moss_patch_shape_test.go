@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"regionio/internal/worldgen"
 )
 
 // mossResidualCell is one mismatched cell that involves the moss patch's ground
@@ -617,4 +619,142 @@ func TestMossResidualPlacementContext(t *testing.T) {
 func chunkEdgeDistance(x, z int) int {
 	bx, bz := x&15, z&15
 	return min(min(bx, 15-bx), min(bz, 15-bz))
+}
+
+// decorationPlantNames are the states the lush-caves stage-9 decoration chain
+// writes: the five entries of moss_vegetation's weighted provider, read out of
+// the datapack, plus the cave plants the neighbouring features place. None of
+// them is terrain. Finding one in a column's candidate cell therefore does not
+// show the patch rejected that column - the plant may well have been placed
+// after the patch scanned, and the placing side's own ground column is
+// frequently exactly such a later write. They are separated so the verdict table
+// cannot over-count "terrain".
+var decorationPlantNames = []string{
+	"minecraft:short_grass", "minecraft:tall_grass", "minecraft:moss_carpet",
+	"minecraft:azalea", "minecraft:flowering_azalea",
+	"minecraft:cave_vines", "minecraft:cave_vines_plant",
+	"minecraft:big_dripleaf", "minecraft:big_dripleaf_stem", "minecraft:small_dripleaf",
+	"minecraft:hanging_roots", "minecraft:spore_blossom", "minecraft:glow_lichen",
+	"minecraft:fern", "minecraft:large_fern",
+}
+
+var decorationPlantIDs = func() map[uint16]bool {
+	ids := make(map[uint16]bool)
+	for _, name := range decorationPlantNames {
+		for _, half := range []string{"lower", "upper"} {
+			for _, props := range []map[string]string{nil, {"half": half}} {
+				if id, ok := nameToStateID(name, props); ok {
+					ids[id] = true
+				}
+			}
+		}
+	}
+	return ids
+}()
+
+// isPostPatchState reports whether a cell holds one of those decoration plants.
+func isPostPatchState(state uint16) bool { return decorationPlantIDs[state] }
+
+// TestMossResidualColumnVerdict separates the two mechanisms a moss-patch rim
+// residual can have, which the cluster shapes alone cannot answer.
+//
+// placeGroundPatch samples depth only for a column it ACCEPTS, and
+// distributeVegetation rolls once per accepted column. A single state-driven
+// rejection early in a patch's column loop therefore shifts every later draw of
+// that instance, and the columns after it split on the edge-column roll alone -
+// which is precisely the scattered one- and two-cell-fragment shape
+// TestMossPatchMismatchShape reports. A residual cell is thus not an
+// independent claim about terrain, and the "support cells match" measurement
+// that exonerated world state was reading the symptom, not the cause.
+//
+// The verdict asks, of the side that did NOT place moss in a cell, whether its
+// own terrain still permits that column: candidate air one block above (moss_patch
+// is surface=floor, so ground = candidate + DOWN), the ground cell face-sturdy,
+// and the ground cell in moss_replaceable. All three holding exonerates terrain
+// for that cell - the only way it stayed unwritten is a draw it lost upstream.
+// A failure names a terrain difference, with the caveat that these are FINAL
+// captures: a cell the patch read as air may have been filled by a later
+// feature, so "candidate filled" is a candidate cause, not a proven one.
+func TestMossResidualColumnVerdict(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_MOSS_PATCH_DIAGNOSTIC")
+
+	capture := readFixtureCapture(t, vanillaParityFixture)
+	gen := NewVanillaRegionGenerator(capture.seed)
+	mossID, clayID := mossStateIDs(t)
+	residual := collectMossResidual(capture, gen, mossID, clayID)
+
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatalf("load feature set: %v", err)
+	}
+	replaceable := geodeTagIDs(set, "minecraft:moss_replaceable")
+
+	verdicts := map[string]int{}
+	split := map[[2]string]int{}
+	for _, c := range residual.cells {
+		if c.ours != mossID && c.vanilla != mossID {
+			continue
+		}
+		skippedBy, ground := "vanilla", c.vanilla
+		if c.ours == mossID {
+			skippedBy, ground = "ours", c.ours
+		}
+		read := residual.vanillaAt
+		if skippedBy == "ours" {
+			read = residual.ourAt
+		}
+		candidate, ok := read(c.x, c.y+1, c.z)
+		if !ok {
+			verdicts["unreadable"]++
+			continue
+		}
+		verdict := "stream: terrain permitted it"
+		switch {
+		case isPostPatchState(candidate):
+			// Nested vegetation lands one block above the ground cell the patch
+			// wrote, so a grass or carpet here was placed AFTER this patch's
+			// scan, on both sides. It says nothing about what the scan saw.
+			verdict = "inconclusive: candidate written after the patch"
+		case !isAirState(candidate):
+			name := fmt.Sprintf("state %d", candidate)
+			if s, known := stateByID(candidate); known {
+				name = s.Name
+			}
+			verdict = "terrain: candidate filled by " + name
+		case !isFaceSturdy(ground):
+			verdict = "terrain: ground not face-sturdy"
+		case !replaceable[ground]:
+			verdict = "terrain: ground not moss_replaceable"
+		}
+		verdicts[verdict]++
+		split[[2]string{skippedBy, verdict}]++
+	}
+
+	keys := make([]string, 0, len(verdicts))
+	for k := range verdicts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	judged := 0
+	for _, n := range verdicts {
+		judged += n
+	}
+	t.Logf("moss ground residual: %d of %d cells judged against the non-placing side's own terrain", judged, len(residual.cells))
+	for _, k := range keys {
+		t.Logf("  %-46s %3d", k, verdicts[k])
+	}
+	for _, side := range [2]string{"vanilla", "ours"} {
+		var stream, terrain int
+		for k, n := range split {
+			if k[0] != side {
+				continue
+			}
+			if strings.HasPrefix(k[1], "stream") {
+				stream += n
+			} else {
+				terrain += n
+			}
+		}
+		t.Logf("  %-8s-only cells: %d permitted by terrain (draw-decided), %d named a terrain reason", side, stream, terrain)
+	}
 }
