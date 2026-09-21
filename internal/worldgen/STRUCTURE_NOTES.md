@@ -976,6 +976,26 @@ This is the same (b') mechanism as the moss rim, with the geography and the
 consumer both named: the state that matters is not "what the scan walks over at the
 candidate" but "what the first pool's footprint touches", and the neighbours that
 matter are exactly the two whose Chebyshev-1 write window covers (0,0)'s south-west.
+
+That inference is now measured. `REGIONIO_LUSH_CLAY_PROBE_STATE=1` digests every
+chunk of the region at the instant the clay feature starts, so a removal can be
+asked *which chunks it changed* rather than only *whether it changed the answer*:
+
+| chunk | none removed | (-1,-1) removed | (0,-1) removed |
+|---|---|---|---|
+| (0,0) - the probed source itself | `aade1eb0` | `df14e32f` | `880c5fe3` |
+| (0,1) - the chunk holding the 20 anchors | `1820d514` | `1820d514` | `1820d514` |
+
+Read together with the identical-candidate-columns result above, that is the whole
+mechanism in two rows: the neighbours' cross-chunk writes land inside (0,0) - not in
+(0,1), whose own pass has not run yet at this point, which is why (0,1) is byte-for-byte
+the same in all three - so the clay feature reads a chunk partly authored by its own
+neighbours, and the columns its first pool happens to touch are exactly where those
+writes are. It also explains why the removal set is not symmetric in a simple way:
+(-2,1) changes when (0,-1) is removed even though (0,-1) cannot write there, because
+the source that can, (-1,0), runs *after* it and reads what it left. State propagates
+through the source sequence, so "which predecessors matter" has no local answer.
+
 The prediction it leaves is correspondingly concrete: replaying (0,0) for a (0,1)
 target loses the second pool for the same reason as skipping (-1,-1), and fixing it
 means (0,0) seeing one world with a single history, not a window chosen per target.

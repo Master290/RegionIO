@@ -1,7 +1,9 @@
 package world
 
 import (
+	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,6 +40,9 @@ import (
 // attributed either to a different floor under the scan or to a different number of
 // draws spent by an earlier position of the same feature - the candidate dump only
 // shows the column a run already chose, so on its own it cannot tell those apart.
+// REGIONIO_LUSH_CLAY_PROBE_STATE=1 adds a per-chunk digest of the world the feature
+// is about to read, which names the chunks a removal actually changed instead of
+// leaving that to be inferred from the answer.
 //
 // Two traps worth recording, because both were walked into. The hand-replayed
 // target feature must call SetFeatureSeed itself - the reseed lives inside the
@@ -117,6 +122,37 @@ func TestProbeLushClayStream(t *testing.T) {
 	// Region state is now exactly what stage 9 for the probed source sees.
 	if err := r.setSource(sourceX, sourceZ); err != nil {
 		t.Fatal(err)
+	}
+
+	// A per-chunk digest of the world the feature is about to read. Comparing two
+	// runs of the probe with this printed turns "removing a neighbour changed the
+	// answer, therefore the state mattered" into a statement about *which* chunks
+	// differ - and in particular whether the probed source's own chunk does, which
+	// is what a cross-chunk write from a Chebyshev-1 neighbour looks like from the
+	// inside.
+	if os.Getenv("REGIONIO_LUSH_CLAY_PROBE_STATE") == "1" {
+		keys := make([][2]int32, 0, len(r.chunks))
+		for key := range r.chunks {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i][0] != keys[j][0] {
+				return keys[i][0] < keys[j][0]
+			}
+			return keys[i][1] < keys[j][1]
+		})
+		for _, key := range keys {
+			chunk := r.chunks[key]
+			digest := uint32(0)
+			if chunk != nil {
+				digest = chunkChecksum(chunk)
+			}
+			line := fmt.Sprintf("STATE chunk (%d,%d) %08x", key[0], key[1], digest)
+			if key == [2]int32{sourceX, sourceZ} {
+				line += "  <- probed source"
+			}
+			t.Log(line)
+		}
 	}
 
 	dumpCol := func(label string, x, z int) {
