@@ -168,10 +168,11 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 36): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 37): biomes and heightmaps exact
 everywhere; blocks 95.959% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
-and **99.909% through the production region replay** — 359 residual cells, 335 of them below y=0 and
-none at the surface. A featureless vanilla capture (`cmd/vanillacapture -featureless -blocks-only`,
+and **99.916% through the production region replay** — 330 residual cells, dominated by the
+lush-caves moss and clay pools and their nested vegetation. A featureless vanilla capture
+(`cmd/vanillacapture -featureless -blocks-only`,
 biomes stripped to their carvers) proves the undecorated pipeline bit-exact against it — density,
 surface rules, carvers, aquifers, and noise-router veins match every one of the fixture's cells — so
 the residual block gap is entirely inside feature replay.

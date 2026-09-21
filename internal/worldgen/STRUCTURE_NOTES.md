@@ -712,7 +712,7 @@ cause and `decorationSources` is the target - it models only (0,0) and (1,0) and
 every other source falls to an untuned default. If it does not, the defect is in
 the acceptance tests themselves.
 
-## The moss rim is not a world-state problem: what the follow-up probes measured
+## The moss rim: what the follow-up probes measured, and where the first one misread
 
 `TestMossResidualPlacementContext` (`REGIONIO_MOSS_PATCH_DIAGNOSTIC=1`) ran the
 two cheap discriminations first, and both came back negative.
@@ -749,15 +749,96 @@ rule is something other than a fixed sweep order. It is also not a
 last-writer-wins effect: the number that swings is the *cascade* count, i.e.
 which features saw which air when they scanned.
 
-What is left, then, is the reach of a write rather than its timing. Our
-`decorationRegion.setBlock` gate is chunk-granular (`abs32(cx-sourceX) > 1`), so
-a patch centred near a source's edge can put a disc up to eight blocks into the
-neighbour; the per-chunk split is asymmetric in a way that deserves a name -
-(0,0) places 21 cells vanilla does not and misses 6, while the other three
-chunks are miss-heavy (18/10, 14/1, 33/4) and 44 of the 71 misses sit at chunk-edge
-distance <= 1 against 46% of agreed moss. So the next probe is the write gate
-itself: what 26.1.2 actually permits a placed feature to write outside its
-origin chunk, and whether a cell beyond that reach is dropped rather than
-deferred. `Biome` has no `decorate` method in this version and no
-`FeatheredBlockAccess` class exists in the jar, so this has to be read out of
-`ChunkGenerator` and whatever replaced the coordinator; it cannot be recalled.
+**The write gate is not it either, and that closes the last alternative.**
+26.1.2 has no `FeatheredBlockAccess` and `Biome` has no `decorate`: decoration
+runs `ChunkStatusTasks.generateFeatures` -> `WorldGenRegion` ->
+`ChunkGenerator.applyBiomeDecoration` -> `PlacedFeature.placeWithBiomeCheck`, and
+the feather was replaced by two radius checks on `WorldGenRegion`.
+`ensureCanWrite` compares `blockToSectionCoord` of the target against the centre
+with `step.blockStateWriteRadius()`, which `ChunkPyramid.FEATURES` sets to **1
+chunk** and carvers/surface/noise to 0; we gate the same way
+(`abs32(cx-sourceX) > 1`). Inside that chunk a feature may write the whole
+16x16 column, and structures are the ones that get clipped to their own chunk by
+`getWritableArea`. Reads use a different bound (the pyramid's dependency array,
+nine entries), so reading is wider than writing - but the moss scan only ever
+looks one block sideways, which is inside both.
+
+### What the verdict probe then showed, overturning the section above
+
+`TestMossResidualColumnVerdict` (`REGIONIO_MOSS_PATCH_DIAGNOSTIC=1`) asks, for
+each residual cell, whether the *non-placing* side's own terrain still permits
+that column - candidate air one block above (`moss_patch` is `surface: floor`),
+ground face-sturdy, ground in `moss_replaceable`. On seed 12345:
+
+| verdict | cells |
+| --- | --- |
+| candidate holds solid rock (21 deepslate, 6 tuff) | 27 |
+| candidate holds the clay pool's own output (9 water, 6 clay) | 15 |
+| candidate holds another moss disc's ground | 11 |
+| candidate holds a decoration plant, which may have arrived after the scan | 45 |
+| terrain permitted the column on both sides, so only a draw decided it | 9 |
+
+The support-cell measurement that exonerated world state had read the cell
+*beside* the moss, not the cell the scan had to pass *through*, and 45 of the
+107 "terrain" readings there were our own nested vegetation, which is downstream
+of the patch and says nothing. Of the 62 cells the verdict can decide, 52 name a
+state difference at the deciding cell; 9 are draw-decided.
+
+That is the answer to the question the clay investigation inherited: the moss rim
+is hypothesis **(b') - the world state the scan walks**, amplified. Acceptance is
+what consumes the `depth` sample, and `distributeVegetation` rolls once per
+accepted column, so one state-driven rejection early in a patch's column loop
+shifts every later draw of that instance and the rest of its rim splits on the
+edge roll alone. Scattered one- and two-cell fragments on both sides is therefore
+the expected shape of a *single* earlier difference per patch, not of 107
+independent terrain errors - which is why no predicate fix moves the count.
+
+The pool's own output sitting in 15 of those candidate cells names the ordering
+directly: the moss patch and the clay pool contend for the same cells, and
+whichever scans first decides both. That is the same mechanism as `2c29024`,
+which raised parity by changing which neighbours had carved first, and it is the
+same one the failed uniform-order experiment says a fixed sweep cannot express.
+`decorationSources` still special-cases only (0,0) and (1,0); every other target,
+including (-1,-1) which carries a third of the residual, falls to the
+target-first default branch. Deriving that order once from
+`ChunkStatusTasks`' scheduling, rather than adding a third `if`, is the remaining
+work on this family.
+
+### VegetationPatchFeature, now verified line for line, and the one real win
+
+Reading the whole method pair against the jar closed every semantics question on
+this path, and each of these is now matched in `vegetation_patches.go`:
+
+- Both scan loops are bounded by `verticalRange` **independently** - the counter
+  is reset between them (`istore 20` twice, offsets 207 and 249), so a column may
+  travel up to twice the range. Phase 1 walks while `isAir` (bootstrap #1 =
+  `BlockStateBase::isAir`) in `surface.getDirection()`; phase 2 walks while
+  `!isAir` (bootstrap #2 = the `lambda$placeGroundPatch$0` synonym) in the
+  opposite direction. `belowState` is read before the emptiness test, and the
+  test is `isEmptyBlock(pos)` on the *candidate*, not on the ground cell.
+- `placeGround` re-samples `groundState` on **every** iteration, not once per
+  column. Irrelevant for this chain: `clay`, `moss_block` and both pool configs
+  ship `simple_state_provider`, which is draw-free.
+- `WeightedStateProvider` is `WeightedList.getRandomOrThrow`: exactly **one**
+  `nextInt(totalWeight)` then a prefix walk. `totalWeight >= 64` picks `Compact`
+  over `Flat`, and the two differ only in storage, so `moss_vegetation`'s 96
+  points of weight are one draw and a linear scan - what we do.
+- `isExposedDirection` calls `BlockState::isFaceSturdy` (`SupportType.FULL`), not
+  the blocks-motion test. We used `fullSolidState` there; the two separate on
+  farmland, sculk sensors and spawners, none of which the fixture puts beside a
+  pool, so the fix is measured at zero cells here and kept anyway.
+- The waterlogged subclass's `placeVegetation` runs super at `placementPos.below()`
+  and then forces `waterlogged=true` on whatever landed there. Net effect: the
+  nested feature is placed *in* the water cell rather than above the ground, and
+  the surface offset is not overridden - which is what
+  `patchVegetationPosition` expresses.
+
+The one place the reading paid off in cells: `WaterloggedVegetationPatchFeature`
+builds `waterSurface` by iterating the ground **HashSet**, so the water set's
+insertion order is the ground set's hash order, and the roll then iterates
+*that* set - within-bucket ties are decided by insertion order. We appended in
+column order instead. Fixing it is worth **29 cells and 12 fluid mismatches** on
+seed 12345, 99.909% -> 99.916%, `generatorVersion` 36 -> 37. Pool roll order is
+not a cosmetic detail: with ~30 water cells over a 64-slot table, ties are the
+normal case, and every draw after the first collision belongs to a different
+cell than it did for vanilla.
