@@ -42,7 +42,10 @@ import (
 // shows the column a run already chose, so on its own it cannot tell those apart.
 // REGIONIO_LUSH_CLAY_PROBE_STATE=1 adds a per-chunk digest of the world the feature
 // is about to read, which names the chunks a removal actually changed instead of
-// leaving that to be inferred from the answer.
+// leaving that to be inferred from the answer. REGIONIO_LUSH_CLAY_PROBE_INDEX
+// replaces only the probed feature's reseed index, which is how the schedule's
+// index was shown to be determined by vanilla's positions rather than merely
+// consistent with them.
 //
 // Two traps worth recording, because both were walked into. The hand-replayed
 // target feature must call SetFeatureSeed itself - the reseed lives inside the
@@ -192,15 +195,28 @@ func TestProbeLushClayStream(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s is not a placed feature", targetFeature)
 		}
+		// REGIONIO_LUSH_CLAY_PROBE_INDEX replaces only this feature's reseed index,
+		// leaving the placement list and the world untouched. Sweeping it shows
+		// whether the schedule's index is determined by vanilla's positions or just
+		// consistent with them: if the answer were insensitive to the index, the
+		// agreement would prove nothing about it.
+		index := scheduled.Index
+		if override := strings.TrimSpace(os.Getenv("REGIONIO_LUSH_CLAY_PROBE_INDEX")); override != "" {
+			value, errParse := strconv.Atoi(override)
+			if errParse != nil {
+				t.Fatalf("REGIONIO_LUSH_CLAY_PROBE_INDEX=%q is not an integer", override)
+			}
+			index = value
+		}
 		t.Logf("=== %s index=%d source (%d,%d) target (%d,%d) ===",
-			targetFeature, scheduled.Index, sourceX, sourceZ, targetX, targetZ)
+			targetFeature, index, sourceX, sourceZ, targetX, targetZ)
 		// Only this one feature is replayed by hand, to interleave the position
 		// and column dumps with its own draws. The reseed and the choice/placement
 		// are the ones the seam would have done - SetFeatureSeed lives inside
 		// placeScheduledVegetationFeature, so skipping the call here leaves this
 		// feature reading the previous one's stream and placing somewhere else
 		// entirely.
-		random.SetFeatureSeed(decorationSeed, scheduled.Index, vegetationStage)
+		random.SetFeatureSeed(decorationSeed, index, vegetationStage)
 		ref := configFeatureRef(set, placed.Feature)
 		err := set.ForEachPlacementPosition(scheduled.Name, random, origin,
 			r.placementContext(func(position worldgen.FeaturePosition) bool {

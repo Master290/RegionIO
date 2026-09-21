@@ -686,6 +686,33 @@ including the fact that `lush_caves_clay` is 5th in `lush_caves` but reseeds as
 29 because `FeatureSchedule`'s indices are positions in the global topological
 step list over the 3x3 neighbourhood, not offsets in the decorating biome's list.
 
+That last distinction was worth an experiment, because the two candidate readings
+give different numbers and only one can be right. Vanilla decorates a chunk's
+single biome and reseeds per entry of *that* list, which would put
+`lush_caves_clay` at index 4; `FeatureSchedule` reports 29. Sweeping the reseed
+index with everything else held fixed - same world, same placement list, same
+seed, only `SetFeatureSeed`'s index varying, via
+`REGIONIO_LUSH_CLAY_PROBE_INDEX` - and scoring each value on whether it reproduces
+vanilla's pools for source (0,0) (well-defined, because the differential shows
+chunk (0,0) with zero missing and zero extra clay cells, so vanilla's two pools are
+exactly the ones we already place):
+
+| index | result |
+|---|---|
+| 4 (the per-biome position) | places nothing |
+| 29 (what `FeatureSchedule` reports) | **(5,-29,12) and (5,-30,13) - vanilla's pair** |
+| the other 39 values | no pool, or a different one |
+
+Distribution over 0..40: 22 indices place no pool at all, 13 place one, 5 place
+two, one places three. So the sweep is sharply sensitive to the index - the curve
+is nowhere near flat, which is what makes a single hit mean something - and 29 is
+the only value in the range that reproduces vanilla's positions, while 4 is not
+merely wrong but silent. Hypothesis (a), a wrong `featureIndex`, is excluded, and
+`FeatureSchedule`'s global-topological numbering is the quantity vanilla actually
+uses here. Note what this does and does not establish: it settles the index for the
+lush-cave fixture's biome neighbourhood, which is where all four captured chunks
+live; it is not a proof that a single-biome region could not number differently.
+
 ## Superseded: the pool divergence closed, and what the residue actually is
 
 `2c29024` (decoration source order aligned with vanilla's `rangeClosed` stream)
