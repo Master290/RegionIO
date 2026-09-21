@@ -8,6 +8,14 @@ import (
 	"testing"
 )
 
+// noLushClayFixture is the same 2x2 capture as vanillaParityFixture with
+// minecraft:lush_caves_clay disabled by vanillacapture's -disable-placed flag,
+// which prepends a count of 0 to that one placed feature. Every other biome's
+// feature list is untouched, so no FeatureSorter index or decoration stream
+// shifts elsewhere: plain minus noClay is exact vanilla ground truth for one
+// feature chain.
+const noLushClayFixture = "testdata/vanilla_no_lush_clay_12345.bin"
+
 // TestVanillaLushClayDiff reads the plain fixture and the capture with
 // minecraft:lush_caves_clay disabled. Cells that differ between the two are
 // exactly the blocks the lush_caves_clay chain writes in vanilla, including
@@ -18,8 +26,16 @@ import (
 // because those cells had changed - not the clay writes alone. Judge pool
 // position against the cells the plain capture reports as clay; treat the rest
 // as cascade evidence.
+//
+// This one is permanent rather than gated: it is the only measurement that
+// isolates a single feature chain, both fixtures are committed, and it costs a
+// few seconds. The bounds below are a ratchet, not a target - they are the
+// numbers the chain misses today, and the point of the assertion is that they
+// only move down.
 func TestVanillaLushClayDiff(t *testing.T) {
-	requireDiagnostic(t, "REGIONIO_LUSH_CLAY_DIFF")
+	if _, err := os.Stat(noLushClayFixture); err != nil {
+		t.Skipf("differential capture unavailable: %v", err)
+	}
 	type chunkData struct {
 		states []uint16
 	}
@@ -68,20 +84,22 @@ func TestVanillaLushClayDiff(t *testing.T) {
 		return chunks, order, nil
 	}
 
-	plain, plainOrder, err := read("testdata/vanilla_overworld_12345.bin")
+	plain, plainOrder, err := read(vanillaParityFixture)
 	if err != nil {
 		t.Skipf("plain fixture: %v", err)
 	}
-	noClay, _, err := read("testdata/vanilla_no_lush_clay_12345.bin")
+	noClay, _, err := read(noLushClayFixture)
 	if err != nil {
 		t.Skipf("no-lush-clay capture: %v", err)
 	}
 
-	clayID, _ := nameToStateID("minecraft:clay", nil)
-	_ = clayID
+	clayID, ok := nameToStateID("minecraft:clay", nil)
+	if !ok {
+		t.Fatal("clay is not in the state table")
+	}
+	var totalMissing, totalAnchors, totalExtra int
 	gen := NewVanillaRegionGenerator(12345)
 	for _, key := range plainOrder {
-		_ = gen
 		a, okA := plain[key]
 		b, okB := noClay[key]
 		if !okA || !okB {
@@ -108,7 +126,6 @@ func TestVanillaLushClayDiff(t *testing.T) {
 		// Column summary, Y-ranges per column.
 		type colStat struct {
 			yMin, yMax, n int
-			anyClay      bool
 		}
 		cols := map[[2]int]*colStat{}
 		for _, c := range diffs {
@@ -168,7 +185,7 @@ func TestVanillaLushClayDiff(t *testing.T) {
 		// what our region generator produced: missing cells (vanilla clay, we
 		// something else) and extra cells (we clay, vanilla something else).
 		ours := gen(key[0], key[1])
-		missing, extra := 0, 0
+		missing, extra, missingAnchor := 0, 0, 0
 		idx3 := 0
 		for y := MinY; y < MinY+WorldHeight; y++ {
 			for z := 0; z < 16; z++ {
@@ -177,6 +194,14 @@ func TestVanillaLushClayDiff(t *testing.T) {
 					got := ours.GetBlock(x, y, z)
 					if vanillaClay && got != a.states[idx3] {
 						missing++
+						// The plain capture calling the cell clay is the
+						// unambiguous anchor: the pool wrote there and nothing
+						// downstream can explain it. A differing cell whose
+						// plain value is moss or a vine is cascade evidence and
+						// is counted separately below.
+						if a.states[idx3] == clayID {
+							missingAnchor++
+						}
 						if missing <= 25 {
 							t.Logf("  MISSING (%d,%d,%d): ours=%s want=%s",
 								int(key[0])*16+x, y, int(key[1])*16+z,
@@ -195,6 +220,25 @@ func TestVanillaLushClayDiff(t *testing.T) {
 				}
 			}
 		}
-		t.Logf("chunk (%d,%d) summary: missing=%d extra_clay=%d", key[0], key[1], missing, extra)
+		totalMissing += missing
+		totalAnchors += missingAnchor
+		totalExtra += extra
+		t.Logf("chunk (%d,%d) summary: missing=%d (clay anchors %d) extra_clay=%d",
+			key[0], key[1], missing, missingAnchor, extra)
+	}
+	// Ratchet: measured on generatorVersion 37 with the waterlog roll-order
+	// fix in. The chain is not closed, so these are not zeros - they are the
+	// budget. Any move up is a regression; when a fix takes cells off the
+	// ledger, tighten the number here rather than deleting the assertion.
+	const (
+		maxMissing = 96
+		maxAnchors = 22
+		maxExtra   = 9
+	)
+	t.Logf("lush_caves_clay chain total: missing=%d (clay anchors %d) extra_clay=%d",
+		totalMissing, totalAnchors, totalExtra)
+	if totalMissing > maxMissing || totalAnchors > maxAnchors || totalExtra > maxExtra {
+		t.Fatalf("lush_caves_clay chain regressed: missing=%d (limit %d), clay anchors=%d (limit %d), extra clay=%d (limit %d)",
+			totalMissing, maxMissing, totalAnchors, maxAnchors, totalExtra, maxExtra)
 	}
 }
