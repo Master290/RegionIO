@@ -652,40 +652,62 @@ water 97, cave_vines_plant 80.
   positions shift by the blob edge).
 - clusters 4/5/7: vine columns plus moss again (~60 cells total).
 
-Leading hypothesis for the vine/moss position divergence: the placement
-position streams for stage-9 features interleave with the FEATURE placement
-draws (the vine feature itself draws while producing positions of the NEXT
-count iteration) - our ForEachPlacementPosition already models this - but
-the moss_patch ceiling variant (count 125, same stream family) and cave
-vines (count 188) both run per source chunk and both scan/cancel against
-cells the clay pools may have already written, so the earlier clay-pool
-position divergence cascades into the moss and vine positions. Fixing the
-pool positions first (cluster 1) is the cheapest path since everything else
-downstream realigns.
+Leading hypothesis at the time (now superseded, kept for the reasoning trail):
+the placement position streams for stage-9 features interleave with the FEATURE
+placement draws, so `glow_lichen` consuming a different number of draws could
+shift `lush_caves_clay`. That cannot happen here: `placeScheduledVegetationPatches`
+calls `SetFeatureSeed(decorationSeed, scheduled.Index, stage)` before every
+feature and `worldgen/random.go:367` implements it as a full
+`SetSeed(decorationSeed + featureIndex + 10000*stage)`, so each feature's stream
+is a pure function of `(seed, index, stage)` and cross-feature draw drift is
+structurally impossible. Only a wrong index, a wrong seed, or a different world
+state can move a feature. `feature_schedule_golden_test.go` pins the indices,
+including the fact that `lush_caves_clay` is 5th in `lush_caves` but reseeds as
+29 because `FeatureSchedule`'s indices are positions in the global topological
+step list over the 3x3 neighbourhood, not offsets in the decorating biome's list.
 
-Next probes: (a) dump our clay-pool placement positions for source chunks
-around (-1,-1) and diff against the vanilla pool at cluster 1 (y=-7..-1,
-x=2..3, z=0..3 area); (b) verify the environment_scan up-walk against
-vanilla's exact step semantics (allowed-condition is checked BEFORE the
-first target test - our implementation matches the bytecode order, so the
-suspect is the position stream feeding it).
+## Superseded: the pool divergence closed, and what the residue actually is
 
-## Clay-pool position divergence follow-up (cluster 1, chunk (-1,-1))
+`2c29024` (decoration source order aligned with vanilla's `rangeClosed` stream)
+fixed the misplaced pool without any change to the patch or scan code, which was
+itself the answer: the cause was the world state the scan walked, not the
+stream. The cluster list above predates it. Re-measured against generator
+version 36 the pool family is 24 vanilla-only and 9 ours-only cells out of 6,515
+(`TestVegetationResidualOverlap`), block parity is 99.909%, and the largest
+remaining family is the moss patch ground at 107 cells.
 
-The misplaced pool (48 cells, y=-7..-1) comes from source chunk (-1,-1)'s
-single surviving lush_caves_clay position: ours lands at (-15,-16,-13),
-vanilla's pool sits ~15 blocks higher (y=-7..-1). The placement chain is
-count(62, constant) -> in_square(2 nextInt) -> height_range uniform
-(nextInt(321), min=-64 above_bottom, max=256 absolute) -> environment_scan
-(down, max 12 steps, allowed=#air, target=solid) -> random_offset(0,-1
-constants, draw-free) -> biome. All modifiers are decoded and match vanilla
-byte-for-byte, so the divergence is the STREAM STATE feeding them: either
-(a) the scheduled.Index for lush_caves_clay in stage 9 differs from ours,
-(b) an earlier stage-9 feature on the same decoration stream consumed a
-different number of draws (glow_lichen runs first at count 104..157 - its
-position loop interleaves feature draws with placement draws), or (c) our
-setFeatureSeed decorationSeed chain differs. The next probe: replay the
-source (-1,-1) stage-9 schedule printing the draw index of every position,
-and cross-check lush_caves_clay's FeatureSchedule index against
-FeatureSorter's step data (set.FeatureSchedule builds indices per possible
-biomes; an off-by-one in the shared step list shifts every later feature).
+`TestMossPatchMismatchShape` and `TestMossPatchMismatchCorrelation`
+(`REGIONIO_MOSS_PATCH_DIAGNOSTIC=1`) then measured the moss family, and the
+shape table rules out the hypotheses that were still open for it. Of 1,050
+vanilla `moss_block` cells we place 1,015 and agree on 979, so the origins are
+right. Every one of the 107 mismatches lies within chebyshev distance 5 of a
+moss cell both sides agree on, and 63 of them at distance 1: these are rim cells
+of discs we also placed, not missing or displaced patches. `VegetationPatchFeature`
+was re-read against the 26.1.2 bytecode to confirm the port is faithful in every
+detail that could move a rim cell - `xzRadius` sampled twice at feature start,
+corner columns skipped without a draw, edge columns kept when
+`nextFloat() <= extraEdgeColumnChance` and skipped without a draw when the
+chance is zero, the scan pair testing `BlockStateBase::isAir` then its negation
+over `vertical_range` steps, the recorded ground position taken before
+`placeGround` moves it, and the vegetation roll one `nextFloat` per set position.
+
+The pool correlation needed a control and the control killed it: 55% of the
+missed cells sit within 3 of a clay cell, against 58% for the cells both sides
+agree on, so missed moss is not pool-related at all. Only our *extra* cells are
+(83% within 3). What is left is a rim defect concentrated in the cells that the
+edge-column roll and the `isEmpty`/`isFaceSturdy`/replaceable acceptance tests
+decide, with the pool region contributing the cells we place and vanilla does
+not. Note one known divergence found while reading the bytecode: `placeGround`
+tests the already-ground condition by BLOCK (`state.is(cur.getBlock())`) and the
+replaceable test is a block-tag test, while our port compares packed state IDs
+and resolves tags to the default state of each member. For the single-state
+blocks in `moss_replaceable` that is identical, so it does not explain these
+cells, but a multi-state member (`cave_vines`, `grass_block[snowed]`) would be
+wrong.
+
+Next probe: the `placeScheduledVegetationFeature` seam, so a replay can walk one
+source's real stage-9 schedule and answer whether our patch, run against
+*vanilla's* column, reproduces vanilla's rim. If it does, the world state is the
+cause and `decorationSources` is the target - it models only (0,0) and (1,0) and
+every other source falls to an untuned default. If it does not, the defect is in
+the acceptance tests themselves.
