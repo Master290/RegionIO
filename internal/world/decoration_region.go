@@ -59,6 +59,10 @@ func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
 		return false
 	}
 	cx, cz := int32(x>>4), int32(z>>4)
+	if traceSetBlock(x, y, z) {
+		fmt.Printf("SETBLOCK (%d,%d,%d) -> %s by source (%d,%d)\n", x, y, z, stateLabel(state), r.sourceX, r.sourceZ)
+		dumpTraceStack()
+	}
 	if abs32(cx-r.sourceX) > 1 || abs32(cz-r.sourceZ) > 1 {
 		return false
 	}

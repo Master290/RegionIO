@@ -44,6 +44,10 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 			}
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 				r.placeVegetationPatch(random, position, config, set, false)
+				if lushClayTrace() {
+					fmt.Printf("VGPATCH src=(%d,%d) feature=%s idx=%d pos=(%d,%d,%d) ground=%s\n",
+						r.sourceX, r.sourceZ, scheduled.Name, scheduled.Index, position.X, position.Y, position.Z, config.Ground.Name)
+				}
 				return nil
 			}); err != nil {
 				return err
@@ -55,6 +59,10 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 			}
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 				r.placeVegetationPatch(random, position, config, set, true)
+				if lushClayTrace() {
+					fmt.Printf("VGPATCH src=(%d,%d) feature=%s idx=%d pos=(%d,%d,%d) ground=%s waterlogged\n",
+						r.sourceX, r.sourceZ, scheduled.Name, scheduled.Index, position.X, position.Y, position.Z, config.Ground.Name)
+				}
 				return nil
 			}); err != nil {
 				return err
@@ -68,6 +76,16 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 				ref := config.FeatureFalse
 				if random.NextBoolean() {
 					ref = config.FeatureTrue
+				}
+				if lushClayTrace() && scheduled.Name == "minecraft:lush_caves_clay" {
+					fmt.Printf("LUSHCLAY src=(%d,%d) pos=(%d,%d,%d) ref=%s\n",
+						r.sourceX, r.sourceZ, position.X, position.Y, position.Z, ref.Name)
+					if traceLushClayColumn(position.X, position.Z) {
+						for y := position.Y; y >= MinY; y-- {
+							fmt.Printf("  LUSHCLAY col (%d,*,%d) y=%d: %s\n",
+								position.X, position.Z, y, stateLabel(r.getBlock(position.X, y, position.Z)))
+						}
+					}
 				}
 				r.placeFeatureRef(random, position, ref, set)
 				return nil
@@ -297,6 +315,11 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			p.Z += dz
 			// Both scan phases use BlockState::isAir semantics: cave_air
 			// carved by lakes, mineshafts, and monster rooms counts as air.
+			// Vanilla walks phase 1 while the cell is AIR (bootstrap #1 =
+			// BlockStateBase::isAir) moving in the surface direction, then
+			// phase 2 while the cell is SOLID (bootstrap #2 = !isAir) moving
+			// in the opposite direction — so the candidate ends on the first
+			// air cell at the cave surface within ±vertical_range of origin.
 			current := r.getBlock(p.X, p.Y, p.Z)
 			steps := 0
 			for isAirState(current) && steps < config.VerticalRange {
@@ -379,6 +402,10 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			continue
 		}
 		fl := random.NextFloat()
+		if lushClayTrace() && len(patchSet) > 0 {
+			fmt.Printf("  VEGROLL src=(%d,%d) origin=(%d,%d,%d) cell=(%d,%d,%d) roll=%.3f pass=%v\n",
+				r.sourceX, r.sourceZ, origin.X, origin.Y, origin.Z, g[0], g[1], g[2], fl, fl < config.VegetationChance)
+		}
 		if fl >= config.VegetationChance {
 			continue
 		}

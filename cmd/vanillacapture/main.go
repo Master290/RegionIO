@@ -39,6 +39,7 @@ func main() {
 	keep := flag.Bool("keep", false, "keep the temporary vanilla world")
 	featureless := flag.Bool("featureless", false, "install a derived datapack that empties biome features and structure sets, capturing base terrain only")
 	noFeatures := flag.Bool("no-features", false, "install a derived datapack that empties biome features but keeps structure sets, capturing base terrain plus structures")
+	disablePlaced := flag.String("disable-placed", "", "install a derived datapack overriding one placed feature with count 0, disabling exactly that feature while every other feature keeps its FeatureSorter index")
 	blocksOnly := flag.Bool("blocks-only", false, "write a blocks-only fixture (RIOBASE1) without biome cells or heightmaps")
 	port := flag.Int("port", 25565, "server listen port; change it when 25565 is taken on this host")
 	flag.Parse()
@@ -76,6 +77,12 @@ func main() {
 	if *noFeatures {
 		packs := filepath.Join(work, "world", "datapacks")
 		if err := installNoFeaturesDatapack(jar, packs); err != nil {
+			fatal(err)
+		}
+	}
+	if *disablePlaced != "" {
+		packs := filepath.Join(work, "world", "datapacks")
+		if err := installDisablePlacedDatapack(jar, packs, *disablePlaced); err != nil {
 			fatal(err)
 		}
 	}
@@ -369,6 +376,83 @@ func installFeaturelessDatapack(jar, packsDir string) error {
 // capture holds base terrain plus structures and nothing else.
 func installNoFeaturesDatapack(jar, packsDir string) error {
 	return installDatapack(jar, packsDir, false)
+}
+
+// installDisablePlacedDatapack overrides one placed feature with count 0.
+// The biome feature lists are untouched, so every placed feature keeps its
+// global FeatureSorter index and every decoration random stream is unchanged;
+// the disabled feature simply places nothing. Diffing a capture against the
+// plain one therefore isolates exactly the blocks that feature writes in
+// vanilla, and which source chunks' streams reach it.
+func installDisablePlacedDatapack(jar, packsDir, placedName string) error {
+	name := strings.TrimPrefix(placedName, "minecraft:")
+	r, err := zip.OpenReader(jar)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	readPlaced := func(entries []*zip.File) ([]byte, bool) {
+		for _, entry := range entries {
+			if entry.Name == "data/minecraft/worldgen/placed_feature/"+name+".json" {
+				raw, err := readZipEntry(entry)
+				if err != nil {
+					fatal(err)
+				}
+				return raw, true
+			}
+		}
+		return nil, false
+	}
+	raw, found := readPlaced(r.File)
+	if !found {
+		for _, entry := range r.File {
+			if !strings.HasPrefix(entry.Name, "META-INF/versions/") || !strings.HasSuffix(entry.Name, ".jar") {
+				continue
+			}
+			nestedRaw, err := readZipEntry(entry)
+			if err != nil {
+				return err
+			}
+			nested, err := zip.NewReader(bytes.NewReader(nestedRaw), int64(len(nestedRaw)))
+			if err != nil {
+				return fmt.Errorf("%s: %w", entry.Name, err)
+			}
+			if nestedRaw, ok := readPlaced(nested.File); ok {
+				raw = nestedRaw
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return fmt.Errorf("placed feature %s not found in server jar", placedName)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("placed feature %s: %w", placedName, err)
+	}
+	// A "count" placement modifier at the head of the chain yields zero
+	// positions; everything downstream (and the shared decoration stream)
+	// never observes it.
+	doc["placement"] = append([]any{map[string]any{"type": "minecraft:count", "count": 0}}, doc["placement"].([]any)...)
+	root := filepath.Join(packsDir, "regionio_disable_placed")
+	placedDir := filepath.Join(root, "data", "minecraft", "worldgen", "placed_feature")
+	if err := os.MkdirAll(placedDir, 0o755); err != nil {
+		return err
+	}
+	mcmeta := `{"pack":{"description":"RegionIO disable-placed capture: ` + name + ` disabled","min_format":[101,1],"max_format":101}}`
+	if err := os.WriteFile(filepath.Join(root, "pack.mcmeta"), []byte(mcmeta), 0o644); err != nil {
+		return err
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(placedDir, name+".json"), out, 0o644); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "disable-placed datapack: %s disabled\n", placedName)
+	return nil
 }
 
 func installDatapack(jar, packsDir string, stripStructures bool) error {
