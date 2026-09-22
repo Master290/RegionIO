@@ -1773,3 +1773,51 @@ attachment with the offset in its y, the way `mega_pine` already does - output-n
 (26.1.2's dark oak uses 0), load-bearing for any pack that does not, and worth knowing because
 `fancy_foliage_placer` uses offset 4 in all six of its configs and `spruce` uses a uniform
 provider: a placer whose skip rule ever starts reading y would meet the same trap.
+
+## Surface decoration, part 7: the leaf-litter experiment, measured and reverted
+
+`place_on_ground` was ported, measured, and taken back out. The implementation is not
+the interesting part; the measurement is.
+
+**What was settled first.** Both facts this decorator had been blocked on were read off
+the bytecode. Its ground test is `Context.checkBlock(pos, BlockState::isSolidRender)` on
+the *sampled* cell, not the written one, and `isSolidRender` is not derivable from
+anything the state table already carries: it is `Block.isShapeFullBlock(canOcclude ?
+getOcclusionShape(state) : empty)`, while `isSolid()` comes from the collision shape and
+`useShapeForLightOcclusion` is a lighting question. A dumper bit was added (format 4,
+`FLAG_SOLID_RENDER = 128`) and the regenerated table was proven additive: 2,758 bytes
+differed, each by exactly +128, plus the version byte, nothing else. Its height test
+*rejects* rather than retargets — `getHeightmapPos(MOTION_BLOCKING_NO_LEAVES, pos).getY() >
+above.getY()` returns the attempt as wasted, so there is no search for the surface, and
+the three `nextIntBetweenInclusive` draws are spent on every attempt whether or not
+anything is written.
+
+**What it scored.** With the decorator live, the forest litter chain's own 50 cells held
+a leaf_litter block in 47 of 50 positions and matched exactly in 43 — the misses were
+`facing=west` where vanilla drew `north`, so the geometry was right and the weighted
+provider's index was not. That is the result the ~50-cell prize predicted.
+
+**Why it was reverted.** The same run took land from 390,767 exact cells to 390,472, the
+surface band from 704 to 965, `trees_old_growth_pine_taiga` from 100-of-100 to 39-of-100,
+and put **843** tree cells in the world where vanilla has 789. A decorator cannot create
+trees, so the decoration stream itself moved: 246 attempts and 738 draws per decorated
+tree is a cost that amplifies any upstream disagreement until it dominates the feature's
+own gain. Two candidates remain and neither is answered by reading the decorator:
+
+  - **which trees are decorated at all.** The port returned early when its own log list
+    was empty, so it is not decorating trunkless trees; what is unverified is whether the
+    *number* of decorated trees in these four chunks matches vanilla's. Vanilla's own
+    precondition is the emptiness of `TreeFeature.place`'s logs and leaves buckets, and
+    this build decides on its `placements` records, which are written by the trunk and
+    foliage setters rather than by the world - so a tree that vanilla aborted before
+    placeTrunk, or whose cells were all rejected, could still be decorated here. This
+    needs a count per chunk, not an argument.
+  - **which source chunk owns the attempt**, which is task #8: the litter chains live in
+    forest and dark forest, so every litter draw belongs to a stream that is only ordered
+    correctly if the 5x5 source attribution is correct.
+
+That is the reason it is recorded rather than shipped: with the attribution unresolved,
+the decorator's cost is unbounded and its benefit is fifty cells. Re-measure it after
+task #8, with the accepted-attempt count and the decorated-tree count printed per chunk,
+so the first question - "did we decorate trees vanilla did not?" - is answered by a line
+of output rather than by reasoning.
