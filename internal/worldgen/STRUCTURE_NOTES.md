@@ -1437,3 +1437,45 @@ The biome and plant census above is also the first evidence about *flora* rather
 trees: `leaf_litter` (50 cells) exists in 26.1.2 and our generator does not place it,
 and `patch_bush` is the feature responsible for most of what our tests currently
 count as "vanilla has leaves here". Both belong to the flora step, not the tree step.
+
+## Surface decoration, part 1: the model was wrong before the algorithm was
+
+The port starts from a claim in this file that read as a limitation of effort -
+"only straight trunks place" - and turns out to have been a limitation of types.
+`TreeFeatureConfig` declared four of `TreeConfiguration`'s nine fields, and typed
+the placer numerics as Go ints. The data does not hold ints there: pine's
+`height`, spruce's `offset`, `radius` and `trunk_height`, and mega_pine's
+`crown_height` are int providers. Measured effect on the 39 configured tree
+features in the pack, under the old struct's own rules:
+
+| outcome | count | which |
+|---|---|---|
+| decoded and validated | 34 | everything else |
+| failed to decode at all | 2 | `minecraft:pine`, `minecraft:spruce` |
+| decoded but rejected by validation | 1 | `minecraft:azalea_tree` (weighted foliage provider) |
+| decoded, validated, and **silently wrong** | 2 | `minecraft:mega_pine`, `minecraft:mega_spruce` - radius 0, height 0 |
+
+So 36 of 39 were "usable" and two of those were corrupt in the quiet way, which is
+the shape this branch keeps hitting: a field a struct does not declare is absent
+rather than missing, so nothing fails. `ea57211` carries the fix and
+`TestTreePlacerSpecMatchesThePack` re-derives its field tables from the pack; the
+commit message for it said "33 of 39" and that number was never measured - the
+table above is, and supersedes it.
+
+Two facts settled against the jar while doing this, both of which contradicted what
+this file and the plan had asserted:
+
+- The FEATURES write radius of 1 is set by `ChunkPyramid`'s step builder, not by
+  `ChunkStatus`, which carries no radius; the step requiring `CARVERS(1)` plus
+  `STRUCTURE_STARTS(8)` is the one that raises it to 1, and `WorldGenRegion`'s
+  `ensureCanWrite` enforces it. This is what makes `decoration_region.go:57-75` a
+  port rather than a simplification.
+- `TreeFeature.place` has no preamble reading the config. It collects position
+  buckets, calls `doPlace`, runs decorators only when a bucket is non-empty, and
+  returns the non-emptiness of a bounding box - not a success flag. Inside
+  `doPlace`: `getTreeHeight`, `foliageHeight`, `foliageRadius`, root-mapped origin,
+  the `minimum_size` clip through `getMaxFreeTreeHeight`, `placeRoots`,
+  `placeTrunk`, then foliage per attachment. `belowTrunkProvider` is consumed by the
+  base `TrunkPlacer` (inside `placeTrunk`), and `ignoreVines` is read in
+  `getMaxFreeTreeHeight` next to `FeatureSize.getSizeAtHeight` - so both belong to
+  the placer implementations, not to a place() prologue that does not exist.
