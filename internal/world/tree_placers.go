@@ -125,6 +125,13 @@ func (t *treePlacer) sampleHeights() error {
 		}
 		t.foliageHeight = h
 	default:
+		// What this reports is the first un-modelled part in sampling order, not the set
+		// of parts that would fail: trunkHeightFromPlacer implements the generic
+		// TrunkPlacer.getTreeHeight and so succeeds even for a trunk this build cannot
+		// place, which is why a dark_oak tree is counted here as foliage_placer and never
+		// reaches the trunk refusal in placeTrunk. Measured in the pack, the 5 configs
+		// carrying dark_oak_foliage_placer are exactly the 5 carrying
+		// dark_oak_trunk_placer - so a tally line names one class and the work needs two.
 		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
 	}
 	t.heightAboveFoliage = t.trunkHeight - t.foliageHeight

@@ -20,9 +20,10 @@ import (
 // (3072/3072) are already hard-asserted to match vanilla.
 // landSurfaceRatchet, landCellRatchet are today's measured land numbers: 945 surface-band
 // mismatches and 390,494 exact cells, with 577 of vanilla's 789 tree cells (73%). The
-// tree figure has room below it because a dark oak's canopy is un-modelled - the diagnostic
-// tally prints dark_oak_foliage_placer 32 times, and a refused tree costs its trunk as well -
-// and because the leaf litter under a birch, place_on_ground, is counted 82 times and skipped
+// tree figure has room below it because 32 dark oak trees are refused for want of their
+// placers - the tally names dark_oak_foliage_placer, and the same five configs also need
+// dark_oak_trunk_placer, so a refused tree costs its trunk as well as its canopy - and
+// because the leaf litter under a birch, place_on_ground, is counted 82 times and skipped
 // without losing the tree.
 const (
 	landSurfaceRatchet = 945

@@ -1684,3 +1684,17 @@ surface decoration deleted from it, `REGIONIO_PARITY_GENERATOR=legacy` prints
 377,329/393,216 (95.960%), where README quoted 95.959%. Re-quoted rather than explained:
 the two cells are not attributed to a cause anywhere in this tree, because attributing
 them would mean running the legacy path per feature and nothing asserts it.
+
+**The not-replayed tally names one class where the work needs two.** Of the 39 configured
+trees this build decodes, 26 have both placers modelled and no `root_placer`; the 13
+refused break down as dark_oak trunk+foliage 5, cherry trunk+foliage 2, mangrove
+`root_placer` 2, forking 1, bending 1, mega_jungle 1, `bush_foliage_placer` (`jungle_bush`)
+1. Reading that off the pack rather than off the counter matters, because
+`trunkHeightFromPlacer` implements the *generic* `TrunkPlacer.getTreeHeight` -
+`base_height` plus two `nextInt(bound+1)` terms - so it succeeds for a trunk placer this
+build cannot place, and `placeTree` reports the first un-modelled part in *sampling* order,
+which is the foliage one at `tree_placers.go:128`. The dark forest trees therefore appear
+as `foliage_placer:minecraft:dark_oak_foliage_placer=32` even though the same five configs
+(`dark_oak`, `dark_oak_leaf_litter`, `pale_oak`, `pale_oak_bonemeal`, `pale_oak_creaking`)
+also carry `minecraft:dark_oak_trunk_placer`. Porting only the foliage placer would move
+the tally line to `trunk_placer:` and place nothing.

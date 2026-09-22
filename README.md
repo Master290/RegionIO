@@ -167,8 +167,9 @@ the one heightmap that ignores canopy, holds at 97.9%, so the height under the
 decoration is right and what remains is placement: the gap sits in the conifer
 chunks (the taiga chunk places 229 of vanilla's 285 tree cells, the old-growth one
 199 of 353) while the plains pair nearly match, 37 of 37 and 112 of 114, and the
-counter the diagnostic prints names the rest — `dark_oak_foliage_placer` from a
-neighbouring forest 32 times, mushroom selectors seven, `place_on_ground` 82.
+counter the diagnostic prints names the rest — 32 `dark_oak` trees refused for want of
+their placers (the tally names `dark_oak_foliage_placer`, and the trunk class is missing
+for the same five configs), mushroom selectors seven, `place_on_ground` 82.
 Springs and flora are done; `dark_oak_foliage_placer` and the leaf litter
 `place_on_ground` paints are the next step. The ocean fixture did not move
 (330 cells, clay 96/22/9, ore parity zero), which is
