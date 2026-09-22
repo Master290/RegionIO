@@ -1347,3 +1347,93 @@ ancestry at all. `42c9bc8` above is the new number of what was first recorded as
 number, for the same reason. `pre-trailer-rewrite` is kept locally as the other half
 of that mapping; it is not a branch to build on, only a lookup table between the two
 sets of numbers.
+
+## The first land capture, and what it showed about a number that read as a pass
+
+Everything above this line was measured on four chunks that are, as it turns out,
+**not a single one of them land**. `vanilla_overworld_12345.bin` covers (0,0), (1,0),
+(0,1) and (-1,-1) at seed 12345 and every one of its 1,024 columns has `water` as its
+top block; the highest non-air cell anywhere in it is **y=62**, y 63..78 is entirely
+air, and no `log`, `leaves`, `sapling` or `bamboo` state occurs between y=60 and y=200.
+So the parity diagnostic's `surface=0` mismatched cells - quoted in README and used to
+rank the residual families - never meant "the surface is correct". It meant nothing
+above the waterline was ever generated, in the one band where decoration is visible.
+
+`testdata/vanilla_land_12345.bin` is the first capture with a surface: chunks
+(16,-40) taiga, (16,-31) old-growth pine taiga, and (-40,21), (-40,20) plains, chosen
+by scoring our own biome and height path over a grid first, which is a legitimate
+prediction only because biome and heightmap parity are separately asserted. Captured
+with the existing tool unchanged, ~30 s per run.
+
+### Baseline, printed by `TestVanillaLandBlockParity`
+
+| measure | value |
+|---|---|
+| block parity on land | 389,834/393,216 = **99.140%** (3,382 cells) vs 99.916% on ocean |
+| bands | deep 700, underground 883, waterline 51, **surface 1,748** |
+| biomes | **6,144/6,144 exact** - the biome prediction holds on land too |
+| `WORLD_SURFACE` heightmap | 417/1,024 = 40.7% |
+| `MOTION_BLOCKING` heightmap | 557/1,024 = 54.4% |
+| `MOTION_BLOCKING_NO_LEAVES` | **990/1,024 = 96.7%** |
+
+The heightmap split is the finding that decides the order of work, and it is the only
+one of the three that ignores leaves. Terrain height is therefore close to right, and
+the surface gap is canopy and undergrowth placement - so no terrain bug is hiding in
+front of the decoration port, and the 34 columns that differ even with leaves excluded
+are consistent with trunks standing in the wrong place.
+
+### Three chunks, three different failures
+
+| chunk | biome | vanilla tree cells | ours |
+|---|---|---|---|
+| (16,-40) | taiga | 285 | 296 |
+| (16,-31) | old-growth pine taiga | **353** | **57** |
+| (-40,21) | plains | 37 | **167** |
+| (-40,20) | plains | 114 | 152 |
+
+Aggregate counts would have averaged these three into "672 vs 789, slightly under".
+They are not the same bug. Dense taiga is roughly the right *amount* in the wrong
+*places*; old-growth pine taiga is a 6x shortfall, which is the hand-written path's
+own admission rate made visible - it accepts only 16 of the 39 configured trees, and
+mega trunks are not among them; and plains is the reverse failure, over-planting by
+4.5x.
+
+### What the plains chunks contain instead of trees
+
+Disabling `trees_plains` removes **zero** cells from either plains chunk. Their
+vanilla leaf cells are `oak_leaves` **with no logs anywhere near them**: 135 leaf
+cells and 50 `leaf_litter`, i.e. bushes (`patch_bush`, firefly bush), not trees. The
+data agrees: `trees_plains` opens with a `count` of
+`weighted_list {0 weight 19, 1 weight 1}` - roughly one attempt per twenty chunks -
+while `trees_taiga` and `trees_old_growth_pine_taiga` use `{10 weight 9, 11 weight 1}`.
+Our hand-written path ignores that weighting entirely and plants full canopies on
+open plains.
+
+Per-chain footprints, from the three `-disable-placed` captures of the same chunks:
+
+| chain disabled | cells it owns | composition |
+|---|---|---|
+| `trees_plains` | 0 on land (2 unrelated `cave_vines` cells, see below) | - |
+| `trees_taiga` | 197 in (16,-40) | 171 spruce_leaves, 22 spruce_log, 3 dirt→grass, 1 vine |
+| `trees_old_growth_pine_taiga` | 102 in (16,-31) | 85 spruce_leaves, 15 spruce_log, ~15 fern/grass churn |
+
+Two things worth recording about the method itself, because the clay chain made it
+look cleaner than it is.
+
+1. Removing a canopy legitimately moves *other* features: the old-growth diff also
+   turned fern and short_grass on and off. Not stream drift - `SetFeatureSeed`
+   reseeds per feature - but cause and effect through the world: `heightmap` is a
+   placement modifier, and MOTION_BLOCKING is exactly what changed. A differential
+   isolates a chain's writes plus everything that reads the heightmap through the
+   removed volume.
+2. Disabling `trees_plains` perturbed two `cave_vines` cells in a chunk whose biome
+   does not reference `trees_plains` at all. That is unexplained, small, and recorded
+   rather than rationalised: either the named placed feature is reachable from
+   somewhere else in the graph, or the count-0 modifier perturbs something the
+   reseed-per-feature argument says it cannot. Worth knowing before the technique is
+   trusted blindly on a surface chain, which is what it is about to be used for.
+
+The biome and plant census above is also the first evidence about *flora* rather than
+trees: `leaf_litter` (50 cells) exists in 26.1.2 and our generator does not place it,
+and `patch_bush` is the feature responsible for most of what our tests currently
+count as "vanilla has leaves here". Both belong to the flora step, not the tree step.

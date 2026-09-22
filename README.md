@@ -145,9 +145,14 @@ corridor carved, now places in full. What is left in the fixture is
 underground: 306 of its 330 residual cells sit below y=0 and the surface band
 contributes none, led by moss-patch extent, then ground cover, clay, and cave
 vines. Surface decoration is the larger structural gap — trees, flora, and
-springs are still hand-written, and only straight trunks place — but a zero
-count in the surface band is evidence these four chunks barely exercise it, not
-evidence that it is correct. Closing both is the road to exact equality, while
+springs are still hand-written, and only straight trunks place. That band is now
+measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four land
+chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture has no
+surface at all — top block `water` on all 1,024 columns — and land parity is 99.140%
+with 1,748 of its 3,382 residual cells in the surface band, while biomes stay
+6,144/6,144 and `MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy,
+holds at 96.7%. So the height under the decoration is close to right and the gap is
+placement. Closing both is the road to exact equality, while
 keeping cold batch generation within an acceptable latency budget.
 
 ## Project layout

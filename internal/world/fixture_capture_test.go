@@ -11,6 +11,13 @@ import (
 type fixtureChunk struct {
 	cx, cz int32
 	states []uint16
+	// biomes holds the 1536 4x4x4 biome cells (y outermost, then z, then x) and
+	// heights the two compacted 16x16 heightmaps, 384 u16 each. Callers that only
+	// need blocks ignore them; they are retained because a capture that disagrees
+	// about *where the surface is* invalidates any conclusion drawn from its blocks,
+	// and that is only checkable if the parse keeps them.
+	biomes  []uint16
+	heights []uint16
 }
 
 // at reads a chunk-local cell. The capture tool writes y outermost, then z,
@@ -26,9 +33,11 @@ type fixtureCapture struct {
 	chunks []fixtureChunk
 }
 
-// readFixtureCapture parses a RIOPAR02 capture. Biome cells and heightmaps are
-// present in the layout but advanced past, because every caller that needs them
-// reads them through the dedicated tests.
+// readFixtureCapture parses a RIOPAR02 capture, keeping blocks, biome cells and
+// the three heightmaps for every chunk. Callers that only need blocks use
+// fixtureChunk.at; the rest is retained because a capture's blocks can only be
+// interpreted if the reader can also show that the biome and the surface height
+// underneath them agree.
 func readFixtureCapture(t *testing.T, path string) fixtureCapture {
 	t.Helper()
 	f, err := os.Open(path)
@@ -67,9 +76,15 @@ func readFixtureCapture(t *testing.T, path string) fixtureCapture {
 			ch.states[j] = binary.BigEndian.Uint16(scratch[:])
 		}
 		// Biome cells (1536) then two heightmaps (2 x 384), all u16.
-		if _, err := io.CopyN(io.Discard, f, 2*int64(1536+768)); err != nil {
-			t.Fatalf("capture chunk %d biomes/heightmaps: %v", i, err)
+		tail := make([]uint16, 1536+768)
+		for j := range tail {
+			if _, err := io.ReadFull(f, scratch[:]); err != nil {
+				t.Fatalf("capture chunk %d biomes/heightmaps %d: %v", i, j, err)
+			}
+			tail[j] = binary.BigEndian.Uint16(scratch[:])
 		}
+		ch.biomes = tail[:1536]
+		ch.heights = tail[1536:]
 		out.chunks = append(out.chunks, ch)
 	}
 	return out
