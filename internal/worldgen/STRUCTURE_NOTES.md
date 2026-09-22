@@ -1737,6 +1737,16 @@ band to 704 and the tree cells to 607, while `MOTION_BLOCKING_NO_LEAVES` went 10
 1024 and the old-growth chunk's heightmap columns 466 -> 616 of 768. Ocean stayed at 330
 residual cells and the clay chain at 96/22/9 throughout.
 
+**The chain differential is the number that moved most, and it moved in the right
+direction.** With the guards fixed and dark oaks growing, `trees_taiga` matches 193 of the
+194 cells the chain owns and `trees_old_growth_pine_taiga` matches **100 of 100**, against
+192-of-194 and 39-of-100 before. Position accuracy on the chain's own footprint - not the
+total - is what says the trees are the same trees vanilla placed. The two new litter
+captures establish the next baseline: `trees_birch_and_oak_leaf_litter` owns 50 cells in
+this window and this build matches 0 of them (place_on_ground, un-ported), and
+`patch_leaf_litter` owns 4 and matches 1 - so the decorator is worth ~50 cells here, and
+its 154 cascade cells are exactly the number that must NOT be read as errors.
+
 **What the dark-oak silhouette was checked against.** The golden's numbers are derived, not
 pasted, and the derivation is worth recording because it is the only way to tell a correct
 canopy from a self-consistent one. With the pack's values (`radius` 0, `offset` 0) and a trunk

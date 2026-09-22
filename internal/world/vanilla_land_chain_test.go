@@ -19,7 +19,23 @@ const (
 	landNoTreesPlains   = "testdata/vanilla_land_notrees_plains_12345.bin"
 	landNoTreesTaiga    = "testdata/vanilla_land_notrees_taiga_12345.bin"
 	landNoTreesOldGrove = "testdata/vanilla_land_notrees_oldgrowth_12345.bin"
+	// The two chains that put leaf litter on the ground. They are separate captures
+	// because they are separate mechanisms in 26.1.2: the forest one is a placed tree
+	// selector whose winners carry place_on_ground decorators, and the dark forest one
+	// is patch_leaf_litter, a simple_block feature that paints litter with no tree at
+	// all. Measuring them together would credit the decorator for cells a scheduled
+	// feature placed.
+	landNoLitterForest     = "testdata/vanilla_land_nolitter_forest_12345.bin"
+	landNoLitterDarkForest = "testdata/vanilla_land_nolitter_darkforest_12345.bin"
 )
+
+// isLeafLitterState is the "own block" test for the litter chains. Leaf litter is not
+// a tree state - it is its own block, painted on the ground - so the tree chains'
+// isTreeState would sort every one of its cells into cascade and report a footprint of
+// zero for a feature that is plainly there.
+func isLeafLitterState(id uint16) bool {
+	return stateLabel(id) == "minecraft:leaf_litter"
+}
 
 // TestVanillaLandTreeChainDiff judges tree placement where it can actually be judged:
 // on the cells the chain owns.
@@ -45,10 +61,13 @@ func TestVanillaLandTreeChainDiff(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		capture string
+		own     func(uint16) bool
 	}{
-		{"trees_plains", landNoTreesPlains},
-		{"trees_taiga", landNoTreesTaiga},
-		{"trees_old_growth_pine_taiga", landNoTreesOldGrove},
+		{"trees_plains", landNoTreesPlains, isTreeState},
+		{"trees_taiga", landNoTreesTaiga, isTreeState},
+		{"trees_old_growth_pine_taiga", landNoTreesOldGrove, isTreeState},
+		{"trees_birch_and_oak_leaf_litter", landNoLitterForest, isLeafLitterState},
+		{"patch_leaf_litter", landNoLitterDarkForest, isLeafLitterState},
 	} {
 		if _, err := os.Stat(tc.capture); err != nil {
 			t.Skipf("chain capture not installed: %v", err)
@@ -80,12 +99,12 @@ func TestVanillaLandTreeChainDiff(t *testing.T) {
 							}
 							anyDifference++
 							ours := mine.GetBlock(x, y, z)
-							if isTreeState(vanilla) || isTreeState(disabled) {
+							if tc.own(vanilla) || tc.own(disabled) {
 								trunkOrCanopy++
 								if ours == vanilla {
 									matched++
 								}
-								if isTreeState(ours) {
+								if tc.own(ours) {
 									oursPlaces++
 								}
 								if ours != vanilla {
@@ -108,7 +127,7 @@ func TestVanillaLandTreeChainDiff(t *testing.T) {
 				t.Fatalf("the plain and %s-disabled captures are identical, so -disable-placed did not take effect", tc.name)
 			}
 			if trunkOrCanopy == 0 {
-				t.Skipf("%s owns %d cells in this window and none of them is a trunk or canopy, so no position score is available here",
+				t.Skipf("%s owns %d cells in this window and none of them holds a block of this chain's own kind, so no position score is available here",
 					tc.name, anyDifference)
 			}
 			type pair struct {
@@ -123,7 +142,13 @@ func TestVanillaLandTreeChainDiff(t *testing.T) {
 				if ranked[i].n != ranked[j].n {
 					return ranked[i].n > ranked[j].n
 				}
-				return ranked[i].n > ranked[j].n && ranked[i].ours < ranked[j].ours
+				// Tie-break on the state pair, because sort.Slice is not stable and a
+				// map iteration order that varies between runs would make the printed
+				// "top misses" line unreadable as a regression signal.
+				if ranked[i].vanilla != ranked[j].vanilla {
+					return ranked[i].vanilla < ranked[j].vanilla
+				}
+				return ranked[i].ours < ranked[j].ours
 			})
 			shown := make([]string, 0, 6)
 			for i, r := range ranked {
@@ -135,7 +160,7 @@ func TestVanillaLandTreeChainDiff(t *testing.T) {
 					stateLabel(r.ours), stateProperties(r.ours), stateLabel(r.vanilla), stateProperties(r.vanilla), r.n))
 			}
 			t.Logf("%s on the cells it missed: %s", tc.name, strings.Join(shown, ", "))
-			t.Logf("%s: the chain's own blocks cover %d cells, of which ours matches %d (%.1f%%) and holds a tree state in %d (%.1f%%); %d further cells differ only because the rest of the stream reacted",
+			t.Logf("%s: the chain's own blocks cover %d cells, of which ours matches %d (%.1f%%) and holds one of its own blocks in %d (%.1f%%); %d further cells differ only because the rest of the stream reacted",
 				tc.name, trunkOrCanopy, matched, 100*float64(matched)/float64(trunkOrCanopy),
 				oursPlaces, 100*float64(oursPlaces)/float64(trunkOrCanopy), cascade)
 		})
