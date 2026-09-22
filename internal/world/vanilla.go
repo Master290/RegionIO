@@ -567,7 +567,6 @@ func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64,
 }
 
 func decorateNonOre(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string, r *chunkRand) {
-	placeVanillaSprings(c, seed, cx, cz, biomeName)
 	placeFlora(c, r, surfTop, grass, biomeName)
 	placeDesertFeatures(c, r, surfTop, biomeName)
 	placeRocks(c, r, surfTop, grass, biomeName)

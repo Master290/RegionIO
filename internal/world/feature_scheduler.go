@@ -77,6 +77,12 @@ func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, se
 		if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
 			return fmt.Errorf("world: replay source underground ores (%d,%d): %w", source.X, source.Z, err)
 		}
+		// Stage 8 sits between the ores and the vegetation, as vanilla's step order
+		// has it: a spring reads the rock the veins left behind and the canopy that
+		// comes after must not have grown into it yet.
+		if err := r.placeScheduledSprings(seed); err != nil {
+			return fmt.Errorf("world: replay source springs (%d,%d): %w", source.X, source.Z, err)
+		}
 		if err := r.placeScheduledVegetationPatches(seed); err != nil {
 			return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
 		}
