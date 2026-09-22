@@ -172,24 +172,23 @@ func vanillaRegionBatchGeneratorFromInputs(seed int64, od *worldgen.OverworldDen
 
 func decorateGeneratedNonOre(c *Chunk, od *worldgen.OverworldDensity, seed int64) {
 	var surfTop [16][16]int
-	var grass [16][16]bool
 	var biomeName [16][16]string
 	baseX, baseZ := int(c.X)*16, int(c.Z)*16
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
-			surfTop[x][z], grass[x][z] = classifyColumnAtSurface(c, x, z)
+			surfTop[x][z] = classifyColumnTopAtSurface(c, x, z)
 			biomeName[x][z] = BiomeNameAt(od, baseX+x, baseZ+z)
 		}
 	}
-	r := newChunkRand(c.X, c.Z, seed)
-	decorateNonOre(c, od, c.X, c.Z, seed, &surfTop, &grass, &biomeName, &r)
+	decorateNonOre(c, od, c.X, c.Z, seed, &surfTop, &biomeName)
 }
 
-func classifyColumnAtSurface(c *Chunk, x, z int) (top int, grass bool) {
+func classifyColumnTopAtSurface(c *Chunk, x, z int) int {
 	var column [WorldHeight]uint16
 	for i := 0; i < WorldHeight; i++ {
 		column[i] = c.GetBlock(x, MinY+i, z)
 	}
-	return classifyColumn(&column)
+	top, _ := classifyColumn(&column)
+	return top
 }
 

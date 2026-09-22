@@ -114,9 +114,8 @@ func generateVanillaWithoutDecoration(od *worldgen.OverworldDensity, fluidPicker
 func generateVanillaDecorated(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32, withDecoration bool) *Chunk {
 	data := generateBaseTerrain(od, fluidPicker, veins, carver, seed, cx, cz)
 	c := data.c
-	surfTop, grass := data.surfTop, data.grass
 	if withDecoration {
-		decorate(c, od, cx, cz, seed, surfTop, grass, data.biomeName)
+		decorate(c, od, cx, cz, seed, data.surfTop, data.biomeName)
 	}
 	return c
 }
@@ -129,7 +128,6 @@ type baseTerrain struct {
 	columns      *[16][16][WorldHeight]uint16
 	worldSurface *[16][16]int // topmost non-air Y before carving
 	surfTop      *[16][16]int
-	grass        *[16][16]bool
 	biomeName    *[16][16]string
 }
 
@@ -192,7 +190,6 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	var columns [16][16][WorldHeight]uint16
 	var surfTop [16][16]int      // top solid index, -1 if none
 	var worldSurface [16][16]int // topmost non-air Y, the WORLD_SURFACE_WG heightmap
-	var grass [16][16]bool       // grassy land surface (tree-plantable)
 
 	// Terrain and fluids first, for the whole chunk. The surface pass has to
 	// wait for all of it: the "steep" condition reads the heights of the
@@ -204,7 +201,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 			defer wg.Done()
 			interp := make([]float64, len(od.Interpolated))
 			for lz := 0; lz < 16; lz++ {
-				surfTop[lx][lz], worldSurface[lx][lz], grass[lx][lz] =
+				surfTop[lx][lz], worldSurface[lx][lz] =
 					fillVanillaColumn(od, aq, fluidPicker, veins, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
 			}
 		}(lx)
@@ -246,7 +243,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 		// the same reason.
 		for lx := 0; lx < 16; lx++ {
 			for lz := 0; lz < 16; lz++ {
-				surfTop[lx][lz], grass[lx][lz] = classifyColumn(&columns[lx][lz])
+				surfTop[lx][lz], _ = classifyColumn(&columns[lx][lz])
 			}
 		}
 	}
@@ -265,7 +262,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	return baseTerrain{
 		c: c, columns: &columns,
 		worldSurface: &worldSurface, surfTop: &surfTop,
-		grass: &grass, biomeName: &biomeName,
+		biomeName: &biomeName,
 	}
 }
 
@@ -301,7 +298,7 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.
 }
 
 // fillVanillaColumn lays the blocks for one column and returns the top solid
-// index and whether the surface is grassy land (suitable for trees).
+// index and the topmost non-air Y.
 //
 // The order matches vanilla: the density pass decides stone-or-not, the aquifer
 // turns every non-stone position into air, water or lava (and can also seal a
@@ -309,7 +306,7 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.
 // then does the surface rule tree walk the finished column. Doing it the other
 // way round is what forced the old unconditional "flood everything under sea
 // level" pass, which left every cave below y=63 underwater.
-func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int, grass bool) {
+func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int) {
 	cx0 := lx / cellWidth
 	cz0 := lz / cellWidth
 	fx := float64(lx%cellWidth) / cellWidth
@@ -335,8 +332,7 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 		}
 	}
 
-	_, grass = classifyColumn(out)
-	return top, worldSurface, grass
+	return top, worldSurface
 }
 
 // classifyColumn returns the top solid index and whether that surface is
@@ -556,18 +552,18 @@ func bedrockAt(rng *chunkRand, d int) bool {
 	return rng.nextFloat() < 1.0-float64(d)/5.0
 }
 
-// decorate places simple oak trees on grassy columns. Trunks are kept two
-// blocks inside the chunk so the radius-2 canopy never crosses into a neighbour
-// (avoiding cross-chunk coordination); placement is deterministic per chunk.
-func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
-	r := newChunkRand(cx, cz, seed)
-
+// decorate is the legacy per-chunk decoration entry point: the hand-written ore
+// scatter, then structures. It places no surface decoration — trees, springs,
+// flora, desert features and rocks replay from the datapack in the region path
+// (vegetation_patches.go, springs.go, block_blob.go). This generator exists to be
+// compared against that one, so keeping a second copy of a feature here would only
+// measure the wrong thing.
+func decorate(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, biomeName *[16][16]string) {
 	placeVanillaOres(c, seed, cx, cz, biomeName)
-	decorateNonOre(c, od, cx, cz, seed, surfTop, grass, biomeName, &r)
+	decorateNonOre(c, od, cx, cz, seed, surfTop, biomeName)
 }
 
-func decorateNonOre(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string, r *chunkRand) {
-
+func decorateNonOre(c *Chunk, od *worldgen.OverworldDensity, cx, cz int32, seed int64, surfTop *[16][16]int, biomeName *[16][16]string) {
 	// Place large structures like villages and strongholds
 	worldgen.PlaceStructures(c, od, cx, cz, seed, surfTop, biomeName)
 }

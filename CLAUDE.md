@@ -161,24 +161,25 @@ parse time).
 
 Known gaps, roughly in order of how visible they are:
 
-- **Feature replay covers the underground stages, not everything.** `worldgen/features.go` parses
+- **Feature replay covers most of the decoration steps, not every configured type.** `worldgen/features.go` parses
   the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
-  production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes, the
-  whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
-  disks, disk features), lush-cave vegetation patches, and stage-3 monster rooms — see
-  `world/feature_scheduler.go`, `world/region_ores.go`, and `world/monster_rooms.go`. Of the
+  production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes and
+  boulders (`world/geodes.go`, `world/block_blob.go`), stage-3 monster rooms (`world/monster_rooms.go`),
+  the whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
+  disks, disk features), stage-8 springs (`world/springs.go`), and stage-9 vegetation — lush-cave
+  patches plus trees, flowers, grass and mushrooms (`world/vegetation_patches.go`,
+  `world/tree_features.go`) — see `world/feature_scheduler.go` and `world/region_ores.go`. Of the
   structure sets, ruined portals (`world/ruined_portal.go`), ocean ruins (`world/ocean_ruin.go`,
   with the post-placement falling-gravel/bubble-column/water-refill physics vanilla's block ticks
   add), and mineshafts (`world/mineshafts.go`, verified against the saved vanilla start NBT
   piece-for-piece and against a structures-only capture cell-for-cell) replay from their datapack
-  configurations. Both stage-1 lava lakes replay from `world/lakes.go` — 26.1.2 has no water-lake
-  configured feature left, so `LakeFeature`'s freeze pass never fires. What is still
-  hand-written is the surface decoration dispatcher at
-  `world/vanilla.go:569-573`: springs (`springs.go`), flora, desert features and rocks
-  (`features.go`). "Hand-written" is not "unused": this is the path the legacy per-chunk
-  generator takes, reached from `decorateGeneratedNonOre` at `world/region_generator.go:173`,
-  and it now places **no trees at all** — the legacy generator is a comparison fallback, not a
-  second tree implementation.
+  configurations. 26.1.2 has no water-lake configured feature left, so `LakeFeature`'s freeze pass
+  never fires. What is still hand-written is the ore scatter of the
+  **legacy per-chunk generator** (`placeVanillaOres` in `world/placed_features.go`, reached from
+  `decorateGeneratedNonOre` at `world/region_generator.go:173`); after this branch deleted its
+  trees, springs, flora, desert features and rocks it places no surface decoration at all, which
+  is fine because that generator is a comparison fallback
+  (`REGIONIO_PARITY_GENERATOR=legacy`) and not a second implementation.
 - **Trees are vanilla's own algorithm**: three trunk placers (straight, giant, fancy), five
   foliage placers (blob, pine, spruce, mega pine, fancy) and the beehive and alter-ground
   decorators, each transcribed from `javap -p -c` output and pinned by a silhouette golden in
