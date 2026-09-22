@@ -381,17 +381,41 @@ func TestAlterGroundPaintsUnderAGrassFloor(t *testing.T) {
 	t.Logf("%d podzol cells under the mega pine", painted)
 }
 
-// TestUnknownDecoratorFailsLoudly keeps a decorator this build has not read from being
-// mistaken for one that did nothing.
-func TestUnknownDecoratorFailsLoudly(t *testing.T) {
+// TestUnmodelledDecoratorLeavesTheTreeStanding is the deliberate asymmetry between a
+// missing placer and a missing decorator. A canopy placer this build has not read means
+// the tree has no body, so the whole tree is refused. A decorator runs after the trunk
+// and the canopy are in the world, so refusing the tree for it costs the canopy too -
+// which is exactly what happened when this was symmetrical: place_on_ground, the leaf
+// litter under a birch, is un-modelled, and vetoing on it removed 101 trees from the
+// four land chunks and put the surface band back from 1,247 mismatches to 1,362.
+func TestUnmodelledDecoratorLeavesTheTreeStanding(t *testing.T) {
 	stone := mustState("minecraft:stone", nil)
 	planter := decoratorPlacer(t, "minecraft:oak_bees_005", func(int, int) uint16 { return stone })
 	planter.config.Decorators = []worldgen.TreeDecorator{{
 		Type:   "minecraft:pale_moss",
 		Fields: map[string]json.RawMessage{},
 	}}
-	if err := planter.placeDecorators(planter.set); err == nil {
-		t.Fatal("pale_moss decorated a tree without being implemented")
+	if err := planter.sampleHeights(); err != nil {
+		t.Fatal(err)
+	}
+	ResetNotReplayed()
+	if err := planter.placeTrunk(8, 71, 8); err != nil {
+		t.Fatal(err)
+	}
+	if err := planter.placeDecorators(planter.set); err != nil {
+		t.Fatalf("an un-modelled decorator failed the tree: %v", err)
+	}
+	if counts := NotReplayed(); counts["tree_decorator:minecraft:pale_moss"] == 0 {
+		t.Error("the un-modelled decorator was skipped without being counted by name")
+	}
+	logs := 0
+	for _, p := range planter.placements {
+		if p.isLog {
+			logs++
+		}
+	}
+	if logs == 0 {
+		t.Error("the tree placed no trunk, so refusing the decorator would have cost a whole tree")
 	}
 }
 

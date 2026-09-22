@@ -1605,3 +1605,39 @@ One honest negative: the four land chunks contain **no mossy cobblestone in vani
 all**, so `forest_rock`'s replay is mechanically correct and unconfirmed by this fixture -
 it paints two cells vanilla does not have. A capture of a windswept or old-growth column
 that actually holds a boulder is what would settle it.
+
+## Surface decoration, part 4: leaves carry a propagated property, and a decorator is not a placer
+
+**A generated leaf's `distance` is not chosen by the placer.** `LeavesBlock` declares
+`distance=7`; `getDistanceAt` answers 0 for a log, the stored value for another leaf, and
+7 for anything else, and a leaf's own value is `min(7, 1 + that)` over the **six axis
+neighbours** - not the twenty-six a Chebyshev ball would suggest. `updateShape` never
+writes: when the value would change it schedules a one-tick recompute, and
+`LeavesBlock.tick` is the thing that finally calls `updateDistance` and sets the block.
+A saved region is therefore a world whose queued leaf ticks have already run, and the
+comparable target is the settled fixpoint, not a single pass at placement time. That one
+property was the entire taiga error: `trees_taiga` owns 194 cells, and we held a tree
+state in 193 of them while matching the exact block in 23. Settling the distance takes
+that to 192 of 194.
+
+**A missing decorator must not veto its tree, and a missing placer must.** The asymmetry
+is measured, not stylistic: `TreeFeature.place` runs decorators after `doPlace` has put
+the trunk and canopy in the world, so refusing a tree over a decorator it cannot run
+throws away a body that vanilla does place. `place_on_ground` - the leaf litter and
+shrubs under birches and beeches - is un-modelled and appears 164 times across the four
+land chunks; vetoing on it there removed 101 whole trees and pushed the surface band from
+945 mismatches back up to 1,362. So `supportsAllParts` checks trunk and foliage placers
+only, and `placeDecorators` counts an un-modelled decorator by name and carries on.
+
+**A pre-flight check has to be free.** The first version of `supportsAllParts` asked the
+trunk placer for its height to confirm the fields were readable - which is
+`getTreeHeight`, two `nextInt` calls - so merely validating a config shifted the
+decoration stream. It halved the taiga match rate (192 of 194 down to 95) with no
+placement logic changed at all, which is the clearest demonstration in this branch of
+what a moved draw is worth. `TestSupportsAllPartsSpendsNoDraws` now compares a checked
+generator against an unchecked one, and was seen to fail when the drawing call was put
+back.
+
+Land is now 390,494/393,216 exact (99.308%), surface band 945 mismatches against the
+1,748 the hand-written path left, `MOTION_BLOCKING_NO_LEAVES` 97.9%. The ocean fixture
+still does not move: 330 residual cells, clay 96/22/9, ore parity zero.

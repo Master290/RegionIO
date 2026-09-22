@@ -18,13 +18,14 @@ import (
 // plains, seed 12345, chosen by sampling our own biome and height path first:
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
-// landSurfaceRatchet, landCellRatchet are the measured land numbers as of the trees,
-// springs, boulders and flora work: 1,328 surface-band mismatches, 390,111 exact cells,
-// and 660 of vanilla's 789 tree cells (83%%). The tree figure has room below it because
-// a dark oak in a border forest is still un-modelled.
+// landSurfaceRatchet, landCellRatchet are today's measured land numbers: 945 surface-band
+// mismatches and 390,494 exact cells, with 577 of vanilla's 789 tree cells (73%%). The
+// tree figure has room below it because a dark oak's canopy is un-modelled - 32 refusals
+// over these chunks, and a refused tree costs its trunk as well - and because the leaf
+// litter under a birch, place_on_ground, is counted 164 times and skipped.
 const (
-	landSurfaceRatchet = 1328
-	landCellRatchet    = 390111
+	landSurfaceRatchet = 945
+	landCellRatchet    = 390494
 )
 
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"

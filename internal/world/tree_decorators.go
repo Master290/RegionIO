@@ -80,7 +80,10 @@ func (t *treePlacer) placeDecorators(set *worldgen.FeatureSet) error {
 				return err
 			}
 		default:
-			return &unmodelledPart{kind: "tree_decorator", name: decorator.Type}
+			// Counted and skipped, not fatal, and not silent: the tree stands because
+			// a decorator cannot undo the trunk, and the gap is reported by name in
+			// the parity diagnostics so it stays a known thing rather than a rumour.
+			noteNotReplayed("tree_decorator:" + decorator.Type)
 		}
 	}
 	return nil

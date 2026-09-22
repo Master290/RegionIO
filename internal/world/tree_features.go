@@ -30,6 +30,12 @@ func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.R
 	if err := planter.sampleHeights(); err != nil {
 		return err
 	}
+	// Checked here rather than discovered halfway: sampleHeights has already spent the
+	// tree's own draws by this point - vanilla spends them the same way - but nothing has
+	// been written, so a tree this build cannot finish leaves no trace in the world.
+	if err := planter.supportsAllParts(); err != nil {
+		return err
+	}
 
 	// doPlace's y test, with the sampled trunk height rather than the clamped one:
 	// low = min(origin, origin) and high = max(origin, origin) + trunkHeight + 1.
@@ -45,7 +51,18 @@ func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.R
 	// From here the trunk height that matters is the free one. The foliage height and
 	// radius were sampled from the sampled height and are not recomputed.
 	planter.trunkHeight = free
-	return planter.placeTrunk(position.X, position.Y, position.Z)
+	if err := planter.placeTrunk(position.X, position.Y, position.Z); err != nil {
+		return err
+	}
+	// Leaves are written at their registry default and LeavesBlock works the distance
+	// out afterwards, one neighbour at a time until nothing moves; a saved region is a
+	// world whose queued leaf ticks have already run, so settling the property here is
+	// what makes the capture comparable.
+	planter.applyLeafDistance()
+	// TreeFeature.place runs the decorators after doPlace has finished, over what the
+	// tree recorded - which is why they see the trunk's own cell below the floor as a
+	// log, and why an un-modelled one is reported rather than passed over.
+	return planter.placeDecorators(set)
 }
 
 // maxFreeTreeHeight is TreeFeature.getMaxFreeTreeHeight: the tallest prefix of the

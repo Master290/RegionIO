@@ -426,6 +426,39 @@ func (t *treePlacer) placeLogWithAxis(x, y, z int, axis string) error {
 	return nil
 }
 
+// supportsAllParts answers, before a single block is written, whether every placer and
+// decorator this config names has been modelled.
+//
+// Without it an un-modelled canopy left a finished trunk behind: placeTrunk paints the
+// logs and only then does the foliage switch fail, so a dark oak in a border forest put
+// 57 log cells into the land chunks and no leaves anywhere, which is worse than not
+// placing the tree - it is a trunk with nothing on it, plus a stream that has already
+// spent its draws. The check is pure, so the tree either places as a whole or not at all.
+func (t *treePlacer) supportsAllParts() error {
+	// Type lookups only. Asking the placer for its height would sample the two
+	// nextInt calls getTreeHeight makes, and a check that runs before the decision has
+	// to leave the stream exactly where it found it - the same rule that makes a
+	// rejected cell free everywhere else in this file.
+	switch t.config.TrunkPlacer.Type {
+	case "minecraft:straight_trunk_placer", "minecraft:giant_trunk_placer", "minecraft:fancy_trunk_placer":
+	default:
+		return &unmodelledPart{kind: "trunk_placer", name: t.config.TrunkPlacer.Type}
+	}
+	switch t.config.FoliagePlacer.Type {
+	case "minecraft:blob_foliage_placer", "minecraft:fancy_foliage_placer", "minecraft:pine_foliage_placer",
+		"minecraft:spruce_foliage_placer", "minecraft:mega_pine_foliage_placer":
+	default:
+		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
+	}
+	// Decorators are deliberately not checked here. A canopy placer this build has not
+	// read means the tree has no body, so refusing it is right; a decorator runs after
+	// the trunk and canopy are already in the world, so the only thing an un-modelled
+	// one costs is its own blocks. Refusing the tree for that lost 101 of them over the
+	// four land chunks - place_on_ground, the leaf litter under birches - and every
+	// canopy they should have had. placeDecorators counts and skips them instead.
+	return nil
+}
+
 // isFree is TrunkPlacer.isFree: a trunk may also grow through an existing log,
 // which validTreePos alone would refuse. Giant trunks test this, straight ones test
 // validTreePos, and the difference is visible on the second column of a mega tree

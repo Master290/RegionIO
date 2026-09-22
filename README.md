@@ -154,10 +154,11 @@ measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.210% (3,105 residual, 1,328 in the surface band) with the
-replayed ones, after springs and boulders joined the schedule and the flora
-percentages were deleted, and the cells above sea level that hold a trunk, canopy
-or plant went from zero to 660 against vanilla's 789. `MOTION_BLOCKING_NO_LEAVES`,
+hand-written trees, to 99.308% (2,722 residual, 945 in the surface band) with the
+replayed ones, after springs and boulders joined the schedule, the flora percentages
+were deleted and leaves were given the distance property vanilla propagates into
+them; the cells above sea level that hold a trunk, canopy or plant went from zero to
+577 against vanilla's 789. `MOTION_BLOCKING_NO_LEAVES`,
 the one heightmap that ignores canopy, holds at 97.9%, so the height under the
 decoration is right and what remains is placement: the four chunks still disagree
 in both directions (one taiga chunk places 200 of vanilla's 353 tree cells, one

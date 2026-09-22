@@ -370,3 +370,24 @@ func symbolize(id uint16) (string, string) {
 	}
 	return name.Name, "?"
 }
+
+// TestSupportsAllPartsSpendsNoDraws is the guard on the pre-flight check itself. The
+// first version asked the trunk placer for its height, which is two nextInt calls, so
+// simply validating a config shifted the stream and the taiga match rate fell from
+// 192-of-194 to 95-of-194 with no logic changed at all. A check that decides whether a
+// tree may place must leave the generator where it found it.
+func TestSupportsAllPartsSpendsNoDraws(t *testing.T) {
+	stone := mustState("minecraft:stone", nil)
+	// Two identical generators: one reads the stream straight away, the other checks its
+	// own config first. If the check is free the two sequences agree; if it drew
+	// anything, they diverge - which is what happened when this test was written and
+	// the check was calling getTreeHeight.
+	checked := decoratorPlacer(t, "minecraft:oak_bees_005", func(int, int) uint16 { return stone })
+	if err := checked.supportsAllParts(); err != nil {
+		t.Fatalf("the config in this fixture should be supported: %v", err)
+	}
+	free := decoratorPlacer(t, "minecraft:oak_bees_005", func(int, int) uint16 { return stone })
+	if got, want := drawStream(checked.random), drawStream(free.random); got != want {
+		t.Errorf("a config that was checked first diverges from one that was not: %v vs %v", got, want)
+	}
+}
