@@ -703,6 +703,39 @@ exactly the ones we already place):
 | 29 (what `FeatureSchedule` reports) | **(5,-29,12) and (5,-30,13) - vanilla's pair** |
 | the other 39 values | no pool, or a different one |
 
+The full ranking, `make clay-index-sweep`, score 1 only when the pools are exactly
+vanilla's pair for source (0,0):
+
+```
+index  0  0   nothing                     index 21  0   (8,-29,2) (5,-52,1)
+index  1  0   nothing                     index 22  0   (6,-30,14)
+index  2  0   nothing                     index 23  0   nothing
+index  3  0   (14,-41,4) (6,-28,5)        index 24  0   (1,-41,12)
+index  4  0   nothing                     index 25  0   (6,-52,1)
+index  5  0   (5,-25,2)                   index 26  0   nothing
+index  6  0   nothing                     index 27  0   (12,-42,7)
+index  7  0   nothing                     index 28  0   (3,-16,7)
+index  8  0   nothing                     index 29  1   (5,-29,12) (5,-30,13) <- vanilla
+index  9  0   (9,-15,11)                  index 30  0   nothing
+index 10  0   (7,-15,9)                   index 31  0   nothing
+index 11  0   nothing                     index 32  0   nothing
+index 12  0   (7,-51,1)                   index 33  0   nothing
+index 13  0   (1,-47,14) (12,-41,13)      index 34  0   (5,-29,10) (3,-53,3)
+            (5,-29,11)                    index 35  0   (2,-24,5)
+index 14  0   (8,-51,2)                   index 36  0   nothing
+index 15  0   nothing                     index 37  0   nothing
+index 16  0   (3,-53,3)                   index 38  0   nothing
+index 17  0   (5,-54,5)                   index 39  0   nothing
+index 18  0   (13,-42,10) (0,-24,5)       index 40  0   nothing
+index 19  0   nothing
+index 20  0   nothing
+```
+
+Two near misses are what make the sharpness concrete rather than assumed: 13 places
+`(5,-29,11)`, one block off vanilla's `(5,-29,12)`, and 34 places `(5,-29,10)`. So a
+wrong index does sometimes land in the same neighbourhood, and a score counting
+"near the right place" would have been ambiguous where an exact one is not.
+
 Distribution over 0..40: 22 indices place no pool at all, 13 place one, 5 place
 two, one places three. So the sweep is sharply sensitive to the index - the curve
 is nowhere near flat, which is what makes a single hit mean something - and 29 is
