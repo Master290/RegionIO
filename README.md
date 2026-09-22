@@ -143,8 +143,9 @@ cell-for-cell against a structures-only capture) replay from the datapack —
 the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
 corridor carved, now places in full. What is left in the fixture is
 underground: 306 of its 330 residual cells sit below y=0 and the surface band
-contributes none, led by moss-patch extent, then ground cover, clay, and cave
-vines. Surface decoration was the larger structural gap and has now been
+contributes none, led by the moss-patch cell disagreement — which per-target nets
+show is about which cells a patch covers, not how far it reaches — then ground cover,
+clay, and cave vines. Surface decoration was the larger structural gap and has now been
 reached: the hand-written tree path is deleted and trees replay from the
 datapack schedule through real trunk and foliage placers — straight, giant and
 fancy trunks, blob, pine, spruce, mega-pine and fancy canopies, with the beehive

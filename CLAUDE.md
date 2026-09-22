@@ -215,10 +215,16 @@ vanilla start NBT and cell-for-cell against a structures-only capture, which is 
 fixture's (-1,-1) pocket — a monster room whose wall opening a mineshaft corridor carved.
 
 The residual is now one family, not a tail: `moss_block`↔`deepslate` is 82 cells (59 where vanilla
-has moss and we have deepslate, 23 the other way), then the ground-cover shuffle
-(`short_grass`/`moss_carpet`/`tall_grass`/`air`, ~54), lush-cave clay at 22, cave vines ~21, kelp 8,
-dripleaves ~12. Net we place 35 fewer moss cells than vanilla, which reads as an extent or radius
-difference in `moss_patch` rather than a position-stream one.
+has moss and we have deepslate, 23 the other way), and lush-cave clay is 22. Everything else in the
+330 is a shuffle among ground cover, cave vines, kelp and dripleaves, and those counts are printed
+rather than quoted here: run the parity test under `REGIONIO_PARITY_DIAGNOSTIC=1` and it lists the
+net per state and the split by y band. Numbers written into a document go stale the moment the
+fixture is re-measured, which has already happened to this sentence three times.
+
+The one reading that was held and is now known wrong: a net of 35 fewer moss cells was taken as an
+extent or radius difference in `moss_patch`. It is not. Per-target nets inside that family point in
+both directions (+15, -8, -13, -29 across the four chunks), so the patch covers what vanilla covers
+and the disagreement is which cells within it, which is a position-stream question like the rest.
 
 The lush-cave clay pools used to be the headline defect — one waterlogged pool landing fifteen blocks
 off in chunk (-1,-1), with moss and vine positions cascading from it. That is closed: `2c29024`
