@@ -281,12 +281,20 @@ debug instrumentation left in `internal/world` has twice broken the package's bu
 plain build could not see. GitHub Actions mirrors the target as its own `diagnostics` job, because
 `make` is not on the runner - so a probe added to one list needs adding to the other.
 
-Not every gated diagnostic runs there, deliberately. The ore-path and capture-comparison probes are
-on-demand because they need captures the runner does not carry, and the clay index sweep re-runs
-the schedule 41 times; `make clay-index-sweep` is its driver, and
-`TestLushClayPositionsAreRecorded` asserts the two decisive points of its result on every run
-instead. The rule worth keeping: a diagnostic whose finding matters should end up asserted, not
-merely printed - a `t.Logf` no one diffs silently survives the thing it was written to detect.
+Every gate the source reads is set by some runner, or excused in writing in
+`excusedGates` inside `TestEveryDiagnosticGateIsReachable`, which compares the names
+in the Go source against the names the Makefile and the workflow assign values to and
+fails in both directions — a gate nothing sets, and a variable nothing reads. It was
+written after an audit found two ways that had already happened: the consolidated
+trace flag is `REGIONIO_LUSH_CLAY_TRACE` while both runners set only
+`REGIONIO_CLAY_TRACE`, which gates the test layer instead, so the in-generator traces
+ran in no CI job; and six ore diagnostics plus the trapezoid one had no runner at all.
+`REGIONIO_LUSH_CLAY_PROBE_INDEX` is set by `make clay-index-sweep` rather than by CI —
+the sweep replays the schedule 41 times for about a minute — and its two decisive
+points are asserted on every run by `TestLushClayPositionsAreRecorded` instead. The
+rule worth keeping: a diagnostic whose finding matters should end up asserted, not
+merely printed - a `t.Logf` no one diffs silently survives the thing it was written
+to detect.
 
 One more convention, because a machine-local path did get committed once. A diagnostic must not
 name one: write to `t.TempDir()`, or to a repo path that `.gitignore` already carries

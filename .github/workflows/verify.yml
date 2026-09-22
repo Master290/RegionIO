@@ -89,19 +89,46 @@ jobs:
       - run: go test -run TestNothingMatchesThis ./...
       - env:
           REGIONIO_CLAY_TRACE: "1"
+          REGIONIO_LUSH_CLAY_TRACE: "1"
           REGIONIO_LUSH_CLAY_PROBE: "1"
           REGIONIO_CLAY_MISMATCH_DIAG: "1"
           REGIONIO_ORE_SCHEDULE_DIAGNOSTIC: "1"
           REGIONIO_MOSS_PATCH_DIAGNOSTIC: "1"
           REGIONIO_BASE_TERRAIN_DIAGNOSTIC: "1"
+          REGIONIO_KELP_TRACE: "1"
         run: >-
-          go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual|BaseTerrain'
+          go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual|BaseTerrain|Kelp'
           ./internal/world -count=1
+      # Every gate the source reads is set by some step here or excused in
+      # excusedGates, which TestEveryDiagnosticGateIsReachable checks both ways. The
+      # ore family and the trapezoid diagnostic were gated with no runner at all,
+      # and the in-generator trace flag was set under a different flag's name.
+      - env:
+          REGIONIO_ORE_FEATURE_DIAGNOSTIC: "1"
+          REGIONIO_ORE_INDEX_DIAGNOSTIC: "1"
+          REGIONIO_ORE_ORDER_DIAGNOSTIC: "1"
+          REGIONIO_ORE_ORDER_PARITY_DIAGNOSTIC: "1"
+          REGIONIO_REGION_ORE_DIAGNOSTIC: "1"
+          REGIONIO_SINGLE_CHUNK_ORE_DIAGNOSTIC: "1"
+        run: go test -run 'Ore' ./internal/world -count=1
+      - env:
+          REGIONIO_TRAPEZOID_DIAGNOSTIC: "1"
+        run: go test -run Trapezoid ./internal/worldgen -count=1
       - env:
           REGIONIO_LUSH_CLAY_PROBE: "1"
           REGIONIO_LUSH_CLAY_PROBE_STATE: "1"
+          REGIONIO_SETBLOCK_TRACE: "-15,-16,-13;-15,-17,-13"
         # -v because these are printf diagnostics: without it `go test` discards
         # the output, and a log with no table in it cannot show a finding moving.
+        run: go test -run TestProbeLushClayStream ./internal/world -count=1 -v
+      - env:
+          REGIONIO_LUSH_CLAY_PROBE: "1"
+          REGIONIO_LUSH_CLAY_PROBE_STATE: "1"
+          REGIONIO_LUSH_CLAY_PROBE_TARGET: "-1,-1"
+          REGIONIO_LUSH_CLAY_PROBE_SOURCE: "-1,-1"
+        # The chunk decorationSources has no branch for, and the one that carries a
+        # third of the residual. Its position table is asserted by
+        # TestLushClayPositionsAreRecorded; this prints the column around it.
         run: go test -run TestProbeLushClayStream ./internal/world -count=1 -v
       - env:
           REGIONIO_LUSH_CLAY_PROBE: "1"

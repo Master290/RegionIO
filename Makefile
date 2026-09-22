@@ -27,20 +27,43 @@ parity:
 # way the plain build could not see. (`go build ./...` never touches _test.go
 # files, so this is the only step in `verify` that compiles them.)
 #
-# The last two lines run the probe's causal modes, not just its default path:
-# SKIP deletes a predecessor's whole contribution and STATE digests the world the
-# probed feature is about to read. Together they are what produced the "which
+# The last three lines run the probe's causal modes and its unmodelled source, not
+# just its default path: SKIP deletes a predecessor's whole contribution, STATE
+# digests the world the probed feature is about to read, and TARGET/SOURCE at
+# (-1,-1) walks the chunk that decorationSources has no branch for and that carries
+# a third of the residual. Together they are what produced the "which
 # chunks does a removal actually change" table, and a mode nothing runs rots the
 # way the probe's private dispatch copy already did. The modes themselves only
 # print; the conclusions they produced are asserted by TestLushClayPositionsAreRecorded
 # and the parity and clay fixtures, which is why they are safe to run here.
+#
+# Every REGIONIO_* gate the source reads is set here or excused in writing in
+# excusedGates, because a gate no runner sets is unreachable code that reads like a
+# test. That is not hypothetical: the consolidated trace flag is
+# REGIONIO_LUSH_CLAY_TRACE, and this file set only REGIONIO_CLAY_TRACE, which gates
+# the test-layer prints instead, so the in-generator traces ran in no CI job; six
+# ore diagnostics and the trapezoid
+# one had no runner at all either. TestEveryDiagnosticGateIsReachable derives the
+# list from the source and fails on either side of the mismatch, so this target
+# cannot drift again.
 diagnostics:
 	go test -run TestNothingMatchesThis ./...
-	REGIONIO_CLAY_TRACE=1 REGIONIO_LUSH_CLAY_PROBE=1 \
+	REGIONIO_CLAY_TRACE=1 REGIONIO_LUSH_CLAY_TRACE=1 REGIONIO_LUSH_CLAY_PROBE=1 \
 	REGIONIO_CLAY_MISMATCH_DIAG=1 REGIONIO_ORE_SCHEDULE_DIAGNOSTIC=1 \
 	REGIONIO_MOSS_PATCH_DIAGNOSTIC=1 REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1 \
-		go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual|BaseTerrain' ./internal/world
+	REGIONIO_KELP_TRACE=1 \
+		go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual|BaseTerrain|Kelp' ./internal/world
+	REGIONIO_ORE_FEATURE_DIAGNOSTIC=1 REGIONIO_ORE_INDEX_DIAGNOSTIC=1 \
+	REGIONIO_ORE_ORDER_DIAGNOSTIC=1 REGIONIO_ORE_ORDER_PARITY_DIAGNOSTIC=1 \
+	REGIONIO_REGION_ORE_DIAGNOSTIC=1 REGIONIO_SINGLE_CHUNK_ORE_DIAGNOSTIC=1 \
+		go test -run 'Ore' ./internal/world -count=1
+	REGIONIO_TRAPEZOID_DIAGNOSTIC=1 \
+		go test -run Trapezoid ./internal/worldgen -count=1
 	REGIONIO_LUSH_CLAY_PROBE=1 REGIONIO_LUSH_CLAY_PROBE_STATE=1 \
+	REGIONIO_SETBLOCK_TRACE="-15,-16,-13;-15,-17,-13" \
+		go test -run TestProbeLushClayStream -count=1 -v ./internal/world
+	REGIONIO_LUSH_CLAY_PROBE=1 REGIONIO_LUSH_CLAY_PROBE_STATE=1 \
+	REGIONIO_LUSH_CLAY_PROBE_TARGET="-1,-1" REGIONIO_LUSH_CLAY_PROBE_SOURCE="-1,-1" \
 		go test -run TestProbeLushClayStream -count=1 -v ./internal/world
 	REGIONIO_LUSH_CLAY_PROBE=1 REGIONIO_LUSH_CLAY_PROBE_STATE=1 \
 	REGIONIO_LUSH_CLAY_PROBE_SKIP="-1,-1" REGIONIO_LUSH_CLAY_COLUMN="5,13;2,12" \

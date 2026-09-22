@@ -85,14 +85,19 @@ residual cells, dominated by the lush-caves moss and clay pools and their nested
 vegetation; both match
 all fixture biomes and heightmaps. CI checks the region path against a 99.7%
 regression floor (91% for the legacy generator, which `make parity` does not
-cover), while `make parity` upgrades the same comparison to exact equality and
-so does not pass yet. GitHub Actions runs four jobs on every push and pull
+cover), while `make parity` sets `REGIONIO_REQUIRE_PARITY=1`, which upgrades the
+same comparison to exact equality and so does not pass yet. The CI regression job
+deliberately omits that variable: green CI means "no worse than 99.7%", not "bit
+exact", and the two are kept apart so the gap stays visible as a number rather than
+turning the whole suite red. GitHub Actions runs four jobs on every push and pull
 request: build/vet/tests, the full race suite, the fixture regression check, and
 `diagnostics`, which mirrors `make diagnostics` — compiling every test binary and
-running the env-gated probes in `internal/world` that break the remaining gap down
-per subsystem (ore paths per state, base-terrain defects with sample coordinates,
-the lush-caves clay chain position by position). The findings those probes produced
-are asserted rather than merely printed, so a conclusion that moves fails the
+running the env-gated probes in `internal/world` and `internal/worldgen` that break
+the remaining gap down per subsystem (ore paths per state, base-terrain defects with
+sample coordinates, the lush-caves clay chain position by position). Every gate named
+in the source is run there or excused with a reason, and a test enforces both halves
+of that, so a probe cannot quietly become unreachable again. The findings those probes
+produced are asserted rather than merely printed, so a conclusion that moves fails the
 build instead of landing in a log nobody reads.
 
 ## v0.4 scope

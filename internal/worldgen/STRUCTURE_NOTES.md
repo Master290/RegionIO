@@ -1075,6 +1075,21 @@ moss/vine/water consequence of a pool that moved, not a pool we failed to place.
 And (1,0) is where we place clay vanilla does not (6 of the 9 extra cells), which
 is the opposite failure and will not be fixed by the same change.
 
+Those are *mismatch* counts, and "anchor" is doing a second job in the plan that has
+to be pinned before the two numbers get read as one. Step 3 spoke of 1,863 differing
+cells of which 1,109 were anchors, and that is not a count of our errors at all: it
+is the **footprint of vanilla's own chain**, the cells where
+`vanilla_overworld_12345.bin` and `vanilla_no_lush_clay_12345.bin` disagree.
+Measured again against the shipped fixtures: still 1,863, of which 1,109 are clay in
+the plain capture, 172 are water and 582 are something else. It has not moved, and
+cannot, because it is a property of the captures rather than of our generator. The
+22 in the table is a different quantity wearing the same word - anchors *we* are
+missing, i.e. the intersection of that 1,109 with our 96 - and a cell vanilla's chain
+writes that we reproduce correctly is an anchor by the first definition and nowhere
+in the second table. That is why the instruction "filter to the 1,109 when judging
+position" cannot be implemented as written: the ratchet has to filter on the
+intersection, and does.
+
 That table is the post-fix state. The baseline the plan asked Step 3 to record -
 the same measurement on the integrated tree, before any generator change - was
 taken but never written down, and only the parity half of it survived in a commit
