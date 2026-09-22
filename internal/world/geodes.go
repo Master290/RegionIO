@@ -193,13 +193,27 @@ func sampleGeodeInt(random worldgen.RandomSource, min, max int) int {
 	return min + int(random.NextIntN(int32(max-min+1)))
 }
 
+// geodeTagIDs resolves a block tag to the state IDs that satisfy it.
+//
+// Vanilla's test is on the *block*: MatchingBlockTagPredicate.test is
+// BlockState.is(TagKey<Block>), and a block tag is a set of blocks, so every
+// state of a member matches. Keying the set by state ID alone is therefore only
+// correct if each member's default state is its only state - and for
+// #minecraft:moss_replaceable that is false in a way that bites: it pulls in
+// #minecraft:cave_vines, whose age property spans twenty-five states, so an aged
+// vine hanging in a lush-cave ceiling read as non-replaceable here while vanilla
+// walks its vegetation column straight through it.
 func geodeTagIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
 	if strings.HasPrefix(tag, "#") {
 		tag = tag[1:]
 	}
 	ids := make(map[uint16]bool)
 	for _, name := range flattenBlockTag(set, tag, nil) {
-		if id, ok := nameToStateID(name, nil); ok {
+		// Resolving the default state first also forces the state table to exist.
+		if _, ok := nameToStateID(name, nil); !ok {
+			continue
+		}
+		for _, id := range idsByName[name] {
 			ids[id] = true
 		}
 	}

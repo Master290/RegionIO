@@ -913,6 +913,35 @@ this path, and each of these is now matched in `vegetation_patches.go`:
   the surface offset is not overridden - which is what
   `patchVegetationPosition` expresses.
 
+That list claimed the semantics of the algorithm were closed, and they were. What it
+missed was the *membership* of the tag the algorithm consults, which is a different
+bug in the same function and was still live: `geodeTagIDs` resolved each
+`moss_replaceable` member through `nameToStateID(name, nil)`, i.e. the block's
+**default state** only, while vanilla's test is `BlockState.is(TagKey<Block>)` and a
+block tag is a set of **blocks** - so every state of a member matches.
+
+That distinction is not academic here, because `moss_replaceable` includes
+`#minecraft:cave_vines`, whose `age` property spans twenty-five states. Every
+cave-vine state other than the default was therefore read as non-replaceable, and
+`placeGround`'s column walk breaks on a non-replaceable cell - so a vine hanging in
+a lush-cave ceiling aborted a patch column that vanilla walks straight through,
+which changes whether the patch is accepted and every draw after it.
+`TestMossReplaceableIsBlockScoped` now asserts block scoping against an
+independently built set over the states the capture actually contains; it names the
+eight it was rejecting, and all eight are `minecraft:cave_vines` /
+`minecraft:cave_vines_plant`.
+
+Measured effect on this fixture: **zero cells** - 99.916%, 330 mismatches, clay
+chain 96/22/9, all identical before and after - because none of those eight states
+happens to sit inside a patch's column walk here. So `generatorVersion` stays at
+37, per the rule that it moves only when output moves. Two lessons in that
+combination, and both are the reason the change is kept anyway: reachable in the
+data and reachable in the code path are different questions, and a correct port is
+worth having on a seed where it is silent, because the next capture is not this one.
+It is also a reminder that "verified line for line against the jar" covers the
+control flow and not the inputs - the semantics of `replaceable` were never
+re-read, only its use.
+
 The one place the reading paid off in cells: `WaterloggedVegetationPatchFeature`
 builds `waterSurface` by iterating the ground **HashSet**, so the water set's
 insertion order is the ground set's hash order, and the roll then iterates
