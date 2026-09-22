@@ -279,6 +279,17 @@ func TestLushClayPositionsAreRecorded(t *testing.T) {
 		}
 	})
 
+	// A source other than (0,0), which is the knob the probe used to lack: the
+	// notes put the bug at (-1,-1) while the probe could only ever ask about
+	// (0,0). Source (-1,-1) is also the writer the cross-chunk trace named for
+	// cell (-15,-16,-13), so this row ties the probe back to that measurement.
+	t.Run("source-north-west-is-probable", func(t *testing.T) {
+		got := positions(lushClayReplay{target: [2]int32{-1, -1}, source: [2]int32{-1, -1}})
+		want := [][3]int{{-15, -16, -13}}
+		if !same(got, want) {
+			t.Fatalf("source (-1,-1) placed %v, want %v", got, want)
+		}
+	})
 	// The index result, narrowed to its two decisive points: the schedule's index is
 	// the unique reproducer, and the per-biome reading vanilla might have used is
 	// not merely wrong but silent. The full 0..40 sweep stays the gated probe's job.

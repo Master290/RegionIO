@@ -1031,6 +1031,17 @@ south side had already decorated in the same region**:
 | (1,0) | (0,-1), (1,-1), (2,-1) | (5,-29,12), (2,-41,12) |
 | (0,1) | none, or (-1,0) in the reverted experiment | (5,-29,12), (2,-41,12) |
 
+Every row of that table holds source (0,0) fixed and moves the target, which left
+the question the plan actually complained about unasked: what does source (-1,-1)
+itself place? Probing it (target (-1,-1), source (-1,-1)) answers it in one line -
+a single pool at (-15,-16,-13), and note the reference:
+`minecraft:clay_pool_with_dripleaves`, the *non*-waterlogged variant, where
+source (0,0)'s pools all chose `clay_with_dripleaves`. That cell is the one
+`REGIONIO_SETBLOCK_TRACE` was run on earlier, which is a useful cross-check: the
+trace attributed the adjacent (-15,-17,-13) clay write to source (-1,-1) inside
+`placeVegetationPatch`, one block below the pool position the probe now reports for
+the same source. Both are asserted, so neither can quietly move.
+
 That started as a correlation and is now a measured cause. `TestProbeLushClayStream`
 shares the production dispatch through `placeScheduledVegetationFeature` (it had a
 private copy of the switch, which is how it silently dropped `minecraft:kelp` and
