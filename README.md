@@ -85,11 +85,14 @@ vegetation; both match
 all fixture biomes and heightmaps. CI checks the region path against a 99.7%
 regression floor (91% for the legacy generator, which `make parity` does not
 cover), while `make parity` upgrades the same comparison to exact equality and
-so does not pass yet. GitHub Actions runs build/vet/tests,
-fixture regression checks, and the full race suite on every push and pull
-request. Env-gated diagnostics in `internal/world` break the remaining gap
-down per subsystem (ore paths per state, base-terrain defects with sample
-coordinates); `make diagnostics` compiles every test binary and runs them.
+so does not pass yet. GitHub Actions runs four jobs on every push and pull
+request: build/vet/tests, the full race suite, the fixture regression check, and
+`diagnostics`, which mirrors `make diagnostics` — compiling every test binary and
+running the env-gated probes in `internal/world` that break the remaining gap down
+per subsystem (ore paths per state, base-terrain defects with sample coordinates,
+the lush-caves clay chain position by position). The findings those probes produced
+are asserted rather than merely printed, so a conclusion that moves fails the
+build instead of landing in a log nobody reads.
 
 ## v0.4 scope
 
