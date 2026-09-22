@@ -89,6 +89,10 @@ func classifyLand(cap fixtureCapture) landSurface {
 // correct" while meaning "nothing above y=78 was ever generated here". A future
 // capture that quietly lands on ocean again would restore that silence, and the
 // whole point of this fixture is to not be silent.
+//
+// Non-inertness is measured, not assumed: pointed at the ocean capture this test
+// fails all three assertions ("0/1024 columns break the surface", 0 tree cells,
+// 0 plant cells), which is the exact reading this guard was written to refuse.
 func TestVanillaLandFixtureHasSurface(t *testing.T) {
 	if _, err := os.Stat(vanillaLandFixture); err != nil {
 		if os.Getenv("REGIONIO_REQUIRE_PARITY") == "1" {
