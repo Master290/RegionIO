@@ -87,7 +87,6 @@ var excusedGates = map[string]string{
 	"REGIONIO_REQUIRE_PARITY":                "a failure-mode switch, not a diagnostic: the parity job deliberately omits it because exact equality is unattainable while the cascade cells remain",
 	"REGIONIO_REQUIRE_BASE_PARITY":           "a failure-mode switch on the base-terrain fixture, same reason",
 	"REGIONIO_PARITY_GENERATOR":              "selects the legacy generator to compare against; running both versions unattended doubles the suite for no new information",
-	"REGIONIO_PARITY_DIAGNOSTIC":             "an extra dump inside TestVanillaBlockParity, which the parity job already runs unguarded",
 	"REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES": "a knob of the task-8 experiment, replaying sources outside the 3x3; the always-on position table asserts what it showed",
 	"REGIONIO_LUSH_CLAY_PROBE_CLAY_IN":       "an ad-hoc census knob of the same probe, whose permanent form is the clay ratchet in TestVanillaLushClayDiff",
 	"REGIONIO_LUSH_CLAY_PROBE_SKIP":          "a causal mode of the gated probe, set by the Makefile and CI under the names listed there",

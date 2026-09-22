@@ -69,7 +69,12 @@ jobs:
       # Deliberately without REGIONIO_REQUIRE_PARITY: exact equality is what
       # `make parity` demands and the generator does not reach it yet, so this
       # job is the regression floor (minBlockPercent) and not a red light.
-      - run: go test ./internal/world -run TestVanillaBlockParity -count=1 -v
+      # The diagnostic gate is on because the per-state net and the y-band split it
+      # prints are what the README's and CLAUDE.md's residual claims quote, and a
+      # number a doc cites should appear in a log on every push.
+      - env:
+          REGIONIO_PARITY_DIAGNOSTIC: "1"
+        run: go test ./internal/world -run TestVanillaBlockParity -count=1 -v
 
   # The gated diagnostics are where the worldgen gaps get attributed, and a
   # mode nothing runs rots: the lush-caves probe shipped carrying a private copy

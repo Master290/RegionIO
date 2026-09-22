@@ -108,6 +108,41 @@ func TestTagStateIDsAreBlockScoped(t *testing.T) {
 	t.Logf("%d tags checked against %d distinct states in the capture: %d of them are "+
 		"non-default states of a member, which the old default-only reading excluded, "+
 		"and %d are still rejected by tagStateIDs", checked, len(present), disagreed, rejectedTotal)
+
+	// The two counts CLAUDE.md and the notes quote, pinned here because they answer
+	// different questions and were being used interchangeably: how many states a
+	// default-state reading rejects across the whole tag is a fact about the registry
+	// and cannot be caught by any fixture, while how many of them this capture
+	// contains is the only one a test can fail on. Both are asserted so the prose
+	// cannot silently drift away from either.
+	for _, want := range []struct {
+		tag           string
+		whole, inFixt int
+	}{
+		{"minecraft:moss_replaceable", 59, 8},
+		{"minecraft:lush_ground_replaceable", 59, 8},
+	} {
+		byBlock, byDefault := tagMembership(t, set, want.tag)
+		whole, inFixture := 0, 0
+		for id := range byBlock {
+			if byDefault[id] {
+				continue
+			}
+			whole++
+			if present[id] {
+				inFixture++
+			}
+		}
+		if whole != want.whole {
+			t.Errorf("%s: a default-state reading rejects %d states across the whole tag, not the %d the documentation quotes",
+				want.tag, whole, want.whole)
+		}
+		if inFixture != want.inFixt {
+			t.Errorf("%s: only %d of those states occur in this capture, not the %d the documentation quotes - the fixture changed, or the claim was never about it",
+				want.tag, inFixture, want.inFixt)
+		}
+	}
+
 	for _, line := range failures {
 		t.Error(line)
 	}

@@ -33,8 +33,9 @@
 
 # Local debugging artefacts: scratch scripts and notes, hand-extracted datapack
 # JSONs kept for inspection (the real embed is internal/worldgen/feature_data.zip),
-# text dumps from the vanilla probes, and cave_box.txt written by the clay trace
-# test on every run. Not source.
+# text dumps from the vanilla probes, and cave_box.txt, which the clay trace test writes when
+# REGIONIO_CLAY_TRACE is set - not on a plain run, but a probe dump either way, so it stays out.
+# Not source.
 /scratch/
 /data/
 /tools/*.txt

@@ -75,7 +75,7 @@ refutation of a correct note: asking for `moss_replaceable` instead of `minecraf
 returns the empty set, so "0 states" looked like the notes being wrong when they were right. Quote
 whole-tag and capture-restricted counts separately — `moss_replaceable` differs from a
 default-state reading on 59 states in principle and 8 in this fixture, and only the second is a
-number a test can fail on.
+number a fixture can fail on — so `TestTagStateIDsAreBlockScoped` pins both.
 
 The prose rule has a test behind it now: `TestDocumentationNamesExist` fails if a document cites a
 test name that no `_test.go` defines (the placeholder in this very sentence was caught by it on the
@@ -212,7 +212,7 @@ fixture's (-1,-1) pocket — a monster room whose wall opening a mineshaft corri
 The residual is now one family, not a tail: `moss_block`↔`deepslate` is 82 cells (59 where vanilla
 has moss and we have deepslate, 23 the other way), then the ground-cover shuffle
 (`short_grass`/`moss_carpet`/`tall_grass`/`air`, ~54), lush-cave clay at 22, cave vines ~21, kelp 8,
-dripleaves ~12. Net we place 36 fewer moss cells than vanilla, which reads as an extent or radius
+dripleaves ~12. Net we place 35 fewer moss cells than vanilla, which reads as an extent or radius
 difference in `moss_patch` rather than a position-stream one.
 
 The lush-cave clay pools used to be the headline defect — one waterlogged pool landing fifteen blocks

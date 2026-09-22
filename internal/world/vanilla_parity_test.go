@@ -3,6 +3,7 @@ package world
 import (
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -43,6 +44,7 @@ func TestVanillaBlockParity(t *testing.T) {
 	type statePair struct{ got, want uint16 }
 	pairs := make(map[statePair]int)
 	wantBlocks := make(map[uint16]int)
+	gotBlocks := make(map[uint16]int)
 	wantBands := make(map[string]int)
 	wantY := make(map[uint16][2]int)
 	var blockTotal, blockExact, biomeTotal, biomeExact, heightTotal, heightExact int
@@ -74,6 +76,7 @@ func TestVanillaBlockParity(t *testing.T) {
 						pairs[statePair{got, want}]++
 						thisChunkPairs[statePair{got, want}]++
 						wantBlocks[want]++
+						gotBlocks[got]++
 						yRange := wantY[want]
 						if yRange[0] == 0 || y < yRange[0] {
 							yRange[0] = y
@@ -187,6 +190,42 @@ func TestVanillaBlockParity(t *testing.T) {
 			rangeY := wantY[block.id]
 			t.Logf("diagnostic wanted %d: %s (%d), y=%d..%d", block.count, stateLabel(block.id), block.id, rangeY[0], rangeY[1])
 		}
+		// The per-state net, not the per-pair top list. A doc sentence that says
+		// "we place N fewer moss cells than vanilla" is a claim about a difference,
+		// and the pair table above cannot answer it: it is capped at the top pairs
+		// and it reports each direction as its own row, so summing it by eye both
+		// truncates and double-counts. This is the number that sentence has to be
+		// checked against.
+		type stateNet struct {
+			id  uint16
+			net int
+		}
+		nets := make([]stateNet, 0, len(wantBlocks)+len(gotBlocks))
+		seen := make(map[uint16]bool)
+		for id := range wantBlocks {
+			seen[id] = true
+		}
+		for id := range gotBlocks {
+			seen[id] = true
+		}
+		for id := range seen {
+			nets = append(nets, stateNet{id, wantBlocks[id] - gotBlocks[id]})
+		}
+		sort.Slice(nets, func(i, j int) bool {
+			if abs(nets[i].net) != abs(nets[j].net) {
+				return abs(nets[i].net) > abs(nets[j].net)
+			}
+			return nets[i].id < nets[j].id
+		})
+		var netParts []string
+		for _, n := range nets {
+			if n.net == 0 {
+				continue
+			}
+			netParts = append(netParts, fmt.Sprintf("%s %+d", stateLabel(n.id), n.net))
+		}
+		t.Logf("diagnostic net per state (want minus got, so negative means we place more): %s",
+			strings.Join(netParts, ", "))
 		t.Logf("diagnostic mismatch y bands: deep=%d underground=%d waterline=%d surface=%d", wantBands["deep"], wantBands["underground"], wantBands["waterline"], wantBands["surface"])
 	}
 	t.Logf("block exact %d/%d (%.3f%%), biome exact %d/%d (%.3f%%), heightmaps exact %d/%d (%.3f%%), fluid mismatches %d, ore mismatches %d",

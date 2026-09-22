@@ -19,7 +19,8 @@ test-race:
 
 parity:
 	test -f internal/world/testdata/vanilla_overworld_12345.bin
-	REGIONIO_REQUIRE_PARITY=1 go test ./internal/world -run TestVanillaBlockParity
+	REGIONIO_REQUIRE_PARITY=1 REGIONIO_PARITY_DIAGNOSTIC=1 \
+		go test -v ./internal/world -run TestVanillaBlockParity
 
 # Compile every test binary, then run the env-gated worldgen diagnostics. The
 # first half is the point: `go build ./...` never compiles _test.go files, and

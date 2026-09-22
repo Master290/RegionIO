@@ -142,7 +142,7 @@ mineshafts (piece-for-piece against the saved vanilla start NBT and
 cell-for-cell against a structures-only capture) replay from the datapack —
 the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
 corridor carved, now places in full. What is left in the fixture is
-underground: 335 of its 359 residual cells sit below y=0 and the surface band
+underground: 306 of its 330 residual cells sit below y=0 and the surface band
 contributes none, led by moss-patch extent, then ground cover, clay, and cave
 vines. Surface decoration is the larger structural gap — trees, flora, and
 springs are still hand-written, and only straight trunks place — but a zero
