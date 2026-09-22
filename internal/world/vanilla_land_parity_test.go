@@ -329,6 +329,11 @@ func TestVanillaLandBlockParity(t *testing.T) {
 	// it better, and say in that commit's message what moved. Leaving them alone after
 	// an improvement is how a ratchet stops meaning anything; lowering them without the
 	// improvement is what this assertion exists to catch.
+	//
+	// The ratchet firing is also on the record: making supportsAllParts veto a tree over
+	// an un-modelled decorator (place_on_ground, 101 trees) widened the band to 989 and
+	// took the tree cells from 577 to 370, and this test failed on both readings before
+	// the veto was reverted.
 	if bands["surface"] > landSurfaceRatchet {
 		t.Errorf("surface-band mismatches went up: %d, want at most %d (the ratchet)", bands["surface"], landSurfaceRatchet)
 	}
