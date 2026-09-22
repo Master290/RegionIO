@@ -47,8 +47,10 @@ func newTreeDecoration(t *treePlacer) *treeDecoration {
 	return d
 }
 
-// placeDecorators runs every decorator of the configured tree, in list order,
-// against what the tree recorded.
+// placeDecorators runs every decorator of the configured tree, in list order, against
+// what the tree recorded. It answers an un-modelled decorator with an error rather than
+// passing over it - a caller has to be able to tell "nothing wanted this" from "this
+// build cannot do this" - and it is placeTree that decides the error is survivable.
 func (t *treePlacer) placeDecorators(set *worldgen.FeatureSet) error {
 	d := newTreeDecoration(t)
 	for _, decorator := range t.config.Decorators {
@@ -80,10 +82,7 @@ func (t *treePlacer) placeDecorators(set *worldgen.FeatureSet) error {
 				return err
 			}
 		default:
-			// Counted and skipped, not fatal, and not silent: the tree stands because
-			// a decorator cannot undo the trunk, and the gap is reported by name in
-			// the parity diagnostics so it stays a known thing rather than a rumour.
-			noteNotReplayed("tree_decorator:" + decorator.Type)
+			return &unmodelledPart{kind: "tree_decorator", name: decorator.Type}
 		}
 	}
 	return nil

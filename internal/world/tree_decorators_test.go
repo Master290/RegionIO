@@ -2,6 +2,7 @@ package world
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"regionio/internal/worldgen"
@@ -381,14 +382,17 @@ func TestAlterGroundPaintsUnderAGrassFloor(t *testing.T) {
 	t.Logf("%d podzol cells under the mega pine", painted)
 }
 
-// TestUnmodelledDecoratorLeavesTheTreeStanding is the deliberate asymmetry between a
-// missing placer and a missing decorator. A canopy placer this build has not read means
-// the tree has no body, so the whole tree is refused. A decorator runs after the trunk
-// and the canopy are in the world, so refusing the tree for it costs the canopy too -
-// which is exactly what happened when this was symmetrical: place_on_ground, the leaf
-// litter under a birch, is un-modelled, and vetoing on it removed 101 trees from the
-// four land chunks and put the surface band back from 1,247 mismatches to 1,362.
-func TestUnmodelledDecoratorLeavesTheTreeStanding(t *testing.T) {
+// TestUnmodelledDecoratorErrorsButNotTheTree is the deliberate asymmetry between a
+// missing placer and a missing decorator, asserted at both boundaries.
+//
+// A canopy placer this build has not read means the tree has no body, so
+// supportsAllParts refuses the tree before it writes anything. A decorator runs after
+// the trunk and canopy are in the world, so placeDecorators - the boundary that knows -
+// still answers an un-modelled one with an error rather than passing it over in
+// silence, and it is placeTree that decides a decorator failure cannot un-place a
+// tree. Refusing on the decorator instead cost 101 whole trees across the four land
+// chunks and put the surface band back from 945 mismatches to 1,362.
+func TestUnmodelledDecoratorErrorsButNotTheTree(t *testing.T) {
 	stone := mustState("minecraft:stone", nil)
 	planter := decoratorPlacer(t, "minecraft:oak_bees_005", func(int, int) uint16 { return stone })
 	planter.config.Decorators = []worldgen.TreeDecorator{{
@@ -402,12 +406,6 @@ func TestUnmodelledDecoratorLeavesTheTreeStanding(t *testing.T) {
 	if err := planter.placeTrunk(8, 71, 8); err != nil {
 		t.Fatal(err)
 	}
-	if err := planter.placeDecorators(planter.set); err != nil {
-		t.Fatalf("an un-modelled decorator failed the tree: %v", err)
-	}
-	if counts := NotReplayed(); counts["tree_decorator:minecraft:pale_moss"] == 0 {
-		t.Error("the un-modelled decorator was skipped without being counted by name")
-	}
 	logs := 0
 	for _, p := range planter.placements {
 		if p.isLog {
@@ -415,7 +413,24 @@ func TestUnmodelledDecoratorLeavesTheTreeStanding(t *testing.T) {
 		}
 	}
 	if logs == 0 {
-		t.Error("the tree placed no trunk, so refusing the decorator would have cost a whole tree")
+		t.Fatal("the fixture tree placed no trunk, so nothing below proves anything")
+	}
+	// The decorator boundary itself has to be loud.
+	if err := planter.placeDecorators(planter.set); err == nil {
+		t.Error("placeDecorators passed over an un-modelled decorator instead of erroring")
+	} else {
+		var part *unmodelledPart
+		if !errors.As(err, &part) || part.kind != "tree_decorator" {
+			t.Errorf("placeDecorators failed with %v, want an unmodelledPart for tree_decorator", err)
+		}
+	}
+	// And the tree-level caller has to absorb exactly that kind of failure.
+	position := worldgen.FeaturePosition{X: 8, Y: 71, Z: 8}
+	if err := planter.r.placeTree(planter.set, planter.random, position, planter.config); err != nil {
+		t.Errorf("the tree was refused over its decorator: %v", err)
+	}
+	if counts := NotReplayed(); counts["tree_decorator:minecraft:pale_moss"] == 0 {
+		t.Error("the un-modelled decorator was skipped without being counted by name")
 	}
 }
 
