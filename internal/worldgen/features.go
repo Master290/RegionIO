@@ -146,6 +146,20 @@ type StateProviderSpec struct {
 	Property string               // randomized_int
 	Source   *StateProviderSpec   // randomized_int
 	Values   CountProvider        // randomized_int
+	// Rules and Fallback are rule_based_state_provider: the first rule whose
+	// predicate passes supplies the state, and its `then` provider is kept raw
+	// because evaluating a predicate needs the world, which this package does
+	// not have. A missing fallback is significant, not an omission - see
+	// RuleBasedStateProvider.getState, which returns the block already at the
+	// position when no rule matched and there is no fallback.
+	Rules    []StateProviderRule
+	Fallback *StateProviderSpec
+}
+
+// StateProviderRule is one {if_true, then} pair of a rule_based provider.
+type StateProviderRule struct {
+	Predicate json.RawMessage
+	Then      json.RawMessage
 }
 
 // SampleState mirrors BlockStateProvider.getState(random): simple returns
@@ -1383,6 +1397,13 @@ func parseNestedIntProvider(raw json.RawMessage) (NestedIntProvider, error) {
 
 // parseStateProviderSpec accepts simple, weighted, and randomized-int state
 // providers.
+// StateProvider parses a block-state provider held in a raw JSON member, so a
+// caller that kept a provider as json.RawMessage (tree configs do) can resolve it
+// without this package having to know where it came from.
+func (s *FeatureSet) StateProvider(raw json.RawMessage) (StateProviderSpec, error) {
+	return parseStateProviderSpec(raw)
+}
+
 func parseStateProviderSpec(raw json.RawMessage) (StateProviderSpec, error) {
 	var probe struct {
 		Type     string     `json:"type"`
@@ -1411,6 +1432,35 @@ func parseStateProviderSpec(raw json.RawMessage) (StateProviderSpec, error) {
 		spec := StateProviderSpec{Type: "weighted", Entries: make([]WeightedBlockState, len(doc.Entries))}
 		for i, e := range doc.Entries {
 			spec.Entries[i] = WeightedBlockState{State: e.Data, Weight: e.Weight}
+		}
+		return spec, nil
+	case "minecraft:rule_based_state_provider":
+		var doc struct {
+			Rules []struct {
+				IfTrue json.RawMessage `json:"if_true"`
+				Then   json.RawMessage `json:"then"`
+			} `json:"rules"`
+			Default json.RawMessage `json:"default_provider"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return StateProviderSpec{}, fmt.Errorf("invalid rule based provider %s: %w", raw, err)
+		}
+		if len(doc.Rules) == 0 {
+			return StateProviderSpec{}, fmt.Errorf("rule based provider with no rules %s", raw)
+		}
+		spec := StateProviderSpec{Type: "rule_based", Rules: make([]StateProviderRule, len(doc.Rules))}
+		for i, rule := range doc.Rules {
+			if len(rule.IfTrue) == 0 || len(rule.Then) == 0 {
+				return StateProviderSpec{}, fmt.Errorf("rule based provider rule %d lacks if_true or then", i)
+			}
+			spec.Rules[i] = StateProviderRule{Predicate: rule.IfTrue, Then: rule.Then}
+		}
+		if len(doc.Default) > 0 {
+			fallback, err := parseStateProviderSpec(doc.Default)
+			if err != nil {
+				return StateProviderSpec{}, err
+			}
+			spec.Fallback = &fallback
 		}
 		return spec, nil
 	case "minecraft:randomized_int_state_provider":
