@@ -11,68 +11,56 @@ import (
 	"regionio/internal/worldgen"
 )
 
-// TestProbeLushClayStream replays one source's real stage-9 schedule against a
-// region whose earlier stages have already run, and dumps the region state along
-// the candidate columns at the moment lush_caves_clay places.
+// lushClayReplay configures one replay of a source's real stage-9 schedule up to
+// and including lush_caves_clay. Everything the gated probe reads from the
+// environment is an option here, so the probe and the always-on assertions run the
+// same code and cannot drift apart.
+type lushClayReplay struct {
+	target [2]int32
+	source [2]int32
+	// skip names sources to leave entirely undecorated before the probed one runs:
+	// removing a predecessor and watching the answer change is what turns a
+	// correlator into a causal test, which no observation at a fixed order can do.
+	skip map[[2]int32]bool
+	// extra names sources outside the target's 3x3 to replay first, widening the
+	// loaded window to reach them. Nothing in the production architecture can
+	// express that, which is the point: it is how the shared-region prediction gets
+	// tested before the architecture changes.
+	extra [][2]int32
+	// index replaces the probed feature's reseed index alone, leaving the world, the
+	// seed and the placement list untouched. Sweeping it shows whether the
+	// schedule's index is determined by vanilla's positions or merely consistent
+	// with them; nil means use the index the schedule reports.
+	index      *int
+	onRegion   func(*decorationRegion)
+	onPosition func(*decorationRegion, worldgen.FeaturePosition)
+	onPlaced   func(*decorationRegion)
+}
+
+// replayLushClayPositions builds the region exactly as replayScheduledOres would
+// have it by the time the probed source reaches stage 9, walks that source's real
+// schedule, and returns the positions lush_caves_clay chose.
 //
-// Which chunk is the centre and which source is probed come from the environment,
-// because the question being asked is "why does the same source place differently
-// for different targets" and a probe welded to (0,0) cannot ask it:
-// REGIONIO_LUSH_CLAY_PROBE_TARGET="x,z" (default 0,0) and
-// REGIONIO_LUSH_CLAY_PROBE_SOURCE="x,z" (default 0,0, which must be a source the
-// target's region replays).
-//
-// The schedule prefix goes through placeScheduledVegetationFeature, the same code
-// the server runs. This file used to carry a private copy of that dispatch, and
-// the copy had already drifted: six of the eight configured types, silently
-// dropping minecraft:kelp and minecraft:seagrass (both of which consume draws) and
-// discarding every error.
-//
-// With the dispatch shared, the probe reproduces the generator's answer exactly:
-// source (0,0) yields positions (5,-29,12)+(5,-30,13) for target (0,0),
-// (5,-29,12)+(2,-41,12) for targets (1,0) and (0,1), and those three plus
-// (4,-7,1) for target (-1,-1) - byte-for-byte the REGIONIO_LUSH_CLAY_TRACE output
-// of the real generator, in 1.3s instead of 8.7s and without a fixture. That is
-// what makes the predecessor experiment worth running here: REGIONIO_LUSH_CLAY_PROBE_SKIP
-// removes a source's whole contribution and the flip in the answer names which
-// predecessors the feature actually reads. REGIONIO_LUSH_CLAY_COLUMN="x,z[;x,z...]"
-// adds pre-feature dumps of whole columns, which is how a displaced position is
-// attributed either to a different floor under the scan or to a different number of
-// draws spent by an earlier position of the same feature - the candidate dump only
-// shows the column a run already chose, so on its own it cannot tell those apart.
-// REGIONIO_LUSH_CLAY_PROBE_STATE=1 adds a per-chunk digest of the world the feature
-// is about to read, which names the chunks a removal actually changed instead of
-// leaving that to be inferred from the answer. REGIONIO_LUSH_CLAY_PROBE_INDEX
-// replaces only the probed feature's reseed index, which is how the schedule's
-// index was shown to be determined by vanilla's positions rather than merely
-// consistent with them.
-//
-// Two traps worth recording, because both were walked into. The hand-replayed
-// target feature must call SetFeatureSeed itself - the reseed lives inside the
-// seam, so omitting it leaves the feature reading the previous one's stream and
-// placing somewhere else entirely, which looks exactly like a state effect. And
-// replaying every source's early stages before touching stage 9 is NOT the
-// generator's world: stage 9 must be interleaved per source, or the filters move
-// positions for reasons that have nothing to do with the question.
-func TestProbeLushClayStream(t *testing.T) {
-	requireDiagnostic(t, "REGIONIO_LUSH_CLAY_PROBE")
+// Two traps worth recording, because both were walked into. Stages must interleave
+// per source: replaying every source's early stages before touching stage 9 gives a
+// different world, and the state-dependent filters then move positions for reasons
+// that have nothing to do with the question. And the target feature is replayed by
+// hand only to interleave the callbacks with its own draws, so it must call
+// SetFeatureSeed itself - the reseed lives inside
+// placeScheduledVegetationFeature, and skipping it leaves the feature reading the
+// previous one's stream and placing somewhere else entirely, which looks exactly
+// like a state effect.
+func replayLushClayPositions(t *testing.T, opts lushClayReplay) []worldgen.FeaturePosition {
+	t.Helper()
+	const targetFeature = "minecraft:lush_caves_clay"
 	seed := int64(12345)
-	targetX, targetZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_TARGET", 0, 0)
-	sourceX, sourceZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_SOURCE", 0, 0)
-	skip := probeSkipSources(t)
-	// REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES="x,z[;x,z...]" replays sources from
-	// *outside* the target's 3x3 before the rest, widening the loaded window to
-	// reach them. It exists to test the shared-region prediction directly: the
-	// claim is that a (0,1) built without (-1,-1) and (0,-1) having decorated
-	// loses source (0,0)'s second pool, and that a (0,1) built with them recovers
-	// it. Nothing in the current architecture can express the second case, so
-	// without this knob the claim is untestable before the architecture changes.
-	extra := probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES")
-	var loadRadius int32 = 2
-	if len(extra) > 0 {
+	targetX, targetZ := opts.target[0], opts.target[1]
+	sourceX, sourceZ := opts.source[0], opts.source[1]
+	loadRadius := int32(2)
+	if len(opts.extra) > 0 {
 		loadRadius = 3
 	}
-	for _, source := range extra {
+	for _, source := range opts.extra {
 		if abs32(targetX-source[0]) > loadRadius-1 || abs32(targetZ-source[1]) > loadRadius-1 {
 			t.Fatalf("extra source (%d,%d) needs a wider window than radius %d gives",
 				source[0], source[1], loadRadius)
@@ -101,24 +89,21 @@ func TestProbeLushClayStream(t *testing.T) {
 	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
 		t.Fatal(err)
 	}
-	// Replay exactly what replayScheduledOres would have done by the time the
-	// probed source reaches stage 9: per source, structures then lakes, geodes,
-	// monster rooms, ores, vegetation - stopping at the probed source instead of
-	// running its vegetation stage, which the schedule loop below walks entry by
-	// entry. Replaying all sources' early stages first would be a different world
-	// (state-dependent placement filters drop or move positions), and the point of
-	// this probe is to reproduce production's answer, not to invent one.
+	// Per source: structures already placed, then lakes, geodes, monster rooms,
+	// ores and vegetation - stopping at the probed source instead of running its
+	// vegetation stage, which the schedule loop below walks entry by entry so the
+	// callbacks can interleave with the feature's own draws.
 	reachedSource := false
 	sources := decorationSources(targetX, targetZ)
-	if len(extra) > 0 {
-		lead := make([]decorationSource, 0, len(extra))
-		for _, source := range extra {
+	if len(opts.extra) > 0 {
+		lead := make([]decorationSource, 0, len(opts.extra))
+		for _, source := range opts.extra {
 			lead = append(lead, decorationSource{X: source[0], Z: source[1]})
 		}
 		sources = append(lead, sources...)
 	}
 	for _, source := range sources {
-		if skip[[2]int32{source.X, source.Z}] {
+		if opts.skip[[2]int32{source.X, source.Z}] {
 			continue
 		}
 		if err := r.setSource(source.X, source.Z); err != nil {
@@ -152,56 +137,8 @@ func TestProbeLushClayStream(t *testing.T) {
 	if err := r.setSource(sourceX, sourceZ); err != nil {
 		t.Fatal(err)
 	}
-
-	// A per-chunk digest of the world the feature is about to read. Comparing two
-	// runs of the probe with this printed turns "removing a neighbour changed the
-	// answer, therefore the state mattered" into a statement about *which* chunks
-	// differ - and in particular whether the probed source's own chunk does, which
-	// is what a cross-chunk write from a Chebyshev-1 neighbour looks like from the
-	// inside.
-	if os.Getenv("REGIONIO_LUSH_CLAY_PROBE_STATE") == "1" {
-		keys := make([][2]int32, 0, len(r.chunks))
-		for key := range r.chunks {
-			keys = append(keys, key)
-		}
-		sort.Slice(keys, func(i, j int) bool {
-			if keys[i][0] != keys[j][0] {
-				return keys[i][0] < keys[j][0]
-			}
-			return keys[i][1] < keys[j][1]
-		})
-		for _, key := range keys {
-			chunk := r.chunks[key]
-			digest := uint32(0)
-			if chunk != nil {
-				digest = chunkChecksum(chunk)
-			}
-			line := fmt.Sprintf("STATE chunk (%d,%d) %08x", key[0], key[1], digest)
-			if key == [2]int32{sourceX, sourceZ} {
-				line += "  <- probed source"
-			}
-			t.Log(line)
-		}
-	}
-
-	dumpCol := func(label string, x, z int) {
-		t.Logf("--- column (%d,*,%d) %s ---", x, z, label)
-		for y := -20; y >= -50; y-- {
-			st := r.getBlock(x, y, z)
-			if !isAirState(st) {
-				t.Logf("  y=%d: %s", y, stateLabel(st))
-			}
-		}
-	}
-	const targetFeature = "minecraft:lush_caves_clay"
-
-	// Which columns to watch before the feature runs comes from the same env flag
-	// the production trace uses, so the probe can ask "what state did the scan see
-	// at the column the *other* run chose" - the candidate dump only shows the
-	// column a run already picked, which is a consequence and cannot name a cause.
-	watch := probeColumns(t, "REGIONIO_LUSH_CLAY_COLUMN")
-	for _, column := range watch {
-		dumpCol("pre-feature", column[0], column[1])
+	if opts.onRegion != nil {
+		opts.onRegion(r)
 	}
 
 	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), vegetationStage)
@@ -210,6 +147,7 @@ func TestProbeLushClayStream(t *testing.T) {
 	}
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(sourceX), int(sourceZ))
 	origin := worldgen.FeaturePosition{X: int(sourceX) << 4, Y: MinY, Z: int(sourceZ) << 4}
+	var positions []worldgen.FeaturePosition
 	for _, scheduled := range schedule {
 		if scheduled.Name != targetFeature {
 			if err := r.placeScheduledVegetationFeature(set, random, scheduled, origin, decorationSeed); err != nil {
@@ -221,27 +159,12 @@ func TestProbeLushClayStream(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s is not a placed feature", targetFeature)
 		}
-		// REGIONIO_LUSH_CLAY_PROBE_INDEX replaces only this feature's reseed index,
-		// leaving the placement list and the world untouched. Sweeping it shows
-		// whether the schedule's index is determined by vanilla's positions or just
-		// consistent with them: if the answer were insensitive to the index, the
-		// agreement would prove nothing about it.
 		index := scheduled.Index
-		if override := strings.TrimSpace(os.Getenv("REGIONIO_LUSH_CLAY_PROBE_INDEX")); override != "" {
-			value, errParse := strconv.Atoi(override)
-			if errParse != nil {
-				t.Fatalf("REGIONIO_LUSH_CLAY_PROBE_INDEX=%q is not an integer", override)
-			}
-			index = value
+		if opts.index != nil {
+			index = *opts.index
 		}
 		t.Logf("=== %s index=%d source (%d,%d) target (%d,%d) ===",
 			targetFeature, index, sourceX, sourceZ, targetX, targetZ)
-		// Only this one feature is replayed by hand, to interleave the position
-		// and column dumps with its own draws. The reseed and the choice/placement
-		// are the ones the seam would have done - SetFeatureSeed lives inside
-		// placeScheduledVegetationFeature, so skipping the call here leaves this
-		// feature reading the previous one's stream and placing somewhere else
-		// entirely.
 		random.SetFeatureSeed(decorationSeed, index, vegetationStage)
 		ref := configFeatureRef(set, placed.Feature)
 		err := set.ForEachPlacementPosition(scheduled.Name, random, origin,
@@ -254,27 +177,226 @@ func TestProbeLushClayStream(t *testing.T) {
 					chosen = ref.FeatureTrue
 				}
 				t.Logf("POSITION (%d,%d,%d) chosen ref: %s", position.X, position.Y, position.Z, chosen.Name)
-				dumpCol("candidate", position.X&15, position.Z&15)
+				positions = append(positions, position)
+				if opts.onPosition != nil {
+					opts.onPosition(r, position)
+				}
 				r.placeFeatureRef(random, position, chosen, set)
 				return nil
 			})
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, column := range watch {
-			dumpCol("post-pool", column[0], column[1])
+		if opts.onPlaced != nil {
+			opts.onPlaced(r)
 		}
-		// REGIONIO_LUSH_CLAY_PROBE_CLAY_IN="cx,cz[;...]" counts the clay the region
-		// holds in those chunks once the feature has placed. Position agreement is
-		// the necessary check, but the question an architecture change has to
-		// answer is how many of the fixture's anchor cells a build recovers, and
-		// that is a census, not a position.
-		for _, chunk := range probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_CLAY_IN") {
-			logClayCensus(t, r, chunk[0], chunk[1])
-		}
-		return
+		return positions
 	}
 	t.Logf("%s not scheduled for source (%d,%d)", targetFeature, sourceX, sourceZ)
+	return nil
+}
+
+// TestLushClayPositionsAreRecorded asserts the findings this investigation
+// measured, so they stop being prose in a notes file that the next refactor is
+// free to invalidate.
+//
+// These are deliberately not parity assertions: several rows record where our
+// generator disagrees with vanilla, which is the residual clay family. What they
+// pin is the self-consistency the whole diagnosis rests on - the same source
+// answering differently depending on which chunk is the region centre, a
+// neighbour's absence moving a pool sixteen blocks, and one reseed index in the
+// range reproducing vanilla while its nearest rival places nothing. If task 8 ever
+// gives every chunk a single history, the first block is the one that has to break,
+// and this test makes that a decision rather than an accident.
+func TestLushClayPositionsAreRecorded(t *testing.T) {
+	positions := func(opts lushClayReplay) [][3]int {
+		got := replayLushClayPositions(t, opts)
+		out := make([][3]int, 0, len(got))
+		for _, p := range got {
+			out = append(out, [3]int{p.X, p.Y, p.Z})
+		}
+		return out
+	}
+	same := func(got, want [][3]int) bool { return fmt.Sprint(got) == fmt.Sprint(want) }
+
+	// The per-target table: source (0,0) gives four different answers about itself
+	// depending on which chunk happens to be the centre.
+	for _, tc := range []struct {
+		target [2]int32
+		want   [][3]int
+	}{
+		{[2]int32{0, 0}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
+		{[2]int32{1, 0}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+		{[2]int32{0, 1}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+		{[2]int32{-1, -1}, [][3]int{{5, -29, 12}, {5, -30, 13}, {4, -7, 1}}},
+	} {
+		t.Run(fmt.Sprintf("target-%d-%d", tc.target[0], tc.target[1]), func(t *testing.T) {
+			got := positions(lushClayReplay{target: tc.target, source: [2]int32{0, 0}})
+			if !same(got, tc.want) {
+				t.Fatalf("source (0,0) placed %v for target (%d,%d), want %v",
+					got, tc.target[0], tc.target[1], tc.want)
+			}
+		})
+	}
+
+	// The predecessor-removal table at target (0,0): the two south-west sources are
+	// jointly and individually required, and losing both moves no further than
+	// losing either.
+	for _, tc := range []struct {
+		name string
+		skip [][2]int32
+		want [][3]int
+	}{
+		{"skip-west", [][2]int32{{-1, 0}}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
+		{"skip-east", [][2]int32{{1, 0}}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
+		{"skip-north-west", [][2]int32{{1, -1}}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
+		{"skip-south-west-corner", [][2]int32{{-1, -1}}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+		{"skip-south-centre", [][2]int32{{0, -1}}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+		{"skip-both-south-west", [][2]int32{{-1, -1}, {0, -1}}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			skip := map[[2]int32]bool{}
+			for _, source := range tc.skip {
+				skip[source] = true
+			}
+			got := positions(lushClayReplay{target: [2]int32{0, 0}, source: [2]int32{0, 0}, skip: skip})
+			if !same(got, tc.want) {
+				t.Fatalf("positions %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The shared-region prediction: give (0,1) the two neighbours its own window
+	// cannot hold, and source (0,0) recovers the pool vanilla puts there.
+	t.Run("extra-south-west-recovers-the-pool", func(t *testing.T) {
+		got := positions(lushClayReplay{
+			target: [2]int32{0, 1}, source: [2]int32{0, 0},
+			extra: [][2]int32{{-1, -1}, {0, -1}},
+		})
+		want := [][3]int{{5, -29, 12}, {5, -30, 13}}
+		if !same(got, want) {
+			t.Fatalf("positions %v, want %v - replaying the south-west sources first is what task 8 must reproduce", got, want)
+		}
+	})
+
+	// The index result, narrowed to its two decisive points: the schedule's index is
+	// the unique reproducer, and the per-biome reading vanilla might have used is
+	// not merely wrong but silent. The full 0..40 sweep stays the gated probe's job.
+	t.Run("index-is-determined", func(t *testing.T) {
+		twentyNine := 29
+		got := positions(lushClayReplay{target: [2]int32{0, 0}, source: [2]int32{0, 0}, index: &twentyNine})
+		want := [][3]int{{5, -29, 12}, {5, -30, 13}}
+		if !same(got, want) {
+			t.Fatalf("index 29 placed %v, want vanilla's %v", got, want)
+		}
+		four := 4
+		if got := positions(lushClayReplay{target: [2]int32{0, 0}, source: [2]int32{0, 0}, index: &four}); len(got) != 0 {
+			t.Fatalf("index 4, the per-biome position, placed %v; the sweep found it places nothing", got)
+		}
+	})
+}
+
+// TestProbeLushClayStream is that same replay with every inspection knob wired up.
+// Its position output is trustworthy: sharing the production dispatch through
+// placeScheduledVegetationFeature made it reproduce the generator's answer for all
+// four captured targets byte for byte, in about 1.3s instead of 8.7s and with no
+// fixture. This file used to carry a private copy of that dispatch, and the copy had
+// already drifted - six of the eight configured types, silently dropping
+// minecraft:kelp and minecraft:seagrass, both of which consume draws, and discarding
+// every error.
+//
+// The knobs, all read from the environment so no coordinates live in source:
+//
+//	REGIONIO_LUSH_CLAY_PROBE_TARGET / _SOURCE  "x,z" centre and probed source
+//	REGIONIO_LUSH_CLAY_PROBE_SKIP              sources left entirely undecorated
+//	REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES     sources outside the 3x3, replayed first
+//	REGIONIO_LUSH_CLAY_PROBE_INDEX             replaces the probed feature's reseed index
+//	REGIONIO_LUSH_CLAY_PROBE_STATE             per-chunk digest of the world it reads
+//	REGIONIO_LUSH_CLAY_COLUMN                  pre- and post-pool dumps of whole columns
+//	REGIONIO_LUSH_CLAY_PROBE_CLAY_IN           clay census of named chunks after placing
+//
+// The digests and censuses exist because a candidate dump only shows the column a
+// run already chose, which is a consequence and cannot name a cause: comparing two
+// runs at the columns the *other* run picked is how a displaced position gets
+// attributed either to a different floor under the scan or to a different number of
+// draws spent by an earlier position of the same feature.
+//
+// TestLushClayPositionsAreRecorded asserts the conclusions; this is the tool for
+// asking the next question.
+func TestProbeLushClayStream(t *testing.T) {
+	requireDiagnostic(t, "REGIONIO_LUSH_CLAY_PROBE")
+	targetX, targetZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_TARGET", 0, 0)
+	sourceX, sourceZ := probeChunk(t, "REGIONIO_LUSH_CLAY_PROBE_SOURCE", 0, 0)
+	watch := probeColumns(t, "REGIONIO_LUSH_CLAY_COLUMN")
+	clayIn := probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_CLAY_IN")
+	dumpCol := func(r *decorationRegion, label string, x, z int) {
+		t.Logf("--- column (%d,*,%d) %s ---", x, z, label)
+		for y := -20; y >= -50; y-- {
+			if st := r.getBlock(x, y, z); !isAirState(st) {
+				t.Logf("  y=%d: %s", y, stateLabel(st))
+			}
+		}
+	}
+	opts := lushClayReplay{
+		target: [2]int32{targetX, targetZ},
+		source: [2]int32{sourceX, sourceZ},
+		skip:   probeSkipSources(t),
+		extra:  probeChunkList(t, "REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES"),
+	}
+	if spec := strings.TrimSpace(os.Getenv("REGIONIO_LUSH_CLAY_PROBE_INDEX")); spec != "" {
+		value, errParse := strconv.Atoi(spec)
+		if errParse != nil {
+			t.Fatalf("REGIONIO_LUSH_CLAY_PROBE_INDEX=%q is not an integer", spec)
+		}
+		opts.index = &value
+	}
+	opts.onRegion = func(r *decorationRegion) {
+		if os.Getenv("REGIONIO_LUSH_CLAY_PROBE_STATE") == "1" {
+			logRegionChunkDigests(t, r, sourceX, sourceZ)
+		}
+		for _, column := range watch {
+			dumpCol(r, "pre-feature", column[0], column[1])
+		}
+	}
+	opts.onPosition = func(r *decorationRegion, position worldgen.FeaturePosition) {
+		dumpCol(r, "candidate", position.X, position.Z)
+	}
+	opts.onPlaced = func(r *decorationRegion) {
+		for _, column := range watch {
+			dumpCol(r, "post-pool", column[0], column[1])
+		}
+		for _, chunk := range clayIn {
+			logClayCensus(t, r, chunk[0], chunk[1])
+		}
+	}
+	replayLushClayPositions(t, opts)
+}
+
+// logRegionChunkDigests digests every chunk of a region, so two runs can be
+// compared on which chunks differ rather than only on whether the answer changed.
+func logRegionChunkDigests(t *testing.T, r *decorationRegion, sourceX, sourceZ int32) {
+	t.Helper()
+	keys := make([][2]int32, 0, len(r.chunks))
+	for key := range r.chunks {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i][0] != keys[j][0] {
+			return keys[i][0] < keys[j][0]
+		}
+		return keys[i][1] < keys[j][1]
+	})
+	for _, key := range keys {
+		digest := uint32(0)
+		if chunk := r.chunks[key]; chunk != nil {
+			digest = chunkChecksum(chunk)
+		}
+		line := fmt.Sprintf("STATE chunk (%d,%d) %08x", key[0], key[1], digest)
+		if key == [2]int32{sourceX, sourceZ} {
+			line += "  <- probed source"
+		}
+		t.Log(line)
+	}
 }
 
 // probeChunkList parses an env var of the form "x,z[;x,z...]". One parser backs
@@ -282,9 +404,8 @@ func TestProbeLushClayStream(t *testing.T) {
 // introduce a fourth flavour of the same syntax.
 func probeChunkList(t *testing.T, name string) [][2]int32 {
 	t.Helper()
-	spec := os.Getenv(name)
 	var out [][2]int32
-	for _, entry := range strings.Split(spec, ";") {
+	for _, entry := range strings.Split(os.Getenv(name), ";") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
 			continue
@@ -327,11 +448,8 @@ func probeColumns(t *testing.T, name string) [][2]int {
 	return out
 }
 
-// probeSkipSources parses REGIONIO_LUSH_CLAY_PROBE_SKIP="x,z[;x,z...]": sources to
-// leave entirely undecorated before the probed one runs. That is what turns the
-// probe from a correlator into a causal test - removing one predecessor and
-// watching the probed feature's positions change names that predecessor as
-// decisive, which no amount of observation at a fixed order can show.
+// probeSkipSources parses REGIONIO_LUSH_CLAY_PROBE_SKIP into the set of sources to
+// leave entirely undecorated before the probed one runs.
 func probeSkipSources(t *testing.T) map[[2]int32]bool {
 	t.Helper()
 	skip := map[[2]int32]bool{}
@@ -346,9 +464,9 @@ func configFeatureRef(set *worldgen.FeatureSet, placedName string) worldgen.Rand
 	return ref
 }
 
-// logClayCensus lists the clay cells one chunk of the region holds, in local
-// column coordinates, so two runs of the probe can be compared cell by cell
-// rather than only by the positions their features chose.
+// logClayCensus lists the clay cells one chunk of the region holds, in world
+// coordinates, so two runs can be compared cell by cell rather than only by the
+// positions their features chose.
 func logClayCensus(t *testing.T, r *decorationRegion, chunkX, chunkZ int32) {
 	t.Helper()
 	clayID, ok := nameToStateID("minecraft:clay", nil)

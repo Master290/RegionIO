@@ -79,10 +79,12 @@ jobs:
       - env:
           REGIONIO_LUSH_CLAY_PROBE: "1"
           REGIONIO_LUSH_CLAY_PROBE_STATE: "1"
-        run: go test -run TestProbeLushClayStream ./internal/world -count=1
+        # -v because these are printf diagnostics: without it `go test` discards
+        # the output, and a log with no table in it cannot show a finding moving.
+        run: go test -run TestProbeLushClayStream ./internal/world -count=1 -v
       - env:
           REGIONIO_LUSH_CLAY_PROBE: "1"
           REGIONIO_LUSH_CLAY_PROBE_STATE: "1"
           REGIONIO_LUSH_CLAY_PROBE_SKIP: "-1,-1"
           REGIONIO_LUSH_CLAY_COLUMN: "5,13;2,12"
-        run: go test -run TestProbeLushClayStream ./internal/world -count=1
+        run: go test -run TestProbeLushClayStream ./internal/world -count=1 -v
