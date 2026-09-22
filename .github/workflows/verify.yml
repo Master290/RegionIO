@@ -19,6 +19,21 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
+      # The tree arrives from checkout with nothing in it, so anything dirty after
+      # the suite was put there by a test. This is the class of defect the plan's
+      # diagnostics work exists to end: a committed debug probe that rewrote a
+      # repo path on every run, which no assertion would ever have caught because
+      # the probe passed. Deliberately not in the Makefile's `test` target - a
+      # developer's own uncommitted edits would trip it, and there they are the
+      # expected state, not a defect.
+      - name: Fail if the test suite dirtied the working tree
+        run: |
+          $dirty = git status --porcelain
+          if ($dirty) {
+            Write-Host "The test suite left the working tree dirty:"
+            $dirty
+            exit 1
+          }
 
   race:
     runs-on: [self-hosted, windows]
