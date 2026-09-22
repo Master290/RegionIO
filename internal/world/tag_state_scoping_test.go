@@ -69,7 +69,20 @@ func TestTagStateIDsAreBlockScoped(t *testing.T) {
 		if len(byBlock) == 0 {
 			continue // a tag the datapack does not define; nothing to assert
 		}
-		production := tagStateIDs(set, "#"+tag)
+		// Configs disagree about whether the '#' is already present - geode and
+		// vegetation-patch tags arrive as "#minecraft:...", lake tags as bare
+		// names - and a helper that assumes one of the two resolves to nothing and
+		// silently switches the feature off. This has actually happened during a
+		// refactor of the helper below, so both spellings are pinned here.
+		withMarker := tagStateIDs(set, "#"+tag)
+		bare := tagStateIDs(set, tag)
+		if len(withMarker) != len(bare) {
+			t.Errorf("tagStateIDs(%q) holds %d states but tagStateIDs(%q) holds %d; "+
+				"one spelling resolves to a different set, which silently disables the feature",
+				"#"+tag, len(withMarker), tag, len(bare))
+			continue
+		}
+		production := withMarker
 		checked++
 		var rejected, nonDefault []uint16
 		for id := range present {
@@ -100,6 +113,93 @@ func TestTagStateIDsAreBlockScoped(t *testing.T) {
 	if disagreed == 0 {
 		t.Skip("no tag member with a non-default state appears in this capture, so the fixture " +
 			"cannot demonstrate the difference; the assertions above still hold")
+	}
+}
+
+// TestDiskReplacesNonDefaultTargetState runs the disk feature on a column of the
+// non-default state of one of its own target blocks and asserts it replaces
+// something.
+//
+// The first version of this check called the shared helper and asserted about the
+// helper's own answer, so it passed no matter what disks.go did - the tautology its
+// own comment warned against, committed anyway. Exercising the feature is the only
+// way to guard the feature, and reverting disks.go to its previous expansion now
+// fails this test, which is the property the earlier version did not have.
+//
+// It matters because a target set resolved from each block's default state - what
+// this code did, and what the tag helper did until the two were unified - does not
+// recognise a snowy grass column as a target at all, so the disk places nothing.
+func TestDiskReplacesNonDefaultTargetState(t *testing.T) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := set.Disk("minecraft:disk_gravel")
+	if err != nil {
+		t.Fatalf("disk_gravel: %v", err)
+	}
+
+	// Find a target block with more than one state, and pick the state that is not
+	// the default: only then do the two readings differ observably.
+	target, other := "", uint16(0)
+	for _, entry := range config.Targets {
+		if strings.HasPrefix(entry, "#") {
+			continue
+		}
+		states := idsByName[entry]
+		defaultID, ok := nameToStateID(entry, nil)
+		if !ok || len(states) < 2 {
+			continue
+		}
+		for _, id := range states {
+			if id != defaultID {
+				target, other = entry, id
+				break
+			}
+		}
+		if target != "" {
+			break
+		}
+	}
+	if target == "" {
+		t.Skip("no disk target block in this datapack has more than one state")
+	}
+
+	chunk := NewChunk(0, 0, BiomePlains)
+	for y := 0; y < 24; y++ {
+		for z := 0; z < 16; z++ {
+			for x := 0; x < 16; x++ {
+				chunk.SetBlock(x, y, z, other)
+			}
+		}
+	}
+	region, err := newDecorationRegion([]*Chunk{chunk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.setSource(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := region.placeDisk(set, worldgen.NewLegacy(12345),
+		worldgen.FeaturePosition{X: 8, Y: 12, Z: 8}, config); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced := 0
+	for y := 0; y < 24; y++ {
+		for z := 0; z < 16; z++ {
+			for x := 0; x < 16; x++ {
+				if chunk.GetBlock(x, y, z) != other {
+					replaced++
+				}
+			}
+		}
+	}
+	t.Logf("disk_gravel across a column of %s (state %d, not its default): %d cells replaced",
+		target, other, replaced)
+	if replaced == 0 {
+		t.Errorf("placeDisk replaced nothing in a column of %s's non-default state: the target "+
+			"set is scoped to default states, where vanilla's BlockStateIngredient accepts the block", target)
 	}
 }
 

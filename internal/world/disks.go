@@ -23,12 +23,7 @@ func (r *decorationRegion) placeDisk(set *worldgen.FeatureSet, random worldgen.R
 		}
 		ruleStates[i] = state
 	}
-	targets := make(map[uint16]bool, len(config.Targets))
-	for _, name := range config.Targets {
-		if id, ok := nameToStateID(name, nil); ok {
-			targets[id] = true
-		}
-	}
+	targets := blockSetStateIDs(set, config.Targets)
 	if len(targets) == 0 {
 		return nil
 	}

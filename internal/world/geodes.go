@@ -208,12 +208,39 @@ func sampleGeodeInt(random worldgen.RandomSource, min, max int) int {
 // vine hanging in a lush-cave ceiling read as non-replaceable here while vanilla
 // walks its vegetation column straight through it.
 func tagStateIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
-	if strings.HasPrefix(tag, "#") {
-		tag = tag[1:]
+	// Configs disagree about whether the '#' is already there - geode and
+	// vegetation-patch tags arrive as "#minecraft:..." and lake tags as bare names -
+	// so normalise rather than assume: prefixing an entry that already carries the
+	// marker asks for "##minecraft:...", which resolves to no blocks at all and
+	// silently turns the feature off.
+	if !strings.HasPrefix(tag, "#") {
+		tag = "#" + tag
 	}
+	return blockSetStateIDs(set, []string{tag})
+}
+
+// blockSetStateIDs is the shared expansion underneath it: a list of the shape
+// vanilla's BlockStateIngredient$Blocks accepts, where an entry is either a block
+// name or a '#tag', and each denotes every state of the blocks it names.
+//
+// Two distinct mistakes are possible here and both were live in the disk feature,
+// which had its own copy of this loop: a '#tag' entry resolved through
+// nameToStateID simply fails, so the member vanished silently, and a bare block
+// name resolved with no properties yields its default state, so waterlogged,
+// snowy and aged variants were missing. carvers and monster rooms already expanded
+// via idsByName, with a comment explaining that tags name blocks rather than
+// states - the package knew; the helper had not been written down once.
+func blockSetStateIDs(set *worldgen.FeatureSet, entries []string) map[uint16]bool {
 	ids := make(map[uint16]bool)
-	for _, name := range flattenBlockTag(set, tag, nil) {
-		// Resolving the default state first also forces the state table to exist.
+	var names []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry, "#") {
+			names = append(names, flattenBlockTag(set, entry[1:], nil)...)
+			continue
+		}
+		names = append(names, entry)
+	}
+	for _, name := range names {
 		if _, ok := nameToStateID(name, nil); !ok {
 			continue
 		}

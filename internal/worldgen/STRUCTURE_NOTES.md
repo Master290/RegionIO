@@ -957,13 +957,34 @@ every `#minecraft:` reference in every configured feature rather than the tags
 someone thought to list, and it was checked by regressing the helper and watching
 it name all seven.
 
-Two lessons in the combination of "real bug" and "zero cells", and both are why the
-change is kept anyway: reachable in the data and reachable in the code path are
-different questions, and a correct port is worth having on a seed where it is
-silent, because the next capture is not this one. It is also a reminder that
-"verified line for line against the jar" covers the control flow and not the inputs
-- the semantics of `replaceable` were never re-read, only its use - and that a
-duplicated helper is how one fix leaves two bugs behind.
+The same expansion existed a third time, in `disks.go`, and two things written about
+it before they were measured were wrong in opposite directions:
+
+- No disk target list in 26.1.2 contains a `#tag` - the entries are `dirt`, `clay`,
+  `mud`, `grass_block`, `podzol`, `mycelium`, `coarse_dirt`, `snow_block` and `ice`.
+  So the "a tag entry resolves to nothing and is dropped silently" failure mode was
+  invented, not latent. Worth recording because it was written down as fact.
+- The default-state failure was genuine and only a behavioural test shows it:
+  `grass_block`, `podzol` and `mycelium` each have two states, so the old
+  resolution left snowy grass out of `disk_gravel`, `disk_sand` and `ice_patch`.
+  Filling a chunk with a non-default state and running `placeDisk` replaces 145
+  cells now and **0** with the previous code.
+
+That contrast is the lesson. The first version of the disk check called the shared
+helper and asserted about the helper's own answer, so it passed identically on the
+broken and the fixed code - the precise tautology the paragraph above warns about,
+committed in the same file as that warning. `TestDiskReplacesNonDefaultTargetState`
+runs the feature and counts changed cells instead, and was confirmed by reverting
+`disks.go` and watching it fail. A guard that has never been seen to fail has not
+been shown to be capable of it.
+
+Two more lessons in "real bug, zero cells", and both are why the change is kept
+anyway: reachable in the data and reachable in the code path are different
+questions, and a correct port is worth having on a seed where it is silent, because
+the next capture is not this one. It is also a reminder that "verified line for
+line against the jar" covers the control flow and not the inputs - the semantics of
+`replaceable` were never re-read, only its use - and that a duplicated helper is how
+one fix leaves two bugs behind.
 
 The one place the reading paid off in cells: `WaterloggedVegetationPatchFeature`
 builds `waterSurface` by iterating the ground **HashSet**, so the water set's
