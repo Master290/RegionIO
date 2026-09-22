@@ -480,6 +480,47 @@ func (m *TreeMinimumSize) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// SizeAtHeight is FeatureSize.getSizeAtHeight(height, selfHeight). Two facts are
+// worth stating because both contradict the parameter names. The callers in
+// TreeFeature.getMaxFreeTreeHeight pass (selfHeight, height) - the arguments are in
+// the other order from the declaration - and each implementation reads only its
+// SECOND parameter, so the value that matters is the y offset from the origin and
+// the configured trunk height is ignored by two_layers entirely.
+func (m TreeMinimumSize) SizeAtHeight(height, selfHeight int) int {
+	limit, ok := m.Limit()
+	if !ok {
+		limit = 0
+	}
+	lower, _ := scalarField(m.Fields, "lower_size")
+	upper, _ := scalarField(m.Fields, "upper_size")
+	if selfHeight < limit {
+		return lower
+	}
+	switch m.Type {
+	case "minecraft:two_layers_feature_size":
+		return upper
+	case "minecraft:three_layers_feature_size":
+		upperLimit, _ := scalarField(m.Fields, "upper_limit")
+		if selfHeight >= height-upperLimit {
+			return upper
+		}
+		middle, _ := scalarField(m.Fields, "middle_size")
+		return middle
+	}
+	return 0
+}
+
+// MinClippedHeight is FeatureSize.minClippedHeight: the optional min_clipped_height
+// member, present on exactly one kind of tree in the pack. It is what lets a trunk be
+// cut short and still place, instead of being refused.
+func (m TreeMinimumSize) MinClippedHeight() (int, bool) {
+	if _, ok := m.Fields["min_clipped_height"]; !ok {
+		return 0, false
+	}
+	value, ok := scalarField(m.Fields, "min_clipped_height")
+	return value, ok
+}
+
 // Limit answers the one thing the size check needs from either variant; the two
 // types spell the field differently, which is why it is looked up by name.
 func (m TreeMinimumSize) Limit() (int, bool) {

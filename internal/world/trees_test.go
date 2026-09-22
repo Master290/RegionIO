@@ -1,45 +1,13 @@
 package world
 
-import (
-	"testing"
+import "testing"
 
-	"regionio/internal/worldgen"
-)
-
-func TestStraightBlobTreeFromDatapack(t *testing.T) {
-	set, err := worldgen.LoadFeatureSet()
-	if err != nil {
-		t.Fatal(err)
-	}
-	config, err := set.Tree("minecraft:oak")
-	if err != nil {
-		t.Fatal(err)
-	}
-	chunk := NewChunk(0, 0, BiomePlains)
-	chunk.setBlockRaw(8, 63, 8, StateGrass)
-	if !placeStraightBlobTree(chunk, worldgen.NewLegacy(42), 8, 64, 8, config) {
-		t.Fatal("datapack oak placement failed")
-	}
-	logs, leaves := 0, 0
-	for y := 64; y < 80; y++ {
-		for x := 0; x < 16; x++ {
-			for z := 0; z < 16; z++ {
-				switch chunk.GetBlock(x, y, z) {
-				case StateOakLog:
-					logs++
-				case StateOakLeaf:
-					leaves++
-				}
-			}
-		}
-	}
-	if logs < 4 || leaves < 10 {
-		t.Fatalf("tree has %d logs and %d leaves", logs, leaves)
-	}
-}
-
-func TestBiomeTreeStageProducesTrees(t *testing.T) {
-	gen := NewVanillaGenerator(12345)
+// TestRegionVegetationStageProducesTrees is the smoke test that the stage-9 replay
+// reaches a tree at all. It used to run against the per-chunk legacy generator, whose
+// hand-written tree path this replaced and deleted; the legacy path now has no trees,
+// so the assertion belongs to the generator the product actually uses.
+func TestRegionVegetationStageProducesTrees(t *testing.T) {
+	gen := NewVanillaRegionGenerator(12345)
 	trees := 0
 	for cx := int32(-4); cx <= 4 && trees == 0; cx++ {
 		for cz := int32(-4); cz <= 4 && trees == 0; cz++ {

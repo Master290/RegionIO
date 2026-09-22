@@ -1,6 +1,7 @@
 package world
 
 import (
+	"errors"
 	"fmt"
 	"math"
 
@@ -124,7 +125,7 @@ func (t *treePlacer) sampleHeights() error {
 		}
 		t.foliageHeight = h
 	default:
-		return fmt.Errorf("world: unimplemented foliage_placer %q for a tree being placed", t.config.FoliagePlacer.Type)
+		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
 	}
 	t.heightAboveFoliage = t.trunkHeight - t.foliageHeight
 
@@ -337,6 +338,25 @@ func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int) bool {
 
 func square(v float32) float32 { return v * v }
 
+// unmodelledPart says a configured tree named a placer or decorator this build has not
+// read from the jar. It is a distinct error rather than a fmt.Errorf because the
+// region decorator walks a 5x5 block of sources, so a tree chain belonging to a
+// neighbouring biome must not abort the chunk being generated: the arm turns this into
+// a counted gap and carries on, while every other error still propagates.
+type unmodelledPart struct {
+	kind string
+	name string
+}
+
+func (u *unmodelledPart) Error() string {
+	return fmt.Sprintf("world: %s %q is not modelled", u.kind, u.name)
+}
+
+func (u *unmodelledPart) Is(target error) bool { return target == errUnmodelled }
+
+// errUnmodelled is the sentinel unmodelledPart matches.
+var errUnmodelled = errors.New("unmodelled")
+
 // placeBelowTrunk is TrunkPlacer.placeBelowTrunkBlock, which asks
 // below_trunk_provider's getOptionalState: when no rule matched and the provider
 // declares no fallback it writes nothing at all, rather than writing back the
@@ -474,7 +494,7 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 			return err
 		}
 	default:
-		return fmt.Errorf("world: unimplemented trunk_placer %q for a tree being placed", t.config.TrunkPlacer.Type)
+		return &unmodelledPart{kind: "trunk_placer", name: t.config.TrunkPlacer.Type}
 	}
 
 	for _, at := range attachments {
@@ -770,7 +790,7 @@ func (t *treePlacer) placeFoliage(at trunkAttachment, offset int) error {
 			}
 		}
 	default:
-		return fmt.Errorf("world: unimplemented foliage_placer %q for a tree being placed", t.config.FoliagePlacer.Type)
+		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
 	}
 	return nil
 }

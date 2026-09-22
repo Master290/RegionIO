@@ -36,17 +36,17 @@ func (r *decorationRegion) testBlockPredicate(set *worldgen.FeatureSet, raw json
 		// (moss_carpet fails both tests in vanilla but blocks motion).
 		return isSolidState(r.getBlock(position.X, position.Y, position.Z)), nil
 	case "minecraft:would_survive":
-		// WouldSurvivePredicate: would the given state survive at the
-		// position. Only sugar cane reaches this in the replayed stages
-		// (SugarCaneBlock.canSurvive: below is sugar cane, or below is
-		// dirt-family/sand with an adjacent water cell below the rim).
+		// WouldSurvivePredicate: `state.canSurvive(level, pos)` - a question about the
+		// named state, asked of a position that normally holds air. It never asks what
+		// stands there, which is why the check below must not look at the cell itself.
 		var value struct {
 			State worldgen.BlockState `json:"state"`
 		}
 		if err := json.Unmarshal(raw, &value); err != nil || value.State.Name == "" {
 			return false, fmt.Errorf("world: would_survive missing state")
 		}
-		if value.State.Name == "minecraft:sugar_cane" {
+		switch value.State.Name {
+		case "minecraft:sugar_cane":
 			below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
 			if !ok {
 				return false, nil
@@ -69,13 +69,32 @@ func (r *decorationRegion) testBlockPredicate(set *worldgen.FeatureSet, raw json
 				}
 			}
 			return false, nil
+		case "minecraft:cactus":
+			// CactusBlock.canSurvive: no solid neighbour and no lava neighbour in any
+			// horizontal direction. The block below is not examined at all, which is
+			// the opposite of every other state that uses this predicate.
+			for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+				neighbor := r.getBlock(position.X+d[0], position.Y, position.Z+d[1])
+				if isSolidState(neighbor) {
+					return false, nil
+				}
+				if name, ok := stateByID(neighbor); ok &&
+					(name.Name == "minecraft:lava" || name.Name == "minecraft:flowing_lava") {
+					return false, nil
+				}
+			}
+			return true, nil
+		case "minecraft:oak_sapling", "minecraft:spruce_sapling", "minecraft:birch_sapling",
+			"minecraft:jungle_sapling", "minecraft:acacia_sapling", "minecraft:dark_oak_sapling",
+			"minecraft:cherry_sapling", "minecraft:pale_oak_sapling", "minecraft:mangrove_propagule",
+			"minecraft:firefly_bush":
+			// VegetationBlock.canSurvive, which is mayPlaceOn of the block below, which
+			// is membership of #minecraft:supports_vegetation. These ten are every tree
+			// chain's placement filter: with the position-contents test that used to sit
+			// in front of them, no tree in a plains or taiga chunk could ever be placed.
+			return r.canVegetationSurvive(position, value.State.Name, set), nil
 		}
-		// Conservative default: the generic vegetation survival check.
-		state, ok := nameToStateID(value.State.Name, value.State.Properties)
-		if !ok {
-			return false, nil
-		}
-		return r.getBlock(position.X, position.Y, position.Z) == state && r.canVegetationSurvive(position, value.State.Name, set), nil
+		return false, fmt.Errorf("world: would_survive for %q has no survival rule modelled; the states that use it in the pack are the nine saplings, the mangrove propagule, the firefly bush, sugar cane and cactus", value.State.Name)
 	case "minecraft:has_sturdy_face":
 		// HasSturdyFacePredicate: the block at pos+offset presents a sturdy
 		// face in the given direction. Our full-cube approximation covers

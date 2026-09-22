@@ -8,6 +8,12 @@ import (
 	"regionio/internal/worldgen"
 )
 
+// vegetationStage is the index of the VEGETATION_DECORATION step in the vanilla
+// feature schedule, which is the step that carries trees, flora and the rest of the
+// surface. It is the stage this file's dispatcher replays, and the number is pinned by
+// TestStage9ScheduleGolden rather than trusted.
+const vegetationStage = 9
+
 func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
@@ -157,6 +163,25 @@ func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.Feature
 		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 			r.placeSimpleBlockFeature(random, position, config, set)
 			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:tree":
+		config, err := set.Tree(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			return r.placeTree(set, random, position, config)
+		}); err != nil {
+			return err
+		}
+	case "minecraft:random_selector":
+		// The tree chains of every temperate biome are one of these, and the entries
+		// are placed features rather than configured ones, so the selector's own
+		// position list is applied first and each winner's is applied after.
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			return r.placeTreeSelector(set, random, position, placed.Feature, context)
 		}); err != nil {
 			return err
 		}

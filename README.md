@@ -118,9 +118,8 @@ runtime captures. The production cache now uses atomic batch publication and
 the datapack-driven region replay path, with cross-chunk writes isolated per
 target. Underground decoration (stage-1 lava lakes, ores with deepslate
 targets, underwater magma, disks) and the mineshaft, ocean ruin and ruined
-portal structure sets run from the vanilla schedule; the largest
-remaining fidelity gap is surface decoration — trees, flora, and springs are
-still hand-written.
+portal structure sets run from the vanilla schedule. Trees now replay from the
+schedule too; flora and springs are the surface work still hand-written.
 The biome parameter
 finder uses an exact spatial index and overlapping region requests share a
 bounded immutable terrain cache, keeping cold 3x3 generation near one second
@@ -144,16 +143,29 @@ the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
 corridor carved, now places in full. What is left in the fixture is
 underground: 306 of its 330 residual cells sit below y=0 and the surface band
 contributes none, led by moss-patch extent, then ground cover, clay, and cave
-vines. Surface decoration is the larger structural gap — trees, flora, and
-springs are still hand-written, and only straight trunks place. That band is now
-measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four land
-chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture has no
-surface at all — top block `water` on all 1,024 columns — and land parity is 99.140%
-with 1,748 of its 3,382 residual cells in the surface band, while biomes stay
-6,144/6,144 and `MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy,
-holds at 96.7%. So the height under the decoration is close to right and the gap is
-placement. Closing both is the road to exact equality, while
-keeping cold batch generation within an acceptable latency budget.
+vines. Surface decoration was the larger structural gap and has now been
+reached: the hand-written tree path is deleted and trees replay from the
+datapack schedule through real trunk and foliage placers — straight, giant and
+fancy trunks, blob, pine, spruce, mega-pine and fancy canopies, with the beehive
+and alter-ground decorators — writing through the region's own radius-one gate,
+so a canopy may cross a chunk border exactly as vanilla's does. That band is
+measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
+land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
+has no surface at all — top block `water` on all 1,024 columns. Land parity went
+from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
+hand-written trees, to 99.208% (3,116 residual, 1,339 in the surface band) with
+the replayed ones, and the cells above sea level that hold a trunk, canopy or
+plant went from zero to 661 against vanilla's 789. `MOTION_BLOCKING_NO_LEAVES`,
+the one heightmap that ignores canopy, holds at 97.9%, so the height under the
+decoration is right and what remains is placement: the four chunks still disagree
+in both directions (one taiga chunk places 200 of vanilla's 353 tree cells, one
+plains chunk 179 against 114), and the counter the diagnostic prints names the
+rest — `dark_oak_foliage_placer` from a neighbouring forest 32 times, a fallen
+tree once, mushroom selectors seven. Flora and springs are the next step; the
+ocean fixture did not move (330 cells, clay 96/22/9, ore parity zero), which is
+the check that a surface change stayed on the surface. Closing the rest is the
+road to exact equality, while keeping cold batch generation within an acceptable
+latency budget.
 
 ## Project layout
 

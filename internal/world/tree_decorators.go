@@ -80,7 +80,7 @@ func (t *treePlacer) placeDecorators(set *worldgen.FeatureSet) error {
 				return err
 			}
 		default:
-			return fmt.Errorf("world: tree decorator %q is not implemented", decorator.Type)
+			return &unmodelledPart{kind: "tree_decorator", name: decorator.Type}
 		}
 	}
 	return nil

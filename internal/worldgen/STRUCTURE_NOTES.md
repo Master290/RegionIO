@@ -1479,3 +1479,79 @@ this file and the plan had asserted:
   base `TrunkPlacer` (inside `placeTrunk`), and `ignoreVines` is read in
   `getMaxFreeTreeHeight` next to `FeatureSize.getSizeAtHeight` - so both belong to
   the placer implementations, not to a place() prologue that does not exist.
+
+## Surface decoration, part 2: the placer bodies, and the filter that had been refusing every tree
+
+Verified against `versions/26.1.2/server-26.1.2.jar` with `javap -p -c`, for the six
+configured trees the taiga and plains chains reach: `oak_bees_005`,
+`fancy_oak_bees_005`, `pine`, `spruce`, `mega_pine`, `mega_spruce`.
+
+`TreeFeature.doPlace` samples three values before it tests anything —
+`getTreeHeight`, then `foliageHeight(random, trunkHeight, config)`, then
+`foliageRadius(random, trunkHeight - foliageHeight)` — and hands the trio to
+`FoliagePlacer.createFoliage` as `(maxFreeHeight, attachment, foliageHeight,
+foliageRadius, offset)`. Two consequences that are easy to get backwards:
+
+* The row count of a canopy comes from `foliageHeight` and its width from
+  `foliageRadius`. Reading them the other way shortens or widens a tree by their
+  difference; blob and pine both did, and neither showed up as an error.
+* The `i` that `PineFoliagePlacer.foliageRadius` bounds its extra `nextInt` with is
+  the `trunkHeight - foliageHeight` argument, not the trunk height.
+
+`doPlace` then clamps: `getMaxFreeTreeHeight` returns the tallest prefix whose every
+row, widened by `minimum_size`, is free, or `y - 2` at the first row that is not. The
+clamped value is what `placeTrunk` and `createFoliage` receive, while
+`foliageHeight`/`foliageRadius` keep the values sampled from the unclamped height. A
+config without `min_clipped_height` still places when the trunk is clipped — it does
+not refuse.
+
+`FeatureSize.getSizeAtHeight(a, b)` is called as `(selfHeight, height)` — the reverse
+of its declared parameter names — and `TwoLayersFeatureSize` reads only its **second**
+argument, so `lowerSize` applies while `y < limit` and `upperSize` from there on,
+regardless of the configured trunk height.
+
+Per-placer facts, all from the bodies: `GiantTrunkPlacer` returns
+`new FoliageAttachment(pos.above(h), 0, true)` — radius offset **0**, the double trunk
+widening rows through `placeLeavesRow`'s extra column instead. `StraightTrunkPlacer`
+paints through `placeLog`, which tests `validTreePos` *before* sampling the trunk
+provider; `GiantTrunkPlacer` gates with `isFree`, which additionally admits an
+existing log. `TrunkPlacer.placeBelowTrunkBlock` calls
+`belowTrunkProvider.getOptionalState`, and a rule-based provider with no matching rule
+and no fallback returns null there — so it writes nothing, where the same provider's
+`getState` would have returned the standing block. `SpruceFoliagePlacer`'s width
+breathes (grow to a limit that itself grows, then collapse to a remembered value), so
+it is not a cone. `MegaPineFoliagePlacer` iterates absolute y values, calls
+`placeLeavesRow` with `y = 0`, and bumps the radius by one on even rows when it equals
+the previous row's. `FancyTrunkPlacer` is a circle-segment outline (`treeShape`),
+limbs rasterised by `makeLimb` in `max(|dx|,|dy|,|dz|)` steps with the log axis set from
+the dominant horizontal component, and `trimBranches` dropping anything below
+`0.2 * clusterHeight`.
+
+`TreeDecorator.Context` builds its `logs`, `leaves` and `roots` lists from three
+`HashSet`s and then sorts each with `Comparator.comparingInt(BlockPos::getY)` — a
+stable merge sort with no tie-break, so the observable order is insertion order
+restricted to equal-height groups. The trunk setter records the block **under** the
+trunk as a log, which is why a mega pine on bare stone ends up standing on podzol: the
+below-trunk provider puts dirt there first, and dirt is in
+`beneath_tree_podzol_replaceable`.
+
+The bug that made all of this moot for as long as it stood was upstream of the
+placers. `minecraft:would_survive` is `state.canSurvive(level, pos)` — a question about
+the *named* state, asked of a position that normally holds air. This build also required
+the cell to already contain that state, which is a question about a placed block, so the
+`block_predicate_filter` on `trees_plains`, `trees_taiga` and every `*_checked` wrapper
+refused every candidate position and the region path placed **zero** trees.
+`VegetationBlock.canSurvive` is `mayPlaceOn(getState(pos.below()))`, i.e. membership of
+`#minecraft:supports_vegetation` = `#substrate_overworld` + `farmland`. `CactusBlock`
+never looks below at all — it refuses when any horizontal neighbour is solid or lava —
+and `SugarCaneBlock` keeps its own rule. The twelve states that use this predicate in
+the pack are now named explicitly, and any thirteenth errors instead of guessing.
+
+Measured, land fixture (four chunks, seed 12345), before to after the replay:
+99.140% to 99.208% exact, surface band 1,748 to 1,339, tree-and-plant cells above sea
+level **0 to 661** against vanilla's 789, `WORLD_SURFACE` 539/1024 to 604/1024,
+`MOTION_BLOCKING` 734 to 788, `MOTION_BLOCKING_NO_LEAVES` 1,002 to 1,004. The ocean
+fixture did not move: 330 residual cells, clay 96/22/9, ore parity zero. Still
+un-replayed and now counted rather than silent: `dark_oak_foliage_placer` (32 times
+across those four chunks, from a neighbouring forest), `fallen_tree` (1), the mushroom
+selectors (7).

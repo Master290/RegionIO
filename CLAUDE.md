@@ -172,16 +172,21 @@ Known gaps, roughly in order of how visible they are:
   add), and mineshafts (`world/mineshafts.go`, verified against the saved vanilla start NBT
   piece-for-piece and against a structures-only capture cell-for-cell) replay from their datapack
   configurations. Both stage-1 lava lakes replay from `world/lakes.go` — 26.1.2 has no water-lake
-  configured feature left, so `LakeFeature`'s freeze pass never fires. What is still hand-written is
-  the surface decoration dispatcher at `world/vanilla.go:569-574`: springs (`springs.go`), trees
-  (`trees.go`), flora, desert features and rocks (`features.go`). "Hand-written" is not "unused":
-  this is the path the shipping generator takes, reached per chunk from
-  `decorateGeneratedNonOre` at `world/region_generator.go:173` — the region replay and these
-  hand-written features are not alternative implementations of the same surface decoration.
-- **Trees are a reference implementation**, not vanilla: only straight-trunk/blob-foliage configs
-  place (`trees.go`), placement ignores per-position biome checks and would-block conditions, and
-  trunks stop two blocks inside the chunk so canopies never cross chunk borders. Vanilla trees write
-  into neighbours; the region infrastructure already supports that.
+  configured feature left, so `LakeFeature`'s freeze pass never fires. What is still
+  hand-written is the surface decoration dispatcher at
+  `world/vanilla.go:569-573`: springs (`springs.go`), flora, desert features and rocks
+  (`features.go`). "Hand-written" is not "unused": this is the path the legacy per-chunk
+  generator takes, reached from `decorateGeneratedNonOre` at `world/region_generator.go:173`,
+  and it now places **no trees at all** — the legacy generator is a comparison fallback, not a
+  second tree implementation.
+- **Trees are vanilla's own algorithm**: three trunk placers (straight, giant, fancy), five
+  foliage placers (blob, pine, spruce, mega pine, fancy) and the beehive and alter-ground
+  decorators, each transcribed from `javap -p -c` output and pinned by a silhouette golden in
+  `tree_placers_test.go`. An un-modelled placer or decorator is counted by name and skipped
+  rather than aborting a region, because the replay walks 5×5 sources and one border forest
+  must not lose a taiga chunk; `TestVanillaLandBlockParity` prints the tally. Canopies do cross
+  chunk borders — vanilla has no border test, only `ChunkStep.blockStateWriteRadius`, which is
+  1 chunk for FEATURES and is what `decorationRegion.setBlock` enforces.
 - **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
   adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
   warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,

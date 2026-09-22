@@ -123,6 +123,7 @@ func TestVanillaLandBlockParity(t *testing.T) {
 	}
 	cap := readFixtureCapture(t, vanillaLandFixture)
 	gen := NewVanillaRegionGenerator(cap.seed)
+	ResetNotReplayed()
 
 	type statePair struct{ got, want uint16 }
 	pairs := map[statePair]int{}
@@ -132,6 +133,20 @@ func TestVanillaLandBlockParity(t *testing.T) {
 	total, exact := 0, 0
 	biomeTotal, biomeExact := 0, 0
 	heightTotal, heightExact := 0, 0
+	// Written now rather than at the end: a failure part way through the loop still
+	// has to say what the selectors chose that this build cannot place.
+	t.Cleanup(func() {
+		if counts := NotReplayed(); len(counts) > 0 {
+			kindCount := make([]string, 0, len(counts))
+			for kind, n := range counts {
+				kindCount = append(kindCount, fmt.Sprintf("%s=%d", kind, n))
+			}
+			sort.Strings(kindCount)
+			t.Logf("configured types a replayed selector chose and this build did not place: %s",
+				strings.Join(kindCount, ", "))
+		}
+	})
+
 	// Split per heightmap, because the three disagree about vegetation and that is
 	// the whole question. WORLD_SURFACE and MOTION_BLOCKING count leaves and plants,
 	// so a canopy in the wrong place shows up in them; MOTION_BLOCKING_NO_LEAVES
