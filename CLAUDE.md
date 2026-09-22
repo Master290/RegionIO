@@ -257,7 +257,15 @@ effect, including what downstream stages did differently because those cells had
 `make diagnostics` compiles every test binary and then runs the gated probes with their variables set.
 The compile half matters more than it looks: `go build ./...` never touches `_test.go` files, and
 debug instrumentation left in `internal/world` has twice broken the package's build in a way the
-plain build could not see.
+plain build could not see. GitHub Actions mirrors the target as its own `diagnostics` job, because
+`make` is not on the runner - so a probe added to one list needs adding to the other.
+
+Not every gated diagnostic runs there, deliberately. The ore-path and capture-comparison probes are
+on-demand because they need captures the runner does not carry, and the clay index sweep re-runs
+the schedule 41 times; `make clay-index-sweep` is its driver, and
+`TestLushClayPositionsAreRecorded` asserts the two decisive points of its result on every run
+instead. The rule worth keeping: a diagnostic whose finding matters should end up asserted, not
+merely printed - a `t.Logf` no one diffs silently survives the thing it was written to detect.
 
 Beyond the always-on tests, `internal/world` carries env-gated diagnostics for hunting the residual
 parity gap (all skip unless the variable is set): `REGIONIO_REGION_ORE_DIAGNOSTIC=1` compares the

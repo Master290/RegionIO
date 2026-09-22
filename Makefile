@@ -31,8 +31,8 @@ diagnostics:
 	go test -run TestNothingMatchesThis ./...
 	REGIONIO_CLAY_TRACE=1 REGIONIO_LUSH_CLAY_PROBE=1 \
 	REGIONIO_CLAY_MISMATCH_DIAG=1 REGIONIO_ORE_SCHEDULE_DIAGNOSTIC=1 \
-	REGIONIO_MOSS_PATCH_DIAGNOSTIC=1 \
-		go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual' ./internal/world
+	REGIONIO_MOSS_PATCH_DIAGNOSTIC=1 REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1 \
+		go test -run 'Clay|LushClay|OreSchedule|Moss|VegetationResidual|BaseTerrain' ./internal/world
 	REGIONIO_LUSH_CLAY_PROBE=1 REGIONIO_LUSH_CLAY_PROBE_STATE=1 \
 		go test -run TestProbeLushClayStream -count=1 -v ./internal/world
 	REGIONIO_LUSH_CLAY_PROBE=1 REGIONIO_LUSH_CLAY_PROBE_STATE=1 \

@@ -2,7 +2,6 @@ package world
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"testing"
 
@@ -64,9 +63,7 @@ func baseTerrainFamily(id uint16) string {
 type basePairKey struct{ got, want uint16 }
 
 func TestBaseTerrainMismatchDiagnostic(t *testing.T) {
-	if os.Getenv("REGIONIO_BASE_TERRAIN_DIAGNOSTIC") != "1" {
-		t.Skip("set REGIONIO_BASE_TERRAIN_DIAGNOSTIC=1 to classify fixture mismatches")
-	}
+	requireDiagnostic(t, "REGIONIO_BASE_TERRAIN_DIAGNOSTIC")
 	fixtures, seed := loadOreFixtureChunks(t)
 
 	od, err := worldgen.LoadOverworldFinalDensity(seed)
