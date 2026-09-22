@@ -133,6 +133,21 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 		}
 		return r.placeVegetationPatch(random, position, config, set, configured.Type == "minecraft:waterlogged_vegetation_patch")
 	}
+	// Nothing in 26.1.2's data reaches this line: the only configured types nested
+	// inside a simple_random_selector or a vegetation patch are simple_block,
+	// simple_random_selector and block_column, measured across every
+	// configured_feature JSON in the embed, which is why this path has no tree
+	// routing to write. Counted rather than silent, because that measurement is a
+	// property of this pack and not of this function - a new biome or a new pack
+	// would otherwise drop a feature with no trace, which is how the kelp and
+	// seagrass gap stayed invisible long enough to corrupt the clay reading.
+	//
+	// It still returns false, and must keep doing so: placePatchVegetationFeature
+	// waterlogs the cell only when the nested call reports that it placed, so
+	// reporting success for a feature that placed nothing would waterlog an empty
+	// cell. That is also why this does not delegate to placeConfiguredVegetation,
+	// which signals the same thing with a nil error.
+	noteNotReplayed("nested:" + configured.Type)
 	return false
 }
 
