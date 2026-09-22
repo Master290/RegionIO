@@ -84,14 +84,31 @@ func placeStraightBlobTree(c *Chunk, random worldgen.RandomSource, x, y, z int, 
 	if floor != StateGrass && floor != StateDirt && floor != StateCoarseDirt && floor != StatePodzol {
 		return false
 	}
-	height := config.TrunkPlacer.BaseHeight
-	if config.TrunkPlacer.HeightRandA > 0 {
-		height += int(random.NextIntN(int32(config.TrunkPlacer.HeightRandA + 1)))
+	height, okBase := config.TrunkPlacer.Scalar("base_height")
+	randA, okA := config.TrunkPlacer.Scalar("height_rand_a")
+	randB, okB := config.TrunkPlacer.Scalar("height_rand_b")
+	if !okBase || !okA || !okB {
+		return false
 	}
-	if config.TrunkPlacer.HeightRandB > 0 {
-		height += int(random.NextIntN(int32(config.TrunkPlacer.HeightRandB + 1)))
+	if height <= 0 {
+		return false
 	}
-	for dy := 0; dy <= height+config.FoliagePlacer.Height; dy++ {
+	if randA > 0 {
+		height += int(random.NextIntN(int32(randA + 1)))
+	}
+	if randB > 0 {
+		height += int(random.NextIntN(int32(randB + 1)))
+	}
+	// The blob placer's three fields are scalars in every config this pack holds,
+	// so reading them as scalars preserves what this function used to place; if a
+	// future pack makes one a provider, this refuses rather than reading a zero.
+	foliageHeight, okH := config.FoliagePlacer.Scalar("height")
+	foliageOffset, okO := config.FoliagePlacer.Scalar("offset")
+	foliageRadius, okR := config.FoliagePlacer.Scalar("radius")
+	if !okH || !okO || !okR {
+		return false
+	}
+	for dy := 0; dy <= height+foliageHeight; dy++ {
 		if c.GetBlock(x, y+dy, z) != StateAir {
 			return false
 		}
@@ -105,10 +122,10 @@ func placeStraightBlobTree(c *Chunk, random worldgen.RandomSource, x, y, z int, 
 	for dy := 0; dy < height; dy++ {
 		c.SetBlock(x, y+dy, z, logState)
 	}
-	centerY := y + height - 1 + config.FoliagePlacer.Offset
-	for layer := 0; layer < config.FoliagePlacer.Height; layer++ {
-		radius := config.FoliagePlacer.Radius
-		if layer == config.FoliagePlacer.Height-1 {
+	centerY := y + height - 1 + foliageOffset
+	for layer := 0; layer < foliageHeight; layer++ {
+		radius := foliageRadius
+		if layer == foliageHeight-1 {
 			radius--
 		}
 		ly := centerY - layer

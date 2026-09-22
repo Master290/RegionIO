@@ -2,11 +2,11 @@ package worldgen
 
 import (
 	"archive/zip"
-	"hash/fnv"
 	"bytes"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"path"
 	"sort"
@@ -141,11 +141,11 @@ type WeightedBlockState struct {
 // from the feature RNG exactly like vanilla's BlockStateProvider.getState.
 type StateProviderSpec struct {
 	Type     string
-	State    BlockState            // simple
-	Entries  []WeightedBlockState  // weighted
-	Property string                // randomized_int
-	Source   *StateProviderSpec    // randomized_int
-	Values   CountProvider         // randomized_int
+	State    BlockState           // simple
+	Entries  []WeightedBlockState // weighted
+	Property string               // randomized_int
+	Source   *StateProviderSpec   // randomized_int
+	Values   CountProvider        // randomized_int
 }
 
 // SampleState mirrors BlockStateProvider.getState(random): simple returns
@@ -226,6 +226,22 @@ type WeightedNestedInt struct {
 	Value  NestedIntProvider
 }
 
+// ConstantValue reports the value of a provider that draws nothing - a bare int or
+// a uniform whose span is one - and false for anything that samples. It exists so
+// call sites that have not implemented provider semantics can say so explicitly
+// instead of reading p.Min and quietly treating a draw as a constant.
+func (p NestedIntProvider) ConstantValue() (int, bool) {
+	switch p.Type {
+	case "constant":
+		return p.Min, true
+	case "uniform":
+		if p.Max-p.Min+1 <= 1 {
+			return p.Min, true
+		}
+	}
+	return 0, false
+}
+
 // Sample mirrors IntProvider.sample: uniform draws once, weighted draws the
 // entry pick then recurses into the entry, biased_to_bottom draws twice
 // (nextInt(span) then nextInt(that+1)).
@@ -290,27 +306,179 @@ type SpringFeatureConfig struct {
 	ValidBlocks        []string   `json:"valid_blocks"`
 }
 
+// TreeFeatureConfig mirrors TreeConfiguration, whose fields `javap -p` lists as
+// exactly: trunk_provider, trunk_placer, foliage_provider, foliage_placer,
+// decorators, minimum_size, ignore_vines, below_trunk_provider, root_placer.
+//
+// The shape of this struct was a bug before it was an omission. trunk_placer and
+// foliage_placer used to hold plain ints, but the taiga placers carry int
+// providers - pine's `height`, spruce's `offset`, mega_pine's `crown_height` are
+// all `uniform` objects - so `minecraft:pine` and `minecraft:spruce` failed to
+// decode outright, while mega_pine and mega_spruce decoded "successfully" with
+// radius 0 and height 0 silently filled in from absent fields. One failure was
+// loud and one was invisible, and only the loud one looked like a bug.
 type TreeFeatureConfig struct {
-	TrunkProvider struct {
-		Type  string     `json:"type"`
-		State BlockState `json:"state"`
-	} `json:"trunk_provider"`
-	FoliageProvider struct {
-		Type  string     `json:"type"`
-		State BlockState `json:"state"`
-	} `json:"foliage_provider"`
-	TrunkPlacer struct {
-		Type        string `json:"type"`
-		BaseHeight  int    `json:"base_height"`
-		HeightRandA int    `json:"height_rand_a"`
-		HeightRandB int    `json:"height_rand_b"`
-	} `json:"trunk_placer"`
-	FoliagePlacer struct {
-		Type   string `json:"type"`
-		Height int    `json:"height"`
-		Offset int    `json:"offset"`
-		Radius int    `json:"radius"`
-	} `json:"foliage_placer"`
+	TrunkProvider      TreeBlockProvider `json:"trunk_provider"`
+	FoliageProvider    TreeBlockProvider `json:"foliage_provider"`
+	BelowTrunkProvider json.RawMessage   `json:"below_trunk_provider"`
+	TrunkPlacer        TreeTrunkPlacer   `json:"trunk_placer"`
+	FoliagePlacer      TreeFoliagePlacer `json:"foliage_placer"`
+	MinimumSize        TreeMinimumSize   `json:"minimum_size"`
+	IgnoreVines        bool              `json:"ignore_vines"`
+	Decorators         []TreeDecorator   `json:"decorators"`
+	RootPlacer         json.RawMessage   `json:"root_placer"`
+}
+
+// TreeBlockProvider is a state supplier as the tree configs use them: either
+// simple_state_provider with one state, or a rule_based/weighted structure that
+// only below_trunk_provider uses in the biomes measured so far.
+// TreeBlockProvider is one of the three state-supplier shapes the tree configs
+// actually use, measured across the 39 configured trees: trunk_provider is always
+// simple_state_provider, foliage_provider is simple except azalea_tree which is a
+// weighted_state_provider, and below_trunk_provider is rule_based_state_provider
+// except once. Only the simple form carries `state`, so the field may be empty for
+// the others and is not treated as a defect - but the type itself must be known.
+type TreeBlockProvider struct {
+	Type  string          `json:"type"`
+	State BlockState      `json:"state"`
+	Raw   json.RawMessage `json:"-"`
+}
+
+// knownStateProviders is again measured rather than remembered.
+var knownStateProviders = map[string]bool{
+	"minecraft:simple_state_provider":         true,
+	"minecraft:weighted_state_provider":       true,
+	"minecraft:rule_based_state_provider":     true,
+	"minecraft:randomized_int_state_provider": true,
+	"minecraft:rotated_block_provider":        true,
+	"minecraft:noise_provider":                true,
+	"minecraft:dual_noise_provider":           true,
+	"minecraft:noise_threshold_provider":      true,
+}
+
+type TreeTrunkPlacer struct {
+	Type   string
+	Fields map[string]json.RawMessage
+}
+
+type TreeFoliagePlacer struct {
+	Type   string
+	Fields map[string]json.RawMessage
+}
+
+// UnmarshalJSON peels "type" off and keeps every other member verbatim, so no
+// field can be lost by not being declared.
+func (p *TreeTrunkPlacer) UnmarshalJSON(raw []byte) error {
+	return unmarshalPlacer(raw, &p.Type, &p.Fields)
+}
+
+func (p *TreeFoliagePlacer) UnmarshalJSON(raw []byte) error {
+	return unmarshalPlacer(raw, &p.Type, &p.Fields)
+}
+
+func unmarshalPlacer(raw []byte, typ *string, fields *map[string]json.RawMessage) error {
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &all); err != nil {
+		return err
+	}
+	name, ok := all["type"]
+	if !ok {
+		return fmt.Errorf("placer has no type field")
+	}
+	if err := json.Unmarshal(name, typ); err != nil {
+		return err
+	}
+	delete(all, "type")
+	*fields = all
+	return nil
+}
+
+// Scalar reads a field the data holds as a plain number; Provider reads one as an
+// int provider, which also accepts a bare int as a draw-free constant.
+func (p TreeTrunkPlacer) Scalar(name string) (int, bool)   { return scalarField(p.Fields, name) }
+func (p TreeFoliagePlacer) Scalar(name string) (int, bool) { return scalarField(p.Fields, name) }
+
+func (p TreeFoliagePlacer) Float(name string) (float64, bool) {
+	raw, ok := p.Fields[name]
+	if !ok {
+		return 0, false
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+func (p TreeTrunkPlacer) Provider(name string) (NestedIntProvider, bool, error) {
+	return providerField(p.Fields, name)
+}
+
+func (p TreeFoliagePlacer) Provider(name string) (NestedIntProvider, bool, error) {
+	return providerField(p.Fields, name)
+}
+
+func scalarField(fields map[string]json.RawMessage, name string) (int, bool) {
+	raw, ok := fields[name]
+	if !ok {
+		return 0, false
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func providerField(fields map[string]json.RawMessage, name string) (NestedIntProvider, bool, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return NestedIntProvider{}, false, nil
+	}
+	parsed, err := parseNestedIntProvider(raw)
+	if err != nil {
+		return NestedIntProvider{}, true, err
+	}
+	return parsed, true, nil
+}
+
+// TreeMinimumSize is two_layers or three_layers - 34 and 5 uses respectively in
+// this pack - and keeps its fields raw for the same reason the placers do.
+type TreeMinimumSize struct {
+	Type   string
+	Fields map[string]json.RawMessage
+}
+
+func (m *TreeMinimumSize) UnmarshalJSON(raw []byte) error {
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &all); err != nil {
+		return err
+	}
+	name, ok := all["type"]
+	if !ok {
+		return fmt.Errorf("minimum_size has no type field")
+	}
+	if err := json.Unmarshal(name, &m.Type); err != nil {
+		return err
+	}
+	delete(all, "type")
+	m.Fields = all
+	return nil
+}
+
+// Limit answers the one thing the size check needs from either variant; the two
+// types spell the field differently, which is why it is looked up by name.
+func (m TreeMinimumSize) Limit() (int, bool) {
+	if v, ok := scalarField(m.Fields, "limit"); ok {
+		return v, true
+	}
+	return scalarField(m.Fields, "min_limit")
+}
+
+type TreeDecorator struct {
+	Type   string          `json:"type"`
+	Config json.RawMessage `json:"-"`
+	Raw    json.RawMessage `json:"-"`
 }
 
 type FeatureRef struct {
@@ -924,6 +1092,92 @@ func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
 	return config, nil
 }
 
+// trunkPlacerSpec and foliagePlacerSpec are the field sets of every placer type,
+// measured by enumerating the 39 minecraft:tree configured features in the embedded
+// pack - 9 trunk types, 11 foliage types, and for each the exact set of members it
+// carries (no type in this pack omits a field its siblings have, so every entry is
+// required rather than split into required/optional).
+//
+// These lists were first written from recollection and were wrong twice: they
+// invented large_oak_foliage_placer, which does not exist; omitted acacia, bush,
+// jungle and mega_jungle; and gave spruce a `height` it has never had while hiding
+// its real `trunk_height`. TestTreePlacerSpecMatchesThePack therefore re-derives
+// them from the data on every run instead of trusting the comment above them.
+var trunkPlacerSpec = map[string][]string{
+	"minecraft:straight_trunk_placer":          {"base_height", "height_rand_a", "height_rand_b"},
+	"minecraft:dark_oak_trunk_placer":          {"base_height", "height_rand_a", "height_rand_b"},
+	"minecraft:fancy_trunk_placer":             {"base_height", "height_rand_a", "height_rand_b"},
+	"minecraft:forking_trunk_placer":           {"base_height", "height_rand_a", "height_rand_b"},
+	"minecraft:giant_trunk_placer":             {"base_height", "height_rand_a", "height_rand_b"},
+	"minecraft:mega_jungle_trunk_placer":       {"base_height", "height_rand_a", "height_rand_b"},
+	"minecraft:bending_trunk_placer":           {"base_height", "bend_length", "height_rand_a", "height_rand_b", "min_height_for_leaves"},
+	"minecraft:cherry_trunk_placer":            {"base_height", "branch_count", "branch_end_offset_from_top", "branch_horizontal_length", "branch_start_offset_from_top", "height_rand_a", "height_rand_b"},
+	"minecraft:upwards_branching_trunk_placer": {"base_height", "can_grow_through", "extra_branch_length", "extra_branch_steps", "height_rand_a", "height_rand_b", "place_branch_per_log_probability"},
+}
+
+var foliagePlacerSpec = map[string][]string{
+	"minecraft:acacia_foliage_placer":        {"offset", "radius"},
+	"minecraft:blob_foliage_placer":          {"height", "offset", "radius"},
+	"minecraft:bush_foliage_placer":          {"height", "offset", "radius"},
+	"minecraft:cherry_foliage_placer":        {"corner_hole_chance", "hanging_leaves_chance", "hanging_leaves_extension_chance", "height", "offset", "radius", "wide_bottom_layer_hole_chance"},
+	"minecraft:dark_oak_foliage_placer":      {"offset", "radius"},
+	"minecraft:fancy_foliage_placer":         {"height", "offset", "radius"},
+	"minecraft:jungle_foliage_placer":        {"height", "offset", "radius"},
+	"minecraft:mega_pine_foliage_placer":     {"crown_height", "offset", "radius"},
+	"minecraft:pine_foliage_placer":          {"height", "offset", "radius"},
+	"minecraft:random_spread_foliage_placer": {"foliage_height", "leaf_placement_attempts", "offset", "radius"},
+	"minecraft:spruce_foliage_placer":        {"offset", "radius", "trunk_height"},
+}
+
+// validateBlockProvider requires a recognised supplier type, and requires an
+// actual state only for the simple form - the weighted and rule-based shapes carry
+// their states inside entries/rules, which is why demanding State.Name here would
+// have rejected azalea_tree.
+func validateBlockProvider(feature, slot string, p TreeBlockProvider) error {
+	if !knownStateProviders[p.Type] {
+		return fmt.Errorf("worldgen: %s: %s has unmodelled provider type %q", feature, slot, p.Type)
+	}
+	if p.Type == "minecraft:simple_state_provider" && p.State.Name == "" {
+		return fmt.Errorf("worldgen: %s: %s is simple_state_provider without a state", feature, slot)
+	}
+	return nil
+}
+
+// validatePlacer checks a placer against its spec: a type the pack does not have is
+// an error, a field the type does not carry is an error, a missing one is an error,
+// and any object-shaped field must parse as an int provider. Without the last
+// check, an unreadable provider would arrive as the zero value - which is exactly
+// how mega_pine used to report a radius of 0.
+func validatePlacer(feature, kind string, typ string, fields map[string]json.RawMessage, spec map[string][]string) error {
+	want, ok := spec[typ]
+	if !ok {
+		return fmt.Errorf("worldgen: %s has an unmodelled %s type %q", feature, kind, typ)
+	}
+	for _, name := range want {
+		if _, present := fields[name]; !present {
+			return fmt.Errorf("worldgen: %s: %s is missing %s", feature, typ, name)
+		}
+	}
+	for name, raw := range fields {
+		found := false
+		for _, w := range want {
+			if w == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("worldgen: %s: %s carries %q, which is not a field this build models for it", feature, typ, name)
+		}
+		if len(raw) > 0 && raw[0] == '{' {
+			if _, err := parseNestedIntProvider(raw); err != nil {
+				return fmt.Errorf("worldgen: %s: %s.%s is not a readable int provider: %w", feature, typ, name, err)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:tree" {
@@ -933,8 +1187,36 @@ func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 	if err := json.Unmarshal(configured.Config, &config); err != nil {
 		return TreeFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
 	}
-	if config.TrunkPlacer.Type == "" || config.FoliagePlacer.Type == "" || config.TrunkProvider.State.Name == "" || config.FoliageProvider.State.Name == "" {
-		return TreeFeatureConfig{}, fmt.Errorf("worldgen: invalid tree config %s", name)
+	var rawSlots struct {
+		TrunkProvider   json.RawMessage `json:"trunk_provider"`
+		FoliageProvider json.RawMessage `json:"foliage_provider"`
+	}
+	if err := json.Unmarshal(configured.Config, &rawSlots); err == nil {
+		config.TrunkProvider.Raw = rawSlots.TrunkProvider
+		config.FoliageProvider.Raw = rawSlots.FoliageProvider
+	}
+	if err := validateBlockProvider(name, "trunk_provider", config.TrunkProvider); err != nil {
+		return TreeFeatureConfig{}, err
+	}
+	if err := validateBlockProvider(name, "foliage_provider", config.FoliageProvider); err != nil {
+		return TreeFeatureConfig{}, err
+	}
+	if err := validatePlacer(name, "trunk_placer", config.TrunkPlacer.Type, config.TrunkPlacer.Fields, trunkPlacerSpec); err != nil {
+		return TreeFeatureConfig{}, err
+	}
+	if err := validatePlacer(name, "foliage_placer", config.FoliagePlacer.Type, config.FoliagePlacer.Fields, foliagePlacerSpec); err != nil {
+		return TreeFeatureConfig{}, err
+	}
+	switch config.MinimumSize.Type {
+	case "":
+	case "minecraft:two_layers_feature_size", "minecraft:three_layers_feature_size":
+	default:
+		return TreeFeatureConfig{}, fmt.Errorf("worldgen: %s has unsupported minimum_size %q", name, config.MinimumSize.Type)
+	}
+	for _, d := range config.Decorators {
+		if d.Type == "" {
+			return TreeFeatureConfig{}, fmt.Errorf("worldgen: %s has a decorator without a type", name)
+		}
 	}
 	return config, nil
 }
@@ -979,9 +1261,9 @@ func (s *FeatureSet) BlockColumn(name string) (BlockColumnFeatureConfig, error) 
 		return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block column", name)
 	}
 	var raw struct {
-		Allowed       json.RawMessage `json:"allowed_placement"`
-		Direction     string          `json:"direction"`
-		Layers        []struct {
+		Allowed   json.RawMessage `json:"allowed_placement"`
+		Direction string          `json:"direction"`
+		Layers    []struct {
 			Height   json.RawMessage `json:"height"`
 			Provider json.RawMessage `json:"provider"`
 		} `json:"layers"`
@@ -1056,6 +1338,19 @@ func parseNestedIntProvider(raw json.RawMessage) (NestedIntProvider, error) {
 		return NestedIntProvider{}, err
 	}
 	switch value.Type {
+	case "":
+		// An int provider may be written without a discriminator at all:
+		// cherry_trunk_placer's branch_start_offset_from_top is exactly
+		// {"min_inclusive": -4, "max_inclusive": -3}. It dispatches as a uniform.
+		// The key check matters - without it, any object that is not a provider at
+		// all would parse as the constant 0 and be believed.
+		if !bytes.Contains(raw, []byte("min_inclusive")) && !bytes.Contains(raw, []byte("max_inclusive")) {
+			return NestedIntProvider{}, fmt.Errorf("int provider without a type: %s", raw)
+		}
+		if value.Max < value.Min {
+			return NestedIntProvider{}, fmt.Errorf("invalid implicit uniform %s", raw)
+		}
+		return NestedIntProvider{Type: "uniform", Min: value.Min, Max: value.Max}, nil
 	case "minecraft:uniform":
 		if value.Max < value.Min {
 			return NestedIntProvider{}, fmt.Errorf("invalid uniform %s", raw)
@@ -1090,8 +1385,8 @@ func parseNestedIntProvider(raw json.RawMessage) (NestedIntProvider, error) {
 // providers.
 func parseStateProviderSpec(raw json.RawMessage) (StateProviderSpec, error) {
 	var probe struct {
-		Type     string          `json:"type"`
-		State    BlockState      `json:"state"`
+		Type     string     `json:"type"`
+		State    BlockState `json:"state"`
 		Entries  []WeightedBlockStateRaw
 		Property string          `json:"property"`
 		Source   json.RawMessage `json:"source"`
@@ -1150,7 +1445,8 @@ type WeightedBlockStateRaw struct {
 	Weight int        `json:"weight"`
 }
 
-func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorConfig, error) {	configured, ok := s.Configured[name]
+func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorConfig, error) {
+	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:random_boolean_selector" {
 		return RandomBooleanSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random boolean selector", name)
 	}
@@ -1613,12 +1909,12 @@ func parsePlacementIntProvider(raw json.RawMessage) (placementIntProvider, error
 		return placementIntProvider{min: fixed, max: fixed}, nil
 	}
 	var value struct {
-		Type            string          `json:"type"`
-		Min             int             `json:"min"`
-		Max             int             `json:"max"`
-		MinInclusive    int             `json:"min_inclusive"`
-		MaxInclusive    int             `json:"max_inclusive"`
-		Plateau         int             `json:"plateau"`
+		Type            string `json:"type"`
+		Min             int    `json:"min"`
+		Max             int    `json:"max"`
+		MinInclusive    int    `json:"min_inclusive"`
+		MaxInclusive    int    `json:"max_inclusive"`
+		Plateau         int    `json:"plateau"`
 		Mean, Deviation float32
 		Source          json.RawMessage `json:"source"`
 	}
@@ -1686,10 +1982,10 @@ func parseIntProvider(raw json.RawMessage) (CountProvider, error) {
 		return CountProvider{Min: fixed, Max: fixed}, nil
 	}
 	var clamped struct {
-		Type          string          `json:"type"`
-		MinInclusive  int             `json:"min_inclusive"`
-		MaxInclusive  int             `json:"max_inclusive"`
-		Source        json.RawMessage `json:"source"`
+		Type         string          `json:"type"`
+		MinInclusive int             `json:"min_inclusive"`
+		MaxInclusive int             `json:"max_inclusive"`
+		Source       json.RawMessage `json:"source"`
 	}
 	if err := json.Unmarshal(raw, &clamped); err == nil && clamped.Type == "minecraft:clamped" {
 		if clamped.MaxInclusive < clamped.MinInclusive || len(clamped.Source) == 0 {
@@ -1833,4 +2129,14 @@ func loadFeatureSet(data []byte) (*FeatureSet, error) {
 func resourceName(file string) string {
 	base := strings.TrimSuffix(path.Base(file), ".json")
 	return "minecraft:" + base
+}
+
+// fieldIn reports whether name appears in a measured field set.
+func fieldIn(fields []string, name string) bool {
+	for _, f := range fields {
+		if f == name {
+			return true
+		}
+	}
+	return false
 }
