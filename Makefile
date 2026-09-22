@@ -9,11 +9,17 @@ vet:
 test:
 	go test ./...
 
-# Measured on this tree: internal/world alone takes 18.4 minutes under -race and
-# the whole module 18.6 wall, because the packages run concurrently rather than
-# summing. The old 20m bound therefore left about ninety seconds of slack on the
-# dominant package - a one-test margin, and a local 15m run has already been
-# misread as a data race when it was a timeout. 30m keeps a real failure legible.
+# Re-measured after the surface-decoration port: internal/world's test binary takes
+# 1649.759s (27.5 minutes) under -race and the whole command 27m37s wall, because the
+# packages run concurrently rather than summing. The bound is per binary, so 30m still
+# passes - with two and a half minutes of slack on the dominant package.
+#
+# Slack has been the whole history of this line: the 18.4-minute measurement it was
+# written against has grown by nine minutes (trees, the leaf-distance fixpoint, four land
+# captures loaded by the chain differential), and the 20m bound before that left ninety
+# seconds and had already been misread as a data race when it was a timeout. If the next
+# feature port crosses 30m, raise it with the new number here rather than letting CI fail
+# in a way that looks like a race.
 test-race:
 	go test -race -timeout 30m ./...
 

@@ -59,7 +59,8 @@ world has been generated and cached.
 
 ```
 go test ./...
-# internal/world alone is 18.4 min under -race; the module is 18.6 wall.
+# internal/world's binary alone is 27.5 min under -race (measured 1649.759s); the whole
+# command is 27m37s wall, because packages run concurrently rather than summing.
 go test -race -timeout 30m ./...
 # or run build, vet, ordinary tests, race tests, and the gated diagnostics:
 make verify
