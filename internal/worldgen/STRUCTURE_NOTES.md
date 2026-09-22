@@ -777,20 +777,26 @@ agree on, so missed moss is not pool-related at all. Only our *extra* cells are
 (83% within 3). What is left is a rim defect concentrated in the cells that the
 edge-column roll and the `isEmpty`/`isFaceSturdy`/replaceable acceptance tests
 decide, with the pool region contributing the cells we place and vanilla does
-not. Note one known divergence found while reading the bytecode: `placeGround`
-tests the already-ground condition by BLOCK (`state.is(cur.getBlock())`) and the
-replaceable test is a block-tag test, while our port compares packed state IDs
-and resolves tags to the default state of each member. For the single-state
-blocks in `moss_replaceable` that is identical, so it does not explain these
-cells, but a multi-state member (`cave_vines`, `grass_block[snowed]`) would be
-wrong.
+not. One known divergence was flagged while reading the bytecode: `placeGround` tests
+the already-ground condition by BLOCK (`state.is(cur.getBlock())`) and the
+replaceable test is a block-tag test, while our port compared packed state IDs and
+resolved tags to each member's default state. The note that closed it - "for the
+single-state blocks in `moss_replaceable` that is identical, so it does not explain
+these cells, but a multi-state member (`cave_vines`, `grass_block[snowed]`) would be
+wrong" - was correct about the moss rim and correct about the bug, and the bug sat
+unactioned for that long. It is fixed, along with three sibling copies of the same
+mistake, in "VegetationPatchFeature, now verified line for line": `cave_vines` does
+have 25 states, aged vines were excluded, and the effect on these cells is
+nonetheless **zero** - which is the interesting result, not a refutation. Read the
+two sections together before chasing a rim cell through replaceability again.
 
-Next probe: the `placeScheduledVegetationFeature` seam, so a replay can walk one
-source's real stage-9 schedule and answer whether our patch, run against
-*vanilla's* column, reproduces vanilla's rim. If it does, the world state is the
-cause and `decorationSources` is the target - it models only (0,0) and (1,0) and
-every other source falls to an untuned default. If it does not, the defect is in
-the acceptance tests themselves.
+Both branches of the probe that was next on the list have now run. The
+`placeScheduledVegetationFeature` seam exists and the replay answers the question
+it was built for: our patch, run against vanilla's column, reproduces vanilla's
+rim, so the world state is the cause - see "The moss rim: what the follow-up probes
+measured" and "The last 22 clay anchors are not an ordering problem either". And
+the other branch was right too: `decorationSources` models only (0,0) and (1,0),
+with every other source falling to an untuned default.
 
 ## The moss rim: what the follow-up probes measured, and where the first one misread
 
