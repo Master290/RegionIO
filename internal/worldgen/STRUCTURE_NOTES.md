@@ -786,10 +786,11 @@ these cells, but a multi-state member (`cave_vines`, `grass_block[snowed]`) woul
 wrong" - was correct about the moss rim and correct about the bug, and the bug sat
 unactioned for that long. It is fixed, along with three sibling copies of the same
 mistake, in "VegetationPatchFeature, now verified line for line": `cave_vines` does
-have 52 states in this build - age and perched, not the 25 its property names
-suggest - and aged vines were excluded, and the effect on these cells is
-nonetheless **zero** - which is the interesting result, not a refutation. Read the
-two sections together before chasing a rim cell through replaceability again.
+have 52 states in this build - `age` takes 26 values, 0..25, and `berries`
+two, which is where the "25" I kept repeating went wrong - and aged vines were
+excluded, and the effect on these cells is nonetheless **zero** - which is the interesting result, not a
+refutation. Read the two sections together before chasing a rim cell through
+replaceability again.
 
 Both branches of the probe that was next on the list have now run. The
 `placeScheduledVegetationFeature` seam exists and the replay answers the question
@@ -928,16 +929,19 @@ bug in the same function and was still live: `geodeTagIDs` resolved each
 block tag is a set of **blocks** - so every state of a member matches.
 
 That distinction is not academic here, because `moss_replaceable` includes
-`#minecraft:cave_vines`, which carries 52 states in this build (`age` and
-`perched`, not the 25 that `age` alone would suggest). Every
+`#minecraft:cave_vines`, which carries 52 states in this build: `age` takes
+26 values (0..25) and `berries` two. Every
 cave-vine state other than the default was therefore read as non-replaceable, and
 `placeGround`'s column walk breaks on a non-replaceable cell - so a vine hanging in
 a lush-cave ceiling aborted a patch column that vanilla walks straight through,
 which changes whether the patch is accepted and every draw after it.
-`TestMossReplaceableIsBlockScoped` now asserts block scoping against an
-independently built set over the states the capture actually contains; it names the
-eight it was rejecting, and all eight are `minecraft:cave_vines` /
-`minecraft:cave_vines_plant`.
+`TestTagStateIDsAreBlockScoped` now asserts block scoping against an
+independently built set. Two counts are worth keeping apart: over the whole tag the
+default-only reading was short by **59 states**, but over the 123 distinct states
+this capture actually holds the gap is **eight**, and all eight are
+`minecraft:cave_vines` / `minecraft:cave_vines_plant` - seven ages of the one, the
+non-default state of the other. Only the second is a number a fixture can fail on,
+which is why the test restricts itself to it.
 
 Measured effect on this fixture: **zero cells** - 99.916%, 330 mismatches, clay
 chain 96/22/9, all identical before and after - because none of those states
@@ -951,19 +955,39 @@ as `lakeTagIDs` with the same defect and no fix. Resolving it once as `tagStateI
 and then asking every tag the configured features reference exposes seven that the
 default-only reading got wrong on states this very capture holds:
 
-| tag | states the block accepts that the default reading rejected | subsystem |
-|---|---|---|
-| `moss_replaceable`, `lush_ground_replaceable` | `cave_vines` ages, `cave_vines_plant` | vegetation patches |
-| `geode_invalid_blocks` | `water`, `lava` in their flowing/falling states | geodes |
-| `features_cannot_replace`, `lava_pool_stone_cannot_replace` | `chest` on any non-default facing | lakes, monster rooms |
-| `mangrove_logs_can_grow_through`, `mangrove_roots_can_grow_through` | `vine` beyond its default facing set | mangrove features |
+| tag | non-default states of its members | of those, in this capture | subsystem |
+|---|---|---|---|
+| `moss_replaceable`, `lush_ground_replaceable` | 59 | 8 (`cave_vines` ages, `cave_vines_plant`) | vegetation patches |
+| `geode_invalid_blocks` | 30 (`water`, `lava`: `level` 0..7 times `falling`) | 6 | geodes |
+| `features_cannot_replace` | 72 | 1 (`chest`) | lakes, monster rooms |
+| `lava_pool_stone_cannot_replace` | 457 | 1 (`chest`) | lakes |
+| `mangrove_logs_can_grow_through` | 102 | 5 (`vine`) | mangrove features |
+| `mangrove_roots_can_grow_through` | 80 | 5 (`vine`) | mangrove features |
 
-`chest` is the one to notice: monster rooms place chests, so a tag test that
-recognised only the default orientation was asking a different question than
-vanilla on six of seven facings. `TestTagStateIDsAreBlockScoped` now enumerates
-every `#minecraft:` reference in every configured feature rather than the tags
-someone thought to list, and it was checked by regressing the helper and watching
-it name all seven.
+`chest` is the one to notice: monster rooms place chests, and the block has 24 states
+- 4 `facing` times 3 `type` times 2 `waterlogged` - so a default-only reading
+recognised one of the 24 and was therefore asking a different question than vanilla
+about the other 23, every non-default orientation included. `TestTagStateIDsAreBlockScoped`
+now enumerates every `#minecraft:` reference in every configured feature rather than
+the tags someone thought to list, and it was checked by regressing the helper and
+watching it name all seven.
+
+The third column is the honest one for a fixture: a tag can hold hundreds of
+states the generated region never contains, and then the bug is latent rather than
+absent. Measured against the two lake tags, `lava_pool_stone_cannot_replace` has 62
+members and they are not what its name suggests - **logs, wood and leaves** from
+eleven tree species, with only three single-state blocks (`bedrock`,
+`reinforced_deepslate`, `spawner`) among them - but of all 62 only two appear in
+this capture at all: `bedrock`, which cannot differ, and `chest`, in two of its 24
+states. `features_cannot_replace` is the same two. So the 457 and the 72 are mostly
+leaves (`distance` times `persistent`) and mostly blocks this region never places,
+and a single chest state is the live part.
+
+The mangrove rows are the ones still open. `vine` is present in five non-default
+facing states, so the *states* exist here; whether any code path in this fixture
+consults `mangrove_logs_can_grow_through` is not measured, so those rows are
+recorded as latent rather than as reachable - the difference matters if a mangrove
+capture is ever added, and nothing currently pins it either way.
 
 The same expansion existed a third time, in `disks.go`, and two things written about
 it before they were measured were wrong in opposite directions:
