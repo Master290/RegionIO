@@ -124,6 +124,12 @@ func (t *treePlacer) sampleHeights() error {
 			return err
 		}
 		t.foliageHeight = h
+	case "minecraft:dark_oak_foliage_placer":
+		// DarkOakFoliagePlacer.foliageHeight is `iconst_4; ireturn`: the RandomSource
+		// argument is never read, so this is a constant, not a sample. Its
+		// createFoliage then ignores the value too - the rows are fixed - but
+		// doPlace's own bookkeeping still uses it.
+		t.foliageHeight = 4
 	default:
 		// What this reports is the first un-modelled part in sampling order, not the set
 		// of parts that would fail: trunkHeightFromPlacer implements the generic
@@ -308,18 +314,26 @@ func (t *treePlacer) placeLeavesRow(at trunkAttachment, radius, y int) error {
 // shouldSkipLocationSigned measures distance to the nearer of two trunk columns
 // when a giant tree's canopy covers both.
 func (t *treePlacer) shouldSkipLocationSigned(dx, y, dz, radius int, doubleTrunk bool) bool {
+	// DarkOakFoliagePlacer overrides this method, and its rule reads the SIGNED
+	// coordinates against the row's own radius - the fold below happens in super,
+	// which it then still calls. It applies only to the middle row of a double
+	// trunk, and only in both axes at once.
+	if t.config.FoliagePlacer.Type == "minecraft:dark_oak_foliage_placer" && y == 0 && doubleTrunk &&
+		(dx == -radius || dx >= radius) && (dz == -radius || dz >= radius) {
+		return true
+	}
 	ax, az := abs(dx), abs(dz)
 	if doubleTrunk {
 		ax = min(ax, abs(dx-1))
 		az = min(az, abs(dz-1))
 	}
-	return t.shouldSkipLocation(ax, y, az, radius)
+	return t.shouldSkipLocation(ax, y, az, radius, doubleTrunk)
 }
 
 // shouldSkipLocation is per placer type, and each implemented case is read from
 // bytecode. The y argument is the row offset, which blob uses and the cone
 // placers do not.
-func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int) bool {
+func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int, doubleTrunk bool) bool {
 	switch t.config.FoliagePlacer.Type {
 	case "minecraft:blob_foliage_placer":
 		// Only exact corners are candidates, and only then does it draw. The corner
@@ -339,6 +353,19 @@ func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int) bool {
 	case "minecraft:mega_pine_foliage_placer":
 		// Two tests: the far corner of the double-trunk square, then the circle.
 		return ax+az >= 7 || ax*ax+az*az > radius*radius
+	case "minecraft:dark_oak_foliage_placer":
+		// Two row rules and nothing else, both on folded coordinates against the
+		// row's own radius. The bottom row of a SINGLE trunk loses exactly its far
+		// corner; and the row one above the middle loses a diagonal band, whether or
+		// not the trunk is double - which is why doubleTrunk is tested only in the
+		// first arm.
+		if y == -1 {
+			return !doubleTrunk && ax == radius && az == radius
+		}
+		if y == 1 {
+			return ax+az > 2*radius-2
+		}
+		return false
 	}
 	return false
 }
@@ -447,13 +474,15 @@ func (t *treePlacer) supportsAllParts() error {
 	// to leave the stream exactly where it found it - the same rule that makes a
 	// rejected cell free everywhere else in this file.
 	switch t.config.TrunkPlacer.Type {
-	case "minecraft:straight_trunk_placer", "minecraft:giant_trunk_placer", "minecraft:fancy_trunk_placer":
+	case "minecraft:straight_trunk_placer", "minecraft:giant_trunk_placer",
+		"minecraft:fancy_trunk_placer", "minecraft:dark_oak_trunk_placer":
 	default:
 		return &unmodelledPart{kind: "trunk_placer", name: t.config.TrunkPlacer.Type}
 	}
 	switch t.config.FoliagePlacer.Type {
 	case "minecraft:blob_foliage_placer", "minecraft:fancy_foliage_placer", "minecraft:pine_foliage_placer",
-		"minecraft:spruce_foliage_placer", "minecraft:mega_pine_foliage_placer":
+		"minecraft:spruce_foliage_placer", "minecraft:mega_pine_foliage_placer",
+		"minecraft:dark_oak_foliage_placer":
 	default:
 		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
 	}
@@ -534,6 +563,12 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 		if err != nil {
 			return err
 		}
+	case "minecraft:dark_oak_trunk_placer":
+		var err error
+		attachments, err = t.placeDarkOakTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
 	default:
 		return &unmodelledPart{kind: "trunk_placer", name: t.config.TrunkPlacer.Type}
 	}
@@ -550,6 +585,89 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 		}
 	}
 	return nil
+}
+
+// darkOakDirections is Direction.Plane.HORIZONTAL in iteration order - NORTH, EAST,
+// SOUTH, WEST - the order Util.getRandom indexes with nextInt(4). Each entry is the
+// (stepX, stepZ) the trunk drifts by.
+var darkOakDirections = [][2]int{{0, -1}, {1, 0}, {0, 1}, {-1, 0}}
+
+// placeDarkOakTrunk is DarkOakTrunkPlacer.placeTrunk: a 2x2 column that leans by at
+// most two cells near the top, a canopy on the drifted crown, and one branch per cell
+// of a ring that actually rolled the die.
+//
+// Three details are what make this match rather than merely look like a fat oak:
+//   - the four below-trunk writes happen at the UNDRIFTED corners and before any
+//     draw, so the dirt patch under a leaning tree stays where the tree started;
+//   - a cell that fails the die spends one nextInt(3) and no length draw, and the
+//     ring is walked dx-major over -1..2 in both axes, skipping only the 2x2
+//     footprint - so the attachment order, and therefore the canopy order, is fixed;
+//   - the branches hang from the ORIGINAL x/z, not the drifted column, while the
+//     crown attachment sits at the drifted one and at topY = y + height - 1, i.e. on
+//     the topmost trunk cell rather than above it.
+func (t *treePlacer) placeDarkOakTrunk(x, y, z int) ([]trunkAttachment, error) {
+	corners := [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}}
+	for _, c := range corners {
+		if err := t.placeBelowTrunk(x+c[0], y-1, z+c[1]); err != nil {
+			return nil, err
+		}
+	}
+	direction := darkOakDirections[int(t.random.NextIntN(4))]
+	// The lean starts at this row and costs the budget one cell at a time.
+	threshold := t.trunkHeight - int(t.random.NextIntN(4))
+	budget := 2 - int(t.random.NextIntN(3))
+	topY := y + t.trunkHeight - 1
+
+	curX, curZ := x, z
+	for row := 0; row < t.trunkHeight; row++ {
+		if row >= threshold && budget > 0 {
+			curX += direction[0]
+			curZ += direction[1]
+			budget--
+		}
+		if !t.isAirOrLeaves(curX, y+row, curZ) {
+			// The whole 2x2 row is skipped, but the drift already happened, so a
+			// blocked row still moves the column - the lean survives its gaps.
+			continue
+		}
+		for _, c := range corners {
+			if err := t.placeLogAt(curX+c[0], y+row, curZ+c[1]); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	attachments := []trunkAttachment{{x: curX, y: topY, z: curZ, doubleTrunk: true}}
+	for dx := -1; dx <= 2; dx++ {
+		for dz := -1; dz <= 2; dz++ {
+			if dx >= 0 && dx <= 1 && dz >= 0 && dz <= 1 {
+				continue
+			}
+			if t.random.NextIntN(3) > 0 {
+				continue
+			}
+			length := 2 + int(t.random.NextIntN(3))
+			for k := 0; k < length; k++ {
+				if err := t.placeLogAt(x+dx, topY-k-1, z+dz); err != nil {
+					return nil, err
+				}
+			}
+			attachments = append(attachments, trunkAttachment{x: x + dx, y: topY, z: z + dz})
+		}
+	}
+	return attachments, nil
+}
+
+// isAirOrLeaves is TreeFeature.isAirOrLeaves - air or the LEAVES tag, and unlike
+// validTreePos NOT the replaceable_by_trees tag. DarkOakTrunkPlacer guards a whole
+// trunk row with it, testing only the drifted corner and then skipping all four cells.
+func (t *treePlacer) isAirOrLeaves(x, y, z int) bool {
+	id := t.stateAt(x, y, z)
+	if isAirState(id) {
+		return true
+	}
+	name, ok := stateByID(id)
+	return ok && flattenBlockTagContains(t.set, "minecraft:leaves", name.Name)
 }
 
 // fancyFoliageCoord is FancyTrunkPlacer.FoliageCoords: an attachment plus the y of
@@ -828,6 +946,47 @@ func (t *treePlacer) placeFoliage(at trunkAttachment, offset int) error {
 				layerRadius--
 			} else if layerRadius < t.foliageRadius+at.radiusExtra {
 				layerRadius++
+			}
+		}
+	case "minecraft:dark_oak_foliage_placer":
+		// DarkOakFoliagePlacer.createFoliage reads neither foliageHeight nor the
+		// maxFreeHeight argument nor the attachment's radiusOffset: the rows are a
+		// fixed shape around the attachment and only the offset provider shifts
+		// them. A double trunk paints three rows and then spends ONE nextBoolean
+		// that gates a fourth - drawn even when it declines it - and a single trunk
+		// paints two, with no draw at all. The order is the stream's order.
+		//
+		// The offset goes into the attachment's own y, exactly as vanilla folds it
+		// into `attachment.pos().above(offset)` before the row loop, because this
+		// placer's skip rules read the row offset itself (-1, 0, +1, +2). Folding it
+		// into the row argument instead - which is what the other cases here do,
+		// harmlessly for them because their rules ignore y - would silently move
+		// those rules if a pack ever gave dark oak a non-zero offset. All five of
+		// 26.1.2's configs use 0, so this choice is measured as output-neutral here
+		// and load-bearing only for a pack that is not this one.
+		base := trunkAttachment{x: at.x, y: at.y + offset, z: at.z, radiusExtra: at.radiusExtra, doubleTrunk: at.doubleTrunk}
+		if at.doubleTrunk {
+			if err := t.placeLeavesRow(base, t.foliageRadius+2, -1); err != nil {
+				return err
+			}
+			if err := t.placeLeavesRow(base, t.foliageRadius+3, 0); err != nil {
+				return err
+			}
+			if err := t.placeLeavesRow(base, t.foliageRadius+2, 1); err != nil {
+				return err
+			}
+			if t.random.NextBoolean() {
+				// The cap row keeps the base radius: no +2, no +3.
+				if err := t.placeLeavesRow(base, t.foliageRadius, 2); err != nil {
+					return err
+				}
+			}
+		} else {
+			if err := t.placeLeavesRow(base, t.foliageRadius+2, -1); err != nil {
+				return err
+			}
+			if err := t.placeLeavesRow(base, t.foliageRadius+1, 0); err != nil {
+				return err
 			}
 		}
 	default:

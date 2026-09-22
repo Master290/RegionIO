@@ -151,29 +151,32 @@ contributes none, led by the moss-patch cell disagreement — which per-target n
 show is about which cells a patch covers, not how far it reaches — then ground cover,
 clay, and cave vines. Surface decoration was the larger structural gap and has now been
 reached: the hand-written tree path is deleted and trees replay from the
-datapack schedule through real trunk and foliage placers — straight, giant and
-fancy trunks, blob, pine, spruce, mega-pine and fancy canopies, with the beehive
-and alter-ground decorators — writing through the region's own radius-one gate,
-so a canopy may cross a chunk border exactly as vanilla's does. That band is
+datapack schedule through real trunk and foliage placers — straight, giant, fancy
+and dark-oak trunks, blob, pine, spruce, mega-pine, fancy and dark-oak canopies,
+with the beehive and alter-ground decorators — writing through the region's own
+radius-one gate, so a canopy may cross a chunk border exactly as vanilla's does. That band is
 measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.308% (2,722 residual, 945 in the surface band) with the
-replayed ones, after springs and boulders joined the schedule, the flora percentages
-were deleted and leaves were given the distance property vanilla propagates into
-them; the cells above sea level that hold a trunk, canopy or plant went from zero to
-577 against vanilla's 789. `MOTION_BLOCKING_NO_LEAVES`,
-the one heightmap that ignores canopy, holds at 97.9%, so the height under the
-decoration is right and what remains is placement: the gap sits in the conifer
-chunks (the taiga chunk places 229 of vanilla's 285 tree cells, the old-growth one
-199 of 353) while the plains pair nearly match, 37 of 37 and 112 of 114, and the
-counter the diagnostic prints names the rest — 32 `dark_oak` trees refused for want of
-their placers (the tally names `dark_oak_foliage_placer`, and the trunk class is missing
-for the same five configs), mushroom selectors seven, `place_on_ground` 82.
-Springs and flora are done; `dark_oak_foliage_placer` and the leaf litter
-`place_on_ground` paints are the next step. The ocean fixture did not move
-(330 cells, clay 96/22/9, ore parity zero), which is
+hand-written trees, to 99.377% (2,449 residual, 704 in the surface band) now, after
+springs and boulders joined the schedule, the flora percentages were deleted, leaves
+were given the distance property vanilla propagates into them, dark oaks grew their
+own trunks and canopies, and three inverted guards in the ported `doPlace` were fixed —
+a tree whose trunk a ceiling cut short is now refused unless `min_clipped_height` says
+otherwise, a vine stops a trunk that does not ignore them, and the free-height probe
+reaches one row above the trunk like vanilla's. Cells above sea level holding a trunk,
+canopy or plant stand at 607 against vanilla's 789; that count went *down* when the
+guards were fixed, which is the point — the earlier 577 included trees vanilla never
+plants. `MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy, is at
+98.4% (1008/1024), so the height under the decoration is nearly right and what remains
+is placement: the gap sits in the conifer chunks (the taiga one places 229 of vanilla's
+285 tree cells, the old-growth one 236 of 353) while the plains pair nearly match,
+37 of 37 and 105 of 114, and the counter the diagnostic prints names what is still not
+replayed — `place_on_ground` 77, stage-2 `large_dripstone` 18, mushroom selectors and
+one fallen tree. The leaf litter is the next step, and with it the question of why a
+correctly-shaped dark oak still lands on the wrong cells; the ocean fixture did not move
+(330 cells, clay 96/22/9, ore parity zero) under any of this, which is
 the check that a surface change stayed on the surface. Closing the rest is the
 road to exact equality, while keeping cold batch generation within an acceptable
 latency budget.

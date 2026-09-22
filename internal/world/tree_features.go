@@ -45,8 +45,17 @@ func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.R
 	}
 
 	free := planter.maxFreeTreeHeight(position)
-	if clipped, ok := config.MinimumSize.MinClippedHeight(); ok && free < planter.trunkHeight && free < clipped {
-		return nil
+	// doPlace's clip test, read at 154-180: proceed only when the free height is the
+	// whole trunk, or when minimum_size names a min_clipped_height the remainder still
+	// clears. An absent min_clipped_height is not "no constraint" - OptionalInt.isEmpty
+	// jumps straight to the return false at 179 - and 33 of the pack's 39 tree configs,
+	// every dark oak and pale oak among them, name none. So a trunk that a ceiling cut
+	// short is refused outright there, while the configs with an explicit floor (the six
+	// fancy oak ones, at 4) may keep the stub.
+	if free < planter.trunkHeight {
+		if clipped, ok := config.MinimumSize.MinClippedHeight(); !ok || free < clipped {
+			return nil
+		}
 	}
 	// From here the trunk height that matters is the free one. The foliage height and
 	// radius were sampled from the sampled height and are not recomputed.
@@ -80,22 +89,27 @@ func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.R
 }
 
 // maxFreeTreeHeight is TreeFeature.getMaxFreeTreeHeight: the tallest prefix of the
-// trunk whose every row, widened by minimum_size, is either placeable or a vine the
-// config tolerates. It consumes no draws.
+// trunk whose every row, widened by minimum_size, is free - and free means placeable,
+// or a vine the config tolerates. It consumes no draws.
 func (t *treePlacer) maxFreeTreeHeight(position worldgen.FeaturePosition) int {
-	for height := 0; height <= t.trunkHeight; height++ {
+	// The probe reaches one row ABOVE the requested trunk (12-17: j <= height + 1), so
+	// a canopy with no room to open out shortens the trunk as well - which, with the
+	// -2 below, is how vanilla lands the whole crown one block down rather than
+	// refusing the tree.
+	for height := 0; height <= t.trunkHeight+1; height++ {
 		// The arguments are passed to the placer in the other order from the
 		// declaration, and the implementations read the second one - the y offset.
 		span := t.config.MinimumSize.SizeAtHeight(t.trunkHeight, height)
 		for dx := -span; dx <= span; dx++ {
 			for dz := -span; dz <= span; dz++ {
-				if t.isFree(position.X+dx, position.Y+height, position.Z+dz) {
-					continue
+				x, y, z := position.X+dx, position.Y+height, position.Z+dz
+				// 78-105: isFree fails -> stop; else ignoreVines true -> keep;
+				// else isVine false -> keep; else stop. A vine cell IS free, because
+				// replaceable_by_trees lists it, so the second clause is the only
+				// thing that can stop a trunk that has run into a vine.
+				if !t.isFree(x, y, z) || (!t.config.IgnoreVines && t.isVine(x, y, z)) {
+					return height - 2
 				}
-				if t.config.IgnoreVines && t.isVine(position.X+dx, position.Y+height, position.Z+dz) {
-					continue
-				}
-				return height - 2
 			}
 		}
 	}

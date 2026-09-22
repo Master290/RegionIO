@@ -18,16 +18,25 @@ import (
 // plains, seed 12345, chosen by sampling our own biome and height path first:
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
-// landSurfaceRatchet, landCellRatchet are today's measured land numbers: 945 surface-band
-// mismatches and 390,494 exact cells, with 577 of vanilla's 789 tree cells (73%). The
-// tree figure has room below it because 32 dark oak trees are refused for want of their
-// placers - the tally names dark_oak_foliage_placer, and the same five configs also need
-// dark_oak_trunk_placer, so a refused tree costs its trunk as well as its canopy - and
-// because the leaf litter under a birch, place_on_ground, is counted 82 times and skipped
-// without losing the tree.
+// landSurfaceRatchet, landCellRatchet are today's measured land numbers: 704 surface-band
+// mismatches and 390,767 exact cells, with 607 of vanilla's 789 tree cells (77%).
+//
+// Both numbers moved twice when dark oaks arrived, and the two moves are separable:
+// fixing the three inverted doPlace guards (clip refusal, the ignore_vines clause, the
+// probe row above the trunk) took the band 945 to 747 on their own while *dropping* tree
+// cells from 577 to 471, because a trunk that vanilla refuses was being planted here; the
+// dark oak placers then took the band to 704 and lifted tree cells back to 607. A
+// different tree count is only progress if the exact-cell count agrees, which is why both
+// are ratcheted.
+//
+// What is left: place_on_ground is counted 77 times and skipped (birch and oak litter,
+// and the litter under the new dark oaks), 18 stage-2 large_dripstone placements are not
+// replayed, and the tally still shows mushrooms and one fallen tree - all of which shift
+// with the shared decoration stream, so their counts are a position signal, not a
+// coverage one.
 const (
-	landSurfaceRatchet = 945
-	landCellRatchet    = 390494
+	landSurfaceRatchet = 704
+	landCellRatchet    = 390767
 )
 
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"

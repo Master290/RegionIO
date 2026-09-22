@@ -266,6 +266,40 @@ func TestCanopySilhouettesAreThePlacersOwn(t *testing.T) {
   y= 82 n=23 ........#####........
   y= 83 n= 5 .........###.........`,
 		},
+		{
+			// dark_oak trunk + dark_oak canopy, the crown rows only (the branches
+			// contribute the cells outside the crown square at y=77). Each n is
+			// derived, not pasted: R=0 and offset=0 in all five of the pack's
+			// configs, so -
+			//   y=77 (dy -1, radius 2, double): the 6x6 = 36-cell square, of which
+			//        the 2x2 trunk holds 4 back, plus the 4 cells branches add
+			//        outside it;
+			//   y=78 (dy 0, radius 3, double): 8x8 = 64, minus the 9 cells the
+			//        dark-oak override drops on the middle row ({-3,3,4} x {-3,3,4}),
+			//        minus the 4 trunk cells = 51;
+			//   y=79 (dy +1, radius 2, double): 6x6 = 36, minus the 12 cells whose
+			//        folded |x|+|z| exceeds 2*2-2 = 24;
+			//   y=80 (dy +2, radius 0, gated by the nextBoolean this seed spent true):
+			//        radius 0 plus the double-trunk extra column = 2x2 = 4.
+			config: "minecraft:dark_oak",
+			want: `trunk=8 foliageHeight=4 foliageRadius=0
+  y= 77 n=36 .......###TTT##......
+  y= 78 n=51 .......###TT###......
+  y= 79 n=24 ........######.......
+  y= 80 n= 4 ..........##.........`,
+		},
+		{
+			// pale_oak is the same two placer classes with different block
+			// providers, so it must produce the identical shape - the point of
+			// keeping both cases is that a change to the shared geometry cannot
+			// pass one and fail the other silently.
+			config: "minecraft:pale_oak",
+			want: `trunk=8 foliageHeight=4 foliageRadius=0
+  y= 77 n=36 .......###TTT##......
+  y= 78 n=51 .......###TT###......
+  y= 79 n=24 ........######.......
+  y= 80 n= 4 ..........##.........`,
+		},
 	} {
 		t.Run(tc.config, func(t *testing.T) {
 			got := canopySilhouette(t, tc.config)
@@ -389,5 +423,92 @@ func TestSupportsAllPartsSpendsNoDraws(t *testing.T) {
 	free := decoratorPlacer(t, "minecraft:oak_bees_005", func(int, int) uint16 { return stone })
 	if got, want := drawStream(checked.random), drawStream(free.random); got != want {
 		t.Errorf("a config that was checked first diverges from one that was not: %v vs %v", got, want)
+	}
+}
+
+// darkOakPlanter puts a minecraft:dark_oak config on the oak fixture's 3x3 region with
+// the whole floor set to one state, so the below-trunk rule can be tested against a
+// surface that is and is not in cannot_replace_below_tree_trunk.
+func darkOakPlanter(t *testing.T, floor string) (*decorationRegion, *treePlacer) {
+	t.Helper()
+	id := mustState(floor, nil)
+	region, planter := oakPlanter(t, func(x, z int) uint16 { return id })
+	config, err := planter.set.Tree("minecraft:dark_oak")
+	if err != nil {
+		t.Fatalf("dark_oak: %v", err)
+	}
+	planter.config = config
+	if err := planter.sampleHeights(); err != nil {
+		t.Fatalf("dark_oak sampleHeights: %v", err)
+	}
+	return region, planter
+}
+
+// TestDarkOakWritesDirtUnderItsFootprintOnGrass is the four cells the bytecode really
+// writes. DarkOakTrunkPlacer calls placeBelowTrunkBlock four times at the UNDRIFTED 2x2
+// corners, and the config's below_trunk_provider is "not in
+// #minecraft:cannot_replace_below_tree_trunk, then dirt". Measured against the embed,
+// that tag is [#dirt, #mud, #moss_blocks, podzol] and grass_block is in none of them, so
+// grass is exactly the case where the dirt patch IS written. A reading that treated
+// grass as protected would lose four block writes per tree - and placeTrunk writes them
+// before its first draw, so the patch stays under the original footprint even when the
+// trunk above it leans away.
+func TestDarkOakWritesDirtUnderItsFootprintOnGrass(t *testing.T) {
+	_, planter := darkOakPlanter(t, "minecraft:grass_block")
+	if err := planter.placeTrunk(8, 71, 8); err != nil {
+		t.Fatal(err)
+	}
+	dirt := mustState("minecraft:dirt", nil)
+	for _, c := range [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}} {
+		if got := planter.stateAt(8+c[0], 70, 8+c[1]); got != dirt {
+			t.Errorf("cell (%d,70,%d) under the footprint holds %d, want dirt (%d)",
+				8+c[0], 8+c[1], got, dirt)
+		}
+	}
+}
+
+// TestDarkOakWritesNothingUnderAProtectedFloor is the other half of the same rule: over
+// podzol the predicate fails and getOptionalState returns null, so the floor survives.
+// Podzol is used rather than dirt because writing dirt over dirt would pass either way.
+func TestDarkOakWritesNothingUnderAProtectedFloor(t *testing.T) {
+	_, planter := darkOakPlanter(t, "minecraft:podzol")
+	if err := planter.placeTrunk(8, 71, 8); err != nil {
+		t.Fatal(err)
+	}
+	podzol := mustState("minecraft:podzol", nil)
+	for _, c := range [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}} {
+		if got := planter.stateAt(8+c[0], 70, 8+c[1]); got != podzol {
+			t.Errorf("cell (%d,70,%d) was overwritten with %d; podzol is inside cannot_replace_below_tree_trunk, so the rule must decline",
+				8+c[0], 8+c[1], got)
+		}
+	}
+}
+
+// TestDarkOakSampleHeightsSpendsTwoDrawsAndPlaceTrunkSpendsTheRing pins the draw
+// budget. sampleHeights owes exactly getTreeHeight's two terms: DarkOakFoliagePlacer.
+// foliageHeight is `iconst_4; ireturn` and never reads the random, and dark_oak's radius
+// and offset are ConstantInt, so anything beyond two means a constant was sampled as a
+// provider. placeTrunk then owes three draws before the ring (direction, threshold,
+// budget), twelve dice, one length draw per branch that the dice granted, and exactly
+// one nextBoolean for the double-trunk crown.
+func TestDarkOakSampleHeightsSpendsTwoDrawsAndPlaceTrunkSpendsTheRing(t *testing.T) {
+	_, planter := darkOakPlanter(t, "minecraft:grass_block")
+	counter := &countingRandom{RandomSource: worldgen.NewWorldgenRandom(4242)}
+	planter.random = counter
+	if err := planter.sampleHeights(); err != nil {
+		t.Fatal(err)
+	}
+	if got := counter.draws; got != 2 {
+		t.Errorf("sampleHeights spent %d draws, want 2 (getTreeHeight only; foliageHeight is a constant here)", got)
+	}
+	before := counter.draws
+	if err := planter.placeTrunk(8, 71, 8); err != nil {
+		t.Fatal(err)
+	}
+	spent := counter.draws - before
+	// 3 + 12 + 1 is the floor every dark oak pays, and each of at most twelve ring
+	// cells can add one length draw.
+	if spent < 16 || spent > 28 {
+		t.Errorf("placeTrunk spent %d draws, which is outside 16..28 for three trunk draws, twelve dice, one crown boolean and at most twelve lengths", spent)
 	}
 }

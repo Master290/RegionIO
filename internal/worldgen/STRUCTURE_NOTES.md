@@ -1698,3 +1698,68 @@ as `foliage_placer:minecraft:dark_oak_foliage_placer=32` even though the same fi
 (`dark_oak`, `dark_oak_leaf_litter`, `pale_oak`, `pale_oak_bonemeal`, `pale_oak_creaking`)
 also carry `minecraft:dark_oak_trunk_placer`. Porting only the foliage placer would move
 the tally line to `trunk_placer:` and place nothing.
+
+## Surface decoration, part 6: three inverted guards, found only because dark oak made them load-bearing
+
+The dark-oak port was reviewed by agents reading the jar independently, and the review's
+most valuable output was not about dark oak: it found three places where the already-shipped
+`doPlace` port compiled the condition backwards. All three were inert for the placers that
+existed before only in the sense that they were silently wrong.
+
+**1. An absent `min_clipped_height` means refuse, not "no constraint".** `doPlace` 154-180:
+`if (free < height)` then `OptionalInt.isEmpty -> iconst_0; ireturn` - the empty case jumps
+straight to the return false, and only a *present* value is compared (`169-176`). Measured in
+the pack: exactly six configs name a `min_clipped_height` (all six are the fancy_oak family,
+value 4), so the other 33 - every dark oak, pale oak, spruce, pine, birch and oak - must
+surrender a trunk that a ceiling cut short. The port had `ok && free < height && free <
+clipped`, which makes the absent case fall through and plant the stub.
+
+**2. A vine stops a trunk that does not ignore vines.** `getMaxFreeTreeHeight` 78-105:
+isFree fails -> return `j-2`; else `ignoreVines` true -> continue; else isVine false ->
+continue; else return `j-2`. So stop iff `!isFree || (!ignoreVines && isVine)`. The port read
+`if isFree { continue }` then `if ignoreVines && isVine { continue }`, i.e. stop iff
+`!isFree && !(ignoreVines && isVine)`. Those differ only for a vine cell - and a vine cell is
+*always* free, because `data/minecraft/tags/block/replaceable_by_trees.json` lists
+`minecraft:vine` among its 27 values. The clause was therefore unreachable in the port, which
+is the shape of bug that no amount of tree-count checking reveals: it hides until a tree grows
+through a vine.
+
+**3. The free-height probe reaches one row above the trunk.** 12-17 is `j <= height + 1`, not
+`j <= height`. That extra row is what makes a blocked crown shorten the trunk (and so land the
+whole canopy a block lower) instead of doing nothing; the `-2` at 101-105 then reports the row
+below the obstruction.
+
+Measured effect of the three fixes alone, dark oak still unmodelled: land surface band 945 ->
+747, exact cells 390,494 -> 390,777, and tree cells *down* 577 -> 471. The direction of the
+tree count is the evidence that the fix is real rather than cosmetic: the port had been planting
+106 trees per four-chunk window that vanilla refuses. Adding the dark-oak placers then took the
+band to 704 and the tree cells to 607, while `MOTION_BLOCKING_NO_LEAVES` went 1003 -> 1008 of
+1024 and the old-growth chunk's heightmap columns 466 -> 616 of 768. Ocean stayed at 330
+residual cells and the clay chain at 96/22/9 throughout.
+
+**What the dark-oak silhouette was checked against.** The golden's numbers are derived, not
+pasted, and the derivation is worth recording because it is the only way to tell a correct
+canopy from a self-consistent one. With the pack's values (`radius` 0, `offset` 0) and a trunk
+of 8 from y=71, topY = 78, and the double-trunk crown is: dy -1 at radius 2, dy 0 at radius 3,
+dy +1 at radius 2, then one `nextBoolean` gating dy +2 at the BASE radius (0 - the cap row takes
+no +2, which is the detail that makes it a cap rather than a fourth widening); every row runs
+`-radius .. radius+1` on BOTH axes because the double-trunk extra column is not an axis quirk.
+That gives 6x6 - 4 trunk cells + 4 branch cells = 36 at y=77; 8x8=64 - 9 (the dark-oak override
+drops the cells where `x in {-r, r, r+1}` and the same for z, only on the `dy == 0` row of a
+double trunk) - 4 trunk = 51 at y=78; 6x6 - 12 (the folded `|x|+|z| > 2r-2` band on the `dy +1`
+row) = 24 at y=79; 2x2 = 4 at y=80. All four printed values match that arithmetic.
+
+**Refuted by the second reader, recorded so it is not re-reported.** Four candidate defects
+were raised and dismissed: that `placeLeavesRow` cannot express the base row (it can - the
+offset folds into the y the skip test reads, and for every in-pack configuration that produces
+exactly the literals the bytecode passes); that `placeTree`'s `root_placer` refusal happens at
+the wrong stream position (it fires for two configs, mangrove and tall_mangrove, and never for
+the trees under review); that mega pine seeds `lastRadius` from the bumped radius (the reading
+of the two texts is accurate but the difference is unreachable); and that `isAirOrLeaves` treats
+an unknown cell as air where vanilla's `isStateAtPosition` answers false (26.1.2's worldgen
+reader applies the predicate to whatever the chunk holds, with no build-height guard). The
+offset-folding finding was kept as a robustness item and handled by building the dark-oak base
+attachment with the offset in its y, the way `mega_pine` already does - output-neutral here
+(26.1.2's dark oak uses 0), load-bearing for any pack that does not, and worth knowing because
+`fancy_foliage_placer` uses offset 4 in all six of its configs and `spruce` uses a uniform
+provider: a placer whose skip rule ever starts reading y would meet the same trap.

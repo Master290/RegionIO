@@ -180,14 +180,23 @@ Known gaps, roughly in order of how visible they are:
   trees, springs, flora, desert features and rocks it places no surface decoration at all, which
   is fine because that generator is a comparison fallback
   (`REGIONIO_PARITY_GENERATOR=legacy`) and not a second implementation.
-- **Trees are vanilla's own algorithm**: three trunk placers (straight, giant, fancy), five
-  foliage placers (blob, pine, spruce, mega pine, fancy) and the beehive and alter-ground
+- **Trees are vanilla's own algorithm**: four trunk placers (straight, giant, fancy, dark oak), six
+  foliage placers (blob, pine, spruce, mega pine, fancy, dark oak) and the beehive and alter-ground
   decorators, each transcribed from `javap -p -c` output and pinned by a silhouette golden in
-  `tree_placers_test.go`. An un-modelled placer or decorator is counted by name and skipped
+  `tree_placers_test.go` whose expected rows are derived from the placer arithmetic, not pasted from
+  a run. An un-modelled placer or decorator is counted by name and skipped
   rather than aborting a region, because the replay walks 5×5 sources and one border forest
   must not lose a taiga chunk; `TestVanillaLandBlockParity` prints the tally. Canopies do cross
   chunk borders — vanilla has no border test, only `ChunkStep.blockStateWriteRadius`, which is
   1 chunk for FEATURES and is what `decorationRegion.setBlock` enforces.
+- **`doPlace`'s three height guards were inverted, and are measured fixes.** A truncated trunk is
+  refused unless `minimum_size` names a `min_clipped_height` (an absent `OptionalInt` means refuse,
+  and 33 of the 39 configs name none); a vine stops a trunk whose `ignore_vines` is false (it has to,
+  because `replaceable_by_trees` lists vine, so the old `isFree` short-circuit made the clause
+  unreachable); and the free-height probe runs to `height + 1`, which is how a blocked crown space
+  shortens the trunk rather than only the canopy. Fixing them cost 106 tree cells (577 to 471 before
+  dark oaks restored them) and removed 198 surface-band mismatches — the honest direction, since
+  the deleted cells are trees vanilla never plants.
 - **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
   adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
   warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,
@@ -197,8 +206,8 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 37): biomes and heightmaps exact
-everywhere; blocks 95.959% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 39): biomes and heightmaps exact
+everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
 and **99.916% through the production region replay** — 330 residual cells, dominated by the
 lush-caves moss and clay pools and their nested vegetation. A featureless vanilla capture
 (`cmd/vanillacapture -featureless -blocks-only`,
