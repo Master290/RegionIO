@@ -62,6 +62,26 @@ javap -p -c -classpath versions/26.1.2/server-26.1.2.jar net.minecraft.world.lev
 threshold was pinned down: `Strategy$2` switches `{0..3}` and everything above falls through to the
 global palette, which `.refjava/` alone could not show.
 
+Block-state and tag counts come from the tables, never from reading a property name or
+remembering a block's shape: `idsByName`, `stateByID` and `flattenBlockTag` already hold every
+answer and a two-line test prints it. Claims in that shape kept being wrong — "cave_vines has 25
+states" (52: `age` 0..25 times `berries`); "powder_snow and gravel are the multi-state spring
+blocks" (one state each, and the reachable one is deepslate, with three); "`chest` has seven
+facings" (four, and 24 states once `type` and `waterlogged` are counted);
+"`lava_pool_stone_cannot_replace` is stone and deepslate" (62 members, eleven species of log and
+leaf, three single-state blocks). Guesses fail quietly in both directions. A wrong count makes the
+test that relies on it SKIP, which reads as passing. And a probe that resolves nothing reads as a
+refutation of a correct note: asking for `moss_replaceable` instead of `minecraft:moss_replaceable`
+returns the empty set, so "0 states" looked like the notes being wrong when they were right. Quote
+whole-tag and capture-restricted counts separately — `moss_replaceable` differs from a
+default-state reading on 59 states in principle and 8 in this fixture, and only the second is a
+number a test can fail on.
+
+The prose rule has a test behind it now: `TestDocumentationNamesExist` fails if a document cites a
+test name that no `_test.go` defines (the placeholder in this very sentence was caught by it on the
+first run), or if a mojibake signature appears, and it asserts how many files and citations it read
+so that a glob which stops matching fails loudly instead of guarding nothing.
+
 When a constant has to come from vanilla's *runtime* rather than its source or reports, dump it with
 a Java program run against the jar. `tools/VanillaBlockStateDump.java` is the one that exists — it
 walks the block-state registry and emits, per state, light opacity and emission, voxel face-occlusion
