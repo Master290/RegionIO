@@ -75,7 +75,7 @@ func (r *decorationRegion) placeGeode(random worldgen.RandomSource, seed int64, 
 
 	points := make([]geodePoint, 0, distributionPoints)
 	invalid := 0
-	invalidBlocks := geodeTagIDs(set, config.InvalidBlocksTag)
+	invalidBlocks := tagStateIDs(set, config.InvalidBlocksTag)
 	for i := 0; i < distributionPoints; i++ {
 		point := geodePoint{
 			x:      origin.X + sampleGeodeInt(random, config.OuterWallMin, config.OuterWallMax),
@@ -95,7 +95,7 @@ func (r *decorationRegion) placeGeode(random worldgen.RandomSource, seed int64, 
 
 	crackPoints := geodeCrackPoints(origin, random, distributionPoints, generateCrack)
 	noise := worldgen.NewNormalNoise(worldgen.NewLegacy(seed), -4, []float64{1})
-	cannotReplace := geodeTagIDs(set, config.CannotReplaceTag)
+	cannotReplace := tagStateIDs(set, config.CannotReplaceTag)
 	placed := false
 	var potentialPlacements [][3]int
 	for z := origin.Z + config.MinGenOffset; z <= origin.Z+config.MaxGenOffset; z++ {
@@ -193,7 +193,11 @@ func sampleGeodeInt(random worldgen.RandomSource, min, max int) int {
 	return min + int(random.NextIntN(int32(max-min+1)))
 }
 
-// geodeTagIDs resolves a block tag to the state IDs that satisfy it.
+// tagStateIDs resolves a block tag to the state IDs that satisfy it. Geodes, lakes, the
+//
+// lush-cave vegetation patches and ore targets all ask the same question of a tag, so they
+// share this one helper - which is the point: a second implementation is how the bug below
+// ended up fixed in one caller and left standing in two others.
 //
 // Vanilla's test is on the *block*: MatchingBlockTagPredicate.test is
 // BlockState.is(TagKey<Block>), and a block tag is a set of blocks, so every
@@ -203,7 +207,7 @@ func sampleGeodeInt(random worldgen.RandomSource, min, max int) int {
 // #minecraft:cave_vines, whose age property spans twenty-five states, so an aged
 // vine hanging in a lush-cave ceiling read as non-replaceable here while vanilla
 // walks its vegetation column straight through it.
-func geodeTagIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
+func tagStateIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
 	if strings.HasPrefix(tag, "#") {
 		tag = tag[1:]
 	}

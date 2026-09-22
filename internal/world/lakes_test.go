@@ -50,8 +50,8 @@ func TestPlaceLakeCarvesAndLines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cannotReplace := lakeTagIDs(set, "minecraft:features_cannot_replace")
-	lavaPoolStone := lakeTagIDs(set, "minecraft:lava_pool_stone_cannot_replace")
+	cannotReplace := tagStateIDs(set, "minecraft:features_cannot_replace")
+	lavaPoolStone := tagStateIDs(set, "minecraft:lava_pool_stone_cannot_replace")
 
 	// Flat stone region covering the 16x8x16 lake volume around (8, 40, 8).
 	chunks := make([]*Chunk, 0, 9)

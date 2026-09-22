@@ -932,15 +932,38 @@ eight it was rejecting, and all eight are `minecraft:cave_vines` /
 `minecraft:cave_vines_plant`.
 
 Measured effect on this fixture: **zero cells** - 99.916%, 330 mismatches, clay
-chain 96/22/9, all identical before and after - because none of those eight states
-happens to sit inside a patch's column walk here. So `generatorVersion` stays at
-37, per the rule that it moves only when output moves. Two lessons in that
-combination, and both are the reason the change is kept anyway: reachable in the
-data and reachable in the code path are different questions, and a correct port is
-worth having on a seed where it is silent, because the next capture is not this one.
-It is also a reminder that "verified line for line against the jar" covers the
-control flow and not the inputs - the semantics of `replaceable` were never
-re-read, only its use.
+chain 96/22/9, all identical before and after - because none of those states
+happens to sit in a code path that consults the tag here. So `generatorVersion`
+stays at 37, per the rule that it moves only when output moves.
+
+The scope turned out to be much wider than the vine that revealed it, which is what
+makes the fix worth its churn. This was not one caller's bug: the helper was shared
+by geodes, lakes, ore targets and vegetation patches, and a **second copy** existed
+as `lakeTagIDs` with the same defect and no fix. Resolving it once as `tagStateIDs`
+and then asking every tag the configured features reference exposes seven that the
+default-only reading got wrong on states this very capture holds:
+
+| tag | states the block accepts that the default reading rejected | subsystem |
+|---|---|---|
+| `moss_replaceable`, `lush_ground_replaceable` | `cave_vines` ages, `cave_vines_plant` | vegetation patches |
+| `geode_invalid_blocks` | `water`, `lava` in their flowing/falling states | geodes |
+| `features_cannot_replace`, `lava_pool_stone_cannot_replace` | `chest` on any non-default facing | lakes, monster rooms |
+| `mangrove_logs_can_grow_through`, `mangrove_roots_can_grow_through` | `vine` beyond its default facing set | mangrove features |
+
+`chest` is the one to notice: monster rooms place chests, so a tag test that
+recognised only the default orientation was asking a different question than
+vanilla on six of seven facings. `TestTagStateIDsAreBlockScoped` now enumerates
+every `#minecraft:` reference in every configured feature rather than the tags
+someone thought to list, and it was checked by regressing the helper and watching
+it name all seven.
+
+Two lessons in the combination of "real bug" and "zero cells", and both are why the
+change is kept anyway: reachable in the data and reachable in the code path are
+different questions, and a correct port is worth having on a seed where it is
+silent, because the next capture is not this one. It is also a reminder that
+"verified line for line against the jar" covers the control flow and not the inputs
+- the semantics of `replaceable` were never re-read, only its use - and that a
+duplicated helper is how one fix leaves two bugs behind.
 
 The one place the reading paid off in cells: `WaterloggedVegetationPatchFeature`
 builds `waterSurface` by iterating the ground **HashSet**, so the water set's

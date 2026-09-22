@@ -73,12 +73,7 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 		if !ok || target.Target.PredicateType != "minecraft:tag_match" {
 			return nil, false
 		}
-		replaceables := make(map[uint16]bool)
-		for _, name := range flattenBlockTag(set, target.Target.Tag, nil) {
-			if id, ok := nameToStateID(name, nil); ok {
-				replaceables[id] = true
-			}
-		}
+		replaceables := tagStateIDs(set, target.Target.Tag)
 		if len(replaceables) == 0 {
 			return nil, false
 		}

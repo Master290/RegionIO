@@ -298,7 +298,7 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 	if config.Surface == "ceiling" {
 		direction = 1
 	}
-	replaceable := geodeTagIDs(set, config.ReplaceableTag)
+	replaceable := tagStateIDs(set, config.ReplaceableTag)
 	ground, groundOK := nameToStateID(config.Ground.Name, config.Ground.Properties)
 	if !groundOK {
 		return false

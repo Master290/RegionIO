@@ -54,8 +54,8 @@ func (r *decorationRegion) placeScheduledLakes(seed int64) error {
 		return err
 	}
 	initMonsterRoomTables() // monsterIsSolid / the features_cannot_replace table
-	lakeCannotReplace := lakeTagIDs(set, "minecraft:features_cannot_replace")
-	lavaPoolStone := lakeTagIDs(set, "minecraft:lava_pool_stone_cannot_replace")
+	lakeCannotReplace := tagStateIDs(set, "minecraft:features_cannot_replace")
+	lavaPoolStone := tagStateIDs(set, "minecraft:lava_pool_stone_cannot_replace")
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
 	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
 	for _, scheduled := range schedule {
@@ -223,12 +223,3 @@ func placeLake(r *decorationRegion, random worldgen.RandomSource, ox, oy, oz int
 	return true
 }
 
-func lakeTagIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
-	ids := make(map[uint16]bool)
-	for _, name := range flattenBlockTag(set, tag, nil) {
-		if id, ok := nameToStateID(name, nil); ok {
-			ids[id] = true
-		}
-	}
-	return ids
-}

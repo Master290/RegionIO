@@ -687,7 +687,7 @@ func TestMossResidualColumnVerdict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load feature set: %v", err)
 	}
-	replaceable := geodeTagIDs(set, "minecraft:moss_replaceable")
+	replaceable := tagStateIDs(set, "minecraft:moss_replaceable")
 
 	verdicts := map[string]int{}
 	split := map[[2]string]int{}

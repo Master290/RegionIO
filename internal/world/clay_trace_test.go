@@ -1633,7 +1633,7 @@ func TestTracePatchAtMinusSeven(t *testing.T) {
 					t.Logf("CLAY ID: %d, isFaceSturdy(clay)=%v, canOcclude=%v, opacity=%d",
 						clayID, isFaceSturdy(clayID), stateFlags(clayID)&flagCanOcclude != 0, lightOpacity(clayID))
 					t.Logf("moss_replaceable members: %v", flattenBlockTag(set, "minecraft:moss_replaceable", nil))
-					t.Logf("geodeTagIDs(set, config.ReplaceableTag)[clayID] = %v", geodeTagIDs(set, placed.Feature)[clayID])
+					t.Logf("tagStateIDs(set, config.ReplaceableTag)[clayID] = %v", tagStateIDs(set, placed.Feature)[clayID])
 					for mi, m := range placed.Placement {
 						t.Logf("  modifier[%d]: %s: %s", mi, m.Type, string(m.Raw))
 					}
