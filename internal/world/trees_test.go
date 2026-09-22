@@ -21,7 +21,7 @@ func TestRegionVegetationStageProducesTrees(t *testing.T) {
 				for x := 0; x < 16; x++ {
 					for z := 0; z < 16; z++ {
 						if isTreeState(chunk.GetBlock(x, y, z)) {
-							logs++
+							cells++
 						}
 					}
 				}
