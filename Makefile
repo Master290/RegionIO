@@ -9,10 +9,11 @@ vet:
 test:
 	go test ./...
 
-# Measured on this tree: the whole module takes ~18.6 minutes under -race, and
-# internal/world alone needs more than 15. The old 20m bound therefore left about
-# a minute and a half of slack - enough that adding one test would fail the job
-# for a reason nobody could act on. 30m keeps a real failure legible.
+# Measured on this tree: internal/world alone takes 18.4 minutes under -race and
+# the whole module 18.6 wall, because the packages run concurrently rather than
+# summing. The old 20m bound therefore left about ninety seconds of slack on the
+# dominant package - a one-test margin, and a local 15m run has already been
+# misread as a data race when it was a timeout. 30m keeps a real failure legible.
 test-race:
 	go test -race -timeout 30m ./...
 

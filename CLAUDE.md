@@ -250,7 +250,8 @@ datapack, which zeroes it while leaving every biome's feature list intact — so
 `-no-features` do. Subtracting that capture from the plain one isolates the chosen chain;
 `testdata/vanilla_no_lush_clay_12345.bin` differs from the plain fixture in 3,670 bytes, all of them
 block state, with zero biome and zero heightmap drift — the check that the override was clean.
-`TestVanillaLushClayDiff` (`REGIONIO_LUSH_CLAY_DIFF=1`) is built on that pair. Subtract only against
+`TestVanillaLushClayDiff` is built on that pair and runs always, with a ratchet on the
+measured counts. Subtract only against
 cells the plain capture reports as the feature's own output: the differential is the whole chain's
 effect, including what downstream stages did differently because those cells had changed.
 

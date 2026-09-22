@@ -51,10 +51,11 @@ jobs:
       - run: Add-Content $env:GITHUB_PATH 'C:\msys64\mingw64\bin'
       # Density-based world tests are intentionally exhaustive and race adds
       # substantial overhead; keep the package timeout above the normal 10m.
-      # Measured locally, same box as the self-hosted runner: ~18.6 minutes for the whole module under
-      # -race, with internal/world alone needing more than 15. Against the old 20m
-      # that is about ninety seconds of slack, so one more test would have failed
-      # the job for a reason nobody could act on.
+      # Measured locally, on the same hardware as the self-hosted runner:
+      # internal/world alone is 18.4 minutes under -race and the whole module 18.6
+      # wall, since packages run concurrently rather than summing. Against the old
+      # 20m that is roughly ninety seconds of slack on one package - and a 15m
+      # attempt has already produced a timeout that reads, misleadingly, like a race.
       - run: go test -race -timeout 30m ./...
 
   parity:
