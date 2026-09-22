@@ -1047,7 +1047,7 @@ cell than it did for vanilla.
 
 ### The last 22 clay anchors are not an ordering problem either
 
-`TestVanillaLushClayDiff` is now permanent (`d0b33ed`), with the budget
+`TestVanillaLushClayDiff` is now permanent (`42c9bc8`), with the budget
 `missing=96 / clay anchors=22 / extra clay=9` as a ratchet rather than an env-gated
 printf. Splitting the 96 into anchors (the plain capture itself reports clay) and
 cascade cells relocates the whole question: the anchors are 0 in (0,0), 0 in
@@ -1330,3 +1330,20 @@ can actually be closed: `TestEnvironmentScanMatchesVanillaControlFlow` compares 
 port against the disassembly of `EnvironmentScanPlacement.getPositions` on columns
 built for the purpose, where the expected landing is known rather than inferred
 from a capture.
+
+### A note on the commit numbers cited in this file
+
+This branch's history was re-created once, before it was published, to drop
+`Co-Authored-By:` trailers from three commit messages. Nothing about the commits
+themselves changed - the tip tree hash is byte-identical before and after, and
+author, committer and both dates are preserved - but git hashes the message, so
+every commit from `51dfe93` (which was `46edf84`) onward has a new number, while
+`ce1436c` and anything older kept its own.
+
+The consequence for a reader is small and worth stating rather than discovering: a
+SHA written down before the renumbering may name a commit that is not in `main`'s
+ancestry at all. `42c9bc8` above is the new number of what was first recorded as
+`d0b33ed`, and one commit body in this range still cites `58c886e`, a pre-rewrite
+number, for the same reason. `pre-trailer-rewrite` is kept locally as the other half
+of that mapping; it is not a branch to build on, only a lookup table between the two
+sets of numbers.
