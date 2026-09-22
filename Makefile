@@ -9,8 +9,12 @@ vet:
 test:
 	go test ./...
 
+# Measured on this tree: the whole module takes ~18.6 minutes under -race, and
+# internal/world alone needs more than 15. The old 20m bound therefore left about
+# a minute and a half of slack - enough that adding one test would fail the job
+# for a reason nobody could act on. 30m keeps a real failure legible.
 test-race:
-	go test -race -timeout 20m ./...
+	go test -race -timeout 30m ./...
 
 parity:
 	test -f internal/world/testdata/vanilla_overworld_12345.bin

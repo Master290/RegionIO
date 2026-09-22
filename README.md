@@ -59,7 +59,8 @@ world has been generated and cached.
 
 ```
 go test ./...
-go test -race -timeout 20m ./...
+# the whole module needs ~18.6 min under -race; internal/world alone is over 15.
+go test -race -timeout 30m ./...
 # or run build, vet, ordinary tests, and race tests:
 make verify
 
