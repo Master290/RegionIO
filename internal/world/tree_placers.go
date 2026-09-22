@@ -2,14 +2,20 @@ package world
 
 import (
 	"fmt"
+	"math"
 
 	"regionio/internal/worldgen"
 )
 
 // Tree placement through the region. Every loop bound, draw and test below was read
 // from javap -p -c output against versions/26.1.2/server-26.1.2.jar for TreeFeature,
-// FoliagePlacer, StraightTrunkPlacer, GiantTrunkPlacer, BlobFoliagePlacer and
-// PineFoliagePlacer; nothing here is reconstructed from what trees.go used to do.
+// FoliagePlacer, TrunkPlacer, StraightTrunkPlacer, GiantTrunkPlacer,
+// BlobFoliagePlacer, PineFoliagePlacer, SpruceFoliagePlacer, MegaPineFoliagePlacer
+// and FancyFoliagePlacer; nothing here is reconstructed from what trees.go used to
+// do. The header of a method in that dump is the only argument list that counts:
+// createFoliage's trailing (foliageHeight, foliageRadius, offset) trio is easy to
+// read backwards, and doing so shortens or lengthens a canopy by the difference
+// between those two numbers.
 //
 // It replaces trees.go, which hand-wrote a trunk-and-blob approximation and got
 // three things wrong in three different ways: it clipped canopies to x,z in [2,13)
@@ -38,9 +44,15 @@ type treePlacer struct {
 	// trunkHeight, foliageHeight and foliageRadius are sampled in that order by
 	// TreeFeature.doPlace; the per-attachment offset comes after them, drawn once
 	// per FoliageAttachment by FoliagePlacer's public createFoliage wrapper.
-	trunkHeight   int
-	foliageHeight int
-	foliageRadius int
+	//
+	// doPlace passes them down as createFoliage(level, setter, random, config,
+	// height, attachment, foliageHeight, foliageRadius, offset), so a placer body
+	// reads the row count from foliageHeight and the width from foliageRadius - not
+	// the other way round, which is how this file first had them.
+	trunkHeight        int
+	foliageHeight      int
+	foliageRadius      int
+	heightAboveFoliage int // doPlace's (trunkHeight - foliageHeight), the foliageRadius argument
 }
 
 // newTreePlacer performs doPlace's sampling preamble, in doPlace's order, before a
@@ -53,19 +65,39 @@ func (t *treePlacer) sampleHeights() error {
 	t.trunkHeight = height
 
 	switch t.config.FoliagePlacer.Type {
-	case "minecraft:blob_foliage_placer":
-		// BlobFoliagePlacer.foliageHeight returns its int field without drawing.
+	case "minecraft:blob_foliage_placer", "minecraft:fancy_foliage_placer":
+		// BlobFoliagePlacer.foliageHeight returns its int field without drawing, and
+		// FancyFoliagePlacer inherits it.
 		h, ok := t.config.FoliagePlacer.Scalar("height")
 		if !ok {
-			return fmt.Errorf("world: blob foliage placer has no scalar height")
+			return fmt.Errorf("world: %s has no scalar height", t.config.FoliagePlacer.Type)
 		}
 		t.foliageHeight = h
 	case "minecraft:pine_foliage_placer":
 		// PineFoliagePlacer.foliageHeight samples its provider: one draw.
-		t.foliageHeight = t.foliageProviderField("height").Sample(t.random)
+		h, err := t.foliageProviderSample("height")
+		if err != nil {
+			return err
+		}
+		t.foliageHeight = h
+	case "minecraft:spruce_foliage_placer":
+		// Math.max(4, trunkHeight - trunk_height.sample(random)): one draw, and the
+		// 4 floors the value, not the draw.
+		h, err := t.foliageProviderSample("trunk_height")
+		if err != nil {
+			return err
+		}
+		t.foliageHeight = max(4, t.trunkHeight-h)
+	case "minecraft:mega_pine_foliage_placer":
+		h, err := t.foliageProviderSample("crown_height")
+		if err != nil {
+			return err
+		}
+		t.foliageHeight = h
 	default:
 		return fmt.Errorf("world: unimplemented foliage_placer %q for a tree being placed", t.config.FoliagePlacer.Type)
 	}
+	t.heightAboveFoliage = t.trunkHeight - t.foliageHeight
 
 	base, err := t.foliagePlacerBaseRadius()
 	if err != nil {
@@ -73,9 +105,12 @@ func (t *treePlacer) sampleHeights() error {
 	}
 	t.foliageRadius = base
 	if t.config.FoliagePlacer.Type == "minecraft:pine_foliage_placer" {
-		// PineFoliagePlacer.foliageRadius = super.foliageRadius(...) +
-		// random.nextInt(max(1, trunkHeight + 1)); an extra draw the blob has not.
-		span := t.trunkHeight + 1
+		// PineFoliagePlacer.foliageRadius = super.foliageRadius(random, i) +
+		// random.nextInt(max(1, i + 1)), and the i doPlace hands it is
+		// trunkHeight - foliageHeight rather than the trunk height: an extra draw
+		// the blob has not, on a bound that differs from the trunk height almost
+		// always.
+		span := t.heightAboveFoliage + 1
 		if span < 1 {
 			span = 1
 		}
@@ -118,12 +153,15 @@ func (t *treePlacer) foliagePlacerBaseRadius() (int, error) {
 	return provider.Sample(t.random), nil
 }
 
-func (t *treePlacer) foliageProviderField(name string) worldgen.NestedIntProvider {
-	provider, _, err := t.config.FoliagePlacer.Provider(name)
+func (t *treePlacer) foliageProviderSample(name string) (int, error) {
+	provider, ok, err := t.config.FoliagePlacer.Provider(name)
 	if err != nil {
-		return worldgen.NestedIntProvider{Type: "constant"}
+		return 0, fmt.Errorf("world: %s: %s is unreadable: %w", t.config.FoliagePlacer.Type, name, err)
 	}
-	return provider
+	if !ok {
+		return 0, fmt.Errorf("world: %s has no %s", t.config.FoliagePlacer.Type, name)
+	}
+	return provider.Sample(t.random), nil
 }
 
 func (t *treePlacer) stateAt(x, y, z int) uint16 { return t.r.getBlock(x, y, z) }
@@ -210,7 +248,7 @@ func (t *treePlacer) placeLeavesRow(at trunkAttachment, radius, y int) error {
 	}
 	for dx := -radius; dx <= radius+extra; dx++ {
 		for dz := -radius; dz <= radius+extra; dz++ {
-			if t.shouldSkipLocationSigned(dx, dz, radius, at.doubleTrunk) {
+			if t.shouldSkipLocationSigned(dx, y, dz, radius, at.doubleTrunk) {
 				continue
 			}
 			if _, err := t.placeLeaf(at.x+dx, at.y+y, at.z+dz); err != nil {
@@ -223,35 +261,48 @@ func (t *treePlacer) placeLeavesRow(at trunkAttachment, radius, y int) error {
 
 // shouldSkipLocationSigned measures distance to the nearer of two trunk columns
 // when a giant tree's canopy covers both.
-func (t *treePlacer) shouldSkipLocationSigned(dx, dz, radius int, doubleTrunk bool) bool {
+func (t *treePlacer) shouldSkipLocationSigned(dx, y, dz, radius int, doubleTrunk bool) bool {
 	ax, az := abs(dx), abs(dz)
 	if doubleTrunk {
 		ax = min(ax, abs(dx-1))
 		az = min(az, abs(dz-1))
 	}
-	return t.shouldSkipLocation(ax, az, radius)
+	return t.shouldSkipLocation(ax, y, az, radius)
 }
 
-// shouldSkipLocation is per placer type, and both implemented cases are read from
-// bytecode. Neither takes y, matching the Java signature's unused height argument.
-func (t *treePlacer) shouldSkipLocation(ax, az, radius int) bool {
+// shouldSkipLocation is per placer type, and each implemented case is read from
+// bytecode. The y argument is the row offset, which blob uses and the cone
+// placers do not.
+func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int) bool {
 	switch t.config.FoliagePlacer.Type {
 	case "minecraft:blob_foliage_placer":
-		// Only exact corners are candidates, and only then does it draw.
+		// Only exact corners are candidates, and only then does it draw. The corner
+		// is dropped when the draw says so, but kept on every non-bottom row:
+		// nextInt(2) == 0 || y == 0.
 		if ax != radius || az != radius {
 			return false
 		}
-		return t.random.NextIntN(2) != 0
-	case "minecraft:pine_foliage_placer":
-		// Pure geometry, no draw at all.
+		return t.random.NextIntN(2) == 0 || y == 0
+	case "minecraft:fancy_foliage_placer":
+		// A round canopy: skip outside the circle of the row radius, measured from
+		// the cell centre rather than the corner.
+		return square(float32(ax)+0.5)+square(float32(az)+0.5) > float32(radius*radius)
+	case "minecraft:pine_foliage_placer", "minecraft:spruce_foliage_placer":
+		// Pure geometry, no draw at all, and identical in both classes.
 		return ax == radius && az == radius && radius > 0
+	case "minecraft:mega_pine_foliage_placer":
+		// Two tests: the far corner of the double-trunk square, then the circle.
+		return ax+az >= 7 || ax*ax+az*az > radius*radius
 	}
 	return false
 }
 
-// placeBelowTrunk asks below_trunk_provider what belongs under the trunk, including
-// the "stay as you are" answer a rule-based provider gives when no rule matched and
-// it declares no fallback.
+func square(v float32) float32 { return v * v }
+
+// placeBelowTrunk is TrunkPlacer.placeBelowTrunkBlock, which asks
+// below_trunk_provider's getOptionalState: when no rule matched and the provider
+// declares no fallback it writes nothing at all, rather than writing back the
+// block that is already there.
 func (t *treePlacer) placeBelowTrunk(x, y, z int) error {
 	if len(t.config.BelowTrunkProvider) == 0 {
 		return nil
@@ -260,15 +311,24 @@ func (t *treePlacer) placeBelowTrunk(x, y, z int) error {
 	if err != nil {
 		return err
 	}
-	state, err := t.r.sampleStateProvider(t.set, spec, t.random, worldgen.FeaturePosition{X: x, Y: y, Z: z})
+	position := worldgen.FeaturePosition{X: x, Y: y, Z: z}
+	state, ok, err := t.r.sampleOptionalStateProvider(t.set, spec, t.random, position)
 	if err != nil {
 		return err
+	}
+	if !ok {
+		return nil
 	}
 	t.r.setBlock(x, y, z, state)
 	return nil
 }
 
+// placeLogAt is TrunkPlacer.placeLog: validTreePos is tested before the trunk
+// provider is sampled, so a cell the trunk cannot grow through costs no draw.
 func (t *treePlacer) placeLogAt(x, y, z int) error {
+	if !t.validTreePos(x, y, z) {
+		return nil
+	}
 	spec, err := t.set.StateProvider(t.config.TrunkProvider.Raw)
 	if err != nil {
 		return err
@@ -279,6 +339,26 @@ func (t *treePlacer) placeLogAt(x, y, z int) error {
 	}
 	t.r.setBlock(x, y, z, state)
 	return nil
+}
+
+// isFree is TrunkPlacer.isFree: a trunk may also grow through an existing log,
+// which validTreePos alone would refuse. Giant trunks test this, straight ones test
+// validTreePos, and the difference is visible on the second column of a mega tree
+// that overlaps a previous tree's leaves-turned-logs.
+func (t *treePlacer) isFree(x, y, z int) bool {
+	if t.validTreePos(x, y, z) {
+		return true
+	}
+	name, ok := stateByID(t.stateAt(x, y, z))
+	return ok && flattenBlockTagContains(t.set, "minecraft:logs", name.Name)
+}
+
+// placeLogIfFreeAt is TrunkPlacer.placeLogIfFree, the gate GiantTrunkPlacer uses.
+func (t *treePlacer) placeLogIfFreeAt(x, y, z int) error {
+	if !t.isFree(x, y, z) {
+		return nil
+	}
+	return t.placeLogAt(x, y, z)
 }
 
 // trunkAttachment is one FoliagePlacer.FoliageAttachment.
@@ -313,15 +393,15 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 		}
 		for i := 0; i < t.trunkHeight; i++ {
 			for _, c := range corners {
-				if !t.validTreePos(x+c[0], y+i, z+c[1]) {
-					continue
-				}
-				if err := t.placeLogAt(x+c[0], y+i, z+c[1]); err != nil {
+				if err := t.placeLogIfFreeAt(x+c[0], y+i, z+c[1]); err != nil {
 					return err
 				}
 			}
 		}
-		attachments = []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, radiusExtra: 1, doubleTrunk: true}}
+		// new FoliageAttachment(pos.above(height), 0, true): the offset is 0, not 1.
+		// A double trunk widens its rows through placeLeavesRow's extra column, and
+		// nothing else, so adding a radius here would square the canopy twice.
+		attachments = []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, doubleTrunk: true}}
 	default:
 		return fmt.Errorf("world: unimplemented trunk_placer %q for a tree being placed", t.config.TrunkPlacer.Type)
 	}
@@ -351,37 +431,83 @@ func (t *treePlacer) foliagePlacerOffset() (int, error) {
 	return provider.Sample(t.random), nil
 }
 
-// placeFoliage paints one canopy. Both loops are transcribed from bytecode: rows
-// are y-OFFSETS from the attachment position, counted down from the sampled offset
-// to offset - radius, so the canopy hangs around the trunk top rather than above it.
+// placeFoliage paints one canopy. Each loop is transcribed from its placer's
+// createFoliage body, whose arguments arrive as (maxFreeHeight, attachment,
+// foliageHeight, foliageRadius, offset) - so the row count comes from
+// foliageHeight and the width from foliageRadius.
+//
+// MegaPineFoliagePlacer is the exception: it iterates absolute y values and calls
+// placeLeavesRow with y = 0, which is why it builds a fresh attachment per row
+// rather than passing an offset.
 func (t *treePlacer) placeFoliage(at trunkAttachment, offset int) error {
 	switch t.config.FoliagePlacer.Type {
 	case "minecraft:blob_foliage_placer":
-		height, ok := t.config.FoliagePlacer.Scalar("height")
-		if !ok {
-			return fmt.Errorf("world: blob foliage placer has no scalar height")
-		}
-		for rowY := offset; rowY >= offset-t.foliageRadius; rowY-- {
-			// Math.max(0, height + radiusOffset - 1 - rowY/2), with rowY/2
+		for rowY := offset; rowY >= offset-t.foliageHeight; rowY-- {
+			// Math.max(0, radius + radiusOffset - 1 - rowY/2), with rowY/2
 			// truncating toward zero exactly as Java's integer division does.
-			radius := max(0, height+at.radiusExtra-1-rowY/2)
+			radius := max(0, t.foliageRadius+at.radiusExtra-1-rowY/2)
 			if err := t.placeLeavesRow(at, radius, rowY); err != nil {
 				return err
 			}
 		}
+	case "minecraft:fancy_foliage_placer":
+		// A sphere: the full radius on every row but the first and last.
+		for rowY := offset; rowY >= offset-t.foliageHeight; rowY-- {
+			radius := t.foliageRadius
+			if rowY != offset && rowY != offset-t.foliageHeight {
+				radius++
+			}
+			if err := t.placeLeavesRow(at, radius, rowY); err != nil {
+				return err
+			}
+		}
+	case "minecraft:spruce_foliage_placer":
+		// The width breathes: it grows until it reaches a limit that itself grows,
+		// then collapses to a recorded value. Which row it collapses on is not the
+		// bottom row, so this cannot be written as a cone.
+		current, limit, nextLimit := int(t.random.NextIntN(2)), 1, 0
+		for rowY := offset; rowY >= -t.foliageHeight; rowY-- {
+			if err := t.placeLeavesRow(at, current, rowY); err != nil {
+				return err
+			}
+			if current < limit {
+				current++
+				continue
+			}
+			current = nextLimit
+			nextLimit = 1
+			limit = min(limit+1, t.foliageRadius+at.radiusExtra)
+		}
+	case "minecraft:mega_pine_foliage_placer":
+		if t.foliageHeight == 0 {
+			// The crown slope divides by it. No config in the pack can reach this -
+			// crown_height is at least 3 - so it is an error rather than a
+			// reproduction of Java's saturating division.
+			return fmt.Errorf("world: %s at (%d,%d,%d) has foliageHeight 0, which divides the crown slope by zero", t.config.FoliagePlacer.Type, at.x, at.y, at.z)
+		}
+		lastRadius := 0
+		for rowY := at.y - t.foliageHeight + offset; rowY <= at.y+offset; rowY++ {
+			distance := at.y - rowY
+			radius := t.foliageRadius + at.radiusExtra + floorFloat32(float32(distance)/float32(t.foliageHeight)*3.5)
+			if distance > 0 && radius == lastRadius && rowY&1 == 0 {
+				radius++
+			}
+			row := trunkAttachment{x: at.x, y: rowY, z: at.z, radiusExtra: at.radiusExtra, doubleTrunk: at.doubleTrunk}
+			if err := t.placeLeavesRow(row, radius, 0); err != nil {
+				return err
+			}
+			lastRadius = radius
+		}
 	case "minecraft:pine_foliage_placer":
 		layerRadius := 0
-		for rowY := offset; rowY >= offset-t.foliageRadius; rowY-- {
+		for rowY := offset; rowY >= offset-t.foliageHeight; rowY-- {
 			if err := t.placeLeavesRow(at, layerRadius, rowY); err != nil {
 				return err
 			}
-			switch {
-			case layerRadius < 1:
-				layerRadius++
-			case rowY == offset-t.foliageRadius+1:
+			if layerRadius >= 1 && rowY == offset-t.foliageHeight+1 {
 				// One row before the bottom the cone closes again.
 				layerRadius--
-			case layerRadius < t.foliageHeight+at.radiusExtra:
+			} else if layerRadius < t.foliageRadius+at.radiusExtra {
 				layerRadius++
 			}
 		}
@@ -389,6 +515,31 @@ func (t *treePlacer) placeFoliage(at trunkAttachment, offset int) error {
 		return fmt.Errorf("world: unimplemented foliage_placer %q for a tree being placed", t.config.FoliagePlacer.Type)
 	}
 	return nil
+}
+
+// floorFloat32 is Mth.floor(float): Java's narrowing cast truncates toward zero and
+// saturates - NaN to 0, +Infinity to Integer.MAX_VALUE - and the -1 for negatives
+// turns that into a true floor.
+func floorFloat32(v float32) int {
+	f := float64(v)
+	switch {
+	case math.IsNaN(f):
+		// Java's narrowing cast gives 0 for NaN.
+		return 0
+	case math.IsInf(f, 1):
+		return math.MaxInt32
+	case math.IsInf(f, -1):
+		return math.MinInt32
+	case f >= math.MaxInt32:
+		return math.MaxInt32
+	case f <= math.MinInt32:
+		return math.MinInt32
+	}
+	i := int(v)
+	if v < 0 {
+		i--
+	}
+	return i
 }
 
 func isWaterSourceState(id uint16) bool {

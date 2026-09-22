@@ -16,40 +16,58 @@ import (
 // The empty-fallback case is the one worth reading twice. RuleBasedStateProvider
 // .getState calls getOptionalState and, when that returns null, hands back
 // level.getBlockState(pos): if no rule matched and the JSON declared no default,
-// the existing block is the answer. Returning false here instead would let a
-// caller skip the write, which looks the same and is not - the difference shows up
-// the moment a caller treats "no state" as "do not place", while vanilla places the
-// block that was already there and counts it as a placed cell.
+// the existing block is the answer - but a caller that asks the optional question,
+// as placeBelowTrunkBlock and AlterGroundDecorator do, gets "write nothing".
 func (r *decorationRegion) sampleStateProvider(set *worldgen.FeatureSet, spec worldgen.StateProviderSpec, random worldgen.RandomSource, position worldgen.FeaturePosition) (uint16, error) {
+	state, ok, err := r.sampleOptionalStateProvider(set, spec, random, position)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return r.getBlock(position.X, position.Y, position.Z), nil
+	}
+	return state, nil
+}
+
+// sampleOptionalStateProvider is BlockStateProvider.getOptionalState: null only
+// from a rule_based provider whose rules all failed and which declares no
+// fallback. Every other provider answers through the default method, which just
+// calls getState, so a randomised or weighted provider can never answer "nothing".
+func (r *decorationRegion) sampleOptionalStateProvider(set *worldgen.FeatureSet, spec worldgen.StateProviderSpec, random worldgen.RandomSource, position worldgen.FeaturePosition) (uint16, bool, error) {
 	switch spec.Type {
 	case "rule_based":
 		for _, rule := range spec.Rules {
 			matched, err := r.testBlockPredicate(set, rule.Predicate, position)
 			if err != nil {
-				return 0, err
+				return 0, false, err
 			}
 			if !matched {
 				continue
 			}
 			then, err := set.StateProvider(rule.Then)
 			if err != nil {
-				return 0, err
+				return 0, false, err
 			}
-			return r.sampleStateProvider(set, then, random, position)
+			// A matched rule answers with its provider's getState, not its
+			// getOptionalState, so a nested rule_based with no matching rule puts
+			// the standing block back rather than declining.
+			state, err := r.sampleStateProvider(set, then, random, position)
+			return state, err == nil, err
 		}
 		if spec.Fallback != nil {
-			return r.sampleStateProvider(set, *spec.Fallback, random, position)
+			state, err := r.sampleStateProvider(set, *spec.Fallback, random, position)
+			return state, err == nil, err
 		}
-		return r.getBlock(position.X, position.Y, position.Z), nil
+		return 0, false, nil
 	default:
 		state, ok := spec.SampleState(random)
 		if !ok {
-			return 0, fmt.Errorf("world: state provider %q produced no state", spec.Type)
+			return 0, false, fmt.Errorf("world: state provider %q produced no state", spec.Type)
 		}
 		id, ok := nameToStateID(state.Name, state.Properties)
 		if !ok {
-			return 0, fmt.Errorf("world: state provider names unknown block %q", state.Name)
+			return 0, false, fmt.Errorf("world: state provider names unknown block %q", state.Name)
 		}
-		return id, nil
+		return id, true, nil
 	}
 }

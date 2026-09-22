@@ -1,6 +1,8 @@
 package world
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"regionio/internal/worldgen"
@@ -108,9 +110,10 @@ func TestPersistentLeavesAreNotReplaced(t *testing.T) {
 	if err := planter.placeTrunk(4, 71, 4); err != nil {
 		t.Fatal(err)
 	}
-	// Trunk cells are expected to change: TrunkPlacer.placeLog writes
-	// unconditionally, unlike placeLogIfFreeWithOffset, which only the giant trunk
-	// uses. Everything that changed must therefore be on the trunk column.
+	// Trunk cells are expected to change: placeLog's gate is validTreePos, and a
+	// leaf is in the LEAVES tag, so the trunk grows through the pre-filled canopy
+	// and replaces it cell by cell. Everything that changed must therefore be on
+	// the trunk column.
 	after := planter.countState(persistent)
 	if after != before-planter.trunkHeight {
 		t.Errorf("persistent leaves went from %d to %d, want a loss of exactly the %d trunk cells",
@@ -178,14 +181,165 @@ func (t *treePlacer) countState(want uint16) int {
 }
 
 // TestUnimplementedPlacersFailLoudly keeps the half-finished port from degrading into
-// the silent shape it replaces: mega_pine used to "work" with radius 0.
+// the silent shape it replaces: mega_pine used to "work" with radius 0. The two types
+// below are outside this pass - neither is reachable from taiga or plains - so an
+// error is the only acceptable answer for them.
 func TestUnimplementedPlacersFailLoudly(t *testing.T) {
 	_, planter := oakPlanter(t, nil)
-	for _, typ := range []string{"minecraft:spruce_foliage_placer", "minecraft:fancy_trunk_placer"} {
-		planter.config.FoliagePlacer.Type = "minecraft:spruce_foliage_placer"
-		planter.config.TrunkPlacer.Type = typ
-		if err := planter.placeTrunk(4, 71, 4); err == nil {
-			t.Errorf("%q placed a tree without being implemented", typ)
-		}
+	planter.config.TrunkPlacer.Type = "minecraft:upwards_branching_trunk_placer"
+	if err := planter.placeTrunk(4, 71, 4); err == nil {
+		t.Error("upwards_branching_trunk_placer placed a tree without being implemented")
 	}
+	planter.config.TrunkPlacer.Type = "minecraft:straight_trunk_placer"
+	planter.config.FoliagePlacer.Type = "minecraft:cherry_foliage_placer"
+	if err := planter.placeTrunk(4, 71, 4); err == nil {
+		t.Error("cherry_foliage_placer placed a canopy without being implemented")
+	}
+}
+
+// TestCanopySilhouettesAreThePlacersOwn is the shape golden. Each expectation was
+// reviewed against what the placer's loop computes - row span from foliageHeight,
+// width from foliageRadius, corners cut per shouldSkipLocation - and each one of
+// them moved when the two arguments were swapped, which is how the first version of
+// this file got a spruce that was wide at the top and the oak's canopy four rows
+// taller than its own height field allows.
+func TestCanopySilhouettesAreThePlacersOwn(t *testing.T) {
+	for _, tc := range []struct {
+		config string
+		want   string
+	}{
+		{
+			// straight trunk + blob canopy: 3x3 at the top, 5x5 below it,
+			// corners cut by nextInt(2) and the bottom row's always.
+			config: "minecraft:oak_bees_005",
+			want: `trunk=6 foliageHeight=3 foliageRadius=2
+  y= 74 n=23 ....##T##....
+  y= 75 n=20 ....##T##....
+  y= 76 n= 6 .....#T#.....
+  y= 77 n= 5 .....###.....`,
+		},
+		{
+			// straight trunk + spruce canopy: eight rows, the width breathing
+			// 0,1,0,1,2,1,2,1 as it descends.
+			config: "minecraft:spruce",
+			want: `trunk=7 foliageHeight=6 foliageRadius=2
+  y= 72 n= 4 .....#T#.....
+  y= 73 n=20 ....##T##....
+  y= 74 n= 4 .....#T#.....
+  y= 75 n=20 ....##T##....
+  y= 76 n= 4 .....#T#.....
+  y= 78 n= 5 .....###.....
+  y= 79 n= 1 ......#......`,
+		},
+		{
+			// straight trunk + pine canopy: a diamond, radius capped at 1, and
+			// the extra draw of foliageRadius landing on 0.
+			config: "minecraft:pine",
+			want: `trunk=8 foliageHeight=3 foliageRadius=1
+  y= 78 n= 4 .....#T#.....
+  y= 79 n= 5 .....###.....
+  y= 80 n= 1 ......#......`,
+		},
+		{
+			// giant trunk + mega pine canopy: two columns of trunk, and a crown
+			// whose rows are counted in absolute y, widening by the 3.5/height
+			// slope with the even-row bump.
+			config: "minecraft:mega_pine",
+			want: `trunk=22 foliageHeight=3 foliageRadius=0
+  y= 90 n=40 ...###TT###..
+  y= 91 n=20 ....##TT##...
+  y= 92 n= 8 .....#TT#....
+  y= 93 n= 4 ......##.....`,
+		},
+	} {
+		t.Run(tc.config, func(t *testing.T) {
+			got := canopySilhouette(t, tc.config)
+			if got != tc.want {
+				t.Errorf("silhouette for %s changed:\ngot:\n%s\nwant:\n%s", tc.config, got, tc.want)
+			}
+		})
+	}
+}
+
+// canopySilhouette places one configured tree at a fixed spot in a one-chunk region
+// and renders every row that holds a leaf or a log: the leaf count in the 13x13
+// window plus the z-centre slice, where '#' is a leaf, 'T' a log and '.' air.
+func canopySilhouette(t *testing.T, configName string) string {
+	t.Helper()
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := set.Tree(configName)
+	if err != nil {
+		t.Fatalf("%s: %v", configName, err)
+	}
+	region, err := newDecorationRegion([]*Chunk{NewChunk(0, 0, BiomePlains)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.setSource(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	random, _ := worldgen.DecorationRandom(12345, 0, 0)
+	planter := &treePlacer{r: region, set: set, random: random, config: config}
+	if err := planter.sampleHeights(); err != nil {
+		t.Fatalf("%s: %v", configName, err)
+	}
+	const trunkBase = 71
+	if err := planter.placeTrunk(8, trunkBase, 8); err != nil {
+		t.Fatalf("%s: %v", configName, err)
+	}
+	out := []string{fmt.Sprintf("trunk=%d foliageHeight=%d foliageRadius=%d",
+		planter.trunkHeight, planter.foliageHeight, planter.foliageRadius)}
+	for y := trunkBase; y <= trunkBase+planter.trunkHeight+planter.foliageHeight+2; y++ {
+		row := ""
+		leaves := 0
+		for dx := -6; dx <= 6; dx++ {
+			stateName, symbol := symbolize(planter.stateAt(8+dx, y, 8))
+			if symbol == "?" {
+				t.Fatalf("%s: cell (%d,%d,8) holds %q, which is neither air, log nor leaf", configName, 8+dx, y, stateName)
+			}
+			if symbol == "#" {
+				leaves++
+			}
+			row += symbol
+		}
+		for dx := -6; dx <= 6; dx++ {
+			for dz := -6; dz <= 6; dz++ {
+				if dz == 0 {
+					continue
+				}
+				if _, symbol := symbolize(planter.stateAt(8+dx, y, 8+dz)); symbol == "#" {
+					leaves++
+				}
+			}
+		}
+		if leaves == 0 {
+			continue // trunk-only rows carry no information about the canopy
+		}
+		out = append(out, fmt.Sprintf("  y=%3d n=%2d %s", y, leaves, row))
+	}
+	return strings.Join(out, "\n")
+}
+
+// symbolize renders one cell of a silhouette, rejecting anything that is not air,
+// a log or a leaf: a tree that grew into the floor would otherwise pass as background.
+func symbolize(id uint16) (string, string) {
+	if isAirState(id) {
+		return "air", "."
+	}
+	name, ok := stateByID(id)
+	if !ok {
+		return "", "?"
+	}
+	switch {
+	case strings.HasSuffix(name.Name, "_log"), name.Name == "minecraft:stem", name.Name == "minecraft:hyphae":
+		return name.Name, "T"
+	case strings.HasSuffix(name.Name, "_leaves"):
+		return name.Name, "#"
+	case name.Name == "minecraft:air":
+		return "air", "."
+	}
+	return name.Name, "?"
 }
