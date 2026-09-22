@@ -343,9 +343,6 @@ type TreeFeatureConfig struct {
 	RootPlacer         json.RawMessage   `json:"root_placer"`
 }
 
-// TreeBlockProvider is a state supplier as the tree configs use them: either
-// simple_state_provider with one state, or a rule_based/weighted structure that
-// only below_trunk_provider uses in the biomes measured so far.
 // TreeBlockProvider is one of the three state-supplier shapes the tree configs
 // actually use, measured across the 39 configured trees: trunk_provider is always
 // simple_state_provider, foliage_provider is simple except azalea_tree which is a
