@@ -978,6 +978,23 @@ runs the feature and counts changed cells instead, and was confirmed by revertin
 `disks.go` and watching it fail. A guard that has never been seen to fail has not
 been shown to be capable of it.
 
+A fourth set of the same shape was in `springs.go`, which a sweep of
+`nameToStateID(name, nil)` call sites had talked me out of: SpringFeature counts
+its five neighbours against `valid_blocks` and requires an exact `rock_count`, so
+that set is a membership test too, not a block to place. The reachable block is
+**deepslate** - `spring_water` and `spring_lava_overworld` both list it and it
+carries three states in this build - and
+`TestSpringCountsNonDefaultValidStateAsRock` lays a cross of non-default deepslate
+and demands falling water; on the old expansion the cell stays `minecraft:air`.
+
+The two blocks that are *not* the reachable one are the cautionary detail. A
+comment named powder snow and hanging gravel before anyone looked, on the reasoning
+that their property names imply several states; both have exactly one. Guessing
+which blocks are multi-state from their names is how a wrong fact gets written into
+the place a future reader trusts, so the state count now lives in a test that
+enumerates it. Output is again unchanged on this seed - 99.916%, 330 cells, fluid
+22 - because no non-default deepslate sits in a spring's cross here.
+
 Two more lessons in "real bug, zero cells", and both are why the change is kept
 anyway: reachable in the data and reachable in the code path are different
 questions, and a correct port is worth having on a seed where it is silent, because

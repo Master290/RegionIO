@@ -43,20 +43,24 @@ func placeVanillaSprings(c *Chunk, seed int64, cx, cz int32, biomes *[16][16]str
 					x := int(random.NextIntN(16))
 					z := int(random.NextIntN(16))
 					y := plan.SampleY(random, MinY, WorldHeight)
-					placeSpring(c, x, y, z, config)
+					placeSpring(set, c, x, y, z, config)
 				}
 			}
 		}
 	}
 }
 
-func placeSpring(c *Chunk, x, y, z int, config worldgen.SpringFeatureConfig) {
-	valid := make(map[uint16]bool, len(config.ValidBlocks))
-	for _, name := range config.ValidBlocks {
-		if state, ok := nameToStateID(name, nil); ok {
-			valid[state] = true
-		}
-	}
+func placeSpring(set *worldgen.FeatureSet, c *Chunk, x, y, z int, config worldgen.SpringFeatureConfig) {
+	// A spring counts its neighbours against valid_blocks and requires an exact
+	// rock_count, so this set is a membership test rather than a block to place.
+	// Resolving each entry to its default state makes a non-default state count as
+	// a hole instead of rock, silently suppressing a spring vanilla places. The
+	// reachable case is deepslate: spring_water and spring_lava_overworld both list
+	// it and it carries three states in this build - not powder_snow or gravel,
+	// which look like obvious candidates from their property names and have one
+	// state each. blockSetStateIDs is where that expansion lives, for the fourth
+	// such set in this package.
+	valid := blockSetStateIDs(set, config.ValidBlocks)
 	state, ok := springStateID(config.State)
 	if !ok || !valid[c.GetBlock(x, y+1, z)] {
 		return
