@@ -953,6 +953,35 @@ moss/vine/water consequence of a pool that moved, not a pool we failed to place.
 And (1,0) is where we place clay vanilla does not (6 of the 9 extra cells), which
 is the opposite failure and will not be fixed by the same change.
 
+That table is the post-fix state. The baseline the plan asked Step 3 to record -
+the same measurement on the integrated tree, before any generator change - was
+taken but never written down, and only the parity half of it survived in a commit
+message. It has now been reconstructed by running both tests in a worktree at
+`ce1436c`, the first green commit after the upstream rebase, with the current
+`data/` registry copied in (`data/` is gitignored, so a worktree would otherwise
+have no datapacks and the generator would not run at all):
+
+| chunk | v36 baseline missing / extra | v37 now missing / anchors / extra |
+|---|---|---|
+| (0,0) | 16 / 0 | 10 / 0 / 0 |
+| (1,0) | 14 / 6 | 14 / 2 / 6 |
+| (0,1) | 22 / 0 | 22 / 20 / 0 |
+| (-1,-1) | 67 / 3 | 50 / 0 / 3 |
+| total | **119 / 9** | **96 / 22 / 9** |
+
+The reconstruction is not assumed, it is checked: that worktree reproduces the
+v36 parity record exactly - 89/90/58/122 residual cells, 99.909%, 34 fluid
+mismatches, the same numbers the `ce1436c` commit message quotes and the same
+29-cell / 12-fluid delta the waterlog fix claims - so old code against the
+current registry is the tree that was measured, not a near-relative of it.
+
+What the comparison is actually worth is the third column read against the second.
+The fix bought 23 clay-chain cells, all of them in (0,0) and (-1,-1), and it moved
+**nothing** in (0,1): 22 missing before, 22 missing after, all 20 of them anchors.
+The residual pool problem this investigation set out to solve was therefore not
+touched by the one generator change that came out of it, which is why it is still
+open and why it is a state-history problem rather than a water-set-ordering one.
+
 Two probes were run against it, and both came back with numbers.
 
 First, `REGIONIO_SETBLOCK_TRACE` on four of those cells. Same source (0,0), same
