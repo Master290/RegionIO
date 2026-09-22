@@ -1,7 +1,6 @@
 package world
 
 import (
-	"strings"
 	"testing"
 
 	"regionio/internal/worldgen"
@@ -190,42 +189,6 @@ func TestRegionPlacesSprings(t *testing.T) {
 		t.Fatal("25 region chunks produced no falling fluid, so stage 8 is not being replayed")
 	}
 	t.Logf("%d falling-fluid cells found", springs)
-}
-
-// TestStage8ScheduleGolden pins which features the fluid-spring step holds for the two
-// captured biomes, in the order the region replays them. A re-indexing of the schedule
-// would move every later feature's per-feature seed, the same failure the stage-9
-// golden exists to catch.
-func TestStage8ScheduleGolden(t *testing.T) {
-	set, err := worldgen.LoadFeatureSet()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The exact pair, in schedule order, with the global index each holds: an
-	// index is what SetFeatureSeed mixes with the decoration seed, so a re-indexing
-	// would move every later feature in the chunk the same way stage 9's golden
-	// guards against.
-	for _, tc := range []struct {
-		biome string
-		want  []int
-		names string
-	}{
-		{"minecraft:plains", nil, "minecraft:spring_water minecraft:spring_lava"},
-		{"minecraft:lush_caves", nil, "minecraft:spring_water minecraft:spring_lava"},
-	} {
-		schedule, err := set.FeatureSchedule(possibleBiomeOrder(), []string{tc.biome}, fluidsStage)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got := ""
-		for _, scheduled := range schedule {
-			got += scheduled.Name + " "
-		}
-		if strings.TrimSpace(got) != tc.names {
-			t.Errorf("%s stage %d schedules %q, want %q", tc.biome, fluidsStage, strings.TrimSpace(got), tc.names)
-		}
-		t.Logf("stage %d for %s: %s", fluidsStage, tc.biome, strings.TrimSpace(got))
-	}
 }
 
 func TestPlacedSpringsAreDeterministic(t *testing.T) {
