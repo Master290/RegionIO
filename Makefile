@@ -17,10 +17,19 @@ test:
 test-race:
 	go test -race -timeout 30m ./...
 
+# The ocean fixture first, then the land one. They prove different things and only
+# the first can prove the other is meaningless: the ocean capture has no surface at
+# all - top block water on all 1,024 columns - so a forest could be entirely wrong
+# and its 330 residual cells would not move. The land steps carry the fixture-content
+# guard (it fails if the capture ever stops holding a surface), the surface-band
+# ratchet, and the per-chain differential against the chain-disabled captures.
 parity:
 	test -f internal/world/testdata/vanilla_overworld_12345.bin
 	REGIONIO_REQUIRE_PARITY=1 REGIONIO_PARITY_DIAGNOSTIC=1 \
 		go test -v ./internal/world -run TestVanillaBlockParity
+	test -f internal/world/testdata/vanilla_land_12345.bin
+	REGIONIO_PARITY_DIAGNOSTIC=1 \
+		go test -v ./internal/world -run 'TestVanillaLandFixtureHasSurface|TestVanillaLandBlockParity|TestVanillaLandTreeChainDiff'
 
 # Compile every test binary, then run the env-gated worldgen diagnostics. The
 # first half is the point: `go build ./...` never compiles _test.go files, and

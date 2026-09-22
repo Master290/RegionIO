@@ -75,6 +75,15 @@ jobs:
       - env:
           REGIONIO_PARITY_DIAGNOSTIC: "1"
         run: go test ./internal/world -run TestVanillaBlockParity -count=1 -v
+      # The land fixture, mirroring `make parity`. It belongs in CI for a specific
+      # reason rather than by symmetry: the ocean capture above has no surface at all,
+      # so nothing in it can notice a forest going wrong. These are the assertions that
+      # can - the fixture-content guard, which fails if the capture ever stops holding
+      # a surface, the surface-band ratchet, which only tightens, and the per-chain
+      # differential against the chain-disabled captures.
+      - env:
+          REGIONIO_PARITY_DIAGNOSTIC: "1"
+        run: go test ./internal/world -run "TestVanillaLandFixtureHasSurface|TestVanillaLandBlockParity|TestVanillaLandTreeChainDiff" -count=1 -v
 
   # The gated diagnostics are where the worldgen gaps get attributed, and a
   # mode nothing runs rots: the lush-caves probe shipped carrying a private copy
