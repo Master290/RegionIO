@@ -1645,3 +1645,42 @@ back.
 Land is now 390,494/393,216 exact (99.308%), surface band 945 mismatches against the
 1,748 the hand-written path left, `MOTION_BLOCKING_NO_LEAVES` 97.9%. The ocean fixture
 still does not move: 330 residual cells, clay 96/22/9, ore parity zero.
+
+## Surface decoration, part 5: what the completion audit found in the pack itself
+
+Three facts measured during the audit of this plan rather than carried over from it, each
+of which changed a claim that was already written down.
+
+**No nested feature ref in 26.1.2 points at a tree.** The plan asked for the nested-ref
+switch in `world/cave_features.go` to "become an error for tree refs". Walking every
+`configured_feature` JSON in the embed and resolving each `feature`/`features` member of
+the two kinds that switch serves (`simple_random_selector`, `vegetation_patch`,
+`waterlogged_vegetation_patch`), the referenced configured types are exactly
+`simple_block` (moss_patch, moss_patch_bonemeal, pale_moss_patch),
+`simple_random_selector` (clay_pool_with_dripleaves, clay_with_dripleaves) and
+`block_column` (moss_patch_ceiling) - all three already handled, zero trees. The thirteen
+configured-tree names that do appear as nested-looking references belong to
+`random_selector` configs, whose entries name *placed* features, which is the same
+ref-kind trap that made an earlier enumeration of this pack report "0 trees": configured
+and placed features share their names, so the file kind has to be resolved before the
+reference does. What the switch needed was not tree routing but a name on its fallthrough
+(`nested:<type>` into the not-replayed counter), and it had to keep returning false,
+because `placePatchVegetationFeature` waterlogs a cell only when the nested call reports
+that it wrote something - which is also why this switch cannot simply delegate to the
+stage-9 seam, whose counted-and-skipped path signals with a nil error.
+
+**The decorator veto experiment had been recorded with stale numbers.** Re-running it
+(vetoing a tree over an un-modelled decorator instead of counting and continuing) gives
+101 refusals, tree cells 577 down to 370, surface band 945 up to 989 - not the 1,362
+first written down, which predates the leaf-distance fix - and `dark_oak_foliage_placer`
+refusals moving 32 up to 43 with no placer logic touched, because the shared decoration
+stream shifted. The shipped build counts 82 `place_on_ground` occurrences, one per
+decorator slot rather than one per tree, and that is what the diagnostic prints; the 164
+these notes carried was not reproduced by today's measurement, so it has been replaced by
+the reading that is rather than given an explanation.
+
+**The legacy generator's fixture number had drifted unrecorded.** With the hand-written
+surface decoration deleted from it, `REGIONIO_PARITY_GENERATOR=legacy` prints
+377,329/393,216 (95.960%), where README quoted 95.959%. Re-quoted rather than explained:
+the two cells are not attributed to a cause anywhere in this tree, because attributing
+them would mean running the legacy path per feature and nothing asserts it.
