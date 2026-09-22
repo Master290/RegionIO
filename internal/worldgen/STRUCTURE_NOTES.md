@@ -786,7 +786,8 @@ these cells, but a multi-state member (`cave_vines`, `grass_block[snowed]`) woul
 wrong" - was correct about the moss rim and correct about the bug, and the bug sat
 unactioned for that long. It is fixed, along with three sibling copies of the same
 mistake, in "VegetationPatchFeature, now verified line for line": `cave_vines` does
-have 25 states, aged vines were excluded, and the effect on these cells is
+have 52 states in this build - age and perched, not the 25 its property names
+suggest - and aged vines were excluded, and the effect on these cells is
 nonetheless **zero** - which is the interesting result, not a refutation. Read the
 two sections together before chasing a rim cell through replaceability again.
 
@@ -927,7 +928,8 @@ bug in the same function and was still live: `geodeTagIDs` resolved each
 block tag is a set of **blocks** - so every state of a member matches.
 
 That distinction is not academic here, because `moss_replaceable` includes
-`#minecraft:cave_vines`, whose `age` property spans twenty-five states. Every
+`#minecraft:cave_vines`, which carries 52 states in this build (`age` and
+`perched`, not the 25 that `age` alone would suggest). Every
 cave-vine state other than the default was therefore read as non-replaceable, and
 `placeGround`'s column walk breaks on a non-replaceable cell - so a vine hanging in
 a lush-cave ceiling aborted a patch column that vanilla walks straight through,

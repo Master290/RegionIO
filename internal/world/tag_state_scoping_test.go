@@ -20,7 +20,8 @@ import (
 // BlockState.is(TagKey<Block>), and a block tag is a set of blocks, so every state
 // of a member satisfies it. The two readings differ for any member that has a
 // property, and #minecraft:moss_replaceable pulls in #minecraft:cave_vines, whose
-// age property spans twenty-five states. So an aged vine in a lush-cave ceiling read
+// 52 states in this build, from age and perched together - not the 25 that the
+// property name alone suggests. So an aged vine in a lush-cave ceiling read
 // as non-replaceable, and placeGround's column walk breaks on the first
 // non-replaceable cell - it aborted a vegetation column that vanilla walks straight
 // through, changing whether the patch is accepted and every draw after it.

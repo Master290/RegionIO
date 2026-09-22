@@ -204,7 +204,8 @@ func sampleGeodeInt(random worldgen.RandomSource, min, max int) int {
 // state of a member matches. Keying the set by state ID alone is therefore only
 // correct if each member's default state is its only state - and for
 // #minecraft:moss_replaceable that is false in a way that bites: it pulls in
-// #minecraft:cave_vines, whose age property spans twenty-five states, so an aged
+// #minecraft:cave_vines, which carries 52 states in this build (age and perched -
+// not the 25 that "age" alone would suggest), so an aged
 // vine hanging in a lush-cave ceiling read as non-replaceable here while vanilla
 // walks its vegetation column straight through it.
 func tagStateIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
