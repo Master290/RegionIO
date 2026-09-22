@@ -19,10 +19,11 @@ import (
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
 // landSurfaceRatchet, landCellRatchet are today's measured land numbers: 945 surface-band
-// mismatches and 390,494 exact cells, with 577 of vanilla's 789 tree cells (73%%). The
-// tree figure has room below it because a dark oak's canopy is un-modelled - 32 refusals
-// over these chunks, and a refused tree costs its trunk as well - and because the leaf
-// litter under a birch, place_on_ground, is counted 164 times and skipped.
+// mismatches and 390,494 exact cells, with 577 of vanilla's 789 tree cells (73%). The
+// tree figure has room below it because a dark oak's canopy is un-modelled - the diagnostic
+// tally prints dark_oak_foliage_placer 32 times, and a refused tree costs its trunk as well -
+// and because the leaf litter under a birch, place_on_ground, is counted 82 times and skipped
+// without losing the tree.
 const (
 	landSurfaceRatchet = 945
 	landCellRatchet    = 390494

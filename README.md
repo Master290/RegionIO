@@ -164,12 +164,14 @@ were deleted and leaves were given the distance property vanilla propagates into
 them; the cells above sea level that hold a trunk, canopy or plant went from zero to
 577 against vanilla's 789. `MOTION_BLOCKING_NO_LEAVES`,
 the one heightmap that ignores canopy, holds at 97.9%, so the height under the
-decoration is right and what remains is placement: the four chunks still disagree
-in both directions (one taiga chunk places 200 of vanilla's 353 tree cells, one
-plains chunk 179 against 114), and the counter the diagnostic prints names the
-rest — `dark_oak_foliage_placer` from a neighbouring forest 32 times, a fallen
-tree once, mushroom selectors seven. Flora and springs are the next step; the
-ocean fixture did not move (330 cells, clay 96/22/9, ore parity zero), which is
+decoration is right and what remains is placement: the gap sits in the conifer
+chunks (the taiga chunk places 229 of vanilla's 285 tree cells, the old-growth one
+199 of 353) while the plains pair nearly match, 37 of 37 and 112 of 114, and the
+counter the diagnostic prints names the rest — `dark_oak_foliage_placer` from a
+neighbouring forest 32 times, mushroom selectors seven, `place_on_ground` 82.
+Springs and flora are done; `dark_oak_foliage_placer` and the leaf litter
+`place_on_ground` paints are the next step. The ocean fixture did not move
+(330 cells, clay 96/22/9, ore parity zero), which is
 the check that a surface change stayed on the surface. Closing the rest is the
 road to exact equality, while keeping cold batch generation within an acceptable
 latency budget.

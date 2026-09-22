@@ -1624,10 +1624,14 @@ that to 192 of 194.
 is measured, not stylistic: `TreeFeature.place` runs decorators after `doPlace` has put
 the trunk and canopy in the world, so refusing a tree over a decorator it cannot run
 throws away a body that vanilla does place. `place_on_ground` - the leaf litter and
-shrubs under birches and beeches - is un-modelled and appears 164 times across the four
-land chunks; vetoing on it there removed 101 whole trees and pushed the surface band from
-945 mismatches back up to 1,362. So `supportsAllParts` checks trunk and foliage placers
-only, and `placeDecorators` counts an un-modelled decorator by name and carries on.
+shrubs under birches and beeches - is un-modelled and the shipped build counts it **82**
+times over the four land chunks, per occurrence, without losing the tree. Re-measured by
+temporarily making `supportsAllParts` veto on it: **101** refusals (one per tree, so the
+two counts differ by what a tree's several decorator slots contribute), tree cells above
+sea level 577 down to **370**, surface band 945 back up to **989**, and `dark_oak_foliage_placer`
+refusals 32 up to 43 because the shared decoration stream moved - cascade, not footprint.
+So `supportsAllParts` checks trunk and foliage placers only, and `placeDecorators` counts
+an un-modelled decorator by name and carries on.
 
 **A pre-flight check has to be free.** The first version of `supportsAllParts` asked the
 trunk placer for its height to confirm the fields were readable - which is

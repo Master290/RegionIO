@@ -453,9 +453,10 @@ func (t *treePlacer) supportsAllParts() error {
 	// Decorators are deliberately not checked here. A canopy placer this build has not
 	// read means the tree has no body, so refusing it is right; a decorator runs after
 	// the trunk and canopy are already in the world, so the only thing an un-modelled
-	// one costs is its own blocks. Refusing the tree for that lost 101 of them over the
-	// four land chunks - place_on_ground, the leaf litter under birches - and every
-	// canopy they should have had. placeDecorators counts and skips them instead.
+	// one costs is its own blocks. Refusing the tree for that drops the land capture's
+	// tree cells from 577 to 370 and widens the surface band from 945 to 989 - 101
+	// place_on_ground refusals, the leaf litter under birches, each taking a whole
+	// canopy with it. placeDecorators counts and skips them instead.
 	return nil
 }
 
