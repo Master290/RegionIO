@@ -18,6 +18,15 @@ import (
 // plains, seed 12345, chosen by sampling our own biome and height path first:
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
+// landSurfaceRatchet, landCellRatchet are the measured land numbers as of the trees,
+// springs, boulders and flora work: 1,328 surface-band mismatches, 390,111 exact cells,
+// and 660 of vanilla's 789 tree cells (83%%). The tree figure has room below it because
+// a dark oak in a border forest is still un-modelled.
+const (
+	landSurfaceRatchet = 1328
+	landCellRatchet    = 390111
+)
+
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"
 
 // landSurface is what a capture says about the surface band, independent of any
@@ -301,6 +310,28 @@ func TestVanillaLandBlockParity(t *testing.T) {
 	for kind, name := range []string{"WORLD_SURFACE", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"} {
 		t.Logf("heightmap %-27s exact %4d/%d (%.3f%%)", name, kindExact[kind], kindTotal[kind],
 			percent(kindExact[kind], kindTotal[kind]))
+	}
+
+	// The ratchet. The ocean fixture's CI floor is 99.7%, which against 330 residual
+	// cells leaves ~849 cells of headroom - enough that an entirely wrong forest would
+	// have passed unnoticed, and the ocean fixture cannot see the surface at all
+	// because every one of its columns tops out as water. So the land numbers that this
+	// test prints are asserted here as well, in the one direction that is useful: they
+	// may only improve.
+	//
+	// Lower these when the surface genuinely gets better, in the same commit that makes
+	// it better, and say in that commit's message what moved. Leaving them alone after
+	// an improvement is how a ratchet stops meaning anything; lowering them without the
+	// improvement is what this assertion exists to catch.
+	if bands["surface"] > landSurfaceRatchet {
+		t.Errorf("surface-band mismatches went up: %d, want at most %d (the ratchet)", bands["surface"], landSurfaceRatchet)
+	}
+	if ourTrees*10 < vanillaTrees*7 {
+		t.Errorf("only %d of vanilla's %d tree cells above sea level are placed, below the 70%% ratchet",
+			ourTrees, vanillaTrees)
+	}
+	if exact < landCellRatchet {
+		t.Errorf("land parity fell below the ratchet: %d/%d exact, want at least %d", exact, total, landCellRatchet)
 	}
 }
 
