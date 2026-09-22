@@ -489,10 +489,53 @@ func (m TreeMinimumSize) Limit() (int, bool) {
 	return scalarField(m.Fields, "min_limit")
 }
 
+// TreeDecorator is one entry of a tree's decorators list. The type is what the
+// replay dispatches on; every other member is kept raw because each decorator reads
+// a different one - beehive a probability, alter_ground a block state provider - and
+// a shared typed struct would have to know all of them.
 type TreeDecorator struct {
-	Type   string          `json:"type"`
-	Config json.RawMessage `json:"-"`
-	Raw    json.RawMessage `json:"-"`
+	Type   string
+	Fields map[string]json.RawMessage
+}
+
+func (d *TreeDecorator) UnmarshalJSON(data []byte) error {
+	var slots map[string]json.RawMessage
+	if err := json.Unmarshal(data, &slots); err != nil {
+		return err
+	}
+	out := TreeDecorator{Fields: make(map[string]json.RawMessage, len(slots))}
+	for name, raw := range slots {
+		if name == "type" {
+			if err := json.Unmarshal(raw, &out.Type); err != nil {
+				return err
+			}
+			continue
+		}
+		out.Fields[name] = raw
+	}
+	*d = out
+	return nil
+}
+
+// Float reads a scalar member of a decorator, which is how beehive's probability
+// arrives.
+func (d TreeDecorator) Float(name string) (float64, bool) {
+	raw, ok := d.Fields[name]
+	if !ok {
+		return 0, false
+	}
+	var value float64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+// Provider returns a decorator's raw member for the caller to resolve; evaluating a
+// block state provider needs a world, which this package does not have.
+func (d TreeDecorator) Provider(name string) (json.RawMessage, bool) {
+	raw, ok := d.Fields[name]
+	return raw, ok && len(raw) > 0
 }
 
 type FeatureRef struct {

@@ -210,46 +210,61 @@ func TestCanopySilhouettesAreThePlacersOwn(t *testing.T) {
 	}{
 		{
 			// straight trunk + blob canopy: 3x3 at the top, 5x5 below it,
-			// corners cut by nextInt(2) and the bottom row's always.
+			// corners cut by nextInt(2) and the row-offset-0 corners always.
 			config: "minecraft:oak_bees_005",
 			want: `trunk=6 foliageHeight=3 foliageRadius=2
-  y= 74 n=23 ....##T##....
-  y= 75 n=20 ....##T##....
-  y= 76 n= 6 .....#T#.....
-  y= 77 n= 5 .....###.....`,
+  y= 74 n=23 ........##T##........
+  y= 75 n=20 ........##T##........
+  y= 76 n= 6 .........#T#.........
+  y= 77 n= 5 .........###.........`,
 		},
 		{
 			// straight trunk + spruce canopy: eight rows, the width breathing
 			// 0,1,0,1,2,1,2,1 as it descends.
 			config: "minecraft:spruce",
 			want: `trunk=7 foliageHeight=6 foliageRadius=2
-  y= 72 n= 4 .....#T#.....
-  y= 73 n=20 ....##T##....
-  y= 74 n= 4 .....#T#.....
-  y= 75 n=20 ....##T##....
-  y= 76 n= 4 .....#T#.....
-  y= 78 n= 5 .....###.....
-  y= 79 n= 1 ......#......`,
+  y= 72 n= 4 .........#T#.........
+  y= 73 n=20 ........##T##........
+  y= 74 n= 4 .........#T#.........
+  y= 75 n=20 ........##T##........
+  y= 76 n= 4 .........#T#.........
+  y= 78 n= 5 .........###.........
+  y= 79 n= 1 ..........#..........`,
 		},
 		{
 			// straight trunk + pine canopy: a diamond, radius capped at 1, and
 			// the extra draw of foliageRadius landing on 0.
 			config: "minecraft:pine",
 			want: `trunk=8 foliageHeight=3 foliageRadius=1
-  y= 78 n= 4 .....#T#.....
-  y= 79 n= 5 .....###.....
-  y= 80 n= 1 ......#......`,
+  y= 78 n= 4 .........#T#.........
+  y= 79 n= 5 .........###.........
+  y= 80 n= 1 ..........#..........`,
 		},
 		{
-			// giant trunk + mega pine canopy: two columns of trunk, and a crown
-			// whose rows are counted in absolute y, widening by the 3.5/height
-			// slope with the even-row bump.
+			// giant trunk + mega pine crown: two columns of trunk, rows counted in
+			// absolute y, width following the 3.5-slope with the even-row bump.
 			config: "minecraft:mega_pine",
 			want: `trunk=22 foliageHeight=3 foliageRadius=0
-  y= 90 n=40 ...###TT###..
-  y= 91 n=20 ....##TT##...
-  y= 92 n= 8 .....#TT#....
-  y= 93 n= 4 ......##.....`,
+  y= 90 n=40 .......###TT###......
+  y= 91 n=20 ........##TT##.......
+  y= 92 n= 8 .........#TT#........
+  y= 93 n= 4 ..........##.........`,
+		},
+		{
+			// fancy trunk + fancy canopy: a third of every plains tree. The trunk is
+			// three wide at y=76 because a limb ran sideways, and the canopy is the
+			// union of four spheres - one per surviving FoliageCoords - which is why
+			// no single-row radius describes it.
+			config: "minecraft:fancy_oak_bees_005",
+			want: `trunk=11 foliageHeight=4 foliageRadius=2
+  y= 76 n= 3 ........#TTT.........
+  y= 77 n=24 .......###T#.#.......
+  y= 78 n=38 .......###T#####.....
+  y= 79 n=45 .......###T#####.....
+  y= 80 n=42 ........########.....
+  y= 81 n=34 ........######.......
+  y= 82 n=23 ........#####........
+  y= 83 n= 5 .........###.........`,
 		},
 	} {
 		t.Run(tc.config, func(t *testing.T) {
@@ -261,9 +276,21 @@ func TestCanopySilhouettesAreThePlacersOwn(t *testing.T) {
 	}
 }
 
-// canopySilhouette places one configured tree at a fixed spot in a one-chunk region
-// and renders every row that holds a leaf or a log: the leaf count in the 13x13
-// window plus the z-centre slice, where '#' is a leaf, 'T' a log and '.' air.
+// loadedChunks builds the 3x3 block of chunks a decoration region needs, so that a
+// test tree's cross-chunk writes land somewhere instead of being refused.
+func loadedChunks() []*Chunk {
+	var chunks []*Chunk
+	for cz := int32(-1); cz <= 1; cz++ {
+		for cx := int32(-1); cx <= 1; cx++ {
+			chunks = append(chunks, NewChunk(cx, cz, BiomePlains))
+		}
+	}
+	return chunks
+}
+
+// canopySilhouette places one configured tree at a fixed spot in a 3x3 region and
+// renders every row that holds a leaf: the leaf count in the 21x21 window plus the
+// z-centre slice, where '#' is a leaf, 'T' a log and '.' air.
 func canopySilhouette(t *testing.T, configName string) string {
 	t.Helper()
 	set, err := worldgen.LoadFeatureSet()
@@ -274,7 +301,7 @@ func canopySilhouette(t *testing.T, configName string) string {
 	if err != nil {
 		t.Fatalf("%s: %v", configName, err)
 	}
-	region, err := newDecorationRegion([]*Chunk{NewChunk(0, 0, BiomePlains)})
+	region, err := newDecorationRegion(loadedChunks())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,10 +319,10 @@ func canopySilhouette(t *testing.T, configName string) string {
 	}
 	out := []string{fmt.Sprintf("trunk=%d foliageHeight=%d foliageRadius=%d",
 		planter.trunkHeight, planter.foliageHeight, planter.foliageRadius)}
-	for y := trunkBase; y <= trunkBase+planter.trunkHeight+planter.foliageHeight+2; y++ {
+	for y := trunkBase; y <= trunkBase+planter.trunkHeight+planter.foliageHeight+8; y++ {
 		row := ""
 		leaves := 0
-		for dx := -6; dx <= 6; dx++ {
+		for dx := -10; dx <= 10; dx++ {
 			stateName, symbol := symbolize(planter.stateAt(8+dx, y, 8))
 			if symbol == "?" {
 				t.Fatalf("%s: cell (%d,%d,8) holds %q, which is neither air, log nor leaf", configName, 8+dx, y, stateName)
@@ -305,8 +332,8 @@ func canopySilhouette(t *testing.T, configName string) string {
 			}
 			row += symbol
 		}
-		for dx := -6; dx <= 6; dx++ {
-			for dz := -6; dz <= 6; dz++ {
+		for dx := -10; dx <= 10; dx++ {
+			for dz := -10; dz <= 10; dz++ {
 				if dz == 0 {
 					continue
 				}

@@ -33,6 +33,30 @@ import (
 // cell must not consume a provider draw, and the clay chain showed repeatedly that
 // one changed draw count moves every later position in the chunk.
 
+// drawFreeCell marks a cell whose processing must not consume a draw, because
+// vanilla refuses it before reaching any provider: a persistent leaf, or a position
+// that fails the placer's own skip test.
+//
+// The rule that a rejected cell is free is what keeps a tree's later positions - and
+// therefore every later feature in the chunk - stable. It is easy to break by
+// sampling a provider to find out whether the result would fit, and every breakage
+// shows up far away from where it was introduced.
+type drawFreeCell int
+
+const (
+	cellIsPlaceable drawFreeCell = iota
+	cellIsPersistentLeaf
+	cellIsSkippedByPlacer
+)
+
+// treePlacement is one recorded cell of TreeDecorator.Context, tagged so a decorator
+// that has to look at logs can ignore leaves without a second world query.
+type treePlacement struct {
+	x, y, z int
+	isLog   bool
+	draw    drawFreeCell
+}
+
 // treePlacer holds one tree: the region, the RNG, the parsed config, and the two
 // heights sampled before any block is written.
 type treePlacer struct {
@@ -40,6 +64,11 @@ type treePlacer struct {
 	set    *worldgen.FeatureSet
 	random worldgen.RandomSource
 	config worldgen.TreeFeatureConfig
+
+	// placements records what this tree wrote, in write order. TreeDecorator.Context
+	// rebuilds its logs and leaves lists from exactly this, and both AlterGround-
+	// Decorator and BeehiveDecorator read y values out of the lists.
+	placements []treePlacement
 
 	// trunkHeight, foliageHeight and foliageRadius are sampled in that order by
 	// TreeFeature.doPlace; the per-attachment offset comes after them, drawn once
@@ -55,7 +84,7 @@ type treePlacer struct {
 	heightAboveFoliage int // doPlace's (trunkHeight - foliageHeight), the foliageRadius argument
 }
 
-// newTreePlacer performs doPlace's sampling preamble, in doPlace's order, before a
+// sampleHeights performs doPlace's sampling preamble, in doPlace's order, before a
 // single block is written.
 func (t *treePlacer) sampleHeights() error {
 	height, err := t.trunkHeightFromPlacer()
@@ -197,8 +226,13 @@ func (t *treePlacer) isPersistentLeaf(x, y, z int) bool {
 //
 // The order is the whole point: the position tests run BEFORE
 // foliageProvider.getState, so a rejected cell never draws. Sampling first would
-// shift every later draw in the feature.
-func (t *treePlacer) placeLeaf(x, y, z int) (bool, error) {
+// shift every later draw in the feature. A cell the placer's own skip test refused
+// never even reaches tryPlaceLeaf, which is why it arrives as a tag rather than as a
+// world query.
+func (t *treePlacer) placeLeaf(x, y, z int, skip drawFreeCell) (bool, error) {
+	if skip != cellIsPlaceable {
+		return false, nil
+	}
 	if t.isPersistentLeaf(x, y, z) {
 		return false, nil
 	}
@@ -235,6 +269,9 @@ func (t *treePlacer) placeLeaf(x, y, z int) (bool, error) {
 		}
 	}
 	t.r.setBlock(x, y, z, state)
+	// TreeFeature$1.set records every leaf it writes, whether or not the world
+	// accepted it, and BeehiveDecorator reads the first of them.
+	t.placements = append(t.placements, treePlacement{x: x, y: y, z: z})
 	return true, nil
 }
 
@@ -248,10 +285,11 @@ func (t *treePlacer) placeLeavesRow(at trunkAttachment, radius, y int) error {
 	}
 	for dx := -radius; dx <= radius+extra; dx++ {
 		for dz := -radius; dz <= radius+extra; dz++ {
+			skip := cellIsPlaceable
 			if t.shouldSkipLocationSigned(dx, y, dz, radius, at.doubleTrunk) {
-				continue
+				skip = cellIsSkippedByPlacer
 			}
-			if _, err := t.placeLeaf(at.x+dx, at.y+y, at.z+dz); err != nil {
+			if _, err := t.placeLeaf(at.x+dx, at.y+y, at.z+dz, skip); err != nil {
 				return err
 			}
 		}
@@ -320,12 +358,20 @@ func (t *treePlacer) placeBelowTrunk(x, y, z int) error {
 		return nil
 	}
 	t.r.setBlock(x, y, z, state)
+	t.placements = append(t.placements, treePlacement{x: x, y: y, z: z, isLog: true})
 	return nil
 }
 
 // placeLogAt is TrunkPlacer.placeLog: validTreePos is tested before the trunk
 // provider is sampled, so a cell the trunk cannot grow through costs no draw.
 func (t *treePlacer) placeLogAt(x, y, z int) error {
+	return t.placeLogWithAxis(x, y, z, "")
+}
+
+// placeLogWithAxis is placeLog with the Function<BlockState,BlockState> argument,
+// which FancyTrunkPlacer uses to re-orient each log along its limb. A block without
+// an axis property is left alone, because the bytecode calls trySetValue.
+func (t *treePlacer) placeLogWithAxis(x, y, z int, axis string) error {
 	if !t.validTreePos(x, y, z) {
 		return nil
 	}
@@ -337,7 +383,26 @@ func (t *treePlacer) placeLogAt(x, y, z int) error {
 	if err != nil {
 		return err
 	}
+	if axis != "" {
+		name, ok := stateByID(state)
+		if !ok {
+			return fmt.Errorf("world: trunk provider returned unknown state %d", state)
+		}
+		if _, has := name.Properties["axis"]; has {
+			merged := map[string]string{}
+			for k, v := range name.Properties {
+				merged[k] = v
+			}
+			merged["axis"] = axis
+			if resolved, ok := nameToStateID(name.Name, merged); ok {
+				state = resolved
+			}
+		}
+	}
 	t.r.setBlock(x, y, z, state)
+	// The trunk placer's setter is the BiConsumer that fills Context's logs list, so
+	// every log - and the block under it - is part of what a decorator sees.
+	t.placements = append(t.placements, treePlacement{x: x, y: y, z: z, isLog: true})
 	return nil
 }
 
@@ -402,6 +467,12 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 		// A double trunk widens its rows through placeLeavesRow's extra column, and
 		// nothing else, so adding a radius here would square the canopy twice.
 		attachments = []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, doubleTrunk: true}}
+	case "minecraft:fancy_trunk_placer":
+		var err error
+		attachments, err = t.placeFancyTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("world: unimplemented trunk_placer %q for a tree being placed", t.config.TrunkPlacer.Type)
 	}
@@ -418,6 +489,193 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 		}
 	}
 	return nil
+}
+
+// fancyFoliageCoord is FancyTrunkPlacer.FoliageCoords: an attachment plus the y of
+// the trunk cell that branch started from. The pair travels together because
+// makeBranches draws the branch again after the canopy list has been filtered.
+type fancyFoliageCoord struct {
+	at         trunkAttachment
+	branchBase int
+}
+
+// placeFancyTrunk is FancyTrunkPlacer.placeTrunk - the curved oak that a third of
+// plains trees are, and the reason this file cannot stay blob-only.
+//
+// It works in doubles and in that order: two nextFloat draws per candidate branch,
+// one per (m) iteration, and the draws are consumed before makeLimb decides whether
+// the limb fits. treeShape's 0.3 cut then skips the lowest rows without drawing.
+func (t *treePlacer) placeFancyTrunk(x, y, z int) ([]trunkAttachment, error) {
+	const (
+		trunkHeightScale  = 0.618
+		clusterDensity    = 13.0
+		branchSlope       = 0.381
+		branchLengthMagic = 0.328
+	)
+	cluster := t.trunkHeight + 2
+	top := floorFloat64(float64(cluster) * trunkHeightScale)
+	if err := t.placeBelowTrunk(x, y-1, z); err != nil {
+		return nil, err
+	}
+	limbs := min(1, floorFloat64(1.382+math.Pow(float64(cluster)/clusterDensity, 2.0)))
+	limit := y + top
+
+	coords := []fancyFoliageCoord{{at: trunkAttachment{x: x, y: y + cluster - 5, z: z}, branchBase: limit}}
+	for row := cluster - 5; row >= 0; row-- {
+		shape := fancyTreeShape(cluster, row)
+		if shape < 0 {
+			continue
+		}
+		for limb := 0; limb < limbs; limb++ {
+			radius := float64(shape) * (float64(t.random.NextFloat()) + branchLengthMagic)
+			angle := float64(t.random.NextFloat()*2.0) * math.Pi
+			bx := x + floorFloat64(radius*math.Sin(angle)+0.5)
+			by := y + row - 1
+			bz := z + floorFloat64(radius*math.Cos(angle)+0.5)
+			ok, err := t.makeLimb(bx, by, bz, bx, by+5, bz, false)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			dx, dz := x-bx, z-bz
+			reach := float64(by) - math.Sqrt(float64(dx*dx+dz*dz))*branchSlope
+			base := int(reach)
+			if reach > float64(limit) {
+				base = limit
+			}
+			ok, err = t.makeLimb(x, base, z, bx, by, bz, false)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			coords = append(coords, fancyFoliageCoord{at: trunkAttachment{x: bx, y: by, z: bz}, branchBase: base})
+		}
+	}
+
+	// The trunk itself, drawn last of the unbranching limbs and with its result
+	// discarded: makeLimb's return value only matters to the branch tests.
+	if _, err := t.makeLimb(x, y, z, x, y+top, z, true); err != nil {
+		return nil, err
+	}
+	for _, c := range coords {
+		if c.at.x == x && c.at.y == c.branchBase && c.at.z == z {
+			continue
+		}
+		if !t.trimFancyBranches(cluster, c.branchBase-y) {
+			continue
+		}
+		if _, err := t.makeLimb(x, c.branchBase, z, c.at.x, c.at.y, c.at.z, true); err != nil {
+			return nil, err
+		}
+	}
+	var out []trunkAttachment
+	for _, c := range coords {
+		if t.trimFancyBranches(cluster, c.branchBase-y) {
+			out = append(out, c.at)
+		}
+	}
+	return out, nil
+}
+
+// makeLimb is FancyTrunkPlacer.makeLimb: a line rasterised in unit steps. With
+// adjustRadius it paints each step through placeLog and so can never fail; without
+// it, it is a pure probe that stops at the first cell the tree cannot occupy.
+func (t *treePlacer) makeLimb(fromX, fromY, fromZ, toX, toY, toZ int, adjustRadius bool) (bool, error) {
+	if !adjustRadius && fromX == toX && fromY == toY && fromZ == toZ {
+		return true, nil
+	}
+	dx, dy, dz := toX-fromX, toY-fromY, toZ-fromZ
+	steps := max(abs(dx), max(abs(dy), abs(dz)))
+	// steps can be 0 only when the endpoints coincide, which the guard above has
+	// already handled for the probe case. For a painting limb it has not: Java
+	// divides by zero there, and Mth.floor turns NaN into 0, so the single step
+	// lands on the origin.
+	var fx, fy, fz float32
+	if steps > 0 {
+		fx, fy, fz = float32(dx)/float32(steps), float32(dy)/float32(steps), float32(dz)/float32(steps)
+	}
+	for i := 0; i <= steps; i++ {
+		px := fromX + floorFloat32(0.5+float32(i)*fx)
+		py := fromY + floorFloat32(0.5+float32(i)*fy)
+		pz := fromZ + floorFloat32(0.5+float32(i)*fz)
+		if !adjustRadius {
+			if !t.isFree(px, py, pz) {
+				return false, nil
+			}
+			continue
+		}
+		if err := t.placeLogWithAxis(px, py, pz, fancyLogAxis(fromX, fromZ, px, pz)); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// fancyLogAxis is getLogAxis: whichever horizontal axis moved further, or Y when the
+// limb is vertical.
+func fancyLogAxis(fromX, fromZ, toX, toZ int) string {
+	dx, dz := abs(toX-fromX), abs(toZ-fromZ)
+	if max(dx, dz) == 0 {
+		return "y"
+	}
+	if dx == max(dx, dz) {
+		return "x"
+	}
+	return "z"
+}
+
+// trimFancyBranches is trimBranches: a branch whose base sits below 20% of the
+// cluster height is dropped, both from the redraw and from the canopy list.
+func (t *treePlacer) trimFancyBranches(cluster, offset int) bool {
+	return float64(offset) >= float64(cluster)*0.2
+}
+
+// fancyTreeShape is treeShape: the trunk is a circle segment, and rows below the
+// 0.3 cut are refused with -1 rather than 0, which is what distinguishes "do not
+// even draw" from "draw nothing".
+func fancyTreeShape(cluster, row int) float32 {
+	if float32(row) < float32(cluster)*0.3 {
+		return -1
+	}
+	f := float32(cluster) / 2.0
+	g := f - float32(row)
+	h := float32(math.Sqrt(float64(f*f - g*g)))
+	switch {
+	case g == 0:
+		h = f
+	case absF32(g) >= f:
+		return 0
+	}
+	return h * 0.5
+}
+
+func absF32(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// floorFloat64 is Mth.floor(double), same truncating-and-saturating cast as the
+// float case.
+func floorFloat64(v float64) int {
+	switch {
+	case math.IsNaN(v):
+		return 0
+	case math.IsInf(v, 1), v >= math.MaxInt32:
+		return math.MaxInt32
+	case math.IsInf(v, -1), v <= math.MinInt32:
+		return math.MinInt32
+	}
+	i := int(v)
+	if v < 0 {
+		i--
+	}
+	return i
 }
 
 func (t *treePlacer) foliagePlacerOffset() (int, error) {
