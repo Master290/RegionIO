@@ -61,7 +61,7 @@ world has been generated and cached.
 go test ./...
 # internal/world alone is 18.4 min under -race; the module is 18.6 wall.
 go test -race -timeout 30m ./...
-# or run build, vet, ordinary tests, and race tests:
+# or run build, vet, ordinary tests, race tests, and the gated diagnostics:
 make verify
 
 # strict block/biome comparison; requires a fixture generated with Java 25:

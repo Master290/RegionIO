@@ -59,4 +59,9 @@ clay-index-sweep:
 	  echo; \
 	done
 
-verify: build vet test test-race
+# diagnostics is in here because CI runs it as its own job: a gated probe that
+# only ever runs by hand is a probe that rots, and the last time that happened the
+# private copy had already dropped two draw-consuming feature types while still
+# reporting what the decoration stream "really" did. Keeping it out of `verify`
+# would mean a diagnostic can break locally and only be caught by the pipeline.
+verify: build vet test test-race diagnostics
