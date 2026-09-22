@@ -9,8 +9,10 @@ vet:
 test:
 	go test ./...
 
-# Re-measured after the surface-decoration port: internal/world's test binary takes
-# 1649.759s (27.5 minutes) under -race and the whole command 27m37s wall, because the
+# Re-measured after the surface-decoration port, and again after dark oaks landed:
+# internal/world's test binary takes 1656.932s (27.6 minutes) under -race - it was
+# 1649.759s before the new placers, so growing the forests costs about seven seconds -
+# and the whole command 27m46s wall, because the
 # packages run concurrently rather than summing. The bound is per binary, so 30m still
 # passes - with two and a half minutes of slack on the dominant package.
 #

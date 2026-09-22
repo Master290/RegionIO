@@ -52,8 +52,9 @@ jobs:
       # Density-based world tests are intentionally exhaustive and race adds
       # substantial overhead; keep the package timeout above the normal 10m.
       # Measured locally, on the same hardware as the self-hosted runner: after the
-      # surface-decoration port internal/world's binary takes 1649.759s - 27.5 minutes -
-      # under -race, and the whole command 27m37s wall, since packages run concurrently
+      # surface-decoration port internal/world's binary takes 1656.932s - 27.6 minutes -
+      # under -race (1649.759s before dark oaks landed, so the new forests cost about
+      # seven seconds), and the whole command 27m46s wall, since packages run concurrently
       # rather than summing. The bound is per binary, so 30m passes with two and a half
       # minutes of slack. That slack is the reason this comment carries a number: the
       # measurement quoted here was 18.4 minutes before this branch, the 20m bound before
