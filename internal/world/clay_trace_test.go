@@ -1629,23 +1629,6 @@ func TestTracePatchAtMinusSeven(t *testing.T) {
 				})
 				if scheduled.Name == "minecraft:lush_caves_vegetation" {
 					t.Logf("LUSH_CAVES_VEG scheduled.Index = %d, vegetationStage = %d", scheduled.Index, vegetationStage)
-					dumpFile, dErr := os.Create(`C:\Users\Daniar\.gemini\antigravity-ide\brain\500e386d-0a40-4d2c-b0ad-5e96e2b7c82d\scratch\chunks_before_veg.bin`)
-					if dErr == nil {
-						binary.Write(dumpFile, binary.BigEndian, int32(len(r.chunks)))
-						for _, ch := range r.chunks {
-							binary.Write(dumpFile, binary.BigEndian, ch.X)
-							binary.Write(dumpFile, binary.BigEndian, ch.Z)
-							for y := 0; y < 384; y++ {
-								for z := 0; z < 16; z++ {
-									for x := 0; x < 16; x++ {
-										st := ch.GetBlock(x, y-64, z)
-										binary.Write(dumpFile, binary.BigEndian, uint16(st))
-									}
-								}
-							}
-						}
-						dumpFile.Close()
-					}
 					clayID, _ := nameToStateID("minecraft:clay", nil)
 					t.Logf("CLAY ID: %d, isFaceSturdy(clay)=%v, canOcclude=%v, opacity=%d",
 						clayID, isFaceSturdy(clayID), stateFlags(clayID)&flagCanOcclude != 0, lightOpacity(clayID))

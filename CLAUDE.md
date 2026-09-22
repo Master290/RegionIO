@@ -267,6 +267,13 @@ the schedule 41 times; `make clay-index-sweep` is its driver, and
 instead. The rule worth keeping: a diagnostic whose finding matters should end up asserted, not
 merely printed - a `t.Logf` no one diffs silently survives the thing it was written to detect.
 
+One more convention, because a machine-local path did get committed once. A diagnostic must not
+name one: write to `t.TempDir()`, or to a repo path that `.gitignore` already carries
+(`internal/world/testdata/cave_box.txt` is the existing example, listed at `.gitignore:41`), or
+best of all log instead of writing. The failure mode is not litter but silence - a dump guarded by
+`if err == nil` to a personal scratch directory simply stops doing anything on another machine,
+and reads as if it ran.
+
 Beyond the always-on tests, `internal/world` carries env-gated diagnostics for hunting the residual
 parity gap (all skip unless the variable is set): `REGIONIO_REGION_ORE_DIAGNOSTIC=1` compares the
 legacy / center-only / region-replay ore paths per state, and
