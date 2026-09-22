@@ -1,12 +1,13 @@
 package world
 
-// features.go places procedural worldgen features beyond trees: ore veins
-// underground, biome-gated surface flora (flowers, dead bushes, cacti), and
-// scattered rocks/boulders. Each placement is deterministic per chunk via the
-// shared chunkRand PRNG, and block-state IDs are resolved at runtime through the
-// embedded blocks.json table (nameToStateID), so no IDs are hardcoded.
-//
-// These run after terrain+surface+biomes are filled, called from decorate.
+// features.go holds the legacy per-chunk ore scatter. Surface flora, cacti and
+// boulders used to live here as percentages against a random number - ~4% of grass
+// columns get a flower, ~3% of sand gets a cactus, ~2% of a windswept column gets a
+// stone cluster - and none of those three shapes exists in the vanilla datapack, which
+// places flora through simple_block, block_column and block_blob features at scheduled
+// indices with the chunk's decoration seed. They are gone rather than kept alongside:
+// the region generator replays the datapack features, and the legacy generator no
+// longer decorates a surface at all.
 
 // oreSpec describes one ore type's placement envelope.
 type oreSpec struct {
@@ -81,142 +82,6 @@ func placeOreBlob(c *Chunk, ore uint16, n int, lx, y, lz int, r *chunkRand) {
 			z++
 		case 5:
 			z--
-		}
-	}
-}
-
-// biomeFlowers maps a biome name to the flower blocks that can spawn on its
-// grassy surface. Empty/absent = no flowers. Names resolve to IDs at runtime.
-var biomeFlowers = map[string][]string{
-	"minecraft:plains":           {"minecraft:dandelion", "minecraft:poppy", "minecraft:azure_bluet", "minecraft:cornflower", "minecraft:oxeye_daisy"},
-	"minecraft:sunflower_plains": {"minecraft:dandelion", "minecraft:poppy", "minecraft:sunflower"},
-	"minecraft:forest":           {"minecraft:dandelion", "minecraft:poppy", "minecraft:lily_of_the_valley"},
-	"minecraft:flower_forest":    {"minecraft:dandelion", "minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet", "minecraft:red_tulip", "minecraft:white_tulip", "minecraft:oxeye_daisy", "minecraft:cornflower"},
-	"minecraft:birch_forest":     {"minecraft:dandelion", "minecraft:poppy"},
-	"minecraft:meadow":           {"minecraft:dandelion", "minecraft:poppy", "minecraft:cornflower", "minecraft:allium"},
-}
-
-// placeFlora scatters biome-appropriate small plants on grassy surface columns.
-// Grass columns (grass[lx][lz]==true) receive a flower with low probability; the
-// per-column biome gates which flower set applies.
-func placeFlora(c *Chunk, r *chunkRand, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
-	for lx := 0; lx < 16; lx++ {
-		for lz := 0; lz < 16; lz++ {
-			if !grass[lx][lz] {
-				continue
-			}
-			// ~4% chance per grass column — sparse, like vanilla plains.
-			if r.next()%100 >= 4 {
-				continue
-			}
-			flowers := biomeFlowers[biomeName[lx][lz]]
-			if len(flowers) == 0 {
-				continue
-			}
-			y := MinY + surfTop[lx][lz] + 1
-			if c.GetBlock(lx, y, lz) != StateAir {
-				continue
-			}
-			if flower, ok := nameToStateID(flowers[int(r.next())%len(flowers)], nil); ok {
-				c.SetBlock(lx, y, lz, flower)
-			}
-		}
-	}
-}
-
-// placeDesertFeatures places cacti and dead bushes in arid biomes. Cacti are
-// 1-3 tall columns; dead bushes are single blocks. Both go on sand, so they use
-// the surface block check rather than the grass flag.
-func placeDesertFeatures(c *Chunk, r *chunkRand, surfTop *[16][16]int, biomeName *[16][16]string) {
-	for lx := 1; lx < 15; lx++ {
-		for lz := 1; lz < 15; lz++ {
-			b := biomeName[lx][lz]
-			if b != "minecraft:desert" && b != "minecraft:desert_lakes" && b != "minecraft:badlands" {
-				continue
-			}
-			topY := MinY + surfTop[lx][lz]
-			if c.GetBlock(lx, topY, lz) != StateSand {
-				continue
-			}
-			// ~3% chance per eligible column.
-			if r.next()%100 >= 3 {
-				continue
-			}
-			if b == "minecraft:desert" || b == "minecraft:desert_lakes" {
-				placeCactus(c, lx, topY+1, lz, r)
-			}
-			if b == "minecraft:badlands" {
-				placeDeadBush(c, lx, topY+1, lz)
-			}
-		}
-	}
-}
-
-// placeCactus writes a 1-3 tall cactus column on top of the surface.
-func placeCactus(c *Chunk, lx, baseY, lz int, r *chunkRand) {
-	cactus, ok := nameToStateID("minecraft:cactus", nil)
-	if !ok {
-		return
-	}
-	h := 1 + int(r.next()%3)
-	for i := 0; i < h; i++ {
-		c.SetBlock(lx, baseY+i, lz, cactus)
-	}
-}
-
-// placeDeadBush writes a single dead_bush on the surface.
-func placeDeadBush(c *Chunk, lx, baseY, lz int) {
-	db, ok := nameToStateID("minecraft:dead_bush", nil)
-	if !ok {
-		return
-	}
-	c.SetBlock(lx, baseY, lz, db)
-}
-
-// placeRocks scatters small cobblestone/granite/diorite/andesite boulders on the
-// surface in windswept/mountain biomes. A boulder is a 2-3 block cluster sitting
-// on grass.
-func placeRocks(c *Chunk, r *chunkRand, surfTop *[16][16]int, grass *[16][16]bool, biomeName *[16][16]string) {
-	for lx := 2; lx < 14; lx++ {
-		for lz := 2; lz < 14; lz++ {
-			if !grass[lx][lz] {
-				continue
-			}
-			b := biomeName[lx][lz]
-			if b != "minecraft:windswept_hills" && b != "minecraft:windswept_forest" &&
-				b != "minecraft:windswept_gravelly_hills" && b != "minecraft:stony_peaks" {
-				continue
-			}
-			// ~2% chance per eligible column.
-			if r.next()%100 >= 2 {
-				continue
-			}
-			placeBoulder(c, lx, MinY+surfTop[lx][lz]+1, lz, r)
-		}
-	}
-}
-
-// placeBoulder writes a small 2-3 block cluster of stone-family blocks.
-func placeBoulder(c *Chunk, lx, baseY, lz int, r *chunkRand) {
-	rocks := []string{"minecraft:cobblestone", "minecraft:granite", "minecraft:diorite", "minecraft:andesite"}
-	block, ok := nameToStateID(rocks[int(r.next())%len(rocks)], nil)
-	if !ok {
-		return
-	}
-	n := 2 + int(r.next()%2)
-	x, yy, z := lx, baseY, lz
-	for i := 0; i < n; i++ {
-		if c.GetBlock(x, yy, z) == StateAir {
-			c.SetBlock(x, yy, z, block)
-		}
-		// Grow up/sideways into air.
-		switch r.next() % 3 {
-		case 0:
-			yy++
-		case 1:
-			z++
-		case 2:
-			x++
 		}
 	}
 }

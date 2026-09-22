@@ -1,6 +1,7 @@
 package world
 
 import (
+	"fmt"
 	"math"
 	"strings"
 
@@ -14,7 +15,9 @@ type geodePoint struct {
 	offset  int
 }
 
-// placeScheduledGeodes replays the stage-2 amethyst geode feature. The layer
+// placeScheduledGeodes replays the features of index 2, which the pack fills with the
+// amethyst geodes plus the surface's local modifications - forest_rock's boulders, the
+// large dripstone of carver-exposed caverns, and the frozen-ocean icebergs. The layer
 // calculation follows GeodeFeature.place: sampled distance points are combined
 // with vanilla normal-noise perturbation, then the nearest layer threshold
 // selects filling, inner, middle, or outer material.
@@ -38,17 +41,40 @@ func (r *decorationRegion) placeScheduledGeodes(seed int64) error {
 			continue
 		}
 		configured, ok := set.Configured[placed.Feature]
-		if !ok || configured.Type != "minecraft:geode" {
+		if !ok {
+			continue
+		}
+		// This step holds both the geodes and the boulders, so the walk dispatches on
+		// the configured type and counts whatever it cannot place. It used to continue
+		// on anything that was not a geode, which is how forest_rock stayed invisible
+		// while a hand-written boulder heuristic placed a different shape instead.
+		switch configured.Type {
+		case "minecraft:geode":
+		case "minecraft:block_blob":
+		default:
+			noteNotReplayed(fmt.Sprintf("stage%d:%s", geodesStage, configured.Type))
+			continue
+		}
+		random.SetFeatureSeed(decorationSeed, scheduled.Index, geodesStage)
+		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
+			return r.biomeAllowsFeature(set, scheduled.Name, geodesStage, position)
+		})
+		if configured.Type == "minecraft:block_blob" {
+			blob, err := set.BlockBlob(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				return r.placeBlockBlob(set, random, position, blob)
+			}); err != nil {
+				return err
+			}
 			continue
 		}
 		config, err := set.Geode(placed.Feature)
 		if err != nil {
 			return err
 		}
-		random.SetFeatureSeed(decorationSeed, scheduled.Index, geodesStage)
-		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
-			return r.biomeAllowsFeature(set, scheduled.Name, geodesStage, position)
-		})
 		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 			r.placeGeode(random, seed, position, config, set)
 			return nil

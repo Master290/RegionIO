@@ -1103,6 +1103,34 @@ func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig,
 	return config, nil
 }
 
+// BlockBlobFeatureConfig is the block_blob configuration: the one state to paint and
+// the predicate that says the blob has found ground it may sit on. There is no radius,
+// size or provider list, which is why the feature is small enough to port exactly.
+type BlockBlobFeatureConfig struct {
+	State      BlockState      `json:"state"`
+	CanPlaceOn json.RawMessage `json:"can_place_on"`
+}
+
+// BlockBlob decodes a block_blob configured feature - forest_rock, the mossy
+// cobblestone boulder of old-growth taiga and a few other biomes.
+func (s *FeatureSet) BlockBlob(name string) (BlockBlobFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:block_blob" {
+		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block blob feature", name)
+	}
+	var config BlockBlobFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.State.Name == "" {
+		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: %s has a block blob without a state", name)
+	}
+	if len(config.CanPlaceOn) == 0 {
+		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: %s has a block blob without can_place_on", name)
+	}
+	return config, nil
+}
+
 func (s *FeatureSet) SimpleBlock(name string) (SimpleBlockFeatureConfig, error) {
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:simple_block" {

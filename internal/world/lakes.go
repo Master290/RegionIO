@@ -23,7 +23,11 @@ import (
 // fluid line, fluid below), and the stone barrier pass whose upper edge
 // cells roll nextInt(2) before the solid check.
 
-const localModificationsStage = 1
+// lakesStage is index 1 of a biome's feature list: the step that holds the lava lakes.
+// It was called localModificationsStage until now, which named a different step and
+// read as though this walk covered the boulders and dripstone that live at index 2.
+// Only the name was wrong, so no output moved.
+const lakesStage = 1
 
 // lakeFeatureConfig is the resolved LakeFeature.Configuration: the fluid the
 // lower half fills with and the barrier state the rim is lined with.
@@ -49,7 +53,7 @@ func (r *decorationRegion) placeScheduledLakes(seed int64) error {
 	if err := r.ensureSourceNeighborhood(); err != nil {
 		return err
 	}
-	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), localModificationsStage)
+	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), lakesStage)
 	if err != nil {
 		return err
 	}
@@ -71,9 +75,9 @@ func (r *decorationRegion) placeScheduledLakes(seed int64) error {
 		if err != nil {
 			return fmt.Errorf("world: lake feature %s: %w", placed.Feature, err)
 		}
-		random.SetFeatureSeed(decorationSeed, scheduled.Index, localModificationsStage)
+		random.SetFeatureSeed(decorationSeed, scheduled.Index, lakesStage)
 		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
-			return r.biomeAllowsFeature(set, scheduled.Name, localModificationsStage, position)
+			return r.biomeAllowsFeature(set, scheduled.Name, lakesStage, position)
 		})
 		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 			placeLake(r, random, position.X, position.Y, position.Z, config, lakeCannotReplace, lavaPoolStone)
@@ -222,4 +226,3 @@ func placeLake(r *decorationRegion, random worldgen.RandomSource, ox, oy, oz int
 	}
 	return true
 }
-

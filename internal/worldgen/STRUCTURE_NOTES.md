@@ -1555,3 +1555,53 @@ fixture did not move: 330 residual cells, clay 96/22/9, ore parity zero. Still
 un-replayed and now counted rather than silent: `dark_oak_foliage_placer` (32 times
 across those four chunks, from a neighbouring forest), `fallen_tree` (1), the mushroom
 selectors (7).
+
+## Surface decoration, part 3: springs were never replayed, and flora was a percentage
+
+Three things this pass settled by reading the jar rather than the code.
+
+**`fluid_springs` is index 8 of the biome feature list, and the region walk did not
+cover it.** The region replayed indices 1, 2, 3, 6 and 9; the per-chunk path replayed
+springs on its own. So the two generators were not two implementations of the same
+decoration - one of them simply had no springs. Springs now come from the schedule,
+seeded `SetFeatureSeed(decorationSeed, index, 8)` like every other stage, and
+`TestStage8ScheduleGolden` pins the pair `spring_water`, `spring_lava` for plains and
+lush caves so a re-indexing cannot move them quietly.
+
+**`SpringFeature.place` reads the cell the spring would fill.** It must be air or one of
+`valid_blocks`, and it is then *not* counted - rock and holes are two independent counts
+over the same five cells (west, east, north, south, below). The chunk-local version had
+no self-cell test, so a spring could open inside standing water. Its other divergence
+was the border: the loop returned as soon as a neighbour fell outside the chunk's own 16
+columns, which suppressed every seam-straddling rock column on one side. Reads are
+region reads now; `decorationRegion.setBlock` still clips the write.
+
+**`block_blob` is eighteen draws, and index 2 was silently dropping it.**
+`BlockBlobFeature.place` walks down until `can_place_on` answers for the cell below, then
+runs three rows, each drawing three `nextInt(2)` to size the box and three more to step
+the centre afterwards - the step happens on the last row too, before the feature returns.
+`TestBlockBlobSpendsEighteenDraws` counts them through a wrapping random source, because
+the number is the thing that matters and it is not derivable from the config.
+`forest_rock` (mossy cobblestone) sits at index 2 beside the geodes, and the stage-2 walk
+tested `configured.Type != "minecraft:geode"` and continued - so boulders, large dripstone
+and the frozen-ocean icebergs were all invisible there. The walk now dispatches on the
+type and counts what it cannot place; that is how `large_dripstone=18` over the four land
+chunks became visible in this commit rather than staying a gap nobody named.
+
+**The flora heuristics had no vanilla counterpart at all.** `placeFlora` took ~4% of
+grassy columns and picked from a hard-coded flower list; `placeDesertFeatures` took ~3% of
+sand columns; `placeRocks` scattered 2-3 stone-family blocks at ~2% of windswept columns.
+Vanilla places that surface through `simple_block` (32 of them, including `flower_plains`,
+`patch_grass_plain`, `patch_tall_grass_2`, the mushrooms and `patch_fire`),
+`block_column` (8: cactus, sugar cane, pumpkin, bamboo) and `block_blob` - all of which
+were already replayed at their scheduled index with the chunk's decoration seed. Both the
+heuristics and their call sites are deleted rather than left dormant. Removing them
+improved the land fixture by 11 cells (390,100 to 390,111) and the surface band by 11
+(1,339 to 1,328); the ocean fixture stayed at 330 residual cells with clay 96/22/9 and ore
+parity zero, and the legacy generator - used now by `cmd/gendump` and comparison only -
+no longer decorates a surface.
+
+One honest negative: the four land chunks contain **no mossy cobblestone in vanilla at
+all**, so `forest_rock`'s replay is mechanically correct and unconfirmed by this fixture -
+it paints two cells vanilla does not have. A capture of a windswept or old-growth column
+that actually holds a boulder is what would settle it.
