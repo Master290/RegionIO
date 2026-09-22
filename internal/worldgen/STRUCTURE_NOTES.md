@@ -1094,3 +1094,29 @@ the candidate. That is why it survived every pass over the patch code: the
 positions are decided by how many columns an earlier pool accepted, and that number
 is decided by neighbours writing into the source's own chunk. Any future
 "the scan must be wrong" instinct should be checked against this table first.
+
+E2 - invert our `environment_scan` over all 321 start Y on vanilla's column, taken
+from the no-clay capture, and see whether vanilla's landing is reachable - was
+attempted and does not work, for a reason worth writing down before anyone retries
+it. Its premise is that the differential capture is the state the scan saw. It is
+not. A placed feature with `count: 62` runs its candidates in sequence, so every
+pool after the first in a column scanned terrain its own chain had already altered,
+and removing the whole feature removes exactly that: the capture is vanilla's world
+with the chain's contribution deleted, which is no moment the chain actually saw.
+Compounding it, the no-clay capture is not clay-free - `(-16, -21, -16)` is
+`minecraft:clay` in it - because other features place clay too.
+
+The symptom is that the answer tracks the definition rather than the scan, and three
+variants make that concrete. Over every clay cell in the plain capture, treating the
+lowest clay of a run as the scanned floor: 0 reachable, 2063 unreachable, 167
+candidates that were not solid and so were never targets. Same universe, floor moved
+down one cell: 35 reachable, 2194 unreachable. Over the differential universe with
+the first definition, which is the correct reading of "pool clay": 1 reachable of
+349. Two one-cell changes of interpretation move the verdict by two orders of
+magnitude, so the number measures the probe's assumption about where a pool floor
+is, not the scan. An experiment whose answer is that sensitive to an assumption it
+cannot check is not measuring the thing it names. So (d) is closed the way a scan
+can actually be closed: `TestEnvironmentScanMatchesVanillaControlFlow` compares the
+port against the disassembly of `EnvironmentScanPlacement.getPositions` on columns
+built for the purpose, where the expected landing is known rather than inferred
+from a capture.
