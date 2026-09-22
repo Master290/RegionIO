@@ -24,14 +24,16 @@ parity:
 # Compile every test binary, then run the env-gated worldgen diagnostics. The
 # first half is the point: `go build ./...` never compiles _test.go files, and
 # debug instrumentation left in internal/world has twice broken the build in a
-# way `make verify` did not see until a package failed to compile.
+# way the plain build could not see. (`go build ./...` never touches _test.go
+# files, so this is the only step in `verify` that compiles them.)
 #
 # The last two lines run the probe's causal modes, not just its default path:
 # SKIP deletes a predecessor's whole contribution and STATE digests the world the
 # probed feature is about to read. Together they are what produced the "which
 # chunks does a removal actually change" table, and a mode nothing runs rots the
-# way the probe's private dispatch copy already did. These are printf diagnostics
-# - `TestVanillaLushClayDiff` and `TestVanillaBlockParity` are what assert.
+# way the probe's private dispatch copy already did. The modes themselves only
+# print; the conclusions they produced are asserted by TestLushClayPositionsAreRecorded
+# and the parity and clay fixtures, which is why they are safe to run here.
 diagnostics:
 	go test -run TestNothingMatchesThis ./...
 	REGIONIO_CLAY_TRACE=1 REGIONIO_LUSH_CLAY_PROBE=1 \
