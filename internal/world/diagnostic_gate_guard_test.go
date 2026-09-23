@@ -90,6 +90,11 @@ var excusedGates = map[string]string{
 	"REGIONIO_LUSH_CLAY_PROBE_EXTRA_SOURCES": "a knob of the task-8 experiment, replaying sources outside the 3x3; the always-on position table asserts what it showed",
 	"REGIONIO_LUSH_CLAY_PROBE_CLAY_IN":       "an ad-hoc census knob of the same probe, whose permanent form is the clay ratchet in TestVanillaLushClayDiff",
 	"REGIONIO_LUSH_CLAY_PROBE_SKIP":          "a causal mode of the gated probe, set by the Makefile and CI under the names listed there",
+	// Not a diagnostic that nothing runs: the sweep it filters is run by the
+	// diagnostics job in full, and this name only narrows which arms a person
+	// re-measures by hand, so setting it in automation would ask CI to do the
+	// same work less completely than it already does.
+	"REGIONIO_DECORATION_ORDER_ARM": "an arm filter for TestDecorationSourceOrderParity, whose enabling gate REGIONIO_DECORATION_ORDER_DIAGNOSTIC is set by the Makefile and CI; the job runs every arm, so naming one in automation would only run a subset",
 	// Fixture paths and capture parameters: a tool flag or an optional fixture
 	// location rather than a diagnostic gate.
 	"REGIONIO_BASE_CAPTURE":     "path to an optional base-terrain capture; the test that reads it skips when the file is absent",

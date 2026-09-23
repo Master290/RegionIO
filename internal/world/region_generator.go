@@ -116,9 +116,23 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 		sources = decorationSources
 	}
 	return func(targetX, targetZ int32) *Chunk {
-		chunks := make([]*Chunk, 0, 25)
-		for cx := targetX - 2; cx <= targetX+2; cx++ {
-			for cz := targetZ - 2; cz <= targetZ+2; cz++ {
+		// The base window is sized from the sources actually going to be replayed, plus
+		// one ring: every source needs its own 3x3 for the biome-set gather
+		// ensureSourceNeighborhood checks, and for today's nine sources that is exactly
+		// the radius-two window this function has always built - so the default order
+		// changes nothing. A wider source set grows the window by the same rule rather
+		// than by an unrelated constant.
+		order := sources(targetX, targetZ)
+		radius := 1
+		for _, s := range order {
+			if d := max(abs(int(s.X-targetX)), abs(int(s.Z-targetZ))); d > radius {
+				radius = d
+			}
+		}
+		edge := int32(radius + 1)
+		chunks := make([]*Chunk, 0, (2*edge+1)*(2*edge+1))
+		for cx := targetX - edge; cx <= targetX+edge; cx++ {
+			for cz := targetZ - edge; cz <= targetZ+edge; cz++ {
 				key := [2]int32{cx, cz}
 				base := terrain.get(key, func() *Chunk {
 					return generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz)
@@ -130,7 +144,7 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 		if err != nil {
 			panic("world: creating decoration region: " + err.Error())
 		}
-		if err := region.replayScheduledOresWithSources(od, seed, targetX, targetZ, sources(targetX, targetZ)); err != nil {
+		if err := region.replayScheduledOresWithSources(od, seed, targetX, targetZ, order); err != nil {
 			panic("world: replaying region ores: " + err.Error())
 		}
 		target := region.chunks[[2]int32{targetX, targetZ}]

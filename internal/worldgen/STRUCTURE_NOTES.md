@@ -1894,3 +1894,57 @@ region shared by the batch instead of re-deriving it once per target, which also
 order. That is an architectural change and it is the honest content of task 8 now; the
 function's comment carries the measurement and the refuted justification so nobody has to
 re-derive either.
+
+## Task 8 follow-up: the wide window was measured too, and it is not a win either
+
+Task 8 left one alternative alive - replay the origins at Chebyshev 2 rather than 1, so a
+feature whose blocks cross a border can arrive from the source that vanilla actually
+decorated. That is now measured rather than argued, because the order parameter made it a
+configuration of the same generator instead of a refactor: the base window derives its size
+from the source set (`radius + 1`), which for today's nine sources is exactly the
+radius-two window it always had, so the default path is byte-identical (ocean 392,886,
+land 390,767).
+
+Exact cells out of 393,216, seven arms, both captures:
+
+| arm | ocean | land | total |
+|---|---|---|---|
+| current (hybrid, 9 sources) | 392,886 | 390,767 | 783,653 |
+| target-first everywhere (9) | 392,641 | 390,767 | 783,408 |
+| row-major everywhere (9) | 392,303 | 389,671 | 781,974 |
+| column-major everywhere (9) | 392,199 | 389,653 | 781,852 |
+| wide row-major (25) | 392,131 | 389,723 | 781,854 |
+| wide target-first (25) | 392,625 | **390,802** | 783,427 |
+| wide hybrid (25) | 392,764 | **390,802** | 783,566 |
+
+Two things worth keeping from this. The predicted mechanism is real: at target (0,1) the
+mismatch count falls 58 -> 46 under a wide window, which is the cross-border clay pool
+that the widened lush-caves probe had already recovered 12 of its 20 anchors from, and no
+per-target order over nine sources can reach it. And the land chunks genuinely prefer the
+wide window - 390,767 -> 390,802, +35 cells, deep band 700 -> 656.
+
+But the same extra origins write into chunks that were already right: at (0,0) the count
+goes 78 -> 180 and at (-1,-1) 104 -> 146, so ocean loses 122 cells and the sum of both
+captures is 87 cells worse than the model today. No arm is Pareto-better on both
+captures, so production keeps the nine-source hybrid and the wide arms stay in
+`TestDecorationSourceOrderParity` as a re-runnable measurement - if some other gap (the
+waterline writer of task 20, the decorated-tree count of task 17) turns out to be what
+made (0,0) fragile under a wide window, the arm that loses today is the arm to re-check,
+and it costs one environment variable to find out.
+
+One caution about what this experiment did and did not test, because the loss is easy to
+read as a verdict on H4 and it is not. Origins at Chebyshev 2 cannot write into the target
+at all - `ensureCanWrite` bounds a source to Chebyshev 1 from itself - so the extra 16
+cannot be harming (0,0) directly. What they do is decorate (0,0)'s ring-1 neighbours
+*differently*, and those neighbours are themselves replayed inside this same target's
+region, so a ring-1 chunk's state when (0,0)'s pass reads it no longer matches the state
+that chunk had in the nine-source run that reproduced the capture. That is the
+re-derivation problem, which is the one thing H4 removes and this arm keeps. So the fair
+summary is: widening the window under per-target replay is harmful, which is evidence about
+the combination, not against single history.
+
+Harness corrections made while doing this, because both would have produced readable but
+wrong numbers: the per-chunk column was labelled `vs-current` while printing the count
+against vanilla, and the arm filter let a run skip the `current` reference, after which
+every arm reported "0 cells changed versus current" - a zero that looks like agreement
+rather than like a missing baseline. `current` now always runs.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +27,61 @@ var decorationOrderArms = []struct {
 	{"target-first", orderTargetFirst},
 	{"row-major", orderRowMajor},
 	{"column-major", orderColumnMajor},
+	// The task-8 arms: replay the origins at Chebyshev 2 as well, so a feature whose
+	// writes cross a border can arrive from the source that vanilla decorated, instead
+	// of only from the nine centers adjacent to the target.
+	{"wide-row-major", orderWideRowMajor},
+	{"wide-target-first", orderWideTargetFirst},
+	// The arm that has not been ruled out: the wide window where the extra origins
+	// recover cross-border clay, combined with the fitted order only on the two chunks
+	// it was fitted to. Current wins ocean, wide-target-first wins land; this is the
+	// only shape that can win both.
+	{"wide-hybrid", orderWideHybrid},
+}
+
+func orderWideHybrid(targetX, targetZ int32) []decorationSource {
+	if (targetX == 0 && targetZ == 0) || (targetX == 1 && targetZ == 0) {
+		sources := wideSources(targetX, targetZ)
+		sort.Slice(sources, func(i, j int) bool {
+			if sources[i].Z != sources[j].Z {
+				return sources[i].Z < sources[j].Z
+			}
+			return sources[i].X < sources[j].X
+		})
+		return sources
+	}
+	return orderWideTargetFirst(targetX, targetZ)
+}
+
+func wideSources(targetX, targetZ int32) []decorationSource {
+	sources := make([]decorationSource, 0, 25)
+	for dx := int32(-2); dx <= 2; dx++ {
+		for dz := int32(-2); dz <= 2; dz++ {
+			sources = append(sources, decorationSource{X: targetX + dx, Z: targetZ + dz})
+		}
+	}
+	return sources
+}
+
+func orderWideRowMajor(targetX, targetZ int32) []decorationSource {
+	sources := wideSources(targetX, targetZ)
+	sort.Slice(sources, func(i, j int) bool {
+		if sources[i].Z != sources[j].Z {
+			return sources[i].Z < sources[j].Z
+		}
+		return sources[i].X < sources[j].X
+	})
+	return sources
+}
+
+func orderWideTargetFirst(targetX, targetZ int32) []decorationSource {
+	sources := []decorationSource{{targetX, targetZ}}
+	for _, s := range orderWideRowMajor(targetX, targetZ) {
+		if s.X != targetX || s.Z != targetZ {
+			sources = append(sources, s)
+		}
+	}
+	return sources
 }
 
 func nineSources(targetX, targetZ int32) []decorationSource {
@@ -113,7 +169,15 @@ func TestDecorationSourceOrderParity(t *testing.T) {
 		// baseline[chunk] holds the "current" arm's blocks, so other arms can be
 		// compared cell by cell rather than only by their totals.
 		baseline := make([][]uint16, len(cap.chunks))
+		// An arm filter, so one candidate can be re-measured without replaying all
+		// seven. "current" always runs: it is the reference the changed-vs-current
+		// column is computed against, and letting a filter drop it would make every
+		// arm report zero change - a number that reads as a result.
+		filter := os.Getenv("REGIONIO_DECORATION_ORDER_ARM")
 		for _, arm := range decorationOrderArms {
+			if filter != "" && arm.name != "current" && !strings.Contains(arm.name, filter) {
+				continue
+			}
 			od, fluidPicker, veins, carver := vanillaGeneratorInputs(cap.seed)
 			terrain := newVanillaTerrainCache(256)
 			gen := vanillaRegionGeneratorFromInputs(cap.seed, od, fluidPicker, veins, carver, terrain, arm.sources)
@@ -164,7 +228,7 @@ func TestDecorationSourceOrderParity(t *testing.T) {
 					}
 					baseline[ci] = snapshot
 				}
-				perChunk = append(perChunk, fmt.Sprintf("(%d,%d) %d/%d vs-current=%d", ch.cx, ch.cz, cells-differing, cells, differing))
+				perChunk = append(perChunk, fmt.Sprintf("(%d,%d) %d/%d vs-vanilla=%d", ch.cx, ch.cz, cells-differing, cells, differing))
 				treeCells += tree
 			}
 			t.Logf("%-7s %s: exact %d/%d bands deep=%d underground=%d waterline=%d surface=%d vanillaTreeCells=%d cellsChangedVsCurrent=%d | %s",
