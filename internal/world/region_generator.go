@@ -86,7 +86,7 @@ func terrainClone(chunk *Chunk) *Chunk {
 // non-ore decoration to the target.
 func NewVanillaRegionGenerator(seed int64) Generator {
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
-	return vanillaRegionGeneratorFromInputs(seed, od, fluidPicker, veins, carver, newVanillaTerrainCache(256))
+	return vanillaRegionGeneratorFromInputs(seed, od, fluidPicker, veins, carver, newVanillaTerrainCache(256), decorationSources)
 }
 
 // NewVanillaRegionBatchGenerator builds one complete 3x3 target batch from a
@@ -103,11 +103,18 @@ func NewVanillaRegionBatchGenerator(seed int64) BatchGenerator {
 func NewVanillaRegionGenerators(seed int64) (Generator, BatchGenerator) {
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
 	terrain := newVanillaTerrainCache(256)
-	return vanillaRegionGeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain),
+	return vanillaRegionGeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain, decorationSources),
 		vanillaRegionBatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain)
 }
 
-func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, terrain *vanillaTerrainCache) Generator {
+// vanillaRegionGeneratorFromInputs builds the single-chunk generator. sources decides
+// which order the nine decoration centers are replayed in and may be nil for
+// decorationSources; it exists so an ordering can be measured against the captures
+// without a production caller depending on the choice being made.
+func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, terrain *vanillaTerrainCache, sources func(int32, int32) []decorationSource) Generator {
+	if sources == nil {
+		sources = decorationSources
+	}
 	return func(targetX, targetZ int32) *Chunk {
 		chunks := make([]*Chunk, 0, 25)
 		for cx := targetX - 2; cx <= targetX+2; cx++ {
@@ -123,7 +130,7 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 		if err != nil {
 			panic("world: creating decoration region: " + err.Error())
 		}
-		if err := region.replayScheduledOres(od, seed, targetX, targetZ); err != nil {
+		if err := region.replayScheduledOresWithSources(od, seed, targetX, targetZ, sources(targetX, targetZ)); err != nil {
 			panic("world: replaying region ores: " + err.Error())
 		}
 		target := region.chunks[[2]int32{targetX, targetZ}]

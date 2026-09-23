@@ -77,6 +77,11 @@ diagnostics:
 		go test -run 'Ore' ./internal/world -count=1
 	REGIONIO_TRAPEZOID_DIAGNOSTIC=1 \
 		go test -run Trapezoid ./internal/worldgen -count=1
+	# The decoration-source arm sweep: four orders replayed against both captures.
+	# Gated because it costs about a minute and would otherwise eat the slack CI's
+	# per-binary race timeout has left with.
+	REGIONIO_DECORATION_ORDER_DIAGNOSTIC=1 \
+		go test -run TestDecorationSourceOrderParity ./internal/world -count=1 -v
 	REGIONIO_LUSH_CLAY_PROBE=1 REGIONIO_LUSH_CLAY_PROBE_STATE=1 \
 	REGIONIO_SETBLOCK_TRACE="-15,-16,-13;-15,-17,-13" \
 		go test -run TestProbeLushClayStream -count=1 -v ./internal/world

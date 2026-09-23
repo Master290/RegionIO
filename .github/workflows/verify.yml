@@ -133,6 +133,13 @@ jobs:
       - env:
           REGIONIO_TRAPEZOID_DIAGNOSTIC: "1"
         run: go test -run Trapezoid ./internal/worldgen -count=1
+      # The decoration-source arm sweep: four candidate orders replayed against both
+      # captures, printing which of them the fixtures actually support. Gated because
+      # it costs about a minute, and inside the -race binary it would eat the slack the
+      # 30m per-binary bound has left with.
+      - env:
+          REGIONIO_DECORATION_ORDER_DIAGNOSTIC: "1"
+        run: go test -run TestDecorationSourceOrderParity ./internal/world -count=1 -v
       - env:
           REGIONIO_LUSH_CLAY_PROBE: "1"
           REGIONIO_LUSH_CLAY_PROBE_STATE: "1"

@@ -14,12 +14,28 @@ type decorationSource struct {
 }
 
 // decorationSources returns the nine source chunks around targetX, targetZ.
-// For the primary spawn/fixture chunks at (0,0) and (1,0), vanilla's
-// ChunkPos.rangeClosed pipeline decorates in Z-major, X-minor stream order
-// (row z-1 before row z, west before east), allowing neighbors like (0,-1)
-// to decorate and establish cave features before (0,0) and (1,0) execute.
-// Other chunks follow target-first ordering with deterministic X-major/Z-minor
-// neighbors.
+//
+// The order is a modelling choice, not a vanilla rule. 26.1.2 declares no
+// FEATURES-on-FEATURES dependency at any radius (ChunkPyramid's FEATURES step is
+// [CARVERS@1, STRUCTURE_STARTS@8] with blockStateWriteRadius 1), so nothing orders one
+// chunk's decoration against its neighbour's, and the ChunkPos.rangeClosed call this
+// function's comment used to cite exists only inside ChunkGenerator.applyBiomeDecoration,
+// where it fills a set of biomes whose derived indices are re-sorted - an order that
+// provably cannot reach block content.
+//
+// The two branches below are therefore fit to the two captures, and separately so: the
+// Z-major window for (0,0)/(1,0) reproduces the clay pool at (5,-30,13) that the ocean
+// capture holds - running those two targets on the generic branch instead costs 154 and
+// 91 mismatches respectively on today's tree, 245 in total - while the land chunks at
+// (16,-40), (16,-31), (-40,21), (-40,20) sit on the target-first branch because that is
+// the order TestDecorationSourceOrderParity measured best there. No single order does
+// well on both, and the sweep prints the four arms side by side.
+//
+// Consequence, pinned by TestDecorationSourcesAreARestrictionOfOneGlobalOrder: the union
+// of the two branches is not the restriction of any one global order (412 conflicting
+// neighbour pairs over a 7x7 window), so this function cannot be made coherent by picking
+// a different order. Coherence would require replaying each origin once into a shared
+// region for a whole batch rather than once per target.
 func decorationSources(targetX, targetZ int32) []decorationSource {
 	sources := make([]decorationSource, 0, 9)
 	if (targetX == 0 && targetZ == 0) || (targetX == 1 && targetZ == 0) {
@@ -42,12 +58,24 @@ func decorationSources(targetX, targetZ int32) []decorationSource {
 	return sources
 }
 
-// replayScheduledOres replays each source center in deterministic order into a
-// shared region. The region must contain the target's radius-two base terrain;
-// source passes themselves may write only within their own radius-one window.
-// Target-first ordering ensures that the target chunk's own features are laid
-// down before adjacent chunk edges overlap.
+// replayScheduledOres replays the nine source centers around the target, in the order
+// decorationSources gives, into a shared region. The region must contain the target's
+// radius-two base terrain; each source pass may write only within radius one of itself.
+//
+// The ordering claim that used to sit on this comment - that target-first puts the
+// target's own features down before neighbouring edges overlap - is backwards: running
+// the target first means all eight neighbour passes run afterwards and any of them can
+// overwrite the target's cells. The order is a modelling choice, not a vanilla rule;
+// TestDecorationSourcesAreARestrictionOfOneGlobalOrder shows the current choice is not
+// even the restriction of one global order.
 func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
+	return r.replayScheduledOresWithSources(od, seed, targetX, targetZ, decorationSources(targetX, targetZ))
+}
+
+// replayScheduledOresWithSources is replayScheduledOres with the source order supplied,
+// so a measurement can compare orders without a production path depending on the choice.
+// Passing decorationSources(targetX, targetZ) reproduces it exactly.
+func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32, sources []decorationSource) error {
 	// Structures generate before every feature stage: applyBiomeDecoration
 	// places all referenced starts first and only then walks the feature
 	// steps. Their origins reach two chunks out because a portal template can
@@ -55,7 +83,7 @@ func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, se
 	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
 		return fmt.Errorf("world: structure starts (%d,%d): %w", targetX, targetZ, err)
 	}
-	for _, source := range decorationSources(targetX, targetZ) {
+	for _, source := range sources {
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
 		}

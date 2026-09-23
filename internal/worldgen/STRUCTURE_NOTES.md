@@ -1821,3 +1821,76 @@ the decorator's cost is unbounded and its benefit is fifty cells. Re-measure it 
 task #8, with the accepted-attempt count and the decorated-tree count printed per chunk,
 so the first question - "did we decorate trees vanilla did not?" - is answered by a line
 of output rather than by reasoning.
+
+## Task 8: the decoration source order, and why it cannot be derived
+
+The open question was whether `decorationSources`' hard-coded exception for chunks (0,0)
+and (1,0) could be replaced by a rule. Three agents read the jar for this and an
+independent second reader attacked each of them; between them they destroyed the premise
+and then measured what was left.
+
+**Vanilla fixes no order.** `ChunkStatus` in 26.1.2 carries no dependency list at all
+(fields: index, parent, chunkType, heightmapsAfter) - requirements moved onto `ChunkStep`,
+and the FEATURES step is `ChunkPyramid.lambda$static$7`: `addRequirement(STRUCTURE_STARTS, 8)`,
+`addRequirement(CARVERS, 1)`, `blockStateWriteRadius(1)`. FEATURES never requires a
+neighbour's FEATURES, at any radius; and because `getAccumulatedRadiusOf` short-circuits
+when the queried status is the target status, FEATURES' own layer radius is 0. What orders
+the work is a level-priority FIFO of insertion-ordered maps
+(`ChunkTaskPriorityQueue.pop` takes the lowest non-empty level then `firstLongKey`), fed by
+`DistanceManager.chunksToUpdateFutures`, a `ReferenceOpenHashSet` iterated in identity-hash
+order. There is no barrier between FEATURES scheduling and block writes:
+`ChunkStatusTasks.generateFeatures` is primeHeightmaps, `new WorldGenRegion`,
+`applyBiomeDecoration`, border ticks, `completedFuture` - no `allOf`, no `join`. And reads
+of a neighbour are capped *below* FEATURES (direct dependencies give CARVERS at radius 1)
+while returning the live aliased `ChunkAccess`, so vanilla accepts torn cross-chunk reads
+and does not sequence them.
+
+**The old justification was not just unproven, it was wrong.** The comment claimed vanilla
+decorates in `ChunkPos.rangeClosed` stream order, and commit 2c29024 quoted that as the
+reason a Z-major window fixed 145 mismatches at (0,0). In 26.1.2 the only `rangeClosed`
+call inside the decoration path is `ChunkGenerator.applyBiomeDecoration` offset 147, and it
+feeds `lambda$applyBiomeDecoration$1` - a `getChunk` plus `biomes.getAll(set::add)` union
+into an `ObjectArraySet`, order-insensitive by construction, whose derived feature indices
+are then passed through `Arrays.sort`. It is the order of a biome-set gather. The fitted
+loop reproduces `ChunkPos$2.tryAdvance` faithfully and reproduces nothing that can reach
+content.
+
+**Two corrections the second reader forced, one of them about my own reading.** The claim
+"target-first means the target's own writes are unbeatable" is inverted: `ensureCanWrite`
+bounds writes to Chebyshev 1 from the *current source*, so with the target first all eight
+neighbour passes run afterwards and any of them can overwrite the target. And the holder
+window is 21x21 (radius 10 from `getAccumulatedRadiusOf(EMPTY)`), not the 17x17 first
+stated; the 9-entry list is the *direct* dependency ceiling, while the accumulated array is
+11 entries.
+
+**What the arms actually measure.** `TestDecorationSourceOrderParity` replays both captures
+under four orders. Exact cells out of 393,216:
+
+| arm | ocean | land | ocean changed vs current | land changed vs current |
+|---|---|---|---|---|
+| current (hybrid) | 392,886 | 390,767 | 0 | 0 |
+| target-first everywhere | 392,641 | 390,767 | 306 | 0 |
+| row-major everywhere | 392,303 | 389,671 | 714 | 1,890 |
+| column-major everywhere | 392,199 | 389,653 | 917 | 1,902 |
+
+Read the invariance first, because it is the harness check: the land column is identical
+under current and target-first, as it must be, since no land chunk is (0,0) or (1,0) - so
+the land numbers never depended on the fitted branch. Ocean shows the fitted branch is
+worth 245 cells (232 vs 78 at (0,0), 181 vs 90 at (1,0)), and both pure global orders lose
+on both captures, row-major by 583 ocean cells and 1,096 land cells. All the ocean damage
+sits in the deep and underground bands - clay pools reading cave walls that another source
+had or had not carved - which is the same mechanism 2c29024 described, minus the invented
+licence for it.
+
+**Conclusion, stated as a model choice rather than a derivation.** No single order is
+Pareto-better on both captures, so the special case cannot be generalised away and is not
+going to be replaced by a cleverer rule. `TestDecorationSourcesAreARestrictionOfOneGlobalOrder`
+pins why the current arrangement is incoherent as a world model: 412 pairs of nearby targets
+rank their shared sources in opposite orders, and most of those conflicts come from the
+*generic* branch, not the fitted one - so "target first" was never a global order either.
+The only model that is coherent by construction is H4: decorate each origin once into a
+region shared by the batch instead of re-deriving it once per target, which also reaches the
+20 clay anchors at (0,1) that live across a border and are unreachable under any per-target
+order. That is an architectural change and it is the honest content of task 8 now; the
+function's comment carries the measurement and the refuted justification so nobody has to
+re-derive either.
