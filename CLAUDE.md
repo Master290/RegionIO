@@ -293,6 +293,12 @@ run at all.
 
 `cmd/vanillacapture` runs the official bundler jar in an isolated temporary world, force-loads fixed
 chunks, reads their region files, and writes `internal/world/testdata/vanilla_overworld_12345.bin`.
+Pass `-server` the *bundler* jar — the one whose `manifest.json` points at a sibling `libraries/`
+tree. The extracted `versions/26.1.2/server-26.1.2.jar` that every `javap` command in these notes
+uses is not it: booting that alone dies at `NoClassDefFoundError: joptsimple/ValueConverter` before
+the server starts and writes nothing. Check a capture by its output file, not its exit status —
+piping through `tail` reports the pipeline's status, and twice here a failed capture read as a
+success because of it.
 The fixture contains every block state, 4x4x4 biome cell, and three heightmaps. Java 25 is required. `make parity`
 requires the fixture and fails when it is absent; ordinary `go test ./...` skips that one test so a
 fresh checkout remains buildable without Mojang's non-redistributable jar. Once the fixture is

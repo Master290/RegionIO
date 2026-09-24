@@ -2144,3 +2144,44 @@ The 34 absences are a separate matter and probably not decoration at all: "water
 water" in two cells is a fluid *level* difference, and 15 cells of air where vanilla has water
 sit in a column our generator never fills. That is the post-placement water path, not a feature.
 
+## Task 23: pinning the sources turned 13 cells into a real bug
+
+Task 22's trace said the clay comes from source (15,-31). The captures held only targets, so a
+source's own content had never been compared to anything - every claim about a neighbour's pass
+was unfalsifiable. `cmd/vanillacapture -server "server (2).jar" -seed 12345 -chunks
+"15,-31;16,-30;-39,20;-39,21"` fixed that, and `TestVanillaLandSourceChunkParity` measures our
+generation of each against the saved bytes. Biomes came out 1536/1536 in all four, so the block
+numbers are readable.
+
+| source | exact | deep | undgr | waterln | surface | largest families |
+|---|---|---|---|---|---|---|
+| (15,-31) | **95.866%** | 496 | 1,945 | 416 | 1,207 | 862 stone-instead-of-clay, 776 clay-instead-of-stone, 334 clay-instead-of-deepslate |
+| (16,-30) | 99.208% | 2 | 31 | 42 | 704 | four pairs of air-instead-of-dark-oak-leaves/log: 63, 53, 49, 46 |
+| (-39,20) | 99.625% | 108 | 111 | 57 | 93 | 71 deepslate-instead-of-sculk, 66 copper-instead-of-stone, 50 stone-instead-of-copper |
+| (-39,21) | 99.651% | 0 | 259 | 0 | 84 | 127 andesite-instead-of-diorite, 96 andesite-instead-of-granite |
+
+Read (15,-31) carefully, because the shape is specific: clay is missing where vanilla has clay
+(862) and present where vanilla has stone or deepslate (776+334), roughly equally. That is not a
+feature that is absent and not one that is doubled - it is the same ~46 `ore_clay` attempts
+landing elsewhere. A displaced-but-conserved set is the signature of a stream that was seeded or
+ordered differently, which is exactly the hypothesis this capture was commissioned to test;
+whether it is the *schedule index* or the *biome union* that differs is the open half, and it is
+the question the jar answers, not this table.
+
+(-39,21) is the same shape in a different family: 223 cells where vanilla's granite/diorite and
+our andesite disagree about which of the three landed. Those come from three configured features
+(`configured_feature/ore_granite.json`, `ore_diorite.json`, `ore_andesite.json`), each of type
+`minecraft:ore` and each referenced by two placed features (`ore_granite_upper`,
+`ore_granite_lower` and the same for the others) - so on the face of it this is the vein path
+again rather than the surface rules. That reading still has to be checked against
+`testdata/vanilla_base_12345.bin`, the featureless capture, which is what would actually separate
+"base terrain moved" from "a vein moved". Recorded as the next question, not as an answer.
+
+No cause is claimed here beyond that, and no ratchet was added: this test prints a baseline on
+purpose, in the same position the land fixture had before anything was fixed. (-39,20) is also recorded as the second tree measurement in this repository that has vanilla's
+exact dark-oak cells available for a per-chain comparison: 704 surface cells there, and the four
+largest mismatch pairs alone - 63, 53, 49 and 46 cells - are all our air under a vanilla
+dark-oak leaf or log, so at least 211 of the 704 are canopy that did not grow, not canopy that
+grew in the wrong place. (Only the top four pairs are printed; the rest are unmeasured here.)
+
+
