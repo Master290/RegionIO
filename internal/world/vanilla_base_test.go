@@ -20,8 +20,23 @@ import (
 // the full fixture's mismatches hard to attribute.
 const vanillaBaseFixture = "testdata/vanilla_base_12345.bin"
 
+// vanillaLandBaseFixture is the same instrument pointed at land: the four captured land
+// chunks plus the four chunks the waterline traces named as decoration sources. Base
+// terrain had only ever been compared on the ocean set, so every claim that a land
+// residual belongs to a feature rather than to density, surface rules, carvers, aquifers
+// or the noise-router veins was an assumption.
+const vanillaLandBaseFixture = "testdata/vanilla_land_base_12345.bin"
+
 func TestVanillaBaseTerrainParity(t *testing.T) {
-	f, err := os.Open(vanillaBaseFixture)
+	runBaseTerrainParity(t, vanillaBaseFixture)
+}
+
+func TestVanillaLandBaseTerrainParity(t *testing.T) {
+	runBaseTerrainParity(t, vanillaLandBaseFixture)
+}
+
+func runBaseTerrainParity(t *testing.T, fixturePath string) {
+	f, err := os.Open(fixturePath)
 	if err != nil {
 		if os.Getenv("REGIONIO_REQUIRE_BASE_PARITY") == "1" {
 			t.Fatalf("required base-terrain fixture: %v", err)

@@ -1995,6 +1995,15 @@ Three reads of the jar, in the order that makes the claim checkable:
   touches the four FINAL maps and cannot reach `OCEAN_FLOOR_WG`. That is the whole rule:
   the WG pair is frozen at the end of the carver step.
 
+  Addendum, because the derivation above reads as "CARVERS is outside the WG window" and it
+  is not: the status is raised only *after* a step's task returns -
+  `ChunkStep.completeChunkGeneration` calls `setPersistedStatus` in the continuation, not
+  before `doWork`. So during the carver task the chunk is still at SURFACE, still holds
+  `WORLDGEN_HEIGHTMAPS`, and the carvers really do write the WG pair. Same conclusion - the
+  snapshot belongs after the carvers - reached by the only route that states it correctly,
+  and worth the difference because the wrong reading says to move the snapshot earlier,
+  which would return every column whose top a cave removed.
+
 Why trees made an ore bug visible: `OreFeature.place` gates every vein on that frozen map,
 and the gate is per column over the vein's own X/Z box, not at the origin -
 
@@ -2185,3 +2194,73 @@ dark-oak leaf or log, so at least 211 of the 704 are canopy that did not grow, n
 grew in the wrong place. (Only the top four pairs are printed; the rest are unmeasured here.)
 
 
+
+## What the two new instruments settled, and one thing they opened
+
+Two reads of the jar gave the same answer and neither agrees with the story this file was
+telling.
+
+**Base terrain is measured on land now, and it is nearly exact.**
+`testdata/vanilla_land_base_12345.bin` is a `-featureless -blocks-only` capture of the four
+captured land chunks plus the four decoration sources, compared cell by cell by
+`TestVanillaLandBaseTerrainParity`: **786,403/786,432 (99.996%)**, one pair, 29 cells where we
+write `podzol` and vanilla has `grass_block` at y=89..94 around (261..264, -474..-483). The
+ocean arm of the same test stays at 393,216/393,216. That single number is what every
+attribution in the last three sections was missing: the 2,321 land cells and the 4,064 cells in
+source (15,-31) are decoration, all of them, with 29 cells of exception - so "the surface rules
+moved" is no longer a candidate explanation for anything, and the podzol pair is its own small
+bug with a fixed address.
+
+**Six of eleven decoration steps are entered, and the omissions are not residuals.** The 65
+biome JSONs carry eleven feature arrays. Census of what is non-empty versus what
+`replayScheduledOresWithSources` walks:
+
+| step | entries | biomes | walked |
+|---|---|---|---|
+| 0 RAW_GENERATION | 1 | 1 (small_end_islands) | no |
+| 1 LAKES | 106 | 53 | yes |
+| 2 LOCAL_MODIFICATIONS | 62 | 55 | yes |
+| 3 UNDERGROUND_STRUCTURES | 114 | 54 | yes |
+| 4 SURFACE_STRUCTURES | 10 | 7 | no (structure starts are handled separately) |
+| 5 STRONGHOLDS | 0 | 0 | - |
+| 6 UNDERGROUND_ORES | 1,577 | 54 | yes |
+| 7 UNDERGROUND_DECORATION | 84 | 17 | **no** |
+| 8 FLUID_SPRINGS | 110 | 53 | yes |
+| 9 VEGETAL_DECORATION | 521 | 59 | yes |
+| 10 TOP_LAYER_MODIFICATION | 56 | 56 | **no** (`freeze_top_layer`, `end_platform`, `void_start_platform`) |
+
+Step 7 is where `sculk_vein`, `sculk_patch_deep_dark`, `dripstone_cluster`, `ore_infested` and
+`patch_fire` live (the same array also carries the nether's `basalt_blobs`, `blackstone_blobs`,
+`spring_delta`, `spring_open` and `glowstone_extra`). The 321-cell sculk family and the 22-cell dripstone family
+in the land fixture have therefore not been mis-placed by a feature this build gets wrong - they
+are an un-entered step, and counting them as residuals has been dividing the deep band by a
+number that includes them. Step 10 is `freeze_top_layer`, which cannot show in a temperate
+capture and is listed so nobody has to rediscover it. Both are scope decisions, not bugs to
+attribute, and they belong in front of the plan's "out of scope" list rather than inside a
+residual count.
+
+**The freeze reaches further than an ore gate.** 34 placed features hand a `*_WG` name to a
+placement modifier - 18 `WORLD_SURFACE_WG`, 16 `OCEAN_FLOOR_WG`, counting the JSONs: the four
+disks (`disk_clay`, `disk_grass`, `disk_gravel`, `disk_sand`), the eight seagrass placers plus
+`warm_ocean_vegetation` and `sea_pickle`, the two kelp placers, the nine `patch_grass_*` plus
+`patch_leaf_litter`, `patch_berry_common`, `patch_berry_rare`, the three `patch_dead_bush*`,
+`patch_waterlily`, `bamboo`, and `lake_lava_surface`. `HeightmapPlacement` filters nothing, so
+all of them
+now read the frozen column, which is what vanilla does. Relatedly, structure pieces place inside
+the FEATURES step (`ChunkGenerator.applyBiomeDecoration` → `startsForStructure` →
+`StructureStart.placeInChunk` → `StructurePiece.postProcess`), so a placer reading a pre-structure
+snapshot is faithful rather than a compromise - but note that this build runs
+`placeScheduledStructures` before stages 1 and 2 while vanilla's Decoration order puts LAKES and
+LOCAL_MODIFICATIONS before the structure steps. It cannot show through the WG path any more; it
+can still show through a live `getBlock` read.
+
+**Some of what the waterline band holds is not generation at all.** A reading of the jar says
+`SpringFeature` places its source block and then calls `scheduleTick` on the fluid, which
+`WorldGenTickAccess` parks in the chunk's `fluid_ticks` and the save writes out; force-loading
+makes a chunk block-tick with no player, and `cmd/vanillacapture` idles a few hundred ticks
+before `save-all flush`. No `ChunkStatus` after FEATURES touches fluid, and there is no
+fluid-filling step in 26.1.2, so a saved chunk can carry flowing water no generator path emits.
+That is a claim about the fixture, not a licence to re-baseline against "generated state plus
+physics": the number of affected cells has to come from a census over the fixtures, and the
+two cells our spring writes as `water[level=8]` where vanilla's source is `water[level=0]` are
+ours to fix regardless of what the waterfall turns out to be.

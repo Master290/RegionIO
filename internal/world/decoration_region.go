@@ -10,16 +10,27 @@ import (
 // worldgenTopY holds one chunk column's two WORLDGEN heightmaps as they stood when
 // the region was built.
 //
-// Which heightmaps a write touches is decided by the chunk's status, not by the
-// writer: ProtoChunk.setBlockState iterates getPersistedStatus().heightmapsAfter(),
-// and the status a chunk holds while features place is CARVERS, whose set is
-// FINAL_HEIGHTMAPS = {OCEAN_FLOOR, WORLD_SURFACE, MOTION_BLOCKING,
-// MOTION_BLOCKING_NO_LEAVES}. The two *_WG types belong to WORLDGEN_HEIGHTMAPS, the
-// set used while the status is the one before, so they stop being written after the
-// carver step and never see a feature's block. Reading them live would hand a
-// feature the canopies, lakes and veins that earlier passes already painted into
-// this same region - and OreFeature.place, vanilla's only mid-decoration reader of
-// OCEAN_FLOOR_WG, gates every vein on it.
+// Which heightmaps a write touches is decided by the chunk's status, not by the writer:
+// ProtoChunk.setBlockState iterates getPersistedStatus().heightmapsAfter(). ChunkStatus
+// gives WORLDGEN_HEIGHTMAPS = {OCEAN_FLOOR_WG, WORLD_SURFACE_WG} to every step through
+// SURFACE, and FINAL_HEIGHTMAPS = {OCEAN_FLOOR, WORLD_SURFACE, MOTION_BLOCKING,
+// MOTION_BLOCKING_NO_LEAVES} to CARVERS and FEATURES. The status is raised only after a
+// step's task returns - ChunkStep.completeChunkGeneration calls setPersistedStatus in the
+// continuation - so the carver task runs while the chunk is still at SURFACE and keeps
+// writing the WG pair. That is the whole window: carvers are inside it, and FEATURES, where
+// structure pieces and every feature write, is outside it. Reading a WG name live therefore
+// hands a feature the lakes, veins, springs and canopies that earlier passes painted into
+// this same region.
+//
+// Two things to know before doubting a snapshot instead of an update. It is value-identical
+// to vanilla's map because Heightmap.update ignores writes below the tracked height,
+// rescans only when the cell at height-1 is replaced, and stores minY for an all-air column;
+// so what would break it is a write that bypasses ChunkAccess.setBlockState, not a column
+// scan. And OreFeature.place's vein gate is not the only consumer: 34 placed features hand a
+// *_WG name to a placement modifier (18 WORLD_SURFACE_WG, 16 OCEAN_FLOOR_WG - the disk,
+// seagrass, kelp, patch_grass, leaf_litter, berry, dead_bush, waterlily, sea_pickle and
+// lake_lava families) and HeightmapPlacement filters nothing, so all of them read this
+// snapshot now.
 type worldgenTopY struct {
 	surface [256]int32
 	floor   [256]int32
