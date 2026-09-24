@@ -22,6 +22,14 @@ test:
 # seconds and had already been misread as a data race when it was a timeout. If the next
 # feature port crosses 30m, raise it with the new number here rather than letting CI fail
 # in a way that looks like a race.
+#
+# Measure this on a quiet machine, and distrust the number otherwise. Three uncontended
+# runs give 1649.759s, 1656.932s and 1704.269s - about three percent apart, and
+# roughly a minute and a half of slack under the 30m bound. A fourth run, while the same
+# machine was also doing a 169-second non-race pass over the same package plus shell
+# polling, took 2114.545s: 35 minutes, which would have failed CI. The -race suite is a
+# whole-machine measurement, not a per-core one, so a timeout there is evidence about the
+# laptop before it is evidence about the code.
 test-race:
 	go test -race -timeout 30m ./...
 
