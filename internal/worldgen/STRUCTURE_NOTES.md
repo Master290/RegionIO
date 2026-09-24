@@ -2087,7 +2087,60 @@ the cells trees write, and near the bottom for the cells below them.
 And summed over both captures the hybrid is still the best arm available (783,781, next
 783,648), which is the only reason production keeps it. Order still matters after the freeze
 because the rest of a vein's reads are live - the block it is about to replace, the air it is
-exposed to, the biome of the source whose schedule is being walked - so this removes one
-contaminant rather than the coupling, and the remaining 249-cell spread is what a shared
-decoration history (task 21) still has to explain.
+exposed to where the config has a discard chance, the biome set whose schedule union picks the
+feature's index - so this removes one contaminant rather than the coupling, and the remaining
+245-cell spread is what a shared decoration history (task 21) still has to explain.
+
+## Task 22: naming the writers of the 51 cells left in the waterline band
+
+The band has 51 cells now and none of them is near a tree - the distance histogram says so
+(d>5 for all 51). Same technique as task 20: coordinates from
+`TestLandWaterlineDiagnostic`, which now prints up to four cells *per family* rather than six
+from the largest family only, because naming a writer means feeding a coordinate to
+`REGIONIO_SETBLOCK_TRACE` and a runner-up should not cost a fresh investigation.
+
+| family | n | where | writer |
+|---|---|---|---|
+| clay instead of stone | 13 | (256..258, 63, -496) in (16,-31) | `ore_clay` ellipsoid, origin (254,65,-496), **source (15,-31)** |
+| stone instead of copper_ore | 18 | (-636,-635, 65, 342..343) in (-40,21) | no write at all - vanilla has ore, we have base terrain |
+| air instead of water | 15 | (-627, 63..66, 321) in (-40,20) | no write - a fluid column we never fill |
+| copper_ore instead of stone | 2 | (-625, 70, 330..331) in (-40,20) | copper ellipsoid, origin (-624,71,331), source (-39,20) |
+| water instead of water | 2 | (-625, 74/76, 321) | written twice by source (-40,20) - same block name, different state, so a fluid level |
+| air instead of glow_lichen | 1 | (-628, 65, 326) | no write |
+
+15 cells are over-placement by neighbour-source ore veins and 34 are absences - ore that never
+came, water that never flowed in. The absences being the larger half is the useful thing this
+table buys: the band is not one bug, and the disk-shaped clay writer that task 20 suspected is
+a real `ore_clay` vein rather than a disk feature.
+
+Three hypotheses about the clay went to the jar and all three died:
+
+* *Perhaps `OCEAN_FLOOR_WG`'s sampler counts water.* No. `Heightmap$Types` builds both
+  `OCEAN_FLOOR` and `OCEAN_FLOOR_WG` from `Heightmap.MATERIAL_MOTION_BLOCKING`, and the
+  bootstrap method resolves that to the bare method reference
+  `BlockBehaviour$BlockStateBase.blocksMotion`. Water is excluded, so our `flagBlocksMotion`
+  predicate for that pair was already right. `MOTION_BLOCKING` is the lambda
+  `blocksMotion() || !fluid.isEmpty()` and the no-leaves variant adds
+  `!(block instanceof LeavesBlock)` - also already ours.
+* *Perhaps `ore_clay` rejects air-exposed cells.* No. The pack gives it
+  `discard_chance_on_air_exposure: 0.0`, and `shouldSkipAirCheck` is
+  `if (density <= 0) return true; if (density >= 1) return false; return random.nextFloat() >=
+  density`, with `canPlaceOre` returning true the moment it is true. At 0.0 no air check runs
+  and no draw is spent, which is what our `shouldSkipAirCheck` already does.
+* *Perhaps the vein's origin moved.* No. `placed_feature/ore_clay.json` is
+  `count(46) -> in_square -> height_range(uniform, above_bottom 0 .. absolute 256) -> biome`:
+  no heightmap modifier, so the origin never reads the world.
+
+What is left is the one input the trace can name but the fixture cannot pin. `ore_clay` reaches
+those cells from source **(15,-31)**, and its seed is `setFeatureSeed(decorationSeed,
+scheduled.Index, 6)` where that index comes from the schedule union of the source's 3x3 biomes.
+The captures hold four chunks; every chunk around them is ours alone, so a biome resolved
+differently in a neighbour shifts that source's stage-6 indices and moves all 46 of its veins at
+once, while the captured chunks still report biomes 6144/6144 exact. The next step is therefore
+not an ore change but a stage-6 schedule golden over the source union - the shape stage 9
+already has - plus a capture that pins at least one neighbour chunk.
+
+The 34 absences are a separate matter and probably not decoration at all: "water instead of
+water" in two cells is a fluid *level* difference, and 15 cells of air where vanilla has water
+sit in a column our generator never fills. That is the post-placement water path, not a feature.
 

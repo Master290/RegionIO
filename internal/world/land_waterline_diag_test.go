@@ -115,20 +115,26 @@ func TestLandWaterlineDiagnostic(t *testing.T) {
 	}
 
 	t.Logf("land waterline band: %d mismatched cells in total", bandTotal)
-	// Print a few of the dirt-over-stone cells with their column, because the pair
-	// alone does not say who wrote them.
-	shown := 0
+	// Print example cells for every family, not just the largest one: naming a writer
+	// means feeding coordinates to REGIONIO_SETBLOCK_TRACE, and a diagnostic that shows
+	// only the top pair makes the runner-up a fresh investigation every time.
+	shown := map[string]int{}
 	ys := map[int]int{}
 	for _, ch := range fixture.chunks {
 		mine := gen(ch.cx, ch.cz)
 		for y := SeaLevel; y < SeaLevel+16; y++ {
 			for z := 0; z < 16; z++ {
 				for x := 0; x < 16; x++ {
-					if stateLabel(mine.GetBlock(x, y, z)) != "minecraft:dirt" || stateLabel(ch.at(x, y, z)) != "minecraft:stone" {
+					gotState, wantState := mine.GetBlock(x, y, z), ch.at(x, y, z)
+					if gotState == wantState {
 						continue
 					}
-					ys[y]++
-					if shown >= 6 {
+					got, want := stateLabel(gotState), stateLabel(wantState)
+					if got == "minecraft:dirt" && want == "minecraft:stone" {
+						ys[y]++
+					}
+					pair := got + " instead of " + want
+					if shown[pair] >= 4 {
 						continue
 					}
 					col := ""
@@ -139,8 +145,9 @@ func TestLandWaterlineDiagnostic(t *testing.T) {
 						}
 						col += fmt.Sprintf(" %s", name)
 					}
-					t.Logf("  example (%d,%d,%d) in (%d,%d):%s", int(ch.cx)*16+x, y, int(ch.cz)*16+z, ch.cx, ch.cz, col)
-					shown++
+					t.Logf("  %-56s (%d,%d,%d) in (%d,%d):%s", pair,
+						int(ch.cx)*16+x, y, int(ch.cz)*16+z, ch.cx, ch.cz, col)
+					shown[pair]++
 				}
 			}
 		}
