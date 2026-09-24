@@ -139,9 +139,12 @@ func (r *decorationRegion) placeScheduledOresFiltered(seed int64, biomeOrder []s
 
 func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
 	setup := drawOreVeinSetup(random, originX, originY, originZ, size)
-	// OreFeature.place's height gate: veins entirely above the ocean-floor
-	// heightmap place nothing and consume no sphere draws. The heightmap is
-	// read live, so earlier features' writes count.
+	// OreFeature.place's height gate: a vein whose top sits above the ocean-floor
+	// heightmap in every column of its own box places nothing and consumes no
+	// sphere draws. The map is OCEAN_FLOOR_WG, which vanilla stops writing after
+	// the carver step - so it must come from the region's frozen snapshot and not
+	// from the live column, or a canopy that grew here earlier in this replay
+	// opens a gate the shipped game holds shut.
 	if !oreVeinPassesHeightGate(originX, originY, originZ, size, func(x, z int) (int, bool) {
 		return region.heightAt("OCEAN_FLOOR_WG", x, z), true
 	}) {

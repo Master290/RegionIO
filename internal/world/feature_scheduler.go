@@ -26,10 +26,14 @@ type decorationSource struct {
 // The two branches below are therefore fit to the two captures, and separately so: the
 // Z-major window for (0,0)/(1,0) reproduces the clay pool at (5,-30,13) that the ocean
 // capture holds - running those two targets on the generic branch instead costs 154 and
-// 91 mismatches respectively on today's tree, 245 in total - while the land chunks at
-// (16,-40), (16,-31), (-40,21), (-40,20) sit on the target-first branch because that is
-// the order TestDecorationSourceOrderParity measured best there. No single order does
-// well on both, and the sweep prints the four arms side by side.
+// 91 mismatches respectively on today's tree, 245 in total. The land chunks sit on the
+// target-first branch for a weaker reason than they used to. Before the OCEAN_FLOOR_WG
+// freeze (STRUCTURE_NOTES, task 20) that branch looked like the best order on land by 1,114
+// cells; most of that was the unfrozen heightmap, and with it frozen column-major wins land
+// by 234. What target-first still wins is the surface band, 687 against column-major's 782,
+// and what it loses is the underground band, 883 against 584. The hybrid as a whole remains
+// the best of the seven arms summed over both captures - 783,781 against 783,648 - and that
+// is the only claim this function is entitled to make about itself.
 //
 // Consequence, pinned by TestDecorationSourcesAreARestrictionOfOneGlobalOrder: the union
 // of the two branches is not the restriction of any one global order (412 conflicting

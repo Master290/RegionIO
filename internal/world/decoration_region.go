@@ -7,6 +7,24 @@ import (
 	"regionio/internal/worldgen"
 )
 
+// worldgenTopY holds one chunk column's two WORLDGEN heightmaps as they stood when
+// the region was built.
+//
+// Which heightmaps a write touches is decided by the chunk's status, not by the
+// writer: ProtoChunk.setBlockState iterates getPersistedStatus().heightmapsAfter(),
+// and the status a chunk holds while features place is CARVERS, whose set is
+// FINAL_HEIGHTMAPS = {OCEAN_FLOOR, WORLD_SURFACE, MOTION_BLOCKING,
+// MOTION_BLOCKING_NO_LEAVES}. The two *_WG types belong to WORLDGEN_HEIGHTMAPS, the
+// set used while the status is the one before, so they stop being written after the
+// carver step and never see a feature's block. Reading them live would hand a
+// feature the canopies, lakes and veins that earlier passes already painted into
+// this same region - and OreFeature.place, vanilla's only mid-decoration reader of
+// OCEAN_FLOOR_WG, gates every vein on it.
+type worldgenTopY struct {
+	surface [256]int32
+	floor   [256]int32
+}
+
 // decorationRegion is the mutable terrain view used while replaying source
 // chunk feature passes. A target needs base terrain through radius two: its nine
 // possible source chunks each inspect biomes in their own radius-one region.
@@ -14,10 +32,16 @@ type decorationRegion struct {
 	chunks  map[[2]int32]*Chunk
 	sourceX int32
 	sourceZ int32
+	// worldgen freezes the *_WG heightmaps; the region's chunks are mutable from
+	// here on, so this is the only moment the frozen values can be taken.
+	worldgen map[[2]int32]*worldgenTopY
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
-	region := &decorationRegion{chunks: make(map[[2]int32]*Chunk, len(chunks))}
+	region := &decorationRegion{
+		chunks:   make(map[[2]int32]*Chunk, len(chunks)),
+		worldgen: make(map[[2]int32]*worldgenTopY, len(chunks)),
+	}
 	for _, chunk := range chunks {
 		if chunk == nil {
 			return nil, fmt.Errorf("world: nil chunk in decoration region")
@@ -27,8 +51,34 @@ func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
 			return nil, fmt.Errorf("world: duplicate decoration chunk (%d,%d)", chunk.X, chunk.Z)
 		}
 		region.chunks[key] = chunk
+		region.worldgen[key] = freezeWorldgenTopY(chunk)
 	}
 	return region, nil
+}
+
+func freezeWorldgenTopY(chunk *Chunk) *worldgenTopY {
+	frozen := &worldgenTopY{}
+	for localZ := 0; localZ < 16; localZ++ {
+		for localX := 0; localX < 16; localX++ {
+			index := localZ*16 + localX
+			surface, floor := MinY, MinY
+			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
+				state := chunk.GetBlock(localX, y, localZ)
+				if state != StateAir && surface == MinY {
+					surface = y + 1
+				}
+				if stateFlags(state)&flagBlocksMotion != 0 && floor == MinY {
+					floor = y + 1
+				}
+				if surface != MinY && floor != MinY {
+					break
+				}
+			}
+			frozen.surface[index] = int32(surface)
+			frozen.floor[index] = int32(floor)
+		}
+	}
+	return frozen
 }
 
 func (r *decorationRegion) setSource(cx, cz int32) error {
@@ -91,15 +141,27 @@ func (r *decorationRegion) setBlockGlobal(x, y, z int, state uint16) bool {
 }
 
 // heightAt mirrors WorldGenRegion.getHeight: one above the highest matching
-// block, or MinY when the column has no match.
+// block, or MinY when the column has no match. The two *_WG types answer from the
+// snapshot this region took at construction; see worldgenTopY.
 func (r *decorationRegion) heightAt(kind string, x, z int) int {
+	switch kind {
+	case "WORLD_SURFACE_WG", "OCEAN_FLOOR_WG":
+		frozen := r.worldgen[[2]int32{int32(x >> 4), int32(z >> 4)}]
+		if frozen == nil {
+			return MinY
+		}
+		if kind == "WORLD_SURFACE_WG" {
+			return int(frozen.surface[(z&15)*16+(x&15)])
+		}
+		return int(frozen.floor[(z&15)*16+(x&15)])
+	}
 	for y := MinY + WorldHeight - 1; y >= MinY; y-- {
 		state := r.getBlock(x, y, z)
 		match := false
 		switch kind {
-		case "WORLD_SURFACE", "WORLD_SURFACE_WG":
+		case "WORLD_SURFACE":
 			match = state != StateAir
-		case "OCEAN_FLOOR", "OCEAN_FLOOR_WG":
+		case "OCEAN_FLOOR":
 			match = stateFlags(state)&flagBlocksMotion != 0
 		case "MOTION_BLOCKING":
 			match = blocksMotionOrFluid(state)

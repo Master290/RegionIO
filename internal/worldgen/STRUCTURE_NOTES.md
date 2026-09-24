@@ -1917,11 +1917,17 @@ Exact cells out of 393,216, seven arms, both captures:
 | wide target-first (25) | 392,625 | **390,802** | 783,427 |
 | wide hybrid (25) | 392,764 | **390,802** | 783,566 |
 
+(Both columns above are the tree of that day. The `OCEAN_FLOOR_WG` freeze in the task-20
+section below moved the land column by more than any ordering choice ever did, and the sweep
+was re-run afterwards; the re-measured table is at the end of that section.)
+
 Two things worth keeping from this. The predicted mechanism is real: at target (0,1) the
 mismatch count falls 58 -> 46 under a wide window, which is the cross-border clay pool
 that the widened lush-caves probe had already recovered 12 of its 20 anchors from, and no
 per-target order over nine sources can reach it. And the land chunks genuinely prefer the
-wide window - 390,767 -> 390,802, +35 cells, deep band 700 -> 656.
+wide window - 390,767 -> 390,802, +35 cells, deep band 700 -> 656. (That second sentence is
+true of that tree only: the `OCEAN_FLOOR_WG` freeze below took the wide arms to 390,884 and
+the current arm past them, so the land preference for Chebyshev 2 was mostly the bug.)
 
 But the same extra origins write into chunks that were already right: at (0,0) the count
 goes 78 -> 180 and at (-1,-1) 104 -> 146, so ocean loses 122 cells and the sum of both
@@ -1948,3 +1954,140 @@ wrong numbers: the per-chunk column was labelled `vs-current` while printing the
 against vanilla, and the arm filter let a run skip the `current` reference, after which
 every arm reported "0 cells changed versus current" - a zero that looks like agreement
 rather than like a missing baseline. `current` now always runs.
+
+## Task 20: the waterline writer was an ore vein, and the reason it got through is a heightmap rule
+
+Task 20 was left standing on two measured facts and one wrong assumption. The facts: the
+band went 51 -> 100 when dark oaks became possible, and 62 of the 100 sat in the one land
+chunk that contains any dark oak block. The assumption, inherited from the shape of the
+number, was that a tree wrote them.
+
+Naming the writer took no new code. `TestLandWaterlineDiagnostic` prints example
+coordinates of the dominant pair, and `REGIONIO_SETBLOCK_TRACE` already attributes any
+world cell's writes to a call stack:
+
+```
+SETBLOCK (256,63,-481) -> minecraft:dirt by source (16,-30)
+regionio/internal/world.placeOreEllipsoidRegion.func2(...)  region_ores.go:162
+regionio/internal/world.(*decorationRegion).placeScheduledUndergroundOresStage.func2  region_ores.go:49
+```
+
+So the 49 dirt-over-stone cells are stage 6, from a neighbouring source, and no tree wrote
+them. What let them through was `region.heightAt("OCEAN_FLOOR_WG", x, z)` - which scanned
+the live region, canopy included, while vanilla's copy of that map has not been written
+since the carvers.
+
+Three reads of the jar, in the order that makes the claim checkable:
+
+* `Heightmap$Types` carries a `Usage` per type, and `OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG` are
+  `WORLDGEN` where `OCEAN_FLOOR`/`WORLD_SURFACE`/`MOTION_BLOCKING`/`MOTION_BLOCKING_NO_LEAVES`
+  are `LIVE_WORLD`/`CLIENT`. The samplers match our table exactly - the `*_WG` pair uses
+  `MATERIAL_MOTION_BLOCKING`, so the predicate was never the bug: `MOTION_BLOCKING` is
+  `blocksMotion() || !fluid.isEmpty()`, and the no-leaves variant adds `!(block instanceof
+  LeavesBlock)`.
+* `ChunkStatus`'s `<clinit>` builds two EnumSets: `WORLDGEN_HEIGHTMAPS = {OCEAN_FLOOR_WG,
+  WORLD_SURFACE_WG}` and `FINAL_HEIGHTMAPS = {OCEAN_FLOOR, WORLD_SURFACE, MOTION_BLOCKING,
+  MOTION_BLOCKING_NO_LEAVES}`, and passes them as each status's `heightmapsAfter`:
+  EMPTY/STRUCTURE_STARTS/STRUCTURE_REFERENCES/BIOMES/NOISE/SURFACE get WORLDGEN, CARVERS and
+  FEATURES get FINAL.
+* `ProtoChunk.setBlockState` iterates `getPersistedStatus().heightmapsAfter()` and updates
+  only those maps. A chunk being decorated is at status CARVERS, so a feature's write
+  touches the four FINAL maps and cannot reach `OCEAN_FLOOR_WG`. That is the whole rule:
+  the WG pair is frozen at the end of the carver step.
+
+Why trees made an ore bug visible: `OreFeature.place` gates every vein on that frozen map,
+and the gate is per column over the vein's own X/Z box, not at the origin -
+
+```java
+for (x = minX; x <= minX + w; x++)
+  for (z = minZ; z <= minZ + w; z++)
+    if (minY <= level.getHeight(OCEAN_FLOOR_WG, x, z)) return doPlace(...);
+return false;
+```
+
+with `minY = originY - 2 - ceil(((size/16)*2+1)/2)`. Our `oreVeinPassesHeightGate` already
+reproduces that shape - same box, same comparison, same early return - so the fix was the
+input, not the test. A taller column can only ever *open* the gate, which is how 33 extra
+accepted dark oaks turned into 49 veins that vanilla never places.
+
+The fix is `worldgenTopY` in `decoration_region.go`: the region snapshots both WG columns
+per chunk at construction - the one moment before anything can write - and `heightAt`
+answers the two `*_WG` names from it. Every reader benefits the same way, including the
+three structure readers (`mineshafts.go`, `ocean_ruin.go`, `ruined_portal_piece.go`), which
+in vanilla likewise run inside the FEATURES window and so do not see each other's blocks
+through a WG map either.
+
+Measured, before -> after, with `generatorVersion` 39 -> 40:
+
+| | before | after |
+|---|---|---|
+| land waterline band | 100 | **51** |
+| land dirt-over-stone cells | 49 | **0** |
+| land surface band | 704 | **687** |
+| land exact cells | 390,767 | **390,895** |
+| ocean exact cells | 392,886 | 392,886 (unchanged, 330 residual) |
+| clay chain | 96/22/9 | 96/22/9 |
+| ore parity | 0 mismatches | 0 mismatches |
+| tree cells above sea level | 607 | 607 |
+
+The ocean number not moving is itself information: nothing in that capture's column profile
+put a feature block high enough to change a WG top, so the 330 residual cells are untouched
+by this. Land is where the model was being violated, and the waterline band is back to the
+51 it held before dark oaks were possible - now with a ratchet of its own
+(`landWaterlineRatchet`), because this band sat inside the surface number where a
+128-cell improvement and a 49-cell regression are not separable.
+
+What the trace also shows, and is not this bug: `(16,-31)` still holds 13 clay-over-stone
+cells and `(-40,21)` 18 stone-over-copper_ore. Both are now the largest remaining families
+in a band that has no tree in it, and the clay one was the shape that first suggested a
+disk-style ground writer. They are the next thing to name the same way - coordinates from
+the diagnostic, writer from `REGIONIO_SETBLOCK_TRACE` - rather than to keep describing.
+
+And a correction to how task 20 was framed: the regression was never "the dark oaks costing
+cells". The dark oaks cost nothing; they were the first build that grew enough canopy to
+make an existing ore-gate defect visible. Reading the pair as a tree problem sent two
+experiments (refusing below-trunk writes, skipping `alter_ground`) at the wrong writer, both
+of which came back negative and were recorded as such.
+
+### The same seven arms, re-measured after the freeze
+
+The order sweep is a measurement of the generator, so it owes a re-run after any change that
+moves output. `REGIONIO_DECORATION_ORDER_DIAGNOSTIC=1 go test ./internal/world -run
+TestDecorationSourceOrderParity` on the frozen-map tree, exact cells out of 393,216:
+
+| arm | ocean | land | total | land deep | land underground | land surface |
+|---|---|---|---|---|---|---|
+| **current (hybrid, 9)** | **392,886** | 390,895 | **783,781** | 700 | 883 | **687** |
+| target-first everywhere (9) | 392,641 | 390,895 | 783,536 | 700 | 883 | 687 |
+| row-major everywhere (9) | 392,303 | 391,120 | 783,423 | 670 | 588 | 787 |
+| column-major everywhere (9) | 392,199 | **391,129** | 783,328 | 670 | **584** | 782 |
+| wide row-major (25) | 392,131 | 391,122 | 783,253 | 622 | 588 | 833 |
+| wide target-first (25) | 392,625 | 390,884 | 783,509 | 656 | 887 | 738 |
+| wide hybrid (25) | 392,764 | 390,884 | 783,648 | 656 | 887 | 738 |
+
+Three things changed and one did not.
+
+Ocean is identical to the previous run to the cell, in all seven arms - the capture has no
+feature block high enough to have been in a WG top, so this fix could not reach it and did
+not.
+
+The land spread collapsed: the seven arms used to span 1,149 cells (389,653 to 390,802) and
+now span 245 (390,884 to 391,129). Roughly four fifths of what looked like a strong ordering
+preference on land was this bug, which is what the previous section's "the land chunks sit on
+the target-first branch because that order measured best there" was actually resting on.
+
+The sign of the land preference flipped: column-major now beats the current branch by 234
+cells on land where it lost by 1,114, and the wide arms have stopped being a land win at all
+(390,884 against 390,895, where the old run said +35). What the current branch now wins is
+the surface band specifically - 687 against column-major's 782 - and what it loses is the
+underground band, 883 against 584, with only the two wide arms (887) doing worse. So the
+honest statement of the trade is per-band, not per-capture: the hybrid is the best arm for
+the cells trees write, and near the bottom for the cells below them.
+
+And summed over both captures the hybrid is still the best arm available (783,781, next
+783,648), which is the only reason production keeps it. Order still matters after the freeze
+because the rest of a vein's reads are live - the block it is about to replace, the air it is
+exposed to, the biome of the source whose schedule is being walked - so this removes one
+contaminant rather than the coupling, and the remaining 249-cell spread is what a shared
+decoration history (task 21) still has to explain.
+

@@ -160,13 +160,21 @@ measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.377% (2,449 residual, 704 in the surface band) now, after
+hand-written trees, to 99.410% (2,321 residual, 687 in the surface band) now, after
 springs and boulders joined the schedule, the flora percentages were deleted, leaves
 were given the distance property vanilla propagates into them, dark oaks grew their
 own trunks and canopies, and three inverted guards in the ported `doPlace` were fixed —
 a tree whose trunk a ceiling cut short is now refused unless `min_clipped_height` says
 otherwise, a vine stops a trunk that does not ignore them, and the free-height probe
-reaches one row above the trunk like vanilla's. Cells above sea level holding a trunk,
+reaches one row above the trunk like vanilla's. The band that grew when the dark oaks
+arrived turned out not to be about trees: a `setblock` trace named the writer as a stage-6
+ore ellipsoid, and the reason it got through is that `OreFeature.place` gates every vein on
+`OCEAN_FLOOR_WG` — a worldgen heightmap, while a chunk being decorated sits at
+`ChunkStatus.CARVERS`, whose `heightmapsAfter` set is the four live maps — so the two `*_WG`
+columns stop being written after the carvers and no feature, canopy included, raises them.
+Reading them live opened a gate vanilla holds shut on 49 cells; the region now snapshots
+both maps when it is built, which returned the waterline band to the 51 it held before dark
+oaks were possible, and that band has its own ratchet. Cells above sea level holding a trunk,
 canopy or plant stand at 607 against vanilla's 789; that count went *down* when the
 guards were fixed, which is the point — the earlier 577 included trees vanilla never
 plants. `MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy, is at

@@ -98,6 +98,17 @@ The 39 jars under `libraries/` are required; the server jar alone will not boot 
 the format version in both the Java and `internal/world/block_properties.go` whenever the layout or
 a flag's meaning changes.
 
+Six heightmaps, two lifetimes: which ones a write touches is chosen by the chunk's *status*, not by
+the writer. `ChunkStatus` gives every step a `heightmapsAfter` set — `WORLDGEN_HEIGHTMAPS` =
+{`OCEAN_FLOOR_WG`, `WORLD_SURFACE_WG`} for everything up to `SURFACE`, `FINAL_HEIGHTMAPS` =
+{`OCEAN_FLOOR`, `WORLD_SURFACE`, `MOTION_BLOCKING`, `MOTION_BLOCKING_NO_LEAVES`} for `CARVERS` and
+`FEATURES` — and `ProtoChunk.setBlockState` updates exactly that set. So during decoration the two
+`*_WG` columns are frozen at the end of the carver step and no feature can raise them, which matters
+because `OreFeature.place` gates every vein on `OCEAN_FLOOR_WG` per column over the vein's own box.
+`decorationRegion` snapshots both maps when it is built and answers those two names from the
+snapshot; a reader that scans the live region for a `*_WG` name re-introduces the bug that cost 49
+cells of phantom dirt and, on land, most of what looked like an ordering preference.
+
 The same trick verifies output, not just constants. `tools/VanillaChunkFormatCheck.java` opens a
 region file we wrote with vanilla's own `RegionFile`, `NbtIo`, `Strategy` and `SimpleBitStorage` and
 fails if the root is not flat, a section `Y` is not a byte, or a palette array is not the width
@@ -206,7 +217,7 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 39): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 40): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
 and **99.916% through the production region replay** — 330 residual cells, dominated by the
 lush-caves moss and clay pools and their nested vegetation. A featureless vanilla capture
@@ -214,6 +225,11 @@ lush-caves moss and clay pools and their nested vegetation. A featureless vanill
 biomes stripped to their carvers) proves the undecorated pipeline bit-exact against it — density,
 surface rules, carvers, aquifers, and noise-router veins match every one of the fixture's cells — so
 the residual block gap is entirely inside feature replay.
+That fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
+chunks): **99.410%**, 2,321 residual cells, of which 687 are the surface band above sea level and 51
+the waterline band, with 607 of vanilla's 789 tree cells placed. Both bands are ratcheted in
+`world/vanilla_land_parity_test.go`, because the ocean floor of 99.7% leaves ~849 cells of headroom
+and an entirely wrong forest fits inside it.
 
 The underground stages are each pinned by their own capture, which is why they can be trusted while
 the surface ones cannot: monster rooms (`world/monster_rooms.go`) replay between geodes and the ores

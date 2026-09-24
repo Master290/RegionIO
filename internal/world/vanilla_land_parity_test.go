@@ -18,8 +18,9 @@ import (
 // plains, seed 12345, chosen by sampling our own biome and height path first:
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
-// landSurfaceRatchet, landCellRatchet are today's measured land numbers: 704 surface-band
-// mismatches and 390,767 exact cells, with 607 of vanilla's 789 tree cells (77%).
+// landSurfaceRatchet, landCellRatchet, landWaterlineRatchet are today's measured land
+// numbers: 687 surface-band mismatches, 51 waterline-band mismatches and 390,895 exact
+// cells, with 607 of vanilla's 789 tree cells (77%).
 //
 // Both numbers moved twice when dark oaks arrived, and the two moves are separable:
 // fixing the three inverted doPlace guards (clip refusal, the ignore_vines clause, the
@@ -29,14 +30,22 @@ import (
 // different tree count is only progress if the exact-cell count agrees, which is why both
 // are ratcheted.
 //
+// The waterline band, which had gone 51 to 100 with the dark oaks and was the reason that
+// pair exists, is now separately ratcheted at 51 because its cause turned out to be nothing
+// to do with trees: our heightAt answered the two *_WG maps by scanning the live region,
+// while vanilla stops updating them after the carver step, so 49 dirt-over-stone cells were
+// ore veins walking through a gate that the shipped game holds shut. See the paragraph in
+// STRUCTURE_NOTES.md written from ChunkStatus and OreFeature.place.
+//
 // What is left: place_on_ground is counted 77 times and skipped (birch and oak litter,
 // and the litter under the new dark oaks), 18 stage-2 large_dripstone placements are not
 // replayed, and the tally still shows mushrooms and one fallen tree - all of which shift
 // with the shared decoration stream, so their counts are a position signal, not a
 // coverage one.
 const (
-	landSurfaceRatchet = 704
-	landCellRatchet    = 390767
+	landSurfaceRatchet   = 687
+	landCellRatchet      = 390895
+	landWaterlineRatchet = 51
 )
 
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"
@@ -346,6 +355,9 @@ func TestVanillaLandBlockParity(t *testing.T) {
 	// the veto was reverted.
 	if bands["surface"] > landSurfaceRatchet {
 		t.Errorf("surface-band mismatches went up: %d, want at most %d (the ratchet)", bands["surface"], landSurfaceRatchet)
+	}
+	if bands["waterline"] > landWaterlineRatchet {
+		t.Errorf("waterline-band mismatches went up: %d, want at most %d (the ratchet)", bands["waterline"], landWaterlineRatchet)
 	}
 	if ourTrees*10 < vanillaTrees*7 {
 		t.Errorf("only %d of vanilla's %d tree cells above sea level are placed, below the 70%% ratchet",

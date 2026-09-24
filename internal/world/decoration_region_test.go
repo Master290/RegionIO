@@ -65,6 +65,47 @@ func TestDecorationRegionHeightmapsMatchPlacementSemantics(t *testing.T) {
 	}
 }
 
+func TestDecorationRegionWorldgenHeightmapsIgnoreFeatureWrites(t *testing.T) {
+	chunk := NewChunk(0, 0, BiomePlains)
+	chunk.SetBlock(2, 30, 3, StateStone)
+	region, err := newDecorationRegion([]*Chunk{chunk})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.setSource(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	// A canopy leaf, which is exactly what a tree writes above the surface, and
+	// exactly what vanilla's OCEAN_FLOOR_WG never learns about: the map is only
+	// written while the chunk's status is one whose heightmapsAfter set contains
+	// the WORLDGEN types, and FEATURES runs with the CARVERS set (FINAL_HEIGHTMAPS).
+	// Reading it live lets an ore vein through OreFeature.place's height gate under
+	// a tree that grew there earlier in the same replay.
+	leaves, leavesOK := nameToStateID("minecraft:oak_leaves", nil)
+	if !leavesOK {
+		t.Fatal("oak leaves not in the state table")
+	}
+	if !region.setBlock(2, 34, 3, leaves) {
+		t.Fatal("leaf write rejected")
+	}
+	if got := region.heightAt("WORLD_SURFACE", 2, 3); got != 35 {
+		t.Fatalf("WORLD_SURFACE after a feature write = %d, want 35 (live)", got)
+	}
+	if got := region.heightAt("OCEAN_FLOOR", 2, 3); got != 35 {
+		t.Fatalf("OCEAN_FLOOR after a feature write = %d, want 35 (live)", got)
+	}
+	if got := region.heightAt("WORLD_SURFACE_WG", 2, 3); got != 31 {
+		t.Fatalf("WORLD_SURFACE_WG = %d, want 31 (frozen before features)", got)
+	}
+	if got := region.heightAt("OCEAN_FLOOR_WG", 2, 3); got != 31 {
+		t.Fatalf("OCEAN_FLOOR_WG = %d, want 31 (frozen before features)", got)
+	}
+	// Out-of-region columns behave as the live scan did: no chunk, no height.
+	if got := region.heightAt("OCEAN_FLOOR_WG", 400, 400); got != MinY {
+		t.Fatalf("unfrozen column = %d, want %d", got, MinY)
+	}
+}
+
 func TestDecorationRegionSourceBiomesUseThreeByThreeChunks(t *testing.T) {
 	var chunks []*Chunk
 	for cx := int32(-1); cx <= 1; cx++ {

@@ -163,7 +163,7 @@ func TestDecorationSourceOrderParity(t *testing.T) {
 		ratchet int // exact cells expected from the "current" arm
 	}{
 		{"ocean", vanillaParityFixture, 392886},
-		{"land", vanillaLandFixture, 390767},
+		{"land", vanillaLandFixture, 390895},
 	} {
 		cap := readFixtureCapture(t, fx.path)
 		// baseline[chunk] holds the "current" arm's blocks, so other arms can be
