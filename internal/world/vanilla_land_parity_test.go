@@ -157,6 +157,9 @@ func TestVanillaLandBlockParity(t *testing.T) {
 	}
 	cap := readFixtureCapture(t, vanillaLandFixture)
 	gen := NewVanillaRegionGenerator(cap.seed)
+	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "h4" {
+		gen = newVanillaRegionH4Generator(cap.seed, h4OrderFromEnv())
+	}
 	ResetNotReplayed()
 
 	type statePair struct{ got, want uint16 }

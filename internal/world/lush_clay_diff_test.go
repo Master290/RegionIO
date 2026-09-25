@@ -99,6 +99,9 @@ func TestVanillaLushClayDiff(t *testing.T) {
 	}
 	var totalMissing, totalAnchors, totalExtra int
 	gen := NewVanillaRegionGenerator(12345)
+	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "h4" {
+		gen = newVanillaRegionH4Generator(12345, h4OrderFromEnv())
+	}
 	for _, key := range plainOrder {
 		a, okA := plain[key]
 		b, okB := noClay[key]

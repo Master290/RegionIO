@@ -62,6 +62,103 @@ func decorationSources(targetX, targetZ int32) []decorationSource {
 	return sources
 }
 
+type decorationBatchSpec struct {
+	anchor            [2]int32
+	publicationRadius int32
+	sourceRadius      int32
+	baseRadius        int32
+}
+
+func floorDivCoordinate(value, divisor int64) int64 {
+	quotient := value / divisor
+	if value%divisor < 0 {
+		quotient--
+	}
+	return quotient
+}
+
+func canonicalDecorationAnchor(targetX, targetZ int32) [2]int32 {
+	return [2]int32{
+		int32(3 * floorDivCoordinate(int64(targetX)+1, 3)),
+		int32(3 * floorDivCoordinate(int64(targetZ)+1, 3)),
+	}
+}
+
+func h4DecorationBatchSpec(targetX, targetZ int32) decorationBatchSpec {
+	return h4DecorationBatchSpecWithRadii(targetX, targetZ, 2, 3)
+}
+
+func h4DecorationBatchSpecWithRadii(targetX, targetZ, sourceRadius, baseRadius int32) decorationBatchSpec {
+	return decorationBatchSpec{
+		anchor:            canonicalDecorationAnchor(targetX, targetZ),
+		publicationRadius: 1,
+		sourceRadius:      sourceRadius,
+		baseRadius:        baseRadius,
+	}
+}
+
+type h4SourceOrder uint8
+
+const (
+	h4OrderZMajor h4SourceOrder = iota
+	h4OrderXMajor
+	h4OrderReverse
+	h4OrderAnchorFirst
+	h4OrderAnchorXMajor
+	h4ProductionOrder = h4OrderXMajor
+)
+
+func h4DecorationSourcesWithOrder(anchorX, anchorZ int32, order h4SourceOrder) []decorationSource {
+	return h4DecorationSourcesWithRadii(anchorX, anchorZ, 2, order)
+}
+
+func h4DecorationSourcesWithRadii(anchorX, anchorZ, radius int32, order h4SourceOrder) []decorationSource {
+	count := int(radius*2 + 1)
+	sources := make([]decorationSource, 0, count*count)
+	for sourceZ := anchorZ - radius; sourceZ <= anchorZ+radius; sourceZ++ {
+		for sourceX := anchorX - radius; sourceX <= anchorX+radius; sourceX++ {
+			sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
+		}
+	}
+	if order == h4OrderXMajor {
+		sort.Slice(sources, func(i, j int) bool {
+			if sources[i].X != sources[j].X {
+				return sources[i].X < sources[j].X
+			}
+			return sources[i].Z < sources[j].Z
+		})
+	} else if order == h4OrderAnchorFirst {
+		sort.Slice(sources, func(i, j int) bool {
+			di := max(abs32(sources[i].X-anchorX), abs32(sources[i].Z-anchorZ))
+			dj := max(abs32(sources[j].X-anchorX), abs32(sources[j].Z-anchorZ))
+			if di != dj {
+				return di < dj
+			}
+			if sources[i].X != sources[j].X {
+				return sources[i].X < sources[j].X
+			}
+			return sources[i].Z < sources[j].Z
+		})
+	} else if order == h4OrderAnchorXMajor {
+		sort.Slice(sources, func(i, j int) bool {
+			iAnchor := sources[i].X == anchorX && sources[i].Z == anchorZ
+			jAnchor := sources[j].X == anchorX && sources[j].Z == anchorZ
+			if iAnchor != jAnchor {
+				return iAnchor
+			}
+			if sources[i].X != sources[j].X {
+				return sources[i].X < sources[j].X
+			}
+			return sources[i].Z < sources[j].Z
+		})
+	} else if order == h4OrderReverse {
+		for left, right := 0, len(sources)-1; left < right; left, right = left+1, right-1 {
+			sources[left], sources[right] = sources[right], sources[left]
+		}
+	}
+	return sources
+}
+
 // replayScheduledOres replays the nine source centers around the target, in the order
 // decorationSources gives, into a shared region. The region must contain the target's
 // radius-two base terrain; each source pass may write only within radius one of itself.
@@ -198,4 +295,3 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	}
 	return nil
 }
-

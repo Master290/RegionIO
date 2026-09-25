@@ -2264,3 +2264,29 @@ That is a claim about the fixture, not a licence to re-baseline against "generat
 physics": the number of affected cells has to come from a census over the fixtures, and the
 two cells our spring writes as `water[level=8]` where vanilla's source is `water[level=0]` are
 ours to fix regardless of what the waterfall turns out to be.
+
+## Task 21: H4 shared replay is an opt-in experiment, not production parity
+
+The shared-replay engine now exists behind `NewVanillaRegionH4Generator` and
+`NewVanillaRegionH4BatchGenerator`. It builds one 7x7 mutable region per canonical
+3x3 tile, replays each of the 25 source origins once, and publishes only the
+canonical 3x3. The canonical anchor is a fixed tile owner, so a coordinate no
+longer depends on which request happened to generate it. `decorationSources` and
+the production hybrid remain unchanged.
+
+The first measurements are deliberately not a new ratchet. Vanilla fixes no
+FEATURES-on-FEATURES order, so the H4 order is a model choice. Against the
+committed captures, X-major gives 392,248/393,216 ocean cells, 391,120/393,216
+land cells, and a lush-caves-clay chain of 228 missing / 36 anchors / 211 extra.
+Anchor-first gives 392,515 ocean, 390,922 land, and 111/24/83 for the clay
+chain, with 739 surface mismatches. Neither order is uniformly better. The old
+hybrid measures 392,886 ocean, 390,895 land, and
+96/22/9 for the clay chain. H4 is therefore a coherent architecture experiment,
+not a replacement for the capture-fitted production model. The canonical cache
+entry point and its tests are kept so a later switch is a wiring change, but
+`server.New` still uses the old generator and no ratchet has been loosened. A
+7x7-vs-9x9 ring-closure check passes for the canonical spawn tile, so the
+initial base halo is large enough for the publication cells in that window; it
+does not prove anything about a wider translation. The hand-written village
+pass was removed from the production region replay; only the legacy per-chunk
+fallback still calls it.

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 )
 
@@ -282,6 +283,38 @@ func TestConcurrentOverlappingBatchLoadsShareFirstResult(t *testing.T) {
 	}
 }
 
+func TestCanonicalBatchGeneratorCoalescesTileMembers(t *testing.T) {
+	var calls atomic.Int32
+	c := NewCache(-1, GenerateFlat)
+	c.SetCanonicalBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		calls.Add(1)
+		anchor := canonicalDecorationAnchor(cx, cz)
+		time.Sleep(10 * time.Millisecond)
+		batch := make(map[[2]int32]*Chunk, 9)
+		for x := anchor[0] - 1; x <= anchor[0]+1; x++ {
+			for z := anchor[1] - 1; z <= anchor[1]+1; z++ {
+				batch[[2]int32{x, z}] = NewChunk(x, z, BiomePlains)
+			}
+		}
+		return batch, nil
+	}, canonicalDecorationAnchor)
+
+	var wg sync.WaitGroup
+	for _, key := range [][2]int32{{0, 0}, {1, 0}, {-1, -1}} {
+		wg.Add(1)
+		go func(key [2]int32) {
+			defer wg.Done()
+			if chunk, err := c.chunkAtErr(key[0], key[1]); err != nil || chunk == nil {
+				t.Errorf("chunk (%d,%d) = %v, %v", key[0], key[1], chunk, err)
+			}
+		}(key)
+	}
+	wg.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("canonical batch calls = %d, want 1", got)
+	}
+}
+
 func TestBatchGeneratorRejectsWrongTargetCoordinates(t *testing.T) {
 	c := NewCache(-1, GenerateFlat)
 	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
@@ -318,6 +351,98 @@ func TestBatchGeneratorPrefersPersistedNeighbors(t *testing.T) {
 	neighbor := c.chunkAt(1, 0)
 	if got := neighbor.GetBlock(0, SeaLevel, 0); got != StateBedrock {
 		t.Fatalf("batch neighbor state = %d, want persisted bedrock %d", got, StateBedrock)
+	}
+}
+
+func TestCanonicalBatchRejectsMalformedResultWithoutPublishing(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	c.SetCanonicalBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		return map[[2]int32]*Chunk{{cx, cz}: NewChunk(cx, cz, BiomePlains)}, nil
+	}, canonicalDecorationAnchor)
+	if _, err := c.chunkAtErr(0, 0); err == nil {
+		t.Fatal("malformed canonical batch succeeded")
+	}
+	c.mu.Lock()
+	published := len(c.chunks)
+	c.mu.Unlock()
+	if published != 0 {
+		t.Fatalf("malformed canonical batch published %d chunks", published)
+	}
+}
+
+func TestCanonicalBatchGeneratorPrefersPersistedNeighbors(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	persisted := NewChunk(1, 0, BiomePlains)
+	persisted.SetBlock(0, SeaLevel, 0, StateBedrock)
+	if err := store.SaveChunk(persisted); err != nil {
+		t.Fatal(err)
+	}
+	c := NewCacheWithStore(-1, GenerateFlat, store)
+	c.SetCanonicalBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		anchor := canonicalDecorationAnchor(cx, cz)
+		batch := make(map[[2]int32]*Chunk, 9)
+		for x := anchor[0] - 1; x <= anchor[0]+1; x++ {
+			for z := anchor[1] - 1; z <= anchor[1]+1; z++ {
+				chunk := NewChunk(x, z, BiomePlains)
+				chunk.SetBlock(0, SeaLevel, 0, StateGrass)
+				batch[[2]int32{x, z}] = chunk
+			}
+		}
+		return batch, nil
+	}, canonicalDecorationAnchor)
+	if got := c.chunkAt(0, 0); got == nil {
+		t.Fatal("batch target was not loaded")
+	}
+	neighbor := c.chunkAt(1, 0)
+	if got := neighbor.GetBlock(0, SeaLevel, 0); got != StateBedrock {
+		t.Fatalf("canonical batch neighbor state = %d, want persisted bedrock %d", got, StateBedrock)
+	}
+}
+
+func TestCanonicalBatchGeneratorRegeneratesStalePersistedChunks(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// Write both the tile's target and one of its neighbours straight to the
+	// region file with the previous generatorVersion. This is what a world
+	// saved before the current version bump looks like, and the point of the
+	// stamp is that neither is served from disk.
+	for _, key := range [][2]int32{{0, 0}, {1, 0}} {
+		compound := chunkToNBT(NewChunk(key[0], key[1], BiomePlains))
+		compound.Set(generatorVersionTag, nbt.Int(generatorVersion-1))
+		raw := nbt.MarshalNamed("", compound)
+		rf, err := store.regionFor(key[0], key[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, lx, lz := regionIndex(key[0], key[1])
+		if err := rf.WriteChunk(lx, lz, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := NewCacheWithStore(-1, GenerateFlat, store)
+	c.SetCanonicalBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		anchor := canonicalDecorationAnchor(cx, cz)
+		batch := make(map[[2]int32]*Chunk, 9)
+		for x := anchor[0] - 1; x <= anchor[0]+1; x++ {
+			for z := anchor[1] - 1; z <= anchor[1]+1; z++ {
+				chunk := NewChunk(x, z, BiomePlains)
+				chunk.SetBlock(0, SeaLevel, 0, StateGrass)
+				batch[[2]int32{x, z}] = chunk
+			}
+		}
+		return batch, nil
+	}, canonicalDecorationAnchor)
+	for _, key := range [][2]int32{{0, 0}, {1, 0}} {
+		if got := c.chunkAt(key[0], key[1]).GetBlock(0, SeaLevel, 0); got != StateGrass {
+			t.Fatalf("stale chunk (%d,%d) served state %d, want regenerated grass %d", key[0], key[1], got, StateGrass)
+		}
 	}
 }
 

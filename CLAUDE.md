@@ -273,6 +273,27 @@ and (1,0) get vanilla's Z-major/X-minor order, and every other target — includ
 assume a chunk that is not (0,0) or (1,0) has a modelled neighbour order; the next fix of this class
 should derive the order once against a multi-target capture rather than add a third `if`.
 
+The opt-in H4 path (`NewVanillaRegionH4Generator` / `NewVanillaRegionH4BatchGenerator`) is the
+first implementation of the alternative: one canonical 3×3 tile, one shared 7×7 region, and
+25 source origins replayed once instead of nine independent per-target histories. It is measured
+but not production: X-major gives 392,248/393,216 ocean and 391,120/393,216 land, while the
+committed hybrid gives 392,886 and 390,895; the H4 clay differential is 228/36/211 against
+96/22/9. `server.New` still uses the hybrid, and no ratchet was loosened. The canonical cache
+entry point and ring-closure test are kept so a later switch is a wiring decision, not a new
+architecture hidden in a parity edit. The hand-written `worldgen.PlaceStructures` village pass
+is no longer called by the production region replay; only the explicitly legacy per-chunk
+fallback retains it. Because that removal changes generated terrain, `generatorVersion` is 41:
+every chunk stamped 40 or earlier regenerates rather than keeping the hand-placed village.
+
+The canonical cache treats a stored chunk as read-only, never as a replay input. A request for a
+tile probes the store for its own target first and reconciles the remaining members afterwards, so
+a persisted neighbour keeps its saved blocks instead of being overwritten by a regenerated one.
+The stamp is what makes this safe across generator changes: `LoadChunk` rejects anything whose
+`generatorVersion` differs, so "read-only" applies only to chunks the current generator could have
+written. Both directions are asserted —
+`TestCanonicalBatchGeneratorPrefersPersistedNeighbors` and
+`TestCanonicalBatchGeneratorRegeneratesStalePersistedChunks`.
+
 ## Testing worldgen
 
 `make verify` is the gate, but most generator defects are invisible to it — they show up as terrain

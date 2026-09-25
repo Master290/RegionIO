@@ -79,6 +79,9 @@ func TestVanillaLandTreeChainDiff(t *testing.T) {
 				t.Fatalf("%d chunks plain, %d with the chain disabled", len(plain.chunks), len(off.chunks))
 			}
 			gen := NewVanillaRegionGenerator(plain.seed)
+			if os.Getenv("REGIONIO_PARITY_GENERATOR") == "h4" {
+				gen = newVanillaRegionH4Generator(plain.seed, h4OrderFromEnv())
+			}
 			var trunkOrCanopy, matched, oursPlaces, cascade, anyDifference int
 			// On the footprint only: which block we put where vanilla put which. This
 			// is what separates "the wrong species was drawn" from "the canopy is

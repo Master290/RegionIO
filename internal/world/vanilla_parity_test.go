@@ -15,6 +15,21 @@ import (
 
 const vanillaParityFixture = "testdata/vanilla_overworld_12345.bin"
 
+func h4OrderFromEnv() h4SourceOrder {
+	switch os.Getenv("REGIONIO_H4_ORDER") {
+	case "x-major":
+		return h4OrderXMajor
+	case "reverse":
+		return h4OrderReverse
+	case "anchor-first":
+		return h4OrderAnchorFirst
+	case "anchor-x-major":
+		return h4OrderAnchorXMajor
+	default:
+		return h4ProductionOrder
+	}
+}
+
 func TestVanillaBlockParity(t *testing.T) {
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
@@ -38,8 +53,11 @@ func TestVanillaBlockParity(t *testing.T) {
 		t.Fatalf("fixture seed=%d chunks=%d", seed, count)
 	}
 	gen := NewVanillaRegionGenerator(seed)
-	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "legacy" {
+	switch os.Getenv("REGIONIO_PARITY_GENERATOR") {
+	case "legacy":
 		gen = NewVanillaGenerator(seed)
+	case "h4":
+		gen = newVanillaRegionH4Generator(seed, h4OrderFromEnv())
 	}
 	type statePair struct{ got, want uint16 }
 	pairs := make(map[statePair]int)

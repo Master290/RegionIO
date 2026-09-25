@@ -95,6 +95,7 @@ var excusedGates = map[string]string{
 	// re-measures by hand, so setting it in automation would ask CI to do the
 	// same work less completely than it already does.
 	"REGIONIO_DECORATION_ORDER_ARM": "an arm filter for TestDecorationSourceOrderParity, whose enabling gate REGIONIO_DECORATION_ORDER_DIAGNOSTIC is set by the Makefile and CI; the job runs every arm, so naming one in automation would only run a subset",
+	"REGIONIO_H4_ORDER":             "an H4 model-order selector used while measuring the shared replay; the default is exercised by the H4 batch contract test and the choice is not a vanilla gate",
 	// Fixture paths and capture parameters: a tool flag or an optional fixture
 	// location rather than a diagnostic gate.
 	"REGIONIO_BASE_CAPTURE":     "path to an optional base-terrain capture; the test that reads it skips when the file is absent",

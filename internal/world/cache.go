@@ -56,9 +56,11 @@ type Cache struct {
 	// Streamers may have their own workers, but they share this admission gate.
 	frameSlots chan struct{}
 	// LRU bookkeeping: order is MRU(front)→LRU(back); index gives O(1) lookup.
-	order *list.List // elements are *[2]int32; nil when maxChunks==0
-	index map[[2]int32]*list.Element
-	loads map[[2]int32]*chunkLoad
+	order       *list.List // elements are *[2]int32; nil when maxChunks==0
+	index       map[[2]int32]*list.Element
+	loads       map[[2]int32]*chunkLoad
+	batchLoads  map[[2]int32]*batchLoad
+	batchAnchor func(int32, int32) [2]int32
 }
 
 // SetBatchGenerator enables optional batch generation. It must be called before
@@ -66,6 +68,14 @@ type Cache struct {
 func (c *Cache) SetBatchGenerator(gen BatchGenerator) {
 	c.mu.Lock()
 	c.batchGen = gen
+	c.batchAnchor = nil
+	c.mu.Unlock()
+}
+
+func (c *Cache) SetCanonicalBatchGenerator(gen BatchGenerator, anchor func(int32, int32) [2]int32) {
+	c.mu.Lock()
+	c.batchGen = gen
+	c.batchAnchor = anchor
 	c.mu.Unlock()
 }
 
@@ -75,6 +85,12 @@ type chunkLoad struct {
 	done chan struct{}
 	ch   *Chunk
 	err  error
+}
+
+type batchLoad struct {
+	done   chan struct{}
+	chunks map[[2]int32]*Chunk
+	err    error
 }
 
 // NewCache returns a world cache that frames packets at the given compression
@@ -97,6 +113,7 @@ func NewCache(threshold int32, gen Generator) *Cache {
 		tickets:    make(map[[2]int32]int),
 		inflight:   make(map[[2]int32]int),
 		loads:      make(map[[2]int32]*chunkLoad),
+		batchLoads: make(map[[2]int32]*batchLoad),
 		frameSlots: make(chan struct{}, workers),
 	}
 	return c
@@ -186,6 +203,13 @@ func (c *Cache) chunkAt(cx, cz int32) *Chunk {
 // chunkAtErr is the error-preserving form used by network and mutation paths.
 // A corrupt or unreadable stored chunk is never replaced by generated terrain.
 func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
+	c.mu.Lock()
+	canonical := c.batchAnchor != nil
+	c.mu.Unlock()
+	if canonical {
+		return c.chunkAtCanonicalErr(cx, cz)
+	}
+
 	key := [2]int32{cx, cz}
 
 	c.mu.Lock()
@@ -273,6 +297,125 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	close(pending.done)
 	c.mu.Unlock()
 	return ch, loadErr
+}
+
+func validateCanonicalBatch(anchor [2]int32, batch map[[2]int32]*Chunk) error {
+	if len(batch) != 9 {
+		return fmt.Errorf("world: canonical batch (%d,%d) returned %d chunks, want 9", anchor[0], anchor[1], len(batch))
+	}
+	for x := anchor[0] - 1; x <= anchor[0]+1; x++ {
+		for z := anchor[1] - 1; z <= anchor[1]+1; z++ {
+			key := [2]int32{x, z}
+			chunk := batch[key]
+			if chunk == nil || chunk.X != x || chunk.Z != z {
+				return fmt.Errorf("world: canonical batch (%d,%d) has invalid chunk %v", anchor[0], anchor[1], key)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Cache) chunkAtCanonicalErr(cx, cz int32) (*Chunk, error) {
+	key := [2]int32{cx, cz}
+	c.mu.Lock()
+	if chunk := c.chunks[key]; chunk != nil {
+		c.touch(key)
+		c.mu.Unlock()
+		return chunk, nil
+	}
+	batchGen := c.batchGen
+	anchorFor := c.batchAnchor
+	c.mu.Unlock()
+	if batchGen == nil || anchorFor == nil {
+		return nil, errors.New("world: canonical batch generator is not configured")
+	}
+
+	if c.store != nil {
+		loaded, err := c.store.LoadChunk(cx, cz)
+		if err == nil {
+			c.mu.Lock()
+			if existing := c.chunks[key]; existing != nil {
+				loaded = existing
+			} else {
+				c.chunks[key] = loaded
+				c.touch(key)
+			}
+			c.evictIfNeeded()
+			c.mu.Unlock()
+			return loaded, nil
+		}
+		if !errors.Is(err, ErrChunkNotFound) {
+			return nil, err
+		}
+	}
+
+	anchor := anchorFor(cx, cz)
+	c.mu.Lock()
+	if chunk := c.chunks[key]; chunk != nil {
+		c.touch(key)
+		c.mu.Unlock()
+		return chunk, nil
+	}
+	if pending := c.batchLoads[anchor]; pending != nil {
+		c.mu.Unlock()
+		<-pending.done
+		if pending.err != nil {
+			return nil, pending.err
+		}
+		chunk := pending.chunks[key]
+		if chunk == nil {
+			return nil, fmt.Errorf("world: canonical batch (%d,%d) omitted target (%d,%d)", anchor[0], anchor[1], cx, cz)
+		}
+		return chunk, nil
+	}
+	pending := &batchLoad{done: make(chan struct{})}
+	c.batchLoads[anchor] = pending
+	c.mu.Unlock()
+
+	batch, err := batchGen(anchor[0], anchor[1])
+	if err == nil {
+		if batch[key] == nil {
+			err = fmt.Errorf("world: canonical batch (%d,%d) omitted target (%d,%d)", anchor[0], anchor[1], cx, cz)
+		}
+	}
+	if err == nil && c.store != nil {
+		batch, err = c.reconcileBatchStore(key, batch)
+	}
+	if err == nil {
+		err = validateCanonicalBatch(anchor, batch)
+	}
+	c.mu.Lock()
+	if err != nil {
+		pending.err = err
+	} else {
+		for batchKey, chunk := range batch {
+			if chunk == nil || chunk.X != batchKey[0] || chunk.Z != batchKey[1] {
+				err = fmt.Errorf("world: canonical batch returned invalid chunk %v", batchKey)
+				break
+			}
+		}
+		if err == nil {
+			for batchKey, chunk := range batch {
+				if existing := c.chunks[batchKey]; existing != nil {
+					batch[batchKey] = existing
+					continue
+				}
+				c.chunks[batchKey] = chunk
+				c.touch(batchKey)
+			}
+			pending.chunks = batch
+			c.evictIfNeeded()
+		} else {
+			pending.err = err
+		}
+	}
+	delete(c.batchLoads, anchor)
+	close(pending.done)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return batch[key], nil
 }
 
 func (c *Cache) reconcileBatchStore(target [2]int32, batch map[[2]int32]*Chunk) (map[[2]int32]*Chunk, error) {

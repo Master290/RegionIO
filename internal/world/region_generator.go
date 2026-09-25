@@ -1,6 +1,7 @@
 package world
 
 import (
+	"fmt"
 	"sync"
 
 	"regionio/internal/worldgen"
@@ -107,6 +108,97 @@ func NewVanillaRegionGenerators(seed int64) (Generator, BatchGenerator) {
 		vanillaRegionBatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain)
 }
 
+func NewVanillaRegionH4Generator(seed int64) Generator {
+	return newVanillaRegionH4Generator(seed, h4ProductionOrder)
+}
+
+func newVanillaRegionH4Generator(seed int64, order h4SourceOrder) Generator {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return vanillaRegionH4GeneratorFromInputs(seed, od, fluidPicker, veins, carver, newVanillaTerrainCache(256), order)
+}
+
+func NewVanillaRegionH4BatchGenerator(seed int64) BatchGenerator {
+	return newVanillaRegionH4BatchGenerator(seed, h4ProductionOrder)
+}
+
+func newVanillaRegionH4BatchGenerator(seed int64, order h4SourceOrder) BatchGenerator {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return vanillaRegionH4BatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver, newVanillaTerrainCache(256), order)
+}
+
+func newVanillaRegionH4BatchGeneratorWithRadii(seed int64, order h4SourceOrder, sourceRadius, baseRadius int32) BatchGenerator {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	return vanillaRegionH4BatchGeneratorFromInputsWithRadii(seed, od, fluidPicker, veins, carver, newVanillaTerrainCache(256), order, sourceRadius, baseRadius)
+}
+
+func NewVanillaRegionH4Generators(seed int64) (Generator, BatchGenerator) {
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(seed)
+	terrain := newVanillaTerrainCache(256)
+	return vanillaRegionH4GeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain, h4ProductionOrder),
+		vanillaRegionH4BatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain, h4ProductionOrder)
+}
+
+func CanonicalDecorationAnchor(cx, cz int32) [2]int32 {
+	return canonicalDecorationAnchor(cx, cz)
+}
+
+func vanillaRegionH4GeneratorFromInputs(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, terrain *vanillaTerrainCache, order h4SourceOrder) Generator {
+	batchGen := vanillaRegionH4BatchGeneratorFromInputs(seed, od, fluidPicker, veins, carver, terrain, order)
+	return func(targetX, targetZ int32) *Chunk {
+		batch, err := batchGen(targetX, targetZ)
+		if err != nil {
+			panic("world: H4 region replay: " + err.Error())
+		}
+		chunk := batch[[2]int32{targetX, targetZ}]
+		if chunk == nil {
+			panic("world: H4 region replay omitted target")
+		}
+		return chunk
+	}
+}
+
+func vanillaRegionH4BatchGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, terrain *vanillaTerrainCache, order h4SourceOrder) BatchGenerator {
+	return vanillaRegionH4BatchGeneratorFromInputsWithRadii(seed, od, fluidPicker, veins, carver, terrain, order, 2, 3)
+}
+
+func vanillaRegionH4BatchGeneratorFromInputsWithRadii(seed int64, od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, terrain *vanillaTerrainCache, order h4SourceOrder, sourceRadius, baseRadius int32) BatchGenerator {
+	return func(targetX, targetZ int32) (map[[2]int32]*Chunk, error) {
+		spec := h4DecorationBatchSpecWithRadii(targetX, targetZ, sourceRadius, baseRadius)
+		span := 2*spec.baseRadius + 1
+		chunkCount := int(span * span)
+		base := make(map[[2]int32]*Chunk, chunkCount)
+		chunks := make([]*Chunk, 0, chunkCount)
+		for cx := spec.anchor[0] - spec.baseRadius; cx <= spec.anchor[0]+spec.baseRadius; cx++ {
+			for cz := spec.anchor[1] - spec.baseRadius; cz <= spec.anchor[1]+spec.baseRadius; cz++ {
+				key := [2]int32{cx, cz}
+				base[key] = terrain.get(key, func() *Chunk {
+					return generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz)
+				})
+				chunks = append(chunks, terrainClone(base[key]))
+			}
+		}
+		region, err := newDecorationRegion(chunks)
+		if err != nil {
+			return nil, err
+		}
+		if err := region.replayScheduledOresWithSources(od, seed, spec.anchor[0], spec.anchor[1], h4DecorationSourcesWithRadii(spec.anchor[0], spec.anchor[1], spec.sourceRadius, order)); err != nil {
+			return nil, err
+		}
+		batch := make(map[[2]int32]*Chunk, 9)
+		for cx := spec.anchor[0] - spec.publicationRadius; cx <= spec.anchor[0]+spec.publicationRadius; cx++ {
+			for cz := spec.anchor[1] - spec.publicationRadius; cz <= spec.anchor[1]+spec.publicationRadius; cz++ {
+				key := [2]int32{cx, cz}
+				chunk := region.chunks[key]
+				if chunk == nil {
+					return nil, fmt.Errorf("world: H4 replay omitted publication chunk (%d,%d)", cx, cz)
+				}
+				batch[key] = chunk
+			}
+		}
+		return batch, nil
+	}
+}
+
 // vanillaRegionGeneratorFromInputs builds the single-chunk generator. sources decides
 // which order the nine decoration centers are replayed in and may be nil for
 // decorationSources; it exists so an ordering can be measured against the captures
@@ -148,7 +240,6 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 			panic("world: replaying region ores: " + err.Error())
 		}
 		target := region.chunks[[2]int32{targetX, targetZ}]
-		decorateGeneratedNonOre(target, od, seed)
 		return target
 	}
 }
@@ -183,33 +274,9 @@ func vanillaRegionBatchGeneratorFromInputs(seed int64, od *worldgen.OverworldDen
 					return nil, err
 				}
 				target := region.chunks[[2]int32{cx, cz}]
-				decorateGeneratedNonOre(target, od, seed)
 				batch[[2]int32{cx, cz}] = target
 			}
 		}
 		return batch, nil
 	}
 }
-
-func decorateGeneratedNonOre(c *Chunk, od *worldgen.OverworldDensity, seed int64) {
-	var surfTop [16][16]int
-	var biomeName [16][16]string
-	baseX, baseZ := int(c.X)*16, int(c.Z)*16
-	for x := 0; x < 16; x++ {
-		for z := 0; z < 16; z++ {
-			surfTop[x][z] = classifyColumnTopAtSurface(c, x, z)
-			biomeName[x][z] = BiomeNameAt(od, baseX+x, baseZ+z)
-		}
-	}
-	decorateNonOre(c, od, c.X, c.Z, seed, &surfTop, &biomeName)
-}
-
-func classifyColumnTopAtSurface(c *Chunk, x, z int) int {
-	var column [WorldHeight]uint16
-	for i := 0; i < WorldHeight; i++ {
-		column[i] = c.GetBlock(x, MinY+i, z)
-	}
-	top, _ := classifyColumn(&column)
-	return top
-}
-

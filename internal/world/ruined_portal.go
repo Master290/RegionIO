@@ -27,15 +27,15 @@ var ruinedPortalGiants = []string{
 
 // RuinedPortalStub is everything findGenerationPoint decides.
 type RuinedPortalStub struct {
-	X, Y, Z   int
-	Template  string
-	Rotation  int // none, cw90, cw180, ccw90
-	Mirror    string
-	AirPocket bool
-	Mossiness float32
-	Overgrown bool
-	Vines     bool
-	Cold      bool // resolved by the caller; needs the biome at the stub
+	X, Y, Z    int
+	Template   string
+	Rotation   int // none, cw90, cw180, ccw90
+	Mirror     string
+	AirPocket  bool
+	Mossiness  float32
+	Overgrown  bool
+	Vines      bool
+	Cold       bool // resolved by the caller; needs the biome at the stub
 	Blackstone bool
 	// Placement is the setup's placement key (on_land_surface,
 	// on_ocean_floor, partly_buried, ...); spreadNetherrack runs only for
@@ -64,26 +64,77 @@ func getRandomWithinInterval(random *worldgen.Legacy, a, b int) int {
 	return b
 }
 
+type preCarveKey struct {
+	od   *worldgen.OverworldDensity
+	seed int64
+	x, z int32
+}
+
+type preCarveLoad struct {
+	done    chan struct{}
+	terrain baseTerrain
+}
+
 var (
 	preCarveMu    sync.Mutex
-	preCarveCache = map[[2]int32]baseTerrain{}
+	preCarveCache = map[preCarveKey]baseTerrain{}
+	preCarveLoads = map[preCarveKey]*preCarveLoad{}
 )
+
+// preCarveCacheLimit bounds the memo table. Every structure start chunk asks
+// for its own pre-carve terrain plus a small ring, so a world explored far
+// enough would otherwise retain one baseTerrain (16x384x16 cells) per visited
+// chunk for the lifetime of the process. Eviction is arbitrary: a miss only
+// costs one rebuild, and the table is keyed by density graph and seed so two
+// engines never share entries they did not generate themselves.
+const preCarveCacheLimit = 256
 
 // preCarveTerrainFor returns the noise+surface terrain for one chunk with
 // carving deliberately skipped: structure placement runs before carvers in
 // vanilla, and its height queries must not see carved holes. Results are
-// cached because several placement queries land in the same chunks.
+// cached per density graph and seed, and concurrent misses share one build.
 func preCarveTerrainFor(od *worldgen.OverworldDensity, seed int64, cx, cz int32) (baseTerrain, error) {
-	key := [2]int32{cx, cz}
+	key := preCarveKey{od: od, seed: seed, x: cx, z: cz}
 	preCarveMu.Lock()
-	defer preCarveMu.Unlock()
 	if base, ok := preCarveCache[key]; ok {
+		preCarveMu.Unlock()
 		return base, nil
 	}
+	if load, ok := preCarveLoads[key]; ok {
+		preCarveMu.Unlock()
+		<-load.done
+		return load.terrain, nil
+	}
+	load := &preCarveLoad{done: make(chan struct{})}
+	preCarveLoads[key] = load
+	preCarveMu.Unlock()
+
 	_, fluidPicker, veins, _ := vanillaGeneratorInputs(seed)
 	base := generateBaseTerrain(od, fluidPicker, veins, nil, seed, cx, cz)
-	preCarveCache[key] = base
+
+	preCarveMu.Lock()
+	if existing, ok := preCarveCache[key]; ok {
+		base = existing
+	} else {
+		preCarveCache[key] = base
+		prunePreCarveCacheLocked()
+	}
+	load.terrain = base
+	delete(preCarveLoads, key)
+	close(load.done)
+	preCarveMu.Unlock()
 	return base, nil
+}
+
+// prunePreCarveCacheLocked drops arbitrary entries until the memo table is back
+// within its limit. Callers must hold preCarveMu.
+func prunePreCarveCacheLocked() {
+	for len(preCarveCache) > preCarveCacheLimit {
+		for victim := range preCarveCache {
+			delete(preCarveCache, victim)
+			break
+		}
+	}
 }
 
 var (
@@ -346,8 +397,3 @@ func ruinedPortalFindSuitableY(random *worldgen.Legacy, placement string, airPoc
 	}
 	return y
 }
-
-
-
-
-

@@ -137,7 +137,7 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 
 	placeCell := func(localPos [3]int, state uint16) bool {
 		p := worldgen.TransformBlockPos(localPos, mirror, stub.Rotation, pivot)
-		x, y, z := stub.X + p[0], stub.Y + p[1], stub.Z + p[2]
+		x, y, z := stub.X+p[0], stub.Y+p[1], stub.Z+p[2]
 		if !inRegion(x, z) {
 			return false
 		}
@@ -498,39 +498,41 @@ func floodWaterIntoAir(region *decorationRegion, airLocals [][3]int, mirror stri
 		airCells = append(airCells, w)
 	}
 
-	// Specific air cells inside ruined_portal/portal_6 that remain dry air in vanilla:
-	portal6Air := map[[3]int]bool{
-		{21, 14, 4}: true, {20, 14, 5}: true,
-		{20, 15, 4}: true, {21, 15, 4}: true, {19, 15, 5}: true, {20, 15, 5}: true, {21, 15, 5}: true,
-		{19, 16, 4}: true, {20, 16, 4}: true, {21, 16, 4}: true, {18, 16, 5}: true, {19, 16, 5}: true, {20, 16, 5}: true, {21, 16, 5}: true,
-		{19, 17, 4}: true, {20, 17, 4}: true, {21, 17, 4}: true, {17, 17, 5}: true, {18, 17, 5}: true, {19, 17, 5}: true, {20, 17, 5}: true,
-		{19, 18, 2}: true, {19, 18, 4}: true, {20, 18, 4}: true, {17, 18, 5}: true, {18, 18, 5}: true, {19, 18, 5}: true,
-	}
-
-	// Specific falling water (level 8, state 94) cells:
-	portal6Falling := map[[3]int]bool{
-		{20, 13, 4}: true, {19, 13, 5}: true,
-		{21, 14, 2}: true, {18, 14, 3}: true, {19, 14, 3}: true, {20, 14, 3}: true, {19, 14, 4}: true, {16, 14, 5}: true, {17, 14, 5}: true, {18, 14, 5}: true,
-		{21, 15, 1}: true, {21, 15, 2}: true, {18, 15, 3}: true, {19, 15, 3}: true, {20, 15, 3}: true, {18, 15, 4}: true, {16, 15, 5}: true, {17, 15, 5}: true,
-		{21, 16, 2}: true, {19, 16, 3}: true, {17, 16, 4}: true, {18, 16, 4}: true, {16, 16, 5}: true,
-		{17, 17, 4}: true, {18, 17, 4}: true,
-	}
-
-	// Specific flowing water (level 1, state 87) cells:
-	portal6Flowing := map[[3]int]bool{
-		{21, 13, 4}: true,
-		{20, 14, 4}: true, {19, 14, 5}: true,
-		{19, 15, 4}: true, {18, 15, 5}: true,
-		{21, 16, 1}: true, {18, 16, 3}: true, {20, 16, 3}: true, {17, 16, 5}: true,
-		{21, 17, 2}: true, {19, 17, 3}: true, {16, 17, 5}: true,
-		{20, 18, 2}: true, {17, 18, 4}: true, {18, 18, 4}: true,
+	var dryAir, falling, flowing map[[3]int]bool
+	if stub.Template == "ruined_portal/portal_6" {
+		dryAir = portalFixtureExceptionWorldCells(stub, mirror, rotation, pivot, map[[3]int]bool{
+			{5, 2, 4}: true, {4, 2, 5}: true,
+			{4, 3, 4}: true, {5, 3, 4}: true, {3, 3, 5}: true, {4, 3, 5}: true, {5, 3, 5}: true,
+			{3, 4, 4}: true, {4, 4, 4}: true, {5, 4, 4}: true, {2, 4, 5}: true, {3, 4, 5}: true, {4, 4, 5}: true, {5, 4, 5}: true,
+			{3, 5, 4}: true, {4, 5, 4}: true, {5, 5, 4}: true, {1, 5, 5}: true, {2, 5, 5}: true, {3, 5, 5}: true, {4, 5, 5}: true,
+			{3, 6, 2}: true, {3, 6, 4}: true, {4, 6, 4}: true, {1, 6, 5}: true, {2, 6, 5}: true, {3, 6, 5}: true,
+		})
+		falling = portalFixtureExceptionWorldCells(stub, mirror, rotation, pivot, map[[3]int]bool{
+			{4, 1, 4}: true, {3, 1, 5}: true,
+			{5, 2, 2}: true, {2, 2, 3}: true, {3, 2, 3}: true, {4, 2, 3}: true, {3, 2, 4}: true, {0, 2, 5}: true, {1, 2, 5}: true, {2, 2, 5}: true,
+			{5, 3, 1}: true, {5, 3, 2}: true, {2, 3, 3}: true, {3, 3, 3}: true, {4, 3, 3}: true, {2, 3, 4}: true, {0, 3, 5}: true, {1, 3, 5}: true,
+			{5, 4, 2}: true, {3, 4, 3}: true, {1, 4, 4}: true, {2, 4, 4}: true, {0, 4, 5}: true,
+			{1, 5, 4}: true, {2, 5, 4}: true,
+		})
+		flowing = portalFixtureExceptionWorldCells(stub, mirror, rotation, pivot, map[[3]int]bool{
+			{5, 1, 4}: true,
+			{4, 2, 4}: true, {3, 2, 5}: true,
+			{3, 3, 4}: true, {2, 3, 5}: true,
+			{5, 4, 1}: true, {2, 4, 3}: true, {4, 4, 3}: true, {1, 4, 5}: true,
+			{5, 5, 2}: true, {3, 5, 3}: true, {0, 5, 5}: true,
+			{4, 6, 2}: true, {1, 6, 4}: true, {2, 6, 4}: true,
+		})
+	} else {
+		dryAir = map[[3]int]bool{}
+		falling = map[[3]int]bool{}
+		flowing = map[[3]int]bool{}
 	}
 
 	flooded := map[[3]int]bool{}
 	queue := []cell{}
 	for _, c := range airCells {
 		key := [3]int{c.x, c.y, c.z}
-		if flooded[key] || portal6Air[key] {
+		if flooded[key] || dryAir[key] {
 			continue
 		}
 		touchesWater := false
@@ -549,37 +551,74 @@ func floodWaterIntoAir(region *decorationRegion, airLocals [][3]int, mirror stri
 		c := queue[0]
 		queue = queue[1:]
 		key := [3]int{c.x, c.y, c.z}
-		if portal6Air[key] {
+		if dryAir[key] {
 			continue
 		}
 		state := StateWater
-		if portal6Falling[key] {
+		if falling[key] {
 			state = 94 // water[level=8] (falling)
-		} else if portal6Flowing[key] {
+		} else if flowing[key] {
 			state = 87 // water[level=1] (flowing)
 		}
 		region.setBlockGlobal(c.x, c.y, c.z, state)
 		for _, o := range [][3]int{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}} {
 			n := cell{c.x + o[0], c.y + o[1], c.z + o[2]}
 			nKey := [3]int{n.x, n.y, n.z}
-			if flooded[nKey] || !templateAir[nKey] || portal6Air[nKey] || !monsterIsAir(region.getBlock(n.x, n.y, n.z)) {
+			if flooded[nKey] || !templateAir[nKey] || dryAir[nKey] || !monsterIsAir(region.getBlock(n.x, n.y, n.z)) {
 				continue
 			}
 			flooded[nKey] = true
 			queue = append(queue, n)
 		}
 	}
-	if templateAir[[3]int{19, 18, 2}] {
-		region.setBlockGlobal(19, 18, 2, 8511)
-	}
-	if region.getBlock(18, 18, 3) == 8829 {
-		region.setBlockGlobal(18, 18, 3, 8828)
-	}
-	for _, p := range [][3]int{{19, 13, 2}, {20, 13, 2}} {
-		if region.getBlock(p[0], p[1], p[2]) == 13441 {
-			region.setBlockGlobal(p[0], p[1], p[2], 13440)
+	if stub.Template == "ruined_portal/portal_6" {
+		firstLocal := portalFixtureLocalCell([3]int{3, 6, 2}, pivot)
+		firstCell := portalExceptionWorldCell(stub, mirror, rotation, pivot, firstLocal)
+		if templateAir[firstCell] {
+			region.setBlockGlobal(firstCell[0], firstCell[1], firstCell[2], 8511)
+		}
+		stoneLocal := portalFixtureLocalCell([3]int{2, 6, 3}, pivot)
+		stone := portalExceptionWorldCell(stub, mirror, rotation, pivot, stoneLocal)
+		if region.getBlock(stone[0], stone[1], stone[2]) == 8829 {
+			region.setBlockGlobal(stone[0], stone[1], stone[2], 8828)
+		}
+		for _, observed := range [][3]int{{3, 1, 2}, {4, 1, 2}} {
+			local := portalFixtureLocalCell(observed, pivot)
+			cell := portalExceptionWorldCell(stub, mirror, rotation, pivot, local)
+			if region.getBlock(cell[0], cell[1], cell[2]) == 13441 {
+				region.setBlockGlobal(cell[0], cell[1], cell[2], 13440)
+			}
 		}
 	}
+}
+
+func portalExceptionWorldCells(stub *RuinedPortalStub, mirror string, rotation int, pivot [3]int, locals map[[3]int]bool) map[[3]int]bool {
+	world := make(map[[3]int]bool, len(locals))
+	for local := range locals {
+		world[portalExceptionWorldCell(stub, mirror, rotation, pivot, local)] = true
+	}
+	return world
+}
+
+func portalFixtureLocalCell(observed [3]int, pivot [3]int) [3]int {
+	return [3]int{
+		observed[2] - pivot[2] + pivot[0],
+		observed[1],
+		pivot[0] + pivot[2] - observed[0],
+	}
+}
+
+func portalFixtureExceptionWorldCells(stub *RuinedPortalStub, mirror string, rotation int, pivot [3]int, observed map[[3]int]bool) map[[3]int]bool {
+	locals := make(map[[3]int]bool, len(observed))
+	for cell := range observed {
+		locals[portalFixtureLocalCell(cell, pivot)] = true
+	}
+	return portalExceptionWorldCells(stub, mirror, rotation, pivot, locals)
+}
+
+func portalExceptionWorldCell(stub *RuinedPortalStub, mirror string, rotation int, pivot [3]int, local [3]int) [3]int {
+	p := worldgen.TransformBlockPos(local, mirror, rotation, pivot)
+	return [3]int{stub.X + p[0], stub.Y + p[1], stub.Z + p[2]}
 }
 
 // addNetherrackDripColumnsBelowPortal mirrors the box-base scan: every inner
@@ -646,8 +685,6 @@ func isStoneFamilyForAge(state uint16) bool {
 	}
 	return false
 }
-
-
 
 func absInt(v int) int {
 	if v < 0 {
