@@ -10,6 +10,9 @@
 /server*.jar
 /libraries/
 /versions/
+# ...and the files the vanilla server writes on its first run in the repo root.
+/eula.txt
+/server.properties
 
 # Build output
 /dist/
