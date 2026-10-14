@@ -208,6 +208,10 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	}
 	wg.Wait()
 
+	// Surface rules test BiomeManager.getBiome per block, not the column biome
+	// above; see biome_zoom.go.
+	zoomed := newZoomedBiomes(od, seed, cx, cz)
+
 	for lx := 0; lx < 16; lx++ {
 		wg.Add(1)
 		go func(lx int) {
@@ -215,6 +219,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 			var sctx *worldgen.SurfaceContext
 			if ruleErr == nil {
 				sctx = surfaceRule.NewContext()
+				sctx.BiomeFunc = zoomed.at
 			}
 			for lz := 0; lz < 16; lz++ {
 				if ruleErr == nil {
@@ -232,9 +237,12 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	// vanilla: it needs the surfaced blocks to retexture a cave mouth, and
 	// decoration needs the carved heights so nothing is planted over a hole.
 	if carver != nil && ruleErr == nil {
+		// applyCarvers hands the same BiomeManager::getBiome to topMaterial.
+		carveCtx := surfaceRule.NewContext()
+		carveCtx.BiomeFunc = zoomed.at
 		view := &carveView{
 			cols: &columns, od: od, rules: surfaceRule,
-			sctx: surfaceRule.NewContext(), biomes: &biomeName,
+			sctx: carveCtx, biomes: &biomeName,
 			worldSurface: &worldSurface, baseX: baseX, baseZ: baseZ,
 		}
 		carver.CarveChunk(view, aq, int(cx), int(cz))

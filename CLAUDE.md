@@ -1,4 +1,4 @@
-﻿# RegionIO — working notes
+# RegionIO — working notes
 
 A Minecraft Java Edition server core in Go, targeting **26.1.2 / protocol 775**.
 The goal is vanilla fidelity, not a lookalike: where vanilla behaviour is known, match it exactly.
@@ -217,19 +217,32 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 40): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 42): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
 and **99.916% through the production region replay** — 330 residual cells, dominated by the
-lush-caves moss and clay pools and their nested vegetation. A featureless vanilla capture
-(`cmd/vanillacapture -featureless -blocks-only`,
-biomes stripped to their carvers) proves the undecorated pipeline bit-exact against it — density,
-surface rules, carvers, aquifers, and noise-router veins match every one of the fixture's cells — so
-the residual block gap is entirely inside feature replay.
-That fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
-chunks): **99.410%**, 2,321 residual cells, of which 687 are the surface band above sea level and 51
+lush-caves moss and clay pools and their nested vegetation. Featureless vanilla captures
+(`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) prove the
+undecorated pipeline bit-exact on both sets — 393,216/393,216 ocean and 786,432/786,432 land
+(`testdata/vanilla_land_base_12345.bin`, the four land chunks plus four decoration sources):
+density, surface rules, carvers, aquifers, and noise-router veins match every cell, and
+`runBaseTerrainParity` now fails on a single mismatch — so the residual block gap is entirely
+inside feature replay.
+That ocean fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
+chunks): **99.411%**, 2,317 residual cells, of which 683 are the surface band above sea level and 51
 the waterline band, with 607 of vanilla's 789 tree cells placed. Both bands are ratcheted in
 `world/vanilla_land_parity_test.go`, because the ocean floor of 99.7% leaves ~849 cells of headroom
 and an entirely wrong forest fits inside it.
+
+**The surface rules and carvers read the biome per block, through `BiomeManager.getBiome`.**
+`SurfaceRules$Context.updateY` memoizes `biomeGetter.apply(pos)` for every block, and both
+`SurfaceSystem.buildSurface` and `applyCarvers` pass `BiomeManager::getBiome` — the fiddled
+Voronoi zoom over the noise biomes, seeded by `obfuscateSeed` — not the 4×4×4 cell and not a
+per-column climate lookup. `world/biome_zoom.go` ports it and `TestBiomeZoomMatchesVanilla` pins
+it against vectors from `tools/VanillaBiomeZoomVectors.java`. The per-column biome it replaced
+agreed with vanilla everywhere except along borders between biomes whose surface rules differ,
+which is why it survived until the land base capture showed 29 podzol-for-grass cells on an
+old_growth_pine_taiga edge. `SurfaceContext.BiomeName` is now only a fallback for callers that
+set no `BiomeFunc`; anything new that applies the rule tree should set the getter.
 
 The underground stages are each pinned by their own capture, which is why they can be trusted while
 the surface ones cannot: monster rooms (`world/monster_rooms.go`) replay between geodes and the ores
@@ -282,8 +295,9 @@ committed hybrid gives 392,886 and 390,895; the H4 clay differential is 228/36/2
 entry point and ring-closure test are kept so a later switch is a wiring decision, not a new
 architecture hidden in a parity edit. The hand-written `worldgen.PlaceStructures` village pass
 is no longer called by the production region replay; only the explicitly legacy per-chunk
-fallback retains it. Because that removal changes generated terrain, `generatorVersion` is 41:
-every chunk stamped 40 or earlier regenerates rather than keeping the hand-placed village.
+fallback retains it. Because that removal changes generated terrain, `generatorVersion` went to 41:
+every chunk stamped 40 or earlier regenerates rather than keeping the hand-placed village. It is
+42 now, for the per-block biome zoom in the surface rules and carvers.
 
 The canonical cache treats a stored chunk as read-only, never as a replay input. A request for a
 tile probes the store for its own target first and reconciles the remaining members afterwards, so

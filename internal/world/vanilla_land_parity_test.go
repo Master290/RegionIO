@@ -19,7 +19,7 @@ import (
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
 // landSurfaceRatchet, landCellRatchet, landWaterlineRatchet are today's measured land
-// numbers: 687 surface-band mismatches, 51 waterline-band mismatches and 390,895 exact
+// numbers: 683 surface-band mismatches, 51 waterline-band mismatches and 390,899 exact
 // cells, with 607 of vanilla's 789 tree cells (77%).
 //
 // Both numbers moved twice when dark oaks arrived, and the two moves are separable:
@@ -42,9 +42,14 @@ import (
 // replayed, and the tally still shows mushrooms and one fallen tree - all of which shift
 // with the shared decoration stream, so their counts are a position signal, not a
 // coverage one.
+//
+// Moved again by generatorVersion 42, which made the surface rules and carvers read
+// BiomeManager.getBiome per block instead of one biome per column: surface band 687 ->
+// 683, exact cells 390,895 -> 390,899, waterline and tree cells unchanged. The cells are
+// the podzol/grass_block border the featureless land capture had pinned, now exact.
 const (
-	landSurfaceRatchet   = 687
-	landCellRatchet      = 390895
+	landSurfaceRatchet   = 683
+	landCellRatchet      = 390899
 	landWaterlineRatchet = 51
 )
 

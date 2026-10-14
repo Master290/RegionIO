@@ -1,4 +1,4 @@
-﻿# <p><img src="https://remo.su/regionio-full.svg" height="60"></p>
+# <p><img src="https://remo.su/regionio-full.svg" height="60"></p>
 
 A Minecraft Java Edition server core written in Go, targeting version
 **26.1.2** (protocol **775**). RegionIO implements the connection lifecycle
@@ -138,8 +138,9 @@ exposing undecorated chunks.
 
 The remaining block-parity gap is entirely inside feature replay: a vanilla
 capture with every feature and structure set stripped out matches our
-undecorated pipeline on all 393,216 cells, so density, surface rules, carvers,
-aquifers, and noise-router veins are already bit-exact. Stage-1 lava lakes,
+undecorated pipeline on all 393,216 cells, and a land one on all 786,432 (since the
+surface rules and carvers read the per-block zoomed biome, as vanilla's do), so density,
+surface rules, carvers, aquifers, and noise-router veins are already bit-exact. Stage-1 lava lakes,
 monster rooms (from their datapack configuration, between the geodes and the
 ores), ocean ruins (cell-for-cell against a dedicated `-no-features` vanilla
 capture of their area, falling gravel and bubble columns included), and
@@ -160,7 +161,7 @@ measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.410% (2,321 residual, 687 in the surface band) now, after
+hand-written trees, to 99.411% (2,317 residual, 683 in the surface band) now, after
 springs and boulders joined the schedule, the flora percentages were deleted, leaves
 were given the distance property vanilla propagates into them, dark oaks grew their
 own trunks and canopies, and three inverted guards in the ported `doPlace` were fixed —

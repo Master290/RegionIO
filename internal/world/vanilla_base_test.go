@@ -186,7 +186,14 @@ func runBaseTerrainParity(t *testing.T, fixturePath string) {
 		t.Logf("base %s -> %s: %d, y=%d..%d, samples %v",
 			stateLabel(key[0]), stateLabel(key[1]), pairs[key], rng[0], rng[1], samples[key])
 	}
-	if os.Getenv("REGIONIO_REQUIRE_BASE_PARITY") == "1" && exact != total {
-		t.Fatalf("base-terrain parity failed: %d mismatches", total-exact)
+	// Exact equality is asserted on every run, not only under
+	// REGIONIO_REQUIRE_BASE_PARITY: both featureless captures (ocean 393,216 and land
+	// 786,432 cells) match bit for bit since the surface rules and carvers read
+	// BiomeManager.getBiome per block (biome_zoom.go). The last residual was 29 cells
+	// of podzol against grass_block on an old_growth_pine_taiga border, which a
+	// per-column biome could not express. Undecorated terrain is the layer every
+	// decoration attribution stands on, so a single cell here is a regression.
+	if exact != total {
+		t.Fatalf("base-terrain parity failed: %d mismatches against %s", total-exact, fixturePath)
 	}
 }

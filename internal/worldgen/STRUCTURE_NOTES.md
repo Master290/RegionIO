@@ -2290,3 +2290,52 @@ initial base halo is large enough for the publication cells in that window; it
 does not prove anything about a wider translation. The hand-written village
 pass was removed from the production region replay; only the legacy per-chunk
 fallback still calls it.
+
+## The 29 podzol cells: the surface rules read a zoomed biome per block
+
+The land base capture left one pair: 29 cells of `podzol` where vanilla has
+`grass_block`, y=89..94 around (261..264, -474..-483), on an `old_growth_pine_taiga`
+edge. Those are the two outcomes of that biome's rule (`surface_noise_above(-0.95)` ->
+podzol) against the grass default of the neighbouring biome, so the question was which
+biome the rule tree was handed - not the noise threshold.
+
+The jar answers it in three reads:
+
+- `SurfaceRules$Context.updateY` sets `biome = Suppliers.memoize(() ->
+  biomeGetter.apply(pos.set(blockX, y, blockZ)))`, so the biome is per *block* and
+  re-resolved for every Y; `lambda$updateY$0` is the apply.
+- `SurfaceSystem.buildSurface` builds that getter from `BiomeManager::getBiome`
+  (offset 62), and `NoiseBasedChunkGenerator.applyCarvers` hands the same method
+  reference, over `withDifferentSource(getNoiseBiome)`, to the carvers' `topMaterial`.
+- `BiomeManager.getBiome` is the fiddled Voronoi zoom: shift the block by -2, take the
+  eight quart corners around it, jitter each by `getFiddle` (`floorMod(l >> 24, 1024)/1024`,
+  centred, times 0.9) from an LCG chain seeded with `obfuscateSeed(seed)` (SHA-256 of the
+  seed, first eight bytes, both little-endian), and keep the nearest under a strict `>`.
+
+This build handed the rule tree one biome per column, found from the 2D climate at the
+exact block column with depth 0. That is the same biome nearly everywhere - which is why
+both featureless captures stayed at 99.99%+ and the ocean one at 100% - and different
+exactly along a border between biomes whose surface rules disagree, offset by up to a
+couple of blocks and varying with Y.
+
+`world/biome_zoom.go` ports the zoom and memoizes noise biomes per quart, lazily, because
+vanilla's supplier is only evaluated when a biome or temperature condition is reached.
+`TestBiomeZoomMatchesVanilla` pins it against `tools/VanillaBiomeZoomVectors.java`, which
+calls the jar's own `getBiome` with a noise source that records the quart it is asked for;
+the vectors include the residual cells themselves and negative coordinates on every axis.
+
+Measured, `generatorVersion` 41 -> 42:
+
+| | before | after |
+|---|---|---|
+| land base (featureless) | 786,403/786,432, 1 pair | **786,432/786,432** |
+| ocean base (featureless) | 393,216/393,216 | 393,216/393,216 |
+| land exact cells | 390,895 | **390,899** |
+| land surface band | 687 | **683** |
+| land waterline band / tree cells | 51 / 607 | 51 / 607 |
+| source (16,-30) | 97,525 exact | **97,545** |
+| ocean exact, clay chain, ore parity | 392,886, 96/22/9, 0 | unchanged |
+
+Base parity is now asserted unconditionally in `runBaseTerrainParity`: with both
+captures exact, any undecorated mismatch is a regression rather than a known residual,
+and every attribution of a decorated cell to a feature leans on that layer.

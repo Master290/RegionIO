@@ -39,8 +39,19 @@ type SurfaceContext struct {
 	WaterHeight int
 	// SeaLevel is the world sea level (63 for the overworld).
 	SeaLevel int
-	// BiomeName is the resolved surface biome (e.g. "minecraft:desert").
+	// BiomeName is the resolved surface biome (e.g. "minecraft:desert"). It is
+	// used only when BiomeFunc is nil.
 	BiomeName string
+	// BiomeFunc, when set, resolves the biome at (X, Y, Z). Vanilla's
+	// SurfaceRules$Context.updateY memoizes biomeGetter.apply(pos) per block, and
+	// the getter is BiomeManager::getBiome, so the biome a rule tests can change
+	// with Y and near a border differs from any one per-column answer. It is
+	// called lazily, at most once per position, and only when a biome or
+	// temperature condition is actually reached - as vanilla's Supplier is.
+	BiomeFunc func(x, y, z int) string
+	biomeKey  [3]int
+	biomeSet  bool
+	biomeName string
 	// MinY is the world bottom for relative-anchor resolution.
 	MinY int
 	// Steep is true when the column's neighbours in the chunk differ in height
@@ -118,12 +129,29 @@ type ConditionTest interface {
 	Test(ctx *SurfaceContext) bool
 }
 
+// Biome returns the biome the rules see at the context's current position: the
+// lazily resolved, per-position BiomeFunc answer when a getter is set, otherwise
+// BiomeName.
+func (ctx *SurfaceContext) Biome() string {
+	if ctx.BiomeFunc == nil {
+		return ctx.BiomeName
+	}
+	key := [3]int{ctx.X, ctx.Y, ctx.Z}
+	if !ctx.biomeSet || ctx.biomeKey != key {
+		ctx.biomeName = ctx.BiomeFunc(ctx.X, ctx.Y, ctx.Z)
+		ctx.biomeKey = key
+		ctx.biomeSet = true
+	}
+	return ctx.biomeName
+}
+
 // biomeTest passes when the column's biome is in the allowlist.
 type biomeTest struct{ allowed []string }
 
 func (t biomeTest) Test(ctx *SurfaceContext) bool {
+	biome := ctx.Biome()
 	for _, b := range t.allowed {
-		if b == ctx.BiomeName {
+		if b == biome {
 			return true
 		}
 	}
@@ -173,7 +201,7 @@ func (t waterTest) Test(ctx *SurfaceContext) bool {
 type temperatureTest struct{}
 
 func (temperatureTest) Test(ctx *SurfaceContext) bool {
-	return coldEnoughToSnow(ctx.BiomeName)
+	return coldEnoughToSnow(ctx.Biome())
 }
 
 // yAboveTest passes when Y clears an anchor, with optional surface-depth and
