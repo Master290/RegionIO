@@ -17,6 +17,8 @@ const vanillaParityFixture = "testdata/vanilla_overworld_12345.bin"
 
 func h4OrderFromEnv() h4SourceOrder {
 	switch os.Getenv("REGIONIO_H4_ORDER") {
+	case "z-major":
+		return h4OrderZMajor
 	case "x-major":
 		return h4OrderXMajor
 	case "reverse":

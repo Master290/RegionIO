@@ -519,6 +519,7 @@ func TestMossResidualPlacementContext(t *testing.T) {
 	supportKind := make(map[mossResidualCell]string, len(res.cells))
 	terrainPairs := make(map[[2]string]int)
 	var examples []string
+	var missedCoords []string
 	for _, c := range res.cells {
 		cell := byChunk[[2]int32{int32(c.x >> 4), int32(c.z >> 4)}]
 		d := chunkEdgeDistance(c.x, c.z)
@@ -526,6 +527,9 @@ func TestMossResidualPlacementContext(t *testing.T) {
 			cell.missed++
 			missedTotal++
 			edge[d]++
+			if len(missedCoords) < 12 {
+				missedCoords = append(missedCoords, fmt.Sprintf("(%d,%d,%d:ours=%s)", c.x, c.y, c.z, stateLabel(c.ours)))
+			}
 		} else {
 			cell.extra++
 		}
@@ -614,6 +618,7 @@ func TestMossResidualPlacementContext(t *testing.T) {
 	for _, e := range examples {
 		t.Logf("    %s", e)
 	}
+	t.Logf("vanilla-only moss cells for draw-by-draw trace: %s", missedCoords)
 }
 
 func chunkEdgeDistance(x, z int) int {
