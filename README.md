@@ -155,14 +155,17 @@ clay, and cave vines. Surface decoration was the larger structural gap and has n
 reached: the hand-written tree path is deleted and trees replay from the
 datapack schedule through real trunk and foliage placers — straight, giant, fancy
 and dark-oak trunks, blob, pine, spruce, mega-pine, fancy and dark-oak canopies,
-with the beehive and alter-ground decorators — writing through the region's own
-radius-one gate, so a canopy may cross a chunk border exactly as vanilla's does. That band is
+with the beehive, alter-ground, place-on-ground, trunk-vine and attached-to-logs
+decorators, plus huge red/brown mushrooms and fallen trees — writing through the
+region's own radius-one gate, so a canopy may cross a chunk border exactly as vanilla's does. That band is
 measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.608% (1,540 residual, 620 in the surface band) now, after
+hand-written trees, to 99.626% (1,470 residual, 550 in the surface band) now, after
 the biome placement filter learned to read the zoomed per-block biome vanilla's does,
+the remaining stage-9 decorators (`place_on_ground`, `trunk_vine`, `attached_to_logs`),
+huge mushrooms, and fallen trees joined the replay,
 springs and boulders joined the schedule, the flora percentages were deleted, leaves
 were given the distance property vanilla propagates into them, dark oaks grew their
 own trunks and canopies, and three inverted guards in the ported `doPlace` were fixed —
@@ -176,19 +179,14 @@ ore ellipsoid, and the reason it got through is that `OreFeature.place` gates ev
 columns stop being written after the carvers and no feature, canopy included, raises them.
 Reading them live opened a gate vanilla holds shut on 49 cells; the region now snapshots
 both maps when it is built, which returned the waterline band to the 51 it held before dark
-oaks were possible, and that band has its own ratchet. Cells above sea level holding a trunk,
-canopy or plant stand at 607 against vanilla's 789; that count went *down* when the
-guards were fixed, which is the point — the earlier 577 included trees vanilla never
-plants. `MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy, is at
-98.4% (1008/1024), so the height under the decoration is nearly right and what remains
-is placement: the gap sits in the conifer chunks (the taiga one places 229 of vanilla's
-285 tree cells, the old-growth one 236 of 353) while the plains pair nearly match,
-37 of 37 and 105 of 114, and the counter the diagnostic prints names what is still not
-replayed — `place_on_ground` 77, stage-2 `large_dripstone` 18, mushroom selectors and
-one fallen tree. The leaf litter is the next step, and with it the question of why a
-correctly-shaped dark oak still lands on the wrong cells; the ocean fixture did not move
-(330 cells, clay 96/22/9, ore parity zero) under any of this, which is
-the check that a surface change stayed on the surface. Closing the rest is the
+oaks were possible, and that band has its own ratchet (now 18 after the zoomed biome filter).
+`MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy, is at
+98.6% (1010/1024), so the height under the decoration is nearly right and what remains
+is cross-border placement: the taiga chunk now matches 286 against vanilla's 285 tree cells
+(58 surface mismatches) and the plains pair match 37 of 37 and 114 of 114, while
+`trees_birch_and_oak_leaf_litter` matches 43 of 50 leaf-litter cells directly (47 of 50
+holding its own block), leaving only stage-2 `large_dripstone` (18) in the un-replayed tally.
+Closing the rest is the
 road to exact equality, while keeping cold batch generation within an acceptable
 latency budget.
 

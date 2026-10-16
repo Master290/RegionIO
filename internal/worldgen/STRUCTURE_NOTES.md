@@ -2395,3 +2395,68 @@ identity is what the structure predicts: target (0,1)'s 3x3 of sources holds nei
 nor (0,-1), so it *is* the both-removed case. Removing one still gives (2,-41,12), and the
 extra-sources row still recovers vanilla's (5,-30,13), so the diagnosis stands: the source's
 answer depends on which chunk is the centre, through which neighbours decorated first.
+
+## Stage-9 leaf litter, log decorators, huge mushrooms, and fallen trees (`generatorVersion` 44)
+
+The `NotReplayed()` tally on the land fixture carried three stage-9 families:
+`tree_decorator:minecraft:place_on_ground=76`, `minecraft:huge_red_mushroom=3`, and
+`minecraft:fallen_tree=1`. Porting all of them from `javap -p -c` against
+`versions/26.1.2/server-26.1.2.jar` removes every stage-9 entry from `NotReplayed()`,
+leaving only `stage2:minecraft:large_dripstone=18`:
+
+- `PlaceOnGroundDecorator` (`world/tree_decorators.go`): takes the lowest-Y slice of
+  `TreeFeature.getLowestTrunkOrRootOfTree` (the base-Y logs when `roots` is empty), builds a
+  `BoundingBox` inflated by `(radius, height, radius)`, and loops `tries` times drawing
+  `(x, y, z)` with `random.nextInt(max - min + 1)` in X, Y, Z order. Each attempt tests
+  `attemptToPlaceBlockAbove` (`above = pos.above()` is air or `Blocks.VINE`, `pos` passes
+  `BlockStateBase.isSolidRender()`, and `getHeight(MOTION_BLOCKING_NO_LEAVES, above) <=
+  above.getY()`) before calling `blockStateProvider.getState(random, above)`, so a rejected
+  position consumes only its three coordinate draws. Checking all 29,873 runtime block states
+  in `server-26.1.2.jar` confirmed `isSolidRender()` is identical (`diffs=0`) to
+  `canOcclude() && getLightDampening() == 15` (`isFaceSturdy`).
+- `TrunkVineDecorator` and `AttachedToLogsDecorator` (`world/tree_decorators.go`):
+  `TrunkVineDecorator` rolls four `nextInt(3) > 0` checks per log in west, east, north, south
+  order and places a vine with the opposite face property (`EAST`, `WEST`, `SOUTH`, `NORTH`)
+  when the neighbour is air. `AttachedToLogsDecorator` runs `Util.shuffledCopy(logs, random)`
+  and, per log, draws one direction from `directions` via `Util.getRandom` and one
+  `nextFloat() <= probability` before checking air and sampling `block_provider`.
+- `TreeDecorator.Context` ordering (`newTreeDecoration` in `world/tree_decorators.go`):
+  `TreeFeature.place` collects `roots`, `logs`, and `leaves` into `Sets.newHashSet()` and
+  `TreeDecorator.Context` copies each `HashSet` into an `ObjectArrayList` before sorting with
+  `Comparator.comparingInt(Vec3i::getY)`. `newTreeDecoration` now deduplicates and orders
+  `logs` and `leaves` through `javaHashSetOrder` before `sort.SliceStable` by `y`.
+- `AbstractHugeMushroomFeature`, `HugeRedMushroomFeature`, and `HugeBrownMushroomFeature`
+  (`world/tree_features.go`): `getTreeHeight` draws `nextInt(3) + 4` and doubles it when
+  `nextInt(12) == 0` *before* `isValidPosition`, so a rejected mushroom still spends both
+  draws. In `isValidPosition`, vanilla passes `-1` as the second argument to
+  `getTreeRadiusForHeight(-1, -1, foliageRadius, dy)`, which makes `HugeRedMushroomFeature`
+  check radius 0 for every `dy >= 0` while `HugeBrownMushroomFeature` checks radius 0 for
+  `dy <= 3` and `foliageRadius` above.
+- `FallenTreeFeature` (`world/tree_features.go`): places the stump at `origin` and runs
+  `stump_decorators`, then draws `Direction.Plane.HORIZONTAL.getRandomDirection(random)`,
+  `log_length.sample(random) - 2`, and `2 + nextInt(2)` offset, steps `startPos` down from
+  `origin.Y + 1` at most 6 times until `mayPlaceOn`, checks `canPlaceEntireFallenLog` (at most
+  2 consecutive non-sturdy support blocks), places the horizontal logs with `axis` set along
+  the direction, and runs `log_decorators` in `HashSet` order.
+
+Measured, `generatorVersion` 43 -> 44:
+
+| | before | after |
+|---|---|---|
+| land exact cells | 391,676 (99.608%) | **391,746 (99.626%)** |
+| land surface band | 620 | **550** |
+| chunk (16,-40) taiga exact / surface mismatches | 98,096 / 136 | **98,174 (99.868%) / 58** |
+| source chunks exact / surface band | 390,082 (99.203%) / 2,103 | **390,529 (99.317%) / 1,694** |
+| source (15,-31) / source (16,-30) | 96,559 (98.225%) / 97,455 (99.136%) | **96,955 (98.628%) / 97,506 (99.188%)** |
+| `trees_taiga` chain | 193/194 (99.5%) | **194/194 (100.0%)** matched, 193/194 own |
+| `trees_birch_and_oak_leaf_litter` chain | 0/50 (0.0%) | **43/50 (86.0%)** exact, **47/50 (94.0%)** own |
+| `patch_leaf_litter` chain | 1/4 (25.0%) | **3/4 (75.0%)** |
+
+Tracing the 7 remaining cells of `trees_birch_and_oak_leaf_litter` in `(-40, 21)` confirmed
+`placeOnGround` itself is 100.0% exact: all 7 belong to the border tree at `(-639, 94..99,
+336)`. When `gen(-40, 20)` runs, its 3x3 source window includes `(-41, 19)`, whose cross-chunk
+tree occupies `(-643, 96, 334)` in `(-41, 20)`, and the border tree at `(-639, 94, 336)`
+matches all 50/50 leaf-litter cells in `(-40, 21)` with exact `facing` and `segment_amount`.
+When `gen(-40, 21)` runs, `(-41, 19)` (`dz = -2`) is outside its 3x3 source window, leaving
+`(-643, 96, 334)` air so try 8 of the first `place_on_ground` decorator accepts that cell and
+spends one provider draw, shifting the second decorator's draws on that single tree.

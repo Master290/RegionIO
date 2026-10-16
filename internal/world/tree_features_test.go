@@ -143,3 +143,136 @@ func TestPlainsTreeChainProducesPositionsAndLogs(t *testing.T) {
 	}
 	t.Logf("dispatcher produced %d log cells and %d leaf cells in the source chunk", logs, leaves)
 }
+
+// TestHugeMushroomsAndFallenTree checks the huge mushroom and fallen tree features
+// reached from stage-9 random selectors (such as dark_forest_vegetation and
+// trees_birch_and_oak_leaf_litter).
+func TestHugeMushroomsAndFallenTree(t *testing.T) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	grass := mustState("minecraft:grass_block", map[string]string{"snowy": "false"})
+	water := mustState("minecraft:water", map[string]string{"level": "0"})
+	newRegion := func(floor uint16) *decorationRegion {
+		var chunks []*Chunk
+		for cz := int32(-1); cz <= 1; cz++ {
+			for cx := int32(-1); cx <= 1; cx++ {
+				c := NewChunk(cx, cz, BiomePlains)
+				for lx := 0; lx < 16; lx++ {
+					for lz := 0; lz < 16; lz++ {
+						c.SetBlock(lx, 70, lz, floor)
+					}
+				}
+				chunks = append(chunks, c)
+			}
+		}
+		region, err := newDecorationRegion(chunks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		region.bindSeed(12345)
+		if err := region.setSource(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		return region
+	}
+
+	// 1. A rejected huge mushroom still consumes its two getTreeHeight draws before
+	// isValidPosition fails on a water floor.
+	refusedRegion := newRegion(water)
+	r1, _ := worldgen.DecorationRandom(999, 0, 0)
+	if err := refusedRegion.placeConfiguredVegetation(set, r1, worldgen.FeaturePosition{X: 8, Y: 71, Z: 8}, "minecraft:huge_red_mushroom", worldgen.PlacementContext{}); err != nil {
+		t.Fatal(err)
+	}
+	r2, _ := worldgen.DecorationRandom(999, 0, 0)
+	r2.NextIntN(3)
+	r2.NextIntN(12)
+	if got, want := drawStream(r1), drawStream(r2); got != want {
+		t.Errorf("rejected huge_red_mushroom draw mismatch: got %v, want %v", got, want)
+	}
+
+	// 2. Huge red mushroom places a stem column and a dome cap with up=false on the
+	// lower skirt rows and up=true on the top two rows.
+	redRegion := newRegion(grass)
+	redRng, _ := worldgen.DecorationRandom(12345, 0, 0)
+	if err := redRegion.placeConfiguredVegetation(set, redRng, worldgen.FeaturePosition{X: 8, Y: 71, Z: 8}, "minecraft:huge_red_mushroom", worldgen.PlacementContext{}); err != nil {
+		t.Fatal(err)
+	}
+	redStems, redCaps := 0, 0
+	for y := 71; y <= 85; y++ {
+		for x := 4; x <= 12; x++ {
+			for z := 4; z <= 12; z++ {
+				name, ok := stateByID(redRegion.getBlock(x, y, z))
+				if !ok {
+					continue
+				}
+				switch name.Name {
+				case "minecraft:mushroom_stem":
+					redStems++
+				case "minecraft:red_mushroom_block":
+					redCaps++
+				}
+			}
+		}
+	}
+	if redStems < 4 || redCaps == 0 {
+		t.Fatalf("huge_red_mushroom placed %d stems and %d caps", redStems, redCaps)
+	}
+
+	// 3. Huge brown mushroom places a stem column and a flat cap with its four corners
+	// omitted.
+	brownRegion := newRegion(grass)
+	brownRng, _ := worldgen.DecorationRandom(12345, 0, 0)
+	if err := brownRegion.placeConfiguredVegetation(set, brownRng, worldgen.FeaturePosition{X: 8, Y: 71, Z: 8}, "minecraft:huge_brown_mushroom", worldgen.PlacementContext{}); err != nil {
+		t.Fatal(err)
+	}
+	brownStems, brownCaps := 0, 0
+	for y := 71; y <= 85; y++ {
+		for x := 4; x <= 12; x++ {
+			for z := 4; z <= 12; z++ {
+				name, ok := stateByID(brownRegion.getBlock(x, y, z))
+				if !ok {
+					continue
+				}
+				switch name.Name {
+				case "minecraft:mushroom_stem":
+					brownStems++
+				case "minecraft:brown_mushroom_block":
+					brownCaps++
+				}
+			}
+		}
+	}
+	if brownStems < 4 || brownCaps != 45 {
+		t.Fatalf("huge_brown_mushroom placed %d stems and %d caps (want 45 = 7x7 - 4 corners)", brownStems, brownCaps)
+	}
+
+	// 4. Fallen birch tree places an upright stump at the origin and a horizontal log
+	// separated by a gap, plus attached_to_logs / trunk_vine decorators.
+	fallenRegion := newRegion(grass)
+	fallenRng, _ := worldgen.DecorationRandom(12345, 0, 0)
+	if err := fallenRegion.placeConfiguredVegetation(set, fallenRng, worldgen.FeaturePosition{X: 8, Y: 71, Z: 8}, "minecraft:fallen_birch_tree", worldgen.PlacementContext{}); err != nil {
+		t.Fatal(err)
+	}
+	stump, ok := stateByID(fallenRegion.getBlock(8, 71, 8))
+	if !ok || stump.Name != "minecraft:birch_log" || stump.Properties["axis"] != "y" {
+		t.Fatalf("fallen_birch_tree stump at (8,71,8) is %v[%v], want birch_log[axis=y]", stump.Name, stump.Properties)
+	}
+	horizontalLogs := 0
+	for x := 0; x < 16; x++ {
+		for z := 0; z < 16; z++ {
+			if x == 8 && z == 8 {
+				continue
+			}
+			name, ok := stateByID(fallenRegion.getBlock(x, 71, z))
+			if ok && name.Name == "minecraft:birch_log" && (name.Properties["axis"] == "x" || name.Properties["axis"] == "z") {
+				horizontalLogs++
+			}
+		}
+	}
+	if horizontalLogs < 3 {
+		t.Fatalf("fallen_birch_tree placed %d horizontal log blocks, want at least 3", horizontalLogs)
+	}
+}
+

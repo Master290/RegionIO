@@ -19,8 +19,8 @@ import (
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
 // landSurfaceRatchet, landCellRatchet, landWaterlineRatchet are today's measured land
-// numbers: 620 surface-band mismatches, 18 waterline-band mismatches and 391,676 exact
-// cells, with 678 of vanilla's 789 tree cells (86%).
+// numbers: 550 surface-band mismatches, 18 waterline-band mismatches and 391,746 exact
+// cells, with 924 tree cells above sea level against vanilla's 789.
 //
 // Both numbers moved twice when dark oaks arrived, and the two moves are separable:
 // fixing the three inverted doPlace guards (clip refusal, the ignore_vines clause, the
@@ -37,11 +37,9 @@ import (
 // ore veins walking through a gate that the shipped game holds shut. See the paragraph in
 // STRUCTURE_NOTES.md written from ChunkStatus and OreFeature.place.
 //
-// What is left: place_on_ground is counted 77 times and skipped (birch and oak litter,
-// and the litter under the new dark oaks), 18 stage-2 large_dripstone placements are not
-// replayed, and the tally still shows mushrooms and one fallen tree - all of which shift
-// with the shared decoration stream, so their counts are a position signal, not a
-// coverage one.
+// What is left: 18 stage-2 large_dripstone placements are not replayed; every stage-9
+// tree decorator (place_on_ground, trunk_vine, attached_to_logs) and selector target
+// (huge_red_mushroom, huge_brown_mushroom, fallen_tree) in the capture is now replayed.
 //
 // Moved again by generatorVersion 42, which made the surface rules and carvers read
 // BiomeManager.getBiome per block instead of one biome per column: surface band 687 ->
@@ -54,9 +52,15 @@ import (
 // waterline 51 -> 18, surface 683 -> 620, tree cells 607 -> 678. A placement filter
 // that read the cell admitted or refused candidates near every biome border differently
 // from vanilla, which is the "conserved but displaced" ore shape source (15,-31) showed.
+//
+// And by generatorVersion 44, which ported PlaceOnGroundDecorator, TrunkVineDecorator,
+// AttachedToLogsDecorator, HugeRedMushroomFeature, HugeBrownMushroomFeature and
+// FallenTreeFeature: exact 391,676 -> 391,746, surface 620 -> 550 (with chunk (16,-40)
+// taiga surface 136 -> 58 and trees_birch_and_oak_leaf_litter 0/50 -> 43/50 exact),
+// eliminating all stage-9 NotReplayed() entries.
 const (
-	landSurfaceRatchet   = 620
-	landCellRatchet      = 391676
+	landSurfaceRatchet   = 550
+	landCellRatchet      = 391746
 	landWaterlineRatchet = 18
 )
 

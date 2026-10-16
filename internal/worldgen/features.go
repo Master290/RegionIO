@@ -569,11 +569,48 @@ func (d TreeDecorator) Float(name string) (float64, bool) {
 	return value, true
 }
 
+// Scalar reads an integer member of a decorator, such as place_on_ground's tries,
+// radius, and height.
+func (d TreeDecorator) Scalar(name string) (int, bool) {
+	return scalarField(d.Fields, name)
+}
+
 // Provider returns a decorator's raw member for the caller to resolve; evaluating a
 // block state provider needs a world, which this package does not have.
 func (d TreeDecorator) Provider(name string) (json.RawMessage, bool) {
 	raw, ok := d.Fields[name]
 	return raw, ok && len(raw) > 0
+}
+
+// Directions reads a non-empty string list member of a decorator, which is how
+// attached_to_logs's directions arrives.
+func (d TreeDecorator) Directions(name string) ([]string, bool) {
+	raw, ok := d.Fields[name]
+	if !ok {
+		return nil, false
+	}
+	var dirs []string
+	if err := json.Unmarshal(raw, &dirs); err != nil || len(dirs) == 0 {
+		return nil, false
+	}
+	return dirs, true
+}
+
+// HugeMushroomFeatureConfig mirrors HugeMushroomFeatureConfiguration, shared by
+// huge_red_mushroom and huge_brown_mushroom.
+type HugeMushroomFeatureConfig struct {
+	CapProvider   json.RawMessage `json:"cap_provider"`
+	StemProvider  json.RawMessage `json:"stem_provider"`
+	FoliageRadius int             `json:"foliage_radius"`
+	CanPlaceOn    json.RawMessage `json:"can_place_on"`
+}
+
+// FallenTreeFeatureConfig mirrors FallenTreeConfiguration.
+type FallenTreeFeatureConfig struct {
+	TrunkProvider   json.RawMessage
+	LogLength       NestedIntProvider
+	StumpDecorators []TreeDecorator
+	LogDecorators   []TreeDecorator
 }
 
 type FeatureRef struct {
@@ -1342,6 +1379,60 @@ func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 		}
 	}
 	return config, nil
+}
+
+func (s *FeatureSet) HugeMushroom(name string) (HugeMushroomFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || (configured.Type != "minecraft:huge_red_mushroom" && configured.Type != "minecraft:huge_brown_mushroom") {
+		return HugeMushroomFeatureConfig{}, fmt.Errorf("worldgen: %s is not a huge mushroom feature", name)
+	}
+	config := HugeMushroomFeatureConfig{FoliageRadius: 2}
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return HugeMushroomFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if len(config.CapProvider) == 0 || len(config.StemProvider) == 0 || len(config.CanPlaceOn) == 0 {
+		return HugeMushroomFeatureConfig{}, fmt.Errorf("worldgen: invalid huge mushroom %s", name)
+	}
+	return config, nil
+}
+
+func (s *FeatureSet) FallenTree(name string) (FallenTreeFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:fallen_tree" {
+		return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a fallen tree feature", name)
+	}
+	var raw struct {
+		TrunkProvider   json.RawMessage `json:"trunk_provider"`
+		LogLength       json.RawMessage `json:"log_length"`
+		StumpDecorators []TreeDecorator `json:"stump_decorators"`
+		LogDecorators   []TreeDecorator `json:"log_decorators"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if len(raw.TrunkProvider) == 0 || len(raw.LogLength) == 0 {
+		return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: invalid fallen tree %s", name)
+	}
+	length, err := parseNestedIntProvider(raw.LogLength)
+	if err != nil {
+		return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s log_length: %w", name, err)
+	}
+	for _, d := range raw.StumpDecorators {
+		if d.Type == "" {
+			return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s has a stump decorator without a type", name)
+		}
+	}
+	for _, d := range raw.LogDecorators {
+		if d.Type == "" {
+			return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s has a log decorator without a type", name)
+		}
+	}
+	return FallenTreeFeatureConfig{
+		TrunkProvider:   raw.TrunkProvider,
+		LogLength:       length,
+		StumpDecorators: raw.StumpDecorators,
+		LogDecorators:   raw.LogDecorators,
+	}, nil
 }
 
 func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {

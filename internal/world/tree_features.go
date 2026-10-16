@@ -203,8 +203,25 @@ func (r *decorationRegion) placeConfiguredVegetation(set *worldgen.FeatureSet, r
 		}
 		r.placeBlockColumn(random, position, config, set)
 		return nil
-	case "minecraft:fallen_tree", "minecraft:huge_brown_mushroom", "minecraft:huge_red_mushroom",
-		"minecraft:huge_fungus", "minecraft:bamboo", "minecraft:multiface_growth",
+	case "minecraft:huge_red_mushroom", "minecraft:huge_brown_mushroom":
+		config, err := set.HugeMushroom(name)
+		if err != nil {
+			return err
+		}
+		return r.placeHugeMushroom(set, random, position, configured.Type, config)
+	case "minecraft:fallen_tree":
+		config, err := set.FallenTree(name)
+		if err != nil {
+			return err
+		}
+		err = r.placeFallenTree(set, random, position, config)
+		var part *unmodelledPart
+		if errors.As(err, &part) {
+			noteNotReplayed(part.kind + ":" + part.name)
+			return nil
+		}
+		return err
+	case "minecraft:huge_fungus", "minecraft:bamboo", "minecraft:multiface_growth",
 		"minecraft:vines", "minecraft:weeping_vines", "minecraft:twisting_vines",
 		"minecraft:iceberg", "minecraft:block_pile", "minecraft:delta_feature",
 		"minecraft:glowstone_blob", "minecraft:sea_pickle", "minecraft:coral_plant",
@@ -217,6 +234,281 @@ func (r *decorationRegion) placeConfiguredVegetation(set *worldgen.FeatureSet, r
 		return nil
 	}
 	return fmt.Errorf("world: configured feature %q of type %q is reached from a tree selector but not replayed", name, configured.Type)
+}
+
+// placeHugeMushroom is AbstractHugeMushroomFeature.place with HugeRedMushroomFeature
+// and HugeBrownMushroomFeature's getTreeRadiusForHeight and makeCap implementations.
+//
+// As in TreeFeature, getTreeHeight(random) runs BEFORE isValidPosition, so a rejected
+// mushroom still consumes its two height draws (nextInt(3)+4, then nextInt(12)==0).
+// In isValidPosition, vanilla calls getTreeRadiusForHeight(-1, -1, foliageRadius, dy):
+// passing -1 as the second parameter means HugeRedMushroomFeature's dy < treeHeight and
+// dy == treeHeight branches are both false for dy >= 0, so red mushrooms check only a
+// radius-0 stem column, while brown mushrooms check radius 0 for dy <= 3 and
+// foliageRadius above.
+func (r *decorationRegion) placeHugeMushroom(set *worldgen.FeatureSet, random worldgen.RandomSource, origin worldgen.FeaturePosition, kind string, config worldgen.HugeMushroomFeatureConfig) error {
+	height := int(random.NextIntN(3)) + 4
+	if random.NextIntN(12) == 0 {
+		height *= 2
+	}
+	if origin.Y < MinY+1 || origin.Y+height+1 > MinY+WorldHeight-1 {
+		return nil
+	}
+	ok, err := r.testBlockPredicate(set, config.CanPlaceOn, worldgen.FeaturePosition{X: origin.X, Y: origin.Y - 1, Z: origin.Z})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	for dy := 0; dy <= height; dy++ {
+		radius := 0
+		if kind == "minecraft:huge_brown_mushroom" && dy > 3 {
+			radius = config.FoliageRadius
+		}
+		for dx := -radius; dx <= radius; dx++ {
+			for dz := -radius; dz <= radius; dz++ {
+				state := r.getBlock(origin.X+dx, origin.Y+dy, origin.Z+dz)
+				if isAirState(state) {
+					continue
+				}
+				name, ok := stateByID(state)
+				if !ok || !flattenBlockTagContains(set, "minecraft:leaves", name.Name) {
+					return nil
+				}
+			}
+		}
+	}
+	capSpec, err := set.StateProvider(config.CapProvider)
+	if err != nil {
+		return err
+	}
+	stemSpec, err := set.StateProvider(config.StemProvider)
+	if err != nil {
+		return err
+	}
+	if kind == "minecraft:huge_red_mushroom" {
+		for dy := height - 3; dy <= height; dy++ {
+			radius := config.FoliageRadius
+			if dy >= height {
+				radius = config.FoliageRadius - 1
+			}
+			inner := config.FoliageRadius - 2
+			for dx := -radius; dx <= radius; dx++ {
+				for dz := -radius; dz <= radius; dz++ {
+					isMinX := dx == -radius
+					isMaxX := dx == radius
+					isMinZ := dz == -radius
+					isMaxZ := dz == radius
+					edgeX := isMinX || isMaxX
+					edgeZ := isMinZ || isMaxZ
+					if dy < height && edgeX == edgeZ {
+						continue
+					}
+					state, err := r.sampleStateProvider(set, capSpec, random, origin)
+					if err != nil {
+						return err
+					}
+					state = withHugeMushroomFaces(state, true, dy >= height-1, dx < -inner, dx > inner, dz < -inner, dz > inner)
+					r.placeMushroomBlock(set, origin.X+dx, origin.Y+dy, origin.Z+dz, state)
+				}
+			}
+		}
+	} else {
+		radius := config.FoliageRadius
+		for dx := -radius; dx <= radius; dx++ {
+			for dz := -radius; dz <= radius; dz++ {
+				isMinX := dx == -radius
+				isMaxX := dx == radius
+				isMinZ := dz == -radius
+				isMaxZ := dz == radius
+				edgeX := isMinX || isMaxX
+				edgeZ := isMinZ || isMaxZ
+				if edgeX && edgeZ {
+					continue
+				}
+				west := isMinX || (edgeZ && dx == 1-radius)
+				east := isMaxX || (edgeZ && dx == radius-1)
+				north := isMinZ || (edgeX && dz == 1-radius)
+				south := isMaxZ || (edgeX && dz == radius-1)
+				state, err := r.sampleStateProvider(set, capSpec, random, origin)
+				if err != nil {
+					return err
+				}
+				state = withHugeMushroomFaces(state, false, false, west, east, north, south)
+				r.placeMushroomBlock(set, origin.X+dx, origin.Y+height, origin.Z+dz, state)
+			}
+		}
+	}
+	for dy := 0; dy < height; dy++ {
+		state, err := r.sampleStateProvider(set, stemSpec, random, origin)
+		if err != nil {
+			return err
+		}
+		r.placeMushroomBlock(set, origin.X, origin.Y+dy, origin.Z, state)
+	}
+	return nil
+}
+
+func (r *decorationRegion) placeMushroomBlock(set *worldgen.FeatureSet, x, y, z int, state uint16) {
+	existing := r.getBlock(x, y, z)
+	if isAirState(existing) {
+		r.setBlock(x, y, z, state)
+		return
+	}
+	if name, ok := stateByID(existing); ok && flattenBlockTagContains(set, "minecraft:replaceable_by_mushrooms", name.Name) {
+		r.setBlock(x, y, z, state)
+	}
+}
+
+func withHugeMushroomFaces(state uint16, setUp, up, west, east, north, south bool) uint16 {
+	name, ok := stateByID(state)
+	if !ok {
+		return state
+	}
+	for _, prop := range []string{"west", "east", "north", "south"} {
+		if _, has := name.Properties[prop]; !has {
+			return state
+		}
+	}
+	if setUp {
+		if _, has := name.Properties["up"]; !has {
+			return state
+		}
+	}
+	merged := make(map[string]string, len(name.Properties))
+	for k, v := range name.Properties {
+		merged[k] = v
+	}
+	if setUp {
+		merged["up"] = formatBoolProp(up)
+	}
+	merged["west"] = formatBoolProp(west)
+	merged["east"] = formatBoolProp(east)
+	merged["north"] = formatBoolProp(north)
+	merged["south"] = formatBoolProp(south)
+	if resolved, ok := nameToStateID(name.Name, merged); ok {
+		return resolved
+	}
+	return state
+}
+
+func formatBoolProp(v bool) string {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+// placeFallenTree is FallenTreeFeature.placeFallenTree: placeStump (with
+// stumpDecorators), then sample direction, logLength-2, and start offset 2+nextInt(2),
+// walk startPos from origin.Y+1 down at most 6 steps until mayPlaceOn, check
+// canPlaceEntireFallenLog, and if valid place the horizontal log blocks into a HashSet
+// and run logDecorators.
+func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.FallenTreeFeatureConfig) error {
+	trunkSpec, err := set.StateProvider(config.TrunkProvider)
+	if err != nil {
+		return err
+	}
+	stumpState, err := r.sampleStateProvider(set, trunkSpec, random, origin)
+	if err != nil {
+		return err
+	}
+	r.setBlock(origin.X, origin.Y, origin.Z, stumpState)
+	if len(config.StumpDecorators) > 0 {
+		dec := &treeDecoration{
+			t:    &treePlacer{r: r, set: set, random: random},
+			logs: []treePlacement{{x: origin.X, y: origin.Y, z: origin.Z, isLog: true}},
+		}
+		if err := dec.runDecorators(set, config.StumpDecorators); err != nil {
+			return err
+		}
+	}
+	direction := darkOakDirections[int(random.NextIntN(4))]
+	logLength := config.LogLength.Sample(random) - 2
+	dist := 2 + int(random.NextIntN(2))
+	startX := origin.X + direction[0]*dist
+	startY := origin.Y + 1
+	startZ := origin.Z + direction[1]*dist
+	for i := 0; i < 6; i++ {
+		if r.fallenTreeValidPos(set, startX, startY, startZ) && isFaceSturdy(r.getBlock(startX, startY-1, startZ)) {
+			break
+		}
+		startY--
+	}
+	gap := 0
+	for i := 0; i < logLength; i++ {
+		px := startX + direction[0]*i
+		py := startY
+		pz := startZ + direction[1]*i
+		if !r.fallenTreeValidPos(set, px, py, pz) {
+			return nil
+		}
+		if !isFaceSturdy(r.getBlock(px, py-1, pz)) {
+			gap++
+			if gap > 2 {
+				return nil
+			}
+		} else {
+			gap = 0
+		}
+	}
+	axis := "z"
+	if direction[0] != 0 {
+		axis = "x"
+	}
+	rawLogs := make([][3]int, 0, logLength)
+	for i := 0; i < logLength; i++ {
+		px := startX + direction[0]*i
+		py := startY
+		pz := startZ + direction[1]*i
+		state, err := r.sampleStateProvider(set, trunkSpec, random, worldgen.FeaturePosition{X: px, Y: py, Z: pz})
+		if err != nil {
+			return err
+		}
+		if name, ok := stateByID(state); ok {
+			if _, has := name.Properties["axis"]; has {
+				merged := make(map[string]string, len(name.Properties))
+				for k, v := range name.Properties {
+					merged[k] = v
+				}
+				merged["axis"] = axis
+				if resolved, ok := nameToStateID(name.Name, merged); ok {
+					state = resolved
+				}
+			}
+		}
+		r.setBlock(px, py, pz, state)
+		rawLogs = append(rawLogs, [3]int{px, py, pz})
+	}
+	if len(config.LogDecorators) > 0 {
+		ordered := javaHashSetOrder(rawLogs)
+		logs := make([]treePlacement, len(ordered))
+		for i, p := range ordered {
+			logs[i] = treePlacement{x: p[0], y: p[1], z: p[2], isLog: true}
+		}
+		dec := &treeDecoration{
+			t:    &treePlacer{r: r, set: set, random: random},
+			logs: logs,
+		}
+		if err := dec.runDecorators(set, config.LogDecorators); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *decorationRegion) fallenTreeValidPos(set *worldgen.FeatureSet, x, y, z int) bool {
+	id := r.getBlock(x, y, z)
+	if isAirState(id) {
+		return true
+	}
+	name, ok := stateByID(id)
+	if !ok {
+		return false
+	}
+	return flattenBlockTagContains(set, "minecraft:leaves", name.Name) ||
+		flattenBlockTagContains(set, "minecraft:replaceable_by_trees", name.Name)
 }
 
 // notReplayedSums counts configured types that a replayed selector chose and this

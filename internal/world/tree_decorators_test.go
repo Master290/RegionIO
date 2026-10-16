@@ -457,3 +457,137 @@ func TestDecoratorConfigFieldsAreKeptRaw(t *testing.T) {
 		t.Error("beehive reported a provider it does not have")
 	}
 }
+
+// TestPlaceOnGroundPaintsOverLowestTrunkBoundingBox checks PlaceOnGroundDecorator's
+// bounding box, solid-render floor gate, ceiling heightmap gate, and the rule that a
+// refused position spends only its three coordinate draws and never reaches the block
+// state provider.
+func TestPlaceOnGroundPaintsOverLowestTrunkBoundingBox(t *testing.T) {
+	grass := mustState("minecraft:grass_block", map[string]string{"snowy": "false"})
+	water := mustState("minecraft:water", map[string]string{"level": "0"})
+	stone := mustState("minecraft:stone", nil)
+	planter := decoratorPlacer(t, "minecraft:birch_leaf_litter", func(x, z int) uint16 {
+		if x < 8 {
+			return water
+		}
+		return grass
+	})
+	if err := planter.sampleHeights(); err != nil {
+		t.Fatal(err)
+	}
+	if err := planter.placeTrunk(8, 71, 8); err != nil {
+		t.Fatal(err)
+	}
+	// Put a solid stone ceiling over (9, 71, 8) at y=85 so MOTION_BLOCKING_NO_LEAVES > 71.
+	planter.r.setBlock(9, 85, 8, stone)
+	if err := planter.placeDecorators(planter.set); err != nil {
+		t.Fatal(err)
+	}
+	litter := 0
+	for y := 69; y <= 73; y++ {
+		for x := 0; x < 16; x++ {
+			for z := 0; z < 16; z++ {
+				name, ok := stateByID(planter.stateAt(x, y, z))
+				if !ok || name.Name != "minecraft:leaf_litter" {
+					continue
+				}
+				litter++
+				if x < 8 {
+					t.Errorf("leaf_litter placed at (%d,%d,%d) over non-solid water floor", x, y, z)
+				}
+				if x == 9 && z == 8 {
+					t.Errorf("leaf_litter placed at (%d,%d,%d) under a motion-blocking ceiling", x, y, z)
+				}
+				if x < 8-4 || x > 8+4 || z < 8-4 || z > 8+4 {
+					t.Errorf("leaf_litter at (%d,%d,%d) outside radius-4 bounding box around (8,70,8)", x, y, z)
+				}
+			}
+		}
+	}
+	if litter == 0 {
+		t.Fatal("birch_leaf_litter placed no leaf_litter cells on the grass half")
+	}
+
+	// Over an all-water floor, every attempt is refused before reaching the weighted
+	// state provider, so 10 tries consume exactly 30 coordinate draws and zero
+	// provider draws.
+	refused := decoratorPlacer(t, "minecraft:birch_leaf_litter", func(int, int) uint16 { return water })
+	refused.placements = []treePlacement{{x: 8, y: 70, z: 8, isLog: true}}
+	refused.config.Decorators = []worldgen.TreeDecorator{refused.config.Decorators[0]}
+	tries, _ := refused.config.Decorators[0].Scalar("tries")
+	radius, _ := refused.config.Decorators[0].Scalar("radius")
+	height, _ := refused.config.Decorators[0].Scalar("height")
+	if err := refused.placeDecorators(refused.set); err != nil {
+		t.Fatal(err)
+	}
+	expected := decoratorPlacer(t, "minecraft:birch_leaf_litter", func(int, int) uint16 { return water })
+	spanX := int32(2*radius + 1)
+	spanY := int32(2*height + 1)
+	spanZ := int32(2*radius + 1)
+	for i := 0; i < tries; i++ {
+		expected.random.NextIntN(spanX)
+		expected.random.NextIntN(spanY)
+		expected.random.NextIntN(spanZ)
+	}
+	if got, want := drawStream(refused.random), drawStream(expected.random); got != want {
+		t.Errorf("refused place_on_ground tries consumed provider draws: got %v, want %v", got, want)
+	}
+}
+
+// TestTrunkVineAndAttachedToLogsDecorators checks TrunkVineDecorator's face orientation
+// and AttachedToLogsDecorator's direction-restricted attachment.
+func TestTrunkVineAndAttachedToLogsDecorators(t *testing.T) {
+	grass := mustState("minecraft:grass_block", map[string]string{"snowy": "false"})
+	planter := decoratorPlacer(t, "minecraft:oak", func(int, int) uint16 { return grass })
+	planter.placements = []treePlacement{
+		{x: 8, y: 71, z: 8, isLog: true},
+		{x: 8, y: 72, z: 8, isLog: true},
+		{x: 8, y: 73, z: 8, isLog: true},
+	}
+	for _, p := range planter.placements {
+		planter.r.setBlock(p.x, p.y, p.z, mustState("minecraft:oak_log", map[string]string{"axis": "y"}))
+	}
+	if err := json.Unmarshal([]byte(`[
+		{"type":"minecraft:trunk_vine"},
+		{
+			"type":"minecraft:attached_to_logs",
+			"probability":1.0,
+			"directions":["up"],
+			"block_provider":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:moss_carpet"}}
+		}
+	]`), &planter.config.Decorators); err != nil {
+		t.Fatal(err)
+	}
+	if err := planter.placeDecorators(planter.set); err != nil {
+		t.Fatal(err)
+	}
+	vines := 0
+	for y := 71; y <= 73; y++ {
+		for _, nb := range []struct {
+			dx, dz int
+			face   string
+		}{
+			{-1, 0, "east"},
+			{1, 0, "west"},
+			{0, -1, "south"},
+			{0, 1, "north"},
+		} {
+			name, ok := stateByID(planter.stateAt(8+nb.dx, y, 8+nb.dz))
+			if !ok || name.Name != "minecraft:vine" {
+				continue
+			}
+			vines++
+			if name.Properties[nb.face] != "true" {
+				t.Errorf("vine at (%d,%d,%d) has %s=%s, want true", 8+nb.dx, y, 8+nb.dz, nb.face, name.Properties[nb.face])
+			}
+		}
+	}
+	if vines == 0 {
+		t.Fatal("trunk_vine placed no vines on three exposed log cells")
+	}
+	topName, ok := stateByID(planter.stateAt(8, 74, 8))
+	if !ok || topName.Name != "minecraft:moss_carpet" {
+		t.Errorf("cell above top log at (8,74,8) holds %v, want minecraft:moss_carpet from attached_to_logs", topName.Name)
+	}
+}
+
