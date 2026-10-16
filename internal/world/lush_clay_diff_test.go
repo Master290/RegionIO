@@ -236,11 +236,14 @@ func TestVanillaLushClayDiff(t *testing.T) {
 	//
 	// generatorVersion 43 took it from 96/22/9 to 88/22/4: BiomeFilter reads the
 	// zoomed biome of the candidate (biome_zoom.go), and lush_caves_clay sits on
-	// the lush_caves border. The 20 anchors in (0,1) did not move, so they are
-	// still the cross-border history problem, not a filter one.
+	// the lush_caves border.
+	//
+	// generatorVersion 46 took it from 88/22/4 to 79/14/4: stage-9 glow_lichen
+	// (MultifaceGrowthFeature) and stage-7 UNDERGROUND_DECORATION closed 8 clay
+	// anchor cells at (14..15, -23..-19, 31) in chunk (0,1).
 	const (
-		maxMissing = 88
-		maxAnchors = 22
+		maxMissing = 79
+		maxAnchors = 14
 		maxExtra   = 4
 	)
 	t.Logf("lush_caves_clay chain total: missing=%d (clay anchors %d) extra_clay=%d",

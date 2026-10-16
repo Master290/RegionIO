@@ -186,6 +186,24 @@ func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.Feature
 		}); err != nil {
 			return err
 		}
+	case "minecraft:multiface_growth":
+		config, err := set.MultifaceGrowth(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeMultifaceGrowth(set, random, position, config)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:vines":
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeVines(position)
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }

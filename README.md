@@ -85,7 +85,7 @@ chunks. The canonical single-chunk generator currently matches 95.960% of
 fixture blocks (377,329/393,216, measured with `REGIONIO_PARITY_GENERATOR=legacy`;
 it no longer places any surface decoration at all, since trees, springs, flora,
 desert features and rocks moved to the datapack path), while the production region
-replay path matches 99.925% — 295
+replay path matches 99.930% — 277
 residual cells, dominated by the lush-caves moss and clay pools and their nested
 vegetation; both match
 all fixture biomes and heightmaps. CI checks the region path against a 99.7%
@@ -122,9 +122,11 @@ vanilla-derived. Surface and biome selection are ported but still need broader
 runtime captures. The production cache now uses atomic batch publication and
 the datapack-driven region replay path, with cross-chunk writes isolated per
 target. Underground decoration (stage-1 lava lakes, ores with deepslate
-targets, underwater magma, disks) and the mineshaft, ocean ruin and ruined
+targets, underwater magma, disks, stage-7 infested stone, sculk veins/patches, and
+dripstone clusters/pointed dripstone) and the mineshaft, ocean ruin and ruined
 portal structure sets run from the vanilla schedule. Trees now replay from the
-schedule too, as do the fluid springs of stage 8 and the boulders of stage 2; the
+schedule too, as do the fluid springs of stage 8, the boulders and large dripstone
+columns of stage 2, and the glow lichen and vines of stage 9; the
 percentage-based flora heuristics are gone.
 The biome parameter
 finder uses an exact spatial index and overlapping region requests share a
@@ -148,7 +150,7 @@ mineshafts (piece-for-piece against the saved vanilla start NBT and
 cell-for-cell against a structures-only capture) replay from the datapack —
 the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
 corridor carved, now places in full. What is left in the fixture is
-underground: 280 of its 295 residual cells sit below y=0 and the surface band
+underground: 265 of its 277 residual cells sit below y=0 and the surface band
 contributes none, led by the moss-patch cell disagreement — which per-target nets
 show is about which cells a patch covers, not how far it reaches — then ground cover,
 clay, and cave vines. Surface decoration was the larger structural gap and has now been
@@ -162,10 +164,13 @@ measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.626% (1,470 residual, 550 in the surface band) now, after
+hand-written trees, to 99.685% (1,238 residual, 550 in the surface band) now, after
 the biome placement filter learned to read the zoomed per-block biome vanilla's does,
 the remaining stage-9 decorators (`place_on_ground`, `trunk_vine`, `attached_to_logs`),
-huge mushrooms, and fallen trees joined the replay,
+huge mushrooms, and fallen trees joined the replay, stage-7 underground decoration
+(`ore_infested`, `sculk_vein`, `sculk_patch_deep_dark`, `dripstone_cluster`,
+`pointed_dripstone`), stage-9 `multiface_growth` / `vines`, and inline `FeatureRef`
+placement chains joined the schedule,
 springs and boulders joined the schedule, the flora percentages were deleted, leaves
 were given the distance property vanilla propagates into them, dark oaks grew their
 own trunks and canopies, and three inverted guards in the ported `doPlace` were fixed —
@@ -179,14 +184,14 @@ ore ellipsoid, and the reason it got through is that `OreFeature.place` gates ev
 columns stop being written after the carvers and no feature, canopy included, raises them.
 Reading them live opened a gate vanilla holds shut on 49 cells; the region now snapshots
 both maps when it is built, which returned the waterline band to the 51 it held before dark
-oaks were possible, and that band has its own ratchet (now 18 after the zoomed biome filter).
+oaks were possible, and that band has its own ratchet (now 17 after stage-7 and `multiface_growth`).
 `MOTION_BLOCKING_NO_LEAVES`, the one heightmap that ignores canopy, is at
 98.6% (1010/1024), so the height under the decoration is nearly right and what remains
 is cross-border placement: the taiga chunk now matches 286 against vanilla's 285 tree cells
 (58 surface mismatches) and the plains pair match 37 of 37 and 114 of 114, while
 `trees_birch_and_oak_leaf_litter` matches 43 of 50 leaf-litter cells directly (47 of 50
-holding its own block), and stage-2 `large_dripstone` completes the un-replayed tally across
-all replayed stages on the land fixture.
+holding its own block), and stage-2 `large_dripstone` plus stage-7 `UNDERGROUND_DECORATION`
+complete the un-replayed tally across all replayed stages on the land fixture.
 Closing the rest is the
 road to exact equality, while keeping cold batch generation within an acceptable
 latency budget.

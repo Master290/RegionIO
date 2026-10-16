@@ -173,14 +173,15 @@ parse time).
 Known gaps, roughly in order of how visible they are:
 
 - **Feature replay covers most of the decoration steps, not every configured type.** `worldgen/features.go` parses
-  the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
+  the placed/configured feature graph (placement modifiers, anchors, biome filters, inline `FeatureRef` placement chains) and the
   production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes,
   boulders, and large dripstone columns (`world/geodes.go`, `world/block_blob.go`,
   `world/large_dripstone.go`), stage-3 monster rooms (`world/monster_rooms.go`),
   the whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
-  disks, disk features), stage-8 springs (`world/springs.go`), and stage-9 vegetation — lush-cave
-  patches plus trees, flowers, grass and mushrooms (`world/vegetation_patches.go`,
-  `world/tree_features.go`) — see `world/feature_scheduler.go` and `world/region_ores.go`. Of the
+  disks, disk features), stage-7 underground decoration (`world/underground_decoration.go`: `ore_infested`,
+  `sculk_vein`, `sculk_patch_deep_dark`, `dripstone_cluster`, `pointed_dripstone`), stage-8 springs (`world/springs.go`),
+  and stage-9 vegetation — lush-cave patches, `multiface_growth` (`glow_lichen`) and `vines`, plus trees, flowers, grass
+  and mushrooms (`world/vegetation_patches.go`, `world/multiface.go`, `world/tree_features.go`) — see `world/feature_scheduler.go` and `world/region_ores.go`. Of the
   structure sets, ruined portals (`world/ruined_portal.go`), ocean ruins (`world/ocean_ruin.go`,
   with the post-placement falling-gravel/bubble-column/water-refill physics vanilla's block ticks
   add), and mineshafts (`world/mineshafts.go`, verified against the saved vanilla start NBT
@@ -221,9 +222,9 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 45): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 46): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
-and **99.925% through the production region replay** — 295 residual cells, dominated by the
+and **99.930% through the production region replay** — 277 residual cells, dominated by the
 lush-caves moss and clay pools and their nested vegetation. Featureless vanilla captures
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) prove the
 undecorated pipeline bit-exact on both sets — 393,216/393,216 ocean and 786,432/786,432 land
@@ -232,7 +233,7 @@ density, surface rules, carvers, aquifers, and noise-router veins match every ce
 `runBaseTerrainParity` now fails on a single mismatch — so the residual block gap is entirely
 inside feature replay.
 That ocean fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
-chunks): **99.626%**, 1,470 residual cells, of which 550 are the surface band above sea level and 18
+chunks): **99.685%**, 1,238 residual cells, of which 550 are the surface band above sea level and 17
 the waterline band, with 924 tree cells above sea level against vanilla's 789. Both bands are ratcheted in
 `world/vanilla_land_parity_test.go`, because the ocean floor of 99.7% leaves ~849 cells of headroom
 and an entirely wrong forest fits inside it.
@@ -311,9 +312,12 @@ architecture hidden in a parity edit. The hand-written `worldgen.PlaceStructures
 is no longer called by the production region replay; only the explicitly legacy per-chunk
 fallback retains it. Because that removal changes generated terrain, `generatorVersion` went to 41:
 every chunk stamped 40 or earlier regenerates rather than keeping the hand-placed village. It is
-44 now: 42 for the per-block biome zoom in the surface rules and carvers, 43 for the same zoom
+46 now: 42 for the per-block biome zoom in the surface rules and carvers, 43 for the same zoom
 in the decoration region's biome filter, 44 for the remaining stage-9 tree decorators
-(`place_on_ground`, `trunk_vine`, `attached_to_logs`), huge mushrooms, and fallen trees.
+(`place_on_ground`, `trunk_vine`, `attached_to_logs`), huge mushrooms, and fallen trees, 45 for
+stage-2 `large_dripstone`, and 46 for stage-7 underground decoration (`ore_infested`, `sculk_vein`,
+`sculk_patch_deep_dark`, `dripstone_cluster`, `pointed_dripstone`), stage-9 `multiface_growth` / `vines`,
+and inline `FeatureRef` placement chains.
 
 The canonical cache treats a stored chunk as read-only, never as a replay input. A request for a
 tile probes the store for its own target first and reconciles the remaining members afterwards, so

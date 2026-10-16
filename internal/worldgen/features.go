@@ -613,16 +613,34 @@ type FallenTreeFeatureConfig struct {
 	LogDecorators   []TreeDecorator
 }
 
-// UniformFloatProvider mirrors net.minecraft.util.valueproviders.UniformFloat:
-// Mth.randomBetween(random, min_inclusive, max_exclusive).
+// UniformFloatProvider mirrors net.minecraft.util.valueproviders.UniformFloat
+// and ClampedNormalFloat.
 type UniformFloatProvider struct {
-	Min float32
-	Max float32
+	Type            string
+	Min             float32
+	Max             float32
+	Mean, Deviation float32
 }
 
-// Sample draws one float in [Min, Max) via Mth.randomBetween.
+// Sample draws one float via Mth.randomBetween or ClampedNormalFloat.sample.
 func (p UniformFloatProvider) Sample(random RandomSource) float32 {
+	if p.Type == "minecraft:clamped_normal" {
+		return SampleClampedNormalFloat(random, p.Mean, p.Deviation, p.Min, p.Max)
+	}
 	return randomBetween(random, p.Min, p.Max)
+}
+
+// SampleClampedNormalFloat mirrors ClampedNormalFloat.sample:
+// Mth.clamp(Mth.normal(random, mean, deviation), min, max).
+func SampleClampedNormalFloat(random RandomSource, mean, deviation, minVal, maxVal float32) float32 {
+	v := mean + float32(random.NextGaussian())*deviation
+	if v < minVal {
+		return minVal
+	}
+	if v > maxVal {
+		return maxVal
+	}
+	return v
 }
 
 // LargeDripstoneFeatureConfig mirrors LargeDripstoneConfiguration.
@@ -636,6 +654,51 @@ type LargeDripstoneFeatureConfig struct {
 	WindSpeed                        UniformFloatProvider
 	MinRadiusForWind                 int
 	MinBluntnessForWind              float32
+}
+
+// MultifaceGrowthFeatureConfig mirrors MultifaceGrowthConfiguration.
+type MultifaceGrowthFeatureConfig struct {
+	Block             string
+	SearchRange       int
+	CanPlaceOnFloor   bool
+	CanPlaceOnCeiling bool
+	CanPlaceOnWall    bool
+	ChanceOfSpreading float32
+	CanBePlacedOn     []string
+}
+
+// SculkPatchFeatureConfig mirrors SculkPatchConfiguration.
+type SculkPatchFeatureConfig struct {
+	ChargeCount      int
+	AmountPerCharge  int
+	SpreadAttempts   int
+	GrowthRounds     int
+	SpreadRounds     int
+	ExtraRareGrowths NestedIntProvider
+	CatalystChance   float32
+}
+
+// DripstoneClusterFeatureConfig mirrors DripstoneClusterConfiguration.
+type DripstoneClusterFeatureConfig struct {
+	FloorToCeilingSearchRange                           int
+	Height                                              NestedIntProvider
+	Radius                                              NestedIntProvider
+	MaxStalagmiteStalactiteHeightDiff                   int
+	HeightDeviation                                     int
+	DripstoneBlockLayerThickness                        NestedIntProvider
+	Density                                             UniformFloatProvider
+	Wetness                                             UniformFloatProvider
+	ChanceOfDripstoneColumnAtMaxDistanceFromCenter      float32
+	MaxDistanceFromEdgeAffectingChanceOfDripstoneColumn int
+	MaxDistanceFromCenterAffectingHeightBias            int
+}
+
+// PointedDripstoneFeatureConfig mirrors PointedDripstoneConfiguration.
+type PointedDripstoneFeatureConfig struct {
+	ChanceOfTallerDripstone   float32
+	ChanceOfDirectionalSpread float32
+	ChanceOfSpreadRadius2     float32
+	ChanceOfSpreadRadius3     float32
 }
 
 type FeatureRef struct {
@@ -1524,17 +1587,222 @@ func parseUniformFloatProvider(raw json.RawMessage) (UniformFloatProvider, error
 		return UniformFloatProvider{Min: fixed, Max: fixed}, nil
 	}
 	var value struct {
-		Type string  `json:"type"`
-		Min  float32 `json:"min_inclusive"`
-		Max  float32 `json:"max_exclusive"`
+		Type         string  `json:"type"`
+		MinInclusive float32 `json:"min_inclusive"`
+		MaxExclusive float32 `json:"max_exclusive"`
+		Min          float32 `json:"min"`
+		Max          float32 `json:"max"`
+		Mean         float32 `json:"mean"`
+		Deviation    float32 `json:"deviation"`
 	}
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return UniformFloatProvider{}, err
 	}
-	if value.Type != "minecraft:uniform" || value.Max <= value.Min {
-		return UniformFloatProvider{}, fmt.Errorf("invalid uniform float provider %s", raw)
+	switch value.Type {
+	case "minecraft:uniform":
+		if value.MaxExclusive <= value.MinInclusive {
+			return UniformFloatProvider{}, fmt.Errorf("invalid uniform float provider %s", raw)
+		}
+		return UniformFloatProvider{Type: value.Type, Min: value.MinInclusive, Max: value.MaxExclusive}, nil
+	case "minecraft:clamped_normal":
+		if value.Max < value.Min || value.Deviation <= 0 {
+			return UniformFloatProvider{}, fmt.Errorf("invalid clamped_normal float provider %s", raw)
+		}
+		return UniformFloatProvider{
+			Type:      value.Type,
+			Min:       value.Min,
+			Max:       value.Max,
+			Mean:      value.Mean,
+			Deviation: value.Deviation,
+		}, nil
+	default:
+		return UniformFloatProvider{}, fmt.Errorf("invalid float provider %s", raw)
 	}
-	return UniformFloatProvider{Min: value.Min, Max: value.Max}, nil
+}
+
+// MultifaceGrowth parses a minecraft:multiface_growth configured feature.
+func (s *FeatureSet) MultifaceGrowth(name string) (MultifaceGrowthFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:multiface_growth" {
+		return MultifaceGrowthFeatureConfig{}, fmt.Errorf("worldgen: %s is not a multiface growth feature", name)
+	}
+	var raw struct {
+		Block             string          `json:"block"`
+		SearchRange       *int            `json:"search_range"`
+		CanPlaceOnFloor   bool            `json:"can_place_on_floor"`
+		CanPlaceOnCeiling bool            `json:"can_place_on_ceiling"`
+		CanPlaceOnWall    bool            `json:"can_place_on_wall"`
+		ChanceOfSpreading *float32        `json:"chance_of_spreading"`
+		CanBePlacedOn     json.RawMessage `json:"can_be_placed_on"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return MultifaceGrowthFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	block := raw.Block
+	if block == "" {
+		block = "minecraft:glow_lichen"
+	}
+	searchRange := 10
+	if raw.SearchRange != nil {
+		searchRange = *raw.SearchRange
+	}
+	chance := float32(0.5)
+	if raw.ChanceOfSpreading != nil {
+		chance = *raw.ChanceOfSpreading
+	}
+	var canBePlacedOn []string
+	if len(raw.CanBePlacedOn) > 0 {
+		if raw.CanBePlacedOn[0] == '"' {
+			var single string
+			if err := json.Unmarshal(raw.CanBePlacedOn, &single); err != nil {
+				return MultifaceGrowthFeatureConfig{}, err
+			}
+			canBePlacedOn = []string{single}
+		} else if err := json.Unmarshal(raw.CanBePlacedOn, &canBePlacedOn); err != nil {
+			return MultifaceGrowthFeatureConfig{}, err
+		}
+	}
+	if searchRange < 1 || len(canBePlacedOn) == 0 {
+		return MultifaceGrowthFeatureConfig{}, fmt.Errorf("worldgen: invalid multiface growth %s", name)
+	}
+	return MultifaceGrowthFeatureConfig{
+		Block:             block,
+		SearchRange:       searchRange,
+		CanPlaceOnFloor:   raw.CanPlaceOnFloor,
+		CanPlaceOnCeiling: raw.CanPlaceOnCeiling,
+		CanPlaceOnWall:    raw.CanPlaceOnWall,
+		ChanceOfSpreading: chance,
+		CanBePlacedOn:     canBePlacedOn,
+	}, nil
+}
+
+// SculkPatch parses a minecraft:sculk_patch configured feature.
+func (s *FeatureSet) SculkPatch(name string) (SculkPatchFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:sculk_patch" {
+		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a sculk patch feature", name)
+	}
+	var raw struct {
+		ChargeCount      int             `json:"charge_count"`
+		AmountPerCharge  int             `json:"amount_per_charge"`
+		SpreadAttempts   int             `json:"spread_attempts"`
+		GrowthRounds     int             `json:"growth_rounds"`
+		SpreadRounds     int             `json:"spread_rounds"`
+		ExtraRareGrowths json.RawMessage `json:"extra_rare_growths"`
+		CatalystChance   float32         `json:"catalyst_chance"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	extra, err := parseNestedIntProvider(raw.ExtraRareGrowths)
+	if err != nil {
+		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: %s extra_rare_growths: %w", name, err)
+	}
+	if raw.ChargeCount < 1 || raw.AmountPerCharge < 1 || raw.SpreadAttempts < 1 {
+		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: invalid sculk patch %s", name)
+	}
+	return SculkPatchFeatureConfig{
+		ChargeCount:      raw.ChargeCount,
+		AmountPerCharge:  raw.AmountPerCharge,
+		SpreadAttempts:   raw.SpreadAttempts,
+		GrowthRounds:     raw.GrowthRounds,
+		SpreadRounds:     raw.SpreadRounds,
+		ExtraRareGrowths: extra,
+		CatalystChance:   raw.CatalystChance,
+	}, nil
+}
+
+// DripstoneCluster parses a minecraft:dripstone_cluster configured feature.
+func (s *FeatureSet) DripstoneCluster(name string) (DripstoneClusterFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:dripstone_cluster" {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s is not a dripstone cluster feature", name)
+	}
+	var raw struct {
+		FloorToCeilingSearchRange                           int             `json:"floor_to_ceiling_search_range"`
+		Height                                              json.RawMessage `json:"height"`
+		Radius                                              json.RawMessage `json:"radius"`
+		MaxStalagmiteStalactiteHeightDiff                   int             `json:"max_stalagmite_stalactite_height_diff"`
+		HeightDeviation                                     int             `json:"height_deviation"`
+		DripstoneBlockLayerThickness                        json.RawMessage `json:"dripstone_block_layer_thickness"`
+		Density                                             json.RawMessage `json:"density"`
+		Wetness                                             json.RawMessage `json:"wetness"`
+		ChanceOfDripstoneColumnAtMaxDistanceFromCenter      float32         `json:"chance_of_dripstone_column_at_max_distance_from_center"`
+		MaxDistanceFromEdgeAffectingChanceOfDripstoneColumn int             `json:"max_distance_from_edge_affecting_chance_of_dripstone_column"`
+		MaxDistanceFromCenterAffectingHeightBias            int             `json:"max_distance_from_center_affecting_height_bias"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	height, err := parseNestedIntProvider(raw.Height)
+	if err != nil {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s height: %w", name, err)
+	}
+	radius, err := parseNestedIntProvider(raw.Radius)
+	if err != nil {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s radius: %w", name, err)
+	}
+	thickness, err := parseNestedIntProvider(raw.DripstoneBlockLayerThickness)
+	if err != nil {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s dripstone_block_layer_thickness: %w", name, err)
+	}
+	density, err := parseUniformFloatProvider(raw.Density)
+	if err != nil {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s density: %w", name, err)
+	}
+	wetness, err := parseUniformFloatProvider(raw.Wetness)
+	if err != nil {
+		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s wetness: %w", name, err)
+	}
+	return DripstoneClusterFeatureConfig{
+		FloorToCeilingSearchRange:         raw.FloorToCeilingSearchRange,
+		Height:                            height,
+		Radius:                            radius,
+		MaxStalagmiteStalactiteHeightDiff: raw.MaxStalagmiteStalactiteHeightDiff,
+		HeightDeviation:                   raw.HeightDeviation,
+		DripstoneBlockLayerThickness:      thickness,
+		Density:                           density,
+		Wetness:                           wetness,
+		ChanceOfDripstoneColumnAtMaxDistanceFromCenter:      raw.ChanceOfDripstoneColumnAtMaxDistanceFromCenter,
+		MaxDistanceFromEdgeAffectingChanceOfDripstoneColumn: raw.MaxDistanceFromEdgeAffectingChanceOfDripstoneColumn,
+		MaxDistanceFromCenterAffectingHeightBias:            raw.MaxDistanceFromCenterAffectingHeightBias,
+	}, nil
+}
+
+// PointedDripstone parses a minecraft:pointed_dripstone configured feature.
+func (s *FeatureSet) PointedDripstone(name string) (PointedDripstoneFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:pointed_dripstone" {
+		return PointedDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s is not a pointed dripstone feature", name)
+	}
+	var raw struct {
+		ChanceOfTallerDripstone   *float32 `json:"chance_of_taller_dripstone"`
+		ChanceOfDirectionalSpread *float32 `json:"chance_of_directional_spread"`
+		ChanceOfSpreadRadius2     *float32 `json:"chance_of_spread_radius_2"`
+		ChanceOfSpreadRadius3     *float32 `json:"chance_of_spread_radius_3"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return PointedDripstoneFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	cfg := PointedDripstoneFeatureConfig{
+		ChanceOfTallerDripstone:   0.2,
+		ChanceOfDirectionalSpread: 0.7,
+		ChanceOfSpreadRadius2:     0.5,
+		ChanceOfSpreadRadius3:     0.5,
+	}
+	if raw.ChanceOfTallerDripstone != nil {
+		cfg.ChanceOfTallerDripstone = *raw.ChanceOfTallerDripstone
+	}
+	if raw.ChanceOfDirectionalSpread != nil {
+		cfg.ChanceOfDirectionalSpread = *raw.ChanceOfDirectionalSpread
+	}
+	if raw.ChanceOfSpreadRadius2 != nil {
+		cfg.ChanceOfSpreadRadius2 = *raw.ChanceOfSpreadRadius2
+	}
+	if raw.ChanceOfSpreadRadius3 != nil {
+		cfg.ChanceOfSpreadRadius3 = *raw.ChanceOfSpreadRadius3
+	}
+	return cfg, nil
 }
 
 func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
@@ -1962,12 +2230,19 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 	if !ok {
 		return fmt.Errorf("worldgen: placed feature %s missing", name)
 	}
+	return s.ForEachPlacementModifiers(name, placed.Placement, r, origin, context, visit)
+}
+
+// ForEachPlacementModifiers executes an arbitrary slice of placement modifiers
+// (either a placed feature's modifier chain or an inline FeatureRef's placement
+// array) in declared order.
+func (s *FeatureSet) ForEachPlacementModifiers(name string, modifiers []PlacementModifier, r RandomSource, origin FeaturePosition, context PlacementContext, visit func(FeaturePosition) error) error {
 	var apply func(int, FeaturePosition) error
 	apply = func(index int, position FeaturePosition) error {
-		if index == len(placed.Placement) {
+		if index == len(modifiers) {
 			return visit(position)
 		}
-		modifier := placed.Placement[index]
+		modifier := modifiers[index]
 		next := func(value FeaturePosition) error { return apply(index+1, value) }
 		switch modifier.Type {
 		case "minecraft:noise_threshold_count":

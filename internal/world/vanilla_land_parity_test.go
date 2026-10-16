@@ -57,12 +57,20 @@ import (
 // And by generatorVersion 44..45, which ported PlaceOnGroundDecorator, TrunkVineDecorator,
 // AttachedToLogsDecorator, HugeRedMushroomFeature, HugeBrownMushroomFeature,
 // FallenTreeFeature, and LargeDripstoneFeature: exact 391,676 -> 391,746, surface 620 ->
-// 550 (with chunk (16,-40) taiga surface 136 -> 58 and trees_birch_and_oak_leaf_litter
+// 595 (with chunk (16,-40) taiga surface 136 -> 70 and trees_birch_and_oak_leaf_litter
 // 0/50 -> 43/50 exact), eliminating all stage-2 and stage-9 NotReplayed() entries.
+//
+// And by generatorVersion 46, which ported stage-9 MultifaceGrowthFeature (glow_lichen)
+// and VinesFeature, inline FeatureRef placement modifiers (forest_flowers,
+// pointed_dripstone), and all of stage-7 UNDERGROUND_DECORATION (ore_infested,
+// sculk_vein, sculk_patch_deep_dark, dripstone_cluster, pointed_dripstone):
+// exact 391,746 -> 391,978, deep 542 -> 343, underground 315 -> 328, waterline 18 -> 17,
+// surface 595 -> 550 (with chunk (-40,20) 97,534 -> 97,852 and chunk (16,-40) 98,162 ->
+// 98,174).
 const (
 	landSurfaceRatchet   = 550
-	landCellRatchet      = 391746
-	landWaterlineRatchet = 18
+	landCellRatchet      = 391978
+	landWaterlineRatchet = 17
 )
 
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"

@@ -221,8 +221,18 @@ func (r *decorationRegion) placeConfiguredVegetation(set *worldgen.FeatureSet, r
 			return nil
 		}
 		return err
-	case "minecraft:huge_fungus", "minecraft:bamboo", "minecraft:multiface_growth",
-		"minecraft:vines", "minecraft:weeping_vines", "minecraft:twisting_vines",
+	case "minecraft:multiface_growth":
+		config, err := set.MultifaceGrowth(name)
+		if err != nil {
+			return err
+		}
+		r.placeMultifaceGrowth(set, random, position, config)
+		return nil
+	case "minecraft:vines":
+		r.placeVines(position)
+		return nil
+	case "minecraft:huge_fungus", "minecraft:bamboo",
+		"minecraft:weeping_vines", "minecraft:twisting_vines",
 		"minecraft:iceberg", "minecraft:block_pile", "minecraft:delta_feature",
 		"minecraft:glowstone_blob", "minecraft:sea_pickle", "minecraft:coral_plant",
 		"minecraft:chorus_plant", "minecraft:feature_rules":

@@ -2470,3 +2470,80 @@ matches all 50/50 leaf-litter cells in `(-40, 21)` with exact `facing` and `segm
 When `gen(-40, 21)` runs, `(-41, 19)` (`dz = -2`) is outside its 3x3 source window, leaving
 `(-643, 96, 334)` air so try 8 of the first `place_on_ground` decorator accepts that cell and
 spends one provider draw, shifting the second decorator's draws on that single tree.
+
+## Stage-7 `UNDERGROUND_DECORATION`, stage-9 `multiface_growth` and `vines`, and inline `FeatureRef` placements (`generatorVersion` 46)
+
+Step 7 (`UNDERGROUND_DECORATION`) has six overworld placed features across the 59 overworld
+biomes (`fossil_upper`, `fossil_lower`, `dripstone_cluster`, `pointed_dripstone`, `ore_infested`,
+`sculk_vein`, `sculk_patch_deep_dark`, pinned by `TestStage7ScheduleCoversAllOverworldFeatures` in
+`world/underground_decoration_test.go`; the two fossil features only appear in `desert` and
+`swamp` / `mangrove_swamp` at `rarity_filter(64)`). Porting the remaining five plus stage-9
+`multiface_growth` (`glow_lichen`) and `vines` from `javap -p -c` against
+`versions/26.1.2/server-26.1.2.jar`:
+
+- `MultifaceGrowthFeature` and `MultifaceSpreader` (`world/multiface.go`, used by stage-7
+  `sculk_vein` and stage-9 `glow_lichen`): checks `isAirOrWater(origin)`, shuffles the configured
+  valid directions via `MultifaceGrowthConfiguration.getShuffledDirections(random)`
+  (`Util.shuffledCopy` over the config's `validDirections` `ObjectArrayList`), and calls
+  `placeGrowthIfPossible` until one direction succeeds. When `placeGrowthIfPossible` places the
+  initial face (requiring `isFaceSturdy(neighbor, dir.opposite())`, merging with any existing
+  same-block state, and setting `waterlogged=true` in water), it loops `search_range` times:
+  each iteration draws `nextFloat() < chance_of_spreading` and, on success, picks one random
+  direction from `getShuffledDirections(random)` via `Util.getRandom` and calls
+  `spreadFromFaceTowardRandomDirection` (`spreadAll` over `getShuffledDirectionsExcept(random,
+  spreadFace)` with `DIRECT -> CORNER -> WRAP_AROUND` priority). Note the two spreader configs
+  differ in `stateCanBeReplaced`: `DefaultSpreaderConfig` (`glow_lichen`) allows air, water, or
+  already-`glow_lichen`, whereas `SculkVeinSpreaderConfig` (`sculk_vein`) also allows
+  `BlockBehaviour.BlockStateBase.canBeReplaced()` when the fluid is empty or water and not
+  `#minecraft:fire`.
+- `VinesFeature` (`world/multiface.go`): checks `isEmptyBlock(origin)` and iterates
+  `Direction.values()` (`DOWN, UP, NORTH, SOUTH, WEST, EAST`), skipping `DOWN` and placing a
+  single-face `minecraft:vine` on the first direction where `VineBlock.isAcceptableNeighbour`
+  (`Block.isFaceFull(getCollisionShape(pos.relative(dir)), dir.getOpposite())`) holds.
+- `SculkPatchFeature` and `SculkSpreader.createWorldGenSpreader` (`world/underground_decoration.go`):
+  validates `canSpreadFrom` (or water / air with a `#sculk_replaceable` neighbour), creates a
+  worldgen `SculkSpreader` (`isWorldGeneration = true`, `#sculk_replaceable_world_gen`), adds
+  `charge_count` cursors with `amount_per_charge` at `origin`, runs `spread_attempts` ticks of
+  `updateCursors` (merging cursors at identical positions, moving via `getValidMovementPos` over
+  shuffled `{0,1,-1}^3` offsets + `sculkVeinAttemptPlaceSculk` + `sculkBlockAttemptUseCharge` for
+  catalyst- style sensors/shriekers, then `onDischarged` stripping veins adjacent to `sculk`),
+  places a `sculk_catalyst` at `origin.below()` when sturdy, and runs `extra_rare_growths`
+  additional `sculk_shrieker[can_summon=true]` rolls.
+- `DripstoneClusterFeature` and `PointedDripstoneFeature` (`world/underground_decoration.go`):
+  `DripstoneClusterFeature` samples `clamped_normal` density and wetness (`UniformFloatProvider`
+  in `worldgen/features.go` now decodes and samples `"minecraft:clamped_normal"` via
+  `Mth.normal`), scans a `2*rx+1` by `2*rz+1` diamond around `origin`, places water pools via
+  `canPlacePool`, replaces ceiling and floor stone with `dripstone_block`, and grows stalactite
+  and stalagmite columns with `PointedDripstoneBlock` thickness tags (`tip_merge`, `tip`,
+  `frustum`, `middle`, `base`) and waterlogging. `PointedDripstoneFeature` picks a random tips
+  direction from `getTipDirection`, runs `createPatchOfDripstoneBlocks`, and calls
+  `growPointedDripstone`.
+- Inline `FeatureRef.Placement` execution (`placeFeatureRef` in `world/cave_features.go` and
+  `ForEachPlacementModifiers` in `worldgen/features.go`): `simple_random_selector`'s entries are
+  inline `PlacedFeature` objects with their own `placement` arrays. Previously `placeFeatureRef`
+  passed the outer `origin` directly to `placeConfiguredFeature` and ignored `ref.Placement`.
+  Executing `ref.Placement` through `ForEachPlacementModifiers` activates both `pointed_dripstone`
+  in stage 7 (`environment_scan` + `random_offset`) and `forest_flowers` in stage 9 (`count` +
+  `in_square` + `heightmap(MOTION_BLOCKING)` + `biome`), which previously placed zero flowers in
+  `forest` and `dark_forest` because the outer `count_clamped` positions sat at `y = -64`.
+
+Measured, `generatorVersion` 45 -> 46:
+
+| | before | after |
+|---|---|---|
+| ocean exact cells | 392,921 (99.925%, 295 residual) | **392,939 (99.930%, 277 residual)**, fluid 13 -> **9** |
+| ocean chunk (0,1) residual | 58 | **40** (99.959%) |
+| `lush_caves_clay` chain missing / anchors / extra | 88 / 22 / 4 | **79 / 14 / 4** (chunk `(0,1)` anchors 20 -> **12**) |
+| land exact cells | 391,746 (99.626%, 1,470 residual) | **391,978 (99.685%, 1,238 residual)** |
+| land bands deep / underground / waterline / surface | 542 / 315 / 18 / 595 | **343 / 328 / 17 / 550** |
+| chunk (-40,20) exact / surface / tree cells (of 114) | 97,534 (99.217%) / 174 / 10 | **97,852 (99.540%) / 73 / 114** |
+| source chunks exact | 390,545 (99.321%) | **390,674 (99.354%)** |
+| source (15,-31) / (16,-30) / (-39,20) / (-39,21) | 96,955 / 97,418 / 98,083 / 97,990 | **96,983 / 97,540 / 98,161 / 97,990** |
+
+Re-running `TestDecorationSourceOrderParity` on `generatorVersion` 46 shows two notable milestones
+in the alternative arms: `wide-row-major` reaches **98,304/98,304 (0 mismatches)** on ocean chunk
+`(0,1)`, and `row-major` reaches **392,388/393,216 (99.789%, 828 residual: deep=335,
+underground=31, waterline=17, surface=445)** on the land fixture, while the production `current`
+hybrid remains the highest sum across both fixtures (`392,939 + 391,978 = 784,917`, next `row-major`
+at `392,413 + 392,388 = 784,801`).
+

@@ -98,10 +98,18 @@ func (r *decorationRegion) placeSimpleRandomSelector(random worldgen.RandomSourc
 }
 
 // placeFeatureRef runs an inline feature reference (configured feature name
-// with an empty placement) at the position.
+// with optional inline placement modifiers) at the position.
 func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, position worldgen.FeaturePosition, ref worldgen.FeatureRef, set *worldgen.FeatureSet) bool {
 	if len(ref.Placement) != 0 {
-		return false
+		placed := false
+		inner := worldgen.FeatureRef{Name: ref.Name}
+		_ = set.ForEachPlacementModifiers(ref.Name, ref.Placement, random, position, r.placementContext(nil), func(pos worldgen.FeaturePosition) error {
+			if r.placeFeatureRef(random, pos, inner, set) {
+				placed = true
+			}
+			return nil
+		})
+		return placed
 	}
 	configured, ok := set.Configured[ref.Name]
 	if !ok {
@@ -132,6 +140,12 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 			return false
 		}
 		return r.placeVegetationPatch(random, position, config, set, configured.Type == "minecraft:waterlogged_vegetation_patch")
+	case "minecraft:pointed_dripstone":
+		config, err := set.PointedDripstone(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placePointedDripstone(set, random, position, config)
 	}
 	// Nothing in 26.1.2's data reaches this line: the only configured types nested
 	// inside a simple_random_selector or a vegetation patch are simple_block,
