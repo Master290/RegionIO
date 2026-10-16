@@ -2339,3 +2339,59 @@ Measured, `generatorVersion` 41 -> 42:
 Base parity is now asserted unconditionally in `runBaseTerrainParity`: with both
 captures exact, any undecorated mismatch is a regression rather than a known residual,
 and every attribution of a decorated cell to a feature leans on that layer.
+
+## The biome placement filter reads the zoomed biome too, and it was most of task 22
+
+Task 22 left (15,-31)'s ore_clay as a "conserved but displaced" set - 862 missing, 776+334
+extra - and named two suspects, the stage-6 schedule index and the source's biome union.
+Neither: the jar says `BiomeFilter.shouldPlace` calls `context.getLevel().getBiome(pos)`,
+which is `LevelReader.getBiome` -> `getBiomeManager().getBiome(pos)`, and `WorldGenRegion`
+builds that manager with `BiomeManager.obfuscateSeed(seed)` over its own chunks. So the filter
+at the end of every placed feature tests the *zoomed* biome of the candidate, the same lookup
+the surface rules use (previous section). `decorationRegion.getBiome` answered with the
+4x4x4 cell holding the block instead. Both agree away from a border; near one, a candidate is
+admitted or refused differently, and every vein whose `biome` filter sat on the
+lush_caves/dripstone/taiga edges moved together - which is exactly the displaced-not-missing
+shape. `MineShaftPiece.isInInvalidLocation` reads `level.getBiome` the same way and now gets
+the same answer.
+
+`decorationRegion.getBiome` zooms over the region's stored chunk biomes, clamping quart Y as
+`ChunkAccess.getNoiseBiome` does. The zoom seed is world-level, which the region's chunks
+cannot supply, so every stage entry point that receives the world seed calls `bindSeed`, and
+`getBiome` panics if it was not - a silent fallback to the cell is the bug being fixed.
+
+Measured, `generatorVersion` 42 -> 43:
+
+| | before | after |
+|---|---|---|
+| land exact cells | 390,899 (99.411%) | **391,676 (99.608%)** |
+| land bands deep / underground / waterline / surface | 700 / 883 / 51 / 683 | **542 / 360 / 18 / 620** |
+| land tree cells above sea level (of 789) | 607 | **678** |
+| ocean exact cells | 392,886 (330 residual) | **392,921 (295)**, fluid 22 -> 13 |
+| lush_caves_clay chain missing / anchors / extra | 96 / 22 / 9 | **88 / 22 / 4** |
+| source (15,-31) | 95.866% | **98.225%** (the clay pairs are gone from its top four) |
+| source (-39,20) / (-39,21) | 99.625% / 99.651% | 99.775% / 99.674% |
+| trees_taiga / trees_old_growth_pine_taiga chain | 193/194, 100/100 | unchanged |
+
+The 20 clay anchors in (0,1) did not move, which keeps them where task 8 put them: a
+cross-border history problem, not a filter one. The (-39,21) granite/diorite/andesite family
+barely moved (223 -> 223 cells in its top pairs), so that one is not a border filter either
+and stays open.
+
+The decoration-order sweep was re-run because it measures the generator. Hybrid 784,597
+(392,921 + 391,676) is still the best sum; wide-hybrid 784,410, target-first 784,352,
+row-major 784,184, column-major 784,165. Column-major still wins land alone (391,866) by
+winning the underground band (59 against 360) and losing the surface (761 against 620).
+`TestDecorationSourceOrderParity` had been asserting the land arm against a literal 390,895
+that generatorVersion 42 already made stale - unnoticed because only the diagnostics job runs
+it - so it now reads `landCellRatchet` directly.
+
+`TestLushClayPositionsAreRecorded` moved in two rows, as it is meant to when the generator
+does, and the two moves are the same answer. For target (0,1), source (0,0) now places
+(5,-29,12), (5,-25,3) and (1,-5,4) - the latter two `clay_pool_with_dripleaves` - instead of
+(5,-29,12), (2,-41,12); and at target (0,0) with *both* south-west sources removed it places
+exactly the same three, where it used to place what removing either one places. That
+identity is what the structure predicts: target (0,1)'s 3x3 of sources holds neither (-1,-1)
+nor (0,-1), so it *is* the both-removed case. Removing one still gives (2,-41,12), and the
+extra-sources row still recovers vanilla's (5,-30,13), so the diagnosis stands: the source's
+answer depends on which chunk is the centre, through which neighbours decorated first.

@@ -15,6 +15,7 @@ import (
 const vegetationStage = 9
 
 func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err

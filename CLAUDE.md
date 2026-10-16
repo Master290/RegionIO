@@ -217,9 +217,9 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 42): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 43): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
-and **99.916% through the production region replay** — 330 residual cells, dominated by the
+and **99.925% through the production region replay** — 295 residual cells, dominated by the
 lush-caves moss and clay pools and their nested vegetation. Featureless vanilla captures
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) prove the
 undecorated pipeline bit-exact on both sets — 393,216/393,216 ocean and 786,432/786,432 land
@@ -228,21 +228,31 @@ density, surface rules, carvers, aquifers, and noise-router veins match every ce
 `runBaseTerrainParity` now fails on a single mismatch — so the residual block gap is entirely
 inside feature replay.
 That ocean fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
-chunks): **99.411%**, 2,317 residual cells, of which 683 are the surface band above sea level and 51
-the waterline band, with 607 of vanilla's 789 tree cells placed. Both bands are ratcheted in
+chunks): **99.608%**, 1,540 residual cells, of which 620 are the surface band above sea level and 18
+the waterline band, with 678 of vanilla's 789 tree cells placed. Both bands are ratcheted in
 `world/vanilla_land_parity_test.go`, because the ocean floor of 99.7% leaves ~849 cells of headroom
 and an entirely wrong forest fits inside it.
 
-**The surface rules and carvers read the biome per block, through `BiomeManager.getBiome`.**
-`SurfaceRules$Context.updateY` memoizes `biomeGetter.apply(pos)` for every block, and both
-`SurfaceSystem.buildSurface` and `applyCarvers` pass `BiomeManager::getBiome` — the fiddled
-Voronoi zoom over the noise biomes, seeded by `obfuscateSeed` — not the 4×4×4 cell and not a
-per-column climate lookup. `world/biome_zoom.go` ports it and `TestBiomeZoomMatchesVanilla` pins
-it against vectors from `tools/VanillaBiomeZoomVectors.java`. The per-column biome it replaced
-agreed with vanilla everywhere except along borders between biomes whose surface rules differ,
-which is why it survived until the land base capture showed 29 podzol-for-grass cells on an
-old_growth_pine_taiga edge. `SurfaceContext.BiomeName` is now only a fallback for callers that
-set no `BiomeFunc`; anything new that applies the rule tree should set the getter.
+**Every vanilla `getBiome(BlockPos)` is the zoomed lookup, `BiomeManager.getBiome`.** It is the
+fiddled Voronoi zoom over the noise biomes, seeded by `obfuscateSeed` — not the 4×4×4 cell holding
+the block and not a per-column climate lookup. `world/biome_zoom.go` ports it and
+`TestBiomeZoomMatchesVanilla` pins it against vectors from `tools/VanillaBiomeZoomVectors.java`.
+Its readers, each confirmed in the jar:
+
+- the surface rules (`SurfaceRules$Context.updateY` memoizes `biomeGetter.apply(pos)` per block;
+  `SurfaceSystem.buildSurface` passes `BiomeManager::getBiome`) and the carvers' `topMaterial`
+  (`applyCarvers` passes the same) — `SurfaceContext.BiomeFunc`, set in `generateBaseTerrain`;
+- `BiomeFilter.shouldPlace`, i.e. every `minecraft:biome` placement modifier, and
+  `MineShaftPiece.isInInvalidLocation` — both call `level.getBiome`, which is
+  `LevelReader.getBiome` -> `WorldGenRegion`'s `BiomeManager` — `decorationRegion.getBiome`, which
+  zooms over the region's stored chunk biomes and needs `bindSeed` first (it panics otherwise).
+
+The per-column surface biome survived until the land base capture showed 29 podzol-for-grass cells
+on an old_growth_pine_taiga edge (generatorVersion 42). The cell-based placement filter was worth
+far more (generatorVersion 43): it admitted or refused candidates near every biome border
+differently from vanilla, which is what source (15,-31)'s "conserved but displaced" ore_clay
+looked like — land 390,899 -> 391,676, ocean 330 -> 295 residual. Anything new that asks for a
+biome at a block during worldgen should go through one of these two, not `Chunk.GetBiome`.
 
 The underground stages are each pinned by their own capture, which is why they can be trusted while
 the surface ones cannot: monster rooms (`world/monster_rooms.go`) replay between geodes and the ores
@@ -297,7 +307,8 @@ architecture hidden in a parity edit. The hand-written `worldgen.PlaceStructures
 is no longer called by the production region replay; only the explicitly legacy per-chunk
 fallback retains it. Because that removal changes generated terrain, `generatorVersion` went to 41:
 every chunk stamped 40 or earlier regenerates rather than keeping the hand-placed village. It is
-42 now, for the per-block biome zoom in the surface rules and carvers.
+43 now: 42 for the per-block biome zoom in the surface rules and carvers, 43 for the same zoom
+in the decoration region's biome filter.
 
 The canonical cache treats a stored chunk as read-only, never as a replay input. A request for a
 tile probes the store for its own target first and reconciles the remaining members afterwards, so

@@ -221,13 +221,19 @@ func TestLushClayPositionsAreRecorded(t *testing.T) {
 
 	// The per-target table: source (0,0) gives four different answers about itself
 	// depending on which chunk happens to be the centre.
+	//
+	// Re-measured on generatorVersion 43 (biome filters read the zoomed biome): only
+	// the (0,1) row moved, from (2,-41,12) to two clay_pool_with_dripleaves at
+	// (5,-25,3) and (1,-5,4). It still diverges right after the first pool and still
+	// misses vanilla's (5,-30,13), so the finding stands - the source's answer depends
+	// on the centre - and the extra-sources row below still recovers vanilla's pair.
 	for _, tc := range []struct {
 		target [2]int32
 		want   [][3]int
 	}{
 		{[2]int32{0, 0}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
 		{[2]int32{1, 0}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
-		{[2]int32{0, 1}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+		{[2]int32{0, 1}, [][3]int{{5, -29, 12}, {5, -25, 3}, {1, -5, 4}}},
 		{[2]int32{-1, -1}, [][3]int{{5, -29, 12}, {5, -30, 13}, {4, -7, 1}}},
 	} {
 		t.Run(fmt.Sprintf("target-%d-%d", tc.target[0], tc.target[1]), func(t *testing.T) {
@@ -240,8 +246,12 @@ func TestLushClayPositionsAreRecorded(t *testing.T) {
 	}
 
 	// The predecessor-removal table at target (0,0): the two south-west sources are
-	// jointly and individually required, and losing both moves no further than
-	// losing either.
+	// jointly and individually required.
+	//
+	// On generatorVersion 37..42 losing both moved no further than losing either. Since
+	// the biome filter reads the zoomed biome (43) losing both gives exactly target
+	// (0,1)'s answer instead - which is what it should be, because (0,1)'s 3x3 of
+	// sources holds neither (-1,-1) nor (0,-1). Losing one still gives (2,-41,12).
 	for _, tc := range []struct {
 		name string
 		skip [][2]int32
@@ -252,7 +262,7 @@ func TestLushClayPositionsAreRecorded(t *testing.T) {
 		{"skip-north-west", [][2]int32{{1, -1}}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
 		{"skip-south-west-corner", [][2]int32{{-1, -1}}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
 		{"skip-south-centre", [][2]int32{{0, -1}}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
-		{"skip-both-south-west", [][2]int32{{-1, -1}, {0, -1}}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
+		{"skip-both-south-west", [][2]int32{{-1, -1}, {0, -1}}, [][3]int{{5, -29, 12}, {5, -25, 3}, {1, -5, 4}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			skip := map[[2]int32]bool{}

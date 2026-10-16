@@ -97,6 +97,7 @@ func (r *decorationRegion) monsterSafeSetBlock(x, y, z int, state uint16) bool {
 // placeScheduledMonsterRooms replays the vanilla stage-3 schedule from one
 // source center into the mutable decoration region.
 func (r *decorationRegion) placeScheduledMonsterRooms(seed int64) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err

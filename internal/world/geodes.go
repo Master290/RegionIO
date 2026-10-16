@@ -22,6 +22,7 @@ type geodePoint struct {
 // with vanilla normal-noise perturbation, then the nearest layer threshold
 // selects filling, inner, middle, or outer material.
 func (r *decorationRegion) placeScheduledGeodes(seed int64) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err

@@ -46,6 +46,12 @@ type decorationRegion struct {
 	// worldgen freezes the *_WG heightmaps; the region's chunks are mutable from
 	// here on, so this is the only moment the frozen values can be taken.
 	worldgen map[[2]int32]*worldgenTopY
+	// biomeZoomSeed is BiomeManager.obfuscateSeed(worldSeed), which getBiome needs
+	// and the chunks alone cannot supply. Every stage entry point that receives the
+	// world seed binds it; see bindSeed.
+	biomeZoomSeed  int64
+	biomeWorldSeed int64
+	biomeZoomBound bool
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
@@ -186,12 +192,35 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 	return MinY
 }
 
+// bindSeed records the world seed the region's biome lookups are zoomed with. It is
+// idempotent and cheap after the first call, so every stage entry point calls it.
+func (r *decorationRegion) bindSeed(seed int64) {
+	if r.biomeZoomBound && r.biomeWorldSeed == seed {
+		return
+	}
+	r.biomeWorldSeed = seed
+	r.biomeZoomSeed = obfuscateBiomeSeed(seed)
+	r.biomeZoomBound = true
+}
+
+// getBiome is WorldGenRegion.getBiome, i.e. LevelReader.getBiome ->
+// BiomeManager.getBiome, whose seed WorldGenRegion's constructor builds with
+// obfuscateSeed and whose noise source is the region's own chunks. That is what
+// BiomeFilter.shouldPlace and StructurePiece.isInInvalidLocation call - the zoomed
+// biome of the block, not the 4x4x4 cell containing it. The chunks' stored noise
+// biomes already match vanilla's cell for cell, so zooming over them is the whole
+// lookup; quart Y is clamped to the world as ChunkAccess.getNoiseBiome clamps it.
 func (r *decorationRegion) getBiome(x, y, z int) (uint16, bool) {
-	chunk := r.chunkAtBlock(x, z)
+	if !r.biomeZoomBound {
+		panic("world: decorationRegion.getBiome called before bindSeed; the zoomed biome lookup needs the world seed")
+	}
+	qx, qy, qz := zoomQuart(r.biomeZoomSeed, x, y, z)
+	qy = min(max(qy, biomeMinQuartY), biomeMinQuartY+biomeQuartsY-1)
+	chunk := r.chunks[[2]int32{int32(qx >> 2), int32(qz >> 2)}]
 	if chunk == nil {
 		return 0, false
 	}
-	return chunk.GetBiome(x&15, y, z&15), true
+	return chunk.GetBiome((qx&3)*biomeCellSize, qy*biomeCellSize, (qz&3)*biomeCellSize), true
 }
 
 func (r *decorationRegion) biomeAllowsFeature(set *worldgen.FeatureSet, feature string, stage int, position worldgen.FeaturePosition) bool {

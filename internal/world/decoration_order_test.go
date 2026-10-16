@@ -162,8 +162,12 @@ func TestDecorationSourceOrderParity(t *testing.T) {
 		path    string
 		ratchet int // exact cells expected from the "current" arm
 	}{
-		{"ocean", vanillaParityFixture, 392886},
-		{"land", vanillaLandFixture, 390895},
+		// The land arm reads landCellRatchet rather than a copy of it: a literal here
+		// went stale once already (390,895 survived generatorVersion 42's 390,899 because
+		// only the diagnostics job runs this test), and a ratchet that is a floor in one
+		// file and an exact count in another must be the same number.
+		{"ocean", vanillaParityFixture, 392921},
+		{"land", vanillaLandFixture, landCellRatchet},
 	} {
 		cap := readFixtureCapture(t, fx.path)
 		// baseline[chunk] holds the "current" arm's blocks, so other arms can be

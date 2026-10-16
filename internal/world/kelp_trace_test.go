@@ -30,6 +30,7 @@ func TestTraceKelpChunk10(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		t.Fatal(err)

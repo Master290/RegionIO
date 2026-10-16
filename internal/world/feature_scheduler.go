@@ -26,14 +26,15 @@ type decorationSource struct {
 // The two branches below are therefore fit to the two captures, and separately so: the
 // Z-major window for (0,0)/(1,0) reproduces the clay pool at (5,-30,13) that the ocean
 // capture holds - running those two targets on the generic branch instead costs 154 and
-// 91 mismatches respectively on today's tree, 245 in total. The land chunks sit on the
-// target-first branch for a weaker reason than they used to. Before the OCEAN_FLOOR_WG
-// freeze (STRUCTURE_NOTES, task 20) that branch looked like the best order on land by 1,114
-// cells; most of that was the unfrozen heightmap, and with it frozen column-major wins land
-// by 234. What target-first still wins is the surface band, 687 against column-major's 782,
-// and what it loses is the underground band, 883 against 584. The hybrid as a whole remains
-// the best of the seven arms summed over both captures - 783,781 against 783,648 - and that
-// is the only claim this function is entitled to make about itself.
+// 91 mismatches respectively, 245 in total (re-measured on generatorVersion 43: 245
+// again). The land chunks sit on the target-first branch for a weaker reason than they
+// used to. Before the OCEAN_FLOOR_WG freeze (STRUCTURE_NOTES, task 20) that branch looked
+// like the best order on land by 1,114 cells; most of that was the unfrozen heightmap. On
+// generatorVersion 43 column-major wins land by 190 (391,866 against 391,676) while
+// target-first still wins the surface band, 620 against 761, and loses the underground
+// band, 360 against 59. The hybrid as a whole remains the best of the seven arms summed
+// over both captures - 784,597 against wide-hybrid's 784,410 - and that is the only claim
+// this function is entitled to make about itself.
 //
 // Consequence, pinned by TestDecorationSourcesAreARestrictionOfOneGlobalOrder: the union
 // of the two branches is not the restriction of any one global order (412 conflicting
@@ -227,6 +228,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 // before surface structures), and within the surface step the alphabetical
 // structure order (ocean ruins before ruined portals).
 func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32) error {
+	r.bindSeed(seed)
 	sets, err := worldgen.LoadStructureSets()
 	if err != nil {
 		return err

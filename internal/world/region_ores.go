@@ -8,6 +8,7 @@ import "regionio/internal/worldgen"
 // disk features. Replaying by feature type silently changed the terrain seen
 // by later entries.
 func (r *decorationRegion) placeScheduledUndergroundOresStage(seed int64) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err
@@ -93,6 +94,7 @@ func (r *decorationRegion) placeScheduledOresWithOrder(seed int64, biomeOrder []
 }
 
 func (r *decorationRegion) placeScheduledOresFiltered(seed int64, biomeOrder []string, featureIndexOffset int, include map[string]bool) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err

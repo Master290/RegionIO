@@ -15,6 +15,7 @@ const fluidsStage = 8
 // never been replayed in the region: the walk covered stages 1, 2, 3, 6 and 9, so a
 // decorated region produced no springs at all while the per-chunk path still did.
 func (r *decorationRegion) placeScheduledSprings(seed int64) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err

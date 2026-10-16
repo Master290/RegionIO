@@ -46,6 +46,7 @@ type lakeStateProviderJSON struct {
 // placeScheduledLakes replays the stage-1 lake features from one source
 // center into the mutable decoration region.
 func (r *decorationRegion) placeScheduledLakes(seed int64) error {
+	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		return err

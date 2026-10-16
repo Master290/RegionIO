@@ -233,10 +233,15 @@ func TestVanillaLushClayDiff(t *testing.T) {
 	// fix in. The chain is not closed, so these are not zeros - they are the
 	// budget. Any move up is a regression; when a fix takes cells off the
 	// ledger, tighten the number here rather than deleting the assertion.
+	//
+	// generatorVersion 43 took it from 96/22/9 to 88/22/4: BiomeFilter reads the
+	// zoomed biome of the candidate (biome_zoom.go), and lush_caves_clay sits on
+	// the lush_caves border. The 20 anchors in (0,1) did not move, so they are
+	// still the cross-border history problem, not a filter one.
 	const (
-		maxMissing = 96
+		maxMissing = 88
 		maxAnchors = 22
-		maxExtra   = 9
+		maxExtra   = 4
 	)
 	t.Logf("lush_caves_clay chain total: missing=%d (clay anchors %d) extra_clay=%d",
 		totalMissing, totalAnchors, totalExtra)

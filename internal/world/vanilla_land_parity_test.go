@@ -19,8 +19,8 @@ import (
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
 // landSurfaceRatchet, landCellRatchet, landWaterlineRatchet are today's measured land
-// numbers: 683 surface-band mismatches, 51 waterline-band mismatches and 390,899 exact
-// cells, with 607 of vanilla's 789 tree cells (77%).
+// numbers: 620 surface-band mismatches, 18 waterline-band mismatches and 391,676 exact
+// cells, with 678 of vanilla's 789 tree cells (86%).
 //
 // Both numbers moved twice when dark oaks arrived, and the two moves are separable:
 // fixing the three inverted doPlace guards (clip refusal, the ignore_vines clause, the
@@ -47,10 +47,17 @@ import (
 // BiomeManager.getBiome per block instead of one biome per column: surface band 687 ->
 // 683, exact cells 390,895 -> 390,899, waterline and tree cells unchanged. The cells are
 // the podzol/grass_block border the featureless land capture had pinned, now exact.
+//
+// And by generatorVersion 43, which made the decoration region's getBiome - BiomeFilter's
+// and the mineshaft blocking-biome check's reader - the same zoomed lookup instead of the
+// 4x4x4 cell: exact 390,899 -> 391,676, deep 700 -> 542, underground 883 -> 360,
+// waterline 51 -> 18, surface 683 -> 620, tree cells 607 -> 678. A placement filter
+// that read the cell admitted or refused candidates near every biome border differently
+// from vanilla, which is the "conserved but displaced" ore shape source (15,-31) showed.
 const (
-	landSurfaceRatchet   = 683
-	landCellRatchet      = 390899
-	landWaterlineRatchet = 51
+	landSurfaceRatchet   = 620
+	landCellRatchet      = 391676
+	landWaterlineRatchet = 18
 )
 
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"

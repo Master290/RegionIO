@@ -89,6 +89,7 @@ func TestPlainsTreeChainProducesPositionsAndLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	region.bindSeed(12345)
 	if err := region.setSource(0, 0); err != nil {
 		t.Fatal(err)
 	}

@@ -85,7 +85,7 @@ chunks. The canonical single-chunk generator currently matches 95.960% of
 fixture blocks (377,329/393,216, measured with `REGIONIO_PARITY_GENERATOR=legacy`;
 it no longer places any surface decoration at all, since trees, springs, flora,
 desert features and rocks moved to the datapack path), while the production region
-replay path matches 99.916% — 330
+replay path matches 99.925% — 295
 residual cells, dominated by the lush-caves moss and clay pools and their nested
 vegetation; both match
 all fixture biomes and heightmaps. CI checks the region path against a 99.7%
@@ -148,7 +148,7 @@ mineshafts (piece-for-piece against the saved vanilla start NBT and
 cell-for-cell against a structures-only capture) replay from the datapack —
 the fixture's dungeon pocket, a monster room whose wall opening a mineshaft
 corridor carved, now places in full. What is left in the fixture is
-underground: 306 of its 330 residual cells sit below y=0 and the surface band
+underground: 280 of its 295 residual cells sit below y=0 and the surface band
 contributes none, led by the moss-patch cell disagreement — which per-target nets
 show is about which cells a patch covers, not how far it reaches — then ground cover,
 clay, and cave vines. Surface decoration was the larger structural gap and has now been
@@ -161,7 +161,8 @@ measured rather than inferred: `testdata/vanilla_land_12345.bin` captures four
 land chunks (taiga, old-growth pine taiga, two plains), where the ocean fixture
 has no surface at all — top block `water` on all 1,024 columns. Land parity went
 from 99.140% (3,382 residual, 1,748 of them in the surface band) with the
-hand-written trees, to 99.411% (2,317 residual, 683 in the surface band) now, after
+hand-written trees, to 99.608% (1,540 residual, 620 in the surface band) now, after
+the biome placement filter learned to read the zoomed per-block biome vanilla's does,
 springs and boulders joined the schedule, the flora percentages were deleted, leaves
 were given the distance property vanilla propagates into them, dark oaks grew their
 own trunks and canopies, and three inverted guards in the ported `doPlace` were fixed —
