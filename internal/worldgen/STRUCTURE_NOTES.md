@@ -2547,3 +2547,66 @@ underground=31, waterline=17, surface=445)** on the land fixture, while the prod
 hybrid remains the highest sum across both fixtures (`392,939 + 391,978 = 784,917`, next `row-major`
 at `392,413 + 392,388 = 784,801`).
 
+## Sculk spread predicates, noise-based `SimpleBlock` state providers, and `simpleBlockCanSurvive` (`generatorVersion` 47)
+
+Four bytecode-level defects across `SculkPatchFeature` / `SculkVeinBlock` and `SimpleBlockFeature`
+accounted for 214 of the remaining 1,238 land mismatches (47 deep, 1 waterline, 166 surface):
+
+- `SculkPatchFeature.canSpreadFrom` and `SculkVeinBlock.hasSubstrateAccess`
+  (`world/underground_decoration.go`): `SculkPatchFeature.lambda$canSpreadFrom$0` checks
+  `BlockStateBase.isCollisionShapeFullBlock(level, pos.relative(dir))` (`canMultifaceAttachTo`) on
+  the six neighbours when the origin is air or water, not `#minecraft:sculk_replaceable`. Checking
+  `#minecraft:sculk_replaceable` rejected origins sitting on `bedrock` or already-spread `sculk`.
+  In `SculkVeinBlock.hasSubstrateAccess`, bytecode offset 57 checks `BlockTags.SCULK_REPLACEABLE`
+  (`#minecraft:sculk_replaceable`) rather than `#minecraft:sculk_replaceable_world_gen`. Also fixed
+  `SculkPatchFeature.place`'s catalyst check (`canMultifaceAttachTo(belowState)`) and extra-rare
+  shrieker property (`can_summon=true` at bytecode offset 309 `iconst_1`). Together these move land
+  `deep` from `343` to `296` (`+47` exact cells, cutting `deepslate -> sculk` from `62` to `27` and
+  eliminating `sculk_vein -> air`).
+- Noise-based and `randomized_int` state providers in `SimpleBlockFeature`
+  (`worldgen/features.go` and `world/vegetation_patches.go`): `parseStateProviderSpec` now decodes
+  `"minecraft:noise_provider"` (`flower_flower_forest`), `"minecraft:noise_threshold_provider"`
+  (`flower_plain`), and `"minecraft:dual_noise_provider"` (`flower_meadow`), constructing their
+  `NormalNoise` instances from `NewLegacy(seed)` exactly as `NoiseBasedStateProvider` does, and
+  `SimpleBlock(name)` delegates to `parseStateProviderSpec` so all 32 `minecraft:simple_block`
+  configured features in the embedded 26.1.2 pack decode (`TestAllEmbeddedSimpleBlockFeaturesDecodeAndSample`).
+- Zero-draw `SimpleStateProvider.getState` (`world/vegetation_patches.go`): previously
+  `SimpleBlock` represented `minecraft:simple_state_provider` as a 1-entry weighted list and
+  `placeSimpleBlockFeature` called `random.NextIntN(1)`, which advances `LegacyRandomSource` /
+  `XoroshiroRandomSource` by one 31-bit draw (`bound & -bound == bound`). Vanilla's
+  `SimpleStateProvider.getState` returns `this.state` without touching `random`. Removing that
+  spurious draw also lifted ocean parity by `+33` cells (`392,906` -> `392,939`, `277` residual).
+- Block-specific `simpleBlockCanSurvive` (`world/cave_features.go`):
+  - `MushroomBlock.canSurvive` (`brown_mushroom`, `red_mushroom`): returns `true` on
+    `#minecraft:overrides_mushroom_light_requirement` (`mycelium`, `podzol`, `crimson_nylium`,
+    `warped_nylium`); otherwise checks `level.getRawBrightness(pos, 0) < 13 && isSolidRender()`.
+    Because `SkyLightSectionStorage.getLightValue(long, false)` returns `15` during
+    `ChunkStatus.FEATURES` (before `INITIALIZE_LIGHT`, when `topSections.get(zeroNode) ==
+    currentLowestY`), `getRawBrightness` is `15` everywhere during worldgen and mushrooms survive
+    only on `#minecraft:overrides_mushroom_light_requirement`.
+  - `LeafLitterBlock.canSurvive` (`leaf_litter`): `isFaceSturdy(below)` (`Direction.UP`), taking the
+    `patch_leaf_litter` chain from `0/4` to `3/4 (75.0%)`.
+  - `DryVegetationBlock.mayPlaceOn` (`dead_bush`, `short_dry_grass`, `tall_dry_grass`):
+    `#minecraft:supports_dry_vegetation`.
+  - `AzaleaBlock.mayPlaceOn` (`azalea`, `flowering_azalea`): `#minecraft:supports_azalea`.
+  - `LilyPadBlock.mayPlaceOn` (`lily_pad`): water or `ice` / `frosted_ice` below and non-fluid at
+    `pos`.
+  - `melon`, `pumpkin`: `BlockBehaviour.canSurvive` (`true`; gated by their placed feature's
+    `block_predicate_filter`).
+
+Measured, `generatorVersion` 46 -> 47:
+
+| | before | after |
+|---|---|---|
+| land exact cells | 391,978 (99.685%, 1,238 residual) | **392,192 (99.740%, 1,024 residual)** |
+| land bands deep / underground / waterline / surface | 343 / 328 / 17 / 550 | **296 / 328 / 17 / 383** |
+| chunk (16,-40) exact / surface | 98,174 / 58 | **98,184 (99.878%) / 48** |
+| chunk (16,-31) exact / surface | 97,759 / 352 | **97,792 (99.479%) / 319** |
+| chunk (-40,21) exact / surface / heightmaps | 98,193 / 67 / 738 | **98,251 (99.946%) / 9 / 768 (100%)** |
+| chunk (-40,20) exact / surface / heightmaps | 97,852 / 73 / 748 | **97,965 (99.655%) / 7 / 768 (100%)** |
+| source chunks exact | 390,674 (99.354%) | **390,899 (99.411%)** |
+| source (15,-31) / (16,-30) / (-39,20) / (-39,21) | 96,983 / 97,540 / 98,161 / 97,990 | **97,022 / 97,566 / 98,241 (surface=0) / 98,070 (surface=0)** |
+| `TestDecorationSourceOrderParity` land `row-major` | 392,388 (99.789%, surface=445) | **392,709 (99.871%, deep=308, underground=31, waterline=17, surface=151)** |
+| `TestDecorationSourceOrderParity` land `column-major` (-40,21) | 98,254/98,304 | **98,303/98,304 (1 mismatch)** |
+
+

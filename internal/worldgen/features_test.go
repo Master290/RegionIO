@@ -547,21 +547,21 @@ func TestEnvironmentScanMatchesVanillaControlFlow(t *testing.T) {
 		want     []FeaturePosition
 	}{
 		{
-			name:     "a start position that fails the allowed condition yields nothing at all",
-			column:   map[int]string{0: "stone"},
-			startY:   0, maxSteps: 12,
+			name:   "a start position that fails the allowed condition yields nothing at all",
+			column: map[int]string{0: "stone"},
+			startY: 0, maxSteps: 12,
 			want: nil,
 		},
 		{
-			name:     "descends through air to the first solid cell",
-			column:   withBlocks(air(-10, 0), -2),
+			name:   "descends through air to the first solid cell",
+			column: withBlocks(air(-10, 0), -2),
 			startY: 0, maxSteps: 12,
 			want: []FeaturePosition{{3, -2, 5}},
 		},
 		{
 			name: "a floor exactly maxSteps cells away is still found, because the loop " +
 				"exits into the same final target test a failed allowed test does",
-			column:   withBlocks(air(-10, 0), -3),
+			column: withBlocks(air(-10, 0), -3),
 			startY: 0, maxSteps: 3,
 			want: []FeaturePosition{{3, -3, 5}},
 		},
@@ -577,8 +577,8 @@ func TestEnvironmentScanMatchesVanillaControlFlow(t *testing.T) {
 			want: nil,
 		},
 		{
-			name:     "running out of steps with no match yields nothing",
-			column:   air(-40, 0),
+			name:   "running out of steps with no match yields nothing",
+			column: air(-40, 0),
 			startY: 0, maxSteps: 3,
 			want: nil,
 		},
@@ -615,5 +615,31 @@ func TestClampedNormalIntMatchesVanillaRuntimeVector(t *testing.T) {
 		if got := provider.Sample(r); got != value {
 			t.Fatalf("sample[%d] = %d, want vanilla %d", i, got, value)
 		}
+	}
+}
+
+func TestAllEmbeddedSimpleBlockFeaturesDecodeAndSample(t *testing.T) {
+	set, err := LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for name, cfg := range set.Configured {
+		if cfg.Type != "minecraft:simple_block" {
+			continue
+		}
+		count++
+		sb, err := set.SimpleBlock(name)
+		if err != nil {
+			t.Fatalf("SimpleBlock(%s): %v", name, err)
+		}
+		r := NewLegacy(42)
+		state, ok := sb.Provider.SampleStateAt(r, FeaturePosition{X: -630, Y: 70, Z: 330})
+		if !ok || state.Name == "" {
+			t.Fatalf("SimpleBlock(%s) failed to sample state: ok=%v state=%+v", name, ok, state)
+		}
+	}
+	if count != 32 {
+		t.Fatalf("embedded simple_block feature count = %d, want 32", count)
 	}
 }

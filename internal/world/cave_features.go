@@ -242,8 +242,46 @@ func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePositi
 		if position.Y <= MinY {
 			return false
 		}
-		below := r.getBlock(position.X, position.Y-1, position.Z)
-		return isSolidState(below) && !isAirState(below)
+		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
+		return ok && flattenBlockTagContains(set, "minecraft:overrides_mushroom_light_requirement", below.Name)
+	}
+	if name == "minecraft:leaf_litter" {
+		if position.Y <= MinY {
+			return false
+		}
+		return isFaceSturdy(r.getBlock(position.X, position.Y-1, position.Z))
+	}
+	if name == "minecraft:dead_bush" || name == "minecraft:short_dry_grass" || name == "minecraft:tall_dry_grass" {
+		if position.Y <= MinY {
+			return false
+		}
+		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
+		return ok && flattenBlockTagContains(set, "minecraft:supports_dry_vegetation", below.Name)
+	}
+	if name == "minecraft:azalea" || name == "minecraft:flowering_azalea" {
+		if position.Y <= MinY {
+			return false
+		}
+		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
+		return ok && flattenBlockTagContains(set, "minecraft:supports_azalea", below.Name)
+	}
+	if name == "minecraft:lily_pad" {
+		if position.Y <= MinY {
+			return false
+		}
+		at := r.getBlock(position.X, position.Y, position.Z)
+		if isWaterState(at) || isLavaState(at) {
+			return false
+		}
+		belowID := r.getBlock(position.X, position.Y-1, position.Z)
+		if isWaterState(belowID) {
+			return true
+		}
+		below, ok := stateByID(belowID)
+		return ok && (below.Name == "minecraft:ice" || below.Name == "minecraft:frosted_ice")
+	}
+	if name == "minecraft:melon" || name == "minecraft:pumpkin" {
+		return true
 	}
 	return r.canVegetationSurvive(position, name, set)
 }

@@ -154,10 +154,10 @@ type sculkChargeCursor struct {
 // SculkPatchFeature, SculkSpreader, SculkSpreader$ChargeCursor, SculkBehaviour,
 // SculkBlock, and SculkVeinBlock.
 func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.SculkPatchFeatureConfig) bool {
-	sculkReplaceable := tagStateIDs(set, "#minecraft:sculk_replaceable")
-	if !r.sculkCanSpreadFrom(origin.X, origin.Y, origin.Z, sculkReplaceable) {
+	if !r.sculkCanSpreadFrom(origin.X, origin.Y, origin.Z) {
 		return false
 	}
+	sculkReplaceable := tagStateIDs(set, "#minecraft:sculk_replaceable")
 	sculkReplaceableWorldGen := tagStateIDs(set, "#minecraft:sculk_replaceable_world_gen")
 	totalRounds := config.SpreadRounds + config.GrowthRounds
 	for round := 0; round < totalRounds; round++ {
@@ -184,7 +184,7 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 				if max(abs(cursor.x-origin.X), max(abs(cursor.y-origin.Y), abs(cursor.z-origin.Z))) > 1024 {
 					continue
 				}
-				r.sculkCursorUpdate(set, cursor, origin, random, sculkReplaceableWorldGen, spreadVeins)
+				r.sculkCursorUpdate(set, cursor, origin, random, sculkReplaceable, sculkReplaceableWorldGen, spreadVeins)
 				if cursor.charge <= 0 {
 					continue
 				}
@@ -196,7 +196,7 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 		}
 	}
 	belowState := r.getBlock(origin.X, origin.Y-1, origin.Z)
-	if random.NextFloat() <= config.CatalystChance && isFaceSturdy(belowState) {
+	if random.NextFloat() <= config.CatalystChance && canMultifaceAttachTo(belowState) {
 		if catalyst, ok := nameToStateID("minecraft:sculk_catalyst", map[string]string{"bloom": "false"}); ok {
 			r.setBlock(origin.X, origin.Y, origin.Z, catalyst)
 		}
@@ -208,7 +208,7 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 		ty := origin.Y
 		if r.getBlock(tx, ty, tz) == StateAir && isFaceSturdy(r.getBlock(tx, ty-1, tz)) {
 			if shrieker, ok := nameToStateID("minecraft:sculk_shrieker", map[string]string{
-				"can_summon":  "false",
+				"can_summon":  "true",
 				"shrieking":   "false",
 				"waterlogged": "false",
 			}); ok {
@@ -219,7 +219,7 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 	return true
 }
 
-func (r *decorationRegion) sculkCanSpreadFrom(x, y, z int, sculkReplaceable map[uint16]bool) bool {
+func (r *decorationRegion) sculkCanSpreadFrom(x, y, z int) bool {
 	state := r.getBlock(x, y, z)
 	if isSculkBehaviourBlock(state) {
 		return true
@@ -228,7 +228,7 @@ func (r *decorationRegion) sculkCanSpreadFrom(x, y, z int, sculkReplaceable map[
 		return false
 	}
 	for _, dir := range allMultifaceDirs {
-		if sculkReplaceable[r.getBlock(x+dir.dx, y+dir.dy, z+dir.dz)] {
+		if canMultifaceAttachTo(r.getBlock(x+dir.dx, y+dir.dy, z+dir.dz)) {
 			return true
 		}
 	}
@@ -248,7 +248,7 @@ func isSculkBehaviourBlock(state uint16) bool {
 	return false
 }
 
-func (r *decorationRegion) sculkCursorUpdate(set *worldgen.FeatureSet, cursor *sculkChargeCursor, sourcePos worldgen.FeaturePosition, random worldgen.RandomSource, sculkReplaceable map[uint16]bool, spreadVeins bool) {
+func (r *decorationRegion) sculkCursorUpdate(set *worldgen.FeatureSet, cursor *sculkChargeCursor, sourcePos worldgen.FeaturePosition, random worldgen.RandomSource, sculkReplaceable, sculkReplaceableWorldGen map[uint16]bool, spreadVeins bool) {
 	if cursor.charge <= 0 {
 		return
 	}
@@ -268,7 +268,7 @@ func (r *decorationRegion) sculkCursorUpdate(set *worldgen.FeatureSet, cursor *s
 			}
 		}
 	}
-	cursor.charge = r.sculkAttemptUseCharge(set, cursor, state, blockName, sourcePos, random, sculkReplaceable, spreadVeins)
+	cursor.charge = r.sculkAttemptUseCharge(set, cursor, state, blockName, sourcePos, random, sculkReplaceableWorldGen, spreadVeins)
 	if cursor.charge <= 0 {
 		if blockName == "minecraft:sculk_vein" {
 			r.sculkVeinOnDischarged(cursor.x, cursor.y, cursor.z, state)

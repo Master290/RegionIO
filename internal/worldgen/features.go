@@ -126,9 +126,12 @@ type VegetationPatchFeatureConfig struct {
 
 // SimpleBlockFeatureConfig is the datapack form used by simple_block. The
 // provider entries retain their vanilla weights and named block properties so
-// the feature can choose a state with the feature RNG at placement time.
+// the feature can choose a state with the feature RNG at placement time, while
+// Provider also supports noise_provider, noise_threshold_provider, and
+// dual_noise_provider.
 type SimpleBlockFeatureConfig struct {
-	States []WeightedBlockState
+	States   []WeightedBlockState
+	Provider StateProviderSpec
 }
 
 type WeightedBlockState struct {
@@ -136,9 +139,10 @@ type WeightedBlockState struct {
 	Weight int
 }
 
-// StateProviderSpec is the parsed form of a block-state provider: one of
-// simple, weighted, or randomized-int-over-another-provider. Sample draws
-// from the feature RNG exactly like vanilla's BlockStateProvider.getState.
+// StateProviderSpec is the parsed form of a block-state provider: simple,
+// weighted, randomized-int-over-another-provider, rule-based, or one of the
+// three noise-based providers (noise_provider, noise_threshold_provider,
+// dual_noise_provider).
 type StateProviderSpec struct {
 	Type     string
 	State    BlockState           // simple
@@ -154,6 +158,20 @@ type StateProviderSpec struct {
 	// position when no rule matched and there is no fallback.
 	Rules    []StateProviderRule
 	Fallback *StateProviderSpec
+
+	// NoiseBasedStateProvider / NoiseProvider / NoiseThresholdProvider / DualNoiseProvider fields.
+	Noise      *NormalNoise
+	Scale      float32
+	States     []BlockState
+	Threshold  float32
+	HighChance float32
+	Default    BlockState
+	LowStates  []BlockState
+	HighStates []BlockState
+	SlowNoise  *NormalNoise
+	SlowScale  float32
+	VarietyMin int
+	VarietyMax int
 }
 
 // StateProviderRule is one {if_true, then} pair of a rule_based provider.
@@ -162,11 +180,16 @@ type StateProviderRule struct {
 	Then      json.RawMessage
 }
 
-// SampleState mirrors BlockStateProvider.getState(random): simple returns
-// without a draw, weighted draws nextInt(totalWeight) and walks the entries,
-// randomized_int draws its source then the int provider and overrides the
-// named property.
+// SampleState mirrors BlockStateProvider.getState(random) for position-independent
+// providers.
 func (p StateProviderSpec) SampleState(r RandomSource) (BlockState, bool) {
+	return p.SampleStateAt(r, FeaturePosition{})
+}
+
+// SampleStateAt mirrors BlockStateProvider.getState(level, random, pos),
+// evaluating noise-based providers at pos while consuming the exact RNG draws
+// vanilla does.
+func (p StateProviderSpec) SampleStateAt(r RandomSource, pos FeaturePosition) (BlockState, bool) {
 	switch p.Type {
 	case "simple":
 		return p.State, true
@@ -190,7 +213,7 @@ func (p StateProviderSpec) SampleState(r RandomSource) (BlockState, bool) {
 		if p.Source == nil {
 			return BlockState{}, false
 		}
-		base, ok := p.Source.SampleState(r)
+		base, ok := p.Source.SampleStateAt(r, pos)
 		if !ok {
 			return BlockState{}, false
 		}
@@ -207,8 +230,83 @@ func (p StateProviderSpec) SampleState(r RandomSource) (BlockState, bool) {
 		}
 		out.Properties[p.Property] = strconv.Itoa(value)
 		return out, true
+	case "noise":
+		if p.Noise == nil || len(p.States) == 0 {
+			return BlockState{}, false
+		}
+		return noiseProviderPickState(p.States, p.noiseValue(pos, float64(p.Scale))), true
+	case "noise_threshold":
+		if p.Noise == nil {
+			return BlockState{}, false
+		}
+		v := p.noiseValue(pos, float64(p.Scale))
+		if v < float64(p.Threshold) {
+			if len(p.LowStates) == 0 {
+				return BlockState{}, false
+			}
+			return p.LowStates[int(r.NextIntN(int32(len(p.LowStates))))], true
+		}
+		if r.NextFloat() < p.HighChance {
+			if len(p.HighStates) == 0 {
+				return BlockState{}, false
+			}
+			return p.HighStates[int(r.NextIntN(int32(len(p.HighStates))))], true
+		}
+		return p.Default, true
+	case "dual_noise":
+		if p.Noise == nil || p.SlowNoise == nil || len(p.States) == 0 {
+			return BlockState{}, false
+		}
+		slowVal := p.slowNoiseValue(pos)
+		localVariety := int(clampedMapDouble(slowVal, -1.0, 1.0, float64(p.VarietyMin), float64(p.VarietyMax+1)))
+		if localVariety <= 0 {
+			return BlockState{}, false
+		}
+		list := make([]BlockState, 0, localVariety)
+		for i := 0; i < localVariety; i++ {
+			offPos := FeaturePosition{
+				X: pos.X + int(int32(i)*54545),
+				Y: pos.Y,
+				Z: pos.Z + int(int32(i)*34234),
+			}
+			list = append(list, noiseProviderPickState(p.States, p.slowNoiseValue(offPos)))
+		}
+		return noiseProviderPickState(list, p.noiseValue(pos, float64(p.Scale))), true
 	}
 	return BlockState{}, false
+}
+
+func (p StateProviderSpec) noiseValue(pos FeaturePosition, scale float64) float64 {
+	return p.Noise.GetValue(float64(pos.X)*scale, float64(pos.Y)*scale, float64(pos.Z)*scale)
+}
+
+func (p StateProviderSpec) slowNoiseValue(pos FeaturePosition) float64 {
+	return p.SlowNoise.GetValue(
+		float64(float32(pos.X)*p.SlowScale),
+		float64(float32(pos.Y)*p.SlowScale),
+		float64(float32(pos.Z)*p.SlowScale),
+	)
+}
+
+func noiseProviderPickState(states []BlockState, noiseValue float64) BlockState {
+	clamped := (1.0 + noiseValue) / 2.0
+	if clamped < 0.0 {
+		clamped = 0.0
+	} else if clamped > 0.9999 {
+		clamped = 0.9999
+	}
+	return states[int(clamped*float64(len(states)))]
+}
+
+func clampedMapDouble(val, inMin, inMax, outMin, outMax float64) float64 {
+	t := (val - inMin) / (inMax - inMin)
+	if t <= 0.0 {
+		return outMin
+	}
+	if t >= 1.0 {
+		return outMax
+	}
+	return outMin + t*(outMax-outMin)
 }
 
 // BlockColumnLayer is one layer of a block_column: a height provider and the
@@ -1264,32 +1362,27 @@ func (s *FeatureSet) SimpleBlock(name string) (SimpleBlockFeatureConfig, error) 
 	if err := json.Unmarshal(configured.Config, &raw); err != nil {
 		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
 	}
-	var provider struct {
-		Type    string     `json:"type"`
-		State   BlockState `json:"state"`
-		Entries []struct {
-			Data   BlockState `json:"data"`
-			Weight int        `json:"weight"`
-		} `json:"entries"`
-	}
-	if err := json.Unmarshal(raw.ToPlace, &provider); err != nil {
+	provider, err := parseStateProviderSpec(raw.ToPlace)
+	if err != nil {
 		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: decode %s provider: %w", name, err)
 	}
-	config := SimpleBlockFeatureConfig{}
+	config := SimpleBlockFeatureConfig{Provider: provider}
 	switch provider.Type {
-	case "minecraft:simple_state_provider":
+	case "simple":
 		config.States = []WeightedBlockState{{State: provider.State, Weight: 1}}
-	case "minecraft:weighted_state_provider":
+	case "weighted":
 		for _, entry := range provider.Entries {
-			if entry.Weight > 0 && entry.Data.Name != "" {
-				config.States = append(config.States, WeightedBlockState{State: entry.Data, Weight: entry.Weight})
+			if entry.Weight > 0 && entry.State.Name != "" {
+				config.States = append(config.States, entry)
 			}
 		}
+		if len(config.States) == 0 {
+			return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: invalid simple block feature %s", name)
+		}
+	case "noise", "noise_threshold", "dual_noise", "randomized_int":
+		// Sampled via Provider.SampleStateAt at placement time.
 	default:
 		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: unsupported simple block provider %q", provider.Type)
-	}
-	if len(config.States) == 0 {
-		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: invalid simple block feature %s", name)
 	}
 	return config, nil
 }
@@ -2056,6 +2149,102 @@ func parseStateProviderSpec(raw json.RawMessage) (StateProviderSpec, error) {
 			values = CountProvider{Min: uniform.Min, Max: uniform.Max}
 		}
 		return StateProviderSpec{Type: "randomized_int", Property: probe.Property, Source: &source, Values: values}, nil
+	case "minecraft:noise_provider":
+		var doc struct {
+			Seed  int64 `json:"seed"`
+			Noise struct {
+				FirstOctave int       `json:"firstOctave"`
+				Amplitudes  []float64 `json:"amplitudes"`
+			} `json:"noise"`
+			Scale  float32      `json:"scale"`
+			States []BlockState `json:"states"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil || len(doc.States) == 0 || len(doc.Noise.Amplitudes) == 0 {
+			return StateProviderSpec{}, fmt.Errorf("invalid noise provider %s", raw)
+		}
+		noise := NewNormalNoise(NewLegacy(doc.Seed), doc.Noise.FirstOctave, doc.Noise.Amplitudes)
+		return StateProviderSpec{
+			Type:   "noise",
+			States: doc.States,
+			Scale:  doc.Scale,
+			Noise:  noise,
+		}, nil
+	case "minecraft:noise_threshold_provider":
+		var doc struct {
+			Seed  int64 `json:"seed"`
+			Noise struct {
+				FirstOctave int       `json:"firstOctave"`
+				Amplitudes  []float64 `json:"amplitudes"`
+			} `json:"noise"`
+			Scale        float32      `json:"scale"`
+			Threshold    float32      `json:"threshold"`
+			HighChance   float32      `json:"high_chance"`
+			DefaultState BlockState   `json:"default_state"`
+			LowStates    []BlockState `json:"low_states"`
+			HighStates   []BlockState `json:"high_states"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil || doc.DefaultState.Name == "" || len(doc.Noise.Amplitudes) == 0 {
+			return StateProviderSpec{}, fmt.Errorf("invalid noise threshold provider %s", raw)
+		}
+		noise := NewNormalNoise(NewLegacy(doc.Seed), doc.Noise.FirstOctave, doc.Noise.Amplitudes)
+		return StateProviderSpec{
+			Type:       "noise_threshold",
+			Scale:      doc.Scale,
+			Noise:      noise,
+			Threshold:  doc.Threshold,
+			HighChance: doc.HighChance,
+			Default:    doc.DefaultState,
+			LowStates:  doc.LowStates,
+			HighStates: doc.HighStates,
+		}, nil
+	case "minecraft:dual_noise_provider":
+		var doc struct {
+			Seed  int64 `json:"seed"`
+			Noise struct {
+				FirstOctave int       `json:"firstOctave"`
+				Amplitudes  []float64 `json:"amplitudes"`
+			} `json:"noise"`
+			Scale     float32 `json:"scale"`
+			SlowNoise struct {
+				FirstOctave int       `json:"firstOctave"`
+				Amplitudes  []float64 `json:"amplitudes"`
+			} `json:"slow_noise"`
+			SlowScale float32         `json:"slow_scale"`
+			Variety   json.RawMessage `json:"variety"`
+			States    []BlockState    `json:"states"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil || len(doc.States) == 0 || len(doc.Noise.Amplitudes) == 0 || len(doc.SlowNoise.Amplitudes) == 0 {
+			return StateProviderSpec{}, fmt.Errorf("invalid dual noise provider %s", raw)
+		}
+		var varietyMin, varietyMax int
+		var arr [2]int
+		if err := json.Unmarshal(doc.Variety, &arr); err == nil {
+			varietyMin, varietyMax = arr[0], arr[1]
+		} else {
+			var obj struct {
+				Min int `json:"min_inclusive"`
+				Max int `json:"max_inclusive"`
+			}
+			if err := json.Unmarshal(doc.Variety, &obj); err != nil {
+				return StateProviderSpec{}, fmt.Errorf("invalid dual noise variety %s", doc.Variety)
+			}
+			varietyMin, varietyMax = obj.Min, obj.Max
+		}
+		if varietyMin < 1 || varietyMax < varietyMin {
+			return StateProviderSpec{}, fmt.Errorf("invalid dual noise variety range [%d,%d]", varietyMin, varietyMax)
+		}
+		noise := NewNormalNoise(NewLegacy(doc.Seed), doc.Noise.FirstOctave, doc.Noise.Amplitudes)
+		slowNoise := NewNormalNoise(NewLegacy(doc.Seed), doc.SlowNoise.FirstOctave, doc.SlowNoise.Amplitudes)
+		return StateProviderSpec{
+			Type:       "dual_noise",
+			States:     doc.States,
+			Scale:      doc.Scale,
+			Noise:      noise,
+			SlowScale:  doc.SlowScale,
+			SlowNoise:  slowNoise,
+			VarietyMin: varietyMin,
+			VarietyMax: varietyMax,
+		}, nil
 	}
 	return StateProviderSpec{}, fmt.Errorf("unsupported state provider %s", raw)
 }

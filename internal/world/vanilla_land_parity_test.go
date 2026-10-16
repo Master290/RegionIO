@@ -67,9 +67,17 @@ import (
 // exact 391,746 -> 391,978, deep 542 -> 343, underground 315 -> 328, waterline 18 -> 17,
 // surface 595 -> 550 (with chunk (-40,20) 97,534 -> 97,852 and chunk (16,-40) 98,162 ->
 // 98,174).
+// And by generatorVersion 47, which fixed SculkPatchFeature.canSpreadFrom and
+// SculkVeinBlock.hasSubstrateAccess, decoded noise_provider / noise_threshold_provider /
+// dual_noise_provider and randomized_int_state_provider in SimpleBlockFeature, stopped
+// SimpleStateProvider from consuming a spurious NextIntN(1) draw, and aligned
+// simpleBlockCanSurvive with MushroomBlock / LeafLitterBlock / DryVegetationBlock /
+// AzaleaBlock / LilyPadBlock:
+// exact 391,978 -> 392,192 (+214 cells), deep 343 -> 296 (-47), underground 328,
+// waterline 17, surface 550 -> 383 (-167), and ocean exact 392,906 -> 392,939 (+33).
 const (
-	landSurfaceRatchet   = 550
-	landCellRatchet      = 391978
+	landSurfaceRatchet   = 383
+	landCellRatchet      = 392192
 	landWaterlineRatchet = 17
 )
 

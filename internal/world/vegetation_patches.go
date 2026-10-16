@@ -159,7 +159,7 @@ func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.Feature
 	case "minecraft:simple_block":
 		config, err := set.SimpleBlock(placed.Feature)
 		if err != nil {
-			return nil
+			return err
 		}
 		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 			r.placeSimpleBlockFeature(random, position, config, set)
@@ -545,26 +545,41 @@ func (r *decorationRegion) patchColumnExposed(g [3]int) bool {
 // then checks canSurvive, so the draw happens even when the placement is
 // rejected - the patch's later vegetation rolls depend on that.
 func (r *decorationRegion) placeSimpleBlockFeature(random worldgen.RandomSource, position worldgen.FeaturePosition, config worldgen.SimpleBlockFeatureConfig, set *worldgen.FeatureSet) bool {
-	total := 0
-	for _, entry := range config.States {
-		if entry.Weight > 0 {
-			total += entry.Weight
+	var chosen worldgen.BlockState
+	switch config.Provider.Type {
+	case "noise", "noise_threshold", "dual_noise", "randomized_int":
+		var ok bool
+		chosen, ok = config.Provider.SampleStateAt(random, position)
+		if !ok {
+			return false
 		}
-	}
-	if total <= 0 {
-		return false
-	}
-	roll := int(random.NextIntN(int32(total)))
-	chosen := worldgen.BlockState{}
-	for _, entry := range config.States {
-		if entry.Weight <= 0 {
-			continue
-		}
-		if roll < entry.Weight {
-			chosen = entry.State
+	case "simple":
+		if len(config.States) == 1 {
+			chosen = config.States[0].State
 			break
 		}
-		roll -= entry.Weight
+		fallthrough
+	default:
+		total := 0
+		for _, entry := range config.States {
+			if entry.Weight > 0 {
+				total += entry.Weight
+			}
+		}
+		if total <= 0 {
+			return false
+		}
+		roll := int(random.NextIntN(int32(total)))
+		for _, entry := range config.States {
+			if entry.Weight <= 0 {
+				continue
+			}
+			if roll < entry.Weight {
+				chosen = entry.State
+				break
+			}
+			roll -= entry.Weight
+		}
 	}
 	state, ok := nameToStateID(chosen.Name, chosen.Properties)
 	if !ok || !r.simpleBlockCanSurvive(position, chosen.Name, set) {
