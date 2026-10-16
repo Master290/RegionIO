@@ -50,8 +50,7 @@ func (r *decorationRegion) placeScheduledGeodes(seed int64) error {
 		// on anything that was not a geode, which is how forest_rock stayed invisible
 		// while a hand-written boulder heuristic placed a different shape instead.
 		switch configured.Type {
-		case "minecraft:geode":
-		case "minecraft:block_blob":
+		case "minecraft:geode", "minecraft:block_blob", "minecraft:large_dripstone":
 		default:
 			noteNotReplayed(fmt.Sprintf("stage%d:%s", geodesStage, configured.Type))
 			continue
@@ -60,13 +59,25 @@ func (r *decorationRegion) placeScheduledGeodes(seed int64) error {
 		context := r.placementContext(func(position worldgen.FeaturePosition) bool {
 			return r.biomeAllowsFeature(set, scheduled.Name, geodesStage, position)
 		})
-		if configured.Type == "minecraft:block_blob" {
+		switch configured.Type {
+		case "minecraft:block_blob":
 			blob, err := set.BlockBlob(placed.Feature)
 			if err != nil {
 				return err
 			}
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 				return r.placeBlockBlob(set, random, position, blob)
+			}); err != nil {
+				return err
+			}
+			continue
+		case "minecraft:large_dripstone":
+			dripstone, err := set.LargeDripstone(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				return r.placeLargeDripstone(set, random, position, dripstone)
 			}); err != nil {
 				return err
 			}

@@ -37,9 +37,10 @@ import (
 // ore veins walking through a gate that the shipped game holds shut. See the paragraph in
 // STRUCTURE_NOTES.md written from ChunkStatus and OreFeature.place.
 //
-// What is left: 18 stage-2 large_dripstone placements are not replayed; every stage-9
-// tree decorator (place_on_ground, trunk_vine, attached_to_logs) and selector target
-// (huge_red_mushroom, huge_brown_mushroom, fallen_tree) in the capture is now replayed.
+// Every stage-2 (geode, block_blob, large_dripstone) and stage-9 tree decorator
+// (place_on_ground, trunk_vine, attached_to_logs) and selector target (huge_red_mushroom,
+// huge_brown_mushroom, fallen_tree) in the capture is now replayed, so NotReplayed() is
+// empty across the land fixture.
 //
 // Moved again by generatorVersion 42, which made the surface rules and carvers read
 // BiomeManager.getBiome per block instead of one biome per column: surface band 687 ->
@@ -53,11 +54,11 @@ import (
 // that read the cell admitted or refused candidates near every biome border differently
 // from vanilla, which is the "conserved but displaced" ore shape source (15,-31) showed.
 //
-// And by generatorVersion 44, which ported PlaceOnGroundDecorator, TrunkVineDecorator,
-// AttachedToLogsDecorator, HugeRedMushroomFeature, HugeBrownMushroomFeature and
-// FallenTreeFeature: exact 391,676 -> 391,746, surface 620 -> 550 (with chunk (16,-40)
-// taiga surface 136 -> 58 and trees_birch_and_oak_leaf_litter 0/50 -> 43/50 exact),
-// eliminating all stage-9 NotReplayed() entries.
+// And by generatorVersion 44..45, which ported PlaceOnGroundDecorator, TrunkVineDecorator,
+// AttachedToLogsDecorator, HugeRedMushroomFeature, HugeBrownMushroomFeature,
+// FallenTreeFeature, and LargeDripstoneFeature: exact 391,676 -> 391,746, surface 620 ->
+// 550 (with chunk (16,-40) taiga surface 136 -> 58 and trees_birch_and_oak_leaf_litter
+// 0/50 -> 43/50 exact), eliminating all stage-2 and stage-9 NotReplayed() entries.
 const (
 	landSurfaceRatchet   = 550
 	landCellRatchet      = 391746

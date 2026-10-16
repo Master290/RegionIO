@@ -613,6 +613,31 @@ type FallenTreeFeatureConfig struct {
 	LogDecorators   []TreeDecorator
 }
 
+// UniformFloatProvider mirrors net.minecraft.util.valueproviders.UniformFloat:
+// Mth.randomBetween(random, min_inclusive, max_exclusive).
+type UniformFloatProvider struct {
+	Min float32
+	Max float32
+}
+
+// Sample draws one float in [Min, Max) via Mth.randomBetween.
+func (p UniformFloatProvider) Sample(random RandomSource) float32 {
+	return randomBetween(random, p.Min, p.Max)
+}
+
+// LargeDripstoneFeatureConfig mirrors LargeDripstoneConfiguration.
+type LargeDripstoneFeatureConfig struct {
+	FloorToCeilingSearchRange        int
+	ColumnRadiusMin, ColumnRadiusMax int
+	HeightScale                      UniformFloatProvider
+	MaxColumnRadiusToCaveHeightRatio float32
+	StalactiteBluntness              UniformFloatProvider
+	StalagmiteBluntness              UniformFloatProvider
+	WindSpeed                        UniformFloatProvider
+	MinRadiusForWind                 int
+	MinBluntnessForWind              float32
+}
+
 type FeatureRef struct {
 	Name      string
 	Placement []PlacementModifier
@@ -1433,6 +1458,83 @@ func (s *FeatureSet) FallenTree(name string) (FallenTreeFeatureConfig, error) {
 		StumpDecorators: raw.StumpDecorators,
 		LogDecorators:   raw.LogDecorators,
 	}, nil
+}
+
+// LargeDripstone parses a minecraft:large_dripstone configured feature.
+func (s *FeatureSet) LargeDripstone(name string) (LargeDripstoneFeatureConfig, error) {
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:large_dripstone" {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s is not a large dripstone feature", name)
+	}
+	var raw struct {
+		FloorToCeilingSearchRange        *int            `json:"floor_to_ceiling_search_range"`
+		ColumnRadius                     json.RawMessage `json:"column_radius"`
+		HeightScale                      json.RawMessage `json:"height_scale"`
+		MaxColumnRadiusToCaveHeightRatio float32         `json:"max_column_radius_to_cave_height_ratio"`
+		StalactiteBluntness              json.RawMessage `json:"stalactite_bluntness"`
+		StalagmiteBluntness              json.RawMessage `json:"stalagmite_bluntness"`
+		WindSpeed                        json.RawMessage `json:"wind_speed"`
+		MinRadiusForWind                 int             `json:"min_radius_for_wind"`
+		MinBluntnessForWind              float32         `json:"min_bluntness_for_wind"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	searchRange := 30
+	if raw.FloorToCeilingSearchRange != nil {
+		searchRange = *raw.FloorToCeilingSearchRange
+	}
+	colRadius, err := parseNestedIntProvider(raw.ColumnRadius)
+	if err != nil {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s column_radius: %w", name, err)
+	}
+	heightScale, err := parseUniformFloatProvider(raw.HeightScale)
+	if err != nil {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s height_scale: %w", name, err)
+	}
+	stalactiteBluntness, err := parseUniformFloatProvider(raw.StalactiteBluntness)
+	if err != nil {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s stalactite_bluntness: %w", name, err)
+	}
+	stalagmiteBluntness, err := parseUniformFloatProvider(raw.StalagmiteBluntness)
+	if err != nil {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s stalagmite_bluntness: %w", name, err)
+	}
+	windSpeed, err := parseUniformFloatProvider(raw.WindSpeed)
+	if err != nil {
+		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s wind_speed: %w", name, err)
+	}
+	return LargeDripstoneFeatureConfig{
+		FloorToCeilingSearchRange:        searchRange,
+		ColumnRadiusMin:                  colRadius.Min,
+		ColumnRadiusMax:                  colRadius.Max,
+		HeightScale:                      heightScale,
+		MaxColumnRadiusToCaveHeightRatio: raw.MaxColumnRadiusToCaveHeightRatio,
+		StalactiteBluntness:              stalactiteBluntness,
+		StalagmiteBluntness:              stalagmiteBluntness,
+		WindSpeed:                        windSpeed,
+		MinRadiusForWind:                 raw.MinRadiusForWind,
+		MinBluntnessForWind:              raw.MinBluntnessForWind,
+	}, nil
+}
+
+func parseUniformFloatProvider(raw json.RawMessage) (UniformFloatProvider, error) {
+	var fixed float32
+	if err := json.Unmarshal(raw, &fixed); err == nil {
+		return UniformFloatProvider{Min: fixed, Max: fixed}, nil
+	}
+	var value struct {
+		Type string  `json:"type"`
+		Min  float32 `json:"min_inclusive"`
+		Max  float32 `json:"max_exclusive"`
+	}
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return UniformFloatProvider{}, err
+	}
+	if value.Type != "minecraft:uniform" || value.Max <= value.Min {
+		return UniformFloatProvider{}, fmt.Errorf("invalid uniform float provider %s", raw)
+	}
+	return UniformFloatProvider{Min: value.Min, Max: value.Max}, nil
 }
 
 func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {

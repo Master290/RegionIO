@@ -185,7 +185,8 @@ oaks were possible, and that band has its own ratchet (now 18 after the zoomed b
 is cross-border placement: the taiga chunk now matches 286 against vanilla's 285 tree cells
 (58 surface mismatches) and the plains pair match 37 of 37 and 114 of 114, while
 `trees_birch_and_oak_leaf_litter` matches 43 of 50 leaf-litter cells directly (47 of 50
-holding its own block), leaving only stage-2 `large_dripstone` (18) in the un-replayed tally.
+holding its own block), and stage-2 `large_dripstone` completes the un-replayed tally across
+all replayed stages on the land fixture.
 Closing the rest is the
 road to exact equality, while keeping cold batch generation within an acceptable
 latency budget.

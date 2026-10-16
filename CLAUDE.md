@@ -174,8 +174,9 @@ Known gaps, roughly in order of how visible they are:
 
 - **Feature replay covers most of the decoration steps, not every configured type.** `worldgen/features.go` parses
   the placed/configured feature graph (placement modifiers, anchors, biome filters) and the
-  production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes and
-  boulders (`world/geodes.go`, `world/block_blob.go`), stage-3 monster rooms (`world/monster_rooms.go`),
+  production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes,
+  boulders, and large dripstone columns (`world/geodes.go`, `world/block_blob.go`,
+  `world/large_dripstone.go`), stage-3 monster rooms (`world/monster_rooms.go`),
   the whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
   disks, disk features), stage-8 springs (`world/springs.go`), and stage-9 vegetation — lush-cave
   patches plus trees, flowers, grass and mushrooms (`world/vegetation_patches.go`,
@@ -199,8 +200,8 @@ Known gaps, roughly in order of how visible they are:
   `tree_decorators_test.go`, and `tree_features_test.go`. An un-modelled placer or decorator is
   counted by name and skipped
   rather than aborting a region, because the replay walks 5×5 sources and one border forest
-  must not lose a taiga chunk; `TestVanillaLandBlockParity` prints the tally (now zero on stage 9,
-  with only `stage2:minecraft:large_dripstone=18` remaining). Canopies do cross
+  must not lose a taiga chunk; `TestVanillaLandBlockParity` prints the tally (now zero across
+  all replayed stages on the land fixture). Canopies do cross
   chunk borders — vanilla has no border test, only `ChunkStep.blockStateWriteRadius`, which is
   1 chunk for FEATURES and is what `decorationRegion.setBlock` enforces.
 - **`doPlace`'s three height guards were inverted, and are measured fixes.** A truncated trunk is
@@ -220,7 +221,7 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 44): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 45): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
 and **99.925% through the production region replay** — 295 residual cells, dominated by the
 lush-caves moss and clay pools and their nested vegetation. Featureless vanilla captures

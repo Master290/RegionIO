@@ -74,3 +74,76 @@ func TestGeodePlacementIsDeterministicAndLayered(t *testing.T) {
 		}
 	}
 }
+
+func TestLargeDripstonePlacementScansCavernAndPlacesColumns(t *testing.T) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := set.LargeDripstone("minecraft:large_dripstone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.FloorToCeilingSearchRange != 30 || config.ColumnRadiusMin != 3 || config.ColumnRadiusMax != 19 {
+		t.Fatalf("unexpected large_dripstone config: %+v", config)
+	}
+
+	chunks := make([]*Chunk, 0, 9)
+	for cx := int32(-1); cx <= 1; cx++ {
+		for cz := int32(-1); cz <= 1; cz++ {
+			chunk := NewChunk(cx, cz, BiomePlains)
+			for y := MinY; y < MinY+WorldHeight; y++ {
+				state := StateStone
+				if y >= 0 && y < 24 {
+					state = StateAir
+				}
+				for x := 0; x < 16; x++ {
+					for z := 0; z < 16; z++ {
+						chunk.setBlockRaw(x, y, z, state)
+					}
+				}
+			}
+			chunks = append(chunks, chunk)
+		}
+	}
+	region, err := newDecorationRegion(chunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := region.setSource(0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Solid origin must return early without consuming RNG draws.
+	rngA := worldgen.NewWorldgenRandom(99)
+	rngB := worldgen.NewWorldgenRandom(99)
+	if err := region.placeLargeDripstone(set, rngA, worldgen.FeaturePosition{X: 8, Y: -10, Z: 8}, config); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rngA.NextInt(), rngB.NextInt(); got != want {
+		t.Fatalf("solid origin consumed RNG draws: got %d, want %d", got, want)
+	}
+
+	// Open cavern origin (y=10 inside y=0..23 air pocket) must scan floor=-1, ceiling=24 and place dripstone_block.
+	if err := region.placeLargeDripstone(set, worldgen.NewWorldgenRandom(12345), worldgen.FeaturePosition{X: 8, Y: 10, Z: 8}, config); err != nil {
+		t.Fatal(err)
+	}
+	dripstoneState, ok := nameToStateID("minecraft:dripstone_block", nil)
+	if !ok {
+		t.Fatal("missing minecraft:dripstone_block state")
+	}
+	placed := 0
+	center := region.chunks[[2]int32{0, 0}]
+	for y := -5; y < 30; y++ {
+		for x := 0; x < 16; x++ {
+			for z := 0; z < 16; z++ {
+				if center.GetBlock(x, y, z) == dripstoneState {
+					placed++
+				}
+			}
+		}
+	}
+	if placed == 0 {
+		t.Fatal("expected large_dripstone to place minecraft:dripstone_block in cavern")
+	}
+}

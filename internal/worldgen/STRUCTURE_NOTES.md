@@ -2396,13 +2396,13 @@ nor (0,-1), so it *is* the both-removed case. Removing one still gives (2,-41,12
 extra-sources row still recovers vanilla's (5,-30,13), so the diagnosis stands: the source's
 answer depends on which chunk is the centre, through which neighbours decorated first.
 
-## Stage-9 leaf litter, log decorators, huge mushrooms, and fallen trees (`generatorVersion` 44)
+## Stage-9 leaf litter, log decorators, huge mushrooms, fallen trees, and stage-2 large dripstone (`generatorVersion` 44..45)
 
-The `NotReplayed()` tally on the land fixture carried three stage-9 families:
-`tree_decorator:minecraft:place_on_ground=76`, `minecraft:huge_red_mushroom=3`, and
-`minecraft:fallen_tree=1`. Porting all of them from `javap -p -c` against
-`versions/26.1.2/server-26.1.2.jar` removes every stage-9 entry from `NotReplayed()`,
-leaving only `stage2:minecraft:large_dripstone=18`:
+The `NotReplayed()` tally on the land fixture carried three stage-9 families
+(`tree_decorator:minecraft:place_on_ground=76`, `minecraft:huge_red_mushroom=3`,
+`minecraft:fallen_tree=1`) and one stage-2 family (`stage2:minecraft:large_dripstone=18`).
+Porting all of them from `javap -p -c` against `versions/26.1.2/server-26.1.2.jar` removes
+every entry from `NotReplayed()` across the land fixture:
 
 - `PlaceOnGroundDecorator` (`world/tree_decorators.go`): takes the lowest-Y slice of
   `TreeFeature.getLowestTrunkOrRootOfTree` (the base-Y logs when `roots` is empty), builds a
@@ -2438,8 +2438,18 @@ leaving only `stage2:minecraft:large_dripstone=18`:
   `origin.Y + 1` at most 6 times until `mayPlaceOn`, checks `canPlaceEntireFallenLog` (at most
   2 consecutive non-sturdy support blocks), places the horizontal logs with `axis` set along
   the direction, and runs `log_decorators` in `HashSet` order.
+- `LargeDripstoneFeature` (`world/large_dripstone.go`, wired into `placeScheduledGeodes` at
+  stage 2 in `world/geodes.go`): checks `DripstoneUtils.isEmptyOrWater(origin)`, scans up and
+  down with `Column.scan` up to `floor_to_ceiling_search_range` (30) for
+  `isDripstoneBaseOrLava`, rejects `range.height() < 4` with zero RNG draws, clamps
+  `int(float32(height) * max_column_radius_to_cave_height_ratio)` to `column_radius`
+  (`[3, 19]`), constructs the stalactite and stalagmite `LargeDripstone` instances (sampling
+  bluntness before height scale), samples `WindOffsetter` only when both pass
+  `isSuitableForWind`, runs `moveBackUntilBaseIsInsideStoneAndShrinkRadiusIfNecessary` on
+  both, and places `minecraft:dripstone_block` columns capped at `WORLD_SURFACE_WG` when
+  pointing up.
 
-Measured, `generatorVersion` 43 -> 44:
+Measured, `generatorVersion` 43 -> 45:
 
 | | before | after |
 |---|---|---|
