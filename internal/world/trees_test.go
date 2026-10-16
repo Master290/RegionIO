@@ -33,3 +33,39 @@ func TestRegionVegetationStageProducesTrees(t *testing.T) {
 	}
 	t.Logf("%d tree cells over the 3x3 window", cells)
 }
+
+// TestChunk4020OakLeafDistanceParity verifies that leaf distance propagation across
+// existing logs and adjacent settled leaves preserves exact vanilla parity for the
+// oak tree canopy in chunk (-40, 20).
+func TestChunk4020OakLeafDistanceParity(t *testing.T) {
+	cap := readFixtureCapture(t, vanillaLandFixture)
+	plain := NewVanillaRegionGenerator(cap.seed)
+	chunk := plain(-40, 20)
+	var vChunk fixtureChunk
+	for _, ch := range cap.chunks {
+		if ch.cx == -40 && ch.cz == 20 {
+			vChunk = ch
+			break
+		}
+	}
+	coords := [][3]int{
+		{-636, 96, 320},
+		{-635, 96, 320},
+		{-635, 96, 321},
+		{-636, 97, 320},
+		{-635, 97, 320},
+		{-635, 97, 321},
+		{-636, 100, 322},
+	}
+	for _, pos := range coords {
+		lx, ly, lz := pos[0]&15, pos[1], pos[2]&15
+		vanilla := vChunk.at(lx, ly, lz)
+		ours := chunk.GetBlock(lx, ly, lz)
+		if ours != vanilla {
+			t.Errorf("pos (%d,%d,%d): ours=%s%s (%d) want=%s%s (%d)",
+				pos[0], pos[1], pos[2],
+				stateLabel(ours), stateProperties(ours), ours,
+				stateLabel(vanilla), stateProperties(vanilla), vanilla)
+		}
+	}
+}

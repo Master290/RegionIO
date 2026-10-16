@@ -97,9 +97,13 @@ func traceLushClayColumn(x, z int) bool {
 func dumpTraceStack() {
 	buf := make([]byte, 1<<16)
 	n := runtime.Stack(buf, false)
-	for _, line := range strings.Split(string(buf[:n]), "\n") {
-		if strings.Contains(line, "regionio/internal/world") {
-			fmt.Println(strings.TrimSpace(line))
+	lines := strings.Split(string(buf[:n]), "\n")
+	for i := 0; i < len(lines); i++ {
+		if strings.Contains(lines[i], "regionio/internal/world") {
+			fmt.Println("  " + strings.TrimSpace(lines[i]))
+			if i+1 < len(lines) && strings.Contains(lines[i+1], ".go:") {
+				fmt.Println("    " + strings.TrimSpace(lines[i+1]))
+			}
 		}
 	}
 }

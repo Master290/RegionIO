@@ -49,16 +49,37 @@ func (t *treePlacer) applyLeafDistance() {
 	if len(leaves) == 0 {
 		return
 	}
-	// Seeds: every leaf starts at 7, the registry default, and the distance spreads from
-	// logs and from leaves that were already settled before this tree - a canopy grown
-	// against an existing canopy inherits the existing canopy's values, as vanilla's
-	// neighbour test does.
+	// Also expand to existing neighbor leaves touching this tree's leaves or logs,
+	// so that a newly grown trunk or canopy propagates lower distance into them.
+	existing := map[pos3]bool{}
+	for c := range leaves {
+		for _, n := range t.leafNeighbours(c) {
+			if !leaves[n] && t.isLeafState(t.stateAt(n.x, n.y, n.z)) {
+				existing[n] = true
+			}
+		}
+	}
+	for c := range logs {
+		for _, n := range t.leafNeighbours(c) {
+			if !leaves[n] && t.isLeafState(t.stateAt(n.x, n.y, n.z)) {
+				existing[n] = true
+			}
+		}
+	}
+	for n := range existing {
+		leaves[n] = true
+	}
+
 	distance := map[pos3]int{}
 	frontier := make([]pos3, 0, len(leaves))
 	for c := range leaves {
-		distance[c] = 7
+		if existing[c] {
+			distance[c] = t.leafStoredDistance(c)
+		} else {
+			distance[c] = 7
+		}
 		for _, n := range t.leafNeighbours(c) {
-			if logs[n] {
+			if logs[n] || t.isLogState(t.stateAt(n.x, n.y, n.z)) {
 				distance[c] = 1
 			}
 		}
@@ -134,6 +155,9 @@ func (t *treePlacer) neighbourLeafDistance(c pos3, logs map[pos3]bool, distance 
 		return d, true
 	}
 	state := t.stateAt(c.x, c.y, c.z)
+	if t.isLogState(state) {
+		return 0, true
+	}
 	if t.isLeafState(state) {
 		name, ok := stateByID(state)
 		if ok {
@@ -154,4 +178,18 @@ func (t *treePlacer) isLeafState(id uint16) bool {
 func (t *treePlacer) isLogState(id uint16) bool {
 	name, ok := stateByID(id)
 	return ok && flattenBlockTagContains(t.set, "minecraft:logs", name.Name)
+}
+
+func (t *treePlacer) leafStoredDistance(c pos3) int {
+	state := t.stateAt(c.x, c.y, c.z)
+	if t.isLeafState(state) {
+		name, ok := stateByID(state)
+		if ok {
+			var stored int
+			if _, err := fmt.Sscanf(name.Properties["distance"], "%d", &stored); err == nil {
+				return stored
+			}
+		}
+	}
+	return 7
 }

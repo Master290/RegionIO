@@ -2609,4 +2609,34 @@ Measured, `generatorVersion` 46 -> 47:
 | `TestDecorationSourceOrderParity` land `row-major` | 392,388 (99.789%, surface=445) | **392,709 (99.871%, deep=308, underground=31, waterline=17, surface=151)** |
 | `TestDecorationSourceOrderParity` land `column-major` (-40,21) | 98,254/98,304 | **98,303/98,304 (1 mismatch)** |
 
+## Stage-9 Tree canopy leaf distance propagation across existing logs and settled leaves (`generatorVersion` 48)
+
+In vanilla Minecraft, `LeavesBlock` distance updates during worldgen decoration propagation:
+1. `LeavesBlock` checks neighbor blocks: if a neighbor is a log (`BlockTags.LOGS`), distance is 1. If a neighbor is a leaf (`LeavesBlock`), distance is neighbor distance + 1 (capped at 7).
+2. When multiple trees grow adjacent to or overlapping each other in the same region, existing logs placed by earlier trees or features provide distance 0 (making neighbor leaves distance 1).
+3. Furthermore, when a new tree places logs or leaves adjacent to existing leaves from an earlier tree, the lower distance must propagate into those existing leaves as well.
+
+Two defects in `world/leaf_distance.go` previously caused canopy distance mismatches:
+- `applyLeafDistance` only tracked leaves placed by the *current* tree (`leaves`), so existing leaves already settled in the world were never included in the relaxation queue. If a newly grown trunk or branch touched existing leaves, their distance property remained stale at 7 (or whatever distance was assigned earlier).
+- `neighbourLeafDistance` checked `logs[c]` (which only held logs from the current tree's `t.placements`), and checked `isLeafState(state)`, but completely omitted `isLogState(state)`. As a result, logs already present in the region were not recognized as distance 0, causing leaves adjacent to neighbor tree trunks to stay at distance 7 or inherit a higher distance.
+
+Fixes (`world/leaf_distance.go`):
+- In `applyLeafDistance`, expand the set of leaves to include existing adjacent leaves touching the new tree's leaves or logs (`existing[n] = true` with `leafStoredDistance(n)`), so relaxation propagates lower distances into them.
+- Check `isLogState(t.stateAt(n.x, n.y, n.z))` in both initial frontier seeding and in `neighbourLeafDistance`, properly treating pre-existing logs as distance 0.
+- Pinned by `TestChunk4020OakLeafDistanceParity` in `world/trees_test.go`.
+
+Measured, `generatorVersion` 47 -> 48:
+
+| | before | after |
+|---|---|---|
+| land exact cells | 392,192 (99.740%, 1,024 residual) | **392,210 (99.744%, 1,006 residual)** |
+| land bands deep / underground / waterline / surface | 296 / 328 / 17 / 383 | **296 / 328 / 17 / 365** |
+| chunk (-40,20) exact / surface / heightmaps | 97,965 (99.655%) / 7 / 768 (100%) | **97,972 (99.662%) / 0 (100%) / 768 (100%)** |
+| chunk (-40,21) exact / surface / heightmaps | 98,251 (99.946%) / 9 / 768 (100%) | **98,251 (99.946%) / 9 / 768 (100%)** |
+| source chunks exact | 390,899 (99.411%) | **390,904 (99.412%)** |
+| `trees_old_growth_pine_taiga` tree cells | 39/100 matched | 39/100 matched (captured tree 39/39 exact) |
+| `trees_birch_and_oak_leaf_litter` chain | 43/50 exact, 47/50 own | 43/50 exact, 47/50 own |
+| `patch_leaf_litter` chain | 3/4 exact | 3/4 exact |
+
+
 
