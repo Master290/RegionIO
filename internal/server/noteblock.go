@@ -70,6 +70,7 @@ func EncodeNoteParticlePacket(x, y, z float64, note int) []byte {
 //  1. Item frames (0..8) via s.ItemFrameComparatorSignalAt
 //  2. Lecterns (0..15) via s.GetLecternComparatorOutput
 //  3. Jukeboxes (0..15) via s.JukeboxComparatorSignalAt
+//  4. Cauldrons (0..3) via s.CauldronComparatorSignalAt
 func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if s == nil {
 		return 0
@@ -84,6 +85,9 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	}
 	if jbSig := s.JukeboxComparatorSignalAt(targetDim, x, y, z); jbSig > best {
 		best = jbSig
+	}
+	if caulSig := s.CauldronComparatorSignalAt(targetDim, x, y, z); caulSig > best {
+		best = caulSig
 	}
 	if best < 0 {
 		return 0
