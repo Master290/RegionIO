@@ -1135,7 +1135,13 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 		return
 	}
 	chunkBox := msChunkBox(cx, cz)
-	region, _ := newDecorationRegion([]*Chunk{c})
+	var region *decorationRegion
+	getRegion := func() *decorationRegion {
+		if region == nil {
+			region, _ = newDecorationRegion([]*Chunk{c})
+		}
+		return region
+	}
 
 	// 1. nether_complexes (fortress + bastion_remnant), range up to 6 chunks.
 	const complexRadius = 6
@@ -1162,8 +1168,10 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 			}
 		}
 	}
-	if len(bastions) > 0 && region != nil {
-		PlaceJigsawStartsForChunk(region, bastions, "minecraft:bastion_remnant", surfaceStructuresStep, seed, cx, cz)
+	if len(bastions) > 0 {
+		if reg := getRegion(); reg != nil {
+			PlaceJigsawStartsForChunk(reg, bastions, "minecraft:bastion_remnant", surfaceStructuresStep, seed, cx, cz)
+		}
 	}
 
 	// 2. nether_fossils, range up to 2 chunks.
@@ -1177,12 +1185,12 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 	}
 
 	// 3. ruined_portals (ruined_portal_nether), range up to 2 chunks.
-	if region != nil {
-		for sx := cx - 2; sx <= cx+2; sx++ {
-			for sz := cz - 2; sz <= cz+2; sz++ {
-				stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
-				if err == nil && stub != nil {
-					_ = PlaceRuinedPortalPiece(region, stub, seed, cx, cz)
+	for sx := cx - 2; sx <= cx+2; sx++ {
+		for sz := cz - 2; sz <= cz+2; sz++ {
+			stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
+			if err == nil && stub != nil {
+				if reg := getRegion(); reg != nil {
+					_ = PlaceRuinedPortalPiece(reg, stub, seed, cx, cz)
 				}
 			}
 		}

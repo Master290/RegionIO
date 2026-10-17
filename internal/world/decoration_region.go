@@ -75,19 +75,23 @@ func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
 
 func freezeWorldgenTopY(chunk *Chunk) *worldgenTopY {
 	frozen := &worldgenTopY{}
+	minY := chunk.minY()
+	maxY := minY + chunk.worldHeight() - 1
+	chunk.mu.RLock()
+	defer chunk.mu.RUnlock()
 	for localZ := 0; localZ < 16; localZ++ {
 		for localX := 0; localX < 16; localX++ {
 			index := localZ*16 + localX
-			surface, floor := MinY, MinY
-			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
-				state := chunk.GetBlock(localX, y, localZ)
-				if state != StateAir && surface == MinY {
+			surface, floor := minY, minY
+			for y := maxY; y >= minY; y-- {
+				state := chunk.getBlock(localX, y, localZ)
+				if state != StateAir && surface == minY {
 					surface = y + 1
 				}
-				if stateFlags(state)&flagBlocksMotion != 0 && floor == MinY {
+				if stateFlags(state)&flagBlocksMotion != 0 && floor == minY {
 					floor = y + 1
 				}
-				if surface != MinY && floor != MinY {
+				if surface != minY && floor != minY {
 					break
 				}
 			}
@@ -172,7 +176,13 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 		}
 		return int(frozen.floor[(z&15)*16+(x&15)])
 	}
-	for y := MinY + WorldHeight - 1; y >= MinY; y-- {
+	minY := MinY
+	maxY := MinY + WorldHeight - 1
+	if chunk := r.chunkAtBlock(x, z); chunk != nil {
+		minY = chunk.minY()
+		maxY = minY + chunk.worldHeight() - 1
+	}
+	for y := maxY; y >= minY; y-- {
 		state := r.getBlock(x, y, z)
 		match := false
 		switch kind {
@@ -189,7 +199,7 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 			return y + 1
 		}
 	}
-	return MinY
+	return minY
 }
 
 // bindSeed records the world seed the region's biome lookups are zoomed with. It is
@@ -215,11 +225,13 @@ func (r *decorationRegion) getBiome(x, y, z int) (uint16, bool) {
 		panic("world: decorationRegion.getBiome called before bindSeed; the zoomed biome lookup needs the world seed")
 	}
 	qx, qy, qz := zoomQuart(r.biomeZoomSeed, x, y, z)
-	qy = min(max(qy, biomeMinQuartY), biomeMinQuartY+biomeQuartsY-1)
 	chunk := r.chunks[[2]int32{int32(qx >> 2), int32(qz >> 2)}]
 	if chunk == nil {
 		return 0, false
 	}
+	minQuartY := chunk.minY() >> 2
+	maxQuartY := minQuartY + (chunk.worldHeight() >> 2) - 1
+	qy = min(max(qy, minQuartY), maxQuartY)
 	return chunk.GetBiome((qx&3)*biomeCellSize, qy*biomeCellSize, (qz&3)*biomeCellSize), true
 }
 

@@ -223,3 +223,66 @@ func TestEndCityGenerationAndPlacement(t *testing.T) {
 		t.Fatalf("expected End City at chunk (%d, %d) to place purpur/end_stone_bricks blocks", foundStart.ChunkX, foundStart.ChunkZ)
 	}
 }
+
+func TestEndHeightmapsBiomesAndDeterminism(t *testing.T) {
+	const seed int64 = 12345
+	gen1 := NewEndGenerator(seed)
+	gen2 := NewEndGenerator(seed)
+
+	// 1. Void ring chunk (30, 0) between central island and outer islands.
+	cVoid := gen1(30, 0)
+	hmVoid := cVoid.ParityHeightmaps()
+	for idx := 0; idx < 256; idx++ {
+		if hmVoid[0][idx] != -1 || hmVoid[1][idx] != -1 || hmVoid[2][idx] != -1 {
+			t.Fatalf("End void chunk heightmaps at idx %d = (%d, %d, %d), want -1", idx, hmVoid[0][idx], hmVoid[1][idx], hmVoid[2][idx])
+		}
+	}
+	regVoid, err := newDecorationRegion([]*Chunk{cVoid})
+	if err != nil {
+		t.Fatalf("newDecorationRegion(cVoid): %v", err)
+	}
+	regVoid.bindSeed(seed)
+	if h := regVoid.heightAt("WORLD_SURFACE_WG", 30*16+8, 8); h != 0 {
+		t.Fatalf("WORLD_SURFACE_WG on empty End column = %d, want 0 (End minY)", h)
+	}
+	if h := regVoid.heightAt("WORLD_SURFACE", 30*16+8, 8); h != 0 {
+		t.Fatalf("WORLD_SURFACE on empty End column = %d, want 0 (End minY)", h)
+	}
+	if bID, ok := regVoid.getBiome(30*16+8, 0, 8); !ok || bID != BiomeTheEnd {
+		t.Fatalf("getBiome on End chunk (30,0) = (%d, %v), want (%d, true)", bID, ok, BiomeTheEnd)
+	}
+
+	// 2. Central island chunk (0, 0) and outer island chunk (70, 10) determinism & heightmaps.
+	for _, coord := range [][2]int32{{0, 0}, {70, 10}} {
+		cx, cz := coord[0], coord[1]
+		c1 := gen1(cx, cz)
+		c2 := gen2(cx, cz)
+		hm1 := c1.ParityHeightmaps()
+		hm2 := c2.ParityHeightmaps()
+		if hm1 != hm2 {
+			t.Fatalf("non-deterministic End heightmaps at (%d, %d)", cx, cz)
+		}
+		for y := 0; y < EndDimensionType.Height; y++ {
+			for z := 0; z < 16; z++ {
+				for x := 0; x < 16; x++ {
+					if got, want := c1.GetBlock(x, y, z), c2.GetBlock(x, y, z); got != want {
+						t.Fatalf("non-deterministic End block at (%d,%d) (%d,%d,%d): %d != %d", cx, cz, x, y, z, got, want)
+					}
+				}
+			}
+		}
+		for y := 0; y < EndDimensionType.Height; y += biomeCellSize {
+			for z := 0; z < 16; z += biomeCellSize {
+				for x := 0; x < 16; x += biomeCellSize {
+					if b1, b2 := c1.GetBiome(x, y, z), c2.GetBiome(x, y, z); b1 != b2 {
+						t.Fatalf("non-deterministic End biome at (%d,%d) (%d,%d,%d): %d != %d", cx, cz, x, y, z, b1, b2)
+					}
+				}
+			}
+		}
+		if len(c1.Encode()) == 0 {
+			t.Fatalf("expected non-empty wire encoding for End chunk (%d, %d)", cx, cz)
+		}
+	}
+}
+

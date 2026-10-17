@@ -286,36 +286,41 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	centerX := minX + (maxX-minX+1)/2
 	centerZ := minZ + (maxZ-minZ+1)/2
 
-	base, err := preCarveTerrainFor(od, seed, int32(centerX>>4), int32(centerZ>>4))
-	if err != nil {
-		return nil
-	}
-	heightmapY := func(x, z int, oceanFloor bool) int {
-		lx, lz := x-int(base.c.X)*16, z-int(base.c.Z)*16
-		for i := WorldHeight - 1; i >= 0; i-- {
-			s := base.columns[lx][lz][i]
-			y := MinY + i
-			if !oceanFloor {
-				if s != StateAir {
+	var y int
+	if isNetherDensity(od) {
+		y = ruinedPortalFindSuitableYNether(od, random, airPocket, minX, minZ, maxX, maxZ)
+	} else {
+		base, err := preCarveTerrainFor(od, seed, int32(centerX>>4), int32(centerZ>>4))
+		if err != nil {
+			return nil
+		}
+		heightmapY := func(x, z int, oceanFloor bool) int {
+			lx, lz := x-int(base.c.X)*16, z-int(base.c.Z)*16
+			for i := WorldHeight - 1; i >= 0; i-- {
+				s := base.columns[lx][lz][i]
+				y := MinY + i
+				if !oceanFloor {
+					if s != StateAir {
+						return y
+					}
+					continue
+				}
+				// OCEAN_FLOOR_WG scans past fluids to the first motion-blocking.
+				if s != StateAir && !isWaterState(s) && stateFlags(s)&flagBlocksMotion != 0 {
 					return y
 				}
-				continue
 			}
-			// OCEAN_FLOOR_WG scans past fluids to the first motion-blocking.
-			if s != StateAir && !isWaterState(s) && stateFlags(s)&flagBlocksMotion != 0 {
-				return y
-			}
+			return MinY - 1
 		}
-		return MinY - 1
-	}
-	oceanFloor := setup.Placement == "on_ocean_floor"
-	// getHeight returns one past the top block and vanilla subtracts one, so
-	// surfaceY lands exactly on the topmost non-air block.
-	surfaceY := heightmapY(centerX, centerZ, oceanFloor)
+		oceanFloor := setup.Placement == "on_ocean_floor"
+		// getHeight returns one past the top block and vanilla subtracts one, so
+		// surfaceY lands exactly on the topmost non-air block.
+		surfaceY := heightmapY(centerX, centerZ, oceanFloor)
 
-	ySpan := size[1]
-	y := ruinedPortalFindSuitableY(random, setup.Placement, airPocket, surfaceY, ySpan,
-		minX, minZ, maxX, maxZ, base)
+		ySpan := size[1]
+		y = ruinedPortalFindSuitableY(random, setup.Placement, airPocket, surfaceY, ySpan,
+			minX, minZ, maxX, maxZ, base)
+	}
 
 	stub := &RuinedPortalStub{
 		X: originX, Z: originZ,
@@ -341,6 +346,38 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 		stub.Cold = worldgen.ColdEnoughToSnowAt(biomeAtStub, stub.X, y, stub.Z, SeaLevel)
 	}
 	return stub
+}
+
+func ruinedPortalFindSuitableYNether(od *worldgen.OverworldDensity, random *worldgen.Legacy, airPocket bool, minX, minZ, maxX, maxZ int) int {
+	const minCut = 15
+	var y int
+	if airPocket {
+		y = randomBetweenInclusiveLegacy(random, 32, 100)
+	} else if random.NextFloat() < 0.5 {
+		y = randomBetweenInclusiveLegacy(random, 27, 29)
+	} else {
+		y = randomBetweenInclusiveLegacy(random, 29, 100)
+	}
+	corners := [4][2]int{{minX, minZ}, {maxX, minZ}, {minX, maxZ}, {maxX, maxZ}}
+	var cols [4][128]uint16
+	for i, c := range corners {
+		cols[i] = netherNoiseColumn(od, c[0], c[1])
+	}
+	for yy := y; yy > minCut; yy-- {
+		if yy < 0 || yy >= 128 {
+			continue
+		}
+		opaque := 0
+		for i := 0; i < 4; i++ {
+			if cols[i][yy] != StateAir {
+				opaque++
+				if opaque == 3 {
+					return yy
+				}
+			}
+		}
+	}
+	return y
 }
 
 func ruinedPortalFindSuitableY(random *worldgen.Legacy, placement string, airPocket bool, surfaceY, ySpan, minX, minZ, maxX, maxZ int, base baseTerrain) int {

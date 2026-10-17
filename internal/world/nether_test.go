@@ -287,3 +287,60 @@ func TestNetherStructuresFortressBastionFossilAndPortal(t *testing.T) {
 		t.Fatalf("unexpected ruined_portal_nether Y=%d (want within [15..110])", portalStub.Y)
 	}
 }
+
+func TestNetherHeightmapsBiomesAndDeterminism(t *testing.T) {
+	const seed int64 = 12345
+	gen1 := NewNetherGenerator(seed)
+	gen2 := NewNetherGenerator(seed)
+
+	c1 := gen1(2, -3)
+	c2 := gen2(2, -3)
+
+	// 1. Verify ParityHeightmaps() and decorationRegion heightAt / getBiome bounds.
+	hm := c1.ParityHeightmaps()
+	for idx := 0; idx < 256; idx++ {
+		if hm[0][idx] != NetherRoofY || hm[1][idx] != NetherRoofY || hm[2][idx] != NetherRoofY {
+			t.Fatalf("Nether heightmaps at idx %d = (%d, %d, %d), want 127", idx, hm[0][idx], hm[1][idx], hm[2][idx])
+		}
+	}
+	reg, err := newDecorationRegion([]*Chunk{c1})
+	if err != nil {
+		t.Fatalf("newDecorationRegion: %v", err)
+	}
+	reg.bindSeed(seed)
+	if h := reg.heightAt("WORLD_SURFACE_WG", 2*16+8, -3*16+8); h != NetherRoofY+1 {
+		t.Fatalf("WORLD_SURFACE_WG on Nether chunk = %d, want %d", h, NetherRoofY+1)
+	}
+	if h := reg.heightAt("WORLD_SURFACE", 2*16+8, -3*16+8); h != NetherRoofY+1 {
+		t.Fatalf("WORLD_SURFACE on Nether chunk = %d, want %d", h, NetherRoofY+1)
+	}
+	if bID, ok := reg.getBiome(2*16+8, 0, -3*16+8); !ok || bID == 0 {
+		t.Fatalf("getBiome at Nether y=0 returned (%d, %v), want valid Nether biome", bID, ok)
+	}
+
+	// 2. Verify bit-for-bit block and biome determinism across two independent generators.
+	for y := 0; y < NetherDimensionType.Height; y++ {
+		for z := 0; z < 16; z++ {
+			for x := 0; x < 16; x++ {
+				if got, want := c1.GetBlock(x, y, z), c2.GetBlock(x, y, z); got != want {
+					t.Fatalf("non-deterministic Nether block at (%d,%d,%d): %d != %d", x, y, z, got, want)
+				}
+			}
+		}
+	}
+	for y := 0; y < NetherDimensionType.Height; y += biomeCellSize {
+		for z := 0; z < 16; z += biomeCellSize {
+			for x := 0; x < 16; x += biomeCellSize {
+				b1 := c1.GetBiome(x, y, z)
+				b2 := c2.GetBiome(x, y, z)
+				if b1 != b2 {
+					t.Fatalf("non-deterministic Nether biome at (%d,%d,%d): %d != %d", x, y, z, b1, b2)
+				}
+			}
+		}
+	}
+	if len(c1.Encode()) == 0 {
+		t.Fatal("expected non-empty wire encoding for Nether chunk")
+	}
+}
+
