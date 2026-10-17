@@ -187,8 +187,9 @@ func (s *Server) SkyDarkening() byte {
 	return 0
 }
 
-// advanceWorldTime moves the clock on by one tick and returns the new values.
-// When doDaylightCycle is false, gameTime still increments while dayTime stays fixed.
+// advanceWorldTime moves the clock on by one tick, ticks active furnaces, and
+// returns the new values. When doDaylightCycle is false, gameTime still
+// increments while dayTime stays fixed.
 func (s *Server) advanceWorldTime() (gameTime, dayTime int64) {
 	gameTime = s.clock.gameTime.Add(1)
 	if s.DaylightCycle() {
@@ -196,6 +197,7 @@ func (s *Server) advanceWorldTime() (gameTime, dayTime int64) {
 	} else {
 		dayTime = s.clock.dayTime.Load()
 	}
+	s.TickFurnaces()
 	return gameTime, dayTime
 }
 

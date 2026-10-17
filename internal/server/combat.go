@@ -458,6 +458,8 @@ func MobMaxHealth(typeName string) float32 {
 		return DefaultZombieMaxHealth
 	case MobTypePig:
 		return DefaultPigMaxHealth
+	case MobTypeVillager:
+		return DefaultVillagerMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -517,6 +519,8 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.zombie.hurt", SoundSourceHostile
 	case MobTypePig:
 		return "minecraft:entity.pig.hurt", SoundSourceNeutral
+	case MobTypeVillager:
+		return "minecraft:entity.villager.hurt", SoundSourceNeutral
 	default:
 		return "minecraft:entity.generic.hurt", SoundSourceNeutral
 	}
@@ -528,6 +532,8 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.zombie.death", SoundSourceHostile
 	case MobTypePig:
 		return "minecraft:entity.pig.death", SoundSourceNeutral
+	case MobTypeVillager:
+		return "minecraft:entity.villager.death", SoundSourceNeutral
 	default:
 		return "minecraft:entity.generic.death", SoundSourceNeutral
 	}
@@ -942,14 +948,20 @@ func EncodeAttackPacket(entityID int32) []byte {
 }
 
 // HandleInteractPacket decodes a serverbound interact or attack packet and
-// executes a melee attack when Action == InteractActionAttack.
+// executes a melee attack when Action == InteractActionAttack, or right-click
+// entity interaction (e.g. opening villager trading UI) when interacting with
+// the main hand.
 func (s *Server) HandleInteractPacket(session *PlayerSession, r *protocol.Reader) error {
 	pkt, err := DecodeInteractPacket(r)
 	if err != nil {
 		return err
 	}
-	if s != nil && session != nil && pkt.Action == InteractActionAttack {
-		s.AttackEntity(session, pkt.EntityID)
+	if s != nil && session != nil {
+		if pkt.Action == InteractActionAttack {
+			s.AttackEntity(session, pkt.EntityID)
+		} else if pkt.Hand == 0 {
+			_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+		}
 	}
 	return nil
 }

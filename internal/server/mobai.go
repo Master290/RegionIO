@@ -86,7 +86,7 @@ func IsHostileMob(typeName string) bool {
 
 // IsPassiveMob reports whether typeName is a passive wandering mob.
 func IsPassiveMob(typeName string) bool {
-	return typeName == MobTypePig
+	return typeName == MobTypePig || typeName == MobTypeVillager
 }
 
 func (s *Server) appendPlayerTargets(dst []playerTarget) []playerTarget {

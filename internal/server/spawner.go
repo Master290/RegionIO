@@ -52,6 +52,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 	for {
 		select {
 		case <-ctx.Done():
+			_ = s.SaveFurnaces()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -66,6 +67,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			s.TickWeather(rng)
 			s.TrySkipNightBySleep()
 			s.TickAllPlayersHunger()
+			s.TickVillagers()
 			tracker.TickAndBroadcast(s, rng)
 		}
 	}
@@ -236,7 +238,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				feetY,
 				snapshot.Z,
 				snapshot.Yaw,
-				PigWanderSpeed,
+				passiveMobWanderSpeed(snapshot.TypeName),
 			)
 		}
 
@@ -341,6 +343,9 @@ func (t *EntityTracker) syncLocked(s *Server) {
 				if viewer.send != nil {
 					t.pktBuf = encodeAddEntityPacket(t.pktBuf[:0], ent)
 					_ = viewer.send(protocol.PlayAddEntity, t.pktBuf)
+					if ent.TypeName == MobTypeVillager {
+						_ = viewer.send(PlaySetEntityDataCB, s.VillagerEntityDataPacket(ent.ID))
+					}
 				}
 				continue
 			}
