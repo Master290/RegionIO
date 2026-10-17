@@ -935,6 +935,7 @@ func (s *Server) TriggerRespawnPointExplosion(activator *PlayerSession, dim stri
 					}
 					if valid, lc := cache.SetBlockWithLight(tx, ty, tz, world.StateAir); valid {
 						blocksDestroyed++
+						s.OnWorkstationBlockBroken(dim, tx, ty, tz)
 						changes = append(changes, world.BlockChange{
 							Pos:      world.BlockPos{X: tx, Y: ty, Z: tz},
 							OldState: st,

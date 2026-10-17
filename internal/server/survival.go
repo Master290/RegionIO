@@ -386,6 +386,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		}
 	}
 	s.OnSculkBlockBroken(dim, x, y, z, prevState)
+	s.OnWorkstationBlockBroken(dim, x, y, z)
 	s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
 	var bannerDrop world.ItemStack
 	var hasBannerDrop bool
@@ -657,6 +658,9 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 		case InteractActionInteractAt:
 			s.InteractWithDecorationAt(session, pkt.EntityID, pkt.Hand, float64(pkt.TargetX), float64(pkt.TargetY), float64(pkt.TargetZ), true)
 		default:
+			if s.InteractWithZombieVillager(session, pkt.EntityID, nil) {
+				return nil
+			}
 			if pkt.Hand == 0 {
 				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
 			}
@@ -784,6 +788,11 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		added, changedSlots := session.AddItemToInventory(live.Item)
 		if added <= 0 {
 			continue
+		}
+		if fishMeta, ok := s.DroppedFishingItemMeta(live.ID); ok && !fishMeta.IsEmpty() {
+			for _, slot := range changedSlots {
+				SetSlotItemMeta(session, slot, fishMeta)
+			}
 		}
 		totalPickedUp += added
 		pickedStack := world.NewItemStack(live.Item.ResolvedItemID(), added)
