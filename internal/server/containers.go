@@ -733,6 +733,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		s.applyPlayerInventoryClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncPlayerInventoryContainer(session)
 	}
 
@@ -747,11 +748,13 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		s.applyChestClickLocked(session, tr, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncChestViewers(session, bx, by, bz)
 	case MenuTypeCrafting:
 		s.applyCraftingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncOpenContainer(session)
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
 		menuType := tr.open.MenuType
@@ -766,11 +769,13 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			}
 		}
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncFurnaceViewers(session, bx, by, bz)
 	case MenuTypeEnchantment:
 		s.applyEnchantingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncOpenContainer(session)
 	case MenuTypeAnvil:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
@@ -781,11 +786,13 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		}
 		if tookResult {
 			s.TriggerInventoryChanged(session)
+			s.UnlockRecipesForInventory(session)
 			if s.DamageAnvilBlockOnUse(session, bx, by, bz, nil) {
 				return nil
 			}
 		} else {
 			s.TriggerInventoryChanged(session)
+			s.UnlockRecipesForInventory(session)
 		}
 		return s.syncOpenContainer(session)
 	case MenuTypeGrindstone:
@@ -798,12 +805,14 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			_ = s.AddPlayerExperience(session, xpAward)
 		}
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncOpenContainer(session)
 	case MenuTypeBrewingStand:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		s.applyBrewingStandContainerClickLocked(session, tr, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return s.syncBrewingStandViewers(session, bx, by, bz)
 	case MenuTypeCartographyTable:
 		tr.mu.Unlock()
@@ -817,6 +826,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			Mode:        mode,
 		})
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return err
 	case MenuTypeStonecutter:
 		tr.mu.Unlock()
@@ -827,6 +837,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			Mode:        mode,
 		})
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return err
 	case MenuTypeSmithing:
 		tr.mu.Unlock()
@@ -837,6 +848,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			Mode:        mode,
 		})
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return err
 	case MenuTypeBeacon:
 		tr.mu.Unlock()
@@ -847,6 +859,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			Mode:        mode,
 		})
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 		return err
 	default:
 		tr.mu.Unlock()
@@ -1007,11 +1020,17 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 
 	if slot == 0 {
 		// Crafting output slot.
+		_, matchedRec, _ := MatchCraftingGrid(slots[1:10], 3, 3)
 		if crafted := s.clickCraftingOutput(session, slots, 1, 9, 3, 3, 10, 46, gridStars, func(menuSlot int) int {
 			return menuSlot - 1
 		}, &tr.carried, mode); !crafted.IsEmpty() {
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
+			recName := ""
+			if matchedRec != nil {
+				recName = matchedRec.Name
+			}
+			s.UnlockRecipeOnCraft(session, recName, crafted)
 		}
 	} else {
 		switch mode {
@@ -1173,11 +1192,17 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 	slots := s.buildPlayerMenuSlots(session, tr.invCraft, tr.invResult)
 
 	if slot == 0 {
+		_, matchedRec, _ := MatchCraftingGrid(slots[1:5], 2, 2)
 		if crafted := s.clickCraftingOutput(session, slots, 1, 4, 2, 2, 9, 45, tr.invCraftStars[:], func(menuSlot int) int {
 			return menuSlot
 		}, &tr.carried, mode); !crafted.IsEmpty() {
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
+			recName := ""
+			if matchedRec != nil {
+				recName = matchedRec.Name
+			}
+			s.UnlockRecipeOnCraft(session, recName, crafted)
 		}
 	} else {
 		switch mode {

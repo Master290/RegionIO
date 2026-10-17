@@ -788,6 +788,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		}
 		s.RecordItemPickedUp(session, pickedStack.ResolvedID(), added)
 		s.TriggerItemAcquired(session, pickedStack)
+		s.UnlockRecipesForItem(session, pickedStack)
 
 		chunkPos := live.ChunkPos()
 		s.BroadcastDimensionChunk(playerDim, chunkPos.X, chunkPos.Z, protocol.PlayTakeItemEntity,
@@ -816,6 +817,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 	}
 	if totalPickedUp > 0 {
 		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
 	}
 	return totalPickedUp
 }

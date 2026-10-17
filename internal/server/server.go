@@ -628,6 +628,11 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 		root.Set("Advancements", d.Advancements)
 		LoadAdvancementsFromPlayerCompound(session, root)
 	}
+	if d.RecipeBook != nil {
+		root := nbt.NewCompound()
+		root.Set("recipeBook", d.RecipeBook)
+		LoadRecipeBookFromPlayerCompound(session, root)
+	}
 	session.mu.Lock()
 	session.position = d.Pos
 	session.yaw = d.Yaw
@@ -835,6 +840,18 @@ func (session *PlayerSession) ReadAdvancementsNBT(root *nbt.Compound) {
 	LoadAdvancementsFromPlayerCompound(session, root)
 }
 
+// WriteRecipeBookNBT writes the player's recipe book state into a playerdata
+// NBT root compound under the "recipeBook" key.
+func (session *PlayerSession) WriteRecipeBookNBT(root *nbt.Compound) {
+	SaveRecipeBookToPlayerCompound(session, root)
+}
+
+// ReadRecipeBookNBT restores the player's recipe book state from a playerdata
+// NBT root compound's "recipeBook" key.
+func (session *PlayerSession) ReadRecipeBookNBT(root *nbt.Compound) {
+	LoadRecipeBookFromPlayerCompound(session, root)
+}
+
 // WriteEffectsNBT writes the player's active status effects, absorption hearts,
 // and slot potion metadata into a playerdata NBT root compound.
 func (session *PlayerSession) WriteEffectsNBT(root *nbt.Compound) {
@@ -861,11 +878,16 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	xpSeed := session.EnchantmentSeed()
 	metaRoot := nbt.NewCompound()
 	SaveAdvancementsToPlayerCompound(session, metaRoot)
+	SaveRecipeBookToPlayerCompound(session, metaRoot)
 	SaveEffectsToPlayerCompound(session, metaRoot)
 	SavePotionMetaToPlayerCompound(session, metaRoot)
 	var advComp *nbt.Compound
 	if tag, ok := metaRoot.Get("Advancements"); ok {
 		advComp, _ = tag.(*nbt.Compound)
+	}
+	var rbComp *nbt.Compound
+	if tag, ok := metaRoot.Get("recipeBook"); ok {
+		rbComp, _ = tag.(*nbt.Compound)
 	}
 	var effList *nbt.List
 	if tag, ok := metaRoot.Get("active_effects"); ok {
@@ -996,6 +1018,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		SpawnDimension:    session.spawnDimension,
 		HasSpawn:          session.hasSpawn,
 		Advancements:      advComp,
+		RecipeBook:        rbComp,
 		ActiveEffects:     effList,
 		AbsorptionAmount:  absAmount,
 		SlotPotions:       slotPotions,

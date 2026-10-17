@@ -222,9 +222,10 @@ type PlayerData struct {
 	SpawnForced    bool
 	SpawnDimension   string
 	HasSpawn         bool
-	Advancements     *nbt.Compound
-	ActiveEffects    *nbt.List
-	AbsorptionAmount float32
+	Advancements      *nbt.Compound
+	RecipeBook        *nbt.Compound
+	ActiveEffects     *nbt.List
+	AbsorptionAmount  float32
 	SlotPotions       *nbt.List
 	SlotMaps          *nbt.List
 	SlotArmorTrims    *nbt.List
@@ -419,6 +420,9 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 
 	if d.Advancements != nil {
 		root.Set("Advancements", d.Advancements)
+	}
+	if d.RecipeBook != nil {
+		root.Set("recipeBook", d.RecipeBook)
 	}
 	if d.ActiveEffects != nil && len(d.ActiveEffects.Elems) > 0 {
 		root.Set("active_effects", *d.ActiveEffects)
@@ -740,6 +744,9 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 
 	if adv, ok := nbtGetCompound(root, "Advancements"); ok && adv != nil {
 		d.Advancements = adv
+	}
+	if rb, ok := nbtGetCompound(root, "recipeBook"); ok && rb != nil {
+		d.RecipeBook = rb
 	}
 	if eff, ok := nbtGetList(root, "active_effects"); ok && eff != nil {
 		cp := *eff

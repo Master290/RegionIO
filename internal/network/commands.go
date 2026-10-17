@@ -207,6 +207,8 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	effectNode := greedyCmd("effect")
 	enchantNode := greedyCmd("enchant")
 	itemNode := greedyCmd("item")
+	recipeNode := greedyCmd("recipe")
+	advancementNode := greedyCmd("advancement")
 
 	nodes[rootIdx].Children = []int32{
 		tpNode,
@@ -240,6 +242,8 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		effectNode,
 		enchantNode,
 		itemNode,
+		recipeNode,
+		advancementNode,
 	}
 	return nodes, rootIdx
 }
@@ -539,6 +543,10 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 			return "You do not have permission to use this command"
 		}
 		return srv.HandleWorldBorderCommand(sender, parsed.Args)
+	case "recipe":
+		return srv.HandleRecipeCommand(sender, parsed.Args)
+	case "advancement":
+		return srv.HandleAdvancementCommand(sender, parsed.Args)
 	default:
 		if reply, handled := srv.HandleItemAndStatusCommand(sender, parsed.Name, parsed.Args); handled {
 			return reply
@@ -778,6 +786,10 @@ func execHelp(args []string) string {
 			return "/spawnpoint [<target> [<x> <y> <z> [angle]]] — set player spawn point"
 		case "setworldspawn":
 			return "/setworldspawn [<x> <y> <z> [angle]] — set world spawn point"
+		case "recipe":
+			return "/recipe <give|take> <targets> (<recipe>|*) — unlock or lock recipes"
+		case "advancement":
+			return "/advancement <grant|revoke> <targets> <everything|only> [<advancement> [<criterion>]] — grant or revoke advancements"
 		case "help":
 			return "/help [command] — show available commands"
 		}

@@ -132,6 +132,11 @@ const (
 	PlayOpenSignEditor           = 0x3c
 	PlayAwardStats               = 0x03
 	PlayChangeDifficulty         = 0x0a
+	PlayPlaceGhostRecipe         = 0x3f
+	PlayRecipeBookAdd            = 0x4a
+	PlayRecipeBookRemove         = 0x4b
+	PlayRecipeBookSettings       = 0x4c
+	PlayUpdateRecipes            = 0x85
 
 	// Entity packets
 	PlayAddEntity        = 0x01
@@ -169,9 +174,12 @@ const (
 	PlayMovePosRot                = 0x1f
 	PlayMoveRot                   = 0x20
 	PlayMoveStatusOnly            = 0x21
+	PlayPlaceRecipe               = 0x27
 	PlayPlayerLoaded              = 0x2c
 	PlayPlayerAction              = 0x29
 	PlayPlayerCommand             = 0x2a
+	PlayRecipeBookChangeSettings  = 0x2e
+	PlayRecipeBookSeenRecipe      = 0x2f
 	PlayRenameItem                = 0x30
 	PlaySeenAdvancements          = 0x32
 	PlaySelectTrade               = 0x33

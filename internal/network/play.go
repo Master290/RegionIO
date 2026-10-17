@@ -107,6 +107,16 @@ func (h *handler) beginPlay() error {
 	if err := h.srv.SendInitialAdvancements(h.session); err != nil {
 		return err
 	}
+	if tab := h.session.SelectedAdvancementTab(); tab != "" {
+		if err := h.conn.Send(server.PlaySelectAdvancementsTab, server.EncodeSelectAdvancementsTabPacket(tab)); err != nil {
+			return err
+		}
+	}
+	if err := h.srv.SendInitialRecipeBook(h.session); err != nil {
+		return err
+	}
+	h.srv.TriggerInventoryChanged(h.session)
+	h.srv.UnlockRecipesForInventory(h.session)
 	if err := h.sendCommands(); err != nil {
 		return err
 	}
@@ -1045,6 +1055,39 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayPlaceRecipe:
+		cid, displayID, useMax, err := server.DecodePlaceRecipePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandlePlaceRecipe(h.session, cid, displayID, useMax); err != nil {
+				return err
+			}
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlayRecipeBookChangeSettings:
+		bookType, isOpen, isFiltering, err := server.DecodeRecipeBookChangeSettingsPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleRecipeBookChangeSettings(h.session, bookType, isOpen, isFiltering)
+		}
+		return nil
+
+	case protocol.PlayRecipeBookSeenRecipe:
+		displayID, err := server.DecodeRecipeBookSeenRecipePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleRecipeBookSeenRecipe(h.session, displayID)
+		}
+		return nil
+
 	case protocol.PlayContainerSlotStateChanged:
 		return nil
 
@@ -1256,6 +1299,7 @@ func (h *handler) handleCreativeSlot(pkt protocol.Packet) error {
 			h.session.SetInventorySlot(slot, stack)
 			if h.srv != nil {
 				h.srv.TriggerInventoryChanged(h.session)
+				h.srv.UnlockRecipesForItem(h.session, stack)
 			}
 		}
 		if h.conn != nil {
