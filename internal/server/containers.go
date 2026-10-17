@@ -12,9 +12,12 @@ import (
 // MenuType registry IDs in BuiltInRegistries.MENU (protocol 775 / 26.1.2).
 const (
 	MenuTypeGeneric9x3   int32 = 2  // Single chest (27 chest slots + 36 player slots)
+	MenuTypeAnvil        int32 = 8  // Anvil (2 input + 1 result + 36 player slots)
 	MenuTypeBlastFurnace int32 = 10 // Blast furnace (3 furnace slots + 36 player slots)
 	MenuTypeCrafting     int32 = 12 // Crafting table (1 result + 9 grid + 36 player slots)
+	MenuTypeEnchantment  int32 = 13 // Enchanting table (2 input + 36 player slots)
 	MenuTypeFurnace      int32 = 14 // Furnace (3 furnace slots + 36 player slots)
+	MenuTypeGrindstone   int32 = 15 // Grindstone (2 input + 1 result + 36 player slots)
 	MenuTypeSmoker       int32 = 22 // Smoker (3 furnace slots + 36 player slots)
 )
 
@@ -50,13 +53,20 @@ type ContainerClick struct {
 
 // OpenContainerState represents the currently open screen on a PlayerSession.
 type OpenContainerState struct {
-	ContainerID int32
-	MenuType    int32
-	BlockX      int
-	BlockY      int
-	BlockZ      int
-	Crafting    [CraftingGridSlotCount]world.ItemStack
-	Result      world.ItemStack
+	ContainerID    int32
+	MenuType       int32
+	BlockX         int
+	BlockY         int
+	BlockZ         int
+	Crafting       [CraftingGridSlotCount]world.ItemStack
+	Result         world.ItemStack
+	EnchantSlots   [2]world.ItemStack
+	CombinerInputs [2]world.ItemStack
+	AnvilRename    string
+	EnchantCosts   [3]int16
+	EnchantClues   [3]int16
+	LevelClues     [3]int16
+	AnvilCost      int16
 }
 
 type chestKey struct {
@@ -365,8 +375,8 @@ func skipHashedStack(r *protocol.Reader) error {
 }
 
 // InteractBlock checks whether the block at (x, y, z) is an interactive
-// container (chest, crafting table, or furnace/blast_furnace/smoker) and opens
-// its UI for session.
+// container (chest, crafting table, furnace/blast_furnace/smoker, enchanting
+// table, anvil, or grindstone) and opens its UI for session.
 func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool, containerID int32, err error) {
 	if s == nil || session == nil || session.IsDead() {
 		return false, 0, nil
@@ -385,6 +395,15 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return err == nil, cid, err
 	case IsFurnaceBlock(state):
 		cid, err := s.OpenFurnace(session, x, y, z)
+		return err == nil, cid, err
+	case IsEnchantingTableBlock(state):
+		cid, err := s.OpenEnchantingTable(session, x, y, z)
+		return err == nil, cid, err
+	case IsAnvilBlock(state):
+		cid, err := s.OpenAnvil(session, x, y, z)
+		return err == nil, cid, err
+	case IsGrindstoneBlock(state):
+		cid, err := s.OpenGrindstone(session, x, y, z)
 		return err == nil, cid, err
 	default:
 		return false, 0, nil
@@ -499,12 +518,20 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	if s == nil || session == nil {
 		return nil
 	}
+	type returnEntry struct {
+		stack world.ItemStack
+		meta  ItemMeta
+	}
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
-	var returnStacks []world.ItemStack
+	var returnItems []returnEntry
 	if !tr.carried.IsEmpty() {
-		returnStacks = append(returnStacks, tr.carried)
+		returnItems = append(returnItems, returnEntry{
+			stack: tr.carried,
+			meta:  GetCarriedItemMeta(session),
+		})
 		tr.carried = world.ItemStack{}
+		SetCarriedItemMeta(session, ItemMeta{})
 	}
 	closedID := containerID
 	hadOpen := false
@@ -513,14 +540,36 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		closedID = tr.open.ContainerID
 		for i := range tr.open.Crafting {
 			if !tr.open.Crafting[i].IsEmpty() {
-				returnStacks = append(returnStacks, tr.open.Crafting[i])
+				returnItems = append(returnItems, returnEntry{stack: tr.open.Crafting[i]})
 			}
 		}
+		metaTr := getItemMetaTracker(session)
+		metaTr.mu.Lock()
+		for i := range tr.open.EnchantSlots {
+			if !tr.open.EnchantSlots[i].IsEmpty() {
+				returnItems = append(returnItems, returnEntry{
+					stack: tr.open.EnchantSlots[i],
+					meta:  metaTr.enchantMeta[i].Clone(),
+				})
+				metaTr.enchantMeta[i] = ItemMeta{}
+			}
+		}
+		for i := range tr.open.CombinerInputs {
+			if !tr.open.CombinerInputs[i].IsEmpty() {
+				returnItems = append(returnItems, returnEntry{
+					stack: tr.open.CombinerInputs[i],
+					meta:  metaTr.combinerMeta[i].Clone(),
+				})
+				metaTr.combinerMeta[i] = ItemMeta{}
+			}
+		}
+		metaTr.resultMeta = ItemMeta{}
+		metaTr.mu.Unlock()
 		tr.open = nil
 	}
 	for i := range tr.invCraft {
 		if !tr.invCraft[i].IsEmpty() {
-			returnStacks = append(returnStacks, tr.invCraft[i])
+			returnItems = append(returnItems, returnEntry{stack: tr.invCraft[i]})
 			tr.invCraft[i] = world.ItemStack{}
 		}
 	}
@@ -532,14 +581,18 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	tr.mu.Unlock()
 
 	snap := session.Snapshot()
-	for _, st := range returnStacks {
-		added, _ := session.AddItemToInventory(st)
+	for _, entry := range returnItems {
+		st := entry.stack
+		added, changedSlots := session.AddItemToInventory(st)
+		if !entry.meta.IsEmpty() && len(changedSlots) > 0 {
+			SetSlotItemMeta(session, changedSlots[0], entry.meta)
+		}
 		if rem := st.Count - added; rem > 0 {
 			s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
 		}
 	}
 
-	if session.send != nil && (notifyClient || hadOpen || len(returnStacks) > 0) {
+	if session.send != nil && (notifyClient || hadOpen || len(returnItems) > 0) {
 		if notifyClient && closedID > 0 {
 			_ = session.send(protocol.PlayContainerClose, EncodeContainerClose(closedID))
 		}
@@ -571,6 +624,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
+				SetCarriedItemMeta(session, ItemMeta{})
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
@@ -610,6 +664,33 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		s.applyFurnaceClickLocked(session, tr, menuType, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
 		return s.syncFurnaceViewers(session, bx, by, bz)
+	case MenuTypeEnchantment:
+		s.applyEnchantingTableClickLocked(session, tr, slot, button, mode)
+		tr.mu.Unlock()
+		return s.syncOpenContainer(session)
+	case MenuTypeAnvil:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		tookResult, costPaid, _ := s.applyAnvilClickLocked(session, tr, slot, button, mode)
+		tr.mu.Unlock()
+		if costPaid > 0 {
+			_ = s.AddPlayerExperienceLevels(session, -costPaid)
+		}
+		if tookResult {
+			if s.DamageAnvilBlockOnUse(session, bx, by, bz, nil) {
+				return nil
+			}
+		}
+		return s.syncOpenContainer(session)
+	case MenuTypeGrindstone:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		tookResult, xpAward := s.applyGrindstoneClickLocked(session, tr, slot, button, mode)
+		tr.mu.Unlock()
+		if tookResult && xpAward > 0 {
+			dim := world.NormalizeDimension(session.Snapshot().Dimension)
+			s.SpawnExperienceOrbsInDimension(dim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, xpAward)
+			_ = s.AddPlayerExperience(session, xpAward)
+		}
+		return s.syncOpenContainer(session)
 	default:
 		tr.mu.Unlock()
 		return nil
@@ -987,6 +1068,8 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	}
 	var slots []world.ItemStack
 	isFurnace := false
+	isEnchant := false
+	isAnvil := false
 	switch openCopy.MenuType {
 	case MenuTypeGeneric9x3:
 		slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
@@ -995,6 +1078,14 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
 		slots = s.buildFurnaceMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 		isFurnace = true
+	case MenuTypeEnchantment:
+		slots = s.buildEnchantingMenuSlots(session, openCopy.EnchantSlots)
+		isEnchant = true
+	case MenuTypeAnvil:
+		slots = s.buildCombinerMenuSlots(session, openCopy.CombinerInputs, openCopy.Result)
+		isAnvil = true
+	case MenuTypeGrindstone:
+		slots = s.buildCombinerMenuSlots(session, openCopy.CombinerInputs, openCopy.Result)
 	default:
 		return nil
 	}
@@ -1004,6 +1095,19 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	}
 	if isFurnace {
 		return s.sendFurnaceDataProperties(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+	}
+	if isEnchant {
+		return s.sendEnchantingDataProperties(
+			session,
+			openCopy.ContainerID,
+			openCopy.EnchantCosts,
+			int16(session.EnchantmentSeed()),
+			openCopy.EnchantClues,
+			openCopy.LevelClues,
+		)
+	}
+	if isAnvil {
+		return session.send(protocol.PlayContainerSetData, EncodeContainerSetData(openCopy.ContainerID, AnvilDataLevelCost, openCopy.AnvilCost))
 	}
 	return nil
 }
