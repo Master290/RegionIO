@@ -531,6 +531,8 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickBrewingStands()
 			h.srv.TickWorldBorder()
 			h.srv.TickJukeboxes()
+			h.srv.TickBeacons()
+			h.srv.TickConduits()
 			h.srv.TickAllPlayerStats()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
@@ -538,10 +540,12 @@ func (h *handler) serverTickLoop() {
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
 				// StartSpawning is not advancing the world clock; tick player,
-				// entity status effects, and raids here.
+				// entity status effects, raids, and boss fights here.
 				h.srv.TickAllPlayerEffects()
 				h.srv.TickAllEntityEffects()
 				h.srv.TickRaids()
+				h.srv.TickWithers(nil)
+				h.srv.TickEnderDragons(nil)
 			}
 			lastGameTime = nowGameTime
 		}
@@ -612,6 +616,13 @@ func (h *handler) syncVisibleEntities() error {
 			if entity.IsVillager() && h.srv != nil {
 				if err := h.conn.Send(protocol.PlaySetEntityData, h.srv.VillagerEntityDataPacket(entity.ID)); err != nil {
 					return err
+				}
+			}
+			if server.IsBossOrBossSupportEntity(entity.TypeName) && h.srv != nil {
+				if metaPkt := h.srv.BossOrSupportEntityDataPacket(entity.ID, entity.TypeName); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
 				}
 			}
 		} else if known != current {
@@ -874,6 +885,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case server.PlayUseItemSB:
 		if h.srv != nil && h.session != nil {
+			_ = h.srv.TryCollectDragonBreath(h.session)
 			if err := h.srv.HandleUseItemPacket(h.session, pkt.Body()); err != nil {
 				return err
 			}
@@ -978,6 +990,19 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case protocol.PlaySelectTrade:
 		if h.srv != nil && h.session != nil {
 			if err := h.srv.HandleSelectTradePacket(h.session, pkt.Body()); err != nil {
+				return err
+			}
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case server.PlaySetBeaconSB:
+		prim, sec, err := server.DecodeSetBeaconPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandleSetBeaconPacket(h.session, prim, sec); err != nil {
 				return err
 			}
 			h.syncHotbarFromSession()
@@ -1328,6 +1353,18 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
 				}
 				heldItem := h.session.InventorySlot(invSlot)
+				if heldItem.ResolvedID() == server.EndCrystalItemID {
+					if _, placed := h.srv.PlaceEndCrystalItem(h.session, dim, x, y, z); placed {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
+				if heldItem.ResolvedID() == "minecraft:glass_bottle" {
+					if h.srv.TryCollectDragonBreath(h.session) {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if world.BlockName(cache.GetBlock(x, y, z)) == "minecraft:sweet_berry_bush" && heldItem.ResolvedID() != "minecraft:bone_meal" {
 					if berries, res := h.srv.HarvestSweetBerries(h.session, x, y, z, nil); berries > 0 {
 						h.broadcastBlockChanges(dim, cache, res)
@@ -1411,6 +1448,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						h.srv.OnBannerPlaced(h.session, h.session.HeldInventorySlot(), px, py, pz)
 						h.srv.SendBannerBlockEntityPacket(h.session, px, py, pz)
 					}
+					if server.IsBeaconBlock(state) && h.srv != nil {
+						h.srv.UpdateBeaconAtInDim(dim, px, py, pz, h.session)
+					}
+					if server.IsConduitBlock(state) && h.srv != nil {
+						h.srv.UpdateConduitAtInDim(dim, px, py, pz)
+					}
 					if h.session != nil {
 						h.srv.RecordItemUsed(h.session, blockName, 1)
 						h.srv.TriggerPlantedSeed(h.session, blockName)
@@ -1425,6 +1468,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 								}
 							}
 						}
+					}
+					if (server.IsWitherSkullBlockState(state) || server.IsWitherBaseBlockState(state)) && h.srv != nil {
+						h.srv.TrySummonWitherAt(dim, px, py, pz, h.session)
 					}
 					h.log.Debug("block placed", "x", px, "y", py, "z", pz, "state", state)
 				}

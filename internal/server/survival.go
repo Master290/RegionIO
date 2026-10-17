@@ -372,6 +372,12 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			s.broadcastDimensionBlockChanges(dim, cache, jbRes.Changes, jbRes.LightChanged)
 		}
 	}
+	if IsBeaconBlock(prevState) {
+		s.RemoveBeaconInDim(dim, x, y, z)
+	}
+	if IsConduitBlock(prevState) {
+		s.RemoveConduitInDim(dim, x, y, z)
+	}
 	var bannerDrop world.ItemStack
 	var hasBannerDrop bool
 	if IsBannerBlock(prevState) {

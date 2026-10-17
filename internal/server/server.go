@@ -291,6 +291,9 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadBannersFile()
 		_ = s.LoadJukeboxes()
 		_ = s.LoadRaids()
+		_ = s.LoadDragonFightFile()
+		_ = s.LoadBeacons()
+		_ = s.LoadConduits()
 	}
 	return s
 }
@@ -451,6 +454,15 @@ func (s *Server) SaveAll() error {
 	if err := s.SaveRaids(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := s.SaveDragonFightFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveBeacons(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveConduits(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.SaveWorldSettingsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -463,25 +475,30 @@ func (s *Server) SaveAll() error {
 	return firstErr
 }
 
-// ChunkBlockEntitiesNBT returns all sign, lectern, and banner block entity NBT
-// compounds belonging to chunk (cx, cz) in dimension for Anvil chunk serialization.
+// ChunkBlockEntitiesNBT returns all sign, lectern, banner, beacon, and conduit
+// block entity NBT compounds belonging to chunk (cx, cz) in dimension for Anvil
+// chunk serialization.
 func (s *Server) ChunkBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Compound {
 	if s == nil {
 		return nil
 	}
 	out := s.ChunkSignAndLecternBlockEntitiesNBT(dimension, cx, cz)
 	out = append(out, s.ChunkBannerBlockEntitiesNBT(dimension, cx, cz)...)
+	out = append(out, s.ChunkBeaconBlockEntitiesNBT(dimension, cx, cz)...)
+	out = append(out, s.ChunkConduitBlockEntitiesNBT(dimension, cx, cz)...)
 	return out
 }
 
-// LoadChunkBlockEntitiesNBT restores any sign, lectern, and banner block entities
-// from a chunk's `block_entities` NBT list.
+// LoadChunkBlockEntitiesNBT restores any sign, lectern, banner, beacon, and
+// conduit block entities from a chunk's `block_entities` NBT list.
 func (s *Server) LoadChunkBlockEntitiesNBT(dimension string, list nbt.List) {
 	if s == nil {
 		return
 	}
 	s.LoadChunkSignAndLecternBlockEntitiesNBT(dimension, list)
 	s.LoadChunkBannerBlockEntitiesNBT(dimension, list)
+	s.LoadChunkBeaconBlockEntitiesNBT(dimension, list)
+	s.LoadChunkConduitBlockEntitiesNBT(dimension, list)
 }
 
 // Config returns the active configuration.

@@ -438,6 +438,10 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenSmithingTable(session, x, y, z)
 		return err == nil, cid, err
+	case IsBeaconBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
+		cid, err := s.OpenBeacon(session, x, y, z)
+		return err == nil, cid, err
 	case IsJukeboxBlock(state):
 		handled, _ := s.InteractJukebox(session, 0, x, y, z)
 		return handled, 0, nil
@@ -812,6 +816,16 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	case MenuTypeSmithing:
 		tr.mu.Unlock()
 		err := s.HandleSmithingClick(session, ContainerClick{
+			ContainerID: containerID,
+			Slot:        int16(slot),
+			Button:      button,
+			Mode:        mode,
+		})
+		s.TriggerInventoryChanged(session)
+		return err
+	case MenuTypeBeacon:
+		tr.mu.Unlock()
+		err := s.HandleBeaconClick(session, ContainerClick{
 			ContainerID: containerID,
 			Slot:        int16(slot),
 			Button:      button,
@@ -1248,6 +1262,8 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		return s.syncStonecutterContainer(session)
 	case MenuTypeSmithing:
 		return s.syncSmithingContainer(session)
+	case MenuTypeBeacon:
+		return s.syncOpenBeacon(session)
 	default:
 		return nil
 	}
