@@ -487,3 +487,211 @@ func TestHopperMinecartTransferAndPersistence(t *testing.T) {
 		t.Fatalf("unexpected loaded hopper state: %+v", loaded)
 	}
 }
+
+func TestHopperVehicleAndRailHooks(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	// 1. Place a detector_rail at (120, 64, 120) and spawn a chest_minecart on it.
+	detSt, _ := world.BlockStateIDByProperties("minecraft:detector_rail", map[string]string{
+		"shape": "north_south", "powered": "true", "waterlogged": "false",
+	})
+	cache.SetBlock(120, 64, 120, detSt)
+	cartID, _ := srv.SpawnVehicle(dim, "minecraft:chest_minecart", 120.5, 64.0625, 120.5, 0)
+	if cartID == 0 {
+		t.Fatal("expected chest_minecart to spawn")
+	}
+	if !srv.HasMinecartOnRail(dim, 120, 64, 120) {
+		t.Fatal("expected HasMinecartOnRail to return true for chest_minecart at (120, 64, 120)")
+	}
+
+	// 2. HopperInsertIntoVehicle & DetectorRailComparatorSignal via ComparatorSignalAt.
+	rem, changed := srv.HopperInsertIntoVehicle(cartID, world.NewNamedItemStack("minecraft:diamond", 64))
+	if !changed || !rem.IsEmpty() {
+		t.Fatalf("expected HopperInsertIntoVehicle to insert 64 diamonds, rem=%+v changed=%v", rem, changed)
+	}
+	if sig := srv.DetectorRailComparatorSignal(dim, 120, 64, 120); sig <= 0 {
+		t.Fatalf("expected positive DetectorRailComparatorSignal for non-empty chest_minecart, got %d", sig)
+	}
+	if sig := srv.ComparatorSignalAt(dim, 120, 64, 120); sig <= 0 {
+		t.Fatalf("expected ComparatorSignalAt on detector_rail with chest_minecart to be > 0, got %d", sig)
+	}
+
+	// 3. HopperExtractFromVehicle.
+	ext, ok := srv.HopperExtractFromVehicle(cartID)
+	if !ok || ext.ResolvedID() != "minecraft:diamond" || ext.Count != 1 {
+		t.Fatalf("expected HopperExtractFromVehicle to extract 1 diamond, got %+v ok=%v", ext, ok)
+	}
+
+	// 4. Powered rail redstone activation nudges a stationary minecart away from a solid wall.
+	stoneSt, _ := world.BlockStateByName("minecraft:stone", nil)
+	cache.SetBlock(124, 64, 125, stoneSt) // solid block at west end (x-1)
+	cache.SetBlock(125, 63, 125, stoneSt) // solid support beneath rail
+	pRailSt, _ := world.BlockStateIDByProperties("minecraft:powered_rail", map[string]string{
+		"shape": "east_west", "powered": "false", "waterlogged": "false",
+	})
+	cache.SetBlock(125, 64, 125, pRailSt)
+	rideCartID, _ := srv.SpawnVehicle(dim, "minecraft:minecart", 125.5, 64.0625, 125.5, 0)
+	redstoneBlockSt, _ := world.BlockStateByName("minecraft:redstone_block", nil)
+	cache.ApplyBlockWithUpdates(125, 64, 126, redstoneBlockSt)
+	if world.BlockProperties(cache.GetBlock(125, 64, 125))["powered"] != "true" {
+		t.Fatal("expected powered_rail at (125, 64, 125) to become powered=true")
+	}
+	if ent := srv.entities.Get(rideCartID); ent == nil || ent.VelocityX <= 0 {
+		t.Fatalf("expected minecart on newly powered rail next to west wall to receive +X velocity nudge, got %+v", ent)
+	}
+
+	// 5. Activator rail redstone activation disables a hopper_minecart on it, and ActiveHopperMinecarts lists it.
+	cache.SetBlock(130, 63, 130, stoneSt) // solid support beneath rail
+	aRailSt, _ := world.BlockStateIDByProperties("minecraft:activator_rail", map[string]string{
+		"shape": "north_south", "powered": "false", "waterlogged": "false",
+	})
+	cache.SetBlock(130, 64, 130, aRailSt)
+	hopCartID, _ := srv.SpawnVehicle(dim, "minecraft:hopper_minecart", 130.5, 64.0625, 130.5, 0)
+	activeIDs := srv.ActiveHopperMinecarts()
+	foundHopCart := false
+	for _, id := range activeIDs {
+		if id == hopCartID {
+			foundHopCart = true
+			break
+		}
+	}
+	if !foundHopCart {
+		t.Fatalf("expected ActiveHopperMinecarts to include %d, got %v", hopCartID, activeIDs)
+	}
+	cache.ApplyBlockWithUpdates(131, 64, 130, redstoneBlockSt)
+	if srv.IsHopperMinecartEnabled(hopCartID) {
+		t.Fatal("expected powered activator_rail to disable hopper_minecart via OnActivatorRailPowerChange")
+	}
+	cache.ApplyBlockWithUpdates(131, 64, 130, world.StateAir)
+	if !srv.IsHopperMinecartEnabled(hopCartID) {
+		t.Fatal("expected unpowering activator_rail to re-enable hopper_minecart")
+	}
+}
+
+func TestWindChargeRedstoneAndDispenserHooks(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	// 1. Wind charge explosion pressing a stone_button powers an adjacent redstone_lamp and schedules release timer.
+	stoneSt, _ := world.BlockStateByName("minecraft:stone", nil)
+	cache.SetBlock(140, 64, 140, stoneSt)
+	btnSt, _ := world.BlockStateIDByProperties("minecraft:stone_button", map[string]string{
+		"face": "wall", "facing": "east", "powered": "false",
+	})
+	cache.SetBlock(141, 64, 140, btnSt)
+	lampSt, _ := world.BlockStateIDByProperties("minecraft:redstone_lamp", map[string]string{"lit": "false"})
+	cache.SetBlock(141, 65, 140, lampSt)
+
+	wcID, err := srv.SpawnWindCharge(dim, 141.5, 64.5, 140.5, 0, 0, 0, 0, false)
+	if err != nil || wcID == 0 {
+		t.Fatalf("SpawnWindCharge: id=%d err=%v", wcID, err)
+	}
+	srv.DetonateWindCharge(wcID, 0)
+	if world.BlockProperties(cache.GetBlock(141, 64, 140))["powered"] != "true" {
+		t.Fatal("expected wind charge explosion to press stone_button at (141, 64, 140)")
+	}
+	if world.BlockProperties(cache.GetBlock(141, 65, 140))["lit"] != "true" {
+		t.Fatal("expected wind charge button press to light adjacent redstone_lamp via WindChargeRedstoneHook")
+	}
+	// Advance scheduled block updates by 25 ticks (stone_button delay = 20) -> button unpowers.
+	for i := 0; i < 25; i++ {
+		cache.TickBlockUpdates()
+	}
+	if world.BlockProperties(cache.GetBlock(141, 64, 140))["powered"] != "false" {
+		t.Fatal("expected stone_button pressed by wind charge to release after 20 ticks")
+	}
+
+	// 2. Dispenser firing minecraft:wind_charge -> calls s.SpawnWindCharge.
+	dispSt, _ := world.BlockStateIDByProperties("minecraft:dispenser", map[string]string{
+		"facing": "east", "triggered": "false",
+	})
+	cache.SetBlock(150, 64, 150, dispSt)
+	srv.SetDispenserSlotInDimension(dim, 150, 64, 150, 0, world.NewNamedItemStack("minecraft:wind_charge", 2))
+	if !srv.DispenseFromDispenser(dim, 150, 64, 150) {
+		t.Fatal("expected dispenser to fire minecraft:wind_charge")
+	}
+	if got := srv.DispenserSlotsInDimension(dim, 150, 64, 150)[0].Count; got != 1 {
+		t.Fatalf("expected 1 wind_charge remaining in dispenser, got %d", got)
+	}
+
+	// 3. Dispenser with minecraft:shears on minecraft:bogged -> calls s.ShearBogged.
+	cache.SetBlock(155, 64, 155, dispSt)
+	srv.SetDispenserSlotInDimension(dim, 155, 64, 155, 0, world.NewNamedItemStack("minecraft:shears", 1))
+	boggedID := srv.entities.Add(&world.Entity{
+		TypeID:    EntityTypeBoggedID,
+		TypeName:  MobTypeBogged,
+		Dimension: dim,
+		X:         156.5,
+		Y:         64.0,
+		Z:         155.5,
+	})
+	if !srv.DispenseFromDispenser(dim, 155, 64, 155) {
+		t.Fatal("expected dispenser with shears to shear bogged in front")
+	}
+	if !srv.IsBoggedSheared(boggedID) {
+		t.Fatal("expected bogged to be marked sheared after dispenser shears activation")
+	}
+
+	// 4. Dispenser with minecraft:brush on minecraft:armadillo -> calls s.BrushArmadillo and wears 16 durability.
+	cache.SetBlock(160, 64, 160, dispSt)
+	srv.SetDispenserSlotInDimension(dim, 160, 64, 160, 0, world.NewNamedItemStack("minecraft:brush", 1))
+	_ = srv.entities.Add(&world.Entity{
+		TypeID:    EntityTypeArmadilloID,
+		TypeName:  MobTypeArmadillo,
+		Dimension: dim,
+		X:         161.5,
+		Y:         64.0,
+		Z:         160.5,
+	})
+	if !srv.DispenseFromDispenser(dim, 160, 64, 160) {
+		t.Fatal("expected dispenser with brush to brush armadillo in front")
+	}
+	be, ok := srv.DispenserAt(dim, 160, 64, 160)
+	if !ok || be.SlotMeta[0].Damage != ArmadilloBrushWearCost {
+		t.Fatalf("expected brush in dispenser to take %d durability wear, got %+v", ArmadilloBrushWearCost, be)
+	}
+}
+
+func TestAllayNoteBlockAndJukeboxHooks(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	// Spawn an Allay at (170.5, 65.0, 170.5).
+	allayID, err := srv.SpawnAllay(dim, 170.5, 65.0, 170.5)
+	if err != nil || allayID == 0 {
+		t.Fatalf("SpawnAllay: id=%d err=%v", allayID, err)
+	}
+
+	// 1. Playing a note block at (170, 64, 170) notifies the Allay via OnNoteBlockPlayedForAllays.
+	nbSt, _ := world.BlockStateByName("minecraft:note_block", nil)
+	cache.SetBlock(170, 64, 170, nbSt)
+	srv.BroadcastNoteBlockPlay(dim, 170, 64, 170, 6, "harp")
+	st, ok := srv.GetAllayState(allayID)
+	if !ok || st.NoteBlockListenTicks <= 0 {
+		t.Fatalf("expected BroadcastNoteBlockPlay to bind nearby Allay's liked note block via OnNoteBlockPlayedForAllays, got %+v", st)
+	}
+
+	// 2. Inserting and ejecting a music disc in a jukebox at (171, 64, 170) notifies the Allay via NotifyJukeboxPlayingForAllays.
+	cache.SetBlock(171, 64, 170, JukeboxBlockState(false))
+	inserted, _ := srv.InsertJukeboxDisc(dim, 171, 64, 170, world.NewNamedItemStack("minecraft:music_disc_cat", 1))
+	if !inserted {
+		t.Fatal("expected InsertJukeboxDisc to succeed")
+	}
+	st, _ = srv.GetAllayState(allayID)
+	if !st.Dancing {
+		t.Fatal("expected InsertJukeboxDisc to notify Allay (playing=true) and start dancing")
+	}
+	_, ejected, _ := srv.EjectJukeboxDisc(dim, 171, 64, 170)
+	if !ejected {
+		t.Fatal("expected EjectJukeboxDisc to succeed")
+	}
+	st, _ = srv.GetAllayState(allayID)
+	if st.Dancing {
+		t.Fatal("expected EjectJukeboxDisc to notify Allay (playing=false) and stop dancing")
+	}
+}
+

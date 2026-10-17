@@ -1,6 +1,8 @@
 package server
 
 import (
+	"strings"
+
 	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
@@ -74,7 +76,7 @@ func EncodeNoteParticlePacket(x, y, z float64, note int) []byte {
 //  5. Brewing stands (0..15) via s.BrewingStandComparatorSignalAt
 //  6. Sculk sensors & calibrated sculk sensors (0..15) via s.SculkSensorComparatorSignalAt
 //  7. Dispensers & droppers (0..15) via s.DispenserComparatorSignalAt
-//  8. Chests, barrels, shulker boxes, hoppers, & furnaces (0..15) via s.ContainerComparatorSignalAt
+//  8. Hoppers, chiseled bookshelves, crafters, detector rails, & containers (0..15)
 func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if s == nil {
 		return 0
@@ -111,6 +113,9 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if crSig := s.CrafterComparatorSignalAt(targetDim, x, y, z); crSig > best {
 		best = crSig
 	}
+	if railSig := s.DetectorRailComparatorSignal(targetDim, x, y, z); railSig > best {
+		best = railSig
+	}
 	if contSig := s.ContainerComparatorSignalAt(targetDim, x, y, z); contSig > best {
 		best = contSig
 	}
@@ -124,9 +129,10 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 }
 
 // BindNoteBlockAndJukeboxRedstone binds comparator signal providers (item
-// frames, lecterns, jukeboxes, dispensers, droppers, containers), jukebox
-// active-playback redstone power, note block play packet broadcasting, and
-// dispenser/dropper 4-tick redstone firing onto the world cache for dim.
+// frames, lecterns, jukeboxes, dispensers, droppers, containers, detector rails),
+// jukebox active-playback redstone power, note block play packet broadcasting,
+// dispenser/dropper 4-tick redstone firing, wind charge redstone toggles, and
+// powered/activator/detector rail hooks onto the world cache for dim.
 func (s *Server) BindNoteBlockAndJukeboxRedstone(dim string) *world.Cache {
 	if s == nil {
 		return nil
@@ -154,12 +160,81 @@ func (s *Server) BindNoteBlockAndJukeboxRedstone(dim string) *world.Cache {
 	cache.SetDispenserFireListener(func(bx, by, bz int, _ bool) {
 		s.FireDispenserOrDropperAt(targetDim, bx, by, bz)
 	})
+	cache.SetRailPowerChangeListener(func(bx, by, bz int, railName string, powered bool) {
+		switch railName {
+		case "minecraft:powered_rail":
+			if powered {
+				s.NudgeMinecartsOnPoweredRail(targetDim, bx, by, bz)
+			}
+		case "minecraft:activator_rail":
+			s.OnActivatorRailPowerChange(targetDim, bx, by, bz, powered)
+		}
+	})
+	s.SetWindChargeRedstoneHook(s.handleWindChargeRedstoneToggle)
 	return cache
+}
+
+// handleWindChargeRedstoneToggle is invoked when a wind_charge or
+// breeze_wind_charge explosion toggles a non-iron door, trapdoor, fence gate,
+// lever, presses a button, or rings a bell. It schedules button release timers
+// and propagates redstone and comparator updates to neighboring blocks.
+func (s *Server) handleWindChargeRedstoneToggle(dim string, x, y, z int, blockName string, oldState, newState uint16) {
+	if s == nil {
+		return
+	}
+	targetDim := dim
+	if targetDim == "" {
+		targetDim = world.DimensionOverworld
+	}
+	cache := s.BindNoteBlockAndJukeboxRedstone(targetDim)
+	if cache == nil {
+		return
+	}
+	if strings.HasSuffix(blockName, "_button") && world.BlockProperties(newState)["powered"] == "true" {
+		cache.ScheduleBlockUpdate(x, y, z, world.UpdateRedstone, world.ButtonTickDelay(newState))
+	}
+	res := cache.UpdateNeighbors(x, y, z)
+	if strings.HasSuffix(blockName, "_door") {
+		if world.BlockProperties(newState)["half"] == "lower" {
+			upperRes := cache.UpdateNeighbors(x, y+1, z)
+			res.Changes = append(res.Changes, upperRes.Changes...)
+		} else {
+			lowerRes := cache.UpdateNeighbors(x, y-1, z)
+			res.Changes = append(res.Changes, lowerRes.Changes...)
+		}
+	}
+	compRes := cache.UpdateComparatorsAround(x, y, z)
+	res.Changes = append(res.Changes, compRes.Changes...)
+	for _, ch := range res.Changes {
+		s.broadcastBlockUpdateInDim(targetDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+	}
+}
+
+// HandleDetectorRailStateChanged updates adjacent redstone components and
+// comparators when a minecart enters or leaves a detector rail.
+func HandleDetectorRailStateChanged(s *Server, dim string, x, y, z int, _ bool) {
+	if s == nil {
+		return
+	}
+	targetDim := dim
+	if targetDim == "" {
+		targetDim = world.DimensionOverworld
+	}
+	cache := s.BindNoteBlockAndJukeboxRedstone(targetDim)
+	if cache == nil {
+		return
+	}
+	res := cache.UpdateNeighbors(x, y, z)
+	compRes := cache.UpdateComparatorsAround(x, y, z)
+	res.Changes = append(res.Changes, compRes.Changes...)
+	for _, ch := range res.Changes {
+		s.broadcastBlockUpdateInDim(targetDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+	}
 }
 
 // BroadcastNoteBlockPlay broadcasts the block event, note block instrument
 // sound, and colored note particle to all players watching the chunk containing
-// (x, y, z) in dim.
+// (x, y, z) in dim, and notifies nearby Allays of the note block play.
 func (s *Server) BroadcastNoteBlockPlay(dim string, x, y, z, note int, instrument string) {
 	if s == nil {
 		return
@@ -193,6 +268,9 @@ func (s *Server) BroadcastNoteBlockPlay(dim string, x, y, z, note int, instrumen
 
 	// 4. Emit vanilla note_block_play game event (vibration frequency 10) for sculk sensors.
 	s.EmitGameEvent(targetDim, GameEventNoteBlockPlay, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
+
+	// 5. Notify nearby Allays that this note block played a note.
+	s.OnNoteBlockPlayedForAllays(targetDim, x, y, z)
 }
 
 // InteractNoteBlock handles a player right-clicking a minecraft:note_block at

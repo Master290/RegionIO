@@ -23,7 +23,27 @@ var (
 	comparatorSignalProviders sync.Map // map[*Cache]func(x, y, z int) int
 	jukeboxPowerProviders     sync.Map // map[*Cache]func(x, y, z int) int
 	dispenserFireListeners    sync.Map // map[*Cache]func(x, y, z int, isDropper bool)
+	railPowerChangeListeners  sync.Map // map[*Cache]func(x, y, z int, railName string, powered bool)
 )
+
+// SetRailPowerChangeListener registers an optional callback invoked whenever a
+// `minecraft:powered_rail` or `minecraft:activator_rail` at (x, y, z) changes
+// its redstone `powered` property.
+func (c *Cache) SetRailPowerChangeListener(fn func(x, y, z int, railName string, powered bool)) {
+	if fn == nil {
+		railPowerChangeListeners.Delete(c)
+		return
+	}
+	railPowerChangeListeners.Store(c, fn)
+}
+
+func (c *Cache) notifyRailPowerChanged(x, y, z int, railName string, powered bool) {
+	if v, ok := railPowerChangeListeners.Load(c); ok && v != nil {
+		if fn, ok := v.(func(int, int, int, string, bool)); ok && fn != nil {
+			fn(x, y, z, railName, powered)
+		}
+	}
+}
 
 // SetDispenserFireListener registers an optional callback invoked when a
 // scheduled 4-tick redstone update fires on a triggered dispenser or dropper at
@@ -249,7 +269,8 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
 		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
-		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper":
+		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper",
+		"minecraft:detector_rail", "minecraft:powered_rail", "minecraft:activator_rail":
 		return true
 	}
 	return strings.HasSuffix(name, "_button") ||
@@ -322,7 +343,7 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 		return clampPower(p)
 	case "minecraft:redstone_block":
 		return MaxRedstonePower
-	case "minecraft:lever":
+	case "minecraft:lever", "minecraft:detector_rail":
 		if info.Properties["powered"] == "true" {
 			return MaxRedstonePower
 		}
@@ -474,6 +495,15 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 		return c.jukeboxRedstoneSignalAt(sx, sy, sz, props)
 
 	case "minecraft:lectern":
+		if props["powered"] != "true" {
+			return 0
+		}
+		if !directOnly || (tx == sx && ty == sy-1 && tz == sz) {
+			return MaxRedstonePower
+		}
+		return 0
+
+	case "minecraft:detector_rail":
 		if props["powered"] != "true" {
 			return 0
 		}
@@ -932,7 +962,8 @@ func hasAnalogOutputSignal(state uint16) bool {
 		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper",
 		"minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel",
 		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker",
-		"minecraft:chiseled_bookshelf", "minecraft:decorated_pot", "minecraft:crafter":
+		"minecraft:chiseled_bookshelf", "minecraft:decorated_pot", "minecraft:crafter",
+		"minecraft:detector_rail":
 		return true
 	}
 	return strings.HasSuffix(info.Name, "shulker_box")
@@ -1370,6 +1401,11 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 			case info.Name == "minecraft:hopper":
 				c.evaluateHopperRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
+			case info.Name == "minecraft:powered_rail" || info.Name == "minecraft:activator_rail":
+				if c.isRailAffectedBySeeds(pos, allSeeds) {
+					c.evaluateRailRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+				}
+
 			case info.Name == "minecraft:piston" || info.Name == "minecraft:sticky_piston":
 				pistonChanged := c.evaluatePistonRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 				nextSeeds = append(nextSeeds, pistonChanged...)
@@ -1415,7 +1451,7 @@ func redstoneSupportOf(x, y, z int, state uint16) (BlockPos, bool) {
 	if info.Name == "minecraft:lever" || strings.HasSuffix(info.Name, "_button") {
 		return attachedSupportPos(x, y, z, info.Properties)
 	}
-	if strings.HasSuffix(info.Name, "_pressure_plate") {
+	if strings.HasSuffix(info.Name, "_pressure_plate") || info.Name == "minecraft:detector_rail" {
 		return BlockPos{X: x, Y: y - 1, Z: z}, true
 	}
 	if info.Name == "minecraft:repeater" || info.Name == "minecraft:comparator" {
@@ -1653,7 +1689,8 @@ func canWireConnectHorizontally(neighborState uint16, dirFromWireToNeighbor stri
 		"minecraft:lever", "minecraft:redstone_torch", "minecraft:redstone_wall_torch",
 		"minecraft:comparator", "minecraft:jukebox", "minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:tripwire_hook",
-		"minecraft:lightning_rod", "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
+		"minecraft:lightning_rod", "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
+		"minecraft:detector_rail":
 		return true
 	case "minecraft:repeater":
 		facing := info.Properties["facing"]
@@ -2205,6 +2242,41 @@ func (c *Cache) evaluateHopperRedstone(x, y, z int, state uint16, info stateName
 	}
 }
 
+func (c *Cache) isRailAffectedBySeeds(pos BlockPos, seeds []BlockPos) bool {
+	for _, s := range seeds {
+		dist := absInt(pos.X-s.X) + absInt(pos.Y-s.Y) + absInt(pos.Z-s.Z)
+		if dist <= 1 {
+			return true
+		}
+		if dist == 2 {
+			for _, off := range sixNeighborOffsets {
+				mx, my, mz := pos.X+off[0], pos.Y+off[1], pos.Z+off[2]
+				if absInt(mx-s.X)+absInt(my-s.Y)+absInt(mz-s.Z) == 1 {
+					if my >= MinY && my < MinY+WorldHeight && isConductiveSolidBlock(c.GetBlock(mx, my, mz)) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (c *Cache) evaluateRailRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	powered := c.IsBlockPowered(x, y, z)
+	wantPowered := "false"
+	if powered {
+		wantPowered = "true"
+	}
+	if info.Properties["powered"] != wantPowered {
+		if nextSt, ok := withStateProperty(state, "powered", wantPowered); ok {
+			if c.setBlockRecorded(x, y, z, nextSt, res) {
+				c.notifyRailPowerChanged(x, y, z, info.Name, powered)
+			}
+		}
+	}
+}
+
 // IsHopperEnabledAt reports whether a `minecraft:hopper` at (x, y, z) is
 // enabled (not locked by redstone power).
 func (c *Cache) IsHopperEnabledAt(x, y, z int) bool {
@@ -2221,6 +2293,7 @@ func (c *Cache) IsHopperEnabledAt(x, y, z int) bool {
 	}
 	return info.Properties["enabled"] != "false"
 }
+
 
 
 

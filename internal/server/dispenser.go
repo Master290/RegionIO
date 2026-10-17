@@ -614,7 +614,7 @@ func DispenserItemMaxStackSize(stack world.ItemStack) int32 {
 		"minecraft:tropical_fish_bucket", "minecraft:pufferfish_bucket",
 		"minecraft:axolotl_bucket", "minecraft:tadpole_bucket",
 		"minecraft:potion", "minecraft:splash_potion", "minecraft:lingering_potion",
-		"minecraft:flint_and_steel", "minecraft:shears", "minecraft:saddle",
+		"minecraft:flint_and_steel", "minecraft:shears", "minecraft:brush", "minecraft:saddle",
 		"minecraft:elytra", "minecraft:shield", "minecraft:carved_pumpkin",
 		"minecraft:leather_horse_armor", "minecraft:iron_horse_armor",
 		"minecraft:golden_horse_armor", "minecraft:diamond_horse_armor",
@@ -977,18 +977,32 @@ func decrementDispenserSlotLocked(be *DispenserBlockEntity, slot int) {
 }
 
 func damageDispenserToolSlotLocked(be *DispenserBlockEntity, slot int, maxDurability int32, rng *rand.Rand) (broke bool) {
+	return damageDispenserToolSlotByAmountLocked(be, slot, 1, maxDurability, rng)
+}
+
+func damageDispenserToolSlotByAmountLocked(be *DispenserBlockEntity, slot int, wearAmount, maxDurability int32, rng *rand.Rand) (broke bool) {
 	if be == nil || slot < 0 || slot >= DispenserSlotCount || be.Slots[slot].IsEmpty() {
 		return false
 	}
+	if wearAmount <= 0 {
+		wearAmount = 1
+	}
 	meta := be.SlotMeta[slot]
 	unbreaking := meta.EnchantmentLevel("minecraft:unbreaking")
-	if unbreaking > 0 && rng != nil {
-		// Vanilla tool Unbreaking formula: 1 / (level + 1) chance to consume durability.
-		if rng.Intn(int(unbreaking)+1) != 0 {
-			return false
+	var actualWear int32
+	for i := int32(0); i < wearAmount; i++ {
+		if unbreaking > 0 && rng != nil {
+			// Vanilla tool Unbreaking formula: 1 / (level + 1) chance to consume durability.
+			if rng.Intn(int(unbreaking)+1) != 0 {
+				continue
+			}
 		}
+		actualWear++
 	}
-	meta.Damage++
+	if actualWear == 0 {
+		return false
+	}
+	meta.Damage += actualWear
 	if meta.Damage >= maxDurability {
 		decrementDispenserSlotLocked(be, slot)
 		return true
@@ -1081,13 +1095,14 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 	fx, fy, fz := x+dx, y+dy, z+dz
 
 	var (
-		succeeded   = true
-		soundEvent  = LevelEventSoundDispense
-		emitSmoke   = true
-		consumeOne  = false
-		replaceWith *world.ItemStack
-		replacePot  string
-		damageTool  int32
+		succeeded      = true
+		soundEvent     = LevelEventSoundDispense
+		emitSmoke      = true
+		consumeOne     = false
+		replaceWith    *world.ItemStack
+		replacePot     string
+		damageTool     int32
+		damageToolWear int32 = 1
 	)
 
 	switch {
@@ -1246,6 +1261,17 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			emitSmoke = false
 		}
 
+	// 10b. Brush (Armadillo -> armadillo_scute, 16 durability wear).
+	case itemID == BrushItemID:
+		if s.dispenseBrush(normDim, fx, fy, fz, rng) {
+			damageTool = BrushMaxDurability
+			damageToolWear = ArmadilloBrushWearCost
+		} else {
+			succeeded = false
+			soundEvent = LevelEventSoundFailDispense
+			emitSmoke = false
+		}
+
 	// 11. Glass Bottle (Water source / waterlogged / water cauldron -> water potion; Beehive honey_level=5 -> honey_bottle).
 	case itemID == "minecraft:glass_bottle":
 		if filledBottle, filledPot, ok := s.dispenseGlassBottle(normDim, cache, fx, fy, fz); ok {
@@ -1285,7 +1311,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 		if replaceWith != nil {
 			overflow = consumeWithRemainderLocked(be, slot, *replaceWith, replacePot)
 		} else if damageTool > 0 {
-			damageDispenserToolSlotLocked(be, slot, damageTool, ds.rng)
+			damageDispenserToolSlotByAmountLocked(be, slot, damageToolWear, damageTool, ds.rng)
 		} else if consumeOne {
 			decrementDispenserSlotLocked(be, slot)
 		}
@@ -1400,7 +1426,23 @@ func (s *Server) resolveImmediateDispenserArrowHit(proj *DispenserProjectile, fx
 func (s *Server) dispenseThrownProjectile(dim string, x, y, z int, facing, itemID string, rng *rand.Rand) int32 {
 	px, py, pz := DispenserDispensePosition(x, y, z, facing, true)
 	vx, vy, vz := DispenserProjectileVelocity(facing, DispenserDefaultProjectilePower, DispenserDefaultProjectileUncertainty, rng)
-	entID := s.spawnDispenserProjectileEntity(dim, itemID, px, py, pz, vx, vy, vz)
+	var entID int32
+	if itemID == WindChargeItemID {
+		dx, dy, dz := DispenserFacingVector(facing)
+		dirX, dirY, dirZ := float64(dx)*WindChargeFlightSpeed, float64(dy)*WindChargeFlightSpeed, float64(dz)*WindChargeFlightSpeed
+		if rng != nil {
+			const spreadScale = 0.0172275 * 1.5
+			dirX += rng.NormFloat64() * spreadScale
+			dirY += rng.NormFloat64() * spreadScale
+			dirZ += rng.NormFloat64() * spreadScale
+		}
+		vx, vy, vz = dirX, dirY, dirZ
+		entID, _ = s.SpawnWindCharge(dim, px, py, pz, vx, vy, vz, 0, false)
+		s.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), PlaySoundPacketID,
+			EncodeSoundPacket(SoundWindChargeThrow, SoundSourceBlocks, px, py, pz, 0.5, 0.5, 0))
+	} else {
+		entID = s.spawnDispenserProjectileEntity(dim, itemID, px, py, pz, vx, vy, vz)
+	}
 	proj := &DispenserProjectile{
 		EntityID:  entID,
 		TypeName:  itemID,
@@ -2287,7 +2329,10 @@ func (s *Server) dispenseMinecart(dim string, cache *world.Cache, fx, fy, fz int
 	} else {
 		return false
 	}
-	entID := s.spawnDispenserProjectileEntity(dim, itemID, float64(fx)+0.5, spawnY, float64(fz)+0.5, 0, 0, 0)
+	entID, _ := s.SpawnVehicle(dim, itemID, float64(fx)+0.5, spawnY, float64(fz)+0.5, 0)
+	if entID == 0 {
+		entID = s.spawnDispenserProjectileEntity(dim, itemID, float64(fx)+0.5, spawnY, float64(fz)+0.5, 0, 0, 0)
+	}
 	return entID != 0
 }
 
@@ -2316,7 +2361,10 @@ func (s *Server) dispenseBoat(dim string, cache *world.Cache, x, y, z, fx, fy, f
 	dx, _, dz := DispenserFacingVector(facing)
 	spawnX := float64(x) + 0.5 + float64(dx)*1.125
 	spawnZ := float64(z) + 0.5 + float64(dz)*1.125
-	entID := s.spawnDispenserProjectileEntity(dim, itemID, spawnX, spawnY, spawnZ, 0, 0, 0)
+	entID, _ := s.SpawnVehicle(dim, itemID, spawnX, spawnY, spawnZ, 0)
+	if entID == 0 {
+		entID = s.spawnDispenserProjectileEntity(dim, itemID, spawnX, spawnY, spawnZ, 0, 0, 0)
+	}
 	return entID != 0
 }
 
@@ -2515,6 +2563,10 @@ func (s *Server) dispenseShears(dim string, cache *world.Cache, fx, fy, fz int, 
 				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
 				return true
 			}
+		case MobTypeBogged:
+			if _, sheared := s.ShearBogged(nil, ent.ID, rng); sheared {
+				return true
+			}
 		}
 	}
 
@@ -2531,6 +2583,26 @@ func (s *Server) dispenseShears(dim string, cache *world.Cache, fx, fy, fz int, 
 		}
 	}
 
+	return false
+}
+
+func (s *Server) dispenseBrush(dim string, fx, fy, fz int, rng *rand.Rand) bool {
+	if fy < world.MinY || fy >= world.MinY+world.WorldHeight {
+		return false
+	}
+	for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
+		if canonicalResourceName(ent.TypeName) != MobTypeArmadillo {
+			continue
+		}
+		dummySess := &PlayerSession{
+			gameMode: GameModeCreative,
+			health:   20,
+		}
+		dummySess.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack(BrushItemID, 1))
+		if _, brushed := s.BrushArmadillo(dummySess, ent.ID, rng); brushed {
+			return true
+		}
+	}
 	return false
 }
 

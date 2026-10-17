@@ -5,7 +5,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -172,7 +171,7 @@ func (s *Server) hopperState() *serverHopperState {
 }
 
 // ensureHopperMinecartHookBound automatically registers HopperMinecartTransfer
-// with Agent B's vehicle manager if RegisterHopperMinecartHook is present on *Server.
+// with Agent B's vehicle manager.
 func (s *Server) ensureHopperMinecartHookBound(hs *serverHopperState) {
 	if s == nil || hs == nil {
 		return
@@ -185,16 +184,7 @@ func (s *Server) ensureHopperMinecartHookBound(hs *serverHopperState) {
 	hs.hookBound = true
 	hs.mu.Unlock()
 
-	rv := reflect.ValueOf(s)
-	m := rv.MethodByName("RegisterHopperMinecartHook")
-	if !m.IsValid() || m.Type().NumIn() != 1 {
-		return
-	}
-	hookType := m.Type().In(0)
-	fnVal := reflect.ValueOf(HopperMinecartTransfer)
-	if fnVal.Type().ConvertibleTo(hookType) {
-		m.Call([]reflect.Value{fnVal.Convert(hookType)})
-	}
+	s.RegisterHopperMinecartHook(HopperMinecartTransfer)
 }
 
 func normalizeHopperDim(dim string) string {
@@ -2249,33 +2239,34 @@ type hopperMinecartEnabledChecker interface {
 }
 
 func (s *Server) getVehicleInventorySlotCount(entityID int32) int {
-	if va, ok := any(s).(hopperVehicleInventoryAccess); ok {
-		if cnt := va.VehicleContainerSlotCount(entityID); cnt > 0 {
+	if s == nil || entityID <= 0 {
+		return 0
+	}
+	if cnt := s.VehicleContainerSlotCount(entityID); cnt > 0 {
+		return cnt
+	}
+	if s.ensureVehicleState(entityID) != nil {
+		if cnt := s.VehicleContainerSlotCount(entityID); cnt > 0 {
 			return cnt
 		}
 	}
-	if s != nil && s.entities != nil {
-		if ent := s.entities.Get(entityID); ent != nil {
-			switch canonicalResourceName(ent.TypeName) {
-			case "minecraft:hopper_minecart":
-				return HopperBlockSlotCount
-			case "minecraft:chest_minecart":
-				return ChestSlotCount
-			default:
-				if strings.HasSuffix(canonicalResourceName(ent.TypeName), "_chest_boat") ||
-					canonicalResourceName(ent.TypeName) == "minecraft:bamboo_chest_raft" {
-					return ChestSlotCount
-				}
-			}
-		}
+	hs := s.hopperState()
+	hs.mu.Lock()
+	_, hasFallback := hs.minecartFallback[entityID]
+	hs.mu.Unlock()
+	if hasFallback {
+		return HopperBlockSlotCount
 	}
 	return 0
 }
 
 func (s *Server) getVehicleInventorySlot(entityID int32, slot int) world.ItemStack {
-	if va, ok := any(s).(hopperVehicleInventoryAccess); ok {
-		if va.VehicleContainerSlotCount(entityID) > 0 {
-			return va.VehicleContainerSlot(entityID, slot)
+	if s == nil || entityID <= 0 {
+		return world.ItemStack{}
+	}
+	if s.VehicleContainerSlotCount(entityID) > 0 || s.ensureVehicleState(entityID) != nil {
+		if s.VehicleContainerSlotCount(entityID) > 0 {
+			return s.VehicleContainerSlot(entityID, slot)
 		}
 	}
 	if slot < 0 || slot >= HopperBlockSlotCount {
@@ -2291,10 +2282,11 @@ func (s *Server) getVehicleInventorySlot(entityID int32, slot int) world.ItemSta
 }
 
 func (s *Server) setVehicleInventorySlot(entityID int32, slot int, stack world.ItemStack) bool {
-	if va, ok := any(s).(hopperVehicleInventoryAccess); ok {
-		if va.VehicleContainerSlotCount(entityID) > 0 {
-			return va.SetVehicleContainerSlot(entityID, slot, stack)
-		}
+	if s == nil || entityID <= 0 {
+		return false
+	}
+	if s.SetVehicleContainerSlot(entityID, slot, stack) {
+		return true
 	}
 	if slot < 0 || slot >= HopperBlockSlotCount {
 		return false
@@ -2316,10 +2308,14 @@ func (s *Server) setVehicleInventorySlot(entityID int32, slot int, stack world.I
 }
 
 func (s *Server) isHopperMinecartEntityEnabled(entityID int32) bool {
-	if ec, ok := any(s).(hopperMinecartEnabledChecker); ok {
-		if va, ok2 := any(s).(hopperVehicleInventoryAccess); ok2 && va.VehicleContainerSlotCount(entityID) > 0 {
-			return ec.IsHopperMinecartEnabled(entityID)
-		}
+	if s == nil || entityID <= 0 {
+		return false
+	}
+	if _, ok := s.VehicleStateByID(entityID); ok {
+		return s.IsHopperMinecartEnabled(entityID)
+	}
+	if s.ensureVehicleState(entityID) != nil {
+		return s.IsHopperMinecartEnabled(entityID)
 	}
 	hs := s.hopperState()
 	hs.mu.Lock()
@@ -2331,31 +2327,290 @@ func (s *Server) isHopperMinecartEntityEnabled(entityID int32) bool {
 	return true
 }
 
-func (s *Server) findVehicleContainersInBlock(dim string, bx, by, bz int) []int32 {
+// HasMinecartOnRail reports whether any minecart entity is currently on the rail
+// at (dimension, x, y, z) (or at y+1 above a sloped rail).
+func (s *Server) HasMinecartOnRail(dimension string, x, y, z int) bool {
+	if s == nil {
+		return false
+	}
+	return s.hasMinecartOnRailAt(dimension, x, y, z)
+}
+
+// DetectorRailComparatorSignal returns the redstone comparator signal (0..15)
+// for a `minecraft:detector_rail` at (dimension, x, y, z):
+//   - 0 if the block is not a powered detector_rail or has no minecart on it.
+//   - Container fullness signal (0..15) for chest_minecart / hopper_minecart.
+//   - 15 for a rideable minecart with a passenger.
+func (s *Server) DetectorRailComparatorSignal(dimension string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	normDim := normalizeHopperDim(dimension)
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		st := cache.GetBlock(x, y, z)
+		if st != world.StateAir && world.BlockName(st) != "minecraft:detector_rail" {
+			return 0
+		}
+	}
+	return s.DetectorRailComparatorOutput(normDim, x, y, z)
+}
+
+// NudgeMinecartsOnPoweredRail launches or boosts any minecart resting on a
+// newly powered `minecraft:powered_rail` at (dimension, x, y, z) away from an
+// adjacent solid block along the rail's axis.
+func (s *Server) NudgeMinecartsOnPoweredRail(dimension string, x, y, z int) {
+	if s == nil || s.entities == nil {
+		return
+	}
+	normDim := normalizeHopperDim(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	railState := cache.GetBlock(x, y, z)
+	if world.BlockName(railState) != "minecraft:powered_rail" || !railPoweredProperty(railState) {
+		return
+	}
+	shape := railShapeProperty(railState)
+
+	ids := s.FindVehiclesInBox(normDim, float64(x)-0.49, float64(y)-0.49, float64(z)-0.49, float64(x+1)+0.49, float64(y+2)+0.49, float64(z+1)+0.49)
+	for _, id := range ids {
+		ent := s.entities.Get(id)
+		if ent == nil || !IsMinecartEntity(ent.TypeName) {
+			continue
+		}
+		vx := float64(ent.VelocityX) / 8000.0
+		vz := float64(ent.VelocityZ) / 8000.0
+		speed := math.Hypot(vx, vz)
+		if speed > 0.01 {
+			vx += (vx / speed) * MinecartPoweredRailBoost
+			vz += (vz / speed) * MinecartPoweredRailBoost
+		} else {
+			switch shape {
+			case "east_west", "ascending_east", "ascending_west":
+				if !isPassableBlock(cache.GetBlock(x-1, y, z)) {
+					vx = MinecartPoweredRailLaunch
+				} else if !isPassableBlock(cache.GetBlock(x+1, y, z)) {
+					vx = -MinecartPoweredRailLaunch
+				}
+			case "north_south", "ascending_north", "ascending_south":
+				if !isPassableBlock(cache.GetBlock(x, y, z-1)) {
+					vz = MinecartPoweredRailLaunch
+				} else if !isPassableBlock(cache.GetBlock(x, y, z+1)) {
+					vz = -MinecartPoweredRailLaunch
+				}
+			}
+		}
+		if vx != 0 || vz != 0 {
+			s.entities.Update(id, func(e *world.Entity) {
+				e.VelocityX = clampVelocityShort(vx)
+				e.VelocityZ = clampVelocityShort(vz)
+			})
+		}
+	}
+}
+
+// OnActivatorRailPowerChange evaluates activator rail effects (dismounting
+// passengers on rideable minecarts, priming TNT minecarts, or toggling
+// hopper_minecart enabled state) for all minecarts on the activator rail at
+// (dimension, x, y, z) when its redstone powered state changes.
+func (s *Server) OnActivatorRailPowerChange(dimension string, x, y, z int, powered bool) {
+	if s == nil || s.entities == nil {
+		return
+	}
+	normDim := normalizeHopperDim(dimension)
+	ids := s.FindVehiclesInBox(normDim, float64(x)-0.49, float64(y)-0.49, float64(z)-0.49, float64(x+1)+0.49, float64(y+2)+0.49, float64(z+1)+0.49)
+	for _, id := range ids {
+		ent := s.entities.Get(id)
+		if ent == nil || !IsMinecartEntity(ent.TypeName) {
+			continue
+		}
+		if canonicalResourceName(ent.TypeName) == EntityTypeHopperMinecart {
+			s.SetHopperMinecartEnabled(id, !powered)
+		}
+		s.evaluateMinecartRailTriggers(id)
+	}
+}
+
+// FindVehiclesInBox returns the entity IDs of all vehicle entities (minecarts
+// and boats/rafts) in dimension whose position lies within
+// [minX, maxX] x [minY, maxY] x [minZ, maxZ].
+func (s *Server) FindVehiclesInBox(dimension string, minX, minY, minZ, maxX, maxY, maxZ float64) []int32 {
 	if s == nil || s.entities == nil {
 		return nil
 	}
-	normDim := normalizeHopperDim(dim)
-	cx, cz := int32(bx>>4), int32(bz>>4)
-	nearby := s.entities.AppendInChunkRange(nil, cx, cz, 1)
+	normDim := normalizeHopperDim(dimension)
+	minCX := int32(int(math.Floor(minX)) >> 4)
+	maxCX := int32(int(math.Floor(maxX)) >> 4)
+	minCZ := int32(int(math.Floor(minZ)) >> 4)
+	maxCZ := int32(int(math.Floor(maxZ)) >> 4)
+	centerCX := (minCX + maxCX) / 2
+	centerCZ := (minCZ + maxCZ) / 2
+	rad := maxCX - minCX + 1
+	if rz := maxCZ - minCZ + 1; rz > rad {
+		rad = rz
+	}
+	if rad < 1 {
+		rad = 1
+	}
+
+	nearby := s.entities.AppendInChunkRange(nil, centerCX, centerCZ, rad)
 	if len(nearby) == 0 {
 		return nil
 	}
-	minX, maxX := float64(bx)-0.49, float64(bx+1)+0.49
-	minY, maxY := float64(by)-0.49, float64(by+1)+0.49
-	minZ, maxZ := float64(bz)-0.49, float64(bz+1)+0.49
-
 	var ids []int32
 	for i := range nearby {
 		ent := &nearby[i]
 		if ent.EffectiveDimension() != normDim {
 			continue
 		}
+		if !IsVehicleEntity(ent.TypeName) && s.getVehicleInventorySlotCount(ent.ID) <= 0 {
+			continue
+		}
 		if ent.X < minX || ent.X > maxX || ent.Y < minY || ent.Y > maxY || ent.Z < minZ || ent.Z > maxZ {
 			continue
 		}
-		if s.getVehicleInventorySlotCount(ent.ID) > 0 {
-			ids = append(ids, ent.ID)
+		ids = append(ids, ent.ID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// HopperInsertIntoVehicle inserts items from stack into the container vehicle
+// identified by vehicleID (chest_minecart, hopper_minecart, or *_chest_boat),
+// returning the uninserted remainder stack and whether any item was inserted.
+func (s *Server) HopperInsertIntoVehicle(vehicleID int32, stack world.ItemStack) (remaining world.ItemStack, changed bool) {
+	if s == nil || vehicleID <= 0 || stack.IsEmpty() || stack.Count <= 0 {
+		return stack, false
+	}
+	slotCount := s.getVehicleInventorySlotCount(vehicleID)
+	if slotCount <= 0 {
+		return stack, false
+	}
+	maxStack := DispenserItemMaxStackSize(stack)
+	itemID := stack.ResolvedItemID()
+	remCount := stack.Count
+
+	// Pass 1: stack onto existing matching slots.
+	if maxStack > 1 {
+		for i := 0; i < slotCount && remCount > 0; i++ {
+			cur := s.getVehicleInventorySlot(vehicleID, i)
+			if cur.IsEmpty() || cur.ResolvedItemID() != itemID || cur.Count >= maxStack {
+				continue
+			}
+			space := maxStack - cur.Count
+			take := remCount
+			if take > space {
+				take = space
+			}
+			if s.setVehicleInventorySlot(vehicleID, i, world.NewItemStack(itemID, cur.Count+take)) {
+				remCount -= take
+				changed = true
+			}
+		}
+	}
+
+	// Pass 2: place into empty slots.
+	for i := 0; i < slotCount && remCount > 0; i++ {
+		cur := s.getVehicleInventorySlot(vehicleID, i)
+		if !cur.IsEmpty() && cur.Count > 0 {
+			continue
+		}
+		take := remCount
+		if take > maxStack {
+			take = maxStack
+		}
+		placed := world.NewItemStack(itemID, take)
+		if placed.IsEmpty() {
+			placed = world.NewNamedItemStack(stack.ResolvedID(), take)
+		}
+		if s.setVehicleInventorySlot(vehicleID, i, placed) {
+			remCount -= take
+			changed = true
+		}
+	}
+
+	if changed {
+		_ = s.syncVehicleContainerViewers(nil, vehicleID)
+	}
+	if remCount <= 0 {
+		return world.ItemStack{}, changed
+	}
+	out := world.NewItemStack(itemID, remCount)
+	if out.IsEmpty() {
+		out = world.NewNamedItemStack(stack.ResolvedID(), remCount)
+	}
+	return out, changed
+}
+
+// HopperExtractFromVehicle extracts 1 item from the first non-empty slot of
+// the container vehicle identified by vehicleID.
+func (s *Server) HopperExtractFromVehicle(vehicleID int32) (extracted world.ItemStack, ok bool) {
+	if s == nil || vehicleID <= 0 {
+		return world.ItemStack{}, false
+	}
+	slotCount := s.getVehicleInventorySlotCount(vehicleID)
+	for i := 0; i < slotCount; i++ {
+		cur := s.getVehicleInventorySlot(vehicleID, i)
+		if cur.IsEmpty() || cur.Count <= 0 {
+			continue
+		}
+		single := world.NewItemStack(cur.ResolvedItemID(), 1)
+		if single.IsEmpty() {
+			single = world.NewNamedItemStack(cur.ResolvedID(), 1)
+		}
+		if cur.Count <= 1 {
+			s.setVehicleInventorySlot(vehicleID, i, world.ItemStack{})
+		} else {
+			s.setVehicleInventorySlot(vehicleID, i, world.NewItemStack(cur.ResolvedItemID(), cur.Count-1))
+		}
+		_ = s.syncVehicleContainerViewers(nil, vehicleID)
+		return single, true
+	}
+	return world.ItemStack{}, false
+}
+
+// ActiveHopperMinecarts returns the entity IDs of all active `minecraft:hopper_minecart`
+// entities tracked by the server.
+func (s *Server) ActiveHopperMinecarts() []int32 {
+	if s == nil {
+		return nil
+	}
+	seen := make(map[int32]bool)
+	var ids []int32
+	mgr := s.vehicleManager()
+	mgr.mu.Lock()
+	for id, st := range mgr.vehicles {
+		if st != nil && canonicalResourceName(st.TypeName) == EntityTypeHopperMinecart {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	mgr.mu.Unlock()
+
+	hs := s.hopperState()
+	hs.mu.Lock()
+	for id := range hs.minecartFallback {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	hs.mu.Unlock()
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func (s *Server) findVehicleContainersInBlock(dim string, bx, by, bz int) []int32 {
+	candidates := s.FindVehiclesInBox(dim,
+		float64(bx)-0.49, float64(by)-0.49, float64(bz)-0.49,
+		float64(bx+1)+0.49, float64(by+1)+0.49, float64(bz+1)+0.49,
+	)
+	var ids []int32
+	for _, id := range candidates {
+		if s.getVehicleInventorySlotCount(id) > 0 {
+			ids = append(ids, id)
 		}
 	}
 	return ids
@@ -2363,30 +2618,9 @@ func (s *Server) findVehicleContainersInBlock(dim string, bx, by, bz int) []int3
 
 func (s *Server) tryInsertIntoVehicleContainerAt(dim string, bx, by, bz int, single world.ItemStack) bool {
 	ids := s.findVehicleContainersInBlock(dim, bx, by, bz)
-	if len(ids) == 0 {
-		return false
-	}
-	maxStack := DispenserItemMaxStackSize(single)
-	itemID := single.ResolvedItemID()
 	for _, vehID := range ids {
-		slotCount := s.getVehicleInventorySlotCount(vehID)
-		if maxStack > 1 {
-			for i := 0; i < slotCount; i++ {
-				cur := s.getVehicleInventorySlot(vehID, i)
-				if !cur.IsEmpty() && cur.ResolvedItemID() == itemID && cur.Count < maxStack {
-					if s.setVehicleInventorySlot(vehID, i, world.NewItemStack(itemID, cur.Count+1)) {
-						return true
-					}
-				}
-			}
-		}
-		for i := 0; i < slotCount; i++ {
-			cur := s.getVehicleInventorySlot(vehID, i)
-			if cur.IsEmpty() || cur.Count <= 0 {
-				if s.setVehicleInventorySlot(vehID, i, single) {
-					return true
-				}
-			}
+		if _, changed := s.HopperInsertIntoVehicle(vehID, single); changed {
+			return true
 		}
 	}
 	return false
@@ -2395,6 +2629,12 @@ func (s *Server) tryInsertIntoVehicleContainerAt(dim string, bx, by, bz int, sin
 func (s *Server) tryExtractFromVehicleContainerAt(dim string, bx, by, bz int, canAccept func(world.ItemStack, ItemMeta, string) bool) (world.ItemStack, bool) {
 	ids := s.findVehicleContainersInBlock(dim, bx, by, bz)
 	for _, vehID := range ids {
+		if canAccept == nil {
+			if st, ok := s.HopperExtractFromVehicle(vehID); ok {
+				return st, true
+			}
+			continue
+		}
 		slotCount := s.getVehicleInventorySlotCount(vehID)
 		for i := 0; i < slotCount; i++ {
 			cur := s.getVehicleInventorySlot(vehID, i)
@@ -2402,7 +2642,7 @@ func (s *Server) tryExtractFromVehicleContainerAt(dim string, bx, by, bz int, ca
 				continue
 			}
 			single := world.NewItemStack(cur.ResolvedItemID(), 1)
-			if canAccept != nil && !canAccept(single, ItemMeta{}, "") {
+			if !canAccept(single, ItemMeta{}, "") {
 				continue
 			}
 			if cur.Count <= 1 {
@@ -2410,6 +2650,7 @@ func (s *Server) tryExtractFromVehicleContainerAt(dim string, bx, by, bz int, ca
 			} else {
 				s.setVehicleInventorySlot(vehID, i, world.NewItemStack(cur.ResolvedItemID(), cur.Count-1))
 			}
+			_ = s.syncVehicleContainerViewers(nil, vehID)
 			return single, true
 		}
 	}
@@ -2452,6 +2693,7 @@ func (s *Server) TickHopperMinecartTransfer(entityID int32, dim string, x, y, z 
 		for i := 0; i < HopperBlockSlotCount; i++ {
 			s.setVehicleInventorySlot(entityID, i, slots[i])
 		}
+		_ = s.syncVehicleContainerViewers(nil, entityID)
 	}
 	return transferred
 }

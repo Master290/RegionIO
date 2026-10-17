@@ -575,6 +575,8 @@ func (s *Server) InsertJukeboxDisc(dimension string, x, y, z int, disc world.Ite
 			EncodeLevelEventPacket(LevelEventPlayJukeboxSong, x, y, z, songIdx, false))
 	}
 
+	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, true)
+
 	_ = s.SaveJukeboxes()
 	return true, res
 }
@@ -620,6 +622,8 @@ func (s *Server) EjectJukeboxDisc(dimension string, x, y, z int) (world.ItemStac
 	cz := int32(z >> 4)
 	s.BroadcastChunk(cx, cz, PlayLevelEventCB,
 		EncodeLevelEventPacket(LevelEventStopJukeboxSong, x, y, z, 0, false))
+
+	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, false)
 
 	// Spawn the ejected disc item entity above the jukebox (matching JukeboxBlockEntity.popOutTheItem).
 	_, _ = s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+1.01, float64(z)+0.5, disc)
@@ -771,6 +775,8 @@ func (s *Server) TickJukeboxes() {
 			s.BroadcastChunk(cx, cz, PlayLevelEventCB,
 				EncodeLevelEventPacket(LevelEventStopJukeboxSong, f.key.x, f.key.y, f.key.z, 0, false))
 
+			s.NotifyJukeboxPlayingForAllays(f.key.dim, f.key.x, f.key.y, f.key.z, false)
+
 			if cache := s.BindNoteBlockAndJukeboxRedstone(f.key.dim); cache != nil {
 				// Re-trigger redstone propagation around the jukebox now that its
 				// direct redstone signal dropped from 15 to 0, while keeping
@@ -844,6 +850,8 @@ func (s *Server) HopperTryExtractFromJukebox(dimension string, x, y, z int) (wor
 	cz := int32(z >> 4)
 	s.BroadcastChunk(cx, cz, PlayLevelEventCB,
 		EncodeLevelEventPacket(LevelEventStopJukeboxSong, x, y, z, 0, false))
+
+	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, false)
 
 	_ = s.SaveJukeboxes()
 	return disc, true, res
