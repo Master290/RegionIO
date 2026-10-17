@@ -1,6 +1,7 @@
 package world
 
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
@@ -459,6 +460,107 @@ func jigsawCanAttach(parent, child rotatedJigsawInfo) bool {
 	return parent.Target == child.Name
 }
 
+type rawPoolAliasBinding struct {
+	Type    string `json:"type"`
+	Alias   string `json:"alias"`
+	Target  string `json:"target"`
+	Targets []struct {
+		Data   string `json:"data"`
+		Weight int    `json:"weight"`
+	} `json:"targets"`
+	Groups []struct {
+		Data   []rawPoolAliasBinding `json:"data"`
+		Weight int                   `json:"weight"`
+	} `json:"groups"`
+}
+
+func applyPoolAliasBinding(b rawPoolAliasBinding, rng worldgen.RandomSource, out map[string]string) {
+	switch normalizeResourceID(b.Type) {
+	case "minecraft:direct":
+		if b.Alias != "" && b.Target != "" {
+			out[normalizeResourceID(b.Alias)] = normalizeResourceID(b.Target)
+		}
+	case "minecraft:random":
+		if b.Alias == "" || len(b.Targets) == 0 {
+			return
+		}
+		total := 0
+		for _, t := range b.Targets {
+			if t.Weight > 0 {
+				total += t.Weight
+			}
+		}
+		if total <= 0 {
+			return
+		}
+		pick := int(rng.NextIntN(int32(total)))
+		for _, t := range b.Targets {
+			if t.Weight <= 0 {
+				continue
+			}
+			if pick < t.Weight {
+				out[normalizeResourceID(b.Alias)] = normalizeResourceID(t.Data)
+				return
+			}
+			pick -= t.Weight
+		}
+	case "minecraft:random_group":
+		if len(b.Groups) == 0 {
+			return
+		}
+		total := 0
+		for _, g := range b.Groups {
+			if g.Weight > 0 {
+				total += g.Weight
+			}
+		}
+		if total <= 0 {
+			return
+		}
+		pick := int(rng.NextIntN(int32(total)))
+		for _, g := range b.Groups {
+			if g.Weight <= 0 {
+				continue
+			}
+			if pick < g.Weight {
+				for _, sub := range g.Data {
+					applyPoolAliasBinding(sub, rng, out)
+				}
+				return
+			}
+			pick -= g.Weight
+		}
+	}
+}
+
+// resolvePoolAliases ports PoolAliasLookup.create(List<PoolAliasBinding>, BlockPos, long).
+func resolvePoolAliases(raw json.RawMessage, startPos [3]int, seed int64) map[string]string {
+	if len(raw) == 0 {
+		return nil
+	}
+	var bindings []rawPoolAliasBinding
+	if err := json.Unmarshal(raw, &bindings); err != nil || len(bindings) == 0 {
+		return nil
+	}
+	factorySeed := worldgen.NewLegacy(seed).NextLong()
+	aliasRng := worldgen.NewLegacy(worldgen.MthGetSeed(startPos[0], startPos[1], startPos[2]) ^ factorySeed)
+	out := make(map[string]string, len(bindings)*2)
+	for _, b := range bindings {
+		applyPoolAliasBinding(b, aliasRng, out)
+	}
+	return out
+}
+
+func lookupPoolAlias(aliases map[string]string, pool string) string {
+	norm := normalizeResourceID(pool)
+	if len(aliases) > 0 {
+		if target, ok := aliases[norm]; ok {
+			return target
+		}
+	}
+	return norm
+}
+
 // BuildJigsawStart ports JigsawStructure.findGenerationPoint and JigsawPlacement.addPieces.
 // Returns (nil, nil) if the start pool is empty, dimension padding fails, or biome check fails.
 func BuildJigsawStart(
@@ -487,11 +589,12 @@ func BuildJigsawStart(
 
 	startY := def.SampleStartHeight(random)
 	startPos := [3]int{int(chunkX) * 16, startY, int(chunkZ) * 16}
+	poolAliases := resolvePoolAliases(def.PoolAliases, startPos, seed)
 
 	// RNG draw 1: Rotation.getRandom(random)
 	rotation := int(random.NextIntN(4))
 
-	startPool := reg.GetPool(def.StartPool)
+	startPool := reg.GetPool(lookupPoolAlias(poolAliases, def.StartPool))
 	if startPool == nil || len(startPool.Expanded) == 0 {
 		return nil, nil
 	}
@@ -621,7 +724,7 @@ func BuildJigsawStart(
 				jigsawLocalY := jigsawPos[1] - parentMinY
 				cachedSurfaceY := -1 << 30
 
-				pool := reg.GetPool(parentJigsaw.Pool)
+				pool := reg.GetPool(lookupPoolAlias(poolAliases, parentJigsaw.Pool))
 				if pool == nil || (len(pool.Expanded) == 0 && pool.Name != "minecraft:empty") {
 					continue
 				}
@@ -677,7 +780,7 @@ func BuildJigsawStart(
 									relNext[2] < zeroBB.minZ || relNext[2] > zeroBB.maxZ {
 									continue
 								}
-								cp := reg.GetPool(cj.Pool)
+								cp := reg.GetPool(lookupPoolAlias(poolAliases, cj.Pool))
 								var cfb *worldgen.TemplatePoolDef
 								if cp != nil {
 									cfb = reg.GetPool(cp.Fallback)
@@ -1173,7 +1276,16 @@ func placeJigsawElementInChunk(
 		isLegacy := elem.ElementType == "minecraft:legacy_single_pool_element"
 		terrainMatching := elem.Projection == "terrain_matching"
 		procs := reg.ResolveProcessors(elem)
-		cappedCounts := make([]int, len(procs))
+
+		type processedBlock struct {
+			orig          worldgen.TemplateBlockInfo
+			worldPos      [3]int
+			curState      uint16
+			curName       string
+			ruleLootTable string
+			ruleLootSeed  int64
+		}
+		survivors := make([]processedBlock, 0, len(pal.blocks))
 
 		for _, orig := range pal.blocks {
 			rel := worldgen.TransformBlockPos(orig.Pos, "none", rotation, [3]int{0, 0, 0})
@@ -1199,11 +1311,11 @@ func placeJigsawElementInChunk(
 				curName = fName
 			}
 
-			// 3. Configured processors (RuleProcessor, CappedProcessor, BlockRotProcessor, ProtectedBlocksProcessor).
+			// 3. Configured processBlock processors (RuleProcessor, BlockRotProcessor, ProtectedBlocksProcessor).
 			discarded := false
 			var ruleLootTable string
 			var ruleLootSeed int64
-			for pIdx, proc := range procs {
+			for _, proc := range procs {
 				switch proc.ProcessorType {
 				case "minecraft:rule":
 					ruleRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
@@ -1227,32 +1339,6 @@ func placeJigsawElementInChunk(
 							ruleLootSeed = ruleRng.NextLong()
 						}
 						break
-					}
-				case "minecraft:capped":
-					if proc.Delegate != nil && proc.Delegate.ProcessorType == "minecraft:rule" && cappedCounts[pIdx] < proc.Limit {
-						ruleRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
-						existing := region.getBlock(worldPos[0], worldPos[1], worldPos[2])
-						for _, rule := range proc.Delegate.Rules {
-							if !testRulePredicate(rule.InputPredicate, curState, ruleRng, fs) {
-								continue
-							}
-							if !testRulePredicate(rule.LocationPredicate, existing, ruleRng, fs) {
-								continue
-							}
-							if !testPosPredicate(rule.PositionPredicate, orig.Pos, worldPos, [3]int{0, 0, 0}, ruleRng) {
-								continue
-							}
-							if outID, ok := nameToStateID(rule.OutputState.Name, rule.OutputState.Properties); ok {
-								curState = outID
-								curName = rule.OutputState.Name
-								cappedCounts[pIdx]++
-							}
-							if rule.BlockEntityModifier.Type == "minecraft:append_loot" && rule.BlockEntityModifier.LootTable != "" {
-								ruleLootTable = rule.BlockEntityModifier.LootTable
-								ruleLootSeed = ruleRng.NextLong()
-							}
-							break
-						}
 					}
 				case "minecraft:block_rot":
 					if proc.Integrity < 1.0 {
@@ -1290,6 +1376,86 @@ func placeJigsawElementInChunk(
 			if isLegacy && (curName == "minecraft:structure_block" || curName == "minecraft:air") {
 				continue
 			}
+
+			survivors = append(survivors, processedBlock{
+				orig:          orig,
+				worldPos:      worldPos,
+				curState:      curState,
+				curName:       curName,
+				ruleLootTable: ruleLootTable,
+				ruleLootSeed:  ruleLootSeed,
+			})
+		}
+
+		// 6. CappedProcessor.finalizeProcessing runs on the survivor list after processBlock.
+		for _, proc := range procs {
+			if proc.ProcessorType != "minecraft:capped" || proc.Delegate == nil || proc.Delegate.ProcessorType != "minecraft:rule" {
+				continue
+			}
+			if proc.Limit <= 0 || len(survivors) == 0 {
+				continue
+			}
+			factorySeed := worldgen.NewLegacy(region.biomeWorldSeed).NextLong()
+			shuffle := worldgen.NewLegacy(worldgen.MthGetSeed(pos[0], pos[1], pos[2]) ^ factorySeed)
+			limit := min(proc.Limit, len(survivors))
+			if limit < 1 {
+				continue
+			}
+			order := make([]int, len(survivors))
+			for i := range order {
+				order[i] = i
+			}
+			for i := len(order); i > 1; i-- {
+				j := int(shuffle.NextIntN(int32(i)))
+				order[i-1], order[j] = order[j], order[i-1]
+			}
+			converted := 0
+			for _, idx := range order {
+				if converted >= limit {
+					break
+				}
+				sb := &survivors[idx]
+				ruleRng := worldgen.NewLegacy(worldgen.MthGetSeed(sb.worldPos[0], sb.worldPos[1], sb.worldPos[2]))
+				existing := region.getBlock(sb.worldPos[0], sb.worldPos[1], sb.worldPos[2])
+				for _, rule := range proc.Delegate.Rules {
+					if !testRulePredicate(rule.InputPredicate, sb.curState, ruleRng, fs) {
+						continue
+					}
+					if !testRulePredicate(rule.LocationPredicate, existing, ruleRng, fs) {
+						continue
+					}
+					if !testPosPredicate(rule.PositionPredicate, sb.orig.Pos, sb.worldPos, [3]int{0, 0, 0}, ruleRng) {
+						continue
+					}
+					changed := false
+					if outID, ok := nameToStateID(rule.OutputState.Name, rule.OutputState.Properties); ok {
+						if outID != sb.curState {
+							changed = true
+						}
+						sb.curState = outID
+						sb.curName = rule.OutputState.Name
+					}
+					if rule.BlockEntityModifier.Type == "minecraft:append_loot" && rule.BlockEntityModifier.LootTable != "" {
+						sb.ruleLootTable = rule.BlockEntityModifier.LootTable
+						sb.ruleLootSeed = ruleRng.NextLong()
+						changed = true
+					}
+					if changed {
+						converted++
+					}
+					break
+				}
+			}
+		}
+
+		for _, sb := range survivors {
+			orig := sb.orig
+			worldPos := sb.worldPos
+			curState := sb.curState
+			curName := sb.curName
+			ruleLootTable := sb.ruleLootTable
+			ruleLootSeed := sb.ruleLootSeed
+
 			if curName == "minecraft:structure_void" {
 				continue
 			}
@@ -1304,8 +1470,11 @@ func placeJigsawElementInChunk(
 			stateToPlace := rotateTemplateState(curState, rotation)
 
 			// RandomizableContainer LootTableSeed draw on chunk's decoration random.
+			// In StructureTemplate.placeInWorld, blockInfo.nbt is only applied when
+			// the placed block at worldPos still creates a matching BlockEntity.
+			keepTemplateNBT := orig.NBT != nil && orig.BlockName != "minecraft:jigsaw" && curName == orig.BlockName
 			var containerLootSeed int64
-			if orig.IsRandomizableContainer {
+			if keepTemplateNBT && orig.IsRandomizableContainer {
 				containerLootSeed = random.NextLong()
 			}
 
@@ -1328,18 +1497,28 @@ func placeJigsawElementInChunk(
 			region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], stateToPlace)
 
 			if ruleLootTable != "" {
+				beID := "minecraft:brushable_block"
+				if defBE, ok := defaultBlockEntityForBlock(curName, worldPos[0], worldPos[1], worldPos[2]); ok {
+					beID = defBE.ID
+				}
 				region.addStructureBlockEntity(StructureBlockEntity{
-					ID:            "minecraft:brushable_block",
+					ID:            beID,
 					X:             worldPos[0],
 					Y:             worldPos[1],
 					Z:             worldPos[2],
 					LootTable:     ruleLootTable,
 					LootTableSeed: ruleLootSeed,
 				})
-			} else if orig.NBT != nil {
+			} else if keepTemplateNBT {
 				if be, ok := extractTemplateBlockEntity(worldPos[0], worldPos[1], worldPos[2], curName, orig.NBT, containerLootSeed); ok {
 					region.addStructureBlockEntity(be)
+				} else {
+					region.removeStructureBlockEntity(worldPos[0], worldPos[1], worldPos[2])
 				}
+			} else if be, ok := defaultBlockEntityForBlock(curName, worldPos[0], worldPos[1], worldPos[2]); ok {
+				region.addStructureBlockEntity(be)
+			} else {
+				region.removeStructureBlockEntity(worldPos[0], worldPos[1], worldPos[2])
 			}
 		}
 
@@ -1380,6 +1559,7 @@ func PlaceJigsawStartsForChunk(region *decorationRegion, starts []*JigsawStart, 
 	if len(starts) == 0 {
 		return
 	}
+	region.bindSeed(seed)
 	stateByIDOnce.Do(buildStateTable)
 	reg, err := worldgen.LoadJigsawDataRegistry()
 	if err != nil {
@@ -1498,3 +1678,175 @@ func BeardifierForJigsawStarts(starts []*JigsawStart, chunkX, chunkZ int32, x, y
 	}
 	return total
 }
+
+type beardifierRigid struct {
+	box              msBox
+	groundLevelDelta int
+	adaptation       string
+}
+
+type chunkBeardifier struct {
+	affectedBox msBox
+	rigids      []beardifierRigid
+	junctions   []JigsawJunction
+}
+
+func buildChunkBeardifier(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *chunkBeardifier {
+	if od == nil {
+		return nil
+	}
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil || sets == nil {
+		return nil
+	}
+	chunkMinX := int(cx) * 16
+	chunkMinZ := int(cz) * 16
+	closeBox := msBox{
+		minX: chunkMinX - 12,
+		minY: -1 << 20,
+		minZ: chunkMinZ - 12,
+		maxX: chunkMinX + 15 + 12,
+		maxY: 1 << 20,
+		maxZ: chunkMinZ + 15 + 12,
+	}
+
+	var rigids []beardifierRigid
+	var junctions []JigsawJunction
+	var affected msBox
+	hasAffected := false
+	includeBox := func(b msBox) {
+		if !hasAffected {
+			affected = b
+			hasAffected = true
+		} else {
+			affected = msEncapsulate(affected, b)
+		}
+	}
+
+	for _, jSet := range []struct {
+		setID  string
+		radius int32
+	}{
+		{"minecraft:ancient_cities", 8},
+		{"minecraft:trail_ruins", 6},
+		{"minecraft:trial_chambers", 8},
+		{"minecraft:pillager_outposts", 6},
+		{"minecraft:villages", 6},
+	} {
+		for sx := cx - jSet.radius; sx <= cx+jSet.radius; sx++ {
+			for sz := cz - jSet.radius; sz <= cz+jSet.radius; sz++ {
+				st, err := JigsawSetGenerationPoint(od, sets, jSet.setID, seed, sx, sz)
+				if err != nil || st == nil {
+					continue
+				}
+				adapt := st.TerrainAdaptation
+				if adapt == "" || adapt == "none" {
+					continue
+				}
+				if !msBoxesIntersect(st.Box, closeBox) {
+					continue
+				}
+				for _, p := range st.Pieces {
+					if !msBoxesIntersect(p.Box, closeBox) {
+						continue
+					}
+					if p.Element.Projection == "rigid" {
+						rigids = append(rigids, beardifierRigid{
+							box:              p.Box,
+							groundLevelDelta: p.GroundLevelDelta,
+							adaptation:       adapt,
+						})
+						includeBox(p.Box)
+					}
+					for _, j := range p.Junctions {
+						if j.SourceX > chunkMinX-12 && j.SourceZ > chunkMinZ-12 &&
+							j.SourceX < chunkMinX+15+12 && j.SourceZ < chunkMinZ+15+12 {
+							junctions = append(junctions, j)
+							includeBox(msBox{
+								minX: j.SourceX, minY: j.SourceGroundY, minZ: j.SourceZ,
+								maxX: j.SourceX, maxY: j.SourceGroundY, maxZ: j.SourceZ,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for sx := cx - 8; sx <= cx+8; sx++ {
+		for sz := cz - 8; sz <= cz+8; sz++ {
+			st, err := StrongholdGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil || st == nil {
+				continue
+			}
+			if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, closeBox) {
+				continue
+			}
+			for _, p := range st.Pieces {
+				if !msBoxesIntersect(p.box, closeBox) {
+					continue
+				}
+				rigids = append(rigids, beardifierRigid{
+					box:              p.box,
+					groundLevelDelta: 0,
+					adaptation:       "bury",
+				})
+				includeBox(p.box)
+			}
+		}
+	}
+
+	if !hasAffected {
+		return nil
+	}
+	affected.minX -= 24
+	affected.minY -= 24
+	affected.minZ -= 24
+	affected.maxX += 24
+	affected.maxY += 24
+	affected.maxZ += 24
+	return &chunkBeardifier{
+		affectedBox: affected,
+		rigids:      rigids,
+		junctions:   junctions,
+	}
+}
+
+func (b *chunkBeardifier) compute(x, y, z int) float64 {
+	if b == nil {
+		return 0.0
+	}
+	if x < b.affectedBox.minX || x > b.affectedBox.maxX ||
+		y < b.affectedBox.minY || y > b.affectedBox.maxY ||
+		z < b.affectedBox.minZ || z > b.affectedBox.maxZ {
+		return 0.0
+	}
+	total := 0.0
+	for _, r := range b.rigids {
+		box := r.box
+		dx := max(0, max(box.minX-x, x-box.maxX))
+		dz := max(0, max(box.minZ-z, z-box.maxZ))
+		groundY := box.minY + r.groundLevelDelta
+		dyFromGround := y - groundY
+		switch r.adaptation {
+		case "bury":
+			total += worldgen.BuryContribution(float64(dx), float64(dyFromGround)/2.0, float64(dz))
+		case "beard_thin":
+			total += worldgen.BeardContribution(dx, dyFromGround, dz, dyFromGround) * 0.8
+		case "beard_box":
+			dy := max(0, max(groundY-y, y-box.maxY))
+			total += worldgen.BeardContribution(dx, dy, dz, dyFromGround) * 0.8
+		case "encapsulate":
+			dy := max(0, max(box.minY-y, y-box.maxY))
+			total += worldgen.BuryContribution(float64(dx)/2.0, float64(dy)/2.0, float64(dz)/2.0) * 0.8
+		}
+	}
+	for _, j := range b.junctions {
+		jdx := x - j.SourceX
+		jdy := y - j.SourceGroundY
+		jdz := z - j.SourceZ
+		total += worldgen.BeardContribution(jdx, jdy, jdz, jdy) * 0.4
+	}
+	return total
+}
+

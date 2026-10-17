@@ -133,6 +133,21 @@ func (c *Chunk) AddStructureBlockEntity(be StructureBlockEntity) {
 	c.blockEntities = append(c.blockEntities, be)
 }
 
+// RemoveStructureBlockEntity removes any structural block entity at (x, y, z) on the chunk.
+func (c *Chunk) RemoveStructureBlockEntity(x, y, z int) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.blockEntities {
+		if c.blockEntities[i].X == x && c.blockEntities[i].Y == y && c.blockEntities[i].Z == z {
+			c.blockEntities = append(c.blockEntities[:i], c.blockEntities[i+1:]...)
+			return
+		}
+	}
+}
+
 // MoveStructureBlockEntity moves a structural block entity from (fromX, fromY, fromZ)
 // to (toX, toY, toZ) within the chunk (e.g. when a brushable block falls).
 func (c *Chunk) MoveStructureBlockEntity(fromX, fromY, fromZ, toX, toY, toZ int) {
@@ -222,6 +237,84 @@ func (r *decorationRegion) addStructureBlockEntity(be StructureBlockEntity) {
 	if ch != nil {
 		ch.AddStructureBlockEntity(be)
 	}
+}
+
+func (r *decorationRegion) removeStructureBlockEntity(x, y, z int) {
+	if r == nil {
+		return
+	}
+	ch := r.chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
+	if ch != nil {
+		ch.RemoveStructureBlockEntity(x, y, z)
+	}
+}
+
+func defaultBlockEntityForBlock(blockName string, x, y, z int) (StructureBlockEntity, bool) {
+	name := normalizeResourceID(blockName)
+	var beID string
+	switch name {
+	case "minecraft:barrel",
+		"minecraft:chest",
+		"minecraft:trapped_chest",
+		"minecraft:dispenser",
+		"minecraft:dropper",
+		"minecraft:crafter",
+		"minecraft:hopper",
+		"minecraft:brewing_stand",
+		"minecraft:furnace",
+		"minecraft:blast_furnace",
+		"minecraft:smoker",
+		"minecraft:decorated_pot",
+		"minecraft:chiseled_bookshelf",
+		"minecraft:lectern",
+		"minecraft:jukebox",
+		"minecraft:bell",
+		"minecraft:campfire",
+		"minecraft:soul_campfire",
+		"minecraft:beehive",
+		"minecraft:sculk_sensor",
+		"minecraft:calibrated_sculk_sensor",
+		"minecraft:sculk_catalyst",
+		"minecraft:sculk_shrieker",
+		"minecraft:conduit",
+		"minecraft:ender_chest",
+		"minecraft:daylight_detector",
+		"minecraft:enchanting_table",
+		"minecraft:beacon",
+		"minecraft:comparator",
+		"minecraft:trial_spawner",
+		"minecraft:vault",
+		"minecraft:creaking_heart":
+		beID = name
+	case "minecraft:bee_nest":
+		beID = "minecraft:beehive"
+	case "minecraft:spawner":
+		beID = "minecraft:mob_spawner"
+	case "minecraft:suspicious_sand", "minecraft:suspicious_gravel":
+		beID = "minecraft:brushable_block"
+	default:
+		if strings.HasSuffix(name, "_shulker_box") || name == "minecraft:shulker_box" {
+			beID = "minecraft:shulker_box"
+		} else if strings.HasSuffix(name, "_bed") {
+			beID = "minecraft:bed"
+		} else if strings.HasSuffix(name, "_banner") {
+			beID = "minecraft:banner"
+		} else if strings.HasSuffix(name, "_hanging_sign") {
+			beID = "minecraft:hanging_sign"
+		} else if strings.HasSuffix(name, "_sign") {
+			beID = "minecraft:sign"
+		} else if strings.HasSuffix(name, "_skull") || strings.HasSuffix(name, "_head") {
+			beID = "minecraft:skull"
+		} else {
+			return StructureBlockEntity{}, false
+		}
+	}
+	return StructureBlockEntity{
+		ID: beID,
+		X:  x,
+		Y:  y,
+		Z:  z,
+	}, true
 }
 
 func (r *decorationRegion) moveStructureBlockEntity(fromX, fromY, fromZ, toX, toY, toZ int) {

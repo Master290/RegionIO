@@ -198,7 +198,14 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 	belowState := r.getBlock(origin.X, origin.Y-1, origin.Z)
 	if random.NextFloat() <= config.CatalystChance && canMultifaceAttachTo(belowState) {
 		if catalyst, ok := nameToStateID("minecraft:sculk_catalyst", map[string]string{"bloom": "false"}); ok {
-			r.setBlock(origin.X, origin.Y, origin.Z, catalyst)
+			if r.setBlock(origin.X, origin.Y, origin.Z, catalyst) {
+				r.addStructureBlockEntity(StructureBlockEntity{
+					ID: "minecraft:sculk_catalyst",
+					X:  origin.X,
+					Y:  origin.Y,
+					Z:  origin.Z,
+				})
+			}
 		}
 	}
 	extra := config.ExtraRareGrowths.Sample(random)
@@ -212,7 +219,14 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 				"shrieking":   "false",
 				"waterlogged": "false",
 			}); ok {
-				r.setBlock(tx, ty, tz, shrieker)
+				if r.setBlock(tx, ty, tz, shrieker) {
+					r.addStructureBlockEntity(StructureBlockEntity{
+						ID: "minecraft:sculk_shrieker",
+						X:  tx,
+						Y:  ty,
+						Z:  tz,
+					})
+				}
 			}
 		}
 	}
@@ -423,6 +437,7 @@ func (r *decorationRegion) sculkBlockAttemptUseCharge(cursor *sculkChargeCursor,
 			waterlogged = "true"
 		}
 		var growthState uint16
+		var growthBE string
 		var ok bool
 		if random.NextIntN(11) == 0 {
 			growthState, ok = nameToStateID("minecraft:sculk_shrieker", map[string]string{
@@ -430,15 +445,24 @@ func (r *decorationRegion) sculkBlockAttemptUseCharge(cursor *sculkChargeCursor,
 				"shrieking":   "false",
 				"waterlogged": waterlogged,
 			})
+			growthBE = "minecraft:sculk_shrieker"
 		} else {
 			growthState, ok = nameToStateID("minecraft:sculk_sensor", map[string]string{
 				"power":              "0",
 				"sculk_sensor_phase": "inactive",
 				"waterlogged":        waterlogged,
 			})
+			growthBE = "minecraft:sculk_sensor"
 		}
 		if ok {
-			r.setBlock(ax, ay, az, growthState)
+			if r.setBlock(ax, ay, az, growthState) {
+				r.addStructureBlockEntity(StructureBlockEntity{
+					ID: growthBE,
+					X:  ax,
+					Y:  ay,
+					Z:  az,
+				})
+			}
 		}
 	}
 	return max(0, charge-50)

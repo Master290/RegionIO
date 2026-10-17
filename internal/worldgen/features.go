@@ -540,6 +540,18 @@ func unmarshalPlacer(raw []byte, typ *string, fields *map[string]json.RawMessage
 func (p TreeTrunkPlacer) Scalar(name string) (int, bool)   { return scalarField(p.Fields, name) }
 func (p TreeFoliagePlacer) Scalar(name string) (int, bool) { return scalarField(p.Fields, name) }
 
+func (p TreeTrunkPlacer) Float(name string) (float64, bool) {
+	raw, ok := p.Fields[name]
+	if !ok {
+		return 0, false
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
 func (p TreeFoliagePlacer) Float(name string) (float64, bool) {
 	raw, ok := p.Fields[name]
 	if !ok {
@@ -1498,8 +1510,8 @@ func (s *FeatureSet) Probability(name string) (ProbabilityFeatureConfig, error) 
 		return v.(ProbabilityFeatureConfig), nil
 	}
 	configured, ok := s.Configured[name]
-	if !ok || configured.Type != "minecraft:seagrass" {
-		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: %s is not seagrass", name)
+	if !ok || (configured.Type != "minecraft:seagrass" && configured.Type != "minecraft:bamboo") {
+		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: %s is not a probability feature", name)
 	}
 	var config ProbabilityFeatureConfig
 	if err := json.Unmarshal(configured.Config, &config); err != nil {
@@ -1509,6 +1521,181 @@ func (s *FeatureSet) Probability(name string) (ProbabilityFeatureConfig, error) 
 		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: invalid probability %s", name)
 	}
 	s.setCachedConfig("probability", name, config)
+	return config, nil
+}
+
+type BlockStateFeatureConfig struct {
+	State BlockState `json:"state"`
+}
+
+func (s *FeatureSet) BlockStateConfig(name string) (BlockStateFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("block_state", name); ok {
+		return v.(BlockStateFeatureConfig), nil
+	}
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:iceberg" {
+		return BlockStateFeatureConfig{}, fmt.Errorf("worldgen: %s is not an iceberg feature", name)
+	}
+	var config BlockStateFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return BlockStateFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.State.Name == "" {
+		return BlockStateFeatureConfig{}, fmt.Errorf("worldgen: invalid block_state config %s", name)
+	}
+	s.setCachedConfig("block_state", name, config)
+	return config, nil
+}
+
+type FossilFeatureConfig struct {
+	FossilStructures       []string `json:"fossil_structures"`
+	OverlayStructures      []string `json:"overlay_structures"`
+	FossilProcessors       string   `json:"fossil_processors"`
+	OverlayProcessors      string   `json:"overlay_processors"`
+	MaxEmptyCornersAllowed int      `json:"max_empty_corners_allowed"`
+}
+
+func (s *FeatureSet) Fossil(name string) (FossilFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("fossil", name); ok {
+		return v.(FossilFeatureConfig), nil
+	}
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:fossil" {
+		return FossilFeatureConfig{}, fmt.Errorf("worldgen: %s is not a fossil feature", name)
+	}
+	var config FossilFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return FossilFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if len(config.FossilStructures) == 0 || len(config.FossilStructures) != len(config.OverlayStructures) {
+		return FossilFeatureConfig{}, fmt.Errorf("worldgen: invalid fossil config %s", name)
+	}
+	s.setCachedConfig("fossil", name, config)
+	return config, nil
+}
+
+type SpikeFeatureConfig struct {
+	State      BlockState      `json:"state"`
+	CanPlaceOn json.RawMessage `json:"can_place_on"`
+	CanReplace json.RawMessage `json:"can_replace"`
+}
+
+func (s *FeatureSet) Spike(name string) (SpikeFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("spike", name); ok {
+		return v.(SpikeFeatureConfig), nil
+	}
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:spike" {
+		return SpikeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a spike feature", name)
+	}
+	var config SpikeFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return SpikeFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.State.Name == "" || len(config.CanPlaceOn) == 0 || len(config.CanReplace) == 0 {
+		return SpikeFeatureConfig{}, fmt.Errorf("worldgen: invalid spike config %s", name)
+	}
+	s.setCachedConfig("spike", name, config)
+	return config, nil
+}
+
+type RootSystemFeatureConfig struct {
+	AllowedTreePosition          json.RawMessage
+	AllowedVerticalWaterForTree  int
+	Feature                      FeatureRef
+	HangingRootPlacementAttempts int
+	HangingRootRadius            int
+	HangingRootStateProvider     StateProviderSpec
+	HangingRootsVerticalSpan     int
+	RequiredVerticalSpaceForTree int
+	RootColumnMaxHeight          int
+	RootPlacementAttempts        int
+	RootRadius                   int
+	RootReplaceable              string
+	RootStateProvider            StateProviderSpec
+}
+
+func (s *FeatureSet) RootSystem(name string) (RootSystemFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("root_system", name); ok {
+		return v.(RootSystemFeatureConfig), nil
+	}
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:root_system" {
+		return RootSystemFeatureConfig{}, fmt.Errorf("worldgen: %s is not a root_system feature", name)
+	}
+	var raw struct {
+		AllowedTreePosition          json.RawMessage `json:"allowed_tree_position"`
+		AllowedVerticalWaterForTree  int             `json:"allowed_vertical_water_for_tree"`
+		Feature                      json.RawMessage `json:"feature"`
+		HangingRootPlacementAttempts int             `json:"hanging_root_placement_attempts"`
+		HangingRootRadius            int             `json:"hanging_root_radius"`
+		HangingRootStateProvider     json.RawMessage `json:"hanging_root_state_provider"`
+		HangingRootsVerticalSpan     int             `json:"hanging_roots_vertical_span"`
+		RequiredVerticalSpaceForTree int             `json:"required_vertical_space_for_tree"`
+		RootColumnMaxHeight          int             `json:"root_column_max_height"`
+		RootPlacementAttempts        int             `json:"root_placement_attempts"`
+		RootRadius                   int             `json:"root_radius"`
+		RootReplaceable              string          `json:"root_replaceable"`
+		RootStateProvider            json.RawMessage `json:"root_state_provider"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return RootSystemFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	featRef, err := s.parseFeatureRef(raw.Feature)
+	if err != nil {
+		return RootSystemFeatureConfig{}, fmt.Errorf("worldgen: %s feature: %w", name, err)
+	}
+	hangingProv, err := parseStateProviderSpec(raw.HangingRootStateProvider)
+	if err != nil {
+		return RootSystemFeatureConfig{}, fmt.Errorf("worldgen: %s hanging_root_state_provider: %w", name, err)
+	}
+	rootProv, err := parseStateProviderSpec(raw.RootStateProvider)
+	if err != nil {
+		return RootSystemFeatureConfig{}, fmt.Errorf("worldgen: %s root_state_provider: %w", name, err)
+	}
+	config := RootSystemFeatureConfig{
+		AllowedTreePosition:          raw.AllowedTreePosition,
+		AllowedVerticalWaterForTree:  raw.AllowedVerticalWaterForTree,
+		Feature:                      featRef,
+		HangingRootPlacementAttempts: raw.HangingRootPlacementAttempts,
+		HangingRootRadius:            raw.HangingRootRadius,
+		HangingRootStateProvider:     hangingProv,
+		HangingRootsVerticalSpan:     raw.HangingRootsVerticalSpan,
+		RequiredVerticalSpaceForTree: raw.RequiredVerticalSpaceForTree,
+		RootColumnMaxHeight:          raw.RootColumnMaxHeight,
+		RootPlacementAttempts:        raw.RootPlacementAttempts,
+		RootRadius:                   raw.RootRadius,
+		RootReplaceable:              raw.RootReplaceable,
+		RootStateProvider:            rootProv,
+	}
+	s.setCachedConfig("root_system", name, config)
+	return config, nil
+}
+
+type CountFeatureConfig struct {
+	Count NestedIntProvider
+}
+
+func (s *FeatureSet) Count(name string) (CountFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("count", name); ok {
+		return v.(CountFeatureConfig), nil
+	}
+	configured, ok := s.Configured[name]
+	if !ok || configured.Type != "minecraft:sea_pickle" {
+		return CountFeatureConfig{}, fmt.Errorf("worldgen: %s is not a sea_pickle feature", name)
+	}
+	var raw struct {
+		Count json.RawMessage `json:"count"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return CountFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	cnt, err := parseNestedIntProvider(raw.Count)
+	if err != nil {
+		return CountFeatureConfig{}, fmt.Errorf("worldgen: %s count: %w", name, err)
+	}
+	config := CountFeatureConfig{Count: cnt}
+	s.setCachedConfig("count", name, config)
 	return config, nil
 }
 

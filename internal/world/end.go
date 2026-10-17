@@ -500,6 +500,18 @@ func PlaceEndSpikes(c *Chunk, seed int64) {
 		}
 		setEndBlock(c, s.CenterX, s.Height, s.CenterZ, StateBedrock)
 		setEndBlock(c, s.CenterX, s.Height+1, s.CenterZ, eb.fire)
+		if s.CenterX >= minX && s.CenterX <= maxX && s.CenterZ >= minZ && s.CenterZ <= maxZ {
+			c.AddStructureEntity(StructureEntity{
+				ID:                  "minecraft:end_crystal",
+				X:                   float64(s.CenterX) + 0.5,
+				Y:                   float64(s.Height + 1),
+				Z:                   float64(s.CenterZ) + 0.5,
+				BlockX:              s.CenterX,
+				BlockY:              s.Height + 1,
+				BlockZ:              s.CenterZ,
+				PersistenceRequired: true,
+			})
+		}
 	}
 }
 

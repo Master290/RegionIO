@@ -242,6 +242,59 @@ func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.Feature
 		}); err != nil {
 			return err
 		}
+	case "minecraft:bamboo":
+		config, err := set.Probability(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeBamboo(random, position, config.Probability, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:root_system":
+		config, err := set.RootSystem(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeRootSystem(random, position, config, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:sea_pickle":
+		config, err := set.Count(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			r.placeSeaPickle(random, position, config, set)
+			return nil
+		}); err != nil {
+			return err
+		}
+	case "minecraft:fallen_tree":
+		config, err := set.FallenTree(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			return r.placeFallenTree(set, random, position, config)
+		}); err != nil {
+			return err
+		}
+	case "minecraft:huge_red_mushroom", "minecraft:huge_brown_mushroom":
+		config, err := set.HugeMushroom(placed.Feature)
+		if err != nil {
+			return err
+		}
+		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+			return r.placeHugeMushroom(set, random, position, configured.Type, config)
+		}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -704,3 +757,330 @@ func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePositio
 	}
 	return false
 }
+
+// placeBamboo ports BambooFeature.place (26.1.2 bytecode).
+func (r *decorationRegion) placeBamboo(random worldgen.RandomSource, origin worldgen.FeaturePosition, probability float32, set *worldgen.FeatureSet) bool {
+	if !isAirState(r.getBlock(origin.X, origin.Y, origin.Z)) {
+		return false
+	}
+	if !r.canBambooSurvive(origin.X, origin.Y, origin.Z, set) {
+		return false
+	}
+	height := int(random.NextIntN(12)) + 5
+	if random.NextFloat() < probability {
+		rad := int(random.NextIntN(4)) + 1
+		podzol, podzolOK := nameToStateID("minecraft:podzol", nil)
+		for xx := origin.X - rad; xx <= origin.X+rad; xx++ {
+			for zz := origin.Z - rad; zz <= origin.Z+rad; zz++ {
+				dx, dz := xx-origin.X, zz-origin.Z
+				if dx*dx+dz*dz <= rad*rad {
+					py := r.heightAt("WORLD_SURFACE", xx, zz) - 1
+					if st, ok := stateByID(r.getBlock(xx, py, zz)); ok && podzolOK && flattenBlockTagContains(set, "minecraft:beneath_bamboo_podzol_replaceable", st.Name) {
+						r.setBlock(xx, py, zz, podzol)
+					}
+				}
+			}
+		}
+	}
+	stalk, _ := nameToStateID("minecraft:bamboo", map[string]string{"age": "1", "leaves": "none", "stage": "0"})
+	topLarge, _ := nameToStateID("minecraft:bamboo", map[string]string{"age": "1", "leaves": "large", "stage": "1"})
+	midLarge, _ := nameToStateID("minecraft:bamboo", map[string]string{"age": "1", "leaves": "large", "stage": "0"})
+	smallLeaves, _ := nameToStateID("minecraft:bamboo", map[string]string{"age": "1", "leaves": "small", "stage": "0"})
+	by := origin.Y
+	for i := 0; i < height && isAirState(r.getBlock(origin.X, by, origin.Z)); i++ {
+		r.setBlock(origin.X, by, origin.Z, stalk)
+		by++
+	}
+	if by-origin.Y >= 3 {
+		r.setBlock(origin.X, by, origin.Z, topLarge)
+		by--
+		r.setBlock(origin.X, by, origin.Z, midLarge)
+		by--
+		r.setBlock(origin.X, by, origin.Z, smallLeaves)
+	}
+	return true
+}
+
+func (r *decorationRegion) canBambooSurvive(x, y, z int, set *worldgen.FeatureSet) bool {
+	if y <= MinY {
+		return false
+	}
+	below, ok := stateByID(r.getBlock(x, y-1, z))
+	return ok && flattenBlockTagContains(set, "minecraft:supports_bamboo", below.Name)
+}
+
+// placeRootSystem ports RootSystemFeature.place (26.1.2 bytecode).
+func (r *decorationRegion) placeRootSystem(random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.RootSystemFeatureConfig, set *worldgen.FeatureSet) bool {
+	if !isAirState(r.getBlock(origin.X, origin.Y, origin.Z)) {
+		return false
+	}
+	workingPos := origin
+	treePlaced := false
+	for y := 0; y < config.RootColumnMaxHeight; y++ {
+		workingPos.Y++
+		allowed, err := r.testBlockPredicate(set, config.AllowedTreePosition, workingPos)
+		if err != nil || !allowed {
+			continue
+		}
+		if !r.spaceForRootSystemTree(config, workingPos) {
+			continue
+		}
+		belowState := r.getBlock(workingPos.X, workingPos.Y-1, workingPos.Z)
+		if isLavaState(belowState) || !isSolidState(belowState) {
+			break
+		}
+		if r.placeFeatureRef(random, workingPos, config.Feature, set) {
+			targetHeight := origin.Y + y
+			replaceable := tagStateIDs(set, config.RootReplaceable)
+			for py := origin.Y; py < targetHeight; py++ {
+				for i := 0; i < config.RootPlacementAttempts; i++ {
+					wx := origin.X + int(random.NextIntN(int32(config.RootRadius))) - int(random.NextIntN(int32(config.RootRadius)))
+					wz := origin.Z + int(random.NextIntN(int32(config.RootRadius))) - int(random.NextIntN(int32(config.RootRadius)))
+					if replaceable[r.getBlock(wx, py, wz)] {
+						if chosen, ok := config.RootStateProvider.SampleStateAt(random, worldgen.FeaturePosition{X: wx, Y: py, Z: wz}); ok {
+							if st, stOK := nameToStateID(chosen.Name, chosen.Properties); stOK {
+								r.setBlock(wx, py, wz, st)
+							}
+						}
+					}
+				}
+			}
+			treePlaced = true
+			break
+		}
+	}
+	if !treePlaced {
+		return false
+	}
+	for i := 0; i < config.HangingRootPlacementAttempts; i++ {
+		wx := origin.X + int(random.NextIntN(int32(config.HangingRootRadius))) - int(random.NextIntN(int32(config.HangingRootRadius)))
+		wy := origin.Y + int(random.NextIntN(int32(config.HangingRootsVerticalSpan))) - int(random.NextIntN(int32(config.HangingRootsVerticalSpan)))
+		wz := origin.Z + int(random.NextIntN(int32(config.HangingRootRadius))) - int(random.NextIntN(int32(config.HangingRootRadius)))
+		if isAirState(r.getBlock(wx, wy, wz)) {
+			chosen, ok := config.HangingRootStateProvider.SampleStateAt(random, worldgen.FeaturePosition{X: wx, Y: wy, Z: wz})
+			if ok && wy+1 < MinY+WorldHeight && isFaceSturdy(r.getBlock(wx, wy+1, wz)) {
+				if st, stOK := nameToStateID(chosen.Name, chosen.Properties); stOK {
+					r.setBlock(wx, wy, wz, st)
+				}
+			}
+		}
+	}
+	return true
+}
+
+func (r *decorationRegion) spaceForRootSystemTree(config worldgen.RootSystemFeatureConfig, pos worldgen.FeaturePosition) bool {
+	for i := 1; i <= config.RequiredVerticalSpaceForTree; i++ {
+		st := r.getBlock(pos.X, pos.Y+i, pos.Z)
+		if !isAirState(st) && (i+1 > config.AllowedVerticalWaterForTree || !isWaterState(st)) {
+			return false
+		}
+	}
+	return true
+}
+
+// placeSeaPickle ports SeaPickleFeature.place (26.1.2 bytecode).
+func (r *decorationRegion) placeSeaPickle(random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.CountFeatureConfig, set *worldgen.FeatureSet) bool {
+	placed := 0
+	count := config.Count.Sample(random)
+	for i := 0; i < count; i++ {
+		dx := int(random.NextIntN(8)) - int(random.NextIntN(8))
+		dz := int(random.NextIntN(8)) - int(random.NextIntN(8))
+		px, pz := origin.X+dx, origin.Z+dz
+		py := r.heightAt("OCEAN_FLOOR", px, pz)
+		pickles := int(random.NextIntN(4)) + 1
+		if r.getBlock(px, py, pz) == StateWater && py > MinY && isFaceSturdy(r.getBlock(px, py-1, pz)) {
+			if st, ok := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": strconv.Itoa(pickles), "waterlogged": "true"}); ok {
+				if r.setBlock(px, py, pz, st) {
+					placed++
+				}
+			}
+		}
+	}
+	return placed > 0
+}
+
+// placeCoralFeature ports CoralFeature.place (26.1.2 bytecode).
+func (r *decorationRegion) placeCoralFeature(random worldgen.RandomSource, origin worldgen.FeaturePosition, kind string, set *worldgen.FeatureSet) bool {
+	coralBlocks := flattenBlockTag(set, "minecraft:coral_blocks", nil)
+	if len(coralBlocks) == 0 {
+		return false
+	}
+	chosenName := coralBlocks[int(random.NextIntN(int32(len(coralBlocks))))]
+	coralBlockState, ok := nameToStateID(chosenName, nil)
+	if !ok {
+		return false
+	}
+	switch kind {
+	case "minecraft:coral_tree":
+		return r.placeCoralTree(random, origin, coralBlockState, set)
+	case "minecraft:coral_claw":
+		return r.placeCoralClaw(random, origin, coralBlockState, set)
+	case "minecraft:coral_mushroom":
+		return r.placeCoralMushroom(random, origin, coralBlockState, set)
+	}
+	return false
+}
+
+func (r *decorationRegion) placeCoralTree(random worldgen.RandomSource, origin worldgen.FeaturePosition, coralBlockState uint16, set *worldgen.FeatureSet) bool {
+	x, y, z := origin.X, origin.Y, origin.Z
+	trunkHeight := int(random.NextIntN(3)) + 1
+	for i := 0; i < trunkHeight; i++ {
+		if !r.placeCoralBlock(random, x, y, z, coralBlockState, set) {
+			return true
+		}
+		y++
+	}
+	topX, topY, topZ := x, y, z
+	numBranches := int(random.NextIntN(3)) + 2
+	dirs := [][2]int{{0, -1}, {1, 0}, {0, 1}, {-1, 0}}
+	for i := len(dirs); i > 1; i-- {
+		j := int(random.NextIntN(int32(i)))
+		dirs[i-1], dirs[j] = dirs[j], dirs[i-1]
+	}
+	for _, d := range dirs[:numBranches] {
+		bx, by, bz := topX+d[0], topY, topZ+d[1]
+		branchLen := int(random.NextIntN(5)) + 2
+		segLen := 0
+		for j := 0; j < branchLen && r.placeCoralBlock(random, bx, by, bz, coralBlockState, set); j++ {
+			segLen++
+			by++
+			if j == 0 || (segLen >= 2 && random.NextFloat() < 0.25) {
+				bx += d[0]
+				bz += d[1]
+				segLen = 0
+			}
+		}
+	}
+	return true
+}
+
+func (r *decorationRegion) placeCoralClaw(random worldgen.RandomSource, origin worldgen.FeaturePosition, coralBlockState uint16, set *worldgen.FeatureSet) bool {
+	if !r.placeCoralBlock(random, origin.X, origin.Y, origin.Z, coralBlockState, set) {
+		return false
+	}
+	type horizDir struct {
+		dx, dz   int
+		cwX, cwZ int
+		ccwX     int
+		ccwZ     int
+	}
+	horiz := [4]horizDir{
+		{0, -1, 1, 0, -1, 0},
+		{1, 0, 0, 1, 0, -1},
+		{0, 1, -1, 0, 1, 0},
+		{-1, 0, 0, -1, 0, 1},
+	}
+	clawDir := horiz[int(random.NextIntN(4))]
+	numBranches := int(random.NextIntN(2)) + 2
+	dirs := [][2]int{{clawDir.dx, clawDir.dz}, {clawDir.cwX, clawDir.cwZ}, {clawDir.ccwX, clawDir.ccwZ}}
+	for i := len(dirs); i > 1; i-- {
+		j := int(random.NextIntN(int32(i)))
+		dirs[i-1], dirs[j] = dirs[j], dirs[i-1]
+	}
+	for _, branchDir := range dirs[:numBranches] {
+		bx, by, bz := origin.X+branchDir[0], origin.Y, origin.Z+branchDir[1]
+		sidewayLen := int(random.NextIntN(2)) + 1
+		var inwayX, inwayY, inwayZ, upLen int
+		if branchDir[0] == clawDir.dx && branchDir[1] == clawDir.dz {
+			inwayX, inwayY, inwayZ = clawDir.dx, 0, clawDir.dz
+			upLen = int(random.NextIntN(3)) + 2
+		} else {
+			by++
+			if random.NextIntN(2) == 0 {
+				inwayX, inwayY, inwayZ = branchDir[0], 0, branchDir[1]
+			} else {
+				inwayX, inwayY, inwayZ = 0, 1, 0
+			}
+			upLen = int(random.NextIntN(3)) + 3
+		}
+		placed := true
+		for i := 0; i < sidewayLen; i++ {
+			if !r.placeCoralBlock(random, bx, by, bz, coralBlockState, set) {
+				placed = false
+				break
+			}
+			bx += inwayX
+			by += inwayY
+			bz += inwayZ
+		}
+		if !placed {
+			continue
+		}
+		bx -= inwayX
+		by -= inwayY
+		bz -= inwayZ
+		by++
+		for i := 0; i < upLen; i++ {
+			bx += clawDir.dx
+			bz += clawDir.dz
+			if !r.placeCoralBlock(random, bx, by, bz, coralBlockState, set) {
+				break
+			}
+			if random.NextFloat() < 0.25 {
+				by++
+			}
+		}
+	}
+	return true
+}
+
+func (r *decorationRegion) placeCoralMushroom(random worldgen.RandomSource, origin worldgen.FeaturePosition, coralBlockState uint16, set *worldgen.FeatureSet) bool {
+	height := int(random.NextIntN(3)) + 3
+	width := int(random.NextIntN(3)) + 3
+	length := int(random.NextIntN(3)) + 3
+	sink := int(random.NextIntN(3)) + 1
+	for x := 0; x <= width; x++ {
+		for y := 0; y <= height; y++ {
+			for z := 0; z <= length; z++ {
+				if ((x == 0 || x == width) && (y == 0 || y == height)) ||
+					((z == 0 || z == length) && (y == 0 || y == height)) ||
+					((x == 0 || x == width) && (z == 0 || z == length)) ||
+					(x != 0 && x != width && y != 0 && y != height && z != 0 && z != length) ||
+					random.NextFloat() < 0.1 {
+					continue
+				}
+				r.placeCoralBlock(random, origin.X+x, origin.Y+y-sink, origin.Z+z, coralBlockState, set)
+			}
+		}
+	}
+	return true
+}
+
+func (r *decorationRegion) placeCoralBlock(random worldgen.RandomSource, x, y, z int, coralBlockState uint16, set *worldgen.FeatureSet) bool {
+	aboveY := y + 1
+	cur := r.getBlock(x, y, z)
+	coralTag := tagStateIDs(set, "minecraft:corals")
+	if (cur == StateWater || coralTag[cur]) && r.getBlock(x, aboveY, z) == StateWater {
+		r.setBlock(x, y, z, coralBlockState)
+		if random.NextFloat() < 0.25 {
+			corals := flattenBlockTag(set, "minecraft:corals", nil)
+			if len(corals) > 0 {
+				cName := corals[int(random.NextIntN(int32(len(corals))))]
+				if cState, ok := nameToStateID(cName, nil); ok {
+					r.setBlock(x, aboveY, z, cState)
+				}
+			}
+		} else if random.NextFloat() < 0.05 {
+			pickles := int(random.NextIntN(4)) + 1
+			if pState, ok := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": strconv.Itoa(pickles), "waterlogged": "true"}); ok {
+				r.setBlock(x, aboveY, z, pState)
+			}
+		}
+		wallCorals := flattenBlockTag(set, "minecraft:wall_corals", nil)
+		horizDirs := [4]struct {
+			dx, dz int
+			name   string
+		}{{0, -1, "north"}, {1, 0, "east"}, {0, 1, "south"}, {-1, 0, "west"}}
+		for _, d := range horizDirs {
+			if random.NextFloat() < 0.2 && r.getBlock(x+d.dx, y, z+d.dz) == StateWater && len(wallCorals) > 0 {
+				wName := wallCorals[int(random.NextIntN(int32(len(wallCorals))))]
+				if wState, ok := nameToStateID(wName, map[string]string{"facing": d.name, "waterlogged": "true"}); ok {
+					r.setBlock(x+d.dx, y, z+d.dz, wState)
+				}
+			}
+		}
+		return true
+	}
+	return false
+}
+

@@ -1,9 +1,11 @@
 package world
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"regionio/internal/worldgen"
 )
@@ -55,6 +57,7 @@ const (
 type treePlacement struct {
 	x, y, z int
 	isLog   bool
+	isRoot  bool
 	draw    drawFreeCell
 }
 
@@ -69,7 +72,8 @@ type treePlacer struct {
 	// placements records what this tree wrote, in write order. TreeDecorator.Context
 	// rebuilds its logs and leaves lists from exactly this, and both AlterGround-
 	// Decorator and BeehiveDecorator read y values out of the lists.
-	placements []treePlacement
+	placements    []treePlacement
+	leafPositions map[[3]int]bool
 
 	// trunkHeight, foliageHeight and foliageRadius are sampled in that order by
 	// TreeFeature.doPlace; the per-attachment offset comes after them, drawn once
@@ -95,17 +99,24 @@ func (t *treePlacer) sampleHeights() error {
 	t.trunkHeight = height
 
 	switch t.config.FoliagePlacer.Type {
-	case "minecraft:blob_foliage_placer", "minecraft:fancy_foliage_placer":
+	case "minecraft:blob_foliage_placer", "minecraft:fancy_foliage_placer",
+		"minecraft:bush_foliage_placer", "minecraft:jungle_foliage_placer":
 		// BlobFoliagePlacer.foliageHeight returns its int field without drawing, and
-		// FancyFoliagePlacer inherits it.
+		// FancyFoliagePlacer, BushFoliagePlacer, and MegaJungleFoliagePlacer follow suit.
 		h, ok := t.config.FoliagePlacer.Scalar("height")
 		if !ok {
 			return fmt.Errorf("world: %s has no scalar height", t.config.FoliagePlacer.Type)
 		}
 		t.foliageHeight = h
-	case "minecraft:pine_foliage_placer":
-		// PineFoliagePlacer.foliageHeight samples its provider: one draw.
+	case "minecraft:pine_foliage_placer", "minecraft:cherry_foliage_placer":
+		// PineFoliagePlacer and CherryFoliagePlacer sample their height provider.
 		h, err := t.foliageProviderSample("height")
+		if err != nil {
+			return err
+		}
+		t.foliageHeight = h
+	case "minecraft:random_spread_foliage_placer":
+		h, err := t.foliageProviderSample("foliage_height")
 		if err != nil {
 			return err
 		}
@@ -124,6 +135,8 @@ func (t *treePlacer) sampleHeights() error {
 			return err
 		}
 		t.foliageHeight = h
+	case "minecraft:acacia_foliage_placer":
+		t.foliageHeight = 0
 	case "minecraft:dark_oak_foliage_placer":
 		// DarkOakFoliagePlacer.foliageHeight is `iconst_4; ireturn`: the RandomSource
 		// argument is never read, so this is a constant, not a sample. Its
@@ -283,6 +296,10 @@ func (t *treePlacer) placeLeaf(x, y, z int, skip drawFreeCell) (bool, error) {
 		}
 	}
 	t.r.setBlock(x, y, z, state)
+	if t.leafPositions == nil {
+		t.leafPositions = make(map[[3]int]bool)
+	}
+	t.leafPositions[[3]int{x, y, z}] = true
 	// TreeFeature$1.set records every leaf it writes, whether or not the world
 	// accepted it, and BeehiveDecorator reads the first of them.
 	t.placements = append(t.placements, treePlacement{x: x, y: y, z: z})
@@ -309,6 +326,55 @@ func (t *treePlacer) placeLeavesRow(at trunkAttachment, radius, y int) error {
 		}
 	}
 	return nil
+}
+
+// placeLeavesRowWithHangingLeavesBelow is FoliagePlacer.placeLeavesRowWithHangingLeavesBelow,
+// used by CherryFoliagePlacer on its bottom two rows.
+func (t *treePlacer) placeLeavesRowWithHangingLeavesBelow(at trunkAttachment, radius, y int, hangingLeavesChance, hangingLeavesExtensionChance float32) error {
+	if err := t.placeLeavesRow(at, radius, y); err != nil {
+		return err
+	}
+	extra := 0
+	if at.doubleTrunk {
+		extra = 1
+	}
+	logPos := [3]int{at.x, at.y - 1, at.z}
+	for dirIdx, alongEdge := range darkOakDirections {
+		toEdge := darkOakDirections[(dirIdx+1)&3]
+		offsetToEdge := radius
+		if toEdge[0] > 0 || toEdge[1] > 0 {
+			offsetToEdge = radius + extra
+		}
+		px := at.x + toEdge[0]*offsetToEdge - alongEdge[0]*radius
+		py := at.y + y - 1
+		pz := at.z + toEdge[1]*offsetToEdge - alongEdge[1]*radius
+		for offsetAlongEdge := -radius; offsetAlongEdge < radius+extra; offsetAlongEdge++ {
+			if t.leafPositions[[3]int{px, py + 1, pz}] {
+				placed, err := t.tryPlaceExtension(hangingLeavesChance, logPos, px, py, pz)
+				if err != nil {
+					return err
+				}
+				if placed {
+					if _, err := t.tryPlaceExtension(hangingLeavesExtensionChance, logPos, px, py-1, pz); err != nil {
+						return err
+					}
+				}
+			}
+			px += alongEdge[0]
+			pz += alongEdge[1]
+		}
+	}
+	return nil
+}
+
+func (t *treePlacer) tryPlaceExtension(chance float32, logPos [3]int, x, y, z int) (bool, error) {
+	if abs(x-logPos[0])+abs(y-logPos[1])+abs(z-logPos[2]) >= 7 {
+		return false, nil
+	}
+	if t.random.NextFloat() > chance {
+		return false, nil
+	}
+	return t.placeLeaf(x, y, z, cellIsPlaceable)
 }
 
 // shouldSkipLocationSigned measures distance to the nearer of two trunk columns
@@ -343,6 +409,13 @@ func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int, doubleTrunk bool)
 			return false
 		}
 		return t.random.NextIntN(2) == 0 || y == 0
+	case "minecraft:bush_foliage_placer":
+		return ax == radius && az == radius && t.random.NextIntN(2) == 0
+	case "minecraft:acacia_foliage_placer":
+		if y == 0 {
+			return (ax > 1 || az > 1) && ax != 0 && az != 0
+		}
+		return ax == radius && az == radius && radius > 0
 	case "minecraft:fancy_foliage_placer":
 		// A round canopy: skip outside the circle of the row radius, measured from
 		// the cell centre rather than the corner.
@@ -350,9 +423,20 @@ func (t *treePlacer) shouldSkipLocation(ax, y, az, radius int, doubleTrunk bool)
 	case "minecraft:pine_foliage_placer", "minecraft:spruce_foliage_placer":
 		// Pure geometry, no draw at all, and identical in both classes.
 		return ax == radius && az == radius && radius > 0
-	case "minecraft:mega_pine_foliage_placer":
+	case "minecraft:mega_pine_foliage_placer", "minecraft:jungle_foliage_placer":
 		// Two tests: the far corner of the double-trunk square, then the circle.
 		return ax+az >= 7 || ax*ax+az*az > radius*radius
+	case "minecraft:cherry_foliage_placer":
+		wideBottom, _ := t.config.FoliagePlacer.Float("wide_bottom_layer_hole_chance")
+		cornerHole, _ := t.config.FoliagePlacer.Float("corner_hole_chance")
+		if y == -1 && (ax == radius || az == radius) && t.random.NextFloat() < float32(wideBottom) {
+			return true
+		}
+		corner := ax == radius && az == radius
+		if radius > 2 {
+			return corner || (ax+az > radius*2-2 && t.random.NextFloat() < float32(cornerHole))
+		}
+		return corner && t.random.NextFloat() < float32(cornerHole)
 	case "minecraft:dark_oak_foliage_placer":
 		// Two row rules and nothing else, both on folded coordinates against the
 		// row's own radius. The bottom row of a SINGLE trunk loses exactly its far
@@ -419,28 +503,38 @@ func (t *treePlacer) placeBelowTrunk(x, y, z int) error {
 // placeLogAt is TrunkPlacer.placeLog: validTreePos is tested before the trunk
 // provider is sampled, so a cell the trunk cannot grow through costs no draw.
 func (t *treePlacer) placeLogAt(x, y, z int) error {
-	return t.placeLogWithAxis(x, y, z, "")
+	_, err := t.placeLogBoolWithAxis(x, y, z, "")
+	return err
+}
+
+func (t *treePlacer) placeLogBoolAt(x, y, z int) (bool, error) {
+	return t.placeLogBoolWithAxis(x, y, z, "")
 }
 
 // placeLogWithAxis is placeLog with the Function<BlockState,BlockState> argument,
 // which FancyTrunkPlacer uses to re-orient each log along its limb. A block without
 // an axis property is left alone, because the bytecode calls trySetValue.
 func (t *treePlacer) placeLogWithAxis(x, y, z int, axis string) error {
+	_, err := t.placeLogBoolWithAxis(x, y, z, axis)
+	return err
+}
+
+func (t *treePlacer) placeLogBoolWithAxis(x, y, z int, axis string) (bool, error) {
 	if !t.validTreePos(x, y, z) {
-		return nil
+		return false, nil
 	}
 	spec, err := t.set.StateProvider(t.config.TrunkProvider.Raw)
 	if err != nil {
-		return err
+		return false, err
 	}
 	state, err := t.r.sampleStateProvider(t.set, spec, t.random, worldgen.FeaturePosition{X: x, Y: y, Z: z})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if axis != "" {
 		name, ok := stateByID(state)
 		if !ok {
-			return fmt.Errorf("world: trunk provider returned unknown state %d", state)
+			return false, fmt.Errorf("world: trunk provider returned unknown state %d", state)
 		}
 		if _, has := name.Properties["axis"]; has {
 			merged := map[string]string{}
@@ -457,7 +551,7 @@ func (t *treePlacer) placeLogWithAxis(x, y, z int, axis string) error {
 	// The trunk placer's setter is the BiConsumer that fills Context's logs list, so
 	// every log - and the block under it - is part of what a decorator sees.
 	t.placements = append(t.placements, treePlacement{x: x, y: y, z: z, isLog: true})
-	return nil
+	return true, nil
 }
 
 // supportsAllParts answers, before a single block is written, whether every placer and
@@ -475,24 +569,33 @@ func (t *treePlacer) supportsAllParts() error {
 	// rejected cell free everywhere else in this file.
 	switch t.config.TrunkPlacer.Type {
 	case "minecraft:straight_trunk_placer", "minecraft:giant_trunk_placer",
-		"minecraft:fancy_trunk_placer", "minecraft:dark_oak_trunk_placer":
+		"minecraft:fancy_trunk_placer", "minecraft:dark_oak_trunk_placer",
+		"minecraft:forking_trunk_placer", "minecraft:mega_jungle_trunk_placer",
+		"minecraft:cherry_trunk_placer", "minecraft:bending_trunk_placer",
+		"minecraft:upwards_branching_trunk_placer":
 	default:
 		return &unmodelledPart{kind: "trunk_placer", name: t.config.TrunkPlacer.Type}
 	}
 	switch t.config.FoliagePlacer.Type {
 	case "minecraft:blob_foliage_placer", "minecraft:fancy_foliage_placer", "minecraft:pine_foliage_placer",
 		"minecraft:spruce_foliage_placer", "minecraft:mega_pine_foliage_placer",
-		"minecraft:dark_oak_foliage_placer":
+		"minecraft:dark_oak_foliage_placer", "minecraft:acacia_foliage_placer",
+		"minecraft:bush_foliage_placer", "minecraft:jungle_foliage_placer",
+		"minecraft:cherry_foliage_placer", "minecraft:random_spread_foliage_placer":
 	default:
 		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
 	}
-	// Decorators are deliberately not checked here. A canopy placer this build has not
-	// read means the tree has no body, so refusing it is right; a decorator runs after
-	// the trunk and canopy are already in the world, so the only thing an un-modelled
-	// one costs is its own blocks. Refusing the tree for that drops the land capture's
-	// tree cells from 577 to 370 and widens the surface band from 945 to 989 - 101
-	// place_on_ground refusals, the leaf litter under birches, each taking a whole
-	// canopy with it. placeDecorators counts and skips them instead.
+	if len(t.config.RootPlacer) > 0 {
+		var head struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(t.config.RootPlacer, &head); err != nil {
+			return err
+		}
+		if head.Type != "minecraft:mangrove_root_placer" {
+			return &unmodelledPart{kind: "root_placer", name: head.Type}
+		}
+	}
 	return nil
 }
 
@@ -566,6 +669,36 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 	case "minecraft:dark_oak_trunk_placer":
 		var err error
 		attachments, err = t.placeDarkOakTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
+	case "minecraft:forking_trunk_placer":
+		var err error
+		attachments, err = t.placeForkingTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
+	case "minecraft:mega_jungle_trunk_placer":
+		var err error
+		attachments, err = t.placeMegaJungleTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
+	case "minecraft:cherry_trunk_placer":
+		var err error
+		attachments, err = t.placeCherryTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
+	case "minecraft:bending_trunk_placer":
+		var err error
+		attachments, err = t.placeBendingTrunk(x, y, z)
+		if err != nil {
+			return err
+		}
+	case "minecraft:upwards_branching_trunk_placer":
+		var err error
+		attachments, err = t.placeUpwardsBranchingTrunk(x, y, z)
 		if err != nil {
 			return err
 		}
@@ -989,10 +1122,695 @@ func (t *treePlacer) placeFoliage(at trunkAttachment, offset int) error {
 				return err
 			}
 		}
+	case "minecraft:acacia_foliage_placer":
+		base := trunkAttachment{x: at.x, y: at.y + offset, z: at.z, radiusExtra: at.radiusExtra, doubleTrunk: at.doubleTrunk}
+		if err := t.placeLeavesRow(base, t.foliageRadius+at.radiusExtra, -1-t.foliageHeight); err != nil {
+			return err
+		}
+		if err := t.placeLeavesRow(base, t.foliageRadius-1, -t.foliageHeight); err != nil {
+			return err
+		}
+		if err := t.placeLeavesRow(base, t.foliageRadius+at.radiusExtra-1, 0); err != nil {
+			return err
+		}
+	case "minecraft:bush_foliage_placer":
+		for rowY := offset; rowY >= offset-t.foliageHeight; rowY-- {
+			radius := t.foliageRadius + at.radiusExtra - 1 - rowY
+			if err := t.placeLeavesRow(at, radius, rowY); err != nil {
+				return err
+			}
+		}
+	case "minecraft:jungle_foliage_placer":
+		leafHeight := 1 + int(t.random.NextIntN(2))
+		if at.doubleTrunk {
+			leafHeight = t.foliageHeight
+		}
+		for rowY := offset; rowY >= offset-leafHeight; rowY-- {
+			radius := t.foliageRadius + at.radiusExtra + 1 - rowY
+			if err := t.placeLeavesRow(at, radius, rowY); err != nil {
+				return err
+			}
+		}
+	case "minecraft:cherry_foliage_placer":
+		if _, ok := t.config.FoliagePlacer.Float("corner_hole_chance"); !ok {
+			return fmt.Errorf("world: cherry_foliage_placer has no corner_hole_chance")
+		}
+		if _, ok := t.config.FoliagePlacer.Float("wide_bottom_layer_hole_chance"); !ok {
+			return fmt.Errorf("world: cherry_foliage_placer has no wide_bottom_layer_hole_chance")
+		}
+		hangingChance, ok := t.config.FoliagePlacer.Float("hanging_leaves_chance")
+		if !ok {
+			return fmt.Errorf("world: cherry_foliage_placer has no hanging_leaves_chance")
+		}
+		hangingExtChance, ok := t.config.FoliagePlacer.Float("hanging_leaves_extension_chance")
+		if !ok {
+			return fmt.Errorf("world: cherry_foliage_placer has no hanging_leaves_extension_chance")
+		}
+		base := trunkAttachment{x: at.x, y: at.y + offset, z: at.z, radiusExtra: at.radiusExtra, doubleTrunk: at.doubleTrunk}
+		currentRadius := t.foliageRadius + at.radiusExtra - 1
+		if err := t.placeLeavesRow(base, currentRadius-2, t.foliageHeight-3); err != nil {
+			return err
+		}
+		if err := t.placeLeavesRow(base, currentRadius-1, t.foliageHeight-4); err != nil {
+			return err
+		}
+		for rowY := t.foliageHeight - 5; rowY >= 0; rowY-- {
+			if err := t.placeLeavesRow(base, currentRadius, rowY); err != nil {
+				return err
+			}
+		}
+		if err := t.placeLeavesRowWithHangingLeavesBelow(base, currentRadius, -1, float32(hangingChance), float32(hangingExtChance)); err != nil {
+			return err
+		}
+		if err := t.placeLeavesRowWithHangingLeavesBelow(base, currentRadius-1, -2, float32(hangingChance), float32(hangingExtChance)); err != nil {
+			return err
+		}
+	case "minecraft:random_spread_foliage_placer":
+		attempts, ok := t.config.FoliagePlacer.Scalar("leaf_placement_attempts")
+		if !ok {
+			return fmt.Errorf("world: random_spread_foliage_placer has no leaf_placement_attempts")
+		}
+		for i := 0; i < attempts; i++ {
+			dx := int(t.random.NextIntN(int32(t.foliageRadius))) - int(t.random.NextIntN(int32(t.foliageRadius)))
+			dy := int(t.random.NextIntN(int32(t.foliageHeight))) - int(t.random.NextIntN(int32(t.foliageHeight)))
+			dz := int(t.random.NextIntN(int32(t.foliageRadius))) - int(t.random.NextIntN(int32(t.foliageRadius)))
+			if _, err := t.placeLeaf(at.x+dx, at.y+dy, at.z+dz, cellIsPlaceable); err != nil {
+				return err
+			}
+		}
 	default:
 		return &unmodelledPart{kind: "foliage_placer", name: t.config.FoliagePlacer.Type}
 	}
 	return nil
+}
+
+// placeForkingTrunk is ForkingTrunkPlacer.placeTrunk.
+func (t *treePlacer) placeForkingTrunk(x, y, z int) ([]trunkAttachment, error) {
+	if err := t.placeBelowTrunk(x, y-1, z); err != nil {
+		return nil, err
+	}
+	leanDirIdx := int(t.random.NextIntN(4))
+	leanDir := darkOakDirections[leanDirIdx]
+	leanHeight := t.trunkHeight - int(t.random.NextIntN(4)) - 1
+	leanSteps := 3 - int(t.random.NextIntN(3))
+
+	var attachments []trunkAttachment
+	tx, tz := x, z
+	eySet := false
+	ey := 0
+	for yo := 0; yo < t.trunkHeight; yo++ {
+		yy := y + yo
+		if yo >= leanHeight && leanSteps > 0 {
+			tx += leanDir[0]
+			tz += leanDir[1]
+			leanSteps--
+		}
+		placed, err := t.placeLogBoolAt(tx, yy, tz)
+		if err != nil {
+			return nil, err
+		}
+		if placed {
+			ey = yy + 1
+			eySet = true
+		}
+	}
+	if eySet {
+		attachments = append(attachments, trunkAttachment{x: tx, y: ey, z: tz, radiusExtra: 1})
+	}
+
+	tx, tz = x, z
+	branchDirIdx := int(t.random.NextIntN(4))
+	if branchDirIdx != leanDirIdx {
+		branchDir := darkOakDirections[branchDirIdx]
+		branchPos := leanHeight - int(t.random.NextIntN(2)) - 1
+		branchSteps := 1 + int(t.random.NextIntN(3))
+		eySet = false
+		for yo := branchPos; yo < t.trunkHeight && branchSteps > 0; yo, branchSteps = yo+1, branchSteps-1 {
+			if yo >= 1 {
+				yy := y + yo
+				tx += branchDir[0]
+				tz += branchDir[1]
+				placed, err := t.placeLogBoolAt(tx, yy, tz)
+				if err != nil {
+					return nil, err
+				}
+				if placed {
+					ey = yy + 1
+					eySet = true
+				}
+			}
+		}
+		if eySet {
+			attachments = append(attachments, trunkAttachment{x: tx, y: ey, z: tz})
+		}
+	}
+	return attachments, nil
+}
+
+// placeMegaJungleTrunk is MegaJungleTrunkPlacer.placeTrunk.
+func (t *treePlacer) placeMegaJungleTrunk(x, y, z int) ([]trunkAttachment, error) {
+	corners := [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}}
+	for _, c := range corners {
+		if err := t.placeBelowTrunk(x+c[0], y-1, z+c[1]); err != nil {
+			return nil, err
+		}
+	}
+	for i := 0; i < t.trunkHeight; i++ {
+		for _, c := range corners {
+			if err := t.placeLogIfFreeAt(x+c[0], y+i, z+c[1]); err != nil {
+				return nil, err
+			}
+		}
+	}
+	attachments := []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, doubleTrunk: true}}
+	for branchHeight := t.trunkHeight - 2 - int(t.random.NextIntN(4)); branchHeight > t.trunkHeight/2; branchHeight -= 2 + int(t.random.NextIntN(4)) {
+		angle := t.random.NextFloat() * (float32(math.Pi) * 2.0)
+		bx, bz := 0, 0
+		for b := 0; b < 5; b++ {
+			bx = int(1.5 + worldgen.MthCos(float64(angle))*float32(b))
+			bz = int(1.5 + worldgen.MthSin(float64(angle))*float32(b))
+			if err := t.placeLogAt(x+bx, y+branchHeight-3+b/2, z+bz); err != nil {
+				return nil, err
+			}
+		}
+		attachments = append(attachments, trunkAttachment{x: x + bx, y: y + branchHeight, z: z + bz, radiusExtra: -2})
+	}
+	return attachments, nil
+}
+
+// placeCherryTrunk is CherryTrunkPlacer.placeTrunk.
+func (t *treePlacer) placeCherryTrunk(x, y, z int) ([]trunkAttachment, error) {
+	branchCountProv, ok, err := t.config.TrunkPlacer.Provider("branch_count")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: cherry_trunk_placer missing branch_count")
+	}
+	branchHorizProv, ok, err := t.config.TrunkPlacer.Provider("branch_horizontal_length")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: cherry_trunk_placer missing branch_horizontal_length")
+	}
+	branchStartProv, ok, err := t.config.TrunkPlacer.Provider("branch_start_offset_from_top")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: cherry_trunk_placer missing branch_start_offset_from_top")
+	}
+	branchEndProv, ok, err := t.config.TrunkPlacer.Provider("branch_end_offset_from_top")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: cherry_trunk_placer missing branch_end_offset_from_top")
+	}
+
+	if err := t.placeBelowTrunk(x, y-1, z); err != nil {
+		return nil, err
+	}
+	firstBranchOffset := max(0, t.trunkHeight-1+branchStartProv.Sample(t.random))
+	secondBranchStartProv := worldgen.NestedIntProvider{
+		Type: "uniform",
+		Min:  branchStartProv.Min,
+		Max:  branchStartProv.Max - 1,
+	}
+	secondBranchOffset := max(0, t.trunkHeight-1+secondBranchStartProv.Sample(t.random))
+	if secondBranchOffset >= firstBranchOffset {
+		secondBranchOffset++
+	}
+	branchCount := branchCountProv.Sample(t.random)
+	hasMiddle := branchCount == 3
+	hasBoth := branchCount >= 2
+
+	var actualTrunkHeight int
+	if hasMiddle {
+		actualTrunkHeight = t.trunkHeight
+	} else if hasBoth {
+		actualTrunkHeight = max(firstBranchOffset, secondBranchOffset) + 1
+	} else {
+		actualTrunkHeight = firstBranchOffset + 1
+	}
+	for i := 0; i < actualTrunkHeight; i++ {
+		if err := t.placeLogAt(x, y+i, z); err != nil {
+			return nil, err
+		}
+	}
+	var attachments []trunkAttachment
+	if hasMiddle {
+		attachments = append(attachments, trunkAttachment{x: x, y: y + actualTrunkHeight, z: z})
+	}
+	treeDirIdx := int(t.random.NextIntN(4))
+	treeDir := darkOakDirections[treeDirIdx]
+	sidewaysAxis := "z"
+	if treeDir[0] != 0 {
+		sidewaysAxis = "x"
+	}
+	firstAt, err := t.generateCherryBranch(x, y, z, sidewaysAxis, treeDir, firstBranchOffset, firstBranchOffset < actualTrunkHeight-1, branchHorizProv, branchEndProv)
+	if err != nil {
+		return nil, err
+	}
+	attachments = append(attachments, firstAt)
+	if hasBoth {
+		oppDir := [2]int{-treeDir[0], -treeDir[1]}
+		secondAt, err := t.generateCherryBranch(x, y, z, sidewaysAxis, oppDir, secondBranchOffset, secondBranchOffset < actualTrunkHeight-1, branchHorizProv, branchEndProv)
+		if err != nil {
+			return nil, err
+		}
+		attachments = append(attachments, secondAt)
+	}
+	return attachments, nil
+}
+
+func (t *treePlacer) generateCherryBranch(
+	originX, originY, originZ int,
+	sidewaysAxis string,
+	branchDir [2]int,
+	offsetFromOrigin int,
+	middleContinuesUpwards bool,
+	branchHorizProv, branchEndProv worldgen.NestedIntProvider,
+) (trunkAttachment, error) {
+	logX, logY, logZ := originX, originY+offsetFromOrigin, originZ
+	branchEndPosOffsetFromOrigin := t.trunkHeight - 1 + branchEndProv.Sample(t.random)
+	extendBranchAwayFromTrunk := middleContinuesUpwards || branchEndPosOffsetFromOrigin < offsetFromOrigin
+	distanceToTrunk := branchHorizProv.Sample(t.random)
+	if extendBranchAwayFromTrunk {
+		distanceToTrunk++
+	}
+	endX := originX + branchDir[0]*distanceToTrunk
+	endY := originY + branchEndPosOffsetFromOrigin
+	endZ := originZ + branchDir[1]*distanceToTrunk
+
+	stepsHorizontally := 1
+	if extendBranchAwayFromTrunk {
+		stepsHorizontally = 2
+	}
+	for i := 0; i < stepsHorizontally; i++ {
+		logX += branchDir[0]
+		logZ += branchDir[1]
+		if err := t.placeLogWithAxis(logX, logY, logZ, sidewaysAxis); err != nil {
+			return trunkAttachment{}, err
+		}
+	}
+	vertStep := -1
+	if endY > logY {
+		vertStep = 1
+	}
+	for {
+		distance := abs(endX-logX) + abs(endY-logY) + abs(endZ-logZ)
+		if distance == 0 {
+			break
+		}
+		chanceToGrowVertically := float32(abs(endY-logY)) / float32(distance)
+		growVertically := t.random.NextFloat() < chanceToGrowVertically
+		if growVertically {
+			logY += vertStep
+			if err := t.placeLogAt(logX, logY, logZ); err != nil {
+				return trunkAttachment{}, err
+			}
+		} else {
+			logX += branchDir[0]
+			logZ += branchDir[1]
+			if err := t.placeLogWithAxis(logX, logY, logZ, sidewaysAxis); err != nil {
+				return trunkAttachment{}, err
+			}
+		}
+	}
+	return trunkAttachment{x: endX, y: endY + 1, z: endZ}, nil
+}
+
+// placeBendingTrunk is BendingTrunkPlacer.placeTrunk.
+func (t *treePlacer) placeBendingTrunk(x, y, z int) ([]trunkAttachment, error) {
+	minHeightForLeaves, ok := t.config.TrunkPlacer.Scalar("min_height_for_leaves")
+	if !ok {
+		return nil, fmt.Errorf("world: bending_trunk_placer missing min_height_for_leaves")
+	}
+	bendLengthProv, ok, err := t.config.TrunkPlacer.Provider("bend_length")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: bending_trunk_placer missing bend_length")
+	}
+	dir := darkOakDirections[int(t.random.NextIntN(4))]
+	logHeight := t.trunkHeight - 1
+	px, py, pz := x, y, z
+	if err := t.placeBelowTrunk(px, py-1, pz); err != nil {
+		return nil, err
+	}
+	var attachments []trunkAttachment
+	for i := 0; i <= logHeight; i++ {
+		if i+1 >= logHeight+int(t.random.NextIntN(2)) {
+			px += dir[0]
+			pz += dir[1]
+		}
+		if t.validTreePos(px, py, pz) {
+			if err := t.placeLogAt(px, py, pz); err != nil {
+				return nil, err
+			}
+		}
+		if i >= minHeightForLeaves {
+			attachments = append(attachments, trunkAttachment{x: px, y: py, z: pz})
+		}
+		py++
+	}
+	dirLength := bendLengthProv.Sample(t.random)
+	for i := 0; i <= dirLength; i++ {
+		if t.validTreePos(px, py, pz) {
+			if err := t.placeLogAt(px, py, pz); err != nil {
+				return nil, err
+			}
+		}
+		attachments = append(attachments, trunkAttachment{x: px, y: py, z: pz})
+		px += dir[0]
+		pz += dir[1]
+	}
+	return attachments, nil
+}
+
+// placeUpwardsBranchingTrunk is UpwardsBranchingTrunkPlacer.placeTrunk.
+func (t *treePlacer) placeUpwardsBranchingTrunk(x, y, z int) ([]trunkAttachment, error) {
+	extraBranchSteps, ok, err := t.config.TrunkPlacer.Provider("extra_branch_steps")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: upwards_branching_trunk_placer missing extra_branch_steps")
+	}
+	extraBranchLength, ok, err := t.config.TrunkPlacer.Provider("extra_branch_length")
+	if err != nil || !ok {
+		return nil, fmt.Errorf("world: upwards_branching_trunk_placer missing extra_branch_length")
+	}
+	branchProb, ok := t.config.TrunkPlacer.Float("place_branch_per_log_probability")
+	if !ok {
+		return nil, fmt.Errorf("world: upwards_branching_trunk_placer missing place_branch_per_log_probability")
+	}
+	rawGrowThrough, ok := t.config.TrunkPlacer.Fields["can_grow_through"]
+	if !ok {
+		return nil, fmt.Errorf("world: upwards_branching_trunk_placer missing can_grow_through")
+	}
+	growThroughList, err := parseBlockListOrTag(rawGrowThrough)
+	if err != nil {
+		return nil, err
+	}
+
+	var attachments []trunkAttachment
+	for heightPos := 0; heightPos < t.trunkHeight; heightPos++ {
+		cy := y + heightPos
+		placed, err := t.placeLogUpwardsBranching(x, cy, z, growThroughList)
+		if err != nil {
+			return nil, err
+		}
+		if placed && heightPos < t.trunkHeight-1 && t.random.NextFloat() < float32(branchProb) {
+			branchDir := darkOakDirections[int(t.random.NextIntN(4))]
+			branchLen := extraBranchLength.Sample(t.random)
+			branchPos := max(0, branchLen-extraBranchLength.Sample(t.random)-1)
+			branchSteps := extraBranchSteps.Sample(t.random)
+			if err := t.placeUpwardsBranch(x, cy, z, branchDir, branchPos, branchSteps, growThroughList, &attachments); err != nil {
+				return nil, err
+			}
+		}
+		if heightPos == t.trunkHeight-1 {
+			attachments = append(attachments, trunkAttachment{x: x, y: cy + 1, z: z})
+		}
+	}
+	return attachments, nil
+}
+
+func (t *treePlacer) placeUpwardsBranch(
+	x, cy, z int,
+	dir [2]int,
+	branchPos, branchSteps int,
+	growThroughList []string,
+	attachments *[]trunkAttachment,
+) error {
+	yPos := cy
+	eySet := false
+	ey := 0
+	for j := branchPos; j < t.trunkHeight && branchSteps > 0 && j >= 1; j, branchSteps = j+1, branchSteps-1 {
+		yPos++
+		bx := x + dir[0]*j
+		bz := z + dir[1]*j
+		placed, err := t.placeLogUpwardsBranching(bx, yPos, bz, growThroughList)
+		if err != nil {
+			return err
+		}
+		if placed {
+			ey = yPos + 1
+			eySet = true
+		}
+	}
+	if eySet {
+		*attachments = append(*attachments, trunkAttachment{
+			x: x + dir[0]*branchPos,
+			y: ey,
+			z: z + dir[1]*branchPos,
+		})
+	}
+	return nil
+}
+
+func (t *treePlacer) placeLogUpwardsBranching(x, y, z int, growThroughList []string) (bool, error) {
+	if !t.validTreePosOrGrowThrough(x, y, z, growThroughList) {
+		return false, nil
+	}
+	spec, err := t.set.StateProvider(t.config.TrunkProvider.Raw)
+	if err != nil {
+		return false, err
+	}
+	state, err := t.r.sampleStateProvider(t.set, spec, t.random, worldgen.FeaturePosition{X: x, Y: y, Z: z})
+	if err != nil {
+		return false, err
+	}
+	t.r.setBlock(x, y, z, state)
+	t.placements = append(t.placements, treePlacement{x: x, y: y, z: z, isLog: true})
+	return true, nil
+}
+
+func (t *treePlacer) validTreePosOrGrowThrough(x, y, z int, growThroughList []string) bool {
+	if t.validTreePos(x, y, z) {
+		return true
+	}
+	return t.matchesBlockListOrTag(x, y, z, growThroughList)
+}
+
+func (t *treePlacer) matchesBlockListOrTag(x, y, z int, entries []string) bool {
+	name, ok := stateByID(t.stateAt(x, y, z))
+	if !ok {
+		return false
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry, "#") {
+			if flattenBlockTagContains(t.set, strings.TrimPrefix(entry, "#"), name.Name) {
+				return true
+			}
+		} else if name.Name == entry {
+			return true
+		}
+	}
+	return false
+}
+
+func parseBlockListOrTag(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if raw[0] == '"' {
+		var single string
+		if err := json.Unmarshal(raw, &single); err != nil {
+			return nil, err
+		}
+		return []string{single}, nil
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+type mangroveRootPlacerConfig struct {
+	Type               string          `json:"type"`
+	TrunkOffsetY       json.RawMessage `json:"trunk_offset_y"`
+	RootProvider       json.RawMessage `json:"root_provider"`
+	AboveRootPlacement *struct {
+		AboveRootProvider        json.RawMessage `json:"above_root_provider"`
+		AboveRootPlacementChance float32         `json:"above_root_placement_chance"`
+	} `json:"above_root_placement"`
+	MangroveRootPlacement struct {
+		MaxRootWidth       int             `json:"max_root_width"`
+		MaxRootLength      int             `json:"max_root_length"`
+		MuddyRootsIn       json.RawMessage `json:"muddy_roots_in"`
+		MuddyRootsProvider json.RawMessage `json:"muddy_roots_provider"`
+		CanGrowThrough     json.RawMessage `json:"can_grow_through"`
+		RandomSkewChance   float32         `json:"random_skew_chance"`
+	} `json:"mangrove_root_placement"`
+}
+
+func (t *treePlacer) sampleTrunkOriginY(originY int) (int, error) {
+	var cfg mangroveRootPlacerConfig
+	if err := json.Unmarshal(t.config.RootPlacer, &cfg); err != nil {
+		return 0, err
+	}
+	var dummy worldgen.TreeTrunkPlacer
+	dummy.Fields = map[string]json.RawMessage{"trunk_offset_y": cfg.TrunkOffsetY}
+	prov, ok, err := dummy.Provider("trunk_offset_y")
+	if err != nil || !ok {
+		return 0, fmt.Errorf("world: mangrove_root_placer missing trunk_offset_y")
+	}
+	return originY + prov.Sample(t.random), nil
+}
+
+func (t *treePlacer) placeMangroveRoots(origin worldgen.FeaturePosition, trunkOriginY int) (bool, error) {
+	var cfg mangroveRootPlacerConfig
+	if err := json.Unmarshal(t.config.RootPlacer, &cfg); err != nil {
+		return false, err
+	}
+	canGrowThrough, err := parseBlockListOrTag(cfg.MangroveRootPlacement.CanGrowThrough)
+	if err != nil {
+		return false, err
+	}
+	muddyRootsIn, err := parseBlockListOrTag(cfg.MangroveRootPlacement.MuddyRootsIn)
+	if err != nil {
+		return false, err
+	}
+	rootSpec, err := t.set.StateProvider(cfg.RootProvider)
+	if err != nil {
+		return false, err
+	}
+	muddySpec, err := t.set.StateProvider(cfg.MangroveRootPlacement.MuddyRootsProvider)
+	if err != nil {
+		return false, err
+	}
+	var aboveSpec worldgen.StateProviderSpec
+	hasAbove := cfg.AboveRootPlacement != nil
+	if hasAbove {
+		aboveSpec, err = t.set.StateProvider(cfg.AboveRootPlacement.AboveRootProvider)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	canPlaceRoot := func(x, y, z int) bool {
+		return t.validTreePosOrGrowThrough(x, y, z, canGrowThrough)
+	}
+
+	for cy := origin.Y; cy < trunkOriginY; cy++ {
+		if !canPlaceRoot(origin.X, cy, origin.Z) {
+			return false, nil
+		}
+	}
+
+	rootPositions := [][3]int{{origin.X, trunkOriginY - 1, origin.Z}}
+	trunkOrigin := [3]int{origin.X, trunkOriginY, origin.Z}
+
+	var simulateRoots func(pos [3]int, dir [2]int, positions *[][3]int, layer int) bool
+	simulateRoots = func(pos [3]int, dir [2]int, positions *[][3]int, layer int) bool {
+		maxLen := cfg.MangroveRootPlacement.MaxRootLength
+		if layer == maxLen || len(*positions) > maxLen {
+			return false
+		}
+		potentials := t.potentialMangroveRootPositions(pos, dir, trunkOrigin, cfg.MangroveRootPlacement.MaxRootWidth, cfg.MangroveRootPlacement.RandomSkewChance)
+		for _, p := range potentials {
+			if canPlaceRoot(p[0], p[1], p[2]) {
+				*positions = append(*positions, p)
+				if !simulateRoots(p, dir, positions, layer+1) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	for _, dir := range darkOakDirections {
+		startPos := [3]int{trunkOrigin[0] + dir[0], trunkOrigin[1], trunkOrigin[2] + dir[1]}
+		var positionsInDir [][3]int
+		if !simulateRoots(startPos, dir, &positionsInDir, 0) {
+			return false, nil
+		}
+		rootPositions = append(rootPositions, positionsInDir...)
+		rootPositions = append(rootPositions, startPos)
+	}
+
+	for _, pos := range rootPositions {
+		px, py, pz := pos[0], pos[1], pos[2]
+		if t.matchesBlockListOrTag(px, py, pz, muddyRootsIn) {
+			state, err := t.r.sampleStateProvider(t.set, muddySpec, t.random, worldgen.FeaturePosition{X: px, Y: py, Z: pz})
+			if err != nil {
+				return false, err
+			}
+			state = t.waterlogRootState(px, py, pz, state)
+			t.r.setBlock(px, py, pz, state)
+			t.placements = append(t.placements, treePlacement{x: px, y: py, z: pz, isRoot: true})
+			continue
+		}
+		if !canPlaceRoot(px, py, pz) {
+			continue
+		}
+		state, err := t.r.sampleStateProvider(t.set, rootSpec, t.random, worldgen.FeaturePosition{X: px, Y: py, Z: pz})
+		if err != nil {
+			return false, err
+		}
+		state = t.waterlogRootState(px, py, pz, state)
+		t.r.setBlock(px, py, pz, state)
+		t.placements = append(t.placements, treePlacement{x: px, y: py, z: pz, isRoot: true})
+		if hasAbove {
+			ax, ay, az := px, py+1, pz
+			if t.random.NextFloat() < cfg.AboveRootPlacement.AboveRootPlacementChance && isAirState(t.stateAt(ax, ay, az)) {
+				aboveState, err := t.r.sampleStateProvider(t.set, aboveSpec, t.random, worldgen.FeaturePosition{X: ax, Y: ay, Z: az})
+				if err != nil {
+					return false, err
+				}
+				aboveState = t.waterlogRootState(ax, ay, az, aboveState)
+				t.r.setBlock(ax, ay, az, aboveState)
+				t.placements = append(t.placements, treePlacement{x: ax, y: ay, z: az, isRoot: true})
+			}
+		}
+	}
+	return true, nil
+}
+
+func (t *treePlacer) potentialMangroveRootPositions(pos [3]int, prevDir [2]int, rootOrigin [3]int, maxRootWidth int, randomSkewChance float32) [][3]int {
+	below := [3]int{pos[0], pos[1] - 1, pos[2]}
+	nextTo := [3]int{pos[0] + prevDir[0], pos[1], pos[2] + prevDir[1]}
+	width := abs(pos[0]-rootOrigin[0]) + abs(pos[1]-rootOrigin[1]) + abs(pos[2]-rootOrigin[2])
+	if width > maxRootWidth-3 && width <= maxRootWidth {
+		if t.random.NextFloat() < randomSkewChance {
+			return [][3]int{below, {nextTo[0], nextTo[1] - 1, nextTo[2]}}
+		}
+		return [][3]int{below}
+	}
+	if width > maxRootWidth {
+		return [][3]int{below}
+	}
+	if t.random.NextFloat() < randomSkewChance {
+		return [][3]int{below}
+	}
+	if t.random.NextBoolean() {
+		return [][3]int{nextTo}
+	}
+	return [][3]int{below}
+}
+
+func (t *treePlacer) waterlogRootState(x, y, z int, state uint16) uint16 {
+	name, ok := stateByID(state)
+	if !ok {
+		return state
+	}
+	if _, has := name.Properties["waterlogged"]; !has {
+		return state
+	}
+	wet := isWaterFluidState(t.stateAt(x, y, z))
+	merged := make(map[string]string, len(name.Properties))
+	for k, v := range name.Properties {
+		merged[k] = v
+	}
+	if wet {
+		merged["waterlogged"] = "true"
+	} else {
+		merged["waterlogged"] = "false"
+	}
+	if resolved, ok := nameToStateID(name.Name, merged); ok {
+		return resolved
+	}
+	return state
+}
+
+func isWaterFluidState(id uint16) bool {
+	name, ok := stateByID(id)
+	if !ok {
+		return false
+	}
+	if name.Name == "minecraft:water" || name.Name == "minecraft:kelp" || name.Name == "minecraft:kelp_plant" ||
+		name.Name == "minecraft:seagrass" || name.Name == "minecraft:tall_seagrass" || name.Name == "minecraft:bubble_column" {
+		return true
+	}
+	return name.Properties["waterlogged"] == "true"
 }
 
 // floorFloat32 is Mth.floor(float): Java's narrowing cast truncates toward zero and

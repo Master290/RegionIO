@@ -51,7 +51,7 @@ func (r *decorationRegion) placeScheduledGeodes(seed int64) error {
 		// on anything that was not a geode, which is how forest_rock stayed invisible
 		// while a hand-written boulder heuristic placed a different shape instead.
 		switch configured.Type {
-		case "minecraft:geode", "minecraft:block_blob", "minecraft:large_dripstone":
+		case "minecraft:geode", "minecraft:block_blob", "minecraft:large_dripstone", "minecraft:iceberg":
 		default:
 			noteNotReplayed(fmt.Sprintf("stage%d:%s", geodesStage, configured.Type))
 			continue
@@ -79,6 +79,18 @@ func (r *decorationRegion) placeScheduledGeodes(seed int64) error {
 			}
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 				return r.placeLargeDripstone(set, random, position, dripstone)
+			}); err != nil {
+				return err
+			}
+			continue
+		case "minecraft:iceberg":
+			iceCfg, err := set.BlockStateConfig(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeIceberg(random, position, iceCfg)
+				return nil
 			}); err != nil {
 				return err
 			}
@@ -352,3 +364,279 @@ func geodeCrackPoints(origin worldgen.FeaturePosition, random worldgen.RandomSou
 		return []geodePoint{{x: origin.X, y: origin.Y + 7, z: origin.Z}, {x: origin.X, y: origin.Y + 5, z: origin.Z}, {x: origin.X, y: origin.Y + 1, z: origin.Z}}
 	}
 }
+
+func (r *decorationRegion) placeIceberg(random worldgen.RandomSource, origin worldgen.FeaturePosition, config worldgen.BlockStateFeatureConfig) bool {
+	origin.Y = SeaLevel
+	freehand := random.NextDouble() > 0.7
+	mainState, ok := nameToStateID(config.State.Name, config.State.Properties)
+	if !ok {
+		return false
+	}
+	shapeAngle := random.NextDouble() * 2.0 * math.Pi
+	ellipseA := 11 - int(random.NextIntN(5))
+	ellipseC := 3 + int(random.NextIntN(3))
+	isEllipse := random.NextDouble() > 0.7
+	var overhangHeight int
+	if isEllipse {
+		overhangHeight = int(random.NextIntN(6)) + 6
+	} else {
+		overhangHeight = int(random.NextIntN(15)) + 3
+	}
+	var underWaterHeight int
+	if !isEllipse && random.NextDouble() > 0.9 {
+		underWaterHeight = int(random.NextIntN(19)) + 7
+	} else {
+		underWaterHeight = int(random.NextIntN(8)) + 7
+	}
+	height := min(overhangHeight+int(random.NextIntN(11)), 18)
+	width := min(overhangHeight+int(random.NextIntN(7))-int(random.NextIntN(5)), 11)
+	a := 11
+	if isEllipse {
+		a = ellipseA
+	}
+	for xo := -a; xo < a; xo++ {
+		for zo := -a; zo < a; zo++ {
+			for yOff := 0; yOff < height; yOff++ {
+				var rad int
+				if isEllipse {
+					rad = icebergHeightDependentRadiusEllipse(yOff, height, width)
+				} else {
+					rad = icebergHeightDependentRadiusRound(random, yOff, height, width)
+				}
+				if isEllipse || xo < rad {
+					r.generateIcebergBlock(random, origin, height, xo, yOff, zo, rad, a, isEllipse, ellipseC, shapeAngle, freehand, mainState)
+				}
+			}
+		}
+	}
+	r.smoothIceberg(origin, width, height, isEllipse, ellipseA)
+	for xo := -a; xo < a; xo++ {
+		for zo := -a; zo < a; zo++ {
+			for yOff := -1; yOff > -underWaterHeight; yOff-- {
+				newA := a
+				if isEllipse {
+					newA = int(math.Ceil(float64(float32(a) * (1.0 - float32(math.Pow(float64(yOff), 2.0))/(float32(underWaterHeight)*8.0)))))
+				}
+				rad := icebergHeightDependentRadiusSteep(random, -yOff, underWaterHeight, width)
+				if xo < rad {
+					r.generateIcebergBlock(random, origin, underWaterHeight, xo, yOff, zo, rad, newA, isEllipse, ellipseC, shapeAngle, freehand, mainState)
+				}
+			}
+		}
+	}
+	var isVerySteep bool
+	if isEllipse {
+		isVerySteep = random.NextDouble() > 0.1
+	} else {
+		isVerySteep = random.NextDouble() > 0.7
+	}
+	if isVerySteep {
+		r.generateIcebergCutOut(random, width, height, origin, isEllipse, ellipseA, shapeAngle, ellipseC)
+	}
+	return true
+}
+
+func (r *decorationRegion) generateIcebergCutOut(random worldgen.RandomSource, width, height int, globalOrigin worldgen.FeaturePosition, isEllipse bool, shapeEllipseA int, shapeAngle float64, shapeEllipseC int) {
+	randomSignX := 1
+	if random.NextBoolean() {
+		randomSignX = -1
+	}
+	randomSignZ := 1
+	if random.NextBoolean() {
+		randomSignZ = -1
+	}
+	xOff := int(random.NextIntN(int32(max(width/2-2, 1))))
+	if random.NextBoolean() {
+		xOff = width/2 + 1 - int(random.NextIntN(int32(max(width-width/2-1, 1))))
+	}
+	zOff := int(random.NextIntN(int32(max(width/2-2, 1))))
+	if random.NextBoolean() {
+		zOff = width/2 + 1 - int(random.NextIntN(int32(max(width-width/2-1, 1))))
+	}
+	if isEllipse {
+		v := int(random.NextIntN(int32(max(shapeEllipseA-5, 1))))
+		xOff = v
+		zOff = v
+	}
+	localOrigin := worldgen.FeaturePosition{X: randomSignX * xOff, Y: 0, Z: randomSignZ * zOff}
+	var angle float64
+	if isEllipse {
+		angle = shapeAngle + math.Pi/2.0
+	} else {
+		angle = random.NextDouble() * 2.0 * math.Pi
+	}
+	for yOff := 0; yOff < height-3; yOff++ {
+		rad := icebergHeightDependentRadiusRound(random, yOff, height, width)
+		r.carveIceberg(rad, yOff, globalOrigin, false, angle, localOrigin, shapeEllipseA, shapeEllipseC)
+	}
+	for yOff := -1; yOff > -height+int(random.NextIntN(5)); yOff-- {
+		rad := icebergHeightDependentRadiusSteep(random, -yOff, height, width)
+		r.carveIceberg(rad, yOff, globalOrigin, true, angle, localOrigin, shapeEllipseA, shapeEllipseC)
+	}
+}
+
+func (r *decorationRegion) carveIceberg(radius, yOff int, globalOrigin worldgen.FeaturePosition, underWater bool, angle float64, localOrigin worldgen.FeaturePosition, shapeEllipseA, shapeEllipseC int) {
+	a := radius + 1 + shapeEllipseA/3
+	c := min(radius-3, 3) + shapeEllipseC/2 - 1
+	for xo := -a; xo < a; xo++ {
+		for zo := -a; zo < a; zo++ {
+			signedDist := icebergSignedDistanceEllipse(xo, zo, localOrigin, a, c, angle)
+			if signedDist < 0.0 {
+				px, py, pz := globalOrigin.X+xo, globalOrigin.Y+yOff, globalOrigin.Z+zo
+				cur := r.getBlock(px, py, pz)
+				if isIcebergBlockState(cur) || blockNameEquals(cur, "minecraft:snow_block") {
+					if underWater {
+						if waterID, ok := nameToStateID("minecraft:water", map[string]string{"level": "0"}); ok {
+							r.setBlockGlobal(px, py, pz, waterID)
+						}
+					} else {
+						r.setBlockGlobal(px, py, pz, StateAir)
+						if blockNameEquals(r.getBlock(px, py+1, pz), "minecraft:snow") {
+							r.setBlockGlobal(px, py+1, pz, StateAir)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func (r *decorationRegion) generateIcebergBlock(random worldgen.RandomSource, origin worldgen.FeaturePosition, height, xo, yOff, zo, radius, a int, isEllipse bool, shapeEllipseC int, shapeAngle float64, snowOnTop bool, mainBlockState uint16) {
+	var signedDist float64
+	if isEllipse {
+		signedDist = icebergSignedDistanceEllipse(xo, zo, worldgen.FeaturePosition{}, a, icebergGetEllipseC(yOff, height, shapeEllipseC), shapeAngle)
+	} else {
+		signedDist = icebergSignedDistanceCircle(xo, zo, worldgen.FeaturePosition{}, radius, random)
+	}
+	if signedDist < 0.0 {
+		px, py, pz := origin.X+xo, origin.Y+yOff, origin.Z+zo
+		var compareVal float64
+		if isEllipse {
+			compareVal = -0.5
+		} else {
+			compareVal = float64(-6 - int(random.NextIntN(3)))
+		}
+		if signedDist > compareVal && random.NextDouble() > 0.9 {
+			return
+		}
+		r.setIcebergBlock(px, py, pz, random, height-yOff, height, isEllipse, snowOnTop, mainBlockState)
+	}
+}
+
+func (r *decorationRegion) setIcebergBlock(px, py, pz int, random worldgen.RandomSource, hDiff, height int, isEllipse, snowOnTop bool, mainBlockState uint16) {
+	cur := r.getBlock(px, py, pz)
+	if isAirState(cur) || blockNameEquals(cur, "minecraft:snow_block") || blockNameEquals(cur, "minecraft:ice") || blockNameEquals(cur, "minecraft:water") {
+		randomness := !isEllipse || random.NextDouble() > 0.05
+		divisor := 2
+		if isEllipse {
+			divisor = 3
+		}
+		if snowOnTop && !blockNameEquals(cur, "minecraft:water") && float64(hDiff) <= float64(random.NextIntN(int32(max(1, height/divisor))))+float64(height)*0.6 && randomness {
+			if snowID, ok := nameToStateID("minecraft:snow_block", nil); ok {
+				r.setBlockGlobal(px, py, pz, snowID)
+				return
+			}
+		}
+		r.setBlockGlobal(px, py, pz, mainBlockState)
+	}
+}
+
+func icebergGetEllipseC(yOff, height, shapeEllipseC int) int {
+	c := shapeEllipseC
+	if yOff > 0 && height-yOff <= 3 {
+		c -= 4 - (height - yOff)
+	}
+	return c
+}
+
+func icebergSignedDistanceCircle(xo, zo int, origin worldgen.FeaturePosition, radius int, random worldgen.RandomSource) float64 {
+	rf := random.NextFloat()
+	if rf < 0.2 {
+		rf = 0.2
+	} else if rf > 0.8 {
+		rf = 0.8
+	}
+	off := 10.0 * rf / float32(radius)
+	return float64(off) + math.Pow(float64(xo-origin.X), 2.0) + math.Pow(float64(zo-origin.Z), 2.0) - math.Pow(float64(radius), 2.0)
+}
+
+func icebergSignedDistanceEllipse(xo, zo int, origin worldgen.FeaturePosition, a, c int, angle float64) float64 {
+	dx := float64(xo - origin.X)
+	dz := float64(zo - origin.Z)
+	u := (dx*math.Cos(angle) - dz*math.Sin(angle)) / float64(a)
+	v := (dx*math.Sin(angle) + dz*math.Cos(angle)) / float64(c)
+	return math.Pow(u, 2.0) + math.Pow(v, 2.0) - 1.0
+}
+
+func icebergHeightDependentRadiusRound(random worldgen.RandomSource, yOff, height, width int) int {
+	k := float32(3.5) - random.NextFloat()
+	scale := (float32(1.0) - float32(math.Pow(float64(yOff), 2.0))/(float32(height)*k)) * float32(width)
+	if height > 15+int(random.NextIntN(5)) {
+		tempYOff := yOff
+		if yOff < 3+int(random.NextIntN(6)) {
+			tempYOff = yOff / 2
+		}
+		scale = (float32(1.0) - float32(tempYOff)/(float32(height)*k*float32(0.4))) * float32(width)
+	}
+	return int(math.Ceil(float64(scale / 2.0)))
+}
+
+func icebergHeightDependentRadiusEllipse(yOff, height, width int) int {
+	scale := (float32(1.0) - float32(math.Pow(float64(yOff), 2.0))/float32(height)) * float32(width)
+	return int(math.Ceil(float64(scale / 2.0)))
+}
+
+func icebergHeightDependentRadiusSteep(random worldgen.RandomSource, yOff, height, width int) int {
+	k := float32(1.0) + random.NextFloat()/2.0
+	scale := (float32(1.0) - float32(yOff)/(float32(height)*k)) * float32(width)
+	return int(math.Ceil(float64(scale / 2.0)))
+}
+
+func isIcebergBlockState(state uint16) bool {
+	return blockNameEquals(state, "minecraft:packed_ice") ||
+		blockNameEquals(state, "minecraft:snow_block") ||
+		blockNameEquals(state, "minecraft:blue_ice")
+}
+
+func blockNameEquals(state uint16, name string) bool {
+	st, ok := stateByID(state)
+	return ok && st.Name == name
+}
+
+func (r *decorationRegion) smoothIceberg(origin worldgen.FeaturePosition, width, height int, isEllipse bool, shapeEllipseA int) {
+	a := width / 2
+	if isEllipse {
+		a = shapeEllipseA
+	}
+	for x := -a; x <= a; x++ {
+		for z := -a; z <= a; z++ {
+			for yOff := 0; yOff <= height; yOff++ {
+				px, py, pz := origin.X+x, origin.Y+yOff, origin.Z+z
+				cur := r.getBlock(px, py, pz)
+				if isIcebergBlockState(cur) || blockNameEquals(cur, "minecraft:snow") {
+					if isAirState(r.getBlock(px, py-1, pz)) {
+						r.setBlockGlobal(px, py, pz, StateAir)
+						r.setBlockGlobal(px, py+1, pz, StateAir)
+					} else if isIcebergBlockState(cur) {
+						sides := [4]uint16{
+							r.getBlock(px-1, py, pz),
+							r.getBlock(px+1, py, pz),
+							r.getBlock(px, py, pz-1),
+							r.getBlock(px, py, pz+1),
+						}
+						counter := 0
+						for _, s := range sides {
+							if !isIcebergBlockState(s) {
+								counter++
+							}
+						}
+						if counter >= 3 {
+							r.setBlockGlobal(px, py, pz, StateAir)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+

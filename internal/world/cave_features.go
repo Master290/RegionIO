@@ -111,6 +111,19 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 		})
 		return placed
 	}
+	if _, isConfigured := set.Configured[ref.Name]; !isConfigured {
+		if pf, isPlaced := set.Placed[ref.Name]; isPlaced {
+			placed := false
+			inner := worldgen.FeatureRef{Name: pf.Feature}
+			_ = set.ForEachPlacementPosition(ref.Name, random, position, r.placementContext(nil), func(pos worldgen.FeaturePosition) error {
+				if r.placeFeatureRef(random, pos, inner, set) {
+					placed = true
+				}
+				return nil
+			})
+			return placed
+		}
+	}
 	configured, ok := set.Configured[ref.Name]
 	if !ok {
 		return false
@@ -134,6 +147,18 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 			return false
 		}
 		return r.placeSimpleRandomSelector(random, position, config, set)
+	case "minecraft:random_boolean_selector":
+		config, err := set.RandomBooleanSelector(ref.Name)
+		if err != nil {
+			return false
+		}
+		chosen := config.FeatureFalse
+		if random.NextBoolean() {
+			chosen = config.FeatureTrue
+		}
+		return r.placeFeatureRef(random, position, chosen, set)
+	case "minecraft:random_selector":
+		return r.placeTreeSelector(set, random, position, ref.Name, r.placementContext(nil)) == nil
 	case "minecraft:vegetation_patch", "minecraft:waterlogged_vegetation_patch":
 		config, err := set.VegetationPatch(ref.Name)
 		if err != nil {
@@ -146,21 +171,46 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 			return false
 		}
 		return r.placePointedDripstone(set, random, position, config)
+	case "minecraft:tree":
+		config, err := set.Tree(ref.Name)
+		if err != nil {
+			return false
+		}
+		placed, err := r.placeTreeWithResult(set, random, position, config)
+		return err == nil && placed
+	case "minecraft:fallen_tree":
+		config, err := set.FallenTree(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeFallenTree(set, random, position, config) == nil
+	case "minecraft:huge_red_mushroom", "minecraft:huge_brown_mushroom":
+		config, err := set.HugeMushroom(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeHugeMushroom(set, random, position, configured.Type, config) == nil
+	case "minecraft:coral_tree", "minecraft:coral_claw", "minecraft:coral_mushroom":
+		return r.placeCoralFeature(random, position, configured.Type, set)
+	case "minecraft:bamboo":
+		config, err := set.Probability(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeBamboo(random, position, config.Probability, set)
+	case "minecraft:root_system":
+		config, err := set.RootSystem(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeRootSystem(random, position, config, set)
+	case "minecraft:sea_pickle":
+		config, err := set.Count(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeSeaPickle(random, position, config, set)
 	}
-	// Nothing in 26.1.2's data reaches this line: the only configured types nested
-	// inside a simple_random_selector or a vegetation patch are simple_block,
-	// simple_random_selector and block_column, measured across every
-	// configured_feature JSON in the embed, which is why this path has no tree
-	// routing to write. Counted rather than silent, because that measurement is a
-	// property of this pack and not of this function - a new biome or a new pack
-	// would otherwise drop a feature with no trace, which is how the kelp and
-	// seagrass gap stayed invisible long enough to corrupt the clay reading.
-	//
-	// It still returns false, and must keep doing so: placePatchVegetationFeature
-	// waterlogs the cell only when the nested call reports that it placed, so
-	// reporting success for a feature that placed nothing would waterlog an empty
-	// cell. That is also why this does not delegate to placeConfiguredVegetation,
-	// which signals the same thing with a nil error.
 	noteNotReplayed("nested:" + configured.Type)
 	return false
 }

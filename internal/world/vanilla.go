@@ -207,6 +207,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	// wait for all of it: the "steep" condition reads the heights of the
 	// column's neighbours, which vanilla takes from the heightmap that doFill
 	// finishes before buildSurface starts.
+	beard := buildChunkBeardifier(od, seed, cx, cz)
 	for lx := 0; lx < 16; lx++ {
 		wg.Add(1)
 		go func(lx int) {
@@ -214,7 +215,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 			interp := make([]float64, len(od.Interpolated))
 			for lz := 0; lz < 16; lz++ {
 				surfTop[lx][lz], worldSurface[lx][lz] =
-					fillVanillaColumn(od, aq, fluidPicker, veins, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
+					fillVanillaColumn(od, aq, fluidPicker, veins, beard, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
 			}
 		}(lx)
 	}
@@ -332,7 +333,7 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.
 // then does the surface rule tree walk the finished column. Doing it the other
 // way round is what forced the old unconditional "flood everything under sea
 // level" pass, which left every cave below y=63 underwater.
-func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int) {
+func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, beard *chunkBeardifier, grids []cornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int) {
 	cx0 := lx / cellWidth
 	cz0 := lz / cellWidth
 	fx := float64(lx%cellWidth) / cellWidth
@@ -348,6 +349,9 @@ func fillVanillaColumn(od *worldgen.OverworldDensity, aq *worldgen.Aquifer, flui
 		y := MinY + i
 		ctx := worldgen.FunctionContext{X: float64(wx), Y: float64(y), Z: float64(wz)}.WithInterp(interp)
 		density := od.Final.Compute(ctx)
+		if beard != nil {
+			density += beard.compute(wx, y, wz)
+		}
 		state, solid := substance(aq, fluidPicker, veins, ctx, wx, y, wz, density)
 		out[i] = state
 		if solid {

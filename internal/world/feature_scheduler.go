@@ -292,6 +292,9 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.placeScheduledMonsterRooms(seed); err != nil {
 			return fmt.Errorf("world: replay source monster rooms (%d,%d): %w", source.X, source.Z, err)
 		}
+		if err := r.placeScheduledSurfaceStructures(seed); err != nil {
+			return fmt.Errorf("world: replay source surface structures (%d,%d): %w", source.X, source.Z, err)
+		}
 		earlyVeg := isDefaultSources && targetX == -1 && targetZ == -1 && source.X == -1 && source.Z == 0
 		if earlyVeg {
 			if err := r.placeScheduledVegetationPatches(seed); err != nil {
@@ -389,8 +392,8 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 		return regionChunks[i][1] < regionChunks[j][1]
 	})
 	var ancientCities []*JigsawStart
-	for sx := targetX - 7; sx <= targetX+7; sx++ {
-		for sz := targetZ - 7; sz <= targetZ+7; sz++ {
+	for sx := targetX - 10; sx <= targetX+10; sx++ {
+		for sz := targetZ - 10; sz <= targetZ+10; sz++ {
 			start, err := JigsawSetGenerationPoint(od, sets, "minecraft:ancient_cities", seed, sx, sz)
 			if err != nil {
 				return err
@@ -432,8 +435,8 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 		stName string
 		radius int32
 	}{
-		{"minecraft:trail_ruins", "minecraft:trail_ruins", 6},
-		{"minecraft:trial_chambers", "minecraft:trial_chambers", 7},
+		{"minecraft:trail_ruins", "minecraft:trail_ruins", 8},
+		{"minecraft:trial_chambers", "minecraft:trial_chambers", 10},
 	} {
 		var starts []*JigsawStart
 		for sx := targetX - ugJigsaw.radius; sx <= targetX+ugJigsaw.radius; sx++ {

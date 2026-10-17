@@ -19,32 +19,40 @@ import (
 // it drew positions, tested, and dropped the tree, which desynchronised the rest of
 // the chunk's decoration for 23 of the 39 configured trees.
 func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.RandomSource, position worldgen.FeaturePosition, config worldgen.TreeFeatureConfig) error {
-	if len(config.RootPlacer) > 0 {
-		// Mangrove and tall_mangrove only. Refusing loudly is the honest answer: a
-		// root placer changes the origin the trunk is built from, so placing the
-		// trunk anyway would be wrong in position rather than merely incomplete.
-		return fmt.Errorf("world: a tree at (%d,%d,%d) has a root_placer, which is not modelled",
-			position.X, position.Y, position.Z)
-	}
+	_, err := r.placeTreeWithResult(set, random, position, config)
+	return err
+}
+
+func (r *decorationRegion) placeTreeWithResult(set *worldgen.FeatureSet, random worldgen.RandomSource, position worldgen.FeaturePosition, config worldgen.TreeFeatureConfig) (bool, error) {
 	planter := &treePlacer{r: r, set: set, random: random, config: config}
 	if err := planter.sampleHeights(); err != nil {
-		return err
+		return false, err
 	}
 	// Checked here rather than discovered halfway: sampleHeights has already spent the
 	// tree's own draws by this point - vanilla spends them the same way - but nothing has
 	// been written, so a tree this build cannot finish leaves no trace in the world.
 	if err := planter.supportsAllParts(); err != nil {
-		return err
+		return false, err
+	}
+
+	trunkOriginY := position.Y
+	if len(config.RootPlacer) > 0 {
+		var err error
+		trunkOriginY, err = planter.sampleTrunkOriginY(position.Y)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	// doPlace's y test, with the sampled trunk height rather than the clamped one:
-	// low = min(origin, origin) and high = max(origin, origin) + trunkHeight + 1.
-	lowY, highY := position.Y, position.Y+planter.trunkHeight+1
+	// low = min(origin, trunkOrigin) and high = max(origin, trunkOrigin) + trunkHeight + 1.
+	lowY := min(position.Y, trunkOriginY)
+	highY := max(position.Y, trunkOriginY) + planter.trunkHeight + 1
 	if lowY < MinY+1 || highY > MinY+WorldHeight-1+1 {
-		return nil
+		return false, nil
 	}
 
-	free := planter.maxFreeTreeHeight(position)
+	free := planter.maxFreeTreeHeight(worldgen.FeaturePosition{X: position.X, Y: trunkOriginY, Z: position.Z})
 	// doPlace's clip test, read at 154-180: proceed only when the free height is the
 	// whole trunk, or when minimum_size names a min_clipped_height the remainder still
 	// clears. An absent min_clipped_height is not "no constraint" - OptionalInt.isEmpty
@@ -54,14 +62,23 @@ func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.R
 	// fancy oak ones, at 4) may keep the stub.
 	if free < planter.trunkHeight {
 		if clipped, ok := config.MinimumSize.MinClippedHeight(); !ok || free < clipped {
-			return nil
+			return false, nil
 		}
 	}
 	// From here the trunk height that matters is the free one. The foliage height and
 	// radius were sampled from the sampled height and are not recomputed.
 	planter.trunkHeight = free
-	if err := planter.placeTrunk(position.X, position.Y, position.Z); err != nil {
-		return err
+	if len(config.RootPlacer) > 0 {
+		ok, err := planter.placeMangroveRoots(position, trunkOriginY)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	if err := planter.placeTrunk(position.X, trunkOriginY, position.Z); err != nil {
+		return false, err
 	}
 	// Leaves are written at their registry default and LeavesBlock works the distance
 	// out afterwards, one neighbour at a time until nothing moves; a saved region is a
@@ -83,9 +100,9 @@ func (r *decorationRegion) placeTree(set *worldgen.FeatureSet, random worldgen.R
 	var part *unmodelledPart
 	if errors.As(err, &part) && part.kind == "tree_decorator" {
 		noteNotReplayed(part.kind + ":" + part.name)
-		return nil
+		return true, nil
 	}
-	return err
+	return len(planter.placements) > 0, err
 }
 
 // maxFreeTreeHeight is TreeFeature.getMaxFreeTreeHeight: the tallest prefix of the
@@ -148,11 +165,10 @@ func (r *decorationRegion) placeTreeSelector(set *worldgen.FeatureSet, random wo
 // which applies its modifiers, and then down to whatever it configures.
 func (r *decorationRegion) placePlacedRef(set *worldgen.FeatureSet, random worldgen.RandomSource, position worldgen.FeaturePosition, ref worldgen.FeatureRef, context worldgen.PlacementContext) error {
 	if _, ok := set.Placed[ref.Name]; !ok {
-		// An inline reference: its own modifier list is what runs, and for every tree
-		// selector in the pack that list is empty, which means "place at this
-		// position".
 		if len(ref.Placement) != 0 {
-			return fmt.Errorf("world: placed reference %q carries %d modifiers and is not in the placed registry", ref.Name, len(ref.Placement))
+			return set.ForEachPlacementModifiers(ref.Name, ref.Placement, random, position, context, func(next worldgen.FeaturePosition) error {
+				return r.placeConfiguredVegetation(set, random, next, ref.Name, context)
+			})
 		}
 		return r.placeConfiguredVegetation(set, random, position, ref.Name, context)
 	}
@@ -231,10 +247,34 @@ func (r *decorationRegion) placeConfiguredVegetation(set *worldgen.FeatureSet, r
 	case "minecraft:vines":
 		r.placeVines(position)
 		return nil
-	case "minecraft:huge_fungus", "minecraft:bamboo",
+	case "minecraft:bamboo":
+		config, err := set.Probability(name)
+		if err != nil {
+			return err
+		}
+		r.placeBamboo(random, position, config.Probability, set)
+		return nil
+	case "minecraft:root_system":
+		config, err := set.RootSystem(name)
+		if err != nil {
+			return err
+		}
+		r.placeRootSystem(random, position, config, set)
+		return nil
+	case "minecraft:sea_pickle":
+		config, err := set.Count(name)
+		if err != nil {
+			return err
+		}
+		r.placeSeaPickle(random, position, config, set)
+		return nil
+	case "minecraft:coral_tree", "minecraft:coral_claw", "minecraft:coral_mushroom":
+		r.placeCoralFeature(random, position, configured.Type, set)
+		return nil
+	case "minecraft:huge_fungus",
 		"minecraft:weeping_vines", "minecraft:twisting_vines",
 		"minecraft:iceberg", "minecraft:block_pile", "minecraft:delta_feature",
-		"minecraft:glowstone_blob", "minecraft:sea_pickle", "minecraft:coral_plant",
+		"minecraft:glowstone_blob", "minecraft:coral_plant",
 		"minecraft:chorus_plant", "minecraft:feature_rules":
 		// Selected by a chain this build does replay, in a biome this pass does not
 		// cover. Counted rather than dropped: the previous behaviour was to fall off

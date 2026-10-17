@@ -32,6 +32,9 @@ func (t *treePlacer) applyLeafDistance() {
 	leaves := map[pos3]bool{}
 	logs := map[pos3]bool{}
 	for _, p := range t.placements {
+		if p.isRoot {
+			continue
+		}
 		c := pos3{p.x, p.y, p.z}
 		if !p.isLog {
 			// The recorded leaf is the cell FoliagePlacer wrote; whether the block
