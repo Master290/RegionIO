@@ -394,7 +394,7 @@ func isProjectileDamageCause(cause string) bool {
 	switch normalizeFoodItemID(cause) {
 	case "minecraft:arrow", "minecraft:skeleton", "minecraft:trident",
 		"minecraft:mob_projectile", "minecraft:projectile", "minecraft:spit",
-		"minecraft:fireball", "minecraft:wind_charge":
+		"minecraft:fireball", "minecraft:wind_charge", "minecraft:wither_skull":
 		return true
 	default:
 		return false
@@ -536,6 +536,12 @@ func MobMaxHealth(typeName string) float32 {
 		return DefaultPigMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
+	case MobTypeWither:
+		return DefaultWitherMaxHealth
+	case MobTypeWitherSkeleton:
+		return DefaultWitherSkeletonMaxHealth
+	case MobTypeEnderDragon:
+		return DefaultEnderDragonMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -585,6 +591,14 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack("minecraft:gunpowder", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeWither:
+		if stack := world.NewNamedItemStack(NetherStarItemID, 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeWitherSkeleton:
+		if stack := world.NewNamedItemStack("minecraft:bone", 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
 	}
 	return nil
 }
@@ -597,6 +611,10 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.pig.hurt", SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.hurt", SoundSourceNeutral
+	case MobTypeWither:
+		return "minecraft:entity.wither.hurt", SoundSourceHostile
+	case MobTypeEnderDragon:
+		return "minecraft:entity.ender_dragon.hurt", SoundSourceHostile
 	default:
 		return "minecraft:entity.generic.hurt", SoundSourceNeutral
 	}
@@ -610,6 +628,10 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.pig.death", SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.death", SoundSourceNeutral
+	case MobTypeWither:
+		return "minecraft:entity.wither.death", SoundSourceHostile
+	case MobTypeEnderDragon:
+		return "minecraft:entity.ender_dragon.death", SoundSourceHostile
 	default:
 		return "minecraft:entity.generic.death", SoundSourceNeutral
 	}
@@ -816,6 +838,13 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		return 0, false
 	}
 
+	if target.TypeName == EntityTypeEndCrystal {
+		if s.DestroyEndCrystal(targetEntityID, session) {
+			return 1.0, true
+		}
+		return 0, false
+	}
+
 	baseDamage, _ := StackAttackStats(session.HeldItem())
 	baseDamage += session.MeleeDamageBonus()
 	scale := session.CurrentAttackStrengthScale(0.5)
@@ -841,6 +870,13 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	}
 
 	s.RecordAttackExhaustion(session)
+
+	if target.TypeName == MobTypeWither {
+		return s.DamageWither(target.ID, damage, session, false)
+	}
+	if target.TypeName == MobTypeEnderDragon {
+		return s.DamageEnderDragon(target.ID, damage, session, false)
+	}
 
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
 	return damage, killed

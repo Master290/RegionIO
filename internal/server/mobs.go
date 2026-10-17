@@ -120,21 +120,28 @@ var (
 		MobTypeChicken,
 	}
 	fallbackEntityTypeIDs = map[string]int{
-		MobTypeArrow:    EntityTypeArrowID,
-		MobTypeChicken:  EntityTypeChickenID,
-		MobTypeCow:      EntityTypeCowID,
-		MobTypeCreeper:  EntityTypeCreeperID,
-		MobTypePig:      EntityTypePigID,
-		MobTypeSheep:    EntityTypeSheepID,
-		MobTypeSkeleton: EntityTypeSkeletonID,
-		MobTypeSpider:   EntityTypeSpiderID,
-		MobTypeVillager:         int(EntityTypeVillagerID),
-		MobTypeZombie:           EntityTypeZombieID,
-		EntityTypeFishingBobber: EntityTypeFishingBobberID,
-		EntityTypeArmorStand:    EntityTypeArmorStandID,
-		EntityTypeGlowItemFrame: EntityTypeGlowItemFrameID,
-		EntityTypeItemFrame:     EntityTypeItemFrameID,
-		EntityTypePainting:      EntityTypePaintingID,
+		MobTypeArrow:              EntityTypeArrowID,
+		MobTypeChicken:            EntityTypeChickenID,
+		MobTypeCow:                EntityTypeCowID,
+		MobTypeCreeper:            EntityTypeCreeperID,
+		MobTypePig:                EntityTypePigID,
+		MobTypeSheep:              EntityTypeSheepID,
+		MobTypeSkeleton:           EntityTypeSkeletonID,
+		MobTypeSpider:             EntityTypeSpiderID,
+		MobTypeVillager:           int(EntityTypeVillagerID),
+		MobTypeZombie:             EntityTypeZombieID,
+		EntityTypeFishingBobber:   EntityTypeFishingBobberID,
+		EntityTypeArmorStand:      EntityTypeArmorStandID,
+		EntityTypeGlowItemFrame:   EntityTypeGlowItemFrameID,
+		EntityTypeItemFrame:       EntityTypeItemFrameID,
+		EntityTypePainting:        EntityTypePaintingID,
+		EntityTypeAreaEffectCloud: EntityTypeAreaEffectCloudID,
+		EntityTypeDragonFireball:  EntityTypeDragonFireballID,
+		MobTypeEnderDragon:        EntityTypeEnderDragonID,
+		EntityTypeEndCrystal:      EntityTypeEndCrystalID,
+		MobTypeWither:             EntityTypeWitherID,
+		MobTypeWitherSkeleton:     EntityTypeWitherSkeletonID,
+		EntityTypeWitherSkull:     EntityTypeWitherSkullID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -212,6 +219,12 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultChickenMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
+	case MobTypeWither:
+		return DefaultWitherMaxHealth
+	case MobTypeWitherSkeleton:
+		return DefaultWitherSkeletonMaxHealth
+	case MobTypeEnderDragon:
+		return DefaultEnderDragonMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -241,6 +254,12 @@ func (s *Server) SpawnMob(x, y, z float64, typeName string) (int32, error) {
 	norm := canonicalResourceName(typeName)
 	if norm == MobTypeVillager {
 		return s.SpawnVillager(x, y, z, VillagerProfessionFarmer, MinVillagerLevel)
+	}
+	if norm == MobTypeWither {
+		return s.SpawnWither(world.DimensionOverworld, x, y, z, true)
+	}
+	if norm == MobTypeEnderDragon {
+		return s.SpawnEnderDragon(x, y, z)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {

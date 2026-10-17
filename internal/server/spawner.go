@@ -44,6 +44,7 @@ func (s *Server) StartSpawning(ctx context.Context, log *slog.Logger) {
 	_ = s.LoadBossBarsFile()
 	_ = s.LoadSignsAndLecternsFile()
 	_ = s.LoadBannersFile()
+	_ = s.LoadDragonFightFile()
 	go s.entityTickLoop(ctx, log)
 	go s.mobSpawnLoop(ctx)
 }
@@ -63,6 +64,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			_ = s.SaveBossBarsFile()
 			_ = s.SaveSignsAndLecternsFile()
 			_ = s.SaveBannersFile()
+			_ = s.SaveDragonFightFile()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -78,6 +80,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 					_ = s.SaveBossBarsFile()
 					_ = s.SaveSignsAndLecternsFile()
 					_ = s.SaveBannersFile()
+					_ = s.SaveDragonFightFile()
 				}
 			}
 			s.TickWeather(rng)
@@ -158,6 +161,10 @@ func NewEntityTracker() *EntityTracker {
 // TickAndBroadcast steps all entities in s and broadcasts resulting visibility
 // and delta-movement packets.
 func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
+	if s != nil {
+		s.TickWithers(rng)
+		s.TickEnderDragons(rng)
+	}
 	t.mu.Lock()
 	t.stepEntitiesLocked(s, rng)
 	t.syncLocked(s)
@@ -204,6 +211,12 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			continue
 		}
 		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) {
+			continue
+		}
+		if IsBossOrBossSupportEntity(snapshot.TypeName) {
+			if snapshot.TypeName == MobTypeWither || snapshot.TypeName == MobTypeEnderDragon {
+				_ = t.mobStateFor(snapshot.ID, aiTick)
+			}
 			continue
 		}
 
@@ -431,6 +444,10 @@ func (t *EntityTracker) syncLocked(s *Server) {
 							if eqPkt := s.ArmorStandEquipmentPacket(ent.ID); len(eqPkt) > 0 {
 								_ = viewer.send(protocol.PlaySetEquipment, eqPkt)
 							}
+						}
+					} else if IsBossOrBossSupportEntity(ent.TypeName) {
+						if metaPkt := s.BossOrSupportEntityDataPacket(ent.ID, ent.TypeName); len(metaPkt) > 0 {
+							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
 						}
 					}
 				}
