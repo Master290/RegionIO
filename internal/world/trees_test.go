@@ -63,17 +63,6 @@ func decorateChunk4020TargetFirst(t *testing.T, seed int64) *Chunk {
 	region.bindSeed(seed)
 
 	sources := decorationSources(-40, 20)
-	for i := range sources {
-		if sources[i] == (decorationSource{X: -40, Z: 19}) {
-			for j := i + 1; j < len(sources); j++ {
-				if sources[j] == (decorationSource{X: -40, Z: 20}) {
-					sources[i], sources[j] = sources[j], sources[i]
-					break
-				}
-			}
-			break
-		}
-	}
 	if err := region.replayScheduledOresWithSources(od, seed, -40, 20, sources); err != nil {
 		t.Fatal(err)
 	}
@@ -208,13 +197,10 @@ func TestChunk1640BirchTallStep62Parity(t *testing.T) {
 	rng := worldgen.NewWorldgenRandom(0)
 	rng.SetFeatureSeed(decSeed, fidxBT, 9)
 
-	// In Vanilla, s=3 at (264, 104, -619) passes the biome check on the
-	// old_growth_birch_forest / taiga border (Temperature = -0.149977), advancing
+	// With Climate.quantizeCoord(float) ((long)(f * 10000.0f)), s=3 at (264, 104, -619)
+	// quantizes Temperature = -0.149977 to -1499 (old_growth_birch_forest), advancing
 	// s=3 -> s=27 -> s=51 -> 53 -> 55 -> s=57 (failSurvive on s=27's canopy) -> s=62.
 	ctx := region.placementContext(func(pos worldgen.FeaturePosition) bool {
-		if pos.X == 264 && pos.Z == -619 {
-			return true
-		}
 		return region.biomeAllowsFeature(set, "minecraft:birch_tall", 9, pos)
 	})
 	origin := worldgen.FeaturePosition{X: 16 * 16, Y: 0, Z: -39 * 16}
