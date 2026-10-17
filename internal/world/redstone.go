@@ -15,6 +15,7 @@ const (
 	RedstoneTorchTickDelay = 2  // Redstone torch inversion delay (2 ticks = 1 redstone tick)
 	ComparatorTickDelay    = 2  // Redstone comparator evaluation delay (2 ticks = 1 redstone tick)
 	DispenserTickDelay     = 4  // Dispenser / dropper activation delay (4 game ticks = 2 redstone ticks)
+	CrafterTickDelay       = 4  // Crafter activation delay (4 game ticks = 2 redstone ticks)
 	MaxPistonPushBlocks    = 12 // Maximum number of blocks a piston can push in a line
 )
 
@@ -23,8 +24,27 @@ var (
 	comparatorSignalProviders sync.Map // map[*Cache]func(x, y, z int) int
 	jukeboxPowerProviders     sync.Map // map[*Cache]func(x, y, z int) int
 	dispenserFireListeners    sync.Map // map[*Cache]func(x, y, z int, isDropper bool)
+	crafterFireListeners      sync.Map // map[*Cache]func(x, y, z int)
 	railPowerChangeListeners  sync.Map // map[*Cache]func(x, y, z int, railName string, powered bool)
 )
+
+// SetCrafterFireListener registers an optional callback invoked when a
+// scheduled 4-tick redstone update fires on a triggered crafter at (x, y, z).
+func (c *Cache) SetCrafterFireListener(fn func(x, y, z int)) {
+	if fn == nil {
+		crafterFireListeners.Delete(c)
+		return
+	}
+	crafterFireListeners.Store(c, fn)
+}
+
+func (c *Cache) fireCrafterAt(x, y, z int) {
+	if v, ok := crafterFireListeners.Load(c); ok && v != nil {
+		if fn, ok := v.(func(int, int, int)); ok && fn != nil {
+			fn(x, y, z)
+		}
+	}
+}
 
 // SetRailPowerChangeListener registers an optional callback invoked whenever a
 // `minecraft:powered_rail` or `minecraft:activator_rail` at (x, y, z) changes
@@ -269,7 +289,7 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
 		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
-		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper",
+		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper", "minecraft:crafter",
 		"minecraft:detector_rail", "minecraft:powered_rail", "minecraft:activator_rail":
 		return true
 	}
@@ -293,7 +313,7 @@ func isConductiveSolidBlock(state uint16) bool {
 		return false
 	}
 	name := info.Name
-	if isRedstoneComponentName(name) && name != "minecraft:note_block" && name != "minecraft:dispenser" && name != "minecraft:dropper" {
+	if isRedstoneComponentName(name) && name != "minecraft:note_block" && name != "minecraft:dispenser" && name != "minecraft:dropper" && name != "minecraft:crafter" {
 		return false
 	}
 	if strings.HasSuffix(name, "_glass") || strings.HasSuffix(name, "_stained_glass") ||
@@ -318,7 +338,7 @@ func isConductiveSolidBlock(state uint16) bool {
 		"minecraft:lectern", "minecraft:composter", "minecraft:bamboo",
 		"minecraft:cactus", "minecraft:sugar_cane", "minecraft:anvil",
 		"minecraft:chipped_anvil", "minecraft:damaged_anvil", "minecraft:farmland",
-		"minecraft:dirt_path", "minecraft:sculk_shrieker":
+		"minecraft:dirt_path", "minecraft:sculk_shrieker", "minecraft:decorated_pot":
 		return false
 	}
 	return isSolidState(state)
@@ -1288,13 +1308,16 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 
 	case name == "minecraft:dispenser" || name == "minecraft:dropper":
 		c.fireDispenserAt(x, y, z, name == "minecraft:dropper")
+
+	case name == "minecraft:crafter":
+		c.fireCrafterAt(x, y, z)
 	}
 }
 
 // propagateRedstoneAround recalculates redstone dust connection shapes and
 // power levels (0..15 with decay), evaluates redstone torch inversions and
 // comparators, schedules repeater delays, and updates doors, trapdoors, lamps,
-// note blocks, dispensers, droppers, and pistons affected by a change at (x, y, z).
+// note blocks, dispensers, droppers, crafters, and pistons affected by a change at (x, y, z).
 func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
 	toggledTorches := make(map[BlockPos]bool)
 	evaluatedComparators := make(map[BlockPos]int)
@@ -1397,6 +1420,9 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 
 			case info.Name == "minecraft:dispenser" || info.Name == "minecraft:dropper":
 				c.evaluateDispenserRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
+			case info.Name == "minecraft:crafter":
+				c.evaluateCrafterRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
 			case info.Name == "minecraft:hopper":
 				c.evaluateHopperRedstone(pos.X, pos.Y, pos.Z, st, info, res)
@@ -2294,6 +2320,32 @@ func (c *Cache) IsHopperEnabledAt(x, y, z int) bool {
 	return info.Properties["enabled"] != "false"
 }
 
+// IsCrafterPowered reports whether a `minecraft:crafter` at (x, y, z) receives
+// redstone power from any neighbor (matching vanilla CrafterBlock.neighborChanged).
+func (c *Cache) IsCrafterPowered(x, y, z int) bool {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false
+	}
+	return c.IsBlockPowered(x, y, z)
+}
 
-
+func (c *Cache) evaluateCrafterRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	powered := c.IsCrafterPowered(x, y, z)
+	wasTriggered := info.Properties["triggered"] == "true"
+	if powered && !wasTriggered {
+		if nextSt, ok := withStateProperty(state, "triggered", "true"); ok {
+			c.setBlockRecorded(x, y, z, nextSt, res)
+		}
+		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, CrafterTickDelay)
+	} else if !powered && (wasTriggered || info.Properties["crafting"] == "true") {
+		curSt := state
+		if s1, ok := withStateProperty(curSt, "triggered", "false"); ok {
+			curSt = s1
+		}
+		if s2, ok := withStateProperty(curSt, "crafting", "false"); ok {
+			curSt = s2
+		}
+		c.setBlockRecorded(x, y, z, curSt, res)
+	}
+}
 

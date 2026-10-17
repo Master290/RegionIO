@@ -1275,7 +1275,8 @@ func IsHopperContainerBlock(state uint16) bool {
 		"minecraft:jukebox",
 		"minecraft:composter",
 		"minecraft:chiseled_bookshelf",
-		"minecraft:crafter":
+		"minecraft:crafter",
+		"minecraft:decorated_pot":
 		return true
 	}
 	return IsShulkerBoxItemOrBlock(name)
@@ -1628,6 +1629,9 @@ func (s *Server) TryHopperInsertIntoBlock(
 	case targetName == "minecraft:crafter":
 		return s.HopperInsertIntoCrafter(normDim, tx, ty, tz, single, meta)
 
+	case targetName == "minecraft:decorated_pot":
+		return s.HopperInsertIntoDecoratedPot(normDim, tx, ty, tz, single, meta)
+
 	case targetName == "minecraft:dispenser" || targetName == "minecraft:dropper":
 		return s.HopperInsertIntoDispenser(normDim, tx, ty, tz, single, meta, potionType)
 	}
@@ -1804,6 +1808,16 @@ func (s *Server) TryHopperExtractFromBlockAbove(
 				}
 			}
 			st, m, extracted := s.HopperExtractFromCrafter(normDim, sx, sy, sz)
+			return st, m, "", true, extracted
+
+		case srcName == "minecraft:decorated_pot":
+			if dp, exists := s.GetDecoratedPotAt(normDim, sx, sy, sz); exists && !dp.Item.IsEmpty() {
+				single := world.NewNamedItemStack(dp.Item.ResolvedID(), 1)
+				if canAccept != nil && !canAccept(single, dp.Meta, "") {
+					return world.ItemStack{}, ItemMeta{}, "", true, false
+				}
+			}
+			st, m, extracted := s.HopperExtractFromDecoratedPot(normDim, sx, sy, sz)
 			return st, m, "", true, extracted
 
 		case srcName == "minecraft:dispenser" || srcName == "minecraft:dropper":

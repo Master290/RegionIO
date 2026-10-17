@@ -340,6 +340,11 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return updated
 		}
 	}
+	if isBlockNamed(state, "minecraft:decorated_pot") && c.GetBlock(x, y, z) == StateWater {
+		if updated, ok := withStateProperty(state, "waterlogged", "true"); ok {
+			return updated
+		}
+	}
 	return state
 }
 

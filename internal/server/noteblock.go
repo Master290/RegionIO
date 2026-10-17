@@ -113,6 +113,9 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if crSig := s.CrafterComparatorSignalAt(targetDim, x, y, z); crSig > best {
 		best = crSig
 	}
+	if potSig := s.DecoratedPotComparatorSignalAt(targetDim, x, y, z); potSig > best {
+		best = potSig
+	}
 	if railSig := s.DetectorRailComparatorSignal(targetDim, x, y, z); railSig > best {
 		best = railSig
 	}
@@ -131,8 +134,8 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 // BindNoteBlockAndJukeboxRedstone binds comparator signal providers (item
 // frames, lecterns, jukeboxes, dispensers, droppers, containers, detector rails),
 // jukebox active-playback redstone power, note block play packet broadcasting,
-// dispenser/dropper 4-tick redstone firing, wind charge redstone toggles, and
-// powered/activator/detector rail hooks onto the world cache for dim.
+// dispenser/dropper/crafter 4-tick redstone firing, wind charge redstone toggles,
+// and powered/activator/detector rail hooks onto the world cache for dim.
 func (s *Server) BindNoteBlockAndJukeboxRedstone(dim string) *world.Cache {
 	if s == nil {
 		return nil
@@ -159,6 +162,9 @@ func (s *Server) BindNoteBlockAndJukeboxRedstone(dim string) *world.Cache {
 	})
 	cache.SetDispenserFireListener(func(bx, by, bz int, _ bool) {
 		s.FireDispenserOrDropperAt(targetDim, bx, by, bz)
+	})
+	cache.SetCrafterFireListener(func(bx, by, bz int) {
+		s.DispenseFromCrafter(targetDim, bx, by, bz)
 	})
 	cache.SetRailPowerChangeListener(func(bx, by, bz int, railName string, powered bool) {
 		switch railName {
