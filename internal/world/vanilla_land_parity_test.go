@@ -72,9 +72,9 @@ import (
 // in chunk (-40, 20) (down to 0):
 // exact 392,192 -> 392,210 (+18 cells), surface 383 -> 365 (-18 cells).
 const (
-	landSurfaceRatchet   = 365
-	landCellRatchet      = 392210
-	landWaterlineRatchet = 17
+	landSurfaceRatchet   = 129
+	landCellRatchet      = 392819
+	landWaterlineRatchet = 0
 )
 
 const vanillaLandFixture = "testdata/vanilla_land_12345.bin"

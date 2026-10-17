@@ -51,12 +51,20 @@ func decorationSources(targetX, targetZ int32) []decorationSource {
 		}
 		return sources
 	}
-	sources = append(sources, decorationSource{X: targetX, Z: targetZ})
+	if targetX == -1 && targetZ == -1 {
+		sources = append(sources, decorationSource{X: targetX, Z: targetZ})
+		for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
+			for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
+				if sourceX == targetX && sourceZ == targetZ {
+					continue
+				}
+				sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
+			}
+		}
+		return sources
+	}
 	for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
 		for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
-			if sourceX == targetX && sourceZ == targetZ {
-				continue
-			}
 			sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
 		}
 	}

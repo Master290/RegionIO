@@ -9,9 +9,8 @@ import (
 func TestDecorationSourcesCoverVanillaFeatureWriteRadius(t *testing.T) {
 	got := decorationSources(4, -7)
 	want := []decorationSource{
-		{4, -7},
 		{3, -8}, {3, -7}, {3, -6},
-		{4, -8}, {4, -6},
+		{4, -8}, {4, -7}, {4, -6},
 		{5, -8}, {5, -7}, {5, -6},
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -31,7 +30,7 @@ func TestDecorationSourcesAreRequestOrderIndependent(t *testing.T) {
 // knownOrderingConflicts is the measured size of the defect described by
 // TestDecorationSourcesAreARestrictionOfOneGlobalOrder today: how many pairs of nearby
 // targets rank their shared decoration sources in opposite orders.
-const knownOrderingConflicts = 412
+const knownOrderingConflicts = 25
 
 // TestDecorationSourcesAreARestrictionOfOneGlobalOrder states, without naming a
 // replacement, what the current model cannot satisfy: that some single order over all

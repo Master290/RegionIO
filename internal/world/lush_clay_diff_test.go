@@ -242,7 +242,7 @@ func TestVanillaLushClayDiff(t *testing.T) {
 	// (MultifaceGrowthFeature) and stage-7 UNDERGROUND_DECORATION closed 8 clay
 	// anchor cells at (14..15, -23..-19, 31) in chunk (0,1).
 	const (
-		maxMissing = 79
+		maxMissing = 75
 		maxAnchors = 14
 		maxExtra   = 4
 	)

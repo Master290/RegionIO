@@ -166,7 +166,7 @@ func TestDecorationSourceOrderParity(t *testing.T) {
 		// went stale once already (390,895 survived generatorVersion 42's 390,899 because
 		// only the diagnostics job runs this test), and a ratchet that is a floor in one
 		// file and an exact count in another must be the same number.
-		{"ocean", vanillaParityFixture, 392939},
+		{"ocean", vanillaParityFixture, 393037},
 		{"land", vanillaLandFixture, landCellRatchet},
 	} {
 		cap := readFixtureCapture(t, fx.path)
@@ -256,4 +256,95 @@ func joinChunks(parts []string) string {
 		out += p
 	}
 	return out
+}
+
+// TestLandDecorationOrderStoneOreParity compares the 9-source decoration
+// orderings (orderTargetFirst, orderRowMajor, orderColumnMajor) on the four
+// target chunks of TestVanillaLandBlockParity ((16,-40), (16,-31), (-40,21),
+// (-40,20)) for boundary overwrites among the #minecraft:base_stone_overworld
+// ore veins (ore_diorite, ore_granite, ore_andesite, ore_tuff):
+//
+//   - orderTargetFirst produces 306 stone-ore mismatches across the 4 chunks
+//     (179x diorite -> granite, 87x granite -> andesite, 20x tuff -> andesite,
+//     9x andesite -> diorite, 6x granite -> diorite, 5x andesite -> granite)
+//     and 302 underground-band mismatches (72 + 106 + 39 + 85).
+//   - orderRowMajor (Z ascending outer, X ascending inner) reduces the 306
+//     stone-ore mismatches to 3 (1x andesite -> granite in (16,-40) from
+//     (16,-39) vs (17,-40), and 2x granite -> andesite in (16,-31) from
+//     (15,-31) vs (16,-32)) and underground-band mismatches to 5.
+//   - orderColumnMajor (X ascending outer, Z ascending inner) matches vanilla's
+//     cross-border overwrite order across all 4 chunks: 0 stone-ore mismatches
+//     (0 in (16,-40), 0 in (16,-31), 0 in (-40,21), 0 in (-40,20)) and only 1
+//     underground-band mismatch across all 4 chunks (0 + 0 + 1 + 0).
+func TestLandDecorationOrderStoneOreParity(t *testing.T) {
+	if _, err := os.Stat(vanillaLandFixture); err != nil {
+		t.Skipf("land fixture not installed: %v", err)
+	}
+	cap := readFixtureCapture(t, vanillaLandFixture)
+	od, fluidPicker, veins, carver := vanillaGeneratorInputs(cap.seed)
+	terrain := newVanillaTerrainCache(256)
+
+	isStoneOreState := func(label string) bool {
+		switch label {
+		case "minecraft:granite", "minecraft:diorite", "minecraft:andesite", "minecraft:tuff":
+			return true
+		}
+		return false
+	}
+
+	candidates := []struct {
+		name              string
+		sources           func(int32, int32) []decorationSource
+		wantStoneOreTotal int
+		wantUnderground   int
+	}{
+		{"target-first", orderTargetFirst, 306, 302},
+		{"row-major", orderRowMajor, 3, 5},
+		{"column-major", orderColumnMajor, 0, 1},
+	}
+
+	for _, cand := range candidates {
+		gen := vanillaRegionGeneratorFromInputs(cap.seed, od, fluidPicker, veins, carver, terrain, cand.sources)
+		totalStoneOre := 0
+		totalUnderground := 0
+		pairTotals := make(map[string]int)
+		perChunkSummary := make([]string, 0, len(cap.chunks))
+
+		for _, ch := range cap.chunks {
+			mine := gen(ch.cx, ch.cz)
+			chStoneOre := 0
+			chUnder := 0
+			for y := MinY; y < MinY+WorldHeight; y++ {
+				for z := 0; z < 16; z++ {
+					for x := 0; x < 16; x++ {
+						want := ch.at(x, y, z)
+						got := mine.GetBlock(x, y, z)
+						if got == want {
+							continue
+						}
+						if yBand(y) == "underground" {
+							chUnder++
+						}
+						gotL, wantL := stateLabel(got), stateLabel(want)
+						if isStoneOreState(gotL) && isStoneOreState(wantL) {
+							chStoneOre++
+							pairTotals[fmt.Sprintf("%s -> %s", gotL, wantL)]++
+						}
+					}
+				}
+			}
+			totalStoneOre += chStoneOre
+			totalUnderground += chUnder
+			perChunkSummary = append(perChunkSummary, fmt.Sprintf("(%d,%d) stoneOre=%d under=%d", ch.cx, ch.cz, chStoneOre, chUnder))
+		}
+
+		t.Logf("%-14s: stoneOre=%3d underground=%3d | %s | pairs=%v",
+			cand.name, totalStoneOre, totalUnderground, strings.Join(perChunkSummary, ", "), pairTotals)
+		if totalStoneOre != cand.wantStoneOreTotal {
+			t.Errorf("%s: total stone-ore mismatches = %d, want %d", cand.name, totalStoneOre, cand.wantStoneOreTotal)
+		}
+		if totalUnderground != cand.wantUnderground {
+			t.Errorf("%s: total underground-band mismatches = %d, want %d", cand.name, totalUnderground, cand.wantUnderground)
+		}
+	}
 }
