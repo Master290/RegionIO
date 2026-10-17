@@ -2096,28 +2096,29 @@ func (s *Server) SetMobEquipment(entityID int32, equipSlot int, stack world.Item
 
 // --- Saddles, Horse Armor, Wolf Armor, Llama Carpets, and Equine Chests ---
 
+// AttachEquineChest attaches a chest onto a tamed adult donkey, mule, llama, or trader_llama.
+func (s *Server) AttachEquineChest(entityID int32) bool {
+	return s.EquipEquineChest(entityID)
+}
+
 func isDispenserAnimalEquipment(itemID, dim string, fx, fy, fz int, s *Server) bool {
 	norm := canonicalResourceName(itemID)
-	switch norm {
-	case "minecraft:saddle",
-		"minecraft:leather_horse_armor", "minecraft:iron_horse_armor",
-		"minecraft:golden_horse_armor", "minecraft:diamond_horse_armor",
-		"minecraft:wolf_armor":
+	if norm == "minecraft:saddle" || norm == "minecraft:wolf_armor" || IsHorseArmorItem(norm) {
 		return true
-	case "minecraft:chest":
-		// Only acts as animal equipment if a tamed donkey/mule/llama is in front.
+	}
+	if norm == "minecraft:chest" {
+		// Only acts as animal equipment if a tamed adult donkey/mule/llama/trader_llama is in front.
 		for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
-			t := canonicalResourceName(ent.TypeName)
-			if (t == MobTypeDonkey || t == MobTypeMule || t == MobTypeLlama || t == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) {
+			if IsChestedEquineMob(ent.TypeName) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) {
 				return true
 			}
 		}
 		return false
 	}
-	if strings.HasSuffix(norm, "_carpet") {
+	if _, isCarpet := CarpetColorByItemName(norm); isCarpet || strings.HasSuffix(norm, "_carpet") {
 		for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
 			t := canonicalResourceName(ent.TypeName)
-			if (t == MobTypeLlama || t == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) {
+			if (t == MobTypeLlama || t == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) {
 				return true
 			}
 		}
@@ -2132,12 +2133,18 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 		mobType := canonicalResourceName(ent.TypeName)
 		switch {
 		case norm == "minecraft:saddle":
-			// Tamed horse/donkey/mule/camel or adult pig/strider.
-			if mobType == MobTypeHorse || mobType == MobTypeDonkey || mobType == MobTypeMule || mobType == "minecraft:camel" {
+			// Tamed adult horse/donkey/mule/skeleton_horse/zombie_horse, camel, or adult pig/strider.
+			if mobType == MobTypeHorse || mobType == MobTypeDonkey || mobType == MobTypeMule || mobType == MobTypeSkeletonHorse || mobType == MobTypeZombieHorse {
+				if s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && !s.IsEquineSaddled(ent.ID) {
+					if s.EquipEquineSaddle(ent.ID, true) {
+						return true
+					}
+				}
+			} else if mobType == "minecraft:camel" {
 				st := s.ensureTamedMobState(ent.ID, mobType)
 				mgr := s.tamedManager()
 				mgr.mu.Lock()
-				canSaddle := st.Tamed && !st.Saddled
+				canSaddle := st.Tamed && !st.Saddled && !s.IsMobBaby(ent.ID)
 				if canSaddle {
 					st.Saddled = true
 				}
@@ -2161,11 +2168,13 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 				}
 			}
 
-		case norm == "minecraft:leather_horse_armor" || norm == "minecraft:iron_horse_armor" ||
-			norm == "minecraft:golden_horse_armor" || norm == "minecraft:diamond_horse_armor":
-			if mobType == MobTypeHorse && s.IsMobTamed(ent.ID) && s.HorseArmor(ent.ID) == "" {
-				s.SetHorseArmor(ent.ID, norm)
-				return true
+		case IsHorseArmorItem(norm):
+			if mobType == MobTypeHorse && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && s.HorseArmor(ent.ID) == "" {
+				stack := world.NewNamedItemStack(norm, 1)
+				if s.EquipHorseArmor(ent.ID, stack) {
+					s.SetHorseArmor(ent.ID, norm)
+					return true
+				}
 			}
 
 		case norm == "minecraft:wolf_armor":
@@ -2175,16 +2184,24 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 			}
 
 		case strings.HasSuffix(norm, "_carpet"):
-			if (mobType == MobTypeLlama || mobType == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) && s.LlamaCarpet(ent.ID) == "" {
-				s.SetLlamaCarpet(ent.ID, norm)
-				return true
+			if (mobType == MobTypeLlama || mobType == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && s.LlamaCarpet(ent.ID) == "" {
+				if color, ok := CarpetColorByItemName(norm); ok {
+					if s.EquipLlamaCarpet(ent.ID, color) {
+						s.SetLlamaCarpet(ent.ID, norm)
+						return true
+					}
+				} else {
+					s.SetLlamaCarpet(ent.ID, norm)
+					return true
+				}
 			}
 
 		case norm == "minecraft:chest":
-			if (mobType == MobTypeDonkey || mobType == MobTypeMule || mobType == MobTypeLlama || mobType == MobTypeTraderLlama) &&
-				s.IsMobTamed(ent.ID) && !s.IsAnimalChested(ent.ID) {
-				s.SetAnimalChested(ent.ID, true)
-				return true
+			if IsChestedEquineMob(mobType) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && !s.IsAnimalChested(ent.ID) {
+				if s.AttachEquineChest(ent.ID) {
+					s.SetAnimalChested(ent.ID, true)
+					return true
+				}
 			}
 		}
 	}
@@ -2195,6 +2212,9 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 func (s *Server) HorseArmor(entityID int32) string {
 	if s == nil {
 		return ""
+	}
+	if item := s.HorseArmorItem(entityID); item != "" {
+		return item
 	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
@@ -2248,6 +2268,9 @@ func (s *Server) LlamaCarpet(entityID int32) string {
 	if s == nil {
 		return ""
 	}
+	if item := s.LlamaCarpetItem(entityID); item != "" {
+		return item
+	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
@@ -2261,7 +2284,11 @@ func (s *Server) SetLlamaCarpet(entityID int32, carpetItemID string) {
 	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	ds.llamaCarpet[entityID] = carpetItemID
+	if carpetItemID == "" {
+		delete(ds.llamaCarpet, entityID)
+	} else {
+		ds.llamaCarpet[entityID] = carpetItemID
+	}
 	ds.mu.Unlock()
 }
 
@@ -2269,6 +2296,9 @@ func (s *Server) SetLlamaCarpet(entityID int32, carpetItemID string) {
 func (s *Server) IsAnimalChested(entityID int32) bool {
 	if s == nil {
 		return false
+	}
+	if s.HasEquineChest(entityID) {
+		return true
 	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
@@ -2289,6 +2319,9 @@ func (s *Server) SetAnimalChested(entityID int32, chested bool) {
 
 // IsEntitySaddled reports whether entityID (horse, donkey, mule, camel, pig, or strider) has a saddle.
 func (s *Server) IsEntitySaddled(entityID int32) bool {
+	if s.IsEquineSaddled(entityID) {
+		return true
+	}
 	if st, ok := s.GetTamedMobState(entityID); ok {
 		return st.Saddled
 	}

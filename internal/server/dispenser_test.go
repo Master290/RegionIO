@@ -380,7 +380,7 @@ func TestDispenserEquipPlayerArmorStandMobHorseAndSummonGolem(t *testing.T) {
 	if !srv.DispenseFromDispenser(dim, dx, dy, dz) {
 		t.Fatal("expected saddle equip onto tamed horse to succeed")
 	}
-	if !srv.IsEntitySaddled(horseID) {
+	if !srv.IsEntitySaddled(horseID) || !srv.IsEquineSaddled(horseID) {
 		t.Fatal("expected tamed horse to be saddled after dispenser saddle")
 	}
 	srv.SetDispenserSlot(dx, dy, dz, 0, world.NewNamedItemStack("minecraft:diamond_horse_armor", 1))
@@ -390,7 +390,46 @@ func TestDispenserEquipPlayerArmorStandMobHorseAndSummonGolem(t *testing.T) {
 	if got := srv.HorseArmor(horseID); got != "minecraft:diamond_horse_armor" {
 		t.Fatalf("horse armor = %q, want minecraft:diamond_horse_armor", got)
 	}
+	if got := srv.HorseArmorItem(horseID); got != "minecraft:diamond_horse_armor" {
+		t.Fatalf("HorseArmorItem = %q, want minecraft:diamond_horse_armor", got)
+	}
 	srv.entities.Remove(horseID)
+
+	// 4b. Equip chest onto a tamed Donkey and red_carpet + chest onto a tamed Llama in front.
+	donkeyID, err := srv.SpawnMobInDimension(dim, float64(fx)+0.5, float64(fy), float64(fz)+0.5, MobTypeDonkey)
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(donkey): %v", err)
+	}
+	srv.TameMob(donkeyID, p)
+	srv.SetDispenserSlot(dx, dy, dz, 0, world.NewNamedItemStack("minecraft:chest", 1))
+	if !srv.DispenseFromDispenser(dim, dx, dy, dz) {
+		t.Fatal("expected chest equip onto tamed donkey to succeed")
+	}
+	if !srv.HasEquineChest(donkeyID) || !srv.IsAnimalChested(donkeyID) {
+		t.Fatal("expected tamed donkey to have equine chest after dispenser chest")
+	}
+	srv.entities.Remove(donkeyID)
+
+	llamaID, err := srv.SpawnMobInDimension(dim, float64(fx)+0.5, float64(fy), float64(fz)+0.5, MobTypeLlama)
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(llama): %v", err)
+	}
+	srv.TameMob(llamaID, p)
+	srv.SetDispenserSlot(dx, dy, dz, 0, world.NewNamedItemStack("minecraft:red_carpet", 1))
+	if !srv.DispenseFromDispenser(dim, dx, dy, dz) {
+		t.Fatal("expected red_carpet equip onto tamed llama to succeed")
+	}
+	if got := srv.LlamaCarpetItem(llamaID); got != "minecraft:red_carpet" {
+		t.Fatalf("LlamaCarpetItem = %q, want minecraft:red_carpet", got)
+	}
+	srv.SetDispenserSlot(dx, dy, dz, 0, world.NewNamedItemStack("minecraft:chest", 1))
+	if !srv.DispenseFromDispenser(dim, dx, dy, dz) {
+		t.Fatal("expected chest equip onto tamed llama to succeed")
+	}
+	if !srv.HasEquineChest(llamaID) {
+		t.Fatal("expected tamed llama to have equine chest after dispenser chest")
+	}
+	srv.entities.Remove(llamaID)
 
 	// 5. Dispensing carved_pumpkin onto 2 snow_blocks summons a Snow Golem!
 	snowBlock, _ := world.BlockStateByName("minecraft:snow_block", nil)
