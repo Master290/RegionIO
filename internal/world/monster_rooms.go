@@ -265,7 +265,15 @@ func placeMonsterRoom(r *decorationRegion, random worldgen.RandomSource, ox, oy,
 			}
 			if r.monsterSafeSetBlock(cx, cy, cz, monsterChestIDs[facing]) {
 				// Vanilla seeds the chest's loot table from one long here.
-				random.NextLong()
+				lootSeed := random.NextLong()
+				r.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:chest",
+					X:             cx,
+					Y:             cy,
+					Z:             cz,
+					LootTable:     "minecraft:chests/simple_dungeon",
+					LootTableSeed: lootSeed,
+				})
 			}
 			// A successful spot ends the inner retry loop (bytecode jumps
 			// to the outer attempt increment right after the loot seed),
@@ -276,7 +284,20 @@ func placeMonsterRoom(r *decorationRegion, random worldgen.RandomSource, ox, oy,
 
 	// Pass 4 places the spawner at the center; picking its mob is one draw.
 	if r.monsterSafeSetBlock(ox, oy, oz, monsterSpawnerID) {
-		random.NextIntN(4) // skeleton / zombie / zombie / spider
+		mobTypes := [4]string{
+			"minecraft:skeleton",
+			"minecraft:zombie",
+			"minecraft:zombie",
+			"minecraft:spider",
+		}
+		mobIdx := int(random.NextIntN(4)) // skeleton / zombie / zombie / spider
+		r.addStructureBlockEntity(StructureBlockEntity{
+			ID:              "minecraft:mob_spawner",
+			X:               ox,
+			Y:               oy,
+			Z:               oz,
+			SpawnerEntityID: mobTypes[mobIdx],
+		})
 	}
 	return true
 }

@@ -1209,6 +1209,13 @@ func msCorridorPostProcess(c *msContext, p *msPiece, random worldgen.RandomSourc
 			if msBoxContains(c.chunkBox, wx, wy, wz) && c.isInterior(p, 1, 0, o) {
 				p.hasPlacedSpider = true
 				c.region.setBlockGlobal(wx, wy, wz, msSpawner)
+				c.region.addStructureBlockEntity(StructureBlockEntity{
+					ID:              "minecraft:mob_spawner",
+					X:               wx,
+					Y:               wy,
+					Z:               wz,
+					SpawnerEntityID: "minecraft:cave_spider",
+				})
 			}
 		}
 	}
@@ -1406,7 +1413,18 @@ func (c *msContext) createChest(p *msPiece, random worldgen.RandomSource, x, y, 
 		rail = msRailEW
 	}
 	c.placeBlock(p, rail, x, y, z)
-	random.NextLong()
+	lootSeed := random.NextLong()
+	c.region.addStructureEntity(StructureEntity{
+		ID:            "minecraft:chest_minecart",
+		X:             float64(wx) + 0.5,
+		Y:             float64(wy) + 0.5,
+		Z:             float64(wz) + 0.5,
+		BlockX:        wx,
+		BlockY:        wy,
+		BlockZ:        wz,
+		LootTable:     "minecraft:chests/abandoned_mineshaft",
+		LootTableSeed: lootSeed,
+	})
 }
 
 func (c *msContext) maybePlaceCobWeb(p *msPiece, random worldgen.RandomSource, chance float32, x, y, z int) {

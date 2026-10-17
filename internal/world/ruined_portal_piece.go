@@ -117,13 +117,14 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 	// of stream alignment - pinned empirically (portal index 10 in the
 	// alphabetical surface_structures order + this single draw reproduces
 	// the vanilla netherrack field on the fixture chunk bit-for-bit).
+	var chestLootSeed int64
 	for _, b := range blocks {
 		if !b.HasNBT {
 			continue
 		}
 		state, ok := stateByID(b.State)
 		if ok && isRandomizableContainerName(state.Name) {
-			random.NextLong()
+			chestLootSeed = random.NextLong()
 		}
 	}
 	inRegion := func(x, z int) bool {
@@ -306,7 +307,16 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 			if final != ruinedLavaID && final != ruinedMagmaID && isLavaState(region.getBlock(x, y, z)) {
 				continue
 			}
-			placeCell(b.Pos, final)
+			if placeCell(b.Pos, final) && b.HasNBT && b.BlockName == "minecraft:chest" {
+				region.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:chest",
+					X:             x,
+					Y:             y,
+					Z:             z,
+					LootTable:     "minecraft:chests/ruined_portal",
+					LootTableSeed: chestLootSeed,
+				})
+			}
 		}
 	}
 

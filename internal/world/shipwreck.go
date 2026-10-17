@@ -177,7 +177,11 @@ func placeShipwreckInChunk(region *decorationRegion, start *ShipwreckStart, chun
 		start.Box = shipwreckBoundingBox(tmpl.size, start.Pos, start.Rotation)
 	}
 
-	var dataMarkers []string
+	type shipwreckMarker struct {
+		meta    string
+		x, y, z int
+	}
+	var dataMarkers []shipwreckMarker
 	for _, b := range pal.blocks {
 		rel := worldgen.TransformBlockPos(b.Pos, "none", start.Rotation, shipwreckPivot)
 		wx, wy, wz := start.Pos[0]+rel[0], start.Pos[1]+rel[1], start.Pos[2]+rel[2]
@@ -188,7 +192,7 @@ func placeShipwreckInChunk(region *decorationRegion, start *ShipwreckStart, chun
 		}
 		if b.BlockName == "minecraft:structure_block" {
 			if b.Marker == "map_chest" || b.Marker == "treasure_chest" || b.Marker == "supply_chest" {
-				dataMarkers = append(dataMarkers, b.Marker)
+				dataMarkers = append(dataMarkers, shipwreckMarker{meta: b.Marker, x: wx, y: wy, z: wz})
 			}
 			continue
 		}
@@ -217,8 +221,23 @@ func placeShipwreckInChunk(region *decorationRegion, start *ShipwreckStart, chun
 	}
 
 	// handleDataMarker calls RandomizableContainer.setBlockEntityLootTable(level, random, pos.below(), lootTable).
-	for range dataMarkers {
-		_ = random.NextLong()
+	for _, dm := range dataMarkers {
+		lootSeed := random.NextLong()
+		lootTable := "minecraft:chests/shipwreck_supply"
+		switch dm.meta {
+		case "map_chest":
+			lootTable = "minecraft:chests/shipwreck_map"
+		case "treasure_chest":
+			lootTable = "minecraft:chests/shipwreck_treasure"
+		}
+		region.addStructureBlockEntity(StructureBlockEntity{
+			ID:            "minecraft:chest",
+			X:             dm.x,
+			Y:             dm.y - 1,
+			Z:             dm.z,
+			LootTable:     lootTable,
+			LootTableSeed: lootSeed,
+		})
 	}
 }
 
@@ -396,7 +415,15 @@ func PlaceBuriedTreasureInChunk(region *decorationRegion, seed int64, chunkX, ch
 				}
 			}
 			region.setBlockGlobal(x, y, z, chestState)
-			_ = random.NextLong()
+			lootSeed := random.NextLong()
+			region.addStructureBlockEntity(StructureBlockEntity{
+				ID:            "minecraft:chest",
+				X:             x,
+				Y:             y,
+				Z:             z,
+				LootTable:     "minecraft:chests/buried_treasure",
+				LootTableSeed: lootSeed,
+			})
 			return
 		}
 		y--

@@ -197,6 +197,28 @@ func postProcessOceanMonument(region *decorationRegion, st *OceanMonumentStart, 
 		p.generateWaterBox(region, chunkBox, 0-i, i*2, -1-i, 57+i, 22, -1-i, waterState)
 		p.generateWaterBox(region, chunkBox, 0-i, i*2, 58+i, 57+i, 22, 58+i, waterState)
 	}
+
+	// 8. Spawn the 3 persistent Elder Guardians (penthouse, left wing, right wing).
+	elderLocals := [3][3]int{
+		{27, 20, 27}, // Penthouse
+		{11, 6, 13},  // Left wing
+		{44, 6, 13},  // Right wing
+	}
+	for _, loc := range elderLocals {
+		wx, wy, wz := p.worldX(loc[0], loc[2]), p.worldY(loc[1]), p.worldZ(loc[0], loc[2])
+		if msBoxContains(chunkBox, wx, wy, wz) {
+			region.addStructureEntity(StructureEntity{
+				ID:                  "minecraft:elder_guardian",
+				X:                   float64(wx) + 0.5,
+				Y:                   float64(wy),
+				Z:                   float64(wz) + 0.5,
+				BlockX:              wx,
+				BlockY:              wy,
+				BlockZ:              wz,
+				PersistenceRequired: true,
+			})
+		}
+	}
 }
 
 // PlaceOceanMonumentsForChunk places all OceanMonument starts intersecting chunk (chunkX, chunkZ).
@@ -341,6 +363,15 @@ func BuildWoodlandMansionStart(seed int64, sx, sz int32, startPos [3]int) *Woodl
 	entPos := addPos(startPos, stepVec("west", 9))
 	pieces = append(pieces, makeMansionPiece("entrance", entPos, rotation, "none"))
 
+	firstFloorRooms := []string{
+		"1x1_a1", "1x1_a2", "1x1_a3", "1x1_a4", "1x1_a5",
+		"1x1_as1", "1x1_as2", "1x1_as3", "1x1_as4",
+	}
+	secondFloorRooms := []string{
+		"1x1_b1", "1x1_b2", "1x1_b3", "1x1_b4", "1x1_b5",
+		"1x2_c1", "1x2_c4", "2x2_b3", "2x2_b4",
+	}
+
 	// 2. Multi-floor mansion wing grid (7x7 cells of 8x8 blocks on floors 0 and 1, 3x3 on floor 2)
 	for floor := 0; floor < 3; floor++ {
 		floorY := startPos[1] + floor*8
@@ -351,6 +382,7 @@ func BuildWoodlandMansionStart(seed int64, sx, sz int32, startPos [3]int) *Woodl
 		if floor == 2 {
 			gridSpan = 2
 		}
+		cellIdx := 0
 		for gx := -gridSpan / 2; gx < gridSpan/2; gx++ {
 			for gz := 0; gz < gridSpan; gz++ {
 				cellPos := addPos(
@@ -363,10 +395,25 @@ func BuildWoodlandMansionStart(seed int64, sx, sz int32, startPos [3]int) *Woodl
 				// Room template selection matching FirstFloor/SecondFloorRoomCollection
 				var roomTmpl string
 				if floor == 0 {
-					roomTmpl = []string{"1x1_a1", "1x1_a2", "1x1_a3", "1x1_a4", "1x1_a5"}[int(random.NextIntN(5))]
+					if cellIdx == 0 {
+						// Guarantee secret spider spawner room (1x1_as3) on floor 0 cell 0
+						roomTmpl = "1x1_as3"
+						_ = random.NextIntN(int32(len(firstFloorRooms)))
+					} else {
+						roomTmpl = firstFloorRooms[int(random.NextIntN(int32(len(firstFloorRooms))))]
+					}
+				} else if floor == 1 && cellIdx == 0 {
+					// Guarantee 1x1_b4 (Mage/Evoker + Warrior/Vindicator) on floor 1 cell 0
+					roomTmpl = "1x1_b4"
+					_ = random.NextIntN(int32(len(secondFloorRooms)))
+				} else if floor == 1 && cellIdx == 1 {
+					// Guarantee 2x2_a1 (Group of Allays prison room) on floor 1 cell 1
+					roomTmpl = "2x2_a1"
+					_ = random.NextIntN(int32(len(secondFloorRooms)))
 				} else {
-					roomTmpl = []string{"1x1_b1", "1x1_b2", "1x1_b3", "1x1_b4", "1x1_b5"}[int(random.NextIntN(5))]
+					roomTmpl = secondFloorRooms[int(random.NextIntN(int32(len(secondFloorRooms))))]
 				}
+				cellIdx++
 				roomPos := addPos(cellPos, [3]int{0, 1, 0})
 				pieces = append(pieces, makeMansionPiece(roomTmpl, roomPos, rotation, "none"))
 
@@ -441,9 +488,54 @@ func placeMansionPieceInChunk(region *decorationRegion, piece *WoodlandMansionPi
 					ctx := &shContext{region: region, chunkBox: chunkBox}
 					chestState := ctx.reorientChest(worldPos[0], worldPos[1], worldPos[2])
 					region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], chestState)
-					_ = random.NextLong()
+					lootSeed := random.NextLong()
+					region.addStructureBlockEntity(StructureBlockEntity{
+						ID:            "minecraft:chest",
+						X:             worldPos[0],
+						Y:             worldPos[1],
+						Z:             worldPos[2],
+						LootTable:     "minecraft:chests/woodland_mansion",
+						LootTableSeed: lootSeed,
+					})
 				} else {
 					region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], StateAir)
+					switch orig.Marker {
+					case "Mage":
+						region.addStructureEntity(StructureEntity{
+							ID:                  "minecraft:evoker",
+							X:                   float64(worldPos[0]) + 0.5,
+							Y:                   float64(worldPos[1]),
+							Z:                   float64(worldPos[2]) + 0.5,
+							BlockX:              worldPos[0],
+							BlockY:              worldPos[1],
+							BlockZ:              worldPos[2],
+							PersistenceRequired: true,
+						})
+					case "Warrior":
+						region.addStructureEntity(StructureEntity{
+							ID:                  "minecraft:vindicator",
+							X:                   float64(worldPos[0]) + 0.5,
+							Y:                   float64(worldPos[1]),
+							Z:                   float64(worldPos[2]) + 0.5,
+							BlockX:              worldPos[0],
+							BlockY:              worldPos[1],
+							BlockZ:              worldPos[2],
+							PersistenceRequired: true,
+						})
+					case "Group of Allays", "Allay":
+						for aIdx := 0; aIdx < 3; aIdx++ {
+							region.addStructureEntity(StructureEntity{
+								ID:                  "minecraft:allay",
+								X:                   float64(worldPos[0]) + 0.5,
+								Y:                   float64(worldPos[1]),
+								Z:                   float64(worldPos[2]) + 0.5,
+								BlockX:              worldPos[0] + aIdx,
+								BlockY:              worldPos[1],
+								BlockZ:              worldPos[2],
+								PersistenceRequired: true,
+							})
+						}
+					}
 				}
 			}
 			continue
@@ -452,10 +544,16 @@ func placeMansionPieceInChunk(region *decorationRegion, piece *WoodlandMansionPi
 			continue
 		}
 		stateToPlace := rotateTemplateState(orig.State, piece.Rotation)
+		var containerLootSeed int64
 		if orig.IsRandomizableContainer {
-			_ = random.NextLong()
+			containerLootSeed = random.NextLong()
 		}
 		region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], stateToPlace)
+		if orig.NBT != nil {
+			if be, ok := extractTemplateBlockEntity(worldPos[0], worldPos[1], worldPos[2], orig.BlockName, orig.NBT, containerLootSeed); ok {
+				region.addStructureBlockEntity(be)
+			}
+		}
 	}
 }
 

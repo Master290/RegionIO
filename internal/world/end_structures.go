@@ -390,12 +390,6 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 			continue
 		}
 		for _, b := range piece.Blocks {
-			if b.BlockName == "minecraft:structure_block" || b.BlockName == "minecraft:structure_void" || b.BlockName == "minecraft:jigsaw" {
-				continue
-			}
-			if b.State == StateAir && !piece.Overwrite {
-				continue
-			}
 			rel := worldgen.TransformBlockPos(b.Pos, "none", piece.Rot, [3]int{0, 0, 0})
 			wx := piece.Pos[0] + rel[0]
 			wy := piece.Pos[1] + rel[1]
@@ -403,8 +397,57 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 			if !chunkBox.isInside(wx, wy, wz) {
 				continue
 			}
+			if b.BlockName == "minecraft:structure_block" {
+				switch b.Marker {
+				case "Chest":
+					c.AddStructureBlockEntity(StructureBlockEntity{
+						ID:            "minecraft:chest",
+						X:             wx,
+						Y:             wy - 1,
+						Z:             wz,
+						LootTable:     "minecraft:chests/end_city_treasure",
+						LootTableSeed: blockPosAsLong(wx, wy-1, wz),
+					})
+				case "Sentry":
+					c.AddStructureEntity(StructureEntity{
+						ID:                  "minecraft:shulker",
+						X:                   float64(wx) + 0.5,
+						Y:                   float64(wy),
+						Z:                   float64(wz) + 0.5,
+						BlockX:              wx,
+						BlockY:              wy,
+						BlockZ:              wz,
+						PersistenceRequired: true,
+					})
+				case "Elytra":
+					c.AddStructureEntity(StructureEntity{
+						ID:                  "minecraft:item_frame",
+						X:                   float64(wx) + 0.5,
+						Y:                   float64(wy) + 0.5,
+						Z:                   float64(wz) + 0.5,
+						BlockX:              wx,
+						BlockY:              wy,
+						BlockZ:              wz,
+						Rotation:            piece.Rot,
+						Item:                "minecraft:elytra",
+						PersistenceRequired: true,
+					})
+				}
+				continue
+			}
+			if b.BlockName == "minecraft:structure_void" || b.BlockName == "minecraft:jigsaw" {
+				continue
+			}
+			if b.State == StateAir && !piece.Overwrite {
+				continue
+			}
 			st := rotateTemplateState(b.State, piece.Rot)
 			setEndBlock(c, wx, wy, wz, st)
+			if b.NBT != nil {
+				if be, ok := extractTemplateBlockEntity(wx, wy, wz, b.BlockName, b.NBT, blockPosAsLong(wx, wy, wz)); ok {
+					c.AddStructureBlockEntity(be)
+				}
+			}
 		}
 	}
 }

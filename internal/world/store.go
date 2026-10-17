@@ -407,7 +407,7 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 
 	root.Set("Heightmaps", buildHeightmaps(c))
 	// Required-but-empty fields so vanilla loads the chunk without complaints.
-	root.Set("block_entities", nbt.List{ElemID: nbt.TagCompound})
+	root.Set("block_entities", structureBlockEntitiesToNBT(c))
 	root.Set("structures", nbt.NewCompound())
 
 	return root
@@ -644,6 +644,7 @@ func nbtToChunkVersioned(root *nbt.Compound, regionX, regionZ, localX, localZ in
 		}
 		readLightSection(c, si, sc)
 	}
+	structureBlockEntitiesFromNBT(c, root)
 	return c, nil
 }
 

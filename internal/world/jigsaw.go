@@ -55,6 +55,7 @@ type cachedJigsawPalette struct {
 type cachedJigsawTemplate struct {
 	size     [3]int
 	palettes []cachedJigsawPalette
+	entities []worldgen.TemplateEntityInfo
 }
 
 var (
@@ -80,6 +81,7 @@ func loadCachedJigsawTemplate(location string) (*cachedJigsawTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
+	entities, _ := worldgen.LoadResolvedTemplateEntitiesBytes(raw)
 
 	// Sort each palette's blocks matching StructureTemplate.loadPalette / buildInfoList:
 	// fullBlocks -> otherBlocks -> blocksWithNbt, each sorted by (Y, X, Z) ascending.
@@ -130,6 +132,7 @@ func loadCachedJigsawTemplate(location string) (*cachedJigsawTemplate, error) {
 	res := &cachedJigsawTemplate{
 		size:     size,
 		palettes: palettes,
+		entities: entities,
 	}
 	jigsawTemplateMu.Lock()
 	jigsawTemplateCache[clean] = res
@@ -1198,6 +1201,8 @@ func placeJigsawElementInChunk(
 
 			// 3. Configured processors (RuleProcessor, CappedProcessor, BlockRotProcessor, ProtectedBlocksProcessor).
 			discarded := false
+			var ruleLootTable string
+			var ruleLootSeed int64
 			for pIdx, proc := range procs {
 				switch proc.ProcessorType {
 				case "minecraft:rule":
@@ -1216,6 +1221,10 @@ func placeJigsawElementInChunk(
 						if outID, ok := nameToStateID(rule.OutputState.Name, rule.OutputState.Properties); ok {
 							curState = outID
 							curName = rule.OutputState.Name
+						}
+						if rule.BlockEntityModifier.Type == "minecraft:append_loot" && rule.BlockEntityModifier.LootTable != "" {
+							ruleLootTable = rule.BlockEntityModifier.LootTable
+							ruleLootSeed = ruleRng.NextLong()
 						}
 						break
 					}
@@ -1237,6 +1246,10 @@ func placeJigsawElementInChunk(
 								curState = outID
 								curName = rule.OutputState.Name
 								cappedCounts[pIdx]++
+							}
+							if rule.BlockEntityModifier.Type == "minecraft:append_loot" && rule.BlockEntityModifier.LootTable != "" {
+								ruleLootTable = rule.BlockEntityModifier.LootTable
+								ruleLootSeed = ruleRng.NextLong()
 							}
 							break
 						}
@@ -1291,8 +1304,9 @@ func placeJigsawElementInChunk(
 			stateToPlace := rotateTemplateState(curState, rotation)
 
 			// RandomizableContainer LootTableSeed draw on chunk's decoration random.
+			var containerLootSeed int64
 			if orig.IsRandomizableContainer {
-				_ = random.NextLong()
+				containerLootSeed = random.NextLong()
 			}
 
 			// Waterlogging check if APPLY_WATERLOGGING.
@@ -1312,6 +1326,50 @@ func placeJigsawElementInChunk(
 			}
 
 			region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], stateToPlace)
+
+			if ruleLootTable != "" {
+				region.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:brushable_block",
+					X:             worldPos[0],
+					Y:             worldPos[1],
+					Z:             worldPos[2],
+					LootTable:     ruleLootTable,
+					LootTableSeed: ruleLootSeed,
+				})
+			} else if orig.NBT != nil {
+				if be, ok := extractTemplateBlockEntity(worldPos[0], worldPos[1], worldPos[2], curName, orig.NBT, containerLootSeed); ok {
+					region.addStructureBlockEntity(be)
+				}
+			}
+		}
+
+		// Place template entities (e.g. piglin_brute, piglin, hoglin in Bastion; iron_golem, allay in Outpost; villagers/animals in Village).
+		for _, ent := range tmpl.entities {
+			relPos := worldgen.TransformEntityPos(ent.Pos, "none", rotation, [3]int{0, 0, 0})
+			relBlock := worldgen.TransformBlockPos(ent.BlockPos, "none", rotation, [3]int{0, 0, 0})
+			wPos := [3]float64{float64(pos[0]) + relPos[0], float64(pos[1]) + relPos[1], float64(pos[2]) + relPos[2]}
+			wBlock := [3]int{pos[0] + relBlock[0], pos[1] + relBlock[1], pos[2] + relBlock[2]}
+			if terrainMatching {
+				surfY := region.heightAt("WORLD_SURFACE_WG", wBlock[0], wBlock[2])
+				wBlock[1] = (surfY - 1) + ent.BlockPos[1]
+				wPos[1] = float64(surfY-1) + ent.Pos[1]
+			}
+			if wBlock[0] < chunkBox.minX || wBlock[0] > chunkBox.maxX ||
+				wBlock[1] < chunkBox.minY || wBlock[1] > chunkBox.maxY ||
+				wBlock[2] < chunkBox.minZ || wBlock[2] > chunkBox.maxZ {
+				continue
+			}
+			region.addStructureEntity(StructureEntity{
+				ID:                  ent.ID,
+				X:                   wPos[0],
+				Y:                   wPos[1],
+				Z:                   wPos[2],
+				BlockX:              wBlock[0],
+				BlockY:              wBlock[1],
+				BlockZ:              wBlock[2],
+				Rotation:            rotation,
+				PersistenceRequired: true,
+			})
 		}
 	}
 }

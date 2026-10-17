@@ -1047,7 +1047,22 @@ func (c *shContext) createChest(p *shPiece, random worldgen.RandomSource, x, y, 
 		return false
 	}
 	c.region.setBlockGlobal(wx, wy, wz, c.reorientChest(wx, wy, wz))
-	random.NextLong()
+	lootSeed := random.NextLong()
+	lootTable := "minecraft:chests/stronghold_corridor"
+	switch p.kind {
+	case shKindRoomCrossing:
+		lootTable = "minecraft:chests/stronghold_crossing"
+	case shKindLibrary:
+		lootTable = "minecraft:chests/stronghold_library"
+	}
+	c.region.addStructureBlockEntity(StructureBlockEntity{
+		ID:            "minecraft:chest",
+		X:             wx,
+		Y:             wy,
+		Z:             wz,
+		LootTable:     lootTable,
+		LootTableSeed: lootSeed,
+	})
 	return true
 }
 
@@ -1424,6 +1439,13 @@ func shPostProcess(c *shContext, p *shPiece, random worldgen.RandomSource) {
 			if msBoxContains(c.chunkBox, wx, wy, wz) {
 				p.hasPlacedSpawner = true
 				c.region.setBlockGlobal(wx, wy, wz, shSpawner)
+				c.region.addStructureBlockEntity(StructureBlockEntity{
+					ID:              "minecraft:mob_spawner",
+					X:               wx,
+					Y:               wy,
+					Z:               wz,
+					SpawnerEntityID: "minecraft:silverfish",
+				})
 			}
 		}
 

@@ -836,6 +836,18 @@ func (p *NetherFortressPiece) postProcess(c *Chunk, chunkBox msBox) {
 				p.fillNetherColumnDown(c, chunkBox, bricks, 18-x, -1, z)
 			}
 		}
+		if wx, wy, wz := p.getWorldX(9, 9), p.getWorldY(5), p.getWorldZ(9, 9); chunkBox.isInside(wx, wy, wz) {
+			c.AddStructureEntity(StructureEntity{
+				ID:                  "minecraft:wither_skeleton",
+				X:                   float64(wx) + 0.5,
+				Y:                   float64(wy),
+				Z:                   float64(wz) + 0.5,
+				BlockX:              wx,
+				BlockY:              wy,
+				BlockZ:              wz,
+				PersistenceRequired: true,
+			})
+		}
 
 	case nfBridgeStraight:
 		p.generateBox(c, chunkBox, 0, 3, 0, 4, 4, 18, bricks, bricks, false)
@@ -954,6 +966,25 @@ func (p *NetherFortressPiece) postProcess(c *Chunk, chunkBox msBox) {
 		p.generateBox(c, chunkBox, 2, 6, 3, 4, 6, 3, fenceEW, fenceEW, false)
 		p.generateBox(c, chunkBox, 1, 7, 3, 5, 7, 3, fenceEW, fenceEW, false)
 		p.placeBlock(c, chunkBox, b.spawner, 3, 5, 5)
+		if wx, wy, wz := p.getWorldX(3, 5), p.getWorldY(5), p.getWorldZ(3, 5); chunkBox.isInside(wx, wy, wz) {
+			c.AddStructureBlockEntity(StructureBlockEntity{
+				ID:              "minecraft:mob_spawner",
+				X:               wx,
+				Y:               wy,
+				Z:               wz,
+				SpawnerEntityID: "minecraft:blaze",
+			})
+			c.AddStructureEntity(StructureEntity{
+				ID:                  "minecraft:blaze",
+				X:                   float64(wx) + 0.5,
+				Y:                   float64(wy) + 1.0,
+				Z:                   float64(wz) + 0.5,
+				BlockX:              wx,
+				BlockY:              wy + 1,
+				BlockZ:              wz,
+				PersistenceRequired: true,
+			})
+		}
 		for x := 1; x <= 5; x++ {
 			for z := 0; z <= 7; z++ {
 				p.fillNetherColumnDown(c, chunkBox, bricks, x, -1, z)
@@ -976,6 +1007,18 @@ func (p *NetherFortressPiece) postProcess(c *Chunk, chunkBox msBox) {
 			for z := 0; z <= 12; z++ {
 				p.fillNetherColumnDown(c, chunkBox, bricks, x, -1, z)
 			}
+		}
+		if wx, wy, wz := p.getWorldX(6, 6), p.getWorldY(4), p.getWorldZ(6, 6); chunkBox.isInside(wx, wy, wz) {
+			c.AddStructureEntity(StructureEntity{
+				ID:                  "minecraft:wither_skeleton",
+				X:                   float64(wx) + 0.5,
+				Y:                   float64(wy),
+				Z:                   float64(wz) + 0.5,
+				BlockX:              wx,
+				BlockY:              wy,
+				BlockZ:              wz,
+				PersistenceRequired: true,
+			})
 		}
 
 	case nfCastleSmallCorridor:
@@ -1020,6 +1063,16 @@ func (p *NetherFortressPiece) postProcess(c *Chunk, chunkBox msBox) {
 		p.generateBox(c, chunkBox, 3, 3, 4, 3, 4, 4, fenceEW, fenceEW, false)
 		if p.isNeedingChest {
 			p.placeBlock(c, chunkBox, b.chest[p.rotateDir(dirWest)&3], 3, 2, 3)
+			if wx, wy, wz := p.getWorldX(3, 3), p.getWorldY(2), p.getWorldZ(3, 3); chunkBox.isInside(wx, wy, wz) {
+				c.AddStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:chest",
+					X:             wx,
+					Y:             wy,
+					Z:             wz,
+					LootTable:     "minecraft:chests/nether_bridge",
+					LootTableSeed: blockPosAsLong(wx, wy, wz),
+				})
+			}
 		}
 		p.generateBox(c, chunkBox, 0, 6, 0, 4, 6, 4, bricks, bricks, false)
 		for x := 0; x <= 4; x++ {
@@ -1040,6 +1093,16 @@ func (p *NetherFortressPiece) postProcess(c *Chunk, chunkBox msBox) {
 		p.generateBox(c, chunkBox, 3, 3, 4, 3, 4, 4, fenceEW, fenceEW, false)
 		if p.isNeedingChest {
 			p.placeBlock(c, chunkBox, b.chest[p.rotateDir(dirEast)&3], 1, 2, 3)
+			if wx, wy, wz := p.getWorldX(1, 3), p.getWorldY(2), p.getWorldZ(1, 3); chunkBox.isInside(wx, wy, wz) {
+				c.AddStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:chest",
+					X:             wx,
+					Y:             wy,
+					Z:             wz,
+					LootTable:     "minecraft:chests/nether_bridge",
+					LootTableSeed: blockPosAsLong(wx, wy, wz),
+				})
+			}
 		}
 		p.generateBox(c, chunkBox, 0, 6, 0, 4, 6, 4, bricks, bricks, false)
 		for x := 0; x <= 4; x++ {

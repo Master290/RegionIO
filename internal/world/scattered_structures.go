@@ -300,7 +300,7 @@ func (p *scatteredPiece) fillColumnDown(region *decorationRegion, chunkBox msBox
 	}
 }
 
-func (p *scatteredPiece) createChest(region *decorationRegion, chunkBox msBox, random worldgen.RandomSource, x, y, z int) bool {
+func (p *scatteredPiece) createChest(region *decorationRegion, chunkBox msBox, random worldgen.RandomSource, x, y, z int, lootTable string) bool {
 	initStrongholdStates()
 	wx, wy, wz := p.worldX(x, z), p.worldY(y), p.worldZ(x, z)
 	if !msBoxContains(chunkBox, wx, wy, wz) {
@@ -312,11 +312,19 @@ func (p *scatteredPiece) createChest(region *decorationRegion, chunkBox msBox, r
 	ctx := &shContext{region: region, chunkBox: chunkBox}
 	chestState := ctx.reorientChest(wx, wy, wz)
 	region.setBlockGlobal(wx, wy, wz, chestState)
-	_ = random.NextLong()
+	lootSeed := random.NextLong()
+	region.addStructureBlockEntity(StructureBlockEntity{
+		ID:            "minecraft:chest",
+		X:             wx,
+		Y:             wy,
+		Z:             wz,
+		LootTable:     lootTable,
+		LootTableSeed: lootSeed,
+	})
 	return true
 }
 
-func (p *scatteredPiece) createDispenser(region *decorationRegion, chunkBox msBox, random worldgen.RandomSource, x, y, z int, facing string) bool {
+func (p *scatteredPiece) createDispenser(region *decorationRegion, chunkBox msBox, random worldgen.RandomSource, x, y, z int, facing, lootTable string) bool {
 	wx, wy, wz := p.worldX(x, z), p.worldY(y), p.worldZ(x, z)
 	if !msBoxContains(chunkBox, wx, wy, wz) {
 		return false
@@ -328,7 +336,15 @@ func (p *scatteredPiece) createDispenser(region *decorationRegion, chunkBox msBo
 	baseDisp, _ := nameToStateID("minecraft:dispenser", map[string]string{"facing": facing, "triggered": "false"})
 	dispState := sfTransformState(baseDisp, p.orientation)
 	region.setBlockGlobal(wx, wy, wz, dispState)
-	_ = random.NextLong()
+	lootSeed := random.NextLong()
+	region.addStructureBlockEntity(StructureBlockEntity{
+		ID:            "minecraft:dispenser",
+		X:             wx,
+		Y:             wy,
+		Z:             wz,
+		LootTable:     lootTable,
+		LootTableSeed: lootSeed,
+	})
 	return true
 }
 
@@ -478,15 +494,50 @@ func placeIglooPieceInChunk(region *decorationRegion, piece *IglooPiece, chunkBo
 			continue
 		}
 		stateToPlace := rotateTemplateState(orig.State, piece.Rotation)
+		var containerLootSeed int64
 		if orig.IsRandomizableContainer {
-			_ = random.NextLong()
+			containerLootSeed = random.NextLong()
 		}
 		region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], stateToPlace)
+		if orig.NBT != nil {
+			if be, ok := extractTemplateBlockEntity(worldPos[0], worldPos[1], worldPos[2], orig.BlockName, orig.NBT, containerLootSeed); ok {
+				region.addStructureBlockEntity(be)
+			}
+		}
 	}
 
 	for _, dmPos := range dataMarkerPositions {
 		region.setBlockGlobal(dmPos[0], dmPos[1], dmPos[2], StateAir)
-		_ = random.NextLong()
+		lootSeed := random.NextLong()
+		region.addStructureBlockEntity(StructureBlockEntity{
+			ID:            "minecraft:chest",
+			X:             dmPos[0],
+			Y:             dmPos[1] - 1,
+			Z:             dmPos[2],
+			LootTable:     "minecraft:chests/igloo_chest",
+			LootTableSeed: lootSeed,
+		})
+	}
+
+	for _, ent := range tmpl.entities {
+		relPos := worldgen.TransformEntityPos(ent.Pos, "none", piece.Rotation, pivot)
+		relBlock := worldgen.TransformBlockPos(ent.BlockPos, "none", piece.Rotation, pivot)
+		wPos := [3]float64{float64(placedPos[0]) + relPos[0], float64(placedPos[1]) + relPos[1], float64(placedPos[2]) + relPos[2]}
+		wBlock := [3]int{placedPos[0] + relBlock[0], placedPos[1] + relBlock[1], placedPos[2] + relBlock[2]}
+		if !msBoxContains(chunkBox, wBlock[0], wBlock[1], wBlock[2]) {
+			continue
+		}
+		region.addStructureEntity(StructureEntity{
+			ID:                  ent.ID,
+			X:                   wPos[0],
+			Y:                   wPos[1],
+			Z:                   wPos[2],
+			BlockX:              wBlock[0],
+			BlockY:              wBlock[1],
+			BlockZ:              wBlock[2],
+			Rotation:            piece.Rotation,
+			PersistenceRequired: true,
+		})
 	}
 
 	if piece.Template == "igloo/top" {
@@ -649,6 +700,31 @@ func postProcessSwampHut(region *decorationRegion, p *scatteredPiece, chunkBox m
 		for x := 1; x <= 5; x += 4 {
 			p.fillColumnDown(region, chunkBox, oakLog, x, -1, z)
 		}
+	}
+
+	// SwampHutPiece.postProcess spawns a persistent Witch and a Black Cat at local (2, 2, 5).
+	wx, wy, wz := p.worldX(2, 5), p.worldY(2), p.worldZ(2, 5)
+	if msBoxContains(chunkBox, wx, wy, wz) {
+		region.addStructureEntity(StructureEntity{
+			ID:                  "minecraft:witch",
+			X:                   float64(wx) + 0.5,
+			Y:                   float64(wy),
+			Z:                   float64(wz) + 0.5,
+			BlockX:              wx,
+			BlockY:              wy,
+			BlockZ:              wz,
+			PersistenceRequired: true,
+		})
+		region.addStructureEntity(StructureEntity{
+			ID:                  "minecraft:cat",
+			X:                   float64(wx) + 0.5,
+			Y:                   float64(wy),
+			Z:                   float64(wz) + 0.5,
+			BlockX:              wx,
+			BlockY:              wy,
+			BlockZ:              wz,
+			PersistenceRequired: true,
+		})
 	}
 }
 
@@ -969,7 +1045,7 @@ func postProcessDesertPyramid(region *decorationRegion, st *DesertPyramidStart, 
 	}
 	for _, cd := range chestDirs {
 		if !st.HasPlacedChest[cd.idx2D] {
-			st.HasPlacedChest[cd.idx2D] = p.createChest(region, chunkBox, random, 10+cd.dx, -11, 10+cd.dz)
+			st.HasPlacedChest[cd.idx2D] = p.createChest(region, chunkBox, random, 10+cd.dx, -11, 10+cd.dz, "minecraft:chests/desert_pyramid")
 		}
 	}
 
@@ -1072,6 +1148,14 @@ func afterPlaceDesertPyramid(region *decorationRegion, st *DesertPyramidStart, c
 		cp := st.RandomCollapsedRoofPos
 		if msBoxContains(chunkBox, cp[0], cp[1], cp[2]) {
 			region.setBlockGlobal(cp[0], cp[1], cp[2], suspiciousSand)
+			region.addStructureBlockEntity(StructureBlockEntity{
+				ID:            "minecraft:brushable_block",
+				X:             cp[0],
+				Y:             cp[1],
+				Z:             cp[2],
+				LootTable:     "minecraft:archaeology/desert_pyramid",
+				LootTableSeed: blockPosAsLong(cp[0], cp[1], cp[2]),
+			})
 		}
 	}
 
@@ -1111,6 +1195,14 @@ func afterPlaceDesertPyramid(region *decorationRegion, st *DesertPyramidStart, c
 			suspiciousCount--
 			if msBoxContains(chunkBox, pos[0], pos[1], pos[2]) {
 				region.setBlockGlobal(pos[0], pos[1], pos[2], suspiciousSand)
+				region.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:brushable_block",
+					X:             pos[0],
+					Y:             pos[1],
+					Z:             pos[2],
+					LootTable:     "minecraft:archaeology/desert_pyramid",
+					LootTableSeed: blockPosAsLong(pos[0], pos[1], pos[2]),
+				})
 			}
 		} else if msBoxContains(chunkBox, pos[0], pos[1], pos[2]) {
 			region.setBlockGlobal(pos[0], pos[1], pos[2], sandState)
@@ -1390,7 +1482,7 @@ func postProcessJungleTemple(region *decorationRegion, st *JungleTempleStart, ch
 	p.placeBlock(region, chunkBox, wireEW, 4, -3, 1)
 	p.placeBlock(region, chunkBox, mossy, 3, -3, 1)
 	if !st.PlacedTrap1 {
-		st.PlacedTrap1 = p.createDispenser(region, chunkBox, random, 3, -2, 1, "north")
+		st.PlacedTrap1 = p.createDispenser(region, chunkBox, random, 3, -2, 1, "north", "minecraft:chests/jungle_temple_dispenser")
 	}
 	p.placeBlock(region, chunkBox, vineS, 3, -2, 2)
 
@@ -1406,12 +1498,12 @@ func postProcessJungleTemple(region *decorationRegion, st *JungleTempleStart, ch
 	p.placeBlock(region, chunkBox, mossy, 9, -3, 4)
 	p.placeBlock(region, chunkBox, wireNS, 9, -2, 4)
 	if !st.PlacedTrap2 {
-		st.PlacedTrap2 = p.createDispenser(region, chunkBox, random, 9, -2, 3, "west")
+		st.PlacedTrap2 = p.createDispenser(region, chunkBox, random, 9, -2, 3, "west", "minecraft:chests/jungle_temple_dispenser")
 	}
 	p.placeBlock(region, chunkBox, vineE, 8, -1, 3)
 	p.placeBlock(region, chunkBox, vineE, 8, -2, 3)
 	if !st.PlacedMainChest {
-		st.PlacedMainChest = p.createChest(region, chunkBox, random, 8, -3, 3)
+		st.PlacedMainChest = p.createChest(region, chunkBox, random, 8, -3, 3, "minecraft:chests/jungle_temple")
 	}
 	p.placeBlock(region, chunkBox, mossy, 9, -3, 2)
 	p.placeBlock(region, chunkBox, mossy, 8, -3, 1)
@@ -1455,7 +1547,7 @@ func postProcessJungleTemple(region *decorationRegion, st *JungleTempleStart, ch
 	p.placeBlock(region, chunkBox, pistonW, 10, -1, 8)
 	p.placeBlock(region, chunkBox, repeaterN, 10, -2, 10)
 	if !st.PlacedHiddenChest {
-		st.PlacedHiddenChest = p.createChest(region, chunkBox, random, 9, -3, 10)
+		st.PlacedHiddenChest = p.createChest(region, chunkBox, random, 9, -3, 10, "minecraft:chests/jungle_temple")
 	}
 }
 

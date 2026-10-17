@@ -94,10 +94,12 @@ type Chunk struct {
 	biome          uint16 // fallback uniform biome when biomes[si] is nil
 
 	// Custom dimension vertical bounds (when customBounds is true, e.g. Nether/End 0..256).
-	customBounds bool
-	dimMinY      int
-	dimHeight    int
-	noSkylight   bool
+	customBounds  bool
+	dimMinY       int
+	dimHeight     int
+	noSkylight    bool
+	blockEntities []StructureBlockEntity
+	entities      []StructureEntity
 }
 
 func (c *Chunk) minY() int {
@@ -337,6 +339,14 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 	}
 	clone.lightReady = c.lightReady
 	clone.lightValidated = c.lightValidated
+	if len(c.blockEntities) > 0 {
+		clone.blockEntities = make([]StructureBlockEntity, len(c.blockEntities))
+		copy(clone.blockEntities, c.blockEntities)
+	}
+	if len(c.entities) > 0 {
+		clone.entities = make([]StructureEntity, len(c.entities))
+		copy(clone.entities, c.entities)
+	}
 	return clone, revision
 }
 

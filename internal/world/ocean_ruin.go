@@ -447,9 +447,27 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 		if stub.BiomeType == "cold" && c.state == int(ruinGravelID) {
 			c.state = int(ruinSuspiciousGrav)
 			converted++
+			lootSeed := worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
+			region.addStructureBlockEntity(StructureBlockEntity{
+				ID:            "minecraft:brushable_block",
+				X:             c.x,
+				Y:             c.y,
+				Z:             c.z,
+				LootTable:     "minecraft:archaeology/ocean_ruin_cold",
+				LootTableSeed: lootSeed,
+			})
 		} else if stub.BiomeType == "warm" && c.state == int(ruinSandID) {
 			c.state = int(ruinSuspiciousSand)
 			converted++
+			lootSeed := worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
+			region.addStructureBlockEntity(StructureBlockEntity{
+				ID:            "minecraft:brushable_block",
+				X:             c.x,
+				Y:             c.y,
+				Z:             c.z,
+				LootTable:     "minecraft:archaeology/ocean_ruin_warm",
+				LootTableSeed: lootSeed,
+			})
 		}
 	}
 	var written [][3]int
@@ -473,12 +491,37 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 			if isWaterState(region.getBlock(m.x, m.y, m.z)) {
 				chest = ruinChestWaterID
 			}
-			if region.setBlock(m.x, m.y, m.z, chest) {
+			placedChest := region.setBlock(m.x, m.y, m.z, chest)
+			if placedChest {
 				written = append(written, [3]int{m.x, m.y, m.z})
 			}
-			random.NextLong()
+			lootSeed := random.NextLong()
+			if placedChest {
+				lootTable := "minecraft:chests/underwater_ruin_small"
+				if piece.IsLarge {
+					lootTable = "minecraft:chests/underwater_ruin_big"
+				}
+				region.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:chest",
+					X:             m.x,
+					Y:             m.y,
+					Z:             m.z,
+					LootTable:     lootTable,
+					LootTableSeed: lootSeed,
+				})
+			}
 		case "drowned":
 			// Entity create is null during generation: no air/water write.
+			region.addStructureEntity(StructureEntity{
+				ID:                  "minecraft:drowned",
+				X:                   float64(m.x) + 0.5,
+				Y:                   float64(m.y),
+				Z:                   float64(m.z) + 0.5,
+				BlockX:              m.x,
+				BlockY:              m.y,
+				BlockZ:              m.z,
+				PersistenceRequired: true,
+			})
 		}
 	}
 	return written, nil
@@ -546,6 +589,7 @@ func applyOceanRuinPhysics(region *decorationRegion, written [][3]int) {
 			}
 			region.setBlock(p[0], land, p[2], state)
 			region.setBlock(p[0], p[1], p[2], StateAir)
+			region.moveStructureBlockEntity(p[0], p[1], p[2], p[0], land, p[2])
 			vacated = append(vacated, [3]int{p[0], p[1], p[2]})
 			tracked = append(tracked, [3]int{p[0], land, p[2]})
 			moved = true
