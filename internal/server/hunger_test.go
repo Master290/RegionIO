@@ -478,4 +478,29 @@ func TestAdvancementTriggersAndEffectModifiersInCombatHungerClockTrading(t *test
 	if !slept || !player.HasCompletedAdvancement("minecraft:adventure/sleep_in_bed") {
 		t.Fatalf("expected SleepInBed to complete minecraft:adventure/sleep_in_bed (slept=%v)", slept)
 	}
+	srv.SetPlayerSleeping(player, false)
+
+	// 6. Shield projectile deflection in combat.go fires TriggerDeflectedProjectile (minecraft:story/deflect_arrow).
+	player.SetInventorySlot(45, world.NewNamedItemStack("minecraft:shield", 1))
+	if !srv.UseShield(player, 1) || !player.IsBlockingWithShield() {
+		t.Fatal("expected UseShield to activate shield blocking")
+	}
+	arrowDmg := srv.ShootSkeletonArrowAtPlayer(100, 12.5, surfaceY, 8.5, player)
+	if arrowDmg != 0 {
+		t.Fatalf("expected shield to block skeleton arrow damage, got %v", arrowDmg)
+	}
+	if !player.HasCompletedAdvancement("minecraft:story/deflect_arrow") {
+		t.Fatal("expected blocking skeleton arrow with shield to complete minecraft:story/deflect_arrow")
+	}
+	player.SetBlockingWithShield(false)
+
+	// 7. finishEating calls TriggerConsumeItem (balanced_diet criterion).
+	srv.SetPlayerHealth(player, 20.0, 10, 0.0)
+	player.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:bread", 1))
+	if !srv.StartEating(player, HandMain) || !srv.finishEating(player) {
+		t.Fatal("expected StartEating + finishEating(bread) to succeed")
+	}
+	if prog, ok := player.AdvancementProgressFor("minecraft:husbandry/balanced_diet"); !ok || !prog.Criteria["bread"].IsDone() {
+		t.Fatal("expected finishEating(bread) to grant balanced_diet criterion 'bread'")
+	}
 }

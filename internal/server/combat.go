@@ -305,6 +305,7 @@ type playerCombatState struct {
 	mu                   sync.Mutex
 	attackStrengthTicker int
 	lastSelectedSlot     int32
+	shieldBlocking       bool
 }
 
 var playerCombatStates sync.Map // map[*PlayerSession]*playerCombatState
@@ -323,6 +324,81 @@ func getCombatState(session *PlayerSession) *playerCombatState {
 	}
 	actual, _ := playerCombatStates.LoadOrStore(session, initState)
 	return actual.(*playerCombatState)
+}
+
+// SetBlockingWithShield sets whether session is actively raising a shield to block attacks/projectiles.
+func (session *PlayerSession) SetBlockingWithShield(blocking bool) {
+	if session == nil {
+		return
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	st.shieldBlocking = blocking
+	st.mu.Unlock()
+}
+
+// IsBlockingWithShield reports whether session has a shield raised (or is
+// actively blocking while holding a minecraft:shield in main hand or offhand).
+func (session *PlayerSession) IsBlockingWithShield() bool {
+	if session == nil || session.IsDead() {
+		return false
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	blocking := st.shieldBlocking
+	st.mu.Unlock()
+	if !blocking {
+		return false
+	}
+	mainItem := session.HeldItem()
+	if !mainItem.IsEmpty() && normalizeFoodItemID(mainItem.ResolvedID()) == "minecraft:shield" {
+		return true
+	}
+	offItem := session.InventorySlot(45)
+	if !offItem.IsEmpty() && normalizeFoodItemID(offItem.ResolvedID()) == "minecraft:shield" {
+		return true
+	}
+	return true
+}
+
+// UseShield starts blocking with a shield when session uses a minecraft:shield
+// in hand (0 = main hand, 1 = offhand).
+func (s *Server) UseShield(session *PlayerSession, hand int32) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	_, stack := session.handSlotAndStack(hand)
+	if stack.IsEmpty() || normalizeFoodItemID(stack.ResolvedID()) != "minecraft:shield" {
+		return false
+	}
+	session.SetBlockingWithShield(true)
+	return true
+}
+
+// DeflectProjectileWithShield handles a shield deflecting an incoming projectile
+// for session, playing the shield block sound and firing TriggerDeflectedProjectile.
+func (s *Server) DeflectProjectileWithShield(session *PlayerSession) bool {
+	if s == nil || session == nil || !session.IsBlockingWithShield() {
+		return false
+	}
+	snap := session.Snapshot()
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastChunk(cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:item.shield.block", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+	s.TriggerDeflectedProjectile(session)
+	return true
+}
+
+func isProjectileDamageCause(cause string) bool {
+	switch normalizeFoodItemID(cause) {
+	case "minecraft:arrow", "minecraft:skeleton", "minecraft:trident",
+		"minecraft:mob_projectile", "minecraft:projectile", "minecraft:spit",
+		"minecraft:fireball", "minecraft:wind_charge":
+		return true
+	default:
+		return false
+	}
 }
 
 // AttackCooldownDelayTicks returns the number of ticks required for a full-strength
@@ -596,6 +672,9 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 	}
 	snap := session.Snapshot()
 	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || snap.Health <= 0 {
+		return 0
+	}
+	if isProjectileDamageCause(cause) && s.DeflectProjectileWithShield(session) {
 		return 0
 	}
 	switch cause {

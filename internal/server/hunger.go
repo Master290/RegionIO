@@ -1124,9 +1124,14 @@ func DecodeUseItemPacket(r *protocol.Reader) (hand, sequence int32, yaw, pitch f
 	return hand, sequence, yaw, pitch, nil
 }
 
+func (s *Server) finishEating(session *PlayerSession) bool {
+	return s.CompleteEating(session)
+}
+
 // HandleUseItemPacket handles a serverbound use_item (0x43) packet for session,
 // starting food consumption when holding an edible item (or drinking/throwing a
-// potion/milk bucket) and acknowledging the block/item sequence number.
+// potion/milk bucket, casting/reeling a fishing rod, or raising a shield) and
+// acknowledging the block/item sequence number.
 func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader) error {
 	hand, seq, _, _, err := DecodeUseItemPacket(r)
 	if err != nil {
@@ -1134,7 +1139,9 @@ func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader)
 	}
 	if s != nil && session != nil {
 		if !s.StartEating(session, hand) && !s.UsePotionOrMilkItem(session, hand) {
-			s.UseFishingRod(session, hand)
+			if cast, wear := s.UseFishingRod(session, hand); !cast && wear == 0 {
+				s.UseShield(session, hand)
+			}
 		}
 		if session.send != nil {
 			ack := protocol.NewWriter(4)
