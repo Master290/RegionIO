@@ -55,6 +55,8 @@ type netherBlockIDs struct {
 	twistingVinesPlant uint16
 	twistingVines      [26]uint16
 	boneBlock          uint16
+	brownMushroom      uint16
+	redMushroom        uint16
 }
 
 var (
@@ -86,6 +88,8 @@ func loadNetherBlocks() *netherBlockIDs {
 		netherBlocks.weepingVinesPlant = def("minecraft:weeping_vines_plant", StateAir)
 		netherBlocks.twistingVinesPlant = def("minecraft:twisting_vines_plant", StateAir)
 		netherBlocks.boneBlock = def("minecraft:bone_block", StateNetherrack)
+		netherBlocks.brownMushroom = def("minecraft:brown_mushroom", StateAir)
+		netherBlocks.redMushroom = def("minecraft:red_mushroom", StateAir)
 
 		defWeep := def("minecraft:weeping_vines", StateAir)
 		defTwist := def("minecraft:twisting_vines", StateAir)
@@ -1182,20 +1186,92 @@ func tryPlaceFungusWeepingVines(c *Chunk, r worldgen.RandomSource, x, y, z int) 
 	placeWeepingVinesColumn(c, r, x, y-1, z, length, 23, 25)
 }
 
+func netherChunkHasBiome(biomeName *[16][16]string, target string) bool {
+	for lx := 0; lx < 16; lx += 4 {
+		for lz := 0; lz < 16; lz += 4 {
+			if biomeName[lx][lz] == target {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isValidNetherSpringRock(st uint16) bool {
+	return st == StateNetherrack || st == StateSoulSand || st == StateGravel || st == StateMagmaBlock || st == StateBlackstone
+}
+
+// PlaceNetherSpring implements SpringFeature.place for Nether lava springs:
+//   - closed == false (spring_open / spring_delta): requires 4 rock neighbors and 1 air neighbor among {W,E,N,S,D}
+//   - closed == true (spring_closed / spring_closed_double): requires 5 rock neighbors and 0 air neighbors among {W,E,N,S,D}
+func PlaceNetherSpring(c *Chunk, x, y, z int, closed bool) bool {
+	if !isValidNetherSpringRock(getNetherBlock(c, x, y+1, z)) {
+		return false
+	}
+	self := getNetherBlock(c, x, y, z)
+	if self != StateAir && !isValidNetherSpringRock(self) {
+		return false
+	}
+	rock, holes := 0, 0
+	for _, off := range [5][3]int{{-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}, {0, -1, 0}} {
+		st := getNetherBlock(c, x+off[0], y+off[1], z+off[2])
+		if isValidNetherSpringRock(st) {
+			rock++
+		} else if st == StateAir {
+			holes++
+		}
+	}
+	wantRock, wantHoles := 4, 1
+	if closed {
+		wantRock, wantHoles = 5, 0
+	}
+	if rock != wantRock || holes != wantHoles {
+		return false
+	}
+	setNetherBlock(c, x, y, z, StateLava)
+	return true
+}
+
+// PlaceNetherMushroomPatch implements RandomPatchFeature (tries=64, xzSpread=7, ySpread=3)
+// for brown_mushroom_nether and red_mushroom_nether.
+func PlaceNetherMushroomPatch(c *Chunk, x, y, z int, r worldgen.RandomSource, mushroomState uint16) bool {
+	placed := false
+	for i := 0; i < 64; i++ {
+		px := x + int(r.NextIntN(8)) - int(r.NextIntN(8))
+		py := y + int(r.NextIntN(4)) - int(r.NextIntN(4))
+		pz := z + int(r.NextIntN(8)) - int(r.NextIntN(8))
+		if getNetherBlock(c, px, py, pz) != StateAir {
+			continue
+		}
+		below := getNetherBlock(c, px, py-1, pz)
+		if below == StateNetherrack || below == StateSoulSoil || below == StateCrimsonNylium || below == StateWarpedNylium || below == StateBasalt || below == StateBlackstone {
+			setNetherBlock(c, px, py, pz, mushroomState)
+			placed = true
+		}
+	}
+	return placed
+}
+
 func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.StructureSets, cx, cz int32, seed int64, biomeName *[16][16]string) {
 	PlaceNetherStructuresInChunk(c, od, sets, seed, cx, cz)
 
 	baseX, baseZ := int(cx)*16, int(cz)*16
 	nb := loadNetherBlocks()
 	r := worldgen.NewXoroshiro(seed ^ int64(cx)*341873128712 ^ int64(cz)*132897987541)
-	centerBiome := biomeName[8][8]
+
+	hasBasaltDeltas := netherChunkHasBiome(biomeName, "minecraft:basalt_deltas")
+	hasSoulSandValley := netherChunkHasBiome(biomeName, "minecraft:soul_sand_valley")
+	hasCrimsonForest := netherChunkHasBiome(biomeName, "minecraft:crimson_forest")
+	hasWarpedForest := netherChunkHasBiome(biomeName, "minecraft:warped_forest")
 
 	// 1. Biome-specific terrain features (deltas, basalt columns, basalt pillars, blobs).
-	switch centerBiome {
-	case "minecraft:basalt_deltas":
+	if hasBasaltDeltas {
 		for i := 0; i < 40; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:basalt_deltas" {
+				continue
+			}
 			for y := netherHeight - 4; y >= NetherLavaSeaLevel; y-- {
 				if getNetherBlock(c, ox, y+1, oz) == StateAir && getNetherBlock(c, ox, y, oz) != StateAir {
 					PlaceDeltaFeature(c, ox, y, oz, r, StateLava, StateMagmaBlock, 3, 7, 0, 2)
@@ -1206,6 +1282,9 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 		for i := 0; i < 2; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:basalt_deltas" {
+				continue
+			}
 			for y := netherHeight - 4; y >= NetherLavaSeaLevel; y-- {
 				if basaltCanPlaceAt(c, NetherLavaSeaLevel, ox, y, oz) {
 					PlaceBasaltColumns(c, ox, y, oz, r, 0, 1, 1, 4)
@@ -1216,6 +1295,9 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 		for i := 0; i < 1; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:basalt_deltas" {
+				continue
+			}
 			for y := netherHeight - 4; y >= NetherLavaSeaLevel; y-- {
 				if basaltCanPlaceAt(c, NetherLavaSeaLevel, ox, y, oz) {
 					PlaceBasaltColumns(c, ox, y, oz, r, 1, 2, 5, 10)
@@ -1223,10 +1305,14 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 				}
 			}
 		}
-	case "minecraft:soul_sand_valley":
+	}
+	if hasSoulSandValley {
 		for i := 0; i < 2; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:soul_sand_valley" {
+				continue
+			}
 			for y := netherHeight - 2; y >= NetherLavaSeaLevel; y-- {
 				if getNetherBlock(c, ox, y, oz) == StateAir && getNetherBlock(c, ox, y+1, oz) != StateAir {
 					PlaceBasaltPillar(c, ox, y, oz, r)
@@ -1243,12 +1329,14 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 		oz := baseZ + int(r.NextIntN(16))
 		PlaceReplaceBlobs(c, ox, oy, oz, r, StateNetherrack, StateBlackstone, 3, 7)
 	}
-	if centerBiome == "minecraft:soul_sand_valley" {
+	if hasSoulSandValley {
 		for i := 0; i < 4; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(120)) + 4
 			oz := baseZ + int(r.NextIntN(16))
-			PlaceReplaceBlobs(c, ox, oy, oz, r, StateNetherrack, StateSoulSand, 3, 7)
+			if biomeName[ox&15][oz&15] == "minecraft:soul_sand_valley" {
+				PlaceReplaceBlobs(c, ox, oy, oz, r, StateNetherrack, StateSoulSand, 3, 7)
+			}
 		}
 	}
 
@@ -1260,20 +1348,30 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 		PlaceGlowstoneBlob(c, ox, oy, oz, r)
 	}
 
-	// 3. Nether ores (quartz, gold, magma, ancient debris).
-	placeNetherOreScatter(c, r, baseX, baseZ, nb.quartzOre, 16, 10, 117, 14)
-	placeNetherOreScatter(c, r, baseX, baseZ, nb.goldOre, 10, 10, 117, 10)
-	placeNetherOreScatter(c, r, baseX, baseZ, StateMagmaBlock, 4, 27, 36, 32)
-	// Ancient debris: 1 large vein in [8..24] and 1 small vein in [8..119].
-	placeNetherOreScatter(c, r, baseX, baseZ, nb.ancientDebris, 1, 8, 22, 3)
-	placeNetherOreScatter(c, r, baseX, baseZ, nb.ancientDebris, 1, 8, 119, 2)
+	// 3. Nether ores (ellipsoid OreFeature for quartz, gold, magma, gravel, blackstone;
+	// ScatteredOreFeature for ancient debris; 2x gold/quartz in basalt_deltas).
+	placeNetherOreVein(c, r, baseX, baseZ, nb.quartzOre, 16, 10, 117, 14, biomeName, false)
+	placeNetherOreVein(c, r, baseX, baseZ, nb.goldOre, 10, 10, 117, 10, biomeName, false)
+	if hasBasaltDeltas {
+		// ore_quartz_deltas (32) and ore_gold_deltas (20) add +16 quartz and +10 gold veins in basalt_deltas.
+		placeNetherOreVein(c, r, baseX, baseZ, nb.quartzOre, 16, 10, 117, 14, biomeName, true)
+		placeNetherOreVein(c, r, baseX, baseZ, nb.goldOre, 10, 10, 117, 10, biomeName, true)
+	}
+	placeNetherOreVein(c, r, baseX, baseZ, StateMagmaBlock, 4, 27, 36, 33, biomeName, false)
+	placeNetherOreVein(c, r, baseX, baseZ, StateGravel, 2, 5, 41, 33, biomeName, false)
+	placeNetherOreVein(c, r, baseX, baseZ, StateBlackstone, 2, 5, 31, 33, biomeName, false)
+	// Ancient debris: 1 large scattered vein (size 3) in [8..22] and 1 small scattered vein (size 2) in [8..119].
+	placeNetherScatteredOre(c, r, baseX, baseZ, nb.ancientDebris, 1, 8, 22, 3)
+	placeNetherScatteredOre(c, r, baseX, baseZ, nb.ancientDebris, 1, 8, 119, 2)
 
-	// 4. Crimson & Warped forest fungi, vegetation, and vines.
-	switch centerBiome {
-	case "minecraft:crimson_forest":
+	// 4. Crimson & Warped forest fungi, vegetation, and vines (with per-position biome checks).
+	if hasCrimsonForest {
 		for i := 0; i < 8; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:crimson_forest" {
+				continue
+			}
 			for y := NetherLavaSeaLevel; y < netherHeight-16; y++ {
 				if getNetherBlock(c, ox, y, oz) == StateAir && getNetherBlock(c, ox, y-1, oz) == StateCrimsonNylium {
 					PlaceHugeFungus(c, ox, y, oz, r, true)
@@ -1284,6 +1382,9 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 		for i := 0; i < 6; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:crimson_forest" {
+				continue
+			}
 			for y := NetherLavaSeaLevel; y < netherHeight-4; y++ {
 				if getNetherBlock(c, ox, y, oz) == StateAir && getNetherBlock(c, ox, y-1, oz) == StateCrimsonNylium {
 					PlaceNetherForestVegetation(c, ox, y, oz, r, true, 8, 4)
@@ -1295,12 +1396,18 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(120)) + 4
 			oz := baseZ + int(r.NextIntN(16))
-			PlaceWeepingVines(c, ox, oy, oz, r)
+			if biomeName[ox&15][oz&15] == "minecraft:crimson_forest" {
+				PlaceWeepingVines(c, ox, oy, oz, r)
+			}
 		}
-	case "minecraft:warped_forest":
+	}
+	if hasWarpedForest {
 		for i := 0; i < 8; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:warped_forest" {
+				continue
+			}
 			for y := NetherLavaSeaLevel; y < netherHeight-16; y++ {
 				if getNetherBlock(c, ox, y, oz) == StateAir && getNetherBlock(c, ox, y-1, oz) == StateWarpedNylium {
 					PlaceHugeFungus(c, ox, y, oz, r, false)
@@ -1311,6 +1418,9 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 		for i := 0; i < 6; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oz := baseZ + int(r.NextIntN(16))
+			if biomeName[ox&15][oz&15] != "minecraft:warped_forest" {
+				continue
+			}
 			for y := NetherLavaSeaLevel; y < netherHeight-4; y++ {
 				if getNetherBlock(c, ox, y, oz) == StateAir && getNetherBlock(c, ox, y-1, oz) == StateWarpedNylium {
 					PlaceNetherForestVegetation(c, ox, y, oz, r, false, 8, 4)
@@ -1322,11 +1432,39 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(120)) + 4
 			oz := baseZ + int(r.NextIntN(16))
-			PlaceTwistingVines(c, ox, oy, oz, r, 8, 4, 8)
+			if biomeName[ox&15][oz&15] == "minecraft:warped_forest" {
+				PlaceTwistingVines(c, ox, oy, oz, r, 8, 4, 8)
+			}
 		}
 	}
 
-	// 5. Fire and soul fire patches.
+	// 5. Nether lava springs (spring_open & spring_closed) and Nether mushrooms.
+	for i := 0; i < 8; i++ {
+		ox := baseX + int(r.NextIntN(16))
+		oy := int(r.NextIntN(116)) + 4
+		oz := baseZ + int(r.NextIntN(16))
+		PlaceNetherSpring(c, ox, oy, oz, false)
+	}
+	for i := 0; i < 16; i++ {
+		ox := baseX + int(r.NextIntN(16))
+		oy := int(r.NextIntN(108)) + 10
+		oz := baseZ + int(r.NextIntN(16))
+		PlaceNetherSpring(c, ox, oy, oz, true)
+	}
+	if r.NextIntN(2) == 0 {
+		ox := baseX + int(r.NextIntN(16))
+		oy := int(r.NextIntN(120)) + 4
+		oz := baseZ + int(r.NextIntN(16))
+		PlaceNetherMushroomPatch(c, ox, oy, oz, r, nb.brownMushroom)
+	}
+	if r.NextIntN(2) == 0 {
+		ox := baseX + int(r.NextIntN(16))
+		oy := int(r.NextIntN(120)) + 4
+		oz := baseZ + int(r.NextIntN(16))
+		PlaceNetherMushroomPatch(c, ox, oy, oz, r, nb.redMushroom)
+	}
+
+	// 6. Fire and soul fire patches.
 	for i := 0; i < 5; i++ {
 		ox := baseX + int(r.NextIntN(16))
 		oy := int(r.NextIntN(116)) + 4
@@ -1342,18 +1480,55 @@ func decorateNether(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Stru
 	}
 }
 
-func placeNetherOreScatter(c *Chunk, r worldgen.RandomSource, baseX, baseZ int, oreState uint16, count, minY, maxY, size int) {
+func placeNetherOreVein(c *Chunk, r worldgen.RandomSource, baseX, baseZ int, oreState uint16, count, minY, maxY, size int, biomeName *[16][16]string, onlyDeltas bool) {
+	var sphereBuf [64]oreSphere
 	for i := 0; i < count; i++ {
 		ox := baseX + int(r.NextIntN(16))
 		oy := sampleUniformInt(r, minY, maxY)
 		oz := baseZ + int(r.NextIntN(16))
-		radius := max(1, size/5)
-		withinManhattan(ox, oy, oz, radius, radius, radius, func(px, py, pz, _ int) bool {
+		if onlyDeltas && biomeName[ox&15][oz&15] != "minecraft:basalt_deltas" {
+			continue
+		}
+		setup := drawOreVeinSetup(r, ox, oy, oz, size)
+		spheres := buildOreSpheresInto(r, setup, sphereBuf[:0])
+		walkOreBlocks(spheres, func(px, py, pz int) {
+			if py < netherMinY || py >= netherHeight {
+				return
+			}
 			cur := getNetherBlock(c, px, py, pz)
-			if cur == StateNetherrack || cur == StateBasalt || cur == StateBlackstone {
+			if cur == StateNetherrack {
 				setNetherBlock(c, px, py, pz, oreState)
 			}
-			return true
 		})
 	}
 }
+
+func placeNetherScatteredOre(c *Chunk, r worldgen.RandomSource, baseX, baseZ int, oreState uint16, count, minY, maxY, size int) {
+	for i := 0; i < count; i++ {
+		ox := baseX + int(r.NextIntN(16))
+		oy := sampleUniformInt(r, minY, maxY)
+		oz := baseZ + int(r.NextIntN(16))
+		n := int(r.NextIntN(int32(size + 1)))
+		for j := 0; j < n; j++ {
+			dist := min(j, 7)
+			dx := int(math.Round(float64((r.NextFloat() - r.NextFloat()) * float32(dist))))
+			dy := int(math.Round(float64((r.NextFloat() - r.NextFloat()) * float32(dist))))
+			dz := int(math.Round(float64((r.NextFloat() - r.NextFloat()) * float32(dist))))
+			px, py, pz := ox+dx, oy+dy, oz+dz
+			cur := getNetherBlock(c, px, py, pz)
+			if cur != StateNetherrack && cur != StateBasalt && cur != StateBlackstone {
+				continue
+			}
+			if getNetherBlock(c, px+1, py, pz) == StateAir ||
+				getNetherBlock(c, px-1, py, pz) == StateAir ||
+				getNetherBlock(c, px, py+1, pz) == StateAir ||
+				getNetherBlock(c, px, py-1, pz) == StateAir ||
+				getNetherBlock(c, px, py, pz+1) == StateAir ||
+				getNetherBlock(c, px, py, pz-1) == StateAir {
+				continue
+			}
+			setNetherBlock(c, px, py, pz, oreState)
+		}
+	}
+}
+

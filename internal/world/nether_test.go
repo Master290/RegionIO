@@ -178,6 +178,17 @@ func TestNetherFeaturesPlacement(t *testing.T) {
 	if !PlaceDeltaFeature(c, 8, 40, 14, r, StateLava, StateMagmaBlock, 2, 4, 1, 2) {
 		t.Fatal("expected PlaceDeltaFeature to succeed at (8, 40, 14)")
 	}
+
+	// 8. Nether closed & open lava springs and mushroom patches.
+	if !PlaceNetherSpring(c, 8, 25, 8, true) {
+		t.Fatal("expected closed PlaceNetherSpring to succeed inside solid netherrack at (8, 25, 8)")
+	}
+	if c.GetBlock(8, 25, 8) != StateLava {
+		t.Fatalf("expected lava at (8, 25, 8), got %s", BlockName(c.GetBlock(8, 25, 8)))
+	}
+	if !PlaceNetherMushroomPatch(c, 8, 41, 8, r, nb.brownMushroom) {
+		t.Fatal("expected PlaceNetherMushroomPatch to succeed on netherrack floor around (8, 41, 8)")
+	}
 }
 
 func TestNetherStructuresFortressBastionFossilAndPortal(t *testing.T) {
