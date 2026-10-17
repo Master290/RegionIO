@@ -159,8 +159,15 @@ var (
 		MobTypeWitch:              EntityTypeWitchID,
 		MobTypeWither:             EntityTypeWitherID,
 		MobTypeWitherSkeleton:     EntityTypeWitherSkeletonID,
-		EntityTypeWitherSkull:     EntityTypeWitherSkullID,
-		EntityTypeFireworkRocket:  EntityTypeFireworkRocketID,
+		EntityTypeWitherSkull:      EntityTypeWitherSkullID,
+		EntityTypeFireworkRocket:   EntityTypeFireworkRocketID,
+		MobTypeArmadillo:           EntityTypeArmadilloID,
+		MobTypeBogged:              EntityTypeBoggedID,
+		MobTypeBreeze:              EntityTypeBreezeID,
+		BreezeWindChargeEntityType: EntityTypeBreezeWindChargeID,
+		MobTypeCamel:               EntityTypeCamelID,
+		MobTypeSniffer:             EntityTypeSnifferID,
+		WindChargeEntityType:       EntityTypeWindChargeID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -203,6 +210,9 @@ func ResolveEntityTypeID(typeName string) int {
 	if idx, ok := fallbackEntityTypeIDs[norm]; ok {
 		return idx
 	}
+	if id, ok := EntityTypeRegistryID(norm); ok {
+		return int(id)
+	}
 	return -1
 }
 
@@ -226,10 +236,14 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultZombieVillagerMaxHealth
 	case MobTypeSkeleton:
 		return DefaultSkeletonMaxHealth
+	case MobTypeBogged:
+		return DefaultBoggedMaxHealth
 	case MobTypeCreeper:
 		return DefaultCreeperMaxHealth
 	case MobTypeSpider:
 		return DefaultSpiderMaxHealth
+	case MobTypeBreeze:
+		return DefaultBreezeMaxHealth
 	case MobTypePig:
 		return DefaultPigMaxHealth
 	case MobTypeCow:
@@ -238,6 +252,12 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultSheepMaxHealth
 	case MobTypeChicken:
 		return DefaultChickenMaxHealth
+	case MobTypeSniffer:
+		return DefaultSnifferMaxHealth
+	case MobTypeArmadillo:
+		return DefaultArmadilloMaxHealth
+	case MobTypeCamel:
+		return DefaultCamelMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
 	case MobTypeWolf:
@@ -291,6 +311,12 @@ func animalWanderSpeed(typeName string) float64 {
 		return SheepWanderSpeed
 	case MobTypeChicken:
 		return ChickenWanderSpeed
+	case MobTypeSniffer:
+		return SnifferWanderSpeed
+	case MobTypeArmadillo:
+		return ArmadilloWanderSpeed
+	case MobTypeCamel:
+		return CamelWalkSpeed
 	case MobTypeVillager:
 		return VillagerWanderSpeed
 	default:
@@ -330,6 +356,21 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypePhantom {
 		return s.SpawnPhantom(normDim, x, y, z, nil)
+	}
+	if norm == MobTypeSniffer {
+		return s.SpawnSniffer(normDim, x, y, z, false)
+	}
+	if norm == MobTypeArmadillo {
+		return s.SpawnArmadillo(normDim, x, y, z, false)
+	}
+	if norm == MobTypeCamel {
+		return s.SpawnCamel(normDim, x, y, z, false)
+	}
+	if norm == MobTypeBreeze {
+		return s.SpawnBreeze(normDim, x, y, z)
+	}
+	if norm == MobTypeBogged {
+		return s.SpawnBogged(normDim, x, y, z)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
@@ -457,6 +498,12 @@ func IsAnimalBreedingFood(typeName, itemName string) bool {
 			"minecraft:torchflower_seeds", "minecraft:pitcher_pod":
 			return true
 		}
+	case MobTypeSniffer:
+		return item == TorchflowerSeedsItemID
+	case MobTypeArmadillo:
+		return item == SpiderEyeItemID
+	case MobTypeCamel:
+		return item == CactusItemID
 	}
 	return false
 }

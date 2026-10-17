@@ -627,6 +627,12 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack(SculkCatalystItemID, 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeBreeze:
+		if stack := RollBreezeRodDrops(rng, 0); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeBogged:
+		return RollBoggedDeathLoot(rng, true)
 	}
 	return nil
 }
@@ -635,8 +641,18 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 	switch normalizeFoodItemID(typeName) {
 	case MobTypeZombie:
 		return "minecraft:entity.zombie.hurt", SoundSourceHostile
+	case MobTypeBogged:
+		return SoundBoggedHurt, SoundSourceHostile
+	case MobTypeBreeze:
+		return SoundBreezeHurt, SoundSourceHostile
 	case MobTypePig:
 		return "minecraft:entity.pig.hurt", SoundSourceNeutral
+	case MobTypeSniffer:
+		return SoundSnifferHurt, SoundSourceNeutral
+	case MobTypeArmadillo:
+		return SoundArmadilloHurt, SoundSourceNeutral
+	case MobTypeCamel:
+		return SoundCamelHurt, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.hurt", SoundSourceNeutral
 	case MobTypeWolf:
@@ -672,8 +688,18 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 	switch normalizeFoodItemID(typeName) {
 	case MobTypeZombie:
 		return "minecraft:entity.zombie.death", SoundSourceHostile
+	case MobTypeBogged:
+		return SoundBoggedDeath, SoundSourceHostile
+	case MobTypeBreeze:
+		return SoundBreezeDeath, SoundSourceHostile
 	case MobTypePig:
 		return "minecraft:entity.pig.death", SoundSourceNeutral
+	case MobTypeSniffer:
+		return SoundSnifferDeath, SoundSourceNeutral
+	case MobTypeArmadillo:
+		return SoundArmadilloDeath, SoundSourceNeutral
+	case MobTypeCamel:
+		return SoundCamelDeath, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.death", SoundSourceNeutral
 	case MobTypeWolf:
@@ -932,6 +958,18 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 		return 0, false
 	}
+	if IsWindChargeEntityType(target.TypeName) {
+		yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
+		pitchRad := float64(snap.Pitch) * (math.Pi / 180.0)
+		cosPitch := math.Cos(pitchRad)
+		dirX := -math.Sin(yawRad) * cosPitch
+		dirY := -math.Sin(pitchRad)
+		dirZ := math.Cos(yawRad) * cosPitch
+		if s.DeflectWindCharge(target.ID, dirX, dirY, dirZ, snap.EntityID) {
+			return 1.0, false
+		}
+		return 0, false
+	}
 
 	baseDamage, _ := StackAttackStats(session.HeldItem())
 	baseDamage += session.MeleeDamageBonus()
@@ -967,6 +1005,13 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	}
 	if target.TypeName == MobTypeWarden {
 		return s.DamageWarden(target.ID, damage, session)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeArmadillo && s.IsArmadilloRolledUp(target.ID) {
+		damage = ReduceArmadilloRolledDamage(damage)
+		kbStrength = 0
+		if damage <= 0 {
+			return 0, false
+		}
 	}
 
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
@@ -1059,6 +1104,11 @@ func (s *Server) applyDamageToMob(
 
 	if !killed {
 		s.OnEntityDamagedWithEffects(target.ID, false)
+		if canonicalResourceName(target.TypeName) == MobTypeArmadillo {
+			s.OnArmadilloDamaged(target.ID)
+		} else if canonicalResourceName(target.TypeName) == MobTypeCamel {
+			s.OnCamelDamaged(target.ID)
+		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,
 			Type:           GameEventEntityDamage,

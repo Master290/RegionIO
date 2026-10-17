@@ -156,6 +156,12 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 		return IsEquineBreedingFood(item)
 	case MobTypeLlama, MobTypeTraderLlama:
 		return IsLlamaBreedingFood(item)
+	case MobTypeSniffer:
+		return item == TorchflowerSeedsItemID
+	case MobTypeArmadillo:
+		return item == SpiderEyeItemID
+	case MobTypeCamel:
+		return item == CactusItemID
 	default:
 		return false
 	}
@@ -167,7 +173,8 @@ func IsBreedableMob(typeName string) bool {
 	switch canonicalResourceName(typeName) {
 	case MobTypeCow, MobTypeSheep, MobTypePig, MobTypeChicken,
 		MobTypeWolf, MobTypeCat,
-		MobTypeHorse, MobTypeDonkey, MobTypeLlama, MobTypeTraderLlama:
+		MobTypeHorse, MobTypeDonkey, MobTypeLlama, MobTypeTraderLlama,
+		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel:
 		return true
 	default:
 		return false
@@ -320,7 +327,11 @@ func (s *Server) SpawnBabyMob(dimension string, x, y, z float64, typeName string
 	if err != nil {
 		return 0, err
 	}
-	s.SetMobAge(id, BabyMobGrowthTicks)
+	growthTicks := BabyMobGrowthTicks
+	if canonicalResourceName(typeName) == MobTypeSniffer {
+		growthTicks = SniffletGrowthTicks
+	}
+	s.SetMobAge(id, growthTicks)
 	return id, nil
 }
 

@@ -175,6 +175,12 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickVillagerGolemSpawning(rng)
 		s.TickPhantomSpawner(rng)
 		s.TickPhantoms(rng)
+		s.TickSniffers(rng)
+		s.TickSnifferEggs(rng)
+		s.TickArmadillos(rng)
+		s.TickCamels(rng)
+		s.TickBreezes(rng)
+		s.TickWindCharges()
 		s.TickMobsInCauldrons()
 	}
 
@@ -222,7 +228,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) {
 			continue
 		}
 		if IsBossOrBossSupportEntity(snapshot.TypeName) {
@@ -231,7 +237,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypePhantom {
+		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true
@@ -250,7 +256,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			mem.lastHealth = mem.health
 			if snapshot.TypeName == MobTypeSpider {
 				mem.provoked = true
-			} else if IsPassiveAnimal(snapshot.TypeName) {
+			} else if IsPassiveAnimal(snapshot.TypeName) || snapshot.TypeName == MobTypeArmadillo {
 				mem.panicTicks = AnimalPanicDurationTicks
 			}
 		}
@@ -299,6 +305,11 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				s.chunks, rng, mem, t.playerTargets,
 				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 			)
+		case MobTypeBogged:
+			nextX, nextY, nextZ, nextYaw, shootTarget = s.stepHostileBoggedAI(
+				s.chunks, rng, mem, t.playerTargets,
+				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+			)
 		case MobTypeCreeper:
 			nextX, nextY, nextZ, nextYaw, swellChanged, exploded = stepHostileCreeperAI(
 				s.chunks, rng, mem, t.playerTargets,
@@ -312,7 +323,35 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			)
 			attackDmg = SpiderAttackDamage
 		default:
-			if IsTameableMob(snapshot.TypeName) && (s.IsMobSitting(snapshot.ID) || s.IsMobTamed(snapshot.ID)) {
+			if snapshot.TypeName == MobTypeArmadillo && s.IsArmadilloRolledUp(snapshot.ID) {
+				if mem.breedCooldown > 0 {
+					mem.breedCooldown--
+				}
+				if mem.inLoveTicks > 0 {
+					mem.inLoveTicks--
+				}
+			} else if snapshot.TypeName == MobTypeCamel && (s.IsCamelSitting(snapshot.ID) || len(s.CamelPassengers(snapshot.ID)) > 0) {
+				if mem.breedCooldown > 0 {
+					mem.breedCooldown--
+				}
+				if mem.inLoveTicks > 0 {
+					mem.inLoveTicks--
+				}
+			} else if snapshot.TypeName == MobTypeSniffer {
+				if sst, ok := s.GetSnifferState(snapshot.ID); ok && sst.State != SnifferStateIdling {
+					if mem.breedCooldown > 0 {
+						mem.breedCooldown--
+					}
+					if mem.inLoveTicks > 0 {
+						mem.inLoveTicks--
+					}
+				} else {
+					nextX, nextY, nextZ, nextYaw = s.stepPassiveAnimalAI(
+						snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
+						snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+					)
+				}
+			} else if IsTameableMob(snapshot.TypeName) && (s.IsMobSitting(snapshot.ID) || s.IsMobTamed(snapshot.ID)) {
 				if mem.breedCooldown > 0 {
 					mem.breedCooldown--
 				}
@@ -366,7 +405,11 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		}
 
 		if shootTarget != nil && !shootTarget.IsDead() {
-			s.ShootSkeletonArrowAtPlayer(snapshot.ID, nextX, nextY, nextZ, shootTarget)
+			if snapshot.TypeName == MobTypeBogged {
+				s.ShootBoggedArrowAtPlayer(snapshot.ID, nextX, nextY, nextZ, shootTarget)
+			} else {
+				s.ShootSkeletonArrowAtPlayer(snapshot.ID, nextX, nextY, nextZ, shootTarget)
+			}
 		}
 		if attackTarget != nil && !attackTarget.IsDead() {
 			s.AttackPlayerFromMob(snapshot.ID, snapshot.TypeName, nextX, nextZ, attackTarget, attackDmg)

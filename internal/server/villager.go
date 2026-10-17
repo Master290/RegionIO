@@ -671,6 +671,11 @@ func (s *Server) TickVillagers() {
 		ids = append(ids, entityID)
 	}
 	vtr.mu.Unlock()
+	for i := 1; i < len(ids); i++ {
+		for j := i; j > 0 && ids[j] < ids[j-1]; j-- {
+			ids[j], ids[j-1] = ids[j-1], ids[j]
+		}
+	}
 
 	var toRestock []int32
 	var toDecay []int32
@@ -829,6 +834,22 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 	}
 	if canonicalResourceName(ent.TypeName) == MobTypeIronGolem {
 		handled := s.InteractWithIronGolem(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeSniffer {
+		handled, _ := s.InteractWithSniffer(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeArmadillo {
+		handled, _ := s.InteractWithArmadillo(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeCamel {
+		handled, _ := s.InteractWithCamel(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeBogged {
+		handled := s.InteractWithBogged(session, targetEntityID)
 		return handled, 0, nil
 	}
 	if IsPassiveAnimal(ent.TypeName) {

@@ -95,7 +95,7 @@ type playerTarget struct {
 // attacks (or explodes near) players.
 func IsHostileMob(typeName string) bool {
 	switch typeName {
-	case MobTypeZombie, MobTypeSkeleton, MobTypeCreeper, MobTypeSpider, MobTypePhantom:
+	case MobTypeZombie, MobTypeSkeleton, MobTypeBogged, MobTypeCreeper, MobTypeSpider, MobTypePhantom, MobTypeBreeze:
 		return true
 	default:
 		return false
@@ -105,7 +105,8 @@ func IsHostileMob(typeName string) bool {
 // IsPassiveMob reports whether typeName is a passive wandering mob or animal.
 func IsPassiveMob(typeName string) bool {
 	switch typeName {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeVillager:
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeVillager,
+		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel:
 		return true
 	default:
 		return false
