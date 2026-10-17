@@ -116,10 +116,9 @@ func TestBlockBlobLandsOnGroundThePredicateAllows(t *testing.T) {
 	if placed == 0 {
 		t.Fatal("no boulder was painted, so the feature places nothing")
 	}
-	// The floor is at y=70, and the blob's centre stops at the first cell whose below
-	// the predicate accepts, so no part of it belongs below the floor - but the rows
-	// step down by one each, so the lowest painted cell can sit just under the centre.
-	if lowest < 69 {
+	// The floor is at y=70, so the centre lands at y=71; two downward steps of -1 reach
+	// y=69, and a vertical radius b=1 on row 2 can paint down to y=68.
+	if lowest < 68 {
 		t.Errorf("boulder reached y=%d from a floor at y=70; the descent went past the ground", lowest)
 	}
 }
@@ -188,3 +187,45 @@ func TestForestRockConfigIsTheTwoFieldsItDeclares(t *testing.T) {
 		}
 	}
 }
+
+type scriptedIntRandom struct {
+	worldgen.RandomSource
+	seq []int32
+	idx int
+}
+
+func (s *scriptedIntRandom) NextIntN(bound int32) int32 {
+	v := s.seq[s.idx%len(s.seq)]
+	s.idx++
+	return v % bound
+}
+
+// TestBlockBlobYStepNegatesDraw pins BlockBlobFeature.place's bytecode at 242-250
+// (`-random.nextInt(2)` rather than `-1 + random.nextInt(2)`): when the Y step draw is
+// 0, the centre stays at the landed Y; when 1, it steps down by 1.
+func TestBlockBlobYStepNegatesDraw(t *testing.T) {
+	region, set, config := blobFixture(t)
+	mossy, _ := nameToStateID("minecraft:mossy_cobblestone", nil)
+	// Row 0: a=0,b=0,c=0; step: dx_draw=1(0), dy_draw=0(0), dz_draw=1(0)
+	// Row 1: a=0,b=0,c=0; step: dx_draw=1(0), dy_draw=0(0), dz_draw=1(0)
+	// Row 2: a=1,b=1,c=1; step: dx_draw=1(0), dy_draw=0(0), dz_draw=1(0)
+	rng := &scriptedIntRandom{
+		seq: []int32{
+			0, 0, 0, 1, 0, 1,
+			0, 0, 0, 1, 0, 1,
+			1, 1, 1, 1, 0, 1,
+		},
+	}
+	if err := region.placeBlockBlob(set, rng, worldgen.FeaturePosition{X: 8, Y: 75, Z: 8}, config); err != nil {
+		t.Fatal(err)
+	}
+	// Landed Y is 71 (above grass at y=70). With dy_draw=0 on both steps, row 2 is
+	// still centred at y=71 with b=1, so y=72 must be painted and y=69 must not be.
+	if got := region.getBlock(8, 72, 8); got != mossy {
+		t.Fatalf("expected mossy_cobblestone at (8,72,8) when Y-step draws are 0, got %s", stateLabel(got))
+	}
+	if got := region.getBlock(8, 69, 8); got == mossy {
+		t.Fatalf("unexpected mossy_cobblestone at (8,69,8) when Y-step draws are 0")
+	}
+}
+

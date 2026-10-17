@@ -56,7 +56,7 @@ func (r *decorationRegion) placeBlockBlob(set *worldgen.FeatureSet, random world
 			}
 		}
 		x += -1 + int(random.NextIntN(2))
-		y += -1 + int(random.NextIntN(2))
+		y -= int(random.NextIntN(2))
 		z += -1 + int(random.NextIntN(2))
 	}
 	return nil
