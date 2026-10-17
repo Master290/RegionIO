@@ -816,36 +816,46 @@ func BuildJigsawStart(
 	}, nil
 }
 
+type jigsawCacheKey struct {
+	setID string
+	seed  int64
+	sx    int32
+	sz    int32
+}
+
 var (
-	villageStartMu    sync.Mutex
-	villageStartCache = map[[3]int64]*JigsawStart{}
+	jigsawStartMu    sync.Mutex
+	jigsawStartCache = map[jigsawCacheKey]*JigsawStart{}
 )
 
-// VillageGenerationPoint checks if (sx, sz) is a valid Village start chunk and
-// returns its assembled JigsawStart.
-func VillageGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, sx, sz int32) (*JigsawStart, error) {
+// JigsawSetGenerationPoint checks if (sx, sz) is a valid start chunk for the
+// given Jigsaw structure set (e.g. "minecraft:villages", "minecraft:pillager_outposts",
+// "minecraft:ancient_cities", "minecraft:trail_ruins", "minecraft:trial_chambers")
+// and returns its assembled JigsawStart.
+func JigsawSetGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, setID string, seed int64, sx, sz int32) (*JigsawStart, error) {
 	if sets == nil {
 		return nil, nil
 	}
-	set := sets.Sets["minecraft:villages"]
+	setID = normalizeResourceID(setID)
+	set := sets.Sets[setID]
 	if set == nil || !set.IsStartChunk(seed, sx, sz) {
 		return nil, nil
 	}
-	cacheKey := [3]int64{seed, int64(sx), int64(sz)}
+	cacheKey := jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}
 	if od != nil {
-		villageStartMu.Lock()
-		if cached, ok := villageStartCache[cacheKey]; ok {
-			villageStartMu.Unlock()
+		jigsawStartMu.Lock()
+		if cached, ok := jigsawStartCache[cacheKey]; ok {
+			jigsawStartMu.Unlock()
 			return cached, nil
 		}
-		villageStartMu.Unlock()
+		jigsawStartMu.Unlock()
 	}
-	stub, ok := FindStructureSetStart(od, sets, "minecraft:villages", seed, sx, sz)
+	stub, ok := FindStructureSetStart(od, sets, setID, seed, sx, sz)
 	if !ok || stub == nil {
 		if od != nil {
-			villageStartMu.Lock()
-			villageStartCache[cacheKey] = nil
-			villageStartMu.Unlock()
+			jigsawStartMu.Lock()
+			jigsawStartCache[cacheKey] = nil
+			jigsawStartMu.Unlock()
 		}
 		return nil, nil
 	}
@@ -855,11 +865,17 @@ func VillageGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Struct
 	}
 	start, err := BuildJigsawStart(od, sets, def, seed, sx, sz, nil)
 	if err == nil && od != nil {
-		villageStartMu.Lock()
-		villageStartCache[cacheKey] = start
-		villageStartMu.Unlock()
+		jigsawStartMu.Lock()
+		jigsawStartCache[cacheKey] = start
+		jigsawStartMu.Unlock()
 	}
 	return start, err
+}
+
+// VillageGenerationPoint checks if (sx, sz) is a valid Village start chunk and
+// returns its assembled JigsawStart.
+func VillageGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, sx, sz int32) (*JigsawStart, error) {
+	return JigsawSetGenerationPoint(od, sets, "minecraft:villages", seed, sx, sz)
 }
 
 func parseFinalStateString(finalState string) (uint16, string, bool) {
@@ -1147,6 +1163,7 @@ func placeJigsawElementInChunk(
 		isLegacy := elem.ElementType == "minecraft:legacy_single_pool_element"
 		terrainMatching := elem.Projection == "terrain_matching"
 		procs := reg.ResolveProcessors(elem)
+		cappedCounts := make([]int, len(procs))
 
 		for _, orig := range pal.blocks {
 			rel := worldgen.TransformBlockPos(orig.Pos, "none", rotation, [3]int{0, 0, 0})
@@ -1172,9 +1189,9 @@ func placeJigsawElementInChunk(
 				curName = fName
 			}
 
-			// 3. Configured processors (RuleProcessor, BlockRotProcessor, ProtectedBlocksProcessor).
+			// 3. Configured processors (RuleProcessor, CappedProcessor, BlockRotProcessor, ProtectedBlocksProcessor).
 			discarded := false
-			for _, proc := range procs {
+			for pIdx, proc := range procs {
 				switch proc.ProcessorType {
 				case "minecraft:rule":
 					ruleRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
@@ -1194,6 +1211,28 @@ func placeJigsawElementInChunk(
 							curName = rule.OutputState.Name
 						}
 						break
+					}
+				case "minecraft:capped":
+					if proc.Delegate != nil && proc.Delegate.ProcessorType == "minecraft:rule" && cappedCounts[pIdx] < proc.Limit {
+						ruleRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
+						existing := region.getBlock(worldPos[0], worldPos[1], worldPos[2])
+						for _, rule := range proc.Delegate.Rules {
+							if !testRulePredicate(rule.InputPredicate, curState, ruleRng, fs) {
+								continue
+							}
+							if !testRulePredicate(rule.LocationPredicate, existing, ruleRng, fs) {
+								continue
+							}
+							if !testPosPredicate(rule.PositionPredicate, orig.Pos, worldPos, [3]int{0, 0, 0}, ruleRng) {
+								continue
+							}
+							if outID, ok := nameToStateID(rule.OutputState.Name, rule.OutputState.Properties); ok {
+								curState = outID
+								curName = rule.OutputState.Name
+								cappedCounts[pIdx]++
+							}
+							break
+						}
 					}
 				case "minecraft:block_rot":
 					if proc.Integrity < 1.0 {

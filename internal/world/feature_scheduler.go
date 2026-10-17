@@ -326,9 +326,8 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	if err != nil {
 		return err
 	}
-	// Step 3 (underground_structures): buried treasure (index 1) and mineshafts
-	// (indices 2, 3). Piece trees for mineshafts reach up to 80 blocks from
-	// their start, so scan a ±8 window.
+	// Step 3 (underground_structures): ancient_city (0), buried_treasure (1),
+	// mineshaft / mineshaft_mesa (2, 3), trail_ruins (4), trial_chambers (5).
 	regionChunks := make([][2]int32, 0, len(r.chunks))
 	for key := range r.chunks {
 		regionChunks = append(regionChunks, key)
@@ -339,6 +338,23 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 		}
 		return regionChunks[i][1] < regionChunks[j][1]
 	})
+	var ancientCities []*JigsawStart
+	for sx := targetX - 7; sx <= targetX+7; sx++ {
+		for sz := targetZ - 7; sz <= targetZ+7; sz++ {
+			start, err := JigsawSetGenerationPoint(od, sets, "minecraft:ancient_cities", seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if start != nil {
+				ancientCities = append(ancientCities, start)
+			}
+		}
+	}
+	if len(ancientCities) > 0 {
+		for _, key := range regionChunks {
+			PlaceJigsawStartsForChunk(r, ancientCities, "minecraft:ancient_city", 3, seed, key[0], key[1])
+		}
+	}
 	for _, key := range regionChunks {
 		if BuriedTreasureGenerationPoint(od, sets, seed, key[0], key[1]) {
 			PlaceBuriedTreasureInChunk(r, seed, key[0], key[1])
@@ -361,8 +377,116 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			PlaceMineshaftsForChunk(r, mineshafts, seed, key[0], key[1])
 		}
 	}
-	// Step 4 (surface_structures), alphabetical index order: ocean ruins
-	// (8,9) before ruined portals (10..16), shipwrecks (17,18), villages (20..24).
+	for _, ugJigsaw := range []struct {
+		setID  string
+		stName string
+		radius int32
+	}{
+		{"minecraft:trail_ruins", "minecraft:trail_ruins", 6},
+		{"minecraft:trial_chambers", "minecraft:trial_chambers", 7},
+	} {
+		var starts []*JigsawStart
+		for sx := targetX - ugJigsaw.radius; sx <= targetX+ugJigsaw.radius; sx++ {
+			for sz := targetZ - ugJigsaw.radius; sz <= targetZ+ugJigsaw.radius; sz++ {
+				st, err := JigsawSetGenerationPoint(od, sets, ugJigsaw.setID, seed, sx, sz)
+				if err != nil {
+					return err
+				}
+				if st != nil {
+					starts = append(starts, st)
+				}
+			}
+		}
+		if len(starts) > 0 {
+			for _, key := range regionChunks {
+				PlaceJigsawStartsForChunk(r, starts, ugJigsaw.stName, 3, seed, key[0], key[1])
+			}
+		}
+	}
+	// Step 4 (surface_structures), alphabetical index order:
+	// desert_pyramid (0), igloo (2), jungle_pyramid (3), mansion (4), monument (5),
+	// pillager_outpost (7), ocean_ruin (8,9), ruined_portal (10..16),
+	// shipwreck (17,18), swamp_hut (19), village (20..24).
+	var desertPyramids []*DesertPyramidStart
+	var igloos []*IglooStart
+	var jungleTemples []*JungleTempleStart
+	var swampHuts []*SwampHutStart
+	for sx := targetX - 2; sx <= targetX+2; sx++ {
+		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
+			if dp, err := DesertPyramidGenerationPoint(od, sets, seed, sx, sz); err != nil {
+				return err
+			} else if dp != nil {
+				desertPyramids = append(desertPyramids, dp)
+			}
+			if ig, err := IglooGenerationPoint(od, sets, seed, sx, sz); err != nil {
+				return err
+			} else if ig != nil {
+				igloos = append(igloos, ig)
+			}
+			if jt, err := JungleTempleGenerationPoint(od, sets, seed, sx, sz); err != nil {
+				return err
+			} else if jt != nil {
+				jungleTemples = append(jungleTemples, jt)
+			}
+			if sh, err := SwampHutGenerationPoint(od, sets, seed, sx, sz); err != nil {
+				return err
+			} else if sh != nil {
+				swampHuts = append(swampHuts, sh)
+			}
+		}
+	}
+	if len(desertPyramids) > 0 {
+		for _, key := range regionChunks {
+			PlaceDesertPyramidsForChunk(r, desertPyramids, seed, key[0], key[1])
+		}
+	}
+	if len(igloos) > 0 {
+		for _, key := range regionChunks {
+			PlaceIgloosForChunk(r, igloos, seed, key[0], key[1])
+		}
+	}
+	if len(jungleTemples) > 0 {
+		for _, key := range regionChunks {
+			PlaceJungleTemplesForChunk(r, jungleTemples, seed, key[0], key[1])
+		}
+	}
+	var mansions []*WoodlandMansionStart
+	var monuments []*OceanMonumentStart
+	var outposts []*JigsawStart
+	for sx := targetX - 6; sx <= targetX+6; sx++ {
+		for sz := targetZ - 6; sz <= targetZ+6; sz++ {
+			if wm, err := WoodlandMansionGenerationPoint(od, sets, seed, sx, sz); err != nil {
+				return err
+			} else if wm != nil {
+				mansions = append(mansions, wm)
+			}
+			if om, err := OceanMonumentGenerationPoint(od, sets, seed, sx, sz); err != nil {
+				return err
+			} else if om != nil {
+				monuments = append(monuments, om)
+			}
+			if po, err := JigsawSetGenerationPoint(od, sets, "minecraft:pillager_outposts", seed, sx, sz); err != nil {
+				return err
+			} else if po != nil {
+				outposts = append(outposts, po)
+			}
+		}
+	}
+	if len(mansions) > 0 {
+		for _, key := range regionChunks {
+			PlaceWoodlandMansionsForChunk(r, mansions, seed, key[0], key[1])
+		}
+	}
+	if len(monuments) > 0 {
+		for _, key := range regionChunks {
+			PlaceOceanMonumentsForChunk(r, monuments, seed, key[0], key[1])
+		}
+	}
+	if len(outposts) > 0 {
+		for _, key := range regionChunks {
+			PlaceJigsawStartsForChunk(r, outposts, "minecraft:pillager_outpost", 4, seed, key[0], key[1])
+		}
+	}
 	for sx := targetX - 2; sx <= targetX+2; sx++ {
 		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
 			stub, random, err := OceanRuinGenerationPoint(od, sets, seed, sx, sz)
@@ -411,6 +535,11 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			for _, key := range regionChunks {
 				PlaceShipwrecksForChunk(r, shipwrecks, sName, seed, key[0], key[1])
 			}
+		}
+	}
+	if len(swampHuts) > 0 {
+		for _, key := range regionChunks {
+			PlaceSwampHutsForChunk(r, swampHuts, seed, key[0], key[1])
 		}
 	}
 	var villages []*JigsawStart
