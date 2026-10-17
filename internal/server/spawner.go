@@ -185,6 +185,9 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() {
+			continue
+		}
 
 		mem := t.mobStateFor(snapshot.ID, aiTick)
 		if !mem.healthInit {
@@ -303,6 +306,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 	}
 
 	t.pruneMobStates(aiTick)
+	s.TickFishingBobbers(rng)
 }
 
 func (s *Server) appendViewerTargets(dst []viewerTarget) []viewerTarget {
@@ -386,10 +390,18 @@ func (t *EntityTracker) syncLocked(s *Server) {
 					seenTick: tickID,
 				})
 				if viewer.send != nil {
-					t.pktBuf = encodeAddEntityPacket(t.pktBuf[:0], ent)
+					if ent.TypeName == EntityTypeFishingBobber {
+						t.pktBuf = s.EncodeFishingBobberAddEntityPacket(t.pktBuf[:0], ent)
+					} else {
+						t.pktBuf = encodeAddEntityPacket(t.pktBuf[:0], ent)
+					}
 					_ = viewer.send(protocol.PlayAddEntity, t.pktBuf)
 					if ent.TypeName == MobTypeVillager {
 						_ = viewer.send(PlaySetEntityDataCB, s.VillagerEntityDataPacket(ent.ID))
+					} else if ent.TypeName == EntityTypeFishingBobber {
+						if metaPkt := s.FishingBobberEntityDataPacket(ent.ID); len(metaPkt) > 0 {
+							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
+						}
 					}
 				}
 				continue

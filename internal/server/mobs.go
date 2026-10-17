@@ -19,19 +19,21 @@ const (
 	MobTypeSpider   = "minecraft:spider"
 	MobTypeCow      = "minecraft:cow"
 	MobTypeSheep    = "minecraft:sheep"
-	MobTypeChicken  = "minecraft:chicken"
-	MobTypeArrow    = "minecraft:arrow"
+	MobTypeChicken          = "minecraft:chicken"
+	MobTypeArrow            = "minecraft:arrow"
+	EntityTypeFishingBobber = "minecraft:fishing_bobber"
 
 	// Vanilla 26.1.2 BuiltInRegistries.ENTITY_TYPE numeric network IDs (protocol 775).
-	EntityTypeArrowID    int = 6
-	EntityTypeChickenID  int = 26
-	EntityTypeCowID      int = 30
-	EntityTypeCreeperID  int = 32
-	EntityTypePigID      int = 100
-	EntityTypeSheepID    int = 111
-	EntityTypeSkeletonID int = 115
-	EntityTypeSpiderID   int = 124
-	EntityTypeZombieID   int = 150
+	EntityTypeArrowID         int = 6
+	EntityTypeChickenID       int = 26
+	EntityTypeCowID           int = 30
+	EntityTypeCreeperID       int = 32
+	EntityTypePigID           int = 100
+	EntityTypeSheepID         int = 111
+	EntityTypeSkeletonID      int = 115
+	EntityTypeSpiderID        int = 124
+	EntityTypeZombieID        int = 150
+	EntityTypeFishingBobberID int = 156
 
 	// Default Mob Max Health values (vanilla 26.1.2).
 	DefaultSkeletonMaxHealth float32 = 20.0
@@ -126,8 +128,9 @@ var (
 		MobTypeSheep:    EntityTypeSheepID,
 		MobTypeSkeleton: EntityTypeSkeletonID,
 		MobTypeSpider:   EntityTypeSpiderID,
-		MobTypeVillager: int(EntityTypeVillagerID),
-		MobTypeZombie:   EntityTypeZombieID,
+		MobTypeVillager:         int(EntityTypeVillagerID),
+		MobTypeZombie:           EntityTypeZombieID,
+		EntityTypeFishingBobber: EntityTypeFishingBobberID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )

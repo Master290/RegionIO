@@ -1133,8 +1133,8 @@ func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader)
 		return err
 	}
 	if s != nil && session != nil {
-		if !s.StartEating(session, hand) {
-			s.UsePotionOrMilkItem(session, hand)
+		if !s.StartEating(session, hand) && !s.UsePotionOrMilkItem(session, hand) {
+			s.UseFishingRod(session, hand)
 		}
 		if session.send != nil {
 			ack := protocol.NewWriter(4)
