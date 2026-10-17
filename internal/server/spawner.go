@@ -43,6 +43,7 @@ func (s *Server) StartSpawning(ctx context.Context, log *slog.Logger) {
 	_ = s.LoadScoreboardFile()
 	_ = s.LoadBossBarsFile()
 	_ = s.LoadSignsAndLecternsFile()
+	_ = s.LoadBannersFile()
 	go s.entityTickLoop(ctx, log)
 	go s.mobSpawnLoop(ctx)
 }
@@ -61,6 +62,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			_ = s.SaveScoreboardFile()
 			_ = s.SaveBossBarsFile()
 			_ = s.SaveSignsAndLecternsFile()
+			_ = s.SaveBannersFile()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -75,6 +77,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 					_ = s.SaveScoreboardFile()
 					_ = s.SaveBossBarsFile()
 					_ = s.SaveSignsAndLecternsFile()
+					_ = s.SaveBannersFile()
 				}
 			}
 			s.TickWeather(rng)

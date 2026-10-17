@@ -575,6 +575,35 @@ func (s *Server) SendChunkSignBlockEntitiesToSession(session *PlayerSession, dim
 	}
 }
 
+// SendChunkBannerBlockEntitiesToSession sends ClientboundBlockEntityDataPacket (0x06)
+// for all banners in chunk (cx, cz) of dimension to session.
+func (s *Server) SendChunkBannerBlockEntitiesToSession(session *PlayerSession, dimension string, cx, cz int32) {
+	if s == nil || session == nil || session.send == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dimension)
+	st := s.bannerStore()
+	st.mu.RLock()
+	var packets [][]byte
+	for key, b := range st.banners {
+		if b != nil && key.dim == normDim && int32(key.x>>4) == cx && int32(key.z>>4) == cz {
+			packets = append(packets, EncodeBannerBlockEntityPacket(b))
+		}
+	}
+	st.mu.RUnlock()
+
+	for _, pkt := range packets {
+		_ = session.send(PlayBlockEntityDataCB, pkt)
+	}
+}
+
+// SendChunkBlockEntityPackets sends ClientboundBlockEntityDataPacket (0x06)
+// for all signs and banners in chunk (cx, cz) of dimension to session.
+func (s *Server) SendChunkBlockEntityPackets(session *PlayerSession, dimension string, cx, cz int32) {
+	s.SendChunkSignBlockEntitiesToSession(session, dimension, cx, cz)
+	s.SendChunkBannerBlockEntitiesToSession(session, dimension, cx, cz)
+}
+
 // OnSignPlaced initializes a SignBlockEntity when session places a sign or hanging sign
 // at (x, y, z), broadcasts its initial BlockEntityData, and sends OpenSignEditor (0x3c)
 // to session so the sign editor screen opens immediately.
