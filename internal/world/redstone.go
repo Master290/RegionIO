@@ -249,7 +249,7 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
 		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
-		"minecraft:dispenser", "minecraft:dropper":
+		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper":
 		return true
 	}
 	return strings.HasSuffix(name, "_button") ||
@@ -1367,6 +1367,9 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 			case info.Name == "minecraft:dispenser" || info.Name == "minecraft:dropper":
 				c.evaluateDispenserRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
+			case info.Name == "minecraft:hopper":
+				c.evaluateHopperRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
 			case info.Name == "minecraft:piston" || info.Name == "minecraft:sticky_piston":
 				pistonChanged := c.evaluatePistonRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 				nextSeeds = append(nextSeeds, pistonChanged...)
@@ -2188,5 +2191,36 @@ func BlockProperties(state uint16) map[string]string {
 func WithBlockProperty(state uint16, prop, val string) (uint16, bool) {
 	return withStateProperty(state, prop, val)
 }
+
+func (c *Cache) evaluateHopperRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	powered := c.IsBlockPowered(x, y, z)
+	wantEnabled := "true"
+	if powered {
+		wantEnabled = "false"
+	}
+	if info.Properties["enabled"] != wantEnabled {
+		if nextSt, ok := withStateProperty(state, "enabled", wantEnabled); ok {
+			c.setBlockRecorded(x, y, z, nextSt, res)
+		}
+	}
+}
+
+// IsHopperEnabledAt reports whether a `minecraft:hopper` at (x, y, z) is
+// enabled (not locked by redstone power).
+func (c *Cache) IsHopperEnabledAt(x, y, z int) bool {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:hopper" {
+		return false
+	}
+	if c.IsBlockPowered(x, y, z) {
+		return false
+	}
+	return info.Properties["enabled"] != "false"
+}
+
 
 

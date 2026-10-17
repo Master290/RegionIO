@@ -102,6 +102,15 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if dispSig := s.DispenserComparatorSignalAt(targetDim, x, y, z); dispSig > best {
 		best = dispSig
 	}
+	if hopSig := s.HopperComparatorSignalAt(targetDim, x, y, z); hopSig > best {
+		best = hopSig
+	}
+	if cbSig := s.ChiseledBookshelfComparatorSignalAt(targetDim, x, y, z); cbSig > best {
+		best = cbSig
+	}
+	if crSig := s.CrafterComparatorSignalAt(targetDim, x, y, z); crSig > best {
+		best = crSig
+	}
 	if contSig := s.ContainerComparatorSignalAt(targetDim, x, y, z); contSig > best {
 		best = contSig
 	}

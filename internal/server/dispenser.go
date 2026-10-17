@@ -519,6 +519,12 @@ func (s *Server) ContainerComparatorSignalAt(dim string, x, y, z int) int {
 	case IsFurnaceBlock(state):
 		slots := s.FurnaceSlots(x, y, z)
 		return CalculateContainerComparatorSignal(slots[:])
+	case name == "minecraft:hopper":
+		return s.HopperComparatorSignalAt(normDim, x, y, z)
+	case name == "minecraft:chiseled_bookshelf":
+		return s.ChiseledBookshelfComparatorSignalAt(normDim, x, y, z)
+	case name == "minecraft:crafter":
+		return s.CrafterComparatorSignalAt(normDim, x, y, z)
 	default:
 		return 0
 	}

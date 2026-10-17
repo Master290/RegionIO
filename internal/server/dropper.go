@@ -175,6 +175,15 @@ func (s *Server) tryDropperTransferIntoContainer(
 		inserted, _ := s.InsertJukeboxDisc(dim, fx, fy, fz, single)
 		return inserted
 
+	case frontName == "minecraft:hopper":
+		return s.HopperInsertIntoHopper(dim, fx, fy, fz, single, meta, potionType)
+
+	case frontName == "minecraft:chiseled_bookshelf":
+		return s.HopperInsertIntoChiseledBookshelf(dim, fx, fy, fz, single, meta)
+
+	case frontName == "minecraft:crafter":
+		return s.HopperInsertIntoCrafter(dim, fx, fy, fz, single, meta)
+
 	default:
 		return false
 	}
