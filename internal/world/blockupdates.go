@@ -334,6 +334,12 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return concrete
 		}
 	}
+	if IsNoteBlock(state) {
+		wantInst := c.ResolveNoteBlockInstrumentAt(x, y, z)
+		if updated, ok := withStateProperty(state, "instrument", wantInst); ok {
+			return updated
+		}
+	}
 	return state
 }
 
@@ -561,6 +567,17 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 				return updated, true
 			}
 		}
+	}
+
+	// Update instrument property on minecraft:note_block when block below (y-1) or head above (y+1) changes.
+	if name == "minecraft:note_block" {
+		wantInst := c.ResolveNoteBlockInstrumentAt(x, y, z)
+		if props["instrument"] != wantInst {
+			if updated, ok := withStateProperty(state, "instrument", wantInst); ok {
+				return updated, true
+			}
+		}
+		return state, true
 	}
 
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)

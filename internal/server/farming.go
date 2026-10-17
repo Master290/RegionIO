@@ -222,41 +222,27 @@ func (s *Server) syncPlayerInventorySlot(session *PlayerSession, slot int) {
 	_ = session.send(protocol.PlayContainerSetSlot, pkt)
 }
 
-// BindItemFrameComparatorSignals registers a comparator signal provider on the
-// world cache for dimension dim (or the primary overworld cache when dim is
-// empty) so redstone comparators automatically read ItemFrameComparatorSignalAt
-// (0..8) from attached item frames.
+// BindItemFrameComparatorSignals registers the unified comparator signal
+// provider (item frames, lecterns, and jukeboxes), jukebox redstone power
+// provider, and note block play listener on the world cache for dimension dim.
 func (s *Server) BindItemFrameComparatorSignals(dim string) *world.Cache {
-	if s == nil {
-		return nil
-	}
-	cache := s.chunks
-	if dim != "" {
-		if dc := s.DimensionChunks(dim); dc != nil {
-			cache = dc
-		}
-	}
-	if cache == nil {
-		return nil
-	}
-	targetDim := dim
-	if targetDim == "" {
-		targetDim = world.DimensionOverworld
-	}
-	cache.SetComparatorSignalProvider(func(bx, by, bz int) int {
-		return s.ItemFrameComparatorSignalAt(targetDim, bx, by, bz)
-	})
-	return cache
+	return s.BindNoteBlockAndJukeboxRedstone(dim)
 }
 
-// UpdateItemFrameComparatorsAt binds the item frame comparator signal provider
-// for dim and updates any redstone comparators reading the block or item frame
-// at (x, y, z).
+// UpdateItemFrameComparatorsAt binds comparator signal providers for dim and
+// updates any redstone comparators reading the block or item frame at (x, y, z).
 func (s *Server) UpdateItemFrameComparatorsAt(dim string, x, y, z int) world.BlockUpdateResult {
 	cache := s.BindItemFrameComparatorSignals(dim)
 	if cache == nil {
 		return world.BlockUpdateResult{}
 	}
 	return cache.UpdateComparatorsAround(x, y, z)
+}
+
+// UpdateComparatorsAt binds comparator signal providers for dim and updates
+// any redstone comparators reading the block at (x, y, z) (e.g. lectern,
+// jukebox, item frame, composter, beehive, cauldron).
+func (s *Server) UpdateComparatorsAt(dim string, x, y, z int) world.BlockUpdateResult {
+	return s.UpdateItemFrameComparatorsAt(dim, x, y, z)
 }
 

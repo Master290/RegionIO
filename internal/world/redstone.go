@@ -20,6 +20,7 @@ const (
 var (
 	pressurePlateCounters     sync.Map // map[*Cache]func(x, y, z int) int
 	comparatorSignalProviders sync.Map // map[*Cache]func(x, y, z int) int
+	jukeboxPowerProviders     sync.Map // map[*Cache]func(x, y, z int) int
 )
 
 // SetPressurePlateEntityCounter registers an optional callback used when a
@@ -60,6 +61,29 @@ func (c *Cache) customComparatorSignalAt(x, y, z int) int {
 		if fn, ok := v.(func(int, int, int) int); ok && fn != nil {
 			return clampPower(fn(x, y, z))
 		}
+	}
+	return 0
+}
+
+// SetJukeboxPowerProvider registers an optional callback that returns the
+// active redstone power (15 while a song is playing, 0 when finished or empty)
+// emitted by a minecraft:jukebox at (x, y, z).
+func (c *Cache) SetJukeboxPowerProvider(fn func(x, y, z int) int) {
+	if fn == nil {
+		jukeboxPowerProviders.Delete(c)
+		return
+	}
+	jukeboxPowerProviders.Store(c, fn)
+}
+
+func (c *Cache) jukeboxRedstoneSignalAt(x, y, z int, props map[string]string) int {
+	if v, ok := jukeboxPowerProviders.Load(c); ok && v != nil {
+		if fn, ok := v.(func(int, int, int) int); ok && fn != nil {
+			return clampPower(fn(x, y, z))
+		}
+	}
+	if props["has_record"] == "true" {
+		return MaxRedstonePower
 	}
 	return 0
 }
@@ -200,7 +224,8 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:lever", "minecraft:redstone_torch", "minecraft:redstone_wall_torch",
 		"minecraft:repeater", "minecraft:comparator",
 		"minecraft:piston", "minecraft:sticky_piston", "minecraft:piston_head",
-		"minecraft:redstone_lamp", "minecraft:target", "minecraft:daylight_detector",
+		"minecraft:redstone_lamp", "minecraft:note_block", "minecraft:jukebox",
+		"minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer":
 		return true
 	}
@@ -224,7 +249,7 @@ func isConductiveSolidBlock(state uint16) bool {
 		return false
 	}
 	name := info.Name
-	if isRedstoneComponentName(name) {
+	if isRedstoneComponentName(name) && name != "minecraft:note_block" {
 		return false
 	}
 	if strings.HasSuffix(name, "_glass") || strings.HasSuffix(name, "_stained_glass") ||
@@ -284,11 +309,13 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 			return MaxRedstonePower
 		}
 		return 0
-	case "minecraft:repeater":
+	case "minecraft:repeater", "minecraft:lectern":
 		if info.Properties["powered"] == "true" {
 			return MaxRedstonePower
 		}
 		return 0
+	case "minecraft:jukebox":
+		return c.jukeboxRedstoneSignalAt(x, y, z, info.Properties)
 	case "minecraft:comparator":
 		return c.ComparatorOutputSignalAt(x, y, z)
 	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate":
@@ -415,6 +442,21 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 			return 0
 		}
 		return MaxRedstonePower
+
+	case "minecraft:jukebox":
+		if directOnly {
+			return 0
+		}
+		return c.jukeboxRedstoneSignalAt(sx, sy, sz, props)
+
+	case "minecraft:lectern":
+		if props["powered"] != "true" {
+			return 0
+		}
+		if !directOnly || (tx == sx && ty == sy-1 && tz == sz) {
+			return MaxRedstonePower
+		}
+		return 0
 
 	case "minecraft:lever":
 		if props["powered"] != "true" {
@@ -835,17 +877,35 @@ func (c *Cache) computeComparatorOutput(x, y, z int, info stateName) int {
 	return 0
 }
 
+func hasAnalogOutputSignal(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:jukebox", "minecraft:lectern", "minecraft:composter",
+		"minecraft:cauldron", "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron",
+		"minecraft:cake", "minecraft:end_portal_frame", "minecraft:respawn_anchor",
+		"minecraft:beehive", "minecraft:bee_nest":
+		return true
+	}
+	return false
+}
+
 func (c *Cache) comparatorRearSignal(x, y, z int, facing string) int {
 	inDX, inDZ := RepeaterInputOffset(facing)
 	ix, iy, iz := x+inDX, y, z+inDZ
 	if iy < MinY || iy >= MinY+WorldHeight {
 		return 0
 	}
+	inState := c.GetBlock(ix, iy, iz)
+	if hasAnalogOutputSignal(inState) {
+		return clampPower(c.analogSignalAt(ix, iy, iz))
+	}
 	sig := c.repeaterInputSignal(x, y, z, facing)
 	if analog := c.analogSignalAt(ix, iy, iz); analog > sig {
 		sig = analog
 	}
-	inState := c.GetBlock(ix, iy, iz)
 	if sig < MaxRedstonePower && isConductiveSolidBlock(inState) {
 		ix2, iz2 := x+2*inDX, z+2*inDZ
 		if analogFar := c.analogSignalAt(ix2, iy, iz2); analogFar > sig {
@@ -992,7 +1052,7 @@ func (c *Cache) ToggleTrapdoor(x, y, z int) (bool, BlockUpdateResult) {
 }
 
 // InteractRedstoneBlock handles a player right-click on a lever, button,
-// repeater, comparator, non-iron door, or non-iron trapdoor at (x, y, z).
+// repeater, comparator, note block, non-iron door, or non-iron trapdoor at (x, y, z).
 func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 	if y < MinY || y >= MinY+WorldHeight {
 		return false, BlockUpdateResult{}
@@ -1011,6 +1071,9 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 		return c.CycleRepeaterDelay(x, y, z)
 	case info.Name == "minecraft:comparator":
 		return c.ToggleComparatorMode(x, y, z)
+	case info.Name == "minecraft:note_block":
+		_, _, _, res := c.TuneNoteBlock(x, y, z)
+		return true, res
 	case strings.HasSuffix(info.Name, "_trapdoor"):
 		return c.ToggleTrapdoor(x, y, z)
 	case strings.HasSuffix(info.Name, "_door"):
@@ -1132,7 +1195,7 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 // propagateRedstoneAround recalculates redstone dust connection shapes and
 // power levels (0..15 with decay), evaluates redstone torch inversions and
 // comparators, schedules repeater delays, and updates doors, trapdoors, lamps,
-// and pistons affected by a change at (x, y, z).
+// note blocks, and pistons affected by a change at (x, y, z).
 func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
 	toggledTorches := make(map[BlockPos]bool)
 	evaluatedComparators := make(map[BlockPos]int)
@@ -1230,6 +1293,9 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 					}
 				}
 
+			case info.Name == "minecraft:note_block":
+				c.evaluateNoteBlockRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
 			case info.Name == "minecraft:piston" || info.Name == "minecraft:sticky_piston":
 				pistonChanged := c.evaluatePistonRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 				nextSeeds = append(nextSeeds, pistonChanged...)
@@ -1238,6 +1304,33 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 
 		seeds = nextSeeds
 	}
+}
+
+func (c *Cache) evaluateNoteBlockRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	powered := c.IsBlockPowered(x, y, z)
+	wasPowered := info.Properties["powered"] == "true"
+	wantInst := c.ResolveNoteBlockInstrumentAt(x, y, z)
+	if powered == wasPowered && info.Properties["instrument"] == wantInst {
+		return
+	}
+	wantPowered := "false"
+	if powered {
+		wantPowered = "true"
+	}
+	nextState, ok := nameToStateID("minecraft:note_block", map[string]string{
+		"instrument": wantInst,
+		"note":       info.Properties["note"],
+		"powered":    wantPowered,
+	})
+	if !ok {
+		return
+	}
+	if !wasPowered && powered {
+		c.setBlockRecorded(x, y, z, nextState, res)
+		c.PlayNoteBlockAt(x, y, z)
+		return
+	}
+	c.setBlockRecorded(x, y, z, nextState, res)
 }
 
 func redstoneSupportOf(x, y, z int, state uint16) (BlockPos, bool) {
@@ -1484,7 +1577,7 @@ func canWireConnectHorizontally(neighborState uint16, dirFromWireToNeighbor stri
 	switch name {
 	case "minecraft:redstone_wire", "minecraft:redstone_block",
 		"minecraft:lever", "minecraft:redstone_torch", "minecraft:redstone_wall_torch",
-		"minecraft:comparator", "minecraft:target", "minecraft:daylight_detector",
+		"minecraft:comparator", "minecraft:jukebox", "minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:tripwire_hook",
 		"minecraft:lightning_rod":
 		return true

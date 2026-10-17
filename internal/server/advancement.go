@@ -432,6 +432,11 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:diamond_sword", AdvancementFrameChallenge, "",
 		true, true, false, 2, 0, cKillAll, rKillAll, 500)
 
+	cJukeboxMeadow, rJukeboxMeadow := allOfCriteria("play_jukebox_in_meadows")
+	add("minecraft:adventure/play_jukebox_in_meadows", "minecraft:adventure/sleep_in_bed", "Sound of Music", "Make the Meadows come alive with the sound of music from a Jukebox",
+		"minecraft:jukebox", AdvancementFrameTask, "",
+		true, true, false, 2, -1, cJukeboxMeadow, rJukeboxMeadow, 0)
+
 	// --- Husbandry tab (minecraft:husbandry/*) ---
 	cHusbRoot, rHusbRoot := allOfCriteria("consumed_item")
 	add("minecraft:husbandry/root", "", "Husbandry", "The world is full of friends and food",
@@ -1192,6 +1197,16 @@ func (s *Server) TriggerEffectsChanged(session *PlayerSession) {
 		}
 	}
 	s.GrantCriterion(session, "minecraft:nether/all_potions", "all_effects")
+}
+
+// TriggerPlayJukeboxInMeadows fires the "Sound of Music" advancement
+// (minecraft:adventure/play_jukebox_in_meadows) when session inserts a music
+// disc into a jukebox located in a minecraft:meadow biome.
+func (s *Server) TriggerPlayJukeboxInMeadows(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/play_jukebox_in_meadows", "play_jukebox_in_meadows")
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---
