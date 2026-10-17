@@ -191,6 +191,9 @@ func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.Feature
 		if err != nil {
 			return err
 		}
+		if scheduled.Name == "minecraft:glow_lichen" {
+			r.clearPreStageGlowLichen()
+		}
 		if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 			r.placeMultifaceGrowth(set, random, position, config)
 			return nil
@@ -585,24 +588,70 @@ func (r *decorationRegion) placeSimpleBlockFeature(random worldgen.RandomSource,
 	if !ok || !r.simpleBlockCanSurvive(position, chosen.Name, set) {
 		return false
 	}
-	// DoublePlantBlock path: any lower-half state places both halves; the
-	// upper half keeps every other property (facing, waterlogged, ...).
+	// DoublePlantBlock.placeAt path: any lower-half state places both halves,
+	// copying waterlogged from the target cells via DoublePlantBlock.copyWaterloggedFrom.
 	if chosen.Properties["half"] == "lower" {
+		if !isAirState(r.getBlock(position.X, position.Y+1, position.Z)) {
+			return false
+		}
+		lowerState := state
+		if _, hasWater := chosen.Properties["waterlogged"]; hasWater {
+			lowerProps := make(map[string]string, len(chosen.Properties))
+			for k, v := range chosen.Properties {
+				lowerProps[k] = v
+			}
+			lowerProps["waterlogged"] = strconv.FormatBool(isWaterState(r.getBlock(position.X, position.Y, position.Z)))
+			if id, ok := nameToStateID(chosen.Name, lowerProps); ok {
+				lowerState = id
+			}
+		}
 		upperProps := make(map[string]string, len(chosen.Properties))
 		for k, v := range chosen.Properties {
 			upperProps[k] = v
 		}
 		upperProps["half"] = "upper"
+		if _, hasWater := chosen.Properties["waterlogged"]; hasWater {
+			upperProps["waterlogged"] = strconv.FormatBool(isWaterState(r.getBlock(position.X, position.Y+1, position.Z)))
+		}
 		upper, upperOK := nameToStateID(chosen.Name, upperProps)
-		if !upperOK || !isAirState(r.getBlock(position.X, position.Y+1, position.Z)) {
+		if !upperOK {
 			return false
 		}
-		if !r.setBlock(position.X, position.Y, position.Z, state) {
+		if !r.setBlock(position.X, position.Y, position.Z, lowerState) {
 			return false
 		}
 		return r.setBlock(position.X, position.Y+1, position.Z, upper)
 	}
 	return r.setBlock(position.X, position.Y, position.Z, state)
+}
+
+// clearPreStageGlowLichen reverts any premature structure-stage waterlogged
+// glow_lichen in the interior (lx, lz in 2..13) of the current source chunk
+// back to StateWater before Stage 9's minecraft:glow_lichen (index 0) runs.
+// Because glow_lichen uses in_square and can step at most 2 blocks across a
+// chunk boundary, no prior source chunk can legitimately place glow_lichen in
+// [2..13]x[2..13]; leaving a premature glow_lichen there causes
+// MultifaceGrowthFeature to skip placement and omit its ChanceOfSpreading RNG
+// draw, desynchronizing subsequent glow_lichen and moss_patch_ceiling rolls.
+func (r *decorationRegion) clearPreStageGlowLichen() {
+	chunk := r.chunks[[2]int32{r.sourceX, r.sourceZ}]
+	if chunk == nil {
+		return
+	}
+	for y := MinY; y < MinY+WorldHeight; y++ {
+		for lz := 2; lz <= 13; lz++ {
+			for lx := 2; lx <= 13; lx++ {
+				id := chunk.GetBlock(lx, y, lz)
+				if st, ok := stateByID(id); ok && st.Name == "minecraft:glow_lichen" {
+					if st.Properties["waterlogged"] == "true" {
+						chunk.SetBlock(lx, y, lz, StateWater)
+					} else {
+						chunk.SetBlock(lx, y, lz, StateAir)
+					}
+				}
+			}
+		}
+	}
 }
 
 func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePosition, name string, set *worldgen.FeatureSet) bool {

@@ -227,3 +227,75 @@ func TestSculkSpreadFromBedrockAndSubstrateAccess(t *testing.T) {
 		t.Fatal("sculkVeinHasSubstrateAccess rejected sculk_vein attached to #minecraft:sculk_replaceable stone")
 	}
 }
+
+func TestClearPreStageGlowLichenAndDoublePlantWaterlogged(t *testing.T) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	region, _ := nestedRefRegion(t)
+	region.sourceX = 1
+	region.sourceZ = 0
+
+	lichenWater, ok := nameToStateID("minecraft:glow_lichen", map[string]string{
+		"up":          "true",
+		"waterlogged": "true",
+	})
+	if !ok {
+		t.Fatal("glow_lichen waterlogged state missing")
+	}
+	lichenDry, ok := nameToStateID("minecraft:glow_lichen", map[string]string{
+		"down":        "true",
+		"waterlogged": "false",
+	})
+	if !ok {
+		t.Fatal("glow_lichen dry state missing")
+	}
+	region.setBlock(19, 18, 2, lichenWater)
+	region.setBlock(20, 18, 3, lichenDry)
+	region.clearPreStageGlowLichen()
+	if got := region.getBlock(19, 18, 2); got != StateWater {
+		t.Fatalf("clearPreStageGlowLichen at (19,18,2) = %d, want StateWater (%d)", got, StateWater)
+	}
+	if got := region.getBlock(20, 18, 3); got != StateAir {
+		t.Fatalf("clearPreStageGlowLichen at (20,18,3) = %d, want StateAir (%d)", got, StateAir)
+	}
+
+	// Verify DoublePlantBlock.copyWaterloggedFrom in placeSimpleBlockFeature:
+	// when the lower cell is water and the upper cell is air, small_dripleaf
+	// copies waterlogged=true for the lower half and waterlogged=false for the upper half.
+	clay, _ := nameToStateID("minecraft:clay", nil)
+	region.setBlock(22, -29, 4, clay)
+	region.setBlock(22, -28, 4, StateWater)
+	region.setBlock(22, -27, 4, StateAir)
+	cfg := worldgen.SimpleBlockFeatureConfig{
+		States: []worldgen.WeightedBlockState{
+			{
+				State: worldgen.BlockState{
+					Name: "minecraft:small_dripleaf",
+					Properties: map[string]string{
+						"facing":      "north",
+						"half":        "lower",
+						"waterlogged": "false",
+					},
+				},
+				Weight: 1,
+			},
+		},
+	}
+	random := &countingRandom{RandomSource: worldgen.NewWorldgenRandom(11)}
+	if !region.placeSimpleBlockFeature(random, worldgen.FeaturePosition{X: 22, Y: -28, Z: 4}, cfg, set) {
+		t.Fatal("expected small_dripleaf simple_block placement to succeed")
+	}
+	lowerSt, ok := stateByID(region.getBlock(22, -28, 4))
+	if !ok || lowerSt.Name != "minecraft:small_dripleaf" || lowerSt.Properties["half"] != "lower" || lowerSt.Properties["waterlogged"] != "true" {
+		t.Fatalf("lower half state = %+v, want small_dripleaf[half=lower,waterlogged=true]", lowerSt)
+	}
+	upperSt, ok := stateByID(region.getBlock(22, -27, 4))
+	if !ok || upperSt.Name != "minecraft:small_dripleaf" || upperSt.Properties["half"] != "upper" || upperSt.Properties["waterlogged"] != "false" {
+		t.Fatalf("upper half state = %+v, want small_dripleaf[half=upper,waterlogged=false]", upperSt)
+	}
+}
+
+
+
