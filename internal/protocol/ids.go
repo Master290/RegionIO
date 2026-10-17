@@ -115,9 +115,15 @@ const (
 	PlaySetPlayerTeam         = 0x6d
 	PlaySetScore              = 0x6e
 	PlaySetSubtitleText       = 0x70
-	PlaySetTitleText          = 0x72
-	PlaySetTitlesAnimation    = 0x73
-	PlayTabList               = 0x7a
+	PlaySetTitleText             = 0x72
+	PlaySetTitlesAnimation       = 0x73
+	PlayTabList                  = 0x7a
+	PlayInitializeBorder         = 0x2b
+	PlaySetBorderCenter          = 0x58
+	PlaySetBorderLerpSize        = 0x59
+	PlaySetBorderSize            = 0x5a
+	PlaySetBorderWarningDelay    = 0x5b
+	PlaySetBorderWarningDistance = 0x5c
 
 	// Entity packets
 	PlayAddEntity        = 0x01

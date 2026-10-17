@@ -193,6 +193,7 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	sayNode := greedyCmd("say")
 	teammsgNode := greedyCmd("teammsg")
 	tmNode := greedyCmd("tm")
+	worldborderNode := greedyCmd("worldborder")
 
 	nodes[rootIdx].Children = []int32{
 		tpNode,
@@ -218,6 +219,7 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		sayNode,
 		teammsgNode,
 		tmNode,
+		worldborderNode,
 	}
 	return nodes, rootIdx
 }
@@ -513,6 +515,11 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 			return "You do not have permission to use this command"
 		}
 		return srv.HandleBossBarCommand(sender, parsed.Args)
+	case "worldborder":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return srv.HandleWorldBorderCommand(sender, parsed.Args)
 	default:
 		if reply, handled := srv.HandleSocialAndScoreboardCommand(sender, parsed.Name, parsed.Args); handled {
 			return reply

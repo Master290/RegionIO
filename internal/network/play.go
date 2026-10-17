@@ -110,6 +110,7 @@ func (h *handler) beginPlay() error {
 	if err := h.conn.Send(protocol.PlaySetTime, h.srv.SetTimePacket()); err != nil {
 		return err
 	}
+	h.srv.SendWorldBorderToPlayer(session)
 	h.srv.BroadcastPlayerInfoAdd(session)
 	_ = h.srv.SendFullTabListToPlayer(session)
 	_ = h.srv.SendFullScoreboardToPlayer(session)
@@ -454,6 +455,7 @@ func (h *handler) serverTickLoop() {
 			return
 		case <-ticker.C:
 			h.srv.TickBrewingStands()
+			h.srv.TickWorldBorder()
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
 				// StartSpawning is not advancing the world clock; tick player

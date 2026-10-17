@@ -532,6 +532,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 
 		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
 		_ = send(protocol.PlaySetTime, s.SetTimePacket())
+		s.SendWorldBorderToPlayer(session)
 	}
 
 	if switchDim != nil {

@@ -710,10 +710,13 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		return false
 	}
 
-	if prot := session.ArmorEnchantmentProtection(cause); prot > 0 {
-		amount *= 1.0 - prot
-		if amount <= 0 {
-			return false
+	isOutOfBorder := cause == "out_of_border" || cause == "outside_border" || cause == "world_border"
+	if !isOutOfBorder {
+		if prot := session.ArmorEnchantmentProtection(cause); prot > 0 {
+			amount *= 1.0 - prot
+			if amount <= 0 {
+				return false
+			}
 		}
 	}
 
@@ -742,7 +745,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	send := session.send
 	session.mu.Unlock()
 
-	if cause != "starve" && cause != "void" && cause != "out_of_world" {
+	if cause != "starve" && cause != "void" && cause != "out_of_world" && !isOutOfBorder {
 		for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
 			if !session.InventorySlot(slot).IsEmpty() {
 				s.DamagePlayerItem(session, slot, 1)
@@ -783,6 +786,8 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 			deathMsg = fmt.Sprintf("%s fell from a high place", name)
 		case "bad_respawn_point":
 			deathMsg = fmt.Sprintf("%s was killed by [Intentional Game Design]", name)
+		case "out_of_border", "outside_border", "world_border":
+			deathMsg = fmt.Sprintf("%s left the confines of this world", name)
 		default:
 			if comp := s.FormatDeathMessage(session, cause, ""); comp.PlainText() != "" {
 				deathMsg = comp.PlainText()
@@ -795,7 +800,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		}
 		if !isCombatDeathCause(cause) {
 			s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
-			if cause == "bad_respawn_point" {
+			if cause == "bad_respawn_point" || isOutOfBorder {
 				chatW := protocol.NewWriter(len(deathMsg) + 8)
 				chatW.Raw(nbt.Marshal(nbt.String(deathMsg)))
 				chatW.Bool(false)
@@ -950,6 +955,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
 
 		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
+		s.SendWorldBorderToPlayer(session)
 	}
 	return nil
 }
