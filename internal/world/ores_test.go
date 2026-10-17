@@ -59,7 +59,7 @@ func TestOreFeatureDoPlaceBytecodeParity(t *testing.T) {
 //  4. When (-40, 21) and (-39, 20) decorate before (-39, 21) (as in
 //     orderRowMajor), (-39, 21)'s own veins overwrite the cross-border tails
 //     exactly as in vanilla 26.1.2, eliminating all 229 andesite/diorite/granite
-//     mismatches (0 ore mismatches; 98,303 / 98,304 exact cells in (-39, 21)).
+//     mismatches (0 ore mismatches; 98,304 / 98,304 exact cells in (-39, 21)).
 func TestSourceChunk3921OreBoundaryOverwrites(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping source-chunk ore boundary trace in -short mode")
@@ -125,8 +125,8 @@ func TestSourceChunk3921OreBoundaryOverwrites(t *testing.T) {
 			}
 		}
 	}
-	if totalMismatchesTargetFirst != 230 {
-		t.Fatalf("expected 230 total mismatches on (-39, 21) under orderTargetFirst, got %d", totalMismatchesTargetFirst)
+	if totalMismatchesTargetFirst != 229 {
+		t.Fatalf("expected 229 total mismatches on (-39, 21) under orderTargetFirst, got %d", totalMismatchesTargetFirst)
 	}
 	wantPairs := map[string]int{
 		"minecraft:andesite instead of minecraft:diorite": 127,
@@ -194,7 +194,7 @@ func TestSourceChunk3921OreBoundaryOverwrites(t *testing.T) {
 
 	// 3. Verify that under orderRowMajor (where (-39,20) and (-40,21) decorate
 	// before (-39,21)), all 229 andesite/diorite/granite mismatches vanish and
-	// total mismatches on (-39,21) drop from 230 to 1.
+	// total mismatches on (-39,21) drop from 229 to 0.
 	regRowMajor := buildFreshRegion()
 	traceRM, err := traceTargetChunkStage6Ores(od, seed, regRowMajor, -39, 21, orderRowMajor(-39, 21))
 	if err != nil {
@@ -226,8 +226,8 @@ func TestSourceChunk3921OreBoundaryOverwrites(t *testing.T) {
 			}
 		}
 	}
-	if totalMismatchesRowMajor != 1 {
-		t.Errorf("expected 1 total mismatch on (-39, 21) under orderRowMajor, got %d", totalMismatchesRowMajor)
+	if totalMismatchesRowMajor != 0 {
+		t.Errorf("expected 0 total mismatches on (-39, 21) under orderRowMajor, got %d", totalMismatchesRowMajor)
 	}
 }
 

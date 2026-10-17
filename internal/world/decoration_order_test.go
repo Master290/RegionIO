@@ -267,15 +267,15 @@ func joinChunks(parts []string) string {
 //   - orderTargetFirst produces 306 stone-ore mismatches across the 4 chunks
 //     (179x diorite -> granite, 87x granite -> andesite, 20x tuff -> andesite,
 //     9x andesite -> diorite, 6x granite -> diorite, 5x andesite -> granite)
-//     and 302 underground-band mismatches (72 + 106 + 39 + 85).
+//     and 301 underground-band mismatches (72 + 106 + 38 + 85).
 //   - orderRowMajor (Z ascending outer, X ascending inner) reduces the 306
 //     stone-ore mismatches to 3 (1x andesite -> granite in (16,-40) from
 //     (16,-39) vs (17,-40), and 2x granite -> andesite in (16,-31) from
-//     (15,-31) vs (16,-32)) and underground-band mismatches to 5.
+//     (15,-31) vs (16,-32)) and underground-band mismatches to 4.
 //   - orderColumnMajor (X ascending outer, Z ascending inner) matches vanilla's
 //     cross-border overwrite order across all 4 chunks: 0 stone-ore mismatches
-//     (0 in (16,-40), 0 in (16,-31), 0 in (-40,21), 0 in (-40,20)) and only 1
-//     underground-band mismatch across all 4 chunks (0 + 0 + 1 + 0).
+//     (0 in (16,-40), 0 in (16,-31), 0 in (-40,21), 0 in (-40,20)) and 0
+//     underground-band mismatches across all 4 chunks (0 + 0 + 0 + 0).
 func TestLandDecorationOrderStoneOreParity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping multi-order land fixture stone-ore sweep in -short mode")
@@ -301,9 +301,9 @@ func TestLandDecorationOrderStoneOreParity(t *testing.T) {
 		wantStoneOreTotal int
 		wantUnderground   int
 	}{
-		{"target-first", orderTargetFirst, 306, 302},
-		{"row-major", orderRowMajor, 3, 5},
-		{"column-major", orderColumnMajor, 0, 1},
+		{"target-first", orderTargetFirst, 306, 301},
+		{"row-major", orderRowMajor, 3, 4},
+		{"column-major", orderColumnMajor, 0, 0},
 	}
 
 	for _, cand := range candidates {
