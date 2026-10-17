@@ -118,7 +118,7 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	gmMode := argument("gamemode", ArgParserGameMode, nil, true, gmTarget)
 	gamemodeNode := literal("gamemode", false, gmMode)
 
-	// /time set (day|noon|night|midnight|<time>) | /time add <time>
+	// /time set (day|noon|night|midnight|<time>) | /time add <time> | /time query (daytime|gametime|day)
 	var minZero [4]byte
 	binary.BigEndian.PutUint32(minZero[:], 0)
 	timeSetDay := literal("day", true)
@@ -130,7 +130,23 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 
 	timeAddVal := argument("time", ArgParserTime, minZero[:], true)
 	timeAdd := literal("add", false, timeAddVal)
-	timeNode := literal("time", false, timeSet, timeAdd)
+
+	timeQueryDaytime := literal("daytime", true)
+	timeQueryGametime := literal("gametime", true)
+	timeQueryDay := literal("day", true)
+	timeQuery := literal("query", false, timeQueryDaytime, timeQueryGametime, timeQueryDay)
+	timeNode := literal("time", false, timeSet, timeAdd, timeQuery)
+
+	// /weather (clear|rain|thunder) [<duration>]
+	var minOne [4]byte
+	binary.BigEndian.PutUint32(minOne[:], 1)
+	weatherClearDur := argument("duration", ArgParserTime, minOne[:], true)
+	weatherRainDur := argument("duration", ArgParserTime, minOne[:], true)
+	weatherThunderDur := argument("duration", ArgParserTime, minOne[:], true)
+	weatherClear := literal("clear", true, weatherClearDur)
+	weatherRain := literal("rain", true, weatherRainDur)
+	weatherThunder := literal("thunder", true, weatherThunderDur)
+	weatherNode := literal("weather", false, weatherClear, weatherRain, weatherThunder)
 
 	// /seed
 	seedNode := literal("seed", true)
@@ -156,6 +172,7 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		tpNode,
 		gamemodeNode,
 		timeNode,
+		weatherNode,
 		seedNode,
 		saveAllNode,
 		stopNode,
@@ -381,6 +398,16 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 			return "You do not have permission to use this command"
 		}
 		return execTime(srv, parsed.Args)
+	case "weather":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execWeather(srv, parsed.Args)
+	case "gamerule":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execGameRule(srv, parsed.Args)
 	case "save-all":
 		if !srv.HasAdminPermission(sender) {
 			return "You do not have permission to use this command"
@@ -549,7 +576,7 @@ func execGameMode(srv *server.Server, sender *server.PlayerSession, args []strin
 
 func execTime(srv *server.Server, args []string) string {
 	if len(args) != 2 {
-		return "Usage: /time <set|add> <value>"
+		return "Usage: /time <set|add|query> <value>"
 	}
 	sub := strings.ToLower(args[0])
 	switch sub {
@@ -571,7 +598,7 @@ func execTime(srv *server.Server, args []string) string {
 		gameTime, dayTime := srv.WorldTime()
 		switch strings.ToLower(args[1]) {
 		case "daytime":
-			return fmt.Sprintf("The time is %d", dayTime%server.TicksPerDay)
+			return fmt.Sprintf("The time is %d", srv.TimeOfDay())
 		case "gametime":
 			return fmt.Sprintf("The game time is %d", gameTime)
 		case "day":
@@ -580,7 +607,65 @@ func execTime(srv *server.Server, args []string) string {
 			return "Usage: /time query <daytime|gametime|day>"
 		}
 	default:
-		return "Usage: /time <set|add> <value>"
+		return "Usage: /time <set|add|query> <value>"
+	}
+}
+
+func execWeather(srv *server.Server, args []string) string {
+	if len(args) < 1 || len(args) > 2 {
+		return "Usage: /weather <clear|rain|thunder> [duration]"
+	}
+	var duration int64
+	if len(args) == 2 {
+		dur, err := ParseTimeValue(args[1], false)
+		if err != nil || dur <= 0 {
+			return fmt.Sprintf("Invalid weather duration: %s", args[1])
+		}
+		duration = dur
+	}
+	switch strings.ToLower(strings.TrimSpace(args[0])) {
+	case "clear", "sun":
+		srv.SetWeather(server.WeatherClear, duration)
+		return "Set the weather to clear"
+	case "rain":
+		srv.SetWeather(server.WeatherRain, duration)
+		return "Set the weather to rain"
+	case "thunder":
+		srv.SetWeather(server.WeatherThunder, duration)
+		return "Set the weather to rain & thunder"
+	default:
+		return "Usage: /weather <clear|rain|thunder> [duration]"
+	}
+}
+
+func execGameRule(srv *server.Server, args []string) string {
+	if len(args) < 1 || len(args) > 2 {
+		return "Usage: /gamerule <doDaylightCycle|doWeatherCycle> [true|false]"
+	}
+	rule := strings.ToLower(strings.TrimSpace(args[0]))
+	switch rule {
+	case "dodaylightcycle":
+		if len(args) == 1 {
+			return fmt.Sprintf("Gamerule doDaylightCycle is currently set to: %v", srv.DaylightCycle())
+		}
+		val, err := strconv.ParseBool(strings.TrimSpace(args[1]))
+		if err != nil {
+			return fmt.Sprintf("Invalid boolean value: %s", args[1])
+		}
+		srv.SetDaylightCycle(val)
+		return fmt.Sprintf("Gamerule doDaylightCycle is now set to: %v", val)
+	case "doweathercycle":
+		if len(args) == 1 {
+			return fmt.Sprintf("Gamerule doWeatherCycle is currently set to: %v", srv.WeatherCycle())
+		}
+		val, err := strconv.ParseBool(strings.TrimSpace(args[1]))
+		if err != nil {
+			return fmt.Sprintf("Invalid boolean value: %s", args[1])
+		}
+		srv.SetWeatherCycle(val)
+		return fmt.Sprintf("Gamerule doWeatherCycle is now set to: %v", val)
+	default:
+		return fmt.Sprintf("Unknown game rule: %s", args[0])
 	}
 }
 
@@ -613,7 +698,11 @@ func execHelp(args []string) string {
 		case "gamemode":
 			return "/gamemode <survival|creative|adventure|spectator> [player] — change game mode"
 		case "time":
-			return "/time <set|add> <value> — set or advance world time"
+			return "/time <set|add|query> <value> — set, advance, or query world time"
+		case "weather":
+			return "/weather <clear|rain|thunder> [duration] — set world weather"
+		case "gamerule":
+			return "/gamerule <doDaylightCycle|doWeatherCycle> [true|false] — get or set game rule"
 		case "seed":
 			return "/seed — display world seed"
 		case "save-all":
@@ -626,7 +715,7 @@ func execHelp(args []string) string {
 			return "/help [command] — show available commands"
 		}
 	}
-	return "Available commands: /tp, /gamemode, /time, /seed, /save-all, /stop, /list, /help"
+	return "Available commands: /tp, /gamemode, /time, /weather, /gamerule, /seed, /save-all, /stop, /list, /help"
 }
 
 func execWhitelist(srv *server.Server, args []string) string {

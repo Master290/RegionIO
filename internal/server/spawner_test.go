@@ -61,6 +61,65 @@ func TestSpawnMobNearPlayerUsesSurface(t *testing.T) {
 	}
 }
 
+func TestMobSpawningByLightLevel(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := srv.RegisterPlayer(Profile{Name: "Alice", UUID: OfflineUUID("Alice")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	feetY := world.FlatSurfaceY + 1
+	srv.SetPlayerTransform(session, 8.5, float64(feetY), 8.5, 0, 0, true)
+
+	// 1. Daytime (1000 ticks) on open grass: skyLight=15, blockLight=0 -> passive pig allowed, hostile zombie disallowed.
+	srv.SetWorldTime(100, 1000)
+	if !srv.CanSpawnPassiveMobAt(8, feetY, 8) {
+		t.Fatal("expected passive mob to be allowed on sunlit grass during the day")
+	}
+	if srv.CanSpawnHostileMobAt(8, feetY, 8) {
+		t.Fatal("expected hostile mob to be disallowed in bright daylight")
+	}
+	rng := rand.New(rand.NewSource(7))
+	if !srv.spawnMobNearPlayer(rng, 10, 20) {
+		t.Fatal("expected daytime spawnMobNearPlayer to succeed")
+	}
+	ents := srv.Entities().All()
+	if len(ents) != 1 || ents[0].TypeName != MobTypePig {
+		t.Fatalf("daytime spawned entity = %+v, want %s", ents, MobTypePig)
+	}
+	srv.Entities().Remove(ents[0].ID)
+
+	// 2. Nighttime (14000 ticks) on unlit grass: skyEffective=4 <= 7, blockLight=0 -> hostile zombie allowed, passive pig disallowed.
+	srv.SetWorldTime(200, 14000)
+	if !srv.CanSpawnHostileMobAt(8, feetY, 8) {
+		t.Fatal("expected hostile mob to be allowed on dark grass at night")
+	}
+	if srv.CanSpawnPassiveMobAt(8, feetY, 8) {
+		t.Fatal("expected passive mob to be disallowed in darkness at night")
+	}
+	if !srv.spawnMobNearPlayer(rng, 10, 20) {
+		t.Fatal("expected nighttime spawnMobNearPlayer to succeed")
+	}
+	ents = srv.Entities().All()
+	if len(ents) != 1 || ents[0].TypeName != MobTypeZombie {
+		t.Fatalf("nighttime spawned entity = %+v, want %s", ents, MobTypeZombie)
+	}
+	srv.Entities().Remove(ents[0].ID)
+
+	// 3. Placing glowstone (blockLight > 0) at night blocks hostile spawning while enabling passive spawning on adjacent grass.
+	srv.Chunks().SetBlock(8, feetY, 8, world.StateGlowstone)
+	if srv.CanSpawnHostileMobAt(9, feetY, 8) {
+		t.Fatal("expected block light from glowstone to prevent hostile mob spawning at night")
+	}
+	if !srv.CanSpawnPassiveMobAt(9, feetY, 8) {
+		t.Fatal("expected glowstone-lit grass (light >= 9) to allow passive mob spawning")
+	}
+}
+
 func TestEntityManagerSpatialChunkIndex(t *testing.T) {
 	em := world.NewEntityManager()
 	id1 := em.Add(&world.Entity{TypeID: 1, X: 4, Y: 70, Z: 4})     // chunk (0, 0)

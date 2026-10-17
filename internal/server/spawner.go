@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"math"
+	"math/bits"
 	"math/rand"
 	"sync"
 	"time"
@@ -19,6 +20,10 @@ const (
 	// matching vanilla's default mob tracking range).
 	maxEntityTrackingChunks = 4
 	fixedPointScale         = 4096.0
+
+	// Light-level thresholds for mob spawning (vanilla 1.18+ / 26.1.2 rules).
+	HostileMaxSkyLight   byte = 7
+	PassiveMinLightLevel byte = 9
 )
 
 var serverTrackers sync.Map // map[*Server]*EntityTracker
@@ -49,17 +54,17 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// The world clock rides this loop because it is the only one
-			// already running at 20 TPS. It belongs on the single authoritative
-			// tick the engine still needs.
-			if gameTime, dayTime := s.advanceWorldTime(); gameTime%timeSyncTicks == 0 {
-				s.Broadcast(protocol.PlaySetTime, encodeSetTime(gameTime, dayTime))
+			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
+			if gameTime, _ := s.advanceWorldTime(); gameTime%timeSyncTicks == 0 {
+				s.Broadcast(protocol.PlaySetTime, s.SetTimePacket())
 				if gameTime%timePersistTicks == 0 {
 					if err := s.SaveWorldTime(); err != nil && log != nil {
 						log.Warn("saving world clock", "err", err)
 					}
 				}
 			}
+			s.TickWeather(rng)
+			s.TrySkipNightBySleep()
 			tracker.TickAndBroadcast(s, rng)
 		}
 	}
@@ -539,34 +544,239 @@ func (s *Server) mobSpawnLoop(ctx context.Context) {
 	}
 }
 
+// LightAt returns the stored sky light (0..15) and block light (0..15) at world
+// block coordinates (x, y, z).
+func (s *Server) LightAt(x, y, z int) (skyLight, blockLight byte) {
+	if s == nil || s.chunks == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return 0, 0
+	}
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	raw, err := s.chunks.LightUpdate(cx, cz)
+	if err != nil {
+		return 0, 0
+	}
+	sky, block, ok := decodeLightFromUpdate(raw, x, y, z)
+	if !ok {
+		return 0, 0
+	}
+	return sky, block
+}
+
+// EffectiveLightAt returns the raw sky light, raw block light, and the effective
+// internal light level at (x, y, z) after applying time-of-day and weather sky
+// darkening.
+func (s *Server) EffectiveLightAt(x, y, z int) (skyLight, blockLight, internalLight byte) {
+	skyLight, blockLight = s.LightAt(x, y, z)
+	darken := s.SkyDarkening()
+	var skyEffective byte
+	if skyLight > darken {
+		skyEffective = skyLight - darken
+	}
+	internalLight = skyEffective
+	if blockLight > internalLight {
+		internalLight = blockLight
+	}
+	return skyLight, blockLight, internalLight
+}
+
+// CanSpawnHostileMobAt reports whether a hostile mob (e.g. zombie) can spawn
+// with its feet at (x, y, z): requires a solid supporting floor at (x, y-1, z),
+// two passable blocks at (y, y+1), zero artificial block light (blockLight == 0),
+// and darkness (skyLight <= 7 or night/thunderstorm).
+func (s *Server) CanSpawnHostileMobAt(x, y, z int) bool {
+	if s == nil || s.chunks == nil || y <= world.MinY || y >= world.MinY+world.WorldHeight-1 {
+		return false
+	}
+	floor := s.chunks.GetBlock(x, y-1, z)
+	if !isSolidGroundBlock(floor) || !isColumnPassableAt(s.chunks, x, y, z) {
+		return false
+	}
+	skyLight, blockLight := s.LightAt(x, y, z)
+	if blockLight > 0 {
+		return false
+	}
+	darken := s.SkyDarkening()
+	var skyEffective byte
+	if skyLight > darken {
+		skyEffective = skyLight - darken
+	}
+	return skyEffective <= HostileMaxSkyLight
+}
+
+// CanSpawnPassiveMobAt reports whether a passive animal (e.g. pig) can spawn
+// with its feet at (x, y, z): requires a grass_block floor at (x, y-1, z), two
+// passable blocks at (y, y+1), and effective light >= PassiveMinLightLevel (9).
+func (s *Server) CanSpawnPassiveMobAt(x, y, z int) bool {
+	if s == nil || s.chunks == nil || y <= world.MinY || y >= world.MinY+world.WorldHeight-1 {
+		return false
+	}
+	floor := s.chunks.GetBlock(x, y-1, z)
+	if floor != world.StateGrass || !isColumnPassableAt(s.chunks, x, y, z) {
+		return false
+	}
+	_, _, internalLight := s.EffectiveLightAt(x, y, z)
+	return internalLight >= PassiveMinLightLevel
+}
+
+func (s *Server) resolveSpawnColumn(x, z int) (spawnY int, canPig, canZombie bool) {
+	topY, ok := s.chunks.SafeSpawnY(x, z)
+	if !ok {
+		return 0, false, false
+	}
+	canPig = s.CanSpawnPassiveMobAt(x, topY, z)
+	canZombie = s.CanSpawnHostileMobAt(x, topY, z)
+	if canPig || canZombie {
+		return topY, canPig, canZombie
+	}
+	// If the top surface is unsuitable (e.g. a sunlit stone roof above an
+	// enclosed dark chamber), scan below for a valid interior spawn floor.
+	for y := topY - 2; y > world.MinY; y-- {
+		if !isSolidGroundBlock(s.chunks.GetBlock(x, y-1, z)) {
+			continue
+		}
+		if !isColumnPassableAt(s.chunks, x, y, z) {
+			continue
+		}
+		cp := s.CanSpawnPassiveMobAt(x, y, z)
+		cz := s.CanSpawnHostileMobAt(x, y, z)
+		if cp || cz {
+			return y, cp, cz
+		}
+	}
+	return 0, false, false
+}
+
 func (s *Server) spawnMobNearPlayer(rng *rand.Rand, pigType, zombieType int) bool {
 	players := s.PlayerSnapshots()
 	if len(players) == 0 {
 		return false
 	}
 	player := players[rng.Intn(len(players))]
-	angle := rng.Float64() * 2 * math.Pi
-	distance := 16.0 + rng.Float64()*16.0
-	x := int(math.Floor(player.X + math.Cos(angle)*distance))
-	z := int(math.Floor(player.Z + math.Sin(angle)*distance))
-	y, ok := s.chunks.SafeSpawnY(x, z)
-	if !ok {
-		return false
+	for attempt := 0; attempt < 8; attempt++ {
+		angle := rng.Float64() * 2 * math.Pi
+		distance := 16.0 + rng.Float64()*16.0
+		x := int(math.Floor(player.X + math.Cos(angle)*distance))
+		z := int(math.Floor(player.Z + math.Sin(angle)*distance))
+		y, canPig, canZombie := s.resolveSpawnColumn(x, z)
+		if !canPig && !canZombie {
+			continue
+		}
+
+		typeID := pigType
+		typeName := MobTypePig
+		if canZombie && canPig {
+			if rng.Float32() < 0.5 {
+				typeID = zombieType
+				typeName = MobTypeZombie
+			}
+		} else if canZombie {
+			typeID = zombieType
+			typeName = MobTypeZombie
+		}
+
+		s.entities.Add(&world.Entity{
+			TypeID:   typeID,
+			TypeName: typeName,
+			X:        float64(x) + 0.5,
+			Y:        float64(y),
+			Z:        float64(z) + 0.5,
+			OnGround: true,
+		})
+		return true
+	}
+	return false
+}
+
+func decodeLightFromUpdate(raw []byte, x, y, z int) (skyLight, blockLight byte, ok bool) {
+	if y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return 0, 0, false
+	}
+	r := protocol.NewReader(raw)
+	if _, err := r.VarInt(); err != nil {
+		return 0, 0, false
+	}
+	if _, err := r.VarInt(); err != nil {
+		return 0, 0, false
+	}
+	skyMask, err := readBitSetMask(r)
+	if err != nil {
+		return 0, 0, false
+	}
+	blockMask, err := readBitSetMask(r)
+	if err != nil {
+		return 0, 0, false
+	}
+	if _, err := readBitSetMask(r); err != nil {
+		return 0, 0, false
+	}
+	if _, err := readBitSetMask(r); err != nil {
+		return 0, 0, false
 	}
 
-	typeID := pigType
-	typeName := "minecraft:pig"
-	if rng.Float32() < 0.5 {
-		typeID = zombieType
-		typeName = "minecraft:zombie"
+	si := (y - world.MinY) >> 4
+	targetBit := uint(si + 1)
+	nibbleIdx := ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)
+
+	skyVal, err := readSectionNibble(r, skyMask, targetBit, nibbleIdx)
+	if err != nil {
+		return 0, 0, false
 	}
-	s.entities.Add(&world.Entity{
-		TypeID:   typeID,
-		TypeName: typeName,
-		X:        float64(x) + 0.5,
-		Y:        float64(y),
-		Z:        float64(z) + 0.5,
-		OnGround: true,
-	})
-	return true
+	blockVal, err := readSectionNibble(r, blockMask, targetBit, nibbleIdx)
+	if err != nil {
+		return 0, 0, false
+	}
+	return skyVal, blockVal, true
 }
+
+func readBitSetMask(r *protocol.Reader) (uint64, error) {
+	n, err := r.VarInt()
+	if err != nil {
+		return 0, err
+	}
+	var mask uint64
+	for i := int32(0); i < n; i++ {
+		v, err := r.Int64()
+		if err != nil {
+			return 0, err
+		}
+		if i == 0 {
+			mask = uint64(v)
+		}
+	}
+	return mask, nil
+}
+
+func readSectionNibble(r *protocol.Reader, mask uint64, targetBit uint, nibbleIdx int) (byte, error) {
+	count, err := r.VarInt()
+	if err != nil {
+		return 0, err
+	}
+	targetIdx := -1
+	if (mask & (1 << targetBit)) != 0 {
+		targetIdx = bits.OnesCount64(mask & ((1 << targetBit) - 1))
+	}
+	var val byte
+	targetByteOffset := nibbleIdx >> 1
+	for i := 0; i < int(count); i++ {
+		arrLen, err := r.VarInt()
+		if err != nil {
+			return 0, err
+		}
+		for j := 0; j < int(arrLen); j++ {
+			b, err := r.ReadByte()
+			if err != nil {
+				return 0, err
+			}
+			if i == targetIdx && int(arrLen) == 2048 && j == targetByteOffset {
+				if nibbleIdx&1 == 0 {
+					val = b & 0x0f
+				} else {
+					val = b >> 4
+				}
+			}
+		}
+	}
+	return val, nil
+}
+

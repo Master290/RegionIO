@@ -103,7 +103,7 @@ func TestDefaultCommandTreeWireEncoding(t *testing.T) {
 		t.Fatalf("trailing %d bytes in commands packet", r.Remaining())
 	}
 
-	for _, want := range []string{"tp", "gamemode", "time", "seed", "save-all", "stop", "list", "help"} {
+	for _, want := range []string{"tp", "gamemode", "time", "query", "weather", "clear", "rain", "thunder", "seed", "save-all", "stop", "list", "help"} {
 		if !literals[want] {
 			t.Errorf("command tree missing literal %q", want)
 		}
@@ -244,6 +244,46 @@ func TestExecuteCommandsAndConsole(t *testing.T) {
 	}
 	if _, dt := srv.WorldTime(); dt != 7000 {
 		t.Fatalf("world dayTime = %d, want 7000", dt)
+	}
+	if got := ExecuteCommand(srv, alice, "/time query daytime"); got != "The time is 7000" {
+		t.Fatalf("/time query daytime = %q, want %q", got, "The time is 7000")
+	}
+
+	// /weather thunder, rain, clear
+	if got := ExecuteCommand(srv, alice, "/weather thunder 10s"); got != "Set the weather to rain & thunder" {
+		t.Fatalf("/weather thunder 10s = %q", got)
+	}
+	if !srv.IsRaining() || !srv.IsThundering() || srv.Weather().Kind() != server.WeatherThunder {
+		t.Fatalf("weather after /weather thunder = %+v, want rain+thunder", srv.Weather())
+	}
+	if got := ExecuteCommand(srv, alice, "/weather clear"); got != "Set the weather to clear" {
+		t.Fatalf("/weather clear = %q", got)
+	}
+	if srv.IsRaining() || srv.IsThundering() || srv.Weather().Kind() != server.WeatherClear {
+		t.Fatalf("weather after /weather clear = %+v, want clear", srv.Weather())
+	}
+
+	// /gamerule doDaylightCycle & doWeatherCycle
+	if got := ExecuteCommand(srv, alice, "/gamerule doDaylightCycle false"); got != "Gamerule doDaylightCycle is now set to: false" {
+		t.Fatalf("/gamerule doDaylightCycle false = %q", got)
+	}
+	if srv.DaylightCycle() {
+		t.Fatal("expected DaylightCycle() == false")
+	}
+	if got := ExecuteCommand(srv, alice, "/gamerule doDaylightCycle true"); got != "Gamerule doDaylightCycle is now set to: true" {
+		t.Fatalf("/gamerule doDaylightCycle true = %q", got)
+	}
+	if !srv.DaylightCycle() {
+		t.Fatal("expected DaylightCycle() == true")
+	}
+	if got := ExecuteCommand(srv, alice, "/gamerule doWeatherCycle false"); got != "Gamerule doWeatherCycle is now set to: false" {
+		t.Fatalf("/gamerule doWeatherCycle false = %q", got)
+	}
+	if srv.WeatherCycle() {
+		t.Fatal("expected WeatherCycle() == false")
+	}
+	if got := ExecuteCommand(srv, alice, "/gamerule doWeatherCycle true"); got != "Gamerule doWeatherCycle is now set to: true" {
+		t.Fatalf("/gamerule doWeatherCycle true = %q", got)
 	}
 
 	// /save-all

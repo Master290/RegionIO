@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -115,3 +116,167 @@ func TestTickLoopBroadcastsTime(t *testing.T) {
 		t.Errorf("clock only reached %d ticks; the loop is not advancing it", gameTime)
 	}
 }
+
+func TestDaylightCyclePauseAndResume(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	srv.SetWorldTime(100, 6000)
+
+	srv.SetDaylightCycle(false)
+	if srv.DaylightCycle() {
+		t.Fatal("expected DaylightCycle() = false after SetDaylightCycle(false)")
+	}
+	for i := 0; i < 10; i++ {
+		srv.advanceWorldTime()
+	}
+	gt, dt := srv.WorldTime()
+	if gt != 110 || dt != 6000 {
+		t.Fatalf("after 10 ticks with doDaylightCycle=false: got (%d, %d), want (110, 6000)", gt, dt)
+	}
+
+	srv.SetDaylightCycle(true)
+	for i := 0; i < 5; i++ {
+		srv.advanceWorldTime()
+	}
+	gt, dt = srv.WorldTime()
+	if gt != 115 || dt != 6005 {
+		t.Fatalf("after 5 ticks with doDaylightCycle=true: got (%d, %d), want (115, 6005)", gt, dt)
+	}
+}
+
+func TestWeatherCycleTimersAndGameEvents(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	var rec packetRecorder
+	_, err := srv.RegisterPlayer(Profile{Name: "WeatherWatcher", UUID: OfflineUUID("WeatherWatcher")}, rec.send)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rng := rand.New(rand.NewSource(123))
+	// Initial tick initializes clear-sky delay timers within vanilla ranges.
+	srv.TickWeather(rng)
+	st := srv.Weather()
+	if st.Raining || st.Thundering {
+		t.Fatalf("initial weather = %+v, want clear", st)
+	}
+	if st.RainTime < WeatherClearMinTicks-1 || st.RainTime > WeatherClearMaxTicks {
+		t.Fatalf("initial RainTime = %d, out of vanilla range [%d, %d]", st.RainTime, WeatherClearMinTicks, WeatherClearMaxTicks)
+	}
+
+	// Start rain for 3 ticks and verify BeginRaining (1) + RainLevelChange (7, 1.0).
+	rec.take()
+	srv.SetWeather(WeatherRain, 3)
+	if !srv.IsRaining() || srv.IsThundering() {
+		t.Fatalf("after SetWeather(WeatherRain, 3): raining=%v thundering=%v", srv.IsRaining(), srv.IsThundering())
+	}
+	pkts := rec.take()
+	sawBeginRain := false
+	sawRainLevelOne := false
+	for _, p := range pkts {
+		if p.id == protocol.PlayGameEvent && len(p.body) == 5 {
+			if p.body[0] == GameEventBeginRaining {
+				sawBeginRain = true
+			}
+			if p.body[0] == GameEventRainLevelChange {
+				sawRainLevelOne = true
+			}
+		}
+	}
+	if !sawBeginRain || !sawRainLevelOne {
+		t.Fatalf("expected BeginRaining and RainLevelChange on SetWeather(WeatherRain), got %+v", pkts)
+	}
+
+	// Pause weather cycle -> timers must not advance.
+	srv.SetWeatherCycle(false)
+	srv.TickWeather(rng)
+	if srv.Weather().RainTime != 3 {
+		t.Fatalf("RainTime changed while doWeatherCycle=false: %d, want 3", srv.Weather().RainTime)
+	}
+	srv.SetWeatherCycle(true)
+
+	// Tick 3 times -> rain expires, transitions to clear, and broadcasts EndRaining (2).
+	for i := 0; i < 3; i++ {
+		srv.TickWeather(rng)
+	}
+	if srv.IsRaining() {
+		t.Fatal("expected rain to end after 3 ticks")
+	}
+	pkts = rec.take()
+	sawEndRain := false
+	for _, p := range pkts {
+		if p.id == protocol.PlayGameEvent && len(p.body) == 5 && p.body[0] == GameEventEndRaining {
+			sawEndRain = true
+		}
+	}
+	if !sawEndRain {
+		t.Fatalf("expected EndRaining GameEvent when rain timer expired, got %+v", pkts)
+	}
+
+	// Set thunderstorm and verify both IsRaining and IsThundering are true.
+	srv.SetWeather(WeatherThunder, 100)
+	if !srv.IsRaining() || !srv.IsThundering() {
+		t.Fatalf("expected rain+thunder on WeatherThunder, got raining=%v thundering=%v", srv.IsRaining(), srv.IsThundering())
+	}
+}
+
+func TestSleepAllPlayersSkipsToMorningAndClearsWeather(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	var aliceRec, bobRec packetRecorder
+	alice, err := srv.RegisterPlayer(Profile{Name: "Alice", UUID: OfflineUUID("Alice")}, aliceRec.send)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := srv.RegisterPlayer(Profile{Name: "Bob", UUID: OfflineUUID("Bob")}, bobRec.send)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = srv.SetPlayerGameMode(alice, GameModeSurvival)
+	_ = srv.SetPlayerGameMode(bob, GameModeSurvival)
+
+	// Daytime + clear weather: cannot sleep yet, but respawn point is set.
+	srv.SetWorldTime(100, 1000)
+	slept, skipped := srv.SleepInBed(alice, 12, -60, 15)
+	if slept || skipped {
+		t.Fatalf("expected daytime SleepInBed to fail: slept=%v skipped=%v", slept, skipped)
+	}
+	if snap := alice.Snapshot(); !snap.HasSpawn || snap.SpawnX != 12 || snap.SpawnY != -60 || snap.SpawnZ != 15 {
+		t.Fatalf("expected bed interaction to set spawn point, got %+v", snap)
+	}
+
+	// Set time to night (14000) and start a thunderstorm.
+	srv.SetWorldTime(500, 14000)
+	srv.SetWeather(WeatherThunder, 6000)
+	if !srv.IsNight() || !srv.CanSleep() {
+		t.Fatal("expected IsNight() and CanSleep() to be true at dayTime 14000")
+	}
+
+	// Alice enters bed: 1 of 2 players sleeping -> night is not skipped yet.
+	slept, skipped = srv.SleepInBed(alice, 12, -60, 15)
+	if !slept || skipped {
+		t.Fatalf("Alice SleepInBed = (%v, %v), want (true, false)", slept, skipped)
+	}
+	if !srv.IsPlayerSleeping(alice) {
+		t.Fatal("expected Alice to be marked as sleeping")
+	}
+	if _, dt := srv.WorldTime(); dt != 14000 {
+		t.Fatalf("dayTime changed with only 1 of 2 players sleeping: %d", dt)
+	}
+
+	// Bob enters bed: 2 of 2 players sleeping -> skips to morning (24000) and clears weather!
+	slept, skipped = srv.SleepInBed(bob, 14, -60, 15)
+	if !slept || !skipped {
+		t.Fatalf("Bob SleepInBed = (%v, %v), want (true, true)", slept, skipped)
+	}
+	if _, dt := srv.WorldTime(); dt != TicksPerDay {
+		t.Fatalf("dayTime after all players slept = %d, want %d (morning)", dt, TicksPerDay)
+	}
+	if srv.TimeOfDay() != 0 || srv.IsNight() {
+		t.Fatalf("expected morning (TimeOfDay=0, IsNight=false), got TimeOfDay=%d IsNight=%v", srv.TimeOfDay(), srv.IsNight())
+	}
+	if srv.IsRaining() || srv.IsThundering() {
+		t.Fatalf("expected sleep to clear weather, got raining=%v thundering=%v", srv.IsRaining(), srv.IsThundering())
+	}
+	if srv.IsPlayerSleeping(alice) || srv.IsPlayerSleeping(bob) {
+		t.Fatal("expected all players to wake up after skipping to morning")
+	}
+}
+
