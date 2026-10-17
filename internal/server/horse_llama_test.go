@@ -368,5 +368,27 @@ func TestRedstoneHooksProjectileTargetLightningRodAndMobTripwire(t *testing.T) {
 	if world.BlockProperties(s.chunks.GetBlock(15, 65, 15))["powered"] != "true" {
 		t.Fatalf("expected mob inside minecraft:tripwire to set powered=true")
 	}
+
+	// 4. Non-fire-immune mob inside lit campfire / soul_campfire takes 1.0 / 2.0 contact damage.
+	campSt, ok := world.BlockStateByName("minecraft:soul_campfire", map[string]string{
+		"facing":      "north",
+		"lit":         "true",
+		"signal_fire": "false",
+		"waterlogged": "false",
+	})
+	if !ok {
+		t.Fatalf("missing minecraft:soul_campfire block state")
+	}
+	s.chunks.SetBlock(18, 65, 18, campSt)
+	cowID, err := s.SpawnMob(18.5, 65.0, 18.5, MobTypeCow)
+	if err != nil {
+		t.Fatalf("SpawnMob(cow) failed: %v", err)
+	}
+	beforeHP := s.MobHealth(cowID)
+	s.TickMobsInCauldrons()
+	if got := s.MobHealth(cowID); got != beforeHP-2.0 {
+		t.Fatalf("expected cow on lit soul_campfire to take 2.0 damage: before=%v got=%v", beforeHP, got)
+	}
 }
+
 

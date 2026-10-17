@@ -1349,9 +1349,23 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 	return true, offspringID
 }
 
-// TickMobsInCauldrons checks all mob entities each tick and invokes
-// s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
-// whenever a mob is inside a cauldron block.
+// IsFireImmuneMob reports whether a mob type is naturally immune to fire and
+// campfire contact damage in vanilla 26.1.2.
+func IsFireImmuneMob(typeName string) bool {
+	switch canonicalResourceName(typeName) {
+	case MobTypeWither, MobTypeWitherSkeleton, MobTypeEnderDragon, MobTypeWarden,
+		MobTypeMagmaCube, "minecraft:blaze", "minecraft:ghast", "minecraft:strider",
+		"minecraft:zombified_piglin":
+		return true
+	default:
+		return false
+	}
+}
+
+// TickMobsInCauldrons checks all mob entities each tick and invokes:
+//   - s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
+//   - s.OnEntityStepTripwire(dim, bx, by, bz)
+//   - s.CampfireContactDamageAt(dim, bx, by, bz) for living non-fire-immune mobs
 func (s *Server) TickMobsInCauldrons() {
 	if s == nil || s.entities == nil {
 		return
@@ -1359,7 +1373,9 @@ func (s *Server) TickMobsInCauldrons() {
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		mob := &allEnts[i]
-		if mob.IsItem() || mob.IsExperienceOrb() || mob.TypeName == EntityTypeFishingBobber || IsDecorationEntity(mob.TypeName) {
+		if mob.IsItem() || mob.IsExperienceOrb() || mob.TypeName == EntityTypeFishingBobber || IsDecorationEntity(mob.TypeName) ||
+			IsStandardProjectileEntityType(mob.TypeName) || IsWindChargeEntityType(mob.TypeName) ||
+			mob.TypeName == EntityTypeLlamaSpit || mob.TypeName == EntityTypeLightning || IsVehicleEntity(mob.TypeName) {
 			continue
 		}
 		dim := mob.EffectiveDimension()
@@ -1380,6 +1396,11 @@ func (s *Server) TickMobsInCauldrons() {
 		if world.BlockName(blk) == "minecraft:tripwire" {
 			s.OnEntityStepTripwire(dim, bx, by, bz)
 		}
+		if !IsFireImmuneMob(mob.TypeName) && !s.HasEntityEffect(mob.ID, EffectFireResistance) {
+			if dmg, ok := s.CampfireContactDamageAt(dim, bx, by, bz); ok && dmg > 0 {
+				s.applyDamageToMob(mob, dmg, nil, 0, false, false)
+			}
+		}
 	}
 }
 
@@ -1390,3 +1411,4 @@ func mobAttackCauseName(mobType string) string {
 	}
 	return short
 }
+
