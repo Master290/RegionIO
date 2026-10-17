@@ -1024,6 +1024,7 @@ func (s *Server) applyDamageToMob(
 	}
 
 	if !killed {
+		s.OnEntityDamagedWithEffects(target.ID, false)
 		if attacker != nil {
 			if canonicalResourceName(target.TypeName) == MobTypeWolf {
 				s.ProvokeWildWolf(target.ID, attacker)
@@ -1058,12 +1059,13 @@ func (s *Server) applyDamageToMob(
 		return false
 	}
 
-	// Mob died: broadcast death event + sound, notify raid manager, remove entity, and spawn loot drops (adults only).
+	// Mob died: broadcast death event + sound, trigger death status effects, notify raid manager, remove entity, and spawn loot drops (adults only).
 	deathSnd, deathSrc := mobDeathSound(target.TypeName)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 		EncodeSoundPacket(deathSnd, deathSrc, target.X, target.Y, target.Z, 1.0, 1.0, 0))
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(target.ID, EntityEventDeath))
+	s.OnEntityDiedWithEffects(target.ID)
 	s.OnRaiderKilled(target.ID, attacker)
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,

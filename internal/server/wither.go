@@ -628,6 +628,8 @@ func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float6
 		}
 	}
 
+	s.DamageDecorationsInRadius(normDim, x, y, z, maxRange, float32(radius*7.0), "explosion")
+
 	cache := s.DimensionChunks(normDim)
 	if cache != nil && s.CreeperBlockGriefing() {
 		rInt := int(math.Ceil(radius))

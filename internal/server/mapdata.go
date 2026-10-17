@@ -1977,12 +1977,19 @@ func (s *Server) checkMapBannersAt(cache *world.Cache, data *MapItemSavedData, x
 // AddItemFrameToMap registers an item frame holding mapID so the map displays a green
 // MapDecorationFrame (1) icon at (blockX, blockZ) with the frame's 2D facing rotation.
 func (s *Server) AddItemFrameToMap(mapID, entityID int32, blockX, blockY, blockZ, direction int) {
-	if s == nil {
+	if s == nil || mapID < 0 {
 		return
 	}
 	data, ok := s.GetMapData(mapID)
 	if !ok || data == nil {
-		return
+		dim := world.DimensionOverworld
+		if s.entities != nil {
+			if ent := s.entities.Get(entityID); ent != nil {
+				dim = ent.EffectiveDimension()
+			}
+		}
+		data = NewFreshMapSavedData(mapID, float64(blockX), float64(blockZ), MapMinScale, true, false, dim)
+		s.SetMapData(mapID, data)
 	}
 	rotDeg := directionTo2DMapRotationDegrees(direction)
 	marker := MapFrameMarker{
@@ -2154,6 +2161,27 @@ func (s *Server) TickMaps() {
 		return
 	}
 
+	// Collect map IDs currently displayed in item frames by dimension.
+	var framedMaps []struct {
+		dim   string
+		mapID int32
+	}
+	if dt := s.decorationTracker(); dt != nil {
+		dt.mu.RLock()
+		for _, fst := range dt.itemFrames {
+			if fst != nil && fst.HasMapID && !fst.Item.IsEmpty() {
+				framedMaps = append(framedMaps, struct {
+					dim   string
+					mapID int32
+				}{
+					dim:   world.NormalizeDimension(fst.Dimension),
+					mapID: fst.MapID,
+				})
+			}
+		}
+		dt.mu.RUnlock()
+	}
+
 	st := s.mapStore()
 	for _, p := range players {
 		if p == nil || p.IsDead() {
@@ -2178,6 +2206,20 @@ func (s *Server) TickMaps() {
 			patch := s.UpdateMapTerrainForPlayer(p, data)
 			s.refreshMapDecorations(data)
 			s.sendMapUpdateToPlayer(st, p, data, patch)
+		}
+		// Also sync maps displayed in item frames in the player's dimension.
+		pDim := world.NormalizeDimension(p.Snapshot().Dimension)
+		for _, fm := range framedMaps {
+			if fm.dim != pDim || seen[fm.mapID] {
+				continue
+			}
+			seen[fm.mapID] = true
+			data, exists := s.GetMapData(fm.mapID)
+			if !exists || data == nil {
+				continue
+			}
+			s.refreshMapDecorations(data)
+			s.sendMapUpdateToPlayer(st, p, data, nil)
 		}
 	}
 }

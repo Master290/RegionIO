@@ -379,7 +379,10 @@ type ArmorStandState struct {
 	EquipmentMeta [EquipmentSlotCount]ItemMeta
 	DisabledSlots int32
 	Invisible     bool
+	NoGravity     bool
 	Invulnerable  bool
+	FireTicks     int
+	Health        float32
 	LastHitTick   int64
 }
 
@@ -795,7 +798,10 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 		}
 		st.Item = inserted
 		st.ItemMeta = GetSlotItemMeta(session, slot)
-		if canonicalResourceName(inserted.ResolvedID()) == FilledMapItemID && heldHasMapID {
+		if canonicalResourceName(inserted.ResolvedID()) == FilledMapItemID {
+			if !heldHasMapID {
+				heldMapID = 0
+			}
 			st.MapID = heldMapID
 			st.HasMapID = true
 			framedMapID = heldMapID
@@ -846,6 +852,9 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 	cp := ent.ChunkPos()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 		s.DecorationEntityDataPacket(entityID))
+	if framedHasMap {
+		s.broadcastFramedMapPacket(dim, cp.X, cp.Z, framedMapID)
+	}
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(soundName, SoundSourceBlocks, ent.X+0.5, ent.Y+0.5, ent.Z+0.5, 1.0, 1.0, 0))
 	return true
@@ -899,10 +908,16 @@ func (s *Server) AttackItemFrame(session *PlayerSession, entityID int32) (handle
 			s.RemoveItemFrameFromMap(mapID, entityID, bx, by, bz)
 		}
 
-		s.SpawnItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.25, float64(bz)+0.5, popped)
+		dropEntID, _ := s.SpawnItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.25, float64(bz)+0.5, popped)
+		if hadMap && dropEntID != 0 {
+			s.AssociateDroppedMapEntity(dropEntID, mapID)
+		}
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 			s.DecorationEntityDataPacket(entityID))
+		if hadMap {
+			s.broadcastFramedMapPacket(dim, cp.X, cp.Z, mapID)
+		}
 		rmSound := "minecraft:entity.item_frame.remove_item"
 		if glow {
 			rmSound = "minecraft:entity.glow_item_frame.remove_item"
@@ -1226,6 +1241,7 @@ func (s *Server) SpawnArmorStand(dim string, x, y, z float64, yaw float32) (int3
 		RightArmPose: DefaultArmorStandRArmPose,
 		LeftLegPose:  DefaultArmorStandLLegPose,
 		RightLegPose: DefaultArmorStandRLegPose,
+		Health:       DefaultArmorStandMaxHealth,
 		LastHitTick:  -1000,
 	}
 	dt.mu.Unlock()
@@ -1437,6 +1453,10 @@ func (s *Server) InteractWithArmorStand(session *PlayerSession, entityID int32, 
 			return false
 		}
 		targetSlot = EquipmentSlotForItem(held.ResolvedID())
+		if (targetSlot == EquipmentSlotMainHand || targetSlot == EquipmentSlotOffHand) && (st.Flags&ArmorStandFlagShowArms) == 0 {
+			dt.mu.Unlock()
+			return false
+		}
 	} else {
 		// Empty hand: unequip clicked slot if occupied, else find first occupied slot.
 		if hasClickY {
@@ -1466,14 +1486,14 @@ func (s *Server) InteractWithArmorStand(session *PlayerSession, entityID int32, 
 		}
 	}
 
-	// Check disabled slots mask.
-	if st.DisabledSlots != 0 && (st.DisabledSlots&(1<<targetSlot)) != 0 {
+	prevStandItem := st.Equipment[targetSlot]
+	prevStandMeta := st.EquipmentMeta[targetSlot].Clone()
+
+	// Check disabled slots mask (both simple 1<<slot and vanilla 1<<(slot+8) / 1<<(slot+16)).
+	if IsArmorStandSlotDisabled(st.DisabledSlots, targetSlot, held.IsEmpty(), !prevStandItem.IsEmpty()) {
 		dt.mu.Unlock()
 		return false
 	}
-
-	prevStandItem := st.Equipment[targetSlot]
-	prevStandMeta := st.EquipmentMeta[targetSlot].Clone()
 
 	if held.IsEmpty() {
 		// Unequip from armor stand into player's hand (or inventory).
@@ -1529,19 +1549,23 @@ func (s *Server) InteractWithArmorStand(session *PlayerSession, entityID int32, 
 }
 
 // AttackArmorStand handles a player left-clicking (attacking) an armor stand:
-//   - First hit (or hit > 75 ticks after the previous hit): records the hit tick,
-//     broadcasts EntityEventArmorStandHit (32) and entity.armor_stand.hit sound.
-//   - Second hit within 75 ticks: breaks the armor stand, drops minecraft:armor_stand
-//     and all equipped armor/hand items, and broadcasts entity.armor_stand.break.
+//   - In Creative mode: breaks on the first hit.
+//   - In Survival/Adventure mode:
+//     * First hit (or hit > 75 ticks after the previous hit): records the hit tick,
+//       broadcasts EntityEventArmorStandHit (32) and entity.armor_stand.hit sound.
+//     * Second hit within 75 ticks: breaks the armor stand, drops minecraft:armor_stand
+//       and all equipped armor/hand items, and broadcasts entity.armor_stand.break.
 func (s *Server) AttackArmorStand(session *PlayerSession, entityID int32) (handled bool, broken bool) {
 	if s == nil || s.entities == nil {
 		return false, false
 	}
+	isCreative := false
 	if session != nil {
 		snap := session.Snapshot()
 		if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
 			return false, false
 		}
+		isCreative = snap.GameMode == GameModeCreative
 	}
 	ent := s.entities.Get(entityID)
 	if ent == nil || ent.TypeName != EntityTypeArmorStand {
@@ -1557,7 +1581,7 @@ func (s *Server) AttackArmorStand(session *PlayerSession, entityID int32) (handl
 	dt := s.decorationTracker()
 	dt.mu.Lock()
 	st := dt.armorStands[entityID]
-	if st == nil || st.Invulnerable {
+	if st == nil || st.Invulnerable || (st.Flags&ArmorStandFlagMarker) != 0 {
 		dt.mu.Unlock()
 		return false, false
 	}
@@ -1572,7 +1596,7 @@ func (s *Server) AttackArmorStand(session *PlayerSession, entityID int32) (handl
 	dim := st.Dimension
 	cp := ent.ChunkPos()
 
-	if nowTick-st.LastHitTick > ArmorStandTwoHitWindowTicks {
+	if !isCreative && nowTick-st.LastHitTick > ArmorStandTwoHitWindowTicks {
 		st.LastHitTick = nowTick
 		dt.mu.Unlock()
 
@@ -1587,22 +1611,7 @@ func (s *Server) AttackArmorStand(session *PlayerSession, entityID int32) (handl
 	delete(dt.armorStands, entityID)
 	dt.mu.Unlock()
 
-	s.entities.Remove(entityID)
-	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
-		EncodeEntityEventPacket(entityID, EntityEventArmorStandHit))
-	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
-		encodeRemoveEntitiesPacket(nil, []int32{entityID}))
-	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-		EncodeSoundPacket("minecraft:entity.armor_stand.break", SoundSourceBlocks, ent.X, ent.Y+1.0, ent.Z, 1.0, 1.0, 0))
-
-	if standItem := world.NewNamedItemStack(ArmorStandItemID, 1); !standItem.IsEmpty() {
-		s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, standItem)
-	}
-	for slot := 0; slot < EquipmentSlotCount; slot++ {
-		if !eq[slot].IsEmpty() {
-			s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.5, ent.Z, eq[slot])
-		}
-	}
+	s.destroyArmorStandWithDrops(ent, dim, cp.X, cp.Z, eq, !isCreative)
 	return true, true
 }
 
@@ -1721,6 +1730,16 @@ func (s *Server) CheckHangingSupport(entityID int32) (broken bool) {
 			s.RemoveItemFrameFromMap(mapID, entityID, bx, by, bz)
 		}
 		s.breakAndRemoveItemFrame(ent, glow, contained, true)
+		if hadMap && !contained.IsEmpty() {
+			for _, e := range s.entities.All() {
+				if e.IsItem() && canonicalResourceName(e.Item.ResolvedID()) == FilledMapItemID {
+					if _, exists := s.DroppedMapEntityID(e.ID); !exists {
+						s.AssociateDroppedMapEntity(e.ID, mapID)
+						break
+					}
+				}
+			}
+		}
 		return true
 
 	case EntityTypePainting:
@@ -1775,7 +1794,7 @@ func (s *Server) CheckHangingEntitiesAroundBlock(dim string, x, y, z int) (broke
 }
 
 // TickDecorations ticks support validation for hanging entities (item frames and
-// paintings) and gravity for armor stands.
+// paintings) and gravity + environmental fire/lava damage for armor stands.
 func (s *Server) TickDecorations() {
 	if s == nil || s.entities == nil {
 		return
@@ -1846,33 +1865,7 @@ func (s *Server) TickDecorations() {
 		s.CheckHangingSupport(id)
 	}
 	for _, id := range standIDs {
-		ent := s.entities.Get(id)
-		if ent == nil {
-			continue
-		}
-		cache := s.DimensionChunks(ent.EffectiveDimension())
-		if cache == nil {
-			cache = s.chunks
-		}
-		if cache == nil {
-			continue
-		}
-		yBelow := int(math.Floor(ent.Y - 0.1))
-		blockBelow := cache.GetBlock(int(math.Floor(ent.X)), yBelow, int(math.Floor(ent.Z)))
-		s.entities.Update(id, func(e *world.Entity) {
-			if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
-				e.OnGround = false
-				e.VelocityY -= 80
-				if e.VelocityY < -3000 {
-					e.VelocityY = -3000
-				}
-				e.Y += float64(e.VelocityY) / 8000.0
-			} else {
-				e.OnGround = true
-				e.VelocityY = 0
-				e.Y = float64(yBelow + 1)
-			}
-		})
+		s.tickArmorStandEnvironmentAndGravity(id)
 	}
 }
 
@@ -1979,8 +1972,22 @@ func EncodeItemFrameEntityDataPacket(entityID int32, direction int, item world.I
 // for an item_frame or glow_item_frame, including DataComponentMapID (46) when
 // hasMapID is true and the framed item is minecraft:filled_map.
 func EncodeItemFrameMapEntityDataPacket(entityID int32, direction int, item world.ItemStack, rotation int, mapID int32, hasMapID bool) []byte {
-	w := protocol.NewWriter(36)
+	return EncodeItemFrameFullEntityDataPacket(entityID, direction, item, rotation, mapID, hasMapID, false)
+}
+
+// EncodeItemFrameFullEntityDataPacket encodes ClientboundSetEntityDataPacket (0x63)
+// for an item_frame or glow_item_frame, including optional EntitySharedFlagInvisible
+// at index 0 and DataComponentMapID (46) at index 9.
+func EncodeItemFrameFullEntityDataPacket(entityID int32, direction int, item world.ItemStack, rotation int, mapID int32, hasMapID bool, invisible bool) []byte {
+	w := protocol.NewWriter(40)
 	w.VarInt(entityID)
+
+	if invisible {
+		// Index 0: DATA_SHARED_FLAGS_ID (invisible bit 0x20)
+		w.Byte(EntityDataSharedFlagsID)
+		w.VarInt(EntityDataSerializerByte)
+		w.Byte(EntitySharedFlagInvisible)
+	}
 
 	// Index 8: DATA_DIRECTION
 	w.Byte(EntityDataHangingDirectionID)
@@ -2028,11 +2035,23 @@ func EncodePaintingEntityDataPacket(entityID int32, direction int, variantRegist
 
 // EncodeArmorStandEntityDataPacket encodes ClientboundSetEntityDataPacket (0x63)
 // for an armor_stand in protocol 775:
-//   - index 15 (BYTE, serializer 0): flags (small, showArms, noBasePlate, marker)
+//   - index 0 (BYTE, serializer 0): shared entity flags (onFire 0x01, invisible 0x20)
+//   - index 5 (BOOLEAN, serializer 8): noGravity
+//   - index 15 (BYTE, serializer 0): client flags (small, showArms, noBasePlate, marker)
 //   - indices 16..21 (ROTATIONS, serializer 9): 6 x (3 x Float32) poses
 func EncodeArmorStandEntityDataPacket(st ArmorStandState) []byte {
-	w := protocol.NewWriter(96)
+	w := protocol.NewWriter(104)
 	w.VarInt(st.EntityID)
+
+	// Index 0: DATA_SHARED_FLAGS_ID (invisible / on fire)
+	w.Byte(EntityDataSharedFlagsID)
+	w.VarInt(EntityDataSerializerByte)
+	w.Byte(st.SharedEntityFlagsByte())
+
+	// Index 5: DATA_NO_GRAVITY
+	w.Byte(EntityDataNoGravityID)
+	w.VarInt(EntityDataSerializerBool)
+	w.Bool(st.NoGravity)
 
 	// Index 15: DATA_CLIENT_FLAGS
 	w.Byte(EntityDataArmorStandFlagsID)
@@ -2098,7 +2117,7 @@ func (s *Server) DecorationEntityDataPacket(entityID int32) []byte {
 	defer dt.mu.RUnlock()
 
 	if st := dt.itemFrames[entityID]; st != nil {
-		return EncodeItemFrameMapEntityDataPacket(entityID, st.Direction, st.Item, st.Rotation, st.MapID, st.HasMapID)
+		return EncodeItemFrameFullEntityDataPacket(entityID, st.Direction, st.Item, st.Rotation, st.MapID, st.HasMapID, st.Invisible)
 	}
 	if pt := dt.paintings[entityID]; pt != nil {
 		return EncodePaintingEntityDataPacket(entityID, pt.Direction, pt.Variant.RegistryIndex)
@@ -2161,12 +2180,18 @@ func (s *Server) SaveDecorationsToNBT() *nbt.Compound {
 		if st.Fixed {
 			c.Set("Fixed", nbt.Byte(1))
 		}
+		if st.Invisible {
+			c.Set("Invisible", nbt.Byte(1))
+		}
 		if !st.Item.IsEmpty() {
 			itemTag := nbt.NewCompound()
 			itemTag.Set("id", nbt.String(st.Item.ResolvedID()))
 			itemTag.Set("count", nbt.Int(st.Item.Count))
 			if st.HasMapID {
 				itemTag.Set("map", nbt.Int(st.MapID))
+				comps := nbt.NewCompound()
+				comps.Set("minecraft:map_id", nbt.Int(st.MapID))
+				itemTag.Set("components", comps)
 			}
 			c.Set("Item", itemTag)
 		}
@@ -2194,27 +2219,7 @@ func (s *Server) SaveDecorationsToNBT() *nbt.Compound {
 			continue
 		}
 		c := nbt.NewCompound()
-		c.Set("id", nbt.String(EntityTypeArmorStand))
-		c.Set("Dimension", nbt.String(world.NormalizeDimension(as.Dimension)))
-		c.Set("X", nbt.Double(ent.X))
-		c.Set("Y", nbt.Double(ent.Y))
-		c.Set("Z", nbt.Double(ent.Z))
-		c.Set("Yaw", nbt.Float(ent.Yaw))
-		c.Set("Flags", nbt.Byte(int8(as.Flags)))
-		c.Set("DisabledSlots", nbt.Int(as.DisabledSlots))
-
-		var eqElems []nbt.Tag
-		for slot := 0; slot < EquipmentSlotCount; slot++ {
-			st := as.Equipment[slot]
-			slotTag := nbt.NewCompound()
-			slotTag.Set("Slot", nbt.Byte(int8(slot)))
-			if !st.IsEmpty() {
-				slotTag.Set("id", nbt.String(st.ResolvedID()))
-				slotTag.Set("count", nbt.Int(st.Count))
-			}
-			eqElems = append(eqElems, slotTag)
-		}
-		c.Set("Equipment", nbt.List{ElemID: nbt.TagCompound, Elems: eqElems})
+		WriteArmorStandFieldsToNBT(c, as, ent)
 		elems = append(elems, c)
 	}
 
@@ -2261,6 +2266,7 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 			dir := int(nbtByteField(c, "Facing"))
 			rot := int(nbtByteField(c, "ItemRotation"))
 			fixed := nbtByteField(c, "Fixed") != 0
+			invisible := nbtByteField(c, "Invisible") != 0
 
 			entID, err := s.SpawnItemFrame(dim, bx, by, bz, dir, glow)
 			if err != nil || entID == 0 {
@@ -2280,6 +2286,16 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 					if _, hasMap := itemComp.Get("map"); hasMap {
 						mapID = nbtIntField(itemComp, "map")
 						hasMapID = true
+					} else if compsRaw, hasComps := itemComp.Get("components"); hasComps {
+						if comps, ok := compsRaw.(*nbt.Compound); ok && comps != nil {
+							if _, hasMapComp := comps.Get("minecraft:map_id"); hasMapComp {
+								mapID = nbtIntField(comps, "minecraft:map_id")
+								hasMapID = true
+							}
+						}
+					} else if canonicalResourceName(itemName) == FilledMapItemID {
+						mapID = 0
+						hasMapID = true
 					}
 				}
 			}
@@ -2291,6 +2307,7 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 				st.HasMapID = hasMapID
 				st.Rotation = rot % ItemFrameRotationSteps
 				st.Fixed = fixed
+				st.Invisible = invisible
 			}
 			dt.mu.Unlock()
 			if hasMapID {
@@ -2318,8 +2335,6 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 			y := nbtDoubleField(c, "Y")
 			z := nbtDoubleField(c, "Z")
 			yaw := nbtFloatField(c, "Yaw")
-			flags := byte(nbtByteField(c, "Flags"))
-			disabled := nbtIntField(c, "DisabledSlots")
 
 			entID, err := s.SpawnArmorStand(dim, x, y, z, yaw)
 			if err != nil || entID == 0 {
@@ -2328,26 +2343,7 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 			dt := s.decorationTracker()
 			dt.mu.Lock()
 			if st := dt.armorStands[entID]; st != nil {
-				if flags != 0 {
-					st.Flags = flags
-				}
-				st.DisabledSlots = disabled
-				if eqRaw, hasEq := c.Get("Equipment"); hasEq {
-					if eqList, ok := eqRaw.(nbt.List); ok {
-						for _, slotElem := range eqList.Elems {
-							sc, ok := slotElem.(*nbt.Compound)
-							if !ok || sc == nil {
-								continue
-							}
-							slotIdx := int(nbtByteField(sc, "Slot"))
-							itemName := nbtStringField(sc, "id")
-							count := nbtIntField(sc, "count")
-							if slotIdx >= 0 && slotIdx < EquipmentSlotCount && itemName != "" && count > 0 {
-								st.Equipment[slotIdx] = world.NewNamedItemStack(itemName, count)
-							}
-						}
-					}
-				}
+				ReadArmorStandFieldsFromNBT(c, st)
 			}
 			dt.mu.Unlock()
 			loaded++

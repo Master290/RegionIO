@@ -1266,7 +1266,7 @@ func (s *Server) DetonateFireworkRocket(entityID int32) (playersHit, mobsHit int
 			for i := range nearby {
 				ent := &nearby[i]
 				if ent.ID == entityID || ent.IsItem() || ent.IsExperienceOrb() ||
-					ent.TypeName == EntityTypeFireworkRocket || IsDecorationEntity(ent.TypeName) {
+					ent.TypeName == EntityTypeFireworkRocket || IsHangingEntity(ent.TypeName) {
 					continue
 				}
 				if ent.EffectiveDimension() != st.Dimension {
@@ -1284,6 +1284,11 @@ func (s *Server) DetonateFireworkRocket(entityID int32) (playersHit, mobsHit int
 					continue
 				}
 				switch ent.TypeName {
+				case EntityTypeArmorStand:
+					if handled, _ := s.DamageArmorStand(ent.ID, dmg, "firework", st.ShooterPlayer); handled {
+						mobsHit++
+					}
+					continue
 				case MobTypeWither:
 					s.DamageWither(ent.ID, dmg, st.ShooterPlayer, true)
 				case MobTypeEnderDragon:
