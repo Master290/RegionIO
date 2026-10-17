@@ -342,6 +342,8 @@ type ItemFrameState struct {
 	Direction      int // 0..5
 	Item           world.ItemStack
 	ItemMeta       ItemMeta
+	MapID          int32
+	HasMapID       bool
 	Rotation       int // 0..7
 	Fixed          bool
 	Invisible      bool
@@ -759,6 +761,9 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 		return false
 	}
 
+	slot, held := session.handSlotAndStack(hand)
+	heldMapID, heldHasMapID := GetSlotMapID(session, slot)
+
 	dt := s.decorationTracker()
 	dt.mu.Lock()
 	st := dt.itemFrames[entityID]
@@ -770,9 +775,12 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 	var soundName string
 	glow := st.Glow
 	dim := st.Dimension
+	bx, by, bz := st.BlockX, st.BlockY, st.BlockZ
+	dir := st.Direction
+	framedMapID := int32(0)
+	framedHasMap := false
 
 	if st.Item.IsEmpty() {
-		slot, held := session.handSlotAndStack(hand)
 		if held.IsEmpty() {
 			dt.mu.Unlock()
 			return false
@@ -787,8 +795,21 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 		}
 		st.Item = inserted
 		st.ItemMeta = GetSlotItemMeta(session, slot)
+		if canonicalResourceName(inserted.ResolvedID()) == FilledMapItemID && heldHasMapID {
+			st.MapID = heldMapID
+			st.HasMapID = true
+			framedMapID = heldMapID
+			framedHasMap = true
+		} else {
+			st.MapID = 0
+			st.HasMapID = false
+		}
 		st.Rotation = 0
 		dt.mu.Unlock()
+
+		if framedHasMap {
+			s.AddItemFrameToMap(framedMapID, entityID, bx, by, bz, dir)
+		}
 
 		// Consume 1 item from the player's hand when in survival/adventure, or when stack has 1 item in tests.
 		if snap.GameMode != GameModeCreative {
@@ -796,6 +817,7 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 			if rem <= 0 {
 				session.SetInventorySlot(slot, world.ItemStack{})
 				SetSlotItemMeta(session, slot, ItemMeta{})
+				ClearSlotMapID(session, slot)
 			} else {
 				session.SetInventorySlot(slot, world.NewItemStack(held.ResolvedItemID(), rem))
 			}
@@ -807,7 +829,13 @@ func (s *Server) InteractWithItemFrame(session *PlayerSession, entityID int32, h
 		}
 	} else {
 		st.Rotation = (st.Rotation + 1) % ItemFrameRotationSteps
+		framedMapID = st.MapID
+		framedHasMap = st.HasMapID
 		dt.mu.Unlock()
+
+		if framedHasMap {
+			s.AddItemFrameToMap(framedMapID, entityID, bx, by, bz, dir)
+		}
 
 		soundName = "minecraft:entity.item_frame.rotate_item"
 		if glow {
@@ -858,10 +886,18 @@ func (s *Server) AttackItemFrame(session *PlayerSession, entityID int32) (handle
 
 	if !st.Item.IsEmpty() {
 		popped := st.Item
+		hadMap := st.HasMapID
+		mapID := st.MapID
 		st.Item = world.ItemStack{}
 		st.ItemMeta = ItemMeta{}
+		st.MapID = 0
+		st.HasMapID = false
 		st.Rotation = 0
 		dt.mu.Unlock()
+
+		if hadMap {
+			s.RemoveItemFrameFromMap(mapID, entityID, bx, by, bz)
+		}
 
 		s.SpawnItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.25, float64(bz)+0.5, popped)
 		cp := ent.ChunkPos()
@@ -1675,9 +1711,15 @@ func (s *Server) CheckHangingSupport(entityID int32) (broken bool) {
 		}
 		glow := st.Glow
 		contained := st.Item
+		hadMap := st.HasMapID
+		mapID := st.MapID
+		bx, by, bz := st.BlockX, st.BlockY, st.BlockZ
 		delete(dt.itemFrames, entityID)
 		dt.mu.Unlock()
 
+		if hadMap {
+			s.RemoveItemFrameFromMap(mapID, entityID, bx, by, bz)
+		}
 		s.breakAndRemoveItemFrame(ent, glow, contained, true)
 		return true
 
@@ -1930,7 +1972,14 @@ func (s *Server) EncodeDecorationAddEntityPacket(dst []byte, e *world.Entity) []
 //   - index 9 (ITEM_STACK, serializer 7): OptionalItemStack
 //   - index 10 (INT, serializer 1): VarInt(rotation)
 func EncodeItemFrameEntityDataPacket(entityID int32, direction int, item world.ItemStack, rotation int) []byte {
-	w := protocol.NewWriter(32)
+	return EncodeItemFrameMapEntityDataPacket(entityID, direction, item, rotation, 0, false)
+}
+
+// EncodeItemFrameMapEntityDataPacket encodes ClientboundSetEntityDataPacket (0x63)
+// for an item_frame or glow_item_frame, including DataComponentMapID (46) when
+// hasMapID is true and the framed item is minecraft:filled_map.
+func EncodeItemFrameMapEntityDataPacket(entityID int32, direction int, item world.ItemStack, rotation int, mapID int32, hasMapID bool) []byte {
+	w := protocol.NewWriter(36)
 	w.VarInt(entityID)
 
 	// Index 8: DATA_DIRECTION
@@ -1941,15 +1990,7 @@ func EncodeItemFrameEntityDataPacket(entityID int32, direction int, item world.I
 	// Index 9: DATA_ITEM
 	w.Byte(EntityDataItemFrameItemID)
 	w.VarInt(EntityDataSerializerItemStack)
-	itemID := item.ResolvedItemID()
-	if item.IsEmpty() || itemID <= 0 {
-		w.VarInt(0)
-	} else {
-		w.VarInt(item.Count)
-		w.VarInt(itemID)
-		w.VarInt(0) // added components
-		w.VarInt(0) // removed components
-	}
+	EncodeSlotWithMapID(w, item, mapID, hasMapID)
 
 	// Index 10: DATA_ROTATION
 	w.Byte(EntityDataItemFrameRotID)
@@ -2057,7 +2098,7 @@ func (s *Server) DecorationEntityDataPacket(entityID int32) []byte {
 	defer dt.mu.RUnlock()
 
 	if st := dt.itemFrames[entityID]; st != nil {
-		return EncodeItemFrameEntityDataPacket(entityID, st.Direction, st.Item, st.Rotation)
+		return EncodeItemFrameMapEntityDataPacket(entityID, st.Direction, st.Item, st.Rotation, st.MapID, st.HasMapID)
 	}
 	if pt := dt.paintings[entityID]; pt != nil {
 		return EncodePaintingEntityDataPacket(entityID, pt.Direction, pt.Variant.RegistryIndex)
@@ -2124,6 +2165,9 @@ func (s *Server) SaveDecorationsToNBT() *nbt.Compound {
 			itemTag := nbt.NewCompound()
 			itemTag.Set("id", nbt.String(st.Item.ResolvedID()))
 			itemTag.Set("count", nbt.Int(st.Item.Count))
+			if st.HasMapID {
+				itemTag.Set("map", nbt.Int(st.MapID))
+			}
 			c.Set("Item", itemTag)
 		}
 		elems = append(elems, c)
@@ -2223,6 +2267,8 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 				continue
 			}
 			var itemStack world.ItemStack
+			var mapID int32
+			var hasMapID bool
 			if itemRaw, hasItem := c.Get("Item"); hasItem {
 				if itemComp, ok := itemRaw.(*nbt.Compound); ok && itemComp != nil {
 					itemName := nbtStringField(itemComp, "id")
@@ -2231,16 +2277,25 @@ func (s *Server) LoadDecorationsFromNBT(root *nbt.Compound) (loaded int) {
 						count = 1
 					}
 					itemStack = world.NewNamedItemStack(itemName, count)
+					if _, hasMap := itemComp.Get("map"); hasMap {
+						mapID = nbtIntField(itemComp, "map")
+						hasMapID = true
+					}
 				}
 			}
 			dt := s.decorationTracker()
 			dt.mu.Lock()
 			if st := dt.itemFrames[entID]; st != nil {
 				st.Item = itemStack
+				st.MapID = mapID
+				st.HasMapID = hasMapID
 				st.Rotation = rot % ItemFrameRotationSteps
 				st.Fixed = fixed
 			}
 			dt.mu.Unlock()
+			if hasMapID {
+				s.AddItemFrameToMap(mapID, entID, bx, by, bz, dir)
+			}
 			loaded++
 
 		case EntityTypePainting:

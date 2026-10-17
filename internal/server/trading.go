@@ -1010,7 +1010,8 @@ func (s *Server) recomputeMerchantResultLocked(tr *playerContainerTracker, offer
 }
 
 // HandleMerchantContainerClick processes a container_click on a merchant window
-// (MenuTypeMerchant), or delegates to HandleContainerClick for all other menus.
+// (MenuTypeMerchant), a cartography table (MenuTypeCartographyTable), or
+// delegates to HandleContainerClick for all other menus.
 // This allows play.go (or tests) to call HandleMerchantContainerClick for all
 // container click packets without needing to edit containers.go.
 func (s *Server) HandleMerchantContainerClick(session *PlayerSession, containerID int32, slot int, button int8, mode int32) error {
@@ -1019,8 +1020,13 @@ func (s *Server) HandleMerchantContainerClick(session *PlayerSession, containerI
 	}
 	if containerID != 0 && slot != -999 {
 		open := session.OpenContainer()
-		if open != nil && open.ContainerID == containerID && open.MenuType == MenuTypeMerchant {
-			return s.handleMerchantClick(session, containerID, slot, button, mode)
+		if open != nil && open.ContainerID == containerID {
+			if open.MenuType == MenuTypeMerchant {
+				return s.handleMerchantClick(session, containerID, slot, button, mode)
+			}
+			if open.MenuType == MenuTypeCartographyTable {
+				return s.HandleCartographyContainerClick(session, containerID, slot, button, mode)
+			}
 		}
 	}
 	return s.HandleContainerClick(session, containerID, slot, button, mode)

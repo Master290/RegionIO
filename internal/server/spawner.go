@@ -53,6 +53,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 		case <-ctx.Done():
 			_ = s.SaveFurnaces()
 			_ = s.SaveDecorationsFile()
+			_ = s.SaveAllMaps()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -63,12 +64,14 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 						log.Warn("saving world clock", "err", err)
 					}
 					_ = s.SaveDecorationsFile()
+					_ = s.SaveAllMaps()
 				}
 			}
 			s.TickWeather(rng)
 			s.TrySkipNightBySleep()
 			s.TickAllPlayersHunger()
 			s.TickVillagers()
+			s.TickMaps()
 			tracker.TickAndBroadcast(s, rng)
 		}
 	}
