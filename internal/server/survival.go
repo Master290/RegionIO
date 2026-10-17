@@ -1238,7 +1238,26 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 	}
 
 	switch itemID {
-	case "minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl", "minecraft:wind_charge":
+	case WindChargeItemID:
+		if chargeID, used := s.UseWindChargeItem(session, hand); used {
+			s.RecordItemUsed(session, itemID, 1)
+			s.EmitVibration(VibrationEvent{
+				Dimension:          snap.Dimension,
+				Type:               GameEventProjectileShoot,
+				X:                  snap.X,
+				Y:                  snap.Y + 1.5,
+				Z:                  snap.Z,
+				SourceEntityID:     snap.EntityID,
+				ProjectileEntityID: chargeID,
+				Player:             session,
+				Sneaking:           session.IsSneaking(),
+				BlockOrItemID:      WindChargeItemID,
+			})
+			return true
+		}
+		return false
+
+	case "minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl":
 		if !s.consumeHandItemOne(session, hand) {
 			return false
 		}

@@ -991,6 +991,11 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case server.PlayPlayerCommandSB:
 		if h.srv != nil {
+			if _, action, jumpBoost, decErr := server.DecodePlayerCommandPacket(pkt.Body()); decErr == nil && action == 5 && h.session != nil {
+				if camelID := h.srv.PlayerMountedCamel(h.session); camelID > 0 && h.srv.CamelDriver(camelID) == h.session.EntityID {
+					_, _, _, _ = h.srv.ExecuteCamelDash(camelID, int(jumpBoost))
+				}
+			}
 			_ = h.srv.HandlePlayerCommandPacket(h.session, pkt.Body())
 			if h.session != nil && !h.srv.IsPlayerSleeping(h.session) {
 				h.srv.ClearPlayerBedOccupancy(h.session)
@@ -1695,6 +1700,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 							customName = server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName
 						}
 						h.srv.OnBrewingStandPlacedInDim(dim, px, py, pz, customName)
+					}
+					if blockName == "minecraft:sniffer_egg" && h.srv != nil {
+						h.srv.PlaceSnifferEgg(dim, px, py, pz)
 					}
 					if h.session != nil {
 						h.srv.RecordItemUsed(h.session, blockName, 1)

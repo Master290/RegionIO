@@ -1024,6 +1024,93 @@ func (s *Server) MountEntityOnVehicle(passengerEntityID, vehicleID int32) (seatI
 	return seatIndex, true
 }
 
+// PlayerMountedCamel returns the entity ID of the Camel currently ridden by
+// session, or 0 if session is not riding a Camel.
+func (s *Server) PlayerMountedCamel(session *PlayerSession) int32 {
+	if s == nil || session == nil {
+		return 0
+	}
+	pid := session.EntityID
+	mgr := s.camelManager()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	for camelID, st := range mgr.camels {
+		if st == nil {
+			continue
+		}
+		for _, r := range st.Passengers {
+			if r == pid {
+				return camelID
+			}
+		}
+	}
+	return 0
+}
+
+// DismountPlayerFromAllCamels removes playerEntityID from any Camel's passenger
+// list and broadcasts updated SetPassengers packets.
+func (s *Server) DismountPlayerFromAllCamels(playerEntityID int32) bool {
+	if s == nil {
+		return false
+	}
+	mgr := s.camelManager()
+	mgr.mu.RLock()
+	var camelIDs []int32
+	for cid, st := range mgr.camels {
+		if st == nil {
+			continue
+		}
+		for _, r := range st.Passengers {
+			if r == playerEntityID {
+				camelIDs = append(camelIDs, cid)
+				break
+			}
+		}
+	}
+	mgr.mu.RUnlock()
+	if len(camelIDs) == 0 {
+		return false
+	}
+	dismounted := false
+	if sess := s.playerByEntityID(playerEntityID); sess != nil {
+		for _, cid := range camelIDs {
+			if s.DismountCamel(sess, cid) {
+				dismounted = true
+			}
+		}
+		return dismounted
+	}
+	for _, cid := range camelIDs {
+		mgr.mu.Lock()
+		st := mgr.camels[cid]
+		var passengersCopy []int32
+		removed := false
+		if st != nil {
+			for i, r := range st.Passengers {
+				if r == playerEntityID {
+					st.Passengers = append(st.Passengers[:i], st.Passengers[i+1:]...)
+					removed = true
+					break
+				}
+			}
+			passengersCopy = make([]int32, len(st.Passengers))
+			copy(passengersCopy, st.Passengers)
+		}
+		mgr.mu.Unlock()
+		if removed {
+			dismounted = true
+			if s.entities != nil {
+				if ent := s.entities.Get(cid); ent != nil {
+					cp := ent.ChunkPos()
+					s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySetPassengersCB,
+						EncodeSetPassengersPacket(cid, passengersCopy))
+				}
+			}
+		}
+	}
+	return dismounted
+}
+
 // DismountPlayerVehicle dismounts session from any vehicle they are currently
 // riding (including Minecarts, Boats, and Camels), places the player at a safe
 // dismount position, broadcasts SetPassengers, and emits GameEventEntityDismount.
@@ -1031,12 +1118,19 @@ func (s *Server) DismountPlayerVehicle(session *PlayerSession) bool {
 	if s == nil || session == nil {
 		return false
 	}
+	camelDismounted := false
+	if camelID := s.PlayerMountedCamel(session); camelID > 0 {
+		camelDismounted = s.DismountCamel(session, camelID)
+	} else if s.DismountPlayerFromAllCamels(session.EntityID) {
+		camelDismounted = true
+	}
+
 	mgr := s.vehicleManager()
 	mgr.mu.Lock()
 	vehicleID, mounted := mgr.byPassengerPlayer[session]
 	if !mounted || vehicleID <= 0 {
 		mgr.mu.Unlock()
-		return false
+		return camelDismounted
 	}
 	delete(mgr.byPassengerPlayer, session)
 	pid := session.EntityID
@@ -1250,7 +1344,7 @@ func (s *Server) HandlePlayerInputPacket(session *PlayerSession, r *protocol.Rea
 	session.SetSprinting(in.Sprint)
 
 	if in.Shift {
-		if s.PlayerMountedVehicle(session) != 0 {
+		if s.PlayerMountedVehicle(session) != 0 || s.PlayerMountedCamel(session) != 0 {
 			s.DismountPlayerVehicle(session)
 		}
 	}
@@ -1302,10 +1396,9 @@ func (s *Server) HandlePaddleBoatPacket(session *PlayerSession, r *protocol.Read
 }
 
 // HandleMoveVehiclePacket processes a ServerboundMoveVehiclePacket (0x22) from
-// the controlling passenger of a boat or minecart, validating movement,
-// applying rail/water/ice constraints, syncing passenger coordinates, awarding
-// distance stats (StatBoatOneCm / StatMinecartOneCm), and broadcasting the
-// vehicle's updated position.
+// the controlling passenger of a boat, minecart, or camel, validating movement,
+// applying rail/water/ice/step-height constraints, syncing passenger coordinates,
+// awarding distance stats, and broadcasting the vehicle's updated position.
 func (s *Server) HandleMoveVehiclePacket(session *PlayerSession, r *protocol.Reader) error {
 	nx, ny, nz, yaw, pitch, _, err := DecodeMoveVehiclePacket(r)
 	if err != nil {
@@ -1320,6 +1413,9 @@ func (s *Server) HandleMoveVehiclePacket(session *PlayerSession, r *protocol.Rea
 	}
 	vehID := s.PlayerMountedVehicle(session)
 	if vehID <= 0 {
+		if camelID := s.PlayerMountedCamel(session); camelID > 0 && s.CamelDriver(camelID) == session.EntityID {
+			return s.handleMoveMountedCamel(session, camelID, nx, ny, nz, yaw, pitch)
+		}
 		return nil
 	}
 	ent := s.entities.Get(vehID)
@@ -1394,6 +1490,63 @@ func (s *Server) HandleMoveVehiclePacket(session *PlayerSession, r *protocol.Rea
 	}
 
 	if updated := s.entities.Get(vehID); updated != nil {
+		cp := updated.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayMoveVehicle, EncodeMoveVehiclePacket(nx, ny, nz, yaw, pitch))
+	}
+	return nil
+}
+
+func (s *Server) handleMoveMountedCamel(session *PlayerSession, camelID int32, nx, ny, nz float64, yaw, pitch float32) error {
+	if s == nil || s.entities == nil || session == nil {
+		return nil
+	}
+	ent := s.entities.Get(camelID)
+	if ent == nil {
+		return nil
+	}
+	oldX, oldY, oldZ := ent.X, ent.Y, ent.Z
+	dx := nx - oldX
+	dy := ny - oldY
+	dz := nz - oldZ
+	if dx*dx+dy*dy+dz*dz > 100.0 {
+		if session.send != nil {
+			_ = session.send(protocol.PlayMoveVehicle, EncodeMoveVehiclePacket(oldX, oldY, oldZ, ent.Yaw, ent.Pitch))
+		}
+		return nil
+	}
+	dim := ent.EffectiveDimension()
+	if cache := s.DimensionChunks(dim); cache != nil {
+		curBX, curBZ := int(math.Floor(oldX)), int(math.Floor(oldZ))
+		candBX, candBZ := int(math.Floor(nx)), int(math.Floor(nz))
+		feetY := int(math.Floor(oldY + 0.01))
+		if candBX != curBX || candBZ != curBZ {
+			if stepY, ok := ResolveCamelStepMove(cache, curBX, feetY, curBZ, candBX, candBZ); ok {
+				if float64(stepY) > ny {
+					ny = float64(stepY)
+				}
+			}
+		}
+	}
+	vx, vy, vz := nx-oldX, ny-oldY, nz-oldZ
+	s.entities.Update(camelID, func(e *world.Entity) {
+		e.X = nx
+		e.Y = ny
+		e.Z = nz
+		e.Yaw = yaw
+		e.Pitch = pitch
+		e.HeadYaw = yaw
+		e.VelocityX = clampVelocityShort(vx)
+		e.VelocityY = clampVelocityShort(vy)
+		e.VelocityZ = clampVelocityShort(vz)
+	})
+	for _, pid := range s.CamelPassengers(camelID) {
+		if rider := s.playerByEntityID(pid); rider != nil {
+			rs := rider.Snapshot()
+			s.SetPlayerTransform(rider, nx, ny, nz, rs.Yaw, rs.Pitch, false)
+		}
+	}
+	if updated := s.entities.Get(camelID); updated != nil {
 		cp := updated.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayMoveVehicle, EncodeMoveVehiclePacket(nx, ny, nz, yaw, pitch))
