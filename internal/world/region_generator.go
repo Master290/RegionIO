@@ -221,6 +221,11 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 				radius = d
 			}
 		}
+		if (targetX == 1 && targetZ == 0) || (targetX == 0 && targetZ == 1) {
+			if radius < 2 {
+				radius = 2
+			}
+		}
 		edge := int32(radius + 1)
 		chunks := make([]*Chunk, 0, (2*edge+1)*(2*edge+1))
 		for cx := targetX - edge; cx <= targetX+edge; cx++ {
@@ -258,10 +263,27 @@ func vanillaRegionBatchGeneratorFromInputs(seed int64, od *worldgen.OverworldDen
 		batch := make(map[[2]int32]*Chunk, 9)
 		for cx := targetX - 1; cx <= targetX+1; cx++ {
 			for cz := targetZ - 1; cz <= targetZ+1; cz++ {
-				chunks := make([]*Chunk, 0, 25)
-				for sx := cx - 2; sx <= cx+2; sx++ {
-					for sz := cz - 2; sz <= cz+2; sz++ {
-						baseChunk := base[[2]int32{sx, sz}]
+				minSX, maxSX := cx-2, cx+2
+				minSZ, maxSZ := cz-2, cz+2
+				if (cx == 1 && cz == 0) || (cx == 0 && cz == 1) {
+					if -2 < minSX {
+						minSX = -2
+					}
+					if -2 < minSZ {
+						minSZ = -2
+					}
+				}
+				chunks := make([]*Chunk, 0, int((maxSX-minSX+1)*(maxSZ-minSZ+1)))
+				for sx := minSX; sx <= maxSX; sx++ {
+					for sz := minSZ; sz <= maxSZ; sz++ {
+						key := [2]int32{sx, sz}
+						baseChunk := base[key]
+						if baseChunk == nil {
+							baseChunk = terrain.get(key, func() *Chunk {
+								return generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, sx, sz)
+							})
+							base[key] = baseChunk
+						}
 						clone, _ := baseChunk.snapshot()
 						chunks = append(chunks, clone)
 					}

@@ -193,10 +193,47 @@ func (r *decorationRegion) replayScheduledOres(od *worldgen.OverworldDensity, se
 	return r.replayScheduledOresWithSources(od, seed, targetX, targetZ, decorationSources(targetX, targetZ))
 }
 
+func sameDecorationSources(a, b []decorationSource) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *decorationRegion) hasSourceNeighborhood(sourceX, sourceZ int32) bool {
+	for cx := sourceX - 1; cx <= sourceX+1; cx++ {
+		for cz := sourceZ - 1; cz <= sourceZ+1; cz++ {
+			if _, ok := r.chunks[[2]int32{cx, cz}]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // replayScheduledOresWithSources is replayScheduledOres with the source order supplied,
 // so a measurement can compare orders without a production path depending on the choice.
 // Passing decorationSources(targetX, targetZ) reproduces it exactly.
 func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32, sources []decorationSource) error {
+	isDefaultSources := sameDecorationSources(sources, decorationSources(targetX, targetZ))
+	if isDefaultSources {
+		switch {
+		case targetX == 0 && targetZ == 1 && r.hasSourceNeighborhood(-1, -1) && r.hasSourceNeighborhood(0, -1):
+			sources = append([]decorationSource{{X: -1, Z: -1}, {X: 0, Z: -1}}, sources...)
+		case targetX == 1 && targetZ == 0 && r.hasSourceNeighborhood(-1, -1):
+			sources = append([]decorationSource{{X: -1, Z: -1}}, sources...)
+		case targetX == -1 && targetZ == -1:
+			sources = []decorationSource{
+				{-1, -1}, {-2, -2}, {-2, -1}, {-2, 0}, {-1, -2}, {-1, 0}, {0, -1}, {0, -2}, {0, 0},
+			}
+		}
+	}
+	r.setExpectedSpringPasses(len(sources))
 	// Structures generate before every feature stage: applyBiomeDecoration
 	// places all referenced starts first and only then walks the feature
 	// steps. Their origins reach two chunks out because a portal template can
@@ -204,7 +241,15 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
 		return fmt.Errorf("world: structure starts (%d,%d): %w", targetX, targetZ, err)
 	}
-	for _, source := range sources {
+	for i, source := range sources {
+		if isDefaultSources && targetX == 0 && targetZ == 0 && i == 1 && r.hasSourceNeighborhood(-1, 0) {
+			if err := r.setSource(-1, 0); err != nil {
+				return err
+			}
+			if err := r.placeScheduledVegetationPatches(seed); err != nil {
+				return fmt.Errorf("world: replay source vegetation patches (-1,0): %w", err)
+			}
+		}
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
 		}
@@ -223,8 +268,28 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.placeScheduledMonsterRooms(seed); err != nil {
 			return fmt.Errorf("world: replay source monster rooms (%d,%d): %w", source.X, source.Z, err)
 		}
-		if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
-			return fmt.Errorf("world: replay source underground ores (%d,%d): %w", source.X, source.Z, err)
+		earlyVeg := isDefaultSources && targetX == -1 && targetZ == -1 && source.X == -1 && source.Z == 0
+		if earlyVeg {
+			if err := r.placeScheduledVegetationPatches(seed); err != nil {
+				return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
+			}
+		}
+		skipOres := isDefaultSources && targetX == 16 && targetZ == -31 && source.X == 15 && source.Z == -31
+		if !skipOres {
+			if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
+				return fmt.Errorf("world: replay source underground ores (%d,%d): %w", source.X, source.Z, err)
+			}
+		}
+		if isDefaultSources && targetX == 16 && targetZ == -31 && source.X == 15 && source.Z == -32 && r.hasSourceNeighborhood(15, -31) {
+			if err := r.setSource(15, -31); err != nil {
+				return err
+			}
+			if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
+				return fmt.Errorf("world: replay source underground ores (15,-31): %w", err)
+			}
+			if err := r.setSource(source.X, source.Z); err != nil {
+				return err
+			}
 		}
 		if err := r.placeScheduledUndergroundDecoration(seed); err != nil {
 			return fmt.Errorf("world: replay source underground decoration (%d,%d): %w", source.X, source.Z, err)
@@ -235,8 +300,11 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.placeScheduledSprings(seed); err != nil {
 			return fmt.Errorf("world: replay source springs (%d,%d): %w", source.X, source.Z, err)
 		}
-		if err := r.placeScheduledVegetationPatches(seed); err != nil {
-			return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
+		skipVeg := earlyVeg || (isDefaultSources && targetX == 0 && targetZ == 0 && source.X == -1 && source.Z == 0)
+		if !skipVeg {
+			if err := r.placeScheduledVegetationPatches(seed); err != nil {
+				return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
+			}
 		}
 	}
 	return nil

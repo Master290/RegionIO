@@ -169,14 +169,26 @@ func (r *decorationRegion) placeSpring(set *worldgen.FeatureSet, position worldg
 }
 
 type regionSpringQueue struct {
-	springs [][3]int
-	passes  int
+	springs  [][3]int
+	passes   int
+	expected int
 }
 
 var (
 	regionSpringsMu sync.Mutex
 	regionSprings   = make(map[*decorationRegion]*regionSpringQueue)
 )
+
+func (r *decorationRegion) setExpectedSpringPasses(n int) {
+	regionSpringsMu.Lock()
+	q := regionSprings[r]
+	if q == nil {
+		q = &regionSpringQueue{}
+		regionSprings[r] = q
+	}
+	q.expected = n
+	regionSpringsMu.Unlock()
+}
 
 func (r *decorationRegion) recordScheduledSpring(x, y, z int) {
 	regionSpringsMu.Lock()
@@ -216,12 +228,16 @@ func (r *decorationRegion) expectedSpringPasses() int {
 }
 
 func (r *decorationRegion) finishSpringSourcePass() {
-	expected := r.expectedSpringPasses()
+	fallback := r.expectedSpringPasses()
 	regionSpringsMu.Lock()
 	q := regionSprings[r]
 	if q == nil {
 		q = &regionSpringQueue{}
 		regionSprings[r] = q
+	}
+	expected := q.expected
+	if expected <= 0 {
+		expected = fallback
 	}
 	q.passes++
 	if q.passes < expected {

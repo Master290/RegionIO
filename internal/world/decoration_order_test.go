@@ -166,7 +166,7 @@ func TestDecorationSourceOrderParity(t *testing.T) {
 		// went stale once already (390,895 survived generatorVersion 42's 390,899 because
 		// only the diagnostics job runs this test), and a ratchet that is a floor in one
 		// file and an exact count in another must be the same number.
-		{"ocean", vanillaParityFixture, 393037},
+		{"ocean", vanillaParityFixture, 393160},
 		{"land", vanillaLandFixture, landCellRatchet},
 	} {
 		cap := readFixtureCapture(t, fx.path)

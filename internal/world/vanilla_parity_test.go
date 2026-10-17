@@ -257,7 +257,7 @@ func TestVanillaBlockParity(t *testing.T) {
 	// The ordinary CI profile is a regression floor while the port is still
 	// incomplete. REGIONIO_REQUIRE_PARITY upgrades the same exhaustive audit to
 	// exact equality; there is no sampled or summary-only comparison path.
-	minBlockPercent := 99.7
+	minBlockPercent := 99.98
 	if os.Getenv("REGIONIO_PARITY_GENERATOR") == "legacy" {
 		minBlockPercent = 91.0
 	}

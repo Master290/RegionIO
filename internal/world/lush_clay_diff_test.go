@@ -245,9 +245,9 @@ func TestVanillaLushClayDiff(t *testing.T) {
 	// (MultifaceGrowthFeature) and stage-7 UNDERGROUND_DECORATION closed 8 clay
 	// anchor cells at (14..15, -23..-19, 31) in chunk (0,1).
 	const (
-		maxMissing = 75
-		maxAnchors = 14
-		maxExtra   = 4
+		maxMissing = 31
+		maxAnchors = 0
+		maxExtra   = 0
 	)
 	t.Logf("lush_caves_clay chain total: missing=%d (clay anchors %d) extra_clay=%d",
 		totalMissing, totalAnchors, totalExtra)
