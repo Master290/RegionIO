@@ -378,6 +378,11 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsConduitBlock(prevState) {
 		s.RemoveConduitInDim(dim, x, y, z)
 	}
+	if IsCauldronBlock(prevState) {
+		if compRes := s.UpdateComparatorsAt(dim, x, y, z); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
+			s.broadcastDimensionBlockChanges(dim, cache, compRes.Changes, compRes.LightChanged)
+		}
+	}
 	var bannerDrop world.ItemStack
 	var hasBannerDrop bool
 	if IsBannerBlock(prevState) {
@@ -408,6 +413,13 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		if hasBannerDrop && !bannerDrop.IsEmpty() {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, bannerDrop)
 			return true, dropID
+		}
+		if IsCauldronBlock(prevState) {
+			cauldDrop := world.NewNamedItemStack("minecraft:cauldron", 1)
+			if !cauldDrop.IsEmpty() {
+				dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, cauldDrop)
+				return true, dropID
+			}
 		}
 		blockName := world.BlockName(prevState)
 		fortune := EnchantmentFortuneLevel(toolMeta)

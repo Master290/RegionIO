@@ -350,6 +350,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 		h.srv.PickupNearbyExperienceOrbs(h.session)
 		bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
 		h.srv.StepPressurePlateAt(h.session.Dimension(), bx, by, bz)
+		h.srv.HandlePlayerInsideCauldron(h.session, bx, by, bz, false)
 		res, err := h.srv.CheckPlayerPortal(h.session)
 		if err != nil {
 			return err
@@ -533,6 +534,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickJukeboxes()
 			h.srv.TickBeacons()
 			h.srv.TickConduits()
+			h.srv.TickCauldrons(nil)
 			h.srv.TickAllPlayerStats()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
@@ -1317,10 +1319,34 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					return h.sendBlockChangedAck(seq)
 				}
 			}
-			if world.BlockName(clickedState) == "minecraft:water_cauldron" {
-				if h.srv.CleanBannerInCauldron(h.session, hand, x, y, z) {
+			if server.IsCauldronBlock(clickedState) {
+				invSlot := h.session.HeldInventorySlot()
+				if hand == server.HandOffHand {
+					invSlot = server.OffHandContainerSlot
+				}
+				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+				}
+				var prevItem string
+				var prevHasDyed bool
+				if invSlot >= 0 {
+					prevItem = h.session.InventorySlot(invSlot).ResolvedID()
+					prevHasDyed = server.HasSlotDyedColor(h.session, invSlot)
+				}
+				if handled, _ := h.srv.InteractCauldronAtInDim(h.session, h.session.Dimension(), x, y, z, invSlot); handled {
+					h.srv.RecordCauldronInteractionStat(h.session, prevItem, prevHasDyed, clickedState)
 					h.syncHotbarFromSession()
+					if invSlot >= 0 && invSlot < world.PlayerInventorySlots && h.conn != nil {
+						_ = h.sendContainerSetSlot(invSlot, h.session.InventorySlot(invSlot))
+					}
 					return h.sendBlockChangedAck(seq)
+				}
+				if world.BlockName(clickedState) == "minecraft:water_cauldron" {
+					if h.srv.CleanBannerInCauldron(h.session, hand, x, y, z) {
+						h.srv.AwardCustomStat(h.session, server.StatCleanBanner, 1)
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
 				}
 			}
 		}
@@ -1453,6 +1479,11 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					if server.IsConduitBlock(state) && h.srv != nil {
 						h.srv.UpdateConduitAtInDim(dim, px, py, pz)
+					}
+					if server.IsCauldronBlock(state) && h.srv != nil {
+						if compRes := h.srv.UpdateComparatorsAt(dim, px, py, pz); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
+							h.broadcastBlockChanges(dim, cache, compRes)
+						}
 					}
 					if h.session != nil {
 						h.srv.RecordItemUsed(h.session, blockName, 1)

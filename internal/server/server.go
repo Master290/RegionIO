@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -1635,3 +1636,92 @@ func (s *Server) StatusJSON(onlinePlayers int) ([]byte, error) {
 	}
 	return json.Marshal(resp)
 }
+
+// TickCauldrons steps cauldron fire extinguishing, lava cauldron contact damage,
+// and precipitation/dripstone filling around connected players for one server tick.
+func (s *Server) TickCauldrons(rng *rand.Rand) {
+	if s == nil {
+		return
+	}
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		players = append(players, p)
+	}
+	s.playersMu.RUnlock()
+
+	if len(players) == 0 {
+		return
+	}
+	if rng == nil {
+		gameTime, _ := s.WorldTime()
+		rng = rand.New(rand.NewSource(gameTime + 0x5CA01D))
+	}
+
+	raining := s.IsRaining()
+	for _, p := range players {
+		if p == nil || p.IsDead() {
+			continue
+		}
+		if ft := s.PlayerFireTicks(p); ft > 0 {
+			s.SetPlayerFireTicks(p, ft-1)
+		}
+		snap := p.Snapshot()
+		dim := world.NormalizeDimension(snap.Dimension)
+		cache := s.DimensionChunks(dim)
+		if cache == nil {
+			continue
+		}
+		bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
+		s.HandlePlayerInsideCauldron(p, bx, by, bz, false)
+
+		// Sample one random column in the player's chunk for precipitation & dripstone cauldron filling.
+		cx := (bx >> 4) << 4
+		cz := (bz >> 4) << 4
+		rx := cx + rng.Intn(16)
+		rz := cz + rng.Intn(16)
+		minY := by - 8
+		if minY < world.MinY {
+			minY = world.MinY
+		}
+		maxY := by + 8
+		if maxY > BeaconDefaultMaxBuild {
+			maxY = BeaconDefaultMaxBuild
+		}
+		for cy := maxY; cy >= minY; cy-- {
+			st := cache.GetBlock(rx, cy, rz)
+			if !IsCauldronBlock(st) {
+				continue
+			}
+			if raining && dim == world.DimensionOverworld {
+				s.TryFillCauldronFromPrecipitation(dim, rx, cy, rz, "rain", rng, false)
+			}
+			s.TryFillCauldronFromDripstone(dim, rx, cy, rz, rng, false)
+		}
+	}
+}
+
+// RecordCauldronInteractionStat awards the vanilla custom statistic and item-used
+// statistic after a successful player right-click interaction with a cauldron.
+func (s *Server) RecordCauldronInteractionStat(session *PlayerSession, prevItem string, prevHasDyed bool, prevState uint16) {
+	if s == nil || session == nil || prevItem == "" {
+		return
+	}
+	itemName := canonicalBeaconResource(prevItem)
+	s.RecordItemUsed(session, itemName, 1)
+	switch itemName {
+	case "minecraft:water_bucket", "minecraft:lava_bucket", "minecraft:powder_snow_bucket", "minecraft:potion":
+		s.AwardCustomStat(session, StatFillCauldron, 1)
+	case "minecraft:bucket", "minecraft:glass_bottle":
+		s.AwardCustomStat(session, StatUseCauldron, 1)
+	default:
+		if IsDyeableLeatherItem(itemName) && prevHasDyed {
+			s.AwardCustomStat(session, StatCleanArmor, 1)
+		} else if IsBannerItem(itemName) {
+			s.AwardCustomStat(session, StatCleanBanner, 1)
+		} else if IsDyedShulkerBoxItem(itemName) {
+			s.AwardCustomStat(session, StatCleanShulkerBox, 1)
+		}
+	}
+}
+

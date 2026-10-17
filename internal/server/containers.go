@@ -451,12 +451,25 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 			s.AwardCustomStat(session, StatTuneNoteBlock, 1)
 		}
 		return handled, 0, nil
-	case blockName == "minecraft:water_cauldron":
-		cleaned := s.CleanBannerInCauldron(session, 0, x, y, z)
-		if cleaned {
-			s.AwardCustomStat(session, StatCleanBanner, 1)
+	case IsCauldronBlock(state):
+		invSlot := session.HeldInventorySlot()
+		var prevItem string
+		var prevHasDyed bool
+		if invSlot >= 0 {
+			prevItem = session.InventorySlot(invSlot).ResolvedID()
+			prevHasDyed = HasSlotDyedColor(session, invSlot)
 		}
-		return cleaned, 0, nil
+		if handled, _ := s.InteractCauldronAt(session, x, y, z, invSlot); handled {
+			s.RecordCauldronInteractionStat(session, prevItem, prevHasDyed, state)
+			return true, 0, nil
+		}
+		if blockName == "minecraft:water_cauldron" {
+			if cleaned := s.CleanBannerInCauldron(session, 0, x, y, z); cleaned {
+				s.AwardCustomStat(session, StatCleanBanner, 1)
+				return true, 0, nil
+			}
+		}
+		return false, 0, nil
 	case IsBedBlock(state):
 		s.InteractBed(session, x, y, z)
 		return true, 0, nil
