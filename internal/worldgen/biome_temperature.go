@@ -78,26 +78,69 @@ var biomeTemperature = map[string]float32{
 	"minecraft:wooded_badlands":          2.0,
 }
 
-// coldEnoughToSnow is Biome.coldEnoughToSnow: below 0.15 the biome gets snow
-// and ice rather than rain.
-//
-// Two parts of vanilla's calculation are not reproduced, both because they need
-// PerlinSimplexNoise, which we do not have:
-//
-//   - the height adjustment, which cools a column above sea level + 17 and so
-//     puts snow on peaks in otherwise temperate biomes. No rule in the
-//     overworld tree reaches this condition above that height.
-//   - the "frozen" temperature modifier, which warms scattered patches of
-//     frozen_ocean and deep_frozen_ocean. Its absence makes frozen-ocean ice
-//     uniform where vanilla leaves open water in it.
-//
-// An unknown biome reads as warm, which is the safe direction: it leaves the
-// default block alone rather than icing something over.
+// coldEnoughToSnow returns true when the biome's base temperature is below
+// 0.15. For position-dependent temperature (including TemperatureModifier.FROZEN
+// and cooling above seaLevel + 17), use ColdEnoughToSnowAt.
 func coldEnoughToSnow(biome string) bool {
 	temperature, ok := biomeTemperature[biome]
 	return ok && temperature < 0.15
 }
 
-// ColdEnoughToSnow exposes the per-biome snow threshold to structure ports.
+// ColdEnoughToSnow exposes the per-biome base snow threshold.
 func ColdEnoughToSnow(biome string) bool { return coldEnoughToSnow(biome) }
+
+// modifyTemperature ports Biome$TemperatureModifier.modifyTemperature.
+// Only frozen_ocean and deep_frozen_ocean use TemperatureModifier.FROZEN in
+// the overworld datapack.
+func modifyTemperature(biome string, x, z int, baseTemp float32) float32 {
+	if biome != "minecraft:frozen_ocean" && biome != "minecraft:deep_frozen_ocean" {
+		return baseTemp
+	}
+	d := frozenTemperatureNoise.GetValue(float64(x)*0.05, float64(z)*0.05, false) * 7.0
+	e := biomeInfoNoise.GetValue(float64(x)*0.2, float64(z)*0.2, false)
+	if d+e < 0.3 {
+		g := biomeInfoNoise.GetValue(float64(x)*0.09, float64(z)*0.09, false)
+		if g < 0.8 {
+			return 0.2
+		}
+	}
+	return baseTemp
+}
+
+// TemperatureAt ports Biome.getHeightAdjustedTemperature(BlockPos, int seaLevel).
+// Above seaLevel + 17, TEMPERATURE_NOISE and altitude cool the column by
+// (g + y - (seaLevel + 17)) * 0.05 / 40.0.
+func TemperatureAt(biome string, x, y, z, seaLevel int) float32 {
+	baseTemp, ok := biomeTemperature[biome]
+	if !ok {
+		return 0.5
+	}
+	f := modifyTemperature(biome, x, z, baseTemp)
+	threshold := seaLevel + 17
+	if y > threshold {
+		g := float32(temperatureNoise.GetValue(float64(float32(x)/8.0), float64(float32(z)/8.0), false) * 8.0)
+		return f - (g+float32(y)-float32(threshold))*0.05/40.0
+	}
+	return f
+}
+
+// WarmEnoughToRainAt ports Biome.warmEnoughToRain(BlockPos, int seaLevel).
+func WarmEnoughToRainAt(biome string, x, y, z, seaLevel int) bool {
+	if _, ok := biomeTemperature[biome]; !ok {
+		return true
+	}
+	return TemperatureAt(biome, x, y, z, seaLevel) >= 0.15
+}
+
+// ColdEnoughToSnowAt ports Biome.coldEnoughToSnow(BlockPos, int seaLevel).
+func ColdEnoughToSnowAt(biome string, x, y, z, seaLevel int) bool {
+	return !WarmEnoughToRainAt(biome, x, y, z, seaLevel)
+}
+
+// ShouldMeltFrozenOceanIcebergSlightly ports
+// Biome.shouldMeltFrozenOceanIcebergSlightly(BlockPos, int seaLevel).
+func ShouldMeltFrozenOceanIcebergSlightly(biome string, x, z, seaLevel int) bool {
+	return TemperatureAt(biome, x, seaLevel, z, seaLevel) > 0.1
+}
+
 

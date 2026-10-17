@@ -43,7 +43,7 @@ chunk (1,0), where the capture carries the portal's obsidian/gold/crying
 obsidian; mineshaft starts land at (-4,1), (-3,10), (4,-1), consistent with
 the deep oak-plank cells crossing chunks (0,0)/(1,0).
 
-Not wired yet: concentric_rings (strongholds only).
+`concentric_rings` (strongholds: `count=128, distance=32, spread=3`) is wired via `ConcentricRings.RingPositions` in `worldgen/structures.go` (`TestStructurePlacementGrid`).
 
 ## Ruined portal (ported, see world/ruined_portal.go)
 
@@ -2671,3 +2671,26 @@ Measured after all five:
 | bands deep / underground / waterline / surface | **170 / 9 / 0 / 0** | **105 / 1 / 0 / 0** |
 | tree cells above sea level (vanilla / ours) | 0 / 0 | **789 / 789 (100%)** |
 | biomes / heightmaps | **6,144/6,144 / 3,072/3,072 (100%)** | **6,144/6,144 / 3,072/3,072 (100%)** |
+
+## Two-hop base terrain window, cross-chunk stage ordering, SurfaceSystem extensions, and Stage 10 `freeze_top_layer`
+
+1. **Two-hop base terrain window and cross-chunk stage ordering** (`world/vanilla_parity_test.go`, `world/feature_scheduler.go`, `world/ruined_portal_piece.go`):
+   - Expanding the base terrain neighborhood in `decorateChunkFromNeighbours` to radius 2 (`5x5` = 25 chunks) gives 2-hop sources (`(-1,-1)` and `(0,-1)` for target `(0,1)`; `(-1,-1)` for target `(1,0)`; `(-2,-2)..(0,0)` around `(-1,-1)`) their complete `3x3` write neighborhoods.
+   - Replaying `(-1,0)` Stage 9 `lush_caves_clay` before `(0,0)` Stage 6 `ore_tuff` on target `(0,0)` and running `(-1,0)` Stage 9 before Stage 6 on target `(-1,-1)` reproduces vanilla's cross-chunk `ore_tuff` / `lush_caves_clay` schedule, dropping `TestVanillaLushClayDiff` to **0 clay anchor mismatches and 0 extra clay mismatches** (`missing=31`) and bringing chunk `(0,1)` to **98,304 / 98,304 (100.000%, 0 mismatches)**.
+   - On land, replaying `(15,-31)` Stage 6 ores before `(15,-32)` Stage 8 springs on target `(16,-31)` brings both `(16,-40)` and `(16,-31)` to **98,304 / 98,304 (100.000%, 0 mismatches)** and `(-40,21)` to **98,303 / 98,304 (99.999%, 1 mismatch)**.
+   - In `PlaceRuinedPortalPiece`, checking `region.chunks[[2]int32{portalChunkX, portalChunkZ}]` mirrors `RuinedPortalPiece.postProcess`'s `chunkBox.isInside(templateBox.getCenter())` guard so portal air pockets flood into adjacent chunks even when the target chunk is outside the portal's bounding box.
+
+2. **`PerlinSimplexNoise`, `Biome` temperature modifiers, `SurfaceSystem` extensions, `concentric_rings`, and Stage 10 `freeze_top_layer`**:
+   - Ported `PerlinSimplexNoise` (`worldgen/simplex_noise.go`) and the three static `Biome` noises (`TEMPERATURE_NOISE` seed `1234`, `FROZEN_TEMPERATURE_NOISE` seed `3456` octaves `[-2,-1,0]`, `BIOME_INFO_NOISE` seed `2345`), together with `TemperatureModifier.FROZEN` and height-adjusted cooling above `seaLevel + 17` (`TemperatureAt`, `ColdEnoughToSnowAt`, `ShouldMeltFrozenOceanIcebergSlightly` in `worldgen/biome_temperature.go`).
+   - Ported `SurfaceSystem.erodedBadlandsExtension` and `SurfaceSystem.frozenOceanExtension` (`worldgen/surface_system.go`, wired into `applySurfaceRule` in `world/vanilla.go`, pinned by `TestColdEnoughToSnowAtAndSurfaceExtensions`).
+   - Ported `ConcentricRings.RingPositions` (`worldgen/structures.go`, pinned by `TestStructurePlacementGrid`) and Stage 10 `SnowAndFreezeFeature` (`placeScheduledFreezeTopLayer` in `world/cave_features.go`, pinned by `TestFreezeTopLayerStage10`).
+
+Measured (`TestVanillaBlockParity` and `TestVanillaLandBlockParity`):
+
+| | ocean (`vanilla_overworld_12345.bin`) | land (`vanilla_land_12345.bin`) |
+|---|---|---|
+| exact cells | **393,160 / 393,216 (99.986%, 56 residual)** | **393,159 / 393,216 (99.986%, 57 residual)** |
+| per-chunk mismatches | `c(0,0)=16, c(1,0)=7, c(0,1)=0 (100%), c(-1,-1)=33` | `c(16,-40)=0 (100%), c(16,-31)=0 (100%), c(-40,21)=1, c(-40,20)=56` |
+| bands deep / underground / waterline / surface | **50 / 6 / 0 / 0** | **57 / 0 / 0 / 0** |
+| `TestVanillaLushClayDiff` | **missing=31, clay anchors=0, extra_clay=0** | — |
+

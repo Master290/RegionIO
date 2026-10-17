@@ -65,3 +65,38 @@ func TestUnhandledNestedFeatureRefIsCountedByName(t *testing.T) {
 		t.Errorf("naming a skipped nested type spent %d draws; the fallthrough has to leave the stream where it found it", random.draws)
 	}
 }
+
+func TestFreezeTopLayerStage10(t *testing.T) {
+	region, _ := nestedRefRegion(t)
+	c := region.chunks[[2]int32{0, 0}]
+	snowyPlains := biomeID("minecraft:snowy_plains")
+	for x := 0; x < 16; x++ {
+		for z := 0; z < 16; z++ {
+			c.SetBiome(x, 63, z, snowyPlains)
+			c.SetBiome(x, 64, z, snowyPlains)
+		}
+	}
+	// Column (4,4): still water at y=62 -> should freeze to ice.
+	c.SetBlock(4, 62, 4, StateWater)
+	// Column (8,8): grass_block[snowy=false] at y=63 -> should get snow[layers=1] at y=64 and snowy=true at y=63.
+	c.SetBlock(8, 63, 8, StateGrass)
+
+	if err := region.placeScheduledFreezeTopLayer(12345); err != nil {
+		t.Fatalf("placeScheduledFreezeTopLayer: %v", err)
+	}
+
+	iceID, _ := nameToStateID("minecraft:ice", nil)
+	snowID, _ := nameToStateID("minecraft:snow", map[string]string{"layers": "1"})
+	snowyGrassID, _ := nameToStateID("minecraft:grass_block", map[string]string{"snowy": "true"})
+
+	if got := region.getBlock(4, 62, 4); got != iceID {
+		t.Errorf("water column (4,62,4) = %d, want %d (minecraft:ice)", got, iceID)
+	}
+	if got := region.getBlock(8, 64, 8); got != snowID {
+		t.Errorf("snow column (8,64,8) = %d, want %d (minecraft:snow[layers=1])", got, snowID)
+	}
+	if got := region.getBlock(8, 63, 8); got != snowyGrassID {
+		t.Errorf("grass column (8,63,8) = %d, want %d (minecraft:grass_block[snowy=true])", got, snowyGrassID)
+	}
+}
+

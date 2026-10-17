@@ -340,7 +340,7 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 		return nil
 	}
 	if setup.CanBeCold {
-		stub.Cold = worldgen.ColdEnoughToSnow(biomeAtStub)
+		stub.Cold = worldgen.ColdEnoughToSnowAt(biomeAtStub, stub.X, y, stub.Z, SeaLevel)
 	}
 	return stub
 }

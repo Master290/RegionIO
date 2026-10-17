@@ -196,12 +196,15 @@ func (t waterTest) Test(ctx *SurfaceContext) bool {
 }
 
 // temperatureTest passes where the biome is cold enough for snow and ice
-// rather than rain. The overworld tree uses it once, to freeze holes in a
-// frozen ocean floor.
+// rather than rain (SurfaceRules.TemperatureConditionSource).
 type temperatureTest struct{}
 
 func (temperatureTest) Test(ctx *SurfaceContext) bool {
-	return coldEnoughToSnow(ctx.Biome())
+	seaLevel := ctx.SeaLevel
+	if seaLevel == 0 {
+		seaLevel = 63
+	}
+	return ColdEnoughToSnowAt(ctx.Biome(), ctx.X, ctx.Y, ctx.Z, seaLevel)
 }
 
 // yAboveTest passes when Y clears an anchor, with optional surface-depth and

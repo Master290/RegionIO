@@ -635,12 +635,15 @@ func addNetherrackDripColumnsBelowPortal(region *decorationRegion, random *world
 	}
 }
 
-// stubColdAt reports whether the column's biome freezes; underground portals
-// in temperate columns never take the cold path. Cold columns need
-// coldEnoughToSnow (a PerlinSimplexNoise we do not port yet), so every portal
-// currently takes the warm path - which draws the 0.07 magma roll.
+// stubColdAt reports whether the column's surface biome freezes via
+// Biome.coldEnoughToSnow.
 func stubColdAt(region *decorationRegion, x, z int) bool {
-	return false
+	y := region.heightAt("WORLD_SURFACE_WG", x, z) - 1
+	biomeID, ok := region.getBiome(x, y, z)
+	if !ok {
+		return false
+	}
+	return worldgen.ColdEnoughToSnowAt(biomeNameByID(biomeID), x, y, z, SeaLevel)
 }
 
 func pick2(r *worldgen.Legacy) int { return int(r.NextIntN(2)) }

@@ -64,6 +64,19 @@ func TestStructurePlacementGrid(t *testing.T) {
 	if gap := b[0] - a[0]; gap < int32(vp.Separation)+1 {
 		t.Fatalf("adjacent village regions %d apart, want >= %d", gap, vp.Separation+1)
 	}
+
+	// Strongholds use concentric_rings (count=128, distance=32, spread=3).
+	strongholds := sets.Sets["minecraft:strongholds"]
+	if strongholds == nil || strongholds.Placement.ConcentricRings == nil {
+		t.Fatal("strongholds concentric_rings placement missing")
+	}
+	rings := strongholds.Placement.ConcentricRings.RingPositions(seed, nil, nil)
+	if len(rings) != 128 {
+		t.Fatalf("stronghold ring positions = %d, want 128", len(rings))
+	}
+	if !strongholds.IsStartChunk(seed, rings[0][0], rings[0][1]) {
+		t.Fatalf("strongholds.IsStartChunk(%v) = false, want true", rings[0])
+	}
 }
 
 func structCoord(v int32) string {

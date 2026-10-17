@@ -286,4 +286,75 @@ func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePositi
 	return r.canVegetationSurvive(position, name, set)
 }
 
-var _ = fmt.Sprintf
+// placeScheduledFreezeTopLayer ports Stage 10 (TOP_LAYER_MODIFICATION)
+// SnowAndFreezeFeature (minecraft:freeze_top_layer): for each column in the
+// source chunk, it checks MOTION_BLOCKING height y and belowY = y - 1 against
+// Biome.shouldFreeze and Biome.shouldSnow, freezing still water to ice and
+// placing snow[layers=1] (plus setting snowy=true on grass_block, podzol, or
+// mycelium below).
+func (r *decorationRegion) placeScheduledFreezeTopLayer(seed int64) error {
+	r.bindSeed(seed)
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		return err
+	}
+	iceID, ok := nameToStateID("minecraft:ice", nil)
+	if !ok {
+		return fmt.Errorf("missing block state for minecraft:ice")
+	}
+	snowID, ok := nameToStateID("minecraft:snow", map[string]string{"layers": "1"})
+	if !ok {
+		return fmt.Errorf("missing block state for minecraft:snow[layers=1]")
+	}
+	baseX, baseZ := int(r.sourceX)*16, int(r.sourceZ)*16
+	for dx := 0; dx < 16; dx++ {
+		for dz := 0; dz < 16; dz++ {
+			x, z := baseX+dx, baseZ+dz
+			y := r.heightAt("MOTION_BLOCKING", x, z)
+			belowY := y - 1
+			biomeID, ok := r.getBiome(x, y, z)
+			if !ok {
+				continue
+			}
+			biome := biomeNameByID(biomeID)
+			if belowY >= MinY && belowY < MinY+WorldHeight && worldgen.ColdEnoughToSnowAt(biome, x, belowY, z, SeaLevel) {
+				if r.getBlock(x, belowY, z) == StateWater {
+					r.setBlock(x, belowY, z, iceID)
+				}
+			}
+			if y >= MinY && y < MinY+WorldHeight && belowY >= MinY && worldgen.ColdEnoughToSnowAt(biome, x, y, z, SeaLevel) {
+				at := r.getBlock(x, y, z)
+				below := r.getBlock(x, belowY, z)
+				if isAirState(at) && snowLayerCanSurviveOn(below, set) {
+					r.setBlock(x, y, z, snowID)
+					if belowState, ok := stateByID(below); ok && belowState.Properties["snowy"] == "false" {
+						props := make(map[string]string, len(belowState.Properties))
+						for k, v := range belowState.Properties {
+							props[k] = v
+						}
+						props["snowy"] = "true"
+						if snowyID, ok := nameToStateID(belowState.Name, props); ok {
+							r.setBlock(x, belowY, z, snowyID)
+						}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func snowLayerCanSurviveOn(below uint16, set *worldgen.FeatureSet) bool {
+	s, ok := stateByID(below)
+	if !ok {
+		return false
+	}
+	if flattenBlockTagContains(set, "minecraft:snow_layer_cannot_survive_on", s.Name) {
+		return false
+	}
+	if flattenBlockTagContains(set, "minecraft:snow_layer_can_survive_on", s.Name) {
+		return true
+	}
+	return isFaceSturdy(below)
+}
+

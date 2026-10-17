@@ -204,3 +204,86 @@ func TestWaterCondition(t *testing.T) {
 		}
 	}
 }
+
+func TestColdEnoughToSnowAtAndSurfaceExtensions(t *testing.T) {
+	od, err := LoadOverworldFinalDensity(12345)
+	if err != nil {
+		t.Fatalf("LoadOverworldFinalDensity: %v", err)
+	}
+	// Height adjustment cools a temperate taiga (base 0.25) well above seaLevel+17 (y=200).
+	if !ColdEnoughToSnowAt("minecraft:taiga", 0, 200, 0, 63) {
+		t.Error("expected taiga at y=200 to cool below 0.15 snow threshold")
+	}
+	if ColdEnoughToSnowAt("minecraft:taiga", 0, 64, 0, 63) {
+		t.Error("expected taiga at y=64 to remain warm (>= 0.15)")
+	}
+	// FrozenTemperatureModifier warms scattered patches of frozen_ocean to 0.2.
+	foundWarmed, foundFrozen := false, false
+	for x := -500; x <= 500; x += 10 {
+		for z := -500; z <= 500; z += 10 {
+			if ColdEnoughToSnowAt("minecraft:frozen_ocean", x, 63, z, 63) {
+				foundFrozen = true
+			} else {
+				foundWarmed = true
+			}
+		}
+	}
+	if !foundWarmed || !foundFrozen {
+		t.Errorf("frozen_ocean modifier: foundWarmed=%v, foundFrozen=%v, want both", foundWarmed, foundFrozen)
+	}
+
+	// ErodedBadlandsExtension raises a stone hoodoo pillar where badlands noises are positive.
+	const minY = -64
+	const height = 384
+	raisedAny := false
+	for x := 0; x < 200; x += 2 {
+		for z := 0; z < 200; z += 2 {
+			var col [height]uint16
+			for y := minY; y <= 63; y++ {
+				col[y-minY] = 1 // stone up to y=63
+			}
+			newTop, changed := od.Surface.ErodedBadlandsExtension(col[:], x, z, 64, minY)
+			if changed && newTop > 63-minY {
+				raisedAny = true
+				break
+			}
+		}
+		if raisedAny {
+			break
+		}
+	}
+	if !raisedAny {
+		t.Error("ErodedBadlandsExtension did not raise any pillar across 10,000 test columns")
+	}
+
+	// FrozenOceanExtension places packed_ice (12914) or snow_block (6928) where iceberg noises exceed 1.8.
+	placedIceberg := false
+	for x := 0; x < 400; x += 2 {
+		for z := 0; z < 400; z += 2 {
+			var col [height]uint16
+			for y := minY; y <= 40; y++ {
+				col[y-minY] = 1
+			}
+			for y := 41; y < 63; y++ {
+				col[y-minY] = 86 // water
+			}
+			od.Surface.FrozenOceanExtension(col[:], 40, "minecraft:frozen_ocean", x, z, 63, minY, 63)
+			for _, s := range col {
+				if s == 12914 || s == 6928 {
+					placedIceberg = true
+					break
+				}
+			}
+			if placedIceberg {
+				break
+			}
+		}
+		if placedIceberg {
+			break
+		}
+	}
+	if !placedIceberg {
+		t.Error("FrozenOceanExtension did not place any iceberg blocks across 40,000 test columns")
+	}
+}
+

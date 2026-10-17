@@ -439,6 +439,18 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 	if top < 0 {
 		return
 	}
+	minY := MinY
+	topY := minY + top + 1
+	surfaceBiome := biomeName
+	if sctx.BiomeFunc != nil {
+		surfaceBiome = sctx.BiomeFunc(wx, topY, wz)
+	}
+	if surfaceBiome == "minecraft:eroded_badlands" && od.Surface != nil {
+		if newTop, changed := od.Surface.ErodedBadlandsExtension(out[:], wx, wz, topY, minY); changed {
+			top = newTop
+			topY = minY + top + 1
+		}
+	}
 	// Column-constant surface quantities, refreshed once per column exactly as
 	// SurfaceRules.Context.updateXZ does. The context itself is reused across
 	// the whole 16-column strip to avoid ~98k allocations per chunk; the fields
@@ -452,7 +464,6 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 	sctx.SurfaceDepth = surfaceDepth
 	sctx.MinSurfaceLevel = od.MinSurfaceLevelAt(wx, wz, surfaceDepth)
 	sctx.Steep = steepAt(worldSurface, lx, lz)
-	minY := MinY
 	stoneDepthAbove := 0
 	waterHeight := worldgen.NoWaterAbove
 	nextCeilingStoneY := math.MaxInt
@@ -496,6 +507,9 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 		if state, ok := rules.Apply(sctx); ok {
 			out[i] = state
 		}
+	}
+	if (surfaceBiome == "minecraft:frozen_ocean" || surfaceBiome == "minecraft:deep_frozen_ocean") && od.Surface != nil {
+		od.Surface.FrozenOceanExtension(out[:], sctx.MinSurfaceLevel, surfaceBiome, wx, wz, topY, minY, SeaLevel)
 	}
 }
 

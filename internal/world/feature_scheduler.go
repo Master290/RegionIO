@@ -306,6 +306,9 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 				return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
 			}
 		}
+		if err := r.placeScheduledFreezeTopLayer(seed); err != nil {
+			return fmt.Errorf("world: replay source freeze top layer (%d,%d): %w", source.X, source.Z, err)
+		}
 	}
 	return nil
 }

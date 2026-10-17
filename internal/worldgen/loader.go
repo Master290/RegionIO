@@ -170,10 +170,40 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("surface_secondary noise: %w", err)
 	}
+	badlandsPillar, err := l.noiseField("minecraft:badlands_pillar")
+	if err != nil {
+		return nil, fmt.Errorf("badlands_pillar noise: %w", err)
+	}
+	badlandsPillarRoof, err := l.noiseField("minecraft:badlands_pillar_roof")
+	if err != nil {
+		return nil, fmt.Errorf("badlands_pillar_roof noise: %w", err)
+	}
+	badlandsSurface, err := l.noiseField("minecraft:badlands_surface")
+	if err != nil {
+		return nil, fmt.Errorf("badlands_surface noise: %w", err)
+	}
+	icebergPillar, err := l.noiseField("minecraft:iceberg_pillar")
+	if err != nil {
+		return nil, fmt.Errorf("iceberg_pillar noise: %w", err)
+	}
+	icebergPillarRoof, err := l.noiseField("minecraft:iceberg_pillar_roof")
+	if err != nil {
+		return nil, fmt.Errorf("iceberg_pillar_roof noise: %w", err)
+	}
+	icebergSurface, err := l.noiseField("minecraft:iceberg_surface")
+	if err != nil {
+		return nil, fmt.Errorf("iceberg_surface noise: %w", err)
+	}
 	od.Surface = &SurfaceSampler{
-		surfaceNoise:   surfaceNoise,
-		secondaryNoise: secondaryNoise,
-		positionalRand: l.rs.Positional(),
+		surfaceNoise:       surfaceNoise,
+		secondaryNoise:     secondaryNoise,
+		badlandsPillar:     badlandsPillar,
+		badlandsPillarRoof: badlandsPillarRoof,
+		badlandsSurface:    badlandsSurface,
+		icebergPillar:      icebergPillar,
+		icebergPillarRoof:  icebergPillarRoof,
+		icebergSurface:     icebergSurface,
+		positionalRand:     l.rs.Positional(),
 	}
 
 	// The rule tree is seed-bound: its noise_threshold conditions sample seeded

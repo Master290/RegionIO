@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -39,24 +40,34 @@ type RandomSpread struct {
 	LocateOffZ int     `json:"-"`
 }
 
+// ConcentricRings mirrors minecraft:concentric_rings placement (strongholds).
+type ConcentricRings struct {
+	Distance        int    `json:"distance"`
+	Spread          int    `json:"spread"`
+	Count           int    `json:"count"`
+	PreferredBiomes string `json:"preferred_biomes"`
+}
+
 // Placement is the tagged union of structure placement types.
 type Placement struct {
-	Type         string       `json:"type"`
-	RandomSpread *RandomSpread `json:"-"`
-	Concentric   bool         `json:"-"`
+	Type            string           `json:"type"`
+	RandomSpread    *RandomSpread    `json:"-"`
+	Concentric      bool             `json:"-"`
+	ConcentricRings *ConcentricRings `json:"-"`
 }
 
 type rawPlacement struct {
-	Type          string  `json:"type"`
-	Salt          int     `json:"salt"`
-	Separation    int     `json:"separation"`
-	Spacing       int     `json:"spacing"`
-	SpreadType    string  `json:"spread_type"`
-	Frequency     float32 `json:"frequency"`
-	FreqMethod    string  `json:"frequency_reduction_method"`
-	LocateOffset  []int   `json:"locate_offset"`
-	Distance      int     `json:"distance"`
-	Count         int     `json:"count"`
+	Type            string  `json:"type"`
+	Salt            int     `json:"salt"`
+	Separation      int     `json:"separation"`
+	Spacing         int     `json:"spacing"`
+	SpreadType      string  `json:"spread_type"`
+	Frequency       float32 `json:"frequency"`
+	FreqMethod      string  `json:"frequency_reduction_method"`
+	LocateOffset    []int   `json:"locate_offset"`
+	Distance        int     `json:"distance"`
+	Spread          int     `json:"spread"`
+	Count           int     `json:"count"`
 	PreferredBiomes string  `json:"preferred_biomes"`
 }
 
@@ -81,7 +92,16 @@ func (p *rawPlacement) decode() (*Placement, error) {
 		}
 		return out, nil
 	case "minecraft:concentric_rings":
-		return &Placement{Type: p.Type, Concentric: true}, nil
+		return &Placement{
+			Type:       p.Type,
+			Concentric: true,
+			ConcentricRings: &ConcentricRings{
+				Distance:        p.Distance,
+				Spread:          p.Spread,
+				Count:           p.Count,
+				PreferredBiomes: p.PreferredBiomes,
+			},
+		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported structure placement %q", p.Type)
 	}
@@ -350,12 +370,78 @@ func (r *RandomSpread) frequencyAllows(seed int64, chunkX, chunkZ int32) bool {
 	}
 }
 
+// RingPositions ports ChunkGeneratorStructureState.generateRingPositions and
+// BiomeSource.findBiomeHorizontal. When biomeAtQuart is non-nil and
+// allowedBiomes is non-empty, each ring anchor is snapped within a 112-block
+// (28-quart) horizontal square at y=0 to a uniformly sampled preferred biome
+// using random.Fork() reservoir sampling.
+func (c *ConcentricRings) RingPositions(seed int64, biomeAtQuart func(qx, qy, qz int) string, allowedBiomes map[string]bool) [][2]int32 {
+	if c == nil || c.Count <= 0 || c.Distance <= 0 || c.Spread <= 0 {
+		return nil
+	}
+	distance := c.Distance
+	count := c.Count
+	spread := c.Spread
+	random := NewLegacy(seed)
+	d := random.NextDouble() * math.Pi * 2.0
+	i := 0
+	j := 0
+	positions := make([][2]int32, 0, count)
+	for k := 0; k < count; k++ {
+		e := float64(4*distance+distance*j*6) + (random.NextDouble()-0.5)*(float64(distance)*2.5)
+		l := int32(math.Floor(math.Cos(d)*e + 0.5))
+		m := int32(math.Floor(math.Sin(d)*e + 0.5))
+		forked := random.Fork()
+		pos := [2]int32{l, m}
+		if biomeAtQuart != nil && len(allowedBiomes) > 0 {
+			centerQX := (int(l)*16 + 8) >> 2
+			centerQZ := (int(m)*16 + 8) >> 2
+			const radiusQ = 112 >> 2 // 28
+			n := 0
+			hasBest := false
+			for dz := -radiusQ; dz <= radiusQ; dz++ {
+				for dx := -radiusQ; dx <= radiusQ; dx++ {
+					qx := centerQX + dx
+					qz := centerQZ + dz
+					if allowedBiomes[biomeAtQuart(qx, 0, qz)] {
+						if !hasBest || forked.NextIntN(int32(n+1)) == 0 {
+							pos = [2]int32{int32(qx >> 2), int32(qz >> 2)}
+							hasBest = true
+						}
+						n++
+					}
+				}
+			}
+		}
+		positions = append(positions, pos)
+		d += (math.Pi * 2.0) / float64(spread)
+		i++
+		if i == spread {
+			j++
+			i = 0
+			spread = spread + 2*spread/(j+1)
+			if spread > count-k {
+				spread = count - k
+			}
+			d += random.NextDouble() * math.Pi * 2.0
+		}
+	}
+	return positions
+}
+
 // IsStartChunk reports whether any structure of this set starts in the given
 // chunk: the random-spread grid picks the chunk, the legacy frequency roll
-// keeps or discards it.
+// keeps or discards it, and concentric_rings checks the generated ring anchors.
 func (s *StructureSet) IsStartChunk(seed int64, chunkX, chunkZ int32) bool {
 	if s.Placement.Concentric {
-		// Stronghold rings are not wired yet; nothing claims the chunk.
+		if s.Placement.ConcentricRings == nil {
+			return false
+		}
+		for _, pos := range s.Placement.ConcentricRings.RingPositions(seed, nil, nil) {
+			if pos[0] == chunkX && pos[1] == chunkZ {
+				return true
+			}
+		}
 		return false
 	}
 	spread := s.Placement.RandomSpread

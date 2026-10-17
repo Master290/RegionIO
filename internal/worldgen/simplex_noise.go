@@ -2,19 +2,18 @@ package worldgen
 
 import "math"
 
-// simplexNoise is the 2D path of vanilla's SimplexNoise. Biome placement
-// counts use a single octave constructed from LegacyRandomSource seed 2345.
+// simplexNoise is the 2D path of vanilla's SimplexNoise.
 type simplexNoise struct {
-	p [256]int
+	xo, yo, zo float64
+	p          [256]int
 }
 
 func newSimplexNoise(random RandomSource) *simplexNoise {
-	// SimplexNoise always consumes three offsets even though its 2D sampler
-	// does not add them to the input coordinates.
-	random.NextDouble()
-	random.NextDouble()
-	random.NextDouble()
-	n := &simplexNoise{}
+	n := &simplexNoise{
+		xo: random.NextDouble() * 256.0,
+		yo: random.NextDouble() * 256.0,
+		zo: random.NextDouble() * 256.0,
+	}
 	for i := range n.p {
 		n.p[i] = i
 	}
@@ -59,10 +58,78 @@ func simplexCorner(gradientIndex int, x, y, radius float64) float64 {
 	return attenuation * attenuation * (g[0]*x + g[1]*y)
 }
 
-var biomeInfoNoise = newSimplexNoise(NewLegacy(2345))
+// PerlinSimplexNoise ports net.minecraft.world.level.levelgen.synth.PerlinSimplexNoise.
+// Vanilla constructs its three static Biome noises with fixed Legacy seeds:
+// TEMPERATURE_NOISE (1234, [0]), FROZEN_TEMPERATURE_NOISE (3456, [-2, -1, 0]),
+// and BIOME_INFO_NOISE (2345, [0]).
+type PerlinSimplexNoise struct {
+	noiseLevels            []*simplexNoise
+	highestFreqInputFactor float64
+	highestFreqValueFactor float64
+}
+
+// NewPerlinSimplexNoise constructs a PerlinSimplexNoise from a sorted, unique
+// non-positive/zero octave list (such as [0] or [-2, -1, 0]).
+func NewPerlinSimplexNoise(random RandomSource, octaves []int) *PerlinSimplexNoise {
+	hasOctave := func(target int) bool {
+		for _, o := range octaves {
+			if o == target {
+				return true
+			}
+		}
+		return false
+	}
+	i := -octaves[0]
+	j := octaves[len(octaves)-1]
+	k := i + j + 1
+	simplex := newSimplexNoise(random)
+	l := j
+	noiseLevels := make([]*simplexNoise, k)
+	if l >= 0 && l < k && hasOctave(0) {
+		noiseLevels[l] = simplex
+	}
+	for m := l + 1; m < k; m++ {
+		if m >= 0 && hasOctave(l-m) {
+			noiseLevels[m] = newSimplexNoise(random)
+		} else {
+			random.ConsumeCount(262)
+		}
+	}
+	return &PerlinSimplexNoise{
+		noiseLevels:            noiseLevels,
+		highestFreqInputFactor: math.Pow(2.0, float64(j)),
+		highestFreqValueFactor: 1.0 / (math.Pow(2.0, float64(k)) - 1.0),
+	}
+}
+
+// GetValue mirrors PerlinSimplexNoise.getValue(x, y, useNoiseOffsets).
+func (p *PerlinSimplexNoise) GetValue(x, y float64, useNoiseOffsets bool) float64 {
+	var d float64
+	e := p.highestFreqInputFactor
+	f := p.highestFreqValueFactor
+	for _, level := range p.noiseLevels {
+		if level != nil {
+			var ox, oy float64
+			if useNoiseOffsets {
+				ox, oy = level.xo, level.yo
+			}
+			d += level.value2D(x*e+ox, y*e+oy) * f
+		}
+		e /= 2.0
+		f *= 2.0
+	}
+	return d
+}
+
+var (
+	temperatureNoise       = NewPerlinSimplexNoise(NewLegacy(1234), []int{0})
+	frozenTemperatureNoise = NewPerlinSimplexNoise(NewLegacy(3456), []int{-2, -1, 0})
+	biomeInfoNoise         = NewPerlinSimplexNoise(NewLegacy(2345), []int{0})
+)
 
 // BiomeInfoNoise is Biome.BIOME_INFO_NOISE.getValue(x, z, false). It is
 // world-seed independent and drives noise-based vegetation attempt counts.
 func BiomeInfoNoise(x, z float64) float64 {
-	return biomeInfoNoise.value2D(x, z)
+	return biomeInfoNoise.GetValue(x, z, false)
 }
+

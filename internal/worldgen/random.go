@@ -322,6 +322,11 @@ func (r *Legacy) ConsumeCount(n int) {
 	}
 }
 
+// Fork mirrors LegacyRandomSource.fork: seeds a new Legacy source from NextLong.
+func (r *Legacy) Fork() *Legacy {
+	return NewLegacy(r.NextLong())
+}
+
 // ForkPositional mirrors LegacyRandomSource.forkPositional.
 func (r *Legacy) ForkPositional() PositionalRandomFactory {
 	return &legacyPositional{seed: uint64(r.NextLong())}
