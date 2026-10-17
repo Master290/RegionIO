@@ -141,6 +141,7 @@ var (
 		MobTypeVillager:           int(EntityTypeVillagerID),
 		MobTypeWolf:               EntityTypeWolfID,
 		MobTypeZombie:             EntityTypeZombieID,
+		MobTypeZombieVillager:     EntityTypeZombieVillagerID,
 		EntityTypeFishingBobber:   EntityTypeFishingBobberID,
 		EntityTypeArmorStand:      EntityTypeArmorStandID,
 		EntityTypeGlowItemFrame:   EntityTypeGlowItemFrameID,
@@ -221,6 +222,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 	switch canonicalResourceName(typeName) {
 	case MobTypeZombie:
 		return DefaultZombieMaxHealth
+	case MobTypeZombieVillager:
+		return DefaultZombieVillagerMaxHealth
 	case MobTypeSkeleton:
 		return DefaultSkeletonMaxHealth
 	case MobTypeCreeper:

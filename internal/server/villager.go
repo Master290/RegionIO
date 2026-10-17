@@ -605,9 +605,15 @@ func (s *Server) RestockVillager(entityID int32) bool {
 	copy(offers, vs.Offers)
 	vLevel := int32(vs.Level)
 	vXP := vs.XP
+	vProf := vs.Profession
 	vtr.mu.Unlock()
 
 	if restockedAny {
+		if ent := s.entities.Get(entityID); ent != nil {
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(VillagerProfessionWorkSound(vProf), SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		}
 		s.syncMerchantOffersToViewers(entityID, offers, vLevel, vXP)
 	}
 	return restockedAny
@@ -631,19 +637,24 @@ func (s *Server) syncMerchantOffersToViewers(entityID int32, offers []MerchantOf
 		if open == nil || open.MenuType != MenuTypeMerchant || int32(open.BlockX) != entityID {
 			continue
 		}
+		s.UpdateVillagerSpecialPricesForPlayer(sess, entityID)
+		effOffers := s.EffectiveOffersForPlayer(sess, entityID, offers)
 		if sess.send != nil {
-			_ = sess.send(PlayMerchantOffersCB, EncodeMerchantOffersPacket(open.ContainerID, offers, level, xp, true, true))
+			_ = sess.send(PlayMerchantOffersCB, EncodeMerchantOffersPacket(open.ContainerID, effOffers, level, xp, true, true))
 		}
 	}
 }
 
-// TickVillagers checks villager work-hour restocking (2000..9000 time of day,
-// up to 2 restocks per day when offers have been used) and cleans up state for
-// removed villager entities.
+// TickVillagers checks villager workstation POI validation/acquisition, daily
+// gossip decay, work-hour restocking (2000..9000 time of day, up to 2 restocks
+// per day when offers have been used), zombie villager conversions, and cleans
+// up state for removed villager entities.
 func (s *Server) TickVillagers() {
 	if s == nil || s.entities == nil {
 		return
 	}
+	s.TickZombieVillagers(nil)
+
 	gameTime, dayTime := s.WorldTime()
 	tod := s.TimeOfDay()
 	curDay := dayTime / TicksPerDay
@@ -655,42 +666,78 @@ func (s *Server) TickVillagers() {
 		vtr.mu.Unlock()
 		return
 	}
-	var toRestock []int32
-	var removed []int32
-	for entityID, vs := range vtr.villagers {
-		ent := s.entities.Get(entityID)
-		if ent == nil || ent.TypeName != MobTypeVillager {
-			removed = append(removed, entityID)
-			delete(vtr.villagers, entityID)
-			continue
-		}
-		if vs.LastRestockDay != curDay {
-			vs.LastRestockDay = curDay
-			vs.RestocksToday = 0
-		}
-		if !inWorkHours || vs.RestocksToday >= MaxVillagerRestocksPerDay {
-			continue
-		}
-		if vs.LastRestockGameTime > 0 && gameTime-vs.LastRestockGameTime < MinRestockIntervalTicks {
-			continue
-		}
-		needsRestock := false
-		for i := range vs.Offers {
-			if vs.Offers[i].Uses > 0 {
-				needsRestock = true
-				break
-			}
-		}
-		if needsRestock {
-			toRestock = append(toRestock, entityID)
-		}
+	ids := make([]int32, 0, len(vtr.villagers))
+	for entityID := range vtr.villagers {
+		ids = append(ids, entityID)
 	}
 	vtr.mu.Unlock()
 
+	var toRestock []int32
+	var toDecay []int32
+	var removed []int32
+
+	for _, entityID := range ids {
+		ent := s.entities.Get(entityID)
+		if ent == nil || ent.TypeName != MobTypeVillager {
+			removed = append(removed, entityID)
+			continue
+		}
+		if _, hadSite := s.VillagerJobSite(entityID); hadSite {
+			s.ValidateVillagerWorkstation(entityID)
+		}
+		vtr.mu.Lock()
+		vs := vtr.villagers[entityID]
+		if vs == nil {
+			vtr.mu.Unlock()
+			continue
+		}
+		prof := canonicalResourceName(vs.Profession)
+		if vs.LastRestockDay != curDay {
+			if vs.LastRestockDay >= 0 {
+				toDecay = append(toDecay, entityID)
+			}
+			vs.LastRestockDay = curDay
+			vs.RestocksToday = 0
+		}
+		vtr.mu.Unlock()
+
+		if prof == VillagerProfessionNone || s.IsVillagerJobSiteLost(entityID) {
+			s.TryAcquireVillagerWorkstation(entityID)
+		}
+		if s.IsVillagerJobSiteLost(entityID) {
+			continue
+		}
+
+		vtr.mu.Lock()
+		vs = vtr.villagers[entityID]
+		if vs != nil && inWorkHours && vs.RestocksToday < MaxVillagerRestocksPerDay &&
+			(vs.LastRestockGameTime <= 0 || gameTime-vs.LastRestockGameTime >= MinRestockIntervalTicks) {
+			for i := range vs.Offers {
+				if vs.Offers[i].Uses > 0 {
+					toRestock = append(toRestock, entityID)
+					break
+				}
+			}
+		}
+		vtr.mu.Unlock()
+	}
+
+	if len(removed) > 0 {
+		vtr.mu.Lock()
+		for _, id := range removed {
+			delete(vtr.villagers, id)
+		}
+		vtr.mu.Unlock()
+	}
+
+	for _, id := range toDecay {
+		s.DecayVillagerGossips(id)
+	}
 	for _, id := range toRestock {
 		s.RestockVillager(id)
 	}
 	for _, id := range removed {
+		s.ReleaseVillagerWorkstation(id)
 		s.closeMerchantScreensForVillager(id)
 	}
 }
@@ -754,8 +801,9 @@ func (s *Server) InteractWithVillager(session *PlayerSession, entityID int32) (o
 }
 
 // InteractWithEntity handles right-click entity interactions (opening the
-// merchant window for a villager, interacting with item frames/armor stands,
-// taming/feeding/sitting pets, repairing iron golems, or breeding farm animals).
+// merchant window for a villager, curing a zombie villager, interacting with
+// item frames/armor stands, taming/feeding/sitting pets, repairing iron golems,
+// or breeding farm animals).
 func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32) (opened bool, containerID int32, err error) {
 	if s == nil || s.entities == nil || session == nil {
 		return false, 0, nil
@@ -766,6 +814,10 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 	}
 	if ent.TypeName == MobTypeVillager {
 		return s.InteractWithVillager(session, targetEntityID)
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeZombieVillager {
+		handled := s.InteractWithZombieVillager(session, targetEntityID, nil)
+		return handled, 0, nil
 	}
 	if IsDecorationEntity(ent.TypeName) {
 		handled := s.InteractWithDecoration(session, targetEntityID, 0)

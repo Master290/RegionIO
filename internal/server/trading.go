@@ -807,6 +807,7 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 		return 0, errors.New("server: villager has no trades")
 	}
 
+	s.UpdateVillagerSpecialPricesForPlayer(session, entityID)
 	_ = s.CloseMerchantContainer(session, 0, false)
 
 	tr := getContainerTracker(session)
@@ -832,7 +833,7 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
 		}
-		offers := ApplyHeroOfTheVillageToOffers(session, vs.Offers)
+		offers := s.EffectiveOffersForPlayer(session, entityID, ApplyHeroOfTheVillageToOffers(session, vs.Offers))
 		offersPkt := EncodeMerchantOffersPacket(cid, offers, int32(vs.Level), vs.XP, true, true)
 		if err := session.send(PlayMerchantOffersCB, offersPkt); err != nil {
 			return cid, err
@@ -1176,6 +1177,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	tr.mu.Unlock()
 
 	if traded {
+		s.OnVillagerTradedWithPlayer(entityID, session)
 		s.TriggerVillagerTrade(session)
 		if ent := s.entities.Get(entityID); ent != nil {
 			cp := ent.ChunkPos()
@@ -1205,7 +1207,8 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 			return err
 		}
 		if traded {
-			offersPkt := EncodeMerchantOffersPacket(cid, offersSnapshot, int32(vLevel), vXP, true, true)
+			effOffers := s.EffectiveOffersForPlayer(session, entityID, offersSnapshot)
+			offersPkt := EncodeMerchantOffersPacket(cid, effOffers, int32(vLevel), vXP, true, true)
 			if err := session.send(PlayMerchantOffersCB, offersPkt); err != nil {
 				return err
 			}

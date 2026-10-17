@@ -147,10 +147,13 @@ type FishingBobberState struct {
 }
 
 type serverFishingTracker struct {
-	mu       sync.Mutex
-	byEntity map[int32]*FishingBobberState
-	byOwner  map[*PlayerSession]*FishingBobberState
-	rng      *rand.Rand
+	mu             sync.Mutex
+	byEntity       map[int32]*FishingBobberState
+	byOwner        map[*PlayerSession]*FishingBobberState
+	lastCatch      map[*PlayerSession]FishingLootDrop
+	droppedMeta    map[int32]ItemMeta
+	jungleOverride map[world.BlockPos]bool
+	rng            *rand.Rand
 }
 
 var serverFishingStates sync.Map // map[*Server]*serverFishingTracker
@@ -160,11 +163,84 @@ func (s *Server) fishingTracker() *serverFishingTracker {
 		return v.(*serverFishingTracker)
 	}
 	actual, _ := serverFishingStates.LoadOrStore(s, &serverFishingTracker{
-		byEntity: make(map[int32]*FishingBobberState),
-		byOwner:  make(map[*PlayerSession]*FishingBobberState),
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
+		byEntity:       make(map[int32]*FishingBobberState),
+		byOwner:        make(map[*PlayerSession]*FishingBobberState),
+		lastCatch:      make(map[*PlayerSession]FishingLootDrop),
+		droppedMeta:    make(map[int32]ItemMeta),
+		jungleOverride: make(map[world.BlockPos]bool),
+		rng:            rand.New(rand.NewSource(time.Now().UnixNano())),
 	})
 	return actual.(*serverFishingTracker)
+}
+
+// LastCaughtFishingLoot returns the most recent FishingLootDrop caught by session.
+func (s *Server) LastCaughtFishingLoot(session *PlayerSession) (FishingLootDrop, bool) {
+	if s == nil || session == nil {
+		return FishingLootDrop{}, false
+	}
+	ft := s.fishingTracker()
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	drop, ok := ft.lastCatch[session]
+	return drop, ok
+}
+
+// DroppedFishingItemMeta returns the ItemMeta (damage/enchantments) rolled for a
+// spawned fishing catch ItemEntity.
+func (s *Server) DroppedFishingItemMeta(entityID int32) (ItemMeta, bool) {
+	if s == nil || entityID <= 0 {
+		return ItemMeta{}, false
+	}
+	ft := s.fishingTracker()
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	meta, ok := ft.droppedMeta[entityID]
+	return meta, ok
+}
+
+// SetFishingJungleAt marks a block column (x, z) as a jungle biome for fishing
+// loot table evaluation (enabling bamboo drops from the junk table).
+func (s *Server) SetFishingJungleAt(x, z int, isJungle bool) {
+	if s == nil {
+		return
+	}
+	ft := s.fishingTracker()
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	pos := world.BlockPos{X: x, Y: 0, Z: z}
+	if isJungle {
+		ft.jungleOverride[pos] = true
+	} else {
+		delete(ft.jungleOverride, pos)
+	}
+}
+
+// IsJungleFishingAt reports whether (x, y, z) is in a jungle biome for fishing loot.
+func (s *Server) IsJungleFishingAt(x, y, z int) bool {
+	if s == nil {
+		return false
+	}
+	ft := s.fishingTracker()
+	ft.mu.Lock()
+	isJ := ft.jungleOverride[world.BlockPos{X: x, Y: 0, Z: z}]
+	ft.mu.Unlock()
+	return isJ
+}
+
+// PlayerFishingLuck computes the effective fishing luck parameter combining
+// the rod's Luck of the Sea level with the player's Luck (+1/lvl) and Bad Luck (-1/lvl) status effects.
+func PlayerFishingLuck(session *PlayerSession, luckOfTheSea int) float32 {
+	luck := float32(luckOfTheSea)
+	if session == nil {
+		return luck
+	}
+	if inst, ok := session.PlayerEffect(EffectLuck); ok {
+		luck += float32(inst.Amplifier + 1)
+	}
+	if inst, ok := session.PlayerEffect(EffectUnluck); ok {
+		luck -= float32(inst.Amplifier + 1)
+	}
+	return luck
 }
 
 // ActiveFishingBobber returns a snapshot copy of session's active fishing
@@ -470,12 +546,29 @@ func (s *Server) retrieveFishingBobber(session *PlayerSession, rodSlot int, rodS
 			} else {
 				reelDamage = FishingWearHookedEntity
 			}
+		} else if hookedPlayer := s.findOnlinePlayerByEntityID(bobberCopy.HookedEntityID, dim); hookedPlayer != nil {
+			s.pullHookedPlayerTowardPlayer(hookedPlayer, bx, by, bz, snap.X, snap.Y, snap.Z, dim)
+			pSnap := hookedPlayer.Snapshot()
+			cpX := int32(int64(math.Floor(pSnap.X)) >> 4)
+			cpZ := int32(int64(math.Floor(pSnap.Z)) >> 4)
+			s.BroadcastDimensionChunk(dim, cpX, cpZ, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(bobberCopy.EntityID, EntityEventFishingHookReel))
+			reelDamage = FishingWearHookedEntity
 		}
 	} else if bobberCopy.NibbleTicks > 0 {
-		luck := float32(bobberCopy.LuckOfTheSea)
-		drop := RollFishingLoot(rng, luck, bobberCopy.OpenWater, false)
+		luck := PlayerFishingLuck(session, bobberCopy.LuckOfTheSea)
+		isJungle := s.IsJungleFishingAt(int(math.Floor(bx)), int(math.Floor(by)), int(math.Floor(bz)))
+		drop := RollFishingLoot(rng, luck, bobberCopy.OpenWater, isJungle)
+		ft.mu.Lock()
+		ft.lastCatch[session] = drop
+		ft.mu.Unlock()
 		if !drop.Stack.IsEmpty() {
 			itemEntID, itemEnt := s.SpawnItemEntityInDimension(dim, bx, by, bz, drop.Stack)
+			if itemEntID > 0 && (drop.Meta.Damage > 0 || drop.Meta.HasEnchantments() || drop.Meta.RepairCost > 0) {
+				ft.mu.Lock()
+				ft.droppedMeta[itemEntID] = drop.Meta.Clone()
+				ft.mu.Unlock()
+			}
 			if itemEnt != nil {
 				// Vanilla FishingHook.retrieve item velocity toward owner:
 				// d0 = player.X - bobber.X; d1 = player.Y - bobber.Y; d2 = player.Z - bobber.Z
@@ -555,6 +648,54 @@ func (s *Server) pullHookedEntityTowardPlayer(hookedID int32, bobberX, bobberY, 
 	})
 	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetEntityMotion,
 		EncodeSetEntityMotionPacket(hookedID, newVX, newVY, newVZ))
+}
+
+func (s *Server) pullHookedPlayerTowardPlayer(target *PlayerSession, bobberX, bobberY, bobberZ, playerX, playerY, playerZ float64, dim string) {
+	if s == nil || target == nil {
+		return
+	}
+	pullVX := (playerX - bobberX) * 0.1
+	pullVY := (playerY - bobberY) * 0.1
+	pullVZ := (playerZ - bobberZ) * 0.1
+
+	tSnap := target.Snapshot()
+	newX := tSnap.X + pullVX*3.0
+	newY := tSnap.Y
+	if pullVY > 0 {
+		newY += pullVY
+	}
+	newZ := tSnap.Z + pullVZ*3.0
+	s.SetPlayerTransform(target, newX, newY, newZ, tSnap.Yaw, tSnap.Pitch, false)
+
+	cx := int32(int64(math.Floor(newX)) >> 4)
+	cz := int32(int64(math.Floor(newZ)) >> 4)
+	pkt := EncodeSetEntityMotionPacket(target.EntityID, pullVX, pullVY, pullVZ)
+	if target.send != nil {
+		_ = target.send(protocol.PlaySetEntityMotion, pkt)
+	}
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetEntityMotion, pkt)
+}
+
+func (s *Server) findOnlinePlayerByEntityID(entityID int32, dim string) *PlayerSession {
+	if s == nil || entityID <= 0 {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	s.playersMu.RLock()
+	defer s.playersMu.RUnlock()
+	for _, sess := range s.players {
+		if sess == nil || sess.IsDead() || sess.EntityID != entityID {
+			continue
+		}
+		snap := sess.Snapshot()
+		if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
+			continue
+		}
+		if world.NormalizeDimension(snap.Dimension) == normDim {
+			return sess
+		}
+	}
+	return nil
 }
 
 func (s *Server) triggerFishingCatchAdvancements(session *PlayerSession, caught world.ItemStack) {
@@ -830,6 +971,12 @@ func classifyOpenWaterBlock(state uint16) openWaterLayerType {
 	case "", "minecraft:air", "minecraft:cave_air", "minecraft:void_air", "minecraft:lily_pad":
 		return openWaterAbove
 	case "minecraft:water":
+		if src, ok := world.BlockStateIDByProperties("minecraft:water", map[string]string{"level": "0"}); ok && state != src && state != world.StateWater {
+			// Flowing water (level > 0) is not source water and invalidates open water.
+			return openWaterInvalid
+		}
+		return openWaterInside
+	case "minecraft:bubble_column":
 		return openWaterInside
 	default:
 		return openWaterInvalid
@@ -851,6 +998,31 @@ func (s *Server) CanSeeSkyAt(x, y, z int) bool {
 		return true
 	}
 	return y >= topY
+}
+
+// ComputeFishingBiteSpeed returns the per-tick countdown speed (0, 1, or 2) for
+// a fishing bobber's wait/approach timers matching vanilla 26.1.2 FishingHook.catchingFish:
+//   - Base speed is 1.
+//   - When raining and exposed to open sky, 25% chance to increment speed (+1 -> average 1.25 ticks/tick).
+//   - When obstructed from open sky, 50% chance to decrement speed (-1 -> average 0.5 ticks/tick).
+func ComputeFishingBiteSpeed(raining, openSky bool, rng *rand.Rand) int {
+	speed := 1
+	if rng == nil {
+		if raining && openSky {
+			return 2
+		}
+		if !openSky {
+			return 0
+		}
+		return 1
+	}
+	if raining && openSky && rng.Float32() < 0.25 {
+		speed++
+	}
+	if !openSky && rng.Float32() < 0.5 {
+		speed--
+	}
+	return speed
 }
 
 // TickFishingBobbers advances all active fishing bobbers by one server tick (50ms).
@@ -928,22 +1100,31 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 
 	switch st.State {
 	case FishHookStateHookedInEntity:
-		hooked := s.entities.Get(st.HookedEntityID)
-		if hooked == nil || hooked.EffectiveDimension() != dim {
-			st.HookedEntityID = 0
-			newHookedEntityID = 0
-			st.State = FishHookStateFlying
-			broadcastData = true
-		} else {
+		if hooked := s.entities.Get(st.HookedEntityID); hooked != nil && hooked.EffectiveDimension() == dim {
 			nextX = hooked.X
 			nextY = hooked.Y + 0.5
 			nextZ = hooked.Z
 			st.VX, st.VY, st.VZ = 0, 0, 0
 			nextOnGround = false
+		} else if hookedPlayer := s.findOnlinePlayerByEntityID(st.HookedEntityID, dim); hookedPlayer != nil {
+			pSnap := hookedPlayer.Snapshot()
+			nextX = pSnap.X
+			nextY = pSnap.Y + 0.8
+			nextZ = pSnap.Z
+			st.VX, st.VY, st.VZ = 0, 0, 0
+			nextOnGround = false
+		} else {
+			st.HookedEntityID = 0
+			newHookedEntityID = 0
+			st.State = FishHookStateFlying
+			broadcastData = true
 		}
 
 	case FishHookStateFlying:
-		if hitID := s.findHookableEntityAt(ent.ID, st.OwnerEntityID, dim, ent.X, ent.Y, ent.Z); hitID != 0 {
+		candX := ent.X + st.VX
+		candY := ent.Y + st.VY
+		candZ := ent.Z + st.VZ
+		if hitID := s.findHookableEntityAlongSegment(ent.ID, st.OwnerEntityID, dim, ent.X, ent.Y, ent.Z, candX, candY, candZ); hitID != 0 {
 			st.HookedEntityID = hitID
 			newHookedEntityID = hitID
 			st.State = FishHookStateHookedInEntity
@@ -960,9 +1141,6 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 			st.OnGround = false
 			break
 		}
-		candX := ent.X + st.VX
-		candY := ent.Y + st.VY
-		candZ := ent.Z + st.VZ
 		candBX := int(math.Floor(candX))
 		candBY := int(math.Floor(candY))
 		candBZ := int(math.Floor(candZ))
@@ -991,9 +1169,16 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 	case FishHookStateBobbing:
 		st.VX *= 0.9
 		st.VZ *= 0.9
+		if math.Abs(st.VX) < 1e-4 {
+			st.VX = 0
+		}
+		if math.Abs(st.VZ) < 1e-4 {
+			st.VZ = 0
+		}
 		if !inWater {
 			st.OutOfWaterTicks++
 			st.VY -= 0.03
+			nextY = ent.Y + st.VY
 			if st.OutOfWaterTicks >= 10 {
 				st.State = FishHookStateFlying
 			}
@@ -1002,6 +1187,28 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		st.OutOfWaterTicks = 0
 		nextOnGround = false
 		st.OnGround = false
+
+		// Drift horizontally if destination block remains water.
+		if st.VX != 0 || st.VZ != 0 {
+			driftX := ent.X + st.VX
+			driftZ := ent.Z + st.VZ
+			if s.isWaterBlockAt(int(math.Floor(driftX)), by, int(math.Floor(driftZ))) {
+				nextX = driftX
+				nextZ = driftZ
+				bx = int(math.Floor(nextX))
+				bz = int(math.Floor(nextZ))
+			} else {
+				st.VX, st.VZ = 0, 0
+			}
+		}
+
+		// Buoyancy: if submerged under another water block above, float upward into the surface block.
+		if s.isWaterBlockAt(bx, by+1, bz) {
+			st.VY = (st.VY + 0.08) * 0.6
+			nextY = ent.Y + st.VY
+			by = int(math.Floor(nextY))
+		}
+
 		st.OpenWater = s.IsOpenWaterFishingAt(bx, by, bz)
 
 		prevBiting := st.Biting
@@ -1013,7 +1220,7 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 				broadcastBiteEvt = true
 				st.VY = -0.2
 			}
-		} else if !newBiting {
+		} else if !newBiting && !s.isWaterBlockAt(bx, by+1, bz) {
 			st.VY = 0
 		}
 	}
@@ -1052,14 +1259,8 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 // stepCatchingFishLocked implements vanilla 26.1.2 FishingHook.catchingFish.
 // Caller must hold ft.mu.
 func (s *Server) stepCatchingFishLocked(st *FishingBobberState, bx, by, bz int, rng *rand.Rand) {
-	speed := 1
 	openSky := s.CanSeeSkyAt(bx, by+1, bz)
-	if s.IsRaining() && openSky && rng.Float32() < 0.25 {
-		speed++
-	}
-	if !openSky && rng.Float32() < 0.5 {
-		speed--
-	}
+	speed := ComputeFishingBiteSpeed(s.IsRaining(), openSky, rng)
 
 	if st.NibbleTicks > 0 {
 		st.NibbleTicks--
@@ -1134,10 +1335,24 @@ func (s *Server) isWaterBlockAt(x, y, z int) bool {
 		return false
 	}
 	state := s.chunks.GetBlock(x, y, z)
-	return state == world.StateWater || world.BlockName(state) == "minecraft:water"
+	return state == world.StateWater || world.BlockName(state) == "minecraft:water" || world.BlockName(state) == "minecraft:bubble_column"
+}
+
+func (s *Server) findHookableEntityAlongSegment(bobberID, ownerEntityID int32, dim string, x0, y0, z0, x1, y1, z1 float64) int32 {
+	if id := s.findHookableEntityAt(bobberID, ownerEntityID, dim, x0, y0, z0); id != 0 {
+		return id
+	}
+	mx := (x0 + x1) * 0.5
+	my := (y0 + y1) * 0.5
+	mz := (z0 + z1) * 0.5
+	if id := s.findHookableEntityAt(bobberID, ownerEntityID, dim, mx, my, mz); id != 0 {
+		return id
+	}
+	return s.findHookableEntityAt(bobberID, ownerEntityID, dim, x1, y1, z1)
 }
 
 func (s *Server) findHookableEntityAt(bobberID, ownerEntityID int32, dim string, x, y, z float64) int32 {
+	normDim := world.NormalizeDimension(dim)
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 	nearby := s.entities.AppendInChunkRange(nil, cx, cz, 1)
@@ -1147,7 +1362,7 @@ func (s *Server) findHookableEntityAt(bobberID, ownerEntityID int32, dim string,
 			other.TypeName == EntityTypeFishingBobber || other.IsExperienceOrb() || IsHangingEntity(other.TypeName) {
 			continue
 		}
-		if other.EffectiveDimension() != world.NormalizeDimension(dim) {
+		if other.EffectiveDimension() != normDim {
 			continue
 		}
 		dx := other.X - x
@@ -1155,6 +1370,24 @@ func (s *Server) findHookableEntityAt(bobberID, ownerEntityID int32, dim string,
 		dz := other.Z - z
 		if dx*dx+dz*dz <= 0.64 && math.Abs(dy) <= 1.0 {
 			return other.ID
+		}
+	}
+	// Also check online players other than ownerEntityID in the same dimension.
+	s.playersMu.RLock()
+	defer s.playersMu.RUnlock()
+	for _, sess := range s.players {
+		if sess == nil || sess.IsDead() || sess.EntityID <= 0 || sess.EntityID == ownerEntityID {
+			continue
+		}
+		pSnap := sess.Snapshot()
+		if pSnap.GameMode == GameModeSpectator || pSnap.Health <= 0 || world.NormalizeDimension(pSnap.Dimension) != normDim {
+			continue
+		}
+		dx := pSnap.X - x
+		dy := (pSnap.Y + 0.9) - y
+		dz := pSnap.Z - z
+		if dx*dx+dz*dz <= 0.64 && math.Abs(dy) <= 1.1 {
+			return sess.EntityID
 		}
 	}
 	return 0

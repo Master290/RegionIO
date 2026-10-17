@@ -367,3 +367,102 @@ func TestFishingHookedEntityPullAndDurabilityWear(t *testing.T) {
 		t.Fatal("expected bobber to despawn when player moves > 32 blocks away")
 	}
 }
+
+func TestFishingRainBiteSpeedupBobberPhysicsAndPlayerPull(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	setupWaterPool(srv.chunks, 8, 64, 8, 2, 3)
+
+	// 1. Verify rain bite speed boost (~1.25 ticks/tick) vs clear (1.0) vs roofed (~0.5).
+	rng := rand.New(rand.NewSource(777))
+	var clearSteps, rainSteps, roofSteps int
+	for i := 0; i < 1000; i++ {
+		clearSteps += ComputeFishingBiteSpeed(false, true, rng)
+		rainSteps += ComputeFishingBiteSpeed(true, true, rng)
+		roofSteps += ComputeFishingBiteSpeed(false, false, rng)
+	}
+	if clearSteps != 1000 {
+		t.Fatalf("clear open-sky steps = %d, want 1000", clearSteps)
+	}
+	if rainSteps <= clearSteps+150 {
+		t.Fatalf("expected rain open-sky steps (%d) to exceed clear steps (%d) by ~25%%", rainSteps, clearSteps)
+	}
+	if roofSteps >= clearSteps-350 {
+		t.Fatalf("expected obstructed-sky steps (%d) to be ~50%% slower than clear steps (%d)", roofSteps, clearSteps)
+	}
+
+	// Verify actual bobber countdown in rain ticks faster than 100 ticks for a 100-tick timer.
+	session := newFishingTestPlayer(t, srv, "RainAngler", 4.5, 65.0, 4.5, nil)
+	rod := world.NewNamedItemStack("minecraft:fishing_rod", 1)
+	hotbarSlot := world.HotbarContainerOffset + int(session.Snapshot().SelectedSlot)
+	session.SetInventorySlot(hotbarSlot, rod)
+
+	srv.SetWeather(WeatherRain, 12000)
+	if cast, _ := srv.UseFishingRodWithRand(session, 0, rng); !cast {
+		t.Fatal("expected cast")
+	}
+	bobber := srv.ActiveFishingBobber(session)
+	// Place bobber submerged at Y=62.5 (below surface Y=64) to test upward water buoyancy too.
+	srv.entities.Update(bobber.EntityID, func(e *world.Entity) {
+		e.X, e.Y, e.Z = 8.5, 62.5, 8.5
+	})
+	srv.SetFishingBobberTimers(session, 100, 0, 0, true)
+
+	ticks := 0
+	for ticks < 100 {
+		srv.TickFishingBobbers(rng)
+		ticks++
+		b := srv.ActiveFishingBobber(session)
+		if b != nil && b.TimeUntilHooked > 0 {
+			break
+		}
+	}
+	if ticks >= 95 {
+		t.Fatalf("expected 100-tick lure timer to expire in < 95 ticks under rain, took %d ticks", ticks)
+	}
+	entAfterFloat := srv.entities.Get(bobber.EntityID)
+	if entAfterFloat == nil || entAfterFloat.Y <= 62.5 {
+		t.Fatalf("expected submerged bobber to float upward toward surface, got Y=%.2f", entAfterFloat.Y)
+	}
+	_, _ = srv.UseFishingRodWithRand(session, 0, rng) // reel in
+
+	// 2. Verify PlayerFishingLuck combines Luck of the Sea + EffectLuck / EffectUnluck.
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectLuck, 600, 1)) // Luck II (+2)
+	if got := PlayerFishingLuck(session, 3); got != 5.0 {
+		t.Fatalf("PlayerFishingLuck(LoTS=3, Luck II) = %.1f, want 5.0", got)
+	}
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectUnluck, 600, 0)) // Bad Luck I (-1)
+	if got := PlayerFishingLuck(session, 3); got != 4.0 {
+		t.Fatalf("PlayerFishingLuck(LoTS=3, Luck II, Unluck I) = %.1f, want 4.0", got)
+	}
+
+	// 3. Verify Jungle bamboo junk loot and Enchanted/Damaged treasure ItemMeta tracking.
+	srv.SetFishingJungleAt(8, 8, true)
+	foundBamboo := false
+	for i := 0; i < 400; i++ {
+		d := RollFishingLoot(rng, 0, false, srv.IsJungleFishingAt(8, 64, 8))
+		if d.Stack.ResolvedID() == "minecraft:bamboo" {
+			foundBamboo = true
+			break
+		}
+	}
+	if !foundBamboo {
+		t.Fatal("expected bamboo to roll from junk table when fishing in jungle biome")
+	}
+
+	// 4. Verify hooking and pulling another online player wears 5 durability and moves the player closer.
+	otherPlayer := newFishingTestPlayer(t, srv, "Swimmer", 4.5, 65.0, 12.5, nil)
+	if cast, _ := srv.UseFishingRodWithRand(session, 0, rng); !cast {
+		t.Fatal("expected cast")
+	}
+	srv.SetFishingBobberHookedEntity(session, otherPlayer.EntityID)
+	beforeDist := math.Hypot(otherPlayer.Snapshot().X-4.5, otherPlayer.Snapshot().Z-4.5)
+	_, wear := srv.UseFishingRodWithRand(session, 0, rng)
+	if wear != FishingWearHookedEntity {
+		t.Fatalf("wear when pulling hooked player = %d, want %d", wear, FishingWearHookedEntity)
+	}
+	afterDist := math.Hypot(otherPlayer.Snapshot().X-4.5, otherPlayer.Snapshot().Z-4.5)
+	if afterDist >= beforeDist {
+		t.Fatalf("expected hooked player to be pulled closer: before=%.2f after=%.2f", beforeDist, afterDist)
+	}
+}
+

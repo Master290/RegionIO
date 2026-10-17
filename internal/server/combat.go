@@ -1072,6 +1072,9 @@ func (s *Server) applyDamageToMob(
 			if canonicalResourceName(target.TypeName) == MobTypeWolf {
 				s.ProvokeWildWolf(target.ID, attacker)
 			}
+			if canonicalResourceName(target.TypeName) == MobTypeVillager {
+				s.OnVillagerHurtByPlayer(target.ID, attacker)
+			}
 			s.NotifyOwnerAttackedTarget(attacker, target.ID)
 		}
 		// Apply horizontal knockback step if walkable, and set velocity on entity.
@@ -1103,6 +1106,7 @@ func (s *Server) applyDamageToMob(
 	}
 
 	// Mob died: broadcast death event + sound, trigger death status effects, notify raid manager, remove entity, and spawn loot drops (adults only).
+	deathX, deathY, deathZ := target.X, target.Y, target.Z
 	deathSnd, deathSrc := mobDeathSound(target.TypeName)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 		EncodeSoundPacket(deathSnd, deathSrc, target.X, target.Y, target.Z, 1.0, 1.0, 0))
@@ -1110,6 +1114,9 @@ func (s *Server) applyDamageToMob(
 		EncodeEntityEventPacket(target.ID, EntityEventDeath))
 	s.OnEntityDiedWithEffects(target.ID)
 	s.OnRaiderKilled(target.ID, attacker)
+	if attacker != nil && canonicalResourceName(target.TypeName) == MobTypeVillager {
+		s.OnVillagerKilledByPlayer(target.ID, dim, deathX, deathY, deathZ, attacker)
+	}
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
