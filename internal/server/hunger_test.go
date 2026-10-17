@@ -397,3 +397,85 @@ func TestHungerNBTRoundTrip(t *testing.T) {
 		t.Fatalf("restored FoodTickTimer = %d, want 42", restored.FoodTickTimer())
 	}
 }
+
+func TestAdvancementTriggersAndEffectModifiersInCombatHungerClockTrading(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	player, err := srv.RegisterPlayer(Profile{Name: "Hero", UUID: OfflineUUID("Hero")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	if err := srv.SetPlayerGameMode(player, GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+	surfaceY := float64(world.FlatSurfaceY + 1)
+	srv.SetPlayerTransform(player, 8.5, surfaceY, 8.5, 0, 0, true)
+
+	// 1. Eating golden_apple triggers husbandry/root and grants Regeneration + Absorption;
+	//    eating honey_bottle removes Poison.
+	player.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:golden_apple", 1))
+	if !srv.EatHeldItem(player) {
+		t.Fatal("EatHeldItem(golden_apple) failed")
+	}
+	if !player.HasCompletedAdvancement("minecraft:husbandry/root") {
+		t.Fatal("expected eating food to complete minecraft:husbandry/root")
+	}
+	if !player.HasPlayerEffect(EffectRegeneration) || player.AbsorptionHealth() < 4.0 {
+		t.Fatalf("expected golden_apple to grant Regeneration and Absorption, got regen=%v abs=%v",
+			player.HasPlayerEffect(EffectRegeneration), player.AbsorptionHealth())
+	}
+	srv.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectPoison, 100, 0))
+	player.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:honey_bottle", 1))
+	if !srv.EatHeldItem(player) {
+		t.Fatal("EatHeldItem(honey_bottle) failed")
+	}
+	if player.HasPlayerEffect(EffectPoison) {
+		t.Fatal("expected honey_bottle to remove Poison")
+	}
+
+	// 2. Hunger effect ticks via TickPlayerHunger (delegating to TickPlayerEffects).
+	srv.ClearPlayerEffects(player)
+	player.SetFoodExhaustion(0)
+	srv.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectHunger, 20, 1)) // +0.01 exhaustion/tick
+	if !HasActiveHungerOrHealthEffects(player) || math.Abs(float64(ActiveHungerExhaustionPerTick(player)-0.01)) > 1e-5 {
+		t.Fatalf("unexpected ActiveHungerExhaustionPerTick = %v", ActiveHungerExhaustionPerTick(player))
+	}
+	srv.TickPlayerHunger(player)
+	if got := player.FoodExhaustion(); math.Abs(float64(got-0.01)) > 1e-5 {
+		t.Fatalf("exhaustion after 1 tick of Hunger II = %v, want 0.01", got)
+	}
+
+	// 3. Strength I (+3 melee bonus) in AttackEntity and TriggerEntityKilled on mob death.
+	srv.ClearPlayerEffects(player)
+	srv.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectStrength, 200, 0))
+	player.SetInventorySlot(world.HotbarContainerOffset, world.ItemStack{})
+	zombieID, err := srv.SpawnMob(9.5, surfaceY, 8.5, MobTypeZombie)
+	if err != nil {
+		t.Fatalf("SpawnMob(zombie): %v", err)
+	}
+	srv.SetMobHealth(zombieID, 3.5)
+	dealt, killed := srv.AttackEntity(player, zombieID)
+	if !killed || math.Abs(float64(dealt-4.0)) > 1e-4 {
+		t.Fatalf("AttackEntity with Strength I: dealt=%v killed=%v, want dealt=4.0 killed=true", dealt, killed)
+	}
+	if !player.HasCompletedAdvancement("minecraft:adventure/root") ||
+		!player.HasCompletedAdvancement("minecraft:adventure/kill_a_mob") {
+		t.Fatal("expected killing zombie to complete adventure/root and adventure/kill_a_mob")
+	}
+
+	// 4. Fire Resistance blocks fire damage in DamagePlayerWithArmor; Resistance I reduces damage by 20%.
+	srv.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectFireResistance, 200, 0))
+	if got := srv.DamagePlayerWithArmor(player, 5.0, "lava"); got != 0 {
+		t.Fatalf("DamagePlayerWithArmor(lava) with Fire Resistance = %v, want 0", got)
+	}
+	srv.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectResistance, 200, 0))
+	if got := srv.DamagePlayerWithArmor(player, 10.0, "zombie"); math.Abs(float64(got-8.0)) > 1e-4 {
+		t.Fatalf("DamagePlayerWithArmor with Resistance I = %v, want 8.0", got)
+	}
+
+	// 5. Sleeping in bed at night fires TriggerSleptInBed.
+	srv.SetWorldTime(13000, 13000)
+	slept, _ := srv.SleepInBed(player, 8, world.FlatSurfaceY+1, 8)
+	if !slept || !player.HasCompletedAdvancement("minecraft:adventure/sleep_in_bed") {
+		t.Fatalf("expected SleepInBed to complete minecraft:adventure/sleep_in_bed (slept=%v)", slept)
+	}
+}

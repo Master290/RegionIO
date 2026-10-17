@@ -629,9 +629,37 @@ func (s *Server) HealPlayer(session *PlayerSession, amount float32) float32 {
 	return healed
 }
 
-// TickPlayerHunger advances one player's eating timer, exhaustion drain, natural
-// regeneration (fast saturated regen at food 20, normal regen at food >= 18), and
-// starvation damage at food 0 according to vanilla 26.1.2 FoodData.tick rules.
+// HasActiveHungerOrHealthEffects reports whether session currently has any of
+// the periodic hunger or health status effects active (hunger, saturation,
+// regeneration, poison, or wither).
+func HasActiveHungerOrHealthEffects(session *PlayerSession) bool {
+	if session == nil {
+		return false
+	}
+	return session.HasPlayerEffect(EffectHunger) ||
+		session.HasPlayerEffect(EffectSaturation) ||
+		session.HasPlayerEffect(EffectRegeneration) ||
+		session.HasPlayerEffect(EffectPoison) ||
+		session.HasPlayerEffect(EffectWither)
+}
+
+// ActiveHungerExhaustionPerTick returns the exhaustion added per tick by an
+// active Hunger status effect (0.005 * (amplifier + 1)), or 0 if not active.
+func ActiveHungerExhaustionPerTick(session *PlayerSession) float32 {
+	if session == nil {
+		return 0
+	}
+	if inst, ok := session.PlayerEffect(EffectHunger); ok {
+		return 0.005 * float32(inst.Amplifier+1)
+	}
+	return 0
+}
+
+// TickPlayerHunger advances one player's eating timer, active status effects
+// (hunger, saturation, regeneration, poison, wither via TickPlayerEffects),
+// exhaustion drain, natural regeneration (fast saturated regen at food 20,
+// normal regen at food >= 18), and starvation damage at food 0 according to
+// vanilla 26.1.2 FoodData.tick rules.
 func (s *Server) TickPlayerHunger(session *PlayerSession) {
 	if s == nil || session == nil {
 		return
@@ -639,11 +667,23 @@ func (s *Server) TickPlayerHunger(session *PlayerSession) {
 	s.tickPlayerCombatCooldown(session)
 	if session.IsDead() {
 		s.CancelEating(session)
+		s.ClearPlayerEffects(session)
 		return
 	}
 
 	// Advance active item consumption first.
 	s.tickPlayerEating(session)
+
+	// Delegate periodic status effect ticking (hunger, saturation, regeneration,
+	// poison, wither, and duration countdown) to TickPlayerEffects so logic is
+	// never duplicated.
+	if HasActiveHungerOrHealthEffects(session) || len(session.PlayerEffects()) > 0 {
+		s.TickPlayerEffects(session)
+		if session.IsDead() {
+			s.CancelEating(session)
+			return
+		}
+	}
 
 	session.mu.RLock()
 	gm := session.gameMode
@@ -770,8 +810,8 @@ func (s *Server) TickPlayerHunger(session *PlayerSession) {
 	}
 }
 
-// TickAllPlayersHunger steps hunger, eating, and combat cooldowns by one tick for
-// all connected players.
+// TickAllPlayersHunger steps hunger, eating, status effects, and combat cooldowns
+// by one tick for all connected players (plus entity effects and lingering clouds).
 func (s *Server) TickAllPlayersHunger() {
 	if s == nil {
 		return
@@ -787,6 +827,8 @@ func (s *Server) TickAllPlayersHunger() {
 		s.tickPlayerCombatCooldown(p)
 		s.TickPlayerHunger(p)
 	}
+	s.TickAllEntityEffects()
+	s.TickLingeringClouds()
 }
 
 func (session *PlayerSession) handSlotAndStack(hand int32) (slot int, stack world.ItemStack) {
@@ -1020,7 +1062,40 @@ func (s *Server) consumeFoodFromHand(session *PlayerSession, hand int32) bool {
 	cx := int32(int64(math.Floor(pos[0])) >> 4)
 	cz := int32(int64(math.Floor(pos[2])) >> 4)
 	s.BroadcastChunk(cx, cz, PlaySoundPacketID, EncodeSoundPacket("minecraft:entity.player.burp", SoundSourcePlayers, pos[0], pos[1], pos[2], 0.5, 1.0, 0))
+	s.applyConsumedFoodEffects(session, stack, props)
+	s.TriggerConsumeItem(session, stack)
 	return true
+}
+
+func (s *Server) applyConsumedFoodEffects(session *PlayerSession, stack world.ItemStack, props FoodProperties) {
+	if s == nil || session == nil || stack.IsEmpty() {
+		return
+	}
+	itemID := normalizeFoodItemID(stack.ResolvedID())
+	switch itemID {
+	case "minecraft:golden_apple":
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectRegeneration, 100, 1))
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectAbsorption, 2400, 0))
+	case "minecraft:enchanted_golden_apple":
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectRegeneration, 400, 1))
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectResistance, 6000, 0))
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectFireResistance, 6000, 0))
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectAbsorption, 2400, 3))
+	case "minecraft:honey_bottle":
+		if session.HasPlayerEffect(EffectPoison) {
+			s.RemovePlayerEffect(session, EffectPoison)
+		}
+	case "minecraft:spider_eye", "minecraft:poisonous_potato":
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectPoison, 100, 0))
+	case "minecraft:pufferfish":
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectPoison, 1200, 1))
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectHunger, 300, 2))
+		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectNausea, 300, 0))
+	default:
+		if props.HungerEffectChance >= 0.8 {
+			s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectHunger, 600, 0))
+		}
+	}
 }
 
 // DecodeUseItemPacket decodes a serverbound use_item (0x43) packet body:
@@ -1050,15 +1125,17 @@ func DecodeUseItemPacket(r *protocol.Reader) (hand, sequence int32, yaw, pitch f
 }
 
 // HandleUseItemPacket handles a serverbound use_item (0x43) packet for session,
-// starting food consumption when holding an edible item and acknowledging the
-// block/item sequence number.
+// starting food consumption when holding an edible item (or drinking/throwing a
+// potion/milk bucket) and acknowledging the block/item sequence number.
 func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader) error {
 	hand, seq, _, _, err := DecodeUseItemPacket(r)
 	if err != nil {
 		return err
 	}
 	if s != nil && session != nil {
-		s.StartEating(session, hand)
+		if !s.StartEating(session, hand) {
+			s.UsePotionOrMilkItem(session, hand)
+		}
 		if session.send != nil {
 			ack := protocol.NewWriter(4)
 			ack.VarInt(seq)

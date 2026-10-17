@@ -459,6 +459,7 @@ func (s *Server) SetPlayerSleeping(session *PlayerSession, sleeping bool) (skipp
 	s.clock.mu.Unlock()
 
 	if sleeping {
+		s.TriggerSleptInBed(session)
 		return s.TrySkipNightBySleep()
 	}
 	return false

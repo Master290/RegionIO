@@ -1169,6 +1169,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	tr.mu.Unlock()
 
 	if traded {
+		s.TriggerVillagerTrade(session)
 		if ent := s.entities.Get(entityID); ent != nil {
 			cp := ent.ChunkPos()
 			s.BroadcastChunk(cp.X, cp.Z, PlaySoundPacketID,

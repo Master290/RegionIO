@@ -732,6 +732,9 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 		dealt := s.DamagePlayerWithArmor(sess, scaled, "creeper")
 		if dealt > 0 {
 			playersDamaged++
+			if sess.IsDead() {
+				s.TriggerKilledByEntity(sess, MobTypeCreeper)
+			}
 			kb := (1.0 - dist/maxRange) * 0.8
 			vx, vy, vz := ComputeKnockback(x, z, 0, snap.X, snap.Z, kb)
 			if sess.send != nil {

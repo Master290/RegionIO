@@ -586,9 +586,10 @@ func (s *Server) SetMobHealth(entityID int32, health float32) {
 	tr.mu.Unlock()
 }
 
-// DamagePlayerWithArmor reduces rawDamage by session's worn armor defense and
-// toughness, records damage exhaustion (0.1), and applies the resulting damage
-// via DamagePlayer. Returns the post-armor damage applied.
+// DamagePlayerWithArmor reduces rawDamage by session's worn armor defense,
+// toughness, Fire Resistance, Resistance status effect, and Absorption hearts,
+// records damage exhaustion (0.1), and applies the resulting damage via
+// DamagePlayerWithEffects. Returns the post-armor, post-resistance damage.
 func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32, cause string) float32 {
 	if s == nil || session == nil || rawDamage <= 0 || session.IsDead() {
 		return 0
@@ -597,19 +598,30 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || snap.Health <= 0 {
 		return 0
 	}
+	switch cause {
+	case "fire", "in_fire", "on_fire", "lava", "hot_floor", "fireball":
+		if session.HasFireResistance() {
+			return 0
+		}
+	}
 	def, tough := session.ArmorDefense()
-	effective := DamageAfterArmor(rawDamage, def, tough)
+	afterArmor := DamageAfterArmor(rawDamage, def, tough)
+	if afterArmor <= 0 {
+		return 0
+	}
+	effective := afterArmor * session.ResistanceDamageMultiplier(cause)
 	if effective <= 0 {
 		return 0
 	}
-	s.DamagePlayer(session, effective, cause)
+	s.DamagePlayerWithEffects(session, afterArmor, cause)
 	s.RecordDamageExhaustion(session)
 	return effective
 }
 
 // AttackPlayerFromMob applies a melee attack from a mob onto target, scaling
-// damage by world difficulty, reducing it by target's armor, applying knockback
-// velocity, and broadcasting hurt sound.
+// damage by world difficulty, reducing it by target's armor and status effects,
+// applying knockback velocity, broadcasting hurt sound, and firing
+// TriggerKilledByEntity if the player dies.
 func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ float64, target *PlayerSession, baseDamage float32) float32 {
 	if s == nil || target == nil || target.IsDead() {
 		return 0
@@ -618,9 +630,12 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 	if scaled <= 0 {
 		return 0
 	}
-	dealt := s.DamagePlayerWithArmor(target, scaled, "zombie")
+	dealt := s.DamagePlayerWithArmor(target, scaled, mobAttackCauseName(mobType))
 	if dealt <= 0 {
 		return 0
+	}
+	if target.IsDead() {
+		s.TriggerKilledByEntity(target, mobType)
 	}
 	snap := target.Snapshot()
 	vx, vy, vz := ComputeKnockback(mobX, mobZ, 0, snap.X, snap.Z, BaseKnockbackStrength)
@@ -634,8 +649,9 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 }
 
 // AttackEntity performs a player melee attack against targetEntityID using
-// session's held weapon, attack cooldown scaling, critical hit and sprint-knockback
-// modifiers, hurt animation/sound, and mob death with item drops.
+// session's held weapon, Strength/Weakness melee bonus, attack cooldown scaling,
+// critical hit and sprint-knockback modifiers, hurt animation/sound, and mob
+// death with item drops and advancement triggers.
 func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dealtDamage float32, killed bool) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return 0, false
@@ -659,8 +675,12 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	}
 
 	baseDamage, _ := StackAttackStats(session.HeldItem())
+	baseDamage += session.MeleeDamageBonus()
 	scale := session.CurrentAttackStrengthScale(0.5)
 	session.ResetAttackCooldown()
+	if baseDamage <= 0 {
+		return 0, false
+	}
 
 	damage := baseDamage * AttackDamageMultiplier(scale)
 
@@ -804,6 +824,9 @@ func (s *Server) applyDamageToMob(
 	drops := MobLootDrops(target.TypeName, nil)
 	for _, drop := range drops {
 		s.SpawnItemEntity(target.X, target.Y+0.25, target.Z, drop)
+	}
+	if attacker != nil {
+		s.TriggerEntityKilled(attacker, target.TypeName)
 	}
 	return true
 }
