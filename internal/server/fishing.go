@@ -562,6 +562,7 @@ func (s *Server) retrieveFishingBobber(session *PlayerSession, rodSlot int, rodS
 		ft.mu.Lock()
 		ft.lastCatch[session] = drop
 		ft.mu.Unlock()
+		s.TriggerFishingRodHooked(session)
 		if !drop.Stack.IsEmpty() {
 			itemEntID, itemEnt := s.SpawnItemEntityInDimension(dim, bx, by, bz, drop.Stack)
 			if itemEntID > 0 && (drop.Meta.Damage > 0 || drop.Meta.HasEnchantments() || drop.Meta.RepairCost > 0) {

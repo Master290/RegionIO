@@ -1339,8 +1339,8 @@ func (s *Server) CompleteZombieVillagerCure(entityID int32) (villagerID int32, o
 		}
 		if zv.HasCurer {
 			s.OnZombieVillagerCuredByPlayer(vid, zv.CurerUUID)
+			s.TriggerCuredZombieVillagerByUUID(zv.CurerUUID)
 			if curer := s.findPlayerByUUID(zv.CurerUUID); curer != nil {
-				s.GrantCriterion(curer, "minecraft:story/cure_zombie_villager", "cured_zombie")
 				s.UpdateVillagerSpecialPricesForPlayer(curer, vid)
 			}
 		}
