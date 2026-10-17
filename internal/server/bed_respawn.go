@@ -706,6 +706,7 @@ func (s *Server) InteractBed(session *PlayerSession, x, y, z int) (slept, skippe
 		hasPartner: hasPartner,
 	})
 
+	s.RecordPlayerSleepInBed(session)
 	skipped := s.SetPlayerSleeping(session, true)
 	if skipped {
 		s.ClearAllBedOccupancy()

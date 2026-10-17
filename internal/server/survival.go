@@ -380,14 +380,20 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 
 	if mode == GameModeSurvival {
 		s.RecordBlockBreakExhaustion(session)
+		s.RecordBlockMined(session, world.BlockName(prevState))
 		var toolMeta ItemMeta
 		var heldStack world.ItemStack
 		heldSlot := session.HeldInventorySlot()
 		if session != nil && heldSlot >= 0 {
 			heldStack = session.InventorySlot(heldSlot)
 			toolMeta = GetSlotItemMeta(session, heldSlot)
+			if !heldStack.IsEmpty() {
+				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
+			}
 			if !world.IsInstantBreakBlock(prevState) {
-				s.DamagePlayerItem(session, heldSlot, 1)
+				if s.DamagePlayerItem(session, heldSlot, 1) && !heldStack.IsEmpty() {
+					s.RecordItemBroken(session, heldStack.ResolvedID())
+				}
 			}
 		}
 		if !s.DoTileDrops() {
@@ -506,7 +512,12 @@ func (s *Server) DamageHeldItem(session *PlayerSession, amount int32) bool {
 	if slot < 0 {
 		return false
 	}
-	return s.DamagePlayerItem(session, slot, amount)
+	heldID := session.InventorySlot(slot).ResolvedID()
+	broke := s.DamagePlayerItem(session, slot, amount)
+	if broke && heldID != "" {
+		s.RecordItemBroken(session, heldID)
+	}
+	return broke
 }
 
 // AttackEntityWithEnchantments performs a melee attack against targetEntityID,
@@ -522,7 +533,12 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 		}
 		dealt, killed := s.AttackEntity(session, targetEntityID)
 		if dealt > 0 {
+			s.RecordPlayerDamageDealt(session, dealt)
 			s.DamageHeldItem(session, 1)
+		}
+		if killed {
+			s.RecordEntityKilled(session, "minecraft:player")
+			s.RecordKilledByEntity(victim, "minecraft:player")
 		}
 		return dealt, killed
 	}
@@ -567,7 +583,9 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 			}
 		}
 	}
+	s.RecordPlayerDamageDealt(session, dealt)
 	if killed {
+		s.RecordEntityKilled(session, target.TypeName)
 		s.TriggerEntityKilled(session, target.TypeName)
 		if s.DoMobLoot() {
 			if xp := mobKillXPPoints(target.TypeName); xp > 0 {
@@ -750,6 +768,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		if pickedStack.ID == "" {
 			pickedStack.ID = live.Item.ResolvedID()
 		}
+		s.RecordItemPickedUp(session, pickedStack.ResolvedID(), added)
 		s.TriggerItemAcquired(session, pickedStack)
 
 		chunkPos := live.ChunkPos()
@@ -849,10 +868,15 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	send := session.send
 	session.mu.Unlock()
 
+	s.RecordPlayerDamageTaken(session, amount)
+
 	if cause != "starve" && cause != "void" && cause != "out_of_world" && !isOutOfBorder {
 		for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
-			if !session.InventorySlot(slot).IsEmpty() {
-				s.DamagePlayerItem(session, slot, 1)
+			st := session.InventorySlot(slot)
+			if !st.IsEmpty() {
+				if s.DamagePlayerItem(session, slot, 1) {
+					s.RecordItemBroken(session, st.ResolvedID())
+				}
 			}
 		}
 	}
@@ -862,6 +886,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	}
 
 	if died {
+		s.RecordPlayerDeath(session)
 		s.DespawnPlayerFishingBobber(session)
 		st := getSurvivalState(session)
 		st.mu.Lock()

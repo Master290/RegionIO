@@ -393,38 +393,49 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return false, 0, nil
 	}
 	state := cache.GetBlock(x, y, z)
+	blockName := world.BlockName(state)
 	switch {
 	case IsChestBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenChest(session, x, y, z)
 		return err == nil, cid, err
 	case IsCraftingTableBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenCraftingTable(session, x, y, z)
 		return err == nil, cid, err
 	case IsFurnaceBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenFurnace(session, x, y, z)
 		return err == nil, cid, err
 	case IsEnchantingTableBlock(state):
 		cid, err := s.OpenEnchantingTable(session, x, y, z)
 		return err == nil, cid, err
 	case IsAnvilBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenAnvil(session, x, y, z)
 		return err == nil, cid, err
 	case IsGrindstoneBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenGrindstone(session, x, y, z)
 		return err == nil, cid, err
 	case IsBrewingStandBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenBrewingStand(session, x, y, z)
 		return err == nil, cid, err
 	case IsCartographyTableBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenCartographyTable(session, x, y, z)
 		return err == nil, cid, err
 	case IsLoomBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenLoom(session, x, y, z)
 		return err == nil, cid, err
 	case IsStonecutterBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenStonecutter(session, x, y, z)
 		return err == nil, cid, err
 	case IsSmithingTableBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenSmithingTable(session, x, y, z)
 		return err == nil, cid, err
 	case IsJukeboxBlock(state):
@@ -432,15 +443,23 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return handled, 0, nil
 	case world.IsNoteBlock(state):
 		handled, _ := s.InteractNoteBlock(session, x, y, z)
+		if handled {
+			s.AwardCustomStat(session, StatTuneNoteBlock, 1)
+		}
 		return handled, 0, nil
-	case world.BlockName(state) == "minecraft:water_cauldron":
-		return s.CleanBannerInCauldron(session, 0, x, y, z), 0, nil
+	case blockName == "minecraft:water_cauldron":
+		cleaned := s.CleanBannerInCauldron(session, 0, x, y, z)
+		if cleaned {
+			s.AwardCustomStat(session, StatCleanBanner, 1)
+		}
+		return cleaned, 0, nil
 	case IsBedBlock(state):
 		s.InteractBed(session, x, y, z)
 		return true, 0, nil
 	case IsRespawnAnchorBlock(state):
 		return s.InteractRespawnAnchor(session, x, y, z), 0, nil
 	case IsLecternBlock(state):
+		s.RecordContainerOpenStat(session, blockName)
 		return s.InteractWithLectern(session, 0, x, y, z), 0, nil
 	case IsSignBlock(state):
 		return s.InteractWithSign(session, 0, x, y, z, true), 0, nil
@@ -684,6 +703,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			tr.mu.Unlock()
 			snap := session.Snapshot()
 			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 			return s.syncOpenContainer(session)
 		}
 		tr.mu.Unlock()
@@ -717,8 +737,15 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
 		menuType := tr.open.MenuType
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		prevOut := s.FurnaceSlots(bx, by, bz)[world.FurnaceSlotOutput]
 		s.applyFurnaceClickLocked(session, tr, menuType, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
+		if slot == world.FurnaceSlotOutput && !prevOut.IsEmpty() {
+			newOut := s.FurnaceSlots(bx, by, bz)[world.FurnaceSlotOutput]
+			if taken := prevOut.Count - newOut.Count; taken > 0 {
+				s.RecordItemCrafted(session, prevOut.ResolvedID(), taken)
+			}
+		}
 		s.TriggerInventoryChanged(session)
 		return s.syncFurnaceViewers(session, bx, by, bz)
 	case MenuTypeEnchantment:
@@ -840,6 +867,7 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 			}
 			snap := session.Snapshot()
 			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 		}
 	}
 
@@ -864,6 +892,7 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 	if slot == 0 {
 		// Crafting output slot.
 		if crafted := s.clickCraftingOutput(slots, 1, 9, 3, 3, 10, 46, &tr.carried, mode); !crafted.IsEmpty() {
+			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 		}
 	} else {
@@ -929,6 +958,7 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 
 	if slot == 0 {
 		if crafted := s.clickCraftingOutput(slots, 1, 4, 2, 2, 9, 45, &tr.carried, mode); !crafted.IsEmpty() {
+			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 		}
 	} else {
@@ -1014,6 +1044,7 @@ func (s *Server) clickCraftingOutput(
 			crafted = res
 		}
 	case ContainerInputQuickMove:
+		var totalCrafted int32
 		for iter := 0; iter < 64; iter++ {
 			curRes, _, match := MatchCraftingGrid(slots[gridStart:gridStart+gridCount], width, height)
 			if !match || curRes.IsEmpty() || curRes.ResolvedItemID() != resID {
@@ -1027,10 +1058,13 @@ func (s *Server) clickCraftingOutput(
 			rem := mergeIntoSlotSlice(slots, curRes, hotbarStart, invEnd)
 			rem = mergeIntoSlotSlice(slots, rem, invStart, hotbarStart)
 			consumeGridOnce()
-			crafted = res
+			totalCrafted += curRes.Count
 			if !rem.IsEmpty() {
 				break
 			}
+		}
+		if totalCrafted > 0 {
+			crafted = world.NewItemStack(resID, totalCrafted)
 		}
 	}
 	return crafted

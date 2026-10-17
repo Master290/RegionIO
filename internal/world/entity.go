@@ -3,6 +3,7 @@ package world
 import (
 	"crypto/rand"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -353,3 +354,58 @@ func (em *EntityManager) Count() int {
 	defer em.mu.RUnlock()
 	return len(em.entities)
 }
+
+var (
+	blockRegOnce     sync.Once
+	blockNameToRegID map[string]int32
+	blockRegIDToName []string
+)
+
+func buildBlockRegistryTable() {
+	stateByIDOnce.Do(buildStateTable)
+	type entry struct {
+		name  string
+		minID uint16
+	}
+	entries := make([]entry, 0, len(idsByName))
+	for name, states := range idsByName {
+		if len(states) == 0 {
+			continue
+		}
+		minID := states[0]
+		for _, id := range states[1:] {
+			if id < minID {
+				minID = id
+			}
+		}
+		entries = append(entries, entry{name: name, minID: minID})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].minID < entries[j].minID
+	})
+	blockNameToRegID = make(map[string]int32, len(entries))
+	blockRegIDToName = make([]string, len(entries))
+	for i, e := range entries {
+		blockNameToRegID[e.name] = int32(i)
+		blockRegIDToName[i] = e.name
+	}
+}
+
+// BlockRegistryID returns the 0-based BuiltInRegistries.BLOCK numeric ID for a
+// canonical block identifier (e.g. "minecraft:stone" -> 1).
+func BlockRegistryID(name string) (int32, bool) {
+	blockRegOnce.Do(buildBlockRegistryTable)
+	id, ok := blockNameToRegID[normalizeItemName(name)]
+	return id, ok
+}
+
+// BlockRegistryName returns the canonical block identifier for a 0-based
+// BuiltInRegistries.BLOCK numeric ID.
+func BlockRegistryName(id int32) (string, bool) {
+	blockRegOnce.Do(buildBlockRegistryTable)
+	if id < 0 || int(id) >= len(blockRegIDToName) {
+		return "", false
+	}
+	return blockRegIDToName[id], true
+}
+

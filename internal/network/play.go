@@ -345,6 +345,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	if h.session != nil {
 		h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
 		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
+		h.srv.RecordPlayerMovementStats(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
 		h.srv.PickupNearbyExperienceOrbs(h.session)
 		bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
@@ -530,6 +531,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickBrewingStands()
 			h.srv.TickWorldBorder()
 			h.srv.TickJukeboxes()
+			h.srv.TickAllPlayerStats()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
 			}
@@ -933,8 +935,12 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 				h.syncHotbarFromSession()
 				return err
 			}
+			prevSeed := h.session.EnchantmentSeed()
 			if err := h.srv.HandleContainerButtonClick(h.session, cid, btn); err != nil {
 				return err
+			}
+			if h.session.EnchantmentSeed() != prevSeed {
+				h.srv.AwardCustomStat(h.session, server.StatEnchantItem, 1)
 			}
 			h.syncHotbarFromSession()
 		}
@@ -1073,13 +1079,18 @@ func (h *handler) handleClientCommand(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	if action == server.ClientCommandPerformRespawn && h.srv != nil && h.session != nil {
-		if err := h.srv.RespawnPlayer(h.session); err != nil {
-			return err
-		}
-		if h.conn != nil {
-			snap := h.session.Snapshot()
-			return h.sendSetHealth(snap.Health, snap.FoodLevel, snap.FoodSaturation)
+	if h.srv != nil && h.session != nil {
+		switch action {
+		case server.ClientCommandPerformRespawn:
+			if err := h.srv.RespawnPlayer(h.session); err != nil {
+				return err
+			}
+			if h.conn != nil {
+				snap := h.session.Snapshot()
+				return h.sendSetHealth(snap.Health, snap.FoodLevel, snap.FoodSaturation)
+			}
+		case server.ClientCommandRequestStats:
+			return h.srv.HandleRequestStats(h.session)
 		}
 	}
 	return nil
@@ -1400,6 +1411,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						h.srv.SendBannerBlockEntityPacket(h.session, px, py, pz)
 					}
 					if h.session != nil {
+						h.srv.RecordItemUsed(h.session, blockName, 1)
 						h.srv.TriggerPlantedSeed(h.session, blockName)
 					}
 					if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSurvival {

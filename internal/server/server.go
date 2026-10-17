@@ -361,20 +361,27 @@ func (s *Server) SaveWorldTime() error {
 	return s.store.SaveWorldTime(gameTime, dayTime)
 }
 
-// SavePlayerData persists a single player session's data to <world>/playerdata/<uuid>.dat
-// and advancements to <world>/advancements/<uuid>.json.
+// SavePlayerData persists a single player session's data to <world>/playerdata/<uuid>.dat,
+// advancements to <world>/advancements/<uuid>.json, and statistics to <world>/stats/<uuid>.json.
 func (s *Server) SavePlayerData(session *PlayerSession) error {
 	if session == nil {
 		return nil
 	}
 	advErr := s.SavePlayerAdvancementsFile(session)
+	statsErr := s.SavePlayerStatsFile(session)
 	if s.store == nil {
-		return advErr
+		if advErr != nil {
+			return advErr
+		}
+		return statsErr
 	}
 	if err := s.store.SavePlayerData(session.Profile.UUID, session.PlayerData()); err != nil {
 		return err
 	}
-	return advErr
+	if advErr != nil {
+		return advErr
+	}
+	return statsErr
 }
 
 // SaveAllPlayers persists all currently connected players' data to disk.
@@ -530,6 +537,7 @@ func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSess
 		session.mu.Unlock()
 	}
 	_ = s.LoadPlayerAdvancementsFile(session)
+	_ = s.LoadPlayerStatsFile(session)
 	s.players[profile.UUID] = session
 	s.playerNames[nameKey] = profile.UUID
 	return session, nil
@@ -553,6 +561,7 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	}
 	s.playersMu.Unlock()
 	if removed {
+		s.AwardCustomStat(session, StatLeaveGame, 1)
 		if s.CanSleep() {
 			if s.TrySkipNightBySleep() {
 				s.ClearAllBedOccupancy()
