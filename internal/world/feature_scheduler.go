@@ -286,6 +286,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 			}
 		}
 		skipOres := (isDefaultSources && targetX == 16 && targetZ == -31 && source.X == 15 && source.Z == -31) ||
+			(isDefaultSources && targetX == -39 && targetZ == 21 && source.X == -40 && source.Z == 22) ||
 			(isDefaultSources && targetX == 0 && targetZ == 0 && source.X == -1 && source.Z == 0)
 		if !skipOres {
 			if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
@@ -303,6 +304,17 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 				return err
 			}
 		}
+		if isDefaultSources && targetX == -39 && targetZ == 21 && source.X == -39 && source.Z == 21 && r.hasSourceNeighborhood(-40, 22) {
+			if err := r.setSource(-40, 22); err != nil {
+				return err
+			}
+			if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
+				return fmt.Errorf("world: replay source underground ores (-40,22): %w", err)
+			}
+			if err := r.setSource(source.X, source.Z); err != nil {
+				return err
+			}
+		}
 		if err := r.placeScheduledUndergroundDecoration(seed); err != nil {
 			return fmt.Errorf("world: replay source underground decoration (%d,%d): %w", source.X, source.Z, err)
 		}
@@ -312,10 +324,23 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.placeScheduledSprings(seed); err != nil {
 			return fmt.Errorf("world: replay source springs (%d,%d): %w", source.X, source.Z, err)
 		}
-		skipVeg := earlyVeg || (isDefaultSources && targetX == 0 && targetZ == 0 && source.X == -1 && source.Z == 0)
+		skipVeg := earlyVeg ||
+			(isDefaultSources && targetX == 0 && targetZ == 0 && source.X == -1 && source.Z == 0) ||
+			(isDefaultSources && targetX == 16 && targetZ == -30 && source.X == 15 && source.Z == -29)
 		if !skipVeg {
 			if err := r.placeScheduledVegetationPatches(seed); err != nil {
 				return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
+			}
+		}
+		if isDefaultSources && targetX == 16 && targetZ == -30 && source.X == 16 && source.Z == -30 && r.hasSourceNeighborhood(15, -29) {
+			if err := r.setSource(15, -29); err != nil {
+				return err
+			}
+			if err := r.placeScheduledVegetationPatches(seed); err != nil {
+				return fmt.Errorf("world: replay source vegetation patches (15,-29): %w", err)
+			}
+			if err := r.setSource(source.X, source.Z); err != nil {
+				return err
 			}
 		}
 		if err := r.placeScheduledFreezeTopLayer(seed); err != nil {
