@@ -710,9 +710,9 @@ func (r *decorationRegion) growPointedDripstone(set *worldgen.FeatureSet, x, sta
 			waterlogged = "true"
 		}
 		if state, ok := nameToStateID("minecraft:pointed_dripstone", map[string]string{
-			"tip_direction": tipDir,
-			"thickness":     thickness,
-			"waterlogged":   waterlogged,
+			"vertical_direction": tipDir,
+			"thickness":          thickness,
+			"waterlogged":        waterlogged,
 		}); ok {
 			r.setBlock(x, y, z, state)
 		}

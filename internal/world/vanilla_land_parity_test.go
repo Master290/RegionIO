@@ -73,7 +73,7 @@ import (
 // exact 392,192 -> 392,210 (+18 cells), surface 383 -> 365 (-18 cells).
 const (
 	landSurfaceRatchet   = 0
-	landCellRatchet      = 393159
+	landCellRatchet      = 393160
 	landWaterlineRatchet = 0
 )
 

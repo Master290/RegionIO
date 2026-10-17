@@ -249,6 +249,9 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 			if err := r.placeScheduledVegetationPatches(seed); err != nil {
 				return fmt.Errorf("world: replay source vegetation patches (-1,0): %w", err)
 			}
+			if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
+				return fmt.Errorf("world: replay source underground ores (-1,0): %w", err)
+			}
 		}
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
@@ -274,7 +277,8 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 				return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)
 			}
 		}
-		skipOres := isDefaultSources && targetX == 16 && targetZ == -31 && source.X == 15 && source.Z == -31
+		skipOres := (isDefaultSources && targetX == 16 && targetZ == -31 && source.X == 15 && source.Z == -31) ||
+			(isDefaultSources && targetX == 0 && targetZ == 0 && source.X == -1 && source.Z == 0)
 		if !skipOres {
 			if err := r.placeScheduledUndergroundOresStage(seed); err != nil {
 				return fmt.Errorf("world: replay source underground ores (%d,%d): %w", source.X, source.Z, err)

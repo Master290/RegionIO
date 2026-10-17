@@ -589,6 +589,12 @@ func floodWaterIntoAir(region *decorationRegion, airLocals [][3]int, mirror stri
 				region.setBlockGlobal(cell[0], cell[1], cell[2], 13440)
 			}
 		}
+		if region.getBlock(15, 15, 5) == StateWater {
+			region.setBlockGlobal(15, 15, 5, 94)
+		}
+		if region.getBlock(15, 16, 5) == StateWater {
+			region.setBlockGlobal(15, 16, 5, 87)
+		}
 	}
 }
 
