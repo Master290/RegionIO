@@ -39,6 +39,9 @@ func (s *Server) entityTracker() *EntityTracker {
 // Cache.StartAutosave's convention: these are background loops that have to be
 // able to report a failure nobody is waiting on.
 func (s *Server) StartSpawning(ctx context.Context, log *slog.Logger) {
+	_ = s.LoadAllMaps()
+	_ = s.LoadScoreboardFile()
+	_ = s.LoadBossBarsFile()
 	go s.entityTickLoop(ctx, log)
 	go s.mobSpawnLoop(ctx)
 }
@@ -55,6 +58,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			_ = s.SaveDecorationsFile()
 			_ = s.SaveAllMaps()
 			_ = s.SaveScoreboardFile()
+			_ = s.SaveBossBarsFile()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -67,6 +71,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 					_ = s.SaveDecorationsFile()
 					_ = s.SaveAllMaps()
 					_ = s.SaveScoreboardFile()
+					_ = s.SaveBossBarsFile()
 				}
 			}
 			s.TickWeather(rng)
