@@ -716,9 +716,61 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case protocol.PlaySetCreativeSlot:
 		return h.handleCreativeSlot(pkt)
 
+	case protocol.PlayContainerClick:
+		return h.handleContainerClick(pkt)
+
+	case protocol.PlayContainerCloseSB:
+		return h.handleContainerClose(pkt)
+
+	case protocol.PlayContainerButtonClick, protocol.PlayContainerSlotStateChanged:
+		return nil
+
 	default:
 		h.log.Debug("play packet ignored", "id", pkt.ID)
 		return nil
+	}
+}
+
+func (h *handler) handleContainerClick(pkt protocol.Packet) error {
+	click, err := server.DecodeContainerClickPacket(pkt.Body())
+	if err != nil {
+		return err
+	}
+	if h.srv != nil && h.session != nil {
+		if err := h.srv.HandleContainerClick(h.session, click.ContainerID, int(click.Slot), click.Button, click.Mode); err != nil {
+			return err
+		}
+		h.syncHotbarFromSession()
+	}
+	return nil
+}
+
+func (h *handler) handleContainerClose(pkt protocol.Packet) error {
+	cid, err := pkt.Body().VarInt()
+	if err != nil {
+		return err
+	}
+	if h.srv != nil && h.session != nil {
+		if err := h.srv.CloseContainer(h.session, cid, false); err != nil {
+			return err
+		}
+		h.syncHotbarFromSession()
+	}
+	return nil
+}
+
+func (h *handler) syncHotbarFromSession() {
+	if h.session == nil {
+		return
+	}
+	inv := h.session.Inventory()
+	for i := 0; i < world.HotbarSlotCount; i++ {
+		st := inv[world.HotbarContainerOffset+i]
+		if st.IsEmpty() {
+			h.hotbar[i] = -1
+		} else {
+			h.hotbar[i] = st.ResolvedItemID()
+		}
 	}
 }
 
@@ -873,6 +925,16 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	seq, err := r.VarInt()
 	if err != nil {
 		return err
+	}
+
+	if h.srv != nil && h.session != nil {
+		opened, _, err := h.srv.InteractBlock(h.session, x, y, z)
+		if err != nil {
+			return err
+		}
+		if opened {
+			return h.sendBlockChangedAck(seq)
+		}
 	}
 
 	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {

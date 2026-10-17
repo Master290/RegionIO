@@ -94,6 +94,7 @@ const (
 	PlayDamageEvent         = 0x19
 	PlayEntityEvent         = 0x22
 	PlayHurtAnimation       = 0x2a
+	PlayOpenScreen          = 0x3b
 	PlayPlayerCombatKill    = 0x44
 	PlayRespawn             = 0x52
 
@@ -112,24 +113,28 @@ const (
 
 // Play, serverbound (protocol 775).
 const (
-	PlayAcceptTeleport    = 0x00
-	PlayChatCommand       = 0x07
-	PlayChatCommandSigned = 0x08
-	PlayClientCommand     = 0x0c
-	PlayKeepAliveServer   = 0x1c
-	PlayClientTickEnd     = 0x0d
-	PlayClientInformation = 0x0e
-	PlayCustomPayload     = 0x16
-	PlayMovePos           = 0x1e
-	PlayMovePosRot        = 0x1f
-	PlayMoveRot           = 0x20
-	PlayMoveStatusOnly    = 0x21
-	PlayPlayerLoaded      = 0x2c
-	PlayPlayerAction      = 0x29
-	PlayUseItemOn         = 0x42
-	PlaySetCreativeSlot   = 0x38
-	PlaySetCarriedItem    = 0x35
-	PlayChatMessage       = 0x09
+	PlayAcceptTeleport            = 0x00
+	PlayChatCommand               = 0x07
+	PlayChatCommandSigned         = 0x08
+	PlayClientCommand             = 0x0c
+	PlayContainerButtonClick      = 0x11
+	PlayContainerClick            = 0x12
+	PlayContainerCloseSB          = 0x13
+	PlayContainerSlotStateChanged = 0x14
+	PlayKeepAliveServer           = 0x1c
+	PlayClientTickEnd             = 0x0d
+	PlayClientInformation         = 0x0e
+	PlayCustomPayload             = 0x16
+	PlayMovePos                   = 0x1e
+	PlayMovePosRot                = 0x1f
+	PlayMoveRot                   = 0x20
+	PlayMoveStatusOnly            = 0x21
+	PlayPlayerLoaded              = 0x2c
+	PlayPlayerAction              = 0x29
+	PlayUseItemOn                 = 0x42
+	PlaySetCreativeSlot           = 0x38
+	PlaySetCarriedItem            = 0x35
+	PlayChatMessage               = 0x09
 )
 
 // GameEvent sub-IDs carried by the clientbound game_event packet.

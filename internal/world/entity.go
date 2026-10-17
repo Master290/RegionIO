@@ -49,6 +49,16 @@ func (e *Entity) IsItem() bool {
 	return e != nil && (e.TypeName == ItemEntityTypeName || !e.Item.IsEmpty())
 }
 
+// BlockName returns the canonical block identifier (e.g. "minecraft:chest")
+// for a block state ID, or "" if unknown.
+func BlockName(state uint16) string {
+	st, ok := stateByID(state)
+	if !ok {
+		return ""
+	}
+	return st.Name
+}
+
 // BlockDropItem returns the ItemStack dropped when breaking state in survival
 // mode, and false if the block does not drop a collectible item.
 func BlockDropItem(state uint16) (ItemStack, bool) {

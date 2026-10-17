@@ -339,6 +339,9 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 	s.broadcastBlockAndLightUpdate(x, y, z, world.StateAir, lightChunks)
+	if IsChestBlock(prevState) {
+		s.DropChestContents(x, y, z)
+	}
 
 	if mode == GameModeSurvival {
 		if drop, ok := world.BlockDropItem(prevState); ok {

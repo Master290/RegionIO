@@ -106,6 +106,7 @@ func (s ItemStack) ResolvedItemID() int32 {
 
 var (
 	itemTableOnce sync.Once
+	itemTableMu   sync.RWMutex
 	itemIDToName  map[int32]string
 	itemNameToID  map[string]int32
 )
@@ -129,6 +130,23 @@ func buildItemTable() {
 	}
 }
 
+// RegisterItems merges a map of canonical item names to network IDs into the
+// item lookup table so non-block items (sticks, tools, ingots, food, etc.)
+// resolve to their protocol item IDs.
+func RegisterItems(items map[string]int32) {
+	itemTableOnce.Do(buildItemTable)
+	itemTableMu.Lock()
+	defer itemTableMu.Unlock()
+	for rawName, id := range items {
+		name := normalizeItemName(rawName)
+		if name == "" || id < 0 {
+			continue
+		}
+		itemIDToName[id] = name
+		itemNameToID[name] = id
+	}
+}
+
 func normalizeItemName(name string) string {
 	name = strings.TrimSpace(strings.ToLower(name))
 	if name == "" {
@@ -146,7 +164,10 @@ func ItemIDToName(itemID int32) string {
 		return "minecraft:air"
 	}
 	itemTableOnce.Do(buildItemTable)
-	if name, ok := itemIDToName[itemID]; ok {
+	itemTableMu.RLock()
+	name, ok := itemIDToName[itemID]
+	itemTableMu.RUnlock()
+	if ok {
 		return name
 	}
 	return fmt.Sprintf("minecraft:item_%d", itemID)
@@ -159,7 +180,10 @@ func ItemNameToID(name string) (int32, bool) {
 		return 0, false
 	}
 	itemTableOnce.Do(buildItemTable)
-	if id, ok := itemNameToID[name]; ok {
+	itemTableMu.RLock()
+	id, ok := itemNameToID[name]
+	itemTableMu.RUnlock()
+	if ok {
 		return id, true
 	}
 	if strings.HasPrefix(name, "minecraft:item_") {

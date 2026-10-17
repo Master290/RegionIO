@@ -380,4 +380,103 @@ func TestPlaySurvivalDigPickupFallDeathAndRespawn(t *testing.T) {
 	}
 }
 
+func TestPlayContainerPacketsOpenClickAndClose(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := server.NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	rec := &recordingConn{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := NewConn(rec)
+	profile := server.Profile{Name: "CraftNet", UUID: server.OfflineUUID("CraftNet")}
+	session, err := srv.RegisterPlayer(profile, conn.Send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	defer srv.UnregisterPlayer(session)
+	srv.SetPlayerTransform(session, 8.5, float64(world.FlatSurfaceY+1), 8.5, 0, 0, true)
+	if err := srv.SetPlayerGameMode(session, server.GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+	h := &handler{
+		conn:    conn,
+		srv:     srv,
+		session: session,
+		log:     slog.Default(),
+		ctx:     ctx,
+	}
+	h.conn.Profile = profile
+
+	tableItemID, ok := world.ItemNameToID("minecraft:crafting_table")
+	if !ok {
+		t.Fatal("failed to resolve crafting_table item ID")
+	}
+	tableState, ok := world.ItemToBlock(tableItemID)
+	if !ok {
+		t.Fatal("failed to resolve crafting_table block state")
+	}
+	tx, ty, tz := 9, world.FlatSurfaceY+1, 8
+	srv.Chunks().SetBlock(tx, ty, tz, tableState)
+
+	// Give player 1x oak_log in hotbar slot 0 (slot 36 -> crafting menu slot 37).
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:oak_log", 1))
+	_ = rec.take(t)
+
+	// 1. Right-click the crafting_table via PlayUseItemOn to open it.
+	useW := protocol.NewWriter(32)
+	useW.VarInt(0)
+	useW.Position(tx, ty, tz)
+	useW.VarInt(1)
+	useW.Float32(0.5).Float32(0.5).Float32(0.5)
+	useW.Bool(false).Bool(false)
+	useW.VarInt(1)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayUseItemOn, Data: useW.Bytes()}); err != nil {
+		t.Fatalf("PlayUseItemOn crafting_table: %v", err)
+	}
+	openPkts := rec.take(t)
+	if countPackets(openPkts, protocol.PlayOpenScreen) != 1 {
+		t.Fatalf("PlayOpenScreen count = %d, want 1", countPackets(openPkts, protocol.PlayOpenScreen))
+	}
+	open := session.OpenContainer()
+	if open == nil || open.MenuType != server.MenuTypeCrafting {
+		t.Fatalf("OpenContainer = %+v, want MenuTypeCrafting", open)
+	}
+
+	// 2. Click slot 37 (pickup oak_log), click slot 1 (place into crafting grid), then shift-click slot 0 (craft 4x oak_planks).
+	sendClick := func(slot int16, button byte, mode int32) {
+		cw := protocol.NewWriter(32)
+		cw.VarInt(open.ContainerID)
+		cw.VarInt(1)
+		cw.Uint16(uint16(slot))
+		cw.Byte(button)
+		cw.VarInt(mode)
+		cw.VarInt(0)   // 0 changedSlots
+		cw.Bool(false) // empty HashedStack carriedItem
+		if err := h.handlePlay(protocol.Packet{ID: protocol.PlayContainerClick, Data: cw.Bytes()}); err != nil {
+			t.Fatalf("PlayContainerClick(slot=%d): %v", slot, err)
+		}
+	}
+	sendClick(37, 0, server.ContainerInputPickup)
+	sendClick(1, 0, server.ContainerInputPickup)
+	sendClick(0, 0, server.ContainerInputQuickMove)
+
+	if got := session.InventorySlot(world.HotbarContainerOffset); got.ResolvedID() != "minecraft:oak_planks" || got.Count != 4 {
+		t.Fatalf("hotbar slot 0 after crafting_table craft = %+v, want 4x minecraft:oak_planks", got)
+	}
+
+	// 3. Send PlayContainerCloseSB.
+	closeW := protocol.NewWriter(8).VarInt(open.ContainerID)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayContainerCloseSB, Data: closeW.Bytes()}); err != nil {
+		t.Fatalf("PlayContainerCloseSB: %v", err)
+	}
+	if session.OpenContainer() != nil {
+		t.Fatal("expected OpenContainer() to be nil after PlayContainerCloseSB")
+	}
+}
+
+
 
