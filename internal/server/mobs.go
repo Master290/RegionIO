@@ -147,6 +147,7 @@ var (
 		MobTypeWither:             EntityTypeWitherID,
 		MobTypeWitherSkeleton:     EntityTypeWitherSkeletonID,
 		EntityTypeWitherSkull:     EntityTypeWitherSkullID,
+		EntityTypeFireworkRocket:  EntityTypeFireworkRocketID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )

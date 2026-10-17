@@ -1302,7 +1302,8 @@ func IsBossOrBossSupportEntity(typeName string) bool {
 	switch strings.ToLower(strings.TrimSpace(typeName)) {
 	case MobTypeWither, EntityTypeWitherSkull,
 		MobTypeEnderDragon, EntityTypeEndCrystal,
-		EntityTypeDragonFireball, EntityTypeAreaEffectCloud:
+		EntityTypeDragonFireball, EntityTypeAreaEffectCloud,
+		EntityTypeFireworkRocket:
 		return true
 	default:
 		return false
@@ -1321,6 +1322,8 @@ func (s *Server) BossOrSupportEntityDataPacket(entityID int32, typeName string) 
 		return s.EnderDragonEntityDataPacket(entityID)
 	case EntityTypeEndCrystal:
 		return s.EndCrystalEntityDataPacket(entityID)
+	case EntityTypeFireworkRocket:
+		return s.FireworkRocketEntityDataPacket(entityID)
 	default:
 		return nil
 	}

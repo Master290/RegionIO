@@ -164,6 +164,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 	if s != nil {
 		s.TickWithers(rng)
 		s.TickEnderDragons(rng)
+		s.TickFireworkRockets()
 	}
 	t.mu.Lock()
 	t.stepEntitiesLocked(s, rng)

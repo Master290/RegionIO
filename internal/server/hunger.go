@@ -829,6 +829,7 @@ func (s *Server) TickAllPlayersHunger() {
 	}
 	s.TickAllEntityEffects()
 	s.TickLingeringClouds()
+	s.TickElytraPlayers()
 }
 
 func (session *PlayerSession) handSlotAndStack(hand int32) (slot int, stack world.ItemStack) {
@@ -1138,10 +1139,12 @@ func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader)
 		return err
 	}
 	if s != nil && session != nil {
-		if !s.StartEating(session, hand) && !s.UsePotionOrMilkItem(session, hand) {
-			if !s.UseEmptyMap(session, hand) && !s.UseBookItem(session, hand) {
-				if cast, wear := s.UseFishingRod(session, hand); !cast && wear == 0 {
-					s.UseShield(session, hand)
+		if _, boosted := s.UseFireworkRocketInAir(session, hand); !boosted && !s.UseCrossbow(session, hand) {
+			if !s.StartEating(session, hand) && !s.UsePotionOrMilkItem(session, hand) {
+				if !s.UseEmptyMap(session, hand) && !s.UseBookItem(session, hand) {
+					if cast, wear := s.UseFishingRod(session, hand); !cast && wear == 0 {
+						s.UseShield(session, hand)
+					}
 				}
 			}
 		}
@@ -1175,7 +1178,7 @@ func DecodePlayerCommandPacket(r *protocol.Reader) (entityID, action, data int32
 }
 
 // HandlePlayerCommandPacket handles a serverbound player_command (0x2a) packet
-// (START_SPRINTING, STOP_SPRINTING, STOP_SLEEPING).
+// (START_SPRINTING, STOP_SPRINTING, STOP_SLEEPING, START_FALL_FLYING).
 func (s *Server) HandlePlayerCommandPacket(session *PlayerSession, r *protocol.Reader) error {
 	_, action, _, err := DecodePlayerCommandPacket(r)
 	if err != nil {
@@ -1191,6 +1194,8 @@ func (s *Server) HandlePlayerCommandPacket(session *PlayerSession, r *protocol.R
 		session.SetSprinting(true)
 	case PlayerCommandStopSprinting:
 		session.SetSprinting(false)
+	case PlayerCommandStartFallFlying, PlayerCommandStartFallFlyingLegacy:
+		s.StartPlayerFallFlying(session)
 	}
 	return nil
 }

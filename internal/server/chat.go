@@ -887,6 +887,9 @@ var vanillaTranslationTemplates = map[string]string{
 	"death.attack.magic":                "%s was killed by magic",
 	"death.attack.wither":               "%s withered away",
 	"death.attack.inWall":               "%s suffocated in a wall",
+	"death.attack.flyIntoWall":          "%s experienced kinetic energy",
+	"death.attack.fireworks":            "%s went off with a bang",
+	"death.attack.fireworks.player":     "%s went off with a bang whilst fighting %s",
 	"death.attack.outOfWorld":           "%s fell out of the world",
 	"death.attack.generic":              "%s died",
 }
@@ -1217,6 +1220,10 @@ func (s *Server) FormatDeathMessage(victim *PlayerSession, cause string, attacke
 		return TranslationComponent("death.attack.wither", victimComp)
 	case "in_wall", "suffocation":
 		return TranslationComponent("death.attack.inWall", victimComp)
+	case "fly_into_wall":
+		return TranslationComponent("death.attack.flyIntoWall", victimComp)
+	case "fireworks":
+		return TranslationComponent("death.attack.fireworks", victimComp)
 	case "out_of_world", "void":
 		return TranslationComponent("death.attack.outOfWorld", victimComp)
 	case "explosion":
