@@ -109,8 +109,13 @@ func preCarveTerrainFor(od *worldgen.OverworldDensity, seed int64, cx, cz int32)
 	preCarveLoads[key] = load
 	preCarveMu.Unlock()
 
-	_, fluidPicker, veins, _ := vanillaGeneratorInputs(seed)
-	base := generateBaseTerrain(od, fluidPicker, veins, nil, seed, cx, cz)
+	var base baseTerrain
+	if isNetherDensity(od) {
+		base = generateNetherBaseTerrain(od, nil, seed, cx, cz)
+	} else {
+		_, fluidPicker, veins, _ := vanillaGeneratorInputs(seed)
+		base = generateBaseTerrain(od, fluidPicker, veins, nil, seed, cx, cz)
+	}
 
 	preCarveMu.Lock()
 	if existing, ok := preCarveCache[key]; ok {
@@ -326,20 +331,13 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	// position AFTER every draw has happened. The climate sampler reads
 	// quarter coordinates, so the position snaps down to the 4-block lattice
 	// exactly like QuartPos.fromBlock.
-	qx, qy, qz := (stub.X>>2)<<2, (y>>2)<<2, (stub.Z>>2)<<2
-	s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
-	biomeAtStub := biomeNameByID(BiomeAt3D(od, s2D, qx, qy, qz))
-	allowed := false
-	for _, name := range sets.BiomesFor(def) {
-		if name == biomeAtStub {
-			allowed = true
-			break
-		}
-	}
-	if !allowed {
+	if !isStructureBiomeAllowed(od, sets, def, stub.X, y, stub.Z) {
 		return nil
 	}
-	if setup.CanBeCold {
+	if setup.CanBeCold && !isNetherDensity(od) {
+		qx, qy, qz := (stub.X>>2)<<2, (y>>2)<<2, (stub.Z>>2)<<2
+		s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
+		biomeAtStub := biomeNameByID(BiomeAt3D(od, s2D, qx, qy, qz))
 		stub.Cold = worldgen.ColdEnoughToSnowAt(biomeAtStub, stub.X, y, stub.Z, SeaLevel)
 	}
 	return stub
@@ -347,6 +345,9 @@ func ruinedPortalVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 
 func ruinedPortalFindSuitableY(random *worldgen.Legacy, placement string, airPocket bool, surfaceY, ySpan, minX, minZ, maxX, maxZ int, base baseTerrain) int {
 	minCut := MinY + 15
+	if placement == "in_nether" {
+		minCut = 15
+	}
 	var y int
 	switch placement {
 	case "in_nether":

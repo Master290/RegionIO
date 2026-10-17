@@ -235,3 +235,36 @@ func containsAll(ranges [AxisCount]ClimateRange, p TargetPoint) bool {
 		ranges[4].contains(p.Depth) &&
 		ranges[5].contains(p.Weirdness)
 }
+
+var netherBiomeTable = NewParameterTable([]BiomeParameter{
+	netherPoint("minecraft:nether_wastes", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+	netherPoint("minecraft:soul_sand_valley", 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0),
+	netherPoint("minecraft:crimson_forest", 0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+	netherPoint("minecraft:warped_forest", 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.375),
+	netherPoint("minecraft:basalt_deltas", -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.175),
+})
+
+func netherPoint(name string, temp, humid, cont, ero, depth, weird, offset float64) BiomeParameter {
+	pt := func(v float64) ClimateRange {
+		q := quantize(v)
+		return ClimateRange{Min: q, Max: q}
+	}
+	return BiomeParameter{
+		Name: name,
+		Ranges: [AxisCount]ClimateRange{
+			pt(temp),
+			pt(humid),
+			pt(cont),
+			pt(ero),
+			pt(depth),
+			pt(weird),
+		},
+		Offset: quantize(offset),
+	}
+}
+
+// NetherBiomeTable returns the parameter table for MultiNoiseBiomeSourceParameterList$Preset.NETHER.
+func NetherBiomeTable() *ParameterTable {
+	return netherBiomeTable
+}
+

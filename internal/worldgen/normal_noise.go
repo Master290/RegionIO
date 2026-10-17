@@ -39,6 +39,32 @@ func NewNormalNoise(r RandomSource, firstOctave int, amplitudes []float64) *Norm
 	return n
 }
 
+// NewLegacyNormalNoise builds a NormalNoise using LegacyPerlinNoise for both
+// octave stacks, matching vanilla NormalNoise.createLegacyNetherBiome.
+func NewLegacyNormalNoise(r RandomSource, firstOctave int, amplitudes []float64) *NormalNoise {
+	n := &NormalNoise{
+		first:  NewLegacyPerlinNoise(r, firstOctave, amplitudes),
+		second: NewLegacyPerlinNoise(r, firstOctave, amplitudes),
+	}
+
+	min, max := len(amplitudes), 0
+	for i, a := range amplitudes {
+		if a != 0 {
+			if i < min {
+				min = i
+			}
+			if i > max {
+				max = i
+			}
+		}
+	}
+	expectedDeviation := 0.1 * (1.0 + 1.0/float64(max-min+1))
+	n.valueFactor = (1.0 / 6.0) / expectedDeviation
+	n.maxValue = (n.first.MaxValue() + n.second.MaxValue()) * n.valueFactor
+	return n
+}
+
+
 // GetValue samples the combined noise at (x, y, z).
 func (n *NormalNoise) GetValue(x, y, z float64) float64 {
 	return (n.first.GetValue(x, y, z) +

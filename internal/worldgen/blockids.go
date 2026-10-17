@@ -112,5 +112,9 @@ func surfaceBlockID(name string, props map[string]string) (uint16, bool) {
 	case "minecraft:smooth_stone":
 		return 13480, true
 	}
+	if id, ok := defaultBlockIDs[name]; ok {
+		return id, true
+	}
 	return 0, false
 }
+

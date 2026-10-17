@@ -613,10 +613,14 @@ func (a *anchorJSON) UnmarshalJSON(data []byte) error {
 // loadSurfaceRuleSet parses the overworld surface_rule tree, binding its
 // conditions to this loader's seeded RandomState.
 func (l *Loader) loadSurfaceRuleSet(minY, height int) (*SurfaceRuleSet, error) {
+	return l.loadSurfaceRuleSetFrom("data/overworld.json", minY, height)
+}
+
+func (l *Loader) loadSurfaceRuleSetFrom(file string, minY, height int) (*SurfaceRuleSet, error) {
 	var doc struct {
 		SurfaceRule json.RawMessage `json:"surface_rule"`
 	}
-	if err := l.readJSON("data/overworld.json", &doc); err != nil {
+	if err := l.readJSON(file, &doc); err != nil {
 		return nil, err
 	}
 	p := &surfaceParser{loader: l, minY: minY, height: height, noiseSlots: map[string]int{}}
@@ -626,3 +630,4 @@ func (l *Loader) loadSurfaceRuleSet(minY, height int) (*SurfaceRuleSet, error) {
 	}
 	return &SurfaceRuleSet{root: root, noises: p.noises}, nil
 }
+

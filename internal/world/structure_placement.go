@@ -153,14 +153,24 @@ func isStructureBiomeAllowed(od *worldgen.OverworldDensity, sets *worldgen.Struc
 		return false
 	}
 	qx, qy, qz := (x>>2)<<2, (y>>2)<<2, (z>>2)<<2
-	s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
-	biome := biomeNameByID(BiomeAt3D(od, s2D, qx, qy, qz))
+	var biome string
+	if isNetherDensity(od) {
+		s2D := worldgen.SampleColumn2D(od, od.SeaLevel, qx, qz)
+		biome = worldgen.NetherBiomeTable().FindBiome(worldgen.SampleCell(od, s2D, qx, qy, qz))
+	} else {
+		s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
+		biome = biomeNameByID(BiomeAt3D(od, s2D, qx, qy, qz))
+	}
 	for _, allowed := range sets.BiomesFor(def) {
 		if allowed == biome {
 			return true
 		}
 	}
 	return false
+}
+
+func isNetherDensity(od *worldgen.OverworldDensity) bool {
+	return od != nil && od.MinY == 0 && od.SeaLevel == 32 && od.Height == 128
 }
 
 // oceanMonumentSurroundingAllowed ports the OceanMonumentStructure.findGenerationPoint
@@ -390,6 +400,20 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 		}
 		return [3]int{stubX, stubY, stubZ}, true
 
+	case "minecraft:fortress":
+		stubX, stubY, stubZ := int(cx)*16, 64, int(cz)*16
+		if !isStructureBiomeAllowed(od, sets, def, stubX, stubY, stubZ) {
+			return [3]int{}, false
+		}
+		return [3]int{stubX, stubY, stubZ}, true
+
+	case "minecraft:nether_fossil":
+		stub := netherFossilVariantPoint(od, sets, seed, cx, cz, def, variantRandom)
+		if stub == nil {
+			return [3]int{}, false
+		}
+		return [3]int{stub.X, stub.Y, stub.Z}, true
+
 	case "minecraft:jigsaw":
 		startY := def.SampleStartHeight(variantRandom)
 		stubX, stubZ := int(cx)*16, int(cz)*16
@@ -400,7 +424,11 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 			stubY = startY + firstFreeY
 		}
 		if def.DimensionPadding > 0 {
-			if stubY < MinY+def.DimensionPadding || stubY > MinY+WorldHeight-def.DimensionPadding {
+			dimMinY, dimHeight := MinY, WorldHeight
+			if od != nil && od.Height > 0 {
+				dimMinY, dimHeight = od.MinY, od.Height
+			}
+			if stubY < dimMinY+def.DimensionPadding || stubY > dimMinY+dimHeight-def.DimensionPadding {
 				return [3]int{}, false
 			}
 		}
@@ -417,3 +445,4 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 		return [3]int{stubX, stubY, stubZ}, true
 	}
 }
+

@@ -533,8 +533,15 @@ func BuildJigsawStart(
 	bb.maxY += dy
 	piecePos[1] += dy
 
+	dimMinY := MinY
+	dimHeight := WorldHeight
+	if od != nil && od.Height > 0 {
+		dimMinY = od.MinY
+		dimHeight = od.Height
+	}
+
 	if def.DimensionPadding > 0 {
-		if bb.minY < MinY+def.DimensionPadding || bb.maxY > MinY+WorldHeight-1-def.DimensionPadding {
+		if bb.minY < dimMinY+def.DimensionPadding || bb.maxY > dimMinY+dimHeight-1-def.DimensionPadding {
 			return nil, nil
 		}
 	}
@@ -573,12 +580,12 @@ func BuildJigsawStart(
 			maxDist = 80
 		}
 		minOuterY := stubY - maxDist
-		if minOuterY < MinY+def.DimensionPadding {
-			minOuterY = MinY + def.DimensionPadding
+		if minOuterY < dimMinY+def.DimensionPadding {
+			minOuterY = dimMinY + def.DimensionPadding
 		}
 		maxOuterY := stubY + maxDist
-		if maxOuterY > MinY+WorldHeight-1-def.DimensionPadding {
-			maxOuterY = MinY + WorldHeight - 1 - def.DimensionPadding
+		if maxOuterY > dimMinY+dimHeight-1-def.DimensionPadding {
+			maxOuterY = dimMinY + dimHeight - 1 - def.DimensionPadding
 		}
 		outerBox := msBox{
 			minX: centerX - maxDist,

@@ -214,6 +214,96 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 	return od, nil
 }
 
+// LoadNetherFinalDensity builds the Nether final_density function, climate
+// router, and surface rule set for the given world seed.
+func LoadNetherFinalDensity(seed int64) (*OverworldDensity, error) {
+	l := &Loader{rs: NewLegacyRandomState(seed), dfCache: make(map[string]DensityFunction)}
+	var settings struct {
+		NoiseRouter map[string]json.RawMessage `json:"noise_router"`
+		SeaLevel    int                        `json:"sea_level"`
+		Noise       struct {
+			MinY   int `json:"min_y"`
+			Height int `json:"height"`
+		} `json:"noise"`
+		AquifersEnabled bool `json:"aquifers_enabled"`
+		OreVeinsEnabled bool `json:"ore_veins_enabled"`
+	}
+	if err := l.readJSON("data/nether.json", &settings); err != nil {
+		return nil, err
+	}
+	var node any
+	if err := json.Unmarshal(settings.NoiseRouter["final_density"], &node); err != nil {
+		return nil, err
+	}
+	final, err := l.parseNode(node)
+	if err != nil {
+		return nil, err
+	}
+	od := &OverworldDensity{
+		Final:           final,
+		SeaLevel:        settings.SeaLevel,
+		MinY:            settings.Noise.MinY,
+		Height:          settings.Noise.Height,
+		AquifersEnabled: settings.AquifersEnabled,
+		OreVeinsEnabled: settings.OreVeinsEnabled,
+		AquiferRandom:   l.rs.AquiferRandom(),
+		OreRandom:       l.rs.OreRandom(),
+		prelim:          newLevelCache(),
+	}
+	routerKeys := []struct {
+		key string
+		dst *DensityFunction
+	}{
+		{"temperature", &od.Temperature},
+		{"vegetation", &od.Humidity},
+		{"continents", &od.Continentalness},
+		{"erosion", &od.Erosion},
+		{"ridges", &od.Weirdness},
+		{"depth", &od.Depth},
+		{"barrier", &od.Barrier},
+		{"fluid_level_floodedness", &od.FluidLevelFloodedness},
+		{"fluid_level_spread", &od.FluidLevelSpread},
+		{"lava", &od.Lava},
+		{"vein_toggle", &od.VeinToggle},
+		{"vein_ridged", &od.VeinRidged},
+		{"vein_gap", &od.VeinGap},
+		{"preliminary_surface_level", &od.PreliminarySurfaceLevel},
+	}
+	for _, rk := range routerKeys {
+		raw, ok := settings.NoiseRouter[rk.key]
+		if !ok {
+			continue
+		}
+		var cn any
+		if err := json.Unmarshal(raw, &cn); err != nil {
+			return nil, fmt.Errorf("parse nether router key %q: %w", rk.key, err)
+		}
+		df, err := l.parseNode(cn)
+		if err != nil {
+			return nil, fmt.Errorf("nether router key %q: %w", rk.key, err)
+		}
+		*rk.dst = df
+	}
+	od.Interpolated = l.interpolated
+
+	surfaceNoise, err := l.noiseField("minecraft:surface")
+	if err != nil {
+		return nil, fmt.Errorf("nether surface noise: %w", err)
+	}
+	secondaryNoise, err := l.noiseField("minecraft:surface_secondary")
+	if err != nil {
+		return nil, fmt.Errorf("nether surface_secondary noise: %w", err)
+	}
+	od.Surface = &SurfaceSampler{
+		surfaceNoise:   surfaceNoise,
+		secondaryNoise: secondaryNoise,
+		positionalRand: l.rs.Positional(),
+	}
+	od.surfaceRule, od.surfaceRuleErr = l.loadSurfaceRuleSetFrom("data/nether.json", od.MinY, od.Height)
+	return od, nil
+}
+
+
 func (l *Loader) readJSON(path string, v any) error {
 	b, err := dataFS.ReadFile(path)
 	if err != nil {

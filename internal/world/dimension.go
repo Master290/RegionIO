@@ -642,41 +642,18 @@ func IsEndPortalState(state uint16) bool {
 	return BlockName(state) == "minecraft:end_portal"
 }
 
-// GenerateNether builds a placeholder Nether chunk at (cx, cz):
-//   - Y = 0: bedrock floor
-//   - Y = 1..63: netherrack floor (with lava pockets at Y = 31..32 away from spawn)
-//   - Y = 64..120: open Nether cavern with hanging glowstone clusters at Y = 120
-//   - Y = 121..126: netherrack ceiling
-//   - Y = 127: bedrock roof
+// GenerateNether builds a 26.1.2 Nether chunk at (cx, cz) for seed 0.
 func GenerateNether(cx, cz int32) *Chunk {
-	c := NewDimensionChunk(cx, cz, BiomeNetherWastes, NetherDimensionType)
-	netherrack, ok := nameToStateID("minecraft:netherrack", nil)
-	if !ok {
-		netherrack = StateStone
-	}
-	for lx := 0; lx < 16; lx++ {
-		for lz := 0; lz < 16; lz++ {
-			c.setBlockRaw(lx, 0, lz, StateBedrock)
-			for y := 1; y <= NetherFloorY; y++ {
-				c.setBlockRaw(lx, y, lz, netherrack)
-			}
-			for y := 121; y < NetherRoofY; y++ {
-				c.setBlockRaw(lx, y, lz, netherrack)
-			}
-			c.setBlockRaw(lx, NetherRoofY, lz, StateBedrock)
-		}
-	}
-	// Place a deterministic glowstone cluster under the ceiling for ambient block light.
-	c.setBlockRaw(8, 120, 8, StateGlowstone)
-	c.setBlockRaw(7, 120, 8, StateGlowstone)
-	c.setBlockRaw(8, 120, 7, StateGlowstone)
-	return c
+	defaultNetherGenOnce.Do(func() {
+		defaultNetherGen, _ = NewNetherGenerators(0)
+	})
+	return defaultNetherGen(cx, cz)
 }
 
-// NewNetherGenerator returns a placeholder Nether chunk generator for the given seed.
+// NewNetherGenerator returns the 26.1.2 Nether chunk generator for the given seed.
 func NewNetherGenerator(seed int64) Generator {
-	_ = seed
-	return GenerateNether
+	gen, _ := NewNetherGenerators(seed)
+	return gen
 }
 
 // GenerateEnd builds a placeholder End chunk at (cx, cz):

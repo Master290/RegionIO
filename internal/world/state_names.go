@@ -55,7 +55,7 @@ func stateByID(id uint16) (stateName, bool) {
 // Light opacity is not sufficient here: stairs and slabs can have opacity zero
 // while still supporting an entity.
 func supportsEntitySpawn(id uint16) bool {
-	if id == StateAir || id == StateWater {
+	if id == StateAir || id == StateWater || id == StateLava {
 		return false
 	}
 	if lightOpacity(id) > 0 {
@@ -69,7 +69,7 @@ func supportsEntitySpawn(id uint16) bool {
 	for _, suffix := range []string{
 		"_sapling", "_flower", "_tulip", "_mushroom", "_torch",
 		"_rail", "_button", "_pressure_plate", "_carpet", "_banner",
-		"_sign", "_hanging_sign",
+		"_sign", "_hanging_sign", "_roots", "_fungus", "_vines", "_vines_plant",
 	} {
 		if strings.HasSuffix(name, suffix) {
 			return false
@@ -80,7 +80,8 @@ func supportsEntitySpawn(id uint16) bool {
 		"minecraft:large_fern", "minecraft:dead_bush", "minecraft:dandelion",
 		"minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet",
 		"minecraft:oxeye_daisy", "minecraft:cornflower",
-		"minecraft:lily_of_the_valley", "minecraft:sunflower":
+		"minecraft:lily_of_the_valley", "minecraft:sunflower",
+		"minecraft:fire", "minecraft:soul_fire", "minecraft:nether_sprouts", "minecraft:lava":
 		return false
 	}
 	return true

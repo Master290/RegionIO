@@ -135,6 +135,7 @@ type carverKind int
 const (
 	carverCave carverKind = iota
 	carverCanyon
+	carverNetherCave
 )
 
 type canyonShape struct {
@@ -201,8 +202,11 @@ func loadCarverConfig(name string) (*carverConfig, error) {
 		return nil, fmt.Errorf("carver %s yScale: %w", name, err)
 	}
 	switch doc.Type {
-	case "minecraft:cave":
+	case "minecraft:cave", "minecraft:nether_cave":
 		c.kind = carverCave
+		if doc.Type == "minecraft:nether_cave" {
+			c.kind = carverNetherCave
+		}
 		for _, f := range []struct {
 			raw json.RawMessage
 			dst *floatProvider
@@ -328,12 +332,43 @@ func NewCarver(od *OverworldDensity, seed int64) (*Carver, error) {
 	return c, nil
 }
 
+// NewNetherCarver loads the Nether cave carver config (nether_cave) and its
+// replaceable block list (#minecraft:nether_carver_replaceables).
+func NewNetherCarver(od *OverworldDensity, seed int64) (*Carver, error) {
+	c := &Carver{seed: seed, minY: od.MinY, height: od.Height}
+	cfg, err := loadCarverConfig("nether_cave")
+	if err != nil {
+		return nil, err
+	}
+	c.configs = append(c.configs, cfg)
+	names, err := loadNetherCarverReplaceables()
+	if err != nil {
+		return nil, err
+	}
+	c.replaceableNames = names
+	return c, nil
+}
+
 // ReplaceableBlocks returns the block names a carver may cut through, so the
 // caller can resolve them to every state of each block.
 func (c *Carver) ReplaceableBlocks() []string { return c.replaceableNames }
 
 func loadCarverReplaceables() ([]string, error) {
 	raw, err := dataFS.ReadFile("data/carver/replaceable.json")
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Values []string `json:"values"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	return doc.Values, nil
+}
+
+func loadNetherCarverReplaceables() ([]string, error) {
+	raw, err := dataFS.ReadFile("data/carver/nether_replaceable.json")
 	if err != nil {
 		return nil, err
 	}
@@ -384,6 +419,8 @@ func (c *Carver) CarveChunk(target CarveTarget, aq *Aquifer, chunkX, chunkZ int)
 				switch cfg.kind {
 				case carverCave:
 					st.carveCave(cfg, random, sourceX, sourceZ)
+				case carverNetherCave:
+					st.carveNetherCave(cfg, random, sourceX, sourceZ)
 				case carverCanyon:
 					st.carveCanyon(cfg, random, sourceX, sourceZ)
 				}
@@ -427,6 +464,38 @@ func (s *carveState) carveCave(cfg *carverConfig, random *Legacy, sourceX, sourc
 		}
 	}
 }
+
+func (s *carveState) carveNetherCave(cfg *carverConfig, random *Legacy, sourceX, sourceZ int) {
+	const caveBound = 10
+	tunnelSystems := int(random.NextIntN(random.NextIntN(random.NextIntN(caveBound)+1) + 1))
+	for k := 0; k < tunnelSystems; k++ {
+		x := float64(sourceX<<4 + int(random.NextIntN(16)))
+		y := float64(cfg.y.sample(random, s.c.minY, s.c.height))
+		z := float64(sourceZ<<4 + int(random.NextIntN(16)))
+		horizontalMul := float64(cfg.horizontalRadiusMultiplier.sample(random))
+		verticalMul := float64(cfg.verticalRadiusMultiplier.sample(random))
+		floorLevel := float64(cfg.floorLevel.sample(random))
+		skip := caveSkip(floorLevel)
+
+		tunnels := 1
+		if random.NextIntN(4) == 0 {
+			roomYScale := float64(cfg.yScale.sample(random))
+			radius := 1.0 + random.NextFloat()*6.0
+			horizontal := 1.5 + float64(MthSin(math.Pi/2)*radius)
+			s.carveEllipsoid(cfg, x+1.0, y, z, horizontal, horizontal*roomYScale, skip)
+			tunnels += int(random.NextIntN(4))
+		}
+		for i := 0; i < tunnels; i++ {
+			yaw := random.NextFloat() * 6.2831855
+			pitch := (random.NextFloat() - 0.5) / 4.0
+			thickness := (random.NextFloat()*2.0 + random.NextFloat()) * 2.0
+			branchCount := carveDistance - int(random.NextIntN(carveDistance/4))
+			s.caveTunnel(cfg, random.NextLong(), x, y, z, horizontalMul, verticalMul,
+				thickness, yaw, pitch, 0, branchCount, 5.0, skip)
+		}
+	}
+}
+
 
 func caveThickness(r RandomSource) float32 {
 	f := r.NextFloat()*2.0 + r.NextFloat()
@@ -642,6 +711,17 @@ func (s *carveState) carveEllipsoid(cfg *carverConfig, x, y, z, horizontal, vert
 
 func (s *carveState) carveBlock(cfg *carverConfig, lx, by, lz, blockX, blockZ int, reachedSurface *bool) {
 	old := s.target.Block(lx, by, lz)
+	if cfg.kind == carverNetherCave {
+		if !s.target.Replaceable(old) {
+			return
+		}
+		carved := blockAir
+		if by <= s.c.minY+31 {
+			carved = blockLava
+		}
+		s.target.SetBlock(lx, by, lz, carved)
+		return
+	}
 	if isSurfaceTop(old) {
 		*reachedSurface = true
 	}
