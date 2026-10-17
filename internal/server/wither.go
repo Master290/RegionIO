@@ -584,6 +584,14 @@ func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float6
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 
+	s.EmitVibration(VibrationEvent{
+		Dimension:      normDim,
+		Type:           GameEventExplode,
+		X:              x,
+		Y:              y,
+		Z:              z,
+		SourceEntityID: sourceEntityID,
+	})
 	s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:entity.generic.explode", SoundSourceHostile, x, y, z, 4.0, 0.8, 0))
 
@@ -826,6 +834,15 @@ func (s *Server) DamageWither(entityID int32, damage float32, attacker *PlayerSe
 	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, protocol.PlayDamageEvent, EncodeDamageEventPacket(entityID, attackerID))
 
 	if !killed {
+		s.EmitVibration(VibrationEvent{
+			Dimension:      snap.Dimension,
+			Type:           GameEventEntityDamage,
+			X:              snap.X,
+			Y:              snap.Y,
+			Z:              snap.Z,
+			Player:         attacker,
+			SourceEntityID: entityID,
+		})
 		s.UpdateRuntimeBossBarHealth(snap.BossBarUUID, snap.Health, snap.MaxHealth)
 		s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
 			EncodeWitherEntityDataPacket(entityID, snap.Health, snap.TargetEntityIDs[0], snap.TargetEntityIDs[1], snap.TargetEntityIDs[2], snap.InvulnerableTicks))
@@ -848,7 +865,19 @@ func (s *Server) DamageWither(entityID int32, damage float32, attacker *PlayerSe
 	if !star.IsEmpty() {
 		s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, star)
 	}
-	s.SpawnExperienceOrbsInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, WitherDeathXP)
+	consumed := s.TriggerSculkCatalystOnMobDeath(snap.Dimension, snap.X, snap.Y, snap.Z, int(WitherDeathXP), attacker)
+	if !consumed {
+		s.SpawnExperienceOrbsInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, WitherDeathXP)
+	}
+	s.EmitVibration(VibrationEvent{
+		Dimension:      snap.Dimension,
+		Type:           GameEventEntityDie,
+		X:              snap.X,
+		Y:              snap.Y,
+		Z:              snap.Z,
+		Player:         attacker,
+		SourceEntityID: entityID,
+	})
 
 	if attacker != nil {
 		s.TriggerEntityKilled(attacker, MobTypeWither)

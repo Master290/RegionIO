@@ -1210,6 +1210,15 @@ func (s *Server) DetonateFireworkRocket(entityID int32) (playersHit, mobsHit int
 	// clients render the particle burst from the rocket's synced Fireworks item.
 	s.BroadcastDimensionChunk(st.Dimension, cx, cz, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(entityID, EntityEventFireworkExplode))
+	s.EmitVibration(VibrationEvent{
+		Dimension:      st.Dimension,
+		Type:           GameEventExplode,
+		X:              st.X,
+		Y:              st.Y,
+		Z:              st.Z,
+		Player:         st.ShooterPlayer,
+		SourceEntityID: entityID,
+	})
 
 	starCount := len(st.Fireworks.Explosions)
 	if starCount > 0 {

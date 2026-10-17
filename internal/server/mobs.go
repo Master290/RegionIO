@@ -154,6 +154,7 @@ var (
 		MobTypePillager:           EntityTypePillagerID,
 		MobTypeRavager:            EntityTypeRavagerID,
 		MobTypeVindicator:         EntityTypeVindicatorID,
+		MobTypeWarden:             EntityTypeWardenID,
 		MobTypeWitch:              EntityTypeWitchID,
 		MobTypeWither:             EntityTypeWitherID,
 		MobTypeWitherSkeleton:     EntityTypeWitherSkeletonID,
@@ -264,6 +265,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultEvokerMaxHealth
 	case MobTypeRavager:
 		return DefaultRavagerMaxHealth
+	case MobTypeWarden:
+		return DefaultWardenMaxHealth
 	case MobTypeWitch:
 		return DefaultWitchMaxHealth
 	case MobTypeWither:
@@ -304,6 +307,7 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	if s == nil || s.entities == nil {
 		return 0, errors.New("server: nil entity manager")
 	}
+	s.EnsureWardenSummonHook()
 	normDim := world.NormalizeDimension(dimension)
 	norm := canonicalResourceName(typeName)
 	if norm == MobTypeVillager {
@@ -314,6 +318,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeEnderDragon {
 		return s.SpawnEnderDragon(x, y, z)
+	}
+	if norm == MobTypeWarden {
+		return s.SpawnWarden(normDim, x, y, z, false)
 	}
 	if norm == MobTypeIronGolem {
 		return s.SpawnIronGolem(normDim, x, y, z, false)
@@ -785,10 +792,22 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 
+	dim := world.DimensionOverworld
 	if s.entities != nil && entityID > 0 {
+		if ent := s.entities.Get(entityID); ent != nil {
+			dim = ent.EffectiveDimension()
+		}
 		s.entities.Remove(entityID)
 		s.BroadcastChunk(cx, cz, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
 	}
+	s.EmitVibration(VibrationEvent{
+		Dimension:      dim,
+		Type:           GameEventExplode,
+		X:              x,
+		Y:              y,
+		Z:              z,
+		SourceEntityID: entityID,
+	})
 	s.BroadcastChunk(cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:entity.generic.explode", SoundSourceHostile, x, y, z, 4.0, 0.8, 0))
 
@@ -1205,7 +1224,6 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 		midY := math.Max(ent.Y, mateY)
 		midZ := (ent.Z + mateZ) * 0.5
 		offspringID, _ = s.SpawnBabyMob(dim, midX, midY, midZ, mobType)
-		s.SpawnExperienceOrbsInDimension(dim, midX, midY+0.25, midZ, 4)
 		s.GrantCriterion(session, "minecraft:husbandry/breed_an_animal", "bred")
 	}
 	return true, offspringID

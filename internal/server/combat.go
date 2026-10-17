@@ -364,7 +364,7 @@ func (session *PlayerSession) IsBlockingWithShield() bool {
 // UseShield starts blocking with a shield when session uses a minecraft:shield
 // in hand (0 = main hand, 1 = offhand).
 func (s *Server) UseShield(session *PlayerSession, hand int32) bool {
-	if s == nil || session == nil || session.IsDead() {
+	if s == nil || session == nil || session.IsDead() || s.IsPlayerShieldDisabled(session) {
 		return false
 	}
 	_, stack := session.handSlotAndStack(hand)
@@ -623,6 +623,10 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack("minecraft:bone", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeWarden:
+		if stack := world.NewNamedItemStack(SculkCatalystItemID, 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
 	}
 	return nil
 }
@@ -653,6 +657,8 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.iron_golem.hurt", SoundSourceNeutral
 	case MobTypePhantom:
 		return "minecraft:entity.phantom.hurt", SoundSourceHostile
+	case MobTypeWarden:
+		return SoundWardenHurt, SoundSourceHostile
 	case MobTypeWither:
 		return "minecraft:entity.wither.hurt", SoundSourceHostile
 	case MobTypeEnderDragon:
@@ -688,6 +694,8 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.iron_golem.death", SoundSourceNeutral
 	case MobTypePhantom:
 		return "minecraft:entity.phantom.death", SoundSourceHostile
+	case MobTypeWarden:
+		return SoundWardenDeath, SoundSourceHostile
 	case MobTypeWither:
 		return "minecraft:entity.wither.death", SoundSourceHostile
 	case MobTypeEnderDragon:
@@ -780,8 +788,26 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 	s.DamagePlayerWithEffects(session, afterArmor, cause)
 	s.RecordDamageExhaustion(session)
 	s.SyncHealthObjectives(session)
+	s.EmitVibration(VibrationEvent{
+		Dimension:      snap.Dimension,
+		Type:           GameEventEntityDamage,
+		X:              snap.X,
+		Y:              snap.Y,
+		Z:              snap.Z,
+		Player:         session,
+		SourceEntityID: snap.EntityID,
+	})
 	if session.IsDead() {
 		s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
+		s.EmitVibration(VibrationEvent{
+			Dimension:      snap.Dimension,
+			Type:           GameEventEntityDie,
+			X:              snap.X,
+			Y:              snap.Y,
+			Z:              snap.Z,
+			Player:         session,
+			SourceEntityID: snap.EntityID,
+		})
 	}
 	return effective
 }
@@ -939,6 +965,9 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	if target.TypeName == MobTypeEnderDragon {
 		return s.DamageEnderDragon(target.ID, damage, session, false)
 	}
+	if target.TypeName == MobTypeWarden {
+		return s.DamageWarden(target.ID, damage, session)
+	}
 
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
 	return damage, killed
@@ -954,6 +983,10 @@ func (s *Server) applyDamageToMob(
 ) (killed bool) {
 	if target == nil || damage <= 0 {
 		return false
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeWarden {
+		_, killed = s.DamageWarden(target.ID, damage, attacker)
+		return killed
 	}
 
 	var (
@@ -1000,6 +1033,7 @@ func (s *Server) applyDamageToMob(
 	}
 	tr.mu.Unlock()
 
+	dim := target.EffectiveDimension()
 	chunkPos := target.ChunkPos()
 	hurtYaw := yawToward(attackerX-target.X, attackerZ-target.Z)
 
@@ -1025,6 +1059,15 @@ func (s *Server) applyDamageToMob(
 
 	if !killed {
 		s.OnEntityDamagedWithEffects(target.ID, false)
+		s.EmitVibration(VibrationEvent{
+			Dimension:      dim,
+			Type:           GameEventEntityDamage,
+			X:              target.X,
+			Y:              target.Y,
+			Z:              target.Z,
+			Player:         attacker,
+			SourceEntityID: target.ID,
+		})
 		if attacker != nil {
 			if canonicalResourceName(target.TypeName) == MobTypeWolf {
 				s.ProvokeWildWolf(target.ID, attacker)
@@ -1070,6 +1113,24 @@ func (s *Server) applyDamageToMob(
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
+
+	xpReward := MobXPReward(target.TypeName, wasBaby)
+	consumed := false
+	if xpReward > 0 {
+		consumed = s.TriggerSculkCatalystOnMobDeath(dim, target.X, target.Y, target.Z, xpReward, attacker)
+	}
+	if !consumed && xpReward > 0 && attacker != nil {
+		s.SpawnExperienceOrbsInDimension(dim, target.X, target.Y+0.25, target.Z, int32(xpReward))
+	}
+	s.EmitVibration(VibrationEvent{
+		Dimension:      dim,
+		Type:           GameEventEntityDie,
+		X:              target.X,
+		Y:              target.Y,
+		Z:              target.Z,
+		Player:         attacker,
+		SourceEntityID: target.ID,
+	})
 
 	if !wasBaby {
 		drops := MobLootDrops(target.TypeName, nil)
