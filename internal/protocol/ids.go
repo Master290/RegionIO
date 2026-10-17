@@ -80,6 +80,7 @@ const (
 	PlayDisconnect       = 0x20
 	PlayBlockUpdate      = 0x08
 	PlayBlockChangedAck  = 0x04
+	PlayCommands         = 0x10
 	PlaySystemChat       = 0x79
 	PlayLightUpdate      = 0x30
 	PlayPlayerInfoRemove = 0x45
@@ -101,6 +102,8 @@ const (
 // Play, serverbound (protocol 775).
 const (
 	PlayAcceptTeleport    = 0x00
+	PlayChatCommand       = 0x07
+	PlayChatCommandSigned = 0x08
 	PlayKeepAliveServer   = 0x1c
 	PlayClientTickEnd     = 0x0d
 	PlayClientInformation = 0x0e
@@ -119,6 +122,7 @@ const (
 
 // GameEvent sub-IDs carried by the clientbound game_event packet.
 const (
+	GameEventChangeGameMode     = 3
 	GameEventStartWaitingChunks = 13
 )
 

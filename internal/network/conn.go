@@ -4,6 +4,8 @@ package network
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
 	"errors"
 	"io"
 	"net"
@@ -38,6 +40,16 @@ type Conn struct {
 
 	// Profile is populated once the client identifies during login.
 	Profile server.Profile
+
+	// Login handshake state (owned by the read loop goroutine).
+	loginStep   uint8
+	loginName   string
+	verifyToken []byte
+	loginProps  []sessionProperty
+
+	encMu  sync.Mutex
+	enc    cipher.Stream
+	encBuf []byte
 
 	outbound     chan outboundPacket
 	done         chan struct{}
@@ -74,6 +86,34 @@ func (c *Conn) EnableCompression(threshold int32) { c.compressionThreshold = thr
 
 // CompressionEnabled reports whether compression is active.
 func (c *Conn) CompressionEnabled() bool { return c.compressionThreshold >= 0 }
+
+// EnableEncryption activates AES-128/CFB8 link encryption using sharedSecret as
+// both the key and the IV, matching Minecraft's post-EncryptionResponse stream.
+func (c *Conn) EnableEncryption(sharedSecret []byte) error {
+	if len(sharedSecret) != aes.BlockSize {
+		return errors.New("network: invalid shared secret length")
+	}
+	block, err := aes.NewCipher(sharedSecret)
+	if err != nil {
+		return err
+	}
+	dec := newCFB8Decrypter(block, sharedSecret)
+	enc := newCFB8Encrypter(block, sharedSecret)
+
+	c.encMu.Lock()
+	c.enc = enc
+	c.encMu.Unlock()
+
+	c.br = bufio.NewReaderSize(cipher.StreamReader{S: dec, R: c.br}, 4096)
+	return nil
+}
+
+// EncryptionEnabled reports whether link encryption is active.
+func (c *Conn) EncryptionEnabled() bool {
+	c.encMu.Lock()
+	defer c.encMu.Unlock()
+	return c.enc != nil
+}
 
 // RemoteAddr returns the peer address for logging.
 func (c *Conn) RemoteAddr() net.Addr { return c.raw.RemoteAddr() }
@@ -178,6 +218,17 @@ func (c *Conn) writeLoop() {
 }
 
 func (c *Conn) writeFrame(frame []byte) error {
+	c.encMu.Lock()
+	if c.enc != nil {
+		if len(c.encBuf) < len(frame) {
+			c.encBuf = make([]byte, len(frame))
+		}
+		buf := c.encBuf[:len(frame)]
+		c.enc.XORKeyStream(buf, frame)
+		frame = buf
+	}
+	c.encMu.Unlock()
+
 	if err := c.raw.SetWriteDeadline(time.Now().Add(networkWriteTimeout)); err != nil {
 		return err
 	}

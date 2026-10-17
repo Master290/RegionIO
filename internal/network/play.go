@@ -60,6 +60,9 @@ func (h *handler) beginPlay() error {
 	if err := h.sendPlayerAbilities(); err != nil {
 		return err
 	}
+	if err := h.sendCommands(); err != nil {
+		return err
+	}
 	// The client's sky stays where it started until it is told the time.
 	if err := h.conn.Send(protocol.PlaySetTime, h.srv.SetTimePacket()); err != nil {
 		return err
@@ -67,6 +70,7 @@ func (h *handler) beginPlay() error {
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
 	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.visibilityRadius())
+	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
 	go h.streamer.run(h.ctx)
 	h.streamer.requestRecenter(0, 0)
 	go h.keepAliveLoop()
@@ -535,6 +539,9 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case protocol.PlayChatMessage:
 		return h.handleChat(pkt)
+
+	case protocol.PlayChatCommand, protocol.PlayChatCommandSigned:
+		return h.handleChatCommand(pkt)
 
 	case protocol.PlayUseItemOn:
 		return h.handleUseItemOn(pkt)

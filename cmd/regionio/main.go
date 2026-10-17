@@ -21,6 +21,14 @@ func main() {
 	}))
 
 	cfg := server.DefaultConfig()
+	cfg.OpsFile = "ops.json"
+	cfg.WhitelistFile = "whitelist.json"
+	if loaded, err := server.LoadPropertiesFile("server.properties", cfg); err != nil {
+		log.Error("failed to load server.properties", "err", err)
+		os.Exit(1)
+	} else {
+		cfg = loaded
+	}
 
 	// World seed: -seed flag takes precedence, then REGIONIO_SEED env, then the
 	// default (0). Accepted formats: decimal, or "0x" hex. An invalid value is
@@ -31,14 +39,16 @@ func main() {
 	worldDir := flag.String("world", cfg.WorldDir, "world directory (empty = in-memory only)")
 	maxCache := flag.Int("maxcache", cfg.MaxCachedChunks, "max cached chunks, LRU eviction (0 = unbounded)")
 	viewDistance := flag.Int("viewdistance", cfg.MaxViewDistance, "maximum client chunk view radius (2-16)")
+	online := flag.Bool("online", cfg.OnlineMode, "enable Mojang authentication and link encryption (online mode)")
 	flag.Parse()
 	cfg.WorldSeed = *seedFlag
 	cfg.Port = *port
 	cfg.WorldDir = *worldDir
 	cfg.MaxCachedChunks = *maxCache
 	cfg.MaxViewDistance = *viewDistance
+	cfg.OnlineMode = *online
 	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir,
-		"maxcache", cfg.MaxCachedChunks, "viewdistance", cfg.MaxViewDistance)
+		"maxcache", cfg.MaxCachedChunks, "viewdistance", cfg.MaxViewDistance, "online", cfg.OnlineMode)
 
 	srv, err := server.New(cfg)
 	if err != nil {
@@ -49,9 +59,11 @@ func main() {
 	// Start the chunk autosave loop. It flushes dirty chunks every 30s and does
 	// a final SaveAll when the context (cancelled by signal) ends.
 	saveCtx, saveStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	srv.SetStopFunc(saveStop)
 	autosaveDone := srv.Chunks().StartAutosave(saveCtx, log, 30*time.Second)
 
 	srv.StartSpawning(saveCtx, log)
+	go network.RunConsole(saveCtx, os.Stdin, srv, log)
 
 	ln := network.NewListener(srv, log)
 
@@ -64,8 +76,8 @@ func main() {
 	}
 	saveStop()
 	<-autosaveDone
-	if err := srv.SaveWorldTime(); err != nil {
-		log.Error("saving world clock", "err", err)
+	if err := srv.SaveAll(); err != nil {
+		log.Error("saving world", "err", err)
 	}
 	if srv.Store() != nil {
 		srv.Store().Close()

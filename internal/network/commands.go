@@ -1,0 +1,710 @@
+package network
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+
+	"regionio/internal/protocol"
+	"regionio/internal/server"
+)
+
+// Brigadier command node flags (ClientboundCommandsPacket).
+const (
+	CommandNodeRoot     byte = 0x00
+	CommandNodeLiteral  byte = 0x01
+	CommandNodeArgument byte = 0x02
+	CommandNodeTypeMask byte = 0x03
+
+	CommandFlagExecutable        byte = 0x04
+	CommandFlagRedirect          byte = 0x08
+	CommandFlagCustomSuggestions byte = 0x10
+	CommandFlagRestricted        byte = 0x20
+)
+
+// BuiltInRegistries.COMMAND_ARGUMENT_TYPE network IDs for 26.1.2 (protocol 775),
+// verified against net.minecraft.commands.synchronization.ArgumentTypeInfos.
+const (
+	ArgParserBool     int32 = 0  // brigadier:bool
+	ArgParserFloat    int32 = 1  // brigadier:float
+	ArgParserDouble   int32 = 2  // brigadier:double
+	ArgParserInteger  int32 = 3  // brigadier:integer
+	ArgParserLong     int32 = 4  // brigadier:long
+	ArgParserString   int32 = 5  // brigadier:string
+	ArgParserEntity   int32 = 6  // minecraft:entity
+	ArgParserVec3     int32 = 10 // minecraft:vec3
+	ArgParserGameMode int32 = 42 // minecraft:gamemode
+	ArgParserTime     int32 = 43 // minecraft:time
+)
+
+// StringArgumentSerializer modes for brigadier:string.
+const (
+	StringArgSingleWord     int32 = 0
+	StringArgQuotablePhrase int32 = 1
+	StringArgGreedyPhrase   int32 = 2
+)
+
+// EntityArgument.Info flags for minecraft:entity.
+const (
+	EntityArgSingle      byte = 0x01
+	EntityArgPlayersOnly byte = 0x02
+)
+
+// CommandNode represents one entry in the clientbound commands (0x10) packet's
+// flattened Brigadier graph.
+type CommandNode struct {
+	Flags        byte
+	Children     []int32
+	Redirect     int32
+	Name         string
+	ParserID     int32
+	Properties   []byte
+	SuggestionID string
+}
+
+// DefaultCommandTree builds the Brigadier command graph advertised to clients
+// upon entering the Play state.
+func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
+	add := func(n CommandNode) int32 {
+		idx := int32(len(nodes))
+		nodes = append(nodes, n)
+		return idx
+	}
+	literal := func(name string, executable bool, children ...int32) int32 {
+		flags := CommandNodeLiteral
+		if executable {
+			flags |= CommandFlagExecutable
+		}
+		return add(CommandNode{
+			Flags:    flags,
+			Children: children,
+			Name:     name,
+		})
+	}
+	argument := func(name string, parserID int32, props []byte, executable bool, children ...int32) int32 {
+		flags := CommandNodeArgument
+		if executable {
+			flags |= CommandFlagExecutable
+		}
+		return add(CommandNode{
+			Flags:      flags,
+			Children:   children,
+			Name:       name,
+			ParserID:   parserID,
+			Properties: props,
+		})
+	}
+
+	// Reserve index 0 for the root node so children can be appended and linked.
+	rootIdx := add(CommandNode{Flags: CommandNodeRoot})
+
+	// /tp <location> | /tp <targets> [<location> | <destination>]
+	tpDestEntity := argument("destination", ArgParserEntity, []byte{EntityArgSingle | EntityArgPlayersOnly}, true)
+	tpDestLocation := argument("location", ArgParserVec3, nil, true)
+	tpTargets := argument("targets", ArgParserEntity, []byte{EntityArgSingle | EntityArgPlayersOnly}, true, tpDestLocation, tpDestEntity)
+	tpSelfLocation := argument("location", ArgParserVec3, nil, true)
+	tpNode := literal("tp", false, tpSelfLocation, tpTargets)
+
+	// /gamemode <gamemode> [<target>]
+	gmTarget := argument("target", ArgParserEntity, []byte{EntityArgSingle | EntityArgPlayersOnly}, true)
+	gmMode := argument("gamemode", ArgParserGameMode, nil, true, gmTarget)
+	gamemodeNode := literal("gamemode", false, gmMode)
+
+	// /time set (day|noon|night|midnight|<time>) | /time add <time>
+	var minZero [4]byte
+	binary.BigEndian.PutUint32(minZero[:], 0)
+	timeSetDay := literal("day", true)
+	timeSetNoon := literal("noon", true)
+	timeSetNight := literal("night", true)
+	timeSetMidnight := literal("midnight", true)
+	timeSetVal := argument("time", ArgParserTime, minZero[:], true)
+	timeSet := literal("set", false, timeSetDay, timeSetNoon, timeSetNight, timeSetMidnight, timeSetVal)
+
+	timeAddVal := argument("time", ArgParserTime, minZero[:], true)
+	timeAdd := literal("add", false, timeAddVal)
+	timeNode := literal("time", false, timeSet, timeAdd)
+
+	// /seed
+	seedNode := literal("seed", true)
+
+	// /save-all [flush]
+	saveFlush := literal("flush", true)
+	saveAllNode := literal("save-all", true, saveFlush)
+
+	// /stop
+	stopNode := literal("stop", true)
+
+	// /list [uuids]
+	listUUIDs := literal("uuids", true)
+	listNode := literal("list", true, listUUIDs)
+
+	// /help [<command>]
+	greedyProps := protocol.NewWriter(2)
+	greedyProps.VarInt(StringArgGreedyPhrase)
+	helpArg := argument("command", ArgParserString, greedyProps.Bytes(), true)
+	helpNode := literal("help", true, helpArg)
+
+	nodes[rootIdx].Children = []int32{
+		tpNode,
+		gamemodeNode,
+		timeNode,
+		seedNode,
+		saveAllNode,
+		stopNode,
+		listNode,
+		helpNode,
+	}
+	return nodes, rootIdx
+}
+
+// EncodeCommandsPacket serializes the default Brigadier command tree into the
+// clientbound commands (0x10) packet payload.
+func EncodeCommandsPacket() []byte {
+	nodes, rootIdx := DefaultCommandTree()
+	return EncodeCommandTree(nodes, rootIdx)
+}
+
+// EncodeCommandTree serializes an arbitrary slice of Brigadier nodes and root
+// index into the wire format of ClientboundCommandsPacket.
+func EncodeCommandTree(nodes []CommandNode, rootIndex int32) []byte {
+	w := protocol.NewWriter(256)
+	w.VarInt(int32(len(nodes)))
+	for _, n := range nodes {
+		w.Byte(n.Flags)
+		w.VarInt(int32(len(n.Children)))
+		for _, child := range n.Children {
+			w.VarInt(child)
+		}
+		if n.Flags&CommandFlagRedirect != 0 {
+			w.VarInt(n.Redirect)
+		}
+		switch n.Flags & CommandNodeTypeMask {
+		case CommandNodeLiteral:
+			w.String(n.Name)
+		case CommandNodeArgument:
+			w.String(n.Name)
+			w.VarInt(n.ParserID)
+			if len(n.Properties) > 0 {
+				w.Raw(n.Properties)
+			}
+			if n.Flags&CommandFlagCustomSuggestions != 0 {
+				w.String(n.SuggestionID)
+			}
+		}
+	}
+	w.VarInt(rootIndex)
+	return w.Bytes()
+}
+
+func (h *handler) sendCommands() error {
+	return h.conn.Send(protocol.PlayCommands, EncodeCommandsPacket())
+}
+
+func (h *handler) handleChatCommand(pkt protocol.Packet) error {
+	cmd, err := pkt.Body().String()
+	if err != nil {
+		return err
+	}
+	h.log.Info("command", "player", h.conn.Profile.Name, "cmd", cmd)
+	reply := ExecuteCommand(h.srv, h.session, cmd)
+	if reply != "" {
+		return h.srv.SendSystemChat(h.session, reply)
+	}
+	return nil
+}
+
+// CoordArg represents a single coordinate argument, either absolute or relative
+// (~offset) to the target's current position.
+type CoordArg struct {
+	Value    float64
+	Relative bool
+}
+
+// Resolve computes the world coordinate given the entity's current coordinate.
+func (c CoordArg) Resolve(origin float64) float64 {
+	if c.Relative {
+		return origin + c.Value
+	}
+	return c.Value
+}
+
+// ParseCoordArg parses an absolute coordinate ("12.5") or tilde-relative
+// coordinate ("~" or "~-3.5").
+func ParseCoordArg(raw string) (CoordArg, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return CoordArg{}, errors.New("empty coordinate")
+	}
+	if strings.HasPrefix(raw, "~") {
+		rest := strings.TrimPrefix(raw, "~")
+		if rest == "" {
+			return CoordArg{Value: 0, Relative: true}, nil
+		}
+		v, err := strconv.ParseFloat(rest, 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return CoordArg{}, fmt.Errorf("invalid relative coordinate %q", raw)
+		}
+		return CoordArg{Value: v, Relative: true}, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return CoordArg{}, fmt.Errorf("invalid coordinate %q", raw)
+	}
+	return CoordArg{Value: v, Relative: false}, nil
+}
+
+// ParseGameMode parses a game mode name or numeric alias into server.GameMode*.
+func ParseGameMode(raw string) (uint8, string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "survival", "s", "0":
+		return server.GameModeSurvival, "Survival", nil
+	case "creative", "c", "1":
+		return server.GameModeCreative, "Creative", nil
+	case "adventure", "a", "2":
+		return server.GameModeAdventure, "Adventure", nil
+	case "spectator", "sp", "3":
+		return server.GameModeSpectator, "Spectator", nil
+	default:
+		return 0, "", fmt.Errorf("unknown game mode %q", raw)
+	}
+}
+
+// ParseTimeValue parses a time argument for /time set or /time add. Presets
+// (day, noon, night, midnight, sunrise, sunset) are accepted when allowPresets
+// is true; numeric values with optional t/s/d suffixes are always accepted.
+func ParseTimeValue(raw string, allowPresets bool) (int64, error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return 0, errors.New("empty time value")
+	}
+	if allowPresets {
+		switch s {
+		case "day":
+			return 1000, nil
+		case "noon":
+			return 6000, nil
+		case "sunset", "dusk":
+			return 12000, nil
+		case "night":
+			return 13000, nil
+		case "midnight":
+			return 18000, nil
+		case "sunrise", "dawn":
+			return 23000, nil
+		}
+	}
+	mult := 1.0
+	switch {
+	case strings.HasSuffix(s, "d"):
+		mult = 24000.0
+		s = strings.TrimSuffix(s, "d")
+	case strings.HasSuffix(s, "s"):
+		mult = 20.0
+		s = strings.TrimSuffix(s, "s")
+	case strings.HasSuffix(s, "t"):
+		mult = 1.0
+		s = strings.TrimSuffix(s, "t")
+	}
+	if mult == 1.0 {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			if v < 0 {
+				return 0, fmt.Errorf("time value %d must be non-negative", v)
+			}
+			return v, nil
+		}
+	}
+	f, err := strconv.ParseFloat(s, 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return 0, fmt.Errorf("invalid time value %q", raw)
+	}
+	return int64(math.Round(f * mult)), nil
+}
+
+// ParsedCommand holds the normalized command name and tokenized arguments.
+type ParsedCommand struct {
+	Name string
+	Args []string
+}
+
+// ParseCommandLine strips an optional leading slash and splits a command line
+// into a lowercase command name and argument tokens.
+func ParseCommandLine(line string) (ParsedCommand, error) {
+	trimmed := strings.TrimSpace(line)
+	trimmed = strings.TrimPrefix(trimmed, "/")
+	fields := strings.Fields(trimmed)
+	if len(fields) == 0 {
+		return ParsedCommand{}, errors.New("empty command")
+	}
+	return ParsedCommand{
+		Name: strings.ToLower(fields[0]),
+		Args: fields[1:],
+	}, nil
+}
+
+// ExecuteCommand parses and runs a command on behalf of sender (nil when
+// executed from the server console) and returns the response message.
+func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine string) string {
+	if srv == nil {
+		return "Server unavailable"
+	}
+	parsed, err := ParseCommandLine(rawLine)
+	if err != nil {
+		return ""
+	}
+	switch parsed.Name {
+	case "help", "?":
+		return execHelp(parsed.Args)
+	case "list":
+		return execList(srv, parsed.Args)
+	case "seed":
+		return fmt.Sprintf("Seed: [%d]", srv.Config().WorldSeed)
+	case "tp", "teleport":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execTeleport(srv, sender, parsed.Args)
+	case "gamemode":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execGameMode(srv, sender, parsed.Args)
+	case "time":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execTime(srv, parsed.Args)
+	case "save-all":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		if err := srv.SaveAll(); err != nil {
+			return fmt.Sprintf("Save failed: %v", err)
+		}
+		return "Saved the game"
+	case "stop":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		srv.BroadcastSystemChat("Stopping the server")
+		if err := srv.RequestStop(); err != nil {
+			return fmt.Sprintf("Stopping the server (save error: %v)", err)
+		}
+		return "Stopping the server"
+	case "op":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		if len(parsed.Args) != 1 {
+			return "Usage: /op <player>"
+		}
+		name := parsed.Args[0]
+		profile := server.Profile{Name: name, UUID: server.OfflineUUID(name)}
+		if target := srv.PlayerByName(name); target != nil {
+			profile = target.Profile
+		}
+		if err := srv.GrantOp(profile); err != nil {
+			return fmt.Sprintf("Failed to op %s: %v", name, err)
+		}
+		return fmt.Sprintf("Made %s a server operator", profile.Name)
+	case "deop":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		if len(parsed.Args) != 1 {
+			return "Usage: /deop <player>"
+		}
+		name := parsed.Args[0]
+		if err := srv.RevokeOp(name); err != nil {
+			return fmt.Sprintf("Failed to deop %s: %v", name, err)
+		}
+		return fmt.Sprintf("Made %s no longer a server operator", name)
+	case "whitelist":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execWhitelist(srv, parsed.Args)
+	default:
+		return fmt.Sprintf("Unknown command: %s. Type /help for a list of commands.", parsed.Name)
+	}
+}
+
+func resolveTargetSession(srv *server.Server, sender *server.PlayerSession, token string) *server.PlayerSession {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "@s", "@p":
+		return sender
+	default:
+		return srv.PlayerByName(token)
+	}
+}
+
+func execTeleport(srv *server.Server, sender *server.PlayerSession, args []string) string {
+	switch len(args) {
+	case 1:
+		if sender == nil {
+			return "Usage: /tp <player> <target> or /tp <player> <x> <y> <z>"
+		}
+		dest := resolveTargetSession(srv, sender, args[0])
+		if dest == nil {
+			return fmt.Sprintf("Player %q not found", args[0])
+		}
+		snap := dest.Snapshot()
+		if err := srv.TeleportPlayer(sender, snap.X, snap.Y, snap.Z, snap.Yaw, snap.Pitch); err != nil {
+			return fmt.Sprintf("Teleport failed: %v", err)
+		}
+		return fmt.Sprintf("Teleported %s to %s", sender.Profile.Name, snap.Profile.Name)
+
+	case 2:
+		subject := resolveTargetSession(srv, sender, args[0])
+		if subject == nil {
+			return fmt.Sprintf("Player %q not found", args[0])
+		}
+		dest := resolveTargetSession(srv, sender, args[1])
+		if dest == nil {
+			return fmt.Sprintf("Player %q not found", args[1])
+		}
+		snap := dest.Snapshot()
+		if err := srv.TeleportPlayer(subject, snap.X, snap.Y, snap.Z, snap.Yaw, snap.Pitch); err != nil {
+			return fmt.Sprintf("Teleport failed: %v", err)
+		}
+		return fmt.Sprintf("Teleported %s to %s", subject.Profile.Name, snap.Profile.Name)
+
+	case 3:
+		if sender == nil {
+			return "Usage: /tp <player> <x> <y> <z>"
+		}
+		return teleportSessionToCoords(srv, sender, args[0], args[1], args[2])
+
+	case 4:
+		subject := resolveTargetSession(srv, sender, args[0])
+		if subject == nil {
+			return fmt.Sprintf("Player %q not found", args[0])
+		}
+		return teleportSessionToCoords(srv, subject, args[1], args[2], args[3])
+
+	default:
+		return "Usage: /tp <x> <y> <z> or /tp <target> [x y z]"
+	}
+}
+
+func teleportSessionToCoords(srv *server.Server, target *server.PlayerSession, rawX, rawY, rawZ string) string {
+	cx, err := ParseCoordArg(rawX)
+	if err != nil {
+		return fmt.Sprintf("Invalid X coordinate: %v", err)
+	}
+	cy, err := ParseCoordArg(rawY)
+	if err != nil {
+		return fmt.Sprintf("Invalid Y coordinate: %v", err)
+	}
+	cz, err := ParseCoordArg(rawZ)
+	if err != nil {
+		return fmt.Sprintf("Invalid Z coordinate: %v", err)
+	}
+	snap := target.Snapshot()
+	x := cx.Resolve(snap.X)
+	y := cy.Resolve(snap.Y)
+	z := cz.Resolve(snap.Z)
+	if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
+		return "Invalid position: coordinates out of world bounds"
+	}
+	if err := srv.TeleportPlayer(target, x, y, z, snap.Yaw, snap.Pitch); err != nil {
+		return fmt.Sprintf("Teleport failed: %v", err)
+	}
+	return fmt.Sprintf("Teleported %s to %.2f, %.2f, %.2f", snap.Profile.Name, x, y, z)
+}
+
+func execGameMode(srv *server.Server, sender *server.PlayerSession, args []string) string {
+	if len(args) < 1 || len(args) > 2 {
+		return "Usage: /gamemode <survival|creative|adventure|spectator> [player]"
+	}
+	mode, label, err := ParseGameMode(args[0])
+	if err != nil {
+		return fmt.Sprintf("Invalid game mode: %s", args[0])
+	}
+	target := sender
+	if len(args) == 2 {
+		target = resolveTargetSession(srv, sender, args[1])
+		if target == nil {
+			return fmt.Sprintf("Player %q not found", args[1])
+		}
+	}
+	if target == nil {
+		return "Usage: /gamemode <mode> <player>"
+	}
+	if err := srv.SetPlayerGameMode(target, mode); err != nil {
+		return fmt.Sprintf("Failed to set game mode: %v", err)
+	}
+	if sender != nil && target == sender {
+		return fmt.Sprintf("Set own game mode to %s Mode", label)
+	}
+	return fmt.Sprintf("Set %s's game mode to %s Mode", target.Profile.Name, label)
+}
+
+func execTime(srv *server.Server, args []string) string {
+	if len(args) != 2 {
+		return "Usage: /time <set|add> <value>"
+	}
+	sub := strings.ToLower(args[0])
+	switch sub {
+	case "set":
+		ticks, err := ParseTimeValue(args[1], true)
+		if err != nil {
+			return fmt.Sprintf("Invalid time value: %s", args[1])
+		}
+		srv.SetDayTime(ticks)
+		return fmt.Sprintf("Set the time to %d", ticks)
+	case "add":
+		ticks, err := ParseTimeValue(args[1], false)
+		if err != nil {
+			return fmt.Sprintf("Invalid time value: %s", args[1])
+		}
+		_, dayTime := srv.AddDayTime(ticks)
+		return fmt.Sprintf("Added %d to the time (now %d)", ticks, dayTime)
+	case "query":
+		gameTime, dayTime := srv.WorldTime()
+		switch strings.ToLower(args[1]) {
+		case "daytime":
+			return fmt.Sprintf("The time is %d", dayTime%server.TicksPerDay)
+		case "gametime":
+			return fmt.Sprintf("The game time is %d", gameTime)
+		case "day":
+			return fmt.Sprintf("The day is %d", dayTime/server.TicksPerDay)
+		default:
+			return "Usage: /time query <daytime|gametime|day>"
+		}
+	default:
+		return "Usage: /time <set|add> <value>"
+	}
+}
+
+func execList(srv *server.Server, args []string) string {
+	showUUIDs := len(args) > 0 && strings.EqualFold(args[0], "uuids")
+	snaps := srv.PlayerSnapshots()
+	sort.Slice(snaps, func(i, j int) bool {
+		return strings.ToLower(snaps[i].Profile.Name) < strings.ToLower(snaps[j].Profile.Name)
+	})
+	names := make([]string, 0, len(snaps))
+	for _, s := range snaps {
+		if showUUIDs {
+			names = append(names, fmt.Sprintf("%s (%s)", s.Profile.Name, server.FormatUUID(s.Profile.UUID)))
+		} else {
+			names = append(names, s.Profile.Name)
+		}
+	}
+	if len(names) == 0 {
+		return fmt.Sprintf("There are 0 of a max of %d players online:", srv.Config().MaxPlayers)
+	}
+	return fmt.Sprintf("There are %d of a max of %d players online: %s",
+		len(names), srv.Config().MaxPlayers, strings.Join(names, ", "))
+}
+
+func execHelp(args []string) string {
+	if len(args) > 0 {
+		switch strings.ToLower(strings.TrimPrefix(args[0], "/")) {
+		case "tp", "teleport":
+			return "/tp <x> <y> <z> | /tp <target> [x y z] — teleport player"
+		case "gamemode":
+			return "/gamemode <survival|creative|adventure|spectator> [player] — change game mode"
+		case "time":
+			return "/time <set|add> <value> — set or advance world time"
+		case "seed":
+			return "/seed — display world seed"
+		case "save-all":
+			return "/save-all — save all dirty chunks and world clock to disk"
+		case "stop":
+			return "/stop — save the world and stop the server"
+		case "list":
+			return "/list [uuids] — list online players"
+		case "help":
+			return "/help [command] — show available commands"
+		}
+	}
+	return "Available commands: /tp, /gamemode, /time, /seed, /save-all, /stop, /list, /help"
+}
+
+func execWhitelist(srv *server.Server, args []string) string {
+	if len(args) == 0 {
+		return "Usage: /whitelist <on|off|list|add|remove> [player]"
+	}
+	switch strings.ToLower(args[0]) {
+	case "on":
+		srv.SetWhitelistEnabled(true)
+		return "Whitelist is now turned on"
+	case "off":
+		srv.SetWhitelistEnabled(false)
+		return "Whitelist is now turned off"
+	case "list":
+		entries := srv.Whitelist()
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name)
+		}
+		if len(names) == 0 {
+			return "There are no whitelisted players"
+		}
+		return fmt.Sprintf("There are %d whitelisted player(s): %s", len(names), strings.Join(names, ", "))
+	case "add":
+		if len(args) != 2 {
+			return "Usage: /whitelist add <player>"
+		}
+		name := args[1]
+		profile := server.Profile{Name: name, UUID: server.OfflineUUID(name)}
+		if err := srv.AddWhitelist(profile); err != nil {
+			return fmt.Sprintf("Failed to whitelist %s: %v", name, err)
+		}
+		return fmt.Sprintf("Added %s to the whitelist", name)
+	case "remove":
+		if len(args) != 2 {
+			return "Usage: /whitelist remove <player>"
+		}
+		name := args[1]
+		if err := srv.RemoveWhitelist(name); err != nil {
+			return fmt.Sprintf("Failed to remove %s from whitelist: %v", name, err)
+		}
+		return fmt.Sprintf("Removed %s from the whitelist", name)
+	default:
+		return "Usage: /whitelist <on|off|list|add|remove> [player]"
+	}
+}
+
+// RunConsole reads commands line-by-line from r (such as os.Stdin) until ctx
+// is cancelled or EOF is reached, executing each command as the server console.
+func RunConsole(ctx context.Context, r io.Reader, srv *server.Server, log *slog.Logger) {
+	lines := make(chan string)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			select {
+			case lines <- scanner.Text():
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case line, ok := <-lines:
+			if !ok {
+				return
+			}
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			reply := ExecuteCommand(srv, nil, line)
+			if reply != "" && log != nil {
+				log.Info("console", "cmd", line, "reply", reply)
+			}
+		}
+	}
+}
