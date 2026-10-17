@@ -1235,6 +1235,7 @@ func (s *Server) tickSingleWitherSkull(skullID int32) {
 		if by >= world.MinY && by < world.MinY+world.WorldHeight {
 			blk := cache.GetBlock(bx, by, bz)
 			if !isPassableBlock(blk) && blk != world.StateWater {
+				_, _ = s.OnProjectileBlockImpact(snap.Dimension, bx, by, bz, snap.X-snap.VX, snap.Y-snap.VY, snap.Z-snap.VZ, snap.X, snap.Y, snap.Z, snap.EntityID, EntityTypeWitherSkull)
 				s.impactWitherSkull(snap, nil)
 				return
 			}

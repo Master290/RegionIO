@@ -235,7 +235,41 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning {
+			continue
+		}
+		if IsStandardProjectileEntityType(snapshot.TypeName) {
+			if snapshot.VelocityX != 0 || snapshot.VelocityY != 0 || snapshot.VelocityZ != 0 {
+				vx := float64(snapshot.VelocityX) / 8000.0
+				vy := float64(snapshot.VelocityY) / 8000.0
+				vz := float64(snapshot.VelocityZ) / 8000.0
+				nx, ny, nz := snapshot.X+vx, snapshot.Y+vy, snapshot.Z+vz
+				dim := snapshot.EffectiveDimension()
+				if cache := s.DimensionChunks(dim); cache != nil {
+					bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
+					if by >= world.MinY && by < world.MinY+world.WorldHeight {
+						blk := cache.GetBlock(bx, by, bz)
+						if !isPassableBlock(blk) && blk != world.StateWater {
+							_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, snapshot.X, snapshot.Y, snapshot.Z, nx, ny, nz, snapshot.ID, snapshot.TypeName)
+							s.entities.Update(snapshot.ID, func(e *world.Entity) {
+								e.X, e.Y, e.Z = nx, ny, nz
+								e.VelocityX, e.VelocityY, e.VelocityZ = 0, 0, 0
+								e.OnGround = true
+							})
+							continue
+						}
+					}
+				}
+				vy = (vy - 0.05) * 0.99
+				vx *= 0.99
+				vz *= 0.99
+				s.entities.Update(snapshot.ID, func(e *world.Entity) {
+					e.X, e.Y, e.Z = nx, ny, nz
+					e.VelocityX = clampVelocityShort(vx)
+					e.VelocityY = clampVelocityShort(vy)
+					e.VelocityZ = clampVelocityShort(vz)
+				})
+			}
 			continue
 		}
 		if IsBossOrBossSupportEntity(snapshot.TypeName) {
@@ -406,6 +440,12 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			e.Yaw = nextYaw
 			e.HeadYaw = nextYaw
 		})
+		if s.chunks != nil {
+			tbx, tby, tbz := int(math.Floor(nextX)), int(math.Floor(nextY)), int(math.Floor(nextZ))
+			if tby >= world.MinY && tby < world.MinY+world.WorldHeight && world.BlockName(s.chunks.GetBlock(tbx, tby, tbz)) == "minecraft:tripwire" {
+				s.OnEntityStepTripwire(snapshot.EffectiveDimension(), tbx, tby, tbz)
+			}
+		}
 
 		if swellChanged {
 			cx := int32(int64(math.Floor(nextX)) >> 4)

@@ -1431,6 +1431,7 @@ func (s *Server) checkFireworkCollision(dim string, x, y, z float64, shooterID i
 		by := int(math.Floor(y))
 		bz := int(math.Floor(z))
 		if !isPassableBlock(cache.GetBlock(bx, by, bz)) {
+			_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, x, y, z, x, y, z, 0, EntityTypeFireworkRocket)
 			return true
 		}
 	}

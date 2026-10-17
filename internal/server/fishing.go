@@ -1154,6 +1154,7 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 			nextOnGround = false
 			st.OnGround = false
 		} else if s.chunks != nil && isSolidGroundBlock(s.chunks.GetBlock(candBX, candBY, candBZ)) {
+			_, _ = s.OnProjectileBlockImpact(dim, candBX, candBY, candBZ, ent.X, ent.Y, ent.Z, candX, candY, candZ, entityID, EntityTypeFishingBobber)
 			nextOnGround = true
 			st.OnGround = true
 			st.VX, st.VY, st.VZ = 0, 0, 0

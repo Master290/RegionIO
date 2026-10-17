@@ -1373,8 +1373,12 @@ func (s *Server) TickMobsInCauldrons() {
 		if by < world.MinY || by >= world.MinY+world.WorldHeight {
 			continue
 		}
-		if IsCauldronBlock(cache.GetBlock(bx, by, bz)) {
+		blk := cache.GetBlock(bx, by, bz)
+		if IsCauldronBlock(blk) {
 			s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
+		}
+		if world.BlockName(blk) == "minecraft:tripwire" {
+			s.OnEntityStepTripwire(dim, bx, by, bz)
 		}
 	}
 }

@@ -1417,6 +1417,12 @@ func (s *Server) stepEntityTowardPoint(ent *world.Entity, cache *world.Cache, fe
 		e.HeadYaw = yaw
 		e.OnGround = true
 	})
+	if cache != nil {
+		tbx, tby, tbz := int(math.Floor(nextX)), int(math.Floor(nextY)), int(math.Floor(nextZ))
+		if tby >= world.MinY && tby < world.MinY+world.WorldHeight && world.BlockName(cache.GetBlock(tbx, tby, tbz)) == "minecraft:tripwire" {
+			s.OnEntityStepTripwire(ent.EffectiveDimension(), tbx, tby, tbz)
+		}
+	}
 }
 
 func (s *Server) moveEntityTowardAndAttackPlayer(

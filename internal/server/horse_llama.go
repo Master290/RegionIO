@@ -1634,13 +1634,13 @@ func (s *Server) tickSingleLlamaSpit(spitID int32) {
 		}
 	}
 
-	// Check solid block collision (and decorated pot shatter).
+	// Check solid block collision (decorated pot shatter, target block hit, or solid wall).
 	if cache != nil {
 		bx, by, bz := int(math.Floor(nextX)), int(math.Floor(nextY)), int(math.Floor(nextZ))
 		if by >= world.MinY && by < world.MinY+world.WorldHeight {
 			bState := cache.GetBlock(bx, by, bz)
-			if IsDecoratedPotBlock(bState) {
-				s.HitDecoratedPotWithProjectile(dim, bx, by, bz, spitID)
+			if IsDecoratedPotBlock(bState) || world.BlockName(bState) == "minecraft:target" {
+				_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, ent.X, ent.Y, ent.Z, nextX, nextY, nextZ, spitID, EntityTypeLlamaSpit)
 				s.removeLlamaSpit(spitID, ent)
 				return
 			}
@@ -1967,9 +1967,14 @@ func (s *Server) SpawnSkeletonTrapHorse(dimension string, x, y, z float64) (int3
 // TrySpawnSkeletonTrapOnLightning rolls for spawning a Skeleton Trap horse when
 // lightning strikes at (x, y, z) in dimension during a thunderstorm (matching
 // vanilla ServerLevel.tickChunk: 0.75%..6.75% chance on Easy..Hard, or 100% if
-// forceSpawn is true).
+// forceSpawn is true). If a `minecraft:lightning_rod` is within 128 blocks,
+// the lightning bolt is redirected to the rod (`RedirectLightningToRod`) and no
+// natural skeleton trap spawns.
 func (s *Server) TrySpawnSkeletonTrapOnLightning(dimension string, x, y, z float64, forceSpawn bool, rng *rand.Rand) (int32, bool) {
 	if s == nil || s.Difficulty() == DifficultyPeaceful {
+		return 0, false
+	}
+	if _, _, _, redirected := s.RedirectLightningToRod(dimension, int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))); redirected && !forceSpawn {
 		return 0, false
 	}
 	if !forceSpawn {
@@ -1986,6 +1991,47 @@ func (s *Server) TrySpawnSkeletonTrapOnLightning(dimension string, x, y, z float
 	}
 	id, err := s.SpawnSkeletonTrapHorse(dimension, x, y, z)
 	return id, err == nil && id > 0
+}
+
+// SpawnLightningBolt spawns a `minecraft:lightning_bolt` (ID 77) in dimension,
+// first checking `RedirectLightningToRod` within 128 blocks of (x, y, z).
+func (s *Server) SpawnLightningBolt(dimension string, x, y, z float64, rng *rand.Rand) (entityID int32, strikeX, strikeY, strikeZ float64, redirected bool) {
+	if s == nil || s.entities == nil {
+		return 0, x, y, z, false
+	}
+	normDim := world.NormalizeDimension(dimension)
+	strikeX, strikeY, strikeZ = x, y, z
+	if rx, ry, rz, redir := s.RedirectLightningToRod(normDim, int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))); redir {
+		redirected = true
+		strikeX = float64(rx) + 0.5
+		strikeY = float64(ry)
+		strikeZ = float64(rz) + 0.5
+	}
+	typeID := ResolveEntityTypeID(EntityTypeLightning)
+	if typeID < 0 {
+		typeID = EntityTypeLightningBoltID
+	}
+	entityID = s.entities.Add(&world.Entity{
+		TypeID:    typeID,
+		TypeName:  EntityTypeLightning,
+		Dimension: normDim,
+		X:         strikeX,
+		Y:         strikeY,
+		Z:         strikeZ,
+		OnGround:  true,
+	})
+	if ent := s.entities.Get(entityID); ent != nil {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket("minecraft:entity.lightning_bolt.thunder", SoundSourceWeather, strikeX, strikeY, strikeZ, 10000.0, 0.8, 0))
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket("minecraft:entity.lightning_bolt.impact", SoundSourceWeather, strikeX, strikeY, strikeZ, 2.0, 0.5, 0))
+	}
+	if !redirected {
+		_, _ = s.TrySpawnSkeletonTrapOnLightning(normDim, strikeX, strikeY, strikeZ, false, rng)
+	}
+	return entityID, strikeX, strikeY, strikeZ, redirected
 }
 
 // TriggerSkeletonTrap activates a skeleton trap horse (`SkeletonTrap == true`),

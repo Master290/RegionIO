@@ -739,9 +739,7 @@ func (s *Server) TickWindCharges() {
 			}
 			blk := cache.GetBlock(bx, by, bz)
 			if !isPassableBlock(blk) && blk != world.StateWater {
-				if IsDecoratedPotBlock(blk) {
-					_, _ = s.HitDecoratedPotWithProjectile(dim, bx, by, bz, id)
-				}
+				_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, ent.X, ent.Y, ent.Z, nextX, nextY, nextZ, id, ent.TypeName)
 				s.entities.Update(id, func(e *world.Entity) {
 					e.X, e.Y, e.Z = nextX, nextY, nextZ
 				})

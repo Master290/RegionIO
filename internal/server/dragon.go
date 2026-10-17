@@ -1600,6 +1600,7 @@ func (s *Server) tickDragonFireballs() {
 				bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
 				if by >= world.MinY && by < world.MinY+world.WorldHeight {
 					if blk := cache.GetBlock(bx, by, bz); !isPassableBlock(blk) {
+						_, _ = s.OnProjectileBlockImpact(snap.Dimension, bx, by, bz, snap.X-snap.VX, snap.Y-snap.VY, snap.Z-snap.VZ, snap.X, snap.Y, snap.Z, id, EntityTypeDragonFireball)
 						impacted = true
 					}
 				}

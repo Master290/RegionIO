@@ -1510,3 +1510,97 @@ func EncodeSoundPacket(soundName string, source int32, x, y, z float64, volume, 
 	w.Int64(seed)
 	return w.Bytes()
 }
+
+// IsStandardProjectileEntityType reports whether typeName is a standard thrown
+// or shot projectile entity (`arrow`, `spectral_arrow`, `trident`, `snowball`,
+// `egg`, `ender_pearl`, `fireball`, `small_fireball`).
+func IsStandardProjectileEntityType(typeName string) bool {
+	switch canonicalResourceName(typeName) {
+	case "minecraft:arrow", "minecraft:spectral_arrow", "minecraft:trident",
+		"minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl",
+		"minecraft:fireball", "minecraft:small_fireball":
+		return true
+	default:
+		return false
+	}
+}
+
+func projectileImpactBlockFace(prevX, prevY, prevZ, hitX, hitY, hitZ float64, bx, by, bz int) string {
+	prevBX := int(math.Floor(prevX))
+	prevBY := int(math.Floor(prevY))
+	prevBZ := int(math.Floor(prevZ))
+	if prevBY > by {
+		return "up"
+	}
+	if prevBY < by {
+		return "down"
+	}
+	if prevBX < bx {
+		return "west"
+	}
+	if prevBX > bx {
+		return "east"
+	}
+	if prevBZ < bz {
+		return "north"
+	}
+	if prevBZ > bz {
+		return "south"
+	}
+	fx := hitX - float64(bx)
+	fy := hitY - float64(by)
+	fz := hitZ - float64(bz)
+	dx := math.Abs(fx - 0.5)
+	dy := math.Abs(fy - 0.5)
+	dz := math.Abs(fz - 0.5)
+	if dy >= dx && dy >= dz {
+		if fy >= 0.5 {
+			return "up"
+		}
+		return "down"
+	}
+	if dx >= dz {
+		if fx >= 0.5 {
+			return "east"
+		}
+		return "west"
+	}
+	if fz >= 0.5 {
+		return "south"
+	}
+	return "north"
+}
+
+// OnProjectileBlockImpact handles any projectile striking block (bx, by, bz) in
+// dim at impact coordinates (hitX, hitY, hitZ) from (prevX, prevY, prevZ):
+//   - Shatters `minecraft:decorated_pot` via HitDecoratedPotWithProjectile
+//   - Powers `minecraft:target` (1..15) via HitTargetBlockWithProjectile
+func (s *Server) OnProjectileBlockImpact(
+	dim string,
+	bx, by, bz int,
+	prevX, prevY, prevZ float64,
+	hitX, hitY, hitZ float64,
+	projectileEntityID int32,
+	projectileType string,
+) (shatteredPot bool, targetPower int) {
+	if s == nil {
+		return false, 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil || by < world.MinY || by >= world.MinY+world.WorldHeight {
+		return false, 0
+	}
+	blk := cache.GetBlock(bx, by, bz)
+	if IsDecoratedPotBlock(blk) {
+		shattered, _ := s.HitDecoratedPotWithProjectile(normDim, bx, by, bz, projectileEntityID)
+		return shattered, 0
+	}
+	if world.BlockName(blk) == "minecraft:target" {
+		face := projectileImpactBlockFace(prevX, prevY, prevZ, hitX, hitY, hitZ, bx, by, bz)
+		power, _ := s.HitTargetBlockWithProjectile(normDim, bx, by, bz, face, hitX, hitY, hitZ, projectileType)
+		return false, power
+	}
+	return false, 0
+}
+

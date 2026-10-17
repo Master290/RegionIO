@@ -307,3 +307,66 @@ func TestWanderingTraderWithTraderLlamasAndSkeletonTrap(t *testing.T) {
 		t.Fatalf("LoadEquinesAndLlamasFile failed: %v", err)
 	}
 }
+
+func TestRedstoneHooksProjectileTargetLightningRodAndMobTripwire(t *testing.T) {
+	s, _ := newTestPlayServer(t)
+	dim := world.DimensionOverworld
+
+	// 1. Projectile hitting minecraft:target powers the target block (1..15).
+	targetSt, ok := world.BlockStateByName("minecraft:target", map[string]string{"power": "0"})
+	if !ok {
+		t.Fatalf("missing minecraft:target block state")
+	}
+	s.chunks.SetBlock(10, 70, 10, targetSt)
+	wcID, err := s.SpawnWindCharge(dim, 9.2, 70.5, 10.5, 1.0, 0.0, 0.0, 0, false)
+	if err != nil || wcID <= 0 {
+		t.Fatalf("SpawnWindCharge failed: %v", err)
+	}
+	s.TickWindCharges()
+	props := world.BlockProperties(s.chunks.GetBlock(10, 70, 10))
+	if props["power"] == "0" || props["power"] == "" {
+		t.Fatalf("expected wind_charge hitting minecraft:target to set power > 0, got %q", props["power"])
+	}
+
+	// 2. Lightning strike redirects to minecraft:lightning_rod within 128 blocks.
+	rodSt, ok := world.BlockStateByName("minecraft:lightning_rod", map[string]string{
+		"facing":      "up",
+		"powered":     "false",
+		"waterlogged": "false",
+	})
+	if !ok {
+		t.Fatalf("missing minecraft:lightning_rod block state")
+	}
+	s.chunks.SetBlock(20, 65, 20, rodSt)
+	boltID, sx, sy, sz, redirected := s.SpawnLightningBolt(dim, 30.5, 65.0, 30.5, nil)
+	if boltID <= 0 || !redirected || sx != 20.5 || sy != 65.0 || sz != 20.5 {
+		t.Fatalf("SpawnLightningBolt = (id=%d, %.1f, %.1f, %.1f, redir=%v), want redirected to (20.5, 65.0, 20.5)", boltID, sx, sy, sz, redirected)
+	}
+	if world.BlockProperties(s.chunks.GetBlock(20, 65, 20))["powered"] != "true" {
+		t.Fatalf("expected lightning_rod at (20,65,20) to be powered=true after lightning strike")
+	}
+
+	// 3. Mob stepping into minecraft:tripwire activates the tripwire.
+	wireSt, ok := world.BlockStateByName("minecraft:tripwire", map[string]string{
+		"attached": "false",
+		"disarmed": "false",
+		"east":     "false",
+		"north":    "false",
+		"powered":  "false",
+		"south":    "false",
+		"west":     "false",
+	})
+	if !ok {
+		t.Fatalf("missing minecraft:tripwire block state")
+	}
+	s.chunks.SetBlock(15, 65, 15, wireSt)
+	_, err = s.SpawnMob(15.5, 65.0, 15.5, MobTypePig)
+	if err != nil {
+		t.Fatalf("SpawnMob(pig) failed: %v", err)
+	}
+	s.TickMobsInCauldrons()
+	if world.BlockProperties(s.chunks.GetBlock(15, 65, 15))["powered"] != "true" {
+		t.Fatalf("expected mob inside minecraft:tripwire to set powered=true")
+	}
+}
+
