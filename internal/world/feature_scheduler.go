@@ -388,5 +388,23 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			}
 		}
 	}
+	// Step 5 (strongholds): piece trees can span up to 8 chunks from start.
+	var strongholds []*StrongholdStart
+	for sx := targetX - 8; sx <= targetX+8; sx++ {
+		for sz := targetZ - 8; sz <= targetZ+8; sz++ {
+			start, err := StrongholdGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if start != nil {
+				strongholds = append(strongholds, start)
+			}
+		}
+	}
+	if len(strongholds) > 0 {
+		for _, key := range regionChunks {
+			PlaceStrongholdsForChunk(r, strongholds, seed, key[0], key[1])
+		}
+	}
 	return nil
 }
