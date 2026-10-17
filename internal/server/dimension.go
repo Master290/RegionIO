@@ -126,6 +126,9 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 	}
 	cache := world.NewCacheWithLimit(int32(s.cfg.CompressionThreshold), gen, dimStore, s.cfg.MaxCachedChunks)
 	cache.SetDimensionType(dt)
+	cache.SetPressurePlateEntityCounter(func(x, y, z int) int {
+		return s.CountEntitiesAtBlock(norm, x, y, z)
+	})
 	ds.caches[norm] = cache
 	return cache
 }

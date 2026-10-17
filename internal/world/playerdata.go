@@ -206,6 +206,8 @@ type PlayerData struct {
 	Health         float32
 	FoodLevel      int32
 	FoodSaturation float32
+	FoodExhaustion float32
+	FoodTickTimer  int32
 	SelectedSlot   int32
 	Inventory      [PlayerInventorySlots]ItemStack
 	SpawnX         int32
@@ -276,6 +278,8 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	root.Set("Health", nbt.Float(health))
 	root.Set("foodLevel", nbt.Int(d.FoodLevel))
 	root.Set("foodSaturationLevel", nbt.Float(d.FoodSaturation))
+	root.Set("foodExhaustionLevel", nbt.Float(d.FoodExhaustion))
+	root.Set("foodTickTimer", nbt.Int(d.FoodTickTimer))
 
 	selected := d.SelectedSlot
 	if selected < 0 || selected >= HotbarSlotCount {
@@ -482,6 +486,14 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	}
 	if sat, ok := nbtGetFloat(root, "foodSaturationLevel"); ok {
 		d.FoodSaturation = sat
+	}
+	if ex, ok := nbtGetFloat(root, "foodExhaustionLevel"); ok && ex >= 0 {
+		d.FoodExhaustion = ex
+	}
+	if tt, ok := nbtGetInt(root, "foodTickTimer"); ok && tt >= 0 {
+		d.FoodTickTimer = tt
+	} else if ttShort, ok := nbtGetShort(root, "foodTickTimer"); ok && ttShort >= 0 {
+		d.FoodTickTimer = int32(ttShort)
 	}
 
 	if sel, ok := nbtGetInt(root, "SelectedItemSlot"); ok && sel >= 0 && sel < HotbarSlotCount {

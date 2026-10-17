@@ -243,6 +243,16 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		enforceWhitelist: cfg.EnforceWhitelist,
 		stopCh:           make(chan struct{}),
 	}
+	if chunks != nil {
+		chunks.SetPressurePlateEntityCounter(func(x, y, z int) int {
+			return s.CountEntitiesAtBlock(world.DimensionOverworld, x, y, z)
+		})
+	}
+	if entities != nil {
+		entities.SetStepCallback(func(dim string, x, y, z int) {
+			s.StepPressurePlateAt(dim, x, y, z)
+		})
+	}
 	if entries, err := LoadOpsFile(cfg.OpsFile); err == nil {
 		s.SetOps(entries)
 	}
@@ -256,6 +266,64 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		s.SetWorldTime(gameTime, dayTime)
 	}
 	return s
+}
+
+// CountEntitiesAtBlock returns the total number of living players and active
+// entities occupying block (x, y, z) in dim (used for pressure plate activation
+// and weighted pressure plate signal calculation).
+func (s *Server) CountEntitiesAtBlock(dim string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	dim = world.NormalizeDimension(dim)
+	count := 0
+	for _, snap := range s.PlayerSnapshots() {
+		if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
+			continue
+		}
+		if world.NormalizeDimension(snap.Dimension) != dim {
+			continue
+		}
+		if int(math.Floor(snap.X)) == x && int(math.Floor(snap.Z)) == z &&
+			snap.Y >= float64(y)-0.25 && snap.Y < float64(y)+1.0 {
+			count++
+		}
+	}
+	if s.entities != nil {
+		cx := int32(x >> 4)
+		cz := int32(z >> 4)
+		s.entities.ForEachInChunkRange(cx, cz, 0, func(e world.Entity) {
+			if e.EffectiveDimension() != dim {
+				return
+			}
+			if int(math.Floor(e.X)) == x && int(math.Floor(e.Z)) == z &&
+				e.Y >= float64(y)-0.25 && e.Y < float64(y)+1.0 {
+				count++
+			}
+		})
+	}
+	return count
+}
+
+// StepPressurePlateAt updates any pressure plate at (x, y, z) in dim with the
+// current entity/player count and broadcasts resulting block changes.
+func (s *Server) StepPressurePlateAt(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	dim = world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return
+	}
+	state := cache.GetBlock(x, y, z)
+	if !strings.HasSuffix(world.BlockName(state), "_pressure_plate") {
+		return
+	}
+	count := s.CountEntitiesAtBlock(dim, x, y, z)
+	if changed, res := cache.StepOnPressurePlate(x, y, z, count); changed && len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+	}
 }
 
 // SaveWorldTime persists the current clock. It is a no-op without a store.
@@ -306,6 +374,9 @@ func (s *Server) SaveAll() error {
 		}
 	}
 	if err := s.SaveAllDimensions(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveFurnaces(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
@@ -415,6 +486,8 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 		return
 	}
 	session.SetDimension(d.Dimension)
+	session.SetFoodExhaustion(d.FoodExhaustion)
+	session.SetFoodTickTimer(d.FoodTickTimer)
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.position = d.Pos
@@ -457,6 +530,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		return world.PlayerData{}
 	}
 	dim := session.Dimension()
+	exhaustion := session.FoodExhaustion()
+	tickTimer := session.FoodTickTimer()
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -469,6 +544,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		Health:         session.health,
 		FoodLevel:      session.foodLevel,
 		FoodSaturation: session.foodSaturation,
+		FoodExhaustion: exhaustion,
+		FoodTickTimer:  tickTimer,
 		SelectedSlot:   session.selectedSlot,
 		Inventory:      session.inventory,
 		SpawnX:         session.spawnX,

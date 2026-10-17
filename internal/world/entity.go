@@ -141,6 +141,7 @@ type EntityManager struct {
 	byChunk  map[ChunkPos][]*Entity
 	chunkOf  map[int32]ChunkPos
 	nextID   int32
+	onStep   func(dim string, x, y, z int)
 }
 
 // NewEntityManager returns a fresh manager starting at a high ID.
@@ -153,10 +154,17 @@ func NewEntityManager() *EntityManager {
 	}
 }
 
+// SetStepCallback registers an optional callback invoked when an entity is
+// added or moved so pressure plates at its block position can be updated.
+func (em *EntityManager) SetStepCallback(fn func(dim string, x, y, z int)) {
+	em.mu.Lock()
+	em.onStep = fn
+	em.mu.Unlock()
+}
+
 // Add assigns an ID and UUID (if missing), indexes the entity by chunk, and tracks it.
 func (em *EntityManager) Add(e *Entity) int32 {
 	em.mu.Lock()
-	defer em.mu.Unlock()
 	em.nextID++
 	e.ID = em.nextID
 	if e.Dimension == "" {
@@ -172,7 +180,15 @@ func (em *EntityManager) Add(e *Entity) int32 {
 	pos := e.ChunkPos()
 	em.chunkOf[e.ID] = pos
 	em.byChunk[pos] = append(em.byChunk[pos], e)
-	return e.ID
+	id := e.ID
+	dim := e.EffectiveDimension()
+	bx, by, bz := int(math.Floor(e.X)), int(math.Floor(e.Y)), int(math.Floor(e.Z))
+	onStep := em.onStep
+	em.mu.Unlock()
+	if onStep != nil {
+		onStep(dim, bx, by, bz)
+	}
+	return id
 }
 
 // Remove drops the entity by its ID and removes it from the spatial index.
@@ -224,7 +240,12 @@ func (em *EntityManager) Get(id int32) *Entity {
 // chunk index if the entity crossed a chunk boundary.
 func (em *EntityManager) Update(id int32, fn func(*Entity)) {
 	em.mu.Lock()
-	defer em.mu.Unlock()
+	var (
+		updated      bool
+		dim          string
+		bx, by, bz   int
+		onStep       func(string, int, int, int)
+	)
 	if e, ok := em.entities[id]; ok {
 		oldPos := em.chunkOf[id]
 		fn(e)
@@ -234,6 +255,14 @@ func (em *EntityManager) Update(id int32, fn func(*Entity)) {
 			em.chunkOf[id] = newPos
 			em.byChunk[newPos] = append(em.byChunk[newPos], e)
 		}
+		updated = true
+		dim = e.EffectiveDimension()
+		bx, by, bz = int(math.Floor(e.X)), int(math.Floor(e.Y)), int(math.Floor(e.Z))
+		onStep = em.onStep
+	}
+	em.mu.Unlock()
+	if updated && onStep != nil {
+		onStep(dim, bx, by, bz)
 	}
 }
 

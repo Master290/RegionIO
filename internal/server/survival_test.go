@@ -338,3 +338,72 @@ func TestConsumeHeldItemInSurvival(t *testing.T) {
 		t.Fatal("expected ConsumeHeldItem on empty slot to return false")
 	}
 }
+
+func TestIntegrationHooksHungerFurnaceAndPressurePlate(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	col := &survivalPacketCollector{}
+	session, err := srv.RegisterPlayer(Profile{Name: "HookTester", UUID: OfflineUUID("HookTester")}, col.send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	if err := srv.SetPlayerGameMode(session, GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+
+	// 1. Breaking a block in survival adds mining exhaustion.
+	beforeEx := session.FoodExhaustion()
+	if broken, _ := srv.BreakBlock(session, 2, world.FlatSurfaceY, 2, PlayerActionStopDestroyBlock); !broken {
+		t.Fatal("expected block at (2, FlatSurfaceY, 2) to break in survival")
+	}
+	if got := session.FoodExhaustion(); got <= beforeEx {
+		t.Fatalf("FoodExhaustion after BreakBlock = %v, want > %v", got, beforeEx)
+	}
+
+	// 2. PlayerData round-trips FoodExhaustion and FoodTickTimer.
+	session.SetFoodExhaustion(2.75)
+	session.SetFoodTickTimer(42)
+	comp := world.PlayerDataToCompound(session.PlayerData())
+	decoded, err := world.PlayerDataFromCompound(comp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	if decoded.FoodExhaustion != 2.75 || decoded.FoodTickTimer != 42 {
+		t.Fatalf("decoded exhaustion/timer = (%v, %d), want (2.75, 42)", decoded.FoodExhaustion, decoded.FoodTickTimer)
+	}
+
+	// 3. RespawnPlayer resets exhaustion, tickTimer, and cancels active eating.
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:Golden_apple", 2))
+	srv.StartEating(session, HandMain)
+	if !session.IsEating() {
+		t.Fatal("expected session.IsEating() = true after StartEating")
+	}
+	if err := srv.RespawnPlayer(session); err != nil {
+		t.Fatalf("RespawnPlayer: %v", err)
+	}
+	if session.FoodExhaustion() != 0 || session.FoodTickTimer() != 0 || session.IsEating() {
+		t.Fatalf("after RespawnPlayer: exhaustion=%v, timer=%d, eating=%v; want 0, 0, false",
+			session.FoodExhaustion(), session.FoodTickTimer(), session.IsEating())
+	}
+
+	// 4. Pressure plate activation via StepPressurePlateAt and automatic release via SetPressurePlateEntityCounter.
+	if itemID, ok := world.ItemNameToID("minecraft:stone_pressure_plate"); ok {
+		if plateState, ok := world.ItemToBlock(itemID); ok {
+			px, py, pz := 6, world.FlatSurfaceY+1, 6
+			srv.Chunks().SetBlock(px, py, pz, plateState)
+			srv.SetPlayerTransform(session, float64(px)+0.5, float64(py), float64(pz)+0.5, 0, 0, true)
+			srv.StepPressurePlateAt(world.DimensionOverworld, px, py, pz)
+			if srv.Chunks().RedstonePowerAt(px, py, pz) != world.MaxRedstonePower {
+				t.Fatalf("expected pressure plate power = 15 when player stands on it, got %d", srv.Chunks().RedstonePowerAt(px, py, pz))
+			}
+			// Move player off the plate and advance 20 ticks; counter returns 0 so plate releases.
+			srv.SetPlayerTransform(session, float64(px)+5.5, float64(py), float64(pz)+5.5, 0, 0, true)
+			for i := 0; i < world.PressurePlateTickDelay; i++ {
+				srv.Chunks().TickBlockUpdates()
+			}
+			if srv.Chunks().RedstonePowerAt(px, py, pz) != 0 {
+				t.Fatalf("expected pressure plate power = 0 after player steps off and 20 ticks elapse, got %d", srv.Chunks().RedstonePowerAt(px, py, pz))
+			}
+		}
+	}
+}
+

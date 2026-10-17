@@ -341,8 +341,12 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsChestBlock(prevState) {
 		s.DropChestContents(x, y, z)
 	}
+	if IsFurnaceBlock(prevState) {
+		s.DropFurnaceContents(x, y, z)
+	}
 
 	if mode == GameModeSurvival {
+		s.RecordBlockBreakExhaustion(session)
 		if drop, ok := world.BlockDropItem(prevState); ok {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
 			return true, dropID
@@ -631,6 +635,10 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	st.dead = false
 	st.fallDistance = 0
 	st.mu.Unlock()
+
+	session.SetFoodExhaustion(0)
+	session.SetFoodTickTimer(0)
+	s.CancelEating(session)
 
 	prevDim := session.Dimension()
 	session.mu.Lock()

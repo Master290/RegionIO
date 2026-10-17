@@ -254,7 +254,10 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	if h.session != nil {
 		h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
+		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
+		bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
+		h.srv.StepPressurePlateAt(h.session.Dimension(), bx, by, bz)
 		res, err := h.srv.CheckPlayerPortal(h.session)
 		if err != nil {
 			return err
@@ -692,6 +695,30 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case protocol.PlayUseItemOn:
 		return h.handleUseItemOn(pkt)
 
+	case server.PlayAttackSB:
+		if h.srv != nil {
+			_ = h.srv.HandleAttackPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case server.PlayInteractSB:
+		if h.srv != nil {
+			_ = h.srv.HandleInteractPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case server.PlayUseItemSB:
+		if h.srv != nil {
+			_ = h.srv.HandleUseItemPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case server.PlayPlayerCommandSB:
+		if h.srv != nil {
+			_ = h.srv.HandlePlayerCommandPacket(h.session, pkt.Body())
+		}
+		return nil
+
 	case protocol.PlaySetCarriedItem:
 		slot, err := pkt.Body().Uint16()
 		if err != nil {
@@ -701,6 +728,10 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 			h.heldSlot = int32(slot)
 			if h.session != nil {
 				h.session.SetSelectedSlot(int32(slot))
+				if h.srv != nil {
+					h.srv.CancelEating(h.session)
+				}
+				h.session.ResetAttackCooldown()
 			}
 		}
 		return nil
@@ -804,14 +835,23 @@ func (h *handler) broadcastSystemChat(text string) error {
 	return nil
 }
 
-// handlePlayerAction processes digging. In creative the client sends
-// START_DESTROY_BLOCK (status 0) for an instant break; survival sends
-// STOP_DESTROY_BLOCK (status 2) when digging finishes and spawns an item drop.
+// handlePlayerAction processes digging and item-use release. In creative the
+// client sends START_DESTROY_BLOCK (status 0) for an instant break; survival
+// sends STOP_DESTROY_BLOCK (status 2) when digging finishes and spawns an item
+// drop; RELEASE_USE_ITEM (status 5) aborts active food consumption.
 func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	r := pkt.Body()
 	status, err := r.VarInt()
 	if err != nil {
 		return err
+	}
+	if status == server.PlayerActionReleaseUseItem {
+		if h.srv != nil {
+			h.srv.CancelEating(h.session)
+		}
+		if r.Remaining() == 0 {
+			return nil
+		}
 	}
 	x, y, z, err := r.Position()
 	if err != nil {
@@ -823,6 +863,9 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	seq, err := r.VarInt()
 	if err != nil {
 		return err
+	}
+	if status == server.PlayerActionReleaseUseItem {
+		return h.sendBlockChangedAck(seq)
 	}
 
 	if h.srv != nil {
@@ -929,6 +972,19 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		}
 	}
 
+	if h.srv != nil {
+		dim := world.DimensionOverworld
+		if h.session != nil {
+			dim = h.session.Dimension()
+		}
+		if cache := h.srv.PlayerChunks(h.session); cache != nil {
+			if handled, res := cache.InteractRedstoneBlock(x, y, z); handled {
+				h.broadcastBlockChanges(dim, cache, res)
+				return h.sendBlockChangedAck(seq)
+			}
+		}
+	}
+
 	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {
 		if h.isHoldingFlintAndSteel() && h.srv != nil {
 			if h.session != nil && h.session.HeldItem().IsEmpty() && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) {
@@ -1027,6 +1083,28 @@ func (h *handler) broadcastBlockUpdate(x, y, z int, state uint16, lightChunks []
 	h.srv.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayBlockUpdate, w.Bytes())
 	if cache != nil {
 		for _, chunk := range lightChunks {
+			if light, err := cache.LightUpdate(chunk.X, chunk.Z); err == nil {
+				h.srv.BroadcastDimensionChunk(dim, chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
+			}
+		}
+	}
+}
+
+func (h *handler) broadcastBlockChanges(dim string, cache *world.Cache, res world.BlockUpdateResult) {
+	if h.srv == nil {
+		return
+	}
+	dim = world.NormalizeDimension(dim)
+	for _, ch := range res.Changes {
+		w := protocol.NewWriter(12)
+		w.Position(ch.Pos.X, ch.Pos.Y, ch.Pos.Z)
+		w.VarInt(int32(ch.NewState))
+		cx := int32(ch.Pos.X >> 4)
+		cz := int32(ch.Pos.Z >> 4)
+		h.srv.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayBlockUpdate, w.Bytes())
+	}
+	if cache != nil {
+		for _, chunk := range res.LightChanged {
 			if light, err := cache.LightUpdate(chunk.X, chunk.Z); err == nil {
 				h.srv.BroadcastDimensionChunk(dim, chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
 			}
