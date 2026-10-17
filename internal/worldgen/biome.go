@@ -11,14 +11,15 @@ import (
 // finder returns the biome whose parameter range is closest to the point by the
 // vanilla fitDistance metric.
 //
-// Coordinates are quantized to long via Math.round(v * 10000.0) exactly as the
-// vanilla Climate.quantizeCoord does. ParameterPoint fitness is the sum of the
-// squared distance to each inclusive axis range and the squared offset.
+// Coordinates are quantized to long via (long)((float)v * 10000.0f) exactly as
+// the vanilla Climate.quantizeCoord(float) bytecode (fload_0; ldc 10000.0f; fmul; f2l) does.
+// ParameterPoint fitness is the sum of the squared distance to each inclusive
+// axis range and the squared offset.
 
-// quantize converts a climate coordinate to its long representation. Java's
-// Math.round is floor(x+0.5), unlike Go's math.Round for negative half values.
+// quantize converts a climate coordinate to its long representation matching
+// Climate.quantizeCoord(float): (long)((float)v * 10000.0f).
 func quantize(v float64) int64 {
-	return int64(math.Floor(v*10000.0 + 0.5))
+	return int64(float32(v) * 10000.0)
 }
 
 // Quantize is the exported form of quantize, for the biome table builder in the
