@@ -504,6 +504,11 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:netherite_chestplate", AdvancementFrameChallenge, "",
 		true, true, false, 2, 0, cNetheriteArmor, rNetheriteArmor, 100)
 
+	cBlazeRod, rBlazeRod := allOfCriteria("blaze_rod")
+	add("minecraft:nether/obtain_blaze_rod", "minecraft:nether/root", "Into Fire", "Relieve a Blaze of its rod",
+		"minecraft:blaze_rod", AdvancementFrameTask, "",
+		true, true, false, 1, -1, cBlazeRod, rBlazeRod, 0)
+
 	cBrew, rBrew := allOfCriteria("potion")
 	add("minecraft:nether/brew_potion", "minecraft:nether/root", "Local Brewery", "Brew a potion",
 		"minecraft:potion", AdvancementFrameTask, "",
@@ -1054,6 +1059,8 @@ func (s *Server) triggerItemIDPresent(session *PlayerSession, itemID string) {
 		s.GrantCriterion(session, "minecraft:nether/obtain_ancient_debris", "ancient_debris")
 	case "netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots":
 		s.GrantCriterion(session, "minecraft:nether/netherite_armor", name)
+	case "blaze_rod":
+		s.GrantCriterion(session, "minecraft:nether/obtain_blaze_rod", "blaze_rod")
 	}
 }
 

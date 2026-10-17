@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,11 +39,23 @@ const (
 	BrewingDataFuelUses int16 = 1 // remaining blaze powder fuel charges (0..20)
 )
 
-// Vanilla 26.1.2 brewing stand timing and fuel constants.
+// Vanilla 26.1.2 brewing stand timing, fuel, sound, level event, and particle constants.
 const (
 	DefaultBrewingTime     int16 = 400 // 20 seconds at 20 TPS
 	BlazePowderFuelCharges int16 = 20  // 1 blaze_powder = 20 fuel charges
 	MaxBrewingFuelCharges  int16 = 20
+
+	// LevelEventSoundBrewingStand is the vanilla LevelEvent (1035) broadcast in
+	// BrewingStandBlockEntity.doBrew when a brewing cycle finishes.
+	LevelEventSoundBrewingStand int32 = 1035
+
+	// SoundBrewingStandBrew is the vanilla sound event played when a brewing cycle finishes.
+	SoundBrewingStandBrew = "minecraft:block.brewing_stand.brew"
+
+	// ParticleTypeBubbleID ("minecraft:bubble" = 4) and ParticleTypeSmokeID
+	// ("minecraft:smoke" = 72) in BuiltInRegistries.PARTICLE_TYPE (protocol 775).
+	ParticleTypeBubbleID int32 = 4
+	ParticleTypeSmokeID  int32 = 72
 )
 
 // Block state IDs for minecraft:brewing_stand in blocks.json (9452..9459).
@@ -85,13 +98,36 @@ func BrewingStandStateBottles(state uint16) (b0, b1, b2, ok bool) {
 	return (bits & 4) != 0, (bits & 2) != 0, (bits & 1) != 0, true
 }
 
+// EncodeBrewingStandBubbleParticlePacket encodes a ClientboundLevelParticlesPacket
+// (0x2f in protocol 775) for the brewing stand's rising bubble/smoke particles.
+func EncodeBrewingStandBubbleParticlePacket(x, y, z int, brewTime int16) []byte {
+	phase := float64(brewTime%20) / 20.0
+	px := float64(x) + 0.4 + 0.2*phase
+	py := float64(y) + 0.7 + 0.2*phase
+	pz := float64(z) + 0.4 + 0.2*(1.0-phase)
+
+	w := protocol.NewWriter(48)
+	w.Bool(false) // overrideLimiter
+	w.Bool(false) // alwaysShow
+	w.Float64(px)
+	w.Float64(py)
+	w.Float64(pz)
+	w.Float32(0.05) // xDist
+	w.Float32(0.08) // yDist
+	w.Float32(0.05) // zDist
+	w.Float32(0.01) // maxSpeed
+	w.Int32(2)      // count
+	w.VarInt(ParticleTypeSmokeID)
+	return w.Bytes()
+}
+
 // --- Brewing Recipe Registry (Vanilla 26.1.2 PotionBrewing) ---
 
 // BrewingMix represents one potion or container conversion rule.
 type BrewingMix struct {
-	From   string
+	From    string
 	Reagent string
-	To     string
+	To      string
 }
 
 // BrewingRecipeRegistry holds the vanilla 26.1.2 container and potion brewing mixes.
@@ -218,6 +254,26 @@ func buildVanillaBrewingRegistry() *BrewingRecipeRegistry {
 	return reg
 }
 
+// ContainerMixes returns a copy of all registered container mixes.
+func (r *BrewingRecipeRegistry) ContainerMixes() []BrewingMix {
+	if r == nil {
+		return nil
+	}
+	out := make([]BrewingMix, len(r.containerMixes))
+	copy(out, r.containerMixes)
+	return out
+}
+
+// PotionMixes returns a copy of all registered potion mixes.
+func (r *BrewingRecipeRegistry) PotionMixes() []BrewingMix {
+	if r == nil {
+		return nil
+	}
+	out := make([]BrewingMix, len(r.potionMixes))
+	copy(out, r.potionMixes)
+	return out
+}
+
 // IsIngredient reports whether itemStack is a valid brewing reagent in any
 // container or potion mix.
 func (r *BrewingRecipeRegistry) IsIngredient(stack world.ItemStack) bool {
@@ -291,15 +347,167 @@ func BrewPotion(bottleStack world.ItemStack, potionType string, ingredient world
 	return DefaultBrewingRegistry().Mix(bottleStack, potionType, ingredient)
 }
 
+// --- Hopper WorldlyContainer Rules & Redstone Comparator Signal ---
+
+// BrewingStandSlotsForFace returns the slot indices accessible to a hopper for
+// the given face of the brewing stand block ("up" / "top", "down" / "bottom",
+// or any horizontal side "north" / "south" / "west" / "east" / "side"),
+// matching vanilla BrewingStandBlockEntity.getSlotsForFace:
+//   - "up": {3} (ingredient slot)
+//   - "down": {0, 1, 2, 3} (3 bottle slots + ingredient slot for leftover glass_bottle)
+//   - sides: {4, 0, 1, 2} (fuel slot 4 first, then bottle slots 0..2)
+func BrewingStandSlotsForFace(face string) []int {
+	switch strings.ToLower(strings.TrimSpace(face)) {
+	case "up", "top":
+		return []int{BrewingStandSlotIngredient}
+	case "down", "bottom":
+		return []int{
+			BrewingStandSlotBottle0,
+			BrewingStandSlotBottle1,
+			BrewingStandSlotBottle2,
+			BrewingStandSlotIngredient,
+		}
+	default:
+		return []int{
+			BrewingStandSlotFuel,
+			BrewingStandSlotBottle0,
+			BrewingStandSlotBottle1,
+			BrewingStandSlotBottle2,
+		}
+	}
+}
+
+// CanPlaceInBrewingSlot reports whether stack can be inserted into slot (0..4)
+// of a brewing stand given the current contents of that slot (existing),
+// matching BrewingStandBlockEntity.canPlaceItem.
+func CanPlaceInBrewingSlot(slot int, stack world.ItemStack, existing world.ItemStack) bool {
+	if stack.IsEmpty() {
+		return false
+	}
+	switch slot {
+	case BrewingStandSlotIngredient:
+		if !IsBrewingIngredient(stack) {
+			return false
+		}
+		maxSt := brewingItemMaxStackSize(stack)
+		return existing.IsEmpty() || (existing.ResolvedItemID() == stack.ResolvedItemID() && existing.Count < maxSt)
+	case BrewingStandSlotFuel:
+		if !IsBrewingFuel(stack) {
+			return false
+		}
+		return existing.IsEmpty() || (existing.ResolvedItemID() == stack.ResolvedItemID() && existing.Count < MaxItemStackSize)
+	case BrewingStandSlotBottle0, BrewingStandSlotBottle1, BrewingStandSlotBottle2:
+		return CanPlaceInBrewingBottleSlot(stack) && existing.IsEmpty()
+	default:
+		return false
+	}
+}
+
+// CanTakeFromBrewingSlot reports whether a hopper below a brewing stand can
+// extract stack from slot (0..4), matching BrewingStandBlockEntity.canTakeItemThroughFace:
+//   - Bottle slots (0..2): any non-empty item can be extracted.
+//   - Ingredient slot (3): only a leftover `minecraft:glass_bottle` (left behind
+//     after brewing with `minecraft:dragon_breath`) or non-ingredient remainder
+//     can be extracted from below.
+func CanTakeFromBrewingSlot(slot int, stack world.ItemStack) bool {
+	if stack.IsEmpty() {
+		return false
+	}
+	switch slot {
+	case BrewingStandSlotBottle0, BrewingStandSlotBottle1, BrewingStandSlotBottle2:
+		return true
+	case BrewingStandSlotIngredient:
+		return normalizeBrewingItem(stack.ResolvedID()) == "minecraft:glass_bottle" || !IsBrewingIngredient(stack)
+	default:
+		return false
+	}
+}
+
+func brewingItemMaxStackSize(stack world.ItemStack) int32 {
+	if stack.IsEmpty() {
+		return MaxItemStackSize
+	}
+	if IsPotionItem(stack) {
+		return 1
+	}
+	switch normalizeBrewingItem(stack.ResolvedID()) {
+	case "minecraft:turtle_helmet":
+		return 1
+	default:
+		return MaxItemStackSize
+	}
+}
+
+// BrewingStandComparatorSignalFromItems computes the vanilla redstone comparator
+// signal (0..15) for the 5 slots of a brewing stand, matching
+// AbstractContainerMenu.getRedstoneSignalFromContainer:
+//   - 0 when all 5 slots are empty
+//   - floor((sum(count_i / maxStack_i) / 5.0) * 14.0) + 1 otherwise
+func BrewingStandComparatorSignalFromItems(items [BrewingStandSlotCount]world.ItemStack) int {
+	var totalRatio float64
+	nonEmpty := false
+	for slot, st := range items {
+		if st.IsEmpty() || st.Count <= 0 {
+			continue
+		}
+		nonEmpty = true
+		maxStack := float64(brewingItemMaxStackSize(st))
+		if slot < 3 && maxStack > 1 {
+			// Bottle slots only hold 1 bottle at a time in BrewingStandMenu,
+			// while potions themselves have maxStackSize == 1.
+			maxStack = 1
+		}
+		ratio := float64(st.Count) / maxStack
+		if ratio > 1.0 {
+			ratio = 1.0
+		}
+		totalRatio += ratio
+	}
+	if !nonEmpty {
+		return 0
+	}
+	sig := int(math.Floor((totalRatio/float64(BrewingStandSlotCount))*14.0)) + 1
+	if sig > world.MaxRedstonePower {
+		sig = world.MaxRedstonePower
+	}
+	return sig
+}
+
+// BrewingStandComparatorSignal returns the redstone comparator signal (0..15)
+// for a BrewingStandBlockEntity.
+func BrewingStandComparatorSignal(b BrewingStandBlockEntity) int {
+	return BrewingStandComparatorSignalFromItems(b.Items)
+}
+
+// BrewingStandComparatorSignalAt returns the redstone comparator signal (0..15)
+// for a brewing stand at (x, y, z) in dim.
+func (s *Server) BrewingStandComparatorSignalAt(dim string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache != nil && !IsBrewingStandBlock(cache.GetBlock(x, y, z)) {
+		return 0
+	}
+	b, ok := s.BrewingStandAtInDim(normDim, x, y, z)
+	if !ok {
+		return 0
+	}
+	return BrewingStandComparatorSignal(b)
+}
+
 // --- BrewingStandBlockEntity State & Persistence ---
 
 // BrewingStandBlockEntity represents the persistent and runtime state of a
-// minecraft:brewing_stand block entity at (X, Y, Z).
+// minecraft:brewing_stand block entity at (Dimension, X, Y, Z).
 type BrewingStandBlockEntity struct {
 	ID          string
+	Dimension   string
 	X           int
 	Y           int
 	Z           int
+	CustomName  string
 	Items       [BrewingStandSlotCount]world.ItemStack
 	PotionTypes [3]string // canonical potion IDs for bottle slots 0..2
 	BrewTime    int16     // remaining ticks in current brew (400..0)
@@ -313,6 +521,11 @@ func (b BrewingStandBlockEntity) Clone() BrewingStandBlockEntity {
 	cp := b
 	if cp.ID == "" {
 		cp.ID = "minecraft:brewing_stand"
+	}
+	if cp.Dimension == "" {
+		cp.Dimension = world.DimensionOverworld
+	} else {
+		cp.Dimension = world.NormalizeDimension(cp.Dimension)
 	}
 	for i := 0; i < 3; i++ {
 		if IsPotionItem(cp.Items[i]) {
@@ -330,11 +543,15 @@ func EncodeBrewingStandBlockEntityNBT(b BrewingStandBlockEntity) *nbt.Compound {
 	b = b.Clone()
 	c := nbt.NewCompound().
 		Set("id", nbt.String("minecraft:brewing_stand")).
+		Set("dimension", nbt.String(b.Dimension)).
 		Set("x", nbt.Int(b.X)).
 		Set("y", nbt.Int(b.Y)).
 		Set("z", nbt.Int(b.Z)).
 		Set("BrewTime", nbt.Short(b.BrewTime)).
 		Set("Fuel", nbt.Byte(b.Fuel))
+	if b.CustomName != "" {
+		c.Set("CustomName", nbt.String(b.CustomName))
+	}
 
 	var items []nbt.Tag
 	for slot, st := range b.Items {
@@ -381,7 +598,18 @@ func DecodeBrewingStandBlockEntityNBT(c *nbt.Compound) (BrewingStandBlockEntity,
 	}
 
 	b := BrewingStandBlockEntity{
-		ID: "minecraft:brewing_stand",
+		ID:        "minecraft:brewing_stand",
+		Dimension: world.DimensionOverworld,
+	}
+	if dimTag, ok := c.Get("dimension"); ok {
+		if ds, ok := dimTag.(nbt.String); ok && string(ds) != "" {
+			b.Dimension = world.NormalizeDimension(string(ds))
+		}
+	}
+	if cnTag, ok := c.Get("CustomName"); ok {
+		if cs, ok := cnTag.(nbt.String); ok {
+			b.CustomName = string(cs)
+		}
 	}
 	if xTag, ok := c.Get("x"); ok {
 		if v, ok := xTag.(nbt.Int); ok {
@@ -485,13 +713,23 @@ func DecodeBrewingStandBlockEntityNBT(c *nbt.Compound) (BrewingStandBlockEntity,
 }
 
 type brewingKey struct {
+	dim     string
 	x, y, z int
 }
 
+func makeBrewingKey(dim string, x, y, z int) brewingKey {
+	return brewingKey{
+		dim: world.NormalizeDimension(dim),
+		x:   x,
+		y:   y,
+		z:   z,
+	}
+}
+
 type serverBrewingState struct {
-	mu          sync.Mutex
-	loadedDisk  bool
-	stands      map[brewingKey]*BrewingStandBlockEntity
+	mu         sync.Mutex
+	loadedDisk bool
+	stands     map[brewingKey]*BrewingStandBlockEntity
 }
 
 var serverBrewingStands sync.Map // map[*Server]*serverBrewingState
@@ -555,13 +793,26 @@ func (s *Server) ensureBrewingLoadedLocked(bs *serverBrewingState) {
 			continue
 		}
 		if b, valid := DecodeBrewingStandBlockEntityNBT(comp); valid {
-			key := brewingKey{b.X, b.Y, b.Z}
+			key := makeBrewingKey(b.Dimension, b.X, b.Y, b.Z)
 			if _, exists := bs.stands[key]; !exists {
 				cp := b.Clone()
 				bs.stands[key] = &cp
 			}
 		}
 	}
+}
+
+// LoadBrewingStands loads all persisted brewing stand block entities from disk.
+func (s *Server) LoadBrewingStands() error {
+	if s == nil {
+		return nil
+	}
+	bs := s.brewingState()
+	bs.mu.Lock()
+	bs.loadedDisk = false
+	s.ensureBrewingLoadedLocked(bs)
+	bs.mu.Unlock()
+	return nil
 }
 
 // SaveBrewingStands persists all tracked brewing stand block entities to disk
@@ -586,6 +837,9 @@ func (s *Server) SaveBrewingStands() error {
 	bs.mu.Unlock()
 
 	sort.Slice(list, func(i, j int) bool {
+		if list[i].Dimension != list[j].Dimension {
+			return list[i].Dimension < list[j].Dimension
+		}
 		if list[i].Y != list[j].Y {
 			return list[i].Y < list[j].Y
 		}
@@ -609,35 +863,49 @@ func (s *Server) SaveBrewingStands() error {
 	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
 }
 
-func (s *Server) getOrCreateBrewingStandLocked(bs *serverBrewingState, x, y, z int) *BrewingStandBlockEntity {
+func (s *Server) getOrCreateBrewingStandInDimLocked(bs *serverBrewingState, dim string, x, y, z int) *BrewingStandBlockEntity {
 	s.ensureBrewingLoadedLocked(bs)
-	key := brewingKey{x, y, z}
+	key := makeBrewingKey(dim, x, y, z)
 	b := bs.stands[key]
 	if b == nil {
 		b = &BrewingStandBlockEntity{
-			ID: "minecraft:brewing_stand",
-			X:  x,
-			Y:  y,
-			Z:  z,
+			ID:        "minecraft:brewing_stand",
+			Dimension: key.dim,
+			X:         x,
+			Y:         y,
+			Z:         z,
 		}
 		bs.stands[key] = b
 	}
 	return b
 }
 
-// BrewingStandAt returns a snapshot of the brewing stand block entity at (x, y, z).
-func (s *Server) BrewingStandAt(x, y, z int) (BrewingStandBlockEntity, bool) {
+func (s *Server) getOrCreateBrewingStandLocked(bs *serverBrewingState, x, y, z int) *BrewingStandBlockEntity {
+	return s.getOrCreateBrewingStandInDimLocked(bs, world.DimensionOverworld, x, y, z)
+}
+
+// BrewingStandAtInDim returns a snapshot of the brewing stand block entity at
+// (x, y, z) in dim.
+func (s *Server) BrewingStandAtInDim(dim string, x, y, z int) (BrewingStandBlockEntity, bool) {
 	if s == nil {
 		return BrewingStandBlockEntity{}, false
 	}
+	normDim := world.NormalizeDimension(dim)
 	bs := s.brewingState()
 	bs.mu.Lock()
 	s.ensureBrewingLoadedLocked(bs)
-	b := bs.stands[brewingKey{x, y, z}]
+	b := bs.stands[makeBrewingKey(normDim, x, y, z)]
 	if b == nil {
 		bs.mu.Unlock()
-		if s.chunks != nil && IsBrewingStandBlock(s.chunks.GetBlock(x, y, z)) {
-			return BrewingStandBlockEntity{ID: "minecraft:brewing_stand", X: x, Y: y, Z: z}, true
+		cache := s.DimensionChunks(normDim)
+		if cache != nil && IsBrewingStandBlock(cache.GetBlock(x, y, z)) {
+			return BrewingStandBlockEntity{
+				ID:        "minecraft:brewing_stand",
+				Dimension: normDim,
+				X:         x,
+				Y:         y,
+				Z:         z,
+			}, true
 		}
 		return BrewingStandBlockEntity{}, false
 	}
@@ -646,8 +914,14 @@ func (s *Server) BrewingStandAt(x, y, z int) (BrewingStandBlockEntity, bool) {
 	return cp, true
 }
 
+// BrewingStandAt returns a snapshot of the brewing stand block entity at (x, y, z)
+// in the Overworld.
+func (s *Server) BrewingStandAt(x, y, z int) (BrewingStandBlockEntity, bool) {
+	return s.BrewingStandAtInDim(world.DimensionOverworld, x, y, z)
+}
+
 // SetBrewingStandState replaces or inserts the brewing stand block entity at
-// (b.X, b.Y, b.Z) and persists it.
+// (b.Dimension, b.X, b.Y, b.Z) and persists it.
 func (s *Server) SetBrewingStandState(b BrewingStandBlockEntity) {
 	if s == nil {
 		return
@@ -659,29 +933,63 @@ func (s *Server) SetBrewingStandState(b BrewingStandBlockEntity) {
 	if !cp.Items[BrewingStandSlotIngredient].IsEmpty() {
 		cp.ingredient = cp.Items[BrewingStandSlotIngredient].ResolvedID()
 	}
-	bs.stands[brewingKey{b.X, b.Y, b.Z}] = &cp
+	key := makeBrewingKey(cp.Dimension, cp.X, cp.Y, cp.Z)
+	bs.stands[key] = &cp
 	bs.mu.Unlock()
 
-	s.updateBrewingStandBottleBlockState(b.X, b.Y, b.Z, cp.Items)
+	s.updateBrewingStandBottleBlockStateInDim(key.dim, cp.X, cp.Y, cp.Z, cp.Items)
 	_ = s.SaveBrewingStands()
 }
 
-// BrewingStandSlots returns a copy of the 5 slots in the brewing stand at (x, y, z).
-func (s *Server) BrewingStandSlots(x, y, z int) [BrewingStandSlotCount]world.ItemStack {
-	b, ok := s.BrewingStandAt(x, y, z)
+// OnBrewingStandPlacedInDim initializes a brewing stand block entity when a
+// brewing stand is placed at (x, y, z) in dim.
+func (s *Server) OnBrewingStandPlacedInDim(dim string, x, y, z int, customName string) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	if cache := s.DimensionChunks(normDim); cache != nil && !IsBrewingStandBlock(cache.GetBlock(x, y, z)) {
+		cache.SetBlock(x, y, z, BrewingStandBlockState(false, false, false))
+	}
+	bs := s.brewingState()
+	bs.mu.Lock()
+	b := s.getOrCreateBrewingStandInDimLocked(bs, normDim, x, y, z)
+	if customName != "" {
+		b.CustomName = customName
+	}
+	itemsCopy := b.Items
+	bs.mu.Unlock()
+	s.updateBrewingStandBottleBlockStateInDim(normDim, x, y, z, itemsCopy)
+	_ = s.SaveBrewingStands()
+}
+
+// OnBrewingStandPlaced initializes a brewing stand block entity in the Overworld.
+func (s *Server) OnBrewingStandPlaced(x, y, z int, customName string) {
+	s.OnBrewingStandPlacedInDim(world.DimensionOverworld, x, y, z, customName)
+}
+
+// BrewingStandSlotsInDim returns a copy of the 5 slots in the brewing stand at
+// (x, y, z) in dim.
+func (s *Server) BrewingStandSlotsInDim(dim string, x, y, z int) [BrewingStandSlotCount]world.ItemStack {
+	b, ok := s.BrewingStandAtInDim(dim, x, y, z)
 	if !ok {
 		return [BrewingStandSlotCount]world.ItemStack{}
 	}
 	return b.Items
 }
 
-// GetBrewingSlotPotionType returns the canonical potion ID of bottle slot (0..2)
-// in the brewing stand at (x, y, z).
-func (s *Server) GetBrewingSlotPotionType(x, y, z, slot int) string {
+// BrewingStandSlots returns a copy of the 5 slots in the brewing stand at (x, y, z).
+func (s *Server) BrewingStandSlots(x, y, z int) [BrewingStandSlotCount]world.ItemStack {
+	return s.BrewingStandSlotsInDim(world.DimensionOverworld, x, y, z)
+}
+
+// GetBrewingSlotPotionTypeInDim returns the canonical potion ID of bottle slot
+// (0..2) in the brewing stand at (x, y, z) in dim.
+func (s *Server) GetBrewingSlotPotionTypeInDim(dim string, x, y, z, slot int) string {
 	if s == nil || slot < 0 || slot >= 3 {
 		return ""
 	}
-	b, ok := s.BrewingStandAt(x, y, z)
+	b, ok := s.BrewingStandAtInDim(dim, x, y, z)
 	if !ok || !IsPotionItem(b.Items[slot]) {
 		return ""
 	}
@@ -691,12 +999,19 @@ func (s *Server) GetBrewingSlotPotionType(x, y, z, slot int) string {
 	return canonicalPotionID(b.PotionTypes[slot])
 }
 
-// SetBrewingSlot sets slot (0..4) in the brewing stand at (x, y, z) along with
-// an optional potionType for bottle slots (0..2).
-func (s *Server) SetBrewingSlot(x, y, z, slot int, stack world.ItemStack, potionType string) bool {
+// GetBrewingSlotPotionType returns the canonical potion ID of bottle slot (0..2)
+// in the brewing stand at (x, y, z).
+func (s *Server) GetBrewingSlotPotionType(x, y, z, slot int) string {
+	return s.GetBrewingSlotPotionTypeInDim(world.DimensionOverworld, x, y, z, slot)
+}
+
+// SetBrewingSlotInDim sets slot (0..4) in the brewing stand at (x, y, z) in dim
+// along with an optional potionType for bottle slots (0..2).
+func (s *Server) SetBrewingSlotInDim(dim string, x, y, z, slot int, stack world.ItemStack, potionType string) bool {
 	if s == nil || slot < 0 || slot >= BrewingStandSlotCount {
 		return false
 	}
+	normDim := world.NormalizeDimension(dim)
 	var normalized world.ItemStack
 	if !stack.IsEmpty() {
 		count := stack.Count
@@ -708,7 +1023,7 @@ func (s *Server) SetBrewingSlot(x, y, z, slot int, stack world.ItemStack, potion
 
 	bs := s.brewingState()
 	bs.mu.Lock()
-	b := s.getOrCreateBrewingStandLocked(bs, x, y, z)
+	b := s.getOrCreateBrewingStandInDimLocked(bs, normDim, x, y, z)
 	b.Items[slot] = normalized
 	if slot < 3 {
 		if IsPotionItem(normalized) {
@@ -731,38 +1046,58 @@ func (s *Server) SetBrewingSlot(x, y, z, slot int, stack world.ItemStack, potion
 	itemsCopy := b.Items
 	bs.mu.Unlock()
 
-	s.updateBrewingStandBottleBlockState(x, y, z, itemsCopy)
+	s.updateBrewingStandBottleBlockStateInDim(normDim, x, y, z, itemsCopy)
 	_ = s.SaveBrewingStands()
 	return true
 }
 
-func (s *Server) updateBrewingStandBottleBlockState(x, y, z int, items [BrewingStandSlotCount]world.ItemStack) {
-	if s == nil || s.chunks == nil {
+// SetBrewingSlot sets slot (0..4) in the brewing stand at (x, y, z) along with
+// an optional potionType for bottle slots (0..2).
+func (s *Server) SetBrewingSlot(x, y, z, slot int, stack world.ItemStack, potionType string) bool {
+	return s.SetBrewingSlotInDim(world.DimensionOverworld, x, y, z, slot, stack, potionType)
+}
+
+func (s *Server) updateBrewingStandBottleBlockStateInDim(dim string, x, y, z int, items [BrewingStandSlotCount]world.ItemStack) {
+	if s == nil {
 		return
 	}
-	curState := s.chunks.GetBlock(x, y, z)
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	curState := cache.GetBlock(x, y, z)
 	if !IsBrewingStandBlock(curState) {
+		cache.UpdateComparatorsAround(x, y, z)
 		return
 	}
 	nextState := BrewingStandBlockState(!items[0].IsEmpty(), !items[1].IsEmpty(), !items[2].IsEmpty())
 	if nextState != curState {
-		if valid, lightChunks := s.chunks.SetBlockWithLight(x, y, z, nextState); valid {
+		if valid, lightChunks := cache.SetBlockWithLight(x, y, z, nextState); valid {
 			s.broadcastBlockAndLightUpdate(x, y, z, nextState, lightChunks)
+		} else {
+			cache.SetBlock(x, y, z, nextState)
 		}
 	}
+	cache.UpdateComparatorsAround(x, y, z)
 }
 
-// DropBrewingStandContents removes the brewing stand block entity at (x, y, z),
-// closes any open brewing stand screens targeting it, and drops its non-empty
-// slots as item entities in the world.
-func (s *Server) DropBrewingStandContents(x, y, z int) {
+func (s *Server) updateBrewingStandBottleBlockState(x, y, z int, items [BrewingStandSlotCount]world.ItemStack) {
+	s.updateBrewingStandBottleBlockStateInDim(world.DimensionOverworld, x, y, z, items)
+}
+
+// DropBrewingStandContentsInDim removes the brewing stand block entity at
+// (x, y, z) in dim, closes any open brewing stand screens targeting it, drops
+// its non-empty slots as item entities in the world, and updates comparators.
+func (s *Server) DropBrewingStandContentsInDim(dim string, x, y, z int) {
 	if s == nil {
 		return
 	}
+	normDim := world.NormalizeDimension(dim)
 	bs := s.brewingState()
 	bs.mu.Lock()
 	s.ensureBrewingLoadedLocked(bs)
-	key := brewingKey{x, y, z}
+	key := makeBrewingKey(normDim, x, y, z)
 	b := bs.stands[key]
 	delete(bs.stands, key)
 	bs.mu.Unlock()
@@ -784,47 +1119,235 @@ func (s *Server) DropBrewingStandContents(x, y, z int) {
 	if b != nil {
 		for _, st := range b.Items {
 			if !st.IsEmpty() {
-				s.SpawnItemEntity(float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, st)
+				s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, st)
 			}
 		}
 		_ = s.SaveBrewingStands()
 	}
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		cache.UpdateComparatorsAround(x, y, z)
+	}
+}
+
+// DropBrewingStandContents removes the brewing stand block entity at (x, y, z)
+// in the Overworld, closes any open brewing stand screens targeting it, and
+// drops its non-empty slots as item entities in the world.
+func (s *Server) DropBrewingStandContents(x, y, z int) {
+	s.DropBrewingStandContentsInDim(world.DimensionOverworld, x, y, z)
+}
+
+// --- Hopper Insert & Extract Helpers (Vanilla 26.1.2 WorldlyContainer) ---
+
+// HopperTryInsertIntoBrewingStand attempts to insert 1 item from stack (having
+// optional potionType when stack is a potion) into the brewing stand at
+// (x, y, z) in dim through fromFace ("up" = ingredient slot 3;
+// "north"/"south"/"west"/"east"/"side" = fuel slot 4 or bottle slots 0..2).
+// Returns (true, remainingStack) if 1 item was inserted, or (false, stack) otherwise.
+func (s *Server) HopperTryInsertIntoBrewingStand(
+	dim string,
+	x, y, z int,
+	fromFace string,
+	stack world.ItemStack,
+	potionType string,
+) (inserted bool, remaining world.ItemStack) {
+	if s == nil || stack.IsEmpty() || stack.Count <= 0 {
+		return false, stack
+	}
+	normDim := world.NormalizeDimension(dim)
+	candidateSlots := BrewingStandSlotsForFace(fromFace)
+	if len(candidateSlots) == 0 {
+		return false, stack
+	}
+
+	bs := s.brewingState()
+	bs.mu.Lock()
+	b := s.getOrCreateBrewingStandInDimLocked(bs, normDim, x, y, z)
+
+	targetSlot := -1
+	for _, slot := range candidateSlots {
+		// Hoppers cannot insert through the bottom face ("down").
+		if strings.EqualFold(strings.TrimSpace(fromFace), "down") || strings.EqualFold(strings.TrimSpace(fromFace), "bottom") {
+			break
+		}
+		if CanPlaceInBrewingSlot(slot, stack, b.Items[slot]) {
+			targetSlot = slot
+			break
+		}
+	}
+	if targetSlot < 0 {
+		bs.mu.Unlock()
+		return false, stack
+	}
+
+	cur := b.Items[targetSlot]
+	if cur.IsEmpty() {
+		b.Items[targetSlot] = world.NewItemStack(stack.ResolvedItemID(), 1)
+	} else {
+		b.Items[targetSlot] = world.NewItemStack(cur.ResolvedItemID(), cur.Count+1)
+	}
+	if targetSlot < 3 {
+		if IsPotionItem(b.Items[targetSlot]) {
+			if potionType == "" {
+				b.PotionTypes[targetSlot] = PotionWater
+			} else {
+				b.PotionTypes[targetSlot] = canonicalPotionID(potionType)
+			}
+		} else {
+			b.PotionTypes[targetSlot] = ""
+		}
+	} else if targetSlot == BrewingStandSlotIngredient {
+		if b.ingredient == "" {
+			b.ingredient = b.Items[targetSlot].ResolvedID()
+		}
+	}
+	itemsCopy := b.Items
+	bs.mu.Unlock()
+
+	remCount := stack.Count - 1
+	if remCount > 0 {
+		remaining = world.NewItemStack(stack.ResolvedItemID(), remCount)
+	}
+	s.updateBrewingStandBottleBlockStateInDim(normDim, x, y, z, itemsCopy)
+	s.broadcastBrewingStandProgressToViewers(x, y, z, true)
+	_ = s.SaveBrewingStands()
+	return true, remaining
+}
+
+// HopperTryInsertIntoBrewingStandAt attempts to insert 1 item from stack into
+// the Overworld brewing stand at (x, y, z) through fromFace.
+func (s *Server) HopperTryInsertIntoBrewingStandAt(
+	x, y, z int,
+	fromFace string,
+	stack world.ItemStack,
+	potionType string,
+) (inserted bool, remaining world.ItemStack) {
+	return s.HopperTryInsertIntoBrewingStand(world.DimensionOverworld, x, y, z, fromFace, stack, potionType)
+}
+
+// HopperTryExtractFromBrewingStand attempts to extract 1 item from the bottom
+// ("down" face: slots 0, 1, 2, 3) of the brewing stand at (x, y, z) in dim.
+// Returns the extracted 1-item stack, its canonical potionType (if a potion),
+// and true on success.
+func (s *Server) HopperTryExtractFromBrewingStand(
+	dim string,
+	x, y, z int,
+) (extracted world.ItemStack, potionType string, ok bool) {
+	if s == nil {
+		return world.ItemStack{}, "", false
+	}
+	normDim := world.NormalizeDimension(dim)
+	downSlots := BrewingStandSlotsForFace("down")
+
+	bs := s.brewingState()
+	bs.mu.Lock()
+	s.ensureBrewingLoadedLocked(bs)
+	b := bs.stands[makeBrewingKey(normDim, x, y, z)]
+	if b == nil {
+		bs.mu.Unlock()
+		return world.ItemStack{}, "", false
+	}
+
+	targetSlot := -1
+	for _, slot := range downSlots {
+		if CanTakeFromBrewingSlot(slot, b.Items[slot]) {
+			targetSlot = slot
+			break
+		}
+	}
+	if targetSlot < 0 {
+		bs.mu.Unlock()
+		return world.ItemStack{}, "", false
+	}
+
+	cur := b.Items[targetSlot]
+	extracted = world.NewItemStack(cur.ResolvedItemID(), 1)
+	if targetSlot < 3 && IsPotionItem(cur) {
+		potionType = b.PotionTypes[targetSlot]
+		if potionType == "" {
+			potionType = PotionWater
+		} else {
+			potionType = canonicalPotionID(potionType)
+		}
+	}
+	rem := cur.Count - 1
+	if rem <= 0 {
+		b.Items[targetSlot] = world.ItemStack{}
+		if targetSlot < 3 {
+			b.PotionTypes[targetSlot] = ""
+		} else if targetSlot == BrewingStandSlotIngredient {
+			b.ingredient = ""
+		}
+	} else {
+		b.Items[targetSlot] = world.NewItemStack(cur.ResolvedItemID(), rem)
+	}
+	itemsCopy := b.Items
+	bs.mu.Unlock()
+
+	s.updateBrewingStandBottleBlockStateInDim(normDim, x, y, z, itemsCopy)
+	s.broadcastBrewingStandProgressToViewers(x, y, z, true)
+	_ = s.SaveBrewingStands()
+	return extracted, potionType, true
+}
+
+// HopperTryExtractFromBrewingStandAt attempts to extract 1 item from the bottom
+// of the Overworld brewing stand at (x, y, z).
+func (s *Server) HopperTryExtractFromBrewingStandAt(x, y, z int) (extracted world.ItemStack, potionType string, ok bool) {
+	return s.HopperTryExtractFromBrewingStand(world.DimensionOverworld, x, y, z)
 }
 
 // --- Brewing Tick Logic (Vanilla 26.1.2 BrewingStandBlockEntity.serverTick) ---
 
-// TickBrewingStandAt advances the brewing stand at (x, y, z) by one game tick:
+// TickBrewingStandAtInDim advances the brewing stand at (x, y, z) in dim by one
+// game tick:
 //   - Consumes 1 blaze_powder in slot 4 to add 20 fuel charges when fuel == 0.
 //   - Starts a 400-tick brew when fuel > 0 and canBrew is true (consuming 1 fuel charge).
+//   - Emits periodic bubble/smoke particles while actively brewing.
 //   - Decrements BrewTime each tick while canBrew remains valid; on reaching 0,
 //     applies the brewing recipe to bottle slots 0..2, consumes 1 ingredient,
-//     and triggers minecraft:nether/brew_potion.
-func (s *Server) TickBrewingStandAt(x, y, z int) bool {
+//     broadcasts LevelEvent 1035 and block.brewing_stand.brew sound, updates
+//     comparators, and triggers minecraft:nether/brew_potion.
+func (s *Server) TickBrewingStandAtInDim(dim string, x, y, z int) bool {
 	if s == nil {
 		return false
 	}
-	if s.chunks != nil {
-		state := s.chunks.GetBlock(x, y, z)
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache != nil {
+		state := cache.GetBlock(x, y, z)
 		if !IsBrewingStandBlock(state) {
-			s.DropBrewingStandContents(x, y, z)
+			s.DropBrewingStandContentsInDim(normDim, x, y, z)
 			return false
 		}
 	}
 
 	bs := s.brewingState()
 	bs.mu.Lock()
-	b := s.getOrCreateBrewingStandLocked(bs, x, y, z)
+	b := s.getOrCreateBrewingStandInDimLocked(bs, normDim, x, y, z)
 	changed, slotsChanged, brewedPotions, brewer, dropDragonBottle := stepBrewingStandTickLocked(b)
 	itemsCopy := b.Items
+	curBrewTime := b.BrewTime
 	bs.mu.Unlock()
 
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+
+	if curBrewTime > 0 && curBrewTime%10 == 0 {
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelParticlesCB,
+			EncodeBrewingStandBubbleParticlePacket(x, y, z, curBrewTime))
+	}
+
 	if dropDragonBottle {
-		s.SpawnItemEntity(float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, world.NewNamedItemStack("minecraft:glass_bottle", 1))
+		s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, world.NewNamedItemStack("minecraft:glass_bottle", 1))
 	}
 	if slotsChanged {
-		s.updateBrewingStandBottleBlockState(x, y, z, itemsCopy)
+		s.updateBrewingStandBottleBlockStateInDim(normDim, x, y, z, itemsCopy)
 	}
 	if len(brewedPotions) > 0 {
+		// Vanilla BrewingStandBlockEntity.doBrew: level.levelEvent(1035, pos, 0) + sound.
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundBrewingStand, x, y, z, 0, false))
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+			EncodeSoundPacket(SoundBrewingStandBrew, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
 		s.notifyBrewedPotionAdvancement(brewer, x, y, z, brewedPotions)
 	}
 	if changed {
@@ -834,6 +1357,11 @@ func (s *Server) TickBrewingStandAt(x, y, z int) bool {
 		s.broadcastBrewingStandProgressToViewers(x, y, z, slotsChanged)
 	}
 	return changed
+}
+
+// TickBrewingStandAt advances the Overworld brewing stand at (x, y, z) by one game tick.
+func (s *Server) TickBrewingStandAt(x, y, z int) bool {
+	return s.TickBrewingStandAtInDim(world.DimensionOverworld, x, y, z)
 }
 
 // TickBrewingStands advances all tracked brewing stands by one game tick and
@@ -852,6 +1380,9 @@ func (s *Server) TickBrewingStands() int {
 	bs.mu.Unlock()
 
 	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].dim != keys[j].dim {
+			return keys[i].dim < keys[j].dim
+		}
 		if keys[i].y != keys[j].y {
 			return keys[i].y < keys[j].y
 		}
@@ -863,7 +1394,7 @@ func (s *Server) TickBrewingStands() int {
 
 	changedCount := 0
 	for _, k := range keys {
-		if s.TickBrewingStandAt(k.x, k.y, k.z) {
+		if s.TickBrewingStandAtInDim(k.dim, k.x, k.y, k.z) {
 			changedCount++
 		}
 	}
@@ -937,7 +1468,7 @@ func stepBrewingStandTickLocked(b *BrewingStandBlockEntity) (
 		slotsChanged = true
 	}
 
-	 brewable := canBrewLocked(b)
+	brewable := canBrewLocked(b)
 	isBrewing := b.BrewTime > 0
 	ing := b.Items[BrewingStandSlotIngredient]
 
@@ -1046,10 +1577,20 @@ func (s *Server) OpenBrewingStand(session *PlayerSession, x, y, z int) (int32, e
 	}
 	_ = s.CloseContainer(session, 0, false)
 
+	dim := session.Dimension()
+	if dim == "" {
+		dim = world.DimensionOverworld
+	}
+	normDim := world.NormalizeDimension(dim)
+
 	bs := s.brewingState()
 	bs.mu.Lock()
-	b := s.getOrCreateBrewingStandLocked(bs, x, y, z)
+	b := s.getOrCreateBrewingStandInDimLocked(bs, normDim, x, y, z)
 	b.lastBrewer = session
+	title := "Brewing Stand"
+	if b.CustomName != "" {
+		title = b.CustomName
+	}
 	bs.mu.Unlock()
 
 	tr := getContainerTracker(session)
@@ -1067,7 +1608,7 @@ func (s *Server) OpenBrewingStand(session *PlayerSession, x, y, z int) (int32, e
 	tr.mu.Unlock()
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeBrewingStand, "Brewing Stand")); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeBrewingStand, title)); err != nil {
 			return cid, err
 		}
 		slots := s.buildBrewingStandMenuSlots(session, x, y, z)
@@ -1083,7 +1624,11 @@ func (s *Server) OpenBrewingStand(session *PlayerSession, x, y, z int) (int32, e
 }
 
 func (s *Server) buildBrewingStandMenuSlots(session *PlayerSession, x, y, z int) []world.ItemStack {
-	standSlots := s.BrewingStandSlots(x, y, z)
+	dim := world.DimensionOverworld
+	if session != nil && session.Dimension() != "" {
+		dim = session.Dimension()
+	}
+	standSlots := s.BrewingStandSlotsInDim(dim, x, y, z)
 	inv := session.Inventory()
 	slots := make([]world.ItemStack, BrewingStandMenuSlotCount)
 	copy(slots[0:5], standSlots[:])
@@ -1096,7 +1641,11 @@ func (s *Server) sendBrewingStandDataProperties(session *PlayerSession, containe
 	if session == nil || session.send == nil {
 		return nil
 	}
-	b, _ := s.BrewingStandAt(x, y, z)
+	dim := session.Dimension()
+	if dim == "" {
+		dim = world.DimensionOverworld
+	}
+	b, _ := s.BrewingStandAtInDim(dim, x, y, z)
 	if err := session.send(protocol.PlayContainerSetData, EncodeContainerSetData(containerID, BrewingDataBrewTime, b.BrewTime)); err != nil {
 		return err
 	}
@@ -1134,7 +1683,7 @@ func (s *Server) HandleBrewingStandClick(session *PlayerSession, click Container
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
 			snap := session.Snapshot()
-			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
 		}
 		tr.mu.Unlock()
 		return s.syncBrewingStandViewers(session, bx, by, bz)
@@ -1155,10 +1704,15 @@ func (s *Server) applyBrewingStandClickLocked(
 	if slot < 0 || slot >= BrewingStandMenuSlotCount {
 		return
 	}
+	dim := session.Dimension()
+	if dim == "" {
+		dim = world.DimensionOverworld
+	}
+	normDim := world.NormalizeDimension(dim)
 
 	bs := s.brewingState()
 	bs.mu.Lock()
-	stand := s.getOrCreateBrewingStandLocked(bs, bx, by, bz)
+	stand := s.getOrCreateBrewingStandInDimLocked(bs, normDim, bx, by, bz)
 	stand.lastBrewer = session
 	var slotPotions [BrewingStandMenuSlotCount]string
 	for i := 0; i < 3; i++ {
@@ -1281,6 +1835,57 @@ func (s *Server) applyBrewingStandClickLocked(
 				}
 			}
 		}
+
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 32 + int(button)
+			hbStack := slots[hotbarIdx]
+			canSwap := true
+			switch {
+			case slot >= 0 && slot < 3:
+				canSwap = hbStack.IsEmpty() || (CanPlaceInBrewingBottleSlot(hbStack) && hbStack.Count == 1)
+			case slot == BrewingStandSlotIngredient:
+				canSwap = hbStack.IsEmpty() || IsBrewingIngredient(hbStack)
+			case slot == BrewingStandSlotFuel:
+				canSwap = hbStack.IsEmpty() || IsBrewingFuel(hbStack)
+			}
+			if canSwap {
+				if slot < 3 && IsPotionItem(slots[slot]) && slotPotions[slot] != "" && slotPotions[slot] != PotionWater {
+					s.TriggerBrewedPotion(session, slotPotions[slot])
+				}
+				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+				slotPotions[slot], slotPotions[hotbarIdx] = slotPotions[hotbarIdx], slotPotions[slot]
+			}
+		}
+
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			maxSt := brewingItemMaxStackSize(slots[slot])
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxSt)
+			carriedPotion = slotPotions[slot]
+		}
+
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			droppedPotion := slotPotions[slot]
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+				slotPotions[slot] = ""
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			if slot < 3 && IsPotionItem(dropStack) && droppedPotion != "" && droppedPotion != PotionWater {
+				s.TriggerBrewedPotion(session, droppedPotion)
+			}
+			snap := session.Snapshot()
+			s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+		}
 	}
 
 	// Write updated slots back to the brewing stand and player inventory.
@@ -1289,7 +1894,7 @@ func (s *Server) applyBrewingStandClickLocked(
 		if i < 3 {
 			pType = slotPotions[i]
 		}
-		s.SetBrewingSlot(bx, by, bz, i, slots[i], pType)
+		s.SetBrewingSlotInDim(normDim, bx, by, bz, i, slots[i], pType)
 	}
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[5+i])

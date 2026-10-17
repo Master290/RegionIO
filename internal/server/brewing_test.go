@@ -485,3 +485,342 @@ func TestBrewingStandClickNoDeadlock(t *testing.T) {
 		t.Fatal("taking brewed potion from stand slot 0 should grant minecraft:nether/brew_potion")
 	}
 }
+
+func TestBrewingStandAll2612RecipesAndDragonBreathRemainder(t *testing.T) {
+	// 1. Verify all 26.1.2 awkward potion recipes including Trial Chambers effects.
+	awkwardCases := []struct {
+		reagent string
+		wantPot string
+	}{
+		{"minecraft:golden_carrot", PotionNightVision},
+		{"minecraft:rabbit_foot", PotionLeaping},
+		{"minecraft:magma_cream", PotionFireResistance},
+		{"minecraft:sugar", PotionSwiftness},
+		{"minecraft:pufferfish", PotionWaterBreathing},
+		{"minecraft:glistering_melon_slice", PotionHealing},
+		{"minecraft:turtle_helmet", PotionTurtleMaster},
+		{"minecraft:phantom_membrane", PotionSlowFalling},
+		{"minecraft:ghast_tear", PotionRegeneration},
+		{"minecraft:blaze_powder", PotionStrength},
+		{"minecraft:spider_eye", PotionPoison},
+		{"minecraft:breeze_rod", PotionWindCharged},
+		{"minecraft:cobweb", PotionWeaving},
+		{"minecraft:slime_block", PotionOozing},
+		{"minecraft:stone", PotionInfested},
+	}
+	for _, tc := range awkwardCases {
+		outItem, outPot, ok := BrewPotion(
+			world.NewNamedItemStack("minecraft:potion", 1),
+			PotionAwkward,
+			world.NewNamedItemStack(tc.reagent, 1),
+		)
+		if !ok || outItem.ResolvedID() != "minecraft:potion" || outPot != tc.wantPot {
+			t.Fatalf("awkward + %s = (%s, %s, %v), want (minecraft:potion, %s, true)",
+				tc.reagent, outItem.ResolvedID(), outPot, ok, tc.wantPot)
+		}
+	}
+
+	// 2. Verify fermented_spider_eye corruptions (including water -> weakness).
+	corruptCases := []struct {
+		inPot   string
+		wantPot string
+	}{
+		{PotionWater, PotionWeakness},
+		{PotionNightVision, PotionInvisibility},
+		{PotionLongNightVision, PotionLongInvisibility},
+		{PotionLeaping, PotionSlowness},
+		{PotionSwiftness, PotionSlowness},
+		{PotionLongSwiftness, PotionLongSlowness},
+		{PotionHealing, PotionHarming},
+		{PotionPoison, PotionHarming},
+		{PotionStrongPoison, PotionStrongHarming},
+	}
+	for _, tc := range corruptCases {
+		_, outPot, ok := BrewPotion(
+			world.NewNamedItemStack("minecraft:potion", 1),
+			tc.inPot,
+			world.NewNamedItemStack("minecraft:fermented_spider_eye", 1),
+		)
+		if !ok || outPot != tc.wantPot {
+			t.Fatalf("%s + fermented_spider_eye = (%s, %v), want (%s, true)", tc.inPot, outPot, ok, tc.wantPot)
+		}
+	}
+
+	// 3. Verify dragon_breath leaves a glass_bottle in ingredient slot 3 when brewing lingering potion.
+	srv := newBrewingTestServer(t)
+	bx, by, bz := 12, 65, 12
+	srv.Chunks().SetBlock(bx, by, bz, BrewingStandBlockState(false, false, false))
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotBottle0, world.NewNamedItemStack("minecraft:splash_potion", 1), PotionWindCharged)
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotIngredient, world.NewNamedItemStack("minecraft:dragon_breath", 1), "")
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotFuel, world.NewNamedItemStack("minecraft:blaze_powder", 1), "")
+
+	for i := 0; i <= int(DefaultBrewingTime); i++ {
+		srv.TickBrewingStandAt(bx, by, bz)
+	}
+	stand, _ := srv.BrewingStandAt(bx, by, bz)
+	if stand.Items[0].ResolvedID() != "minecraft:lingering_potion" || stand.PotionTypes[0] != PotionWindCharged {
+		t.Fatalf("expected lingering_potion of wind_charged, got (%s, %s)", stand.Items[0].ResolvedID(), stand.PotionTypes[0])
+	}
+	if stand.Items[BrewingStandSlotIngredient].ResolvedID() != "minecraft:glass_bottle" || stand.Items[BrewingStandSlotIngredient].Count != 1 {
+		t.Fatalf("expected dragon_breath to leave 1 glass_bottle in ingredient slot 3, got %+v", stand.Items[BrewingStandSlotIngredient])
+	}
+}
+
+func TestBrewingStandHopperWorldlyContainer(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	bx, by, bz := 16, 65, 16
+	srv.Chunks().SetBlock(bx, by, bz, BrewingStandBlockState(false, false, false))
+
+	// 1. Top hopper ("up") inserts ingredients into slot 3 and rejects bottles/cobblestone.
+	if inserted, rem := srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, "up", world.NewNamedItemStack("minecraft:cobblestone", 1), ""); inserted || rem.Count != 1 {
+		t.Fatalf("expected top hopper to reject cobblestone, got (inserted=%v, rem=%+v)", inserted, rem)
+	}
+	if inserted, rem := srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, "up", world.NewNamedItemStack("minecraft:potion", 1), PotionWater); inserted || rem.Count != 1 {
+		t.Fatalf("expected top hopper to reject potion bottle, got (inserted=%v, rem=%+v)", inserted, rem)
+	}
+	// Vanilla hopper transfers 1 item per tick, so inserting a stack of 2 leaves remainder 1 on first tick, 0 on second tick.
+	inserted, rem := srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, "up", world.NewNamedItemStack("minecraft:nether_wart", 2), "")
+	if !inserted || rem.Count != 1 {
+		t.Fatalf("expected top hopper tick 1 to insert 1 nether_wart, got (inserted=%v, rem=%+v)", inserted, rem)
+	}
+	inserted, rem = srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, "up", rem, "")
+	if !inserted || !rem.IsEmpty() {
+		t.Fatalf("expected top hopper tick 2 to insert 2nd nether_wart, got (inserted=%v, rem=%+v)", inserted, rem)
+	}
+	stand, _ := srv.BrewingStandAt(bx, by, bz)
+	if stand.Items[BrewingStandSlotIngredient].ResolvedID() != "minecraft:nether_wart" || stand.Items[BrewingStandSlotIngredient].Count != 2 {
+		t.Fatalf("slot 3 after top hopper insert = %+v, want 2 nether_wart", stand.Items[BrewingStandSlotIngredient])
+	}
+
+	// 2. Side hopper ("north"/"east"/"west") inserts blaze_powder into fuel slot 4
+	//    (not ingredient slot 3!) and potion bottles into slots 0..2 (1 per slot).
+	if inserted, rem := srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, "north", world.NewNamedItemStack("minecraft:blaze_powder", 1), ""); !inserted || !rem.IsEmpty() {
+		t.Fatalf("expected side hopper to insert blaze_powder into fuel slot 4, got (inserted=%v, rem=%+v)", inserted, rem)
+	}
+	stand, _ = srv.BrewingStandAt(bx, by, bz)
+	if stand.Items[BrewingStandSlotFuel].ResolvedID() != "minecraft:blaze_powder" || stand.Items[BrewingStandSlotFuel].Count != 1 {
+		t.Fatalf("fuel slot 4 after side hopper insert = %+v, want 1 blaze_powder", stand.Items[BrewingStandSlotFuel])
+	}
+
+	for i, face := range []string{"east", "south", "west"} {
+		inserted, rem := srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, face, world.NewNamedItemStack("minecraft:potion", 1), PotionWater)
+		if !inserted || !rem.IsEmpty() {
+			t.Fatalf("side hopper bottle insert %d (%s) returned (inserted=%v, rem=%+v)", i, face, inserted, rem)
+		}
+	}
+	// 4th bottle should be rejected because all 3 bottle slots are full.
+	if inserted, rem := srv.HopperTryInsertIntoBrewingStandAt(bx, by, bz, "east", world.NewNamedItemStack("minecraft:potion", 1), PotionWater); inserted || rem.Count != 1 {
+		t.Fatalf("expected 4th bottle insert to fail when slots 0..2 are full, got (inserted=%v, rem=%+v)", inserted, rem)
+	}
+
+	// 3. Bottom hopper ("down") extracts bottles from slots 0..2, and also extracts
+	//    a leftover glass_bottle from slot 3 (e.g. after dragon_breath), but does NOT
+	//    extract active brewing reagents like nether_wart from slot 3.
+	for wantSlot := 0; wantSlot < 3; wantSlot++ {
+		st, pot, ok := srv.HopperTryExtractFromBrewingStandAt(bx, by, bz)
+		if !ok || st.ResolvedID() != "minecraft:potion" || pot != PotionWater {
+			t.Fatalf("extract %d: got (%s, %s, ok=%v), want (minecraft:potion, water, true)",
+				wantSlot, st.ResolvedID(), pot, ok)
+		}
+	}
+	// Now only nether_wart (slot 3) and blaze_powder (slot 4) remain — bottom hopper must NOT extract them.
+	if _, _, ok := srv.HopperTryExtractFromBrewingStandAt(bx, by, bz); ok {
+		t.Fatal("bottom hopper should not extract nether_wart from slot 3 or blaze_powder from slot 4")
+	}
+
+	// Place a leftover glass_bottle in slot 3 (as left by dragon_breath) -> bottom hopper CAN extract it.
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotIngredient, world.NewNamedItemStack("minecraft:glass_bottle", 1), "")
+	st, _, ok := srv.HopperTryExtractFromBrewingStandAt(bx, by, bz)
+	if !ok || st.ResolvedID() != "minecraft:glass_bottle" {
+		t.Fatalf("expected bottom hopper to extract leftover glass_bottle from slot 3, got (%+v, ok=%v)", st, ok)
+	}
+}
+
+func TestBrewingStandComparatorSignalAndLiveRedstone(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	srv.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+	bx, by, bz := 20, 65, 20
+	srv.Chunks().SetBlock(bx, by, bz, BrewingStandBlockState(false, false, false))
+
+	// Place a comparator at (bx+1, by, bz) facing west (input at bx, output at bx+2).
+	compState, ok := world.BlockStateIDByProperties("minecraft:comparator", map[string]string{
+		"facing":  "west",
+		"mode":    "compare",
+		"powered": "false",
+	})
+	if !ok {
+		t.Fatal("failed to build comparator block state")
+	}
+	poweredComp, _ := world.BlockStateIDByProperties("minecraft:comparator", map[string]string{
+		"facing":  "west",
+		"mode":    "compare",
+		"powered": "true",
+	})
+	stone := mustBlockState(t, "minecraft:stone")
+	srv.Chunks().SetBlock(bx+1, by-1, bz, stone)
+	srv.Chunks().SetBlock(bx+1, by, bz, compState)
+
+	if sig := srv.BrewingStandComparatorSignalAt(world.DimensionOverworld, bx, by, bz); sig != 0 {
+		t.Fatalf("empty brewing stand comparator signal = %d, want 0", sig)
+	}
+
+	// 1 bottle (max stack 1) in 5-slot container -> floor(1 + (1/5)*14) = 3.
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotBottle0, world.NewNamedItemStack("minecraft:potion", 1), PotionWater)
+	if sig := srv.ComparatorSignalAt(world.DimensionOverworld, bx, by, bz); sig != 3 {
+		t.Fatalf("1-bottle comparator signal = %d, want 3", sig)
+	}
+	// Verify the live comparator block at (bx+1, by, bz) updated to powered=true.
+	if gotComp := srv.Chunks().GetBlock(bx+1, by, bz); gotComp != poweredComp {
+		t.Fatalf("live comparator block state = %d, want powered (%d)", gotComp, poweredComp)
+	}
+
+	// Fill all 5 slots to max capacity -> signal 15.
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotBottle1, world.NewNamedItemStack("minecraft:potion", 1), PotionWater)
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotBottle2, world.NewNamedItemStack("minecraft:potion", 1), PotionWater)
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotIngredient, world.NewNamedItemStack("minecraft:nether_wart", 64), "")
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotFuel, world.NewNamedItemStack("minecraft:blaze_powder", 64), "")
+	if sig := srv.BrewingStandComparatorSignalAt(world.DimensionOverworld, bx, by, bz); sig != 15 {
+		t.Fatalf("full brewing stand comparator signal = %d, want 15", sig)
+	}
+}
+
+func TestBrewingStandSoundParticlesAndDiskPersistence(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	var sawLevelEvent1035 bool
+	var sawBrewSound bool
+	var sawBubbleParticles bool
+
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{9, 9, 9, 1},
+		Name: "SoundObserver",
+	}, func(id int32, body []byte) error {
+		switch id {
+		case PlayLevelEventCB:
+			r := protocol.NewReader(body)
+			evType, err := r.Int32()
+			if err == nil && evType == LevelEventSoundBrewingStand {
+				sawLevelEvent1035 = true
+			}
+		case PlaySoundPacketID:
+			sawBrewSound = true
+		case PlayLevelParticlesCB:
+			sawBubbleParticles = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerTransform(sess, 24.0, 65.0, 24.0, 0, 0, true)
+
+	bx, by, bz := 24, 65, 24
+	srv.OnBrewingStandPlaced(bx, by, bz, "Alchemist Stand")
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotBottle0, world.NewNamedItemStack("minecraft:potion", 1), PotionAwkward)
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotIngredient, world.NewNamedItemStack("minecraft:breeze_rod", 1), "")
+	srv.SetBrewingSlot(bx, by, bz, BrewingStandSlotFuel, world.NewNamedItemStack("minecraft:blaze_powder", 1), "")
+
+	// Tick 200 times (halfway through brew), then test SaveBrewingStands + LoadBrewingStands.
+	for i := 0; i < 200; i++ {
+		srv.TickBrewingStands()
+	}
+	if !sawBubbleParticles {
+		t.Fatal("expected bubble/smoke particles to be broadcast while brewing")
+	}
+	if err := srv.SaveBrewingStands(); err != nil {
+		t.Fatalf("SaveBrewingStands: %v", err)
+	}
+
+	// Load into a second server sharing the same WorldDir.
+	cache2 := world.NewCache(-1, world.GenerateFlat)
+	srv2, err := NewWithCache(cfg, cache2)
+	if err != nil {
+		t.Fatalf("NewWithCache srv2: %v", err)
+	}
+	if err := srv2.LoadBrewingStands(); err != nil {
+		t.Fatalf("LoadBrewingStands: %v", err)
+	}
+	loaded, ok := srv2.BrewingStandAt(bx, by, bz)
+	if !ok || loaded.CustomName != "Alchemist Stand" || loaded.Fuel != 19 || loaded.BrewTime <= 0 {
+		t.Fatalf("loaded brewing stand mismatch: %+v (ok=%v)", loaded, ok)
+	}
+
+	// Finish remaining ticks on srv and verify LevelEvent 1035 + sound packet fire on completion.
+	for i := 0; i < 210; i++ {
+		srv.TickBrewingStands()
+	}
+	if !sawLevelEvent1035 {
+		t.Fatal("expected LevelEventSoundBrewingStand (1035) packet on brew completion")
+	}
+	if !sawBrewSound {
+		t.Fatal("expected PlaySound packet on brew completion")
+	}
+}
+
+func TestTrialChambersStatusEffects2612(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{6, 1, 2, 1},
+		Name: "TrialTester",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerTransform(sess, 30.5, 65.0, 30.5, 0, 0, true)
+
+	// 1. Weaving doubles cobweb movement speed (0.25 -> 0.50) and places cobwebs on death.
+	if got := sess.CobwebSpeedMultiplier(); got != 0.25 {
+		t.Fatalf("CobwebSpeedMultiplier without Weaving = %v, want 0.25", got)
+	}
+	srv.ApplyPlayerEffect(sess, NewStatusEffectInstance(EffectWeaving, 600, 0))
+	if got := sess.CobwebSpeedMultiplier(); got != 0.5 {
+		t.Fatalf("CobwebSpeedMultiplier with Weaving = %v, want 0.5", got)
+	}
+	placedCobwebs := srv.TriggerWeavingDeathCobwebs(world.DimensionOverworld, 30.5, 65.0, 30.5)
+	if placedCobwebs < 2 {
+		t.Fatalf("TriggerWeavingDeathCobwebs placed %d cobwebs, want >= 2", placedCobwebs)
+	}
+
+	// 2. Oozing spawns 2 small slimes on death.
+	slimeIDs := srv.TriggerOozingDeathSlimes(world.DimensionOverworld, 32.5, 65.0, 32.5, "minecraft:zombie")
+	if len(slimeIDs) != 2 {
+		t.Fatalf("TriggerOozingDeathSlimes spawned %d slimes, want 2", len(slimeIDs))
+	}
+
+	// 3. Wind Charged emits a wind burst on death that knocks back nearby entities.
+	zombieID := srv.Entities().Add(&world.Entity{
+		TypeID:    1,
+		TypeName:  "minecraft:zombie",
+		Dimension: world.DimensionOverworld,
+		X:         36.5,
+		Y:         65.0,
+		Z:         35.5,
+	})
+	affected := srv.TriggerWindChargedDeathBurst(world.DimensionOverworld, 35.5, 65.0, 35.5, 0)
+	if affected < 1 {
+		t.Fatalf("TriggerWindChargedDeathBurst affected %d entities, want >= 1", affected)
+	}
+	if ent := srv.Entities().Get(zombieID); ent == nil || ent.X <= 36.5 || ent.Y <= 65.0 {
+		t.Fatalf("expected nearby zombie to be knocked back by wind burst, got %+v", ent)
+	}
+
+	// 4. Infested spawns 1..2 silverfish when taking damage (forced=true).
+	sfIDs := srv.TriggerInfestedDamageSilverfish(world.DimensionOverworld, 35.5, 65.0, 35.5, "minecraft:zombie", true)
+	if len(sfIDs) < 1 {
+		t.Fatalf("TriggerInfestedDamageSilverfish spawned %d silverfish, want >= 1", len(sfIDs))
+	}
+
+	// 5. Acquiring blaze_rod grants minecraft:nether/obtain_blaze_rod ("Into Fire").
+	srv.TriggerItemAcquired(sess, world.NewNamedItemStack("minecraft:blaze_rod", 1))
+	if !sess.HasCompletedAdvancement("minecraft:nether/obtain_blaze_rod") {
+		t.Fatal("expected acquiring blaze_rod to grant minecraft:nether/obtain_blaze_rod (Into Fire)")
+	}
+}
+
+

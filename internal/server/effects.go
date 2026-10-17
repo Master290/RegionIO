@@ -2,12 +2,14 @@ package server
 
 import (
 	"math"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
+	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -1385,13 +1387,288 @@ func (s *Server) damageOrKillMobFromEffect(ent *world.Entity, amount float32) {
 	dim := ent.EffectiveDimension()
 	if rem > 0 {
 		s.SetMobHealth(ent.ID, rem)
+		s.OnEntityDamagedWithEffects(ent.ID, false)
 		s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlayHurtAnimation, EncodeHurtAnimation(ent.ID, 0))
 		return
 	}
+	s.OnEntityDiedWithEffects(ent.ID)
 	s.SetMobHealth(ent.ID, 0)
 	s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlayEntityEvent, EncodeEntityEventPacket(ent.ID, EntityEventDeath))
 	s.entities.Remove(ent.ID)
 	s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{ent.ID}))
+}
+
+// --- 26.1.2 Trial Chambers Status Effect Mechanics (Wind Charged, Weaving, Oozing, Infested) ---
+
+// HasEntityEffect reports whether entityID currently has effectID active.
+func (s *Server) HasEntityEffect(entityID int32, effectID string) bool {
+	if s == nil || entityID <= 0 {
+		return false
+	}
+	id := canonicalEffectID(effectID)
+	es := s.entityEffectState()
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	m := es.effects[entityID]
+	if m == nil {
+		return false
+	}
+	_, ok := m[id]
+	return ok
+}
+
+// WeavingCobwebSpeedMultiplier returns the horizontal cobweb movement speed
+// multiplier: 0.50 when Weaving (`minecraft:weaving`) is active (double the
+// normal 0.25 cobweb speed), or 0.25 otherwise.
+func WeavingCobwebSpeedMultiplier(hasWeaving bool) float32 {
+	if hasWeaving {
+		return 0.50
+	}
+	return 0.25
+}
+
+// CobwebSpeedMultiplier returns session's cobweb movement speed multiplier
+// (0.50 with `minecraft:weaving`, 0.25 without).
+func (session *PlayerSession) CobwebSpeedMultiplier() float32 {
+	if session == nil {
+		return 0.25
+	}
+	return WeavingCobwebSpeedMultiplier(session.HasPlayerEffect(EffectWeaving))
+}
+
+// TriggerWindChargedDeathBurst emits a vanilla Wind Charged death burst at
+// (x, y, z) in dim, knocking back nearby living entities within a 3.5-block
+// radius without destroying blocks. Returns the number of knocked-back entities.
+func (s *Server) TriggerWindChargedDeathBurst(dim string, x, y, z float64, dyingEntityID int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	const burstRadius = 3.5
+	knocked := 0
+
+	if s.entities != nil {
+		cx := int32(int64(math.Floor(x)) >> 4)
+		cz := int32(int64(math.Floor(z)) >> 4)
+		ents := s.entities.AppendInChunkRange(nil, cx, cz, 1)
+		for i := range ents {
+			ent := &ents[i]
+			if ent.ID == dyingEntityID || ent.EffectiveDimension() != normDim || ent.IsItem() || ent.IsExperienceOrb() {
+				continue
+			}
+			dx := ent.X - x
+			dy := ent.Y - y
+			dz := ent.Z - z
+			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+			if dist > burstRadius {
+				continue
+			}
+			scale := 1.0 - dist/burstRadius
+			horiz := math.Sqrt(dx*dx + dz*dz)
+			s.entities.Update(ent.ID, func(live *world.Entity) {
+				if horiz > 1e-4 {
+					live.X += (dx / horiz) * 0.8 * scale
+					live.Z += (dz / horiz) * 0.8 * scale
+				}
+				live.Y += 0.45 * scale
+			})
+			knocked++
+		}
+	}
+	return knocked
+}
+
+// TriggerWeavingDeathCobwebs places 2..3 `minecraft:cobweb` blocks in
+// replaceable air positions with solid support below around (x, y, z) in dim,
+// matching vanilla WeavingMobEffect.spawnCobwebsRandomlyAround.
+func (s *Server) TriggerWeavingDeathCobwebs(dim string, x, y, z float64) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	cobwebState, ok := world.BlockStateIDByProperties("minecraft:cobweb", nil)
+	if !ok || cobwebState == world.StateAir {
+		return 0
+	}
+	bx := int(math.Floor(x))
+	by := int(math.Floor(y))
+	bz := int(math.Floor(z))
+
+	offsets := [][3]int{
+		{0, 0, 0},
+		{1, 0, 0},
+		{-1, 0, 0},
+		{0, 0, 1},
+		{0, 0, -1},
+		{1, 0, 1},
+		{-1, 0, -1},
+		{1, 0, -1},
+		{-1, 0, 1},
+	}
+	placed := 0
+	for _, off := range offsets {
+		if placed >= 3 {
+			break
+		}
+		tx, ty, tz := bx+off[0], by+off[1], bz+off[2]
+		if cache.GetBlock(tx, ty, tz) != world.StateAir {
+			continue
+		}
+		if valid, lightChunks := cache.SetBlockWithLight(tx, ty, tz, cobwebState); valid {
+			s.broadcastBlockAndLightUpdate(tx, ty, tz, cobwebState, lightChunks)
+		} else {
+			cache.SetBlock(tx, ty, tz, cobwebState)
+		}
+		placed++
+	}
+	return placed
+}
+
+// TriggerOozingDeathSlimes spawns 2 small `minecraft:slime` entities at
+// (x, y, z) in dim when a non-slime entity with `minecraft:oozing` dies,
+// matching vanilla OozingMobEffect.onMobRemoved.
+func (s *Server) TriggerOozingDeathSlimes(dim string, x, y, z float64, dyingTypeName string) []int32 {
+	if s == nil || s.entities == nil {
+		return nil
+	}
+	short := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(dyingTypeName)), "minecraft:")
+	if short == "slime" {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	slimeType := registry.EntityTypeIndex("minecraft:slime")
+	if slimeType < 0 {
+		slimeType = 1
+	}
+	spawned := make([]int32, 0, 2)
+	for i := 0; i < 2; i++ {
+		offset := float64(i)*0.5 - 0.25
+		id := s.entities.Add(&world.Entity{
+			TypeID:    slimeType,
+			TypeName:  "minecraft:slime",
+			Dimension: normDim,
+			X:         x + offset,
+			Y:         y,
+			Z:         z + offset,
+		})
+		s.SetMobHealth(id, 4.0)
+		spawned = append(spawned, id)
+	}
+	return spawned
+}
+
+// TriggerInfestedDamageSilverfish spawns 1..2 `minecraft:silverfish` entities
+// at (x, y, z) in dim when a non-silverfish entity with `minecraft:infested`
+// takes damage (10% vanilla chance, or guaranteed when force is true),
+// matching vanilla InfestedMobEffect.onMobHurt.
+func (s *Server) TriggerInfestedDamageSilverfish(dim string, x, y, z float64, hurtTypeName string, force bool) []int32 {
+	if s == nil || s.entities == nil {
+		return nil
+	}
+	short := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(hurtTypeName)), "minecraft:")
+	if short == "silverfish" {
+		return nil
+	}
+	if !force && rand.Float32() >= 0.10 {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	sfType := registry.EntityTypeIndex("minecraft:silverfish")
+	if sfType < 0 {
+		sfType = 1
+	}
+	count := 1 + rand.Intn(2)
+	if force {
+		count = 2
+	}
+	spawned := make([]int32, 0, count)
+	for i := 0; i < count; i++ {
+		id := s.entities.Add(&world.Entity{
+			TypeID:    sfType,
+			TypeName:  "minecraft:silverfish",
+			Dimension: normDim,
+			X:         x,
+			Y:         y + 0.25,
+			Z:         z,
+		})
+		s.SetMobHealth(id, MobMaxHealth("minecraft:silverfish"))
+		spawned = append(spawned, id)
+	}
+	return spawned
+}
+
+// OnEntityDamagedWithEffects checks if entityID has `minecraft:infested` and
+// triggers silverfish spawning on damage.
+func (s *Server) OnEntityDamagedWithEffects(entityID int32, forceInfested bool) []int32 {
+	if s == nil || s.entities == nil || !s.HasEntityEffect(entityID, EffectInfested) {
+		return nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return nil
+	}
+	return s.TriggerInfestedDamageSilverfish(ent.EffectiveDimension(), ent.X, ent.Y, ent.Z, ent.TypeName, forceInfested)
+}
+
+// OnPlayerDamagedWithEffects checks if session has `minecraft:infested` and
+// triggers silverfish spawning on damage.
+func (s *Server) OnPlayerDamagedWithEffects(session *PlayerSession, forceInfested bool) []int32 {
+	if s == nil || session == nil || !session.HasPlayerEffect(EffectInfested) {
+		return nil
+	}
+	snap := session.Snapshot()
+	return s.TriggerInfestedDamageSilverfish(snap.Dimension, snap.X, snap.Y, snap.Z, "minecraft:player", forceInfested)
+}
+
+// OnEntityDiedWithEffects triggers any active death-triggered status effects
+// (`minecraft:wind_charged`, `minecraft:weaving`, `minecraft:oozing`) on
+// entityID and clears its tracked status effects.
+func (s *Server) OnEntityDiedWithEffects(entityID int32) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return
+	}
+	dim := ent.EffectiveDimension()
+	if s.HasEntityEffect(entityID, EffectWindCharged) {
+		s.TriggerWindChargedDeathBurst(dim, ent.X, ent.Y, ent.Z, entityID)
+	}
+	if s.HasEntityEffect(entityID, EffectWeaving) {
+		s.TriggerWeavingDeathCobwebs(dim, ent.X, ent.Y, ent.Z)
+	}
+	if s.HasEntityEffect(entityID, EffectOozing) {
+		s.TriggerOozingDeathSlimes(dim, ent.X, ent.Y, ent.Z, ent.TypeName)
+	}
+	es := s.entityEffectState()
+	es.mu.Lock()
+	delete(es.effects, entityID)
+	es.mu.Unlock()
+}
+
+// OnPlayerDiedWithEffects triggers any active death-triggered status effects
+// (`minecraft:wind_charged`, `minecraft:weaving`, `minecraft:oozing`) on
+// session and clears session's active status effects.
+func (s *Server) OnPlayerDiedWithEffects(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	snap := session.Snapshot()
+	if session.HasPlayerEffect(EffectWindCharged) {
+		s.TriggerWindChargedDeathBurst(snap.Dimension, snap.X, snap.Y, snap.Z, session.EntityID)
+	}
+	if session.HasPlayerEffect(EffectWeaving) {
+		s.TriggerWeavingDeathCobwebs(snap.Dimension, snap.X, snap.Y, snap.Z)
+	}
+	if session.HasPlayerEffect(EffectOozing) {
+		s.TriggerOozingDeathSlimes(snap.Dimension, snap.X, snap.Y, snap.Z, "minecraft:player")
+	}
+	s.ClearPlayerEffects(session)
 }
 
 // --- NBT Serialization (Vanilla 26.1.2 "active_effects" Format) ---

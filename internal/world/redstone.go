@@ -886,7 +886,7 @@ func hasAnalogOutputSignal(state uint16) bool {
 	case "minecraft:jukebox", "minecraft:lectern", "minecraft:composter",
 		"minecraft:cauldron", "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron",
 		"minecraft:cake", "minecraft:end_portal_frame", "minecraft:respawn_anchor",
-		"minecraft:beehive", "minecraft:bee_nest":
+		"minecraft:beehive", "minecraft:bee_nest", "minecraft:brewing_stand":
 		return true
 	}
 	return false
@@ -975,6 +975,22 @@ func (c *Cache) analogSignalAt(x, y, z int) int {
 		blockSig = clampPower(lvl)
 	case "minecraft:lava_cauldron":
 		blockSig = 3
+	case "minecraft:brewing_stand":
+		if sig == 0 {
+			bottles := 0
+			if info.Properties["has_bottle_0"] == "true" {
+				bottles++
+			}
+			if info.Properties["has_bottle_1"] == "true" {
+				bottles++
+			}
+			if info.Properties["has_bottle_2"] == "true" {
+				bottles++
+			}
+			if bottles > 0 {
+				blockSig = (bottles*14)/5 + 1
+			}
+		}
 	case "minecraft:cake":
 		bites, _ := strconv.Atoi(info.Properties["bites"])
 		if bites >= 0 && bites < 7 {

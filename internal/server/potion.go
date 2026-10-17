@@ -11,7 +11,7 @@ import (
 	"regionio/internal/world"
 )
 
-// Vanilla 26.1.2 splash and lingering potion constants.
+// Vanilla 26.1.2 splash and lingering potion constants, level events, and sounds.
 const (
 	SplashPotionRadius              float64 = 4.0
 	WaterSplashSensitiveDamage      float32 = 1.0
@@ -21,6 +21,18 @@ const (
 	LingeringCloudDefaultDuration   int32   = 600 // 30 seconds at 20 TPS
 	LingeringCloudWaitTime          int32   = 10  // 0.5 seconds before first application
 	LingeringCloudReapplyDelayTicks int32   = 20  // 1.0 second per-entity cooldown
+
+	// DefaultPotionWaterColorRGB is the default water bottle RGB color (0x385DC6 = -13083194).
+	DefaultPotionWaterColorRGB int32 = 0x385DC6
+
+	// Vanilla LevelEvent IDs for splash/lingering potion impact particles + glass break sound.
+	LevelEventParticlesSpellPotionBreak   int32 = 2002
+	LevelEventParticlesInstantPotionBreak int32 = 2007
+
+	// Vanilla potion sound events.
+	SoundSplashPotionBreak    = "minecraft:entity.splash_potion.break"
+	SoundSplashPotionThrow    = "minecraft:entity.splash_potion.throw"
+	SoundLingeringPotionThrow = "minecraft:entity.lingering_potion.throw"
 )
 
 // Canonical vanilla 26.1.2 potion identifiers (BuiltInRegistries.POTION).
@@ -145,6 +157,51 @@ func PotionEffects(potionID string) []StatusEffectInstance {
 		out[i] = e.Clone()
 	}
 	return out
+}
+
+// PotionHasInstantEffect reports whether any status effect of potionID is
+// instantaneous (e.g. instant_health or instant_damage), which selects
+// LevelEvent 2007 instead of 2002 on splash/lingering impact.
+func PotionHasInstantEffect(potionID string) bool {
+	for _, eff := range PotionEffects(potionID) {
+		if def, ok := MobEffectByID(eff.ID); ok && def.Instantaneous {
+			return true
+		}
+	}
+	return false
+}
+
+// PotionColor computes the blended 24-bit RGB color of potionID's effects
+// (or DefaultPotionWaterColorRGB = 0x385DC6 when potionID has no effects),
+// matching vanilla PotionContents.getColor.
+func PotionColor(potionID string) int32 {
+	effects := PotionEffects(potionID)
+	if len(effects) == 0 {
+		return DefaultPotionWaterColorRGB
+	}
+	var sumR, sumG, sumB, totalWeight int32
+	for _, eff := range effects {
+		def, ok := MobEffectByID(eff.ID)
+		if !ok || !eff.ShowParticles {
+			continue
+		}
+		weight := eff.Amplifier + 1
+		if weight < 1 {
+			weight = 1
+		}
+		c := def.Color & 0xFFFFFF
+		sumR += ((c >> 16) & 0xFF) * weight
+		sumG += ((c >> 8) & 0xFF) * weight
+		sumB += (c & 0xFF) * weight
+		totalWeight += weight
+	}
+	if totalWeight <= 0 {
+		return DefaultPotionWaterColorRGB
+	}
+	r := (sumR / totalWeight) & 0xFF
+	g := (sumG / totalWeight) & 0xFF
+	b := (sumB / totalWeight) & 0xFF
+	return (r << 16) | (g << 8) | b
 }
 
 func canonicalPotionID(id string) string {
@@ -507,6 +564,28 @@ func (s *Server) ThrowSplashPotion(session *PlayerSession, hand int32) bool {
 	return true
 }
 
+func (s *Server) broadcastPotionBreakEffect(dim string, x, y, z float64, potionID string) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	bx := int(math.Floor(x))
+	by := int(math.Floor(y))
+	bz := int(math.Floor(z))
+	cx := int32(bx >> 4)
+	cz := int32(bz >> 4)
+
+	evID := LevelEventParticlesSpellPotionBreak
+	if PotionHasInstantEffect(potionID) {
+		evID = LevelEventParticlesInstantPotionBreak
+	}
+	color := PotionColor(potionID)
+	s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+		EncodeLevelEventPacket(evID, bx, by, bz, color, false))
+	s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundSplashPotionBreak, SoundSourceNeutral, x, y, z, 1.0, 1.0, 0))
+}
+
 // ApplySplashPotionAt applies a splash potion detonation at (x, y, z) in dim
 // with vanilla's 4.0-block radius and distance attenuation (1.0 - dist/4.0).
 // If directHitEntityID > 0, that entity receives full scale (1.0).
@@ -516,11 +595,33 @@ func (s *Server) ApplySplashPotionAt(dim string, x, y, z float64, potionID strin
 	}
 	dim = world.NormalizeDimension(dim)
 	potionID = canonicalPotionID(potionID)
+	s.broadcastPotionBreakEffect(dim, x, y, z, potionID)
 	effects := PotionEffects(potionID)
 	affected := 0
 
-	// Water splash potion damages water-sensitive mobs (blaze, enderman).
+	// Water splash potion damages water-sensitive mobs (blaze, enderman) and extinguishes burning entities/players.
 	if len(effects) == 0 && (potionID == PotionWater || potionID == PotionMundane || potionID == PotionThick || potionID == PotionAwkward) {
+		s.playersMu.RLock()
+		players := make([]*PlayerSession, 0, len(s.players))
+		for _, p := range s.players {
+			players = append(players, p)
+		}
+		s.playersMu.RUnlock()
+		for _, p := range players {
+			if p == nil || p.IsDead() {
+				continue
+			}
+			ps := p.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim {
+				continue
+			}
+			dist := math.Sqrt((ps.X-x)*(ps.X-x) + (ps.Y-y)*(ps.Y-y) + (ps.Z-z)*(ps.Z-z))
+			if dist <= SplashPotionRadius && s.IsPlayerOnFire(p) {
+				s.SetPlayerFireTicks(p, 0)
+				affected++
+			}
+		}
+
 		if s.entities != nil {
 			cx := int32(int64(math.Floor(x)) >> 4)
 			cz := int32(int64(math.Floor(z)) >> 4)
@@ -531,11 +632,17 @@ func (s *Server) ApplySplashPotionAt(dim string, x, y, z float64, potionID strin
 					continue
 				}
 				dist := math.Sqrt((ent.X-x)*(ent.X-x) + (ent.Y-y)*(ent.Y-y) + (ent.Z-z)*(ent.Z-z))
-				if dist <= SplashPotionRadius && isWaterSensitiveMob(ent.TypeName) {
-					live := s.entities.Get(ent.ID)
-					if live != nil {
-						s.damageOrKillMobFromEffect(live, WaterSplashSensitiveDamage)
+				if dist <= SplashPotionRadius {
+					if s.IsEntityOnFire(ent.ID) {
+						s.SetEntityFireTicks(ent.ID, 0)
 						affected++
+					}
+					if isWaterSensitiveMob(ent.TypeName) {
+						live := s.entities.Get(ent.ID)
+						if live != nil {
+							s.damageOrKillMobFromEffect(live, WaterSplashSensitiveDamage)
+							affected++
+						}
 					}
 				}
 			}
@@ -732,6 +839,7 @@ func (s *Server) SpawnLingeringPotionCloud(dim string, x, y, z float64, potionID
 	}
 	dim = world.NormalizeDimension(dim)
 	potionID = canonicalPotionID(potionID)
+	s.broadcastPotionBreakEffect(dim, x, y, z, potionID)
 	effects := PotionEffects(potionID)
 
 	st := s.lingeringCloudState()
