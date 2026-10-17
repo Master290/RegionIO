@@ -169,10 +169,9 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 	if err != nil {
 		return 0
 	}
-	structureBlock, _ := nameToStateID("minecraft:structure_block", nil)
 	placed := 0
 	for _, b := range blocks {
-		if b.State == StateAir || (structureBlock != 0 && b.State == structureBlock) {
+		if b.State == StateAir || b.BlockName == "minecraft:structure_block" || b.BlockName == "minecraft:structure_void" || b.BlockName == "minecraft:jigsaw" {
 			continue
 		}
 		rel := worldgen.TransformBlockPos(b.Pos, "none", stub.Rotation, [3]int{0, 0, 0})
@@ -185,20 +184,18 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 		placed++
 	}
 
-	// placeDriedGhast: PositionalRandomFactory.at(box.getCenter())
+	// placeDriedGhast: RandomSource.createThreadLocalInstance(level.getSeed()).forkPositional().at(templateBox.getCenter())
 	centerX := stub.Box.minX + (stub.Box.maxX-stub.Box.minX+1)/2
 	centerY := stub.Box.minY + (stub.Box.maxY-stub.Box.minY+1)/2
 	centerZ := stub.Box.minZ + (stub.Box.maxZ-stub.Box.minZ+1)/2
-	decorRand := worldgen.NewLegacy(0)
-	decorRand.SetDecorationSeed(seed, int(cx)*16, int(cz)*16)
-	ghastRand := decorRand.ForkPositional().At(centerX, centerY, centerZ)
+	ghastRand := worldgen.NewLegacy(seed).ForkPositional().At(centerX, centerY, centerZ)
 	if ghastRand.NextFloat() < 0.5 {
 		gx := stub.Box.minX + int(ghastRand.NextIntN(int32(stub.Box.xSpan())))
 		gy := stub.Box.minY
 		gz := stub.Box.minZ + int(ghastRand.NextIntN(int32(stub.Box.zSpan())))
 		if chunkBox.isInside(gx, gy, gz) && c.GetBlock(gx&15, gy, gz&15) == StateAir {
 			facing := "north"
-			switch stub.Rotation {
+			switch ghastRand.NextIntN(4) {
 			case 1:
 				facing = "east"
 			case 2:

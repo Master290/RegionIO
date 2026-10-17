@@ -269,6 +269,16 @@ func TestNetherStructuresFortressBastionFossilAndPortal(t *testing.T) {
 	if placed := PlaceNetherFossil(fc, fossilStub, seed, fcx, fcz); placed == 0 {
 		t.Fatalf("expected PlaceNetherFossil to place bone blocks at %+v", fossilStub)
 	}
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			for y := 0; y < NetherDimensionType.Height; y++ {
+				name := BlockName(fc.GetBlock(lx, y, lz))
+				if name == "minecraft:structure_block" || name == "minecraft:structure_void" || name == "minecraft:jigsaw" {
+					t.Fatalf("leaked marker block %s in Nether Fossil chunk (%d, %d) at (%d, %d, %d)", name, fcx, fcz, lx, y, lz)
+				}
+			}
+		}
+	}
 
 	// 4. Verify Ruined Portal Nether generation point and placement.
 	var portalStub *RuinedPortalStub

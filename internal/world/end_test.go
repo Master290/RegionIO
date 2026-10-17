@@ -205,16 +205,25 @@ func TestEndCityGenerationAndPlacement(t *testing.T) {
 		t.Fatalf("FindStructureSetStart(end_cities, %d, %d) = (%v, %v), want valid end_city", foundStart.ChunkX, foundStart.ChunkZ, stub, ok)
 	}
 
-	// Render the End City into its start chunk and verify purpur / end_stone_bricks blocks appear.
-	c := NewDimensionChunk(foundStart.ChunkX, foundStart.ChunkZ, BiomeEndHighlands, EndDimensionType)
-	PlaceEndCity(c, foundStart, foundStart.ChunkX, foundStart.ChunkZ)
+	// Render the End City across its entire bounding box and verify purpur / end_stone_bricks
+	// appear and no structure_block / structure_void markers leak into the world.
 	purpurOrBricks := 0
-	for lx := 0; lx < 16; lx++ {
-		for lz := 0; lz < 16; lz++ {
-			for y := 55; y < 160; y++ {
-				st := c.GetBlock(lx, y, lz)
-				if st == eb.purpurBlock || st == eb.purpurPillar || st == eb.endStoneBricks {
-					purpurOrBricks++
+	for cx := int32(foundStart.Box.minX >> 4); cx <= int32(foundStart.Box.maxX>>4); cx++ {
+		for cz := int32(foundStart.Box.minZ >> 4); cz <= int32(foundStart.Box.maxZ>>4); cz++ {
+			c := NewDimensionChunk(cx, cz, BiomeEndHighlands, EndDimensionType)
+			PlaceEndCity(c, foundStart, cx, cz)
+			for lx := 0; lx < 16; lx++ {
+				for lz := 0; lz < 16; lz++ {
+					for y := 0; y < EndDimensionType.Height; y++ {
+						st := c.GetBlock(lx, y, lz)
+						if st == eb.purpurBlock || st == eb.purpurPillar || st == eb.endStoneBricks {
+							purpurOrBricks++
+						}
+						name := BlockName(st)
+						if name == "minecraft:structure_block" || name == "minecraft:structure_void" || name == "minecraft:jigsaw" {
+							t.Fatalf("leaked marker block %s in End City chunk (%d, %d) at (%d, %d, %d)", name, cx, cz, lx, y, lz)
+						}
+					}
 				}
 			}
 		}

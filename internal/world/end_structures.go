@@ -385,14 +385,12 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 	if !start.Box.intersects(chunkBox) {
 		return
 	}
-	structureBlock, _ := nameToStateID("minecraft:structure_block", nil)
-	jigsawBlock, _ := nameToStateID("minecraft:jigsaw", nil)
 	for _, piece := range start.Pieces {
 		if len(piece.Blocks) == 0 || !piece.Box.intersects(chunkBox) {
 			continue
 		}
 		for _, b := range piece.Blocks {
-			if (structureBlock != 0 && b.State == structureBlock) || (jigsawBlock != 0 && b.State == jigsawBlock) {
+			if b.BlockName == "minecraft:structure_block" || b.BlockName == "minecraft:structure_void" || b.BlockName == "minecraft:jigsaw" {
 				continue
 			}
 			if b.State == StateAir && !piece.Overwrite {

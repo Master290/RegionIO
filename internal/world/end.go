@@ -669,12 +669,26 @@ func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
 	return true
 }
 
+func endChunkBiomesHas(biomeName *[16][16]string, target string) bool {
+	return biomeName[0][0] == target ||
+		biomeName[8][0] == target ||
+		biomeName[0][8] == target ||
+		biomeName[8][8] == target
+}
+
+func endNeighborChunkHasBiome(od *worldgen.OverworldDensity, ncx, ncz int32, target string) bool {
+	qx0, qz0 := int(ncx)*4, int(ncz)*4
+	return worldgen.EndBiomeAt(od.Erosion, qx0, 0, qz0) == target ||
+		worldgen.EndBiomeAt(od.Erosion, qx0+2, 0, qz0) == target ||
+		worldgen.EndBiomeAt(od.Erosion, qx0, 0, qz0+2) == target ||
+		worldgen.EndBiomeAt(od.Erosion, qx0+2, 0, qz0+2) == target
+}
+
 func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.StructureSets, cx, cz int32, seed int64, biomeName *[16][16]string) {
 	PlaceEndStructuresInChunk(c, od, sets, seed, cx, cz)
 
 	baseX, baseZ := int(cx)*16, int(cz)*16
 	zoomSeed := obfuscateBiomeSeed(seed)
-	chunkBiome := biomeName[8][8]
 
 	r := worldgen.NewWorldgenRandom(0)
 
@@ -682,8 +696,7 @@ func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Structu
 	// Check 3x3 chunk neighborhood so small islands near chunk borders aren't clipped.
 	for ncx := cx - 1; ncx <= cx+1; ncx++ {
 		for ncz := cz - 1; ncz <= cz+1; ncz++ {
-			nb := worldgen.EndBiomeAt(od.Erosion, int(ncx)*4, 0, int(ncz)*4)
-			if nb != "minecraft:small_end_islands" {
+			if !endNeighborChunkHasBiome(od, ncx, ncz, "minecraft:small_end_islands") {
 				continue
 			}
 			nBaseX, nBaseZ := int(ncx)*16, int(ncz)*16
@@ -707,14 +720,16 @@ func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Structu
 	}
 
 	decSeed := r.SetDecorationSeed(seed, baseX, baseZ)
+	hasTheEnd := endChunkBiomesHas(biomeName, "minecraft:the_end")
+	hasHighlands := endChunkBiomesHas(biomeName, "minecraft:end_highlands")
 
 	// Step 4 (SURFACE_STRUCTURES, stage=4):
 	// - the_end: end_spike
 	// - end_highlands: end_gateway_return
-	switch chunkBiome {
-	case "minecraft:the_end":
+	if hasTheEnd {
 		PlaceEndSpikes(c, seed)
-	case "minecraft:end_highlands":
+	}
+	if hasHighlands {
 		r.SetFeatureSeed(decSeed, 0, 4)
 		if r.NextFloat() < 1.0/float32(700) {
 			px := baseX + int(r.NextIntN(16))
@@ -730,7 +745,7 @@ func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Structu
 	}
 
 	// Step 9 (VEGETAL_DECORATION, stage=9): chorus_plant in end_highlands.
-	if chunkBiome == "minecraft:end_highlands" {
+	if hasHighlands {
 		r.SetFeatureSeed(decSeed, 0, 9)
 		count := int(r.NextIntN(5))
 		for i := 0; i < count; i++ {
@@ -744,7 +759,7 @@ func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Structu
 	}
 
 	// Step 10 (TOP_LAYER_MODIFICATION, stage=10): end_platform in the_end.
-	if chunkBiome == "minecraft:the_end" {
+	if hasTheEnd {
 		PlaceEndPlatform(c)
 	}
 }
