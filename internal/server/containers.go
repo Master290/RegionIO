@@ -368,10 +368,14 @@ func skipHashedStack(r *protocol.Reader) error {
 // container (chest, crafting table, or furnace/blast_furnace/smoker) and opens
 // its UI for session.
 func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool, containerID int32, err error) {
-	if s == nil || s.chunks == nil || session == nil || session.IsDead() {
+	if s == nil || session == nil || session.IsDead() {
 		return false, 0, nil
 	}
-	state := s.chunks.GetBlock(x, y, z)
+	cache := s.PlayerChunks(session)
+	if cache == nil {
+		return false, 0, nil
+	}
+	state := cache.GetBlock(x, y, z)
 	switch {
 	case IsChestBlock(state):
 		cid, err := s.OpenChest(session, x, y, z)

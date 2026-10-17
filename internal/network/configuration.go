@@ -5,6 +5,7 @@ import (
 
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
+	"regionio/internal/server"
 )
 
 // beginConfiguration is called on entering the configuration phase. It mirrors
@@ -196,6 +197,12 @@ func (h *handler) sendKnownPacks() error {
 // matching known pack.
 func (h *handler) sendRegistries() error {
 	for _, reg := range registry.Synced() {
+		if reg.Name == "minecraft:dimension_type" {
+			if err := h.conn.Send(protocol.ConfigRegistryData, server.EncodeDimensionRegistryData(false)); err != nil {
+				return err
+			}
+			continue
+		}
 		w := protocol.NewWriter(64 + len(reg.Entries)*24)
 		w.String(reg.Name)
 		w.VarInt(int32(len(reg.Entries)))

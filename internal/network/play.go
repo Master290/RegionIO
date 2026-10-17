@@ -109,8 +109,10 @@ func (h *handler) beginPlay() error {
 	}
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
-	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.visibilityRadius())
+	playerCache := h.srv.PlayerChunks(session)
+	h.streamer = newStreamer(playerCache, h.conn, h.log, h.visibilityRadius())
 	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
+	h.srv.SetPlayerDimensionSwitchFunc(session, h.streamer.switchDimension)
 	go h.streamer.run(h.ctx)
 	h.streamer.requestRecenter(startCX, startCZ)
 	go h.keepAliveLoop()
@@ -253,6 +255,13 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	if h.session != nil {
 		h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
+		res, err := h.srv.CheckPlayerPortal(h.session)
+		if err != nil {
+			return err
+		}
+		if res.Travelled {
+			return nil
+		}
 	}
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
@@ -276,48 +285,24 @@ func (h *handler) visibilityRadius() int {
 // sendPlayLogin writes the clientbound play "login" packet. Field layout was
 // confirmed against the 26.1.2 vanilla server capture.
 func (h *handler) sendPlayLogin() error {
-	dimTypeIdx := registry.Index("minecraft:dimension_type", "minecraft:overworld")
-	if dimTypeIdx < 0 {
-		dimTypeIdx = 0
-	}
-
-	w := protocol.NewWriter(128)
 	entityID := int32(1)
 	gameMode := byte(server.GameModeCreative)
+	dim := world.DimensionOverworld
 	if h.session != nil {
+		snap := h.session.Snapshot()
 		entityID = h.session.EntityID
-		gameMode = h.session.Snapshot().GameMode
+		gameMode = snap.GameMode
+		dim = world.NormalizeDimension(snap.Dimension)
 	}
-	w.Int32(entityID) // entity ID
-	w.Bool(false)     // is hardcore
-
-	// Dimension names: the worlds available on this server.
-	dims := []string{"minecraft:overworld", "minecraft:the_end", "minecraft:the_nether"}
-	w.VarInt(int32(len(dims)))
-	for _, d := range dims {
-		w.String(d)
-	}
-
-	w.VarInt(int32(h.srv.Config().MaxPlayers)) // max players (legacy)
-	w.VarInt(int32(h.visibilityRadius()))      // view distance
-	w.VarInt(int32(h.visibilityRadius()))      // simulation distance
-	w.Bool(false)                              // reduced debug info
-	w.Bool(true)                               // enable respawn screen
-	w.Bool(false)                              // do limited crafting
-
-	w.VarInt(int32(dimTypeIdx))     // dimension type (registry index)
-	w.String("minecraft:overworld") // dimension name (this world)
-	w.Int64(0)                      // hashed seed
-	w.Byte(gameMode)                // game mode
-	w.Byte(0xFF)                    // previous game mode: -1 (none)
-	w.Bool(false)                   // is debug
-	w.Bool(false)                   // is flat
-	w.Bool(false)                   // has death location
-	w.VarInt(0)                     // portal cooldown
-	w.VarInt(63)                    // sea level (overworld)
-	w.Bool(false)                   // enforces secure chat
-
-	return h.conn.SendWriter(protocol.PlayLogin, w)
+	payload := server.EncodePlayLoginPacket(
+		entityID,
+		gameMode,
+		dim,
+		int32(h.srv.Config().MaxPlayers),
+		int32(h.visibilityRadius()),
+		h.srv.Config().WorldSeed,
+	)
+	return h.conn.Send(protocol.PlayLogin, payload)
 }
 
 // sendGameEvent writes a game_event packet (event id + float value).
@@ -444,6 +429,7 @@ func (h *handler) syncVisibleEntities() error {
 				TypeID: registry.EntityTypeIndex("minecraft:player"), TypeName: "minecraft:player",
 				X: player.X, Y: player.Y, Z: player.Z,
 				Yaw: player.Yaw, Pitch: player.Pitch, HeadYaw: player.Yaw,
+				Dimension: world.NormalizeDimension(player.Dimension),
 			},
 			onGround: player.OnGround,
 		}
@@ -503,10 +489,16 @@ func (h *handler) entityChunkResident(x, z float64) bool {
 }
 
 func playerVisible(viewer, target server.PlayerSnapshot, radius int) bool {
+	if world.NormalizeDimension(viewer.Dimension) != world.NormalizeDimension(target.Dimension) {
+		return false
+	}
 	return chunksWithin(viewer.X, viewer.Z, target.X, target.Z, radius)
 }
 
 func entityVisible(viewer server.PlayerSnapshot, target world.Entity, radius int) bool {
+	if world.NormalizeDimension(viewer.Dimension) != target.EffectiveDimension() {
+		return false
+	}
 	return chunksWithin(viewer.X, viewer.Z, target.X, target.Z, radius)
 }
 
@@ -938,27 +930,67 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	}
 
 	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {
+		if h.isHoldingFlintAndSteel() && h.srv != nil {
+			if h.session != nil && h.session.HeldItem().IsEmpty() && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) {
+				if flintID, ok := world.ItemNameToID("minecraft:flint_and_steel"); ok && h.hotbar[h.heldSlot] == flintID {
+					h.session.SetInventorySlot(int(world.HotbarContainerOffset+h.heldSlot), world.NewItemStack(flintID, 1))
+				}
+			}
+			lit, used, err := h.srv.UseFlintAndSteel(h.session, x, y, z, int(face))
+			if err != nil {
+				return err
+			}
+			if lit || used {
+				return h.sendBlockChangedAck(seq)
+			}
+		}
 		if state, ok := h.heldBlock(); ok {
 			off := faceOffsets[face]
 			px, py, pz := x+off[0], y+off[1], z+off[2]
-			if valid, lightChunks := h.srv.Chunks().SetBlockWithLight(px, py, pz, state); valid {
-				h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
-				if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSurvival {
-					if slot, updated, consumed := h.srv.ConsumeHeldItem(h.session, 1); consumed {
-						if hotbarIdx := slot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
-							if updated.IsEmpty() {
-								h.hotbar[hotbarIdx] = -1
-							} else {
-								h.hotbar[hotbarIdx] = updated.ResolvedItemID()
+			dim := world.DimensionOverworld
+			if h.session != nil {
+				dim = h.session.Dimension()
+			}
+			cache := h.srv.PlayerChunks(h.session)
+			if cache != nil {
+				if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {
+					h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
+					if name := world.BlockName(state); name == "minecraft:fire" || name == "minecraft:soul_fire" {
+						_, _ = h.srv.LightPortalAt(dim, px, py, pz)
+					}
+					if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSurvival {
+						if slot, updated, consumed := h.srv.ConsumeHeldItem(h.session, 1); consumed {
+							if hotbarIdx := slot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
+								if updated.IsEmpty() {
+									h.hotbar[hotbarIdx] = -1
+								} else {
+									h.hotbar[hotbarIdx] = updated.ResolvedItemID()
+								}
 							}
 						}
 					}
+					h.log.Debug("block placed", "x", px, "y", py, "z", pz, "state", state)
 				}
-				h.log.Debug("block placed", "x", px, "y", py, "z", pz, "state", state)
 			}
 		}
 	}
 	return h.sendBlockChangedAck(seq)
+}
+
+func (h *handler) isHoldingFlintAndSteel() bool {
+	if h.session != nil {
+		if held := h.session.HeldItem(); !held.IsEmpty() {
+			return server.IsFlintAndSteelItem(held)
+		}
+	}
+	flintID, ok := world.ItemNameToID("minecraft:flint_and_steel")
+	if !ok {
+		return false
+	}
+	if h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) {
+		return h.hotbar[h.heldSlot] == flintID
+	}
+	return false
 }
 
 // heldBlock returns the block state for the currently held item, if it is a
@@ -982,15 +1014,22 @@ func (h *handler) heldBlock() (uint16, bool) {
 }
 
 func (h *handler) broadcastBlockUpdate(x, y, z int, state uint16, lightChunks []world.ChunkPos) {
+	dim := world.DimensionOverworld
+	if h.session != nil {
+		dim = h.session.Dimension()
+	}
+	cache := h.srv.PlayerChunks(h.session)
 	w := protocol.NewWriter(12)
 	w.Position(x, y, z)
 	w.VarInt(int32(state))
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	h.srv.BroadcastChunk(cx, cz, protocol.PlayBlockUpdate, w.Bytes())
-	for _, chunk := range lightChunks {
-		if light, err := h.srv.Chunks().LightUpdate(chunk.X, chunk.Z); err == nil {
-			h.srv.BroadcastChunk(chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
+	h.srv.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayBlockUpdate, w.Bytes())
+	if cache != nil {
+		for _, chunk := range lightChunks {
+			if light, err := cache.LightUpdate(chunk.X, chunk.Z); err == nil {
+				h.srv.BroadcastDimensionChunk(dim, chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
+			}
 		}
 	}
 }

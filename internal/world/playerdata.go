@@ -197,6 +197,7 @@ func ItemNameToID(name string) (int32, bool) {
 
 // PlayerData holds the persistent state of a player stored in playerdata/<uuid>.dat.
 type PlayerData struct {
+	Dimension      string
 	Pos            [3]float64
 	Yaw            float32
 	Pitch          float32
@@ -223,6 +224,7 @@ func DefaultPlayerData(x, y, z float64) PlayerData {
 	sy := int32(math.Floor(y))
 	sz := int32(math.Floor(z))
 	return PlayerData{
+		Dimension:      DimensionOverworld,
 		Pos:            [3]float64{x, y, z},
 		Yaw:            0,
 		Pitch:          0,
@@ -235,7 +237,7 @@ func DefaultPlayerData(x, y, z float64) PlayerData {
 		SpawnX:         sx,
 		SpawnY:         sy,
 		SpawnZ:         sz,
-		SpawnDimension: "minecraft:overworld",
+		SpawnDimension: DimensionOverworld,
 		HasSpawn:       true,
 	}
 }
@@ -244,7 +246,7 @@ func DefaultPlayerData(x, y, z float64) PlayerData {
 func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	root := nbt.NewCompound()
 	root.Set("DataVersion", nbt.Int(dataVersion26))
-	root.Set("Dimension", nbt.String("minecraft:overworld"))
+	root.Set("Dimension", nbt.String(NormalizeDimension(d.Dimension)))
 	root.Set("Pos", nbt.List{
 		ElemID: nbt.TagDouble,
 		Elems: []nbt.Tag{
@@ -417,13 +419,27 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 		return PlayerData{}, errors.New("world: nil playerdata NBT compound")
 	}
 	d := PlayerData{
+		Dimension:      DimensionOverworld,
 		OnGround:       true,
 		GameMode:       1,
 		Health:         DefaultPlayerHealth,
 		FoodLevel:      DefaultPlayerFoodLevel,
 		FoodSaturation: DefaultPlayerSaturation,
 		SelectedSlot:   0,
-		SpawnDimension: "minecraft:overworld",
+		SpawnDimension: DimensionOverworld,
+	}
+
+	if dimStr, ok := nbtGetString(root, "Dimension"); ok && dimStr != "" {
+		d.Dimension = NormalizeDimension(dimStr)
+	} else if dimInt, ok := nbtGetInt(root, "Dimension"); ok {
+		switch dimInt {
+		case -1:
+			d.Dimension = DimensionNether
+		case 1:
+			d.Dimension = DimensionEnd
+		default:
+			d.Dimension = DimensionOverworld
+		}
 	}
 
 	if posList, ok := nbtGetList(root, "Pos"); ok && len(posList.Elems) == 3 {

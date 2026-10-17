@@ -44,6 +44,7 @@ type Cache struct {
 	batchGen  BatchGenerator
 	store     *Store // nil = in-memory only (tests, flat worlds)
 	maxChunks int    // LRU capacity; 0 = unbounded
+	dimType   *DimensionType
 
 	mu       sync.Mutex
 	lightMu  sync.RWMutex
@@ -62,6 +63,47 @@ type Cache struct {
 	batchLoads  map[[2]int32]*batchLoad
 	frameLoads  map[[2]int32]*frameLoad
 	batchAnchor func(int32, int32) [2]int32
+}
+
+// SetDimensionType configures the dimension type for this world cache.
+func (c *Cache) SetDimensionType(dt DimensionType) {
+	c.mu.Lock()
+	c.dimType = &dt
+	if c.store != nil {
+		c.store.dimType = &dt
+	}
+	c.mu.Unlock()
+}
+
+// DimensionType returns the configured dimension type, defaulting to OverworldDimensionType.
+func (c *Cache) DimensionType() DimensionType {
+	c.mu.Lock()
+	dt := c.dimType
+	c.mu.Unlock()
+	if dt != nil {
+		return *dt
+	}
+	return OverworldDimensionType
+}
+
+func (c *Cache) minY() int {
+	c.mu.Lock()
+	dt := c.dimType
+	c.mu.Unlock()
+	if dt != nil {
+		return int(dt.MinY)
+	}
+	return MinY
+}
+
+func (c *Cache) maxY() int {
+	c.mu.Lock()
+	dt := c.dimType
+	c.mu.Unlock()
+	if dt != nil {
+		return int(dt.MinY + dt.Height)
+	}
+	return MinY + WorldHeight
 }
 
 // SetBatchGenerator enables optional batch generation. It must be called before
@@ -306,6 +348,14 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	}
 
 	c.mu.Lock()
+	if loadErr == nil && ch != nil && c.dimType != nil {
+		if int(c.dimType.MinY) != MinY || int(c.dimType.Height) != WorldHeight {
+			ch.customBounds = true
+			ch.dimMinY = int(c.dimType.MinY)
+			ch.dimHeight = int(c.dimType.Height)
+		}
+		ch.noSkylight = !c.dimType.HasSkylight
+	}
 	if c.loads[key] != pending {
 		// An overlapping batch completed this target while its own generation was
 		// running. Keep the first published result and do not close done twice.
@@ -913,7 +963,7 @@ func (c *Cache) frameErr(cx, cz int32) ([]byte, error) {
 // GetBlock returns the block state at world coordinates (x, y, z).
 // It loads or generates the chunk if necessary.
 func (c *Cache) GetBlock(x, y, z int) uint16 {
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return 0 // StateAir
 	}
 	cx := int32(x >> 4)
@@ -942,9 +992,22 @@ func (c *Cache) SafeSpawnY(x, z int) (int, bool) {
 		return 0, false
 	}
 
+	minY := c.minY()
+	topY := c.maxY() - 3
+	c.mu.Lock()
+	dt := c.dimType
+	c.mu.Unlock()
+	if dt != nil && dt.HasCeiling && dt.LogicalHeight > 0 {
+		if ceilingScan := int(dt.MinY+dt.LogicalHeight) - 4; ceilingScan < topY {
+			topY = ceilingScan
+		}
+	} else if ch.noSkylight && topY > 124 {
+		topY = 124
+	}
+
 	ch.mu.RLock()
 	defer ch.mu.RUnlock()
-	for y := MinY + WorldHeight - 3; y >= MinY; y-- {
+	for y := topY; y >= minY; y-- {
 		floor := ch.getBlock(x, y, z)
 		if !supportsEntitySpawn(floor) {
 			continue
@@ -987,7 +1050,7 @@ type ChunkPos struct {
 // light changed. Lighting operations are serialized so concurrent edits cannot
 // publish mutually stale propagation results.
 func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) {
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return false, nil
 	}
 	cx := int32(x >> 4)

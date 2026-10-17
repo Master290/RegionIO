@@ -537,6 +537,12 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		name == "minecraft:kelp" || name == "minecraft:kelp_plant" {
 		replacement = StateWater
 	}
+	if name == "minecraft:nether_portal" {
+		if !c.isCompletePortalAt(x, y, z, props["axis"]) {
+			return StateAir, false
+		}
+		return state, true
+	}
 
 	// Update snowy property on grass_block / podzol / mycelium when the block above changes.
 	if snowy, hasSnowy := props["snowy"]; hasSnowy {

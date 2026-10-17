@@ -92,6 +92,41 @@ type Chunk struct {
 	// reconciled with current neighbor blocks once after entering a live cache.
 	lightValidated bool
 	biome          uint16 // fallback uniform biome when biomes[si] is nil
+
+	// Custom dimension vertical bounds (when customBounds is true, e.g. Nether/End 0..256).
+	customBounds bool
+	dimMinY      int
+	dimHeight    int
+	noSkylight   bool
+}
+
+func (c *Chunk) minY() int {
+	if c.customBounds {
+		return c.dimMinY
+	}
+	return MinY
+}
+
+func (c *Chunk) worldHeight() int {
+	if c.customBounds && c.dimHeight > 0 {
+		return c.dimHeight
+	}
+	return WorldHeight
+}
+
+func (c *Chunk) sectionBounds() (startSec, endSec int) {
+	if !c.customBounds || c.dimHeight <= 0 {
+		return 0, SectionCount
+	}
+	startSec = (c.dimMinY - MinY) >> 4
+	if startSec < 0 {
+		startSec = 0
+	}
+	endSec = startSec + (c.dimHeight >> 4)
+	if endSec > SectionCount {
+		endSec = SectionCount
+	}
+	return startSec, endSec
 }
 
 // ParityHeightmaps returns the three client heightmaps as absolute top-block Y
@@ -100,25 +135,27 @@ type Chunk struct {
 func (c *Chunk) ParityHeightmaps() [3][256]int16 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	minY := c.minY()
+	height := c.worldHeight()
 	var maps [3][256]int16
 	for z := 0; z < 16; z++ {
 		for x := 0; x < 16; x++ {
 			idx := z*16 + x
 			for kind := range maps {
-				maps[kind][idx] = int16(MinY - 1)
+				maps[kind][idx] = int16(minY - 1)
 			}
-			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
+			for y := minY + height - 1; y >= minY; y-- {
 				state := c.getBlock(x, y, z)
-				if maps[0][idx] == int16(MinY-1) && state != StateAir {
+				if maps[0][idx] == int16(minY-1) && state != StateAir {
 					maps[0][idx] = int16(y)
 				}
-				if maps[1][idx] == int16(MinY-1) && blocksMotionOrFluid(state) {
+				if maps[1][idx] == int16(minY-1) && blocksMotionOrFluid(state) {
 					maps[1][idx] = int16(y)
 				}
-				if maps[2][idx] == int16(MinY-1) && blocksMotionNoLeaves(state) {
+				if maps[2][idx] == int16(minY-1) && blocksMotionNoLeaves(state) {
 					maps[2][idx] = int16(y)
 				}
-				if maps[0][idx] != int16(MinY-1) && maps[1][idx] != int16(MinY-1) && maps[2][idx] != int16(MinY-1) {
+				if maps[0][idx] != int16(minY-1) && maps[1][idx] != int16(minY-1) && maps[2][idx] != int16(minY-1) {
 					break
 				}
 			}
@@ -270,7 +307,15 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 	defer c.mu.RUnlock()
 
 	revision := c.revision.Load()
-	clone := &Chunk{X: c.X, Z: c.Z, biome: c.biome}
+	clone := &Chunk{
+		X:            c.X,
+		Z:            c.Z,
+		biome:        c.biome,
+		customBounds: c.customBounds,
+		dimMinY:      c.dimMinY,
+		dimHeight:    c.dimHeight,
+		noSkylight:   c.noSkylight,
+	}
 	clone.revision.Store(revision)
 	for i := 0; i < SectionCount; i++ {
 		if c.sections[i] != nil {
@@ -308,7 +353,8 @@ func (c *Chunk) encode() []byte {
 
 	// Section data is length-prefixed.
 	sec := protocol.NewWriter(4096)
-	for i := 0; i < SectionCount; i++ {
+	startSec, endSec := c.sectionBounds()
+	for i := startSec; i < endSec; i++ {
 		c.writeSection(sec, i)
 	}
 	w.VarInt(int32(sec.Len()))
@@ -361,11 +407,13 @@ func (c *Chunk) writeHeightmaps(w *protocol.Writer) {
 // matching block, relative to the world floor — what Heightmap.setHeight
 // writes — so 0 means the column has no matching block at all.
 func (c *Chunk) heightmaps() (surface, motion, motionNoLeaves [256]uint16) {
+	minY := c.minY()
+	startSec, endSec := c.sectionBounds()
 	for lx := 0; lx < 16; lx++ {
 		for lz := 0; lz < 16; lz++ {
 			i := lz*16 + lx
 			var haveSurface, haveMotion, haveNoLeaves bool
-			for si := SectionCount - 1; si >= 0; si-- {
+			for si := endSec - 1; si >= startSec; si-- {
 				s := c.sections[si]
 				if s == nil {
 					continue
@@ -376,7 +424,7 @@ func (c *Chunk) heightmaps() (surface, motion, motionNoLeaves [256]uint16) {
 					if state == StateAir {
 						continue
 					}
-					h := uint16(y + 1 - MinY)
+					h := uint16(y + 1 - minY)
 					if !haveSurface {
 						surface[i], haveSurface = h, true
 					}

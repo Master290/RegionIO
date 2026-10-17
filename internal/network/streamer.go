@@ -34,6 +34,10 @@ type streamer struct {
 
 	recenter chan recenterReq
 
+	switchMu     sync.Mutex
+	pendingCache *world.Cache
+	resetPending bool
+
 	// The loaded-set and current center are owned solely by the streamer's run
 	// goroutine — no other goroutine reads or writes them.
 	loaded    map[[2]int32]bool
@@ -113,13 +117,66 @@ func (s *streamer) requestRecenter(cx, cz int32) {
 	}
 }
 
+// switchDimension switches the streamer to a new dimension chunk cache, clears
+// client chunk residency (since ClientboundRespawnPacket resets client chunks),
+// and queues a recenter on (cx, cz).
+func (s *streamer) switchDimension(cache *world.Cache, cx, cz int32) {
+	if s == nil {
+		return
+	}
+	s.switchMu.Lock()
+	s.pendingCache = cache
+	s.resetPending = true
+	s.switchMu.Unlock()
+
+	s.residentMu.Lock()
+	s.resident = make(map[[2]int32]bool)
+	s.residentMu.Unlock()
+
+	s.requestRecenter(cx, cz)
+}
+
+func (s *streamer) hasPendingSwitch() bool {
+	s.switchMu.Lock()
+	pending := s.resetPending
+	s.switchMu.Unlock()
+	return pending
+}
+
+func (s *streamer) applyPendingSwitch() {
+	s.switchMu.Lock()
+	if !s.resetPending {
+		s.switchMu.Unlock()
+		return
+	}
+	newCache := s.pendingCache
+	s.pendingCache = nil
+	s.resetPending = false
+	s.switchMu.Unlock()
+
+	if s.tickets != nil {
+		s.tickets.Close()
+		s.tickets = nil
+	}
+	s.cache = newCache
+	if s.cache != nil {
+		s.tickets = s.cache.NewTicketSet()
+	}
+	s.loaded = make(map[[2]int32]bool)
+	s.residentMu.Lock()
+	s.resident = make(map[[2]int32]bool)
+	s.residentMu.Unlock()
+}
+
 // run is the streamer's main loop. It blocks until ctx is cancelled (on
 // connection close). On each recenter it generates+sends the newly-in-range
 // chunks in spiral order (nearest first) and pre-generates the outer ring.
 func (s *streamer) run(ctx context.Context) {
-	if s.tickets != nil {
-		defer s.tickets.Close()
-	}
+	defer func() {
+		if s.tickets != nil {
+			s.tickets.Close()
+		}
+	}()
 	for {
 		var req recenterReq
 		select {
@@ -141,6 +198,7 @@ func (s *streamer) run(ctx context.Context) {
 // pre-generates the predictive ring, and drops chunks that left client view.
 // It is the only place `loaded`/`centerX`/`centerZ` are mutated.
 func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterReq, bool) {
+	s.applyPendingSwitch()
 	s.centerX, s.centerZ, s.hasCenter = cx, cz, true
 
 	s.sendChunkCacheCenter(cx, cz)
@@ -389,6 +447,9 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 	// Generation completes out of order, but client presentation should not.
 	// Emit the contiguous spiral order supplied by the caller.
 	for _, j := range pending {
+		if s.hasPendingSwitch() {
+			return
+		}
 		r, ok := generated[[2]int32{j.cx, j.cz}]
 		if !ok {
 			return

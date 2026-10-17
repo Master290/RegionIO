@@ -142,6 +142,7 @@ type PlayerSession struct {
 type PlayerSnapshot struct {
 	EntityID       int32
 	Profile        Profile
+	Dimension      string
 	X, Y, Z        float64
 	Yaw, Pitch     float32
 	OnGround       bool
@@ -304,6 +305,9 @@ func (s *Server) SaveAll() error {
 			firstErr = err
 		}
 	}
+	if err := s.SaveAllDimensions(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -410,6 +414,7 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	if session == nil {
 		return
 	}
+	session.SetDimension(d.Dimension)
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.position = d.Pos
@@ -441,7 +446,7 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	if d.SpawnDimension != "" {
 		session.spawnDimension = d.SpawnDimension
 	} else {
-		session.spawnDimension = "minecraft:overworld"
+		session.spawnDimension = world.DimensionOverworld
 	}
 	session.hasSpawn = d.HasSpawn
 }
@@ -451,9 +456,11 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	if session == nil {
 		return world.PlayerData{}
 	}
+	dim := session.Dimension()
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
+		Dimension:      dim,
 		Pos:            session.position,
 		Yaw:            session.yaw,
 		Pitch:          session.pitch,
@@ -645,10 +652,12 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 	if session == nil {
 		return PlayerSnapshot{}
 	}
+	dim := session.Dimension()
 	session.mu.RLock()
 	snapshot := PlayerSnapshot{
 		EntityID:       session.EntityID,
 		Profile:        session.Profile,
+		Dimension:      dim,
 		X:              session.position[0],
 		Y:              session.position[1],
 		Z:              session.position[2],

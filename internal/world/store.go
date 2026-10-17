@@ -80,6 +80,11 @@ type Store struct {
 
 	metaMu sync.Mutex
 	meta   worldMetadata
+
+	fallbackDir string
+	dimType     *DimensionType
+	dimMu       sync.Mutex
+	dimStores   map[string]*Store
 }
 
 const worldMetadataFile = "regionio-world.json"
@@ -303,6 +308,12 @@ func (s *Store) loadChunk(cx, cz int32, requireGeneratorVersion bool) (*Chunk, e
 		return nil, err
 	}
 	raw, err := rf.ReadChunk(lx, lz)
+	if errors.Is(err, ErrChunkNotFound) && s.fallbackDir != "" {
+		if fbRF, fbErr := OpenRegion(filepath.Join(s.fallbackDir, "region"), rx, rz); fbErr == nil {
+			raw, err = fbRF.ReadChunk(lx, lz)
+			fbRF.Close()
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +325,19 @@ func (s *Store) loadChunk(cx, cz int32, requireGeneratorVersion bool) (*Chunk, e
 	if !ok {
 		return nil, fmt.Errorf("world: chunk (%d,%d) root is not a compound", cx, cz)
 	}
-	return nbtToChunkVersioned(root, rx, rz, lx, lz, requireGeneratorVersion)
+	ch, err := nbtToChunkVersioned(root, rx, rz, lx, lz, requireGeneratorVersion)
+	if err != nil {
+		return nil, err
+	}
+	if s.dimType != nil {
+		if int(s.dimType.MinY) != MinY || int(s.dimType.Height) != WorldHeight {
+			ch.customBounds = true
+			ch.dimMinY = int(s.dimType.MinY)
+			ch.dimHeight = int(s.dimType.Height)
+		}
+		ch.noSkylight = !s.dimType.HasSkylight
+	}
+	return ch, nil
 }
 
 // SaveChunk encodes the chunk and writes it to its region file.
@@ -336,9 +359,9 @@ func (s *Store) saveSnapshot(c *Chunk) error {
 
 // Close releases all open region files. Called on shutdown.
 func (s *Store) Close() error {
+	firstErr := s.closeDimensionStores()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var firstErr error
 	for _, rf := range s.regions {
 		if err := rf.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -358,12 +381,14 @@ func (s *Store) Close() error {
 // official server generated. That last part is what the surface-height parity
 // capture needs.
 func chunkToNBT(c *Chunk) *nbt.Compound {
+	startSec, endSec := c.sectionBounds()
+	yPos := int32(startSec + minYSection)
 	root := nbt.NewCompound().
 		Set("DataVersion", nbt.Int(dataVersion26)).
 		Set(generatorVersionTag, nbt.Int(generatorVersion)).
 		Set("xPos", nbt.Int(c.X)).
 		Set("zPos", nbt.Int(c.Z)).
-		Set("yPos", nbt.Int(int32(minYSection))).
+		Set("yPos", nbt.Int(yPos)).
 		Set("Status", nbt.String("minecraft:full")).
 		Set("LastUpdate", nbt.Long(0)).
 		Set("InhabitedTime", nbt.Long(0))
@@ -375,7 +400,7 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 	// section Y range is contiguous (vanilla expects all sections present for
 	// the full height, though absent sections are tolerated as air).
 	sections := nbt.List{ElemID: nbt.TagCompound}
-	for si := 0; si < SectionCount; si++ {
+	for si := startSec; si < endSec; si++ {
 		sections.Elems = append(sections.Elems, sectionToNBT(c, si))
 	}
 	root.Set("sections", sections)
@@ -471,11 +496,12 @@ func buildHeightmaps(c *Chunk) *nbt.Compound {
 	const bits = 9
 	longs := make(nbt.LongArray, 37) // 256 values × 9 bits / 64 ≈ 36, +1
 	perLong := 64 / bits             // 7
+	minY := c.minY()
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
 			h := topNonAirY(c, x, z)
-			// heightmap value is (y - MinY + 1); store absolute block count.
-			val := int64(h - MinY + 1)
+			// heightmap value is (y - minY + 1); store absolute block count.
+			val := int64(h - minY + 1)
 			if val < 0 {
 				val = 0
 			}
@@ -489,9 +515,10 @@ func buildHeightmaps(c *Chunk) *nbt.Compound {
 }
 
 // topNonAirY returns the Y of the highest non-air block in column (x,z), or
-// MinY-1 if the column is empty.
+// minY-1 if the column is empty.
 func topNonAirY(c *Chunk, x, z int) int {
-	for si := SectionCount - 1; si >= 0; si-- {
+	startSec, endSec := c.sectionBounds()
+	for si := endSec - 1; si >= startSec; si-- {
 		s := c.sections[si]
 		if s == nil {
 			continue
@@ -502,7 +529,7 @@ func topNonAirY(c *Chunk, x, z int) int {
 			}
 		}
 	}
-	return MinY - 1
+	return c.minY() - 1
 }
 
 // blockStorageBits is Strategy$1.getConfigurationForPaletteSize(...).bitsInStorage()
@@ -583,6 +610,13 @@ func nbtToChunkVersioned(root *nbt.Compound, regionX, regionZ, localX, localZ in
 	secList, ok := secTag.(nbt.List)
 	if !ok || secList.ElemID != nbt.TagCompound {
 		return nil, errors.New("world: chunk sections is not a compound list")
+	}
+	if yPosTag, hasYPos := root.Get("yPos"); hasYPos {
+		if yPos, ok := yPosTag.(nbt.Int); ok && int(yPos) > minYSection && len(secList.Elems) > 0 && len(secList.Elems) < SectionCount {
+			c.customBounds = true
+			c.dimMinY = int(yPos) * 16
+			c.dimHeight = len(secList.Elems) * 16
+		}
 	}
 	seenSections := make(map[int]bool, len(secList.Elems))
 	for index, st := range secList.Elems {

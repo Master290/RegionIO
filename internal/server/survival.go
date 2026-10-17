@@ -153,8 +153,14 @@ func (session *PlayerSession) AddItemToInventory(stack world.ItemStack) (added i
 }
 
 // SpawnItemEntity spawns a minecraft:item entity carrying stack at (x, y, z)
-// and broadcasts its creation and item metadata to nearby players.
+// in the Overworld and broadcasts its creation and item metadata to nearby players.
 func (s *Server) SpawnItemEntity(x, y, z float64, stack world.ItemStack) (int32, *world.Entity) {
+	return s.SpawnItemEntityInDimension(world.DimensionOverworld, x, y, z, stack)
+}
+
+// SpawnItemEntityInDimension spawns a minecraft:item entity carrying stack at (x, y, z)
+// in dim and broadcasts its creation and item metadata to nearby players in dim.
+func (s *Server) SpawnItemEntityInDimension(dim string, x, y, z float64, stack world.ItemStack) (int32, *world.Entity) {
 	if s == nil || s.entities == nil || stack.IsEmpty() {
 		return 0, nil
 	}
@@ -162,18 +168,20 @@ func (s *Server) SpawnItemEntity(x, y, z float64, stack world.ItemStack) (int32,
 	if itemID <= 0 {
 		return 0, nil
 	}
+	dim = world.NormalizeDimension(dim)
 	normalized := world.NewItemStack(itemID, stack.Count)
 	typeID := registry.EntityTypeIndex(world.ItemEntityTypeName)
 	if typeID < 0 {
 		typeID = 0
 	}
 	ent := world.NewItemEntity(x, y, z, normalized, typeID)
+	ent.Dimension = dim
 	id := s.entities.Add(ent)
 	saved := s.entities.Get(id)
 	if saved != nil {
 		pos := saved.ChunkPos()
-		s.BroadcastChunk(pos.X, pos.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, saved))
-		s.BroadcastChunk(pos.X, pos.Z, protocol.PlaySetEntityData, EncodeItemEntityData(id, normalized))
+		s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, saved))
+		s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlaySetEntityData, EncodeItemEntityData(id, normalized))
 	}
 	return id, saved
 }
@@ -235,23 +243,7 @@ func EncodePlayerCombatKill(playerEntityID int32, message string) []byte {
 // EncodeRespawnPacket encodes a clientbound respawn (0x52) packet body for
 // protocol 775 (CommonPlayerSpawnInfo + dataToKeep).
 func EncodeRespawnPacket(gameMode uint8) []byte {
-	dimTypeIdx := registry.Index("minecraft:dimension_type", "minecraft:overworld")
-	if dimTypeIdx < 0 {
-		dimTypeIdx = 0
-	}
-	w := protocol.NewWriter(64)
-	w.VarInt(int32(dimTypeIdx))
-	w.String("minecraft:overworld")
-	w.Int64(0)       // hashed seed
-	w.Byte(gameMode) // game mode
-	w.Byte(0xFF)     // previous game mode (-1 = none)
-	w.Bool(false)    // is debug
-	w.Bool(false)    // is flat
-	w.Bool(false)    // has last death location
-	w.VarInt(0)      // portal cooldown
-	w.VarInt(63)     // sea level
-	w.Byte(0)        // dataToKeep flags
-	return w.Bytes()
+	return EncodeDimensionRespawnPacket(world.DimensionOverworld, gameMode, 0, 0)
 }
 
 func encodeContainerSetSlotPacket(stateID int32, slot int, stack world.ItemStack) []byte {
@@ -298,28 +290,35 @@ func encodeContainerSetContentPacket(stateID int32, inv [world.PlayerInventorySl
 // (or START_DESTROY_BLOCK for zero-hardness plants/torches) and spawn a dropped
 // item entity at the block center.
 func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (broken bool, dropEntityID int32) {
-	if s == nil || s.chunks == nil {
+	if s == nil {
 		return false, 0
 	}
 	mode := GameModeCreative
+	dim := world.DimensionOverworld
 	if session != nil {
 		if session.IsDead() {
 			return false, 0
 		}
-		mode = session.Snapshot().GameMode
+		snap := session.Snapshot()
+		mode = snap.GameMode
+		dim = world.NormalizeDimension(snap.Dimension)
 	}
 	if mode == GameModeAdventure || mode == GameModeSpectator {
 		return false, 0
 	}
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return false, 0
+	}
 
-	prevState := s.chunks.GetBlock(x, y, z)
+	prevState := cache.GetBlock(x, y, z)
 	if prevState == world.StateAir || prevState == world.StateWater {
 		return false, 0
 	}
 
 	switch mode {
 	case GameModeSurvival:
-		if prevState == world.StateBedrock {
+		if prevState == world.StateBedrock || world.BlockName(prevState) == "minecraft:end_portal_frame" || world.BlockName(prevState) == "minecraft:end_portal" {
 			return false, 0
 		}
 		if status != PlayerActionStopDestroyBlock &&
@@ -334,18 +333,18 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 
-	valid, lightChunks := s.chunks.SetBlockWithLight(x, y, z, world.StateAir)
-	if !valid {
+	broken, upd := cache.BreakBlockWithUpdates(x, y, z)
+	if !broken {
 		return false, 0
 	}
-	s.broadcastBlockAndLightUpdate(x, y, z, world.StateAir, lightChunks)
+	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
 	if IsChestBlock(prevState) {
 		s.DropChestContents(x, y, z)
 	}
 
 	if mode == GameModeSurvival {
 		if drop, ok := world.BlockDropItem(prevState); ok {
-			dropID, _ := s.SpawnItemEntity(float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
+			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
 			return true, dropID
 		}
 	}
@@ -353,15 +352,24 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 }
 
 func (s *Server) broadcastBlockAndLightUpdate(x, y, z int, state uint16, lightChunks []world.ChunkPos) {
-	w := protocol.NewWriter(12)
-	w.Position(x, y, z)
-	w.VarInt(int32(state))
-	cx := int32(x >> 4)
-	cz := int32(z >> 4)
-	s.BroadcastChunk(cx, cz, protocol.PlayBlockUpdate, w.Bytes())
-	for _, chunk := range lightChunks {
-		if light, err := s.chunks.LightUpdate(chunk.X, chunk.Z); err == nil {
-			s.BroadcastChunk(chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
+	s.broadcastDimensionBlockChanges(world.DimensionOverworld, s.chunks, []world.BlockChange{{Pos: world.BlockPos{X: x, Y: y, Z: z}, NewState: state}}, lightChunks)
+}
+
+func (s *Server) broadcastDimensionBlockChanges(dim string, cache *world.Cache, changes []world.BlockChange, lightChunks []world.ChunkPos) {
+	dim = world.NormalizeDimension(dim)
+	for _, ch := range changes {
+		w := protocol.NewWriter(12)
+		w.Position(ch.Pos.X, ch.Pos.Y, ch.Pos.Z)
+		w.VarInt(int32(ch.NewState))
+		cx := int32(ch.Pos.X >> 4)
+		cz := int32(ch.Pos.Z >> 4)
+		s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayBlockUpdate, w.Bytes())
+	}
+	if cache != nil {
+		for _, chunk := range lightChunks {
+			if light, err := cache.LightUpdate(chunk.X, chunk.Z); err == nil {
+				s.BroadcastDimensionChunk(dim, chunk.X, chunk.Z, protocol.PlayLightUpdate, light)
+			}
 		}
 	}
 }
@@ -433,6 +441,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 	if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
 		return 0
 	}
+	playerDim := world.NormalizeDimension(snap.Dimension)
 
 	cx := int32(int64(math.Floor(snap.X)) >> 4)
 	cz := int32(int64(math.Floor(snap.Z)) >> 4)
@@ -444,6 +453,9 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		if !ent.IsItem() || ent.PickupDelay > 0 || ent.Item.IsEmpty() {
 			continue
 		}
+		if ent.EffectiveDimension() != playerDim {
+			continue
+		}
 		if math.Abs(ent.X-snap.X) > ItemPickupHorizontalRadius ||
 			math.Abs(ent.Z-snap.Z) > ItemPickupHorizontalRadius ||
 			math.Abs(ent.Y-snap.Y) > ItemPickupVerticalRadius {
@@ -451,7 +463,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		}
 		// Re-fetch under lock to ensure the entity wasn't already picked up.
 		live := s.entities.Get(ent.ID)
-		if live == nil || !live.IsItem() || live.PickupDelay > 0 || live.Item.IsEmpty() {
+		if live == nil || !live.IsItem() || live.PickupDelay > 0 || live.Item.IsEmpty() || live.EffectiveDimension() != playerDim {
 			continue
 		}
 
@@ -462,7 +474,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		totalPickedUp += added
 
 		chunkPos := live.ChunkPos()
-		s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayTakeItemEntity,
+		s.BroadcastDimensionChunk(playerDim, chunkPos.X, chunkPos.Z, protocol.PlayTakeItemEntity,
 			EncodeTakeItemEntity(live.ID, session.EntityID, added))
 
 		if session.send != nil {
@@ -475,14 +487,14 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 
 		if added >= live.Item.Count {
 			s.entities.Remove(live.ID)
-			s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
+			s.BroadcastDimensionChunk(playerDim, chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 				encodeRemoveEntitiesPacket(nil, []int32{live.ID}))
 		} else {
 			remaining := world.NewItemStack(live.Item.ResolvedItemID(), live.Item.Count-added)
 			s.entities.Update(live.ID, func(e *world.Entity) {
 				e.Item = remaining
 			})
-			s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlaySetEntityData,
+			s.BroadcastDimensionChunk(playerDim, chunkPos.X, chunkPos.Z, protocol.PlaySetEntityData,
 				EncodeItemEntityData(live.ID, remaining))
 		}
 	}
@@ -497,6 +509,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		return false
 	}
 
+	dim := session.Dimension()
 	session.mu.Lock()
 	if session.gameMode == GameModeCreative || session.gameMode == GameModeSpectator {
 		session.mu.Unlock()
@@ -532,7 +545,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	cx := int32(int64(math.Floor(pos[0])) >> 4)
 	cz := int32(int64(math.Floor(pos[2])) >> 4)
 	hurtPayload := EncodeHurtAnimation(entityID, 0)
-	s.BroadcastChunk(cx, cz, protocol.PlayHurtAnimation, hurtPayload)
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayHurtAnimation, hurtPayload)
 
 	if send != nil {
 		_ = send(protocol.PlaySetHealth, EncodeSetHealth(newHealth, food, saturation))
@@ -619,6 +632,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	st.fallDistance = 0
 	st.mu.Unlock()
 
+	prevDim := session.Dimension()
 	session.mu.Lock()
 	session.health = world.DefaultPlayerHealth
 	session.foodLevel = world.DefaultPlayerFoodLevel
@@ -627,6 +641,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	selectedSlot := session.selectedSlot
 	inv := session.inventory
 	hasSpawn := session.hasSpawn
+	spawnDim := world.NormalizeDimension(session.spawnDimension)
 	spawnX, spawnY, spawnZ := session.spawnX, session.spawnY, session.spawnZ
 	spawnYaw, spawnPitch := session.spawnYaw, session.spawnPitch
 	session.containerStateID++
@@ -637,12 +652,14 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	send := session.send
 	session.mu.Unlock()
 
+	session.SetDimension(spawnDim)
+	targetCache := s.DimensionChunks(spawnDim)
 	targetX := 8.5
 	targetY := float64(world.FlatSurfaceY + 1)
 	targetZ := 8.5
 	var targetYaw, targetPitch float32
-	if s.chunks != nil {
-		if y, ok := s.chunks.SafeSpawnY(8, 8); ok {
+	if targetCache != nil {
+		if y, ok := targetCache.SafeSpawnY(8, 8); ok {
 			targetY = float64(y)
 		}
 	}
@@ -655,8 +672,15 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	}
 
 	if send != nil {
-		if err := send(protocol.PlayRespawn, EncodeRespawnPacket(mode)); err != nil {
+		if err := send(protocol.PlayRespawn, EncodeDimensionRespawnPacket(spawnDim, mode, s.cfg.WorldSeed, 0)); err != nil {
 			return err
+		}
+	}
+	targetCX := int32(int64(math.Floor(targetX)) >> 4)
+	targetCZ := int32(int64(math.Floor(targetZ)) >> 4)
+	if prevDim != spawnDim {
+		if switchFn := getPlayerDimSwitchFunc(session); switchFn != nil && targetCache != nil {
+			switchFn(targetCache, targetCX, targetCZ)
 		}
 	}
 	if err := s.TeleportPlayer(session, targetX, targetY, targetZ, targetYaw, targetPitch); err != nil {

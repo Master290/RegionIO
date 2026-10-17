@@ -11,6 +11,7 @@ type lightVolume struct {
 	minX, minZ int
 	width      int
 	depth      int
+	noSky      bool
 	blocks     []uint16
 	sky        []byte
 	block      []byte
@@ -41,6 +42,9 @@ func newLightVolume(minCX, minCZ, chunksWide, chunksDeep int, chunks map[[2]int3
 	v.sky = make([]byte, count)
 	v.block = make([]byte, count)
 	for key, chunk := range chunks {
+		if chunk.noSkylight {
+			v.noSky = true
+		}
 		baseX := int(key[0])*16 - v.minX
 		baseZ := int(key[1])*16 - v.minZ
 		for y := MinY; y < MinY+WorldHeight; y++ {
@@ -49,7 +53,9 @@ func newLightVolume(minCX, minCZ, chunksWide, chunksDeep int, chunks map[[2]int3
 					idx := v.indexLocal(baseX+x, y, baseZ+z)
 					v.blocks[idx] = chunk.getBlock(x, y, z)
 					if chunk.lightReady {
-						v.sky[idx] = chunk.getLight(false, x, y, z)
+						if !chunk.noSkylight {
+							v.sky[idx] = chunk.getLight(false, x, y, z)
+						}
 						v.block[idx] = chunk.getLight(true, x, y, z)
 					}
 				}
@@ -68,11 +74,16 @@ func (v *lightVolume) inside(x, y, z int) bool {
 }
 
 func (v *lightVolume) calculate() {
-	v.calculateSky()
+	if !v.noSky {
+		v.calculateSky()
+	}
 	v.calculateBlock()
 }
 
 func (v *lightVolume) calculateSky() {
+	if v.noSky {
+		return
+	}
 	queue := make([]int, 0, len(v.sky)/2)
 	for z := 0; z < v.depth; z++ {
 		for x := 0; x < v.width; x++ {
@@ -144,7 +155,6 @@ func (v *lightVolume) coordinates(idx int) (x, y, z int) {
 }
 
 func (v *lightVolume) relaxBlockChange(x, y, z int) {
-	skySources := v.skySources()
 	blockSeeds := make([]int, 0, 7)
 	if v.inside(x, y, z) {
 		idx := v.indexLocal(x, y, z)
@@ -156,7 +166,11 @@ func (v *lightVolume) relaxBlockChange(x, y, z int) {
 		}
 	}
 	v.relax(v.block, nil, blockSeeds)
+	if v.noSky {
+		return
+	}
 
+	skySources := v.skySources()
 	skySeeds := make([]int, 0, WorldHeight*2)
 	for sy := MinY; sy < MinY+WorldHeight; sy++ {
 		idx := v.indexLocal(x, sy, z)
@@ -372,7 +386,14 @@ func (c *Chunk) writeLight(w *protocol.Writer) {
 		chunks := map[[2]int32]*Chunk{{c.X, c.Z}: c}
 		v := newLightVolume(int(c.X), int(c.Z), 1, 1, chunks)
 		v.calculate()
-		standalone := &Chunk{X: c.X, Z: c.Z}
+		standalone := &Chunk{
+			X:            c.X,
+			Z:            c.Z,
+			customBounds: c.customBounds,
+			dimMinY:      c.dimMinY,
+			dimHeight:    c.dimHeight,
+			noSkylight:   c.noSkylight,
+		}
 		standalone.installLight(v)
 		sky, block = standalone.skyLight, standalone.blockLight
 	}
@@ -380,17 +401,19 @@ func (c *Chunk) writeLight(w *protocol.Writer) {
 	if maxLightSection < 0 {
 		maxLightSection = 0
 	}
-	writeLightLayers(w, sky, block, maxLightSection)
+	startSec, endSec := c.sectionBounds()
+	writeLightLayersForBounds(w, sky, block, startSec, endSec, maxLightSection, c.noSkylight)
 }
 
 func (c *Chunk) highestFilledSection() int {
-	for si := SectionCount - 1; si >= 0; si-- {
+	startSec, endSec := c.sectionBounds()
+	for si := endSec - 1; si >= startSec; si-- {
 		if c.sections[si] == nil {
 			continue
 		}
 		for _, state := range c.sections[si] {
 			if state != StateAir {
-				return si
+				return si - startSec
 			}
 		}
 	}
@@ -398,16 +421,27 @@ func (c *Chunk) highestFilledSection() int {
 }
 
 func writeLightLayers(w *protocol.Writer, sky, block [SectionCount]*[2048]byte, maxLightSection int) {
-	if maxLightSection >= lightSections {
-		maxLightSection = lightSections - 1
+	writeLightLayersForBounds(w, sky, block, 0, SectionCount, maxLightSection, false)
+}
+
+func writeLightLayersForBounds(w *protocol.Writer, sky, block [SectionCount]*[2048]byte, startSec, endSec, maxLightSection int, noSkylight bool) {
+	numWorldSecs := endSec - startSec
+	totalLightSecs := numWorldSecs + 2
+	if totalLightSecs > lightSections {
+		totalLightSecs = lightSections
+	}
+	if maxLightSection >= totalLightSecs {
+		maxLightSection = totalLightSecs - 1
 	}
 	var skySections [lightSections]*[2048]byte
 	var blockSections [lightSections]*[2048]byte
-	for i := 0; i < SectionCount && i+1 <= maxLightSection; i++ {
-		skySections[i+1] = sky[i]
-		blockSections[i+1] = block[i]
+	for i := 0; i < numWorldSecs && i+1 <= maxLightSection; i++ {
+		if !noSkylight {
+			skySections[i+1] = sky[startSec+i]
+		}
+		blockSections[i+1] = block[startSec+i]
 	}
-	if maxLightSection == lightSections-1 {
+	if !noSkylight && maxLightSection == totalLightSecs-1 {
 		skySections[maxLightSection] = new([2048]byte)
 		for i := range skySections[maxLightSection] {
 			skySections[maxLightSection][i] = 0xff
@@ -431,8 +465,8 @@ func writeLightLayers(w *protocol.Writer, sky, block [SectionCount]*[2048]byte, 
 	writeBitSet(w, []uint64{blockMask})
 	writeBitSet(w, []uint64{emptySkyMask})
 	writeBitSet(w, []uint64{emptyBlockMask})
-	writeLightArrays(w, skySections[:])
-	writeLightArrays(w, blockSections[:])
+	writeLightArrays(w, skySections[:totalLightSecs])
+	writeLightArrays(w, blockSections[:totalLightSecs])
 }
 
 func writeLightArrays(w *protocol.Writer, sections []*[2048]byte) {
@@ -463,11 +497,19 @@ func (c *Chunk) EncodeLightUpdate() []byte {
 		chunks := map[[2]int32]*Chunk{{snapshot.X, snapshot.Z}: snapshot}
 		volume := newLightVolume(int(snapshot.X), int(snapshot.Z), 1, 1, chunks)
 		volume.calculate()
-		standalone := &Chunk{X: snapshot.X, Z: snapshot.Z}
+		standalone := &Chunk{
+			X:            snapshot.X,
+			Z:            snapshot.Z,
+			customBounds: snapshot.customBounds,
+			dimMinY:      snapshot.dimMinY,
+			dimHeight:    snapshot.dimHeight,
+			noSkylight:   snapshot.noSkylight,
+		}
 		standalone.installLight(volume)
 		sky, block = standalone.skyLight, standalone.blockLight
 	}
-	writeLightLayers(w, sky, block, lightSections-1)
+	startSec, endSec := snapshot.sectionBounds()
+	writeLightLayersForBounds(w, sky, block, startSec, endSec, (endSec-startSec)+1, snapshot.noSkylight)
 	return w.Bytes()
 }
 

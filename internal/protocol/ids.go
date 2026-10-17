@@ -140,7 +140,16 @@ const (
 // GameEvent sub-IDs carried by the clientbound game_event packet.
 const (
 	GameEventChangeGameMode     = 3
+	GameEventWinGame            = 4
 	GameEventStartWaitingChunks = 13
+)
+
+// ClientboundRespawnPacket dataToKeep bitflags (protocol 775).
+const (
+	RespawnKeepNothing    byte = 0x00
+	RespawnKeepAttributes byte = 0x01
+	RespawnKeepEntityData byte = 0x02
+	RespawnKeepAllData    byte = 0x03
 )
 
 // NextState values carried by the handshake packet.

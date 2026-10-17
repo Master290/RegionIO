@@ -12,10 +12,11 @@ const ItemEntityTypeName = "minecraft:item"
 
 // Entity represents an in-game movable entity (mob, animal, dropped item, etc).
 type Entity struct {
-	ID       int32
-	UUID     [16]byte
-	TypeID   int // Network ID from the built-in minecraft:entity_type registry
-	TypeName string
+	ID        int32
+	UUID      [16]byte
+	TypeID    int // Network ID from the built-in minecraft:entity_type registry
+	TypeName  string
+	Dimension string
 
 	X, Y, Z    float64
 	Pitch, Yaw float32
@@ -34,14 +35,24 @@ type Entity struct {
 // NewItemEntity constructs a dropped item entity carrying stack at (x, y, z).
 func NewItemEntity(x, y, z float64, stack ItemStack, typeID int) *Entity {
 	return &Entity{
-		TypeID:   typeID,
-		TypeName: ItemEntityTypeName,
-		X:        x,
-		Y:        y,
-		Z:        z,
-		OnGround: true,
-		Item:     stack,
+		TypeID:    typeID,
+		TypeName:  ItemEntityTypeName,
+		Dimension: DimensionOverworld,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		OnGround:  true,
+		Item:      stack,
 	}
+}
+
+// EffectiveDimension returns the canonical dimension name for this entity,
+// defaulting to DimensionOverworld when unset.
+func (e *Entity) EffectiveDimension() string {
+	if e == nil {
+		return DimensionOverworld
+	}
+	return NormalizeDimension(e.Dimension)
 }
 
 // IsItem reports whether e is a dropped item entity.
@@ -72,7 +83,8 @@ func BlockDropItem(state uint16) (ItemStack, bool) {
 	dropName := st.Name
 	switch st.Name {
 	case "minecraft:air", "minecraft:cave_air", "minecraft:void_air",
-		"minecraft:water", "minecraft:lava", "minecraft:bedrock", "minecraft:fire":
+		"minecraft:water", "minecraft:lava", "minecraft:bedrock", "minecraft:fire",
+		"minecraft:nether_portal", "minecraft:end_portal":
 		return ItemStack{}, false
 	case "minecraft:grass_block", "minecraft:dirt_path", "minecraft:farmland":
 		dropName = "minecraft:dirt"
@@ -106,7 +118,8 @@ func IsInstantBreakBlock(state uint16) bool {
 		"minecraft:large_fern", "minecraft:dead_bush", "minecraft:dandelion",
 		"minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet",
 		"minecraft:oxeye_daisy", "minecraft:cornflower",
-		"minecraft:lily_of_the_valley", "minecraft:sunflower", "minecraft:sugar_cane":
+		"minecraft:lily_of_the_valley", "minecraft:sunflower", "minecraft:sugar_cane",
+		"minecraft:fire", "minecraft:soul_fire":
 		return true
 	}
 	return false
@@ -146,6 +159,9 @@ func (em *EntityManager) Add(e *Entity) int32 {
 	defer em.mu.Unlock()
 	em.nextID++
 	e.ID = em.nextID
+	if e.Dimension == "" {
+		e.Dimension = DimensionOverworld
+	}
 	if e.UUID == [16]byte{} {
 		rand.Read(e.UUID[:])
 		// Version 4 UUID
