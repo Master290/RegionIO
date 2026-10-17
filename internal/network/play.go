@@ -245,6 +245,16 @@ func (h *handler) sendContainerSetContent() error {
 					server.EncodeSlotWithBookContent(w, inv[i], nil, &sb)
 					continue
 				}
+			case server.FireworkRocketItemID:
+				if fw, ok := server.GetSlotFireworks(h.session, i); ok {
+					server.EncodeSlotWithFireworks(w, inv[i], fw)
+					continue
+				}
+			case server.FireworkStarItemID:
+				if exp, ok := server.GetSlotFireworkStar(h.session, i); ok {
+					server.EncodeSlotWithFireworkStar(w, inv[i], exp)
+					continue
+				}
 			}
 			if id := inv[i].ResolvedID(); server.IsBannerItem(id) || id == "minecraft:shield" {
 				pats := server.GetSlotBannerPatterns(h.session, i)
@@ -291,6 +301,16 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 		case server.WrittenBookItemID:
 			if sb, ok := server.GetSlotWrittenBook(h.session, slot); ok {
 				server.EncodeSlotWithBookContent(w, stack, nil, &sb)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
+		case server.FireworkRocketItemID:
+			if fw, ok := server.GetSlotFireworks(h.session, slot); ok {
+				server.EncodeSlotWithFireworks(w, stack, fw)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
+		case server.FireworkStarItemID:
+			if exp, ok := server.GetSlotFireworkStar(h.session, slot); ok {
+				server.EncodeSlotWithFireworkStar(w, stack, exp)
 				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 			}
 		}
@@ -343,7 +363,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	}
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	if h.session != nil {
-		h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
+		h.srv.HandlePlayerElytraMove(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.RecordPlayerMovementStats(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
@@ -542,12 +562,14 @@ func (h *handler) serverTickLoop() {
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
 				// StartSpawning is not advancing the world clock; tick player,
-				// entity status effects, raids, and boss fights here.
+				// entity status effects, raids, boss fights, and elytra/fireworks here.
 				h.srv.TickAllPlayerEffects()
 				h.srv.TickAllEntityEffects()
 				h.srv.TickRaids()
 				h.srv.TickWithers(nil)
 				h.srv.TickEnderDragons(nil)
+				h.srv.TickElytraPlayers()
+				h.srv.TickFireworkRockets()
 			}
 			lastGameTime = nowGameTime
 		}
@@ -1266,11 +1288,17 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	// Skip cursor (3 floats) + insideBlock + worldBorderHit, then read sequence.
-	for i := 0; i < 3; i++ {
-		if _, err := r.Float32(); err != nil {
-			return err
-		}
+	cursorX, err := r.Float32()
+	if err != nil {
+		return err
+	}
+	cursorY, err := r.Float32()
+	if err != nil {
+		return err
+	}
+	cursorZ, err := r.Float32()
+	if err != nil {
+		return err
 	}
 	if _, err := r.Bool(); err != nil {
 		return err
@@ -1435,6 +1463,17 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			}
 		}
 		if h.srv != nil && h.session != nil {
+			invSlot := h.session.HeldInventorySlot()
+			if hand == server.HandOffHand {
+				invSlot = server.OffHandContainerSlot
+			}
+			if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+				h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+			}
+			if _, launched := h.srv.UseFireworkRocketOnBlock(h.session, hand, x, y, z, face, cursorX, cursorY, cursorZ); launched {
+				h.syncHotbarFromSession()
+				return h.sendBlockChangedAck(seq)
+			}
 			if _, placed := h.srv.UseDecorationItemOn(h.session, hand, x, y, z, int(face)); placed {
 				h.syncHotbarFromSession()
 				return h.sendBlockChangedAck(seq)

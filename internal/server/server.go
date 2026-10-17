@@ -720,6 +720,54 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 			}
 		}
 	}
+	if d.SlotFireworks != nil {
+		for _, elem := range d.SlotFireworks.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok || comp == nil {
+				continue
+			}
+			slotTag, ok1 := comp.Get("Slot")
+			fwTag, ok2 := comp.Get("Fireworks")
+			if !ok1 || !ok2 {
+				continue
+			}
+			sb, ok1 := slotTag.(nbt.Byte)
+			fc, ok2 := fwTag.(*nbt.Compound)
+			if !ok1 || !ok2 || fc == nil {
+				continue
+			}
+			slot := int(uint8(sb))
+			if slot >= 0 && slot < world.PlayerInventorySlots {
+				if fw, ok := ReadFireworksNBT(fc); ok {
+					SetSlotFireworks(session, slot, fw)
+				}
+			}
+		}
+	}
+	if d.SlotFireworkStars != nil {
+		for _, elem := range d.SlotFireworkStars.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok || comp == nil {
+				continue
+			}
+			slotTag, ok1 := comp.Get("Slot")
+			expTag, ok2 := comp.Get("Explosion")
+			if !ok1 || !ok2 {
+				continue
+			}
+			sb, ok1 := slotTag.(nbt.Byte)
+			ec, ok2 := expTag.(*nbt.Compound)
+			if !ok1 || !ok2 || ec == nil {
+				continue
+			}
+			slot := int(uint8(sb))
+			if slot >= 0 && slot < world.PlayerInventorySlots {
+				if exp, ok := ReadFireworkExplosionNBT(ec); ok {
+					SetSlotFireworkStar(session, slot, exp)
+				}
+			}
+		}
+	}
 }
 
 // WriteExperienceNBT writes the player's experience level, total XP, progress,
@@ -848,6 +896,10 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	var mapElems []nbt.Tag
 	var slotArmorTrims *nbt.List
 	var trimElems []nbt.Tag
+	var slotFireworks *nbt.List
+	var fwElems []nbt.Tag
+	var slotFireworkStars *nbt.List
+	var starElems []nbt.Tag
 	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
 		st := session.InventorySlot(slot)
 		if st.IsEmpty() {
@@ -869,6 +921,26 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 				trimElems = append(trimElems, entry)
 			}
 		}
+		if st.ResolvedID() == FireworkRocketItemID {
+			if fw, ok := GetSlotFireworks(session, slot); ok {
+				if fc := WriteFireworksNBT(fw); fc != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slot))).
+						Set("Fireworks", fc)
+					fwElems = append(fwElems, entry)
+				}
+			}
+		}
+		if st.ResolvedID() == FireworkStarItemID {
+			if exp, ok := GetSlotFireworkStar(session, slot); ok {
+				if ec := WriteFireworkExplosionNBT(exp); ec != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slot))).
+						Set("Explosion", ec)
+					starElems = append(starElems, entry)
+				}
+			}
+		}
 	}
 	if len(mapElems) > 0 {
 		slotMaps = &nbt.List{
@@ -882,40 +954,54 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 			Elems:  trimElems,
 		}
 	}
+	if len(fwElems) > 0 {
+		slotFireworks = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  fwElems,
+		}
+	}
+	if len(starElems) > 0 {
+		slotFireworkStars = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  starElems,
+		}
+	}
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
-		Dimension:        dim,
-		Pos:              session.position,
-		Yaw:              session.yaw,
-		Pitch:            session.pitch,
-		OnGround:         session.onGround,
-		GameMode:         session.gameMode,
-		Health:           session.health,
-		FoodLevel:        session.foodLevel,
-		FoodSaturation:   session.foodSaturation,
-		FoodExhaustion:   exhaustion,
-		FoodTickTimer:    tickTimer,
-		XpLevel:          xpLevel,
-		XpTotal:          xpTotal,
-		XpP:              xpP,
-		XpSeed:           xpSeed,
-		SelectedSlot:     session.selectedSlot,
-		Inventory:        session.inventory,
-		SpawnX:           session.spawnX,
-		SpawnY:           session.spawnY,
-		SpawnZ:           session.spawnZ,
-		SpawnYaw:         session.spawnYaw,
-		SpawnPitch:       session.spawnPitch,
-		SpawnForced:      session.spawnForced,
-		SpawnDimension:   session.spawnDimension,
-		HasSpawn:         session.hasSpawn,
-		Advancements:     advComp,
-		ActiveEffects:    effList,
-		AbsorptionAmount: absAmount,
-		SlotPotions:      slotPotions,
-		SlotMaps:         slotMaps,
-		SlotArmorTrims:   slotArmorTrims,
+		Dimension:         dim,
+		Pos:               session.position,
+		Yaw:               session.yaw,
+		Pitch:             session.pitch,
+		OnGround:          session.onGround,
+		GameMode:          session.gameMode,
+		Health:            session.health,
+		FoodLevel:         session.foodLevel,
+		FoodSaturation:    session.foodSaturation,
+		FoodExhaustion:    exhaustion,
+		FoodTickTimer:     tickTimer,
+		XpLevel:           xpLevel,
+		XpTotal:           xpTotal,
+		XpP:               xpP,
+		XpSeed:            xpSeed,
+		SelectedSlot:      session.selectedSlot,
+		Inventory:         session.inventory,
+		SpawnX:            session.spawnX,
+		SpawnY:            session.spawnY,
+		SpawnZ:            session.spawnZ,
+		SpawnYaw:          session.spawnYaw,
+		SpawnPitch:        session.spawnPitch,
+		SpawnForced:       session.spawnForced,
+		SpawnDimension:    session.spawnDimension,
+		HasSpawn:          session.hasSpawn,
+		Advancements:      advComp,
+		ActiveEffects:     effList,
+		AbsorptionAmount:  absAmount,
+		SlotPotions:       slotPotions,
+		SlotMaps:          slotMaps,
+		SlotArmorTrims:    slotArmorTrims,
+		SlotFireworks:     slotFireworks,
+		SlotFireworkStars: slotFireworkStars,
 	}
 }
 

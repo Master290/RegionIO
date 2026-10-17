@@ -225,9 +225,11 @@ type PlayerData struct {
 	Advancements     *nbt.Compound
 	ActiveEffects    *nbt.List
 	AbsorptionAmount float32
-	SlotPotions      *nbt.List
-	SlotMaps         *nbt.List
-	SlotArmorTrims   *nbt.List
+	SlotPotions       *nbt.List
+	SlotMaps          *nbt.List
+	SlotArmorTrims    *nbt.List
+	SlotFireworks     *nbt.List
+	SlotFireworkStars *nbt.List
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -316,6 +318,36 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 			}
 		}
 	}
+	var fwBySlot map[int]*nbt.Compound
+	if d.SlotFireworks != nil && len(d.SlotFireworks.Elems) > 0 {
+		fwBySlot = make(map[int]*nbt.Compound, len(d.SlotFireworks.Elems))
+		for _, el := range d.SlotFireworks.Elems {
+			ec, ok := el.(*nbt.Compound)
+			if !ok || ec == nil {
+				continue
+			}
+			sb, okS := nbtGetByte(ec, "Slot")
+			fc, okF := nbtGetCompound(ec, "Fireworks")
+			if okS && okF && fc != nil {
+				fwBySlot[int(uint8(sb))] = fc
+			}
+		}
+	}
+	var starBySlot map[int]*nbt.Compound
+	if d.SlotFireworkStars != nil && len(d.SlotFireworkStars.Elems) > 0 {
+		starBySlot = make(map[int]*nbt.Compound, len(d.SlotFireworkStars.Elems))
+		for _, el := range d.SlotFireworkStars.Elems {
+			ec, ok := el.(*nbt.Compound)
+			if !ok || ec == nil {
+				continue
+			}
+			sb, okS := nbtGetByte(ec, "Slot")
+			sc, okE := nbtGetCompound(ec, "Explosion")
+			if okS && okE && sc != nil {
+				starBySlot[int(uint8(sb))] = sc
+			}
+		}
+	}
 
 	invElems := make([]nbt.Tag, 0)
 	for slot, stack := range d.Inventory {
@@ -330,9 +362,26 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 		if itemID := stack.ResolvedItemID(); itemID > 0 {
 			itemComp.Set("item_id", nbt.Int(itemID))
 		}
+		var comps *nbt.Compound
 		if tc := trimBySlot[slot]; tc != nil {
-			comps := nbt.NewCompound()
+			if comps == nil {
+				comps = nbt.NewCompound()
+			}
 			comps.Set("minecraft:trim", tc)
+		}
+		if fc := fwBySlot[slot]; fc != nil {
+			if comps == nil {
+				comps = nbt.NewCompound()
+			}
+			comps.Set("minecraft:fireworks", fc)
+		}
+		if sc := starBySlot[slot]; sc != nil {
+			if comps == nil {
+				comps = nbt.NewCompound()
+			}
+			comps.Set("minecraft:firework_explosion", sc)
+		}
+		if comps != nil {
 			itemComp.Set("components", comps)
 		}
 		invElems = append(invElems, itemComp)
@@ -385,6 +434,12 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	if d.SlotArmorTrims != nil && len(d.SlotArmorTrims.Elems) > 0 {
 		root.Set("SlotArmorTrims", *d.SlotArmorTrims)
+	}
+	if d.SlotFireworks != nil && len(d.SlotFireworks.Elems) > 0 {
+		root.Set("SlotFireworks", *d.SlotFireworks)
+	}
+	if d.SlotFireworkStars != nil && len(d.SlotFireworkStars.Elems) > 0 {
+		root.Set("SlotFireworkStars", *d.SlotFireworkStars)
 	}
 
 	return root
@@ -567,6 +622,8 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	}
 
 	var invTrimElems []nbt.Tag
+	var invFwElems []nbt.Tag
+	var invStarElems []nbt.Tag
 	if invList, ok := nbtGetList(root, "Inventory"); ok {
 		for _, elem := range invList.Elems {
 			comp, ok := elem.(*nbt.Compound)
@@ -624,6 +681,18 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 						Set("Slot", nbt.Byte(int8(slotIdx))).
 						Set("Trim", tc)
 					invTrimElems = append(invTrimElems, entry)
+				}
+				if fc, ok := nbtGetCompound(comps, "minecraft:fireworks"); ok && fc != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slotIdx))).
+						Set("Fireworks", fc)
+					invFwElems = append(invFwElems, entry)
+				}
+				if sc, ok := nbtGetCompound(comps, "minecraft:firework_explosion"); ok && sc != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slotIdx))).
+						Set("Explosion", sc)
+					invStarElems = append(invStarElems, entry)
 				}
 			}
 		}
@@ -694,6 +763,24 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 		d.SlotArmorTrims = &nbt.List{
 			ElemID: nbt.TagCompound,
 			Elems:  invTrimElems,
+		}
+	}
+	if sf, ok := nbtGetList(root, "SlotFireworks"); ok && sf != nil {
+		cp := *sf
+		d.SlotFireworks = &cp
+	} else if len(invFwElems) > 0 {
+		d.SlotFireworks = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  invFwElems,
+		}
+	}
+	if sfs, ok := nbtGetList(root, "SlotFireworkStars"); ok && sfs != nil {
+		cp := *sfs
+		d.SlotFireworkStars = &cp
+	} else if len(invStarElems) > 0 {
+		d.SlotFireworkStars = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  invStarElems,
 		}
 	}
 
