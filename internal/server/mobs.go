@@ -121,14 +121,25 @@ var (
 	}
 	fallbackEntityTypeIDs = map[string]int{
 		MobTypeArrow:              EntityTypeArrowID,
+		MobTypeCat:                EntityTypeCatID,
 		MobTypeChicken:            EntityTypeChickenID,
 		MobTypeCow:                EntityTypeCowID,
 		MobTypeCreeper:            EntityTypeCreeperID,
+		MobTypeDonkey:             EntityTypeDonkeyID,
+		MobTypeHorse:              EntityTypeHorseID,
+		MobTypeIronGolem:          EntityTypeIronGolemID,
+		MobTypeLlama:              EntityTypeLlamaID,
+		MobTypeMule:               EntityTypeMuleID,
+		MobTypeParrot:             EntityTypeParrotID,
+		MobTypePhantom:            EntityTypePhantomID,
 		MobTypePig:                EntityTypePigID,
 		MobTypeSheep:              EntityTypeSheepID,
 		MobTypeSkeleton:           EntityTypeSkeletonID,
+		MobTypeSnowGolem:          EntityTypeSnowGolemID,
 		MobTypeSpider:             EntityTypeSpiderID,
+		MobTypeTraderLlama:        EntityTypeTraderLlamaID,
 		MobTypeVillager:           int(EntityTypeVillagerID),
+		MobTypeWolf:               EntityTypeWolfID,
 		MobTypeZombie:             EntityTypeZombieID,
 		EntityTypeFishingBobber:   EntityTypeFishingBobberID,
 		EntityTypeArmorStand:      EntityTypeArmorStandID,
@@ -225,6 +236,26 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultChickenMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
+	case MobTypeWolf:
+		return DefaultWolfWildMaxHealth
+	case MobTypeCat:
+		return DefaultCatMaxHealth
+	case MobTypeParrot:
+		return DefaultParrotMaxHealth
+	case MobTypeHorse:
+		return DefaultHorseMaxHealth
+	case MobTypeDonkey:
+		return DefaultDonkeyMaxHealth
+	case MobTypeMule:
+		return DefaultMuleMaxHealth
+	case MobTypeLlama, MobTypeTraderLlama:
+		return DefaultLlamaMaxHealth
+	case MobTypeIronGolem:
+		return DefaultIronGolemMaxHealth
+	case MobTypeSnowGolem:
+		return DefaultSnowGolemMaxHealth
+	case MobTypePhantom:
+		return DefaultPhantomMaxHealth
 	case MobTypePillager:
 		return DefaultPillagerMaxHealth
 	case MobTypeVindicator:
@@ -261,33 +292,47 @@ func animalWanderSpeed(typeName string) float64 {
 	}
 }
 
-// SpawnMob spawns a mob entity of typeName at (x, y, z), initializes its AI
-// and health state, and broadcasts PlayAddEntity to nearby viewers.
+// SpawnMob spawns a mob entity of typeName at (x, y, z) in the Overworld,
+// initializes its AI and health state, and broadcasts PlayAddEntity to nearby viewers.
 func (s *Server) SpawnMob(x, y, z float64, typeName string) (int32, error) {
+	return s.SpawnMobInDimension(world.DimensionOverworld, x, y, z, typeName)
+}
+
+// SpawnMobInDimension spawns a mob entity of typeName at (x, y, z) in dimension,
+// initializes its AI and health state, and broadcasts PlayAddEntity to nearby viewers.
+func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName string) (int32, error) {
 	if s == nil || s.entities == nil {
 		return 0, errors.New("server: nil entity manager")
 	}
+	normDim := world.NormalizeDimension(dimension)
 	norm := canonicalResourceName(typeName)
 	if norm == MobTypeVillager {
 		return s.SpawnVillager(x, y, z, VillagerProfessionFarmer, MinVillagerLevel)
 	}
 	if norm == MobTypeWither {
-		return s.SpawnWither(world.DimensionOverworld, x, y, z, true)
+		return s.SpawnWither(normDim, x, y, z, true)
 	}
 	if norm == MobTypeEnderDragon {
 		return s.SpawnEnderDragon(x, y, z)
+	}
+	if norm == MobTypeIronGolem {
+		return s.SpawnIronGolem(normDim, x, y, z, false)
+	}
+	if norm == MobTypePhantom {
+		return s.SpawnPhantom(normDim, x, y, z, nil)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
 		return 0, errors.New("server: unknown mob entity type " + norm)
 	}
 	id := s.entities.Add(&world.Entity{
-		TypeID:   typeID,
-		TypeName: norm,
-		X:        x,
-		Y:        y,
-		Z:        z,
-		OnGround: true,
+		TypeID:    typeID,
+		TypeName:  norm,
+		Dimension: normDim,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		OnGround:  true,
 	})
 	tr := s.entityTracker()
 	tr.mu.Lock()
@@ -300,9 +345,13 @@ func (s *Server) SpawnMob(x, y, z float64, typeName string) (int32, error) {
 	}
 	tr.mu.Unlock()
 
+	if IsTameableMob(norm) {
+		_ = s.ensureTamedMobState(id, norm)
+	}
+
 	if ent := s.entities.Get(id); ent != nil {
 		cp := ent.ChunkPos()
-		s.BroadcastChunk(cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
 	}
 	return id, nil
 }
@@ -1090,21 +1139,26 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 		return false, 0
 	}
 
-	// 3. Breeding food -> enter love mode and check for a mate in love.
+	// 3. Breeding food -> feed baby to speed up growth by 10%, or enter love mode for adults.
 	if !IsAnimalBreedingFood(mobType, heldID) {
 		return false, 0
+	}
+	if s.IsMobBaby(entityID) {
+		fed, _ := s.FeedBabyMob(session, entityID, heldID)
+		return fed, 0
 	}
 
 	tr := s.entityTracker()
 	tr.mu.Lock()
 	mem := tr.mobStateFor(entityID, tr.aiTickID)
-	if mem.breedCooldown > 0 || mem.inLoveTicks > 0 {
+	if mem.ageTicks < 0 || mem.breedCooldown > 0 || mem.inLoveTicks > 0 {
 		tr.mu.Unlock()
 		return false, 0
 	}
 	mem.inLoveTicks = AnimalLoveDurationTicks
+	mem.loveCause = session
 
-	// Search for a nearby mate of the same species that is also in love.
+	// Search for a nearby adult mate of the same species that is also in love.
 	var mateID int32
 	var mateX, mateY, mateZ float64
 	allEnts := s.entities.AppendAll(nil)
@@ -1120,13 +1174,15 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 			continue
 		}
 		otherMem := tr.mobStates[other.ID]
-		if otherMem != nil && otherMem.inLoveTicks > 0 && otherMem.breedCooldown <= 0 {
+		if otherMem != nil && otherMem.ageTicks >= 0 && otherMem.inLoveTicks > 0 && otherMem.breedCooldown <= 0 {
 			mateID = other.ID
 			mateX, mateY, mateZ = other.X, other.Y, other.Z
 			otherMem.inLoveTicks = 0
 			otherMem.breedCooldown = AnimalBreedCooldownTicks
+			otherMem.loveCause = nil
 			mem.inLoveTicks = 0
 			mem.breedCooldown = AnimalBreedCooldownTicks
+			mem.loveCause = nil
 			break
 		}
 	}
@@ -1142,14 +1198,47 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 		}
 	}
 
-	s.BroadcastChunk(cp.X, cp.Z, protocol.PlayEntityEvent, EncodeEntityEventPacket(entityID, EntityEventLoveHearts))
+	dim := ent.EffectiveDimension()
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent, EncodeEntityEventPacket(entityID, EntityEventLoveHearts))
 	if mateID > 0 {
 		midX := (ent.X + mateX) * 0.5
 		midY := math.Max(ent.Y, mateY)
 		midZ := (ent.Z + mateZ) * 0.5
-		offspringID, _ = s.SpawnMob(midX, midY, midZ, mobType)
+		offspringID, _ = s.SpawnBabyMob(dim, midX, midY, midZ, mobType)
+		s.SpawnExperienceOrbsInDimension(dim, midX, midY+0.25, midZ, 4)
+		s.GrantCriterion(session, "minecraft:husbandry/breed_an_animal", "bred")
 	}
 	return true, offspringID
+}
+
+// TickMobsInCauldrons checks all mob entities each tick and invokes
+// s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
+// whenever a mob is inside a cauldron block.
+func (s *Server) TickMobsInCauldrons() {
+	if s == nil || s.entities == nil {
+		return
+	}
+	allEnts := s.entities.AppendAll(nil)
+	for i := range allEnts {
+		mob := &allEnts[i]
+		if mob.IsItem() || mob.IsExperienceOrb() || mob.TypeName == EntityTypeFishingBobber || IsDecorationEntity(mob.TypeName) {
+			continue
+		}
+		dim := mob.EffectiveDimension()
+		cache := s.DimensionChunks(dim)
+		if cache == nil {
+			continue
+		}
+		bx := int(math.Floor(mob.X))
+		by := int(math.Floor(mob.Y))
+		bz := int(math.Floor(mob.Z))
+		if by < world.MinY || by >= world.MinY+world.WorldHeight {
+			continue
+		}
+		if IsCauldronBlock(cache.GetBlock(bx, by, bz)) {
+			s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
+		}
+	}
 }
 
 func mobAttackCauseName(mobType string) string {

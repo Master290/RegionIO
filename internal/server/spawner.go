@@ -161,13 +161,24 @@ func NewEntityTracker() *EntityTracker {
 // TickAndBroadcast steps all entities in s and broadcasts resulting visibility
 // and delta-movement packets.
 func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
+	t.mu.Lock()
+	t.stepEntitiesLocked(s, rng)
+	t.mu.Unlock()
+
 	if s != nil {
 		s.TickWithers(rng)
 		s.TickEnderDragons(rng)
 		s.TickFireworkRockets()
+		s.TickBabyMobs()
+		s.TickTamedMobs(rng)
+		s.TickIronGolems(rng)
+		s.TickVillagerGolemSpawning(rng)
+		s.TickPhantomSpawner(rng)
+		s.TickPhantoms(rng)
+		s.TickMobsInCauldrons()
 	}
+
 	t.mu.Lock()
-	t.stepEntitiesLocked(s, rng)
 	t.syncLocked(s)
 	t.mu.Unlock()
 }
@@ -217,6 +228,15 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		if IsBossOrBossSupportEntity(snapshot.TypeName) {
 			if snapshot.TypeName == MobTypeWither || snapshot.TypeName == MobTypeEnderDragon {
 				_ = t.mobStateFor(snapshot.ID, aiTick)
+			}
+			continue
+		}
+		if snapshot.TypeName == MobTypePhantom {
+			mem := t.mobStateFor(snapshot.ID, aiTick)
+			if !mem.healthInit {
+				mem.healthInit = true
+				mem.health = ResolveMobMaxHealth(snapshot.TypeName)
+				mem.lastHealth = mem.health
 			}
 			continue
 		}
@@ -292,10 +312,26 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			)
 			attackDmg = SpiderAttackDamage
 		default:
-			nextX, nextY, nextZ, nextYaw = s.stepPassiveAnimalAI(
-				snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
-				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
-			)
+			if IsTameableMob(snapshot.TypeName) && (s.IsMobSitting(snapshot.ID) || s.IsMobTamed(snapshot.ID)) {
+				if mem.breedCooldown > 0 {
+					mem.breedCooldown--
+				}
+				if mem.inLoveTicks > 0 {
+					mem.inLoveTicks--
+				}
+			} else if snapshot.TypeName == MobTypeIronGolem {
+				if gst, ok := s.GetIronGolemState(snapshot.ID); !ok || gst.TargetMobID == 0 {
+					nextX, nextY, nextZ, nextYaw = s.stepPassiveAnimalAI(
+						snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
+						snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+					)
+				}
+			} else {
+				nextX, nextY, nextZ, nextYaw = s.stepPassiveAnimalAI(
+					snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
+					snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+				)
+			}
 		}
 
 		if exploded {
@@ -450,6 +486,15 @@ func (t *EntityTracker) syncLocked(s *Server) {
 						if metaPkt := s.BossOrSupportEntityDataPacket(ent.ID, ent.TypeName); len(metaPkt) > 0 {
 							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
 						}
+					} else if IsTameableMob(ent.TypeName) {
+						if metaPkt := s.TamedMobEntityDataPacket(ent.ID, ent.TypeName); len(metaPkt) > 0 {
+							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
+						}
+					} else if ent.TypeName == MobTypeIronGolem {
+						_ = viewer.send(PlaySetEntityDataCB, EncodeIronGolemDataPacket(ent.ID, s.IsIronGolemPlayerCreated(ent.ID)))
+					}
+					if mem := t.mobStates[ent.ID]; mem != nil && mem.ageTicks < 0 {
+						_ = viewer.send(PlaySetEntityDataCB, EncodeAgeableMobDataPacket(ent.ID, true))
 					}
 				}
 				continue

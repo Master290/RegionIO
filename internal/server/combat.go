@@ -529,32 +529,7 @@ func ComputeKnockback(attackerX, attackerZ float64, attackerYaw float32, targetX
 
 // MobMaxHealth returns the default maximum health for a mob entity type.
 func MobMaxHealth(typeName string) float32 {
-	switch normalizeFoodItemID(typeName) {
-	case MobTypeZombie:
-		return DefaultZombieMaxHealth
-	case MobTypePig:
-		return DefaultPigMaxHealth
-	case MobTypeVillager:
-		return DefaultVillagerMaxHealth
-	case MobTypePillager:
-		return DefaultPillagerMaxHealth
-	case MobTypeVindicator:
-		return DefaultVindicatorMaxHealth
-	case MobTypeEvoker:
-		return DefaultEvokerMaxHealth
-	case MobTypeRavager:
-		return DefaultRavagerMaxHealth
-	case MobTypeWitch:
-		return DefaultWitchMaxHealth
-	case MobTypeWither:
-		return DefaultWitherMaxHealth
-	case MobTypeWitherSkeleton:
-		return DefaultWitherSkeletonMaxHealth
-	case MobTypeEnderDragon:
-		return DefaultEnderDragonMaxHealth
-	default:
-		return DefaultMobMaxHealth
-	}
+	return ResolveMobMaxHealth(typeName)
 }
 
 // MobLootDrops returns the item stack(s) dropped when a mob of typeName dies.
@@ -601,6 +576,45 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack("minecraft:gunpowder", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeIronGolem:
+		ingots := int32(3)
+		if rng != nil {
+			ingots += int32(rng.Intn(3)) // 3..5 iron_ingot
+		}
+		var out []world.ItemStack
+		if s1 := world.NewNamedItemStack("minecraft:iron_ingot", ingots); !s1.IsEmpty() {
+			out = append(out, s1)
+		}
+		poppies := int32(1)
+		if rng != nil {
+			poppies = int32(rng.Intn(3)) // 0..2 poppy
+		}
+		if poppies > 0 {
+			if s2 := world.NewNamedItemStack("minecraft:poppy", poppies); !s2.IsEmpty() {
+				out = append(out, s2)
+			}
+		}
+		return out
+	case MobTypePhantom:
+		if stack := world.NewNamedItemStack("minecraft:phantom_membrane", 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeParrot:
+		feathers := int32(1)
+		if rng != nil {
+			feathers = int32(1 + rng.Intn(2))
+		}
+		if stack := world.NewNamedItemStack("minecraft:feather", feathers); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama:
+		if stack := world.NewNamedItemStack("minecraft:leather", 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeCat:
+		if stack := world.NewNamedItemStack("minecraft:string", 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
 	case MobTypeWither:
 		if stack := world.NewNamedItemStack(NetherStarItemID, 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
@@ -621,6 +635,24 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.pig.hurt", SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.hurt", SoundSourceNeutral
+	case MobTypeWolf:
+		return "minecraft:entity.wolf.hurt", SoundSourceNeutral
+	case MobTypeCat:
+		return "minecraft:entity.cat.hurt", SoundSourceNeutral
+	case MobTypeParrot:
+		return "minecraft:entity.parrot.hurt", SoundSourceNeutral
+	case MobTypeHorse:
+		return "minecraft:entity.horse.hurt", SoundSourceNeutral
+	case MobTypeDonkey:
+		return "minecraft:entity.donkey.hurt", SoundSourceNeutral
+	case MobTypeMule:
+		return "minecraft:entity.mule.hurt", SoundSourceNeutral
+	case MobTypeLlama, MobTypeTraderLlama:
+		return "minecraft:entity.llama.hurt", SoundSourceNeutral
+	case MobTypeIronGolem:
+		return "minecraft:entity.iron_golem.hurt", SoundSourceNeutral
+	case MobTypePhantom:
+		return "minecraft:entity.phantom.hurt", SoundSourceHostile
 	case MobTypeWither:
 		return "minecraft:entity.wither.hurt", SoundSourceHostile
 	case MobTypeEnderDragon:
@@ -638,6 +670,24 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.pig.death", SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.death", SoundSourceNeutral
+	case MobTypeWolf:
+		return "minecraft:entity.wolf.death", SoundSourceNeutral
+	case MobTypeCat:
+		return "minecraft:entity.cat.death", SoundSourceNeutral
+	case MobTypeParrot:
+		return "minecraft:entity.parrot.death", SoundSourceNeutral
+	case MobTypeHorse:
+		return "minecraft:entity.horse.death", SoundSourceNeutral
+	case MobTypeDonkey:
+		return "minecraft:entity.donkey.death", SoundSourceNeutral
+	case MobTypeMule:
+		return "minecraft:entity.mule.death", SoundSourceNeutral
+	case MobTypeLlama, MobTypeTraderLlama:
+		return "minecraft:entity.llama.death", SoundSourceNeutral
+	case MobTypeIronGolem:
+		return "minecraft:entity.iron_golem.death", SoundSourceNeutral
+	case MobTypePhantom:
+		return "minecraft:entity.phantom.death", SoundSourceHostile
 	case MobTypeWither:
 		return "minecraft:entity.wither.death", SoundSourceHostile
 	case MobTypeEnderDragon:
@@ -767,6 +817,8 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 	if target.IsDead() {
 		s.TriggerKilledByEntity(target, mobType)
 		s.BroadcastDeathMessage(target, mobAttackCauseName(mobType), mobType)
+	} else if mobID > 0 {
+		s.NotifyOwnerDamagedByMob(target, mobID)
 	}
 	snap := target.Snapshot()
 	vx, vy, vz := ComputeKnockback(mobX, mobZ, 0, snap.X, snap.Z, BaseKnockbackStrength)
@@ -939,6 +991,7 @@ func (s *Server) applyDamageToMob(
 		mem.healthInit = true
 		mem.health = MobMaxHealth(target.TypeName)
 	}
+	wasBaby := mem.ageTicks < 0
 	mem.health -= damage
 	if mem.health <= 0 {
 		mem.health = 0
@@ -971,6 +1024,12 @@ func (s *Server) applyDamageToMob(
 	}
 
 	if !killed {
+		if attacker != nil {
+			if canonicalResourceName(target.TypeName) == MobTypeWolf {
+				s.ProvokeWildWolf(target.ID, attacker)
+			}
+			s.NotifyOwnerAttackedTarget(attacker, target.ID)
+		}
 		// Apply horizontal knockback step if walkable, and set velocity on entity.
 		curFeetY := int(math.Floor(target.Y + 0.01))
 		nextX := target.X + vx
@@ -999,7 +1058,7 @@ func (s *Server) applyDamageToMob(
 		return false
 	}
 
-	// Mob died: broadcast death event + sound, notify raid manager, remove entity, and spawn loot drops.
+	// Mob died: broadcast death event + sound, notify raid manager, remove entity, and spawn loot drops (adults only).
 	deathSnd, deathSrc := mobDeathSound(target.TypeName)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 		EncodeSoundPacket(deathSnd, deathSrc, target.X, target.Y, target.Z, 1.0, 1.0, 0))
@@ -1010,9 +1069,11 @@ func (s *Server) applyDamageToMob(
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
 
-	drops := MobLootDrops(target.TypeName, nil)
-	for _, drop := range drops {
-		s.SpawnItemEntity(target.X, target.Y+0.25, target.Z, drop)
+	if !wasBaby {
+		drops := MobLootDrops(target.TypeName, nil)
+		for _, drop := range drops {
+			s.SpawnItemEntity(target.X, target.Y+0.25, target.Z, drop)
+		}
 	}
 	if attacker != nil {
 		s.TriggerEntityKilled(attacker, target.TypeName)

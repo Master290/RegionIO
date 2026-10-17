@@ -755,7 +755,7 @@ func (s *Server) InteractWithVillager(session *PlayerSession, entityID int32) (o
 
 // InteractWithEntity handles right-click entity interactions (opening the
 // merchant window for a villager, interacting with item frames/armor stands,
-// or interacting with passive farm animals).
+// taming/feeding/sitting pets, repairing iron golems, or breeding farm animals).
 func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32) (opened bool, containerID int32, err error) {
 	if s == nil || s.entities == nil || session == nil {
 		return false, 0, nil
@@ -769,6 +769,14 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 	}
 	if IsDecorationEntity(ent.TypeName) {
 		handled := s.InteractWithDecoration(session, targetEntityID, 0)
+		return handled, 0, nil
+	}
+	if IsTameableMob(ent.TypeName) {
+		handled, _ := s.InteractWithTameableMob(session, targetEntityID, nil)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeIronGolem {
+		handled := s.InteractWithIronGolem(session, targetEntityID)
 		return handled, 0, nil
 	}
 	if IsPassiveAnimal(ent.TypeName) {

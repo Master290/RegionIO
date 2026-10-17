@@ -70,15 +70,17 @@ type mobMemory struct {
 	creeperSwellDir int8
 	provoked        bool
 	panicTicks      int
-	inLoveTicks     int
-	breedCooldown   int
-	eggTimer        int
-	sheared         bool
-	woolRegrowTimer int
-	seenTick        uint64
-	healthInit      bool
-	health          float32
-	lastHealth      float32
+	inLoveTicks      int
+	breedCooldown    int
+	ageTicks         int
+	loveCause        *PlayerSession
+	eggTimer         int
+	sheared          bool
+	woolRegrowTimer  int
+	seenTick         uint64
+	healthInit       bool
+	health           float32
+	lastHealth       float32
 }
 
 type playerTarget struct {
@@ -93,7 +95,7 @@ type playerTarget struct {
 // attacks (or explodes near) players.
 func IsHostileMob(typeName string) bool {
 	switch typeName {
-	case MobTypeZombie, MobTypeSkeleton, MobTypeCreeper, MobTypeSpider:
+	case MobTypeZombie, MobTypeSkeleton, MobTypeCreeper, MobTypeSpider, MobTypePhantom:
 		return true
 	default:
 		return false
