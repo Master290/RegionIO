@@ -322,6 +322,12 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		if prevState == world.StateBedrock || world.BlockName(prevState) == "minecraft:end_portal_frame" || world.BlockName(prevState) == "minecraft:end_portal" {
 			return false, 0
 		}
+		if status == PlayerActionStartDestroyBlock && world.IsNoteBlock(prevState) {
+			if _, nbRes := s.AttackNoteBlock(session, x, y, z); len(nbRes.Changes) > 0 || len(nbRes.LightChanged) > 0 {
+				s.broadcastDimensionBlockChanges(dim, cache, nbRes.Changes, nbRes.LightChanged)
+			}
+			return false, 0
+		}
 		if status != PlayerActionStopDestroyBlock &&
 			!(status == PlayerActionStartDestroyBlock && world.IsInstantBreakBlock(prevState)) {
 			return false, 0
@@ -359,6 +365,12 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 	if IsSignBlock(prevState) {
 		s.RemoveSignAt(dim, x, y, z)
+	}
+	if IsJukeboxBlock(prevState) {
+		_, jbRes := s.BreakJukeboxAt(dim, x, y, z)
+		if len(jbRes.Changes) > 0 || len(jbRes.LightChanged) > 0 {
+			s.broadcastDimensionBlockChanges(dim, cache, jbRes.Changes, jbRes.LightChanged)
+		}
 	}
 	var bannerDrop world.ItemStack
 	var hasBannerDrop bool

@@ -250,6 +250,12 @@ func (h *handler) sendContainerSetContent() error {
 					continue
 				}
 			}
+			meta := server.GetSlotItemMeta(h.session, i)
+			trim, hasTrim := server.GetSlotArmorTrim(h.session, i)
+			if !meta.IsEmpty() || hasTrim {
+				server.WriteSlotWithArmorTrim(w, inv[i], meta, trim)
+				continue
+			}
 		}
 		writeItemStack(w, inv[i])
 	}
@@ -291,6 +297,12 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 				server.EncodeSlotWithBannerPatterns(w, stack, pats, baseCol)
 				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 			}
+		}
+		meta := server.GetSlotItemMeta(h.session, slot)
+		trim, hasTrim := server.GetSlotArmorTrim(h.session, slot)
+		if !meta.IsEmpty() || hasTrim {
+			server.WriteSlotWithArmorTrim(w, stack, meta, trim)
+			return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 		}
 	}
 	writeItemStack(w, stack)
@@ -422,6 +434,8 @@ func (h *handler) keepAliveLoop() {
 			h.srv.WakePlayerFromBed(h.session)
 			h.srv.CloseLecternIfOpen(h.session)
 			_ = h.srv.CloseLoomContainer(h.session, 0, false)
+			_ = h.srv.CloseStonecutterContainer(h.session, 0, false)
+			_ = h.srv.CloseSmithingContainer(h.session, 0, false)
 			_ = h.srv.CloseCartographyContainer(h.session, 0, false)
 			h.srv.OnPlayerQuitBossBars(h.session)
 			h.srv.BroadcastPlayerInfoRemove(h.session.Profile.UUID)
@@ -483,8 +497,8 @@ func (h *handler) entitySyncLoop() {
 
 var activeServerTickLoops sync.Map // map[*server.Server]bool
 
-// serverTickLoop drives the 20 TPS brewing stand, world border, random block,
-// and status effect ticks for h.srv while at least one play connection is active.
+// serverTickLoop drives the 20 TPS brewing stand, world border, jukebox, random
+// block, and status effect ticks for h.srv while at least one play connection is active.
 func (h *handler) serverTickLoop() {
 	if h.srv == nil {
 		return
@@ -505,6 +519,7 @@ func (h *handler) serverTickLoop() {
 		case <-ticker.C:
 			h.srv.TickBrewingStands()
 			h.srv.TickWorldBorder()
+			h.srv.TickJukeboxes()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
 			}
@@ -904,6 +919,10 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 				h.syncHotbarFromSession()
 				return err
 			}
+			if handled, err := h.srv.HandleStonecutterButtonClick(h.session, cid, btn); handled {
+				h.syncHotbarFromSession()
+				return err
+			}
 			if err := h.srv.HandleContainerButtonClick(h.session, cid, btn); err != nil {
 				return err
 			}
@@ -994,6 +1013,14 @@ func (h *handler) handleContainerClose(pkt protocol.Packet) error {
 			}
 		} else if open != nil && open.MenuType == server.MenuTypeLoom {
 			if err := h.srv.CloseLoomContainer(h.session, cid, false); err != nil {
+				return err
+			}
+		} else if open != nil && open.MenuType == server.MenuTypeStonecutter {
+			if err := h.srv.CloseStonecutterContainer(h.session, cid, false); err != nil {
+				return err
+			}
+		} else if open != nil && open.MenuType == server.MenuTypeSmithing {
+			if err := h.srv.CloseSmithingContainer(h.session, cid, false); err != nil {
 				return err
 			}
 		} else if err := h.srv.CloseMerchantContainer(h.session, cid, false); err != nil {
@@ -1211,6 +1238,23 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			if server.IsSignBlock(clickedState) {
 				if h.srv.InteractWithSign(h.session, hand, x, y, z, true) {
 					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+			if server.IsJukeboxBlock(clickedState) {
+				invSlot := h.session.HeldInventorySlot()
+				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+				}
+				if handled, res := h.srv.InteractJukebox(h.session, hand, x, y, z); handled {
+					h.broadcastBlockChanges(h.session.Dimension(), cache, res)
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+			if world.IsNoteBlock(clickedState) {
+				if handled, res := h.srv.InteractNoteBlock(h.session, x, y, z); handled {
+					h.broadcastBlockChanges(h.session.Dimension(), cache, res)
 					return h.sendBlockChangedAck(seq)
 				}
 			}

@@ -247,6 +247,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		chunks.SetPressurePlateEntityCounter(func(x, y, z int) int {
 			return s.CountEntitiesAtBlock(world.DimensionOverworld, x, y, z)
 		})
+		s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
 	}
 	if entities != nil {
 		entities.SetStepCallback(func(dim string, x, y, z int) {
@@ -273,6 +274,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadWorldBorderFile()
 		_ = s.LoadSignsAndLecternsFile()
 		_ = s.LoadBannersFile()
+		_ = s.LoadJukeboxes()
 	}
 	return s
 }
@@ -418,6 +420,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveBannersFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveJukeboxes(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
@@ -642,6 +647,30 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 			}
 		}
 	}
+	if d.SlotArmorTrims != nil {
+		for _, elem := range d.SlotArmorTrims.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok || comp == nil {
+				continue
+			}
+			slotTag, ok1 := comp.Get("Slot")
+			trimTag, ok2 := comp.Get("Trim")
+			if !ok1 || !ok2 {
+				continue
+			}
+			sb, ok1 := slotTag.(nbt.Byte)
+			tc, ok2 := trimTag.(*nbt.Compound)
+			if !ok1 || !ok2 || tc == nil {
+				continue
+			}
+			slot := int(uint8(sb))
+			if slot >= 0 && slot < world.PlayerInventorySlots {
+				if trim, ok := ArmorTrimFromNBT(tc); ok {
+					SetSlotArmorTrim(session, slot, trim)
+				}
+			}
+		}
+	}
 }
 
 // WriteExperienceNBT writes the player's experience level, total XP, progress,
@@ -768,22 +797,40 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	}
 	var slotMaps *nbt.List
 	var mapElems []nbt.Tag
+	var slotArmorTrims *nbt.List
+	var trimElems []nbt.Tag
 	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
 		st := session.InventorySlot(slot)
-		if st.ResolvedID() != FilledMapItemID {
+		if st.IsEmpty() {
 			continue
 		}
-		if mapID, ok := GetSlotMapID(session, slot); ok {
-			entry := nbt.NewCompound().
-				Set("Slot", nbt.Byte(int8(slot))).
-				Set("MapID", nbt.Int(mapID))
-			mapElems = append(mapElems, entry)
+		if st.ResolvedID() == FilledMapItemID {
+			if mapID, ok := GetSlotMapID(session, slot); ok {
+				entry := nbt.NewCompound().
+					Set("Slot", nbt.Byte(int8(slot))).
+					Set("MapID", nbt.Int(mapID))
+				mapElems = append(mapElems, entry)
+			}
+		}
+		if trim, ok := GetSlotArmorTrim(session, slot); ok {
+			if tc := ArmorTrimToNBT(trim); tc != nil {
+				entry := nbt.NewCompound().
+					Set("Slot", nbt.Byte(int8(slot))).
+					Set("Trim", tc)
+				trimElems = append(trimElems, entry)
+			}
 		}
 	}
 	if len(mapElems) > 0 {
 		slotMaps = &nbt.List{
 			ElemID: nbt.TagCompound,
 			Elems:  mapElems,
+		}
+	}
+	if len(trimElems) > 0 {
+		slotArmorTrims = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  trimElems,
 		}
 	}
 	session.mu.RLock()
@@ -819,6 +866,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		AbsorptionAmount: absAmount,
 		SlotPotions:      slotPotions,
 		SlotMaps:         slotMaps,
+		SlotArmorTrims:   slotArmorTrims,
 	}
 }
 

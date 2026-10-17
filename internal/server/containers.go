@@ -154,6 +154,7 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 	if stack.IsEmpty() {
 		SetCarriedItemMeta(session, ItemMeta{})
 		SetCarriedPotionType(session, "")
+		SetCarriedArmorTrim(session, ArmorTrim{})
 	}
 }
 
@@ -420,6 +421,18 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	case IsLoomBlock(state):
 		cid, err := s.OpenLoom(session, x, y, z)
 		return err == nil, cid, err
+	case IsStonecutterBlock(state):
+		cid, err := s.OpenStonecutter(session, x, y, z)
+		return err == nil, cid, err
+	case IsSmithingTableBlock(state):
+		cid, err := s.OpenSmithingTable(session, x, y, z)
+		return err == nil, cid, err
+	case IsJukeboxBlock(state):
+		handled, _ := s.InteractJukebox(session, 0, x, y, z)
+		return handled, 0, nil
+	case world.IsNoteBlock(state):
+		handled, _ := s.InteractNoteBlock(session, x, y, z)
+		return handled, 0, nil
 	case world.BlockName(state) == "minecraft:water_cauldron":
 		return s.CleanBannerInCauldron(session, 0, x, y, z), 0, nil
 	case IsBedBlock(state):
@@ -549,19 +562,23 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		stack  world.ItemStack
 		meta   ItemMeta
 		potion string
+		trim   ArmorTrim
 	}
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
 	var returnItems []returnEntry
 	if !tr.carried.IsEmpty() {
+		carriedTrim, _ := GetCarriedArmorTrim(session)
 		returnItems = append(returnItems, returnEntry{
 			stack:  tr.carried,
 			meta:   GetCarriedItemMeta(session),
 			potion: GetCarriedPotionType(session),
+			trim:   carriedTrim,
 		})
 		tr.carried = world.ItemStack{}
 		SetCarriedItemMeta(session, ItemMeta{})
 		SetCarriedPotionType(session, "")
+		SetCarriedArmorTrim(session, ArmorTrim{})
 	}
 	closedID := containerID
 	hadOpen := false
@@ -620,6 +637,9 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		if entry.potion != "" && len(changedSlots) > 0 {
 			SetSlotPotionType(session, changedSlots[0], entry.potion)
 		}
+		if entry.trim.IsValid() && len(changedSlots) > 0 {
+			SetSlotArmorTrim(session, changedSlots[0], entry.trim)
+		}
 		if rem := st.Count - added; rem > 0 {
 			s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
 		}
@@ -629,9 +649,7 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		if notifyClient && closedID > 0 {
 			_ = session.send(protocol.PlayContainerClose, EncodeContainerClose(closedID))
 		}
-		stateID := session.NextContainerStateID()
-		inv := session.Inventory()
-		_ = session.send(protocol.PlayContainerSetContent, EncodeContainerContent(0, stateID, inv[:], world.ItemStack{}))
+		_ = s.syncPlayerInventoryContainer(session)
 	}
 	return nil
 }
@@ -659,6 +677,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 				tr.carried = world.ItemStack{}
 				SetCarriedItemMeta(session, ItemMeta{})
 				SetCarriedPotionType(session, "")
+				SetCarriedArmorTrim(session, ArmorTrim{})
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
@@ -746,6 +765,26 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	case MenuTypeLoom:
 		tr.mu.Unlock()
 		err := s.HandleLoomClick(session, ContainerClick{
+			ContainerID: containerID,
+			Slot:        int16(slot),
+			Button:      button,
+			Mode:        mode,
+		})
+		s.TriggerInventoryChanged(session)
+		return err
+	case MenuTypeStonecutter:
+		tr.mu.Unlock()
+		err := s.HandleStonecutterClick(session, ContainerClick{
+			ContainerID: containerID,
+			Slot:        int16(slot),
+			Button:      button,
+			Mode:        mode,
+		})
+		s.TriggerInventoryChanged(session)
+		return err
+	case MenuTypeSmithing:
+		tr.mu.Unlock()
+		err := s.HandleSmithingClick(session, ContainerClick{
 			ContainerID: containerID,
 			Slot:        int16(slot),
 			Button:      button,
@@ -1171,6 +1210,10 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 			openCopy.Result,
 		)
 		isLoom = true
+	case MenuTypeStonecutter:
+		return s.syncStonecutterContainer(session)
+	case MenuTypeSmithing:
+		return s.syncSmithingContainer(session)
 	default:
 		return nil
 	}
@@ -1225,7 +1268,27 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 
 	slots := s.buildPlayerMenuSlots(session, grid, res)
 	stateID := session.NextContainerStateID()
-	return session.send(protocol.PlayContainerSetContent, EncodeContainerContent(0, stateID, slots, carried))
+	w := protocol.NewWriter(32 + len(slots)*12)
+	w.VarInt(0)
+	w.VarInt(stateID)
+	w.VarInt(int32(len(slots)))
+	for i, st := range slots {
+		meta := GetSlotItemMeta(session, i)
+		trim, hasTrim := GetSlotArmorTrim(session, i)
+		if !meta.IsEmpty() || hasTrim {
+			WriteSlotWithArmorTrim(w, st, meta, trim)
+		} else {
+			writeContainerItemStack(w, st)
+		}
+	}
+	carriedMeta := GetCarriedItemMeta(session)
+	carriedTrim, hasCarriedTrim := GetCarriedArmorTrim(session)
+	if !carriedMeta.IsEmpty() || hasCarriedTrim {
+		WriteSlotWithArmorTrim(w, carried, carriedMeta, carriedTrim)
+	} else {
+		writeContainerItemStack(w, carried)
+	}
+	return session.send(protocol.PlayContainerSetContent, w.Bytes())
 }
 
 func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {

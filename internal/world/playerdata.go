@@ -227,6 +227,7 @@ type PlayerData struct {
 	AbsorptionAmount float32
 	SlotPotions      *nbt.List
 	SlotMaps         *nbt.List
+	SlotArmorTrims   *nbt.List
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -300,6 +301,22 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	root.Set("SelectedItemSlot", nbt.Int(selected))
 
+	var trimBySlot map[int]*nbt.Compound
+	if d.SlotArmorTrims != nil && len(d.SlotArmorTrims.Elems) > 0 {
+		trimBySlot = make(map[int]*nbt.Compound, len(d.SlotArmorTrims.Elems))
+		for _, el := range d.SlotArmorTrims.Elems {
+			ec, ok := el.(*nbt.Compound)
+			if !ok || ec == nil {
+				continue
+			}
+			sb, okS := nbtGetByte(ec, "Slot")
+			tc, okT := nbtGetCompound(ec, "Trim")
+			if okS && okT && tc != nil {
+				trimBySlot[int(uint8(sb))] = tc
+			}
+		}
+	}
+
 	invElems := make([]nbt.Tag, 0)
 	for slot, stack := range d.Inventory {
 		if stack.IsEmpty() {
@@ -312,6 +329,11 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 		itemComp.Set("Count", nbt.Byte(int8(stack.Count)))
 		if itemID := stack.ResolvedItemID(); itemID > 0 {
 			itemComp.Set("item_id", nbt.Int(itemID))
+		}
+		if tc := trimBySlot[slot]; tc != nil {
+			comps := nbt.NewCompound()
+			comps.Set("minecraft:trim", tc)
+			itemComp.Set("components", comps)
 		}
 		invElems = append(invElems, itemComp)
 	}
@@ -360,6 +382,9 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	if d.SlotMaps != nil && len(d.SlotMaps.Elems) > 0 {
 		root.Set("SlotMaps", *d.SlotMaps)
+	}
+	if d.SlotArmorTrims != nil && len(d.SlotArmorTrims.Elems) > 0 {
+		root.Set("SlotArmorTrims", *d.SlotArmorTrims)
 	}
 
 	return root
@@ -541,6 +566,7 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 		d.SelectedSlot = sel
 	}
 
+	var invTrimElems []nbt.Tag
 	if invList, ok := nbtGetList(root, "Inventory"); ok {
 		for _, elem := range invList.Elems {
 			comp, ok := elem.(*nbt.Compound)
@@ -591,6 +617,14 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 				ItemID: itemID,
 				ID:     idStr,
 				Count:  count,
+			}
+			if comps, ok := nbtGetCompound(comp, "components"); ok && comps != nil {
+				if tc, ok := nbtGetCompound(comps, "minecraft:trim"); ok && tc != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slotIdx))).
+						Set("Trim", tc)
+					invTrimElems = append(invTrimElems, entry)
+				}
 			}
 		}
 	}
@@ -652,6 +686,15 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	if sm, ok := nbtGetList(root, "SlotMaps"); ok && sm != nil {
 		cp := *sm
 		d.SlotMaps = &cp
+	}
+	if st, ok := nbtGetList(root, "SlotArmorTrims"); ok && st != nil {
+		cp := *st
+		d.SlotArmorTrims = &cp
+	} else if len(invTrimElems) > 0 {
+		d.SlotArmorTrims = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  invTrimElems,
+		}
 	}
 
 	return d, nil

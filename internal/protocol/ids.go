@@ -125,6 +125,9 @@ const (
 	PlaySetBorderWarningDelay    = 0x5b
 	PlaySetBorderWarningDistance = 0x5c
 	PlayBlockEntityData          = 0x06
+	PlayBlockEvent               = 0x07
+	PlayLevelEvent               = 0x2e
+	PlayLevelParticles           = 0x2f
 	PlayOpenBook                 = 0x3a
 	PlayOpenSignEditor           = 0x3c
 
