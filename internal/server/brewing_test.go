@@ -436,3 +436,52 @@ func TestBrewingStandRecipesFuelTickPersistenceAndAdvancements(t *testing.T) {
 		t.Fatal("expected minecraft:nether/all_potions (A Furious Cocktail) to complete when all 17 potion effects are active")
 	}
 }
+
+func TestBrewingStandClickNoDeadlock(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{7, 8, 9, 10},
+		Name: "BrewClicker",
+	}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+
+	bx, by, bz := 8, 65, 8
+	srv.Chunks().SetBlock(bx, by, bz, BrewingStandBlockState(false, false, false))
+	cid, err := srv.OpenBrewingStand(sess, bx, by, bz)
+	if err != nil {
+		t.Fatalf("OpenBrewingStand: %v", err)
+	}
+
+	// Place a swiftness potion in player hotbar slot 0 (player inventory slot 36 -> menu slot 32).
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:potion", 1))
+	SetSlotPotionType(sess, 36, PotionSwiftness)
+
+	// Shift-click (ContainerInputQuickMove) menu slot 32 into brewing stand bottle slot 0.
+	if err := srv.HandleContainerClick(sess, cid, 32, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick quick-move into stand: %v", err)
+	}
+	stand, _ := srv.BrewingStandAt(bx, by, bz)
+	if stand.Items[0].ResolvedID() != "minecraft:potion" || stand.PotionTypes[0] != PotionSwiftness {
+		t.Fatalf("expected bottle slot 0 to hold swiftness potion after quick-move, got item=%+v pot=%q", stand.Items[0], stand.PotionTypes[0])
+	}
+
+	// Pickup-click (ContainerInputPickup) bottle slot 0 to take the potion onto cursor and grant Local Brewery.
+	if err := srv.HandleBrewingStandClick(sess, ContainerClick{
+		ContainerID: cid,
+		Slot:        0,
+		Button:      0,
+		Mode:        ContainerInputPickup,
+	}); err != nil {
+		t.Fatalf("HandleBrewingStandClick pickup from stand: %v", err)
+	}
+	if sess.CarriedItem().ResolvedID() != "minecraft:potion" || GetCarriedPotionType(sess) != PotionSwiftness {
+		t.Fatalf("expected carried item to be swiftness potion, got item=%+v pot=%q", sess.CarriedItem(), GetCarriedPotionType(sess))
+	}
+	if !sess.HasCompletedAdvancement("minecraft:nether/brew_potion") {
+		t.Fatal("taking brewed potion from stand slot 0 should grant minecraft:nether/brew_potion")
+	}
+}

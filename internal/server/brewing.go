@@ -1160,12 +1160,12 @@ func (s *Server) applyBrewingStandClickLocked(
 	bs.mu.Lock()
 	stand := s.getOrCreateBrewingStandLocked(bs, bx, by, bz)
 	stand.lastBrewer = session
-	slots := s.buildBrewingStandMenuSlots(session, bx, by, bz)
 	var slotPotions [BrewingStandMenuSlotCount]string
 	for i := 0; i < 3; i++ {
 		slotPotions[i] = stand.PotionTypes[i]
 	}
 	bs.mu.Unlock()
+	slots := s.buildBrewingStandMenuSlots(session, bx, by, bz)
 
 	for i := 0; i < 27; i++ {
 		slotPotions[5+i] = GetSlotPotionType(session, 9+i)
