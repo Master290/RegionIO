@@ -474,6 +474,16 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:netherite_chestplate", AdvancementFrameChallenge, "",
 		true, true, false, 2, 0, cNetheriteArmor, rNetheriteArmor, 100)
 
+	cBrew, rBrew := allOfCriteria("potion")
+	add("minecraft:nether/brew_potion", "minecraft:nether/root", "Local Brewery", "Brew a potion",
+		"minecraft:potion", AdvancementFrameTask, "",
+		true, true, false, 1, 1, cBrew, rBrew, 0)
+
+	cAllPotions, rAllPotions := allOfCriteria("all_effects")
+	add("minecraft:nether/all_potions", "minecraft:nether/brew_potion", "A Furious Cocktail", "Have every potion effect applied at the same time",
+		"minecraft:milk_bucket", AdvancementFrameChallenge, "",
+		true, true, false, 2, 1, cAllPotions, rAllPotions, 100)
+
 	reg := &AdvancementRegistry{
 		defs:     defs,
 		byID:     make(map[string]*AdvancementDef, len(defs)),
@@ -1118,6 +1128,53 @@ func (s *Server) TriggerDeflectedProjectile(session *PlayerSession) {
 		return
 	}
 	s.GrantCriterion(session, "minecraft:story/deflect_arrow", "deflected_projectile")
+}
+
+// TriggerBrewedPotion fires brewed_potion advancement criteria ("Local Brewery")
+// when session brews or removes a potion from a brewing stand.
+func (s *Server) TriggerBrewedPotion(session *PlayerSession, potionID string) {
+	if session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:nether/brew_potion", "potion")
+}
+
+// FuriousCocktailEffects returns the canonical list of 17 potion-brewable status
+// effects required simultaneously for "A Furious Cocktail" (minecraft:nether/all_potions).
+func FuriousCocktailEffects() []string {
+	return []string{
+		EffectSpeed,
+		EffectSlowness,
+		EffectStrength,
+		EffectJumpBoost,
+		EffectRegeneration,
+		EffectFireResistance,
+		EffectWaterBreathing,
+		EffectInvisibility,
+		EffectNightVision,
+		EffectWeakness,
+		EffectPoison,
+		EffectSlowFalling,
+		EffectResistance,
+		EffectWindCharged,
+		EffectWeaving,
+		EffectOozing,
+		EffectInfested,
+	}
+}
+
+// TriggerEffectsChanged fires effects_changed advancement criteria (such as
+// "A Furious Cocktail") whenever session's active status effects change.
+func (s *Server) TriggerEffectsChanged(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	for _, effID := range FuriousCocktailEffects() {
+		if !session.HasPlayerEffect(effID) {
+			return
+		}
+	}
+	s.GrantCriterion(session, "minecraft:nether/all_potions", "all_effects")
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---

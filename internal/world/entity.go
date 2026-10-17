@@ -10,6 +10,12 @@ import (
 // ItemEntityTypeName is the canonical entity_type identifier for dropped items.
 const ItemEntityTypeName = "minecraft:item"
 
+// ExperienceOrbEntityTypeName is the canonical entity_type identifier for XP orbs.
+const ExperienceOrbEntityTypeName = "minecraft:experience_orb"
+
+// VillagerEntityTypeName is the canonical entity_type identifier for villagers.
+const VillagerEntityTypeName = "minecraft:villager"
+
 // Entity represents an in-game movable entity (mob, animal, dropped item, etc).
 type Entity struct {
 	ID        int32
@@ -25,6 +31,8 @@ type Entity struct {
 	VelocityY  int16
 	VelocityZ  int16
 	OnGround   bool
+	Health     float32
+	MaxHealth  float32
 
 	// Item entity fields (populated when TypeName == ItemEntityTypeName).
 	Item        ItemStack
@@ -58,6 +66,16 @@ func (e *Entity) EffectiveDimension() string {
 // IsItem reports whether e is a dropped item entity.
 func (e *Entity) IsItem() bool {
 	return e != nil && (e.TypeName == ItemEntityTypeName || !e.Item.IsEmpty())
+}
+
+// IsExperienceOrb reports whether e is an experience orb entity.
+func (e *Entity) IsExperienceOrb() bool {
+	return e != nil && e.TypeName == ExperienceOrbEntityTypeName
+}
+
+// IsVillager reports whether e is a villager entity.
+func (e *Entity) IsVillager() bool {
+	return e != nil && e.TypeName == VillagerEntityTypeName
 }
 
 // BlockName returns the canonical block identifier (e.g. "minecraft:chest")

@@ -100,6 +100,9 @@ func (h *handler) beginPlay() error {
 	if err := h.sendSetHealth(snap.Health, snap.FoodLevel, snap.FoodSaturation); err != nil {
 		return err
 	}
+	if err := h.srv.SendPlayerExperience(session); err != nil {
+		return err
+	}
 	if err := h.sendCommands(); err != nil {
 		return err
 	}
@@ -256,6 +259,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 		h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
 		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
+		h.srv.PickupNearbyExperienceOrbs(h.session)
 		bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
 		h.srv.StepPressurePlateAt(h.session.Dimension(), bx, by, bz)
 		res, err := h.srv.CheckPlayerPortal(h.session)
@@ -450,8 +454,13 @@ func (h *handler) syncVisibleEntities() error {
 			if err := h.sendAddEntity(&entity); err != nil {
 				return err
 			}
-			if entity.IsItem() {
+			if entity.IsItem() && !entity.IsExperienceOrb() {
 				if err := h.conn.Send(protocol.PlaySetEntityData, server.EncodeItemEntityData(entity.ID, entity.Item)); err != nil {
+					return err
+				}
+			}
+			if entity.IsVillager() && h.srv != nil {
+				if err := h.conn.Send(protocol.PlaySetEntityData, h.srv.VillagerEntityDataPacket(entity.ID)); err != nil {
 					return err
 				}
 			}
@@ -697,13 +706,15 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case server.PlayAttackSB:
 		if h.srv != nil {
-			_ = h.srv.HandleAttackPacket(h.session, pkt.Body())
+			_ = h.srv.HandlePlayerAttackPacket(h.session, pkt.Body())
+			h.syncHotbarFromSession()
 		}
 		return nil
 
 	case server.PlayInteractSB:
 		if h.srv != nil {
-			_ = h.srv.HandleInteractPacket(h.session, pkt.Body())
+			_ = h.srv.HandlePlayerInteractPacket(h.session, pkt.Body())
+			h.syncHotbarFromSession()
 		}
 		return nil
 
@@ -745,7 +756,42 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case protocol.PlayContainerCloseSB:
 		return h.handleContainerClose(pkt)
 
-	case protocol.PlayContainerButtonClick, protocol.PlayContainerSlotStateChanged:
+	case protocol.PlayContainerButtonClick:
+		cid, btn, err := server.DecodeContainerButtonClickPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandleContainerButtonClick(h.session, cid, btn); err != nil {
+				return err
+			}
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlayRenameItem:
+		name, err := server.DecodeRenameItemPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandleRenameItem(h.session, name); err != nil {
+				return err
+			}
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlaySelectTrade:
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandleSelectTradePacket(h.session, pkt.Body()); err != nil {
+				return err
+			}
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlayContainerSlotStateChanged:
 		return nil
 
 	default:
@@ -760,7 +806,7 @@ func (h *handler) handleContainerClick(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
-		if err := h.srv.HandleContainerClick(h.session, click.ContainerID, int(click.Slot), click.Button, click.Mode); err != nil {
+		if err := h.srv.HandleMerchantContainerClick(h.session, click.ContainerID, int(click.Slot), click.Button, click.Mode); err != nil {
 			return err
 		}
 		h.syncHotbarFromSession()
@@ -774,7 +820,7 @@ func (h *handler) handleContainerClose(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
-		if err := h.srv.CloseContainer(h.session, cid, false); err != nil {
+		if err := h.srv.CloseMerchantContainer(h.session, cid, false); err != nil {
 			return err
 		}
 		h.syncHotbarFromSession()
@@ -870,6 +916,7 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 
 	if h.srv != nil {
 		if broken, _ := h.srv.BreakBlock(h.session, x, y, z, status); broken {
+			h.syncHotbarFromSession()
 			h.log.Debug("block broken", "x", x, "y", y, "z", z)
 		}
 	}

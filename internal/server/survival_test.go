@@ -407,3 +407,103 @@ func TestIntegrationHooksHungerFurnaceAndPressurePlate(t *testing.T) {
 	}
 }
 
+func TestEnchantingCombatDurabilityAndXPPersistenceHooks(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	col := &survivalPacketCollector{}
+	session, err := srv.RegisterPlayer(Profile{Name: "EnchMiner", UUID: OfflineUUID("EnchMiner")}, col.send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	if err := srv.SetPlayerGameMode(session, GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+	feetY := float64(world.FlatSurfaceY + 1)
+	srv.SetPlayerTransform(session, 8.5, feetY, 8.5, 0, 0, true)
+
+	// 1. Breaking stone with a Silk Touch pickaxe drops minecraft:stone (not cobblestone) and wears 1 durability.
+	heldSlot := world.HotbarContainerOffset
+	session.SetSelectedSlot(0)
+	session.SetInventorySlot(heldSlot, world.NewNamedItemStack("minecraft:diamond_pickaxe", 1))
+	var pickMeta ItemMeta
+	pickMeta.SetEnchantment("minecraft:silk_touch", 1)
+	SetSlotItemMeta(session, heldSlot, pickMeta)
+
+	srv.Chunks().SetBlock(8, world.FlatSurfaceY, 8, world.StateStone)
+	broken, dropID := srv.BreakBlock(session, 8, world.FlatSurfaceY, 8, PlayerActionStopDestroyBlock)
+	if !broken || dropID == 0 {
+		t.Fatalf("BreakBlock with Silk Touch pickaxe = (%v, %d), want (true, >0)", broken, dropID)
+	}
+	dropEnt := srv.Entities().Get(dropID)
+	if dropEnt == nil || dropEnt.Item.ResolvedID() != "minecraft:stone" {
+		t.Fatalf("Silk Touch drop = %+v, want minecraft:stone", dropEnt)
+	}
+	if gotDmg := GetSlotItemMeta(session, heldSlot).Damage; gotDmg != 1 {
+		t.Fatalf("pickaxe durability damage after BreakBlock = %d, want 1", gotDmg)
+	}
+
+	// 2. Equipping Feather Falling IV boots reduces fall damage in HandlePlayerFall / DamagePlayer and wears armor durability.
+	session.SetInventorySlot(ArmorSlotFeet, world.NewNamedItemStack("minecraft:diamond_boots", 1))
+	var bootsMeta ItemMeta
+	bootsMeta.SetEnchantment("minecraft:feather_falling", 4) // EPF = 12 -> 48% reduction
+	SetSlotItemMeta(session, ArmorSlotFeet, bootsMeta)
+
+	srv.HandlePlayerFall(session, 75.0, 68.0, true, false)
+	fallDmg := srv.HandlePlayerFall(session, 68.0, 62.0, false, true) // 13 blocks -> base 10.0, reduced by 48% -> 5.2
+	if fallDmg >= 6.0 || fallDmg <= 5.0 {
+		t.Fatalf("fall damage with Feather Falling IV = %v, want ~5.2", fallDmg)
+	}
+	if gotBootsDmg := GetSlotItemMeta(session, ArmorSlotFeet).Damage; gotBootsDmg != 1 {
+		t.Fatalf("boots durability damage after fall = %d, want 1", gotBootsDmg)
+	}
+
+	// 3. Weapon enchantment attack bonus (Sharpness V = +3.0) and weapon durability wear in AttackEntityWithEnchantments.
+	session.SetInventorySlot(heldSlot, world.NewNamedItemStack("minecraft:diamond_sword", 1)) // 7.0 base
+	var swordMeta ItemMeta
+	swordMeta.SetEnchantment("minecraft:sharpness", 5) // +3.0 -> 10.0 total, one-shots a 10 HP pig
+	SetSlotItemMeta(session, heldSlot, swordMeta)
+	session.SetAttackStrengthTicks(30)
+
+	pigID := srv.Entities().Add(&world.Entity{
+		TypeName: MobTypePig,
+		X:        8.5,
+		Y:        feetY,
+		Z:        10.0,
+		OnGround: true,
+	})
+	dealt, killed := srv.AttackEntityWithEnchantments(session, pigID)
+	if !killed || dealt < 9.9 {
+		t.Fatalf("AttackEntityWithEnchantments with Sharpness V diamond sword: dealt=%v killed=%v, want >=10.0 & true", dealt, killed)
+	}
+	if gotSwordDmg := GetSlotItemMeta(session, heldSlot).Damage; gotSwordDmg != 1 {
+		t.Fatalf("sword durability damage after attack = %d, want 1", gotSwordDmg)
+	}
+
+	// 4. XP persistence round-trip in PlayerData and ApplyPlayerData.
+	if err := srv.AddPlayerExperience(session, 200); err != nil {
+		t.Fatalf("AddPlayerExperience: %v", err)
+	}
+	session.SetEnchantmentSeed(777888)
+	savedComp := world.PlayerDataToCompound(session.PlayerData())
+	restoredData, err := world.PlayerDataFromCompound(savedComp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	if restoredData.XpTotal != session.TotalExperience() || restoredData.XpLevel != session.ExperienceLevel() || restoredData.XpSeed != 777888 {
+		t.Fatalf("restored XP = (lvl=%d, tot=%d, seed=%d), want (%d, %d, 777888)",
+			restoredData.XpLevel, restoredData.XpTotal, restoredData.XpSeed,
+			session.ExperienceLevel(), session.TotalExperience())
+	}
+
+	session2, err := srv.RegisterPlayer(Profile{Name: "EnchMiner2", UUID: OfflineUUID("EnchMiner2")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(2): %v", err)
+	}
+	session2.ApplyPlayerData(restoredData)
+	if session2.TotalExperience() != session.TotalExperience() || session2.ExperienceLevel() != session.ExperienceLevel() || session2.EnchantmentSeed() != 777888 {
+		t.Fatalf("ApplyPlayerData XP = (lvl=%d, tot=%d, seed=%d), want (%d, %d, 777888)",
+			session2.ExperienceLevel(), session2.TotalExperience(), session2.EnchantmentSeed(),
+			session.ExperienceLevel(), session.TotalExperience())
+	}
+}
+
+

@@ -351,6 +351,12 @@ func EncodeDimensionRespawnPacket(dim string, gameMode uint8, hashedSeed int64, 
 // BroadcastDimensionChunk sends a packet only to players in dim whose chunk
 // view contains (cx, cz).
 func (s *Server) BroadcastDimensionChunk(dim string, cx, cz int32, id int32, body []byte) {
+	s.BroadcastDimensionChunkExcept(dim, cx, cz, [16]byte{}, id, body)
+}
+
+// BroadcastDimensionChunkExcept sends a packet to players in dim whose chunk
+// view contains (cx, cz), excluding the player with exceptUUID.
+func (s *Server) BroadcastDimensionChunkExcept(dim string, cx, cz int32, exceptUUID [16]byte, id int32, body []byte) {
 	if s == nil {
 		return
 	}
@@ -363,6 +369,9 @@ func (s *Server) BroadcastDimensionChunk(dim string, cx, cz int32, id int32, bod
 	s.playersMu.RUnlock()
 
 	for _, player := range players {
+		if exceptUUID != ([16]byte{}) && player.Profile.UUID == exceptUUID {
+			continue
+		}
 		if player.Dimension() != normDim {
 			continue
 		}

@@ -347,12 +347,188 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 
 	if mode == GameModeSurvival {
 		s.RecordBlockBreakExhaustion(session)
-		if drop, ok := world.BlockDropItem(prevState); ok {
+		var toolMeta ItemMeta
+		heldSlot := session.HeldInventorySlot()
+		if session != nil && heldSlot >= 0 {
+			toolMeta = GetSlotItemMeta(session, heldSlot)
+			if !world.IsInstantBreakBlock(prevState) {
+				s.DamagePlayerItem(session, heldSlot, 1)
+			}
+		}
+		if drop, ok := ApplyBlockDropEnchantments(prevState, toolMeta, nil); ok {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
 			return true, dropID
 		}
 	}
 	return true, 0
+}
+
+// HeldInventorySlot returns the container slot index (36..44, or fallback 0..8)
+// of the player's currently selected hotbar slot, or -1 if session is nil.
+func (session *PlayerSession) HeldInventorySlot() int {
+	if session == nil {
+		return -1
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	sel := int(session.selectedSlot)
+	if sel < 0 || sel >= world.HotbarSlotCount {
+		sel = 0
+	}
+	slot := world.HotbarContainerOffset + sel
+	if session.inventory[slot].IsEmpty() && !session.inventory[sel].IsEmpty() {
+		return sel
+	}
+	return slot
+}
+
+// HeldItemMeta returns the ItemMeta (enchantments, durability damage, custom name)
+// associated with the player's currently held hotbar slot.
+func (session *PlayerSession) HeldItemMeta() ItemMeta {
+	slot := session.HeldInventorySlot()
+	if slot < 0 {
+		return ItemMeta{}
+	}
+	return GetSlotItemMeta(session, slot)
+}
+
+// ArmorEnchantmentProtection returns the fraction of damage (in [0, 0.80]) absorbed
+// by enchantments on the player's equipped armor pieces (slots 5..8) for cause.
+func (session *PlayerSession) ArmorEnchantmentProtection(cause string) float32 {
+	if session == nil {
+		return 0
+	}
+	var armorMetas []ItemMeta
+	for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
+		if !session.InventorySlot(slot).IsEmpty() {
+			armorMetas = append(armorMetas, GetSlotItemMeta(session, slot))
+		}
+	}
+	if len(armorMetas) == 0 {
+		return 0
+	}
+	return EnchantmentArmorProtection(armorMetas, cause)
+}
+
+// PlayerWeaponAttackBonus returns the extra melee damage granted by enchantments
+// (Sharpness, Smite, Bane of Arthropods) on session's held weapon against targetEntityType.
+func (s *Server) PlayerWeaponAttackBonus(session *PlayerSession, targetEntityType string) float32 {
+	if session == nil {
+		return 0
+	}
+	return EnchantmentAttackBonus(session.HeldItemMeta(), targetEntityType)
+}
+
+// DamageHeldItem applies durability wear to session's currently held item when in
+// survival mode (respecting Unbreaking and removing the item if it breaks).
+func (s *Server) DamageHeldItem(session *PlayerSession, amount int32) bool {
+	if s == nil || session == nil || amount <= 0 {
+		return false
+	}
+	if session.Snapshot().GameMode != GameModeSurvival {
+		return false
+	}
+	slot := session.HeldInventorySlot()
+	if slot < 0 {
+		return false
+	}
+	return s.DamagePlayerItem(session, slot, amount)
+}
+
+// AttackEntityWithEnchantments performs a melee attack against targetEntityID,
+// applying weapon enchantment bonus damage (Sharpness/Smite/Bane of Arthropods),
+// wearing the held weapon's durability in survival mode, and spawning XP orbs on kill.
+func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEntityID int32) (dealtDamage float32, killed bool) {
+	if s == nil || s.entities == nil || session == nil || session.IsDead() {
+		return 0, false
+	}
+	target := s.entities.Get(targetEntityID)
+	if target == nil || target.IsItem() {
+		return 0, false
+	}
+	scale := session.CurrentAttackStrengthScale(0.5)
+	bonus := s.PlayerWeaponAttackBonus(session, target.TypeName) * scale
+
+	dealt, killed := s.AttackEntity(session, targetEntityID)
+	if dealt <= 0 {
+		return 0, false
+	}
+	s.DamageHeldItem(session, 1)
+
+	if bonus > 0 {
+		dealt += bonus
+		chunkPos := target.ChunkPos()
+		s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, PlayAnimateCB,
+			EncodeAnimatePacket(target.ID, AnimateMagicCriticalHit))
+		if !killed {
+			rem := s.MobHealth(targetEntityID) - bonus
+			if rem > 0 {
+				s.SetMobHealth(targetEntityID, rem)
+			} else {
+				killed = true
+				s.SetMobHealth(targetEntityID, 0)
+				deathSnd, deathSrc := mobDeathSound(target.TypeName)
+				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, PlaySoundPacketID,
+					EncodeSoundPacket(deathSnd, deathSrc, target.X, target.Y, target.Z, 1.0, 1.0, 0))
+				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, protocol.PlayEntityEvent,
+					EncodeEntityEventPacket(target.ID, EntityEventDeath))
+				s.entities.Remove(target.ID)
+				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
+					encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
+				for _, drop := range MobLootDrops(target.TypeName, nil) {
+					s.SpawnItemEntityInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, drop)
+				}
+			}
+		}
+	}
+	if killed {
+		if xp := mobKillXPPoints(target.TypeName); xp > 0 {
+			s.SpawnExperienceOrbsInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, xp)
+		}
+	}
+	return dealt, killed
+}
+
+func mobKillXPPoints(typeName string) int32 {
+	switch normalizeFoodItemID(typeName) {
+	case MobTypeZombie, "minecraft:skeleton", "minecraft:spider", "minecraft:creeper", "minecraft:enderman":
+		return 5
+	case MobTypePig, "minecraft:cow", "minecraft:sheep", "minecraft:chicken":
+		return 2
+	default:
+		return 0
+	}
+}
+
+// HandlePlayerAttackPacket decodes a 26.1.2 serverbound attack (0x01) packet and
+// executes an enchantment-aware melee attack against the target entity.
+func (s *Server) HandlePlayerAttackPacket(session *PlayerSession, r *protocol.Reader) error {
+	entityID, err := r.VarInt()
+	if err != nil {
+		return err
+	}
+	if s != nil && session != nil {
+		s.AttackEntityWithEnchantments(session, entityID)
+	}
+	return nil
+}
+
+// HandlePlayerInteractPacket decodes a serverbound interact (0x1a) packet and
+// executes an enchantment-aware melee attack when Action == InteractActionAttack,
+// or right-click entity interaction (e.g. opening villager trading UI) otherwise.
+func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.Reader) error {
+	pkt, err := DecodeInteractPacket(r)
+	if err != nil {
+		return err
+	}
+	if s != nil && session != nil {
+		if pkt.Action == InteractActionAttack {
+			s.AttackEntityWithEnchantments(session, pkt.EntityID)
+		} else if pkt.Hand == 0 {
+			_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+		}
+	}
+	return nil
 }
 
 func (s *Server) broadcastBlockAndLightUpdate(x, y, z int, state uint16, lightChunks []world.ChunkPos) {
@@ -454,7 +630,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 	var totalPickedUp int32
 	for i := range nearby {
 		ent := &nearby[i]
-		if !ent.IsItem() || ent.PickupDelay > 0 || ent.Item.IsEmpty() {
+		if !ent.IsItem() || ent.IsExperienceOrb() || ent.PickupDelay > 0 || ent.Item.IsEmpty() {
 			continue
 		}
 		if ent.EffectiveDimension() != playerDim {
@@ -467,7 +643,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		}
 		// Re-fetch under lock to ensure the entity wasn't already picked up.
 		live := s.entities.Get(ent.ID)
-		if live == nil || !live.IsItem() || live.PickupDelay > 0 || live.Item.IsEmpty() || live.EffectiveDimension() != playerDim {
+		if live == nil || !live.IsItem() || live.IsExperienceOrb() || live.PickupDelay > 0 || live.Item.IsEmpty() || live.EffectiveDimension() != playerDim {
 			continue
 		}
 
@@ -513,6 +689,13 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		return false
 	}
 
+	if prot := session.ArmorEnchantmentProtection(cause); prot > 0 {
+		amount *= 1.0 - prot
+		if amount <= 0 {
+			return false
+		}
+	}
+
 	dim := session.Dimension()
 	session.mu.Lock()
 	if session.gameMode == GameModeCreative || session.gameMode == GameModeSpectator {
@@ -537,6 +720,14 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	pos := session.position
 	send := session.send
 	session.mu.Unlock()
+
+	if cause != "starve" && cause != "void" && cause != "out_of_world" {
+		for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
+			if !session.InventorySlot(slot).IsEmpty() {
+				s.DamagePlayerItem(session, slot, 1)
+			}
+		}
+	}
 
 	if died {
 		st := getSurvivalState(session)
@@ -617,8 +808,9 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	if damage <= 0 {
 		return 0
 	}
+	prot := session.ArmorEnchantmentProtection("fall")
 	s.DamagePlayer(session, damage, "fall")
-	return damage
+	return damage * (1.0 - prot)
 }
 
 // RespawnPlayer restores a dead (or respawning) player's health and hunger to

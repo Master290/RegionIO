@@ -95,8 +95,10 @@ const (
 	PlayEntityEvent         = 0x22
 	PlayHurtAnimation       = 0x2a
 	PlayOpenScreen          = 0x3b
+	PlayMerchantOffers      = 0x34
 	PlayPlayerCombatKill    = 0x44
 	PlayRespawn             = 0x52
+	PlaySetExperience       = 0x67
 
 	// Entity packets
 	PlayAddEntity        = 0x01
@@ -114,6 +116,7 @@ const (
 // Play, serverbound (protocol 775).
 const (
 	PlayAcceptTeleport            = 0x00
+	PlayAttack                    = 0x01
 	PlayChatCommand               = 0x07
 	PlayChatCommandSigned         = 0x08
 	PlayClientCommand             = 0x0c
@@ -121,6 +124,7 @@ const (
 	PlayContainerClick            = 0x12
 	PlayContainerCloseSB          = 0x13
 	PlayContainerSlotStateChanged = 0x14
+	PlayInteract                  = 0x1a
 	PlayKeepAliveServer           = 0x1c
 	PlayClientTickEnd             = 0x0d
 	PlayClientInformation         = 0x0e
@@ -131,10 +135,20 @@ const (
 	PlayMoveStatusOnly            = 0x21
 	PlayPlayerLoaded              = 0x2c
 	PlayPlayerAction              = 0x29
+	PlayPlayerCommand             = 0x2a
+	PlayRenameItem                = 0x30
+	PlaySelectTrade               = 0x33
 	PlayUseItemOn                 = 0x42
+	PlayUseItem                   = 0x43
 	PlaySetCreativeSlot           = 0x38
 	PlaySetCarriedItem            = 0x35
 	PlayChatMessage               = 0x09
+)
+
+// Built-in entity_type registry IDs (protocol 775).
+const (
+	EntityTypeExperienceOrb = 44
+	EntityTypeVillager      = 139
 )
 
 // GameEvent sub-IDs carried by the clientbound game_event packet.

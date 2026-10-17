@@ -488,6 +488,16 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	session.SetDimension(d.Dimension)
 	session.SetFoodExhaustion(d.FoodExhaustion)
 	session.SetFoodTickTimer(d.FoodTickTimer)
+	if st := getPlayerXPState(session); st != nil {
+		st.mu.Lock()
+		st.level = d.XpLevel
+		st.totalXP = d.XpTotal
+		st.progress = d.XpP
+		if d.XpSeed != 0 {
+			st.enchantSeed = d.XpSeed
+		}
+		st.mu.Unlock()
+	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	session.position = d.Pos
@@ -524,6 +534,58 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	session.hasSpawn = d.HasSpawn
 }
 
+// WriteExperienceNBT writes the player's experience level, total XP, progress,
+// and enchantment seed into a playerdata NBT root compound.
+func (session *PlayerSession) WriteExperienceNBT(root *nbt.Compound) {
+	if session == nil || root == nil {
+		return
+	}
+	lvl, total, prog := session.Experience()
+	seed := session.EnchantmentSeed()
+	root.Set("XpLevel", nbt.Int(lvl))
+	root.Set("XpTotal", nbt.Int(total))
+	root.Set("XpP", nbt.Float(prog))
+	root.Set("XpSeed", nbt.Int(seed))
+}
+
+// ReadExperienceNBT restores the player's experience level, total XP, progress,
+// and enchantment seed from a playerdata NBT root compound.
+func (session *PlayerSession) ReadExperienceNBT(root *nbt.Compound) {
+	if session == nil || root == nil {
+		return
+	}
+	st := getPlayerXPState(session)
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if t, ok := root.Get("XpLevel"); ok {
+		if v, ok := t.(nbt.Int); ok && v >= 0 {
+			st.level = int32(v)
+		}
+	}
+	if t, ok := root.Get("XpTotal"); ok {
+		if v, ok := t.(nbt.Int); ok && v >= 0 {
+			st.totalXP = int32(v)
+		}
+	}
+	if t, ok := root.Get("XpP"); ok {
+		if v, ok := t.(nbt.Float); ok && v >= 0 {
+			p := float32(v)
+			if p > 1 {
+				p = 1
+			}
+			st.progress = p
+		}
+	}
+	if t, ok := root.Get("XpSeed"); ok {
+		if v, ok := t.(nbt.Int); ok && v != 0 {
+			st.enchantSeed = int32(v)
+		}
+	}
+}
+
 // PlayerData exports a consistent copy of the session's state for persistence.
 func (session *PlayerSession) PlayerData() world.PlayerData {
 	if session == nil {
@@ -532,6 +594,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	dim := session.Dimension()
 	exhaustion := session.FoodExhaustion()
 	tickTimer := session.FoodTickTimer()
+	xpLevel, xpTotal, xpP := session.Experience()
+	xpSeed := session.EnchantmentSeed()
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -546,6 +610,10 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		FoodSaturation: session.foodSaturation,
 		FoodExhaustion: exhaustion,
 		FoodTickTimer:  tickTimer,
+		XpLevel:        xpLevel,
+		XpTotal:        xpTotal,
+		XpP:            xpP,
+		XpSeed:         xpSeed,
 		SelectedSlot:   session.selectedSlot,
 		Inventory:      session.inventory,
 		SpawnX:         session.spawnX,
