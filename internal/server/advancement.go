@@ -270,7 +270,13 @@ func canonicalAdvancementID(id string) string {
 		return ""
 	}
 	if !strings.Contains(id, ":") {
-		return "minecraft:" + id
+		id = "minecraft:" + id
+	}
+	switch id {
+	case "minecraft:nether/construct_beacon", "minecraft:construct_beacon", "minecraft:create_beacon":
+		return "minecraft:nether/create_beacon"
+	case "minecraft:create_full_beacon":
+		return "minecraft:nether/create_full_beacon"
 	}
 	return id
 }
@@ -507,6 +513,16 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 	add("minecraft:nether/all_potions", "minecraft:nether/brew_potion", "A Furious Cocktail", "Have every potion effect applied at the same time",
 		"minecraft:milk_bucket", AdvancementFrameChallenge, "",
 		true, true, false, 2, 1, cAllPotions, rAllPotions, 100)
+
+	cCreateBeacon, rCreateBeacon := allOfCriteria("construct_beacon")
+	add("minecraft:nether/create_beacon", "minecraft:nether/root", "Bring Home the Beacon", "Construct and place a Beacon",
+		"minecraft:beacon", AdvancementFrameTask, "",
+		true, true, false, 1, 2, cCreateBeacon, rCreateBeacon, 0)
+
+	cFullBeacon, rFullBeacon := allOfCriteria("construct_beacon")
+	add("minecraft:nether/create_full_beacon", "minecraft:nether/create_beacon", "Beaconator", "Bring a Beacon to full power",
+		"minecraft:beacon", AdvancementFrameGoal, "",
+		true, true, false, 2, 2, cFullBeacon, rFullBeacon, 0)
 
 	reg := &AdvancementRegistry{
 		defs:     defs,
@@ -1240,6 +1256,20 @@ func (s *Server) TriggerHeroOfTheVillage(session *PlayerSession) {
 		return
 	}
 	s.GrantCriterion(session, "minecraft:adventure/hero_of_the_village", "hero_of_the_village")
+}
+
+// TriggerConstructBeacon fires the "Bring Home the Beacon"
+// (minecraft:nether/create_beacon) advancement when a beacon activates at
+// level >= 1, and "Beaconator" (minecraft:nether/create_full_beacon) when a
+// beacon reaches full power (level >= 4).
+func (s *Server) TriggerConstructBeacon(session *PlayerSession, level int) {
+	if session == nil || level <= 0 {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:nether/create_beacon", "construct_beacon")
+	if level >= 4 {
+		s.GrantCriterion(session, "minecraft:nether/create_full_beacon", "construct_beacon")
+	}
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---
