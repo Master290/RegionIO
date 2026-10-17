@@ -105,19 +105,24 @@ type viewerTarget struct {
 type EntityTracker struct {
 	mu             sync.Mutex
 	viewers        map[[16]byte]*viewerEntityState
+	mobStates      map[int32]*mobMemory
 	viewerBuf      []viewerTarget
+	playerTargets  []playerTarget
 	allEntitiesBuf []world.Entity
 	visibleBuf     []world.Entity
 	removeBuf      []int32
 	pktBuf         []byte
 	tickID         uint64
+	aiTickID       uint64
 }
 
 // NewEntityTracker constructs an EntityTracker with preallocated scratch buffers.
 func NewEntityTracker() *EntityTracker {
 	return &EntityTracker{
 		viewers:        make(map[[16]byte]*viewerEntityState),
+		mobStates:      make(map[int32]*mobMemory),
 		viewerBuf:      make([]viewerTarget, 0, 16),
+		playerTargets:  make([]playerTarget, 0, 16),
 		allEntitiesBuf: make([]world.Entity, 0, 64),
 		visibleBuf:     make([]world.Entity, 0, 64),
 		removeBuf:      make([]int32, 0, 32),
@@ -142,68 +147,105 @@ func (t *EntityTracker) Sync(s *Server) {
 }
 
 func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
-	t.viewerBuf = s.appendViewerTargets(t.viewerBuf[:0])
+	t.aiTickID++
+	aiTick := t.aiTickID
+	t.playerTargets = s.appendPlayerTargets(t.playerTargets[:0])
 	t.allEntitiesBuf = s.entities.AppendAll(t.allEntitiesBuf[:0])
 
 	for i := range t.allEntitiesBuf {
 		snapshot := t.allEntitiesBuf[i]
 		yBelow := int(math.Floor(snapshot.Y - 0.1))
 		blockBelow := s.chunks.GetBlock(int(math.Floor(snapshot.X)), yBelow, int(math.Floor(snapshot.Z)))
-		nearestX, nearestZ, hasPlayer := nearestViewerXZ(t.viewerBuf, snapshot.X, snapshot.Y, snapshot.Z)
 
-		s.entities.Update(snapshot.ID, func(e *world.Entity) {
-			if blockBelow == world.StateAir || blockBelow == world.StateWater {
+		if snapshot.IsItem() {
+			s.entities.Update(snapshot.ID, func(e *world.Entity) {
+				if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
+					e.OnGround = false
+					e.VelocityY -= 80
+					if e.VelocityY < -3000 {
+						e.VelocityY = -3000
+					}
+					e.Y += float64(e.VelocityY) / 8000.0
+				} else {
+					e.OnGround = true
+					e.VelocityY = 0
+					e.Y = float64(yBelow + 1)
+				}
+				if e.PickupDelay > 0 {
+					e.PickupDelay--
+				}
+				e.Age++
+			})
+			continue
+		}
+
+		mem := t.mobStateFor(snapshot.ID, aiTick)
+		if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
+			if mem.attackCooldown > 0 {
+				mem.attackCooldown--
+			}
+			s.entities.Update(snapshot.ID, func(e *world.Entity) {
 				e.OnGround = false
 				e.VelocityY -= 80
 				if e.VelocityY < -3000 {
 					e.VelocityY = -3000
 				}
-			} else {
-				e.OnGround = true
-				e.VelocityY = 0
-				e.Y = float64(yBelow + 1)
-
-				if hasPlayer && e.TypeName == "minecraft:zombie" {
-					dx := nearestX - e.X
-					dz := nearestZ - e.Z
-					dist := math.Sqrt(dx*dx + dz*dz)
-					if dist > 1.0 && dist < 32.0 {
-						e.X += (dx / dist) * 0.15
-						e.Z += (dz / dist) * 0.15
-						e.Yaw = float32(math.Atan2(-dx, dz) * (180 / math.Pi))
-						e.HeadYaw = e.Yaw
-					}
-				} else if rng != nil {
-					e.X += (rng.Float64() - 0.5) * 0.2
-					e.Z += (rng.Float64() - 0.5) * 0.2
-					e.Yaw += float32((rng.Float64() - 0.5) * 10.0)
-					e.HeadYaw = e.Yaw
-				}
-			}
-
-			if e.VelocityY != 0 {
 				e.Y += float64(e.VelocityY) / 8000.0
-			}
-		})
-	}
-}
+			})
+			continue
+		}
 
-func nearestViewerXZ(viewers []viewerTarget, x, y, z float64) (nx, nz float64, ok bool) {
-	minDist := -1.0
-	for i := range viewers {
-		v := &viewers[i]
-		dx := v.x - x
-		dy := v.y - y
-		dz := v.z - z
-		dist := dx*dx + dy*dy + dz*dz
-		if minDist < 0 || dist < minDist {
-			minDist = dist
-			nx = v.x
-			nz = v.z
-			ok = true
+		feetY := yBelow + 1
+		var (
+			nextX        = snapshot.X
+			nextY        = float64(feetY)
+			nextZ        = snapshot.Z
+			nextYaw      = snapshot.Yaw
+			attackTarget *PlayerSession
+		)
+		if IsHostileMob(snapshot.TypeName) {
+			nextX, nextY, nextZ, nextYaw, attackTarget = stepHostileZombieAI(
+				s.chunks,
+				rng,
+				mem,
+				t.playerTargets,
+				snapshot.X,
+				feetY,
+				snapshot.Z,
+				snapshot.Yaw,
+			)
+		} else {
+			if mem.repathCooldown > 0 {
+				mem.repathCooldown--
+			}
+			nextX, nextY, nextZ, nextYaw = stepWanderAI(
+				s.chunks,
+				rng,
+				mem,
+				snapshot.X,
+				feetY,
+				snapshot.Z,
+				snapshot.Yaw,
+				PigWanderSpeed,
+			)
+		}
+
+		s.entities.Update(snapshot.ID, func(e *world.Entity) {
+			e.OnGround = true
+			e.VelocityY = 0
+			e.X = nextX
+			e.Y = nextY
+			e.Z = nextZ
+			e.Yaw = nextYaw
+			e.HeadYaw = nextYaw
+		})
+
+		if attackTarget != nil && !attackTarget.IsDead() {
+			s.DamagePlayer(attackTarget, ZombieAttackDamage, "zombie")
 		}
 	}
-	return nx, nz, ok
+
+	t.pruneMobStates(aiTick)
 }
 
 func (s *Server) appendViewerTargets(dst []viewerTarget) []viewerTarget {
