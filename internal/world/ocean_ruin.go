@@ -42,8 +42,12 @@ const (
 // oceanRuinPieceSpec is one child piece of a start: template resource path and
 // its BlockRotProcessor integrity.
 type oceanRuinPieceSpec struct {
-	Template  string
-	Integrity float32
+	Template     string
+	Integrity    float32
+	HasCustomPos bool
+	X, Z         int
+	Rotation     int32
+	IsLarge      bool
 }
 
 // OceanRuinStub is one ocean-ruin start decided by OceanRuinGenerationPoint.
@@ -58,10 +62,10 @@ type OceanRuinStub struct {
 
 var (
 	ruinTemplateArrays = map[string][]string{
-		"warm":  {"warm_1", "warm_2", "warm_3", "warm_4", "warm_5", "warm_6", "warm_7", "warm_8"},
-		"brick": {"brick_1", "brick_2", "brick_3", "brick_4", "brick_5", "brick_6", "brick_7", "brick_8"},
-		"cracked": {"cracked_1", "cracked_2", "cracked_3", "cracked_4", "cracked_5", "cracked_6", "cracked_7", "cracked_8"},
-		"mossy":  {"mossy_1", "mossy_2", "mossy_3", "mossy_4", "mossy_5", "mossy_6", "mossy_7", "mossy_8"},
+		"warm":        {"warm_1", "warm_2", "warm_3", "warm_4", "warm_5", "warm_6", "warm_7", "warm_8"},
+		"brick":       {"brick_1", "brick_2", "brick_3", "brick_4", "brick_5", "brick_6", "brick_7", "brick_8"},
+		"cracked":     {"cracked_1", "cracked_2", "cracked_3", "cracked_4", "cracked_5", "cracked_6", "cracked_7", "cracked_8"},
+		"mossy":       {"mossy_1", "mossy_2", "mossy_3", "mossy_4", "mossy_5", "mossy_6", "mossy_7", "mossy_8"},
 		"big_brick":   {"big_brick_1", "big_brick_2", "big_brick_3", "big_brick_8"},
 		"big_cracked": {"big_cracked_1", "big_cracked_2", "big_cracked_3", "big_cracked_8"},
 		"big_mossy":   {"big_mossy_1", "big_mossy_2", "big_mossy_3", "big_mossy_8"},
@@ -118,6 +122,35 @@ func OceanRuinGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	return nil, nil, nil
 }
 
+func appendOceanRuinPiece(stub *OceanRuinStub, random *worldgen.Legacy, biomeType string, isLarge bool, integrity float32, customPos bool, px, pz int, rot int32) {
+	switch biomeType {
+	case "cold":
+		bricks := ruinTemplateArrays["brick"]
+		if isLarge {
+			bricks = ruinTemplateArrays["big_brick"]
+		}
+		i := int(random.NextIntN(int32(len(bricks))))
+		stub.Pieces = append(stub.Pieces,
+			oceanRuinPieceSpec{Template: "underwater_ruin/" + bricks[i], Integrity: integrity, HasCustomPos: customPos, X: px, Z: pz, Rotation: rot, IsLarge: isLarge},
+			oceanRuinPieceSpec{Template: "underwater_ruin/" + ruinTemplateArrays[ternary(isLarge, "big_cracked", "cracked")][i], Integrity: 0.7, HasCustomPos: customPos, X: px, Z: pz, Rotation: rot, IsLarge: isLarge},
+			oceanRuinPieceSpec{Template: "underwater_ruin/" + ruinTemplateArrays[ternary(isLarge, "big_mossy", "mossy")][i], Integrity: 0.5, HasCustomPos: customPos, X: px, Z: pz, Rotation: rot, IsLarge: isLarge},
+		)
+	case "warm":
+		wa := ruinTemplateArrays["warm"]
+		if isLarge {
+			wa = ruinTemplateArrays["big_warm"]
+		}
+		i := int(random.NextIntN(int32(len(wa))))
+		stub.Pieces = append(stub.Pieces,
+			oceanRuinPieceSpec{Template: "underwater_ruin/" + wa[i], Integrity: integrity, HasCustomPos: customPos, X: px, Z: pz, Rotation: rot, IsLarge: isLarge},
+		)
+	}
+}
+
+func oceanRuinNextInt(random *worldgen.Legacy, minVal, maxVal int) int {
+	return int(random.NextIntN(int32(maxVal-minVal+1))) + minVal
+}
+
 func oceanRuinVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, def *worldgen.StructureDef, random *worldgen.Legacy, baseX, baseZ int) *OceanRuinStub {
 	rotation := int(random.NextIntN(4))
 	isLarge := random.NextFloat() <= oceanRuinLargeProbability
@@ -129,47 +162,74 @@ func oceanRuinVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Structu
 	if biomeType == "" {
 		biomeType = "cold"
 	}
-	stub := &OceanRuinStub{Rotation: int32(rotation), BiomeType: biomeType, IsLarge: isLarge, X: baseX, Z: baseZ}
-	switch biomeType {
-	case "cold":
-		bricks := ruinTemplateArrays["brick"]
-		if isLarge {
-			bricks = ruinTemplateArrays["big_brick"]
-		}
-		i := int(random.NextIntN(int32(len(bricks))))
-		stub.Pieces = []oceanRuinPieceSpec{
-			{Template: "underwater_ruin/" + bricks[i], Integrity: integrity},
-			{Template: "underwater_ruin/" + ruinTemplateArrays[ternary(isLarge, "big_cracked", "cracked")][i], Integrity: 0.7},
-			{Template: "underwater_ruin/" + ruinTemplateArrays[ternary(isLarge, "big_mossy", "mossy")][i], Integrity: 0.5},
-		}
-	case "warm":
-		wa := ruinTemplateArrays["warm"]
-		if isLarge {
-			wa = ruinTemplateArrays["big_warm"]
-		}
-		i := int(random.NextIntN(int32(len(wa))))
-		stub.Pieces = []oceanRuinPieceSpec{{Template: "underwater_ruin/" + wa[i], Integrity: integrity}}
-	default:
+	if biomeType != "cold" && biomeType != "warm" {
 		return nil
 	}
-	_ = oceanRuinClusterProbability // cluster ruins deferred until a large fixture appears
+	stub := &OceanRuinStub{Rotation: int32(rotation), BiomeType: biomeType, IsLarge: isLarge, X: baseX, Z: baseZ}
+	appendOceanRuinPiece(stub, random, biomeType, isLarge, integrity, false, baseX, baseZ, int32(rotation))
+
+	if isLarge && random.NextFloat() <= oceanRuinClusterProbability {
+		far := worldgen.TransformBlockPos([3]int{15, 0, 15}, "none", rotation, [3]int{0, 0, 0})
+		farX, farZ := baseX+far[0], baseZ+far[2]
+		largeBB := msBox{
+			minX: minInt(baseX, farX),
+			minY: 90,
+			minZ: minInt(baseZ, farZ),
+			maxX: maxInt(baseX, farX),
+			maxY: 90,
+			maxZ: maxInt(baseZ, farZ),
+		}
+		minX, minZ := largeBB.minX, largeBB.minZ
+		candidates := [][2]int{
+			{minX - 16 + oceanRuinNextInt(random, 1, 8), minZ + 16 + oceanRuinNextInt(random, 1, 7)},
+			{minX - 16 + oceanRuinNextInt(random, 1, 8), minZ + oceanRuinNextInt(random, 1, 7)},
+			{minX - 16 + oceanRuinNextInt(random, 1, 8), minZ - 16 + oceanRuinNextInt(random, 4, 8)},
+			{minX + oceanRuinNextInt(random, 1, 7), minZ + 16 + oceanRuinNextInt(random, 1, 7)},
+			{minX + oceanRuinNextInt(random, 1, 7), minZ - 16 + oceanRuinNextInt(random, 4, 6)},
+			{minX + 16 + oceanRuinNextInt(random, 1, 7), minZ + 16 + oceanRuinNextInt(random, 3, 8)},
+			{minX + 16 + oceanRuinNextInt(random, 1, 7), minZ + oceanRuinNextInt(random, 1, 7)},
+			{minX + 16 + oceanRuinNextInt(random, 1, 7), minZ - 16 + oceanRuinNextInt(random, 4, 8)},
+		}
+		clusterCount := oceanRuinNextInt(random, 4, 8)
+		for i := 0; i < clusterCount && len(candidates) > 0; i++ {
+			idx := int(random.NextIntN(int32(len(candidates))))
+			cPos := candidates[idx]
+			candidates = append(candidates[:idx], candidates[idx+1:]...)
+			cRot := int(random.NextIntN(4))
+			cFar := worldgen.TransformBlockPos([3]int{5, 0, 6}, "none", cRot, [3]int{0, 0, 0})
+			cFarX, cFarZ := cPos[0]+cFar[0], cPos[1]+cFar[2]
+			clusterBB := msBox{
+				minX: minInt(cPos[0], cFarX),
+				minY: 90,
+				minZ: minInt(cPos[1], cFarZ),
+				maxX: maxInt(cPos[0], cFarX),
+				maxY: 90,
+				maxZ: maxInt(cPos[1], cFarZ),
+			}
+			if !msBoxesIntersect(clusterBB, largeBB) {
+				appendOceanRuinPiece(stub, random, biomeType, false, 0.8, true, cPos[0], cPos[1], int32(cRot))
+			}
+		}
+	}
 
 	// findValidGenerationPoint filters by the 3D noise biome at the start
 	// position (here the piece base position, y=90) after every draw, exactly
 	// like the portal replay: the climate sampler reads quarter coordinates,
 	// so the position snaps to the 4-block lattice.
-	qx, qz := (baseX>>2)<<2, (baseZ>>2)<<2
-	s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
-	biomeAtStub := biomeNameByID(BiomeAt3D(od, s2D, qx, (90>>2)<<2, qz))
-	allowed := false
-	for _, name := range sets.BiomesFor(def) {
-		if name == biomeAtStub {
-			allowed = true
-			break
+	if od != nil && sets != nil {
+		qx, qz := (baseX>>2)<<2, (baseZ>>2)<<2
+		s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
+		biomeAtStub := biomeNameByID(BiomeAt3D(od, s2D, qx, (90>>2)<<2, qz))
+		allowed := false
+		for _, name := range sets.BiomesFor(def) {
+			if name == biomeAtStub {
+				allowed = true
+				break
+			}
 		}
-	}
-	if !allowed {
-		return nil
+		if !allowed {
+			return nil
+		}
 	}
 	return stub
 }
@@ -253,9 +313,12 @@ func PlaceOceanRuinPieces(region *decorationRegion, random *worldgen.Legacy, stu
 	baseX, baseZ := stub.X, stub.Z
 	rot := stub.Rotation
 	var written [][3]int
-	// All children of one start share basePos, rotation and (for COLD) index.
 	for _, piece := range stub.Pieces {
-		w, err := placeOceanRuinPiece(region, random, stub, piece, baseX, baseZ, rot, seed)
+		px, pz, prot := baseX, baseZ, rot
+		if piece.HasCustomPos {
+			px, pz, prot = piece.X, piece.Z, piece.Rotation
+		}
+		w, err := placeOceanRuinPiece(region, random, stub, piece, px, pz, prot, seed)
 		if err != nil {
 			return err
 		}

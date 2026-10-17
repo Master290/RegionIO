@@ -326,8 +326,24 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	if err != nil {
 		return err
 	}
-	// Step 3 (underground_structures): mineshafts. Piece trees reach up to
-	// 80 blocks from their start, so scan a ±8 window.
+	// Step 3 (underground_structures): buried treasure (index 1) and mineshafts
+	// (indices 2, 3). Piece trees for mineshafts reach up to 80 blocks from
+	// their start, so scan a ±8 window.
+	regionChunks := make([][2]int32, 0, len(r.chunks))
+	for key := range r.chunks {
+		regionChunks = append(regionChunks, key)
+	}
+	sort.Slice(regionChunks, func(i, j int) bool {
+		if regionChunks[i][0] != regionChunks[j][0] {
+			return regionChunks[i][0] < regionChunks[j][0]
+		}
+		return regionChunks[i][1] < regionChunks[j][1]
+	})
+	for _, key := range regionChunks {
+		if BuriedTreasureGenerationPoint(od, sets, seed, key[0], key[1]) {
+			PlaceBuriedTreasureInChunk(r, seed, key[0], key[1])
+		}
+	}
 	var mineshafts []*MineshaftStart
 	for sx := targetX - 8; sx <= targetX+8; sx++ {
 		for sz := targetZ - 8; sz <= targetZ+8; sz++ {
@@ -340,23 +356,13 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			}
 		}
 	}
-	regionChunks := make([][2]int32, 0, len(r.chunks))
-	for key := range r.chunks {
-		regionChunks = append(regionChunks, key)
-	}
-	sort.Slice(regionChunks, func(i, j int) bool {
-		if regionChunks[i][0] != regionChunks[j][0] {
-			return regionChunks[i][0] < regionChunks[j][0]
-		}
-		return regionChunks[i][1] < regionChunks[j][1]
-	})
 	if len(mineshafts) > 0 {
 		for _, key := range regionChunks {
 			PlaceMineshaftsForChunk(r, mineshafts, seed, key[0], key[1])
 		}
 	}
 	// Step 4 (surface_structures), alphabetical index order: ocean ruins
-	// (8,9) before ruined portals (10).
+	// (8,9) before ruined portals (10..16), shipwrecks (17,18), villages (20..24).
 	for sx := targetX - 2; sx <= targetX+2; sx++ {
 		for sz := targetZ - 2; sz <= targetZ+2; sz++ {
 			stub, random, err := OceanRuinGenerationPoint(od, sets, seed, sx, sz)
@@ -385,6 +391,25 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			}
 			if err := PlaceRuinedPortalPiece(r, stub, seed, targetX, targetZ); err != nil {
 				return err
+			}
+		}
+	}
+	var shipwrecks []*ShipwreckStart
+	for sx := targetX - 3; sx <= targetX+3; sx++ {
+		for sz := targetZ - 3; sz <= targetZ+3; sz++ {
+			start, err := ShipwreckGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if start != nil {
+				shipwrecks = append(shipwrecks, start)
+			}
+		}
+	}
+	if len(shipwrecks) > 0 {
+		for _, sName := range []string{"minecraft:shipwreck", "minecraft:shipwreck_beached"} {
+			for _, key := range regionChunks {
+				PlaceShipwrecksForChunk(r, shipwrecks, sName, seed, key[0], key[1])
 			}
 		}
 	}
