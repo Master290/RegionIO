@@ -41,6 +41,15 @@ type TemplateBlockInfo struct {
 	BlockProps              map[string]string
 	Jigsaw                  *JigsawBlockTag
 	IsRandomizableContainer bool
+	NBT                     *nbt.Compound
+}
+
+// TemplateEntityInfo is one entity entry from a StructureTemplate's "entities" list.
+type TemplateEntityInfo struct {
+	Pos      [3]float64
+	BlockPos [3]int
+	ID       string
+	NBT      *nbt.Compound
 }
 
 // LoadResolvedTemplate reads a template file from disk.
@@ -224,6 +233,7 @@ func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, pro
 						info.HasNBT = true
 						info.IsRandomizableContainer = isRandomizableContainerBlock(pe.name)
 						if nc, isCompound := nbtTag.(*nbt.Compound); isCompound {
+							info.NBT = nc
 							if mt, ok := nc.Get("metadata"); ok {
 								info.Marker = string(mt.(nbt.String))
 							}
@@ -261,6 +271,69 @@ func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, pro
 		}
 	}
 	return out, size, nil
+}
+
+// LoadResolvedTemplateEntitiesBytes parses the "entities" list of a StructureTemplate NBT.
+func LoadResolvedTemplateEntitiesBytes(raw []byte) ([]TemplateEntityInfo, error) {
+	raw, err := readMaybeGzipBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	_, root, err := nbt.UnmarshalNamed(raw)
+	if err != nil {
+		return nil, err
+	}
+	comp, ok := root.(*nbt.Compound)
+	if !ok {
+		return nil, fmt.Errorf("template root is not a compound")
+	}
+	rawTag, ok := comp.Get("entities")
+	if !ok {
+		return nil, nil
+	}
+	tag, isList := rawTag.(nbt.List)
+	if !isList || len(tag.Elems) == 0 {
+		return nil, nil
+	}
+	out := make([]TemplateEntityInfo, 0, len(tag.Elems))
+	for _, entry := range tag.Elems {
+		ec, ok := entry.(*nbt.Compound)
+		if !ok {
+			continue
+		}
+		var info TemplateEntityInfo
+		if posTag, ok := ec.Get("pos"); ok {
+			if posList, isList := posTag.(nbt.List); isList && len(posList.Elems) == 3 {
+				for i := 0; i < 3; i++ {
+					switch v := posList.Elems[i].(type) {
+					case nbt.Double:
+						info.Pos[i] = float64(v)
+					case nbt.Float:
+						info.Pos[i] = float64(v)
+					}
+				}
+			}
+		}
+		if bpTag, ok := ec.Get("blockPos"); ok {
+			if bpList, isList := bpTag.(nbt.List); isList && len(bpList.Elems) == 3 {
+				for i := 0; i < 3; i++ {
+					if iv, ok := bpList.Elems[i].(nbt.Int); ok {
+						info.BlockPos[i] = int(iv)
+					}
+				}
+			}
+		}
+		if nbtTag, ok := ec.Get("nbt"); ok {
+			if nc, isCompound := nbtTag.(*nbt.Compound); isCompound {
+				info.NBT = nc
+				info.ID = nbtStringOr(nc, "id", "")
+			}
+		}
+		if info.ID != "" {
+			out = append(out, info)
+		}
+	}
+	return out, nil
 }
 
 // LoadResolvedTemplateBytes parses template NBT already in memory.
@@ -309,6 +382,27 @@ func TransformBlockPos(pos [3]int, mirror string, rotation int, pivot [3]int) [3
 		return [3]int{px - pz + z, y, px + pz - x}
 	}
 	return [3]int{x, y, z}
+}
+
+// TransformEntityPos mirrors StructureTemplate.transform(Vec3, mirror, rotation, pivot).
+func TransformEntityPos(pos [3]float64, mirror string, rotation int, pivot [3]int) [3]float64 {
+	x, y, z := pos[0], pos[1], pos[2]
+	switch mirror {
+	case "left_right":
+		z = 1.0 - z
+	case "front_back":
+		x = 1.0 - x
+	}
+	px, pz := float64(pivot[0]), float64(pivot[2])
+	switch rotation {
+	case 1: // clockwise_90
+		return [3]float64{px + pz + 1.0 - z, y, pz - px + x}
+	case 2: // clockwise_180
+		return [3]float64{px + px + 1.0 - x, y, pz + pz + 1.0 - z}
+	case 3: // counterclockwise_90
+		return [3]float64{px - pz + z, y, px + pz + 1.0 - x}
+	}
+	return [3]float64{x, y, z}
 }
 
 // MthGetSeed is Mth.getSeed(x,y,z), the positional seed every template

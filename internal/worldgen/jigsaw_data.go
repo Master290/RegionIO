@@ -25,7 +25,7 @@ var (
 
 func ensureStructureZipMap() map[string][]byte {
 	structureZipOnce.Do(func() {
-		structureZipMap = make(map[string][]byte, 1200)
+		structureZipMap = make(map[string][]byte, 1600)
 		zr, err := zip.NewReader(bytes.NewReader(structureDataZip), int64(len(structureDataZip)))
 		if err != nil {
 			return
@@ -73,12 +73,19 @@ type PosPredicateDef struct {
 	Axis          string  `json:"axis"`
 }
 
+// RuleBlockEntityModifierDef is a block_entity_modifier in a ProcessorRule (e.g. minecraft:append_loot).
+type RuleBlockEntityModifierDef struct {
+	Type      string `json:"type"`
+	LootTable string `json:"loot_table"`
+}
+
 // ProcessorRuleDef is one rule inside a RuleProcessor.
 type ProcessorRuleDef struct {
-	InputPredicate    RulePredicateDef `json:"input_predicate"`
-	LocationPredicate RulePredicateDef `json:"location_predicate"`
-	PositionPredicate PosPredicateDef  `json:"position_predicate"`
-	OutputState       BlockState       `json:"output_state"`
+	InputPredicate      RulePredicateDef           `json:"input_predicate"`
+	LocationPredicate   RulePredicateDef           `json:"location_predicate"`
+	PositionPredicate   PosPredicateDef            `json:"position_predicate"`
+	OutputState         BlockState                 `json:"output_state"`
+	BlockEntityModifier RuleBlockEntityModifierDef `json:"block_entity_modifier"`
 }
 
 // ProcessorDef is one entry of a StructureProcessorList.
