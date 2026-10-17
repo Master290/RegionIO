@@ -537,10 +537,11 @@ func (h *handler) serverTickLoop() {
 			}
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
-				// StartSpawning is not advancing the world clock; tick player
-				// and entity status effects here.
+				// StartSpawning is not advancing the world clock; tick player,
+				// entity status effects, and raids here.
 				h.srv.TickAllPlayerEffects()
 				h.srv.TickAllEntityEffects()
+				h.srv.TickRaids()
 			}
 			lastGameTime = nowGameTime
 		}

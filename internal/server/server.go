@@ -290,6 +290,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadSignsAndLecternsFile()
 		_ = s.LoadBannersFile()
 		_ = s.LoadJukeboxes()
+		_ = s.LoadRaids()
 	}
 	return s
 }
@@ -445,6 +446,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveJukeboxes(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveRaids(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldSettingsFile(); err != nil && firstErr == nil {
