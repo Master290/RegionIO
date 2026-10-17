@@ -28,6 +28,8 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -short ./...
+      - name: Run e2e integration tests
+        run: go test -v -timeout 2m -count=1 ./internal/e2e
       # The tree arrives from checkout with nothing in it, so anything dirty after
       # the suite was put there by a test. This is the class of defect the plan's
       # diagnostics work exists to end: a committed debug probe that rewrote a
@@ -51,7 +53,7 @@ jobs:
       matrix:
         shard:
           - name: other-packages
-            args: "./cmd/... ./internal/nbt ./internal/network ./internal/protocol ./internal/registry ./internal/server ./internal/worldgen"
+            args: "./cmd/... ./internal/e2e ./internal/nbt ./internal/network ./internal/protocol ./internal/registry ./internal/server ./internal/worldgen"
           - name: world-A-G
             args: "./internal/world -run ^Test[A-G]"
           - name: world-H-U
