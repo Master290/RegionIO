@@ -506,4 +506,105 @@ func TestEnchantingCombatDurabilityAndXPPersistenceHooks(t *testing.T) {
 	}
 }
 
+func TestWiredAdvancementHooksAndPlayerDataPersistence(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	session, err := srv.RegisterPlayer(Profile{Name: "AdvTester", UUID: OfflineUUID("AdvTester")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	feetY := float64(world.FlatSurfaceY + 1)
+	srv.SetPlayerTransform(session, 8.5, feetY, 8.5, 0, 0, true)
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
 
+	// 1. Item pickup in TryPickupItems triggers mine_stone & mine_diamond.
+	cobbleStack := world.NewNamedItemStack("minecraft:cobblestone", 1)
+	_, _ = srv.SpawnItemEntity(8.5, feetY, 8.5, cobbleStack)
+	if picked := srv.TryPickupItems(session); picked != 1 {
+		t.Fatalf("TryPickupItems = %d, want 1", picked)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/mine_stone") {
+		t.Fatal("expected minecraft:story/mine_stone after picking up cobblestone")
+	}
+
+	// 2. Crafting in HandleContainerClick triggers story/root (crafting_table).
+	planks := world.NewNamedItemStack("minecraft:oak_planks", 1)
+	for s := 1; s <= 4; s++ {
+		session.SetInventorySlot(s, planks)
+	}
+	if err := srv.HandleContainerClick(session, 0, 0, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick(craft crafting_table): %v", err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/root") {
+		t.Fatal("expected minecraft:story/root after crafting crafting_table")
+	}
+
+	// 3. Furnace output take triggers smelt_iron.
+	srv.SetFurnaceSlot(10, world.FlatSurfaceY, 10, world.FurnaceSlotOutput, world.NewNamedItemStack("minecraft:iron_ingot", 1))
+	cid, err := srv.OpenFurnace(session, 10, world.FlatSurfaceY, 10)
+	if err != nil {
+		t.Fatalf("OpenFurnace: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, world.FurnaceSlotOutput, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick(furnace output): %v", err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/smelt_iron") {
+		t.Fatal("expected minecraft:story/smelt_iron after taking iron_ingot from furnace")
+	}
+	_ = srv.CloseContainer(session, cid, false)
+
+	// 4. Enchanting table button click triggers enchant_item.
+	_ = srv.AddPlayerExperienceLevels(session, 30)
+	enchCID, err := srv.OpenEnchantingTable(session, 12, world.FlatSurfaceY, 12)
+	if err != nil {
+		t.Fatalf("OpenEnchantingTable: %v", err)
+	}
+	session.SetInventorySlot(9, world.NewNamedItemStack("minecraft:iron_sword", 1))
+	session.SetInventorySlot(10, world.NewNamedItemStack("minecraft:lapis_lazuli", 10))
+	_ = srv.HandleContainerClick(session, enchCID, 2, 0, ContainerInputQuickMove)
+	_ = srv.HandleContainerClick(session, enchCID, 3, 0, ContainerInputQuickMove)
+	if err := srv.HandleContainerButtonClick(session, enchCID, 0); err != nil {
+		t.Fatalf("HandleContainerButtonClick: %v", err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/enchant_item") {
+		t.Fatal("expected minecraft:story/enchant_item after enchanting item")
+	}
+	_ = srv.CloseContainer(session, enchCID, false)
+
+	// 5. Dimension transfer triggers enter_the_nether and enter_the_end.
+	if err := srv.ChangePlayerDimension(session, world.DimensionNether, 0.5, 65, 0.5, 0, 0); err != nil {
+		t.Fatalf("ChangePlayerDimension(nether): %v", err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/enter_the_nether") || !session.HasCompletedAdvancement("minecraft:nether/root") {
+		t.Fatal("expected enter_the_nether and nether/root after dimension transfer to Nether")
+	}
+	if err := srv.ChangePlayerDimension(session, world.DimensionEnd, 100.5, 49, 0.5, 0, 0); err != nil {
+		t.Fatalf("ChangePlayerDimension(end): %v", err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/enter_the_end") {
+		t.Fatal("expected enter_the_end after dimension transfer to End")
+	}
+
+	// 6. PlayerData NBT round-trip preserves advancements.
+	comp := world.PlayerDataToCompound(session.PlayerData())
+	decoded, err := world.PlayerDataFromCompound(comp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	sessionRestored, err := srv.RegisterPlayer(Profile{Name: "AdvRestored", UUID: OfflineUUID("AdvRestored")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(AdvRestored): %v", err)
+	}
+	sessionRestored.ApplyPlayerData(decoded)
+	for _, advID := range []string{
+		"minecraft:story/mine_stone",
+		"minecraft:story/root",
+		"minecraft:story/smelt_iron",
+		"minecraft:story/enchant_item",
+		"minecraft:story/enter_the_nether",
+		"minecraft:story/enter_the_end",
+	} {
+		if !sessionRestored.HasCompletedAdvancement(advID) {
+			t.Fatalf("restored session missing advancement %s", advID)
+		}
+	}
+}

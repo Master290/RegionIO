@@ -482,6 +482,7 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 		}
 	}
 	if killed {
+		s.TriggerEntityKilled(session, target.TypeName)
 		if xp := mobKillXPPoints(target.TypeName); xp > 0 {
 			s.SpawnExperienceOrbsInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, xp)
 		}
@@ -652,6 +653,11 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 			continue
 		}
 		totalPickedUp += added
+		pickedStack := world.NewItemStack(live.Item.ResolvedItemID(), added)
+		if pickedStack.ID == "" {
+			pickedStack.ID = live.Item.ResolvedID()
+		}
+		s.TriggerItemAcquired(session, pickedStack)
 
 		chunkPos := live.ChunkPos()
 		s.BroadcastDimensionChunk(playerDim, chunkPos.X, chunkPos.Z, protocol.PlayTakeItemEntity,
@@ -677,6 +683,9 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 			s.BroadcastDimensionChunk(playerDim, chunkPos.X, chunkPos.Z, protocol.PlaySetEntityData,
 				EncodeItemEntityData(live.ID, remaining))
 		}
+	}
+	if totalPickedUp > 0 {
+		s.TriggerInventoryChanged(session)
 	}
 	return totalPickedUp
 }

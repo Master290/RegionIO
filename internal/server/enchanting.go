@@ -492,7 +492,7 @@ func SetSlotItemMeta(session *PlayerSession, slot int, meta ItemMeta) {
 
 // GetCarriedItemMeta returns the ItemMeta for the item on the player's cursor.
 func GetCarriedItemMeta(session *PlayerSession) ItemMeta {
-	if session == nil || session.CarriedItem().IsEmpty() {
+	if session == nil {
 		return ItemMeta{}
 	}
 	tr := getItemMetaTracker(session)
@@ -1492,6 +1492,7 @@ func (s *Server) HandleContainerButtonClick(session *PlayerSession, containerID,
 	if !creative {
 		_ = s.AddPlayerExperienceLevels(session, -levelCost)
 	}
+	s.TriggerEnchantedItem(session)
 	return s.syncOpenContainer(session)
 }
 

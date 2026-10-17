@@ -222,6 +222,7 @@ type PlayerData struct {
 	SpawnForced    bool
 	SpawnDimension string
 	HasSpawn       bool
+	Advancements   *nbt.Compound
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -342,6 +343,10 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 		respawn.Set("pitch", nbt.Float(d.SpawnPitch))
 		respawn.Set("forced", nbt.Byte(forcedByte))
 		root.Set("respawn", respawn)
+	}
+
+	if d.Advancements != nil {
+		root.Set("Advancements", d.Advancements)
 	}
 
 	return root
@@ -615,6 +620,10 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 		if dim, ok := nbtGetString(root, "SpawnDimension"); ok && dim != "" {
 			d.SpawnDimension = dim
 		}
+	}
+
+	if adv, ok := nbtGetCompound(root, "Advancements"); ok && adv != nil {
+		d.Advancements = adv
 	}
 
 	return d, nil

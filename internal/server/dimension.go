@@ -540,6 +540,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 		recenter(cx, cz)
 	}
 
+	s.TriggerChangeDimension(session, normTarget)
 	_ = s.SavePlayerData(session)
 	return nil
 }

@@ -824,7 +824,8 @@ func (s *Server) applyFurnaceClickLocked(session *PlayerSession, tr *playerConta
 		return
 	}
 	slots := s.buildFurnaceMenuSlots(session, bx, by, bz)
-	prevOutputCount := slots[world.FurnaceSlotOutput].Count
+	prevOutput := slots[world.FurnaceSlotOutput]
+	prevOutputCount := prevOutput.Count
 	furnaceID := s.resolveFurnaceIDAt(bx, by, bz, furnaceIDForMenuType(menuType))
 
 	switch mode {
@@ -934,6 +935,7 @@ func (s *Server) applyFurnaceClickLocked(session *PlayerSession, tr *playerConta
 	}
 	if slots[world.FurnaceSlotOutput].Count < prevOutputCount {
 		s.AwardFurnaceExperience(bx, by, bz)
+		s.TriggerItemSmelted(session, prevOutput)
 	}
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[3+i])

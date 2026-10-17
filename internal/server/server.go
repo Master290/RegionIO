@@ -335,17 +335,25 @@ func (s *Server) SaveWorldTime() error {
 	return s.store.SaveWorldTime(gameTime, dayTime)
 }
 
-// SavePlayerData persists a single player session's data to <world>/playerdata/<uuid>.dat.
+// SavePlayerData persists a single player session's data to <world>/playerdata/<uuid>.dat
+// and advancements to <world>/advancements/<uuid>.json.
 func (s *Server) SavePlayerData(session *PlayerSession) error {
-	if session == nil || s.store == nil {
+	if session == nil {
 		return nil
 	}
-	return s.store.SavePlayerData(session.Profile.UUID, session.PlayerData())
+	advErr := s.SavePlayerAdvancementsFile(session)
+	if s.store == nil {
+		return advErr
+	}
+	if err := s.store.SavePlayerData(session.Profile.UUID, session.PlayerData()); err != nil {
+		return err
+	}
+	return advErr
 }
 
 // SaveAllPlayers persists all currently connected players' data to disk.
 func (s *Server) SaveAllPlayers() error {
-	if s.store == nil {
+	if s.store == nil && s.cfg.WorldDir == "" {
 		return nil
 	}
 	s.playersMu.RLock()
@@ -444,6 +452,7 @@ func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSess
 		session.loadedFromDisk = true
 		session.mu.Unlock()
 	}
+	_ = s.LoadPlayerAdvancementsFile(session)
 	s.players[profile.UUID] = session
 	s.playerNames[nameKey] = profile.UUID
 	return session, nil
@@ -497,6 +506,11 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 			st.enchantSeed = d.XpSeed
 		}
 		st.mu.Unlock()
+	}
+	if d.Advancements != nil {
+		root := nbt.NewCompound()
+		root.Set("Advancements", d.Advancements)
+		LoadAdvancementsFromPlayerCompound(session, root)
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -586,6 +600,18 @@ func (session *PlayerSession) ReadExperienceNBT(root *nbt.Compound) {
 	}
 }
 
+// WriteAdvancementsNBT writes the player's advancements state into a playerdata
+// NBT root compound under the "Advancements" key.
+func (session *PlayerSession) WriteAdvancementsNBT(root *nbt.Compound) {
+	SaveAdvancementsToPlayerCompound(session, root)
+}
+
+// ReadAdvancementsNBT restores the player's advancements state from a playerdata
+// NBT root compound's "Advancements" key.
+func (session *PlayerSession) ReadAdvancementsNBT(root *nbt.Compound) {
+	LoadAdvancementsFromPlayerCompound(session, root)
+}
+
 // PlayerData exports a consistent copy of the session's state for persistence.
 func (session *PlayerSession) PlayerData() world.PlayerData {
 	if session == nil {
@@ -596,6 +622,12 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	tickTimer := session.FoodTickTimer()
 	xpLevel, xpTotal, xpP := session.Experience()
 	xpSeed := session.EnchantmentSeed()
+	advRoot := nbt.NewCompound()
+	SaveAdvancementsToPlayerCompound(session, advRoot)
+	var advComp *nbt.Compound
+	if tag, ok := advRoot.Get("Advancements"); ok {
+		advComp, _ = tag.(*nbt.Compound)
+	}
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -624,6 +656,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		SpawnForced:    session.spawnForced,
 		SpawnDimension: session.spawnDimension,
 		HasSpawn:       session.hasSpawn,
+		Advancements:   advComp,
 	}
 }
 

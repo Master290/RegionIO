@@ -94,11 +94,13 @@ const (
 	PlayDamageEvent         = 0x19
 	PlayEntityEvent         = 0x22
 	PlayHurtAnimation       = 0x2a
-	PlayOpenScreen          = 0x3b
-	PlayMerchantOffers      = 0x34
-	PlayPlayerCombatKill    = 0x44
-	PlayRespawn             = 0x52
-	PlaySetExperience       = 0x67
+	PlayOpenScreen            = 0x3b
+	PlayMerchantOffers        = 0x34
+	PlayPlayerCombatKill      = 0x44
+	PlayRespawn               = 0x52
+	PlaySelectAdvancementsTab = 0x55
+	PlaySetExperience         = 0x67
+	PlayUpdateAdvancements    = 0x82
 
 	// Entity packets
 	PlayAddEntity        = 0x01
@@ -137,6 +139,7 @@ const (
 	PlayPlayerAction              = 0x29
 	PlayPlayerCommand             = 0x2a
 	PlayRenameItem                = 0x30
+	PlaySeenAdvancements          = 0x32
 	PlaySelectTrade               = 0x33
 	PlayUseItemOn                 = 0x42
 	PlayUseItem                   = 0x43

@@ -213,6 +213,7 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 	if err := s.ChangePlayerDimension(session, toDim, destX, destY, destZ, snap.Yaw, snap.Pitch); err != nil {
 		return PortalTravelResult{}, err
 	}
+	s.TriggerChangeDimension(session, toDim)
 
 	return PortalTravelResult{
 		Travelled:     true,
@@ -266,6 +267,7 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 		if err := s.ChangePlayerDimension(session, toDim, destX, destY, destZ, yaw, pitch); err != nil {
 			return PortalTravelResult{}, err
 		}
+		s.TriggerChangeDimension(session, toDim)
 		return PortalTravelResult{
 			Travelled:     true,
 			FromDimension: fromDim,
@@ -289,6 +291,7 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 	if err := s.ChangePlayerDimension(session, toDim, destX, destY, destZ, 90.0, 0.0); err != nil {
 		return PortalTravelResult{}, err
 	}
+	s.TriggerChangeDimension(session, toDim)
 	return PortalTravelResult{
 		Travelled:     true,
 		FromDimension: fromDim,

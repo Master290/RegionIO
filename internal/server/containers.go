@@ -149,6 +149,9 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 	tr.mu.Lock()
 	tr.carried = stack
 	tr.mu.Unlock()
+	if stack.IsEmpty() {
+		SetCarriedItemMeta(session, ItemMeta{})
+	}
 }
 
 // ChestSlots returns a copy of the 27 slots stored in the chest at (x, y, z).
@@ -640,6 +643,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	if containerID == 0 {
 		s.applyPlayerInventoryClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
 		return s.syncPlayerInventoryContainer(session)
 	}
 
@@ -653,20 +657,24 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		s.applyChestClickLocked(session, tr, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
 		return s.syncChestViewers(session, bx, by, bz)
 	case MenuTypeCrafting:
 		s.applyCraftingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
 		return s.syncOpenContainer(session)
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
 		menuType := tr.open.MenuType
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		s.applyFurnaceClickLocked(session, tr, menuType, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
 		return s.syncFurnaceViewers(session, bx, by, bz)
 	case MenuTypeEnchantment:
 		s.applyEnchantingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
 		return s.syncOpenContainer(session)
 	case MenuTypeAnvil:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
@@ -676,9 +684,12 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			_ = s.AddPlayerExperienceLevels(session, -costPaid)
 		}
 		if tookResult {
+			s.TriggerInventoryChanged(session)
 			if s.DamageAnvilBlockOnUse(session, bx, by, bz, nil) {
 				return nil
 			}
+		} else {
+			s.TriggerInventoryChanged(session)
 		}
 		return s.syncOpenContainer(session)
 	case MenuTypeGrindstone:
@@ -690,6 +701,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			s.SpawnExperienceOrbsInDimension(dim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, xpAward)
 			_ = s.AddPlayerExperience(session, xpAward)
 		}
+		s.TriggerInventoryChanged(session)
 		return s.syncOpenContainer(session)
 	default:
 		tr.mu.Unlock()
@@ -762,7 +774,9 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 
 	if slot == 0 {
 		// Crafting output slot.
-		s.clickCraftingOutput(slots, 1, 9, 3, 3, 10, 46, &tr.carried, mode)
+		if crafted := s.clickCraftingOutput(slots, 1, 9, 3, 3, 10, 46, &tr.carried, mode); !crafted.IsEmpty() {
+			s.TriggerRecipeCrafted(session, crafted)
+		}
 	} else {
 		switch mode {
 		case ContainerInputPickup:
@@ -825,7 +839,9 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 	slots := s.buildPlayerMenuSlots(session, tr.invCraft, tr.invResult)
 
 	if slot == 0 {
-		s.clickCraftingOutput(slots, 1, 4, 2, 2, 9, 45, &tr.carried, mode)
+		if crafted := s.clickCraftingOutput(slots, 1, 4, 2, 2, 9, 45, &tr.carried, mode); !crafted.IsEmpty() {
+			s.TriggerRecipeCrafted(session, crafted)
+		}
 	} else {
 		switch mode {
 		case ContainerInputPickup:
@@ -871,15 +887,15 @@ func (s *Server) clickCraftingOutput(
 	invStart, invEnd int,
 	carried *world.ItemStack,
 	mode int32,
-) {
+) world.ItemStack {
 	grid := slots[gridStart : gridStart+gridCount]
 	res, _, ok := MatchCraftingGrid(grid, width, height)
 	if !ok || res.IsEmpty() {
-		return
+		return world.ItemStack{}
 	}
 	resID := res.ResolvedItemID()
 	if resID <= 0 {
-		return
+		return world.ItemStack{}
 	}
 
 	consumeGridOnce := func() {
@@ -896,14 +912,17 @@ func (s *Server) clickCraftingOutput(
 		}
 	}
 
+	var crafted world.ItemStack
 	switch mode {
 	case ContainerInputPickup:
 		if carried.IsEmpty() {
 			*carried = world.NewItemStack(resID, res.Count)
 			consumeGridOnce()
+			crafted = res
 		} else if carried.ResolvedItemID() == resID && carried.Count+res.Count <= MaxItemStackSize {
 			*carried = world.NewItemStack(resID, carried.Count+res.Count)
 			consumeGridOnce()
+			crafted = res
 		}
 	case ContainerInputQuickMove:
 		for iter := 0; iter < 64; iter++ {
@@ -919,11 +938,13 @@ func (s *Server) clickCraftingOutput(
 			rem := mergeIntoSlotSlice(slots, curRes, hotbarStart, invEnd)
 			rem = mergeIntoSlotSlice(slots, rem, invStart, hotbarStart)
 			consumeGridOnce()
+			crafted = res
 			if !rem.IsEmpty() {
 				break
 			}
 		}
 	}
+	return crafted
 }
 
 func applyPickupSlot(slotStack, carried world.ItemStack, button int8) (newSlot, newCarried world.ItemStack) {

@@ -103,6 +103,10 @@ func (h *handler) beginPlay() error {
 	if err := h.srv.SendPlayerExperience(session); err != nil {
 		return err
 	}
+	_ = h.srv.LoadPlayerAdvancementsFile(h.session)
+	if err := h.srv.SendInitialAdvancements(h.session); err != nil {
+		return err
+	}
 	if err := h.sendCommands(); err != nil {
 		return err
 	}
@@ -791,6 +795,16 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case server.PlaySeenAdvancementsSB:
+		action, tab, err := server.DecodeSeenAdvancementsPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleSeenAdvancements(h.session, action, tab)
+		}
+		return nil
+
 	case protocol.PlayContainerSlotStateChanged:
 		return nil
 
@@ -960,6 +974,9 @@ func (h *handler) handleCreativeSlot(pkt protocol.Packet) error {
 	if slot >= 0 && slot < world.PlayerInventorySlots {
 		if h.session != nil {
 			h.session.SetInventorySlot(slot, stack)
+			if h.srv != nil {
+				h.srv.TriggerInventoryChanged(h.session)
+			}
 		}
 		if h.conn != nil {
 			if err := h.sendContainerSetSlot(slot, stack); err != nil {
@@ -1058,8 +1075,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			if cache != nil {
 				if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {
 					h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
-					if name := world.BlockName(state); name == "minecraft:fire" || name == "minecraft:soul_fire" {
+					blockName := world.BlockName(state)
+					if blockName == "minecraft:fire" || blockName == "minecraft:soul_fire" {
 						_, _ = h.srv.LightPortalAt(dim, px, py, pz)
+					}
+					if h.session != nil {
+						h.srv.TriggerPlantedSeed(h.session, blockName)
 					}
 					if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSurvival {
 						if slot, updated, consumed := h.srv.ConsumeHeldItem(h.session, 1); consumed {
