@@ -1,6 +1,7 @@
 package world
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -8,15 +9,23 @@ import (
 
 // Redstone constants and tick delays.
 const (
-	MaxRedstonePower      = 15
-	StoneButtonTickDelay  = 20 // Stone / polished blackstone button pulse duration (20 ticks)
-	WoodButtonTickDelay   = 30 // Wooden / bamboo / nether button pulse duration (30 ticks)
-	PressurePlateTickDelay = 20 // Minimum pressed hold / re-check interval for pressure plates (20 ticks)
-	RedstoneTorchTickDelay = 2  // Redstone torch inversion delay (2 ticks = 1 redstone tick)
-	ComparatorTickDelay    = 2  // Redstone comparator evaluation delay (2 ticks = 1 redstone tick)
-	DispenserTickDelay     = 4  // Dispenser / dropper activation delay (4 game ticks = 2 redstone ticks)
-	CrafterTickDelay       = 4  // Crafter activation delay (4 game ticks = 2 redstone ticks)
-	MaxPistonPushBlocks    = 12 // Maximum number of blocks a piston can push in a line
+	MaxRedstonePower               = 15
+	StoneButtonTickDelay           = 20  // Stone / polished blackstone button pulse duration (20 ticks)
+	WoodButtonTickDelay            = 30  // Wooden / bamboo / nether button pulse duration (30 ticks)
+	PressurePlateTickDelay         = 20  // Minimum pressed hold / re-check interval for pressure plates (20 ticks)
+	RedstoneTorchTickDelay         = 2   // Redstone torch inversion delay (2 ticks = 1 redstone tick)
+	ComparatorTickDelay            = 2   // Redstone comparator evaluation delay (2 ticks = 1 redstone tick)
+	RedstoneLampTurnOffDelay       = 4   // Redstone lamp turn-off delay (4 game ticks = 2 redstone ticks)
+	DispenserTickDelay             = 4   // Dispenser / dropper activation delay (4 game ticks = 2 redstone ticks)
+	CrafterTickDelay               = 4   // Crafter activation delay (4 game ticks = 2 redstone ticks)
+	TargetBlockArrowTickDelay      = 20  // Target block pulse duration when hit by arrow / trident (20 game ticks)
+	TargetBlockProjectileTickDelay = 8   // Target block pulse duration when hit by other projectiles (8 game ticks)
+	LightningRodTickDelay          = 8   // Lightning rod pulse duration when struck by lightning (8 game ticks)
+	LightningRodAttractRadius      = 128 // Horizontal radius within which a lightning rod attracts lightning
+	LightningRodRedirectRadius     = 128 // Radius within which a lightning rod redirects lightning
+	MaxTripwireDistance            = 42  // Maximum distance between two opposing tripwire hooks
+	TripwireTickDelay              = 10  // Tripwire / tripwire hook re-check and break pulse duration (10 game ticks)
+	MaxPistonPushBlocks            = 12  // Maximum number of blocks a piston can push in a line
 )
 
 var (
@@ -26,6 +35,7 @@ var (
 	dispenserFireListeners    sync.Map // map[*Cache]func(x, y, z int, isDropper bool)
 	crafterFireListeners      sync.Map // map[*Cache]func(x, y, z int)
 	railPowerChangeListeners  sync.Map // map[*Cache]func(x, y, z int, railName string, powered bool)
+	daylightContextProviders  sync.Map // map[*Cache]func(x, y, z int) (skyLight int, timeOfDay int64, raining, thundering bool)
 )
 
 // SetCrafterFireListener registers an optional callback invoked when a
@@ -286,7 +296,8 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:repeater", "minecraft:comparator",
 		"minecraft:piston", "minecraft:sticky_piston", "minecraft:piston_head",
 		"minecraft:redstone_lamp", "minecraft:note_block", "minecraft:jukebox",
-		"minecraft:target", "minecraft:daylight_detector",
+		"minecraft:target", "minecraft:daylight_detector", "minecraft:lightning_rod",
+		"minecraft:tripwire", "minecraft:tripwire_hook",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
 		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
 		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper", "minecraft:crafter",
@@ -313,7 +324,13 @@ func isConductiveSolidBlock(state uint16) bool {
 		return false
 	}
 	name := info.Name
-	if isRedstoneComponentName(name) && name != "minecraft:note_block" && name != "minecraft:dispenser" && name != "minecraft:dropper" && name != "minecraft:crafter" {
+	if isRedstoneComponentName(name) &&
+		name != "minecraft:note_block" &&
+		name != "minecraft:dispenser" &&
+		name != "minecraft:dropper" &&
+		name != "minecraft:crafter" &&
+		name != "minecraft:redstone_lamp" &&
+		name != "minecraft:target" {
 		return false
 	}
 	if strings.HasSuffix(name, "_glass") || strings.HasSuffix(name, "_stained_glass") ||
@@ -363,7 +380,8 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 		return clampPower(p)
 	case "minecraft:redstone_block":
 		return MaxRedstonePower
-	case "minecraft:lever", "minecraft:detector_rail":
+	case "minecraft:lever", "minecraft:detector_rail", "minecraft:observer",
+		"minecraft:lightning_rod", "minecraft:tripwire_hook":
 		if info.Properties["powered"] == "true" {
 			return MaxRedstonePower
 		}
@@ -382,8 +400,15 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 		return c.jukeboxRedstoneSignalAt(x, y, z, info.Properties)
 	case "minecraft:comparator":
 		return c.ComparatorOutputSignalAt(x, y, z)
+	case "minecraft:target":
+		p, _ := strconv.Atoi(info.Properties["power"])
+		p = clampPower(p)
+		if nb := c.BestNeighborSignal(x, y, z); nb > p {
+			return nb
+		}
+		return p
 	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate",
-		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor", "minecraft:daylight_detector":
 		p, _ := strconv.Atoi(info.Properties["power"])
 		return clampPower(p)
 	}
@@ -423,10 +448,13 @@ func (c *Cache) WeakSignalTo(sx, sy, sz, tx, ty, tz int) int {
 		return 0
 	}
 	sState := c.GetBlock(sx, sy, sz)
+	sig := c.emittedSignalFromSource(sx, sy, sz, tx, ty, tz, false, false)
 	if isConductiveSolidBlock(sState) {
-		return c.strongPowerToSolidBlock(sx, sy, sz, BlockPos{X: tx, Y: ty, Z: tz}, true, false)
+		if sp := c.strongPowerToSolidBlock(sx, sy, sz, BlockPos{X: tx, Y: ty, Z: tz}, true, false); sp > sig {
+			sig = sp
+		}
 	}
-	return c.emittedSignalFromSource(sx, sy, sz, tx, ty, tz, false, false)
+	return sig
 }
 
 func (c *Cache) bestNeighborSignalExcluding(x, y, z int, excludePos BlockPos, hasExclude bool) int {
@@ -452,10 +480,13 @@ func (c *Cache) bestNeighborSignalExcluding(x, y, z int, excludePos BlockPos, ha
 
 func (c *Cache) signalFromNeighborExcluding(sx, sy, sz, tx, ty, tz int, excludePos BlockPos, hasExclude bool) int {
 	sState := c.GetBlock(sx, sy, sz)
+	sig := c.emittedSignalFromSource(sx, sy, sz, tx, ty, tz, false, false)
 	if isConductiveSolidBlock(sState) {
-		return c.strongPowerToSolidBlock(sx, sy, sz, excludePos, hasExclude, false)
+		if sp := c.strongPowerToSolidBlock(sx, sy, sz, excludePos, hasExclude, false); sp > sig {
+			sig = sp
+		}
 	}
-	return c.emittedSignalFromSource(sx, sy, sz, tx, ty, tz, false, false)
+	return sig
 }
 
 // strongPowerToSolidBlock returns the power level (0..15) injected into a
@@ -513,6 +544,49 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 			return 0
 		}
 		return c.jukeboxRedstoneSignalAt(sx, sy, sz, props)
+
+	case "minecraft:target", "minecraft:daylight_detector":
+		if directOnly {
+			return 0
+		}
+		p, _ := strconv.Atoi(props["power"])
+		return clampPower(p)
+
+	case "minecraft:observer":
+		if props["powered"] != "true" {
+			return 0
+		}
+		bx, by, bz := ObserverOutputPos(sx, sy, sz, props["facing"])
+		if tx == bx && ty == by && tz == bz {
+			return MaxRedstonePower
+		}
+		return 0
+
+	case "minecraft:lightning_rod":
+		if props["powered"] != "true" {
+			return 0
+		}
+		if !directOnly {
+			return MaxRedstonePower
+		}
+		if dx, dy, dz, ok := directionOffset3D(oppositeDirection(props["facing"])); ok {
+			if tx == sx+dx && ty == sy+dy && tz == sz+dz {
+				return MaxRedstonePower
+			}
+		}
+		return 0
+
+	case "minecraft:tripwire_hook":
+		if props["powered"] != "true" {
+			return 0
+		}
+		if !directOnly {
+			return MaxRedstonePower
+		}
+		if sup, ok := wallSupportPos(sx, sy, sz, name, props); ok && sup.X == tx && sup.Y == ty && sup.Z == tz {
+			return MaxRedstonePower
+		}
+		return 0
 
 	case "minecraft:lectern":
 		if props["powered"] != "true" {
@@ -1005,7 +1079,14 @@ func (c *Cache) comparatorRearSignal(x, y, z int, facing string) int {
 	}
 	if sig < MaxRedstonePower && isConductiveSolidBlock(inState) {
 		ix2, iz2 := x+2*inDX, z+2*inDZ
-		if analogFar := c.analogSignalAt(ix2, iy, iz2); analogFar > sig {
+		farState := c.GetBlock(ix2, iy, iz2)
+		if hasAnalogOutputSignal(farState) {
+			// In vanilla ComparatorBlock.getInputSignal, when the rear solid
+			// block's signal is < 15 and the block behind it has an analog output
+			// (e.g. a container), the container's analog signal overrides the
+			// solid block's < 15 signal (even when the container is empty -> 0).
+			sig = c.analogSignalAt(ix2, iy, iz2)
+		} else if analogFar := c.analogSignalAt(ix2, iy, iz2); analogFar > sig {
 			sig = analogFar
 		}
 	}
@@ -1168,7 +1249,8 @@ func (c *Cache) ToggleTrapdoor(x, y, z int) (bool, BlockUpdateResult) {
 }
 
 // InteractRedstoneBlock handles a player right-click on a lever, button,
-// repeater, comparator, note block, non-iron door, or non-iron trapdoor at (x, y, z).
+// repeater, comparator, daylight detector, note block, non-iron door, or
+// non-iron trapdoor at (x, y, z).
 func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 	if y < MinY || y >= MinY+WorldHeight {
 		return false, BlockUpdateResult{}
@@ -1187,6 +1269,8 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 		return c.CycleRepeaterDelay(x, y, z)
 	case info.Name == "minecraft:comparator":
 		return c.ToggleComparatorMode(x, y, z)
+	case info.Name == "minecraft:daylight_detector":
+		return c.ToggleDaylightDetector(x, y, z)
 	case info.Name == "minecraft:note_block":
 		_, _, _, res := c.TuneNoteBlock(x, y, z)
 		return true, res
@@ -1201,7 +1285,9 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 
 // stepRedstoneUpdate executes a scheduled UpdateRedstone tick at (x, y, z) for
 // buttons (timed release), pressure plates (entity re-check / release),
-// repeaters (delayed turn-on / turn-off), comparators, and redstone torches (delayed inversion).
+// repeaters (delayed turn-on / turn-off), comparators, redstone torches,
+// redstone lamps, observers, target blocks, lightning rods, tripwires, pistons,
+// dispensers, droppers, and crafters.
 func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 	if y < MinY || y >= MinY+WorldHeight {
 		return
@@ -1246,6 +1332,43 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 		if valid && c.setBlockRecorded(x, y, z, nextState, res) {
 			c.propagateRedstoneAround(x, y, z, state, nextState, res)
 		}
+
+	case name == "minecraft:redstone_lamp":
+		if props["lit"] == "true" && !c.IsBlockPowered(x, y, z) {
+			if nextState, ok := withStateProperty(state, "lit", "false"); ok {
+				c.setBlockRecorded(x, y, z, nextState, res)
+			}
+		}
+
+	case name == "minecraft:observer":
+		c.stepObserverUpdate(x, y, z, state, info, res)
+
+	case name == "minecraft:target":
+		if props["power"] != "0" {
+			if nextState, ok := withStateProperty(state, "power", "0"); ok {
+				if c.setBlockRecorded(x, y, z, nextState, res) {
+					c.propagateRedstoneAround(x, y, z, state, nextState, res)
+				}
+			}
+		}
+
+	case name == "minecraft:lightning_rod":
+		if props["powered"] == "true" {
+			if nextState, ok := withStateProperty(state, "powered", "false"); ok {
+				if c.setBlockRecorded(x, y, z, nextState, res) {
+					c.propagateRedstoneAround(x, y, z, state, nextState, res)
+				}
+			}
+		}
+
+	case name == "minecraft:tripwire":
+		c.stepTripwireUpdate(x, y, z, state, info, res)
+
+	case name == "minecraft:tripwire_hook":
+		c.stepTripwireHookUpdate(x, y, z, state, info, res)
+
+	case name == "minecraft:piston" || name == "minecraft:sticky_piston":
+		c.stepPistonUpdate(x, y, z, state, info, res)
 
 	case name == "minecraft:repeater":
 		locked := c.isRepeaterLockedAt(x, y, z, props["facing"])
@@ -1405,14 +1528,15 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 				c.evaluateTrapdoorRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
 			case info.Name == "minecraft:redstone_lamp":
-				wantLit := "false"
 				if c.IsBlockPowered(pos.X, pos.Y, pos.Z) {
-					wantLit = "true"
-				}
-				if info.Properties["lit"] != wantLit {
-					if nextSt, ok := withStateProperty(st, "lit", wantLit); ok {
-						c.setBlockRecorded(pos.X, pos.Y, pos.Z, nextSt, res)
+					if info.Properties["lit"] != "true" {
+						if nextSt, ok := withStateProperty(st, "lit", "true"); ok {
+							c.setBlockRecorded(pos.X, pos.Y, pos.Z, nextSt, res)
+						}
 					}
+				} else if info.Properties["lit"] == "true" {
+					// Vanilla RedstoneLampBlock: turns ON immediately, but turns OFF after 4 game ticks (2 redstone ticks).
+					c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, RedstoneLampTurnOffDelay)
 				}
 
 			case info.Name == "minecraft:note_block":
@@ -1476,6 +1600,18 @@ func redstoneSupportOf(x, y, z int, state uint16) (BlockPos, bool) {
 	}
 	if info.Name == "minecraft:lever" || strings.HasSuffix(info.Name, "_button") {
 		return attachedSupportPos(x, y, z, info.Properties)
+	}
+	if info.Name == "minecraft:tripwire_hook" {
+		return wallSupportPos(x, y, z, info.Name, info.Properties)
+	}
+	if info.Name == "minecraft:observer" {
+		bx, by, bz := ObserverOutputPos(x, y, z, info.Properties["facing"])
+		return BlockPos{X: bx, Y: by, Z: bz}, true
+	}
+	if info.Name == "minecraft:lightning_rod" {
+		if dx, dy, dz, ok := directionOffset3D(oppositeDirection(info.Properties["facing"])); ok {
+			return BlockPos{X: x + dx, Y: y + dy, Z: z + dz}, true
+		}
 	}
 	if strings.HasSuffix(info.Name, "_pressure_plate") || info.Name == "minecraft:detector_rail" {
 		return BlockPos{X: x, Y: y - 1, Z: z}, true
@@ -1636,11 +1772,11 @@ func (c *Cache) externalPowerForWire(x, y, z int) int {
 		if isBlockNamed(nState, "minecraft:redstone_wire") {
 			continue
 		}
-		var sig int
+		sig := c.emittedSignalFromSource(nx, ny, nz, x, y, z, false, true)
 		if isConductiveSolidBlock(nState) {
-			sig = c.strongPowerToSolidBlock(nx, ny, nz, BlockPos{X: x, Y: y, Z: z}, true, true)
-		} else {
-			sig = c.emittedSignalFromSource(nx, ny, nz, x, y, z, false, true)
+			if sp := c.strongPowerToSolidBlock(nx, ny, nz, BlockPos{X: x, Y: y, Z: z}, true, true); sp > sig {
+				sig = sp
+			}
 		}
 		if sig > best {
 			best = sig
@@ -1921,142 +2057,692 @@ func (c *Cache) evaluateTrapdoorRedstone(x, y, z int, state uint16, info stateNa
 	c.setBlockRecorded(x, y, z, s2, res)
 }
 
-func (c *Cache) isPistonPowered(x, y, z int, facing string) bool {
-	frontDX, frontDY, frontDZ, ok := directionOffset3D(facing)
-	if !ok {
-		return false
+// ComputeTargetBlockHitPower calculates the redstone signal strength (1..15)
+// emitted by a `minecraft:target` block when hit on `face` at coordinates
+// (hitX, hitY, hitZ), matching vanilla TargetBlock.getRedstoneStrength.
+func ComputeTargetBlockHitPower(face string, hitX, hitY, hitZ float64) int {
+	fx := hitX - math.Floor(hitX)
+	fy := hitY - math.Floor(hitY)
+	fz := hitZ - math.Floor(hitZ)
+	// Handle exact 1.0 boundary when local [0..1] coordinates are passed.
+	if hitX == 1.0 {
+		fx = 1.0
 	}
-	frontPos := BlockPos{X: x + frontDX, Y: y + frontDY, Z: z + frontDZ}
-	return c.bestNeighborSignalExcluding(x, y, z, frontPos, true) > 0
+	if hitY == 1.0 {
+		fy = 1.0
+	}
+	if hitZ == 1.0 {
+		fz = 1.0
+	}
+	dx := math.Abs(fx - 0.5)
+	dy := math.Abs(fy - 0.5)
+	dz := math.Abs(fz - 0.5)
+
+	var maxDist float64
+	switch face {
+	case "up", "down":
+		maxDist = math.Max(dx, dz)
+	case "north", "south":
+		maxDist = math.Max(dx, dy)
+	case "east", "west":
+		maxDist = math.Max(dy, dz)
+	default:
+		maxDist = math.Max(dx, math.Max(dy, dz))
+	}
+
+	norm := (0.5 - maxDist) / 0.5
+	if norm < 0 {
+		norm = 0
+	} else if norm > 1 {
+		norm = 1
+	}
+	power := int(math.Ceil(15.0 * norm))
+	if power < 1 {
+		power = 1
+	}
+	if power > MaxRedstonePower {
+		power = MaxRedstonePower
+	}
+	return power
 }
 
-func (c *Cache) evaluatePistonRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) []BlockPos {
-	facing := info.Properties["facing"]
-	if facing == "" {
-		facing = "north"
+// HitTargetBlock applies a projectile hit to a `minecraft:target` block at
+// (x, y, z), setting its `power` property to 1..15 based on accuracy toward the
+// face center and scheduling reset to 0 after 20 ticks (for arrows/tridents,
+// isPersistentProjectile=true) or 8 ticks (for other projectiles).
+func (c *Cache) HitTargetBlock(x, y, z int, face string, hitX, hitY, hitZ float64, isPersistentProjectile bool) (int, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return 0, res
 	}
-	isSticky := info.Name == "minecraft:sticky_piston"
-	isExtended := info.Properties["extended"] == "true"
-	isPowered := c.isPistonPowered(x, y, z, facing)
-
-	if isPowered && !isExtended {
-		return c.tryExtendPiston(x, y, z, state, facing, isSticky, res)
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:target" {
+		return 0, res
 	}
-	if !isPowered && isExtended {
-		return c.retractPiston(x, y, z, state, facing, isSticky, res)
+	power := ComputeTargetBlockHitPower(face, hitX, hitY, hitZ)
+	nextState, ok := withStateProperty(state, "power", strconv.Itoa(power))
+	if !ok {
+		return 0, res
 	}
-	return nil
+	if c.setBlockRecorded(x, y, z, nextState, &res) {
+		c.propagateRedstoneAround(x, y, z, state, nextState, &res)
+	}
+	delay := TargetBlockProjectileTickDelay
+	if isPersistentProjectile {
+		delay = TargetBlockArrowTickDelay
+	}
+	c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
+	return power, res
 }
 
-func (c *Cache) tryExtendPiston(x, y, z int, state uint16, facing string, isSticky bool, res *BlockUpdateResult) []BlockPos {
-	dx, dy, dz, ok := directionOffset3D(facing)
+// StrikeLightningRod powers a `minecraft:lightning_rod` at (x, y, z) to signal
+// strength 15 for LightningRodTickDelay (8) game ticks and propagates redstone
+// updates around the rod and its attached support block.
+func (c *Cache) StrikeLightningRod(x, y, z int) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:lightning_rod" {
+		return false, res
+	}
+	nextState, ok := withStateProperty(state, "powered", "true")
 	if !ok {
-		return nil
+		return false, res
 	}
-
-	var pushed []BlockPos
-	var pushedStates []uint16
-	cx, cy, cz := x+dx, y+dy, z+dz
-
-	for step := 0; step <= MaxPistonPushBlocks; step++ {
-		if cy < MinY || cy >= MinY+WorldHeight {
-			return nil
-		}
-		cur := c.GetBlock(cx, cy, cz)
-		if isAirState(cur) || isPistonDestroyOnPush(cur) {
-			// Found space (or a fragile block that breaks on push) within the 12-block limit.
-			goto canPush
-		}
-		if !canPistonPushBlock(cur) {
-			return nil
-		}
-		if len(pushed) >= MaxPistonPushBlocks {
-			return nil
-		}
-		pushed = append(pushed, BlockPos{X: cx, Y: cy, Z: cz})
-		pushedStates = append(pushedStates, cur)
-		cx += dx
-		cy += dy
-		cz += dz
+	changed := c.setBlockRecorded(x, y, z, nextState, &res)
+	if changed {
+		c.propagateRedstoneAround(x, y, z, state, nextState, &res)
 	}
-	return nil
-
-canPush:
-	var affected []BlockPos
-	// Move pushed blocks 1 cell forward from farthest to nearest.
-	for i := len(pushed) - 1; i >= 0; i-- {
-		dstX := pushed[i].X + dx
-		dstY := pushed[i].Y + dy
-		dstZ := pushed[i].Z + dz
-		c.setBlockRecorded(dstX, dstY, dstZ, pushedStates[i], res)
-		affected = append(affected, BlockPos{X: dstX, Y: dstY, Z: dstZ})
-	}
-
-	headType := "normal"
-	if isSticky {
-		headType = "sticky"
-	}
-	headState, ok := nameToStateID("minecraft:piston_head", map[string]string{
-		"facing": facing,
-		"type":   headType,
-		"short":  "false",
-	})
-	if !ok {
-		return nil
-	}
-	hx, hy, hz := x+dx, y+dy, z+dz
-	c.setBlockRecorded(hx, hy, hz, headState, res)
-	affected = append(affected, BlockPos{X: hx, Y: hy, Z: hz})
-
-	if extState, ok := withStateProperty(state, "extended", "true"); ok {
-		c.setBlockRecorded(x, y, z, extState, res)
-		affected = append(affected, BlockPos{X: x, Y: y, Z: z})
-	}
-
-	for _, pos := range affected {
-		c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
-		c.scheduleAround(pos.X, pos.Y, pos.Z)
-	}
-	return affected
+	c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, LightningRodTickDelay)
+	return changed, res
 }
 
-func (c *Cache) retractPiston(x, y, z int, state uint16, facing string, isSticky bool, res *BlockUpdateResult) []BlockPos {
-	dx, dy, dz, ok := directionOffset3D(facing)
-	if !ok {
-		return nil
+// FindNearestLightningRod searches loaded chunks within `radius` (defaulting to
+// LightningRodRedirectRadius = 128 when radius <= 0) of (centerX, centerY, centerZ)
+// for the nearest `minecraft:lightning_rod`.
+func (c *Cache) FindNearestLightningRod(centerX, centerY, centerZ, radius int) (BlockPos, bool) {
+	if c == nil {
+		return BlockPos{}, false
 	}
-	var affected []BlockPos
-	if retractedState, ok := withStateProperty(state, "extended", "false"); ok {
-		c.setBlockRecorded(x, y, z, retractedState, res)
-		affected = append(affected, BlockPos{X: x, Y: y, Z: z})
+	if radius <= 0 {
+		radius = LightningRodRedirectRadius
+	}
+	// Ensure center chunk is loaded if nothing is resident yet.
+	_ = c.GetBlock(centerX, maxInt(c.minY(), minInt(c.maxY()-1, centerY)), centerZ)
+
+	minX, maxX := centerX-radius, centerX+radius
+	minY, maxY := maxInt(c.minY(), centerY-radius), minInt(c.maxY()-1, centerY+radius)
+	minZ, maxZ := centerZ-radius, centerZ+radius
+	minCX, maxCX := int32(minX>>4), int32(maxX>>4)
+	minCZ, maxCZ := int32(minZ>>4), int32(maxZ>>4)
+
+	c.mu.Lock()
+	candidates := make([]*Chunk, 0, len(c.chunks))
+	for key, ch := range c.chunks {
+		if ch != nil && key[0] >= minCX && key[0] <= maxCX && key[1] >= minCZ && key[1] <= maxCZ {
+			candidates = append(candidates, ch)
+		}
+	}
+	c.mu.Unlock()
+
+	bestDistSq := radius*radius + 1
+	var bestPos BlockPos
+	found := false
+
+	for _, ch := range candidates {
+		chunkBaseX := int(ch.X) * 16
+		chunkBaseZ := int(ch.Z) * 16
+		x0 := maxInt(minX, chunkBaseX)
+		x1 := minInt(maxX, chunkBaseX+15)
+		z0 := maxInt(minZ, chunkBaseZ)
+		z1 := minInt(maxZ, chunkBaseZ+15)
+
+		ch.mu.RLock()
+		for y := minY; y <= maxY; y++ {
+			for z := z0; z <= z1; z++ {
+				for x := x0; x <= x1; x++ {
+					st := ch.getBlock(x, y, z)
+					if st == StateAir || !isBlockNamed(st, "minecraft:lightning_rod") {
+						continue
+					}
+					dx := x - centerX
+					dy := y - centerY
+					dz := z - centerZ
+					distSq := dx*dx + dy*dy + dz*dz
+					if distSq <= radius*radius && (!found || distSq < bestDistSq || (distSq == bestDistSq && y > bestPos.Y)) {
+						bestDistSq = distSq
+						bestPos = BlockPos{X: x, Y: y, Z: z}
+						found = true
+					}
+				}
+			}
+		}
+		ch.mu.RUnlock()
+	}
+	return bestPos, found
+}
+
+// DaylightContextProvider supplies the current world time of day and weather
+// flags for daylight detector evaluation.
+type DaylightContextProvider func() (timeOfDay int64, isRaining, isThundering bool)
+
+var (
+	daylightProviderMu sync.RWMutex
+	daylightProvider   DaylightContextProvider
+)
+
+// SetDaylightContextProvider registers an optional callback for reading world
+// time and weather when evaluating daylight detectors.
+func (c *Cache) SetDaylightContextProvider(fn DaylightContextProvider) {
+	daylightProviderMu.Lock()
+	daylightProvider = fn
+	daylightProviderMu.Unlock()
+}
+
+// ComputeDaylightDetectorSignal calculates the output power (0..15) of a
+// `minecraft:daylight_detector` given sky light (0..15), timeOfDay (ticks),
+// weather flags, and inverted mode, matching vanilla DaylightDetectorBlock.
+func ComputeDaylightDetectorSignal(skyLight int, timeOfDay int64, isRaining, isThundering, inverted bool) int {
+	skyLight = clampPower(skyLight)
+	t := ((timeOfDay % 24000) + 24000) % 24000
+	d := float64(t)/24000.0 - 0.25
+	if d < 0 {
+		d += 1.0
+	}
+	if d > 1 {
+		d -= math.Floor(d)
+	}
+	e := 0.5 - math.Cos(d*math.Pi)/2.0
+	timeFrac := (d*2.0 + e) / 3.0
+	sunAngle := timeFrac * (math.Pi * 2.0)
+
+	rainFactor := 1.0
+	if isRaining || isThundering {
+		rainFactor = 1.0 - 5.0/16.0
+	}
+	thunderFactor := 1.0
+	if isThundering {
+		thunderFactor = 1.0 - 5.0/16.0
+	}
+	cosClamped := math.Cos(sunAngle)
+	if cosClamped < -0.25 {
+		cosClamped = -0.25
+	} else if cosClamped > 0.25 {
+		cosClamped = 0.25
+	}
+	fBright := 0.5 + 2.0*cosClamped
+	skyDarken := int((1.0 - fBright*rainFactor*thunderFactor) * 11.0)
+
+	i := skyLight - skyDarken
+	if inverted {
+		return clampPower(15 - i)
+	}
+	if i > 0 {
+		targetAngle := 0.0
+		if sunAngle >= math.Pi {
+			targetAngle = math.Pi * 2.0
+		}
+		adjAngle := sunAngle + (targetAngle-sunAngle)*0.2
+		i = int(math.Round(float64(i) * math.Cos(adjAngle)))
+	}
+	return clampPower(i)
+}
+
+func (c *Cache) skyLightAt(x, y, z int) int {
+	if c == nil || !c.DimensionType().HasSkylight {
+		return 0
+	}
+	if y < c.minY() || y >= c.maxY() {
+		return MaxRedstonePower
+	}
+	cx, cz := int32(x>>4), int32(z>>4)
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil || ch == nil {
+		return MaxRedstonePower
+	}
+	ch.mu.RLock()
+	defer ch.mu.RUnlock()
+	if ch.lightReady && !ch.noSkylight {
+		return int(ch.getLight(false, x&15, y, z&15))
+	}
+	sky := MaxRedstonePower
+	for sy := c.maxY() - 1; sy > y; sy-- {
+		st := ch.getBlock(x, sy, z)
+		if st == StateAir {
+			continue
+		}
+		op := int(lightOpacity(st))
+		if op >= MaxRedstonePower {
+			return 0
+		}
+		sky -= op
+		if sky <= 0 {
+			return 0
+		}
+	}
+	return clampPower(sky)
+}
+
+func (c *Cache) currentDaylightContext() (int64, bool, bool) {
+	daylightProviderMu.RLock()
+	fn := daylightProvider
+	daylightProviderMu.RUnlock()
+	if fn != nil {
+		return fn()
+	}
+	return 6000, false, false
+}
+
+// UpdateDaylightDetectorAt recalculates and updates the `power` property of a
+// `minecraft:daylight_detector` at (x, y, z) using the given sky time and weather.
+func (c *Cache) UpdateDaylightDetectorAt(x, y, z int, timeOfDay int64, isRaining, isThundering bool) (int, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return 0, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:daylight_detector" {
+		return 0, res
+	}
+	if !c.DimensionType().HasSkylight {
+		return 0, res
+	}
+	inverted := info.Properties["inverted"] == "true"
+	skyLight := c.skyLightAt(x, y, z)
+	power := ComputeDaylightDetectorSignal(skyLight, timeOfDay, isRaining, isThundering, inverted)
+	curPower, _ := strconv.Atoi(info.Properties["power"])
+	if curPower != power {
+		if nextState, ok := withStateProperty(state, "power", strconv.Itoa(power)); ok {
+			if c.setBlockRecorded(x, y, z, nextState, &res) {
+				c.propagateRedstoneAround(x, y, z, state, nextState, &res)
+			}
+		}
+	}
+	return power, res
+}
+
+// ToggleDaylightDetector toggles the `inverted` property on a
+// `minecraft:daylight_detector` at (x, y, z) and immediately recalculates its
+// emitted signal.
+func (c *Cache) ToggleDaylightDetector(x, y, z int) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:daylight_detector" {
+		return false, res
+	}
+	nextInverted := "true"
+	invertedBool := true
+	if info.Properties["inverted"] == "true" {
+		nextInverted = "false"
+		invertedBool = false
+	}
+	nextState, ok := withStateProperty(state, "inverted", nextInverted)
+	if !ok {
+		return false, res
+	}
+	if c.DimensionType().HasSkylight {
+		timeOfDay, isRaining, isThundering := c.currentDaylightContext()
+		skyLight := c.skyLightAt(x, y, z)
+		power := ComputeDaylightDetectorSignal(skyLight, timeOfDay, isRaining, isThundering, invertedBool)
+		if s2, ok := withStateProperty(nextState, "power", strconv.Itoa(power)); ok {
+			nextState = s2
+		}
+	} else {
+		if s2, ok := withStateProperty(nextState, "power", "0"); ok {
+			nextState = s2
+		}
+	}
+	if c.setBlockRecorded(x, y, z, nextState, &res) {
+		c.propagateRedstoneAround(x, y, z, state, nextState, &res)
+		return true, res
+	}
+	return false, res
+}
+
+// TripwireEntityCheckFunc reports whether at least one non-spectator entity
+// capable of triggering tripwire currently intersects the tripwire block at (x, y, z).
+type TripwireEntityCheckFunc func(x, y, z int) bool
+
+var (
+	tripwireEntityMu    sync.RWMutex
+	tripwireEntityCheck TripwireEntityCheckFunc
+)
+
+// SetTripwireEntityCheck registers an optional callback used when a tripwire's
+// scheduled tick re-evaluates whether entities are still standing on it.
+func (c *Cache) SetTripwireEntityCheck(fn TripwireEntityCheckFunc) {
+	tripwireEntityMu.Lock()
+	tripwireEntityCheck = fn
+	tripwireEntityMu.Unlock()
+}
+
+func (c *Cache) hasEntityOnTripwire(x, y, z int) bool {
+	tripwireEntityMu.RLock()
+	fn := tripwireEntityCheck
+	tripwireEntityMu.RUnlock()
+	if fn != nil {
+		return fn(x, y, z)
+	}
+	return false
+}
+
+func (c *Cache) updateTripwireHorizontalConnections(x, y, z int, res *BlockUpdateResult) {
+	if y < MinY || y >= MinY+WorldHeight {
+		return
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:tripwire" {
+		return
+	}
+	cur := state
+	for _, d := range cardinalDirs {
+		nx, nz := x+d.dx, z+d.dz
+		nState := c.GetBlock(nx, y, nz)
+		nInfo, nOK := stateByID(nState)
+		connected := false
+		if nOK {
+			if nInfo.Name == "minecraft:tripwire" {
+				connected = true
+			} else if nInfo.Name == "minecraft:tripwire_hook" && nInfo.Properties["facing"] == d.opposite {
+				connected = true
+			}
+		}
+		want := "false"
+		if connected {
+			want = "true"
+		}
+		if nextSt, ok := withStateProperty(cur, d.name, want); ok {
+			cur = nextSt
+		}
+	}
+	if cur != state {
+		c.setBlockRecorded(x, y, z, cur, res)
+	}
+}
+
+func (c *Cache) recalculateTripwireLineFromHook(hx, hy, hz int, forcePulse bool, res *BlockUpdateResult) {
+	if hy < MinY || hy >= MinY+WorldHeight {
+		return
+	}
+	hookState := c.GetBlock(hx, hy, hz)
+	hookInfo, ok := stateByID(hookState)
+	if !ok || hookInfo.Name != "minecraft:tripwire_hook" {
+		return
+	}
+	facing := hookInfo.Properties["facing"]
+	dx, dz := 0, 0
+	for _, d := range cardinalDirs {
+		if d.name == facing {
+			dx, dz = d.dx, d.dz
+			break
+		}
+	}
+	if dx == 0 && dz == 0 {
+		return
+	}
+	oppFacing := oppositeDirection(facing)
+
+	var wirePositions []BlockPos
+	var partnerPos *BlockPos
+	var partnerState uint16
+	linePowered := forcePulse
+
+	for dist := 1; dist <= MaxTripwireDistance; dist++ {
+		wx, wz := hx+dx*dist, hz+dz*dist
+		st := c.GetBlock(wx, hy, wz)
+		info, ok := stateByID(st)
+		if !ok {
+			break
+		}
+		if info.Name == "minecraft:tripwire_hook" {
+			if info.Properties["facing"] == oppFacing && dist >= 2 {
+				pos := BlockPos{X: wx, Y: hy, Z: wz}
+				partnerPos = &pos
+				partnerState = st
+			}
+			break
+		}
+		if info.Name == "minecraft:tripwire" {
+			wirePositions = append(wirePositions, BlockPos{X: wx, Y: hy, Z: wz})
+			if info.Properties["disarmed"] != "true" && info.Properties["powered"] == "true" {
+				linePowered = true
+			}
+			continue
+		}
+		break
 	}
 
-	hx, hy, hz := x+dx, y+dy, z+dz
-	if hy >= MinY && hy < MinY+WorldHeight {
-		headState := c.GetBlock(hx, hy, hz)
-		if isBlockNamed(headState, "minecraft:piston_head") {
-			c.setBlockRecorded(hx, hy, hz, StateAir, res)
-			affected = append(affected, BlockPos{X: hx, Y: hy, Z: hz})
+	nextAttached := partnerPos != nil
+	nextPowered := (nextAttached && linePowered) || (forcePulse && hookInfo.Properties["attached"] == "true")
+	if forcePulse {
+		nextAttached = false
+	}
+
+	attachedStr := "false"
+	if nextAttached {
+		attachedStr = "true"
+	}
+	poweredStr := "false"
+	if nextPowered {
+		poweredStr = "true"
+	}
+
+	applyHookState := func(x, y, z int, origState uint16) {
+		cur := origState
+		if s1, ok := withStateProperty(cur, "attached", attachedStr); ok {
+			cur = s1
+		}
+		if s2, ok := withStateProperty(cur, "powered", poweredStr); ok {
+			cur = s2
+		}
+		if cur != origState {
+			if c.setBlockRecorded(x, y, z, cur, res) {
+				c.propagateRedstoneAround(x, y, z, origState, cur, res)
+			}
+		}
+		if nextPowered {
+			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, TripwireTickDelay)
 		}
 	}
 
-	if isSticky {
-		px, py, pz := x+2*dx, y+2*dy, z+2*dz
-		if py >= MinY && py < MinY+WorldHeight && hy >= MinY && hy < MinY+WorldHeight {
-			pulled := c.GetBlock(px, py, pz)
-			if !isAirState(pulled) && !isPistonDestroyOnPush(pulled) && canPistonPushBlock(pulled) {
-				c.setBlockRecorded(hx, hy, hz, pulled, res)
-				c.setBlockRecorded(px, py, pz, StateAir, res)
-				affected = append(affected, BlockPos{X: px, Y: py, Z: pz})
+	applyHookState(hx, hy, hz, hookState)
+	if partnerPos != nil {
+		applyHookState(partnerPos.X, partnerPos.Y, partnerPos.Z, partnerState)
+	}
+
+	for _, wp := range wirePositions {
+		wSt := c.GetBlock(wp.X, wp.Y, wp.Z)
+		if !isBlockNamed(wSt, "minecraft:tripwire") {
+			continue
+		}
+		if nextW, ok := withStateProperty(wSt, "attached", attachedStr); ok && nextW != wSt {
+			c.setBlockRecorded(wp.X, wp.Y, wp.Z, nextW, res)
+		}
+		c.updateTripwireHorizontalConnections(wp.X, wp.Y, wp.Z, res)
+	}
+}
+
+func (c *Cache) recalculateTripwireAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return
+	}
+	oldInfo, oldOK := stateByID(oldState)
+	newInfo, newOK := stateByID(newState)
+	wasTripwire := oldOK && (oldInfo.Name == "minecraft:tripwire" || oldInfo.Name == "minecraft:tripwire_hook")
+	isTripwire := newOK && (newInfo.Name == "minecraft:tripwire" || newInfo.Name == "minecraft:tripwire_hook")
+	if !wasTripwire && !isTripwire {
+		return
+	}
+
+	if newOK && newInfo.Name == "minecraft:tripwire" {
+		c.updateTripwireHorizontalConnections(x, y, z, res)
+	}
+	for _, d := range cardinalDirs {
+		c.updateTripwireHorizontalConnections(x+d.dx, y, z+d.dz, res)
+	}
+
+	// Check if an attached, non-disarmed tripwire was broken without shears.
+	forcePulse := oldOK && oldInfo.Name == "minecraft:tripwire" &&
+		(!newOK || newInfo.Name != "minecraft:tripwire") &&
+		oldInfo.Properties["attached"] == "true" &&
+		oldInfo.Properties["disarmed"] != "true"
+
+	if newOK && newInfo.Name == "minecraft:tripwire_hook" {
+		c.recalculateTripwireLineFromHook(x, y, z, false, res)
+	}
+	if oldOK && oldInfo.Name == "minecraft:tripwire_hook" && (!newOK || newInfo.Name != "minecraft:tripwire_hook") {
+		facing := oldInfo.Properties["facing"]
+		for _, d := range cardinalDirs {
+			if d.name == facing {
+				for dist := 1; dist <= MaxTripwireDistance; dist++ {
+					wx, wz := x+d.dx*dist, z+d.dz*dist
+					st := c.GetBlock(wx, y, wz)
+					info, ok := stateByID(st)
+					if !ok {
+						break
+					}
+					if info.Name == "minecraft:tripwire" {
+						if nextW, ok := withStateProperty(st, "attached", "false"); ok && nextW != st {
+							c.setBlockRecorded(wx, y, wz, nextW, res)
+						}
+						c.updateTripwireHorizontalConnections(wx, y, wz, res)
+						continue
+					}
+					if info.Name == "minecraft:tripwire_hook" && info.Properties["facing"] == d.opposite {
+						c.recalculateTripwireLineFromHook(wx, y, wz, false, res)
+					}
+					break
+				}
 			}
 		}
 	}
 
-	for _, pos := range affected {
-		c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
-		c.scheduleAround(pos.X, pos.Y, pos.Z)
+	// Scan in all 4 cardinal directions up to MaxTripwireDistance for hooks facing toward (x, y, z).
+	for _, d := range cardinalDirs {
+		for dist := 1; dist <= MaxTripwireDistance; dist++ {
+			hx, hz := x+d.dx*dist, z+d.dz*dist
+			st := c.GetBlock(hx, y, hz)
+			info, ok := stateByID(st)
+			if !ok {
+				break
+			}
+			if info.Name == "minecraft:tripwire_hook" {
+				if info.Properties["facing"] == d.opposite {
+					c.recalculateTripwireLineFromHook(hx, y, hz, forcePulse, res)
+				}
+				break
+			}
+			if info.Name != "minecraft:tripwire" {
+				break
+			}
+		}
 	}
-	return affected
+}
+
+// StepOnTripwire activates the `minecraft:tripwire` at (x, y, z) when an entity
+// steps into its bounding box, powering any attached `minecraft:tripwire_hook`
+// pair and scheduling a 10-tick re-evaluation.
+func (c *Cache) StepOnTripwire(x, y, z int) (bool, BlockUpdateResult) {
+	return c.UpdateTripwireEntities(x, y, z, true)
+}
+
+// UpdateTripwireEntities updates a `minecraft:tripwire` at (x, y, z) based on
+// whether entities currently intersect it (`hasEntities`), propagating power to
+// any attached `minecraft:tripwire_hook` pair.
+func (c *Cache) UpdateTripwireEntities(x, y, z int, hasEntities bool) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:tripwire" {
+		return false, res
+	}
+	wantPowered := "false"
+	if hasEntities {
+		wantPowered = "true"
+	}
+	changed := false
+	curState := state
+	if info.Properties["powered"] != wantPowered {
+		if nextState, ok := withStateProperty(state, "powered", wantPowered); ok {
+			if c.setBlockRecorded(x, y, z, nextState, &res) {
+				curState = nextState
+				changed = true
+				c.propagateRedstoneAround(x, y, z, state, nextState, &res)
+			}
+		}
+	}
+	if hasEntities {
+		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, TripwireTickDelay)
+	}
+	c.recalculateTripwireAround(x, y, z, state, curState, &res)
+	return changed, res
+}
+
+// BreakTripwireAt breaks a `minecraft:tripwire` at (x, y, z). When `withShears`
+// is true, the tripwire is disarmed (`disarmed="true"`) prior to removal so that
+// attached tripwire hooks detach silently without emitting a 10-tick redstone
+// pulse. When `withShears` is false, attached hooks emit a 10-tick pulse.
+func (c *Cache) BreakTripwireAt(x, y, z int, withShears bool) BlockUpdateResult {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:tripwire" {
+		_, res = c.BreakBlockWithUpdates(x, y, z)
+		return res
+	}
+	if withShears {
+		if disarmedState, ok := withStateProperty(state, "disarmed", "true"); ok {
+			c.SetBlock(x, y, z, disarmedState)
+		}
+	}
+	_, res = c.BreakBlockWithUpdates(x, y, z)
+	return res
+}
+
+func (c *Cache) stepTripwireUpdate(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	if info.Properties["powered"] != "true" {
+		return
+	}
+	if c.hasEntityOnTripwire(x, y, z) {
+		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, TripwireTickDelay)
+		return
+	}
+	if nextState, ok := withStateProperty(state, "powered", "false"); ok {
+		if c.setBlockRecorded(x, y, z, nextState, res) {
+			c.propagateRedstoneAround(x, y, z, state, nextState, res)
+			c.recalculateTripwireAround(x, y, z, state, nextState, res)
+		}
+	}
+}
+
+func (c *Cache) stepTripwireHookUpdate(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	if info.Properties["attached"] != "true" {
+		if info.Properties["powered"] == "true" {
+			if nextState, ok := withStateProperty(state, "powered", "false"); ok {
+				if c.setBlockRecorded(x, y, z, nextState, res) {
+					c.propagateRedstoneAround(x, y, z, state, nextState, res)
+				}
+			}
+		}
+		return
+	}
+	c.recalculateTripwireLineFromHook(x, y, z, false, res)
 }
 
 func isPistonDestroyOnPush(state uint16) bool {
@@ -2076,7 +2762,7 @@ func isPistonDestroyOnPush(state uint16) bool {
 	}
 	if strings.HasSuffix(name, "_button") || strings.HasSuffix(name, "_pressure_plate") ||
 		strings.HasSuffix(name, "_carpet") || strings.HasSuffix(name, "_bed") ||
-		strings.HasSuffix(name, "_candle") {
+		strings.HasSuffix(name, "_candle") || strings.HasSuffix(name, "_amethyst_bud") {
 		return true
 	}
 	switch name {
@@ -2093,7 +2779,9 @@ func isPistonDestroyOnPush(state uint16) bool {
 		"minecraft:cave_vines", "minecraft:cave_vines_plant",
 		"minecraft:weeping_vines", "minecraft:weeping_vines_plant",
 		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
-		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:kelp", "minecraft:kelp_plant":
+		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:decorated_pot", "minecraft:amethyst_cluster", "minecraft:lily_pad",
+		"minecraft:frogspawn", "minecraft:turtle_egg", "minecraft:sniffer_egg":
 		return true
 	}
 	return false
@@ -2114,7 +2802,9 @@ func canPistonPushBlock(state uint16) bool {
 	if strings.HasSuffix(name, "_door") && !strings.HasSuffix(name, "_trapdoor") {
 		return false
 	}
-	if strings.HasSuffix(name, "_sign") || strings.HasSuffix(name, "_banner") {
+	if strings.HasSuffix(name, "_sign") || strings.HasSuffix(name, "_banner") ||
+		strings.HasSuffix(name, "_hanging_sign") || strings.HasSuffix(name, "_head") ||
+		strings.HasSuffix(name, "_skull") {
 		return false
 	}
 	switch name {
@@ -2135,7 +2825,9 @@ func canPistonPushBlock(state uint16) bool {
 		"minecraft:hopper", "minecraft:dropper", "minecraft:dispenser",
 		"minecraft:brewing_stand", "minecraft:jukebox", "minecraft:campfire",
 		"minecraft:soul_campfire", "minecraft:chiseled_bookshelf", "minecraft:decorated_pot",
-		"minecraft:crafter", "minecraft:bell", "minecraft:daylight_detector":
+		"minecraft:crafter", "minecraft:bell", "minecraft:daylight_detector",
+		"minecraft:beehive", "minecraft:bee_nest", "minecraft:Suspicious_sand",
+		"minecraft:suspicious_sand", "minecraft:suspicious_gravel":
 		return false
 	case "minecraft:piston", "minecraft:sticky_piston":
 		return info.Properties["extended"] != "true"

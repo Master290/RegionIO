@@ -180,6 +180,7 @@ func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpd
 	}
 	if oldState != targetState {
 		res.appendChange(BlockPos{X: x, Y: y, Z: z}, oldState, targetState, lightChanged)
+		c.notifyObserversOfChangeAt(x, y, z, oldState, targetState)
 	}
 	c.applyImmediatePostPlacement(x, y, z, oldState, targetState, &res)
 	return true, res
@@ -322,6 +323,7 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 		return false
 	}
 	res.appendChange(BlockPos{X: x, Y: y, Z: z}, oldState, newState, light)
+	c.notifyObserversOfChangeAt(x, y, z, oldState, newState)
 	return true
 }
 
@@ -340,7 +342,7 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return updated
 		}
 	}
-	if isBlockNamed(state, "minecraft:decorated_pot") && c.GetBlock(x, y, z) == StateWater {
+	if (isBlockNamed(state, "minecraft:decorated_pot") || isBlockNamed(state, "minecraft:lightning_rod")) && c.GetBlock(x, y, z) == StateWater {
 		if updated, ok := withStateProperty(state, "waterlogged", "true"); ok {
 			return updated
 		}
@@ -398,9 +400,15 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 		c.checkFluidContactReactions(x, y, z, res)
 	}
 
-	// Break double-block partner (doors, tall plants) when one half is removed.
+	// Break double-block partner (doors, tall plants, extended pistons/heads) when one half is removed.
 	if !isSameBlockType(oldState, newState) {
 		c.propagateMultiBlockPartnerBreak(x, y, z, oldState, res)
+	}
+
+	// Update tripwire horizontal connections and hook-to-hook attachment when tripwire or tripwire_hook changes.
+	if isBlockNamed(oldState, "minecraft:tripwire") || isBlockNamed(oldState, "minecraft:tripwire_hook") ||
+		isBlockNamed(newState, "minecraft:tripwire") || isBlockNamed(newState, "minecraft:tripwire_hook") {
+		c.recalculateTripwireAround(x, y, z, oldState, newState, res)
 	}
 
 	// Propagate support/survival checks across neighbors (and chains like cacti,
@@ -448,10 +456,43 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 }
 
 // propagateMultiBlockPartnerBreak removes the other half of a two-block-tall
-// plant or door when one half is broken.
+// plant, door, or extended piston/piston_head when one half is broken.
 func (c *Cache) propagateMultiBlockPartnerBreak(x, y, z int, brokenState uint16, res *BlockUpdateResult) {
 	info, ok := stateByID(brokenState)
 	if !ok {
+		return
+	}
+	switch info.Name {
+	case "minecraft:piston", "minecraft:sticky_piston":
+		if info.Properties["extended"] == "true" {
+			if dx, dy, dz, ok := directionOffset3D(info.Properties["facing"]); ok {
+				hx, hy, hz := x+dx, y+dy, z+dz
+				if hy >= MinY && hy < MinY+WorldHeight {
+					hState := c.GetBlock(hx, hy, hz)
+					if hInfo, ok := stateByID(hState); ok && hInfo.Name == "minecraft:piston_head" && hInfo.Properties["facing"] == info.Properties["facing"] {
+						if c.setBlockRecorded(hx, hy, hz, StateAir, res) {
+							c.scheduleAround(hx, hy, hz)
+						}
+					}
+				}
+			}
+		}
+		return
+	case "minecraft:piston_head":
+		if dx, dy, dz, ok := directionOffset3D(info.Properties["facing"]); ok {
+			bx, by, bz := x-dx, y-dy, z-dz
+			if by >= MinY && by < MinY+WorldHeight {
+				bState := c.GetBlock(bx, by, bz)
+				if bInfo, ok := stateByID(bState); ok &&
+					(bInfo.Name == "minecraft:piston" || bInfo.Name == "minecraft:sticky_piston") &&
+					bInfo.Properties["facing"] == info.Properties["facing"] &&
+					bInfo.Properties["extended"] == "true" {
+					if c.setBlockRecorded(bx, by, bz, StateAir, res) {
+						c.scheduleAround(bx, by, bz)
+					}
+				}
+			}
+		}
 		return
 	}
 	half := info.Properties["half"]
@@ -555,6 +596,22 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 	}
 	if name == "minecraft:nether_portal" {
 		if !c.isCompletePortalAt(x, y, z, props["axis"]) {
+			return StateAir, false
+		}
+		return state, true
+	}
+	if name == "minecraft:piston_head" {
+		dx, dy, dz, ok := directionOffset3D(props["facing"])
+		if !ok {
+			return StateAir, false
+		}
+		bx, by, bz := x-dx, y-dy, z-dz
+		if by < MinY || by >= MinY+WorldHeight {
+			return StateAir, false
+		}
+		bInfo, ok := stateByID(c.GetBlock(bx, by, bz))
+		if !ok || (bInfo.Name != "minecraft:piston" && bInfo.Name != "minecraft:sticky_piston") ||
+			bInfo.Properties["facing"] != props["facing"] || bInfo.Properties["extended"] != "true" {
 			return StateAir, false
 		}
 		return state, true
