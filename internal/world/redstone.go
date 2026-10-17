@@ -14,6 +14,7 @@ const (
 	PressurePlateTickDelay = 20 // Minimum pressed hold / re-check interval for pressure plates (20 ticks)
 	RedstoneTorchTickDelay = 2  // Redstone torch inversion delay (2 ticks = 1 redstone tick)
 	ComparatorTickDelay    = 2  // Redstone comparator evaluation delay (2 ticks = 1 redstone tick)
+	DispenserTickDelay     = 4  // Dispenser / dropper activation delay (4 game ticks = 2 redstone ticks)
 	MaxPistonPushBlocks    = 12 // Maximum number of blocks a piston can push in a line
 )
 
@@ -21,7 +22,27 @@ var (
 	pressurePlateCounters     sync.Map // map[*Cache]func(x, y, z int) int
 	comparatorSignalProviders sync.Map // map[*Cache]func(x, y, z int) int
 	jukeboxPowerProviders     sync.Map // map[*Cache]func(x, y, z int) int
+	dispenserFireListeners    sync.Map // map[*Cache]func(x, y, z int, isDropper bool)
 )
+
+// SetDispenserFireListener registers an optional callback invoked when a
+// scheduled 4-tick redstone update fires on a triggered dispenser or dropper at
+// (x, y, z).
+func (c *Cache) SetDispenserFireListener(fn func(x, y, z int, isDropper bool)) {
+	if fn == nil {
+		dispenserFireListeners.Delete(c)
+		return
+	}
+	dispenserFireListeners.Store(c, fn)
+}
+
+func (c *Cache) fireDispenserAt(x, y, z int, isDropper bool) {
+	if v, ok := dispenserFireListeners.Load(c); ok && v != nil {
+		if fn, ok := v.(func(int, int, int, bool)); ok && fn != nil {
+			fn(x, y, z, isDropper)
+		}
+	}
+}
 
 // SetPressurePlateEntityCounter registers an optional callback used when a
 // pressure plate's scheduled release tick fires to check how many entities still
@@ -227,7 +248,8 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:redstone_lamp", "minecraft:note_block", "minecraft:jukebox",
 		"minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
-		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
+		"minecraft:dispenser", "minecraft:dropper":
 		return true
 	}
 	return strings.HasSuffix(name, "_button") ||
@@ -250,7 +272,7 @@ func isConductiveSolidBlock(state uint16) bool {
 		return false
 	}
 	name := info.Name
-	if isRedstoneComponentName(name) && name != "minecraft:note_block" {
+	if isRedstoneComponentName(name) && name != "minecraft:note_block" && name != "minecraft:dispenser" && name != "minecraft:dropper" {
 		return false
 	}
 	if strings.HasSuffix(name, "_glass") || strings.HasSuffix(name, "_stained_glass") ||
@@ -906,10 +928,14 @@ func hasAnalogOutputSignal(state uint16) bool {
 		"minecraft:cauldron", "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron",
 		"minecraft:cake", "minecraft:end_portal_frame", "minecraft:respawn_anchor",
 		"minecraft:beehive", "minecraft:bee_nest", "minecraft:brewing_stand",
-		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
+		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper",
+		"minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel",
+		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker",
+		"minecraft:chiseled_bookshelf", "minecraft:decorated_pot", "minecraft:crafter":
 		return true
 	}
-	return false
+	return strings.HasSuffix(info.Name, "shulker_box")
 }
 
 func (c *Cache) comparatorRearSignal(x, y, z int, facing string) int {
@@ -989,6 +1015,9 @@ func (c *Cache) analogSignalAt(x, y, z int) int {
 	switch info.Name {
 	case "minecraft:composter":
 		lvl, _ := strconv.Atoi(info.Properties["level"])
+		blockSig = clampPower(lvl)
+	case "minecraft:beehive", "minecraft:bee_nest":
+		lvl, _ := strconv.Atoi(info.Properties["honey_level"])
 		blockSig = clampPower(lvl)
 	case "minecraft:water_cauldron", "minecraft:powder_snow_cauldron":
 		lvl, _ := strconv.Atoi(info.Properties["level"])
@@ -1225,13 +1254,16 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 			newState := c.GetBlock(x, y, z)
 			c.propagateRedstoneAround(x, y, z, state, newState, res)
 		}
+
+	case name == "minecraft:dispenser" || name == "minecraft:dropper":
+		c.fireDispenserAt(x, y, z, name == "minecraft:dropper")
 	}
 }
 
 // propagateRedstoneAround recalculates redstone dust connection shapes and
 // power levels (0..15 with decay), evaluates redstone torch inversions and
 // comparators, schedules repeater delays, and updates doors, trapdoors, lamps,
-// note blocks, and pistons affected by a change at (x, y, z).
+// note blocks, dispensers, droppers, and pistons affected by a change at (x, y, z).
 func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
 	toggledTorches := make(map[BlockPos]bool)
 	evaluatedComparators := make(map[BlockPos]int)
@@ -1331,6 +1363,9 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 
 			case info.Name == "minecraft:note_block":
 				c.evaluateNoteBlockRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
+			case info.Name == "minecraft:dispenser" || info.Name == "minecraft:dropper":
+				c.evaluateDispenserRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
 			case info.Name == "minecraft:piston" || info.Name == "minecraft:sticky_piston":
 				pistonChanged := c.evaluatePistonRedstone(pos.X, pos.Y, pos.Z, st, info, res)
@@ -2069,11 +2104,8 @@ func (c *Cache) CalibratedSculkSensorInputPower(x, y, z int) int {
 	sig := c.repeaterInputSignal(x, y, z, facing)
 	inDX, inDZ := RepeaterInputOffset(facing)
 	ix, iy, iz := x+inDX, y, z+inDZ
-	inState := c.GetBlock(ix, iy, iz)
-	if hasAnalogOutputSignal(inState) {
-		if analog := c.analogSignalAt(ix, iy, iz); analog > sig {
-			sig = analog
-		}
+	if analog := c.analogSignalAt(ix, iy, iz); analog > sig {
+		sig = analog
 	}
 	return clampPower(sig)
 }
@@ -2096,6 +2128,65 @@ func (c *Cache) ApplySculkSensorRedstoneState(x, y, z int, nextState uint16) (bo
 		return true, res
 	}
 	return false, res
+}
+
+// IsDispenserOrDropper reports whether state is `minecraft:dispenser` or `minecraft:dropper`.
+func IsDispenserOrDropper(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	return info.Name == "minecraft:dispenser" || info.Name == "minecraft:dropper"
+}
+
+// IsDispenserPowered reports whether a dispenser or dropper at (x, y, z)
+// receives redstone power directly or via quasi-connectivity from (x, y+1, z),
+// matching vanilla DispenserBlock.neighborChanged.
+func (c *Cache) IsDispenserPowered(x, y, z int) bool {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false
+	}
+	if c.IsBlockPowered(x, y, z) {
+		return true
+	}
+	if y+1 < MinY+WorldHeight && c.IsBlockPowered(x, y+1, z) {
+		return true
+	}
+	return false
+}
+
+func (c *Cache) evaluateDispenserRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+	powered := c.IsDispenserPowered(x, y, z)
+	wasTriggered := info.Properties["triggered"] == "true"
+	if powered && !wasTriggered {
+		if nextSt, ok := withStateProperty(state, "triggered", "true"); ok {
+			c.setBlockRecorded(x, y, z, nextSt, res)
+		}
+		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, DispenserTickDelay)
+	} else if !powered && wasTriggered {
+		if nextSt, ok := withStateProperty(state, "triggered", "false"); ok {
+			c.setBlockRecorded(x, y, z, nextSt, res)
+		}
+	}
+}
+
+// BlockProperties returns a copy of the state property map for state (or nil if none).
+func BlockProperties(state uint16) map[string]string {
+	info, ok := stateByID(state)
+	if !ok || len(info.Properties) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(info.Properties))
+	for k, v := range info.Properties {
+		out[k] = v
+	}
+	return out
+}
+
+// WithBlockProperty returns the block state ID obtained by setting property
+// prop=val on state, or (0, false) if invalid.
+func WithBlockProperty(state uint16, prop, val string) (uint16, bool) {
+	return withStateProperty(state, prop, val)
 }
 
 

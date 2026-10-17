@@ -73,6 +73,8 @@ func EncodeNoteParticlePacket(x, y, z float64, note int) []byte {
 //  4. Cauldrons (0..3) via s.CauldronComparatorSignalAt
 //  5. Brewing stands (0..15) via s.BrewingStandComparatorSignalAt
 //  6. Sculk sensors & calibrated sculk sensors (0..15) via s.SculkSensorComparatorSignalAt
+//  7. Dispensers & droppers (0..15) via s.DispenserComparatorSignalAt
+//  8. Chests, barrels, shulker boxes, hoppers, & furnaces (0..15) via s.ContainerComparatorSignalAt
 func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if s == nil {
 		return 0
@@ -97,6 +99,12 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if sculkSig := s.SculkSensorComparatorSignalAt(targetDim, x, y, z); sculkSig > best {
 		best = sculkSig
 	}
+	if dispSig := s.DispenserComparatorSignalAt(targetDim, x, y, z); dispSig > best {
+		best = dispSig
+	}
+	if contSig := s.ContainerComparatorSignalAt(targetDim, x, y, z); contSig > best {
+		best = contSig
+	}
 	if best < 0 {
 		return 0
 	}
@@ -107,8 +115,9 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 }
 
 // BindNoteBlockAndJukeboxRedstone binds comparator signal providers (item
-// frames, lecterns, jukeboxes), jukebox active-playback redstone power, and
-// note block play packet broadcasting onto the world cache for dim.
+// frames, lecterns, jukeboxes, dispensers, droppers, containers), jukebox
+// active-playback redstone power, note block play packet broadcasting, and
+// dispenser/dropper 4-tick redstone firing onto the world cache for dim.
 func (s *Server) BindNoteBlockAndJukeboxRedstone(dim string) *world.Cache {
 	if s == nil {
 		return nil
@@ -132,6 +141,9 @@ func (s *Server) BindNoteBlockAndJukeboxRedstone(dim string) *world.Cache {
 	})
 	cache.SetNoteBlockPlayListener(func(bx, by, bz, note int, instrument string) {
 		s.BroadcastNoteBlockPlay(targetDim, bx, by, bz, note, instrument)
+	})
+	cache.SetDispenserFireListener(func(bx, by, bz int, _ bool) {
+		s.FireDispenserOrDropperAt(targetDim, bx, by, bz)
 	})
 	return cache
 }
