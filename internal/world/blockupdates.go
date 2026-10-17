@@ -129,6 +129,7 @@ var cacheSchedulers sync.Map // map[*Cache]*BlockUpdateScheduler
 // BlockUpdates returns the BlockUpdateScheduler bound to c, creating it on
 // first use.
 func (c *Cache) BlockUpdates() *BlockUpdateScheduler {
+	c.ensureCopperComparatorProvider()
 	if s, ok := cacheSchedulers.Load(c); ok {
 		return s.(*BlockUpdateScheduler)
 	}
@@ -299,6 +300,7 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 			c.stepFluid(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateRedstone:
 			c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateFire:
 			c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		}
@@ -363,6 +365,7 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 	if newState != StateAir {
 		c.checkPoweredTNTAround(x, y, z, res)
 	}
+	c.checkCopperBulbsAround(x, y, z, res)
 	return true
 }
 
@@ -391,9 +394,27 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return updated
 		}
 	}
-	if (isBlockNamed(state, "minecraft:decorated_pot") || isBlockNamed(state, "minecraft:lightning_rod")) && c.GetBlock(x, y, z) == StateWater {
+	if (isBlockNamed(state, "minecraft:decorated_pot") || isBlockNamed(state, "minecraft:lightning_rod") || IsCopperWaterloggableBlock(state)) && c.GetBlock(x, y, z) == StateWater {
 		if updated, ok := withStateProperty(state, "waterlogged", "true"); ok {
-			return updated
+			state = updated
+		}
+	}
+	if IsCopperBarsBlock(state) {
+		return c.ResolveCopperBarsStateAt(x, y, z, state)
+	}
+	if IsCopperBulbBlock(state) {
+		if info, ok := stateByID(state); ok {
+			powered := c.IsBlockPowered(x, y, z)
+			wasPowered := info.Properties["powered"] == "true"
+			if powered && !wasPowered {
+				nextLit := "true"
+				if info.Properties["lit"] == "true" {
+					nextLit = "false"
+				}
+				if updated, ok := nameToStateID(info.Name, map[string]string{"lit": nextLit, "powered": "true"}); ok {
+					return updated
+				}
+			}
 		}
 	}
 	if isBlockNamed(state, "minecraft:campfire") || isBlockNamed(state, "minecraft:soul_campfire") {
@@ -468,9 +489,14 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 		c.checkFluidContactReactions(x, y, z, res)
 	}
 
-	// Break double-block partner (doors, tall plants, extended pistons/heads) when one half is removed.
+	// Break double-block partner (doors, tall plants, extended pistons/heads) when one half is removed,
+	// or synchronize the partner half when a copper door is oxidized/waxed/scraped.
 	if !isSameBlockType(oldState, newState) {
-		c.propagateMultiBlockPartnerBreak(x, y, z, oldState, res)
+		if IsCopperDoorBlock(oldState) && IsCopperDoorBlock(newState) {
+			c.syncCopperDoorPartner(x, y, z, newState, res)
+		} else {
+			c.propagateMultiBlockPartnerBreak(x, y, z, oldState, res)
+		}
 	}
 
 	// Update tripwire horizontal connections and hook-to-hook attachment when tripwire or tripwire_hook changes.
@@ -493,6 +519,12 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 
 	// Propagate redstone dust power, connection shapes, torches, repeaters, doors, trapdoors, and pistons.
 	c.propagateRedstoneAround(x, y, z, oldState, newState, res)
+
+	// Update copper bulbs and comparators reading copper blocks around (x, y, z).
+	c.checkCopperBulbsAround(x, y, z, res)
+	if IsCopperBulbBlock(newState) || IsCopperGolemStatueBlock(newState) || IsCopperBulbBlock(oldState) || IsCopperGolemStatueBlock(oldState) {
+		c.syncComparatorsAroundCopperBlock(x, y, z, res)
+	}
 
 	// Check whether any TNT block at or near (x, y, z) is now powered by redstone.
 	c.checkPoweredTNTAround(x, y, z, res)
@@ -752,6 +784,10 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		return resolved, true
 	}
 
+	if IsCopperBarsBlock(state) {
+		return c.ResolveCopperBarsStateAt(x, y, z, state), true
+	}
+
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)
 	if supportPos, isWallMounted := wallSupportPos(x, y, z, name, props); isWallMounted {
 		if supportPos.Y < MinY || supportPos.Y >= MinY+WorldHeight {
@@ -862,7 +898,15 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 			}
 			below := c.GetBlock(x, y-1, z)
 			bInfo, ok := stateByID(below)
-			if !ok || bInfo.Name != name || bInfo.Properties["half"] != "lower" {
+			if !ok || bInfo.Properties["half"] != "lower" {
+				return replacement, false
+			}
+			if bInfo.Name != name {
+				if IsCopperDoorBlock(state) && IsCopperDoorBlock(below) {
+					if synced, ok := nameToStateID(bInfo.Name, props); ok {
+						return synced, true
+					}
+				}
 				return replacement, false
 			}
 			return state, true
@@ -1788,6 +1832,11 @@ func canSupportHangingBlock(name string, above uint16) bool {
 		}
 	case "minecraft:pale_hanging_moss":
 		if isBlockNamed(above, "minecraft:pale_hanging_moss") {
+			return true
+		}
+	}
+	if strings.HasSuffix(name, "lantern") {
+		if IsChainBlock(above) || IsCopperBarsBlock(above) || isBlockNamed(above, "minecraft:iron_bars") {
 			return true
 		}
 	}
