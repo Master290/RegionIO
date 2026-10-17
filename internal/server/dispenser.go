@@ -122,6 +122,7 @@ type PrimedTNTState struct {
 	X, Y, Z   float64
 	VX, VY, VZ float64
 	FuseTicks int
+	IgniterID int32
 }
 
 // DropperContainerTransferFunc is an optional callback that Agent B can register
@@ -1242,7 +1243,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 
 	// 9. Primed TNT.
 	case itemID == "minecraft:tnt":
-		if fy >= world.MinY && fy < world.MinY+world.WorldHeight {
+		if fy >= world.MinY && fy < world.MinY+world.WorldHeight && s.TNTExplodes() {
 			s.SpawnPrimedTNT(normDim, float64(fx)+0.5, float64(fy), float64(fz)+0.5, DefaultPrimedTNTFuseTicks)
 			consumeOne = true
 		} else {
@@ -2423,6 +2424,9 @@ func (s *Server) dispenseFlintAndSteel(dim string, cache *world.Cache, fx, fy, f
 
 	// 2. Prime a TNT block.
 	if targetName == "minecraft:tnt" {
+		if !s.TNTExplodes() {
+			return false
+		}
 		s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateAir)
 		s.SpawnPrimedTNT(dim, float64(fx)+0.5, float64(fy), float64(fz)+0.5, DefaultPrimedTNTFuseTicks)
 		return true
@@ -2451,32 +2455,7 @@ func (s *Server) dispenseFlintAndSteel(dim string, cache *world.Cache, fx, fy, f
 // SpawnPrimedTNT spawns a primed `minecraft:tnt` entity at (x, y, z) in dim
 // with the given fuse duration in ticks (default 80).
 func (s *Server) SpawnPrimedTNT(dim string, x, y, z float64, fuseTicks int) int32 {
-	if s == nil {
-		return 0
-	}
-	normDim := normalizeDispenserDim(dim)
-	if fuseTicks <= 0 {
-		fuseTicks = DefaultPrimedTNTFuseTicks
-	}
-	entID := s.spawnDispenserProjectileEntity(normDim, EntityTypeTNT, x, y, z, 0, 0.2, 0)
-	ds := s.dispenserState()
-	ds.mu.Lock()
-	ds.primedTNTs[entID] = &PrimedTNTState{
-		EntityID:  entID,
-		Dimension: normDim,
-		X:         x,
-		Y:         y,
-		Z:         z,
-		VY:        0.2,
-		FuseTicks: fuseTicks,
-	}
-	ds.mu.Unlock()
-
-	cx, cz := int32(math.Floor(x))>>4, int32(math.Floor(z))>>4
-	s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-		EncodeSoundPacket("minecraft:entity.tnt.primed", SoundSourceBlocks, x, y, z, 1.0, 1.0, 0))
-	s.EmitGameEvent(normDim, GameEventPrimeFuse, x, y, z, VibrationSource{EntityID: entID})
-	return entID
+	return s.SpawnPrimedTNTWithFuse(dim, x, y, z, fuseTicks, nil)
 }
 
 // PrimedTNTByID returns a snapshot of the PrimedTNTState for entityID.
@@ -2504,6 +2483,7 @@ func (s *Server) TickPrimedTNT() int {
 	ds.mu.Lock()
 	var exploding []PrimedTNTState
 	for id, st := range ds.primedTNTs {
+		s.stepPrimedTNTPhysics(st)
 		st.FuseTicks--
 		if st.FuseTicks <= 0 {
 			exploding = append(exploding, *st)
@@ -2519,9 +2499,7 @@ func (s *Server) TickPrimedTNT() int {
 		cx, cz := int32(math.Floor(tnt.X))>>4, int32(math.Floor(tnt.Z))>>4
 		s.BroadcastDimensionChunk(tnt.Dimension, cx, cz, protocol.PlayRemoveEntities,
 			encodeRemoveEntitiesPacket(nil, []int32{tnt.EntityID}))
-		s.BroadcastDimensionChunk(tnt.Dimension, cx, cz, PlaySoundPacketID,
-			EncodeSoundPacket("minecraft:entity.generic.explode", SoundSourceBlocks, tnt.X, tnt.Y, tnt.Z, 4.0, 1.0, 0))
-		s.EmitGameEvent(tnt.Dimension, GameEventExplode, tnt.X, tnt.Y, tnt.Z, VibrationSource{EntityID: tnt.EntityID})
+		s.detonatePrimedTNT(tnt)
 	}
 	return len(exploding)
 }

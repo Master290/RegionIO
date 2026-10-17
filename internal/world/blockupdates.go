@@ -24,6 +24,8 @@ const (
 	UpdateFluid
 	// UpdateRedstone steps delayed redstone components (buttons, pressure plates, repeaters, torches).
 	UpdateRedstone
+	// UpdateFire steps fire aging, burnout, rain extinguishment, and spread ticks.
+	UpdateFire
 )
 
 // Vanilla game-tick delays for runtime block physics.
@@ -297,6 +299,8 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 			c.stepFluid(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateRedstone:
 			c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+		case UpdateFire:
+			c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		}
 	}
 	return res
@@ -356,6 +360,9 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 	}
 	res.appendChange(BlockPos{X: x, Y: y, Z: z}, oldState, newState, light)
 	c.notifyObserversOfChangeAt(x, y, z, oldState, newState)
+	if newState != StateAir {
+		c.checkPoweredTNTAround(x, y, z, res)
+	}
 	return true
 }
 
@@ -366,6 +373,16 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	if concrete, ok := concretePowderToConcrete(state); ok {
 		if c.touchesWater(x, y, z) {
 			return concrete
+		}
+	}
+	if IsFireBlock(state) || IsSoulFireBlock(state) {
+		if c.CanSoulFireSurviveAt(x, y, z) {
+			if sf := SoulFireBlockState(); sf != StateAir {
+				return sf
+			}
+		}
+		if IsFireBlock(state) {
+			return c.ResolveFireBlockStateAt(x, y, z, FireAge(state))
 		}
 	}
 	if IsNoteBlock(state) {
@@ -476,6 +493,9 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 
 	// Propagate redstone dust power, connection shapes, torches, repeaters, doors, trapdoors, and pistons.
 	c.propagateRedstoneAround(x, y, z, oldState, newState, res)
+
+	// Check whether any TNT block at or near (x, y, z) is now powered by redstone.
+	c.checkPoweredTNTAround(x, y, z, res)
 }
 
 func (c *Cache) scheduleAround(x, y, z int) {
@@ -503,6 +523,9 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 			delay = LavaTickDelay
 		}
 		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, delay)
+	}
+	if IsFireBlock(state) && c.DoFireTick() {
+		c.ScheduleBlockUpdate(x, y, z, UpdateFire, FireTickDelay)
 	}
 }
 
@@ -712,6 +735,21 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 			}
 		}
 		return cur, true
+	}
+
+	if name == "minecraft:soul_fire" {
+		if !c.CanSoulFireSurviveAt(x, y, z) {
+			return StateAir, false
+		}
+		return state, true
+	}
+
+	if name == "minecraft:fire" {
+		if !c.CanFireSurviveAt(x, y, z) {
+			return StateAir, false
+		}
+		resolved := c.ResolveFireBlockStateAt(x, y, z, FireAge(state))
+		return resolved, true
 	}
 
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)
