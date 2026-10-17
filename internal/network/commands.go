@@ -173,13 +173,15 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	listUUIDs := literal("uuids", true)
 	listNode := literal("list", true, listUUIDs)
 
-	// /spawnpoint [<targets> [<pos>]]
-	spPos := argument("pos", ArgParserVec3, nil, true)
-	spTargets := argument("targets", ArgParserEntity, []byte{EntityArgSingle | EntityArgPlayersOnly}, true, spPos)
+	// /spawnpoint [<targets> [<pos> [<angle>]]]
+	spAngle := argument("angle", ArgParserFloat, nil, true)
+	spPos := argument("pos", ArgParserVec3, nil, true, spAngle)
+	spTargets := argument("targets", ArgParserEntity, []byte{EntityArgPlayersOnly}, true, spPos)
 	spawnpointNode := literal("spawnpoint", true, spTargets)
 
-	// /setworldspawn [<pos>]
-	swsPos := argument("pos", ArgParserVec3, nil, true)
+	// /setworldspawn [<pos> [<angle>]]
+	swsAngle := argument("angle", ArgParserFloat, nil, true)
+	swsPos := argument("pos", ArgParserVec3, nil, true, swsAngle)
 	setworldspawnNode := literal("setworldspawn", true, swsPos)
 
 	// /help [<command>]
@@ -2321,49 +2323,109 @@ func execHelp(args []string) string {
 	return "Available commands: /tp, /execute, /gamemode, /time, /weather, /difficulty, /gamerule, /seed, /save-all, /stop, /list, /spawnpoint, /setworldspawn, /help"
 }
 
+func resolveSpawnPointPlayers(srv *server.Server, sender *server.PlayerSession, raw string) ([]*server.PlayerSession, error) {
+	targets, err := ResolveTargets(srv, NewCommandContext(srv, sender), raw)
+	if err != nil {
+		if p := resolveTargetSession(srv, sender, raw); p != nil {
+			return []*server.PlayerSession{p}, nil
+		}
+		return nil, fmt.Errorf("Player %q not found", raw)
+	}
+	var players []*server.PlayerSession
+	for _, t := range targets {
+		if t.Player != nil {
+			players = append(players, t.Player)
+		}
+	}
+	if len(players) == 0 {
+		return nil, fmt.Errorf("Player %q not found", raw)
+	}
+	return players, nil
+}
+
+func parseAngleArg(raw string, baseYaw float32) (float32, error) {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "~") {
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "~"))
+		if rest == "" {
+			return baseYaw, nil
+		}
+		v, err := strconv.ParseFloat(rest, 32)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, fmt.Errorf("Invalid angle %q", raw)
+		}
+		return baseYaw + float32(v), nil
+	}
+	v, err := strconv.ParseFloat(trimmed, 32)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("Invalid angle %q", raw)
+	}
+	return float32(v), nil
+}
+
 func execSpawnPoint(srv *server.Server, sender *server.PlayerSession, args []string) string {
-	target := sender
+	var targets []*server.PlayerSession
 	var coordArgs []string
 	switch len(args) {
 	case 0:
-		if target == nil {
+		if sender == nil {
 			return "Usage: /spawnpoint <player> [<x> <y> <z> [angle]]"
 		}
+		targets = []*server.PlayerSession{sender}
 	case 1:
-		target = resolveTargetSession(srv, sender, args[0])
-		if target == nil {
-			return fmt.Sprintf("Player %q not found", args[0])
+		resolved, err := resolveSpawnPointPlayers(srv, sender, args[0])
+		if err != nil {
+			return err.Error()
 		}
+		targets = resolved
 	case 3:
-		if target == nil {
+		if sender == nil {
 			return "Usage: /spawnpoint <player> <x> <y> <z> [angle]"
 		}
+		targets = []*server.PlayerSession{sender}
 		coordArgs = args
 	case 4:
-		if _, err := ParseCoordArg(args[0]); err == nil && target != nil {
+		if _, err := ParseCoordArg(args[0]); err == nil && sender != nil {
+			targets = []*server.PlayerSession{sender}
 			coordArgs = args
 		} else {
-			target = resolveTargetSession(srv, sender, args[0])
-			if target == nil {
-				return fmt.Sprintf("Player %q not found", args[0])
+			resolved, err := resolveSpawnPointPlayers(srv, sender, args[0])
+			if err != nil {
+				return err.Error()
 			}
+			targets = resolved
 			coordArgs = args[1:]
 		}
 	case 5:
-		target = resolveTargetSession(srv, sender, args[0])
-		if target == nil {
-			return fmt.Sprintf("Player %q not found", args[0])
+		resolved, err := resolveSpawnPointPlayers(srv, sender, args[0])
+		if err != nil {
+			return err.Error()
 		}
+		targets = resolved
 		coordArgs = args[1:]
 	default:
 		return "Usage: /spawnpoint [<player> [<x> <y> <z> [angle]]]"
 	}
 
-	snap := target.Snapshot()
+	ref := targets[0]
+	if sender != nil {
+		ref = sender
+	}
+	snap := ref.Snapshot()
 	sx := int32(math.Floor(snap.X))
 	sy := int32(math.Floor(snap.Y))
 	sz := int32(math.Floor(snap.Z))
 	angle := snap.Yaw
+	dim := ref.Dimension()
+
+	if len(coordArgs) == 0 && len(targets) == 1 {
+		tSnap := targets[0].Snapshot()
+		sx = int32(math.Floor(tSnap.X))
+		sy = int32(math.Floor(tSnap.Y))
+		sz = int32(math.Floor(tSnap.Z))
+		angle = tSnap.Yaw
+		dim = targets[0].Dimension()
+	}
 
 	if len(coordArgs) >= 3 {
 		cx, err := ParseCoordArg(coordArgs[0])
@@ -2388,22 +2450,29 @@ func execSpawnPoint(srv *server.Server, sender *server.PlayerSession, args []str
 		sy = int32(math.Floor(y))
 		sz = int32(math.Floor(z))
 		if len(coordArgs) == 4 {
-			v, err := strconv.ParseFloat(strings.TrimSpace(coordArgs[3]), 32)
-			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
-				return fmt.Sprintf("Invalid angle %q", coordArgs[3])
+			parsedAngle, err := parseAngleArg(coordArgs[3], snap.Yaw)
+			if err != nil {
+				return err.Error()
 			}
-			angle = float32(v)
+			angle = parsedAngle
 		} else {
 			angle = 0
 		}
 	}
 
-	dim := target.Dimension()
-	srv.SetPlayerDimensionSpawnPoint(target, dim, sx, sy, sz, angle, 0, true)
-	return fmt.Sprintf("Set the spawn point for %s to %d, %d, %d [%.1f] in %s", target.Profile.Name, sx, sy, sz, angle, dim)
+	for _, target := range targets {
+		srv.SetPlayerDimensionSpawnPoint(target, dim, sx, sy, sz, angle, 0, true)
+	}
+	if len(targets) == 1 {
+		return fmt.Sprintf("Set the spawn point for %s to %d, %d, %d [%.1f] in %s", targets[0].Profile.Name, sx, sy, sz, angle, dim)
+	}
+	return fmt.Sprintf("Set the spawn point for %d players to %d, %d, %d [%.1f] in %s", len(targets), sx, sy, sz, angle, dim)
 }
 
 func execSetWorldSpawn(srv *server.Server, sender *server.PlayerSession, args []string) string {
+	if sender != nil && world.NormalizeDimension(sender.Dimension()) != world.DimensionOverworld {
+		return "Cannot set the world spawn point in this dimension"
+	}
 	var sx, sy, sz int32
 	var angle float32
 	switch len(args) {
@@ -2417,11 +2486,13 @@ func execSetWorldSpawn(srv *server.Server, sender *server.PlayerSession, args []
 		sz = int32(math.Floor(snap.Z))
 		angle = snap.Yaw
 	case 3, 4:
-		wx, wy, wz, _ := srv.WorldSpawn()
+		wx, wy, wz, wyaw := srv.WorldSpawn()
 		ox, oy, oz := float64(wx), float64(wy), float64(wz)
+		baseYaw := wyaw
 		if sender != nil {
 			snap := sender.Snapshot()
 			ox, oy, oz = snap.X, snap.Y, snap.Z
+			baseYaw = snap.Yaw
 		}
 		cx, err := ParseCoordArg(args[0])
 		if err != nil {
@@ -2445,11 +2516,11 @@ func execSetWorldSpawn(srv *server.Server, sender *server.PlayerSession, args []
 		sy = int32(math.Floor(y))
 		sz = int32(math.Floor(z))
 		if len(args) == 4 {
-			v, err := strconv.ParseFloat(strings.TrimSpace(args[3]), 32)
-			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
-				return fmt.Sprintf("Invalid angle %q", args[3])
+			parsedAngle, err := parseAngleArg(args[3], baseYaw)
+			if err != nil {
+				return err.Error()
 			}
-			angle = float32(v)
+			angle = parsedAngle
 		}
 	default:
 		return "Usage: /setworldspawn [<x> <y> <z> [angle]]"

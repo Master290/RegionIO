@@ -114,6 +114,7 @@ func (s *Server) SetWorldSpawn(x, y, z int, yaw float32) {
 			_ = p.send(protocol.PlayDefaultSpawnPos, pkt)
 		}
 	}
+	_ = s.SaveWorldSettingsFile()
 }
 
 // EncodeDefaultSpawnPosPacket encodes a protocol 775 clientbound

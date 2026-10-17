@@ -610,8 +610,11 @@ func (s *Server) SetGameRuleInt(name string, val int) bool {
 	ws.intRules[def.Name] = val
 	ws.mu.Unlock()
 
-	if def.Name == "randomTickSpeed" {
+	switch def.Name {
+	case "randomTickSpeed":
 		s.SetRandomTickSpeed(val)
+	case "playersSleepingPercentage":
+		s.TrySkipNightBySleep()
 	}
 	_ = s.SaveWorldSettingsFile()
 	return true
@@ -829,6 +832,17 @@ func (s *Server) SaveWorldSettingsNBT() *nbt.Compound {
 		}
 	}
 	root.Set("GameRules", rulesComp)
+
+	spCfg := getWorldSpawnConfig(s)
+	spCfg.mu.RLock()
+	if spCfg.custom {
+		root.Set("SpawnCustom", nbt.Byte(1))
+		root.Set("SpawnX", nbt.Int(int32(spCfg.x)))
+		root.Set("SpawnY", nbt.Int(int32(spCfg.y)))
+		root.Set("SpawnZ", nbt.Int(int32(spCfg.z)))
+		root.Set("SpawnAngle", nbt.Float(spCfg.yaw))
+	}
+	spCfg.mu.RUnlock()
 	return root
 }
 
@@ -900,6 +914,40 @@ func (s *Server) LoadWorldSettingsNBT(root *nbt.Compound) {
 					}
 				}
 			}
+		}
+	}
+	if tag, ok := root.Get("SpawnCustom"); ok {
+		if b, ok := tag.(nbt.Byte); ok && b != 0 {
+			var sx, sy, sz int32
+			var syaw float32
+			if t, ok := root.Get("SpawnX"); ok {
+				if v, ok := t.(nbt.Int); ok {
+					sx = int32(v)
+				}
+			}
+			if t, ok := root.Get("SpawnY"); ok {
+				if v, ok := t.(nbt.Int); ok {
+					sy = int32(v)
+				}
+			}
+			if t, ok := root.Get("SpawnZ"); ok {
+				if v, ok := t.(nbt.Int); ok {
+					sz = int32(v)
+				}
+			}
+			if t, ok := root.Get("SpawnAngle"); ok {
+				if v, ok := t.(nbt.Float); ok {
+					syaw = float32(v)
+				}
+			}
+			spCfg := getWorldSpawnConfig(s)
+			spCfg.mu.Lock()
+			spCfg.custom = true
+			spCfg.x = int(sx)
+			spCfg.y = int(sy)
+			spCfg.z = int(sz)
+			spCfg.yaw = syaw
+			spCfg.mu.Unlock()
 		}
 	}
 }

@@ -348,3 +348,86 @@ func TestRespawnAnchorChargeUseExplodeAndRespawn(t *testing.T) {
 		t.Fatalf("expected missing/obstructed spawn message, got %v", msgs)
 	}
 }
+
+func TestPlayersSleepingPercentageAndTimeSinceRest(t *testing.T) {
+	srv := newBedTestServer(t)
+	srv.SetDayTime(13000) // night
+
+	p1, err := srv.RegisterPlayer(Profile{Name: "Sleeper1", UUID: OfflineUUID("Sleeper1")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer p1: %v", err)
+	}
+	p2, err := srv.RegisterPlayer(Profile{Name: "Sleeper2", UUID: OfflineUUID("Sleeper2")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer p2: %v", err)
+	}
+	netherPlayer, err := srv.RegisterPlayer(Profile{Name: "NetherExplorer", UUID: OfflineUUID("NetherExplorer")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer netherPlayer: %v", err)
+	}
+	netherPlayer.SetDimension(world.DimensionNether)
+
+	srv.SetPlayerTransform(p1, 10.5, 4.0, 10.5, 0, 0, true)
+	srv.SetPlayerTransform(p2, 14.5, 4.0, 10.5, 0, 0, true)
+	_ = srv.SetPlayerGameMode(p1, GameModeSurvival)
+	_ = srv.SetPlayerGameMode(p2, GameModeSurvival)
+
+	// Accumulate insomnia ticks on p1 (>72,000 ticks makes player eligible for phantoms).
+	srv.SetPlayerStat(p1, StatTypeCustom, StatTimeSinceRest, 80000)
+	if got := srv.GetPlayerStat(p1, StatTypeCustom, StatTimeSinceRest); got != 80000 {
+		t.Fatalf("expected initial time_since_rest=80000, got %d", got)
+	}
+
+	redBed, _ := BedBlockState("minecraft:red_bed", "south", "foot", false)
+	if !srv.PlaceBedBlock(p1, 10, 4, 10, redBed) {
+		t.Fatal("PlaceBedBlock failed")
+	}
+
+	// Default playersSleepingPercentage = 100 -> 1 of 2 Overworld players sleeping does NOT skip night,
+	// even though time_since_rest is immediately reset to 0 on entering bed.
+	slept, skipped := srv.InteractBed(p1, 10, 4, 10)
+	if !slept || skipped {
+		t.Fatalf("expected slept=true, skipped=false at 100%% with 1/2 sleeping, got slept=%v skipped=%v", slept, skipped)
+	}
+	if got := srv.GetPlayerStat(p1, StatTypeCustom, StatTimeSinceRest); got != 0 {
+		t.Fatalf("expected time_since_rest reset to 0 on bed sleep, got %d", got)
+	}
+	if got := srv.GetPlayerStat(p1, StatTypeCustom, StatSleepInBed); got != 1 {
+		t.Fatalf("expected sleep_in_bed=1, got %d", got)
+	}
+
+	// Lower playersSleepingPercentage to 50 -> 1 of 2 Overworld players (50%) immediately skips night to morning
+	// (the 3rd player in the Nether does not block Overworld sleep!).
+	srv.SetPlayersSleepingPercentage(50)
+	if srv.IsNight() {
+		t.Fatal("expected night to be skipped when playersSleepingPercentage lowered to 50 with 1/2 Overworld players sleeping")
+	}
+	if srv.IsPlayerSleeping(p1) {
+		t.Fatal("expected p1 to be woken up after night skip")
+	}
+}
+
+func TestWorldSpawnPersistence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.WorldDir = dir
+	srv1, err := NewWithCache(cfg, world.NewCache(16, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache srv1: %v", err)
+	}
+	defer func() { _ = srv1.RequestStop() }()
+
+	srv1.SetWorldSpawn(120, 70, -45, 90.0)
+
+	srv2, err := NewWithCache(cfg, world.NewCache(16, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache srv2: %v", err)
+	}
+	defer func() { _ = srv2.RequestStop() }()
+
+	wx, wy, wz, wyaw := srv2.WorldSpawn()
+	if wx != 120 || wy != 70 || wz != -45 || wyaw != 90.0 {
+		t.Fatalf("expected persisted WorldSpawn (120, 70, -45, 90.0), got (%d, %d, %d, %.1f)", wx, wy, wz, wyaw)
+	}
+}
+

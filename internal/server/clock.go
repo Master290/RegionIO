@@ -477,7 +477,7 @@ func (s *Server) WakeAllPlayers() {
 }
 
 // SleepingPlayerCount returns the number of currently sleeping players and the
-// total number of online players eligible to sleep (alive, non-spectator).
+// total number of online Overworld players eligible to sleep (alive, non-spectator).
 func (s *Server) SleepingPlayerCount() (sleeping, eligible int) {
 	if s == nil {
 		return 0, 0
@@ -499,6 +499,9 @@ func (s *Server) SleepingPlayerCount() (sleeping, eligible int) {
 		if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
 			continue
 		}
+		if world.NormalizeDimension(snap.Dimension) != world.DimensionOverworld {
+			continue
+		}
 		eligible++
 		if s.clock.sleeping[p.Profile.UUID] {
 			sleeping++
@@ -507,17 +510,27 @@ func (s *Server) SleepingPlayerCount() (sleeping, eligible int) {
 	return sleeping, eligible
 }
 
-// TrySkipNightBySleep checks whether all online eligible players are sleeping
-// during night or a thunderstorm; if so, it advances dayTime to the next
-// morning (0 ticks into the new day), clears rain/thunder, and wakes all players.
+// TrySkipNightBySleep checks whether enough online eligible Overworld players are
+// sleeping during night or a thunderstorm (per the playersSleepingPercentage gamerule);
+// if so, it advances dayTime to the next morning (0 ticks into the new day), clears
+// rain/thunder, resets time_since_rest for sleeping players, wakes all players, and
+// clears bed occupancy.
 func (s *Server) TrySkipNightBySleep() bool {
 	if s == nil || !s.CanSleep() {
 		s.WakeAllPlayers()
+		s.ClearAllBedOccupancy()
 		return false
 	}
 	sleeping, eligible := s.SleepingPlayerCount()
-	if eligible == 0 || sleeping < eligible {
+	if !s.CanSkipNightWithSleepingPlayers(sleeping, eligible) {
 		return false
+	}
+
+	// Reset time_since_rest for all sleeping players waking up to morning.
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && s.IsPlayerSleeping(p) {
+			s.SetPlayerStat(p, StatTypeCustom, StatTimeSinceRest, 0)
+		}
 	}
 
 	_, dayTime := s.WorldTime()
@@ -530,13 +543,14 @@ func (s *Server) TrySkipNightBySleep() bool {
 	s.SetDayTime(nextMorning)
 	s.SetWeather(WeatherClear, 0)
 	s.WakeAllPlayers()
+	s.ClearAllBedOccupancy()
 	return true
 }
 
 // SleepInBed sets session's respawn point to (bedX, bedY, bedZ) and attempts
 // to put the player to sleep. If it is neither night nor thundering, slept is
 // false (though the respawn point is still recorded) and a system chat notice
-// is sent. When all online players are in bed, time skips to morning and
+// is sent. When enough online players are in bed, time skips to morning and
 // weather is cleared.
 func (s *Server) SleepInBed(session *PlayerSession, bedX, bedY, bedZ int) (slept bool, skippedToMorning bool) {
 	if s == nil || session == nil || session.IsDead() {
@@ -551,6 +565,7 @@ func (s *Server) SleepInBed(session *PlayerSession, bedX, bedY, bedZ int) (slept
 		_ = s.SendSystemChat(session, "You can sleep only at night or during thunderstorms")
 		return false, false
 	}
+	s.RecordPlayerSleepInBed(session)
 	skipped := s.SetPlayerSleeping(session, true)
 	return true, skipped
 }
