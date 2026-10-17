@@ -273,8 +273,9 @@ func (s *Server) HandleTitleCommand(sender *PlayerSession, args []string) string
 }
 
 // HandleSocialAndScoreboardCommand dispatches /scoreboard, /team, /tellraw,
-// /title, /bossbar, /msg (/tell, /w), /me, /say, and /teammsg (/tm). It returns
-// handled=true when cmdName matches one of those commands.
+// /title, /bossbar, /give, /clear, /effect, /enchant, /item, /msg (/tell, /w),
+// /me, /say, and /teammsg (/tm). It returns handled=true when cmdName matches
+// one of those commands.
 func (s *Server) HandleSocialAndScoreboardCommand(sender *PlayerSession, cmdName string, args []string) (reply string, handled bool) {
 	switch strings.ToLower(strings.TrimSpace(cmdName)) {
 	case "scoreboard":
@@ -287,6 +288,16 @@ func (s *Server) HandleSocialAndScoreboardCommand(sender *PlayerSession, cmdName
 		return s.HandleTitleCommand(sender, args), true
 	case "bossbar":
 		return s.HandleBossBarCommand(sender, args), true
+	case "give":
+		return s.HandleGiveCommand(sender, args), true
+	case "clear":
+		return s.HandleClearCommand(sender, args), true
+	case "effect":
+		return s.HandleEffectCommand(sender, args), true
+	case "enchant":
+		return s.HandleEnchantCommand(sender, args), true
+	case "item":
+		return s.HandleItemCommand(sender, args), true
 	case "msg", "tell", "w":
 		return s.HandleMsgCommand(sender, args), true
 	case "me":
