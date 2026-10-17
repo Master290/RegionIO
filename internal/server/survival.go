@@ -36,9 +36,11 @@ const (
 )
 
 type playerSurvivalState struct {
-	mu           sync.Mutex
-	fallDistance float64
-	dead         bool
+	mu            sync.Mutex
+	fallDistance  float64
+	dead          bool
+	drawingWeapon string
+	drawingHand   int32
 }
 
 var playerSurvivalStates sync.Map // map[*PlayerSession]*playerSurvivalState
@@ -1159,3 +1161,316 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	}
 	return nil
 }
+
+// UseProjectileItem handles starting a bow/trident draw or immediately throwing
+// a throwable projectile (snowball, egg, ender pearl, wind charge) on serverbound
+// use_item. It also emits projectile vibrations for charged crossbows and
+// aerial firework rockets before HandleUseItemPacket processes them.
+func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	slot, stack := session.handSlotAndStack(hand)
+	if stack.IsEmpty() {
+		return false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return false
+	}
+	itemID := canonicalItemName(stack.ResolvedID())
+
+	switch itemID {
+	case "minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl", "minecraft:wind_charge":
+		if !s.consumeHandItemOne(session, hand) {
+			return false
+		}
+		s.RecordItemUsed(session, itemID, 1)
+		cause := "thrown"
+		if itemID == "minecraft:Snowball" || itemID == "minecraft:snowball" {
+			cause = "snowball"
+		}
+		s.traceAndResolveProjectileShot(session, -1, itemID, 0.0, cause, 24.0)
+		return true
+
+	case "minecraft:bow", "minecraft:trident":
+		st := getSurvivalState(session)
+		if st != nil {
+			st.mu.Lock()
+			st.drawingWeapon = itemID
+			st.drawingHand = hand
+			st.mu.Unlock()
+		}
+		return false
+
+	case CrossbowItemID:
+		charged := GetSlotChargedProjectiles(session, slot)
+		if len(charged) > 0 {
+			projItemID := canonicalItemName(charged[0].Stack.ResolvedID())
+			if projItemID == FireworkRocketItemID {
+				s.EmitVibration(VibrationEvent{
+					Dimension:          snap.Dimension,
+					Type:               GameEventProjectileShoot,
+					X:                  snap.X,
+					Y:                  snap.Y + 1.5,
+					Z:                  snap.Z,
+					SourceEntityID:     snap.EntityID,
+					ProjectileEntityID: -1,
+					Player:             session,
+					Sneaking:           session.IsSneaking(),
+					BlockOrItemID:      FireworkRocketItemID,
+				})
+			} else {
+				s.traceAndResolveProjectileShot(session, -1, "minecraft:arrow", 6.0, "arrow", 32.0)
+			}
+		}
+		return false
+
+	case FireworkRocketItemID:
+		if session.IsFallFlying() {
+			s.EmitVibration(VibrationEvent{
+				Dimension:          snap.Dimension,
+				Type:               GameEventProjectileShoot,
+				X:                  snap.X,
+				Y:                  snap.Y,
+				Z:                  snap.Z,
+				SourceEntityID:     snap.EntityID,
+				ProjectileEntityID: -1,
+				Player:             session,
+				Sneaking:           session.IsSneaking(),
+				BlockOrItemID:      FireworkRocketItemID,
+			})
+		}
+		return false
+	}
+	return false
+}
+
+// ReleaseProjectileWeapon handles PlayerActionReleaseUseItem for a drawn bow or
+// trident, consuming ammo/durability as appropriate, raycasting for block/mob/
+// armor-stand impact, and emitting GameEventProjectileShoot + GameEventProjectileLand.
+func (s *Server) ReleaseProjectileWeapon(session *PlayerSession) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	st := getSurvivalState(session)
+	var weapon string
+	var hand int32
+	if st != nil {
+		st.mu.Lock()
+		weapon = st.drawingWeapon
+		hand = st.drawingHand
+		st.drawingWeapon = ""
+		st.mu.Unlock()
+	}
+
+	slot, stack := session.handSlotAndStack(hand)
+	itemID := canonicalItemName(stack.ResolvedID())
+	if itemID != "minecraft:bow" && itemID != "minecraft:trident" {
+		slot, stack = session.handSlotAndStack(HandMain)
+		itemID = canonicalItemName(stack.ResolvedID())
+		if itemID != "minecraft:bow" && itemID != "minecraft:trident" {
+			slot, stack = session.handSlotAndStack(HandOffHand)
+			itemID = canonicalItemName(stack.ResolvedID())
+		}
+	}
+	if weapon == "" && (itemID == "minecraft:bow" || itemID == "minecraft:trident") {
+		weapon = itemID
+	}
+	if weapon != "minecraft:bow" && weapon != "minecraft:trident" {
+		return false
+	}
+	if stack.IsEmpty() || canonicalItemName(stack.ResolvedID()) != weapon {
+		return false
+	}
+
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return false
+	}
+
+	if weapon == "minecraft:bow" {
+		meta := GetSlotItemMeta(session, slot)
+		hasInfinity := meta.EnchantmentLevel("minecraft:infinity") > 0
+		if snap.GameMode != GameModeCreative {
+			ammoSlot := -1
+			var ammoStack world.ItemStack
+			for idx := 0; idx < world.PlayerInventorySlots; idx++ {
+				cand := session.InventorySlot(idx)
+				if isCrossbowArrowProjectile(cand) {
+					ammoSlot = idx
+					ammoStack = cand
+					break
+				}
+			}
+			if ammoSlot < 0 {
+				return false
+			}
+			if !hasInfinity || canonicalItemName(ammoStack.ResolvedID()) != "minecraft:arrow" {
+				var updated world.ItemStack
+				if ammoStack.Count > 1 {
+					updated = world.NewItemStack(ammoStack.ResolvedItemID(), ammoStack.Count-1)
+				}
+				session.SetInventorySlot(ammoSlot, updated)
+				if session.send != nil {
+					stID := session.NextContainerStateID()
+					_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stID, ammoSlot, updated))
+				}
+			}
+			s.DamagePlayerItem(session, slot, 1)
+		}
+		s.RecordItemUsed(session, weapon, 1)
+		dmg := float32(6.0)
+		if pwr := meta.EnchantmentLevel("minecraft:power"); pwr > 0 {
+			dmg += float32(pwr)*1.5 + 0.5
+		}
+		var projID int32 = -1
+		if s.entities != nil {
+			lx, ly, lz := ElytraLookVector(snap.Yaw, snap.Pitch)
+			typeID := registry.EntityTypeIndex(MobTypeArrow)
+			if typeID < 0 {
+				typeID = EntityTypeArrowID
+			}
+			projID = s.entities.Add(&world.Entity{
+				TypeID:    typeID,
+				TypeName:  MobTypeArrow,
+				Dimension: world.NormalizeDimension(snap.Dimension),
+				X:         snap.X,
+				Y:         snap.Y + 1.5,
+				Z:         snap.Z,
+				Yaw:       snap.Yaw,
+				Pitch:     snap.Pitch,
+				VelocityX: clampVelocityShort(lx * 3.0),
+				VelocityY: clampVelocityShort(ly * 3.0),
+				VelocityZ: clampVelocityShort(lz * 3.0),
+			})
+		}
+		s.traceAndResolveProjectileShot(session, projID, "minecraft:arrow", dmg, "arrow", 32.0)
+		return true
+	}
+
+	// Trident throw
+	if snap.GameMode != GameModeCreative {
+		s.DamagePlayerItem(session, slot, 1)
+	}
+	s.RecordItemUsed(session, weapon, 1)
+	s.traceAndResolveProjectileShot(session, -1, "minecraft:trident", 8.0, "arrow", 32.0)
+	return true
+}
+
+func (s *Server) traceAndResolveProjectileShot(
+	session *PlayerSession,
+	projID int32,
+	itemID string,
+	damage float32,
+	cause string,
+	maxRange float64,
+) {
+	if s == nil || session == nil {
+		return
+	}
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	startX, startY, startZ := snap.X, snap.Y+1.5, snap.Z
+	if projID == 0 {
+		projID = -1
+	}
+
+	s.EmitVibration(VibrationEvent{
+		Dimension:          dim,
+		Type:               GameEventProjectileShoot,
+		X:                  startX,
+		Y:                  startY,
+		Z:                  startZ,
+		SourceEntityID:     snap.EntityID,
+		ProjectileEntityID: projID,
+		Player:             session,
+		Sneaking:           session.IsSneaking(),
+		BlockOrItemID:      itemID,
+	})
+
+	lx, ly, lz := ElytraLookVector(snap.Yaw, snap.Pitch)
+	landX := startX + lx*maxRange
+	landY := startY + ly*maxRange
+	landZ := startZ + lz*maxRange
+
+	cache := s.DimensionChunks(dim)
+	steps := int(maxRange * 2.0)
+	if steps < 1 {
+		steps = 1
+	}
+	for step := 1; step <= steps; step++ {
+		dist := float64(step) * 0.5
+		rx := startX + lx*dist
+		ry := startY + ly*dist
+		rz := startZ + lz*dist
+
+		if s.entities != nil {
+			cx := int32(int64(math.Floor(rx)) >> 4)
+			cz := int32(int64(math.Floor(rz)) >> 4)
+			nearby := s.entities.AppendInChunkRange(nil, cx, cz, 1)
+			hitEntity := false
+			for i := range nearby {
+				ent := &nearby[i]
+				if ent.ID == snap.EntityID || ent.ID == projID || ent.IsItem() || ent.IsExperienceOrb() ||
+					ent.TypeName == EntityTypeFireworkRocket || IsHangingEntity(ent.TypeName) {
+					continue
+				}
+				if ent.EffectiveDimension() != dim {
+					continue
+				}
+				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= ent.Y+2.0 && math.Abs(ent.Z-rz) <= 0.8 {
+					if ent.TypeName == EntityTypeArmorStand {
+						dmg := damage
+						if dmg <= 0 {
+							dmg = 1.0
+						}
+						s.DamageArmorStand(ent.ID, dmg, cause, session)
+						hitEntity = true
+						break
+					}
+					if damage > 0 {
+						switch ent.TypeName {
+						case MobTypeWither:
+							s.DamageWither(ent.ID, damage, session, true)
+						case MobTypeEnderDragon:
+							s.DamageEnderDragon(ent.ID, damage, session, true)
+						default:
+							s.applyDamageToMob(ent, damage, session, 0.3, false, false)
+						}
+					}
+					hitEntity = true
+					break
+				}
+			}
+			if hitEntity {
+				landX, landY, landZ = rx, ry, rz
+				break
+			}
+		}
+
+		if cache != nil {
+			bx := int(math.Floor(rx))
+			by := int(math.Floor(ry))
+			bz := int(math.Floor(rz))
+			if !isPassableBlock(cache.GetBlock(bx, by, bz)) {
+				landX, landY, landZ = rx, ry, rz
+				break
+			}
+		}
+	}
+
+	s.EmitVibration(VibrationEvent{
+		Dimension:          dim,
+		Type:               GameEventProjectileLand,
+		X:                  landX,
+		Y:                  landY,
+		Z:                  landZ,
+		SourceEntityID:     snap.EntityID,
+		ProjectileEntityID: projID,
+		Player:             session,
+		Sneaking:           session.IsSneaking(),
+		BlockOrItemID:      itemID,
+	})
+}
+

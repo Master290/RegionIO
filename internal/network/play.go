@@ -963,6 +963,9 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case server.PlayUseItemSB:
 		if h.srv != nil && h.session != nil {
 			_ = h.srv.TryCollectDragonBreath(h.session)
+			if hand, err := pkt.Body().VarInt(); err == nil {
+				_ = h.srv.UseProjectileItem(h.session, hand)
+			}
 			if err := h.srv.HandleUseItemPacket(h.session, pkt.Body()); err != nil {
 				return err
 			}
@@ -1280,6 +1283,9 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 		}
 		if h.srv != nil {
 			h.srv.CancelEating(h.session)
+			if h.srv.ReleaseProjectileWeapon(h.session) {
+				h.syncHotbarFromSession()
+			}
 		}
 		if r.Remaining() == 0 {
 			return nil
@@ -1571,7 +1577,20 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
 				h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
 			}
-			if _, launched := h.srv.UseFireworkRocketOnBlock(h.session, hand, x, y, z, face, cursorX, cursorY, cursorZ); launched {
+			if rocketID, launched := h.srv.UseFireworkRocketOnBlock(h.session, hand, x, y, z, face, cursorX, cursorY, cursorZ); launched {
+				snap := h.session.Snapshot()
+				h.srv.EmitVibration(server.VibrationEvent{
+					Dimension:          snap.Dimension,
+					Type:               server.GameEventProjectileShoot,
+					X:                  float64(x) + 0.5,
+					Y:                  float64(y) + 0.5,
+					Z:                  float64(z) + 0.5,
+					SourceEntityID:     snap.EntityID,
+					ProjectileEntityID: rocketID,
+					Player:             h.session,
+					Sneaking:           h.session.IsSneaking(),
+					BlockOrItemID:      server.FireworkRocketItemID,
+				})
 				h.syncHotbarFromSession()
 				return h.sendBlockChangedAck(seq)
 			}

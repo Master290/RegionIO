@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -281,6 +283,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 	if cfg.Hardcore {
 		s.SetHardcore(true)
 	}
+	s.RegisterWardenSummonHook()
 	if cfg.WorldDir != "" {
 		_ = s.LoadWorldSettingsFile()
 		_ = s.LoadDecorationsFile()
@@ -297,6 +300,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadConduits()
 		_ = s.LoadBrewingStands()
 		_ = s.LoadSculk()
+		_ = s.LoadWardenFile()
 	}
 	return s
 }
@@ -444,6 +448,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveSculk(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveWardenFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {
@@ -2030,5 +2037,139 @@ func IsBlockActivatedState(state uint16) bool {
 	}
 	return false
 }
+
+// SaveWardenFile persists all active Wardens to <WorldDir>/data/wardens.dat.
+func (s *Server) SaveWardenFile() error {
+	if s == nil || s.cfg.WorldDir == "" {
+		return nil
+	}
+	dir := filepath.Join(s.cfg.WorldDir, "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	wardens := s.ActiveWardens()
+	elems := make([]nbt.Tag, 0, len(wardens))
+	for _, w := range wardens {
+		if w.Health <= 0 {
+			continue
+		}
+		c := nbt.NewCompound().
+			Set("Dimension", nbt.String(world.NormalizeDimension(w.Dimension))).
+			Set("X", nbt.Double(w.X)).
+			Set("Y", nbt.Double(w.Y)).
+			Set("Z", nbt.Double(w.Z)).
+			Set("Yaw", nbt.Float(w.Yaw)).
+			Set("Health", nbt.Float(w.Health)).
+			Set("Phase", nbt.Byte(int8(w.Phase))).
+			Set("Pose", nbt.Byte(int8(w.Pose))).
+			Set("PhaseTicks", nbt.Int(int32(w.PhaseTicks))).
+			Set("TicksWithoutAnger", nbt.Int(int32(w.TicksWithoutAnger)))
+		elems = append(elems, c)
+	}
+	root := nbt.NewCompound().Set("Wardens", nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  elems,
+	})
+	return os.WriteFile(filepath.Join(dir, "wardens.dat"), nbt.Marshal(root), 0o644)
+}
+
+// LoadWardenFile restores saved Wardens from <WorldDir>/data/wardens.dat.
+func (s *Server) LoadWardenFile() error {
+	if s == nil || s.cfg.WorldDir == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(s.cfg.WorldDir, "data", "wardens.dat"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	rootTag, err := nbt.Unmarshal(raw)
+	if err != nil || rootTag == nil {
+		return err
+	}
+	root, ok := rootTag.(*nbt.Compound)
+	if !ok || root == nil {
+		return nil
+	}
+	listTag, ok := root.Get("Wardens")
+	if !ok {
+		return nil
+	}
+	list, ok := listTag.(nbt.List)
+	if !ok {
+		return nil
+	}
+	for _, elem := range list.Elems {
+		comp, ok := elem.(*nbt.Compound)
+		if !ok || comp == nil {
+			continue
+		}
+		dim := world.DimensionOverworld
+		if dt, ok := comp.Get("Dimension"); ok {
+			if ds, ok := dt.(nbt.String); ok && string(ds) != "" {
+				dim = world.NormalizeDimension(string(ds))
+			}
+		}
+		var x, y, z float64
+		if xt, ok := comp.Get("X"); ok {
+			if xd, ok := xt.(nbt.Double); ok {
+				x = float64(xd)
+			}
+		}
+		if yt, ok := comp.Get("Y"); ok {
+			if yd, ok := yt.(nbt.Double); ok {
+				y = float64(yd)
+			}
+		}
+		if zt, ok := comp.Get("Z"); ok {
+			if zd, ok := zt.(nbt.Double); ok {
+				z = float64(zd)
+			}
+		}
+		id, err := s.SpawnWarden(dim, x, y, z, false)
+		if err != nil || id == 0 {
+			continue
+		}
+		mgr := s.wardenManager()
+		mgr.mu.Lock()
+		if st := mgr.wardens[id]; st != nil {
+			if ht, ok := comp.Get("Health"); ok {
+				if hf, ok := ht.(nbt.Float); ok && hf > 0 {
+					st.Health = float32(hf)
+				}
+			}
+			if ywt, ok := comp.Get("Yaw"); ok {
+				if ywf, ok := ywt.(nbt.Float); ok {
+					st.Yaw = float32(ywf)
+				}
+			}
+			if pt, ok := comp.Get("Phase"); ok {
+				if pb, ok := pt.(nbt.Byte); ok {
+					st.Phase = WardenPhase(uint8(pb))
+				}
+			}
+			if pst, ok := comp.Get("Pose"); ok {
+				if psb, ok := pst.(nbt.Byte); ok {
+					st.Pose = byte(psb)
+				}
+			}
+			if ptt, ok := comp.Get("PhaseTicks"); ok {
+				if pti, ok := ptt.(nbt.Int); ok {
+					st.PhaseTicks = int(pti)
+				}
+			}
+			if twt, ok := comp.Get("TicksWithoutAnger"); ok {
+				if twi, ok := twt.(nbt.Int); ok {
+					st.TicksWithoutAnger = int(twi)
+				}
+			}
+		}
+		mgr.mu.Unlock()
+	}
+	return nil
+}
+
 
 
