@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"math"
 	"testing"
 
 	"regionio/internal/protocol"
@@ -391,3 +392,131 @@ func TestFurnaceBlockEntityPersistenceAndChunkReload(t *testing.T) {
 		t.Fatalf("EncodeContainerSetData payload = (prop=%d, val=%d), want (%d, 85)", propID, val, FurnaceDataCookingTimer)
 	}
 }
+
+func TestFurnaceExperienceAwardOnTakeAndBreakLightComparatorAndHoppers(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	col := &survivalPacketCollector{}
+	session, err := srv.RegisterPlayer(Profile{Name: "MasterSmelter", UUID: OfflineUUID("MasterSmelter")}, col.send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	if err := srv.SetPlayerGameMode(session, GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+
+	// Verify bamboo (50 ticks) and scaffolding (50 ticks) fuel values and halving in smoker/blast_furnace.
+	bamboo := world.NewNamedItemStack("minecraft:bamboo", 1)
+	scaffolding := world.NewNamedItemStack("minecraft:scaffolding", 1)
+	if got := FurnaceFuelBurnDuration("minecraft:furnace", bamboo); got != 50 {
+		t.Fatalf("bamboo burn duration (furnace) = %d, want 50", got)
+	}
+	if got := FurnaceFuelBurnDuration("minecraft:furnace", scaffolding); got != 50 {
+		t.Fatalf("scaffolding burn duration (furnace) = %d, want 50", got)
+	}
+	if got := FurnaceFuelBurnDuration("minecraft:smoker", scaffolding); got != 25 {
+		t.Fatalf("scaffolding burn duration (smoker) = %d, want 25", got)
+	}
+	if got := FurnaceFuelBurnDuration("minecraft:blast_furnace", bamboo); got != 25 {
+		t.Fatalf("bamboo burn duration (blast_furnace) = %d, want 25", got)
+	}
+
+	// 1. Place furnace at (30, y, 30) and a comparator at (31, y, 30) facing west (reading furnace at X=30, outputting to X=32).
+	fx, fy, fz := 30, world.FlatSurfaceY+1, 30
+	placeFurnaceBlockForTest(t, srv, "minecraft:furnace", fx, fy, fz)
+	compSt, ok := world.BlockStateIDByProperties("minecraft:comparator", map[string]string{
+		"facing":  "west",
+		"mode":    "compare",
+		"powered": "false",
+	})
+	if !ok {
+		t.Fatal("failed to resolve comparator state")
+	}
+	wireSt, _ := world.BlockStateIDByProperties("minecraft:redstone_wire", map[string]string{"power": "0"})
+	srv.Chunks().ApplyBlockWithUpdates(fx+1, fy, fz, compSt)
+	srv.Chunks().ApplyBlockWithUpdates(fx+2, fy, fz, wireSt)
+
+	// Fill furnace slots and verify comparator signal & lit block light (13).
+	srv.SetFurnaceSlot(fx, fy, fz, world.FurnaceSlotInput, world.NewNamedItemStack("minecraft:raw_iron", 1))
+	srv.SetFurnaceSlot(fx, fy, fz, world.FurnaceSlotFuel, world.NewNamedItemStack("minecraft:coal", 1))
+	if sig := srv.FurnaceComparatorSignalAt(fx, fy, fz); sig <= 0 {
+		t.Fatalf("FurnaceComparatorSignalAt with input+fuel = %d, want > 0", sig)
+	}
+	if world.BlockProperties(srv.Chunks().GetBlock(fx+1, fy, fz))["powered"] != "true" {
+		t.Fatalf("expected comparator reading non-empty furnace to become powered=true")
+	}
+
+	// Tick 1 ignites furnace -> check block light at (fx, fy, fz) is 13.
+	srv.TickFurnaceAt(fx, fy, fz)
+	if _, blkLight := srv.LightAt(fx, fy, fz); blkLight != 13 {
+		t.Fatalf("lit furnace block light = %d, want 13", blkLight)
+	}
+
+	// Complete the 200-tick smelt of 1x raw_iron (0.7 XP -> rounds to 1 XP).
+	for i := 0; i < 199; i++ {
+		srv.TickFurnaceAt(fx, fy, fz)
+	}
+	_, cid, err := srv.InteractBlock(session, fx, fy, fz)
+	if err != nil {
+		t.Fatalf("InteractBlock(furnace): %v", err)
+	}
+	// Extract output via QuickMove -> awards XP to player and spawns XP orb.
+	if err := srv.HandleContainerClick(session, cid, world.FurnaceSlotOutput, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove furnace output: %v", err)
+	}
+	if session.TotalExperience() < 1 {
+		t.Fatalf("expected player TotalExperience >= 1 after taking smelted iron_ingot, got %d", session.TotalExperience())
+	}
+
+	// 2. Hopper interaction:
+	//   - Top hopper at (fx, fy+1, fz) facing "down" -> inserts into input slot 0.
+	//   - Side hopper at (fx-1, fy, fz) facing "east" -> inserts fuel into fuel slot 1.
+	//   - Bottom hopper at (fx, fy-1, fz) facing "down" -> extracts output from slot 2 (and empty bucket from slot 1).
+	hx, hy, hz := 40, world.FlatSurfaceY+2, 40
+	placeFurnaceBlockForTest(t, srv, "minecraft:blast_furnace", hx, hy, hz)
+	srv.Chunks().SetBlock(hx, hy+1, hz, HopperBlockState("down", true))
+	srv.Chunks().SetBlock(hx-1, hy, hz, HopperBlockState("east", true))
+	srv.Chunks().SetBlock(hx, hy-1, hz, HopperBlockState("down", true))
+
+	dim := world.DimensionOverworld
+	srv.SetHopperSlotInDimension(dim, hx, hy+1, hz, 0, world.NewNamedItemStack("minecraft:raw_gold", 1))
+	srv.SetHopperSlotInDimension(dim, hx-1, hy, hz, 0, world.NewNamedItemStack("minecraft:lava_bucket", 1))
+
+	// Tick top and side hoppers to push raw_gold into slot 0 and lava_bucket into slot 1.
+	srv.TickHopperAt(dim, hx, hy+1, hz)
+	srv.TickHopperAt(dim, hx-1, hy, hz)
+	bfSlots := srv.FurnaceSlots(hx, hy, hz)
+	if bfSlots[world.FurnaceSlotInput].ResolvedID() != "minecraft:raw_gold" {
+		t.Fatalf("top hopper -> blast_furnace input = %+v, want raw_gold", bfSlots[world.FurnaceSlotInput])
+	}
+	if bfSlots[world.FurnaceSlotFuel].ResolvedID() != "minecraft:lava_bucket" {
+		t.Fatalf("side hopper -> blast_furnace fuel = %+v, want lava_bucket", bfSlots[world.FurnaceSlotFuel])
+	}
+
+	// Smelt raw_gold in blast_furnace (100 ticks); lava_bucket becomes empty bucket in fuel slot 1, gold_ingot in output slot 2.
+	for i := 0; i < 100; i++ {
+		srv.TickFurnaceAt(hx, hy, hz)
+	}
+	// Tick bottom hopper twice (clearing cooldown): should extract gold_ingot (slot 2) and empty bucket (slot 1).
+	srv.SetHopperTransferCooldown(dim, hx, hy-1, hz, 0)
+	srv.TickHopperAt(dim, hx, hy-1, hz)
+	srv.SetHopperTransferCooldown(dim, hx, hy-1, hz, 0)
+	srv.TickHopperAt(dim, hx, hy-1, hz)
+	botSlots := srv.HopperSlotsInDimension(dim, hx, hy-1, hz)
+	if botSlots[0].ResolvedID() != "minecraft:gold_ingot" || botSlots[1].ResolvedID() != "minecraft:bucket" {
+		t.Fatalf("bottom hopper extracted = [%+v, %+v], want [gold_ingot, bucket]", botSlots[0], botSlots[1])
+	}
+
+	// 3. Breaking the blast_furnace drops any remaining items AND spawns XP orbs for stored RecipesUsed.
+	srv.DropFurnaceContents(hx, hy, hz)
+	foundOrb := false
+	for _, ent := range srv.entities.All() {
+		if ent.IsExperienceOrb() && math.Hypot(ent.X-(float64(hx)+0.5), ent.Z-(float64(hz)+0.5)) < 1.0 {
+			foundOrb = true
+			break
+		}
+	}
+	if !foundOrb {
+		t.Fatal("expected ExperienceOrb to be spawned at broken blast_furnace with stored RecipesUsed")
+	}
+}
+

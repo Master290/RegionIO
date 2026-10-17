@@ -347,6 +347,25 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return updated
 		}
 	}
+	if isBlockNamed(state, "minecraft:campfire") || isBlockNamed(state, "minecraft:soul_campfire") {
+		cur := state
+		if c.GetBlock(x, y, z) == StateWater {
+			if updated, ok := withStateProperty(cur, "waterlogged", "true"); ok {
+				cur = updated
+			}
+			if updated, ok := withStateProperty(cur, "lit", "false"); ok {
+				cur = updated
+			}
+		}
+		wantSignal := "false"
+		if y > MinY && isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:hay_block") {
+			wantSignal = "true"
+		}
+		if updated, ok := withStateProperty(cur, "signal_fire", wantSignal); ok {
+			cur = updated
+		}
+		return cur
+	}
 	return state
 }
 
@@ -640,6 +659,27 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 			}
 		}
 		return state, true
+	}
+
+	// Update signal_fire property on minecraft:campfire / minecraft:soul_campfire when hay_block below changes,
+	// and ensure waterlogged campfires are extinguished (lit=false).
+	if name == "minecraft:campfire" || name == "minecraft:soul_campfire" {
+		cur := state
+		wantSignal := "false"
+		if y > MinY && isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:hay_block") {
+			wantSignal = "true"
+		}
+		if props["signal_fire"] != wantSignal {
+			if updated, ok := withStateProperty(cur, "signal_fire", wantSignal); ok {
+				cur = updated
+			}
+		}
+		if props["waterlogged"] == "true" && props["lit"] == "true" {
+			if updated, ok := withStateProperty(cur, "lit", "false"); ok {
+				cur = updated
+			}
+		}
+		return cur, true
 	}
 
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)

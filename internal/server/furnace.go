@@ -33,12 +33,13 @@ const (
 	DefaultSmeltingCookTime int16 = 200
 	DefaultBlastingCookTime int16 = 100
 	DefaultSmokingCookTime  int16 = 100
+	DefaultCampfireCookTime int16 = 600
 )
 
-// SmeltingRecipe represents one parsed vanilla smelting, blasting, or smoking recipe.
+// SmeltingRecipe represents one parsed vanilla smelting, blasting, smoking, or campfire_cooking recipe.
 type SmeltingRecipe struct {
-	Name        string
-	Type        string // "minecraft:smelting", "minecraft:blasting", or "minecraft:smoking"
+	Name string
+	Type string // "minecraft:smelting", "minecraft:blasting", "minecraft:smoking", or "minecraft:campfire_cooking"
 	Category    string
 	Group       string
 	Ingredient  Ingredient
@@ -172,7 +173,7 @@ func parseSmeltingRecipe(name string, data []byte, tags map[string][]string) (*S
 		return nil, false, err
 	}
 	rtype := canonicalResourceName(header.Type)
-	if rtype != "minecraft:smelting" && rtype != "minecraft:blasting" && rtype != "minecraft:smoking" {
+	if rtype != "minecraft:smelting" && rtype != "minecraft:blasting" && rtype != "minecraft:smoking" && rtype != "minecraft:campfire_cooking" {
 		return nil, false, nil
 	}
 
@@ -306,6 +307,8 @@ func DefaultCookTimeForRecipeType(recipeType string) int16 {
 		return DefaultBlastingCookTime
 	case "minecraft:smoking":
 		return DefaultSmokingCookTime
+	case "minecraft:campfire_cooking":
+		return DefaultCampfireCookTime
 	default:
 		return DefaultSmeltingCookTime
 	}
@@ -632,6 +635,7 @@ func (s *Server) SetFurnaceState(f world.FurnaceBlockEntity) {
 	if s == nil {
 		return
 	}
+	s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
 	fs := s.furnaceState()
 	fs.mu.Lock()
 	s.ensureChunkFurnacesLoadedLocked(fs, int32(f.X>>4), int32(f.Z>>4))
@@ -643,6 +647,23 @@ func (s *Server) SetFurnaceState(f world.FurnaceBlockEntity) {
 	fs.furnaces[furnaceKey{f.X, f.Y, f.Z}] = &cp
 	fs.mu.Unlock()
 	s.persistChunkFurnaces(int32(f.X>>4), int32(f.Z>>4))
+	s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, f.X, f.Y, f.Z)
+}
+
+// FurnaceComparatorSignal returns the redstone comparator output (0..15) for a
+// furnace block entity snapshot.
+func FurnaceComparatorSignal(f world.FurnaceBlockEntity) int {
+	return CalculateContainerComparatorSignal(f.Items[:])
+}
+
+// FurnaceComparatorSignalAt returns the redstone comparator output (0..15) for
+// the furnace, blast_furnace, or smoker at (x, y, z).
+func (s *Server) FurnaceComparatorSignalAt(x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	slots := s.FurnaceSlots(x, y, z)
+	return CalculateContainerComparatorSignal(slots[:])
 }
 
 // FurnaceSlots returns a copy of the 3 slots (input, fuel, output) in the
@@ -662,6 +683,7 @@ func (s *Server) SetFurnaceSlot(x, y, z, slot int, stack world.ItemStack) bool {
 	if s == nil || slot < 0 || slot >= FurnaceSlotCount {
 		return false
 	}
+	s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
 	var normalized world.ItemStack
 	if !stack.IsEmpty() {
 		normalized = world.NewItemStack(stack.ResolvedItemID(), stack.Count)
@@ -686,12 +708,14 @@ func (s *Server) SetFurnaceSlot(x, y, z, slot int, stack world.ItemStack) bool {
 	fs.mu.Unlock()
 
 	s.persistChunkFurnaces(int32(x>>4), int32(z>>4))
+	s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, x, y, z)
 	return true
 }
 
 // DropFurnaceContents removes any stored furnace block entity at (x, y, z),
 // closes any open furnace screens targeting that position, spawns non-empty
-// input/fuel/output stacks as item entities in the world, and updates disk state.
+// input/fuel/output stacks as item entities in the world, spawns stored
+// smelting XP orbs from RecipesUsed, and updates disk state.
 func (s *Server) DropFurnaceContents(x, y, z int) {
 	if s == nil {
 		return
@@ -725,8 +749,12 @@ func (s *Server) DropFurnaceContents(x, y, z int) {
 				s.SpawnItemEntity(float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, st)
 			}
 		}
+		if totalXP := calculateFurnaceRecipesXP(f.RecipesUsed); totalXP > 0 {
+			s.SpawnExperienceOrbs(float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, int32(totalXP))
+		}
 		s.persistChunkFurnaces(int32(x>>4), int32(z>>4))
 	}
+	s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, x, y, z)
 }
 
 func isFurnaceMenuType(menuType int32) bool {
@@ -934,7 +962,9 @@ func (s *Server) applyFurnaceClickLocked(session *PlayerSession, tr *playerConta
 		s.SetFurnaceSlot(bx, by, bz, i, slots[i])
 	}
 	if slots[world.FurnaceSlotOutput].Count < prevOutputCount {
-		s.AwardFurnaceExperience(bx, by, bz)
+		if xp := s.AwardFurnaceExperience(bx, by, bz); xp > 0 && session != nil {
+			_ = s.AddPlayerExperience(session, int32(xp))
+		}
 		s.TriggerItemSmelted(session, prevOutput)
 	}
 	for i := 0; i < 27; i++ {
@@ -1023,6 +1053,10 @@ func (s *Server) TickFurnaceAt(x, y, z int) bool {
 		}
 	}
 
+	if slotsChanged {
+		s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+		s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, x, y, z)
+	}
 	if changed {
 		s.persistChunkFurnaces(int32(x>>4), int32(z>>4))
 	}
@@ -1225,8 +1259,32 @@ func completeFurnaceBurn(items *[FurnaceSlotCount]world.ItemStack, result world.
 	}
 }
 
+func calculateFurnaceRecipesXP(used map[string]int32) int {
+	if len(used) == 0 {
+		return 0
+	}
+	book := DefaultSmeltingBook()
+	totalXP := 0
+	for recName, count := range used {
+		if count <= 0 {
+			continue
+		}
+		if rec, ok := book.Recipe(recName); ok && rec.Experience > 0 {
+			raw := float64(count) * float64(rec.Experience)
+			whole := int(math.Floor(raw))
+			frac := raw - float64(whole)
+			if frac >= 0.5 || (whole == 0 && frac > 0) {
+				whole++
+			}
+			totalXP += whole
+		}
+	}
+	return totalXP
+}
+
 // AwardFurnaceExperience computes the total stored XP from a furnace's
-// RecipesUsed map and clears the map (matching AbstractFurnaceBlockEntity.getRecipesToAwardAndPopExperience).
+// RecipesUsed map, clears the map, and spawns experience orbs at the furnace
+// (matching AbstractFurnaceBlockEntity.getRecipesToAwardAndPopExperience).
 func (s *Server) AwardFurnaceExperience(x, y, z int) int {
 	if s == nil {
 		return 0
@@ -1242,16 +1300,9 @@ func (s *Server) AwardFurnaceExperience(x, y, z int) int {
 	f.RecipesUsed = make(map[string]int32)
 	fs.mu.Unlock()
 
-	book := DefaultSmeltingBook()
-	totalXP := 0
-	for recName, count := range used {
-		if count <= 0 {
-			continue
-		}
-		if rec, ok := book.Recipe(recName); ok && rec.Experience > 0 {
-			raw := float64(count) * float64(rec.Experience)
-			totalXP += int(math.Floor(raw))
-		}
+	totalXP := calculateFurnaceRecipesXP(used)
+	if totalXP > 0 {
+		s.SpawnExperienceOrbs(float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, int32(totalXP))
 	}
 	s.persistChunkFurnaces(int32(x>>4), int32(z>>4))
 	return totalXP
