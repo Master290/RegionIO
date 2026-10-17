@@ -1139,7 +1139,7 @@ func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader)
 	}
 	if s != nil && session != nil {
 		if !s.StartEating(session, hand) && !s.UsePotionOrMilkItem(session, hand) {
-			if !s.UseEmptyMap(session, hand) {
+			if !s.UseEmptyMap(session, hand) && !s.UseBookItem(session, hand) {
 				if cast, wear := s.UseFishingRod(session, hand); !cast && wear == 0 {
 					s.UseShield(session, hand)
 				}
