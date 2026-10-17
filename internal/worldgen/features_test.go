@@ -643,3 +643,33 @@ func TestAllEmbeddedSimpleBlockFeaturesDecodeAndSample(t *testing.T) {
 		t.Fatalf("embedded simple_block feature count = %d, want 32", count)
 	}
 }
+
+func TestTreeMinimumSizeDefaultsAndDefaultBelowTrunkProvider(t *testing.T) {
+	set, err := LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"minecraft:dark_oak", "minecraft:dark_oak_leaf_litter", "minecraft:pale_oak"} {
+		tree, err := set.Tree(name)
+		if err != nil {
+			t.Fatalf("Tree(%s): %v", name, err)
+		}
+		if len(tree.BelowTrunkProvider) == 0 {
+			t.Fatalf("Tree(%s): expected default BelowTrunkProvider to be populated", name)
+		}
+		limit, ok := tree.MinimumSize.Limit()
+		if !ok || limit != 1 {
+			t.Fatalf("Tree(%s): MinimumSize.Limit() = (%d, %v), want (1, true)", name, limit, ok)
+		}
+		if got := tree.MinimumSize.SizeAtHeight(6, 0); got != 0 {
+			t.Fatalf("Tree(%s): SizeAtHeight(6, 0) = %d, want 0 (default lower_size)", name, got)
+		}
+		if got := tree.MinimumSize.SizeAtHeight(6, 1); got != 1 {
+			t.Fatalf("Tree(%s): SizeAtHeight(6, 1) = %d, want 1 (default middle_size)", name, got)
+		}
+		if got := tree.MinimumSize.SizeAtHeight(6, 5); got != 2 {
+			t.Fatalf("Tree(%s): SizeAtHeight(6, 5) = %d, want 2 (upper_size)", name, got)
+		}
+	}
+}
+

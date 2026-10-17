@@ -38,6 +38,41 @@ func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
 	return nil
 }
 
+func (r *decorationRegion) placeScheduledSurfaceTrees(seed int64) error {
+	r.bindSeed(seed)
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		return err
+	}
+	if err := r.ensureSourceNeighborhood(); err != nil {
+		return err
+	}
+	biomes := r.sourceBiomes()
+	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), biomes, vegetationStage)
+	if err != nil {
+		return err
+	}
+	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
+	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
+	for _, scheduled := range schedule {
+		placed, ok := set.Placed[scheduled.Name]
+		if !ok {
+			continue
+		}
+		configured, ok := set.Configured[placed.Feature]
+		if !ok {
+			continue
+		}
+		if configured.Type != "minecraft:tree" && configured.Type != "minecraft:random_selector" {
+			continue
+		}
+		if err := r.placeScheduledVegetationFeature(set, random, scheduled, origin, decorationSeed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // placeScheduledVegetationFeature replays one scheduled stage-9 feature against
 // the region's current source. It is the loop body of
 // placeScheduledVegetationPatches, split out so a probe can walk a source's real

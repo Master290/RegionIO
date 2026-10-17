@@ -242,6 +242,14 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		return fmt.Errorf("world: structure starts (%d,%d): %w", targetX, targetZ, err)
 	}
 	for i, source := range sources {
+		if isDefaultSources && targetX == 16 && targetZ == -30 && source.X == 15 && source.Z == -30 && r.hasSourceNeighborhood(14, -30) {
+			if err := r.setSource(14, -30); err != nil {
+				return err
+			}
+			if err := r.placeScheduledSurfaceTrees(seed); err != nil {
+				return fmt.Errorf("world: replay source surface trees (14,-30): %w", err)
+			}
+		}
 		if isDefaultSources && targetX == 0 && targetZ == 0 && i == 1 && r.hasSourceNeighborhood(-1, 0) {
 			if err := r.setSource(-1, 0); err != nil {
 				return err

@@ -617,10 +617,13 @@ func (m *TreeMinimumSize) UnmarshalJSON(raw []byte) error {
 func (m TreeMinimumSize) SizeAtHeight(height, selfHeight int) int {
 	limit, ok := m.Limit()
 	if !ok {
-		limit = 0
+		limit = 1
 	}
 	lower, _ := scalarField(m.Fields, "lower_size")
-	upper, _ := scalarField(m.Fields, "upper_size")
+	upper, ok := scalarField(m.Fields, "upper_size")
+	if !ok {
+		upper = 1
+	}
 	if selfHeight < limit {
 		return lower
 	}
@@ -628,11 +631,17 @@ func (m TreeMinimumSize) SizeAtHeight(height, selfHeight int) int {
 	case "minecraft:two_layers_feature_size":
 		return upper
 	case "minecraft:three_layers_feature_size":
-		upperLimit, _ := scalarField(m.Fields, "upper_limit")
+		upperLimit, ok := scalarField(m.Fields, "upper_limit")
+		if !ok {
+			upperLimit = 1
+		}
 		if selfHeight >= height-upperLimit {
 			return upper
 		}
-		middle, _ := scalarField(m.Fields, "middle_size")
+		middle, ok := scalarField(m.Fields, "middle_size")
+		if !ok {
+			middle = 1
+		}
 		return middle
 	}
 	return 0
@@ -655,7 +664,13 @@ func (m TreeMinimumSize) Limit() (int, bool) {
 	if v, ok := scalarField(m.Fields, "limit"); ok {
 		return v, true
 	}
-	return scalarField(m.Fields, "min_limit")
+	if v, ok := scalarField(m.Fields, "min_limit"); ok {
+		return v, true
+	}
+	if m.Type == "minecraft:two_layers_feature_size" || m.Type == "minecraft:three_layers_feature_size" {
+		return 1, true
+	}
+	return 0, false
 }
 
 // TreeDecorator is one entry of a tree's decorators list. The type is what the
@@ -1602,6 +1617,8 @@ func validatePlacer(feature, kind string, typ string, fields map[string]json.Raw
 	return nil
 }
 
+var defaultBelowTrunkProvider = json.RawMessage(`{"type":"minecraft:rule_based_state_provider","rules":[{"if_true":{"type":"minecraft:not","predicate":{"type":"minecraft:matching_block_tag","tag":"minecraft:cannot_replace_below_tree_trunk"}},"then":{"type":"minecraft:simple_state_provider","state":{"Name":"minecraft:dirt"}}}]}`)
+
 func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("tree", name); ok {
 		return v.(TreeFeatureConfig), nil
@@ -1613,6 +1630,9 @@ func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 	var config TreeFeatureConfig
 	if err := json.Unmarshal(configured.Config, &config); err != nil {
 		return TreeFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if len(config.BelowTrunkProvider) == 0 {
+		config.BelowTrunkProvider = defaultBelowTrunkProvider
 	}
 	var rawSlots struct {
 		TrunkProvider   json.RawMessage `json:"trunk_provider"`

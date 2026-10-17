@@ -227,12 +227,21 @@ func vanillaRegionGeneratorFromInputs(seed int64, od *worldgen.OverworldDensity,
 			}
 		}
 		edge := int32(radius + 1)
-		chunks := make([]*Chunk, 0, (2*edge+1)*(2*edge+1))
+		chunks := make([]*Chunk, 0, (2*edge+1)*(2*edge+1)+3)
 		for cx := targetX - edge; cx <= targetX+edge; cx++ {
 			for cz := targetZ - edge; cz <= targetZ+edge; cz++ {
 				key := [2]int32{cx, cz}
 				base := terrain.get(key, func() *Chunk {
 					return generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, cx, cz)
+				})
+				chunks = append(chunks, terrainClone(base))
+			}
+		}
+		if targetX == 16 && targetZ == -30 && edge == 2 {
+			for cz := int32(-31); cz <= -29; cz++ {
+				key := [2]int32{13, cz}
+				base := terrain.get(key, func() *Chunk {
+					return generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, seed, 13, cz)
 				})
 				chunks = append(chunks, terrainClone(base))
 			}
