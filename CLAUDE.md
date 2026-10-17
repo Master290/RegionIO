@@ -9,15 +9,16 @@ README.md describes what the server does. This file is about how to work on it.
 
 ```
 go build ./... && go vet ./...
-make test          # go test ./...
-make test-race     # go test -race ./...
-make verify        # build, vet, tests, race tests, and the gated diagnostics
-make parity        # requires the committed vanilla block fixture
+make test          # go test -short ./...
+make test-full     # go test ./... (includes heavy multi-chunk parity fixtures)
+make test-race     # sharded go test -race -short (matches CI matrix)
+make verify        # build, vet, test (-short), sharded test-race, and gated diagnostics
+make parity        # requires the committed vanilla ocean and land block fixtures
 
-go run ./cmd/regionio -seed 12345            # serves on 0.0.0.0:25565
+go run ./cmd/regionio -seed 12345            # serves on 0.0.0.0:25565 (reads server.properties if present)
 go run ./cmd/regionio -seed 12345 -world ""  # in-memory world, nothing read from or written to disk
 go run ./cmd/gendump                         # client-free generator diagnostics
-go run ./cmd/genfeatures                     # dumps the embedded feature/biome graph for inspection
+go run ./cmd/genfeatures -server server.jar  # extracts internal/worldgen/feature_data.zip from server.jar
 go run ./cmd/vanillacapture                  # regenerate vanilla block parity fixture (Java 25)
 ```
 
@@ -121,23 +122,24 @@ Substring-matching block names is how the light table was wrong before (`grass_b
 ## Layout
 
 ```
-cmd/regionio/     entry point (flags, listener, graceful shutdown)
+cmd/regionio/     entry point (flags, server.properties, listener, console stdin, graceful shutdown)
 cmd/gendump/      client-free generator diagnostics — biome spread, surface blocks,
                   subsurface banding, deep-layer composition, bedrock band, fluid census,
                   cross-section
 cmd/genblocks/    generates internal/worldgen/generated_blocks.go from the block report
-cmd/genfeatures/  dumps the embedded placed/configured feature + biome graph
+cmd/genfeatures/  extracts the embedded placed/configured feature + biome + tag archive from server.jar
 cmd/genlight/     legacy light-table generator, superseded by tools/VanillaBlockStateDump.java
+cmd/vanillacapture/ captures vanilla block/biome/heightmap fixtures from the official server (Java 25)
 tools/            Java dumpers run against the jar, plus their Go-side fixtures
 internal/protocol/  VarInt, framing, compression, packet IDs
 internal/nbt/       NBT codec (modified UTF-8)
 internal/registry/  28 embedded synced registries + tags, verbatim from vanilla
-internal/world/     chunk model, wire encoder, cache + tickets, Anvil store, lighting,
-                    the chunk generator itself (vanilla.go), decoration
+internal/world/     chunk model, wire encoder, cache + tickets, Anvil store, playerdata, lighting,
+                    entities, the chunk generator itself (vanilla.go), decoration
 internal/worldgen/  the library: noise, density-function interpreter, surface rules,
                     aquifer, climate/biome finder, embedded datapack under data/
-internal/network/   per-connection state machine
-internal/server/    shared core: config, sessions, status, profiles, entity loops
+internal/network/   per-connection state machine (login/crypto, configuration, play, Brigadier commands)
+internal/server/    shared core: config, server.properties, ops/whitelist, sessions, status, entity spawner
 ```
 
 Note the split: `internal/worldgen` is a *library* over the datapack; the chunk generator that drives
@@ -148,11 +150,13 @@ it is `internal/world/vanilla.go`.
 Bit-exact and parity-tested — treat as settled, change only with a vanilla reference in hand:
 `random.go` (Xoroshiro128++, `upgradeSeedTo128bit`, MD5 seeding), `improved_noise.go`,
 `perlin_noise.go`, `normal_noise.go`, `blended.go`, `spline.go`, `density.go`, the 4×8×4 cell grid
-with trilinear interpolation, the climate/biome finder, and the chunk wire encoder
-(`TestGoldenAgainstVanilla` compares bytes against a real vanilla chunk).
+with trilinear interpolation, the climate/biome finder (`Climate.quantizeCoord` truncating toward
+zero), and the chunk wire encoder (`TestGoldenAgainstVanilla` compares bytes against a real vanilla
+chunk).
 
 Ported from the decompiled source and checked by behaviour rather than by bytes — faithful as far as
-we can tell, but no vanilla capture confirms them: the aquifer (`worldgen/aquifer.go`, the whole of
+we can tell, and confirmed bit-exact on both featureless base-terrain captures (393,216/393,216 ocean
+and 786,432/786,432 land): the aquifer (`worldgen/aquifer.go`, the whole of
 `Aquifer.NoiseBasedAquifer` bar `shouldScheduleFluidUpdate`), the surface-rule interpreter
 (`worldgen/surface.go`, every condition the overworld tree uses), the badlands clay bands
 (`worldgen/bandlands.go`), and the column pass in `world/vanilla.go` that mirrors `SurfaceSystem`.
@@ -173,13 +177,15 @@ parse time).
 Known gaps, roughly in order of how visible they are:
 
 - **Feature replay covers most of the decoration steps, not every configured type.** `worldgen/features.go` parses
-  the placed/configured feature graph (placement modifiers, anchors, biome filters, inline `FeatureRef` placement chains) and the
+  the placed/configured feature graph (placement modifiers, anchors, `VeryBiasedToBottomHeight` and
+  other height providers, biome filters, inline `FeatureRef` placement chains) and the
   production region replay runs it for stage-1 lava lakes (`world/lakes.go`), stage-2 geodes,
   boulders, and large dripstone columns (`world/geodes.go`, `world/block_blob.go`,
   `world/large_dripstone.go`), stage-3 monster rooms (`world/monster_rooms.go`),
   the whole stage-6 schedule (ores with real deepslate targets, underwater magma between copper and the
   disks, disk features), stage-7 underground decoration (`world/underground_decoration.go`: `ore_infested`,
-  `sculk_vein`, `sculk_patch_deep_dark`, `dripstone_cluster`, `pointed_dripstone`), stage-8 springs (`world/springs.go`),
+  `sculk_vein`, `sculk_patch_deep_dark`, `dripstone_cluster`, `pointed_dripstone`), stage-8 springs
+  (`world/springs.go`, including 5-direction flowing water/lava tick spread),
   and stage-9 vegetation — lush-cave patches, `multiface_growth` (`glow_lichen`) and `vines`, plus trees, flowers, grass
   and mushrooms (`world/vegetation_patches.go`, `world/multiface.go`, `world/tree_features.go`) — see `world/feature_scheduler.go` and `world/region_ores.go`. Of the
   structure sets, ruined portals (`world/ruined_portal.go`), ocean ruins (`world/ocean_ruin.go`,
@@ -222,10 +228,11 @@ Known gaps, roughly in order of how visible they are:
 - **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
   outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 47): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 48): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
-and **99.930% through the production region replay** — 277 residual cells, dominated by the
-lush-caves moss and clay pools and their nested vegetation. Featureless vanilla captures
+and **99.954% through the production region replay** (393,037/393,216 — **179** residual cells:
+`deep=170`, `underground=9`, `waterline=0`, `surface=0`, dominated by the lush-caves moss and clay
+pools and their nested vegetation). Featureless vanilla captures
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) prove the
 undecorated pipeline bit-exact on both sets — 393,216/393,216 ocean and 786,432/786,432 land
 (`testdata/vanilla_land_base_12345.bin`, the four land chunks plus four decoration sources):
@@ -233,10 +240,12 @@ density, surface rules, carvers, aquifers, and noise-router veins match every ce
 `runBaseTerrainParity` now fails on a single mismatch — so the residual block gap is entirely
 inside feature replay.
 That ocean fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
-chunks): **99.740%**, 1,024 residual cells, of which 383 are the surface band above sea level and 17
-the waterline band, with 924 tree cells above sea level against vanilla's 789. Both bands are ratcheted in
-`world/vanilla_land_parity_test.go`, because the ocean floor of 99.7% leaves ~849 cells of headroom
-and an entirely wrong forest fits inside it.
+chunks): **99.973%** (393,110/393,216), **106** residual cells (`deep=105`, `underground=1`,
+`waterline=0`, `surface=0`), with **789/789** tree cells above sea level and **1,024/1,024** on all
+three heightmaps. Both the surface and waterline bands are ratcheted at **0** (`landSurfaceRatchet = 0`,
+`landWaterlineRatchet = 0`, `landCellRatchet = 393110`) in `world/vanilla_land_parity_test.go`,
+because the ocean floor of 99.7% leaves ~849 cells of headroom and an entirely wrong forest fits
+inside it.
 
 **Every vanilla `getBiome(BlockPos)` is the zoomed lookup, `BiomeManager.getBiome`.** It is the
 fiddled Voronoi zoom over the noise biomes, seeded by `obfuscateSeed` — not the 4×4×4 cell holding
@@ -268,12 +277,13 @@ source-water refill); mineshafts (`world/mineshafts.go`) replay piece-for-piece 
 vanilla start NBT and cell-for-cell against a structures-only capture, which is what closed the
 fixture's (-1,-1) pocket — a monster room whose wall opening a mineshaft corridor carved.
 
-The residual is now one family, not a tail: `moss_block`↔`deepslate` is 82 cells (59 where vanilla
-has moss and we have deepslate, 23 the other way), and lush-cave clay is 22. Everything else in the
-330 is a shuffle among ground cover, cave vines, kelp and dripleaves, and those counts are printed
-rather than quoted here: run the parity test under `REGIONIO_PARITY_DIAGNOSTIC=1` and it lists the
-net per state and the split by y band. Numbers written into a document go stale the moment the
-fixture is re-measured, which has already happened to this sentence three times.
+The ocean residual (179 cells) is now one family, not a tail: `moss_block`↔`deepslate` is 47 cells
+(34 where we have moss and vanilla has deepslate, 13 the other way), and lush-cave clay anchors are
+14 (`maxMissing = 75`, `maxAnchors = 14`, `maxExtra = 4` in `TestVanillaLushClayDiff`). Everything
+else in the 179 is a shuffle among ground cover, cave vines, kelp and dripleaves, and those counts
+are printed rather than quoted here: run the parity test under `REGIONIO_PARITY_DIAGNOSTIC=1` and it
+lists the net per state and the split by y band. Numbers written into a document go stale the moment
+the fixture is re-measured, which has already happened to this sentence three times.
 
 The one reading that was held and is now known wrong: a net of 35 fewer moss cells was taken as an
 extent or radius difference in `moss_patch`. It is not. Per-target nets inside that family point in
@@ -283,8 +293,9 @@ and the disagreement is which cells within it, which is a position-stream questi
 The lush-cave clay pools used to be the headline defect — one waterlogged pool landing fifteen blocks
 off in chunk (-1,-1), with moss and vine positions cascading from it. That is closed: `2c29024`
 aligned the decoration source ordering with vanilla's `rangeClosed` stream, and the differential
-capture below now shows clay at 22 cells against 268-extra/49-missing before. Two structural facts
-came out of the chase and are worth keeping, because they rule whole hypothesis classes out cheaply:
+capture below now shows clay anchors at 14 cells against 268-extra/49-missing before. Two structural
+facts came out of the chase and are worth keeping, because they rule whole hypothesis classes out
+cheaply:
 
 - `SetFeatureSeed` (`worldgen/random.go:367`) fully reseeds from `decorationSeed + featureIndex +
   10000*stage`, so an earlier feature consuming a different number of draws **cannot** shift a later
@@ -295,32 +306,35 @@ came out of the chase and are worth keeping, because they rule whole hypothesis 
   5th in `lush_caves` and reseeds as 29. `feature_schedule_golden_test.go` pins both numbers, so a
   reordering of the biome parameter table now fails loudly instead of silently moving every feature.
 
-`decorationSources` (`world/feature_scheduler.go:16-43`) remains a set of special cases: only (0,0)
-and (1,0) get vanilla's Z-major/X-minor order, and every other target — including the fixture's
-(-1,-1) — falls through to a target-first, then X-major, default that nothing derived it. Do not
-assume a chunk that is not (0,0) or (1,0) has a modelled neighbour order; the next fix of this class
-should derive the order once against a multi-target capture rather than add a third `if`.
+`decorationSources` (`world/feature_scheduler.go:44-84`) remains a hybrid of target-specific and
+column-major orders: `(0,0)` and `(1,0)` get Z-major/X-minor order, `(-1,-1)` gets target-first
+then column-major, `(-40,20)` runs its south two rows column-major (`z=20..21`) before the north row
+(`z=19`), and every other target — including the remaining three land chunks `(16,-40)`, `(16,-31)`,
+and `(-40,21)` — runs in column-major (X-major/Z-minor) order, which eliminated all 306 boundary
+stone-ore overwrites across the land targets (`TestLandTargetChunksOreBoundaryOrder`).
 
 The opt-in H4 path (`NewVanillaRegionH4Generator` / `NewVanillaRegionH4BatchGenerator`) is the
 first implementation of the alternative: one canonical 3×3 tile, one shared 7×7 region, and
 25 source origins replayed once instead of nine independent per-target histories. It is measured
-but not production: X-major gives 392,248/393,216 ocean and 391,120/393,216 land, while the
-committed hybrid gives 392,886 and 390,895; the H4 clay differential is 228/36/211 against
-96/22/9. `server.New` still uses the hybrid, and no ratchet was loosened. The canonical cache
+but not production: `server.New` uses the hybrid, and no ratchet was loosened. The canonical cache
 entry point and ring-closure test are kept so a later switch is a wiring decision, not a new
 architecture hidden in a parity edit. The hand-written `worldgen.PlaceStructures` village pass
 is no longer called by the production region replay; only the explicitly legacy per-chunk
 fallback retains it. Because that removal changes generated terrain, `generatorVersion` went to 41:
 every chunk stamped 40 or earlier regenerates rather than keeping the hand-placed village. It is
-47 now: 42 for the per-block biome zoom in the surface rules and carvers, 43 for the same zoom
+48 now: 42 for the per-block biome zoom in the surface rules and carvers, 43 for the same zoom
 in the decoration region's biome filter, 44 for the remaining stage-9 tree decorators
 (`place_on_ground`, `trunk_vine`, `attached_to_logs`), huge mushrooms, and fallen trees, 45 for
 stage-2 `large_dripstone`, 46 for stage-7 underground decoration (`ore_infested`, `sculk_vein`,
 `sculk_patch_deep_dark`, `dripstone_cluster`, `pointed_dripstone`), stage-9 `multiface_growth` / `vines`,
-and inline `FeatureRef` placement chains, and 47 for `SculkPatchFeature.canSpreadFrom` /
+and inline `FeatureRef` placement chains, 47 for `SculkPatchFeature.canSpreadFrom` /
 `SculkVeinBlock.hasSubstrateAccess`, noise-based and `randomized_int` state providers in
 `SimpleBlockFeature`, zero-draw `SimpleStateProvider`, and block-specific `simpleBlockCanSurvive`
-rules.
+rules, and 48 for tree leaf distance propagation across pre-existing logs and adjacent settled
+leaves (`world/leaf_distance.go`), stage-8 `SpringFeature` flowing tick spread and
+`VeryBiasedToBottomHeight` (`world/springs.go`), pre-stage `glow_lichen` RNG parity and
+`DoublePlantBlock` waterlogging (`world/vegetation_patches.go`), `Climate.quantizeCoord` truncation
+toward zero (`worldgen/biome.go`), and column-major `decorationSources`.
 
 The canonical cache treats a stored chunk as read-only, never as a replay input. A request for a
 tile probes the store for its own target first and reconciles the remaining members afterwards, so

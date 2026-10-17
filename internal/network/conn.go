@@ -1,5 +1,8 @@
-// Package network owns the TCP listener and per-connection lifecycle: framing,
-// the handshake state machine, and dispatch to per-state handlers.
+// Package network owns the TCP listener and per-connection lifecycle: packet
+// framing, zlib compression, optional RSA/AES-CFB8 online-mode encryption and
+// Mojang session verification, the handshake/status/login/configuration/play
+// state machine, chunk/lighting/entity streaming, and Brigadier command
+// dispatch.
 package network
 
 import (

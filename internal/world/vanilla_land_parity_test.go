@@ -19,8 +19,8 @@ import (
 // that prediction is legitimate only because biomes (6144/6144) and heightmaps
 // (3072/3072) are already hard-asserted to match vanilla.
 // landSurfaceRatchet, landCellRatchet, landWaterlineRatchet are today's measured land
-// numbers: 550 surface-band mismatches, 18 waterline-band mismatches and 391,746 exact
-// cells, with 924 tree cells above sea level against vanilla's 789.
+// numbers: 0 surface-band mismatches, 0 waterline-band mismatches and 393,110 exact
+// cells (99.973%, 106 residual), with 789 tree cells above sea level matching vanilla's 789.
 //
 // Both numbers moved twice when dark oaks arrived, and the two moves are separable:
 // fixing the three inverted doPlace guards (clip refusal, the ignore_vines clause, the

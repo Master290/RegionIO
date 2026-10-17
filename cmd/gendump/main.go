@@ -1,3 +1,7 @@
+// Command gendump prints client-free diagnostics about the overworld generator:
+// biome distribution, surface blocks, subsurface banding, deep-layer
+// composition, bedrock floor integrity, underground fluid census, badlands clay
+// bands, and an ASCII terrain cross-section.
 package main
 
 import (
@@ -8,8 +12,6 @@ import (
 	"regionio/internal/worldgen"
 )
 
-// gendump prints diagnostics about the current generator output so we can see
-// concretely what terrain/biomes/surface look like without a client.
 func main() {
 	const seed = 12345
 	od, err := worldgen.LoadOverworldFinalDensity(seed)

@@ -45,7 +45,7 @@ the deep oak-plank cells crossing chunks (0,0)/(1,0).
 
 Not wired yet: concentric_rings (strongholds only).
 
-## Ruined portal (decoded, not yet ported)
+## Ruined portal (ported, see world/ruined_portal.go)
 
 ### Seeding chain (ChunkGenerator.createStructures / lambda$createStructures$0)
 
@@ -2638,5 +2638,36 @@ Measured, `generatorVersion` 47 -> 48:
 | `trees_birch_and_oak_leaf_litter` chain | 43/50 exact, 47/50 own | 43/50 exact, 47/50 own |
 | `patch_leaf_litter` chain | 3/4 exact | 3/4 exact |
 
+## Stage-8 spring tick spread, `VeryBiasedToBottomHeight`, pre-stage `glow_lichen` RNG, `Climate.quantizeCoord`, and column-major `decorationSources`
 
+Five follow-up fixes closed the remaining surface and waterline bands on both fixtures (`0` surface mismatches and `0` waterline mismatches across all 8 ocean + land chunks):
 
+- **Stage-8 `SpringFeature` fluid tick spread and `VeryBiasedToBottomHeight`** (`world/springs.go`):
+  `SpringFeature.place` schedules a fluid tick (`level.scheduleTick(pos, fluidState.getType(), 0)`),
+  which runs `FlowingFluid.tick` inside the region immediately after placing the source block,
+  spreading water (drop-off 1, slope distance 4) and lava (drop-off 2, slope distance 2) downward
+  and horizontally into open cave pockets. Also ported `VeryBiasedToBottomHeight.sample`
+  (`Mth.nextInt(random, minY, Mth.nextInt(random, minY + inner, maxY))` with the two inclusive
+  bounds resolved before the draws). Pinned by `TestSpringFeaturePlacesFallingFluid` and
+  `TestRegionPlacesSprings`.
+- **Pre-stage `glow_lichen` RNG parity and `DoublePlantBlock` waterlogging** (`world/vegetation_patches.go`):
+  aligned candidate draw consumption and waterlogged lower-half state selection for double plants in
+  lush-cave patches.
+- **`Climate.quantizeCoord(float)` truncation toward zero** (`worldgen/biome.go`): Java's `(int)(f * 10000.0F)`
+  truncates toward zero, whereas `math.Floor` rounded negative climate coordinates down by 1 unit at
+  exact boundaries. Pinned by `TestQuantize`.
+- **Column-major `decorationSources` and `(-40,20)` source ordering** (`world/feature_scheduler.go`):
+  switching the generic `decorationSources` fallback from target-first to column-major (X-major/Z-minor),
+  keeping `(-1,-1)` target-first and ordering `(-40,20)` with its south two rows (`z=20..21`) before
+  the north row (`z=19`), eliminated all 306 boundary stone-ore overwrites across the four land
+  targets (`TestLandTargetChunksOreBoundaryOrder`) and matched all 789/789 land tree cells
+  (`TestChunk4020SourceOrderOakParity`, `TestChunk1640BirchTallStep62Parity`).
+
+Measured after all five:
+
+| | ocean (`vanilla_overworld_12345.bin`) | land (`vanilla_land_12345.bin`) |
+|---|---|---|
+| exact cells | **393,037 / 393,216 (99.954%, 179 residual)** | **393,110 / 393,216 (99.973%, 106 residual)** |
+| bands deep / underground / waterline / surface | **170 / 9 / 0 / 0** | **105 / 1 / 0 / 0** |
+| tree cells above sea level (vanilla / ours) | 0 / 0 | **789 / 789 (100%)** |
+| biomes / heightmaps | **6,144/6,144 / 3,072/3,072 (100%)** | **6,144/6,144 / 3,072/3,072 (100%)** |

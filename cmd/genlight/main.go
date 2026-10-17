@@ -1,3 +1,5 @@
+// Command genlight is the legacy heuristic light-table generator from blocks.json,
+// superseded by tools/VanillaBlockStateDump.java and internal/world/block_properties.bin.
 package main
 
 import (

@@ -1,6 +1,9 @@
-// Package world provides chunk data for the play phase: an in-memory chunk
-// representation, the level_chunk_with_light encoder, and (for now) a flat
-// world generator. Real noise-based generation arrives in a later sub-milestone.
+// Package world provides the chunk model and world runtime for the play phase:
+// concurrency-safe chunk snapshots, the level_chunk_with_light wire encoder,
+// ticket-aware LRU caching with canonical 3x3 batch publication, Anvil .mca
+// region and playerdata persistence, sky/block lighting propagation, entity
+// spatial indexing, and the 26.1.2 overworld generator and datapack feature
+// scheduler.
 package world
 
 // FlatSurfaceY is the Y of the topmost solid block (grass) in the flat world.

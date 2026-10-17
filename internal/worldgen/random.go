@@ -1,5 +1,10 @@
-// Package worldgen ports Minecraft's noise-based terrain generation: the random
-// sources, Perlin/normal noise, and (later) the density-function interpreter.
+// Package worldgen ports Minecraft 26.1.2's noise-based terrain generation and
+// worldgen datapack runtime: Xoroshiro128++ and LegacyRandomSource RNGs,
+// ImprovedNoise/PerlinNoise/NormalNoise/BlendedNoise, cubic splines, the
+// noise_router density-function interpreter, NoiseBasedAquifer, the surface-rule
+// interpreter and badlands clay bands, the 3D multi-noise climate/biome finder,
+// structure placement and NBT templates, and the embedded feature/biome/carver
+// datapack parser.
 //
 // Implementations mirror the official 26.1.2 server bit-for-bit; values are
 // verified against vectors captured from the real classes (see random_test.go).

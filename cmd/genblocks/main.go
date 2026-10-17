@@ -1,3 +1,6 @@
+// Command genblocks reads generated/reports/blocks.json from the vanilla data
+// generator and writes internal/worldgen/generated_blocks.go mapping block
+// names to their default block-state IDs.
 package main
 
 import (

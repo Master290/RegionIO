@@ -1,5 +1,7 @@
-// Package server holds the RegionIO core: configuration, shared state, and the
-// data shown to clients (status, MOTD).
+// Package server holds the RegionIO core: configuration, server.properties and
+// ops/whitelist/ban persistence, player sessions and inventory/playerdata state,
+// status/MOTD responses, entity spawning/visibility loops, and console/command
+// administration.
 package server
 
 import (
