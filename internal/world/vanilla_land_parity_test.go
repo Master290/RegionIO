@@ -181,6 +181,9 @@ func TestVanillaLandFixtureHasSurface(t *testing.T) {
 // minBlockPercent allows ~1,179 mismatched cells and the ocean fixture uses 330,
 // leaving 849 cells of headroom: an entirely wrong forest passes today.
 func TestVanillaLandBlockParity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full land fixture parity check in -short mode")
+	}
 	if _, err := os.Stat(vanillaLandFixture); err != nil {
 		t.Skipf("land fixture not installed: %v", err)
 	}

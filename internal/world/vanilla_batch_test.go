@@ -130,6 +130,9 @@ func TestVanillaRegionGeneratorIsDeterministic(t *testing.T) {
 }
 
 func TestVanillaRegionBatchContainsCanonicalTargets(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy 9-chunk batch vs single-chunk comparison in -short mode")
+	}
 	gen, batchGen := NewVanillaRegionGenerators(12345)
 	batch, err := batchGen(0, 0)
 	if err != nil {
@@ -218,6 +221,9 @@ func TestH4DecorationSourcesUseOneGlobalOrder(t *testing.T) {
 }
 
 func TestH4RingClosureDoesNotChangePublication(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy H4 wide-ring batch comparison in -short mode")
+	}
 	small := newVanillaRegionH4BatchGeneratorWithRadii(12345, h4ProductionOrder, 2, 3)
 	wide := newVanillaRegionH4BatchGeneratorWithRadii(12345, h4ProductionOrder, 2, 4)
 	smallBatch, err := small(0, 0)
@@ -246,6 +252,9 @@ func TestH4RingClosureDoesNotChangePublication(t *testing.T) {
 }
 
 func TestH4RegionBatchCanonicalizesRequests(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy 3x H4 batch canonicalization test in -short mode")
+	}
 	batchGen := NewVanillaRegionH4BatchGenerator(12345)
 	first, err := batchGen(0, 0)
 	if err != nil {

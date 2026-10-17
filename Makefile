@@ -1,4 +1,4 @@
-.PHONY: build vet test test-race parity diagnostics verify
+.PHONY: build vet test test-full test-race parity diagnostics verify
 
 build:
 	go build ./...
@@ -7,31 +7,22 @@ vet:
 	go vet ./...
 
 test:
+	go test -short ./...
+
+test-full:
 	go test ./...
 
-# Re-measured after the surface-decoration port, and again after dark oaks landed:
-# internal/world's test binary takes 1656.932s (27.6 minutes) under -race - it was
-# 1649.759s before the new placers, so growing the forests costs about seven seconds -
-# and the whole command 27m46s wall, because the
-# packages run concurrently rather than summing. The bound is per binary, so 30m still
-# passes - with two and a half minutes of slack on the dominant package.
-#
-# Slack has been the whole history of this line: the 18.4-minute measurement it was
-# written against has grown by nine minutes (trees, the leaf-distance fixpoint, four land
-# captures loaded by the chain differential), and the 20m bound before that left ninety
-# seconds and had already been misread as a data race when it was a timeout. If the next
-# feature port crosses 30m, raise it with the new number here rather than letting CI fail
-# in a way that looks like a race.
-#
-# Measure this on a quiet machine, and distrust the number otherwise. Three uncontended
-# runs give 1649.759s, 1656.932s and 1704.269s - about three percent apart, and
-# roughly a minute and a half of slack under the 30m bound. A fourth run, while the same
-# machine was also doing a 169-second non-race pass over the same package plus shell
-# polling, took 2114.545s: 35 minutes, which would have failed CI. The -race suite is a
-# whole-machine measurement, not a per-core one, so a timeout there is evidence about the
-# laptop before it is evidence about the code.
+# Previously an unsharded `go test -race -timeout 30m ./...` took 1656.932s (27.6m)
+# on internal/world, leaving only ~2.4 minutes of slack under the 30m bound.
+# Sharding internal/world across three `-run` prefix groups (`^Test[A-G]`,
+# `^Test[H-U]`, `^Test[V-Z]`) and skipping heavy multi-chunk parity fixtures under
+# `-short` (covered by `parity` and `diagnostics`) brings each shard down to ~1-4m
+# under -race with a 15m per-shard timeout, matching `.github/workflows/verify.yml`.
 test-race:
-	go test -race -timeout 30m ./...
+	go test -race -short -timeout 10m ./cmd/... ./internal/nbt ./internal/network ./internal/protocol ./internal/registry ./internal/server ./internal/worldgen
+	go test -race -short -timeout 15m ./internal/world -run '^Test[A-G]'
+	go test -race -short -timeout 15m ./internal/world -run '^Test[H-U]'
+	go test -race -short -timeout 15m ./internal/world -run '^Test[V-Z]'
 
 # The ocean fixture first, then the land one. They prove different things and only
 # the first can prove the other is meaningless: the ocean capture has no surface at

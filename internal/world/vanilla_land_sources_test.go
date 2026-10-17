@@ -28,6 +28,9 @@ const vanillaLandSourcesFixture = "testdata/vanilla_land_srcs_12345.bin"
 // about which biome owns each column - and deliberately does not ratchet the cell counts
 // yet, because nothing has been changed to move them.
 func TestVanillaLandSourceChunkParity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping source-chunk fixture parity check in -short mode")
+	}
 	if _, err := os.Stat(vanillaLandSourcesFixture); err != nil {
 		t.Skipf("source-chunk fixture not installed: %v", err)
 	}

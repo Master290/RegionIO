@@ -37,6 +37,9 @@ func TestPreCarveCacheStaysBounded(t *testing.T) {
 // exceptions are derived from, so a translation or transform change cannot
 // silently move them while the aggregate parity test still passes.
 func TestPortalExceptionFixtureCells(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy fixture portal exception test in -short mode")
+	}
 	cap := readFixtureCapture(t, vanillaParityFixture)
 	var want *fixtureChunk
 	for i := range cap.chunks {

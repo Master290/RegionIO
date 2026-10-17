@@ -58,6 +58,9 @@ func isLeafLitterState(id uint16) bool {
 // against. The second is reported because it is large, and because reading it as
 // errors would be the same mistake in a new costume.
 func TestVanillaLandTreeChainDiff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-capture tree chain parity diff in -short mode")
+	}
 	for _, tc := range []struct {
 		name    string
 		capture string

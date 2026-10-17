@@ -33,6 +33,9 @@ func h4OrderFromEnv() h4SourceOrder {
 }
 
 func TestVanillaBlockParity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full ocean fixture parity check in -short mode")
+	}
 	f, err := os.Open(vanillaParityFixture)
 	if err != nil {
 		if os.Getenv("REGIONIO_REQUIRE_PARITY") == "1" {

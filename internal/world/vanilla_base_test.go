@@ -36,6 +36,9 @@ func TestVanillaLandBaseTerrainParity(t *testing.T) {
 }
 
 func runBaseTerrainParity(t *testing.T, fixturePath string) {
+	if testing.Short() {
+		t.Skip("skipping base-terrain fixture parity check in -short mode")
+	}
 	f, err := os.Open(fixturePath)
 	if err != nil {
 		if os.Getenv("REGIONIO_REQUIRE_BASE_PARITY") == "1" {

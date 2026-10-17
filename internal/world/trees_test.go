@@ -11,6 +11,9 @@ import (
 // hand-written tree path this replaced and deleted; the legacy path now has no trees,
 // so the assertion belongs to the generator the product actually uses.
 func TestRegionVegetationStageProducesTrees(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping 3x3 region tree smoke scan in -short mode")
+	}
 	// A fixed 3x3 window over the old-growth taiga the land fixture measured, not a
 	// search: the first version of this scanned up to 81 region chunks looking for an
 	// oak log and stopped as soon as it found one, which made its runtime a property of
@@ -73,6 +76,9 @@ func decorateChunk4020TargetFirst(t *testing.T, seed int64) *Chunk {
 // existing logs and adjacent settled leaves preserves exact vanilla parity for the
 // oak tree canopy in chunk (-40, 20).
 func TestChunk4020OakLeafDistanceParity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full-region oak leaf distance fixture parity in -short mode")
+	}
 	cap := readFixtureCapture(t, vanillaLandFixture)
 	chunk := decorateChunk4020TargetFirst(t, cap.seed)
 	var vChunk fixtureChunk
@@ -110,6 +116,9 @@ func TestChunk4020OakLeafDistanceParity(t *testing.T) {
 // 4 RNG draws on those cells and advances the stream to step 801, placing the second
 // oak tree at (-637, 95, 322) and matching all 114 vanilla tree cells in (-40, 20).
 func TestChunk4020SourceOrderOakParity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full-region oak source-order fixture parity in -short mode")
+	}
 	cap := readFixtureCapture(t, vanillaLandFixture)
 	var vChunk fixtureChunk
 	for _, ch := range cap.chunks {
@@ -145,6 +154,9 @@ func TestChunk4020SourceOrderOakParity(t *testing.T) {
 // (261, 104, -624) to place super_birch_bees_0002, eliminating all 45 birch leaf
 // surface mismatches (22 missing + 23 extra) at z=-626..-625 in chunk (16, -40).
 func TestChunk1640BirchTallStep62Parity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full-region birch_tall fixture parity in -short mode")
+	}
 	cap := readFixtureCapture(t, vanillaLandFixture)
 	var vChunk fixtureChunk
 	for _, ch := range cap.chunks {

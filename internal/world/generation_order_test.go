@@ -30,6 +30,9 @@ var generatedRegionChunks = [][2]int32{{0, 0}, {1, 0}, {0, 1}, {-1, -1}}
 // the cache property, and equality across instances says the cache is the only
 // route by which one request could affect another.
 func TestGeneratedChunkOrderIndependence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-chunk forward/reverse region generation sweep in -short mode")
+	}
 	reversed := make([][2]int32, len(generatedRegionChunks))
 	for i, key := range generatedRegionChunks {
 		reversed[len(generatedRegionChunks)-1-i] = key

@@ -33,6 +33,9 @@ const noLushClayFixture = "testdata/vanilla_no_lush_clay_12345.bin"
 // numbers the chain misses today, and the point of the assertion is that they
 // only move down.
 func TestVanillaLushClayDiff(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping lush-clay differential fixture check in -short mode")
+	}
 	if _, err := os.Stat(noLushClayFixture); err != nil {
 		t.Skipf("differential capture unavailable: %v", err)
 	}

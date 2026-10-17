@@ -61,6 +61,9 @@ func TestOreFeatureDoPlaceBytecodeParity(t *testing.T) {
 //     exactly as in vanilla 26.1.2, eliminating all 229 andesite/diorite/granite
 //     mismatches (0 ore mismatches; 98,303 / 98,304 exact cells in (-39, 21)).
 func TestSourceChunk3921OreBoundaryOverwrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping source-chunk ore boundary trace in -short mode")
+	}
 	if _, err := os.Stat(vanillaLandSourcesFixture); err != nil {
 		t.Skipf("source-chunk fixture not installed: %v", err)
 	}
@@ -256,6 +259,9 @@ func TestSourceChunk3921OreBoundaryOverwrites(t *testing.T) {
 //  4. Replacing orderTargetFirst with orderColumnMajor eliminates all 306
 //     stone-ore mismatches across all 4 target chunks (0 remaining).
 func TestLandTargetChunksOreBoundaryOrder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping heavy 4-target land ore boundary order test in -short mode")
+	}
 	if _, err := os.Stat(vanillaLandFixture); err != nil {
 		t.Skipf("land fixture not installed: %v", err)
 	}

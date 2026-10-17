@@ -209,6 +209,9 @@ func replayLushClayPositions(t *testing.T, opts lushClayReplay) []worldgen.Featu
 // gives every chunk a single history, the first block is the one that has to break,
 // and this test makes that a decision rather than an accident.
 func TestLushClayPositionsAreRecorded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-region lush-clay position sweep in -short mode")
+	}
 	positions := func(opts lushClayReplay) [][3]int {
 		got := replayLushClayPositions(t, opts)
 		out := make([][3]int, 0, len(got))

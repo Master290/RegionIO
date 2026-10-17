@@ -277,6 +277,9 @@ func joinChunks(parts []string) string {
 //     (0 in (16,-40), 0 in (16,-31), 0 in (-40,21), 0 in (-40,20)) and only 1
 //     underground-band mismatch across all 4 chunks (0 + 0 + 1 + 0).
 func TestLandDecorationOrderStoneOreParity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-order land fixture stone-ore sweep in -short mode")
+	}
 	if _, err := os.Stat(vanillaLandFixture); err != nil {
 		t.Skipf("land fixture not installed: %v", err)
 	}

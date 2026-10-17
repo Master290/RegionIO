@@ -252,6 +252,9 @@ func TestSculkPatchBytecodeRules(t *testing.T) {
 }
 
 func TestChunk4020And4021SculkParityAndSourceOrdering(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping multi-order deep-dark sculk fixture parity in -short mode")
+	}
 	if _, err := os.Stat(vanillaLandFixture); err != nil {
 		t.Skipf("land fixture not installed: %v", err)
 	}
