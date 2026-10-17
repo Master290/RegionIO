@@ -656,59 +656,18 @@ func NewNetherGenerator(seed int64) Generator {
 	return gen
 }
 
-// GenerateEnd builds a placeholder End chunk at (cx, cz):
-//   - Main island of end_stone around (0, 0) within radius 64 blocks (Y = 46..58)
-//   - The 5x5 obsidian spawn platform at (100, 48, 0) with air at Y = 49..51 so
-//     players arriving at (100, 49, 0) stand on solid obsidian.
+// GenerateEnd builds a 26.1.2 End chunk at (cx, cz) for seed 0.
 func GenerateEnd(cx, cz int32) *Chunk {
-	c := NewDimensionChunk(cx, cz, BiomeTheEnd, EndDimensionType)
-	endStone, ok := nameToStateID("minecraft:end_stone", nil)
-	if !ok {
-		endStone = StateStone
-	}
-	obsidian, ok := nameToStateID("minecraft:obsidian", nil)
-	if !ok {
-		obsidian = StateBedrock
-	}
-
-	baseX := int(cx) * 16
-	baseZ := int(cz) * 16
-	for lx := 0; lx < 16; lx++ {
-		wx := baseX + lx
-		for lz := 0; lz < 16; lz++ {
-			wz := baseZ + lz
-			distSq := wx*wx + wz*wz
-			if distSq <= 64*64 {
-				// Central End island.
-				topY := 58 - (distSq / (16 * 16))
-				if topY < 50 {
-					topY = 50
-				}
-				bottomY := 44 + (distSq / (20 * 20))
-				if bottomY > topY {
-					bottomY = topY
-				}
-				for y := bottomY; y <= topY; y++ {
-					c.setBlockRaw(lx, y, lz, endStone)
-				}
-			}
-			// Vanilla End obsidian spawn platform at (98..102, 48, -2..2), clearing 49..51.
-			if wx >= EndSpawnX-EndPlatformRadius && wx <= EndSpawnX+EndPlatformRadius &&
-				wz >= EndSpawnZ-EndPlatformRadius && wz <= EndSpawnZ+EndPlatformRadius {
-				c.setBlockRaw(lx, EndPlatformFloorY, lz, obsidian)
-				for y := EndSpawnY; y <= EndSpawnY+2; y++ {
-					c.setBlockRaw(lx, y, lz, StateAir)
-				}
-			}
-		}
-	}
-	return c
+	defaultEndGenOnce.Do(func() {
+		defaultEndGen, _ = NewEndGenerators(0)
+	})
+	return defaultEndGen(cx, cz)
 }
 
-// NewEndGenerator returns a placeholder End chunk generator for the given seed.
+// NewEndGenerator returns the 26.1.2 End chunk generator for the given seed.
 func NewEndGenerator(seed int64) Generator {
-	_ = seed
-	return GenerateEnd
+	gen, _ := NewEndGenerators(seed)
+	return gen
 }
 
 // EnsureEndSpawnPlatform places the vanilla 5x5 obsidian platform centered at

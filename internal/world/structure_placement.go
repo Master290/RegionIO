@@ -154,7 +154,9 @@ func isStructureBiomeAllowed(od *worldgen.OverworldDensity, sets *worldgen.Struc
 	}
 	qx, qy, qz := (x>>2)<<2, (y>>2)<<2, (z>>2)<<2
 	var biome string
-	if isNetherDensity(od) {
+	if isEndDensity(od) {
+		biome = worldgen.EndBiomeAt(od.Erosion, x>>2, y>>2, z>>2)
+	} else if isNetherDensity(od) {
 		s2D := worldgen.SampleColumn2D(od, od.SeaLevel, qx, qz)
 		biome = worldgen.NetherBiomeTable().FindBiome(worldgen.SampleCell(od, s2D, qx, qy, qz))
 	} else {
@@ -171,6 +173,10 @@ func isStructureBiomeAllowed(od *worldgen.OverworldDensity, sets *worldgen.Struc
 
 func isNetherDensity(od *worldgen.OverworldDensity) bool {
 	return od != nil && od.MinY == 0 && od.SeaLevel == 32 && od.Height == 128
+}
+
+func isEndDensity(od *worldgen.OverworldDensity) bool {
+	return od != nil && od.MinY == 0 && od.SeaLevel == 0 && od.Height == 128
 }
 
 // oceanMonumentSurroundingAllowed ports the OceanMonumentStructure.findGenerationPoint
@@ -413,6 +419,9 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 			return [3]int{}, false
 		}
 		return [3]int{stub.X, stub.Y, stub.Z}, true
+
+	case "minecraft:end_city":
+		return endCityVariantPoint(od, sets, def, variantRandom, cx, cz)
 
 	case "minecraft:jigsaw":
 		startY := def.SampleStartHeight(variantRandom)

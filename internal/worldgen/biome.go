@@ -268,3 +268,32 @@ func NetherBiomeTable() *ParameterTable {
 	return netherBiomeTable
 }
 
+// EndBiomeAt ports TheEndBiomeSource.getNoiseBiome(int quartX, int quartY, int quartZ, Climate.Sampler).
+func EndBiomeAt(erosion DensityFunction, quartX, quartY, quartZ int) string {
+	blockX := quartX << 2
+	blockY := quartY << 2
+	blockZ := quartZ << 2
+	sectionX := blockX >> 4
+	sectionZ := blockZ >> 4
+	if int64(sectionX)*int64(sectionX)+int64(sectionZ)*int64(sectionZ) <= 4096 {
+		return "minecraft:the_end"
+	}
+	weirdBlockX := (sectionX*2 + 1) * 8
+	weirdBlockZ := (sectionZ*2 + 1) * 8
+	var d float64
+	if erosion != nil {
+		d = erosion.Compute(FunctionContext{X: float64(weirdBlockX), Y: float64(blockY), Z: float64(weirdBlockZ)})
+	}
+	if d > 0.25 {
+		return "minecraft:end_highlands"
+	}
+	if d >= -0.0625 {
+		return "minecraft:end_midlands"
+	}
+	if d < -0.21875 {
+		return "minecraft:small_end_islands"
+	}
+	return "minecraft:end_barrens"
+}
+
+
