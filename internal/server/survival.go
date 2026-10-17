@@ -1061,6 +1061,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	session.SetFoodExhaustion(0)
 	session.SetFoodTickTimer(0)
 	session.SetBlockingWithShield(false)
+	s.StopPlayerFallFlying(session)
 	s.CancelEating(session)
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)

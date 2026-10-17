@@ -363,7 +363,11 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	}
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	if h.session != nil {
-		h.srv.HandlePlayerElytraMove(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
+		if h.session.IsFallFlying() {
+			h.srv.HandlePlayerElytraMove(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
+		} else {
+			h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
+		}
 		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.RecordPlayerMovementStats(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
@@ -562,14 +566,12 @@ func (h *handler) serverTickLoop() {
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
 				// StartSpawning is not advancing the world clock; tick player,
-				// entity status effects, raids, boss fights, and elytra/fireworks here.
+				// entity status effects, raids, and boss fights here.
 				h.srv.TickAllPlayerEffects()
 				h.srv.TickAllEntityEffects()
 				h.srv.TickRaids()
 				h.srv.TickWithers(nil)
 				h.srv.TickEnderDragons(nil)
-				h.srv.TickElytraPlayers()
-				h.srv.TickFireworkRockets()
 			}
 			lastGameTime = nowGameTime
 		}

@@ -59,6 +59,7 @@ type OpenContainerState struct {
 	BlockY         int
 	BlockZ         int
 	Crafting       [CraftingGridSlotCount]world.ItemStack
+	CraftingStars  [CraftingGridSlotCount]FireworkExplosion
 	Result         world.ItemStack
 	EnchantSlots   [2]world.ItemStack
 	CombinerInputs [2]world.ItemStack
@@ -79,12 +80,13 @@ type serverChestState struct {
 }
 
 type playerContainerTracker struct {
-	mu          sync.Mutex
-	nextWindow  int32
-	carried     world.ItemStack
-	open        *OpenContainerState
-	invCraft    [4]world.ItemStack
-	invResult   world.ItemStack
+	mu            sync.Mutex
+	nextWindow    int32
+	carried       world.ItemStack
+	open          *OpenContainerState
+	invCraft      [4]world.ItemStack
+	invCraftStars [4]FireworkExplosion
+	invResult     world.ItemStack
 }
 
 var (
@@ -910,22 +912,185 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 	}
 }
 
+func getCarriedFireworkStar(session *PlayerSession) (FireworkExplosion, bool) {
+	if session == nil {
+		return FireworkExplosion{}, false
+	}
+	st := getFireworkSlotState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.carriedStar == nil {
+		return FireworkExplosion{}, false
+	}
+	return st.carriedStar.Clone(), true
+}
+
+func setCarriedFireworkStar(session *PlayerSession, exp *FireworkExplosion) {
+	if session == nil {
+		return
+	}
+	st := getFireworkSlotState(session)
+	st.mu.Lock()
+	if exp == nil {
+		st.carriedStar = nil
+	} else {
+		cp := exp.Clone()
+		st.carriedStar = &cp
+	}
+	st.mu.Unlock()
+}
+
+func getCarriedFireworks(session *PlayerSession) (FireworksComponent, bool) {
+	if session == nil {
+		return FireworksComponent{}, false
+	}
+	st := getFireworkSlotState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.carriedFW == nil {
+		return FireworksComponent{}, false
+	}
+	return st.carriedFW.Clone(), true
+}
+
+func setCarriedFireworks(session *PlayerSession, fw *FireworksComponent) {
+	if session == nil {
+		return
+	}
+	st := getFireworkSlotState(session)
+	st.mu.Lock()
+	if fw == nil {
+		st.carriedFW = nil
+	} else {
+		cp := fw.Clone()
+		st.carriedFW = &cp
+	}
+	st.mu.Unlock()
+}
+
+func matchCraftingWithFireworks(
+	grid []world.ItemStack,
+	width, height int,
+	gridStars []FireworkExplosion,
+) (res world.ItemStack, starExp *FireworkExplosion, fwComp *FireworksComponent, ok bool) {
+	if res, _, ok := MatchCraftingGrid(grid, width, height); ok {
+		return res, nil, nil, true
+	}
+	if out, exp, matched := MatchFireworkStarRecipe(grid); matched {
+		cp := exp.Clone()
+		return out, &cp, nil, true
+	}
+	if out, exp, matched := MatchFireworkStarFadeRecipe(grid, gridStars); matched {
+		cp := exp.Clone()
+		return out, &cp, nil, true
+	}
+	if out, fw, matched := MatchFireworkRocketRecipe(grid, gridStars); matched {
+		cp := fw.Clone()
+		return out, nil, &cp, true
+	}
+	return world.ItemStack{}, nil, nil, false
+}
+
 func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) {
 	if slot < 0 || slot >= CraftingMenuSlotCount || tr.open == nil {
 		return
 	}
 	slots := s.buildCraftingMenuSlots(session, tr.open.Crafting, tr.open.Result)
+	gridStars := make([]FireworkExplosion, CraftingGridSlotCount)
+	for i := 0; i < CraftingGridSlotCount; i++ {
+		if len(tr.open.CraftingStars[i].Colors) > 0 || len(tr.open.CraftingStars[i].FadeColors) > 0 {
+			gridStars[i] = tr.open.CraftingStars[i].Clone()
+		} else if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
+			gridStars[i] = exp
+		}
+	}
 
 	if slot == 0 {
 		// Crafting output slot.
-		if crafted := s.clickCraftingOutput(slots, 1, 9, 3, 3, 10, 46, &tr.carried, mode); !crafted.IsEmpty() {
+		if crafted := s.clickCraftingOutput(session, slots, 1, 9, 3, 3, 10, 46, gridStars, func(menuSlot int) int {
+			return menuSlot - 1
+		}, &tr.carried, mode); !crafted.IsEmpty() {
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 		}
 	} else {
 		switch mode {
 		case ContainerInputPickup:
+			prevSlotEmpty := slots[slot].IsEmpty()
+			prevCarriedEmpty := tr.carried.IsEmpty()
+			var slotStar *FireworkExplosion
+			var slotFW *FireworksComponent
+			if slot >= 1 && slot <= 9 {
+				if len(gridStars[slot-1].Colors) > 0 || len(gridStars[slot-1].FadeColors) > 0 {
+					cp := gridStars[slot-1].Clone()
+					slotStar = &cp
+				}
+			} else if slot >= 10 && slot < 46 {
+				sessSlot := slot - 1
+				if exp, ok := GetSlotFireworkStar(session, sessSlot); ok {
+					slotStar = &exp
+				}
+				if fw, ok := GetSlotFireworks(session, sessSlot); ok && slots[slot].ResolvedID() == FireworkRocketItemID {
+					slotFW = &fw
+				}
+			}
+			var cStar *FireworkExplosion
+			if exp, ok := getCarriedFireworkStar(session); ok {
+				cStar = &exp
+			}
+			var cFW *FireworksComponent
+			if fw, ok := getCarriedFireworks(session); ok {
+				cFW = &fw
+			}
+
 			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+
+			var newSlotStar *FireworkExplosion
+			var newSlotFW *FireworksComponent
+			var newCStar *FireworkExplosion
+			var newCFW *FireworksComponent
+			switch {
+			case prevSlotEmpty && !slots[slot].IsEmpty():
+				newSlotStar, newSlotFW = cStar, cFW
+				if !tr.carried.IsEmpty() {
+					newCStar, newCFW = cStar, cFW
+				}
+			case prevCarriedEmpty && !tr.carried.IsEmpty():
+				newCStar, newCFW = slotStar, slotFW
+				if !slots[slot].IsEmpty() {
+					newSlotStar, newSlotFW = slotStar, slotFW
+				}
+			case !slots[slot].IsEmpty() && !tr.carried.IsEmpty():
+				if slots[slot].ResolvedItemID() == tr.carried.ResolvedItemID() {
+					newSlotStar, newSlotFW = slotStar, slotFW
+					newCStar, newCFW = cStar, cFW
+				} else {
+					newSlotStar, newSlotFW = cStar, cFW
+					newCStar, newCFW = slotStar, slotFW
+				}
+			}
+			if slot >= 1 && slot <= 9 {
+				if newSlotStar != nil {
+					tr.open.CraftingStars[slot-1] = newSlotStar.Clone()
+				} else {
+					tr.open.CraftingStars[slot-1] = FireworkExplosion{}
+				}
+			} else if slot >= 10 && slot < 46 {
+				sessSlot := slot - 1
+				if newSlotStar != nil && slots[slot].ResolvedID() == FireworkStarItemID {
+					SetSlotFireworkStar(session, sessSlot, *newSlotStar)
+				} else if slots[slot].IsEmpty() || slots[slot].ResolvedID() != FireworkStarItemID {
+					ClearSlotFireworkStar(session, sessSlot)
+				}
+				if newSlotFW != nil && slots[slot].ResolvedID() == FireworkRocketItemID {
+					SetSlotFireworks(session, sessSlot, *newSlotFW)
+				} else if slots[slot].IsEmpty() || slots[slot].ResolvedID() != FireworkRocketItemID {
+					ClearSlotFireworks(session, sessSlot)
+				}
+			}
+			setCarriedFireworkStar(session, newCStar)
+			setCarriedFireworks(session, newCFW)
+
 		case ContainerInputQuickMove:
 			if slot >= 1 && slot <= 9 {
 				// Crafting grid -> player inventory
@@ -953,11 +1118,30 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 	// Write back crafting grid (1..9), recompute result (0), and write back player inventory (10..45).
 	for i := 0; i < CraftingGridSlotCount; i++ {
 		tr.open.Crafting[i] = slots[1+i]
+		if tr.open.Crafting[i].IsEmpty() {
+			tr.open.CraftingStars[i] = FireworkExplosion{}
+		} else if len(tr.open.CraftingStars[i].Colors) == 0 && len(tr.open.CraftingStars[i].FadeColors) == 0 {
+			if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
+				tr.open.CraftingStars[i] = exp
+			}
+		}
 	}
-	if res, _, ok := MatchCraftingGrid(tr.open.Crafting[:], 3, 3); ok {
+	if res, starExp, fwComp, ok := matchCraftingWithFireworks(tr.open.Crafting[:], 3, 3, tr.open.CraftingStars[:]); ok {
 		tr.open.Result = res
+		if starExp != nil {
+			SetSlotFireworkStar(session, 0, *starExp)
+			ClearSlotFireworks(session, 0)
+		} else if fwComp != nil {
+			SetSlotFireworks(session, 0, *fwComp)
+			ClearSlotFireworkStar(session, 0)
+		} else {
+			ClearSlotFireworkStar(session, 0)
+			ClearSlotFireworks(session, 0)
+		}
 	} else {
 		tr.open.Result = world.ItemStack{}
+		ClearSlotFireworkStar(session, 0)
+		ClearSlotFireworks(session, 0)
 	}
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[10+i])
@@ -975,8 +1159,13 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 		if tr.invCraft[i].IsEmpty() {
 			tr.invCraft[i] = session.InventorySlot(1 + i)
 		}
+		if len(tr.invCraftStars[i].Colors) == 0 && len(tr.invCraftStars[i].FadeColors) == 0 {
+			if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
+				tr.invCraftStars[i] = exp
+			}
+		}
 	}
-	if res, _, ok := MatchCraftingGrid(tr.invCraft[:], 2, 2); ok {
+	if res, _, _, ok := matchCraftingWithFireworks(tr.invCraft[:], 2, 2, tr.invCraftStars[:]); ok {
 		tr.invResult = res
 	} else {
 		tr.invResult = world.ItemStack{}
@@ -984,14 +1173,82 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 	slots := s.buildPlayerMenuSlots(session, tr.invCraft, tr.invResult)
 
 	if slot == 0 {
-		if crafted := s.clickCraftingOutput(slots, 1, 4, 2, 2, 9, 45, &tr.carried, mode); !crafted.IsEmpty() {
+		if crafted := s.clickCraftingOutput(session, slots, 1, 4, 2, 2, 9, 45, tr.invCraftStars[:], func(menuSlot int) int {
+			return menuSlot
+		}, &tr.carried, mode); !crafted.IsEmpty() {
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 		}
 	} else {
 		switch mode {
 		case ContainerInputPickup:
+			prevSlotEmpty := slots[slot].IsEmpty()
+			prevCarriedEmpty := tr.carried.IsEmpty()
+			var slotStar *FireworkExplosion
+			if exp, ok := GetSlotFireworkStar(session, slot); ok {
+				slotStar = &exp
+			} else if slot >= 1 && slot <= 4 && (len(tr.invCraftStars[slot-1].Colors) > 0 || len(tr.invCraftStars[slot-1].FadeColors) > 0) {
+				cp := tr.invCraftStars[slot-1].Clone()
+				slotStar = &cp
+			}
+			var slotFW *FireworksComponent
+			if fw, ok := GetSlotFireworks(session, slot); ok && slots[slot].ResolvedID() == FireworkRocketItemID {
+				slotFW = &fw
+			}
+			var cStar *FireworkExplosion
+			if exp, ok := getCarriedFireworkStar(session); ok {
+				cStar = &exp
+			}
+			var cFW *FireworksComponent
+			if fw, ok := getCarriedFireworks(session); ok {
+				cFW = &fw
+			}
+
 			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+
+			var newSlotStar *FireworkExplosion
+			var newSlotFW *FireworksComponent
+			var newCStar *FireworkExplosion
+			var newCFW *FireworksComponent
+			switch {
+			case prevSlotEmpty && !slots[slot].IsEmpty():
+				newSlotStar, newSlotFW = cStar, cFW
+				if !tr.carried.IsEmpty() {
+					newCStar, newCFW = cStar, cFW
+				}
+			case prevCarriedEmpty && !tr.carried.IsEmpty():
+				newCStar, newCFW = slotStar, slotFW
+				if !slots[slot].IsEmpty() {
+					newSlotStar, newSlotFW = slotStar, slotFW
+				}
+			case !slots[slot].IsEmpty() && !tr.carried.IsEmpty():
+				if slots[slot].ResolvedItemID() == tr.carried.ResolvedItemID() {
+					newSlotStar, newSlotFW = slotStar, slotFW
+					newCStar, newCFW = cStar, cFW
+				} else {
+					newSlotStar, newSlotFW = cStar, cFW
+					newCStar, newCFW = slotStar, slotFW
+				}
+			}
+			if newSlotStar != nil && slots[slot].ResolvedID() == FireworkStarItemID {
+				SetSlotFireworkStar(session, slot, *newSlotStar)
+				if slot >= 1 && slot <= 4 {
+					tr.invCraftStars[slot-1] = newSlotStar.Clone()
+				}
+			} else if slots[slot].IsEmpty() || slots[slot].ResolvedID() != FireworkStarItemID {
+				ClearSlotFireworkStar(session, slot)
+				if slot >= 1 && slot <= 4 {
+					tr.invCraftStars[slot-1] = FireworkExplosion{}
+				}
+			}
+			if newSlotFW != nil && slots[slot].ResolvedID() == FireworkRocketItemID {
+				SetSlotFireworks(session, slot, *newSlotFW)
+			} else if slots[slot].IsEmpty() || slots[slot].ResolvedID() != FireworkRocketItemID {
+				ClearSlotFireworks(session, slot)
+			}
+			setCarriedFireworkStar(session, newCStar)
+			setCarriedFireworks(session, newCFW)
+
 		case ContainerInputQuickMove:
 			if slot >= 1 && slot <= 4 {
 				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 36, 45)
@@ -1015,11 +1272,31 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 
 	for i := 0; i < 4; i++ {
 		tr.invCraft[i] = slots[1+i]
+		if tr.invCraft[i].IsEmpty() {
+			tr.invCraftStars[i] = FireworkExplosion{}
+			ClearSlotFireworkStar(session, 1+i)
+		} else if len(tr.invCraftStars[i].Colors) == 0 && len(tr.invCraftStars[i].FadeColors) == 0 {
+			if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
+				tr.invCraftStars[i] = exp
+			}
+		}
 	}
-	if res, _, ok := MatchCraftingGrid(tr.invCraft[:], 2, 2); ok {
+	if res, starExp, fwComp, ok := matchCraftingWithFireworks(tr.invCraft[:], 2, 2, tr.invCraftStars[:]); ok {
 		tr.invResult = res
+		if starExp != nil {
+			SetSlotFireworkStar(session, 0, *starExp)
+			ClearSlotFireworks(session, 0)
+		} else if fwComp != nil {
+			SetSlotFireworks(session, 0, *fwComp)
+			ClearSlotFireworkStar(session, 0)
+		} else {
+			ClearSlotFireworkStar(session, 0)
+			ClearSlotFireworks(session, 0)
+		}
 	} else {
 		tr.invResult = world.ItemStack{}
+		ClearSlotFireworkStar(session, 0)
+		ClearSlotFireworks(session, 0)
 	}
 	slots[0] = tr.invResult
 	for i := 0; i < world.PlayerInventorySlots; i++ {
@@ -1028,14 +1305,17 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 }
 
 func (s *Server) clickCraftingOutput(
+	session *PlayerSession,
 	slots []world.ItemStack,
 	gridStart, gridCount, width, height int,
 	invStart, invEnd int,
+	gridStars []FireworkExplosion,
+	menuSlotToSessionSlot func(menuSlot int) int,
 	carried *world.ItemStack,
 	mode int32,
 ) world.ItemStack {
 	grid := slots[gridStart : gridStart+gridCount]
-	res, _, ok := MatchCraftingGrid(grid, width, height)
+	res, starExp, fwComp, ok := matchCraftingWithFireworks(grid, width, height, gridStars)
 	if !ok || res.IsEmpty() {
 		return world.ItemStack{}
 	}
@@ -1065,25 +1345,56 @@ func (s *Server) clickCraftingOutput(
 			*carried = world.NewItemStack(resID, res.Count)
 			consumeGridOnce()
 			crafted = res
+			if starExp != nil {
+				setCarriedFireworkStar(session, starExp)
+				setCarriedFireworks(session, nil)
+			} else if fwComp != nil {
+				setCarriedFireworks(session, fwComp)
+				setCarriedFireworkStar(session, nil)
+			}
 		} else if carried.ResolvedItemID() == resID && carried.Count+res.Count <= MaxItemStackSize {
 			*carried = world.NewItemStack(resID, carried.Count+res.Count)
 			consumeGridOnce()
 			crafted = res
+			if starExp != nil {
+				setCarriedFireworkStar(session, starExp)
+				setCarriedFireworks(session, nil)
+			} else if fwComp != nil {
+				setCarriedFireworks(session, fwComp)
+				setCarriedFireworkStar(session, nil)
+			}
 		}
 	case ContainerInputQuickMove:
 		var totalCrafted int32
 		for iter := 0; iter < 64; iter++ {
-			curRes, _, match := MatchCraftingGrid(slots[gridStart:gridStart+gridCount], width, height)
+			curRes, curStarExp, curFwComp, match := matchCraftingWithFireworks(slots[gridStart:gridStart+gridCount], width, height, gridStars)
 			if !match || curRes.IsEmpty() || curRes.ResolvedItemID() != resID {
 				break
 			}
 			if !canFitInSlice(slots, curRes, invStart, invEnd) {
 				break
 			}
+			prevCounts := make([]int32, invEnd)
+			for idx := invStart; idx < invEnd; idx++ {
+				prevCounts[idx] = slots[idx].Count
+			}
 			// Prefer hotbar (last 9 slots of invStart..invEnd) then main inventory.
 			hotbarStart := invEnd - 9
 			rem := mergeIntoSlotSlice(slots, curRes, hotbarStart, invEnd)
 			rem = mergeIntoSlotSlice(slots, rem, invStart, hotbarStart)
+			if menuSlotToSessionSlot != nil && (curStarExp != nil || curFwComp != nil) {
+				for idx := invStart; idx < invEnd; idx++ {
+					if slots[idx].Count > prevCounts[idx] {
+						dstSlot := menuSlotToSessionSlot(idx)
+						if curStarExp != nil {
+							SetSlotFireworkStar(session, dstSlot, *curStarExp)
+						}
+						if curFwComp != nil {
+							SetSlotFireworks(session, dstSlot, *curFwComp)
+						}
+					}
+				}
+			}
 			consumeGridOnce()
 			totalCrafted += curRes.Count
 			if !rem.IsEmpty() {
@@ -1336,6 +1647,18 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 	w.VarInt(stateID)
 	w.VarInt(int32(len(slots)))
 	for i, st := range slots {
+		switch st.ResolvedID() {
+		case FireworkRocketItemID:
+			if fw, ok := GetSlotFireworks(session, i); ok {
+				EncodeSlotWithFireworks(w, st, fw)
+				continue
+			}
+		case FireworkStarItemID:
+			if exp, ok := GetSlotFireworkStar(session, i); ok {
+				EncodeSlotWithFireworkStar(w, st, exp)
+				continue
+			}
+		}
 		meta := GetSlotItemMeta(session, i)
 		trim, hasTrim := GetSlotArmorTrim(session, i)
 		if !meta.IsEmpty() || hasTrim {
@@ -1344,12 +1667,27 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 			writeContainerItemStack(w, st)
 		}
 	}
-	carriedMeta := GetCarriedItemMeta(session)
-	carriedTrim, hasCarriedTrim := GetCarriedArmorTrim(session)
-	if !carriedMeta.IsEmpty() || hasCarriedTrim {
-		WriteSlotWithArmorTrim(w, carried, carriedMeta, carriedTrim)
-	} else {
-		writeContainerItemStack(w, carried)
+	encodedCarried := false
+	switch carried.ResolvedID() {
+	case FireworkRocketItemID:
+		if fw, ok := getCarriedFireworks(session); ok {
+			EncodeSlotWithFireworks(w, carried, fw)
+			encodedCarried = true
+		}
+	case FireworkStarItemID:
+		if exp, ok := getCarriedFireworkStar(session); ok {
+			EncodeSlotWithFireworkStar(w, carried, exp)
+			encodedCarried = true
+		}
+	}
+	if !encodedCarried {
+		carriedMeta := GetCarriedItemMeta(session)
+		carriedTrim, hasCarriedTrim := GetCarriedArmorTrim(session)
+		if !carriedMeta.IsEmpty() || hasCarriedTrim {
+			WriteSlotWithArmorTrim(w, carried, carriedMeta, carriedTrim)
+		} else {
+			writeContainerItemStack(w, carried)
+		}
 	}
 	return session.send(protocol.PlayContainerSetContent, w.Bytes())
 }
