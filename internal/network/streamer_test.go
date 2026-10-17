@@ -285,3 +285,61 @@ func clientsWithPacket(recorders []*recordingConn, id int32) int {
 	}
 	return count
 }
+
+func TestStreamerBatchGeneratorAvoidsOverlappingBatches(t *testing.T) {
+	var batchCalls atomic.Int32
+	cache := world.NewCache(-1, func(cx, cz int32) *world.Chunk {
+		return world.NewChunk(cx, cz, world.BiomePlains)
+	})
+	cache.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*world.Chunk, error) {
+		batchCalls.Add(1)
+		batch := make(map[[2]int32]*world.Chunk, 9)
+		for x := cx - 1; x <= cx+1; x++ {
+			for z := cz - 1; z <= cz+1; z++ {
+				batch[[2]int32{x, z}] = world.NewChunk(x, z, world.BiomePlains)
+			}
+		}
+		return batch, nil
+	})
+	recorder := &recordingConn{}
+	s := newStreamer(cache, NewConn(recorder), nil, 2)
+	s.poolSize = 8
+	if _, superseded := s.processRecenter(context.Background(), 0, 0); superseded {
+		t.Fatal("unexpected recenter supersession")
+	}
+	defer s.tickets.Close()
+
+	if got := batchCalls.Load(); got != 9 {
+		t.Fatalf("cold recenter batch calls = %d, want 9 non-overlapping 3x3 tiles", got)
+	}
+	if got := recorder.countPacketID(protocol.PlayLevelChunk); got != 25 {
+		t.Fatalf("level chunks sent = %d, want 25", got)
+	}
+}
+
+func TestStreamerServesPregeneratedSpawnWithoutGenerating(t *testing.T) {
+	var calls atomic.Int32
+	cache := world.NewCache(-1, func(cx, cz int32) *world.Chunk {
+		calls.Add(1)
+		return world.NewChunk(cx, cz, world.BiomePlains)
+	})
+	if err := cache.Pregenerate(context.Background(), 0, 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	calls.Store(0)
+
+	recorder := &recordingConn{}
+	s := newStreamer(cache, NewConn(recorder), nil, 2)
+	if _, superseded := s.processRecenter(context.Background(), 0, 0); superseded {
+		t.Fatal("unexpected recenter supersession")
+	}
+	defer s.tickets.Close()
+
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("generator calls after Pregenerate = %d, want 0", got)
+	}
+	if got := recorder.countPacketID(protocol.PlayLevelChunk); got != 25 {
+		t.Fatalf("level chunks sent = %d, want 25", got)
+	}
+}
+

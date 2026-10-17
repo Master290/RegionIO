@@ -148,13 +148,18 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterR
 	// Build the desired set: everything within genRadius (the union of what we
 	// send + the pre-gen ring). Sent = within viewRadius; pre-gen = the ring.
 	order := spiralOrder(cx, cz, s.genRadius)
-	view := make(map[[2]int32]bool, (2*s.viewRadius+1)*(2*s.viewRadius+1))
+	viewCount := (2*s.viewRadius + 1) * (2*s.viewRadius + 1)
+	if viewCount > len(order) {
+		viewCount = len(order)
+	}
+	preGenCount := len(order) - viewCount
+	view := make(map[[2]int32]bool, viewCount)
 
 	// Split into "to send" (within viewRadius) and "pre-gen only" (the ring).
-	var toSend [][2]int32
-	var toPreGen [][2]int32
-	var viewTickets []world.ChunkPos
-	var prefetchTickets []world.ChunkPos
+	toSend := make([][2]int32, 0, viewCount)
+	toPreGen := make([][2]int32, 0, preGenCount)
+	viewTickets := make([]world.ChunkPos, 0, viewCount)
+	prefetchTickets := make([]world.ChunkPos, 0, preGenCount)
 	for _, key := range order {
 		if chunkDistanceFrom(cx, cz, key) <= int32(s.viewRadius) {
 			view[key] = true
@@ -172,7 +177,7 @@ func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterR
 	// The center frame needs a 3x3 terrain neighborhood for lighting. Preload
 	// those chunks concurrently so the first visible chunk is not delayed by
 	// eight sequential generator calls inside the lighting pass.
-	if !s.loaded[[2]int32{cx, cz}] {
+	if !s.loaded[[2]int32{cx, cz}] && (s.cache == nil || !s.cache.HasFrame(cx, cz)) {
 		s.parallelPreload(ctx, spiralOrder(cx, cz, 1))
 	}
 
@@ -215,8 +220,27 @@ func chunkDistanceFrom(cx, cz int32, key [2]int32) int32 {
 }
 
 func (s *streamer) streamPriority(ctx context.Context, cx, cz int32, keys [][2]int32, send bool) (recenterReq, bool) {
+	if !send && s.cache != nil && s.cache.HasBatchGenerator() {
+		s.parallelPreload(ctx, keys)
+		if next, ok := s.latestRecenter(); ok {
+			return next, true
+		}
+		return recenterReq{}, false
+	}
+	lastPreloadedRing := int32(0)
 	for start := 0; start < len(keys); {
 		ring := chunkDistanceFrom(cx, cz, keys[start])
+		if send && ring > lastPreloadedRing && s.cache != nil && s.cache.HasBatchGenerator() {
+			ringEnd := start
+			for ringEnd < len(keys) && chunkDistanceFrom(cx, cz, keys[ringEnd]) == ring {
+				ringEnd++
+			}
+			s.preloadLightingForRing(ctx, keys[start:ringEnd])
+			lastPreloadedRing = ring
+			if next, ok := s.latestRecenter(); ok {
+				return next, true
+			}
+		}
 		end := start
 		for end < len(keys) && end-start < s.poolSize && chunkDistanceFrom(cx, cz, keys[end]) == ring {
 			end++
@@ -237,6 +261,32 @@ func (s *streamer) streamPriority(ctx context.Context, cx, cz int32, keys [][2]i
 		start = end
 	}
 	return recenterReq{}, false
+}
+
+func (s *streamer) preloadLightingForRing(ctx context.Context, ringKeys [][2]int32) {
+	if s.cache == nil {
+		return
+	}
+	seen := make(map[[2]int32]bool, len(ringKeys)*3)
+	neighbors := make([][2]int32, 0, len(ringKeys)*3)
+	for _, k := range ringKeys {
+		if s.loaded[k] || s.cache.HasFrame(k[0], k[1]) {
+			continue
+		}
+		for dz := int32(-1); dz <= 1; dz++ {
+			for dx := int32(-1); dx <= 1; dx++ {
+				nk := [2]int32{k[0] + dx, k[1] + dz}
+				if seen[nk] || s.loaded[nk] || s.cache.IsChunkLoaded(nk[0], nk[1]) {
+					continue
+				}
+				seen[nk] = true
+				neighbors = append(neighbors, nk)
+			}
+		}
+	}
+	if len(neighbors) > 0 {
+		s.parallelPreload(ctx, neighbors)
+	}
 }
 
 func (s *streamer) latestRecenter() (recenterReq, bool) {
@@ -376,14 +426,21 @@ func (s *streamer) isResident(cx, cz int32) bool {
 // parallelPreload warms terrain for the given chunks without calculating light,
 // encoding frames, or sending packets. Errors are ignored.
 func (s *streamer) parallelPreload(ctx context.Context, keys [][2]int32) {
-	var pending []frameJob
+	if s.cache == nil || len(keys) == 0 {
+		return
+	}
+	pending := make([][2]int32, 0, len(keys))
 	for _, k := range keys {
-		if s.loaded[k] {
+		if s.loaded[k] || s.cache.IsChunkLoaded(k[0], k[1]) {
 			continue
 		}
-		pending = append(pending, frameJob{k[0], k[1]})
+		pending = append(pending, k)
 	}
 	if len(pending) == 0 {
+		return
+	}
+	if s.cache.HasBatchGenerator() {
+		_ = s.cache.PreloadBatchContext(ctx, s.centerX, s.centerZ, pending)
 		return
 	}
 
@@ -408,11 +465,11 @@ func (s *streamer) parallelPreload(ctx context.Context, keys [][2]int32) {
 		}()
 	}
 Loop:
-	for _, j := range pending {
+	for _, k := range pending {
 		select {
 		case <-ctx.Done():
 			break Loop
-		case jobs <- j:
+		case jobs <- frameJob{k[0], k[1]}:
 		}
 	}
 	close(jobs)

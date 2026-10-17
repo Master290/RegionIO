@@ -40,6 +40,7 @@ func main() {
 	maxCache := flag.Int("maxcache", cfg.MaxCachedChunks, "max cached chunks, LRU eviction (0 = unbounded)")
 	viewDistance := flag.Int("viewdistance", cfg.MaxViewDistance, "maximum client chunk view radius (2-16)")
 	online := flag.Bool("online", cfg.OnlineMode, "enable Mojang authentication and link encryption (online mode)")
+	pregenerate := flag.Int("pregenerate", 0, "pregenerate spawn chunk radius before listening (0 = disabled)")
 	flag.Parse()
 	cfg.WorldSeed = *seedFlag
 	cfg.Port = *port
@@ -48,7 +49,8 @@ func main() {
 	cfg.MaxViewDistance = *viewDistance
 	cfg.OnlineMode = *online
 	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir,
-		"maxcache", cfg.MaxCachedChunks, "viewdistance", cfg.MaxViewDistance, "online", cfg.OnlineMode)
+		"maxcache", cfg.MaxCachedChunks, "viewdistance", cfg.MaxViewDistance,
+		"online", cfg.OnlineMode, "pregenerate", *pregenerate)
 
 	srv, err := server.New(cfg)
 	if err != nil {
@@ -61,6 +63,16 @@ func main() {
 	saveCtx, saveStop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	srv.SetStopFunc(saveStop)
 	autosaveDone := srv.Chunks().StartAutosave(saveCtx, log, 30*time.Second)
+
+	if *pregenerate > 0 {
+		start := time.Now()
+		log.Info("pregenerating spawn chunks", "radius", *pregenerate)
+		if err := srv.Chunks().Pregenerate(saveCtx, 0, 0, *pregenerate); err != nil {
+			log.Error("failed to pregenerate spawn chunks", "radius", *pregenerate, "err", err)
+			os.Exit(1)
+		}
+		log.Info("pregeneration complete", "radius", *pregenerate, "elapsed", time.Since(start))
+	}
 
 	srv.StartSpawning(saveCtx, log)
 	go network.RunConsole(saveCtx, os.Stdin, srv, log)

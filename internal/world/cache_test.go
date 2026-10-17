@@ -2,6 +2,7 @@ package world
 
 import (
 	"bytes"
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -506,5 +507,101 @@ func TestConcurrentFrameAndBlockEdits(t *testing.T) {
 	wantFrame := protocol.AppendPacket(nil, 256, protocol.PlayLevelChunk, snapshot.encode())
 	if !bytes.Equal(finalFrame, wantFrame) {
 		t.Fatal("cached frame does not represent the final chunk revision")
+	}
+}
+
+func TestPreloadErrCoalescesAdjacentBatchLoads(t *testing.T) {
+	var calls atomic.Int32
+	c := NewCache(-1, GenerateFlat)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		calls.Add(1)
+		time.Sleep(15 * time.Millisecond)
+		batch := make(map[[2]int32]*Chunk, 9)
+		for x := cx - 1; x <= cx+1; x++ {
+			for z := cz - 1; z <= cz+1; z++ {
+				batch[[2]int32{x, z}] = NewChunk(x, z, BiomePlains)
+			}
+		}
+		return batch, nil
+	})
+
+	if err := c.PreloadBatchContext(context.Background(), 0, 0, cacheSpiralOrder(0, 0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("3x3 PreloadBatchContext batch calls = %d, want 1", got)
+	}
+	for x := int32(-1); x <= 1; x++ {
+		for z := int32(-1); z <= 1; z++ {
+			if !c.IsChunkLoaded(x, z) {
+				t.Fatalf("missing preloaded chunk (%d,%d)", x, z)
+			}
+		}
+	}
+}
+
+func TestPregenerateWarmsFramesAndReleasesTickets(t *testing.T) {
+	var batchCalls atomic.Int32
+	gen := flatGen()
+	c := NewCache(256, gen)
+	c.SetBatchGenerator(func(cx, cz int32) (map[[2]int32]*Chunk, error) {
+		batchCalls.Add(1)
+		batch := make(map[[2]int32]*Chunk, 9)
+		for x := cx - 1; x <= cx+1; x++ {
+			for z := cz - 1; z <= cz+1; z++ {
+				batch[[2]int32{x, z}] = gen(x, z)
+			}
+		}
+		return batch, nil
+	})
+
+	if err := c.Pregenerate(context.Background(), 0, 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := batchCalls.Load(); got != 9 {
+		t.Fatalf("Pregenerate(radius=2) batch calls = %d, want 9 disjoint 3x3 tiles", got)
+	}
+	stats := c.Stats()
+	if stats.Tickets != 0 || stats.TicketedChunks != 0 {
+		t.Fatalf("Pregenerate left active tickets: %+v", stats)
+	}
+	if stats.Frames != 25 {
+		t.Fatalf("Pregenerate frames = %d, want 25", stats.Frames)
+	}
+
+	ref := NewCache(256, gen)
+	for x := int32(-2); x <= 2; x++ {
+		for z := int32(-2); z <= 2; z++ {
+			if !c.HasFrame(x, z) {
+				t.Fatalf("missing pregenerated frame (%d,%d)", x, z)
+			}
+			got := c.Frame(x, z)
+			want := ref.Frame(x, z)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("pregenerated frame (%d,%d) differs from single-chunk frame", x, z)
+			}
+		}
+	}
+	if got := batchCalls.Load(); got != 9 {
+		t.Fatalf("serving pregenerated frames triggered extra batch calls: got %d, want 9", got)
+	}
+}
+
+func TestPregeneratePreservesBitwiseVanillaOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full vanilla pregeneration parity check in -short mode")
+	}
+	gen, batchGen := NewVanillaGenerators(12345)
+	batchCache := NewCache(256, gen)
+	batchCache.SetBatchGenerator(batchGen)
+	if err := batchCache.Pregenerate(context.Background(), 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	singleCache := NewCache(256, NewVanillaGenerator(12345))
+	gotFrame := batchCache.Frame(0, 0)
+	wantFrame := singleCache.Frame(0, 0)
+	if !bytes.Equal(gotFrame, wantFrame) {
+		t.Fatal("pregenerated vanilla frame (0,0) is not bitwise identical to single-chunk frame")
 	}
 }

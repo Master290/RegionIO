@@ -7,14 +7,28 @@ func (c *Cache) beginUse(key [2]int32) func() {
 	c.inflight[key]++
 	c.mu.Unlock()
 	return func() {
-		c.mu.Lock()
-		c.inflight[key]--
-		if c.inflight[key] <= 0 {
-			delete(c.inflight, key)
-		}
-		c.evictIfNeeded()
-		c.mu.Unlock()
+		c.endUse(key)
 	}
+}
+
+func (c *Cache) startUse(key [2]int32) {
+	c.mu.Lock()
+	c.inflight[key]++
+	c.mu.Unlock()
+}
+
+func (c *Cache) endUse(key [2]int32) {
+	c.mu.Lock()
+	n := c.inflight[key] - 1
+	if n <= 0 {
+		delete(c.inflight, key)
+		if c.maxChunks > 0 && len(c.chunks) > c.maxChunks && c.tickets[key] <= 0 {
+			c.evictIfNeeded()
+		}
+	} else {
+		c.inflight[key] = n
+	}
+	c.mu.Unlock()
 }
 
 // TicketLevel describes why a streamer keeps a chunk resident. View tickets
@@ -30,15 +44,20 @@ const (
 // the complete set on recenter and closes it on disconnect. Multiple sets may
 // overlap; a chunk becomes evictable only after its final owner releases it.
 type TicketSet struct {
-	mu     sync.Mutex
-	cache  *Cache
-	held   map[[2]int32]TicketLevel
-	closed bool
+	mu      sync.Mutex
+	cache   *Cache
+	held    map[[2]int32]TicketLevel
+	scratch map[[2]int32]TicketLevel
+	closed  bool
 }
 
 // NewTicketSet creates an empty ticket set associated with this cache.
 func (c *Cache) NewTicketSet() *TicketSet {
-	return &TicketSet{cache: c, held: make(map[[2]int32]TicketLevel)}
+	return &TicketSet{
+		cache:   c,
+		held:    make(map[[2]int32]TicketLevel),
+		scratch: make(map[[2]int32]TicketLevel),
+	}
 }
 
 // Replace atomically changes the ticket set. View entries take precedence when
@@ -47,7 +66,18 @@ func (t *TicketSet) Replace(view, prefetch []ChunkPos) {
 	if t == nil || t.cache == nil {
 		return
 	}
-	desired := make(map[[2]int32]TicketLevel, len(view)+len(prefetch))
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+
+	desired := t.scratch
+	if desired == nil {
+		desired = make(map[[2]int32]TicketLevel, len(view)+len(prefetch))
+	} else {
+		clear(desired)
+	}
 	for _, pos := range prefetch {
 		desired[[2]int32{pos.X, pos.Z}] = TicketPrefetch
 	}
@@ -55,12 +85,8 @@ func (t *TicketSet) Replace(view, prefetch []ChunkPos) {
 		desired[[2]int32{pos.X, pos.Z}] = TicketView
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.closed {
-		return
-	}
 	t.cache.mu.Lock()
+	released := false
 	for key := range t.held {
 		if _, keep := desired[key]; keep {
 			continue
@@ -68,6 +94,7 @@ func (t *TicketSet) Replace(view, prefetch []ChunkPos) {
 		t.cache.tickets[key]--
 		if t.cache.tickets[key] <= 0 {
 			delete(t.cache.tickets, key)
+			released = true
 		}
 	}
 	for key := range desired {
@@ -75,8 +102,11 @@ func (t *TicketSet) Replace(view, prefetch []ChunkPos) {
 			t.cache.tickets[key]++
 		}
 	}
+	t.scratch = t.held
 	t.held = desired
-	t.cache.evictIfNeeded()
+	if released {
+		t.cache.evictIfNeeded()
+	}
 	t.cache.mu.Unlock()
 }
 
@@ -98,6 +128,7 @@ func (t *TicketSet) Close() {
 		}
 	}
 	clear(t.held)
+	clear(t.scratch)
 	t.closed = true
 	t.cache.evictIfNeeded()
 	t.cache.mu.Unlock()

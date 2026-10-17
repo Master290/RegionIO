@@ -60,6 +60,7 @@ type Cache struct {
 	index       map[[2]int32]*list.Element
 	loads       map[[2]int32]*chunkLoad
 	batchLoads  map[[2]int32]*batchLoad
+	frameLoads  map[[2]int32]*frameLoad
 	batchAnchor func(int32, int32) [2]int32
 }
 
@@ -79,6 +80,14 @@ func (c *Cache) SetCanonicalBatchGenerator(gen BatchGenerator, anchor func(int32
 	c.mu.Unlock()
 }
 
+// HasBatchGenerator reports whether batch generation is configured on this cache.
+func (c *Cache) HasBatchGenerator() bool {
+	c.mu.Lock()
+	ok := c.batchGen != nil
+	c.mu.Unlock()
+	return ok
+}
+
 // chunkLoad coordinates concurrent misses for the same coordinate. The first
 // caller performs disk I/O or generation; all others wait for that exact result.
 type chunkLoad struct {
@@ -91,6 +100,13 @@ type batchLoad struct {
 	done   chan struct{}
 	chunks map[[2]int32]*Chunk
 	err    error
+}
+
+type frameLoad struct {
+	done  chan struct{}
+	frame []byte
+	err   error
+	stale bool
 }
 
 // NewCache returns a world cache that frames packets at the given compression
@@ -114,6 +130,7 @@ func NewCache(threshold int32, gen Generator) *Cache {
 		inflight:   make(map[[2]int32]int),
 		loads:      make(map[[2]int32]*chunkLoad),
 		batchLoads: make(map[[2]int32]*batchLoad),
+		frameLoads: make(map[[2]int32]*frameLoad),
 		frameSlots: make(chan struct{}, workers),
 	}
 	return c
@@ -161,19 +178,19 @@ func (c *Cache) touch(key [2]int32) {
 // Dirty chunks are skipped (moved back to MRU and the eviction halts) so the
 // autosave can persist them first. Must be called under c.mu.
 func (c *Cache) evictIfNeeded() {
-	if c.maxChunks <= 0 {
+	if c.maxChunks <= 0 || len(c.chunks) <= c.maxChunks {
 		return
 	}
-	checked := 0
-	for len(c.chunks) > c.maxChunks && checked < len(c.chunks) {
+	remaining := c.order.Len()
+	for len(c.chunks) > c.maxChunks && remaining > 0 {
 		back := c.order.Back()
 		if back == nil {
 			return
 		}
+		remaining--
 		key := *back.Value.(*[2]int32)
 		if c.tickets[key] > 0 || c.inflight[key] > 0 {
 			c.order.MoveToFront(back)
-			checked++
 			continue
 		}
 		// Never drop a dirty chunk: it has unsaved edits. Bump it to MRU and
@@ -181,15 +198,27 @@ func (c *Cache) evictIfNeeded() {
 		// next eviction pass can reclaim it.
 		if _, dirty := c.dirty[key]; dirty && c.store != nil {
 			c.order.MoveToFront(back)
-			checked++
 			continue
 		}
 		delete(c.chunks, key)
 		delete(c.frames, key)
 		c.order.Remove(back)
 		delete(c.index, key)
-		checked = 0
 	}
+}
+
+func (c *Cache) adjacentBatchLoadLocked(cx, cz int32) *chunkLoad {
+	for dz := int32(-1); dz <= 1; dz++ {
+		for dx := int32(-1); dx <= 1; dx++ {
+			if dx == 0 && dz == 0 {
+				continue
+			}
+			if load := c.loads[[2]int32{cx + dx, cz + dz}]; load != nil {
+				return load
+			}
+		}
+	}
+	return nil
 }
 
 // chunkAt returns the chunk at (cx, cz). Resolution order: in-memory cache →
@@ -213,15 +242,26 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	key := [2]int32{cx, cz}
 
 	c.mu.Lock()
-	if ch, ok := c.chunks[key]; ok {
-		c.touch(key)
-		c.mu.Unlock()
-		return ch, nil
-	}
-	if pending, ok := c.loads[key]; ok {
-		c.mu.Unlock()
-		<-pending.done
-		return pending.ch, pending.err
+	for {
+		if ch, ok := c.chunks[key]; ok {
+			c.touch(key)
+			c.mu.Unlock()
+			return ch, nil
+		}
+		if pending, ok := c.loads[key]; ok {
+			c.mu.Unlock()
+			<-pending.done
+			return pending.ch, pending.err
+		}
+		if c.batchGen != nil && c.batchAnchor == nil && len(c.inflight) > 0 {
+			if neighbor := c.adjacentBatchLoadLocked(cx, cz); neighbor != nil {
+				c.mu.Unlock()
+				<-neighbor.done
+				c.mu.Lock()
+				continue
+			}
+		}
+		break
 	}
 	pending := &chunkLoad{done: make(chan struct{})}
 	c.loads[key] = pending
@@ -454,14 +494,43 @@ func (c *Cache) FrameErr(cx, cz int32) ([]byte, error) {
 // worker budget. Cancellation prevents obsolete streamer jobs from starting;
 // an operation already admitted completes so cache state is never half-built.
 func (c *Cache) FrameErrContext(ctx context.Context, cx, cz int32) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key := [2]int32{cx, cz}
+	for {
+		c.mu.Lock()
+		if f, ok := c.frames[key]; ok {
+			c.touch(key)
+			c.mu.Unlock()
+			return f, nil
+		}
+		fl := c.frameLoads[key]
+		c.mu.Unlock()
+		if fl == nil {
+			break
+		}
+		select {
+		case <-fl.done:
+			if fl.err != nil {
+				return nil, fl.err
+			}
+			if !fl.stale && fl.frame != nil {
+				return fl.frame, nil
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
 	select {
 	case c.frameSlots <- struct{}{}:
 		defer func() { <-c.frameSlots }()
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	release := c.beginUse([2]int32{cx, cz})
-	defer release()
+	c.startUse(key)
+	defer c.endUse(key)
 	return c.frameErr(cx, cz)
 }
 
@@ -469,16 +538,289 @@ func (c *Cache) FrameErrContext(ctx context.Context, cx, cz int32) ([]byte, erro
 // encoding a network frame. Streamers use it for predictive terrain work so a
 // prefetch ring does not recursively expand through lighting neighborhoods.
 func (c *Cache) PreloadErrContext(ctx context.Context, cx, cz int32) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	key := [2]int32{cx, cz}
+	for {
+		c.mu.Lock()
+		if _, ok := c.chunks[key]; ok {
+			c.touch(key)
+			c.mu.Unlock()
+			return nil
+		}
+		var waitCh <-chan struct{}
+		if c.batchAnchor != nil {
+			if pending := c.batchLoads[c.batchAnchor(cx, cz)]; pending != nil {
+				waitCh = pending.done
+			}
+		} else if pending := c.loads[key]; pending != nil {
+			waitCh = pending.done
+		} else if c.batchGen != nil {
+			if neighbor := c.adjacentBatchLoadLocked(cx, cz); neighbor != nil {
+				waitCh = neighbor.done
+			}
+		}
+		c.mu.Unlock()
+		if waitCh == nil {
+			break
+		}
+		select {
+		case <-waitCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 	select {
 	case c.frameSlots <- struct{}{}:
 		defer func() { <-c.frameSlots }()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	release := c.beginUse([2]int32{cx, cz})
-	defer release()
+	c.startUse(key)
+	defer c.endUse(key)
 	_, err := c.chunkAtErr(cx, cz)
 	return err
+}
+
+// PreloadBatchContext loads or generates a slice of chunk coordinates in
+// parallel. When a BatchGenerator is configured, it schedules non-overlapping
+// 3x3 batch centers first so concurrent workers do not redundantly decorate
+// overlapping neighborhoods.
+func (c *Cache) PreloadBatchContext(ctx context.Context, centerX, centerZ int32, keys [][2]int32) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	missing := make([][2]int32, 0, len(keys))
+	seen := make(map[[2]int32]bool, len(keys))
+	for _, k := range keys {
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		if _, ok := c.chunks[k]; ok {
+			c.touch(k)
+			continue
+		}
+		missing = append(missing, k)
+	}
+	hasBatch := c.batchGen != nil && c.batchAnchor == nil
+	allowTileAnchors := c.maxChunks == 0 || c.maxChunks >= 25
+	c.mu.Unlock()
+	if len(missing) == 0 {
+		return nil
+	}
+
+	if hasBatch {
+		if allowTileAnchors {
+			anchors := make([][2]int32, 0, (len(missing)+8)/9)
+			anchorSeen := make(map[[2]int32]bool, (len(missing)+8)/9)
+			for _, k := range missing {
+				anchor := [2]int32{
+					centerX + 3*int32(floorDivCoordinate(int64(k[0]-centerX)+1, 3)),
+					centerZ + 3*int32(floorDivCoordinate(int64(k[1]-centerZ)+1, 3)),
+				}
+				if !anchorSeen[anchor] {
+					anchorSeen[anchor] = true
+					anchors = append(anchors, anchor)
+				}
+			}
+			if err := c.runParallelPreload(ctx, anchors); err != nil {
+				return err
+			}
+		}
+		for {
+			c.mu.Lock()
+			remaining := missing[:0]
+			for _, k := range missing {
+				if _, ok := c.chunks[k]; !ok {
+					remaining = append(remaining, k)
+				}
+			}
+			missing = remaining
+			c.mu.Unlock()
+			if len(missing) == 0 {
+				return nil
+			}
+			wave := selectDisjointBatchCenters(missing)
+			if err := c.runParallelPreload(ctx, wave); err != nil {
+				return err
+			}
+		}
+	}
+	return c.runParallelPreload(ctx, missing)
+}
+
+func selectDisjointBatchCenters(keys [][2]int32) [][2]int32 {
+	out := make([][2]int32, 0, (len(keys)+8)/9+1)
+	for _, k := range keys {
+		disjoint := true
+		for _, a := range out {
+			if abs32(k[0]-a[0]) < 3 && abs32(k[1]-a[1]) < 3 {
+				disjoint = false
+				break
+			}
+		}
+		if disjoint {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func (c *Cache) runParallelPreload(ctx context.Context, keys [][2]int32) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	if len(keys) == 1 {
+		return c.PreloadErrContext(ctx, keys[0][0], keys[0][1])
+	}
+	workers := cap(c.frameSlots)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(keys) {
+		workers = len(keys)
+	}
+	jobs := make(chan [2]int32, len(keys))
+	for _, k := range keys {
+		jobs <- k
+	}
+	close(jobs)
+
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := range jobs {
+				if err := c.PreloadErrContext(ctx, k[0], k[1]); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
+// Pregenerate warms the chunk and frame cache around (centerX, centerZ) out to
+// the given Chebyshev chunk radius, including the radius+1 outer terrain ring
+// required for lighting and predictive streaming.
+func (c *Cache) Pregenerate(ctx context.Context, centerX, centerZ int32, radius int) error {
+	if radius < 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	outerOrder := cacheSpiralOrder(centerX, centerZ, radius+1)
+	viewCap := (2*radius + 1) * (2*radius + 1)
+	viewKeys := outerOrder[:viewCap]
+	prefetchKeys := outerOrder[viewCap:]
+
+	viewTickets := make([]ChunkPos, len(viewKeys))
+	for i, k := range viewKeys {
+		viewTickets[i] = ChunkPos{X: k[0], Z: k[1]}
+	}
+	prefetchTickets := make([]ChunkPos, len(prefetchKeys))
+	for i, k := range prefetchKeys {
+		prefetchTickets[i] = ChunkPos{X: k[0], Z: k[1]}
+	}
+	tickets := c.NewTicketSet()
+	tickets.Replace(viewTickets, prefetchTickets)
+	defer tickets.Close()
+
+	if err := c.PreloadBatchContext(ctx, centerX, centerZ, outerOrder); err != nil {
+		return err
+	}
+
+	workers := cap(c.frameSlots)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(viewKeys) {
+		workers = len(viewKeys)
+	}
+	jobs := make(chan [2]int32, len(viewKeys))
+	for _, k := range viewKeys {
+		jobs <- k
+	}
+	close(jobs)
+
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for k := range jobs {
+				if _, err := c.FrameErrContext(ctx, k[0], k[1]); err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	c.mu.Lock()
+	for i := len(viewKeys) - 1; i >= 0; i-- {
+		c.touch(viewKeys[i])
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+func cacheSpiralOrder(cx, cz int32, radius int) [][2]int32 {
+	if radius < 0 {
+		radius = 0
+	}
+	out := make([][2]int32, 0, (2*radius+1)*(2*radius+1))
+	out = append(out, [2]int32{cx, cz})
+	for r := 1; r <= radius; r++ {
+		for x := -r; x <= r; x++ {
+			out = append(out, [2]int32{cx + int32(x), cz - int32(r)})
+		}
+		for z := -r + 1; z <= r; z++ {
+			out = append(out, [2]int32{cx + int32(r), cz + int32(z)})
+		}
+		for x := r - 1; x >= -r; x-- {
+			out = append(out, [2]int32{cx + int32(x), cz + int32(r)})
+		}
+		for z := r - 1; z >= -r+1; z-- {
+			out = append(out, [2]int32{cx - int32(r), cz + int32(z)})
+		}
+	}
+	return out
 }
 
 // IsChunkLoaded reports whether a chunk is currently resident in the live
@@ -486,6 +828,15 @@ func (c *Cache) PreloadErrContext(ctx context.Context, cx, cz int32) error {
 func (c *Cache) IsChunkLoaded(cx, cz int32) bool {
 	c.mu.Lock()
 	_, ok := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	return ok
+}
+
+// HasFrame reports whether a framed level_chunk packet is currently cached for
+// (cx, cz). It does not load, generate, light, touch, or retain the chunk.
+func (c *Cache) HasFrame(cx, cz int32) bool {
+	c.mu.Lock()
+	_, ok := c.frames[[2]int32{cx, cz}]
 	c.mu.Unlock()
 	return ok
 }
@@ -500,13 +851,31 @@ func (c *Cache) frameErr(cx, cz int32) ([]byte, error) {
 			c.mu.Unlock()
 			return f, nil
 		}
+		if fl := c.frameLoads[key]; fl != nil {
+			c.mu.Unlock()
+			<-fl.done
+			if fl.err != nil {
+				return nil, fl.err
+			}
+			if !fl.stale && fl.frame != nil {
+				return fl.frame, nil
+			}
+			continue
+		}
+		fl := &frameLoad{done: make(chan struct{})}
+		c.frameLoads[key] = fl
 		c.mu.Unlock()
 
 		ch, err := c.chunkAtErr(cx, cz)
-		if err != nil {
-			return nil, err
+		if err == nil {
+			err = c.ensureLight(ch)
 		}
-		if err := c.ensureLight(ch); err != nil {
+		if err != nil {
+			c.mu.Lock()
+			fl.err = err
+			delete(c.frameLoads, key)
+			close(fl.done)
+			c.mu.Unlock()
 			return nil, err
 		}
 		snapshot, revision := ch.snapshot()
@@ -515,18 +884,27 @@ func (c *Cache) frameErr(cx, cz int32) ([]byte, error) {
 		c.mu.Lock()
 		if existing, ok := c.frames[key]; ok {
 			c.touch(key)
+			fl.frame = existing
+			delete(c.frameLoads, key)
+			close(fl.done)
 			c.mu.Unlock()
 			return existing, nil
 		}
 		// An edit or eviction while the frame was being built makes it stale.
 		// Retry from a fresh snapshot instead of publishing old bytes forever.
 		if c.chunks[key] != ch || ch.currentRevision() != revision {
+			fl.stale = true
+			delete(c.frameLoads, key)
+			close(fl.done)
 			c.mu.Unlock()
 			continue
 		}
 		c.frames[key] = frame
 		c.touch(key)
 		c.evictIfNeeded()
+		fl.frame = frame
+		delete(c.frameLoads, key)
+		close(fl.done)
 		c.mu.Unlock()
 		return frame, nil
 	}
@@ -540,8 +918,9 @@ func (c *Cache) GetBlock(x, y, z int) uint16 {
 	}
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	release := c.beginUse([2]int32{cx, cz})
-	defer release()
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return StateAir
@@ -555,8 +934,9 @@ func (c *Cache) GetBlock(x, y, z int) uint16 {
 func (c *Cache) SafeSpawnY(x, z int) (int, bool) {
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	release := c.beginUse([2]int32{cx, cz})
-	defer release()
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return 0, false
@@ -578,8 +958,9 @@ func (c *Cache) SafeSpawnY(x, z int) (int, bool) {
 
 // LightUpdate returns the standalone light_update body for a loaded chunk.
 func (c *Cache) LightUpdate(cx, cz int32) ([]byte, error) {
-	release := c.beginUse([2]int32{cx, cz})
-	defer release()
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return nil, err
@@ -611,8 +992,9 @@ func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) 
 	}
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	release := c.beginUse([2]int32{cx, cz})
-	defer release()
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return false, nil
@@ -642,7 +1024,6 @@ func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) 
 	}
 
 	c.mu.Lock()
-	key := [2]int32{cx, cz}
 	delete(c.frames, key)
 	if c.store != nil {
 		c.dirty[key] = ch.currentRevision()
