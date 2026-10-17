@@ -3,6 +3,7 @@ package network
 import (
 	"errors"
 	"math"
+	"sync"
 	"time"
 
 	"regionio/internal/nbt"
@@ -103,6 +104,9 @@ func (h *handler) beginPlay() error {
 	if err := h.srv.SendPlayerExperience(session); err != nil {
 		return err
 	}
+	if err := h.srv.SendPlayerActiveEffects(h.session); err != nil {
+		return err
+	}
 	_ = h.srv.LoadPlayerAdvancementsFile(h.session)
 	if err := h.srv.SendInitialAdvancements(h.session); err != nil {
 		return err
@@ -124,6 +128,7 @@ func (h *handler) beginPlay() error {
 	h.streamer.requestRecenter(startCX, startCZ)
 	go h.keepAliveLoop()
 	go h.entitySyncLoop()
+	go h.serverTickLoop()
 	return nil
 }
 
@@ -398,6 +403,41 @@ func (h *handler) entitySyncLoop() {
 			if err := h.syncVisibleEntities(); err != nil {
 				return
 			}
+		}
+	}
+}
+
+var activeServerTickLoops sync.Map // map[*server.Server]bool
+
+// serverTickLoop drives the 20 TPS brewing stand and status effect ticks for
+// h.srv while at least one play connection is active.
+func (h *handler) serverTickLoop() {
+	if h.srv == nil {
+		return
+	}
+	if _, loaded := activeServerTickLoops.LoadOrStore(h.srv, true); loaded {
+		return
+	}
+	defer activeServerTickLoops.Delete(h.srv)
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	lastGameTime, _ := h.srv.WorldTime()
+	for {
+		select {
+		case <-h.ctx.Done():
+			return
+		case <-ticker.C:
+			h.srv.TickBrewingStands()
+			nowGameTime, _ := h.srv.WorldTime()
+			if nowGameTime == lastGameTime {
+				// StartSpawning is not advancing the world clock; tick player
+				// and entity status effects here.
+				h.srv.TickAllPlayerEffects()
+				h.srv.TickAllEntityEffects()
+			}
+			lastGameTime = nowGameTime
 		}
 	}
 }
@@ -723,8 +763,17 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		return nil
 
 	case server.PlayUseItemSB:
-		if h.srv != nil {
+		if h.srv != nil && h.session != nil {
+			hand, seq, _, _, err := server.DecodeUseItemPacket(pkt.Body())
+			if err != nil {
+				return err
+			}
+			if h.srv.UsePotionOrMilkItem(h.session, hand) {
+				h.syncHotbarFromSession()
+				return h.sendBlockChangedAck(seq)
+			}
 			_ = h.srv.HandleUseItemPacket(h.session, pkt.Body())
+			h.syncHotbarFromSession()
 		}
 		return nil
 

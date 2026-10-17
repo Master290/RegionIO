@@ -608,3 +608,115 @@ func TestWiredAdvancementHooksAndPlayerDataPersistence(t *testing.T) {
 		}
 	}
 }
+
+func TestWiredBrewingPotionAndEffectHooks(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	session, err := srv.RegisterPlayer(Profile{Name: "Alchemist", UUID: OfflineUUID("Alchemist")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	feetY := float64(world.FlatSurfaceY + 1)
+	srv.SetPlayerTransform(session, 8.5, feetY, 8.5, 0, 0, true)
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	// 1. InteractBlock opens BrewingStand, HandleContainerClick moves items, BreakBlock drops contents.
+	bx, by, bz := 14, world.FlatSurfaceY+1, 14
+	srv.Chunks().SetBlock(bx, by, bz, BrewingStandBlockState(false, false, false))
+	opened, cid, err := srv.InteractBlock(session, bx, by, bz)
+	if err != nil || !opened || cid <= 0 {
+		t.Fatalf("InteractBlock(brewing_stand) = (%v, %d, %v), want (true, >0, nil)", opened, cid, err)
+	}
+	if oc := session.OpenContainer(); oc == nil || oc.MenuType != MenuTypeBrewingStand {
+		t.Fatalf("OpenContainer = %+v, want MenuTypeBrewingStand (%d)", oc, MenuTypeBrewingStand)
+	}
+
+	// Put a water potion in player inventory slot 9 (menu slot 5) and shift-click into brewing stand slot 0.
+	session.SetInventorySlot(9, world.NewNamedItemStack("minecraft:potion", 1))
+	SetSlotPotionType(session, 9, PotionWater)
+	if err := srv.HandleContainerClick(session, cid, BrewingStandSlotCount, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick(quick-move bottle into stand): %v", err)
+	}
+	stand, ok := srv.BrewingStandAt(bx, by, bz)
+	if !ok || stand.Items[0].IsEmpty() || stand.PotionTypes[0] != PotionWater {
+		t.Fatalf("BrewingStandAt after quick-move = %+v (ok=%v), want water bottle in slot 0", stand, ok)
+	}
+
+	// Pick up and place back with Pickup mode to verify re-entrant CarriedItem() doesn't deadlock.
+	if err := srv.HandleContainerClick(session, cid, 0, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick(pickup bottle from stand): %v", err)
+	}
+	if GetCarriedPotionType(session) != PotionWater {
+		t.Fatalf("GetCarriedPotionType = %q, want %q", GetCarriedPotionType(session), PotionWater)
+	}
+	if err := srv.HandleContainerClick(session, cid, 0, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick(place bottle into stand): %v", err)
+	}
+
+	// Break the brewing stand block in survival mode -> drops its contents and closes container.
+	broken, _ := srv.BreakBlock(session, bx, by, bz, PlayerActionStopDestroyBlock)
+	if !broken {
+		t.Fatal("BreakBlock(brewing_stand) returned false")
+	}
+	if session.OpenContainer() != nil {
+		t.Fatalf("expected brewing stand screen to close on BreakBlock, got %+v", session.OpenContainer())
+	}
+	foundPotionDrop := false
+	for _, ent := range srv.Entities().All() {
+		if ent.IsItem() && ent.Item.ResolvedID() == "minecraft:potion" {
+			foundPotionDrop = true
+			break
+		}
+	}
+	if !foundPotionDrop {
+		t.Fatal("expected breaking brewing stand to drop its contained potion item entity")
+	}
+
+	// 2. Fall damage respects Slow Falling and Jump Boost; RespawnPlayer clears active effects.
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectSlowFalling, 200, 0))
+	if dmg := srv.HandlePlayerFall(session, feetY+10, feetY, false, true); dmg != 0 {
+		t.Fatalf("HandlePlayerFall with Slow Falling = %v, want 0", dmg)
+	}
+	srv.RemovePlayerEffect(session, EffectSlowFalling)
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectJumpBoost, 200, 1)) // Jump Boost II (-2 fall damage)
+	_ = srv.HandlePlayerFall(session, feetY+6, feetY+3, true, false)
+	if dmg := srv.HandlePlayerFall(session, feetY+3, feetY, false, true); dmg != 1.0 {
+		t.Fatalf("HandlePlayerFall(6 blocks) with Jump Boost II = %v, want 1.0", dmg)
+	}
+
+	// 3. PlayerData NBT round-trip preserves active status effects, absorption, and slot potion types.
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectSpeed, 1200, 1))
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectAbsorption, 1200, 0))
+	hotbarSlot := world.HotbarContainerOffset
+	session.SetInventorySlot(hotbarSlot, world.NewNamedItemStack("minecraft:potion", 1))
+	SetSlotPotionType(session, hotbarSlot, PotionStrongHealing)
+
+	comp := world.PlayerDataToCompound(session.PlayerData())
+	decoded, err := world.PlayerDataFromCompound(comp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	session2, err := srv.RegisterPlayer(Profile{Name: "Alchemist2", UUID: OfflineUUID("Alchemist2")}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Alchemist2): %v", err)
+	}
+	session2.ApplyPlayerData(decoded)
+	if sp, ok := session2.PlayerEffect(EffectSpeed); !ok || sp.Amplifier != 1 || sp.Duration != 1200 {
+		t.Fatalf("restored Speed effect = (%+v, %v), want Amplifier=1 Duration=1200", sp, ok)
+	}
+	if abs := session2.AbsorptionHealth(); abs != 4.0 {
+		t.Fatalf("restored AbsorptionHealth = %v, want 4.0", abs)
+	}
+	if pot := GetSlotPotionType(session2, hotbarSlot); pot != PotionStrongHealing {
+		t.Fatalf("restored slot potion type = %q, want %q", pot, PotionStrongHealing)
+	}
+
+	// RespawnPlayer clears all active effects on session2.
+	if err := srv.RespawnPlayer(session2); err != nil {
+		t.Fatalf("RespawnPlayer: %v", err)
+	}
+	if len(session2.PlayerEffects()) != 0 || session2.AbsorptionHealth() != 0 {
+		t.Fatalf("expected RespawnPlayer to clear effects and absorption, got effects=%d abs=%v",
+			len(session2.PlayerEffects()), session2.AbsorptionHealth())
+	}
+}
+

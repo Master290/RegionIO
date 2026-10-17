@@ -220,9 +220,12 @@ type PlayerData struct {
 	SpawnYaw       float32
 	SpawnPitch     float32
 	SpawnForced    bool
-	SpawnDimension string
-	HasSpawn       bool
-	Advancements   *nbt.Compound
+	SpawnDimension   string
+	HasSpawn         bool
+	Advancements     *nbt.Compound
+	ActiveEffects    *nbt.List
+	AbsorptionAmount float32
+	SlotPotions      *nbt.List
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -347,6 +350,15 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 
 	if d.Advancements != nil {
 		root.Set("Advancements", d.Advancements)
+	}
+	if d.ActiveEffects != nil && len(d.ActiveEffects.Elems) > 0 {
+		root.Set("active_effects", *d.ActiveEffects)
+	}
+	if d.AbsorptionAmount > 0 {
+		root.Set("AbsorptionAmount", nbt.Float(d.AbsorptionAmount))
+	}
+	if d.SlotPotions != nil && len(d.SlotPotions.Elems) > 0 {
+		root.Set("SlotPotions", *d.SlotPotions)
 	}
 
 	return root
@@ -624,6 +636,17 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 
 	if adv, ok := nbtGetCompound(root, "Advancements"); ok && adv != nil {
 		d.Advancements = adv
+	}
+	if eff, ok := nbtGetList(root, "active_effects"); ok && eff != nil {
+		cp := *eff
+		d.ActiveEffects = &cp
+	}
+	if abs, ok := nbtGetFloat(root, "AbsorptionAmount"); ok && abs > 0 {
+		d.AbsorptionAmount = abs
+	}
+	if sp, ok := nbtGetList(root, "SlotPotions"); ok && sp != nil {
+		cp := *sp
+		d.SlotPotions = &cp
 	}
 
 	return d, nil

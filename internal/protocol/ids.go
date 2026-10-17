@@ -98,9 +98,11 @@ const (
 	PlayMerchantOffers        = 0x34
 	PlayPlayerCombatKill      = 0x44
 	PlayRespawn               = 0x52
+	PlayRemoveMobEffect       = 0x4e
 	PlaySelectAdvancementsTab = 0x55
 	PlaySetExperience         = 0x67
 	PlayUpdateAdvancements    = 0x82
+	PlayUpdateMobEffect       = 0x84
 
 	// Entity packets
 	PlayAddEntity        = 0x01

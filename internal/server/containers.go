@@ -120,8 +120,9 @@ func (session *PlayerSession) OpenContainer() *OpenContainerState {
 		return nil
 	}
 	tr := getContainerTracker(session)
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
+	if tr.mu.TryLock() {
+		defer tr.mu.Unlock()
+	}
 	if tr.open == nil {
 		return nil
 	}
@@ -135,8 +136,9 @@ func (session *PlayerSession) CarriedItem() world.ItemStack {
 		return world.ItemStack{}
 	}
 	tr := getContainerTracker(session)
-	tr.mu.Lock()
-	defer tr.mu.Unlock()
+	if tr.mu.TryLock() {
+		defer tr.mu.Unlock()
+	}
 	return tr.carried
 }
 
@@ -151,6 +153,7 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 	tr.mu.Unlock()
 	if stack.IsEmpty() {
 		SetCarriedItemMeta(session, ItemMeta{})
+		SetCarriedPotionType(session, "")
 	}
 }
 
@@ -379,7 +382,7 @@ func skipHashedStack(r *protocol.Reader) error {
 
 // InteractBlock checks whether the block at (x, y, z) is an interactive
 // container (chest, crafting table, furnace/blast_furnace/smoker, enchanting
-// table, anvil, or grindstone) and opens its UI for session.
+// table, anvil, grindstone, or brewing stand) and opens its UI for session.
 func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool, containerID int32, err error) {
 	if s == nil || session == nil || session.IsDead() {
 		return false, 0, nil
@@ -407,6 +410,9 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return err == nil, cid, err
 	case IsGrindstoneBlock(state):
 		cid, err := s.OpenGrindstone(session, x, y, z)
+		return err == nil, cid, err
+	case IsBrewingStandBlock(state):
+		cid, err := s.OpenBrewingStand(session, x, y, z)
 		return err == nil, cid, err
 	default:
 		return false, 0, nil
@@ -522,19 +528,22 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		return nil
 	}
 	type returnEntry struct {
-		stack world.ItemStack
-		meta  ItemMeta
+		stack  world.ItemStack
+		meta   ItemMeta
+		potion string
 	}
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
 	var returnItems []returnEntry
 	if !tr.carried.IsEmpty() {
 		returnItems = append(returnItems, returnEntry{
-			stack: tr.carried,
-			meta:  GetCarriedItemMeta(session),
+			stack:  tr.carried,
+			meta:   GetCarriedItemMeta(session),
+			potion: GetCarriedPotionType(session),
 		})
 		tr.carried = world.ItemStack{}
 		SetCarriedItemMeta(session, ItemMeta{})
+		SetCarriedPotionType(session, "")
 	}
 	closedID := containerID
 	hadOpen := false
@@ -590,6 +599,9 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		if !entry.meta.IsEmpty() && len(changedSlots) > 0 {
 			SetSlotItemMeta(session, changedSlots[0], entry.meta)
 		}
+		if entry.potion != "" && len(changedSlots) > 0 {
+			SetSlotPotionType(session, changedSlots[0], entry.potion)
+		}
 		if rem := st.Count - added; rem > 0 {
 			s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
 		}
@@ -628,6 +640,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
 				SetCarriedItemMeta(session, ItemMeta{})
+				SetCarriedPotionType(session, "")
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
@@ -703,6 +716,12 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		}
 		s.TriggerInventoryChanged(session)
 		return s.syncOpenContainer(session)
+	case MenuTypeBrewingStand:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		s.applyBrewingStandContainerClickLocked(session, tr, bx, by, bz, slot, button, mode)
+		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
+		return s.syncBrewingStandViewers(session, bx, by, bz)
 	default:
 		tr.mu.Unlock()
 		return nil
@@ -1091,6 +1110,7 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	isFurnace := false
 	isEnchant := false
 	isAnvil := false
+	isBrewingStand := false
 	switch openCopy.MenuType {
 	case MenuTypeGeneric9x3:
 		slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
@@ -1107,6 +1127,9 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		isAnvil = true
 	case MenuTypeGrindstone:
 		slots = s.buildCombinerMenuSlots(session, openCopy.CombinerInputs, openCopy.Result)
+	case MenuTypeBrewingStand:
+		slots = s.buildBrewingStandMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+		isBrewingStand = true
 	default:
 		return nil
 	}
@@ -1129,6 +1152,9 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	}
 	if isAnvil {
 		return session.send(protocol.PlayContainerSetData, EncodeContainerSetData(openCopy.ContainerID, AnvilDataLevelCost, openCopy.AnvilCost))
+	}
+	if isBrewingStand {
+		return s.sendBrewingStandDataProperties(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	}
 	return nil
 }
@@ -1173,3 +1199,157 @@ func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {
 	}
 	return firstErr
 }
+
+func (s *Server) applyBrewingStandContainerClickLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	bx, by, bz, slot int,
+	button int8,
+	mode int32,
+) {
+	if slot < 0 || slot >= BrewingStandMenuSlotCount {
+		return
+	}
+
+	bs := s.brewingState()
+	bs.mu.Lock()
+	stand := s.getOrCreateBrewingStandLocked(bs, bx, by, bz)
+	stand.lastBrewer = session
+	var slotPotions [BrewingStandMenuSlotCount]string
+	for i := 0; i < 3; i++ {
+		slotPotions[i] = stand.PotionTypes[i]
+	}
+	bs.mu.Unlock()
+
+	slots := s.buildBrewingStandMenuSlots(session, bx, by, bz)
+	for i := 0; i < 27; i++ {
+		slotPotions[5+i] = GetSlotPotionType(session, 9+i)
+	}
+	for i := 0; i < 9; i++ {
+		slotPotions[32+i] = GetSlotPotionType(session, 36+i)
+	}
+	carriedPotion := GetCarriedPotionType(session)
+
+	switch mode {
+	case ContainerInputPickup:
+		switch {
+		case slot >= 0 && slot < 3:
+			if tr.carried.IsEmpty() {
+				if !slots[slot].IsEmpty() {
+					takenPotion := slotPotions[slot]
+					tr.carried = slots[slot]
+					carriedPotion = takenPotion
+					slots[slot] = world.ItemStack{}
+					slotPotions[slot] = ""
+					if IsPotionItem(tr.carried) && takenPotion != "" && takenPotion != PotionWater {
+						s.TriggerBrewedPotion(session, takenPotion)
+					}
+				}
+			} else if CanPlaceInBrewingBottleSlot(tr.carried) {
+				if slots[slot].IsEmpty() {
+					slots[slot] = world.NewItemStack(tr.carried.ResolvedItemID(), 1)
+					slotPotions[slot] = carriedPotion
+					rem := tr.carried.Count - 1
+					if rem <= 0 {
+						tr.carried = world.ItemStack{}
+						carriedPotion = ""
+					} else {
+						tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
+					}
+				} else if tr.carried.Count == 1 {
+					slots[slot], tr.carried = tr.carried, slots[slot]
+					slotPotions[slot], carriedPotion = carriedPotion, slotPotions[slot]
+				}
+			}
+
+		case slot == BrewingStandSlotIngredient:
+			if tr.carried.IsEmpty() || IsBrewingIngredient(tr.carried) {
+				slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+			}
+
+		case slot == BrewingStandSlotFuel:
+			if tr.carried.IsEmpty() || IsBrewingFuel(tr.carried) {
+				slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+			}
+
+		default:
+			prevSlotEmpty := slots[slot].IsEmpty()
+			prevCarriedEmpty := tr.carried.IsEmpty()
+			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+			if prevSlotEmpty && !slots[slot].IsEmpty() {
+				slotPotions[slot] = carriedPotion
+				if tr.carried.IsEmpty() {
+					carriedPotion = ""
+				}
+			} else if prevCarriedEmpty && !tr.carried.IsEmpty() {
+				carriedPotion = slotPotions[slot]
+				if slots[slot].IsEmpty() {
+					slotPotions[slot] = ""
+				}
+			} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() {
+				slotPotions[slot], carriedPotion = carriedPotion, slotPotions[slot]
+			}
+		}
+
+	case ContainerInputQuickMove:
+		if slot < BrewingStandSlotCount {
+			movedPotion := slotPotions[slot]
+			wasBottleSlot := slot < 3 && IsPotionItem(slots[slot])
+			for dst := 5; dst < BrewingStandMenuSlotCount && !slots[slot].IsEmpty(); dst++ {
+				if slots[dst].IsEmpty() {
+					slots[dst] = slots[slot]
+					slotPotions[dst] = movedPotion
+					slots[slot] = world.ItemStack{}
+					slotPotions[slot] = ""
+					if wasBottleSlot && movedPotion != "" && movedPotion != PotionWater {
+						s.TriggerBrewedPotion(session, movedPotion)
+					}
+					break
+				}
+			}
+		} else {
+			clicked := slots[slot]
+			clickedPotion := slotPotions[slot]
+			if !clicked.IsEmpty() {
+				switch {
+				case IsBrewingFuel(clicked):
+					slots[slot] = mergeIntoSlotSlice(slots, clicked, BrewingStandSlotFuel, BrewingStandSlotFuel+1)
+				case IsBrewingIngredient(clicked):
+					slots[slot] = mergeIntoSlotSlice(slots, clicked, BrewingStandSlotIngredient, BrewingStandSlotIngredient+1)
+				case CanPlaceInBrewingBottleSlot(clicked):
+					for bSlot := 0; bSlot < 3 && !slots[slot].IsEmpty(); bSlot++ {
+						if slots[bSlot].IsEmpty() {
+							slots[bSlot] = world.NewItemStack(slots[slot].ResolvedItemID(), 1)
+							slotPotions[bSlot] = clickedPotion
+							rem := slots[slot].Count - 1
+							if rem <= 0 {
+								slots[slot] = world.ItemStack{}
+								slotPotions[slot] = ""
+							} else {
+								slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for i := 0; i < BrewingStandSlotCount; i++ {
+		pType := ""
+		if i < 3 {
+			pType = slotPotions[i]
+		}
+		s.SetBrewingSlot(bx, by, bz, i, slots[i], pType)
+	}
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[5+i])
+		SetSlotPotionType(session, 9+i, slotPotions[5+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[32+i])
+		SetSlotPotionType(session, 36+i, slotPotions[32+i])
+	}
+	SetCarriedPotionType(session, carriedPotion)
+}
+

@@ -344,6 +344,9 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsFurnaceBlock(prevState) {
 		s.DropFurnaceContents(x, y, z)
 	}
+	if IsBrewingStandBlock(prevState) {
+		s.DropBrewingStandContents(x, y, z)
+	}
 
 	if mode == GameModeSurvival {
 		s.RecordBlockBreakExhaustion(session)
@@ -810,16 +813,24 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	st.fallDistance = 0
 	st.mu.Unlock()
 
+	if session.HasSlowFalling() {
+		return 0
+	}
 	if totalFall <= FallDamageThreshold {
 		return 0
 	}
-	damage := float32(math.Ceil(totalFall - FallDamageThreshold))
-	if damage <= 0 {
+	rawDamage := float32(math.Ceil(totalFall - FallDamageThreshold))
+	effectiveBase := rawDamage
+	if jb := session.JumpBoostLevel(); jb > 0 {
+		effectiveBase -= float32(jb)
+	}
+	if effectiveBase <= 0 {
 		return 0
 	}
 	prot := session.ArmorEnchantmentProtection("fall")
-	s.DamagePlayer(session, damage, "fall")
-	return damage * (1.0 - prot)
+	resMult := session.ResistanceDamageMultiplier("fall")
+	s.DamagePlayerWithEffects(session, rawDamage, "fall")
+	return effectiveBase * resMult * (1.0 - prot)
 }
 
 // RespawnPlayer restores a dead (or respawning) player's health and hunger to
@@ -840,6 +851,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	session.SetFoodExhaustion(0)
 	session.SetFoodTickTimer(0)
 	s.CancelEating(session)
+	s.ClearPlayerEffects(session)
 
 	prevDim := session.Dimension()
 	session.mu.Lock()

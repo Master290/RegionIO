@@ -387,6 +387,9 @@ func (s *Server) SaveAll() error {
 	if err := s.SaveFurnaces(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := s.SaveBrewingStands(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -513,7 +516,6 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 		LoadAdvancementsFromPlayerCompound(session, root)
 	}
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	session.position = d.Pos
 	session.yaw = d.Yaw
 	session.pitch = d.Pitch
@@ -546,6 +548,20 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 		session.spawnDimension = world.DimensionOverworld
 	}
 	session.hasSpawn = d.HasSpawn
+	session.mu.Unlock()
+
+	effRoot := nbt.NewCompound()
+	if d.ActiveEffects != nil {
+		effRoot.Set("active_effects", *d.ActiveEffects)
+	} else {
+		effRoot.Set("active_effects", nbt.List{ElemID: nbt.TagEnd})
+	}
+	effRoot.Set("AbsorptionAmount", nbt.Float(d.AbsorptionAmount))
+	if d.SlotPotions != nil && len(d.SlotPotions.Elems) > 0 {
+		effRoot.Set("SlotPotions", *d.SlotPotions)
+	}
+	LoadEffectsFromPlayerCompound(session, effRoot)
+	LoadPotionMetaFromPlayerCompound(session, effRoot)
 }
 
 // WriteExperienceNBT writes the player's experience level, total XP, progress,
@@ -612,6 +628,20 @@ func (session *PlayerSession) ReadAdvancementsNBT(root *nbt.Compound) {
 	LoadAdvancementsFromPlayerCompound(session, root)
 }
 
+// WriteEffectsNBT writes the player's active status effects, absorption hearts,
+// and slot potion metadata into a playerdata NBT root compound.
+func (session *PlayerSession) WriteEffectsNBT(root *nbt.Compound) {
+	SaveEffectsToPlayerCompound(session, root)
+	SavePotionMetaToPlayerCompound(session, root)
+}
+
+// ReadEffectsNBT restores the player's active status effects, absorption hearts,
+// and slot potion metadata from a playerdata NBT root compound.
+func (session *PlayerSession) ReadEffectsNBT(root *nbt.Compound) {
+	LoadEffectsFromPlayerCompound(session, root)
+	LoadPotionMetaFromPlayerCompound(session, root)
+}
+
 // PlayerData exports a consistent copy of the session's state for persistence.
 func (session *PlayerSession) PlayerData() world.PlayerData {
 	if session == nil {
@@ -622,41 +652,72 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	tickTimer := session.FoodTickTimer()
 	xpLevel, xpTotal, xpP := session.Experience()
 	xpSeed := session.EnchantmentSeed()
-	advRoot := nbt.NewCompound()
-	SaveAdvancementsToPlayerCompound(session, advRoot)
+	metaRoot := nbt.NewCompound()
+	SaveAdvancementsToPlayerCompound(session, metaRoot)
+	SaveEffectsToPlayerCompound(session, metaRoot)
+	SavePotionMetaToPlayerCompound(session, metaRoot)
 	var advComp *nbt.Compound
-	if tag, ok := advRoot.Get("Advancements"); ok {
+	if tag, ok := metaRoot.Get("Advancements"); ok {
 		advComp, _ = tag.(*nbt.Compound)
+	}
+	var effList *nbt.List
+	if tag, ok := metaRoot.Get("active_effects"); ok {
+		switch v := tag.(type) {
+		case nbt.List:
+			cp := v
+			effList = &cp
+		case *nbt.List:
+			effList = v
+		}
+	}
+	var absAmount float32
+	if tag, ok := metaRoot.Get("AbsorptionAmount"); ok {
+		if f, ok := tag.(nbt.Float); ok {
+			absAmount = float32(f)
+		}
+	}
+	var slotPotions *nbt.List
+	if tag, ok := metaRoot.Get("SlotPotions"); ok {
+		switch v := tag.(type) {
+		case nbt.List:
+			cp := v
+			slotPotions = &cp
+		case *nbt.List:
+			slotPotions = v
+		}
 	}
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
-		Dimension:      dim,
-		Pos:            session.position,
-		Yaw:            session.yaw,
-		Pitch:          session.pitch,
-		OnGround:       session.onGround,
-		GameMode:       session.gameMode,
-		Health:         session.health,
-		FoodLevel:      session.foodLevel,
-		FoodSaturation: session.foodSaturation,
-		FoodExhaustion: exhaustion,
-		FoodTickTimer:  tickTimer,
-		XpLevel:        xpLevel,
-		XpTotal:        xpTotal,
-		XpP:            xpP,
-		XpSeed:         xpSeed,
-		SelectedSlot:   session.selectedSlot,
-		Inventory:      session.inventory,
-		SpawnX:         session.spawnX,
-		SpawnY:         session.spawnY,
-		SpawnZ:         session.spawnZ,
-		SpawnYaw:       session.spawnYaw,
-		SpawnPitch:     session.spawnPitch,
-		SpawnForced:    session.spawnForced,
-		SpawnDimension: session.spawnDimension,
-		HasSpawn:       session.hasSpawn,
-		Advancements:   advComp,
+		Dimension:        dim,
+		Pos:              session.position,
+		Yaw:              session.yaw,
+		Pitch:            session.pitch,
+		OnGround:         session.onGround,
+		GameMode:         session.gameMode,
+		Health:           session.health,
+		FoodLevel:        session.foodLevel,
+		FoodSaturation:   session.foodSaturation,
+		FoodExhaustion:   exhaustion,
+		FoodTickTimer:    tickTimer,
+		XpLevel:          xpLevel,
+		XpTotal:          xpTotal,
+		XpP:              xpP,
+		XpSeed:           xpSeed,
+		SelectedSlot:     session.selectedSlot,
+		Inventory:        session.inventory,
+		SpawnX:           session.spawnX,
+		SpawnY:           session.spawnY,
+		SpawnZ:           session.spawnZ,
+		SpawnYaw:         session.spawnYaw,
+		SpawnPitch:       session.spawnPitch,
+		SpawnForced:      session.spawnForced,
+		SpawnDimension:   session.spawnDimension,
+		HasSpawn:         session.hasSpawn,
+		Advancements:     advComp,
+		ActiveEffects:    effList,
+		AbsorptionAmount: absAmount,
+		SlotPotions:      slotPotions,
 	}
 }
 
