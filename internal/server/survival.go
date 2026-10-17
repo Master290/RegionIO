@@ -1238,6 +1238,13 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 	}
 
 	switch itemID {
+	case GoatHornItemID:
+		if s.UseGoatHornItem(session, hand, "") {
+			s.RecordItemUsed(session, itemID, 1)
+			return true
+		}
+		return false
+
 	case WindChargeItemID:
 		if chargeID, used := s.UseWindChargeItem(session, hand); used {
 			s.RecordItemUsed(session, itemID, 1)

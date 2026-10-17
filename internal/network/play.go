@@ -1643,6 +1643,28 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			}
 			off := faceOffsets[face]
 			px, py, pz := x+off[0], y+off[1], z+off[2]
+			dim := h.session.Dimension()
+			if dim == "" {
+				dim = world.DimensionOverworld
+			}
+			heldInHand := h.session.InventorySlot(invSlot)
+			switch heldInHand.ResolvedID() {
+			case server.TadpoleBucketItemID:
+				if _, ok := h.srv.ReleaseTadpoleFromBucket(h.session, dim, px, py, pz); ok {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			case server.AxolotlBucketItemID:
+				if _, ok := h.srv.ReleaseAxolotlFromBucket(h.session, dim, px, py, pz); ok {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			case server.GoatHornItemID:
+				if h.srv.UseGoatHornItem(h.session, hand, "") {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
 			if h.srv.PlaceBannerBlock(h.session, hand, face, px, py, pz) {
 				h.syncHotbarFromSession()
 				return h.sendBlockChangedAck(seq)
