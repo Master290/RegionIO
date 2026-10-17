@@ -457,6 +457,16 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:white_banner", AdvancementFrameChallenge, "",
 		true, true, true, 2, 2, cHeroVillage, rHeroVillage, 100)
 
+	cAvoidVib, rAvoidVib := allOfCriteria("avoid_vibration")
+	add("minecraft:adventure/avoid_vibration", "minecraft:adventure/root", "Sneak 100", "Sneak near a Sculk Sensor or Warden to prevent it from detecting you",
+		"minecraft:sculk_sensor", AdvancementFrameTask, "",
+		true, true, false, 1, 3, cAvoidVib, rAvoidVib, 0)
+
+	cItSpreads, rItSpreads := allOfCriteria("kill_mob_near_sculk_catalyst")
+	add("minecraft:adventure/kill_mob_near_sculk_catalyst", "minecraft:adventure/kill_a_mob", "It Spreads", "Kill a mob near a Sculk Catalyst",
+		"minecraft:sculk_catalyst", AdvancementFrameChallenge, "",
+		true, true, false, 2, 1, cItSpreads, rItSpreads, 0)
+
 	// --- Husbandry tab (minecraft:husbandry/*) ---
 	cHusbRoot, rHusbRoot := allOfCriteria("consumed_item")
 	add("minecraft:husbandry/root", "", "Husbandry", "The world is full of friends and food",
@@ -1277,6 +1287,26 @@ func (s *Server) TriggerConstructBeacon(session *PlayerSession, level int) {
 	if level >= 4 {
 		s.GrantCriterion(session, "minecraft:nether/create_full_beacon", "construct_beacon")
 	}
+}
+
+// TriggerAvoidVibration fires the "Sneak 100" advancement
+// (minecraft:adventure/avoid_vibration) when session sneaks near a sculk sensor
+// or warden to prevent vibration detection.
+func (s *Server) TriggerAvoidVibration(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/avoid_vibration", "avoid_vibration")
+}
+
+// TriggerKillMobNearSculkCatalyst fires the "It Spreads" advancement
+// (minecraft:adventure/kill_mob_near_sculk_catalyst) when session kills a mob
+// whose experience is absorbed by a nearby sculk catalyst.
+func (s *Server) TriggerKillMobNearSculkCatalyst(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/kill_mob_near_sculk_catalyst", "kill_mob_near_sculk_catalyst")
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---

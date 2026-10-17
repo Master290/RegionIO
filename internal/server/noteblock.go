@@ -72,6 +72,7 @@ func EncodeNoteParticlePacket(x, y, z float64, note int) []byte {
 //  3. Jukeboxes (0..15) via s.JukeboxComparatorSignalAt
 //  4. Cauldrons (0..3) via s.CauldronComparatorSignalAt
 //  5. Brewing stands (0..15) via s.BrewingStandComparatorSignalAt
+//  6. Sculk sensors & calibrated sculk sensors (0..15) via s.SculkSensorComparatorSignalAt
 func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	if s == nil {
 		return 0
@@ -92,6 +93,9 @@ func (s *Server) ComparatorSignalAt(dim string, x, y, z int) int {
 	}
 	if brewSig := s.BrewingStandComparatorSignalAt(targetDim, x, y, z); brewSig > best {
 		best = brewSig
+	}
+	if sculkSig := s.SculkSensorComparatorSignalAt(targetDim, x, y, z); sculkSig > best {
+		best = sculkSig
 	}
 	if best < 0 {
 		return 0
@@ -165,6 +169,9 @@ func (s *Server) BroadcastNoteBlockPlay(dim string, x, y, z, note int, instrumen
 		s.BroadcastDimensionChunk(targetDim, cx, cz, PlayLevelParticlesCB,
 			EncodeNoteParticlePacket(float64(x)+0.5, float64(y)+1.2, float64(z)+0.5, note))
 	}
+
+	// 4. Emit vanilla note_block_play game event (vibration frequency 10) for sculk sensors.
+	s.EmitGameEvent(targetDim, GameEventNoteBlockPlay, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
 }
 
 // InteractNoteBlock handles a player right-clicking a minecraft:note_block at

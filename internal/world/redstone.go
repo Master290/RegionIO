@@ -226,7 +226,8 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:piston", "minecraft:sticky_piston", "minecraft:piston_head",
 		"minecraft:redstone_lamp", "minecraft:note_block", "minecraft:jukebox",
 		"minecraft:target", "minecraft:daylight_detector",
-		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer":
+		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
 		return true
 	}
 	return strings.HasSuffix(name, "_button") ||
@@ -274,7 +275,7 @@ func isConductiveSolidBlock(state uint16) bool {
 		"minecraft:lectern", "minecraft:composter", "minecraft:bamboo",
 		"minecraft:cactus", "minecraft:sugar_cane", "minecraft:anvil",
 		"minecraft:chipped_anvil", "minecraft:damaged_anvil", "minecraft:farmland",
-		"minecraft:dirt_path":
+		"minecraft:dirt_path", "minecraft:sculk_shrieker":
 		return false
 	}
 	return isSolidState(state)
@@ -318,7 +319,8 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 		return c.jukeboxRedstoneSignalAt(x, y, z, info.Properties)
 	case "minecraft:comparator":
 		return c.ComparatorOutputSignalAt(x, y, z)
-	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate":
+	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate",
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
 		p, _ := strconv.Atoi(info.Properties["power"])
 		return clampPower(p)
 	}
@@ -518,10 +520,27 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 		}
 		return 0
 
-	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate":
+	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate",
+		"minecraft:sculk_sensor":
 		p, _ := strconv.Atoi(props["power"])
 		p = clampPower(p)
 		if p <= 0 {
+			return 0
+		}
+		if !directOnly || (tx == sx && ty == sy-1 && tz == sz) {
+			return p
+		}
+		return 0
+
+	case "minecraft:calibrated_sculk_sensor":
+		p, _ := strconv.Atoi(props["power"])
+		p = clampPower(p)
+		if p <= 0 {
+			return 0
+		}
+		// Calibrated sculk sensor does not emit redstone power out of its calibration input side (facing).
+		inDX, inDZ := RepeaterInputOffset(props["facing"])
+		if tx == sx+inDX && ty == sy && tz == sz+inDZ {
 			return 0
 		}
 		if !directOnly || (tx == sx && ty == sy-1 && tz == sz) {
@@ -886,7 +905,8 @@ func hasAnalogOutputSignal(state uint16) bool {
 	case "minecraft:jukebox", "minecraft:lectern", "minecraft:composter",
 		"minecraft:cauldron", "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron",
 		"minecraft:cake", "minecraft:end_portal_frame", "minecraft:respawn_anchor",
-		"minecraft:beehive", "minecraft:bee_nest", "minecraft:brewing_stand":
+		"minecraft:beehive", "minecraft:bee_nest", "minecraft:brewing_stand",
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
 		return true
 	}
 	return false
@@ -1595,7 +1615,7 @@ func canWireConnectHorizontally(neighborState uint16, dirFromWireToNeighbor stri
 		"minecraft:lever", "minecraft:redstone_torch", "minecraft:redstone_wall_torch",
 		"minecraft:comparator", "minecraft:jukebox", "minecraft:target", "minecraft:daylight_detector",
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:tripwire_hook",
-		"minecraft:lightning_rod":
+		"minecraft:lightning_rod", "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
 		return true
 	case "minecraft:repeater":
 		facing := info.Properties["facing"]
@@ -2027,4 +2047,55 @@ func canPistonPushBlock(state uint16) bool {
 func BlockStateIDByProperties(name string, props map[string]string) (uint16, bool) {
 	return nameToStateID(name, props)
 }
+
+// CalibratedSculkSensorInputPower returns the calibration redstone signal (0..15)
+// entering the amethyst input side (`facing`) of a `minecraft:calibrated_sculk_sensor`
+// at (x, y, z). When the returned value is 0, the calibrated sculk sensor accepts
+// all vibration frequencies (1..15); when it is 1..15, only vibrations of that
+// exact frequency are accepted.
+func (c *Cache) CalibratedSculkSensorInputPower(x, y, z int) int {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return 0
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:calibrated_sculk_sensor" {
+		return 0
+	}
+	facing := info.Properties["facing"]
+	if facing == "" {
+		facing = "north"
+	}
+	sig := c.repeaterInputSignal(x, y, z, facing)
+	inDX, inDZ := RepeaterInputOffset(facing)
+	ix, iy, iz := x+inDX, y, z+inDZ
+	inState := c.GetBlock(ix, iy, iz)
+	if hasAnalogOutputSignal(inState) {
+		if analog := c.analogSignalAt(ix, iy, iz); analog > sig {
+			sig = analog
+		}
+	}
+	return clampPower(sig)
+}
+
+// ApplySculkSensorRedstoneState sets the block state of a `sculk_sensor` or
+// `calibrated_sculk_sensor` at (x, y, z) to nextState and propagates redstone
+// power and comparator updates to connected wires and mechanisms.
+func (c *Cache) ApplySculkSensorRedstoneState(x, y, z int, nextState uint16) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	oldState := c.GetBlock(x, y, z)
+	if oldState == nextState {
+		c.propagateRedstoneAround(x, y, z, oldState, nextState, &res)
+		return false, res
+	}
+	if c.setBlockRecorded(x, y, z, nextState, &res) {
+		c.propagateRedstoneAround(x, y, z, oldState, nextState, &res)
+		return true, res
+	}
+	return false, res
+}
+
 
