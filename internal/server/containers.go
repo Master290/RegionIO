@@ -417,6 +417,11 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	case IsCartographyTableBlock(state):
 		cid, err := s.OpenCartographyTable(session, x, y, z)
 		return err == nil, cid, err
+	case IsLoomBlock(state):
+		cid, err := s.OpenLoom(session, x, y, z)
+		return err == nil, cid, err
+	case world.BlockName(state) == "minecraft:water_cauldron":
+		return s.CleanBannerInCauldron(session, 0, x, y, z), 0, nil
 	case IsBedBlock(state):
 		s.InteractBed(session, x, y, z)
 		return true, 0, nil
@@ -738,6 +743,16 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	case MenuTypeCartographyTable:
 		tr.mu.Unlock()
 		return s.HandleCartographyContainerClick(session, containerID, slot, button, mode)
+	case MenuTypeLoom:
+		tr.mu.Unlock()
+		err := s.HandleLoomClick(session, ContainerClick{
+			ContainerID: containerID,
+			Slot:        int16(slot),
+			Button:      button,
+			Mode:        mode,
+		})
+		s.TriggerInventoryChanged(session)
+		return err
 	default:
 		tr.mu.Unlock()
 		return nil
@@ -1127,6 +1142,7 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	isEnchant := false
 	isAnvil := false
 	isBrewingStand := false
+	isLoom := false
 	switch openCopy.MenuType {
 	case MenuTypeGeneric9x3:
 		slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
@@ -1146,6 +1162,15 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	case MenuTypeBrewingStand:
 		slots = s.buildBrewingStandMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 		isBrewingStand = true
+	case MenuTypeLoom:
+		slots = s.buildLoomMenuSlots(
+			session,
+			openCopy.Crafting[LoomSlotBanner],
+			openCopy.Crafting[LoomSlotDye],
+			openCopy.Crafting[LoomSlotPattern],
+			openCopy.Result,
+		)
+		isLoom = true
 	default:
 		return nil
 	}
@@ -1171,6 +1196,18 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	}
 	if isBrewingStand {
 		return s.sendBrewingStandDataProperties(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+	}
+	if isLoom {
+		if err := session.send(protocol.PlayContainerSetData, EncodeContainerSetData(openCopy.ContainerID, 0, openCopy.AnvilCost)); err != nil {
+			return err
+		}
+		if !openCopy.Result.IsEmpty() {
+			btr := getBannerMetaTracker(session)
+			btr.mu.Lock()
+			resPats := btr.loomResult.Clone()
+			btr.mu.Unlock()
+			return session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithBanner(openCopy.ContainerID, session.NextContainerStateID(), LoomSlotResult, openCopy.Result, resPats, ""))
+		}
 	}
 	return nil
 }

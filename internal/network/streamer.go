@@ -51,10 +51,11 @@ type streamer struct {
 	residentMu sync.RWMutex
 	resident   map[[2]int32]bool
 
-	viewRadius int // chunks within this Chebyshev radius are sent to the client
-	genRadius  int // viewRadius + 1: pre-generated but not sent (predictive ring)
-	poolSize   int // parallel generation workers
-	tickets    *world.TicketSet
+	viewRadius  int // chunks within this Chebyshev radius are sent to the client
+	genRadius   int // viewRadius + 1: pre-generated but not sent (predictive ring)
+	poolSize    int // parallel generation workers
+	tickets     *world.TicketSet
+	onChunkSent func(cx, cz int32)
 }
 
 // defaultViewRadius is used when the client hasn't sent client_information or
@@ -464,6 +465,9 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 		}
 		s.loaded[[2]int32{j.cx, j.cz}] = true
 		s.setResident([2]int32{j.cx, j.cz}, true)
+		if s.onChunkSent != nil {
+			s.onChunkSent(j.cx, j.cz)
+		}
 	}
 }
 

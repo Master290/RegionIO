@@ -120,6 +120,11 @@ func (h *handler) beginPlay() error {
 	// read loop stays free; requestRecenter is a non-blocking push.
 	playerCache := h.srv.PlayerChunks(session)
 	h.streamer = newStreamer(playerCache, h.conn, h.log, h.visibilityRadius())
+	h.streamer.onChunkSent = func(cx, cz int32) {
+		if h.srv != nil && h.session != nil {
+			h.srv.SendChunkBlockEntityPackets(h.session, h.session.Dimension(), cx, cz)
+		}
+	}
 	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
 	h.srv.SetPlayerDimensionSwitchFunc(session, h.streamer.switchDimension)
 	go h.streamer.run(h.ctx)
@@ -237,6 +242,14 @@ func (h *handler) sendContainerSetContent() error {
 					continue
 				}
 			}
+			if id := inv[i].ResolvedID(); server.IsBannerItem(id) || id == "minecraft:shield" {
+				pats := server.GetSlotBannerPatterns(h.session, i)
+				baseCol := server.GetSlotShieldBaseColor(h.session, i)
+				if !pats.IsEmpty() || baseCol != "" {
+					server.EncodeSlotWithBannerPatterns(w, inv[i], pats, baseCol)
+					continue
+				}
+			}
 		}
 		writeItemStack(w, inv[i])
 	}
@@ -268,6 +281,14 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 		case server.WrittenBookItemID:
 			if sb, ok := server.GetSlotWrittenBook(h.session, slot); ok {
 				server.EncodeSlotWithBookContent(w, stack, nil, &sb)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
+		}
+		if id := stack.ResolvedID(); server.IsBannerItem(id) || id == "minecraft:shield" {
+			pats := server.GetSlotBannerPatterns(h.session, slot)
+			baseCol := server.GetSlotShieldBaseColor(h.session, slot)
+			if !pats.IsEmpty() || baseCol != "" {
+				server.EncodeSlotWithBannerPatterns(w, stack, pats, baseCol)
 				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 			}
 		}
@@ -400,6 +421,7 @@ func (h *handler) keepAliveLoop() {
 			h.srv.DespawnPlayerFishingBobber(h.session)
 			h.srv.WakePlayerFromBed(h.session)
 			h.srv.CloseLecternIfOpen(h.session)
+			_ = h.srv.CloseLoomContainer(h.session, 0, false)
 			_ = h.srv.CloseCartographyContainer(h.session, 0, false)
 			h.srv.OnPlayerQuitBossBars(h.session)
 			h.srv.BroadcastPlayerInfoRemove(h.session.Profile.UUID)
@@ -878,6 +900,10 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 				h.syncHotbarFromSession()
 				return err
 			}
+			if handled, err := h.srv.HandleLoomButtonClick(h.session, cid, btn); handled {
+				h.syncHotbarFromSession()
+				return err
+			}
 			if err := h.srv.HandleContainerButtonClick(h.session, cid, btn); err != nil {
 				return err
 			}
@@ -964,6 +990,10 @@ func (h *handler) handleContainerClose(pkt protocol.Packet) error {
 		h.srv.CloseLecternIfOpen(h.session)
 		if open := h.session.OpenContainer(); open != nil && open.MenuType == server.MenuTypeCartographyTable {
 			if err := h.srv.CloseCartographyContainer(h.session, cid, false); err != nil {
+				return err
+			}
+		} else if open != nil && open.MenuType == server.MenuTypeLoom {
+			if err := h.srv.CloseLoomContainer(h.session, cid, false); err != nil {
 				return err
 			}
 		} else if err := h.srv.CloseMerchantContainer(h.session, cid, false); err != nil {
@@ -1184,6 +1214,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					return h.sendBlockChangedAck(seq)
 				}
 			}
+			if world.BlockName(clickedState) == "minecraft:water_cauldron" {
+				if h.srv.CleanBannerInCauldron(h.session, hand, x, y, z) {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
 		}
 		opened, _, err := h.srv.InteractBlock(h.session, x, y, z)
 		if err != nil {
@@ -1262,6 +1298,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				h.syncHotbarFromSession()
 				return h.sendBlockChangedAck(seq)
 			}
+			off := faceOffsets[face]
+			px, py, pz := x+off[0], y+off[1], z+off[2]
+			if h.srv.PlaceBannerBlock(h.session, hand, face, px, py, pz) {
+				h.syncHotbarFromSession()
+				return h.sendBlockChangedAck(seq)
+			}
 		}
 		if state, ok := h.heldBlock(); ok {
 			off := faceOffsets[face]
@@ -1286,6 +1328,10 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					if server.IsSignBlock(state) && h.srv != nil && h.session != nil {
 						h.srv.OnSignPlaced(h.session, px, py, pz, true)
+					}
+					if server.IsBannerBlock(state) && h.srv != nil && h.session != nil {
+						h.srv.OnBannerPlaced(h.session, h.session.HeldInventorySlot(), px, py, pz)
+						h.srv.SendBannerBlockEntityPacket(h.session, px, py, pz)
 					}
 					if h.session != nil {
 						h.srv.TriggerPlantedSeed(h.session, blockName)

@@ -360,6 +360,11 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsSignBlock(prevState) {
 		s.RemoveSignAt(dim, x, y, z)
 	}
+	var bannerDrop world.ItemStack
+	var hasBannerDrop bool
+	if IsBannerBlock(prevState) {
+		bannerDrop, _, hasBannerDrop = s.RemoveBannerAt(dim, x, y, z)
+	}
 
 	if mode == GameModeSurvival {
 		s.RecordBlockBreakExhaustion(session)
@@ -372,6 +377,10 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			if !world.IsInstantBreakBlock(prevState) {
 				s.DamagePlayerItem(session, heldSlot, 1)
 			}
+		}
+		if hasBannerDrop && !bannerDrop.IsEmpty() {
+			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, bannerDrop)
+			return true, dropID
 		}
 		blockName := world.BlockName(prevState)
 		fortune := EnchantmentFortuneLevel(toolMeta)

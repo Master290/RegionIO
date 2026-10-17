@@ -272,6 +272,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadBossBarsFile()
 		_ = s.LoadWorldBorderFile()
 		_ = s.LoadSignsAndLecternsFile()
+		_ = s.LoadBannersFile()
 	}
 	return s
 }
@@ -416,6 +417,9 @@ func (s *Server) SaveAll() error {
 	if err := s.SaveSignsAndLecternsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := s.SaveBannersFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -423,6 +427,27 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	return firstErr
+}
+
+// ChunkBlockEntitiesNBT returns all sign, lectern, and banner block entity NBT
+// compounds belonging to chunk (cx, cz) in dimension for Anvil chunk serialization.
+func (s *Server) ChunkBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	out := s.ChunkSignAndLecternBlockEntitiesNBT(dimension, cx, cz)
+	out = append(out, s.ChunkBannerBlockEntitiesNBT(dimension, cx, cz)...)
+	return out
+}
+
+// LoadChunkBlockEntitiesNBT restores any sign, lectern, and banner block entities
+// from a chunk's `block_entities` NBT list.
+func (s *Server) LoadChunkBlockEntitiesNBT(dimension string, list nbt.List) {
+	if s == nil {
+		return
+	}
+	s.LoadChunkSignAndLecternBlockEntitiesNBT(dimension, list)
+	s.LoadChunkBannerBlockEntitiesNBT(dimension, list)
 }
 
 // Config returns the active configuration.
