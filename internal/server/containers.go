@@ -524,6 +524,33 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenDispenserOrDropper(session, x, y, z)
 		return err == nil, cid, err
+	case IsHopperBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		cid, err := s.OpenHopper(session, x, y, z)
+		return err == nil, cid, err
+	case IsCrafterBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		cid, err := s.OpenCrafter(session, x, y, z)
+		return err == nil, cid, err
+	case IsDecoratedPotBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		_, wobbled := s.InteractDecoratedPot(session, session.Dimension(), x, y, z)
+		return wobbled, 0, nil
+	case IsCampfireBlock(state):
+		_, ok := s.InteractCampfire(session, x, y, z)
+		return ok, 0, nil
+	case blockName == "minecraft:daylight_detector":
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		ok, _ := s.InteractDaylightDetector(session, x, y, z)
+		return ok, 0, nil
 	case IsLecternBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		return s.InteractWithLectern(session, 0, x, y, z), 0, nil
@@ -820,8 +847,16 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			s.UnlockRecipesForInventory(session)
 			return s.syncVehicleContainerViewers(session, vehID)
 		}
+		openCopy := *tr.open
 		tr.mu.Unlock()
-		return nil
+		return s.HandleHopperClick(session, &openCopy, slot, button, mode)
+	case CrafterMenuType:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		s.applyCrafterClickLocked(session, tr, bx, by, bz, slot, button, mode)
+		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		return s.SyncCrafterViewers(session, bx, by, bz)
 	case MenuTypeGeneric3x3:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		s.ApplyDispenserOrDropperClickLocked(session, tr, bx, by, bz, int(slot), button, mode)
@@ -1065,6 +1100,11 @@ func matchCraftingWithFireworks(
 	width, height int,
 	gridStars []FireworkExplosion,
 ) (res world.ItemStack, starExp *FireworkExplosion, fwComp *FireworksComponent, ok bool) {
+	if width == 3 && height == 3 && len(grid) >= 9 {
+		if potOut, _, matched := MatchDecoratedPotRecipe(grid); matched {
+			return potOut, nil, nil, true
+		}
+	}
 	if res, _, ok := MatchCraftingGrid(grid, width, height); ok {
 		return res, nil, nil, true
 	}
@@ -1419,6 +1459,13 @@ func (s *Server) clickCraftingOutput(
 	mode int32,
 ) world.ItemStack {
 	grid := slots[gridStart : gridStart+gridCount]
+	var potSherds *[4]string
+	if width == 3 && height == 3 && len(grid) >= 9 {
+		if _, sh, matchedPot := MatchDecoratedPotRecipe(grid); matchedPot {
+			shCopy := sh
+			potSherds = &shCopy
+		}
+	}
 	res, starExp, fwComp, ok := matchCraftingWithFireworks(grid, width, height, gridStars)
 	if !ok || res.IsEmpty() {
 		return world.ItemStack{}
@@ -1449,6 +1496,9 @@ func (s *Server) clickCraftingOutput(
 			*carried = world.NewItemStack(resID, res.Count)
 			consumeGridOnce()
 			crafted = res
+			if potSherds != nil {
+				s.SetLastCraftedDecoratedPotSherds(*potSherds)
+			}
 			if starExp != nil {
 				setCarriedFireworkStar(session, starExp)
 				setCarriedFireworks(session, nil)
@@ -1460,6 +1510,9 @@ func (s *Server) clickCraftingOutput(
 			*carried = world.NewItemStack(resID, carried.Count+res.Count)
 			consumeGridOnce()
 			crafted = res
+			if potSherds != nil {
+				s.SetLastCraftedDecoratedPotSherds(*potSherds)
+			}
 			if starExp != nil {
 				setCarriedFireworkStar(session, starExp)
 				setCarriedFireworks(session, nil)
@@ -1471,6 +1524,13 @@ func (s *Server) clickCraftingOutput(
 	case ContainerInputQuickMove:
 		var totalCrafted int32
 		for iter := 0; iter < 64; iter++ {
+			var curPotSherds *[4]string
+			if width == 3 && height == 3 && gridCount >= 9 {
+				if _, sh, matchedPot := MatchDecoratedPotRecipe(slots[gridStart : gridStart+gridCount]); matchedPot {
+					shCopy := sh
+					curPotSherds = &shCopy
+				}
+			}
 			curRes, curStarExp, curFwComp, match := matchCraftingWithFireworks(slots[gridStart:gridStart+gridCount], width, height, gridStars)
 			if !match || curRes.IsEmpty() || curRes.ResolvedItemID() != resID {
 				break
@@ -1486,7 +1546,10 @@ func (s *Server) clickCraftingOutput(
 			hotbarStart := invEnd - 9
 			rem := mergeIntoSlotSlice(slots, curRes, hotbarStart, invEnd)
 			rem = mergeIntoSlotSlice(slots, rem, invStart, hotbarStart)
-			if menuSlotToSessionSlot != nil && (curStarExp != nil || curFwComp != nil) {
+			if curPotSherds != nil {
+				s.SetLastCraftedDecoratedPotSherds(*curPotSherds)
+			}
+			if menuSlotToSessionSlot != nil && (curStarExp != nil || curFwComp != nil || curPotSherds != nil) {
 				for idx := invStart; idx < invEnd; idx++ {
 					if slots[idx].Count > prevCounts[idx] {
 						dstSlot := menuSlotToSessionSlot(idx)
@@ -1495,6 +1558,9 @@ func (s *Server) clickCraftingOutput(
 						}
 						if curFwComp != nil {
 							SetSlotFireworks(session, dstSlot, *curFwComp)
+						}
+						if curPotSherds != nil {
+							SetSlotDecoratedPotSherds(s, session, dstSlot, *curPotSherds)
 						}
 					}
 				}
@@ -1658,6 +1724,7 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	isAnvil := false
 	isBrewingStand := false
 	isLoom := false
+	isCrafter := false
 	switch openCopy.MenuType {
 	case MenuTypeGeneric9x3:
 		if openCopy.VehicleEntityID != 0 {
@@ -1669,8 +1736,11 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		if openCopy.VehicleEntityID != 0 {
 			slots = s.buildVehicleHopperMenuSlots(session, openCopy.VehicleEntityID)
 		} else {
-			return nil
+			slots = s.BuildHopperWindowSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 		}
+	case CrafterMenuType:
+		slots = s.BuildCrafterMenuSlots(session, session.Dimension(), openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+		isCrafter = true
 	case MenuTypeGeneric3x3:
 		slots = s.BuildDispenserMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	case MenuTypeCrafting:
@@ -1710,6 +1780,9 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	stateID := session.NextContainerStateID()
 	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried)); err != nil {
 		return err
+	}
+	if isCrafter {
+		return s.sendCrafterDataProperties(session, openCopy.ContainerID, session.Dimension(), openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	}
 	if isFurnace {
 		return s.sendFurnaceDataProperties(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
@@ -2197,5 +2270,168 @@ func (s *Server) syncVehicleContainerViewers(actor *PlayerSession, entityID int3
 	}
 	return firstErr
 }
+
+// OpenCrafter opens the 46-slot `minecraft:crafter_3x3` screen at (x, y, z)
+// for session, sends `open_screen` + `container_set_content` + `container_set_data`,
+// and emits `GameEventContainerOpen`.
+func (s *Server) OpenCrafter(session *PlayerSession, x, y, z int) (int32, error) {
+	if s == nil || session == nil {
+		return 0, errors.New("server: nil session")
+	}
+	_ = s.CloseContainer(session, 0, false)
+
+	dim := normalizeHopperDim(session.Dimension())
+	s.EmitPlayerBlockVibration(session, GameEventContainerOpen, dim, x, y, z, "minecraft:crafter")
+
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.nextWindow = (tr.nextWindow % 100) + 1
+	cid := tr.nextWindow
+	tr.open = &OpenContainerState{
+		ContainerID: cid,
+		MenuType:    CrafterMenuType,
+		BlockX:      x,
+		BlockY:      y,
+		BlockZ:      z,
+	}
+	carried := tr.carried
+	tr.mu.Unlock()
+
+	if session.send != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, CrafterMenuType, "Crafter")); err != nil {
+			return cid, err
+		}
+		slots := s.BuildCrafterMenuSlots(session, dim, x, y, z)
+		stateID := session.NextContainerStateID()
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+			return cid, err
+		}
+		if err := s.sendCrafterDataProperties(session, cid, dim, x, y, z); err != nil {
+			return cid, err
+		}
+	}
+	return cid, nil
+}
+
+func (s *Server) sendCrafterDataProperties(session *PlayerSession, cid int32, dim string, x, y, z int) error {
+	if session == nil || session.send == nil {
+		return nil
+	}
+	props := s.CrafterContainerData(dim, x, y, z)
+	for i := int16(0); i < int16(len(props)); i++ {
+		if err := session.send(protocol.PlayContainerSetData, EncodeContainerSetData(cid, i, props[i])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) applyCrafterClickLocked(session *PlayerSession, tr *playerContainerTracker, bx, by, bz, slot int, button int8, mode int32) {
+	if slot < 0 || slot >= CrafterMenuSlotCount || slot == CrafterMenuResultSlot {
+		return
+	}
+	dim := normalizeHopperDim(session.Dimension())
+	slots := s.BuildCrafterMenuSlots(session, dim, bx, by, bz)
+
+	if slot >= 0 && slot < CrafterSlotCount {
+		if mode == ContainerInputPickup && tr.carried.IsEmpty() && slots[slot].IsEmpty() {
+			s.ToggleCrafterSlotDisabled(dim, bx, by, bz, slot)
+			return
+		}
+		if !tr.carried.IsEmpty() && s.IsCrafterSlotDisabled(dim, bx, by, bz, slot) {
+			s.SetCrafterSlotDisabled(dim, bx, by, bz, slot, false)
+		}
+	}
+
+	switch mode {
+	case ContainerInputPickup:
+		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+	case ContainerInputQuickMove:
+		if slot < CrafterSlotCount {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 36, 45)
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 9, 36)
+		} else if slot >= 9 && slot < 45 {
+			for dst := 0; dst < CrafterSlotCount && !slots[slot].IsEmpty(); dst++ {
+				if s.IsCrafterSlotDisabled(dim, bx, by, bz, dst) {
+					continue
+				}
+				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], dst, dst+1)
+			}
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 36 + int(button)
+			if slot < CrafterSlotCount && !slots[hotbarIdx].IsEmpty() && s.IsCrafterSlotDisabled(dim, bx, by, bz, slot) {
+				s.SetCrafterSlotDisabled(dim, bx, by, bz, slot, false)
+			}
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+		}
+	}
+
+	for i := 0; i < CrafterSlotCount; i++ {
+		s.SetCrafterSlot(dim, bx, by, bz, i, slots[i], ItemMeta{})
+	}
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[9+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[36+i])
+	}
+}
+
+// SyncCrafterViewers synchronizes the open crafter container screen for all
+// players currently viewing the crafter at (bx, by, bz).
+func (s *Server) SyncCrafterViewers(actor *PlayerSession, bx, by, bz int) error {
+	if s == nil {
+		return nil
+	}
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, sess := range s.players {
+		sessions = append(sessions, sess)
+	}
+	s.playersMu.RUnlock()
+
+	var firstErr error
+	for _, sess := range sessions {
+		if sess == nil || sess.send == nil {
+			continue
+		}
+		open := sess.OpenContainer()
+		if open != nil && open.MenuType == CrafterMenuType &&
+			open.BlockX == bx && open.BlockY == by && open.BlockZ == bz {
+			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		} else if sess == actor {
+			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
 
 

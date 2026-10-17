@@ -399,6 +399,8 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 		}
 		h.srv.HandlePlayerStepOnSculkShrieker(h.session, x, y, z)
 		h.srv.StepPressurePlateAt(h.session.Dimension(), bx, by, bz)
+		h.srv.OnEntityStepTripwire(h.session.Dimension(), bx, by, bz)
+		h.srv.ApplyCampfireContactDamageToPlayer(h.session)
 		h.srv.HandlePlayerInsideCauldron(h.session, bx, by, bz, false)
 		res, err := h.srv.CheckPlayerPortal(h.session)
 		if err != nil {
@@ -580,6 +582,10 @@ func (h *handler) serverTickLoop() {
 				h.srv.DespawnHostileMobs()
 			}
 			h.srv.TickBrewingStands()
+			h.srv.TickHoppers()
+			h.srv.TickCrafters()
+			h.srv.TickCampfires()
+			h.srv.TickAllPlayersCampfireContactDamage()
 			h.srv.TickWorldBorder()
 			h.srv.TickJukeboxes()
 			h.srv.TickBeacons()
@@ -1155,6 +1161,30 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		return nil
 
 	case protocol.PlayContainerSlotStateChanged:
+		if h.srv != nil && h.session != nil {
+			r := pkt.Body()
+			slotID, err := r.VarInt()
+			if err != nil {
+				return err
+			}
+			containerID, err := r.VarInt()
+			if err != nil {
+				return err
+			}
+			newState, err := r.Bool()
+			if err != nil {
+				return err
+			}
+			if open := h.session.OpenContainer(); open != nil && open.MenuType == server.CrafterMenuType && open.ContainerID == containerID {
+				dim := h.session.Dimension()
+				if dim == "" {
+					dim = world.DimensionOverworld
+				}
+				if h.srv.SetCrafterSlotDisabled(dim, open.BlockX, open.BlockY, open.BlockZ, int(slotID), !newState) {
+					h.srv.SyncCrafterViewers(h.session, open.BlockX, open.BlockY, open.BlockZ)
+				}
+			}
+		}
 		return nil
 
 	case protocol.PlayChangeDifficultySB:
@@ -1459,6 +1489,16 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		}
 		if cache := h.srv.PlayerChunks(h.session); cache != nil {
 			clickedState := cache.GetBlock(x, y, z)
+			if server.IsChiseledBookshelfBlock(clickedState) && !h.session.IsSneaking() {
+				invSlot := h.session.HeldInventorySlot()
+				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+				}
+				if handled, _ := h.srv.InteractChiseledBookshelf(h.session, h.session.Dimension(), x, y, z, server.BlockFaceDirectionName(face), float64(cursorX), float64(cursorY), float64(cursorZ)); handled {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
 			if server.IsLecternBlock(clickedState) {
 				if h.srv.InteractWithLectern(h.session, hand, x, y, z) {
 					h.syncHotbarFromSession()
@@ -1688,12 +1728,22 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			}
 			cache := h.srv.PlayerChunks(h.session)
 			if cache != nil {
-				if server.IsDispenserOrDropperBlock(state) && h.srv != nil {
-					state = h.srv.ResolveDispenserOrDropperPlacementState(h.session, state)
+				if h.srv != nil {
+					state = h.srv.ResolvePlacedBlockState(h.session, state, face)
 				}
 				placed := false
 				if server.IsBedBlock(state) && h.srv != nil {
 					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)
+				} else if server.IsDecoratedPotBlock(state) && h.srv != nil {
+					sherds := h.srv.LastCraftedDecoratedPotSherds()
+					if h.session != nil {
+						if sh, hasSlotSherds := server.GetSlotDecoratedPotSherds(h.srv, h.session, h.session.HeldInventorySlot()); hasSlotSherds {
+							sherds = sh
+						}
+					}
+					if dp, _ := h.srv.PlaceDecoratedPotAt(dim, px, py, pz, server.DecoratedPotFacing(state), sherds); dp != nil {
+						placed = true
+					}
 				} else if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {
 					h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
 					placed = true
@@ -1706,6 +1756,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					if blockName == "minecraft:fire" || blockName == "minecraft:soul_fire" {
 						_, _ = h.srv.LightPortalAt(dim, px, py, pz)
+					}
+					if server.IsCampfireBlock(state) && h.srv != nil {
+						h.srv.UpdateCampfireSignalFire(dim, px, py, pz)
+					}
+					if blockName == "minecraft:hay_block" && h.srv != nil {
+						h.srv.UpdateCampfireSignalFire(dim, px, py+1, pz)
 					}
 					if server.IsSignBlock(state) && h.srv != nil && h.session != nil {
 						h.srv.OnSignPlaced(h.session, px, py, pz, true)

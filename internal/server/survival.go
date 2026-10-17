@@ -342,6 +342,65 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 
+	var heldStack world.ItemStack
+	var toolMeta ItemMeta
+	heldSlot := -1
+	if session != nil {
+		heldSlot = session.HeldInventorySlot()
+		if heldSlot >= 0 {
+			heldStack = session.InventorySlot(heldSlot)
+			toolMeta = GetSlotItemMeta(session, heldSlot)
+		}
+	}
+
+	if world.BlockName(prevState) == "minecraft:tripwire" {
+		if mode == GameModeSurvival && s.DoTileDrops() {
+			s.BreakTripwireBlock(dim, x, y, z, heldStack.ResolvedID())
+		} else {
+			withShears := canonicalResourceName(heldStack.ResolvedID()) == "minecraft:shears"
+			twRes := cache.BreakTripwireAt(x, y, z, withShears)
+			s.broadcastDimensionBlockChanges(dim, cache, twRes.Changes, twRes.LightChanged)
+		}
+		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+		s.OnSculkBlockBroken(dim, x, y, z, prevState)
+		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:tripwire")
+		if mode == GameModeSurvival {
+			s.RecordBlockBreakExhaustion(session)
+			s.RecordBlockMined(session, "minecraft:tripwire")
+			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
+				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
+			}
+		}
+		return true, 0
+	}
+
+	if IsDecoratedPotBlock(prevState) {
+		shatter := mode == GameModeSurvival && ShouldToolShatterDecoratedPot(heldStack, toolMeta)
+		s.BreakDecoratedPotAt(dim, x, y, z, shatter, mode == GameModeSurvival)
+		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+		s.OnSculkBlockBroken(dim, x, y, z, prevState)
+		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:decorated_pot")
+		if mode == GameModeSurvival {
+			s.RecordBlockBreakExhaustion(session)
+			s.RecordBlockMined(session, "minecraft:decorated_pot")
+			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
+				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
+				if s.DamagePlayerItem(session, heldSlot, 1) {
+					s.RecordItemBroken(session, heldStack.ResolvedID())
+				}
+			}
+		}
+		return true, 0
+	}
+
+	if IsCampfireBlock(prevState) {
+		if mode == GameModeSurvival && s.DoTileDrops() {
+			s.BreakCampfireAt(dim, x, y, z, HasSilkTouch(toolMeta))
+		} else {
+			s.dropAndRemoveCampfireEntity(dim, x, y, z)
+		}
+	}
+
 	broken, upd := cache.BreakBlockWithUpdates(x, y, z)
 	if !broken {
 		return false, 0
@@ -352,6 +411,9 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
 	s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+	if y+1 < world.MinY+world.WorldHeight && IsCampfireBlock(cache.GetBlock(x, y+1, z)) {
+		s.UpdateCampfireSignalFire(dim, x, y+1, z)
+	}
 	if IsBedBlock(prevState) {
 		s.BreakBedPartner(dim, cache, x, y, z, prevState)
 	}
@@ -360,6 +422,27 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 	if IsDispenserOrDropperBlock(prevState) {
 		s.BreakDispenserOrDropper(dim, x, y, z)
+	}
+	if IsHopperBlock(prevState) {
+		s.BreakHopperAndDropItems(dim, x, y, z)
+	}
+	if IsCrafterBlock(prevState) {
+		if drops, _, ok := s.RemoveCrafterAt(dim, x, y, z); ok {
+			for _, d := range drops {
+				if !d.IsEmpty() && d.Count > 0 {
+					_, _ = s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, d)
+				}
+			}
+		}
+	}
+	if IsChiseledBookshelfBlock(prevState) {
+		if drops, _, ok := s.RemoveChiseledBookshelfAt(dim, x, y, z); ok {
+			for _, d := range drops {
+				if !d.IsEmpty() && d.Count > 0 {
+					_, _ = s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, d)
+				}
+			}
+		}
 	}
 	if IsShulkerBoxItemOrBlock(world.BlockName(prevState)) {
 		s.BreakShulkerBox(dim, x, y, z)
@@ -407,12 +490,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if mode == GameModeSurvival {
 		s.RecordBlockBreakExhaustion(session)
 		s.RecordBlockMined(session, world.BlockName(prevState))
-		var toolMeta ItemMeta
-		var heldStack world.ItemStack
-		heldSlot := session.HeldInventorySlot()
 		if session != nil && heldSlot >= 0 {
-			heldStack = session.InventorySlot(heldSlot)
-			toolMeta = GetSlotItemMeta(session, heldSlot)
 			if !heldStack.IsEmpty() {
 				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
 			}
@@ -423,6 +501,19 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			}
 		}
 		if !s.DoTileDrops() {
+			return true, 0
+		}
+		if IsCampfireBlock(prevState) {
+			return true, 0
+		}
+		if IsChiseledBookshelfBlock(prevState) {
+			if HasSilkTouch(toolMeta) {
+				bsDrop := world.NewNamedItemStack("minecraft:chiseled_bookshelf", 1)
+				if !bsDrop.IsEmpty() {
+					dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, bsDrop)
+					return true, dropID
+				}
+			}
 			return true, 0
 		}
 		if hasBannerDrop && !bannerDrop.IsEmpty() {
@@ -1620,6 +1711,101 @@ func (s *Server) ResolveDispenserOrDropperPlacementState(session *PlayerSession,
 	return baseState
 }
 
+// BlockFaceDirectionName converts a protocol Face index (0..5: DOWN, UP, NORTH,
+// SOUTH, WEST, EAST) into its lowercase direction name.
+func BlockFaceDirectionName(face int32) string {
+	switch face {
+	case 0:
+		return "down"
+	case 1:
+		return "up"
+	case 2:
+		return "north"
+	case 3:
+		return "south"
+	case 4:
+		return "west"
+	case 5:
+		return "east"
+	default:
+		return "up"
+	}
+}
+
+// ResolvePlacedBlockState resolves orientation/facing properties for directional
+// blocks placed by a player.
+func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint16, clickedFace int32) uint16 {
+	if IsDispenserOrDropperBlock(baseState) {
+		return s.ResolveDispenserOrDropperPlacementState(session, baseState)
+	}
+	var yaw, pitch float32
+	if session != nil {
+		snap := session.Snapshot()
+		yaw, pitch = snap.Yaw, snap.Pitch
+	}
+	oppLookDir := DispenserPlacementFacing(yaw, pitch)
+	lookDir := oppositeDropperDirection(oppLookDir)
+	oppHorizFacing := DispenserPlacementFacing(yaw, 0)
+	horizLookDir := oppositeDropperDirection(oppHorizFacing)
+	faceName := BlockFaceDirectionName(clickedFace)
+
+	if IsCrafterBlock(baseState) {
+		orient := CrafterOrientationForPlacement(lookDir, horizLookDir)
+		if st := CrafterBlockState(orient, false, false); st != 0 {
+			return st
+		}
+		return baseState
+	}
+	if IsHopperBlock(baseState) {
+		if st := HopperBlockState(HopperPlacementFacing(faceName), true); st != 0 {
+			return st
+		}
+		return baseState
+	}
+	if IsChiseledBookshelfBlock(baseState) {
+		if st := ChiseledBookshelfBlockState(oppHorizFacing, [ChiseledBookshelfSlotCount]bool{}); st != 0 {
+			return st
+		}
+		return baseState
+	}
+	if IsDecoratedPotBlock(baseState) {
+		if st := DecoratedPotBlockState(oppHorizFacing, false, false); st != 0 {
+			return st
+		}
+		return baseState
+	}
+	if IsCampfireBlock(baseState) {
+		if st, ok := world.WithBlockProperty(baseState, "facing", oppHorizFacing); ok {
+			return st
+		}
+		return baseState
+	}
+	switch world.BlockName(baseState) {
+	case "minecraft:observer":
+		if st, ok := world.WithBlockProperty(baseState, "facing", world.ObserverFacingForPlacement(lookDir)); ok {
+			return st
+		}
+	case "minecraft:piston", "minecraft:sticky_piston":
+		if st, ok := world.WithBlockProperty(baseState, "facing", oppLookDir); ok {
+			return st
+		}
+	case "minecraft:lightning_rod":
+		if st, ok := world.WithBlockProperty(baseState, "facing", faceName); ok {
+			return st
+		}
+	case "minecraft:tripwire_hook":
+		hookFacing := oppHorizFacing
+		switch faceName {
+		case "north", "south", "west", "east":
+			hookFacing = faceName
+		}
+		if st, ok := world.WithBlockProperty(baseState, "facing", hookFacing); ok {
+			return st
+		}
+	}
+	return baseState
+}
+
 // BreakDispenserOrDropper drops all stored items from a broken dispenser or
 // dropper at (dim, x, y, z), removes its block entity state, and updates comparators.
 func (s *Server) BreakDispenserOrDropper(dim string, x, y, z int) {
@@ -1721,4 +1907,21 @@ func (s *Server) TickDispenserProjectiles() int {
 	}
 	ds.mu.Unlock()
 	return ticked
+}
+
+// TickAllPlayersCampfireContactDamage applies lit campfire contact damage to all
+// connected players standing on a lit campfire block.
+func (s *Server) TickAllPlayersCampfireContactDamage() {
+	if s == nil {
+		return
+	}
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, sess := range s.players {
+		sessions = append(sessions, sess)
+	}
+	s.playersMu.RUnlock()
+	for _, sess := range sessions {
+		s.ApplyCampfireContactDamageToPlayer(sess)
+	}
 }

@@ -256,7 +256,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		chunks.SetPressurePlateEntityCounter(func(x, y, z int) int {
 			return s.CountEntitiesAtBlock(world.DimensionOverworld, x, y, z)
 		})
-		s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+		s.BindPistonAndRedstoneHooks(world.DimensionOverworld)
 	}
 	if entities != nil {
 		entities.SetStepCallback(func(dim string, x, y, z int) {
@@ -303,6 +303,10 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadWardenFile()
 		_ = s.LoadVehiclesFile()
 		_ = s.LoadDispensers()
+		_ = s.LoadHoppers()
+		_ = s.LoadCrafters()
+		_ = s.LoadChiseledBookshelves()
+		_ = s.LoadDecoratedPots()
 		_ = s.LoadPortalsFile()
 	}
 	return s
@@ -460,6 +464,21 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveDispensers(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveHoppers(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveCrafters(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveChiseledBookshelves(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveDecoratedPots(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveCampfires(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SavePortalsFile(); err != nil && firstErr == nil {

@@ -173,6 +173,11 @@ func ItemIDToName(itemID int32) string {
 	return fmt.Sprintf("minecraft:item_%d", itemID)
 }
 
+// ItemNameByID is an alias for ItemIDToName.
+func ItemNameByID(itemID int32) string {
+	return ItemIDToName(itemID)
+}
+
 // ItemNameToID resolves an item resource location string to its network item ID.
 func ItemNameToID(name string) (int32, bool) {
 	name = normalizeItemName(name)

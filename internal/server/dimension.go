@@ -94,8 +94,8 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 	}
 	ds := s.dimState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
 	if c, ok := ds.caches[norm]; ok && c != nil {
+		ds.mu.Unlock()
 		return c
 	}
 
@@ -112,6 +112,7 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 		if s.chunks != nil {
 			s.chunks.SetDimensionType(world.OverworldDimensionType)
 			ds.caches[world.DimensionOverworld] = s.chunks
+			ds.mu.Unlock()
 			return s.chunks
 		}
 		gen = world.NewVanillaGenerator(s.cfg.WorldSeed)
@@ -130,6 +131,8 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 		return s.CountEntitiesAtBlock(norm, x, y, z)
 	})
 	ds.caches[norm] = cache
+	ds.mu.Unlock()
+	s.BindPistonAndRedstoneHooks(norm)
 	return cache
 }
 
