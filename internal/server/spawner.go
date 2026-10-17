@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"regionio/internal/protocol"
-	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -190,17 +189,29 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		mem := t.mobStateFor(snapshot.ID, aiTick)
 		if !mem.healthInit {
 			mem.healthInit = true
-			mem.health = MobMaxHealth(snapshot.TypeName)
+			mem.health = ResolveMobMaxHealth(snapshot.TypeName)
+			mem.lastHealth = mem.health
+		} else if mem.health < mem.lastHealth {
+			mem.lastHealth = mem.health
+			if snapshot.TypeName == MobTypeSpider {
+				mem.provoked = true
+			} else if IsPassiveAnimal(snapshot.TypeName) {
+				mem.panicTicks = AnimalPanicDurationTicks
+			}
 		}
 		if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
 			if mem.attackCooldown > 0 {
 				mem.attackCooldown--
 			}
+			minFallVel := int16(-3000)
+			if snapshot.TypeName == MobTypeChicken {
+				minFallVel = ChickenMaxFallVelocity
+			}
 			s.entities.Update(snapshot.ID, func(e *world.Entity) {
 				e.OnGround = false
 				e.VelocityY -= 80
-				if e.VelocityY < -3000 {
-					e.VelocityY = -3000
+				if e.VelocityY < minFallVel {
+					e.VelocityY = minFallVel
 				}
 				e.Y += float64(e.VelocityY) / 8000.0
 			})
@@ -214,37 +225,57 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			nextZ        = snapshot.Z
 			nextYaw      = snapshot.Yaw
 			attackTarget *PlayerSession
+			shootTarget  *PlayerSession
+			attackDmg    = ZombieAttackDamage
+			swellChanged bool
+			swellDir     int8
+			exploded     bool
+			leaped       bool
 		)
-		if IsHostileMob(snapshot.TypeName) {
+		switch snapshot.TypeName {
+		case MobTypeZombie:
 			nextX, nextY, nextZ, nextYaw, attackTarget = stepHostileZombieAI(
-				s.chunks,
-				rng,
-				mem,
-				t.playerTargets,
-				snapshot.X,
-				feetY,
-				snapshot.Z,
-				snapshot.Yaw,
+				s.chunks, rng, mem, t.playerTargets,
+				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 			)
-		} else {
-			if mem.repathCooldown > 0 {
-				mem.repathCooldown--
-			}
-			nextX, nextY, nextZ, nextYaw = stepWanderAI(
-				s.chunks,
-				rng,
-				mem,
-				snapshot.X,
-				feetY,
-				snapshot.Z,
-				snapshot.Yaw,
-				passiveMobWanderSpeed(snapshot.TypeName),
+			attackDmg = ZombieAttackDamage
+		case MobTypeSkeleton:
+			nextX, nextY, nextZ, nextYaw, shootTarget = stepHostileSkeletonAI(
+				s.chunks, rng, mem, t.playerTargets,
+				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+			)
+		case MobTypeCreeper:
+			nextX, nextY, nextZ, nextYaw, swellChanged, exploded = stepHostileCreeperAI(
+				s.chunks, rng, mem, t.playerTargets,
+				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+			)
+			swellDir = mem.creeperSwellDir
+		case MobTypeSpider:
+			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderAI(
+				s.chunks, rng, mem, t.playerTargets,
+				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+			)
+			attackDmg = SpiderAttackDamage
+		default:
+			nextX, nextY, nextZ, nextYaw = s.stepPassiveAnimalAI(
+				snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
+				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 			)
 		}
 
+		if exploded {
+			delete(t.mobStates, snapshot.ID)
+			s.TriggerCreeperExplosion(snapshot.ID, nextX, nextY, nextZ)
+			continue
+		}
+
 		s.entities.Update(snapshot.ID, func(e *world.Entity) {
-			e.OnGround = true
-			e.VelocityY = 0
+			e.OnGround = !leaped
+			if leaped {
+				e.VelocityY = 2400
+			} else {
+				e.VelocityY = 0
+			}
 			e.X = nextX
 			e.Y = nextY
 			e.Z = nextZ
@@ -252,8 +283,22 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			e.HeadYaw = nextYaw
 		})
 
+		if swellChanged {
+			cx := int32(int64(math.Floor(nextX)) >> 4)
+			cz := int32(int64(math.Floor(nextZ)) >> 4)
+			s.BroadcastChunk(cx, cz, PlaySetEntityDataCB,
+				EncodeCreeperSwellDataPacket(snapshot.ID, int32(swellDir), swellDir > 0))
+			if swellDir > 0 {
+				s.BroadcastChunk(cx, cz, PlaySoundPacketID,
+					EncodeSoundPacket("minecraft:entity.creeper.primed", SoundSourceHostile, nextX, nextY, nextZ, 1.0, 0.5, 0))
+			}
+		}
+
+		if shootTarget != nil && !shootTarget.IsDead() {
+			s.ShootSkeletonArrowAtPlayer(snapshot.ID, nextX, nextY, nextZ, shootTarget)
+		}
 		if attackTarget != nil && !attackTarget.IsDead() {
-			s.AttackPlayerFromMob(snapshot.ID, snapshot.TypeName, nextX, nextZ, attackTarget, ZombieAttackDamage)
+			s.AttackPlayerFromMob(snapshot.ID, snapshot.TypeName, nextX, nextZ, attackTarget, attackDmg)
 		}
 	}
 
@@ -535,12 +580,6 @@ func (s *Server) mobSpawnLoop(ctx context.Context) {
 	defer ticker.Stop()
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	pigType := registry.EntityTypeIndex("minecraft:pig")
-	zombieType := registry.EntityTypeIndex("minecraft:zombie")
-	if pigType < 0 || zombieType < 0 {
-		return
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -549,7 +588,7 @@ func (s *Server) mobSpawnLoop(ctx context.Context) {
 			if s.PlayerCount() == 0 || s.entities.Count() >= 20 {
 				continue
 			}
-			s.spawnMobNearPlayer(rng, pigType, zombieType)
+			s.spawnRandomMobNearPlayer(rng)
 		}
 	}
 }
@@ -693,6 +732,40 @@ func (s *Server) spawnMobNearPlayer(rng *rand.Rand, pigType, zombieType int) boo
 			Z:        float64(z) + 0.5,
 			OnGround: true,
 		})
+		return true
+	}
+	return false
+}
+
+func (s *Server) spawnRandomMobNearPlayer(rng *rand.Rand) bool {
+	players := s.PlayerSnapshots()
+	if len(players) == 0 {
+		return false
+	}
+	player := players[rng.Intn(len(players))]
+	passiveTypes := AllPassiveAnimalTypes()
+	hostileTypes := AllHostileMobTypes()
+	for attempt := 0; attempt < 8; attempt++ {
+		angle := rng.Float64() * 2 * math.Pi
+		distance := 16.0 + rng.Float64()*16.0
+		x := int(math.Floor(player.X + math.Cos(angle)*distance))
+		z := int(math.Floor(player.Z + math.Sin(angle)*distance))
+		y, canPassive, canHostile := s.resolveSpawnColumn(x, z)
+		if !canPassive && !canHostile {
+			continue
+		}
+
+		spawnHostile := canHostile && (!canPassive || rng.Float32() < 0.5)
+		var typeName string
+		if spawnHostile {
+			typeName = hostileTypes[rng.Intn(len(hostileTypes))]
+		} else {
+			typeName = passiveTypes[rng.Intn(len(passiveTypes))]
+		}
+
+		if _, err := s.SpawnMob(float64(x)+0.5, float64(y), float64(z)+0.5, typeName); err != nil {
+			continue
+		}
 		return true
 	}
 	return false

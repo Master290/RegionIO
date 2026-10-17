@@ -56,18 +56,29 @@ type PathNode struct {
 }
 
 type mobMemory struct {
-	state          mobBehaviorState
-	stateTicks     int
-	goalX          float64
-	goalY          float64
-	goalZ          float64
-	waypoints      []PathNode
-	waypointIdx    int
-	repathCooldown int
-	attackCooldown int
-	seenTick       uint64
-	healthInit     bool
-	health         float32
+	state           mobBehaviorState
+	stateTicks      int
+	goalX           float64
+	goalY           float64
+	goalZ           float64
+	waypoints       []PathNode
+	waypointIdx     int
+	repathCooldown  int
+	attackCooldown  int
+	leapCooldown    int
+	creeperFuseTicks int
+	creeperSwellDir int8
+	provoked        bool
+	panicTicks      int
+	inLoveTicks     int
+	breedCooldown   int
+	eggTimer        int
+	sheared         bool
+	woolRegrowTimer int
+	seenTick        uint64
+	healthInit      bool
+	health          float32
+	lastHealth      float32
 }
 
 type playerTarget struct {
@@ -79,14 +90,24 @@ type playerTarget struct {
 }
 
 // IsHostileMob reports whether typeName is a hostile mob that chases and
-// attacks players.
+// attacks (or explodes near) players.
 func IsHostileMob(typeName string) bool {
-	return typeName == MobTypeZombie
+	switch typeName {
+	case MobTypeZombie, MobTypeSkeleton, MobTypeCreeper, MobTypeSpider:
+		return true
+	default:
+		return false
+	}
 }
 
-// IsPassiveMob reports whether typeName is a passive wandering mob.
+// IsPassiveMob reports whether typeName is a passive wandering mob or animal.
 func IsPassiveMob(typeName string) bool {
-	return typeName == MobTypePig || typeName == MobTypeVillager
+	switch typeName {
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeVillager:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) appendPlayerTargets(dst []playerTarget) []playerTarget {
