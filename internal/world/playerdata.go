@@ -229,8 +229,9 @@ type PlayerData struct {
 	SlotPotions       *nbt.List
 	SlotMaps          *nbt.List
 	SlotArmorTrims    *nbt.List
-	SlotFireworks     *nbt.List
-	SlotFireworkStars *nbt.List
+	SlotFireworks      *nbt.List
+	SlotFireworkStars  *nbt.List
+	WardenSpawnTracker *nbt.Compound
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -444,6 +445,9 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	if d.SlotFireworkStars != nil && len(d.SlotFireworkStars.Elems) > 0 {
 		root.Set("SlotFireworkStars", *d.SlotFireworkStars)
+	}
+	if d.WardenSpawnTracker != nil {
+		root.Set("warden_spawn_tracker", d.WardenSpawnTracker)
 	}
 
 	return root
@@ -789,6 +793,9 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 			ElemID: nbt.TagCompound,
 			Elems:  invStarElems,
 		}
+	}
+	if wst, ok := nbtGetCompound(root, "warden_spawn_tracker"); ok && wst != nil {
+		d.WardenSpawnTracker = wst
 	}
 
 	return d, nil

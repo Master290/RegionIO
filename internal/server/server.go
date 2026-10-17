@@ -296,6 +296,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadBeacons()
 		_ = s.LoadConduits()
 		_ = s.LoadBrewingStands()
+		_ = s.LoadSculk()
 	}
 	return s
 }
@@ -355,6 +356,19 @@ func (s *Server) StepPressurePlateAt(dim string, x, y, z int) {
 	count := s.CountEntitiesAtBlock(dim, x, y, z)
 	if changed, res := cache.StepOnPressurePlate(x, y, z, count); changed && len(res.Changes) > 0 {
 		s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+		newState := cache.GetBlock(x, y, z)
+		evType := GameEventBlockDeactivate
+		if IsBlockActivatedState(newState) {
+			evType = GameEventBlockActivate
+		}
+		s.EmitVibration(VibrationEvent{
+			Dimension:     dim,
+			Type:          evType,
+			X:             float64(x) + 0.5,
+			Y:             float64(y),
+			Z:             float64(z) + 0.5,
+			BlockOrItemID: world.BlockName(newState),
+		})
 	}
 }
 
@@ -427,6 +441,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveBrewingStands(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveSculk(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {
@@ -678,8 +695,12 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	if d.SlotPotions != nil && len(d.SlotPotions.Elems) > 0 {
 		effRoot.Set("SlotPotions", *d.SlotPotions)
 	}
+	if d.WardenSpawnTracker != nil {
+		effRoot.Set("warden_spawn_tracker", d.WardenSpawnTracker)
+	}
 	LoadEffectsFromPlayerCompound(session, effRoot)
 	LoadPotionMetaFromPlayerCompound(session, effRoot)
+	LoadSculkTrackerFromPlayerCompound(session, effRoot)
 	if d.SlotMaps != nil {
 		for _, elem := range d.SlotMaps.Elems {
 			comp, ok := elem.(*nbt.Compound)
@@ -881,6 +902,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	SaveRecipeBookToPlayerCompound(session, metaRoot)
 	SaveEffectsToPlayerCompound(session, metaRoot)
 	SavePotionMetaToPlayerCompound(session, metaRoot)
+	SaveSculkTrackerToPlayerCompound(session, metaRoot)
 	var advComp *nbt.Compound
 	if tag, ok := metaRoot.Get("Advancements"); ok {
 		advComp, _ = tag.(*nbt.Compound)
@@ -888,6 +910,10 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	var rbComp *nbt.Compound
 	if tag, ok := metaRoot.Get("recipeBook"); ok {
 		rbComp, _ = tag.(*nbt.Compound)
+	}
+	var wstComp *nbt.Compound
+	if tag, ok := metaRoot.Get("warden_spawn_tracker"); ok {
+		wstComp, _ = tag.(*nbt.Compound)
 	}
 	var effList *nbt.List
 	if tag, ok := metaRoot.Get("active_effects"); ok {
@@ -992,40 +1018,41 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
-		Dimension:         dim,
-		Pos:               session.position,
-		Yaw:               session.yaw,
-		Pitch:             session.pitch,
-		OnGround:          session.onGround,
-		GameMode:          session.gameMode,
-		Health:            session.health,
-		FoodLevel:         session.foodLevel,
-		FoodSaturation:    session.foodSaturation,
-		FoodExhaustion:    exhaustion,
-		FoodTickTimer:     tickTimer,
-		XpLevel:           xpLevel,
-		XpTotal:           xpTotal,
-		XpP:               xpP,
-		XpSeed:            xpSeed,
-		SelectedSlot:      session.selectedSlot,
-		Inventory:         session.inventory,
-		SpawnX:            session.spawnX,
-		SpawnY:            session.spawnY,
-		SpawnZ:            session.spawnZ,
-		SpawnYaw:          session.spawnYaw,
-		SpawnPitch:        session.spawnPitch,
-		SpawnForced:       session.spawnForced,
-		SpawnDimension:    session.spawnDimension,
-		HasSpawn:          session.hasSpawn,
-		Advancements:      advComp,
-		RecipeBook:        rbComp,
-		ActiveEffects:     effList,
-		AbsorptionAmount:  absAmount,
-		SlotPotions:       slotPotions,
-		SlotMaps:          slotMaps,
-		SlotArmorTrims:    slotArmorTrims,
-		SlotFireworks:     slotFireworks,
-		SlotFireworkStars: slotFireworkStars,
+		Dimension:          dim,
+		Pos:                session.position,
+		Yaw:                session.yaw,
+		Pitch:              session.pitch,
+		OnGround:           session.onGround,
+		GameMode:           session.gameMode,
+		Health:             session.health,
+		FoodLevel:          session.foodLevel,
+		FoodSaturation:     session.foodSaturation,
+		FoodExhaustion:     exhaustion,
+		FoodTickTimer:      tickTimer,
+		XpLevel:            xpLevel,
+		XpTotal:            xpTotal,
+		XpP:                xpP,
+		XpSeed:             xpSeed,
+		SelectedSlot:       session.selectedSlot,
+		Inventory:          session.inventory,
+		SpawnX:             session.spawnX,
+		SpawnY:             session.spawnY,
+		SpawnZ:             session.spawnZ,
+		SpawnYaw:           session.spawnYaw,
+		SpawnPitch:         session.spawnPitch,
+		SpawnForced:        session.spawnForced,
+		SpawnDimension:     session.spawnDimension,
+		HasSpawn:           session.hasSpawn,
+		Advancements:       advComp,
+		RecipeBook:         rbComp,
+		ActiveEffects:      effList,
+		AbsorptionAmount:   absAmount,
+		SlotPotions:        slotPotions,
+		SlotMaps:           slotMaps,
+		SlotArmorTrims:     slotArmorTrims,
+		SlotFireworks:      slotFireworks,
+		SlotFireworkStars:  slotFireworkStars,
+		WardenSpawnTracker: wstComp,
 	}
 }
 
@@ -1834,4 +1861,174 @@ func (s *Server) RecordCauldronInteractionStat(session *PlayerSession, prevItem 
 		}
 	}
 }
+
+// TickSculk advances all tracked sculk sensors, calibrated sculk sensors,
+// sculk shriekers, sculk catalysts, and player Warden warning trackers by 1 tick.
+func (s *Server) TickSculk(_ ...int64) {
+	if s == nil {
+		return
+	}
+	s.TickAllSculk()
+}
+
+// OnSculkBlockPlaced registers or updates sculk block state and adjacent comparators
+// when a sculk sensor, calibrated sculk sensor, sculk shrieker, or sculk catalyst is placed.
+func (s *Server) OnSculkBlockPlaced(dim string, x, y, z int, state uint16) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	if IsSculkSensorBlock(state) {
+		phase, power, _, calibrated, _, _ := ParseSculkSensorState(state)
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		key := makeBrewingKey(normDim, x, y, z)
+		st.sensors[key] = &SculkSensorBlockEntity{
+			Dimension:  normDim,
+			X:          x,
+			Y:          y,
+			Z:          z,
+			Calibrated: calibrated,
+			Phase:      phase,
+			Power:      power,
+		}
+		st.mu.Unlock()
+		if cache := s.DimensionChunks(normDim); cache != nil {
+			res := cache.UpdateComparatorsAround(x, y, z)
+			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+			}
+		}
+		_ = s.SaveSculk()
+	}
+}
+
+// OnSculkBlockBroken cleans up sculk block entity state and updates adjacent comparators
+// when a sculk sensor, calibrated sculk sensor, sculk shrieker, or sculk catalyst is broken.
+func (s *Server) OnSculkBlockBroken(dim string, x, y, z int, oldState uint16) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	key := makeBrewingKey(normDim, x, y, z)
+	switch {
+	case IsSculkSensorBlock(oldState):
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		delete(st.sensors, key)
+		st.mu.Unlock()
+		if cache := s.DimensionChunks(normDim); cache != nil {
+			res := cache.UpdateComparatorsAround(x, y, z)
+			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+			}
+		}
+		_ = s.SaveSculk()
+	case IsSculkShriekerBlock(oldState):
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		delete(st.shriekers, key)
+		st.mu.Unlock()
+		_ = s.SaveSculk()
+	case IsSculkCatalystBlock(oldState):
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		delete(st.catalysts, key)
+		st.mu.Unlock()
+		_ = s.SaveSculk()
+	}
+}
+
+// EmitPlayerBlockVibration dispatches a block-related vibration (e.g., GameEventBlockPlace,
+// GameEventBlockDestroy, GameEventBlockActivate, GameEventBlockDeactivate) caused by session.
+func (s *Server) EmitPlayerBlockVibration(session *PlayerSession, event, dim string, x, y, z int, blockOrItemID string) int {
+	if s == nil {
+		return 0
+	}
+	var sneaking bool
+	if session != nil {
+		sneaking = session.IsSneaking()
+		if dim == "" {
+			dim = session.Dimension()
+		}
+	}
+	return s.EmitVibration(VibrationEvent{
+		Dimension:     world.NormalizeDimension(dim),
+		Type:          event,
+		X:             float64(x) + 0.5,
+		Y:             float64(y) + 0.5,
+		Z:             float64(z) + 0.5,
+		Player:        session,
+		Sneaking:      sneaking,
+		BlockOrItemID: blockOrItemID,
+	})
+}
+
+// EmitPlayerMovementVibration dispatches a movement vibration (GameEventStep,
+// GameEventHitGround, GameEventSwim) for session at (x, y, z), respecting sneaking dampening.
+func (s *Server) EmitPlayerMovementVibration(session *PlayerSession, event string, x, y, z float64) int {
+	if s == nil || session == nil {
+		return 0
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
+		return 0
+	}
+	return s.EmitVibration(VibrationEvent{
+		Dimension: world.NormalizeDimension(snap.Dimension),
+		Type:      event,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		Player:    session,
+		Sneaking:  session.IsSneaking(),
+	})
+}
+
+// HandlePlayerStepOnSculkShrieker triggers any sculk_shrieker block directly at or
+// beneath the player's feet at (x, y, z).
+func (s *Server) HandlePlayerStepOnSculkShrieker(session *PlayerSession, x, y, z float64) bool {
+	if s == nil || session == nil || session.IsSneaking() {
+		return false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
+		return false
+	}
+	cache := s.DimensionChunks(world.NormalizeDimension(snap.Dimension))
+	if cache == nil {
+		return false
+	}
+	bx := int(math.Floor(x))
+	by := int(math.Floor(y))
+	bz := int(math.Floor(z))
+	if IsSculkShriekerBlock(cache.GetBlock(bx, by, bz)) {
+		return s.StepOnSculkShrieker(session, bx, by, bz)
+	}
+	if by > world.MinY && IsSculkShriekerBlock(cache.GetBlock(bx, by-1, bz)) {
+		return s.StepOnSculkShrieker(session, bx, by-1, bz)
+	}
+	return false
+}
+
+// IsBlockActivatedState reports whether a redstone-interactive block state (door,
+// trapdoor, fence gate, button, lever, or pressure plate) is in its open/powered state.
+func IsBlockActivatedState(state uint16) bool {
+	_, props, ok := world.BlockStateProperties(state)
+	if !ok {
+		return false
+	}
+	if props["open"] == "true" || props["powered"] == "true" {
+		return true
+	}
+	if p, ok := props["power"]; ok && p != "" && p != "0" {
+		return true
+	}
+	return false
+}
+
 

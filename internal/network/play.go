@@ -383,6 +383,21 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 		h.srv.TryPickupItems(h.session)
 		h.srv.PickupNearbyExperienceOrbs(h.session)
 		bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
+		if !prev.OnGround && onGround {
+			h.srv.EmitPlayerMovementVibration(h.session, server.GameEventHitGround, x, y, z)
+		}
+		if (x-prev.X)*(x-prev.X)+(z-prev.Z)*(z-prev.Z) > 1e-4 {
+			inWater := false
+			if cache := h.srv.PlayerChunks(h.session); cache != nil {
+				inWater = cache.GetBlock(bx, by, bz) == world.StateWater
+			}
+			if inWater {
+				h.srv.EmitPlayerMovementVibration(h.session, server.GameEventSwim, x, y, z)
+			} else if onGround {
+				h.srv.EmitPlayerMovementVibration(h.session, server.GameEventStep, x, y, z)
+			}
+		}
+		h.srv.HandlePlayerStepOnSculkShrieker(h.session, x, y, z)
 		h.srv.StepPressurePlateAt(h.session.Dimension(), bx, by, bz)
 		h.srv.HandlePlayerInsideCauldron(h.session, bx, by, bz, false)
 		res, err := h.srv.CheckPlayerPortal(h.session)
@@ -568,6 +583,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickJukeboxes()
 			h.srv.TickBeacons()
 			h.srv.TickConduits()
+			h.srv.TickAllSculk()
 			h.srv.TickCauldrons(nil)
 			h.srv.TickAllPlayerStats()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
@@ -582,6 +598,7 @@ func (h *handler) serverTickLoop() {
 				h.srv.TickRaids()
 				h.srv.TickWithers(nil)
 				h.srv.TickEnderDragons(nil)
+				h.srv.TickWardens(nil)
 			}
 			lastGameTime = nowGameTime
 		}
@@ -656,6 +673,27 @@ func (h *handler) syncVisibleEntities() error {
 			}
 			if server.IsBossOrBossSupportEntity(entity.TypeName) && h.srv != nil {
 				if metaPkt := h.srv.BossOrSupportEntityDataPacket(entity.ID, entity.TypeName); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+			}
+			if server.IsDecorationEntity(entity.TypeName) && h.srv != nil {
+				if metaPkt := h.srv.DecorationEntityDataPacket(entity.ID); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+				if entity.TypeName == server.EntityTypeArmorStand {
+					if eqPkt := h.srv.ArmorStandEquipmentPacket(entity.ID); len(eqPkt) > 0 {
+						if err := h.conn.Send(protocol.PlaySetEquipment, eqPkt); err != nil {
+							return err
+						}
+					}
+				}
+			}
+			if entity.TypeName == server.MobTypeWarden && h.srv != nil {
+				if metaPkt := h.srv.WardenEntityDataPacket(entity.ID); len(metaPkt) > 0 {
 					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
 						return err
 					}
@@ -753,6 +791,9 @@ func (h *handler) sendPlayerInfoRemove(uuid [16]byte) error {
 
 // sendAddEntity sends the minecraft:add_entity packet.
 func (h *handler) sendAddEntity(e *world.Entity) error {
+	if h.srv != nil && server.IsDecorationEntity(e.TypeName) {
+		return h.conn.Send(protocol.PlayAddEntity, h.srv.EncodeDecorationAddEntityPacket(nil, e))
+	}
 	w := protocol.NewWriter(64)
 	w.VarInt(e.ID)
 	w.UUID(e.UUID)
@@ -1131,21 +1172,29 @@ func (h *handler) handleContainerClose(pkt protocol.Packet) error {
 	if h.srv != nil && h.session != nil {
 		h.srv.CloseLecternIfOpen(h.session)
 		if open := h.session.OpenContainer(); open != nil && open.MenuType == server.MenuTypeCartographyTable {
+			bx, by, bz := open.BlockX, open.BlockY, open.BlockZ
 			if err := h.srv.CloseCartographyContainer(h.session, cid, false); err != nil {
 				return err
 			}
+			h.srv.EmitPlayerBlockVibration(h.session, server.GameEventContainerClose, h.session.Dimension(), bx, by, bz, "")
 		} else if open != nil && open.MenuType == server.MenuTypeLoom {
+			bx, by, bz := open.BlockX, open.BlockY, open.BlockZ
 			if err := h.srv.CloseLoomContainer(h.session, cid, false); err != nil {
 				return err
 			}
+			h.srv.EmitPlayerBlockVibration(h.session, server.GameEventContainerClose, h.session.Dimension(), bx, by, bz, "")
 		} else if open != nil && open.MenuType == server.MenuTypeStonecutter {
+			bx, by, bz := open.BlockX, open.BlockY, open.BlockZ
 			if err := h.srv.CloseStonecutterContainer(h.session, cid, false); err != nil {
 				return err
 			}
+			h.srv.EmitPlayerBlockVibration(h.session, server.GameEventContainerClose, h.session.Dimension(), bx, by, bz, "")
 		} else if open != nil && open.MenuType == server.MenuTypeSmithing {
+			bx, by, bz := open.BlockX, open.BlockY, open.BlockZ
 			if err := h.srv.CloseSmithingContainer(h.session, cid, false); err != nil {
 				return err
 			}
+			h.srv.EmitPlayerBlockVibration(h.session, server.GameEventContainerClose, h.session.Dimension(), bx, by, bz, "")
 		} else if err := h.srv.CloseMerchantContainer(h.session, cid, false); err != nil {
 			return err
 		}
@@ -1442,6 +1491,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		if cache := h.srv.PlayerChunks(h.session); cache != nil {
 			if handled, res := cache.InteractRedstoneBlock(x, y, z); handled {
 				h.broadcastBlockChanges(dim, cache, res)
+				newState := cache.GetBlock(x, y, z)
+				evType := server.GameEventBlockDeactivate
+				if server.IsBlockActivatedState(newState) {
+					evType = server.GameEventBlockActivate
+				}
+				h.srv.EmitPlayerBlockVibration(h.session, evType, dim, x, y, z, world.BlockName(newState))
 				return h.sendBlockChangedAck(seq)
 			}
 			if h.session != nil && !h.session.IsDead() {
@@ -1549,6 +1604,10 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 				if placed {
 					blockName := world.BlockName(state)
+					if h.srv != nil {
+						h.srv.OnSculkBlockPlaced(dim, px, py, pz, state)
+						h.srv.EmitPlayerBlockVibration(h.session, server.GameEventBlockPlace, dim, px, py, pz, blockName)
+					}
 					if blockName == "minecraft:fire" || blockName == "minecraft:soul_fire" {
 						_, _ = h.srv.LightPortalAt(dim, px, py, pz)
 					}

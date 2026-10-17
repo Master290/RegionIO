@@ -383,6 +383,8 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			s.broadcastDimensionBlockChanges(dim, cache, compRes.Changes, compRes.LightChanged)
 		}
 	}
+	s.OnSculkBlockBroken(dim, x, y, z, prevState)
+	s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
 	var bannerDrop world.ItemStack
 	var hasBannerDrop bool
 	if IsBannerBlock(prevState) {

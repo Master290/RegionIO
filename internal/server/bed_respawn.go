@@ -888,6 +888,15 @@ func (s *Server) TriggerRespawnPointExplosion(activator *PlayerSession, dim stri
 
 	s.BroadcastDimensionChunk(dim, chunkX, chunkZ, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:entity.generic.explode", SoundSourceBlocks, cx, cy, cz, 4.0, 0.8, 0))
+	s.DamageDecorationsInRadius(dim, cx, cy, cz, RespawnPointExplosionRadius*2.0, float32(RespawnPointExplosionRadius*7.0), "explosion")
+	s.EmitVibration(VibrationEvent{
+		Dimension: dim,
+		Type:      GameEventExplode,
+		X:         cx,
+		Y:         cy,
+		Z:         cz,
+		Player:    activator,
+	})
 
 	// 1. Destroy nearby fragile blocks within radius 3 in dim.
 	if cache := s.DimensionChunks(dim); cache != nil && s.CreeperBlockGriefing() {

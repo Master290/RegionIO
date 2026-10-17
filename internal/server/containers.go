@@ -400,49 +400,85 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	case IsChestBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenChest(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsCraftingTableBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenCraftingTable(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsFurnaceBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenFurnace(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsEnchantingTableBlock(state):
 		cid, err := s.OpenEnchantingTable(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsAnvilBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenAnvil(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsGrindstoneBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenGrindstone(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsBrewingStandBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenBrewingStand(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsCartographyTableBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenCartographyTable(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsLoomBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenLoom(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsStonecutterBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenStonecutter(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsSmithingTableBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenSmithingTable(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsBeaconBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenBeacon(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
 		return err == nil, cid, err
 	case IsJukeboxBlock(state):
 		handled, _ := s.InteractJukebox(session, 0, x, y, z)
@@ -620,9 +656,11 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	}
 	closedID := containerID
 	hadOpen := false
+	var closedX, closedY, closedZ int
 	if tr.open != nil && (containerID == 0 || containerID == tr.open.ContainerID) {
 		hadOpen = true
 		closedID = tr.open.ContainerID
+		closedX, closedY, closedZ = tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		for i := range tr.open.Crafting {
 			if !tr.open.Crafting[i].IsEmpty() {
 				returnItems = append(returnItems, returnEntry{stack: tr.open.Crafting[i]})
@@ -664,6 +702,10 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		session.SetInventorySlot(i, world.ItemStack{})
 	}
 	tr.mu.Unlock()
+
+	if hadOpen {
+		s.EmitPlayerBlockVibration(session, GameEventContainerClose, session.Dimension(), closedX, closedY, closedZ, "")
+	}
 
 	snap := session.Snapshot()
 	for _, entry := range returnItems {
