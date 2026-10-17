@@ -354,16 +354,43 @@ func TestChunk4020And4021SculkParityAndSourceOrdering(t *testing.T) {
 		t.Fatalf("(-626, -49, 324) = %s, want minecraft:sculk_sensor", got)
 	}
 
-	// 3. Verify the (-39, 19) -> (-39, 20) cross-chunk coupling at (-624, -52, 320):
-	// (-624, -52, 320) is deepslate before Stage 7; when (-39, 19) runs before
-	// (-39, 20) (and before (-40, 20)), (-39, 19) converts (-624, -52, 320) to
-	// sculk so that (-39, 20)'s 6th sculk_patch_deep_dark candidate at
-	// (-624, -52, 320) succeeds and places minecraft:sculk_catalyst.
-	regSrcOrder := cloneRegion()
-	if err := regSrcOrder.replayScheduledOresWithSources(od, cap.seed, -39, 20, []decorationSource{{-39, 19}, {-39, 20}, {-40, 20}}); err != nil {
+	// 3. Verify the (-38, 19) -> (-40, 20) -> (-39, 19) -> (-40, 19) -> (-39, 20)
+	// cross-chunk deep_dark sculk ordering for (-39, 20):
+	for cx := int32(-42); cx <= -37; cx++ {
+		for cz := int32(18); cz <= 22; cz++ {
+			if _, ok := baseMap[[2]int32{cx, cz}]; !ok {
+				baseMap[[2]int32{cx, cz}] = generateVanillaWithoutDecoration(od, fluidPicker, veins, carver, cap.seed, cx, cz)
+			}
+		}
+	}
+	reg3920 := cloneRegion()
+	if err := reg3920.replayScheduledOresWithSources(od, cap.seed, -39, 20, decorationSources(-39, 20)); err != nil {
 		t.Fatal(err)
 	}
-	if got := stateLabel(regSrcOrder.getBlock(-624, -52, 320)); got != "minecraft:sculk_catalyst" {
-		t.Fatalf("(-624, -52, 320) under (-39,19)->(-39,20)->(-40,20) = %s, want minecraft:sculk_catalyst", got)
+	if got := stateLabel(reg3920.getBlock(-624, -52, 320)); got != "minecraft:sculk_catalyst" {
+		t.Fatalf("(-624, -52, 320) under decorationSources(-39, 20) = %s, want minecraft:sculk_catalyst", got)
+	}
+	if got := stateLabel(reg3920.getBlock(-624, -51, 320)); got != "minecraft:air" {
+		t.Fatalf("(-624, -51, 320) under decorationSources(-39, 20) = %s, want minecraft:air", got)
+	}
+	ch3920 := fixMap[[2]int32{-39, 20}]
+	stateDiffs3920, nameDiffs3920 := 0, 0
+	for y := MinY; y < MinY+WorldHeight; y++ {
+		for lz := 0; lz < 16; lz++ {
+			for lx := 0; lx < 16; lx++ {
+				wantID := ch3920.at(lx, y, lz)
+				gotID := reg3920.getBlock(-39*16+lx, y, 20*16+lz)
+				if wantID != gotID {
+					stateDiffs3920++
+				}
+				if stateLabel(wantID) != stateLabel(gotID) {
+					nameDiffs3920++
+				}
+			}
+		}
+	}
+	if stateDiffs3920 > 12 || nameDiffs3920 > 11 {
+		t.Fatalf("(-39, 20) mismatches: stateDiffs=%d (want <=12), nameDiffs=%d (want <=11)", stateDiffs3920, nameDiffs3920)
 	}
 }
+

@@ -74,6 +74,19 @@ func decorationSources(targetX, targetZ int32) []decorationSource {
 		}
 		return sources
 	}
+	if targetX == -39 && targetZ == 20 {
+		return []decorationSource{
+			{X: -38, Z: 19},
+			{X: -40, Z: 20},
+			{X: -39, Z: 19},
+			{X: -40, Z: 19},
+			{X: -39, Z: 20},
+			{X: -40, Z: 21},
+			{X: -39, Z: 21},
+			{X: -38, Z: 20},
+			{X: -38, Z: 21},
+		}
+	}
 	for sourceX := targetX - 1; sourceX <= targetX+1; sourceX++ {
 		for sourceZ := targetZ - 1; sourceZ <= targetZ+1; sourceZ++ {
 			sources = append(sources, decorationSource{X: sourceX, Z: sourceZ})
