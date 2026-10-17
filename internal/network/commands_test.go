@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -79,7 +80,7 @@ func TestDefaultCommandTreeWireEncoding(t *testing.T) {
 				if _, err := r.VarInt(); err != nil {
 					t.Fatalf("node %d string mode: %v", i, err)
 				}
-			case ArgParserVec3, ArgParserGameMode:
+			case ArgParserVec3, ArgParserRotation, ArgParserGameMode:
 				// singleton argument info: 0 property bytes
 			default:
 				t.Fatalf("node %d unexpected parserID %d", i, parserID)
@@ -103,7 +104,7 @@ func TestDefaultCommandTreeWireEncoding(t *testing.T) {
 		t.Fatalf("trailing %d bytes in commands packet", r.Remaining())
 	}
 
-	for _, want := range []string{"tp", "gamemode", "time", "query", "weather", "clear", "rain", "thunder", "seed", "save-all", "stop", "list", "help"} {
+	for _, want := range []string{"tp", "teleport", "execute", "gamemode", "time", "query", "weather", "clear", "rain", "thunder", "seed", "save-all", "stop", "list", "help"} {
 		if !literals[want] {
 			t.Errorf("command tree missing literal %q", want)
 		}
@@ -336,3 +337,135 @@ func TestExecuteCommandsAndConsole(t *testing.T) {
 		}
 	}
 }
+
+func TestTeleportPolishAndExecuteCommand(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	cfg.WorldSeed = 424242
+	cfg.MaxPlayers = 10
+	srv, err := server.NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice, err := srv.RegisterPlayer(server.Profile{Name: "Alice", UUID: server.OfflineUUID("Alice")}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := srv.RegisterPlayer(server.Profile{Name: "Bob", UUID: server.OfflineUUID("Bob")}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetPlayerTransform(alice, 0, 70, 0, 0, 0, true)   // facing south (+Z)
+	srv.SetPlayerTransform(bob, 20, 70, 0, -90, 0, true) // at +X
+
+	// 1. Local ^left ^up ^forwards coordinates: facing south (yaw=0, pitch=0),
+	// ^0 ^2 ^10 moves +10 along +Z and +2 along +Y -> (0, 72, 10).
+	if got := ExecuteCommand(srv, alice, "/teleport @s ^0 ^2 ^10"); !strings.Contains(got, "0.00, 72.00, 10.00") {
+		t.Fatalf("/teleport local ^ coords = %q", got)
+	}
+	if snap := alice.Snapshot(); math.Abs(snap.X-0) > 1e-4 || math.Abs(snap.Y-72) > 1e-4 || math.Abs(snap.Z-10) > 1e-4 {
+		t.Fatalf("alice pos after local ^ tp = (%v, %v, %v), want (0, 72, 10)", snap.X, snap.Y, snap.Z)
+	}
+
+	// 2. /tp with explicit rotation (<yaw> <pitch>) and relative rotation (~yaw ~pitch).
+	if got := ExecuteCommand(srv, alice, "/tp @s 0 70 0 90 -15"); !strings.Contains(got, "0.00, 70.00, 0.00") {
+		t.Fatalf("/tp with rotation = %q", got)
+	}
+	if snap := alice.Snapshot(); snap.Yaw != 90 || snap.Pitch != -15 {
+		t.Fatalf("alice rot = (%v, %v), want (90, -15)", snap.Yaw, snap.Pitch)
+	}
+	if got := ExecuteCommand(srv, alice, "/tp @s ~ ~ ~ ~-45 ~15"); !strings.Contains(got, "0.00, 70.00, 0.00") {
+		t.Fatalf("/tp with relative rotation = %q", got)
+	}
+	if snap := alice.Snapshot(); snap.Yaw != 45 || snap.Pitch != 0 {
+		t.Fatalf("alice relative rot = (%v, %v), want (45, 0)", snap.Yaw, snap.Pitch)
+	}
+
+	// 3. /tp facing <x> <y> <z> and /tp facing entity <target> [eyes|feet].
+	// Looking from (0, 70, 0) toward (10, 70, 0) (+X, east) gives yaw = -90, pitch = 0.
+	if got := ExecuteCommand(srv, alice, "/tp @s 0 70 0 facing 10 70 0"); !strings.Contains(got, "Teleported Alice") {
+		t.Fatalf("/tp facing coords = %q", got)
+	}
+	if snap := alice.Snapshot(); math.Abs(float64(snap.Yaw - -90)) > 1e-3 || math.Abs(float64(snap.Pitch)) > 1e-3 {
+		t.Fatalf("alice facing +X rot = (%v, %v), want (-90, 0)", snap.Yaw, snap.Pitch)
+	}
+	// Looking from (0, 70, 0) toward Bob at (20, 70, 0) feet gives yaw = -90, pitch = 0.
+	if got := ExecuteCommand(srv, alice, "/tp @s 0 70 0 facing entity Bob feet"); !strings.Contains(got, "Teleported Alice") {
+		t.Fatalf("/tp facing entity Bob feet = %q", got)
+	}
+	if snap := alice.Snapshot(); math.Abs(float64(snap.Yaw - -90)) > 1e-3 || math.Abs(float64(snap.Pitch)) > 1e-3 {
+		t.Fatalf("alice facing entity Bob feet rot = (%v, %v), want (-90, 0)", snap.Yaw, snap.Pitch)
+	}
+
+	// 4. Multi-target selector @a[distance=..30] and non-player entity @e[type=zombie].
+	zombieID := srv.Entities().Add(&world.Entity{
+		TypeName:  "minecraft:zombie",
+		Dimension: world.DimensionOverworld,
+		X:         5,
+		Y:         70,
+		Z:         5,
+	})
+	if got := ExecuteCommand(srv, alice, "/tp @e[type=zombie,distance=..20] 12 71 14"); !strings.Contains(got, "12.00, 71.00, 14.00") {
+		t.Fatalf("/tp zombie = %q", got)
+	}
+	if z := srv.Entities().Get(zombieID); z == nil || z.X != 12 || z.Y != 71 || z.Z != 14 {
+		t.Fatalf("zombie after /tp = %+v", z)
+	}
+
+	// 5. /execute as, at, positioned, rotated, align, anchored, in, if/unless, run.
+	if got := ExecuteCommand(srv, alice, "/execute as Bob at @s positioned ~5 ~2 ~-3 align xyz run tp @s ~ ~ ~"); !strings.Contains(got, "25.00, 72.00, -3.00") {
+		t.Fatalf("/execute as Bob at @s positioned align run tp = %q", got)
+	}
+	if snap := bob.Snapshot(); snap.X != 25 || snap.Y != 72 || snap.Z != -3 {
+		t.Fatalf("bob pos after /execute = (%v, %v, %v), want (25, 72, -3)", snap.X, snap.Y, snap.Z)
+	}
+
+	// /execute if block & unless block
+	stoneState := world.StateStone
+	srv.Chunks().SetBlock(0, 69, 0, stoneState)
+	if got := ExecuteCommand(srv, alice, "/execute if block 0 69 0 minecraft:stone"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if block stone = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute unless block 0 69 0 minecraft:stone run tp @s 99 99 99"); got != "" {
+		t.Fatalf("/execute unless block stone should not run, got %q", got)
+	}
+
+	// /execute if blocks (region comparison)
+	srv.Chunks().SetBlock(2, 69, 2, stoneState)
+	if got := ExecuteCommand(srv, alice, "/execute if blocks 0 69 0 0 69 0 2 69 2 all"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if blocks = %q", got)
+	}
+
+	// /execute if entity & if dimension
+	if got := ExecuteCommand(srv, alice, "/execute if entity @e[type=minecraft:zombie] if dimension minecraft:overworld"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if entity + dimension = %q", got)
+	}
+
+	// /execute if score (matches and operator comparison)
+	ExecuteCommand(srv, alice, "/scoreboard objectives add pts dummy")
+	_, _ = srv.SetScore("Alice", "pts", 15)
+	_, _ = srv.SetScore("Bob", "pts", 10)
+	if got := ExecuteCommand(srv, alice, "/execute if score Alice pts matches 10..20 if score Alice pts > Bob pts"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if score = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute if score Alice pts < Bob pts"); got != "Test failed" {
+		t.Fatalf("/execute if score false = %q, want Test failed", got)
+	}
+
+	// /execute in minecraft:the_nether run tp @s 8 64 8 (cross-dimension teleport!)
+	if got := ExecuteCommand(srv, alice, "/execute in minecraft:the_nether run tp @s 8 64 8"); !strings.Contains(got, "8.00, 64.00, 8.00") {
+		t.Fatalf("/execute in the_nether run tp = %q", got)
+	}
+	if alice.Dimension() != world.DimensionNether {
+		t.Fatalf("alice dimension = %q, want %q", alice.Dimension(), world.DimensionNether)
+	}
+	if snap := alice.Snapshot(); snap.X != 8 || snap.Y != 64 || snap.Z != 8 {
+		t.Fatalf("alice nether pos = (%v, %v, %v), want (8, 64, 8)", snap.X, snap.Y, snap.Z)
+	}
+}
+
