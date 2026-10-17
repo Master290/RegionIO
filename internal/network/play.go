@@ -1526,6 +1526,13 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 							h.broadcastBlockChanges(dim, cache, compRes)
 						}
 					}
+					if server.IsBrewingStandBlock(state) && h.srv != nil {
+						var customName string
+						if h.session != nil {
+							customName = server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName
+						}
+						h.srv.OnBrewingStandPlacedInDim(dim, px, py, pz, customName)
+					}
 					if h.session != nil {
 						h.srv.RecordItemUsed(h.session, blockName, 1)
 						h.srv.TriggerPlantedSeed(h.session, blockName)
@@ -1543,6 +1550,10 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					if (server.IsWitherSkullBlockState(state) || server.IsWitherBaseBlockState(state)) && h.srv != nil {
 						h.srv.TrySummonWitherAt(dim, px, py, pz, h.session)
+					}
+					if (blockName == "minecraft:carved_pumpkin" || blockName == "minecraft:jack_o_lantern") && h.srv != nil {
+						h.srv.TrySummonIronGolemAt(dim, px, py, pz, h.session)
+						h.srv.TrySummonSnowGolemAt(dim, px, py, pz, h.session)
 					}
 					h.log.Debug("block placed", "x", px, "y", py, "z", pz, "state", state)
 				}

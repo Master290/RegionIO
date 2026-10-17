@@ -356,7 +356,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		s.DropFurnaceContents(x, y, z)
 	}
 	if IsBrewingStandBlock(prevState) {
-		s.DropBrewingStandContents(x, y, z)
+		s.DropBrewingStandContentsInDim(dim, x, y, z)
 	}
 	if IsLecternBlock(prevState) {
 		if book, _, _, ok := s.RemoveLecternAt(dim, x, y, z); ok && !book.IsEmpty() {
@@ -887,6 +887,8 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	session.mu.Unlock()
 
 	s.RecordPlayerDamageTaken(session, amount)
+	s.DismountShoulderParrots(session)
+	s.OnPlayerDamagedWithEffects(session, false)
 
 	if cause != "starve" && cause != "void" && cause != "out_of_world" && !isOutOfBorder {
 		for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
@@ -905,6 +907,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 
 	if died {
 		s.RecordPlayerDeath(session)
+		s.OnPlayerDiedWithEffects(session)
 		s.DespawnPlayerFishingBobber(session)
 		st := getSurvivalState(session)
 		st.mu.Lock()
@@ -1001,15 +1004,26 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	}
 
 	dy := newY - oldY
+	jumped := false
+	fellFar := false
 	st.mu.Lock()
 	if dy < 0 {
 		st.fallDistance += -dy
+		if st.fallDistance > 0.5 {
+			fellFar = true
+		}
 	} else if !onGround && wasOnGround {
 		// Jumping upward from ground starts a fresh airborne trajectory.
 		st.fallDistance = 0
+		if dy > 0 {
+			jumped = true
+		}
 	}
 	if !onGround {
 		st.mu.Unlock()
+		if jumped || fellFar {
+			s.DismountShoulderParrots(session)
+		}
 		return 0
 	}
 	totalFall := st.fallDistance
@@ -1017,6 +1031,7 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	st.mu.Unlock()
 
 	if totalFall > 0.5 {
+		s.DismountShoulderParrots(session)
 		if trampled, res := s.CheckPlayerFarmlandTrample(session, totalFall, nil); trampled && len(res.Changes) > 0 {
 			dim := world.NormalizeDimension(snap.Dimension)
 			s.broadcastDimensionBlockChanges(dim, s.DimensionChunks(dim), res.Changes, res.LightChanged)

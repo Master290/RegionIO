@@ -295,6 +295,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadDragonFightFile()
 		_ = s.LoadBeacons()
 		_ = s.LoadConduits()
+		_ = s.LoadBrewingStands()
 	}
 	return s
 }
