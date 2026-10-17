@@ -642,6 +642,135 @@ func IsEndPortalState(state uint16) bool {
 	return BlockName(state) == "minecraft:end_portal"
 }
 
+// IsEndPortalFrameState reports whether state is minecraft:end_portal_frame.
+func IsEndPortalFrameState(state uint16) bool {
+	return BlockName(state) == "minecraft:end_portal_frame"
+}
+
+// IsEndGatewayState reports whether state is minecraft:end_gateway.
+func IsEndGatewayState(state uint16) bool {
+	return BlockName(state) == "minecraft:end_gateway"
+}
+
+// PortalPOIType is the vanilla Point of Interest type identifier for Nether portal blocks.
+const PortalPOIType = "minecraft:nether_portal"
+
+// PortalPOIEntry represents a registered minecraft:nether_portal POI record in a dimension.
+type PortalPOIEntry struct {
+	Pos  BlockPos
+	Axis string
+}
+
+type portalPOISet struct {
+	mu   sync.RWMutex
+	pois map[BlockPos]string // BlockPos -> axis ("x" or "z")
+}
+
+var cachePortalPOIs sync.Map // map[*Cache]*portalPOISet
+
+func getPortalPOISet(c *Cache) *portalPOISet {
+	if c == nil {
+		return nil
+	}
+	if v, ok := cachePortalPOIs.Load(c); ok {
+		return v.(*portalPOISet)
+	}
+	actual, _ := cachePortalPOIs.LoadOrStore(c, &portalPOISet{
+		pois: make(map[BlockPos]string),
+	})
+	return actual.(*portalPOISet)
+}
+
+// RegisterPortalPOI registers a minecraft:nether_portal POI at pos in c.
+func (c *Cache) RegisterPortalPOI(pos BlockPos, axis string) {
+	set := getPortalPOISet(c)
+	if set == nil {
+		return
+	}
+	if axis != PortalAxisZ {
+		axis = PortalAxisX
+	}
+	set.mu.Lock()
+	set.pois[pos] = axis
+	set.mu.Unlock()
+}
+
+// UnregisterPortalPOI removes any minecraft:nether_portal POI at pos from c.
+func (c *Cache) UnregisterPortalPOI(pos BlockPos) {
+	set := getPortalPOISet(c)
+	if set == nil {
+		return
+	}
+	set.mu.Lock()
+	delete(set.pois, pos)
+	set.mu.Unlock()
+}
+
+// HasPortalPOI reports whether pos is registered in c's Portal POI index.
+func (c *Cache) HasPortalPOI(pos BlockPos) bool {
+	set := getPortalPOISet(c)
+	if set == nil {
+		return false
+	}
+	set.mu.RLock()
+	_, ok := set.pois[pos]
+	set.mu.RUnlock()
+	return ok
+}
+
+// PortalPOIs returns a snapshot of all registered minecraft:nether_portal POIs in c.
+func (c *Cache) PortalPOIs() []PortalPOIEntry {
+	set := getPortalPOISet(c)
+	if set == nil {
+		return nil
+	}
+	set.mu.RLock()
+	out := make([]PortalPOIEntry, 0, len(set.pois))
+	for pos, axis := range set.pois {
+		out = append(out, PortalPOIEntry{Pos: pos, Axis: axis})
+	}
+	set.mu.RUnlock()
+	return out
+}
+
+// LoadPortalPOIs replaces c's Portal POI index with entries.
+func (c *Cache) LoadPortalPOIs(entries []PortalPOIEntry) {
+	set := getPortalPOISet(c)
+	if set == nil {
+		return
+	}
+	set.mu.Lock()
+	set.pois = make(map[BlockPos]string, len(entries))
+	for _, e := range entries {
+		axis := e.Axis
+		if axis != PortalAxisZ {
+			axis = PortalAxisX
+		}
+		set.pois[e.Pos] = axis
+	}
+	set.mu.Unlock()
+}
+
+// PortalPOIsInRadius returns all registered Portal POIs within horizontal Chebyshev
+// distance radius of (targetX, targetZ), matching vanilla PoiManager.getInSquare.
+func (c *Cache) PortalPOIsInRadius(targetX, targetZ, radius int) []PortalPOIEntry {
+	set := getPortalPOISet(c)
+	if set == nil || radius < 0 {
+		return nil
+	}
+	minX, maxX := targetX-radius, targetX+radius
+	minZ, maxZ := targetZ-radius, targetZ+radius
+	set.mu.RLock()
+	var out []PortalPOIEntry
+	for pos, axis := range set.pois {
+		if pos.X >= minX && pos.X <= maxX && pos.Z >= minZ && pos.Z <= maxZ {
+			out = append(out, PortalPOIEntry{Pos: pos, Axis: axis})
+		}
+	}
+	set.mu.RUnlock()
+	return out
+}
+
 // GenerateNether builds a 26.1.2 Nether chunk at (cx, cz) for seed 0.
 func GenerateNether(cx, cz int32) *Chunk {
 	defaultNetherGenOnce.Do(func() {
@@ -755,8 +884,98 @@ func (ps PortalShape) SpawnPosition() (x, y, z float64) {
 		float64(ps.BottomLeft.Z) + 0.5 + float64(dz)*0.5*float64(ps.Width-1)
 }
 
-// Light fills the interior of ps with minecraft:nether_portal[axis=ps.Axis]
-// and returns the placed positions and affected lighting chunks.
+// RelativeOffset computes the entity's normalized [0..1] offset across the portal width
+// and up the portal height, matching vanilla PortalShape.getRelativePosition.
+func (ps PortalShape) RelativeOffset(x, y, z float64) (relAcross, relUp float64) {
+	w := float64(ps.Width)
+	if w < 1 {
+		w = float64(MinPortalWidth)
+	}
+	h := float64(ps.Height)
+	if h < 1 {
+		h = float64(MinPortalHeight)
+	}
+	if ps.Axis == PortalAxisZ {
+		relAcross = (z - float64(ps.BottomLeft.Z)) / w
+	} else {
+		relAcross = (x - float64(ps.BottomLeft.X)) / w
+	}
+	if relAcross < 0 {
+		relAcross = 0
+	} else if relAcross > 1 {
+		relAcross = 1
+	}
+	relUp = (y - float64(ps.BottomLeft.Y)) / math.Max(1, h-1.8)
+	if relUp < 0 {
+		relUp = 0
+	} else if relUp > 1 {
+		relUp = 1
+	}
+	return relAcross, relUp
+}
+
+// MapArrival maps a normalized portal entry offset (relAcross, relUp) and entry axis/yaw/velocity
+// onto this destination PortalShape, rotating yaw by 90 degrees and swapping horizontal velocity
+// if the destination portal axis differs from the source portal axis.
+func (ps PortalShape) MapArrival(relAcross, relUp float64, fromAxis string, yaw float32, vx, vy, vz float64) (destX, destY, destZ float64, destYaw float32, destVX, destVY, destVZ float64) {
+	if relAcross < 0 || relAcross > 1 {
+		relAcross = 0.5
+	}
+	if relUp < 0 {
+		relUp = 0
+	} else if relUp > 1 {
+		relUp = 1
+	}
+	dx, dz := axisStep(ps.Axis)
+	w := float64(ps.Width)
+	if w < float64(MinPortalWidth) {
+		w = float64(MinPortalWidth)
+	}
+	h := float64(ps.Height)
+	if h < float64(MinPortalHeight) {
+		h = float64(MinPortalHeight)
+	}
+	// Map relAcross inside the interior width with a 0.5-block margin from the side pillars.
+	usableW := math.Max(0, w-1.0)
+	acrossBlocks := 0.5 + relAcross*usableW
+	if ps.Axis == PortalAxisZ {
+		destX = float64(ps.BottomLeft.X) + 0.5
+		destZ = float64(ps.BottomLeft.Z) + acrossBlocks
+	} else {
+		destX = float64(ps.BottomLeft.X) + acrossBlocks
+		destZ = float64(ps.BottomLeft.Z) + 0.5
+	}
+	_ = dx
+	_ = dz
+	usableH := math.Max(0, h-2.0)
+	destY = float64(ps.BottomLeft.Y) + math.Floor(relUp*usableH)
+	destYaw = yaw
+	destVX, destVY, destVZ = vx, vy, vz
+	normFrom := fromAxis
+	if normFrom != "" && normFrom != PortalAxisZ {
+		normFrom = PortalAxisX
+	}
+	normTo := ps.Axis
+	if normTo != PortalAxisZ {
+		normTo = PortalAxisX
+	}
+	if normFrom != "" && normFrom != normTo {
+		destYaw = yaw + 90.0
+		for destYaw >= 180.0 {
+			destYaw -= 360.0
+		}
+		for destYaw < -180.0 {
+			destYaw += 360.0
+		}
+		destVX = -vz
+		destVZ = vx
+	}
+	return destX, destY, destZ, destYaw, destVX, destVY, destVZ
+}
+
+// Light fills the interior of ps with minecraft:nether_portal[axis=ps.Axis],
+// registers each interior block in cache's Portal POI registry, and returns
+// the placed positions and affected lighting chunks.
 func (ps PortalShape) Light(cache *Cache) ([]BlockPos, []ChunkPos) {
 	if cache == nil || ps.Width < MinPortalWidth || ps.Height < MinPortalHeight {
 		return nil, nil
@@ -774,6 +993,7 @@ func (ps PortalShape) Light(cache *Cache) ([]BlockPos, []ChunkPos) {
 	seenLight := make(map[ChunkPos]bool)
 	for _, pos := range positions {
 		if valid, lc := cache.SetBlockWithLight(pos.X, pos.Y, pos.Z, portalState); valid {
+			cache.RegisterPortalPOI(pos, axis)
 			for _, cp := range lc {
 				if !seenLight[cp] {
 					seenLight[cp] = true
@@ -1007,6 +1227,10 @@ func FindClosestPortal(cache *Cache, dim string, targetX, targetY, targetZ int) 
 
 // FindClosestPortalWithin searches for the closest lit Nether portal within
 // radius blocks horizontally of (targetX, targetY, targetZ).
+// It first queries the dimension Cache's Portal POI registry (matching vanilla
+// PoiManager.getInSquare(PoiTypes.NETHER_PORTAL)), pruning any stale POI whose
+// block is no longer minecraft:nether_portal, and also scans loaded chunks around
+// the target so portals placed directly via SetBlock are indexed and found.
 func FindClosestPortalWithin(cache *Cache, targetX, targetY, targetZ, radius int) (PortalShape, bool) {
 	if cache == nil || radius < 0 {
 		return PortalShape{}, false
@@ -1030,10 +1254,52 @@ func FindClosestPortalWithin(cache *Cache, targetX, targetY, targetZ, radius int
 		found     bool
 	)
 
+	considerBlock := func(wx, wy, wz int, st uint16) {
+		dx := float64(wx - targetX)
+		dy := float64(wy - targetY)
+		dz := float64(wz - targetZ)
+		dist := dx*dx + dy*dy + dz*dz
+		if !found || dist < bestDist || (dist == bestDist && wy < bestShape.BottomLeft.Y) {
+			if shape, ok := FindCompletePortalShape(cache, wx, wy, wz); ok {
+				bestShape = shape
+				bestDist = dist
+				found = true
+			} else {
+				_, props, _ := BlockStateProperties(st)
+				axis := props["axis"]
+				if axis != PortalAxisZ {
+					axis = PortalAxisX
+				}
+				bestShape = PortalShape{
+					Axis:       axis,
+					BottomLeft: BlockPos{X: wx, Y: wy, Z: wz},
+					Width:      MinPortalWidth,
+					Height:     MinPortalHeight,
+				}
+				bestDist = dist
+				found = true
+			}
+		}
+	}
+
+	// 1. Query the Portal POI registry within horizontal Chebyshev radius.
+	for _, poi := range cache.PortalPOIsInRadius(targetX, targetZ, radius) {
+		if poi.Pos.Y < minY || poi.Pos.Y >= maxY {
+			cache.UnregisterPortalPOI(poi.Pos)
+			continue
+		}
+		st := cache.GetBlock(poi.Pos.X, poi.Pos.Y, poi.Pos.Z)
+		if !IsNetherPortalState(st) {
+			cache.UnregisterPortalPOI(poi.Pos)
+			continue
+		}
+		considerBlock(poi.Pos.X, poi.Pos.Y, poi.Pos.Z, st)
+	}
+
+	// 2. Also scan loaded chunks (and the immediate 1-chunk neighborhood of the target)
+	// so portals placed via SetBlock without Light() are discovered and registered as POIs.
 	for cx := minCX; cx <= maxCX; cx++ {
 		for cz := minCZ; cz <= maxCZ; cz++ {
-			// Scan already-loaded chunks or the immediate 1-chunk neighborhood of the target
-			// so searching a 128-block radius in Overworld does not force-generate 289 chunks.
 			if !cache.IsChunkLoaded(cx, cz) && (abs32(cx-targetCX) > 1 || abs32(cz-targetCZ) > 1) {
 				continue
 			}
@@ -1071,31 +1337,13 @@ func FindClosestPortalWithin(cache *Cache, targetX, targetY, targetZ, radius int
 							if !IsNetherPortalState(st) {
 								continue
 							}
-							dx := float64(wx - targetX)
-							dy := float64(wy - targetY)
-							dz := float64(wz - targetZ)
-							dist := dx*dx + dy*dy + dz*dz
-							if !found || dist < bestDist || (dist == bestDist && wy < bestShape.BottomLeft.Y) {
-								if shape, ok := FindCompletePortalShape(cache, wx, wy, wz); ok {
-									bestShape = shape
-									bestDist = dist
-									found = true
-								} else {
-									_, props, _ := BlockStateProperties(st)
-									axis := props["axis"]
-									if axis != PortalAxisZ {
-										axis = PortalAxisX
-									}
-									bestShape = PortalShape{
-										Axis:       axis,
-										BottomLeft: BlockPos{X: wx, Y: wy, Z: wz},
-										Width:      MinPortalWidth,
-										Height:     MinPortalHeight,
-									}
-									bestDist = dist
-									found = true
-								}
+							_, props, _ := BlockStateProperties(st)
+							axis := props["axis"]
+							if axis != PortalAxisZ {
+								axis = PortalAxisX
 							}
+							cache.RegisterPortalPOI(BlockPos{X: wx, Y: wy, Z: wz}, axis)
+							considerBlock(wx, wy, wz, st)
 						}
 					}
 				}
@@ -1195,3 +1443,69 @@ func FindOrCreatePortal(cache *Cache, dim string, targetX, targetY, targetZ int,
 	created := CreateNetherPortal(cache, dim, targetX, targetY, targetZ, axis)
 	return created, true
 }
+
+func isFilledEndPortalFrameAt(cache *Cache, x, y, z int) bool {
+	if cache == nil {
+		return false
+	}
+	name, props, ok := BlockStateProperties(cache.GetBlock(x, y, z))
+	return ok && name == "minecraft:end_portal_frame" && props["eye"] == "true"
+}
+
+func isCompleteEndPortalRingAt(cache *Cache, centerX, y, centerZ int) bool {
+	if cache == nil {
+		return false
+	}
+	for d := -1; d <= 1; d++ {
+		// North side (z = centerZ - 2), South side (z = centerZ + 2),
+		// West side (x = centerX - 2), East side (x = centerX + 2).
+		if !isFilledEndPortalFrameAt(cache, centerX+d, y, centerZ-2) ||
+			!isFilledEndPortalFrameAt(cache, centerX+d, y, centerZ+2) ||
+			!isFilledEndPortalFrameAt(cache, centerX-2, y, centerZ+d) ||
+			!isFilledEndPortalFrameAt(cache, centerX+2, y, centerZ+d) {
+			return false
+		}
+	}
+	return true
+}
+
+// ActivateEndPortalAt checks whether the filled minecraft:end_portal_frame at
+// (frameX, frameY, frameZ) completes a 12-frame End portal ring around a 3x3
+// interior, and if so fills the 3x3 interior with minecraft:end_portal blocks.
+func ActivateEndPortalAt(cache *Cache, frameX, frameY, frameZ int) ([]BlockPos, []ChunkPos, bool) {
+	if cache == nil || !isFilledEndPortalFrameAt(cache, frameX, frameY, frameZ) {
+		return nil, nil, false
+	}
+	endPortalState, ok := nameToStateID("minecraft:end_portal", nil)
+	if !ok {
+		return nil, nil, false
+	}
+	for dcx := -2; dcx <= 2; dcx++ {
+		for dcz := -2; dcz <= 2; dcz++ {
+			cx := frameX + dcx
+			cz := frameZ + dcz
+			if !isCompleteEndPortalRingAt(cache, cx, frameY, cz) {
+				continue
+			}
+			placed := make([]BlockPos, 0, 9)
+			var lightChunks []ChunkPos
+			seenLight := make(map[ChunkPos]bool)
+			for ix := cx - 1; ix <= cx+1; ix++ {
+				for iz := cz - 1; iz <= cz+1; iz++ {
+					if valid, lc := cache.SetBlockWithLight(ix, frameY, iz, endPortalState); valid {
+						placed = append(placed, BlockPos{X: ix, Y: frameY, Z: iz})
+						for _, cp := range lc {
+							if !seenLight[cp] {
+								seenLight[cp] = true
+								lightChunks = append(lightChunks, cp)
+							}
+						}
+					}
+				}
+			}
+			return placed, lightChunks, true
+		}
+	}
+	return nil, nil, false
+}
+

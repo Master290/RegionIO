@@ -232,6 +232,8 @@ type PlayerData struct {
 	SlotFireworks      *nbt.List
 	SlotFireworkStars  *nbt.List
 	WardenSpawnTracker *nbt.Compound
+	PortalCooldown     int32
+	SeenCredits        bool
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -448,6 +450,12 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	if d.WardenSpawnTracker != nil {
 		root.Set("warden_spawn_tracker", d.WardenSpawnTracker)
+	}
+	if d.PortalCooldown > 0 {
+		root.Set("PortalCooldown", nbt.Int(d.PortalCooldown))
+	}
+	if d.SeenCredits {
+		root.Set("seenCredits", nbt.Byte(1))
 	}
 
 	return root
@@ -796,6 +804,12 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	}
 	if wst, ok := nbtGetCompound(root, "warden_spawn_tracker"); ok && wst != nil {
 		d.WardenSpawnTracker = wst
+	}
+	if pc, ok := nbtGetInt(root, "PortalCooldown"); ok && pc > 0 {
+		d.PortalCooldown = pc
+	}
+	if sc, ok := nbtGetByte(root, "seenCredits"); ok && sc != 0 {
+		d.SeenCredits = true
 	}
 
 	return d, nil

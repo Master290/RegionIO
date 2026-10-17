@@ -303,6 +303,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadWardenFile()
 		_ = s.LoadVehiclesFile()
 		_ = s.LoadDispensers()
+		_ = s.LoadPortalsFile()
 	}
 	return s
 }
@@ -459,6 +460,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveDispensers(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SavePortalsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {
@@ -646,6 +650,14 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	session.SetDimension(d.Dimension)
 	session.SetFoodExhaustion(d.FoodExhaustion)
 	session.SetFoodTickTimer(d.FoodTickTimer)
+	if pst := getPlayerPortalState(session); pst != nil {
+		pst.mu.Lock()
+		if d.PortalCooldown > 0 {
+			pst.portalCooldown = int(d.PortalCooldown)
+		}
+		pst.seenCredits = d.SeenCredits
+		pst.mu.Unlock()
+	}
 	if st := getPlayerXPState(session); st != nil {
 		st.mu.Lock()
 		st.level = d.XpLevel
@@ -1031,6 +1043,14 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 			Elems:  starElems,
 		}
 	}
+	var portalCooldown int32
+	var seenCredits bool
+	if pst := getPlayerPortalState(session); pst != nil {
+		pst.mu.Lock()
+		portalCooldown = int32(pst.portalCooldown)
+		seenCredits = pst.seenCredits
+		pst.mu.Unlock()
+	}
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -1069,6 +1089,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		SlotFireworks:      slotFireworks,
 		SlotFireworkStars:  slotFireworkStars,
 		WardenSpawnTracker: wstComp,
+		PortalCooldown:     portalCooldown,
+		SeenCredits:        seenCredits,
 	}
 }
 

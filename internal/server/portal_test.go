@@ -257,3 +257,267 @@ func TestEndPortalTravelToObsidianPlatformAndDimensionPersistence(t *testing.T) 
 		t.Fatalf("rejoined.Dimension() = %q, want %q", rejoined.Dimension(), world.DimensionEnd)
 	}
 }
+
+func TestPortalWarmupCooldownAndPOILinking(t *testing.T) {
+	dir := t.TempDir()
+	st, err := world.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	cfg := DefaultConfig()
+	cfg.WorldDir = dir
+	srv, err := NewWithCacheAndStore(cfg, world.NewCacheWithStore(256, world.GenerateFlat, st), st)
+	if err != nil {
+		t.Fatalf("NewWithCacheAndStore: %v", err)
+	}
+	defer func() { _ = srv.RequestStop() }()
+
+	prof := Profile{UUID: OfflineUUID("PortalWarmupTester"), Name: "PortalWarmupTester"}
+	session, err := srv.RegisterPlayer(prof, func(id int32, body []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	overworldCache := srv.DimensionChunks(world.DimensionOverworld)
+	obsidian, _ := world.BlockStateByName("minecraft:obsidian", nil)
+	for x := 15; x <= 18; x++ {
+		for y := 64; y <= 68; y++ {
+			isBorder := x == 15 || x == 18 || y == 64 || y == 68
+			if isBorder {
+				overworldCache.SetBlock(x, y, z0, obsidian)
+			} else {
+				overworldCache.SetBlock(x, y, z0, world.StateAir)
+			}
+		}
+	}
+	if _, ok := srv.LightPortalAt(world.DimensionOverworld, 16, 65, z0); !ok {
+		t.Fatal("expected LightPortalAt to light Overworld frame")
+	}
+	if !overworldCache.HasPortalPOI(world.BlockPos{X: 16, Y: 65, Z: z0}) {
+		t.Fatal("expected Portal POI registered at (16, 65, z0)")
+	}
+
+	srv.SetPlayerTransform(session, 16.5, 65.0, float64(z0)+0.5, 0, 0, true)
+
+	// In Survival, 79 ticks should not yet teleport (wait = 80 ticks).
+	for i := 0; i < 79; i++ {
+		res, err := srv.TickPlayerPortal(session)
+		if err != nil {
+			t.Fatalf("TickPlayerPortal(%d): %v", i, err)
+		}
+		if res.Travelled {
+			t.Fatalf("expected no travel before 80 ticks, travelled at tick %d", i+1)
+		}
+	}
+	// 80th tick triggers travel!
+	res, err := srv.TickPlayerPortal(session)
+	if err != nil {
+		t.Fatalf("TickPlayerPortal(80): %v", err)
+	}
+	if !res.Travelled || res.ToDimension != world.DimensionNether {
+		t.Fatalf("expected travel to Nether on tick 80, got %+v", res)
+	}
+	if got := srv.PlayerPortalCooldown(session); got != DefaultPortalCooldownTicks {
+		t.Fatalf("PlayerPortalCooldown = %d, want %d", got, DefaultPortalCooldownTicks)
+	}
+
+	// Breaking a portal block invalidates its POI.
+	netherCache := srv.DimensionChunks(world.DimensionNether)
+	pois := netherCache.PortalPOIs()
+	if len(pois) == 0 {
+		t.Fatal("expected Nether destination portal POIs to be registered")
+	}
+	firstPOI := pois[0]
+	netherCache.SetBlockWithLight(firstPOI.Pos.X, firstPOI.Pos.Y, firstPOI.Pos.Z, world.StateAir)
+	srv.InvalidatePortalPOIs(world.DimensionNether, []world.BlockChange{
+		{Pos: firstPOI.Pos, NewState: world.StateAir},
+	})
+	if netherCache.HasPortalPOI(firstPOI.Pos) {
+		t.Fatal("expected broken portal block POI to be invalidated")
+	}
+}
+
+const z0 = 24
+
+func TestEndPortalFrameActivationAndEndReturnCredits(t *testing.T) {
+	dir := t.TempDir()
+	st, err := world.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	cfg := DefaultConfig()
+	cfg.WorldDir = dir
+	srv, err := NewWithCacheAndStore(cfg, world.NewCacheWithStore(256, world.GenerateFlat, st), st)
+	if err != nil {
+		t.Fatalf("NewWithCacheAndStore: %v", err)
+	}
+	defer func() { _ = srv.RequestStop() }()
+
+	overworldCache := srv.DimensionChunks(world.DimensionOverworld)
+
+	// Build a 3x3 End portal ring centered at (0, 64, 0):
+	// North row (z=-2, x=-1..1), South row (z=2, x=-1..1), West col (x=-2, z=-1..1), East col (x=2, z=-1..1).
+	type framePos struct {
+		x, z   int
+		facing string
+	}
+	var frames []framePos
+	for d := -1; d <= 1; d++ {
+		frames = append(frames,
+			framePos{x: d, z: -2, facing: "south"},
+			framePos{x: d, z: 2, facing: "north"},
+			framePos{x: -2, z: d, facing: "east"},
+			framePos{x: 2, z: d, facing: "west"},
+		)
+	}
+	for i, fp := range frames {
+		eye := "true"
+		if i == len(frames)-1 {
+			eye = "false" // leave last frame without eye
+		}
+		fState, ok := world.BlockStateByName("minecraft:end_portal_frame", map[string]string{
+			"facing": fp.facing,
+			"eye":    eye,
+		})
+		if !ok {
+			t.Fatal("missing end_portal_frame state")
+		}
+		overworldCache.SetBlock(fp.x, 64, fp.z, fState)
+	}
+
+	prof := Profile{UUID: OfflineUUID("EndFrameTester"), Name: "EndFrameTester"}
+	session, err := srv.RegisterPlayer(prof, func(id int32, body []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	last := frames[len(frames)-1]
+	placed, activated, _, err := srv.UseEyeOfEnderOnFrame(session, last.x, 64, last.z)
+	if err != nil {
+		t.Fatalf("UseEyeOfEnderOnFrame: %v", err)
+	}
+	if !placed || !activated {
+		t.Fatalf("expected placed=true, activated=true, got placed=%v, activated=%v", placed, activated)
+	}
+	endPortalState, _ := world.BlockStateByName("minecraft:end_portal", nil)
+	for x := -1; x <= 1; x++ {
+		for z := -1; z <= 1; z++ {
+			if overworldCache.GetBlock(x, 64, z) != endPortalState {
+				t.Fatalf("expected minecraft:end_portal at (%d, 64, %d)", x, z)
+			}
+		}
+	}
+
+	// Travel to End, then step into End exit portal -> returns to Overworld and marks SeenCredits=true.
+	res, err := srv.TravelThroughEndPortal(session)
+	if err != nil || !res.Travelled || res.ToDimension != world.DimensionEnd {
+		t.Fatalf("TravelThroughEndPortal to End: %+v, err=%v", res, err)
+	}
+	srv.ClearPlayerPortalCooldown(session)
+	srv.DimensionChunks(world.DimensionEnd).SetBlockWithLight(100, 49, 0, endPortalState)
+	srv.SetPlayerTransform(session, 100.5, 49.0, 0.5, 0, 0, true)
+
+	resBack, err := srv.CheckPlayerPortal(session)
+	if err != nil {
+		t.Fatalf("CheckPlayerPortal from End: %v", err)
+	}
+	if !resBack.Travelled || resBack.ToDimension != world.DimensionOverworld {
+		t.Fatalf("expected travel to Overworld from End exit portal, got %+v", resBack)
+	}
+	if !srv.PlayerSeenCredits(session) {
+		t.Fatal("expected PlayerSeenCredits(session) == true after returning from End")
+	}
+}
+
+func TestEndGatewayAndVehicleDimensionTransfer(t *testing.T) {
+	dir := t.TempDir()
+	st, err := world.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	cfg := DefaultConfig()
+	cfg.WorldDir = dir
+	srv, err := NewWithCacheAndStore(cfg, world.NewCacheWithStore(256, world.GenerateFlat, st), st)
+	if err != nil {
+		t.Fatalf("NewWithCacheAndStore: %v", err)
+	}
+	defer func() { _ = srv.RequestStop() }()
+
+	endCache := srv.DimensionChunks(world.DimensionEnd)
+	gwState, ok := world.BlockStateByName("minecraft:end_gateway", nil)
+	if !ok {
+		t.Fatal("missing minecraft:end_gateway state")
+	}
+	endCache.SetBlock(75, 75, 0, gwState)
+	srv.SetEndGatewayExit(world.DimensionEnd, 75, 75, 0, world.BlockPos{X: 1024, Y: 70, Z: 0}, true)
+
+	prof := Profile{UUID: OfflineUUID("GatewayTester"), Name: "GatewayTester"}
+	session, err := srv.RegisterPlayer(prof, func(id int32, body []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	if err := srv.ChangePlayerDimension(session, world.DimensionEnd, 75.5, 75.0, 0.5, 0, 0); err != nil {
+		t.Fatalf("ChangePlayerDimension: %v", err)
+	}
+	srv.SetPlayerPortalCooldown(session, 0)
+
+	res, err := srv.TravelThroughEndGateway(session, 75, 75, 0)
+	if err != nil {
+		t.Fatalf("TravelThroughEndGateway: %v", err)
+	}
+	if !res.Travelled || res.DestX != 1024.5 || res.DestZ != 0.5 {
+		t.Fatalf("unexpected gateway teleport result: %+v", res)
+	}
+
+	// Test vehicle + passenger dimension transfer and portal file persistence.
+	boatID, boatEnt := srv.SpawnVehicle(world.DimensionOverworld, "minecraft:oak_boat", 10.5, 65.0, 10.5, 0)
+	if boatEnt == nil || boatID == 0 {
+		t.Fatal("SpawnVehicle failed")
+	}
+	pigID := srv.Entities().Add(&world.Entity{
+		TypeName:  "minecraft:pig",
+		Dimension: world.DimensionOverworld,
+		X:         10.5,
+		Y:         65.0,
+		Z:         10.5,
+	})
+	if _, mounted := srv.MountEntityOnVehicle(pigID, boatID); !mounted {
+		t.Fatal("MountEntityOnVehicle failed")
+	}
+
+	if err := srv.ChangeVehicleDimensionWithPassengers(boatID, world.DimensionNether, 20.5, 70.0, 20.5, 0); err != nil {
+		t.Fatalf("ChangeVehicleDimensionWithPassengers: %v", err)
+	}
+	movedBoat := srv.Entities().Get(boatID)
+	if movedBoat == nil || movedBoat.EffectiveDimension() != world.DimensionNether {
+		t.Fatalf("expected boat in Nether, got %+v", movedBoat)
+	}
+	movedPig := srv.Entities().Get(pigID)
+	if movedPig == nil || movedPig.EffectiveDimension() != world.DimensionNether || srv.EntityMountedVehicle(pigID) != boatID {
+		t.Fatalf("expected passenger pig in Nether riding boat, got %+v vehicle=%d", movedPig, srv.EntityMountedVehicle(pigID))
+	}
+
+	if err := srv.SaveAll(); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+	srv2, err := NewWithCacheAndStore(cfg, world.NewCacheWithStore(256, world.GenerateFlat, st), st)
+	if err != nil {
+		t.Fatalf("NewWithCacheAndStore(reload): %v", err)
+	}
+	defer func() { _ = srv2.RequestStop() }()
+	gw := srv2.GetOrCreateEndGatewayAt(world.DimensionEnd, 75, 75, 0)
+	if gw == nil || gw.ExitPortal.X != 1024 || gw.ExitPortal.Y != 70 || gw.ExitPortal.Z != 0 || !gw.ExactTeleport {
+		t.Fatalf("expected persisted gateway exit (1024,70,0 exact=true), got %+v", gw)
+	}
+}
+
+
+

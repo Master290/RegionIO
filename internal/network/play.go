@@ -587,6 +587,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickAllSculk()
 			h.srv.TickCauldrons(nil)
 			h.srv.TickVehicles()
+			h.srv.TickPortals()
 			h.srv.TickPrimedTNT()
 			h.srv.TickDispenserProjectiles()
 			h.srv.TickAllPlayerStats()
@@ -1553,6 +1554,14 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
 				}
 				heldItem := h.session.InventorySlot(invSlot)
+				if server.IsEnderEyeItem(heldItem) && world.IsEndPortalFrameState(cache.GetBlock(x, y, z)) {
+					if placedEye, _, _, err := h.srv.UseEyeOfEnderOnFrame(h.session, x, y, z); err != nil {
+						return err
+					} else if placedEye {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if heldItem.ResolvedID() == server.EndCrystalItemID {
 					if _, placed := h.srv.PlaceEndCrystalItem(h.session, dim, x, y, z); placed {
 						h.syncHotbarFromSession()

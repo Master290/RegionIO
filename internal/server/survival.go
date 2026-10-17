@@ -321,7 +321,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 
 	switch mode {
 	case GameModeSurvival:
-		if prevState == world.StateBedrock || world.BlockName(prevState) == "minecraft:end_portal_frame" || world.BlockName(prevState) == "minecraft:end_portal" {
+		if prevState == world.StateBedrock || world.BlockName(prevState) == "minecraft:end_portal_frame" || world.BlockName(prevState) == "minecraft:end_portal" || world.BlockName(prevState) == "minecraft:end_gateway" {
 			return false, 0
 		}
 		if status == PlayerActionStartDestroyBlock && world.IsNoteBlock(prevState) {
@@ -345,6 +345,10 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	broken, upd := cache.BreakBlockWithUpdates(x, y, z)
 	if !broken {
 		return false, 0
+	}
+	s.InvalidatePortalPOIs(dim, upd.Changes)
+	if world.IsEndGatewayState(prevState) {
+		s.RemoveEndGatewayAt(dim, x, y, z)
 	}
 	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
 	s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
@@ -1121,6 +1125,10 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	if s == nil || session == nil {
 		return errors.New("server: nil player session")
+	}
+	if !session.IsDead() && session.Dimension() == world.DimensionEnd {
+		_, err := s.TravelThroughEndPortal(session)
+		return err
 	}
 
 	st := getSurvivalState(session)

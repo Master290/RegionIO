@@ -39,6 +39,11 @@ type Entity struct {
 	Item        ItemStack
 	PickupDelay int
 	Age         int
+
+	// Portal state for cross-dimension travel.
+	PortalCooldown int
+	PortalTime     int
+	InPortal       bool
 }
 
 // NewItemEntity constructs a dropped item entity carrying stack at (x, y, z).
