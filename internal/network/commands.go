@@ -177,10 +177,18 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	helpArg := argument("command", ArgParserString, greedyProps.Bytes(), true)
 	helpNode := literal("help", true, helpArg)
 
+	// /difficulty [peaceful|easy|normal|hard]
+	diffPeaceful := literal("peaceful", true)
+	diffEasy := literal("easy", true)
+	diffNormal := literal("normal", true)
+	diffHard := literal("hard", true)
+	difficultyNode := literal("difficulty", true, diffPeaceful, diffEasy, diffNormal, diffHard)
+
 	greedyCmd := func(name string) int32 {
 		arg := argument("args", ArgParserString, greedyProps.Bytes(), true)
 		return literal(name, true, arg)
 	}
+	gameruleNode := greedyCmd("gamerule")
 	scoreboardNode := greedyCmd("scoreboard")
 	teamNode := greedyCmd("team")
 	tellrawNode := greedyCmd("tellraw")
@@ -205,6 +213,8 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		gamemodeNode,
 		timeNode,
 		weatherNode,
+		difficultyNode,
+		gameruleNode,
 		seedNode,
 		saveAllNode,
 		stopNode,
@@ -284,7 +294,7 @@ func (h *handler) handleChatCommand(pkt protocol.Packet) error {
 	}
 	h.log.Info("command", "player", h.conn.Profile.Name, "cmd", cmd)
 	reply := ExecuteCommand(h.srv, h.session, cmd)
-	if reply != "" {
+	if reply != "" && (h.srv == nil || h.srv.SendCommandFeedback()) {
 		return h.srv.SendSystemChat(h.session, reply)
 	}
 	return nil
@@ -455,11 +465,10 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 			return "You do not have permission to use this command"
 		}
 		return execWeather(srv, parsed.Args)
+	case "difficulty":
+		return srv.HandleDifficultyCommand(sender, parsed.Args)
 	case "gamerule":
-		if !srv.HasAdminPermission(sender) {
-			return "You do not have permission to use this command"
-		}
-		return execGameRule(srv, parsed.Args)
+		return srv.HandleGameRuleCommand(sender, parsed.Args)
 	case "save-all":
 		if !srv.HasAdminPermission(sender) {
 			return "You do not have permission to use this command"
@@ -718,44 +727,7 @@ func execWeather(srv *server.Server, args []string) string {
 }
 
 func execGameRule(srv *server.Server, args []string) string {
-	if len(args) < 1 || len(args) > 2 {
-		return "Usage: /gamerule <doDaylightCycle|doWeatherCycle|randomTickSpeed> [value]"
-	}
-	rule := strings.ToLower(strings.TrimSpace(args[0]))
-	switch rule {
-	case "dodaylightcycle":
-		if len(args) == 1 {
-			return fmt.Sprintf("Gamerule doDaylightCycle is currently set to: %v", srv.DaylightCycle())
-		}
-		val, err := strconv.ParseBool(strings.TrimSpace(args[1]))
-		if err != nil {
-			return fmt.Sprintf("Invalid boolean value: %s", args[1])
-		}
-		srv.SetDaylightCycle(val)
-		return fmt.Sprintf("Gamerule doDaylightCycle is now set to: %v", val)
-	case "doweathercycle":
-		if len(args) == 1 {
-			return fmt.Sprintf("Gamerule doWeatherCycle is currently set to: %v", srv.WeatherCycle())
-		}
-		val, err := strconv.ParseBool(strings.TrimSpace(args[1]))
-		if err != nil {
-			return fmt.Sprintf("Invalid boolean value: %s", args[1])
-		}
-		srv.SetWeatherCycle(val)
-		return fmt.Sprintf("Gamerule doWeatherCycle is now set to: %v", val)
-	case "randomtickspeed":
-		if len(args) == 1 {
-			return fmt.Sprintf("Gamerule randomTickSpeed is currently set to: %d", srv.RandomTickSpeed())
-		}
-		val, err := strconv.Atoi(strings.TrimSpace(args[1]))
-		if err != nil || val < 0 {
-			return fmt.Sprintf("Invalid integer value: %s", args[1])
-		}
-		srv.SetRandomTickSpeed(val)
-		return fmt.Sprintf("Gamerule randomTickSpeed is now set to: %d", val)
-	default:
-		return fmt.Sprintf("Unknown game rule: %s", args[0])
-	}
+	return srv.HandleGameRuleCommand(nil, args)
 }
 
 func execList(srv *server.Server, args []string) string {
@@ -790,8 +762,10 @@ func execHelp(args []string) string {
 			return "/time <set|add|query> <value> — set, advance, or query world time"
 		case "weather":
 			return "/weather <clear|rain|thunder> [duration] — set world weather"
+		case "difficulty":
+			return "/difficulty [peaceful|easy|normal|hard] — get or set world difficulty"
 		case "gamerule":
-			return "/gamerule <doDaylightCycle|doWeatherCycle> [true|false] — get or set game rule"
+			return "/gamerule [<rule> [value]] — get or set game rule"
 		case "seed":
 			return "/seed — display world seed"
 		case "save-all":
@@ -808,7 +782,7 @@ func execHelp(args []string) string {
 			return "/help [command] — show available commands"
 		}
 	}
-	return "Available commands: /tp, /gamemode, /time, /weather, /gamerule, /seed, /save-all, /stop, /list, /spawnpoint, /setworldspawn, /help"
+	return "Available commands: /tp, /gamemode, /time, /weather, /difficulty, /gamerule, /seed, /save-all, /stop, /list, /spawnpoint, /setworldspawn, /help"
 }
 
 func execSpawnPoint(srv *server.Server, sender *server.PlayerSession, args []string) string {

@@ -55,6 +55,10 @@ type Config struct {
 	// more expensive than vanilla's pregenerated worlds, so the server owns the
 	// upper bound instead of accepting the client's render distance verbatim.
 	MaxViewDistance int
+	// Difficulty sets the initial world difficulty ("peaceful", "easy", "normal", "hard").
+	Difficulty string
+	// Hardcore enables hardcore mode (forces Hard difficulty and spectator mode on death).
+	Hardcore bool
 }
 
 // DefaultConfig returns sensible defaults matching vanilla expectations.
@@ -75,6 +79,8 @@ func DefaultConfig() Config {
 		// streamer's pre-gen ring and player view distance comfortably fit.
 		MaxCachedChunks: 1024,
 		MaxViewDistance: 2,
+		Difficulty:      "normal",
+		Hardcore:        false,
 	}
 }
 
@@ -266,7 +272,16 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		gameTime, dayTime := store.WorldTime()
 		s.SetWorldTime(gameTime, dayTime)
 	}
+	if cfg.Difficulty != "" {
+		if d, ok := ParseDifficulty(cfg.Difficulty); ok {
+			s.SetDifficulty(d)
+		}
+	}
+	if cfg.Hardcore {
+		s.SetHardcore(true)
+	}
 	if cfg.WorldDir != "" {
+		_ = s.LoadWorldSettingsFile()
 		_ = s.LoadDecorationsFile()
 		_ = s.LoadAllMaps()
 		_ = s.LoadScoreboardFile()
@@ -423,6 +438,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveJukeboxes(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveWorldSettingsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {

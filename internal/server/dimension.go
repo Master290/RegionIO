@@ -281,13 +281,27 @@ func EncodeDimensionRegistryData(includeNBT bool) []byte {
 // for protocol 775 (26.1.2), including the server's dimension list and the
 // player's current dimension type, dimension key, and sea level.
 func EncodePlayLoginPacket(entityID int32, gameMode uint8, dim string, maxPlayers, viewDistance int32, hashedSeed int64) []byte {
+	return EncodePlayLoginPacketWithFlags(entityID, gameMode, dim, maxPlayers, viewDistance, hashedSeed, false, false, true, false)
+}
+
+// EncodePlayLoginPacketWithFlags encodes the clientbound play login (0x31)
+// packet body for protocol 775 (26.1.2) with explicit hardcore and gamerule
+// flags (reducedDebugInfo, enableRespawnScreen, doLimitedCrafting).
+func EncodePlayLoginPacketWithFlags(
+	entityID int32,
+	gameMode uint8,
+	dim string,
+	maxPlayers, viewDistance int32,
+	hashedSeed int64,
+	isHardcore, reducedDebugInfo, enableRespawnScreen, doLimitedCrafting bool,
+) []byte {
 	normDim := world.NormalizeDimension(dim)
 	dimTypeIdx := DimensionTypeRegistryIndex(normDim)
 	dt, _ := world.LookupDimensionType(normDim)
 
 	w := protocol.NewWriter(128)
 	w.Int32(entityID)
-	w.Bool(false) // is hardcore
+	w.Bool(isHardcore)
 
 	dims := []string{
 		world.DimensionOverworld,
@@ -302,9 +316,9 @@ func EncodePlayLoginPacket(entityID int32, gameMode uint8, dim string, maxPlayer
 	w.VarInt(maxPlayers)
 	w.VarInt(viewDistance)
 	w.VarInt(viewDistance)
-	w.Bool(false) // reduced debug info
-	w.Bool(true)  // enable respawn screen
-	w.Bool(false) // do limited crafting
+	w.Bool(reducedDebugInfo)
+	w.Bool(enableRespawnScreen)
+	w.Bool(doLimitedCrafting)
 
 	// CommonPlayerSpawnInfo
 	w.VarInt(dimTypeIdx)
@@ -533,6 +547,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
 		_ = send(protocol.PlaySetTime, s.SetTimePacket())
 		s.SendWorldBorderToPlayer(session)
+		s.SendDifficultyToPlayer(session)
 	}
 
 	if switchDim != nil {

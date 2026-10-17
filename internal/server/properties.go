@@ -101,6 +101,18 @@ func ParseProperties(r io.Reader, base Config) (Config, error) {
 				return base, fmt.Errorf("server.properties:%d: invalid network-compression-threshold %q", lineNo, val)
 			}
 			cfg.CompressionThreshold = ct
+		case "difficulty":
+			d, ok := ParseDifficulty(val)
+			if !ok {
+				return base, fmt.Errorf("server.properties:%d: invalid difficulty %q", lineNo, val)
+			}
+			cfg.Difficulty = d.String()
+		case "hardcore":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid hardcore %q", lineNo, val)
+			}
+			cfg.Hardcore = b
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -186,6 +198,10 @@ func LoadPropertiesFile(path string, base Config) (Config, error) {
 
 // WriteProperties serializes cfg in server.properties format.
 func WriteProperties(w io.Writer, cfg Config) error {
+	diff := cfg.Difficulty
+	if diff == "" {
+		diff = "normal"
+	}
 	_, err := fmt.Fprintf(w,
 		"#Minecraft server properties\n"+
 			"server-ip=%s\n"+
@@ -197,7 +213,9 @@ func WriteProperties(w io.Writer, cfg Config) error {
 			"motd=%s\n"+
 			"online-mode=%t\n"+
 			"white-list=%t\n"+
-			"network-compression-threshold=%d\n",
+			"network-compression-threshold=%d\n"+
+			"difficulty=%s\n"+
+			"hardcore=%t\n",
 		cfg.Host,
 		cfg.Port,
 		cfg.WorldDir,
@@ -208,6 +226,8 @@ func WriteProperties(w io.Writer, cfg Config) error {
 		cfg.OnlineMode,
 		cfg.EnforceWhitelist,
 		cfg.CompressionThreshold,
+		diff,
+		cfg.Hardcore,
 	)
 	return err
 }

@@ -130,6 +130,8 @@ const (
 	PlayLevelParticles           = 0x2f
 	PlayOpenBook                 = 0x3a
 	PlayOpenSignEditor           = 0x3c
+	PlayAwardStats               = 0x03
+	PlayChangeDifficulty         = 0x0a
 
 	// Entity packets
 	PlayAddEntity        = 0x01
@@ -148,6 +150,7 @@ const (
 const (
 	PlayAcceptTeleport            = 0x00
 	PlayAttack                    = 0x01
+	PlayChangeDifficultySB        = 0x04
 	PlayChatCommand               = 0x07
 	PlayChatCommandSigned         = 0x08
 	PlayClientCommand             = 0x0c
@@ -158,6 +161,7 @@ const (
 	PlayEditBook                  = 0x18
 	PlayInteract                  = 0x1a
 	PlayKeepAliveServer           = 0x1c
+	PlayLockDifficultySB          = 0x1d
 	PlayClientTickEnd             = 0x0d
 	PlayClientInformation         = 0x0e
 	PlayCustomPayload             = 0x16
@@ -187,9 +191,11 @@ const (
 
 // GameEvent sub-IDs carried by the clientbound game_event packet.
 const (
-	GameEventChangeGameMode     = 3
-	GameEventWinGame            = 4
-	GameEventStartWaitingChunks = 13
+	GameEventChangeGameMode      = 3
+	GameEventWinGame             = 4
+	GameEventEnableRespawnScreen = 11
+	GameEventLimitedCrafting     = 12
+	GameEventStartWaitingChunks  = 13
 )
 
 // ClientboundRespawnPacket dataToKeep bitflags (protocol 775).

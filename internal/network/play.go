@@ -67,6 +67,10 @@ func (h *handler) beginPlay() error {
 	if err := h.sendPlayLogin(); err != nil {
 		return err
 	}
+	h.srv.SendDifficultyToPlayer(session)
+	if h.srv.ReducedDebugInfo() {
+		_ = h.conn.Send(protocol.PlayEntityEvent, server.EncodeEntityEventPacket(session.EntityID, server.EntityEventReducedDebugInfo))
+	}
 	// "Start waiting for level chunks": tells the client to show the loading
 	// screen until chunks arrive.
 	if err := h.sendGameEvent(protocol.GameEventStartWaitingChunks, 0); err != nil {
@@ -375,6 +379,9 @@ func (h *handler) visibilityRadius() int {
 // sendPlayLogin writes the clientbound play "login" packet. Field layout was
 // confirmed against the 26.1.2 vanilla server capture.
 func (h *handler) sendPlayLogin() error {
+	if h.srv != nil {
+		return h.conn.Send(protocol.PlayLogin, h.srv.EncodePlayerLoginPacket(h.session, int32(h.visibilityRadius())))
+	}
 	entityID := int32(1)
 	gameMode := byte(server.GameModeCreative)
 	dim := world.DimensionOverworld
@@ -388,9 +395,9 @@ func (h *handler) sendPlayLogin() error {
 		entityID,
 		gameMode,
 		dim,
-		int32(h.srv.Config().MaxPlayers),
+		20,
 		int32(h.visibilityRadius()),
-		h.srv.Config().WorldSeed,
+		0,
 	)
 	return h.conn.Send(protocol.PlayLogin, payload)
 }
@@ -517,6 +524,9 @@ func (h *handler) serverTickLoop() {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
+			if h.srv.Difficulty() == server.DifficultyPeaceful {
+				h.srv.DespawnHostileMobs()
+			}
 			h.srv.TickBrewingStands()
 			h.srv.TickWorldBorder()
 			h.srv.TickJukeboxes()
@@ -978,6 +988,18 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		return nil
 
 	case protocol.PlayContainerSlotStateChanged:
+		return nil
+
+	case protocol.PlayChangeDifficultySB:
+		if h.srv != nil {
+			return h.srv.HandleChangeDifficultyPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayLockDifficultySB:
+		if h.srv != nil {
+			return h.srv.HandleLockDifficultyPacket(h.session, pkt.Body())
+		}
 		return nil
 
 	default:

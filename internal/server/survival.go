@@ -390,6 +390,9 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 				s.DamagePlayerItem(session, heldSlot, 1)
 			}
 		}
+		if !s.DoTileDrops() {
+			return true, 0
+		}
 		if hasBannerDrop && !bannerDrop.IsEmpty() {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, bannerDrop)
 			return true, dropID
@@ -513,6 +516,16 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return 0, false
 	}
+	if victim := s.playerByEntityID(targetEntityID); victim != nil {
+		if !s.PvP() {
+			return 0, false
+		}
+		dealt, killed := s.AttackEntity(session, targetEntityID)
+		if dealt > 0 {
+			s.DamageHeldItem(session, 1)
+		}
+		return dealt, killed
+	}
 	target := s.entities.Get(targetEntityID)
 	if target == nil || target.IsItem() {
 		return 0, false
@@ -546,16 +559,20 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 				s.entities.Remove(target.ID)
 				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 					encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
-				for _, drop := range MobLootDrops(target.TypeName, nil) {
-					s.SpawnItemEntityInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, drop)
+				if s.DoMobLoot() {
+					for _, drop := range MobLootDrops(target.TypeName, nil) {
+						s.SpawnItemEntityInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, drop)
+					}
 				}
 			}
 		}
 	}
 	if killed {
 		s.TriggerEntityKilled(session, target.TypeName)
-		if xp := mobKillXPPoints(target.TypeName); xp > 0 {
-			s.SpawnExperienceOrbsInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, xp)
+		if s.DoMobLoot() {
+			if xp := mobKillXPPoints(target.TypeName); xp > 0 {
+				s.SpawnExperienceOrbsInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, xp)
+			}
 		}
 	}
 	return dealt, killed
@@ -774,6 +791,29 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		return false
 	}
 
+	switch cause {
+	case "fall":
+		if !s.FallDamage() {
+			return false
+		}
+	case "fire", "in_fire", "on_fire", "lava", "hot_floor", "fireball":
+		if !s.FireDamage() {
+			return false
+		}
+	case "drown", "drowning":
+		if !s.DrowningDamage() {
+			return false
+		}
+	case "freeze", "freezing":
+		if !s.FreezeDamage() {
+			return false
+		}
+	case "player":
+		if !s.PvP() {
+			return false
+		}
+	}
+
 	isOutOfBorder := cause == "out_of_border" || cause == "outside_border" || cause == "world_border"
 	if !isOutOfBorder {
 		if prot := session.ArmorEnchantmentProtection(cause); prot > 0 {
@@ -828,6 +868,15 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		st.dead = true
 		st.fallDistance = 0
 		st.mu.Unlock()
+		if !s.KeepInventory() {
+			s.DropPlayerDeathInventoryAndXP(session)
+		}
+		if s.IsHardcore() {
+			session.mu.Lock()
+			session.gameMode = GameModeSpectator
+			session.mu.Unlock()
+			s.BroadcastPlayerGameModeUpdate(session)
+		}
 	}
 
 	cx := int32(int64(math.Floor(pos[0])) >> 4)
@@ -859,19 +908,24 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 				deathMsg = fmt.Sprintf("%s died", name)
 			}
 		}
-		if send != nil {
+		if send != nil && !s.DoImmediateRespawn() {
 			_ = send(protocol.PlayPlayerCombatKill, EncodePlayerCombatKill(entityID, deathMsg))
 		}
 		if !isCombatDeathCause(cause) {
 			s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
-			if cause == "bad_respawn_point" || isOutOfBorder {
-				chatW := protocol.NewWriter(len(deathMsg) + 8)
-				chatW.Raw(nbt.Marshal(nbt.String(deathMsg)))
-				chatW.Bool(false)
-				s.Broadcast(protocol.PlaySystemChat, chatW.Bytes())
-			} else {
-				s.BroadcastDeathMessage(session, cause, "")
+			if s.ShowDeathMessages() {
+				if cause == "bad_respawn_point" || isOutOfBorder {
+					chatW := protocol.NewWriter(len(deathMsg) + 8)
+					chatW.Raw(nbt.Marshal(nbt.String(deathMsg)))
+					chatW.Bool(false)
+					s.Broadcast(protocol.PlaySystemChat, chatW.Bytes())
+				} else {
+					s.BroadcastDeathMessage(session, cause, "")
+				}
 			}
+		}
+		if s.DoImmediateRespawn() && !s.IsHardcore() {
+			_ = s.RespawnPlayer(session)
 		}
 	}
 	return died
@@ -926,7 +980,7 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 		}
 	}
 
-	if session.HasSlowFalling() {
+	if !s.FallDamage() || session.HasSlowFalling() {
 		return 0
 	}
 	if totalFall <= FallDamageThreshold {
@@ -970,10 +1024,14 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	s.ClearPlayerEffects(session)
 
 	prevDim := session.Dimension()
+	isHC := s.IsHardcore()
 	session.mu.Lock()
 	session.health = world.DefaultPlayerHealth
 	session.foodLevel = world.DefaultPlayerFoodLevel
 	session.foodSaturation = world.DefaultPlayerSaturation
+	if isHC {
+		session.gameMode = GameModeSpectator
+	}
 	mode := session.gameMode
 	selectedSlot := session.selectedSlot
 	inv := session.inventory
@@ -984,6 +1042,10 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	stateID := session.containerStateID
 	send := session.send
 	session.mu.Unlock()
+
+	if isHC {
+		s.BroadcastPlayerGameModeUpdate(session)
+	}
 
 	targetDim, targetX, targetY, targetZ, targetYaw, targetPitch, _, _ := s.ResolvePlayerRespawn(session)
 	session.SetDimension(targetDim)
@@ -1026,7 +1088,11 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
 
 		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
+		if s.KeepInventory() {
+			_ = s.SendPlayerExperience(session)
+		}
 		s.SendWorldBorderToPlayer(session)
+		s.SendDifficultyToPlayer(session)
 	}
 	return nil
 }
