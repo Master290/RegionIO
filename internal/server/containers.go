@@ -18,6 +18,7 @@ const (
 	MenuTypeEnchantment  int32 = 13 // Enchanting table (2 input + 36 player slots)
 	MenuTypeFurnace      int32 = 14 // Furnace (3 furnace slots + 36 player slots)
 	MenuTypeGrindstone   int32 = 15 // Grindstone (2 input + 1 result + 36 player slots)
+	MenuTypeHopper       int32 = 16 // Hopper / Hopper Minecart (5 hopper slots + 36 player slots)
 	MenuTypeSmoker       int32 = 22 // Smoker (3 furnace slots + 36 player slots)
 )
 
@@ -36,6 +37,8 @@ const (
 const (
 	ChestSlotCount        = 27
 	ChestMenuSlotCount    = 63 // 27 chest + 27 main inventory + 9 hotbar
+	HopperSlotCount       = 5
+	HopperMenuSlotCount   = 41 // 5 hopper + 27 main inventory + 9 hotbar
 	CraftingGridSlotCount = 9
 	CraftingMenuSlotCount = 46 // 1 result + 9 grid + 27 main inventory + 9 hotbar
 	FurnaceSlotCount      = world.FurnaceSlotCount
@@ -53,21 +56,22 @@ type ContainerClick struct {
 
 // OpenContainerState represents the currently open screen on a PlayerSession.
 type OpenContainerState struct {
-	ContainerID    int32
-	MenuType       int32
-	BlockX         int
-	BlockY         int
-	BlockZ         int
-	Crafting       [CraftingGridSlotCount]world.ItemStack
-	CraftingStars  [CraftingGridSlotCount]FireworkExplosion
-	Result         world.ItemStack
-	EnchantSlots   [2]world.ItemStack
-	CombinerInputs [2]world.ItemStack
-	AnvilRename    string
-	EnchantCosts   [3]int16
-	EnchantClues   [3]int16
-	LevelClues     [3]int16
-	AnvilCost      int16
+	ContainerID     int32
+	MenuType        int32
+	BlockX          int
+	BlockY          int
+	BlockZ          int
+	VehicleEntityID int32
+	Crafting        [CraftingGridSlotCount]world.ItemStack
+	CraftingStars   [CraftingGridSlotCount]FireworkExplosion
+	Result          world.ItemStack
+	EnchantSlots    [2]world.ItemStack
+	CombinerInputs  [2]world.ItemStack
+	AnvilRename     string
+	EnchantCosts    [3]int16
+	EnchantClues    [3]int16
+	LevelClues      [3]int16
+	AnvilCost       int16
 }
 
 type chestKey struct {
@@ -786,12 +790,31 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 
 	switch tr.open.MenuType {
 	case MenuTypeGeneric9x3:
+		if tr.open.VehicleEntityID != 0 {
+			vehID := tr.open.VehicleEntityID
+			s.applyVehicleChestClickLocked(session, tr, vehID, slot, button, mode)
+			tr.mu.Unlock()
+			s.TriggerInventoryChanged(session)
+			s.UnlockRecipesForInventory(session)
+			return s.syncVehicleContainerViewers(session, vehID)
+		}
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		s.applyChestClickLocked(session, tr, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
 		return s.syncChestViewers(session, bx, by, bz)
+	case MenuTypeHopper:
+		if tr.open.VehicleEntityID != 0 {
+			vehID := tr.open.VehicleEntityID
+			s.applyVehicleHopperClickLocked(session, tr, vehID, slot, button, mode)
+			tr.mu.Unlock()
+			s.TriggerInventoryChanged(session)
+			s.UnlockRecipesForInventory(session)
+			return s.syncVehicleContainerViewers(session, vehID)
+		}
+		tr.mu.Unlock()
+		return nil
 	case MenuTypeCrafting:
 		s.applyCraftingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
@@ -1623,7 +1646,17 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	isLoom := false
 	switch openCopy.MenuType {
 	case MenuTypeGeneric9x3:
-		slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+		if openCopy.VehicleEntityID != 0 {
+			slots = s.buildVehicleChestMenuSlots(session, openCopy.VehicleEntityID)
+		} else {
+			slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+		}
+	case MenuTypeHopper:
+		if openCopy.VehicleEntityID != 0 {
+			slots = s.buildVehicleHopperMenuSlots(session, openCopy.VehicleEntityID)
+		} else {
+			return nil
+		}
 	case MenuTypeCrafting:
 		slots = s.buildCraftingMenuSlots(session, openCopy.Crafting, openCopy.Result)
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
@@ -1936,4 +1969,217 @@ func (s *Server) applyBrewingStandContainerClickLocked(
 	}
 	SetCarriedPotionType(session, carriedPotion)
 }
+
+// OpenVehicleContainer opens the container menu for a chest minecart (27 slots),
+// hopper minecart (5 slots), or chest boat/raft (27 slots).
+func (s *Server) OpenVehicleContainer(session *PlayerSession, entityID int32) (int32, error) {
+	if s == nil || s.entities == nil || session == nil {
+		return 0, errors.New("server: nil session")
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || !IsContainerVehicleEntity(ent.TypeName) {
+		return 0, errors.New("server: entity is not a vehicle container")
+	}
+
+	_ = s.CloseContainer(session, 0, false)
+
+	menuType := MenuTypeGeneric9x3
+	title := "Minecart with Chest"
+	switch {
+	case ent.TypeName == EntityTypeHopperMinecart:
+		menuType = MenuTypeHopper
+		title = "Minecart with Hopper"
+	case ent.TypeName == "minecraft:bamboo_chest_raft":
+		title = "Raft with Chest"
+	case IsChestBoatEntity(ent.TypeName):
+		title = "Boat with Chest"
+	}
+
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.nextWindow = (tr.nextWindow % 100) + 1
+	cid := tr.nextWindow
+	tr.open = &OpenContainerState{
+		ContainerID:     cid,
+		MenuType:        menuType,
+		BlockX:          int(ent.X),
+		BlockY:          int(ent.Y),
+		BlockZ:          int(ent.Z),
+		VehicleEntityID: entityID,
+	}
+	carried := tr.carried
+	tr.mu.Unlock()
+
+	if session.send != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, menuType, title)); err != nil {
+			return cid, err
+		}
+		var slots []world.ItemStack
+		if menuType == MenuTypeHopper {
+			slots = s.buildVehicleHopperMenuSlots(session, entityID)
+		} else {
+			slots = s.buildVehicleChestMenuSlots(session, entityID)
+		}
+		stateID := session.NextContainerStateID()
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+			return cid, err
+		}
+	}
+	return cid, nil
+}
+
+func (s *Server) buildVehicleChestMenuSlots(session *PlayerSession, entityID int32) []world.ItemStack {
+	vehSlots := s.VehicleContainerSlots(entityID)
+	inv := session.Inventory()
+	slots := make([]world.ItemStack, ChestMenuSlotCount)
+	copy(slots[0:ChestSlotCount], vehSlots[:])
+	copy(slots[27:54], inv[9:36])
+	copy(slots[54:63], inv[36:45])
+	return slots
+}
+
+func (s *Server) buildVehicleHopperMenuSlots(session *PlayerSession, entityID int32) []world.ItemStack {
+	vehSlots := s.VehicleContainerSlots(entityID)
+	inv := session.Inventory()
+	slots := make([]world.ItemStack, HopperMenuSlotCount)
+	copy(slots[0:HopperSlotCount], vehSlots[:HopperSlotCount])
+	copy(slots[5:32], inv[9:36])
+	copy(slots[32:41], inv[36:45])
+	return slots
+}
+
+func (s *Server) applyVehicleChestClickLocked(session *PlayerSession, tr *playerContainerTracker, entityID int32, slot int, button int8, mode int32) {
+	if slot < 0 || slot >= ChestMenuSlotCount {
+		return
+	}
+	slots := s.buildVehicleChestMenuSlots(session, entityID)
+
+	switch mode {
+	case ContainerInputPickup:
+		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+	case ContainerInputQuickMove:
+		if slot < ChestSlotCount {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 63)
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 27, 54)
+		} else {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, ChestSlotCount)
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 54 + int(button)
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+		}
+	}
+
+	for i := 0; i < ChestSlotCount; i++ {
+		s.SetVehicleContainerSlot(entityID, i, slots[i])
+	}
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[27+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[54+i])
+	}
+}
+
+func (s *Server) applyVehicleHopperClickLocked(session *PlayerSession, tr *playerContainerTracker, entityID int32, slot int, button int8, mode int32) {
+	if slot < 0 || slot >= HopperMenuSlotCount {
+		return
+	}
+	slots := s.buildVehicleHopperMenuSlots(session, entityID)
+
+	switch mode {
+	case ContainerInputPickup:
+		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+	case ContainerInputQuickMove:
+		if slot < HopperSlotCount {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 32, 41)
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 5, 32)
+		} else {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, HopperSlotCount)
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 32 + int(button)
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+		}
+	}
+
+	for i := 0; i < HopperSlotCount; i++ {
+		s.SetVehicleContainerSlot(entityID, i, slots[i])
+	}
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[5+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[32+i])
+	}
+}
+
+func (s *Server) syncVehicleContainerViewers(actor *PlayerSession, entityID int32) error {
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, sess := range s.players {
+		sessions = append(sessions, sess)
+	}
+	s.playersMu.RUnlock()
+
+	var firstErr error
+	for _, sess := range sessions {
+		open := sess.OpenContainer()
+		if open != nil && open.VehicleEntityID == entityID {
+			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		} else if sess == actor {
+			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
 

@@ -490,6 +490,7 @@ func (h *handler) keepAliveLoop() {
 		if h.srv != nil && h.session != nil {
 			h.srv.DespawnPlayerFishingBobber(h.session)
 			h.srv.WakePlayerFromBed(h.session)
+			h.srv.DismountPlayerVehicle(h.session)
 			h.srv.CloseLecternIfOpen(h.session)
 			_ = h.srv.CloseLoomContainer(h.session, 0, false)
 			_ = h.srv.CloseStonecutterContainer(h.session, 0, false)
@@ -585,6 +586,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickConduits()
 			h.srv.TickAllSculk()
 			h.srv.TickCauldrons(nil)
+			h.srv.TickVehicles()
 			h.srv.TickAllPlayerStats()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
@@ -695,6 +697,18 @@ func (h *handler) syncVisibleEntities() error {
 			if entity.TypeName == server.MobTypeWarden && h.srv != nil {
 				if metaPkt := h.srv.WardenEntityDataPacket(entity.ID); len(metaPkt) > 0 {
 					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+			}
+			if entity.IsVehicle() && h.srv != nil {
+				if metaPkt := server.EncodeVehicleEntityDataPacket(entity.ID, 0, 1, 0.0); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+				if passengers := h.srv.VehiclePassengers(entity.ID); len(passengers) > 0 {
+					if err := h.conn.Send(protocol.PlaySetPassengers, server.EncodeVehiclePassengersPacket(entity.ID, passengers)); err != nil {
 						return err
 					}
 				}
@@ -1147,6 +1161,24 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayPlayerInputSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandlePlayerInputPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayMoveVehicleSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleMoveVehiclePacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayPaddleBoatSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandlePaddleBoatPacket(h.session, pkt.Body())
+		}
+		return nil
+
 	default:
 		h.log.Debug("play packet ignored", "id", pkt.ID)
 		return nil
@@ -1595,6 +1627,10 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				return h.sendBlockChangedAck(seq)
 			}
 			if _, placed := h.srv.UseDecorationItemOn(h.session, hand, x, y, z, int(face)); placed {
+				h.syncHotbarFromSession()
+				return h.sendBlockChangedAck(seq)
+			}
+			if _, placed := h.srv.UseVehicleItemOnBlock(h.session, hand, x, y, z, face, cursorX, cursorY, cursorZ); placed {
 				h.syncHotbarFromSession()
 				return h.sendBlockChangedAck(seq)
 			}

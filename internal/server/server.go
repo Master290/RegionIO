@@ -301,6 +301,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadBrewingStands()
 		_ = s.LoadSculk()
 		_ = s.LoadWardenFile()
+		_ = s.LoadVehiclesFile()
 	}
 	return s
 }
@@ -453,6 +454,9 @@ func (s *Server) SaveAll() error {
 	if err := s.SaveWardenFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := s.SaveVehiclesFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -599,6 +603,7 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	}
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)
+	s.DismountPlayerVehicle(session)
 	removed := false
 	s.playersMu.Lock()
 	if current := s.players[session.Profile.UUID]; current == session {

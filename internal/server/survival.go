@@ -569,6 +569,20 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 	if target == nil || target.IsItem() {
 		return 0, false
 	}
+	if IsVehicleEntity(target.TypeName) {
+		scale := session.CurrentAttackStrengthScale(0.5)
+		weaponDmg := BasePlayerAttackDamage
+		if ws, ok := vanillaWeapons[canonicalItemName(session.HeldItem().ResolvedID())]; ok {
+			weaponDmg = ws.AttackDamage
+		}
+		baseDmg := weaponDmg * (0.2 + scale*scale*0.8)
+		session.ResetAttackCooldown()
+		if baseDmg < 1.0 {
+			baseDmg = 1.0
+		}
+		destroyed := s.DamageVehicle(target.ID, baseDmg, session)
+		return baseDmg, destroyed
+	}
 	scale := session.CurrentAttackStrengthScale(0.5)
 	bonus := s.PlayerWeaponAttackBonus(session, target.TypeName) * scale
 
@@ -656,12 +670,22 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 		case InteractActionAttack:
 			s.AttackEntityWithEnchantments(session, pkt.EntityID)
 		case InteractActionInteractAt:
-			s.InteractWithDecorationAt(session, pkt.EntityID, pkt.Hand, float64(pkt.TargetX), float64(pkt.TargetY), float64(pkt.TargetZ), true)
+			if s.InteractWithDecorationAt(session, pkt.EntityID, pkt.Hand, float64(pkt.TargetX), float64(pkt.TargetY), float64(pkt.TargetZ), true) {
+				return nil
+			}
+			if pkt.Hand == 0 {
+				if handled, _, err := s.InteractWithVehicle(session, pkt.EntityID); handled || err != nil {
+					return err
+				}
+			}
 		default:
 			if s.InteractWithZombieVillager(session, pkt.EntityID, nil) {
 				return nil
 			}
 			if pkt.Hand == 0 {
+				if handled, _, err := s.InteractWithVehicle(session, pkt.EntityID); handled || err != nil {
+					return err
+				}
 				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
 			}
 		}
@@ -924,6 +948,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		s.RecordPlayerDeath(session)
 		s.OnPlayerDiedWithEffects(session)
 		s.DespawnPlayerFishingBobber(session)
+		s.DismountPlayerVehicle(session)
 		st := getSurvivalState(session)
 		st.mu.Lock()
 		st.dead = true
@@ -1011,7 +1036,7 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	snap := session.Snapshot()
 	st := getSurvivalState(session)
 
-	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
+	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || s.PlayerMountedVehicle(session) != 0 {
 		st.mu.Lock()
 		st.fallDistance = 0
 		st.mu.Unlock()
@@ -1092,6 +1117,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	session.SetFoodTickTimer(0)
 	session.SetBlockingWithShield(false)
 	s.StopPlayerFallFlying(session)
+	s.DismountPlayerVehicle(session)
 	s.CancelEating(session)
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)
@@ -1188,6 +1214,12 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 		return false
 	}
 	itemID := canonicalItemName(stack.ResolvedID())
+
+	if IsBoatItem(itemID) {
+		if _, placed := s.UseBoatItemInAir(session, hand); placed {
+			return true
+		}
+	}
 
 	switch itemID {
 	case "minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl", "minecraft:wind_charge":
@@ -1435,6 +1467,15 @@ func (s *Server) traceAndResolveProjectileShot(
 							dmg = 1.0
 						}
 						s.DamageArmorStand(ent.ID, dmg, cause, session)
+						hitEntity = true
+						break
+					}
+					if IsVehicleEntity(ent.TypeName) {
+						dmg := damage
+						if dmg <= 0 {
+							dmg = 1.0
+						}
+						s.DamageVehicle(ent.ID, dmg, session)
 						hitEntity = true
 						break
 					}

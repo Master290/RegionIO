@@ -79,6 +79,47 @@ func (e *Entity) IsVillager() bool {
 	return e != nil && e.TypeName == VillagerEntityTypeName
 }
 
+// IsMinecart reports whether e is any minecart variant entity.
+func (e *Entity) IsMinecart() bool {
+	if e == nil {
+		return false
+	}
+	t := strings.ToLower(strings.TrimSpace(e.TypeName))
+	if !strings.Contains(t, ":") && t != "" {
+		t = "minecraft:" + t
+	}
+	return t == "minecraft:minecart" || strings.HasSuffix(t, "_minecart")
+}
+
+// IsBoat reports whether e is any boat or raft entity (including chest boats/rafts).
+func (e *Entity) IsBoat() bool {
+	if e == nil {
+		return false
+	}
+	t := strings.ToLower(strings.TrimSpace(e.TypeName))
+	if !strings.Contains(t, ":") && t != "" {
+		t = "minecraft:" + t
+	}
+	return strings.HasSuffix(t, "_boat") || strings.HasSuffix(t, "_raft")
+}
+
+// IsChestBoat reports whether e is a chest boat or chest raft entity.
+func (e *Entity) IsChestBoat() bool {
+	if e == nil {
+		return false
+	}
+	t := strings.ToLower(strings.TrimSpace(e.TypeName))
+	if !strings.Contains(t, ":") && t != "" {
+		t = "minecraft:" + t
+	}
+	return strings.HasSuffix(t, "_chest_boat") || strings.HasSuffix(t, "_chest_raft")
+}
+
+// IsVehicle reports whether e is a minecart or boat/raft entity.
+func (e *Entity) IsVehicle() bool {
+	return e.IsMinecart() || e.IsBoat()
+}
+
 // BlockName returns the canonical block identifier (e.g. "minecraft:chest")
 // for a block state ID, or "" if unknown.
 func BlockName(state uint16) string {

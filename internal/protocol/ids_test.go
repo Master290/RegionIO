@@ -30,6 +30,8 @@ func TestPlayPacketIDsProtocol775(t *testing.T) {
 		"PlayPlayerInfoRemove": PlayPlayerInfoRemove,
 		"PlayPlayerInfoUpdate": PlayPlayerInfoUpdate,
 		"PlayTeleportEntity":   PlayTeleportEntity,
+		"PlayMoveVehicle":      PlayMoveVehicle,
+		"PlaySetPassengers":    PlaySetPassengers,
 	}
 	wantClientbound := map[string]int32{
 		"PlayAddEntity":        0x01,
@@ -58,6 +60,8 @@ func TestPlayPacketIDsProtocol775(t *testing.T) {
 		"PlayPlayerInfoRemove": 0x45,
 		"PlayPlayerInfoUpdate": 0x46,
 		"PlayTeleportEntity":   0x7d,
+		"PlayMoveVehicle":      0x39,
+		"PlaySetPassengers":    0x6b,
 	}
 	assertIDs(t, "clientbound", clientbound, wantClientbound)
 
@@ -71,6 +75,9 @@ func TestPlayPacketIDsProtocol775(t *testing.T) {
 		"PlayMovePosRot":        PlayMovePosRot,
 		"PlayMoveRot":           PlayMoveRot,
 		"PlayMoveStatusOnly":    PlayMoveStatusOnly,
+		"PlayMoveVehicleSB":     PlayMoveVehicleSB,
+		"PlayPaddleBoatSB":      PlayPaddleBoatSB,
+		"PlayPlayerInputSB":     PlayPlayerInputSB,
 		"PlayPlayerLoaded":      PlayPlayerLoaded,
 		"PlayPlayerAction":      PlayPlayerAction,
 		"PlayUseItemOn":         PlayUseItemOn,
@@ -88,6 +95,9 @@ func TestPlayPacketIDsProtocol775(t *testing.T) {
 		"PlayMovePosRot":        0x1f,
 		"PlayMoveRot":           0x20,
 		"PlayMoveStatusOnly":    0x21,
+		"PlayMoveVehicleSB":     0x22,
+		"PlayPaddleBoatSB":      0x23,
+		"PlayPlayerInputSB":     0x2b,
 		"PlayPlayerLoaded":      0x2c,
 		"PlayPlayerAction":      0x29,
 		"PlayUseItemOn":         0x42,

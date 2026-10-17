@@ -144,10 +144,12 @@ const (
 	PlayMoveEntityPos    = 0x35
 	PlayMoveEntityPosRot = 0x36
 	PlayMoveEntityRot    = 0x38
+	PlayMoveVehicle      = 0x39
 	PlaySetEntityMotion  = 0x65
 	PlayRemoveEntities   = 0x4d
 	PlaySetEntityData    = 0x63
 	PlaySetEquipment     = 0x66
+	PlaySetPassengers    = 0x6b
 	PlayTakeItemEntity   = 0x7c
 )
 
@@ -174,10 +176,13 @@ const (
 	PlayMovePosRot                = 0x1f
 	PlayMoveRot                   = 0x20
 	PlayMoveStatusOnly            = 0x21
+	PlayMoveVehicleSB             = 0x22
+	PlayPaddleBoatSB              = 0x23
 	PlayPlaceRecipe               = 0x27
 	PlayPlayerLoaded              = 0x2c
 	PlayPlayerAction              = 0x29
 	PlayPlayerCommand             = 0x2a
+	PlayPlayerInputSB             = 0x2b
 	PlayRecipeBookChangeSettings  = 0x2e
 	PlayRecipeBookSeenRecipe      = 0x2f
 	PlayRenameItem                = 0x30
