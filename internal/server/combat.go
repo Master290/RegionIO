@@ -697,7 +697,23 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 	}
 	s.DamagePlayerWithEffects(session, afterArmor, cause)
 	s.RecordDamageExhaustion(session)
+	s.SyncHealthObjectives(session)
+	if session.IsDead() {
+		s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
+	}
 	return effective
+}
+
+func (s *Server) playerByEntityID(entityID int32) *PlayerSession {
+	if s == nil || entityID == 0 {
+		return nil
+	}
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && p.EntityID == entityID {
+			return p
+		}
+	}
+	return nil
 }
 
 // AttackPlayerFromMob applies a melee attack from a mob onto target, scaling
@@ -718,6 +734,7 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 	}
 	if target.IsDead() {
 		s.TriggerKilledByEntity(target, mobType)
+		s.BroadcastDeathMessage(target, mobAttackCauseName(mobType), mobType)
 	}
 	snap := target.Snapshot()
 	vx, vy, vz := ComputeKnockback(mobX, mobZ, 0, snap.X, snap.Z, BaseKnockbackStrength)
@@ -741,6 +758,42 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	snap := session.Snapshot()
 	if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
 		return 0, false
+	}
+
+	if victim := s.playerByEntityID(targetEntityID); victim != nil {
+		if victim == session || !s.CanAttackPlayer(session, victim) {
+			return 0, false
+		}
+		vSnap := victim.Snapshot()
+		dx := vSnap.X - snap.X
+		dy := vSnap.Y - snap.Y
+		dz := vSnap.Z - snap.Z
+		if snap.GameMode != GameModeCreative && (dx*dx+dy*dy+dz*dz) > MaxMeleeAttackReach*MaxMeleeAttackReach {
+			return 0, false
+		}
+		baseDamage, _ := StackAttackStats(session.HeldItem())
+		baseDamage += session.MeleeDamageBonus()
+		scale := session.CurrentAttackStrengthScale(0.5)
+		session.ResetAttackCooldown()
+		if baseDamage <= 0 {
+			return 0, false
+		}
+		damage := baseDamage * AttackDamageMultiplier(scale)
+		if scale > 0.9 && !snap.OnGround && session.FallDistance() > 0 && !session.IsSprinting() {
+			damage *= CriticalHitMultiplier
+		}
+		s.RecordAttackExhaustion(session)
+		dealt := s.DamagePlayerWithArmor(victim, damage, "player")
+		if dealt <= 0 {
+			return 0, false
+		}
+		if victim.IsDead() {
+			s.IncrementCriteriaObjectives(session.Profile.Name, "playerKillCount", 1)
+			s.IncrementCriteriaObjectives(session.Profile.Name, "totalKillCount", 1)
+			s.BroadcastDeathMessage(victim, "player", session.Profile.Name)
+			return dealt, true
+		}
+		return dealt, false
 	}
 
 	target := s.entities.Get(targetEntityID)
@@ -916,6 +969,7 @@ func (s *Server) applyDamageToMob(
 	}
 	if attacker != nil {
 		s.TriggerEntityKilled(attacker, target.TypeName)
+		s.IncrementCriteriaObjectives(attacker.Profile.Name, "totalKillCount", 1)
 	}
 	return true
 }
