@@ -17,6 +17,18 @@ import (
 // properties map onto the runtime's state IDs (surface rules know a subset,
 // the full table knows everything).
 
+// JigsawBlockTag holds the NBT attributes of a minecraft:jigsaw block inside a StructureTemplate.
+type JigsawBlockTag struct {
+	Orientation       string
+	Name              string
+	Target            string
+	Pool              string
+	FinalState        string
+	Joint             string
+	SelectionPriority int
+	PlacementPriority int
+}
+
 // TemplateBlockInfo is one resolved template cell.
 type TemplateBlockInfo struct {
 	Pos    [3]int
@@ -24,7 +36,11 @@ type TemplateBlockInfo struct {
 	HasNBT bool
 	// Marker is the data-marker metadata string for structure_block blocks
 	// with a nested NBT compound (e.g. "chest", "drowned"), empty otherwise.
-	Marker string
+	Marker                  string
+	BlockName               string
+	BlockProps              map[string]string
+	Jigsaw                  *JigsawBlockTag
+	IsRandomizableContainer bool
 }
 
 // LoadResolvedTemplate reads a template file from disk.
@@ -41,13 +57,94 @@ func LoadResolvedTemplate(path string, resolve func(name string, props map[strin
 }
 
 // EmbeddedStructureTemplate reads a template from the embedded datapack data
-// by its resource-path name, e.g. "ruined_portal/portal_1".
+// by its resource-path name, e.g. "ruined_portal/portal_1" or "village/plains/houses/plains_small_house_1".
 func EmbeddedStructureTemplate(name string) ([]byte, error) {
+	if b, ok := EmbeddedStructureTemplateZip(name); ok {
+		return b, nil
+	}
 	return dataFS.ReadFile("data/structure_template/" + name + ".nbt")
 }
 
-// LoadResolvedTemplateBytes parses template NBT already in memory.
-func LoadResolvedTemplateBytes(raw []byte, resolve func(name string, props map[string]string) (uint16, bool)) ([]TemplateBlockInfo, [3]int, error) {
+type resolvedPaletteEntry struct {
+	id    uint16
+	valid bool
+	name  string
+	props map[string]string
+}
+
+func parsePaletteList(tag nbt.List, resolve func(name string, props map[string]string) (uint16, bool)) []resolvedPaletteEntry {
+	var palette []resolvedPaletteEntry
+	for _, entry := range tag.Elems {
+		stateComp, ok := entry.(*nbt.Compound)
+		if !ok {
+			palette = append(palette, resolvedPaletteEntry{})
+			continue
+		}
+		name := ""
+		if nameTag, ok := stateComp.Get("Name"); ok {
+			name = string(nameTag.(nbt.String))
+		}
+		props := map[string]string{}
+		if propTag, ok := stateComp.Get("Properties"); ok {
+			if propComp, isCompound := propTag.(*nbt.Compound); isCompound {
+				for _, key := range propComp.Keys() {
+					if v, ok := propComp.Get(key); ok {
+						props[key] = string(v.(nbt.String))
+					}
+				}
+			}
+		}
+		id, valid := resolve(name, props)
+		palette = append(palette, resolvedPaletteEntry{
+			id:    id,
+			valid: valid,
+			name:  name,
+			props: props,
+		})
+	}
+	return palette
+}
+
+func nbtStringOr(nc *nbt.Compound, key, def string) string {
+	if v, ok := nc.Get(key); ok {
+		if s, isStr := v.(nbt.String); isStr && string(s) != "" {
+			return string(s)
+		}
+	}
+	return def
+}
+
+func nbtIntOr(nc *nbt.Compound, key string, def int) int {
+	if v, ok := nc.Get(key); ok {
+		switch iv := v.(type) {
+		case nbt.Int:
+			return int(iv)
+		case nbt.Short:
+			return int(iv)
+		case nbt.Byte:
+			return int(iv)
+		case nbt.Long:
+			return int(iv)
+		}
+	}
+	return def
+}
+
+func isRandomizableContainerBlock(name string) bool {
+	switch name {
+	case "minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel",
+		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper",
+		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker",
+		"minecraft:brewing_stand", "minecraft:shulker_box", "minecraft:decorated_pot",
+		"minecraft:crafter":
+		return true
+	}
+	return false
+}
+
+// LoadResolvedTemplatePalettesBytes parses a template NBT (handling both single
+// "palette" and multi-palette "palettes") into one []TemplateBlockInfo per palette.
+func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, props map[string]string) (uint16, bool)) ([][]TemplateBlockInfo, [3]int, error) {
 	raw, err := readMaybeGzipBytes(raw)
 	if err != nil {
 		return nil, [3]int{}, err
@@ -70,81 +167,112 @@ func LoadResolvedTemplateBytes(raw []byte, resolve func(name string, props map[s
 		}
 	}
 
-	var palette []struct {
-		id    uint16
-		valid bool
+	var palettes [][]resolvedPaletteEntry
+	if rawPalettes, ok := comp.Get("palettes"); ok {
+		if palList, isList := rawPalettes.(nbt.List); isList {
+			for _, pElem := range palList.Elems {
+				if subList, ok := pElem.(nbt.List); ok {
+					palettes = append(palettes, parsePaletteList(subList, resolve))
+				}
+			}
+		}
 	}
-	if rawTag, ok := comp.Get("palette"); ok {
+	if len(palettes) == 0 {
+		if rawTag, ok := comp.Get("palette"); ok {
+			if tag, isList := rawTag.(nbt.List); isList {
+				palettes = append(palettes, parsePaletteList(tag, resolve))
+			}
+		}
+	}
+	if len(palettes) == 0 {
+		return nil, size, nil
+	}
+
+	out := make([][]TemplateBlockInfo, len(palettes))
+	if rawTag, ok := comp.Get("blocks"); ok {
 		if tag, isList := rawTag.(nbt.List); isList {
-			for _, entry := range tag.Elems {
-				stateComp, ok := entry.(*nbt.Compound)
-				if !ok {
-					palette = append(palette, struct {
-						id    uint16
-						valid bool
-					}{})
-					continue
-				}
-				name := ""
-				if nameTag, ok := stateComp.Get("Name"); ok {
-					name = string(nameTag.(nbt.String))
-				}
-				props := map[string]string{}
-				if propTag, ok := stateComp.Get("Properties"); ok {
-					if propComp, isCompound := propTag.(*nbt.Compound); isCompound {
-						for _, key := range propComp.Keys() {
-							if v, ok := propComp.Get(key); ok {
-								props[key] = string(v.(nbt.String))
+			for pIdx, palette := range palettes {
+				var blocks []TemplateBlockInfo
+				for _, entry := range tag.Elems {
+					blockComp, ok := entry.(*nbt.Compound)
+					if !ok {
+						continue
+					}
+					stateIdx := nbt.Int(0)
+					if stateTag, ok := blockComp.Get("state"); ok {
+						stateIdx = stateTag.(nbt.Int)
+					}
+					var pos [3]int
+					if posTag, ok := blockComp.Get("pos"); ok {
+						if posList, isList := posTag.(nbt.List); isList && len(posList.Elems) == 3 {
+							pos[0] = int(posList.Elems[0].(nbt.Int))
+							pos[1] = int(posList.Elems[1].(nbt.Int))
+							pos[2] = int(posList.Elems[2].(nbt.Int))
+						}
+					}
+					if int(stateIdx) < 0 || int(stateIdx) >= len(palette) || !palette[stateIdx].valid {
+						continue
+					}
+					pe := palette[stateIdx]
+					info := TemplateBlockInfo{
+						Pos:        pos,
+						State:      pe.id,
+						BlockName:  pe.name,
+						BlockProps: pe.props,
+					}
+					if nbtTag, hasNBT := blockComp.Get("nbt"); hasNBT {
+						info.HasNBT = true
+						info.IsRandomizableContainer = isRandomizableContainerBlock(pe.name)
+						if nc, isCompound := nbtTag.(*nbt.Compound); isCompound {
+							if mt, ok := nc.Get("metadata"); ok {
+								info.Marker = string(mt.(nbt.String))
+							}
+							if pe.name == "minecraft:jigsaw" {
+								orient := pe.props["orientation"]
+								if orient == "" {
+									orient = "north_up"
+								}
+								joint := nbtStringOr(nc, "joint", "")
+								if joint != "rollable" && joint != "aligned" {
+									if orient == "up_north" || orient == "up_east" || orient == "up_south" || orient == "up_west" ||
+										orient == "down_north" || orient == "down_east" || orient == "down_south" || orient == "down_west" {
+										joint = "rollable"
+									} else {
+										joint = "aligned"
+									}
+								}
+								info.Jigsaw = &JigsawBlockTag{
+									Orientation:       orient,
+									Name:              nbtStringOr(nc, "name", "minecraft:empty"),
+									Target:            nbtStringOr(nc, "target", "minecraft:empty"),
+									Pool:              nbtStringOr(nc, "pool", "minecraft:empty"),
+									FinalState:        nbtStringOr(nc, "final_state", "minecraft:air"),
+									Joint:             joint,
+									SelectionPriority: nbtIntOr(nc, "selection_priority", 0),
+									PlacementPriority: nbtIntOr(nc, "placement_priority", 0),
+								}
 							}
 						}
 					}
+					blocks = append(blocks, info)
 				}
-				id, valid := resolve(name, props)
-				palette = append(palette, struct {
-					id    uint16
-					valid bool
-				}{id, valid})
+				out[pIdx] = blocks
 			}
 		}
 	}
+	return out, size, nil
+}
 
-	var blocks []TemplateBlockInfo
-	if rawTag, ok := comp.Get("blocks"); ok {
-		if tag, isList := rawTag.(nbt.List); isList {
-			for _, entry := range tag.Elems {
-				blockComp, ok := entry.(*nbt.Compound)
-				if !ok {
-					continue
-				}
-				stateIdx := nbt.Int(0)
-				if stateTag, ok := blockComp.Get("state"); ok {
-					stateIdx = stateTag.(nbt.Int)
-				}
-				var pos [3]int
-				if posTag, ok := blockComp.Get("pos"); ok {
-					if posList, isList := posTag.(nbt.List); isList && len(posList.Elems) == 3 {
-						pos[0] = int(posList.Elems[0].(nbt.Int))
-						pos[1] = int(posList.Elems[1].(nbt.Int))
-						pos[2] = int(posList.Elems[2].(nbt.Int))
-					}
-				}
-				if int(stateIdx) < 0 || int(stateIdx) >= len(palette) || !palette[stateIdx].valid {
-					continue
-				}
-				info := TemplateBlockInfo{Pos: pos, State: palette[stateIdx].id}
-				if nbtTag, hasNBT := blockComp.Get("nbt"); hasNBT {
-					info.HasNBT = true
-					if nc, isCompound := nbtTag.(*nbt.Compound); isCompound {
-						if mt, ok := nc.Get("metadata"); ok {
-							info.Marker = string(mt.(nbt.String))
-						}
-					}
-				}
-				blocks = append(blocks, info)
-			}
-		}
+// LoadResolvedTemplateBytes parses template NBT already in memory.
+func LoadResolvedTemplateBytes(raw []byte, resolve func(name string, props map[string]string) (uint16, bool)) ([]TemplateBlockInfo, [3]int, error) {
+	palettes, size, err := LoadResolvedTemplatePalettesBytes(raw, resolve)
+	if err != nil {
+		return nil, [3]int{}, err
 	}
-	return blocks, size, nil
+	if len(palettes) == 0 {
+		return nil, size, nil
+	}
+	return palettes[0], size, nil
 }
 
 func readMaybeGzipBytes(b []byte) ([]byte, error) {

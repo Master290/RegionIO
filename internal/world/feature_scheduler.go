@@ -388,6 +388,31 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 			}
 		}
 	}
+	var villages []*JigsawStart
+	for sx := targetX - 6; sx <= targetX+6; sx++ {
+		for sz := targetZ - 6; sz <= targetZ+6; sz++ {
+			start, err := VillageGenerationPoint(od, sets, seed, sx, sz)
+			if err != nil {
+				return err
+			}
+			if start != nil {
+				villages = append(villages, start)
+			}
+		}
+	}
+	if len(villages) > 0 {
+		for _, vName := range []string{
+			"minecraft:village_desert",
+			"minecraft:village_plains",
+			"minecraft:village_savanna",
+			"minecraft:village_snowy",
+			"minecraft:village_taiga",
+		} {
+			for _, key := range regionChunks {
+				PlaceJigsawStartsForChunk(r, villages, vName, 4, seed, key[0], key[1])
+			}
+		}
+	}
 	// Step 5 (strongholds): piece trees can span up to 8 chunks from start.
 	var strongholds []*StrongholdStart
 	for sx := targetX - 8; sx <= targetX+8; sx++ {
