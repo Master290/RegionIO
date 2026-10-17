@@ -1082,6 +1082,14 @@ func (s *Server) emitGameEventInternal(
 	if s == nil {
 		return 0
 	}
+	s.EnsureWardenSummonHook()
+	srcID := source.EntityID
+	if srcID == 0 && source.Player != nil {
+		srcID = source.Player.EntityID
+	}
+	if srcID != 0 && s.IsWardenEntity(srcID) {
+		return 0
+	}
 	canonicalEv := canonicalGameEvent(event)
 	freq := VibrationFrequency(canonicalEv)
 	if freq <= 0 {
@@ -1209,7 +1217,7 @@ func (s *Server) emitGameEventInternal(
 					MaxDistance:    radius,
 					TicksRemaining: VibrationTravelTicks(dist),
 					Player:         source.Player,
-					EntityID:       source.EntityID,
+					EntityID:       srcID,
 					IsResonance:    isResonance,
 				}
 				scheduledCount++
@@ -1220,6 +1228,19 @@ func (s *Server) emitGameEventInternal(
 
 	if scheduledCount > 0 {
 		_ = s.SaveSculk()
+	}
+	if excludeSensor == nil {
+		s.NotifyWardensOfVibration(VibrationEvent{
+			Dimension:      normDim,
+			Type:           canonicalEv,
+			X:              x,
+			Y:              y,
+			Z:              z,
+			SourceEntityID: srcID,
+			Player:         source.Player,
+			Sneaking:       source.Sneaking,
+			BlockOrItemID:  source.BlockOrItemID,
+		})
 	}
 	return scheduledCount
 }
