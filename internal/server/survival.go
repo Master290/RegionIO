@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"sync"
 
@@ -787,6 +788,9 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 				if handled, _, err := s.InteractWithVehicle(session, pkt.EntityID); handled || err != nil {
 					return err
 				}
+				if handled, err := s.InteractWithEquineEntity(session, pkt.EntityID, pkt.UsingSecondaryAction || session.IsSneaking()); handled || err != nil {
+					return err
+				}
 			}
 		default:
 			if s.InteractWithZombieVillager(session, pkt.EntityID, nil) {
@@ -796,12 +800,64 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 				if handled, _, err := s.InteractWithVehicle(session, pkt.EntityID); handled || err != nil {
 					return err
 				}
+				if handled, err := s.InteractWithEquineEntity(session, pkt.EntityID, pkt.UsingSecondaryAction || session.IsSneaking()); handled || err != nil {
+					return err
+				}
 				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
 				s.RefreshItemFrameComparators(pkt.EntityID)
 			}
 		}
 	}
 	return nil
+}
+
+// InteractWithEquineEntity handles right-clicking an equine or llama entity:
+//   - If sneaking with an empty hand on a tamed mob, opens ClientboundHorseScreenOpenPacket.
+//   - If sneaking or holding equipment/food/chest/shears, delegates to InteractWithTameableMob.
+//   - Otherwise (not sneaking, adult, unridden), mounts the player onto the equine/llama.
+func (s *Server) InteractWithEquineEntity(session *PlayerSession, entityID int32, sneaking bool) (bool, error) {
+	if s == nil || s.entities == nil || session == nil || session.IsDead() {
+		return false, nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || !IsHorseLikeMob(ent.TypeName) {
+		return false, nil
+	}
+	held := session.HeldItem()
+	if sneaking && held.IsEmpty() && s.IsMobTamed(entityID) {
+		cid, err := s.OpenEquineInventory(session, entityID)
+		return cid > 0 || err != nil, err
+	}
+	if sneaking || !held.IsEmpty() {
+		if handled, _ := s.InteractWithTameableMob(session, entityID, nil); handled {
+			return true, nil
+		}
+		if sneaking {
+			return false, nil
+		}
+	}
+	if !s.IsMobBaby(entityID) && s.EquineRider(entityID) == 0 {
+		if !s.IsMobTamed(entityID) {
+			_, _ = s.InteractWithTameableMob(session, entityID, nil)
+		}
+		if s.MountEquine(session.EntityID, entityID) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// StrikeLightningInThunderstorm spawns a lightning bolt at (dim, x, y, z) and,
+// when the server weather is thundering, rolls TrySpawnSkeletonTrapOnLightning.
+func (s *Server) StrikeLightningInThunderstorm(dim string, x, y, z float64, rng *rand.Rand) (boltID, trapHorseID int32, trapSpawned bool) {
+	if s == nil {
+		return 0, 0, false
+	}
+	boltID, sx, sy, sz, _ := s.SpawnLightningBolt(dim, x, y, z, rng)
+	if s.IsThundering() {
+		trapHorseID, trapSpawned = s.TrySpawnSkeletonTrapOnLightning(dim, sx, sy, sz, false, rng)
+	}
+	return boltID, trapHorseID, trapSpawned
 }
 
 func (s *Server) broadcastBlockAndLightUpdate(x, y, z int, state uint16, lightChunks []world.ChunkPos) {

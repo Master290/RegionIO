@@ -92,8 +92,9 @@ const (
 	PlayPlayerInfoUpdate    = 0x46
 	PlaySetTime             = 0x71
 	PlayDamageEvent         = 0x19
-	PlayEntityEvent         = 0x22
-	PlayHurtAnimation       = 0x2a
+	PlayEntityEvent           = 0x22
+	PlayHorseScreenOpen       = 0x29
+	PlayHurtAnimation         = 0x2a
 	PlayOpenScreen            = 0x3b
 	PlayMerchantOffers        = 0x34
 	PlayPlayerCombatKill      = 0x44

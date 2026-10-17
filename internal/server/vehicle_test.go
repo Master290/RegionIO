@@ -544,3 +544,50 @@ func TestVehicleDamageDestructionDropsAndNBTPersistence(t *testing.T) {
 		t.Fatalf("expected chest_minecart (%v) and 7x emerald (%v) drops on destruction", sawChestMinecart, sawEmerald)
 	}
 }
+
+func TestEquineInventoryScreenAndRidingHooks(t *testing.T) {
+	srv, sess := newTestPlayServer(t)
+
+	horseID, err := srv.SpawnMob(1.5, 65, 1.5, MobTypeHorse)
+	if err != nil {
+		t.Fatalf("SpawnMob(horse): %v", err)
+	}
+	srv.TameMob(horseID, sess)
+
+	// Right-click tamed horse while not sneaking with empty hand mounts the player.
+	handled, err := srv.InteractWithEquineEntity(sess, horseID, false)
+	if err != nil || !handled || srv.PlayerMountedEquine(sess) != horseID {
+		t.Fatalf("expected non-sneak empty-hand interact to mount horse: handled=%v err=%v mounted=%d", handled, err, srv.PlayerMountedEquine(sess))
+	}
+
+	// Sneaking with empty hand on tamed horse opens ClientboundHorseScreenOpenPacket (MenuTypeHorse).
+	srv.DismountPlayerVehicle(sess)
+	if srv.PlayerMountedEquine(sess) != 0 {
+		t.Fatalf("expected DismountPlayerVehicle to dismount equine")
+	}
+	handled, err = srv.InteractWithEquineEntity(sess, horseID, true)
+	if err != nil || !handled {
+		t.Fatalf("expected sneak empty-hand interact on tamed horse to open inventory: handled=%v err=%v", handled, err)
+	}
+	open := sess.OpenContainer()
+	if open == nil || open.MenuType != MenuTypeHorse || open.VehicleEntityID != horseID {
+		t.Fatalf("expected open MenuTypeHorse for horse %d, got %+v", horseID, open)
+	}
+
+	// Shift-click saddle and diamond_horse_armor from player hotbar into slots 0 and 1.
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:saddle", 1))
+	sess.SetInventorySlot(37, world.NewNamedItemStack("minecraft:diamond_horse_armor", 1))
+	if err := srv.HandleContainerClick(sess, open.ContainerID, 2+27+0, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick(saddle): %v", err)
+	}
+	if !srv.IsEquineSaddled(horseID) {
+		t.Fatalf("expected quick-move saddle to equip horse saddle")
+	}
+	if err := srv.HandleContainerClick(sess, open.ContainerID, 2+27+1, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick(armor): %v", err)
+	}
+	if srv.HorseArmorItem(horseID) != "minecraft:diamond_horse_armor" {
+		t.Fatalf("expected quick-move armor to equip diamond_horse_armor, got %q", srv.HorseArmorItem(horseID))
+	}
+}
+

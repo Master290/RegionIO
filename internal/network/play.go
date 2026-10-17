@@ -998,9 +998,26 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case server.PlayPlayerCommandSB:
 		if h.srv != nil {
-			if _, action, jumpBoost, decErr := server.DecodePlayerCommandPacket(pkt.Body()); decErr == nil && action == 5 && h.session != nil {
-				if camelID := h.srv.PlayerMountedCamel(h.session); camelID > 0 && h.srv.CamelDriver(camelID) == h.session.EntityID {
-					_, _, _, _ = h.srv.ExecuteCamelDash(camelID, int(jumpBoost))
+			if _, action, jumpBoost, decErr := server.DecodePlayerCommandPacket(pkt.Body()); decErr == nil && h.session != nil {
+				switch action {
+				case 3: // START_RIDING_JUMP
+					if jumpBoost >= 1 && jumpBoost <= 100 {
+						if mountID := h.srv.PlayerMountedEquine(h.session); mountID > 0 && h.srv.EquineRider(mountID) == h.session.EntityID {
+							_, _, _, _ = h.srv.ExecuteEquineJump(mountID, jumpBoost)
+						} else if camelID := h.srv.PlayerMountedCamel(h.session); camelID > 0 && h.srv.CamelDriver(camelID) == h.session.EntityID {
+							_, _, _, _ = h.srv.ExecuteCamelDash(camelID, int(jumpBoost))
+						}
+					}
+				case 5: // OPEN_INVENTORY (also legacy test action for camel dash when jumpBoost > 0)
+					if mountID := h.srv.PlayerMountedEquine(h.session); mountID > 0 && h.srv.EquineRider(mountID) == h.session.EntityID {
+						if jumpBoost >= 1 && jumpBoost <= 100 {
+							_, _, _, _ = h.srv.ExecuteEquineJump(mountID, jumpBoost)
+						} else if h.srv.IsMobTamed(mountID) {
+							_, _ = h.srv.OpenEquineInventory(h.session, mountID)
+						}
+					} else if camelID := h.srv.PlayerMountedCamel(h.session); camelID > 0 && h.srv.CamelDriver(camelID) == h.session.EntityID && jumpBoost > 0 {
+						_, _, _, _ = h.srv.ExecuteCamelDash(camelID, int(jumpBoost))
+					}
 				}
 			}
 			_ = h.srv.HandlePlayerCommandPacket(h.session, pkt.Body())

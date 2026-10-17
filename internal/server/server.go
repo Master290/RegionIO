@@ -308,6 +308,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadChiseledBookshelves()
 		_ = s.LoadDecoratedPots()
 		_ = s.LoadPortalsFile()
+		_ = s.LoadEquinesAndLlamasFile()
 	}
 	return s
 }
@@ -482,6 +483,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SavePortalsFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveEquinesAndLlamasFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {

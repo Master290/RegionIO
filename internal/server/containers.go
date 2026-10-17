@@ -11,6 +11,7 @@ import (
 
 // MenuType registry IDs in BuiltInRegistries.MENU (protocol 775 / 26.1.2).
 const (
+	MenuTypeHorse        int32 = -2 // Equine/llama inventory screen (opened via PlayHorseScreenOpen 0x29)
 	MenuTypeGeneric9x3   int32 = 2  // Single chest (27 chest slots + 36 player slots)
 	MenuTypeAnvil        int32 = 8  // Anvil (2 input + 1 result + 36 player slots)
 	MenuTypeBlastFurnace int32 = 10 // Blast furnace (3 furnace slots + 36 player slots)
@@ -975,6 +976,13 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
 		return err
+	case MenuTypeHorse:
+		equineID := tr.open.VehicleEntityID
+		s.applyEquineContainerClickLocked(session, tr, equineID, slot, button, mode)
+		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		return s.syncOpenContainer(session)
 	default:
 		tr.mu.Unlock()
 		return nil
@@ -1741,6 +1749,8 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	case CrafterMenuType:
 		slots = s.BuildCrafterMenuSlots(session, session.Dimension(), openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 		isCrafter = true
+	case MenuTypeHorse:
+		slots = s.BuildEquineMenuSlots(session, openCopy.VehicleEntityID)
 	case MenuTypeGeneric3x3:
 		slots = s.BuildDispenserMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	case MenuTypeCrafting:
@@ -2432,6 +2442,272 @@ func (s *Server) SyncCrafterViewers(actor *PlayerSession, bx, by, bz int) error 
 	}
 	return firstErr
 }
+
+// EncodeHorseScreenOpen encodes a ClientboundHorseScreenOpenPacket (0x29 in protocol 775):
+// VarInt(ContainerID), VarInt(InventoryColumns), Int32(EntityID).
+func EncodeHorseScreenOpen(containerID, inventoryColumns, entityID int32) []byte {
+	w := protocol.NewWriter(16)
+	w.VarInt(containerID)
+	w.VarInt(inventoryColumns)
+	w.Int32(entityID)
+	return w.Bytes()
+}
+
+// DecodeHorseScreenOpen decodes a ClientboundHorseScreenOpenPacket (0x29).
+func DecodeHorseScreenOpen(r *protocol.Reader) (containerID, inventoryColumns, entityID int32, err error) {
+	containerID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	inventoryColumns, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	entityID, err = r.Int32()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return containerID, inventoryColumns, entityID, nil
+}
+
+// OpenEquineInventory opens a ClientboundHorseScreenOpenPacket (0x29) menu for
+// a tamed horse, donkey, mule, skeleton_horse, zombie_horse, llama, or trader_llama.
+func (s *Server) OpenEquineInventory(session *PlayerSession, entityID int32) (int32, error) {
+	if s == nil || s.entities == nil || session == nil || session.IsDead() {
+		return 0, nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || !IsHorseLikeMob(ent.TypeName) || !s.IsMobTamed(entityID) {
+		return 0, nil
+	}
+	if open := session.OpenContainer(); open != nil {
+		_ = s.CloseContainer(session, open.ContainerID, true)
+	}
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.nextWindow = (tr.nextWindow % 100) + 1
+	cid := tr.nextWindow
+	tr.open = &OpenContainerState{
+		ContainerID:     cid,
+		MenuType:        MenuTypeHorse,
+		VehicleEntityID: entityID,
+	}
+	tr.mu.Unlock()
+
+	chestSlots := s.EquineChestSlotCountFor(entityID)
+	columns := int32(chestSlots / 3)
+	if session.send != nil {
+		if err := session.send(protocol.PlayHorseScreenOpen, EncodeHorseScreenOpen(cid, columns, entityID)); err != nil {
+			return cid, err
+		}
+	}
+	return cid, s.syncOpenContainer(session)
+}
+
+// BuildEquineMenuSlots builds the container slot slice for a horse/llama screen:
+//   - Slot 0: Saddle (`IsEquineSaddled`)
+//   - Slot 1: Horse armor (`HorseArmorItem`) or Llama carpet (`LlamaCarpetItem`)
+//   - Slots 2 .. 2+chestSlots-1: Chest slots when `HasEquineChest` (`EquineInventorySlot`)
+//   - Remaining 36 slots: Player main inventory (9..35) + hotbar (36..44)
+func (s *Server) BuildEquineMenuSlots(session *PlayerSession, entityID int32) []world.ItemStack {
+	chestSlots := 0
+	if s != nil && s.HasEquineChest(entityID) {
+		chestSlots = s.EquineChestSlotCountFor(entityID)
+	}
+	equipAndChest := 2 + chestSlots
+	slots := make([]world.ItemStack, equipAndChest+36)
+	if s != nil && entityID > 0 {
+		if s.IsEquineSaddled(entityID) {
+			slots[0] = world.NewNamedItemStack("minecraft:saddle", 1)
+		}
+		if armorItem := s.HorseArmorItem(entityID); armorItem != "" {
+			slots[1] = world.NewNamedItemStack(armorItem, 1)
+		} else if carpetItem := s.LlamaCarpetItem(entityID); carpetItem != "" {
+			slots[1] = world.NewNamedItemStack(carpetItem, 1)
+		}
+		for i := 0; i < chestSlots; i++ {
+			slots[2+i] = s.EquineInventorySlot(entityID, i)
+		}
+	}
+	if session != nil {
+		for i := 0; i < 27; i++ {
+			slots[equipAndChest+i] = session.InventorySlot(9 + i)
+		}
+		for i := 0; i < 9; i++ {
+			slots[equipAndChest+27+i] = session.InventorySlot(36 + i)
+		}
+	}
+	return slots
+}
+
+func (s *Server) canAcceptEquineSlot(entityID int32, slot int, stack world.ItemStack) bool {
+	if stack.IsEmpty() || s == nil || s.entities == nil {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return false
+	}
+	norm := canonicalResourceName(ent.TypeName)
+	itemName := canonicalResourceName(stack.ResolvedID())
+	switch slot {
+	case 0:
+		if norm == MobTypeLlama || norm == MobTypeTraderLlama {
+			return false
+		}
+		return itemName == "minecraft:saddle"
+	case 1:
+		if norm == MobTypeHorse {
+			return IsHorseArmorItem(itemName)
+		}
+		if norm == MobTypeLlama || norm == MobTypeTraderLlama {
+			_, ok := CarpetColorByItemName(itemName)
+			return ok
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) applyEquineContainerClickLocked(session *PlayerSession, tr *playerContainerTracker, entityID int32, slot int, button int8, mode int32) {
+	if s == nil || session == nil || entityID <= 0 {
+		return
+	}
+	slots := s.BuildEquineMenuSlots(session, entityID)
+	chestSlots := 0
+	if s.HasEquineChest(entityID) {
+		chestSlots = s.EquineChestSlotCountFor(entityID)
+	}
+	equipAndChest := 2 + chestSlots
+	totalSlots := equipAndChest + 36
+	if slot < 0 || slot >= totalSlots {
+		return
+	}
+
+	switch mode {
+	case ContainerInputPickup:
+		if (slot == 0 || slot == 1) && !tr.carried.IsEmpty() {
+			if !s.canAcceptEquineSlot(entityID, slot, tr.carried) {
+				return
+			}
+			if slots[slot].IsEmpty() {
+				slots[slot] = world.NewItemStack(tr.carried.ResolvedItemID(), 1)
+				if tr.carried.Count <= 1 {
+					tr.carried = world.ItemStack{}
+				} else {
+					tr.carried.Count--
+				}
+			} else if tr.carried.Count == 1 {
+				slots[slot], tr.carried = tr.carried, slots[slot]
+			}
+		} else {
+			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+		}
+	case ContainerInputQuickMove:
+		if slot < equipAndChest {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], equipAndChest+27, totalSlots)
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], equipAndChest, equipAndChest+27)
+		} else {
+			cur := slots[slot]
+			if !cur.IsEmpty() {
+				if slots[0].IsEmpty() && s.canAcceptEquineSlot(entityID, 0, cur) {
+					slots[0] = world.NewItemStack(cur.ResolvedItemID(), 1)
+					if cur.Count <= 1 {
+						slots[slot] = world.ItemStack{}
+					} else {
+						slots[slot].Count--
+					}
+				} else if slots[1].IsEmpty() && s.canAcceptEquineSlot(entityID, 1, cur) {
+					slots[1] = world.NewItemStack(cur.ResolvedItemID(), 1)
+					if cur.Count <= 1 {
+						slots[slot] = world.ItemStack{}
+					} else {
+						slots[slot].Count--
+					}
+				} else if chestSlots > 0 {
+					slots[slot] = mergeIntoSlotSlice(slots, cur, 2, equipAndChest)
+				}
+			}
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := equipAndChest + 27 + int(button)
+			if slot == 0 || slot == 1 {
+				if !slots[hotbarIdx].IsEmpty() && (!s.canAcceptEquineSlot(entityID, slot, slots[hotbarIdx]) || slots[hotbarIdx].Count > 1) {
+					return
+				}
+			}
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+	}
+
+	// Sync slot 0: Saddle
+	wantSaddled := !slots[0].IsEmpty() && canonicalResourceName(slots[0].ResolvedID()) == "minecraft:saddle"
+	if wantSaddled != s.IsEquineSaddled(entityID) {
+		s.EquipEquineSaddle(entityID, wantSaddled)
+	}
+
+	// Sync slot 1: Horse armor or Llama carpet
+	if ent := s.entities.Get(entityID); ent != nil {
+		norm := canonicalResourceName(ent.TypeName)
+		switch norm {
+		case MobTypeHorse:
+			curArmor := s.HorseArmorItem(entityID)
+			newItem := ""
+			if !slots[1].IsEmpty() {
+				newItem = canonicalResourceName(slots[1].ResolvedID())
+			}
+			if newItem != curArmor {
+				if curArmor != "" {
+					_, _ = s.RemoveHorseArmor(entityID)
+				}
+				if newItem != "" && IsHorseArmorItem(newItem) {
+					s.EquipHorseArmor(entityID, slots[1])
+				}
+			}
+		case MobTypeLlama, MobTypeTraderLlama:
+			curCarpet := s.LlamaCarpetItem(entityID)
+			newItem := ""
+			if !slots[1].IsEmpty() {
+				newItem = canonicalResourceName(slots[1].ResolvedID())
+			}
+			if newItem != curCarpet {
+				if newItem == "" {
+					mgr := s.equineManager()
+					mgr.mu.Lock()
+					if st := mgr.equines[entityID]; st != nil {
+						st.CarpetColor = -1
+					}
+					mgr.mu.Unlock()
+					cp := ent.ChunkPos()
+					s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEquipment,
+						EncodeBodyEquipmentPacket(entityID, world.ItemStack{}))
+				} else if color, ok := CarpetColorByItemName(newItem); ok {
+					s.EquipLlamaCarpet(entityID, color)
+				}
+			}
+		}
+	}
+
+	// Sync chest slots 2 .. 2+chestSlots-1
+	for i := 0; i < chestSlots; i++ {
+		s.SetEquineInventorySlot(entityID, i, slots[2+i])
+	}
+
+	// Sync player inventory
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[equipAndChest+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[equipAndChest+27+i])
+	}
+}
+
 
 
 

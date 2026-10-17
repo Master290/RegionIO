@@ -174,13 +174,13 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	listNode := literal("list", true, listUUIDs)
 
 	// /spawnpoint [<targets> [<pos> [<angle>]]]
-	spAngle := argument("angle", ArgParserFloat, nil, true)
+	spAngle := argument("angle", ArgParserRotation, nil, true)
 	spPos := argument("pos", ArgParserVec3, nil, true, spAngle)
 	spTargets := argument("targets", ArgParserEntity, []byte{EntityArgPlayersOnly}, true, spPos)
 	spawnpointNode := literal("spawnpoint", true, spTargets)
 
 	// /setworldspawn [<pos> [<angle>]]
-	swsAngle := argument("angle", ArgParserFloat, nil, true)
+	swsAngle := argument("angle", ArgParserRotation, nil, true)
 	swsPos := argument("pos", ArgParserVec3, nil, true, swsAngle)
 	setworldspawnNode := literal("setworldspawn", true, swsPos)
 

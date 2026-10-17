@@ -1111,8 +1111,49 @@ func (s *Server) DismountPlayerFromAllCamels(playerEntityID int32) bool {
 	return dismounted
 }
 
+// PlayerMountedEquine returns the entity ID of the horse/donkey/mule/llama/
+// skeleton_horse/zombie_horse currently ridden by session, or 0 if not riding one.
+func (s *Server) PlayerMountedEquine(session *PlayerSession) int32 {
+	if s == nil || session == nil {
+		return 0
+	}
+	pid := session.EntityID
+	mgr := s.equineManager()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	for eqID, st := range mgr.equines {
+		if st != nil && st.RiderEntityID == pid && pid != 0 {
+			return eqID
+		}
+	}
+	return 0
+}
+
+// DismountPlayerFromAllEquines removes playerEntityID from any equine/llama mount.
+func (s *Server) DismountPlayerFromAllEquines(playerEntityID int32) bool {
+	if s == nil || playerEntityID <= 0 {
+		return false
+	}
+	mgr := s.equineManager()
+	mgr.mu.RLock()
+	var eqIDs []int32
+	for eqID, st := range mgr.equines {
+		if st != nil && st.RiderEntityID == playerEntityID {
+			eqIDs = append(eqIDs, eqID)
+		}
+	}
+	mgr.mu.RUnlock()
+	dismounted := false
+	for _, eqID := range eqIDs {
+		if s.DismountEquine(eqID) {
+			dismounted = true
+		}
+	}
+	return dismounted
+}
+
 // DismountPlayerVehicle dismounts session from any vehicle they are currently
-// riding (including Minecarts, Boats, and Camels), places the player at a safe
+// riding (including Minecarts, Boats, Camels, and Equines/Llamas), places the player at a safe
 // dismount position, broadcasts SetPassengers, and emits GameEventEntityDismount.
 func (s *Server) DismountPlayerVehicle(session *PlayerSession) bool {
 	if s == nil || session == nil {
@@ -1122,6 +1163,13 @@ func (s *Server) DismountPlayerVehicle(session *PlayerSession) bool {
 	if camelID := s.PlayerMountedCamel(session); camelID > 0 {
 		camelDismounted = s.DismountCamel(session, camelID)
 	} else if s.DismountPlayerFromAllCamels(session.EntityID) {
+		camelDismounted = true
+	}
+	if eqID := s.PlayerMountedEquine(session); eqID > 0 {
+		if s.DismountEquine(eqID) {
+			camelDismounted = true
+		}
+	} else if s.DismountPlayerFromAllEquines(session.EntityID) {
 		camelDismounted = true
 	}
 
@@ -1344,7 +1392,7 @@ func (s *Server) HandlePlayerInputPacket(session *PlayerSession, r *protocol.Rea
 	session.SetSprinting(in.Sprint)
 
 	if in.Shift {
-		if s.PlayerMountedVehicle(session) != 0 || s.PlayerMountedCamel(session) != 0 {
+		if s.PlayerMountedVehicle(session) != 0 || s.PlayerMountedCamel(session) != 0 || s.PlayerMountedEquine(session) != 0 {
 			s.DismountPlayerVehicle(session)
 		}
 	}
@@ -1396,7 +1444,7 @@ func (s *Server) HandlePaddleBoatPacket(session *PlayerSession, r *protocol.Read
 }
 
 // HandleMoveVehiclePacket processes a ServerboundMoveVehiclePacket (0x22) from
-// the controlling passenger of a boat, minecart, or camel, validating movement,
+// the controlling passenger of a boat, minecart, camel, or equine, validating movement,
 // applying rail/water/ice/step-height constraints, syncing passenger coordinates,
 // awarding distance stats, and broadcasting the vehicle's updated position.
 func (s *Server) HandleMoveVehiclePacket(session *PlayerSession, r *protocol.Reader) error {
@@ -1415,6 +1463,9 @@ func (s *Server) HandleMoveVehiclePacket(session *PlayerSession, r *protocol.Rea
 	if vehID <= 0 {
 		if camelID := s.PlayerMountedCamel(session); camelID > 0 && s.CamelDriver(camelID) == session.EntityID {
 			return s.handleMoveMountedCamel(session, camelID, nx, ny, nz, yaw, pitch)
+		}
+		if eqID := s.PlayerMountedEquine(session); eqID > 0 && s.EquineRider(eqID) == session.EntityID {
+			return s.handleMoveMountedEquine(session, eqID, nx, ny, nz, yaw, pitch)
 		}
 		return nil
 	}
@@ -1490,6 +1541,51 @@ func (s *Server) HandleMoveVehiclePacket(session *PlayerSession, r *protocol.Rea
 	}
 
 	if updated := s.entities.Get(vehID); updated != nil {
+		cp := updated.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayMoveVehicle, EncodeMoveVehiclePacket(nx, ny, nz, yaw, pitch))
+	}
+	return nil
+}
+
+func (s *Server) handleMoveMountedEquine(session *PlayerSession, eqID int32, nx, ny, nz float64, yaw, pitch float32) error {
+	if s == nil || s.entities == nil || session == nil {
+		return nil
+	}
+	ent := s.entities.Get(eqID)
+	if ent == nil {
+		return nil
+	}
+	oldX, oldY, oldZ := ent.X, ent.Y, ent.Z
+	dx := nx - oldX
+	dy := ny - oldY
+	dz := nz - oldZ
+	if dx*dx+dy*dy+dz*dz > 100.0 {
+		if session.send != nil {
+			_ = session.send(protocol.PlayMoveVehicle, EncodeMoveVehiclePacket(oldX, oldY, oldZ, ent.Yaw, ent.Pitch))
+		}
+		return nil
+	}
+	dim := ent.EffectiveDimension()
+	vx, vy, vz := nx-oldX, ny-oldY, nz-oldZ
+	s.entities.Update(eqID, func(e *world.Entity) {
+		e.X = nx
+		e.Y = ny
+		e.Z = nz
+		e.Yaw = yaw
+		e.Pitch = pitch
+		e.HeadYaw = yaw
+		e.VelocityX = clampVelocityShort(vx)
+		e.VelocityY = clampVelocityShort(vy)
+		e.VelocityZ = clampVelocityShort(vz)
+	})
+	rs := session.Snapshot()
+	s.SetPlayerTransform(session, nx, ny, nz, rs.Yaw, rs.Pitch, false)
+	horizCm := int32(math.Round(math.Sqrt(dx*dx+dz*dz) * 100.0))
+	if horizCm > 0 {
+		s.AwardCustomStat(session, StatHorseOneCm, horizCm)
+	}
+	if updated := s.entities.Get(eqID); updated != nil {
 		cp := updated.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayMoveVehicle, EncodeMoveVehiclePacket(nx, ny, nz, yaw, pitch))
