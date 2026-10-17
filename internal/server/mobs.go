@@ -168,6 +168,13 @@ var (
 		MobTypeCamel:               EntityTypeCamelID,
 		MobTypeSniffer:             EntityTypeSnifferID,
 		WindChargeEntityType:       EntityTypeWindChargeID,
+		MobTypeAllay:               EntityTypeAllayID,
+		MobTypeAxolotl:             EntityTypeAxolotlID,
+		MobTypeFrog:                EntityTypeFrogID,
+		MobTypeGoat:                EntityTypeGoatID,
+		MobTypeMagmaCube:           EntityTypeMagmaCubeID,
+		MobTypeSlime:               EntityTypeSlimeID,
+		MobTypeTadpole:             EntityTypeTadpoleID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -258,6 +265,16 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultArmadilloMaxHealth
 	case MobTypeCamel:
 		return DefaultCamelMaxHealth
+	case MobTypeAllay:
+		return DefaultAllayMaxHealth
+	case MobTypeFrog:
+		return DefaultFrogMaxHealth
+	case MobTypeTadpole:
+		return DefaultTadpoleMaxHealth
+	case MobTypeAxolotl:
+		return DefaultAxolotlMaxHealth
+	case MobTypeGoat:
+		return DefaultGoatMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
 	case MobTypeWolf:
@@ -317,6 +334,16 @@ func animalWanderSpeed(typeName string) float64 {
 		return ArmadilloWanderSpeed
 	case MobTypeCamel:
 		return CamelWalkSpeed
+	case MobTypeAllay:
+		return AllayFlySpeed
+	case MobTypeFrog:
+		return FrogWanderSpeed
+	case MobTypeTadpole:
+		return TadpoleSwimSpeed
+	case MobTypeAxolotl:
+		return AxolotlSwimSpeed
+	case MobTypeGoat:
+		return GoatWanderSpeed
 	case MobTypeVillager:
 		return VillagerWanderSpeed
 	default:
@@ -371,6 +398,21 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeBogged {
 		return s.SpawnBogged(normDim, x, y, z)
+	}
+	if norm == MobTypeAllay {
+		return s.SpawnAllay(normDim, x, y, z)
+	}
+	if norm == MobTypeFrog {
+		return s.SpawnFrog(normDim, x, y, z, -1)
+	}
+	if norm == MobTypeTadpole {
+		return s.SpawnTadpole(normDim, x, y, z)
+	}
+	if norm == MobTypeAxolotl {
+		return s.SpawnAxolotl(normDim, x, y, z, -1, false)
+	}
+	if norm == MobTypeGoat {
+		return s.SpawnGoat(normDim, x, y, z, false, false)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
@@ -504,6 +546,12 @@ func IsAnimalBreedingFood(typeName, itemName string) bool {
 		return item == SpiderEyeItemID
 	case MobTypeCamel:
 		return item == CactusItemID
+	case MobTypeFrog:
+		return item == SlimeBallItemID
+	case MobTypeAxolotl:
+		return item == TropicalFishBucketItemID
+	case MobTypeGoat:
+		return item == GoatBreedingFoodItemID
 	}
 	return false
 }

@@ -852,6 +852,26 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 		handled := s.InteractWithBogged(session, targetEntityID)
 		return handled, 0, nil
 	}
+	if canonicalResourceName(ent.TypeName) == MobTypeAllay {
+		handled, _ := s.InteractWithAllay(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeFrog {
+		handled, _ := s.InteractWithFrog(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeTadpole {
+		handled, _ := s.InteractWithTadpole(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeAxolotl {
+		handled, _ := s.InteractWithAxolotl(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeGoat {
+		handled, _ := s.InteractWithGoat(session, targetEntityID)
+		return handled, 0, nil
+	}
 	if IsPassiveAnimal(ent.TypeName) {
 		handled, _ := s.InteractWithAnimal(session, targetEntityID)
 		return handled, 0, nil

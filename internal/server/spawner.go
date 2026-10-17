@@ -181,6 +181,11 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickCamels(rng)
 		s.TickBreezes(rng)
 		s.TickWindCharges()
+		s.TickAllays(rng)
+		s.TickFrogs(rng)
+		s.TickTadpoles(rng)
+		s.TickAxolotls(rng)
+		s.TickGoats(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -237,7 +242,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze {
+		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true

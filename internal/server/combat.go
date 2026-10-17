@@ -653,6 +653,16 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundArmadilloHurt, SoundSourceNeutral
 	case MobTypeCamel:
 		return SoundCamelHurt, SoundSourceNeutral
+	case MobTypeAllay:
+		return SoundAllayHurt, SoundSourceNeutral
+	case MobTypeFrog:
+		return SoundFrogHurt, SoundSourceNeutral
+	case MobTypeTadpole:
+		return SoundTadpoleHurt, SoundSourceNeutral
+	case MobTypeAxolotl:
+		return SoundAxolotlHurt, SoundSourceNeutral
+	case MobTypeGoat:
+		return SoundGoatHurt, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.hurt", SoundSourceNeutral
 	case MobTypeWolf:
@@ -700,6 +710,16 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundArmadilloDeath, SoundSourceNeutral
 	case MobTypeCamel:
 		return SoundCamelDeath, SoundSourceNeutral
+	case MobTypeAllay:
+		return SoundAllayDeath, SoundSourceNeutral
+	case MobTypeFrog:
+		return SoundFrogDeath, SoundSourceNeutral
+	case MobTypeTadpole:
+		return SoundTadpoleDeath, SoundSourceNeutral
+	case MobTypeAxolotl:
+		return SoundAxolotlDeath, SoundSourceNeutral
+	case MobTypeGoat:
+		return SoundGoatDeath, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.death", SoundSourceNeutral
 	case MobTypeWolf:
@@ -1006,6 +1026,9 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	if target.TypeName == MobTypeWarden {
 		return s.DamageWarden(target.ID, damage, session)
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeAllay && s.IsAllayImmuneToAttacker(target.ID, session) {
+		return 0, false
+	}
 	if canonicalResourceName(target.TypeName) == MobTypeArmadillo && s.IsArmadilloRolledUp(target.ID) {
 		damage = ReduceArmadilloRolledDamage(damage)
 		kbStrength = 0
@@ -1108,6 +1131,8 @@ func (s *Server) applyDamageToMob(
 			s.OnArmadilloDamaged(target.ID)
 		} else if canonicalResourceName(target.TypeName) == MobTypeCamel {
 			s.OnCamelDamaged(target.ID)
+		} else if canonicalResourceName(target.TypeName) == MobTypeAxolotl {
+			s.OnAxolotlDamaged(target.ID, damage, nil)
 		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,

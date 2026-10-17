@@ -106,7 +106,8 @@ func IsHostileMob(typeName string) bool {
 func IsPassiveMob(typeName string) bool {
 	switch typeName {
 	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeVillager,
-		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel:
+		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
+		MobTypeAllay, MobTypeFrog, MobTypeTadpole, MobTypeAxolotl, MobTypeGoat:
 		return true
 	default:
 		return false
