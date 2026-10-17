@@ -137,6 +137,11 @@ func IsInstantBreakBlock(state uint16) bool {
 		"minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet",
 		"minecraft:oxeye_daisy", "minecraft:cornflower",
 		"minecraft:lily_of_the_valley", "minecraft:sunflower", "minecraft:sugar_cane",
+		"minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
+		"minecraft:melon_stem", "minecraft:attached_melon_stem",
+		"minecraft:pumpkin_stem", "minecraft:attached_pumpkin_stem",
+		"minecraft:nether_wart", "minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:bamboo_sapling",
 		"minecraft:fire", "minecraft:soul_fire":
 		return true
 	}

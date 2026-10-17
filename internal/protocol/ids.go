@@ -124,6 +124,9 @@ const (
 	PlaySetBorderSize            = 0x5a
 	PlaySetBorderWarningDelay    = 0x5b
 	PlaySetBorderWarningDistance = 0x5c
+	PlayBlockEntityData          = 0x06
+	PlayOpenBook                 = 0x3a
+	PlayOpenSignEditor           = 0x3c
 
 	// Entity packets
 	PlayAddEntity        = 0x01
@@ -149,6 +152,7 @@ const (
 	PlayContainerClick            = 0x12
 	PlayContainerCloseSB          = 0x13
 	PlayContainerSlotStateChanged = 0x14
+	PlayEditBook                  = 0x18
 	PlayInteract                  = 0x1a
 	PlayKeepAliveServer           = 0x1c
 	PlayClientTickEnd             = 0x0d
@@ -164,6 +168,7 @@ const (
 	PlayRenameItem                = 0x30
 	PlaySeenAdvancements          = 0x32
 	PlaySelectTrade               = 0x33
+	PlaySignUpdate                = 0x3c
 	PlayUseItemOn                 = 0x42
 	PlayUseItem                   = 0x43
 	PlaySetCreativeSlot           = 0x38

@@ -422,6 +422,10 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return true, 0, nil
 	case IsRespawnAnchorBlock(state):
 		return s.InteractRespawnAnchor(session, x, y, z), 0, nil
+	case IsLecternBlock(state):
+		return s.InteractWithLectern(session, 0, x, y, z), 0, nil
+	case IsSignBlock(state):
+		return s.InteractWithSign(session, 0, x, y, z, true), 0, nil
 	default:
 		return false, 0, nil
 	}
@@ -535,6 +539,7 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	if s == nil || session == nil {
 		return nil
 	}
+	s.CloseLecternIfOpen(session)
 	type returnEntry struct {
 		stack  world.ItemStack
 		meta   ItemMeta

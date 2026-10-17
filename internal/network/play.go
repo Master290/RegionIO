@@ -219,10 +219,23 @@ func (h *handler) sendContainerSetContent() error {
 	w.VarInt(stateID)
 	w.VarInt(world.PlayerInventorySlots)
 	for i := 0; i < world.PlayerInventorySlots; i++ {
-		if h.session != nil && inv[i].ResolvedID() == server.FilledMapItemID {
-			if mapID, ok := server.GetSlotMapID(h.session, i); ok {
-				server.EncodeSlotWithMapID(w, inv[i], mapID, true)
-				continue
+		if h.session != nil {
+			switch inv[i].ResolvedID() {
+			case server.FilledMapItemID:
+				if mapID, ok := server.GetSlotMapID(h.session, i); ok {
+					server.EncodeSlotWithMapID(w, inv[i], mapID, true)
+					continue
+				}
+			case server.WritableBookItemID:
+				if wb, ok := server.GetSlotWritableBook(h.session, i); ok {
+					server.EncodeSlotWithBookContent(w, inv[i], &wb, nil)
+					continue
+				}
+			case server.WrittenBookItemID:
+				if sb, ok := server.GetSlotWrittenBook(h.session, i); ok {
+					server.EncodeSlotWithBookContent(w, inv[i], nil, &sb)
+					continue
+				}
 			}
 		}
 		writeItemStack(w, inv[i])
@@ -240,10 +253,23 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 	w.VarInt(0) // containerId 0 = player inventory
 	w.VarInt(stateID)
 	w.Uint16(uint16(int16(slot)))
-	if h.session != nil && stack.ResolvedID() == server.FilledMapItemID {
-		if mapID, ok := server.GetSlotMapID(h.session, slot); ok {
-			server.EncodeSlotWithMapID(w, stack, mapID, true)
-			return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+	if h.session != nil {
+		switch stack.ResolvedID() {
+		case server.FilledMapItemID:
+			if mapID, ok := server.GetSlotMapID(h.session, slot); ok {
+				server.EncodeSlotWithMapID(w, stack, mapID, true)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
+		case server.WritableBookItemID:
+			if wb, ok := server.GetSlotWritableBook(h.session, slot); ok {
+				server.EncodeSlotWithBookContent(w, stack, &wb, nil)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
+		case server.WrittenBookItemID:
+			if sb, ok := server.GetSlotWrittenBook(h.session, slot); ok {
+				server.EncodeSlotWithBookContent(w, stack, nil, &sb)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
 		}
 	}
 	writeItemStack(w, stack)
@@ -373,6 +399,7 @@ func (h *handler) keepAliveLoop() {
 		if h.srv != nil && h.session != nil {
 			h.srv.DespawnPlayerFishingBobber(h.session)
 			h.srv.WakePlayerFromBed(h.session)
+			h.srv.CloseLecternIfOpen(h.session)
 			_ = h.srv.CloseCartographyContainer(h.session, 0, false)
 			h.srv.OnPlayerQuitBossBars(h.session)
 			h.srv.BroadcastPlayerInfoRemove(h.session.Profile.UUID)
@@ -434,8 +461,8 @@ func (h *handler) entitySyncLoop() {
 
 var activeServerTickLoops sync.Map // map[*server.Server]bool
 
-// serverTickLoop drives the 20 TPS brewing stand and status effect ticks for
-// h.srv while at least one play connection is active.
+// serverTickLoop drives the 20 TPS brewing stand, world border, random block,
+// and status effect ticks for h.srv while at least one play connection is active.
 func (h *handler) serverTickLoop() {
 	if h.srv == nil {
 		return
@@ -456,6 +483,9 @@ func (h *handler) serverTickLoop() {
 		case <-ticker.C:
 			h.srv.TickBrewingStands()
 			h.srv.TickWorldBorder()
+			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
+			}
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
 				// StartSpawning is not advancing the world clock; tick player
@@ -844,10 +874,29 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 			return err
 		}
 		if h.srv != nil && h.session != nil {
+			if handled, err := h.srv.HandleLecternButtonClick(h.session, cid, btn); handled {
+				h.syncHotbarFromSession()
+				return err
+			}
 			if err := h.srv.HandleContainerButtonClick(h.session, cid, btn); err != nil {
 				return err
 			}
 			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlayEditBook:
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandleEditBookPacket(h.session, pkt.Body()); err != nil {
+				return err
+			}
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlaySignUpdate:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleSignUpdatePacket(h.session, pkt.Body())
 		}
 		return nil
 
@@ -912,6 +961,7 @@ func (h *handler) handleContainerClose(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
+		h.srv.CloseLecternIfOpen(h.session)
 		if open := h.session.OpenContainer(); open != nil && open.MenuType == server.MenuTypeCartographyTable {
 			if err := h.srv.CloseCartographyContainer(h.session, cid, false); err != nil {
 				return err
@@ -1120,6 +1170,21 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			h.syncHotbarFromSession()
 			return h.sendBlockChangedAck(seq)
 		}
+		if cache := h.srv.PlayerChunks(h.session); cache != nil {
+			clickedState := cache.GetBlock(x, y, z)
+			if server.IsLecternBlock(clickedState) {
+				if h.srv.InteractWithLectern(h.session, hand, x, y, z) {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+			if server.IsSignBlock(clickedState) {
+				if h.srv.InteractWithSign(h.session, hand, x, y, z, true) {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+		}
 		opened, _, err := h.srv.InteractBlock(h.session, x, y, z)
 		if err != nil {
 			return err
@@ -1139,6 +1204,40 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			if handled, res := cache.InteractRedstoneBlock(x, y, z); handled {
 				h.broadcastBlockChanges(dim, cache, res)
 				return h.sendBlockChangedAck(seq)
+			}
+			if h.session != nil && !h.session.IsDead() {
+				invSlot := h.session.HeldInventorySlot()
+				if hand == server.HandOffHand {
+					invSlot = server.OffHandContainerSlot
+				}
+				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+				}
+				heldItem := h.session.InventorySlot(invSlot)
+				if world.BlockName(cache.GetBlock(x, y, z)) == "minecraft:sweet_berry_bush" && heldItem.ResolvedID() != "minecraft:bone_meal" {
+					if berries, res := h.srv.HarvestSweetBerries(h.session, x, y, z, nil); berries > 0 {
+						h.broadcastBlockChanges(dim, cache, res)
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
+				if consumed, res := h.srv.UseBoneMeal(h.session, x, y, z, invSlot, nil); consumed {
+					h.broadcastBlockChanges(dim, cache, res)
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if tilled, res := h.srv.TillBlockWithHoe(h.session, x, y, z, invSlot, nil); tilled {
+					h.broadcastBlockChanges(dim, cache, res)
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if face >= 0 && int(face) < len(faceOffsets) {
+					if planted, _, res := h.srv.PlantSeedOrCrop(h.session, x, y, z, int(face), invSlot); planted {
+						h.broadcastBlockChanges(dim, cache, res)
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 			}
 		}
 	}
@@ -1184,6 +1283,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					blockName := world.BlockName(state)
 					if blockName == "minecraft:fire" || blockName == "minecraft:soul_fire" {
 						_, _ = h.srv.LightPortalAt(dim, px, py, pz)
+					}
+					if server.IsSignBlock(state) && h.srv != nil && h.session != nil {
+						h.srv.OnSignPlaced(h.session, px, py, pz, true)
 					}
 					if h.session != nil {
 						h.srv.TriggerPlantedSeed(h.session, blockName)

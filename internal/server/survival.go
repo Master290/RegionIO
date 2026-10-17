@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 
 	"regionio/internal/nbt"
@@ -351,16 +352,46 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsBrewingStandBlock(prevState) {
 		s.DropBrewingStandContents(x, y, z)
 	}
+	if IsLecternBlock(prevState) {
+		if book, _, _, ok := s.RemoveLecternAt(dim, x, y, z); ok && !book.IsEmpty() {
+			_, _ = s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, book)
+		}
+	}
+	if IsSignBlock(prevState) {
+		s.RemoveSignAt(dim, x, y, z)
+	}
 
 	if mode == GameModeSurvival {
 		s.RecordBlockBreakExhaustion(session)
 		var toolMeta ItemMeta
+		var heldStack world.ItemStack
 		heldSlot := session.HeldInventorySlot()
 		if session != nil && heldSlot >= 0 {
+			heldStack = session.InventorySlot(heldSlot)
 			toolMeta = GetSlotItemMeta(session, heldSlot)
 			if !world.IsInstantBreakBlock(prevState) {
 				s.DamagePlayerItem(session, heldSlot, 1)
 			}
+		}
+		blockName := world.BlockName(prevState)
+		fortune := EnchantmentFortuneLevel(toolMeta)
+		if isFarmingCropBlockName(blockName) && !(HasSilkTouch(toolMeta) && blockName == "minecraft:melon") {
+			var firstDropID int32
+			for _, d := range HarvestCropDrops(prevState, fortune, nil) {
+				if id, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, d); firstDropID == 0 {
+					firstDropID = id
+				}
+			}
+			return true, firstDropID
+		}
+		if strings.HasSuffix(blockName, "_leaves") && !HasSilkTouch(toolMeta) && heldStack.ResolvedID() != "minecraft:shears" {
+			var firstDropID int32
+			for _, d := range HarvestLeafDecayDrops(prevState, fortune, nil) {
+				if id, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, d); firstDropID == 0 {
+					firstDropID = id
+				}
+			}
+			return true, firstDropID
 		}
 		if drop, ok := ApplyBlockDropEnchantments(prevState, toolMeta, nil); ok {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
@@ -368,6 +399,18 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		}
 	}
 	return true, 0
+}
+
+func isFarmingCropBlockName(blockName string) bool {
+	switch blockName {
+	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
+		"minecraft:melon_stem", "minecraft:attached_melon_stem",
+		"minecraft:pumpkin_stem", "minecraft:attached_pumpkin_stem",
+		"minecraft:melon", "minecraft:nether_wart", "minecraft:cocoa", "minecraft:sweet_berry_bush":
+		return true
+	default:
+		return false
+	}
 }
 
 // HeldInventorySlot returns the container slot index (36..44, or fallback 0..8)
@@ -854,6 +897,13 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	totalFall := st.fallDistance
 	st.fallDistance = 0
 	st.mu.Unlock()
+
+	if totalFall > 0.5 {
+		if trampled, res := s.CheckPlayerFarmlandTrample(session, totalFall, nil); trampled && len(res.Changes) > 0 {
+			dim := world.NormalizeDimension(snap.Dimension)
+			s.broadcastDimensionBlockChanges(dim, s.DimensionChunks(dim), res.Changes, res.LightChanged)
+		}
+	}
 
 	if session.HasSlowFalling() {
 		return 0

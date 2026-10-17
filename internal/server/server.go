@@ -271,6 +271,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadScoreboardFile()
 		_ = s.LoadBossBarsFile()
 		_ = s.LoadWorldBorderFile()
+		_ = s.LoadSignsAndLecternsFile()
 	}
 	return s
 }
@@ -410,6 +411,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveWorldBorderFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveSignsAndLecternsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {

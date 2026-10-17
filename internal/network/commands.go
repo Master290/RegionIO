@@ -194,6 +194,11 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	teammsgNode := greedyCmd("teammsg")
 	tmNode := greedyCmd("tm")
 	worldborderNode := greedyCmd("worldborder")
+	giveNode := greedyCmd("give")
+	clearNode := greedyCmd("clear")
+	effectNode := greedyCmd("effect")
+	enchantNode := greedyCmd("enchant")
+	itemNode := greedyCmd("item")
 
 	nodes[rootIdx].Children = []int32{
 		tpNode,
@@ -220,6 +225,11 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		teammsgNode,
 		tmNode,
 		worldborderNode,
+		giveNode,
+		clearNode,
+		effectNode,
+		enchantNode,
+		itemNode,
 	}
 	return nodes, rootIdx
 }
@@ -521,6 +531,9 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 		}
 		return srv.HandleWorldBorderCommand(sender, parsed.Args)
 	default:
+		if reply, handled := srv.HandleItemAndStatusCommand(sender, parsed.Name, parsed.Args); handled {
+			return reply
+		}
 		if reply, handled := srv.HandleSocialAndScoreboardCommand(sender, parsed.Name, parsed.Args); handled {
 			return reply
 		}
@@ -706,7 +719,7 @@ func execWeather(srv *server.Server, args []string) string {
 
 func execGameRule(srv *server.Server, args []string) string {
 	if len(args) < 1 || len(args) > 2 {
-		return "Usage: /gamerule <doDaylightCycle|doWeatherCycle> [true|false]"
+		return "Usage: /gamerule <doDaylightCycle|doWeatherCycle|randomTickSpeed> [value]"
 	}
 	rule := strings.ToLower(strings.TrimSpace(args[0]))
 	switch rule {
@@ -730,6 +743,16 @@ func execGameRule(srv *server.Server, args []string) string {
 		}
 		srv.SetWeatherCycle(val)
 		return fmt.Sprintf("Gamerule doWeatherCycle is now set to: %v", val)
+	case "randomtickspeed":
+		if len(args) == 1 {
+			return fmt.Sprintf("Gamerule randomTickSpeed is currently set to: %d", srv.RandomTickSpeed())
+		}
+		val, err := strconv.Atoi(strings.TrimSpace(args[1]))
+		if err != nil || val < 0 {
+			return fmt.Sprintf("Invalid integer value: %s", args[1])
+		}
+		srv.SetRandomTickSpeed(val)
+		return fmt.Sprintf("Gamerule randomTickSpeed is now set to: %d", val)
 	default:
 		return fmt.Sprintf("Unknown game rule: %s", args[0])
 	}
