@@ -147,15 +147,31 @@ func msVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets,
 	builder := &msBuilder{pieces: []*msPiece{room}}
 	msRoomAddChildren(room, builder, random)
 
-	// moveBelowSeaLevel(seaLevel, minY, random, 10): bottom moves to minY+1
-	// plus a random drop, top capped at seaLevel-10.
 	bounds := msTreeBounds(builder.pieces)
-	maxAllowedY := SeaLevel - 10
-	newMaxY := bounds.ySpan() + MinY + 1
-	if newMaxY < maxAllowedY {
-		newMaxY += int(random.NextIntN(int32(maxAllowedY - newMaxY)))
+	var deltaY int
+	if mesa {
+		centerX := bounds.minX + (bounds.maxX-bounds.minX+1)/2
+		centerY := bounds.minY + (bounds.maxY-bounds.minY+1)/2
+		centerZ := bounds.minZ + (bounds.maxZ-bounds.minZ+1)/2
+		baseHeight := SeaLevel + 20
+		if od != nil {
+			baseHeight = preCarveFirstOccupiedHeight(od, 0, centerX, centerZ, false) + 1
+		}
+		targetY := SeaLevel
+		if baseHeight > SeaLevel {
+			targetY = SeaLevel + int(random.NextIntN(int32(baseHeight-SeaLevel+1)))
+		}
+		deltaY = targetY - centerY
+	} else {
+		// moveBelowSeaLevel(seaLevel, minY, random, 10): bottom moves to minY+1
+		// plus a random drop, top capped at seaLevel-10.
+		maxAllowedY := SeaLevel - 10
+		newMaxY := bounds.ySpan() + MinY + 1
+		if newMaxY < maxAllowedY {
+			newMaxY += int(random.NextIntN(int32(maxAllowedY - newMaxY)))
+		}
+		deltaY = newMaxY - bounds.maxY
 	}
-	deltaY := newMaxY - bounds.maxY
 	for _, p := range builder.pieces {
 		p.box.minY += deltaY
 		p.box.maxY += deltaY
@@ -167,19 +183,21 @@ func msVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets,
 
 	// Biome filter at the stub position (middleBlockX, 50+deltaY, minBlockZ),
 	// quart-snapped like every climate sample.
-	qx, qz := (baseX+8)>>2<<2, baseZ>>2<<2
-	qy := (50 + deltaY) >> 2 << 2
-	s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
-	biomeAtStub := biomeNameByID(BiomeAt3D(od, s2D, qx, qy, qz))
-	allowed := false
-	for _, name := range sets.BiomesFor(def) {
-		if name == biomeAtStub {
-			allowed = true
-			break
+	if od != nil && sets != nil {
+		qx, qz := (baseX+8)>>2<<2, baseZ>>2<<2
+		qy := (50 + deltaY) >> 2 << 2
+		s2D := worldgen.SampleColumn2D(od, SeaLevel, qx, qz)
+		biomeAtStub := biomeNameByID(BiomeAt3D(od, s2D, qx, qy, qz))
+		allowed := false
+		for _, name := range sets.BiomesFor(def) {
+			if name == biomeAtStub {
+				allowed = true
+				break
+			}
 		}
-	}
-	if !allowed {
-		return nil
+		if !allowed {
+			return nil
+		}
 	}
 	return &MineshaftStart{
 		ChunkX: int32(baseX / 16),
@@ -666,9 +684,24 @@ func (s *fastutilLongSet) elements() []int64 {
 	return out
 }
 
+// BuildMineshaftStart constructs a normal or mesa MineshaftStart for chunk (sx, sz).
+func BuildMineshaftStart(seed int64, sx, sz int32, mesa bool) *MineshaftStart {
+	random := worldgen.NewLegacy(0)
+	random.SetLargeFeatureSeed(seed, int(sx), int(sz))
+	mType := "normal"
+	if mesa {
+		mType = "mesa"
+	}
+	def := &worldgen.StructureDef{
+		Type:          "minecraft:mineshaft",
+		MineshaftType: mType,
+	}
+	return msVariantPoint(nil, nil, def, random, int(sx)*16, int(sz)*16)
+}
+
 // PlaceMineshaftsForChunk places all mineshaft starts intersecting chunk (chunkX, chunkZ)
 // in the exact order determined by vanilla's StructureManager/LongOpenHashSet,
-// sharing a single decoration random stream seeded once for step 3 (underground structures).
+// running normal mineshafts (index 2) followed by mesa mineshafts (index 3) in step 3.
 func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart, seed int64, chunkX, chunkZ int32) {
 	if len(starts) == 0 {
 		return
@@ -680,45 +713,54 @@ func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart,
 		start *MineshaftStart
 		key   int64
 	}
-	var candidates []startCandidate
-	var set fastutilLongSet
-	for _, st := range starts {
-		if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, chunkBox) {
-			continue
-		}
-		hasIntersectingPiece := false
-		for _, p := range st.Pieces {
-			if msBoxesIntersect(p.box, chunkBox) {
-				hasIntersectingPiece = true
-				break
+	for _, wantMesa := range []bool{false, true} {
+		var candidates []startCandidate
+		var set fastutilLongSet
+		for _, st := range starts {
+			if st.Mesa != wantMesa {
+				continue
 			}
+			if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, chunkBox) {
+				continue
+			}
+			hasIntersectingPiece := false
+			for _, p := range st.Pieces {
+				if msBoxesIntersect(p.box, chunkBox) {
+					hasIntersectingPiece = true
+					break
+				}
+			}
+			if !hasIntersectingPiece {
+				continue
+			}
+			key := packChunkPos(st.ChunkX, st.ChunkZ)
+			set.add(key)
+			candidates = append(candidates, startCandidate{start: st, key: key})
 		}
-		if !hasIntersectingPiece {
+		if len(candidates) == 0 {
 			continue
 		}
-		key := packChunkPos(st.ChunkX, st.ChunkZ)
-		set.add(key)
-		candidates = append(candidates, startCandidate{start: st, key: key})
-	}
-	if len(candidates) == 0 {
-		return
-	}
 
-	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
-	random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep("mineshaft"), 3)
+		stName := "minecraft:mineshaft"
+		if wantMesa {
+			stName = "minecraft:mineshaft_mesa"
+		}
+		random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
+		random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep(stName), 3)
 
-	orderedKeys := set.elements()
-	for _, key := range orderedKeys {
-		for _, c := range candidates {
-			if c.key == key {
-				ctx := &msContext{region: region, chunkBox: chunkBox, mesa: c.start.Mesa}
-				for _, piece := range c.start.Pieces {
-					if !msBoxesIntersect(piece.box, chunkBox) {
-						continue
+		orderedKeys := set.elements()
+		for _, key := range orderedKeys {
+			for _, c := range candidates {
+				if c.key == key {
+					ctx := &msContext{region: region, chunkBox: chunkBox, mesa: c.start.Mesa}
+					for _, piece := range c.start.Pieces {
+						if !msBoxesIntersect(piece.box, chunkBox) {
+							continue
+						}
+						msPostProcess(ctx, piece, random)
 					}
-					msPostProcess(ctx, piece, random)
+					break
 				}
-				break
 			}
 		}
 	}

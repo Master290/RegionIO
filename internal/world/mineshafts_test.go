@@ -47,3 +47,81 @@ func TestMineshaftDungeonPlaces(t *testing.T) {
 		t.Errorf("dungeon chest at (-4,36,-16) = %d, want a chest", region.getBlock(-4, 36, -16))
 	}
 }
+
+func TestBuildAndPlaceMineshaftNormalAndMesa(t *testing.T) {
+	t.Run("NormalMineshaft", func(t *testing.T) {
+		st := BuildMineshaftStart(12345, 0, 0, false)
+		if st == nil || len(st.Pieces) == 0 {
+			t.Fatalf("expected non-empty normal MineshaftStart")
+		}
+		if st.Mesa {
+			t.Fatalf("expected st.Mesa == false")
+		}
+		if st.Box.maxY > SeaLevel-10 {
+			t.Fatalf("expected normal mineshaft maxY <= %d, got %d", SeaLevel-10, st.Box.maxY)
+		}
+		reg := buildFlatTestDecorationRegion(t, 0, 0, 3, 80, false)
+		reg.bindSeed(12345)
+		for cx := int32(-2); cx <= 2; cx++ {
+			for cz := int32(-2); cz <= 2; cz++ {
+				PlaceMineshaftStart(reg, st, 12345, cx, cz)
+			}
+		}
+		counts := make(map[string]int)
+		for y := st.Box.minY - 2; y <= st.Box.maxY+2; y++ {
+			for z := -32; z < 48; z++ {
+				for x := -32; x < 48; x++ {
+					if v, ok := stateByID(reg.getBlock(x, y, z)); ok {
+						counts[v.Name]++
+					}
+				}
+			}
+		}
+		if counts["minecraft:oak_planks"] == 0 || counts["minecraft:oak_fence"] == 0 || counts["minecraft:rail"] == 0 {
+			t.Fatalf("normal mineshaft missing expected blocks: oak_planks=%d oak_fence=%d rail=%d",
+				counts["minecraft:oak_planks"], counts["minecraft:oak_fence"], counts["minecraft:rail"])
+		}
+		if counts["minecraft:dark_oak_planks"] != 0 {
+			t.Fatalf("normal mineshaft unexpectedly placed dark_oak_planks=%d", counts["minecraft:dark_oak_planks"])
+		}
+	})
+
+	t.Run("MesaMineshaft", func(t *testing.T) {
+		st := BuildMineshaftStart(12345, 0, 0, true)
+		if st == nil || len(st.Pieces) == 0 {
+			t.Fatalf("expected non-empty mesa MineshaftStart")
+		}
+		if !st.Mesa {
+			t.Fatalf("expected st.Mesa == true")
+		}
+		centerY := (st.Box.minY + st.Box.maxY) / 2
+		if centerY < SeaLevel-1 {
+			t.Fatalf("expected mesa mineshaft centerY near or above SeaLevel (%d), got %d (box=%+v)", SeaLevel, centerY, st.Box)
+		}
+		reg := buildFlatTestDecorationRegion(t, 0, 0, 3, 95, false)
+		reg.bindSeed(12345)
+		for cx := int32(-2); cx <= 2; cx++ {
+			for cz := int32(-2); cz <= 2; cz++ {
+				PlaceMineshaftStart(reg, st, 12345, cx, cz)
+			}
+		}
+		counts := make(map[string]int)
+		for y := st.Box.minY - 2; y <= st.Box.maxY+2; y++ {
+			for z := -32; z < 48; z++ {
+				for x := -32; x < 48; x++ {
+					if v, ok := stateByID(reg.getBlock(x, y, z)); ok {
+						counts[v.Name]++
+					}
+				}
+			}
+		}
+		if counts["minecraft:dark_oak_planks"] == 0 || counts["minecraft:dark_oak_fence"] == 0 || counts["minecraft:rail"] == 0 {
+			t.Fatalf("mesa mineshaft missing expected blocks: dark_oak_planks=%d dark_oak_fence=%d rail=%d",
+				counts["minecraft:dark_oak_planks"], counts["minecraft:dark_oak_fence"], counts["minecraft:rail"])
+		}
+		if counts["minecraft:oak_planks"] != 0 {
+			t.Fatalf("mesa mineshaft unexpectedly placed oak_planks=%d", counts["minecraft:oak_planks"])
+		}
+	})
+}
+
