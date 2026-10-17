@@ -198,6 +198,7 @@ func (s *Server) advanceWorldTime() (gameTime, dayTime int64) {
 		dayTime = s.clock.dayTime.Load()
 	}
 	s.TickFurnaces()
+	s.TickRaids()
 	return gameTime, dayTime
 }
 

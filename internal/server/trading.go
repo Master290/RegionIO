@@ -832,7 +832,8 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
 		}
-		offersPkt := EncodeMerchantOffersPacket(cid, vs.Offers, int32(vs.Level), vs.XP, true, true)
+		offers := ApplyHeroOfTheVillageToOffers(session, vs.Offers)
+		offersPkt := EncodeMerchantOffersPacket(cid, offers, int32(vs.Level), vs.XP, true, true)
 		if err := session.send(PlayMerchantOffersCB, offersPkt); err != nil {
 			return cid, err
 		}

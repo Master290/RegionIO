@@ -536,6 +536,16 @@ func MobMaxHealth(typeName string) float32 {
 		return DefaultPigMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
+	case MobTypePillager:
+		return DefaultPillagerMaxHealth
+	case MobTypeVindicator:
+		return DefaultVindicatorMaxHealth
+	case MobTypeEvoker:
+		return DefaultEvokerMaxHealth
+	case MobTypeRavager:
+		return DefaultRavagerMaxHealth
+	case MobTypeWitch:
+		return DefaultWitchMaxHealth
 	case MobTypeWither:
 		return DefaultWitherMaxHealth
 	case MobTypeWitherSkeleton:
@@ -989,12 +999,13 @@ func (s *Server) applyDamageToMob(
 		return false
 	}
 
-	// Mob died: broadcast death event + sound, remove entity, and spawn loot drops.
+	// Mob died: broadcast death event + sound, notify raid manager, remove entity, and spawn loot drops.
 	deathSnd, deathSrc := mobDeathSound(target.TypeName)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 		EncodeSoundPacket(deathSnd, deathSrc, target.X, target.Y, target.Z, 1.0, 1.0, 0))
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(target.ID, EntityEventDeath))
+	s.OnRaiderKilled(target.ID, attacker)
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{target.ID}))

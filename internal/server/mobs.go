@@ -139,6 +139,11 @@ var (
 		EntityTypeDragonFireball:  EntityTypeDragonFireballID,
 		MobTypeEnderDragon:        EntityTypeEnderDragonID,
 		EntityTypeEndCrystal:      EntityTypeEndCrystalID,
+		MobTypeEvoker:             EntityTypeEvokerID,
+		MobTypePillager:           EntityTypePillagerID,
+		MobTypeRavager:            EntityTypeRavagerID,
+		MobTypeVindicator:         EntityTypeVindicatorID,
+		MobTypeWitch:              EntityTypeWitchID,
 		MobTypeWither:             EntityTypeWitherID,
 		MobTypeWitherSkeleton:     EntityTypeWitherSkeletonID,
 		EntityTypeWitherSkull:     EntityTypeWitherSkullID,
@@ -219,6 +224,16 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultChickenMaxHealth
 	case MobTypeVillager:
 		return DefaultVillagerMaxHealth
+	case MobTypePillager:
+		return DefaultPillagerMaxHealth
+	case MobTypeVindicator:
+		return DefaultVindicatorMaxHealth
+	case MobTypeEvoker:
+		return DefaultEvokerMaxHealth
+	case MobTypeRavager:
+		return DefaultRavagerMaxHealth
+	case MobTypeWitch:
+		return DefaultWitchMaxHealth
 	case MobTypeWither:
 		return DefaultWitherMaxHealth
 	case MobTypeWitherSkeleton:
