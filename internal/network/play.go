@@ -110,6 +110,11 @@ func (h *handler) beginPlay() error {
 	if err := h.conn.Send(protocol.PlaySetTime, h.srv.SetTimePacket()); err != nil {
 		return err
 	}
+	h.srv.BroadcastPlayerInfoAdd(session)
+	_ = h.srv.SendFullTabListToPlayer(session)
+	_ = h.srv.SendFullScoreboardToPlayer(session)
+	h.srv.SendBossBarsOnPlayerJoin(session)
+	h.srv.BroadcastJoinMessage(session)
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
 	playerCache := h.srv.PlayerChunks(session)
@@ -213,6 +218,12 @@ func (h *handler) sendContainerSetContent() error {
 	w.VarInt(stateID)
 	w.VarInt(world.PlayerInventorySlots)
 	for i := 0; i < world.PlayerInventorySlots; i++ {
+		if h.session != nil && inv[i].ResolvedID() == server.FilledMapItemID {
+			if mapID, ok := server.GetSlotMapID(h.session, i); ok {
+				server.EncodeSlotWithMapID(w, inv[i], mapID, true)
+				continue
+			}
+		}
 		writeItemStack(w, inv[i])
 	}
 	writeItemStack(w, world.ItemStack{}) // carried item
@@ -228,6 +239,12 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 	w.VarInt(0) // containerId 0 = player inventory
 	w.VarInt(stateID)
 	w.Uint16(uint16(int16(slot)))
+	if h.session != nil && stack.ResolvedID() == server.FilledMapItemID {
+		if mapID, ok := server.GetSlotMapID(h.session, slot); ok {
+			server.EncodeSlotWithMapID(w, stack, mapID, true)
+			return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+		}
+	}
 	writeItemStack(w, stack)
 	return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 }
@@ -355,6 +372,10 @@ func (h *handler) keepAliveLoop() {
 		if h.srv != nil && h.session != nil {
 			h.srv.DespawnPlayerFishingBobber(h.session)
 			h.srv.WakePlayerFromBed(h.session)
+			_ = h.srv.CloseCartographyContainer(h.session, 0, false)
+			h.srv.OnPlayerQuitBossBars(h.session)
+			h.srv.BroadcastPlayerInfoRemove(h.session.Profile.UUID)
+			h.srv.BroadcastLeaveMessage(h.session)
 		}
 	}()
 	for {
@@ -665,12 +686,16 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		h.keepAliveMu.Lock()
 		valid := h.keepAlivePending && id == h.keepAliveID
+		sentAt := h.keepAliveSent
 		if valid {
 			h.keepAlivePending = false
 		}
 		h.keepAliveMu.Unlock()
 		if !valid {
 			return errors.New("unexpected keep-alive response")
+		}
+		if h.srv != nil && h.session != nil && !sentAt.IsZero() {
+			h.srv.SetPlayerLatency(h.session, int32(time.Since(sentAt).Milliseconds()))
 		}
 		h.log.Debug("keep-alive ack", "id", id)
 		return nil
@@ -885,7 +910,11 @@ func (h *handler) handleContainerClose(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
-		if err := h.srv.CloseMerchantContainer(h.session, cid, false); err != nil {
+		if open := h.session.OpenContainer(); open != nil && open.MenuType == server.MenuTypeCartographyTable {
+			if err := h.srv.CloseCartographyContainer(h.session, cid, false); err != nil {
+				return err
+			}
+		} else if err := h.srv.CloseMerchantContainer(h.session, cid, false); err != nil {
 			return err
 		}
 		h.syncHotbarFromSession()
@@ -926,8 +955,7 @@ func (h *handler) handleClientCommand(pkt protocol.Packet) error {
 }
 
 // handleChat reads a chat message (only the leading text field is needed) and
-// echoes it to the player as a system message prefixed with their name. Once a
-// player registry exists this will broadcast to everyone.
+// broadcasts it via the server's formatted chat system.
 func (h *handler) handleChat(pkt protocol.Packet) error {
 	msg, err := pkt.Body().String()
 	if err != nil {
@@ -935,6 +963,10 @@ func (h *handler) handleChat(pkt protocol.Packet) error {
 	}
 	line := "<" + h.conn.Profile.Name + "> " + msg
 	h.log.Info("chat", "msg", line)
+	if h.srv != nil && h.session != nil {
+		h.srv.BroadcastPlayerChat(h.session, msg)
+		return nil
+	}
 	return h.broadcastSystemChat(line)
 }
 
@@ -1052,7 +1084,8 @@ var faceOffsets = [6][3]int{
 // insideBlock bool, worldBorderHit bool, sequence.
 func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	r := pkt.Body()
-	if _, err := r.VarInt(); err != nil { // hand
+	hand, err := r.VarInt()
+	if err != nil {
 		return err
 	}
 	x, y, z, err := r.Position()
@@ -1081,6 +1114,10 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	}
 
 	if h.srv != nil && h.session != nil {
+		if h.srv.UseMapItemOn(h.session, hand, x, y, z) {
+			h.syncHotbarFromSession()
+			return h.sendBlockChangedAck(seq)
+		}
 		opened, _, err := h.srv.InteractBlock(h.session, x, y, z)
 		if err != nil {
 			return err
@@ -1116,6 +1153,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				return err
 			}
 			if lit || used {
+				return h.sendBlockChangedAck(seq)
+			}
+		}
+		if h.srv != nil && h.session != nil {
+			if _, placed := h.srv.UseDecorationItemOn(h.session, hand, x, y, z, int(face)); placed {
+				h.syncHotbarFromSession()
 				return h.sendBlockChangedAck(seq)
 			}
 		}

@@ -103,6 +103,21 @@ const (
 	PlaySetExperience         = 0x67
 	PlayUpdateAdvancements    = 0x82
 	PlayUpdateMobEffect       = 0x84
+	PlayBossEvent             = 0x09
+	PlayClearTitles           = 0x0e
+	PlayDisguisedChat         = 0x21
+	PlayMapItemData           = 0x32
+	PlayPlayerChat            = 0x41
+	PlayResetScore            = 0x4f
+	PlaySetActionBarText      = 0x57
+	PlaySetDisplayObjective   = 0x62
+	PlaySetObjective          = 0x6a
+	PlaySetPlayerTeam         = 0x6d
+	PlaySetScore              = 0x6e
+	PlaySetSubtitleText       = 0x70
+	PlaySetTitleText          = 0x72
+	PlaySetTitlesAnimation    = 0x73
+	PlayTabList               = 0x7a
 
 	// Entity packets
 	PlayAddEntity        = 0x01

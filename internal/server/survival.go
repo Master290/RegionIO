@@ -338,6 +338,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+	s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
 	if IsBedBlock(prevState) {
 		s.BreakBedPartner(dim, cache, x, y, z, prevState)
 	}
@@ -529,10 +530,15 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 		return err
 	}
 	if s != nil && session != nil {
-		if pkt.Action == InteractActionAttack {
+		switch pkt.Action {
+		case InteractActionAttack:
 			s.AttackEntityWithEnchantments(session, pkt.EntityID)
-		} else if pkt.Hand == 0 {
-			_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+		case InteractActionInteractAt:
+			s.InteractWithDecorationAt(session, pkt.EntityID, pkt.Hand, float64(pkt.TargetX), float64(pkt.TargetY), float64(pkt.TargetZ), true)
+		default:
+			if pkt.Hand == 0 {
+				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+			}
 		}
 	}
 	return nil
@@ -765,6 +771,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	if send != nil {
 		_ = send(protocol.PlaySetHealth, EncodeSetHealth(newHealth, food, saturation))
 	}
+	s.SyncHealthObjectives(session)
 
 	if died {
 		if name == "" {
@@ -777,17 +784,37 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		case "bad_respawn_point":
 			deathMsg = fmt.Sprintf("%s was killed by [Intentional Game Design]", name)
 		default:
-			deathMsg = fmt.Sprintf("%s died", name)
+			if comp := s.FormatDeathMessage(session, cause, ""); comp.PlainText() != "" {
+				deathMsg = comp.PlainText()
+			} else {
+				deathMsg = fmt.Sprintf("%s died", name)
+			}
 		}
 		if send != nil {
 			_ = send(protocol.PlayPlayerCombatKill, EncodePlayerCombatKill(entityID, deathMsg))
 		}
-		chatW := protocol.NewWriter(len(deathMsg) + 8)
-		chatW.Raw(nbt.Marshal(nbt.String(deathMsg)))
-		chatW.Bool(false)
-		s.Broadcast(protocol.PlaySystemChat, chatW.Bytes())
+		if !isCombatDeathCause(cause) {
+			s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
+			if cause == "bad_respawn_point" {
+				chatW := protocol.NewWriter(len(deathMsg) + 8)
+				chatW.Raw(nbt.Marshal(nbt.String(deathMsg)))
+				chatW.Bool(false)
+				s.Broadcast(protocol.PlaySystemChat, chatW.Bytes())
+			} else {
+				s.BroadcastDeathMessage(session, cause, "")
+			}
+		}
 	}
 	return died
+}
+
+func isCombatDeathCause(cause string) bool {
+	switch cause {
+	case "player", "mob", "zombie", "skeleton", "spider", "enderman", "creeper", "arrow", "projectile":
+		return true
+	default:
+		return false
+	}
 }
 
 // HandlePlayerFall updates session's accumulated fall distance from vertical

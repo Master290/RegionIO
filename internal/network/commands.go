@@ -177,6 +177,23 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	helpArg := argument("command", ArgParserString, greedyProps.Bytes(), true)
 	helpNode := literal("help", true, helpArg)
 
+	greedyCmd := func(name string) int32 {
+		arg := argument("args", ArgParserString, greedyProps.Bytes(), true)
+		return literal(name, true, arg)
+	}
+	scoreboardNode := greedyCmd("scoreboard")
+	teamNode := greedyCmd("team")
+	tellrawNode := greedyCmd("tellraw")
+	titleNode := greedyCmd("title")
+	bossbarNode := greedyCmd("bossbar")
+	msgNode := greedyCmd("msg")
+	tellNode := greedyCmd("tell")
+	wNode := greedyCmd("w")
+	meNode := greedyCmd("me")
+	sayNode := greedyCmd("say")
+	teammsgNode := greedyCmd("teammsg")
+	tmNode := greedyCmd("tm")
+
 	nodes[rootIdx].Children = []int32{
 		tpNode,
 		gamemodeNode,
@@ -189,6 +206,18 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		spawnpointNode,
 		setworldspawnNode,
 		helpNode,
+		scoreboardNode,
+		teamNode,
+		tellrawNode,
+		titleNode,
+		bossbarNode,
+		msgNode,
+		tellNode,
+		wNode,
+		meNode,
+		sayNode,
+		teammsgNode,
+		tmNode,
 	}
 	return nodes, rootIdx
 }
@@ -479,7 +508,15 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 			return "You do not have permission to use this command"
 		}
 		return execSetWorldSpawn(srv, sender, parsed.Args)
+	case "bossbar":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return srv.HandleBossBarCommand(sender, parsed.Args)
 	default:
+		if reply, handled := srv.HandleSocialAndScoreboardCommand(sender, parsed.Name, parsed.Args); handled {
+			return reply
+		}
 		return fmt.Sprintf("Unknown command: %s. Type /help for a list of commands.", parsed.Name)
 	}
 }
@@ -589,6 +626,7 @@ func execGameMode(srv *server.Server, sender *server.PlayerSession, args []strin
 	if err := srv.SetPlayerGameMode(target, mode); err != nil {
 		return fmt.Sprintf("Failed to set game mode: %v", err)
 	}
+	srv.BroadcastPlayerGameModeUpdate(target)
 	if sender != nil && target == sender {
 		return fmt.Sprintf("Set own game mode to %s Mode", label)
 	}

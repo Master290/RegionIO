@@ -226,6 +226,7 @@ type PlayerData struct {
 	ActiveEffects    *nbt.List
 	AbsorptionAmount float32
 	SlotPotions      *nbt.List
+	SlotMaps         *nbt.List
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -356,6 +357,9 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	if d.SlotPotions != nil && len(d.SlotPotions.Elems) > 0 {
 		root.Set("SlotPotions", *d.SlotPotions)
+	}
+	if d.SlotMaps != nil && len(d.SlotMaps.Elems) > 0 {
+		root.Set("SlotMaps", *d.SlotMaps)
 	}
 
 	return root
@@ -644,6 +648,10 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	if sp, ok := nbtGetList(root, "SlotPotions"); ok && sp != nil {
 		cp := *sp
 		d.SlotPotions = &cp
+	}
+	if sm, ok := nbtGetList(root, "SlotMaps"); ok && sm != nil {
+		cp := *sm
+		d.SlotMaps = &cp
 	}
 
 	return d, nil

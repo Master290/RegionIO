@@ -414,6 +414,9 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	case IsBrewingStandBlock(state):
 		cid, err := s.OpenBrewingStand(session, x, y, z)
 		return err == nil, cid, err
+	case IsCartographyTableBlock(state):
+		cid, err := s.OpenCartographyTable(session, x, y, z)
+		return err == nil, cid, err
 	case IsBedBlock(state):
 		s.InteractBed(session, x, y, z)
 		return true, 0, nil
@@ -727,6 +730,9 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
 		return s.syncBrewingStandViewers(session, bx, by, bz)
+	case MenuTypeCartographyTable:
+		tr.mu.Unlock()
+		return s.HandleCartographyContainerClick(session, containerID, slot, button, mode)
 	default:
 		tr.mu.Unlock()
 		return nil

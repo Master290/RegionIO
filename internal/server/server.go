@@ -265,6 +265,12 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		gameTime, dayTime := store.WorldTime()
 		s.SetWorldTime(gameTime, dayTime)
 	}
+	if cfg.WorldDir != "" {
+		_ = s.LoadDecorationsFile()
+		_ = s.LoadAllMaps()
+		_ = s.LoadScoreboardFile()
+		_ = s.LoadBossBarsFile()
+	}
 	return s
 }
 
@@ -388,6 +394,18 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveBrewingStands(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveAllMaps(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveScoreboardFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveBossBarsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
@@ -569,6 +587,28 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	}
 	LoadEffectsFromPlayerCompound(session, effRoot)
 	LoadPotionMetaFromPlayerCompound(session, effRoot)
+	if d.SlotMaps != nil {
+		for _, elem := range d.SlotMaps.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok {
+				continue
+			}
+			slotTag, ok1 := comp.Get("Slot")
+			mapTag, ok2 := comp.Get("MapID")
+			if !ok1 || !ok2 {
+				continue
+			}
+			sb, ok1 := slotTag.(nbt.Byte)
+			mi, ok2 := mapTag.(nbt.Int)
+			if !ok1 || !ok2 {
+				continue
+			}
+			slot := int(uint8(sb))
+			if slot >= 0 && slot < world.PlayerInventorySlots {
+				SetSlotMapID(session, slot, int32(mi))
+			}
+		}
+	}
 }
 
 // WriteExperienceNBT writes the player's experience level, total XP, progress,
@@ -693,6 +733,26 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 			slotPotions = v
 		}
 	}
+	var slotMaps *nbt.List
+	var mapElems []nbt.Tag
+	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
+		st := session.InventorySlot(slot)
+		if st.ResolvedID() != FilledMapItemID {
+			continue
+		}
+		if mapID, ok := GetSlotMapID(session, slot); ok {
+			entry := nbt.NewCompound().
+				Set("Slot", nbt.Byte(int8(slot))).
+				Set("MapID", nbt.Int(mapID))
+			mapElems = append(mapElems, entry)
+		}
+	}
+	if len(mapElems) > 0 {
+		slotMaps = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  mapElems,
+		}
+	}
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -725,6 +785,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		ActiveEffects:    effList,
 		AbsorptionAmount: absAmount,
 		SlotPotions:      slotPotions,
+		SlotMaps:         slotMaps,
 	}
 }
 
