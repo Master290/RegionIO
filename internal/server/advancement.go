@@ -416,6 +416,10 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:blaze",
 		"minecraft:ghast",
 		"minecraft:wither_skeleton",
+		"minecraft:pillager",
+		"minecraft:vindicator",
+		"minecraft:evoker",
+		"minecraft:ravager",
 	}
 	cKillMob, rKillMob := anyOfCriteria(hostileMobs...)
 	add("minecraft:adventure/kill_a_mob", "minecraft:adventure/root", "Monster Hunter", "Kill any hostile monster",
@@ -436,6 +440,16 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 	add("minecraft:adventure/play_jukebox_in_meadows", "minecraft:adventure/sleep_in_bed", "Sound of Music", "Make the Meadows come alive with the sound of music from a Jukebox",
 		"minecraft:jukebox", AdvancementFrameTask, "",
 		true, true, false, 2, -1, cJukeboxMeadow, rJukeboxMeadow, 0)
+
+	cVolExile, rVolExile := allOfCriteria("voluntary_exile")
+	add("minecraft:adventure/voluntary_exile", "minecraft:adventure/root", "Voluntary Exile", "Kill a raid captain. Maybe consider staying away from villages for the time being...",
+		"minecraft:white_banner", AdvancementFrameTask, "",
+		true, true, true, 1, 2, cVolExile, rVolExile, 0)
+
+	cHeroVillage, rHeroVillage := allOfCriteria("hero_of_the_village")
+	add("minecraft:adventure/hero_of_the_village", "minecraft:adventure/voluntary_exile", "Hero of the Village", "Successfully defend a village from a raid",
+		"minecraft:white_banner", AdvancementFrameChallenge, "",
+		true, true, true, 2, 2, cHeroVillage, rHeroVillage, 100)
 
 	// --- Husbandry tab (minecraft:husbandry/*) ---
 	cHusbRoot, rHusbRoot := allOfCriteria("consumed_item")
@@ -1207,6 +1221,25 @@ func (s *Server) TriggerPlayJukeboxInMeadows(session *PlayerSession) {
 		return
 	}
 	s.GrantCriterion(session, "minecraft:adventure/play_jukebox_in_meadows", "play_jukebox_in_meadows")
+}
+
+// TriggerVoluntaryExile fires the "Voluntary Exile" advancement
+// (minecraft:adventure/voluntary_exile) when session kills a raid captain.
+func (s *Server) TriggerVoluntaryExile(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/voluntary_exile", "voluntary_exile")
+}
+
+// TriggerHeroOfTheVillage fires the "Hero of the Village" advancement
+// (minecraft:adventure/hero_of_the_village) when session successfully defends
+// a village from a raid.
+func (s *Server) TriggerHeroOfTheVillage(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/hero_of_the_village", "hero_of_the_village")
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---

@@ -451,6 +451,8 @@ func (s *Server) UsePotionOrMilkItem(session *PlayerSession, hand int32) bool {
 	case "minecraft:lingering_potion":
 		_, ok := s.ThrowLingeringPotion(session, hand)
 		return ok
+	case "minecraft:ominous_bottle":
+		return s.DrinkOminousBottle(session, hand)
 	default:
 		return false
 	}
