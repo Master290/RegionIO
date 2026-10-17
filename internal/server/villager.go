@@ -322,13 +322,27 @@ func (s *Server) ensureVillagerState(entityID int32) *VillagerState {
 		return nil
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || ent.TypeName != MobTypeVillager {
+	if ent == nil || (ent.TypeName != MobTypeVillager && canonicalResourceName(ent.TypeName) != MobTypeWanderingTrader) {
 		return nil
 	}
 	vtr := s.villagerTracker()
 	vtr.mu.Lock()
 	defer vtr.mu.Unlock()
 	if vs, ok := vtr.villagers[entityID]; ok && vs != nil {
+		return vs
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
+		offers := RollWanderingTraderOffers(vtr.rng)
+		vs := &VillagerState{
+			EntityID:       entityID,
+			VillagerType:   VillagerTypePlains,
+			Profession:     VillagerProfessionFarmer,
+			Level:          MinVillagerLevel,
+			XP:             0,
+			Offers:         offers,
+			LastRestockDay: -1,
+		}
+		vtr.villagers[entityID] = vs
 		return vs
 	}
 	// Default a newly discovered villager entity to a Novice profession with
@@ -416,7 +430,7 @@ func (s *Server) VillagerState(entityID int32) (VillagerState, bool) {
 		return VillagerState{}, false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || ent.TypeName != MobTypeVillager {
+	if ent == nil || (ent.TypeName != MobTypeVillager && canonicalResourceName(ent.TypeName) != MobTypeWanderingTrader) {
 		return VillagerState{}, false
 	}
 	vs := s.ensureVillagerState(entityID)
@@ -683,8 +697,11 @@ func (s *Server) TickVillagers() {
 
 	for _, entityID := range ids {
 		ent := s.entities.Get(entityID)
-		if ent == nil || ent.TypeName != MobTypeVillager {
+		if ent == nil || (ent.TypeName != MobTypeVillager && canonicalResourceName(ent.TypeName) != MobTypeWanderingTrader) {
 			removed = append(removed, entityID)
+			continue
+		}
+		if canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
 			continue
 		}
 		if _, hadSite := s.VillagerJobSite(entityID); hadSite {
@@ -806,9 +823,9 @@ func (s *Server) InteractWithVillager(session *PlayerSession, entityID int32) (o
 }
 
 // InteractWithEntity handles right-click entity interactions (opening the
-// merchant window for a villager, curing a zombie villager, interacting with
-// item frames/armor stands, taming/feeding/sitting pets, repairing iron golems,
-// or breeding farm animals).
+// merchant window for a villager or wandering trader, curing a zombie villager,
+// interacting with item frames/armor stands, taming/feeding/sitting pets,
+// repairing iron golems, or breeding farm animals).
 func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32) (opened bool, containerID int32, err error) {
 	if s == nil || s.entities == nil || session == nil {
 		return false, 0, nil
@@ -819,6 +836,9 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 	}
 	if ent.TypeName == MobTypeVillager {
 		return s.InteractWithVillager(session, targetEntityID)
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
+		return s.InteractWithWanderingTrader(session, targetEntityID)
 	}
 	if canonicalResourceName(ent.TypeName) == MobTypeZombieVillager {
 		handled := s.InteractWithZombieVillager(session, targetEntityID, nil)

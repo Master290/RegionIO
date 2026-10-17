@@ -123,11 +123,12 @@ func (s *Server) tamedManager() *tamedMobManager {
 }
 
 // IsTameableMob reports whether typeName is a tameable animal (wolf, cat,
-// parrot, horse, donkey, mule, llama, or trader_llama).
+// parrot, horse, donkey, mule, skeleton_horse, zombie_horse, llama, or trader_llama).
 func IsTameableMob(typeName string) bool {
 	switch canonicalResourceName(typeName) {
 	case MobTypeWolf, MobTypeCat, MobTypeParrot,
 		MobTypeHorse, MobTypeDonkey, MobTypeMule,
+		MobTypeSkeletonHorse, MobTypeZombieHorse,
 		MobTypeLlama, MobTypeTraderLlama:
 		return true
 	default:
@@ -135,11 +136,13 @@ func IsTameableMob(typeName string) bool {
 	}
 }
 
-// IsEquineOrLlamaMob reports whether typeName is a horse, donkey, mule, llama,
-// or trader_llama.
+// IsEquineOrLlamaMob reports whether typeName is a horse, donkey, mule,
+// skeleton_horse, zombie_horse, llama, or trader_llama.
 func IsEquineOrLlamaMob(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama:
+	case MobTypeHorse, MobTypeDonkey, MobTypeMule,
+		MobTypeSkeletonHorse, MobTypeZombieHorse,
+		MobTypeLlama, MobTypeTraderLlama:
 		return true
 	default:
 		return false
@@ -427,9 +430,13 @@ func (s *Server) broadcastTamedMobMetadata(ent *world.Entity, snap TamedMobState
 	case MobTypeCat, MobTypeParrot:
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 			EncodeTamableMobDataPacket(ent.ID, snap.Tamed, snap.Sitting))
-	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama:
-		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
-			EncodeAbstractHorseDataPacket(ent.ID, snap.Tamed, snap.Saddled, false))
+	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
+		if pkt := s.EquineOrLlamaEntityDataPacket(ent.ID, ent.TypeName); len(pkt) > 0 {
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB, pkt)
+		} else {
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+				EncodeAbstractHorseDataPacket(ent.ID, snap.Tamed, snap.Saddled, false))
+		}
 	}
 }
 
@@ -446,7 +453,10 @@ func (s *Server) TamedMobEntityDataPacket(entityID int32, typeName string) []byt
 		return EncodeWolfEntityDataPacket(entityID, hp, st.Tamed, st.Sitting, st.CollarColor, int32(st.AngerTicks))
 	case MobTypeCat, MobTypeParrot:
 		return EncodeTamableMobDataPacket(entityID, st.Tamed, st.Sitting)
-	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama:
+	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
+		if pkt := s.EquineOrLlamaEntityDataPacket(entityID, typeName); len(pkt) > 0 {
+			return pkt
+		}
 		return EncodeAbstractHorseDataPacket(entityID, st.Tamed, st.Saddled, false)
 	default:
 		return nil
@@ -585,7 +595,7 @@ func (s *Server) InteractWithTameableMob(session *PlayerSession, entityID int32,
 		return s.interactWithCat(session, ent, heldID, rng)
 	case MobTypeParrot:
 		return s.interactWithParrot(session, ent, heldID, rng)
-	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama:
+	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
 		return s.interactWithEquineOrLlama(session, ent, heldID, rng)
 	default:
 		return false, 0
@@ -801,7 +811,7 @@ func (s *Server) interactWithEquineOrLlama(session *PlayerSession, ent *world.En
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
 
-	// 1. Feeding food (heals, increases temper, accelerates baby growth, or triggers breeding when tamed).
+	// 1. Feeding food (heals up to EquineMaxHealth, increases temper, accelerates baby growth, or triggers breeding when tamed).
 	if heal, temperGain, ok := EquineFoodStats(norm, heldID); ok {
 		if s.IsMobBaby(ent.ID) {
 			consumeOneHeldItemInSurvival(session)
@@ -820,7 +830,7 @@ func (s *Server) interactWithEquineOrLlama(session *PlayerSession, ent *world.En
 		}
 
 		acted := false
-		maxHP := ResolveMobMaxHealth(norm)
+		maxHP := s.EquineMaxHealth(ent.ID)
 		curHP := s.MobHealth(ent.ID)
 		if heal > 0 && curHP < maxHP {
 			nextHP := curHP + heal
@@ -846,22 +856,61 @@ func (s *Server) interactWithEquineOrLlama(session *PlayerSession, ent *world.En
 		}
 		if acted {
 			consumeOneHeldItemInSurvival(session)
+			eatSound := SoundHorseEat
+			if norm == MobTypeDonkey || norm == MobTypeMule {
+				eatSound = SoundDonkeyEat
+			} else if norm == MobTypeLlama || norm == MobTypeTraderLlama {
+				eatSound = SoundLlamaEat
+			}
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(eatSound, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 			return true, offspringID
 		}
 	}
 
-	// 2. Equipping saddle on tamed horse/donkey/mule.
-	if tamed && !saddled && heldID == "minecraft:saddle" && (norm == MobTypeHorse || norm == MobTypeDonkey || norm == MobTypeMule) {
-		consumeOneHeldItemInSurvival(session)
-		mgr.mu.Lock()
-		st.Saddled = true
-		snap := *st
-		mgr.mu.Unlock()
-		s.broadcastTamedMobMetadata(ent, snap)
-		return true, 0
+	// 2. Equipping saddle on tamed horse/donkey/mule/skeleton_horse/zombie_horse.
+	if tamed && !saddled && heldID == "minecraft:saddle" &&
+		(norm == MobTypeHorse || norm == MobTypeDonkey || norm == MobTypeMule || norm == MobTypeSkeletonHorse || norm == MobTypeZombieHorse) {
+		if s.EquipEquineSaddle(ent.ID, true) {
+			consumeOneHeldItemInSurvival(session)
+			return true, 0
+		}
 	}
 
-	// 3. Wild equine/llama interaction -> attempt taming roll against Temper (increasing Temper by +5 on failure).
+	// 3. Equipping horse armor on a tamed horse.
+	if tamed && norm == MobTypeHorse && IsHorseArmorItem(heldID) && s.HorseArmorItem(ent.ID) == "" {
+		if s.EquipHorseArmor(ent.ID, world.NewNamedItemStack(heldID, 1)) {
+			consumeOneHeldItemInSurvival(session)
+			return true, 0
+		}
+	}
+
+	// 4. Equipping carpet on a tamed llama or trader llama.
+	if tamed && (norm == MobTypeLlama || norm == MobTypeTraderLlama) {
+		if cColor, ok := CarpetColorByItemName(heldID); ok && s.LlamaCarpetColor(ent.ID) < 0 {
+			if s.EquipLlamaCarpet(ent.ID, cColor) {
+				consumeOneHeldItemInSurvival(session)
+				return true, 0
+			}
+		}
+	}
+
+	// 5. Attaching a chest on a tamed adult donkey, mule, llama, or trader llama.
+	if tamed && !s.IsMobBaby(ent.ID) && heldID == "minecraft:chest" && IsChestedEquineMob(norm) && !s.HasEquineChest(ent.ID) {
+		if s.EquipEquineChest(ent.ID) {
+			consumeOneHeldItemInSurvival(session)
+			return true, 0
+		}
+	}
+
+	// 6. Shears remove horse armor, llama carpet, or saddle from a tamed unmounted equine/llama.
+	if tamed && heldID == "minecraft:shears" {
+		if _, removed := s.ShearEquineOrLlamaEquipment(session, ent.ID); removed {
+			return true, 0
+		}
+	}
+
+	// 7. Wild equine/llama interaction -> attempt taming roll against Temper (increasing Temper by +5 on failure).
 	if !tamed {
 		mgr.mu.Lock()
 		curTemper := st.Temper
@@ -877,11 +926,21 @@ func (s *Server) interactWithEquineOrLlama(session *PlayerSession, ent *world.En
 			mgr.mu.Unlock()
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
 				EncodeEntityEventPacket(ent.ID, EntityEventTamingFailed))
+			angrySnd := SoundHorseAngry
+			if norm == MobTypeDonkey {
+				angrySnd = SoundDonkeyAngry
+			} else if norm == MobTypeMule {
+				angrySnd = SoundMuleAngry
+			} else if norm == MobTypeLlama || norm == MobTypeTraderLlama {
+				angrySnd = SoundLlamaAngry
+			}
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(angrySnd, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		}
 		return true, 0
 	}
 
-	// 4. Tamed equine/llama owner interaction -> toggle stationary/follow state.
+	// 8. Tamed equine/llama owner interaction -> toggle stationary/follow state.
 	if ownerUUID == session.Profile.UUID {
 		s.SetMobSitting(ent.ID, !sitting)
 		return true, 0
@@ -1116,6 +1175,9 @@ func (s *Server) inheritTamedParentTraits(parentA, parentB, offspringID int32, o
 
 	if canonicalResourceName(offspringType) == MobTypeWolf {
 		s.SetMobHealth(offspringID, DefaultWolfTamedMaxHealth)
+	}
+	if IsEquineOrLlamaMob(offspringType) {
+		s.inheritEquineOrLlamaTraits(parentA, parentB, offspringID, offspringType, rng)
 	}
 	if ent := s.entities.Get(offspringID); ent != nil {
 		s.broadcastTamedMobMetadata(ent, snap)

@@ -611,6 +611,14 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack("minecraft:leather", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeSkeletonHorse:
+		if stack := world.NewNamedItemStack("minecraft:bone", 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeZombieHorse:
+		if stack := world.NewNamedItemStack("minecraft:rotten_flesh", 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
 	case MobTypeCat:
 		if stack := world.NewNamedItemStack("minecraft:string", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
@@ -665,6 +673,8 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundGoatHurt, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.hurt", SoundSourceNeutral
+	case MobTypeWanderingTrader:
+		return SoundWanderingTraderHurt, SoundSourceNeutral
 	case MobTypeWolf:
 		return "minecraft:entity.wolf.hurt", SoundSourceNeutral
 	case MobTypeCat:
@@ -672,13 +682,17 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 	case MobTypeParrot:
 		return "minecraft:entity.parrot.hurt", SoundSourceNeutral
 	case MobTypeHorse:
-		return "minecraft:entity.horse.hurt", SoundSourceNeutral
+		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
-		return "minecraft:entity.donkey.hurt", SoundSourceNeutral
+		return SoundDonkeyHurt, SoundSourceNeutral
 	case MobTypeMule:
-		return "minecraft:entity.mule.hurt", SoundSourceNeutral
+		return SoundMuleHurt, SoundSourceNeutral
+	case MobTypeSkeletonHorse:
+		return SoundSkeletonHorseHurt, SoundSourceNeutral
+	case MobTypeZombieHorse:
+		return SoundZombieHorseHurt, SoundSourceNeutral
 	case MobTypeLlama, MobTypeTraderLlama:
-		return "minecraft:entity.llama.hurt", SoundSourceNeutral
+		return SoundLlamaHurt, SoundSourceNeutral
 	case MobTypeIronGolem:
 		return "minecraft:entity.iron_golem.hurt", SoundSourceNeutral
 	case MobTypePhantom:
@@ -722,6 +736,8 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundGoatDeath, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.death", SoundSourceNeutral
+	case MobTypeWanderingTrader:
+		return SoundWanderingTraderDeath, SoundSourceNeutral
 	case MobTypeWolf:
 		return "minecraft:entity.wolf.death", SoundSourceNeutral
 	case MobTypeCat:
@@ -729,13 +745,17 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 	case MobTypeParrot:
 		return "minecraft:entity.parrot.death", SoundSourceNeutral
 	case MobTypeHorse:
-		return "minecraft:entity.horse.death", SoundSourceNeutral
+		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
-		return "minecraft:entity.donkey.death", SoundSourceNeutral
+		return SoundDonkeyDeath, SoundSourceNeutral
 	case MobTypeMule:
-		return "minecraft:entity.mule.death", SoundSourceNeutral
+		return SoundMuleDeath, SoundSourceNeutral
+	case MobTypeSkeletonHorse:
+		return SoundSkeletonHorseDeath, SoundSourceNeutral
+	case MobTypeZombieHorse:
+		return SoundZombieHorseDeath, SoundSourceNeutral
 	case MobTypeLlama, MobTypeTraderLlama:
-		return "minecraft:entity.llama.death", SoundSourceNeutral
+		return SoundLlamaDeath, SoundSourceNeutral
 	case MobTypeIronGolem:
 		return "minecraft:entity.iron_golem.death", SoundSourceNeutral
 	case MobTypePhantom:
@@ -1056,6 +1076,12 @@ func (s *Server) applyDamageToMob(
 		_, killed = s.DamageWarden(target.ID, damage, attacker)
 		return killed
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeHorse {
+		damage = s.ReduceHorseDamageByArmor(target.ID, damage)
+		if damage <= 0 {
+			return false
+		}
+	}
 
 	var (
 		attackerID  int32
@@ -1090,7 +1116,11 @@ func (s *Server) applyDamageToMob(
 	}
 	if !mem.healthInit {
 		mem.healthInit = true
-		mem.health = MobMaxHealth(target.TypeName)
+		if IsEquineOrLlamaMob(target.TypeName) {
+			mem.health = s.EquineMaxHealth(target.ID)
+		} else {
+			mem.health = MobMaxHealth(target.TypeName)
+		}
 	}
 	wasBaby := mem.ageTicks < 0
 	mem.health -= damage
@@ -1127,12 +1157,17 @@ func (s *Server) applyDamageToMob(
 
 	if !killed {
 		s.OnEntityDamagedWithEffects(target.ID, false)
-		if canonicalResourceName(target.TypeName) == MobTypeArmadillo {
+		normTarget := canonicalResourceName(target.TypeName)
+		if normTarget == MobTypeArmadillo {
 			s.OnArmadilloDamaged(target.ID)
-		} else if canonicalResourceName(target.TypeName) == MobTypeCamel {
+		} else if normTarget == MobTypeCamel {
 			s.OnCamelDamaged(target.ID)
-		} else if canonicalResourceName(target.TypeName) == MobTypeAxolotl {
+		} else if normTarget == MobTypeAxolotl {
 			s.OnAxolotlDamaged(target.ID, damage, nil)
+		} else if normTarget == MobTypeLlama || normTarget == MobTypeTraderLlama {
+			s.OnLlamaDamaged(target.ID, attacker, 0)
+		} else if normTarget == MobTypeWanderingTrader {
+			s.OnWanderingTraderDamaged(target.ID, attacker, 0)
 		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,
@@ -1144,10 +1179,10 @@ func (s *Server) applyDamageToMob(
 			SourceEntityID: target.ID,
 		})
 		if attacker != nil {
-			if canonicalResourceName(target.TypeName) == MobTypeWolf {
+			if normTarget == MobTypeWolf {
 				s.ProvokeWildWolf(target.ID, attacker)
 			}
-			if canonicalResourceName(target.TypeName) == MobTypeVillager {
+			if normTarget == MobTypeVillager {
 				s.OnVillagerHurtByPlayer(target.ID, attacker)
 			}
 			s.NotifyOwnerAttackedTarget(attacker, target.ID)
@@ -1189,8 +1224,16 @@ func (s *Server) applyDamageToMob(
 		EncodeEntityEventPacket(target.ID, EntityEventDeath))
 	s.OnEntityDiedWithEffects(target.ID)
 	s.OnRaiderKilled(target.ID, attacker)
+	_ = s.DismountEntityFromVehicle(target.ID)
+	if canonicalResourceName(target.TypeName) == MobTypeWanderingTrader && attacker != nil {
+		s.OnWanderingTraderDamaged(target.ID, attacker, 0)
+	}
 	if attacker != nil && canonicalResourceName(target.TypeName) == MobTypeVillager {
 		s.OnVillagerKilledByPlayer(target.ID, dim, deathX, deathY, deathZ, attacker)
+	}
+	eqDrops := s.OnEquineOrLlamaKilled(target.ID)
+	for _, eqDrop := range eqDrops {
+		s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, eqDrop)
 	}
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,

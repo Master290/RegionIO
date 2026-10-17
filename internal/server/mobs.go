@@ -175,6 +175,10 @@ var (
 		MobTypeMagmaCube:           EntityTypeMagmaCubeID,
 		MobTypeSlime:               EntityTypeSlimeID,
 		MobTypeTadpole:             EntityTypeTadpoleID,
+		MobTypeSkeletonHorse:       EntityTypeSkeletonHorseID,
+		MobTypeZombieHorse:         EntityTypeZombieHorseID,
+		MobTypeWanderingTrader:     EntityTypeWanderingTraderID,
+		EntityTypeLlamaSpit:        EntityTypeLlamaSpitID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -289,8 +293,14 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultDonkeyMaxHealth
 	case MobTypeMule:
 		return DefaultMuleMaxHealth
+	case MobTypeSkeletonHorse:
+		return DefaultSkeletonHorseMaxHealth
+	case MobTypeZombieHorse:
+		return DefaultZombieHorseMaxHealth
 	case MobTypeLlama, MobTypeTraderLlama:
 		return DefaultLlamaMaxHealth
+	case MobTypeWanderingTrader:
+		return DefaultWanderingTraderMaxHealth
 	case MobTypeIronGolem:
 		return DefaultIronGolemMaxHealth
 	case MobTypeSnowGolem:
@@ -344,8 +354,10 @@ func animalWanderSpeed(typeName string) float64 {
 		return AxolotlSwimSpeed
 	case MobTypeGoat:
 		return GoatWanderSpeed
-	case MobTypeVillager:
+	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
+	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
+		return DonkeyDefaultSpeed
 	default:
 		return PigWanderSpeed
 	}
@@ -368,6 +380,10 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	norm := canonicalResourceName(typeName)
 	if norm == MobTypeVillager {
 		return s.SpawnVillager(x, y, z, VillagerProfessionFarmer, MinVillagerLevel)
+	}
+	if norm == MobTypeWanderingTrader {
+		traderID, _, err := s.SpawnWanderingTrader(normDim, x, y, z, false, nil)
+		return traderID, err
 	}
 	if norm == MobTypeWither {
 		return s.SpawnWither(normDim, x, y, z, true)
@@ -427,20 +443,26 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 		Z:         z,
 		OnGround:  true,
 	})
+	if IsTameableMob(norm) {
+		_ = s.ensureTamedMobState(id, norm)
+	}
+	if IsEquineOrLlamaMob(norm) {
+		s.initEquineOrLlamaOnSpawn(id, norm, nil)
+	}
 	tr := s.entityTracker()
 	tr.mu.Lock()
 	mem := tr.mobStateFor(id, tr.aiTickID)
 	mem.healthInit = true
-	mem.health = ResolveMobMaxHealth(norm)
+	if IsEquineOrLlamaMob(norm) {
+		mem.health = s.EquineMaxHealth(id)
+	} else {
+		mem.health = ResolveMobMaxHealth(norm)
+	}
 	mem.lastHealth = mem.health
 	if norm == MobTypeChicken && mem.eggTimer <= 0 {
 		mem.eggTimer = ChickenEggMinTicks
 	}
 	tr.mu.Unlock()
-
-	if IsTameableMob(norm) {
-		_ = s.ensureTamedMobState(id, norm)
-	}
 
 	if ent := s.entities.Get(id); ent != nil {
 		cp := ent.ChunkPos()

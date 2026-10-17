@@ -186,6 +186,8 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickTadpoles(rng)
 		s.TickAxolotls(rng)
 		s.TickGoats(rng)
+		s.TickEquinesAndLlamas(rng)
+		s.TickLlamaSpits()
 		s.TickMobsInCauldrons()
 	}
 
@@ -233,7 +235,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit {
 			continue
 		}
 		if IsBossOrBossSupportEntity(snapshot.TypeName) {
@@ -255,15 +257,22 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		mem := t.mobStateFor(snapshot.ID, aiTick)
 		if !mem.healthInit {
 			mem.healthInit = true
-			mem.health = ResolveMobMaxHealth(snapshot.TypeName)
+			if IsEquineOrLlamaMob(snapshot.TypeName) {
+				mem.health = s.EquineMaxHealth(snapshot.ID)
+			} else {
+				mem.health = ResolveMobMaxHealth(snapshot.TypeName)
+			}
 			mem.lastHealth = mem.health
 		} else if mem.health < mem.lastHealth {
 			mem.lastHealth = mem.health
 			if snapshot.TypeName == MobTypeSpider {
 				mem.provoked = true
-			} else if IsPassiveAnimal(snapshot.TypeName) || snapshot.TypeName == MobTypeArmadillo {
+			} else if IsPassiveAnimal(snapshot.TypeName) || snapshot.TypeName == MobTypeArmadillo || IsEquineOrLlamaMob(snapshot.TypeName) {
 				mem.panicTicks = AnimalPanicDurationTicks
 			}
+		}
+		if s.EntityMountedVehicle(snapshot.ID) > 0 {
+			continue
 		}
 		if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
 			if mem.attackCooldown > 0 {
@@ -537,6 +546,9 @@ func (t *EntityTracker) syncLocked(s *Server) {
 					} else if IsTameableMob(ent.TypeName) {
 						if metaPkt := s.TamedMobEntityDataPacket(ent.ID, ent.TypeName); len(metaPkt) > 0 {
 							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
+						}
+						if eqPkt := s.EquineBodyEquipmentPacket(ent.ID); len(eqPkt) > 0 {
+							_ = viewer.send(protocol.PlaySetEquipment, eqPkt)
 						}
 					} else if ent.TypeName == MobTypeIronGolem {
 						_ = viewer.send(PlaySetEntityDataCB, EncodeIronGolemDataPacket(ent.ID, s.IsIronGolemPlayerCreated(ent.ID)))

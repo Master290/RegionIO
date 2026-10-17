@@ -798,16 +798,19 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 		return 0, errors.New("server: dead player cannot trade")
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || ent.TypeName != MobTypeVillager {
+	if ent == nil || (ent.TypeName != MobTypeVillager && canonicalResourceName(ent.TypeName) != MobTypeWanderingTrader) {
 		return 0, errors.New("server: entity is not a villager")
 	}
+	isWanderingTrader := canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader
 
 	vs := s.ensureVillagerState(entityID)
-	if vs == nil || !CanProfessionTrade(vs.Profession) || len(vs.Offers) == 0 {
+	if vs == nil || (!isWanderingTrader && !CanProfessionTrade(vs.Profession)) || len(vs.Offers) == 0 {
 		return 0, errors.New("server: villager has no trades")
 	}
 
-	s.UpdateVillagerSpecialPricesForPlayer(session, entityID)
+	if !isWanderingTrader {
+		s.UpdateVillagerSpecialPricesForPlayer(session, entityID)
+	}
 	_ = s.CloseMerchantContainer(session, 0, false)
 
 	tr := getContainerTracker(session)
@@ -825,6 +828,9 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 
 	if session.send != nil {
 		title := VillagerProfessionTitle(vs.Profession)
+		if isWanderingTrader {
+			title = "Wandering Trader"
+		}
 		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeMerchant, title)); err != nil {
 			return cid, err
 		}
@@ -833,8 +839,14 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
 		}
-		offers := s.EffectiveOffersForPlayer(session, entityID, ApplyHeroOfTheVillageToOffers(session, vs.Offers))
-		offersPkt := EncodeMerchantOffersPacket(cid, offers, int32(vs.Level), vs.XP, true, true)
+		var offers []MerchantOffer
+		if isWanderingTrader {
+			offers = make([]MerchantOffer, len(vs.Offers))
+			copy(offers, vs.Offers)
+		} else {
+			offers = s.EffectiveOffersForPlayer(session, entityID, ApplyHeroOfTheVillageToOffers(session, vs.Offers))
+		}
+		offersPkt := EncodeMerchantOffersPacket(cid, offers, int32(vs.Level), vs.XP, !isWanderingTrader, !isWanderingTrader)
 		if err := session.send(PlayMerchantOffersCB, offersPkt); err != nil {
 			return cid, err
 		}
@@ -1151,8 +1163,13 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	tr.open.Crafting[1] = slots[MerchantSlotPayment2]
 	writeBackMerchantPlayerSlots(session, slots)
 
+	isWanderingTrader := false
+	if ent := s.entities.Get(entityID); ent != nil && canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
+		isWanderingTrader = true
+	}
+
 	leveledUp := false
-	if traded {
+	if traded && !isWanderingTrader {
 		vs.XP += xpGained
 		for CanVillagerLevelUp(vs.Level, vs.XP) {
 			vs.Level++
@@ -1177,12 +1194,18 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	tr.mu.Unlock()
 
 	if traded {
-		s.OnVillagerTradedWithPlayer(entityID, session)
+		if !isWanderingTrader {
+			s.OnVillagerTradedWithPlayer(entityID, session)
+		}
 		s.TriggerVillagerTrade(session)
 		if ent := s.entities.Get(entityID); ent != nil {
 			cp := ent.ChunkPos()
+			yesSnd := "minecraft:entity.villager.yes"
+			if isWanderingTrader {
+				yesSnd = SoundWanderingTraderYes
+			}
 			s.BroadcastChunk(cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket("minecraft:entity.villager.yes", SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+				EncodeSoundPacket(yesSnd, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 			if leveledUp {
 				s.BroadcastChunk(cp.X, cp.Z, PlaySetEntityDataCB,
 					EncodeVillagerEntityDataPacket(entityID, VillagerTypeID(vType), VillagerProfessionID(vProf), int32(vLevel)))
@@ -1207,8 +1230,13 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 			return err
 		}
 		if traded {
-			effOffers := s.EffectiveOffersForPlayer(session, entityID, offersSnapshot)
-			offersPkt := EncodeMerchantOffersPacket(cid, effOffers, int32(vLevel), vXP, true, true)
+			var effOffers []MerchantOffer
+			if isWanderingTrader {
+				effOffers = offersSnapshot
+			} else {
+				effOffers = s.EffectiveOffersForPlayer(session, entityID, offersSnapshot)
+			}
+			offersPkt := EncodeMerchantOffersPacket(cid, effOffers, int32(vLevel), vXP, !isWanderingTrader, !isWanderingTrader)
 			if err := session.send(PlayMerchantOffersCB, offersPkt); err != nil {
 				return err
 			}

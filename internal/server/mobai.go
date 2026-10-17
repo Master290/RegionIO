@@ -105,7 +105,9 @@ func IsHostileMob(typeName string) bool {
 // IsPassiveMob reports whether typeName is a passive wandering mob or animal.
 func IsPassiveMob(typeName string) bool {
 	switch typeName {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeVillager,
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeVillager, MobTypeWanderingTrader,
+		MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse,
+		MobTypeLlama, MobTypeTraderLlama,
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
 		MobTypeAllay, MobTypeFrog, MobTypeTadpole, MobTypeAxolotl, MobTypeGoat:
 		return true
