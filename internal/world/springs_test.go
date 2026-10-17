@@ -40,17 +40,26 @@ func springRegion(t *testing.T, rock uint16, cells [][3]int) (*decorationRegion,
 }
 
 // TestSpringFeaturePlacesFallingFluid is the basic shape: four rock neighbours, one
-// hole, rock above and below, and the spring comes out as falling water rather than a
-// source - the config's `falling: true` property has no such state, so the port maps
-// it to level 8.
+// hole, rock above and below. SpringFeature.place writes the source legacy block
+// (level=0 via FlowingFluid.getLegacyLevel) and schedules a fluid tick, which spreads
+// into the hole at (8,10,9) (level=1) and falls to (8,9,9) (level=8).
 func TestSpringFeaturePlacesFallingFluid(t *testing.T) {
 	region, set, config := springRegion(t, StateStone, [][3]int{{8, 11, 8}, {8, 9, 8}, {7, 10, 8}, {9, 10, 8}, {8, 10, 7}})
 	if err := region.placeSpring(set, worldgen.FeaturePosition{X: 8, Y: 10, Z: 8}, config); err != nil {
 		t.Fatal(err)
 	}
+	source, ok := nameToStateID("minecraft:water", map[string]string{"level": "0"})
+	if !ok || region.getBlock(8, 10, 8) != source {
+		t.Fatalf("spring origin state = %s%s, want source water (level=0)", stateLabel(region.getBlock(8, 10, 8)), stateProperties(region.getBlock(8, 10, 8)))
+	}
+	region.finishSpringSourcePass()
+	flowing1, ok := nameToStateID("minecraft:water", map[string]string{"level": "1"})
+	if !ok || region.getBlock(8, 10, 9) != flowing1 {
+		t.Fatalf("spring hole state = %s%s, want flowing water (level=1)", stateLabel(region.getBlock(8, 10, 9)), stateProperties(region.getBlock(8, 10, 9)))
+	}
 	falling, ok := nameToStateID("minecraft:water", map[string]string{"level": "8"})
-	if !ok || region.getBlock(8, 10, 8) != falling {
-		t.Fatalf("spring state = %s, want falling water", stateLabel(region.getBlock(8, 10, 8)))
+	if !ok || region.getBlock(8, 9, 9) != falling {
+		t.Fatalf("spring waterfall state = %s%s, want falling water (level=8)", stateLabel(region.getBlock(8, 9, 9)), stateProperties(region.getBlock(8, 9, 9)))
 	}
 }
 
@@ -82,11 +91,12 @@ func TestSpringCountsAcrossTheChunkSeam(t *testing.T) {
 	if err := region.placeSpring(set, worldgen.FeaturePosition{X: 0, Y: 10, Z: 8}, config); err != nil {
 		t.Fatal(err)
 	}
-	falling, _ := nameToStateID("minecraft:water", map[string]string{"level": "8"})
-	if got := region.getBlock(0, 10, 8); got != falling {
+	source, _ := nameToStateID("minecraft:water", map[string]string{"level": "0"})
+	if got := region.getBlock(0, 10, 8); got != source {
 		t.Fatalf("spring at the seam = %s, want it to place from a rock column that spans two chunks",
 			stateLabel(got))
 	}
+	region.finishSpringSourcePass()
 }
 
 // TestSpringSeparatesRockFromHoles guards the one place where counting rock and holes
@@ -135,12 +145,13 @@ func TestSpringCountsNonDefaultValidStateAsRock(t *testing.T) {
 	if err := region.placeSpring(set, worldgen.FeaturePosition{X: 8, Y: 10, Z: 8}, config); err != nil {
 		t.Fatal(err)
 	}
-	falling, _ := nameToStateID("minecraft:water", map[string]string{"level": "8"})
-	if got := region.getBlock(8, 10, 8); got != falling {
-		t.Fatalf("spring under a non-default deepslate state = %s, want falling water: a valid "+
+	source, _ := nameToStateID("minecraft:water", map[string]string{"level": "0"})
+	if got := region.getBlock(8, 10, 8); got != source {
+		t.Fatalf("spring under a non-default deepslate state = %s, want source water: a valid "+
 			"block must count as rock in every state, as vanilla's BlockStateIngredient does",
 			stateLabel(got))
 	}
+	region.finishSpringSourcePass()
 }
 
 // TestRegionPlacesSprings is the point of the stage: a region that carries a spring in
@@ -204,3 +215,5 @@ func TestPlacedSpringsAreDeterministic(t *testing.T) {
 		}
 	}
 }
+
+
