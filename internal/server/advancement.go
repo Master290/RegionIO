@@ -390,6 +390,11 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:enchanted_book", AdvancementFrameTask, "",
 		true, true, false, 6, 0, cEnchant, rEnchant, 0)
 
+	cCureZV, rCureZV := allOfCriteria("cured_zombie")
+	add("minecraft:story/cure_zombie_villager", "minecraft:story/enter_the_nether", "Zombie Doctor", "Weaken and then cure a Zombie Villager",
+		"minecraft:golden_apple", AdvancementFrameGoal, "",
+		true, true, false, 6, 2, cCureZV, rCureZV, 0)
+
 	cEye, rEye := allOfCriteria("in_stronghold")
 	add("minecraft:story/follow_ender_eye", "minecraft:story/enter_the_nether", "Eye Spy", "Follow an Eye of Ender",
 		"minecraft:ender_eye", AdvancementFrameTask, "",
@@ -1307,6 +1312,66 @@ func (s *Server) TriggerKillMobNearSculkCatalyst(session *PlayerSession) {
 		return
 	}
 	s.GrantCriterion(session, "minecraft:adventure/kill_mob_near_sculk_catalyst", "kill_mob_near_sculk_catalyst")
+}
+
+// TriggerFishingRodHooked fires the minecraft:fishing_rod_hooked advancement
+// trigger ("Fishy Business", minecraft:husbandry/fishy_business) for session by
+// inspecting s.LastCaughtFishingLoot(session).
+func (s *Server) TriggerFishingRodHooked(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	drop, ok := s.LastCaughtFishingLoot(session)
+	if !ok || drop.Stack.IsEmpty() {
+		return
+	}
+	s.TriggerFishingRodHookedItem(session, drop.Stack)
+}
+
+// TriggerFishingRodHookedItem fires the minecraft:fishing_rod_hooked advancement
+// criteria for a caught item stack.
+func (s *Server) TriggerFishingRodHookedItem(session *PlayerSession, item world.ItemStack) {
+	if s == nil || session == nil || item.IsEmpty() {
+		return
+	}
+	name := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(item.ResolvedID())), "minecraft:")
+	switch name {
+	case "cod", "salmon", "tropical_fish", "pufferfish":
+		s.GrantCriterion(session, "minecraft:husbandry/fishy_business", name)
+	}
+	s.TriggerItemAcquired(session, item)
+}
+
+// TriggerCuredZombieVillager fires the minecraft:cured_zombie_villager
+// advancement trigger ("Zombie Doctor", minecraft:story/cure_zombie_villager)
+// for session.
+func (s *Server) TriggerCuredZombieVillager(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:story/cure_zombie_villager", "cured_zombie")
+}
+
+// TriggerCuredZombieVillagerByUUID fires the minecraft:cured_zombie_villager
+// advancement trigger ("Zombie Doctor", minecraft:story/cure_zombie_villager)
+// for the online player matching curerUUID (intended to be called from
+// CompleteZombieVillagerCure).
+func (s *Server) TriggerCuredZombieVillagerByUUID(curerUUID [16]byte) {
+	if s == nil || curerUUID == ([16]byte{}) {
+		return
+	}
+	s.playersMu.RLock()
+	var target *PlayerSession
+	for _, sess := range s.players {
+		if sess != nil && sess.Profile.UUID == curerUUID {
+			target = sess
+			break
+		}
+	}
+	s.playersMu.RUnlock()
+	if target != nil {
+		s.TriggerCuredZombieVillager(target)
+	}
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---

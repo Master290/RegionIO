@@ -1254,6 +1254,9 @@ func (s *Server) ApplyEntityEffectScaled(entityID int32, inst StatusEffectInstan
 		s.BroadcastDimensionChunk(ent.EffectiveDimension(), pos.X, pos.Z, PlayUpdateMobEffect,
 			EncodeUpdateMobEffectPacket(entityID, active, true))
 	}
+	if !exists && def.ID == EffectWeakness && canonicalEffectID(ent.TypeName) == "minecraft:zombie_villager" {
+		s.SetZombieVillagerWeakened(entityID, true)
+	}
 	return changed
 }
 
@@ -1351,6 +1354,9 @@ func (s *Server) TickAllEntityEffects() {
 	}
 	for _, rem := range expired {
 		if ent := s.entities.Get(rem.entityID); ent != nil {
+			if rem.effectID == EffectWeakness && canonicalEffectID(ent.TypeName) == "minecraft:zombie_villager" {
+				s.SetZombieVillagerWeakened(rem.entityID, false)
+			}
 			pos := ent.ChunkPos()
 			s.BroadcastDimensionChunk(ent.EffectiveDimension(), pos.X, pos.Z, PlayRemoveMobEffect,
 				EncodeRemoveMobEffectPacket(rem.entityID, rem.effectID))

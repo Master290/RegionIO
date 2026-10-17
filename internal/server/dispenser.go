@@ -1375,6 +1375,18 @@ func (s *Server) resolveImmediateDispenserArrowHit(proj *DispenserProjectile, fx
 			}
 			s.SetMobHealth(ent.ID, nextHP)
 		}
+		if proj.Spectral {
+			s.ApplyEntityEffectScaled(ent.ID, NewStatusEffectInstance(EffectGlowing, 200, 0), 1.0)
+		}
+		if proj.PotionType != "" {
+			for _, ef := range PotionEffects(proj.PotionType) {
+				if def, ok := MobEffectByID(ef.ID); ok && def.Instantaneous {
+					s.ApplyEntityEffectScaled(ent.ID, ef, 1.0)
+				} else {
+					s.ApplyEntityEffectScaled(ent.ID, ef, 0.125)
+				}
+			}
+		}
 		return
 	}
 }

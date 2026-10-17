@@ -823,4 +823,72 @@ func TestTrialChambersStatusEffects2612(t *testing.T) {
 	}
 }
 
+func TestZombieVillagerWeaknessAndFishingVillagerAdvancementHooks(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	uuid := [16]byte{9, 9, 1, 2}
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: uuid,
+		Name: "VillagerCurer",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerTransform(sess, 20.5, 65.0, 20.5, 0, 0, true)
+
+	// 1. Splash Potion of Weakness on a minecraft:zombie_villager marks it weakened.
+	zvType := registry.EntityTypeIndex("minecraft:zombie_villager")
+	if zvType < 0 {
+		zvType = 1
+	}
+	zvID := srv.Entities().Add(&world.Entity{
+		TypeID:    zvType,
+		TypeName:  "minecraft:zombie_villager",
+		Dimension: world.DimensionOverworld,
+		X:         21.5,
+		Y:         65.0,
+		Z:         20.5,
+	})
+	srv.SetMobHealth(zvID, 20.0)
+	if srv.IsZombieVillagerWeakened(zvID) {
+		t.Fatal("expected zombie_villager to start not weakened")
+	}
+
+	srv.ApplySplashPotionAt(world.DimensionOverworld, 21.5, 65.0, 20.5, PotionWeakness, 0)
+	if !srv.IsZombieVillagerWeakened(zvID) {
+		t.Fatal("expected Splash Potion of Weakness to mark zombie_villager as weakened via SetZombieVillagerWeakened")
+	}
+
+	// 2. Curing zombie villager advancement trigger by UUID ("Zombie Doctor").
+	if sess.HasCompletedAdvancement("minecraft:story/cure_zombie_villager") {
+		t.Fatal("expected minecraft:story/cure_zombie_villager to be incomplete initially")
+	}
+	srv.TriggerCuredZombieVillagerByUUID(uuid)
+	if !sess.HasCompletedAdvancement("minecraft:story/cure_zombie_villager") {
+		t.Fatal("expected TriggerCuredZombieVillagerByUUID to grant minecraft:story/cure_zombie_villager")
+	}
+
+	// 3. Fishing rod hooked advancement trigger ("Fishy Business").
+	if sess.HasCompletedAdvancement("minecraft:husbandry/fishy_business") {
+		t.Fatal("expected minecraft:husbandry/fishy_business to be incomplete initially")
+	}
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:fishing_rod", 1))
+	cast, _ := srv.UseFishingRod(sess, HandMain)
+	if !cast {
+		t.Fatal("expected first UseFishingRod to cast bobber")
+	}
+	if !srv.SetFishingBobberTimers(sess, 0, 0, 20, true) {
+		t.Fatal("expected SetFishingBobberTimers to succeed")
+	}
+	_, _ = srv.UseFishingRod(sess, HandMain)
+	if _, ok := srv.LastCaughtFishingLoot(sess); !ok {
+		t.Fatal("expected LastCaughtFishingLoot to be populated after reeling in biting bobber")
+	}
+	srv.TriggerFishingRodHooked(sess)
+	srv.TriggerFishingRodHookedItem(sess, world.NewNamedItemStack("minecraft:cod", 1))
+	if !sess.HasCompletedAdvancement("minecraft:husbandry/fishy_business") {
+		t.Fatal("expected fishing rod hooked trigger after catching cod to grant minecraft:husbandry/fishy_business")
+	}
+}
+
+
 
