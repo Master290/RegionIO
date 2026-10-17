@@ -22,6 +22,8 @@ const (
 	UpdateFalling
 	// UpdateFluid steps runtime fluid propagation and drainage (water, lava).
 	UpdateFluid
+	// UpdateRedstone steps delayed redstone components (buttons, pressure plates, repeaters, torches).
+	UpdateRedstone
 )
 
 // Vanilla game-tick delays for runtime block physics.
@@ -260,6 +262,8 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 			c.stepFallingBlock(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateFluid:
 			c.stepFluid(u.pos.X, u.pos.Y, u.pos.Z, &res)
+		case UpdateRedstone:
+			c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		}
 	}
 	return res
@@ -394,6 +398,9 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 
 	// Schedule falling ticks and fluid ticks at (x, y, z) and its 6 neighbors.
 	c.scheduleAround(x, y, z)
+
+	// Propagate redstone dust power, connection shapes, torches, repeaters, doors, trapdoors, and pistons.
+	c.propagateRedstoneAround(x, y, z, oldState, newState, res)
 }
 
 func (c *Cache) scheduleAround(x, y, z int) {
