@@ -587,6 +587,8 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickAllSculk()
 			h.srv.TickCauldrons(nil)
 			h.srv.TickVehicles()
+			h.srv.TickPrimedTNT()
+			h.srv.TickDispenserProjectiles()
 			h.srv.TickAllPlayerStats()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
@@ -1650,6 +1652,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			}
 			cache := h.srv.PlayerChunks(h.session)
 			if cache != nil {
+				if server.IsDispenserOrDropperBlock(state) && h.srv != nil {
+					state = h.srv.ResolveDispenserOrDropperPlacementState(h.session, state)
+				}
 				placed := false
 				if server.IsBedBlock(state) && h.srv != nil {
 					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)

@@ -517,6 +517,13 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return true, 0, nil
 	case IsRespawnAnchorBlock(state):
 		return s.InteractRespawnAnchor(session, x, y, z), 0, nil
+	case IsDispenserOrDropperBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		s.RecordContainerOpenStat(session, blockName)
+		cid, err := s.OpenDispenserOrDropper(session, x, y, z)
+		return err == nil, cid, err
 	case IsLecternBlock(state):
 		s.RecordContainerOpenStat(session, blockName)
 		return s.InteractWithLectern(session, 0, x, y, z), 0, nil
@@ -815,6 +822,13 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		}
 		tr.mu.Unlock()
 		return nil
+	case MenuTypeGeneric3x3:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		s.ApplyDispenserOrDropperClickLocked(session, tr, bx, by, bz, int(slot), button, mode)
+		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		return s.SyncDispenserViewers(session, bx, by, bz)
 	case MenuTypeCrafting:
 		s.applyCraftingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
@@ -1657,6 +1671,8 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		} else {
 			return nil
 		}
+	case MenuTypeGeneric3x3:
+		slots = s.BuildDispenserMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	case MenuTypeCrafting:
 		slots = s.buildCraftingMenuSlots(session, openCopy.Crafting, openCopy.Result)
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:

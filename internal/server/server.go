@@ -302,6 +302,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadSculk()
 		_ = s.LoadWardenFile()
 		_ = s.LoadVehiclesFile()
+		_ = s.LoadDispensers()
 	}
 	return s
 }
@@ -455,6 +456,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveVehiclesFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveDispensers(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {

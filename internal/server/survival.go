@@ -354,6 +354,12 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsChestBlock(prevState) {
 		s.DropChestContents(x, y, z)
 	}
+	if IsDispenserOrDropperBlock(prevState) {
+		s.BreakDispenserOrDropper(dim, x, y, z)
+	}
+	if IsShulkerBoxItemOrBlock(world.BlockName(prevState)) {
+		s.BreakShulkerBox(dim, x, y, z)
+	}
 	if IsFurnaceBlock(prevState) {
 		s.DropFurnaceContents(x, y, z)
 	}
@@ -585,8 +591,16 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 	}
 	scale := session.CurrentAttackStrengthScale(0.5)
 	bonus := s.PlayerWeaponAttackBonus(session, target.TypeName) * scale
+	frameSt, hadFrame := s.ItemFrameState(targetEntityID)
 
 	dealt, killed := s.AttackEntity(session, targetEntityID)
+	if hadFrame {
+		if _, stillThere := s.ItemFrameState(targetEntityID); stillThere {
+			s.RefreshItemFrameComparators(targetEntityID)
+		} else {
+			s.refreshRemovedItemFrameComparators(frameSt)
+		}
+	}
 	if dealt <= 0 {
 		return 0, false
 	}
@@ -671,6 +685,7 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 			s.AttackEntityWithEnchantments(session, pkt.EntityID)
 		case InteractActionInteractAt:
 			if s.InteractWithDecorationAt(session, pkt.EntityID, pkt.Hand, float64(pkt.TargetX), float64(pkt.TargetY), float64(pkt.TargetZ), true) {
+				s.RefreshItemFrameComparators(pkt.EntityID)
 				return nil
 			}
 			if pkt.Hand == 0 {
@@ -687,6 +702,7 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 					return err
 				}
 				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+				s.RefreshItemFrameComparators(pkt.EntityID)
 			}
 		}
 	}
@@ -1524,3 +1540,151 @@ func (s *Server) traceAndResolveProjectileShot(
 	})
 }
 
+// DispenserPlacementFacing computes the 6-direction `facing` property ("north",
+// "south", "west", "east", "up", "down") opposite to a player's look direction
+// (matching vanilla DispenserBlock.getStateForPlacement -> getNearestLookingDirection().getOpposite()).
+func DispenserPlacementFacing(yaw, pitch float32) string {
+	lx, ly, lz := ElytraLookVector(yaw, pitch)
+	ax, ay, az := math.Abs(lx), math.Abs(ly), math.Abs(lz)
+	if ay > ax && ay > az {
+		if ly > 0 {
+			return "down"
+		}
+		return "up"
+	}
+	if ax > az {
+		if lx > 0 {
+			return "west"
+		}
+		return "east"
+	}
+	if lz > 0 {
+		return "north"
+	}
+	return "south"
+}
+
+// ResolveDispenserOrDropperPlacementState resolves the placed block state for a
+// `minecraft:dispenser` or `minecraft:dropper` with `facing` opposite to
+// session's look direction and `triggered=false`.
+func (s *Server) ResolveDispenserOrDropperPlacementState(session *PlayerSession, baseState uint16) uint16 {
+	if !IsDispenserOrDropperBlock(baseState) {
+		return baseState
+	}
+	facing := "north"
+	if session != nil {
+		snap := session.Snapshot()
+		facing = DispenserPlacementFacing(snap.Yaw, snap.Pitch)
+	}
+	blockName := world.BlockName(baseState)
+	if st, ok := world.BlockStateByName(blockName, map[string]string{
+		"facing":    facing,
+		"triggered": "false",
+	}); ok {
+		return st
+	}
+	return baseState
+}
+
+// BreakDispenserOrDropper drops all stored items from a broken dispenser or
+// dropper at (dim, x, y, z), removes its block entity state, and updates comparators.
+func (s *Server) BreakDispenserOrDropper(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	s.DropDispenserContentsInDimension(dim, x, y, z)
+}
+
+// BreakShulkerBox clears the stored shulker box block entity state at (dim, x, y, z)
+// and updates any adjacent redstone comparators.
+func (s *Server) BreakShulkerBox(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := normalizeDispenserDim(dim)
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	delete(ds.shulkerBoxes, dispenserBlockKey{dim: normDim, x: x, y: y, z: z})
+	ds.mu.Unlock()
+	cs := s.chestState()
+	cs.mu.Lock()
+	delete(cs.chests, chestKey{x, y, z})
+	cs.mu.Unlock()
+	s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
+}
+
+func (s *Server) refreshRemovedItemFrameComparators(st ItemFrameState) {
+	if s == nil {
+		return
+	}
+	normDim := normalizeDispenserDim(st.Dimension)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
+	if cache == nil {
+		return
+	}
+	res1 := cache.UpdateComparatorsAround(st.BlockX, st.BlockY, st.BlockZ)
+	dx, dy, dz := DirectionOffset(st.Direction)
+	res2 := cache.UpdateComparatorsAround(st.BlockX-dx, st.BlockY-dy, st.BlockZ-dz)
+	changes := append(res1.Changes, res2.Changes...)
+	lightChanged := append(res1.LightChanged, res2.LightChanged...)
+	if len(changes) > 0 || len(lightChanged) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, changes, lightChanged)
+	}
+}
+
+// TickDispenserProjectiles advances all active projectiles launched by dispensers
+// by one game tick and cleans up expired or impacted projectiles.
+func (s *Server) TickDispenserProjectiles() int {
+	if s == nil {
+		return 0
+	}
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	if len(ds.projectiles) == 0 {
+		ds.mu.Unlock()
+		return 0
+	}
+	var toRemove []int32
+	ticked := 0
+	for id, proj := range ds.projectiles {
+		if proj == nil {
+			toRemove = append(toRemove, id)
+			continue
+		}
+		ticked++
+		proj.TicksLived++
+		if proj.Impacted || (proj.MaxTicks > 0 && proj.TicksLived >= proj.MaxTicks) {
+			toRemove = append(toRemove, id)
+			continue
+		}
+		proj.X += proj.VX
+		proj.Y += proj.VY
+		proj.Z += proj.VZ
+		if proj.TypeName != EntityTypeSmallFireball && proj.TypeName != EntityTypeWindCharge {
+			proj.VY -= 0.05
+			proj.VX *= 0.99
+			proj.VY *= 0.99
+			proj.VZ *= 0.99
+		}
+		if s.entities != nil {
+			nx, ny, nz := proj.X, proj.Y, proj.Z
+			vx, vy, vz := proj.VX, proj.VY, proj.VZ
+			s.entities.Update(id, func(e *world.Entity) {
+				e.X = nx
+				e.Y = ny
+				e.Z = nz
+				e.VelocityX = int16(clampDispenserFloat(vx*8000, -32767, 32767))
+				e.VelocityY = int16(clampDispenserFloat(vy*8000, -32767, 32767))
+				e.VelocityZ = int16(clampDispenserFloat(vz*8000, -32767, 32767))
+			})
+		}
+	}
+	for _, id := range toRemove {
+		delete(ds.projectiles, id)
+		if s.entities != nil {
+			s.entities.Remove(id)
+		}
+	}
+	ds.mu.Unlock()
+	return ticked
+}
