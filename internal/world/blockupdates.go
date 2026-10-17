@@ -44,11 +44,25 @@ type BlockChange struct {
 	LightChanged []ChunkPos
 }
 
-// BlockUpdateResult aggregates all block transitions and deduplicated
-// light-dirty chunks produced by a block edit or tick pass.
+// FallingBlockLanding records a gravity-affected block landing on a supporting
+// surface after falling FallDistance blocks (>= 1).
+type FallingBlockLanding struct {
+	Pos          BlockPos
+	State        uint16
+	FallDistance int
+}
+
+// FallingAnvilLandingHook is an optional callback invoked when a falling anvil
+// block lands at pos after falling fallDistance blocks. If handled is true,
+// newState replaces the landed anvil state (e.g. chipped/damaged anvil or StateAir).
+type FallingAnvilLandingHook func(c *Cache, pos BlockPos, state uint16, fallDistance int) (newState uint16, handled bool)
+
+// BlockUpdateResult aggregates all block transitions, deduplicated
+// light-dirty chunks, and falling-block landings produced by a block edit or tick pass.
 type BlockUpdateResult struct {
 	Changes      []BlockChange
 	LightChanged []ChunkPos
+	Landings     []FallingBlockLanding
 }
 
 func (r *BlockUpdateResult) appendChange(pos BlockPos, oldState, newState uint16, light []ChunkPos) {
@@ -79,6 +93,9 @@ func (r *BlockUpdateResult) merge(other BlockUpdateResult) {
 	for _, cp := range other.LightChanged {
 		r.addLightChunk(cp)
 	}
+	if len(other.Landings) > 0 {
+		r.Landings = append(r.Landings, other.Landings...)
+	}
 }
 
 type scheduledUpdateKey struct {
@@ -96,11 +113,13 @@ type scheduledUpdate struct {
 // BlockUpdateScheduler manages the per-world tick queue for gravity, fluid flow,
 // and neighbor block updates on a Cache.
 type BlockUpdateScheduler struct {
-	c       *Cache
-	mu      sync.Mutex
-	tick    uint64
-	nextSeq uint64
-	pending map[scheduledUpdateKey]scheduledUpdate
+	c            *Cache
+	mu           sync.Mutex
+	tick         uint64
+	nextSeq      uint64
+	pending      map[scheduledUpdateKey]scheduledUpdate
+	fallDist     map[BlockPos]int
+	anvilLanding FallingAnvilLandingHook
 }
 
 var cacheSchedulers sync.Map // map[*Cache]*BlockUpdateScheduler
@@ -112,11 +131,24 @@ func (c *Cache) BlockUpdates() *BlockUpdateScheduler {
 		return s.(*BlockUpdateScheduler)
 	}
 	created := &BlockUpdateScheduler{
-		c:       c,
-		pending: make(map[scheduledUpdateKey]scheduledUpdate),
+		c:        c,
+		pending:  make(map[scheduledUpdateKey]scheduledUpdate),
+		fallDist: make(map[BlockPos]int),
 	}
 	actual, _ := cacheSchedulers.LoadOrStore(c, created)
 	return actual.(*BlockUpdateScheduler)
+}
+
+// SetFallingAnvilLandingHook registers an optional hook called when a falling
+// anvil lands on a supporting block in c.
+func (c *Cache) SetFallingAnvilLandingHook(hook FallingAnvilLandingHook) {
+	if c == nil {
+		return
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	s.anvilLanding = hook
+	s.mu.Unlock()
 }
 
 // CurrentBlockTick returns the scheduler's current game tick counter.
@@ -931,6 +963,50 @@ func isFreeToFallThrough(state uint16) bool {
 	return false
 }
 
+// IsAnvilBlockState reports whether state is any anvil variant
+// (minecraft:anvil, minecraft:chipped_anvil, minecraft:damaged_anvil).
+func IsAnvilBlockState(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil":
+		return true
+	default:
+		return false
+	}
+}
+
+// StepAnvilDamageBlockState advances an anvil block state to its next damage
+// stage (anvil -> chipped_anvil -> damaged_anvil -> StateAir) while preserving
+// its horizontal facing property.
+func StepAnvilDamageBlockState(state uint16) (nextState uint16, broken bool) {
+	info, ok := stateByID(state)
+	if !ok {
+		return state, false
+	}
+	var nextName string
+	switch info.Name {
+	case "minecraft:anvil":
+		nextName = "minecraft:chipped_anvil"
+	case "minecraft:chipped_anvil":
+		nextName = "minecraft:damaged_anvil"
+	case "minecraft:damaged_anvil":
+		return StateAir, true
+	default:
+		return state, false
+	}
+	facing := info.Properties["facing"]
+	if facing == "" {
+		facing = "north"
+	}
+	if id, ok := nameToStateID(nextName, map[string]string{"facing": facing}); ok {
+		return id, false
+	}
+	return state, false
+}
+
 func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 	if y <= MinY || y >= MinY+WorldHeight {
 		return
@@ -943,6 +1019,18 @@ func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 	if !isFreeToFallThrough(below) {
 		return
 	}
+
+	s := c.BlockUpdates()
+	srcPos := BlockPos{X: x, Y: y, Z: z}
+	dstPos := BlockPos{X: x, Y: y - 1, Z: z}
+	s.mu.Lock()
+	if s.fallDist == nil {
+		s.fallDist = make(map[BlockPos]int)
+	}
+	dist := s.fallDist[srcPos] + 1
+	delete(s.fallDist, srcPos)
+	hook := s.anvilLanding
+	s.mu.Unlock()
 
 	// Remove the falling block from (x, y, z).
 	if !c.setBlockRecorded(x, y, z, StateAir, res) {
@@ -958,7 +1046,27 @@ func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 		}
 	}
 
-	c.setBlockRecorded(x, y-1, z, landedState, res)
+	willContinue := (y-1 > MinY) && isFreeToFallThrough(c.GetBlock(x, y-2, z))
+	if willContinue {
+		s.mu.Lock()
+		s.fallDist[dstPos] = dist
+		s.mu.Unlock()
+	} else {
+		if IsAnvilBlockState(landedState) && hook != nil {
+			if nextState, handled := hook(c, dstPos, landedState, dist); handled {
+				landedState = nextState
+			}
+		}
+		res.Landings = append(res.Landings, FallingBlockLanding{
+			Pos:          dstPos,
+			State:        landedState,
+			FallDistance: dist,
+		})
+	}
+
+	if landedState != StateAir || below != StateAir {
+		c.setBlockRecorded(x, y-1, z, landedState, res)
+	}
 
 	// Notify neighbors around both the vacated cell and the destination cell.
 	c.runNeighborSupportPass(x, y, z, res)

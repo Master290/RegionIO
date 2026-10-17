@@ -107,6 +107,8 @@ type EnchantmentInstance struct {
 type EnchantmentOffer struct {
 	Slot          int
 	Cost          int16
+	LapisCost     int16
+	LevelCost     int16
 	Enchantments  []EnchantmentInstance
 	ClueEnchantID int16
 	ClueLevel     int16
@@ -582,7 +584,7 @@ func MaxItemDurability(itemName string) int32 {
 		return 432
 	case "shears":
 		return 238
-	case "flint_and_steel", "fishing_rod", "brush":
+	case "flint_and_steel", "fishing_rod", "brush", "wolf_armor":
 		return 64
 	case "carrot_on_a_stick":
 		return 25
@@ -900,6 +902,47 @@ func IsEnchantingTableBlock(state uint16) bool {
 	return world.BlockName(state) == "minecraft:enchanting_table"
 }
 
+// IsEnchantingBookshelfBlock reports whether state provides enchanting power
+// (vanilla #minecraft:enchantment_power_provider, i.e. minecraft:bookshelf).
+func IsEnchantingBookshelfBlock(state uint16) bool {
+	return world.BlockName(state) == "minecraft:bookshelf"
+}
+
+// IsValidEnchantingBookshelfOffset reports whether (dx, dy, dz) is one of the 32
+// canonical vanilla EnchantingTableBlock.BOOKSHELF_OFFSETS (dy in {0, 1} and
+// max(|dx|, |dz|) == 2).
+func IsValidEnchantingBookshelfOffset(dx, dy, dz int) bool {
+	if dy < 0 || dy > 1 || dx < -2 || dx > 2 || dz < -2 || dz > 2 {
+		return false
+	}
+	return absInt(dx) == 2 || absInt(dz) == 2
+}
+
+// EnchantingBookshelfOffsets returns the 32 canonical relative (dx, dy, dz)
+// positions checked around an enchanting table for bookshelves.
+func EnchantingBookshelfOffsets() [][3]int {
+	offsets := make([][3]int, 0, 32)
+	for dy := 0; dy <= 1; dy++ {
+		for dz := -2; dz <= 2; dz++ {
+			for dx := -2; dx <= 2; dx++ {
+				if IsValidEnchantingBookshelfOffset(dx, dy, dz) {
+					offsets = append(offsets, [3]int{dx, dy, dz})
+				}
+			}
+		}
+	}
+	return offsets
+}
+
+// IsEnchantingPathClear reports whether the intermediate block between an
+// enchanting table and a bookshelf is unobstructed air (vanilla
+// #minecraft:enchantment_power_transmitter: air, cave_air, void_air).
+// Any non-air block (torch, carpet, snow layer, water, cobweb, slab, etc.) blocks
+// bookshelf power transmission.
+func IsEnchantingPathClear(state uint16) bool {
+	return isEnchantingPathClear(state)
+}
+
 // CountEnchantingBookshelves counts the valid bookshelves around an enchanting
 // table at (x, y, z) in cache, up to MaxEnchantingBookshelves (15).
 // Following vanilla EnchantingTableBlock.BOOKSHELF_OFFSETS, bookshelves must lie
@@ -922,7 +965,7 @@ func CountEnchantingBookshelves(cache *world.Cache, x, y, z int) int {
 				if !isEnchantingPathClear(cache.GetBlock(midX, midY, midZ)) {
 					continue
 				}
-				if world.BlockName(cache.GetBlock(x+dx, y+dy, z+dz)) == "minecraft:bookshelf" {
+				if IsEnchantingBookshelfBlock(cache.GetBlock(x+dx, y+dy, z+dz)) {
 					count++
 					if count >= MaxEnchantingBookshelves {
 						return MaxEnchantingBookshelves
@@ -932,6 +975,73 @@ func CountEnchantingBookshelves(cache *world.Cache, x, y, z int) int {
 		}
 	}
 	return count
+}
+
+// CountEnchantingBookshelvesAt counts the valid bookshelves around an enchanting
+// table at (x, y, z) in dim (up to MaxEnchantingBookshelves = 15), checking both
+// that the intermediate cell (x + dx/2, y + dy, z + dz/2) is air and that no
+// item or decoration entity occupies the intermediate block.
+func (s *Server) CountEnchantingBookshelvesAt(dim string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	var nearby []world.Entity
+	if s.entities != nil {
+		nearby = s.entities.AppendInChunkRange(nil, int32(x>>4), int32(z>>4), 1)
+	}
+	count := 0
+	for dy := 0; dy <= 1; dy++ {
+		for dz := -2; dz <= 2; dz++ {
+			for dx := -2; dx <= 2; dx++ {
+				if absInt(dx) != 2 && absInt(dz) != 2 {
+					continue
+				}
+				midX := x + dx/2
+				midY := y + dy
+				midZ := z + dz/2
+				if !isEnchantingPathClear(cache.GetBlock(midX, midY, midZ)) {
+					continue
+				}
+				if hasBlockingItemInCell(nearby, normDim, midX, midY, midZ) {
+					continue
+				}
+				if IsEnchantingBookshelfBlock(cache.GetBlock(x+dx, y+dy, z+dz)) {
+					count++
+					if count >= MaxEnchantingBookshelves {
+						return MaxEnchantingBookshelves
+					}
+				}
+			}
+		}
+	}
+	return count
+}
+
+func hasBlockingItemInCell(entities []world.Entity, dim string, bx, by, bz int) bool {
+	for i := range entities {
+		e := &entities[i]
+		if e.EffectiveDimension() != dim {
+			continue
+		}
+		if !e.IsItem() && e.TypeName != "minecraft:item_frame" && e.TypeName != "minecraft:glow_item_frame" {
+			continue
+		}
+		if e.IsExperienceOrb() {
+			continue
+		}
+		ex := int(math.Floor(e.X))
+		ey := int(math.Floor(e.Y))
+		ez := int(math.Floor(e.Z))
+		if ex == bx && ey == by && ez == bz {
+			return true
+		}
+	}
+	return false
 }
 
 func isEnchantingPathClear(state uint16) bool {
@@ -1017,6 +1127,8 @@ func CalculateEnchantmentOffers(stack world.ItemStack, meta ItemMeta, bookshelve
 		offers[i] = EnchantmentOffer{
 			Slot:          i,
 			Cost:          0,
+			LapisCost:     0,
+			LevelCost:     0,
 			ClueEnchantID: -1,
 			ClueLevel:     -1,
 		}
@@ -1055,9 +1167,12 @@ func CalculateEnchantmentOffers(stack world.ItemStack, meta ItemMeta, bookshelve
 		if def, ok := EnchantmentByID(clue.ID); ok {
 			clueRegID = int16(def.RegistryIndex)
 		}
+		tierCost := int16(slot + 1)
 		offers[slot] = EnchantmentOffer{
 			Slot:          slot,
 			Cost:          int16(cost),
+			LapisCost:     tierCost,
+			LevelCost:     tierCost,
 			Enchantments:  enchs,
 			ClueEnchantID: clueRegID,
 			ClueLevel:     int16(clue.Level),
@@ -1252,10 +1367,7 @@ func (s *Server) recomputeEnchantingOffersLocked(session *PlayerSession, tr *pla
 	itemMeta := metaTr.enchantMeta[0].Clone()
 	metaTr.mu.Unlock()
 
-	bookshelves := 0
-	if cache := s.PlayerChunks(session); cache != nil {
-		bookshelves = CountEnchantingBookshelves(cache, tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ)
-	}
+	bookshelves := s.CountEnchantingBookshelvesAt(session.Dimension(), tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ)
 	offers := CalculateEnchantmentOffers(tr.open.EnchantSlots[0], itemMeta, bookshelves, session.EnchantmentSeed())
 	for i := 0; i < 3; i++ {
 		tr.open.EnchantCosts[i] = offers[i].Cost
@@ -1421,6 +1533,7 @@ func (s *Server) HandleContainerButtonClick(session *PlayerSession, containerID,
 		return nil
 	}
 
+	bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 	item := tr.open.EnchantSlots[0]
 	lapis := tr.open.EnchantSlots[1]
 	if item.IsEmpty() || item.Count != 1 {
@@ -1437,10 +1550,7 @@ func (s *Server) HandleContainerButtonClick(session *PlayerSession, containerID,
 		return nil
 	}
 
-	bookshelves := 0
-	if cache := s.PlayerChunks(session); cache != nil {
-		bookshelves = CountEnchantingBookshelves(cache, tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ)
-	}
+	bookshelves := s.CountEnchantingBookshelvesAt(session.Dimension(), bx, by, bz)
 	offers := CalculateEnchantmentOffers(item, itemMeta, bookshelves, session.EnchantmentSeed())
 	offer := offers[buttonID]
 	if offer.Cost <= 0 || len(offer.Enchantments) == 0 {
@@ -1492,6 +1602,9 @@ func (s *Server) HandleContainerButtonClick(session *PlayerSession, containerID,
 	if !creative {
 		_ = s.AddPlayerExperienceLevels(session, -levelCost)
 	}
+	dim := world.NormalizeDimension(session.Dimension())
+	s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:block.enchantment_table.use", SoundSourceBlocks, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, 1.0, 1.0, 0))
 	s.TriggerEnchantedItem(session)
 	return s.syncOpenContainer(session)
 }

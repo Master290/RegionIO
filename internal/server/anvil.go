@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"math"
 	"math/rand"
 	"strings"
 	"unicode/utf8"
@@ -13,7 +14,7 @@ import (
 // Serverbound rename_item packet ID in Minecraft 26.1.2 (protocol 775).
 const PlayRenameItemSB int32 = 0x30
 
-// Anvil and Grindstone container layout constants.
+// Anvil container layout and mechanic constants (MenuTypeAnvil = 8).
 const (
 	AnvilSlotLeft        = 0
 	AnvilSlotRight       = 1
@@ -25,11 +26,19 @@ const (
 	MaxAnvilNameRunes    = 50
 	AnvilBreakChance     = 0.12
 
-	GrindstoneSlotTop        = 0
-	GrindstoneSlotBottom     = 1
-	GrindstoneSlotResult     = 2
-	GrindstoneInputSlotCount = 2
-	GrindstoneMenuSlotCount  = 39 // 3 grindstone + 27 main inventory + 9 hotbar
+	// AnvilDamageChanceOnUse aliases AnvilBreakChance (12% chance per anvil use in survival mode).
+	AnvilDamageChanceOnUse = AnvilBreakChance
+
+	// Falling anvil damage and degradation constants (vanilla 26.1.2 AnvilBlock / FallingBlockEntity).
+	AnvilFallDamagePerBlock       = 2.0
+	MaxAnvilFallDamage            = 40.0
+	AnvilFallDegradeChancePerStep = 0.05
+	AnvilHelmetDamageFactor       = 0.75
+
+	// Vanilla LevelEvent IDs for Anvil sounds and particles (ClientboundLevelEventPacket 0x2e).
+	LevelEventSoundAnvilBroken int32 = 1029
+	LevelEventSoundAnvilUsed   int32 = 1030
+	LevelEventSoundAnvilLand   int32 = 1031
 )
 
 // AnvilResult holds the computed output and cost of an anvil operation.
@@ -41,17 +50,14 @@ type AnvilResult struct {
 	TooExpensive        bool
 }
 
-// GrindstoneResult holds the computed output and XP reward of a grindstone operation.
-type GrindstoneResult struct {
-	Output     world.ItemStack
-	OutputMeta ItemMeta
-	MinXP      int32
-	MaxXP      int32
-	XPAward    int32
-}
+// AnvilCombineResult aliases AnvilResult.
+type AnvilCombineResult = AnvilResult
 
 // IsAnvilBlock reports whether state is an anvil, chipped_anvil, or damaged_anvil block.
 func IsAnvilBlock(state uint16) bool {
+	if world.IsAnvilBlockState(state) {
+		return true
+	}
 	switch world.BlockName(state) {
 	case "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil":
 		return true
@@ -60,15 +66,46 @@ func IsAnvilBlock(state uint16) bool {
 	}
 }
 
-// IsGrindstoneBlock reports whether state is a minecraft:grindstone block.
-func IsGrindstoneBlock(state uint16) bool {
-	return world.BlockName(state) == "minecraft:grindstone"
+// AnvilBlockState returns the block state ID for an anvil variant
+// ("minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil")
+// with the given horizontal facing ("north", "south", "west", "east").
+func AnvilBlockState(blockName, facing string) uint16 {
+	name := canonicalEnchantmentID(blockName)
+	switch name {
+	case "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil":
+	default:
+		name = "minecraft:anvil"
+	}
+	f := strings.ToLower(strings.TrimSpace(facing))
+	switch f {
+	case "north", "south", "west", "east":
+	default:
+		f = "north"
+	}
+	if st, ok := world.BlockStateIDByProperties(name, map[string]string{"facing": f}); ok {
+		return st
+	}
+	return blockBaseStateByName(name)
+}
+
+// AnvilFacing returns the horizontal facing ("north", "south", "west", "east")
+// of an anvil block state, defaulting to "north".
+func AnvilFacing(state uint16) string {
+	if props := world.BlockProperties(state); props != nil {
+		if f := props["facing"]; f != "" {
+			return f
+		}
+	}
+	return "north"
 }
 
 // StepAnvilDamageState advances an anvil block state by one damage stage
 // (anvil -> chipped_anvil -> damaged_anvil -> air), preserving facing offset.
 // When the anvil breaks completely, nextState is world.StateAir and broken is true.
 func StepAnvilDamageState(state uint16) (nextState uint16, broken bool) {
+	if next, brk := world.StepAnvilDamageBlockState(state); brk || next != state {
+		return next, brk
+	}
 	curName := world.BlockName(state)
 	var nextName string
 	switch curName {
@@ -112,6 +149,201 @@ func blockBaseStateByName(blockName string) uint16 {
 	return whileBase
 }
 
+// CalculateFallingAnvilDamage computes the vanilla entity damage dealt by an
+// anvil landing after falling fallDistance blocks:
+//   - 0 damage if fallDistance <= 1.0
+//   - min(floor(ceil(fallDistance - 1.0) * 2.0), 40.0) otherwise
+func CalculateFallingAnvilDamage(fallDistance float64) float32 {
+	if fallDistance <= 1.0 {
+		return 0
+	}
+	blocksAfterFirst := math.Ceil(fallDistance - 1.0)
+	if blocksAfterFirst <= 0 {
+		return 0
+	}
+	dmg := math.Floor(blocksAfterFirst * AnvilFallDamagePerBlock)
+	if dmg > MaxAnvilFallDamage {
+		dmg = MaxAnvilFallDamage
+	}
+	return float32(dmg)
+}
+
+// FallingAnvilDegradeChance returns the vanilla probability in [0.0, 1.0] that
+// a falling anvil degrades by one damage stage when landing after falling
+// fallDistance blocks:
+//   - 0.0 if fallDistance <= 1.0
+//   - min((ceil(fallDistance - 1.0) + 1) * 0.05, 1.0) otherwise
+func FallingAnvilDegradeChance(fallDistance float64) float64 {
+	if fallDistance <= 1.0 {
+		return 0
+	}
+	steps := int(math.Ceil(fallDistance-1.0)) + 1
+	if steps <= 1 {
+		return 0
+	}
+	chance := float64(steps) * AnvilFallDegradeChancePerStep
+	if chance > 1.0 {
+		chance = 1.0
+	}
+	return chance
+}
+
+// DamageAnvilOnFallLanding rolls whether an anvil block state degrades when
+// landing from a fall of fallDistance blocks.
+func DamageAnvilOnFallLanding(state uint16, fallDistance float64, rng *rand.Rand) (nextState uint16, degraded bool, broken bool) {
+	if !IsAnvilBlock(state) {
+		return state, false, false
+	}
+	chance := FallingAnvilDegradeChance(fallDistance)
+	if chance <= 0 {
+		return state, false, false
+	}
+	roll := rand.Float64()
+	if rng != nil {
+		roll = rng.Float64()
+	}
+	if roll >= chance {
+		return state, false, false
+	}
+	next, brk := StepAnvilDamageState(state)
+	return next, true, brk
+}
+
+// HandleFallingAnvilLanding processes a falling anvil landing at (x, y, z) in dim
+// after falling fallDistance blocks:
+//   - Deals falling-anvil damage (2 HP per block after the first, max 40 HP) to
+//     mobs and survival/adventure players in the landing block, reducing damage
+//     by 25% if a player wears a helmet while damaging the helmet.
+//   - Rolls fall degradation (5% * blocks fallen when fallDistance > 1) to advance
+//     anvil -> chipped_anvil -> damaged_anvil -> air.
+//   - Emits LevelEventSoundAnvilBroken (1029) if destroyed or LevelEventSoundAnvilLand (1031) otherwise.
+func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16, fallDistance float64, rng *rand.Rand) (finalState uint16, degraded bool, broken bool, damagedEntities int) {
+	if s == nil {
+		return state, false, false, 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if state == 0 && cache != nil {
+		state = cache.GetBlock(x, y, z)
+	}
+	if !IsAnvilBlock(state) {
+		return state, false, false, 0
+	}
+
+	dmg := CalculateFallingAnvilDamage(fallDistance)
+	if dmg > 0 {
+		minX, maxX := float64(x), float64(x+1)
+		minY, maxY := float64(y), float64(y+2)
+		minZ, maxZ := float64(z), float64(z+1)
+
+		// Damage mobs overlapping the landing cell.
+		if s.entities != nil {
+			nearby := s.entities.AppendInChunkRange(nil, int32(x>>4), int32(z>>4), 1)
+			for i := range nearby {
+				ent := &nearby[i]
+				if ent.IsItem() || ent.IsExperienceOrb() || ent.EffectiveDimension() != normDim {
+					continue
+				}
+				if ent.X >= minX-0.3 && ent.X <= maxX+0.3 &&
+					ent.Y >= minY-0.5 && ent.Y <= maxY &&
+					ent.Z >= minZ-0.3 && ent.Z <= maxZ+0.3 {
+					hp := s.MobHealth(ent.ID)
+					if hp <= 0 {
+						continue
+					}
+					damagedEntities++
+					rem := hp - dmg
+					if rem > 0 {
+						s.SetMobHealth(ent.ID, rem)
+					} else {
+						s.SetMobHealth(ent.ID, 0)
+						s.entities.Remove(ent.ID)
+						cp := ent.ChunkPos()
+						s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+							encodeRemoveEntitiesPacket(nil, []int32{ent.ID}))
+					}
+				}
+			}
+		}
+
+		// Damage survival/adventure players overlapping the landing cell.
+		s.playersMu.RLock()
+		sessions := make([]*PlayerSession, 0, len(s.players))
+		for _, ps := range s.players {
+			sessions = append(sessions, ps)
+		}
+		s.playersMu.RUnlock()
+
+		for _, sess := range sessions {
+			if sess == nil || sess.IsDead() {
+				continue
+			}
+			snap := sess.Snapshot()
+			if world.NormalizeDimension(snap.Dimension) != normDim {
+				continue
+			}
+			if snap.GameMode != GameModeSurvival && snap.GameMode != GameModeAdventure {
+				continue
+			}
+			if snap.X >= minX-0.3 && snap.X <= maxX+0.3 &&
+				snap.Y >= minY-0.5 && snap.Y <= maxY &&
+				snap.Z >= minZ-0.3 && snap.Z <= maxZ+0.3 {
+				playerDmg := dmg
+				helmet := sess.InventorySlot(ArmorSlotHead)
+				if !helmet.IsEmpty() && IsArmorItem(helmet.ResolvedID()) {
+					playerDmg *= AnvilHelmetDamageFactor
+					helmetMeta := GetSlotItemMeta(sess, ArmorSlotHead)
+					wear := int32(math.Max(1, math.Floor(float64(dmg)/4.0)))
+					newHelmet, newMeta, broke := DamageItem(helmet, helmetMeta, wear, rng)
+					sess.SetInventorySlot(ArmorSlotHead, newHelmet)
+					if broke {
+						SetSlotItemMeta(sess, ArmorSlotHead, ItemMeta{})
+					} else {
+						SetSlotItemMeta(sess, ArmorSlotHead, newMeta)
+					}
+				}
+				beforeHP := sess.Snapshot().Health
+				s.DamagePlayer(sess, playerDmg, "falling_anvil")
+				if sess.Snapshot().Health < beforeHP {
+					damagedEntities++
+				}
+			}
+		}
+	}
+
+	nextState, didDegrade, didBreak := DamageAnvilOnFallLanding(state, fallDistance, rng)
+	if cache != nil && didDegrade && nextState != state {
+		_, res := cache.ApplyBlockWithUpdates(x, y, z, nextState)
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+	}
+	cx, cz := int32(x>>4), int32(z>>4)
+	if didBreak {
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilBroken, x, y, z, 0, false))
+	} else {
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilLand, x, y, z, 0, false))
+	}
+	return nextState, didDegrade, didBreak, damagedEntities
+}
+
+func slotIdxSession(sess *PlayerSession) *PlayerSession {
+	return sess
+}
+
+// ProcessFallingBlockLandings processes all anvil landings recorded in a
+// world.BlockUpdateResult.Landings slice.
+func (s *Server) ProcessFallingBlockLandings(dim string, landings []world.FallingBlockLanding, rng *rand.Rand) {
+	if s == nil || len(landings) == 0 {
+		return
+	}
+	for _, l := range landings {
+		if IsAnvilBlock(l.State) {
+			s.HandleFallingAnvilLanding(dim, l.Pos.X, l.Pos.Y, l.Pos.Z, l.State, float64(l.FallDistance), rng)
+		}
+	}
+}
+
 // IsValidRepairMaterial reports whether materialItemName is the valid anvil
 // repair unit material for targetItemName (e.g. iron_ingot for iron tools/armor,
 // diamond for diamond tools/armor, planks for wooden tools/shields).
@@ -145,6 +377,8 @@ func IsValidRepairMaterial(targetItemName, materialItemName string) bool {
 		return mat == "phantom_membrane"
 	case target == "mace":
 		return mat == "breeze_rod"
+	case target == "wolf_armor":
+		return mat == "armadillo_scute"
 	default:
 		return false
 	}
@@ -188,6 +422,9 @@ func ComputeAnvilResult(
 	maxDur := MaxItemDurability(leftName)
 
 	if !right.IsEmpty() {
+		if left.Count != 1 {
+			return AnvilResult{}
+		}
 		rightName := right.ResolvedID()
 		isBook := rightName == "minecraft:enchanted_book" && rightMeta.HasEnchantments()
 
@@ -212,6 +449,9 @@ func ComputeAnvilResult(
 		} else {
 			// Mode 2: Same-item combination or enchanted book application.
 			if !isBook && (leftName != rightName || maxDur <= 0) {
+				return AnvilResult{}
+			}
+			if right.Count != 1 {
 				return AnvilResult{}
 			}
 
@@ -275,9 +515,6 @@ func ComputeAnvilResult(
 					}
 				}
 				opCost += fee * int32(newLevel)
-				if left.Count > 1 {
-					opCost = MaxAnvilSurvivalCost
-				}
 			}
 
 			if anyIncompatible && !anyCompatible {
@@ -349,152 +586,6 @@ func sanitizeAnvilName(raw string) string {
 	return s
 }
 
-// ComputeGrindstoneResult calculates the disenchanted/repaired output and
-// experience reward for a grindstone with inputs top and bottom, matching
-// vanilla GrindstoneMenu.
-func ComputeGrindstoneResult(
-	top, bottom world.ItemStack,
-	topMeta, bottomMeta ItemMeta,
-) (GrindstoneResult, bool) {
-	topEmpty := top.IsEmpty()
-	botEmpty := bottom.IsEmpty()
-	if topEmpty && botEmpty {
-		return GrindstoneResult{}, false
-	}
-
-	if !topEmpty && !botEmpty {
-		topName := top.ResolvedID()
-		botName := bottom.ResolvedID()
-		if topName != botName || topName == "minecraft:enchanted_book" {
-			return GrindstoneResult{}, false
-		}
-		maxDur := MaxItemDurability(topName)
-		if maxDur <= 0 || top.Count != 1 || bottom.Count != 1 {
-			return GrindstoneResult{}, false
-		}
-
-		remTop := maxDur - topMeta.Damage
-		remBot := maxDur - bottomMeta.Damage
-		if remTop < 0 {
-			remTop = 0
-		}
-		if remBot < 0 {
-			remBot = 0
-		}
-		bonus := maxDur * 5 / 100
-		if bonus < 1 {
-			bonus = 1
-		}
-		newDamage := maxDur - (remTop + remBot + bonus)
-		if newDamage < 0 {
-			newDamage = 0
-		}
-
-		outMeta := stripNonCurseEnchantments(topMeta)
-		for _, inst := range bottomMeta.SortedEnchantments() {
-			if def, ok := EnchantmentByID(inst.ID); ok && def.Curse {
-				cur := outMeta.EnchantmentLevel(inst.ID)
-				if inst.Level > cur {
-					outMeta.SetEnchantment(inst.ID, inst.Level)
-				}
-			}
-		}
-		outMeta.Damage = newDamage
-		outMeta.RepairCost = 0
-
-		minXP := grindstoneXPFromMeta(topMeta) + grindstoneXPFromMeta(bottomMeta)
-		var award int32
-		if minXP > 0 {
-			award = (minXP + 1) / 2
-			if award < 1 {
-				award = 1
-			}
-		}
-		return GrindstoneResult{
-			Output:     world.NewNamedItemStack(topName, 1),
-			OutputMeta: outMeta,
-			MinXP:      (minXP + 1) / 2,
-			MaxXP:      minXP,
-			XPAward:    award,
-		}, true
-	}
-
-	// Single item disenchanting.
-	src := top
-	srcMeta := topMeta
-	if topEmpty {
-		src = bottom
-		srcMeta = bottomMeta
-	}
-	if src.Count != 1 || !hasNonCurseEnchantments(srcMeta) {
-		return GrindstoneResult{}, false
-	}
-
-	outMeta := stripNonCurseEnchantments(srcMeta)
-	outMeta.RepairCost = 0
-	outStack := world.NewNamedItemStack(src.ResolvedID(), 1)
-	if src.ResolvedID() == "minecraft:enchanted_book" && !outMeta.HasEnchantments() {
-		if book := world.NewNamedItemStack("minecraft:book", 1); !book.IsEmpty() {
-			outStack = book
-		}
-	}
-
-	minXP := grindstoneXPFromMeta(srcMeta)
-	award := (minXP + 1) / 2
-	if award < 1 {
-		award = 1
-	}
-	return GrindstoneResult{
-		Output:     outStack,
-		OutputMeta: outMeta,
-		MinXP:      award,
-		MaxXP:      minXP,
-		XPAward:    award,
-	}, true
-}
-
-func hasNonCurseEnchantments(meta ItemMeta) bool {
-	for id, lvl := range meta.Enchantments {
-		if lvl <= 0 {
-			continue
-		}
-		if def, ok := EnchantmentByID(id); ok && !def.Curse {
-			return true
-		}
-	}
-	return false
-}
-
-func stripNonCurseEnchantments(meta ItemMeta) ItemMeta {
-	out := meta.Clone()
-	out.Enchantments = nil
-	for id, lvl := range meta.Enchantments {
-		if lvl <= 0 {
-			continue
-		}
-		if def, ok := EnchantmentByID(id); ok && def.Curse {
-			out.SetEnchantment(def.ID, lvl)
-		}
-	}
-	return out
-}
-
-func grindstoneXPFromMeta(meta ItemMeta) int32 {
-	var sum int32
-	for _, inst := range meta.SortedEnchantments() {
-		def, ok := EnchantmentByID(inst.ID)
-		if !ok || def.Curse {
-			continue
-		}
-		cost := def.MinCost(inst.Level)
-		if cost < 1 {
-			cost = 1
-		}
-		sum += int32(cost)
-	}
-	return sum
-}
-
 // OpenAnvil opens the Anvil container UI (MenuTypeAnvil = 8) at (x, y, z) for
 // session and sends open_screen, container_set_content, and property 0 = 0.
 func (s *Server) OpenAnvil(session *PlayerSession, x, y, z int) (int32, error) {
@@ -539,54 +630,13 @@ func (s *Server) OpenAnvil(session *PlayerSession, x, y, z int) (int32, error) {
 	return cid, nil
 }
 
-// OpenGrindstone opens the Grindstone container UI (MenuTypeGrindstone = 15)
-// at (x, y, z) for session.
-func (s *Server) OpenGrindstone(session *PlayerSession, x, y, z int) (int32, error) {
-	if s == nil || session == nil {
-		return 0, errors.New("server: nil session")
-	}
-	_ = s.CloseContainer(session, 0, false)
-
-	metaTr := getItemMetaTracker(session)
-	metaTr.mu.Lock()
-	metaTr.combinerMeta = [2]ItemMeta{}
-	metaTr.resultMeta = ItemMeta{}
-	metaTr.mu.Unlock()
-
-	tr := getContainerTracker(session)
-	tr.mu.Lock()
-	tr.nextWindow = (tr.nextWindow % 100) + 1
-	cid := tr.nextWindow
-	tr.open = &OpenContainerState{
-		ContainerID: cid,
-		MenuType:    MenuTypeGrindstone,
-		BlockX:      x,
-		BlockY:      y,
-		BlockZ:      z,
-	}
-	carried := tr.carried
-	tr.mu.Unlock()
-
-	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGrindstone, "Repair & Disenchant")); err != nil {
-			return cid, err
-		}
-		slots := s.buildCombinerMenuSlots(session, [2]world.ItemStack{}, world.ItemStack{})
-		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
-			return cid, err
-		}
-	}
-	return cid, nil
-}
-
 // DecodeRenameItemPacket parses a protocol 775 serverbound rename_item (0x30) packet body.
 func DecodeRenameItemPacket(r *protocol.Reader) (string, error) {
 	return r.String()
 }
 
-// HandleRenameItem updates the rename text in session's open Anvil container,
-// recomputes the anvil result and level cost, and synchronizes the client.
+// HandleRenameItem updates the rename text on session's open Anvil container
+// and recomputes the output slot and level cost.
 func (s *Server) HandleRenameItem(session *PlayerSession, name string) error {
 	if s == nil || session == nil || session.IsDead() {
 		return nil
@@ -697,36 +747,6 @@ func (s *Server) recomputeAnvilStateLocked(session *PlayerSession, tr *playerCon
 	return res
 }
 
-func (s *Server) recomputeGrindstoneStateLocked(session *PlayerSession, tr *playerContainerTracker) (GrindstoneResult, bool) {
-	if tr == nil || tr.open == nil || tr.open.MenuType != MenuTypeGrindstone {
-		return GrindstoneResult{}, false
-	}
-	metaTr := getItemMetaTracker(session)
-	metaTr.mu.Lock()
-	topMeta := metaTr.combinerMeta[0].Clone()
-	botMeta := metaTr.combinerMeta[1].Clone()
-	metaTr.mu.Unlock()
-
-	res, ok := ComputeGrindstoneResult(
-		tr.open.CombinerInputs[0],
-		tr.open.CombinerInputs[1],
-		topMeta,
-		botMeta,
-	)
-	if !ok {
-		tr.open.Result = world.ItemStack{}
-		metaTr.mu.Lock()
-		metaTr.resultMeta = ItemMeta{}
-		metaTr.mu.Unlock()
-		return GrindstoneResult{}, false
-	}
-	tr.open.Result = res.Output
-	metaTr.mu.Lock()
-	metaTr.resultMeta = res.OutputMeta.Clone()
-	metaTr.mu.Unlock()
-	return res, true
-}
-
 func (s *Server) applyAnvilClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) (tookResult bool, costPaid int32, anvilBroke bool) {
 	if slot < 0 || slot >= AnvilMenuSlotCount || tr.open == nil {
 		return false, 0, false
@@ -740,7 +760,7 @@ func (s *Server) applyAnvilClickLocked(session *PlayerSession, tr *playerContain
 			return false, 0, false
 		}
 		creative := session.Snapshot().GameMode == GameModeCreative
-		if !creative && session.ExperienceLevel() < curRes.LevelCost {
+		if !creative && (curRes.LevelCost >= MaxAnvilSurvivalCost || session.ExperienceLevel() < curRes.LevelCost) {
 			return false, 0, false
 		}
 
@@ -793,56 +813,6 @@ func (s *Server) applyAnvilClickLocked(session *PlayerSession, tr *playerContain
 	return tookResult, costPaid, anvilBroke
 }
 
-func (s *Server) applyGrindstoneClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) (tookResult bool, xpAward int32) {
-	if slot < 0 || slot >= GrindstoneMenuSlotCount || tr.open == nil {
-		return false, 0
-	}
-	curRes, ok := s.recomputeGrindstoneStateLocked(session, tr)
-	slots := s.buildCombinerMenuSlots(session, tr.open.CombinerInputs, tr.open.Result)
-	metas := buildCombinerMenuMetas(session)
-
-	if slot == GrindstoneSlotResult {
-		if !ok || curRes.Output.IsEmpty() {
-			return false, 0
-		}
-		canTake := false
-		switch mode {
-		case ContainerInputPickup:
-			if tr.carried.IsEmpty() {
-				tr.carried = curRes.Output
-				SetCarriedItemMeta(session, curRes.OutputMeta)
-				canTake = true
-			}
-		case ContainerInputQuickMove:
-			rem, _ := mergeIntoSlotSliceWithMeta(slots, metas, curRes.Output, curRes.OutputMeta, 30, 39)
-			rem, _ = mergeIntoSlotSliceWithMeta(slots, metas, rem, curRes.OutputMeta, 3, 30)
-			if rem.IsEmpty() {
-				canTake = true
-			}
-		}
-		if !canTake {
-			return false, 0
-		}
-
-		slots[0] = world.ItemStack{}
-		metas[0] = ItemMeta{}
-		slots[1] = world.ItemStack{}
-		metas[1] = ItemMeta{}
-		slots[2] = world.ItemStack{}
-		metas[2] = ItemMeta{}
-		tookResult = true
-		xpAward = curRes.XPAward
-	} else {
-		applyCombinerNonResultClick(session, tr, slots, metas, slot, button, mode)
-	}
-
-	tr.open.CombinerInputs[0] = slots[0]
-	tr.open.CombinerInputs[1] = slots[1]
-	writeBackCombinerMenuMetas(session, slots, metas)
-	s.recomputeGrindstoneStateLocked(session, tr)
-	return tookResult, xpAward
-}
-
 func applyCombinerNonResultClick(
 	session *PlayerSession,
 	tr *playerContainerTracker,
@@ -874,13 +844,18 @@ func applyCombinerNonResultClick(
 }
 
 // DamageAnvilBlockOnUse applies the vanilla 12% anvil degradation roll (or an
-// explicit rng) at (x, y, z) in session's dimension when in survival mode.
+// explicit rng) at (x, y, z) in session's dimension when in survival mode,
+// and emits LevelEventSoundAnvilBroken (1029) or LevelEventSoundAnvilUsed (1030).
 // Returns true if the anvil broke into air (and closes the anvil screen).
 func (s *Server) DamageAnvilBlockOnUse(session *PlayerSession, x, y, z int, rng *rand.Rand) bool {
 	if s == nil || session == nil {
 		return false
 	}
+	dim := world.NormalizeDimension(session.Dimension())
+	cx, cz := int32(x>>4), int32(z>>4)
 	if session.Snapshot().GameMode == GameModeCreative {
+		s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilUsed, x, y, z, 0, false))
 		return false
 	}
 	cache := s.PlayerChunks(session)
@@ -889,6 +864,8 @@ func (s *Server) DamageAnvilBlockOnUse(session *PlayerSession, x, y, z int, rng 
 	}
 	state := cache.GetBlock(x, y, z)
 	if !IsAnvilBlock(state) {
+		s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilUsed, x, y, z, 0, false))
 		return false
 	}
 	var roll float64
@@ -898,12 +875,20 @@ func (s *Server) DamageAnvilBlockOnUse(session *PlayerSession, x, y, z int, rng 
 		roll = rand.Float64()
 	}
 	if roll >= AnvilBreakChance {
+		s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilUsed, x, y, z, 0, false))
 		return false
 	}
 	nextState, broken := StepAnvilDamageState(state)
-	cache.SetBlock(x, y, z, nextState)
+	_, res := cache.ApplyBlockWithUpdates(x, y, z, nextState)
+	s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
 	if broken {
+		s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilBroken, x, y, z, 0, false))
 		_ = s.CloseContainer(session, 0, true)
+		return true
 	}
-	return broken
+	s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
+		EncodeLevelEventPacket(LevelEventSoundAnvilUsed, x, y, z, 0, false))
+	return false
 }

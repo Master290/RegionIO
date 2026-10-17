@@ -488,3 +488,77 @@ func TestGrindstoneDisenchantAndCombine(t *testing.T) {
 		t.Fatalf("expected player to receive XP from grindstone, got TotalExperience=%d", sess.TotalExperience())
 	}
 }
+
+func TestEnchantingBookshelfObstructionByBlocksAndItemsAndOffers(t *testing.T) {
+	srv, cache := newTestEnchantServer(t)
+	bx, by, bz := 20, 64, 20
+
+	for dy := 0; dy <= 2; dy++ {
+		for dz := -3; dz <= 3; dz++ {
+			for dx := -3; dx <= 3; dx++ {
+				cache.SetBlock(bx+dx, by+dy, bz+dz, world.StateAir)
+			}
+		}
+	}
+	placeNamedBlock(t, cache, bx, by, bz, "minecraft:enchanting_table")
+
+	offsets := EnchantingBookshelfOffsets()
+	if len(offsets) != 32 {
+		t.Fatalf("EnchantingBookshelfOffsets len = %d, want 32", len(offsets))
+	}
+
+	// Place 1 bookshelf at (bx+2, by, bz) and 1 chiseled_bookshelf at (bx-2, by, bz).
+	// Only minecraft:bookshelf counts as an enchanting power provider.
+	placeNamedBlock(t, cache, bx+2, by, bz, "minecraft:bookshelf")
+	placeNamedBlock(t, cache, bx-2, by, bz, "minecraft:chiseled_bookshelf")
+	if got := srv.CountEnchantingBookshelvesAt(world.DimensionOverworld, bx, by, bz); got != 1 {
+		t.Fatalf("CountEnchantingBookshelvesAt with 1 bookshelf + 1 chiseled_bookshelf = %d, want 1", got)
+	}
+
+	// Torch or carpet in intermediate block (bx+1, by, bz) blocks the bookshelf.
+	placeNamedBlock(t, cache, bx+1, by, bz, "minecraft:torch")
+	if got := srv.CountEnchantingBookshelvesAt(world.DimensionOverworld, bx, by, bz); got != 0 {
+		t.Fatalf("expected torch at (bx+1,by,bz) to block bookshelf, got %d", got)
+	}
+	placeNamedBlock(t, cache, bx+1, by, bz, "minecraft:white_carpet")
+	if got := srv.CountEnchantingBookshelvesAt(world.DimensionOverworld, bx, by, bz); got != 0 {
+		t.Fatalf("expected carpet at (bx+1,by,bz) to block bookshelf, got %d", got)
+	}
+	cache.SetBlock(bx+1, by, bz, world.StateAir)
+	if got := srv.CountEnchantingBookshelvesAt(world.DimensionOverworld, bx, by, bz); got != 1 {
+		t.Fatalf("expected bookshelf to be unblocked after clearing air gap, got %d", got)
+	}
+
+	// Dropped item entity in intermediate cell (bx+1, by, bz) also blocks the bookshelf.
+	entID, _ := srv.SpawnItemEntityInDimension(
+		world.DimensionOverworld,
+		float64(bx+1)+0.5, float64(by)+0.2, float64(bz)+0.5,
+		world.NewNamedItemStack("minecraft:cobblestone", 1),
+	)
+	if got := srv.CountEnchantingBookshelvesAt(world.DimensionOverworld, bx, by, bz); got != 0 {
+		t.Fatalf("expected dropped item in intermediate cell to block bookshelf, got %d", got)
+	}
+	srv.entities.Remove(entID)
+	if got := srv.CountEnchantingBookshelvesAt(world.DimensionOverworld, bx, by, bz); got != 1 {
+		t.Fatalf("expected bookshelf to be unblocked after removing item entity, got %d", got)
+	}
+
+	// Verify LapisCost, LevelCost, and clues on CalculateEnchantmentOffers.
+	sword := world.NewNamedItemStack("minecraft:diamond_sword", 1)
+	offers := CalculateEnchantmentOffers(sword, ItemMeta{}, 15, 77777)
+	for slot := 0; slot < 3; slot++ {
+		if offers[slot].Cost <= 0 {
+			t.Fatalf("slot %d Cost = %d, want > 0", slot, offers[slot].Cost)
+		}
+		wantTier := int16(slot + 1)
+		if offers[slot].LapisCost != wantTier || offers[slot].LevelCost != wantTier {
+			t.Fatalf("slot %d (LapisCost=%d, LevelCost=%d), want (%d, %d)",
+				slot, offers[slot].LapisCost, offers[slot].LevelCost, wantTier, wantTier)
+		}
+		if offers[slot].ClueEnchantID < 0 || offers[slot].ClueLevel < 1 {
+			t.Fatalf("slot %d clues = (id=%d, lvl=%d), want valid clue",
+				slot, offers[slot].ClueEnchantID, offers[slot].ClueLevel)
+		}
+	}
+}
+
