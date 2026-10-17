@@ -40,12 +40,8 @@ func (h *handler) beginPlay() error {
 		if snap.HasSpawn {
 			h.spawnY = float64(snap.SpawnY)
 		} else {
-			spawnY, ok := h.srv.Chunks().SafeSpawnY(int(math.Floor(spawnX)), int(math.Floor(spawnZ)))
-			if !ok {
-				spawnY = world.SeaLevel + 1
-			}
-			h.spawnY = float64(spawnY)
-			h.srv.SetPlayerSpawnPoint(session, int32(math.Floor(spawnX)), int32(spawnY), int32(math.Floor(spawnZ)), 0, 0, false)
+			_, wy, _, _ := h.srv.WorldSpawn()
+			h.spawnY = float64(wy)
 		}
 		h.heldSlot = snap.SelectedSlot
 		for i := 0; i < world.HotbarSlotCount; i++ {
@@ -58,13 +54,9 @@ func (h *handler) beginPlay() error {
 			}
 		}
 	} else {
-		spawnY, ok := h.srv.Chunks().SafeSpawnY(int(math.Floor(spawnX)), int(math.Floor(spawnZ)))
-		if !ok {
-			spawnY = world.SeaLevel + 1
-		}
-		h.spawnY = float64(spawnY)
-		h.srv.SetPlayerTransform(session, spawnX, h.spawnY, spawnZ, 0, 0, true)
-		h.srv.SetPlayerSpawnPoint(session, int32(math.Floor(spawnX)), int32(spawnY), int32(math.Floor(spawnZ)), 0, 0, false)
+		wx, wy, wz, wyaw := h.srv.WorldSpawn()
+		h.spawnY = float64(wy)
+		h.srv.SetPlayerTransform(session, float64(wx)+0.5, h.spawnY, float64(wz)+0.5, wyaw, 0, true)
 	}
 
 	h.srv.SetPlayerViewDistance(session, h.visibilityRadius())
@@ -145,6 +137,11 @@ func (h *handler) sendDefaultSpawnPosition() error {
 	dim := "minecraft:overworld"
 	sx, sy, sz := 8, int(math.Floor(h.spawnY)), 8
 	yaw, pitch := float32(0.0), float32(0.0)
+	if h.srv != nil {
+		wx, wy, wz, wyaw := h.srv.WorldSpawn()
+		sx, sy, sz = wx, wy, wz
+		yaw = wyaw
+	}
 	if h.session != nil {
 		snap := h.session.Snapshot()
 		if snap.HasSpawn {
@@ -354,6 +351,12 @@ func (h *handler) sendPlayerPosition(teleportID int32) error {
 func (h *handler) keepAliveLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+	defer func() {
+		if h.srv != nil && h.session != nil {
+			h.srv.DespawnPlayerFishingBobber(h.session)
+			h.srv.WakePlayerFromBed(h.session)
+		}
+	}()
 	for {
 		select {
 		case <-h.ctx.Done():
@@ -764,15 +767,9 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case server.PlayUseItemSB:
 		if h.srv != nil && h.session != nil {
-			hand, seq, _, _, err := server.DecodeUseItemPacket(pkt.Body())
-			if err != nil {
+			if err := h.srv.HandleUseItemPacket(h.session, pkt.Body()); err != nil {
 				return err
 			}
-			if h.srv.UsePotionOrMilkItem(h.session, hand) {
-				h.syncHotbarFromSession()
-				return h.sendBlockChangedAck(seq)
-			}
-			_ = h.srv.HandleUseItemPacket(h.session, pkt.Body())
 			h.syncHotbarFromSession()
 		}
 		return nil
@@ -780,6 +777,9 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case server.PlayPlayerCommandSB:
 		if h.srv != nil {
 			_ = h.srv.HandlePlayerCommandPacket(h.session, pkt.Body())
+			if h.session != nil && !h.srv.IsPlayerSleeping(h.session) {
+				h.srv.ClearPlayerBedOccupancy(h.session)
+			}
 		}
 		return nil
 
@@ -792,8 +792,10 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 			h.heldSlot = int32(slot)
 			if h.session != nil {
 				h.session.SetSelectedSlot(int32(slot))
+				h.session.SetBlockingWithShield(false)
 				if h.srv != nil {
 					h.srv.CancelEating(h.session)
+					h.srv.DespawnPlayerFishingBobber(h.session)
 				}
 				h.session.ResetAttackCooldown()
 			}
@@ -955,6 +957,9 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 		return err
 	}
 	if status == server.PlayerActionReleaseUseItem {
+		if h.session != nil {
+			h.session.SetBlockingWithShield(false)
+		}
 		if h.srv != nil {
 			h.srv.CancelEating(h.session)
 		}
@@ -1081,6 +1086,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			return err
 		}
 		if opened {
+			h.syncHotbarFromSession()
 			return h.sendBlockChangedAck(seq)
 		}
 	}
@@ -1122,8 +1128,14 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			}
 			cache := h.srv.PlayerChunks(h.session)
 			if cache != nil {
-				if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {
+				placed := false
+				if server.IsBedBlock(state) && h.srv != nil {
+					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)
+				} else if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {
 					h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
+					placed = true
+				}
+				if placed {
 					blockName := world.BlockName(state)
 					if blockName == "minecraft:fire" || blockName == "minecraft:soul_fire" {
 						_, _ = h.srv.LightPortalAt(dim, px, py, pz)

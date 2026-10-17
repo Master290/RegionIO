@@ -323,11 +323,8 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 		Elems:  invElems,
 	})
 
-	if d.HasSpawn || d.SpawnX != 0 || d.SpawnY != 0 || d.SpawnZ != 0 || d.SpawnDimension != "" {
-		dim := d.SpawnDimension
-		if dim == "" {
-			dim = "minecraft:overworld"
-		}
+	if d.HasSpawn || d.SpawnX != 0 || d.SpawnY != 0 || d.SpawnZ != 0 || d.SpawnForced {
+		dim := NormalizeDimension(d.SpawnDimension)
 		var forcedByte int8
 		if d.SpawnForced {
 			forcedByte = 1

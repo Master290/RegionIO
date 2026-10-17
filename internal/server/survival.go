@@ -338,6 +338,9 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+	if IsBedBlock(prevState) {
+		s.BreakBedPartner(dim, cache, x, y, z, prevState)
+	}
 	if IsChestBlock(prevState) {
 		s.DropChestContents(x, y, z)
 	}
@@ -741,7 +744,12 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		}
 	}
 
+	if s.IsPlayerSleeping(session) {
+		s.WakePlayerFromBed(session)
+	}
+
 	if died {
+		s.DespawnPlayerFishingBobber(session)
 		st := getSurvivalState(session)
 		st.mu.Lock()
 		st.dead = true
@@ -766,6 +774,8 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		switch cause {
 		case "fall":
 			deathMsg = fmt.Sprintf("%s fell from a high place", name)
+		case "bad_respawn_point":
+			deathMsg = fmt.Sprintf("%s was killed by [Intentional Game Design]", name)
 		default:
 			deathMsg = fmt.Sprintf("%s died", name)
 		}
@@ -850,7 +860,10 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 
 	session.SetFoodExhaustion(0)
 	session.SetFoodTickTimer(0)
+	session.SetBlockingWithShield(false)
 	s.CancelEating(session)
+	s.DespawnPlayerFishingBobber(session)
+	s.WakePlayerFromBed(session)
 	s.ClearPlayerEffects(session)
 
 	prevDim := session.Dimension()
@@ -861,10 +874,6 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	mode := session.gameMode
 	selectedSlot := session.selectedSlot
 	inv := session.inventory
-	hasSpawn := session.hasSpawn
-	spawnDim := world.NormalizeDimension(session.spawnDimension)
-	spawnX, spawnY, spawnZ := session.spawnX, session.spawnY, session.spawnZ
-	spawnYaw, spawnPitch := session.spawnYaw, session.spawnPitch
 	session.containerStateID++
 	if session.containerStateID <= 0 {
 		session.containerStateID = 1
@@ -873,33 +882,18 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	send := session.send
 	session.mu.Unlock()
 
-	session.SetDimension(spawnDim)
-	targetCache := s.DimensionChunks(spawnDim)
-	targetX := 8.5
-	targetY := float64(world.FlatSurfaceY + 1)
-	targetZ := 8.5
-	var targetYaw, targetPitch float32
-	if targetCache != nil {
-		if y, ok := targetCache.SafeSpawnY(8, 8); ok {
-			targetY = float64(y)
-		}
-	}
-	if hasSpawn {
-		targetX = float64(spawnX) + 0.5
-		targetY = float64(spawnY)
-		targetZ = float64(spawnZ) + 0.5
-		targetYaw = spawnYaw
-		targetPitch = spawnPitch
-	}
+	targetDim, targetX, targetY, targetZ, targetYaw, targetPitch, _, _ := s.ResolvePlayerRespawn(session)
+	session.SetDimension(targetDim)
+	targetCache := s.DimensionChunks(targetDim)
 
 	if send != nil {
-		if err := send(protocol.PlayRespawn, EncodeDimensionRespawnPacket(spawnDim, mode, s.cfg.WorldSeed, 0)); err != nil {
+		if err := send(protocol.PlayRespawn, EncodeDimensionRespawnPacket(targetDim, mode, s.cfg.WorldSeed, 0)); err != nil {
 			return err
 		}
 	}
 	targetCX := int32(int64(math.Floor(targetX)) >> 4)
 	targetCZ := int32(int64(math.Floor(targetZ)) >> 4)
-	if prevDim != spawnDim {
+	if prevDim != targetDim {
 		if switchFn := getPlayerDimSwitchFunc(session); switchFn != nil && targetCache != nil {
 			switchFn(targetCache, targetCX, targetCZ)
 		}

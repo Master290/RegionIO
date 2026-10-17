@@ -414,6 +414,11 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	case IsBrewingStandBlock(state):
 		cid, err := s.OpenBrewingStand(session, x, y, z)
 		return err == nil, cid, err
+	case IsBedBlock(state):
+		s.InteractBed(session, x, y, z)
+		return true, 0, nil
+	case IsRespawnAnchorBlock(state):
+		return s.InteractRespawnAnchor(session, x, y, z), 0, nil
 	default:
 		return false, 0, nil
 	}

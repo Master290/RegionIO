@@ -162,6 +162,15 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	listUUIDs := literal("uuids", true)
 	listNode := literal("list", true, listUUIDs)
 
+	// /spawnpoint [<targets> [<pos>]]
+	spPos := argument("pos", ArgParserVec3, nil, true)
+	spTargets := argument("targets", ArgParserEntity, []byte{EntityArgSingle | EntityArgPlayersOnly}, true, spPos)
+	spawnpointNode := literal("spawnpoint", true, spTargets)
+
+	// /setworldspawn [<pos>]
+	swsPos := argument("pos", ArgParserVec3, nil, true)
+	setworldspawnNode := literal("setworldspawn", true, swsPos)
+
 	// /help [<command>]
 	greedyProps := protocol.NewWriter(2)
 	greedyProps.VarInt(StringArgGreedyPhrase)
@@ -177,6 +186,8 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		saveAllNode,
 		stopNode,
 		listNode,
+		spawnpointNode,
+		setworldspawnNode,
 		helpNode,
 	}
 	return nodes, rootIdx
@@ -458,6 +469,16 @@ func ExecuteCommand(srv *server.Server, sender *server.PlayerSession, rawLine st
 			return "You do not have permission to use this command"
 		}
 		return execWhitelist(srv, parsed.Args)
+	case "spawnpoint":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execSpawnPoint(srv, sender, parsed.Args)
+	case "setworldspawn":
+		if !srv.HasAdminPermission(sender) {
+			return "You do not have permission to use this command"
+		}
+		return execSetWorldSpawn(srv, sender, parsed.Args)
 	default:
 		return fmt.Sprintf("Unknown command: %s. Type /help for a list of commands.", parsed.Name)
 	}
@@ -711,11 +732,153 @@ func execHelp(args []string) string {
 			return "/stop — save the world and stop the server"
 		case "list":
 			return "/list [uuids] — list online players"
+		case "spawnpoint":
+			return "/spawnpoint [<target> [<x> <y> <z> [angle]]] — set player spawn point"
+		case "setworldspawn":
+			return "/setworldspawn [<x> <y> <z> [angle]] — set world spawn point"
 		case "help":
 			return "/help [command] — show available commands"
 		}
 	}
-	return "Available commands: /tp, /gamemode, /time, /weather, /gamerule, /seed, /save-all, /stop, /list, /help"
+	return "Available commands: /tp, /gamemode, /time, /weather, /gamerule, /seed, /save-all, /stop, /list, /spawnpoint, /setworldspawn, /help"
+}
+
+func execSpawnPoint(srv *server.Server, sender *server.PlayerSession, args []string) string {
+	target := sender
+	var coordArgs []string
+	switch len(args) {
+	case 0:
+		if target == nil {
+			return "Usage: /spawnpoint <player> [<x> <y> <z> [angle]]"
+		}
+	case 1:
+		target = resolveTargetSession(srv, sender, args[0])
+		if target == nil {
+			return fmt.Sprintf("Player %q not found", args[0])
+		}
+	case 3:
+		if target == nil {
+			return "Usage: /spawnpoint <player> <x> <y> <z> [angle]"
+		}
+		coordArgs = args
+	case 4:
+		if _, err := ParseCoordArg(args[0]); err == nil && target != nil {
+			coordArgs = args
+		} else {
+			target = resolveTargetSession(srv, sender, args[0])
+			if target == nil {
+				return fmt.Sprintf("Player %q not found", args[0])
+			}
+			coordArgs = args[1:]
+		}
+	case 5:
+		target = resolveTargetSession(srv, sender, args[0])
+		if target == nil {
+			return fmt.Sprintf("Player %q not found", args[0])
+		}
+		coordArgs = args[1:]
+	default:
+		return "Usage: /spawnpoint [<player> [<x> <y> <z> [angle]]]"
+	}
+
+	snap := target.Snapshot()
+	sx := int32(math.Floor(snap.X))
+	sy := int32(math.Floor(snap.Y))
+	sz := int32(math.Floor(snap.Z))
+	angle := snap.Yaw
+
+	if len(coordArgs) >= 3 {
+		cx, err := ParseCoordArg(coordArgs[0])
+		if err != nil {
+			return fmt.Sprintf("Invalid X coordinate: %v", err)
+		}
+		cy, err := ParseCoordArg(coordArgs[1])
+		if err != nil {
+			return fmt.Sprintf("Invalid Y coordinate: %v", err)
+		}
+		cz, err := ParseCoordArg(coordArgs[2])
+		if err != nil {
+			return fmt.Sprintf("Invalid Z coordinate: %v", err)
+		}
+		x := cx.Resolve(snap.X)
+		y := cy.Resolve(snap.Y)
+		z := cz.Resolve(snap.Z)
+		if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
+			return "Invalid position: coordinates out of world bounds"
+		}
+		sx = int32(math.Floor(x))
+		sy = int32(math.Floor(y))
+		sz = int32(math.Floor(z))
+		if len(coordArgs) == 4 {
+			v, err := strconv.ParseFloat(strings.TrimSpace(coordArgs[3]), 32)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Sprintf("Invalid angle %q", coordArgs[3])
+			}
+			angle = float32(v)
+		} else {
+			angle = 0
+		}
+	}
+
+	dim := target.Dimension()
+	srv.SetPlayerDimensionSpawnPoint(target, dim, sx, sy, sz, angle, 0, true)
+	return fmt.Sprintf("Set the spawn point for %s to %d, %d, %d [%.1f] in %s", target.Profile.Name, sx, sy, sz, angle, dim)
+}
+
+func execSetWorldSpawn(srv *server.Server, sender *server.PlayerSession, args []string) string {
+	var sx, sy, sz int32
+	var angle float32
+	switch len(args) {
+	case 0:
+		if sender == nil {
+			return "Usage: /setworldspawn <x> <y> <z> [angle]"
+		}
+		snap := sender.Snapshot()
+		sx = int32(math.Floor(snap.X))
+		sy = int32(math.Floor(snap.Y))
+		sz = int32(math.Floor(snap.Z))
+		angle = snap.Yaw
+	case 3, 4:
+		wx, wy, wz, _ := srv.WorldSpawn()
+		ox, oy, oz := float64(wx), float64(wy), float64(wz)
+		if sender != nil {
+			snap := sender.Snapshot()
+			ox, oy, oz = snap.X, snap.Y, snap.Z
+		}
+		cx, err := ParseCoordArg(args[0])
+		if err != nil {
+			return fmt.Sprintf("Invalid X coordinate: %v", err)
+		}
+		cy, err := ParseCoordArg(args[1])
+		if err != nil {
+			return fmt.Sprintf("Invalid Y coordinate: %v", err)
+		}
+		cz, err := ParseCoordArg(args[2])
+		if err != nil {
+			return fmt.Sprintf("Invalid Z coordinate: %v", err)
+		}
+		x := cx.Resolve(ox)
+		y := cy.Resolve(oy)
+		z := cz.Resolve(oz)
+		if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
+			return "Invalid position: coordinates out of world bounds"
+		}
+		sx = int32(math.Floor(x))
+		sy = int32(math.Floor(y))
+		sz = int32(math.Floor(z))
+		if len(args) == 4 {
+			v, err := strconv.ParseFloat(strings.TrimSpace(args[3]), 32)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Sprintf("Invalid angle %q", args[3])
+			}
+			angle = float32(v)
+		}
+	default:
+		return "Usage: /setworldspawn [<x> <y> <z> [angle]]"
+	}
+
+	srv.SetWorldSpawn(int(sx), int(sy), int(sz), angle)
+	return fmt.Sprintf("Set the world spawn point to %d, %d, %d [%.1f]", sx, sy, sz, angle)
 }
 
 func execWhitelist(srv *server.Server, args []string) string {

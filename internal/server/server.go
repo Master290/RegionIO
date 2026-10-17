@@ -468,6 +468,8 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	if session == nil {
 		return
 	}
+	s.DespawnPlayerFishingBobber(session)
+	s.WakePlayerFromBed(session)
 	removed := false
 	s.playersMu.Lock()
 	if current := s.players[session.Profile.UUID]; current == session {
@@ -477,6 +479,11 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	}
 	s.playersMu.Unlock()
 	if removed {
+		if s.CanSleep() {
+			if s.TrySkipNightBySleep() {
+				s.ClearAllBedOccupancy()
+			}
+		}
 		_ = s.SavePlayerData(session)
 	}
 }
@@ -821,6 +828,7 @@ func (s *Server) SetPlayerSpawnPoint(session *PlayerSession, x, y, z int32, yaw,
 	if session == nil {
 		return
 	}
+	dim := session.Dimension()
 	session.mu.Lock()
 	session.spawnX = x
 	session.spawnY = y
@@ -828,8 +836,10 @@ func (s *Server) SetPlayerSpawnPoint(session *PlayerSession, x, y, z int32, yaw,
 	session.spawnYaw = yaw
 	session.spawnPitch = pitch
 	session.spawnForced = forced
-	if session.spawnDimension == "" {
-		session.spawnDimension = "minecraft:overworld"
+	if dim != "" {
+		session.spawnDimension = world.NormalizeDimension(dim)
+	} else if session.spawnDimension == "" {
+		session.spawnDimension = world.DimensionOverworld
 	}
 	session.hasSpawn = true
 	session.mu.Unlock()

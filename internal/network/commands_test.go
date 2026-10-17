@@ -286,6 +286,20 @@ func TestExecuteCommandsAndConsole(t *testing.T) {
 		t.Fatalf("/gamerule doWeatherCycle true = %q", got)
 	}
 
+	// /spawnpoint & /setworldspawn
+	if got := ExecuteCommand(srv, alice, "/spawnpoint ~ ~2 ~ 90"); !strings.Contains(got, "Set the spawn point for Alice to 100, 82, -50") {
+		t.Fatalf("/spawnpoint = %q", got)
+	}
+	if snap := alice.Snapshot(); !snap.HasSpawn || !snap.SpawnForced || snap.SpawnX != 100 || snap.SpawnY != 82 || snap.SpawnZ != -50 {
+		t.Fatalf("alice spawn point after /spawnpoint = %+v", snap)
+	}
+	if got := ExecuteCommand(srv, alice, "/setworldspawn 12 72 -8 45"); !strings.Contains(got, "Set the world spawn point to 12, 72, -8") {
+		t.Fatalf("/setworldspawn = %q", got)
+	}
+	if wx, wy, wz, wAngle := srv.WorldSpawn(); wx != 12 || wy != 72 || wz != -8 || wAngle != 45 {
+		t.Fatalf("world spawn after /setworldspawn = (%d, %d, %d, %v), want (12, 72, -8, 45)", wx, wy, wz, wAngle)
+	}
+
 	// /save-all
 	if got := ExecuteCommand(srv, alice, "/save-all"); got != "Saved the game" {
 		t.Fatalf("/save-all = %q", got)
