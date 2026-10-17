@@ -75,17 +75,22 @@ const (
 	PlayChunkCacheCenter = 0x5e
 	PlayLevelChunk       = 0x2d
 	PlayForgetLevelChunk = 0x25
-	PlayAbilities        = 0x40
-	PlaySetHeldSlot      = 0x69
-	PlayDisconnect       = 0x20
-	PlayBlockUpdate      = 0x08
-	PlayBlockChangedAck  = 0x04
-	PlayCommands         = 0x10
-	PlaySystemChat       = 0x79
-	PlayLightUpdate      = 0x30
-	PlayPlayerInfoRemove = 0x45
-	PlayPlayerInfoUpdate = 0x46
-	PlaySetTime          = 0x71
+	PlayAbilities           = 0x40
+	PlaySetHealth           = 0x68
+	PlaySetHeldSlot         = 0x69
+	PlayDisconnect          = 0x20
+	PlayBlockUpdate         = 0x08
+	PlayBlockChangedAck     = 0x04
+	PlayCommands            = 0x10
+	PlayContainerClose      = 0x11
+	PlayContainerSetContent = 0x12
+	PlayContainerSetData    = 0x13
+	PlayContainerSetSlot    = 0x14
+	PlaySystemChat          = 0x79
+	PlayLightUpdate         = 0x30
+	PlayPlayerInfoRemove    = 0x45
+	PlayPlayerInfoUpdate    = 0x46
+	PlaySetTime             = 0x71
 
 	// Entity packets
 	PlayAddEntity        = 0x01

@@ -30,16 +30,47 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	h.session = session
-	spawnY, ok := h.srv.Chunks().SafeSpawnY(int(math.Floor(spawnX)), int(math.Floor(spawnZ)))
-	if !ok {
-		spawnY = world.SeaLevel + 1
-	}
-	h.spawnY = float64(spawnY)
-	h.srv.SetPlayerTransform(session, spawnX, h.spawnY, spawnZ, 0, 0, true)
-	h.srv.SetPlayerViewDistance(session, h.visibilityRadius())
 	for i := range h.hotbar {
 		h.hotbar[i] = -1 // empty
 	}
+
+	if session.LoadedFromDisk() {
+		snap := session.Snapshot()
+		if snap.HasSpawn {
+			h.spawnY = float64(snap.SpawnY)
+		} else {
+			spawnY, ok := h.srv.Chunks().SafeSpawnY(int(math.Floor(spawnX)), int(math.Floor(spawnZ)))
+			if !ok {
+				spawnY = world.SeaLevel + 1
+			}
+			h.spawnY = float64(spawnY)
+			h.srv.SetPlayerSpawnPoint(session, int32(math.Floor(spawnX)), int32(spawnY), int32(math.Floor(spawnZ)), 0, 0, false)
+		}
+		h.heldSlot = snap.SelectedSlot
+		for i := 0; i < world.HotbarSlotCount; i++ {
+			st := snap.Inventory[world.HotbarContainerOffset+i]
+			if st.IsEmpty() {
+				st = snap.Inventory[i]
+			}
+			if !st.IsEmpty() {
+				h.hotbar[i] = st.ResolvedItemID()
+			}
+		}
+	} else {
+		spawnY, ok := h.srv.Chunks().SafeSpawnY(int(math.Floor(spawnX)), int(math.Floor(spawnZ)))
+		if !ok {
+			spawnY = world.SeaLevel + 1
+		}
+		h.spawnY = float64(spawnY)
+		h.srv.SetPlayerTransform(session, spawnX, h.spawnY, spawnZ, 0, 0, true)
+		h.srv.SetPlayerSpawnPoint(session, int32(math.Floor(spawnX)), int32(spawnY), int32(math.Floor(spawnZ)), 0, 0, false)
+	}
+
+	h.srv.SetPlayerViewDistance(session, h.visibilityRadius())
+	snap := session.Snapshot()
+	startCX := int32(int64(math.Floor(snap.X)) >> 4)
+	startCZ := int32(int64(math.Floor(snap.Z)) >> 4)
+
 	if err := h.sendPlayLogin(); err != nil {
 		return err
 	}
@@ -51,13 +82,22 @@ func (h *handler) beginPlay() error {
 	if err := h.sendPlayerPosition(1); err != nil {
 		return err
 	}
-	if err := h.sendChunkCacheCenter(0, 0); err != nil {
+	if err := h.sendChunkCacheCenter(startCX, startCZ); err != nil {
 		return err
 	}
 	if err := h.sendDefaultSpawnPosition(); err != nil {
 		return err
 	}
 	if err := h.sendPlayerAbilities(); err != nil {
+		return err
+	}
+	if err := h.sendSetHeldSlot(snap.SelectedSlot); err != nil {
+		return err
+	}
+	if err := h.sendContainerSetContent(); err != nil {
+		return err
+	}
+	if err := h.sendSetHealth(snap.Health, snap.FoodLevel, snap.FoodSaturation); err != nil {
 		return err
 	}
 	if err := h.sendCommands(); err != nil {
@@ -72,7 +112,7 @@ func (h *handler) beginPlay() error {
 	h.streamer = newStreamer(h.srv.Chunks(), h.conn, h.log, h.visibilityRadius())
 	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
 	go h.streamer.run(h.ctx)
-	h.streamer.requestRecenter(0, 0)
+	h.streamer.requestRecenter(startCX, startCZ)
 	go h.keepAliveLoop()
 	go h.entitySyncLoop()
 	return nil
@@ -88,20 +128,109 @@ func (h *handler) sendChunkCacheCenter(cx, cz int32) error {
 func (h *handler) sendDefaultSpawnPosition() error {
 	// 26.1.2 wraps the spawn in LevelData.RespawnData: GlobalPos followed by
 	// yaw and pitch. GlobalPos starts with the dimension resource key.
+	dim := "minecraft:overworld"
+	sx, sy, sz := 8, int(math.Floor(h.spawnY)), 8
+	yaw, pitch := float32(0.0), float32(0.0)
+	if h.session != nil {
+		snap := h.session.Snapshot()
+		if snap.HasSpawn {
+			if snap.SpawnDimension != "" {
+				dim = snap.SpawnDimension
+			}
+			sx, sy, sz = int(snap.SpawnX), int(snap.SpawnY), int(snap.SpawnZ)
+			yaw, pitch = snap.SpawnYaw, snap.SpawnPitch
+		}
+	}
 	w := protocol.NewWriter(40)
-	w.String("minecraft:overworld")
-	w.Position(8, int(math.Floor(h.spawnY)), 8)
-	w.Float32(0.0)
-	w.Float32(0.0)
+	w.String(dim)
+	w.Position(sx, sy, sz)
+	w.Float32(yaw)
+	w.Float32(pitch)
 	return h.conn.SendWriter(protocol.PlayDefaultSpawnPos, w)
 }
 
 func (h *handler) sendPlayerAbilities() error {
+	mode := server.GameModeCreative
+	if h.session != nil {
+		mode = h.session.Snapshot().GameMode
+	}
+	var flags byte
+	switch mode {
+	case server.GameModeCreative:
+		flags = 0x0F
+	case server.GameModeSpectator:
+		flags = 0x07
+	default:
+		flags = 0x00
+	}
 	w := protocol.NewWriter(9)
-	w.Byte(0x0F)
+	w.Byte(flags)
 	w.Float32(0.05)
 	w.Float32(0.1)
 	return h.conn.SendWriter(protocol.PlayAbilities, w)
+}
+
+func (h *handler) sendSetHeldSlot(slot int32) error {
+	if slot < 0 || slot >= world.HotbarSlotCount {
+		slot = 0
+	}
+	w := protocol.NewWriter(4)
+	w.VarInt(slot)
+	return h.conn.SendWriter(protocol.PlaySetHeldSlot, w)
+}
+
+func (h *handler) sendSetHealth(health float32, food int32, saturation float32) error {
+	if health <= 0 {
+		health = world.DefaultPlayerHealth
+	}
+	w := protocol.NewWriter(16)
+	w.Float32(health)
+	w.VarInt(food)
+	w.Float32(saturation)
+	return h.conn.SendWriter(protocol.PlaySetHealth, w)
+}
+
+func (h *handler) sendContainerSetContent() error {
+	var inv [world.PlayerInventorySlots]world.ItemStack
+	stateID := int32(1)
+	if h.session != nil {
+		inv = h.session.Inventory()
+		stateID = h.session.NextContainerStateID()
+	}
+	w := protocol.NewWriter(256)
+	w.VarInt(0) // containerId 0 = player inventory
+	w.VarInt(stateID)
+	w.VarInt(world.PlayerInventorySlots)
+	for i := 0; i < world.PlayerInventorySlots; i++ {
+		writeItemStack(w, inv[i])
+	}
+	writeItemStack(w, world.ItemStack{}) // carried item
+	return h.conn.SendWriter(protocol.PlayContainerSetContent, w)
+}
+
+func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
+	stateID := int32(1)
+	if h.session != nil {
+		stateID = h.session.NextContainerStateID()
+	}
+	w := protocol.NewWriter(32)
+	w.VarInt(0) // containerId 0 = player inventory
+	w.VarInt(stateID)
+	w.Uint16(uint16(int16(slot)))
+	writeItemStack(w, stack)
+	return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+}
+
+func writeItemStack(w *protocol.Writer, stack world.ItemStack) {
+	itemID := stack.ResolvedItemID()
+	if stack.IsEmpty() || itemID <= 0 {
+		w.VarInt(0)
+		return
+	}
+	w.VarInt(stack.Count)
+	w.VarInt(itemID)
+	w.VarInt(0) // added data components
+	w.VarInt(0) // removed data components
 }
 
 // onPlayerMove recenters the streamer when the player crosses into a new chunk.
@@ -146,8 +275,10 @@ func (h *handler) sendPlayLogin() error {
 
 	w := protocol.NewWriter(128)
 	entityID := int32(1)
+	gameMode := byte(server.GameModeCreative)
 	if h.session != nil {
 		entityID = h.session.EntityID
+		gameMode = h.session.Snapshot().GameMode
 	}
 	w.Int32(entityID) // entity ID
 	w.Bool(false)     // is hardcore
@@ -169,7 +300,7 @@ func (h *handler) sendPlayLogin() error {
 	w.VarInt(int32(dimTypeIdx))     // dimension type (registry index)
 	w.String("minecraft:overworld") // dimension name (this world)
 	w.Int64(0)                      // hashed seed
-	w.Byte(1)                       // game mode: creative (instant break, creative inventory)
+	w.Byte(gameMode)                // game mode
 	w.Byte(0xFF)                    // previous game mode: -1 (none)
 	w.Bool(false)                   // is debug
 	w.Bool(false)                   // is flat
@@ -189,16 +320,23 @@ func (h *handler) sendGameEvent(event byte, value float32) error {
 	return h.conn.SendWriter(protocol.PlayGameEvent, w)
 }
 
-// sendPlayerPosition teleports the player to spawn. The client must echo the
-// teleport ID back via accept_teleportation.
+// sendPlayerPosition teleports the player to their current/spawn position.
+// The client must echo the teleport ID back via accept_teleportation.
 func (h *handler) sendPlayerPosition(teleportID int32) error {
+	x, y, z := spawnX, h.spawnY, spawnZ
+	yaw, pitch := float32(0), float32(0)
+	if h.session != nil {
+		snap := h.session.Snapshot()
+		x, y, z = snap.X, snap.Y, snap.Z
+		yaw, pitch = snap.Yaw, snap.Pitch
+	}
 	w := protocol.NewWriter(64)
 	w.VarInt(teleportID)
-	w.Float64(spawnX).Float64(h.spawnY).Float64(spawnZ) // position
-	w.Float64(0).Float64(0).Float64(0)                  // velocity
-	w.Float32(0)                                        // yaw
-	w.Float32(0)                                        // pitch
-	w.Int32(0)                                          // relative flags
+	w.Float64(x).Float64(y).Float64(z) // position
+	w.Float64(0).Float64(0).Float64(0) // velocity
+	w.Float32(yaw)                     // yaw
+	w.Float32(pitch)                   // pitch
+	w.Int32(0)                         // relative flags
 	return h.conn.SendWriter(protocol.PlayPlayerPosition, w)
 }
 
@@ -551,8 +689,11 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		if err != nil {
 			return err
 		}
-		if slot < 9 {
+		if slot < world.HotbarSlotCount {
 			h.heldSlot = int32(slot)
+			if h.session != nil {
+				h.session.SetSelectedSlot(int32(slot))
+			}
 		}
 		return nil
 
@@ -619,35 +760,49 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 }
 
 // hotbarInvStart is the inventory slot index of hotbar slot 0.
-const hotbarInvStart = 36
+const hotbarInvStart = world.HotbarContainerOffset
 
 // handleCreativeSlot records the item a creative player placed into a slot so we
-// know what block to place. The packet is: Short slot, then an item stack
-// (VarInt count; if non-empty, VarInt item id followed by components we ignore).
+// know what block to place and keeps the player's container synchronized.
+// The packet is: Short slot, then an item stack (VarInt count; if non-empty,
+// VarInt item id followed by components we ignore).
 func (h *handler) handleCreativeSlot(pkt protocol.Packet) error {
 	r := pkt.Body()
-	slot, err := r.Uint16()
+	slotRaw, err := r.Uint16()
 	if err != nil {
 		return err
 	}
-	hotbarIdx := int(slot) - hotbarInvStart
-	if hotbarIdx < 0 || hotbarIdx >= len(h.hotbar) {
-		return nil // not a hotbar slot; ignored
-	}
-
 	count, err := r.VarInt()
 	if err != nil {
 		return err
 	}
-	if count <= 0 {
-		h.hotbar[hotbarIdx] = -1 // emptied
-		return nil
+	var stack world.ItemStack
+	if count > 0 {
+		itemID, err := r.VarInt()
+		if err != nil {
+			return err
+		}
+		stack = world.NewItemStack(itemID, count)
 	}
-	itemID, err := r.VarInt()
-	if err != nil {
-		return err
+
+	slot := int(int16(slotRaw))
+	if hotbarIdx := slot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
+		if stack.IsEmpty() {
+			h.hotbar[hotbarIdx] = -1
+		} else {
+			h.hotbar[hotbarIdx] = stack.ResolvedItemID()
+		}
 	}
-	h.hotbar[hotbarIdx] = itemID // remaining component data is not needed
+	if slot >= 0 && slot < world.PlayerInventorySlots {
+		if h.session != nil {
+			h.session.SetInventorySlot(slot, stack)
+		}
+		if h.conn != nil {
+			if err := h.sendContainerSetSlot(slot, stack); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -706,6 +861,16 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 // heldBlock returns the block state for the currently held item, if it is a
 // placeable block.
 func (h *handler) heldBlock() (uint16, bool) {
+	if h.session != nil {
+		if held := h.session.HeldItem(); !held.IsEmpty() {
+			if itemID := held.ResolvedItemID(); itemID >= 0 {
+				return world.ItemToBlock(itemID)
+			}
+		}
+	}
+	if h.heldSlot < 0 || int(h.heldSlot) >= len(h.hotbar) {
+		return 0, false
+	}
 	itemID := h.hotbar[h.heldSlot]
 	if itemID < 0 {
 		return 0, false

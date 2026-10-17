@@ -108,28 +108,57 @@ type PacketSender func(id int32, body []byte) error
 // PlayerSession is one active play-state client. Position is guarded separately
 // so entity ticks can inspect players without holding the server registry lock.
 type PlayerSession struct {
-	EntityID   int32
-	Profile    Profile
-	send       PacketSender
-	mu         sync.RWMutex
-	position   [3]float64
-	yaw        float32
-	pitch      float32
-	onGround   bool
-	viewDist   int
-	gameMode   uint8
-	recenterFn func(cx, cz int32)
+	EntityID         int32
+	Profile          Profile
+	send             PacketSender
+	mu               sync.RWMutex
+	loadedFromDisk   bool
+	position         [3]float64
+	yaw              float32
+	pitch            float32
+	onGround         bool
+	viewDist         int
+	gameMode         uint8
+	health           float32
+	foodLevel        int32
+	foodSaturation   float32
+	selectedSlot     int32
+	inventory        [world.PlayerInventorySlots]world.ItemStack
+	containerStateID int32
+	spawnX           int32
+	spawnY           int32
+	spawnZ           int32
+	spawnYaw         float32
+	spawnPitch       float32
+	spawnForced      bool
+	spawnDimension   string
+	hasSpawn         bool
+	recenterFn       func(cx, cz int32)
 }
 
 // PlayerSnapshot is an immutable view of one play-state session.
 type PlayerSnapshot struct {
-	EntityID     int32
-	Profile      Profile
-	X, Y, Z      float64
-	Yaw, Pitch   float32
-	OnGround     bool
-	ViewDistance int
-	GameMode     uint8
+	EntityID       int32
+	Profile        Profile
+	X, Y, Z        float64
+	Yaw, Pitch     float32
+	OnGround       bool
+	ViewDistance   int
+	GameMode       uint8
+	Health         float32
+	FoodLevel      int32
+	FoodSaturation float32
+	SelectedSlot   int32
+	Inventory      [world.PlayerInventorySlots]world.ItemStack
+	SpawnX         int32
+	SpawnY         int32
+	SpawnZ         int32
+	SpawnYaw       float32
+	SpawnPitch     float32
+	SpawnForced    bool
+	SpawnDimension string
+	HasSpawn       bool
+	LoadedFromDisk bool
 }
 
 var (
@@ -164,13 +193,19 @@ func New(cfg Config) (*Server, error) {
 // NewWithCache constructs a server around an existing cache. It is useful for
 // embedding and integration tests that provide a specialized world generator.
 func NewWithCache(cfg Config, chunks *world.Cache) (*Server, error) {
+	return NewWithCacheAndStore(cfg, chunks, nil)
+}
+
+// NewWithCacheAndStore constructs a server around an existing cache and an
+// optional persistent world store.
+func NewWithCacheAndStore(cfg Config, chunks *world.Cache, store *world.Store) (*Server, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
 	if chunks == nil {
 		return nil, errors.New("server: nil chunk cache")
 	}
-	return newServerState(cfg, chunks, nil, world.NewEntityManager()), nil
+	return newServerState(cfg, chunks, store, world.NewEntityManager()), nil
 }
 
 func validateConfig(cfg Config) error {
@@ -229,7 +264,37 @@ func (s *Server) SaveWorldTime() error {
 	return s.store.SaveWorldTime(gameTime, dayTime)
 }
 
-// SaveAll flushes all dirty chunks and persists the world clock.
+// SavePlayerData persists a single player session's data to <world>/playerdata/<uuid>.dat.
+func (s *Server) SavePlayerData(session *PlayerSession) error {
+	if session == nil || s.store == nil {
+		return nil
+	}
+	return s.store.SavePlayerData(session.Profile.UUID, session.PlayerData())
+}
+
+// SaveAllPlayers persists all currently connected players' data to disk.
+func (s *Server) SaveAllPlayers() error {
+	if s.store == nil {
+		return nil
+	}
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		sessions = append(sessions, p)
+	}
+	s.playersMu.RUnlock()
+
+	var firstErr error
+	for _, p := range sessions {
+		if err := s.SavePlayerData(p); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// SaveAll flushes all dirty chunks, persists the world clock, and saves all
+// connected players' playerdata.
 func (s *Server) SaveAll() error {
 	var firstErr error
 	if s.chunks != nil {
@@ -238,6 +303,9 @@ func (s *Server) SaveAll() error {
 		}
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveAllPlayers(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
@@ -252,10 +320,21 @@ func (s *Server) Chunks() *world.Cache { return s.chunks }
 // Entities returns the shared entity manager.
 func (s *Server) Entities() *world.EntityManager { return s.entities }
 
-// RegisterPlayer adds a profile to the active play-state registry.
+// RegisterPlayer adds a profile to the active play-state registry and restores
+// persisted playerdata from disk if available.
 func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSession, error) {
 	if err := s.checkAccess(profile); err != nil {
 		return nil, err
+	}
+	var (
+		persisted world.PlayerData
+		hasSaved  bool
+	)
+	if s.store != nil {
+		if loaded, ok, err := s.store.LoadPlayerData(profile.UUID); err == nil && ok {
+			persisted = loaded
+			hasSaved = true
+		}
 	}
 	s.playersMu.Lock()
 	defer s.playersMu.Unlock()
@@ -271,30 +350,253 @@ func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSess
 	}
 	s.nextPlayerID++
 	session := &PlayerSession{
-		EntityID: s.nextPlayerID,
-		Profile:  profile,
-		send:     send,
-		onGround: true,
-		viewDist: 4,
-		gameMode: GameModeCreative,
+		EntityID:       s.nextPlayerID,
+		Profile:        profile,
+		send:           send,
+		onGround:       true,
+		viewDist:       4,
+		gameMode:       GameModeCreative,
+		health:         world.DefaultPlayerHealth,
+		foodLevel:      world.DefaultPlayerFoodLevel,
+		foodSaturation: world.DefaultPlayerSaturation,
+		spawnDimension: "minecraft:overworld",
+	}
+	if hasSaved {
+		session.ApplyPlayerData(persisted)
+		session.mu.Lock()
+		session.loadedFromDisk = true
+		session.mu.Unlock()
 	}
 	s.players[profile.UUID] = session
 	s.playerNames[nameKey] = profile.UUID
 	return session, nil
 }
 
-// UnregisterPlayer removes exactly the supplied session. Pointer identity keeps
-// a delayed disconnect from removing a future session with the same profile.
+// UnregisterPlayer saves the session's playerdata and removes the session.
+// Pointer identity keeps a delayed disconnect from removing a future session
+// with the same profile.
 func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	if session == nil {
 		return
 	}
+	removed := false
 	s.playersMu.Lock()
-	defer s.playersMu.Unlock()
 	if current := s.players[session.Profile.UUID]; current == session {
 		delete(s.players, session.Profile.UUID)
 		delete(s.playerNames, strings.ToLower(session.Profile.Name))
+		removed = true
 	}
+	s.playersMu.Unlock()
+	if removed {
+		_ = s.SavePlayerData(session)
+	}
+}
+
+// LoadedFromDisk reports whether this session was populated from an existing
+// playerdata/<uuid>.dat file on disk.
+func (session *PlayerSession) LoadedFromDisk() bool {
+	if session == nil {
+		return false
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.loadedFromDisk
+}
+
+// ApplyPlayerData populates the session's gameplay and inventory state from d.
+func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.position = d.Pos
+	session.yaw = d.Yaw
+	session.pitch = d.Pitch
+	session.onGround = d.OnGround
+	if d.GameMode <= GameModeSpectator {
+		session.gameMode = d.GameMode
+	}
+	if d.Health > 0 {
+		session.health = d.Health
+	} else {
+		session.health = world.DefaultPlayerHealth
+	}
+	session.foodLevel = d.FoodLevel
+	session.foodSaturation = d.FoodSaturation
+	if d.SelectedSlot >= 0 && d.SelectedSlot < world.HotbarSlotCount {
+		session.selectedSlot = d.SelectedSlot
+	} else {
+		session.selectedSlot = 0
+	}
+	session.inventory = d.Inventory
+	session.spawnX = d.SpawnX
+	session.spawnY = d.SpawnY
+	session.spawnZ = d.SpawnZ
+	session.spawnYaw = d.SpawnYaw
+	session.spawnPitch = d.SpawnPitch
+	session.spawnForced = d.SpawnForced
+	if d.SpawnDimension != "" {
+		session.spawnDimension = d.SpawnDimension
+	} else {
+		session.spawnDimension = "minecraft:overworld"
+	}
+	session.hasSpawn = d.HasSpawn
+}
+
+// PlayerData exports a consistent copy of the session's state for persistence.
+func (session *PlayerSession) PlayerData() world.PlayerData {
+	if session == nil {
+		return world.PlayerData{}
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return world.PlayerData{
+		Pos:            session.position,
+		Yaw:            session.yaw,
+		Pitch:          session.pitch,
+		OnGround:       session.onGround,
+		GameMode:       session.gameMode,
+		Health:         session.health,
+		FoodLevel:      session.foodLevel,
+		FoodSaturation: session.foodSaturation,
+		SelectedSlot:   session.selectedSlot,
+		Inventory:      session.inventory,
+		SpawnX:         session.spawnX,
+		SpawnY:         session.spawnY,
+		SpawnZ:         session.spawnZ,
+		SpawnYaw:       session.spawnYaw,
+		SpawnPitch:     session.spawnPitch,
+		SpawnForced:    session.spawnForced,
+		SpawnDimension: session.spawnDimension,
+		HasSpawn:       session.hasSpawn,
+	}
+}
+
+// SetInventorySlot sets one slot in the player's 46-slot inventory container.
+func (session *PlayerSession) SetInventorySlot(slot int, stack world.ItemStack) bool {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return false
+	}
+	if stack.IsEmpty() {
+		stack = world.ItemStack{}
+	} else {
+		if stack.ID == "" && stack.ItemID > 0 {
+			stack.ID = world.ItemIDToName(stack.ItemID)
+		}
+		if stack.ItemID <= 0 && stack.ID != "" {
+			if id, ok := world.ItemNameToID(stack.ID); ok {
+				stack.ItemID = id
+			}
+		}
+	}
+	session.mu.Lock()
+	session.inventory[slot] = stack
+	session.mu.Unlock()
+	return true
+}
+
+// InventorySlot returns the ItemStack at container slot index (0..45).
+func (session *PlayerSession) InventorySlot(slot int) world.ItemStack {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return world.ItemStack{}
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.inventory[slot]
+}
+
+// Inventory returns a copy of all 46 player container slots.
+func (session *PlayerSession) Inventory() [world.PlayerInventorySlots]world.ItemStack {
+	if session == nil {
+		return [world.PlayerInventorySlots]world.ItemStack{}
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.inventory
+}
+
+// SetSelectedSlot sets the active hotbar index (0..8).
+func (session *PlayerSession) SetSelectedSlot(slot int32) bool {
+	if session == nil || slot < 0 || slot >= world.HotbarSlotCount {
+		return false
+	}
+	session.mu.Lock()
+	session.selectedSlot = slot
+	session.mu.Unlock()
+	return true
+}
+
+// SelectedSlot returns the active hotbar index (0..8).
+func (session *PlayerSession) SelectedSlot() int32 {
+	if session == nil {
+		return 0
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.selectedSlot
+}
+
+// HeldItem returns the ItemStack currently held in the player's selected hotbar slot.
+func (session *PlayerSession) HeldItem() world.ItemStack {
+	if session == nil {
+		return world.ItemStack{}
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	sel := int(session.selectedSlot)
+	if sel < 0 || sel >= world.HotbarSlotCount {
+		sel = 0
+	}
+	if stack := session.inventory[world.HotbarContainerOffset+sel]; !stack.IsEmpty() {
+		return stack
+	}
+	return session.inventory[sel]
+}
+
+// NextContainerStateID increments and returns the container state sequence ID.
+func (session *PlayerSession) NextContainerStateID() int32 {
+	if session == nil {
+		return 1
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	session.containerStateID++
+	if session.containerStateID <= 0 {
+		session.containerStateID = 1
+	}
+	return session.containerStateID
+}
+
+// SetPlayerSpawnPoint records the player's respawn position.
+func (s *Server) SetPlayerSpawnPoint(session *PlayerSession, x, y, z int32, yaw, pitch float32, forced bool) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	session.spawnX = x
+	session.spawnY = y
+	session.spawnZ = z
+	session.spawnYaw = yaw
+	session.spawnPitch = pitch
+	session.spawnForced = forced
+	if session.spawnDimension == "" {
+		session.spawnDimension = "minecraft:overworld"
+	}
+	session.hasSpawn = true
+	session.mu.Unlock()
+}
+
+// SetPlayerHealth updates the player's health, food, and saturation.
+func (s *Server) SetPlayerHealth(session *PlayerSession, health float32, food int32, saturation float32) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	session.health = health
+	session.foodLevel = food
+	session.foodSaturation = saturation
+	session.mu.Unlock()
 }
 
 // SetPlayerPosition updates a session's authoritative position snapshot.
@@ -343,16 +645,30 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 	}
 	session.mu.RLock()
 	snapshot := PlayerSnapshot{
-		EntityID:     session.EntityID,
-		Profile:      session.Profile,
-		X:            session.position[0],
-		Y:            session.position[1],
-		Z:            session.position[2],
-		Yaw:          session.yaw,
-		Pitch:        session.pitch,
-		OnGround:     session.onGround,
-		ViewDistance: session.viewDist,
-		GameMode:     session.gameMode,
+		EntityID:       session.EntityID,
+		Profile:        session.Profile,
+		X:              session.position[0],
+		Y:              session.position[1],
+		Z:              session.position[2],
+		Yaw:            session.yaw,
+		Pitch:          session.pitch,
+		OnGround:       session.onGround,
+		ViewDistance:   session.viewDist,
+		GameMode:       session.gameMode,
+		Health:         session.health,
+		FoodLevel:      session.foodLevel,
+		FoodSaturation: session.foodSaturation,
+		SelectedSlot:   session.selectedSlot,
+		Inventory:      session.inventory,
+		SpawnX:         session.spawnX,
+		SpawnY:         session.spawnY,
+		SpawnZ:         session.spawnZ,
+		SpawnYaw:       session.spawnYaw,
+		SpawnPitch:     session.spawnPitch,
+		SpawnForced:    session.spawnForced,
+		SpawnDimension: session.spawnDimension,
+		HasSpawn:       session.hasSpawn,
+		LoadedFromDisk: session.loadedFromDisk,
 	}
 	session.mu.RUnlock()
 	return snapshot
