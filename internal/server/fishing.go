@@ -1098,12 +1098,12 @@ func (s *Server) shouldStopFishing(owner *PlayerSession, bobber *world.Entity, d
 	if owner == nil || bobber == nil || owner.IsDead() {
 		return true
 	}
-	// Check that owner is still online when s.players has active sessions.
+	// Check that owner is still online in s.players.
 	s.playersMu.RLock()
 	onlineCount := len(s.players)
-	_, isOnline := s.players[owner.Profile.UUID]
+	cur, isOnline := s.players[owner.Profile.UUID]
 	s.playersMu.RUnlock()
-	if onlineCount > 0 && !isOnline {
+	if (onlineCount > 0 || owner.EntityID > 0) && (!isOnline || cur != owner) {
 		return true
 	}
 
@@ -1144,7 +1144,7 @@ func (s *Server) findHookableEntityAt(bobberID, ownerEntityID int32, dim string,
 	for i := range nearby {
 		other := &nearby[i]
 		if other.ID == bobberID || other.ID == ownerEntityID ||
-			other.TypeName == EntityTypeFishingBobber || other.IsExperienceOrb() {
+			other.TypeName == EntityTypeFishingBobber || other.IsExperienceOrb() || IsHangingEntity(other.TypeName) {
 			continue
 		}
 		if other.EffectiveDimension() != world.NormalizeDimension(dim) {

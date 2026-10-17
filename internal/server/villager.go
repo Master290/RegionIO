@@ -753,8 +753,9 @@ func (s *Server) InteractWithVillager(session *PlayerSession, entityID int32) (o
 	return true, cid, nil
 }
 
-// InteractWithEntity handles right-click entity interactions (currently opening
-// the merchant window when targetEntityID is a villager).
+// InteractWithEntity handles right-click entity interactions (opening the
+// merchant window for a villager, interacting with item frames/armor stands,
+// or interacting with passive farm animals).
 func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32) (opened bool, containerID int32, err error) {
 	if s == nil || s.entities == nil || session == nil {
 		return false, 0, nil
@@ -765,6 +766,14 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 	}
 	if ent.TypeName == MobTypeVillager {
 		return s.InteractWithVillager(session, targetEntityID)
+	}
+	if IsDecorationEntity(ent.TypeName) {
+		handled := s.InteractWithDecoration(session, targetEntityID, 0)
+		return handled, 0, nil
+	}
+	if IsPassiveAnimal(ent.TypeName) {
+		handled, _ := s.InteractWithAnimal(session, targetEntityID)
+		return handled, 0, nil
 	}
 	return false, 0, nil
 }

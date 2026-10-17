@@ -52,6 +52,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 		select {
 		case <-ctx.Done():
 			_ = s.SaveFurnaces()
+			_ = s.SaveDecorationsFile()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -61,6 +62,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 					if err := s.SaveWorldTime(); err != nil && log != nil {
 						log.Warn("saving world clock", "err", err)
 					}
+					_ = s.SaveDecorationsFile()
 				}
 			}
 			s.TickWeather(rng)
@@ -185,7 +187,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) {
 			continue
 		}
 
@@ -307,6 +309,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 
 	t.pruneMobStates(aiTick)
 	s.TickFishingBobbers(rng)
+	s.TickDecorations()
 }
 
 func (s *Server) appendViewerTargets(dst []viewerTarget) []viewerTarget {
@@ -392,6 +395,8 @@ func (t *EntityTracker) syncLocked(s *Server) {
 				if viewer.send != nil {
 					if ent.TypeName == EntityTypeFishingBobber {
 						t.pktBuf = s.EncodeFishingBobberAddEntityPacket(t.pktBuf[:0], ent)
+					} else if IsDecorationEntity(ent.TypeName) {
+						t.pktBuf = s.EncodeDecorationAddEntityPacket(t.pktBuf[:0], ent)
 					} else {
 						t.pktBuf = encodeAddEntityPacket(t.pktBuf[:0], ent)
 					}
@@ -401,6 +406,15 @@ func (t *EntityTracker) syncLocked(s *Server) {
 					} else if ent.TypeName == EntityTypeFishingBobber {
 						if metaPkt := s.FishingBobberEntityDataPacket(ent.ID); len(metaPkt) > 0 {
 							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
+						}
+					} else if IsDecorationEntity(ent.TypeName) {
+						if metaPkt := s.DecorationEntityDataPacket(ent.ID); len(metaPkt) > 0 {
+							_ = viewer.send(PlaySetEntityDataCB, metaPkt)
+						}
+						if ent.TypeName == EntityTypeArmorStand {
+							if eqPkt := s.ArmorStandEquipmentPacket(ent.ID); len(eqPkt) > 0 {
+								_ = viewer.send(protocol.PlaySetEquipment, eqPkt)
+							}
 						}
 					}
 				}

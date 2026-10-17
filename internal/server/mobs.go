@@ -131,6 +131,10 @@ var (
 		MobTypeVillager:         int(EntityTypeVillagerID),
 		MobTypeZombie:           EntityTypeZombieID,
 		EntityTypeFishingBobber: EntityTypeFishingBobberID,
+		EntityTypeArmorStand:    EntityTypeArmorStandID,
+		EntityTypeGlowItemFrame: EntityTypeGlowItemFrameID,
+		EntityTypeItemFrame:     EntityTypeItemFrameID,
+		EntityTypePainting:      EntityTypePaintingID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )

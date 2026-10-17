@@ -625,6 +625,9 @@ func (s *Server) MobHealth(entityID int32) float32 {
 	if ent == nil || ent.IsItem() {
 		return 0
 	}
+	if IsDecorationEntity(ent.TypeName) {
+		return 1000.0
+	}
 	tr := s.entityTracker()
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -743,6 +746,13 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	target := s.entities.Get(targetEntityID)
 	if target == nil || target.IsItem() {
 		return 0, false
+	}
+	if IsDecorationEntity(target.TypeName) {
+		handled, broken := s.AttackDecoration(session, targetEntityID)
+		if !handled {
+			return 0, false
+		}
+		return 1.0, broken
 	}
 
 	// Enforce vanilla 6-block interaction reach in survival and adventure modes.
@@ -1051,8 +1061,8 @@ func EncodeAttackPacket(entityID int32) []byte {
 
 // HandleInteractPacket decodes a serverbound interact or attack packet and
 // executes a melee attack when Action == InteractActionAttack, or right-click
-// entity interaction (e.g. opening villager trading UI) when interacting with
-// the main hand.
+// entity interaction (e.g. opening villager trading UI, rotating/inserting
+// item frames, or equipping armor stands) when interacting with the main hand.
 func (s *Server) HandleInteractPacket(session *PlayerSession, r *protocol.Reader) error {
 	pkt, err := DecodeInteractPacket(r)
 	if err != nil {
@@ -1061,8 +1071,13 @@ func (s *Server) HandleInteractPacket(session *PlayerSession, r *protocol.Reader
 	if s != nil && session != nil {
 		if pkt.Action == InteractActionAttack {
 			s.AttackEntity(session, pkt.EntityID)
-		} else if pkt.Hand == 0 {
-			_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+		} else {
+			if pkt.Action == InteractActionInteractAt {
+				s.recordInteractAtY(session, pkt.EntityID, float64(pkt.TargetY))
+			}
+			if pkt.Hand == 0 {
+				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+			}
 		}
 	}
 	return nil
