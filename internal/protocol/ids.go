@@ -91,6 +91,11 @@ const (
 	PlayPlayerInfoRemove    = 0x45
 	PlayPlayerInfoUpdate    = 0x46
 	PlaySetTime             = 0x71
+	PlayDamageEvent         = 0x19
+	PlayEntityEvent         = 0x22
+	PlayHurtAnimation       = 0x2a
+	PlayPlayerCombatKill    = 0x44
+	PlayRespawn             = 0x52
 
 	// Entity packets
 	PlayAddEntity        = 0x01
@@ -102,6 +107,7 @@ const (
 	PlayRemoveEntities   = 0x4d
 	PlaySetEntityData    = 0x63
 	PlaySetEquipment     = 0x66
+	PlayTakeItemEntity   = 0x7c
 )
 
 // Play, serverbound (protocol 775).
@@ -109,6 +115,7 @@ const (
 	PlayAcceptTeleport    = 0x00
 	PlayChatCommand       = 0x07
 	PlayChatCommandSigned = 0x08
+	PlayClientCommand     = 0x0c
 	PlayKeepAliveServer   = 0x1c
 	PlayClientTickEnd     = 0x0d
 	PlayClientInformation = 0x0e

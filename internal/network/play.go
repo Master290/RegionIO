@@ -245,7 +245,15 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
 		return errors.New("player position outside world bounds")
 	}
+	var prev server.PlayerSnapshot
+	if h.session != nil {
+		prev = h.session.Snapshot()
+	}
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
+	if h.session != nil {
+		h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
+		h.srv.TryPickupItems(h.session)
+	}
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 	if h.streamer != nil {
@@ -452,6 +460,11 @@ func (h *handler) syncVisibleEntities() error {
 			entity := current.entity
 			if err := h.sendAddEntity(&entity); err != nil {
 				return err
+			}
+			if entity.IsItem() {
+				if err := h.conn.Send(protocol.PlaySetEntityData, server.EncodeItemEntityData(entity.ID, entity.Item)); err != nil {
+					return err
+				}
 			}
 		} else if known != current {
 			entity := current.entity
@@ -675,6 +688,9 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case protocol.PlayPlayerAction:
 		return h.handlePlayerAction(pkt)
 
+	case protocol.PlayClientCommand:
+		return h.handleClientCommand(pkt)
+
 	case protocol.PlayChatMessage:
 		return h.handleChat(pkt)
 
@@ -706,6 +722,23 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	}
 }
 
+func (h *handler) handleClientCommand(pkt protocol.Packet) error {
+	action, err := pkt.Body().VarInt()
+	if err != nil {
+		return err
+	}
+	if action == server.ClientCommandPerformRespawn && h.srv != nil && h.session != nil {
+		if err := h.srv.RespawnPlayer(h.session); err != nil {
+			return err
+		}
+		if h.conn != nil {
+			snap := h.session.Snapshot()
+			return h.sendSetHealth(snap.Health, snap.FoodLevel, snap.FoodSaturation)
+		}
+	}
+	return nil
+}
+
 // handleChat reads a chat message (only the leading text field is needed) and
 // echoes it to the player as a system message prefixed with their name. Once a
 // player registry exists this will broadcast to everyone.
@@ -728,9 +761,8 @@ func (h *handler) broadcastSystemChat(text string) error {
 }
 
 // handlePlayerAction processes digging. In creative the client sends
-// START_DESTROY_BLOCK (status 0) for an instant break; survival also sends
-// STOP/FINISH (status 2). Either way we clear the block, push a block_update,
-// and acknowledge the sequence so the client keeps its predicted change.
+// START_DESTROY_BLOCK (status 0) for an instant break; survival sends
+// STOP_DESTROY_BLOCK (status 2) when digging finishes and spawns an item drop.
 func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	r := pkt.Body()
 	status, err := r.VarInt()
@@ -749,10 +781,8 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 		return err
 	}
 
-	const startDig, finishDig = 0, 2
-	if status == startDig || status == finishDig {
-		if valid, lightChunks := h.srv.Chunks().SetBlockWithLight(x, y, z, world.StateAir); valid {
-			h.broadcastBlockUpdate(x, y, z, world.StateAir, lightChunks)
+	if h.srv != nil {
+		if broken, _ := h.srv.BreakBlock(h.session, x, y, z, status); broken {
 			h.log.Debug("block broken", "x", x, "y", y, "z", z)
 		}
 	}
@@ -845,12 +875,23 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		return err
 	}
 
-	if face >= 0 && int(face) < len(faceOffsets) {
+	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {
 		if state, ok := h.heldBlock(); ok {
 			off := faceOffsets[face]
 			px, py, pz := x+off[0], y+off[1], z+off[2]
 			if valid, lightChunks := h.srv.Chunks().SetBlockWithLight(px, py, pz, state); valid {
 				h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
+				if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSurvival {
+					if slot, updated, consumed := h.srv.ConsumeHeldItem(h.session, 1); consumed {
+						if hotbarIdx := slot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
+							if updated.IsEmpty() {
+								h.hotbar[hotbarIdx] = -1
+							} else {
+								h.hotbar[hotbarIdx] = updated.ResolvedItemID()
+							}
+						}
+					}
+				}
 				h.log.Debug("block placed", "x", px, "y", py, "z", pz, "state", state)
 			}
 		}

@@ -3,10 +3,14 @@ package world
 import (
 	"crypto/rand"
 	"math"
+	"strings"
 	"sync"
 )
 
-// Entity represents an in-game movable entity (mob, animal, etc).
+// ItemEntityTypeName is the canonical entity_type identifier for dropped items.
+const ItemEntityTypeName = "minecraft:item"
+
+// Entity represents an in-game movable entity (mob, animal, dropped item, etc).
 type Entity struct {
 	ID       int32
 	UUID     [16]byte
@@ -20,6 +24,82 @@ type Entity struct {
 	VelocityY  int16
 	VelocityZ  int16
 	OnGround   bool
+
+	// Item entity fields (populated when TypeName == ItemEntityTypeName).
+	Item        ItemStack
+	PickupDelay int
+	Age         int
+}
+
+// NewItemEntity constructs a dropped item entity carrying stack at (x, y, z).
+func NewItemEntity(x, y, z float64, stack ItemStack, typeID int) *Entity {
+	return &Entity{
+		TypeID:   typeID,
+		TypeName: ItemEntityTypeName,
+		X:        x,
+		Y:        y,
+		Z:        z,
+		OnGround: true,
+		Item:     stack,
+	}
+}
+
+// IsItem reports whether e is a dropped item entity.
+func (e *Entity) IsItem() bool {
+	return e != nil && (e.TypeName == ItemEntityTypeName || !e.Item.IsEmpty())
+}
+
+// BlockDropItem returns the ItemStack dropped when breaking state in survival
+// mode, and false if the block does not drop a collectible item.
+func BlockDropItem(state uint16) (ItemStack, bool) {
+	if state == StateAir || state == StateWater || state == StateBedrock {
+		return ItemStack{}, false
+	}
+	st, ok := stateByID(state)
+	if !ok || st.Name == "" {
+		return ItemStack{}, false
+	}
+	dropName := st.Name
+	switch st.Name {
+	case "minecraft:air", "minecraft:cave_air", "minecraft:void_air",
+		"minecraft:water", "minecraft:lava", "minecraft:bedrock", "minecraft:fire":
+		return ItemStack{}, false
+	case "minecraft:grass_block", "minecraft:dirt_path", "minecraft:farmland":
+		dropName = "minecraft:dirt"
+	case "minecraft:stone":
+		if _, hasCobble := ItemNameToID("minecraft:cobblestone"); hasCobble {
+			dropName = "minecraft:cobblestone"
+		}
+	}
+	stack := NewNamedItemStack(dropName, 1)
+	if stack.IsEmpty() || stack.ResolvedItemID() <= 0 {
+		return ItemStack{}, false
+	}
+	return stack, true
+}
+
+// IsInstantBreakBlock reports whether state has zero hardness in survival mode
+// (e.g. tall grass, flowers, saplings, torches), breaking immediately on
+// START_DESTROY_BLOCK (status 0).
+func IsInstantBreakBlock(state uint16) bool {
+	st, ok := stateByID(state)
+	if !ok || st.Name == "" {
+		return false
+	}
+	for _, suffix := range []string{"_sapling", "_flower", "_tulip", "_mushroom", "_torch"} {
+		if strings.HasSuffix(st.Name, suffix) {
+			return true
+		}
+	}
+	switch st.Name {
+	case "minecraft:short_grass", "minecraft:tall_grass", "minecraft:fern",
+		"minecraft:large_fern", "minecraft:dead_bush", "minecraft:dandelion",
+		"minecraft:poppy", "minecraft:allium", "minecraft:azure_bluet",
+		"minecraft:oxeye_daisy", "minecraft:cornflower",
+		"minecraft:lily_of_the_valley", "minecraft:sunflower", "minecraft:sugar_cane":
+		return true
+	}
+	return false
 }
 
 // ChunkPos returns the chunk coordinates containing the entity's X/Z position.

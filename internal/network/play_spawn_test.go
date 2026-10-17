@@ -270,3 +270,114 @@ func TestPlayerDataSavedOnSaveAllAndStop(t *testing.T) {
 	}
 }
 
+func TestPlaySurvivalDigPickupFallDeathAndRespawn(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := server.NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	rec := &recordingConn{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := NewConn(rec)
+	profile := server.Profile{Name: "Surv", UUID: server.OfflineUUID("Surv")}
+	session, err := srv.RegisterPlayer(profile, conn.Send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	defer srv.UnregisterPlayer(session)
+	srv.SetPlayerTransform(session, 8.5, float64(world.FlatSurfaceY+1), 8.5, 0, 0, true)
+	srv.SetPlayerSpawnPoint(session, 8, int32(world.FlatSurfaceY+1), 8, 0, 0, false)
+	if err := srv.SetPlayerGameMode(session, server.GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+	h := &handler{
+		conn:    conn,
+		srv:     srv,
+		session: session,
+		log:     slog.Default(),
+		ctx:     ctx,
+	}
+	h.conn.Profile = profile
+	_ = rec.take(t)
+
+	// 1. Dig block at (8, FlatSurfaceY, 8) with STOP_DESTROY_BLOCK (status 2).
+	digW := protocol.NewWriter(16)
+	digW.VarInt(server.PlayerActionStopDestroyBlock)
+	digW.Position(8, world.FlatSurfaceY, 8)
+	digW.Byte(1) // UP face
+	digW.VarInt(7)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayPlayerAction, Data: digW.Bytes()}); err != nil {
+		t.Fatalf("PlayPlayerAction: %v", err)
+	}
+	if srv.Entities().Count() != 1 {
+		t.Fatalf("entity count after survival break = %d, want 1", srv.Entities().Count())
+	}
+
+	// 2. Move near the dropped item at (8.5, FlatSurfaceY+0.25, 8.5) to pick it up.
+	moveW := protocol.NewWriter(32)
+	moveW.Float64(8.5).Float64(float64(world.FlatSurfaceY) + 0.5).Float64(8.5)
+	moveW.Byte(1) // onGround
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayMovePos, Data: moveW.Bytes()}); err != nil {
+		t.Fatalf("PlayMovePos pickup: %v", err)
+	}
+	if srv.Entities().Count() != 0 {
+		t.Fatalf("entity count after pickup = %d, want 0", srv.Entities().Count())
+	}
+	if got := h.session.InventorySlot(world.HotbarContainerOffset); got.Count != 1 || got.ResolvedID() != "minecraft:dirt" {
+		t.Fatalf("hotbar slot 0 after pickup = %+v, want 1x minecraft:dirt", got)
+	}
+
+	// 3. Place the picked-up dirt block back via PlayUseItemOn and verify the stack is consumed.
+	useW := protocol.NewWriter(32)
+	useW.VarInt(0) // main hand
+	useW.Position(8, world.FlatSurfaceY-1, 8)
+	useW.VarInt(1) // UP face -> places at (8, FlatSurfaceY, 8)
+	useW.Float32(0.5).Float32(1.0).Float32(0.5)
+	useW.Bool(false).Bool(false)
+	useW.VarInt(8)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayUseItemOn, Data: useW.Bytes()}); err != nil {
+		t.Fatalf("PlayUseItemOn: %v", err)
+	}
+	if got := srv.Chunks().GetBlock(8, world.FlatSurfaceY, 8); got != world.StateDirt {
+		t.Fatalf("placed block = %d, want StateDirt (%d)", got, world.StateDirt)
+	}
+	if got := h.session.InventorySlot(world.HotbarContainerOffset); !got.IsEmpty() {
+		t.Fatalf("hotbar slot 0 after placement = %+v, want empty", got)
+	}
+
+	// 4. Fall 30 blocks to trigger fatal fall damage.
+	_ = rec.take(t)
+	upW := protocol.NewWriter(32).Float64(8.5).Float64(95.0).Float64(8.5).Byte(0)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayMovePos, Data: upW.Bytes()}); err != nil {
+		t.Fatalf("PlayMovePos up: %v", err)
+	}
+	downW := protocol.NewWriter(32).Float64(8.5).Float64(65.0).Float64(8.5).Byte(1)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayMovePos, Data: downW.Bytes()}); err != nil {
+		t.Fatalf("PlayMovePos down: %v", err)
+	}
+	if !h.session.IsDead() {
+		t.Fatal("expected player to be dead after 30-block fall")
+	}
+	fallPkts := rec.take(t)
+	if countPackets(fallPkts, protocol.PlayPlayerCombatKill) != 1 {
+		t.Fatalf("PlayPlayerCombatKill count = %d, want 1", countPackets(fallPkts, protocol.PlayPlayerCombatKill))
+	}
+
+	// 5. Send PlayClientCommand (action 0 = PERFORM_RESPAWN) and verify respawn.
+	respawnW := protocol.NewWriter(4).VarInt(server.ClientCommandPerformRespawn)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayClientCommand, Data: respawnW.Bytes()}); err != nil {
+		t.Fatalf("PlayClientCommand respawn: %v", err)
+	}
+	if h.session.IsDead() || h.session.Health() != world.DefaultPlayerHealth {
+		t.Fatalf("player state after respawn: dead=%v health=%v", h.session.IsDead(), h.session.Health())
+	}
+	respawnPkts := rec.take(t)
+	if countPackets(respawnPkts, protocol.PlayRespawn) != 1 {
+		t.Fatalf("PlayRespawn count = %d, want 1", countPackets(respawnPkts, protocol.PlayRespawn))
+	}
+}
+
+
