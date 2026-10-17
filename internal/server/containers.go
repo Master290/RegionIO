@@ -11,8 +11,11 @@ import (
 
 // MenuType registry IDs in BuiltInRegistries.MENU (protocol 775 / 26.1.2).
 const (
-	MenuTypeGeneric9x3 int32 = 2  // Single chest (27 chest slots + 36 player slots)
-	MenuTypeCrafting   int32 = 12 // Crafting table (1 result + 9 grid + 36 player slots)
+	MenuTypeGeneric9x3   int32 = 2  // Single chest (27 chest slots + 36 player slots)
+	MenuTypeBlastFurnace int32 = 10 // Blast furnace (3 furnace slots + 36 player slots)
+	MenuTypeCrafting     int32 = 12 // Crafting table (1 result + 9 grid + 36 player slots)
+	MenuTypeFurnace      int32 = 14 // Furnace (3 furnace slots + 36 player slots)
+	MenuTypeSmoker       int32 = 22 // Smoker (3 furnace slots + 36 player slots)
 )
 
 // ContainerInput click mode IDs in ServerboundContainerClickPacket (protocol 775).
@@ -32,6 +35,8 @@ const (
 	ChestMenuSlotCount    = 63 // 27 chest + 27 main inventory + 9 hotbar
 	CraftingGridSlotCount = 9
 	CraftingMenuSlotCount = 46 // 1 result + 9 grid + 27 main inventory + 9 hotbar
+	FurnaceSlotCount      = world.FurnaceSlotCount
+	FurnaceMenuSlotCount  = 39 // 3 furnace + 27 main inventory + 9 hotbar
 )
 
 // ContainerClick holds the decoded fields of a serverbound container_click packet.
@@ -249,6 +254,15 @@ func EncodeContainerSlot(containerID, stateID int32, slot int, stack world.ItemS
 	return w.Bytes()
 }
 
+// EncodeContainerSetData encodes a clientbound container_set_data (0x13) packet body.
+func EncodeContainerSetData(containerID int32, propID, value int16) []byte {
+	w := protocol.NewWriter(8)
+	w.VarInt(containerID)
+	w.Uint16(uint16(propID))
+	w.Uint16(uint16(value))
+	return w.Bytes()
+}
+
 func writeContainerItemStack(w *protocol.Writer, stack world.ItemStack) {
 	itemID := stack.ResolvedItemID()
 	if stack.IsEmpty() || itemID <= 0 {
@@ -351,7 +365,8 @@ func skipHashedStack(r *protocol.Reader) error {
 }
 
 // InteractBlock checks whether the block at (x, y, z) is an interactive
-// container (chest or crafting table) and opens its UI for session.
+// container (chest, crafting table, or furnace/blast_furnace/smoker) and opens
+// its UI for session.
 func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool, containerID int32, err error) {
 	if s == nil || s.chunks == nil || session == nil || session.IsDead() {
 		return false, 0, nil
@@ -363,6 +378,9 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return err == nil, cid, err
 	case IsCraftingTableBlock(state):
 		cid, err := s.OpenCraftingTable(session, x, y, z)
+		return err == nil, cid, err
+	case IsFurnaceBlock(state):
+		cid, err := s.OpenFurnace(session, x, y, z)
 		return err == nil, cid, err
 	default:
 		return false, 0, nil
@@ -582,6 +600,12 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		s.applyCraftingTableClickLocked(session, tr, slot, button, mode)
 		tr.mu.Unlock()
 		return s.syncOpenContainer(session)
+	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
+		menuType := tr.open.MenuType
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		s.applyFurnaceClickLocked(session, tr, menuType, bx, by, bz, slot, button, mode)
+		tr.mu.Unlock()
+		return s.syncFurnaceViewers(session, bx, by, bz)
 	default:
 		tr.mu.Unlock()
 		return nil
@@ -958,16 +982,26 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		return s.syncPlayerInventoryContainer(session)
 	}
 	var slots []world.ItemStack
+	isFurnace := false
 	switch openCopy.MenuType {
 	case MenuTypeGeneric9x3:
 		slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	case MenuTypeCrafting:
 		slots = s.buildCraftingMenuSlots(session, openCopy.Crafting, openCopy.Result)
+	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
+		slots = s.buildFurnaceMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+		isFurnace = true
 	default:
 		return nil
 	}
 	stateID := session.NextContainerStateID()
-	return session.send(protocol.PlayContainerSetContent, EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried))
+	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried)); err != nil {
+		return err
+	}
+	if isFurnace {
+		return s.sendFurnaceDataProperties(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+	}
+	return nil
 }
 
 func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
