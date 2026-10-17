@@ -438,7 +438,7 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:hay_block", AdvancementFrameTask, AdvancementBgHusbandry,
 		false, false, false, 0, 0, cHusbRoot, rHusbRoot, 0)
 
-	cSeed, rSeed := anyOfCriteria("wheat", "pumpkin_stem", "melon_stem", "beetroots", "nether_wart")
+	cSeed, rSeed := anyOfCriteria("wheat", "pumpkin_stem", "melon_stem", "beetroots", "nether_wart", "carrots", "potatoes", "cocoa", "sweet_berry_bush", "torchflower", "pitcher_crop")
 	add("minecraft:husbandry/plant_seed", "minecraft:husbandry/root", "A Seedy Place", "Plant a seed and watch it grow",
 		"minecraft:wheat", AdvancementFrameTask, "",
 		true, true, false, 1, 0, cSeed, rSeed, 0)
@@ -457,6 +457,11 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 	add("minecraft:husbandry/obtain_netherite_hoe", "minecraft:husbandry/plant_seed", "Serious Dedication", "Use a Netherite Ingot to upgrade a Hoe, and then reevaluate your life choices",
 		"minecraft:netherite_hoe", AdvancementFrameChallenge, "",
 		true, true, false, 2, 1, cNetheriteHoe, rNetheriteHoe, 100)
+
+	cFishy, rFishy := anyOfCriteria("cod", "salmon", "tropical_fish", "pufferfish")
+	add("minecraft:husbandry/fishy_business", "minecraft:husbandry/root", "Fishy Business", "Catch a fish",
+		"minecraft:fishing_rod", AdvancementFrameTask, "",
+		true, true, false, 1, 2, cFishy, rFishy, 0)
 
 	// --- Nether tab (minecraft:nether/*) ---
 	cNetherRoot, rNetherRoot := allOfCriteria("entered_nether")
@@ -1119,6 +1124,18 @@ func (s *Server) TriggerPlantedSeed(session *PlayerSession, blockOrSeedName stri
 		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "beetroots")
 	case "nether_wart":
 		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "nether_wart")
+	case "carrot", "carrots":
+		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "carrots")
+	case "potato", "potatoes":
+		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "potatoes")
+	case "cocoa_beans", "cocoa":
+		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "cocoa")
+	case "sweet_berries", "sweet_berry_bush":
+		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "sweet_berry_bush")
+	case "torchflower_seeds", "torchflower_crop", "torchflower":
+		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "torchflower")
+	case "pitcher_pod", "pitcher_crop", "pitcher_plant":
+		s.GrantCriterion(session, "minecraft:husbandry/plant_seed", "pitcher_crop")
 	}
 }
 

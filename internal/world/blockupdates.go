@@ -396,6 +396,11 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 	// sugar cane, bamboo, kelp, torches, carpets, wall attachments, hanging vines).
 	c.runNeighborSupportPass(x, y, z, res)
 
+	// Recompute nearby leaf distances when a log or leaf block changes.
+	if isLogOrStemBlock(oldState) || isLogOrStemBlock(newState) || isLeafBlock(oldState) || isLeafBlock(newState) {
+		c.updateLeafDistancesAround(x, y, z, res)
+	}
+
 	// Schedule falling ticks and fluid ticks at (x, y, z) and its 6 neighbors.
 	c.scheduleAround(x, y, z)
 
@@ -697,6 +702,38 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		below := c.GetBlock(x, y-1, z)
 		if !canPlantSurviveOn(name, below) {
 			return replacement, false
+		}
+		// Attached melon/pumpkin stem reverts to mature stem[age=7] when its fruit is broken.
+		if name == "minecraft:attached_melon_stem" || name == "minecraft:attached_pumpkin_stem" {
+			dx, dz := facingOffset(props["facing"])
+			fruit := c.GetBlock(x+dx, y, z+dz)
+			if name == "minecraft:attached_melon_stem" && !isBlockNamed(fruit, "minecraft:melon") {
+				if stem, ok := nameToStateID("minecraft:melon_stem", map[string]string{"age": "7"}); ok {
+					return stem, true
+				}
+			}
+			if name == "minecraft:attached_pumpkin_stem" && !isBlockNamed(fruit, "minecraft:pumpkin") && !isBlockNamed(fruit, "minecraft:carved_pumpkin") {
+				if stem, ok := nameToStateID("minecraft:pumpkin_stem", map[string]string{"age": "7"}); ok {
+					return stem, true
+				}
+			}
+		}
+		return state, true
+	}
+
+	// 7b. Cocoa pods require an adjacent jungle log/wood on their facing side.
+	if name == "minecraft:cocoa" {
+		if !c.canCocoaSurviveAt(x, y, z, props["facing"]) {
+			return StateAir, false
+		}
+		return state, true
+	}
+
+	// 7c. Farmland turns back to dirt when a solid / motion-blocking block is placed directly on top of it.
+	if name == "minecraft:farmland" && y+1 < MinY+WorldHeight {
+		above := c.GetBlock(x, y+1, z)
+		if isFullOpaqueTurfCover(above) {
+			return StateDirt, true
 		}
 		return state, true
 	}
@@ -1550,7 +1587,7 @@ func isPlantRequiringSoil(name string) bool {
 		"minecraft:cornflower", "minecraft:lily_of_the_valley", "minecraft:wither_rose",
 		"minecraft:torchflower", "minecraft:pink_petals", "minecraft:wildflowers",
 		"minecraft:bush", "minecraft:short_dry_grass", "minecraft:tall_dry_grass",
-		"minecraft:cactus_flower", "minecraft:sweet_berry_bush",
+		"minecraft:cactus_flower", "minecraft:sweet_berry_bush", "minecraft:nether_wart",
 		"minecraft:brown_mushroom", "minecraft:red_mushroom",
 		"minecraft:crimson_fungus", "minecraft:warped_fungus",
 		"minecraft:crimson_roots", "minecraft:warped_roots", "minecraft:nether_sprouts",
@@ -1574,6 +1611,8 @@ func canPlantSurviveOn(plantName string, below uint16) bool {
 		return false
 	}
 	switch plantName {
+	case "minecraft:nether_wart":
+		return bInfo.Name == "minecraft:soul_sand"
 	case "minecraft:lily_pad":
 		return below == StateWater || bInfo.Name == "minecraft:water" ||
 			bInfo.Name == "minecraft:ice" || bInfo.Name == "minecraft:frosted_ice"

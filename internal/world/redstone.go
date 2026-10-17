@@ -13,11 +13,13 @@ const (
 	WoodButtonTickDelay   = 30 // Wooden / bamboo / nether button pulse duration (30 ticks)
 	PressurePlateTickDelay = 20 // Minimum pressed hold / re-check interval for pressure plates (20 ticks)
 	RedstoneTorchTickDelay = 2  // Redstone torch inversion delay (2 ticks = 1 redstone tick)
-	MaxPistonPushBlocks   = 12 // Maximum number of blocks a piston can push in a line
+	ComparatorTickDelay    = 2  // Redstone comparator evaluation delay (2 ticks = 1 redstone tick)
+	MaxPistonPushBlocks    = 12 // Maximum number of blocks a piston can push in a line
 )
 
 var (
-	pressurePlateCounters sync.Map // map[*Cache]func(x, y, z int) int
+	pressurePlateCounters     sync.Map // map[*Cache]func(x, y, z int) int
+	comparatorSignalProviders sync.Map // map[*Cache]func(x, y, z int) int
 )
 
 // SetPressurePlateEntityCounter registers an optional callback used when a
@@ -36,6 +38,27 @@ func (c *Cache) countEntitiesOnPlate(x, y, z int) int {
 	if v, ok := pressurePlateCounters.Load(c); ok && v != nil {
 		if fn, ok := v.(func(int, int, int) int); ok && fn != nil {
 			return fn(x, y, z)
+		}
+	}
+	return 0
+}
+
+// SetComparatorSignalProvider registers an optional callback that returns the
+// analog comparator signal (0..15) for a block or attached entity (such as an
+// item frame returning 0..8 via ItemFrameComparatorSignalAt, a lectern, or a
+// container) at (x, y, z).
+func (c *Cache) SetComparatorSignalProvider(fn func(x, y, z int) int) {
+	if fn == nil {
+		comparatorSignalProviders.Delete(c)
+		return
+	}
+	comparatorSignalProviders.Store(c, fn)
+}
+
+func (c *Cache) customComparatorSignalAt(x, y, z int) int {
+	if v, ok := comparatorSignalProviders.Load(c); ok && v != nil {
+		if fn, ok := v.(func(int, int, int) int); ok && fn != nil {
+			return clampPower(fn(x, y, z))
 		}
 	}
 	return 0
@@ -266,6 +289,8 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 			return MaxRedstonePower
 		}
 		return 0
+	case "minecraft:comparator":
+		return c.ComparatorOutputSignalAt(x, y, z)
 	case "minecraft:light_weighted_pressure_plate", "minecraft:heavy_weighted_pressure_plate":
 		p, _ := strconv.Atoi(info.Properties["power"])
 		return clampPower(p)
@@ -441,6 +466,13 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 		outDX, outDZ := RepeaterOutputOffset(props["facing"])
 		if tx == sx+outDX && ty == sy && tz == sz+outDZ {
 			return MaxRedstonePower
+		}
+		return 0
+
+	case "minecraft:comparator":
+		outDX, outDZ := RepeaterOutputOffset(props["facing"])
+		if tx == sx+outDX && ty == sy && tz == sz+outDZ {
+			return c.ComparatorOutputSignalAt(sx, sy, sz)
 		}
 		return 0
 
@@ -699,6 +731,218 @@ func (c *Cache) CycleRepeaterDelay(x, y, z int) (bool, BlockUpdateResult) {
 	return false, res
 }
 
+// ToggleComparatorMode switches a minecraft:comparator at (x, y, z) between
+// "compare" and "subtract" mode and re-evaluates its output signal.
+func (c *Cache) ToggleComparatorMode(x, y, z int) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:comparator" {
+		return false, res
+	}
+	nextMode := "subtract"
+	if info.Properties["mode"] == "subtract" {
+		nextMode = "compare"
+	}
+	nextState, ok := withStateProperty(state, "mode", nextMode)
+	if !ok {
+		return false, res
+	}
+	if !c.setBlockRecorded(x, y, z, nextState, &res) {
+		return false, res
+	}
+	c.propagateRedstoneAround(x, y, z, state, nextState, &res)
+	return true, res
+}
+
+// UpdateComparatorAt re-evaluates the minecraft:comparator at (x, y, z) and
+// propagates its analog output signal (0..15) to connected redstone dust and
+// mechanisms.
+func (c *Cache) UpdateComparatorAt(x, y, z int) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:comparator" {
+		return false, res
+	}
+	out := c.computeComparatorOutput(x, y, z, info)
+	wantPowered := "false"
+	if out > 0 {
+		wantPowered = "true"
+	}
+	curState := state
+	if info.Properties["powered"] != wantPowered {
+		if nextState, ok := withStateProperty(state, "powered", wantPowered); ok {
+			if c.setBlockRecorded(x, y, z, nextState, &res) {
+				curState = nextState
+			}
+		}
+	}
+	c.propagateRedstoneAround(x, y, z, state, curState, &res)
+	return len(res.Changes) > 0, res
+}
+
+// UpdateComparatorsAround re-evaluates any minecraft:comparator within 2 blocks
+// horizontally of (x, y, z) (matching both direct rear adjacency and reading
+// through a solid conductive block) and propagates any changed output signals.
+func (c *Cache) UpdateComparatorsAround(x, y, z int) BlockUpdateResult {
+	var res BlockUpdateResult
+	if y < MinY || y >= MinY+WorldHeight {
+		return res
+	}
+	st := c.GetBlock(x, y, z)
+	c.propagateRedstoneAround(x, y, z, st, st, &res)
+	return res
+}
+
+// ComparatorOutputSignalAt returns the active analog redstone signal (0..15)
+// emitted by a minecraft:comparator at (x, y, z).
+func (c *Cache) ComparatorOutputSignalAt(x, y, z int) int {
+	if y < MinY || y >= MinY+WorldHeight {
+		return 0
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:comparator" {
+		return 0
+	}
+	out := c.computeComparatorOutput(x, y, z, info)
+	if out > 0 {
+		return out
+	}
+	return 0
+}
+
+func (c *Cache) computeComparatorOutput(x, y, z int, info stateName) int {
+	facing := info.Properties["facing"]
+	rear := c.comparatorRearSignal(x, y, z, facing)
+	if rear <= 0 {
+		return 0
+	}
+	side := c.comparatorSideSignal(x, y, z, facing)
+	if info.Properties["mode"] == "subtract" {
+		return clampPower(rear - side)
+	}
+	if rear >= side {
+		return clampPower(rear)
+	}
+	return 0
+}
+
+func (c *Cache) comparatorRearSignal(x, y, z int, facing string) int {
+	inDX, inDZ := RepeaterInputOffset(facing)
+	ix, iy, iz := x+inDX, y, z+inDZ
+	if iy < MinY || iy >= MinY+WorldHeight {
+		return 0
+	}
+	sig := c.repeaterInputSignal(x, y, z, facing)
+	if analog := c.analogSignalAt(ix, iy, iz); analog > sig {
+		sig = analog
+	}
+	inState := c.GetBlock(ix, iy, iz)
+	if sig < MaxRedstonePower && isConductiveSolidBlock(inState) {
+		ix2, iz2 := x+2*inDX, z+2*inDZ
+		if analogFar := c.analogSignalAt(ix2, iy, iz2); analogFar > sig {
+			sig = analogFar
+		}
+	}
+	return clampPower(sig)
+}
+
+func (c *Cache) comparatorSideSignal(x, y, z int, facing string) int {
+	best := 0
+	for _, d := range cardinalDirs {
+		// Check only the two sides perpendicular to the comparator's facing axis.
+		if d.name == facing || d.opposite == facing {
+			continue
+		}
+		sx, sz := x+d.dx, z+d.dz
+		sState := c.GetBlock(sx, y, sz)
+		sInfo, ok := stateByID(sState)
+		if !ok {
+			continue
+		}
+		var sig int
+		switch sInfo.Name {
+		case "minecraft:redstone_wire":
+			p, _ := strconv.Atoi(sInfo.Properties["power"])
+			sig = clampPower(p)
+		case "minecraft:redstone_block":
+			sig = MaxRedstonePower
+		case "minecraft:repeater":
+			if sInfo.Properties["powered"] == "true" {
+				outDX, outDZ := RepeaterOutputOffset(sInfo.Properties["facing"])
+				if sx+outDX == x && sz+outDZ == z {
+					sig = MaxRedstonePower
+				}
+			}
+		case "minecraft:comparator":
+			outDX, outDZ := RepeaterOutputOffset(sInfo.Properties["facing"])
+			if sx+outDX == x && sz+outDZ == z {
+				sig = c.ComparatorOutputSignalAt(sx, y, sz)
+			}
+		}
+		if sig > best {
+			best = sig
+		}
+	}
+	return best
+}
+
+func (c *Cache) analogSignalAt(x, y, z int) int {
+	if y < MinY || y >= MinY+WorldHeight {
+		return 0
+	}
+	sig := c.customComparatorSignalAt(x, y, z)
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok {
+		return sig
+	}
+	var blockSig int
+	switch info.Name {
+	case "minecraft:composter":
+		lvl, _ := strconv.Atoi(info.Properties["level"])
+		blockSig = clampPower(lvl)
+	case "minecraft:water_cauldron", "minecraft:powder_snow_cauldron":
+		lvl, _ := strconv.Atoi(info.Properties["level"])
+		blockSig = clampPower(lvl)
+	case "minecraft:lava_cauldron":
+		blockSig = 3
+	case "minecraft:cake":
+		bites, _ := strconv.Atoi(info.Properties["bites"])
+		if bites >= 0 && bites < 7 {
+			blockSig = (7 - bites) * 2
+		}
+	case "minecraft:end_portal_frame":
+		if info.Properties["eye"] == "true" {
+			blockSig = MaxRedstonePower
+		}
+	case "minecraft:respawn_anchor":
+		charges, _ := strconv.Atoi(info.Properties["charges"])
+		switch charges {
+		case 1:
+			blockSig = 3
+		case 2:
+			blockSig = 7
+		case 3:
+			blockSig = 11
+		case 4:
+			blockSig = MaxRedstonePower
+		}
+	}
+	if blockSig > sig {
+		sig = blockSig
+	}
+	return clampPower(sig)
+}
+
 // ToggleDoor toggles the open state of a non-iron door at (x, y, z) (updating
 // both upper and lower halves).
 func (c *Cache) ToggleDoor(x, y, z int) (bool, BlockUpdateResult) {
@@ -748,7 +992,7 @@ func (c *Cache) ToggleTrapdoor(x, y, z int) (bool, BlockUpdateResult) {
 }
 
 // InteractRedstoneBlock handles a player right-click on a lever, button,
-// repeater, non-iron door, or non-iron trapdoor at (x, y, z).
+// repeater, comparator, non-iron door, or non-iron trapdoor at (x, y, z).
 func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 	if y < MinY || y >= MinY+WorldHeight {
 		return false, BlockUpdateResult{}
@@ -765,6 +1009,8 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 		return c.PressButton(x, y, z)
 	case info.Name == "minecraft:repeater":
 		return c.CycleRepeaterDelay(x, y, z)
+	case info.Name == "minecraft:comparator":
+		return c.ToggleComparatorMode(x, y, z)
 	case strings.HasSuffix(info.Name, "_trapdoor"):
 		return c.ToggleTrapdoor(x, y, z)
 	case strings.HasSuffix(info.Name, "_door"):
@@ -776,7 +1022,7 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 
 // stepRedstoneUpdate executes a scheduled UpdateRedstone tick at (x, y, z) for
 // buttons (timed release), pressure plates (entity re-check / release),
-// repeaters (delayed turn-on / turn-off), and redstone torches (delayed inversion).
+// repeaters (delayed turn-on / turn-off), comparators, and redstone torches (delayed inversion).
 func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 	if y < MinY || y >= MinY+WorldHeight {
 		return
@@ -859,6 +1105,22 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 			}
 		}
 
+	case name == "minecraft:comparator":
+		out := c.computeComparatorOutput(x, y, z, info)
+		wantPowered := "false"
+		if out > 0 {
+			wantPowered = "true"
+		}
+		curState := state
+		if props["powered"] != wantPowered {
+			if s2, ok := withStateProperty(curState, "powered", wantPowered); ok {
+				if c.setBlockRecorded(x, y, z, s2, res) {
+					curState = s2
+				}
+			}
+		}
+		c.propagateRedstoneAround(x, y, z, state, curState, res)
+
 	case name == "minecraft:redstone_torch" || name == "minecraft:redstone_wall_torch":
 		if c.evaluateRedstoneTorchAt(x, y, z, state, info, res) {
 			newState := c.GetBlock(x, y, z)
@@ -868,11 +1130,12 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 }
 
 // propagateRedstoneAround recalculates redstone dust connection shapes and
-// power levels (0..15 with decay), evaluates redstone torch inversions,
-// schedules repeater delays, and updates doors, trapdoors, lamps, and pistons
-// affected by a change at (x, y, z).
+// power levels (0..15 with decay), evaluates redstone torch inversions and
+// comparators, schedules repeater delays, and updates doors, trapdoors, lamps,
+// and pistons affected by a change at (x, y, z).
 func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
 	toggledTorches := make(map[BlockPos]bool)
+	evaluatedComparators := make(map[BlockPos]int)
 	seeds := []BlockPos{{X: x, Y: y, Z: z}}
 	if sup, ok := redstoneSupportOf(x, y, z, oldState); ok {
 		seeds = append(seeds, sup)
@@ -925,6 +1188,31 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 			case info.Name == "minecraft:repeater":
 				c.evaluateRepeaterOnNeighbor(pos.X, pos.Y, pos.Z, st, info, res)
 
+			case info.Name == "minecraft:comparator":
+				out := c.computeComparatorOutput(pos.X, pos.Y, pos.Z, info)
+				wantPowered := "false"
+				if out > 0 {
+					wantPowered = "true"
+				}
+				stateChanged := false
+				if info.Properties["powered"] != wantPowered {
+					if evaluatedComparators[pos] >= 2 {
+						c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, ComparatorTickDelay)
+						continue
+					}
+					if nextSt, ok := withStateProperty(st, "powered", wantPowered); ok {
+						if c.setBlockRecorded(pos.X, pos.Y, pos.Z, nextSt, res) {
+							stateChanged = true
+						}
+					}
+				}
+				if stateChanged || evaluatedComparators[pos] == 0 {
+					evaluatedComparators[pos]++
+					outDX, outDZ := RepeaterOutputOffset(info.Properties["facing"])
+					nextSeeds = append(nextSeeds, pos)
+					nextSeeds = append(nextSeeds, BlockPos{X: pos.X + outDX, Y: pos.Y, Z: pos.Z + outDZ})
+				}
+
 			case strings.HasSuffix(info.Name, "_door") && !strings.HasSuffix(info.Name, "_trapdoor"):
 				c.evaluateDoorRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
@@ -963,7 +1251,7 @@ func redstoneSupportOf(x, y, z int, state uint16) (BlockPos, bool) {
 	if strings.HasSuffix(info.Name, "_pressure_plate") {
 		return BlockPos{X: x, Y: y - 1, Z: z}, true
 	}
-	if info.Name == "minecraft:repeater" {
+	if info.Name == "minecraft:repeater" || info.Name == "minecraft:comparator" {
 		dx, dz := RepeaterOutputOffset(info.Properties["facing"])
 		return BlockPos{X: x + dx, Y: y, Z: z + dz}, true
 	}
@@ -1624,3 +1912,10 @@ func canPistonPushBlock(state uint16) bool {
 	}
 	return true
 }
+
+// BlockStateIDByProperties resolves a block name and property map to its
+// block state ID.
+func BlockStateIDByProperties(name string, props map[string]string) (uint16, bool) {
+	return nameToStateID(name, props)
+}
+

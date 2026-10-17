@@ -460,3 +460,63 @@ func TestPistonsAndStickyPistonsPushLimitAndRetract(t *testing.T) {
 		t.Fatalf("piston with 13 blocks in front should not extend, got %s", strconv.Quote(pInfo.Properties["extended"]))
 	}
 }
+
+func TestComparatorItemFrameSignalAndSubtractMode(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 1
+
+	// Simulate an item frame attached to a stone wall block at (90, y, 90)
+	// with rotation 0..7 producing signal 1..8 (or 0 when empty).
+	frameSignal := 0
+	c.SetComparatorSignalProvider(func(x, by, z int) int {
+		if x == 90 && by == y && z == 90 {
+			return frameSignal
+		}
+		return 0
+	})
+	defer c.SetComparatorSignalProvider(nil)
+
+	c.ApplyBlockWithUpdates(90, y, 90, StateStone)
+	comp := mustRedstoneState(t, "minecraft:comparator", map[string]string{
+		"facing":  "north", // rear input at (90, y, 90), front output at (90, y, 92)
+		"mode":    "compare",
+		"powered": "false",
+	})
+	wire0 := mustRedstoneState(t, "minecraft:redstone_wire", map[string]string{
+		"north": "none", "south": "none", "east": "none", "west": "none", "power": "0",
+	})
+	c.ApplyBlockWithUpdates(90, y, 91, comp)
+	c.ApplyBlockWithUpdates(90, y, 92, wire0)
+
+	if got := c.RedstonePowerAt(90, y, 92); got != 0 {
+		t.Fatalf("empty item frame wire power = %d, want 0", got)
+	}
+
+	// Test rotations 0..7 -> signals 1..8.
+	for rot := 0; rot < 8; rot++ {
+		frameSignal = rot + 1
+		c.UpdateComparatorsAround(90, y, 90)
+		if got := c.ComparatorOutputSignalAt(90, y, 91); got != rot+1 {
+			t.Fatalf("rotation %d: ComparatorOutputSignalAt = %d, want %d", rot, got, rot+1)
+		}
+		if got := c.RedstonePowerAt(90, y, 92); got != rot+1 {
+			t.Fatalf("rotation %d: wire power in front of comparator = %d, want %d", rot, got, rot+1)
+		}
+	}
+
+	// Place side redstone wire at (91, y, 91) powered by a weighted plate (power=3) at (92, y, 91)
+	// and switch comparator to subtract mode.
+	plate3 := mustRedstoneState(t, "minecraft:light_weighted_pressure_plate", map[string]string{
+		"power": "3",
+	})
+	c.ApplyBlockWithUpdates(92, y, 91, plate3)
+	c.ApplyBlockWithUpdates(91, y, 91, wire0)
+	c.InteractRedstoneBlock(90, y, 91) // compare -> subtract
+	if got := c.ComparatorOutputSignalAt(90, y, 91); got != 5 {
+		t.Fatalf("subtract mode (8 - 3) comparator output = %d, want 5", got)
+	}
+	if got := c.RedstonePowerAt(90, y, 92); got != 5 {
+		t.Fatalf("subtract mode (8 - 3) wire power = %d, want 5", got)
+	}
+}
+
