@@ -43,7 +43,7 @@ chunk (1,0), where the capture carries the portal's obsidian/gold/crying
 obsidian; mineshaft starts land at (-4,1), (-3,10), (4,-1), consistent with
 the deep oak-plank cells crossing chunks (0,0)/(1,0).
 
-`concentric_rings` (strongholds: `count=128, distance=32, spread=3`) is wired via `ConcentricRings.RingPositions` in `worldgen/structures.go` (`TestStructurePlacementGrid`).
+`concentric_rings` (strongholds: `count=128, distance=32, spread=3`) is wired via `ConcentricRings.RingPositions` in `worldgen/structures.go` (`TestStructurePlacementGrid`, `TestStrongholdBiomeSnappedPlacement`, `TestStructureSetsMetadataAndExclusionZone`, `TestFindStructureSetStartKnownVanillaFixtures`).
 
 ## Ruined portal (ported, see world/ruined_portal.go)
 

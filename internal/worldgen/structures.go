@@ -48,36 +48,50 @@ type ConcentricRings struct {
 	PreferredBiomes string `json:"preferred_biomes"`
 }
 
+// ExclusionZone mirrors StructurePlacement.ExclusionZone (e.g. pillager_outposts
+// forbidding placement within ChunkCount chunks of a start chunk in OtherSet).
+type ExclusionZone struct {
+	OtherSet   string        `json:"other_set"`
+	ChunkCount int           `json:"chunk_count"`
+	other      *StructureSet `json:"-"`
+}
+
 // Placement is the tagged union of structure placement types.
 type Placement struct {
 	Type            string           `json:"type"`
 	RandomSpread    *RandomSpread    `json:"-"`
 	Concentric      bool             `json:"-"`
 	ConcentricRings *ConcentricRings `json:"-"`
+	ExclusionZone   *ExclusionZone   `json:"-"`
 }
 
 type rawPlacement struct {
-	Type            string  `json:"type"`
-	Salt            int     `json:"salt"`
-	Separation      int     `json:"separation"`
-	Spacing         int     `json:"spacing"`
-	SpreadType      string  `json:"spread_type"`
-	Frequency       float32 `json:"frequency"`
-	FreqMethod      string  `json:"frequency_reduction_method"`
-	LocateOffset    []int   `json:"locate_offset"`
-	Distance        int     `json:"distance"`
-	Spread          int     `json:"spread"`
-	Count           int     `json:"count"`
-	PreferredBiomes string  `json:"preferred_biomes"`
+	Type            string         `json:"type"`
+	Salt            int            `json:"salt"`
+	Separation      int            `json:"separation"`
+	Spacing         int            `json:"spacing"`
+	SpreadType      string         `json:"spread_type"`
+	Frequency       float32        `json:"frequency"`
+	FreqMethod      string         `json:"frequency_reduction_method"`
+	LocateOffset    []int          `json:"locate_offset"`
+	Distance        int            `json:"distance"`
+	Spread          int            `json:"spread"`
+	Count           int            `json:"count"`
+	PreferredBiomes string         `json:"preferred_biomes"`
+	ExclusionZone   *ExclusionZone `json:"exclusion_zone"`
 }
 
 func (p *rawPlacement) decode() (*Placement, error) {
 	switch p.Type {
 	case "minecraft:random_spread":
-		out := &Placement{Type: p.Type, RandomSpread: &RandomSpread{
-			Salt: p.Salt, Separation: p.Separation, Spacing: p.Spacing,
-			SpreadType: p.SpreadType, Frequency: p.Frequency, FreqMethod: p.FreqMethod,
-		}}
+		out := &Placement{
+			Type: p.Type,
+			RandomSpread: &RandomSpread{
+				Salt: p.Salt, Separation: p.Separation, Spacing: p.Spacing,
+				SpreadType: p.SpreadType, Frequency: p.Frequency, FreqMethod: p.FreqMethod,
+			},
+			ExclusionZone: p.ExclusionZone,
+		}
 		if len(p.LocateOffset) == 3 {
 			out.RandomSpread.LocateOffX, out.RandomSpread.LocateOffZ = p.LocateOffset[0], p.LocateOffset[2]
 		}
@@ -101,6 +115,7 @@ func (p *rawPlacement) decode() (*Placement, error) {
 				Count:           p.Count,
 				PreferredBiomes: p.PreferredBiomes,
 			},
+			ExclusionZone: p.ExclusionZone,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported structure placement %q", p.Type)
@@ -122,33 +137,114 @@ type RuinedPortalSetup struct {
 
 // StructureDef is one entry of data/minecraft/worldgen/structure.
 type StructureDef struct {
-	Name   string              `json:"-"`
-	Type   string              `json:"type"`
-	Biomes string              `json:"biomes"`
-	Step   string              `json:"step"`
+	Name              string              `json:"-"`
+	Type              string              `json:"type"`
+	Biomes            string              `json:"biomes"`
+	Step              string              `json:"step"`
+	TerrainAdaptation string              `json:"terrain_adaptation"`
 	// BiomeTemp is the ocean-ruin variant discriminator: "cold" | "warm".
-	BiomeTemp string              `json:"biome_temp"`
+	BiomeTemp          string              `json:"biome_temp"`
+	LargeProbability   float32             `json:"large_probability"`
+	ClusterProbability float32             `json:"cluster_probability"`
 	// MineshaftType is the mineshaft variant discriminator: "normal" | "mesa".
-	MineshaftType string          `json:"mineshaft_type"`
-	Setups []RuinedPortalSetup `json:"-"`
+	MineshaftType string              `json:"mineshaft_type"`
+	IsBeached     bool                `json:"is_beached"`
+	Setups        []RuinedPortalSetup `json:"-"`
+
+	// Jigsaw structure fields.
+	StartPool             string          `json:"start_pool"`
+	StartJigsawName       string          `json:"start_jigsaw_name"`
+	Size                  int             `json:"size"`
+	MaxDistanceFromCenter int             `json:"max_distance_from_center"`
+	ProjectStartToHeightmap string        `json:"project_start_to_heightmap"`
+	UseExpansionHack      bool            `json:"use_expansion_hack"`
+	StartHeight           json.RawMessage `json:"start_height"`
+	DimensionPadding      int             `json:"dimension_padding"`
+	LiquidSettings        string          `json:"liquid_settings"`
+	PoolAliases           json.RawMessage `json:"pool_aliases"`
+}
+
+// SampleStartHeight evaluates the structure's start_height HeightProvider
+// (either {"absolute": N} or {"type": "minecraft:uniform", "min_inclusive": {"absolute": A}, "max_inclusive": {"absolute": B}}).
+func (d *StructureDef) SampleStartHeight(random RandomSource) int {
+	if len(d.StartHeight) == 0 {
+		return 0
+	}
+	var doc struct {
+		Type         string `json:"type"`
+		Absolute     *int   `json:"absolute"`
+		MinInclusive struct {
+			Absolute int `json:"absolute"`
+		} `json:"min_inclusive"`
+		MaxInclusive struct {
+			Absolute int `json:"absolute"`
+		} `json:"max_inclusive"`
+	}
+	if err := json.Unmarshal(d.StartHeight, &doc); err != nil {
+		return 0
+	}
+	if doc.Absolute != nil {
+		return *doc.Absolute
+	}
+	if doc.Type == "minecraft:uniform" || doc.Type == "uniform" {
+		minY := doc.MinInclusive.Absolute
+		maxY := doc.MaxInclusive.Absolute
+		if minY > maxY {
+			return minY
+		}
+		return minY + int(random.NextIntN(int32(maxY-minY+1)))
+	}
+	return 0
 }
 
 func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 	var doc struct {
-		Type          string             `json:"type"`
-		Biomes        string             `json:"biomes"`
-		Step          string             `json:"step"`
-		BiomeTemp     string             `json:"biome_temp"`
-		MineshaftType string             `json:"mineshaft_type"`
-		Setups        []RuinedPortalSetup `json:"setups"`
+		Type                    string              `json:"type"`
+		Biomes                  string              `json:"biomes"`
+		Step                    string              `json:"step"`
+		TerrainAdaptation       string              `json:"terrain_adaptation"`
+		BiomeTemp               string              `json:"biome_temp"`
+		LargeProbability        float32             `json:"large_probability"`
+		ClusterProbability      float32             `json:"cluster_probability"`
+		MineshaftType           string              `json:"mineshaft_type"`
+		IsBeached               bool                `json:"is_beached"`
+		Setups                  []RuinedPortalSetup `json:"setups"`
+		StartPool               string              `json:"start_pool"`
+		StartJigsawName         string              `json:"start_jigsaw_name"`
+		Size                    int                 `json:"size"`
+		MaxDistanceFromCenter   int                 `json:"max_distance_from_center"`
+		ProjectStartToHeightmap string              `json:"project_start_to_heightmap"`
+		UseExpansionHack        bool                `json:"use_expansion_hack"`
+		StartHeight             json.RawMessage     `json:"start_height"`
+		DimensionPadding        int                 `json:"dimension_padding"`
+		LiquidSettings          string              `json:"liquid_settings"`
+		PoolAliases             json.RawMessage     `json:"pool_aliases"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
 	}
 	return &StructureDef{
-		Name: name, Type: doc.Type, Biomes: strings.TrimPrefix(doc.Biomes, "minecraft:"),
-		Step: doc.Step, Setups: doc.Setups, BiomeTemp: doc.BiomeTemp,
-		MineshaftType: doc.MineshaftType,
+		Name:                    name,
+		Type:                    doc.Type,
+		Biomes:                  strings.TrimPrefix(doc.Biomes, "minecraft:"),
+		Step:                    doc.Step,
+		TerrainAdaptation:       doc.TerrainAdaptation,
+		Setups:                  doc.Setups,
+		BiomeTemp:               doc.BiomeTemp,
+		LargeProbability:        doc.LargeProbability,
+		ClusterProbability:      doc.ClusterProbability,
+		MineshaftType:           doc.MineshaftType,
+		IsBeached:               doc.IsBeached,
+		StartPool:               doc.StartPool,
+		StartJigsawName:         doc.StartJigsawName,
+		Size:                    doc.Size,
+		MaxDistanceFromCenter:   doc.MaxDistanceFromCenter,
+		ProjectStartToHeightmap: doc.ProjectStartToHeightmap,
+		UseExpansionHack:        doc.UseExpansionHack,
+		StartHeight:             doc.StartHeight,
+		DimensionPadding:        doc.DimensionPadding,
+		LiquidSettings:          doc.LiquidSettings,
+		PoolAliases:             doc.PoolAliases,
 	}, nil
 }
 
@@ -161,11 +257,11 @@ type StructureSet struct {
 
 // StructureSets is the parsed, immutable structure datapack.
 type StructureSets struct {
-	Sets       map[string]*StructureSet            // set name -> set
-	Structures map[string]*StructureDef            // structure name -> def
-	BiomeTags  map[string][]string                 // biome tag name -> member names, flattened
-	setOrder   []string                            // deterministic iteration order
-	structuresBySet map[string][]*StructureDef    // expanded weighted entries per set
+	Sets            map[string]*StructureSet       // set name -> set
+	Structures      map[string]*StructureDef       // structure name -> def
+	BiomeTags       map[string][]string            // biome tag name -> member names, flattened
+	setOrder        []string                       // deterministic iteration order
+	structuresBySet map[string][]*StructureDef     // expanded weighted entries per set
 }
 
 var (
@@ -286,6 +382,13 @@ func loadStructureSets() (*StructureSets, error) {
 		}
 		out.structuresBySet[name] = expanded
 	}
+	for _, set := range out.Sets {
+		if set.Placement != nil && set.Placement.ExclusionZone != nil {
+			ez := set.Placement.ExclusionZone
+			otherName := "minecraft:" + strings.TrimPrefix(ez.OtherSet, "minecraft:")
+			ez.other = out.Sets[otherName]
+		}
+	}
 	return out, nil
 }
 
@@ -386,34 +489,14 @@ func (c *ConcentricRings) RingPositions(seed int64, biomeAtQuart func(qx, qy, qz
 	d := random.NextDouble() * math.Pi * 2.0
 	i := 0
 	j := 0
-	positions := make([][2]int32, 0, count)
+	positions := make([][2]int32, count)
+	forkedRNGs := make([]RandomSource, count)
 	for k := 0; k < count; k++ {
 		e := float64(4*distance+distance*j*6) + (random.NextDouble()-0.5)*(float64(distance)*2.5)
 		l := int32(math.Floor(math.Cos(d)*e + 0.5))
 		m := int32(math.Floor(math.Sin(d)*e + 0.5))
-		forked := random.Fork()
-		pos := [2]int32{l, m}
-		if biomeAtQuart != nil && len(allowedBiomes) > 0 {
-			centerQX := (int(l)*16 + 8) >> 2
-			centerQZ := (int(m)*16 + 8) >> 2
-			const radiusQ = 112 >> 2 // 28
-			n := 0
-			hasBest := false
-			for dz := -radiusQ; dz <= radiusQ; dz++ {
-				for dx := -radiusQ; dx <= radiusQ; dx++ {
-					qx := centerQX + dx
-					qz := centerQZ + dz
-					if allowedBiomes[biomeAtQuart(qx, 0, qz)] {
-						if !hasBest || forked.NextIntN(int32(n+1)) == 0 {
-							pos = [2]int32{int32(qx >> 2), int32(qz >> 2)}
-							hasBest = true
-						}
-						n++
-					}
-				}
-			}
-		}
-		positions = append(positions, pos)
+		forkedRNGs[k] = random.Fork()
+		positions[k] = [2]int32{l, m}
 		d += (math.Pi * 2.0) / float64(spread)
 		i++
 		if i == spread {
@@ -426,30 +509,159 @@ func (c *ConcentricRings) RingPositions(seed int64, biomeAtQuart func(qx, qy, qz
 			d += random.NextDouble() * math.Pi * 2.0
 		}
 	}
+	if biomeAtQuart != nil && len(allowedBiomes) > 0 {
+		var wg sync.WaitGroup
+		for k := 0; k < count; k++ {
+			wg.Add(1)
+			go func(k int) {
+				defer wg.Done()
+				l, m := positions[k][0], positions[k][1]
+				forked := forkedRNGs[k]
+				pos := [2]int32{l, m}
+				centerQX := (int(l)*16 + 8) >> 2
+				centerQZ := (int(m)*16 + 8) >> 2
+				const radiusQ = 112 >> 2 // 28
+				n := 0
+				hasBest := false
+				for dz := -radiusQ; dz <= radiusQ; dz++ {
+					for dx := -radiusQ; dx <= radiusQ; dx++ {
+						qx := centerQX + dx
+						qz := centerQZ + dz
+						if allowedBiomes[biomeAtQuart(qx, 0, qz)] {
+							if !hasBest || forked.NextIntN(int32(n+1)) == 0 {
+								pos = [2]int32{int32(qx >> 2), int32(qz >> 2)}
+								hasBest = true
+							}
+							n++
+						}
+					}
+				}
+				positions[k] = pos
+			}(k)
+		}
+		wg.Wait()
+	}
 	return positions
+}
+
+// isPlacementForbidden ports StructurePlacement.ExclusionZone.isPlacementForbidden
+// and ChunkGeneratorStructureState.hasStructureChunkInRange: returns true if
+// any chunk within ChunkCount of (chunkX, chunkZ) is a structure start chunk of
+// the referenced OtherSet.
+func (ez *ExclusionZone) isPlacementForbidden(seed int64, chunkX, chunkZ int32) bool {
+	if ez == nil || ez.other == nil || ez.ChunkCount <= 0 {
+		return false
+	}
+	r := int32(ez.ChunkCount)
+	minCX, maxCX := chunkX-r, chunkX+r
+	minCZ, maxCZ := chunkZ-r, chunkZ+r
+	if spread := ez.other.Placement.RandomSpread; spread != nil && spread.Spacing > 0 {
+		sp := int32(spread.Spacing)
+		minRX := floorDiv32(minCX, sp)
+		maxRX := floorDiv32(maxCX, sp)
+		minRZ := floorDiv32(minCZ, sp)
+		maxRZ := floorDiv32(maxCZ, sp)
+		for rx := minRX; rx <= maxRX; rx++ {
+			for rz := minRZ; rz <= maxRZ; rz++ {
+				picked := spread.potentialStructureChunk(seed, rx*sp, rz*sp)
+				if picked[0] >= minCX && picked[0] <= maxCX && picked[1] >= minCZ && picked[1] <= maxCZ {
+					if ez.other.IsStartChunk(seed, picked[0], picked[1]) {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	for x := minCX; x <= maxCX; x++ {
+		for z := minCZ; z <= maxCZ; z++ {
+			if ez.other.IsStartChunk(seed, x, z) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // IsStartChunk reports whether any structure of this set starts in the given
 // chunk: the random-spread grid picks the chunk, the legacy frequency roll
-// keeps or discards it, and concentric_rings checks the generated ring anchors.
+// keeps or discards it, concentric_rings checks the generated ring anchors,
+// and any exclusion_zone restriction is enforced.
 func (s *StructureSet) IsStartChunk(seed int64, chunkX, chunkZ int32) bool {
 	if s.Placement.Concentric {
 		if s.Placement.ConcentricRings == nil {
 			return false
 		}
+		found := false
 		for _, pos := range s.Placement.ConcentricRings.RingPositions(seed, nil, nil) {
 			if pos[0] == chunkX && pos[1] == chunkZ {
-				return true
+				found = true
+				break
 			}
 		}
-		return false
+		if !found {
+			return false
+		}
+		if s.Placement.ExclusionZone != nil && s.Placement.ExclusionZone.isPlacementForbidden(seed, chunkX, chunkZ) {
+			return false
+		}
+		return true
 	}
 	spread := s.Placement.RandomSpread
 	picked := spread.potentialStructureChunk(seed, chunkX, chunkZ)
 	if picked[0] != chunkX || picked[1] != chunkZ {
 		return false
 	}
-	return spread.frequencyAllows(seed, chunkX, chunkZ)
+	if !spread.frequencyAllows(seed, chunkX, chunkZ) {
+		return false
+	}
+	if s.Placement.ExclusionZone != nil && s.Placement.ExclusionZone.isPlacementForbidden(seed, chunkX, chunkZ) {
+		return false
+	}
+	return true
+}
+
+// StrongholdRingPositions computes the 128 stronghold chunk positions for seed,
+// snapping each ring anchor to #minecraft:stronghold_biased_to when
+// biomeAtQuart is non-nil.
+func (s *StructureSets) StrongholdRingPositions(seed int64, biomeAtQuart func(qx, qy, qz int) string) [][2]int32 {
+	set := s.Sets["minecraft:strongholds"]
+	if set == nil || set.Placement == nil || set.Placement.ConcentricRings == nil {
+		return nil
+	}
+	var allowed map[string]bool
+	if biomeAtQuart != nil {
+		tag := strings.TrimPrefix(set.Placement.ConcentricRings.PreferredBiomes, "#")
+		tag = "minecraft:" + strings.TrimPrefix(tag, "minecraft:")
+		members := s.BiomeTags[tag]
+		allowed = make(map[string]bool, len(members))
+		for _, m := range members {
+			allowed[m] = true
+		}
+	}
+	return set.Placement.ConcentricRings.RingPositions(seed, biomeAtQuart, allowed)
+}
+
+// IsStartChunkWithBiomes reports whether setName's placement selects (chunkX, chunkZ),
+// using biome-snapped ring positions for concentric_rings sets when biomeAtQuart is provided.
+func (s *StructureSets) IsStartChunkWithBiomes(setName string, seed int64, chunkX, chunkZ int32, biomeAtQuart func(qx, qy, qz int) string) bool {
+	name := "minecraft:" + strings.TrimPrefix(setName, "minecraft:")
+	set := s.Sets[name]
+	if set == nil || set.Placement == nil {
+		return false
+	}
+	if set.Placement.Concentric {
+		for _, pos := range s.StrongholdRingPositions(seed, biomeAtQuart) {
+			if pos[0] == chunkX && pos[1] == chunkZ {
+				if set.Placement.ExclusionZone != nil && set.Placement.ExclusionZone.isPlacementForbidden(seed, chunkX, chunkZ) {
+					return false
+				}
+				return true
+			}
+		}
+		return false
+	}
+	return set.IsStartChunk(seed, chunkX, chunkZ)
 }
 
 func floorDiv32(a, b int32) int32 {
