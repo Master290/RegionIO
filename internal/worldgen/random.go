@@ -196,6 +196,26 @@ func (f *xoroshiroPositional) At(x, y, z int) RandomSource {
 	return newXoroshiroFrom(uint64(positionSeed(x, y, z))^f.seedLo, f.seedHi)
 }
 
+func (f *xoroshiroPositional) atValue(x, y, z int) Xoroshiro {
+	lo, hi := uint64(positionSeed(x, y, z))^f.seedLo, f.seedHi
+	if lo == 0 && hi == 0 {
+		lo, hi = goldenRatio64, silverRatio64
+	}
+	return Xoroshiro{lo: lo, hi: hi}
+}
+
+func nextFloatAt(f PositionalRandomFactory, x, y, z int) float32 {
+	if xp, ok := f.(*xoroshiroPositional); ok {
+		r := xp.atValue(x, y, z)
+		return r.NextFloat()
+	}
+	if lp, ok := f.(*legacyPositional); ok {
+		r := lp.atValue(x, y, z)
+		return r.NextFloat()
+	}
+	return f.At(x, y, z).NextFloat()
+}
+
 // --- Legacy LCG (java.util.Random) ---
 
 const (
@@ -343,6 +363,11 @@ func (f *legacyPositional) FromHashOf(name string) RandomSource {
 // At mirrors LegacyPositionalRandomFactory.at.
 func (f *legacyPositional) At(x, y, z int) RandomSource {
 	return NewLegacy(positionSeed(x, y, z) ^ int64(f.seed))
+}
+
+func (f *legacyPositional) atValue(x, y, z int) Legacy {
+	seed := positionSeed(x, y, z) ^ int64(f.seed)
+	return Legacy{seed: (uint64(seed) ^ lcgMultiplier) & lcgMask}
 }
 
 // WorldgenRandom is the adapter used by ChunkGenerator.applyBiomeDecoration in

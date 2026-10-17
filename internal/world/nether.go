@@ -158,10 +158,15 @@ func generateNetherChunk(od *worldgen.OverworldDensity, carver *worldgen.Carver,
 	return c
 }
 
+var netherColumnsPool = sync.Pool{
+	New: func() any {
+		return new([16][16][WorldHeight]uint16)
+	},
+}
+
 // generateNetherBaseTerrain builds the noise, surface, and carved base terrain
 // for Nether chunk (cx, cz).
 func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
-	c := NewDimensionChunk(cx, cz, BiomeNetherWastes, NetherDimensionType)
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
 	grids := make([]netherCornerGrid, len(od.Interpolated))
@@ -185,25 +190,31 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 	wg.Wait()
 
 	netherBiomes := worldgen.NetherBiomeTable()
-	var s2D [16][16]worldgen.Sample2D
 	var biomeName [16][16]string
-	for lx := 0; lx < 16; lx++ {
-		wg.Add(1)
-		go func(lx int) {
-			defer wg.Done()
-			for lz := 0; lz < 16; lz++ {
-				s2D[lx][lz] = worldgen.SampleColumn2D(od, od.SeaLevel, baseX+lx, baseZ+lz)
-				biomeName[lx][lz] = netherBiomes.FindBiome(
-					worldgen.NewTargetPoint(s2D[lx][lz].Temperature, s2D[lx][lz].Humidity,
-						s2D[lx][lz].Continentalness, s2D[lx][lz].Erosion, s2D[lx][lz].Weirdness, 0))
+	for bx := 0; bx < biomeCellsXZ; bx++ {
+		lx0 := bx * biomeCellSize
+		for bz := 0; bz < biomeCellsXZ; bz++ {
+			lz0 := bz * biomeCellSize
+			s2D := worldgen.SampleColumn2D(od, od.SeaLevel, baseX+lx0, baseZ+lz0)
+			name := netherBiomes.FindBiome(
+				worldgen.NewTargetPoint(s2D.Temperature, s2D.Humidity,
+					s2D.Continentalness, s2D.Erosion, s2D.Weirdness, 0))
+			for dx := 0; dx < biomeCellSize; dx++ {
+				for dz := 0; dz < biomeCellSize; dz++ {
+					biomeName[lx0+dx][lz0+dz] = name
+				}
 			}
-		}(lx)
+		}
 	}
-	wg.Wait()
+
+	firstBiomeID := biomeID(biomeName[0][0])
+	c := NewDimensionChunk(cx, cz, firstBiomeID, NetherDimensionType)
 
 	surfaceRule, ruleErr := od.SurfaceRule()
 
-	var columns [16][16][WorldHeight]uint16
+	columns := netherColumnsPool.Get().(*[16][16][WorldHeight]uint16)
+	defer netherColumnsPool.Put(columns)
+
 	var surfTop [16][16]int
 	var worldSurface [16][16]int
 
@@ -242,7 +253,7 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 		carveCtx := surfaceRule.NewContext()
 		carveCtx.BiomeFunc = zoomed.at
 		view := &netherCarveView{
-			cols: &columns, od: od, rules: surfaceRule,
+			cols: columns, od: od, rules: surfaceRule,
 			sctx: carveCtx, biomes: &biomeName,
 			worldSurface: &worldSurface, baseX: baseX, baseZ: baseZ,
 		}
@@ -263,11 +274,8 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 	}
 	fillNetherBiomes3D(c, biomeName)
 	return baseTerrain{
-		c:            c,
-		columns:      &columns,
-		worldSurface: &worldSurface,
-		surfTop:      &surfTop,
-		biomeName:    &biomeName,
+		c:         c,
+		biomeName: &biomeName,
 	}
 }
 
@@ -424,6 +432,9 @@ func fillNetherBiomes3D(c *Chunk, biomeName [16][16]string) {
 		for bz := 0; bz < biomeCellsXZ; bz++ {
 			lz := bz * biomeCellSize
 			bID := biomeID(biomeName[lx][lz])
+			if bID == c.biome {
+				continue
+			}
 			for wy := 0; wy < NetherDimensionType.Height; wy += biomeCellSize {
 				c.SetBiome(lx, wy, lz, bID)
 			}

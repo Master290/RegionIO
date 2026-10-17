@@ -2,6 +2,7 @@ package world
 
 import (
 	"math"
+	"sync"
 
 	"regionio/internal/worldgen"
 )
@@ -15,13 +16,47 @@ type resolvedOreTarget struct {
 
 type oreSphere struct{ x, y, z, radius float64 }
 
+type oreTargetCacheKey struct {
+	set        *worldgen.FeatureSet
+	size       int
+	firstState string
+	targetLen  int
+}
+
+var (
+	oreTargetCacheMu sync.RWMutex
+	oreTargetCache   = make(map[oreTargetCacheKey][]resolvedOreTarget)
+)
+
+func chunkOceanFloorMap(c *Chunk) [16][16]int {
+	var floor [16][16]int
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	minY := c.minY()
+	maxY := minY + c.worldHeight() - 1
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			found := minY
+			for y := maxY; y >= minY; y-- {
+				if stateFlags(c.getBlock(lx, y, lz))&flagBlocksMotion != 0 {
+					found = y + 1
+					break
+				}
+			}
+			floor[lx][lz] = found
+		}
+	}
+	return floor
+}
+
 func placeVanillaOres(c *Chunk, seed int64, cx, cz int32, biomes *[16][16]string) {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		panic("world: loading feature datapack: " + err.Error())
 	}
+	floor := chunkOceanFloorMap(c)
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(cx), int(cz))
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, 32)
 	for bx := 0; bx < 16; bx += 4 {
 		for bz := 0; bz < 16; bz += 4 {
 			biome := set.Biomes[biomes[bx][bz]]
@@ -59,7 +94,7 @@ func placeVanillaOres(c *Chunk, seed int64, cx, cz int32, biomes *[16][16]string
 					x := int(cx)*16 + int(random.NextIntN(16))
 					z := int(cz)*16 + int(random.NextIntN(16))
 					y := plan.SampleY(random, MinY, WorldHeight)
-					placeOreEllipsoid(c, random, x, y, z, config.Size, config.DiscardAirExposure, targets)
+					placeOreEllipsoidWithFloor(c, random, x, y, z, config.Size, config.DiscardAirExposure, targets, &floor)
 				}
 			}
 		}
@@ -67,6 +102,22 @@ func placeVanillaOres(c *Chunk, seed int64, cx, cz int32, biomes *[16][16]string
 }
 
 func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfig) ([]resolvedOreTarget, bool) {
+	if len(config.Targets) == 0 {
+		return nil, false
+	}
+	key := oreTargetCacheKey{
+		set:        set,
+		size:       config.Size,
+		firstState: config.Targets[0].State.Name,
+		targetLen:  len(config.Targets),
+	}
+	oreTargetCacheMu.RLock()
+	if cached, ok := oreTargetCache[key]; ok {
+		oreTargetCacheMu.RUnlock()
+		return cached, len(cached) > 0
+	}
+	oreTargetCacheMu.RUnlock()
+
 	targets := make([]resolvedOreTarget, 0, len(config.Targets))
 	for _, target := range config.Targets {
 		state, ok := nameToStateID(target.State.Name, nil)
@@ -79,6 +130,9 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 		}
 		targets = append(targets, resolvedOreTarget{state: state, replaceables: replaceables})
 	}
+	oreTargetCacheMu.Lock()
+	oreTargetCache[key] = targets
+	oreTargetCacheMu.Unlock()
 	return targets, true
 }
 
@@ -103,11 +157,18 @@ func flattenBlockTag(set *worldgen.FeatureSet, tag string, visiting map[string]b
 }
 
 func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget) {
+	placeOreEllipsoidWithFloor(c, random, originX, originY, originZ, size, discard, targets, nil)
+}
+
+func placeOreEllipsoidWithFloor(c *Chunk, random worldgen.RandomSource, originX, originY, originZ, size int, discard float64, targets []resolvedOreTarget, floor *[16][16]int) {
 	setup := drawOreVeinSetup(random, originX, originY, originZ, size)
 	if !oreVeinPassesHeightGate(originX, originY, originZ, size, func(x, z int) (int, bool) {
 		lx, lz := x-int(c.X)*16, z-int(c.Z)*16
 		if lx < 0 || lx >= 16 || lz < 0 || lz >= 16 {
 			return 0, false
+		}
+		if floor != nil {
+			return floor[lx][lz], true
 		}
 		for y := MinY + WorldHeight - 1; y >= MinY; y-- {
 			if stateFlags(c.GetBlock(lx, y, lz))&flagBlocksMotion != 0 {
@@ -118,7 +179,8 @@ func placeOreEllipsoid(c *Chunk, random worldgen.RandomSource, originX, originY,
 	}) {
 		return
 	}
-	spheres := buildOreSpheresFrom(random, setup)
+	var sphereBuf [64]oreSphere
+	spheres := buildOreSpheresInto(random, setup, sphereBuf[:0])
 	walkOreBlocks(spheres, func(x, y, z int) {
 		localX := x - int(c.X)*16
 		if localX < 0 || localX >= 16 {
@@ -201,12 +263,21 @@ func buildOreSpheres(random worldgen.RandomSource, originX, originY, originZ, si
 }
 
 func buildOreSpheresFrom(random worldgen.RandomSource, setup oreVeinSetup) []oreSphere {
+	return buildOreSpheresInto(random, setup, make([]oreSphere, 0, setup.size))
+}
+
+func buildOreSpheresInto(random worldgen.RandomSource, setup oreVeinSetup, dst []oreSphere) []oreSphere {
 	size := setup.size
 	x0, x1 := setup.x0, setup.x1
 	z0, z1 := setup.z0, setup.z1
 	y0, y1 := setup.y0, setup.y1
 
-	spheres := make([]oreSphere, size)
+	var spheres []oreSphere
+	if cap(dst) >= size {
+		spheres = dst[:size]
+	} else {
+		spheres = make([]oreSphere, size)
+	}
 	for i := 0; i < size; i++ {
 		t := float32(i) / float32(size)
 		randomScale := random.NextDouble() * float64(size) / 16.0
@@ -243,6 +314,85 @@ func buildOreSpheresFrom(random worldgen.RandomSource, setup oreVeinSetup) []ore
 }
 
 func walkOreBlocks(spheres []oreSphere, visit func(x, y, z int)) {
+	const maxBitsetWords = 256
+	boxMinX, boxMaxX := math.MaxInt, math.MinInt
+	boxMinY, boxMaxY := math.MaxInt, math.MinInt
+	boxMinZ, boxMaxZ := math.MaxInt, math.MinInt
+	hasValid := false
+	for _, sphere := range spheres {
+		if sphere.radius < 0 {
+			continue
+		}
+		hasValid = true
+		minX, maxX := int(math.Floor(sphere.x-sphere.radius)), int(math.Floor(sphere.x+sphere.radius))
+		minY, maxY := int(math.Floor(sphere.y-sphere.radius)), int(math.Floor(sphere.y+sphere.radius))
+		minZ, maxZ := int(math.Floor(sphere.z-sphere.radius)), int(math.Floor(sphere.z+sphere.radius))
+		if minX < boxMinX {
+			boxMinX = minX
+		}
+		if maxX > boxMaxX {
+			boxMaxX = maxX
+		}
+		if minY < boxMinY {
+			boxMinY = minY
+		}
+		if maxY > boxMaxY {
+			boxMaxY = maxY
+		}
+		if minZ < boxMinZ {
+			boxMinZ = minZ
+		}
+		if maxZ > boxMaxZ {
+			boxMaxZ = maxZ
+		}
+	}
+	if !hasValid {
+		return
+	}
+	spanX := boxMaxX - boxMinX + 1
+	spanY := boxMaxY - boxMinY + 1
+	spanZ := boxMaxZ - boxMinZ + 1
+	totalCells := spanX * spanY * spanZ
+	if totalCells > 0 && totalCells <= maxBitsetWords*64 {
+		var visitedBits [maxBitsetWords]uint64
+		for _, sphere := range spheres {
+			if sphere.radius < 0 {
+				continue
+			}
+			minX, maxX := int(math.Floor(sphere.x-sphere.radius)), int(math.Floor(sphere.x+sphere.radius))
+			minY, maxY := int(math.Floor(sphere.y-sphere.radius)), int(math.Floor(sphere.y+sphere.radius))
+			minZ, maxZ := int(math.Floor(sphere.z-sphere.radius)), int(math.Floor(sphere.z+sphere.radius))
+			for x := minX; x <= maxX; x++ {
+				dx := (float64(x) + 0.5 - sphere.x) / sphere.radius
+				if dx*dx >= 1 {
+					continue
+				}
+				xBase := (x - boxMinX) * spanY
+				for y := minY; y <= maxY; y++ {
+					dy := (float64(y) + 0.5 - sphere.y) / sphere.radius
+					if dx*dx+dy*dy >= 1 {
+						continue
+					}
+					xyBase := (xBase + (y - boxMinY)) * spanZ
+					for z := minZ; z <= maxZ; z++ {
+						dz := (float64(z) + 0.5 - sphere.z) / sphere.radius
+						if dx*dx+dy*dy+dz*dz >= 1 {
+							continue
+						}
+						idx := xyBase + (z - boxMinZ)
+						word, mask := idx>>6, uint64(1)<<(uint(idx)&63)
+						if visitedBits[word]&mask != 0 {
+							continue
+						}
+						visitedBits[word] |= mask
+						visit(x, y, z)
+					}
+				}
+			}
+		}
+		return
+	}
+
 	visited := make(map[[3]int]bool)
 	for _, sphere := range spheres {
 		if sphere.radius < 0 {

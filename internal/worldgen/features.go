@@ -28,7 +28,26 @@ type FeatureSet struct {
 	Biomes     map[string]BiomeGeneration
 	BlockTags  map[string][]string
 
-	inlineMu sync.Mutex
+	inlineMu   sync.Mutex
+	cacheMu    sync.RWMutex
+	stepsCache map[string][][]string
+	cfgCache   map[[2]string]any
+}
+
+func (s *FeatureSet) getCachedConfig(kind, name string) (any, bool) {
+	s.cacheMu.RLock()
+	v, ok := s.cfgCache[[2]string{kind, name}]
+	s.cacheMu.RUnlock()
+	return v, ok
+}
+
+func (s *FeatureSet) setCachedConfig(kind, name string, val any) {
+	s.cacheMu.Lock()
+	if s.cfgCache == nil {
+		s.cfgCache = make(map[[2]string]any)
+	}
+	s.cfgCache[[2]string{kind, name}] = val
+	s.cacheMu.Unlock()
 }
 
 type IndexedFeature struct {
@@ -55,8 +74,22 @@ type PlacedFeature struct {
 }
 
 type PlacementModifier struct {
-	Type string
-	Raw  json.RawMessage
+	Type   string
+	Raw    json.RawMessage
+	parsed *parsedPlacementModifier
+}
+
+func (m *PlacementModifier) UnmarshalJSON(raw []byte) error {
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &head); err != nil {
+		return err
+	}
+	m.Type = head.Type
+	m.Raw = append(m.Raw[:0], raw...)
+	m.parsed = compilePlacementModifier(m.Type, m.Raw)
+	return nil
 }
 
 type OreFeatureConfig struct {
@@ -970,6 +1003,14 @@ func LoadFeatureSet() (*FeatureSet, error) {
 // BiomeSource.possibleBiomes encounter order because it assigns the stable
 // identity used to break otherwise unconstrained graph ties.
 func (s *FeatureSet) FeatureSteps(biomeOrder []string) ([][]string, error) {
+	cacheKey := strings.Join(biomeOrder, "\x00")
+	s.cacheMu.RLock()
+	if steps, ok := s.stepsCache[cacheKey]; ok {
+		s.cacheMu.RUnlock()
+		return steps, nil
+	}
+	s.cacheMu.RUnlock()
+
 	type node struct {
 		stage, identity int
 		name            string
@@ -1052,6 +1093,12 @@ func (s *FeatureSet) FeatureSteps(biomeOrder []string) ([][]string, error) {
 		n := nodes[ordered[i]]
 		steps[n.stage] = append(steps[n.stage], n.name)
 	}
+	s.cacheMu.Lock()
+	if s.stepsCache == nil {
+		s.stepsCache = make(map[string][][]string)
+	}
+	s.stepsCache[cacheKey] = steps
+	s.cacheMu.Unlock()
 	return steps, nil
 }
 
@@ -1097,6 +1144,9 @@ func (s *FeatureSet) FeatureSchedule(allBiomeOrder, sourceBiomes []string, stage
 }
 
 func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("ore", name); ok {
+		return v.(OreFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:ore" {
 		return OreFeatureConfig{}, fmt.Errorf("worldgen: %s is not an ore feature", name)
@@ -1108,10 +1158,14 @@ func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {
 	if config.Size < 1 || len(config.Targets) == 0 {
 		return OreFeatureConfig{}, fmt.Errorf("worldgen: invalid ore config %s", name)
 	}
+	s.setCachedConfig("ore", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) Disk(name string) (DiskFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("disk", name); ok {
+		return v.(DiskFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:disk" {
 		return DiskFeatureConfig{}, fmt.Errorf("worldgen: %s is not a disk feature", name)
@@ -1175,10 +1229,14 @@ func (s *FeatureSet) Disk(name string) (DiskFeatureConfig, error) {
 	if config.RadiusMin < 0 || config.RadiusMax < config.RadiusMin || config.State.Name == "" || len(config.Targets) == 0 {
 		return DiskFeatureConfig{}, fmt.Errorf("worldgen: invalid disk config %s", name)
 	}
+	s.setCachedConfig("disk", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) Geode(name string) (GeodeFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("geode", name); ok {
+		return v.(GeodeFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:geode" {
 		return GeodeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a geode feature", name)
@@ -1271,10 +1329,14 @@ func (s *FeatureSet) Geode(name string) (GeodeFeatureConfig, error) {
 		config.InvalidBlocksThreshold < 0 || config.CannotReplaceTag == "" || config.InvalidBlocksTag == "" {
 		return GeodeFeatureConfig{}, fmt.Errorf("worldgen: invalid geode config %s", name)
 	}
+	s.setCachedConfig("geode", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("vegetation_patch", name); ok {
+		return v.(VegetationPatchFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:vegetation_patch" && configured.Type != "minecraft:waterlogged_vegetation_patch" {
 		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a vegetation patch", name)
@@ -1320,6 +1382,7 @@ func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig,
 		config.VerticalRange < 1 || config.Ground.Name == "" || config.ReplaceableTag == "" {
 		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: invalid vegetation patch %s", name)
 	}
+	s.setCachedConfig("vegetation_patch", name, config)
 	return config, nil
 }
 
@@ -1334,6 +1397,9 @@ type BlockBlobFeatureConfig struct {
 // BlockBlob decodes a block_blob configured feature - forest_rock, the mossy
 // cobblestone boulder of old-growth taiga and a few other biomes.
 func (s *FeatureSet) BlockBlob(name string) (BlockBlobFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("block_blob", name); ok {
+		return v.(BlockBlobFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:block_blob" {
 		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block blob feature", name)
@@ -1348,10 +1414,14 @@ func (s *FeatureSet) BlockBlob(name string) (BlockBlobFeatureConfig, error) {
 	if len(config.CanPlaceOn) == 0 {
 		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: %s has a block blob without can_place_on", name)
 	}
+	s.setCachedConfig("block_blob", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) SimpleBlock(name string) (SimpleBlockFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("simple_block", name); ok {
+		return v.(SimpleBlockFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:simple_block" {
 		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: %s is not a simple block feature", name)
@@ -1384,10 +1454,14 @@ func (s *FeatureSet) SimpleBlock(name string) (SimpleBlockFeatureConfig, error) 
 	default:
 		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: unsupported simple block provider %q", provider.Type)
 	}
+	s.setCachedConfig("simple_block", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) UnderwaterMagma(name string) (UnderwaterMagmaFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("underwater_magma", name); ok {
+		return v.(UnderwaterMagmaFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:underwater_magma" {
 		return UnderwaterMagmaFeatureConfig{}, fmt.Errorf("worldgen: %s is not underwater magma", name)
@@ -1400,10 +1474,14 @@ func (s *FeatureSet) UnderwaterMagma(name string) (UnderwaterMagmaFeatureConfig,
 		config.PlacementProbability <= 0 || config.PlacementProbability > 1 {
 		return UnderwaterMagmaFeatureConfig{}, fmt.Errorf("worldgen: invalid underwater magma config %s", name)
 	}
+	s.setCachedConfig("underwater_magma", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) Probability(name string) (ProbabilityFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("probability", name); ok {
+		return v.(ProbabilityFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:seagrass" {
 		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: %s is not seagrass", name)
@@ -1415,10 +1493,14 @@ func (s *FeatureSet) Probability(name string) (ProbabilityFeatureConfig, error) 
 	if config.Probability < 0 || config.Probability > 1 {
 		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: invalid probability %s", name)
 	}
+	s.setCachedConfig("probability", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("spring", name); ok {
+		return v.(SpringFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:spring_feature" {
 		return SpringFeatureConfig{}, fmt.Errorf("worldgen: %s is not a spring feature", name)
@@ -1430,6 +1512,7 @@ func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
 	if config.State.Name == "" || len(config.ValidBlocks) == 0 || config.HoleCount < 0 || config.RockCount < 0 {
 		return SpringFeatureConfig{}, fmt.Errorf("worldgen: invalid spring config %s", name)
 	}
+	s.setCachedConfig("spring", name, config)
 	return config, nil
 }
 
@@ -1520,6 +1603,9 @@ func validatePlacer(feature, kind string, typ string, fields map[string]json.Raw
 }
 
 func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("tree", name); ok {
+		return v.(TreeFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:tree" {
 		return TreeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a tree feature", name)
@@ -1559,10 +1645,14 @@ func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 			return TreeFeatureConfig{}, fmt.Errorf("worldgen: %s has a decorator without a type", name)
 		}
 	}
+	s.setCachedConfig("tree", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) HugeMushroom(name string) (HugeMushroomFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("huge_mushroom", name); ok {
+		return v.(HugeMushroomFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || (configured.Type != "minecraft:huge_red_mushroom" && configured.Type != "minecraft:huge_brown_mushroom") {
 		return HugeMushroomFeatureConfig{}, fmt.Errorf("worldgen: %s is not a huge mushroom feature", name)
@@ -1574,10 +1664,14 @@ func (s *FeatureSet) HugeMushroom(name string) (HugeMushroomFeatureConfig, error
 	if len(config.CapProvider) == 0 || len(config.StemProvider) == 0 || len(config.CanPlaceOn) == 0 {
 		return HugeMushroomFeatureConfig{}, fmt.Errorf("worldgen: invalid huge mushroom %s", name)
 	}
+	s.setCachedConfig("huge_mushroom", name, config)
 	return config, nil
 }
 
 func (s *FeatureSet) FallenTree(name string) (FallenTreeFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("fallen_tree", name); ok {
+		return v.(FallenTreeFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:fallen_tree" {
 		return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a fallen tree feature", name)
@@ -1608,16 +1702,21 @@ func (s *FeatureSet) FallenTree(name string) (FallenTreeFeatureConfig, error) {
 			return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s has a log decorator without a type", name)
 		}
 	}
-	return FallenTreeFeatureConfig{
+	config := FallenTreeFeatureConfig{
 		TrunkProvider:   raw.TrunkProvider,
 		LogLength:       length,
 		StumpDecorators: raw.StumpDecorators,
 		LogDecorators:   raw.LogDecorators,
-	}, nil
+	}
+	s.setCachedConfig("fallen_tree", name, config)
+	return config, nil
 }
 
 // LargeDripstone parses a minecraft:large_dripstone configured feature.
 func (s *FeatureSet) LargeDripstone(name string) (LargeDripstoneFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("large_dripstone", name); ok {
+		return v.(LargeDripstoneFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:large_dripstone" {
 		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s is not a large dripstone feature", name)
@@ -1660,7 +1759,7 @@ func (s *FeatureSet) LargeDripstone(name string) (LargeDripstoneFeatureConfig, e
 	if err != nil {
 		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s wind_speed: %w", name, err)
 	}
-	return LargeDripstoneFeatureConfig{
+	config := LargeDripstoneFeatureConfig{
 		FloorToCeilingSearchRange:        searchRange,
 		ColumnRadiusMin:                  colRadius.Min,
 		ColumnRadiusMax:                  colRadius.Max,
@@ -1671,7 +1770,9 @@ func (s *FeatureSet) LargeDripstone(name string) (LargeDripstoneFeatureConfig, e
 		WindSpeed:                        windSpeed,
 		MinRadiusForWind:                 raw.MinRadiusForWind,
 		MinBluntnessForWind:              raw.MinBluntnessForWind,
-	}, nil
+	}
+	s.setCachedConfig("large_dripstone", name, config)
+	return config, nil
 }
 
 func parseUniformFloatProvider(raw json.RawMessage) (UniformFloatProvider, error) {
@@ -1715,6 +1816,9 @@ func parseUniformFloatProvider(raw json.RawMessage) (UniformFloatProvider, error
 
 // MultifaceGrowth parses a minecraft:multiface_growth configured feature.
 func (s *FeatureSet) MultifaceGrowth(name string) (MultifaceGrowthFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("multiface_growth", name); ok {
+		return v.(MultifaceGrowthFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:multiface_growth" {
 		return MultifaceGrowthFeatureConfig{}, fmt.Errorf("worldgen: %s is not a multiface growth feature", name)
@@ -1758,7 +1862,7 @@ func (s *FeatureSet) MultifaceGrowth(name string) (MultifaceGrowthFeatureConfig,
 	if searchRange < 1 || len(canBePlacedOn) == 0 {
 		return MultifaceGrowthFeatureConfig{}, fmt.Errorf("worldgen: invalid multiface growth %s", name)
 	}
-	return MultifaceGrowthFeatureConfig{
+	config := MultifaceGrowthFeatureConfig{
 		Block:             block,
 		SearchRange:       searchRange,
 		CanPlaceOnFloor:   raw.CanPlaceOnFloor,
@@ -1766,11 +1870,16 @@ func (s *FeatureSet) MultifaceGrowth(name string) (MultifaceGrowthFeatureConfig,
 		CanPlaceOnWall:    raw.CanPlaceOnWall,
 		ChanceOfSpreading: chance,
 		CanBePlacedOn:     canBePlacedOn,
-	}, nil
+	}
+	s.setCachedConfig("multiface_growth", name, config)
+	return config, nil
 }
 
 // SculkPatch parses a minecraft:sculk_patch configured feature.
 func (s *FeatureSet) SculkPatch(name string) (SculkPatchFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("sculk_patch", name); ok {
+		return v.(SculkPatchFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:sculk_patch" {
 		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a sculk patch feature", name)
@@ -1794,7 +1903,7 @@ func (s *FeatureSet) SculkPatch(name string) (SculkPatchFeatureConfig, error) {
 	if raw.ChargeCount < 1 || raw.AmountPerCharge < 1 || raw.SpreadAttempts < 1 {
 		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: invalid sculk patch %s", name)
 	}
-	return SculkPatchFeatureConfig{
+	config := SculkPatchFeatureConfig{
 		ChargeCount:      raw.ChargeCount,
 		AmountPerCharge:  raw.AmountPerCharge,
 		SpreadAttempts:   raw.SpreadAttempts,
@@ -1802,11 +1911,16 @@ func (s *FeatureSet) SculkPatch(name string) (SculkPatchFeatureConfig, error) {
 		SpreadRounds:     raw.SpreadRounds,
 		ExtraRareGrowths: extra,
 		CatalystChance:   raw.CatalystChance,
-	}, nil
+	}
+	s.setCachedConfig("sculk_patch", name, config)
+	return config, nil
 }
 
 // DripstoneCluster parses a minecraft:dripstone_cluster configured feature.
 func (s *FeatureSet) DripstoneCluster(name string) (DripstoneClusterFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("dripstone_cluster", name); ok {
+		return v.(DripstoneClusterFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:dripstone_cluster" {
 		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s is not a dripstone cluster feature", name)
@@ -1847,7 +1961,7 @@ func (s *FeatureSet) DripstoneCluster(name string) (DripstoneClusterFeatureConfi
 	if err != nil {
 		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s wetness: %w", name, err)
 	}
-	return DripstoneClusterFeatureConfig{
+	config := DripstoneClusterFeatureConfig{
 		FloorToCeilingSearchRange:         raw.FloorToCeilingSearchRange,
 		Height:                            height,
 		Radius:                            radius,
@@ -1859,11 +1973,16 @@ func (s *FeatureSet) DripstoneCluster(name string) (DripstoneClusterFeatureConfi
 		ChanceOfDripstoneColumnAtMaxDistanceFromCenter:      raw.ChanceOfDripstoneColumnAtMaxDistanceFromCenter,
 		MaxDistanceFromEdgeAffectingChanceOfDripstoneColumn: raw.MaxDistanceFromEdgeAffectingChanceOfDripstoneColumn,
 		MaxDistanceFromCenterAffectingHeightBias:            raw.MaxDistanceFromCenterAffectingHeightBias,
-	}, nil
+	}
+	s.setCachedConfig("dripstone_cluster", name, config)
+	return config, nil
 }
 
 // PointedDripstone parses a minecraft:pointed_dripstone configured feature.
 func (s *FeatureSet) PointedDripstone(name string) (PointedDripstoneFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("pointed_dripstone", name); ok {
+		return v.(PointedDripstoneFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:pointed_dripstone" {
 		return PointedDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s is not a pointed dripstone feature", name)
@@ -1895,10 +2014,14 @@ func (s *FeatureSet) PointedDripstone(name string) (PointedDripstoneFeatureConfi
 	if raw.ChanceOfSpreadRadius3 != nil {
 		cfg.ChanceOfSpreadRadius3 = *raw.ChanceOfSpreadRadius3
 	}
+	s.setCachedConfig("pointed_dripstone", name, cfg)
 	return cfg, nil
 }
 
 func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
+	if v, ok := s.getCachedConfig("random_selector", name); ok {
+		return v.(RandomSelectorConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:random_selector" {
 		return RandomSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random selector", name)
@@ -1926,6 +2049,7 @@ func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
 			return RandomSelectorConfig{}, err
 		}
 	}
+	s.setCachedConfig("random_selector", name, selector)
 	return selector, nil
 }
 
@@ -1933,6 +2057,9 @@ func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
 // (nested height provider + state provider), the allowed-placement predicate,
 // and the tip priority.
 func (s *FeatureSet) BlockColumn(name string) (BlockColumnFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("block_column", name); ok {
+		return v.(BlockColumnFeatureConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:block_column" {
 		return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block column", name)
@@ -1969,11 +2096,15 @@ func (s *FeatureSet) BlockColumn(name string) (BlockColumnFeatureConfig, error) 
 		}
 		config.Layers[i] = BlockColumnLayer{Height: height, Provider: provider}
 	}
+	s.setCachedConfig("block_column", name, config)
 	return config, nil
 }
 
 // SimpleRandomSelector parses the simple_random_selector configured feature.
 func (s *FeatureSet) SimpleRandomSelector(name string) (SimpleRandomSelectorConfig, error) {
+	if v, ok := s.getCachedConfig("simple_random_selector", name); ok {
+		return v.(SimpleRandomSelectorConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:simple_random_selector" {
 		return SimpleRandomSelectorConfig{}, fmt.Errorf("worldgen: %s is not a simple random selector", name)
@@ -1992,6 +2123,7 @@ func (s *FeatureSet) SimpleRandomSelector(name string) (SimpleRandomSelectorConf
 		}
 		config.Features[i] = ref
 	}
+	s.setCachedConfig("simple_random_selector", name, config)
 	return config, nil
 }
 
@@ -2064,7 +2196,16 @@ func parseNestedIntProvider(raw json.RawMessage) (NestedIntProvider, error) {
 // caller that kept a provider as json.RawMessage (tree configs do) can resolve it
 // without this package having to know where it came from.
 func (s *FeatureSet) StateProvider(raw json.RawMessage) (StateProviderSpec, error) {
-	return parseStateProviderSpec(raw)
+	key := string(raw)
+	if v, ok := s.getCachedConfig("state_provider", key); ok {
+		return v.(StateProviderSpec), nil
+	}
+	spec, err := parseStateProviderSpec(raw)
+	if err != nil {
+		return StateProviderSpec{}, err
+	}
+	s.setCachedConfig("state_provider", key, spec)
+	return spec, nil
 }
 
 func parseStateProviderSpec(raw json.RawMessage) (StateProviderSpec, error) {
@@ -2255,6 +2396,9 @@ type WeightedBlockStateRaw struct {
 }
 
 func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorConfig, error) {
+	if v, ok := s.getCachedConfig("random_boolean_selector", name); ok {
+		return v.(RandomBooleanSelectorConfig), nil
+	}
 	configured, ok := s.Configured[name]
 	if !ok || configured.Type != "minecraft:random_boolean_selector" {
 		return RandomBooleanSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random boolean selector", name)
@@ -2274,6 +2418,7 @@ func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorCo
 	if selector.FeatureFalse, err = s.parseFeatureRef(raw.FeatureFalse); err != nil {
 		return RandomBooleanSelectorConfig{}, err
 	}
+	s.setCachedConfig("random_boolean_selector", name, selector)
 	return selector, nil
 }
 
@@ -2335,6 +2480,9 @@ func hashRawFeature(raw []byte) string {
 }
 
 func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
+	if v, ok := s.getCachedConfig("placement", name); ok {
+		return v.(PlacementPlan), nil
+	}
 	placed, ok := s.Placed[name]
 	if !ok {
 		return PlacementPlan{}, fmt.Errorf("worldgen: placed feature %s missing", name)
@@ -2396,6 +2544,7 @@ func (s *FeatureSet) Placement(name string) (PlacementPlan, error) {
 			return PlacementPlan{}, fmt.Errorf("worldgen: %s unsupported placement modifier %q", name, modifier.Type)
 		}
 	}
+	s.setCachedConfig("placement", name, plan)
 	return plan, nil
 }
 
@@ -2422,253 +2571,373 @@ func (s *FeatureSet) ForEachPlacementPosition(name string, r RandomSource, origi
 	return s.ForEachPlacementModifiers(name, placed.Placement, r, origin, context, visit)
 }
 
+type parsedPlacementModifier struct {
+	valid      bool
+	err        error
+	errLabel   string
+	noiseLevel float64
+	belowNoise int
+	aboveNoise int
+
+	noiseRatio  int
+	noiseFactor float64
+	noiseOffset float64
+
+	count        CountProvider
+	rarityChance int
+	heightPlan   PlacementPlan
+
+	heightmap     string
+	minOffset     int
+	maxOffset     int
+	maxWaterDepth int
+
+	xzSpread placementIntProvider
+	ySpread  placementIntProvider
+
+	predicate     json.RawMessage
+	scanDirection string
+	scanTarget    json.RawMessage
+	scanAllowed   json.RawMessage
+	scanMaxSteps  int
+}
+
+func compilePlacementModifier(typ string, raw json.RawMessage) *parsedPlacementModifier {
+	p := &parsedPlacementModifier{}
+	switch typ {
+	case "minecraft:noise_threshold_count":
+		var value struct {
+			NoiseLevel float64 `json:"noise_level"`
+			BelowNoise int     `json:"below_noise"`
+			AboveNoise int     `json:"above_noise"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil {
+			p.valid = true
+			p.noiseLevel = value.NoiseLevel
+			p.belowNoise = value.BelowNoise
+			p.aboveNoise = value.AboveNoise
+		}
+	case "minecraft:noise_based_count":
+		var value struct {
+			Ratio  int     `json:"noise_to_count_ratio"`
+			Factor float64 `json:"noise_factor"`
+			Offset float64 `json:"noise_offset"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && value.Ratio >= 0 && value.Factor != 0 {
+			p.valid = true
+			p.noiseRatio = value.Ratio
+			p.noiseFactor = value.Factor
+			p.noiseOffset = value.Offset
+		}
+	case "minecraft:count":
+		var value struct {
+			Count json.RawMessage `json:"count"`
+		}
+		if err := json.Unmarshal(raw, &value); err != nil {
+			p.err = err
+			return p
+		}
+		count, err := parseIntProvider(value.Count)
+		if err != nil {
+			p.err = err
+			return p
+		}
+		p.valid = true
+		p.count = count
+	case "minecraft:rarity_filter":
+		var value struct {
+			Chance int `json:"chance"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && value.Chance >= 1 {
+			p.valid = true
+			p.rarityChance = value.Chance
+		}
+	case "minecraft:in_square", "minecraft:biome":
+		p.valid = true
+	case "minecraft:height_range":
+		plan, err := placementHeightPlan(raw)
+		if err != nil {
+			p.err = err
+			return p
+		}
+		p.valid = true
+		p.heightPlan = plan
+	case "minecraft:heightmap":
+		var value struct {
+			Heightmap string `json:"heightmap"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && value.Heightmap != "" {
+			p.valid = true
+			p.heightmap = value.Heightmap
+		}
+	case "minecraft:surface_water_depth_filter":
+		var value struct {
+			MaxWaterDepth int `json:"max_water_depth"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && value.MaxWaterDepth >= 0 {
+			p.valid = true
+			p.maxWaterDepth = value.MaxWaterDepth
+		}
+	case "minecraft:surface_relative_threshold_filter":
+		var value struct {
+			Heightmap string `json:"heightmap"`
+			Min       *int   `json:"min_inclusive"`
+			Max       *int   `json:"max_inclusive"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && value.Heightmap != "" {
+			p.valid = true
+			p.heightmap = value.Heightmap
+			p.minOffset, p.maxOffset = -int(^uint(0)>>1)-1, int(^uint(0)>>1)
+			if value.Min != nil {
+				p.minOffset = *value.Min
+			}
+			if value.Max != nil {
+				p.maxOffset = *value.Max
+			}
+		}
+	case "minecraft:random_offset":
+		var value struct {
+			XZSpread json.RawMessage `json:"xz_spread"`
+			YSpread  json.RawMessage `json:"y_spread"`
+		}
+		if err := json.Unmarshal(raw, &value); err != nil {
+			p.err = err
+			return p
+		}
+		xz, err := parsePlacementIntProvider(value.XZSpread)
+		if err != nil {
+			p.err = err
+			p.errLabel = "xz spread"
+			return p
+		}
+		y, err := parsePlacementIntProvider(value.YSpread)
+		if err != nil {
+			p.err = err
+			p.errLabel = "y spread"
+			return p
+		}
+		p.valid = true
+		p.xzSpread = xz
+		p.ySpread = y
+	case "minecraft:block_predicate_filter":
+		var value struct {
+			Predicate json.RawMessage `json:"predicate"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && len(value.Predicate) > 0 {
+			p.valid = true
+			p.predicate = value.Predicate
+		}
+	case "minecraft:environment_scan":
+		var value struct {
+			Direction string          `json:"direction_of_search"`
+			Target    json.RawMessage `json:"target_condition"`
+			Allowed   json.RawMessage `json:"allowed_search_condition"`
+			MaxSteps  int             `json:"max_steps"`
+		}
+		if err := json.Unmarshal(raw, &value); err == nil && value.MaxSteps >= 1 &&
+			(value.Direction == "up" || value.Direction == "down") {
+			p.valid = true
+			p.scanDirection = value.Direction
+			p.scanTarget = value.Target
+			p.scanAllowed = value.Allowed
+			p.scanMaxSteps = value.MaxSteps
+		}
+	}
+	return p
+}
+
 // ForEachPlacementModifiers executes an arbitrary slice of placement modifiers
 // (either a placed feature's modifier chain or an inline FeatureRef's placement
 // array) in declared order.
 func (s *FeatureSet) ForEachPlacementModifiers(name string, modifiers []PlacementModifier, r RandomSource, origin FeaturePosition, context PlacementContext, visit func(FeaturePosition) error) error {
-	var apply func(int, FeaturePosition) error
-	apply = func(index int, position FeaturePosition) error {
-		if index == len(modifiers) {
-			return visit(position)
+	return applyPlacementModifiers(name, modifiers, 0, origin, r, context, visit)
+}
+
+func applyPlacementModifiers(name string, modifiers []PlacementModifier, index int, position FeaturePosition, r RandomSource, context PlacementContext, visit func(FeaturePosition) error) error {
+	if index == len(modifiers) {
+		return visit(position)
+	}
+	modifier := modifiers[index]
+	p := modifier.parsed
+	if p == nil {
+		p = compilePlacementModifier(modifier.Type, modifier.Raw)
+	}
+	switch modifier.Type {
+	case "minecraft:noise_threshold_count":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid noise threshold count", name)
 		}
-		modifier := modifiers[index]
-		next := func(value FeaturePosition) error { return apply(index+1, value) }
-		switch modifier.Type {
-		case "minecraft:noise_threshold_count":
-			var value struct {
-				NoiseLevel float64 `json:"noise_level"`
-				BelowNoise int     `json:"below_noise"`
-				AboveNoise int     `json:"above_noise"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
-				return fmt.Errorf("worldgen: %s invalid noise threshold count", name)
-			}
-			noise := BiomeInfoNoise(float64(position.X)/200.0, float64(position.Z)/200.0)
-			count := value.AboveNoise
-			if noise < value.NoiseLevel {
-				count = value.BelowNoise
-			}
-			for ; count > 0; count-- {
-				if err := next(position); err != nil {
-					return err
-				}
-			}
-			return nil
-		case "minecraft:noise_based_count":
-			var value struct {
-				Ratio  int     `json:"noise_to_count_ratio"`
-				Factor float64 `json:"noise_factor"`
-				Offset float64 `json:"noise_offset"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Ratio < 0 || value.Factor == 0 {
-				return fmt.Errorf("worldgen: %s invalid noise based count", name)
-			}
-			noise := BiomeInfoNoise(float64(position.X)/value.Factor, float64(position.Z)/value.Factor)
-			for count := int(math.Ceil((noise + value.Offset) * float64(value.Ratio))); count > 0; count-- {
-				if err := next(position); err != nil {
-					return err
-				}
-			}
-			return nil
-		case "minecraft:count":
-			var value struct {
-				Count json.RawMessage `json:"count"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
+		noise := BiomeInfoNoise(float64(position.X)/200.0, float64(position.Z)/200.0)
+		count := p.aboveNoise
+		if noise < p.noiseLevel {
+			count = p.belowNoise
+		}
+		for ; count > 0; count-- {
+			if err := applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit); err != nil {
 				return err
 			}
-			count, err := parseIntProvider(value.Count)
-			if err != nil {
+		}
+		return nil
+	case "minecraft:noise_based_count":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid noise based count", name)
+		}
+		noise := BiomeInfoNoise(float64(position.X)/p.noiseFactor, float64(position.Z)/p.noiseFactor)
+		for count := int(math.Ceil((noise + p.noiseOffset) * float64(p.noiseRatio))); count > 0; count-- {
+			if err := applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit); err != nil {
 				return err
 			}
-			for n := count.Sample(r); n > 0; n-- {
-				if err := next(position); err != nil {
-					return err
-				}
-			}
-			return nil
-		case "minecraft:rarity_filter":
-			var value struct {
-				Chance int `json:"chance"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Chance < 1 {
-				return fmt.Errorf("worldgen: %s invalid rarity filter", name)
-			}
-			if r.NextFloat() < 1/float32(value.Chance) {
-				return next(position)
-			}
-			return nil
-		case "minecraft:in_square":
-			position.X += int(r.NextIntN(16))
-			position.Z += int(r.NextIntN(16))
-			return next(position)
-		case "minecraft:height_range":
-			plan, err := placementHeightPlan(modifier.Raw)
-			if err != nil {
+		}
+		return nil
+	case "minecraft:count":
+		if !p.valid {
+			return p.err
+		}
+		for n := p.count.Sample(r); n > 0; n-- {
+			if err := applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit); err != nil {
 				return err
 			}
-			position.Y = plan.SampleY(r, context.MinY, context.Height)
-			return next(position)
-		case "minecraft:heightmap":
-			var value struct {
-				Heightmap string `json:"heightmap"`
+		}
+		return nil
+	case "minecraft:rarity_filter":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid rarity filter", name)
+		}
+		if r.NextFloat() < 1/float32(p.rarityChance) {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	case "minecraft:in_square":
+		position.X += int(r.NextIntN(16))
+		position.Z += int(r.NextIntN(16))
+		return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+	case "minecraft:height_range":
+		if !p.valid {
+			return p.err
+		}
+		position.Y = p.heightPlan.SampleY(r, context.MinY, context.Height)
+		return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+	case "minecraft:heightmap":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid heightmap placement", name)
+		}
+		if context.HeightAt == nil {
+			return fmt.Errorf("worldgen: %s heightmap placement requires HeightAt", name)
+		}
+		position.Y = context.HeightAt(p.heightmap, position.X, position.Z)
+		if position.Y > context.MinY {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	case "minecraft:surface_water_depth_filter":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid surface water depth filter", name)
+		}
+		if context.HeightAt == nil {
+			return fmt.Errorf("worldgen: %s surface water depth filter requires HeightAt", name)
+		}
+		oceanFloor := context.HeightAt("OCEAN_FLOOR", position.X, position.Z)
+		worldSurface := context.HeightAt("WORLD_SURFACE", position.X, position.Z)
+		if worldSurface-oceanFloor <= p.maxWaterDepth {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	case "minecraft:surface_relative_threshold_filter":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid surface relative threshold", name)
+		}
+		if context.HeightAt == nil {
+			return fmt.Errorf("worldgen: %s surface relative threshold requires HeightAt", name)
+		}
+		surface := context.HeightAt(p.heightmap, position.X, position.Z)
+		positionY, surfaceY := int64(position.Y), int64(surface)
+		if positionY >= surfaceY+int64(p.minOffset) && positionY <= surfaceY+int64(p.maxOffset) {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	case "minecraft:random_offset":
+		if !p.valid {
+			if p.errLabel != "" {
+				return fmt.Errorf("worldgen: %s %s: %w", name, p.errLabel, p.err)
 			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Heightmap == "" {
-				return fmt.Errorf("worldgen: %s invalid heightmap placement", name)
-			}
-			if context.HeightAt == nil {
-				return fmt.Errorf("worldgen: %s heightmap placement requires HeightAt", name)
-			}
-			position.Y = context.HeightAt(value.Heightmap, position.X, position.Z)
-			if position.Y > context.MinY {
-				return next(position)
-			}
-			return nil
-		case "minecraft:surface_water_depth_filter":
-			var value struct {
-				MaxWaterDepth int `json:"max_water_depth"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.MaxWaterDepth < 0 {
-				return fmt.Errorf("worldgen: %s invalid surface water depth filter", name)
-			}
-			if context.HeightAt == nil {
-				return fmt.Errorf("worldgen: %s surface water depth filter requires HeightAt", name)
-			}
-			oceanFloor := context.HeightAt("OCEAN_FLOOR", position.X, position.Z)
-			worldSurface := context.HeightAt("WORLD_SURFACE", position.X, position.Z)
-			if worldSurface-oceanFloor <= value.MaxWaterDepth {
-				return next(position)
-			}
-			return nil
-		case "minecraft:surface_relative_threshold_filter":
-			var value struct {
-				Heightmap string `json:"heightmap"`
-				Min       *int   `json:"min_inclusive"`
-				Max       *int   `json:"max_inclusive"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.Heightmap == "" {
-				return fmt.Errorf("worldgen: %s invalid surface relative threshold", name)
-			}
-			if context.HeightAt == nil {
-				return fmt.Errorf("worldgen: %s surface relative threshold requires HeightAt", name)
-			}
-			minOffset, maxOffset := -int(^uint(0)>>1)-1, int(^uint(0)>>1)
-			if value.Min != nil {
-				minOffset = *value.Min
-			}
-			if value.Max != nil {
-				maxOffset = *value.Max
-			}
-			surface := context.HeightAt(value.Heightmap, position.X, position.Z)
-			positionY, surfaceY := int64(position.Y), int64(surface)
-			if positionY >= surfaceY+int64(minOffset) && positionY <= surfaceY+int64(maxOffset) {
-				return next(position)
-			}
-			return nil
-		case "minecraft:random_offset":
-			var value struct {
-				XZSpread json.RawMessage `json:"xz_spread"`
-				YSpread  json.RawMessage `json:"y_spread"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil {
+			return p.err
+		}
+		position.X += p.xzSpread.Sample(r)
+		position.Y += p.ySpread.Sample(r)
+		position.Z += p.xzSpread.Sample(r)
+		return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+	case "minecraft:block_predicate_filter":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid block predicate filter", name)
+		}
+		if context.BlockPredicate == nil {
+			return fmt.Errorf("worldgen: %s block predicate filter requires BlockPredicate", name)
+		}
+		ok, err := context.BlockPredicate(p.predicate, position)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	case "minecraft:environment_scan":
+		if !p.valid {
+			return fmt.Errorf("worldgen: %s invalid environment scan", name)
+		}
+		if context.BlockPredicate == nil {
+			return fmt.Errorf("worldgen: %s environment scan requires BlockPredicate", name)
+		}
+		// An absent allowed_search_condition means every block is a
+		// valid search step (vanilla's Optional<BlockPredicate>).
+		if len(p.scanAllowed) > 0 {
+			allowed, err := context.BlockPredicate(p.scanAllowed, position)
+			if err != nil || !allowed {
 				return err
 			}
-			xz, err := parsePlacementIntProvider(value.XZSpread)
-			if err != nil {
-				return fmt.Errorf("worldgen: %s xz spread: %w", name, err)
-			}
-			y, err := parsePlacementIntProvider(value.YSpread)
-			if err != nil {
-				return fmt.Errorf("worldgen: %s y spread: %w", name, err)
-			}
-			position.X += xz.Sample(r)
-			position.Y += y.Sample(r)
-			position.Z += xz.Sample(r)
-			return next(position)
-		case "minecraft:block_predicate_filter":
-			var value struct {
-				Predicate json.RawMessage `json:"predicate"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || len(value.Predicate) == 0 {
-				return fmt.Errorf("worldgen: %s invalid block predicate filter", name)
-			}
-			if context.BlockPredicate == nil {
-				return fmt.Errorf("worldgen: %s block predicate filter requires BlockPredicate", name)
-			}
-			ok, err := context.BlockPredicate(value.Predicate, position)
-			if err != nil {
-				return err
-			}
-			if ok {
-				return next(position)
-			}
-			return nil
-		case "minecraft:environment_scan":
-			var value struct {
-				Direction string          `json:"direction_of_search"`
-				Target    json.RawMessage `json:"target_condition"`
-				Allowed   json.RawMessage `json:"allowed_search_condition"`
-				MaxSteps  int             `json:"max_steps"`
-			}
-			if err := json.Unmarshal(modifier.Raw, &value); err != nil || value.MaxSteps < 1 ||
-				value.Direction != "up" && value.Direction != "down" {
-				return fmt.Errorf("worldgen: %s invalid environment scan", name)
-			}
-			if context.BlockPredicate == nil {
-				return fmt.Errorf("worldgen: %s environment scan requires BlockPredicate", name)
-			}
-			// An absent allowed_search_condition means every block is a
-			// valid search step (vanilla's Optional<BlockPredicate>).
-			if len(value.Allowed) > 0 {
-				allowed, err := context.BlockPredicate(value.Allowed, position)
-				if err != nil || !allowed {
-					return err
-				}
-			}
-			dy := 1
-			if value.Direction == "down" {
-				dy = -1
-			}
-			for step := 0; step < value.MaxSteps; step++ {
-				matched, err := context.BlockPredicate(value.Target, position)
-				if err != nil {
-					return err
-				}
-				if matched {
-					return next(position)
-				}
-				position.Y += dy
-				if position.Y < context.MinY || position.Y >= context.MinY+context.Height {
-					return nil
-				}
-				if len(value.Allowed) > 0 {
-					allowed, err := context.BlockPredicate(value.Allowed, position)
-					if err != nil {
-						return err
-					}
-					if !allowed {
-						break
-					}
-				}
-			}
-			matched, err := context.BlockPredicate(value.Target, position)
+		}
+		dy := 1
+		if p.scanDirection == "down" {
+			dy = -1
+		}
+		for step := 0; step < p.scanMaxSteps; step++ {
+			matched, err := context.BlockPredicate(p.scanTarget, position)
 			if err != nil {
 				return err
 			}
 			if matched {
-				return next(position)
+				return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
 			}
-			return nil
-		case "minecraft:biome":
-			if context.BiomeAllows == nil || context.BiomeAllows(position) {
-				return next(position)
+			position.Y += dy
+			if position.Y < context.MinY || position.Y >= context.MinY+context.Height {
+				return nil
 			}
-			return nil
-		default:
-			return fmt.Errorf("worldgen: %s unsupported executable placement modifier %q", name, modifier.Type)
+			if len(p.scanAllowed) > 0 {
+				allowed, err := context.BlockPredicate(p.scanAllowed, position)
+				if err != nil {
+					return err
+				}
+				if !allowed {
+					break
+				}
+			}
 		}
+		matched, err := context.BlockPredicate(p.scanTarget, position)
+		if err != nil {
+			return err
+		}
+		if matched {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	case "minecraft:biome":
+		if context.BiomeAllows == nil || context.BiomeAllows(position) {
+			return applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit)
+		}
+		return nil
+	default:
+		return fmt.Errorf("worldgen: %s unsupported executable placement modifier %q", name, modifier.Type)
 	}
-	return apply(0, origin)
 }
 
 type placementIntProvider struct {

@@ -298,7 +298,7 @@ func (t verticalGradientTest) Test(ctx *SurfaceContext) bool {
 		return false
 	}
 	probability := mapRange(float64(ctx.Y), float64(t.trueAtAndBelow), float64(t.falseAtAndAbove), 1.0, 0.0)
-	return float64(t.random.At(ctx.X, ctx.Y, ctx.Z).NextFloat()) < probability
+	return float64(nextFloatAt(t.random, ctx.X, ctx.Y, ctx.Z)) < probability
 }
 
 // abovePreliminarySurfaceTest gates the whole biome surface subtree: below the

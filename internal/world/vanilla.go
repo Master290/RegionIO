@@ -131,6 +131,12 @@ type baseTerrain struct {
 	biomeName    *[16][16]string
 }
 
+var overworldColumnsPool = sync.Pool{
+	New: func() any {
+		return new([16][16][WorldHeight]uint16)
+	},
+}
+
 func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
 	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
@@ -187,7 +193,13 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 		aq = worldgen.NewAquifer(od, int(cx), int(cz), fluidPicker)
 	}
 
-	var columns [16][16][WorldHeight]uint16
+	var columns *[16][16][WorldHeight]uint16
+	if carver != nil {
+		columns = overworldColumnsPool.Get().(*[16][16][WorldHeight]uint16)
+		defer overworldColumnsPool.Put(columns)
+	} else {
+		columns = new([16][16][WorldHeight]uint16)
+	}
 	var surfTop [16][16]int      // top solid index, -1 if none
 	var worldSurface [16][16]int // topmost non-air Y, the WORLD_SURFACE_WG heightmap
 
@@ -241,7 +253,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 		carveCtx := surfaceRule.NewContext()
 		carveCtx.BiomeFunc = zoomed.at
 		view := &carveView{
-			cols: &columns, od: od, rules: surfaceRule,
+			cols: columns, od: od, rules: surfaceRule,
 			sctx: carveCtx, biomes: &biomeName,
 			worldSurface: &worldSurface, baseX: baseX, baseZ: baseZ,
 		}
@@ -267,8 +279,12 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 		}
 	}
 	fillBiomes3D(c, od, s2D, baseX, baseZ)
+	var retCols *[16][16][WorldHeight]uint16
+	if carver == nil {
+		retCols = columns
+	}
 	return baseTerrain{
-		c: c, columns: &columns,
+		c: c, columns: retCols,
 		worldSurface: &worldSurface, surfTop: &surfTop,
 		biomeName: &biomeName,
 	}
@@ -296,7 +312,9 @@ func fillBiomes3D(c *Chunk, od *worldgen.OverworldDensity, s2D [16][16]worldgen.
 					for by := 0; by < biomeCellsXZ; by++ {
 						wy := MinY + si*16 + by*biomeCellSize
 						biome := BiomeAt3D(od, col2D, baseX+lx, wy, baseZ+lz)
-						c.SetBiome(lx, wy, lz, biome)
+						if biome != c.biome {
+							c.SetBiome(lx, wy, lz, biome)
+						}
 					}
 				}
 			}

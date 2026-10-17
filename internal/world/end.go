@@ -183,12 +183,34 @@ func generateEndChunk(od *worldgen.OverworldDensity, sets *worldgen.StructureSet
 // generateEndBaseTerrain builds the noise and surface terrain for End chunk (cx, cz).
 func generateEndBaseTerrain(od *worldgen.OverworldDensity, _ int64, cx, cz int32) baseTerrain {
 	eb := loadEndBlocks()
-	chunkBiomeName := worldgen.EndBiomeAt(od.Erosion, int(cx)*4, 0, int(cz)*4)
-	chunkBiomeID := biomeID(chunkBiomeName)
-	c := NewDimensionChunk(cx, cz, chunkBiomeID, EndDimensionType)
+	var qBiomes [biomeCellsXZ][biomeCellsXZ]string
+	var qBiomeIDs [biomeCellsXZ][biomeCellsXZ]uint16
+	uniformBiome := true
+	var firstBiomeID uint16
+	for bx := 0; bx < biomeCellsXZ; bx++ {
+		for bz := 0; bz < biomeCellsXZ; bz++ {
+			name := worldgen.EndBiomeAt(od.Erosion, int(cx)*4+bx, 0, int(cz)*4+bz)
+			id := biomeID(name)
+			qBiomes[bx][bz] = name
+			qBiomeIDs[bx][bz] = id
+			if bx == 0 && bz == 0 {
+				firstBiomeID = id
+			} else if id != firstBiomeID {
+				uniformBiome = false
+			}
+		}
+	}
+
+	c := NewDimensionChunk(cx, cz, firstBiomeID, EndDimensionType)
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
-	grids := make([]endCornerGrid, len(od.Interpolated))
+	var gridBuf [4]endCornerGrid
+	var grids []endCornerGrid
+	if len(od.Interpolated) <= len(gridBuf) {
+		grids = gridBuf[:len(od.Interpolated)]
+	} else {
+		grids = make([]endCornerGrid, len(od.Interpolated))
+	}
 	for ix := 0; ix <= endCellsXZ; ix++ {
 		wx := float64(baseX + ix*endCellWidth)
 		for iz := 0; iz <= endCellsXZ; iz++ {
@@ -203,49 +225,49 @@ func generateEndBaseTerrain(od *worldgen.OverworldDensity, _ int64, cx, cz int32
 		}
 	}
 
-	var columns [16][16][WorldHeight]uint16
-	var surfTop [16][16]int
-	var worldSurface [16][16]int
 	var biomeName [16][16]string
-
-	interp := make([]float64, len(od.Interpolated))
+	var interpBuf [4]float64
+	var interp []float64
+	if len(od.Interpolated) <= len(interpBuf) {
+		interp = interpBuf[:len(od.Interpolated)]
+	} else {
+		interp = make([]float64, len(od.Interpolated))
+	}
 	for lx := 0; lx < 16; lx++ {
+		bx := lx >> 2
 		for lz := 0; lz < 16; lz++ {
-			biomeName[lx][lz] = chunkBiomeName
-			surfTop[lx][lz], worldSurface[lx][lz] =
-				fillEndColumn(od, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz, eb.endStone)
+			biomeName[lx][lz] = qBiomes[bx][lz>>2]
+			fillEndChunkColumn(c, od, grids, interp, baseX+lx, baseZ+lz, lx, lz, eb.endStone)
 		}
 	}
 
-	baseIdx := endMinY - MinY
-	for lx := 0; lx < 16; lx++ {
-		for lz := 0; lz < 16; lz++ {
-			col := &columns[lx][lz]
-			for y := 0; y < endHeight; y++ {
-				if s := col[baseIdx+y]; s != StateAir {
-					c.setBlockRaw(lx, y, lz, s)
+	if !uniformBiome {
+		for bx := 0; bx < biomeCellsXZ; bx++ {
+			lx := bx * biomeCellSize
+			for bz := 0; bz < biomeCellsXZ; bz++ {
+				lz := bz * biomeCellSize
+				bID := qBiomeIDs[bx][bz]
+				if bID == firstBiomeID {
+					continue
+				}
+				for wy := 0; wy < EndDimensionType.Height; wy += biomeCellSize {
+					c.SetBiome(lx, wy, lz, bID)
 				}
 			}
 		}
 	}
-	fillEndBiomes3D(c, chunkBiomeID)
 	return baseTerrain{
-		c:            c,
-		columns:      &columns,
-		worldSurface: &worldSurface,
-		surfTop:      &surfTop,
-		biomeName:    &biomeName,
+		c:         c,
+		biomeName: &biomeName,
 	}
 }
 
-func fillEndColumn(od *worldgen.OverworldDensity, grids []endCornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int, endStone uint16) (top, worldSurface int) {
+func fillEndChunkColumn(c *Chunk, od *worldgen.OverworldDensity, grids []endCornerGrid, interp []float64, wx, wz, lx, lz int, endStone uint16) {
 	cx0 := lx / endCellWidth
 	cz0 := lz / endCellWidth
 	fx := float64(lx%endCellWidth) / endCellWidth
 	fz := float64(lz%endCellWidth) / endCellWidth
 
-	baseIdx := endMinY - MinY
-	top, worldSurface = -1, endMinY-1
 	for y := 0; y < endHeight; y++ {
 		cy0 := y / endCellHeight
 		fy := float64(y%endCellHeight) / endCellHeight
@@ -254,13 +276,9 @@ func fillEndColumn(od *worldgen.OverworldDensity, grids []endCornerGrid, interp 
 		}
 		ctx := worldgen.FunctionContext{X: float64(wx), Y: float64(y), Z: float64(wz)}.WithInterp(interp)
 		if od.Final.Compute(ctx) > 0 {
-			idx := baseIdx + y
-			out[idx] = endStone
-			top = idx
-			worldSurface = y
+			c.setBlockRaw(lx, y, lz, endStone)
 		}
 	}
-	return top, worldSurface
 }
 
 func trilerpEnd(c *endCornerGrid, x0, y0, z0 int, fx, fy, fz float64) float64 {
@@ -272,18 +290,6 @@ func trilerpEnd(c *endCornerGrid, x0, y0, z0 int, fx, fy, fz float64) float64 {
 	return lerpf(fz, lerpf(fy, c00, c10), lerpf(fy, c01, c11))
 }
 
-func fillEndBiomes3D(c *Chunk, bID uint16) {
-	for bx := 0; bx < biomeCellsXZ; bx++ {
-		lx := bx * biomeCellSize
-		for bz := 0; bz < biomeCellsXZ; bz++ {
-			lz := bz * biomeCellSize
-			for wy := 0; wy < EndDimensionType.Height; wy += biomeCellSize {
-				c.SetBiome(lx, wy, lz, bID)
-			}
-		}
-	}
-}
-
 func endZoomedBiomeAt(od *worldgen.OverworldDensity, zoomSeed int64, x, y, z int) string {
 	qx, qy, qz := zoomQuart(zoomSeed, x, y, z)
 	return worldgen.EndBiomeAt(od.Erosion, qx, qy, qz)
@@ -293,16 +299,23 @@ func endZoomedBiomeAt(od *worldgen.OverworldDensity, zoomSeed int64, x, y, z int
 // (top solid Y, or -1 if column is empty) at world coordinates (wx, wz)
 // using The End's noise router. Used by EndCityStructure.
 func EndFirstOccupiedHeight(od *worldgen.OverworldDensity, wx, wz int) int {
-	eb := loadEndBlocks()
 	cx := wx >> 4
 	cz := wz >> 4
 	baseX, baseZ := cx*16, cz*16
 	lx, lz := wx-baseX, wz-baseZ
 	cx0 := lx / endCellWidth
 	cz0 := lz / endCellWidth
+	fx := float64(lx%endCellWidth) / endCellWidth
+	fz := float64(lz%endCellWidth) / endCellWidth
 
 	// Only evaluate the 4 horizontal corners of the cell containing (lx, lz).
-	grids := make([]endCornerGrid, len(od.Interpolated))
+	var gridBuf [4]endCornerGrid
+	var grids []endCornerGrid
+	if len(od.Interpolated) <= len(gridBuf) {
+		grids = gridBuf[:len(od.Interpolated)]
+	} else {
+		grids = make([]endCornerGrid, len(od.Interpolated))
+	}
 	for dx := 0; dx <= 1; dx++ {
 		ix := cx0 + dx
 		cwx := float64(baseX + ix*endCellWidth)
@@ -318,10 +331,25 @@ func EndFirstOccupiedHeight(od *worldgen.OverworldDensity, wx, wz int) int {
 			}
 		}
 	}
-	var col [WorldHeight]uint16
-	interp := make([]float64, len(od.Interpolated))
-	_, ws := fillEndColumn(od, grids, interp, &col, wx, wz, lx, lz, eb.endStone)
-	return ws
+	var interpBuf [4]float64
+	var interp []float64
+	if len(od.Interpolated) <= len(interpBuf) {
+		interp = interpBuf[:len(od.Interpolated)]
+	} else {
+		interp = make([]float64, len(od.Interpolated))
+	}
+	for y := endHeight - 1; y >= 0; y-- {
+		cy0 := y / endCellHeight
+		fy := float64(y%endCellHeight) / endCellHeight
+		for n := range grids {
+			interp[n] = trilerpEnd(&grids[n], cx0, cy0, cz0, fx, fy, fz)
+		}
+		ctx := worldgen.FunctionContext{X: float64(wx), Y: float64(y), Z: float64(wz)}.WithInterp(interp)
+		if od.Final.Compute(ctx) > 0 {
+			return y
+		}
+	}
+	return endMinY - 1
 }
 
 // ---- End Features ----------------------------------------------------------

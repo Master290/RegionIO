@@ -153,7 +153,8 @@ func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSou
 	}) {
 		return
 	}
-	spheres := buildOreSpheresFrom(random, setup)
+	var sphereBuf [64]oreSphere
+	spheres := buildOreSpheresInto(random, setup, sphereBuf[:0])
 	walkOreBlocks(spheres, func(x, y, z int) {
 		if y < MinY || y >= MinY+WorldHeight {
 			return

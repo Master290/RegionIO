@@ -45,7 +45,8 @@ type decorationRegion struct {
 	sourceZ int32
 	// worldgen freezes the *_WG heightmaps; the region's chunks are mutable from
 	// here on, so this is the only moment the frozen values can be taken.
-	worldgen map[[2]int32]*worldgenTopY
+	worldgen          map[[2]int32]*worldgenTopY
+	sourceBiomesCache map[[2]int32][]string
 	// biomeZoomSeed is BiomeManager.obfuscateSeed(worldSeed), which getBiome needs
 	// and the chunks alone cannot supply. Every stage entry point that receives the
 	// world seed binds it; see bindSeed.
@@ -176,14 +177,17 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 		}
 		return int(frozen.floor[(z&15)*16+(x&15)])
 	}
-	minY := MinY
-	maxY := MinY + WorldHeight - 1
-	if chunk := r.chunkAtBlock(x, z); chunk != nil {
-		minY = chunk.minY()
-		maxY = minY + chunk.worldHeight() - 1
+	chunk := r.chunkAtBlock(x, z)
+	if chunk == nil {
+		return MinY
 	}
+	minY := chunk.minY()
+	maxY := minY + chunk.worldHeight() - 1
+	lx, lz := x&15, z&15
+	chunk.mu.RLock()
+	defer chunk.mu.RUnlock()
 	for y := maxY; y >= minY; y-- {
-		state := r.getBlock(x, y, z)
+		state := chunk.getBlock(lx, y, lz)
 		match := false
 		switch kind {
 		case "WORLD_SURFACE":
@@ -253,20 +257,26 @@ func (r *decorationRegion) biomeAllowsFeature(set *worldgen.FeatureSet, feature 
 }
 
 func (r *decorationRegion) sourceBiomes() []string {
-	seen := make(map[uint16]bool)
-	var names []string
+	key := [2]int32{r.sourceX, r.sourceZ}
+	if cached, ok := r.sourceBiomesCache[key]; ok {
+		return cached
+	}
+	var seen [256]bool
+	names := make([]string, 0, 8)
 	for cx := r.sourceX - 1; cx <= r.sourceX+1; cx++ {
 		for cz := r.sourceZ - 1; cz <= r.sourceZ+1; cz++ {
 			chunk := r.chunks[[2]int32{cx, cz}]
 			if chunk == nil {
 				continue
 			}
-			for si := 0; si < SectionCount; si++ {
+			cMinY := chunk.minY()
+			secCount := chunk.worldHeight() >> 4
+			for si := 0; si < secCount; si++ {
 				for bx := 0; bx < biomeCellsXZ; bx++ {
 					for by := 0; by < biomeCellsXZ; by++ {
 						for bz := 0; bz < biomeCellsXZ; bz++ {
-							id := chunk.GetBiome(bx*biomeCellSize, MinY+si*16+by*biomeCellSize, bz*biomeCellSize)
-							if !seen[id] {
+							id := chunk.GetBiome(bx*biomeCellSize, cMinY+si*16+by*biomeCellSize, bz*biomeCellSize)
+							if int(id) < len(seen) && !seen[id] {
 								seen[id] = true
 								names = append(names, biomeNameByID(id))
 							}
@@ -276,6 +286,10 @@ func (r *decorationRegion) sourceBiomes() []string {
 			}
 		}
 	}
+	if r.sourceBiomesCache == nil {
+		r.sourceBiomesCache = make(map[[2]int32][]string, 9)
+	}
+	r.sourceBiomesCache[key] = names
 	return names
 }
 

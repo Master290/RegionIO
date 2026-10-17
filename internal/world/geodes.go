@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 
 	"regionio/internal/worldgen"
 )
@@ -269,7 +270,30 @@ func tagStateIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
 // snowy and aged variants were missing. carvers and monster rooms already expanded
 // via idsByName, with a comment explaining that tags name blocks rather than
 // states - the package knew; the helper had not been written down once.
+type blockSetCacheKey struct {
+	set *worldgen.FeatureSet
+	key string
+}
+
+var (
+	blockSetCacheMu sync.RWMutex
+	blockSetCache   = make(map[blockSetCacheKey]map[uint16]bool)
+)
+
 func blockSetStateIDs(set *worldgen.FeatureSet, entries []string) map[uint16]bool {
+	cacheKey := blockSetCacheKey{set: set}
+	if len(entries) == 1 {
+		cacheKey.key = entries[0]
+	} else {
+		cacheKey.key = strings.Join(entries, "\x00")
+	}
+	blockSetCacheMu.RLock()
+	if cached, ok := blockSetCache[cacheKey]; ok {
+		blockSetCacheMu.RUnlock()
+		return cached
+	}
+	blockSetCacheMu.RUnlock()
+
 	ids := make(map[uint16]bool)
 	var names []string
 	for _, entry := range entries {
@@ -287,6 +311,10 @@ func blockSetStateIDs(set *worldgen.FeatureSet, entries []string) map[uint16]boo
 			ids[id] = true
 		}
 	}
+
+	blockSetCacheMu.Lock()
+	blockSetCache[cacheKey] = ids
+	blockSetCacheMu.Unlock()
 	return ids
 }
 

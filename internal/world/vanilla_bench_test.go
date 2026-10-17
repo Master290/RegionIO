@@ -21,3 +21,22 @@ func BenchmarkGenerateVanillaRegionBatch(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkGenerateNether(b *testing.B) {
+	g := NewNetherGenerator(12345)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = g(int32(i), 0)
+	}
+}
+
+func BenchmarkGenerateEnd(b *testing.B) {
+	g := NewEndGenerator(12345)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = g(int32(65+i), 0)
+	}
+}
+

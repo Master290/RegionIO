@@ -85,6 +85,24 @@ func (o *OreVeinifier) Calculate(ctx FunctionContext, x, y, z int) (uint16, bool
 		return 0, false
 	}
 
+	if xp, ok := o.random.(*xoroshiroPositional); ok {
+		random := xp.atValue(x, y, z)
+		if random.NextFloat() > veinSolidness {
+			return 0, false
+		}
+		if o.ridged.Compute(ctx) >= 0 {
+			return 0, false
+		}
+		richness := clampedMap(absVeininess, veininessThreshold, maxRichnessThreshold, minRichness, maxRichness)
+		if float64(random.NextFloat()) < richness && o.gap.Compute(ctx) > skipOreIfGapNoiseIsBelow {
+			if random.NextFloat() < chanceOfRawOreBlock {
+				return vein.rawOreBlock, true
+			}
+			return vein.ore, true
+		}
+		return vein.filler, true
+	}
+
 	random := o.random.At(x, y, z)
 	if random.NextFloat() > veinSolidness {
 		return 0, false

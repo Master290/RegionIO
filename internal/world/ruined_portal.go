@@ -226,6 +226,10 @@ func RuinedPortalGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.S
 		if def == nil || len(def.Setups) == 0 {
 			return nil, fmt.Errorf("portal variant %s missing setups", set.Structures[entry].Structure)
 		}
+		if od != nil && isNetherDensity(od) != (def.Setups[0].Placement == "in_nether") {
+			indices = append(indices[:selected], indices[selected+1:]...)
+			continue
+		}
 		// GenerationContext.random() is lazy: every attempt reseeds a fresh
 		// Legacy stream from the same formula instead of continuing the
 		// previous attempt's stream.
