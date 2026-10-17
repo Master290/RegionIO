@@ -206,7 +206,7 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 		tx := origin.X + int(random.NextIntN(5)) - 2
 		tz := origin.Z + int(random.NextIntN(5)) - 2
 		ty := origin.Y
-		if r.getBlock(tx, ty, tz) == StateAir && isFaceSturdy(r.getBlock(tx, ty-1, tz)) {
+		if isAirState(r.getBlock(tx, ty, tz)) && isFaceSturdy(r.getBlock(tx, ty-1, tz)) {
 			if shrieker, ok := nameToStateID("minecraft:sculk_shrieker", map[string]string{
 				"can_summon":  "true",
 				"shrieking":   "false",
@@ -240,12 +240,7 @@ func isSculkBehaviourBlock(state uint16) bool {
 	if !ok {
 		return false
 	}
-	switch name.Name {
-	case "minecraft:sculk", "minecraft:sculk_vein", "minecraft:sculk_catalyst",
-		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor", "minecraft:sculk_shrieker":
-		return true
-	}
-	return false
+	return name.Name == "minecraft:sculk" || name.Name == "minecraft:sculk_vein"
 }
 
 func (r *decorationRegion) sculkCursorUpdate(set *worldgen.FeatureSet, cursor *sculkChargeCursor, sourcePos worldgen.FeaturePosition, random worldgen.RandomSource, sculkReplaceable, sculkReplaceableWorldGen map[uint16]bool, spreadVeins bool) {
@@ -301,12 +296,7 @@ func (r *decorationRegion) sculkCursorUpdate(set *worldgen.FeatureSet, cursor *s
 }
 
 func isSculkBehaviourName(name string) bool {
-	switch name {
-	case "minecraft:sculk", "minecraft:sculk_vein", "minecraft:sculk_catalyst",
-		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor", "minecraft:sculk_shrieker":
-		return true
-	}
-	return false
+	return name == "minecraft:sculk" || name == "minecraft:sculk_vein"
 }
 
 func blockNameOfState(state uint16) string {
