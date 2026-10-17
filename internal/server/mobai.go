@@ -66,6 +66,8 @@ type mobMemory struct {
 	repathCooldown int
 	attackCooldown int
 	seenTick       uint64
+	healthInit     bool
+	health         float32
 }
 
 type playerTarget struct {

@@ -65,6 +65,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			}
 			s.TickWeather(rng)
 			s.TrySkipNightBySleep()
+			s.TickAllPlayersHunger()
 			tracker.TickAndBroadcast(s, rng)
 		}
 	}
@@ -185,6 +186,10 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		}
 
 		mem := t.mobStateFor(snapshot.ID, aiTick)
+		if !mem.healthInit {
+			mem.healthInit = true
+			mem.health = MobMaxHealth(snapshot.TypeName)
+		}
 		if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
 			if mem.attackCooldown > 0 {
 				mem.attackCooldown--
@@ -246,7 +251,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		})
 
 		if attackTarget != nil && !attackTarget.IsDead() {
-			s.DamagePlayer(attackTarget, ZombieAttackDamage, "zombie")
+			s.AttackPlayerFromMob(snapshot.ID, snapshot.TypeName, nextX, nextZ, attackTarget, ZombieAttackDamage)
 		}
 	}
 
