@@ -257,6 +257,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 			return s.CountEntitiesAtBlock(world.DimensionOverworld, x, y, z)
 		})
 		s.BindPistonAndRedstoneHooks(world.DimensionOverworld)
+		s.BindBellRedstone(world.DimensionOverworld)
 	}
 	if entities != nil {
 		entities.SetStepCallback(func(dim string, x, y, z int) {
@@ -2258,10 +2259,84 @@ func (s *Server) TickAllBlockUpdates() {
 		ds.mu.Unlock()
 		if dim == world.DimensionOverworld || cache != nil {
 			s.TickDimensionBlockUpdates(dim)
+			s.TickDimensionRandomBlocks(dim, nil)
 		}
 	}
 }
 
+// RandomTickBlockAtInDimension dispatches a random block tick at (dimension, x, y, z)
+// to copper oxidation, vine/hanging-flora growth, or snow/ice/frosted-ice melting.
+func (s *Server) RandomTickBlockAtInDimension(dimension string, x, y, z int, rng *rand.Rand) bool {
+	if s == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return false
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return false
+	}
+	state := cache.GetBlock(x, y, z)
+	if state == world.StateAir {
+		return false
+	}
+	if world.CanCopperBlockOxidize(state) {
+		return s.RandomTickCopperBlockAt(normDim, x, y, z)
+	}
+	switch world.BlockName(state) {
+	case "minecraft:vine", "minecraft:cave_vines", "minecraft:weeping_vines", "minecraft:twisting_vines":
+		return s.RandomTickVinesAndFloraInDimension(normDim, x, y, z, rng)
+	}
+	if world.IsSnowLayerBlock(state) || world.IsIceBlock(state) || world.IsFrostedIceBlock(state) {
+		return s.RandomTickSnowOrIceInDimension(normDim, x, y, z, rng)
+	}
+	return false
+}
 
-
-
+// TickDimensionRandomBlocks samples random blocks near connected players in dim
+// for copper oxidation, vine/hanging-flora growth, and snow/ice/frosted-ice melting.
+func (s *Server) TickDimensionRandomBlocks(dim string, rng *rand.Rand) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	speed := cache.RandomTickSpeed()
+	if speed <= 0 {
+		return
+	}
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		players = append(players, p)
+	}
+	s.playersMu.RUnlock()
+	if len(players) == 0 {
+		return
+	}
+	if rng == nil {
+		gt, _ := s.WorldTime()
+		rng = rand.New(rand.NewSource(gt + 0xC099E2))
+	}
+	for _, p := range players {
+		if p == nil || p.IsDead() {
+			continue
+		}
+		snap := p.Snapshot()
+		if world.NormalizeDimension(snap.Dimension) != normDim {
+			continue
+		}
+		bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
+		cx := (bx >> 4) << 4
+		cz := (bz >> 4) << 4
+		baseY := (by >> 4) << 4
+		for i := 0; i < speed; i++ {
+			rx := cx + rng.Intn(16)
+			ry := baseY + rng.Intn(16)
+			rz := cz + rng.Intn(16)
+			s.RandomTickBlockAtInDimension(normDim, rx, ry, rz, rng)
+		}
+	}
+}

@@ -402,6 +402,10 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 		h.srv.OnEntityStepTripwire(h.session.Dimension(), bx, by, bz)
 		h.srv.ApplyCampfireContactDamageToPlayer(h.session)
 		h.srv.HandlePlayerInsideCauldron(h.session, bx, by, bz, false)
+		if onGround {
+			h.srv.ApplyPlayerFrostWalker(h.session, bx, by, bz)
+		}
+		h.srv.StepPlayerPowderSnow(h.session)
 		res, err := h.srv.CheckPlayerPortal(h.session)
 		if err != nil {
 			return err
@@ -1587,6 +1591,79 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						return h.sendBlockChangedAck(seq)
 					}
 				}
+			}
+			dim := h.session.Dimension()
+			if dim == "" {
+				dim = world.DimensionOverworld
+			}
+			invSlot := h.session.HeldInventorySlot()
+			if hand == server.HandOffHand {
+				invSlot = server.OffHandContainerSlot
+			}
+			if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+				h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+			}
+			var heldStack world.ItemStack
+			var heldMeta server.ItemMeta
+			if invSlot >= 0 {
+				heldStack = h.session.InventorySlot(invSlot)
+				heldMeta = server.GetSlotItemMeta(h.session, invSlot)
+			}
+			creative := h.session.Snapshot().GameMode == server.GameModeCreative
+			sneaking := h.session.IsSneaking()
+
+			if world.IsBellBlock(clickedState) && !sneaking {
+				faceDir := server.BlockFaceDirectionName(face)
+				if world.CanRingBellFromDirection(clickedState, faceDir, float64(cursorY)) {
+					if h.srv.RingBellAt(dim, x, y, z, faceDir, h.session.EntityID, h.session) {
+						return h.sendBlockChangedAck(seq)
+					}
+				}
+			}
+			if world.IsCaveVinesBlock(clickedState) && world.BlockProperties(clickedState)["berries"] == "true" {
+				if _, harvested := h.srv.HarvestCaveVinesBerries(h.session, dim, x, y, z, true); harvested {
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+			if heldStack.ResolvedID() == "minecraft:bone_meal" {
+				if newStack, grown := h.srv.BoneMealHangingFloraAt(dim, x, y, z, heldStack, creative, nil); grown {
+					if invSlot >= 0 {
+						h.session.SetInventorySlot(invSlot, newStack)
+						if invSlot < world.PlayerInventorySlots && h.conn != nil {
+							_ = h.sendContainerSetSlot(invSlot, newStack)
+						}
+					}
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+			if heldStack.ResolvedID() == "minecraft:shears" {
+				if newStack, newMeta, sheared := h.srv.ShearGrowingPlantTip(dim, x, y, z, heldStack, heldMeta, creative); sheared {
+					if invSlot >= 0 {
+						h.session.SetInventorySlot(invSlot, newStack)
+						server.SetSlotItemMeta(h.session, invSlot, newMeta)
+						if invSlot < world.PlayerInventorySlots && h.conn != nil {
+							_ = h.sendContainerSetSlot(invSlot, newStack)
+						}
+					}
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+			if newStack, newMeta, soundEvent, handled := h.srv.TryInteractCopperBlock(dim, x, y, z, heldStack, heldMeta, sneaking, creative); handled {
+				if invSlot >= 0 {
+					h.session.SetInventorySlot(invSlot, newStack)
+					server.SetSlotItemMeta(h.session, invSlot, newMeta)
+					if invSlot < world.PlayerInventorySlots && h.conn != nil {
+						_ = h.sendContainerSetSlot(invSlot, newStack)
+					}
+				}
+				if soundEvent != "" {
+					h.srv.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), server.PlaySoundPacketID,
+						server.EncodeSoundPacket(soundEvent, server.SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+				}
+				h.syncHotbarFromSession()
+				return h.sendBlockChangedAck(seq)
 			}
 		}
 		opened, _, err := h.srv.InteractBlock(h.session, x, y, z)

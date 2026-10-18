@@ -37,11 +37,13 @@ const (
 )
 
 type playerSurvivalState struct {
-	mu            sync.Mutex
-	fallDistance  float64
-	dead          bool
-	drawingWeapon string
-	drawingHand   int32
+	mu                sync.Mutex
+	fallDistance      float64
+	dead              bool
+	drawingWeapon     string
+	drawingHand       int32
+	ticksFrozen       int
+	freezeTickCounter int
 }
 
 var playerSurvivalStates sync.Map // map[*PlayerSession]*playerSurvivalState
@@ -420,6 +422,25 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return true, 0
 	}
 
+	if world.IsIceBlock(prevState) {
+		droppedIce, _ := s.BreakIceBlock(dim, x, y, z, heldStack, toolMeta, mode == GameModeCreative)
+		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+		s.OnSculkBlockBroken(dim, x, y, z, prevState)
+		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:ice")
+		if mode == GameModeSurvival {
+			s.RecordBlockBreakExhaustion(session)
+			s.RecordBlockMined(session, "minecraft:ice")
+			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
+				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
+				if s.DamagePlayerItem(session, heldSlot, 1) {
+					s.RecordItemBroken(session, heldStack.ResolvedID())
+				}
+			}
+		}
+		_ = droppedIce
+		return true, 0
+	}
+
 	if IsCampfireBlock(prevState) {
 		if mode == GameModeSurvival && s.DoTileDrops() {
 			s.BreakCampfireAt(dim, x, y, z, HasSilkTouch(toolMeta))
@@ -457,7 +478,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsBedBlock(prevState) {
 		s.BreakBedPartner(dim, cache, x, y, z, prevState)
 	}
-	if IsChestBlock(prevState) {
+	if IsChestBlock(prevState) || world.IsCopperChestBlock(prevState) {
 		s.DropChestContents(x, y, z)
 	}
 	if IsDispenserOrDropperBlock(prevState) {
@@ -1740,7 +1761,14 @@ func (s *Server) traceAndResolveProjectileShot(
 			bx := int(math.Floor(rx))
 			by := int(math.Floor(ry))
 			bz := int(math.Floor(rz))
-			if !isPassableBlock(cache.GetBlock(bx, by, bz)) {
+			hitState := cache.GetBlock(bx, by, bz)
+			if world.IsBellBlock(hitState) {
+				s.RingBellAt(dim, bx, by, bz, "", projID, session)
+			}
+			if IsCampfireBlock(hitState) && itemID == "minecraft:arrow" && s.PlayerFireTicks(session) > 0 {
+				s.TryIgniteCampfireWithProjectile(dim, bx, by, bz, true)
+			}
+			if !isPassableBlock(hitState) {
 				landX, landY, landZ = rx, ry, rz
 				break
 			}
@@ -1999,6 +2027,12 @@ func (s *Server) TickDispenserProjectiles() int {
 		return 0
 	}
 	var toRemove []int32
+	type bellHit struct {
+		dim        string
+		x, y, z    int
+		projEntity int32
+	}
+	var bellHits []bellHit
 	ticked := 0
 	for id, proj := range ds.projectiles {
 		if proj == nil {
@@ -2020,6 +2054,13 @@ func (s *Server) TickDispenserProjectiles() int {
 			proj.VY *= 0.99
 			proj.VZ *= 0.99
 		}
+		if cache := s.DimensionChunks(proj.Dimension); cache != nil {
+			bx, by, bz := int(math.Floor(proj.X)), int(math.Floor(proj.Y)), int(math.Floor(proj.Z))
+			if by >= world.MinY && by < world.MinY+world.WorldHeight && world.IsBellBlock(cache.GetBlock(bx, by, bz)) {
+				proj.Impacted = true
+				bellHits = append(bellHits, bellHit{dim: proj.Dimension, x: bx, y: by, z: bz, projEntity: id})
+			}
+		}
 		if s.entities != nil {
 			nx, ny, nz := proj.X, proj.Y, proj.Z
 			vx, vy, vz := proj.VX, proj.VY, proj.VZ
@@ -2040,11 +2081,14 @@ func (s *Server) TickDispenserProjectiles() int {
 		}
 	}
 	ds.mu.Unlock()
+	for _, bh := range bellHits {
+		s.RingBellAt(bh.dim, bh.x, bh.y, bh.z, "", bh.projEntity, nil)
+	}
 	return ticked
 }
 
-// TickAllPlayersCampfireContactDamage applies lit campfire contact damage to all
-// connected players standing on a lit campfire block.
+// TickAllPlayersCampfireContactDamage applies lit campfire contact damage and
+// powder snow freezing ticks to all connected players.
 func (s *Server) TickAllPlayersCampfireContactDamage() {
 	if s == nil {
 		return
@@ -2057,6 +2101,7 @@ func (s *Server) TickAllPlayersCampfireContactDamage() {
 	s.playersMu.RUnlock()
 	for _, sess := range sessions {
 		s.ApplyCampfireContactDamageToPlayer(sess)
+		s.StepPlayerPowderSnow(sess)
 	}
 }
 
@@ -3373,6 +3418,131 @@ func (s *Server) broadcastBlockUpdate(x, y, z int, state uint16) {
 	s.broadcastBlockUpdateInDim(world.DimensionOverworld, x, y, z, state)
 }
 
+// ApplyPlayerFrostWalker freezes exposed source water around (blockX, blockY, blockZ)
+// into frosted_ice[age=0] when session is wearing boots enchanted with frost_walker.
+func (s *Server) ApplyPlayerFrostWalker(session *PlayerSession, blockX, blockY, blockZ int) int {
+	if s == nil || session == nil || session.IsDead() {
+		return 0
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || !snap.OnGround {
+		return 0
+	}
+	boots := session.InventorySlot(ArmorSlotFeet)
+	if boots.IsEmpty() {
+		return 0
+	}
+	lvl := int(GetSlotItemMeta(session, ArmorSlotFeet).EnchantmentLevel("minecraft:frost_walker"))
+	if lvl <= 0 {
+		return 0
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return 0
+	}
+	placed, upd := cache.ApplyFrostWalkerAround(blockX, blockY, blockZ, lvl)
+	if placed > 0 {
+		s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+	}
+	return placed
+}
 
+// CanPlayerWalkOnPowderSnow reports whether session is wearing leather_boots
+// and can walk on top of powder_snow without sinking.
+func (s *Server) CanPlayerWalkOnPowderSnow(session *PlayerSession) bool {
+	if session == nil {
+		return false
+	}
+	return world.CanEntityWalkOnPowderSnow(session.InventorySlot(ArmorSlotFeet).ResolvedID())
+}
 
+// PlayerTicksFrozen returns session's current powder_snow freeze ticks (0..140).
+func (s *Server) PlayerTicksFrozen(session *PlayerSession) int {
+	if session == nil {
+		return 0
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.ticksFrozen
+}
 
+// SetPlayerTicksFrozen sets session's powder_snow freeze ticks (clamped to 0..140).
+func (s *Server) SetPlayerTicksFrozen(session *PlayerSession, ticks int) {
+	if session == nil {
+		return
+	}
+	if ticks < 0 {
+		ticks = 0
+	} else if ticks > world.PowderSnowMinFreezeTicks {
+		ticks = world.PowderSnowMinFreezeTicks
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.ticksFrozen = ticks
+	st.mu.Unlock()
+}
+
+// StepPlayerPowderSnow advances session's powder_snow freezing counter by 1 tick
+// (or cools down by 2 ticks outside powder_snow / with leather armor), melts
+// powder_snow when the player is burning, and deals 1.0 freeze damage every 40 ticks when fully frozen.
+func (s *Server) StepPlayerPowderSnow(session *PlayerSession) (ticksFrozen int, fullyFrozen bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return 0, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return 0, false
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return 0, false
+	}
+	bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
+	inPowderSnow := false
+	if by >= world.MinY && by < world.MinY+world.WorldHeight {
+		inPowderSnow = world.IsPowderSnowBlock(cache.GetBlock(bx, by, bz))
+		if !inPowderSnow && by+1 < world.MinY+world.WorldHeight {
+			inPowderSnow = world.IsPowderSnowBlock(cache.GetBlock(bx, by+1, bz))
+		}
+	}
+	if inPowderSnow && s.PlayerFireTicks(session) > 0 {
+		if melted, upd := cache.ExtinguishBurningEntityInPowderSnowAt(bx, by, bz, true, true); melted {
+			s.SetPlayerFireTicks(session, 0)
+			s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+			inPowderSnow = false
+		}
+	}
+
+	bootsID := session.InventorySlot(ArmorSlotFeet).ResolvedID()
+	_ = world.CanEntityWalkOnPowderSnow(bootsID)
+	hasLeatherArmor := world.IsEntityFreezeImmuneByArmor(
+		session.InventorySlot(ArmorSlotHead).ResolvedID(),
+		session.InventorySlot(ArmorSlotHead+1).ResolvedID(),
+		session.InventorySlot(ArmorSlotHead+2).ResolvedID(),
+		bootsID,
+	)
+
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	nextFrozen, frozen := world.StepPowderSnowFreezing(inPowderSnow, hasLeatherArmor, st.ticksFrozen)
+	st.ticksFrozen = nextFrozen
+	shouldDamage := false
+	if frozen && snap.GameMode != GameModeCreative {
+		st.freezeTickCounter++
+		if st.freezeTickCounter >= world.PowderSnowFreezeDamageIntervalTicks {
+			st.freezeTickCounter = 0
+			shouldDamage = true
+		}
+	} else {
+		st.freezeTickCounter = 0
+	}
+	st.mu.Unlock()
+
+	if shouldDamage {
+		s.DamagePlayer(session, world.PowderSnowFreezeDamage, "freeze")
+	}
+	return nextFrozen, frozen
+}

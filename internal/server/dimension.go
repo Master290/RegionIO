@@ -133,6 +133,7 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 	ds.caches[norm] = cache
 	ds.mu.Unlock()
 	s.BindPistonAndRedstoneHooks(norm)
+	s.BindBellRedstone(norm)
 	return cache
 }
 
