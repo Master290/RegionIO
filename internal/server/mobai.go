@@ -119,7 +119,7 @@ func IsPassiveMob(typeName string) bool {
 func (s *Server) appendPlayerTargets(dst []playerTarget) []playerTarget {
 	s.playersMu.RLock()
 	for _, session := range s.players {
-		if session == nil || session.IsDead() {
+		if session == nil || !session.IsJoined() || session.IsDead() {
 			continue
 		}
 		session.mu.RLock()

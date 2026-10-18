@@ -107,7 +107,7 @@ func (s *Server) SetWorldSpawn(x, y, z int, yaw float32) {
 	s.playersMu.RUnlock()
 
 	for _, p := range sessions {
-		if p == nil || p.send == nil {
+		if p == nil || !p.IsJoined() || p.send == nil {
 			continue
 		}
 		if !p.Snapshot().HasSpawn {

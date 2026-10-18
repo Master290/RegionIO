@@ -26,7 +26,8 @@ const (
 // hands chunk streaming off to the background streamer. The streamer stops when
 // h.ctx (the connection lifetime context) is cancelled.
 func (h *handler) beginPlay() error {
-	session, err := h.srv.RegisterPlayer(h.conn.Profile, h.conn.Enqueue)
+	wx, wy, wz, wyaw := h.srv.WorldSpawn()
+	session, err := h.srv.RegisterPlayerPending(h.conn.Profile, h.conn.Enqueue)
 	if err != nil {
 		return err
 	}
@@ -40,7 +41,6 @@ func (h *handler) beginPlay() error {
 		if snap.HasSpawn {
 			h.spawnY = float64(snap.SpawnY)
 		} else {
-			_, wy, _, _ := h.srv.WorldSpawn()
 			h.spawnY = float64(wy)
 		}
 		h.heldSlot = snap.SelectedSlot
@@ -54,7 +54,6 @@ func (h *handler) beginPlay() error {
 			}
 		}
 	} else {
-		wx, wy, wz, wyaw := h.srv.WorldSpawn()
 		h.spawnY = float64(wy)
 		h.srv.SetPlayerTransform(session, float64(wx)+0.5, h.spawnY, float64(wz)+0.5, wyaw, 0, true)
 	}
@@ -125,6 +124,7 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	h.srv.SendWorldBorderToPlayer(session)
+	session.SetJoined(true)
 	h.srv.BroadcastPlayerInfoAdd(session)
 	_ = h.srv.SendFullTabListToPlayer(session)
 	_ = h.srv.SendFullScoreboardToPlayer(session)

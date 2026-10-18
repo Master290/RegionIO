@@ -478,5 +478,75 @@ func TestPlayContainerPacketsOpenClickAndClose(t *testing.T) {
 	}
 }
 
+func TestBeginPlayNeverSendsSetTimeBeforePlayLogin(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	var srv *server.Server
+	cache := world.NewCache(-1, func(cx, cz int32) *world.Chunk {
+		if cx == 0 && cz == 0 && srv != nil {
+			// Simulate the tick loop broadcasting set_time, chunk updates, and
+			// weather while the fresh world spawn chunk is still generating.
+			srv.Broadcast(protocol.PlaySetTime, srv.SetTimePacket())
+			srv.BroadcastChunk(0, 0, protocol.PlayBlockUpdate, []byte{0})
+			srv.SetWorldSpawn(8, world.FlatSurfaceY+1, 8, 0)
+		}
+		return world.GenerateFlat(cx, cz)
+	})
+	var err error
+	srv, err = server.NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
 
+	// Verify RegisterPlayerPending gates broadcasts until SetJoined(true).
+	pendingRec := &recordingConn{}
+	pendingConn := NewConn(pendingRec)
+	pendingProfile := server.Profile{Name: "Pending", UUID: server.OfflineUUID("Pending")}
+	pendingSess, err := srv.RegisterPlayerPending(pendingProfile, pendingConn.Send)
+	if err != nil {
+		t.Fatalf("RegisterPlayerPending: %v", err)
+	}
+	if pendingSess.IsJoined() {
+		t.Fatal("expected pending session IsJoined() = false")
+	}
+	srv.Broadcast(protocol.PlaySetTime, srv.SetTimePacket())
+	if pkts := pendingRec.take(t); len(pkts) != 0 {
+		t.Fatalf("pending session received %d broadcast packets before SetJoined(true), want 0", len(pkts))
+	}
+	if snaps := srv.PlayerSnapshots(); len(snaps) != 0 {
+		t.Fatalf("PlayerSnapshots length with pending session = %d, want 0", len(snaps))
+	}
+	pendingSess.SetJoined(true)
+	srv.Broadcast(protocol.PlaySetTime, srv.SetTimePacket())
+	if pkts := pendingRec.take(t); len(pkts) != 1 || pkts[0].ID != protocol.PlaySetTime {
+		t.Fatalf("joined session broadcast packets = %v, want 1 PlaySetTime", pkts)
+	}
+	srv.UnregisterPlayer(pendingSess)
 
+	// Verify full beginPlay() sends PlayLogin as the very first packet even when
+	// WorldSpawn generation triggers concurrent server broadcasts.
+	rec := &recordingConn{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &handler{
+		conn: NewConn(rec),
+		srv:  srv,
+		log:  slog.Default(),
+		ctx:  ctx,
+	}
+	h.conn.Profile = server.Profile{Name: "FreshJoin", UUID: server.OfflineUUID("FreshJoin")}
+	if err := h.beginPlay(); err != nil {
+		t.Fatalf("beginPlay: %v", err)
+	}
+	defer srv.UnregisterPlayer(h.session)
+	if !h.session.IsJoined() {
+		t.Fatal("expected session IsJoined() = true after beginPlay")
+	}
+	pkts := rec.take(t)
+	if len(pkts) == 0 {
+		t.Fatal("expected join packets from beginPlay")
+	}
+	if pkts[0].ID != protocol.PlayLogin {
+		t.Fatalf("first packet ID = %#x, want PlayLogin (%#x)", pkts[0].ID, protocol.PlayLogin)
+	}
+}

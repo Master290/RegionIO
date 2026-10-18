@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
@@ -149,6 +150,7 @@ type PlayerSession struct {
 	walkSpeed        float32
 	cameraEntityID   int32
 	recenterFn       func(cx, cz int32)
+	joined           atomic.Bool
 }
 
 // PlayerSnapshot is an immutable view of one play-state session.
@@ -581,8 +583,20 @@ func (s *Server) Chunks() *world.Cache { return s.chunks }
 func (s *Server) Entities() *world.EntityManager { return s.entities }
 
 // RegisterPlayer adds a profile to the active play-state registry and restores
-// persisted playerdata from disk if available.
+// persisted playerdata from disk if available. The returned session is marked
+// ready to receive broadcasts immediately.
 func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSession, error) {
+	return s.registerPlayer(profile, send, true)
+}
+
+// RegisterPlayerPending adds a profile to the active play-state registry while
+// keeping the session unjoined (joined=false) until the network handler has
+// sent PlayLogin and initial state packets and calls session.SetJoined(true).
+func (s *Server) RegisterPlayerPending(profile Profile, send PacketSender) (*PlayerSession, error) {
+	return s.registerPlayer(profile, send, false)
+}
+
+func (s *Server) registerPlayer(profile Profile, send PacketSender, joined bool) (*PlayerSession, error) {
 	if err := s.checkAccess(profile); err != nil {
 		return nil, err
 	}
@@ -623,6 +637,7 @@ func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSess
 		flySpeed:       0.05,
 		walkSpeed:      0.1,
 	}
+	session.joined.Store(joined)
 	if hasSaved {
 		session.ApplyPlayerData(persisted)
 		session.mu.Lock()
@@ -636,6 +651,23 @@ func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSess
 	return session, nil
 }
 
+// IsJoined reports whether the session has finished its play-state login
+// sequence and is ready to receive broadcasts.
+func (session *PlayerSession) IsJoined() bool {
+	if session == nil {
+		return false
+	}
+	return session.joined.Load()
+}
+
+// SetJoined marks whether the session is ready to receive broadcasts.
+func (session *PlayerSession) SetJoined(joined bool) {
+	if session == nil {
+		return
+	}
+	session.joined.Store(joined)
+}
+
 // UnregisterPlayer saves the session's playerdata and removes the session.
 // Pointer identity keeps a delayed disconnect from removing a future session
 // with the same profile.
@@ -643,6 +675,7 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	if session == nil {
 		return
 	}
+	session.joined.Store(false)
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)
 	s.DismountPlayerVehicle(session)
@@ -2133,7 +2166,9 @@ func (s *Server) PlayerSnapshots() []PlayerSnapshot {
 	s.playersMu.RLock()
 	players := make([]*PlayerSession, 0, len(s.players))
 	for _, player := range s.players {
-		players = append(players, player)
+		if player != nil && player.IsJoined() {
+			players = append(players, player)
+		}
 	}
 	s.playersMu.RUnlock()
 
@@ -2157,7 +2192,9 @@ func (s *Server) Broadcast(id int32, body []byte) {
 	s.playersMu.RLock()
 	senders := make([]PacketSender, 0, len(s.players))
 	for _, player := range s.players {
-		senders = append(senders, player.send)
+		if player != nil && player.IsJoined() {
+			senders = append(senders, player.send)
+		}
 	}
 	s.playersMu.RUnlock()
 	for _, send := range senders {
@@ -2173,7 +2210,9 @@ func (s *Server) BroadcastChunk(cx, cz int32, id int32, body []byte) {
 	s.playersMu.RLock()
 	players := make([]*PlayerSession, 0, len(s.players))
 	for _, player := range s.players {
-		players = append(players, player)
+		if player != nil && player.IsJoined() {
+			players = append(players, player)
+		}
 	}
 	s.playersMu.RUnlock()
 
@@ -2209,7 +2248,9 @@ func (s *Server) NearestPlayer(x, y, z float64) (pos [3]float64, ok bool) {
 	s.playersMu.RLock()
 	players := make([]*PlayerSession, 0, len(s.players))
 	for _, player := range s.players {
-		players = append(players, player)
+		if player != nil && player.IsJoined() {
+			players = append(players, player)
+		}
 	}
 	s.playersMu.RUnlock()
 	for _, player := range players {

@@ -74,6 +74,9 @@ func main() {
 		log.Info("pregeneration complete", "radius", *pregenerate, "elapsed", time.Since(start))
 	}
 
+	spawnX, spawnY, spawnZ, _ := srv.WorldSpawn()
+	log.Info("world spawn ready", "x", spawnX, "y", spawnY, "z", spawnZ)
+
 	srv.StartSpawning(saveCtx, log)
 	go network.RunConsole(saveCtx, os.Stdin, srv, log)
 

@@ -382,7 +382,9 @@ func (s *Server) BroadcastDimensionChunkExcept(dim string, cx, cz int32, exceptU
 	s.playersMu.RLock()
 	players := make([]*PlayerSession, 0, len(s.players))
 	for _, player := range s.players {
-		players = append(players, player)
+		if player != nil && player.IsJoined() {
+			players = append(players, player)
+		}
 	}
 	s.playersMu.RUnlock()
 
@@ -479,6 +481,11 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 	dimSt.mu.RUnlock()
 
 	if send != nil {
+		wasJoined := session.IsJoined()
+		if wasJoined {
+			session.SetJoined(false)
+			defer session.SetJoined(true)
+		}
 		// 1. ClientboundRespawnPacket (with KEEP_ALL_DATA = 0x03 for dimension change).
 		respawnPkt := EncodeDimensionRespawnPacket(normTarget, mode, s.cfg.WorldSeed, protocol.RespawnKeepAllData)
 		if err := send(protocol.PlayRespawn, respawnPkt); err != nil {

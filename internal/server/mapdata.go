@@ -1654,7 +1654,7 @@ func (s *Server) onlinePlayersSnapshot() []*PlayerSession {
 	s.playersMu.RLock()
 	out := make([]*PlayerSession, 0, len(s.players))
 	for _, p := range s.players {
-		if p != nil {
+		if p != nil && p.IsJoined() {
 			out = append(out, p)
 		}
 	}

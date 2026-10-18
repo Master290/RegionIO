@@ -491,6 +491,9 @@ func (s *Server) appendViewerTargets(dst []viewerTarget) []viewerTarget {
 	}
 	s.playersMu.RLock()
 	for _, session := range s.players {
+		if session == nil || !session.IsJoined() {
+			continue
+		}
 		session.mu.RLock()
 		pos := session.position
 		vd := session.viewDist
