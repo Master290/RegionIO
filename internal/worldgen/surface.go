@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // surface.go implements the vanilla SurfaceRules interpreter: a rule tree that
@@ -21,6 +22,12 @@ import (
 // matching the Integer.MIN_VALUE vanilla uses. A caller building a context by
 // hand must set it explicitly; the zero value would read as water at y=0.
 const NoWaterAbove = math.MinInt
+
+// BiomeGetter resolves the zoomed biome at a block position without allocating
+// a method-value closure.
+type BiomeGetter interface {
+	BiomeAt(x, y, z int) string
+}
 
 // SurfaceContext carries the per-block data a surface rule needs to decide.
 type SurfaceContext struct {
@@ -40,8 +47,11 @@ type SurfaceContext struct {
 	// SeaLevel is the world sea level (63 for the overworld).
 	SeaLevel int
 	// BiomeName is the resolved surface biome (e.g. "minecraft:desert"). It is
-	// used only when BiomeFunc is nil.
+	// used only when BiomeFunc and BiomeGetter are nil.
 	BiomeName string
+	// BiomeGetter, when set, resolves the biome at (X, Y, Z) without allocating
+	// a method-value closure.
+	BiomeGetter BiomeGetter
 	// BiomeFunc, when set, resolves the biome at (X, Y, Z). Vanilla's
 	// SurfaceRules$Context.updateY memoizes biomeGetter.apply(pos) per block, and
 	// the getter is BiomeManager::getBiome, so the biome a rule tests can change
@@ -73,6 +83,7 @@ type SurfaceContext struct {
 	// conditions reference, refreshed once per column by BeginColumn. Vanilla
 	// caches these the same way, through LazyXZCondition.
 	noiseValues []float64
+	noiseBuf    [16]float64
 }
 
 // SurfaceRule decides the block at a context. Apply returns ok=false when the
@@ -130,15 +141,19 @@ type ConditionTest interface {
 }
 
 // Biome returns the biome the rules see at the context's current position: the
-// lazily resolved, per-position BiomeFunc answer when a getter is set, otherwise
+// lazily resolved, per-position BiomeGetter/BiomeFunc answer when set, otherwise
 // BiomeName.
 func (ctx *SurfaceContext) Biome() string {
-	if ctx.BiomeFunc == nil {
+	if ctx.BiomeGetter == nil && ctx.BiomeFunc == nil {
 		return ctx.BiomeName
 	}
 	key := [3]int{ctx.X, ctx.Y, ctx.Z}
 	if !ctx.biomeSet || ctx.biomeKey != key {
-		ctx.biomeName = ctx.BiomeFunc(ctx.X, ctx.Y, ctx.Z)
+		if ctx.BiomeGetter != nil {
+			ctx.biomeName = ctx.BiomeGetter.BiomeAt(ctx.X, ctx.Y, ctx.Z)
+		} else {
+			ctx.biomeName = ctx.BiomeFunc(ctx.X, ctx.Y, ctx.Z)
+		}
 		ctx.biomeKey = key
 		ctx.biomeSet = true
 	}
@@ -323,10 +338,44 @@ type SurfaceRuleSet struct {
 	noises []*NormalNoise
 }
 
+var surfaceContextPool = sync.Pool{
+	New: func() any {
+		return &SurfaceContext{}
+	},
+}
+
 // NewContext returns a SurfaceContext sized for this rule set's per-column
 // noise cache. Reuse one per goroutine; BeginColumn refreshes it.
 func (s *SurfaceRuleSet) NewContext() *SurfaceContext {
-	return &SurfaceContext{noiseValues: make([]float64, len(s.noises))}
+	ctx := &SurfaceContext{}
+	if len(s.noises) <= len(ctx.noiseBuf) {
+		ctx.noiseValues = ctx.noiseBuf[:len(s.noises)]
+	} else {
+		ctx.noiseValues = make([]float64, len(s.noises))
+	}
+	return ctx
+}
+
+// AcquireContext returns a pooled SurfaceContext sized for this rule set.
+func (s *SurfaceRuleSet) AcquireContext() *SurfaceContext {
+	ctx := surfaceContextPool.Get().(*SurfaceContext)
+	*ctx = SurfaceContext{}
+	if len(s.noises) <= len(ctx.noiseBuf) {
+		ctx.noiseValues = ctx.noiseBuf[:len(s.noises)]
+	} else {
+		ctx.noiseValues = make([]float64, len(s.noises))
+	}
+	return ctx
+}
+
+// ReleaseSurfaceContext returns a pooled SurfaceContext to the pool.
+func ReleaseSurfaceContext(ctx *SurfaceContext) {
+	if ctx == nil {
+		return
+	}
+	ctx.BiomeGetter = nil
+	ctx.BiomeFunc = nil
+	surfaceContextPool.Put(ctx)
 }
 
 // BeginColumn samples every noise the tree references at (x, z) and stores the

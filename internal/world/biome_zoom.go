@@ -127,21 +127,48 @@ type zoomedBiomes struct {
 	od       *worldgen.OverworldDensity
 	zoomSeed int64
 	qx0, qz0 int
+	gen      uint32
 
-	colOnce [biomeZoomSpan][biomeZoomSpan]sync.Once
-	cols    [biomeZoomSpan][biomeZoomSpan]worldgen.Sample2D
+	colMu  [biomeZoomSpan][biomeZoomSpan]sync.Mutex
+	colGen [biomeZoomSpan][biomeZoomSpan]uint32
+	cols   [biomeZoomSpan][biomeZoomSpan]worldgen.Sample2D
 
-	nameOnce [biomeZoomSpan][biomeZoomSpan][biomeQuartsY]sync.Once
-	names    [biomeZoomSpan][biomeZoomSpan][biomeQuartsY]string
+	nameGen [biomeZoomSpan][biomeZoomSpan][biomeQuartsY]uint32
+	names   [biomeZoomSpan][biomeZoomSpan][biomeQuartsY]string
+}
+
+var zoomedBiomesPool = sync.Pool{
+	New: func() any {
+		return &zoomedBiomes{}
+	},
 }
 
 func newZoomedBiomes(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *zoomedBiomes {
-	return &zoomedBiomes{
-		od:       od,
-		zoomSeed: obfuscateBiomeSeed(seed),
-		qx0:      int(cx)*4 - 1,
-		qz0:      int(cz)*4 - 1,
+	z := zoomedBiomesPool.Get().(*zoomedBiomes)
+	z.od = od
+	z.zoomSeed = obfuscateBiomeSeed(seed)
+	z.qx0 = int(cx)*4 - 1
+	z.qz0 = int(cz)*4 - 1
+	z.gen++
+	if z.gen == 0 {
+		clear(z.colGen[:])
+		clear(z.nameGen[:])
+		z.gen = 1
 	}
+	return z
+}
+
+func releaseZoomedBiomes(z *zoomedBiomes) {
+	if z == nil {
+		return
+	}
+	z.od = nil
+	zoomedBiomesPool.Put(z)
+}
+
+// BiomeAt implements worldgen.BiomeGetter without allocating a method-value closure.
+func (z *zoomedBiomes) BiomeAt(x, y, zc int) string {
+	return z.at(x, y, zc)
 }
 
 // at is BiomeManager.getBiome(x, y, z) by name.
@@ -163,11 +190,16 @@ func (z *zoomedBiomes) noiseBiome(qx, qy, qz int) string {
 		return loadBiomeTable().FindBiome(worldgen.SampleCell(z.od, s2D, qx*4, qy*4, qz*4))
 	}
 	j := qy - biomeMinQuartY
-	z.nameOnce[i][k][j].Do(func() {
-		z.colOnce[i][k].Do(func() {
+	z.colMu[i][k].Lock()
+	if z.nameGen[i][k][j] != z.gen {
+		if z.colGen[i][k] != z.gen {
 			z.cols[i][k] = worldgen.SampleColumn2D(z.od, SeaLevel, qx*4, qz*4)
-		})
+			z.colGen[i][k] = z.gen
+		}
 		z.names[i][k][j] = loadBiomeTable().FindBiome(worldgen.SampleCell(z.od, z.cols[i][k], qx*4, qy*4, qz*4))
-	})
-	return z.names[i][k][j]
+		z.nameGen[i][k][j] = z.gen
+	}
+	name := z.names[i][k][j]
+	z.colMu[i][k].Unlock()
+	return name
 }

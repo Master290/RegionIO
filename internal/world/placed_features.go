@@ -475,7 +475,7 @@ func walkOreBlocks(spheres []oreSphere, visit func(x, y, z int)) {
 }
 
 func exposedToAir(c *Chunk, x, y, z int) bool {
-	for _, offset := range [][3]int{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}} {
+	for _, offset := range [6][3]int{{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}} {
 		nx, ny, nz := x+offset[0], y+offset[1], z+offset[2]
 		if nx < 0 || nx >= 16 || nz < 0 || nz >= 16 {
 			continue

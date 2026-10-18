@@ -29,7 +29,7 @@ type SurfaceSampler struct {
 // or negative, which is exactly what the "hole" condition looks for.
 func (s *SurfaceSampler) SurfaceDepth(blockX, blockZ int) int {
 	noiseValue := s.surfaceNoise.GetValue(float64(blockX), 0, float64(blockZ))
-	jitter := s.positionalRand.At(blockX, 0, blockZ).NextDouble() * 0.25
+	jitter := nextDoubleAt(s.positionalRand, blockX, 0, blockZ) * 0.25
 	return int(noiseValue*2.75 + 3.0 + jitter)
 }
 

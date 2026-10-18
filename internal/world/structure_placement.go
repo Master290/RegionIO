@@ -71,9 +71,19 @@ func preCarveFirstOccupiedHeight(od *worldgen.OverworldDensity, seed int64, x, z
 	fz := float64(z-baseZ) / cellWidth
 
 	nInterp := len(od.Interpolated)
-	topCorners := make([][2][2]float64, nInterp)
-	botCorners := make([][2][2]float64, nInterp)
-	interp := make([]float64, nInterp)
+	var topBuf, botBuf [16][2][2]float64
+	var interpBuf [16]float64
+	var topCorners, botCorners [][2][2]float64
+	var interp []float64
+	if nInterp <= len(interpBuf) {
+		topCorners = topBuf[:nInterp]
+		botCorners = botBuf[:nInterp]
+		interp = interpBuf[:nInterp]
+	} else {
+		topCorners = make([][2][2]float64, nInterp)
+		botCorners = make([][2][2]float64, nInterp)
+		interp = make([]float64, nInterp)
+	}
 
 	sampleLayer := func(wy float64, dst [][2][2]float64) {
 		for dx := 0; dx <= 1; dx++ {
@@ -91,6 +101,7 @@ func preCarveFirstOccupiedHeight(od *worldgen.OverworldDensity, seed int64, x, z
 	var aq *worldgen.Aquifer
 	if od.AquifersEnabled {
 		aq = worldgen.NewAquifer(od, x>>4, z>>4, fluidPicker)
+		defer worldgen.ReleaseAquifer(aq)
 	}
 
 	sampleLayer(float64(MinY+cellsY*cellHeight), topCorners)
@@ -186,13 +197,16 @@ func oceanMonumentSurroundingAllowed(od *worldgen.OverworldDensity, sets *worldg
 	if od == nil || sets == nil {
 		return false
 	}
-	allowedList := sets.BiomeTags["minecraft:required_ocean_monument_surrounding"]
-	if len(allowedList) == 0 {
-		return false
-	}
-	allowed := make(map[string]bool, len(allowedList))
-	for _, b := range allowedList {
-		allowed[b] = true
+	allowed := sets.BiomeTagSets["minecraft:required_ocean_monument_surrounding"]
+	if len(allowed) == 0 {
+		allowedList := sets.BiomeTags["minecraft:required_ocean_monument_surrounding"]
+		if len(allowedList) == 0 {
+			return false
+		}
+		allowed = make(map[string]bool, len(allowedList))
+		for _, b := range allowedList {
+			allowed[b] = true
+		}
 	}
 	centerX := int(cx)*16 + 9
 	centerY := SeaLevel
@@ -230,7 +244,10 @@ func FindStructureSetStart(od *worldgen.OverworldDensity, sets *worldgen.Structu
 	if sets == nil {
 		return nil, false
 	}
-	fullSetName := "minecraft:" + strings.TrimPrefix(setName, "minecraft:")
+	fullSetName := setName
+	if !strings.HasPrefix(setName, "minecraft:") {
+		fullSetName = "minecraft:" + setName
+	}
 	set := sets.Sets[fullSetName]
 	if set == nil || set.Placement == nil || len(set.Structures) == 0 {
 		return nil, false
@@ -246,7 +263,10 @@ func FindStructureSetStart(od *worldgen.OverworldDensity, sets *worldgen.Structu
 	}
 
 	tryEntry := func(entry worldgen.WeightedEntry) (*StructureStartStub, bool) {
-		structName := "minecraft:" + strings.TrimPrefix(entry.Structure, "minecraft:")
+		structName := entry.Structure
+		if !strings.HasPrefix(structName, "minecraft:") {
+			structName = "minecraft:" + structName
+		}
 		def := sets.Structures[structName]
 		if def == nil {
 			return nil, false
@@ -269,9 +289,15 @@ func FindStructureSetStart(od *worldgen.OverworldDensity, sets *worldgen.Structu
 		return tryEntry(set.Structures[0])
 	}
 
-	pickRandom := worldgen.NewLegacy(0)
+	var pickRandom worldgen.Legacy
 	pickRandom.SetLargeFeatureSeed(seed, int(cx), int(cz))
-	indices := make([]int, len(set.Structures))
+	var indicesBuf [8]int
+	var indices []int
+	if len(set.Structures) <= len(indicesBuf) {
+		indices = indicesBuf[:len(set.Structures)]
+	} else {
+		indices = make([]int, len(set.Structures))
+	}
 	totalWeight := 0
 	for i, e := range set.Structures {
 		indices[i] = i

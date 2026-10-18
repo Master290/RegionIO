@@ -137,11 +137,30 @@ var overworldColumnsPool = sync.Pool{
 	},
 }
 
+var overworldCornerGridsPool = sync.Pool{}
+
+func acquireCornerGrids(n int) []cornerGrid {
+	if v := overworldCornerGridsPool.Get(); v != nil {
+		grids := v.([]cornerGrid)
+		if cap(grids) >= n {
+			return grids[:n]
+		}
+	}
+	return make([]cornerGrid, n)
+}
+
+func releaseCornerGrids(grids []cornerGrid) {
+	if grids != nil {
+		overworldCornerGridsPool.Put(grids)
+	}
+}
+
 func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.FluidPicker, veins *worldgen.OreVeinifier, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
 	c := NewChunk(cx, cz, BiomePlains) // per-cell biomes override below
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
-	grids := make([]cornerGrid, len(od.Interpolated))
+	grids := acquireCornerGrids(len(od.Interpolated))
+	defer releaseCornerGrids(grids)
 	var wg sync.WaitGroup
 	for ix := 0; ix <= cellsXZ; ix++ {
 		wg.Add(1)
@@ -191,6 +210,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	var aq *worldgen.Aquifer
 	if od.AquifersEnabled {
 		aq = worldgen.NewAquifer(od, int(cx), int(cz), fluidPicker)
+		defer worldgen.ReleaseAquifer(aq)
 	}
 
 	var columns *[16][16][WorldHeight]uint16
@@ -212,7 +232,13 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 		wg.Add(1)
 		go func(lx int) {
 			defer wg.Done()
-			interp := make([]float64, len(od.Interpolated))
+			var interpBuf [16]float64
+			var interp []float64
+			if len(od.Interpolated) <= len(interpBuf) {
+				interp = interpBuf[:len(od.Interpolated)]
+			} else {
+				interp = make([]float64, len(od.Interpolated))
+			}
 			for lz := 0; lz < 16; lz++ {
 				surfTop[lx][lz], worldSurface[lx][lz] =
 					fillVanillaColumn(od, aq, fluidPicker, veins, beard, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
@@ -224,6 +250,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	// Surface rules test BiomeManager.getBiome per block, not the column biome
 	// above; see biome_zoom.go.
 	zoomed := newZoomedBiomes(od, seed, cx, cz)
+	defer releaseZoomedBiomes(zoomed)
 
 	for lx := 0; lx < 16; lx++ {
 		wg.Add(1)
@@ -231,8 +258,9 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 			defer wg.Done()
 			var sctx *worldgen.SurfaceContext
 			if ruleErr == nil {
-				sctx = surfaceRule.NewContext()
-				sctx.BiomeFunc = zoomed.at
+				sctx = surfaceRule.AcquireContext()
+				sctx.BiomeGetter = zoomed
+				defer worldgen.ReleaseSurfaceContext(sctx)
 			}
 			for lz := 0; lz < 16; lz++ {
 				if ruleErr == nil {
@@ -251,14 +279,15 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	// decoration needs the carved heights so nothing is planted over a hole.
 	if carver != nil && ruleErr == nil {
 		// applyCarvers hands the same BiomeManager::getBiome to topMaterial.
-		carveCtx := surfaceRule.NewContext()
-		carveCtx.BiomeFunc = zoomed.at
+		carveCtx := surfaceRule.AcquireContext()
+		carveCtx.BiomeGetter = zoomed
 		view := &carveView{
 			cols: columns, od: od, rules: surfaceRule,
 			sctx: carveCtx, biomes: &biomeName,
 			worldSurface: &worldSurface, baseX: baseX, baseZ: baseZ,
 		}
 		carver.CarveChunk(view, aq, int(cx), int(cz))
+		worldgen.ReleaseSurfaceContext(carveCtx)
 		// The heights decoration plants against are the post-carve ones.
 		// Vanilla re-primes its heightmaps at the start of the feature step for
 		// the same reason.
@@ -464,7 +493,9 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 	minY := MinY
 	topY := minY + top + 1
 	surfaceBiome := biomeName
-	if sctx.BiomeFunc != nil {
+	if sctx.BiomeGetter != nil {
+		surfaceBiome = sctx.BiomeGetter.BiomeAt(wx, topY, wz)
+	} else if sctx.BiomeFunc != nil {
 		surfaceBiome = sctx.BiomeFunc(wx, topY, wz)
 	}
 	if surfaceBiome == "minecraft:eroded_badlands" && od.Surface != nil {

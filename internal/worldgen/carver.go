@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // carver.go ports net.minecraft.world.level.levelgen.carver: the cave and
@@ -386,11 +387,20 @@ type carveState struct {
 	c      *Carver
 	target CarveTarget
 	aq     *Aquifer
-	mask   *carvingMask
+	mask   carvingMask
 	// chunkX and chunkZ are the chunk being written, which is not the chunk a
 	// tunnel was seeded in.
 	chunkX, chunkZ int
 	lavaY          int
+	canyonFactors  []float32
+	mainRand       Legacy
+	tunnelRand     [2]Legacy
+}
+
+var carveStatePool = sync.Pool{
+	New: func() any {
+		return &carveState{}
+	},
 }
 
 // CarveChunk replays every carver seeded in the 17x17 chunks around (chunkX,
@@ -399,12 +409,29 @@ type carveState struct {
 // The order is fixed and cannot be parallelised inside a chunk: a later carve
 // reads blocks an earlier one wrote, and they share the mask.
 func (c *Carver) CarveChunk(target CarveTarget, aq *Aquifer, chunkX, chunkZ int) {
-	st := &carveState{
-		c: c, target: target, aq: aq,
-		mask:   newCarvingMask(c.minY, c.height),
-		chunkX: chunkX, chunkZ: chunkZ,
+	st := carveStatePool.Get().(*carveState)
+	st.c = c
+	st.target = target
+	st.aq = aq
+	st.chunkX = chunkX
+	st.chunkZ = chunkZ
+	maskWords := (256*c.height + 63) / 64
+	if cap(st.mask.bits) < maskWords {
+		st.mask.bits = make([]uint64, maskWords)
+	} else {
+		st.mask.bits = st.mask.bits[:maskWords]
+		clear(st.mask.bits)
 	}
-	random := NewLegacy(0)
+	st.mask.minY = c.minY
+	defer func() {
+		st.c = nil
+		st.target = nil
+		st.aq = nil
+		carveStatePool.Put(st)
+	}()
+
+	random := &st.mainRand
+	random.SetSeed(0)
 	for dx := -carverNeighbourhood; dx <= carverNeighbourhood; dx++ {
 		for dz := -carverNeighbourhood; dz <= carverNeighbourhood; dz++ {
 			sourceX, sourceZ := chunkX+dx, chunkZ+dz
@@ -460,7 +487,7 @@ func (s *carveState) carveCave(cfg *carverConfig, random *Legacy, sourceX, sourc
 			thickness := caveThickness(random)
 			branchCount := carveDistance - int(random.NextIntN(carveDistance/4))
 			s.caveTunnel(cfg, random.NextLong(), x, y, z, horizontalMul, verticalMul,
-				thickness, yaw, pitch, 0, branchCount, 1.0, skip)
+				thickness, yaw, pitch, 0, branchCount, 1.0, skip, 0)
 		}
 	}
 }
@@ -491,7 +518,7 @@ func (s *carveState) carveNetherCave(cfg *carverConfig, random *Legacy, sourceX,
 			thickness := (random.NextFloat()*2.0 + random.NextFloat()) * 2.0
 			branchCount := carveDistance - int(random.NextIntN(carveDistance/4))
 			s.caveTunnel(cfg, random.NextLong(), x, y, z, horizontalMul, verticalMul,
-				thickness, yaw, pitch, 0, branchCount, 5.0, skip)
+				thickness, yaw, pitch, 0, branchCount, 5.0, skip, 0)
 		}
 	}
 }
@@ -508,17 +535,18 @@ func caveThickness(r RandomSource) float32 {
 // caveSkip is CaveWorldCarver's CarveSkipChecker: an ellipsoid, with everything
 // below the sampled floor level cut flat so tunnels have a floor to walk on.
 func caveSkip(floorLevel float64) skipChecker {
-	return func(relX, relY, relZ float64, _ int) bool {
-		if relY <= floorLevel {
-			return true
-		}
-		return relX*relX+relY*relY+relZ*relZ >= 1.0
-	}
+	return skipChecker{floorLevel: floorLevel}
 }
 
 func (s *carveState) caveTunnel(cfg *carverConfig, seed int64, x, y, z, horizontalMul, verticalMul float64,
-	thickness, yaw, pitch float32, branchIndex, branchCount int, yScale float64, skip skipChecker) {
-	r := NewLegacy(seed)
+	thickness, yaw, pitch float32, branchIndex, branchCount int, yScale float64, skip skipChecker, depth int) {
+	var r *Legacy
+	if depth < len(s.tunnelRand) {
+		r = &s.tunnelRand[depth]
+		r.SetSeed(seed)
+	} else {
+		r = NewLegacy(seed)
+	}
 	branchAt := int(r.NextIntN(int32(branchCount/2))) + branchCount/4
 	gentle := r.NextIntN(6) == 0
 	var yawDelta, pitchDelta float32
@@ -546,9 +574,9 @@ func (s *carveState) caveTunnel(cfg *carverConfig, seed int64, x, y, z, horizont
 			// Two branches at right angles, and the parent stops. Branch
 			// thickness is always below 1, so this never recurses further.
 			s.caveTunnel(cfg, r.NextLong(), x, y, z, horizontalMul, verticalMul,
-				r.NextFloat()*0.5+0.5, yaw-1.5707964, pitch/3.0, j, branchCount, 1.0, skip)
+				r.NextFloat()*0.5+0.5, yaw-1.5707964, pitch/3.0, j, branchCount, 1.0, skip, depth+1)
 			s.caveTunnel(cfg, r.NextLong(), x, y, z, horizontalMul, verticalMul,
-				r.NextFloat()*0.5+0.5, yaw+1.5707964, pitch/3.0, j, branchCount, 1.0, skip)
+				r.NextFloat()*0.5+0.5, yaw+1.5707964, pitch/3.0, j, branchCount, 1.0, skip, depth+1)
 			return
 		}
 		if r.NextIntN(4) == 0 {
@@ -577,7 +605,8 @@ func (s *carveState) carveCanyon(cfg *carverConfig, random *Legacy, sourceX, sou
 
 func (s *carveState) canyonWalk(cfg *carverConfig, seed int64, x, y, z float64,
 	thickness, yaw, pitch float32, branchIndex, branchCount int, yScale float64) {
-	r := NewLegacy(seed)
+	r := &s.tunnelRand[0]
+	r.SetSeed(seed)
 	widthFactors := s.canyonWidthFactors(cfg, r)
 	skip := canyonSkip(widthFactors, s.c.minY)
 	var yawDelta, pitchDelta float32
@@ -613,7 +642,12 @@ func (s *carveState) canyonWalk(cfg *carverConfig, seed int64, x, y, z float64,
 // changes every few levels, which is what gives a ravine its ledges. It runs
 // once per ravine and consumes the front of the inner random stream.
 func (s *carveState) canyonWidthFactors(cfg *carverConfig, r RandomSource) []float32 {
-	factors := make([]float32, s.c.height)
+	if cap(s.canyonFactors) < s.c.height {
+		s.canyonFactors = make([]float32, s.c.height)
+	} else {
+		s.canyonFactors = s.canyonFactors[:s.c.height]
+	}
+	factors := s.canyonFactors
 	value := float32(1.0)
 	for i := range factors {
 		if i == 0 || r.NextIntN(int32(cfg.shape.widthSmoothness)) == 0 {
@@ -634,20 +668,33 @@ func (s *carveState) canyonVerticalRadius(cfg *carverConfig, r RandomSource, ver
 }
 
 func canyonSkip(widthFactors []float32, minY int) skipChecker {
-	return func(relX, relY, relZ float64, blockY int) bool {
-		index := blockY - minY - 1
-		if index < 0 || index >= len(widthFactors) {
-			return true
-		}
-		return (relX*relX+relZ*relZ)*float64(widthFactors[index])+(relY*relY)/6.0 >= 1.0
-	}
+	return skipChecker{widthFactors: widthFactors, minY: minY, isCanyon: true}
 }
 
 // ---- shared carving ----------------------------------------------------
 
 // skipChecker is CarveSkipChecker: given a position's offset from the ellipsoid
 // centre, decide whether to leave it alone.
-type skipChecker func(relX, relY, relZ float64, blockY int) bool
+type skipChecker struct {
+	floorLevel   float64
+	widthFactors []float32
+	minY         int
+	isCanyon     bool
+}
+
+func (sc skipChecker) shouldSkip(relX, relY, relZ float64, blockY int) bool {
+	if sc.isCanyon {
+		index := blockY - sc.minY - 1
+		if index < 0 || index >= len(sc.widthFactors) {
+			return true
+		}
+		return (relX*relX+relZ*relZ)*float64(sc.widthFactors[index])+(relY*relY)/6.0 >= 1.0
+	}
+	if relY <= sc.floorLevel {
+		return true
+	}
+	return relX*relX+relY*relY+relZ*relZ >= 1.0
+}
 
 // canReach abandons a tunnel once it can no longer reach the chunk being
 // carved, even walking straight at it for every remaining step.
@@ -696,7 +743,7 @@ func (s *carveState) carveEllipsoid(cfg *carverConfig, x, y, z, horizontal, vert
 			reachedSurface := false
 			for by := yHi; by > yLo; by-- {
 				relY := (float64(by) - 0.5 - y) / vertical
-				if skip(relX, relY, relZ, by) {
+				if skip.shouldSkip(relX, relY, relZ, by) {
 					continue
 				}
 				if s.mask.get(lx, by, lz) {

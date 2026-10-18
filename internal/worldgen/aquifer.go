@@ -67,9 +67,19 @@ func (f FluidStatus) At(blockY int) uint16 {
 // position would hold if there were no aquifer at all.
 type FluidPicker func(x, y, z int) FluidStatus
 
+var defaultOverworldFluidPicker FluidPicker = func(_, y, _ int) FluidStatus {
+	if y < -54 {
+		return FluidStatus{Level: -54, Type: blockLava}
+	}
+	return FluidStatus{Level: 63, Type: blockWater}
+}
+
 // OverworldFluidPicker is NoiseBasedChunkGenerator.createFluidPicker: lava
 // below y=-54, sea water above it.
 func OverworldFluidPicker(seaLevel int) FluidPicker {
+	if seaLevel == 63 {
+		return defaultOverworldFluidPicker
+	}
 	lava := FluidStatus{Level: -54, Type: blockLava}
 	sea := FluidStatus{Level: seaLevel, Type: blockWater}
 	lavaBelow := min(-54, seaLevel)
@@ -108,6 +118,22 @@ type Aquifer struct {
 
 type aquiferPos struct{ x, y, z int }
 
+var aquiferPool = sync.Pool{
+	New: func() any {
+		return &Aquifer{}
+	},
+}
+
+// ReleaseAquifer returns an Aquifer to the pool for reuse.
+func ReleaseAquifer(a *Aquifer) {
+	if a == nil {
+		return
+	}
+	a.od = nil
+	a.global = nil
+	aquiferPool.Put(a)
+}
+
 // NewAquifer builds the aquifer covering the given chunk.
 //
 // Vanilla fills the cell grid lazily as columns are generated; we fill it
@@ -119,7 +145,9 @@ func NewAquifer(od *OverworldDensity, chunkX, chunkZ int, picker FluidPicker) *A
 	minBlockX, minBlockZ := chunkX*16, chunkZ*16
 	maxBlockX, maxBlockZ := minBlockX+15, minBlockZ+15
 
-	a := &Aquifer{od: od, global: picker}
+	a := aquiferPool.Get().(*Aquifer)
+	a.od = od
+	a.global = picker
 	a.minGridX = aquiferGridX(minBlockX - 5)
 	maxGridX := aquiferGridX(maxBlockX-5) + 1
 	a.gridSizeX = maxGridX - a.minGridX + 1
@@ -131,8 +159,18 @@ func NewAquifer(od *OverworldDensity, chunkX, chunkZ int, picker FluidPicker) *A
 	a.gridSizeZ = maxGridZ - a.minGridZ + 1
 
 	n := a.gridSizeX * a.gridSizeY * a.gridSizeZ
-	a.locations = make([]aquiferPos, n)
-	a.status = make([]FluidStatus, n)
+	if cap(a.locations) < n {
+		a.locations = make([]aquiferPos, n)
+	} else {
+		a.locations = a.locations[:n]
+		clear(a.locations)
+	}
+	if cap(a.status) < n {
+		a.status = make([]FluidStatus, n)
+	} else {
+		a.status = a.status[:n]
+		clear(a.status)
+	}
 
 	maxAdjusted := adjustSurfaceLevel(od.MaxPreliminarySurfaceLevel(
 		fromAquiferGridX(a.minGridX, 0), fromAquiferGridZ(a.minGridZ, 0),
@@ -144,6 +182,7 @@ func NewAquifer(od *OverworldDensity, chunkX, chunkZ int, picker FluidPicker) *A
 	// skipSamplingAboveY, and the anchor search reaches at most one cell higher.
 	topUsedGridY := min(aquiferGridY(a.skipSamplingAboveY+1)+1, maxGridY)
 
+	xp, isXoro := od.AquiferRandom.(*xoroshiroPositional)
 	var wg sync.WaitGroup
 	for gy := a.minGridY; gy <= topUsedGridY; gy++ {
 		wg.Add(1)
@@ -152,11 +191,21 @@ func NewAquifer(od *OverworldDensity, chunkX, chunkZ int, picker FluidPicker) *A
 			for gz := a.minGridZ; gz < a.minGridZ+a.gridSizeZ; gz++ {
 				for gx := a.minGridX; gx < a.minGridX+a.gridSizeX; gx++ {
 					i := a.index(gx, gy, gz)
-					r := od.AquiferRandom.At(gx, gy, gz)
-					pos := aquiferPos{
-						x: fromAquiferGridX(gx, int(r.NextIntN(aquiferXRange))),
-						y: fromAquiferGridY(gy, int(r.NextIntN(aquiferYRange))),
-						z: fromAquiferGridZ(gz, int(r.NextIntN(aquiferZRange))),
+					var pos aquiferPos
+					if isXoro {
+						r := xp.atValue(gx, gy, gz)
+						pos = aquiferPos{
+							x: fromAquiferGridX(gx, int(r.NextIntN(aquiferXRange))),
+							y: fromAquiferGridY(gy, int(r.NextIntN(aquiferYRange))),
+							z: fromAquiferGridZ(gz, int(r.NextIntN(aquiferZRange))),
+						}
+					} else {
+						r := od.AquiferRandom.At(gx, gy, gz)
+						pos = aquiferPos{
+							x: fromAquiferGridX(gx, int(r.NextIntN(aquiferXRange))),
+							y: fromAquiferGridY(gy, int(r.NextIntN(aquiferYRange))),
+							z: fromAquiferGridZ(gz, int(r.NextIntN(aquiferZRange))),
+						}
 					}
 					a.locations[i] = pos
 					a.status[i] = a.computeFluid(pos.x, pos.y, pos.z)

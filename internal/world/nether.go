@@ -173,12 +173,31 @@ var netherColumnsPool = sync.Pool{
 	},
 }
 
+var netherCornerGridsPool = sync.Pool{}
+
+func acquireNetherCornerGrids(n int) []netherCornerGrid {
+	if v := netherCornerGridsPool.Get(); v != nil {
+		grids := v.([]netherCornerGrid)
+		if cap(grids) >= n {
+			return grids[:n]
+		}
+	}
+	return make([]netherCornerGrid, n)
+}
+
+func releaseNetherCornerGrids(grids []netherCornerGrid) {
+	if grids != nil {
+		netherCornerGridsPool.Put(grids)
+	}
+}
+
 // generateNetherBaseTerrain builds the noise, surface, and carved base terrain
 // for Nether chunk (cx, cz).
 func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
 	baseX, baseZ := int(cx)*16, int(cz)*16
 
-	grids := make([]netherCornerGrid, len(od.Interpolated))
+	grids := acquireNetherCornerGrids(len(od.Interpolated))
+	defer releaseNetherCornerGrids(grids)
 	var wg sync.WaitGroup
 	for ix := 0; ix <= netherCellsXZ; ix++ {
 		wg.Add(1)
@@ -231,7 +250,13 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 		wg.Add(1)
 		go func(lx int) {
 			defer wg.Done()
-			interp := make([]float64, len(od.Interpolated))
+			var interpBuf [16]float64
+			var interp []float64
+			if len(od.Interpolated) <= len(interpBuf) {
+				interp = interpBuf[:len(od.Interpolated)]
+			} else {
+				interp = make([]float64, len(od.Interpolated))
+			}
 			for lz := 0; lz < 16; lz++ {
 				surfTop[lx][lz], worldSurface[lx][lz] =
 					fillNetherColumn(od, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
@@ -241,14 +266,16 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 	wg.Wait()
 
 	zoomed := newNetherZoomedBiomes(od, seed, cx, cz)
+	defer releaseNetherZoomedBiomes(zoomed)
 
 	if ruleErr == nil && surfaceRule != nil {
 		for lx := 0; lx < 16; lx++ {
 			wg.Add(1)
 			go func(lx int) {
 				defer wg.Done()
-				sctx := surfaceRule.NewContext()
-				sctx.BiomeFunc = zoomed.at
+				sctx := surfaceRule.AcquireContext()
+				sctx.BiomeGetter = zoomed
+				defer worldgen.ReleaseSurfaceContext(sctx)
 				for lz := 0; lz < 16; lz++ {
 					applyNetherSurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
 						baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz])
@@ -259,14 +286,15 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 	}
 
 	if carver != nil && ruleErr == nil && surfaceRule != nil {
-		carveCtx := surfaceRule.NewContext()
-		carveCtx.BiomeFunc = zoomed.at
+		carveCtx := surfaceRule.AcquireContext()
+		carveCtx.BiomeGetter = zoomed
 		view := &netherCarveView{
 			cols: columns, od: od, rules: surfaceRule,
 			sctx: carveCtx, biomes: &biomeName,
 			worldSurface: &worldSurface, baseX: baseX, baseZ: baseZ,
 		}
 		carver.CarveChunk(view, nil, int(cx), int(cz))
+		worldgen.ReleaseSurfaceContext(carveCtx)
 	}
 
 	// Copy Nether vertical slice y = 0..127 into the chunk.
@@ -408,17 +436,42 @@ type netherZoomedBiomes struct {
 	od       *worldgen.OverworldDensity
 	zoomSeed int64
 	qx0, qz0 int
-	colOnce  [biomeZoomSpan][biomeZoomSpan]sync.Once
+	gen      uint32
+	colMu    [biomeZoomSpan][biomeZoomSpan]sync.Mutex
+	colGen   [biomeZoomSpan][biomeZoomSpan]uint32
 	names    [biomeZoomSpan][biomeZoomSpan]string
 }
 
+var netherZoomedBiomesPool = sync.Pool{
+	New: func() any {
+		return &netherZoomedBiomes{}
+	},
+}
+
 func newNetherZoomedBiomes(od *worldgen.OverworldDensity, seed int64, cx, cz int32) *netherZoomedBiomes {
-	return &netherZoomedBiomes{
-		od:       od,
-		zoomSeed: obfuscateBiomeSeed(seed),
-		qx0:      int(cx)*4 - 1,
-		qz0:      int(cz)*4 - 1,
+	z := netherZoomedBiomesPool.Get().(*netherZoomedBiomes)
+	z.od = od
+	z.zoomSeed = obfuscateBiomeSeed(seed)
+	z.qx0 = int(cx)*4 - 1
+	z.qz0 = int(cz)*4 - 1
+	z.gen++
+	if z.gen == 0 {
+		clear(z.colGen[:])
+		z.gen = 1
 	}
+	return z
+}
+
+func releaseNetherZoomedBiomes(z *netherZoomedBiomes) {
+	if z == nil {
+		return
+	}
+	z.od = nil
+	netherZoomedBiomesPool.Put(z)
+}
+
+func (z *netherZoomedBiomes) BiomeAt(x, y, zc int) string {
+	return z.at(x, y, zc)
 }
 
 func (z *netherZoomedBiomes) at(x, y, zc int) string {
@@ -428,11 +481,15 @@ func (z *netherZoomedBiomes) at(x, y, zc int) string {
 		pt := worldgen.SampleColumn(z.od, z.od.SeaLevel, qx*4, qz*4)
 		return worldgen.NetherBiomeTable().FindBiome(pt)
 	}
-	z.colOnce[i][k].Do(func() {
+	z.colMu[i][k].Lock()
+	if z.colGen[i][k] != z.gen {
 		pt := worldgen.SampleColumn(z.od, z.od.SeaLevel, qx*4, qz*4)
 		z.names[i][k] = worldgen.NetherBiomeTable().FindBiome(pt)
-	})
-	return z.names[i][k]
+		z.colGen[i][k] = z.gen
+	}
+	name := z.names[i][k]
+	z.colMu[i][k].Unlock()
+	return name
 }
 
 func fillNetherBiomes3D(c *Chunk, biomeName [16][16]string) {

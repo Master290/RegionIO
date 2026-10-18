@@ -216,6 +216,18 @@ func nextFloatAt(f PositionalRandomFactory, x, y, z int) float32 {
 	return f.At(x, y, z).NextFloat()
 }
 
+func nextDoubleAt(f PositionalRandomFactory, x, y, z int) float64 {
+	if xp, ok := f.(*xoroshiroPositional); ok {
+		r := xp.atValue(x, y, z)
+		return r.NextDouble()
+	}
+	if lp, ok := f.(*legacyPositional); ok {
+		r := lp.atValue(x, y, z)
+		return r.NextDouble()
+	}
+	return f.At(x, y, z).NextDouble()
+}
+
 // --- Legacy LCG (java.util.Random) ---
 
 const (

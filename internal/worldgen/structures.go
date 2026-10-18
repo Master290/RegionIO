@@ -152,23 +152,27 @@ type StructureDef struct {
 	Setups        []RuinedPortalSetup `json:"-"`
 
 	// Jigsaw structure fields.
-	StartPool             string          `json:"start_pool"`
-	StartJigsawName       string          `json:"start_jigsaw_name"`
-	Size                  int             `json:"size"`
-	MaxDistanceFromCenter int             `json:"max_distance_from_center"`
-	ProjectStartToHeightmap string        `json:"project_start_to_heightmap"`
-	UseExpansionHack      bool            `json:"use_expansion_hack"`
-	StartHeight           json.RawMessage `json:"start_height"`
-	DimensionPadding      int             `json:"dimension_padding"`
-	LiquidSettings        string          `json:"liquid_settings"`
-	PoolAliases           json.RawMessage `json:"pool_aliases"`
+	StartPool               string          `json:"start_pool"`
+	StartJigsawName         string          `json:"start_jigsaw_name"`
+	Size                    int             `json:"size"`
+	MaxDistanceFromCenter   int             `json:"max_distance_from_center"`
+	ProjectStartToHeightmap string          `json:"project_start_to_heightmap"`
+	UseExpansionHack        bool            `json:"use_expansion_hack"`
+	StartHeight             json.RawMessage `json:"start_height"`
+	DimensionPadding        int             `json:"dimension_padding"`
+	LiquidSettings          string          `json:"liquid_settings"`
+	PoolAliases             json.RawMessage `json:"pool_aliases"`
+
+	startHeightParsed  bool     `json:"-"`
+	startHeightUniform bool     `json:"-"`
+	startHeightMinY    int      `json:"-"`
+	startHeightMaxY    int      `json:"-"`
+	resolvedBiomes     []string `json:"-"`
 }
 
-// SampleStartHeight evaluates the structure's start_height HeightProvider
-// (either {"absolute": N} or {"type": "minecraft:uniform", "min_inclusive": {"absolute": A}, "max_inclusive": {"absolute": B}}).
-func (d *StructureDef) SampleStartHeight(random RandomSource) int {
-	if len(d.StartHeight) == 0 {
-		return 0
+func parseStartHeightRaw(raw json.RawMessage) (parsed, uniform bool, minY, maxY int) {
+	if len(raw) == 0 {
+		return true, false, 0, 0
 	}
 	var doc struct {
 		Type         string `json:"type"`
@@ -180,21 +184,32 @@ func (d *StructureDef) SampleStartHeight(random RandomSource) int {
 			Absolute int `json:"absolute"`
 		} `json:"max_inclusive"`
 	}
-	if err := json.Unmarshal(d.StartHeight, &doc); err != nil {
-		return 0
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return true, false, 0, 0
 	}
 	if doc.Absolute != nil {
-		return *doc.Absolute
+		return true, false, *doc.Absolute, *doc.Absolute
 	}
 	if doc.Type == "minecraft:uniform" || doc.Type == "uniform" {
-		minY := doc.MinInclusive.Absolute
-		maxY := doc.MaxInclusive.Absolute
-		if minY > maxY {
-			return minY
-		}
-		return minY + int(random.NextIntN(int32(maxY-minY+1)))
+		return true, true, doc.MinInclusive.Absolute, doc.MaxInclusive.Absolute
 	}
-	return 0
+	return true, false, 0, 0
+}
+
+// SampleStartHeight evaluates the structure's start_height HeightProvider
+// (either {"absolute": N} or {"type": "minecraft:uniform", "min_inclusive": {"absolute": A}, "max_inclusive": {"absolute": B}}).
+func (d *StructureDef) SampleStartHeight(random RandomSource) int {
+	parsed, uniform, minY, maxY := d.startHeightParsed, d.startHeightUniform, d.startHeightMinY, d.startHeightMaxY
+	if !parsed {
+		_, uniform, minY, maxY = parseStartHeightRaw(d.StartHeight)
+	}
+	if !uniform {
+		return minY
+	}
+	if minY > maxY {
+		return minY
+	}
+	return minY + int(random.NextIntN(int32(maxY-minY+1)))
 }
 
 func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
@@ -223,6 +238,7 @@ func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
 	}
+	parsed, uniform, minY, maxY := parseStartHeightRaw(doc.StartHeight)
 	return &StructureDef{
 		Name:                    name,
 		Type:                    doc.Type,
@@ -245,6 +261,10 @@ func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 		DimensionPadding:        doc.DimensionPadding,
 		LiquidSettings:          doc.LiquidSettings,
 		PoolAliases:             doc.PoolAliases,
+		startHeightParsed:       parsed,
+		startHeightUniform:      uniform,
+		startHeightMinY:         minY,
+		startHeightMaxY:         maxY,
 	}, nil
 }
 
@@ -257,11 +277,12 @@ type StructureSet struct {
 
 // StructureSets is the parsed, immutable structure datapack.
 type StructureSets struct {
-	Sets            map[string]*StructureSet       // set name -> set
-	Structures      map[string]*StructureDef       // structure name -> def
-	BiomeTags       map[string][]string            // biome tag name -> member names, flattened
-	setOrder        []string                       // deterministic iteration order
-	structuresBySet map[string][]*StructureDef     // expanded weighted entries per set
+	Sets            map[string]*StructureSet        // set name -> set
+	Structures      map[string]*StructureDef        // structure name -> def
+	BiomeTags       map[string][]string             // biome tag name -> member names, flattened
+	BiomeTagSets    map[string]map[string]bool      // biome tag name -> member lookup set
+	setOrder        []string                        // deterministic iteration order
+	structuresBySet map[string][]*StructureDef      // expanded weighted entries per set
 }
 
 var (
@@ -281,6 +302,7 @@ func loadStructureSets() (*StructureSets, error) {
 		Sets:            map[string]*StructureSet{},
 		Structures:      map[string]*StructureDef{},
 		BiomeTags:       map[string][]string{},
+		BiomeTagSets:    map[string]map[string]bool{},
 		structuresBySet: map[string][]*StructureDef{},
 	}
 
@@ -322,6 +344,11 @@ func loadStructureSets() (*StructureSets, error) {
 			flat = append(flat, "minecraft:"+strings.TrimPrefix(value, "minecraft:"))
 		}
 		out.BiomeTags[name] = flat
+		set := make(map[string]bool, len(flat))
+		for _, m := range flat {
+			set[m] = true
+		}
+		out.BiomeTagSets[name] = set
 		return flat
 	}
 	for name := range rawTags {
@@ -341,6 +368,14 @@ func loadStructureSets() (*StructureSets, error) {
 		def, err := decodeStructureDef(name, raw)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		ref := def.Biomes
+		if strings.HasPrefix(ref, "#") {
+			tagName := strings.TrimPrefix(ref[1:], "minecraft:")
+			tagName = strings.TrimPrefix(tagName, "has_structure/")
+			def.resolvedBiomes = out.BiomeTags["minecraft:"+tagName]
+		} else if ref != "" {
+			def.resolvedBiomes = []string{"minecraft:" + ref}
 		}
 		out.Structures[name] = def
 	}
@@ -405,6 +440,9 @@ func (s *StructureSets) StructuresInSet(set string) []*StructureDef {
 // reference tags through the has_structure/ namespace, but the extracted tag
 // files drop that prefix.
 func (s *StructureSets) BiomesFor(def *StructureDef) []string {
+	if def != nil && def.resolvedBiomes != nil {
+		return def.resolvedBiomes
+	}
 	ref := def.Biomes
 	if strings.HasPrefix(ref, "#") {
 		name := strings.TrimPrefix(ref[1:], "minecraft:")
@@ -420,11 +458,11 @@ func (s *StructureSets) BiomesFor(def *StructureDef) []string {
 func (r *RandomSpread) potentialStructureChunk(seed int64, chunkX, chunkZ int32) [2]int32 {
 	regionX := floorDiv32(chunkX, int32(r.Spacing))
 	regionZ := floorDiv32(chunkZ, int32(r.Spacing))
-	random := NewLegacy(0)
+	var random Legacy
 	random.SetLargeFeatureWithSalt(seed, int(regionX), int(regionZ), r.Salt)
 	span := r.Spacing - r.Separation
-	offsetX := spreadEvaluate(random, r.SpreadType, span)
-	offsetZ := spreadEvaluate(random, r.SpreadType, span)
+	offsetX := spreadEvaluate(&random, r.SpreadType, span)
+	offsetZ := spreadEvaluate(&random, r.SpreadType, span)
 	return [2]int32{regionX*int32(r.Spacing) + int32(offsetX), regionZ*int32(r.Spacing) + int32(offsetZ)}
 }
 
@@ -434,7 +472,7 @@ func (r *RandomSpread) PotentialChunk(seed int64, chunkX, chunkZ int32) [2]int32
 }
 
 // spreadEvaluate is RandomSpreadType.evaluate.
-func spreadEvaluate(random RandomSource, spreadType string, span int) int {
+func spreadEvaluate(random *Legacy, spreadType string, span int) int {
 	if spreadType == "triangular" {
 		return (int(random.NextIntN(int32(span))) + int(random.NextIntN(int32(span)))) / 2
 	}
@@ -447,7 +485,7 @@ func (r *RandomSpread) frequencyAllows(seed int64, chunkX, chunkZ int32) bool {
 	if r.Frequency >= 1.0 {
 		return true
 	}
-	random := NewLegacy(0)
+	var random Legacy
 	switch r.FreqMethod {
 	case "default":
 		random.SetLargeFeatureWithSalt(seed, int(chunkX), int(chunkZ), r.Salt)
@@ -633,10 +671,13 @@ func (s *StructureSets) StrongholdRingPositions(seed int64, biomeAtQuart func(qx
 	if biomeAtQuart != nil {
 		tag := strings.TrimPrefix(set.Placement.ConcentricRings.PreferredBiomes, "#")
 		tag = "minecraft:" + strings.TrimPrefix(tag, "minecraft:")
-		members := s.BiomeTags[tag]
-		allowed = make(map[string]bool, len(members))
-		for _, m := range members {
-			allowed[m] = true
+		allowed = s.BiomeTagSets[tag]
+		if allowed == nil {
+			members := s.BiomeTags[tag]
+			allowed = make(map[string]bool, len(members))
+			for _, m := range members {
+				allowed[m] = true
+			}
 		}
 	}
 	return set.Placement.ConcentricRings.RingPositions(seed, biomeAtQuart, allowed)
