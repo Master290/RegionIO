@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"regionio/internal/protocol"
+	"regionio/internal/registry"
 	"regionio/internal/server"
 	"regionio/internal/world"
 )
@@ -223,6 +224,15 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	itemNode := greedyCmd("item")
 	recipeNode := greedyCmd("recipe")
 	advancementNode := greedyCmd("advancement")
+	setblockNode := greedyCmd("setblock")
+	fillNode := greedyCmd("fill")
+	cloneNode := greedyCmd("clone")
+	fillbiomeNode := greedyCmd("fillbiome")
+	killNode := greedyCmd("kill")
+	damageNode := greedyCmd("damage")
+	xpNode := greedyCmd("xp")
+	experienceNode := greedyCmd("experience")
+	summonNode := greedyCmd("summon")
 
 	nodes[rootIdx].Children = []int32{
 		tpNode,
@@ -260,6 +270,15 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		itemNode,
 		recipeNode,
 		advancementNode,
+		setblockNode,
+		fillNode,
+		cloneNode,
+		fillbiomeNode,
+		killNode,
+		damageNode,
+		xpNode,
+		experienceNode,
+		summonNode,
 	}
 	return nodes, rootIdx
 }
@@ -1423,6 +1442,46 @@ func ExecuteCommandWithContext(srv *server.Server, ctx CommandContext, rawLine s
 		return srv.HandleRecipeCommand(effectivePlayer, parsed.Args)
 	case "advancement":
 		return srv.HandleAdvancementCommand(effectivePlayer, parsed.Args)
+	case "setblock":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execSetBlock(srv, ctx, parsed.Args)
+	case "fill":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execFill(srv, ctx, parsed.Args)
+	case "clone":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execClone(srv, ctx, parsed.Args)
+	case "fillbiome":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execFillBiome(srv, ctx, parsed.Args)
+	case "kill":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execKill(srv, ctx, parsed.Args)
+	case "damage":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execDamage(srv, ctx, parsed.Args)
+	case "xp", "experience":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execExperience(srv, ctx, parsed.Args)
+	case "summon":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execSummon(srv, ctx, parsed.Args)
 	default:
 		if reply, handled := srv.HandleItemAndStatusCommand(effectivePlayer, parsed.Name, parsed.Args); handled {
 			return reply
@@ -2119,24 +2178,81 @@ func resolveConditionBlockPos(ctx CommandContext, rx, ry, rz string) (int, int, 
 	return int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z)), nil
 }
 
-func matchBlockPredicate(state uint16, rawPred string) bool {
-	s := strings.TrimSpace(rawPred)
+func parseBlockNameAndProps(raw string) (string, map[string]string, error) {
+	s := strings.TrimSpace(raw)
 	if s == "" {
-		return false
+		return "", nil, errors.New("empty block name")
+	}
+	// Strip optional trailing SNBT "{...}"
+	if braceIdx := strings.IndexByte(s, '{'); braceIdx >= 0 {
+		s = strings.TrimSpace(s[:braceIdx])
 	}
 	blockName := s
+	var props map[string]string
 	if openIdx := strings.IndexByte(s, '['); openIdx >= 0 {
+		closeIdx := strings.LastIndexByte(s, ']')
+		if closeIdx < openIdx {
+			return "", nil, fmt.Errorf("unclosed block state properties in %q", raw)
+		}
 		blockName = s[:openIdx]
+		inner := strings.TrimSpace(s[openIdx+1 : closeIdx])
+		if inner != "" {
+			props = make(map[string]string)
+			for _, part := range strings.Split(inner, ",") {
+				kv := strings.SplitN(part, "=", 2)
+				if len(kv) != 2 {
+					return "", nil, fmt.Errorf("invalid block state property %q", part)
+				}
+				k := strings.ToLower(strings.TrimSpace(kv[0]))
+				v := strings.ToLower(strings.TrimSpace(kv[1]))
+				props[k] = v
+			}
+		}
 	}
 	blockName = strings.ToLower(strings.TrimSpace(blockName))
 	if !strings.Contains(blockName, ":") {
 		blockName = "minecraft:" + blockName
 	}
-	actualName := world.BlockName(state)
-	if actualName == "" && state == world.StateAir {
-		actualName = "minecraft:air"
+	return blockName, props, nil
+}
+
+func parseBlockStateInput(raw string) (uint16, string, error) {
+	blockName, props, err := parseBlockNameAndProps(raw)
+	if err != nil {
+		return 0, "", err
 	}
-	return actualName == blockName
+	if blockName == "minecraft:air" {
+		return world.StateAir, blockName, nil
+	}
+	st, ok := world.BlockStateByName(blockName, props)
+	if !ok {
+		return 0, "", fmt.Errorf("Unknown block %q", raw)
+	}
+	return st, blockName, nil
+}
+
+func matchBlockPredicate(state uint16, rawPred string) bool {
+	blockName, wantProps, err := parseBlockNameAndProps(rawPred)
+	if err != nil {
+		return false
+	}
+	actualName, actualProps, ok := world.BlockStateProperties(state)
+	if !ok || actualName == "" {
+		if state == world.StateAir {
+			actualName = "minecraft:air"
+		} else {
+			actualName = world.BlockName(state)
+		}
+	}
+	if actualName != blockName {
+		return false
+	}
+	for k, v := range wantProps {
+		if actualProps == nil || !strings.EqualFold(actualProps[k], v) {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveScoreHolder(srv *server.Server, ctx CommandContext, token string) (string, bool) {
@@ -2609,3 +2725,770 @@ func RunConsole(ctx context.Context, r io.Reader, srv *server.Server, log *slog.
 		}
 	}
 }
+
+// MaxCommandBlockVolume is the default vanilla commandModificationBlockLimit (32768).
+const MaxCommandBlockVolume = 32768
+
+func parseBlockStateSpec(raw string) (uint16, string, map[string]string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, "", nil, errors.New("empty block state")
+	}
+	if braceIdx := strings.IndexByte(s, '{'); braceIdx >= 0 {
+		s = strings.TrimSpace(s[:braceIdx])
+	}
+	blockName := s
+	var props map[string]string
+	if openIdx := strings.IndexByte(s, '['); openIdx >= 0 {
+		if !strings.HasSuffix(s, "]") {
+			return 0, "", nil, fmt.Errorf("malformed block state properties in %q", raw)
+		}
+		blockName = strings.TrimSpace(s[:openIdx])
+		propStr := strings.TrimSpace(s[openIdx+1 : len(s)-1])
+		if propStr != "" {
+			props = make(map[string]string)
+			for _, part := range strings.Split(propStr, ",") {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				eq := strings.IndexByte(part, '=')
+				if eq <= 0 {
+					return 0, "", nil, fmt.Errorf("invalid block property %q", part)
+				}
+				k := strings.ToLower(strings.TrimSpace(part[:eq]))
+				v := strings.ToLower(strings.TrimSpace(part[eq+1:]))
+				props[k] = v
+			}
+		}
+	}
+	blockName = strings.ToLower(strings.TrimSpace(blockName))
+	if !strings.Contains(blockName, ":") {
+		blockName = "minecraft:" + blockName
+	}
+	if blockName == "minecraft:air" && len(props) == 0 {
+		return world.StateAir, blockName, nil, nil
+	}
+	state, ok := world.BlockStateByName(blockName, props)
+	if !ok {
+		if blockName == "minecraft:cave_air" || blockName == "minecraft:void_air" {
+			return world.StateAir, blockName, props, nil
+		}
+		return 0, "", nil, fmt.Errorf("Unknown block state %q", raw)
+	}
+	return state, blockName, props, nil
+}
+
+func execSetBlock(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 4 || len(args) > 5 {
+		return "Usage: /setblock <x> <y> <z> <block> [destroy|keep|replace]"
+	}
+	bx, by, bz, err := resolveConditionBlockPos(ctx, args[0], args[1], args[2])
+	if err != nil {
+		return fmt.Sprintf("Invalid block position: %v", err)
+	}
+	dt, _ := srv.DimensionType(ctx.Dimension)
+	if by < dt.MinY || by >= dt.MaxY() {
+		return "That position is out of this world!"
+	}
+	state, _, _, err := parseBlockStateSpec(args[3])
+	if err != nil {
+		return err.Error()
+	}
+	mode := "replace"
+	if len(args) == 5 {
+		mode = strings.ToLower(strings.TrimSpace(args[4]))
+		if mode != "replace" && mode != "keep" && mode != "destroy" {
+			return fmt.Sprintf("Invalid setblock mode %q (expected destroy, keep, or replace)", args[4])
+		}
+	}
+	cache := srv.DimensionChunks(ctx.Dimension)
+	if cache == nil {
+		return "Could not set the block"
+	}
+	oldState := cache.GetBlock(bx, by, bz)
+	if mode == "keep" && oldState != world.StateAir {
+		return "Could not set the block"
+	}
+	if mode == "replace" && oldState == state {
+		return "Could not set the block"
+	}
+	if mode == "destroy" && oldState != world.StateAir && srv.DoTileDrops() {
+		if drop, ok := server.ApplyBlockDropEnchantments(oldState, server.ItemMeta{}, nil); ok && !drop.IsEmpty() {
+			srv.SpawnItemEntityInDimension(ctx.Dimension, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, drop)
+		}
+	}
+	valid, lightChunks := cache.SetBlockWithLight(bx, by, bz, state)
+	if !valid {
+		return "That position is out of this world!"
+	}
+	srv.BroadcastDimensionBlocks(ctx.Dimension, []world.BlockChange{
+		{Pos: world.BlockPos{X: bx, Y: by, Z: bz}, OldState: oldState, NewState: state},
+	}, lightChunks)
+	return fmt.Sprintf("Changed the block at %d, %d, %d", bx, by, bz)
+}
+
+func execFill(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 7 || len(args) > 9 {
+		return "Usage: /fill <from> <to> <block> [destroy|hollow|keep|outline|replace [<filter>]]"
+	}
+	x1, y1, z1, err := resolveConditionBlockPos(ctx, args[0], args[1], args[2])
+	if err != nil {
+		return fmt.Sprintf("Invalid from position: %v", err)
+	}
+	x2, y2, z2, err := resolveConditionBlockPos(ctx, args[3], args[4], args[5])
+	if err != nil {
+		return fmt.Sprintf("Invalid to position: %v", err)
+	}
+	if x1 > x2 {
+		x1, x2 = x2, x1
+	}
+	if y1 > y2 {
+		y1, y2 = y2, y1
+	}
+	if z1 > z2 {
+		z1, z2 = z2, z1
+	}
+	dt, _ := srv.DimensionType(ctx.Dimension)
+	if y1 < dt.MinY || y2 >= dt.MaxY() {
+		return "That position is out of this world!"
+	}
+	vol := (x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1)
+	if vol > MaxCommandBlockVolume {
+		return fmt.Sprintf("Too many blocks in the specified area (maximum %d, specified %d)", MaxCommandBlockVolume, vol)
+	}
+	state, _, _, err := parseBlockStateSpec(args[6])
+	if err != nil {
+		return err.Error()
+	}
+	mode := "replace"
+	var filter string
+	if len(args) >= 8 {
+		mode = strings.ToLower(strings.TrimSpace(args[7]))
+		switch mode {
+		case "replace", "keep", "hollow", "outline", "destroy":
+		default:
+			return fmt.Sprintf("Invalid fill mode %q", args[7])
+		}
+		if len(args) == 9 {
+			if mode != "replace" {
+				return "Filter predicate is only supported with 'replace' mode"
+			}
+			if _, _, _, err := parseBlockStateSpec(args[8]); err != nil {
+				return err.Error()
+			}
+			filter = args[8]
+		}
+	}
+
+	cache := srv.DimensionChunks(ctx.Dimension)
+	if cache == nil {
+		return "No blocks were filled"
+	}
+
+	var (
+		changes     []world.BlockChange
+		lightChunks []world.ChunkPos
+		seenLight   = make(map[world.ChunkPos]bool)
+		filled      int
+	)
+	for y := y1; y <= y2; y++ {
+		for z := z1; z <= z2; z++ {
+			for x := x1; x <= x2; x++ {
+				isBoundary := x == x1 || x == x2 || y == y1 || y == y2 || z == z1 || z == z2
+				if mode == "outline" && !isBoundary {
+					continue
+				}
+				targetState := state
+				if mode == "hollow" && !isBoundary {
+					targetState = world.StateAir
+				}
+				oldState := cache.GetBlock(x, y, z)
+				if mode == "keep" && oldState != world.StateAir {
+					continue
+				}
+				if filter != "" && !matchBlockPredicate(oldState, filter) {
+					continue
+				}
+				if mode == "destroy" && oldState != world.StateAir && srv.DoTileDrops() {
+					if drop, ok := server.ApplyBlockDropEnchantments(oldState, server.ItemMeta{}, nil); ok && !drop.IsEmpty() {
+						srv.SpawnItemEntityInDimension(ctx.Dimension, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, drop)
+					}
+				}
+				if oldState == targetState && mode != "hollow" && mode != "destroy" {
+					continue
+				}
+				if valid, lc := cache.SetBlockWithLight(x, y, z, targetState); valid {
+					filled++
+					changes = append(changes, world.BlockChange{
+						Pos:      world.BlockPos{X: x, Y: y, Z: z},
+						OldState: oldState,
+						NewState: targetState,
+					})
+					for _, cp := range lc {
+						if !seenLight[cp] {
+							seenLight[cp] = true
+							lightChunks = append(lightChunks, cp)
+						}
+					}
+				}
+			}
+		}
+	}
+	if len(changes) > 0 {
+		srv.BroadcastDimensionBlocks(ctx.Dimension, changes, lightChunks)
+	}
+	if filled == 0 {
+		return "No blocks were filled"
+	}
+	return fmt.Sprintf("Successfully filled %d block(s)", filled)
+}
+
+func execClone(srv *server.Server, ctx CommandContext, args []string) string {
+	idx := 0
+	srcDim := ctx.Dimension
+	dstDim := ctx.Dimension
+	if idx+1 < len(args) && strings.EqualFold(args[idx], "from") {
+		norm := world.NormalizeDimension(args[idx+1])
+		if !world.IsValidDimension(norm) {
+			return fmt.Sprintf("Unknown source dimension %q", args[idx+1])
+		}
+		srcDim = norm
+		idx += 2
+	}
+	if idx+6 > len(args) {
+		return "Usage: /clone [from <srcDim>] <begin> <end> [to <dstDim>] <destination> [replace|masked|filtered [<filter>]] [force|move|normal]"
+	}
+	x1, y1, z1, err := resolveConditionBlockPos(ctx, args[idx], args[idx+1], args[idx+2])
+	if err != nil {
+		return fmt.Sprintf("Invalid begin position: %v", err)
+	}
+	x2, y2, z2, err := resolveConditionBlockPos(ctx, args[idx+3], args[idx+4], args[idx+5])
+	if err != nil {
+		return fmt.Sprintf("Invalid end position: %v", err)
+	}
+	idx += 6
+	if idx+1 < len(args) && strings.EqualFold(args[idx], "to") {
+		norm := world.NormalizeDimension(args[idx+1])
+		if !world.IsValidDimension(norm) {
+			return fmt.Sprintf("Unknown target dimension %q", args[idx+1])
+		}
+		dstDim = norm
+		idx += 2
+	}
+	if idx+3 > len(args) {
+		return "Usage: /clone [from <srcDim>] <begin> <end> [to <dstDim>] <destination> [replace|masked|filtered [<filter>]] [force|move|normal]"
+	}
+	dx, dy, dz, err := resolveConditionBlockPos(ctx, args[idx], args[idx+1], args[idx+2])
+	if err != nil {
+		return fmt.Sprintf("Invalid destination position: %v", err)
+	}
+	idx += 3
+
+	maskMode := "replace"
+	var filter string
+	cloneMode := "normal"
+	if idx < len(args) {
+		m := strings.ToLower(strings.TrimSpace(args[idx]))
+		switch m {
+		case "replace", "masked":
+			maskMode = m
+			idx++
+		case "filtered":
+			maskMode = "filtered"
+			idx++
+			if idx >= len(args) {
+				return "Usage: /clone ... filtered <filter> [force|move|normal]"
+			}
+			if _, _, _, err := parseBlockStateSpec(args[idx]); err != nil {
+				return err.Error()
+			}
+			filter = args[idx]
+			idx++
+		default:
+			return fmt.Sprintf("Invalid clone mask mode %q", args[idx])
+		}
+	}
+	if idx < len(args) {
+		cm := strings.ToLower(strings.TrimSpace(args[idx]))
+		switch cm {
+		case "normal", "force", "move":
+			cloneMode = cm
+			idx++
+		default:
+			return fmt.Sprintf("Invalid clone mode %q", args[idx])
+		}
+	}
+	if idx != len(args) {
+		return "Usage: /clone [from <srcDim>] <begin> <end> [to <dstDim>] <destination> [replace|masked|filtered [<filter>]] [force|move|normal]"
+	}
+
+	if x1 > x2 {
+		x1, x2 = x2, x1
+	}
+	if y1 > y2 {
+		y1, y2 = y2, y1
+	}
+	if z1 > z2 {
+		z1, z2 = z2, z1
+	}
+	sizeX := x2 - x1 + 1
+	sizeY := y2 - y1 + 1
+	sizeZ := z2 - z1 + 1
+	vol := sizeX * sizeY * sizeZ
+	if vol > MaxCommandBlockVolume {
+		return fmt.Sprintf("Too many blocks in the specified area (maximum %d, specified %d)", MaxCommandBlockVolume, vol)
+	}
+
+	srcDT, _ := srv.DimensionType(srcDim)
+	dstDT, _ := srv.DimensionType(dstDim)
+	if y1 < srcDT.MinY || y2 >= srcDT.MaxY() || dy < dstDT.MinY || dy+sizeY-1 >= dstDT.MaxY() {
+		return "That position is out of this world!"
+	}
+
+	dx2 := dx + sizeX - 1
+	dy2 := dy + sizeY - 1
+	dz2 := dz + sizeZ - 1
+	if srcDim == dstDim && cloneMode != "force" {
+		overlaps := x1 <= dx2 && x2 >= dx && y1 <= dy2 && y2 >= dy && z1 <= dz2 && z2 >= dz
+		if overlaps {
+			return "Source and destination can not overlap"
+		}
+	}
+
+	srcCache := srv.DimensionChunks(srcDim)
+	dstCache := srv.DimensionChunks(dstDim)
+	if srcCache == nil || dstCache == nil {
+		return "No blocks were cloned"
+	}
+
+	type clonedCell struct {
+		ox, oy, oz int
+		state      uint16
+	}
+	var snapshot []clonedCell
+	for oy := 0; oy < sizeY; oy++ {
+		for oz := 0; oz < sizeZ; oz++ {
+			for ox := 0; ox < sizeX; ox++ {
+				st := srcCache.GetBlock(x1+ox, y1+oy, z1+oz)
+				if maskMode == "masked" && st == world.StateAir {
+					continue
+				}
+				if maskMode == "filtered" && !matchBlockPredicate(st, filter) {
+					continue
+				}
+				snapshot = append(snapshot, clonedCell{ox: ox, oy: oy, oz: oz, state: st})
+			}
+		}
+	}
+
+	if cloneMode == "move" && len(snapshot) > 0 {
+		var srcChanges []world.BlockChange
+		var srcLight []world.ChunkPos
+		seenSrcLight := make(map[world.ChunkPos]bool)
+		for _, cell := range snapshot {
+			sx, sy, sz := x1+cell.ox, y1+cell.oy, z1+cell.oz
+			oldSt := srcCache.GetBlock(sx, sy, sz)
+			if oldSt == world.StateAir {
+				continue
+			}
+			if valid, lc := srcCache.SetBlockWithLight(sx, sy, sz, world.StateAir); valid {
+				srcChanges = append(srcChanges, world.BlockChange{
+					Pos:      world.BlockPos{X: sx, Y: sy, Z: sz},
+					OldState: oldSt,
+					NewState: world.StateAir,
+				})
+				for _, cp := range lc {
+					if !seenSrcLight[cp] {
+						seenSrcLight[cp] = true
+						srcLight = append(srcLight, cp)
+					}
+				}
+			}
+		}
+		if len(srcChanges) > 0 {
+			srv.BroadcastDimensionBlocks(srcDim, srcChanges, srcLight)
+		}
+	}
+
+	var (
+		dstChanges []world.BlockChange
+		dstLight   []world.ChunkPos
+		seenDst    = make(map[world.ChunkPos]bool)
+		cloned     int
+	)
+	for _, cell := range snapshot {
+		tx, ty, tz := dx+cell.ox, dy+cell.oy, dz+cell.oz
+		oldSt := dstCache.GetBlock(tx, ty, tz)
+		if valid, lc := dstCache.SetBlockWithLight(tx, ty, tz, cell.state); valid {
+			cloned++
+			if oldSt != cell.state {
+				dstChanges = append(dstChanges, world.BlockChange{
+					Pos:      world.BlockPos{X: tx, Y: ty, Z: tz},
+					OldState: oldSt,
+					NewState: cell.state,
+				})
+				for _, cp := range lc {
+					if !seenDst[cp] {
+						seenDst[cp] = true
+						dstLight = append(dstLight, cp)
+					}
+				}
+			}
+		}
+	}
+	if len(dstChanges) > 0 {
+		srv.BroadcastDimensionBlocks(dstDim, dstChanges, dstLight)
+	}
+	if cloned == 0 {
+		return "No blocks were cloned"
+	}
+	return fmt.Sprintf("Successfully cloned %d block(s)", cloned)
+}
+
+func lookupBiomeRegistryID(raw string) (uint16, string, bool) {
+	name := strings.ToLower(strings.TrimSpace(raw))
+	if name == "" {
+		return 0, "", false
+	}
+	if !strings.Contains(name, ":") {
+		name = "minecraft:" + name
+	}
+	switch name {
+	case "minecraft:plains":
+		return world.BiomePlains, name, true
+	case "minecraft:nether_wastes":
+		return world.BiomeNetherWastes, name, true
+	case "minecraft:the_end":
+		return world.BiomeTheEnd, name, true
+	}
+	if idx := registry.Index("minecraft:worldgen/biome", name); idx >= 0 {
+		return uint16(idx), name, true
+	}
+	return 0, "", false
+}
+
+func execFillBiome(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) != 7 && len(args) != 9 {
+		return "Usage: /fillbiome <from> <to> <biome> [replace <filter>]"
+	}
+	x1, y1, z1, err := resolveConditionBlockPos(ctx, args[0], args[1], args[2])
+	if err != nil {
+		return fmt.Sprintf("Invalid from position: %v", err)
+	}
+	x2, y2, z2, err := resolveConditionBlockPos(ctx, args[3], args[4], args[5])
+	if err != nil {
+		return fmt.Sprintf("Invalid to position: %v", err)
+	}
+	if x1 > x2 {
+		x1, x2 = x2, x1
+	}
+	if y1 > y2 {
+		y1, y2 = y2, y1
+	}
+	if z1 > z2 {
+		z1, z2 = z2, z1
+	}
+	dt, _ := srv.DimensionType(ctx.Dimension)
+	if y1 < dt.MinY || y2 >= dt.MaxY() {
+		return "That position is out of this world!"
+	}
+	vol := (x2 - x1 + 1) * (y2 - y1 + 1) * (z2 - z1 + 1)
+	if vol > MaxCommandBlockVolume {
+		return fmt.Sprintf("Too many blocks in the specified area (maximum %d, specified %d)", MaxCommandBlockVolume, vol)
+	}
+	biomeID, _, ok := lookupBiomeRegistryID(args[6])
+	if !ok {
+		return fmt.Sprintf("Unknown biome %q", args[6])
+	}
+	var hasFilter bool
+	var filterBiomeID uint16
+	if len(args) == 9 {
+		if !strings.EqualFold(args[7], "replace") {
+			return "Usage: /fillbiome <from> <to> <biome> [replace <filter>]"
+		}
+		fid, _, fok := lookupBiomeRegistryID(args[8])
+		if !fok {
+			return fmt.Sprintf("Unknown filter biome %q", args[8])
+		}
+		hasFilter = true
+		filterBiomeID = fid
+	}
+	cache := srv.DimensionChunks(ctx.Dimension)
+	if cache == nil {
+		return "0 biome cell(s) set"
+	}
+	qMinX, qMaxX := (x1>>2)<<2, (x2>>2)<<2
+	qMinY, qMaxY := (y1>>2)<<2, (y2>>2)<<2
+	qMinZ, qMaxZ := (z1>>2)<<2, (z2>>2)<<2
+	count := 0
+	for y := qMinY; y <= qMaxY; y += 4 {
+		for z := qMinZ; z <= qMaxZ; z += 4 {
+			for x := qMinX; x <= qMaxX; x += 4 {
+				if hasFilter && cache.GetBiome(x, y, z) != filterBiomeID {
+					continue
+				}
+				if cache.SetBiome(x, y, z, biomeID) {
+					count++
+				}
+			}
+		}
+	}
+	return fmt.Sprintf("%d biome cell(s) set between %d, %d, %d and %d, %d, %d", count, qMinX, qMinY, qMinZ, qMaxX+3, qMaxY+3, qMaxZ+3)
+}
+
+func execKill(srv *server.Server, ctx CommandContext, args []string) string {
+	var targets []CommandTarget
+	if len(args) == 0 {
+		t, ok := ctx.Target()
+		if !ok {
+			return "Usage: /kill <targets>"
+		}
+		targets = []CommandTarget{t}
+	} else if len(args) == 1 {
+		resolved, err := ResolveTargets(srv, ctx, args[0])
+		if err != nil || len(resolved) == 0 {
+			return "No entity was found"
+		}
+		targets = resolved
+	} else {
+		return "Usage: /kill [<targets>]"
+	}
+	killed := 0
+	var lastName string
+	for _, t := range targets {
+		if t.IsPlayer() {
+			if srv.KillPlayerCommand(t.Player) {
+				killed++
+				lastName = t.Name()
+			}
+		} else if t.Entity.ID > 0 {
+			if srv.KillEntityCommand(t.Entity.ID) {
+				killed++
+				lastName = t.Name()
+			}
+		}
+	}
+	if killed == 0 {
+		return "No entity was found"
+	}
+	if killed == 1 {
+		return fmt.Sprintf("Killed %s", lastName)
+	}
+	return fmt.Sprintf("Killed %d entities", killed)
+}
+
+func execDamage(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 2 {
+		return "Usage: /damage <target> <amount> [<damageType>] [at <location> | by <entity> [from <cause>]]"
+	}
+	targets, err := ResolveTargets(srv, ctx, args[0])
+	if err != nil || len(targets) == 0 {
+		return "No entity was found"
+	}
+	if len(targets) > 1 {
+		return "Only one entity is allowed, but the provided selector allows more than one"
+	}
+	target := targets[0]
+	amt, err := strconv.ParseFloat(strings.TrimSpace(args[1]), 32)
+	if err != nil || math.IsNaN(amt) || math.IsInf(amt, 0) || amt < 0 {
+		return fmt.Sprintf("Invalid damage amount %q (must be >= 0)", args[1])
+	}
+	cause := "generic"
+	idx := 2
+	if idx < len(args) {
+		tok := strings.ToLower(strings.TrimSpace(args[idx]))
+		if tok != "at" && tok != "by" {
+			cause = strings.TrimPrefix(tok, "minecraft:")
+			idx++
+		}
+	}
+	if idx < len(args) {
+		sub := strings.ToLower(strings.TrimSpace(args[idx]))
+		switch sub {
+		case "at":
+			if idx+4 != len(args) {
+				return "Usage: /damage <target> <amount> [<damageType>] at <x> <y> <z>"
+			}
+			if _, _, _, err := resolveConditionBlockPos(ctx, args[idx+1], args[idx+2], args[idx+3]); err != nil {
+				return fmt.Sprintf("Invalid damage location: %v", err)
+			}
+		case "by":
+			if idx+2 > len(args) {
+				return "Usage: /damage <target> <amount> [<damageType>] by <entity> [from <cause>]"
+			}
+			atk, err := ResolveTargets(srv, ctx, args[idx+1])
+			if err != nil || len(atk) != 1 {
+				return "Attacker entity not found"
+			}
+			idx += 2
+			if idx < len(args) {
+				if idx+2 != len(args) || !strings.EqualFold(args[idx], "from") {
+					return "Usage: /damage <target> <amount> [<damageType>] by <entity> [from <cause>]"
+				}
+				src, err := ResolveTargets(srv, ctx, args[idx+1])
+				if err != nil || len(src) != 1 {
+					return "Source entity not found"
+				}
+			}
+		default:
+			return "Usage: /damage <target> <amount> [<damageType>] [at <location> | by <entity> [from <cause>]]"
+		}
+	}
+
+	if target.IsPlayer() {
+		if cause == "out_of_world" || cause == "generic_kill" || cause == "kill" {
+			srv.DamagePlayer(target.Player, float32(amt), cause)
+		} else {
+			srv.DamagePlayerWithEffects(target.Player, float32(amt), cause)
+		}
+	} else if target.Entity.ID > 0 {
+		if !srv.DamageEntityCommand(target.Entity.ID, float32(amt)) {
+			return fmt.Sprintf("Unable to apply damage to %s", target.Name())
+		}
+	}
+	return fmt.Sprintf("Applied %.1f damage to %s", amt, target.Name())
+}
+
+func execExperience(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) == 0 {
+		return "Usage: /xp (add|set <targets> <amount> [points|levels] | query <targets> (points|levels))"
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	// Support shorthand `/xp <amount>[L] [<targets>]` as well as `/xp (add|set|query) ...`.
+	if sub != "add" && sub != "set" && sub != "query" {
+		rawAmt := strings.TrimSpace(args[0])
+		unit := "points"
+		if strings.HasSuffix(rawAmt, "L") || strings.HasSuffix(rawAmt, "l") {
+			unit = "levels"
+			rawAmt = rawAmt[:len(rawAmt)-1]
+		}
+		targetTok := "@s"
+		if len(args) >= 2 {
+			targetTok = args[1]
+		}
+		args = []string{"add", targetTok, rawAmt, unit}
+		sub = "add"
+	}
+
+	switch sub {
+	case "query":
+		if len(args) != 3 {
+			return "Usage: /xp query <targets> (points|levels)"
+		}
+		players, err := ResolveTargetSessions(srv, ctx, args[1])
+		if err != nil || len(players) == 0 {
+			return "No player was found"
+		}
+		if len(players) > 1 {
+			return "Only one player is allowed"
+		}
+		p := players[0]
+		unit := strings.ToLower(strings.TrimSpace(args[2]))
+		switch unit {
+		case "levels":
+			return fmt.Sprintf("%s has %d experience levels", p.Profile.Name, p.ExperienceLevel())
+		case "points":
+			lvl, totalXP, prog := p.Experience()
+			pts := int32(math.Floor(float64(prog) * float64(server.XPForNextLevel(lvl))))
+			if pts == 0 && totalXP > server.TotalXPForLevel(lvl) {
+				pts = totalXP - server.TotalXPForLevel(lvl)
+			}
+			return fmt.Sprintf("%s has %d experience points", p.Profile.Name, pts)
+		default:
+			return "Usage: /xp query <targets> (points|levels)"
+		}
+
+	case "add", "set":
+		if len(args) < 3 || len(args) > 4 {
+			return fmt.Sprintf("Usage: /xp %s <targets> <amount> [points|levels]", sub)
+		}
+		players, err := ResolveTargetSessions(srv, ctx, args[1])
+		if err != nil || len(players) == 0 {
+			return "No player was found"
+		}
+		amt64, err := strconv.ParseInt(strings.TrimSpace(args[2]), 10, 32)
+		if err != nil {
+			return fmt.Sprintf("Invalid experience amount %q", args[2])
+		}
+		amt := int32(amt64)
+		if sub == "set" && amt < 0 {
+			return "Cannot set experience to a negative value"
+		}
+		unit := "points"
+		if len(args) == 4 {
+			unit = strings.ToLower(strings.TrimSpace(args[3]))
+			if unit != "points" && unit != "levels" {
+				return fmt.Sprintf("Invalid experience unit %q (expected points or levels)", args[3])
+			}
+		}
+		for _, p := range players {
+			if sub == "add" {
+				if unit == "levels" {
+					_ = srv.AddPlayerExperienceLevels(p, amt)
+				} else {
+					_ = srv.AddPlayerExperience(p, amt)
+				}
+			} else {
+				if unit == "levels" {
+					_, _, prog := p.Experience()
+					needed := server.XPForNextLevel(amt)
+					inLvl := int32(math.Floor(float64(prog) * float64(needed)))
+					_ = srv.SetPlayerExperience(p, amt, server.TotalXPForLevel(amt)+inLvl, prog)
+				} else {
+					lvl, _, _ := p.Experience()
+					needed := server.XPForNextLevel(lvl)
+					if amt < needed {
+						prog := float32(amt) / float32(needed)
+						_ = srv.SetPlayerExperience(p, lvl, server.TotalXPForLevel(lvl)+amt, prog)
+					} else {
+						_ = srv.SetPlayerTotalExperience(p, amt)
+					}
+				}
+			}
+		}
+		verb := "Gave"
+		if sub == "set" {
+			verb = "Set"
+		}
+		if len(players) == 1 {
+			return fmt.Sprintf("%s %d experience %s to %s", verb, amt, unit, players[0].Profile.Name)
+		}
+		return fmt.Sprintf("%s %d experience %s to %d players", verb, amt, unit, len(players))
+
+	default:
+		return "Usage: /xp (add|set <targets> <amount> [points|levels] | query <targets> (points|levels))"
+	}
+}
+
+func execSummon(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /summon <entity> [<x> <y> <z>] [<nbt>]"
+	}
+	x, y, z := ctx.X, ctx.Y, ctx.Z
+	if len(args) >= 4 {
+		cx, cy, cz, err := ParseVec3Args(args[1], args[2], args[3])
+		if err != nil {
+			return fmt.Sprintf("Invalid summon coordinates: %v", err)
+		}
+		ox, oy, oz := ctx.X, ctx.Y, ctx.Z
+		if cx.Local {
+			ox, oy, oz = ctx.AnchorOrigin()
+		}
+		x, y, z = ResolveVec3(ox, oy, oz, ctx.Yaw, ctx.Pitch, cx, cy, cz)
+	} else if len(args) != 1 {
+		return "Usage: /summon <entity> [<x> <y> <z>] [<nbt>]"
+	}
+	if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
+		return "Invalid position for summon"
+	}
+	ent, err := srv.SummonEntityCommand(ctx.Dimension, args[0], x, y, z)
+	if err != nil || ent == nil {
+		if err != nil {
+			return err.Error()
+		}
+		return fmt.Sprintf("Unable to summon %s", args[0])
+	}
+	return fmt.Sprintf("Summoned new %s", ent.TypeName)
+}
+

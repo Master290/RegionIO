@@ -1078,8 +1078,9 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		}
 	}
 
+	isKillCommand := cause == "kill" || cause == "generic_kill"
 	isOutOfBorder := cause == "out_of_border" || cause == "outside_border" || cause == "world_border"
-	if !isOutOfBorder {
+	if !isOutOfBorder && !isKillCommand {
 		if prot := session.ArmorEnchantmentProtection(cause); prot > 0 {
 			amount *= 1.0 - prot
 			if amount <= 0 {
@@ -1090,7 +1091,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 
 	dim := session.Dimension()
 	session.mu.Lock()
-	if session.gameMode == GameModeCreative || session.gameMode == GameModeSpectator {
+	if !isKillCommand && (session.gameMode == GameModeCreative || session.gameMode == GameModeSpectator) {
 		session.mu.Unlock()
 		return false
 	}
@@ -1100,7 +1101,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	}
 	newHealth := session.health - amount
 	died := false
-	if newHealth <= 0 {
+	if isKillCommand || newHealth <= 0 {
 		newHealth = 0
 		died = true
 	}
@@ -2156,4 +2157,156 @@ func (s *Server) TickFire() {
 	s.syncTNTAndFireRulesToCaches()
 	_ = s.CheckPlayersInFire()
 }
+
+// BroadcastDimensionBlocks invalidates any affected Portal POIs and broadcasts
+// block and lighting updates in dim.
+func (s *Server) BroadcastDimensionBlocks(dim string, changes []world.BlockChange, lightChunks []world.ChunkPos) {
+	if s == nil || len(changes) == 0 {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	s.InvalidatePortalPOIs(normDim, changes)
+	s.broadcastDimensionBlockChanges(normDim, cache, changes, lightChunks)
+}
+
+// KillPlayerCommand kills session via /kill (generic_kill), bypassing Creative
+// and Spectator invulnerability.
+func (s *Server) KillPlayerCommand(session *PlayerSession) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	session.mu.Lock()
+	prevMode := session.gameMode
+	if prevMode == GameModeCreative || prevMode == GameModeSpectator {
+		session.gameMode = GameModeSurvival
+	}
+	hp := session.health
+	if hp <= 0 {
+		hp = 20
+		session.health = 20
+	}
+	session.mu.Unlock()
+
+	killed := s.DamagePlayer(session, hp+1000, "generic_kill")
+	if prevMode == GameModeCreative || prevMode == GameModeSpectator {
+		session.mu.Lock()
+		if !s.IsHardcore() {
+			session.gameMode = prevMode
+		}
+		session.mu.Unlock()
+	}
+	return killed
+}
+
+// KillEntityCommand removes a non-player entity via /kill and broadcasts its removal.
+func (s *Server) KillEntityCommand(entityID int32) bool {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return false
+	}
+	dim := ent.EffectiveDimension()
+	cp := ent.ChunkPos()
+	s.SetMobHealth(entityID, 0)
+	s.entities.Remove(entityID)
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+		encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+	return true
+}
+
+// DamageEntityCommand applies amount damage to a non-player entity via /damage.
+func (s *Server) DamageEntityCommand(entityID int32, amount float32) bool {
+	if s == nil || s.entities == nil || entityID <= 0 || amount < 0 {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return false
+	}
+	dim := ent.EffectiveDimension()
+	cp := ent.ChunkPos()
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayHurtAnimation, EncodeHurtAnimation(entityID, 0))
+	curHP := s.MobHealth(entityID)
+	if curHP > 0 {
+		rem := curHP - amount
+		if rem <= 0 {
+			s.SetMobHealth(entityID, 0)
+			s.entities.Remove(entityID)
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+				encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+		} else {
+			s.SetMobHealth(entityID, rem)
+		}
+		return true
+	}
+	if amount > 0 && ent.IsItem() {
+		s.entities.Remove(entityID)
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+			encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+	}
+	return true
+}
+
+// SummonEntityCommand spawns an entity of typeName at (x, y, z) in dim for /summon.
+func (s *Server) SummonEntityCommand(dim, typeName string, x, y, z float64) (*world.Entity, error) {
+	if s == nil || s.entities == nil {
+		return nil, errors.New("entity manager unavailable")
+	}
+	normDim := world.NormalizeDimension(dim)
+	normType := strings.ToLower(strings.TrimSpace(typeName))
+	if !strings.Contains(normType, ":") {
+		normType = "minecraft:" + normType
+	}
+	if IsVehicleEntity(normType) {
+		_, vEnt := s.SpawnVehicle(normDim, normType, x, y, z, 0)
+		if vEnt != nil {
+			return vEnt, nil
+		}
+	}
+	if normType == "minecraft:lightning_bolt" {
+		boltID, _, _, _, _ := s.SpawnLightningBolt(normDim, x, y, z, nil)
+		if ent := s.entities.Get(boltID); ent != nil {
+			return ent, nil
+		}
+	}
+	if normType == "minecraft:tnt" {
+		tntID := s.SpawnPrimedTNTWithFuse(normDim, x, y, z, DefaultPrimedTNTFuseTicks, nil)
+		if ent := s.entities.Get(tntID); ent != nil {
+			return ent, nil
+		}
+	}
+	if normType == "minecraft:player" || normType == "minecraft:fishing_bobber" {
+		return nil, fmt.Errorf("Unable to summon %s", typeName)
+	}
+	if mobID, err := s.SpawnMobInDimension(normDim, x, y, z, normType); err == nil && mobID > 0 {
+		if ent := s.entities.Get(mobID); ent != nil {
+			return ent, nil
+		}
+	}
+	typeID := ResolveEntityTypeID(normType)
+	if typeID < 0 {
+		return nil, fmt.Errorf("Unknown entity type %q", typeName)
+	}
+	ent := &world.Entity{
+		TypeID:    typeID,
+		TypeName:  normType,
+		Dimension: normDim,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		OnGround:  true,
+	}
+	id := s.entities.Add(ent)
+	s.SetMobHealth(id, 20.0)
+	saved := s.entities.Get(id)
+	if saved != nil {
+		cp := saved.ChunkPos()
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, saved))
+	}
+	return saved, nil
+}
+
 

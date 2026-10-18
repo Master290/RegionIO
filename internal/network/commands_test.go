@@ -469,3 +469,89 @@ func TestTeleportPolishAndExecuteCommand(t *testing.T) {
 	}
 }
 
+func TestWorldBlockAndEntityCommandsBatch1(t *testing.T) {
+	srv, err := server.NewWithCache(server.DefaultConfig(), world.NewCache(256, world.GenerateFlat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.RequestStop() }()
+
+	alice, err := srv.RegisterPlayer(server.Profile{Name: "Alice", UUID: server.OfflineUUID("Alice")}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetPlayerTransform(alice, 0, 70, 0, 0, 0, true)
+
+	// 1. /setblock (replace, keep, destroy)
+	if got := ExecuteCommand(srv, alice, "/setblock 5 70 5 minecraft:obsidian"); !strings.Contains(got, "Changed the block at 5, 70, 5") {
+		t.Fatalf("/setblock obsidian = %q", got)
+	}
+	if world.BlockName(srv.Chunks().GetBlock(5, 70, 5)) != "minecraft:obsidian" {
+		t.Fatalf("block at (5,70,5) = %s, want minecraft:obsidian", world.BlockName(srv.Chunks().GetBlock(5, 70, 5)))
+	}
+	if got := ExecuteCommand(srv, alice, "/setblock 5 70 5 minecraft:stone keep"); got != "Could not set the block" {
+		t.Fatalf("/setblock keep on non-air = %q, want 'Could not set the block'", got)
+	}
+
+	// 2. /fill (replace, hollow, outline, replace with filter)
+	if got := ExecuteCommand(srv, alice, "/fill 10 70 10 12 72 12 minecraft:stone hollow"); !strings.Contains(got, "Successfully filled") {
+		t.Fatalf("/fill hollow = %q", got)
+	}
+	if srv.Chunks().GetBlock(11, 71, 11) != world.StateAir {
+		t.Fatalf("hollow interior should be air, got %d", srv.Chunks().GetBlock(11, 71, 11))
+	}
+	if world.BlockName(srv.Chunks().GetBlock(10, 70, 10)) != "minecraft:stone" {
+		t.Fatalf("hollow shell should be stone, got %s", world.BlockName(srv.Chunks().GetBlock(10, 70, 10)))
+	}
+	if got := ExecuteCommand(srv, alice, "/fill 10 70 10 12 72 12 minecraft:obsidian replace minecraft:stone"); !strings.Contains(got, "26") {
+		t.Fatalf("/fill replace filter = %q", got)
+	}
+
+	// 3. /clone (replace, masked, move)
+	if got := ExecuteCommand(srv, alice, "/clone 10 70 10 12 72 12 20 70 20 masked move"); !strings.Contains(got, "26") {
+		t.Fatalf("/clone masked move = %q", got)
+	}
+	if world.BlockName(srv.Chunks().GetBlock(20, 70, 20)) != "minecraft:obsidian" {
+		t.Fatalf("cloned destination (20,70,20) = %s, want minecraft:obsidian", world.BlockName(srv.Chunks().GetBlock(20, 70, 20)))
+	}
+	if srv.Chunks().GetBlock(10, 70, 10) != world.StateAir {
+		t.Fatalf("moved source (10,70,10) should be air, got %d", srv.Chunks().GetBlock(10, 70, 10))
+	}
+
+	// 4. /fillbiome
+	if got := ExecuteCommand(srv, alice, "/fillbiome 0 64 0 7 67 7 minecraft:nether_wastes"); !strings.Contains(got, "biome cell(s) set") {
+		t.Fatalf("/fillbiome = %q", got)
+	}
+	if b := srv.Chunks().GetBiome(0, 64, 0); b != world.BiomeNetherWastes {
+		t.Fatalf("GetBiome(0,64,0) = %d, want %d", b, world.BiomeNetherWastes)
+	}
+
+	// 5. /xp and /experience (add, set, query)
+	if got := ExecuteCommand(srv, alice, "/xp add @s 5 levels"); !strings.Contains(got, "5 experience levels") {
+		t.Fatalf("/xp add levels = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/experience query @s levels"); !strings.Contains(got, "5 experience levels") {
+		t.Fatalf("/experience query levels = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/xp set @s 20 points"); !strings.Contains(got, "20 experience points") {
+		t.Fatalf("/xp set points = %q", got)
+	}
+	if alice.TotalExperience() != 20 {
+		t.Fatalf("alice TotalExperience = %d, want 20", alice.TotalExperience())
+	}
+
+	// 6. /summon, /damage, and /kill
+	if got := ExecuteCommand(srv, alice, "/summon minecraft:zombie 30 70 30"); !strings.Contains(got, "Summoned new minecraft:zombie") {
+		t.Fatalf("/summon zombie = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/damage @e[type=minecraft:zombie,limit=1] 5 generic"); !strings.Contains(got, "Applied 5.0 damage") {
+		t.Fatalf("/damage zombie = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/kill @e[type=minecraft:zombie]"); !strings.Contains(got, "Killed") {
+		t.Fatalf("/kill zombie = %q", got)
+	}
+}
+
+

@@ -1509,3 +1509,64 @@ func ActivateEndPortalAt(cache *Cache, frameX, frameY, frameZ int) ([]BlockPos, 
 	return nil, nil, false
 }
 
+// GetBiome returns the biome registry index of the 4x4x4 cell containing world coordinates (x, y, z).
+func (c *Cache) GetBiome(x, y, z int) uint16 {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return BiomePlains
+	}
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil || ch == nil {
+		return BiomePlains
+	}
+	return ch.GetBiome(x&15, y, z&15)
+}
+
+// SetBiome sets the biome registry index of the 4x4x4 cell containing world coordinates (x, y, z).
+func (c *Cache) SetBiome(x, y, z int, biomeID uint16) bool {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false
+	}
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil || ch == nil {
+		return false
+	}
+	si := (y - MinY) >> 4
+	if si < 0 || si >= SectionCount {
+		return false
+	}
+	ch.mu.Lock()
+	if ch.biomes[si] == nil {
+		arr := new([biomeCellsPerSection]uint16)
+		for i := range arr {
+			arr[i] = ch.biome
+		}
+		ch.biomes[si] = arr
+	}
+	idx := biomeIndex(x&15, y, z&15)
+	changed := ch.biomes[si][idx] != biomeID
+	ch.biomes[si][idx] = biomeID
+	rev := ch.revision.Add(1)
+	ch.mu.Unlock()
+	if changed {
+		c.mu.Lock()
+		delete(c.frames, key)
+		if c.store != nil {
+			c.dirty[key] = rev
+		}
+		c.touch(key)
+		c.mu.Unlock()
+	}
+	return true
+}
+
+
