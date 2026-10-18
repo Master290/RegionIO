@@ -303,6 +303,7 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 		case UpdateRedstone:
 			c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			c.stepComposterUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateFire:
 			c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		}
@@ -411,6 +412,20 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	}
 	if IsLanternBlock(state) {
 		return c.ResolveLanternPlacementAt(x, y, z, state)
+	}
+	if IsCandleBlock(state) {
+		cur := state
+		if c.GetBlock(x, y, z) == StateWater {
+			if updated, ok := withStateProperty(cur, "waterlogged", "true"); ok {
+				cur = updated
+			}
+		}
+		if isWaterloggedState(cur) && IsCandleOrCandleCakeLit(cur) {
+			if updated, ok := withStateProperty(cur, "lit", "false"); ok {
+				cur = updated
+			}
+		}
+		return cur
 	}
 	if IsCopperBarsBlock(state) {
 		return c.ResolveCopperBarsStateAt(x, y, z, state)
@@ -601,6 +616,9 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 	}
 	if c.needsScaffoldingTickAt(x, y, z, state) {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, ScaffoldingTickDelay)
+	}
+	if lvl, ok := ComposterLevel(state); ok && lvl == ComposterMaxFillLevel {
+		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ComposterReadyTickDelay)
 	}
 	if kind, _, ok := classifyFluidState(state); ok {
 		delay := WaterTickDelay
@@ -835,6 +853,12 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 			}
 		}
 		return cur, true
+	}
+
+	if IsCandleBlockName(name) && props["waterlogged"] == "true" && props["lit"] == "true" {
+		if updated, ok := withStateProperty(state, "lit", "false"); ok {
+			state = updated
+		}
 	}
 
 	if name == "minecraft:soul_fire" {
@@ -2085,6 +2109,9 @@ func requiresFloorSupport(name string, props map[string]string) bool {
 		return true
 	}
 	if (strings.HasSuffix(name, "_button") || name == "minecraft:lever") && props["face"] == "floor" {
+		return true
+	}
+	if name == "minecraft:cake" || IsCandleBlockName(name) || IsCandleCakeBlockName(name) {
 		return true
 	}
 	switch name {

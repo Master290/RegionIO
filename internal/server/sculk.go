@@ -811,13 +811,19 @@ type PlayerWardenTracker struct {
 // when a `can_summon=true` sculk shrieker reaches warning level 4.
 type WardenSummonHookFunc func(dim string, spawnX, spawnY, spawnZ float64, shriekerX, shriekerY, shriekerZ int, triggerPlayer *PlayerSession) bool
 
+// WardenPresentPredicateFunc reports whether an active Warden already exists
+// within `radius` blocks of (x, y, z) in `dim` (vanilla WardenSpawnTracker
+// suppresses warning escalation when a Warden is within 48 blocks).
+type WardenPresentPredicateFunc func(dim string, x, y, z float64, radius float64) bool
+
 type serverSculkState struct {
-	mu               sync.Mutex
-	loadedDisk       bool
-	sensors          map[brewingKey]*SculkSensorBlockEntity
-	shriekers        map[brewingKey]*SculkShriekerBlockEntity
-	catalysts        map[brewingKey]*SculkCatalystBlockEntity
-	wardenSummonHook WardenSummonHookFunc
+	mu                sync.Mutex
+	loadedDisk        bool
+	sensors           map[brewingKey]*SculkSensorBlockEntity
+	shriekers         map[brewingKey]*SculkShriekerBlockEntity
+	catalysts         map[brewingKey]*SculkCatalystBlockEntity
+	wardenSummonHook  WardenSummonHookFunc
+	wardenPresentHook WardenPresentPredicateFunc
 }
 
 var (
@@ -857,6 +863,18 @@ func (s *Server) SetWardenSummonHook(fn WardenSummonHookFunc) {
 	st := s.sculkState()
 	st.mu.Lock()
 	st.wardenSummonHook = fn
+	st.mu.Unlock()
+}
+
+// SetWardenPresentHook registers Agent A's predicate to check if a Warden is
+// already within `radius` (48) blocks of a shrieker, suppressing duplicate summons.
+func (s *Server) SetWardenPresentHook(fn WardenPresentPredicateFunc) {
+	if s == nil {
+		return
+	}
+	st := s.sculkState()
+	st.mu.Lock()
+	st.wardenPresentHook = fn
 	st.mu.Unlock()
 }
 
@@ -1714,6 +1732,7 @@ func (s *Server) TriggerSculkShriekerAt(dim string, x, y, z int, player *PlayerS
 	be.ShriekingTicks = SculkShriekerDurationTicks
 	be.TargetPlayer = player
 	summonHook := st.wardenSummonHook
+	presentHook := st.wardenPresentHook
 	st.mu.Unlock()
 
 	nextState := SculkShriekerBlockState(canSummon, true, waterlogged)
@@ -1736,21 +1755,67 @@ func (s *Server) TriggerSculkShriekerAt(dim string, x, y, z int, player *PlayerS
 	})
 
 	if canSummon && player != nil {
-		newLevel, incremented := s.tryIncrementPlayerWarningLevel(normDim, x, y, z, player)
-		if incremented {
-			s.applySculkShriekerDarkness(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5)
-			if newLevel >= WardenWarningMaxLevel && summonHook != nil {
-				spawnX, spawnY, spawnZ, found := s.FindWardenSpawnPosition(normDim, x, y, z)
-				if !found {
-					spawnX, spawnY, spawnZ = float64(x)+0.5, float64(y)+1.0, float64(z)+0.5
+		sx, sy, sz := float64(x)+0.5, float64(y)+0.5, float64(z)+0.5
+		if presentHook != nil && presentHook(normDim, sx, sy, sz, WardenWarningCopyRadius) {
+			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundWardenListeningAngry, SoundSourceHostile, sx, sy, sz, 10.0, 1.0, 0))
+		} else {
+			newLevel, incremented := s.tryIncrementPlayerWarningLevel(normDim, x, y, z, player)
+			if incremented {
+				s.applySculkShriekerDarkness(normDim, sx, sy, sz)
+				switch newLevel {
+				case 1:
+					s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+						EncodeSoundPacket(SoundWardenNearbyClose, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
+				case 2:
+					s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+						EncodeSoundPacket(SoundWardenNearbyCloser, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
+				case 3:
+					s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+						EncodeSoundPacket(SoundWardenNearbyClosest, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
 				}
-				summonHook(normDim, spawnX, spawnY, spawnZ, x, y, z, player)
+				if newLevel >= WardenWarningMaxLevel && summonHook != nil {
+					spawnX, spawnY, spawnZ, found := s.FindWardenSpawnPosition(normDim, x, y, z)
+					if !found {
+						spawnX, spawnY, spawnZ = sx, float64(y)+1.0, sz
+					}
+					summonHook(normDim, spawnX, spawnY, spawnZ, x, y, z, player)
+				}
 			}
 		}
 	}
 
 	_ = s.SaveSculk()
 	return true
+}
+
+// ResolvePlayerPlacedSculkShriekerState returns the block state for a player-placed
+// `minecraft:sculk_shrieker` (`can_summon=false, shrieking=false`), which never
+// summons Wardens when placed by a player.
+func ResolvePlayerPlacedSculkShriekerState(waterlogged bool) uint16 {
+	return SculkShriekerBlockState(false, false, waterlogged)
+}
+
+// OnBreakSculkShriekerAt cleans up runtime state when a `minecraft:sculk_shrieker`
+// at (x, y, z) in dim is broken, and if it was broken mid-shriek (`shrieking=true`)
+// with `can_summon=true` and an active target player, ensures the darkness/warning
+// response still completes (vanilla SculkShriekerBlock.onRemove -> tryRespond).
+func (s *Server) OnBreakSculkShriekerAt(dim string, x, y, z int, brokenState uint16) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	key := makeBrewingKey(normDim, x, y, z)
+	st := s.sculkState()
+	st.mu.Lock()
+	s.ensureSculkLoadedLocked(st)
+	be := st.shriekers[key]
+	delete(st.shriekers, key)
+	st.mu.Unlock()
+	if be != nil && be.ShriekingTicks > 0 && be.CanSummon {
+		s.applySculkShriekerDarkness(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5)
+	}
+	_ = s.SaveSculk()
 }
 
 func (s *Server) tryIncrementPlayerWarningLevel(dim string, sx, sy, sz int, player *PlayerSession) (int, bool) {

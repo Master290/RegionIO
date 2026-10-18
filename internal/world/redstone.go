@@ -1062,6 +1062,9 @@ func hasAnalogOutputSignal(state uint16) bool {
 		"minecraft:detector_rail":
 		return true
 	}
+	if IsCandleCakeBlockName(info.Name) {
+		return true
+	}
 	return strings.HasSuffix(info.Name, "shulker_box")
 }
 
@@ -1194,6 +1197,10 @@ func (c *Cache) analogSignalAt(x, y, z int) int {
 			blockSig = 11
 		case 4:
 			blockSig = MaxRedstonePower
+		}
+	default:
+		if IsCandleCakeBlockName(info.Name) {
+			blockSig = FullCakeComparatorSignal
 		}
 	}
 	if blockSig > sig {
