@@ -398,10 +398,19 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return updated
 		}
 	}
-	if (isBlockNamed(state, "minecraft:decorated_pot") || isBlockNamed(state, "minecraft:lightning_rod") || IsCopperWaterloggableBlock(state)) && c.GetBlock(x, y, z) == StateWater {
+	if (isBlockNamed(state, "minecraft:decorated_pot") || isBlockNamed(state, "minecraft:lightning_rod") || IsCopperWaterloggableBlock(state) || IsChainBlock(state)) && c.GetBlock(x, y, z) == StateWater {
 		if updated, ok := withStateProperty(state, "waterlogged", "true"); ok {
 			state = updated
 		}
+	}
+	if IsScaffoldingBlock(state) {
+		return c.ResolveScaffoldingStateAt(x, y, z, state)
+	}
+	if IsPointedDripstoneBlock(state) {
+		return c.ResolvePointedDripstoneStateAt(x, y, z, state)
+	}
+	if IsLanternBlock(state) {
+		return c.ResolveLanternPlacementAt(x, y, z, state)
 	}
 	if IsCopperBarsBlock(state) {
 		return c.ResolveCopperBarsStateAt(x, y, z, state)
@@ -541,6 +550,11 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 	// sugar cane, bamboo, kelp, torches, carpets, wall attachments, hanging vines).
 	c.runNeighborSupportPass(x, y, z, res)
 
+	// Recompute pointed_dripstone column thickness around (x, y, z) when a dripstone segment is placed or broken.
+	if IsPointedDripstoneBlock(oldState) || IsPointedDripstoneBlock(newState) {
+		c.RecalculatePointedDripstoneColumnAround(x, y, z, res)
+	}
+
 	// Recompute nearby leaf distances when a log or leaf block changes.
 	if isLogOrStemBlock(oldState) || isLogOrStemBlock(newState) || isLeafBlock(oldState) || isLeafBlock(newState) {
 		c.updateLeafDistancesAround(x, y, z, res)
@@ -584,6 +598,9 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 	state := c.GetBlock(x, y, z)
 	if IsFallingBlock(state) && y > MinY && isFreeToFallThrough(c.GetBlock(x, y-1, z)) {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, FallingBlockTickDelay)
+	}
+	if c.needsScaffoldingTickAt(x, y, z, state) {
+		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, ScaffoldingTickDelay)
 	}
 	if kind, _, ok := classifyFluidState(state); ok {
 		delay := WaterTickDelay
@@ -707,6 +724,21 @@ func (c *Cache) runNeighborSupportPass(x, y, z int, res *BlockUpdateResult) {
 		}
 		if newState, stays := c.evaluateBlockSurvival(cur.X, cur.Y, cur.Z, state); !stays {
 			if c.setBlockRecorded(cur.X, cur.Y, cur.Z, newState, res) {
+				if IsPointedDripstoneBlock(state) && PointedDripstoneDirection(state) == "down" {
+					landY := c.findFallingLandingY(cur.X, cur.Y, cur.Z)
+					fallDist := cur.Y - landY
+					if fallDist < 1 {
+						fallDist = 1
+					}
+					res.Landings = append(res.Landings, FallingBlockLanding{
+						Pos:          BlockPos{X: cur.X, Y: landY, Z: cur.Z},
+						State:        state,
+						FallDistance: fallDist,
+					})
+				}
+				if IsPointedDripstoneBlock(state) {
+					c.RecalculatePointedDripstoneColumnAround(cur.X, cur.Y, cur.Z, res)
+				}
 				c.propagateMultiBlockPartnerBreak(cur.X, cur.Y, cur.Z, state, res)
 				c.scheduleAround(cur.X, cur.Y, cur.Z)
 				enqueueAround(cur.X, cur.Y, cur.Z)
@@ -1146,11 +1178,15 @@ func StepAnvilDamageBlockState(state uint16) (nextState uint16, broken bool) {
 }
 
 func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
-	if y <= MinY || y >= MinY+WorldHeight {
+	if y < MinY || y >= MinY+WorldHeight {
 		return
 	}
 	state := c.GetBlock(x, y, z)
-	if !IsFallingBlock(state) {
+	if IsScaffoldingBlock(state) {
+		c.stepScaffoldingTick(x, y, z, state, res)
+		return
+	}
+	if y <= MinY || !IsFallingBlock(state) {
 		return
 	}
 	below := c.GetBlock(x, y-1, z)
@@ -1880,7 +1916,7 @@ func requiresCeilingSupport(name string, props map[string]string) bool {
 		"minecraft:waxed_weathered_copper_lantern", "minecraft:waxed_oxidized_copper_lantern":
 		return props["hanging"] == "true"
 	case "minecraft:pointed_dripstone":
-		return props["tip_direction"] == "down"
+		return props["vertical_direction"] == "down" || props["tip_direction"] == "down"
 	}
 	if (strings.HasSuffix(name, "_button") || name == "minecraft:lever") && props["face"] == "ceiling" {
 		return true
@@ -1902,7 +1938,8 @@ func canSupportHangingBlock(name string, above uint16) bool {
 			return true
 		}
 	case "minecraft:pointed_dripstone":
-		if aInfo, ok := stateByID(above); ok && aInfo.Name == "minecraft:pointed_dripstone" && aInfo.Properties["tip_direction"] == "down" {
+		if aInfo, ok := stateByID(above); ok && aInfo.Name == "minecraft:pointed_dripstone" &&
+			(aInfo.Properties["vertical_direction"] == "down" || aInfo.Properties["tip_direction"] == "down") {
 			return true
 		}
 	case "minecraft:pale_hanging_moss":
@@ -1910,9 +1947,17 @@ func canSupportHangingBlock(name string, above uint16) bool {
 			return true
 		}
 	}
+	if IsChainBlock(above) {
+		return IsVerticalChainBlock(above)
+	}
 	if strings.HasSuffix(name, "lantern") {
-		if IsChainBlock(above) || IsCopperBarsBlock(above) || isBlockNamed(above, "minecraft:iron_bars") {
+		if IsCopperBarsBlock(above) || isBlockNamed(above, "minecraft:iron_bars") {
 			return true
+		}
+		if aInfo, ok := stateByID(above); ok {
+			if strings.HasSuffix(aInfo.Name, "_fence") || strings.HasSuffix(aInfo.Name, "_wall") || aInfo.Name == "minecraft:hopper" {
+				return true
+			}
 		}
 	}
 	return isSturdySupportBlock(above)
@@ -2055,7 +2100,7 @@ func requiresFloorSupport(name string, props map[string]string) bool {
 		"minecraft:waxed_weathered_copper_lantern", "minecraft:waxed_oxidized_copper_lantern":
 		return props["hanging"] == "false"
 	case "minecraft:pointed_dripstone":
-		return props["tip_direction"] == "up"
+		return props["vertical_direction"] == "up" || props["tip_direction"] == "up"
 	}
 	return false
 }
@@ -2073,7 +2118,8 @@ func canSupportFloorBlock(name string, below uint16) bool {
 			return true
 		}
 	case "minecraft:pointed_dripstone":
-		if bInfo, ok := stateByID(below); ok && bInfo.Name == "minecraft:pointed_dripstone" && bInfo.Properties["tip_direction"] == "up" {
+		if bInfo, ok := stateByID(below); ok && bInfo.Name == "minecraft:pointed_dripstone" &&
+			(bInfo.Properties["vertical_direction"] == "up" || bInfo.Properties["tip_direction"] == "up") {
 			return true
 		}
 	case "minecraft:snow":
@@ -2082,6 +2128,19 @@ func canSupportFloorBlock(name string, below uint16) bool {
 		}
 		if bInfo, ok := stateByID(below); ok && bInfo.Name == "minecraft:snow" {
 			return bInfo.Properties["layers"] == "8"
+		}
+	}
+	if IsChainBlock(below) {
+		return IsVerticalChainBlock(below) && strings.HasSuffix(name, "lantern")
+	}
+	if strings.HasSuffix(name, "lantern") {
+		if IsCopperBarsBlock(below) || isBlockNamed(below, "minecraft:iron_bars") {
+			return true
+		}
+		if bInfo, ok := stateByID(below); ok {
+			if strings.HasSuffix(bInfo.Name, "_fence") || strings.HasSuffix(bInfo.Name, "_wall") || bInfo.Name == "minecraft:hopper" {
+				return true
+			}
 		}
 	}
 	if strings.HasSuffix(name, "_carpet") {
@@ -2314,7 +2373,8 @@ func inferUpdateKindFromBlockID(blockID string, isFluidList bool) BlockUpdateKin
 		return UpdateFire
 	case "minecraft:sand", "minecraft:red_sand", "minecraft:gravel",
 		"minecraft:suspicious_sand", "minecraft:suspicious_gravel",
-		"minecraft:dragon_egg", "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil":
+		"minecraft:dragon_egg", "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil",
+		"minecraft:scaffolding", "minecraft:pointed_dripstone":
 		return UpdateFalling
 	default:
 		if strings.HasSuffix(norm, "_concrete_powder") {
