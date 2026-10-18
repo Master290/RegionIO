@@ -295,6 +295,9 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		s.SetHardcore(true)
 	}
 	s.RegisterWardenSummonHook()
+	if store != nil {
+		_ = s.LoadFurnaces()
+	}
 	if cfg.WorldDir != "" {
 		_ = s.LoadWorldSettingsFile()
 		_ = s.LoadDecorationsFile()
@@ -315,9 +318,13 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadVehiclesFile()
 		_ = s.LoadDispensers()
 		_ = s.LoadHoppers()
+		_ = s.LoadFurnaces()
+		_ = s.LoadCampfires()
 		_ = s.LoadCrafters()
 		_ = s.LoadChiseledBookshelves()
 		_ = s.LoadDecoratedPots()
+		_ = s.LoadCopperBlockEntities()
+		_ = s.LoadRedstoneRuntimeFile()
 		_ = s.LoadPortalsFile()
 		_ = s.LoadEquinesAndLlamasFile()
 	}
@@ -535,6 +542,12 @@ func (s *Server) SaveAll() error {
 	if err := s.SaveConduits(); err != nil && firstErr == nil {
 		firstErr = err
 	}
+	if err := s.SaveCopperBlockEntities(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveRedstoneRuntimeFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.SaveWorldSettingsFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
@@ -547,30 +560,293 @@ func (s *Server) SaveAll() error {
 	return firstErr
 }
 
-// ChunkBlockEntitiesNBT returns all sign, lectern, banner, beacon, and conduit
-// block entity NBT compounds belonging to chunk (cx, cz) in dimension for Anvil
-// chunk serialization.
+func (s *Server) redstoneRuntimeFilePath() string {
+	if s == nil || s.cfg.WorldDir == "" {
+		return ""
+	}
+	return filepath.Join(s.cfg.WorldDir, "data", "redstone_runtime.dat")
+}
+
+// SaveRedstoneRuntimeFile persists scheduled block/fluid ticks, piston runtime,
+// and observer retrigger runtime across all dimensions to <WorldDir>/data/redstone_runtime.dat.
+func (s *Server) SaveRedstoneRuntimeFile() error {
+	path := s.redstoneRuntimeFilePath()
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	root := nbt.NewCompound()
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		cache := s.DimensionChunks(dim)
+		if cache == nil {
+			continue
+		}
+		root.Set(dim, cache.ExportRedstoneRuntimeNBT())
+	}
+	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
+}
+
+// LoadRedstoneRuntimeFile restores scheduled block/fluid ticks, piston runtime,
+// and observer retrigger runtime across all dimensions from <WorldDir>/data/redstone_runtime.dat.
+func (s *Server) LoadRedstoneRuntimeFile() error {
+	path := s.redstoneRuntimeFilePath()
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	_, rootTag, err := nbt.UnmarshalNamed(raw)
+	if err != nil {
+		return err
+	}
+	root, ok := rootTag.(*nbt.Compound)
+	if !ok || root == nil {
+		return nil
+	}
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		if tag, ok := root.Get(dim); ok {
+			if comp, ok := tag.(*nbt.Compound); ok {
+				if cache := s.DimensionChunks(dim); cache != nil {
+					cache.ImportRedstoneRuntimeNBT(comp)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// ChunkBlockEntitiesNBT returns all block entity NBT compounds belonging to
+// chunk (cx, cz) in dimension without removing them from memory.
 func (s *Server) ChunkBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Compound {
 	if s == nil {
 		return nil
 	}
-	out := s.ChunkSignAndLecternBlockEntitiesNBT(dimension, cx, cz)
-	out = append(out, s.ChunkBannerBlockEntitiesNBT(dimension, cx, cz)...)
-	out = append(out, s.ChunkBeaconBlockEntitiesNBT(dimension, cx, cz)...)
-	out = append(out, s.ChunkConduitBlockEntitiesNBT(dimension, cx, cz)...)
+	dim := world.NormalizeDimension(dimension)
+	out := s.ChunkSignAndLecternBlockEntitiesNBT(dim, cx, cz)
+	out = append(out, s.ChunkBannerBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkHopperBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkDispenserBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkFurnaceBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkCampfireBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkBrewingStandBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkCrafterBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkChiseledBookshelfBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkDecoratedPotBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkJukeboxBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkBeaconBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkConduitBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkSculkBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkCopperBlockEntitiesNBT(dim, cx, cz)...)
 	return out
 }
 
-// LoadChunkBlockEntitiesNBT restores any sign, lectern, banner, beacon, and
-// conduit block entities from a chunk's `block_entities` NBT list.
+// UnloadChunkBlockEntities extracts and removes all runtime block entities in
+// chunk (cx, cz) of dimension, returning their `block_entities` NBT compounds.
+func (s *Server) UnloadChunkBlockEntities(dimension string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	dim := world.NormalizeDimension(dimension)
+	out := s.ChunkSignAndLecternBlockEntitiesNBT(dim, cx, cz)
+	out = append(out, s.ChunkBannerBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkHoppers(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkDispensers(dim, cx, cz)...)
+	out = append(out, s.ChunkFurnaceBlockEntitiesNBT(dim, cx, cz)...)
+	if dim == world.DimensionOverworld {
+		_ = s.UnloadChunkFurnaces(cx, cz)
+	}
+	out = append(out, s.UnloadChunkCampfires(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkBrewingStands(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkCrafters(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkChiseledBookshelves(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkDecoratedPots(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkJukeboxes(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkBeacons(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkConduits(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkSculk(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkCopperBlockEntities(dim, cx, cz)...)
+	return out
+}
+
+// LoadChunkBlockEntitiesNBT restores all block entities from a chunk's
+// `block_entities` NBT list.
 func (s *Server) LoadChunkBlockEntitiesNBT(dimension string, list nbt.List) {
 	if s == nil {
 		return
 	}
-	s.LoadChunkSignAndLecternBlockEntitiesNBT(dimension, list)
-	s.LoadChunkBannerBlockEntitiesNBT(dimension, list)
-	s.LoadChunkBeaconBlockEntitiesNBT(dimension, list)
-	s.LoadChunkConduitBlockEntitiesNBT(dimension, list)
+	dim := world.NormalizeDimension(dimension)
+	s.LoadChunkSignAndLecternBlockEntitiesNBT(dim, list)
+	s.LoadChunkBannerBlockEntitiesNBT(dim, list)
+	s.LoadChunkBeaconBlockEntitiesNBT(dim, list)
+	s.LoadChunkConduitBlockEntitiesNBT(dim, list)
+
+	compounds := make([]*nbt.Compound, 0, len(list.Elems))
+	for _, elem := range list.Elems {
+		if comp, ok := elem.(*nbt.Compound); ok && comp != nil {
+			compounds = append(compounds, comp)
+		}
+	}
+	if len(compounds) == 0 {
+		return
+	}
+	s.LoadChunkHopperBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkDispenserBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkFurnaceBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkCampfireBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkBrewingStandBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkCrafterBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkChiseledBookshelfBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkDecoratedPotBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkJukeboxBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkSculkBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkCopperBlockEntitiesNBT(dim, compounds)
+}
+
+// ExportChunkRedstoneRuntimeNBT exports scheduled block/fluid ticks, piston
+// runtime, and observer runtime for chunk (cx, cz) in dimension. When unload is
+// true, the runtime state for (cx, cz) is also removed from memory.
+func (s *Server) ExportChunkRedstoneRuntimeNBT(dimension string, cx, cz int32, unload bool) *nbt.Compound {
+	if s == nil {
+		return nbt.NewCompound()
+	}
+	cache := s.DimensionChunks(world.NormalizeDimension(dimension))
+	if cache == nil {
+		return nbt.NewCompound()
+	}
+	if unload {
+		return cache.UnloadChunkRedstoneRuntime(cx, cz)
+	}
+	root := nbt.NewCompound()
+	cache.SaveChunkScheduledTicksToNBT(cx, cz, root)
+	var pistonChunk []world.PistonRuntimeEntrySnapshot
+	for _, e := range cache.ExportPistonRuntimeEntries() {
+		if int32(e.X>>4) == cx && int32(e.Z>>4) == cz {
+			pistonChunk = append(pistonChunk, e)
+		}
+	}
+	var observerChunk []world.ObserverRuntimeSnapshot
+	for _, e := range cache.ExportObserverRuntimeEntries() {
+		if int32(e.X>>4) == cx && int32(e.Z>>4) == cz {
+			observerChunk = append(observerChunk, e)
+		}
+	}
+	root.Set("piston_runtime", world.EncodePistonRuntimeNBT(pistonChunk))
+	root.Set("observer_runtime", world.EncodeObserverRuntimeNBT(observerChunk))
+	return root
+}
+
+// ImportChunkRedstoneRuntimeNBT restores scheduled block/fluid ticks, piston
+// runtime, and observer runtime for chunk (cx, cz) in dimension from chunkNBT,
+// and recovers active transient block ticks when recoverIfMissing is true or
+// block_ticks is absent.
+func (s *Server) ImportChunkRedstoneRuntimeNBT(dimension string, cx, cz int32, chunkNBT *nbt.Compound, recoverIfMissing bool) int {
+	if s == nil {
+		return 0
+	}
+	cache := s.DimensionChunks(world.NormalizeDimension(dimension))
+	if cache == nil {
+		return 0
+	}
+	if chunkNBT != nil {
+		if _, hasBlockTicks := chunkNBT.Get("block_ticks"); !hasBlockTicks && recoverIfMissing {
+			return cache.LoadChunkRedstoneRuntime(cx, cz, chunkNBT)
+		}
+		if recoverIfMissing {
+			return cache.LoadChunkRedstoneRuntime(cx, cz, chunkNBT)
+		}
+		restored := cache.LoadChunkScheduledTicksFromNBT(cx, cz, chunkNBT)
+		if prTag, ok := chunkNBT.Get("piston_runtime"); ok {
+			if list, ok := prTag.(nbt.List); ok {
+				restored += cache.ImportPistonRuntimeEntries(world.DecodePistonRuntimeNBT(list))
+			}
+		}
+		if orTag, ok := chunkNBT.Get("observer_runtime"); ok {
+			if list, ok := orTag.(nbt.List); ok {
+				restored += cache.ImportObserverRuntimeEntries(world.DecodeObserverRuntimeNBT(list))
+			}
+		}
+		return restored
+	}
+	if recoverIfMissing {
+		return cache.RecoverChunkActiveBlockTicks(cx, cz)
+	}
+	return 0
+}
+
+// ExportChunkPersistenceNBT exports `block_ticks`, `fluid_ticks`,
+// `piston_runtime`, `observer_runtime`, and `block_entities` for chunk (cx, cz)
+// in dimension. When unload is true, the chunk's runtime state and block
+// entities are also unloaded from memory.
+func (s *Server) ExportChunkPersistenceNBT(dimension string, cx, cz int32, unload bool) *nbt.Compound {
+	root := s.ExportChunkRedstoneRuntimeNBT(dimension, cx, cz, unload)
+	var compounds []*nbt.Compound
+	if unload {
+		compounds = s.UnloadChunkBlockEntities(dimension, cx, cz)
+	} else {
+		compounds = s.ChunkBlockEntitiesNBT(dimension, cx, cz)
+	}
+	elems := make([]nbt.Tag, 0, len(compounds))
+	for _, c := range compounds {
+		if c != nil {
+			elems = append(elems, c)
+		}
+	}
+	root.Set("block_entities", nbt.List{ElemID: nbt.TagCompound, Elems: elems})
+	return root
+}
+
+// ImportChunkPersistenceNBT restores redstone runtime (`block_ticks`,
+// `fluid_ticks`, `piston_runtime`, `observer_runtime`), active transient block
+// ticks, `block_entities`, and regional-store furnaces for chunk (cx, cz) in dimension.
+func (s *Server) ImportChunkPersistenceNBT(dimension string, cx, cz int32, chunkNBT *nbt.Compound) {
+	if s == nil {
+		return
+	}
+	dim := world.NormalizeDimension(dimension)
+	s.ImportChunkRedstoneRuntimeNBT(dim, cx, cz, chunkNBT, true)
+	loadedFurnacesFromNBT := 0
+	if chunkNBT != nil {
+		if beTag, ok := chunkNBT.Get("block_entities"); ok {
+			if list, ok := beTag.(nbt.List); ok {
+				s.LoadChunkBlockEntitiesNBT(dim, list)
+				for _, elem := range list.Elems {
+					if comp, ok := elem.(*nbt.Compound); ok && comp != nil {
+						if idTag, ok := comp.Get("id"); ok {
+							if idStr, ok := idTag.(nbt.String); ok && world.IsFurnaceBlockID(string(idStr)) {
+								loadedFurnacesFromNBT++
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if dim == world.DimensionOverworld && loadedFurnacesFromNBT == 0 {
+		_ = s.ReloadChunkFurnaces(cx, cz)
+	}
+}
+
+// OnChunkLoaded ensures that when chunk (cx, cz) in dimension is loaded from
+// the regional store, any persisted furnaces and active transient block ticks
+// are recovered.
+func (s *Server) OnChunkLoaded(dimension string, cx, cz int32) {
+	if s == nil {
+		return
+	}
+	dim := world.NormalizeDimension(dimension)
+	if cache := s.DimensionChunks(dim); cache != nil {
+		cache.RecoverChunkActiveBlockTicks(cx, cz)
+	}
+	if dim == world.DimensionOverworld {
+		_ = s.ReloadChunkFurnaces(cx, cz)
+	}
 }
 
 // Config returns the active configuration.

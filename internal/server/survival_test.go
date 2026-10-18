@@ -907,4 +907,112 @@ func TestPlayerMechanicsSweep(t *testing.T) {
 	}
 }
 
+func TestServerPersistenceHooksAndFurnaceCustomName(t *testing.T) {
+	dir := t.TempDir()
+	store, err := world.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	cache := world.NewCacheWithStore(-1, world.GenerateFlat, store)
+	cfg := DefaultConfig()
+	cfg.WorldDir = dir
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	srv.store = store
+	dim := world.DimensionOverworld
+
+	// 1. Place a furnace with CustomName via SetFurnaceState and verify OpenFurnace uses CustomName.
+	furnaceSt, ok := world.BlockStateByName("minecraft:furnace", map[string]string{
+		"facing": "north",
+		"lit":    "false",
+	})
+	if !ok {
+		t.Fatalf("missing furnace block state")
+	}
+	cache.SetBlock(2, 64, 2, furnaceSt)
+	srv.SetFurnaceState(world.FurnaceBlockEntity{
+		ID:         "minecraft:furnace",
+		X:          2,
+		Y:          64,
+		Z:          2,
+		CustomName: "Master Smelter",
+	})
+	f, ok := srv.FurnaceAt(2, 64, 2)
+	if !ok || f.CustomName != "Master Smelter" {
+		t.Fatalf("FurnaceAt CustomName = %q, want 'Master Smelter'", f.CustomName)
+	}
+
+	// 2. Populate chunk (0, 0) with a hopper, campfire, copper golem statue, and scheduled redstone tick.
+	hopperSt, _ := world.BlockStateByName("minecraft:hopper", map[string]string{
+		"enabled": "true",
+		"facing":  "down",
+	})
+	cache.SetBlock(3, 64, 3, hopperSt)
+	srv.SetHopperCustomName(dim, 3, 64, 3, "Chunk Hopper")
+	srv.SetCopperGolemStatueAt(&CopperGolemStatueBlockEntity{
+		Dimension:  dim,
+		X:          4,
+		Y:          64,
+		Z:          4,
+		Pose:       "running",
+		Stage:      world.CopperStageWeathered,
+		CustomName: "Copper Guard",
+	})
+	cache.ScheduleBlockUpdate(2, 64, 2, world.UpdateRedstone, 10)
+
+	// Non-destructive read via ChunkBlockEntitiesNBT.
+	nonDestructive := srv.ChunkBlockEntitiesNBT(dim, 0, 0)
+	if len(nonDestructive) < 3 {
+		t.Fatalf("ChunkBlockEntitiesNBT count = %d, want >= 3", len(nonDestructive))
+	}
+	if _, ok := srv.HopperAt(dim, 3, 64, 3); !ok {
+		t.Fatalf("expected hopper still in memory after ChunkBlockEntitiesNBT")
+	}
+
+	// Destructive chunk export/unload and re-import via ExportChunkPersistenceNBT / ImportChunkPersistenceNBT.
+	chunkNBT := srv.ExportChunkPersistenceNBT(dim, 0, 0, true)
+	if _, ok := srv.HopperAt(dim, 3, 64, 3); ok {
+		t.Fatalf("expected hopper unloaded after ExportChunkPersistenceNBT(unload=true)")
+	}
+	if _, ok := srv.GetCopperGolemStatueAt(dim, 4, 64, 4); ok {
+		t.Fatalf("expected copper statue unloaded after ExportChunkPersistenceNBT(unload=true)")
+	}
+	if cache.HasPendingBlockUpdate(2, 64, 2, world.UpdateRedstone) {
+		t.Fatalf("expected scheduled redstone tick unloaded after ExportChunkPersistenceNBT(unload=true)")
+	}
+
+	srv.ImportChunkPersistenceNBT(dim, 0, 0, chunkNBT)
+	if h, ok := srv.HopperAt(dim, 3, 64, 3); !ok || h.CustomName != "Chunk Hopper" {
+		t.Fatalf("expected hopper restored after ImportChunkPersistenceNBT, got %+v (ok=%v)", h, ok)
+	}
+	if st, ok := srv.GetCopperGolemStatueAt(dim, 4, 64, 4); !ok || st.CustomName != "Copper Guard" {
+		t.Fatalf("expected copper statue restored after ImportChunkPersistenceNBT, got %+v (ok=%v)", st, ok)
+	}
+	if !cache.HasPendingBlockUpdate(2, 64, 2, world.UpdateRedstone) {
+		t.Fatalf("expected scheduled redstone tick restored after ImportChunkPersistenceNBT")
+	}
+
+	// 3. Verify SaveAll writes copper block entities and redstone runtime file, and startup reloads them.
+	if err := srv.SaveAll(); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+	cache2 := world.NewCacheWithStore(-1, world.GenerateFlat, store)
+	cache2.SetBlock(2, 64, 2, furnaceSt)
+	cache2.SetBlock(3, 64, 3, hopperSt)
+	srv2, err := NewWithCache(cfg, cache2)
+	if err != nil {
+		t.Fatalf("NewWithCache(srv2): %v", err)
+	}
+	if st, ok := srv2.GetCopperGolemStatueAt(dim, 4, 64, 4); !ok || st.CustomName != "Copper Guard" {
+		t.Fatalf("expected copper statue loaded on startup, got %+v (ok=%v)", st, ok)
+	}
+	if !cache2.HasPendingBlockUpdate(2, 64, 2, world.UpdateRedstone) {
+		t.Fatalf("expected scheduled redstone tick loaded from redstone_runtime.dat on startup")
+	}
+}
+
+
 

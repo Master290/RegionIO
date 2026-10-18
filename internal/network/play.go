@@ -2022,6 +2022,22 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						}
 						h.srv.OnBrewingStandPlacedInDim(dim, px, py, pz, customName)
 					}
+					if server.IsFurnaceBlock(state) && h.srv != nil && h.session != nil {
+						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
+							h.srv.SetFurnaceState(world.FurnaceBlockEntity{
+								ID:         blockName,
+								X:          px,
+								Y:          py,
+								Z:          pz,
+								CustomName: customName,
+							})
+						}
+					}
+					if blockName == "minecraft:hopper" && h.srv != nil && h.session != nil {
+						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
+							h.srv.SetHopperCustomName(dim, px, py, pz, customName)
+						}
+					}
 					if blockName == "minecraft:sniffer_egg" && h.srv != nil {
 						h.srv.PlaceSnifferEgg(dim, px, py, pz)
 					}
