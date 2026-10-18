@@ -2,6 +2,7 @@ package server
 
 import (
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
@@ -518,6 +519,113 @@ func TestEndGatewayAndVehicleDimensionTransfer(t *testing.T) {
 		t.Fatalf("expected persisted gateway exit (1024,70,0 exact=true), got %+v", gw)
 	}
 }
+
+func TestPortalsRemainderFeatures(t *testing.T) {
+	dir := t.TempDir()
+	st, err := world.NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer st.Close()
+
+	cfg := DefaultConfig()
+	cfg.WorldDir = dir
+	srv, err := NewWithCacheAndStore(cfg, world.NewCacheWithStore(256, world.GenerateFlat, st), st)
+	if err != nil {
+		t.Fatalf("NewWithCacheAndStore: %v", err)
+	}
+	defer func() { _ = srv.RequestStop() }()
+
+	// 1. DragonGatewayPositions & SpawnNextEndDragonGateway (20 gateways on ring radius 96, Y=75).
+	ring := DragonGatewayPositions()
+	if len(ring) != EndDragonGatewayCount {
+		t.Fatalf("DragonGatewayPositions len = %d, want %d", len(ring), EndDragonGatewayCount)
+	}
+	if ring[0].X != 96 || ring[0].Y != 75 || ring[0].Z != 0 {
+		t.Fatalf("ring[0] = %+v, want (96, 75, 0)", ring[0])
+	}
+	gw0, ok := srv.SpawnNextEndDragonGateway()
+	if !ok || gw0 == nil || gw0.X != 96 || gw0.Y != 75 || gw0.Z != 0 || !gw0.HasExitPortal {
+		t.Fatalf("SpawnNextEndDragonGateway #0 = %+v, ok=%v", gw0, ok)
+	}
+	if rem := srv.RemainingDragonGatewayIndices(); len(rem) != EndDragonGatewayCount-1 {
+		t.Fatalf("remaining dragon gateways = %d, want %d", len(rem), EndDragonGatewayCount-1)
+	}
+
+	// 2. End Exit Portal WinGame packet (1.0 on first exit, 0.0 on subsequent exit).
+	var winParams []float32
+	prof := Profile{UUID: OfflineUUID("CreditsTester"), Name: "CreditsTester"}
+	session, err := srv.RegisterPlayer(prof, func(id int32, body []byte) error {
+		if id == protocol.PlayGameEvent && len(body) >= 5 && body[0] == protocol.GameEventWinGame {
+			r := protocol.NewReader(body[1:])
+			if v, err := r.Float32(); err == nil {
+				winParams = append(winParams, v)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.ChangePlayerDimension(session, world.DimensionEnd, 100.5, 49.0, 0.5, 0, 0)
+	srv.ClearPlayerPortalCooldown(session)
+	res1, err := srv.TravelThroughEndPortal(session)
+	if err != nil || !res1.Travelled || !res1.ShowEndCredits {
+		t.Fatalf("first End exit: %+v, err=%v", res1, err)
+	}
+	_ = srv.ChangePlayerDimension(session, world.DimensionEnd, 100.5, 49.0, 0.5, 0, 0)
+	srv.ClearPlayerPortalCooldown(session)
+	res2, err := srv.TravelThroughEndPortal(session)
+	if err != nil || !res2.Travelled || res2.ShowEndCredits {
+		t.Fatalf("second End exit: expected ShowEndCredits=false, got %+v, err=%v", res2, err)
+	}
+	if len(winParams) != 2 || winParams[0] != 1.0 || winParams[1] != 0.0 {
+		t.Fatalf("WinGame packet params = %v, want [1.0, 0.0]", winParams)
+	}
+
+	// 3. Cascade collapse of Nether portal when a frame or interior block is broken,
+	// and random-tick zombified_piglin spawn before breaking.
+	owCache := srv.DimensionChunks(world.DimensionOverworld)
+	shape := world.CreateNetherPortal(owCache, world.DimensionOverworld, 20, 65, 20, world.PortalAxisX)
+	interior := shape.InteriorPositions()
+	if len(interior) != 6 {
+		t.Fatalf("interior len = %d, want 6", len(interior))
+	}
+
+	srv.SetDifficulty(DifficultyHard)
+	srv.SetGameRuleBool("doMobSpawning", true)
+	// Seed 0 has first Intn(2000) or find a deterministic RNG seed that rolls < 3.
+	var spawnedID int32
+	for s := int64(0); s < 5000; s++ {
+		r := rand.New(rand.NewSource(s))
+		if r.Intn(2000) < 3 {
+			id, sp := srv.TrySpawnPortalZombifiedPiglin(world.DimensionOverworld, interior[0].X, interior[0].Y, interior[0].Z, rand.New(rand.NewSource(s)))
+			if !sp || id <= 0 {
+				t.Fatalf("TrySpawnPortalZombifiedPiglin failed with seed %d", s)
+			}
+			spawnedID = id
+			break
+		}
+	}
+	piglin := srv.Entities().Get(spawnedID)
+	if piglin == nil || piglin.TypeName != "minecraft:zombified_piglin" || piglin.PortalCooldown != DefaultPortalCooldownTicks {
+		t.Fatalf("unexpected zombified_piglin entity: %+v", piglin)
+	}
+
+	// Break bottom obsidian frame block -> all 6 connected nether_portal blocks collapse to air.
+	frameX, frameY, frameZ := shape.BottomLeft.X, shape.BottomLeft.Y-1, shape.BottomLeft.Z
+	oldFrame := owCache.GetBlock(frameX, frameY, frameZ)
+	owCache.SetBlockWithLight(frameX, frameY, frameZ, world.StateAir)
+	srv.InvalidatePortalPOIs(world.DimensionOverworld, []world.BlockChange{
+		{Pos: world.BlockPos{X: frameX, Y: frameY, Z: frameZ}, OldState: oldFrame, NewState: world.StateAir},
+	})
+	for _, pos := range interior {
+		if st := owCache.GetBlock(pos.X, pos.Y, pos.Z); st != world.StateAir {
+			t.Fatalf("expected portal block at %+v to collapse to air, got state %d (%s)", pos, st, world.BlockName(st))
+		}
+	}
+}
+
 
 
 

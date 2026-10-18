@@ -3,12 +3,14 @@ package server
 import (
 	"errors"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sync"
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
+	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -17,18 +19,29 @@ const (
 	DefaultPortalCooldownTicks     = 300 // 15s (Entity.getDimensionChangingDelay)
 	DefaultEndGatewayCooldownTicks = 100 // 5s (TheEndGatewayBlockEntity.COOLDOWN_TIME)
 	EndGatewayOuterIslandRadius    = 1024.0
+	EndDragonGatewayRingRadius     = 96.0
+	EndDragonGatewayY              = 75
+	EndDragonGatewayRingY          = EndDragonGatewayY
+	EndDragonGatewayCount          = 20
+
+	LevelEventSoundPortalTravel   int32 = 1032
+	LevelEventPortalTravel        int32 = LevelEventSoundPortalTravel
+	LevelEventSoundEndPortalSpawn int32 = 1038
+	LevelEventEndPortalSpawn      int32 = LevelEventSoundEndPortalSpawn
+	GameEventWinGame              byte  = 4
 )
 
 // PortalTravelResult summarizes the outcome of a player or entity portal transition.
 type PortalTravelResult struct {
-	Travelled     bool
-	FromDimension string
-	ToDimension   string
-	DestX         float64
-	DestY         float64
-	DestZ         float64
-	PortalCreated bool
-	PortalShape   world.PortalShape
+	Travelled      bool
+	FromDimension  string
+	ToDimension    string
+	DestX          float64
+	DestY          float64
+	DestZ          float64
+	PortalCreated  bool
+	PortalShape    world.PortalShape
+	ShowEndCredits bool
 }
 
 // EndGatewayBlockEntity holds the server-side state for a minecraft:end_gateway block entity.
@@ -43,21 +56,34 @@ type EndGatewayBlockEntity struct {
 }
 
 type serverPortalManager struct {
-	mu       sync.Mutex
-	gateways map[dimBlockKey]*EndGatewayBlockEntity
+	mu             sync.Mutex
+	gateways       map[dimBlockKey]*EndGatewayBlockEntity
+	dragonGateways []int // remaining unspawned dragon gateway indices (0..19)
 }
 
 var serverPortalManagers sync.Map // map[*Server]*serverPortalManager
 
+func defaultDragonGatewayOrder() []int {
+	order := make([]int, EndDragonGatewayCount)
+	for i := 0; i < EndDragonGatewayCount; i++ {
+		order[i] = i
+	}
+	return order
+}
+
 func (s *Server) portalManager() *serverPortalManager {
 	if s == nil {
-		return &serverPortalManager{gateways: make(map[dimBlockKey]*EndGatewayBlockEntity)}
+		return &serverPortalManager{
+			gateways:       make(map[dimBlockKey]*EndGatewayBlockEntity),
+			dragonGateways: defaultDragonGatewayOrder(),
+		}
 	}
 	if v, ok := serverPortalManagers.Load(s); ok {
 		return v.(*serverPortalManager)
 	}
 	initMgr := &serverPortalManager{
-		gateways: make(map[dimBlockKey]*EndGatewayBlockEntity),
+		gateways:       make(map[dimBlockKey]*EndGatewayBlockEntity),
+		dragonGateways: defaultDragonGatewayOrder(),
 	}
 	actual, _ := serverPortalManagers.LoadOrStore(s, initMgr)
 	return actual.(*serverPortalManager)
@@ -380,6 +406,7 @@ func (s *Server) UseEyeOfEnderOnFrame(session *PlayerSession, x, y, z int) (plac
 		}
 		s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
 			EncodeSoundPacket("minecraft:block.end_portal.spawn", SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+		s.Broadcast(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventEndPortalSpawn, x, y, z, 0, true))
 	}
 	return true, activated, placed, nil
 }
@@ -460,6 +487,9 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 			return PortalTravelResult{}, err
 		}
 	}
+	if session.send != nil {
+		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, int(math.Floor(destX)), int(math.Floor(destY)), int(math.Floor(destZ)), 0, false))
+	}
 	s.TriggerChangeDimension(session, toDim)
 
 	return PortalTravelResult{
@@ -519,7 +549,7 @@ func (s *Server) ResolveEndReturnSpawn(session *PlayerSession) (toDim string, de
 
 // TravelThroughEndPortal transports session to the obsidian spawn platform at
 // (100, 49, 0) in minecraft:the_end (or returns the player from the_end to their
-// bed/respawn anchor/Overworld spawn point and marks SeenCredits = true).
+// bed/respawn anchor/Overworld spawn point, sends GameEvent WinGame, and marks SeenCredits = true).
 func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelResult, error) {
 	if s == nil || session == nil {
 		return PortalTravelResult{}, errors.New("server: nil player session")
@@ -531,12 +561,24 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 	st.inPortal = true
 	st.portalCooldown = DefaultPortalCooldownTicks
 	st.portalTime = 0
+	var showCredits bool
 	if fromDim == world.DimensionEnd {
+		showCredits = !st.seenCredits
 		st.seenCredits = true
 	}
 	st.mu.Unlock()
 
 	if fromDim == world.DimensionEnd {
+		if session.send != nil {
+			winParam := float32(0.0)
+			if showCredits {
+				winParam = 1.0
+			}
+			ev := protocol.NewWriter(5)
+			ev.Byte(protocol.GameEventWinGame)
+			ev.Float32(winParam)
+			_ = session.send(protocol.PlayGameEvent, ev.Bytes())
+		}
 		toDim, destX, destY, destZ, yaw, pitch := s.ResolveEndReturnSpawn(session)
 		if vID := s.PlayerMountedVehicle(session); vID > 0 {
 			if err := s.ChangeVehicleDimensionWithPassengers(vID, toDim, destX, destY, destZ, yaw); err != nil {
@@ -549,12 +591,13 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 		}
 		s.TriggerChangeDimension(session, toDim)
 		return PortalTravelResult{
-			Travelled:     true,
-			FromDimension: fromDim,
-			ToDimension:   toDim,
-			DestX:         destX,
-			DestY:         destY,
-			DestZ:         destZ,
+			Travelled:      true,
+			FromDimension:  fromDim,
+			ToDimension:    toDim,
+			DestX:          destX,
+			DestY:          destY,
+			DestZ:          destZ,
+			ShowEndCredits: showCredits,
 		}, nil
 	}
 
@@ -576,6 +619,9 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 		if err := s.ChangePlayerDimension(session, toDim, destX, destY, destZ, 90.0, 0.0); err != nil {
 			return PortalTravelResult{}, err
 		}
+	}
+	if session.send != nil {
+		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, int(math.Floor(destX)), int(math.Floor(destY)), int(math.Floor(destZ)), 0, false))
 	}
 	s.TriggerChangeDimension(session, toDim)
 	return PortalTravelResult{
@@ -732,6 +778,78 @@ func (s *Server) GetOrCreateEndGatewayAt(dim string, gx, gy, gz int) *EndGateway
 	return &cp
 }
 
+// DragonGatewayPositions computes the 20 vanilla End dragon gateway positions
+// on the ring of radius 96 at Y = 75:
+//   x = floor(96 * cos(2 * (-pi + 0.1 * pi * i)))
+//   z = floor(96 * sin(2 * (-pi + 0.1 * pi * i)))
+func DragonGatewayPositions() [EndDragonGatewayCount]world.BlockPos {
+	var out [EndDragonGatewayCount]world.BlockPos
+	for i := 0; i < EndDragonGatewayCount; i++ {
+		angle := 2.0 * (-math.Pi + 0.1*math.Pi*float64(i))
+		gx := int(math.Floor(EndDragonGatewayRingRadius * math.Cos(angle)))
+		gz := int(math.Floor(EndDragonGatewayRingRadius * math.Sin(angle)))
+		out[i] = world.BlockPos{X: gx, Y: EndDragonGatewayRingY, Z: gz}
+	}
+	return out
+}
+
+// RemainingDragonGatewayIndices returns a copy of the unspawned End dragon gateway
+// ring indices (0..19).
+func (s *Server) RemainingDragonGatewayIndices() []int {
+	if s == nil {
+		return nil
+	}
+	mgr := s.portalManager()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	cp := make([]int, len(mgr.dragonGateways))
+	copy(cp, mgr.dragonGateways)
+	return cp
+}
+
+// SpawnNextEndDragonGateway pops the next unspawned End gateway index from the
+// 20-gateway ring (radius 96, Y=75), places its bedrock cage in minecraft:the_end,
+// registers its EndGatewayBlockEntity (and paired outer-island return gateway),
+// and broadcasts block updates. Returns (nil, false) once all 20 gateways have spawned.
+func (s *Server) SpawnNextEndDragonGateway() (*EndGatewayBlockEntity, bool) {
+	if s == nil {
+		return nil, false
+	}
+	mgr := s.portalManager()
+	mgr.mu.Lock()
+	if len(mgr.dragonGateways) == 0 {
+		mgr.mu.Unlock()
+		return nil, false
+	}
+	idx := mgr.dragonGateways[0]
+	mgr.dragonGateways = mgr.dragonGateways[1:]
+	mgr.mu.Unlock()
+
+	if idx < 0 || idx >= EndDragonGatewayCount {
+		idx = 0
+	}
+	ring := DragonGatewayPositions()
+	pos := ring[idx]
+	endCache := s.DimensionChunks(world.DimensionEnd)
+	if endCache != nil {
+		placeEndGatewayCage(endCache, pos.X, pos.Y, pos.Z)
+		for dy := -2; dy <= 2; dy++ {
+			for dx := -1; dx <= 1; dx++ {
+				for dz := -1; dz <= 1; dz++ {
+					tx, ty, tz := pos.X+dx, pos.Y+dy, pos.Z+dz
+					st := endCache.GetBlock(tx, ty, tz)
+					w := protocol.NewWriter(12)
+					w.Position(tx, ty, tz)
+					w.VarInt(int32(st))
+					s.BroadcastDimensionChunk(world.DimensionEnd, int32(tx>>4), int32(tz>>4), protocol.PlayBlockUpdate, w.Bytes())
+				}
+			}
+		}
+	}
+	gw := s.RegisterSpawnedEndGateway(pos.X, pos.Y, pos.Z)
+	return gw, gw != nil
+}
+
 // RegisterSpawnedEndGateway is a hook called when a new End gateway is generated
 // (e.g. after defeating the Ender Dragon) at (gx, gy, gz) in minecraft:the_end.
 func (s *Server) RegisterSpawnedEndGateway(gx, gy, gz int) *EndGatewayBlockEntity {
@@ -803,6 +921,19 @@ func resolveEndGatewayArrival(cache *world.Cache, gw *EndGatewayBlockEntity) (de
 	return float64(ex) + 0.5, float64(surfY), float64(ez) + 0.5
 }
 
+func (s *Server) broadcastEndGatewayBeamEvent(dim string, gx, gy, gz int) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	blockID := registry.Index("minecraft:block", "minecraft:end_gateway")
+	if blockID < 0 {
+		blockID = 0
+	}
+	s.BroadcastDimensionChunk(normDim, int32(gx>>4), int32(gz>>4), PlayBlockEventCB,
+		EncodeBlockEventPacket(gx, gy, gz, int32(blockID), 1, 0))
+}
+
 // TravelThroughEndGateway teleports session through the minecraft:end_gateway block at (gx, gy, gz).
 func (s *Server) TravelThroughEndGateway(session *PlayerSession, gx, gy, gz int) (PortalTravelResult, error) {
 	if s == nil || session == nil {
@@ -826,6 +957,7 @@ func (s *Server) TravelThroughEndGateway(session *PlayerSession, gx, gy, gz int)
 		stored.TeleportCooldown = DefaultEndGatewayCooldownTicks
 	}
 	mgr.mu.Unlock()
+	s.broadcastEndGatewayBeamEvent(dim, gx, gy, gz)
 
 	st := getPlayerPortalState(session)
 	st.mu.Lock()
@@ -1258,8 +1390,66 @@ func (s *Server) CheckEntityPortal(entityID int32) (PortalTravelResult, error) {
 	}, nil
 }
 
+// TrySpawnPortalZombifiedPiglin attempts to spawn a minecraft:zombified_piglin
+// from a Nether portal block at (x, y, z) in dim following vanilla NetherPortalBlock.randomTick:
+//   - Requires gamerule doMobSpawning = true and server difficulty > Peaceful (1..3).
+//   - Rolls rng.Intn(2000) < difficulty (Easy: 1/2000, Normal: 2/2000, Hard: 3/2000).
+//   - Spawns the zombified piglin with PortalCooldown = DefaultPortalCooldownTicks (300)
+//     so it does not immediately travel back through the portal.
+func (s *Server) TrySpawnPortalZombifiedPiglin(dim string, x, y, z int, rng *rand.Rand) (int32, bool) {
+	if s == nil || s.entities == nil || !s.DoMobSpawning() {
+		return 0, false
+	}
+	diff := int(s.Difficulty())
+	if diff <= int(DifficultyPeaceful) {
+		return 0, false
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil || !world.IsNetherPortalState(cache.GetBlock(x, y, z)) {
+		return 0, false
+	}
+	var roll int
+	if rng != nil {
+		roll = rng.Intn(2000)
+	} else {
+		roll = rand.Intn(2000)
+	}
+	if roll >= diff {
+		return 0, false
+	}
+	// Walk down to the lowest contiguous portal block in this column so the mob spawns on the bottom frame.
+	spawnY := y
+	for steps := 0; steps < world.MaxPortalHeight && world.IsNetherPortalState(cache.GetBlock(x, spawnY-1, z)); steps++ {
+		spawnY--
+	}
+	typeID := registry.EntityTypeIndex("minecraft:zombified_piglin")
+	if typeID < 0 {
+		typeID = 0
+	}
+	ent := &world.Entity{
+		TypeID:         typeID,
+		TypeName:       "minecraft:zombified_piglin",
+		Dimension:      normDim,
+		X:              float64(x) + 0.5,
+		Y:              float64(spawnY),
+		Z:              float64(z) + 0.5,
+		OnGround:       true,
+		PortalCooldown: DefaultPortalCooldownTicks,
+		InPortal:       true,
+	}
+	id := s.entities.Add(ent)
+	s.SetMobHealth(id, 20.0)
+	if saved := s.entities.Get(id); saved != nil {
+		cp := saved.ChunkPos()
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, saved))
+	}
+	return id, true
+}
+
 // TickPortals advances portal warmup/cooldown for all online players, active
-// non-player entities, and End gateway block entities.
+// non-player entities, End gateway block entities, and Nether portal random-tick
+// zombified_piglin spawns.
 func (s *Server) TickPortals() {
 	if s == nil {
 		return
@@ -1293,10 +1483,141 @@ func (s *Server) TickPortals() {
 			}
 		}
 	}
+
+	if s.DoMobSpawning() && s.Difficulty() > DifficultyPeaceful {
+		for _, dim := range []string{world.DimensionOverworld, world.DimensionNether} {
+			cache := s.DimensionChunks(dim)
+			if cache == nil {
+				continue
+			}
+			for _, poi := range cache.PortalPOIs() {
+				// Vanilla randomTickSpeed = 3 out of 4096 blocks per section per tick.
+				if rand.Intn(4096) < 3 {
+					_, _ = s.TrySpawnPortalZombifiedPiglin(dim, poi.Pos.X, poi.Pos.Y, poi.Pos.Z, nil)
+				}
+			}
+		}
+	}
+}
+
+func isCompleteLitNetherPortalAt(cache *world.Cache, x, y, z int, axis string) bool {
+	if cache == nil {
+		return false
+	}
+	if axis != world.PortalAxisZ {
+		axis = world.PortalAxisX
+	}
+	shape, ok := world.FindEmptyPortalShapeOnAxis(cache, x, y, z, axis)
+	if !ok {
+		return false
+	}
+	for _, pos := range shape.InteriorPositions() {
+		st := cache.GetBlock(pos.X, pos.Y, pos.Z)
+		name, props, okP := world.BlockStateProperties(st)
+		if !okP || name != "minecraft:nether_portal" {
+			return false
+		}
+		if pAxis := props["axis"]; pAxis != "" && pAxis != axis {
+			return false
+		}
+	}
+	return true
+}
+
+// BreakConnectedNetherPortalAround checks (x, y, z) and its 6 orthogonal neighbors
+// in dim for any minecraft:nether_portal blocks whose enclosing obsidian frame or
+// interior is no longer complete, and cascades their removal to StateAir while
+// unregistering their Portal POIs and broadcasting block/light updates.
+func (s *Server) BreakConnectedNetherPortalAround(dim string, x, y, z int) []world.BlockPos {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return nil
+	}
+	seeds := [7]world.BlockPos{
+		{X: x, Y: y, Z: z},
+		{X: x + 1, Y: y, Z: z},
+		{X: x - 1, Y: y, Z: z},
+		{X: x, Y: y + 1, Z: z},
+		{X: x, Y: y - 1, Z: z},
+		{X: x, Y: y, Z: z + 1},
+		{X: x, Y: y, Z: z - 1},
+	}
+	visited := make(map[world.BlockPos]bool)
+	var removed []world.BlockPos
+	var changes []world.BlockChange
+	var lightChunks []world.ChunkPos
+	seenLight := make(map[world.ChunkPos]bool)
+
+	for _, seed := range seeds {
+		if visited[seed] {
+			continue
+		}
+		st := cache.GetBlock(seed.X, seed.Y, seed.Z)
+		name, props, ok := world.BlockStateProperties(st)
+		if !ok || name != "minecraft:nether_portal" {
+			continue
+		}
+		axis := props["axis"]
+		if axis != world.PortalAxisZ {
+			axis = world.PortalAxisX
+		}
+		if isCompleteLitNetherPortalAt(cache, seed.X, seed.Y, seed.Z, axis) {
+			continue
+		}
+		// Flood-fill all connected minecraft:nether_portal blocks and collapse them.
+		queue := []world.BlockPos{seed}
+		visited[seed] = true
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			curSt := cache.GetBlock(cur.X, cur.Y, cur.Z)
+			if !world.IsNetherPortalState(curSt) {
+				continue
+			}
+			if valid, lc := cache.SetBlockWithLight(cur.X, cur.Y, cur.Z, world.StateAir); valid {
+				cache.UnregisterPortalPOI(cur)
+				removed = append(removed, cur)
+				changes = append(changes, world.BlockChange{
+					Pos:      cur,
+					OldState: curSt,
+					NewState: world.StateAir,
+				})
+				for _, cp := range lc {
+					if !seenLight[cp] {
+						seenLight[cp] = true
+						lightChunks = append(lightChunks, cp)
+					}
+				}
+			}
+			neighbors := [6]world.BlockPos{
+				{X: cur.X + 1, Y: cur.Y, Z: cur.Z},
+				{X: cur.X - 1, Y: cur.Y, Z: cur.Z},
+				{X: cur.X, Y: cur.Y + 1, Z: cur.Z},
+				{X: cur.X, Y: cur.Y - 1, Z: cur.Z},
+				{X: cur.X, Y: cur.Y, Z: cur.Z + 1},
+				{X: cur.X, Y: cur.Y, Z: cur.Z - 1},
+			}
+			for _, nb := range neighbors {
+				if !visited[nb] && world.IsNetherPortalState(cache.GetBlock(nb.X, nb.Y, nb.Z)) {
+					visited[nb] = true
+					queue = append(queue, nb)
+				}
+			}
+		}
+	}
+	if len(changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, changes, lightChunks)
+	}
+	return removed
 }
 
 // InvalidatePortalPOIs unregisters any Portal POIs whose minecraft:nether_portal
-// blocks were removed in changes.
+// blocks were removed in changes, and cascades collapse of any connected Nether
+// portal when a portal block or obsidian frame block is broken or replaced.
 func (s *Server) InvalidatePortalPOIs(dim string, changes []world.BlockChange) {
 	if s == nil || len(changes) == 0 {
 		return
@@ -1308,6 +1629,9 @@ func (s *Server) InvalidatePortalPOIs(dim string, changes []world.BlockChange) {
 	for _, ch := range changes {
 		if !world.IsNetherPortalState(ch.NewState) {
 			cache.UnregisterPortalPOI(ch.Pos)
+			if world.IsNetherPortalState(ch.OldState) || world.IsObsidianState(ch.OldState) {
+				s.BreakConnectedNetherPortalAround(dim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z)
+			}
 		}
 	}
 }
@@ -1377,12 +1701,17 @@ func (s *Server) SavePortalsFile() error {
 		}
 		gwElems = append(gwElems, c)
 	}
+	dragonArr := make([]int32, len(mgr.dragonGateways))
+	for i, idx := range mgr.dragonGateways {
+		dragonArr[i] = int32(idx)
+	}
 	mgr.mu.Unlock()
 	gwElemID := byte(nbt.TagCompound)
 	if len(gwElems) == 0 {
 		gwElemID = nbt.TagEnd
 	}
 	root.Set("EndGateways", nbt.List{ElemID: gwElemID, Elems: gwElems})
+	root.Set("DragonGateways", nbt.IntArray(dragonArr))
 
 	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
 }
@@ -1495,6 +1824,18 @@ func (s *Server) LoadPortalsFile() error {
 				}
 				key := dimBlockKey{dim: normDim, pos: world.BlockPos{X: gw.X, Y: gw.Y, Z: gw.Z}}
 				mgr.gateways[key] = gw
+			}
+			mgr.mu.Unlock()
+		}
+	}
+
+	if dgTag, ok := root.Get("DragonGateways"); ok {
+		if arr, ok := dgTag.(nbt.IntArray); ok {
+			mgr := s.portalManager()
+			mgr.mu.Lock()
+			mgr.dragonGateways = make([]int, len(arr))
+			for i, v := range arr {
+				mgr.dragonGateways[i] = int(v)
 			}
 			mgr.mu.Unlock()
 		}
