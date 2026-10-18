@@ -172,6 +172,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickBabyMobs()
 		s.TickTamedMobs(rng)
 		s.TickIronGolems(rng)
+		s.TickCopperGolems(rng)
 		s.TickVillagerGolemSpawning(rng)
 		s.TickPhantomSpawner(rng)
 		s.TickPhantoms(rng)

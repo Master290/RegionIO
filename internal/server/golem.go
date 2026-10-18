@@ -758,3 +758,292 @@ func (s *Server) tickSingleIronGolem(golem *world.Entity, hostiles []world.Entit
 		}
 	}
 }
+
+// --- Copper Golem & Copper Golem Statue Hooks (Minecraft 26.1.2) ---
+
+const (
+	// MobTypeCopperGolem is the canonical 26.1.2 entity identifier for Copper Golem (`minecraft:copper_golem`, ID 28).
+	MobTypeCopperGolem = "minecraft:copper_golem"
+
+	// EntityTypeCopperGolemID is the protocol 775 numeric entity type ID for `minecraft:copper_golem`.
+	EntityTypeCopperGolemID int = 28
+
+	// DefaultCopperGolemMaxHealth is the vanilla max health for a Copper Golem (12.0 HP = 6 hearts).
+	DefaultCopperGolemMaxHealth float32 = 12.0
+
+	// CopperGolemStageAdvanceTicks is the oxidation stage interval in ticks for an unwaxed Copper Golem.
+	CopperGolemStageAdvanceTicks = 12000
+)
+
+// CopperGolemState tracks per-entity oxidation stage, wax state, pose, and facing for a `minecraft:copper_golem`.
+type CopperGolemState struct {
+	EntityID       int32
+	Dimension      string
+	OxidationStage world.CopperOxidationStage
+	Waxed          bool
+	Pose           string
+	Facing         string
+	OxidationTicks int
+}
+
+var (
+	copperGolemStatesMap sync.Map // map[*Server]*copperGolemManager
+)
+
+type copperGolemManager struct {
+	mu         sync.RWMutex
+	golems     map[int32]*CopperGolemState
+	hookInited bool
+}
+
+func (s *Server) copperGolemMgr() *copperGolemManager {
+	if v, ok := copperGolemStatesMap.Load(s); ok {
+		return v.(*copperGolemManager)
+	}
+	actual, _ := copperGolemStatesMap.LoadOrStore(s, &copperGolemManager{
+		golems: make(map[int32]*CopperGolemState),
+	})
+	return actual.(*copperGolemManager)
+}
+
+// EnsureCopperGolemStatueReviveHook registers the server's `SetCopperGolemStatueReviveHook`
+// callback so scraping an unoxidized, unwaxed `minecraft:copper_golem_statue` with an axe
+// revives it into a living `minecraft:copper_golem` entity.
+func (s *Server) EnsureCopperGolemStatueReviveHook() {
+	if s == nil {
+		return
+	}
+	mgr := s.copperGolemMgr()
+	mgr.mu.Lock()
+	if mgr.hookInited {
+		mgr.mu.Unlock()
+		return
+	}
+	mgr.hookInited = true
+	mgr.mu.Unlock()
+
+	s.SetCopperGolemStatueReviveHook(func(dim string, x, y, z int, facing string) (int32, bool) {
+		id, err := s.SpawnCopperGolem(dim, float64(x)+0.5, float64(y), float64(z)+0.5, facing)
+		return id, err == nil && id > 0
+	})
+}
+
+func yawForCardinalFacing(facing string) float32 {
+	switch strings.ToLower(strings.TrimSpace(facing)) {
+	case "north":
+		return 180.0
+	case "south":
+		return 0.0
+	case "west":
+		return 90.0
+	case "east":
+		return -90.0
+	default:
+		return 0.0
+	}
+}
+
+func cardinalFacingFromYaw(yaw float32) string {
+	norm := math.Mod(float64(yaw), 360.0)
+	if norm < 0 {
+		norm += 360.0
+	}
+	switch {
+	case norm >= 315.0 || norm < 45.0:
+		return "south"
+	case norm >= 45.0 && norm < 135.0:
+		return "west"
+	case norm >= 135.0 && norm < 225.0:
+		return "north"
+	default:
+		return "east"
+	}
+}
+
+// SpawnCopperGolem spawns a `minecraft:copper_golem` (ID 28) at (x, y, z) in dimension.
+func (s *Server) SpawnCopperGolem(dimension string, x, y, z float64, facing string) (int32, error) {
+	if s == nil || s.entities == nil {
+		return 0, errors.New("server: nil entity manager")
+	}
+	s.EnsureCopperGolemStatueReviveHook()
+	normDim := world.NormalizeDimension(dimension)
+	if facing == "" {
+		facing = "north"
+	}
+	yaw := yawForCardinalFacing(facing)
+	typeID := ResolveEntityTypeID(MobTypeCopperGolem)
+	if typeID < 0 {
+		typeID = EntityTypeCopperGolemID
+	}
+	id := s.entities.Add(&world.Entity{
+		TypeID:    typeID,
+		TypeName:  MobTypeCopperGolem,
+		Dimension: normDim,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		Yaw:       yaw,
+		HeadYaw:   yaw,
+		OnGround:  true,
+	})
+
+	tr := s.entityTracker()
+	tr.mu.Lock()
+	mem := tr.mobStateFor(id, tr.aiTickID)
+	mem.healthInit = true
+	mem.health = DefaultCopperGolemMaxHealth
+	mem.lastHealth = DefaultCopperGolemMaxHealth
+	tr.mu.Unlock()
+
+	mgr := s.copperGolemMgr()
+	mgr.mu.Lock()
+	mgr.golems[id] = &CopperGolemState{
+		EntityID:       id,
+		Dimension:      normDim,
+		OxidationStage: world.CopperStageUnaffected,
+		Waxed:          false,
+		Pose:           "standing",
+		Facing:         facing,
+	}
+	mgr.mu.Unlock()
+
+	if ent := s.entities.Get(id); ent != nil {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
+	}
+	return id, nil
+}
+
+// GetCopperGolemState returns a snapshot of the CopperGolemState for entityID.
+func (s *Server) GetCopperGolemState(entityID int32) (CopperGolemState, bool) {
+	if s == nil {
+		return CopperGolemState{}, false
+	}
+	mgr := s.copperGolemMgr()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	st, ok := mgr.golems[entityID]
+	if !ok || st == nil {
+		return CopperGolemState{}, false
+	}
+	return *st, true
+}
+
+// SetCopperGolemState updates the oxidation stage, wax state, and pose of a Copper Golem.
+func (s *Server) SetCopperGolemState(entityID int32, stage world.CopperOxidationStage, waxed bool, pose string) bool {
+	if s == nil {
+		return false
+	}
+	mgr := s.copperGolemMgr()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	st, ok := mgr.golems[entityID]
+	if !ok || st == nil {
+		return false
+	}
+	st.OxidationStage = stage
+	st.Waxed = waxed
+	if pose != "" {
+		st.Pose = pose
+	}
+	return true
+}
+
+// PetrifyCopperGolemIntoStatue petrifies a fully oxidized `minecraft:copper_golem`
+// into an `oxidized_copper_golem_statue` (or `waxed_oxidized_copper_golem_statue`)
+// block by invoking `s.TurnCopperGolemIntoStatue(dimension, x, y, z, facing, pose, waxed)`
+// and despawning the mob entity.
+func (s *Server) PetrifyCopperGolemIntoStatue(entityID int32, rng *rand.Rand) (statueState uint16, ok bool) {
+	if s == nil || s.entities == nil {
+		return 0, false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCopperGolem {
+		return 0, false
+	}
+	mgr := s.copperGolemMgr()
+	mgr.mu.Lock()
+	st := mgr.golems[entityID]
+	var (
+		facing = cardinalFacingFromYaw(ent.Yaw)
+		pose   = "standing"
+		waxed  = false
+	)
+	if st != nil {
+		if st.Facing != "" {
+			facing = st.Facing
+		}
+		if st.Pose != "" {
+			pose = st.Pose
+		} else if rng != nil {
+			poses := [4]string{"standing", "sitting", "running", "star"}
+			pose = poses[rng.Intn(len(poses))]
+		}
+		waxed = st.Waxed
+		delete(mgr.golems, entityID)
+	}
+	mgr.mu.Unlock()
+
+	dim := ent.EffectiveDimension()
+	bx := int(math.Floor(ent.X))
+	by := int(math.Floor(ent.Y))
+	bz := int(math.Floor(ent.Z))
+
+	statueState, ok = s.TurnCopperGolemIntoStatue(dim, bx, by, bz, facing, pose, waxed)
+	if !ok {
+		return 0, false
+	}
+	cp := ent.ChunkPos()
+	s.entities.Remove(entityID)
+	tr := s.entityTracker()
+	tr.mu.Lock()
+	delete(tr.mobStates, entityID)
+	tr.mu.Unlock()
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+	return statueState, true
+}
+
+// TickCopperGolems advances oxidation for unwaxed `minecraft:copper_golem` entities
+// and petrifies fully oxidized golems into statues via `PetrifyCopperGolemIntoStatue`.
+func (s *Server) TickCopperGolems(rng *rand.Rand) {
+	if s == nil || s.entities == nil {
+		return
+	}
+	s.EnsureCopperGolemStatueReviveHook()
+	mgr := s.copperGolemMgr()
+	var toPetrify []int32
+
+	mgr.mu.Lock()
+	for id, st := range mgr.golems {
+		if st == nil {
+			delete(mgr.golems, id)
+			continue
+		}
+		if s.entities.Get(id) == nil {
+			delete(mgr.golems, id)
+			continue
+		}
+		if st.Waxed {
+			continue
+		}
+		st.OxidationTicks++
+		if st.OxidationTicks >= CopperGolemStageAdvanceTicks {
+			st.OxidationTicks = 0
+			switch st.OxidationStage {
+			case world.CopperStageUnaffected:
+				st.OxidationStage = world.CopperStageExposed
+			case world.CopperStageExposed:
+				st.OxidationStage = world.CopperStageWeathered
+			case world.CopperStageWeathered:
+				st.OxidationStage = world.CopperStageOxidized
+			case world.CopperStageOxidized:
+				toPetrify = append(toPetrify, id)
+			}
+		}
+	}
+	mgr.mu.Unlock()
+
+	for _, id := range toPetrify {
+		_, _ = s.PetrifyCopperGolemIntoStatue(id, rng)
+	}
+}

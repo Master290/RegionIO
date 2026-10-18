@@ -1974,7 +1974,11 @@ func (s *Server) TrySpawnSkeletonTrapOnLightning(dimension string, x, y, z float
 	if s == nil || s.Difficulty() == DifficultyPeaceful {
 		return 0, false
 	}
-	if _, _, _, redirected := s.RedirectLightningToRod(dimension, int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))); redirected && !forceSpawn {
+	bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
+	if _, _, _, redirected := s.RedirectLightningToCopperRod(dimension, bx, by, bz, 128); redirected && !forceSpawn {
+		return 0, false
+	}
+	if _, _, _, redirected := s.RedirectLightningToRod(dimension, bx, by, bz); redirected && !forceSpawn {
 		return 0, false
 	}
 	if !forceSpawn {
@@ -1994,19 +1998,32 @@ func (s *Server) TrySpawnSkeletonTrapOnLightning(dimension string, x, y, z float
 }
 
 // SpawnLightningBolt spawns a `minecraft:lightning_bolt` (ID 77) in dimension,
-// first checking `RedirectLightningToRod` within 128 blocks of (x, y, z).
+// first checking `RedirectLightningToCopperRod` (and `RedirectLightningToRod`)
+// within 128 blocks of (x, y, z), and then invoking `OnLightningStrikeCopper`
+// at the final strike block.
 func (s *Server) SpawnLightningBolt(dimension string, x, y, z float64, rng *rand.Rand) (entityID int32, strikeX, strikeY, strikeZ float64, redirected bool) {
 	if s == nil || s.entities == nil {
 		return 0, x, y, z, false
 	}
 	normDim := world.NormalizeDimension(dimension)
 	strikeX, strikeY, strikeZ = x, y, z
-	if rx, ry, rz, redir := s.RedirectLightningToRod(normDim, int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))); redir {
+	bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
+	if rx, ry, rz, redir := s.RedirectLightningToCopperRod(normDim, bx, by, bz, 128); redir {
+		redirected = true
+		strikeX = float64(rx) + 0.5
+		strikeY = float64(ry)
+		strikeZ = float64(rz) + 0.5
+	} else if rx, ry, rz, redir := s.RedirectLightningToRod(normDim, bx, by, bz); redir {
 		redirected = true
 		strikeX = float64(rx) + 0.5
 		strikeY = float64(ry)
 		strikeZ = float64(rz) + 0.5
 	}
+	targetBX := int(math.Floor(strikeX))
+	targetBY := int(math.Floor(strikeY))
+	targetBZ := int(math.Floor(strikeZ))
+	_, _ = s.OnLightningStrikeCopper(normDim, targetBX, targetBY, targetBZ)
+
 	typeID := ResolveEntityTypeID(EntityTypeLightning)
 	if typeID < 0 {
 		typeID = EntityTypeLightningBoltID

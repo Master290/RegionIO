@@ -180,6 +180,7 @@ var (
 		MobTypeWanderingTrader:     EntityTypeWanderingTraderID,
 		EntityTypeLlamaSpit:        EntityTypeLlamaSpitID,
 		MobTypeBee:                 EntityTypeBeeID,
+		MobTypeCopperGolem:         EntityTypeCopperGolemID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -306,6 +307,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultIronGolemMaxHealth
 	case MobTypeSnowGolem:
 		return DefaultSnowGolemMaxHealth
+	case MobTypeCopperGolem:
+		return DefaultCopperGolemMaxHealth
 	case MobTypePhantom:
 		return DefaultPhantomMaxHealth
 	case MobTypePillager:
@@ -381,6 +384,7 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 		return 0, errors.New("server: nil entity manager")
 	}
 	s.EnsureWardenSummonHook()
+	s.EnsureCopperGolemStatueReviveHook()
 	normDim := world.NormalizeDimension(dimension)
 	norm := canonicalResourceName(typeName)
 	if norm == MobTypeVillager {
@@ -401,6 +405,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeIronGolem {
 		return s.SpawnIronGolem(normDim, x, y, z, false)
+	}
+	if norm == MobTypeCopperGolem {
+		return s.SpawnCopperGolem(normDim, x, y, z, "north")
 	}
 	if norm == MobTypePhantom {
 		return s.SpawnPhantom(normDim, x, y, z, nil)

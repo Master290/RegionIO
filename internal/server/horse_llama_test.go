@@ -391,4 +391,68 @@ func TestRedstoneHooksProjectileTargetLightningRodAndMobTripwire(t *testing.T) {
 	}
 }
 
+func TestCopperGolemAndLightningHooks(t *testing.T) {
+	s := newSurvivalTestServer(t)
 
+	// 1. Lightning bolt redirects to oxidized lightning rod within 128 blocks and cleans oxidation + powers rod.
+	rodSt, ok := world.BlockStateByName("minecraft:oxidized_lightning_rod", map[string]string{
+		"facing":      "up",
+		"powered":     "false",
+		"waterlogged": "false",
+	})
+	if !ok {
+		t.Fatalf("missing minecraft:oxidized_lightning_rod")
+	}
+	s.chunks.SetBlock(12, 66, 12, rodSt)
+	boltID, _, _, _, _ := s.SpawnLightningBolt(world.DimensionOverworld, 10.5, 65.0, 10.5, rand.New(rand.NewSource(1)))
+	if boltID == 0 {
+		t.Fatalf("expected non-zero lightning bolt ID")
+	}
+	afterRod := s.chunks.GetBlock(12, 66, 12)
+	if got := world.BlockName(afterRod); got != "minecraft:lightning_rod" {
+		t.Fatalf("expected lightning strike on rod to clean oxidation to minecraft:lightning_rod, got %q", got)
+	}
+	if world.BlockProperties(afterRod)["powered"] != "true" {
+		t.Fatalf("expected lightning rod to be powered=true after strike")
+	}
+
+	// 2. Copper golem spawns, oxidizes into statue when Oxidized & unwaxed, and revives when scraped with axe on unaffected statue.
+	golemID, err := s.SpawnCopperGolem(world.DimensionOverworld, 14.5, 65.0, 14.5, "south")
+	if err != nil {
+		t.Fatalf("SpawnCopperGolem failed: %v", err)
+	}
+	if _, ok := s.GetCopperGolemState(golemID); !ok {
+		t.Fatalf("missing CopperGolemState for %d", golemID)
+	}
+	s.SetCopperGolemState(golemID, world.CopperStageOxidized, false, "sitting")
+
+	statueBlock, ok := s.PetrifyCopperGolemIntoStatue(golemID, nil)
+	if !ok {
+		t.Fatalf("expected PetrifyCopperGolemIntoStatue to succeed")
+	}
+	if got := world.BlockName(statueBlock); got != "minecraft:oxidized_copper_golem_statue" {
+		t.Fatalf("expected minecraft:oxidized_copper_golem_statue, got %q", got)
+	}
+	if _, ok := s.GetCopperGolemState(golemID); ok {
+		t.Fatalf("expected copper golem entity %d to be despawned after turning into statue", golemID)
+	}
+
+	// Scrape statue down to unaffected, then scrape once more to revive copper golem via hook.
+	unaffectedStatue, ok := world.BlockStateByName("minecraft:copper_golem_statue", map[string]string{
+		"copper_golem_pose": "sitting",
+		"facing":            "south",
+		"waterlogged":       "false",
+	})
+	if !ok {
+		t.Fatalf("missing minecraft:copper_golem_statue")
+	}
+	s.chunks.SetBlock(14, 65, 14, unaffectedStatue)
+	axeStack := world.ItemStack{ID: "minecraft:iron_axe", Count: 1}
+	_, _, act, revived := s.UseAxeOnCopperBlock(world.DimensionOverworld, 14, 65, 14, axeStack, ItemMeta{}, true)
+	if !revived || act != world.CopperAxeActionScrape {
+		t.Fatalf("expected UseAxeOnCopperBlock on unaffected copper_golem_statue to revive golem: revived=%v act=%v", revived, act)
+	}
+	if got := s.chunks.GetBlock(14, 65, 14); got != world.StateAir {
+		t.Fatalf("expected statue block to break on revive, got %d (%s)", got, world.BlockName(got))
+	}
+}
