@@ -200,42 +200,103 @@ func ItemNameToID(name string) (int32, bool) {
 	return -1, false
 }
 
+// PlayerAbilities represents the vanilla player `abilities` NBT compound and
+// protocol abilities flags/speeds.
+type PlayerAbilities struct {
+	Invulnerable bool
+	Flying       bool
+	MayFly       bool
+	Instabuild   bool
+	MayBuild     bool
+	FlySpeed     float32
+	WalkSpeed    float32
+}
+
+// DefaultPlayerAbilities returns the default vanilla PlayerAbilities for gameMode
+// (0=Survival, 1=Creative, 2=Adventure, 3=Spectator).
+func DefaultPlayerAbilities(gameMode uint8) PlayerAbilities {
+	switch gameMode {
+	case 1: // Creative
+		return PlayerAbilities{
+			Invulnerable: true,
+			Flying:       false,
+			MayFly:       true,
+			Instabuild:   true,
+			MayBuild:     true,
+			FlySpeed:     0.05,
+			WalkSpeed:    0.1,
+		}
+	case 2: // Adventure
+		return PlayerAbilities{
+			Invulnerable: false,
+			Flying:       false,
+			MayFly:       false,
+			Instabuild:   false,
+			MayBuild:     false,
+			FlySpeed:     0.05,
+			WalkSpeed:    0.1,
+		}
+	case 3: // Spectator
+		return PlayerAbilities{
+			Invulnerable: true,
+			Flying:       true,
+			MayFly:       true,
+			Instabuild:   false,
+			MayBuild:     false,
+			FlySpeed:     0.05,
+			WalkSpeed:    0.1,
+		}
+	default: // Survival
+		return PlayerAbilities{
+			Invulnerable: false,
+			Flying:       false,
+			MayFly:       false,
+			Instabuild:   false,
+			MayBuild:     true,
+			FlySpeed:     0.05,
+			WalkSpeed:    0.1,
+		}
+	}
+}
+
 // PlayerData holds the persistent state of a player stored in playerdata/<uuid>.dat.
 type PlayerData struct {
-	Dimension      string
-	Pos            [3]float64
-	Yaw            float32
-	Pitch          float32
-	OnGround       bool
-	GameMode       uint8
-	Health         float32
-	FoodLevel      int32
-	FoodSaturation float32
-	FoodExhaustion float32
-	FoodTickTimer  int32
-	XpLevel        int32
-	XpTotal        int32
-	XpP            float32
-	XpSeed         int32
-	SelectedSlot   int32
-	Inventory      [PlayerInventorySlots]ItemStack
-	SpawnX         int32
-	SpawnY         int32
-	SpawnZ         int32
-	SpawnYaw       float32
-	SpawnPitch     float32
-	SpawnForced    bool
-	SpawnDimension   string
-	HasSpawn         bool
-	Advancements      *nbt.Compound
-	RecipeBook        *nbt.Compound
-	ActiveEffects     *nbt.List
-	AbsorptionAmount  float32
-	SlotPotions       *nbt.List
-	SlotMaps          *nbt.List
-	SlotArmorTrims    *nbt.List
+	Dimension          string
+	Pos                [3]float64
+	Yaw                float32
+	Pitch              float32
+	OnGround           bool
+	GameMode           uint8
+	Health             float32
+	FoodLevel          int32
+	FoodSaturation     float32
+	FoodExhaustion     float32
+	FoodTickTimer      int32
+	XpLevel            int32
+	XpTotal            int32
+	XpP                float32
+	XpSeed             int32
+	SelectedSlot       int32
+	Inventory          [PlayerInventorySlots]ItemStack
+	SpawnX             int32
+	SpawnY             int32
+	SpawnZ             int32
+	SpawnYaw           float32
+	SpawnPitch         float32
+	SpawnForced        bool
+	SpawnDimension     string
+	HasSpawn           bool
+	Advancements       *nbt.Compound
+	RecipeBook         *nbt.Compound
+	ActiveEffects      *nbt.List
+	AbsorptionAmount   float32
+	SlotPotions        *nbt.List
+	SlotMaps           *nbt.List
+	SlotArmorTrims     *nbt.List
 	SlotFireworks      *nbt.List
 	SlotFireworkStars  *nbt.List
+	SlotItemMetas      *nbt.List
+	Abilities          *PlayerAbilities
 	WardenSpawnTracker *nbt.Compound
 	PortalCooldown     int32
 	SeenCredits        bool
@@ -453,6 +514,49 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	if d.SlotFireworkStars != nil && len(d.SlotFireworkStars.Elems) > 0 {
 		root.Set("SlotFireworkStars", *d.SlotFireworkStars)
 	}
+	if d.SlotItemMetas != nil && len(d.SlotItemMetas.Elems) > 0 {
+		root.Set("SlotItemMetas", *d.SlotItemMetas)
+	}
+	ab := DefaultPlayerAbilities(d.GameMode)
+	if d.Abilities != nil {
+		ab = *d.Abilities
+		if ab.FlySpeed <= 0 {
+			ab.FlySpeed = 0.05
+		}
+		if ab.WalkSpeed <= 0 {
+			ab.WalkSpeed = 0.1
+		}
+	}
+	abComp := nbt.NewCompound()
+	if ab.Invulnerable {
+		abComp.Set("invulnerable", nbt.Byte(1))
+	} else {
+		abComp.Set("invulnerable", nbt.Byte(0))
+	}
+	if ab.Flying {
+		abComp.Set("flying", nbt.Byte(1))
+	} else {
+		abComp.Set("flying", nbt.Byte(0))
+	}
+	if ab.MayFly {
+		abComp.Set("mayfly", nbt.Byte(1))
+	} else {
+		abComp.Set("mayfly", nbt.Byte(0))
+	}
+	if ab.Instabuild {
+		abComp.Set("instabuild", nbt.Byte(1))
+	} else {
+		abComp.Set("instabuild", nbt.Byte(0))
+	}
+	if ab.MayBuild {
+		abComp.Set("mayBuild", nbt.Byte(1))
+	} else {
+		abComp.Set("mayBuild", nbt.Byte(0))
+	}
+	abComp.Set("flySpeed", nbt.Float(ab.FlySpeed))
+	abComp.Set("walkSpeed", nbt.Float(ab.WalkSpeed))
+	root.Set("abilities", abComp)
+
 	if d.WardenSpawnTracker != nil {
 		root.Set("warden_spawn_tracker", d.WardenSpawnTracker)
 	}
@@ -806,6 +910,41 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 			ElemID: nbt.TagCompound,
 			Elems:  invStarElems,
 		}
+	}
+	if sim, ok := nbtGetList(root, "SlotItemMetas"); ok && sim != nil {
+		cp := *sim
+		d.SlotItemMetas = &cp
+	}
+	if abComp, ok := nbtGetCompound(root, "abilities"); ok && abComp != nil {
+		ab := DefaultPlayerAbilities(d.GameMode)
+		if b, ok := nbtGetByte(abComp, "invulnerable"); ok {
+			ab.Invulnerable = b != 0
+		}
+		if b, ok := nbtGetByte(abComp, "flying"); ok {
+			ab.Flying = b != 0
+		}
+		if b, ok := nbtGetByte(abComp, "mayfly"); ok {
+			ab.MayFly = b != 0
+		}
+		if b, ok := nbtGetByte(abComp, "instabuild"); ok {
+			ab.Instabuild = b != 0
+		}
+		if b, ok := nbtGetByte(abComp, "mayBuild"); ok {
+			ab.MayBuild = b != 0
+		}
+		if fs, ok := nbtGetFloat(abComp, "flySpeed"); ok && fs > 0 {
+			ab.FlySpeed = fs
+		}
+		if ws, ok := nbtGetFloat(abComp, "walkSpeed"); ok && ws > 0 {
+			ab.WalkSpeed = ws
+		}
+		if d.GameMode == 3 {
+			ab.Flying = true
+			ab.MayFly = true
+		} else if !ab.MayFly {
+			ab.Flying = false
+		}
+		d.Abilities = &ab
 	}
 	if wst, ok := nbtGetCompound(root, "warden_spawn_tracker"); ok && wst != nil {
 		d.WardenSpawnTracker = wst

@@ -144,6 +144,10 @@ type PlayerSession struct {
 	spawnForced      bool
 	spawnDimension   string
 	hasSpawn         bool
+	flying           bool
+	flySpeed         float32
+	walkSpeed        float32
+	cameraEntityID   int32
 	recenterFn       func(cx, cz int32)
 }
 
@@ -170,6 +174,10 @@ type PlayerSnapshot struct {
 	SpawnForced    bool
 	SpawnDimension string
 	HasSpawn       bool
+	Flying         bool
+	FlySpeed       float32
+	WalkSpeed      float32
+	CameraEntityID int32
 	LoadedFromDisk bool
 }
 
@@ -612,6 +620,8 @@ func (s *Server) RegisterPlayer(profile Profile, send PacketSender) (*PlayerSess
 		foodLevel:      world.DefaultPlayerFoodLevel,
 		foodSaturation: world.DefaultPlayerSaturation,
 		spawnDimension: "minecraft:overworld",
+		flySpeed:       0.05,
+		walkSpeed:      0.1,
 	}
 	if hasSaved {
 		session.ApplyPlayerData(persisted)
@@ -711,6 +721,25 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	if d.GameMode <= GameModeSpectator {
 		session.gameMode = d.GameMode
 	}
+	ab := world.DefaultPlayerAbilities(session.gameMode)
+	if d.Abilities != nil {
+		ab = *d.Abilities
+	}
+	if ab.FlySpeed <= 0 {
+		ab.FlySpeed = 0.05
+	}
+	if ab.WalkSpeed <= 0 {
+		ab.WalkSpeed = 0.1
+	}
+	if session.gameMode == GameModeSpectator {
+		session.flying = true
+	} else if session.gameMode == GameModeCreative {
+		session.flying = ab.Flying
+	} else {
+		session.flying = false
+	}
+	session.flySpeed = ab.FlySpeed
+	session.walkSpeed = ab.WalkSpeed
 	if d.Health > 0 {
 		session.health = d.Health
 	} else {
@@ -845,6 +874,56 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 				if exp, ok := ReadFireworkExplosionNBT(ec); ok {
 					SetSlotFireworkStar(session, slot, exp)
 				}
+			}
+		}
+	}
+	if d.SlotItemMetas != nil {
+		for _, elem := range d.SlotItemMetas.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok || comp == nil {
+				continue
+			}
+			slotTag, okS := comp.Get("Slot")
+			if !okS {
+				continue
+			}
+			sb, okS := slotTag.(nbt.Byte)
+			if !okS {
+				continue
+			}
+			slot := int(uint8(sb))
+			if slot < 0 || slot >= world.PlayerInventorySlots {
+				continue
+			}
+			var meta ItemMeta
+			if dmgTag, ok := comp.Get("Damage"); ok {
+				if dv, ok := dmgTag.(nbt.Int); ok && dv > 0 {
+					meta.Damage = int32(dv)
+				}
+			}
+			if rcTag, ok := comp.Get("RepairCost"); ok {
+				if rv, ok := rcTag.(nbt.Int); ok && rv > 0 {
+					meta.RepairCost = int32(rv)
+				}
+			}
+			if cnTag, ok := comp.Get("CustomName"); ok {
+				if cv, ok := cnTag.(nbt.String); ok {
+					meta.CustomName = string(cv)
+				}
+			}
+			if enchTag, ok := comp.Get("Enchantments"); ok {
+				if enchComp, ok := enchTag.(*nbt.Compound); ok && enchComp != nil {
+					for _, k := range enchComp.Keys() {
+						if lvlTag, ok := enchComp.Get(k); ok {
+							if lv, ok := lvlTag.(nbt.Int); ok && lv > 0 {
+								meta.SetEnchantment(k, int(lv))
+							}
+						}
+					}
+				}
+			}
+			if !meta.IsEmpty() {
+				SetSlotItemMeta(session, slot, meta)
 			}
 		}
 	}
@@ -1002,6 +1081,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	var fwElems []nbt.Tag
 	var slotFireworkStars *nbt.List
 	var starElems []nbt.Tag
+	var slotItemMetas *nbt.List
+	var itemMetaElems []nbt.Tag
 	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
 		st := session.InventorySlot(slot)
 		if st.IsEmpty() {
@@ -1043,6 +1124,28 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 				}
 			}
 		}
+		if meta := GetSlotItemMeta(session, slot); !meta.IsEmpty() {
+			entry := nbt.NewCompound().Set("Slot", nbt.Byte(int8(slot)))
+			if meta.Damage > 0 {
+				entry.Set("Damage", nbt.Int(meta.Damage))
+			}
+			if meta.RepairCost > 0 {
+				entry.Set("RepairCost", nbt.Int(meta.RepairCost))
+			}
+			if meta.CustomName != "" {
+				entry.Set("CustomName", nbt.String(meta.CustomName))
+			}
+			if len(meta.Enchantments) > 0 {
+				enchComp := nbt.NewCompound()
+				for k, lvl := range meta.Enchantments {
+					if lvl > 0 {
+						enchComp.Set(k, nbt.Int(int32(lvl)))
+					}
+				}
+				entry.Set("Enchantments", enchComp)
+			}
+			itemMetaElems = append(itemMetaElems, entry)
+		}
 	}
 	if len(mapElems) > 0 {
 		slotMaps = &nbt.List{
@@ -1068,6 +1171,12 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 			Elems:  starElems,
 		}
 	}
+	if len(itemMetaElems) > 0 {
+		slotItemMetas = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  itemMetaElems,
+		}
+	}
 	var portalCooldown int32
 	var seenCredits bool
 	if pst := getPlayerPortalState(session); pst != nil {
@@ -1076,6 +1185,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		seenCredits = pst.seenCredits
 		pst.mu.Unlock()
 	}
+	abilities := session.Abilities()
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -1113,6 +1223,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		SlotArmorTrims:     slotArmorTrims,
 		SlotFireworks:      slotFireworks,
 		SlotFireworkStars:  slotFireworkStars,
+		SlotItemMetas:      slotItemMetas,
+		Abilities:          &abilities,
 		WardenSpawnTracker: wstComp,
 		PortalCooldown:     portalCooldown,
 		SeenCredits:        seenCredits,
@@ -1294,6 +1406,14 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 	}
 	dim := session.Dimension()
 	session.mu.RLock()
+	fs := session.flySpeed
+	if fs <= 0 {
+		fs = 0.05
+	}
+	ws := session.walkSpeed
+	if ws <= 0 {
+		ws = 0.1
+	}
 	snapshot := PlayerSnapshot{
 		EntityID:       session.EntityID,
 		Profile:        session.Profile,
@@ -1319,10 +1439,133 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 		SpawnForced:    session.spawnForced,
 		SpawnDimension: session.spawnDimension,
 		HasSpawn:       session.hasSpawn,
+		Flying:         session.flying || session.gameMode == GameModeSpectator,
+		FlySpeed:       fs,
+		WalkSpeed:      ws,
+		CameraEntityID: session.cameraEntityID,
 		LoadedFromDisk: session.loadedFromDisk,
 	}
 	session.mu.RUnlock()
 	return snapshot
+}
+
+// IsFlying reports whether session is currently flying.
+func (session *PlayerSession) IsFlying() bool {
+	if session == nil {
+		return false
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.flying || session.gameMode == GameModeSpectator
+}
+
+// CanFly reports whether session is allowed to fly in its current game mode.
+func (session *PlayerSession) CanFly() bool {
+	if session == nil {
+		return false
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.gameMode == GameModeCreative || session.gameMode == GameModeSpectator
+}
+
+// SetFlying sets whether session is currently flying (clamped to true in Spectator
+// and false in Survival/Adventure).
+func (session *PlayerSession) SetFlying(flying bool) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	switch session.gameMode {
+	case GameModeSpectator:
+		session.flying = true
+	case GameModeCreative:
+		session.flying = flying
+	default:
+		session.flying = false
+	}
+	session.mu.Unlock()
+	if flying {
+		if st := getSurvivalState(session); st != nil {
+			st.mu.Lock()
+			st.fallDistance = 0
+			st.mu.Unlock()
+		}
+	}
+}
+
+// Abilities returns the effective vanilla PlayerAbilities for session.
+func (session *PlayerSession) Abilities() world.PlayerAbilities {
+	if session == nil {
+		return world.DefaultPlayerAbilities(GameModeSurvival)
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	ab := world.DefaultPlayerAbilities(session.gameMode)
+	if session.gameMode == GameModeSpectator {
+		ab.Flying = true
+	} else if session.gameMode == GameModeCreative {
+		ab.Flying = session.flying
+	} else {
+		ab.Flying = false
+	}
+	if session.flySpeed > 0 {
+		ab.FlySpeed = session.flySpeed
+	}
+	if session.walkSpeed > 0 {
+		ab.WalkSpeed = session.walkSpeed
+	}
+	return ab
+}
+
+// SetAbilities updates session's flying flag and fly/walk speeds.
+func (session *PlayerSession) SetAbilities(ab world.PlayerAbilities) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	if session.gameMode == GameModeSpectator {
+		session.flying = true
+	} else if session.gameMode == GameModeCreative {
+		session.flying = ab.Flying
+	} else {
+		session.flying = false
+	}
+	if ab.FlySpeed > 0 {
+		session.flySpeed = ab.FlySpeed
+	}
+	if ab.WalkSpeed > 0 {
+		session.walkSpeed = ab.WalkSpeed
+	}
+	session.mu.Unlock()
+}
+
+// CameraEntityID returns the entity ID the spectator player's camera is attached to
+// (0 or session.EntityID means the player's own camera).
+func (session *PlayerSession) CameraEntityID() int32 {
+	if session == nil {
+		return 0
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	if session.cameraEntityID == 0 {
+		return session.EntityID
+	}
+	return session.cameraEntityID
+}
+
+// SetCameraEntityID records the entity ID attached to session's spectator camera.
+func (session *PlayerSession) SetCameraEntityID(entityID int32) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	if entityID == session.EntityID {
+		session.cameraEntityID = 0
+	} else {
+		session.cameraEntityID = entityID
+	}
+	session.mu.Unlock()
 }
 
 // SetPlayerRecenterFunc binds a chunk-streamer recenter callback to session so
@@ -1384,6 +1627,177 @@ func (s *Server) TeleportPlayer(session *PlayerSession, x, y, z float64, yaw, pi
 	return session.send(protocol.PlayPlayerPosition, w.Bytes())
 }
 
+// EncodePlayerAbilitiesPacket encodes ClientboundPlayerAbilitiesPacket (0x3b).
+func EncodePlayerAbilitiesPacket(ab world.PlayerAbilities) []byte {
+	var flags byte
+	if ab.Invulnerable {
+		flags |= 0x01
+	}
+	if ab.Flying {
+		flags |= 0x02
+	}
+	if ab.MayFly {
+		flags |= 0x04
+	}
+	if ab.Instabuild {
+		flags |= 0x08
+	}
+	fs := ab.FlySpeed
+	if fs <= 0 {
+		fs = 0.05
+	}
+	ws := ab.WalkSpeed
+	if ws <= 0 {
+		ws = 0.1
+	}
+	w := protocol.NewWriter(9)
+	w.Byte(flags)
+	w.Float32(fs)
+	w.Float32(ws)
+	return w.Bytes()
+}
+
+// SendPlayerAbilities sends ClientboundPlayerAbilitiesPacket (0x3b) to session.
+func (s *Server) SendPlayerAbilities(session *PlayerSession) error {
+	if session == nil || session.send == nil {
+		return nil
+	}
+	return session.send(protocol.PlayAbilities, EncodePlayerAbilitiesPacket(session.Abilities()))
+}
+
+// HandlePlayerAbilitiesPacket processes ServerboundPlayerAbilitiesPacket (0x26):
+// Byte(flags) where bit 0x02 indicates whether the client is flying.
+func (s *Server) HandlePlayerAbilitiesPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	flags, err := r.ReadByte()
+	if err != nil {
+		return err
+	}
+	wantFlying := (flags & 0x02) != 0
+	if !session.CanFly() && wantFlying {
+		session.SetFlying(false)
+		return s.SendPlayerAbilities(session)
+	}
+	session.SetFlying(wantFlying)
+	return nil
+}
+
+// EncodeSetCameraPacket encodes ClientboundSetCameraPacket (0x56): VarInt(cameraEntityID).
+func EncodeSetCameraPacket(cameraEntityID int32) []byte {
+	w := protocol.NewWriter(5)
+	w.VarInt(cameraEntityID)
+	return w.Bytes()
+}
+
+// SetSpectatorCamera attaches a Spectator player's camera to targetEntityID
+// (or resets it to the player's own EntityID when targetEntityID == 0 or
+// targetEntityID == session.EntityID) and sends PlaySetCamera (0x56).
+func (s *Server) SetSpectatorCamera(session *PlayerSession, targetEntityID int32) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	snap := session.Snapshot()
+	if targetEntityID == 0 || targetEntityID == session.EntityID {
+		session.SetCameraEntityID(session.EntityID)
+		if session.send != nil {
+			_ = session.send(protocol.PlaySetCamera, EncodeSetCameraPacket(session.EntityID))
+		}
+		return true
+	}
+	if snap.GameMode != GameModeSpectator {
+		return false
+	}
+
+	var targetX, targetY, targetZ float64
+	var targetYaw, targetPitch float32
+	found := false
+
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		players = append(players, p)
+	}
+	s.playersMu.RUnlock()
+
+	for _, p := range players {
+		if p != nil && p.EntityID == targetEntityID {
+			ps := p.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) == world.NormalizeDimension(snap.Dimension) {
+				targetX, targetY, targetZ = ps.X, ps.Y, ps.Z
+				targetYaw, targetPitch = ps.Yaw, ps.Pitch
+				found = true
+			}
+			break
+		}
+	}
+	if !found && s.entities != nil {
+		if ent := s.entities.Get(targetEntityID); ent != nil && !ent.IsItem() && !ent.IsExperienceOrb() {
+			if ent.EffectiveDimension() == world.NormalizeDimension(snap.Dimension) {
+				targetX, targetY, targetZ = ent.X, ent.Y, ent.Z
+				targetYaw, targetPitch = ent.Yaw, ent.Pitch
+				found = true
+			}
+		}
+	}
+	if !found {
+		return false
+	}
+
+	session.SetCameraEntityID(targetEntityID)
+	_ = s.TeleportPlayer(session, targetX, targetY, targetZ, targetYaw, targetPitch)
+	if session.send != nil {
+		_ = session.send(protocol.PlaySetCamera, EncodeSetCameraPacket(targetEntityID))
+	}
+	return true
+}
+
+// HandleTeleportToEntityPacket processes ServerboundTeleportToEntityPacket (0x3d):
+// 16-byte target UUID (Spectator hotbar teleport menu).
+func (s *Server) HandleTeleportToEntityPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	targetUUID, err := r.UUID()
+	if err != nil {
+		return err
+	}
+	snap := session.Snapshot()
+	if snap.GameMode != GameModeSpectator {
+		return nil
+	}
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		players = append(players, p)
+	}
+	s.playersMu.RUnlock()
+
+	for _, p := range players {
+		if p != nil && p.Profile.UUID == targetUUID {
+			ps := p.Snapshot()
+			targetDim := world.NormalizeDimension(ps.Dimension)
+			if targetDim != world.NormalizeDimension(snap.Dimension) {
+				return s.ChangePlayerDimension(session, targetDim, ps.X, ps.Y, ps.Z, ps.Yaw, ps.Pitch)
+			}
+			return s.TeleportPlayer(session, ps.X, ps.Y, ps.Z, ps.Yaw, ps.Pitch)
+		}
+	}
+	if s.entities != nil {
+		for _, ent := range s.entities.All() {
+			if ent.UUID == targetUUID {
+				targetDim := ent.EffectiveDimension()
+				if targetDim != world.NormalizeDimension(snap.Dimension) {
+					return s.ChangePlayerDimension(session, targetDim, ent.X, ent.Y, ent.Z, ent.Yaw, ent.Pitch)
+				}
+				return s.TeleportPlayer(session, ent.X, ent.Y, ent.Z, ent.Yaw, ent.Pitch)
+			}
+		}
+	}
+	return nil
+}
+
 // SetPlayerGameMode updates session's game mode and sends game_event +
 // player_abilities to the target player.
 func (s *Server) SetPlayerGameMode(session *PlayerSession, mode uint8) error {
@@ -1394,8 +1808,35 @@ func (s *Server) SetPlayerGameMode(session *PlayerSession, mode uint8) error {
 		return fmt.Errorf("server: invalid game mode %d", mode)
 	}
 	session.mu.Lock()
+	prevMode := session.gameMode
+	prevCam := session.cameraEntityID
 	session.gameMode = mode
+	switch mode {
+	case GameModeSpectator:
+		session.flying = true
+	case GameModeCreative:
+		// Keep current flying state when switching into Creative, or enable flying by default
+		// when switching from Spectator.
+		if prevMode == GameModeSpectator {
+			session.flying = true
+		}
+	default:
+		session.flying = false
+	}
+	if mode != GameModeSpectator {
+		session.cameraEntityID = 0
+	}
 	session.mu.Unlock()
+
+	if mode == GameModeSpectator {
+		_ = s.CloseContainer(session, 0, true)
+		s.DismountPlayerVehicle(session)
+	} else if prevMode == GameModeSpectator && prevCam != 0 && prevCam != session.EntityID {
+		if session.send != nil {
+			_ = session.send(protocol.PlaySetCamera, EncodeSetCameraPacket(session.EntityID))
+		}
+	}
+	s.BroadcastPlayerGameModeUpdate(session)
 
 	if session.send == nil {
 		return nil
@@ -1407,20 +1848,12 @@ func (s *Server) SetPlayerGameMode(session *PlayerSession, mode uint8) error {
 		return err
 	}
 
-	var abilityFlags byte
-	switch mode {
-	case GameModeCreative:
-		abilityFlags = 0x0F // invulnerable | flying | allowFlying | instabuild
-	case GameModeSpectator:
-		abilityFlags = 0x07 // invulnerable | flying | allowFlying
-	default:
-		abilityFlags = 0x00
+	ab := session.Abilities()
+	if mode == GameModeCreative && prevMode != GameModeSpectator {
+		// Preserve historical protocol expectation where /gamemode creative sends 0x0F.
+		ab.Flying = true
 	}
-	ab := protocol.NewWriter(9)
-	ab.Byte(abilityFlags)
-	ab.Float32(0.05)
-	ab.Float32(0.1)
-	return session.send(protocol.PlayAbilities, ab.Bytes())
+	return session.send(protocol.PlayAbilities, EncodePlayerAbilitiesPacket(ab))
 }
 
 // SetDayTime sets the world's time-of-day counter and broadcasts set_time to

@@ -720,3 +720,191 @@ func TestWiredBrewingPotionAndEffectHooks(t *testing.T) {
 	}
 }
 
+func TestPlayerMechanicsSweep(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	collector := &survivalPacketCollector{}
+	session, err := srv.RegisterPlayer(Profile{
+		Name: "SweepTester",
+		UUID: OfflineUUID("SweepTester"),
+	}, collector.send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	// 1. DropSelectedItem (single & full stack) and SwapHeldWithOffhand (F key) with ItemMeta preservation.
+	hotbar0 := world.HotbarContainerOffset
+	session.SetSelectedSlot(0)
+	session.SetInventorySlot(hotbar0, world.NewNamedItemStack("minecraft:diamond_sword", 1))
+	SetSlotItemMeta(session, hotbar0, ItemMeta{
+		Damage:     15,
+		RepairCost: 1,
+		CustomName: "SharpBlade",
+		Enchantments: map[string]int{
+			"minecraft:sharpness": 5,
+		},
+	})
+	if !srv.SwapHeldWithOffhand(session) {
+		t.Fatal("SwapHeldWithOffhand failed")
+	}
+	if session.InventorySlot(OffHandContainerSlot).ResolvedID() != "minecraft:diamond_sword" {
+		t.Fatalf("offhand after swap = %+v, want diamond_sword", session.InventorySlot(OffHandContainerSlot))
+	}
+	if meta := GetSlotItemMeta(session, OffHandContainerSlot); meta.CustomName != "SharpBlade" || meta.Damage != 15 {
+		t.Fatalf("offhand meta after swap = %+v, want SharpBlade/Damage=15", meta)
+	}
+	if !srv.SwapHeldWithOffhand(session) {
+		t.Fatal("SwapHeldWithOffhand back failed")
+	}
+	if _, dropped := srv.DropSelectedItem(session, false); dropped.Count != 1 {
+		t.Fatalf("DropSelectedItem(single) = %+v, want count 1", dropped)
+	}
+	if !session.InventorySlot(hotbar0).IsEmpty() || !GetSlotItemMeta(session, hotbar0).IsEmpty() {
+		t.Fatalf("expected hotbar0 and its meta to be cleared after drop")
+	}
+
+	// Stack drop (Ctrl+Q)
+	session.SetInventorySlot(hotbar0, world.NewNamedItemStack("minecraft:cobblestone", 32))
+	if _, dropped := srv.DropSelectedItem(session, true); dropped.Count != 32 {
+		t.Fatalf("DropSelectedItem(entireStack) = %+v, want count 32", dropped)
+	}
+	if !session.InventorySlot(hotbar0).IsEmpty() {
+		t.Fatalf("expected hotbar0 empty after full stack drop")
+	}
+
+	// 2. Curse of Binding prevents removing armor from slots 5..8, and WearableArmorSlotForItem validates armor slots.
+	if slot, ok := WearableArmorSlotForItem("minecraft:diamond_helmet"); !ok || slot != ArmorSlotHead {
+		t.Fatalf("expected diamond_helmet slot %d, got (%d, %v)", ArmorSlotHead, slot, ok)
+	}
+	if slot, ok := WearableArmorSlotForItem("minecraft:elytra"); !ok || slot != ArmorSlotChest {
+		t.Fatalf("expected elytra slot %d, got (%d, %v)", ArmorSlotChest, slot, ok)
+	}
+	session.SetInventorySlot(ArmorSlotHead, world.NewNamedItemStack("minecraft:iron_helmet", 1))
+	SetSlotItemMeta(session, ArmorSlotHead, ItemMeta{
+		Enchantments: map[string]int{
+			EnchantBindingCurse: 1,
+		},
+	})
+	if !HasBindingCurseOnSlot(session, ArmorSlotHead) {
+		t.Fatal("expected HasBindingCurseOnSlot=true on cursed helmet")
+	}
+	// Attempting to click or shift-click cursed helmet in survival must not remove it.
+	if err := srv.HandleContainerClick(session, 0, ArmorSlotHead, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick(cursed helmet): %v", err)
+	}
+	if session.InventorySlot(ArmorSlotHead).ResolvedID() != "minecraft:iron_helmet" || !session.CarriedItem().IsEmpty() {
+		t.Fatalf("expected cursed helmet to remain equipped in survival, got slot=%+v carried=%+v",
+			session.InventorySlot(ArmorSlotHead), session.CarriedItem())
+	}
+
+	// Shift-click diamond_chestplate from hotbar equips it into chest armor slot (6).
+	session.SetInventorySlot(hotbar0, world.NewNamedItemStack("minecraft:diamond_chestplate", 1))
+	SetSlotItemMeta(session, hotbar0, ItemMeta{Damage: 7, CustomName: "ChestGuard"})
+	if err := srv.HandleContainerClick(session, 0, hotbar0, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick(quickMove chestplate): %v", err)
+	}
+	if session.InventorySlot(ArmorSlotChest).ResolvedID() != "minecraft:diamond_chestplate" {
+		t.Fatalf("expected shift-click to equip diamond_chestplate into slot 6, got %+v", session.InventorySlot(ArmorSlotChest))
+	}
+	if meta := GetSlotItemMeta(session, ArmorSlotChest); meta.CustomName != "ChestGuard" || meta.Damage != 7 {
+		t.Fatalf("expected shift-click to preserve armor ItemMeta, got %+v", meta)
+	}
+
+	// 3. PickItemFromBlock & PickItemFromEntity (middle-click pick item).
+	session.SetInventorySlot(world.HotbarContainerOffset+3, world.NewNamedItemStack("minecraft:oak_planks", 16))
+	if !srv.SelectOrPickItem(session, "minecraft:oak_planks") {
+		t.Fatal("SelectOrPickItem(oak_planks) failed")
+	}
+	if session.SelectedSlot() != 3 {
+		t.Fatalf("SelectedSlot after SelectOrPickItem = %d, want 3", session.SelectedSlot())
+	}
+	// Creative pick-block spawns item if not in inventory.
+	_ = srv.SetPlayerGameMode(session, GameModeCreative)
+	if !srv.SelectOrPickItem(session, "minecraft:lantern") {
+		t.Fatal("Creative SelectOrPickItem(lantern) failed")
+	}
+	if session.HeldItem().ResolvedID() != "minecraft:lantern" {
+		t.Fatalf("HeldItem after Creative pick = %+v, want minecraft:lantern", session.HeldItem())
+	}
+
+	// 4. PlayerAbilities: toggling flight in Creative and verifying flying suppresses fall damage.
+	abW := protocol.NewWriter(1)
+	abW.Byte(0x02) // flying = true
+	if err := srv.HandlePlayerAbilitiesPacket(session, protocol.NewReader(abW.Bytes())); err != nil {
+		t.Fatalf("HandlePlayerAbilitiesPacket: %v", err)
+	}
+	if !session.IsFlying() {
+		t.Fatal("expected session.IsFlying() == true after client toggle in Creative")
+	}
+	// Verify fall damage is suppressed while flying in Creative/Spectator.
+	_ = srv.HandlePlayerFall(session, 80.0, 70.0, true, false)
+	if dmg := srv.HandlePlayerFall(session, 70.0, 65.0, false, true); dmg != 0 {
+		t.Fatalf("expected 0 fall damage while flying, got %v", dmg)
+	}
+
+	// 5. Spectator camera attachment/detachment and TeleportToEntity.
+	target, err := srv.RegisterPlayer(Profile{
+		Name: "SpectateTarget",
+		UUID: OfflineUUID("SpectateTarget"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(SpectateTarget): %v", err)
+	}
+	srv.SetPlayerTransform(target, 120.5, 70.0, -45.5, 90.0, 15.0, true)
+
+	_ = srv.SetPlayerGameMode(session, GameModeSpectator)
+	srv.SetSpectatorCamera(session, target.EntityID)
+	if session.CameraEntityID() != target.EntityID {
+		t.Fatalf("CameraEntityID = %d, want %d", session.CameraEntityID(), target.EntityID)
+	}
+	// Pressing Shift (sneak) in Spectator resets camera back to self.
+	inW := protocol.NewWriter(1)
+	inW.Byte(PlayerInputFlagShift)
+	if err := srv.HandlePlayerInputPacket(session, protocol.NewReader(inW.Bytes())); err != nil {
+		t.Fatalf("HandlePlayerInputPacket: %v", err)
+	}
+	if session.CameraEntityID() != session.EntityID {
+		t.Fatalf("CameraEntityID after Shift = %d, want self (%d)", session.CameraEntityID(), session.EntityID)
+	}
+	// TeleportToEntity packet teleports spectator to target's position.
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+	tpW := protocol.NewWriter(16)
+	tpW.UUID(target.Profile.UUID)
+	if err := srv.HandleTeleportToEntityPacket(session, protocol.NewReader(tpW.Bytes())); err != nil {
+		t.Fatalf("HandleTeleportToEntityPacket: %v", err)
+	}
+	snap := session.Snapshot()
+	if snap.X != 120.5 || snap.Y != 70.0 || snap.Z != -45.5 {
+		t.Fatalf("Spectator pos after TeleportToEntity = (%v, %v, %v), want (120.5, 70.0, -45.5)", snap.X, snap.Y, snap.Z)
+	}
+
+	// 6. PlayerData round-trip preserves Abilities and SlotItemMetas (Damage, CustomName, Enchantments, ArmorTrim).
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+	SetSlotArmorTrim(session, ArmorSlotChest, ArmorTrim{
+		Material: "minecraft:amethyst",
+		Pattern:  "minecraft:silence",
+	})
+	pd := session.PlayerData()
+	comp := world.PlayerDataToCompound(pd)
+	decoded, err := world.PlayerDataFromCompound(comp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	restored, err := srv.RegisterPlayer(Profile{
+		Name: "RestoredPlayer",
+		UUID: OfflineUUID("RestoredPlayer"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(RestoredPlayer): %v", err)
+	}
+	restored.ApplyPlayerData(decoded)
+	if meta := GetSlotItemMeta(restored, ArmorSlotChest); meta.CustomName != "ChestGuard" || meta.Damage != 7 {
+		t.Fatalf("restored ChestGuard meta = %+v, want CustomName=ChestGuard Damage=7", meta)
+	}
+	if trim, ok := GetSlotArmorTrim(restored, ArmorSlotChest); !ok || trim.Pattern != "minecraft:silence" {
+		t.Fatalf("restored ArmorTrim = (%+v, %v), want silence/amethyst", trim, ok)
+	}
+}
+
+

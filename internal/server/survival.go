@@ -696,6 +696,10 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return 0, false
 	}
+	if session.Snapshot().GameMode == GameModeSpectator {
+		s.SetSpectatorCamera(session, targetEntityID)
+		return 0, false
+	}
 	if victim := s.playerByEntityID(targetEntityID); victim != nil {
 		if !s.PvP() {
 			return 0, false
@@ -799,13 +803,18 @@ func mobKillXPPoints(typeName string) int32 {
 }
 
 // HandlePlayerAttackPacket decodes a 26.1.2 serverbound attack (0x01) packet and
-// executes an enchantment-aware melee attack against the target entity.
+// executes an enchantment-aware melee attack against the target entity (or
+// attaches the spectator camera in Spectator mode).
 func (s *Server) HandlePlayerAttackPacket(session *PlayerSession, r *protocol.Reader) error {
 	entityID, err := r.VarInt()
 	if err != nil {
 		return err
 	}
 	if s != nil && session != nil {
+		if session.Snapshot().GameMode == GameModeSpectator {
+			s.SetSpectatorCamera(session, entityID)
+			return nil
+		}
 		s.AttackEntityWithEnchantments(session, entityID)
 	}
 	return nil
@@ -820,10 +829,18 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 		return err
 	}
 	if s != nil && session != nil {
+		isSpectator := session.Snapshot().GameMode == GameModeSpectator
 		switch pkt.Action {
 		case InteractActionAttack:
+			if isSpectator {
+				s.SetSpectatorCamera(session, pkt.EntityID)
+				return nil
+			}
 			s.AttackEntityWithEnchantments(session, pkt.EntityID)
 		case InteractActionInteractAt:
+			if isSpectator {
+				return nil
+			}
 			if s.InteractWithDecorationAt(session, pkt.EntityID, pkt.Hand, float64(pkt.TargetX), float64(pkt.TargetY), float64(pkt.TargetZ), true) {
 				s.RefreshItemFrameComparators(pkt.EntityID)
 				return nil
@@ -837,6 +854,9 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 				}
 			}
 		default:
+			if isSpectator {
+				return nil
+			}
 			if s.InteractWithZombieVillager(session, pkt.EntityID, nil) {
 				return nil
 			}
@@ -1249,7 +1269,7 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 	snap := session.Snapshot()
 	st := getSurvivalState(session)
 
-	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || s.PlayerMountedVehicle(session) != 0 {
+	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || snap.Flying || session.IsFlying() || s.PlayerMountedVehicle(session) != 0 {
 		st.mu.Lock()
 		st.fallDistance = 0
 		st.mu.Unlock()

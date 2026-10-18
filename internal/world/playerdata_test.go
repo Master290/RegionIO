@@ -179,3 +179,52 @@ func TestStoreSaveAndLoadPlayerData(t *testing.T) {
 		t.Fatalf("loaded slot = %+v, want 48x minecraft:cobblestone", got.Inventory[HotbarContainerOffset+2])
 	}
 }
+
+func TestPlayerDataAbilitiesAndSlotItemMetas(t *testing.T) {
+	orig := DefaultPlayerData(10, 64, 10)
+	orig.GameMode = 1
+	orig.Abilities = &PlayerAbilities{
+		Invulnerable: true,
+		Flying:       true,
+		MayFly:       true,
+		Instabuild:   true,
+		MayBuild:     true,
+		FlySpeed:     0.08,
+		WalkSpeed:    0.15,
+	}
+	metaEntry := nbt.NewCompound().
+		Set("Slot", nbt.Byte(36)).
+		Set("Damage", nbt.Int(42)).
+		Set("RepairCost", nbt.Int(3)).
+		Set("CustomName", nbt.String("Excalibur"))
+	orig.SlotItemMetas = &nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  []nbt.Tag{metaEntry},
+	}
+
+	comp := PlayerDataToCompound(orig)
+	got, err := PlayerDataFromCompound(comp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	if got.Abilities == nil {
+		t.Fatal("expected Abilities to be decoded")
+	}
+	if !got.Abilities.Flying || !got.Abilities.MayFly || !got.Abilities.Instabuild || got.Abilities.FlySpeed != 0.08 || got.Abilities.WalkSpeed != 0.15 {
+		t.Fatalf("decoded Abilities = %+v, want %+v", got.Abilities, orig.Abilities)
+	}
+	if got.SlotItemMetas == nil || len(got.SlotItemMetas.Elems) != 1 {
+		t.Fatalf("expected 1 SlotItemMetas entry, got %+v", got.SlotItemMetas)
+	}
+	ec, ok := got.SlotItemMetas.Elems[0].(*nbt.Compound)
+	if !ok {
+		t.Fatalf("expected compound element in SlotItemMetas")
+	}
+	if name, _ := nbtGetString(ec, "CustomName"); name != "Excalibur" {
+		t.Fatalf("decoded CustomName = %q, want Excalibur", name)
+	}
+	if dmg, _ := nbtGetInt(ec, "Damage"); dmg != 42 {
+		t.Fatalf("decoded Damage = %d, want 42", dmg)
+	}
+}
+

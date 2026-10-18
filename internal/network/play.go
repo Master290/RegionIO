@@ -1260,6 +1260,18 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayPlayerAbilitiesSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandlePlayerAbilitiesPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayTeleportToEntitySB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleTeleportToEntityPacket(h.session, pkt.Body())
+		}
+		return nil
+
 	default:
 		h.log.Debug("play packet ignored", "id", pkt.ID)
 		return nil
@@ -1449,7 +1461,8 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	}
 
 	if h.srv != nil {
-		if status == server.PlayerActionStartDestroyBlock && int(faceByte) < len(faceOffsets) {
+		canModifyWorld := h.session == nil || (h.session.Snapshot().GameMode != server.GameModeSpectator && h.session.Snapshot().GameMode != server.GameModeAdventure)
+		if canModifyWorld && status == server.PlayerActionStartDestroyBlock && int(faceByte) < len(faceOffsets) {
 			dim := world.DimensionOverworld
 			if h.session != nil {
 				dim = h.session.Dimension()
@@ -1564,6 +1577,11 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		return err
 	}
 
+	if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSpectator {
+		return h.sendBlockChangedAck(seq)
+	}
+	isAdventure := h.session != nil && h.session.Snapshot().GameMode == server.GameModeAdventure
+
 	if h.srv != nil && h.session != nil {
 		if h.srv.UseMapItemOn(h.session, hand, x, y, z) {
 			h.syncHotbarFromSession()
@@ -1571,7 +1589,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		}
 		if cache := h.srv.PlayerChunks(h.session); cache != nil {
 			clickedState := cache.GetBlock(x, y, z)
-			if server.IsChiseledBookshelfBlock(clickedState) && !h.session.IsSneaking() {
+			if !isAdventure && server.IsChiseledBookshelfBlock(clickedState) && !h.session.IsSneaking() {
 				invSlot := h.session.HeldInventorySlot()
 				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
 					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
@@ -1672,20 +1690,33 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					return h.sendBlockChangedAck(seq)
 				}
 			}
-			if heldStack.ResolvedID() == "minecraft:bone_meal" {
-				if newStack, grown := h.srv.BoneMealHangingFloraAt(dim, x, y, z, heldStack, creative, nil); grown {
-					if invSlot >= 0 {
-						h.session.SetInventorySlot(invSlot, newStack)
-						if invSlot < world.PlayerInventorySlots && h.conn != nil {
-							_ = h.sendContainerSetSlot(invSlot, newStack)
+			if !isAdventure {
+				if heldStack.ResolvedID() == "minecraft:bone_meal" {
+					if newStack, grown := h.srv.BoneMealHangingFloraAt(dim, x, y, z, heldStack, creative, nil); grown {
+						if invSlot >= 0 {
+							h.session.SetInventorySlot(invSlot, newStack)
+							if invSlot < world.PlayerInventorySlots && h.conn != nil {
+								_ = h.sendContainerSetSlot(invSlot, newStack)
+							}
 						}
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
 					}
-					h.syncHotbarFromSession()
-					return h.sendBlockChangedAck(seq)
 				}
-			}
-			if heldStack.ResolvedID() == "minecraft:shears" {
-				if newStack, newMeta, sheared := h.srv.ShearGrowingPlantTip(dim, x, y, z, heldStack, heldMeta, creative); sheared {
+				if heldStack.ResolvedID() == "minecraft:shears" {
+					if newStack, newMeta, sheared := h.srv.ShearGrowingPlantTip(dim, x, y, z, heldStack, heldMeta, creative); sheared {
+						if invSlot >= 0 {
+							h.session.SetInventorySlot(invSlot, newStack)
+							server.SetSlotItemMeta(h.session, invSlot, newMeta)
+							if invSlot < world.PlayerInventorySlots && h.conn != nil {
+								_ = h.sendContainerSetSlot(invSlot, newStack)
+							}
+						}
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
+				if newStack, newMeta, soundEvent, handled := h.srv.TryInteractCopperBlock(dim, x, y, z, heldStack, heldMeta, sneaking, creative); handled {
 					if invSlot >= 0 {
 						h.session.SetInventorySlot(invSlot, newStack)
 						server.SetSlotItemMeta(h.session, invSlot, newMeta)
@@ -1693,24 +1724,13 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 							_ = h.sendContainerSetSlot(invSlot, newStack)
 						}
 					}
+					if soundEvent != "" {
+						h.srv.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), server.PlaySoundPacketID,
+							server.EncodeSoundPacket(soundEvent, server.SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+					}
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
-			}
-			if newStack, newMeta, soundEvent, handled := h.srv.TryInteractCopperBlock(dim, x, y, z, heldStack, heldMeta, sneaking, creative); handled {
-				if invSlot >= 0 {
-					h.session.SetInventorySlot(invSlot, newStack)
-					server.SetSlotItemMeta(h.session, invSlot, newMeta)
-					if invSlot < world.PlayerInventorySlots && h.conn != nil {
-						_ = h.sendContainerSetSlot(invSlot, newStack)
-					}
-				}
-				if soundEvent != "" {
-					h.srv.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), server.PlaySoundPacketID,
-						server.EncodeSoundPacket(soundEvent, server.SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
-				}
-				h.syncHotbarFromSession()
-				return h.sendBlockChangedAck(seq)
 			}
 		}
 		opened, _, err := h.srv.InteractBlock(h.session, x, y, z)
@@ -1753,7 +1773,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				h.srv.EmitPlayerBlockVibration(h.session, evType, dim, x, y, z, world.BlockName(newState))
 				return h.sendBlockChangedAck(seq)
 			}
-			if h.session != nil && !h.session.IsDead() {
+			if !isAdventure && h.session != nil && !h.session.IsDead() {
 				invSlot := h.session.HeldInventorySlot()
 				if hand == server.HandOffHand {
 					invSlot = server.OffHandContainerSlot
@@ -1818,6 +1838,10 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 			}
 		}
+	}
+
+	if isAdventure {
+		return h.sendBlockChangedAck(seq)
 	}
 
 	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {

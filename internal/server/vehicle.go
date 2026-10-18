@@ -1395,6 +1395,9 @@ func (s *Server) HandlePlayerInputPacket(session *PlayerSession, r *protocol.Rea
 		if s.PlayerMountedVehicle(session) != 0 || s.PlayerMountedCamel(session) != 0 || s.PlayerMountedEquine(session) != 0 {
 			s.DismountPlayerVehicle(session)
 		}
+		if session.Snapshot().GameMode == GameModeSpectator && session.CameraEntityID() != session.EntityID {
+			s.SetSpectatorCamera(session, session.EntityID)
+		}
 	}
 	return nil
 }
