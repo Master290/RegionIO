@@ -19,20 +19,22 @@ type StructureStartStub struct {
 	StubPos       [3]int
 }
 
+const maxStrongholdRingsCacheEntries = 16
+
 var (
-	strongholdRingsMu    sync.Mutex
+	strongholdRingsMu    sync.RWMutex
 	strongholdRingsCache = map[int64]map[[2]int32]bool{}
 )
 
 // StrongholdChunkSet returns the cached set of 128 biome-snapped stronghold
 // start chunks for (od, sets, seed), matching ChunkGeneratorStructureState.generateRingPositions.
 func StrongholdChunkSet(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64) map[[2]int32]bool {
-	strongholdRingsMu.Lock()
+	strongholdRingsMu.RLock()
 	if cached, ok := strongholdRingsCache[seed]; ok {
-		strongholdRingsMu.Unlock()
+		strongholdRingsMu.RUnlock()
 		return cached
 	}
-	strongholdRingsMu.Unlock()
+	strongholdRingsMu.RUnlock()
 
 	var biomeAtQuart func(qx, qy, qz int) string
 	if od != nil {
@@ -49,6 +51,9 @@ func StrongholdChunkSet(od *worldgen.OverworldDensity, sets *worldgen.StructureS
 	}
 
 	strongholdRingsMu.Lock()
+	if len(strongholdRingsCache) >= maxStrongholdRingsCacheEntries {
+		clear(strongholdRingsCache)
+	}
 	strongholdRingsCache[seed] = lookup
 	strongholdRingsMu.Unlock()
 	return lookup

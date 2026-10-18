@@ -90,7 +90,7 @@ type levelCache struct {
 	shards [16]levelShard
 }
 
-const levelShardCap = 1 << 16
+const levelShardCap = 1 << 12
 
 type levelShard struct {
 	mu sync.RWMutex
@@ -123,7 +123,7 @@ func (c *levelCache) put(key uint64, v int) {
 	s := c.shardOf(key)
 	s.mu.Lock()
 	if len(s.m) >= levelShardCap {
-		s.m = make(map[uint64]int)
+		clear(s.m)
 	}
 	s.m[key] = v
 	s.mu.Unlock()

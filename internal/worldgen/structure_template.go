@@ -82,7 +82,7 @@ type resolvedPaletteEntry struct {
 }
 
 func parsePaletteList(tag nbt.List, resolve func(name string, props map[string]string) (uint16, bool)) []resolvedPaletteEntry {
-	var palette []resolvedPaletteEntry
+	palette := make([]resolvedPaletteEntry, 0, len(tag.Elems))
 	for _, entry := range tag.Elems {
 		stateComp, ok := entry.(*nbt.Compound)
 		if !ok {
@@ -93,12 +93,16 @@ func parsePaletteList(tag nbt.List, resolve func(name string, props map[string]s
 		if nameTag, ok := stateComp.Get("Name"); ok {
 			name = string(nameTag.(nbt.String))
 		}
-		props := map[string]string{}
+		var props map[string]string
 		if propTag, ok := stateComp.Get("Properties"); ok {
 			if propComp, isCompound := propTag.(*nbt.Compound); isCompound {
-				for _, key := range propComp.Keys() {
-					if v, ok := propComp.Get(key); ok {
-						props[key] = string(v.(nbt.String))
+				keys := propComp.Keys()
+				if len(keys) > 0 {
+					props = make(map[string]string, len(keys))
+					for _, key := range keys {
+						if v, ok := propComp.Get(key); ok {
+							props[key] = string(v.(nbt.String))
+						}
 					}
 				}
 			}
@@ -151,6 +155,26 @@ func isRandomizableContainerBlock(name string) bool {
 	return false
 }
 
+// LoadResolvedTemplateFullBytes parses a template NBT in a single pass, returning
+// all resolved block palettes, template entities, and the template bounding size.
+func LoadResolvedTemplateFullBytes(raw []byte, resolve func(name string, props map[string]string) (uint16, bool)) ([][]TemplateBlockInfo, []TemplateEntityInfo, [3]int, error) {
+	raw, err := readMaybeGzipBytes(raw)
+	if err != nil {
+		return nil, nil, [3]int{}, err
+	}
+	_, root, err := nbt.UnmarshalNamed(raw)
+	if err != nil {
+		return nil, nil, [3]int{}, err
+	}
+	comp, ok := root.(*nbt.Compound)
+	if !ok {
+		return nil, nil, [3]int{}, fmt.Errorf("template root is not a compound")
+	}
+	palettes, size := parseTemplatePalettesFromCompound(comp, resolve)
+	entities := parseTemplateEntitiesFromCompound(comp)
+	return palettes, entities, size, nil
+}
+
 // LoadResolvedTemplatePalettesBytes parses a template NBT (handling both single
 // "palette" and multi-palette "palettes") into one []TemplateBlockInfo per palette.
 func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, props map[string]string) (uint16, bool)) ([][]TemplateBlockInfo, [3]int, error) {
@@ -166,7 +190,11 @@ func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, pro
 	if !ok {
 		return nil, [3]int{}, fmt.Errorf("template root is not a compound")
 	}
+	out, size := parseTemplatePalettesFromCompound(comp, resolve)
+	return out, size, nil
+}
 
+func parseTemplatePalettesFromCompound(comp *nbt.Compound, resolve func(name string, props map[string]string) (uint16, bool)) ([][]TemplateBlockInfo, [3]int) {
 	var size [3]int
 	if rawTag, ok := comp.Get("size"); ok {
 		if tag, isList := rawTag.(nbt.List); isList && len(tag.Elems) == 3 {
@@ -194,14 +222,14 @@ func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, pro
 		}
 	}
 	if len(palettes) == 0 {
-		return nil, size, nil
+		return nil, size
 	}
 
 	out := make([][]TemplateBlockInfo, len(palettes))
 	if rawTag, ok := comp.Get("blocks"); ok {
 		if tag, isList := rawTag.(nbt.List); isList {
 			for pIdx, palette := range palettes {
-				var blocks []TemplateBlockInfo
+				blocks := make([]TemplateBlockInfo, 0, len(tag.Elems))
 				for _, entry := range tag.Elems {
 					blockComp, ok := entry.(*nbt.Compound)
 					if !ok {
@@ -270,7 +298,7 @@ func LoadResolvedTemplatePalettesBytes(raw []byte, resolve func(name string, pro
 			}
 		}
 	}
-	return out, size, nil
+	return out, size
 }
 
 // LoadResolvedTemplateEntitiesBytes parses the "entities" list of a StructureTemplate NBT.
@@ -287,13 +315,17 @@ func LoadResolvedTemplateEntitiesBytes(raw []byte) ([]TemplateEntityInfo, error)
 	if !ok {
 		return nil, fmt.Errorf("template root is not a compound")
 	}
+	return parseTemplateEntitiesFromCompound(comp), nil
+}
+
+func parseTemplateEntitiesFromCompound(comp *nbt.Compound) []TemplateEntityInfo {
 	rawTag, ok := comp.Get("entities")
 	if !ok {
-		return nil, nil
+		return nil
 	}
 	tag, isList := rawTag.(nbt.List)
 	if !isList || len(tag.Elems) == 0 {
-		return nil, nil
+		return nil
 	}
 	out := make([]TemplateEntityInfo, 0, len(tag.Elems))
 	for _, entry := range tag.Elems {
@@ -333,7 +365,7 @@ func LoadResolvedTemplateEntitiesBytes(raw []byte) ([]TemplateEntityInfo, error)
 			out = append(out, info)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // LoadResolvedTemplateBytes parses template NBT already in memory.

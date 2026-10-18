@@ -59,73 +59,85 @@ type cachedJigsawTemplate struct {
 	entities []worldgen.TemplateEntityInfo
 }
 
+const (
+	maxJigsawTemplateCacheEntries = 2048
+	maxJigsawStartCacheEntries    = 256
+)
+
 var (
-	jigsawTemplateMu    sync.Mutex
+	jigsawTemplateMu    sync.RWMutex
 	jigsawTemplateCache = map[string]*cachedJigsawTemplate{}
+	poolMaxSizeMu       sync.RWMutex
+	poolMaxSizeCache    = map[*worldgen.TemplatePoolDef]int{}
 )
 
 func loadCachedJigsawTemplate(location string) (*cachedJigsawTemplate, error) {
 	clean := strings.TrimPrefix(location, "minecraft:")
-	jigsawTemplateMu.Lock()
+	jigsawTemplateMu.RLock()
 	if cached, ok := jigsawTemplateCache[clean]; ok {
-		jigsawTemplateMu.Unlock()
+		jigsawTemplateMu.RUnlock()
 		return cached, nil
 	}
-	jigsawTemplateMu.Unlock()
+	jigsawTemplateMu.RUnlock()
 
 	stateByIDOnce.Do(buildStateTable)
 	raw, err := worldgen.EmbeddedStructureTemplate(clean)
 	if err != nil {
 		return nil, err
 	}
-	rawPalettes, size, err := worldgen.LoadResolvedTemplatePalettesBytes(raw, nameToStateID)
+	rawPalettes, entities, size, err := worldgen.LoadResolvedTemplateFullBytes(raw, nameToStateID)
 	if err != nil {
 		return nil, err
 	}
-	entities, _ := worldgen.LoadResolvedTemplateEntitiesBytes(raw)
 
 	// Sort each palette's blocks matching StructureTemplate.loadPalette / buildInfoList:
-	// fullBlocks -> otherBlocks -> blocksWithNbt, each sorted by (Y, X, Z) ascending.
+	// fullBlocks (0) -> otherBlocks (1) -> blocksWithNbt (2), each sorted by (Y, X, Z) ascending.
+	blockBucket := func(b *worldgen.TemplateBlockInfo) int {
+		if b.HasNBT {
+			return 2
+		}
+		if fullSolidState(b.State) {
+			return 0
+		}
+		return 1
+	}
 	palettes := make([]cachedJigsawPalette, len(rawPalettes))
 	for pIdx, blocks := range rawPalettes {
-		var fullBlocks, otherBlocks, nbtBlocks []worldgen.TemplateBlockInfo
-		for _, b := range blocks {
-			if b.HasNBT {
-				nbtBlocks = append(nbtBlocks, b)
-			} else if fullSolidState(b.State) {
-				fullBlocks = append(fullBlocks, b)
-			} else {
-				otherBlocks = append(otherBlocks, b)
+		sort.Slice(blocks, func(i, j int) bool {
+			bi, bj := blockBucket(&blocks[i]), blockBucket(&blocks[j])
+			if bi != bj {
+				return bi < bj
+			}
+			if blocks[i].Pos[1] != blocks[j].Pos[1] {
+				return blocks[i].Pos[1] < blocks[j].Pos[1]
+			}
+			if blocks[i].Pos[0] != blocks[j].Pos[0] {
+				return blocks[i].Pos[0] < blocks[j].Pos[0]
+			}
+			return blocks[i].Pos[2] < blocks[j].Pos[2]
+		})
+
+		jigsawCount := 0
+		for i := range blocks {
+			if blocks[i].Jigsaw != nil {
+				jigsawCount++
 			}
 		}
-		yxzLess := func(s []worldgen.TemplateBlockInfo) func(i, j int) bool {
-			return func(i, j int) bool {
-				if s[i].Pos[1] != s[j].Pos[1] {
-					return s[i].Pos[1] < s[j].Pos[1]
-				}
-				if s[i].Pos[0] != s[j].Pos[0] {
-					return s[i].Pos[0] < s[j].Pos[0]
-				}
-				return s[i].Pos[2] < s[j].Pos[2]
-			}
-		}
-		sort.Slice(fullBlocks, yxzLess(fullBlocks))
-		sort.Slice(otherBlocks, yxzLess(otherBlocks))
-		sort.Slice(nbtBlocks, yxzLess(nbtBlocks))
-
-		combined := make([]worldgen.TemplateBlockInfo, 0, len(blocks))
-		combined = append(combined, fullBlocks...)
-		combined = append(combined, otherBlocks...)
-		combined = append(combined, nbtBlocks...)
-
 		var jigsaws []worldgen.TemplateBlockInfo
-		for _, b := range combined {
-			if b.Jigsaw != nil {
-				jigsaws = append(jigsaws, b)
+		if jigsawCount > 0 {
+			jigsaws = make([]worldgen.TemplateBlockInfo, 0, jigsawCount)
+			for i := range blocks {
+				b := &blocks[i]
+				if b.Jigsaw != nil {
+					b.Jigsaw.Name = normalizeResourceID(b.Jigsaw.Name)
+					b.Jigsaw.Target = normalizeResourceID(b.Jigsaw.Target)
+					b.Jigsaw.Pool = normalizeResourceID(b.Jigsaw.Pool)
+					jigsaws = append(jigsaws, *b)
+				}
 			}
 		}
 		palettes[pIdx] = cachedJigsawPalette{
-			blocks:  combined,
+			blocks:  blocks,
 			jigsaws: jigsaws,
 		}
 	}
@@ -136,6 +148,9 @@ func loadCachedJigsawTemplate(location string) (*cachedJigsawTemplate, error) {
 		entities: entities,
 	}
 	jigsawTemplateMu.Lock()
+	if len(jigsawTemplateCache) >= maxJigsawTemplateCacheEntries {
+		clear(jigsawTemplateCache)
+	}
 	jigsawTemplateCache[clean] = res
 	jigsawTemplateMu.Unlock()
 	return res, nil
@@ -152,7 +167,8 @@ func selectJigsawPalette(tmpl *cachedJigsawTemplate, pos [3]int) *cachedJigsawPa
 	if pos != ([3]int{0, 0, 0}) {
 		seed = worldgen.MthGetSeed(pos[0], pos[1], pos[2])
 	}
-	rng := worldgen.NewLegacy(seed)
+	var rng worldgen.Legacy
+	rng.SetSeed(seed)
 	return &tmpl.palettes[int(rng.NextIntN(int32(len(tmpl.palettes))))]
 }
 
@@ -189,11 +205,11 @@ func rotateJigsawDirection(dir string, rotation int) string {
 }
 
 func parseJigsawOrientation(orient string, rotation int) (front, top string) {
-	parts := strings.SplitN(orient, "_", 2)
-	if len(parts) != 2 {
+	p0, p1, ok := strings.Cut(orient, "_")
+	if !ok {
 		return rotateJigsawDirection("north", rotation), "up"
 	}
-	return rotateJigsawDirection(parts[0], rotation), rotateJigsawDirection(parts[1], rotation)
+	return rotateJigsawDirection(p0, rotation), rotateJigsawDirection(p1, rotation)
 }
 
 func jigsawOppositeDir(dir string) string {
@@ -307,11 +323,16 @@ func getElementBoundingBox(elem worldgen.PoolElementDef, pos [3]int, rotation in
 }
 
 func getShuffledJigsawBlocks(elem worldgen.PoolElementDef, pos [3]int, rotation int, random worldgen.RandomSource) []rotatedJigsawInfo {
+	return appendShuffledJigsawBlocks(nil, elem, pos, rotation, random)
+}
+
+func appendShuffledJigsawBlocks(dst []rotatedJigsawInfo, elem worldgen.PoolElementDef, pos [3]int, rotation int, random worldgen.RandomSource) []rotatedJigsawInfo {
+	dst = dst[:0]
 	switch elem.ElementType {
 	case "minecraft:feature_pool_element":
 		// FeaturePoolElement.getShuffledJigsawBlocks does NOT call Util.shuffle (0 RNG draws).
 		front, top := parseJigsawOrientation("down_south", rotation)
-		return []rotatedJigsawInfo{{
+		return append(dst, rotatedJigsawInfo{
 			WorldPos:          pos,
 			Front:             front,
 			Top:               top,
@@ -322,45 +343,56 @@ func getShuffledJigsawBlocks(elem worldgen.PoolElementDef, pos [3]int, rotation 
 			Joint:             "rollable",
 			SelectionPriority: 0,
 			PlacementPriority: 0,
-		}}
+		})
 	case "minecraft:list_pool_element":
 		if len(elem.Elements) == 0 {
-			return nil
+			return dst
 		}
-		return getShuffledJigsawBlocks(elem.Elements[0], pos, rotation, random)
+		return appendShuffledJigsawBlocks(dst, elem.Elements[0], pos, rotation, random)
 	case "minecraft:single_pool_element", "minecraft:legacy_single_pool_element":
 		tmpl, err := loadCachedJigsawTemplate(elem.Location)
 		if err != nil || tmpl == nil {
-			return nil
+			return dst
 		}
 		pal := selectJigsawPalette(tmpl, pos)
 		if pal == nil || len(pal.jigsaws) == 0 {
-			return nil
+			return dst
 		}
-		out := make([]rotatedJigsawInfo, len(pal.jigsaws))
+		if cap(dst) < len(pal.jigsaws) {
+			dst = make([]rotatedJigsawInfo, len(pal.jigsaws))
+		} else {
+			dst = dst[:len(pal.jigsaws)]
+		}
+		hasDiffPrio := false
+		firstPrio := pal.jigsaws[0].Jigsaw.SelectionPriority
 		for i, b := range pal.jigsaws {
 			rel := worldgen.TransformBlockPos(b.Pos, "none", rotation, [3]int{0, 0, 0})
 			front, top := parseJigsawOrientation(b.Jigsaw.Orientation, rotation)
-			out[i] = rotatedJigsawInfo{
+			if b.Jigsaw.SelectionPriority != firstPrio {
+				hasDiffPrio = true
+			}
+			dst[i] = rotatedJigsawInfo{
 				WorldPos:          [3]int{pos[0] + rel[0], pos[1] + rel[1], pos[2] + rel[2]},
 				Front:             front,
 				Top:               top,
-				Name:              normalizeResourceID(b.Jigsaw.Name),
-				Target:            normalizeResourceID(b.Jigsaw.Target),
-				Pool:              normalizeResourceID(b.Jigsaw.Pool),
+				Name:              b.Jigsaw.Name,
+				Target:            b.Jigsaw.Target,
+				Pool:              b.Jigsaw.Pool,
 				FinalState:        b.Jigsaw.FinalState,
 				Joint:             b.Jigsaw.Joint,
 				SelectionPriority: b.Jigsaw.SelectionPriority,
 				PlacementPriority: b.Jigsaw.PlacementPriority,
 			}
 		}
-		jigsawShuffleSlice(out, random)
-		sort.SliceStable(out, func(i, j int) bool {
-			return out[i].SelectionPriority > out[j].SelectionPriority
-		})
-		return out
+		jigsawShuffleSlice(dst, random)
+		if hasDiffPrio {
+			sort.SliceStable(dst, func(i, j int) bool {
+				return dst[i].SelectionPriority > dst[j].SelectionPriority
+			})
+		}
+		return dst
 	default:
-		return nil
+		return dst
 	}
 }
 
@@ -368,6 +400,13 @@ func poolMaxSize(pool *worldgen.TemplatePoolDef) int {
 	if pool == nil {
 		return 0
 	}
+	poolMaxSizeMu.RLock()
+	if v, ok := poolMaxSizeCache[pool]; ok {
+		poolMaxSizeMu.RUnlock()
+		return v
+	}
+	poolMaxSizeMu.RUnlock()
+
 	maxY := 0
 	for _, we := range pool.Elements {
 		if we.Element.ElementType == "minecraft:empty_pool_element" {
@@ -378,6 +417,12 @@ func poolMaxSize(pool *worldgen.TemplatePoolDef) int {
 			maxY = span
 		}
 	}
+	poolMaxSizeMu.Lock()
+	if len(poolMaxSizeCache) >= 1024 {
+		clear(poolMaxSizeCache)
+	}
+	poolMaxSizeCache[pool] = maxY
+	poolMaxSizeMu.Unlock()
 	return maxY
 }
 
@@ -707,6 +752,9 @@ func BuildJigsawStart(
 		}
 
 		placing := newSequencedPriorityQueue()
+		var parentJigsawsBuf []rotatedJigsawInfo
+		var childJigsawsBuf []rotatedJigsawInfo
+		var candidatesBuf []worldgen.PoolElementDef
 		tryPlacingChildren := func(piece *JigsawPiece, freeSpace *jigsawFreeSpace, depth int) {
 			parentElem := piece.Element
 			parentPos := piece.Pos
@@ -716,7 +764,8 @@ func BuildJigsawStart(
 			parentBB := piece.Box
 			parentMinY := parentBB.minY
 
-			parentJigsaws := getShuffledJigsawBlocks(parentElem, parentPos, parentRot, random)
+			parentJigsawsBuf = appendShuffledJigsawBlocks(parentJigsawsBuf, parentElem, parentPos, parentRot, random)
+			parentJigsaws := parentJigsawsBuf
 			for _, parentJigsaw := range parentJigsaws {
 				step := jigsawDirStep(parentJigsaw.Front)
 				jigsawPos := parentJigsaw.WorldPos
@@ -746,17 +795,16 @@ func BuildJigsawStart(
 					collisionShape = freeSpace
 				}
 
-				var candidates []worldgen.PoolElementDef
+				candidates := candidatesBuf[:0]
 				if depth != maxDepth {
-					poolCopy := make([]worldgen.PoolElementDef, len(pool.Expanded))
-					copy(poolCopy, pool.Expanded)
-					jigsawShuffleSlice(poolCopy, random)
-					candidates = append(candidates, poolCopy...)
+					startIdx := len(candidates)
+					candidates = append(candidates, pool.Expanded...)
+					jigsawShuffleSlice(candidates[startIdx:], random)
 				}
-				fbCopy := make([]worldgen.PoolElementDef, len(fallback.Expanded))
-				copy(fbCopy, fallback.Expanded)
-				jigsawShuffleSlice(fbCopy, random)
-				candidates = append(candidates, fbCopy...)
+				fbStart := len(candidates)
+				candidates = append(candidates, fallback.Expanded...)
+				jigsawShuffleSlice(candidates[fbStart:], random)
+				candidatesBuf = candidates
 
 				placementPrio := parentJigsaw.PlacementPriority
 
@@ -765,10 +813,12 @@ func BuildJigsawStart(
 					if candidate.ElementType == "minecraft:empty_pool_element" {
 						break
 					}
-					rots := []int{0, 1, 2, 3}
+					rotsArr := [4]int{0, 1, 2, 3}
+					rots := rotsArr[:]
 					jigsawShuffleSlice(rots, random)
 					for _, candidateRot := range rots {
-						childJigsaws := getShuffledJigsawBlocks(candidate, [3]int{0, 0, 0}, candidateRot, random)
+						childJigsawsBuf = appendShuffledJigsawBlocks(childJigsawsBuf, candidate, [3]int{0, 0, 0}, candidateRot, random)
+						childJigsaws := childJigsawsBuf
 						zeroBB := getElementBoundingBox(candidate, [3]int{0, 0, 0}, candidateRot)
 						expandY := 0
 						if def.UseExpansionHack && zeroBB.ySpan() <= 16 {
@@ -937,21 +987,21 @@ type jigsawCacheKey struct {
 }
 
 var (
-	jigsawStartMu    sync.Mutex
+	jigsawStartMu    sync.RWMutex
 	jigsawStartCache = map[jigsawCacheKey]*JigsawStart{}
 )
 
 func getCachedJigsawStart(seed int64, setID string, sx, sz int32) (*JigsawStart, bool) {
-	jigsawStartMu.Lock()
+	jigsawStartMu.RLock()
 	cached, ok := jigsawStartCache[jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}]
-	jigsawStartMu.Unlock()
+	jigsawStartMu.RUnlock()
 	return cached, ok
 }
 
 func putCachedJigsawStart(seed int64, setID string, sx, sz int32, start *JigsawStart) {
 	jigsawStartMu.Lock()
-	if len(jigsawStartCache) >= 512 {
-		jigsawStartCache = make(map[jigsawCacheKey]*JigsawStart, 64)
+	if len(jigsawStartCache) >= maxJigsawStartCacheEntries {
+		clear(jigsawStartCache)
 	}
 	jigsawStartCache[jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}] = start
 	jigsawStartMu.Unlock()

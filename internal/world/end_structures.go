@@ -333,8 +333,10 @@ type endCityCacheKey struct {
 	cz   int32
 }
 
+const maxEndCityCacheEntries = 128
+
 var (
-	endCityCacheMu sync.Mutex
+	endCityCacheMu sync.RWMutex
 	endCityCache   = make(map[endCityCacheKey]*EndCityStart)
 )
 
@@ -349,28 +351,28 @@ func EndCityGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Struct
 		return nil
 	}
 	key := endCityCacheKey{seed: seed, cx: cx, cz: cz}
-	endCityCacheMu.Lock()
+	endCityCacheMu.RLock()
 	if cached, ok := endCityCache[key]; ok {
-		endCityCacheMu.Unlock()
+		endCityCacheMu.RUnlock()
 		return cached
 	}
-	endCityCacheMu.Unlock()
+	endCityCacheMu.RUnlock()
 
 	def := sets.Structures["minecraft:end_city"]
 	if def == nil {
 		return nil
 	}
-	r := worldgen.NewLegacy(0)
+	var r worldgen.Legacy
 	r.SetLargeFeatureSeed(seed, int(cx), int(cz))
 	rot := int(r.NextIntN(4))
 	pos, minY := endCityLowestY(od, cx, cz, rot)
 	var start *EndCityStart
 	if minY >= 60 && isStructureBiomeAllowed(od, sets, def, pos[0], pos[1], pos[2]) {
-		start = BuildEndCityStart(cx, cz, pos, rot, r)
+		start = BuildEndCityStart(cx, cz, pos, rot, &r)
 	}
 	endCityCacheMu.Lock()
-	if len(endCityCache) > 256 {
-		endCityCache = make(map[endCityCacheKey]*EndCityStart)
+	if len(endCityCache) >= maxEndCityCacheEntries {
+		clear(endCityCache)
 	}
 	endCityCache[key] = start
 	endCityCacheMu.Unlock()

@@ -42,10 +42,15 @@ type netherStructureCacheKey struct {
 	sx, sz int32
 }
 
+const (
+	maxNetherFossilCacheEntries   = 256
+	maxNetherFortressCacheEntries = 128
+)
+
 var (
-	netherFossilCacheMu   sync.Mutex
+	netherFossilCacheMu   sync.RWMutex
 	netherFossilCache     = make(map[netherStructureCacheKey]*NetherFossilStub)
-	netherFortressCacheMu sync.Mutex
+	netherFortressCacheMu sync.RWMutex
 	netherFortressCache   = make(map[netherStructureCacheKey]*NetherFortressStart)
 )
 
@@ -60,24 +65,24 @@ func NetherFossilGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.S
 		return nil
 	}
 	key := netherStructureCacheKey{seed: seed, sx: sx, sz: sz}
-	netherFossilCacheMu.Lock()
+	netherFossilCacheMu.RLock()
 	if cached, ok := netherFossilCache[key]; ok {
-		netherFossilCacheMu.Unlock()
+		netherFossilCacheMu.RUnlock()
 		return cached
 	}
-	netherFossilCacheMu.Unlock()
+	netherFossilCacheMu.RUnlock()
 
 	def := sets.Structures["minecraft:nether_fossil"]
 	if def == nil {
 		return nil
 	}
-	r := worldgen.NewLegacy(0)
+	var r worldgen.Legacy
 	r.SetLargeFeatureSeed(seed, int(sx), int(sz))
-	stub := netherFossilVariantPoint(od, sets, seed, sx, sz, def, r)
+	stub := netherFossilVariantPoint(od, sets, seed, sx, sz, def, &r)
 
 	netherFossilCacheMu.Lock()
-	if len(netherFossilCache) >= 512 {
-		netherFossilCache = make(map[netherStructureCacheKey]*NetherFossilStub, 64)
+	if len(netherFossilCache) >= maxNetherFossilCacheEntries {
+		clear(netherFossilCache)
 	}
 	netherFossilCache[key] = stub
 	netherFossilCacheMu.Unlock()
@@ -144,9 +149,14 @@ func netherNoiseColumn(od *worldgen.OverworldDensity, x, z int) [128]uint16 {
 	fz := float64(z-baseZ) / 4.0
 	nInterp := len(od.Interpolated)
 	const netherCellsY = 128 / 8
+	var gridsBuf [8][2][netherCellsY + 1][2]float64
 	var grids [][2][netherCellsY + 1][2]float64
 	if nInterp > 0 {
-		grids = make([][2][netherCellsY + 1][2]float64, nInterp)
+		if nInterp <= len(gridsBuf) {
+			grids = gridsBuf[:nInterp]
+		} else {
+			grids = make([][2][netherCellsY + 1][2]float64, nInterp)
+		}
 		for dx := 0; dx <= 1; dx++ {
 			wx := float64(baseX + dx*4)
 			for iy := 0; iy <= netherCellsY; iy++ {
@@ -160,7 +170,13 @@ func netherNoiseColumn(od *worldgen.OverworldDensity, x, z int) [128]uint16 {
 			}
 		}
 	}
-	interp := make([]float64, nInterp)
+	var interpBuf [8]float64
+	var interp []float64
+	if nInterp <= len(interpBuf) {
+		interp = interpBuf[:nInterp]
+	} else {
+		interp = make([]float64, nInterp)
+	}
 	for y := 0; y < 128; y++ {
 		cy0 := y / 8
 		fy := float64(y%8) / 8.0
@@ -490,14 +506,14 @@ func nfIsOkBox(box msBox) bool {
 // validated fortress start chunk (sx, sz).
 func BuildNetherFortressStart(seed int64, sx, sz int32) *NetherFortressStart {
 	key := netherStructureCacheKey{seed: seed, sx: sx, sz: sz}
-	netherFortressCacheMu.Lock()
+	netherFortressCacheMu.RLock()
 	if cached, ok := netherFortressCache[key]; ok {
-		netherFortressCacheMu.Unlock()
+		netherFortressCacheMu.RUnlock()
 		return cached
 	}
-	netherFortressCacheMu.Unlock()
+	netherFortressCacheMu.RUnlock()
 
-	r := worldgen.NewLegacy(0)
+	var r worldgen.Legacy
 	r.SetLargeFeatureSeed(seed, int(sx), int(sz))
 
 	startX := int(sx)*16 + 2
@@ -523,12 +539,12 @@ func BuildNetherFortressStart(seed int64, sx, sz int32) *NetherFortressStart {
 		state.castleWeights = append(state.castleWeights, &cp)
 	}
 
-	startPiece.addChildren(state, r)
+	startPiece.addChildren(state, &r)
 	for len(state.pending) > 0 {
 		idx := int(r.NextIntN(int32(len(state.pending))))
 		piece := state.pending[idx]
 		state.pending = append(state.pending[:idx], state.pending[idx+1:]...)
-		piece.addChildren(state, r)
+		piece.addChildren(state, &r)
 	}
 
 	// moveInsideHeights(r, 48, 70)
@@ -557,8 +573,8 @@ func BuildNetherFortressStart(seed int64, sx, sz int32) *NetherFortressStart {
 		Pieces: state.pieces,
 	}
 	netherFortressCacheMu.Lock()
-	if len(netherFortressCache) >= 256 {
-		netherFortressCache = make(map[netherStructureCacheKey]*NetherFortressStart, 64)
+	if len(netherFortressCache) >= maxNetherFortressCacheEntries {
+		clear(netherFortressCache)
 	}
 	netherFortressCache[key] = start
 	netherFortressCacheMu.Unlock()

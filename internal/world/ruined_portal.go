@@ -87,7 +87,7 @@ var (
 // chunk for the lifetime of the process. Eviction is arbitrary: a miss only
 // costs one rebuild, and the table is keyed by density graph and seed so two
 // engines never share entries they did not generate themselves.
-const preCarveCacheLimit = 256
+const preCarveCacheLimit = 64
 
 // preCarveTerrainFor returns the noise+surface terrain for one chunk with
 // carving deliberately skipped: structure placement runs before carvers in
@@ -113,7 +113,8 @@ func preCarveTerrainFor(od *worldgen.OverworldDensity, seed int64, cx, cz int32)
 	if isNetherDensity(od) {
 		base = generateNetherBaseTerrain(od, nil, seed, cx, cz)
 	} else {
-		_, fluidPicker, veins, _ := vanillaGeneratorInputs(seed)
+		fluidPicker := worldgen.OverworldFluidPicker(od.SeaLevel)
+		veins := worldgen.NewOreVeinifier(od)
 		base = generateBaseTerrain(od, fluidPicker, veins, nil, seed, cx, cz)
 	}
 
@@ -142,18 +143,23 @@ func prunePreCarveCacheLocked() {
 	}
 }
 
+const maxTemplateCacheEntries = 256
+
 var (
-	templateCacheMu sync.Mutex
+	templateCacheMu sync.RWMutex
 	templateCache   = map[string][]worldgen.TemplateBlockInfo{}
 	templateSizes   = map[string][3]int{}
 )
 
 func loadTemplateCached(name string) ([]worldgen.TemplateBlockInfo, [3]int, error) {
-	templateCacheMu.Lock()
-	defer templateCacheMu.Unlock()
+	templateCacheMu.RLock()
 	if blocks, ok := templateCache[name]; ok {
-		return blocks, templateSizes[name], nil
+		size := templateSizes[name]
+		templateCacheMu.RUnlock()
+		return blocks, size, nil
 	}
+	templateCacheMu.RUnlock()
+
 	raw, err := worldgen.EmbeddedStructureTemplate(name)
 	if err != nil {
 		return nil, [3]int{}, err
@@ -165,8 +171,14 @@ func loadTemplateCached(name string) ([]worldgen.TemplateBlockInfo, [3]int, erro
 	if err != nil {
 		return nil, [3]int{}, err
 	}
+	templateCacheMu.Lock()
+	if len(templateCache) >= maxTemplateCacheEntries {
+		clear(templateCache)
+		clear(templateSizes)
+	}
 	templateCache[name] = blocks
 	templateSizes[name] = size
+	templateCacheMu.Unlock()
 	return blocks, size, nil
 }
 
@@ -200,10 +212,16 @@ func RuinedPortalGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.S
 	if set == nil || !set.IsStartChunk(seed, sx, sz) {
 		return nil, nil
 	}
-	random := worldgen.NewLegacy(0)
+	var random worldgen.Legacy
 	random.SetLargeFeatureSeed(seed, int(sx), int(sz))
 
-	indices := make([]int, len(set.Structures))
+	var indicesBuf [16]int
+	var indices []int
+	if len(set.Structures) <= len(indicesBuf) {
+		indices = indicesBuf[:len(set.Structures)]
+	} else {
+		indices = make([]int, len(set.Structures))
+	}
 	for i := range indices {
 		indices[i] = i
 	}
@@ -233,9 +251,9 @@ func RuinedPortalGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.S
 		// GenerationContext.random() is lazy: every attempt reseeds a fresh
 		// Legacy stream from the same formula instead of continuing the
 		// previous attempt's stream.
-		variantRandom := worldgen.NewLegacy(0)
+		var variantRandom worldgen.Legacy
 		variantRandom.SetLargeFeatureSeed(seed, int(sx), int(sz))
-		stub := ruinedPortalVariantPoint(od, sets, seed, sx, sz, def, variantRandom)
+		stub := ruinedPortalVariantPoint(od, sets, seed, sx, sz, def, &variantRandom)
 		if stub != nil {
 			return stub, nil
 		}
