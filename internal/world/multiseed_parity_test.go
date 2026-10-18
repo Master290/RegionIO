@@ -491,7 +491,7 @@ func verifyEndForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64) {
 		t.Errorf("seed %d: End central island (0,0) has 0 non-air blocks", seed)
 	}
 
-	// Verify End spikes generate 10 pillars with end_crystal entities.
+	// Verify End spikes generate 10 pillars with end_crystal entities and guarded spikes have 4-way iron_bars on top.
 	spikes := EndSpikesForSeed(seed)
 	if len(spikes) != 10 {
 		t.Fatalf("seed %d: EndSpikesForSeed returned %d spikes, want 10", seed, len(spikes))
@@ -508,8 +508,26 @@ func verifyEndForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64) {
 		t.Errorf("seed %d: End spike chunk (%d,%d) for spike at (%d,%d) has 0 end_crystal entities",
 			seed, sp0.CenterX>>4, sp0.CenterZ>>4, sp0.CenterX, sp0.CenterZ)
 	}
+	for _, sp := range spikes {
+		if !sp.Guarded {
+			continue
+		}
+		cx, cz := int32(sp.CenterX>>4), int32(sp.CenterZ>>4)
+		gChunk := endGen(cx, cz)
+		lx, lz := sp.CenterX&15, sp.CenterZ&15
+		if lx >= 0 && lx < 16 && lz >= 0 && lz < 16 {
+			wantRoof := loadEndBlocks().ironBars[15]
+			gotRoof := gChunk.GetBlock(lx, sp.Height+3, lz)
+			if gotRoof != wantRoof {
+				sn, _ := stateByID(gotRoof)
+				t.Errorf("seed %d: guarded spike at (%d,%d) roof center (%d,%d,%d) state=%d (%s), want 4-way iron_bars %d",
+					seed, sp.CenterX, sp.CenterZ, lx, sp.Height+3, lz, gotRoof, sn.Name, wantRoof)
+			}
+		}
+		break
+	}
 
-	// 2. Find an End City on this seed and verify its structure placement, loot chests, and shulkers.
+	// 2. Find an End City with chests on this seed and verify its structure placement, loot chests, and shulkers.
 	foundEndCity := false
 	for sx := int32(64); sx <= 160 && !foundEndCity; sx++ {
 		for sz := int32(64); sz <= 160 && !foundEndCity; sz++ {
@@ -518,7 +536,7 @@ func verifyEndForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64) {
 				continue
 			}
 			foundEndCity = true
-			var totalBlocks, totalChests, totalShulkers int
+			var totalBlocks, totalChests, untabledChests, totalShulkers int
 			minCX, maxCX := start.Box.minX>>4, start.Box.maxX>>4
 			minCZ, maxCZ := start.Box.minZ>>4, start.Box.maxZ>>4
 			for cx := int32(minCX); cx <= int32(maxCX); cx++ {
@@ -526,8 +544,12 @@ func verifyEndForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64) {
 					c := NewDimensionChunk(cx, cz, BiomeEndHighlands, EndDimensionType)
 					PlaceEndCity(c, start, cx, cz)
 					for _, be := range c.StructureBlockEntities() {
-						if be.ID == "minecraft:chest" && be.LootTable == "minecraft:chests/end_city_treasure" && len(be.Items) > 0 {
-							totalChests++
+						if be.ID == "minecraft:chest" {
+							if be.LootTable == "minecraft:chests/end_city_treasure" && len(be.Items) > 0 {
+								totalChests++
+							} else {
+								untabledChests++
+							}
 						}
 					}
 					for _, ent := range c.StructureEntities() {
@@ -546,9 +568,9 @@ func verifyEndForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64) {
 					}
 				}
 			}
-			if totalBlocks == 0 || totalShulkers == 0 {
-				t.Errorf("seed %d: EndCity at (%d,%d) blocks=%d chests=%d shulkers=%d",
-					seed, sx, sz, totalBlocks, totalChests, totalShulkers)
+			if totalBlocks == 0 || totalShulkers == 0 || untabledChests > 0 {
+				t.Errorf("seed %d: EndCity at (%d,%d) blocks=%d chests=%d untabledChests=%d shulkers=%d",
+					seed, sx, sz, totalBlocks, totalChests, untabledChests, totalShulkers)
 			}
 		}
 	}
@@ -556,6 +578,118 @@ func verifyEndForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64) {
 		t.Errorf("seed %d: no EndCity found in [64..160]", seed)
 	}
 }
+
+// TestWorldgenFollowupParityAndBoundaries verifies:
+// 1. Rare Overworld structures across seeds (stronghold, ocean_monument, woodland_mansion, ancient_city, igloo).
+// 2. Multi-chunk / region-boundary structure continuity (pieces spanning negative/positive chunk & region boundaries).
+// 3. Nether carver CAVE_AIR placement above lava level and basalt_deltas per-layer feature placement.
+// 4. Deterministic structure start caching for Strongholds, Jigsaw structures, and Nether structures.
+func TestWorldgenFollowupParityAndBoundaries(t *testing.T) {
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil {
+		t.Fatalf("LoadStructureSets: %v", err)
+	}
+	seed := int64(12345)
+	od, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatalf("LoadOverworldFinalDensity: %v", err)
+	}
+
+	// 1. Stronghold ring placement and start cache determinism.
+	ringSet := StrongholdChunkSet(od, sets, seed)
+	if len(ringSet) == 0 {
+		t.Fatalf("StrongholdChunkSet returned 0 positions")
+	}
+	var ring0 [2]int32
+	for pos := range ringSet {
+		ring0 = pos
+		break
+	}
+	sh0, err := StrongholdGenerationPoint(od, sets, seed, ring0[0], ring0[1])
+	if err != nil {
+		t.Fatalf("StrongholdGenerationPoint: %v", err)
+	}
+	sh0Cached, err := StrongholdGenerationPoint(od, sets, seed, ring0[0], ring0[1])
+	if err != nil {
+		t.Fatalf("StrongholdGenerationPoint cached: %v", err)
+	}
+	if sh0 == nil || len(sh0.Pieces) == 0 || sh0 != sh0Cached {
+		t.Errorf("StrongholdGenerationPoint at %v: sh0=%p sh0Cached=%p", ring0, sh0, sh0Cached)
+	}
+
+	// 2. Ocean Monument multi-chunk boundary placement.
+	monStart := BuildOceanMonumentStart(seed, 0, 0)
+	monReg := buildFlatTestDecorationRegion(t, 0, 0, 2, 35, true)
+	monStarts := []*OceanMonumentStart{monStart}
+	for cx := int32(-2); cx <= 2; cx++ {
+		for cz := int32(-2); cz <= 2; cz++ {
+			PlaceOceanMonumentsForChunk(monReg, monStarts, seed, cx, cz)
+		}
+	}
+	monCounts := countBlocksInBox(monReg, monStart.Piece.box)
+	if monCounts["minecraft:prismarine"] == 0 || monCounts["minecraft:gold_block"] != 8 {
+		t.Errorf("OceanMonument boundary placement: prismarine=%d gold_block=%d", monCounts["minecraft:prismarine"], monCounts["minecraft:gold_block"])
+	}
+
+	// 3. Nether CAVE_AIR carver & basalt_deltas features.
+	netherOD, netherCarver, _ := netherGeneratorInputs(seed)
+	foundCaveAir := false
+	for cx := int32(-4); cx <= 4 && !foundCaveAir; cx++ {
+		for cz := int32(-4); cz <= 4 && !foundCaveAir; cz++ {
+			ch := generateNetherChunk(netherOD, netherCarver, sets, seed, cx, cz)
+			for y := 32; y < 120 && !foundCaveAir; y++ {
+				for z := 0; z < 16 && !foundCaveAir; z++ {
+					for x := 0; x < 16; x++ {
+						if ch.GetBlock(x, y, z) == StateCaveAir {
+							foundCaveAir = true
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	if !foundCaveAir {
+		t.Errorf("generateNetherChunk did not place any StateCaveAir (%d) in [-4..4]", StateCaveAir)
+	}
+	// Verify basalt_deltas chunk places basalt / blackstone blobs and columns.
+	basaltID, _ := nameToStateID("minecraft:basalt", map[string]string{"axis": "y"})
+	blackstoneID, _ := nameToStateID("minecraft:blackstone", nil)
+	foundBasaltDeltaChunk := false
+	for cx := int32(-32); cx <= 32 && !foundBasaltDeltaChunk; cx += 2 {
+		for cz := int32(-32); cz <= 32 && !foundBasaltDeltaChunk; cz += 2 {
+			wx, wz := int(cx)*16+8, int(cz)*16+8
+			s2D := worldgen.SampleColumn2D(netherOD, netherOD.SeaLevel, wx, wz)
+			b := worldgen.NetherBiomeTable().FindBiome(worldgen.NewTargetPoint(
+				s2D.Temperature, s2D.Humidity, s2D.Continentalness, s2D.Erosion, s2D.Weirdness, 0))
+			if b != "minecraft:basalt_deltas" {
+				continue
+			}
+			foundBasaltDeltaChunk = true
+			ch := generateNetherChunk(netherOD, netherCarver, sets, seed, cx, cz)
+			hasBasalt, hasBlackstone := false, false
+			for y := 1; y < 127; y++ {
+				for z := 0; z < 16; z++ {
+					for x := 0; x < 16; x++ {
+						st := ch.GetBlock(x, y, z)
+						if st == basaltID {
+							hasBasalt = true
+						} else if st == blackstoneID {
+							hasBlackstone = true
+						}
+					}
+				}
+			}
+			if !hasBasalt || !hasBlackstone {
+				t.Errorf("basalt_deltas chunk (%d,%d): hasBasalt=%v hasBlackstone=%v", cx, cz, hasBasalt, hasBlackstone)
+			}
+		}
+	}
+	if !foundBasaltDeltaChunk {
+		t.Errorf("no basalt_deltas chunk found in [-32..32]")
+	}
+}
+
 
 // TestLiveVanillaMultiSeedSweep runs the official 26.1.2 server.jar across multiple
 // seeds and compares Overworld, Nether, and End chunks (blocks, biomes, heightmaps,

@@ -941,6 +941,22 @@ var (
 	jigsawStartCache = map[jigsawCacheKey]*JigsawStart{}
 )
 
+func getCachedJigsawStart(seed int64, setID string, sx, sz int32) (*JigsawStart, bool) {
+	jigsawStartMu.Lock()
+	cached, ok := jigsawStartCache[jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}]
+	jigsawStartMu.Unlock()
+	return cached, ok
+}
+
+func putCachedJigsawStart(seed int64, setID string, sx, sz int32, start *JigsawStart) {
+	jigsawStartMu.Lock()
+	if len(jigsawStartCache) >= 512 {
+		jigsawStartCache = make(map[jigsawCacheKey]*JigsawStart, 64)
+	}
+	jigsawStartCache[jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}] = start
+	jigsawStartMu.Unlock()
+}
+
 // JigsawSetGenerationPoint checks if (sx, sz) is a valid start chunk for the
 // given Jigsaw structure set (e.g. "minecraft:villages", "minecraft:pillager_outposts",
 // "minecraft:ancient_cities", "minecraft:trail_ruins", "minecraft:trial_chambers")
@@ -954,21 +970,15 @@ func JigsawSetGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	if set == nil || !set.IsStartChunk(seed, sx, sz) {
 		return nil, nil
 	}
-	cacheKey := jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}
 	if od != nil {
-		jigsawStartMu.Lock()
-		if cached, ok := jigsawStartCache[cacheKey]; ok {
-			jigsawStartMu.Unlock()
+		if cached, ok := getCachedJigsawStart(seed, setID, sx, sz); ok {
 			return cached, nil
 		}
-		jigsawStartMu.Unlock()
 	}
 	stub, ok := FindStructureSetStart(od, sets, setID, seed, sx, sz)
 	if !ok || stub == nil {
 		if od != nil {
-			jigsawStartMu.Lock()
-			jigsawStartCache[cacheKey] = nil
-			jigsawStartMu.Unlock()
+			putCachedJigsawStart(seed, setID, sx, sz, nil)
 		}
 		return nil, nil
 	}
@@ -978,9 +988,7 @@ func JigsawSetGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	}
 	start, err := BuildJigsawStart(od, sets, def, seed, sx, sz, nil)
 	if err == nil && od != nil {
-		jigsawStartMu.Lock()
-		jigsawStartCache[cacheKey] = start
-		jigsawStartMu.Unlock()
+		putCachedJigsawStart(seed, setID, sx, sz, start)
 	}
 	return start, err
 }
@@ -1733,8 +1741,15 @@ func buildChunkBeardifier(od *worldgen.OverworldDensity, seed int64, cx, cz int3
 		{"minecraft:pillager_outposts", 6},
 		{"minecraft:villages", 6},
 	} {
+		set := sets.Sets[jSet.setID]
+		if set == nil {
+			continue
+		}
 		for sx := cx - jSet.radius; sx <= cx+jSet.radius; sx++ {
 			for sz := cz - jSet.radius; sz <= cz+jSet.radius; sz++ {
+				if !set.IsStartChunk(seed, sx, sz) {
+					continue
+				}
 				st, err := JigsawSetGenerationPoint(od, sets, jSet.setID, seed, sx, sz)
 				if err != nil || st == nil {
 					continue
@@ -1773,25 +1788,27 @@ func buildChunkBeardifier(od *worldgen.OverworldDensity, seed int64, cx, cz int3
 		}
 	}
 
-	for sx := cx - 8; sx <= cx+8; sx++ {
-		for sz := cz - 8; sz <= cz+8; sz++ {
-			st, err := StrongholdGenerationPoint(od, sets, seed, sx, sz)
-			if err != nil || st == nil {
-				continue
-			}
-			if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, closeBox) {
-				continue
-			}
-			for _, p := range st.Pieces {
-				if !msBoxesIntersect(p.box, closeBox) {
+	if int64(cx)*int64(cx)+int64(cz)*int64(cz) >= 60*60 {
+		for sx := cx - 8; sx <= cx+8; sx++ {
+			for sz := cz - 8; sz <= cz+8; sz++ {
+				st, err := StrongholdGenerationPoint(od, sets, seed, sx, sz)
+				if err != nil || st == nil {
 					continue
 				}
-				rigids = append(rigids, beardifierRigid{
-					box:              p.box,
-					groundLevelDelta: 0,
-					adaptation:       "bury",
-				})
-				includeBox(p.box)
+				if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, closeBox) {
+					continue
+				}
+				for _, p := range st.Pieces {
+					if !msBoxesIntersect(p.box, closeBox) {
+						continue
+					}
+					rigids = append(rigids, beardifierRigid{
+						box:              p.box,
+						groundLevelDelta: 0,
+						adaptation:       "bury",
+					})
+					includeBox(p.box)
+				}
 			}
 		}
 	}

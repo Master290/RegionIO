@@ -215,6 +215,16 @@ type StrongholdStart struct {
 	PortalRoom *shPiece
 }
 
+type strongholdStartCacheKey struct {
+	seed   int64
+	sx, sz int32
+}
+
+var (
+	strongholdStartCacheMu sync.Mutex
+	strongholdStartCache   = make(map[strongholdStartCacheKey]*StrongholdStart)
+)
+
 // StrongholdGenerationPoint replays StrongholdStructure.findValidGenerationPoint
 // and StrongholdStructure.generatePieces for chunk (sx, sz).
 func StrongholdGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, sx, sz int32) (*StrongholdStart, error) {
@@ -230,14 +240,35 @@ func StrongholdGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Str
 	if !ringSet[[2]int32{sx, sz}] {
 		return nil, nil
 	}
+	key := strongholdStartCacheKey{seed: seed, sx: sx, sz: sz}
+	if od != nil {
+		strongholdStartCacheMu.Lock()
+		if cached, ok := strongholdStartCache[key]; ok {
+			strongholdStartCacheMu.Unlock()
+			return cached, nil
+		}
+		strongholdStartCacheMu.Unlock()
+	}
 	def := sets.Structures["minecraft:stronghold"]
 	if def == nil {
 		return nil, nil
 	}
 	if od != nil && !isStructureBiomeAllowed(od, sets, def, int(sx)*16, 0, int(sz)*16) {
+		strongholdStartCacheMu.Lock()
+		strongholdStartCache[key] = nil
+		strongholdStartCacheMu.Unlock()
 		return nil, nil
 	}
-	return BuildStrongholdStart(seed, sx, sz), nil
+	start := BuildStrongholdStart(seed, sx, sz)
+	if od != nil {
+		strongholdStartCacheMu.Lock()
+		if len(strongholdStartCache) >= 128 {
+			strongholdStartCache = make(map[strongholdStartCacheKey]*StrongholdStart, 32)
+		}
+		strongholdStartCache[key] = start
+		strongholdStartCacheMu.Unlock()
+	}
+	return start, nil
 }
 
 // BuildStrongholdStart runs StrongholdStructure.generatePieces directly for
