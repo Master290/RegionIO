@@ -16,9 +16,12 @@ import (
 
 // Serverbound player_action status values (protocol 775).
 const (
-	PlayerActionStartDestroyBlock = 0
-	PlayerActionAbortDestroyBlock = 1
-	PlayerActionStopDestroyBlock  = 2
+	PlayerActionStartDestroyBlock   = 0
+	PlayerActionAbortDestroyBlock   = 1
+	PlayerActionStopDestroyBlock    = 2
+	PlayerActionDropAllItems        = 3
+	PlayerActionDropItem            = 4
+	PlayerActionSwapItemWithOffHand = 6
 )
 
 // Serverbound client_command action values (protocol 775).
@@ -419,25 +422,6 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 				}
 			}
 		}
-		return true, 0
-	}
-
-	if world.IsIceBlock(prevState) {
-		droppedIce, _ := s.BreakIceBlock(dim, x, y, z, heldStack, toolMeta, mode == GameModeCreative)
-		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
-		s.OnSculkBlockBroken(dim, x, y, z, prevState)
-		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:ice")
-		if mode == GameModeSurvival {
-			s.RecordBlockBreakExhaustion(session)
-			s.RecordBlockMined(session, "minecraft:ice")
-			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
-				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
-				if s.DamagePlayerItem(session, heldSlot, 1) {
-					s.RecordItemBroken(session, heldStack.ResolvedID())
-				}
-			}
-		}
-		_ = droppedIce
 		return true, 0
 	}
 
@@ -1177,6 +1161,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		s.OnPlayerDiedWithEffects(session)
 		s.DespawnPlayerFishingBobber(session)
 		s.DismountPlayerVehicle(session)
+		_ = s.CloseContainer(session, 0, true)
 		st := getSurvivalState(session)
 		st.mu.Lock()
 		st.dead = true
@@ -3546,3 +3531,408 @@ func (s *Server) StepPlayerPowderSnow(session *PlayerSession) (ticksFrozen int, 
 	}
 	return nextFrozen, frozen
 }
+
+// DropSelectedItem drops 1 item (dropAll == false, Q) or the entire held stack
+// (dropAll == true, Ctrl+Q) from session's selected hotbar slot into the world
+// in front of the player, preserving metadata and recording drop statistics.
+func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, world.ItemStack) {
+	if s == nil || session == nil || session.IsDead() {
+		return 0, world.ItemStack{}
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return 0, world.ItemStack{}
+	}
+	invSlot := session.HeldInventorySlot()
+	if invSlot < 0 || invSlot >= world.PlayerInventorySlots {
+		return 0, world.ItemStack{}
+	}
+	cur := session.InventorySlot(invSlot)
+	if cur.IsEmpty() {
+		return 0, world.ItemStack{}
+	}
+	dropCount := int32(1)
+	if dropAll || cur.Count <= 1 {
+		dropCount = cur.Count
+	}
+	dropped := world.NewItemStack(cur.ResolvedItemID(), dropCount)
+
+	rem := cur.Count - dropCount
+	if rem <= 0 {
+		session.SetInventorySlot(invSlot, world.ItemStack{})
+		SetSlotItemMeta(session, invSlot, ItemMeta{})
+		SetSlotPotionType(session, invSlot, "")
+		SetSlotArmorTrim(session, invSlot, ArmorTrim{})
+		ClearSlotBannerMeta(session, invSlot)
+	} else {
+		session.SetInventorySlot(invSlot, world.NewItemStack(cur.ResolvedItemID(), rem))
+	}
+
+	if session.send != nil {
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), invSlot, session.InventorySlot(invSlot)))
+	}
+	s.TriggerInventoryChanged(session)
+
+	yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
+	pitchRad := float64(snap.Pitch) * (math.Pi / 180.0)
+	dirX := -math.Sin(yawRad) * math.Cos(pitchRad)
+	dirZ := math.Cos(yawRad) * math.Cos(pitchRad)
+	spawnX := snap.X + dirX*0.3
+	spawnY := snap.Y + 1.3
+	spawnZ := snap.Z + dirZ*0.3
+
+	dim := world.NormalizeDimension(snap.Dimension)
+	entID, _ := s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, dropped)
+	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)
+	return entID, dropped
+}
+
+// SwapHeldWithOffhand swaps the player's currently selected hotbar slot with
+// OffHandContainerSlot (slot 45), preserving all item metadata/components and
+// broadcasting updated equipment to nearby players.
+func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	if session.Snapshot().GameMode == GameModeSpectator {
+		return false
+	}
+	mainSlot := session.HeldInventorySlot()
+	if mainSlot < 0 || mainSlot >= world.PlayerInventorySlots {
+		return false
+	}
+	offSlot := OffHandContainerSlot
+	mainStack := session.InventorySlot(mainSlot)
+	offStack := session.InventorySlot(offSlot)
+	if mainStack.IsEmpty() && offStack.IsEmpty() {
+		return false
+	}
+
+	mainMeta := GetSlotItemMeta(session, mainSlot)
+	offMeta := GetSlotItemMeta(session, offSlot)
+	mainPotion := GetSlotPotionType(session, mainSlot)
+	offPotion := GetSlotPotionType(session, offSlot)
+	mainTrim, _ := GetSlotArmorTrim(session, mainSlot)
+	offTrim, _ := GetSlotArmorTrim(session, offSlot)
+	mainStar, hasMainStar := GetSlotFireworkStar(session, mainSlot)
+	offStar, hasOffStar := GetSlotFireworkStar(session, offSlot)
+	mainFW, hasMainFW := GetSlotFireworks(session, mainSlot)
+	offFW, hasOffFW := GetSlotFireworks(session, offSlot)
+	mainBanner := GetSlotBannerPatterns(session, mainSlot)
+	offBanner := GetSlotBannerPatterns(session, offSlot)
+
+	session.SetInventorySlot(mainSlot, offStack)
+	session.SetInventorySlot(offSlot, mainStack)
+	SetSlotItemMeta(session, mainSlot, offMeta)
+	SetSlotItemMeta(session, offSlot, mainMeta)
+	SetSlotPotionType(session, mainSlot, offPotion)
+	SetSlotPotionType(session, offSlot, mainPotion)
+	SetSlotArmorTrim(session, mainSlot, offTrim)
+	SetSlotArmorTrim(session, offSlot, mainTrim)
+	if hasOffStar {
+		SetSlotFireworkStar(session, mainSlot, offStar)
+	} else {
+		ClearSlotFireworkStar(session, mainSlot)
+	}
+	if hasMainStar {
+		SetSlotFireworkStar(session, offSlot, mainStar)
+	} else {
+		ClearSlotFireworkStar(session, offSlot)
+	}
+	if hasOffFW {
+		SetSlotFireworks(session, mainSlot, offFW)
+	} else {
+		ClearSlotFireworks(session, mainSlot)
+	}
+	if hasMainFW {
+		SetSlotFireworks(session, offSlot, mainFW)
+	} else {
+		ClearSlotFireworks(session, offSlot)
+	}
+	SetSlotBannerPatterns(session, mainSlot, offBanner)
+	SetSlotBannerPatterns(session, offSlot, mainBanner)
+
+	if session.send != nil {
+		stateID := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, mainSlot, offStack))
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, offSlot, mainStack))
+	}
+	s.TriggerInventoryChanged(session)
+	return true
+}
+
+func pickBlockItemName(state uint16) string {
+	bname := world.BlockName(state)
+	if bname == "" || bname == "minecraft:air" || bname == "minecraft:cave_air" || bname == "minecraft:void_air" {
+		return ""
+	}
+	switch bname {
+	case "minecraft:redstone_wire":
+		return "minecraft:redstone"
+	case "minecraft:wheat":
+		return "minecraft:wheat_seeds"
+	case "minecraft:carrots":
+		return "minecraft:carrot"
+	case "minecraft:potatoes":
+		return "minecraft:potato"
+	case "minecraft:beetroots":
+		return "minecraft:beetroot_seeds"
+	case "minecraft:melon_stem", "minecraft:attached_melon_stem":
+		return "minecraft:melon_seeds"
+	case "minecraft:pumpkin_stem", "minecraft:attached_pumpkin_stem":
+		return "minecraft:pumpkin_seeds"
+	case "minecraft:sweet_berry_bush":
+		return "minecraft:sweet_berries"
+	case "minecraft:cave_vines", "minecraft:cave_vines_plant":
+		return "minecraft:glow_berries"
+	case "minecraft:kelp_plant":
+		return "minecraft:kelp"
+	case "minecraft:tall_seagrass":
+		return "minecraft:seagrass"
+	case "minecraft:bamboo_sapling":
+		return "minecraft:bamboo"
+	case "minecraft:cocoa":
+		return "minecraft:cocoa_beans"
+	case "minecraft:tripwire":
+		return "minecraft:string"
+	case "minecraft:powder_snow":
+		return "minecraft:powder_snow_bucket"
+	case "minecraft:wall_torch":
+		return "minecraft:torch"
+	case "minecraft:soul_wall_torch":
+		return "minecraft:soul_torch"
+	case "minecraft:redstone_wall_torch":
+		return "minecraft:redstone_torch"
+	case "minecraft:copper_wall_torch":
+		return "minecraft:copper_torch"
+	case "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron":
+		return "minecraft:cauldron"
+	case "minecraft:piston_head", "minecraft:moving_piston":
+		return "minecraft:piston"
+	}
+	switch {
+	case strings.HasSuffix(bname, "_wall_sign"):
+		bname = strings.TrimSuffix(bname, "_wall_sign") + "_sign"
+	case strings.HasSuffix(bname, "_wall_hanging_sign"):
+		bname = strings.TrimSuffix(bname, "_wall_hanging_sign") + "_hanging_sign"
+	case strings.HasSuffix(bname, "_wall_banner"):
+		bname = strings.TrimSuffix(bname, "_wall_banner") + "_banner"
+	case strings.HasSuffix(bname, "_wall_head"):
+		bname = strings.TrimSuffix(bname, "_wall_head") + "_head"
+	case strings.HasSuffix(bname, "_wall_skull"):
+		bname = strings.TrimSuffix(bname, "_wall_skull") + "_skull"
+	}
+	if id, ok := world.ItemNameToID(bname); ok && id > 0 {
+		return bname
+	}
+	return ""
+}
+
+func pickEntityItemName(ent *world.Entity) string {
+	if ent == nil {
+		return ""
+	}
+	if ent.IsItem() && !ent.Item.IsEmpty() {
+		return ent.Item.ResolvedID()
+	}
+	typeName := canonicalResourceName(ent.TypeName)
+	if typeName == "" {
+		return ""
+	}
+	switch typeName {
+	case "minecraft:leash_knot":
+		return "minecraft:lead"
+	case "minecraft:armor_stand",
+		"minecraft:end_crystal",
+		"minecraft:item_frame",
+		"minecraft:glow_item_frame",
+		"minecraft:painting",
+		"minecraft:minecart",
+		"minecraft:chest_minecart",
+		"minecraft:furnace_minecart",
+		"minecraft:tnt_minecart",
+		"minecraft:hopper_minecart":
+		if id, ok := world.ItemNameToID(typeName); ok && id > 0 {
+			return typeName
+		}
+	}
+	if strings.HasSuffix(typeName, "_boat") || strings.HasSuffix(typeName, "_raft") {
+		if id, ok := world.ItemNameToID(typeName); ok && id > 0 {
+			return typeName
+		}
+	}
+	eggName := typeName + "_spawn_egg"
+	if id, ok := world.ItemNameToID(eggName); ok && id > 0 {
+		return eggName
+	}
+	return ""
+}
+
+// SelectOrPickItem implements vanilla middle-click item selection:
+// 1. If the item is already on the hotbar (slots 36..44), switch SelectedSlot to that hotbar slot.
+// 2. If the item is in the main inventory (slots 9..35), swap it into an empty hotbar slot (or the current SelectedSlot).
+// 3. In Creative mode, if the item is not in the inventory, place a 1-count stack into an empty hotbar slot (or SelectedSlot).
+func (s *Server) SelectOrPickItem(session *PlayerSession, itemName string) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return false
+	}
+	itemID, ok := world.ItemNameToID(itemName)
+	if !ok || itemID <= 0 {
+		return false
+	}
+
+	inv := session.Inventory()
+	// 1. Check hotbar (slots 36..44)
+	for hb := 0; hb < world.HotbarSlotCount; hb++ {
+		slot := world.HotbarContainerOffset + hb
+		if !inv[slot].IsEmpty() && inv[slot].ResolvedItemID() == itemID {
+			session.SetSelectedSlot(int32(hb))
+			if session.send != nil {
+				w := protocol.NewWriter(2)
+				w.VarInt(int32(hb))
+				_ = session.send(protocol.PlaySetHeldSlot, w.Bytes())
+			}
+			return true
+		}
+	}
+
+	targetHB := int(session.SelectedSlot())
+	if targetHB < 0 || targetHB >= world.HotbarSlotCount {
+		targetHB = 0
+	}
+	targetSlot := world.HotbarContainerOffset + targetHB
+	if !inv[targetSlot].IsEmpty() {
+		for hb := 0; hb < world.HotbarSlotCount; hb++ {
+			sSlot := world.HotbarContainerOffset + hb
+			if inv[sSlot].IsEmpty() {
+				targetHB = hb
+				targetSlot = sSlot
+				break
+			}
+		}
+	}
+
+	// 2. Check main inventory (slots 9..35)
+	for srcSlot := 9; srcSlot < world.HotbarContainerOffset; srcSlot++ {
+		if !inv[srcSlot].IsEmpty() && inv[srcSlot].ResolvedItemID() == itemID {
+			srcStack := inv[srcSlot]
+			dstStack := inv[targetSlot]
+			srcMeta := GetSlotItemMeta(session, srcSlot)
+			dstMeta := GetSlotItemMeta(session, targetSlot)
+			srcTrim, _ := GetSlotArmorTrim(session, srcSlot)
+			dstTrim, _ := GetSlotArmorTrim(session, targetSlot)
+
+			session.SetInventorySlot(targetSlot, srcStack)
+			session.SetInventorySlot(srcSlot, dstStack)
+			SetSlotItemMeta(session, targetSlot, srcMeta)
+			SetSlotItemMeta(session, srcSlot, dstMeta)
+			SetSlotArmorTrim(session, targetSlot, srcTrim)
+			SetSlotArmorTrim(session, srcSlot, dstTrim)
+
+			session.SetSelectedSlot(int32(targetHB))
+			if session.send != nil {
+				stateID := session.NextContainerStateID()
+				_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, targetSlot, srcStack))
+				_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, srcSlot, dstStack))
+				w := protocol.NewWriter(2)
+				w.VarInt(int32(targetHB))
+				_ = session.send(protocol.PlaySetHeldSlot, w.Bytes())
+			}
+			return true
+		}
+	}
+
+	// 3. Creative mode spawns the item into targetSlot.
+	if snap.GameMode == GameModeCreative {
+		newStack := world.NewItemStack(itemID, 1)
+		session.SetInventorySlot(targetSlot, newStack)
+		SetSlotItemMeta(session, targetSlot, ItemMeta{})
+		SetSlotArmorTrim(session, targetSlot, ArmorTrim{})
+		session.SetSelectedSlot(int32(targetHB))
+		if session.send != nil {
+			stateID := session.NextContainerStateID()
+			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, targetSlot, newStack))
+			w := protocol.NewWriter(2)
+			w.VarInt(int32(targetHB))
+			_ = session.send(protocol.PlaySetHeldSlot, w.Bytes())
+		}
+		return true
+	}
+	return false
+}
+
+// PickItemFromBlock handles middle-click block picking at (x, y, z).
+func (s *Server) PickItemFromBlock(session *PlayerSession, x, y, z int, includeData bool) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	cache := s.PlayerChunks(session)
+	if cache == nil {
+		return false
+	}
+	state := cache.GetBlock(x, y, z)
+	itemName := pickBlockItemName(state)
+	if itemName == "" {
+		return false
+	}
+	_ = includeData
+	return s.SelectOrPickItem(session, itemName)
+}
+
+// PickItemFromEntity handles middle-click entity picking for entityID.
+func (s *Server) PickItemFromEntity(session *PlayerSession, entityID int32, includeData bool) bool {
+	if s == nil || session == nil || s.entities == nil {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return false
+	}
+	itemName := pickEntityItemName(ent)
+	if itemName == "" {
+		return false
+	}
+	_ = includeData
+	return s.SelectOrPickItem(session, itemName)
+}
+
+// HandlePickItemFromBlockPacket decodes ServerboundPickItemFromBlockPacket (0x24):
+// Position(pos), Bool(includeData).
+func (s *Server) HandlePickItemFromBlockPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	x, y, z, err := r.Position()
+	if err != nil {
+		return err
+	}
+	includeData, err := r.Bool()
+	if err != nil {
+		return err
+	}
+	s.PickItemFromBlock(session, x, y, z, includeData)
+	return nil
+}
+
+// HandlePickItemFromEntityPacket decodes ServerboundPickItemFromEntityPacket (0x25):
+// VarInt(entityID), Bool(includeData).
+func (s *Server) HandlePickItemFromEntityPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	entityID, err := r.VarInt()
+	if err != nil {
+		return err
+	}
+	includeData, err := r.Bool()
+	if err != nil {
+		return err
+	}
+	s.PickItemFromEntity(session, entityID, includeData)
+	return nil
+}
+

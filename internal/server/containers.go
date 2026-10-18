@@ -1059,6 +1059,8 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
 			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 		}
+	case ContainerInputPickupAll:
+		applyPickupAllSlice(slots, &tr.carried, 0)
 	}
 
 	// Write back chest slots (0..26) and player inventory slots (27..62).
@@ -1070,6 +1072,77 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 	}
 	for i := 0; i < 9; i++ {
 		session.SetInventorySlot(36+i, slots[54+i])
+	}
+}
+
+// WearableArmorSlotForItem returns the player inventory armor slot index
+// (ArmorSlotHead..ArmorSlotFeet = 5..8) where itemID can be worn, or false if
+// itemID is not wearable in an armor slot.
+func WearableArmorSlotForItem(itemID string) (int, bool) {
+	norm := canonicalResourceName(itemID)
+	if stats, ok := ArmorItemStats(norm); ok {
+		return stats.Slot, true
+	}
+	switch norm {
+	case "minecraft:carved_pumpkin",
+		"minecraft:skeleton_skull",
+		"minecraft:wither_skeleton_skull",
+		"minecraft:player_head",
+		"minecraft:zombie_head",
+		"minecraft:creeper_head",
+		"minecraft:dragon_head",
+		"minecraft:piglin_head":
+		return ArmorSlotHead, true
+	case "minecraft:elytra":
+		return ArmorSlotChest, true
+	default:
+		return -1, false
+	}
+}
+
+// HasBindingCurseOnSlot reports whether session is in a non-Creative game mode
+// and the armor slot (5..8) holds an item enchanted with minecraft:binding_curse.
+func HasBindingCurseOnSlot(session *PlayerSession, slot int) bool {
+	if session == nil || slot < ArmorSlotHead || slot > ArmorSlotFeet {
+		return false
+	}
+	if session.Snapshot().GameMode == GameModeCreative {
+		return false
+	}
+	if session.InventorySlot(slot).IsEmpty() {
+		return false
+	}
+	return GetSlotItemMeta(session, slot).EnchantmentLevel("minecraft:binding_curse") > 0
+}
+
+func applyPickupAllSlice(slots []world.ItemStack, carried *world.ItemStack, minSlot int) {
+	if carried == nil || carried.IsEmpty() {
+		return
+	}
+	itemID := carried.ResolvedItemID()
+	maxStack := MaxItemStackSize
+	if MaxItemDurability(carried.ResolvedID()) > 0 || carried.ResolvedID() == "minecraft:enchanted_book" {
+		maxStack = 1
+	}
+	if carried.Count >= maxStack {
+		return
+	}
+	for i := minSlot; i < len(slots) && carried.Count < maxStack; i++ {
+		st := slots[i]
+		if st.IsEmpty() || st.ResolvedItemID() != itemID {
+			continue
+		}
+		space := maxStack - carried.Count
+		take := st.Count
+		if take > space {
+			take = space
+		}
+		*carried = world.NewItemStack(itemID, carried.Count+take)
+		if st.Count-take <= 0 {
+			slots[i] = world.ItemStack{}
+		} else {
+			slots[i] = world.NewItemStack(itemID, st.Count-take)
+		}
 	}
 }
 
@@ -1284,6 +1357,25 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
 			}
+		case ContainerInputThrow:
+			if !slots[slot].IsEmpty() {
+				dropCount := int32(1)
+				if button == 1 {
+					dropCount = slots[slot].Count
+				}
+				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+				rem := slots[slot].Count - dropCount
+				if rem <= 0 {
+					slots[slot] = world.ItemStack{}
+				} else {
+					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+				}
+				snap := session.Snapshot()
+				s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
+				s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+			}
+		case ContainerInputPickupAll:
+			applyPickupAllSlice(slots, &tr.carried, 1)
 		}
 	}
 
@@ -1343,6 +1435,14 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 		tr.invResult = world.ItemStack{}
 	}
 	slots := s.buildPlayerMenuSlots(session, tr.invCraft, tr.invResult)
+	metas := make([]ItemMeta, world.PlayerInventorySlots)
+	trims := make([]ArmorTrim, world.PlayerInventorySlots)
+	for i := 0; i < world.PlayerInventorySlots; i++ {
+		metas[i] = GetSlotItemMeta(session, i)
+		if t, ok := GetSlotArmorTrim(session, i); ok {
+			trims[i] = t
+		}
+	}
 
 	if slot == 0 {
 		_, matchedRec, _ := MatchCraftingGrid(slots[1:5], 2, 2)
@@ -1358,8 +1458,22 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			s.UnlockRecipeOnCraft(session, recName, crafted)
 		}
 	} else {
+		isArmorSlot := slot >= ArmorSlotHead && slot <= ArmorSlotFeet
 		switch mode {
 		case ContainerInputPickup:
+			if isArmorSlot {
+				if HasBindingCurseOnSlot(session, slot) && !slots[slot].IsEmpty() {
+					return
+				}
+				if !tr.carried.IsEmpty() {
+					if targetSlot, ok := WearableArmorSlotForItem(tr.carried.ResolvedID()); !ok || targetSlot != slot {
+						return
+					}
+					if !slots[slot].IsEmpty() && tr.carried.Count > 1 {
+						return
+					}
+				}
+			}
 			prevSlotEmpty := slots[slot].IsEmpty()
 			prevCarriedEmpty := tr.carried.IsEmpty()
 			var slotStar *FireworkExplosion
@@ -1381,8 +1495,34 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			if fw, ok := getCarriedFireworks(session); ok {
 				cFW = &fw
 			}
+			carriedMeta := GetCarriedItemMeta(session)
+			carriedTrim, _ := GetCarriedArmorTrim(session)
 
-			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+			if isArmorSlot && slots[slot].IsEmpty() && !tr.carried.IsEmpty() && tr.carried.Count > 1 {
+				slots[slot] = world.NewItemStack(tr.carried.ResolvedItemID(), 1)
+				metas[slot] = carriedMeta.Clone()
+				trims[slot] = carriedTrim
+				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), tr.carried.Count-1)
+			} else {
+				slotTrim := trims[slot]
+				slots[slot], metas[slot], tr.carried, carriedMeta = applyPickupSlotWithMeta(slots[slot], metas[slot], tr.carried, carriedMeta, button)
+				switch {
+				case prevSlotEmpty && !slots[slot].IsEmpty():
+					trims[slot] = carriedTrim
+					if tr.carried.IsEmpty() {
+						carriedTrim = ArmorTrim{}
+					}
+				case prevCarriedEmpty && !tr.carried.IsEmpty():
+					carriedTrim = slotTrim
+					if slots[slot].IsEmpty() {
+						trims[slot] = ArmorTrim{}
+					}
+				case !slots[slot].IsEmpty() && !tr.carried.IsEmpty() && slots[slot].ResolvedItemID() != tr.carried.ResolvedItemID():
+					trims[slot], carriedTrim = carriedTrim, slotTrim
+				}
+				SetCarriedItemMeta(session, carriedMeta)
+				SetCarriedArmorTrim(session, carriedTrim)
+			}
 
 			var newSlotStar *FireworkExplosion
 			var newSlotFW *FireworksComponent
@@ -1429,21 +1569,133 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 
 		case ContainerInputQuickMove:
 			if slot >= 1 && slot <= 4 {
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 36, 45)
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 9, 36)
-			} else if slot >= 9 && slot < 36 {
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 36, 45)
-			} else if slot >= 36 && slot < 45 {
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 9, 36)
+				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 36, 45)
+				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 9, 36)
+			} else if isArmorSlot {
+				if HasBindingCurseOnSlot(session, slot) {
+					return
+				}
+				movedTrim := trims[slot]
+				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 9, 36)
+				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 36, 45)
+				if slots[slot].IsEmpty() {
+					trims[slot] = ArmorTrim{}
+					if movedTrim.IsValid() {
+						for dst := 9; dst < 45; dst++ {
+							if !slots[dst].IsEmpty() && !trims[dst].IsValid() {
+								trims[dst] = movedTrim
+								break
+							}
+						}
+					}
+				}
+			} else if slot == OffHandContainerSlot {
+				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 9, 36)
+				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 36, 45)
+			} else if slot >= 9 && slot < 45 && !slots[slot].IsEmpty() {
+				if targetArmor, ok := WearableArmorSlotForItem(slots[slot].ResolvedID()); ok && slots[targetArmor].IsEmpty() {
+					slots[targetArmor] = world.NewItemStack(slots[slot].ResolvedItemID(), 1)
+					metas[targetArmor] = metas[slot].Clone()
+					trims[targetArmor] = trims[slot]
+					if slots[slot].Count <= 1 {
+						slots[slot] = world.ItemStack{}
+						metas[slot] = ItemMeta{}
+						trims[slot] = ArmorTrim{}
+					} else {
+						slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), slots[slot].Count-1)
+					}
+				} else if canonicalResourceName(slots[slot].ResolvedID()) == "minecraft:shield" && slots[OffHandContainerSlot].IsEmpty() {
+					slots[OffHandContainerSlot] = world.NewItemStack(slots[slot].ResolvedItemID(), 1)
+					metas[OffHandContainerSlot] = metas[slot].Clone()
+					if slots[slot].Count <= 1 {
+						slots[slot] = world.ItemStack{}
+						metas[slot] = ItemMeta{}
+					} else {
+						slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), slots[slot].Count-1)
+					}
+				} else if slot >= 9 && slot < 36 {
+					slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 36, 45)
+				} else if slot >= 36 && slot < 45 {
+					slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 9, 36)
+				}
 			}
 		case ContainerInputSwap:
+			targetIdx := -1
 			if button >= 0 && button < 9 {
-				hotbarIdx := 36 + int(button)
-				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+				targetIdx = 36 + int(button)
+			} else if button == 40 {
+				targetIdx = OffHandContainerSlot
+			}
+			if targetIdx >= 0 && targetIdx < world.PlayerInventorySlots {
+				if isArmorSlot {
+					if HasBindingCurseOnSlot(session, slot) {
+						return
+					}
+					if !slots[targetIdx].IsEmpty() {
+						if ws, ok := WearableArmorSlotForItem(slots[targetIdx].ResolvedID()); !ok || ws != slot || slots[targetIdx].Count > 1 {
+							return
+						}
+					}
+				}
+				slots[slot], slots[targetIdx] = slots[targetIdx], slots[slot]
+				metas[slot], metas[targetIdx] = metas[targetIdx], metas[slot]
+				trims[slot], trims[targetIdx] = trims[targetIdx], trims[slot]
 			}
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+			}
+		case ContainerInputThrow:
+			if isArmorSlot && HasBindingCurseOnSlot(session, slot) {
+				return
+			}
+			if !slots[slot].IsEmpty() {
+				dropCount := int32(1)
+				if button == 1 {
+					dropCount = slots[slot].Count
+				}
+				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+				rem := slots[slot].Count - dropCount
+				if rem <= 0 {
+					slots[slot] = world.ItemStack{}
+					metas[slot] = ItemMeta{}
+					trims[slot] = ArmorTrim{}
+				} else {
+					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+				}
+				snap := session.Snapshot()
+				s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
+				s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+			}
+		case ContainerInputPickupAll:
+			if !tr.carried.IsEmpty() && GetCarriedItemMeta(session).IsEmpty() {
+				itemID := tr.carried.ResolvedItemID()
+				maxStack := MaxItemStackSize
+				if MaxItemDurability(tr.carried.ResolvedID()) > 0 || tr.carried.ResolvedID() == "minecraft:enchanted_book" {
+					maxStack = 1
+				}
+				for i := 1; i < world.PlayerInventorySlots && tr.carried.Count < maxStack; i++ {
+					if i >= ArmorSlotHead && i <= ArmorSlotFeet && HasBindingCurseOnSlot(session, i) {
+						continue
+					}
+					st := slots[i]
+					if st.IsEmpty() || st.ResolvedItemID() != itemID || !metas[i].IsEmpty() {
+						continue
+					}
+					space := maxStack - tr.carried.Count
+					take := st.Count
+					if take > space {
+						take = space
+					}
+					tr.carried = world.NewItemStack(itemID, tr.carried.Count+take)
+					if st.Count-take <= 0 {
+						slots[i] = world.ItemStack{}
+						metas[i] = ItemMeta{}
+						trims[i] = ArmorTrim{}
+					} else {
+						slots[i] = world.NewItemStack(itemID, st.Count-take)
+					}
+				}
 			}
 		}
 	}
@@ -1479,6 +1731,17 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 	slots[0] = tr.invResult
 	for i := 0; i < world.PlayerInventorySlots; i++ {
 		session.SetInventorySlot(i, slots[i])
+		if slots[i].IsEmpty() {
+			SetSlotItemMeta(session, i, ItemMeta{})
+			ClearSlotArmorTrim(session, i)
+		} else {
+			SetSlotItemMeta(session, i, metas[i])
+			if trims[i].IsValid() {
+				SetSlotArmorTrim(session, i, trims[i])
+			} else {
+				ClearSlotArmorTrim(session, i)
+			}
+		}
 	}
 }
 

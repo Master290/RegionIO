@@ -636,6 +636,7 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)
 	s.DismountPlayerVehicle(session)
+	_ = s.CloseContainer(session, 0, false)
 	removed := false
 	s.playersMu.Lock()
 	if current := s.players[session.Profile.UUID]; current == session {

@@ -1240,6 +1240,26 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayPickItemFromBlockSB:
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandlePickItemFromBlockPacket(h.session, pkt.Body()); err != nil {
+				return err
+			}
+			h.heldSlot = h.session.SelectedSlot()
+			h.syncHotbarFromSession()
+		}
+		return nil
+
+	case protocol.PlayPickItemFromEntitySB:
+		if h.srv != nil && h.session != nil {
+			if err := h.srv.HandlePickItemFromEntityPacket(h.session, pkt.Body()); err != nil {
+				return err
+			}
+			h.heldSlot = h.session.SelectedSlot()
+			h.syncHotbarFromSession()
+		}
+		return nil
+
 	default:
 		h.log.Debug("play packet ignored", "id", pkt.ID)
 		return nil
@@ -1370,7 +1390,8 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	if status == server.PlayerActionReleaseUseItem {
+	switch status {
+	case server.PlayerActionReleaseUseItem:
 		if h.session != nil {
 			h.session.SetBlockingWithShield(false)
 		}
@@ -1379,6 +1400,30 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 			if h.srv.ReleaseProjectileWeapon(h.session) {
 				h.syncHotbarFromSession()
 			}
+		}
+		if r.Remaining() == 0 {
+			return nil
+		}
+	case server.PlayerActionDropAllItems, server.PlayerActionDropItem:
+		if h.srv != nil && h.session != nil {
+			invSlot := h.session.HeldInventorySlot()
+			if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+				h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+			}
+			h.srv.DropSelectedItem(h.session, status == server.PlayerActionDropAllItems)
+			h.syncHotbarFromSession()
+		}
+		if r.Remaining() == 0 {
+			return nil
+		}
+	case server.PlayerActionSwapItemWithOffHand:
+		if h.srv != nil && h.session != nil {
+			invSlot := h.session.HeldInventorySlot()
+			if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+				h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+			}
+			h.srv.SwapHeldWithOffhand(h.session)
+			h.syncHotbarFromSession()
 		}
 		if r.Remaining() == 0 {
 			return nil
@@ -1396,7 +1441,10 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	if status == server.PlayerActionReleaseUseItem {
+	if status == server.PlayerActionReleaseUseItem ||
+		status == server.PlayerActionDropAllItems ||
+		status == server.PlayerActionDropItem ||
+		status == server.PlayerActionSwapItemWithOffHand {
 		return h.sendBlockChangedAck(seq)
 	}
 
@@ -1614,10 +1662,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 
 			if world.IsBellBlock(clickedState) && !sneaking {
 				faceDir := server.BlockFaceDirectionName(face)
-				if world.CanRingBellFromDirection(clickedState, faceDir, float64(cursorY)) {
-					if h.srv.RingBellAt(dim, x, y, z, faceDir, h.session.EntityID, h.session) {
-						return h.sendBlockChangedAck(seq)
-					}
+				if h.srv.InteractBell(h.session, dim, x, y, z, faceDir, float64(cursorY)) {
+					h.srv.AwardCustomStat(h.session, server.StatBellRing, 1)
+					return h.sendBlockChangedAck(seq)
 				}
 			}
 			if world.IsCaveVinesBlock(clickedState) && world.BlockProperties(clickedState)["berries"] == "true" {

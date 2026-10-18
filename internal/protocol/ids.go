@@ -101,6 +101,7 @@ const (
 	PlayRespawn               = 0x52
 	PlayRemoveMobEffect       = 0x4e
 	PlaySelectAdvancementsTab = 0x55
+	PlaySetCamera             = 0x56
 	PlaySetExperience         = 0x67
 	PlayUpdateAdvancements    = 0x82
 	PlayUpdateMobEffect       = 0x84
@@ -179,6 +180,9 @@ const (
 	PlayMoveStatusOnly            = 0x21
 	PlayMoveVehicleSB             = 0x22
 	PlayPaddleBoatSB              = 0x23
+	PlayPickItemFromBlockSB       = 0x24
+	PlayPickItemFromEntitySB      = 0x25
+	PlayPlayerAbilitiesSB         = 0x26
 	PlayPlaceRecipe               = 0x27
 	PlayPlayerLoaded              = 0x2c
 	PlayPlayerAction              = 0x29
@@ -190,6 +194,7 @@ const (
 	PlaySeenAdvancements          = 0x32
 	PlaySelectTrade               = 0x33
 	PlaySignUpdate                = 0x3c
+	PlayTeleportToEntitySB        = 0x3d
 	PlayUseItemOn                 = 0x42
 	PlayUseItem                   = 0x43
 	PlaySetCreativeSlot           = 0x38
