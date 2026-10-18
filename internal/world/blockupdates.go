@@ -366,6 +366,7 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 		c.checkPoweredTNTAround(x, y, z, res)
 	}
 	c.checkCopperBulbsAround(x, y, z, res)
+	c.checkBellsAround(x, y, z, res)
 	return true
 }
 
@@ -401,6 +402,22 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	}
 	if IsCopperBarsBlock(state) {
 		return c.ResolveCopperBarsStateAt(x, y, z, state)
+	}
+	if IsBellBlock(state) {
+		if resolved, ok := c.EvaluateBellSurvivalAt(x, y, z, state); ok {
+			state = resolved
+		}
+		if c.IsBlockPowered(x, y, z) {
+			if updated, ok := withStateProperty(state, "powered", "true"); ok {
+				state = updated
+			}
+		}
+		return state
+	}
+	if IsPaleHangingMossBlock(state) {
+		if resolved, ok := c.EvaluatePaleHangingMossAt(x, y, z, state); ok {
+			return resolved
+		}
 	}
 	if IsCopperBulbBlock(state) {
 		if info, ok := stateByID(state); ok {
@@ -525,6 +542,9 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 	if IsCopperBulbBlock(newState) || IsCopperGolemStatueBlock(newState) || IsCopperBulbBlock(oldState) || IsCopperGolemStatueBlock(oldState) {
 		c.syncComparatorsAroundCopperBlock(x, y, z, res)
 	}
+
+	// Update bells around (x, y, z) on redstone rising/falling edges.
+	c.checkBellsAround(x, y, z, res)
 
 	// Check whether any TNT block at or near (x, y, z) is now powered by redstone.
 	c.checkPoweredTNTAround(x, y, z, res)
@@ -786,6 +806,22 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 
 	if IsCopperBarsBlock(state) {
 		return c.ResolveCopperBarsStateAt(x, y, z, state), true
+	}
+
+	if name == "minecraft:bell" {
+		return c.EvaluateBellSurvivalAt(x, y, z, state)
+	}
+
+	if name == "minecraft:vine" {
+		return c.EvaluateVineSupportAt(x, y, z, state)
+	}
+
+	if name == "minecraft:glow_lichen" {
+		return c.EvaluateGlowLichenSupportAt(x, y, z, state)
+	}
+
+	if name == "minecraft:pale_hanging_moss" {
+		return c.EvaluatePaleHangingMossAt(x, y, z, state)
 	}
 
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)
