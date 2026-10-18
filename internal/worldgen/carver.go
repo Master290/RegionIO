@@ -715,7 +715,7 @@ func (s *carveState) carveBlock(cfg *carverConfig, lx, by, lz, blockX, blockZ in
 		if !s.target.Replaceable(old) {
 			return
 		}
-		carved := blockAir
+		carved := blockCaveAir
 		if by <= s.c.minY+31 {
 			carved = blockLava
 		}
@@ -767,6 +767,7 @@ const (
 	blockGrass         uint16 = 9
 	blockMyceliumSnowy uint16 = 8918
 	blockMycelium      uint16 = 8919
+	blockCaveAir       uint16 = 12953
 )
 
 func isSurfaceTop(state uint16) bool {

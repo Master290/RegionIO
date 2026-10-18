@@ -37,6 +37,18 @@ type NetherFossilStub struct {
 	Box      msBox
 }
 
+type netherStructureCacheKey struct {
+	seed   int64
+	sx, sz int32
+}
+
+var (
+	netherFossilCacheMu   sync.Mutex
+	netherFossilCache     = make(map[netherStructureCacheKey]*NetherFossilStub)
+	netherFortressCacheMu sync.Mutex
+	netherFortressCache   = make(map[netherStructureCacheKey]*NetherFortressStart)
+)
+
 // NetherFossilGenerationPoint ports NetherFossilStructure.findGenerationPoint
 // for candidate chunk (sx, sz).
 func NetherFossilGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, sx, sz int32) *NetherFossilStub {
@@ -47,13 +59,29 @@ func NetherFossilGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.S
 	if set == nil || !set.IsStartChunk(seed, sx, sz) {
 		return nil
 	}
+	key := netherStructureCacheKey{seed: seed, sx: sx, sz: sz}
+	netherFossilCacheMu.Lock()
+	if cached, ok := netherFossilCache[key]; ok {
+		netherFossilCacheMu.Unlock()
+		return cached
+	}
+	netherFossilCacheMu.Unlock()
+
 	def := sets.Structures["minecraft:nether_fossil"]
 	if def == nil {
 		return nil
 	}
 	r := worldgen.NewLegacy(0)
 	r.SetLargeFeatureSeed(seed, int(sx), int(sz))
-	return netherFossilVariantPoint(od, sets, seed, sx, sz, def, r)
+	stub := netherFossilVariantPoint(od, sets, seed, sx, sz, def, r)
+
+	netherFossilCacheMu.Lock()
+	if len(netherFossilCache) >= 512 {
+		netherFossilCache = make(map[netherStructureCacheKey]*NetherFossilStub, 64)
+	}
+	netherFossilCache[key] = stub
+	netherFossilCacheMu.Unlock()
+	return stub
 }
 
 func netherFossilVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, sx, sz int32, def *worldgen.StructureDef, r *worldgen.Legacy) *NetherFossilStub {
@@ -193,7 +221,7 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 		gx := stub.Box.minX + int(ghastRand.NextIntN(int32(stub.Box.xSpan())))
 		gy := stub.Box.minY
 		gz := stub.Box.minZ + int(ghastRand.NextIntN(int32(stub.Box.zSpan())))
-		if chunkBox.isInside(gx, gy, gz) && c.GetBlock(gx&15, gy, gz&15) == StateAir {
+		if chunkBox.isInside(gx, gy, gz) && isNetherAir(c.GetBlock(gx&15, gy, gz&15)) {
 			facing := "north"
 			switch ghastRand.NextIntN(4) {
 			case 1:
@@ -338,7 +366,7 @@ func (p *scPiece) generateBox(c *Chunk, chunkBox msBox, x0, y0, z0, x1, y1, z1 i
 				if !chunkBox.isInside(wx, wy, wz) {
 					continue
 				}
-				if skipAir && c.GetBlock(wx&15, wy, wz&15) == StateAir {
+				if skipAir && isNetherAir(c.GetBlock(wx&15, wy, wz&15)) {
 					continue
 				}
 				st := fillState
@@ -461,6 +489,14 @@ func nfIsOkBox(box msBox) bool {
 // BuildNetherFortressStart ports NetherFortressStructure.generatePieces for a
 // validated fortress start chunk (sx, sz).
 func BuildNetherFortressStart(seed int64, sx, sz int32) *NetherFortressStart {
+	key := netherStructureCacheKey{seed: seed, sx: sx, sz: sz}
+	netherFortressCacheMu.Lock()
+	if cached, ok := netherFortressCache[key]; ok {
+		netherFortressCacheMu.Unlock()
+		return cached
+	}
+	netherFortressCacheMu.Unlock()
+
 	r := worldgen.NewLegacy(0)
 	r.SetLargeFeatureSeed(seed, int(sx), int(sz))
 
@@ -514,12 +550,19 @@ func BuildNetherFortressStart(seed int64, sx, sz int32) *NetherFortressStart {
 		p.box.maxY += dy
 	}
 
-	return &NetherFortressStart{
+	start := &NetherFortressStart{
 		ChunkX: sx,
 		ChunkZ: sz,
 		Box:    totalBox,
 		Pieces: state.pieces,
 	}
+	netherFortressCacheMu.Lock()
+	if len(netherFortressCache) >= 256 {
+		netherFortressCache = make(map[netherStructureCacheKey]*NetherFortressStart, 64)
+	}
+	netherFortressCache[key] = start
+	netherFortressCacheMu.Unlock()
+	return start
 }
 
 func (p *NetherFortressPiece) addChildren(st *nfStartState, r *worldgen.Legacy) {
@@ -752,7 +795,7 @@ func (p *NetherFortressPiece) fillNetherColumnDown(c *Chunk, chunkBox msBox, sta
 	}
 	for wy > 1 {
 		cur := c.GetBlock(wx&15, wy, wz&15)
-		if cur != StateAir && cur != StateWater && cur != StateLava {
+		if !isNetherAir(cur) && cur != StateWater && cur != StateLava {
 			break
 		}
 		c.SetBlock(wx&15, wy, wz&15, state)
@@ -1217,12 +1260,19 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 				fort := BuildNetherFortressStart(seed, sx, sz)
 				PlaceNetherFortress(c, fort, cx, cz)
 			case "minecraft:bastion_remnant":
-				def := sets.Structures["minecraft:bastion_remnant"]
-				if def == nil {
-					continue
+				jStart, cached := getCachedJigsawStart(seed, "minecraft:nether_complexes", sx, sz)
+				if !cached {
+					def := sets.Structures["minecraft:bastion_remnant"]
+					if def != nil {
+						var err error
+						jStart, err = BuildJigsawStart(od, sets, def, seed, sx, sz, nil)
+						if err != nil {
+							jStart = nil
+						}
+					}
+					putCachedJigsawStart(seed, "minecraft:nether_complexes", sx, sz, jStart)
 				}
-				jStart, err := BuildJigsawStart(od, sets, def, seed, sx, sz, nil)
-				if err == nil && jStart != nil && jStart.Box.intersects(chunkBox) {
+				if jStart != nil && jStart.Box.intersects(chunkBox) {
 					bastions = append(bastions, jStart)
 				}
 			}

@@ -80,7 +80,7 @@ func TestNetherBaseTerrainSurfaceAndCarver(t *testing.T) {
 			}
 			for y := 5; y <= 122; y++ {
 				st := c.GetBlock(lx, y, lz)
-				if st == StateAir || st == StateLava {
+				if isNetherAir(st) || st == StateLava {
 					airOrLava++
 				} else {
 					solidInterior++
