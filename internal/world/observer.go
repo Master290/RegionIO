@@ -1,8 +1,11 @@
 package world
 
 import (
+	"sort"
 	"strings"
 	"sync"
+
+	"regionio/internal/nbt"
 )
 
 // ObserverTickDelay is the vanilla 2-game-tick (1 redstone tick) delay before
@@ -165,3 +168,157 @@ func (c *Cache) stepObserverUpdate(x, y, z int, state uint16, info stateName, re
 		c.propagateRedstoneAround(x, y, z, state, nextState, res)
 	}
 }
+
+// --- Observer Runtime Persistence & Chunk Unload/Reload ---
+
+// ObserverRuntimeSnapshot captures the queued retrigger flag for an active
+// `minecraft:observer` at (X, Y, Z) across save/reload or chunk unload/reload.
+type ObserverRuntimeSnapshot struct {
+	X, Y, Z           int
+	RetriggerOnFinish bool
+}
+
+func sortObserverSnapshots(entries []ObserverRuntimeSnapshot) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Y != entries[j].Y {
+			return entries[i].Y < entries[j].Y
+		}
+		if entries[i].Z != entries[j].Z {
+			return entries[i].Z < entries[j].Z
+		}
+		return entries[i].X < entries[j].X
+	})
+}
+
+// ExportObserverRuntimeEntries returns all observers with a pending retrigger-on-finish flag.
+func (c *Cache) ExportObserverRuntimeEntries() []ObserverRuntimeSnapshot {
+	if c == nil {
+		return nil
+	}
+	tr := c.getObserverTracker()
+	tr.mu.Lock()
+	var out []ObserverRuntimeSnapshot
+	for pos, retrig := range tr.retriggerOnFinish {
+		if retrig {
+			out = append(out, ObserverRuntimeSnapshot{
+				X:                 pos.X,
+				Y:                 pos.Y,
+				Z:                 pos.Z,
+				RetriggerOnFinish: true,
+			})
+		}
+	}
+	tr.mu.Unlock()
+	sortObserverSnapshots(out)
+	return out
+}
+
+// ImportObserverRuntimeEntries restores observer retrigger-on-finish flags onto c
+// and ensures that each referenced observer has a scheduled 2-tick update queued.
+func (c *Cache) ImportObserverRuntimeEntries(entries []ObserverRuntimeSnapshot) int {
+	if c == nil || len(entries) == 0 {
+		return 0
+	}
+	tr := c.getObserverTracker()
+	tr.mu.Lock()
+	var toSchedule []BlockPos
+	imported := 0
+	for _, snap := range entries {
+		if snap.Y < MinY || snap.Y >= MinY+WorldHeight || !snap.RetriggerOnFinish {
+			continue
+		}
+		pos := BlockPos{X: snap.X, Y: snap.Y, Z: snap.Z}
+		tr.retriggerOnFinish[pos] = true
+		toSchedule = append(toSchedule, pos)
+		imported++
+	}
+	tr.mu.Unlock()
+
+	for _, pos := range toSchedule {
+		if !c.HasPendingBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone) {
+			c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, ObserverTickDelay)
+		}
+	}
+	return imported
+}
+
+// UnloadChunkObservers extracts and removes any observer runtime entries in chunk (cx, cz).
+func (c *Cache) UnloadChunkObservers(cx, cz int32) []ObserverRuntimeSnapshot {
+	if c == nil {
+		return nil
+	}
+	tr := c.getObserverTracker()
+	tr.mu.Lock()
+	var out []ObserverRuntimeSnapshot
+	for pos, retrig := range tr.retriggerOnFinish {
+		if int32(pos.X>>4) == cx && int32(pos.Z>>4) == cz {
+			if retrig {
+				out = append(out, ObserverRuntimeSnapshot{
+					X:                 pos.X,
+					Y:                 pos.Y,
+					Z:                 pos.Z,
+					RetriggerOnFinish: true,
+				})
+			}
+			delete(tr.retriggerOnFinish, pos)
+		}
+	}
+	tr.mu.Unlock()
+	sortObserverSnapshots(out)
+	return out
+}
+
+// EncodeObserverRuntimeNBT encodes ObserverRuntimeSnapshot entries into an NBT list.
+func EncodeObserverRuntimeNBT(entries []ObserverRuntimeSnapshot) nbt.List {
+	if len(entries) == 0 {
+		return nbt.List{ElemID: nbt.TagEnd}
+	}
+	elems := make([]nbt.Tag, 0, len(entries))
+	for _, e := range entries {
+		var retrigByte int8
+		if e.RetriggerOnFinish {
+			retrigByte = 1
+		}
+		comp := nbt.NewCompound().
+			Set("x", nbt.Int(int32(e.X))).
+			Set("y", nbt.Int(int32(e.Y))).
+			Set("z", nbt.Int(int32(e.Z))).
+			Set("retrigger", nbt.Byte(retrigByte))
+		elems = append(elems, comp)
+	}
+	return nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  elems,
+	}
+}
+
+// DecodeObserverRuntimeNBT decodes ObserverRuntimeSnapshot entries from an NBT list.
+func DecodeObserverRuntimeNBT(list nbt.List) []ObserverRuntimeSnapshot {
+	if len(list.Elems) == 0 {
+		return nil
+	}
+	out := make([]ObserverRuntimeSnapshot, 0, len(list.Elems))
+	for _, elem := range list.Elems {
+		comp, ok := elem.(*nbt.Compound)
+		if !ok || comp == nil {
+			continue
+		}
+		retrig := true
+		if t, ok := comp.Get("retrigger"); ok {
+			if v, ok := t.(nbt.Byte); ok {
+				retrig = v != 0
+			}
+		}
+		if !retrig {
+			continue
+		}
+		out = append(out, ObserverRuntimeSnapshot{
+			X:                 int(nbtAsInt(comp, "x")),
+			Y:                 int(nbtAsInt(comp, "y")),
+			Z:                 int(nbtAsInt(comp, "z")),
+			RetriggerOnFinish: true,
+		})
+	}
+	return out
+}
+

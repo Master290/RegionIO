@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"regionio/internal/nbt"
 )
 
 // BlockPos identifies a block in world coordinates.
@@ -2087,3 +2089,372 @@ func canSupportFloorBlock(name string, below uint16) bool {
 	}
 	return isSturdySupportBlock(below)
 }
+
+// --- Scheduled Block & Fluid Tick Persistence (Vanilla 26.1.2 `block_ticks` / `fluid_ticks`) ---
+
+// ScheduledBlockTickEntry represents a single persisted scheduled block or
+// fluid tick (vanilla Anvil `block_ticks` / `fluid_ticks` compound entry).
+type ScheduledBlockTickEntry struct {
+	X, Y, Z      int
+	Kind         BlockUpdateKind
+	Delay        int    // remaining game ticks (>= 1)
+	Priority     int    // vanilla tick priority (0 = normal)
+	BlockID      string // canonical block or fluid identifier (`i`)
+	FallDistance int    // optional in-flight fall distance for UpdateFalling
+}
+
+// HasPendingBlockUpdate reports whether a scheduled update of `kind` is
+// currently queued at (x, y, z).
+func (c *Cache) HasPendingBlockUpdate(x, y, z int, kind BlockUpdateKind) bool {
+	if c == nil {
+		return false
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.pending[scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}]
+	return ok
+}
+
+// RemainingBlockUpdateDelay returns the remaining game ticks (>= 1) until the
+// scheduled update of `kind` at (x, y, z) fires, or (0, false) if none is queued.
+func (c *Cache) RemainingBlockUpdateDelay(x, y, z int, kind BlockUpdateKind) (int, bool) {
+	if c == nil {
+		return 0, false
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.pending[scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}]
+	if !ok {
+		return 0, false
+	}
+	rem := 1
+	if u.dueTick > s.tick {
+		rem = int(u.dueTick - s.tick)
+	}
+	return rem, true
+}
+
+func (c *Cache) scheduledEntryFromUpdateLocked(s *BlockUpdateScheduler, u scheduledUpdate) ScheduledBlockTickEntry {
+	delay := 1
+	if u.dueTick > s.tick {
+		delay = int(u.dueTick - s.tick)
+	}
+	blockID := "minecraft:air"
+	if c != nil {
+		st := c.GetBlock(u.pos.X, u.pos.Y, u.pos.Z)
+		if info, ok := stateByID(st); ok && info.Name != "" {
+			blockID = info.Name
+		}
+	}
+	return ScheduledBlockTickEntry{
+		X:            u.pos.X,
+		Y:            u.pos.Y,
+		Z:            u.pos.Z,
+		Kind:         u.kind,
+		Delay:        delay,
+		Priority:     0,
+		BlockID:      blockID,
+		FallDistance: s.fallDist[u.pos],
+	}
+}
+
+func sortScheduledTickEntries(entries []ScheduledBlockTickEntry) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Delay != entries[j].Delay {
+			return entries[i].Delay < entries[j].Delay
+		}
+		if entries[i].Priority != entries[j].Priority {
+			return entries[i].Priority < entries[j].Priority
+		}
+		if entries[i].Kind != entries[j].Kind {
+			return entries[i].Kind < entries[j].Kind
+		}
+		if entries[i].Y != entries[j].Y {
+			return entries[i].Y < entries[j].Y
+		}
+		if entries[i].Z != entries[j].Z {
+			return entries[i].Z < entries[j].Z
+		}
+		return entries[i].X < entries[j].X
+	})
+}
+
+// ExportScheduledBlockTicks returns a deterministic snapshot of all pending
+// scheduled block and fluid ticks across the cache.
+func (c *Cache) ExportScheduledBlockTicks() []ScheduledBlockTickEntry {
+	if c == nil {
+		return nil
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	raw := make([]scheduledUpdate, 0, len(s.pending))
+	for _, u := range s.pending {
+		raw = append(raw, u)
+	}
+	out := make([]ScheduledBlockTickEntry, 0, len(raw))
+	for _, u := range raw {
+		out = append(out, c.scheduledEntryFromUpdateLocked(s, u))
+	}
+	s.mu.Unlock()
+	sortScheduledTickEntries(out)
+	return out
+}
+
+// ImportScheduledBlockTicks queues all given scheduled block/fluid tick entries
+// onto c's BlockUpdateScheduler, preserving their remaining delays and any
+// in-flight falling-block distance.
+func (c *Cache) ImportScheduledBlockTicks(entries []ScheduledBlockTickEntry) int {
+	if c == nil || len(entries) == 0 {
+		return 0
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fallDist == nil {
+		s.fallDist = make(map[BlockPos]int)
+	}
+	imported := 0
+	for _, e := range entries {
+		if e.Y < MinY || e.Y >= MinY+WorldHeight {
+			continue
+		}
+		delay := e.Delay
+		if delay < 1 {
+			delay = 1
+		}
+		due := s.tick + uint64(delay)
+		pos := BlockPos{X: e.X, Y: e.Y, Z: e.Z}
+		key := scheduledUpdateKey{pos: pos, kind: e.Kind}
+		if existing, ok := s.pending[key]; ok && existing.dueTick <= due {
+			continue
+		}
+		s.nextSeq++
+		s.pending[key] = scheduledUpdate{
+			pos:     pos,
+			kind:    e.Kind,
+			dueTick: due,
+			seq:     s.nextSeq,
+		}
+		if e.Kind == UpdateFalling && e.FallDistance > 0 {
+			s.fallDist[pos] = e.FallDistance
+		}
+		imported++
+	}
+	return imported
+}
+
+// ExportChunkScheduledBlockTicks returns all pending scheduled block and fluid
+// ticks located within chunk (cx, cz).
+func (c *Cache) ExportChunkScheduledBlockTicks(cx, cz int32) []ScheduledBlockTickEntry {
+	if c == nil {
+		return nil
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	var out []ScheduledBlockTickEntry
+	for _, u := range s.pending {
+		if int32(u.pos.X>>4) == cx && int32(u.pos.Z>>4) == cz {
+			out = append(out, c.scheduledEntryFromUpdateLocked(s, u))
+		}
+	}
+	s.mu.Unlock()
+	sortScheduledTickEntries(out)
+	return out
+}
+
+// UnloadChunkScheduledBlockTicks extracts and removes all pending scheduled
+// block and fluid ticks belonging to chunk (cx, cz) when the chunk is unloaded.
+func (c *Cache) UnloadChunkScheduledBlockTicks(cx, cz int32) []ScheduledBlockTickEntry {
+	if c == nil {
+		return nil
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	var out []ScheduledBlockTickEntry
+	for key, u := range s.pending {
+		if int32(u.pos.X>>4) == cx && int32(u.pos.Z>>4) == cz {
+			out = append(out, c.scheduledEntryFromUpdateLocked(s, u))
+			delete(s.pending, key)
+			delete(s.fallDist, u.pos)
+		}
+	}
+	s.mu.Unlock()
+	sortScheduledTickEntries(out)
+	return out
+}
+
+// ImportChunkScheduledBlockTicks imports scheduled ticks belonging to chunk (cx, cz).
+func (c *Cache) ImportChunkScheduledBlockTicks(cx, cz int32, entries []ScheduledBlockTickEntry) int {
+	if c == nil || len(entries) == 0 {
+		return 0
+	}
+	filtered := make([]ScheduledBlockTickEntry, 0, len(entries))
+	for _, e := range entries {
+		if int32(e.X>>4) == cx && int32(e.Z>>4) == cz {
+			filtered = append(filtered, e)
+		}
+	}
+	return c.ImportScheduledBlockTicks(filtered)
+}
+
+func inferUpdateKindFromBlockID(blockID string, isFluidList bool) BlockUpdateKind {
+	if isFluidList {
+		return UpdateFluid
+	}
+	norm := strings.ToLower(strings.TrimSpace(blockID))
+	if norm != "" && !strings.HasPrefix(norm, "minecraft:") {
+		norm = "minecraft:" + norm
+	}
+	switch norm {
+	case "minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava":
+		return UpdateFluid
+	case "minecraft:fire", "minecraft:soul_fire":
+		return UpdateFire
+	case "minecraft:sand", "minecraft:red_sand", "minecraft:gravel",
+		"minecraft:suspicious_sand", "minecraft:suspicious_gravel",
+		"minecraft:dragon_egg", "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil":
+		return UpdateFalling
+	default:
+		if strings.HasSuffix(norm, "_concrete_powder") {
+			return UpdateFalling
+		}
+		return UpdateRedstone
+	}
+}
+
+// EncodeScheduledBlockTicksNBT encodes a slice of ScheduledBlockTickEntry into
+// a vanilla 26.1.2 `block_ticks` / `fluid_ticks` NBT list (`i`, `x`, `y`, `z`,
+// `t`, `p`, plus `kind` and `fall_dist`).
+func EncodeScheduledBlockTicksNBT(entries []ScheduledBlockTickEntry) nbt.List {
+	if len(entries) == 0 {
+		return nbt.List{ElemID: nbt.TagEnd}
+	}
+	elems := make([]nbt.Tag, 0, len(entries))
+	for _, e := range entries {
+		id := e.BlockID
+		if id == "" {
+			if e.Kind == UpdateFluid {
+				id = "minecraft:water"
+			} else {
+				id = "minecraft:stone"
+			}
+		}
+		delay := e.Delay
+		if delay < 1 {
+			delay = 1
+		}
+		comp := nbt.NewCompound().
+			Set("i", nbt.String(id)).
+			Set("x", nbt.Int(int32(e.X))).
+			Set("y", nbt.Int(int32(e.Y))).
+			Set("z", nbt.Int(int32(e.Z))).
+			Set("t", nbt.Int(int32(delay))).
+			Set("p", nbt.Int(int32(e.Priority))).
+			Set("kind", nbt.Byte(int8(e.Kind)))
+		if e.FallDistance > 0 {
+			comp.Set("fall_dist", nbt.Int(int32(e.FallDistance)))
+		}
+		elems = append(elems, comp)
+	}
+	return nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  elems,
+	}
+}
+
+// DecodeScheduledBlockTicksNBT decodes a vanilla 26.1.2 `block_ticks` or
+// `fluid_ticks` NBT list into ScheduledBlockTickEntry values.
+func DecodeScheduledBlockTicksNBT(list nbt.List, isFluidList bool) []ScheduledBlockTickEntry {
+	if len(list.Elems) == 0 {
+		return nil
+	}
+	out := make([]ScheduledBlockTickEntry, 0, len(list.Elems))
+	for _, elem := range list.Elems {
+		comp, ok := elem.(*nbt.Compound)
+		if !ok || comp == nil {
+			continue
+		}
+		var blockID string
+		if tag, ok := comp.Get("i"); ok {
+			if s, ok := tag.(nbt.String); ok {
+				blockID = string(s)
+			}
+		}
+		x := int(nbtAsInt(comp, "x"))
+		y := int(nbtAsInt(comp, "y"))
+		z := int(nbtAsInt(comp, "z"))
+		delay := int(nbtAsInt(comp, "t"))
+		if delay < 1 {
+			delay = 1
+		}
+		prio := int(nbtAsInt(comp, "p"))
+		fallDist := int(nbtAsInt(comp, "fall_dist"))
+
+		kind := inferUpdateKindFromBlockID(blockID, isFluidList)
+		if kTag, ok := comp.Get("kind"); ok {
+			switch v := kTag.(type) {
+			case nbt.Byte:
+				if BlockUpdateKind(v) <= UpdateFire {
+					kind = BlockUpdateKind(v)
+				}
+			case nbt.Int:
+				if v >= 0 && BlockUpdateKind(v) <= UpdateFire {
+					kind = BlockUpdateKind(v)
+				}
+			}
+		}
+		out = append(out, ScheduledBlockTickEntry{
+			X:            x,
+			Y:            y,
+			Z:            z,
+			Kind:         kind,
+			Delay:        delay,
+			Priority:     prio,
+			BlockID:      blockID,
+			FallDistance: fallDist,
+		})
+	}
+	return out
+}
+
+// SaveChunkScheduledTicksToNBT writes the chunk's pending `block_ticks` and
+// `fluid_ticks` lists onto an Anvil chunk NBT root compound.
+func (c *Cache) SaveChunkScheduledTicksToNBT(cx, cz int32, chunkRoot *nbt.Compound) {
+	if c == nil || chunkRoot == nil {
+		return
+	}
+	all := c.ExportChunkScheduledBlockTicks(cx, cz)
+	var blockEntries, fluidEntries []ScheduledBlockTickEntry
+	for _, e := range all {
+		if e.Kind == UpdateFluid {
+			fluidEntries = append(fluidEntries, e)
+		} else {
+			blockEntries = append(blockEntries, e)
+		}
+	}
+	chunkRoot.Set("block_ticks", EncodeScheduledBlockTicksNBT(blockEntries))
+	chunkRoot.Set("fluid_ticks", EncodeScheduledBlockTicksNBT(fluidEntries))
+}
+
+// LoadChunkScheduledTicksFromNBT restores `block_ticks` and `fluid_ticks` from
+// an Anvil chunk NBT root compound onto c's BlockUpdateScheduler.
+func (c *Cache) LoadChunkScheduledTicksFromNBT(cx, cz int32, chunkRoot *nbt.Compound) int {
+	if c == nil || chunkRoot == nil {
+		return 0
+	}
+	imported := 0
+	if btTag, ok := chunkRoot.Get("block_ticks"); ok {
+		if list, ok := btTag.(nbt.List); ok {
+			imported += c.ImportChunkScheduledBlockTicks(cx, cz, DecodeScheduledBlockTicksNBT(list, false))
+		}
+	}
+	if ftTag, ok := chunkRoot.Get("fluid_ticks"); ok {
+		if list, ok := ftTag.(nbt.List); ok {
+			imported += c.ImportChunkScheduledBlockTicks(cx, cz, DecodeScheduledBlockTicksNBT(list, true))
+		}
+	}
+	return imported
+}
+

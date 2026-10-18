@@ -27,6 +27,7 @@ const (
 type FurnaceBlockEntity struct {
 	ID               string // "minecraft:furnace", "minecraft:blast_furnace", or "minecraft:smoker"
 	X, Y, Z          int
+	CustomName       string
 	Items            [FurnaceSlotCount]ItemStack
 	LitTimeRemaining int16 // NBT "lit_time_remaining" (ContainerData index 0)
 	LitTotalTime     int16 // NBT "lit_total_time"     (ContainerData index 1)
@@ -126,6 +127,9 @@ func EncodeFurnaceBlockEntityNBT(f FurnaceBlockEntity) *nbt.Compound {
 		Set("cooking_total_time", nbt.Short(f.CookingTotalTime)).
 		Set("lit_time_remaining", nbt.Short(f.LitTimeRemaining)).
 		Set("lit_total_time", nbt.Short(f.LitTotalTime))
+	if f.CustomName != "" {
+		c.Set("CustomName", nbt.String(f.CustomName))
+	}
 
 	items := nbt.List{ElemID: nbt.TagCompound}
 	for slot := 0; slot < FurnaceSlotCount; slot++ {
@@ -177,6 +181,7 @@ func DecodeFurnaceBlockEntityNBT(c *nbt.Compound) (FurnaceBlockEntity, bool) {
 		X:                int(nbtAsInt(c, "x")),
 		Y:                int(nbtAsInt(c, "y")),
 		Z:                int(nbtAsInt(c, "z")),
+		CustomName:       string(nbtAsString(c, "CustomName")),
 		CookingTimer:     nbtShortOrInt(c, "cooking_time_spent", "CookTime"),
 		CookingTotalTime: nbtShortOrInt(c, "cooking_total_time", "CookTimeTotal"),
 		LitTimeRemaining: nbtShortOrInt(c, "lit_time_remaining", "BurnTime"),

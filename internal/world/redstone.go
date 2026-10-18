@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"regionio/internal/nbt"
 )
 
 // Redstone constants and tick delays.
@@ -3040,4 +3042,292 @@ func (c *Cache) evaluateCrafterRedstone(x, y, z int, state uint16, info stateNam
 		c.setBlockRecorded(x, y, z, curSt, res)
 	}
 }
+
+// --- Chunk Reload Active-Tick Recovery & Redstone Runtime NBT Persistence ---
+
+// RecoverChunkActiveBlockTicks scans loaded non-empty sections of chunk (cx, cz)
+// after chunk load/reload and ensures that any block in an active transient or
+// timed state (powered buttons, observers, target blocks, lightning rods,
+// tripwires, pressure plates, unpowered lit redstone lamps, mismatched repeaters,
+// comparators, redstone torches, frosted ice, fire, unsupported falling blocks,
+// and flowing fluids) has its corresponding scheduled tick queued if not already pending.
+func (c *Cache) RecoverChunkActiveBlockTicks(cx, cz int32) int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch == nil {
+		return 0
+	}
+
+	type candidateBlock struct {
+		x, y, z int
+		state   uint16
+	}
+	var candidates []candidateBlock
+	baseX := int(cx) * 16
+	baseZ := int(cz) * 16
+
+	ch.mu.RLock()
+	for secIdx, sec := range ch.sections {
+		if sec == nil {
+			continue
+		}
+		secBaseY := MinY + secIdx*16
+		for ly := 0; ly < 16; ly++ {
+			y := secBaseY + ly
+			if y < MinY || y >= MinY+WorldHeight {
+				continue
+			}
+			for lz := 0; lz < 16; lz++ {
+				z := baseZ + lz
+				for lx := 0; lx < 16; lx++ {
+					x := baseX + lx
+					st := ch.getBlock(x, y, z)
+					if st == StateAir || st == StateStone || st == StateDirt || st == StateBedrock {
+						continue
+					}
+					candidates = append(candidates, candidateBlock{
+						x:     x,
+						y:     y,
+						z:     z,
+						state: st,
+					})
+				}
+			}
+		}
+	}
+	ch.mu.RUnlock()
+
+	recovered := 0
+	for _, cb := range candidates {
+		info, ok := stateByID(cb.state)
+		if !ok {
+			continue
+		}
+		name := info.Name
+		props := info.Properties
+
+		switch {
+		case name == "minecraft:observer":
+			if props["powered"] == "true" && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, ObserverTickDelay)
+				recovered++
+			}
+
+		case strings.HasSuffix(name, "_button"):
+			if props["powered"] == "true" && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, ButtonTickDelay(cb.state))
+				recovered++
+			}
+
+		case strings.HasSuffix(name, "lightning_rod"):
+			if props["powered"] == "true" && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, LightningRodTickDelay)
+				recovered++
+			}
+
+		case name == "minecraft:target":
+			if p, _ := strconv.Atoi(props["power"]); p > 0 && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, TargetBlockProjectileTickDelay)
+				recovered++
+			}
+
+		case name == "minecraft:tripwire" || name == "minecraft:tripwire_hook":
+			if props["powered"] == "true" && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, TripwireTickDelay)
+				recovered++
+			}
+
+		case strings.HasSuffix(name, "_pressure_plate"):
+			p, _ := strconv.Atoi(props["power"])
+			if (props["powered"] == "true" || p > 0) && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, PressurePlateTickDelay)
+				recovered++
+			}
+
+		case name == "minecraft:redstone_lamp":
+			if props["lit"] == "true" && !c.IsBlockPowered(cb.x, cb.y, cb.z) &&
+				!c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, RedstoneLampTurnOffDelay)
+				recovered++
+			}
+
+		case name == "minecraft:repeater":
+			if props["locked"] != "true" {
+				isPowered := props["powered"] == "true"
+				shouldTurnOn := c.repeaterInputSignal(cb.x, cb.y, cb.z, props["facing"]) > 0
+				if isPowered != shouldTurnOn && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, RepeaterDelayTicks(cb.state))
+					recovered++
+				}
+			}
+
+		case name == "minecraft:comparator":
+			isPowered := props["powered"] == "true"
+			out := c.computeComparatorOutput(cb.x, cb.y, cb.z, info)
+			if isPowered != (out > 0) && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, ComparatorTickDelay)
+				recovered++
+			}
+
+		case name == "minecraft:redstone_torch" || name == "minecraft:redstone_wall_torch":
+			wantLit := !c.isTorchSupportPowered(cb.x, cb.y, cb.z, info)
+			curLit := props["lit"] == "true"
+			if wantLit != curLit && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, RedstoneTorchTickDelay)
+				recovered++
+			}
+
+		case name == "minecraft:frosted_ice":
+			if !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, 20)
+				recovered++
+			}
+
+		case name == "minecraft:fire":
+			if !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateFire) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFire, FireTickDelay)
+				recovered++
+			}
+
+		default:
+			if IsFallingBlock(cb.state) && cb.y > MinY && isFreeToFallThrough(c.GetBlock(cb.x, cb.y-1, cb.z)) {
+				if !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateFalling) {
+					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFalling, FallingBlockTickDelay)
+					recovered++
+				}
+			} else if kind, lvl, isFluid := isStandaloneFluidBlock(cb.state); isFluid {
+				needsTick := lvl > 0
+				if !needsTick {
+					if cb.y > MinY && c.GetBlock(cb.x, cb.y-1, cb.z) == 0 {
+						needsTick = true
+					} else {
+						for _, d := range cardinalDirs {
+							if c.GetBlock(cb.x+d.dx, cb.y, cb.z+d.dz) == 0 {
+								needsTick = true
+								break
+							}
+						}
+					}
+				}
+				if needsTick && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateFluid) {
+					delay := WaterTickDelay
+					if kind == fluidLava {
+						delay = LavaTickDelay
+					}
+					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFluid, delay)
+					recovered++
+				}
+			}
+		}
+	}
+	return recovered
+}
+
+// ExportRedstoneRuntimeNBT exports all pending scheduled block/fluid ticks,
+// piston runtime entries, and observer retrigger entries on c into an NBT compound.
+func (c *Cache) ExportRedstoneRuntimeNBT() *nbt.Compound {
+	root := nbt.NewCompound()
+	if c == nil {
+		return root
+	}
+	allTicks := c.ExportScheduledBlockTicks()
+	var blockEntries, fluidEntries []ScheduledBlockTickEntry
+	for _, e := range allTicks {
+		if e.Kind == UpdateFluid {
+			fluidEntries = append(fluidEntries, e)
+		} else {
+			blockEntries = append(blockEntries, e)
+		}
+	}
+	root.Set("block_ticks", EncodeScheduledBlockTicksNBT(blockEntries))
+	root.Set("fluid_ticks", EncodeScheduledBlockTicksNBT(fluidEntries))
+	root.Set("piston_runtime", EncodePistonRuntimeNBT(c.ExportPistonRuntimeEntries()))
+	root.Set("observer_runtime", EncodeObserverRuntimeNBT(c.ExportObserverRuntimeEntries()))
+	return root
+}
+
+// ImportRedstoneRuntimeNBT restores scheduled block/fluid ticks, piston runtime
+// entries, and observer retrigger entries onto c from an NBT compound.
+func (c *Cache) ImportRedstoneRuntimeNBT(root *nbt.Compound) int {
+	if c == nil || root == nil {
+		return 0
+	}
+	imported := 0
+	if btTag, ok := root.Get("block_ticks"); ok {
+		if list, ok := btTag.(nbt.List); ok {
+			imported += c.ImportScheduledBlockTicks(DecodeScheduledBlockTicksNBT(list, false))
+		}
+	}
+	if ftTag, ok := root.Get("fluid_ticks"); ok {
+		if list, ok := ftTag.(nbt.List); ok {
+			imported += c.ImportScheduledBlockTicks(DecodeScheduledBlockTicksNBT(list, true))
+		}
+	}
+	if prTag, ok := root.Get("piston_runtime"); ok {
+		if list, ok := prTag.(nbt.List); ok {
+			imported += c.ImportPistonRuntimeEntries(DecodePistonRuntimeNBT(list))
+		}
+	}
+	if orTag, ok := root.Get("observer_runtime"); ok {
+		if list, ok := orTag.(nbt.List); ok {
+			imported += c.ImportObserverRuntimeEntries(DecodeObserverRuntimeNBT(list))
+		}
+	}
+	return imported
+}
+
+// UnloadChunkRedstoneRuntime extracts and removes all scheduled block/fluid
+// ticks, piston runtime entries, and observer retrigger entries in chunk (cx, cz),
+// returning them serialized as an NBT compound ready for chunk persistence.
+func (c *Cache) UnloadChunkRedstoneRuntime(cx, cz int32) *nbt.Compound {
+	root := nbt.NewCompound()
+	if c == nil {
+		return root
+	}
+	ticks := c.UnloadChunkScheduledBlockTicks(cx, cz)
+	var blockEntries, fluidEntries []ScheduledBlockTickEntry
+	for _, e := range ticks {
+		if e.Kind == UpdateFluid {
+			fluidEntries = append(fluidEntries, e)
+		} else {
+			blockEntries = append(blockEntries, e)
+		}
+	}
+	root.Set("block_ticks", EncodeScheduledBlockTicksNBT(blockEntries))
+	root.Set("fluid_ticks", EncodeScheduledBlockTicksNBT(fluidEntries))
+	root.Set("piston_runtime", EncodePistonRuntimeNBT(c.UnloadChunkPistonRuntime(cx, cz)))
+	root.Set("observer_runtime", EncodeObserverRuntimeNBT(c.UnloadChunkObservers(cx, cz)))
+	return root
+}
+
+// LoadChunkRedstoneRuntime restores scheduled block/fluid ticks, piston runtime
+// entries, and observer retrigger entries for chunk (cx, cz) from comp, and
+// runs RecoverChunkActiveBlockTicks(cx, cz) to recover any unqueued active
+// transient block states in the chunk.
+func (c *Cache) LoadChunkRedstoneRuntime(cx, cz int32, comp *nbt.Compound) int {
+	if c == nil {
+		return 0
+	}
+	restored := 0
+	if comp != nil {
+		restored += c.LoadChunkScheduledTicksFromNBT(cx, cz, comp)
+		if prTag, ok := comp.Get("piston_runtime"); ok {
+			if list, ok := prTag.(nbt.List); ok {
+				restored += c.ImportPistonRuntimeEntries(DecodePistonRuntimeNBT(list))
+			}
+		}
+		if orTag, ok := comp.Get("observer_runtime"); ok {
+			if list, ok := orTag.(nbt.List); ok {
+				restored += c.ImportObserverRuntimeEntries(DecodeObserverRuntimeNBT(list))
+			}
+		}
+	}
+	restored += c.RecoverChunkActiveBlockTicks(cx, cz)
+	return restored
+}
+
 

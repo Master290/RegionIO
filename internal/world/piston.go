@@ -4,6 +4,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"regionio/internal/nbt"
 )
 
 // PistonTickDelay is the vanilla duration (2 game ticks = 1 redstone tick)
@@ -770,3 +772,221 @@ func (c *Cache) retractPistonWithOption(x, y, z int, state uint16, facing string
 	}
 	return affected
 }
+
+// --- Piston Runtime State Persistence & Chunk Unload/Reload ---
+
+// PistonRuntimeEntrySnapshot captures the in-flight state of a piston or
+// sticky piston at (X, Y, Z) so that pending 2-tick extensions/retractions and
+// 1-tick sticky-piston block-spitting state survive save/reload and chunk unload/reload.
+type PistonRuntimeEntrySnapshot struct {
+	X, Y, Z           int
+	PulseStartTick    uint64
+	LastExtendedTick  uint64
+	PushedOnThisPulse bool
+	PendingAction     uint8 // 0=none, 1=extend, 2=retract
+	SpitOnRetract     bool
+}
+
+func sortPistonSnapshots(entries []PistonRuntimeEntrySnapshot) {
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Y != entries[j].Y {
+			return entries[i].Y < entries[j].Y
+		}
+		if entries[i].Z != entries[j].Z {
+			return entries[i].Z < entries[j].Z
+		}
+		return entries[i].X < entries[j].X
+	})
+}
+
+// ExportPistonRuntimeEntries returns a deterministic snapshot of all non-idle
+// piston runtime tracker entries on c.
+func (c *Cache) ExportPistonRuntimeEntries() []PistonRuntimeEntrySnapshot {
+	if c == nil {
+		return nil
+	}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	var out []PistonRuntimeEntrySnapshot
+	for pos, e := range tr.entries {
+		if e == nil {
+			continue
+		}
+		if e.pendingAction == pistonActionNone && !e.pushedOnThisPulse && !e.spitOnRetract &&
+			e.pulseStartTick == 0 && e.lastExtendedTick == 0 {
+			continue
+		}
+		out = append(out, PistonRuntimeEntrySnapshot{
+			X:                 pos.X,
+			Y:                 pos.Y,
+			Z:                 pos.Z,
+			PulseStartTick:    e.pulseStartTick,
+			LastExtendedTick:  e.lastExtendedTick,
+			PushedOnThisPulse: e.pushedOnThisPulse,
+			PendingAction:     uint8(e.pendingAction),
+			SpitOnRetract:     e.spitOnRetract,
+		})
+	}
+	tr.mu.Unlock()
+	sortPistonSnapshots(out)
+	return out
+}
+
+// ImportPistonRuntimeEntries restores piston runtime tracker entries onto c
+// and re-schedules any pending 2-tick piston action if not already queued.
+func (c *Cache) ImportPistonRuntimeEntries(entries []PistonRuntimeEntrySnapshot) int {
+	if c == nil || len(entries) == 0 {
+		return 0
+	}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	var toSchedule []BlockPos
+	imported := 0
+	for _, snap := range entries {
+		if snap.Y < MinY || snap.Y >= MinY+WorldHeight {
+			continue
+		}
+		pos := BlockPos{X: snap.X, Y: snap.Y, Z: snap.Z}
+		act := pistonActionKind(snap.PendingAction)
+		if act > pistonActionRetract {
+			act = pistonActionNone
+		}
+		tr.entries[pos] = &pistonStateEntry{
+			pulseStartTick:    snap.PulseStartTick,
+			lastExtendedTick:  snap.LastExtendedTick,
+			pushedOnThisPulse: snap.PushedOnThisPulse,
+			pendingAction:     act,
+			spitOnRetract:     snap.SpitOnRetract,
+		}
+		if act != pistonActionNone {
+			toSchedule = append(toSchedule, pos)
+		}
+		imported++
+	}
+	tr.mu.Unlock()
+
+	for _, pos := range toSchedule {
+		if !c.HasPendingBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone) {
+			c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, PistonTickDelay)
+		}
+	}
+	return imported
+}
+
+// UnloadChunkPistonRuntime extracts and removes all piston runtime tracker
+// entries belonging to chunk (cx, cz).
+func (c *Cache) UnloadChunkPistonRuntime(cx, cz int32) []PistonRuntimeEntrySnapshot {
+	if c == nil {
+		return nil
+	}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	var out []PistonRuntimeEntrySnapshot
+	for pos, e := range tr.entries {
+		if int32(pos.X>>4) != cx || int32(pos.Z>>4) != cz {
+			continue
+		}
+		if e != nil && (e.pendingAction != pistonActionNone || e.pushedOnThisPulse || e.spitOnRetract ||
+			e.pulseStartTick > 0 || e.lastExtendedTick > 0) {
+			out = append(out, PistonRuntimeEntrySnapshot{
+				X:                 pos.X,
+				Y:                 pos.Y,
+				Z:                 pos.Z,
+				PulseStartTick:    e.pulseStartTick,
+				LastExtendedTick:  e.lastExtendedTick,
+				PushedOnThisPulse: e.pushedOnThisPulse,
+				PendingAction:     uint8(e.pendingAction),
+				SpitOnRetract:     e.spitOnRetract,
+			})
+		}
+		delete(tr.entries, pos)
+	}
+	tr.mu.Unlock()
+	sortPistonSnapshots(out)
+	return out
+}
+
+// EncodePistonRuntimeNBT encodes a slice of PistonRuntimeEntrySnapshot into an NBT list.
+func EncodePistonRuntimeNBT(entries []PistonRuntimeEntrySnapshot) nbt.List {
+	if len(entries) == 0 {
+		return nbt.List{ElemID: nbt.TagEnd}
+	}
+	elems := make([]nbt.Tag, 0, len(entries))
+	for _, e := range entries {
+		var pushedByte, spitByte int8
+		if e.PushedOnThisPulse {
+			pushedByte = 1
+		}
+		if e.SpitOnRetract {
+			spitByte = 1
+		}
+		comp := nbt.NewCompound().
+			Set("x", nbt.Int(int32(e.X))).
+			Set("y", nbt.Int(int32(e.Y))).
+			Set("z", nbt.Int(int32(e.Z))).
+			Set("pulse_start_tick", nbt.Long(int64(e.PulseStartTick))).
+			Set("last_extended_tick", nbt.Long(int64(e.LastExtendedTick))).
+			Set("pushed_on_pulse", nbt.Byte(pushedByte)).
+			Set("pending_action", nbt.Byte(int8(e.PendingAction))).
+			Set("spit_on_retract", nbt.Byte(spitByte))
+		elems = append(elems, comp)
+	}
+	return nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  elems,
+	}
+}
+
+// DecodePistonRuntimeNBT decodes a PistonRuntimeEntrySnapshot slice from an NBT list.
+func DecodePistonRuntimeNBT(list nbt.List) []PistonRuntimeEntrySnapshot {
+	if len(list.Elems) == 0 {
+		return nil
+	}
+	out := make([]PistonRuntimeEntrySnapshot, 0, len(list.Elems))
+	for _, elem := range list.Elems {
+		comp, ok := elem.(*nbt.Compound)
+		if !ok || comp == nil {
+			continue
+		}
+		var pulseStart, lastExt uint64
+		if t, ok := comp.Get("pulse_start_tick"); ok {
+			if v, ok := t.(nbt.Long); ok && v >= 0 {
+				pulseStart = uint64(v)
+			}
+		}
+		if t, ok := comp.Get("last_extended_tick"); ok {
+			if v, ok := t.(nbt.Long); ok && v >= 0 {
+				lastExt = uint64(v)
+			}
+		}
+		var pushed, spit bool
+		if t, ok := comp.Get("pushed_on_pulse"); ok {
+			if v, ok := t.(nbt.Byte); ok {
+				pushed = v != 0
+			}
+		}
+		if t, ok := comp.Get("spit_on_retract"); ok {
+			if v, ok := t.(nbt.Byte); ok {
+				spit = v != 0
+			}
+		}
+		var act uint8
+		if t, ok := comp.Get("pending_action"); ok {
+			if v, ok := t.(nbt.Byte); ok && v >= 0 {
+				act = uint8(v)
+			}
+		}
+		out = append(out, PistonRuntimeEntrySnapshot{
+			X:                 int(nbtAsInt(comp, "x")),
+			Y:                 int(nbtAsInt(comp, "y")),
+			Z:                 int(nbtAsInt(comp, "z")),
+			PulseStartTick:    pulseStart,
+			LastExtendedTick:  lastExt,
+			PushedOnThisPulse: pushed,
+			PendingAction:     act,
+			SpitOnRetract:     spit,
+		})
+	}
+	return out
+}
+
