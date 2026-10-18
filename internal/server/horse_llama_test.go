@@ -456,3 +456,72 @@ func TestCopperGolemAndLightningHooks(t *testing.T) {
 		t.Fatalf("expected statue block to break on revive, got %d (%s)", got, world.BlockName(got))
 	}
 }
+
+func TestExplosionTNTFireAndProjectileMechanismHooks(t *testing.T) {
+	s, player := newTestPlayServer(t)
+	s.SetDifficulty(DifficultyNormal)
+
+	// 1. Charged creeper explosion uses ExplodeMob / DetonateExplosion.
+	creeperID, err := s.SpawnMob(20.5, 65.0, 20.5, MobTypeCreeper)
+	if err != nil {
+		t.Fatalf("SpawnMob(creeper): %v", err)
+	}
+	s.SetCreeperCharged(creeperID, true)
+	if !s.IsCreeperCharged(creeperID) {
+		t.Fatalf("expected creeper to be charged")
+	}
+	s.SetPlayerTransform(player, 22.5, 65.0, 20.5, 0, 0, true)
+	damaged := s.TriggerCreeperExplosion(creeperID, 20.5, 65.0, 20.5)
+	if damaged == 0 {
+		t.Fatalf("expected charged creeper explosion to damage nearby player")
+	}
+
+	// 2. Ghast fireball impact triggers radius-1.0 explosion with fire.
+	res := s.DetonateGhastFireball(world.DimensionOverworld, 25.5, 65.0, 25.5, 0)
+	_ = res
+
+	// 3. Burning projectile ignites TNT block via OnProjectileBlockImpact / TryIgniteTNTByBurningProjectile.
+	tntSt := world.TNTBlockState(false)
+	s.chunks.SetBlock(30, 65, 30, tntSt)
+	primedID, ignited := s.TryIgniteTNTByBurningProjectile(world.DimensionOverworld, 30, 65, 30, "minecraft:arrow", true)
+	if !ignited || primedID == 0 {
+		t.Fatalf("expected burning arrow to ignite TNT block: ignited=%v primedID=%d", ignited, primedID)
+	}
+	if s.chunks.GetBlock(30, 65, 30) != world.StateAir {
+		t.Fatalf("expected TNT block to be removed after priming")
+	}
+
+	// 4. Projectile impact activates wooden button via HitBlockWithProjectileMechanism.
+	stoneSt, _ := world.BlockStateByName("minecraft:stone", nil)
+	s.chunks.SetBlock(35, 65, 34, stoneSt)
+	btnSt, ok := world.BlockStateByName("minecraft:oak_button", map[string]string{
+		"face":    "wall",
+		"facing":  "south",
+		"powered": "false",
+	})
+	if !ok {
+		t.Fatalf("missing minecraft:oak_button")
+	}
+	s.chunks.SetBlock(35, 65, 35, btnSt)
+	_, _ = s.OnProjectileBlockImpact(world.DimensionOverworld, 35, 65, 35, 35.5, 65.5, 36.5, 35.5, 65.5, 35.1, 0, "minecraft:arrow")
+	if world.BlockProperties(s.chunks.GetBlock(35, 65, 35))["powered"] != "true" {
+		t.Fatalf("expected arrow impact on oak_button to set powered=true")
+	}
+
+	// 5. FireDamageAtPosition damages non-fire-immune mobs in fire (1.0) and soul_fire (2.0).
+	soulFireSt, ok := world.BlockStateByName("minecraft:soul_fire", nil)
+	if !ok {
+		t.Fatalf("missing minecraft:soul_fire")
+	}
+	s.chunks.SetBlock(40, 65, 40, soulFireSt)
+	pigID, err := s.SpawnMob(40.5, 65.0, 40.5, MobTypePig)
+	if err != nil {
+		t.Fatalf("SpawnMob(pig): %v", err)
+	}
+	beforeHP := s.MobHealth(pigID)
+	s.TickMobsInCauldrons()
+	if got := s.MobHealth(pigID); got != beforeHP-2.0 {
+		t.Fatalf("expected pig in soul_fire to take 2.0 damage: before=%v got=%v", beforeHP, got)
+	}
+}
+

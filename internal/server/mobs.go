@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"regionio/internal/protocol"
@@ -58,9 +59,11 @@ const (
 	CreeperAggroRange        = 32.0
 	CreeperIgniteRange       = 3.0
 	CreeperCancelRange       = 7.0
-	CreeperFuseDurationTicks = 30 // 1.5s at 20 TPS
-	CreeperExplosionRadius   = 3.0
-	CreeperMaxBaseDamage     = float32(43.0)
+	CreeperFuseDurationTicks      = 30 // 1.5s at 20 TPS
+	CreeperExplosionRadius        = 3.0
+	ChargedCreeperExplosionRadius = 6.0
+	GhastFireballExplosionRadius  = 1.0
+	CreeperMaxBaseDamage          = float32(43.0)
 
 	// Hostile/Neutral Spider parameters (light-dependent aggro + leap + bite).
 	SpiderChaseSpeed          = 0.18
@@ -918,16 +921,86 @@ func ComputeCreeperExplosionDamage(dist, radius float64) float32 {
 	return float32(raw)
 }
 
+var creeperChargedMap sync.Map // map[int32]bool
+
+// SetCreeperCharged sets whether the creeper with entityID is charged (explosion radius 6.0 instead of 3.0).
+func (s *Server) SetCreeperCharged(entityID int32, charged bool) {
+	if entityID <= 0 {
+		return
+	}
+	if charged {
+		creeperChargedMap.Store(entityID, true)
+	} else {
+		creeperChargedMap.Delete(entityID)
+	}
+}
+
+// IsCreeperCharged reports whether the creeper with entityID is charged.
+func (s *Server) IsCreeperCharged(entityID int32) bool {
+	if entityID <= 0 {
+		return false
+	}
+	v, ok := creeperChargedMap.Load(entityID)
+	return ok && v == true
+}
+
+// ExplodeMob executes a mob-caused explosion at (x, y, z) in dimension with the
+// given radius, createFire flag, and mobGriefing flag, delegating to DetonateExplosion.
+func (s *Server) ExplodeMob(dimension string, x, y, z, radius float64, createFire, mobGriefing bool, attackerEntityID int32) ExplosionResult {
+	if s == nil || radius <= 0 {
+		return ExplosionResult{}
+	}
+	normDim := world.NormalizeDimension(dimension)
+	sourceType := ""
+	if s.entities != nil && attackerEntityID > 0 {
+		if ent := s.entities.Get(attackerEntityID); ent != nil {
+			sourceType = ent.TypeName
+		}
+	}
+	cause := "explosion"
+	if sourceType != "" {
+		cause = mobAttackCauseName(sourceType)
+	}
+	breakBlocks := mobGriefing
+	return s.DetonateExplosion(ExplosionOptions{
+		Dimension:      normDim,
+		X:              x,
+		Y:              y,
+		Z:              z,
+		Radius:         radius,
+		Category:       ExplosionSourceMob,
+		DamageCause:    cause,
+		SourceEntityID: attackerEntityID,
+		SourceMobType:  sourceType,
+		CausesFire:     createFire,
+		BreakBlocks:    &breakBlocks,
+	})
+}
+
+// DetonateGhastFireball detonates a Ghast fireball at (x, y, z) in dimension
+// with vanilla radius 1.0 and createFire=true via ExplodeMob.
+func (s *Server) DetonateGhastFireball(dimension string, x, y, z float64, fireballEntityID int32) ExplosionResult {
+	if s == nil {
+		return ExplosionResult{}
+	}
+	return s.ExplodeMob(dimension, x, y, z, GhastFireballExplosionRadius, true, s.MobGriefing() && s.CreeperBlockGriefing(), fireballEntityID)
+}
+
 // TriggerCreeperExplosion detonates the creeper with entityID at (x, y, z):
-// removes the creeper entity, broadcasts explosion sound, applies distance-scaled
-// explosion damage and knockback to nearby players, and optionally destroys
-// nearby fragile blocks.
+// removes the creeper entity and delegates to s.ExplodeMob (radius 3.0 normal,
+// 6.0 if charged) for raycast shielding, blast damage/knockback, and block drops.
 func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playersDamaged int) {
 	if s == nil {
 		return 0
 	}
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
+
+	radius := CreeperExplosionRadius
+	if s.IsCreeperCharged(entityID) {
+		radius = ChargedCreeperExplosionRadius
+	}
+	s.SetCreeperCharged(entityID, false)
 
 	dim := world.DimensionOverworld
 	if s.entities != nil && entityID > 0 {
@@ -937,89 +1010,22 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 		s.entities.Remove(entityID)
 		s.BroadcastChunk(cx, cz, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
 	}
-	s.EmitVibration(VibrationEvent{
+
+	canGrief := s.MobGriefing() && s.CreeperBlockGriefing()
+	res := s.DetonateExplosion(ExplosionOptions{
 		Dimension:      dim,
-		Type:           GameEventExplode,
 		X:              x,
 		Y:              y,
 		Z:              z,
+		Radius:         radius,
+		Category:       ExplosionSourceMob,
+		DamageCause:    "creeper",
 		SourceEntityID: entityID,
+		SourceMobType:  MobTypeCreeper,
+		CausesFire:     false,
+		BreakBlocks:    &canGrief,
 	})
-	s.BroadcastChunk(cx, cz, PlaySoundPacketID,
-		EncodeSoundPacket("minecraft:entity.generic.explode", SoundSourceHostile, x, y, z, 4.0, 0.8, 0))
-
-	// Damage and knock back players within 2 * CreeperExplosionRadius (6.0 blocks).
-	maxRange := CreeperExplosionRadius * 2.0
-	var sessions []*PlayerSession
-	s.playersMu.RLock()
-	for _, sess := range s.players {
-		if sess != nil && !sess.IsDead() {
-			sessions = append(sessions, sess)
-		}
-	}
-	s.playersMu.RUnlock()
-
-	for _, sess := range sessions {
-		snap := sess.Snapshot()
-		if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || snap.Health <= 0 {
-			continue
-		}
-		dx := snap.X - x
-		dy := snap.Y - y
-		dz := snap.Z - z
-		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-		if dist >= maxRange {
-			continue
-		}
-		baseDmg := ComputeCreeperExplosionDamage(dist, CreeperExplosionRadius)
-		scaled := ScaleDamageByDifficulty(baseDmg, s.Difficulty())
-		if scaled <= 0 {
-			continue
-		}
-		dealt := s.DamagePlayerWithArmor(sess, scaled, "creeper")
-		if dealt > 0 {
-			playersDamaged++
-			if sess.IsDead() {
-				s.TriggerKilledByEntity(sess, MobTypeCreeper)
-			}
-			kb := (1.0 - dist/maxRange) * 0.8
-			vx, vy, vz := ComputeKnockback(x, z, 0, snap.X, snap.Z, kb)
-			if sess.send != nil {
-				_ = sess.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(sess.EntityID, vx, vy, vz))
-			}
-		}
-	}
-
-	// Optional block griefing in radius 2 around explosion center (excluding bedrock/liquids/air).
-	if s.chunks != nil && s.CreeperBlockGriefing() {
-		bx0 := int(math.Floor(x))
-		by0 := int(math.Floor(y))
-		bz0 := int(math.Floor(z))
-		for dy := -1; dy <= 2; dy++ {
-			by := by0 + dy
-			if by <= world.MinY+1 || by >= world.MinY+world.WorldHeight-1 {
-				continue
-			}
-			for dx := -2; dx <= 2; dx++ {
-				for dz := -2; dz <= 2; dz++ {
-					if dx*dx+dy*dy+dz*dz > 4 {
-						continue
-					}
-					bx, bz := bx0+dx, bz0+dz
-					st := s.chunks.GetBlock(bx, by, bz)
-					if st == world.StateAir || st == world.StateBedrock || st == world.StateWater || st == world.StateLava {
-						continue
-					}
-					if IsChestBlock(st) || IsFurnaceBlock(st) {
-						continue
-					}
-					s.chunks.SetBlock(bx, by, bz, world.StateAir)
-				}
-			}
-		}
-	}
-
-	return playersDamaged
+	return res.PlayersDamaged
 }
 
 // stepHostileSpiderAI advances a spider by one tick: neutral in bright daylight
@@ -1379,10 +1385,53 @@ func IsFireImmuneMob(typeName string) bool {
 	}
 }
 
+// FireDamageAtPosition checks the block footprint of an entity AABB centered at
+// (x, z) from y to y+height in dimension and returns the highest fire contact
+// damage (1.0 for `minecraft:fire`, 2.0 for `minecraft:soul_fire`) when gamerule
+// fireDamage is enabled.
+func (s *Server) FireDamageAtPosition(dimension string, x, y, z, width, height float64) (float32, bool) {
+	if s == nil || !s.FireDamage() {
+		return 0, false
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0, false
+	}
+	if width <= 0 {
+		width = 0.6
+	}
+	if height <= 0 {
+		height = 1.8
+	}
+	half := width * 0.5
+	minX := int(math.Floor(x - half + 1e-4))
+	maxX := int(math.Floor(x + half - 1e-4))
+	minY := int(math.Floor(y + 1e-4))
+	maxY := int(math.Floor(y + height - 1e-4))
+	minZ := int(math.Floor(z - half + 1e-4))
+	maxZ := int(math.Floor(z + half - 1e-4))
+
+	var best float32
+	for by := minY; by <= maxY; by++ {
+		if by < world.MinY || by >= world.MinY+world.WorldHeight {
+			continue
+		}
+		for bx := minX; bx <= maxX; bx++ {
+			for bz := minZ; bz <= maxZ; bz++ {
+				if dmg := world.FireDamageForBlock(cache.GetBlock(bx, by, bz)); dmg > best {
+					best = dmg
+				}
+			}
+		}
+	}
+	return best, best > 0
+}
+
 // TickMobsInCauldrons checks all mob entities each tick and invokes:
 //   - s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
 //   - s.OnEntityStepTripwire(dim, bx, by, bz)
-//   - s.CampfireContactDamageAt(dim, bx, by, bz) for living non-fire-immune mobs
+//   - s.CampfireContactDamageAt(dim, bx, by, bz) and s.FireDamageAtPosition for living non-fire-immune mobs
 func (s *Server) TickMobsInCauldrons() {
 	if s == nil || s.entities == nil {
 		return
@@ -1416,6 +1465,8 @@ func (s *Server) TickMobsInCauldrons() {
 		if !IsFireImmuneMob(mob.TypeName) && !s.HasEntityEffect(mob.ID, EffectFireResistance) {
 			if dmg, ok := s.CampfireContactDamageAt(dim, bx, by, bz); ok && dmg > 0 {
 				s.applyDamageToMob(mob, dmg, nil, 0, false, false)
+			} else if fDmg, fOK := s.FireDamageAtPosition(dim, mob.X, mob.Y, mob.Z, 0.6, 1.8); fOK && fDmg > 0 {
+				s.applyDamageToMob(mob, fDmg, nil, 0, false, false)
 			}
 		}
 	}

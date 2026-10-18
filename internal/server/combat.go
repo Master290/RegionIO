@@ -1584,8 +1584,48 @@ func projectileImpactBlockFace(prevX, prevY, prevZ, hitX, hitY, hitZ float64, bx
 	return "north"
 }
 
+// TryIgniteTNTByBurningProjectile primes a `minecraft:tnt` block at (bx, by, bz)
+// in dimension when hit by a burning projectile (`onFire == true`) or fire
+// projectile (`fireball` / `small_fireball`).
+func (s *Server) TryIgniteTNTByBurningProjectile(dimension string, bx, by, bz int, projectileType string, onFire bool) (int32, bool) {
+	if s == nil {
+		return 0, false
+	}
+	return s.IgniteTNTWithProjectile(dimension, bx, by, bz, onFire, projectileType, nil)
+}
+
+// TryIgniteTNTAlongProjectileSegment steps along segment (x0, y0, z0) -> (x1, y1, z1)
+// and primes the first `minecraft:tnt` block encountered by a burning/fiery projectile.
+func (s *Server) TryIgniteTNTAlongProjectileSegment(dimension string, x0, y0, z0, x1, y1, z1 float64, projectileType string, onFire bool) (int32, bool) {
+	if s == nil {
+		return 0, false
+	}
+	const steps = 8
+	var lastCell [3]int
+	hasLast := false
+	for i := 0; i <= steps; i++ {
+		t := float64(i) / float64(steps)
+		bx := int(math.Floor(x0 + (x1-x0)*t))
+		by := int(math.Floor(y0 + (y1-y0)*t))
+		bz := int(math.Floor(z0 + (z1-z0)*t))
+		cell := [3]int{bx, by, bz}
+		if hasLast && cell == lastCell {
+			continue
+		}
+		lastCell = cell
+		hasLast = true
+		if entID, ok := s.TryIgniteTNTByBurningProjectile(dimension, bx, by, bz, projectileType, onFire); ok {
+			return entID, true
+		}
+	}
+	return 0, false
+}
+
 // OnProjectileBlockImpact handles any projectile striking block (bx, by, bz) in
 // dim at impact coordinates (hitX, hitY, hitZ) from (prevX, prevY, prevZ):
+//   - Primes `minecraft:tnt` when hit by a burning projectile or fireball via IgniteTNTWithProjectile
+//   - Activates buttons/bells/doors/trapdoors/fence_gates/levers via HitBlockWithProjectileMechanism
+//   - Detonates Ghast `minecraft:fireball` (radius 1.0, createFire=true) via DetonateGhastFireball
 //   - Shatters `minecraft:decorated_pot` via HitDecoratedPotWithProjectile
 //   - Powers `minecraft:target` (1..15) via HitTargetBlockWithProjectile
 func (s *Server) OnProjectileBlockImpact(
@@ -1605,6 +1645,14 @@ func (s *Server) OnProjectileBlockImpact(
 		return false, 0
 	}
 	blk := cache.GetBlock(bx, by, bz)
+	onFire := projectileEntityID > 0 && s.IsEntityOnFire(projectileEntityID)
+	if world.IsTNTBlock(blk) {
+		_, _ = s.IgniteTNTWithProjectile(normDim, bx, by, bz, onFire, projectileType, nil)
+	}
+	_ = s.HitBlockWithProjectileMechanism(normDim, bx, by, bz, projectileType, projectileEntityID)
+	if canonicalResourceName(projectileType) == "minecraft:fireball" {
+		_ = s.DetonateGhastFireball(normDim, hitX, hitY, hitZ, projectileEntityID)
+	}
 	if IsDecoratedPotBlock(blk) {
 		shattered, _ := s.HitDecoratedPotWithProjectile(normDim, bx, by, bz, projectileEntityID)
 		return shattered, 0
@@ -1616,4 +1664,5 @@ func (s *Server) OnProjectileBlockImpact(
 	}
 	return false, 0
 }
+
 

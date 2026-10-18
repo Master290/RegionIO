@@ -574,72 +574,32 @@ func IsWitherDestroyableBlock(blockName string, allowStrongBlocks bool) bool {
 }
 
 // TriggerWitherExplosion executes an explosion of radius at (x, y, z) in dimension,
-// damaging nearby players (excluding sourceEntityID) and breaking non-immune blocks
-// when CreeperBlockGriefing() is enabled.
+// delegating to DetonateExplosion (or ExplodeMob) for raycast shielding, blast
+// damage/knockback, and block drops, plus breaking high-resistance blocks when
+// breakStrongBlocks is true (dangerous blue Wither skulls).
 func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float64, breakStrongBlocks bool, sourceEntityID int32) int {
 	if s == nil || radius <= 0 {
 		return 0
 	}
 	normDim := world.NormalizeDimension(dimension)
-	cx := int32(int64(math.Floor(x)) >> 4)
-	cz := int32(int64(math.Floor(z)) >> 4)
+	canGrief := s.MobGriefing() && s.CreeperBlockGriefing()
 
-	s.EmitVibration(VibrationEvent{
+	res := s.DetonateExplosion(ExplosionOptions{
 		Dimension:      normDim,
-		Type:           GameEventExplode,
 		X:              x,
 		Y:              y,
 		Z:              z,
+		Radius:         radius,
+		Category:       ExplosionSourceMob,
+		DamageCause:    MobTypeWither,
 		SourceEntityID: sourceEntityID,
+		SourceMobType:  MobTypeWither,
+		CausesFire:     false,
+		BreakBlocks:    &canGrief,
 	})
-	s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-		EncodeSoundPacket("minecraft:entity.generic.explode", SoundSourceHostile, x, y, z, 4.0, 0.8, 0))
-
-	maxRange := radius * 2.0
-	playersDamaged := 0
-	for _, sess := range s.onlinePlayersSnapshot() {
-		if sess == nil || sess.IsDead() {
-			continue
-		}
-		snap := sess.Snapshot()
-		if world.NormalizeDimension(snap.Dimension) != normDim {
-			continue
-		}
-		if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || snap.Health <= 0 {
-			continue
-		}
-		dx := snap.X - x
-		dy := snap.Y - y
-		dz := snap.Z - z
-		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-		if dist >= maxRange {
-			continue
-		}
-		baseDmg := ComputeCreeperExplosionDamage(dist, radius)
-		scaled := ScaleDamageByDifficulty(baseDmg, s.Difficulty())
-		if scaled <= 0 {
-			continue
-		}
-		dealt := s.DamagePlayerWithArmor(sess, scaled, MobTypeWither)
-		if dealt > 0 {
-			playersDamaged++
-			if sess.IsDead() {
-				s.TriggerKilledByEntity(sess, MobTypeWither)
-				s.BroadcastDeathMessage(sess, MobTypeWither, MobTypeWither)
-			} else {
-				kb := (1.0 - dist/maxRange) * 0.8
-				vx, vy, vz := ComputeKnockback(x, z, 0, snap.X, snap.Z, kb)
-				if sess.send != nil {
-					_ = sess.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(sess.EntityID, vx, vy, vz))
-				}
-			}
-		}
-	}
-
-	s.DamageDecorationsInRadius(normDim, x, y, z, maxRange, float32(radius*7.0), "explosion")
 
 	cache := s.DimensionChunks(normDim)
-	if cache != nil && s.CreeperBlockGriefing() {
+	if breakStrongBlocks && cache != nil && canGrief {
 		rInt := int(math.Ceil(radius))
 		if rInt > 5 {
 			rInt = 5
@@ -675,7 +635,7 @@ func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float6
 		}
 	}
 
-	return playersDamaged
+	return res.PlayersDamaged
 }
 
 // ShootWitherSkull spawns and launches a minecraft:wither_skull projectile from

@@ -252,7 +252,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 					bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
 					if by >= world.MinY && by < world.MinY+world.WorldHeight {
 						blk := cache.GetBlock(bx, by, bz)
-						if !isPassableBlock(blk) && blk != world.StateWater {
+						if (!isPassableBlock(blk) && blk != world.StateWater) || world.IsWoodenButtonBlock(blk) || world.IsBellBlock(blk) {
 							_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, snapshot.X, snapshot.Y, snapshot.Z, nx, ny, nz, snapshot.ID, snapshot.TypeName)
 							s.entities.Update(snapshot.ID, func(e *world.Entity) {
 								e.X, e.Y, e.Z = nx, ny, nz
