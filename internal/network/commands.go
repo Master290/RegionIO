@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
 	"regionio/internal/server"
@@ -233,6 +234,24 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	xpNode := greedyCmd("xp")
 	experienceNode := greedyCmd("experience")
 	summonNode := greedyCmd("summon")
+	playsoundNode := greedyCmd("playsound")
+	stopsoundNode := greedyCmd("stopsound")
+	particleNode := greedyCmd("particle")
+	rideNode := greedyCmd("ride")
+	spreadplayersNode := greedyCmd("spreadplayers")
+	tagNode := greedyCmd("tag")
+	attributeNode := greedyCmd("attribute")
+	locateNode := greedyCmd("locate")
+	forceloadNode := greedyCmd("forceload")
+	tickNode := greedyCmd("tick")
+	kickNode := greedyCmd("kick")
+	banNode := greedyCmd("ban")
+	pardonNode := greedyCmd("pardon")
+	banIPNode := greedyCmd("ban-ip")
+	pardonIPNode := greedyCmd("pardon-ip")
+	banlistNode := greedyCmd("banlist")
+	transferNode := greedyCmd("transfer")
+	dataNode := greedyCmd("data")
 
 	nodes[rootIdx].Children = []int32{
 		tpNode,
@@ -279,6 +298,24 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		xpNode,
 		experienceNode,
 		summonNode,
+		playsoundNode,
+		stopsoundNode,
+		particleNode,
+		rideNode,
+		spreadplayersNode,
+		tagNode,
+		attributeNode,
+		locateNode,
+		forceloadNode,
+		tickNode,
+		kickNode,
+		banNode,
+		pardonNode,
+		banIPNode,
+		pardonIPNode,
+		banlistNode,
+		transferNode,
+		dataNode,
 	}
 	return nodes, rootIdx
 }
@@ -966,6 +1003,10 @@ func ResolveTargets(srv *server.Server, ctx CommandContext, rawSelector string) 
 		typeExclude   []string
 		nameInclude   []string
 		nameExclude   []string
+		tagInclude    []string
+		tagExclude    []string
+		teamInclude   []string
+		teamExclude   []string
 		gmInclude     []uint8
 		gmExclude     []uint8
 		hasDistRange  bool
@@ -1011,6 +1052,22 @@ func ResolveTargets(srv *server.Server, ctx CommandContext, rawSelector string) 
 					nameExclude = append(nameExclude, val)
 				} else {
 					nameInclude = append(nameInclude, val)
+				}
+			case "tag":
+				neg := strings.HasPrefix(val, "!")
+				if neg {
+					val = strings.TrimSpace(val[1:])
+					tagExclude = append(tagExclude, val)
+				} else {
+					tagInclude = append(tagInclude, val)
+				}
+			case "team":
+				neg := strings.HasPrefix(val, "!")
+				if neg {
+					val = strings.TrimSpace(val[1:])
+					teamExclude = append(teamExclude, val)
+				} else {
+					teamInclude = append(teamInclude, val)
 				}
 			case "distance":
 				r, err := parseFloatRange(val)
@@ -1194,6 +1251,58 @@ func ResolveTargets(srv *server.Server, ctx CommandContext, rawSelector string) 
 		}
 		if excluded {
 			continue
+		}
+
+		if len(tagInclude) > 0 || len(tagExclude) > 0 {
+			hasTag := func(tag string) bool {
+				if c.IsPlayer() {
+					return srv.HasPlayerTag(c.Player, tag)
+				}
+				return srv.HasEntityTag(c.Entity.ID, tag)
+			}
+			for _, req := range tagInclude {
+				if !hasTag(req) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+			for _, ex := range tagExclude {
+				if hasTag(ex) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+
+		if len(teamInclude) > 0 || len(teamExclude) > 0 {
+			teamName := ""
+			if tm, ok := srv.PlayerTeam(c.Name()); ok && tm != nil {
+				teamName = tm.Name
+			}
+			for _, req := range teamInclude {
+				if !strings.EqualFold(teamName, req) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+			for _, ex := range teamExclude {
+				if strings.EqualFold(teamName, ex) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
 		}
 
 		if len(gmInclude) > 0 || len(gmExclude) > 0 {
@@ -1482,6 +1591,96 @@ func ExecuteCommandWithContext(srv *server.Server, ctx CommandContext, rawLine s
 			return "You do not have permission to use this command"
 		}
 		return execSummon(srv, ctx, parsed.Args)
+	case "playsound":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execPlaySound(srv, ctx, parsed.Args)
+	case "stopsound":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execStopSound(srv, ctx, parsed.Args)
+	case "particle":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execParticle(srv, ctx, parsed.Args)
+	case "ride":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execRide(srv, ctx, parsed.Args)
+	case "spreadplayers":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execSpreadPlayers(srv, ctx, parsed.Args)
+	case "tag":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execTag(srv, ctx, parsed.Args)
+	case "attribute":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execAttribute(srv, ctx, parsed.Args)
+	case "locate":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execLocate(srv, ctx, parsed.Args)
+	case "forceload":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execForceLoad(srv, ctx, parsed.Args)
+	case "tick":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execTick(srv, ctx, parsed.Args)
+	case "kick":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execKick(srv, ctx, parsed.Args)
+	case "ban":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execBan(srv, ctx, parsed.Args)
+	case "pardon":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execPardon(srv, ctx, parsed.Args)
+	case "ban-ip":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execBanIP(srv, ctx, parsed.Args)
+	case "pardon-ip":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execPardonIP(srv, ctx, parsed.Args)
+	case "banlist":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execBanList(srv, ctx, parsed.Args)
+	case "transfer":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execTransfer(srv, ctx, parsed.Args)
+	case "data":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execData(srv, ctx, parsed.Args)
 	default:
 		if reply, handled := srv.HandleItemAndStatusCommand(effectivePlayer, parsed.Name, parsed.Args); handled {
 			return reply
@@ -3492,3 +3691,1314 @@ func execSummon(srv *server.Server, ctx CommandContext, args []string) string {
 	return fmt.Sprintf("Summoned new %s", ent.TypeName)
 }
 
+func execPlaySound(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /playsound <sound> [<source>] [<targets>] [<x> <y> <z>] [<volume>] [<pitch>] [<minVolume>]"
+	}
+	soundName := strings.TrimSpace(args[0])
+	if !strings.Contains(soundName, ":") {
+		soundName = "minecraft:" + soundName
+	}
+	source := server.SoundSourceMaster
+	idx := 1
+	if idx < len(args) {
+		if src, ok := server.ParseSoundSource(args[idx]); ok {
+			source = src
+			idx++
+		}
+	}
+	var targets []*server.PlayerSession
+	if idx < len(args) {
+		resolved, err := ResolveTargetSessions(srv, ctx, args[idx])
+		if err != nil || len(resolved) == 0 {
+			return "No player was found"
+		}
+		targets = resolved
+		idx++
+	} else {
+		if ctx.ExecutorPlayer != nil {
+			targets = []*server.PlayerSession{ctx.ExecutorPlayer}
+		} else if ctx.Sender != nil {
+			targets = []*server.PlayerSession{ctx.Sender}
+		}
+		if len(targets) == 0 {
+			return "Usage: /playsound <sound> [<source>] <targets> [<x> <y> <z>] [<volume>] [<pitch>] [<minVolume>]"
+		}
+	}
+	x, y, z := ctx.X, ctx.Y, ctx.Z
+	hasCustomPos := false
+	if idx+3 <= len(args) {
+		cx, cy, cz, err := ParseVec3Args(args[idx], args[idx+1], args[idx+2])
+		if err != nil {
+			return fmt.Sprintf("Invalid sound position: %v", err)
+		}
+		ox, oy, oz := ctx.X, ctx.Y, ctx.Z
+		if cx.Local {
+			ox, oy, oz = ctx.AnchorOrigin()
+		}
+		x, y, z = ResolveVec3(ox, oy, oz, ctx.Yaw, ctx.Pitch, cx, cy, cz)
+		hasCustomPos = true
+		idx += 3
+	}
+	volume := float32(1.0)
+	if idx < len(args) {
+		v, err := strconv.ParseFloat(args[idx], 32)
+		if err != nil || v < 0 {
+			return fmt.Sprintf("Invalid volume %q (must be >= 0)", args[idx])
+		}
+		volume = float32(v)
+		idx++
+	}
+	pitch := float32(1.0)
+	if idx < len(args) {
+		p, err := strconv.ParseFloat(args[idx], 32)
+		if err != nil || p < 0 || p > 2.0 {
+			return fmt.Sprintf("Invalid pitch %q (must be between 0.0 and 2.0)", args[idx])
+		}
+		pitch = float32(p)
+		idx++
+	}
+	minVolume := float32(0.0)
+	if idx < len(args) {
+		mv, err := strconv.ParseFloat(args[idx], 32)
+		if err != nil || mv < 0 || mv > 1.0 {
+			return fmt.Sprintf("Invalid minVolume %q (must be between 0.0 and 1.0)", args[idx])
+		}
+		minVolume = float32(mv)
+	}
+	played := 0
+	var lastPlayer string
+	for _, p := range targets {
+		snap := p.Snapshot()
+		px, py, pz := x, y, z
+		if !hasCustomPos {
+			px, py, pz = snap.X, snap.Y, snap.Z
+		}
+		vol := volume
+		maxDist := 16.0
+		if volume > 1.0 {
+			maxDist = 16.0 * float64(volume)
+		}
+		dist := math.Sqrt((snap.X-px)*(snap.X-px) + (snap.Y-py)*(snap.Y-py) + (snap.Z-pz)*(snap.Z-pz))
+		if dist > maxDist {
+			if minVolume <= 0 {
+				continue
+			}
+			vol = minVolume
+		}
+		srv.SendPlaySoundToPlayer(p, soundName, source, px, py, pz, vol, pitch, 0)
+		played++
+		lastPlayer = p.Profile.Name
+	}
+	if played == 0 {
+		return "Target is too far away to hear the sound"
+	}
+	if played == 1 {
+		return fmt.Sprintf("Played sound %s to %s", soundName, lastPlayer)
+	}
+	return fmt.Sprintf("Played sound %s to %d players", soundName, played)
+}
+
+func execStopSound(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 || len(args) > 3 {
+		return "Usage: /stopsound <targets> [<source>|*] [<sound>]"
+	}
+	targets, err := ResolveTargetSessions(srv, ctx, args[0])
+	if err != nil || len(targets) == 0 {
+		return "No player was found"
+	}
+	hasSource := false
+	source := server.SoundSourceMaster
+	if len(args) >= 2 && args[1] != "*" {
+		src, ok := server.ParseSoundSource(args[1])
+		if !ok {
+			return fmt.Sprintf("Unknown sound source %q", args[1])
+		}
+		hasSource = true
+		source = src
+	}
+	soundName := ""
+	if len(args) == 3 {
+		soundName = strings.TrimSpace(args[2])
+		if !strings.Contains(soundName, ":") {
+			soundName = "minecraft:" + soundName
+		}
+	}
+	for _, p := range targets {
+		srv.SendStopSoundToPlayer(p, hasSource, source, soundName)
+	}
+	if soundName != "" {
+		return fmt.Sprintf("Stopped sound '%s'", soundName)
+	}
+	return "Stopped all sounds"
+}
+
+func execParticle(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /particle <name> [<pos>] [<delta> <speed> <count> [force|normal] [<viewers>]]"
+	}
+	particleName := strings.TrimSpace(args[0])
+	if !strings.Contains(particleName, ":") {
+		particleName = "minecraft:" + particleName
+	}
+	x, y, z := ctx.X, ctx.Y, ctx.Z
+	var dx, dy, dz float32
+	var speed float32
+	count := int32(1)
+	force := false
+	var viewers []*server.PlayerSession
+
+	if len(args) >= 4 {
+		cx, cy, cz, err := ParseVec3Args(args[1], args[2], args[3])
+		if err != nil {
+			return fmt.Sprintf("Invalid particle position: %v", err)
+		}
+		ox, oy, oz := ctx.X, ctx.Y, ctx.Z
+		if cx.Local {
+			ox, oy, oz = ctx.AnchorOrigin()
+		}
+		x, y, z = ResolveVec3(ox, oy, oz, ctx.Yaw, ctx.Pitch, cx, cy, cz)
+	}
+	if len(args) >= 9 {
+		vx, err1 := strconv.ParseFloat(args[4], 32)
+		vy, err2 := strconv.ParseFloat(args[5], 32)
+		vz, err3 := strconv.ParseFloat(args[6], 32)
+		sp, err4 := strconv.ParseFloat(args[7], 32)
+		cnt, err5 := strconv.ParseInt(args[8], 10, 32)
+		if err1 != nil || err2 != nil || err3 != nil || err4 != nil || err5 != nil || sp < 0 || cnt < 0 {
+			return "Invalid particle delta, speed, or count"
+		}
+		dx, dy, dz = float32(vx), float32(vy), float32(vz)
+		speed = float32(sp)
+		count = int32(cnt)
+		if len(args) >= 10 {
+			mode := strings.ToLower(strings.TrimSpace(args[9]))
+			switch mode {
+			case "force":
+				force = true
+			case "normal":
+				force = false
+			default:
+				return fmt.Sprintf("Invalid particle mode %q (expected force or normal)", args[9])
+			}
+		}
+		if len(args) >= 11 {
+			resolved, err := ResolveTargetSessions(srv, ctx, args[10])
+			if err != nil || len(resolved) == 0 {
+				return "No player was found"
+			}
+			viewers = resolved
+		}
+	}
+	if len(viewers) == 0 {
+		dim := world.NormalizeDimension(ctx.Dimension)
+		for _, snap := range srv.PlayerSnapshots() {
+			if world.NormalizeDimension(snap.Dimension) == dim {
+				if p := srv.PlayerByName(snap.Profile.Name); p != nil {
+					viewers = append(viewers, p)
+				}
+			}
+		}
+	}
+	for _, p := range viewers {
+		srv.SendParticleToPlayer(p, particleName, x, y, z, dx, dy, dz, speed, count, force)
+	}
+	return fmt.Sprintf("Displaying particle %s", particleName)
+}
+
+func execRide(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 2 {
+		return "Usage: /ride <target> (mount <vehicle> | dismount)"
+	}
+	riders, err := ResolveTargets(srv, ctx, args[0])
+	if err != nil || len(riders) == 0 {
+		return "No entity was found"
+	}
+	if len(riders) > 1 {
+		return "Only one entity is allowed"
+	}
+	rider := riders[0]
+	action := strings.ToLower(strings.TrimSpace(args[1]))
+	switch action {
+	case "mount":
+		if len(args) != 3 {
+			return "Usage: /ride <target> mount <vehicle>"
+		}
+		vehicles, err := ResolveTargets(srv, ctx, args[2])
+		if err != nil || len(vehicles) == 0 {
+			return "No vehicle entity was found"
+		}
+		if len(vehicles) > 1 {
+			return "Only one vehicle entity is allowed"
+		}
+		veh := vehicles[0]
+		if veh.IsPlayer() {
+			return "Players cannot be ridden"
+		}
+		if world.NormalizeDimension(rider.Dimension()) != world.NormalizeDimension(veh.Dimension()) {
+			return "Cannot mount entity in a different dimension"
+		}
+		if err := srv.MountEntityCommand(rider.Player, rider.Entity.ID, veh.Entity.ID); err != nil {
+			return err.Error()
+		}
+		return fmt.Sprintf("%s started riding %s", rider.Name(), veh.Name())
+
+	case "dismount":
+		if len(args) != 2 {
+			return "Usage: /ride <target> dismount"
+		}
+		if !srv.DismountEntityCommand(rider.Player, rider.Entity.ID) {
+			return fmt.Sprintf("%s is not riding any entity", rider.Name())
+		}
+		return fmt.Sprintf("%s stopped riding", rider.Name())
+
+	default:
+		return "Usage: /ride <target> (mount <vehicle> | dismount)"
+	}
+}
+
+func execSpreadPlayers(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) != 6 && len(args) != 8 {
+		return "Usage: /spreadplayers <centerX> <centerZ> <spreadDistance> <maxRange> [under <maxHeight>] <respectTeams> <targets>"
+	}
+	cxArg, err1 := ParseCoordArg(args[0])
+	czArg, err2 := ParseCoordArg(args[1])
+	if err1 != nil || err2 != nil || cxArg.Local || czArg.Local {
+		return "Invalid center coordinates"
+	}
+	centerX := cxArg.Resolve(ctx.X)
+	centerZ := czArg.Resolve(ctx.Z)
+
+	spreadDist, err := strconv.ParseFloat(args[2], 64)
+	if err != nil || spreadDist < 0 {
+		return fmt.Sprintf("Invalid spreadDistance %q (must be >= 0)", args[2])
+	}
+	maxRange, err := strconv.ParseFloat(args[3], 64)
+	if err != nil || maxRange < spreadDist+1.0 {
+		return fmt.Sprintf("Invalid maxRange %q (must be at least spreadDistance + 1)", args[3])
+	}
+	dt, _ := srv.DimensionType(ctx.Dimension)
+	maxHeight := dt.MaxY() - 1
+	idx := 4
+	if len(args) == 8 {
+		if !strings.EqualFold(args[4], "under") {
+			return "Usage: /spreadplayers <centerX> <centerZ> <spreadDistance> <maxRange> [under <maxHeight>] <respectTeams> <targets>"
+		}
+		mh, err := strconv.Atoi(args[5])
+		if err != nil || mh <= dt.MinY {
+			return fmt.Sprintf("Invalid maxHeight %q", args[5])
+		}
+		if mh < maxHeight {
+			maxHeight = mh
+		}
+		idx = 6
+	}
+	respectTeams, err := strconv.ParseBool(strings.ToLower(args[idx]))
+	if err != nil {
+		return fmt.Sprintf("Invalid respectTeams %q (expected true or false)", args[idx])
+	}
+	targets, err := ResolveTargets(srv, ctx, args[idx+1])
+	if err != nil || len(targets) == 0 {
+		return "No entity was found"
+	}
+
+	cache := srv.DimensionChunks(ctx.Dimension)
+	safeSurfaceY := func(bx, bz int) int {
+		if cache == nil {
+			return 64
+		}
+		for y := maxHeight; y >= dt.MinY; y-- {
+			st := cache.GetBlock(bx, y, bz)
+			if st != world.StateAir && world.BlockName(st) != "minecraft:cave_air" && world.BlockName(st) != "minecraft:void_air" {
+				if world.BlockName(st) == "minecraft:lava" || world.BlockName(st) == "minecraft:fire" || world.BlockName(st) == "minecraft:magma_block" {
+					break
+				}
+				return y + 1
+			}
+		}
+		return 64
+	}
+
+	n := len(targets)
+	var avgDist float64
+	teamPos := make(map[string][2]float64)
+	positions := make([][2]float64, n)
+	for i, t := range targets {
+		if respectTeams {
+			if tm, ok := srv.PlayerTeam(t.Name()); ok && tm != nil {
+				if pos, ok := teamPos[tm.Name]; ok {
+					positions[i] = pos
+					continue
+				}
+			}
+		}
+		angle := 2.0 * math.Pi * float64(i) / float64(max(1, n))
+		r := math.Min(maxRange, math.Max(spreadDist*0.75, maxRange*0.5))
+		if n == 1 {
+			r = 0
+		}
+		px := math.Floor(centerX+math.Cos(angle)*r) + 0.5
+		pz := math.Floor(centerZ+math.Sin(angle)*r) + 0.5
+		positions[i] = [2]float64{px, pz}
+		if respectTeams {
+			if tm, ok := srv.PlayerTeam(t.Name()); ok && tm != nil {
+				teamPos[tm.Name] = positions[i]
+			}
+		}
+	}
+
+	for i, t := range targets {
+		px, pz := positions[i][0], positions[i][1]
+		py := float64(safeSurfaceY(int(math.Floor(px)), int(math.Floor(pz))))
+		yaw, pitch := t.Rotation()
+		_ = teleportTarget(srv, t, ctx.Dimension, px, py, pz, yaw, pitch)
+	}
+	if n > 1 {
+		for i := 0; i < n; i++ {
+			minD := math.MaxFloat64
+			for j := 0; j < n; j++ {
+				if i == j {
+					continue
+				}
+				dx := positions[i][0] - positions[j][0]
+				dz := positions[i][1] - positions[j][1]
+				d := math.Hypot(dx, dz)
+				if d < minD {
+					minD = d
+				}
+			}
+			avgDist += minD
+		}
+		avgDist /= float64(n)
+	}
+	return fmt.Sprintf("Spread %d player(s)/entity(ies) around %.1f, %.1f (average distance %.1f blocks apart)", n, centerX, centerZ, avgDist)
+}
+
+func execTag(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 2 {
+		return "Usage: /tag <targets> (add <name> | remove <name> | list)"
+	}
+	targets, err := ResolveTargets(srv, ctx, args[0])
+	if err != nil || len(targets) == 0 {
+		return "No entity was found"
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[1]))
+	switch sub {
+	case "add":
+		if len(args) != 3 {
+			return "Usage: /tag <targets> add <name>"
+		}
+		tag := strings.TrimSpace(args[2])
+		added := 0
+		var lastName string
+		for _, t := range targets {
+			ok := false
+			if t.IsPlayer() {
+				ok = srv.AddPlayerTag(t.Player, tag)
+			} else if t.Entity.ID > 0 {
+				ok = srv.AddEntityTag(t.Entity.ID, tag)
+			}
+			if ok {
+				added++
+				lastName = t.Name()
+			}
+		}
+		if added == 0 {
+			return "Target either already has the tag or has too many tags"
+		}
+		if len(targets) == 1 {
+			return fmt.Sprintf("Added tag '%s' to %s", tag, lastName)
+		}
+		return fmt.Sprintf("Added tag '%s' to %d entities", tag, added)
+
+	case "remove":
+		if len(args) != 3 {
+			return "Usage: /tag <targets> remove <name>"
+		}
+		tag := strings.TrimSpace(args[2])
+		removed := 0
+		var lastName string
+		for _, t := range targets {
+			ok := false
+			if t.IsPlayer() {
+				ok = srv.RemovePlayerTag(t.Player, tag)
+			} else if t.Entity.ID > 0 {
+				ok = srv.RemoveEntityTag(t.Entity.ID, tag)
+			}
+			if ok {
+				removed++
+				lastName = t.Name()
+			}
+		}
+		if removed == 0 {
+			return fmt.Sprintf("Target does not have tag '%s'", tag)
+		}
+		if len(targets) == 1 {
+			return fmt.Sprintf("Removed tag '%s' from %s", tag, lastName)
+		}
+		return fmt.Sprintf("Removed tag '%s' from %d entities", tag, removed)
+
+	case "list":
+		if len(args) != 2 {
+			return "Usage: /tag <targets> list"
+		}
+		if len(targets) == 1 {
+			t := targets[0]
+			var tags []string
+			if t.IsPlayer() {
+				tags = srv.PlayerTags(t.Player)
+			} else if t.Entity.ID > 0 {
+				tags = srv.EntityTags(t.Entity.ID)
+			}
+			sort.Strings(tags)
+			if len(tags) == 0 {
+				return fmt.Sprintf("%s has no tags", t.Name())
+			}
+			return fmt.Sprintf("%s has %d tags: %s", t.Name(), len(tags), strings.Join(tags, ", "))
+		}
+		tagSet := make(map[string]bool)
+		for _, t := range targets {
+			var tags []string
+			if t.IsPlayer() {
+				tags = srv.PlayerTags(t.Player)
+			} else if t.Entity.ID > 0 {
+				tags = srv.EntityTags(t.Entity.ID)
+			}
+			for _, tg := range tags {
+				tagSet[tg] = true
+			}
+		}
+		all := make([]string, 0, len(tagSet))
+		for tg := range tagSet {
+			all = append(all, tg)
+		}
+		sort.Strings(all)
+		if len(all) == 0 {
+			return fmt.Sprintf("The %d entities have no tags", len(targets))
+		}
+		return fmt.Sprintf("The %d entities have %d total tags: %s", len(targets), len(all), strings.Join(all, ", "))
+
+	default:
+		return "Usage: /tag <targets> (add <name> | remove <name> | list)"
+	}
+}
+
+func execAttribute(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 3 {
+		return "Usage: /attribute <target> <attribute> (get [<scale>] | base (get [<scale>] | set <value> | reset) | modifier (add <id> <value> <op> | remove <id> | value get <id> [<scale>]))"
+	}
+	targets, err := ResolveTargets(srv, ctx, args[0])
+	if err != nil || len(targets) == 0 {
+		return "No entity was found"
+	}
+	if len(targets) > 1 {
+		return "Only one entity is allowed"
+	}
+	target := targets[0]
+	attr := args[1]
+	sub := strings.ToLower(strings.TrimSpace(args[2]))
+
+	switch sub {
+	case "get":
+		scale := 1.0
+		if len(args) == 4 {
+			sc, err := strconv.ParseFloat(args[3], 64)
+			if err != nil {
+				return fmt.Sprintf("Invalid scale %q", args[3])
+			}
+			scale = sc
+		}
+		val, err := srv.GetTargetAttributeTotal(target.Player, target.Entity.ID, attr)
+		if err != nil {
+			return err.Error()
+		}
+		return fmt.Sprintf("Value of attribute %s for %s is %.4f", attr, target.Name(), val*scale)
+
+	case "base":
+		if len(args) < 4 {
+			return "Usage: /attribute <target> <attribute> base (get [<scale>] | set <value> | reset)"
+		}
+		bsub := strings.ToLower(strings.TrimSpace(args[3]))
+		switch bsub {
+		case "get":
+			scale := 1.0
+			if len(args) == 5 {
+				sc, err := strconv.ParseFloat(args[4], 64)
+				if err != nil {
+					return fmt.Sprintf("Invalid scale %q", args[4])
+				}
+				scale = sc
+			}
+			val, err := srv.GetTargetAttributeBase(target.Player, target.Entity.ID, attr)
+			if err != nil {
+				return err.Error()
+			}
+			return fmt.Sprintf("Base value of attribute %s for %s is %.4f", attr, target.Name(), val*scale)
+		case "set":
+			if len(args) != 5 {
+				return "Usage: /attribute <target> <attribute> base set <value>"
+			}
+			v, err := strconv.ParseFloat(args[4], 64)
+			if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+				return fmt.Sprintf("Invalid attribute base value %q", args[4])
+			}
+			if err := srv.SetTargetAttributeBase(target.Player, target.Entity.ID, attr, v); err != nil {
+				return err.Error()
+			}
+			return fmt.Sprintf("Base value of attribute %s for %s set to %.4f", attr, target.Name(), v)
+		case "reset":
+			defVal, err := srv.ResetTargetAttributeBase(target.Player, target.Entity.ID, attr)
+			if err != nil {
+				return err.Error()
+			}
+			return fmt.Sprintf("Base value of attribute %s for %s reset to default %.4f", attr, target.Name(), defVal)
+		default:
+			return "Usage: /attribute <target> <attribute> base (get [<scale>] | set <value> | reset)"
+		}
+
+	case "modifier":
+		if len(args) < 5 {
+			return "Usage: /attribute <target> <attribute> modifier (add <id> <value> <op> | remove <id> | value get <id> [<scale>])"
+		}
+		msub := strings.ToLower(strings.TrimSpace(args[3]))
+		switch msub {
+		case "add":
+			if len(args) != 7 {
+				return "Usage: /attribute <target> <attribute> modifier add <id> <value> (add_value|add_multiplied_base|add_multiplied_total)"
+			}
+			modID := args[4]
+			val, err := strconv.ParseFloat(args[5], 64)
+			if err != nil || math.IsNaN(val) || math.IsInf(val, 0) {
+				return fmt.Sprintf("Invalid modifier value %q", args[5])
+			}
+			var op int
+			switch strings.ToLower(strings.TrimSpace(args[6])) {
+			case "add_value", "add":
+				op = 0
+			case "add_multiplied_base", "multiply_base":
+				op = 1
+			case "add_multiplied_total", "multiply_total":
+				op = 2
+			default:
+				return fmt.Sprintf("Unknown modifier operation %q", args[6])
+			}
+			if err := srv.AddTargetAttributeModifier(target.Player, target.Entity.ID, attr, modID, val, op); err != nil {
+				return err.Error()
+			}
+			return fmt.Sprintf("Added modifier %s to attribute %s for %s", modID, attr, target.Name())
+		case "remove":
+			if len(args) != 5 {
+				return "Usage: /attribute <target> <attribute> modifier remove <id>"
+			}
+			ok, err := srv.RemoveTargetAttributeModifier(target.Player, target.Entity.ID, attr, args[4])
+			if err != nil {
+				return err.Error()
+			}
+			if !ok {
+				return fmt.Sprintf("Attribute %s has no modifier %s", attr, args[4])
+			}
+			return fmt.Sprintf("Removed modifier %s from attribute %s for %s", args[4], attr, target.Name())
+		case "value":
+			if len(args) < 6 || !strings.EqualFold(args[4], "get") {
+				return "Usage: /attribute <target> <attribute> modifier value get <id> [<scale>]"
+			}
+			scale := 1.0
+			if len(args) == 7 {
+				sc, err := strconv.ParseFloat(args[6], 64)
+				if err != nil {
+					return fmt.Sprintf("Invalid scale %q", args[6])
+				}
+				scale = sc
+			}
+			val, ok, err := srv.GetTargetAttributeModifierValue(target.Player, target.Entity.ID, attr, args[5])
+			if err != nil {
+				return err.Error()
+			}
+			if !ok {
+				return fmt.Sprintf("Attribute %s has no modifier %s", attr, args[5])
+			}
+			return fmt.Sprintf("Value of modifier %s on attribute %s for %s is %.4f", args[5], attr, target.Name(), val*scale)
+		default:
+			return "Usage: /attribute <target> <attribute> modifier (add|remove|value)"
+		}
+
+	default:
+		return "Usage: /attribute <target> <attribute> (get|base|modifier)"
+	}
+}
+
+func execLocate(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) != 2 {
+		return "Usage: /locate (structure <structure> | biome <biome> | poi <poi>)"
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	targetID := strings.ToLower(strings.TrimSpace(args[1]))
+	if !strings.Contains(targetID, ":") && !strings.HasPrefix(targetID, "#") {
+		targetID = "minecraft:" + targetID
+	}
+	ox := int(math.Floor(ctx.X))
+	oy := int(math.Floor(ctx.Y))
+	oz := int(math.Floor(ctx.Z))
+	cache := srv.DimensionChunks(ctx.Dimension)
+
+	switch sub {
+	case "biome":
+		wantID, canonName, ok := lookupBiomeRegistryID(strings.TrimPrefix(targetID, "#"))
+		if !ok {
+			return fmt.Sprintf("Unknown biome %q", args[1])
+		}
+		if cache != nil {
+			for r := 0; r <= 64; r += 4 {
+				for dx := -r; dx <= r; dx += 4 {
+					for dz := -r; dz <= r; dz += 4 {
+						if math.Abs(float64(dx)) != float64(r) && math.Abs(float64(dz)) != float64(r) {
+							continue
+						}
+						bx, bz := ox+dx, oz+dz
+						if cache.GetBiome(bx, oy, bz) == wantID {
+							dist := int(math.Round(math.Hypot(float64(dx), float64(dz))))
+							return fmt.Sprintf("The nearest %s is at [%d, %d, %d] (%d blocks away)", canonName, bx, oy, bz, dist)
+						}
+					}
+				}
+			}
+		}
+		return fmt.Sprintf("Could not find a %s within reasonable distance", canonName)
+
+	case "poi":
+		if cache != nil {
+			for r := 0; r <= 32; r++ {
+				for dx := -r; dx <= r; dx++ {
+					for dz := -r; dz <= r; dz++ {
+						if r > 0 && int(math.Abs(float64(dx))) != r && int(math.Abs(float64(dz))) != r {
+							continue
+						}
+						for dy := -64; dy <= 64; dy++ {
+							bx, by, bz := ox+dx, oy+dy, oz+dz
+							bName := world.BlockName(cache.GetBlock(bx, by, bz))
+							if (strings.Contains(targetID, "nether_portal") && bName == "minecraft:nether_portal") ||
+								(strings.Contains(targetID, "lodestone") && bName == "minecraft:lodestone") ||
+								(strings.Contains(targetID, "lightning_rod") && strings.Contains(bName, "lightning_rod")) ||
+								(strings.Contains(targetID, "home") && strings.HasSuffix(bName, "_bed")) ||
+								(strings.Contains(targetID, "meeting") && bName == "minecraft:bell") ||
+								bName == targetID {
+								dist := int(math.Round(math.Hypot(float64(dx), float64(dz))))
+								return fmt.Sprintf("The nearest %s is at [%d, %d, %d] (%d blocks away)", targetID, bx, by, bz, dist)
+							}
+						}
+					}
+				}
+			}
+		}
+		return fmt.Sprintf("Could not find a %s within reasonable distance", targetID)
+
+	case "structure":
+		// Deterministic structure location based on world seed and structure grid.
+		seed := srv.Config().WorldSeed
+		h := int64(0)
+		for _, ch := range targetID {
+			h = h*31 + int64(ch)
+		}
+		spacing := 32 * 16
+		gx := (ox / spacing) * spacing
+		gz := (oz / spacing) * spacing
+		offX := int(((seed ^ h) & 0xFF))
+		offZ := int((((seed >> 8) ^ h) & 0xFF))
+		sx := gx + offX
+		sz := gz + offZ
+		dist := int(math.Round(math.Hypot(float64(sx-ox), float64(sz-oz))))
+		return fmt.Sprintf("The nearest %s is at [%d, ~, %d] (%d blocks away)", targetID, sx, sz, dist)
+
+	default:
+		return "Usage: /locate (structure <structure> | biome <biome> | poi <poi>)"
+	}
+}
+
+func resolveColumnBlockXZ(ctx CommandContext, rawX, rawZ string) (int, int, error) {
+	cx, err := ParseCoordArg(rawX)
+	if err != nil {
+		return 0, 0, err
+	}
+	cz, err := ParseCoordArg(rawZ)
+	if err != nil {
+		return 0, 0, err
+	}
+	if cx.Local || cz.Local {
+		return 0, 0, errors.New("local coordinates (^ ^) are not allowed for 2D column positions")
+	}
+	return int(math.Floor(cx.Resolve(ctx.X))), int(math.Floor(cz.Resolve(ctx.Z))), nil
+}
+
+func execForceLoad(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) == 0 {
+		return "Usage: /forceload (add <from> [<to>] | remove (<from> [<to>] | all) | query [<pos>])"
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	dim := world.NormalizeDimension(ctx.Dimension)
+
+	switch sub {
+	case "add", "remove":
+		if sub == "remove" && len(args) == 2 && strings.EqualFold(args[1], "all") {
+			srv.ClearForceLoadedChunks(dim)
+			return fmt.Sprintf("Unmarked all force loaded chunks in %s", dim)
+		}
+		if len(args) != 3 && len(args) != 5 {
+			return fmt.Sprintf("Usage: /forceload %s <fromX> <fromZ> [<toX> <toZ>]", sub)
+		}
+		x1, z1, err := resolveColumnBlockXZ(ctx, args[1], args[2])
+		if err != nil {
+			return fmt.Sprintf("Invalid from position: %v", err)
+		}
+		x2, z2 := x1, z1
+		if len(args) == 5 {
+			x2, z2, err = resolveColumnBlockXZ(ctx, args[3], args[4])
+			if err != nil {
+				return fmt.Sprintf("Invalid to position: %v", err)
+			}
+		}
+		cx1, cz1 := int32(x1>>4), int32(z1>>4)
+		cx2, cz2 := int32(x2>>4), int32(z2>>4)
+		if cx1 > cx2 {
+			cx1, cx2 = cx2, cx1
+		}
+		if cz1 > cz2 {
+			cz1, cz2 = cz2, cz1
+		}
+		count := (cx2 - cx1 + 1) * (cz2 - cz1 + 1)
+		if count > 256 {
+			return fmt.Sprintf("Too many chunks in the specified area (maximum 256, specified %d)", count)
+		}
+		changed := 0
+		forced := sub == "add"
+		for cx := cx1; cx <= cx2; cx++ {
+			for cz := cz1; cz <= cz2; cz++ {
+				if srv.SetChunkForceLoaded(dim, cx, cz, forced) {
+					changed++
+				}
+			}
+		}
+		if changed == 0 {
+			return "No chunks were marked/unmarked for force loading"
+		}
+		verb := "Marked"
+		if !forced {
+			verb = "Unmarked"
+		}
+		if count == 1 {
+			return fmt.Sprintf("%s chunk [%d, %d] in %s for force loading", verb, cx1, cz1, dim)
+		}
+		return fmt.Sprintf("%s %d chunks from [%d, %d] to [%d, %d] in %s for force loading", verb, changed, cx1, cz1, cx2, cz2, dim)
+
+	case "query":
+		if len(args) == 1 {
+			chunks := srv.ForceLoadedChunks(dim)
+			if len(chunks) == 0 {
+				return fmt.Sprintf("No force loaded chunks were found in %s", dim)
+			}
+			sort.Slice(chunks, func(i, j int) bool {
+				if chunks[i][0] != chunks[j][0] {
+					return chunks[i][0] < chunks[j][0]
+				}
+				return chunks[i][1] < chunks[j][1]
+			})
+			parts := make([]string, 0, len(chunks))
+			for _, c := range chunks {
+				parts = append(parts, fmt.Sprintf("[%d, %d]", c[0], c[1]))
+			}
+			return fmt.Sprintf("There are %d force loaded chunk(s) in %s: %s", len(chunks), dim, strings.Join(parts, ", "))
+		}
+		if len(args) == 3 {
+			bx, bz, err := resolveColumnBlockXZ(ctx, args[1], args[2])
+			if err != nil {
+				return fmt.Sprintf("Invalid position: %v", err)
+			}
+			cx, cz := int32(bx>>4), int32(bz>>4)
+			if srv.IsChunkForceLoaded(dim, cx, cz) {
+				return fmt.Sprintf("Chunk [%d, %d] in %s is marked for force loading", cx, cz, dim)
+			}
+			return fmt.Sprintf("Chunk [%d, %d] in %s is not marked for force loading", cx, cz, dim)
+		}
+		return "Usage: /forceload query [<x> <z>]"
+
+	default:
+		return "Usage: /forceload (add|remove|query)"
+	}
+}
+
+func execTick(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) == 0 {
+		return "Usage: /tick (query | rate <rate> | freeze | unfreeze | step [<time>|stop] | sprint (<time>|stop))"
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	switch sub {
+	case "query":
+		rate, frozen, stepTicks, sprintTicks := srv.TickState()
+		status := "Normally running"
+		if frozen {
+			status = "Frozen"
+			if stepTicks > 0 {
+				status = fmt.Sprintf("Stepping (%d ticks remaining)", stepTicks)
+			}
+		} else if sprintTicks > 0 {
+			status = fmt.Sprintf("Sprinting (%d ticks remaining)", sprintTicks)
+		}
+		return fmt.Sprintf("The game is %s. Target tick rate: %.1f per second.", status, rate)
+
+	case "rate":
+		if len(args) != 2 {
+			return "Usage: /tick rate <rate>"
+		}
+		r, err := strconv.ParseFloat(args[1], 32)
+		if err != nil || r < 1.0 || r > 10000.0 {
+			return fmt.Sprintf("Invalid tick rate %q (must be between 1.0 and 10000.0)", args[1])
+		}
+		srv.SetTickRate(float32(r))
+		return fmt.Sprintf("Set the target tick rate to %.1f per second", r)
+
+	case "freeze":
+		srv.SetTickFrozen(true)
+		return "The game is frozen"
+
+	case "unfreeze":
+		srv.SetTickFrozen(false)
+		return "The game is running normally"
+
+	case "step":
+		if len(args) == 1 {
+			if !srv.StepServerTicks(1) {
+				return "The game must be frozen in order to step"
+			}
+			return "Stepping 1 tick"
+		}
+		if strings.EqualFold(args[1], "stop") {
+			srv.StepServerTicks(0)
+			return "Stopped stepping"
+		}
+		ticks, err := ParseTimeValue(args[1], false)
+		if err != nil || ticks <= 0 {
+			return fmt.Sprintf("Invalid step duration %q", args[1])
+		}
+		if !srv.StepServerTicks(int(ticks)) {
+			return "The game must be frozen in order to step"
+		}
+		return fmt.Sprintf("Stepping %d ticks", ticks)
+
+	case "sprint":
+		if len(args) != 2 {
+			return "Usage: /tick sprint (<time>|stop)"
+		}
+		if strings.EqualFold(args[1], "stop") {
+			srv.SprintServerTicks(0)
+			return "Stopped tick sprint"
+		}
+		ticks, err := ParseTimeValue(args[1], false)
+		if err != nil || ticks <= 0 {
+			return fmt.Sprintf("Invalid sprint duration %q", args[1])
+		}
+		srv.SprintServerTicks(int(ticks))
+		return fmt.Sprintf("Sprinting for %d ticks", ticks)
+
+	default:
+		return "Usage: /tick (query | rate <rate> | freeze | unfreeze | step [<time>|stop] | sprint (<time>|stop))"
+	}
+}
+
+func execKick(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /kick <targets> [<reason>...]"
+	}
+	players, err := ResolveTargetSessions(srv, ctx, args[0])
+	if err != nil || len(players) == 0 {
+		return "No player was found"
+	}
+	reason := "Kicked by an operator"
+	if len(args) > 1 {
+		reason = strings.Join(args[1:], " ")
+	}
+	for _, p := range players {
+		srv.KickPlayer(p, reason)
+	}
+	if len(players) == 1 {
+		return fmt.Sprintf("Kicked %s: %s", players[0].Profile.Name, reason)
+	}
+	return fmt.Sprintf("Kicked %d players: %s", len(players), reason)
+}
+
+func execBan(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /ban <targets> [<reason>...]"
+	}
+	reason := "Banned by an operator."
+	if len(args) > 1 {
+		reason = strings.Join(args[1:], " ")
+	}
+	var names []string
+	if players, err := ResolveTargetSessions(srv, ctx, args[0]); err == nil && len(players) > 0 {
+		for _, p := range players {
+			names = append(names, p.Profile.Name)
+		}
+	} else if !strings.HasPrefix(args[0], "@") {
+		names = []string{args[0]}
+	} else {
+		return "No player was found"
+	}
+	banned := 0
+	var last string
+	for _, name := range names {
+		if srv.BanPlayer(name, reason) {
+			banned++
+			last = name
+		}
+	}
+	if banned == 0 {
+		return "Nothing changed. The player is already banned"
+	}
+	return fmt.Sprintf("Banned %s: %s", last, reason)
+}
+
+func execPardon(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) != 1 {
+		return "Usage: /pardon <target>"
+	}
+	if !srv.PardonPlayer(args[0]) {
+		return "Nothing changed. The player isn't banned"
+	}
+	return fmt.Sprintf("Unbanned %s", args[0])
+}
+
+func execBanIP(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /ban-ip <target> [<reason>...]"
+	}
+	reason := "Banned by an operator."
+	if len(args) > 1 {
+		reason = strings.Join(args[1:], " ")
+	}
+	target := strings.TrimSpace(args[0])
+	if !srv.BanIP(target, reason) {
+		return "Nothing changed. That IP is already banned"
+	}
+	return fmt.Sprintf("Banned IP %s: %s", target, reason)
+}
+
+func execPardonIP(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) != 1 {
+		return "Usage: /pardon-ip <target>"
+	}
+	if !srv.PardonIP(args[0]) {
+		return "Nothing changed. That IP isn't banned"
+	}
+	return fmt.Sprintf("Unbanned IP %s", args[0])
+}
+
+func execBanList(srv *server.Server, ctx CommandContext, args []string) string {
+	mode := "players"
+	if len(args) >= 1 {
+		mode = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+	switch mode {
+	case "ips":
+		ips := srv.BannedIPs()
+		if len(ips) == 0 {
+			return "There are no banned IP addresses"
+		}
+		parts := make([]string, 0, len(ips))
+		for _, b := range ips {
+			parts = append(parts, fmt.Sprintf("%s (%s)", b.Target, b.Reason))
+		}
+		sort.Strings(parts)
+		return fmt.Sprintf("There are %d banned IP(s): %s", len(ips), strings.Join(parts, ", "))
+	case "players":
+		players := srv.BannedPlayers()
+		if len(players) == 0 {
+			return "There are no banned players"
+		}
+		parts := make([]string, 0, len(players))
+		for _, b := range players {
+			parts = append(parts, fmt.Sprintf("%s (%s)", b.Target, b.Reason))
+		}
+		sort.Strings(parts)
+		return fmt.Sprintf("There are %d banned player(s): %s", len(players), strings.Join(parts, ", "))
+	default:
+		return "Usage: /banlist [ips|players]"
+	}
+}
+
+func execTransfer(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 || len(args) > 3 {
+		return "Usage: /transfer <hostname> [<port>] [<players>]"
+	}
+	host := strings.TrimSpace(args[0])
+	if host == "" {
+		return "Usage: /transfer <hostname> [<port>] [<players>]"
+	}
+	port := 25565
+	if len(args) >= 2 {
+		p, err := strconv.Atoi(args[1])
+		if err != nil || p < 1 || p > 65535 {
+			return fmt.Sprintf("Invalid port %q (must be between 1 and 65535)", args[1])
+		}
+		port = p
+	}
+	var players []*server.PlayerSession
+	if len(args) == 3 {
+		resolved, err := ResolveTargetSessions(srv, ctx, args[2])
+		if err != nil || len(resolved) == 0 {
+			return "No player was found"
+		}
+		players = resolved
+	} else {
+		if ctx.ExecutorPlayer != nil {
+			players = []*server.PlayerSession{ctx.ExecutorPlayer}
+		} else if ctx.Sender != nil {
+			players = []*server.PlayerSession{ctx.Sender}
+		}
+		if len(players) == 0 {
+			return "Usage: /transfer <hostname> <port> <players>"
+		}
+	}
+	for _, p := range players {
+		srv.TransferPlayer(p, host, port)
+	}
+	if len(players) == 1 {
+		return fmt.Sprintf("Transferring %s to %s:%d", players[0].Profile.Name, host, port)
+	}
+	return fmt.Sprintf("Transferring %d players to %s:%d", len(players), host, port)
+}
+
+func parseSimpleSNBTValue(raw string) nbt.Tag {
+	s := strings.TrimSpace(raw)
+	if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) && len(s) >= 2 {
+		return nbt.String(s[1 : len(s)-1])
+	}
+	if strings.EqualFold(s, "true") {
+		return nbt.Byte(1)
+	}
+	if strings.EqualFold(s, "false") {
+		return nbt.Byte(0)
+	}
+	if strings.HasSuffix(s, "b") || strings.HasSuffix(s, "B") {
+		if v, err := strconv.ParseInt(s[:len(s)-1], 10, 8); err == nil {
+			return nbt.Byte(int8(v))
+		}
+	}
+	if strings.HasSuffix(s, "s") || strings.HasSuffix(s, "S") {
+		if v, err := strconv.ParseInt(s[:len(s)-1], 10, 16); err == nil {
+			return nbt.Short(int16(v))
+		}
+	}
+	if strings.HasSuffix(s, "l") || strings.HasSuffix(s, "L") {
+		if v, err := strconv.ParseInt(s[:len(s)-1], 10, 64); err == nil {
+			return nbt.Long(v)
+		}
+	}
+	if strings.HasSuffix(s, "f") || strings.HasSuffix(s, "F") {
+		if v, err := strconv.ParseFloat(s[:len(s)-1], 32); err == nil {
+			return nbt.Float(float32(v))
+		}
+	}
+	if strings.HasSuffix(s, "d") || strings.HasSuffix(s, "D") {
+		if v, err := strconv.ParseFloat(s[:len(s)-1], 64); err == nil {
+			return nbt.Double(v)
+		}
+	}
+	if v, err := strconv.ParseInt(s, 10, 32); err == nil {
+		return nbt.Int(int32(v))
+	}
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		return nbt.Double(v)
+	}
+	return nbt.String(s)
+}
+
+func parseSimpleSNBTCompound(raw string) *nbt.Compound {
+	c := nbt.NewCompound()
+	s := strings.TrimSpace(raw)
+	s = strings.TrimPrefix(s, "{")
+	s = strings.TrimSuffix(s, "}")
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return c
+	}
+	for _, pair := range strings.Split(s, ",") {
+		pair = strings.TrimSpace(pair)
+		colon := strings.IndexByte(pair, ':')
+		if colon <= 0 {
+			continue
+		}
+		k := strings.Trim(strings.TrimSpace(pair[:colon]), `"`)
+		v := strings.TrimSpace(pair[colon+1:])
+		c.Set(k, parseSimpleSNBTValue(v))
+	}
+	return c
+}
+
+func formatNBTTagSNBT(t nbt.Tag) string {
+	switch v := t.(type) {
+	case nil:
+		return "{}"
+	case nbt.Byte:
+		return fmt.Sprintf("%db", int8(v))
+	case nbt.Short:
+		return fmt.Sprintf("%ds", int16(v))
+	case nbt.Int:
+		return fmt.Sprintf("%d", int32(v))
+	case nbt.Long:
+		return fmt.Sprintf("%dL", int64(v))
+	case nbt.Float:
+		return fmt.Sprintf("%gf", float32(v))
+	case nbt.Double:
+		return fmt.Sprintf("%gd", float64(v))
+	case nbt.String:
+		return fmt.Sprintf("%q", string(v))
+	case *nbt.Compound:
+		if v == nil {
+			return "{}"
+		}
+		keys := v.Keys()
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			val, _ := v.Get(k)
+			parts = append(parts, fmt.Sprintf("%s: %s", k, formatNBTTagSNBT(val)))
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func execData(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 3 {
+		return "Usage: /data (get|merge|remove|modify) (block <x> <y> <z> | entity <target> | storage <target>) ..."
+	}
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	kind := strings.ToLower(strings.TrimSpace(args[1]))
+	idx := 2
+	var holderLabel string
+	var root *nbt.Compound
+	var isPlayerTarget bool
+
+	switch kind {
+	case "storage":
+		storageID := args[idx]
+		idx++
+		holderLabel = fmt.Sprintf("storage %s", storageID)
+		root = srv.CommandStorage(storageID)
+
+	case "entity":
+		targets, err := ResolveTargets(srv, ctx, args[idx])
+		if err != nil || len(targets) == 0 {
+			return "No entity was found"
+		}
+		if len(targets) > 1 {
+			return "Only one entity is allowed"
+		}
+		idx++
+		t := targets[0]
+		holderLabel = t.Name()
+		isPlayerTarget = t.IsPlayer()
+		root = nbt.NewCompound()
+		x, y, z := t.Position()
+		root.Set("id", nbt.String(t.TypeName()))
+		root.Set("Dimension", nbt.String(t.Dimension()))
+		root.Set("Pos", &nbt.List{ElemID: nbt.TagDouble, Elems: []nbt.Tag{nbt.Double(x), nbt.Double(y), nbt.Double(z)}})
+		if t.IsPlayer() {
+			snap := t.Player.Snapshot()
+			root.Set("Health", nbt.Float(snap.Health))
+			root.Set("foodLevel", nbt.Int(snap.FoodLevel))
+			root.Set("XpLevel", nbt.Int(t.Player.ExperienceLevel()))
+			root.Set("SelectedItemSlot", nbt.Int(snap.SelectedSlot))
+		} else {
+			root.Set("Health", nbt.Float(srv.MobHealth(t.Entity.ID)))
+		}
+
+	case "block":
+		if idx+3 > len(args) {
+			return "Usage: /data <op> block <x> <y> <z> ..."
+		}
+		bx, by, bz, err := resolveConditionBlockPos(ctx, args[idx], args[idx+1], args[idx+2])
+		if err != nil {
+			return fmt.Sprintf("Invalid block position: %v", err)
+		}
+		idx += 3
+		holderLabel = fmt.Sprintf("%d, %d, %d", bx, by, bz)
+		storageKey := fmt.Sprintf("block:%s:%d:%d:%d", world.NormalizeDimension(ctx.Dimension), bx, by, bz)
+		root = srv.CommandStorage(storageKey)
+		root.Set("x", nbt.Int(int32(bx)))
+		root.Set("y", nbt.Int(int32(by)))
+		root.Set("z", nbt.Int(int32(bz)))
+		if cache := srv.DimensionChunks(ctx.Dimension); cache != nil {
+			root.Set("id", nbt.String(world.BlockName(cache.GetBlock(bx, by, bz))))
+		}
+
+	default:
+		return "Usage: /data (get|merge|remove|modify) (block|entity|storage) ..."
+	}
+
+	switch sub {
+	case "get":
+		if idx >= len(args) {
+			return fmt.Sprintf("%s has the following entity/block/storage data: %s", holderLabel, formatNBTTagSNBT(root))
+		}
+		path := args[idx]
+		tag, ok := root.Get(path)
+		if !ok {
+			return fmt.Sprintf("Found no elements matching %s", path)
+		}
+		return fmt.Sprintf("%s has the following data at %s: %s", holderLabel, path, formatNBTTagSNBT(tag))
+
+	case "merge":
+		if isPlayerTarget {
+			return "Unable to modify player data"
+		}
+		if idx >= len(args) {
+			return "Usage: /data merge (block|entity|storage) <target> <nbt>"
+		}
+		snbt := strings.Join(args[idx:], " ")
+		parsed := parseSimpleSNBTCompound(snbt)
+		for _, k := range parsed.Keys() {
+			if val, ok := parsed.Get(k); ok {
+				root.Set(k, val)
+			}
+		}
+		return fmt.Sprintf("Modified data of %s", holderLabel)
+
+	case "remove":
+		if isPlayerTarget {
+			return "Unable to modify player data"
+		}
+		if idx >= len(args) {
+			return "Usage: /data remove (block|entity|storage) <target> <path>"
+		}
+		path := args[idx]
+		if _, ok := root.Get(path); !ok {
+			return fmt.Sprintf("Nothing changed; %s does not exist", path)
+		}
+		rebuilt := nbt.NewCompound()
+		for _, k := range root.Keys() {
+			if k == path {
+				continue
+			}
+			if val, ok := root.Get(k); ok {
+				rebuilt.Set(k, val)
+			}
+		}
+		*root = *rebuilt
+		return fmt.Sprintf("Modified data of %s", holderLabel)
+
+	case "modify":
+		if isPlayerTarget {
+			return "Unable to modify player data"
+		}
+		if idx+3 > len(args) {
+			return "Usage: /data modify (block|entity|storage) <target> <path> set value <value>"
+		}
+		path := args[idx]
+		valStr := strings.Join(args[idx+3:], " ")
+		root.Set(path, parseSimpleSNBTValue(valStr))
+		return fmt.Sprintf("Modified data of %s", holderLabel)
+
+	default:
+		return "Usage: /data (get|merge|remove|modify) (block|entity|storage) ..."
+	}
+}

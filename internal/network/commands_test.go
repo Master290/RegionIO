@@ -470,7 +470,9 @@ func TestTeleportPolishAndExecuteCommand(t *testing.T) {
 }
 
 func TestWorldBlockAndEntityCommandsBatch1(t *testing.T) {
-	srv, err := server.NewWithCache(server.DefaultConfig(), world.NewCache(256, world.GenerateFlat))
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := server.NewWithCache(cfg, world.NewCache(256, world.GenerateFlat))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,5 +555,153 @@ func TestWorldBlockAndEntityCommandsBatch1(t *testing.T) {
 		t.Fatalf("/kill zombie = %q", got)
 	}
 }
+
+func TestCommandsBatch2(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := server.NewWithCache(cfg, world.NewCache(256, world.GenerateFlat))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.RequestStop() }()
+
+	var receivedPkts []int32
+	alice, err := srv.RegisterPlayer(server.Profile{Name: "Alice", UUID: server.OfflineUUID("Alice")}, func(id int32, body []byte) error {
+		receivedPkts = append(receivedPkts, id)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := srv.RegisterPlayer(server.Profile{Name: "Bob", UUID: server.OfflineUUID("Bob")}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.SetPlayerTransform(alice, 0, 70, 0, 0, 0, true)
+	srv.SetPlayerTransform(bob, 2, 70, 2, 0, 0, true)
+
+	// 1. /playsound, /stopsound, /particle
+	if got := ExecuteCommand(srv, alice, "/playsound minecraft:entity.experience_orb.pickup master @s ~ ~ ~ 1 1"); !strings.Contains(got, "Played sound") {
+		t.Fatalf("/playsound = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/stopsound @s master minecraft:entity.experience_orb.pickup"); !strings.Contains(got, "Stopped sound") {
+		t.Fatalf("/stopsound = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/particle minecraft:flame ~ ~1 ~ 0.1 0.1 0.1 0.05 5 force @s"); !strings.Contains(got, "Displaying particle") {
+		t.Fatalf("/particle = %q", got)
+	}
+
+	// 2. /tag + @a[tag=...] selector filter
+	if got := ExecuteCommand(srv, alice, "/tag @s add vip"); !strings.Contains(got, "Added tag 'vip'") {
+		t.Fatalf("/tag add = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/tag @s list"); !strings.Contains(got, "vip") {
+		t.Fatalf("/tag list = %q", got)
+	}
+	targets, err := ResolveTargets(srv, NewCommandContext(srv, alice), "@a[tag=vip]")
+	if err != nil || len(targets) != 1 || targets[0].Name() != "Alice" {
+		t.Fatalf("ResolveTargets(@a[tag=vip]) = %v, %v", targets, err)
+	}
+	if got := ExecuteCommand(srv, alice, "/tag @s remove vip"); !strings.Contains(got, "Removed tag 'vip'") {
+		t.Fatalf("/tag remove = %q", got)
+	}
+
+	// 3. /attribute (base set, modifier add, get, modifier remove)
+	if got := ExecuteCommand(srv, alice, "/attribute @s minecraft:max_health base set 30"); !strings.Contains(got, "30.0000") {
+		t.Fatalf("/attribute base set = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/attribute @s minecraft:max_health modifier add bonus_hp 10 add_value"); !strings.Contains(got, "Added modifier") {
+		t.Fatalf("/attribute modifier add = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/attribute @s minecraft:max_health get"); !strings.Contains(got, "40.0000") {
+		t.Fatalf("/attribute get = %q, want 40.0000", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/attribute @s minecraft:max_health modifier remove bonus_hp"); !strings.Contains(got, "Removed modifier") {
+		t.Fatalf("/attribute modifier remove = %q", got)
+	}
+
+	// 4. /ride mount & dismount
+	ExecuteCommand(srv, alice, "/summon minecraft:oak_boat 1 70 1")
+	if got := ExecuteCommand(srv, alice, "/ride @s mount @e[type=minecraft:oak_boat,limit=1]"); !strings.Contains(got, "started riding") {
+		t.Fatalf("/ride mount = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/ride @s dismount"); !strings.Contains(got, "stopped riding") {
+		t.Fatalf("/ride dismount = %q", got)
+	}
+
+	// 5. /spreadplayers
+	if got := ExecuteCommand(srv, alice, "/spreadplayers 0 0 2 10 false @a"); !strings.Contains(got, "Spread") {
+		t.Fatalf("/spreadplayers = %q", got)
+	}
+
+	// 6. /locate (biome, poi, structure)
+	srv.SetPlayerTransform(alice, 0, 70, 0, 0, 0, true)
+	ExecuteCommand(srv, alice, "/setblock 4 70 4 minecraft:lodestone")
+	if got := ExecuteCommand(srv, alice, "/locate poi minecraft:lodestone"); !strings.Contains(got, "[4, 70, 4]") {
+		t.Fatalf("/locate poi = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/locate structure minecraft:village_plains"); !strings.Contains(got, "The nearest") {
+		t.Fatalf("/locate structure = %q", got)
+	}
+
+	// 7. /forceload
+	if got := ExecuteCommand(srv, alice, "/forceload add 0 0 16 16"); !strings.Contains(got, "Marked") {
+		t.Fatalf("/forceload add = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/forceload query 0 0"); !strings.Contains(got, "is marked for force loading") {
+		t.Fatalf("/forceload query = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/forceload remove all"); !strings.Contains(got, "Unmarked all") {
+		t.Fatalf("/forceload remove all = %q", got)
+	}
+
+	// 8. /tick
+	if got := ExecuteCommand(srv, alice, "/tick rate 40"); !strings.Contains(got, "40.0") {
+		t.Fatalf("/tick rate = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/tick freeze"); !strings.Contains(got, "frozen") {
+		t.Fatalf("/tick freeze = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/tick step 5t"); !strings.Contains(got, "Stepping 5") {
+		t.Fatalf("/tick step = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/tick unfreeze"); !strings.Contains(got, "running normally") {
+		t.Fatalf("/tick unfreeze = %q", got)
+	}
+
+	// 9. /data storage
+	if got := ExecuteCommand(srv, alice, "/data merge storage regionio:test {score:42}"); !strings.Contains(got, "Modified") {
+		t.Fatalf("/data merge storage = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/data get storage regionio:test score"); !strings.Contains(got, "42") {
+		t.Fatalf("/data get storage = %q", got)
+	}
+
+	// 10. /ban, /banlist, /pardon, /ban-ip, /pardon-ip, /transfer, /kick
+	if got := ExecuteCommand(srv, alice, "/ban GriefUser griefing"); !strings.Contains(got, "Banned GriefUser") {
+		t.Fatalf("/ban = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/banlist players"); !strings.Contains(got, "GriefUser") {
+		t.Fatalf("/banlist = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/pardon GriefUser"); !strings.Contains(got, "Unbanned GriefUser") {
+		t.Fatalf("/pardon = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/ban-ip 192.168.1.99 spam"); !strings.Contains(got, "Banned IP") {
+		t.Fatalf("/ban-ip = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/pardon-ip 192.168.1.99"); !strings.Contains(got, "Unbanned IP") {
+		t.Fatalf("/pardon-ip = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/transfer play.example.com 25565 @s"); !strings.Contains(got, "Transferring Alice") {
+		t.Fatalf("/transfer = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/kick Bob testing kick"); !strings.Contains(got, "Kicked Bob") {
+		t.Fatalf("/kick = %q", got)
+	}
+}
+
 
 

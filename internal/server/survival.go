@@ -2309,4 +2309,1052 @@ func (s *Server) SummonEntityCommand(dim, typeName string, x, y, z float64) (*wo
 	return saved, nil
 }
 
+// PlayStopSoundCB is ClientboundStopSoundPacket (0x76 in protocol 775).
+const PlayStopSoundCB int32 = 0x76
+
+// PlayTransferCB is ClientboundTransferPacket (0x7f in protocol 775).
+const PlayTransferCB int32 = 0x7f
+
+// PlayUpdateAttributesCB is ClientboundUpdateAttributesPacket (0x83 in protocol 775).
+const PlayUpdateAttributesCB int32 = 0x83
+
+// ErrPlayerBanned is returned when a banned player attempts to join.
+var ErrPlayerBanned = errors.New("server: player is banned from this server")
+
+// ParseSoundSource parses a vanilla sound source name into its SoundSource enum index.
+func ParseSoundSource(name string) (int32, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "master":
+		return SoundSourceMaster, true
+	case "music":
+		return SoundSourceMusic, true
+	case "record", "records":
+		return SoundSourceRecords, true
+	case "weather":
+		return SoundSourceWeather, true
+	case "block", "blocks":
+		return SoundSourceBlocks, true
+	case "hostile":
+		return SoundSourceHostile, true
+	case "neutral":
+		return SoundSourceNeutral, true
+	case "player", "players":
+		return SoundSourcePlayers, true
+	case "ambient":
+		return SoundSourceAmbient, true
+	case "voice":
+		return SoundSourceVoice, true
+	case "ui":
+		return SoundSourceUI, true
+	default:
+		return SoundSourceMaster, false
+	}
+}
+
+// SendPlaySoundToPlayer sends a ClientboundSoundPacket directly to session.
+func (s *Server) SendPlaySoundToPlayer(session *PlayerSession, soundName string, source int32, x, y, z float64, volume, pitch float32, seed int64) {
+	if session == nil || session.send == nil {
+		return
+	}
+	name := strings.ToLower(strings.TrimSpace(soundName))
+	if !strings.Contains(name, ":") {
+		name = "minecraft:" + name
+	}
+	_ = session.send(PlaySoundPacketID, EncodeSoundPacket(name, source, x, y, z, volume, pitch, seed))
+}
+
+// EncodeStopSoundPacket encodes a ClientboundStopSoundPacket (0x76 in protocol 775).
+func EncodeStopSoundPacket(hasSource bool, source int32, soundName string) []byte {
+	var flags byte
+	if hasSource {
+		flags |= 0x01
+	}
+	if soundName != "" {
+		flags |= 0x02
+	}
+	w := protocol.NewWriter(32)
+	w.Byte(flags)
+	if hasSource {
+		w.VarInt(source)
+	}
+	if soundName != "" {
+		name := strings.ToLower(strings.TrimSpace(soundName))
+		if !strings.Contains(name, ":") {
+			name = "minecraft:" + name
+		}
+		w.String(name)
+	}
+	return w.Bytes()
+}
+
+// SendStopSoundToPlayer sends a ClientboundStopSoundPacket directly to session.
+func (s *Server) SendStopSoundToPlayer(session *PlayerSession, hasSource bool, source int32, soundName string) {
+	if session == nil || session.send == nil {
+		return
+	}
+	_ = session.send(PlayStopSoundCB, EncodeStopSoundPacket(hasSource, source, soundName))
+}
+
+var vanillaParticleIDs = map[string]int32{
+	"minecraft:angry_villager": 0,
+	"minecraft:Bubble":         4,
+	"minecraft:bubble":         4,
+	"minecraft:cloud":          7,
+	"minecraft:crit":           8,
+	"minecraft:damage_indicator": 9,
+	"minecraft:dragon_breath":  10,
+	"minecraft:enchant":        17,
+	"minecraft:end_rod":        18,
+	"minecraft:explosion":      20,
+	"minecraft:explosion_emitter": 19,
+	"minecraft:firework":       24,
+	"minecraft:flame":          26,
+	"minecraft:happy_villager": 34,
+	"minecraft:heart":          35,
+	"minecraft:instant_effect": 36,
+	"minecraft:large_smoke":    41,
+	"minecraft:lava":           42,
+	"minecraft:mycelium":       43,
+	"minecraft:nautilus":       44,
+	"minecraft:note":           ParticleTypeNoteID,
+	"minecraft:poof":           46,
+	"minecraft:portal":         47,
+	"minecraft:rain":           48,
+	"minecraft:smoke":          50,
+	"minecraft:white_smoke":    51,
+	"minecraft:sneeze":         52,
+	"minecraft:spit":           53,
+	"minecraft:squid_ink":      54,
+	"minecraft:sweep_attack":   55,
+	"minecraft:totem_of_undying": 56,
+	"minecraft:witch":          60,
+	"minecraft:soul_fire_flame": 30,
+	"minecraft:soul":           31,
+	"minecraft:campfire_cosy_smoke": 64,
+	"minecraft:campfire_signal_smoke": 65,
+	"minecraft:Ash":            70,
+	"minecraft:ash":            70,
+	"minecraft:crimson_spore":  71,
+	"minecraft:warped_spore":   72,
+	"minecraft:reverse_portal": 77,
+	"minecraft:white_ash":      78,
+	"minecraft:snowflake":      87,
+	"minecraft:sonic_boom":     91,
+	"minecraft:sculk_soul":     92,
+	"minecraft:trial_spawner_detection": 102,
+}
+
+// EncodeGenericParticlePacket encodes a ClientboundLevelParticlesPacket (0x2f) for a simple particle.
+func EncodeGenericParticlePacket(particleName string, x, y, z float64, dx, dy, dz, speed float32, count int32, force bool) []byte {
+	norm := strings.ToLower(strings.TrimSpace(particleName))
+	if !strings.Contains(norm, ":") {
+		norm = "minecraft:" + norm
+	}
+	pid, ok := vanillaParticleIDs[norm]
+	if !ok {
+		pid = 50 // default to minecraft:smoke for unknown simple particle names
+	}
+	w := protocol.NewWriter(64)
+	w.Bool(force)
+	w.Bool(force)
+	w.Float64(x)
+	w.Float64(y)
+	w.Float64(z)
+	w.Float32(dx)
+	w.Float32(dy)
+	w.Float32(dz)
+	w.Float32(speed)
+	w.Int32(count)
+	w.VarInt(pid)
+	return w.Bytes()
+}
+
+// SendParticleToPlayer sends a ClientboundLevelParticlesPacket to session.
+func (s *Server) SendParticleToPlayer(session *PlayerSession, particleName string, x, y, z float64, dx, dy, dz, speed float32, count int32, force bool) {
+	if session == nil || session.send == nil {
+		return
+	}
+	_ = session.send(PlayLevelParticlesCB, EncodeGenericParticlePacket(particleName, x, y, z, dx, dy, dz, speed, count, force))
+}
+
+// BanEntry represents a player or IP ban entry.
+type BanEntry struct {
+	Target string
+	Reason string
+}
+
+// AttributeModifier represents an attribute modifier applied via /attribute.
+type AttributeModifier struct {
+	ID        string
+	Amount    float64
+	Operation int // 0 = add_value, 1 = add_multiplied_base, 2 = add_multiplied_total
+}
+
+type attributeInstance struct {
+	Base      float64
+	Modifiers map[string]AttributeModifier
+}
+
+type serverCommandAuxState struct {
+	mu                sync.RWMutex
+	playerTags        map[[16]byte]map[string]bool
+	entityTags        map[int32]map[string]bool
+	playerAttrs       map[[16]byte]map[string]*attributeInstance
+	entityAttrs       map[int32]map[string]*attributeInstance
+	entityMount       map[int32]int32 // riderEntityID -> vehicleEntityID
+	forceLoadedChunks map[string]map[[2]int32]bool
+	tickRate          float32
+	tickFrozen        bool
+	tickStepTicks     int
+	tickSprintTicks   int
+	bannedPlayers     map[string]BanEntry
+	bannedIPs         map[string]BanEntry
+	commandStorage    map[string]*nbt.Compound
+}
+
+var serverAuxStates sync.Map // map[*Server]*serverCommandAuxState
+
+func (s *Server) cmdAux() *serverCommandAuxState {
+	if s == nil {
+		return nil
+	}
+	if v, ok := serverAuxStates.Load(s); ok {
+		return v.(*serverCommandAuxState)
+	}
+	initSt := &serverCommandAuxState{
+		playerTags:        make(map[[16]byte]map[string]bool),
+		entityTags:        make(map[int32]map[string]bool),
+		playerAttrs:       make(map[[16]byte]map[string]*attributeInstance),
+		entityAttrs:       make(map[int32]map[string]*attributeInstance),
+		entityMount:       make(map[int32]int32),
+		forceLoadedChunks: make(map[string]map[[2]int32]bool),
+		tickRate:          20.0,
+		bannedPlayers:     make(map[string]BanEntry),
+		bannedIPs:         make(map[string]BanEntry),
+		commandStorage:    make(map[string]*nbt.Compound),
+	}
+	actual, _ := serverAuxStates.LoadOrStore(s, initSt)
+	return actual.(*serverCommandAuxState)
+}
+
+// MountEntityCommand mounts a rider (player or entity) onto vehicleEntityID for /ride.
+func (s *Server) MountEntityCommand(riderPlayer *PlayerSession, riderEntityID, vehicleEntityID int32) error {
+	if s == nil {
+		return errors.New("server unavailable")
+	}
+	if riderEntityID == vehicleEntityID || (riderPlayer != nil && riderPlayer.EntityID == vehicleEntityID) {
+		return errors.New("Entity cannot ride itself")
+	}
+	if riderPlayer != nil {
+		riderEntityID = riderPlayer.EntityID
+		if _, ok := s.MountPlayerOnVehicle(riderPlayer, vehicleEntityID); ok {
+			return nil
+		}
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	// Check cycle
+	cur := vehicleEntityID
+	for cur != 0 {
+		if cur == riderEntityID {
+			aux.mu.Unlock()
+			return errors.New("Cannot mount entity in a riding loop")
+		}
+		cur = aux.entityMount[cur]
+	}
+	aux.entityMount[riderEntityID] = vehicleEntityID
+	var passengers []int32
+	for r, v := range aux.entityMount {
+		if v == vehicleEntityID {
+			passengers = append(passengers, r)
+		}
+	}
+	aux.mu.Unlock()
+
+	dim := world.DimensionOverworld
+	var cx, cz int32
+	if ent := s.entities.Get(vehicleEntityID); ent != nil {
+		dim = ent.EffectiveDimension()
+		cp := ent.ChunkPos()
+		cx, cz = cp.X, cp.Z
+	} else if riderPlayer != nil {
+		snap := riderPlayer.Snapshot()
+		dim = snap.Dimension
+		cx = int32(int64(math.Floor(snap.X)) >> 4)
+		cz = int32(int64(math.Floor(snap.Z)) >> 4)
+	}
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetPassengers, EncodeSetPassengersPacket(vehicleEntityID, passengers))
+	return nil
+}
+
+// DismountEntityCommand dismounts a rider (player or entity) from its current vehicle for /ride.
+func (s *Server) DismountEntityCommand(riderPlayer *PlayerSession, riderEntityID int32) bool {
+	if s == nil {
+		return false
+	}
+	if riderPlayer != nil {
+		riderEntityID = riderPlayer.EntityID
+		if s.DismountPlayerVehicle(riderPlayer) {
+			return true
+		}
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	vehicleID, ok := aux.entityMount[riderEntityID]
+	if ok {
+		delete(aux.entityMount, riderEntityID)
+	}
+	var passengers []int32
+	if ok {
+		for r, v := range aux.entityMount {
+			if v == vehicleID {
+				passengers = append(passengers, r)
+			}
+		}
+	}
+	aux.mu.Unlock()
+	if !ok {
+		return false
+	}
+	dim := world.DimensionOverworld
+	var cx, cz int32
+	if ent := s.entities.Get(vehicleID); ent != nil {
+		dim = ent.EffectiveDimension()
+		cp := ent.ChunkPos()
+		cx, cz = cp.X, cp.Z
+	} else if riderPlayer != nil {
+		snap := riderPlayer.Snapshot()
+		dim = snap.Dimension
+		cx = int32(int64(math.Floor(snap.X)) >> 4)
+		cz = int32(int64(math.Floor(snap.Z)) >> 4)
+	}
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetPassengers, EncodeSetPassengersPacket(vehicleID, passengers))
+	return true
+}
+
+// AddPlayerTag adds a scoreboard tag to session, returning false if already present.
+func (s *Server) AddPlayerTag(session *PlayerSession, tag string) bool {
+	if s == nil || session == nil || tag == "" {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	m := aux.playerTags[session.Profile.UUID]
+	if m == nil {
+		m = make(map[string]bool)
+		aux.playerTags[session.Profile.UUID] = m
+	}
+	if m[tag] {
+		return false
+	}
+	m[tag] = true
+	return true
+}
+
+// RemovePlayerTag removes a scoreboard tag from session.
+func (s *Server) RemovePlayerTag(session *PlayerSession, tag string) bool {
+	if s == nil || session == nil || tag == "" {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	m := aux.playerTags[session.Profile.UUID]
+	if m == nil || !m[tag] {
+		return false
+	}
+	delete(m, tag)
+	return true
+}
+
+// PlayerTags returns a sorted list of tags on session.
+func (s *Server) PlayerTags(session *PlayerSession) []string {
+	if s == nil || session == nil {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	m := aux.playerTags[session.Profile.UUID]
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// HasPlayerTag reports whether session has the specified scoreboard tag.
+func (s *Server) HasPlayerTag(session *PlayerSession, tag string) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	m := aux.playerTags[session.Profile.UUID]
+	if tag == "" {
+		return len(m) == 0
+	}
+	return m != nil && m[tag]
+}
+
+// AddEntityTag adds a scoreboard tag to entityID.
+func (s *Server) AddEntityTag(entityID int32, tag string) bool {
+	if s == nil || entityID <= 0 || tag == "" {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	m := aux.entityTags[entityID]
+	if m == nil {
+		m = make(map[string]bool)
+		aux.entityTags[entityID] = m
+	}
+	if m[tag] {
+		return false
+	}
+	m[tag] = true
+	return true
+}
+
+// RemoveEntityTag removes a scoreboard tag from entityID.
+func (s *Server) RemoveEntityTag(entityID int32, tag string) bool {
+	if s == nil || entityID <= 0 || tag == "" {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	m := aux.entityTags[entityID]
+	if m == nil || !m[tag] {
+		return false
+	}
+	delete(m, tag)
+	return true
+}
+
+// EntityTags returns all scoreboard tags on entityID.
+func (s *Server) EntityTags(entityID int32) []string {
+	if s == nil || entityID <= 0 {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	m := aux.entityTags[entityID]
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// HasEntityTag reports whether entityID has the specified scoreboard tag.
+func (s *Server) HasEntityTag(entityID int32, tag string) bool {
+	if s == nil || entityID <= 0 {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	m := aux.entityTags[entityID]
+	if tag == "" {
+		return len(m) == 0
+	}
+	return m != nil && m[tag]
+}
+
+var defaultAttributeBases = map[string]float64{
+	"minecraft:max_health":               20.0,
+	"minecraft:follow_range":             32.0,
+	"minecraft:knockback_resistance":     0.0,
+	"minecraft:movement_speed":           0.1,
+	"minecraft:flying_speed":             0.4,
+	"minecraft:attack_damage":            1.0,
+	"minecraft:attack_knockback":         0.0,
+	"minecraft:attack_speed":             4.0,
+	"minecraft:armor":                    0.0,
+	"minecraft:armor_toughness":          0.0,
+	"minecraft:fall_damage_multiplier":   1.0,
+	"minecraft:luck":                     0.0,
+	"minecraft:max_absorption":           0.0,
+	"minecraft:safe_fall_distance":       3.0,
+	"minecraft:scale":                    1.0,
+	"minecraft:step_height":              0.6,
+	"minecraft:gravity":                  0.08,
+	"minecraft:jump_strength":            0.42,
+	"minecraft:burning_time":             1.0,
+	"minecraft:explosion_knockback_resistance": 0.0,
+	"minecraft:movement_efficiency":      0.0,
+	"minecraft:oxygen_bonus":             0.0,
+	"minecraft:water_movement_efficiency": 0.0,
+	"minecraft:block_interaction_range":  4.5,
+	"minecraft:entity_interaction_range": 3.0,
+	"minecraft:block_break_speed":        1.0,
+	"minecraft:mining_efficiency":        0.0,
+	"minecraft:sneaking_speed":           0.3,
+	"minecraft:submerged_mining_speed":   0.2,
+	"minecraft:sweeping_damage_ratio":    0.0,
+}
+
+// CanonicalAttributeName normalizes an attribute identifier (supporting both
+// "minecraft:generic.max_health" and 26.1.2 "minecraft:max_health").
+func CanonicalAttributeName(attr string) (string, float64, bool) {
+	a := strings.ToLower(strings.TrimSpace(attr))
+	if !strings.Contains(a, ":") {
+		a = "minecraft:" + a
+	}
+	a = strings.Replace(a, "minecraft:generic.", "minecraft:", 1)
+	a = strings.Replace(a, "minecraft:player.", "minecraft:", 1)
+	a = strings.Replace(a, "minecraft:horse.", "minecraft:", 1)
+	base, ok := defaultAttributeBases[a]
+	return a, base, ok
+}
+
+func (s *Server) getOrCreateAttrLocked(aux *serverCommandAuxState, session *PlayerSession, entityID int32, canonAttr string, defaultBase float64) *attributeInstance {
+	if session != nil {
+		m := aux.playerAttrs[session.Profile.UUID]
+		if m == nil {
+			m = make(map[string]*attributeInstance)
+			aux.playerAttrs[session.Profile.UUID] = m
+		}
+		inst := m[canonAttr]
+		if inst == nil {
+			inst = &attributeInstance{Base: defaultBase, Modifiers: make(map[string]AttributeModifier)}
+			m[canonAttr] = inst
+		}
+		return inst
+	}
+	m := aux.entityAttrs[entityID]
+	if m == nil {
+		m = make(map[string]*attributeInstance)
+		aux.entityAttrs[entityID] = m
+	}
+	inst := m[canonAttr]
+	if inst == nil {
+		if canonAttr == "minecraft:max_health" {
+			if hp := s.MobHealth(entityID); hp > 0 {
+				defaultBase = float64(hp)
+			}
+		}
+		inst = &attributeInstance{Base: defaultBase, Modifiers: make(map[string]AttributeModifier)}
+		m[canonAttr] = inst
+	}
+	return inst
+}
+
+func computeAttributeTotal(inst *attributeInstance) float64 {
+	if inst == nil {
+		return 0
+	}
+	v := inst.Base
+	for _, mod := range inst.Modifiers {
+		if mod.Operation == 0 {
+			v += mod.Amount
+		}
+	}
+	multBase := 0.0
+	for _, mod := range inst.Modifiers {
+		if mod.Operation == 1 {
+			multBase += mod.Amount
+		}
+	}
+	v *= (1.0 + multBase)
+	for _, mod := range inst.Modifiers {
+		if mod.Operation == 2 {
+			v *= (1.0 + mod.Amount)
+		}
+	}
+	return v
+}
+
+// GetTargetAttributeBase returns the base value of attr on session or entityID.
+func (s *Server) GetTargetAttributeBase(session *PlayerSession, entityID int32, attr string) (float64, error) {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return 0, fmt.Errorf("Unknown attribute %q", attr)
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	inst := s.getOrCreateAttrLocked(aux, session, entityID, canon, defBase)
+	return inst.Base, nil
+}
+
+// SetTargetAttributeBase sets the base value of attr on session or entityID.
+func (s *Server) SetTargetAttributeBase(session *PlayerSession, entityID int32, attr string, base float64) error {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return fmt.Errorf("Unknown attribute %q", attr)
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	inst := s.getOrCreateAttrLocked(aux, session, entityID, canon, defBase)
+	inst.Base = base
+	total := computeAttributeTotal(inst)
+	aux.mu.Unlock()
+	s.syncAttributeChange(session, entityID, canon, total)
+	return nil
+}
+
+// ResetTargetAttributeBase resets the base value of attr to its vanilla default.
+func (s *Server) ResetTargetAttributeBase(session *PlayerSession, entityID int32, attr string) (float64, error) {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return 0, fmt.Errorf("Unknown attribute %q", attr)
+	}
+	_ = s.SetTargetAttributeBase(session, entityID, canon, defBase)
+	return defBase, nil
+}
+
+// GetTargetAttributeTotal returns the computed total value of attr (including modifiers).
+func (s *Server) GetTargetAttributeTotal(session *PlayerSession, entityID int32, attr string) (float64, error) {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return 0, fmt.Errorf("Unknown attribute %q", attr)
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	inst := s.getOrCreateAttrLocked(aux, session, entityID, canon, defBase)
+	return computeAttributeTotal(inst), nil
+}
+
+// AddTargetAttributeModifier adds a modifier to attr on session or entityID.
+func (s *Server) AddTargetAttributeModifier(session *PlayerSession, entityID int32, attr, modID string, amount float64, op int) error {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return fmt.Errorf("Unknown attribute %q", attr)
+	}
+	normID := strings.ToLower(strings.TrimSpace(modID))
+	if !strings.Contains(normID, ":") {
+		normID = "minecraft:" + normID
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	inst := s.getOrCreateAttrLocked(aux, session, entityID, canon, defBase)
+	if _, exists := inst.Modifiers[normID]; exists {
+		aux.mu.Unlock()
+		return fmt.Errorf("Modifier %s is already present on attribute %s", normID, canon)
+	}
+	inst.Modifiers[normID] = AttributeModifier{ID: normID, Amount: amount, Operation: op}
+	total := computeAttributeTotal(inst)
+	aux.mu.Unlock()
+	s.syncAttributeChange(session, entityID, canon, total)
+	return nil
+}
+
+// RemoveTargetAttributeModifier removes a modifier from attr on session or entityID.
+func (s *Server) RemoveTargetAttributeModifier(session *PlayerSession, entityID int32, attr, modID string) (bool, error) {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return false, fmt.Errorf("Unknown attribute %q", attr)
+	}
+	normID := strings.ToLower(strings.TrimSpace(modID))
+	if !strings.Contains(normID, ":") {
+		normID = "minecraft:" + normID
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	inst := s.getOrCreateAttrLocked(aux, session, entityID, canon, defBase)
+	if _, exists := inst.Modifiers[normID]; !exists {
+		aux.mu.Unlock()
+		return false, nil
+	}
+	delete(inst.Modifiers, normID)
+	total := computeAttributeTotal(inst)
+	aux.mu.Unlock()
+	s.syncAttributeChange(session, entityID, canon, total)
+	return true, nil
+}
+
+// GetTargetAttributeModifierValue returns the amount of a modifier on attr.
+func (s *Server) GetTargetAttributeModifierValue(session *PlayerSession, entityID int32, attr, modID string) (float64, bool, error) {
+	canon, defBase, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return 0, false, fmt.Errorf("Unknown attribute %q", attr)
+	}
+	normID := strings.ToLower(strings.TrimSpace(modID))
+	if !strings.Contains(normID, ":") {
+		normID = "minecraft:" + normID
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	inst := s.getOrCreateAttrLocked(aux, session, entityID, canon, defBase)
+	mod, exists := inst.Modifiers[normID]
+	if !exists {
+		return 0, false, nil
+	}
+	return mod.Amount, true, nil
+}
+
+func (s *Server) syncAttributeChange(session *PlayerSession, entityID int32, canonAttr string, total float64) {
+	if canonAttr == "minecraft:max_health" {
+		if session != nil {
+			snap := session.Snapshot()
+			if float64(snap.Health) > total && total > 0 {
+				s.SetPlayerHealth(session, float32(total), snap.FoodLevel, snap.FoodSaturation)
+				if session.send != nil {
+					w := protocol.NewWriter(16)
+					w.Float32(float32(total))
+					w.VarInt(snap.FoodLevel)
+					w.Float32(snap.FoodSaturation)
+					_ = session.send(protocol.PlaySetHealth, w.Bytes())
+				}
+			}
+		} else if entityID > 0 && total > 0 {
+			if cur := s.MobHealth(entityID); float64(cur) > total {
+				s.SetMobHealth(entityID, float32(total))
+			}
+		}
+	}
+}
+
+// SetChunkForceLoaded sets or clears the force-loaded status of chunk (cx, cz) in dim.
+func (s *Server) SetChunkForceLoaded(dim string, cx, cz int32, forced bool) bool {
+	if s == nil {
+		return false
+	}
+	normDim := world.NormalizeDimension(dim)
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	m := aux.forceLoadedChunks[normDim]
+	if m == nil {
+		m = make(map[[2]int32]bool)
+		aux.forceLoadedChunks[normDim] = m
+	}
+	key := [2]int32{cx, cz}
+	changed := false
+	if forced {
+		if !m[key] {
+			m[key] = true
+			changed = true
+		}
+	} else {
+		if m[key] {
+			delete(m, key)
+			changed = true
+		}
+	}
+	aux.mu.Unlock()
+	if forced {
+		if cache := s.DimensionChunks(normDim); cache != nil {
+			_ = cache.GetBlock(int(cx)*16, 64, int(cz)*16)
+		}
+	}
+	return changed
+}
+
+// IsChunkForceLoaded reports whether chunk (cx, cz) in dim is force-loaded.
+func (s *Server) IsChunkForceLoaded(dim string, cx, cz int32) bool {
+	if s == nil {
+		return false
+	}
+	normDim := world.NormalizeDimension(dim)
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	m := aux.forceLoadedChunks[normDim]
+	return m != nil && m[[2]int32{cx, cz}]
+}
+
+// ForceLoadedChunks returns all force-loaded chunk coordinates in dim.
+func (s *Server) ForceLoadedChunks(dim string) [][2]int32 {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	m := aux.forceLoadedChunks[normDim]
+	out := make([][2]int32, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// ClearForceLoadedChunks removes all force-loaded chunks in dim.
+func (s *Server) ClearForceLoadedChunks(dim string) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	n := len(aux.forceLoadedChunks[normDim])
+	delete(aux.forceLoadedChunks, normDim)
+	return n
+}
+
+// TickState returns the current tick rate, frozen status, step ticks, and sprint ticks.
+func (s *Server) TickState() (rate float32, frozen bool, stepTicks, sprintTicks int) {
+	if s == nil {
+		return 20.0, false, 0, 0
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	return aux.tickRate, aux.tickFrozen, aux.tickStepTicks, aux.tickSprintTicks
+}
+
+// SetTickRate updates the target server tick rate (1..10000 TPS).
+func (s *Server) SetTickRate(rate float32) {
+	if s == nil {
+		return
+	}
+	if rate < 1.0 {
+		rate = 1.0
+	}
+	if rate > 10000.0 {
+		rate = 10000.0
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	aux.tickRate = rate
+	aux.mu.Unlock()
+}
+
+// SetTickFrozen sets whether the server tick loop is frozen.
+func (s *Server) SetTickFrozen(frozen bool) {
+	if s == nil {
+		return
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	aux.tickFrozen = frozen
+	if !frozen {
+		aux.tickStepTicks = 0
+	}
+	aux.mu.Unlock()
+}
+
+// StepServerTicks schedules ticks to advance while frozen (or stops stepping when ticks == 0).
+func (s *Server) StepServerTicks(ticks int) bool {
+	if s == nil {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	if ticks > 0 && !aux.tickFrozen {
+		return false
+	}
+	aux.tickStepTicks = ticks
+	return true
+}
+
+// SprintServerTicks schedules ticks to sprint at maximum speed (or stops sprinting when ticks == 0).
+func (s *Server) SprintServerTicks(ticks int) (wasActive bool) {
+	if s == nil {
+		return false
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	wasActive = aux.tickSprintTicks > 0
+	aux.tickSprintTicks = ticks
+	return wasActive
+}
+
+// KickPlayer disconnects session with aPlayDisconnect packet and unregisters them.
+func (s *Server) KickPlayer(session *PlayerSession, reason string) {
+	if s == nil || session == nil {
+		return
+	}
+	if reason == "" {
+		reason = "Kicked by an operator"
+	}
+	if session.send != nil {
+		w := protocol.NewWriter(len(reason) + 8)
+		w.Raw(nbt.Marshal(nbt.String(reason)))
+		_ = session.send(protocol.PlayDisconnect, w.Bytes())
+	}
+	s.UnregisterPlayer(session)
+}
+
+// BanPlayer adds name to the banned players list and kicks them if online.
+func (s *Server) BanPlayer(name, reason string) bool {
+	if s == nil {
+		return false
+	}
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return false
+	}
+	if reason == "" {
+		reason = "Banned by an operator."
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	if _, exists := aux.bannedPlayers[key]; exists {
+		aux.mu.Unlock()
+		return false
+	}
+	aux.bannedPlayers[key] = BanEntry{Target: strings.TrimSpace(name), Reason: reason}
+	aux.mu.Unlock()
+	if online := s.PlayerByName(name); online != nil {
+		s.KickPlayer(online, "You are banned from this server. Reason: "+reason)
+	}
+	return true
+}
+
+// PardonPlayer removes name from the banned players list.
+func (s *Server) PardonPlayer(name string) bool {
+	if s == nil {
+		return false
+	}
+	key := strings.ToLower(strings.TrimSpace(name))
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	if _, exists := aux.bannedPlayers[key]; !exists {
+		return false
+	}
+	delete(aux.bannedPlayers, key)
+	return true
+}
+
+// BannedPlayers returns all active player bans.
+func (s *Server) BannedPlayers() []BanEntry {
+	if s == nil {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	out := make([]BanEntry, 0, len(aux.bannedPlayers))
+	for _, b := range aux.bannedPlayers {
+		out = append(out, b)
+	}
+	return out
+}
+
+// BanIP adds ip to the banned IP list.
+func (s *Server) BanIP(ip, reason string) bool {
+	if s == nil {
+		return false
+	}
+	key := strings.ToLower(strings.TrimSpace(ip))
+	if key == "" {
+		return false
+	}
+	if reason == "" {
+		reason = "Banned by an operator."
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	if _, exists := aux.bannedIPs[key]; exists {
+		return false
+	}
+	aux.bannedIPs[key] = BanEntry{Target: strings.TrimSpace(ip), Reason: reason}
+	return true
+}
+
+// PardonIP removes ip from the banned IP list.
+func (s *Server) PardonIP(ip string) bool {
+	if s == nil {
+		return false
+	}
+	key := strings.ToLower(strings.TrimSpace(ip))
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	if _, exists := aux.bannedIPs[key]; !exists {
+		return false
+	}
+	delete(aux.bannedIPs, key)
+	return true
+}
+
+// BannedIPs returns all active IP bans.
+func (s *Server) BannedIPs() []BanEntry {
+	if s == nil {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	out := make([]BanEntry, 0, len(aux.bannedIPs))
+	for _, b := range aux.bannedIPs {
+		out = append(out, b)
+	}
+	return out
+}
+
+// TransferPlayer sends a ClientboundTransferPacket (0x7f) to session.
+func (s *Server) TransferPlayer(session *PlayerSession, host string, port int) {
+	if session == nil || session.send == nil {
+		return
+	}
+	w := protocol.NewWriter(len(host) + 8)
+	w.String(host)
+	w.VarInt(int32(port))
+	_ = session.send(PlayTransferCB, w.Bytes())
+}
+
+// CommandStorage returns or initializes the NBT compound for command storage id.
+func (s *Server) CommandStorage(id string) *nbt.Compound {
+	if s == nil {
+		return nbt.NewCompound()
+	}
+	norm := strings.ToLower(strings.TrimSpace(id))
+	if !strings.Contains(norm, ":") {
+		norm = "minecraft:" + norm
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	c := aux.commandStorage[norm]
+	if c == nil {
+		c = nbt.NewCompound()
+		aux.commandStorage[norm] = c
+	}
+	return c
+}
+
+// DeleteCommandStorageKey removes key from the command storage compound id.
+func (s *Server) DeleteCommandStorageKey(id, key string) bool {
+	if s == nil {
+		return false
+	}
+	norm := strings.ToLower(strings.TrimSpace(id))
+	if !strings.Contains(norm, ":") {
+		norm = "minecraft:" + norm
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	c := aux.commandStorage[norm]
+	if c == nil {
+		return false
+	}
+	if _, ok := c.Get(key); !ok {
+		return false
+	}
+	next := nbt.NewCompound()
+	for _, k := range c.Keys() {
+		if k == key {
+			continue
+		}
+		if v, ok := c.Get(k); ok {
+			next.Set(k, v)
+		}
+	}
+	aux.commandStorage[norm] = next
+	return true
+}
+
+func (s *Server) broadcastBlockUpdate(x, y, z int, state uint16) {
+	s.broadcastBlockUpdateInDim(world.DimensionOverworld, x, y, z, state)
+}
+
+
+
 
