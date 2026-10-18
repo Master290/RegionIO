@@ -597,6 +597,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickPrimedTNT()
 			h.srv.TickDispenserProjectiles()
 			h.srv.TickAllPlayerStats()
+			h.srv.TickAllBlockUpdates()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
 			}

@@ -2225,5 +2225,43 @@ func (s *Server) LoadWardenFile() error {
 	return nil
 }
 
+// TickDimensionBlockUpdates advances scheduled block updates and falling blocks
+// in dim by one game tick, broadcasts block/light changes, and processes any
+// falling anvil landings via ProcessFallingBlockLandings.
+func (s *Server) TickDimensionBlockUpdates(dim string) world.BlockUpdateResult {
+	if s == nil {
+		return world.BlockUpdateResult{}
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return world.BlockUpdateResult{}
+	}
+	res := cache.TickBlockUpdates()
+	if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+	}
+	s.ProcessFallingBlockLandings(normDim, res.Landings, nil)
+	return res
+}
+
+// TickAllBlockUpdates advances scheduled block updates and falling block landings
+// across all initialized dimensions.
+func (s *Server) TickAllBlockUpdates() {
+	if s == nil {
+		return
+	}
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		ds := s.dimState()
+		ds.mu.Lock()
+		cache := ds.caches[dim]
+		ds.mu.Unlock()
+		if dim == world.DimensionOverworld || cache != nil {
+			s.TickDimensionBlockUpdates(dim)
+		}
+	}
+}
+
+
 
 

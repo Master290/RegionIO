@@ -1836,6 +1836,29 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 		}
 		return baseState
 	}
+	if IsAnvilBlock(baseState) {
+		anvilFacing := clockwiseHorizontalDirection(horizLookDir)
+		if st := AnvilBlockState(world.BlockName(baseState), anvilFacing); st != 0 {
+			return st
+		}
+		return baseState
+	}
+	if IsGrindstoneBlock(baseState) {
+		gsFace := "wall"
+		gsFacing := faceName
+		switch faceName {
+		case "up":
+			gsFace = "floor"
+			gsFacing = horizLookDir
+		case "down":
+			gsFace = "ceiling"
+			gsFacing = horizLookDir
+		}
+		if st := GrindstoneBlockState(gsFace, gsFacing); st != 0 {
+			return st
+		}
+		return baseState
+	}
 	switch world.BlockName(baseState) {
 	case "minecraft:observer":
 		if st, ok := world.WithBlockProperty(baseState, "facing", world.ObserverFacingForPlacement(lookDir)); ok {
@@ -1860,6 +1883,21 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 		}
 	}
 	return baseState
+}
+
+func clockwiseHorizontalDirection(dir string) string {
+	switch dir {
+	case "north":
+		return "east"
+	case "east":
+		return "south"
+	case "south":
+		return "west"
+	case "west":
+		return "north"
+	default:
+		return "north"
+	}
 }
 
 // BreakDispenserOrDropper drops all stored items from a broken dispenser or
