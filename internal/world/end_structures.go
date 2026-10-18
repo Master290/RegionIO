@@ -1,6 +1,7 @@
 package world
 
 import (
+	"strings"
 	"sync"
 
 	"regionio/internal/worldgen"
@@ -389,56 +390,19 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 		if len(piece.Blocks) == 0 || !piece.Box.intersects(chunkBox) {
 			continue
 		}
+		// Pass 1: template.placeInWorld (regular blocks and template block entities).
 		for _, b := range piece.Blocks {
+			if b.BlockName == "minecraft:structure_block" || b.BlockName == "minecraft:structure_void" || b.BlockName == "minecraft:jigsaw" {
+				continue
+			}
+			if b.State == StateAir && !piece.Overwrite {
+				continue
+			}
 			rel := worldgen.TransformBlockPos(b.Pos, "none", piece.Rot, [3]int{0, 0, 0})
 			wx := piece.Pos[0] + rel[0]
 			wy := piece.Pos[1] + rel[1]
 			wz := piece.Pos[2] + rel[2]
 			if !chunkBox.isInside(wx, wy, wz) {
-				continue
-			}
-			if b.BlockName == "minecraft:structure_block" {
-				switch b.Marker {
-				case "Chest":
-					c.AddStructureBlockEntity(StructureBlockEntity{
-						ID:            "minecraft:chest",
-						X:             wx,
-						Y:             wy - 1,
-						Z:             wz,
-						LootTable:     "minecraft:chests/end_city_treasure",
-						LootTableSeed: blockPosAsLong(wx, wy-1, wz),
-					})
-				case "Sentry":
-					c.AddStructureEntity(StructureEntity{
-						ID:                  "minecraft:shulker",
-						X:                   float64(wx) + 0.5,
-						Y:                   float64(wy),
-						Z:                   float64(wz) + 0.5,
-						BlockX:              wx,
-						BlockY:              wy,
-						BlockZ:              wz,
-						PersistenceRequired: true,
-					})
-				case "Elytra":
-					c.AddStructureEntity(StructureEntity{
-						ID:                  "minecraft:item_frame",
-						X:                   float64(wx) + 0.5,
-						Y:                   float64(wy) + 0.5,
-						Z:                   float64(wz) + 0.5,
-						BlockX:              wx,
-						BlockY:              wy,
-						BlockZ:              wz,
-						Rotation:            piece.Rot,
-						Item:                "minecraft:elytra",
-						PersistenceRequired: true,
-					})
-				}
-				continue
-			}
-			if b.BlockName == "minecraft:structure_void" || b.BlockName == "minecraft:jigsaw" {
-				continue
-			}
-			if b.State == StateAir && !piece.Overwrite {
 				continue
 			}
 			st := rotateTemplateState(b.State, piece.Rot)
@@ -447,6 +411,61 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 				if be, ok := extractTemplateBlockEntity(wx, wy, wz, b.BlockName, b.NBT, blockPosAsLong(wx, wy, wz)); ok {
 					c.AddStructureBlockEntity(be)
 				}
+			} else if be, ok := defaultBlockEntityForBlock(b.BlockName, wx, wy, wz); ok {
+				c.AddStructureBlockEntity(be)
+			} else {
+				c.RemoveStructureBlockEntity(wx, wy, wz)
+			}
+		}
+		// Pass 2: TemplateStructurePiece.postProcess -> handleDataMarker on STRUCTURE_BLOCK.
+		for _, b := range piece.Blocks {
+			if b.BlockName != "minecraft:structure_block" || b.Marker == "" {
+				continue
+			}
+			rel := worldgen.TransformBlockPos(b.Pos, "none", piece.Rot, [3]int{0, 0, 0})
+			wx := piece.Pos[0] + rel[0]
+			wy := piece.Pos[1] + rel[1]
+			wz := piece.Pos[2] + rel[2]
+			if strings.HasPrefix(b.Marker, "Chest") {
+				if chunkBox.isInside(wx, wy-1, wz) {
+					c.AddStructureBlockEntity(StructureBlockEntity{
+						ID:            "minecraft:chest",
+						X:             wx,
+						Y:             wy - 1,
+						Z:             wz,
+						LootTable:     "minecraft:chests/end_city_treasure",
+						LootTableSeed: blockPosAsLong(wx, wy-1, wz),
+					})
+				}
+				continue
+			}
+			if !chunkBox.isInside(wx, wy, wz) {
+				continue
+			}
+			if strings.HasPrefix(b.Marker, "Sentry") {
+				c.AddStructureEntity(StructureEntity{
+					ID:                  "minecraft:shulker",
+					X:                   float64(wx) + 0.5,
+					Y:                   float64(wy),
+					Z:                   float64(wz) + 0.5,
+					BlockX:              wx,
+					BlockY:              wy,
+					BlockZ:              wz,
+					PersistenceRequired: true,
+				})
+			} else if strings.HasPrefix(b.Marker, "Elytra") {
+				c.AddStructureEntity(StructureEntity{
+					ID:                  "minecraft:item_frame",
+					X:                   float64(wx) + 0.5,
+					Y:                   float64(wy) + 0.5,
+					Z:                   float64(wz) + 0.5,
+					BlockX:              wx,
+					BlockY:              wy,
+					BlockZ:              wz,
+					Rotation:            piece.Rot,
+					Item:                "minecraft:elytra",
+					PersistenceRequired: true,
+				})
 			}
 		}
 	}

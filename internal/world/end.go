@@ -458,7 +458,7 @@ func PlaceEndSpikes(c *Chunk, seed int64) {
 			continue
 		}
 		rSq := s.Radius*s.Radius + 1
-		for y := 0; y < s.Height+10; y++ {
+		for y := 0; y <= s.Height+10; y++ {
 			for x := s.CenterX - s.Radius; x <= s.CenterX+s.Radius; x++ {
 				for z := s.CenterZ - s.Radius; z <= s.CenterZ+s.Radius; z++ {
 					dx := x - s.CenterX
@@ -479,17 +479,19 @@ func PlaceEndSpikes(c *Chunk, seed int64) {
 					for dy := 0; dy <= 3; dy++ {
 						top := dy == 3
 						if edgeX || edgeZ || top {
+							connNS := edgeX || top
+							connWE := edgeZ || top
 							mask := 0
-							if edgeX && dz != -2 {
+							if connNS && dz != -2 {
 								mask |= 1 // north
 							}
-							if edgeX && dz != 2 {
+							if connNS && dz != 2 {
 								mask |= 2 // south
 							}
-							if edgeZ && dx != -2 {
+							if connWE && dx != -2 {
 								mask |= 4 // west
 							}
-							if edgeZ && dx != 2 {
+							if connWE && dx != 2 {
 								mask |= 8 // east
 							}
 							setEndBlock(c, s.CenterX+dx, s.Height+dy, s.CenterZ+dz, eb.ironBars[mask])
