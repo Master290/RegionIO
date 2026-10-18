@@ -775,7 +775,7 @@ const (
 	CopperGolemStageAdvanceTicks = 12000
 )
 
-// CopperGolemState tracks per-entity oxidation stage, wax state, pose, and facing for a `minecraft:copper_golem`.
+// CopperGolemState tracks per-entity oxidation stage, wax state, pose, facing, and custom name for a `minecraft:copper_golem`.
 type CopperGolemState struct {
 	EntityID       int32
 	Dimension      string
@@ -783,6 +783,7 @@ type CopperGolemState struct {
 	Waxed          bool
 	Pose           string
 	Facing         string
+	CustomName     string
 	OxidationTicks int
 }
 
@@ -808,7 +809,8 @@ func (s *Server) copperGolemMgr() *copperGolemManager {
 
 // EnsureCopperGolemStatueReviveHook registers the server's `SetCopperGolemStatueReviveHook`
 // callback so scraping an unoxidized, unwaxed `minecraft:copper_golem_statue` with an axe
-// revives it into a living `minecraft:copper_golem` entity.
+// revives it into a living `minecraft:copper_golem` entity, restoring any saved
+// `CustomName` and `EntityUUID` from `GetCopperGolemStatueAt` and clearing the statue record.
 func (s *Server) EnsureCopperGolemStatueReviveHook() {
 	if s == nil {
 		return
@@ -823,8 +825,33 @@ func (s *Server) EnsureCopperGolemStatueReviveHook() {
 	mgr.mu.Unlock()
 
 	s.SetCopperGolemStatueReviveHook(func(dim string, x, y, z int, facing string) (int32, bool) {
+		statueBE, hasBE := s.GetCopperGolemStatueAt(dim, x, y, z)
+		s.RemoveCopperGolemStatueAt(dim, x, y, z)
+
 		id, err := s.SpawnCopperGolem(dim, float64(x)+0.5, float64(y), float64(z)+0.5, facing)
-		return id, err == nil && id > 0
+		if err != nil || id <= 0 {
+			return 0, false
+		}
+		if hasBE && statueBE != nil {
+			if statueBE.HasUUID && statueBE.EntityUUID != ([16]byte{}) && s.entities != nil {
+				uuid := statueBE.EntityUUID
+				s.entities.Update(id, func(e *world.Entity) {
+					e.UUID = uuid
+				})
+			}
+			if statueBE.CustomName != "" {
+				s.SetCopperGolemCustomName(id, statueBE.CustomName)
+			}
+			if statueBE.Pose != "" {
+				mgr := s.copperGolemMgr()
+				mgr.mu.Lock()
+				if st := mgr.golems[id]; st != nil {
+					st.Pose = statueBE.Pose
+				}
+				mgr.mu.Unlock()
+			}
+		}
+		return id, true
 	})
 }
 
@@ -949,10 +976,26 @@ func (s *Server) SetCopperGolemState(entityID int32, stage world.CopperOxidation
 	return true
 }
 
+// SetCopperGolemCustomName sets the CustomName on a living Copper Golem.
+func (s *Server) SetCopperGolemCustomName(entityID int32, name string) bool {
+	if s == nil {
+		return false
+	}
+	mgr := s.copperGolemMgr()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	st, ok := mgr.golems[entityID]
+	if !ok || st == nil {
+		return false
+	}
+	st.CustomName = name
+	return true
+}
+
 // PetrifyCopperGolemIntoStatue petrifies a fully oxidized `minecraft:copper_golem`
 // into an `oxidized_copper_golem_statue` (or `waxed_oxidized_copper_golem_statue`)
-// block by invoking `s.TurnCopperGolemIntoStatue(dimension, x, y, z, facing, pose, waxed)`
-// and despawning the mob entity.
+// block by invoking `s.TurnCopperGolemIntoStatue(dimension, x, y, z, facing, pose, waxed)`,
+// saving `CustomName` and `EntityUUID` via `s.SetCopperGolemStatueAt`, and despawning the mob entity.
 func (s *Server) PetrifyCopperGolemIntoStatue(entityID int32, rng *rand.Rand) (statueState uint16, ok bool) {
 	if s == nil || s.entities == nil {
 		return 0, false
@@ -961,13 +1004,17 @@ func (s *Server) PetrifyCopperGolemIntoStatue(entityID int32, rng *rand.Rand) (s
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCopperGolem {
 		return 0, false
 	}
+	entUUID := ent.UUID
+	hasUUID := entUUID != ([16]byte{})
+
 	mgr := s.copperGolemMgr()
 	mgr.mu.Lock()
 	st := mgr.golems[entityID]
 	var (
-		facing = cardinalFacingFromYaw(ent.Yaw)
-		pose   = "standing"
-		waxed  = false
+		facing     = cardinalFacingFromYaw(ent.Yaw)
+		pose       = "standing"
+		waxed      = false
+		customName string
 	)
 	if st != nil {
 		if st.Facing != "" {
@@ -980,6 +1027,7 @@ func (s *Server) PetrifyCopperGolemIntoStatue(entityID int32, rng *rand.Rand) (s
 			pose = poses[rng.Intn(len(poses))]
 		}
 		waxed = st.Waxed
+		customName = st.CustomName
 		delete(mgr.golems, entityID)
 	}
 	mgr.mu.Unlock()
@@ -992,6 +1040,20 @@ func (s *Server) PetrifyCopperGolemIntoStatue(entityID int32, rng *rand.Rand) (s
 	statueState, ok = s.TurnCopperGolemIntoStatue(dim, bx, by, bz, facing, pose, waxed)
 	if !ok {
 		return 0, false
+	}
+	if customName != "" || hasUUID {
+		s.SetCopperGolemStatueAt(&CopperGolemStatueBlockEntity{
+			Dimension:  dim,
+			X:          bx,
+			Y:          by,
+			Z:          bz,
+			Pose:       pose,
+			Stage:      world.CopperStageOxidized,
+			Waxed:      waxed,
+			CustomName: customName,
+			EntityUUID: entUUID,
+			HasUUID:    hasUUID,
+		})
 	}
 	cp := ent.ChunkPos()
 	s.entities.Remove(entityID)

@@ -421,9 +421,12 @@ func TestCopperGolemAndLightningHooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SpawnCopperGolem failed: %v", err)
 	}
-	if _, ok := s.GetCopperGolemState(golemID); !ok {
-		t.Fatalf("missing CopperGolemState for %d", golemID)
+	origEnt := s.entities.Get(golemID)
+	if origEnt == nil {
+		t.Fatalf("missing copper golem entity %d", golemID)
 	}
+	origUUID := origEnt.UUID
+	s.SetCopperGolemCustomName(golemID, "CopperBuddy")
 	s.SetCopperGolemState(golemID, world.CopperStageOxidized, false, "sitting")
 
 	statueBlock, ok := s.PetrifyCopperGolemIntoStatue(golemID, nil)
@@ -435,6 +438,10 @@ func TestCopperGolemAndLightningHooks(t *testing.T) {
 	}
 	if _, ok := s.GetCopperGolemState(golemID); ok {
 		t.Fatalf("expected copper golem entity %d to be despawned after turning into statue", golemID)
+	}
+	statueBE, hasBE := s.GetCopperGolemStatueAt(world.DimensionOverworld, 14, 65, 14)
+	if !hasBE || statueBE == nil || statueBE.CustomName != "CopperBuddy" || !statueBE.HasUUID || statueBE.EntityUUID != origUUID {
+		t.Fatalf("expected statue block entity to preserve CustomName=CopperBuddy and EntityUUID: got %+v", statueBE)
 	}
 
 	// Scrape statue down to unaffected, then scrape once more to revive copper golem via hook.
@@ -454,6 +461,9 @@ func TestCopperGolemAndLightningHooks(t *testing.T) {
 	}
 	if got := s.chunks.GetBlock(14, 65, 14); got != world.StateAir {
 		t.Fatalf("expected statue block to break on revive, got %d (%s)", got, world.BlockName(got))
+	}
+	if _, stillHasBE := s.GetCopperGolemStatueAt(world.DimensionOverworld, 14, 65, 14); stillHasBE {
+		t.Fatalf("expected statue block entity record to be removed after revival")
 	}
 }
 
