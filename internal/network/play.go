@@ -1605,6 +1605,20 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			dim = h.session.Dimension()
 		}
 		if cache := h.srv.PlayerChunks(h.session); cache != nil {
+			if h.session == nil || !h.session.IsSneaking() {
+				if world.IsFenceGateBlock(cache.GetBlock(x, y, z)) {
+					playerFacing := "south"
+					if h.session != nil {
+						playerFacing = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
+					}
+					if _, toggled := h.srv.InteractFenceGate(h.session, dim, x, y, z, playerFacing); toggled {
+						return h.sendBlockChangedAck(seq)
+					}
+				}
+				if _, toggled := h.srv.InteractDoorWithPartner(h.session, dim, x, y, z); toggled {
+					return h.sendBlockChangedAck(seq)
+				}
+			}
 			if handled, res := cache.InteractRedstoneBlock(x, y, z); handled {
 				h.broadcastBlockChanges(dim, cache, res)
 				newState := cache.GetBlock(x, y, z)
@@ -1624,6 +1638,16 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
 				}
 				heldItem := h.session.InventorySlot(invSlot)
+				if world.IsSnowLayerBlock(cache.GetBlock(x, y, z)) && heldItem.ResolvedID() == "minecraft:snow" {
+					creative := h.session.Snapshot().GameMode == server.GameModeCreative
+					if newStack, stacked := h.srv.StackSnowLayerWithItem(dim, x, y, z, heldItem, creative); stacked {
+						if invSlot >= 0 {
+							h.session.SetInventorySlot(invSlot, newStack)
+						}
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if server.IsEnderEyeItem(heldItem) && world.IsEndPortalFrameState(cache.GetBlock(x, y, z)) {
 					if placedEye, _, _, err := h.srv.UseEyeOfEnderOnFrame(h.session, x, y, z); err != nil {
 						return err
@@ -1783,6 +1807,11 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				if h.srv != nil {
 					state = h.srv.ResolvePlacedBlockState(h.session, state, face)
 				}
+				if world.IsFenceGateBlock(state) && h.session != nil {
+					if fgState, ok := cache.ResolveFenceGatePlacementAt(px, py, pz, world.BlockName(state), server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)); ok {
+						state = fgState
+					}
+				}
 				placed := false
 				if server.IsBedBlock(state) && h.srv != nil {
 					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)
@@ -1794,6 +1823,11 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						}
 					}
 					if dp, _ := h.srv.PlaceDecoratedPotAt(dim, px, py, pz, server.DecoratedPotFacing(state), sherds); dp != nil {
+						placed = true
+					}
+				} else if world.BlockName(state) == "minecraft:wet_sponge" && h.srv != nil {
+					if finalSt, _ := h.srv.PlaceWetSpongeAt(dim, px, py, pz); finalSt != world.StateAir {
+						state = finalSt
 						placed = true
 					}
 				} else if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {

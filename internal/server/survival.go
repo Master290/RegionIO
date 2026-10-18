@@ -402,6 +402,24 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return true, 0
 	}
 
+	if world.IsIceBlock(prevState) {
+		s.BreakIceBlock(dim, x, y, z, heldStack, toolMeta, mode == GameModeCreative)
+		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+		s.OnSculkBlockBroken(dim, x, y, z, prevState)
+		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
+		if mode == GameModeSurvival {
+			s.RecordBlockBreakExhaustion(session)
+			s.RecordBlockMined(session, world.BlockName(prevState))
+			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
+				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
+				if s.DamagePlayerItem(session, heldSlot, 1) {
+					s.RecordItemBroken(session, heldStack.ResolvedID())
+				}
+			}
+		}
+		return true, 0
+	}
+
 	if IsCampfireBlock(prevState) {
 		if mode == GameModeSurvival && s.DoTileDrops() {
 			s.BreakCampfireAt(dim, x, y, z, HasSilkTouch(toolMeta))
