@@ -586,6 +586,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickCrafters()
 			h.srv.TickCampfires()
 			h.srv.TickAllPlayersCampfireContactDamage()
+			h.srv.TickFire()
 			h.srv.TickWorldBorder()
 			h.srv.TickJukeboxes()
 			h.srv.TickBeacons()
@@ -1383,7 +1384,8 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	if _, err := r.ReadByte(); err != nil { // face
+	faceByte, err := r.ReadByte() // face
+	if err != nil {
 		return err
 	}
 	seq, err := r.VarInt()
@@ -1395,6 +1397,16 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	}
 
 	if h.srv != nil {
+		if status == server.PlayerActionStartDestroyBlock && int(faceByte) < len(faceOffsets) {
+			dim := world.DimensionOverworld
+			if h.session != nil {
+				dim = h.session.Dimension()
+			}
+			off := faceOffsets[faceByte]
+			if h.srv.ExtinguishFireAt(dim, x+off[0], y+off[1], z+off[2]) {
+				return h.sendBlockChangedAck(seq)
+			}
+		}
 		if broken, _ := h.srv.BreakBlock(h.session, x, y, z, status); broken {
 			h.syncHotbarFromSession()
 			h.log.Debug("block broken", "x", x, "y", y, "z", z)
@@ -1661,6 +1673,28 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	}
 
 	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {
+		if h.srv != nil && h.session != nil {
+			invSlot := h.session.HeldInventorySlot()
+			if hand == server.HandOffHand {
+				invSlot = server.OffHandContainerSlot
+			}
+			if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+				h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+			}
+			heldStack := h.session.InventorySlot(invSlot)
+			itemID := heldStack.ResolvedID()
+			if itemID == "minecraft:flint_and_steel" || itemID == "minecraft:fire_charge" {
+				dim := h.session.Dimension()
+				creative := h.session.Snapshot().GameMode == server.GameModeCreative
+				if newStack, handled := h.srv.TryIgniteBlockOrTNTWithItem(dim, x, y, z, face, heldStack, creative); handled {
+					if invSlot >= 0 {
+						h.session.SetInventorySlot(invSlot, newStack)
+					}
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
+		}
 		if h.isHoldingFlintAndSteel() && h.srv != nil {
 			if h.session != nil && h.session.HeldItem().IsEmpty() && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) {
 				if flintID, ok := world.ItemNameToID("minecraft:flint_and_steel"); ok && h.hotbar[h.heldSlot] == flintID {

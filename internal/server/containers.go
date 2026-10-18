@@ -514,9 +514,35 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		}
 		return false, 0, nil
 	case IsBedBlock(state):
+		dim := world.NormalizeDimension(session.Dimension())
+		if dt, _ := world.LookupDimensionType(dim); !dt.BedWorks {
+			headPos, footPos, hasPartner := ResolveBedPositions(cache, x, y, z)
+			s.WakePlayersInBedAt(dim, headPos.X, headPos.Y, headPos.Z)
+			if broken, upd := cache.BreakBlockWithUpdates(headPos.X, headPos.Y, headPos.Z); broken {
+				s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+			}
+			if hasPartner {
+				if broken, upd := cache.BreakBlockWithUpdates(footPos.X, footPos.Y, footPos.Z); broken {
+					s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+				}
+			}
+			s.ExplodeBlock(dim, headPos.X, headPos.Y, headPos.Z, 5.0, true)
+			return true, 0, nil
+		}
 		s.InteractBed(session, x, y, z)
 		return true, 0, nil
 	case IsRespawnAnchorBlock(state):
+		dim := world.NormalizeDimension(session.Dimension())
+		charges := RespawnAnchorCharges(state)
+		if !(IsGlowstoneItem(session.HeldItem()) && charges < MaxRespawnAnchorCharges) && charges > 0 {
+			if dt, _ := world.LookupDimensionType(dim); !dt.RespawnAnchorWorks {
+				if broken, upd := cache.BreakBlockWithUpdates(x, y, z); broken {
+					s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+				}
+				s.ExplodeBlock(dim, x, y, z, 5.0, true)
+				return true, 0, nil
+			}
+		}
 		return s.InteractRespawnAnchor(session, x, y, z), 0, nil
 	case IsDispenserOrDropperBlock(state):
 		if session.IsSneaking() && !session.HeldItem().IsEmpty() {

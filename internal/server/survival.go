@@ -394,6 +394,14 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return true, 0
 	}
 
+	if world.IsFireBlock(prevState) {
+		s.ExtinguishFireAt(dim, x, y, z)
+		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+		s.OnSculkBlockBroken(dim, x, y, z, prevState)
+		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
+		return true, 0
+	}
+
 	if IsCampfireBlock(prevState) {
 		if mode == GameModeSurvival && s.DoTileDrops() {
 			s.BreakCampfireAt(dim, x, y, z, HasSilkTouch(toolMeta))
@@ -411,6 +419,19 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		s.RemoveEndGatewayAt(dim, x, y, z)
 	}
 	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+	if world.IsTNTBlock(prevState) {
+		usedShears := canonicalResourceName(heldStack.ResolvedID()) == "minecraft:shears"
+		if mode != GameModeCreative && s.HandleTNTBlockBreak(dim, x, y, z, prevState, usedShears) {
+			s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
+			s.OnSculkBlockBroken(dim, x, y, z, prevState)
+			s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:tnt")
+			if mode == GameModeSurvival {
+				s.RecordBlockBreakExhaustion(session)
+				s.RecordBlockMined(session, "minecraft:tnt")
+			}
+			return true, 0
+		}
+	}
 	s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
 	if y+1 < world.MinY+world.WorldHeight && IsCampfireBlock(cache.GetBlock(x, y+1, z)) {
 		s.UpdateCampfireSignalFire(dim, x, y+1, z)
@@ -2019,3 +2040,120 @@ func (s *Server) TickAllPlayersCampfireContactDamage() {
 		s.ApplyCampfireContactDamageToPlayer(sess)
 	}
 }
+
+// ExplodeBlock triggers a block-category explosion (bed in Nether/End, respawn
+// anchor outside Nether) at (x+0.5, y+0.5, z+0.5) in dimension with radius and causesFire.
+func (s *Server) ExplodeBlock(dimension string, x, y, z int, radius float64, causesFire bool) ExplosionResult {
+	if s == nil {
+		return ExplosionResult{}
+	}
+	return s.DetonateExplosion(ExplosionOptions{
+		Dimension:   dimension,
+		X:           float64(x) + 0.5,
+		Y:           float64(y) + 0.5,
+		Z:           float64(z) + 0.5,
+		Radius:      radius,
+		Category:    ExplosionSourceBlock,
+		DamageCause: "bad_respawn_point",
+		CausesFire:  causesFire,
+	})
+}
+
+// TryIgniteBlockOrTNTWithItem handles right-clicking block (x, y, z) on face
+// (0..5) with flint_and_steel or fire_charge, priming TNT, lighting campfires/
+// candles/portals, or placing fire.
+func (s *Server) TryIgniteBlockOrTNTWithItem(dimension string, x, y, z int, face int32, heldStack world.ItemStack, creative bool) (world.ItemStack, bool) {
+	if s == nil || heldStack.IsEmpty() {
+		return heldStack, false
+	}
+	faceName := BlockFaceDirectionName(face)
+	var dummySess *PlayerSession
+	if creative {
+		dummySess = &PlayerSession{gameMode: GameModeCreative, health: 20}
+	}
+	nextStack, _, ok := s.IgniteBlockWithItem(dummySess, dimension, x, y, z, faceName, heldStack, ItemMeta{})
+	return nextStack, ok
+}
+
+// HandleTNTBlockBreak checks whether breaking a minecraft:tnt block with state
+// at (x, y, z) in dimension should prime the TNT instead of dropping an item
+// (i.e. when unstable=true and not broken with shears).
+func (s *Server) HandleTNTBlockBreak(dimension string, x, y, z int, state uint16, usedShears bool) bool {
+	if s == nil || !world.IsTNTBlock(state) {
+		return false
+	}
+	if world.IsUnstableTNTState(state) && !usedShears {
+		if s.TNTExplodes() {
+			s.SpawnPrimedTNTWithFuse(dimension, float64(x)+0.5, float64(y), float64(z)+0.5, DefaultPrimedTNTFuseTicks, nil)
+		}
+		return true
+	}
+	return false
+}
+
+// FireContactDamage records fire contact damage applied to a player standing in fire or soul_fire.
+type FireContactDamage struct {
+	Player       *PlayerSession
+	Damage       float32
+	SetFireTicks int
+}
+
+// CheckPlayersInFire checks all connected players for contact with fire (1.0 damage,
+// 160 fire ticks) or soul_fire (2.0 damage, 160 fire ticks) and applies contact damage.
+func (s *Server) CheckPlayersInFire() []FireContactDamage {
+	if s == nil {
+		return nil
+	}
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, sess := range s.players {
+		sessions = append(sessions, sess)
+	}
+	s.playersMu.RUnlock()
+
+	var out []FireContactDamage
+	for _, sess := range sessions {
+		if sess == nil || sess.IsDead() {
+			continue
+		}
+		snap := sess.Snapshot()
+		if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator || snap.Health <= 0 {
+			continue
+		}
+		dim := world.NormalizeDimension(snap.Dimension)
+		cache := s.DimensionChunks(dim)
+		if cache == nil {
+			continue
+		}
+		bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
+		if by < world.MinY || by >= world.MinY+world.WorldHeight {
+			continue
+		}
+		st := cache.GetBlock(bx, by, bz)
+		if !world.IsFireBlock(st) {
+			continue
+		}
+		rawDmg := world.FireDamageForBlock(st)
+		s.ApplyPlayerFireBlockContactDamage(sess)
+		if s.PlayerFireTicks(sess) < 160 {
+			s.SetPlayerFireTicks(sess, 160)
+		}
+		out = append(out, FireContactDamage{
+			Player:       sess,
+			Damage:       rawDmg,
+			SetFireTicks: 160,
+		})
+	}
+	return out
+}
+
+// TickFire synchronizes fire/TNT gamerules to dimension caches and processes
+// player fire contact damage on each server tick.
+func (s *Server) TickFire() {
+	if s == nil {
+		return
+	}
+	s.syncTNTAndFireRulesToCaches()
+	_ = s.CheckPlayersInFire()
+}
+
