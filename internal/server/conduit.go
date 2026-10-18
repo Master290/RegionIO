@@ -360,6 +360,9 @@ func EncodeConduitBlockEntityNBT(c ConduitBlockEntity) *nbt.Compound {
 			comp.Set("TargetEntityID", nbt.Int(c.TargetEntityID))
 		}
 	}
+	if c.TickCounter > 0 {
+		comp.Set("TickCounter", nbt.Int(int32(c.TickCounter)))
+	}
 	return comp
 }
 
@@ -438,6 +441,11 @@ func DecodeConduitBlockEntityNBT(comp *nbt.Compound) (ConduitBlockEntity, bool) 
 		if iv, ok := v.(nbt.Int); ok && iv > 0 {
 			c.TargetEntityID = int32(iv)
 			c.HasTarget = true
+		}
+	}
+	if v, ok := comp.Get("TickCounter"); ok {
+		if iv, ok := v.(nbt.Int); ok && iv >= 0 {
+			c.TickCounter = int(iv)
 		}
 	}
 	return c, true
@@ -607,6 +615,32 @@ func (s *Server) ChunkConduitBlockEntitiesNBT(dimension string, cx, cz int32) []
 		}
 		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
 			out = append(out, EncodeConduitBlockEntityNBT(*c))
+		}
+	}
+	cs.mu.Unlock()
+	return out
+}
+
+// UnloadChunkConduits removes all conduit block entities in chunk (cx, cz) of
+// dimension from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkConduits(dimension string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	dim := world.NormalizeDimension(dimension)
+	cs := s.conduitState()
+	cs.mu.Lock()
+	s.ensureConduitsLoadedLocked(cs)
+	var out []*nbt.Compound
+	for k, c := range cs.conduits {
+		if k.dim != dim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if c != nil {
+				out = append(out, EncodeConduitBlockEntityNBT(*c))
+			}
+			delete(cs.conduits, k)
 		}
 	}
 	cs.mu.Unlock()

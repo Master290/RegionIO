@@ -273,10 +273,18 @@ func JukeboxBlockEntityFromNBT(comp *nbt.Compound) (*JukeboxBlockEntity, error) 
 	if comp == nil {
 		return nil, errors.New("server: nil jukebox NBT")
 	}
+	if idStr, ok := nbtStringTag(comp, "id"); ok && idStr != "" {
+		if canonicalResourceName(idStr) != "minecraft:jukebox" {
+			return nil, errors.New("server: not a jukebox block entity")
+		}
+	}
 	x, _ := nbtIntTag(comp, "x")
 	y, _ := nbtIntTag(comp, "y")
 	z, _ := nbtIntTag(comp, "z")
 	dim, _ := nbtStringTag(comp, "dimension")
+	if dim == "" {
+		dim, _ = nbtStringTag(comp, "Dimension")
+	}
 	if dim == "" {
 		dim = world.DimensionOverworld
 	}
@@ -447,6 +455,25 @@ func (s *Server) SaveJukeboxes() error {
 	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
 }
 
+func (s *Server) syncLoadedJukeboxBlockState(jb *JukeboxBlockEntity) {
+	if s == nil || jb == nil {
+		return
+	}
+	cache := s.BindNoteBlockAndJukeboxRedstone(jb.Dimension)
+	if cache == nil {
+		return
+	}
+	curState := cache.GetBlock(jb.X, jb.Y, jb.Z)
+	if IsJukeboxBlock(curState) {
+		targetState := JukeboxBlockState(jb.HasRecord())
+		if curState != targetState {
+			_, _ = cache.ApplyBlockWithUpdates(jb.X, jb.Y, jb.Z, targetState)
+		}
+	}
+	_ = cache.UpdateNeighbors(jb.X, jb.Y, jb.Z)
+	_ = cache.UpdateComparatorsAround(jb.X, jb.Y, jb.Z)
+}
+
 // LoadJukeboxes reloads jukebox block entities from <WorldDir>/region/jukeboxes.nbt.
 func (s *Server) LoadJukeboxes() error {
 	if s == nil {
@@ -457,9 +484,93 @@ func (s *Server) LoadJukeboxes() error {
 	st.loadedDisk = false
 	st.jukeboxes = make(map[blockPosDimKey]*JukeboxBlockEntity)
 	s.ensureJukeboxesLoadedLocked(st)
+	loaded := make([]*JukeboxBlockEntity, 0, len(st.jukeboxes))
+	for _, jb := range st.jukeboxes {
+		if jb != nil {
+			loaded = append(loaded, jb.Clone())
+		}
+	}
 	st.mu.Unlock()
+	for _, jb := range loaded {
+		s.syncLoadedJukeboxBlockState(jb)
+	}
 	return nil
 }
+
+// ChunkJukeboxBlockEntitiesNBT returns NBT compounds for all jukeboxes in chunk (cx, cz) of dim.
+func (s *Server) ChunkJukeboxBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.jukeboxStore()
+	st.mu.RLock()
+	var out []*nbt.Compound
+	for k, jb := range st.jukeboxes {
+		if jb == nil || !jb.HasRecord() || k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, jb.ToNBT())
+		}
+	}
+	st.mu.RUnlock()
+	return out
+}
+
+// UnloadChunkJukeboxes removes all jukeboxes in chunk (cx, cz) of dim from runtime memory
+// and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkJukeboxes(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.jukeboxStore()
+	st.mu.Lock()
+	var out []*nbt.Compound
+	for k, jb := range st.jukeboxes {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if jb != nil && jb.HasRecord() {
+				out = append(out, jb.ToNBT())
+			}
+			delete(st.jukeboxes, k)
+		}
+	}
+	st.mu.Unlock()
+	return out
+}
+
+// LoadChunkJukeboxBlockEntitiesNBT loads jukebox block entities from a chunk's block_entities NBT list.
+func (s *Server) LoadChunkJukeboxBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.jukeboxStore()
+	count := 0
+	var loaded []*JukeboxBlockEntity
+	st.mu.Lock()
+	for _, comp := range list {
+		jb, err := JukeboxBlockEntityFromNBT(comp)
+		if err != nil || jb == nil || !jb.HasRecord() {
+			continue
+		}
+		jb.Dimension = normDim
+		key := blockPosDimKey{dim: normDim, x: jb.X, y: jb.Y, z: jb.Z}
+		st.jukeboxes[key] = jb
+		loaded = append(loaded, jb.Clone())
+		count++
+	}
+	st.mu.Unlock()
+	for _, jb := range loaded {
+		s.syncLoadedJukeboxBlockState(jb)
+	}
+	return count
+}
+
 
 // GetJukeboxAt returns a copy of the JukeboxBlockEntity at (dimension, x, y, z), if present.
 func (s *Server) GetJukeboxAt(dimension string, x, y, z int) (*JukeboxBlockEntity, bool) {

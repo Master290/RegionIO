@@ -2,10 +2,14 @@ package server
 
 import (
 	"math/rand"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"regionio/internal/nbt"
 	"regionio/internal/world"
 )
 
@@ -534,6 +538,376 @@ func (s *Server) TurnCopperGolemIntoStatue(dim string, x, y, z int, facing, pose
 	if !applied {
 		return 0, false
 	}
+	s.SetCopperGolemStatueAt(&CopperGolemStatueBlockEntity{
+		Dimension: targetDim,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		Pose:      pose,
+		Stage:     world.CopperStageOxidized,
+		Waxed:     waxed,
+	})
 	s.broadcastCopperBlockUpdateResult(targetDim, res)
 	return cache.GetBlock(x, y, z), true
 }
+
+// --- Copper Golem Statue Block Entity Persistence ---
+
+// CopperGolemStatueBlockEntity stores persistent block-entity metadata for a
+// `minecraft:*copper_golem_statue` block (pose, oxidation stage, waxed flag,
+// optional CustomName, and original golem EntityUUID).
+type CopperGolemStatueBlockEntity struct {
+	Dimension  string
+	X, Y, Z    int
+	Pose       string
+	Stage      world.CopperOxidationStage
+	Waxed      bool
+	CustomName string
+	EntityUUID [16]byte
+	HasUUID    bool
+}
+
+// Clone returns a copy of b.
+func (b *CopperGolemStatueBlockEntity) Clone() *CopperGolemStatueBlockEntity {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	if cp.Dimension == "" {
+		cp.Dimension = world.DimensionOverworld
+	}
+	if cp.Pose == "" {
+		cp.Pose = "standing"
+	}
+	return &cp
+}
+
+// EncodeCopperGolemStatueBlockEntityNBT serializes a CopperGolemStatueBlockEntity to NBT.
+func EncodeCopperGolemStatueBlockEntityNBT(b *CopperGolemStatueBlockEntity) *nbt.Compound {
+	if b == nil {
+		return nbt.NewCompound()
+	}
+	dim := b.Dimension
+	if dim == "" {
+		dim = world.DimensionOverworld
+	}
+	pose := b.Pose
+	if pose == "" {
+		pose = "standing"
+	}
+	var waxedByte nbt.Byte
+	if b.Waxed {
+		waxedByte = 1
+	}
+	comp := nbt.NewCompound().
+		Set("id", nbt.String("minecraft:copper_golem_statue")).
+		Set("Dimension", nbt.String(world.NormalizeDimension(dim))).
+		Set("x", nbt.Int(int32(b.X))).
+		Set("y", nbt.Int(int32(b.Y))).
+		Set("z", nbt.Int(int32(b.Z))).
+		Set("Pose", nbt.String(pose)).
+		Set("Stage", nbt.Int(int32(b.Stage))).
+		Set("Waxed", waxedByte)
+	if b.CustomName != "" {
+		comp.Set("CustomName", nbt.String(b.CustomName))
+	}
+	if b.HasUUID {
+		comp.Set("EntityUUID", uuidToNBTIntArray(b.EntityUUID))
+	}
+	return comp
+}
+
+// DecodeCopperGolemStatueBlockEntityNBT parses a CopperGolemStatueBlockEntity from NBT.
+func DecodeCopperGolemStatueBlockEntityNBT(comp *nbt.Compound) (*CopperGolemStatueBlockEntity, bool) {
+	if comp == nil {
+		return nil, false
+	}
+	if idStr, ok := nbtStringTag(comp, "id"); ok && idStr != "" {
+		if canonicalResourceName(idStr) != "minecraft:copper_golem_statue" {
+			return nil, false
+		}
+	}
+	dim, _ := nbtStringTag(comp, "Dimension")
+	if dim == "" {
+		dim, _ = nbtStringTag(comp, "dimension")
+	}
+	if dim == "" {
+		dim = world.DimensionOverworld
+	}
+	x, _ := nbtIntTag(comp, "x")
+	y, _ := nbtIntTag(comp, "y")
+	z, _ := nbtIntTag(comp, "z")
+	pose, _ := nbtStringTag(comp, "Pose")
+	if pose == "" {
+		pose = "standing"
+	}
+	stageInt, _ := nbtIntTag(comp, "Stage")
+	var waxed bool
+	if rawW, ok := comp.Get("Waxed"); ok {
+		if bv, ok := rawW.(nbt.Byte); ok {
+			waxed = bv != 0
+		}
+	}
+	customName, _ := nbtStringTag(comp, "CustomName")
+	b := &CopperGolemStatueBlockEntity{
+		Dimension:  world.NormalizeDimension(dim),
+		X:          int(x),
+		Y:          int(y),
+		Z:          int(z),
+		Pose:       pose,
+		Stage:      world.CopperOxidationStage(stageInt),
+		Waxed:      waxed,
+		CustomName: customName,
+	}
+	if rawUUID, ok := comp.Get("EntityUUID"); ok {
+		if arr, ok := rawUUID.(nbt.IntArray); ok {
+			if u, valid := uuidFromNBTIntArray(arr); valid {
+				b.EntityUUID = u
+				b.HasUUID = true
+			}
+		}
+	}
+	return b, true
+}
+
+type serverCopperBlockEntityStore struct {
+	mu         sync.RWMutex
+	loadedDisk bool
+	statues    map[blockPosDimKey]*CopperGolemStatueBlockEntity
+}
+
+var copperBlockEntityStores sync.Map // map[*Server]*serverCopperBlockEntityStore
+
+func (s *Server) copperBlockEntityStore() *serverCopperBlockEntityStore {
+	if s == nil {
+		return &serverCopperBlockEntityStore{
+			statues: make(map[blockPosDimKey]*CopperGolemStatueBlockEntity),
+		}
+	}
+	if v, ok := copperBlockEntityStores.Load(s); ok {
+		st := v.(*serverCopperBlockEntityStore)
+		st.mu.Lock()
+		s.ensureCopperBlockEntitiesLoadedLocked(st)
+		st.mu.Unlock()
+		return st
+	}
+	st := &serverCopperBlockEntityStore{
+		statues: make(map[blockPosDimKey]*CopperGolemStatueBlockEntity),
+	}
+	actual, _ := copperBlockEntityStores.LoadOrStore(s, st)
+	res := actual.(*serverCopperBlockEntityStore)
+	res.mu.Lock()
+	s.ensureCopperBlockEntitiesLoadedLocked(res)
+	res.mu.Unlock()
+	return res
+}
+
+func (s *Server) copperSidecarPath() string {
+	if s == nil || s.cfg.WorldDir == "" {
+		return ""
+	}
+	return filepath.Join(s.cfg.WorldDir, "region", "copper_statues.nbt")
+}
+
+func (s *Server) ensureCopperBlockEntitiesLoadedLocked(st *serverCopperBlockEntityStore) {
+	if st.loadedDisk {
+		return
+	}
+	st.loadedDisk = true
+	path := s.copperSidecarPath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_, parsedTag, err := nbt.UnmarshalNamed(data)
+	if err != nil {
+		return
+	}
+	root, ok := parsedTag.(*nbt.Compound)
+	if !ok || root == nil {
+		return
+	}
+	listTag, ok := root.Get("CopperStatues")
+	if !ok {
+		return
+	}
+	for _, el := range nbtListElems(listTag) {
+		comp, ok := el.(*nbt.Compound)
+		if !ok {
+			continue
+		}
+		if b, ok := DecodeCopperGolemStatueBlockEntityNBT(comp); ok && b != nil {
+			key := blockPosDimKey{dim: b.Dimension, x: b.X, y: b.Y, z: b.Z}
+			st.statues[key] = b
+		}
+	}
+}
+
+// GetCopperGolemStatueAt returns a copy of the CopperGolemStatueBlockEntity at (dim, x, y, z).
+func (s *Server) GetCopperGolemStatueAt(dim string, x, y, z int) (*CopperGolemStatueBlockEntity, bool) {
+	if s == nil {
+		return nil, false
+	}
+	key := blockPosDimKey{dim: world.NormalizeDimension(dim), x: x, y: y, z: z}
+	st := s.copperBlockEntityStore()
+	st.mu.RLock()
+	b := st.statues[key].Clone()
+	st.mu.RUnlock()
+	if b == nil {
+		return nil, false
+	}
+	return b, true
+}
+
+// SetCopperGolemStatueAt stores or updates a CopperGolemStatueBlockEntity.
+func (s *Server) SetCopperGolemStatueAt(b *CopperGolemStatueBlockEntity) {
+	if s == nil || b == nil {
+		return
+	}
+	cp := b.Clone()
+	cp.Dimension = world.NormalizeDimension(cp.Dimension)
+	key := blockPosDimKey{dim: cp.Dimension, x: cp.X, y: cp.Y, z: cp.Z}
+	st := s.copperBlockEntityStore()
+	st.mu.Lock()
+	st.statues[key] = cp
+	st.mu.Unlock()
+}
+
+// RemoveCopperGolemStatueAt removes a CopperGolemStatueBlockEntity at (dim, x, y, z).
+func (s *Server) RemoveCopperGolemStatueAt(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	key := blockPosDimKey{dim: world.NormalizeDimension(dim), x: x, y: y, z: z}
+	st := s.copperBlockEntityStore()
+	st.mu.Lock()
+	delete(st.statues, key)
+	st.mu.Unlock()
+}
+
+// SaveCopperBlockEntities persists all CopperGolemStatueBlockEntity entries to
+// <WorldDir>/region/copper_statues.nbt.
+func (s *Server) SaveCopperBlockEntities() error {
+	if s == nil {
+		return nil
+	}
+	path := s.copperSidecarPath()
+	if path == "" {
+		return nil
+	}
+	st := s.copperBlockEntityStore()
+	st.mu.RLock()
+	keys := make([]blockPosDimKey, 0, len(st.statues))
+	for k, b := range st.statues {
+		if b != nil {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].dim != keys[j].dim {
+			return keys[i].dim < keys[j].dim
+		}
+		if keys[i].x != keys[j].x {
+			return keys[i].x < keys[j].x
+		}
+		if keys[i].y != keys[j].y {
+			return keys[i].y < keys[j].y
+		}
+		return keys[i].z < keys[j].z
+	})
+	elems := make([]nbt.Tag, 0, len(keys))
+	for _, k := range keys {
+		elems = append(elems, EncodeCopperGolemStatueBlockEntityNBT(st.statues[k]))
+	}
+	st.mu.RUnlock()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	root := nbt.NewCompound().Set("CopperStatues", nbt.List{ElemID: nbt.TagCompound, Elems: elems})
+	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
+}
+
+// LoadCopperBlockEntities reloads CopperGolemStatueBlockEntity entries from disk.
+func (s *Server) LoadCopperBlockEntities() error {
+	if s == nil {
+		return nil
+	}
+	st := s.copperBlockEntityStore()
+	st.mu.Lock()
+	st.loadedDisk = false
+	st.statues = make(map[blockPosDimKey]*CopperGolemStatueBlockEntity)
+	s.ensureCopperBlockEntitiesLoadedLocked(st)
+	st.mu.Unlock()
+	return nil
+}
+
+// ChunkCopperBlockEntitiesNBT returns NBT compounds for all copper golem statues in chunk (cx, cz) of dim.
+func (s *Server) ChunkCopperBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.copperBlockEntityStore()
+	st.mu.RLock()
+	var out []*nbt.Compound
+	for k, b := range st.statues {
+		if b == nil || k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, EncodeCopperGolemStatueBlockEntityNBT(b))
+		}
+	}
+	st.mu.RUnlock()
+	return out
+}
+
+// UnloadChunkCopperBlockEntities removes all copper golem statues in chunk (cx, cz) of dim
+// from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkCopperBlockEntities(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.copperBlockEntityStore()
+	st.mu.Lock()
+	var out []*nbt.Compound
+	for k, b := range st.statues {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if b != nil {
+				out = append(out, EncodeCopperGolemStatueBlockEntityNBT(b))
+			}
+			delete(st.statues, k)
+		}
+	}
+	st.mu.Unlock()
+	return out
+}
+
+// LoadChunkCopperBlockEntitiesNBT loads copper golem statue block entities from a chunk's block_entities NBT list.
+func (s *Server) LoadChunkCopperBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.copperBlockEntityStore()
+	st.mu.Lock()
+	count := 0
+	for _, comp := range list {
+		if b, ok := DecodeCopperGolemStatueBlockEntityNBT(comp); ok && b != nil {
+			b.Dimension = normDim
+			key := blockPosDimKey{dim: normDim, x: b.X, y: b.Y, z: b.Z}
+			st.statues[key] = b
+			count++
+		}
+	}
+	st.mu.Unlock()
+	return count
+}
+

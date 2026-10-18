@@ -802,7 +802,8 @@ func (s *Server) ensureBrewingLoadedLocked(bs *serverBrewingState) {
 	}
 }
 
-// LoadBrewingStands loads all persisted brewing stand block entities from disk.
+// LoadBrewingStands loads all persisted brewing stand block entities from disk
+// and synchronizes their `has_bottle_0..2` block state properties and comparators.
 func (s *Server) LoadBrewingStands() error {
 	if s == nil {
 		return nil
@@ -811,8 +812,103 @@ func (s *Server) LoadBrewingStands() error {
 	bs.mu.Lock()
 	bs.loadedDisk = false
 	s.ensureBrewingLoadedLocked(bs)
+	var loaded []BrewingStandBlockEntity
+	for _, stand := range bs.stands {
+		if stand != nil {
+			loaded = append(loaded, stand.Clone())
+		}
+	}
 	bs.mu.Unlock()
+
+	for _, stand := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(stand.Dimension)
+		s.updateBrewingStandBottleBlockStateInDim(stand.Dimension, stand.X, stand.Y, stand.Z, stand.Items)
+		s.updateHopperComparatorsAndBroadcast(stand.Dimension, stand.X, stand.Y, stand.Z)
+	}
 	return nil
+}
+
+// ChunkBrewingStandBlockEntitiesNBT returns vanilla `block_entities` NBT compounds
+// for all brewing stands in chunk (cx, cz) of dim.
+func (s *Server) ChunkBrewingStandBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	bs := s.brewingState()
+	bs.mu.Lock()
+	s.ensureBrewingLoadedLocked(bs)
+	var out []*nbt.Compound
+	for k, stand := range bs.stands {
+		if k.dim != normDim || stand == nil {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, EncodeBrewingStandBlockEntityNBT(stand.Clone()))
+		}
+	}
+	bs.mu.Unlock()
+	return out
+}
+
+// UnloadChunkBrewingStands removes all brewing stands in chunk (cx, cz) of dim
+// from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkBrewingStands(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	bs := s.brewingState()
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, stand := range bs.stands {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if stand != nil {
+				out = append(out, EncodeBrewingStandBlockEntityNBT(stand.Clone()))
+			}
+			delete(bs.stands, k)
+		}
+	}
+	return out
+}
+
+// LoadChunkBrewingStandBlockEntitiesNBT loads brewing stand block entities from
+// a chunk's `block_entities` NBT list and syncs their `has_bottle_0..2` block states.
+func (s *Server) LoadChunkBrewingStandBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	bs := s.brewingState()
+	bs.mu.Lock()
+	var loaded []BrewingStandBlockEntity
+	for _, c := range list {
+		b, valid := DecodeBrewingStandBlockEntityNBT(c)
+		if !valid {
+			continue
+		}
+		if b.Dimension == "" {
+			b.Dimension = normDim
+		} else {
+			b.Dimension = world.NormalizeDimension(b.Dimension)
+		}
+		key := makeBrewingKey(b.Dimension, b.X, b.Y, b.Z)
+		cp := b.Clone()
+		bs.stands[key] = &cp
+		loaded = append(loaded, cp)
+	}
+	bs.mu.Unlock()
+
+	for _, stand := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(stand.Dimension)
+		s.updateBrewingStandBottleBlockStateInDim(stand.Dimension, stand.X, stand.Y, stand.Z, stand.Items)
+		s.updateHopperComparatorsAndBroadcast(stand.Dimension, stand.X, stand.Y, stand.Z)
+	}
+	return len(loaded)
 }
 
 // SaveBrewingStands persists all tracked brewing stand block entities to disk

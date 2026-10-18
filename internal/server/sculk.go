@@ -2406,10 +2406,13 @@ func (s *Server) SaveSculk() error {
 
 func encodeSculkSensorNBT(be *SculkSensorBlockEntity) *nbt.Compound {
 	var calByte byte
+	idStr := "minecraft:sculk_sensor"
 	if be.Calibrated {
 		calByte = 1
+		idStr = "minecraft:calibrated_sculk_sensor"
 	}
 	c := nbt.NewCompound().
+		Set("id", nbt.String(idStr)).
 		Set("dimension", nbt.String(be.Dimension)).
 		Set("x", nbt.Int(be.X)).
 		Set("y", nbt.Int(be.Y)).
@@ -2421,11 +2424,20 @@ func encodeSculkSensorNBT(be *SculkSensorBlockEntity) *nbt.Compound {
 		Set("last_vibration_frequency", nbt.Int(be.LastVibrationFrequency))
 	if be.Pending != nil {
 		p := be.Pending
+		var resByte byte
+		if p.IsResonance {
+			resByte = 1
+		}
 		c.Set("pending_event", nbt.String(p.Event)).
 			Set("pending_freq", nbt.Int(p.Frequency)).
 			Set("pending_ticks", nbt.Int(p.TicksRemaining)).
 			Set("pending_dist", nbt.Double(p.Distance)).
-			Set("pending_max_dist", nbt.Double(p.MaxDistance))
+			Set("pending_max_dist", nbt.Double(p.MaxDistance)).
+			Set("pending_source_x", nbt.Double(p.SourceX)).
+			Set("pending_source_y", nbt.Double(p.SourceY)).
+			Set("pending_source_z", nbt.Double(p.SourceZ)).
+			Set("pending_entity_id", nbt.Int(p.EntityID)).
+			Set("pending_resonance", nbt.Byte(resByte))
 	}
 	return c
 }
@@ -2434,6 +2446,11 @@ func decodeSculkSensorNBT(c *nbt.Compound) *SculkSensorBlockEntity {
 	be := &SculkSensorBlockEntity{
 		Dimension: world.DimensionOverworld,
 		Phase:     SculkSensorPhaseInactive,
+	}
+	if t, ok := c.Get("id"); ok {
+		if v, ok := t.(nbt.String); ok && canonicalResourceName(string(v)) == "minecraft:calibrated_sculk_sensor" {
+			be.Calibrated = true
+		}
 	}
 	if t, ok := c.Get("dimension"); ok {
 		if v, ok := t.(nbt.String); ok && string(v) != "" {
@@ -2505,6 +2522,31 @@ func decodeSculkSensorNBT(c *nbt.Compound) *SculkSensorBlockEntity {
 					p.MaxDistance = float64(v)
 				}
 			}
+			if t, ok := c.Get("pending_source_x"); ok {
+				if v, ok := t.(nbt.Double); ok {
+					p.SourceX = float64(v)
+				}
+			}
+			if t, ok := c.Get("pending_source_y"); ok {
+				if v, ok := t.(nbt.Double); ok {
+					p.SourceY = float64(v)
+				}
+			}
+			if t, ok := c.Get("pending_source_z"); ok {
+				if v, ok := t.(nbt.Double); ok {
+					p.SourceZ = float64(v)
+				}
+			}
+			if t, ok := c.Get("pending_entity_id"); ok {
+				if v, ok := t.(nbt.Int); ok {
+					p.EntityID = int32(v)
+				}
+			}
+			if t, ok := c.Get("pending_resonance"); ok {
+				if v, ok := t.(nbt.Byte); ok {
+					p.IsResonance = v != 0
+				}
+			}
 			if p.TicksRemaining > 0 && p.Frequency > 0 {
 				be.Pending = p
 			}
@@ -2519,6 +2561,7 @@ func encodeSculkShriekerNBT(be *SculkShriekerBlockEntity) *nbt.Compound {
 		csByte = 1
 	}
 	return nbt.NewCompound().
+		Set("id", nbt.String("minecraft:sculk_shrieker")).
 		Set("dimension", nbt.String(be.Dimension)).
 		Set("x", nbt.Int(be.X)).
 		Set("y", nbt.Int(be.Y)).
@@ -2572,6 +2615,7 @@ func decodeSculkShriekerNBT(c *nbt.Compound) *SculkShriekerBlockEntity {
 
 func encodeSculkCatalystNBT(be *SculkCatalystBlockEntity) *nbt.Compound {
 	return nbt.NewCompound().
+		Set("id", nbt.String("minecraft:sculk_catalyst")).
 		Set("dimension", nbt.String(be.Dimension)).
 		Set("x", nbt.Int(be.X)).
 		Set("y", nbt.Int(be.Y)).
@@ -2610,3 +2654,139 @@ func decodeSculkCatalystNBT(c *nbt.Compound) *SculkCatalystBlockEntity {
 	}
 	return be
 }
+
+// ChunkSculkBlockEntitiesNBT returns NBT compounds for all active sculk sensors,
+// shriekers, and catalysts in chunk (cx, cz) of dim.
+func (s *Server) ChunkSculkBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.sculkState()
+	st.mu.Lock()
+	s.ensureSculkLoadedLocked(st)
+	var out []*nbt.Compound
+	for k, be := range st.sensors {
+		if be == nil || k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, encodeSculkSensorNBT(be))
+		}
+	}
+	for k, be := range st.shriekers {
+		if be == nil || k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, encodeSculkShriekerNBT(be))
+		}
+	}
+	for k, be := range st.catalysts {
+		if be == nil || k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, encodeSculkCatalystNBT(be))
+		}
+	}
+	st.mu.Unlock()
+	return out
+}
+
+// UnloadChunkSculk removes all sculk block entities in chunk (cx, cz) of dim
+// from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkSculk(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.sculkState()
+	st.mu.Lock()
+	s.ensureSculkLoadedLocked(st)
+	var out []*nbt.Compound
+	for k, be := range st.sensors {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if be != nil {
+				out = append(out, encodeSculkSensorNBT(be))
+			}
+			delete(st.sensors, k)
+		}
+	}
+	for k, be := range st.shriekers {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if be != nil {
+				out = append(out, encodeSculkShriekerNBT(be))
+			}
+			delete(st.shriekers, k)
+		}
+	}
+	for k, be := range st.catalysts {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if be != nil {
+				out = append(out, encodeSculkCatalystNBT(be))
+			}
+			delete(st.catalysts, k)
+		}
+	}
+	st.mu.Unlock()
+	return out
+}
+
+// LoadChunkSculkBlockEntitiesNBT loads sculk sensor, shrieker, and catalyst
+// block entities from a chunk's block_entities NBT list.
+func (s *Server) LoadChunkSculkBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.sculkState()
+	st.mu.Lock()
+	s.ensureSculkLoadedLocked(st)
+	count := 0
+	for _, comp := range list {
+		if comp == nil {
+			continue
+		}
+		idTag, ok := comp.Get("id")
+		if !ok {
+			continue
+		}
+		idStr, ok := idTag.(nbt.String)
+		if !ok {
+			continue
+		}
+		switch canonicalResourceName(string(idStr)) {
+		case "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
+			be := decodeSculkSensorNBT(comp)
+			be.Dimension = normDim
+			key := makeBrewingKey(normDim, be.X, be.Y, be.Z)
+			st.sensors[key] = be
+			count++
+		case "minecraft:sculk_shrieker":
+			be := decodeSculkShriekerNBT(comp)
+			be.Dimension = normDim
+			key := makeBrewingKey(normDim, be.X, be.Y, be.Z)
+			st.shriekers[key] = be
+			count++
+		case "minecraft:sculk_catalyst":
+			be := decodeSculkCatalystNBT(comp)
+			be.Dimension = normDim
+			key := makeBrewingKey(normDim, be.X, be.Y, be.Z)
+			st.catalysts[key] = be
+			count++
+		}
+	}
+	st.mu.Unlock()
+	return count
+}
+

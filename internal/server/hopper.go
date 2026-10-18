@@ -113,11 +113,12 @@ func (cb *ChiseledBookshelfBlockEntity) Clone() *ChiseledBookshelfBlockEntity {
 // CrafterBlockEntity represents the server-side state of a `minecraft:crafter`
 // at (Dimension, X, Y, Z).
 type CrafterBlockEntity struct {
-	Dimension string
-	X, Y, Z   int
-	Slots     [CrafterSlotCount]world.ItemStack
-	SlotMeta  [CrafterSlotCount]ItemMeta
-	Disabled  [CrafterSlotCount]bool
+	Dimension              string
+	X, Y, Z                int
+	Slots                  [CrafterSlotCount]world.ItemStack
+	SlotMeta               [CrafterSlotCount]ItemMeta
+	Disabled               [CrafterSlotCount]bool
+	CraftingTicksRemaining int
 }
 
 // Clone returns a deep copy of the CrafterBlockEntity.
@@ -1265,6 +1266,9 @@ func IsHopperContainerBlock(state uint16) bool {
 	if state == world.StateAir {
 		return false
 	}
+	if world.IsCopperChestBlock(state) {
+		return true
+	}
 	name := world.BlockName(state)
 	switch name {
 	case "minecraft:hopper",
@@ -1290,7 +1294,8 @@ func doubleChestPartnerPos(cache *world.Cache, x, y, z int, state uint16) (px, p
 		return 0, 0, 0, false, false
 	}
 	name := world.BlockName(state)
-	if name != "minecraft:chest" && name != "minecraft:trapped_chest" {
+	isCopperChest := world.IsCopperChestBlock(state)
+	if name != "minecraft:chest" && name != "minecraft:trapped_chest" && !isCopperChest {
 		return 0, 0, 0, false, false
 	}
 	props := world.BlockProperties(state)
@@ -1332,7 +1337,7 @@ func doubleChestPartnerPos(cache *world.Cache, x, y, z int, state uint16) (px, p
 	}
 	nx, ny, nz := x+dx, y, z+dz
 	nState := cache.GetBlock(nx, ny, nz)
-	if world.BlockName(nState) != name {
+	if world.BlockName(nState) != name && !(isCopperChest && world.IsCopperChestBlock(nState)) {
 		return 0, 0, 0, false, false
 	}
 	nProps := world.BlockProperties(nState)
@@ -1591,7 +1596,7 @@ func (s *Server) TryHopperInsertIntoBlock(
 	case targetName == "minecraft:hopper":
 		return s.HopperInsertIntoHopper(normDim, tx, ty, tz, single, meta, potionType)
 
-	case IsChestBlock(targetState) || targetName == "minecraft:trapped_chest" || targetName == "minecraft:barrel":
+	case IsChestBlock(targetState) || world.IsCopperChestBlock(targetState) || targetName == "minecraft:trapped_chest" || targetName == "minecraft:barrel":
 		return s.hopperInsertIntoChestOrBarrel(normDim, cache, tx, ty, tz, targetState, single)
 
 	case IsFurnaceBlock(targetState):
@@ -1716,7 +1721,7 @@ func (s *Server) TryHopperExtractFromBlockAbove(
 			}
 			return world.ItemStack{}, ItemMeta{}, "", true, false
 
-		case IsChestBlock(srcState) || srcName == "minecraft:trapped_chest" || srcName == "minecraft:barrel":
+		case IsChestBlock(srcState) || world.IsCopperChestBlock(srcState) || srcName == "minecraft:trapped_chest" || srcName == "minecraft:barrel":
 			st, extracted := s.hopperExtractFromChestOrBarrel(normDim, cache, sx, sy, sz, srcState, canAccept)
 			return st, ItemMeta{}, "", true, extracted
 
@@ -3031,6 +3036,24 @@ func EncodeHopperBlockEntityNBT(be *HopperBlockEntity) *nbt.Compound {
 		if be.SlotMeta[slot].CustomName != "" {
 			it.Set("CustomName", nbt.String(be.SlotMeta[slot].CustomName))
 		}
+		encodeItemMetaToNBT(it, be.SlotMeta[slot])
+		if shulker := be.SlotShulker[slot]; shulker != nil {
+			var shulkerTags []nbt.Tag
+			for sIdx := 0; sIdx < ChestSlotCount; sIdx++ {
+				sst := shulker[sIdx]
+				if sst.IsEmpty() || sst.Count <= 0 {
+					continue
+				}
+				sc := nbt.NewCompound()
+				sc.Set("Slot", nbt.Byte(int8(sIdx)))
+				sc.Set("id", nbt.String(sst.ResolvedID()))
+				sc.Set("count", nbt.Int(sst.Count))
+				shulkerTags = append(shulkerTags, sc)
+			}
+			if len(shulkerTags) > 0 {
+				it.Set("ShulkerItems", nbt.List{ElemID: nbt.TagCompound, Elems: shulkerTags})
+			}
+		}
 		items = append(items, it)
 	}
 	c.Set("Items", nbt.List{ElemID: nbt.TagCompound, Elems: items})
@@ -3091,20 +3114,49 @@ func DecodeHopperBlockEntityNBT(c *nbt.Compound, fallbackDim string) (*HopperBlo
 			if pot, ok := nbtGetString(itComp, "Potion"); ok {
 				be.SlotPotions[slotIdx] = pot
 			}
-			var meta ItemMeta
-			if dmg, ok := nbtGetInt(itComp, "Damage"); ok {
-				meta.Damage = dmg
+			meta := decodeItemMetaFromNBT(itComp)
+			if meta.Damage == 0 {
+				if dmg, ok := nbtGetInt(itComp, "Damage"); ok && dmg > 0 {
+					meta.Damage = dmg
+				}
 			}
-			if cname, ok := nbtGetString(itComp, "CustomName"); ok {
-				meta.CustomName = cname
+			if meta.CustomName == "" {
+				if cname, ok := nbtGetString(itComp, "CustomName"); ok && cname != "" {
+					meta.CustomName = cname
+				}
 			}
 			be.SlotMeta[slotIdx] = meta
+
+			if shElems, ok := nbtGetListElems(itComp, "ShulkerItems"); ok && len(shElems) > 0 {
+				var sh [ChestSlotCount]world.ItemStack
+				hasSh := false
+				for _, shElem := range shElems {
+					sc, ok := shElem.(*nbt.Compound)
+					if !ok || sc == nil {
+						continue
+					}
+					sb, _ := nbtGetByte(sc, "Slot")
+					sIdx := int(sb)
+					if sIdx < 0 || sIdx >= ChestSlotCount {
+						continue
+					}
+					sID, _ := nbtGetString(sc, "id")
+					sCnt, _ := nbtGetInt(sc, "count")
+					if sID != "" && sCnt > 0 {
+						sh[sIdx] = world.NewNamedItemStack(sID, sCnt)
+						hasSh = true
+					}
+				}
+				if hasSh {
+					be.SlotShulker[slotIdx] = &sh
+				}
+			}
 		}
 	}
 	return be, true
 }
 
-// SaveHoppersToNBT serializes all tracked hoppers into an NBT root compound.
+// SaveHoppersToNBT serializes all tracked hoppers and pending composter ticks into an NBT root compound.
 func (s *Server) SaveHoppersToNBT() *nbt.Compound {
 	root := nbt.NewCompound()
 	if s == nil {
@@ -3134,36 +3186,86 @@ func (s *Server) SaveHoppersToNBT() *nbt.Compound {
 	for _, k := range keys {
 		elems = append(elems, EncodeHopperBlockEntityNBT(hs.hoppers[k]))
 	}
+
+	compKeys := make([]hopperBlockKey, 0, len(hs.composterPending))
+	for k := range hs.composterPending {
+		compKeys = append(compKeys, k)
+	}
+	sort.Slice(compKeys, func(i, j int) bool {
+		if compKeys[i].dim != compKeys[j].dim {
+			return compKeys[i].dim < compKeys[j].dim
+		}
+		if compKeys[i].x != compKeys[j].x {
+			return compKeys[i].x < compKeys[j].x
+		}
+		if compKeys[i].y != compKeys[j].y {
+			return compKeys[i].y < compKeys[j].y
+		}
+		return compKeys[i].z < compKeys[j].z
+	})
+	var compElems []nbt.Tag
+	for _, k := range compKeys {
+		ticks := hs.composterPending[k]
+		if ticks <= 0 {
+			continue
+		}
+		cc := nbt.NewCompound()
+		cc.Set("Dimension", nbt.String(k.dim))
+		cc.Set("x", nbt.Int(int32(k.x)))
+		cc.Set("y", nbt.Int(int32(k.y)))
+		cc.Set("z", nbt.Int(int32(k.z)))
+		cc.Set("Ticks", nbt.Int(int32(ticks)))
+		compElems = append(compElems, cc)
+	}
 	hs.mu.Unlock()
+
 	root.Set("Hoppers", nbt.List{ElemID: nbt.TagCompound, Elems: elems})
+	if len(compElems) > 0 {
+		root.Set("ComposterPending", nbt.List{ElemID: nbt.TagCompound, Elems: compElems})
+	}
 	return root
 }
 
-// LoadHoppersFromNBT restores hoppers from an NBT compound produced by SaveHoppersToNBT.
+// LoadHoppersFromNBT restores hoppers and pending composter ticks from an NBT compound produced by SaveHoppersToNBT.
 func (s *Server) LoadHoppersFromNBT(root *nbt.Compound) int {
 	if s == nil || root == nil {
-		return 0
-	}
-	listElems, ok := nbtGetListElems(root, "Hoppers")
-	if !ok {
 		return 0
 	}
 	hs := s.hopperState()
 	hs.mu.Lock()
 	loaded := 0
 	var dims []string
-	for _, elem := range listElems {
-		c, ok := elem.(*nbt.Compound)
-		if !ok || c == nil {
-			continue
+	if listElems, ok := nbtGetListElems(root, "Hoppers"); ok {
+		for _, elem := range listElems {
+			c, ok := elem.(*nbt.Compound)
+			if !ok || c == nil {
+				continue
+			}
+			be, ok := DecodeHopperBlockEntityNBT(c, world.DimensionOverworld)
+			if !ok || be == nil {
+				continue
+			}
+			hs.hoppers[hopperBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}] = be
+			dims = append(dims, be.Dimension)
+			loaded++
 		}
-		be, ok := DecodeHopperBlockEntityNBT(c, world.DimensionOverworld)
-		if !ok || be == nil {
-			continue
+	}
+	if compElems, ok := nbtGetListElems(root, "ComposterPending"); ok {
+		for _, elem := range compElems {
+			cc, ok := elem.(*nbt.Compound)
+			if !ok || cc == nil {
+				continue
+			}
+			dim, _ := nbtGetString(cc, "Dimension")
+			x, _ := nbtGetInt(cc, "x")
+			y, _ := nbtGetInt(cc, "y")
+			z, _ := nbtGetInt(cc, "z")
+			ticks, _ := nbtGetInt(cc, "Ticks")
+			if ticks <= 0 {
+				ticks = 20
+			}
+			hs.composterPending[hopperBlockKey{dim: normalizeHopperDim(dim), x: int(x), y: int(y), z: int(z)}] = int(ticks)
 		}
-		hs.hoppers[hopperBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}] = be
-		dims = append(dims, be.Dimension)
-		loaded++
 	}
 	hs.mu.Unlock()
 	for _, d := range dims {
@@ -3236,6 +3338,36 @@ func (s *Server) ChunkHopperBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Co
 	return out
 }
 
+// UnloadChunkHoppers removes all hoppers in chunk (cx, cz) of dim from runtime
+// memory and returns their serialized `block_entities` NBT compounds.
+func (s *Server) UnloadChunkHoppers(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	hs := s.hopperState()
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, be := range hs.hoppers {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if be != nil {
+				out = append(out, EncodeHopperBlockEntityNBT(be))
+			}
+			delete(hs.hoppers, k)
+		}
+	}
+	for k := range hs.composterPending {
+		if k.dim == normDim && int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			delete(hs.composterPending, k)
+		}
+	}
+	return out
+}
+
 // LoadChunkHopperBlockEntitiesNBT loads hopper block entities from a chunk's
 // `block_entities` NBT list.
 func (s *Server) LoadChunkHopperBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
@@ -3260,3 +3392,4 @@ func (s *Server) LoadChunkHopperBlockEntitiesNBT(dim string, list []*nbt.Compoun
 	}
 	return loaded
 }
+

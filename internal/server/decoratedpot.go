@@ -818,6 +818,9 @@ func DecoratedPotBlockEntityFromNBT(comp *nbt.Compound) (*DecoratedPotBlockEntit
 	if comp == nil {
 		return nil, false
 	}
+	if idStr, hasID := nbtGetString(comp, "id"); hasID && idStr != "" && canonicalResourceName(idStr) != "minecraft:decorated_pot" {
+		return nil, false
+	}
 	dim, _ := nbtGetString(comp, "Dimension")
 	x, okX := nbtGetInt(comp, "x")
 	y, okY := nbtGetInt(comp, "y")
@@ -936,6 +939,7 @@ func (s *Server) LoadDecoratedPots() error {
 		return nil
 	}
 	entries, _ := nbtGetListElems(root, "DecoratedPots")
+	var loaded []*DecoratedPotBlockEntity
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	for _, raw := range entries {
@@ -945,8 +949,92 @@ func (s *Server) LoadDecoratedPots() error {
 		}
 		if dp, ok := DecoratedPotBlockEntityFromNBT(comp); ok && dp != nil {
 			st.pots[hopperBlockKey{dim: dp.Dimension, x: dp.X, y: dp.Y, z: dp.Z}] = dp
+			loaded = append(loaded, dp.Clone())
 		}
 	}
 	st.mu.Unlock()
+
+	for _, dp := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(dp.Dimension)
+		s.updateHopperComparatorsAndBroadcast(dp.Dimension, dp.X, dp.Y, dp.Z)
+	}
 	return nil
 }
+
+// ChunkDecoratedPotBlockEntitiesNBT returns vanilla `block_entities` NBT
+// compounds for all decorated pots in chunk (cx, cz) of dim.
+func (s *Server) ChunkDecoratedPotBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	st := s.decoratedPotStore()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []*nbt.Compound
+	for k, dp := range st.pots {
+		if k.dim != normDim || dp == nil {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, dp.ToNBT())
+		}
+	}
+	return out
+}
+
+// UnloadChunkDecoratedPots removes all decorated pots in chunk (cx, cz) of dim
+// from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkDecoratedPots(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	st := s.decoratedPotStore()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var out []*nbt.Compound
+	for k, dp := range st.pots {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if dp != nil {
+				out = append(out, dp.ToNBT())
+			}
+			delete(st.pots, k)
+		}
+	}
+	return out
+}
+
+// LoadChunkDecoratedPotBlockEntitiesNBT loads decorated pot block entities
+// from a chunk's `block_entities` NBT list and updates comparators.
+func (s *Server) LoadChunkDecoratedPotBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	var loaded []*DecoratedPotBlockEntity
+	st := s.decoratedPotStore()
+	st.mu.Lock()
+	for _, comp := range list {
+		dp, ok := DecoratedPotBlockEntityFromNBT(comp)
+		if !ok || dp == nil {
+			continue
+		}
+		if dp.Dimension == "" {
+			dp.Dimension = normDim
+		}
+		st.pots[hopperBlockKey{dim: dp.Dimension, x: dp.X, y: dp.Y, z: dp.Z}] = dp
+		loaded = append(loaded, dp.Clone())
+	}
+	st.mu.Unlock()
+
+	for _, dp := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(dp.Dimension)
+		s.updateHopperComparatorsAndBroadcast(dp.Dimension, dp.X, dp.Y, dp.Z)
+	}
+	return len(loaded)
+}
+

@@ -357,6 +357,9 @@ func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelf
 	if comp == nil {
 		return nil, false
 	}
+	if idStr, hasID := nbtGetString(comp, "id"); hasID && idStr != "" && canonicalResourceName(idStr) != "minecraft:chiseled_bookshelf" {
+		return nil, false
+	}
 	dim, _ := nbtGetString(comp, "Dimension")
 	x, okX := nbtGetInt(comp, "x")
 	y, okY := nbtGetInt(comp, "y")
@@ -398,6 +401,29 @@ func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelf
 		}
 	}
 	return cb, true
+}
+
+func (s *Server) syncLoadedChiseledBookshelfBlockState(cb *ChiseledBookshelfBlockEntity) {
+	if s == nil || cb == nil {
+		return
+	}
+	normDim := normalizeHopperDim(cb.Dimension)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
+	if cache != nil {
+		curState := cache.GetBlock(cb.X, cb.Y, cb.Z)
+		if IsChiseledBookshelfBlock(curState) {
+			var occ [ChiseledBookshelfSlotCount]bool
+			for i := 0; i < ChiseledBookshelfSlotCount; i++ {
+				occ[i] = !cb.Slots[i].IsEmpty() && cb.Slots[i].Count > 0
+			}
+			nextState := ChiseledBookshelfBlockState(ChiseledBookshelfFacing(curState), occ)
+			if nextState != 0 && nextState != curState {
+				_, _ = cache.SetBlockWithLight(cb.X, cb.Y, cb.Z, nextState)
+				s.broadcastBlockUpdateInDim(normDim, cb.X, cb.Y, cb.Z, nextState)
+			}
+		}
+	}
+	s.updateHopperComparatorsAndBroadcast(normDim, cb.X, cb.Y, cb.Z)
 }
 
 func (s *Server) chiseledBookshelvesFilePath() string {
@@ -478,6 +504,7 @@ func (s *Server) LoadChiseledBookshelves() error {
 		return nil
 	}
 	entries, _ := nbtGetListElems(root, "ChiseledBookshelves")
+	var loaded []*ChiseledBookshelfBlockEntity
 	hs := s.hopperState()
 	hs.mu.Lock()
 	for _, raw := range entries {
@@ -487,8 +514,90 @@ func (s *Server) LoadChiseledBookshelves() error {
 		}
 		if cb, ok := ChiseledBookshelfBlockEntityFromNBT(comp); ok && cb != nil {
 			hs.bookshelves[hopperBlockKey{dim: cb.Dimension, x: cb.X, y: cb.Y, z: cb.Z}] = cb
+			loaded = append(loaded, cb.Clone())
 		}
 	}
 	hs.mu.Unlock()
+
+	for _, cb := range loaded {
+		s.syncLoadedChiseledBookshelfBlockState(cb)
+	}
 	return nil
 }
+
+// ChunkChiseledBookshelfBlockEntitiesNBT returns vanilla `block_entities` NBT
+// compounds for all chiseled bookshelves in chunk (cx, cz) of dim.
+func (s *Server) ChunkChiseledBookshelfBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	hs := s.hopperState()
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, cb := range hs.bookshelves {
+		if k.dim != normDim || cb == nil {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, cb.ToNBT())
+		}
+	}
+	return out
+}
+
+// UnloadChunkChiseledBookshelves removes all chiseled bookshelves in chunk
+// (cx, cz) of dim from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkChiseledBookshelves(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	hs := s.hopperState()
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, cb := range hs.bookshelves {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if cb != nil {
+				out = append(out, cb.ToNBT())
+			}
+			delete(hs.bookshelves, k)
+		}
+	}
+	return out
+}
+
+// LoadChunkChiseledBookshelfBlockEntitiesNBT loads chiseled bookshelf block
+// entities from a chunk's `block_entities` NBT list and syncs their slot occupancy.
+func (s *Server) LoadChunkChiseledBookshelfBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	var loaded []*ChiseledBookshelfBlockEntity
+	hs := s.hopperState()
+	hs.mu.Lock()
+	for _, comp := range list {
+		cb, ok := ChiseledBookshelfBlockEntityFromNBT(comp)
+		if !ok || cb == nil {
+			continue
+		}
+		if cb.Dimension == "" {
+			cb.Dimension = normDim
+		}
+		hs.bookshelves[hopperBlockKey{dim: cb.Dimension, x: cb.X, y: cb.Y, z: cb.Z}] = cb
+		loaded = append(loaded, cb.Clone())
+	}
+	hs.mu.Unlock()
+
+	for _, cb := range loaded {
+		s.syncLoadedChiseledBookshelfBlockState(cb)
+	}
+	return len(loaded)
+}
+

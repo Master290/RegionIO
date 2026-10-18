@@ -551,6 +551,9 @@ func EncodeBeaconBlockEntityNBT(b BeaconBlockEntity) *nbt.Compound {
 	if b.CustomName != "" {
 		comp.Set("CustomName", nbt.String(b.CustomName))
 	}
+	if b.TickCounter > 0 {
+		comp.Set("TickCounter", nbt.Int(int32(b.TickCounter)))
+	}
 	return comp
 }
 
@@ -636,6 +639,11 @@ func DecodeBeaconBlockEntityNBT(comp *nbt.Compound) (BeaconBlockEntity, bool) {
 	if v, ok := comp.Get("CustomName"); ok {
 		if s, ok := v.(nbt.String); ok {
 			b.CustomName = string(s)
+		}
+	}
+	if v, ok := comp.Get("TickCounter"); ok {
+		if iv, ok := v.(nbt.Int); ok && iv >= 0 {
+			b.TickCounter = int(iv)
 		}
 	}
 	return b, true
@@ -805,6 +813,32 @@ func (s *Server) ChunkBeaconBlockEntitiesNBT(dimension string, cx, cz int32) []*
 		}
 		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
 			out = append(out, EncodeBeaconBlockEntityNBT(*b))
+		}
+	}
+	bs.mu.Unlock()
+	return out
+}
+
+// UnloadChunkBeacons removes all beacon block entities in chunk (cx, cz) of
+// dimension from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkBeacons(dimension string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	dim := world.NormalizeDimension(dimension)
+	bs := s.beaconState()
+	bs.mu.Lock()
+	s.ensureBeaconsLoadedLocked(bs)
+	var out []*nbt.Compound
+	for k, b := range bs.beacons {
+		if k.dim != dim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if b != nil {
+				out = append(out, EncodeBeaconBlockEntityNBT(*b))
+			}
+			delete(bs.beacons, k)
 		}
 	}
 	bs.mu.Unlock()

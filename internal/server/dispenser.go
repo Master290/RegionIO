@@ -3088,47 +3088,126 @@ func (s *Server) SaveDispensersToNBT() *nbt.Compound {
 		if be == nil {
 			continue
 		}
-		c := nbt.NewCompound()
-		id := "minecraft:dispenser"
-		if be.IsDropper {
-			id = "minecraft:dropper"
-		}
-		c.Set("id", nbt.String(id))
-		c.Set("Dimension", nbt.String(be.Dimension))
-		c.Set("x", nbt.Int(int32(be.X)))
-		c.Set("y", nbt.Int(int32(be.Y)))
-		c.Set("z", nbt.Int(int32(be.Z)))
-		if be.CustomName != "" {
-			c.Set("CustomName", nbt.String(be.CustomName))
-		}
-		var itemTags []nbt.Tag
-		for slotIdx := 0; slotIdx < DispenserSlotCount; slotIdx++ {
-			st := be.Slots[slotIdx]
-			if st.IsEmpty() || st.Count <= 0 {
-				continue
-			}
-			it := nbt.NewCompound()
-			it.Set("Slot", nbt.Byte(int8(slotIdx)))
-			it.Set("id", nbt.String(st.ResolvedID()))
-			it.Set("count", nbt.Int(st.Count))
-			if be.SlotPotions[slotIdx] != "" {
-				it.Set("Potion", nbt.String(be.SlotPotions[slotIdx]))
-			}
-			if be.SlotMeta[slotIdx].Damage > 0 {
-				it.Set("Damage", nbt.Int(be.SlotMeta[slotIdx].Damage))
-			}
-			if be.SlotMeta[slotIdx].CustomName != "" {
-				it.Set("CustomName", nbt.String(be.SlotMeta[slotIdx].CustomName))
-			}
-			itemTags = append(itemTags, it)
-		}
-		c.Set("Items", nbt.List{ElemID: nbt.TagCompound, Elems: itemTags})
-		entries = append(entries, c)
+		entries = append(entries, EncodeDispenserBlockEntityNBT(be))
 	}
 	ds.mu.Unlock()
 
 	root.Set("Dispensers", nbt.List{ElemID: nbt.TagCompound, Elems: entries})
 	return root
+}
+
+// EncodeDispenserBlockEntityNBT serializes a DispenserBlockEntity (dispenser or dropper) into an NBT compound.
+func EncodeDispenserBlockEntityNBT(be *DispenserBlockEntity) *nbt.Compound {
+	c := nbt.NewCompound()
+	if be == nil {
+		return c
+	}
+	id := "minecraft:dispenser"
+	if be.IsDropper {
+		id = "minecraft:dropper"
+	}
+	c.Set("id", nbt.String(id))
+	c.Set("Dimension", nbt.String(normalizeDispenserDim(be.Dimension)))
+	c.Set("x", nbt.Int(int32(be.X)))
+	c.Set("y", nbt.Int(int32(be.Y)))
+	c.Set("z", nbt.Int(int32(be.Z)))
+	if be.CustomName != "" {
+		c.Set("CustomName", nbt.String(be.CustomName))
+	}
+	var itemTags []nbt.Tag
+	for slotIdx := 0; slotIdx < DispenserSlotCount; slotIdx++ {
+		st := be.Slots[slotIdx]
+		if st.IsEmpty() || st.Count <= 0 {
+			continue
+		}
+		it := nbt.NewCompound()
+		it.Set("Slot", nbt.Byte(int8(slotIdx)))
+		it.Set("id", nbt.String(st.ResolvedID()))
+		it.Set("count", nbt.Int(st.Count))
+		if be.SlotPotions[slotIdx] != "" {
+			it.Set("Potion", nbt.String(be.SlotPotions[slotIdx]))
+		}
+		if be.SlotMeta[slotIdx].Damage > 0 {
+			it.Set("Damage", nbt.Int(be.SlotMeta[slotIdx].Damage))
+		}
+		if be.SlotMeta[slotIdx].CustomName != "" {
+			it.Set("CustomName", nbt.String(be.SlotMeta[slotIdx].CustomName))
+		}
+		encodeItemMetaToNBT(it, be.SlotMeta[slotIdx])
+		itemTags = append(itemTags, it)
+	}
+	c.Set("Items", nbt.List{ElemID: nbt.TagCompound, Elems: itemTags})
+	return c
+}
+
+// DecodeDispenserBlockEntityNBT deserializes a DispenserBlockEntity (dispenser or dropper) from an NBT compound.
+func DecodeDispenserBlockEntityNBT(c *nbt.Compound, fallbackDim string) (*DispenserBlockEntity, bool) {
+	if c == nil {
+		return nil, false
+	}
+	idStr, _ := nbtGetString(c, "id")
+	normID := canonicalResourceName(idStr)
+	if idStr != "" && normID != "minecraft:dispenser" && normID != "minecraft:dropper" {
+		return nil, false
+	}
+	dim, _ := nbtGetString(c, "Dimension")
+	if dim == "" {
+		dim = fallbackDim
+	}
+	normDim := normalizeDispenserDim(dim)
+	x, _ := nbtGetInt(c, "x")
+	y, _ := nbtGetInt(c, "y")
+	z, _ := nbtGetInt(c, "z")
+	customName, _ := nbtGetString(c, "CustomName")
+
+	be := &DispenserBlockEntity{
+		Dimension:  normDim,
+		X:          int(x),
+		Y:          int(y),
+		Z:          int(z),
+		IsDropper:  normID == "minecraft:dropper",
+		CustomName: customName,
+	}
+	if itemElems, ok := nbtGetListElems(c, "Items"); ok {
+		for _, itElem := range itemElems {
+			itComp, ok := itElem.(*nbt.Compound)
+			if !ok || itComp == nil {
+				continue
+			}
+			slotByte, _ := nbtGetByte(itComp, "Slot")
+			slotIdx := int(slotByte)
+			if slotIdx < 0 || slotIdx >= DispenserSlotCount {
+				continue
+			}
+			itemID, _ := nbtGetString(itComp, "id")
+			count, _ := nbtGetInt(itComp, "count")
+			if count <= 0 {
+				if bCount, ok := nbtGetByte(itComp, "Count"); ok {
+					count = int32(bCount)
+				}
+			}
+			if itemID == "" || count <= 0 {
+				continue
+			}
+			be.Slots[slotIdx] = world.NewNamedItemStack(itemID, count)
+			if pot, ok := nbtGetString(itComp, "Potion"); ok {
+				be.SlotPotions[slotIdx] = pot
+			}
+			meta := decodeItemMetaFromNBT(itComp)
+			if meta.Damage == 0 {
+				if dmg, ok := nbtGetInt(itComp, "Damage"); ok && dmg > 0 {
+					meta.Damage = dmg
+				}
+			}
+			if meta.CustomName == "" {
+				if cname, ok := nbtGetString(itComp, "CustomName"); ok && cname != "" {
+					meta.CustomName = cname
+				}
+			}
+			be.SlotMeta[slotIdx] = meta
+		}
+	}
+	return be, true
 }
 
 func nbtGetString(c *nbt.Compound, key string) (string, bool) {
@@ -3209,65 +3288,90 @@ func (s *Server) LoadDispensersFromNBT(root *nbt.Compound) int {
 		if !ok || c == nil {
 			continue
 		}
-		dim, _ := nbtGetString(c, "Dimension")
-		normDim := normalizeDispenserDim(dim)
-		x, _ := nbtGetInt(c, "x")
-		y, _ := nbtGetInt(c, "y")
-		z, _ := nbtGetInt(c, "z")
-		idStr, _ := nbtGetString(c, "id")
-		customName, _ := nbtGetString(c, "CustomName")
-
-		be := &DispenserBlockEntity{
-			Dimension:  normDim,
-			X:          int(x),
-			Y:          int(y),
-			Z:          int(z),
-			IsDropper:  idStr == "minecraft:dropper",
-			CustomName: customName,
+		be, ok := DecodeDispenserBlockEntityNBT(c, world.DimensionOverworld)
+		if !ok || be == nil {
+			continue
 		}
-		if itemElems, ok := nbtGetListElems(c, "Items"); ok {
-			for _, itElem := range itemElems {
-				itComp, ok := itElem.(*nbt.Compound)
-				if !ok || itComp == nil {
-					continue
-				}
-				slotByte, _ := nbtGetByte(itComp, "Slot")
-				slotIdx := int(slotByte)
-				if slotIdx < 0 || slotIdx >= DispenserSlotCount {
-					continue
-				}
-				itemID, _ := nbtGetString(itComp, "id")
-				count, _ := nbtGetInt(itComp, "count")
-				if count <= 0 {
-					if bCount, ok := nbtGetByte(itComp, "Count"); ok {
-						count = int32(bCount)
-					}
-				}
-				if itemID == "" || count <= 0 {
-					continue
-				}
-				be.Slots[slotIdx] = world.NewNamedItemStack(itemID, count)
-				if pot, ok := nbtGetString(itComp, "Potion"); ok {
-					be.SlotPotions[slotIdx] = pot
-				}
-				var meta ItemMeta
-				if dmg, ok := nbtGetInt(itComp, "Damage"); ok {
-					meta.Damage = dmg
-				}
-				if cname, ok := nbtGetString(itComp, "CustomName"); ok {
-					meta.CustomName = cname
-				}
-				be.SlotMeta[slotIdx] = meta
-			}
-		}
-		ds.blocks[dispenserBlockKey{dim: normDim, x: int(x), y: int(y), z: int(z)}] = be
-		dimsToBind = append(dimsToBind, normDim)
+		ds.blocks[dispenserBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}] = be
+		dimsToBind = append(dimsToBind, be.Dimension)
 		loaded++
 	}
 	ds.mu.Unlock()
 
 	for _, d := range dimsToBind {
 		s.BindNoteBlockAndJukeboxRedstone(d)
+	}
+	return loaded
+}
+
+// ChunkDispenserBlockEntitiesNBT returns vanilla `block_entities` NBT compounds
+// for all dispensers and droppers in chunk (cx, cz) of dim.
+func (s *Server) ChunkDispenserBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeDispenserDim(dim)
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	var out []*nbt.Compound
+	for k, be := range ds.blocks {
+		if k.dim != normDim || be == nil {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, EncodeDispenserBlockEntityNBT(be))
+		}
+	}
+	return out
+}
+
+// UnloadChunkDispensers removes all dispensers and droppers in chunk (cx, cz)
+// of dim from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkDispensers(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeDispenserDim(dim)
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	var out []*nbt.Compound
+	for k, be := range ds.blocks {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if be != nil {
+				out = append(out, EncodeDispenserBlockEntityNBT(be))
+			}
+			delete(ds.blocks, k)
+		}
+	}
+	return out
+}
+
+// LoadChunkDispenserBlockEntitiesNBT loads dispenser and dropper block entities
+// from a chunk's `block_entities` NBT list.
+func (s *Server) LoadChunkDispenserBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := normalizeDispenserDim(dim)
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	loaded := 0
+	for _, c := range list {
+		be, ok := DecodeDispenserBlockEntityNBT(c, normDim)
+		if !ok || be == nil {
+			continue
+		}
+		ds.blocks[dispenserBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}] = be
+		loaded++
+	}
+	ds.mu.Unlock()
+	if loaded > 0 {
+		s.BindNoteBlockAndJukeboxRedstone(normDim)
 	}
 	return loaded
 }

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
@@ -644,10 +645,33 @@ func (s *Server) SetFurnaceState(f world.FurnaceBlockEntity) {
 	if cp.RecipesUsed == nil {
 		cp.RecipesUsed = make(map[string]int32)
 	}
+	if cp.CookingTotalTime <= 0 && !cp.Items[world.FurnaceSlotInput].IsEmpty() {
+		if rec, ok := MatchSmeltingRecipe(cp.ID, cp.Items[world.FurnaceSlotInput]); ok {
+			cp.CookingTotalTime = rec.CookingTime
+		}
+	}
 	fs.furnaces[furnaceKey{f.X, f.Y, f.Z}] = &cp
 	fs.mu.Unlock()
+	s.syncFurnaceLitBlockStateAt(f.X, f.Y, f.Z, cp.LitTimeRemaining > 0)
 	s.persistChunkFurnaces(int32(f.X>>4), int32(f.Z>>4))
 	s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, f.X, f.Y, f.Z)
+}
+
+func (s *Server) syncFurnaceLitBlockStateAt(x, y, z int, wantLit bool) {
+	if s == nil || s.chunks == nil {
+		return
+	}
+	curState := s.chunks.GetBlock(x, y, z)
+	if !world.IsFurnaceBlockState(curState) {
+		return
+	}
+	if world.FurnaceStateLit(curState) == wantLit {
+		return
+	}
+	if nextState, ok := world.SetFurnaceStateLit(curState, wantLit); ok && nextState != curState {
+		_, _ = s.chunks.SetBlockWithLight(x, y, z, nextState)
+		s.broadcastBlockUpdateInDim(world.DimensionOverworld, x, y, z, nextState)
+	}
 }
 
 // FurnaceComparatorSignal returns the redstone comparator output (0..15) for a
@@ -783,6 +807,9 @@ func (s *Server) OpenFurnace(session *PlayerSession, x, y, z int) (int32, error)
 	fs.mu.Lock()
 	f := s.getOrCreateFurnaceLocked(fs, x, y, z, blockEntityID)
 	menuType, title = furnaceMenuAndTitleForID(f.ID)
+	if f.CustomName != "" {
+		title = f.CustomName
+	}
 	fs.mu.Unlock()
 
 	tr := getContainerTracker(session)
@@ -1307,3 +1334,147 @@ func (s *Server) AwardFurnaceExperience(x, y, z int) int {
 	s.persistChunkFurnaces(int32(x>>4), int32(z>>4))
 	return totalXP
 }
+
+// LoadFurnaces loads all persisted furnace block entities from disk and
+// synchronizes their `lit` block states, cooking total times, and comparators.
+func (s *Server) LoadFurnaces() error {
+	if s == nil {
+		return nil
+	}
+	s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+	fs := s.furnaceState()
+	fs.mu.Lock()
+	fs.loadedStore = false
+	s.ensureFurnacesLoadedLocked(fs)
+	var loaded []world.FurnaceBlockEntity
+	for _, f := range fs.furnaces {
+		if f == nil {
+			continue
+		}
+		if f.CookingTotalTime <= 0 && !f.Items[world.FurnaceSlotInput].IsEmpty() {
+			if rec, ok := MatchSmeltingRecipe(f.ID, f.Items[world.FurnaceSlotInput]); ok {
+				f.CookingTotalTime = rec.CookingTime
+			}
+		}
+		loaded = append(loaded, f.Clone())
+	}
+	fs.mu.Unlock()
+
+	for _, f := range loaded {
+		s.syncFurnaceLitBlockStateAt(f.X, f.Y, f.Z, f.LitTimeRemaining > 0)
+		s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, f.X, f.Y, f.Z)
+	}
+	return nil
+}
+
+// UnloadChunkFurnaces persists and removes all furnace block entities in chunk
+// (cx, cz) from runtime memory when the chunk is unloaded.
+func (s *Server) UnloadChunkFurnaces(cx, cz int32) error {
+	if s == nil {
+		return nil
+	}
+	fs := s.furnaceState()
+	fs.mu.Lock()
+	list := s.collectChunkFurnacesLocked(fs, cx, cz)
+	for key := range fs.furnaces {
+		if int32(key.x>>4) == cx && int32(key.z>>4) == cz {
+			delete(fs.furnaces, key)
+		}
+	}
+	delete(fs.loadedChunk, [2]int32{cx, cz})
+	fs.mu.Unlock()
+
+	if s.chunks != nil && s.store != nil {
+		return s.chunks.SaveChunkFurnaces(cx, cz, list)
+	}
+	return nil
+}
+
+// ReloadChunkFurnaces reloads furnace block entities for chunk (cx, cz) from
+// disk and synchronizes their `lit` block states and comparator outputs.
+func (s *Server) ReloadChunkFurnaces(cx, cz int32) error {
+	if s == nil {
+		return nil
+	}
+	s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+	fs := s.furnaceState()
+	fs.mu.Lock()
+	delete(fs.loadedChunk, [2]int32{cx, cz})
+	s.ensureChunkFurnacesLoadedLocked(fs, cx, cz)
+	var chunkFurnaces []world.FurnaceBlockEntity
+	for key, f := range fs.furnaces {
+		if int32(key.x>>4) == cx && int32(key.z>>4) == cz && f != nil {
+			if f.CookingTotalTime <= 0 && !f.Items[world.FurnaceSlotInput].IsEmpty() {
+				if rec, ok := MatchSmeltingRecipe(f.ID, f.Items[world.FurnaceSlotInput]); ok {
+					f.CookingTotalTime = rec.CookingTime
+				}
+			}
+			chunkFurnaces = append(chunkFurnaces, f.Clone())
+		}
+	}
+	fs.mu.Unlock()
+
+	for _, f := range chunkFurnaces {
+		s.syncFurnaceLitBlockStateAt(f.X, f.Y, f.Z, f.LitTimeRemaining > 0)
+		s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, f.X, f.Y, f.Z)
+	}
+	return nil
+}
+
+// ChunkFurnaceBlockEntitiesNBT returns vanilla `block_entities` NBT compounds
+// for all furnaces, blast furnaces, and smokers in chunk (cx, cz).
+func (s *Server) ChunkFurnaceBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	fs := s.furnaceState()
+	fs.mu.Lock()
+	s.ensureChunkFurnacesLoadedLocked(fs, cx, cz)
+	list := s.collectChunkFurnacesLocked(fs, cx, cz)
+	fs.mu.Unlock()
+
+	out := make([]*nbt.Compound, 0, len(list))
+	for _, f := range list {
+		out = append(out, world.EncodeFurnaceBlockEntityNBT(f))
+	}
+	return out
+}
+
+// LoadChunkFurnaceBlockEntitiesNBT decodes and loads furnace block entities
+// from a chunk's `block_entities` NBT list.
+func (s *Server) LoadChunkFurnaceBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	s.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+	fs := s.furnaceState()
+	fs.mu.Lock()
+	var loaded []world.FurnaceBlockEntity
+	for _, c := range list {
+		f, ok := world.DecodeFurnaceBlockEntityNBT(c)
+		if !ok {
+			continue
+		}
+		f.ID = s.resolveFurnaceIDAt(f.X, f.Y, f.Z, f.ID)
+		if f.RecipesUsed == nil {
+			f.RecipesUsed = make(map[string]int32)
+		}
+		if f.CookingTotalTime <= 0 && !f.Items[world.FurnaceSlotInput].IsEmpty() {
+			if rec, ok := MatchSmeltingRecipe(f.ID, f.Items[world.FurnaceSlotInput]); ok {
+				f.CookingTotalTime = rec.CookingTime
+			}
+		}
+		cp := f.Clone()
+		fs.furnaces[furnaceKey{f.X, f.Y, f.Z}] = &cp
+		fs.loadedChunk[[2]int32{int32(f.X >> 4), int32(f.Z >> 4)}] = true
+		loaded = append(loaded, cp)
+	}
+	fs.mu.Unlock()
+
+	for _, f := range loaded {
+		s.syncFurnaceLitBlockStateAt(f.X, f.Y, f.Z, f.LitTimeRemaining > 0)
+		s.updateHopperComparatorsAndBroadcast(world.DimensionOverworld, f.X, f.Y, f.Z)
+	}
+	return len(loaded)
+}
+

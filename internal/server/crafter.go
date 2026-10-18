@@ -661,6 +661,7 @@ func (cr *CrafterBlockEntity) ToNBT() *nbt.Compound {
 	comp.Set("x", nbt.Int(int32(cr.X)))
 	comp.Set("y", nbt.Int(int32(cr.Y)))
 	comp.Set("z", nbt.Int(int32(cr.Z)))
+	comp.Set("crafting_ticks_remaining", nbt.Int(int32(cr.CraftingTicksRemaining)))
 
 	var disabledIndices []int32
 	var itemEntries []nbt.Tag
@@ -693,6 +694,9 @@ func CrafterBlockEntityFromNBT(comp *nbt.Compound) (*CrafterBlockEntity, bool) {
 	if comp == nil {
 		return nil, false
 	}
+	if idStr, hasID := nbtGetString(comp, "id"); hasID && idStr != "" && canonicalResourceName(idStr) != "minecraft:crafter" {
+		return nil, false
+	}
 	dim, _ := nbtGetString(comp, "Dimension")
 	x, okX := nbtGetInt(comp, "x")
 	y, okY := nbtGetInt(comp, "y")
@@ -700,11 +704,16 @@ func CrafterBlockEntityFromNBT(comp *nbt.Compound) (*CrafterBlockEntity, bool) {
 	if !okX || !okY || !okZ {
 		return nil, false
 	}
+	craftingTicks, _ := nbtGetInt(comp, "crafting_ticks_remaining")
+	if craftingTicks < 0 {
+		craftingTicks = 0
+	}
 	cr := &CrafterBlockEntity{
-		Dimension: normalizeHopperDim(dim),
-		X:         int(x),
-		Y:         int(y),
-		Z:         int(z),
+		Dimension:              normalizeHopperDim(dim),
+		X:                      int(x),
+		Y:                      int(y),
+		Z:                      int(z),
+		CraftingTicksRemaining: int(craftingTicks),
 	}
 	if rawDis, ok := comp.Get("disabled_slots"); ok {
 		if dis, ok := rawDis.(nbt.IntArray); ok {
@@ -763,6 +772,14 @@ func (s *Server) SaveCrafters() error {
 	if path == "" {
 		return nil
 	}
+	tm := s.crafterTimers()
+	tm.mu.Lock()
+	timerSnap := make(map[hopperBlockKey]int, len(tm.timers))
+	for k, v := range tm.timers {
+		timerSnap[k] = v
+	}
+	tm.mu.Unlock()
+
 	hs := s.hopperState()
 	hs.mu.Lock()
 	keys := make([]hopperBlockKey, 0, len(hs.crafters))
@@ -784,7 +801,11 @@ func (s *Server) SaveCrafters() error {
 	list := make([]nbt.Tag, 0, len(keys))
 	for _, k := range keys {
 		if cr := hs.crafters[k]; cr != nil {
-			list = append(list, cr.ToNBT())
+			cp := cr.Clone()
+			if rem, ok := timerSnap[k]; ok && rem > 0 {
+				cp.CraftingTicksRemaining = rem
+			}
+			list = append(list, cp.ToNBT())
 		}
 	}
 	hs.mu.Unlock()
@@ -824,6 +845,7 @@ func (s *Server) LoadCrafters() error {
 		return nil
 	}
 	entries, _ := nbtGetListElems(root, "Crafters")
+	var loaded []*CrafterBlockEntity
 	hs := s.hopperState()
 	hs.mu.Lock()
 	for _, raw := range entries {
@@ -833,8 +855,149 @@ func (s *Server) LoadCrafters() error {
 		}
 		if cr, ok := CrafterBlockEntityFromNBT(comp); ok && cr != nil {
 			hs.crafters[hopperBlockKey{dim: cr.Dimension, x: cr.X, y: cr.Y, z: cr.Z}] = cr
+			loaded = append(loaded, cr.Clone())
 		}
 	}
 	hs.mu.Unlock()
+
+	tm := s.crafterTimers()
+	for _, cr := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(cr.Dimension)
+		key := hopperBlockKey{dim: cr.Dimension, x: cr.X, y: cr.Y, z: cr.Z}
+		rem := cr.CraftingTicksRemaining
+		if rem <= 0 {
+			if cache := s.DimensionChunks(cr.Dimension); cache != nil {
+				if CrafterCrafting(cache.GetBlock(cr.X, cr.Y, cr.Z)) {
+					rem = CrafterCraftingVisualTicks
+				}
+			}
+		}
+		if rem > 0 {
+			tm.mu.Lock()
+			tm.timers[key] = rem
+			tm.mu.Unlock()
+		}
+		s.updateHopperComparatorsAndBroadcast(cr.Dimension, cr.X, cr.Y, cr.Z)
+	}
 	return nil
 }
+
+// ChunkCrafterBlockEntitiesNBT returns vanilla `block_entities` NBT compounds
+// for all crafters in chunk (cx, cz) of dim.
+func (s *Server) ChunkCrafterBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	tm := s.crafterTimers()
+	tm.mu.Lock()
+	timerSnap := make(map[hopperBlockKey]int, len(tm.timers))
+	for k, v := range tm.timers {
+		timerSnap[k] = v
+	}
+	tm.mu.Unlock()
+
+	hs := s.hopperState()
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, cr := range hs.crafters {
+		if k.dim != normDim || cr == nil {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			cp := cr.Clone()
+			if rem, ok := timerSnap[k]; ok && rem > 0 {
+				cp.CraftingTicksRemaining = rem
+			}
+			out = append(out, cp.ToNBT())
+		}
+	}
+	return out
+}
+
+// UnloadChunkCrafters removes all crafters in chunk (cx, cz) of dim from runtime
+// memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkCrafters(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	tm := s.crafterTimers()
+	tm.mu.Lock()
+	timerSnap := make(map[hopperBlockKey]int)
+	for k, v := range tm.timers {
+		if k.dim == normDim && int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			timerSnap[k] = v
+			delete(tm.timers, k)
+		}
+	}
+	tm.mu.Unlock()
+
+	hs := s.hopperState()
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, cr := range hs.crafters {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if cr != nil {
+				cp := cr.Clone()
+				if rem, ok := timerSnap[k]; ok && rem > 0 {
+					cp.CraftingTicksRemaining = rem
+				}
+				out = append(out, cp.ToNBT())
+			}
+			delete(hs.crafters, k)
+		}
+	}
+	return out
+}
+
+// LoadChunkCrafterBlockEntitiesNBT loads crafter block entities from a chunk's
+// `block_entities` NBT list and restores any active `crafting_ticks_remaining` timers.
+func (s *Server) LoadChunkCrafterBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	var loaded []*CrafterBlockEntity
+	hs := s.hopperState()
+	hs.mu.Lock()
+	for _, comp := range list {
+		cr, ok := CrafterBlockEntityFromNBT(comp)
+		if !ok || cr == nil {
+			continue
+		}
+		if cr.Dimension == "" {
+			cr.Dimension = normDim
+		}
+		hs.crafters[hopperBlockKey{dim: cr.Dimension, x: cr.X, y: cr.Y, z: cr.Z}] = cr
+		loaded = append(loaded, cr.Clone())
+	}
+	hs.mu.Unlock()
+
+	tm := s.crafterTimers()
+	for _, cr := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(cr.Dimension)
+		key := hopperBlockKey{dim: cr.Dimension, x: cr.X, y: cr.Y, z: cr.Z}
+		rem := cr.CraftingTicksRemaining
+		if rem <= 0 {
+			if cache := s.DimensionChunks(cr.Dimension); cache != nil {
+				if CrafterCrafting(cache.GetBlock(cr.X, cr.Y, cr.Z)) {
+					rem = CrafterCraftingVisualTicks
+				}
+			}
+		}
+		if rem > 0 {
+			tm.mu.Lock()
+			tm.timers[key] = rem
+			tm.mu.Unlock()
+		}
+		s.updateHopperComparatorsAndBroadcast(cr.Dimension, cr.X, cr.Y, cr.Z)
+	}
+	return len(loaded)
+}
+

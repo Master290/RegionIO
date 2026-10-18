@@ -894,6 +894,11 @@ func DecodeCampfireBlockEntityNBT(c *nbt.Compound) (CampfireBlockEntity, bool) {
 			}
 		}
 	}
+	for i := 0; i < CampfireSlotCount; i++ {
+		if !be.Items[i].IsEmpty() && be.CookingTime[i] <= 0 {
+			be.CookingTime[i] = int16(CampfireDefaultCookTime)
+		}
+	}
 	return be, true
 }
 
@@ -1025,3 +1030,114 @@ func (s *Server) loadPersistedCampfires() ([]CampfireBlockEntity, error) {
 	}
 	return out, nil
 }
+
+// LoadCampfires loads all persisted campfire block entities from `<worldDir>/data/campfires.dat`
+// and synchronizes their `signal_fire` property above `minecraft:hay_block`.
+func (s *Server) LoadCampfires() error {
+	if s == nil {
+		return nil
+	}
+	persisted, err := s.loadPersistedCampfires()
+	if err != nil {
+		return err
+	}
+	cs := s.campfireState()
+	cs.mu.Lock()
+	cs.loadedStore = true
+	cs.campfires = make(map[campfireKey]*CampfireBlockEntity, len(persisted))
+	for _, be := range persisted {
+		normDim := normalizeCampfireDim(be.Dimension)
+		cp := be.Clone()
+		cp.Dimension = normDim
+		cp.ID = s.resolveCampfireIDAt(normDim, cp.X, cp.Y, cp.Z, cp.ID)
+		cs.campfires[campfireKey{dim: normDim, x: cp.X, y: cp.Y, z: cp.Z}] = &cp
+	}
+	cs.mu.Unlock()
+
+	for _, be := range persisted {
+		s.UpdateCampfireSignalFire(be.Dimension, be.X, be.Y, be.Z)
+	}
+	return nil
+}
+
+// ChunkCampfireBlockEntitiesNBT returns vanilla `block_entities` NBT compounds
+// for all campfires and soul campfires in chunk (cx, cz) of dim.
+func (s *Server) ChunkCampfireBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeCampfireDim(dim)
+	cs := s.campfireState()
+	cs.mu.Lock()
+	s.ensureCampfiresLoadedLocked(cs)
+	var out []*nbt.Compound
+	for k, be := range cs.campfires {
+		if k.dim != normDim || be == nil {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			out = append(out, EncodeCampfireBlockEntityNBT(*be))
+		}
+	}
+	cs.mu.Unlock()
+	return out
+}
+
+// UnloadChunkCampfires removes all campfire block entities in chunk (cx, cz)
+// of dim from runtime memory and returns their serialized NBT compounds.
+func (s *Server) UnloadChunkCampfires(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeCampfireDim(dim)
+	cs := s.campfireState()
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	var out []*nbt.Compound
+	for k, be := range cs.campfires {
+		if k.dim != normDim {
+			continue
+		}
+		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if be != nil {
+				out = append(out, EncodeCampfireBlockEntityNBT(*be))
+			}
+			delete(cs.campfires, k)
+		}
+	}
+	return out
+}
+
+// LoadChunkCampfireBlockEntitiesNBT loads campfire block entities from a chunk's
+// `block_entities` NBT list and synchronizes their `signal_fire` block state.
+func (s *Server) LoadChunkCampfireBlockEntitiesNBT(dim string, list []*nbt.Compound) int {
+	if s == nil || len(list) == 0 {
+		return 0
+	}
+	normDim := normalizeCampfireDim(dim)
+	cs := s.campfireState()
+	cs.mu.Lock()
+	var loaded []CampfireBlockEntity
+	for _, c := range list {
+		be, ok := DecodeCampfireBlockEntityNBT(c)
+		if !ok {
+			continue
+		}
+		if be.Dimension == "" {
+			be.Dimension = normDim
+		} else {
+			be.Dimension = normalizeCampfireDim(be.Dimension)
+		}
+		be.ID = s.resolveCampfireIDAt(be.Dimension, be.X, be.Y, be.Z, be.ID)
+		cp := be.Clone()
+		cs.campfires[campfireKey{dim: cp.Dimension, x: cp.X, y: cp.Y, z: cp.Z}] = &cp
+		loaded = append(loaded, cp)
+	}
+	cs.mu.Unlock()
+
+	for _, be := range loaded {
+		s.UpdateCampfireSignalFire(be.Dimension, be.X, be.Y, be.Z)
+	}
+	return len(loaded)
+}
+
