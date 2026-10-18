@@ -671,6 +671,8 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundAxolotlHurt, SoundSourceNeutral
 	case MobTypeGoat:
 		return SoundGoatHurt, SoundSourceNeutral
+	case MobTypeBee:
+		return SoundBeeHurt, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.hurt", SoundSourceNeutral
 	case MobTypeWanderingTrader:
@@ -734,6 +736,8 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundAxolotlDeath, SoundSourceNeutral
 	case MobTypeGoat:
 		return SoundGoatDeath, SoundSourceNeutral
+	case MobTypeBee:
+		return SoundBeeDeath, SoundSourceNeutral
 	case MobTypeVillager:
 		return "minecraft:entity.villager.death", SoundSourceNeutral
 	case MobTypeWanderingTrader:
@@ -1182,6 +1186,9 @@ func (s *Server) applyDamageToMob(
 			if normTarget == MobTypeWolf {
 				s.ProvokeWildWolf(target.ID, attacker)
 			}
+			if normTarget == MobTypeBee {
+				s.AngerBeesNear(dim, target.X, target.Y, target.Z, BeeSwarmAlertRadius, attacker, nil)
+			}
 			if normTarget == MobTypeVillager {
 				s.OnVillagerHurtByPlayer(target.ID, attacker)
 			}
@@ -1225,6 +1232,12 @@ func (s *Server) applyDamageToMob(
 	s.OnEntityDiedWithEffects(target.ID)
 	s.OnRaiderKilled(target.ID, attacker)
 	_ = s.DismountEntityFromVehicle(target.ID)
+	if canonicalResourceName(target.TypeName) == MobTypeBee {
+		s.RemoveBeeState(target.ID)
+		if attacker != nil {
+			s.AngerBeesNear(dim, deathX, deathY, deathZ, BeeSwarmAlertRadius, attacker, nil)
+		}
+	}
 	if canonicalResourceName(target.TypeName) == MobTypeWanderingTrader && attacker != nil {
 		s.OnWanderingTraderDamaged(target.ID, attacker, 0)
 	}

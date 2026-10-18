@@ -188,6 +188,8 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickGoats(rng)
 		s.TickEquinesAndLlamas(rng)
 		s.TickLlamaSpits()
+		s.TickBees(rng)
+		s.TickBeehives(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -278,12 +280,18 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay {
+		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true
 				mem.health = ResolveMobMaxHealth(snapshot.TypeName)
 				mem.lastHealth = mem.health
+			}
+			if mem.breedCooldown > 0 {
+				mem.breedCooldown--
+			}
+			if mem.inLoveTicks > 0 {
+				mem.inLoveTicks--
 			}
 			continue
 		}

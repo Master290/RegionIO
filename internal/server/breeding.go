@@ -168,6 +168,8 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 		return item == TropicalFishBucketItemID
 	case MobTypeGoat:
 		return item == GoatBreedingFoodItemID
+	case MobTypeBee:
+		return IsBeeBreedItem(item)
 	default:
 		return false
 	}
@@ -181,7 +183,7 @@ func IsBreedableMob(typeName string) bool {
 		MobTypeWolf, MobTypeCat,
 		MobTypeHorse, MobTypeDonkey, MobTypeLlama, MobTypeTraderLlama,
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
-		MobTypeFrog, MobTypeAxolotl, MobTypeGoat:
+		MobTypeFrog, MobTypeAxolotl, MobTypeGoat, MobTypeBee:
 		return true
 	default:
 		return false

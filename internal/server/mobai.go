@@ -109,7 +109,7 @@ func IsPassiveMob(typeName string) bool {
 		MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse,
 		MobTypeLlama, MobTypeTraderLlama,
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
-		MobTypeAllay, MobTypeFrog, MobTypeTadpole, MobTypeAxolotl, MobTypeGoat:
+		MobTypeAllay, MobTypeFrog, MobTypeTadpole, MobTypeAxolotl, MobTypeGoat, MobTypeBee:
 		return true
 	default:
 		return false

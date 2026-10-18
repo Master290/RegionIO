@@ -179,6 +179,7 @@ var (
 		MobTypeZombieHorse:         EntityTypeZombieHorseID,
 		MobTypeWanderingTrader:     EntityTypeWanderingTraderID,
 		EntityTypeLlamaSpit:        EntityTypeLlamaSpitID,
+		MobTypeBee:                 EntityTypeBeeID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -200,10 +201,10 @@ func AllPassiveAnimalTypes() []string {
 }
 
 // IsPassiveAnimal reports whether typeName is a breedable passive farm animal
-// (pig, cow, sheep, or chicken).
+// (pig, cow, sheep, chicken, or bee).
 func IsPassiveAnimal(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken:
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee:
 		return true
 	default:
 		return false
@@ -325,6 +326,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultWitherSkeletonMaxHealth
 	case MobTypeEnderDragon:
 		return DefaultEnderDragonMaxHealth
+	case MobTypeBee:
+		return DefaultBeeMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -354,6 +357,8 @@ func animalWanderSpeed(typeName string) float64 {
 		return AxolotlSwimSpeed
 	case MobTypeGoat:
 		return GoatWanderSpeed
+	case MobTypeBee:
+		return BeeFlySpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -429,6 +434,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeGoat {
 		return s.SpawnGoat(normDim, x, y, z, false, false)
+	}
+	if norm == MobTypeBee {
+		return s.SpawnBee(normDim, x, y, z, false)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
@@ -574,6 +582,8 @@ func IsAnimalBreedingFood(typeName, itemName string) bool {
 		return item == TropicalFishBucketItemID
 	case MobTypeGoat:
 		return item == GoatBreedingFoodItemID
+	case MobTypeBee:
+		return IsBeeBreedItem(item)
 	}
 	return false
 }
