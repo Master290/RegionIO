@@ -367,6 +367,7 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 	}
 	c.checkCopperBulbsAround(x, y, z, res)
 	c.checkBellsAround(x, y, z, res)
+	c.checkFenceGatesAround(x, y, z, res)
 	return true
 }
 
@@ -402,6 +403,18 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	}
 	if IsCopperBarsBlock(state) {
 		return c.ResolveCopperBarsStateAt(x, y, z, state)
+	}
+	if IsFenceGateBlock(state) {
+		state = c.ResolveFenceGateStateAt(x, y, z, state)
+		if c.IsBlockPowered(x, y, z) {
+			if s1, ok1 := withStateProperty(state, "powered", "true"); ok1 {
+				state = s1
+			}
+			if s2, ok2 := withStateProperty(state, "open", "true"); ok2 {
+				state = s2
+			}
+		}
+		return state
 	}
 	if IsBellBlock(state) {
 		if resolved, ok := c.EvaluateBellSurvivalAt(x, y, z, state); ok {
@@ -543,8 +556,9 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 		c.syncComparatorsAroundCopperBlock(x, y, z, res)
 	}
 
-	// Update bells around (x, y, z) on redstone rising/falling edges.
+	// Update bells and fence gates around (x, y, z) on redstone edges.
 	c.checkBellsAround(x, y, z, res)
+	c.checkFenceGatesAround(x, y, z, res)
 
 	// Check whether any TNT block at or near (x, y, z) is now powered by redstone.
 	c.checkPoweredTNTAround(x, y, z, res)
@@ -806,6 +820,10 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 
 	if IsCopperBarsBlock(state) {
 		return c.ResolveCopperBarsStateAt(x, y, z, state), true
+	}
+
+	if IsFenceGateBlock(state) {
+		return c.ResolveFenceGateStateAt(x, y, z, state), true
 	}
 
 	if name == "minecraft:bell" {
@@ -1688,8 +1706,9 @@ func (c *Cache) obsidianOrCobblestone(lavaLevel int) uint16 {
 }
 
 // tryAbsorbWaterWithSponge implements SpongeBlock.tryAbsorbWater: breadth-first
-// search up to depth 6 and 64 water cells, converting the sponge into
-// wet_sponge if at least one water block was absorbed.
+// search up to depth 6 and 64 water cells (including standalone water,
+// waterlogged blocks, and kelp/seagrass), converting the sponge into
+// wet_sponge if at least one water cell was absorbed.
 func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bool {
 	wetSponge, ok := nameToStateID("minecraft:wet_sponge", nil)
 	if !ok {
@@ -1699,9 +1718,13 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 		pos   BlockPos
 		depth int
 	}
+	type absorbedCell struct {
+		pos      BlockPos
+		newState uint16
+	}
 	queue := []node{{pos: BlockPos{X: x, Y: y, Z: z}, depth: 0}}
 	visited := map[BlockPos]bool{{X: x, Y: y, Z: z}: true}
-	var absorbed []BlockPos
+	var absorbed []absorbedCell
 
 	for len(queue) > 0 && len(absorbed) < 64 {
 		cur := queue[0]
@@ -1713,8 +1736,22 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 			}
 			visited[np] = true
 			st := c.GetBlock(np.X, np.Y, np.Z)
+			var nextSt uint16
+			matched := false
 			if kind, _, ok := isStandaloneFluidBlock(st); ok && kind == fluidWater {
-				absorbed = append(absorbed, np)
+				nextSt = StateAir
+				matched = true
+			} else if isRemovableAquaticPlant(st) {
+				nextSt = StateAir
+				matched = true
+			} else if isWaterloggedState(st) {
+				if drained, ok := withStateProperty(st, "waterlogged", "false"); ok && drained != st {
+					nextSt = drained
+					matched = true
+				}
+			}
+			if matched {
+				absorbed = append(absorbed, absorbedCell{pos: np, newState: nextSt})
 				if len(absorbed) >= 64 {
 					break
 				}
@@ -1728,10 +1765,10 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 		return false
 	}
 	c.setBlockRecorded(x, y, z, wetSponge, res)
-	for _, pos := range absorbed {
-		if c.setBlockRecorded(pos.X, pos.Y, pos.Z, StateAir, res) {
-			c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
-			c.scheduleAround(pos.X, pos.Y, pos.Z)
+	for _, cell := range absorbed {
+		if c.setBlockRecorded(cell.pos.X, cell.pos.Y, cell.pos.Z, cell.newState, res) {
+			c.runNeighborSupportPass(cell.pos.X, cell.pos.Y, cell.pos.Z, res)
+			c.scheduleAround(cell.pos.X, cell.pos.Y, cell.pos.Z)
 		}
 	}
 	return true
