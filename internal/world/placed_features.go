@@ -23,9 +23,27 @@ type oreTargetCacheKey struct {
 	targetLen  int
 }
 
+const (
+	maxOreTargetCacheEntries = 512
+	maxBlockTagCacheEntries  = 1024
+)
+
+type blockTagCacheKey struct {
+	set *worldgen.FeatureSet
+	tag string
+}
+
+type cachedBlockTag struct {
+	names []string
+	set   map[string]bool
+}
+
 var (
 	oreTargetCacheMu sync.RWMutex
 	oreTargetCache   = make(map[oreTargetCacheKey][]resolvedOreTarget)
+
+	blockTagCacheMu sync.RWMutex
+	blockTagCache   = make(map[blockTagCacheKey]cachedBlockTag)
 )
 
 func chunkOceanFloorMap(c *Chunk) [16][16]int {
@@ -131,15 +149,46 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 		targets = append(targets, resolvedOreTarget{state: state, replaceables: replaceables})
 	}
 	oreTargetCacheMu.Lock()
+	if len(oreTargetCache) >= maxOreTargetCacheEntries {
+		clear(oreTargetCache)
+	}
 	oreTargetCache[key] = targets
 	oreTargetCacheMu.Unlock()
 	return targets, true
 }
 
+func getCachedBlockTag(set *worldgen.FeatureSet, tag string) cachedBlockTag {
+	key := blockTagCacheKey{set: set, tag: tag}
+	blockTagCacheMu.RLock()
+	if cached, ok := blockTagCache[key]; ok {
+		blockTagCacheMu.RUnlock()
+		return cached
+	}
+	blockTagCacheMu.RUnlock()
+
+	names := flattenBlockTagUncached(set, tag, make(map[string]bool))
+	memberSet := make(map[string]bool, len(names))
+	for _, n := range names {
+		memberSet[n] = true
+	}
+	entry := cachedBlockTag{names: names, set: memberSet}
+	blockTagCacheMu.Lock()
+	if len(blockTagCache) >= maxBlockTagCacheEntries {
+		clear(blockTagCache)
+	}
+	blockTagCache[key] = entry
+	blockTagCacheMu.Unlock()
+	return entry
+}
+
 func flattenBlockTag(set *worldgen.FeatureSet, tag string, visiting map[string]bool) []string {
 	if visiting == nil {
-		visiting = make(map[string]bool)
+		return getCachedBlockTag(set, tag).names
 	}
+	return flattenBlockTagUncached(set, tag, visiting)
+}
+
+func flattenBlockTagUncached(set *worldgen.FeatureSet, tag string, visiting map[string]bool) []string {
 	if visiting[tag] {
 		return nil
 	}
@@ -148,7 +197,7 @@ func flattenBlockTag(set *worldgen.FeatureSet, tag string, visiting map[string]b
 	var names []string
 	for _, value := range set.BlockTags[tag] {
 		if len(value) > 0 && value[0] == '#' {
-			names = append(names, flattenBlockTag(set, value[1:], visiting)...)
+			names = append(names, flattenBlockTagUncached(set, value[1:], visiting)...)
 		} else {
 			names = append(names, value)
 		}

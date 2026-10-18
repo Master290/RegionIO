@@ -381,12 +381,7 @@ func (r *decorationRegion) canSeagrassSurvive(x, y, z int, set *worldgen.Feature
 }
 
 func blockTagContains(set *worldgen.FeatureSet, tag, name string) bool {
-	for _, member := range flattenBlockTag(set, tag, nil) {
-		if member == name {
-			return true
-		}
-	}
-	return false
+	return flattenBlockTagContains(set, tag, name)
 }
 
 // placeVegetationFeatureRef runs an inline feature reference produced by a
@@ -750,12 +745,8 @@ func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePositio
 	if name == "minecraft:moss_carpet" || name == "minecraft:pale_moss_carpet" {
 		return !isAirState(below)
 	}
-	for _, supported := range flattenBlockTag(set, "minecraft:supports_vegetation", nil) {
-		if state, ok := stateByID(below); ok && state.Name == supported {
-			return true
-		}
-	}
-	return false
+	state, ok := stateByID(below)
+	return ok && flattenBlockTagContains(set, "minecraft:supports_vegetation", state.Name)
 }
 
 // placeBamboo ports BambooFeature.place (26.1.2 bytecode).

@@ -265,10 +265,28 @@ func tagStateIDs(set *worldgen.FeatureSet, tag string) map[uint16]bool {
 	// so normalise rather than assume: prefixing an entry that already carries the
 	// marker asks for "##minecraft:...", which resolves to no blocks at all and
 	// silently turns the feature off.
-	if !strings.HasPrefix(tag, "#") {
-		tag = "#" + tag
+	cacheKey := blockSetCacheKey{set: set, key: tag}
+	blockSetCacheMu.RLock()
+	if cached, ok := blockSetCache[cacheKey]; ok {
+		blockSetCacheMu.RUnlock()
+		return cached
 	}
-	return blockSetStateIDs(set, []string{tag})
+	blockSetCacheMu.RUnlock()
+
+	normTag := tag
+	if !strings.HasPrefix(normTag, "#") {
+		normTag = "#" + normTag
+	}
+	ids := blockSetStateIDs(set, []string{normTag})
+	if tag != normTag {
+		blockSetCacheMu.Lock()
+		if len(blockSetCache) >= maxBlockSetCacheEntries {
+			clear(blockSetCache)
+		}
+		blockSetCache[cacheKey] = ids
+		blockSetCacheMu.Unlock()
+	}
+	return ids
 }
 
 // blockSetStateIDs is the shared expansion underneath it: a list of the shape
@@ -286,6 +304,8 @@ type blockSetCacheKey struct {
 	set *worldgen.FeatureSet
 	key string
 }
+
+const maxBlockSetCacheEntries = 1024
 
 var (
 	blockSetCacheMu sync.RWMutex
@@ -325,6 +345,9 @@ func blockSetStateIDs(set *worldgen.FeatureSet, entries []string) map[uint16]boo
 	}
 
 	blockSetCacheMu.Lock()
+	if len(blockSetCache) >= maxBlockSetCacheEntries {
+		clear(blockSetCache)
+	}
 	blockSetCache[cacheKey] = ids
 	blockSetCacheMu.Unlock()
 	return ids

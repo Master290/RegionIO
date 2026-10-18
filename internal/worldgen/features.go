@@ -28,11 +28,18 @@ type FeatureSet struct {
 	Biomes     map[string]BiomeGeneration
 	BlockTags  map[string][]string
 
-	inlineMu   sync.Mutex
-	cacheMu    sync.RWMutex
-	stepsCache map[string][][]string
-	cfgCache   map[[2]string]any
+	inlineMu       sync.Mutex
+	cacheMu        sync.RWMutex
+	lastStepsOrder []string
+	lastSteps      [][]string
+	stepsCache     map[string][][]string
+	cfgCache       map[[2]string]any
 }
+
+const (
+	maxFeatureSetCfgCacheEntries   = 4096
+	maxFeatureSetStepsCacheEntries = 64
+)
 
 func (s *FeatureSet) getCachedConfig(kind, name string) (any, bool) {
 	s.cacheMu.RLock()
@@ -45,6 +52,8 @@ func (s *FeatureSet) setCachedConfig(kind, name string, val any) {
 	s.cacheMu.Lock()
 	if s.cfgCache == nil {
 		s.cfgCache = make(map[[2]string]any)
+	} else if len(s.cfgCache) >= maxFeatureSetCfgCacheEntries {
+		clear(s.cfgCache)
 	}
 	s.cfgCache[[2]string{kind, name}] = val
 	s.cacheMu.Unlock()
@@ -498,27 +507,35 @@ var knownStateProviders = map[string]bool{
 	"minecraft:noise_threshold_provider":      true,
 }
 
+type parsedPlacerFields struct {
+	scalars   map[string]int
+	floats    map[string]float64
+	providers map[string]NestedIntProvider
+}
+
 type TreeTrunkPlacer struct {
 	Type   string
 	Fields map[string]json.RawMessage
+	parsed *parsedPlacerFields
 }
 
 type TreeFoliagePlacer struct {
 	Type   string
 	Fields map[string]json.RawMessage
+	parsed *parsedPlacerFields
 }
 
 // UnmarshalJSON peels "type" off and keeps every other member verbatim, so no
 // field can be lost by not being declared.
 func (p *TreeTrunkPlacer) UnmarshalJSON(raw []byte) error {
-	return unmarshalPlacer(raw, &p.Type, &p.Fields)
+	return unmarshalPlacer(raw, &p.Type, &p.Fields, &p.parsed)
 }
 
 func (p *TreeFoliagePlacer) UnmarshalJSON(raw []byte) error {
-	return unmarshalPlacer(raw, &p.Type, &p.Fields)
+	return unmarshalPlacer(raw, &p.Type, &p.Fields, &p.parsed)
 }
 
-func unmarshalPlacer(raw []byte, typ *string, fields *map[string]json.RawMessage) error {
+func unmarshalPlacer(raw []byte, typ *string, fields *map[string]json.RawMessage, parsed **parsedPlacerFields) error {
 	var all map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &all); err != nil {
 		return err
@@ -532,15 +549,51 @@ func unmarshalPlacer(raw []byte, typ *string, fields *map[string]json.RawMessage
 	}
 	delete(all, "type")
 	*fields = all
+	pf := &parsedPlacerFields{
+		scalars:   make(map[string]int, len(all)),
+		floats:    make(map[string]float64, len(all)),
+		providers: make(map[string]NestedIntProvider, len(all)),
+	}
+	for k, v := range all {
+		var n int
+		if err := json.Unmarshal(v, &n); err == nil {
+			pf.scalars[k] = n
+		}
+		var f float64
+		if err := json.Unmarshal(v, &f); err == nil {
+			pf.floats[k] = f
+		}
+		if prov, err := parseNestedIntProvider(v); err == nil {
+			pf.providers[k] = prov
+		}
+	}
+	*parsed = pf
 	return nil
 }
 
 // Scalar reads a field the data holds as a plain number; Provider reads one as an
 // int provider, which also accepts a bare int as a draw-free constant.
-func (p TreeTrunkPlacer) Scalar(name string) (int, bool)   { return scalarField(p.Fields, name) }
-func (p TreeFoliagePlacer) Scalar(name string) (int, bool) { return scalarField(p.Fields, name) }
+func (p TreeTrunkPlacer) Scalar(name string) (int, bool) {
+	if p.parsed != nil {
+		v, ok := p.parsed.scalars[name]
+		return v, ok
+	}
+	return scalarField(p.Fields, name)
+}
+
+func (p TreeFoliagePlacer) Scalar(name string) (int, bool) {
+	if p.parsed != nil {
+		v, ok := p.parsed.scalars[name]
+		return v, ok
+	}
+	return scalarField(p.Fields, name)
+}
 
 func (p TreeTrunkPlacer) Float(name string) (float64, bool) {
+	if p.parsed != nil {
+		v, ok := p.parsed.floats[name]
+		return v, ok
+	}
 	raw, ok := p.Fields[name]
 	if !ok {
 		return 0, false
@@ -553,6 +606,10 @@ func (p TreeTrunkPlacer) Float(name string) (float64, bool) {
 }
 
 func (p TreeFoliagePlacer) Float(name string) (float64, bool) {
+	if p.parsed != nil {
+		v, ok := p.parsed.floats[name]
+		return v, ok
+	}
 	raw, ok := p.Fields[name]
 	if !ok {
 		return 0, false
@@ -565,10 +622,26 @@ func (p TreeFoliagePlacer) Float(name string) (float64, bool) {
 }
 
 func (p TreeTrunkPlacer) Provider(name string) (NestedIntProvider, bool, error) {
+	if p.parsed != nil {
+		if prov, ok := p.parsed.providers[name]; ok {
+			return prov, true, nil
+		}
+		if _, exists := p.Fields[name]; !exists {
+			return NestedIntProvider{}, false, nil
+		}
+	}
 	return providerField(p.Fields, name)
 }
 
 func (p TreeFoliagePlacer) Provider(name string) (NestedIntProvider, bool, error) {
+	if p.parsed != nil {
+		if prov, ok := p.parsed.providers[name]; ok {
+			return prov, true, nil
+		}
+		if _, exists := p.Fields[name]; !exists {
+			return NestedIntProvider{}, false, nil
+		}
+	}
 	return providerField(p.Fields, name)
 }
 
@@ -601,6 +674,16 @@ func providerField(fields map[string]json.RawMessage, name string) (NestedIntPro
 type TreeMinimumSize struct {
 	Type   string
 	Fields map[string]json.RawMessage
+
+	parsed              bool
+	limit               int
+	hasLimit            bool
+	lowerSize           int
+	upperSize           int
+	upperLimit          int
+	middleSize          int
+	minClippedHeight    int
+	hasMinClippedHeight bool
 }
 
 func (m *TreeMinimumSize) UnmarshalJSON(raw []byte) error {
@@ -617,6 +700,33 @@ func (m *TreeMinimumSize) UnmarshalJSON(raw []byte) error {
 	}
 	delete(all, "type")
 	m.Fields = all
+	m.parsed = true
+	if v, ok := scalarField(all, "limit"); ok {
+		m.limit, m.hasLimit = v, true
+	} else if v, ok := scalarField(all, "min_limit"); ok {
+		m.limit, m.hasLimit = v, true
+	} else if m.Type == "minecraft:two_layers_feature_size" || m.Type == "minecraft:three_layers_feature_size" {
+		m.limit, m.hasLimit = 1, true
+	}
+	m.lowerSize, _ = scalarField(all, "lower_size")
+	if v, ok := scalarField(all, "upper_size"); ok {
+		m.upperSize = v
+	} else {
+		m.upperSize = 1
+	}
+	if v, ok := scalarField(all, "upper_limit"); ok {
+		m.upperLimit = v
+	} else {
+		m.upperLimit = 1
+	}
+	if v, ok := scalarField(all, "middle_size"); ok {
+		m.middleSize = v
+	} else {
+		m.middleSize = 1
+	}
+	if _, exists := all["min_clipped_height"]; exists {
+		m.minClippedHeight, m.hasMinClippedHeight = scalarField(all, "min_clipped_height")
+	}
 	return nil
 }
 
@@ -627,6 +737,25 @@ func (m *TreeMinimumSize) UnmarshalJSON(raw []byte) error {
 // SECOND parameter, so the value that matters is the y offset from the origin and
 // the configured trunk height is ignored by two_layers entirely.
 func (m TreeMinimumSize) SizeAtHeight(height, selfHeight int) int {
+	if m.parsed {
+		limit := m.limit
+		if !m.hasLimit {
+			limit = 1
+		}
+		if selfHeight < limit {
+			return m.lowerSize
+		}
+		switch m.Type {
+		case "minecraft:two_layers_feature_size":
+			return m.upperSize
+		case "minecraft:three_layers_feature_size":
+			if selfHeight >= height-m.upperLimit {
+				return m.upperSize
+			}
+			return m.middleSize
+		}
+		return 0
+	}
 	limit, ok := m.Limit()
 	if !ok {
 		limit = 1
@@ -663,6 +792,9 @@ func (m TreeMinimumSize) SizeAtHeight(height, selfHeight int) int {
 // member, present on exactly one kind of tree in the pack. It is what lets a trunk be
 // cut short and still place, instead of being refused.
 func (m TreeMinimumSize) MinClippedHeight() (int, bool) {
+	if m.parsed {
+		return m.minClippedHeight, m.hasMinClippedHeight
+	}
 	if _, ok := m.Fields["min_clipped_height"]; !ok {
 		return 0, false
 	}
@@ -673,6 +805,9 @@ func (m TreeMinimumSize) MinClippedHeight() (int, bool) {
 // Limit answers the one thing the size check needs from either variant; the two
 // types spell the field differently, which is why it is looked up by name.
 func (m TreeMinimumSize) Limit() (int, bool) {
+	if m.parsed {
+		return m.limit, m.hasLimit
+	}
 	if v, ok := scalarField(m.Fields, "limit"); ok {
 		return v, true
 	}
@@ -690,8 +825,11 @@ func (m TreeMinimumSize) Limit() (int, bool) {
 // a different one - beehive a probability, alter_ground a block state provider - and
 // a shared typed struct would have to know all of them.
 type TreeDecorator struct {
-	Type   string
-	Fields map[string]json.RawMessage
+	Type       string
+	Fields     map[string]json.RawMessage
+	scalars    map[string]int
+	floats     map[string]float64
+	directions map[string][]string
 }
 
 func (d *TreeDecorator) UnmarshalJSON(data []byte) error {
@@ -699,7 +837,12 @@ func (d *TreeDecorator) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &slots); err != nil {
 		return err
 	}
-	out := TreeDecorator{Fields: make(map[string]json.RawMessage, len(slots))}
+	out := TreeDecorator{
+		Fields:     make(map[string]json.RawMessage, len(slots)),
+		scalars:    make(map[string]int, len(slots)),
+		floats:     make(map[string]float64, len(slots)),
+		directions: make(map[string][]string, len(slots)),
+	}
 	for name, raw := range slots {
 		if name == "type" {
 			if err := json.Unmarshal(raw, &out.Type); err != nil {
@@ -708,6 +851,18 @@ func (d *TreeDecorator) UnmarshalJSON(data []byte) error {
 			continue
 		}
 		out.Fields[name] = raw
+		var n int
+		if err := json.Unmarshal(raw, &n); err == nil {
+			out.scalars[name] = n
+		}
+		var f float64
+		if err := json.Unmarshal(raw, &f); err == nil {
+			out.floats[name] = f
+		}
+		var dirs []string
+		if err := json.Unmarshal(raw, &dirs); err == nil && len(dirs) > 0 {
+			out.directions[name] = dirs
+		}
 	}
 	*d = out
 	return nil
@@ -716,6 +871,10 @@ func (d *TreeDecorator) UnmarshalJSON(data []byte) error {
 // Float reads a scalar member of a decorator, which is how beehive's probability
 // arrives.
 func (d TreeDecorator) Float(name string) (float64, bool) {
+	if d.floats != nil {
+		v, ok := d.floats[name]
+		return v, ok
+	}
 	raw, ok := d.Fields[name]
 	if !ok {
 		return 0, false
@@ -730,6 +889,10 @@ func (d TreeDecorator) Float(name string) (float64, bool) {
 // Scalar reads an integer member of a decorator, such as place_on_ground's tries,
 // radius, and height.
 func (d TreeDecorator) Scalar(name string) (int, bool) {
+	if d.scalars != nil {
+		v, ok := d.scalars[name]
+		return v, ok
+	}
 	return scalarField(d.Fields, name)
 }
 
@@ -743,6 +906,10 @@ func (d TreeDecorator) Provider(name string) (json.RawMessage, bool) {
 // Directions reads a non-empty string list member of a decorator, which is how
 // attached_to_logs's directions arrives.
 func (d TreeDecorator) Directions(name string) ([]string, bool) {
+	if d.directions != nil {
+		v, ok := d.directions[name]
+		return v, ok
+	}
 	raw, ok := d.Fields[name]
 	if !ok {
 		return nil, false
@@ -1026,10 +1193,30 @@ func LoadFeatureSet() (*FeatureSet, error) {
 	return featureSet, featureSetErr
 }
 
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // FeatureSteps mirrors FeatureSorter.buildFeaturesPerStep. biomeOrder must be
 // BiomeSource.possibleBiomes encounter order because it assigns the stable
 // identity used to break otherwise unconstrained graph ties.
 func (s *FeatureSet) FeatureSteps(biomeOrder []string) ([][]string, error) {
+	s.cacheMu.RLock()
+	if s.lastSteps != nil && stringSliceEqual(biomeOrder, s.lastStepsOrder) {
+		steps := s.lastSteps
+		s.cacheMu.RUnlock()
+		return steps, nil
+	}
+	s.cacheMu.RUnlock()
+
 	cacheKey := strings.Join(biomeOrder, "\x00")
 	s.cacheMu.RLock()
 	if steps, ok := s.stepsCache[cacheKey]; ok {
@@ -1123,8 +1310,12 @@ func (s *FeatureSet) FeatureSteps(biomeOrder []string) ([][]string, error) {
 	s.cacheMu.Lock()
 	if s.stepsCache == nil {
 		s.stepsCache = make(map[string][][]string)
+	} else if len(s.stepsCache) >= maxFeatureSetStepsCacheEntries {
+		clear(s.stepsCache)
 	}
 	s.stepsCache[cacheKey] = steps
+	s.lastStepsOrder = append([]string(nil), biomeOrder...)
+	s.lastSteps = steps
 	s.cacheMu.Unlock()
 	return steps, nil
 }

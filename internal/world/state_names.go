@@ -24,11 +24,17 @@ type stateName struct {
 	Properties map[string]string // nil when the block has no state properties
 }
 
+const (
+	specialAir uint8 = 1 << iota
+	specialLava
+)
+
 var (
-	stateByIDOnce sync.Once
-	stateByIDImpl map[uint16]stateName
-	idsByName     map[string][]uint16
-	defaultByName map[string]uint16
+	stateByIDOnce     sync.Once
+	stateByIDTable    [totalBlockStates]stateName
+	stateSpecialTable [totalBlockStates]uint8
+	idsByName         map[string][]uint16
+	defaultByName     map[string]uint16
 )
 
 // stateLabel returns the block name of a state ID for diagnostics, or
@@ -47,8 +53,11 @@ func stateLabel(id uint16) string {
 // map is loaded so every state round-trips.
 func stateByID(id uint16) (stateName, bool) {
 	stateByIDOnce.Do(buildStateTable)
-	s, ok := stateByIDImpl[id]
-	return s, ok
+	if int(id) >= totalBlockStates {
+		return stateName{}, false
+	}
+	s := stateByIDTable[id]
+	return s, s.Name != ""
 }
 
 // supportsEntitySpawn distinguishes collision floors from decorative blocks.
@@ -98,16 +107,23 @@ func buildStateTable() {
 	if err := json.Unmarshal(blocksReportJSON, &blocks); err != nil {
 		panic("world: parsing embedded blocks.json: " + err.Error())
 	}
-	stateByIDImpl = make(map[uint16]stateName, 30000)
 	idsByName = make(map[string][]uint16, len(blocks))
 	defaultByName = make(map[string]uint16, len(blocks))
 	for name, b := range blocks {
+		var sp uint8
+		switch name {
+		case "minecraft:air", "minecraft:cave_air", "minecraft:void_air":
+			sp = specialAir
+		case "minecraft:lava":
+			sp = specialLava
+		}
 		for _, s := range b.States {
-			if s.ID < 0 || s.ID > 65535 {
+			if s.ID < 0 || s.ID >= totalBlockStates {
 				continue
 			}
 			id := uint16(s.ID)
-			stateByIDImpl[id] = stateName{Name: name, Properties: s.Properties}
+			stateByIDTable[id] = stateName{Name: name, Properties: s.Properties}
+			stateSpecialTable[id] = sp
 			idsByName[name] = append(idsByName[name], id)
 			if s.Default {
 				defaultByName[name] = id
@@ -177,21 +193,32 @@ func nameToStateID(name string, props map[string]string) (uint16, bool) {
 	// Overlay only keys the block actually has; an unknown key or an illegal
 	// value leaves the default's value in place, which is what
 	// StateHolder.setValue's helper does after logging.
-	base := stateByIDImpl[defaultID].Properties
-	merged := make(map[string]string, len(base))
-	for k, v := range base {
-		if override, present := props[k]; present {
-			merged[k] = override
-			continue
-		}
-		merged[k] = v
+	base := stateByIDTable[defaultID].Properties
+	if len(base) == 0 {
+		return defaultID, true
 	}
 	for _, id := range idsByName[name] {
-		if propsMatch(stateByIDImpl[id].Properties, merged) {
+		if propsMatchOverlay(stateByIDTable[id].Properties, base, props) {
 			return id, true
 		}
 	}
 	return defaultID, true
+}
+
+func propsMatchOverlay(cand, base, overrides map[string]string) bool {
+	if len(cand) != len(base) {
+		return false
+	}
+	for k, baseVal := range base {
+		want := baseVal
+		if override, present := overrides[k]; present {
+			want = override
+		}
+		if cand[k] != want {
+			return false
+		}
+	}
+	return true
 }
 
 func propsMatch(a, b map[string]string) bool {
