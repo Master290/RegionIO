@@ -1026,3 +1026,67 @@ func MultifaceBreakDrops(state uint16, toolName string, hasSilkTouch bool) []Ite
 		return nil
 	}
 }
+
+// --- Cache StructureBlockEntity Accessors ---
+
+// StructureBlockEntityAt returns the worldgen StructureBlockEntity at world
+// coordinates (x, y, z) if the containing chunk is loaded and has one.
+func (c *Cache) StructureBlockEntityAt(x, y, z int) (StructureBlockEntity, bool) {
+	if c == nil {
+		return StructureBlockEntity{}, false
+	}
+	cx, cz := int32(x>>4), int32(z>>4)
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch == nil {
+		ch = c.chunkAt(cx, cz)
+	}
+	if ch == nil {
+		return StructureBlockEntity{}, false
+	}
+	return ch.StructureBlockEntityAt(x, y, z)
+}
+
+// AddStructureBlockEntity records or updates a worldgen StructureBlockEntity on
+// the chunk containing (be.X, be.Y, be.Z).
+func (c *Cache) AddStructureBlockEntity(be StructureBlockEntity) {
+	if c == nil {
+		return
+	}
+	cx, cz := int32(be.X>>4), int32(be.Z>>4)
+	ch := c.chunkAt(cx, cz)
+	if ch != nil {
+		ch.AddStructureBlockEntity(be)
+	}
+}
+
+// RemoveStructureBlockEntity removes any worldgen StructureBlockEntity at world
+// coordinates (x, y, z) if the containing chunk is loaded.
+func (c *Cache) RemoveStructureBlockEntity(x, y, z int) {
+	if c == nil {
+		return
+	}
+	cx, cz := int32(x>>4), int32(z>>4)
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch != nil {
+		ch.RemoveStructureBlockEntity(x, y, z)
+	}
+}
+
+// MoveStructureBlockEntity moves a worldgen StructureBlockEntity from
+// (fromX, fromY, fromZ) to (toX, toY, toZ).
+func (c *Cache) MoveStructureBlockEntity(fromX, fromY, fromZ, toX, toY, toZ int) {
+	if c == nil {
+		return
+	}
+	cx, cz := int32(fromX>>4), int32(fromZ>>4)
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch != nil {
+		ch.MoveStructureBlockEntity(fromX, fromY, fromZ, toX, toY, toZ)
+	}
+}

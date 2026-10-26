@@ -254,9 +254,51 @@ func (s *Server) getOrCreateDecoratedPotLocked(st *serverDecoratedPotStore, dim 
 			Z:         z,
 			Sherds:    DefaultDecoratedPotSherds(),
 		}
+		if s != nil {
+			if cache := s.DimensionChunks(normDim); cache != nil {
+				if sbe, ok := cache.StructureBlockEntityAt(x, y, z); ok && canonicalResourceName(sbe.ID) == "minecraft:decorated_pot" {
+					var shArr [4]string = DefaultDecoratedPotSherds()
+					for i := 0; i < 4 && i < len(sbe.Sherds); i++ {
+						shArr[i] = sbe.Sherds[i]
+					}
+					dp.Sherds = normalizePotSherds(shArr)
+					for _, slot := range sbe.Items {
+						if slot.ItemID != "" && slot.Count > 0 {
+							dp.Item = world.NewNamedItemStack(slot.ItemID, int32(slot.Count))
+							break
+						}
+					}
+				}
+			}
+		}
 		st.pots[key] = dp
 	}
 	return dp
+}
+
+// IsAllSherdsDecoratedPot reports whether all 4 sides of sherds are pottery
+// sherds (`*_pottery_sherd`) rather than `minecraft:brick`.
+func IsAllSherdsDecoratedPot(sherds [4]string) bool {
+	for i := 0; i < 4; i++ {
+		if !IsPotterySherd(sherds[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// OnDecoratedPotCrafted records the 4 crafted sherds on the server and grants
+// `"minecraft:adventure/craft_decorated_pot_using_only_sherds"` ("Careful Restoration")
+// when all 4 sides are pottery sherds.
+func (s *Server) OnDecoratedPotCrafted(session *PlayerSession, sherds [4]string) bool {
+	if s != nil {
+		s.SetLastCraftedDecoratedPotSherds(sherds)
+	}
+	if s != nil && session != nil && IsAllSherdsDecoratedPot(sherds) {
+		ensureArchaeologyAdvancementsRegistered()
+		return s.GrantAdvancement(session, "minecraft:adventure/craft_decorated_pot_using_only_sherds")
+	}
+	return false
 }
 
 // SetLastCraftedDecoratedPotSherds records the 4 sherds of the most recently
@@ -555,15 +597,21 @@ func (s *Server) DecoratedPotComparatorSignalAt(dim string, x, y, z int) int {
 		return 0
 	}
 	normDim := normalizeHopperDim(dim)
-	if cache := s.DimensionChunks(normDim); cache != nil {
+	cache := s.DimensionChunks(normDim)
+	isPotBlock := false
+	if cache != nil {
 		st := cache.GetBlock(x, y, z)
 		if st != world.StateAir && !IsDecoratedPotBlock(st) {
 			return 0
 		}
+		isPotBlock = IsDecoratedPotBlock(st)
 	}
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	dp := st.pots[hopperBlockKey{dim: normDim, x: x, y: y, z: z}]
+	if dp == nil && isPotBlock {
+		dp = s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+	}
 	if dp == nil || dp.Item.IsEmpty() || dp.Item.Count <= 0 {
 		st.mu.Unlock()
 		return 0
@@ -619,10 +667,14 @@ func (s *Server) HopperExtractFromDecoratedPot(dim string, x, y, z int) (world.I
 		return world.ItemStack{}, ItemMeta{}, false
 	}
 	normDim := normalizeHopperDim(dim)
-	s.BindNoteBlockAndJukeboxRedstone(normDim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
+	isPotBlock := cache != nil && IsDecoratedPotBlock(cache.GetBlock(x, y, z))
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	dp := st.pots[hopperBlockKey{dim: normDim, x: x, y: y, z: z}]
+	if dp == nil && isPotBlock {
+		dp = s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+	}
 	if dp == nil || dp.Item.IsEmpty() || dp.Item.Count <= 0 {
 		st.mu.Unlock()
 		return world.ItemStack{}, ItemMeta{}, false
@@ -681,16 +733,25 @@ func (s *Server) BreakDecoratedPotAt(
 	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
 	key := hopperBlockKey{dim: normDim, x: x, y: y, z: z}
 
+	blockIsPot := false
+	if cache != nil && IsDecoratedPotBlock(cache.GetBlock(x, y, z)) {
+		blockIsPot = true
+	}
+
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	dp, ok := st.pots[key]
+	if !ok && blockIsPot {
+		dp = s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+		ok = dp != nil
+	}
 	if ok {
 		delete(st.pots, key)
 	}
 	st.mu.Unlock()
 
-	blockIsPot := false
 	if cache != nil {
+		cache.RemoveStructureBlockEntity(x, y, z)
 		curState := cache.GetBlock(x, y, z)
 		if IsDecoratedPotBlock(curState) {
 			blockIsPot = true

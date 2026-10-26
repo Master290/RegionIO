@@ -1284,6 +1284,17 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			consumeOne = true
 		}
 
+	// 11b. Water Potion Bottle (`dirt` / `coarse_dirt` / `rooted_dirt` -> `mud`, returning `glass_bottle`).
+	case itemID == "minecraft:potion" && (potionType == "" || canonicalResourceName(potionType) == PotionWater):
+		if s.ConvertDirtToMudWithWaterBottle(nil, normDim, fx, fy, fz) {
+			emptyBottle := world.NewNamedItemStack("minecraft:glass_bottle", 1)
+			replaceWith = &emptyBottle
+		} else {
+			single := world.NewNamedItemStack("minecraft:potion", 1)
+			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			consumeOne = true
+		}
+
 	// 12. Honeycomb (Waxing Copper Blocks & Signs).
 	case itemID == "minecraft:honeycomb":
 		if s.dispenseHoneycombWax(normDim, cache, fx, fy, fz) {
@@ -1399,6 +1410,9 @@ func (s *Server) resolveImmediateDispenserArrowHit(proj *DispenserProjectile, fx
 	}
 	// Check mobs in the front cell.
 	for _, ent := range s.mobsInBlockBox(proj.Dimension, fx, fy, fz) {
+		if ent.ID == proj.EntityID {
+			continue
+		}
 		proj.Impacted = true
 		curHP := s.MobHealth(ent.ID)
 		if curHP > 0 {
@@ -1420,6 +1434,11 @@ func (s *Server) resolveImmediateDispenserArrowHit(proj *DispenserProjectile, fx
 				}
 			}
 		}
+		return
+	}
+	// Check if the front cell is a decorated pot — arrows shatter it on impact.
+	if shattered, _ := s.HitDecoratedPotWithProjectile(proj.Dimension, fx, fy, fz, proj.EntityID); shattered {
+		proj.Impacted = true
 		return
 	}
 }
@@ -1463,6 +1482,9 @@ func (s *Server) dispenseThrownProjectile(dim string, x, y, z int, facing, itemI
 
 	dx, dy, dz := DispenserFacingVector(facing)
 	fx, fy, fz := x+dx, y+dy, z+dz
+	if shattered, _ := s.HitDecoratedPotWithProjectile(dim, fx, fy, fz, entID); shattered {
+		proj.Impacted = true
+	}
 	switch itemID {
 	case "minecraft:snowball":
 		for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
@@ -1579,7 +1601,11 @@ func (s *Server) dispenseFireCharge(dim string, x, y, z int, facing string, fx, 
 			s.SetMobHealth(mobs[0].ID, maxFloat32(0, curHP-5.0))
 		}
 	} else if cache := s.DimensionChunks(dim); cache != nil {
-		_ = s.dispenseFlintAndSteel(dim, cache, fx, fy, fz)
+		if shattered, _ := s.HitDecoratedPotWithProjectile(dim, fx, fy, fz, entID); shattered {
+			proj.Impacted = true
+		} else {
+			_ = s.dispenseFlintAndSteel(dim, cache, fx, fy, fz)
+		}
 	}
 	s.EmitGameEvent(dim, GameEventProjectileShoot, px, py, pz, VibrationSource{EntityID: entID})
 	return entID
@@ -2820,10 +2846,21 @@ func (s *Server) mobsInBlockBox(dim string, bx, by, bz int) []*world.Entity {
 	var out []*world.Entity
 	for i := range all {
 		e := &all[i]
-		if e.IsItem() || canonicalResourceName(e.TypeName) == EntityTypeArmorStand ||
-			canonicalResourceName(e.TypeName) == EntityTypeItemFrame ||
-			canonicalResourceName(e.TypeName) == EntityTypeGlowItemFrame ||
-			canonicalResourceName(e.TypeName) == EntityTypePainting {
+		typeName := canonicalResourceName(e.TypeName)
+		if e.IsItem() || typeName == EntityTypeArmorStand ||
+			typeName == EntityTypeItemFrame ||
+			typeName == EntityTypeGlowItemFrame ||
+			typeName == EntityTypePainting ||
+			typeName == MobTypeArrow ||
+			typeName == EntityTypeSpectralArrow ||
+			typeName == EntityTypeSmallFireball ||
+			typeName == EntityTypeExperienceBottle ||
+			typeName == "minecraft:snowball" ||
+			typeName == "minecraft:egg" ||
+			typeName == "minecraft:wind_charge" ||
+			typeName == "minecraft:firework_rocket" ||
+			typeName == "minecraft:splash_potion" ||
+			typeName == "minecraft:lingering_potion" {
 			continue
 		}
 		if normalizeDispenserDim(e.EffectiveDimension()) != normDim {
