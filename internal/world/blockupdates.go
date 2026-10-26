@@ -206,11 +206,12 @@ func (c *Cache) ScheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTick
 // fluid mixing), and schedules delayed gravity and fluid ticks.
 func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpdateResult) {
 	var res BlockUpdateResult
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return false, res
 	}
 	oldState := c.GetBlock(x, y, z)
 	targetState := c.resolvePlacementReaction(x, y, z, state)
+	c.ensureLightNeighborhoodLoadedAt(x, z, oldState, targetState)
 	ok, lightChanged := c.SetBlockWithLight(x, y, z, targetState)
 	if !ok {
 		return false, res
@@ -352,13 +353,14 @@ var horizontalOffsets = [4][3]int{
 }
 
 func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateResult) bool {
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return false
 	}
 	oldState := c.GetBlock(x, y, z)
 	if oldState == newState {
 		return false
 	}
+	c.ensureLightNeighborhoodLoadedAt(x, z, oldState, newState)
 	ok, light := c.SetBlockWithLight(x, y, z, newState)
 	if !ok {
 		return false
@@ -399,8 +401,13 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 			return updated
 		}
 	}
-	if (isBlockNamed(state, "minecraft:decorated_pot") || isBlockNamed(state, "minecraft:lightning_rod") || IsCopperWaterloggableBlock(state) || IsChainBlock(state)) && c.GetBlock(x, y, z) == StateWater {
-		if updated, ok := withStateProperty(state, "waterlogged", "true"); ok {
+	existing := c.GetBlock(x, y, z)
+	if CanBlockBeWaterlogged(state) && isStandaloneWaterSourceOrBubble(existing) {
+		if updated, ok := SetWaterlogged(state, true); ok {
+			state = updated
+		}
+	} else if info, ok := stateByID(state); ok && strings.HasSuffix(info.Name, "_slab") && info.Properties["type"] == "double" && info.Properties["waterlogged"] == "true" {
+		if updated, ok := withStateProperty(state, "waterlogged", "false"); ok {
 			state = updated
 		}
 	}
@@ -415,8 +422,8 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	}
 	if IsCandleBlock(state) {
 		cur := state
-		if c.GetBlock(x, y, z) == StateWater {
-			if updated, ok := withStateProperty(cur, "waterlogged", "true"); ok {
+		if isStandaloneWaterSourceOrBubble(existing) {
+			if updated, ok := SetWaterlogged(cur, true); ok {
 				cur = updated
 			}
 		}
@@ -475,16 +482,13 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	}
 	if isBlockNamed(state, "minecraft:campfire") || isBlockNamed(state, "minecraft:soul_campfire") {
 		cur := state
-		if c.GetBlock(x, y, z) == StateWater {
-			if updated, ok := withStateProperty(cur, "waterlogged", "true"); ok {
-				cur = updated
-			}
-			if updated, ok := withStateProperty(cur, "lit", "false"); ok {
+		if isStandaloneWaterSourceOrBubble(existing) {
+			if updated, ok := SetWaterlogged(cur, true); ok {
 				cur = updated
 			}
 		}
 		wantSignal := "false"
-		if y > MinY && isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:hay_block") {
+		if y > c.minY() && isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:hay_block") {
 			wantSignal = "true"
 		}
 		if updated, ok := withStateProperty(cur, "signal_fire", wantSignal); ok {
@@ -508,7 +512,7 @@ func (c *Cache) touchesWater(x, y, z int) bool {
 			continue
 		}
 		ny := y + off[1]
-		if ny < MinY || ny >= MinY+WorldHeight {
+		if ny < c.minY() || ny >= c.maxY() {
 			continue
 		}
 		if hasWaterFluid(c.GetBlock(x+off[0], ny, z+off[2])) {
@@ -527,7 +531,7 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 	if hasWaterFluid(newState) {
 		for _, off := range sixNeighborOffsets {
 			nx, ny, nz := x+off[0], y+off[1], z+off[2]
-			if ny < MinY || ny >= MinY+WorldHeight {
+			if ny < c.minY() || ny >= c.maxY() {
 				continue
 			}
 			nState := c.GetBlock(nx, ny, nz)
@@ -540,9 +544,19 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 			}
 		}
 	}
-	// Check immediate water/lava contact reactions around (x, y, z).
+	// Check immediate water/lava/basalt contact reactions at and around (x, y, z).
 	if isLavaBlock(newState) || hasWaterFluid(newState) {
 		c.checkFluidContactReactions(x, y, z, res)
+	} else if isBlockNamed(newState, "minecraft:blue_ice") || isBlockNamed(newState, "minecraft:soul_soil") {
+		for _, off := range sixNeighborOffsets {
+			nx, ny, nz := x+off[0], y+off[1], z+off[2]
+			if ny < c.minY() || ny >= c.maxY() {
+				continue
+			}
+			if isLavaBlock(c.GetBlock(nx, ny, nz)) {
+				c.checkFluidContactReactions(nx, ny, nz, res)
+			}
+		}
 	}
 
 	// Break double-block partner (doors, tall plants, extended pistons/heads) when one half is removed,
@@ -599,7 +613,7 @@ func (c *Cache) scheduleAround(x, y, z int) {
 	c.scheduleCellIfNeeded(x, y, z)
 	for _, off := range sixNeighborOffsets {
 		nx, ny, nz := x+off[0], y+off[1], z+off[2]
-		if ny < MinY || ny >= MinY+WorldHeight {
+		if ny < c.minY() || ny >= c.maxY() {
 			continue
 		}
 		c.scheduleCellIfNeeded(nx, ny, nz)
@@ -607,11 +621,11 @@ func (c *Cache) scheduleAround(x, y, z int) {
 }
 
 func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return
 	}
 	state := c.GetBlock(x, y, z)
-	if IsFallingBlock(state) && y > MinY && isFreeToFallThrough(c.GetBlock(x, y-1, z)) {
+	if IsFallingBlock(state) && y > c.minY() && isFreeToFallThrough(c.GetBlock(x, y-1, z)) {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, FallingBlockTickDelay)
 	}
 	if c.needsScaffoldingTickAt(x, y, z, state) {
@@ -620,12 +634,13 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 	if lvl, ok := ComposterLevel(state); ok && lvl == ComposterMaxFillLevel {
 		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ComposterReadyTickDelay)
 	}
-	if kind, _, ok := classifyFluidState(state); ok {
-		delay := WaterTickDelay
-		if kind == fluidLava {
-			delay = LavaTickDelay
-		}
-		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, delay)
+	if c.needsBubbleColumnTickAt(x, y, z) {
+		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, BubbleColumnTickDelay)
+	} else if kind, _, ok := classifyFluidState(state); ok {
+		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, c.fluidTickDelayFor(kind))
+	}
+	if (isBlockNamed(state, "minecraft:soul_sand") || isBlockNamed(state, "minecraft:magma_block")) && y+1 < c.maxY() && c.needsBubbleColumnTickAt(x, y+1, z) {
+		c.ScheduleBlockUpdate(x, y+1, z, UpdateFluid, BubbleColumnTickDelay)
 	}
 	if IsFireBlock(state) && c.DoFireTick() {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFire, FireTickDelay)
@@ -1374,8 +1389,11 @@ func isStandaloneFluidBlock(state uint16) (fluidKind, int, bool) {
 // spread, infinite water source formation, and water/lava stone/cobblestone/
 // obsidian interactions.
 func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return
+	}
+	if c.needsBubbleColumnTickAt(x, y, z) {
+		c.UpdateBubbleColumnFrom(x, y, z, res)
 	}
 	state := c.GetBlock(x, y, z)
 	kind, level, ok := classifyFluidState(state)
@@ -1405,26 +1423,26 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 		}
 	}
 
-	// 2. Check contact reactions (water + lava -> obsidian/cobblestone/stone).
+	// 2. Check contact reactions (water + lava -> obsidian/cobblestone/stone, or basalt generator).
 	if c.checkFluidContactReactions(x, y, z, res) {
 		return
 	}
 
 	// 3. Downward spread into (x, y-1, z).
-	if y > MinY {
+	if y > c.minY() {
 		below := c.GetBlock(x, y-1, z)
 		if c.tryFlowDownward(x, y-1, z, kind, below, res) {
 			// In vanilla FlowingFluid.spread, non-source blocks that can flow
-			// straight down do not spread horizontally unless they sit on a
-			// solid/blocking floor.
-			if level > 0 {
+			// straight down only spread horizontally when surrounded by 3+
+			// horizontal source blocks of the same fluid.
+			if level > 0 && c.countHorizontalFluidSources(x, y, z, kind) < 3 {
 				return
 			}
 		}
 	}
 
 	// 4. Horizontal spread into (-X, +X, -Z, +Z).
-	drop := fluidDropOff(kind)
+	drop := c.fluidDropOffFor(kind)
 	effectiveLevel := level
 	if level >= 8 {
 		effectiveLevel = 0
@@ -1435,7 +1453,7 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 	}
 	// A falling fluid block (level >= 8) only spreads horizontally when the cell
 	// below it is not passable to this fluid.
-	if level >= 8 && y > MinY && c.canFluidReplace(x, y-1, z, kind, c.GetBlock(x, y-1, z)) {
+	if level >= 8 && y > c.minY() && c.canFluidReplace(x, y-1, z, kind, c.GetBlock(x, y-1, z)) {
 		return
 	}
 
@@ -1462,6 +1480,9 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 		if !c.canFluidSpreadHorizontallyInto(nx, y, nz, kind, nextLevel, target) {
 			continue
 		}
+		if !isAirState(target) {
+			c.propagateMultiBlockPartnerBreak(nx, y, nz, target, res)
+		}
 		if c.setBlockRecorded(nx, y, nz, nextState, res) {
 			c.runNeighborSupportPass(nx, y, nz, res)
 			c.scheduleAround(nx, y, nz)
@@ -1469,15 +1490,26 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 	}
 }
 
+func (c *Cache) countHorizontalFluidSources(x, y, z int, kind fluidKind) int {
+	sources := 0
+	for _, off := range horizontalOffsets {
+		nKind, nLevel, ok := classifyFluidState(c.GetBlock(x+off[0], y, z+off[2]))
+		if ok && nKind == kind && nLevel == 0 {
+			sources++
+		}
+	}
+	return sources
+}
+
 func (c *Cache) computeFlowingFluidLevel(x, y, z int, kind fluidKind) int {
 	// If the cell above holds the same fluid, this cell is falling fluid (level 8).
-	if y+1 < MinY+WorldHeight {
+	if y+1 < c.maxY() {
 		if upKind, _, ok := classifyFluidState(c.GetBlock(x, y+1, z)); ok && upKind == kind {
 			return 8
 		}
 	}
 
-	drop := fluidDropOff(kind)
+	drop := c.fluidDropOffFor(kind)
 	best := 999
 	sourceNeighbors := 0
 	for _, off := range horizontalOffsets {
@@ -1493,7 +1525,7 @@ func (c *Cache) computeFlowingFluidLevel(x, y, z int, kind fluidKind) int {
 		eff := nLevel
 		if nLevel >= 8 {
 			// A falling neighbor only feeds horizontally if its floor is blocked.
-			if y > MinY && c.canFluidReplace(nx, y-1, nz, kind, c.GetBlock(nx, y-1, nz)) {
+			if y > c.minY() && c.canFluidReplace(nx, y-1, nz, kind, c.GetBlock(nx, y-1, nz)) {
 				continue
 			}
 			eff = 0
@@ -1503,14 +1535,16 @@ func (c *Cache) computeFlowingFluidLevel(x, y, z int, kind fluidKind) int {
 		}
 	}
 
-	// Infinite water source rule: 2+ horizontal water sources over a solid block
-	// or another water source.
-	if kind == fluidWater && sourceNeighbors >= 2 && y > MinY {
+	// Infinite fluid source rule (FlowingFluid.getNewLiquid + waterSourceConversion / lavaSourceConversion):
+	// 2+ horizontal sources of the same fluid over a solid block or another source of the same fluid.
+	canConvertToSource := (kind == fluidWater && c.WaterSourceConversion()) ||
+		(kind == fluidLava && c.LavaSourceConversion())
+	if canConvertToSource && sourceNeighbors >= 2 && y > c.minY() {
 		below := c.GetBlock(x, y-1, z)
 		if isSolidState(below) {
 			return 0
 		}
-		if bKind, bLevel, ok := classifyFluidState(below); ok && bKind == fluidWater && bLevel == 0 {
+		if bKind, bLevel, ok := classifyFluidState(below); ok && bKind == kind && bLevel == 0 {
 			return 0
 		}
 	}
@@ -1537,9 +1571,12 @@ func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *
 		}
 		// Opposite fluid below:
 		if kind == fluidLava && bKind == fluidWater {
-			// Lava flowing down onto water turns the water into stone.
-			if c.setBlockRecorded(x, y, z, StateStone, res) {
-				c.scheduleAround(x, y, z)
+			// Lava flowing down onto standalone water / bubble column turns it into stone.
+			// Waterlogged blocks below lava are NOT overwritten with stone.
+			if isStandaloneWaterOrBubble(below) {
+				if c.setBlockRecorded(x, y, z, StateStone, res) {
+					c.scheduleAround(x, y, z)
+				}
 			}
 			return false
 		}
@@ -1568,6 +1605,9 @@ func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *
 	if !c.canFluidReplace(x, y, z, kind, below) {
 		return false
 	}
+	if !isAirState(below) {
+		c.propagateMultiBlockPartnerBreak(x, y, z, below, res)
+	}
 	falling := fluidStateForLevel(kind, 8)
 	if c.setBlockRecorded(x, y, z, falling, res) {
 		c.runNeighborSupportPass(x, y, z, res)
@@ -1588,6 +1628,13 @@ func (c *Cache) canFluidReplace(x, y, z int, kind fluidKind, target uint16) bool
 	}
 	info, ok := stateByID(target)
 	if !ok {
+		return false
+	}
+	// In vanilla FlowingFluid.canHoldFluid, any LiquidBlockContainer (blocks
+	// with the waterlogged property such as rails, candles, sea pickles, coral
+	// fans, glow lichen, sculk veins, hanging roots, scaffolding) cannot be
+	// washed away by flowing fluids.
+	if info.Properties["waterlogged"] != "" {
 		return false
 	}
 	// Doors, signs, ladders, sugar_cane, bubble_column, portals, and structure blocks block fluid replacement.
@@ -1622,7 +1669,7 @@ func (c *Cache) canFluidSpreadHorizontallyInto(x, y, z int, kind fluidKind, next
 }
 
 func (c *Cache) chooseHorizontalSpreadDirs(x, y, z int, kind fluidKind) [][3]int {
-	maxDist := fluidSlopeDistance(kind)
+	maxDist := c.fluidSlopeDistanceFor(kind)
 	bestDist := 999
 	var dirs [][3]int
 	for _, off := range horizontalOffsets {
@@ -1644,7 +1691,7 @@ func (c *Cache) chooseHorizontalSpreadDirs(x, y, z int, kind fluidKind) [][3]int
 }
 
 func (c *Cache) slopeDistance(x, y, z int, kind fluidKind, depth, maxDepth int, exclude [2]int) int {
-	if y <= MinY {
+	if y <= c.minY() {
 		return 999
 	}
 	below := c.GetBlock(x, y-1, z)
@@ -1700,7 +1747,7 @@ func (c *Cache) checkFluidContactReactions(x, y, z int, res *BlockUpdateResult) 
 				break
 			}
 		}
-		if !touchesWater && y+1 < MinY+WorldHeight && hasWaterFluid(c.GetBlock(x, y+1, z)) {
+		if !touchesWater && y+1 < c.maxY() && hasWaterFluid(c.GetBlock(x, y+1, z)) {
 			touchesWater = true
 		}
 		if touchesWater {
@@ -1709,6 +1756,10 @@ func (c *Cache) checkFluidContactReactions(x, y, z int, res *BlockUpdateResult) 
 				c.scheduleAround(x, y, z)
 				return true
 			}
+		}
+		// Basalt generator: lava over soul_soil touching blue_ice horizontally or from above.
+		if c.checkBasaltGeneratorReaction(x, y, z, res) {
+			return true
 		}
 	} else if kind == fluidWater {
 		// Water touching adjacent lava converts that lava cell.
@@ -1722,7 +1773,7 @@ func (c *Cache) checkFluidContactReactions(x, y, z int, res *BlockUpdateResult) 
 				}
 			}
 		}
-		if y > MinY {
+		if y > c.minY() {
 			below := c.GetBlock(x, y-1, z)
 			if bKind, bLevel, ok := classifyFluidState(below); ok && bKind == fluidLava {
 				solid := c.obsidianOrCobblestone(bLevel)

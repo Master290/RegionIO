@@ -1666,7 +1666,6 @@ func (s *Server) dispenseFilledBucket(dim string, cache *world.Cache, fx, fy, fz
 	}
 	targetState := cache.GetBlock(fx, fy, fz)
 	targetName := world.BlockName(targetState)
-	props := world.BlockProperties(targetState)
 
 	switch itemID {
 	case "minecraft:lava_bucket":
@@ -1705,13 +1704,15 @@ func (s *Server) dispenseFilledBucket(dim string, cache *world.Cache, fx, fy, fz
 				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
 				placedWater = true
 			}
-		} else if _, hasWL := props["waterlogged"]; hasWL && props["waterlogged"] == "false" {
-			if nextSt, ok := world.WithBlockProperty(targetState, "waterlogged", "true"); ok {
+		} else if world.CanBlockBeWaterlogged(targetState) && !world.IsWaterlogged(targetState) {
+			if dim == world.DimensionNether || cache.IsWaterEvaporatingDimension() {
+				placedWater = true
+			} else if nextSt, ok := world.SetWaterlogged(targetState, true); ok {
 				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, nextSt)
 				placedWater = true
 			}
 		} else if isDispenserFluidReplaceable(targetState) {
-			if dim == world.DimensionNether {
+			if dim == world.DimensionNether || cache.IsWaterEvaporatingDimension() {
 				placedWater = true
 			} else {
 				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateWater)
@@ -1787,6 +1788,9 @@ func (s *Server) dispenseEmptyBucketScoop(dim string, cache *world.Cache, fx, fy
 			s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateAir)
 			return world.NewNamedItemStack("minecraft:water_bucket", 1), true
 		}
+	case "minecraft:bubble_column":
+		s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateAir)
+		return world.NewNamedItemStack("minecraft:water_bucket", 1), true
 	case "minecraft:lava":
 		if props["level"] == "" || props["level"] == "0" {
 			s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateAir)

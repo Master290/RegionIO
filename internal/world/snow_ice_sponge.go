@@ -90,40 +90,25 @@ func (c *Cache) StackSnowLayerAt(x, y, z int) (newState uint16, res BlockUpdateR
 }
 
 // BlockLightAt returns the effective block light level (0..15) at (x, y, z),
-// combining stored chunk block light with direct Manhattan-distance emission
-// from nearby light sources within 4 blocks.
+// ensuring 3D chunk lighting is initialized and propagated (respecting solid
+// walls and block opacity). When the queried block itself attenuates light
+// (such as `snow[layers=8]`, `ice`, or `frosted_ice`), it also considers the
+// incident 3D-propagated block light from the 6 adjacent faces (`neighbor - 1`).
 func (c *Cache) BlockLightAt(x, y, z int) int {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return 0
 	}
-	best := 0
-	cx, cz := int32(x>>4), int32(z>>4)
-	key := [2]int32{cx, cz}
-	c.startUse(key)
-	ch, err := c.chunkAtErr(cx, cz)
-	if err == nil && ch != nil {
-		_, blk, ready := ch.LightAt(x&15, y, z&15)
-		if ready && int(blk) > best {
-			best = int(blk)
-		}
-	}
-	c.endUse(key)
-
-	for dy := -4; dy <= 4; dy++ {
-		ny := y + dy
-		if ny < MinY || ny >= MinY+WorldHeight {
-			continue
-		}
-		for dz := -4; dz <= 4; dz++ {
-			for dx := -4; dx <= 4; dx++ {
-				dist := absInt(dx) + absInt(dy) + absInt(dz)
-				if dist > 4 {
-					continue
-				}
-				em := int(lightEmission(c.GetBlock(x+dx, ny, z+dz)))
-				if em-dist > best {
-					best = em - dist
-				}
+	_, blk := c.EnsureLightAt(x, y, z)
+	best := int(blk)
+	if lightOpacity(c.GetBlock(x, y, z)) > 0 {
+		for _, off := range sixNeighborOffsets {
+			ny := y + off[1]
+			if ny < c.minY() || ny >= c.maxY() {
+				continue
+			}
+			_, nBlk := c.EnsureLightAt(x+off[0], ny, z+off[2])
+			if int(nBlk)-1 > best {
+				best = int(nBlk) - 1
 			}
 		}
 	}
