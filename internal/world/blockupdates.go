@@ -496,6 +496,9 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 		}
 		return cur
 	}
+	if IsChorusPlantBlock(state) {
+		return c.ResolveChorusPlantStateAt(x, y, z)
+	}
 	return state
 }
 
@@ -634,7 +637,9 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 	if lvl, ok := ComposterLevel(state); ok && lvl == ComposterMaxFillLevel {
 		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ComposterReadyTickDelay)
 	}
-	if c.needsBubbleColumnTickAt(x, y, z) {
+	if c.needsCoralDeathTickAt(x, y, z, state) {
+		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, c.coralDeathDelay())
+	} else if c.needsBubbleColumnTickAt(x, y, z) {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, BubbleColumnTickDelay)
 	} else if kind, _, ok := classifyFluidState(state); ok {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFluid, c.fluidTickDelayFor(kind))
@@ -913,6 +918,14 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 
 	if name == "minecraft:pale_hanging_moss" {
 		return c.EvaluatePaleHangingMossAt(x, y, z, state)
+	}
+
+	if IsAmethystBudOrClusterBlock(state) {
+		return c.EvaluateAmethystClusterSupportAt(x, y, z, state)
+	}
+
+	if IsChorusPlantBlock(state) || IsChorusFlowerBlock(state) {
+		return c.EvaluateChorusBlockAt(x, y, z, state)
 	}
 
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)
@@ -1396,6 +1409,10 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 		c.UpdateBubbleColumnFrom(x, y, z, res)
 	}
 	state := c.GetBlock(x, y, z)
+	if IsLiveCoralAny(state) && !c.HasWaterForCoralAt(x, y, z, state) {
+		c.stepCoralUpdate(x, y, z, res)
+		return
+	}
 	kind, level, ok := classifyFluidState(state)
 	if !ok {
 		return
@@ -2162,7 +2179,7 @@ func requiresFloorSupport(name string, props map[string]string) bool {
 	if (strings.HasSuffix(name, "_button") || name == "minecraft:lever") && props["face"] == "floor" {
 		return true
 	}
-	if name == "minecraft:cake" || IsCandleBlockName(name) || IsCandleCakeBlockName(name) {
+	if name == "minecraft:cake" || IsCandleBlockName(name) || IsCandleCakeBlockName(name) || IsCoralPlantOrFloorFanName(name) {
 		return true
 	}
 	switch name {

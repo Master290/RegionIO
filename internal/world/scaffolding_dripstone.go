@@ -694,7 +694,7 @@ func (c *Cache) CanGrowPointedDripstoneAt(x, y, z int) bool {
 		return false
 	}
 	above := c.GetBlock(x, rootY+1, z)
-	return above == StateWater || (isBlockNamed(above, "minecraft:water") && stateProperty(above, "level") == "0") || isWaterloggedState(above)
+	return isStandaloneWaterSourceOrBubble(above) || isWaterloggedState(above)
 }
 
 func stateProperty(state uint16, key string) string {
@@ -738,6 +738,16 @@ func (c *Cache) tryGrowStalactiteDown(x, tipY, z int, res *BlockUpdateResult) bo
 		return false
 	}
 	target := c.GetBlock(x, targetY, z)
+	if IsPointedDripstoneBlock(target) && PointedDripstoneDirection(target) == "up" && PointedDripstoneThickness(target) == "tip" {
+		if res != nil {
+			c.RecalculatePointedDripstoneColumnAround(x, tipY, z, res)
+		} else {
+			var local BlockUpdateResult
+			c.RecalculatePointedDripstoneColumnAround(x, tipY, z, &local)
+		}
+		c.scheduleAround(x, tipY, z)
+		return true
+	}
 	if !canDripstoneGrowInto(target) {
 		return false
 	}
@@ -789,6 +799,16 @@ func (c *Cache) tryGrowStalagmiteBelow(x, stalactiteTipY, z int, res *BlockUpdat
 				return false
 			}
 			growY := cy + 1
+			if growY == stalactiteTipY {
+				if res != nil {
+					c.RecalculatePointedDripstoneColumnAround(x, cy, z, res)
+				} else {
+					var local BlockUpdateResult
+					c.RecalculatePointedDripstoneColumnAround(x, cy, z, &local)
+				}
+				c.scheduleAround(x, cy, z)
+				return true
+			}
 			if growY >= MinY+WorldHeight || !canDripstoneGrowInto(c.GetBlock(x, growY, z)) {
 				return false
 			}

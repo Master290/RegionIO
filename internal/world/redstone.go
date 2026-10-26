@@ -2771,7 +2771,9 @@ func isPistonDestroyOnPush(state uint16) bool {
 	}
 	if strings.HasSuffix(name, "_button") || strings.HasSuffix(name, "_pressure_plate") ||
 		strings.HasSuffix(name, "_carpet") || strings.HasSuffix(name, "_bed") ||
-		strings.HasSuffix(name, "_candle") || strings.HasSuffix(name, "_amethyst_bud") {
+		strings.HasSuffix(name, "_candle") || strings.HasSuffix(name, "_amethyst_bud") ||
+		strings.HasSuffix(name, "_coral_fan") || strings.HasSuffix(name, "_coral_wall_fan") ||
+		IsCoralPlantOrFloorFanName(name) {
 		return true
 	}
 	switch name {
@@ -2789,7 +2791,8 @@ func isPistonDestroyOnPush(state uint16) bool {
 		"minecraft:weeping_vines", "minecraft:weeping_vines_plant",
 		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
 		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:kelp", "minecraft:kelp_plant",
-		"minecraft:decorated_pot", "minecraft:amethyst_cluster", "minecraft:lily_pad",
+		"minecraft:decorated_pot", "minecraft:amethyst_cluster", "minecraft:budding_amethyst",
+		"minecraft:lily_pad",
 		"minecraft:frogspawn", "minecraft:turtle_egg", "minecraft:sniffer_egg":
 		return true
 	}
