@@ -259,10 +259,14 @@ func TestLoadSixteenClientStreamersBoundedAndReleasesTickets(t *testing.T) {
 		wg.Wait()
 		t.Fatalf("loaded stats = %+v, want at least %d frames and %d tickets", stats, groups*9, clients*9)
 	}
-	if got := peak.Load(); got > 8 {
+	limit := int32(world.GeneratorWorkers())
+	if limit < 8 {
+		limit = 8
+	}
+	if got := peak.Load(); got > limit {
 		cancel()
 		wg.Wait()
-		t.Fatalf("peak concurrent generators = %d, want <= shared limit 8", got)
+		t.Fatalf("peak concurrent generators = %d, want <= shared limit %d", got, limit)
 	}
 
 	cancel()

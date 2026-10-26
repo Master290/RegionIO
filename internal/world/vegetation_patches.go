@@ -392,7 +392,7 @@ func (r *decorationRegion) placeVegetationFeatureRef(random worldgen.RandomSourc
 	if len(ref.Placement) != 0 {
 		return fmt.Errorf("world: vegetation selector feature %s has non-empty placement", ref.Name)
 	}
-	configured, ok := set.Configured[ref.Name]
+	configured, ok := set.LookupConfigured(ref.Name)
 	if !ok {
 		return fmt.Errorf("world: vegetation selector feature %s missing", ref.Name)
 	}

@@ -297,3 +297,79 @@ func TestH4RegionBatchCanonicalizesRequests(t *testing.T) {
 		}
 	}
 }
+
+func TestParallelBatchGeneratorDeterminism(t *testing.T) {
+	prev := GeneratorWorkers()
+	defer SetGeneratorWorkers(prev)
+
+	SetGeneratorWorkers(1)
+	_, batch1 := NewVanillaRegionGenerators(12345)
+	res1, err := batch1(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	SetGeneratorWorkers(4)
+	_, batch4 := NewVanillaRegionGenerators(12345)
+	res4, err := batch4(0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for key, want := range res1 {
+		got := res4[key]
+		if got == nil {
+			t.Fatalf("4-worker batch omitted %v", key)
+		}
+		for y := MinY; y < MinY+WorldHeight; y++ {
+			for z := 0; z < 16; z++ {
+				for x := 0; x < 16; x++ {
+					if got.GetBlock(x, y, z) != want.GetBlock(x, y, z) {
+						t.Fatalf("parallel batch chunk %v differs at (%d,%d,%d)", key, x, y, z)
+					}
+					if got.GetBiome(x, y, z) != want.GetBiome(x, y, z) {
+						t.Fatalf("parallel batch chunk %v biome differs at (%d,%d,%d)", key, x, y, z)
+					}
+				}
+			}
+		}
+		if got.ParityHeightmaps() != want.ParityHeightmaps() {
+			t.Fatalf("parallel batch chunk %v heightmaps differ", key)
+		}
+	}
+}
+
+func TestPersistGeneratedSavesToStoreOnSaveAll(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	calls := 0
+	gen := func(cx, cz int32) *Chunk {
+		calls++
+		ch := NewChunk(cx, cz, BiomePlains)
+		ch.SetBlock(0, 0, 0, StateStone)
+		return ch
+	}
+	cache := NewCacheWithLimit(-1, gen, store, 32)
+	cache.SetPersistGenerated(true)
+	if frame := cache.Frame(0, 0); len(frame) == 0 {
+		t.Fatal("Frame(0,0) returned empty frame")
+	}
+	if err := cache.SaveAll(); err != nil {
+		t.Fatal(err)
+	}
+
+	callsBefore := calls
+	cache2 := NewCacheWithLimit(-1, gen, store, 32)
+	cache2.SetPersistGenerated(true)
+	if got := cache2.GetBlock(0, 0, 0); got != StateStone {
+		t.Fatalf("reloaded GetBlock(0,0,0) = %d, want %d", got, StateStone)
+	}
+	if calls != callsBefore {
+		t.Fatalf("generator called %d extra times after SaveAll, want 0 (loaded from store)", calls-callsBefore)
+	}
+}

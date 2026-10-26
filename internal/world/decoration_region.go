@@ -56,6 +56,10 @@ type decorationRegion struct {
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
+	return newDecorationRegionWithTopY(chunks, nil)
+}
+
+func newDecorationRegionWithTopY(chunks []*Chunk, topYs map[[2]int32]*worldgenTopY) (*decorationRegion, error) {
 	region := &decorationRegion{
 		chunks:   make(map[[2]int32]*Chunk, len(chunks)),
 		worldgen: make(map[[2]int32]*worldgenTopY, len(chunks)),
@@ -69,7 +73,11 @@ func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
 			return nil, fmt.Errorf("world: duplicate decoration chunk (%d,%d)", chunk.X, chunk.Z)
 		}
 		region.chunks[key] = chunk
-		region.worldgen[key] = freezeWorldgenTopY(chunk)
+		if topY := topYs[key]; topY != nil {
+			region.worldgen[key] = topY
+		} else {
+			region.worldgen[key] = freezeWorldgenTopY(chunk)
+		}
 	}
 	return region, nil
 }
@@ -77,23 +85,51 @@ func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
 func freezeWorldgenTopY(chunk *Chunk) *worldgenTopY {
 	frozen := &worldgenTopY{}
 	minY := chunk.minY()
-	maxY := minY + chunk.worldHeight() - 1
+	startSec, endSec := chunk.sectionBounds()
 	chunk.mu.RLock()
 	defer chunk.mu.RUnlock()
+	topSec := startSec - 1
+	for si := endSec - 1; si >= startSec; si-- {
+		if chunk.sections[si] != nil {
+			topSec = si
+			break
+		}
+	}
+	if topSec < startSec {
+		for i := range frozen.surface {
+			frozen.surface[i] = int32(minY)
+			frozen.floor[i] = int32(minY)
+		}
+		return frozen
+	}
 	for localZ := 0; localZ < 16; localZ++ {
+		zOff := localZ << 4
 		for localX := 0; localX < 16; localX++ {
-			index := localZ*16 + localX
+			index := zOff + localX
 			surface, floor := minY, minY
-			for y := maxY; y >= minY; y-- {
-				state := chunk.getBlock(localX, y, localZ)
-				if state != StateAir && surface == minY {
-					surface = y + 1
+			colOff := zOff | localX
+		secLoop:
+			for si := topSec; si >= startSec; si-- {
+				sec := chunk.sections[si]
+				if sec == nil {
+					continue
 				}
-				if stateFlags(state)&flagBlocksMotion != 0 && floor == minY {
-					floor = y + 1
-				}
-				if surface != minY && floor != minY {
-					break
+				baseY := MinY + (si << 4)
+				for ly := 15; ly >= 0; ly-- {
+					state := sec[(ly<<8)|colOff]
+					if state == StateAir {
+						continue
+					}
+					y := baseY + ly
+					if surface == minY {
+						surface = y + 1
+					}
+					if floor == minY && stateFlags(state)&flagBlocksMotion != 0 {
+						floor = y + 1
+					}
+					if surface != minY && floor != minY {
+						break secLoop
+					}
 				}
 			}
 			frozen.surface[index] = int32(surface)

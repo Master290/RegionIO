@@ -143,13 +143,7 @@ func NewNetherGenerators(seed int64) (Generator, BatchGenerator) {
 		return generateNetherChunk(od, carver, sets, seed, cx, cz)
 	}
 	batch := func(targetX, targetZ int32) (map[[2]int32]*Chunk, error) {
-		out := make(map[[2]int32]*Chunk, 9)
-		for cx := targetX - 1; cx <= targetX+1; cx++ {
-			for cz := targetZ - 1; cz <= targetZ+1; cz++ {
-				out[[2]int32{cx, cz}] = generateNetherChunk(od, carver, sets, seed, cx, cz)
-			}
-		}
-		return out, nil
+		return buildParallel3x3Batch(targetX, targetZ, gen), nil
 	}
 	return gen, batch
 }

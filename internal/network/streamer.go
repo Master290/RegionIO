@@ -3,7 +3,6 @@ package network
 import (
 	"context"
 	"log/slog"
-	"runtime"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -73,10 +72,7 @@ func newStreamer(cache *world.Cache, conn *Conn, log *slog.Logger, viewDistance 
 	if viewDistance > 16 {
 		viewDistance = 16
 	}
-	pool := runtime.NumCPU()
-	if pool > 8 {
-		pool = 8
-	}
+	pool := world.GeneratorWorkers()
 	if pool < 2 {
 		pool = 2
 	}
@@ -425,12 +421,14 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 		close(jobs)
 	}()
 
-	// Sender: drain results serially so writes don't interleave.
+	// Sender: drain results serially so writes don't interleave, emitting
+	// contiguous spiral chunks immediately as each becomes ready.
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 	generated := make(map[[2]int32]frameResult, len(pending))
+	nextIdx := 0
 	failed := false
 	for r := range results {
 		if r.err != nil {
@@ -440,33 +438,35 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 			failed = true
 			continue
 		}
+		if failed {
+			continue
+		}
 		generated[[2]int32{r.cx, r.cz}] = r
-	}
-	if failed {
-		return
-	}
-	// Generation completes out of order, but client presentation should not.
-	// Emit the contiguous spiral order supplied by the caller.
-	for _, j := range pending {
-		if s.hasPendingSwitch() {
-			return
-		}
-		r, ok := generated[[2]int32{j.cx, j.cz}]
-		if !ok {
-			return
-		}
-		if s.conn != nil {
-			if err := s.conn.SendFramed(r.frame); err != nil {
-				if s.log != nil {
-					s.log.Debug("streamer send failed", "cx", r.cx, "cz", r.cz, "err", err)
-				}
-				return
+		for nextIdx < len(pending) {
+			if s.hasPendingSwitch() {
+				failed = true
+				break
 			}
-		}
-		s.loaded[[2]int32{j.cx, j.cz}] = true
-		s.setResident([2]int32{j.cx, j.cz}, true)
-		if s.onChunkSent != nil {
-			s.onChunkSent(j.cx, j.cz)
+			j := pending[nextIdx]
+			ready, ok := generated[[2]int32{j.cx, j.cz}]
+			if !ok {
+				break
+			}
+			if s.conn != nil {
+				if err := s.conn.SendFramed(ready.frame); err != nil {
+					if s.log != nil {
+						s.log.Debug("streamer send failed", "cx", ready.cx, "cz", ready.cz, "err", err)
+					}
+					failed = true
+					break
+				}
+			}
+			s.loaded[[2]int32{j.cx, j.cz}] = true
+			s.setResident([2]int32{j.cx, j.cz}, true)
+			if s.onChunkSent != nil {
+				s.onChunkSent(j.cx, j.cz)
+			}
+			nextIdx++
 		}
 	}
 }

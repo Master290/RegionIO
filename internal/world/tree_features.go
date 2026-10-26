@@ -182,7 +182,7 @@ func (r *decorationRegion) placePlacedRef(set *worldgen.FeatureSet, random world
 // a scheduler arm or from a selector. It is the recursive half of the stage-9 dispatch,
 // and it is where an unmodelled configured type becomes an error instead of a no-op.
 func (r *decorationRegion) placeConfiguredVegetation(set *worldgen.FeatureSet, random worldgen.RandomSource, position worldgen.FeaturePosition, name string, context worldgen.PlacementContext) error {
-	configured, ok := set.Configured[name]
+	configured, ok := set.LookupConfigured(name)
 	if !ok {
 		return nil
 	}

@@ -989,6 +989,7 @@ type jigsawCacheKey struct {
 var (
 	jigsawStartMu    sync.RWMutex
 	jigsawStartCache = map[jigsawCacheKey]*JigsawStart{}
+	jigsawInflight   = map[jigsawCacheKey]chan struct{}{}
 )
 
 func getCachedJigsawStart(seed int64, setID string, sx, sz int32) (*JigsawStart, bool) {
@@ -1021,8 +1022,39 @@ func JigsawSetGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 		return nil, nil
 	}
 	if od != nil {
-		if cached, ok := getCachedJigsawStart(seed, setID, sx, sz); ok {
-			return cached, nil
+		key := jigsawCacheKey{setID: setID, seed: seed, sx: sx, sz: sz}
+		for {
+			jigsawStartMu.RLock()
+			cached, ok := jigsawStartCache[key]
+			wait := jigsawInflight[key]
+			jigsawStartMu.RUnlock()
+			if ok {
+				return cached, nil
+			}
+			if wait != nil {
+				<-wait
+				continue
+			}
+			jigsawStartMu.Lock()
+			if cached, ok := jigsawStartCache[key]; ok {
+				jigsawStartMu.Unlock()
+				return cached, nil
+			}
+			if wait := jigsawInflight[key]; wait != nil {
+				jigsawStartMu.Unlock()
+				<-wait
+				continue
+			}
+			inflight := make(chan struct{})
+			jigsawInflight[key] = inflight
+			jigsawStartMu.Unlock()
+			defer func() {
+				jigsawStartMu.Lock()
+				delete(jigsawInflight, key)
+				close(inflight)
+				jigsawStartMu.Unlock()
+			}()
+			break
 		}
 	}
 	stub, ok := FindStructureSetStart(od, sets, setID, seed, sx, sz)

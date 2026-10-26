@@ -1,6 +1,10 @@
 package world
 
-import "regionio/internal/protocol"
+import (
+	"sync"
+
+	"regionio/internal/protocol"
+)
 
 // Light is stored as vanilla nibble arrays: one 2048-byte array per 16^3
 // section. The two protocol-only sections below and above the world are added
@@ -12,9 +16,76 @@ type lightVolume struct {
 	width      int
 	depth      int
 	noSky      bool
+	maxBlockY  int
 	blocks     []uint16
 	sky        []byte
 	block      []byte
+	queue      []int
+}
+
+var lightVolume3x3Pool = sync.Pool{
+	New: func() any {
+		const count = 48 * WorldHeight * 48
+		return &lightVolume{
+			width:  48,
+			depth:  48,
+			blocks: make([]uint16, count),
+			sky:    make([]byte, count),
+			block:  make([]byte, count),
+			queue:  make([]int, 0, 16384),
+		}
+	},
+}
+
+func acquireLightVolume3x3(minCX, minCZ int) *lightVolume {
+	v := lightVolume3x3Pool.Get().(*lightVolume)
+	v.minX = minCX * 16
+	v.minZ = minCZ * 16
+	v.width = 48
+	v.depth = 48
+	v.noSky = false
+	v.maxBlockY = MinY - 1
+	clear(v.blocks)
+	clear(v.sky)
+	clear(v.block)
+	return v
+}
+
+func (v *lightVolume) loadChunkBlocks(chunk *Chunk) {
+	if chunk.noSkylight {
+		v.noSky = true
+	}
+	baseX := int(chunk.X)*16 - v.minX
+	baseZ := int(chunk.Z)*16 - v.minZ
+	strideY := v.depth * v.width
+	strideZ := v.width
+	for si := 0; si < SectionCount; si++ {
+		sec := chunk.sections[si]
+		if sec == nil {
+			continue
+		}
+		if topY := MinY + (si << 4) + 15; topY > v.maxBlockY {
+			v.maxBlockY = topY
+		}
+		yBase := si << 4
+		for ly := 0; ly < 16; ly++ {
+			yOff := (yBase + ly) * strideY
+			secYOff := ly << 8
+			for z := 0; z < 16; z++ {
+				dstIdx := yOff + (baseZ+z)*strideZ + baseX
+				srcIdx := secYOff | (z << 4)
+				copy(v.blocks[dstIdx:dstIdx+16], sec[srcIdx:srcIdx+16])
+			}
+		}
+	}
+}
+
+func releaseLightVolume3x3(v *lightVolume) {
+	if v == nil || v.width != 48 || v.depth != 48 {
+		return
+	}
+	v.queue = v.queue[:0]
+	lightVolume3x3Pool.Put(v)
 }
 
 type lightNode struct {
@@ -32,10 +103,11 @@ var lightDirections = [...]lightNode{
 
 func newLightVolume(minCX, minCZ, chunksWide, chunksDeep int, chunks map[[2]int32]*Chunk) *lightVolume {
 	v := &lightVolume{
-		minX:  minCX * 16,
-		minZ:  minCZ * 16,
-		width: chunksWide * 16,
-		depth: chunksDeep * 16,
+		minX:      minCX * 16,
+		minZ:      minCZ * 16,
+		width:     chunksWide * 16,
+		depth:     chunksDeep * 16,
+		maxBlockY: MinY + WorldHeight - 1,
 	}
 	count := v.width * WorldHeight * v.depth
 	v.blocks = make([]uint16, count)
@@ -84,37 +156,111 @@ func (v *lightVolume) calculateSky() {
 	if v.noSky {
 		return
 	}
-	queue := make([]int, 0, len(v.sky)/2)
+	topWorldY := MinY + WorldHeight - 1
+	scanStartY := topWorldY
+	if v.maxBlockY >= MinY-1 && v.maxBlockY+1 < scanStartY {
+		scanStartY = v.maxBlockY + 1
+	}
+	// Above scanStartY every block in the volume is StateAir with sky light 15.
+	if scanStartY < topWorldY {
+		firstLayerStart := (scanStartY + 1 - MinY) * v.depth * v.width
+		topSlice := v.sky[firstLayerStart:]
+		for i := range topSlice {
+			topSlice[i] = 15
+		}
+	}
+
+	var stopYBuf [48 * 48]int
+	var stopY []int
+	if v.width*v.depth <= len(stopYBuf) {
+		stopY = stopYBuf[:v.width*v.depth]
+	} else {
+		stopY = make([]int, v.width*v.depth)
+	}
+
+	strideY := v.depth * v.width
 	for z := 0; z < v.depth; z++ {
+		zOff := z * v.width
 		for x := 0; x < v.width; x++ {
 			from := StateAir
-			for y := MinY + WorldHeight - 1; y >= MinY; y-- {
-				idx := v.indexLocal(x, y, z)
+			colStop := MinY
+			colOff := zOff + x
+			for y := scanStartY; y >= MinY; y-- {
+				idx := (y-MinY)*strideY + colOff
 				state := v.blocks[idx]
-				if lightOpacity(state) != 0 || lightShapeOccludes(from, state, 0) {
+				if state != StateAir && (lightOpacity(state) != 0 || lightShapeOccludes(from, state, 0)) {
+					colStop = y + 1
 					break
 				}
 				v.sky[idx] = 15
-				queue = append(queue, idx)
 				from = state
+			}
+			stopY[colOff] = colStop
+		}
+	}
+
+	queue := v.queue[:0]
+	for z := 0; z < v.depth; z++ {
+		zOff := z * v.width
+		for x := 0; x < v.width; x++ {
+			colOff := zOff + x
+			sY := stopY[colOff]
+			if sY > topWorldY {
+				continue
+			}
+			topSeedY := sY
+			if x > 0 {
+				if ny := stopY[colOff-1] - 1; ny > topSeedY {
+					topSeedY = ny
+				}
+			}
+			if x+1 < v.width {
+				if ny := stopY[colOff+1] - 1; ny > topSeedY {
+					topSeedY = ny
+				}
+			}
+			if z > 0 {
+				if ny := stopY[colOff-v.width] - 1; ny > topSeedY {
+					topSeedY = ny
+				}
+			}
+			if z+1 < v.depth {
+				if ny := stopY[colOff+v.width] - 1; ny > topSeedY {
+					topSeedY = ny
+				}
+			}
+			if topSeedY > topWorldY {
+				topSeedY = topWorldY
+			}
+			for y := topSeedY; y >= sY; y-- {
+				queue = append(queue, (y-MinY)*strideY+colOff)
 			}
 		}
 	}
-	v.propagateIncreases(v.sky, queue)
+	v.queue = v.propagateIncreases(v.sky, queue)
 }
 
 func (v *lightVolume) calculateBlock() {
-	queue := make([]int, 0, 256)
-	for idx, state := range v.blocks {
-		if emission := lightEmission(state); emission > 0 {
-			v.block[idx] = emission
-			queue = append(queue, idx)
+	queue := v.queue[:0]
+	limit := len(v.blocks)
+	if v.maxBlockY < MinY {
+		return
+	}
+	if v.maxBlockY < MinY+WorldHeight-1 {
+		limit = (v.maxBlockY - MinY + 1) * v.depth * v.width
+	}
+	for idx, state := range v.blocks[:limit] {
+		if state != StateAir {
+			if emission := lightEmission(state); emission > 0 {
+				v.block[idx] = emission
+				queue = append(queue, idx)
+			}
 		}
 	}
-	v.propagateIncreases(v.block, queue)
+	v.queue = v.propagateIncreases(v.block, queue)
 }
 
-func (v *lightVolume) propagateIncreases(levels []byte, queue []int) {
+func (v *lightVolume) propagateIncreases(levels []byte, queue []int) []int {
 	for head := 0; head < len(queue); head++ {
 		idx := queue[head]
 		level := levels[idx]
@@ -144,6 +290,7 @@ func (v *lightVolume) propagateIncreases(levels []byte, queue []int) {
 			}
 		}
 	}
+	return queue
 }
 
 func (v *lightVolume) coordinates(idx int) (x, y, z int) {
@@ -330,14 +477,42 @@ func (c *Chunk) installLight(v *lightVolume) bool {
 	var block [SectionCount]*[2048]byte
 	baseX := int(c.X)*16 - v.minX
 	baseZ := int(c.Z)*16 - v.minZ
-	for y := MinY; y < MinY+WorldHeight; y++ {
-		for z := 0; z < 16; z++ {
-			for x := 0; x < 16; x++ {
-				idx := v.indexLocal(baseX+x, y, baseZ+z)
-				installNibble(&sky, x, y, z, v.sky[idx])
-				installNibble(&block, x, y, z, v.block[idx])
+	strideY := v.depth * v.width
+	strideZ := v.width
+	for si := 0; si < SectionCount; si++ {
+		var skySec *[2048]byte
+		var blockSec *[2048]byte
+		yBase := si << 4
+		for ly := 0; ly < 16; ly++ {
+			yOff := (yBase + ly) * strideY
+			secYOff := ly << 7
+			for z := 0; z < 16; z++ {
+				rowIdx := yOff + (baseZ+z)*strideZ + baseX
+				byteIdx := secYOff | (z << 3)
+				if !v.noSky {
+					for x := 0; x < 16; x += 2 {
+						b := (v.sky[rowIdx+x] & 0x0f) | (v.sky[rowIdx+x+1] << 4)
+						if b != 0 {
+							if skySec == nil {
+								skySec = new([2048]byte)
+							}
+							skySec[byteIdx+(x>>1)] = b
+						}
+					}
+				}
+				for x := 0; x < 16; x += 2 {
+					b := (v.block[rowIdx+x] & 0x0f) | (v.block[rowIdx+x+1] << 4)
+					if b != 0 {
+						if blockSec == nil {
+							blockSec = new([2048]byte)
+						}
+						blockSec[byteIdx+(x>>1)] = b
+					}
+				}
 			}
 		}
+		sky[si] = skySec
+		block[si] = blockSec
 	}
 	if !lightLayersEqual(c.skyLight, sky) || !lightLayersEqual(c.blockLight, block) {
 		changed = true

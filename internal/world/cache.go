@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"sync"
 	"time"
 
@@ -46,23 +45,35 @@ type Cache struct {
 	maxChunks int    // LRU capacity; 0 = unbounded
 	dimType   *DimensionType
 
-	mu       sync.Mutex
-	lightMu  sync.RWMutex
-	chunks   map[[2]int32]*Chunk
-	frames   map[[2]int32][]byte
-	dirty    map[[2]int32]uint64
-	tickets  map[[2]int32]int
-	inflight map[[2]int32]int
+	mu               sync.Mutex
+	lightMu          sync.RWMutex
+	chunks           map[[2]int32]*Chunk
+	frames           map[[2]int32][]byte
+	dirty            map[[2]int32]uint64
+	persistGenerated bool
+	unsavedGen       map[[2]int32]bool
+	tickets          map[[2]int32]int
+	inflight         map[[2]int32]int
 	// frameSlots bounds expensive load/light/encode work across all players.
 	// Streamers may have their own workers, but they share this admission gate.
 	frameSlots chan struct{}
 	// LRU bookkeeping: order is MRU(front)→LRU(back); index gives O(1) lookup.
-	order       *list.List // elements are *[2]int32; nil when maxChunks==0
-	index       map[[2]int32]*list.Element
-	loads       map[[2]int32]*chunkLoad
-	batchLoads  map[[2]int32]*batchLoad
-	frameLoads  map[[2]int32]*frameLoad
-	batchAnchor func(int32, int32) [2]int32
+	order         *list.List // elements are *[2]int32; nil when maxChunks==0
+	index         map[[2]int32]*list.Element
+	loads         map[[2]int32]*chunkLoad
+	batchLoads    map[[2]int32]*batchLoad
+	frameLoads    map[[2]int32]*frameLoad
+	batchAnchor   func(int32, int32) [2]int32
+	filteredBatch filteredBatchGenerator
+}
+
+// SetPersistGenerated enables persisting newly generated chunks to disk on
+// autosave and SaveAll so subsequent server restarts load them from the region
+// store instead of regenerating.
+func (c *Cache) SetPersistGenerated(enabled bool) {
+	c.mu.Lock()
+	c.persistGenerated = enabled
+	c.mu.Unlock()
 }
 
 // SetDimensionType configures the dimension type for this world cache.
@@ -112,6 +123,7 @@ func (c *Cache) SetBatchGenerator(gen BatchGenerator) {
 	c.mu.Lock()
 	c.batchGen = gen
 	c.batchAnchor = nil
+	c.filteredBatch = lookupFilteredBatchGenerator(gen)
 	c.mu.Unlock()
 }
 
@@ -119,6 +131,7 @@ func (c *Cache) SetCanonicalBatchGenerator(gen BatchGenerator, anchor func(int32
 	c.mu.Lock()
 	c.batchGen = gen
 	c.batchAnchor = anchor
+	c.filteredBatch = nil
 	c.mu.Unlock()
 }
 
@@ -155,10 +168,7 @@ type frameLoad struct {
 // threshold using gen to produce missing chunks. It has no persistence and no
 // eviction limit (unbounded; for tests/flat worlds).
 func NewCache(threshold int32, gen Generator) *Cache {
-	workers := runtime.GOMAXPROCS(0)
-	if workers > 8 {
-		workers = 8
-	}
+	workers := GeneratorWorkers()
 	if workers < 2 {
 		workers = 2
 	}
@@ -168,6 +178,7 @@ func NewCache(threshold int32, gen Generator) *Cache {
 		chunks:     make(map[[2]int32]*Chunk),
 		frames:     make(map[[2]int32][]byte),
 		dirty:      make(map[[2]int32]uint64),
+		unsavedGen: make(map[[2]int32]bool),
 		tickets:    make(map[[2]int32]int),
 		inflight:   make(map[[2]int32]int),
 		loads:      make(map[[2]int32]*chunkLoad),
@@ -244,6 +255,7 @@ func (c *Cache) evictIfNeeded() {
 		}
 		delete(c.chunks, key)
 		delete(c.frames, key)
+		delete(c.unsavedGen, key)
 		c.order.Remove(back)
 		delete(c.index, key)
 	}
@@ -313,9 +325,11 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	var ch *Chunk
 	var loadErr error
 	var generatedBatch map[[2]int32]*Chunk
+	fromStore := false
 	if c.store != nil {
 		if loaded, err := c.store.LoadChunk(cx, cz); err == nil {
 			ch = loaded
+			fromStore = true
 		} else if !errors.Is(err, ErrChunkNotFound) {
 			loadErr = fmt.Errorf("world: load chunk (%d,%d): %w", cx, cz, err)
 		}
@@ -323,9 +337,23 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	if ch == nil && loadErr == nil {
 		c.mu.Lock()
 		batchGen := c.batchGen
+		filteredBatch := c.filteredBatch
 		c.mu.Unlock()
 		if batchGen != nil {
-			batch, err := batchGen(cx, cz)
+			var batch map[[2]int32]*Chunk
+			var err error
+			if filteredBatch != nil {
+				batch, err = filteredBatch(cx, cz, func(nx, nz int32) bool {
+					nKey := [2]int32{nx, nz}
+					c.mu.Lock()
+					_, exists := c.chunks[nKey]
+					inTickets := len(c.tickets) == 0 || c.tickets[nKey] > 0
+					c.mu.Unlock()
+					return !exists && inTickets
+				})
+			} else {
+				batch, err = batchGen(cx, cz)
+			}
 			if err != nil {
 				loadErr = err
 			} else {
@@ -370,6 +398,9 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 			}
 			if _, exists := c.chunks[batchKey]; !exists {
 				c.chunks[batchKey] = batchChunk
+				if c.persistGenerated && c.store != nil {
+					c.unsavedGen[batchKey] = true
+				}
 				c.touch(batchKey)
 			}
 			if neighborLoad := c.loads[batchKey]; neighborLoad != nil {
@@ -379,6 +410,9 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 			}
 		}
 		c.chunks[key] = ch
+		if !fromStore && c.persistGenerated && c.store != nil {
+			c.unsavedGen[key] = true
+		}
 		c.touch(key)
 		c.evictIfNeeded()
 	}
@@ -491,6 +525,9 @@ func (c *Cache) chunkAtCanonicalErr(cx, cz int32) (*Chunk, error) {
 					continue
 				}
 				c.chunks[batchKey] = chunk
+				if c.persistGenerated && c.store != nil {
+					c.unsavedGen[batchKey] = true
+				}
 				c.touch(batchKey)
 			}
 			pending.chunks = batch
@@ -670,16 +707,31 @@ func (c *Cache) PreloadBatchContext(ctx context.Context, centerX, centerZ int32,
 		if allowTileAnchors {
 			anchors := make([][2]int32, 0, (len(missing)+8)/9)
 			anchorSeen := make(map[[2]int32]bool, (len(missing)+8)/9)
+			c.mu.Lock()
+			hasTickets := len(c.tickets) > 0
 			for _, k := range missing {
 				anchor := [2]int32{
 					centerX + 3*int32(floorDivCoordinate(int64(k[0]-centerX)+1, 3)),
 					centerZ + 3*int32(floorDivCoordinate(int64(k[1]-centerZ)+1, 3)),
+				}
+				if hasTickets && c.tickets[anchor] == 0 {
+					if anchor[0] > centerX && c.tickets[[2]int32{anchor[0] - 1, centerZ}] > 0 {
+						anchor[0]--
+					} else if anchor[0] < centerX && c.tickets[[2]int32{anchor[0] + 1, centerZ}] > 0 {
+						anchor[0]++
+					}
+					if anchor[1] > centerZ && c.tickets[[2]int32{centerX, anchor[1] - 1}] > 0 {
+						anchor[1]--
+					} else if anchor[1] < centerZ && c.tickets[[2]int32{centerX, anchor[1] + 1}] > 0 {
+						anchor[1]++
+					}
 				}
 				if !anchorSeen[anchor] {
 					anchorSeen[anchor] = true
 					anchors = append(anchors, anchor)
 				}
 			}
+			c.mu.Unlock()
 			if err := c.runParallelPreload(ctx, anchors); err != nil {
 				return err
 			}
@@ -1142,12 +1194,20 @@ func (c *Cache) StartAutosave(ctx context.Context, log *slog.Logger, interval ti
 	return done
 }
 
-// flushDirty saves every chunk currently marked dirty and clears the set.
+// flushDirty saves every chunk currently marked dirty or newly generated and clears the sets.
 func (c *Cache) flushDirty() error {
 	c.mu.Lock()
-	keys := make([][2]int32, 0, len(c.dirty))
+	keys := make([][2]int32, 0, len(c.dirty)+len(c.unsavedGen))
+	seen := make(map[[2]int32]bool, len(c.dirty)+len(c.unsavedGen))
 	for k := range c.dirty {
+		seen[k] = true
 		keys = append(keys, k)
+	}
+	for k := range c.unsavedGen {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
 	}
 	chunks := make(map[[2]int32]*Chunk, len(keys))
 	for _, k := range keys {
@@ -1161,6 +1221,7 @@ func (c *Cache) flushDirty() error {
 		if ch == nil {
 			c.mu.Lock()
 			delete(c.dirty, k)
+			delete(c.unsavedGen, k)
 			c.mu.Unlock()
 			continue
 		}
@@ -1172,6 +1233,7 @@ func (c *Cache) flushDirty() error {
 			continue
 		}
 		c.mu.Lock()
+		delete(c.unsavedGen, k)
 		if dirtyRevision, ok := c.dirty[k]; ok && dirtyRevision <= savedRevision {
 			delete(c.dirty, k)
 		}

@@ -17,52 +17,124 @@ func (c *Cache) ensureLight(chunk *Chunk) error {
 
 func (c *Cache) ensureLightLocked(chunk *Chunk) error {
 	for {
-		center, revision := chunk.snapshot()
-		if center.lightReady && center.lightValidated {
+		chunk.mu.RLock()
+		wasLightReady := chunk.lightReady
+		validated := chunk.lightValidated
+		revision := chunk.revision.Load()
+		chunk.mu.RUnlock()
+		if wasLightReady && validated {
 			return nil
 		}
 
-		chunks := make(map[[2]int32]*Chunk, 9)
-		for dz := int32(-1); dz <= 1; dz++ {
+		volume := acquireLightVolume3x3(int(chunk.X-1), int(chunk.Z-1))
+		chunk.mu.RLock()
+		if chunk.revision.Load() != revision {
+			chunk.mu.RUnlock()
+			releaseLightVolume3x3(volume)
+			continue
+		}
+		volume.loadChunkBlocks(chunk)
+		chunk.mu.RUnlock()
+
+		var loadErr error
+		for dz := int32(-1); dz <= 1 && loadErr == nil; dz++ {
 			for dx := int32(-1); dx <= 1; dx++ {
-				key := [2]int32{chunk.X + dx, chunk.Z + dz}
 				if dx == 0 && dz == 0 {
-					chunks[key] = center
 					continue
 				}
-				snapshot, err := c.lightInputSnapshot(key[0], key[1])
-				if err != nil {
-					return err
+				if err := c.copyLightInputBlocks(chunk.X+dx, chunk.Z+dz, volume); err != nil {
+					loadErr = err
+					break
 				}
-				chunks[key] = snapshot
 			}
 		}
+		if loadErr != nil {
+			releaseLightVolume3x3(volume)
+			return loadErr
+		}
 
-		volume := newLightVolume(int(chunk.X-1), int(chunk.Z-1), 3, 3, chunks)
-		clear(volume.sky)
-		clear(volume.block)
 		volume.calculate()
 
 		chunk.mu.Lock()
 		if chunk.revision.Load() != revision {
 			chunk.mu.Unlock()
+			releaseLightVolume3x3(volume)
 			continue
 		}
 		changed := chunk.installLight(volume)
-		if center.lightReady && changed {
+		if wasLightReady && changed {
 			revision = chunk.revision.Add(1)
 		}
 		chunk.mu.Unlock()
+		releaseLightVolume3x3(volume)
 
 		c.mu.Lock()
 		key := [2]int32{chunk.X, chunk.Z}
 		delete(c.frames, key)
-		if c.store != nil && center.lightReady && changed {
+		if c.store != nil && wasLightReady && changed {
 			c.dirty[key] = revision
 		}
 		c.mu.Unlock()
 		return nil
 	}
+}
+
+func (c *Cache) copyLightInputBlocks(cx, cz int32, volume *lightVolume) error {
+	key := [2]int32{cx, cz}
+	if c.maxChunks > 0 && c.maxChunks < 9 {
+		c.mu.Lock()
+		if chunk := c.chunks[key]; chunk != nil {
+			c.touch(key)
+			c.mu.Unlock()
+			chunk.mu.RLock()
+			volume.loadChunkBlocks(chunk)
+			chunk.mu.RUnlock()
+			return nil
+		}
+		if pending := c.loads[key]; pending != nil {
+			c.mu.Unlock()
+			<-pending.done
+			if pending.err != nil {
+				return pending.err
+			}
+			pending.ch.mu.RLock()
+			volume.loadChunkBlocks(pending.ch)
+			pending.ch.mu.RUnlock()
+			return nil
+		}
+		c.mu.Unlock()
+		if c.store != nil {
+			loaded, err := c.store.LoadChunk(cx, cz)
+			if err == nil {
+				loaded.mu.RLock()
+				volume.loadChunkBlocks(loaded)
+				loaded.mu.RUnlock()
+				return nil
+			}
+			if !errors.Is(err, ErrChunkNotFound) {
+				return fmt.Errorf("world: load light neighbor (%d,%d): %w", cx, cz, err)
+			}
+		}
+		generated := c.gen(cx, cz)
+		if generated == nil {
+			return fmt.Errorf("world: generator returned nil light neighbor (%d,%d)", cx, cz)
+		}
+		generated.mu.RLock()
+		volume.loadChunkBlocks(generated)
+		generated.mu.RUnlock()
+		return nil
+	}
+
+	release := c.beginUse(key)
+	defer release()
+	chunk, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return fmt.Errorf("world: load light neighbor (%d,%d): %w", cx, cz, err)
+	}
+	chunk.mu.RLock()
+	volume.loadChunkBlocks(chunk)
+	chunk.mu.RUnlock()
+	return nil
 }
 
 // lightInputSnapshot returns a stable neighbor snapshot. Cache misses are kept

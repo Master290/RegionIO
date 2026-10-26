@@ -100,13 +100,14 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 	}
 
 	var gen world.Generator
+	var batchGen world.BatchGenerator
 	var dt world.DimensionType
 	switch norm {
 	case world.DimensionNether:
-		gen = world.NewNetherGenerator(s.cfg.WorldSeed)
+		gen, batchGen = world.NewNetherGenerators(s.cfg.WorldSeed)
 		dt = world.NetherDimensionType
 	case world.DimensionEnd:
-		gen = world.NewEndGenerator(s.cfg.WorldSeed)
+		gen, batchGen = world.NewEndGenerators(s.cfg.WorldSeed)
 		dt = world.EndDimensionType
 	default:
 		if s.chunks != nil {
@@ -115,7 +116,7 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 			ds.mu.Unlock()
 			return s.chunks
 		}
-		gen = world.NewVanillaGenerator(s.cfg.WorldSeed)
+		gen, batchGen = world.NewVanillaRegionGenerators(s.cfg.WorldSeed)
 		dt = world.OverworldDimensionType
 	}
 
@@ -126,6 +127,12 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 		}
 	}
 	cache := world.NewCacheWithLimit(int32(s.cfg.CompressionThreshold), gen, dimStore, s.cfg.MaxCachedChunks)
+	if batchGen != nil {
+		cache.SetBatchGenerator(batchGen)
+	}
+	if dimStore != nil {
+		cache.SetPersistGenerated(true)
+	}
 	cache.SetDimensionType(dt)
 	cache.SetPressurePlateEntityCounter(func(x, y, z int) int {
 		return s.CountEntitiesAtBlock(norm, x, y, z)

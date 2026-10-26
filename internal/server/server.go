@@ -63,6 +63,9 @@ type Config struct {
 	Difficulty string
 	// Hardcore enables hardcore mode (forces Hard difficulty and spectator mode on death).
 	Hardcore bool
+	// GenWorkers configures the parallel chunk generation worker pool size
+	// (0 = default max(1, runtime.NumCPU()-1)).
+	GenWorkers int
 }
 
 // DefaultConfig returns sensible defaults matching vanilla expectations.
@@ -196,6 +199,9 @@ func New(cfg Config) (*Server, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
+	if cfg.GenWorkers > 0 {
+		world.SetGeneratorWorkers(cfg.GenWorkers)
+	}
 	gen, batchGen := world.NewVanillaRegionGenerators(cfg.WorldSeed)
 	em := world.NewEntityManager()
 	if cfg.WorldDir == "" {
@@ -209,6 +215,7 @@ func New(cfg Config) (*Server, error) {
 	}
 	chunks := world.NewCacheWithLimit(int32(cfg.CompressionThreshold), gen, store, cfg.MaxCachedChunks)
 	chunks.SetBatchGenerator(batchGen)
+	chunks.SetPersistGenerated(true)
 	return newServerState(cfg, chunks, store, em), nil
 }
 

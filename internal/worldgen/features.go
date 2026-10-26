@@ -28,12 +28,26 @@ type FeatureSet struct {
 	Biomes     map[string]BiomeGeneration
 	BlockTags  map[string][]string
 
-	inlineMu       sync.Mutex
-	cacheMu        sync.RWMutex
-	lastStepsOrder []string
-	lastSteps      [][]string
-	stepsCache     map[string][][]string
-	cfgCache       map[[2]string]any
+	inlineMu         sync.RWMutex
+	inlineConfigured map[string]ConfiguredFeature
+	cacheMu          sync.RWMutex
+	lastStepsOrder   []string
+	lastSteps        [][]string
+	stepsCache       map[string][][]string
+	cfgCache         map[[2]string]any
+}
+
+// LookupConfigured looks up a configured feature by name, checking both the
+// immutable datapack Configured table and any inline configured features
+// registered by parseFeatureRef.
+func (s *FeatureSet) LookupConfigured(name string) (ConfiguredFeature, bool) {
+	if cf, ok := s.Configured[name]; ok {
+		return cf, true
+	}
+	s.inlineMu.RLock()
+	cf, ok := s.inlineConfigured[name]
+	s.inlineMu.RUnlock()
+	return cf, ok
 }
 
 const (
@@ -1365,7 +1379,7 @@ func (s *FeatureSet) Ore(name string) (OreFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("ore", name); ok {
 		return v.(OreFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:ore" {
 		return OreFeatureConfig{}, fmt.Errorf("worldgen: %s is not an ore feature", name)
 	}
@@ -1384,7 +1398,7 @@ func (s *FeatureSet) Disk(name string) (DiskFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("disk", name); ok {
 		return v.(DiskFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:disk" {
 		return DiskFeatureConfig{}, fmt.Errorf("worldgen: %s is not a disk feature", name)
 	}
@@ -1455,7 +1469,7 @@ func (s *FeatureSet) Geode(name string) (GeodeFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("geode", name); ok {
 		return v.(GeodeFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:geode" {
 		return GeodeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a geode feature", name)
 	}
@@ -1555,7 +1569,7 @@ func (s *FeatureSet) VegetationPatch(name string) (VegetationPatchFeatureConfig,
 	if v, ok := s.getCachedConfig("vegetation_patch", name); ok {
 		return v.(VegetationPatchFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:vegetation_patch" && configured.Type != "minecraft:waterlogged_vegetation_patch" {
 		return VegetationPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a vegetation patch", name)
 	}
@@ -1618,7 +1632,7 @@ func (s *FeatureSet) BlockBlob(name string) (BlockBlobFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("block_blob", name); ok {
 		return v.(BlockBlobFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:block_blob" {
 		return BlockBlobFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block blob feature", name)
 	}
@@ -1640,7 +1654,7 @@ func (s *FeatureSet) SimpleBlock(name string) (SimpleBlockFeatureConfig, error) 
 	if v, ok := s.getCachedConfig("simple_block", name); ok {
 		return v.(SimpleBlockFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:simple_block" {
 		return SimpleBlockFeatureConfig{}, fmt.Errorf("worldgen: %s is not a simple block feature", name)
 	}
@@ -1680,7 +1694,7 @@ func (s *FeatureSet) UnderwaterMagma(name string) (UnderwaterMagmaFeatureConfig,
 	if v, ok := s.getCachedConfig("underwater_magma", name); ok {
 		return v.(UnderwaterMagmaFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:underwater_magma" {
 		return UnderwaterMagmaFeatureConfig{}, fmt.Errorf("worldgen: %s is not underwater magma", name)
 	}
@@ -1700,7 +1714,7 @@ func (s *FeatureSet) Probability(name string) (ProbabilityFeatureConfig, error) 
 	if v, ok := s.getCachedConfig("probability", name); ok {
 		return v.(ProbabilityFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || (configured.Type != "minecraft:seagrass" && configured.Type != "minecraft:bamboo") {
 		return ProbabilityFeatureConfig{}, fmt.Errorf("worldgen: %s is not a probability feature", name)
 	}
@@ -1723,7 +1737,7 @@ func (s *FeatureSet) BlockStateConfig(name string) (BlockStateFeatureConfig, err
 	if v, ok := s.getCachedConfig("block_state", name); ok {
 		return v.(BlockStateFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:iceberg" {
 		return BlockStateFeatureConfig{}, fmt.Errorf("worldgen: %s is not an iceberg feature", name)
 	}
@@ -1750,7 +1764,7 @@ func (s *FeatureSet) Fossil(name string) (FossilFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("fossil", name); ok {
 		return v.(FossilFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:fossil" {
 		return FossilFeatureConfig{}, fmt.Errorf("worldgen: %s is not a fossil feature", name)
 	}
@@ -1775,7 +1789,7 @@ func (s *FeatureSet) Spike(name string) (SpikeFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("spike", name); ok {
 		return v.(SpikeFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:spike" {
 		return SpikeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a spike feature", name)
 	}
@@ -1810,7 +1824,7 @@ func (s *FeatureSet) RootSystem(name string) (RootSystemFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("root_system", name); ok {
 		return v.(RootSystemFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:root_system" {
 		return RootSystemFeatureConfig{}, fmt.Errorf("worldgen: %s is not a root_system feature", name)
 	}
@@ -1871,7 +1885,7 @@ func (s *FeatureSet) Count(name string) (CountFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("count", name); ok {
 		return v.(CountFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:sea_pickle" {
 		return CountFeatureConfig{}, fmt.Errorf("worldgen: %s is not a sea_pickle feature", name)
 	}
@@ -1894,7 +1908,7 @@ func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("spring", name); ok {
 		return v.(SpringFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:spring_feature" {
 		return SpringFeatureConfig{}, fmt.Errorf("worldgen: %s is not a spring feature", name)
 	}
@@ -2001,7 +2015,7 @@ func (s *FeatureSet) Tree(name string) (TreeFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("tree", name); ok {
 		return v.(TreeFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:tree" {
 		return TreeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a tree feature", name)
 	}
@@ -2051,7 +2065,7 @@ func (s *FeatureSet) HugeMushroom(name string) (HugeMushroomFeatureConfig, error
 	if v, ok := s.getCachedConfig("huge_mushroom", name); ok {
 		return v.(HugeMushroomFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || (configured.Type != "minecraft:huge_red_mushroom" && configured.Type != "minecraft:huge_brown_mushroom") {
 		return HugeMushroomFeatureConfig{}, fmt.Errorf("worldgen: %s is not a huge mushroom feature", name)
 	}
@@ -2070,7 +2084,7 @@ func (s *FeatureSet) FallenTree(name string) (FallenTreeFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("fallen_tree", name); ok {
 		return v.(FallenTreeFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:fallen_tree" {
 		return FallenTreeFeatureConfig{}, fmt.Errorf("worldgen: %s is not a fallen tree feature", name)
 	}
@@ -2115,7 +2129,7 @@ func (s *FeatureSet) LargeDripstone(name string) (LargeDripstoneFeatureConfig, e
 	if v, ok := s.getCachedConfig("large_dripstone", name); ok {
 		return v.(LargeDripstoneFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:large_dripstone" {
 		return LargeDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s is not a large dripstone feature", name)
 	}
@@ -2217,7 +2231,7 @@ func (s *FeatureSet) MultifaceGrowth(name string) (MultifaceGrowthFeatureConfig,
 	if v, ok := s.getCachedConfig("multiface_growth", name); ok {
 		return v.(MultifaceGrowthFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:multiface_growth" {
 		return MultifaceGrowthFeatureConfig{}, fmt.Errorf("worldgen: %s is not a multiface growth feature", name)
 	}
@@ -2278,7 +2292,7 @@ func (s *FeatureSet) SculkPatch(name string) (SculkPatchFeatureConfig, error) {
 	if v, ok := s.getCachedConfig("sculk_patch", name); ok {
 		return v.(SculkPatchFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:sculk_patch" {
 		return SculkPatchFeatureConfig{}, fmt.Errorf("worldgen: %s is not a sculk patch feature", name)
 	}
@@ -2319,7 +2333,7 @@ func (s *FeatureSet) DripstoneCluster(name string) (DripstoneClusterFeatureConfi
 	if v, ok := s.getCachedConfig("dripstone_cluster", name); ok {
 		return v.(DripstoneClusterFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:dripstone_cluster" {
 		return DripstoneClusterFeatureConfig{}, fmt.Errorf("worldgen: %s is not a dripstone cluster feature", name)
 	}
@@ -2381,7 +2395,7 @@ func (s *FeatureSet) PointedDripstone(name string) (PointedDripstoneFeatureConfi
 	if v, ok := s.getCachedConfig("pointed_dripstone", name); ok {
 		return v.(PointedDripstoneFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:pointed_dripstone" {
 		return PointedDripstoneFeatureConfig{}, fmt.Errorf("worldgen: %s is not a pointed dripstone feature", name)
 	}
@@ -2420,7 +2434,7 @@ func (s *FeatureSet) RandomSelector(name string) (RandomSelectorConfig, error) {
 	if v, ok := s.getCachedConfig("random_selector", name); ok {
 		return v.(RandomSelectorConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:random_selector" {
 		return RandomSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random selector", name)
 	}
@@ -2458,7 +2472,7 @@ func (s *FeatureSet) BlockColumn(name string) (BlockColumnFeatureConfig, error) 
 	if v, ok := s.getCachedConfig("block_column", name); ok {
 		return v.(BlockColumnFeatureConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:block_column" {
 		return BlockColumnFeatureConfig{}, fmt.Errorf("worldgen: %s is not a block column", name)
 	}
@@ -2503,7 +2517,7 @@ func (s *FeatureSet) SimpleRandomSelector(name string) (SimpleRandomSelectorConf
 	if v, ok := s.getCachedConfig("simple_random_selector", name); ok {
 		return v.(SimpleRandomSelectorConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:simple_random_selector" {
 		return SimpleRandomSelectorConfig{}, fmt.Errorf("worldgen: %s is not a simple random selector", name)
 	}
@@ -2797,7 +2811,7 @@ func (s *FeatureSet) RandomBooleanSelector(name string) (RandomBooleanSelectorCo
 	if v, ok := s.getCachedConfig("random_boolean_selector", name); ok {
 		return v.(RandomBooleanSelectorConfig), nil
 	}
-	configured, ok := s.Configured[name]
+	configured, ok := s.LookupConfigured(name)
 	if !ok || configured.Type != "minecraft:random_boolean_selector" {
 		return RandomBooleanSelectorConfig{}, fmt.Errorf("worldgen: %s is not a random boolean selector", name)
 	}
@@ -2861,8 +2875,11 @@ func (s *FeatureSet) parseFeatureRef(raw json.RawMessage) (FeatureRef, error) {
 	}
 	key := "inline:" + hashRawFeature(inline.Feature)
 	s.inlineMu.Lock()
-	if _, exists := s.Configured[key]; !exists {
-		s.Configured[key] = ConfiguredFeature{Type: doc.Type, Config: doc.Config}
+	if s.inlineConfigured == nil {
+		s.inlineConfigured = make(map[string]ConfiguredFeature)
+	}
+	if _, exists := s.inlineConfigured[key]; !exists {
+		s.inlineConfigured[key] = ConfiguredFeature{Type: doc.Type, Config: doc.Config}
 	}
 	s.inlineMu.Unlock()
 	ref.Name = key
@@ -3606,7 +3623,49 @@ func loadFeatureSet(data []byte) (*FeatureSet, error) {
 			}
 		}
 	}
+	set.prewarmInlineFeatures()
 	return set, nil
+}
+
+// prewarmInlineFeatures resolves all inline feature references at load time so
+// inlineConfigured is pre-populated before concurrent chunk generation starts.
+func (s *FeatureSet) prewarmInlineFeatures() {
+	visited := make(map[string]bool, len(s.Configured))
+	for {
+		var pending []string
+		for name := range s.Configured {
+			if !visited[name] {
+				pending = append(pending, name)
+			}
+		}
+		for name := range s.inlineConfigured {
+			if !visited[name] {
+				pending = append(pending, name)
+			}
+		}
+		if len(pending) == 0 {
+			return
+		}
+		for _, name := range pending {
+			visited[name] = true
+			cf, ok := s.LookupConfigured(name)
+			if !ok {
+				continue
+			}
+			switch cf.Type {
+			case "minecraft:vegetation_patch", "minecraft:waterlogged_vegetation_patch":
+				_, _ = s.VegetationPatch(name)
+			case "minecraft:root_system":
+				_, _ = s.RootSystem(name)
+			case "minecraft:random_selector":
+				_, _ = s.RandomSelector(name)
+			case "minecraft:simple_random_selector":
+				_, _ = s.SimpleRandomSelector(name)
+			case "minecraft:random_boolean_selector":
+				_, _ = s.RandomBooleanSelector(name)
+			}
+		}
+	}
 }
 
 func resourceName(file string) string {

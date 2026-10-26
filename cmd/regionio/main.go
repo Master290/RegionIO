@@ -13,6 +13,7 @@ import (
 
 	"regionio/internal/network"
 	"regionio/internal/server"
+	"regionio/internal/world"
 )
 
 func main() {
@@ -39,6 +40,7 @@ func main() {
 	worldDir := flag.String("world", cfg.WorldDir, "world directory (empty = in-memory only)")
 	maxCache := flag.Int("maxcache", cfg.MaxCachedChunks, "max cached chunks, LRU eviction (0 = unbounded)")
 	viewDistance := flag.Int("viewdistance", cfg.MaxViewDistance, "maximum client chunk view radius (2-16)")
+	workers := flag.Int("workers", world.DefaultGeneratorWorkers(), "parallel chunk generation workers (default = CPU cores - 1)")
 	online := flag.Bool("online", cfg.OnlineMode, "enable Mojang authentication and link encryption (online mode)")
 	pregenerate := flag.Int("pregenerate", 0, "pregenerate spawn chunk radius before listening (0 = disabled)")
 	flag.Parse()
@@ -47,10 +49,11 @@ func main() {
 	cfg.WorldDir = *worldDir
 	cfg.MaxCachedChunks = *maxCache
 	cfg.MaxViewDistance = *viewDistance
+	cfg.GenWorkers = *workers
 	cfg.OnlineMode = *online
 	log.Info("using world seed", "seed", cfg.WorldSeed, "worldDir", cfg.WorldDir,
 		"maxcache", cfg.MaxCachedChunks, "viewdistance", cfg.MaxViewDistance,
-		"online", cfg.OnlineMode, "pregenerate", *pregenerate)
+		"workers", cfg.GenWorkers, "online", cfg.OnlineMode, "pregenerate", *pregenerate)
 
 	srv, err := server.New(cfg)
 	if err != nil {

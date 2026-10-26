@@ -111,7 +111,7 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 		})
 		return placed
 	}
-	if _, isConfigured := set.Configured[ref.Name]; !isConfigured {
+	if _, isConfigured := set.LookupConfigured(ref.Name); !isConfigured {
 		if pf, isPlaced := set.Placed[ref.Name]; isPlaced {
 			placed := false
 			inner := worldgen.FeatureRef{Name: pf.Feature}
@@ -124,7 +124,7 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 			return placed
 		}
 	}
-	configured, ok := set.Configured[ref.Name]
+	configured, ok := set.LookupConfigured(ref.Name)
 	if !ok {
 		return false
 	}
