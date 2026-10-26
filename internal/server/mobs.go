@@ -1503,7 +1503,144 @@ func (s *Server) FireDamageAtPosition(dimension string, x, y, z, width, height f
 	return best, best > 0
 }
 
-// TickMobsInCauldrons checks all mob entities each tick and invokes:
+// BoatBubbleColumnSinkTicks is the number of ticks (60 = 3 seconds) a boat or
+// raft rocks/wobbles on the surface of a bubble column before sinking.
+const BoatBubbleColumnSinkTicks = 60
+
+var boatBubbleColumnTicks sync.Map // map[int32]int
+
+func isBoatOrRaftEntityType(typeName string) bool {
+	norm := canonicalResourceName(typeName)
+	return strings.HasSuffix(norm, "_boat") || strings.HasSuffix(norm, "_raft")
+}
+
+// EntitySubmergedFluidDepth computes the fluid height (`cache.FluidHeightAt`)
+// at `(x, y, z)` in `dimension` and returns the immersion depth (`surfaceY - y`),
+// the block's fluid height (`0..1`), the `world.FluidKind`, and whether the
+// entity's feet are submerged (`depth > 0`).
+func (s *Server) EntitySubmergedFluidDepth(dimension string, x, y, z float64) (submergedDepth float64, fluidHeight float32, kind world.FluidKind, submerged bool) {
+	if s == nil {
+		return 0, 0, world.FluidNone, false
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0, 0, world.FluidNone, false
+	}
+	bx := int(math.Floor(x))
+	by := int(math.Floor(y))
+	bz := int(math.Floor(z))
+	fh := cache.FluidHeightAt(bx, by, bz)
+	if fh <= 0 {
+		return 0, 0, world.FluidNone, false
+	}
+	k, _, _, _, _, ok := world.ClassifyFluidState(cache.GetBlock(bx, by, bz))
+	if !ok {
+		return 0, 0, world.FluidNone, false
+	}
+	surfaceY := float64(by) + float64(fh)
+	depth := surfaceY - y
+	if depth <= 0 {
+		return 0, fh, k, false
+	}
+	return depth, fh, k, true
+}
+
+// StepEntityFluidAndBubbleColumn applies `cache.BubbleColumnVelocityAt` and
+// `cache.FluidHeightAt` physics to a mob, item, or boat/raft entity:
+//   - Mobs and items inside or directly above a `minecraft:bubble_column` receive
+//     the vanilla upward/whirlpool vertical velocity from `BubbleColumnVelocityAt`.
+//   - Boats/rafts on the surface of a `minecraft:bubble_column` wobble for
+//     `BoatBubbleColumnSinkTicks` (60 ticks) and then sink (`boatSunk = true`).
+func (s *Server) StepEntityFluidAndBubbleColumn(entityID int32) (vx, vy, vz float64, inBubbleColumn bool, boatSunk bool) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return 0, 0, 0, false, false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return 0, 0, 0, false, false
+	}
+	dim := ent.EffectiveDimension()
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return 0, 0, 0, false, false
+	}
+	bx := int(math.Floor(ent.X))
+	by := int(math.Floor(ent.Y))
+	bz := int(math.Floor(ent.Z))
+	yBelow := int(math.Floor(ent.Y - 0.1))
+
+	curVX := float64(ent.VelocityX) / 8000.0
+	curVY := float64(ent.VelocityY) / 8000.0
+	curVZ := float64(ent.VelocityZ) / 8000.0
+
+	colY := by
+	nvx, nvy, nvz, ok := cache.BubbleColumnVelocityAt(bx, by, bz, curVX, curVY, curVZ)
+	if !ok && yBelow != by {
+		nvx, nvy, nvz, ok = cache.BubbleColumnVelocityAt(bx, yBelow, bz, curVX, curVY, curVZ)
+		if ok {
+			colY = yBelow
+		}
+	}
+
+	isBoat := isBoatOrRaftEntityType(ent.TypeName)
+	if ok {
+		if isBoat {
+			onSurface := colY+1 >= world.MinY+world.WorldHeight || cache.GetBlock(bx, colY+1, bz) == world.StateAir
+			if onSurface {
+				ticks := 1
+				if prev, loaded := boatBubbleColumnTicks.Load(entityID); loaded {
+					ticks = prev.(int) + 1
+				}
+				boatBubbleColumnTicks.Store(entityID, ticks)
+				if ticks < BoatBubbleColumnSinkTicks {
+					wobblePitch := float32(math.Sin(float64(ticks)*0.5) * 6.0)
+					s.entities.Update(entityID, func(e *world.Entity) {
+						e.Pitch = wobblePitch
+					})
+					return curVX, 0, curVZ, true, false
+				}
+				// After 60 ticks of rocking on a bubble column, the boat sinks!
+				boatBubbleColumnTicks.Delete(entityID)
+				if nvy > -0.7 {
+					nvy = -0.7
+				}
+				s.entities.Update(entityID, func(e *world.Entity) {
+					e.Pitch = 0
+					e.VelocityX = clampVelocityShort(nvx)
+					e.VelocityY = clampVelocityShort(nvy)
+					e.VelocityZ = clampVelocityShort(nvz)
+					e.Y += nvy
+					e.OnGround = false
+				})
+				cp := ent.ChunkPos()
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityMotion,
+					EncodeSetEntityMotionPacket(entityID, nvx, nvy, nvz))
+				return nvx, nvy, nvz, true, true
+			}
+		}
+
+		s.entities.Update(entityID, func(e *world.Entity) {
+			e.VelocityX = clampVelocityShort(nvx)
+			e.VelocityY = clampVelocityShort(nvy)
+			e.VelocityZ = clampVelocityShort(nvz)
+			e.Y += nvy
+			e.OnGround = false
+		})
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityMotion,
+			EncodeSetEntityMotionPacket(entityID, nvx, nvy, nvz))
+		return nvx, nvy, nvz, true, false
+	}
+
+	if isBoat {
+		boatBubbleColumnTicks.Delete(entityID)
+	}
+	return curVX, curVY, curVZ, false, false
+}
+
+// TickMobsInCauldrons checks all mob/item/boat entities each tick and invokes:
+//   - s.StepEntityFluidAndBubbleColumn(mob.ID) for bubble_column velocity and boat wobble/sinking
 //   - s.HandleEntityInsideCauldron(dim, mob.ID, bx, by, bz, s.IsEntityOnFire(mob.ID))
 //   - s.OnEntityStepTripwire(dim, bx, by, bz)
 //   - s.CampfireContactDamageAt(dim, bx, by, bz) and s.FireDamageAtPosition for living non-fire-immune mobs
@@ -1514,11 +1651,16 @@ func (s *Server) TickMobsInCauldrons() {
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		mob := &allEnts[i]
-		if mob.IsItem() || mob.IsExperienceOrb() || mob.TypeName == EntityTypeFishingBobber || IsDecorationEntity(mob.TypeName) ||
+		if mob.IsItem() || isBoatOrRaftEntityType(mob.TypeName) {
+			s.StepEntityFluidAndBubbleColumn(mob.ID)
+			continue
+		}
+		if mob.IsExperienceOrb() || mob.TypeName == EntityTypeFishingBobber || IsDecorationEntity(mob.TypeName) ||
 			IsStandardProjectileEntityType(mob.TypeName) || IsWindChargeEntityType(mob.TypeName) ||
 			mob.TypeName == EntityTypeLlamaSpit || mob.TypeName == EntityTypeLightning || IsVehicleEntity(mob.TypeName) {
 			continue
 		}
+		s.StepEntityFluidAndBubbleColumn(mob.ID)
 		dim := mob.EffectiveDimension()
 		cache := s.DimensionChunks(dim)
 		if cache == nil {

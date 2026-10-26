@@ -220,12 +220,42 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		blockBelow := s.chunks.GetBlock(int(math.Floor(snapshot.X)), yBelow, int(math.Floor(snapshot.Z)))
 
 		if snapshot.IsItem() {
+			dim := snapshot.EffectiveDimension()
+			cache := s.DimensionChunks(dim)
+			bx, by, bz := int(math.Floor(snapshot.X)), int(math.Floor(snapshot.Y)), int(math.Floor(snapshot.Z))
+			if cache != nil {
+				curVX := float64(snapshot.VelocityX) / 8000.0
+				curVY := float64(snapshot.VelocityY) / 8000.0
+				curVZ := float64(snapshot.VelocityZ) / 8000.0
+				if nvx, nvy, nvz, inBC := cache.BubbleColumnVelocityAt(bx, by, bz, curVX, curVY, curVZ); inBC {
+					s.entities.Update(snapshot.ID, func(e *world.Entity) {
+						e.OnGround = false
+						e.VelocityX = clampVelocityShort(nvx)
+						e.VelocityY = clampVelocityShort(nvy)
+						e.VelocityZ = clampVelocityShort(nvz)
+						e.Y += nvy
+						if e.PickupDelay > 0 {
+							e.PickupDelay--
+						}
+						e.Age++
+					})
+					continue
+				}
+			}
 			s.entities.Update(snapshot.ID, func(e *world.Entity) {
 				if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
 					e.OnGround = false
-					e.VelocityY -= 80
-					if e.VelocityY < -3000 {
-						e.VelocityY = -3000
+					if cache != nil && cache.FluidHeightAt(bx, by, bz) > 0 {
+						// Items float upward gently when submerged in water.
+						e.VelocityY += 40
+						if e.VelocityY > 480 {
+							e.VelocityY = 480
+						}
+					} else {
+						e.VelocityY -= 80
+						if e.VelocityY < -3000 {
+							e.VelocityY = -3000
+						}
 					}
 					e.Y += float64(e.VelocityY) / 8000.0
 				} else {
@@ -330,6 +360,23 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			} else {
 				if mem.attackCooldown > 0 {
 					mem.attackCooldown--
+				}
+				dim := snapshot.EffectiveDimension()
+				if cache := s.DimensionChunks(dim); cache != nil {
+					bx, by, bz := int(math.Floor(snapshot.X)), int(math.Floor(snapshot.Y)), int(math.Floor(snapshot.Z))
+					curVX := float64(snapshot.VelocityX) / 8000.0
+					curVY := float64(snapshot.VelocityY) / 8000.0
+					curVZ := float64(snapshot.VelocityZ) / 8000.0
+					if nvx, nvy, nvz, inBC := cache.BubbleColumnVelocityAt(bx, by, bz, curVX, curVY, curVZ); inBC {
+						s.entities.Update(snapshot.ID, func(e *world.Entity) {
+							e.OnGround = false
+							e.VelocityX = clampVelocityShort(nvx)
+							e.VelocityY = clampVelocityShort(nvy)
+							e.VelocityZ = clampVelocityShort(nvz)
+							e.Y += nvy
+						})
+						continue
+					}
 				}
 				minFallVel := int16(-3000)
 				if snapshot.TypeName == MobTypeChicken {

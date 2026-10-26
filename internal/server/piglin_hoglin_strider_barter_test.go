@@ -263,3 +263,60 @@ func TestStriderLavaWalkingShiveringSaddleStickSteeringAndBreeding(t *testing.T)
 		t.Fatal("expected striders fed warped_fungus to breed a baby strider")
 	}
 }
+
+func TestEntityFluidHeightAndBubbleColumnMobsItemsAndBoats(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+
+	// 1. Verify EntitySubmergedFluidDepth using cache.FluidHeightAt.
+	srv.chunks.SetBlock(10, 64, 10, world.WaterBlockState(0))
+	depth, fh, kind, submerged := srv.EntitySubmergedFluidDepth(world.DimensionOverworld, 10.5, 64.2, 10.5)
+	if !submerged || kind != world.FluidWater || fh <= 0 || depth <= 0 {
+		t.Fatalf("EntitySubmergedFluidDepth = (depth=%v, fh=%v, kind=%v, submerged=%v), want submerged water", depth, fh, kind, submerged)
+	}
+
+	// 2. Upward bubble_column propels mobs and items upward.
+	upBubble := world.BubbleColumnBlockState(false)
+	srv.chunks.SetBlock(12, 64, 12, upBubble)
+	srv.chunks.SetBlock(12, 65, 12, world.StateAir)
+
+	pigID, err := srv.SpawnMob(12.5, 64.0, 12.5, MobTypePig)
+	if err != nil {
+		t.Fatalf("SpawnMob(pig) failed: %v", err)
+	}
+	_, vy, _, inBC, _ := srv.StepEntityFluidAndBubbleColumn(pigID)
+	if !inBC || vy <= 0 {
+		t.Fatalf("expected upward bubble column to give pig positive vy, got vy=%v inBC=%v", vy, inBC)
+	}
+
+	itemID, _ := srv.SpawnItemEntityInDimension(world.DimensionOverworld, 12.5, 64.0, 12.5, world.NewNamedItemStack("minecraft:gold_ingot", 1))
+	_, ivy, _, itemInBC, _ := srv.StepEntityFluidAndBubbleColumn(itemID)
+	if !itemInBC || ivy <= 0 {
+		t.Fatalf("expected upward bubble column to give item positive vy, got vy=%v inBC=%v", ivy, itemInBC)
+	}
+
+	// 3. Boats on the surface of a bubble column wobble for 59 ticks and sink on the 60th tick.
+	whirlpoolBubble := world.BubbleColumnBlockState(true)
+	srv.chunks.SetBlock(14, 64, 14, whirlpoolBubble)
+	srv.chunks.SetBlock(14, 65, 14, world.StateAir)
+
+	boatID := srv.entities.Add(&world.Entity{
+		TypeID:    ResolveEntityTypeID("minecraft:oak_boat"),
+		TypeName:  "minecraft:oak_boat",
+		Dimension: world.DimensionOverworld,
+		X:         14.5,
+		Y:         64.0,
+		Z:         14.5,
+		OnGround:  true,
+	})
+	for tick := 1; tick < BoatBubbleColumnSinkTicks; tick++ {
+		_, _, _, bc, sunk := srv.StepEntityFluidAndBubbleColumn(boatID)
+		if !bc || sunk {
+			t.Fatalf("tick %d: expected boat to wobble without sinking, got bc=%v sunk=%v", tick, bc, sunk)
+		}
+	}
+	_, bvy, _, bc, sunk := srv.StepEntityFluidAndBubbleColumn(boatID)
+	if !bc || !sunk || bvy >= 0 {
+		t.Fatalf("tick 60: expected boat on bubble column to sink, got bc=%v sunk=%v vy=%v", bc, sunk, bvy)
+	}
+}
+
