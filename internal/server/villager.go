@@ -896,6 +896,11 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 		handled, _ := s.InteractWithBee(session, targetEntityID)
 		return handled, 0, nil
 	}
+	switch canonicalResourceName(ent.TypeName) {
+	case MobTypeFox, MobTypePanda, MobTypeOcelot:
+		handled, _ := s.InteractWithFoxPandaOrOcelot(session, targetEntityID, nil)
+		return handled, 0, nil
+	}
 	if IsPassiveAnimal(ent.TypeName) {
 		handled, _ := s.InteractWithAnimal(session, targetEntityID)
 		return handled, 0, nil

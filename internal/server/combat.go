@@ -683,6 +683,12 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.cat.hurt", SoundSourceNeutral
 	case MobTypeParrot:
 		return "minecraft:entity.parrot.hurt", SoundSourceNeutral
+	case MobTypeFox:
+		return SoundFoxHurt, SoundSourceNeutral
+	case MobTypePanda:
+		return SoundPandaHurt, SoundSourceNeutral
+	case MobTypeOcelot:
+		return SoundOcelotHurt, SoundSourceNeutral
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -748,6 +754,12 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.cat.death", SoundSourceNeutral
 	case MobTypeParrot:
 		return "minecraft:entity.parrot.death", SoundSourceNeutral
+	case MobTypeFox:
+		return SoundFoxDeath, SoundSourceNeutral
+	case MobTypePanda:
+		return SoundPandaDeath, SoundSourceNeutral
+	case MobTypeOcelot:
+		return SoundOcelotDeath, SoundSourceNeutral
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -915,6 +927,7 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 		s.BroadcastDeathMessage(target, mobAttackCauseName(mobType), mobType)
 	} else if mobID > 0 {
 		s.NotifyOwnerDamagedByMob(target, mobID)
+		s.NotifyTrustedPlayerAttacked(target, mobID)
 	}
 	snap := target.Snapshot()
 	vx, vy, vz := ComputeKnockback(mobX, mobZ, 0, snap.X, snap.Z, BaseKnockbackStrength)
@@ -1086,6 +1099,15 @@ func (s *Server) applyDamageToMob(
 			return false
 		}
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeWolf && s.HasWolfArmor(target.ID) {
+		if absorbed, _, _ := s.AbsorbWolfDamageWithArmor(target.ID, damage, false); absorbed {
+			if attacker != nil {
+				s.ProvokeWildWolf(target.ID, attacker)
+				s.NotifyOwnerAttackedTarget(attacker, target.ID)
+			}
+			return false
+		}
+	}
 
 	var (
 		attackerID  int32
@@ -1172,6 +1194,8 @@ func (s *Server) applyDamageToMob(
 			s.OnLlamaDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypeWanderingTrader {
 			s.OnWanderingTraderDamaged(target.ID, attacker, 0)
+		} else if normTarget == MobTypePanda {
+			s.OnPandaDamaged(target.ID, attacker, 0)
 		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,
@@ -1247,6 +1271,11 @@ func (s *Server) applyDamageToMob(
 	eqDrops := s.OnEquineOrLlamaKilled(target.ID)
 	for _, eqDrop := range eqDrops {
 		s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, eqDrop)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeFox {
+		if fst, ok := s.GetFoxState(target.ID); ok && !fst.HeldItem.IsEmpty() {
+			s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, fst.HeldItem)
+		}
 	}
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,

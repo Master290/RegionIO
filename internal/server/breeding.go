@@ -170,6 +170,12 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 		return item == GoatBreedingFoodItemID
 	case MobTypeBee:
 		return IsBeeBreedItem(item)
+	case MobTypeFox:
+		return IsFoxFoodItem(item)
+	case MobTypePanda:
+		return IsPandaFoodItem(item)
+	case MobTypeOcelot:
+		return IsCatFoodItem(item)
 	default:
 		return false
 	}
@@ -183,7 +189,8 @@ func IsBreedableMob(typeName string) bool {
 		MobTypeWolf, MobTypeCat,
 		MobTypeHorse, MobTypeDonkey, MobTypeLlama, MobTypeTraderLlama,
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
-		MobTypeFrog, MobTypeAxolotl, MobTypeGoat, MobTypeBee:
+		MobTypeFrog, MobTypeAxolotl, MobTypeGoat, MobTypeBee,
+		MobTypeFox, MobTypePanda, MobTypeOcelot:
 		return true
 	default:
 		return false
@@ -494,6 +501,7 @@ func (s *Server) TryBreedMobWithNearbyMate(entityID int32, maxDist float64, rng 
 
 	// Inherit ownership and attributes if parents are tamed.
 	s.inheritTamedParentTraits(ent.ID, mateEnt.ID, offspringID, offspringType, rng)
+	s.inheritFoxPandaOcelotTraits(ent.ID, mateEnt.ID, offspringID, offspringType, causePlayer, rng)
 
 	// Spawn 1..7 XP orbs at the breeding position.
 	xp := int32(BreedingMinXP)

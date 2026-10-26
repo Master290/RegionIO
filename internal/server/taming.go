@@ -399,6 +399,9 @@ func (s *Server) TameMob(entityID int32, owner *PlayerSession) bool {
 	if norm == MobTypeWolf {
 		s.SetMobHealth(entityID, DefaultWolfTamedMaxHealth)
 	}
+	if norm == MobTypeCat {
+		s.recordCatVariantTamedByOwner(owner, entityID)
+	}
 
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
@@ -633,12 +636,50 @@ func (s *Server) interactWithWolf(session *PlayerSession, ent *world.Entity, hel
 
 	isOwner := ownerUUID == session.Profile.UUID
 
-	// 2. Tamed wolf + dye -> recolor collar (owner only).
+	// 2a. Tamed adult wolf + wolf_armor -> equip wolf armor (owner only).
+	if isOwner && heldID == WolfArmorItemID && !s.IsMobBaby(ent.ID) && !s.HasWolfArmor(ent.ID) {
+		pSnap := session.Snapshot()
+		slotIdx := world.HotbarContainerOffset + int(pSnap.SelectedSlot)
+		heldStack := session.HeldItem()
+		heldMeta := GetSlotItemMeta(session, slotIdx)
+		if s.EquipWolfArmor(ent.ID, heldStack, heldMeta) {
+			consumeOneHeldItemInSurvival(session)
+			return true, 0
+		}
+	}
+
+	// 2b. Tamed armored wolf + armadillo_scute -> repair wolf armor by 8 durability (owner only).
+	if isOwner && heldID == ArmadilloScuteItemID && s.HasWolfArmor(ent.ID) {
+		if _, repaired := s.RepairWolfArmorWithScute(session, ent.ID); repaired {
+			return true, 0
+		}
+	}
+
+	// 2c. Tamed armored wolf + shears -> remove and drop wolf armor (owner only).
+	if isOwner && heldID == "minecraft:shears" && s.HasWolfArmor(ent.ID) {
+		if _, _, removed := s.RemoveWolfArmorWithShears(session, ent.ID); removed {
+			return true, 0
+		}
+	}
+
+	// 2d. Tamed wolf + dye -> recolor collar or dye equipped wolf_armor (owner only).
 	if dyeIdx, ok := DyeColorIndexByItemName(heldID); ok && isOwner {
+		if session.IsSneaking() && s.HasWolfArmor(ent.ID) {
+			if _, dyed := s.DyeEquippedWolfArmor(ent.ID, dyeIdx); dyed {
+				consumeOneHeldItemInSurvival(session)
+				return true, 0
+			}
+		}
 		if dyeIdx != collar {
 			consumeOneHeldItemInSurvival(session)
 			s.SetMobCollarColor(ent.ID, dyeIdx)
 			return true, 0
+		}
+		if s.HasWolfArmor(ent.ID) {
+			if _, dyed := s.DyeEquippedWolfArmor(ent.ID, dyeIdx); dyed {
+				consumeOneHeldItemInSurvival(session)
+				return true, 0
+			}
 		}
 		return false, 0
 	}
@@ -757,6 +798,9 @@ func (s *Server) interactWithParrot(session *PlayerSession, ent *world.Entity, h
 	// 1. Feeding a cookie to a parrot is lethally poisonous in vanilla!
 	if heldID == "minecraft:cookie" {
 		consumeOneHeldItemInSurvival(session)
+		s.ApplyEntityEffectScaled(ent.ID, NewStatusEffectInstance(EffectPoison, ParrotCookiePoisonTicks, 0), 1.0)
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundParrotEat, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		s.applyDamageToMob(ent, 1000.0, session, 0, false, false)
 		return true, 0
 	}
@@ -975,13 +1019,27 @@ func (s *Server) TryPerchParrotOnShoulder(owner *PlayerSession, parrotEntityID i
 		return false
 	}
 	copied := *st
-	if sh.LeftParrot == nil {
+	leftSlot := sh.LeftParrot == nil
+	if leftSlot {
 		sh.LeftParrot = &copied
 	} else {
 		sh.RightParrot = &copied
 	}
 	delete(mgr.mobs, parrotEntityID)
 	mgr.mu.Unlock()
+
+	pVar := s.ParrotVariant(parrotEntityID)
+	pm := s.petDetails()
+	pm.mu.Lock()
+	sv := pm.shoulderVariants[owner.Profile.UUID]
+	if leftSlot {
+		sv[0] = pVar
+	} else {
+		sv[1] = pVar
+	}
+	pm.shoulderVariants[owner.Profile.UUID] = sv
+	delete(pm.parrots, parrotEntityID)
+	pm.mu.Unlock()
 
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
@@ -1009,10 +1067,16 @@ func (s *Server) DismountShoulderParrots(owner *PlayerSession) []int32 {
 	delete(mgr.shoulders, owner.Profile.UUID)
 	mgr.mu.Unlock()
 
+	pm := s.petDetails()
+	pm.mu.Lock()
+	sv := pm.shoulderVariants[owner.Profile.UUID]
+	delete(pm.shoulderVariants, owner.Profile.UUID)
+	pm.mu.Unlock()
+
 	snap := owner.Snapshot()
 	dim := world.NormalizeDimension(snap.Dimension)
 	var spawned []int32
-	for _, p := range []*TamedMobState{left, right} {
+	for idx, p := range []*TamedMobState{left, right} {
 		if p == nil {
 			continue
 		}
@@ -1022,6 +1086,7 @@ func (s *Server) DismountShoulderParrots(owner *PlayerSession) []int32 {
 		}
 		s.TameMob(id, owner)
 		s.SetMobSitting(id, false)
+		s.SetParrotVariant(id, sv[idx])
 		spawned = append(spawned, id)
 	}
 	return spawned
@@ -1175,6 +1240,18 @@ func (s *Server) inheritTamedParentTraits(parentA, parentB, offspringID int32, o
 
 	if canonicalResourceName(offspringType) == MobTypeWolf {
 		s.SetMobHealth(offspringID, DefaultWolfTamedMaxHealth)
+		varVar := s.WolfVariant(parentA)
+		if rng != nil && rng.Intn(2) == 1 {
+			varVar = s.WolfVariant(parentB)
+		}
+		s.SetWolfVariant(offspringID, varVar)
+	}
+	if canonicalResourceName(offspringType) == MobTypeCat {
+		catVar := s.CatVariant(parentA)
+		if rng != nil && rng.Intn(2) == 1 {
+			catVar = s.CatVariant(parentB)
+		}
+		s.SetCatVariant(offspringID, catVar)
 	}
 	if IsEquineOrLlamaMob(offspringType) {
 		s.inheritEquineOrLlamaTraits(parentA, parentB, offspringID, offspringType, rng)
@@ -1237,6 +1314,10 @@ func (s *Server) tickSingleTamedMob(entityID int32, rng *rand.Rand) {
 	dim := ent.EffectiveDimension()
 	cache := s.DimensionChunks(dim)
 	feetY := int(math.Floor(ent.Y + 0.01))
+
+	if snap.TypeName == MobTypeParrot {
+		s.tickParrotDetails(entityID, rng)
+	}
 
 	// 1. Angry wild wolf chasing a player who hit it.
 	if !snap.Tamed && snap.TypeName == MobTypeWolf && snap.AngerTicks > 0 && snap.TargetPlayer != nil && !snap.TargetPlayer.IsDead() {

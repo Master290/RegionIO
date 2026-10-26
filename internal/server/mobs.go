@@ -184,6 +184,9 @@ var (
 		EntityTypeLlamaSpit:        EntityTypeLlamaSpitID,
 		MobTypeBee:                 EntityTypeBeeID,
 		MobTypeCopperGolem:         EntityTypeCopperGolemID,
+		MobTypeFox:                 EntityTypeFoxID,
+		MobTypePanda:               EntityTypePandaID,
+		MobTypeOcelot:              EntityTypeOcelotID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -204,11 +207,11 @@ func AllPassiveAnimalTypes() []string {
 	return out
 }
 
-// IsPassiveAnimal reports whether typeName is a breedable passive farm animal
-// (pig, cow, sheep, chicken, or bee).
+// IsPassiveAnimal reports whether typeName is a breedable passive farm/wild animal
+// (pig, cow, sheep, chicken, bee, fox, panda, or ocelot).
 func IsPassiveAnimal(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee:
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot:
 		return true
 	default:
 		return false
@@ -334,6 +337,12 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultEnderDragonMaxHealth
 	case MobTypeBee:
 		return DefaultBeeMaxHealth
+	case MobTypeFox:
+		return DefaultFoxMaxHealth
+	case MobTypePanda:
+		return DefaultPandaMaxHealth
+	case MobTypeOcelot:
+		return DefaultOcelotMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -365,6 +374,12 @@ func animalWanderSpeed(typeName string) float64 {
 		return GoatWanderSpeed
 	case MobTypeBee:
 		return BeeFlySpeed
+	case MobTypeFox:
+		return FoxWanderSpeed
+	case MobTypePanda:
+		return PandaWanderSpeed
+	case MobTypeOcelot:
+		return OcelotWanderSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -448,6 +463,15 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	if norm == MobTypeBee {
 		return s.SpawnBee(normDim, x, y, z, false)
 	}
+	if norm == MobTypeFox {
+		return s.SpawnFox(normDim, x, y, z, false)
+	}
+	if norm == MobTypePanda {
+		return s.SpawnPanda(normDim, x, y, z, false, PandaGeneNormal, PandaGeneNormal, nil)
+	}
+	if norm == MobTypeOcelot {
+		return s.SpawnOcelot(normDim, x, y, z, false)
+	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
 		return 0, errors.New("server: unknown mob entity type " + norm)
@@ -463,6 +487,14 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	})
 	if IsTameableMob(norm) {
 		_ = s.ensureTamedMobState(id, norm)
+		switch norm {
+		case MobTypeWolf:
+			_ = s.ensureWolfDetailState(id)
+		case MobTypeCat:
+			_ = s.ensureCatDetailState(id, nil)
+		case MobTypeParrot:
+			_ = s.ensureParrotDetailState(id, nil)
+		}
 	}
 	if IsEquineOrLlamaMob(norm) {
 		s.initEquineOrLlamaOnSpawn(id, norm, nil)

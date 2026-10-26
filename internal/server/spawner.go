@@ -191,6 +191,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickLlamaSpits()
 		s.TickBees(rng)
 		s.TickBeehives(rng)
+		s.TickFoxesPandasAndOcelots(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -368,11 +369,37 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 			)
 		case MobTypeCreeper:
-			nextX, nextY, nextZ, nextYaw, swellChanged, exploded = stepHostileCreeperAI(
-				s.chunks, rng, mem, t.playerTargets,
-				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
-			)
-			swellDir = mem.creeperSwellDir
+			if _, fx, _, fz, ok := s.HasCatOrOcelotNearPosition(snapshot.EffectiveDimension(), snapshot.X, float64(feetY), snapshot.Z, CatCreeperRepelRange); ok {
+				if mem.creeperFuseTicks > 0 || mem.creeperSwellDir != 0 {
+					mem.creeperFuseTicks = 0
+					mem.creeperSwellDir = 0
+					swellChanged = true
+					swellDir = 0
+				}
+				awayX := snapshot.X - fx
+				awayZ := snapshot.Z - fz
+				dist := math.Hypot(awayX, awayZ)
+				if dist < 1e-4 {
+					awayX = 1.0
+					dist = 1.0
+				}
+				tx := snapshot.X + (awayX/dist)*CreeperChaseSpeed
+				tz := snapshot.Z + (awayZ/dist)*CreeperChaseSpeed
+				nextYaw = yawToward(awayX, awayZ)
+				if s.chunks != nil {
+					if nx, ny, nz, stepOK := tryApplyHorizontalStep(s.chunks, snapshot.X, feetY, snapshot.Z, tx, tz); stepOK {
+						nextX, nextY, nextZ = nx, float64(ny), nz
+					}
+				} else {
+					nextX, nextZ = tx, tz
+				}
+			} else {
+				nextX, nextY, nextZ, nextYaw, swellChanged, exploded = stepHostileCreeperAI(
+					s.chunks, rng, mem, t.playerTargets,
+					snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+				)
+				swellDir = mem.creeperSwellDir
+			}
 		case MobTypeSpider:
 			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderAI(
 				s.chunks, rng, mem, t.playerTargets,
@@ -414,6 +441,27 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				}
 				if mem.inLoveTicks > 0 {
 					mem.inLoveTicks--
+				}
+			} else if snapshot.TypeName == MobTypeFox && s.IsFoxSleeping(snapshot.ID) {
+				if mem.breedCooldown > 0 {
+					mem.breedCooldown--
+				}
+				if mem.inLoveTicks > 0 {
+					mem.inLoveTicks--
+				}
+			} else if snapshot.TypeName == MobTypePanda {
+				if pst, ok := s.GetPandaState(snapshot.ID); ok && (pst.Flags&(PandaFlagSitting|PandaFlagRolling|PandaFlagOnBack) != 0 || pst.AngerTicks > 0) {
+					if mem.breedCooldown > 0 {
+						mem.breedCooldown--
+					}
+					if mem.inLoveTicks > 0 {
+						mem.inLoveTicks--
+					}
+				} else {
+					nextX, nextY, nextZ, nextYaw = s.stepPassiveAnimalAI(
+						snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
+						snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+					)
 				}
 			} else if snapshot.TypeName == MobTypeIronGolem {
 				if gst, ok := s.GetIronGolemState(snapshot.ID); !ok || gst.TargetMobID == 0 {
