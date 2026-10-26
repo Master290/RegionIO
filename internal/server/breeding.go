@@ -180,6 +180,8 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 		return item == "minecraft:crimson_fungus"
 	case MobTypeStrider:
 		return item == "minecraft:warped_fungus"
+	case MobTypeTurtle:
+		return IsTurtleBreedingFoodItem(item)
 	default:
 		return false
 	}
@@ -195,7 +197,7 @@ func IsBreedableMob(typeName string) bool {
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
 		MobTypeFrog, MobTypeAxolotl, MobTypeGoat, MobTypeBee,
 		MobTypeFox, MobTypePanda, MobTypeOcelot,
-		MobTypeHoglin, MobTypeStrider:
+		MobTypeHoglin, MobTypeStrider, MobTypeTurtle:
 		return true
 	default:
 		return false
@@ -427,6 +429,9 @@ func (s *Server) TickBabyMobs() {
 			cp := ent.ChunkPos()
 			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySetEntityDataCB,
 				EncodeAgeableMobDataPacket(id, false))
+			if canonicalResourceName(ent.TypeName) == MobTypeTurtle {
+				s.OnBabyTurtleGrownUp(id)
+			}
 		}
 	}
 }

@@ -193,6 +193,16 @@ var (
 		MobTypeHoglin:              EntityTypeHoglinID,
 		MobTypeZoglin:              EntityTypeZoglinID,
 		MobTypeStrider:             EntityTypeStriderID,
+		MobTypeDolphin:             EntityTypeDolphinID,
+		MobTypeTurtle:              EntityTypeTurtleID,
+		MobTypeSquid:               EntityTypeSquidID,
+		MobTypeGlowSquid:           EntityTypeGlowSquidID,
+		MobTypeCod:                 EntityTypeCodID,
+		MobTypeSalmon:              EntityTypeSalmonID,
+		MobTypeTropicalFish:        EntityTypeTropicalFishID,
+		MobTypePufferfish:          EntityTypePufferfishID,
+		MobTypeGuardian:            EntityTypeGuardianID,
+		MobTypeElderGuardian:       EntityTypeElderGuardianID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -361,6 +371,26 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultZoglinMaxHealth
 	case MobTypeStrider:
 		return DefaultStriderMaxHealth
+	case MobTypeDolphin:
+		return DefaultDolphinMaxHealth
+	case MobTypeTurtle:
+		return DefaultTurtleMaxHealth
+	case MobTypeSquid:
+		return DefaultSquidMaxHealth
+	case MobTypeGlowSquid:
+		return DefaultGlowSquidMaxHealth
+	case MobTypeCod:
+		return DefaultCodMaxHealth
+	case MobTypeSalmon:
+		return DefaultSalmonMaxHealth
+	case MobTypeTropicalFish:
+		return DefaultTropicalFishMaxHealth
+	case MobTypePufferfish:
+		return DefaultPufferfishMaxHealth
+	case MobTypeGuardian:
+		return DefaultGuardianMaxHealth
+	case MobTypeElderGuardian:
+		return DefaultElderGuardianMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -408,6 +438,18 @@ func animalWanderSpeed(typeName string) float64 {
 		return ZoglinChaseSpeed
 	case MobTypeStrider:
 		return StriderLandSpeed
+	case MobTypeDolphin:
+		return DolphinSwimSpeed
+	case MobTypeTurtle:
+		return TurtleLandSpeed
+	case MobTypeSquid, MobTypeGlowSquid:
+		return SquidJetSpeed
+	case MobTypeCod, MobTypeSalmon, MobTypeTropicalFish, MobTypePufferfish:
+		return FishSwimSpeed
+	case MobTypeGuardian:
+		return GuardianSwimSpeed
+	case MobTypeElderGuardian:
+		return ElderGuardianSwimSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -514,6 +556,27 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeStrider {
 		return s.SpawnStrider(normDim, x, y, z, false)
+	}
+	if norm == MobTypeDolphin {
+		return s.SpawnDolphin(normDim, x, y, z)
+	}
+	if norm == MobTypeTurtle {
+		return s.SpawnTurtle(normDim, x, y, z, false)
+	}
+	if norm == MobTypeSquid {
+		return s.SpawnSquid(normDim, x, y, z)
+	}
+	if norm == MobTypeGlowSquid {
+		return s.SpawnGlowSquid(normDim, x, y, z)
+	}
+	if IsFishMobType(norm) {
+		return s.SpawnFish(normDim, x, y, z, norm, false, nil)
+	}
+	if norm == MobTypeGuardian {
+		return s.SpawnGuardian(normDim, x, y, z)
+	}
+	if norm == MobTypeElderGuardian {
+		return s.SpawnElderGuardian(normDim, x, y, z)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {

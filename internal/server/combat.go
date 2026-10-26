@@ -641,6 +641,44 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		}
 	case MobTypeBogged:
 		return RollBoggedDeathLoot(rng, true)
+	case MobTypeSquid:
+		count := int32(1)
+		if rng != nil {
+			count = int32(1 + rng.Intn(3)) // 1..3 ink_sac
+		}
+		if stack := world.NewNamedItemStack(InkSacItemID, count); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeGlowSquid:
+		count := int32(1)
+		if rng != nil {
+			count = int32(1 + rng.Intn(3)) // 1..3 glow_ink_sac
+		}
+		if stack := world.NewNamedItemStack(GlowInkSacItemID, count); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeCod, MobTypeSalmon, MobTypeTropicalFish, MobTypePufferfish:
+		normFish := canonicalResourceName(typeName)
+		if stack := world.NewNamedItemStack(normFish, 1); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeGuardian:
+		shards := int32(1)
+		if rng != nil {
+			shards = int32(1 + rng.Intn(2)) // 1..2 prismarine_shard
+		}
+		if stack := world.NewNamedItemStack(PrismarineShardItemID, shards); !stack.IsEmpty() {
+			return []world.ItemStack{stack}
+		}
+	case MobTypeElderGuardian:
+		var out []world.ItemStack
+		if s1 := world.NewNamedItemStack(PrismarineShardItemID, 2); !s1.IsEmpty() {
+			out = append(out, s1)
+		}
+		if s2 := world.NewNamedItemStack(WetSpongeItemID, 1); !s2.IsEmpty() {
+			out = append(out, s2)
+		}
+		return out
 	}
 	return nil
 }
@@ -701,6 +739,26 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundZoglinHurt, SoundSourceHostile
 	case MobTypeStrider:
 		return SoundStriderHurt, SoundSourceNeutral
+	case MobTypeDolphin:
+		return SoundDolphinHurt, SoundSourceNeutral
+	case MobTypeTurtle:
+		return SoundTurtleHurt, SoundSourceNeutral
+	case MobTypeSquid:
+		return SoundSquidHurt, SoundSourceNeutral
+	case MobTypeGlowSquid:
+		return SoundGlowSquidHurt, SoundSourceNeutral
+	case MobTypeCod:
+		return SoundCodHurt, SoundSourceNeutral
+	case MobTypeSalmon:
+		return SoundSalmonHurt, SoundSourceNeutral
+	case MobTypeTropicalFish:
+		return SoundTropicalFishHurt, SoundSourceNeutral
+	case MobTypePufferfish:
+		return SoundPufferfishHurt, SoundSourceNeutral
+	case MobTypeGuardian:
+		return SoundGuardianHurt, SoundSourceHostile
+	case MobTypeElderGuardian:
+		return SoundElderGuardianHurt, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -784,6 +842,26 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundZoglinDeath, SoundSourceHostile
 	case MobTypeStrider:
 		return SoundStriderDeath, SoundSourceNeutral
+	case MobTypeDolphin:
+		return SoundDolphinDeath, SoundSourceNeutral
+	case MobTypeTurtle:
+		return SoundTurtleDeath, SoundSourceNeutral
+	case MobTypeSquid:
+		return SoundSquidDeath, SoundSourceNeutral
+	case MobTypeGlowSquid:
+		return SoundGlowSquidDeath, SoundSourceNeutral
+	case MobTypeCod:
+		return SoundCodDeath, SoundSourceNeutral
+	case MobTypeSalmon:
+		return SoundSalmonDeath, SoundSourceNeutral
+	case MobTypeTropicalFish:
+		return SoundTropicalFishDeath, SoundSourceNeutral
+	case MobTypePufferfish:
+		return SoundPufferfishDeath, SoundSourceNeutral
+	case MobTypeGuardian:
+		return SoundGuardianDeath, SoundSourceHostile
+	case MobTypeElderGuardian:
+		return SoundElderGuardianDeath, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -1222,6 +1300,10 @@ func (s *Server) applyDamageToMob(
 			s.OnPandaDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypePiglin || normTarget == MobTypePiglinBrute {
 			s.OnPiglinOrBruteDamaged(target.ID, attacker, 0)
+		} else if normTarget == MobTypeSquid || normTarget == MobTypeGlowSquid {
+			s.OnSquidDamaged(target.ID, attacker)
+		} else if normTarget == MobTypeGuardian || normTarget == MobTypeElderGuardian {
+			s.OnGuardianThornsRetaliate(target.ID, attacker)
 		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,

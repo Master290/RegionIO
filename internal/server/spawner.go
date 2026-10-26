@@ -193,6 +193,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickBeehives(rng)
 		s.TickFoxesPandasAndOcelots(rng)
 		s.TickPiglinsHoglinsAndStriders(rng)
+		s.TickAquaticMobs(rng)
 		s.TickMobsInCauldrons()
 	}
 
