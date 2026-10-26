@@ -365,3 +365,118 @@ func TestNetherHeightmapsBiomesAndDeterminism(t *testing.T) {
 	}
 }
 
+func TestNetherCrossChunk3x3Decoration(t *testing.T) {
+	// Build a 3x3 netherRegion centered at (0, 0) where a feature originates in
+	// neighbor chunk (-1, 0) at world x = -1 (local lx = 15) and must spill across
+	// the chunk boundary into target chunk (0, 0) (world x >= 0).
+	new3x3Cavern := func() *netherRegion {
+		reg := &netherRegion{centerX: 0, centerZ: 0}
+		for ix := 0; ix < 3; ix++ {
+			for iz := 0; iz < 3; iz++ {
+				cx, cz := int32(ix-1), int32(iz-1)
+				ch := NewDimensionChunk(cx, cz, BiomeNetherWastes, NetherDimensionType)
+				for lx := 0; lx < 16; lx++ {
+					for lz := 0; lz < 16; lz++ {
+						ch.setBlockRaw(lx, 0, lz, StateBedrock)
+						for y := 1; y <= 40; y++ {
+							ch.setBlockRaw(lx, y, lz, StateNetherrack)
+						}
+						for y := 80; y < 127; y++ {
+							ch.setBlockRaw(lx, y, lz, StateNetherrack)
+						}
+						ch.setBlockRaw(lx, 127, lz, StateBedrock)
+					}
+				}
+				reg.chunks[ix][iz] = ch
+			}
+		}
+		return reg
+	}
+
+	countInTarget := func(reg *netherRegion, match func(uint16) bool) int {
+		target := reg.chunks[1][1]
+		n := 0
+		for lx := 0; lx < 16; lx++ {
+			for lz := 0; lz < 16; lz++ {
+				for y := 1; y < 127; y++ {
+					if match(target.GetBlock(lx, y, lz)) {
+						n++
+					}
+				}
+			}
+		}
+		return n
+	}
+
+	// 1. Cross-chunk glowstone blob from neighbor chunk (-1, 0) at (-1, 79, 8) into (0, 0).
+	regGlow := new3x3Cavern()
+	if !placeGlowstoneBlobRegion(regGlow, -1, 79, 8, worldgen.NewXoroshiro(101)) {
+		t.Fatal("expected placeGlowstoneBlobRegion at (-1, 79, 8) to succeed")
+	}
+	if n := countInTarget(regGlow, func(st uint16) bool { return st == StateGlowstone }); n == 0 {
+		t.Fatal("expected glowstone blob originating in neighbor chunk (-1, 0) at x=-1 to place blocks in target chunk (0, 0)")
+	}
+
+	// 2. Cross-chunk large_dripstone from neighbor chunk (-1, 0) at (-1, 60, 8) into (0, 0).
+	regDrip := new3x3Cavern()
+	dripstoneID, _ := nameToStateID("minecraft:dripstone_block", nil)
+	if !placeNetherLargeDripstoneRegion(regDrip, -1, 60, 8, worldgen.NewXoroshiro(202)) {
+		t.Fatal("expected placeNetherLargeDripstoneRegion at (-1, 60, 8) to succeed")
+	}
+	if n := countInTarget(regDrip, func(st uint16) bool { return st == dripstoneID }); n == 0 {
+		t.Fatal("expected large_dripstone originating in neighbor chunk (-1, 0) at x=-1 to place columns in target chunk (0, 0)")
+	}
+
+	// 3. Cross-chunk basalt columns & huge fungus hat from neighbor chunk (-1, 0) into (0, 0).
+	regCols := new3x3Cavern()
+	if !placeBasaltColumnsRegion(regCols, -1, 41, 8, worldgen.NewXoroshiro(303), 2, 3, 5, 10) {
+		t.Fatal("expected placeBasaltColumnsRegion at (-1, 41, 8) to succeed")
+	}
+	if n := countInTarget(regCols, func(st uint16) bool { return st == StateBasalt }); n == 0 {
+		t.Fatal("expected large_basalt_columns originating in (-1, 0) at x=-1 to place basalt in target chunk (0, 0)")
+	}
+
+	regFungus := new3x3Cavern()
+	regFungus.setBlock(-1, 40, 8, StateCrimsonNylium)
+	if !placeHugeFungusRegion(regFungus, -1, 41, 8, worldgen.NewXoroshiro(404), true) {
+		t.Fatal("expected placeHugeFungusRegion at (-1, 41, 8) to succeed")
+	}
+	if n := countInTarget(regFungus, func(st uint16) bool { return st == StateNetherWartBlock || st == StateShroomlight }); n == 0 {
+		t.Fatal("expected huge crimson fungus originating in (-1, 0) at x=-1 to place canopy blocks in target chunk (0, 0)")
+	}
+
+	// 4. Cross-chunk RuinedPortalNether from neighbor chunk (-1, 0) into target chunk (0, 0).
+	regPortal := new3x3Cavern()
+	var decChunks []*Chunk
+	for ix := 0; ix < 3; ix++ {
+		for iz := 0; iz < 3; iz++ {
+			decChunks = append(decChunks, regPortal.chunks[ix][iz])
+		}
+	}
+	decReg, err := newDecorationRegion(decChunks)
+	if err != nil {
+		t.Fatalf("newDecorationRegion: %v", err)
+	}
+	decReg.bindSeed(12345)
+	stub := &RuinedPortalStub{
+		X:         -3,
+		Y:         41,
+		Z:         6,
+		Rotation:  0,
+		Mirror:    "none",
+		Template:  "ruined_portal/giant_portal_1",
+		Placement: "in_nether",
+	}
+	if err := PlaceRuinedPortalPiece(decReg, stub, 12345, 0, 0); err != nil {
+		t.Fatalf("PlaceRuinedPortalPiece: %v", err)
+	}
+	obsidianID, _ := nameToStateID("minecraft:obsidian", nil)
+	cryingObsidianID, _ := nameToStateID("minecraft:crying_obsidian", nil)
+	if n := countInTarget(regPortal, func(st uint16) bool {
+		return st == obsidianID || st == cryingObsidianID || st == StateMagmaBlock
+	}); n == 0 {
+		t.Fatal("expected ruined_portal_nether centered in neighbor chunk (-1, 0) to place blocks across border into target chunk (0, 0)")
+	}
+}
+
+

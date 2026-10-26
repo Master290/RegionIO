@@ -1253,20 +1253,45 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 	if c == nil || od == nil || sets == nil {
 		return
 	}
-	chunkBox := msChunkBox(cx, cz)
-	var region *decorationRegion
-	getRegion := func() *decorationRegion {
-		if region == nil {
-			region, _ = newDecorationRegion([]*Chunk{c})
+	region, _ := newDecorationRegion([]*Chunk{c})
+	PlaceNetherStructuresInRegion(region, od, sets, seed, cx, cz)
+}
+
+// PlaceNetherStructuresInRegion places all Nether structures (fortress,
+// bastion_remnant, nether_fossil, ruined_portal_nether) across a decoration
+// region centered at (centerX, centerZ) (up to a 3x3 chunk window).
+func PlaceNetherStructuresInRegion(reg *decorationRegion, od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, centerX, centerZ int32) {
+	if reg == nil || od == nil || sets == nil || len(reg.chunks) == 0 {
+		return
+	}
+	reg.bindSeed(seed)
+
+	// Collect all chunks in the region in deterministic (cx, cz) order.
+	var coords [9][2]int32
+	nCoords := 0
+	for dx := int32(-1); dx <= 1; dx++ {
+		for dz := int32(-1); dz <= 1; dz++ {
+			key := [2]int32{centerX + dx, centerZ + dz}
+			if reg.chunks[key] != nil {
+				coords[nCoords] = key
+				nCoords++
+			}
 		}
-		return region
+	}
+	if nCoords == 0 {
+		key := [2]int32{centerX, centerZ}
+		if reg.chunks[key] != nil {
+			coords[0] = key
+			nCoords = 1
+		}
 	}
 
-	// 1. nether_complexes (fortress + bastion_remnant), range up to 6 chunks.
+	// 1. nether_complexes (fortress + bastion_remnant), range up to 6 chunks around the region.
 	const complexRadius = 6
+	var forts []*NetherFortressStart
 	var bastions []*JigsawStart
-	for sx := cx - complexRadius; sx <= cx+complexRadius; sx++ {
-		for sz := cz - complexRadius; sz <= cz+complexRadius; sz++ {
+	for sx := centerX - complexRadius - 1; sx <= centerX+complexRadius+1; sx++ {
+		for sz := centerZ - complexRadius - 1; sz <= centerZ+complexRadius+1; sz++ {
 			stub, ok := FindStructureSetStart(od, sets, "minecraft:nether_complexes", seed, sx, sz)
 			if !ok || stub == nil {
 				continue
@@ -1274,7 +1299,9 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 			switch stub.StructureName {
 			case "minecraft:fortress":
 				fort := BuildNetherFortressStart(seed, sx, sz)
-				PlaceNetherFortress(c, fort, cx, cz)
+				if fort != nil {
+					forts = append(forts, fort)
+				}
 			case "minecraft:bastion_remnant":
 				jStart, cached := getCachedJigsawStart(seed, "minecraft:nether_complexes", sx, sz)
 				if !cached {
@@ -1288,36 +1315,57 @@ func PlaceNetherStructuresInChunk(c *Chunk, od *worldgen.OverworldDensity, sets 
 					}
 					putCachedJigsawStart(seed, "minecraft:nether_complexes", sx, sz, jStart)
 				}
-				if jStart != nil && jStart.Box.intersects(chunkBox) {
+				if jStart != nil {
 					bastions = append(bastions, jStart)
 				}
 			}
 		}
 	}
-	if len(bastions) > 0 {
-		if reg := getRegion(); reg != nil {
-			PlaceJigsawStartsForChunk(reg, bastions, "minecraft:bastion_remnant", surfaceStructuresStep, seed, cx, cz)
+	for i := 0; i < nCoords; i++ {
+		cx, cz := coords[i][0], coords[i][1]
+		c := reg.chunks[[2]int32{cx, cz}]
+		for _, fort := range forts {
+			PlaceNetherFortress(c, fort, cx, cz)
+		}
+		if len(bastions) > 0 {
+			chunkBox := msChunkBox(cx, cz)
+			var hitting []*JigsawStart
+			for _, b := range bastions {
+				if b.Box.intersects(chunkBox) {
+					hitting = append(hitting, b)
+				}
+			}
+			if len(hitting) > 0 {
+				PlaceJigsawStartsForChunk(reg, hitting, "minecraft:bastion_remnant", surfaceStructuresStep, seed, cx, cz)
+			}
 		}
 	}
 
-	// 2. nether_fossils, range up to 2 chunks.
-	for sx := cx - 2; sx <= cx+2; sx++ {
-		for sz := cz - 2; sz <= cz+2; sz++ {
-			stub := NetherFossilGenerationPoint(od, sets, seed, sx, sz)
-			if stub != nil {
+	// 2. nether_fossils, range up to 2 chunks around each region chunk.
+	var fossils []*NetherFossilStub
+	for sx := centerX - 3; sx <= centerX+3; sx++ {
+		for sz := centerZ - 3; sz <= centerZ+3; sz++ {
+			if stub := NetherFossilGenerationPoint(od, sets, seed, sx, sz); stub != nil {
+				fossils = append(fossils, stub)
+			}
+		}
+	}
+	if len(fossils) > 0 {
+		for i := 0; i < nCoords; i++ {
+			cx, cz := coords[i][0], coords[i][1]
+			c := reg.chunks[[2]int32{cx, cz}]
+			for _, stub := range fossils {
 				PlaceNetherFossil(c, stub, seed, cx, cz)
 			}
 		}
 	}
 
-	// 3. ruined_portals (ruined_portal_nether), range up to 2 chunks.
-	for sx := cx - 2; sx <= cx+2; sx++ {
-		for sz := cz - 2; sz <= cz+2; sz++ {
+	// 3. ruined_portals (ruined_portal_nether), range up to 2 chunks around the region.
+	for sx := centerX - 3; sx <= centerX+3; sx++ {
+		for sz := centerZ - 3; sz <= centerZ+3; sz++ {
 			stub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz)
 			if err == nil && stub != nil {
-				if reg := getRegion(); reg != nil {
-					_ = PlaceRuinedPortalPiece(reg, stub, seed, cx, cz)
-				}
+				_ = PlaceRuinedPortalPiece(reg, stub, seed, centerX, centerZ)
 			}
 		}
 	}

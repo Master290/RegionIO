@@ -407,7 +407,7 @@ func spreadNetherrack(region *decorationRegion, random *worldgen.WorldgenRandom,
 			if absInt(y-minY) > 3 {
 				continue
 			}
-			if !canBlockBeReplacedByNetherrackOrMagma(region, x, y, z) {
+			if !canBlockBeReplacedByNetherrackOrMagma(region, stub, x, y, z) {
 				continue
 			}
 			if !inChunk(x, z) {
@@ -434,15 +434,18 @@ func spreadNetherrack(region *decorationRegion, random *worldgen.WorldgenRandom,
 // replaceable block - NOT air, NOT obsidian, NOT in #features_cannot_replace,
 // and (outside the nether) NOT lava. The spread replaces ground, it does not
 // float in air.
-func canBlockBeReplacedByNetherrackOrMagma(region *decorationRegion, x, y, z int) bool {
+func canBlockBeReplacedByNetherrackOrMagma(region *decorationRegion, stub *RuinedPortalStub, x, y, z int) bool {
 	state := region.getBlock(x, y, z)
 	if state == ruinedAirID || state == ruinedObsidianID {
+		return false
+	}
+	if stub != nil && stub.Placement == "in_nether" && state == ruinedCaveAirID {
 		return false
 	}
 	if monsterCannotTable[state] {
 		return false
 	}
-	if isLavaState(state) {
+	if (stub == nil || stub.Placement != "in_nether") && isLavaState(state) {
 		return false
 	}
 	return true
