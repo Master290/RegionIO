@@ -1453,3 +1453,255 @@ func TestFluidBucketsGamerulesBubbleColumnAndWaterlogging(t *testing.T) {
 	}
 }
 
+func TestTotemOfUndyingFatalDamageAndBypasses(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	type pkt struct {
+		id   int32
+		body []byte
+	}
+	var mu sync.Mutex
+	var sent []pkt
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x91}, Name: "TotemHero"}, func(id int32, body []byte) error {
+		mu.Lock()
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		sent = append(sent, pkt{id: id, body: cp})
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	session.SetSelectedSlot(0)
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+
+	// 1. Place Totem of Undying in off-hand and apply Poison + fatal lava damage.
+	session.SetInventorySlot(OffHandContainerSlot, world.NewNamedItemStack(TotemOfUndyingItemID, 1))
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectPoison, 200, 0))
+	if !session.HasPlayerEffect(EffectPoison) {
+		t.Fatalf("expected Poison effect before totem activation")
+	}
+
+	died := srv.DamagePlayer(session, 50.0, "lava")
+	if died || session.IsDead() {
+		t.Fatalf("expected Totem of Undying to prevent fatal lava damage (died=%v, isDead=%v)", died, session.IsDead())
+	}
+	if hp := session.Health(); hp != 1.0 {
+		t.Fatalf("expected health = 1.0 after Totem activation, got %v", hp)
+	}
+	if !session.InventorySlot(OffHandContainerSlot).IsEmpty() {
+		t.Fatalf("expected off-hand Totem to be consumed, got %+v", session.InventorySlot(OffHandContainerSlot))
+	}
+	if session.HasPlayerEffect(EffectPoison) {
+		t.Fatalf("expected Poison effect cleared by Totem activation")
+	}
+	if !session.HasPlayerEffect(EffectRegeneration) || !session.HasPlayerEffect(EffectAbsorption) || !session.HasPlayerEffect(EffectFireResistance) {
+		t.Fatalf("expected Regeneration, Absorption, and Fire Resistance after Totem activation")
+	}
+	if !srv.HasCriterion(session, "minecraft:adventure/totem_of_undying", "used_totem") {
+		t.Fatalf("expected minecraft:adventure/totem_of_undying advancement granted")
+	}
+
+	mu.Lock()
+	gotTotemEvent := false
+	for _, p := range sent {
+		if p.id == protocol.PlayEntityEvent && len(p.body) == 5 && p.body[4] == EntityEventTotemActivated {
+			gotTotemEvent = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !gotTotemEvent {
+		t.Fatalf("expected PlayEntityEvent with status 35 (EntityEventTotemActivated)")
+	}
+
+	// 2. Void damage ("out_of_world") bypasses Totem of Undying.
+	hbSlot := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hbSlot, world.NewNamedItemStack(TotemOfUndyingItemID, 1))
+	died = srv.DamagePlayer(session, 50.0, "out_of_world")
+	if !died || !session.IsDead() {
+		t.Fatalf("expected void damage to bypass Totem of Undying and kill player")
+	}
+}
+
+func TestSpyglassUseStopAndAdvancements(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x92}, Name: "Watcher"}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	session.SetSelectedSlot(0)
+	hbSlot := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hbSlot, world.NewNamedItemStack(SpyglassItemID, 1))
+	// Look due south (Yaw=0, Pitch=0 -> +Z).
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+
+	// Spawn a parrot at (0.5, 66.0, 10.5) in front of the player.
+	parrotID := srv.entities.Add(&world.Entity{
+		TypeName:  "minecraft:parrot",
+		Dimension: world.DimensionOverworld,
+		X:         0.5,
+		Y:         66.0,
+		Z:         10.5,
+	})
+	_ = parrotID
+
+	lookedType, started := srv.StartUsingSpyglass(session, HandMain)
+	if !started || !srv.IsUsingSpyglass(session) {
+		t.Fatalf("StartUsingSpyglass: started=%v isUsing=%v, want true", started, srv.IsUsingSpyglass(session))
+	}
+	if lookedType != "minecraft:parrot" {
+		t.Fatalf("Spyglass lookedAtType = %q, want minecraft:parrot", lookedType)
+	}
+	if !srv.HasCriterion(session, "minecraft:adventure/spyglass_at_parrot", "look_at_parrot") {
+		t.Fatalf("expected minecraft:adventure/spyglass_at_parrot advancement granted")
+	}
+
+	if !srv.StopUsingSpyglass(session) || srv.IsUsingSpyglass(session) {
+		t.Fatalf("expected StopUsingSpyglass to clear using state")
+	}
+}
+
+func TestGoatHornPerSlotInstrumentDropPickupAndCooldown(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	type pkt struct {
+		id   int32
+		body []byte
+	}
+	var mu sync.Mutex
+	var sent []pkt
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x93}, Name: "HornPlayer"}, func(id int32, body []byte) error {
+		mu.Lock()
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		sent = append(sent, pkt{id: id, body: cp})
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	session.SetSelectedSlot(0)
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+
+	hbSlot := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hbSlot, world.NewNamedItemStack(GoatHornItemID, 1))
+	SetSlotGoatHornInstrument(session, hbSlot, "minecraft:sing_goat_horn")
+
+	// Drop the horn and pick it back up; verify its instrument is preserved.
+	entID, dropped := srv.DropSelectedItem(session, false)
+	if entID <= 0 || dropped.ResolvedID() != GoatHornItemID {
+		t.Fatalf("DropSelectedItem failed: entID=%d dropped=%+v", entID, dropped)
+	}
+	if gotInst := GetSlotGoatHornInstrument(session, hbSlot); gotInst != "" {
+		t.Fatalf("expected slot instrument cleared after drop, got %q", gotInst)
+	}
+	srv.entities.Update(entID, func(e *world.Entity) {
+		e.X, e.Y, e.Z = 0.5, 65.0, 0.5
+		e.PickupDelay = 0
+	})
+	if picked := srv.TryPickupItems(session); picked != 1 {
+		t.Fatalf("TryPickupItems = %d, want 1", picked)
+	}
+	if gotInst := GetSlotGoatHornInstrument(session, hbSlot); gotInst != "minecraft:sing_goat_horn" {
+		t.Fatalf("expected picked up goat horn instrument %q, got %q", "minecraft:sing_goat_horn", gotInst)
+	}
+
+	mu.Lock()
+	sent = nil
+	mu.Unlock()
+	if !srv.UsePlayerGoatHorn(session, HandMain) {
+		t.Fatalf("expected first UsePlayerGoatHorn to succeed")
+	}
+	if srv.UsePlayerGoatHorn(session, HandMain) {
+		t.Fatalf("expected second UsePlayerGoatHorn during 140t cooldown to be rejected")
+	}
+	mu.Lock()
+	gotCooldown0x11 := false
+	for _, p := range sent {
+		if p.id == protocol.PlayCooldown {
+			gotCooldown0x11 = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !gotCooldown0x11 {
+		t.Fatalf("expected protocol.PlayCooldown (0x11) packet on UsePlayerGoatHorn")
+	}
+}
+
+func TestThrownSplashPotionRaycastAndWaterFireExtinguish(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x94}, Name: "Alchemist"}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	session.SetSelectedSlot(0)
+	// Look due south (Yaw=0, Pitch=0 -> +Z) toward a stone wall at Z=5 with fire in front at Z=4.
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+	cache.SetBlock(0, 66, 5, world.StateStone)
+	fireSt, _ := world.BlockStateByName("minecraft:fire", nil)
+	cache.SetBlock(0, 65, 4, fireSt)
+
+	hbSlot := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hbSlot, world.NewNamedItemStack("minecraft:splash_potion", 1))
+	SetSlotPotionType(session, hbSlot, PotionWater)
+
+	if !srv.UseBeverageOrThrownPotion(session, HandMain) {
+		t.Fatalf("expected UseBeverageOrThrownPotion(splash_potion) to succeed")
+	}
+	if cache.GetBlock(0, 65, 4) != world.StateAir {
+		t.Fatalf("expected fire at (0,65,4) to be extinguished by water splash potion, got %s", world.BlockName(cache.GetBlock(0, 65, 4)))
+	}
+	if !session.InventorySlot(hbSlot).IsEmpty() {
+		t.Fatalf("expected splash_potion consumed in survival mode")
+	}
+
+	// Verify milk_bucket via UseBeverageOrThrownPotion clears effects and leaves empty bucket.
+	srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectPoison, 200, 0))
+	session.SetInventorySlot(hbSlot, world.NewNamedItemStack("minecraft:milk_bucket", 1))
+	if !srv.UseBeverageOrThrownPotion(session, HandMain) {
+		t.Fatalf("expected UseBeverageOrThrownPotion(milk_bucket) to succeed")
+	}
+	if session.HasPlayerEffect(EffectPoison) {
+		t.Fatalf("expected milk_bucket to clear Poison effect")
+	}
+	if got := session.InventorySlot(hbSlot).ResolvedID(); got != "minecraft:bucket" {
+		t.Fatalf("expected milk_bucket replaced by minecraft:bucket, got %q", got)
+	}
+}
+
+

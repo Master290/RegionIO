@@ -45,6 +45,8 @@ type playerSurvivalState struct {
 	dead              bool
 	drawingWeapon     string
 	drawingHand       int32
+	usingSpyglass     bool
+	spyglassHand      int32
 	ticksFrozen       int
 	freezeTickCounter int
 	bubbleVX          float64
@@ -1084,6 +1086,16 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 				SetSlotItemMeta(session, slot, fishMeta)
 			}
 		}
+		if hornInst, ok := s.DroppedGoatHornInstrument(live.ID); ok && hornInst != "" {
+			for _, slot := range changedSlots {
+				SetSlotGoatHornInstrument(session, slot, hornInst)
+			}
+		}
+		if mapID, ok := s.DroppedMapEntityID(live.ID); ok {
+			for _, slot := range changedSlots {
+				SetSlotMapID(session, slot, mapID)
+			}
+		}
 		totalPickedUp += added
 		pickedStack := world.NewItemStack(live.Item.ResolvedItemID(), added)
 		if pickedStack.ID == "" {
@@ -1211,7 +1223,13 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		s.WakePlayerFromBed(session)
 	}
 
+	if died && s.TryConsumeTotemOfUndying(session, cause) {
+		died = false
+		newHealth = 1.0
+	}
+
 	if died {
+		s.StopUsingSpyglass(session)
 		s.RecordPlayerDeath(session)
 		s.OnPlayerDiedWithEffects(session)
 		s.DespawnPlayerFishingBobber(session)
@@ -1398,6 +1416,7 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	session.SetFoodExhaustion(0)
 	session.SetFoodTickTimer(0)
 	session.SetBlockingWithShield(false)
+	s.StopUsingSpyglass(session)
 	s.StopPlayerFallFlying(session)
 	s.DismountPlayerVehicle(session)
 	s.CancelEating(session)
@@ -3629,6 +3648,10 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		dropCount = cur.Count
 	}
 	dropped := world.NewItemStack(cur.ResolvedItemID(), dropCount)
+	slotHornInst := GetSlotGoatHornInstrument(session, invSlot)
+	slotMapID, hasSlotMapID := GetSlotMapID(session, invSlot)
+	slotMeta := GetSlotItemMeta(session, invSlot)
+	s.StopUsingSpyglass(session)
 
 	rem := cur.Count - dropCount
 	if rem <= 0 {
@@ -3637,6 +3660,8 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		SetSlotPotionType(session, invSlot, "")
 		SetSlotArmorTrim(session, invSlot, ArmorTrim{})
 		ClearSlotBannerMeta(session, invSlot)
+		ClearSlotGoatHornInstrument(session, invSlot)
+		ClearSlotMapID(session, invSlot)
 	} else {
 		session.SetInventorySlot(invSlot, world.NewItemStack(cur.ResolvedItemID(), rem))
 	}
@@ -3656,6 +3681,20 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 
 	dim := world.NormalizeDimension(snap.Dimension)
 	entID, _ := s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, dropped)
+	if entID > 0 {
+		if !slotMeta.IsEmpty() {
+			ft := s.fishingTracker()
+			ft.mu.Lock()
+			ft.droppedMeta[entID] = slotMeta.Clone()
+			ft.mu.Unlock()
+		}
+		if slotHornInst != "" && canonicalItemName(dropped.ResolvedID()) == GoatHornItemID {
+			s.AssociateDroppedGoatHornEntity(entID, slotHornInst)
+		}
+		if hasSlotMapID && canonicalItemName(dropped.ResolvedID()) == FilledMapItemID {
+			s.AssociateDroppedMapEntity(entID, slotMapID)
+		}
+	}
 	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)
 	return entID, dropped
 }
@@ -3693,6 +3732,11 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 	offFW, hasOffFW := GetSlotFireworks(session, offSlot)
 	mainBanner := GetSlotBannerPatterns(session, mainSlot)
 	offBanner := GetSlotBannerPatterns(session, offSlot)
+	mainHorn := GetSlotGoatHornInstrument(session, mainSlot)
+	offHorn := GetSlotGoatHornInstrument(session, offSlot)
+	mainMapID, hasMainMap := GetSlotMapID(session, mainSlot)
+	offMapID, hasOffMap := GetSlotMapID(session, offSlot)
+	s.StopUsingSpyglass(session)
 
 	session.SetInventorySlot(mainSlot, offStack)
 	session.SetInventorySlot(offSlot, mainStack)
@@ -3702,6 +3746,18 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 	SetSlotPotionType(session, offSlot, mainPotion)
 	SetSlotArmorTrim(session, mainSlot, offTrim)
 	SetSlotArmorTrim(session, offSlot, mainTrim)
+	SetSlotGoatHornInstrument(session, mainSlot, offHorn)
+	SetSlotGoatHornInstrument(session, offSlot, mainHorn)
+	if hasOffMap {
+		SetSlotMapID(session, mainSlot, offMapID)
+	} else {
+		ClearSlotMapID(session, mainSlot)
+	}
+	if hasMainMap {
+		SetSlotMapID(session, offSlot, mainMapID)
+	} else {
+		ClearSlotMapID(session, offSlot)
+	}
 	if hasOffStar {
 		SetSlotFireworkStar(session, mainSlot, offStar)
 	} else {
@@ -4303,5 +4359,662 @@ func (s *Server) UseEmptyBucketInAir(session *PlayerSession, hand int32) (res wo
 	}
 	return res, false
 }
+
+// --- Totem of Undying (minecraft:totem_of_undying) ---
+
+const (
+	// TotemOfUndyingItemID is the canonical item ID for Totem of Undying.
+	TotemOfUndyingItemID = "minecraft:totem_of_undying"
+
+	// EntityEventTotemActivated is ClientboundEntityEventPacket status 35 (totem activation animation & sound).
+	EntityEventTotemActivated byte = 35
+
+	// Vanilla Totem of Undying status effect durations (ticks) and amplifiers.
+	TotemRegenerationDuration    int32 = 900 // 45s Regeneration II
+	TotemRegenerationAmplifier   int32 = 1
+	TotemAbsorptionDuration      int32 = 100 // 5s Absorption II
+	TotemAbsorptionAmplifier     int32 = 1
+	TotemFireResistanceDuration  int32 = 800 // 40s Fire Resistance I
+	TotemFireResistanceAmplifier int32 = 0
+)
+
+var itemUseAdvancementsOnce sync.Once
+
+func ensureItemUseAdvancementsRegistered() {
+	itemUseAdvancementsOnce.Do(func() {
+		reg := DefaultAdvancementRegistry()
+		if reg == nil {
+			return
+		}
+		register := func(id, parent, title, desc, icon string, frame int32, crit string) {
+			if _, exists := reg.byID[id]; exists {
+				return
+			}
+			def := &AdvancementDef{
+				ID:       id,
+				ParentID: parent,
+				Display: &AdvancementDisplay{
+					Title:          title,
+					Description:    desc,
+					IconItem:       icon,
+					Frame:          frame,
+					ShowToast:      true,
+					AnnounceToChat: true,
+				},
+				Criteria:            []string{crit},
+				Requirements:        [][]string{{crit}},
+				SendsTelemetryEvent: true,
+			}
+			reg.defs = append(reg.defs, def)
+			reg.byID[id] = def
+			if parent != "" {
+				reg.children[parent] = append(reg.children[parent], def)
+			}
+		}
+		register("minecraft:adventure/totem_of_undying", "minecraft:adventure/kill_a_mob",
+			"Postmortal", "Use a Totem of Undying to cheat death", TotemOfUndyingItemID, AdvancementFrameGoal, "used_totem")
+		register("minecraft:adventure/spyglass_at_parrot", "minecraft:adventure/root",
+			"Is It a Bird?", "Look at a Parrot through a Spyglass", SpyglassItemID, AdvancementFrameTask, "look_at_parrot")
+		register("minecraft:adventure/spyglass_at_ghast", "minecraft:adventure/spyglass_at_parrot",
+			"Is It a Balloon?", "Look at a Ghast through a Spyglass", SpyglassItemID, AdvancementFrameTask, "look_at_ghast")
+		register("minecraft:adventure/spyglass_at_dragon", "minecraft:adventure/spyglass_at_ghast",
+			"Is It a Plane?", "Look at the Ender Dragon through a Spyglass", SpyglassItemID, AdvancementFrameTask, "look_at_dragon")
+		register("minecraft:adventure/salvage_sherd", "minecraft:adventure/root",
+			"Respecting the Remnants", "Brush a Suspicious block to obtain a Pottery Sherd", "minecraft:brush", AdvancementFrameTask, "has_sherd")
+	})
+}
+
+// HasCriterion reports whether session has obtained criterion on advancementID.
+func (s *Server) HasCriterion(session *PlayerSession, advancementID, criterion string) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	ensureItemUseAdvancementsRegistered()
+	advID := canonicalAdvancementID(advancementID)
+	tr := getAdvancementTracker(session)
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	prog, ok := tr.progress[advID]
+	if !ok || prog == nil {
+		return false
+	}
+	cp, exists := prog.Criteria[criterion]
+	return exists && cp.IsDone()
+}
+
+// TriggerUsedTotem fires the "Postmortal" advancement
+// (`minecraft:adventure/totem_of_undying`, criterion `"used_totem"`).
+func (s *Server) TriggerUsedTotem(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	ensureItemUseAdvancementsRegistered()
+	s.GrantCriterion(session, "minecraft:adventure/totem_of_undying", "used_totem")
+}
+
+// TryConsumeTotemOfUndying checks whether fatal damage from cause can be
+// prevented by a `minecraft:totem_of_undying` in session's main hand or off-hand.
+// In vanilla 26.1.2, void (`out_of_world`), `/kill` (`generic_kill`), and world
+// border bypass Totem of Undying. When activated:
+//   - Consumes 1 totem from main hand (checked first) or off-hand in non-Creative mode
+//   - Sets player health to 1.0
+//   - Clears all existing status effects (`ClearPlayerEffects`)
+//   - Applies Regeneration II (900t), Absorption II (100t), Fire Resistance I (800t)
+//   - Broadcasts `PlayEntityEvent` (status 35) and records `used:totem_of_undying` + `minecraft:adventure/totem_of_undying`
+func (s *Server) TryConsumeTotemOfUndying(session *PlayerSession, cause string) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	switch cause {
+	case "kill", "generic_kill", "void", "out_of_world", "out_of_border", "outside_border", "world_border":
+		return false
+	}
+
+	mainSlot := session.HeldInventorySlot()
+	checkSlots := [2]int{mainSlot, OffHandContainerSlot}
+	totemSlot := -1
+	var totemStack world.ItemStack
+	for _, sl := range checkSlots {
+		if sl < 0 || sl >= world.PlayerInventorySlots {
+			continue
+		}
+		st := session.InventorySlot(sl)
+		if !st.IsEmpty() && canonicalItemName(st.ResolvedID()) == TotemOfUndyingItemID {
+			totemSlot = sl
+			totemStack = st
+			break
+		}
+	}
+	if totemSlot < 0 {
+		return false
+	}
+
+	dim := world.NormalizeDimension(session.Dimension())
+	session.mu.Lock()
+	session.health = 1.0
+	gm := session.gameMode
+	entityID := session.EntityID
+	pos := session.position
+	send := session.send
+	session.mu.Unlock()
+
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.dead = false
+	st.mu.Unlock()
+
+	if gm != GameModeCreative {
+		var updated world.ItemStack
+		if totemStack.Count > 1 {
+			updated = world.NewItemStack(totemStack.ResolvedItemID(), totemStack.Count-1)
+		}
+		session.SetInventorySlot(totemSlot, updated)
+		if updated.IsEmpty() {
+			SetSlotItemMeta(session, totemSlot, ItemMeta{})
+		}
+		if send != nil {
+			_ = send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), totemSlot, updated))
+		}
+	}
+
+	s.ClearPlayerEffects(session)
+	s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectRegeneration, TotemRegenerationDuration, TotemRegenerationAmplifier))
+	s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectAbsorption, TotemAbsorptionDuration, TotemAbsorptionAmplifier))
+	s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectFireResistance, TotemFireResistanceDuration, TotemFireResistanceAmplifier))
+
+	evPkt := EncodeEntityEventPacket(entityID, EntityEventTotemActivated)
+	if send != nil {
+		_ = send(protocol.PlayEntityEvent, evPkt)
+	}
+	cx := int32(int64(math.Floor(pos[0])) >> 4)
+	cz := int32(int64(math.Floor(pos[2])) >> 4)
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayEntityEvent, evPkt)
+
+	s.RecordItemUsed(session, TotemOfUndyingItemID, 1)
+	s.TriggerUsedTotem(session)
+	s.TriggerInventoryChanged(session)
+	return true
+}
+
+// --- Spyglass (minecraft:spyglass) ---
+
+const (
+	// SpyglassItemID is the canonical item ID for Spyglass.
+	SpyglassItemID = "minecraft:spyglass"
+
+	// SpyglassMaxLookRange is the maximum distance (blocks) for spyglass look advancements.
+	SpyglassMaxLookRange = 64.0
+)
+
+// EncodeLivingEntityUsingFlagsPacket encodes a ClientboundSetEntityDataPacket (0x61)
+// updating LivingEntity `DATA_LIVING_ENTITY_FLAGS` (index 8, Byte serializer 0):
+// bit 0x01 = isUsingItem, bit 0x02 = off-hand.
+func EncodeLivingEntityUsingFlagsPacket(entityID int32, usingItem bool, hand int32) []byte {
+	var flags byte
+	if usingItem {
+		flags |= 0x01
+		if hand == HandOffHand {
+			flags |= 0x02
+		}
+	}
+	w := protocol.NewWriter(12)
+	w.VarInt(entityID)
+	w.Byte(8) // LivingEntity DATA_LIVING_ENTITY_FLAGS index
+	w.VarInt(0)
+	w.Byte(flags)
+	w.Byte(0xff)
+	return w.Bytes()
+}
+
+// IsUsingSpyglass reports whether session is currently looking through a spyglass.
+func (s *Server) IsUsingSpyglass(session *PlayerSession) bool {
+	if session == nil {
+		return false
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	using := st.usingSpyglass
+	st.mu.Unlock()
+	return using
+}
+
+// StartUsingSpyglass starts using a `minecraft:spyglass` in `hand`, sets the
+// player's LivingEntity using-item metadata flag (for third-person animation and
+// client FOV zoom), plays `minecraft:item.spyglass.use`, records item-used stats,
+// and checks line-of-sight up to 64 blocks for "Is It a Bird?" (`parrot`),
+// "Is It a Balloon?" (`ghast`), and "Is It a Plane?" (`ender_dragon`).
+func (s *Server) StartUsingSpyglass(session *PlayerSession, hand int32) (lookedAtType string, started bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return "", false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return "", false
+	}
+	_, held := session.handSlotAndStack(hand)
+	if held.IsEmpty() || canonicalItemName(held.ResolvedID()) != SpyglassItemID {
+		return "", false
+	}
+
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.usingSpyglass = true
+	st.spyglassHand = hand
+	st.mu.Unlock()
+
+	dim := world.NormalizeDimension(snap.Dimension)
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	metaPkt := EncodeLivingEntityUsingFlagsPacket(snap.EntityID, true, hand)
+	if session.send != nil {
+		_ = session.send(protocol.PlaySetEntityData, metaPkt)
+	}
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetEntityData, metaPkt)
+	s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:item.spyglass.use", SoundSourcePlayers, snap.X, snap.Y+1.62, snap.Z, 1.0, 1.0, 0))
+	s.RecordItemUsed(session, SpyglassItemID, 1)
+
+	lookedAtType = s.SpyglassLookAtEntity(session)
+	switch lookedAtType {
+	case "minecraft:parrot":
+		ensureItemUseAdvancementsRegistered()
+		s.GrantCriterion(session, "minecraft:adventure/spyglass_at_parrot", "look_at_parrot")
+	case "minecraft:ghast":
+		ensureItemUseAdvancementsRegistered()
+		s.GrantCriterion(session, "minecraft:adventure/spyglass_at_ghast", "look_at_ghast")
+	case "minecraft:ender_dragon":
+		ensureItemUseAdvancementsRegistered()
+		s.GrantCriterion(session, "minecraft:adventure/spyglass_at_dragon", "look_at_dragon")
+	}
+	return lookedAtType, true
+}
+
+// StopUsingSpyglass stops active spyglass usage for session, clearing the
+// LivingEntity using-item flag and playing `minecraft:item.spyglass.stop_using`.
+func (s *Server) StopUsingSpyglass(session *PlayerSession) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	if !st.usingSpyglass {
+		st.mu.Unlock()
+		return false
+	}
+	st.usingSpyglass = false
+	st.mu.Unlock()
+
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	metaPkt := EncodeLivingEntityUsingFlagsPacket(snap.EntityID, false, HandMain)
+	if session.send != nil {
+		_ = session.send(protocol.PlaySetEntityData, metaPkt)
+	}
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetEntityData, metaPkt)
+	s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:item.spyglass.stop_using", SoundSourcePlayers, snap.X, snap.Y+1.62, snap.Z, 1.0, 1.0, 0))
+	return true
+}
+
+// SpyglassLookAtEntity raycasts up to SpyglassMaxLookRange (64 blocks) along
+// session's look vector and returns the canonical TypeName of the closest entity
+// within the look cone (or "" if none).
+func (s *Server) SpyglassLookAtEntity(session *PlayerSession) string {
+	if s == nil || s.entities == nil || session == nil {
+		return ""
+	}
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	lx, ly, lz := ElytraLookVector(snap.Yaw, snap.Pitch)
+	eyeX, eyeY, eyeZ := snap.X, snap.Y+1.62, snap.Z
+
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	ents := s.entities.AppendInChunkRange(nil, cx, cz, 4)
+
+	bestDist := SpyglassMaxLookRange + 1.0
+	bestType := ""
+	for i := range ents {
+		ent := &ents[i]
+		if ent.EffectiveDimension() != dim || ent.IsItem() || ent.IsExperienceOrb() {
+			continue
+		}
+		targetY := ent.Y + 0.5
+		dx := ent.X - eyeX
+		dy := targetY - eyeY
+		dz := ent.Z - eyeZ
+		proj := dx*lx + dy*ly + dz*lz
+		if proj <= 0 || proj > SpyglassMaxLookRange || proj >= bestDist {
+			continue
+		}
+		perpX := dx - proj*lx
+		perpY := dy - proj*ly
+		perpZ := dz - proj*lz
+		perpDistSq := perpX*perpX + perpY*perpY + perpZ*perpZ
+		hitRadius := 1.25
+		if canonicalResourceName(ent.TypeName) == "minecraft:ghast" || canonicalResourceName(ent.TypeName) == "minecraft:ender_dragon" {
+			hitRadius = 3.0
+		}
+		if perpDistSq <= hitRadius*hitRadius {
+			bestDist = proj
+			bestType = canonicalResourceName(ent.TypeName)
+		}
+	}
+	return bestType
+}
+
+// --- Goat Horn Per-Slot Instrument & Protocol 775 Cooldown ---
+
+type sessionGoatHornTracker struct {
+	mu          sync.Mutex
+	slotInst    [world.PlayerInventorySlots]string
+	carriedInst string
+}
+
+var playerGoatHorns sync.Map // map[*PlayerSession]*sessionGoatHornTracker
+
+func getGoatHornTracker(session *PlayerSession) *sessionGoatHornTracker {
+	if session == nil {
+		return nil
+	}
+	if v, ok := playerGoatHorns.Load(session); ok {
+		return v.(*sessionGoatHornTracker)
+	}
+	actual, _ := playerGoatHorns.LoadOrStore(session, &sessionGoatHornTracker{})
+	return actual.(*sessionGoatHornTracker)
+}
+
+// GetSlotGoatHornInstrument returns the goat horn instrument ID stored in
+// session's inventory slot (0..45), or "" if none is set.
+func GetSlotGoatHornInstrument(session *PlayerSession, slot int) string {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return ""
+	}
+	tr := getGoatHornTracker(session)
+	tr.mu.Lock()
+	inst := tr.slotInst[slot]
+	tr.mu.Unlock()
+	return inst
+}
+
+// SetSlotGoatHornInstrument associates a goat horn instrument ID with session's
+// inventory slot (0..45).
+func SetSlotGoatHornInstrument(session *PlayerSession, slot int, instrument string) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getGoatHornTracker(session)
+	tr.mu.Lock()
+	if instrument == "" {
+		tr.slotInst[slot] = ""
+	} else {
+		tr.slotInst[slot] = canonicalResourceName(instrument)
+	}
+	tr.mu.Unlock()
+}
+
+// ClearSlotGoatHornInstrument clears any goat horn instrument on slot (0..45).
+func ClearSlotGoatHornInstrument(session *PlayerSession, slot int) {
+	SetSlotGoatHornInstrument(session, slot, "")
+}
+
+// GetCarriedGoatHornInstrument returns the goat horn instrument on the cursor.
+func GetCarriedGoatHornInstrument(session *PlayerSession) string {
+	if session == nil {
+		return ""
+	}
+	tr := getGoatHornTracker(session)
+	tr.mu.Lock()
+	inst := tr.carriedInst
+	tr.mu.Unlock()
+	return inst
+}
+
+// SetCarriedGoatHornInstrument sets or clears the goat horn instrument on the cursor.
+func SetCarriedGoatHornInstrument(session *PlayerSession, instrument string) {
+	if session == nil {
+		return
+	}
+	tr := getGoatHornTracker(session)
+	tr.mu.Lock()
+	if instrument == "" {
+		tr.carriedInst = ""
+	} else {
+		tr.carriedInst = canonicalResourceName(instrument)
+	}
+	tr.mu.Unlock()
+}
+
+// AssociateDroppedGoatHornEntity records the goat horn instrument for a dropped item entity.
+func (s *Server) AssociateDroppedGoatHornEntity(entityID int32, instrument string) {
+	if s == nil || entityID <= 0 || instrument == "" {
+		return
+	}
+	mgr := s.goatManager()
+	mgr.mu.Lock()
+	mgr.hornInstrument[entityID] = canonicalResourceName(instrument)
+	mgr.mu.Unlock()
+}
+
+// DroppedGoatHornInstrument returns the goat horn instrument associated with a dropped item entity.
+func (s *Server) DroppedGoatHornInstrument(entityID int32) (string, bool) {
+	if s == nil || entityID <= 0 {
+		return "", false
+	}
+	mgr := s.goatManager()
+	mgr.mu.Lock()
+	inst, ok := mgr.hornInstrument[entityID]
+	mgr.mu.Unlock()
+	return inst, ok && inst != ""
+}
+
+// UsePlayerGoatHorn plays the `minecraft:goat_horn` held in session's `hand`
+// using the slot's stored instrument (or `ponder_goat_horn` by default),
+// enforces the 140-tick cooldown, sends `protocol.PlayCooldown` (0x11 in protocol 775),
+// and records `used:goat_horn`.
+func (s *Server) UsePlayerGoatHorn(session *PlayerSession, hand int32) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	slot, held := session.handSlotAndStack(hand)
+	if held.IsEmpty() || canonicalItemName(held.ResolvedID()) != GoatHornItemID {
+		return false
+	}
+	inst := GetSlotGoatHornInstrument(session, slot)
+	if !s.UseGoatHornItem(session, hand, inst) {
+		return false
+	}
+	if session.send != nil {
+		_ = session.send(protocol.PlayCooldown, EncodeCooldownPacket(GoatHornItemID, GoatHornCooldownTicks))
+	}
+	s.RecordItemUsed(session, GoatHornItemID, 1)
+	return true
+}
+
+// --- Milk Bucket & Thrown Potion Trajectory / Water Splash Extinguish ---
+
+// RaycastThrownPotionImpact traces along session's look vector up to 12 blocks
+// to determine the impact point `(hitX, hitY, hitZ)` and any directly hit entity
+// for a thrown splash or lingering potion.
+func (s *Server) RaycastThrownPotionImpact(session *PlayerSession) (hitX, hitY, hitZ float64, directEntityID int32) {
+	if s == nil || session == nil {
+		return 0, 0, 0, 0
+	}
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	lx, ly, lz := ElytraLookVector(snap.Yaw, snap.Pitch)
+	eyeX, eyeY, eyeZ := snap.X, snap.Y+1.5, snap.Z
+
+	var ents []world.Entity
+	if s.entities != nil {
+		cx := int32(int64(math.Floor(snap.X)) >> 4)
+		cz := int32(int64(math.Floor(snap.Z)) >> 4)
+		ents = s.entities.AppendInChunkRange(nil, cx, cz, 2)
+	}
+
+	curX, curY, curZ := eyeX, eyeY, eyeZ
+	for step := 1; step <= 24; step++ {
+		dist := float64(step) * 0.5
+		px := eyeX + lx*dist
+		py := eyeY + ly*dist - 0.015*dist*dist // slight gravity arc
+		pz := eyeZ + lz*dist
+
+		for i := range ents {
+			ent := &ents[i]
+			if ent.EffectiveDimension() != dim || ent.IsItem() || ent.IsExperienceOrb() {
+				continue
+			}
+			dx := ent.X - px
+			dy := (ent.Y + 0.5) - py
+			dz := ent.Z - pz
+			if dx*dx+dy*dy+dz*dz <= 0.8*0.8 {
+				return ent.X, ent.Y, ent.Z, ent.ID
+			}
+		}
+
+		if cache != nil {
+			bx, by, bz := int(math.Floor(px)), int(math.Floor(py)), int(math.Floor(pz))
+			if by >= world.MinY && by < world.MinY+world.WorldHeight {
+				st := cache.GetBlock(bx, by, bz)
+				if !isPassableBlock(st) && st != world.StateWater {
+					return curX, curY, curZ, 0
+				}
+			}
+		}
+		curX, curY, curZ = px, py, pz
+	}
+	return curX, curY, curZ, 0
+}
+
+// ExtinguishBlocksWithWaterSplashAt extinguishes `minecraft:fire`, `minecraft:soul_fire`,
+// lit campfires, and lit candles within 2 blocks of `(x, y, z)` in `dim`.
+func (s *Server) ExtinguishBlocksWithWaterSplashAt(dim string, x, y, z float64) int {
+	if s == nil {
+		return 0
+	}
+	dim = world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return 0
+	}
+	cx, cy, cz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
+	extinguished := 0
+	for dx := -2; dx <= 2; dx++ {
+		for dy := -1; dy <= 1; dy++ {
+			for dz := -2; dz <= 2; dz++ {
+				bx, by, bz := cx+dx, cy+dy, cz+dz
+				if by < world.MinY || by >= world.MinY+world.WorldHeight {
+					continue
+				}
+				st := cache.GetBlock(bx, by, bz)
+				if st == world.StateAir {
+					continue
+				}
+				bname := world.BlockName(st)
+				if bname == "minecraft:fire" || bname == "minecraft:soul_fire" {
+					if s.ExtinguishFireAt(dim, bx, by, bz) {
+						extinguished++
+					}
+					continue
+				}
+				if IsCampfireBlock(st) && CampfireStateLit(st) {
+					if s.ExtinguishCampfire(dim, bx, by, bz, true) {
+						extinguished++
+					}
+					continue
+				}
+				if strings.HasSuffix(bname, "candle") || strings.Contains(bname, "candle_cake") {
+					props := world.BlockProperties(st)
+					if props["lit"] == "true" {
+						newProps := make(map[string]string, len(props))
+						for k, v := range props {
+							newProps[k] = v
+						}
+						newProps["lit"] = "false"
+						if unlit, ok := world.BlockStateByName(bname, newProps); ok && unlit != st {
+							if applied, upd := cache.ApplyBlockWithUpdates(bx, by, bz, unlit); applied {
+								s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+								extinguished++
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return extinguished
+}
+
+// UseBeverageOrThrownPotion handles right-clicking (`use_item`) with a potion,
+// milk bucket, ominous bottle, splash potion, or lingering potion, including
+// look-vector trajectory raycasting and water splash block extinguishing.
+func (s *Server) UseBeverageOrThrownPotion(session *PlayerSession, hand int32) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	slot, stack := session.handSlotAndStack(hand)
+	if stack.IsEmpty() {
+		return false
+	}
+	itemID := canonicalItemName(stack.ResolvedID())
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+
+	switch itemID {
+	case "minecraft:potion":
+		if s.DrinkPotion(session, hand) {
+			s.RecordItemUsed(session, itemID, 1)
+			return true
+		}
+		return false
+	case "minecraft:milk_bucket":
+		if _, ok := s.DrinkMilkBucket(session, hand); ok {
+			s.RecordItemUsed(session, itemID, 1)
+			return true
+		}
+		return false
+	case "minecraft:ominous_bottle":
+		if s.DrinkOminousBottle(session, hand) {
+			s.RecordItemUsed(session, itemID, 1)
+			return true
+		}
+		return false
+	case "minecraft:splash_potion":
+		potionID := GetSlotPotionType(session, slot)
+		if potionID == "" {
+			potionID = PotionWater
+		}
+		hitX, hitY, hitZ, directEntID := s.RaycastThrownPotionImpact(session)
+		s.consumeThrownPotionSlot(session, slot, stack)
+		s.ApplySplashPotionAt(dim, hitX, hitY, hitZ, potionID, directEntID)
+		normPot := canonicalPotionID(potionID)
+		if normPot == PotionWater || normPot == PotionMundane || normPot == PotionThick || normPot == PotionAwkward {
+			s.ExtinguishBlocksWithWaterSplashAt(dim, hitX, hitY, hitZ)
+		}
+		s.RecordItemUsed(session, itemID, 1)
+		return true
+	case "minecraft:lingering_potion":
+		potionID := GetSlotPotionType(session, slot)
+		if potionID == "" {
+			potionID = PotionWater
+		}
+		hitX, hitY, hitZ, _ := s.RaycastThrownPotionImpact(session)
+		s.consumeThrownPotionSlot(session, slot, stack)
+		s.broadcastPotionBreakEffect(dim, hitX, hitY, hitZ, potionID)
+		s.SpawnLingeringPotionCloud(dim, hitX, hitY, hitZ, potionID)
+		normPot := canonicalPotionID(potionID)
+		if normPot == PotionWater || normPot == PotionMundane || normPot == PotionThick || normPot == PotionAwkward {
+			s.ExtinguishBlocksWithWaterSplashAt(dim, hitX, hitY, hitZ)
+		}
+		s.RecordItemUsed(session, itemID, 1)
+		return true
+	default:
+		return false
+	}
+}
+
 
 

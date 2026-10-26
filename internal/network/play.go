@@ -1020,7 +1020,30 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case server.PlayUseItemSB:
 		if h.srv != nil && h.session != nil {
 			_ = h.srv.TryCollectDragonBreath(h.session)
-			if hand, err := pkt.Body().VarInt(); err == nil {
+			if hand, seq, _, _, err := server.DecodeUseItemPacket(pkt.Body()); err == nil {
+				invSlot := h.session.HeldInventorySlot()
+				if hand == server.HandOffHand {
+					invSlot = server.OffHandContainerSlot
+				}
+				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+				}
+				if _, handled := h.srv.UseEmptyBucketInAir(h.session, hand); handled {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if _, started := h.srv.StartUsingSpyglass(h.session, hand); started {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if h.srv.UsePlayerGoatHorn(h.session, hand) {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if h.srv.UseBeverageOrThrownPotion(h.session, hand) {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
 				_ = h.srv.UseProjectileItem(h.session, hand)
 			}
 			if err := h.srv.HandleUseItemPacket(h.session, pkt.Body()); err != nil {
@@ -1073,6 +1096,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 				h.session.SetBlockingWithShield(false)
 				if h.srv != nil {
 					h.srv.CancelEating(h.session)
+					h.srv.StopUsingSpyglass(h.session)
 					h.srv.DespawnPlayerFishingBobber(h.session)
 				}
 				h.session.ResetAttackCooldown()
@@ -1500,6 +1524,7 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 		}
 		if h.srv != nil {
 			h.srv.CancelEating(h.session)
+			h.srv.StopUsingSpyglass(h.session)
 			if h.srv.ReleaseProjectileWeapon(h.session) {
 				h.syncHotbarFromSession()
 			}
@@ -2037,7 +2062,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					return h.sendBlockChangedAck(seq)
 				}
 			case server.GoatHornItemID:
-				if h.srv.UseGoatHornItem(h.session, hand, "") {
+				if h.srv.UsePlayerGoatHorn(h.session, hand) {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
