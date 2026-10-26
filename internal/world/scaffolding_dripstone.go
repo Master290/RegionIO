@@ -590,7 +590,8 @@ func (c *Cache) TryDripFromPointedDripstoneAt(x, y, z int, res *BlockUpdateResul
 	hasWaterAbove := hasWaterFluid(aboveState) || isBlockNamed(aboveState, "minecraft:mud")
 	hasLavaAbove := isLavaBlock(aboveState)
 
-	// 1. Clay -> Mud conversion when water (or mud) sits above a clay ceiling block.
+	// 1. Clay -> Mud conversion when water (or mud) sits above a clay ceiling block,
+	// and Mud -> Clay drying when mud sits above a non-clay ceiling block (or is the ceiling block).
 	if isBlockNamed(rootState, "minecraft:clay") && hasWaterAbove {
 		if mudState, ok := nameToStateID("minecraft:mud", nil); ok {
 			if res != nil {
@@ -601,6 +602,33 @@ func (c *Cache) TryDripFromPointedDripstoneAt(x, y, z int, res *BlockUpdateResul
 				}
 			} else {
 				_, upd := c.ApplyBlockWithUpdates(x, rootY, z, mudState)
+				return len(upd.Changes) > 0
+			}
+		}
+	}
+	if isBlockNamed(aboveState, "minecraft:mud") {
+		if clayState, ok := nameToStateID("minecraft:clay", nil); ok {
+			if res != nil {
+				if c.setBlockRecorded(x, rootY+1, z, clayState, res) {
+					c.runNeighborSupportPass(x, rootY+1, z, res)
+					c.scheduleAround(x, rootY+1, z)
+					return true
+				}
+			} else {
+				_, upd := c.ApplyBlockWithUpdates(x, rootY+1, z, clayState)
+				return len(upd.Changes) > 0
+			}
+		}
+	} else if isBlockNamed(rootState, "minecraft:mud") && !hasWaterAbove {
+		if clayState, ok := nameToStateID("minecraft:clay", nil); ok {
+			if res != nil {
+				if c.setBlockRecorded(x, rootY, z, clayState, res) {
+					c.runNeighborSupportPass(x, rootY, z, res)
+					c.scheduleAround(x, rootY, z)
+					return true
+				}
+			} else {
+				_, upd := c.ApplyBlockWithUpdates(x, rootY, z, clayState)
 				return len(upd.Changes) > 0
 			}
 		}

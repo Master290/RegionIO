@@ -499,6 +499,22 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	if IsChorusPlantBlock(state) {
 		return c.ResolveChorusPlantStateAt(x, y, z)
 	}
+	if IsMultifaceGrowthBlock(state) && IsMultifaceGrowthBlock(existing) {
+		if merged, ok := MergeMultifaceStates(existing, state); ok {
+			state = merged
+		}
+	}
+	if info, ok := stateByID(state); ok {
+		if _, hasSnowy := info.Properties["snowy"]; hasSnowy && y+1 < c.maxY() {
+			wantSnowy := "false"
+			if isSnowBlockOrLayer(c.GetBlock(x, y+1, z)) {
+				wantSnowy = "true"
+			}
+			if updated, ok := withStateProperty(state, "snowy", wantSnowy); ok {
+				state = updated
+			}
+		}
+	}
 	return state
 }
 
@@ -916,6 +932,10 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		return c.EvaluateGlowLichenSupportAt(x, y, z, state)
 	}
 
+	if name == "minecraft:sculk_vein" || name == "minecraft:resin_clump" {
+		return c.EvaluateSculkVeinSupportAt(x, y, z, state)
+	}
+
 	if name == "minecraft:pale_hanging_moss" {
 		return c.EvaluatePaleHangingMossAt(x, y, z, state)
 	}
@@ -1243,6 +1263,9 @@ func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 	}
 	below := c.GetBlock(x, y-1, z)
 	if !isFreeToFallThrough(below) {
+		if IsBrushableBlock(state) {
+			c.DecayBrushableBlockAt(x, y, z, res)
+		}
 		return
 	}
 
@@ -1277,7 +1300,31 @@ func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 		s.mu.Lock()
 		s.fallDist[dstPos] = dist
 		s.mu.Unlock()
+		if IsBrushableBlock(state) {
+			if ch := c.chunkAt(int32(x>>4), int32(z>>4)); ch != nil {
+				ch.MoveStructureBlockEntity(x, y, z, x, y-1, z)
+			}
+		}
 	} else {
+		if IsBrushableBlock(state) {
+			// Vanilla BrushableBlock.onBrokenAfterFall (cancelDrop=true):
+			// falling suspicious_sand / suspicious_gravel shatters upon landing,
+			// leaving no block and dropping no item.
+			if ch := c.chunkAt(int32(x>>4), int32(z>>4)); ch != nil {
+				ch.RemoveStructureBlockEntity(x, y, z)
+				ch.RemoveStructureBlockEntity(x, y-1, z)
+			}
+			res.Landings = append(res.Landings, FallingBlockLanding{
+				Pos:          dstPos,
+				State:        state,
+				FallDistance: dist,
+			})
+			c.runNeighborSupportPass(x, y, z, res)
+			c.runNeighborSupportPass(x, y-1, z, res)
+			c.scheduleAround(x, y, z)
+			c.scheduleAround(x, y-1, z)
+			return
+		}
 		if IsAnvilBlockState(landedState) && hook != nil {
 			if nextState, handled := hook(c, dstPos, landedState, dist); handled {
 				landedState = nextState

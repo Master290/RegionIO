@@ -104,6 +104,8 @@ func IsRandomTickableBlock(state uint16) bool {
 		"minecraft:bamboo_sapling", "minecraft:bamboo",
 		"minecraft:kelp",
 		"minecraft:grass_block", "minecraft:mycelium",
+		"minecraft:crimson_nylium", "minecraft:warped_nylium",
+		"minecraft:vine", "minecraft:cave_vines", "minecraft:weeping_vines", "minecraft:twisting_vines",
 		"minecraft:azalea", "minecraft:flowering_azalea",
 		"minecraft:mangrove_propagule",
 		"minecraft:budding_amethyst":
@@ -337,6 +339,11 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 		c.randomTickKelp(x, y, z, state, info, rng, res)
 	case "minecraft:grass_block", "minecraft:mycelium":
 		c.randomTickSpreadingTurf(x, y, z, state, info, rng, res)
+	case "minecraft:crimson_nylium", "minecraft:warped_nylium":
+		c.RandomTickNyliumAt(x, y, z, res)
+	case "minecraft:vine", "minecraft:cave_vines", "minecraft:weeping_vines", "minecraft:twisting_vines":
+		_, upd := c.RandomTickVinesAndFloraAt(x, y, z, rng)
+		res.merge(upd)
 	case "minecraft:azalea", "minecraft:flowering_azalea", "minecraft:mangrove_propagule":
 		c.randomTickSapling(x, y, z, state, info, rng, res)
 	case "minecraft:pointed_dripstone":
@@ -1115,11 +1122,20 @@ func CanBoneMeal(state uint16) bool {
 		age, err := strconv.Atoi(info.Properties["age"])
 		return err == nil && age < 2
 	case "minecraft:grass_block",
+		"minecraft:moss_block", "minecraft:pale_moss_block",
+		"minecraft:crimson_nylium", "minecraft:warped_nylium", "minecraft:netherrack",
+		"minecraft:rooted_dirt",
+		"minecraft:crimson_fungus", "minecraft:warped_fungus",
+		"minecraft:glow_lichen", "minecraft:pale_hanging_moss",
+		"minecraft:weeping_vines", "minecraft:weeping_vines_plant",
+		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
 		"minecraft:azalea", "minecraft:flowering_azalea", "minecraft:mangrove_propagule",
 		"minecraft:bamboo_sapling", "minecraft:bamboo",
 		"minecraft:kelp", "minecraft:kelp_plant",
 		"minecraft:brown_mushroom", "minecraft:red_mushroom":
 		return true
+	case "minecraft:cave_vines", "minecraft:cave_vines_plant":
+		return !CaveVinesHasBerries(state)
 	}
 	return strings.HasSuffix(info.Name, "_sapling")
 }
@@ -1217,6 +1233,69 @@ func (c *Cache) ApplyBoneMeal(x, y, z int, rng *rand.Rand) (consumed bool, res B
 			c.growHugeMushroom(x, y, z, info.Name, rng, &res)
 		}
 		return true, res
+
+	case "minecraft:moss_block", "minecraft:pale_moss_block":
+		if !c.BoneMealMossBlockAt(x, y, z, info.Name, rng, &res) {
+			return false, res
+		}
+		return true, res
+
+	case "minecraft:crimson_nylium", "minecraft:warped_nylium":
+		if !c.BoneMealNyliumAt(x, y, z, info.Name, rng, &res) {
+			return false, res
+		}
+		return true, res
+
+	case "minecraft:netherrack":
+		if !c.BoneMealNetherrackAt(x, y, z, rng, &res) {
+			return false, res
+		}
+		return true, res
+
+	case "minecraft:rooted_dirt":
+		if !c.BoneMealRootedDirtAt(x, y, z, &res) {
+			return false, res
+		}
+		return true, res
+
+	case "minecraft:crimson_fungus":
+		if y <= c.minY() || !isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:crimson_nylium") {
+			return false, res
+		}
+		if rng.Float64() < 0.40 {
+			c.GrowHugeFungusAt(x, y, z, info.Name, rng, &res)
+		}
+		return true, res
+
+	case "minecraft:warped_fungus":
+		if y <= c.minY() || !isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:warped_nylium") {
+			return false, res
+		}
+		if rng.Float64() < 0.40 {
+			c.GrowHugeFungusAt(x, y, z, info.Name, rng, &res)
+		}
+		return true, res
+
+	case "minecraft:glow_lichen":
+		ok, upd := c.BoneMealGlowLichenAt(x, y, z)
+		res.merge(upd)
+		return ok, res
+
+	case "minecraft:cave_vines", "minecraft:cave_vines_plant":
+		_, upd, ok := c.BoneMealCaveVinesAt(x, y, z)
+		res.merge(upd)
+		return ok, res
+
+	case "minecraft:weeping_vines", "minecraft:weeping_vines_plant",
+		"minecraft:twisting_vines", "minecraft:twisting_vines_plant":
+		n, upd := c.BoneMealNetherVinesAt(x, y, z, 0, rng)
+		res.merge(upd)
+		return n > 0, res
+
+	case "minecraft:pale_hanging_moss":
+		ok, upd := c.BoneMealPaleHangingMossAt(x, y, z)
+		res.merge(upd)
+		return ok, res
 	}
 
 	if strings.HasSuffix(info.Name, "_sapling") {
