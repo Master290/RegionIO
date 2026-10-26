@@ -705,3 +705,51 @@ func TestCommandsBatch2(t *testing.T) {
 
 
 
+
+func TestCommandSuggestionsProtocol775(t *testing.T) {
+	srv, err := server.New(server.DefaultConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	alice, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{11}, Name: "Alice"}, func(int32, []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+
+	// 1. Completing command name "/gamem" -> ["gamemode"]
+	start, length, sugg := ComputeCommandSuggestions(srv, alice, "/gamem")
+	if start != 1 || length != 5 || len(sugg) != 1 || sugg[0] != "gamemode" {
+		t.Fatalf("ComputeCommandSuggestions('/gamem') = (%d, %d, %v), want (1, 5, ['gamemode'])", start, length, sugg)
+	}
+
+	// 2. Completing subcommand "/gamemode sp" -> ["spectator"]
+	start, length, sugg = ComputeCommandSuggestions(srv, alice, "/gamemode sp")
+	if start != 10 || length != 2 || len(sugg) != 1 || sugg[0] != "spectator" {
+		t.Fatalf("ComputeCommandSuggestions('/gamemode sp') = (%d, %d, %v), want (10, 2, ['spectator'])", start, length, sugg)
+	}
+
+	// 3. Completing gamerule "/gamerule keep" -> ["keepInventory"]
+	start, length, sugg = ComputeCommandSuggestions(srv, alice, "/gamerule keep")
+	if start != 10 || length != 4 || len(sugg) != 1 || sugg[0] != "keepInventory" {
+		t.Fatalf("ComputeCommandSuggestions('/gamerule keep') = (%d, %d, %v), want (10, 4, ['keepInventory'])", start, length, sugg)
+	}
+
+	// 4. Completing player name "/tp Al" -> ["Alice"]
+	start, length, sugg = ComputeCommandSuggestions(srv, alice, "/tp Al")
+	if start != 4 || length != 2 || len(sugg) != 1 || sugg[0] != "Alice" {
+		t.Fatalf("ComputeCommandSuggestions('/tp Al') = (%d, %d, %v), want (4, 2, ['Alice'])", start, length, sugg)
+	}
+
+	// 5. Round-trip packet encoding/decoding for ServerboundCommandSuggestionPacket (0x0f) & ClientboundCommandSuggestionsPacket (0x0f).
+	sb := EncodeCommandSuggestionSBPacket(42, "/gamemode ")
+	id, cmd, err := DecodeCommandSuggestionSBPacket(protocol.NewReader(sb))
+	if err != nil || id != 42 || cmd != "/gamemode " {
+		t.Fatalf("DecodeCommandSuggestionSBPacket = (%d, %q, %v)", id, cmd, err)
+	}
+	start, length, sugg = ComputeCommandSuggestions(srv, alice, cmd)
+	cb := EncodeCommandSuggestionsPacket(id, start, length, sugg)
+	gotID, gotStart, gotLen, gotSugg, err := DecodeCommandSuggestionsPacket(protocol.NewReader(cb))
+	if err != nil || gotID != 42 || gotStart != 10 || gotLen != 0 || len(gotSugg) != 4 {
+		t.Fatalf("DecodeCommandSuggestionsPacket = (%d, %d, %d, %v, %v)", gotID, gotStart, gotLen, gotSugg, err)
+	}
+}

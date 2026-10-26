@@ -252,12 +252,20 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 	banlistNode := greedyCmd("banlist")
 	transferNode := greedyCmd("transfer")
 	dataNode := greedyCmd("data")
+	opNode := greedyCmd("op")
+	deopNode := greedyCmd("deop")
+	whitelistNode := greedyCmd("whitelist")
+	spectateNode := greedyCmd("spectate")
+	defaultgamemodeNode := greedyCmd("defaultgamemode")
+	lootNode := greedyCmd("loot")
+	returnNode := greedyCmd("return")
 
 	nodes[rootIdx].Children = []int32{
 		tpNode,
 		teleportNode,
 		executeNode,
 		gamemodeNode,
+		defaultgamemodeNode,
 		timeNode,
 		weatherNode,
 		difficultyNode,
@@ -268,6 +276,7 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		listNode,
 		spawnpointNode,
 		setworldspawnNode,
+		spectateNode,
 		helpNode,
 		scoreboardNode,
 		teamNode,
@@ -287,6 +296,7 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		effectNode,
 		enchantNode,
 		itemNode,
+		lootNode,
 		recipeNode,
 		advancementNode,
 		setblockNode,
@@ -314,8 +324,12 @@ func DefaultCommandTree() (nodes []CommandNode, rootIndex int32) {
 		banIPNode,
 		pardonIPNode,
 		banlistNode,
+		opNode,
+		deopNode,
+		whitelistNode,
 		transferNode,
 		dataNode,
+		returnNode,
 	}
 	return nodes, rootIdx
 }
@@ -5001,4 +5015,244 @@ func execData(srv *server.Server, ctx CommandContext, args []string) string {
 	default:
 		return "Usage: /data (get|merge|remove|modify) (block|entity|storage) ..."
 	}
+}
+
+
+// EncodeCommandSuggestionSBPacket encodes ServerboundCommandSuggestionPacket (0x0f):
+// VarInt(id), String(command).
+func EncodeCommandSuggestionSBPacket(id int32, command string) []byte {
+	w := protocol.NewWriter(8 + len(command))
+	w.VarInt(id)
+	w.String(command)
+	return w.Bytes()
+}
+
+// DecodeCommandSuggestionSBPacket decodes ServerboundCommandSuggestionPacket (0x0f).
+func DecodeCommandSuggestionSBPacket(r *protocol.Reader) (id int32, command string, err error) {
+	id, err = r.VarInt()
+	if err != nil {
+		return 0, "", err
+	}
+	command, err = r.String()
+	if err != nil {
+		return 0, "", err
+	}
+	return id, command, nil
+}
+
+// EncodeCommandSuggestionsPacket encodes ClientboundCommandSuggestionsPacket (0x0f):
+// VarInt(id), VarInt(start), VarInt(length), VarInt(count), followed by (String text, Bool hasTooltip=false).
+func EncodeCommandSuggestionsPacket(id, start, length int32, suggestions []string) []byte {
+	w := protocol.NewWriter(16 + len(suggestions)*16)
+	w.VarInt(id)
+	w.VarInt(start)
+	w.VarInt(length)
+	w.VarInt(int32(len(suggestions)))
+	for _, s := range suggestions {
+		w.String(s)
+		w.Bool(false) // no tooltip
+	}
+	return w.Bytes()
+}
+
+// DecodeCommandSuggestionsPacket decodes ClientboundCommandSuggestionsPacket (0x0f).
+func DecodeCommandSuggestionsPacket(r *protocol.Reader) (id, start, length int32, suggestions []string, err error) {
+	id, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	start, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	length, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	count, err := r.VarInt()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	if count < 0 || count > 4096 {
+		return 0, 0, 0, nil, fmt.Errorf("command_suggestions: invalid count %d", count)
+	}
+	suggestions = make([]string, 0, count)
+	for i := int32(0); i < count; i++ {
+		text, err := r.String()
+		if err != nil {
+			return 0, 0, 0, nil, err
+		}
+		hasTooltip, err := r.Bool()
+		if err != nil {
+			return 0, 0, 0, nil, err
+		}
+		if hasTooltip {
+			return 0, 0, 0, nil, errors.New("command_suggestions: unexpected tooltip tag")
+		}
+		suggestions = append(suggestions, text)
+	}
+	return id, start, length, suggestions, nil
+}
+
+var allVanillaCommandNames = []string{
+	"advancement", "attribute", "ban", "ban-ip", "banlist", "bossbar",
+	"clear", "clone", "damage", "data", "defaultgamemode", "deop",
+	"difficulty", "effect", "enchant", "execute", "experience",
+	"fill", "fillbiome", "forceload", "gamemode", "gamerule", "give",
+	"help", "item", "kick", "kill", "list", "locate", "loot", "me",
+	"msg", "op", "pardon", "pardon-ip", "particle", "playsound",
+	"recipe", "return", "ride", "save-all", "say", "scoreboard",
+	"seed", "setblock", "setworldspawn", "spawnpoint", "spectate",
+	"spreadplayers", "stop", "stopsound", "summon", "tag", "team",
+	"teammsg", "teleport", "tell", "tellraw", "tick", "time", "title",
+	"tm", "tp", "transfer", "w", "weather", "whitelist", "worldborder", "xp",
+}
+
+// ComputeCommandSuggestions computes Brigadier tab-completion candidates for an
+// input command buffer (e.g. "/gamem", "/gamemode c", "/gamerule keep", "/tp A").
+func ComputeCommandSuggestions(srv *server.Server, sender *server.PlayerSession, input string) (start, length int32, suggestions []string) {
+	if len(input) > 32500 {
+		input = input[:32500]
+	}
+	hasSlash := strings.HasPrefix(input, "/")
+	raw := input
+	baseOffset := int32(0)
+	if hasSlash {
+		raw = input[1:]
+		baseOffset = 1
+	}
+
+	// Find last whitespace boundary to determine which token is being completed.
+	lastSpace := strings.LastIndexByte(raw, ' ')
+	if lastSpace < 0 {
+		// Completing the command name itself.
+		prefix := strings.ToLower(raw)
+		start = baseOffset
+		length = int32(len(raw))
+		for _, cmd := range allVanillaCommandNames {
+			if strings.HasPrefix(cmd, prefix) {
+				suggestions = append(suggestions, cmd)
+			}
+		}
+		return start, length, suggestions
+	}
+
+	cmdPart := strings.TrimSpace(raw[:lastSpace])
+	tokenPrefix := raw[lastSpace+1:]
+	start = baseOffset + int32(lastSpace+1)
+	length = int32(len(tokenPrefix))
+	lowerPrefix := strings.ToLower(tokenPrefix)
+
+	fields := strings.Fields(cmdPart)
+	if len(fields) == 0 {
+		return start, length, nil
+	}
+	cmdName := strings.ToLower(fields[0])
+	argIdx := len(fields) // 1 = first argument after command name
+
+	var candidates []string
+	onlinePlayers := func() []string {
+		var out []string
+		if srv != nil {
+			for _, snap := range srv.PlayerSnapshots() {
+				if snap.Profile.Name != "" {
+					out = append(out, snap.Profile.Name)
+				}
+			}
+		}
+		sort.Strings(out)
+		return append([]string{"@a", "@e", "@p", "@r", "@s"}, out...)
+	}
+
+	switch cmdName {
+	case "gamemode", "defaultgamemode":
+		if argIdx == 1 {
+			candidates = []string{"adventure", "creative", "spectator", "survival"}
+		} else if argIdx == 2 && cmdName == "gamemode" {
+			candidates = onlinePlayers()
+		}
+	case "difficulty":
+		if argIdx == 1 {
+			candidates = []string{"easy", "hard", "normal", "peaceful"}
+		}
+	case "weather":
+		if argIdx == 1 {
+			candidates = []string{"clear", "rain", "thunder"}
+		}
+	case "time":
+		if argIdx == 1 {
+			candidates = []string{"add", "query", "set"}
+		} else if argIdx == 2 {
+			switch strings.ToLower(fields[1]) {
+			case "set":
+				candidates = []string{"day", "midnight", "night", "noon"}
+			case "query":
+				candidates = []string{"day", "daytime", "gametime"}
+			}
+		}
+	case "gamerule":
+		if argIdx == 1 {
+			candidates = server.AllGameRuleNames()
+		} else if argIdx == 2 {
+			if def, ok := server.LookupGameRule(fields[1]); ok && def.Type == server.GameRuleTypeBool {
+				candidates = []string{"false", "true"}
+			}
+		}
+	case "whitelist":
+		if argIdx == 1 {
+			candidates = []string{"add", "list", "off", "on", "reload", "remove"}
+		} else if argIdx == 2 && (fields[1] == "add" || fields[1] == "remove") {
+			candidates = onlinePlayers()
+		}
+	case "tp", "teleport", "kill", "op", "deop", "kick", "ban", "spawnpoint", "spectate", "msg", "tell", "w", "give", "clear", "effect", "enchant":
+		if argIdx == 1 {
+			candidates = onlinePlayers()
+		}
+	case "help":
+		if argIdx == 1 {
+			candidates = allVanillaCommandNames
+		}
+	case "save-all":
+		if argIdx == 1 {
+			candidates = []string{"flush"}
+		}
+	case "list":
+		if argIdx == 1 {
+			candidates = []string{"uuids"}
+		}
+	case "tick":
+		if argIdx == 1 {
+			candidates = []string{"freeze", "query", "rate", "sprint", "step", "unfreeze"}
+		}
+	case "forceload":
+		if argIdx == 1 {
+			candidates = []string{"add", "query", "remove"}
+		}
+	case "locate":
+		if argIdx == 1 {
+			candidates = []string{"biome", "poi", "structure"}
+		}
+	case "data":
+		if argIdx == 1 {
+			candidates = []string{"get", "merge", "modify", "remove"}
+		} else if argIdx == 2 {
+			candidates = []string{"block", "entity", "storage"}
+		}
+	}
+
+	for _, c := range candidates {
+		if strings.HasPrefix(strings.ToLower(c), lowerPrefix) {
+			suggestions = append(suggestions, c)
+		}
+	}
+	return start, length, suggestions
+}
+
+func (h *handler) handleCommandSuggestion(pkt protocol.Packet) error {
+	id, cmd, err := DecodeCommandSuggestionSBPacket(pkt.Body())
+	if err != nil {
+		return err
+	}
+	start, length, suggestions := ComputeCommandSuggestions(h.srv, h.session, cmd)
+	return h.conn.Send(protocol.PlayCommandSuggestions, EncodeCommandSuggestionsPacket(id, start, length, suggestions))
 }

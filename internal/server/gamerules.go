@@ -1064,3 +1064,242 @@ func (s *Server) CanSkipNightWithSleepingPlayers(sleepingCount, eligibleCount in
 	}
 	return sleepingCount >= required
 }
+
+// DecodeAnimatePacket decodes ClientboundAnimatePacket (0x02).
+func DecodeAnimatePacket(r *protocol.Reader) (entityID int32, action byte, err error) {
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, err
+	}
+	action, err = r.ReadByte()
+	if err != nil {
+		return 0, 0, err
+	}
+	return entityID, action, nil
+}
+
+// EncodeSwingSBPacket encodes ServerboundSwingPacket (0x3f): VarInt(hand) where 0=main, 1=off.
+func EncodeSwingSBPacket(hand int32) []byte {
+	w := protocol.NewWriter(2)
+	w.VarInt(hand)
+	return w.Bytes()
+}
+
+// DecodeSwingSBPacket decodes ServerboundSwingPacket (0x3f).
+func DecodeSwingSBPacket(r *protocol.Reader) (int32, error) {
+	return r.VarInt()
+}
+
+// HandlePlayerSwingPacket processes ServerboundSwingPacket (0x3f): resets the
+// player's attack cooldown and broadcasts ClientboundAnimatePacket (0x02) to
+// nearby viewers in the same dimension.
+func (s *Server) HandlePlayerSwingPacket(session *PlayerSession, r *protocol.Reader) error {
+	hand, err := DecodeSwingSBPacket(r)
+	if err != nil {
+		return err
+	}
+	if session == nil {
+		return nil
+	}
+	session.ResetAttackCooldown()
+	if s == nil {
+		return nil
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return nil
+	}
+	action := AnimateSwingMainHand
+	if hand == 1 {
+		action = AnimateSwingOffHand
+	}
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunkExcept(
+		world.NormalizeDimension(snap.Dimension),
+		cx, cz,
+		session.Profile.UUID,
+		protocol.PlayAnimate,
+		EncodeAnimatePacket(session.EntityID, action),
+	)
+	return nil
+}
+
+// EncodePingRequestSBPacket encodes ServerboundPingRequestPacket (0x26): Int64(time).
+func EncodePingRequestSBPacket(timePayload int64) []byte {
+	w := protocol.NewWriter(8)
+	w.Int64(timePayload)
+	return w.Bytes()
+}
+
+// DecodePingRequestSBPacket decodes ServerboundPingRequestPacket (0x26).
+func DecodePingRequestSBPacket(r *protocol.Reader) (int64, error) {
+	return r.Int64()
+}
+
+// EncodePongResponsePacket encodes ClientboundPongResponsePacket (0x3e): Int64(time).
+func EncodePongResponsePacket(timePayload int64) []byte {
+	w := protocol.NewWriter(8)
+	w.Int64(timePayload)
+	return w.Bytes()
+}
+
+// DecodePongResponsePacket decodes ClientboundPongResponsePacket (0x3e).
+func DecodePongResponsePacket(r *protocol.Reader) (int64, error) {
+	return r.Int64()
+}
+
+// HandlePingRequestPacket processes ServerboundPingRequestPacket (0x26) in Play
+// state and replies immediately with ClientboundPongResponsePacket (0x3e).
+func (s *Server) HandlePingRequestPacket(session *PlayerSession, r *protocol.Reader) error {
+	payload, err := DecodePingRequestSBPacket(r)
+	if err != nil {
+		return err
+	}
+	if session != nil && session.send != nil {
+		return session.send(protocol.PlayPongResponse, EncodePongResponsePacket(payload))
+	}
+	return nil
+}
+
+// EncodeChangeGameModeSBPacket encodes ServerboundChangeGameModePacket (0x05): VarInt(mode).
+func EncodeChangeGameModeSBPacket(mode uint8) []byte {
+	w := protocol.NewWriter(2)
+	w.VarInt(int32(mode))
+	return w.Bytes()
+}
+
+// DecodeChangeGameModeSBPacket decodes ServerboundChangeGameModePacket (0x05).
+func DecodeChangeGameModeSBPacket(r *protocol.Reader) (uint8, error) {
+	mode, err := r.VarInt()
+	if err != nil {
+		return 0, err
+	}
+	if mode < 0 || mode > int32(GameModeSpectator) {
+		return 0, fmt.Errorf("gamemode: invalid mode %d", mode)
+	}
+	return uint8(mode), nil
+}
+
+// HandleChangeGameModePacket processes ServerboundChangeGameModePacket (0x05,
+// F3+F4 game mode switcher in 26.1.2) for operators.
+func (s *Server) HandleChangeGameModePacket(session *PlayerSession, r *protocol.Reader) error {
+	mode, err := DecodeChangeGameModeSBPacket(r)
+	if err != nil {
+		return err
+	}
+	if s == nil || session == nil || !s.HasAdminPermission(session) {
+		return nil
+	}
+	s.SetPlayerGameMode(session, mode)
+	return nil
+}
+
+// EncodeSetGameRuleSBPacket encodes ServerboundSetGameRulePacket (0x39):
+// VarInt(count), followed by (ResourceKey<GameRule>, String value) entries.
+func EncodeSetGameRuleSBPacket(entries map[string]string) []byte {
+	keys := make([]string, 0, len(entries))
+	for k := range entries {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	w := protocol.NewWriter(32 * (len(keys) + 1))
+	w.VarInt(int32(len(keys)))
+	for _, k := range keys {
+		rk := k
+		if !strings.Contains(rk, ":") {
+			rk = "minecraft:" + rk
+		}
+		w.String(rk)
+		w.String(entries[k])
+	}
+	return w.Bytes()
+}
+
+// DecodeSetGameRuleSBPacket decodes ServerboundSetGameRulePacket (0x39).
+func DecodeSetGameRuleSBPacket(r *protocol.Reader) (map[string]string, error) {
+	count, err := r.VarInt()
+	if err != nil {
+		return nil, err
+	}
+	if count < 0 || count > 256 {
+		return nil, fmt.Errorf("gamerules: invalid entry count %d", count)
+	}
+	out := make(map[string]string, count)
+	for i := int32(0); i < count; i++ {
+		key, err := r.String()
+		if err != nil {
+			return nil, err
+		}
+		val, err := r.String()
+		if err != nil {
+			return nil, err
+		}
+		out[key] = val
+	}
+	return out, nil
+}
+
+// EncodeGameRuleValuesPacket encodes ClientboundGameRuleValuesPacket (0x27):
+// VarInt(count), followed by (ResourceKey<GameRule>, String value) entries.
+func EncodeGameRuleValuesPacket(values map[string]string) []byte {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	w := protocol.NewWriter(32 * (len(keys) + 1))
+	w.VarInt(int32(len(keys)))
+	for _, k := range keys {
+		rk := k
+		if !strings.Contains(rk, ":") {
+			rk = "minecraft:" + rk
+		}
+		w.String(rk)
+		w.String(values[k])
+	}
+	return w.Bytes()
+}
+
+// DecodeGameRuleValuesPacket decodes ClientboundGameRuleValuesPacket (0x27).
+func DecodeGameRuleValuesPacket(r *protocol.Reader) (map[string]string, error) {
+	return DecodeSetGameRuleSBPacket(r)
+}
+
+// HandleSetGameRulePacket processes ServerboundSetGameRulePacket (0x39) for
+// operators, applying valid rule changes and broadcasting ClientboundGameRuleValuesPacket (0x27).
+func (s *Server) HandleSetGameRulePacket(session *PlayerSession, r *protocol.Reader) error {
+	entries, err := DecodeSetGameRuleSBPacket(r)
+	if err != nil {
+		return err
+	}
+	if s == nil || !s.HasAdminPermission(session) || len(entries) == 0 {
+		return nil
+	}
+	applied := make(map[string]string, len(entries))
+	for k, v := range entries {
+		canon, formatted, err := s.SetGameRuleFromString(k, v)
+		if err == nil {
+			applied["minecraft:"+canon] = formatted
+		}
+	}
+	if len(applied) > 0 && s.players != nil {
+		s.Broadcast(protocol.PlayGameRuleValues, EncodeGameRuleValuesPacket(applied))
+	}
+	return nil
+}
+
+
+// HandleSpectateEntityPacket processes ServerboundSpectateEntityPacket (0x3e):
+// VarInt(entityID), attaching a Spectator player's camera to targetEntityID.
+func (s *Server) HandleSpectateEntityPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	targetEntityID, err := r.VarInt()
+	if err != nil {
+		return err
+	}
+	s.SetSpectatorCamera(session, targetEntityID)
+	return nil
+}

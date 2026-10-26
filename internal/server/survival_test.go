@@ -1016,3 +1016,133 @@ func TestServerPersistenceHooksAndFurnaceCustomName(t *testing.T) {
 
 
 
+
+func TestProtocol775ServerboundHandlers_SwingPingChangeGameModeSetGameRuleSpectateEntity(t *testing.T) {
+	srv, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	type pktRec struct {
+		id   int32
+		body []byte
+	}
+	var p1Sent, p2Sent []pktRec
+	p1, err := srv.RegisterPlayer(Profile{UUID: [16]byte{51}, Name: "Alice"}, func(id int32, body []byte) error {
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		p1Sent = append(p1Sent, pktRec{id: id, body: cp})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer p1: %v", err)
+	}
+	p2, err := srv.RegisterPlayer(Profile{UUID: [16]byte{52}, Name: "Bob"}, func(id int32, body []byte) error {
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		p2Sent = append(p2Sent, pktRec{id: id, body: cp})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer p2: %v", err)
+	}
+	srv.SetPlayerTransform(p1, 0.5, 64.0, 0.5, 0, 0, true)
+	srv.SetPlayerTransform(p2, 2.5, 64.0, 0.5, 0, 0, true)
+
+	// 1. ServerboundPingRequestPacket (0x26) -> ClientboundPongResponsePacket (0x3e).
+	p1Sent = nil
+	if err := srv.HandlePingRequestPacket(p1, protocol.NewReader(EncodePingRequestSBPacket(123456789))); err != nil {
+		t.Fatalf("HandlePingRequestPacket: %v", err)
+	}
+	var gotPong int64
+	for _, pkt := range p1Sent {
+		if pkt.id == protocol.PlayPongResponse {
+			val, err := DecodePongResponsePacket(protocol.NewReader(pkt.body))
+			if err != nil {
+				t.Fatalf("DecodePongResponsePacket: %v", err)
+			}
+			gotPong = val
+		}
+	}
+	if gotPong != 123456789 {
+		t.Fatalf("expected PongResponse payload 123456789, got %d", gotPong)
+	}
+
+	// 2. ServerboundSwingPacket (0x3f) -> broadcasts ClientboundAnimatePacket (0x02) to nearby viewer p2 (not p1).
+	p1Sent = nil
+	p2Sent = nil
+	if err := srv.HandlePlayerSwingPacket(p1, protocol.NewReader(EncodeSwingSBPacket(1))); err != nil {
+		t.Fatalf("HandlePlayerSwingPacket: %v", err)
+	}
+	var p2GotAnim bool
+	for _, pkt := range p2Sent {
+		if pkt.id == protocol.PlayAnimate {
+			eid, act, err := DecodeAnimatePacket(protocol.NewReader(pkt.body))
+			if err != nil {
+				t.Fatalf("DecodeAnimatePacket: %v", err)
+			}
+			if eid == p1.EntityID && act == AnimateSwingOffHand {
+				p2GotAnim = true
+			}
+		}
+	}
+	if !p2GotAnim {
+		t.Fatalf("expected nearby player p2 to receive PlayAnimate (0x02) with offhand swing (action=3)")
+	}
+
+	// 3. ServerboundChangeGameModePacket (0x05, F3+F4 switcher) -> switches op's game mode.
+	if err := srv.HandleChangeGameModePacket(p1, protocol.NewReader(EncodeChangeGameModeSBPacket(GameModeSpectator))); err != nil {
+		t.Fatalf("HandleChangeGameModePacket: %v", err)
+	}
+	if p1.Snapshot().GameMode != GameModeSpectator {
+		t.Fatalf("expected p1 GameModeSpectator after F3+F4 packet, got %d", p1.Snapshot().GameMode)
+	}
+
+	// 4. ServerboundSpectateEntityPacket (0x3e) -> attaches spectator camera to p2.EntityID and sends PlaySetCamera (0x5d).
+	p1Sent = nil
+	specW := protocol.NewWriter(4)
+	specW.VarInt(p2.EntityID)
+	if err := srv.HandleSpectateEntityPacket(p1, protocol.NewReader(specW.Bytes())); err != nil {
+		t.Fatalf("HandleSpectateEntityPacket: %v", err)
+	}
+	if p1.CameraEntityID() != p2.EntityID {
+		t.Fatalf("expected CameraEntityID=%d, got %d", p2.EntityID, p1.CameraEntityID())
+	}
+	var sawCamera bool
+	for _, pkt := range p1Sent {
+		if pkt.id == protocol.PlaySetCamera {
+			cid, err := protocol.NewReader(pkt.body).VarInt()
+			if err == nil && cid == p2.EntityID {
+				sawCamera = true
+			}
+		}
+	}
+	if !sawCamera {
+		t.Fatalf("expected PlaySetCamera (0x5d) for targetEntityID=%d", p2.EntityID)
+	}
+
+	// 5. ServerboundSetGameRulePacket (0x39) -> updates game rules and broadcasts ClientboundGameRuleValuesPacket (0x27).
+	p1Sent = nil
+	if err := srv.HandleSetGameRulePacket(p1, protocol.NewReader(EncodeSetGameRuleSBPacket(map[string]string{
+		"minecraft:keep_inventory": "true",
+		"randomTickSpeed":          "7",
+	}))); err != nil {
+		t.Fatalf("HandleSetGameRulePacket: %v", err)
+	}
+	if !srv.KeepInventory() || srv.GameRuleInt("randomTickSpeed") != 7 {
+		t.Fatalf("expected keepInventory=true and randomTickSpeed=7, got %v / %d", srv.KeepInventory(), srv.GameRuleInt("randomTickSpeed"))
+	}
+	var gotRules map[string]string
+	for _, pkt := range p1Sent {
+		if pkt.id == protocol.PlayGameRuleValues {
+			var err error
+			gotRules, err = DecodeGameRuleValuesPacket(protocol.NewReader(pkt.body))
+			if err != nil {
+				t.Fatalf("DecodeGameRuleValuesPacket: %v", err)
+			}
+		}
+	}
+	if gotRules["minecraft:keepInventory"] != "true" || gotRules["minecraft:randomTickSpeed"] != "7" {
+		t.Fatalf("unexpected GameRuleValues broadcast: %+v", gotRules)
+	}
+}

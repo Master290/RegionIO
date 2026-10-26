@@ -1099,7 +1099,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
-	case protocol.PlaySignUpdate:
+	case protocol.PlaySignUpdate, 0x3c:
 		if h.srv != nil && h.session != nil {
 			return h.srv.HandleSignUpdatePacket(h.session, pkt.Body())
 		}
@@ -1266,10 +1266,55 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlaySpectateEntitySB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleSpectateEntityPacket(h.session, pkt.Body())
+		}
+		return nil
+
 	case protocol.PlayTeleportToEntitySB:
 		if h.srv != nil && h.session != nil {
 			return h.srv.HandleTeleportToEntityPacket(h.session, pkt.Body())
 		}
+		return nil
+
+	case protocol.PlayCommandSuggestionSB:
+		return h.handleCommandSuggestion(pkt)
+
+	case protocol.PlayPingRequestSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandlePingRequestPacket(h.session, pkt.Body())
+		}
+		payload, err := server.DecodePingRequestSBPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		return h.conn.Send(protocol.PlayPongResponse, server.EncodePongResponsePacket(payload))
+
+	case protocol.PlaySwingSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandlePlayerSwingPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayChangeGameModeSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleChangeGameModePacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlaySetGameRuleSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleSetGameRulePacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayClientTickEnd, protocol.PlayChunkBatchReceivedSB,
+		protocol.PlayPongSB, protocol.PlayChatAckSB, protocol.PlayChatSessionUpdateSB,
+		protocol.PlayConfigurationAcknowledged, protocol.PlayCookieResponseSB,
+		protocol.PlayCustomPayload, protocol.PlayDebugSubscriptionRequestSB,
+		protocol.PlayResourcePackSB, protocol.PlayCustomClickActionSB,
+		protocol.PlayBundleItemSelectedSB:
 		return nil
 
 	default:
