@@ -59,6 +59,10 @@ func (h *handler) beginPlay() error {
 	}
 
 	h.srv.SetPlayerViewDistance(session, h.visibilityRadius())
+	if rawInfo, ok := pendingHandlerClientInfo.LoadAndDelete(h); ok {
+		info := rawInfo.(server.ClientInformationState)
+		h.srv.SetPlayerClientInformation(session, info, false)
+	}
 	snap := session.Snapshot()
 	startCX := int32(int64(math.Floor(snap.X)) >> 4)
 	startCZ := int32(int64(math.Floor(snap.Z)) >> 4)
@@ -67,6 +71,7 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	h.srv.SendDifficultyToPlayer(session)
+	_ = h.conn.Send(protocol.PlayServerData, server.EncodeServerDataPacket(h.srv.Config().MOTD, nil))
 	if h.srv.ReducedDebugInfo() {
 		_ = h.conn.Send(protocol.PlayEntityEvent, server.EncodeEntityEventPacket(session.EntityID, server.EntityEventReducedDebugInfo))
 	}
@@ -80,6 +85,11 @@ func (h *handler) beginPlay() error {
 	}
 	if err := h.sendChunkCacheCenter(startCX, startCZ); err != nil {
 		return err
+	}
+	_ = h.conn.Send(protocol.PlayChunkCacheRadius, server.EncodeSetChunkCacheRadiusPacket(int32(h.visibilityRadius())))
+	_ = h.conn.Send(protocol.PlaySetSimulationDistance, server.EncodeSetSimulationDistancePacket(int32(h.visibilityRadius())))
+	if cInfo := h.srv.PlayerClientInformation(session); cInfo.MainHand != server.PlayerMainHandRight || cInfo.ModelCustomisation != server.DefaultPlayerSkinParts {
+		_ = h.conn.Send(protocol.PlaySetEntityData, server.EncodePlayerAvatarEntityDataPacket(session.EntityID, cInfo.MainHand, cInfo.ModelCustomisation))
 	}
 	if err := h.sendDefaultSpawnPosition(); err != nil {
 		return err
@@ -728,10 +738,25 @@ func (h *handler) syncVisibleEntities() error {
 					}
 				}
 			}
+			if entity.TypeName == "minecraft:player" && h.srv != nil {
+				if metaPkt := h.srv.PlayerAvatarEntityDataPacketByEntityID(entity.ID); len(metaPkt) > 0 {
+					_, mh, sp, decErr := server.DecodePlayerAvatarEntityDataPacket(protocol.NewReader(metaPkt))
+					if decErr == nil && (mh != server.PlayerMainHandRight || sp != server.DefaultPlayerSkinParts) {
+						if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+							return err
+						}
+					}
+				}
+			}
 		} else if known != current {
 			entity := current.entity
 			if err := h.sendEntityTeleportState(&entity, current.onGround); err != nil {
 				return err
+			}
+			if byte(known.entity.HeadYaw*256.0/360.0) != byte(entity.HeadYaw*256.0/360.0) {
+				if err := h.conn.Send(protocol.PlayRotateHead, server.EncodeRotateHeadPacket(entity.ID, entity.HeadYaw)); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -1309,12 +1334,30 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayClientInformation:
+		return h.handleClientInformation(pkt)
+
+	case protocol.PlayBlockEntityTagQuerySB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleBlockEntityTagQueryPacket(h.session, pkt.Body())
+		}
+		return nil
+
+	case protocol.PlayEntityTagQuerySB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleEntityTagQueryPacket(h.session, pkt.Body())
+		}
+		return nil
+
 	case protocol.PlayClientTickEnd, protocol.PlayChunkBatchReceivedSB,
 		protocol.PlayPongSB, protocol.PlayChatAckSB, protocol.PlayChatSessionUpdateSB,
 		protocol.PlayConfigurationAcknowledged, protocol.PlayCookieResponseSB,
 		protocol.PlayCustomPayload, protocol.PlayDebugSubscriptionRequestSB,
 		protocol.PlayResourcePackSB, protocol.PlayCustomClickActionSB,
-		protocol.PlayBundleItemSelectedSB:
+		protocol.PlayBundleItemSelectedSB, protocol.PlayJigsawGenerateSB,
+		protocol.PlaySetCommandBlockSB, protocol.PlaySetCommandMinecartSB,
+		protocol.PlaySetJigsawBlockSB, protocol.PlaySetStructureBlockSB,
+		protocol.PlayTestInstanceBlockActionSB:
 		return nil
 
 	default:

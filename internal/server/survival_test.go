@@ -4,6 +4,7 @@ import (
 	"sync"
 	"testing"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
@@ -1144,5 +1145,158 @@ func TestProtocol775ServerboundHandlers_SwingPingChangeGameModeSetGameRuleSpecta
 	}
 	if gotRules["minecraft:keepInventory"] != "true" || gotRules["minecraft:randomTickSpeed"] != "7" {
 		t.Fatalf("unexpected GameRuleValues broadcast: %+v", gotRules)
+	}
+}
+
+func TestProtocol775ClientInfoAvatarDataRotateHeadAndTagQueries(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxViewDistance = 10
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	type pktRec struct {
+		id   int32
+		body []byte
+	}
+	var p1Sent, p2Sent []pktRec
+	p1, err := srv.RegisterPlayer(Profile{UUID: [16]byte{61}, Name: "Alice"}, func(id int32, body []byte) error {
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		p1Sent = append(p1Sent, pktRec{id: id, body: cp})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer p1: %v", err)
+	}
+	p2, err := srv.RegisterPlayer(Profile{UUID: [16]byte{62}, Name: "Bob"}, func(id int32, body []byte) error {
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		p2Sent = append(p2Sent, pktRec{id: id, body: cp})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer p2: %v", err)
+	}
+	srv.SetPlayerTransform(p1, 0.5, 64.0, 0.5, 0, 0, true)
+	srv.SetPlayerTransform(p2, 2.5, 64.0, 0.5, 0, 0, true)
+
+	// 1. ClientInformation round-trip & Play-state application (skin parts + left hand + chunk cache radius).
+	wantInfo := ClientInformationState{
+		Language:             "ru_ru",
+		ViewDistance:         6,
+		ChatVisibility:       1,
+		ChatColors:           true,
+		ModelCustomisation:   0x55,
+		MainHand:             PlayerMainHandLeft,
+		TextFilteringEnabled: true,
+		AllowsListing:        false,
+		ParticleStatus:       2,
+	}
+	rawInfo := EncodeClientInformationPacket(wantInfo)
+	gotInfo, err := DecodeClientInformationPacket(protocol.NewReader(rawInfo))
+	if err != nil {
+		t.Fatalf("DecodeClientInformationPacket: %v", err)
+	}
+	if gotInfo != wantInfo {
+		t.Fatalf("DecodeClientInformationPacket = %+v, want %+v", gotInfo, wantInfo)
+	}
+
+	p1Sent = nil
+	p2Sent = nil
+	vd := srv.SetPlayerClientInformation(p1, gotInfo, true)
+	if vd != 6 {
+		t.Fatalf("SetPlayerClientInformation viewDistance = %d, want 6", vd)
+	}
+	var sawRadius bool
+	for _, pkt := range p1Sent {
+		if pkt.id == protocol.PlayChunkCacheRadius {
+			r, err := DecodeSetChunkCacheRadiusPacket(protocol.NewReader(pkt.body))
+			if err == nil && r == 6 {
+				sawRadius = true
+			}
+		}
+	}
+	if !sawRadius {
+		t.Fatalf("expected p1 to receive PlayChunkCacheRadius (0x5f) with radius=6")
+	}
+	var sawAvatarMeta bool
+	for _, pkt := range p2Sent {
+		if pkt.id == protocol.PlaySetEntityData {
+			eid, mh, sp, err := DecodePlayerAvatarEntityDataPacket(protocol.NewReader(pkt.body))
+			if err == nil && eid == p1.EntityID && mh == PlayerMainHandLeft && sp == 0x55 {
+				sawAvatarMeta = true
+			}
+		}
+	}
+	if !sawAvatarMeta {
+		t.Fatalf("expected nearby player p2 to receive Avatar SynchedEntityData (mainHand=Left, skinParts=0x55)")
+	}
+
+	// 2. RotateHead (0x53) & SimulationDistance (0x6f) & ServerData (0x56) codecs.
+	rhPkt := EncodeRotateHeadPacket(p1.EntityID, 90.0)
+	rhID, rhAngle, err := DecodeRotateHeadPacket(protocol.NewReader(rhPkt))
+	if err != nil || rhID != p1.EntityID || rhAngle != 64 {
+		t.Fatalf("DecodeRotateHeadPacket = (%d, %d, %v), want (%d, 64, nil)", rhID, rhAngle, err, p1.EntityID)
+	}
+	simPkt := EncodeSetSimulationDistancePacket(8)
+	if simDist, err := DecodeSetSimulationDistancePacket(protocol.NewReader(simPkt)); err != nil || simDist != 8 {
+		t.Fatalf("DecodeSetSimulationDistancePacket = (%d, %v), want (8, nil)", simDist, err)
+	}
+	if sd := EncodeServerDataPacket("RegionIO 26.1.2", []byte{1, 2, 3}); len(sd) == 0 {
+		t.Fatalf("expected non-empty ServerData packet")
+	}
+
+	// 3. F3+I Block Entity Tag Query (0x02) -> ClientboundTagQueryPacket (0x7b).
+	hopperSt, _ := world.BlockStateByName("minecraft:hopper", map[string]string{"enabled": "true", "facing": "down"})
+	cache.SetBlock(4, 64, 4, hopperSt)
+	srv.SetHopperCustomName(world.DimensionOverworld, 4, 64, 4, "TagQueryHopper")
+	p1Sent = nil
+	if err := srv.HandleBlockEntityTagQueryPacket(p1, protocol.NewReader(EncodeBlockEntityTagQuerySBPacket(77, 4, 64, 4))); err != nil {
+		t.Fatalf("HandleBlockEntityTagQueryPacket: %v", err)
+	}
+	var gotBlockTag *nbt.Compound
+	for _, pkt := range p1Sent {
+		if pkt.id == protocol.PlayTagQuery {
+			tx, comp, err := DecodeTagQueryPacket(protocol.NewReader(pkt.body))
+			if err != nil {
+				t.Fatalf("DecodeTagQueryPacket(block): %v", err)
+			}
+			if tx == 77 {
+				gotBlockTag = comp
+			}
+		}
+	}
+	if gotBlockTag == nil {
+		t.Fatalf("expected PlayTagQuery (0x7b) response for block entity query")
+	}
+	if cn, ok := gotBlockTag.Get("CustomName"); !ok || cn != nbt.String("TagQueryHopper") {
+		t.Fatalf("expected CustomName='TagQueryHopper' in block tag query, got %v", cn)
+	}
+
+	// 4. F3+I Entity Tag Query (0x19) -> ClientboundTagQueryPacket (0x7b).
+	p1Sent = nil
+	if err := srv.HandleEntityTagQueryPacket(p1, protocol.NewReader(EncodeEntityTagQuerySBPacket(88, p2.EntityID))); err != nil {
+		t.Fatalf("HandleEntityTagQueryPacket: %v", err)
+	}
+	var gotEntTag *nbt.Compound
+	for _, pkt := range p1Sent {
+		if pkt.id == protocol.PlayTagQuery {
+			tx, comp, err := DecodeTagQueryPacket(protocol.NewReader(pkt.body))
+			if err != nil {
+				t.Fatalf("DecodeTagQueryPacket(entity): %v", err)
+			}
+			if tx == 88 {
+				gotEntTag = comp
+			}
+		}
+	}
+	if gotEntTag == nil {
+		t.Fatalf("expected PlayTagQuery (0x7b) response for entity query")
+	}
+	if idTag, ok := gotEntTag.Get("id"); !ok || idTag != nbt.String("minecraft:player") {
+		t.Fatalf("expected id='minecraft:player' in entity tag query, got %v", idTag)
 	}
 }

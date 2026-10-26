@@ -2,11 +2,14 @@ package network
 
 import (
 	"errors"
+	"sync"
 
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
 	"regionio/internal/server"
 )
+
+var pendingHandlerClientInfo sync.Map // map[*handler]server.ClientInformationState
 
 // beginConfiguration is called on entering the configuration phase. It mirrors
 // the vanilla opening sequence: server brand, enabled feature flags, then the
@@ -57,7 +60,8 @@ func (h *handler) handleConfiguration(pkt protocol.Packet) error {
 		return h.handleKnownPacks(pkt)
 
 	case protocol.ConfigKeepAliveServer, protocol.ConfigPong,
-		protocol.ConfigResourcePackResp, protocol.ConfigCookieResponse:
+		protocol.ConfigResourcePackResp, protocol.ConfigCookieResponse,
+		protocol.ConfigCustomClickAction, protocol.ConfigAcceptCodeOfConduct:
 		h.log.Debug("configuration packet ignored", "id", pkt.ID)
 		return nil
 
@@ -75,26 +79,7 @@ func (h *handler) handleConfiguration(pkt protocol.Packet) error {
 // handleClientInformation records the client's settings (no longer the trigger
 // to finish configuration; that is now driven by known-packs negotiation).
 func (h *handler) handleClientInformation(pkt protocol.Packet) error {
-	r := pkt.Body()
-	locale, err := r.String()
-	if err != nil {
-		return err
-	}
-	vd, err := r.ReadByte()
-	if err != nil {
-		return err
-	}
-	chatMode, err := r.VarInt()
-	if err != nil {
-		return err
-	}
-	if _, err := r.Bool(); err != nil { // chat colors
-		return err
-	}
-	if _, err := r.ReadByte(); err != nil { // displayed skin parts
-		return err
-	}
-	mainHand, err := r.VarInt()
+	info, err := server.DecodeClientInformationPacket(pkt.Body())
 	if err != nil {
 		return err
 	}
@@ -102,18 +87,26 @@ func (h *handler) handleClientInformation(pkt protocol.Packet) error {
 	// view_distance drives the chunk streamer radius. The server owns the upper
 	// bound because accepting the client's render distance can multiply cold
 	// generation work into hundreds of chunks.
-	vdInt := int(int8(vd))
+	vdInt := info.ViewDistance
 	if vdInt < 2 {
 		vdInt = 2
 	}
-	if max := h.srv.Config().MaxViewDistance; vdInt > max {
-		vdInt = max
+	if h.srv != nil {
+		if max := h.srv.Config().MaxViewDistance; max > 0 && vdInt > max {
+			vdInt = max
+		}
 	}
+	info.ViewDistance = vdInt
 	h.viewDistance = vdInt
+	pendingHandlerClientInfo.Store(h, info)
+	if h.srv != nil && h.session != nil {
+		h.srv.SetPlayerClientInformation(h.session, info, h.conn != nil && h.conn.State() == protocol.StatePlay)
+	}
 
 	h.log.Info("client information",
-		"locale", locale, "view_distance", vdInt,
-		"chat_mode", chatMode, "main_hand", mainHand)
+		"locale", info.Language, "view_distance", vdInt,
+		"chat_mode", info.ChatVisibility, "main_hand", info.MainHand,
+		"skin_parts", info.ModelCustomisation)
 	return nil
 }
 

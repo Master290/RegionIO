@@ -1303,3 +1303,475 @@ func (s *Server) HandleSpectateEntityPacket(session *PlayerSession, r *protocol.
 	s.SetSpectatorCamera(session, targetEntityID)
 	return nil
 }
+
+// SynchedEntityData indices and serializers for Avatar/Player in Minecraft 26.1.2 (protocol 775).
+const (
+	EntityDataPlayerMainHandID          byte  = 15 // Avatar.DATA_PLAYER_MAIN_HAND (HUMANOID_ARM serializer = 42)
+	EntityDataPlayerModeCustomisationID byte  = 16 // Avatar.DATA_PLAYER_MODE_CUSTOMISATION (BYTE serializer = 0)
+	EntityDataSerializerHumanoidArm     int32 = 42
+
+	DefaultPlayerSkinParts byte = 0x7f // cape|jacket|left_sleeve|right_sleeve|left_pants|right_pants|hat
+	PlayerMainHandLeft     byte = 0
+	PlayerMainHandRight    byte = 1
+)
+
+// ClientInformationState holds a player's ClientInformation settings (0x00 Config / 0x0e Play).
+type ClientInformationState struct {
+	Language             string
+	ViewDistance         int
+	ChatVisibility       int32
+	ChatColors           bool
+	ModelCustomisation   byte
+	MainHand             byte
+	TextFilteringEnabled bool
+	AllowsListing        bool
+	ParticleStatus       int32
+}
+
+// DefaultClientInformation returns the vanilla 26.1.2 default ClientInformationState.
+func DefaultClientInformation() ClientInformationState {
+	return ClientInformationState{
+		Language:             "en_us",
+		ViewDistance:         2,
+		ChatVisibility:       0,
+		ChatColors:           true,
+		ModelCustomisation:   DefaultPlayerSkinParts,
+		MainHand:             PlayerMainHandRight,
+		TextFilteringEnabled: false,
+		AllowsListing:        true,
+		ParticleStatus:       0,
+	}
+}
+
+// EncodeClientInformationPacket encodes ServerboundClientInformationPacket (0x00 Config / 0x0e Play).
+func EncodeClientInformationPacket(info ClientInformationState) []byte {
+	w := protocol.NewWriter(32)
+	lang := info.Language
+	if lang == "" {
+		lang = "en_us"
+	}
+	w.String(lang)
+	w.Byte(byte(info.ViewDistance))
+	w.VarInt(info.ChatVisibility)
+	w.Bool(info.ChatColors)
+	w.Byte(info.ModelCustomisation)
+	w.VarInt(int32(info.MainHand))
+	w.Bool(info.TextFilteringEnabled)
+	w.Bool(info.AllowsListing)
+	w.VarInt(info.ParticleStatus)
+	return w.Bytes()
+}
+
+// DecodeClientInformationPacket decodes ServerboundClientInformationPacket (0x00 Config / 0x0e Play).
+func DecodeClientInformationPacket(r *protocol.Reader) (ClientInformationState, error) {
+	info := DefaultClientInformation()
+	lang, err := r.String()
+	if err != nil {
+		return info, err
+	}
+	vd, err := r.ReadByte()
+	if err != nil {
+		return info, err
+	}
+	chatMode, err := r.VarInt()
+	if err != nil {
+		return info, err
+	}
+	chatColors, err := r.Bool()
+	if err != nil {
+		return info, err
+	}
+	skinParts, err := r.ReadByte()
+	if err != nil {
+		return info, err
+	}
+	mainHand, err := r.VarInt()
+	if err != nil {
+		return info, err
+	}
+	info.Language = lang
+	info.ViewDistance = int(int8(vd))
+	info.ChatVisibility = chatMode
+	info.ChatColors = chatColors
+	info.ModelCustomisation = skinParts
+	if mainHand == 0 {
+		info.MainHand = PlayerMainHandLeft
+	} else {
+		info.MainHand = PlayerMainHandRight
+	}
+	if r.Remaining() > 0 {
+		if tf, err := r.Bool(); err == nil {
+			info.TextFilteringEnabled = tf
+		}
+	}
+	if r.Remaining() > 0 {
+		if al, err := r.Bool(); err == nil {
+			info.AllowsListing = al
+		}
+	}
+	if r.Remaining() > 0 {
+		if ps, err := r.VarInt(); err == nil {
+			info.ParticleStatus = ps
+		}
+	}
+	return info, nil
+}
+
+// EncodePlayerAvatarEntityDataPacket encodes ClientboundSetEntityDataPacket (0x63)
+// for Avatar.DATA_PLAYER_MAIN_HAND (15) and Avatar.DATA_PLAYER_MODE_CUSTOMISATION (16).
+func EncodePlayerAvatarEntityDataPacket(entityID int32, mainHand byte, skinParts byte) []byte {
+	if mainHand > PlayerMainHandRight {
+		mainHand = PlayerMainHandRight
+	}
+	w := protocol.NewWriter(16)
+	w.VarInt(entityID)
+	w.Byte(EntityDataPlayerMainHandID)
+	w.VarInt(EntityDataSerializerHumanoidArm)
+	w.VarInt(int32(mainHand))
+	w.Byte(EntityDataPlayerModeCustomisationID)
+	w.VarInt(EntityDataSerializerByte)
+	w.Byte(skinParts)
+	w.Byte(0xff)
+	return w.Bytes()
+}
+
+// DecodePlayerAvatarEntityDataPacket decodes a packet produced by EncodePlayerAvatarEntityDataPacket.
+func DecodePlayerAvatarEntityDataPacket(r *protocol.Reader) (entityID int32, mainHand byte, skinParts byte, err error) {
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	mainHand = PlayerMainHandRight
+	skinParts = DefaultPlayerSkinParts
+	for {
+		idx, err := r.ReadByte()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		if idx == 0xff {
+			break
+		}
+		ser, err := r.VarInt()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		switch idx {
+		case EntityDataPlayerMainHandID:
+			if ser != EntityDataSerializerHumanoidArm {
+				return 0, 0, 0, fmt.Errorf("avatar entity data: unexpected main hand serializer %d", ser)
+			}
+			v, err := r.VarInt()
+			if err != nil {
+				return 0, 0, 0, err
+			}
+			mainHand = byte(v)
+		case EntityDataPlayerModeCustomisationID:
+			if ser != EntityDataSerializerByte {
+				return 0, 0, 0, fmt.Errorf("avatar entity data: unexpected skin parts serializer %d", ser)
+			}
+			b, err := r.ReadByte()
+			if err != nil {
+				return 0, 0, 0, err
+			}
+			skinParts = b
+		default:
+			return 0, 0, 0, fmt.Errorf("avatar entity data: unexpected index %d", idx)
+		}
+	}
+	return entityID, mainHand, skinParts, nil
+}
+
+var playerClientInfoStore sync.Map // map[*PlayerSession]ClientInformationState
+
+// SetPlayerClientInformation stores session's ClientInformationState, updates
+// view distance, sends ClientboundSetChunkCacheRadiusPacket (0x5f) when in Play,
+// and broadcasts the player's Avatar SynchedEntityData (main hand & skin parts).
+func (s *Server) SetPlayerClientInformation(session *PlayerSession, info ClientInformationState, inPlay bool) int {
+	vd := info.ViewDistance
+	if vd < 2 {
+		vd = 2
+	}
+	if s != nil && s.cfg.MaxViewDistance > 0 && vd > s.cfg.MaxViewDistance {
+		vd = s.cfg.MaxViewDistance
+	}
+	info.ViewDistance = vd
+	if session == nil {
+		return vd
+	}
+	playerClientInfoStore.Store(session, info)
+	if s != nil {
+		s.SetPlayerViewDistance(session, vd)
+	}
+	if inPlay && s != nil {
+		if session.send != nil {
+			_ = session.send(protocol.PlayChunkCacheRadius, EncodeSetChunkCacheRadiusPacket(int32(vd)))
+		}
+		snap := session.Snapshot()
+		cx := int32(int64(math.Floor(snap.X)) >> 4)
+		cz := int32(int64(math.Floor(snap.Z)) >> 4)
+		s.BroadcastDimensionChunk(
+			world.NormalizeDimension(snap.Dimension),
+			cx, cz,
+			protocol.PlaySetEntityData,
+			EncodePlayerAvatarEntityDataPacket(session.EntityID, info.MainHand, info.ModelCustomisation),
+		)
+	}
+	return vd
+}
+
+// PlayerClientInformation returns session's current ClientInformationState.
+func (s *Server) PlayerClientInformation(session *PlayerSession) ClientInformationState {
+	if session != nil {
+		if v, ok := playerClientInfoStore.Load(session); ok {
+			return v.(ClientInformationState)
+		}
+	}
+	return DefaultClientInformation()
+}
+
+// PlayerAvatarEntityDataPacketByEntityID returns the ClientboundSetEntityDataPacket (0x63)
+// payload for a player's Avatar metadata (main hand + displayed skin parts).
+func (s *Server) PlayerAvatarEntityDataPacketByEntityID(entityID int32) []byte {
+	info := DefaultClientInformation()
+	if s != nil {
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p != nil && p.EntityID == entityID {
+				info = s.PlayerClientInformation(p)
+				break
+			}
+		}
+	}
+	return EncodePlayerAvatarEntityDataPacket(entityID, info.MainHand, info.ModelCustomisation)
+}
+
+// EncodeRotateHeadPacket encodes ClientboundRotateHeadPacket (0x53):
+// VarInt(entityID), Byte(yHeadRot).
+func EncodeRotateHeadPacket(entityID int32, headYawDeg float32) []byte {
+	w := protocol.NewWriter(6)
+	w.VarInt(entityID)
+	w.Byte(byte(headYawDeg * 256.0 / 360.0))
+	return w.Bytes()
+}
+
+// DecodeRotateHeadPacket decodes ClientboundRotateHeadPacket (0x53).
+func DecodeRotateHeadPacket(r *protocol.Reader) (entityID int32, headYawAngleByte byte, err error) {
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, err
+	}
+	headYawAngleByte, err = r.ReadByte()
+	if err != nil {
+		return 0, 0, err
+	}
+	return entityID, headYawAngleByte, nil
+}
+
+// EncodeSetChunkCacheRadiusPacket encodes ClientboundSetChunkCacheRadiusPacket (0x5f): VarInt(radius).
+func EncodeSetChunkCacheRadiusPacket(radius int32) []byte {
+	w := protocol.NewWriter(5)
+	w.VarInt(radius)
+	return w.Bytes()
+}
+
+// DecodeSetChunkCacheRadiusPacket decodes ClientboundSetChunkCacheRadiusPacket (0x5f).
+func DecodeSetChunkCacheRadiusPacket(r *protocol.Reader) (int32, error) {
+	return r.VarInt()
+}
+
+// EncodeSetSimulationDistancePacket encodes ClientboundSetSimulationDistancePacket (0x6f): VarInt(simulationDistance).
+func EncodeSetSimulationDistancePacket(distance int32) []byte {
+	w := protocol.NewWriter(5)
+	w.VarInt(distance)
+	return w.Bytes()
+}
+
+// DecodeSetSimulationDistancePacket decodes ClientboundSetSimulationDistancePacket (0x6f).
+func DecodeSetSimulationDistancePacket(r *protocol.Reader) (int32, error) {
+	return r.VarInt()
+}
+
+// EncodeServerDataPacket encodes ClientboundServerDataPacket (0x56):
+// Component(motd as anonymous NBT compound), Optional<ByteArray>(iconBytes).
+func EncodeServerDataPacket(motd string, iconBytes []byte) []byte {
+	root := nbt.NewCompound().Set("text", nbt.String(motd))
+	nbtBytes := nbt.Marshal(root)
+	w := protocol.NewWriter(len(nbtBytes) + len(iconBytes) + 8)
+	w.Raw(nbtBytes)
+	if len(iconBytes) > 0 {
+		w.Bool(true)
+		w.VarInt(int32(len(iconBytes)))
+		w.Raw(iconBytes)
+	} else {
+		w.Bool(false)
+	}
+	return w.Bytes()
+}
+
+// EncodeBlockEntityTagQuerySBPacket encodes ServerboundBlockEntityTagQueryPacket (0x02):
+// VarInt(transactionID), Position(x, y, z).
+func EncodeBlockEntityTagQuerySBPacket(transactionID int32, x, y, z int) []byte {
+	w := protocol.NewWriter(14)
+	w.VarInt(transactionID)
+	w.Position(x, y, z)
+	return w.Bytes()
+}
+
+// DecodeBlockEntityTagQuerySBPacket decodes ServerboundBlockEntityTagQueryPacket (0x02).
+func DecodeBlockEntityTagQuerySBPacket(r *protocol.Reader) (transactionID int32, x, y, z int, err error) {
+	transactionID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	x, y, z, err = r.Position()
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return transactionID, x, y, z, nil
+}
+
+// EncodeEntityTagQuerySBPacket encodes ServerboundEntityTagQueryPacket (0x19):
+// VarInt(transactionID), VarInt(entityID).
+func EncodeEntityTagQuerySBPacket(transactionID, entityID int32) []byte {
+	w := protocol.NewWriter(10)
+	w.VarInt(transactionID)
+	w.VarInt(entityID)
+	return w.Bytes()
+}
+
+// DecodeEntityTagQuerySBPacket decodes ServerboundEntityTagQueryPacket (0x19).
+func DecodeEntityTagQuerySBPacket(r *protocol.Reader) (transactionID, entityID int32, err error) {
+	transactionID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, err
+	}
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, err
+	}
+	return transactionID, entityID, nil
+}
+
+// EncodeTagQueryPacket encodes ClientboundTagQueryPacket (0x7b):
+// VarInt(transactionID), CompoundTag(tag).
+func EncodeTagQueryPacket(transactionID int32, tag *nbt.Compound) []byte {
+	if tag == nil {
+		tag = nbt.NewCompound()
+	}
+	nbtBytes := nbt.Marshal(tag)
+	w := protocol.NewWriter(6 + len(nbtBytes))
+	w.VarInt(transactionID)
+	w.Raw(nbtBytes)
+	return w.Bytes()
+}
+
+// DecodeTagQueryPacket decodes ClientboundTagQueryPacket (0x7b).
+func DecodeTagQueryPacket(r *protocol.Reader) (transactionID int32, tag *nbt.Compound, err error) {
+	transactionID, err = r.VarInt()
+	if err != nil {
+		return 0, nil, err
+	}
+	rem := make([]byte, r.Remaining())
+	for i := range rem {
+		b, err := r.ReadByte()
+		if err != nil {
+			return 0, nil, err
+		}
+		rem[i] = b
+	}
+	t, err := nbt.Unmarshal(rem)
+	if err != nil {
+		return 0, nil, err
+	}
+	comp, ok := t.(*nbt.Compound)
+	if !ok {
+		return 0, nil, fmt.Errorf("tag_query: expected Compound tag, got %T", t)
+	}
+	return transactionID, comp, nil
+}
+
+// HandleBlockEntityTagQueryPacket processes ServerboundBlockEntityTagQueryPacket (0x02, F3+I on block)
+// for operators and replies with ClientboundTagQueryPacket (0x7b).
+func (s *Server) HandleBlockEntityTagQueryPacket(session *PlayerSession, r *protocol.Reader) error {
+	txID, x, y, z, err := DecodeBlockEntityTagQuerySBPacket(r)
+	if err != nil {
+		return err
+	}
+	if s == nil || session == nil || session.send == nil || !s.HasAdminPermission(session) {
+		return nil
+	}
+	dim := world.NormalizeDimension(session.Dimension())
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+	var found *nbt.Compound
+	for _, c := range s.ChunkBlockEntitiesNBT(dim, cx, cz) {
+		if c == nil {
+			continue
+		}
+		bx, okX := c.Get("x")
+		by, okY := c.Get("y")
+		bz, okZ := c.Get("z")
+		if okX && okY && okZ {
+			ix, _ := bx.(nbt.Int)
+			iy, _ := by.(nbt.Int)
+			iz, _ := bz.(nbt.Int)
+			if int(ix) == x && int(iy) == y && int(iz) == z {
+				found = c
+				break
+			}
+		}
+	}
+	if found == nil {
+		found = nbt.NewCompound().
+			Set("x", nbt.Int(x)).
+			Set("y", nbt.Int(y)).
+			Set("z", nbt.Int(z))
+	}
+	return session.send(protocol.PlayTagQuery, EncodeTagQueryPacket(txID, found))
+}
+
+// HandleEntityTagQueryPacket processes ServerboundEntityTagQueryPacket (0x19, F3+I on entity)
+// for operators and replies with ClientboundTagQueryPacket (0x7b).
+func (s *Server) HandleEntityTagQueryPacket(session *PlayerSession, r *protocol.Reader) error {
+	txID, entityID, err := DecodeEntityTagQuerySBPacket(r)
+	if err != nil {
+		return err
+	}
+	if s == nil || session == nil || session.send == nil || !s.HasAdminPermission(session) {
+		return nil
+	}
+	tag := nbt.NewCompound()
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && p.EntityID == entityID {
+			ps := p.Snapshot()
+			tag.Set("id", nbt.String("minecraft:player")).
+				Set("CustomName", nbt.String(ps.Profile.Name)).
+				Set("Dimension", nbt.String(world.NormalizeDimension(ps.Dimension))).
+				Set("Health", nbt.Float(ps.Health)).
+				Set("playerGameType", nbt.Int(int32(ps.GameMode))).
+				Set("Pos", nbt.List{
+					ElemID: nbt.TagDouble,
+					Elems:  []nbt.Tag{nbt.Double(ps.X), nbt.Double(ps.Y), nbt.Double(ps.Z)},
+				})
+			return session.send(protocol.PlayTagQuery, EncodeTagQueryPacket(txID, tag))
+		}
+	}
+	if s.entities != nil {
+		if ent := s.entities.Get(entityID); ent != nil {
+			typeName := ent.TypeName
+			if typeName == "" {
+				typeName = "minecraft:entity"
+			}
+			tag.Set("id", nbt.String(typeName)).
+				Set("Dimension", nbt.String(ent.EffectiveDimension())).
+				Set("Pos", nbt.List{
+					ElemID: nbt.TagDouble,
+					Elems:  []nbt.Tag{nbt.Double(ent.X), nbt.Double(ent.Y), nbt.Double(ent.Z)},
+				}).
+				Set("Rotation", nbt.List{
+					ElemID: nbt.TagFloat,
+					Elems:  []nbt.Tag{nbt.Float(ent.Yaw), nbt.Float(ent.Pitch)},
+				})
+		}
+	}
+	return session.send(protocol.PlayTagQuery, EncodeTagQueryPacket(txID, tag))
+}
