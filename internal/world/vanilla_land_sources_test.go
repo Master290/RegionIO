@@ -146,4 +146,13 @@ func TestVanillaLandSourceChunkParity(t *testing.T) {
 	}
 	t.Logf("source chunks: %d/%d exact (%.3f%%), bands %v, %d vanilla tree cells above sea level in %d land columns",
 		totalExact, totalCells, percent(totalExact, totalCells), bandTotal, treeCells, surfaceColumns)
+
+	const minSourceTotalExact = 393200
+	if totalExact < minSourceTotalExact {
+		t.Errorf("source-chunk block parity regressed: got %d/%d (%.3f%%), want at least %d",
+			totalExact, totalCells, percent(totalExact, totalCells), minSourceTotalExact)
+	}
+	if bandTotal["deep"] > 12 || bandTotal["underground"] > 0 || bandTotal["waterline"] > 0 || bandTotal["surface"] > 4 {
+		t.Errorf("source-chunk band mismatches regressed: got %v, want deep<=12 underground=0 waterline=0 surface<=4", bandTotal)
+	}
 }

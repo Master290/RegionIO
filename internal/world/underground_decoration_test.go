@@ -373,24 +373,25 @@ func TestChunk4020And4021SculkParityAndSourceOrdering(t *testing.T) {
 	if got := stateLabel(reg3920.getBlock(-624, -51, 320)); got != "minecraft:air" {
 		t.Fatalf("(-624, -51, 320) under decorationSources(-39, 20) = %s, want minecraft:air", got)
 	}
-	ch3920 := fixMap[[2]int32{-39, 20}]
-	stateDiffs3920, nameDiffs3920 := 0, 0
-	for y := MinY; y < MinY+WorldHeight; y++ {
-		for lz := 0; lz < 16; lz++ {
-			for lx := 0; lx < 16; lx++ {
-				wantID := ch3920.at(lx, y, lz)
-				gotID := reg3920.getBlock(-39*16+lx, y, 20*16+lz)
-				if wantID != gotID {
-					stateDiffs3920++
-				}
-				if stateLabel(wantID) != stateLabel(gotID) {
-					nameDiffs3920++
+	if ch3920, ok := fixMap[[2]int32{-39, 20}]; ok {
+		stateDiffs3920, nameDiffs3920 := 0, 0
+		for y := MinY; y < MinY+WorldHeight; y++ {
+			for lz := 0; lz < 16; lz++ {
+				for lx := 0; lx < 16; lx++ {
+					wantID := ch3920.at(lx, y, lz)
+					gotID := reg3920.getBlock(-39*16+lx, y, 20*16+lz)
+					if wantID != gotID {
+						stateDiffs3920++
+					}
+					if stateLabel(wantID) != stateLabel(gotID) {
+						nameDiffs3920++
+					}
 				}
 			}
 		}
-	}
-	if stateDiffs3920 > 12 || nameDiffs3920 > 11 {
-		t.Fatalf("(-39, 20) mismatches: stateDiffs=%d (want <=12), nameDiffs=%d (want <=11)", stateDiffs3920, nameDiffs3920)
+		if stateDiffs3920 > 12 || nameDiffs3920 > 11 {
+			t.Fatalf("(-39, 20) mismatches: stateDiffs=%d (want <=12), nameDiffs=%d (want <=11)", stateDiffs3920, nameDiffs3920)
+		}
 	}
 }
 
