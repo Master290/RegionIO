@@ -736,3 +736,67 @@ func TestItemFrameAndDispenserComparatorSignalsAndPersistence(t *testing.T) {
 		t.Fatalf("reloaded slot[0] potion = %q, want minecraft:swiftness", pot)
 	}
 }
+
+func TestDispenserWolfArmorAndJukeboxParrotDanceHooks(t *testing.T) {
+	srv := newDispenserTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.DimensionChunks(dim)
+	p, _ := addDispenserTestPlayer(t, srv, "WolfTamer")
+
+	// 1. Dispenser equips dyed wolf_armor onto a tamed wolf and shears it off.
+	dx, dy, dz := 40, 70, 40
+	placeDispenserOrDropperForTest(t, srv, dim, dx, dy, dz, "minecraft:dispenser", "south")
+	wolfID, err := srv.SpawnMobInDimension(dim, float64(dx)+0.5, float64(dy), float64(dz+1)+0.5, MobTypeWolf)
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(wolf): %v", err)
+	}
+	srv.TameMob(wolfID, p)
+
+	dyedMeta, wantRGB, ok := DyeWolfArmorItem(ItemMeta{}, "minecraft:red_dye")
+	if !ok {
+		t.Fatalf("expected DyeWolfArmorItem to succeed")
+	}
+	srv.SetDispenserSlotWithMeta(dim, dx, dy, dz, 0, world.NewNamedItemStack("minecraft:wolf_armor", 1), dyedMeta)
+	if !srv.DispenseFromDispenser(dim, dx, dy, dz) {
+		t.Fatalf("expected dispenser to equip wolf_armor onto tamed wolf")
+	}
+	if !srv.HasWolfArmor(wolfID) || srv.WolfArmor(wolfID).IsEmpty() {
+		t.Fatalf("expected wolf to have wolf_armor equipped (HasWolfArmor=%v, WolfArmor=%+v)", srv.HasWolfArmor(wolfID), srv.WolfArmor(wolfID))
+	}
+	if ws, ok := srv.GetWolfDetailState(wolfID); !ok || ws.DyedRGB != wantRGB {
+		t.Fatalf("expected wolf detail state DyedRGB=%#x, got %+v", wantRGB, ws)
+	}
+
+	// Dispenser with shears removes the wolf_armor via RemoveWolfArmorWithShears.
+	srv.SetDispenserSlot(dx, dy, dz, 0, world.NewNamedItemStack("minecraft:shears", 1))
+	if !srv.DispenseFromDispenser(dim, dx, dy, dz) {
+		t.Fatalf("expected dispenser with shears to remove wolf_armor from tamed wolf")
+	}
+	if srv.HasWolfArmor(wolfID) || !srv.WolfArmor(wolfID).IsEmpty() {
+		t.Fatalf("expected wolf_armor to be removed after dispenser shears")
+	}
+
+	// 2. Inserting and ejecting a music disc in a jukebox immediately toggles nearby parrot dancing.
+	jx, jy, jz := 50, 70, 50
+	cache.SetBlock(jx, jy, jz, JukeboxBlockState(false))
+	parrotID, err := srv.SpawnMobInDimension(dim, float64(jx)+1.5, float64(jy), float64(jz)+0.5, MobTypeParrot)
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(parrot): %v", err)
+	}
+	if srv.IsParrotDancing(parrotID) {
+		t.Fatalf("expected parrot not dancing before disc insert")
+	}
+	inserted, _ := srv.InsertJukeboxDisc(dim, jx, jy, jz, world.NewNamedItemStack("minecraft:music_disc_cat", 1))
+	if !inserted {
+		t.Fatalf("expected InsertJukeboxDisc to succeed")
+	}
+	if !srv.IsParrotDancing(parrotID) {
+		t.Fatalf("expected parrot to start dancing immediately upon InsertJukeboxDisc")
+	}
+	if _, ejected, _ := srv.EjectJukeboxDisc(dim, jx, jy, jz); !ejected {
+		t.Fatalf("expected EjectJukeboxDisc to succeed")
+	}
+	if srv.IsParrotDancing(parrotID) {
+		t.Fatalf("expected parrot to stop dancing immediately upon EjectJukeboxDisc")
+	}
+}

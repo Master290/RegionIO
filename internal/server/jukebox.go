@@ -687,9 +687,33 @@ func (s *Server) InsertJukeboxDisc(dimension string, x, y, z int, disc world.Ite
 	}
 
 	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, true)
+	s.notifyJukeboxParrots(dim, x, y, z)
 
 	_ = s.SaveJukeboxes()
 	return true, res
+}
+
+func (s *Server) notifyJukeboxParrots(dim string, x, y, z int) {
+	if s == nil || s.entities == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	all := s.entities.AppendAll(nil)
+	for i := range all {
+		e := &all[i]
+		if canonicalResourceName(e.TypeName) != MobTypeParrot {
+			continue
+		}
+		if world.NormalizeDimension(e.EffectiveDimension()) != normDim {
+			continue
+		}
+		dx := (float64(x) + 0.5) - e.X
+		dy := (float64(y) + 0.5) - e.Y
+		dz := (float64(z) + 0.5) - e.Z
+		if dx*dx+dy*dy+dz*dz <= 36.0 {
+			s.UpdateParrotDancingState(e.ID)
+		}
+	}
 }
 
 // EjectJukeboxDisc removes the music disc from the jukebox at (dimension, x, y, z),
@@ -735,6 +759,7 @@ func (s *Server) EjectJukeboxDisc(dimension string, x, y, z int) (world.ItemStac
 		EncodeLevelEventPacket(LevelEventStopJukeboxSong, x, y, z, 0, false))
 
 	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, false)
+	s.notifyJukeboxParrots(dim, x, y, z)
 
 	// Spawn the ejected disc item entity above the jukebox (matching JukeboxBlockEntity.popOutTheItem).
 	_, _ = s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+1.01, float64(z)+0.5, disc)
@@ -887,6 +912,7 @@ func (s *Server) TickJukeboxes() {
 				EncodeLevelEventPacket(LevelEventStopJukeboxSong, f.key.x, f.key.y, f.key.z, 0, false))
 
 			s.NotifyJukeboxPlayingForAllays(f.key.dim, f.key.x, f.key.y, f.key.z, false)
+			s.notifyJukeboxParrots(f.key.dim, f.key.x, f.key.y, f.key.z)
 
 			if cache := s.BindNoteBlockAndJukeboxRedstone(f.key.dim); cache != nil {
 				// Re-trigger redstone propagation around the jukebox now that its
@@ -963,6 +989,7 @@ func (s *Server) HopperTryExtractFromJukebox(dimension string, x, y, z int) (wor
 		EncodeLevelEventPacket(LevelEventStopJukeboxSong, x, y, z, 0, false))
 
 	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, false)
+	s.notifyJukeboxParrots(dim, x, y, z)
 
 	_ = s.SaveJukeboxes()
 	return disc, true, res

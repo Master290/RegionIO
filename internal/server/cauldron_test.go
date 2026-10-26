@@ -453,3 +453,38 @@ func TestCauldronExtinguishingAndLavaBurning(t *testing.T) {
 		t.Fatalf("expected player health to decrease in lava_cauldron: before=%v after=%v", beforeHP, afterHP)
 	}
 }
+
+func TestCauldronWashDyedWolfArmorMeta(t *testing.T) {
+	s, cache := newBeaconTestServer(t)
+	session := newBeaconTestPlayer(s, "WolfArmorWasher", 14.5, 64, 14.5)
+
+	x, y, z := 14, 64, 14
+	cache.SetBlock(x, y, z, CauldronWaterBlockState(2))
+
+	const slot = 36
+	session.SetInventorySlot(slot, world.NewNamedItemStack("minecraft:wolf_armor", 1))
+	dyedMeta, wantRGB, ok := DyeWolfArmorItem(ItemMeta{Damage: 5}, "minecraft:blue_dye")
+	if !ok {
+		t.Fatalf("expected DyeWolfArmorItem to succeed")
+	}
+	SetSlotItemMeta(session, slot, dyedMeta)
+
+	if gotRGB, has := GetSlotDyedColor(session, slot); !has || gotRGB != wantRGB {
+		t.Fatalf("expected GetSlotDyedColor to report WolfArmorDyedRGB (%#x, true), got (%#x, %v)", wantRGB, gotRGB, has)
+	}
+
+	ok, st := s.InteractCauldronAt(session, x, y, z, slot)
+	if !ok || st != CauldronWaterBlockState(1) {
+		t.Fatalf("expected washing dyed wolf_armor to lower water_cauldron from 2 to 1 (ok=%v, st=%d)", ok, st)
+	}
+	if HasSlotDyedColor(session, slot) {
+		t.Fatalf("expected dyed color to be cleared after cauldron wash")
+	}
+	washedMeta := GetSlotItemMeta(session, slot)
+	if _, stillDyed := WolfArmorDyedRGB(washedMeta); stillDyed {
+		t.Fatalf("expected minecraft:dyed_color to be removed from wolf_armor ItemMeta")
+	}
+	if washedMeta.Damage != 5 {
+		t.Fatalf("expected wolf_armor Damage=5 to be preserved after washing, got %d", washedMeta.Damage)
+	}
+}

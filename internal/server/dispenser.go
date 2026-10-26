@@ -1204,7 +1204,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 
 	// 6. Saddles, Horse Armor, Wolf Armor, Llama Carpets, and Equine Chests.
 	case isDispenserAnimalEquipment(itemID, normDim, fx, fy, fz, s):
-		if s.dispenseAnimalEquipment(normDim, fx, fy, fz, itemID) {
+		if s.dispenseAnimalEquipment(normDim, fx, fy, fz, itemID, meta) {
 			consumeOne = true
 		} else {
 			succeeded = false
@@ -2131,7 +2131,7 @@ func isDispenserAnimalEquipment(itemID, dim string, fx, fy, fz int, s *Server) b
 	return false
 }
 
-func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID string) bool {
+func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID string, meta ItemMeta) bool {
 	norm := canonicalResourceName(itemID)
 	mobs := s.mobsInBlockBox(dim, fx, fy, fz)
 	for _, ent := range mobs {
@@ -2183,8 +2183,12 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 			}
 
 		case norm == "minecraft:wolf_armor":
-			if mobType == MobTypeWolf && s.IsMobTamed(ent.ID) && s.WolfArmor(ent.ID).IsEmpty() {
-				s.SetWolfArmor(ent.ID, world.NewNamedItemStack("minecraft:wolf_armor", 1))
+			if mobType == MobTypeWolf && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && s.WolfArmor(ent.ID).IsEmpty() {
+				stack := world.NewNamedItemStack("minecraft:wolf_armor", 1)
+				if s.EquipWolfArmor(ent.ID, stack, meta) {
+					return true
+				}
+				s.SetWolfArmor(ent.ID, stack)
 				return true
 			}
 
@@ -2249,11 +2253,13 @@ func (s *Server) WolfArmor(entityID int32) world.ItemStack {
 	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	return ds.wolfArmor[entityID]
+	stack := ds.wolfArmor[entityID]
+	ds.mu.Unlock()
+	return stack
 }
 
-// SetWolfArmor sets the equipped wolf armor stack on entityID.
+// SetWolfArmor sets the equipped wolf armor stack on entityID and synchronizes
+// the wolf detail state.
 func (s *Server) SetWolfArmor(entityID int32, stack world.ItemStack) {
 	if s == nil {
 		return
@@ -2266,6 +2272,24 @@ func (s *Server) SetWolfArmor(entityID int32, stack world.ItemStack) {
 		ds.wolfArmor[entityID] = stack
 	}
 	ds.mu.Unlock()
+
+	if entityID > 0 {
+		ws := s.ensureWolfDetailState(entityID)
+		if ws != nil {
+			pm := s.petDetails()
+			pm.mu.Lock()
+			if stack.IsEmpty() {
+				ws.HasArmor = false
+				ws.ArmorStack = world.ItemStack{}
+				ws.ArmorMeta = ItemMeta{}
+				ws.DyedRGB = DefaultWolfArmorRGB
+			} else {
+				ws.HasArmor = true
+				ws.ArmorStack = stack
+			}
+			pm.mu.Unlock()
+		}
+	}
 }
 
 // LlamaCarpet returns the carpet item ID equipped on llama entityID.
@@ -2580,6 +2604,11 @@ func (s *Server) dispenseShears(dim string, cache *world.Cache, fx, fy, fz int, 
 			}
 		case MobTypeBogged:
 			if _, sheared := s.ShearBogged(nil, ent.ID, rng); sheared {
+				return true
+			}
+		case MobTypeWolf:
+			if _, _, sheared := s.RemoveWolfArmorWithShears(nil, ent.ID); sheared {
+				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
 				return true
 			}
 		}

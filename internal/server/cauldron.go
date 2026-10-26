@@ -338,11 +338,18 @@ func SetSlotDyedColor(session *PlayerSession, slot int, rgb int32) {
 	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
 		return
 	}
+	clamped := rgb & 0xFFFFFF
 	tr := getDyedColorTracker(session)
 	tr.mu.Lock()
-	tr.slotColor[slot] = rgb & 0xFFFFFF
+	tr.slotColor[slot] = clamped
 	tr.slotHasColor[slot] = true
 	tr.mu.Unlock()
+
+	if canonicalBeaconResource(session.InventorySlot(slot).ResolvedID()) == "minecraft:wolf_armor" {
+		meta := GetSlotItemMeta(session, slot)
+		setWolfArmorDyedRGBOnMeta(&meta, clamped)
+		SetSlotItemMeta(session, slot, meta)
+	}
 }
 
 // GetSlotDyedColor returns the custom RGB dye color on player inventory slot (0..45).
@@ -355,11 +362,16 @@ func GetSlotDyedColor(session *PlayerSession, slot int) (rgb int32, hasColor boo
 	}
 	tr := getDyedColorTracker(session)
 	tr.mu.Lock()
-	defer tr.mu.Unlock()
-	if !tr.slotHasColor[slot] {
-		return 0, false
+	has := tr.slotHasColor[slot]
+	col := tr.slotColor[slot]
+	tr.mu.Unlock()
+	if has {
+		return col, true
 	}
-	return tr.slotColor[slot], true
+	if metaRGB, ok := WolfArmorDyedRGB(GetSlotItemMeta(session, slot)); ok {
+		return metaRGB, true
+	}
+	return 0, false
 }
 
 // HasSlotDyedColor reports whether player inventory slot (0..45) has a custom
@@ -371,7 +383,7 @@ func HasSlotDyedColor(session *PlayerSession, slot int) bool {
 
 // ClearSlotDyedColor removes the custom `minecraft:dyed_color` component from
 // player inventory slot (0..45), as performed when washing dyed leather armor
-// in a water cauldron.
+// or `minecraft:wolf_armor` in a water cauldron.
 func ClearSlotDyedColor(session *PlayerSession, slot int) {
 	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
 		return
@@ -381,6 +393,12 @@ func ClearSlotDyedColor(session *PlayerSession, slot int) {
 	tr.slotColor[slot] = 0
 	tr.slotHasColor[slot] = false
 	tr.mu.Unlock()
+
+	meta := GetSlotItemMeta(session, slot)
+	if _, ok := WolfArmorDyedRGB(meta); ok {
+		setWolfArmorDyedRGBOnMeta(&meta, -1)
+		SetSlotItemMeta(session, slot, meta)
+	}
 }
 
 // IsDyedShulkerBoxItem reports whether itemName is one of the 16 colored
