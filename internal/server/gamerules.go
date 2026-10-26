@@ -540,6 +540,8 @@ func (s *Server) SetGameRuleBool(name string, val bool) bool {
 		s.SetWeatherCycle(val)
 	case "naturalRegeneration":
 		s.SetNaturalRegeneration(val)
+	case "waterSourceConversion", "lavaSourceConversion":
+		s.syncFluidConversionRulesToCaches()
 	case "doImmediateRespawn":
 		v := float32(0.0)
 		if val {
@@ -730,8 +732,43 @@ func (s *Server) PlayersSleepingPercentage() int { return s.GameRuleInt("players
 func (s *Server) SetPlayersSleepingPercentage(v int) {
 	s.SetGameRuleInt("playersSleepingPercentage", v)
 }
-func (s *Server) SpawnRadius() int      { return s.GameRuleInt("spawnRadius") }
-func (s *Server) SetSpawnRadius(v int)  { s.SetGameRuleInt("spawnRadius", v) }
+func (s *Server) SpawnRadius() int               { return s.GameRuleInt("spawnRadius") }
+func (s *Server) SetSpawnRadius(v int)           { s.SetGameRuleInt("spawnRadius", v) }
+func (s *Server) WaterSourceConversion() bool    { return s.GameRuleBool("waterSourceConversion") }
+func (s *Server) SetWaterSourceConversion(v bool) {
+	s.SetGameRuleBool("waterSourceConversion", v)
+}
+func (s *Server) LavaSourceConversion() bool { return s.GameRuleBool("lavaSourceConversion") }
+func (s *Server) SetLavaSourceConversion(v bool) {
+	s.SetGameRuleBool("lavaSourceConversion", v)
+}
+
+func (s *Server) syncFluidConversionRulesToCaches() {
+	if s == nil {
+		return
+	}
+	waterConv := s.WaterSourceConversion()
+	lavaConv := s.LavaSourceConversion()
+	if s.chunks != nil {
+		s.chunks.SetWaterSourceConversion(waterConv)
+		s.chunks.SetLavaSourceConversion(lavaConv)
+	}
+	if v, ok := serverDimensions.Load(s); ok {
+		ds := v.(*serverDimensionState)
+		ds.mu.Lock()
+		caches := make([]*world.Cache, 0, len(ds.caches))
+		for _, c := range ds.caches {
+			if c != nil {
+				caches = append(caches, c)
+			}
+		}
+		ds.mu.Unlock()
+		for _, c := range caches {
+			c.SetWaterSourceConversion(waterConv)
+			c.SetLavaSourceConversion(lavaConv)
+		}
+	}
+}
 
 // DropPlayerDeathInventoryAndXP drops all items in session's inventory (except
 // items with minecraft:vanishing_curse) and experience orbs (min(level*7, 100))
@@ -898,6 +935,8 @@ func (s *Server) LoadWorldSettingsNBT(root *nbt.Compound) {
 									s.SetWeatherCycle(b)
 								case "naturalRegeneration":
 									s.SetNaturalRegeneration(b)
+								case "waterSourceConversion", "lavaSourceConversion":
+									s.syncFluidConversionRulesToCaches()
 								}
 							}
 						} else {

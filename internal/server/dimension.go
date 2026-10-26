@@ -134,6 +134,8 @@ func (s *Server) DimensionChunks(dim string) *world.Cache {
 		cache.SetPersistGenerated(true)
 	}
 	cache.SetDimensionType(dt)
+	cache.SetWaterSourceConversion(s.WaterSourceConversion())
+	cache.SetLavaSourceConversion(s.LavaSourceConversion())
 	cache.SetPressurePlateEntityCounter(func(x, y, z int) int {
 		return s.CountEntitiesAtBlock(norm, x, y, z)
 	})

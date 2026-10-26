@@ -383,6 +383,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	}
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	if h.session != nil {
+		_, _, _, _, inWater := h.srv.StepPlayerFluidAndBubbleColumn(h.session)
 		if h.session.IsFallFlying() {
 			h.srv.HandlePlayerElytraMove(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		} else {
@@ -397,9 +398,11 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 			h.srv.EmitPlayerMovementVibration(h.session, server.GameEventHitGround, x, y, z)
 		}
 		if (x-prev.X)*(x-prev.X)+(z-prev.Z)*(z-prev.Z) > 1e-4 {
-			inWater := false
-			if cache := h.srv.PlayerChunks(h.session); cache != nil {
-				inWater = cache.GetBlock(bx, by, bz) == world.StateWater
+			if !inWater {
+				if cache := h.srv.PlayerChunks(h.session); cache != nil {
+					st := cache.GetBlock(bx, by, bz)
+					inWater = st == world.StateWater || world.IsBubbleColumnBlock(st) || world.IsWaterlogged(st)
+				}
 			}
 			if inWater {
 				h.srv.EmitPlayerMovementVibration(h.session, server.GameEventSwim, x, y, z)
@@ -1779,6 +1782,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 			}
 			if !isAdventure {
+				if heldStack.ResolvedID() == "minecraft:bucket" {
+					if _, _, handled := h.srv.UseFluidBucketOnBlock(h.session, hand, x, y, z, face); handled {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if heldStack.ResolvedID() == "minecraft:bone_meal" {
 					if newStack, grown := h.srv.BoneMealHangingFloraAt(dim, x, y, z, heldStack, creative, nil); grown {
 						if invSlot >= 0 {
@@ -1870,6 +1879,13 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
 				}
 				heldItem := h.session.InventorySlot(invSlot)
+				switch heldItem.ResolvedID() {
+				case "minecraft:bucket", "minecraft:water_bucket", "minecraft:lava_bucket":
+					if _, _, handled := h.srv.UseFluidBucketOnBlock(h.session, hand, x, y, z, face); handled {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if world.IsSnowLayerBlock(cache.GetBlock(x, y, z)) && heldItem.ResolvedID() == "minecraft:snow" {
 					creative := h.session.Snapshot().GameMode == server.GameModeCreative
 					if newStack, stacked := h.srv.StackSnowLayerWithItem(dim, x, y, z, heldItem, creative); stacked {
@@ -2048,6 +2064,17 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						state = fgState
 					}
 				}
+				if world.CanBlockBeWaterlogged(state) {
+					if cache.IsWaterEvaporatingDimension() {
+						if dry, ok := world.SetWaterlogged(state, false); ok {
+							state = dry
+						}
+					} else if existing := cache.GetBlock(px, py, pz); existing == world.StateWater || world.IsBubbleColumnBlock(existing) {
+						if wl, ok := world.SetWaterlogged(state, true); ok {
+							state = wl
+						}
+					}
+				}
 				placed := false
 				if server.IsBedBlock(state) && h.srv != nil {
 					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)
@@ -2072,6 +2099,11 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 				if placed {
 					blockName := world.BlockName(state)
+					if world.IsWaterlogged(state) || blockName == "minecraft:soul_sand" || blockName == "minecraft:magma_block" {
+						if nbRes := cache.UpdateNeighbors(px, py, pz); len(nbRes.Changes) > 0 || len(nbRes.LightChanged) > 0 {
+							h.broadcastBlockChanges(dim, cache, nbRes)
+						}
+					}
 					if h.srv != nil {
 						h.srv.OnSculkBlockPlaced(dim, px, py, pz, state)
 						h.srv.EmitPlayerBlockVibration(h.session, server.GameEventBlockPlace, dim, px, py, pz, blockName)

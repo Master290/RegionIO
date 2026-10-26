@@ -1300,3 +1300,156 @@ func TestProtocol775ClientInfoAvatarDataRotateHeadAndTagQueries(t *testing.T) {
 		t.Fatalf("expected id='minecraft:player' in entity tag query, got %v", idTag)
 	}
 }
+
+func TestFluidBucketsGamerulesBubbleColumnAndWaterlogging(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxViewDistance = 10
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	type sentPkt struct {
+		id   int32
+		body []byte
+	}
+	var mu sync.Mutex
+	var sent []sentPkt
+
+	session, err := srv.RegisterPlayer(
+		Profile{UUID: [16]byte{0xbb, 1}, Name: "FluidTester"},
+		func(id int32, body []byte) error {
+			cp := append([]byte(nil), body...)
+			mu.Lock()
+			sent = append(sent, sentPkt{id: id, body: cp})
+			mu.Unlock()
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	session.mu.Lock()
+	session.gameMode = GameModeSurvival
+	session.mu.Unlock()
+	srv.SetPlayerTransform(session, 2.5, 65.0, 2.5, 0, 0, true)
+
+	// 1. Gamerules waterSourceConversion and lavaSourceConversion sync to dimension caches.
+	if !cache.WaterSourceConversion() || cache.LavaSourceConversion() {
+		t.Fatalf("default cache conversion = (water=%v, lava=%v), want (true, false)",
+			cache.WaterSourceConversion(), cache.LavaSourceConversion())
+	}
+	srv.SetGameRuleBool("waterSourceConversion", false)
+	srv.SetGameRuleBool("lavaSourceConversion", true)
+	if cache.WaterSourceConversion() || !cache.LavaSourceConversion() {
+		t.Fatalf("updated cache conversion = (water=%v, lava=%v), want (false, true)",
+			cache.WaterSourceConversion(), cache.LavaSourceConversion())
+	}
+	netherCache := srv.DimensionChunks(world.DimensionNether)
+	if netherCache.WaterSourceConversion() || !netherCache.LavaSourceConversion() {
+		t.Fatalf("nether cache conversion = (water=%v, lava=%v), want (false, true)",
+			netherCache.WaterSourceConversion(), netherCache.LavaSourceConversion())
+	}
+
+	// 2. Waterlogging a slab with water_bucket and draining it with an empty bucket (PickupFluidAt).
+	slabSt, ok := world.BlockStateByName("minecraft:oak_slab", map[string]string{"type": "bottom", "waterlogged": "false"})
+	if !ok {
+		t.Fatalf("missing oak_slab state")
+	}
+	cache.SetBlock(3, 65, 3, slabSt)
+	hbSlot := session.HeldInventorySlot()
+	session.SetInventorySlot(hbSlot, world.NewNamedItemStack("minecraft:water_bucket", 1))
+
+	res, evap, handled := srv.UseFluidBucketOnBlock(session, HandMain, 3, 65, 3, 1)
+	if !handled || evap || len(res.Changes) == 0 {
+		t.Fatalf("UseFluidBucketOnBlock(water_bucket on slab): handled=%v evap=%v changes=%d", handled, evap, len(res.Changes))
+	}
+	if !world.IsWaterlogged(cache.GetBlock(3, 65, 3)) {
+		t.Fatalf("expected oak_slab at (3,65,3) to be waterlogged")
+	}
+	if got := session.InventorySlot(hbSlot).ResolvedID(); got != "minecraft:bucket" {
+		t.Fatalf("held item after placing water_bucket = %q, want minecraft:bucket", got)
+	}
+
+	// Drain the waterlogged slab with the empty bucket.
+	res, evap, handled = srv.UseFluidBucketOnBlock(session, HandMain, 3, 65, 3, 1)
+	if !handled || evap || len(res.Changes) == 0 {
+		t.Fatalf("UseFluidBucketOnBlock(bucket on waterlogged slab): handled=%v evap=%v changes=%d", handled, evap, len(res.Changes))
+	}
+	if world.IsWaterlogged(cache.GetBlock(3, 65, 3)) {
+		t.Fatalf("expected oak_slab at (3,65,3) to be drained")
+	}
+	if got := session.InventorySlot(hbSlot).ResolvedID(); got != "minecraft:water_bucket" {
+		t.Fatalf("held item after draining waterlogged slab = %q, want minecraft:water_bucket", got)
+	}
+
+	// 3. Nether water evaporation: using water_bucket in the Nether evaporates water and returns empty bucket.
+	session.SetDimension(world.DimensionNether)
+	netherCache.SetBlock(4, 64, 4, world.StateNetherrack)
+	netherCache.SetBlock(4, 65, 4, world.StateAir)
+	_, evap, handled = srv.UseFluidBucketOnBlock(session, HandMain, 4, 64, 4, 1) // face UP -> (4, 65, 4)
+	if !handled || !evap {
+		t.Fatalf("UseFluidBucketOnBlock(water_bucket in Nether): handled=%v evap=%v, want (true, true)", handled, evap)
+	}
+	if netherCache.GetBlock(4, 65, 4) != world.StateAir {
+		t.Fatalf("expected water to evaporate in Nether, got state %d", netherCache.GetBlock(4, 65, 4))
+	}
+	if got := session.InventorySlot(hbSlot).ResolvedID(); got != "minecraft:bucket" {
+		t.Fatalf("held item after Nether evaporation = %q, want minecraft:bucket", got)
+	}
+	session.SetDimension(world.DimensionOverworld)
+
+	// 4. Player movement in bubble_column: BubbleColumnVelocityAt, FallDistance reset to 0, fire extinguish, PlaySetEntityMotion.
+	cache.SetBlock(5, 65, 5, world.BubbleColumnBlockState(false))
+	cache.SetBlock(5, 66, 5, world.StateAir)
+	session.SetFallDistance(12.5)
+	srv.SetPlayerFireTicks(session, 100)
+	srv.SetPlayerTransform(session, 5.5, 65.0, 5.5, 0, 0, false)
+	mu.Lock()
+	sent = nil
+	mu.Unlock()
+
+	vx, vy, vz, inBubble, inWater := srv.StepPlayerFluidAndBubbleColumn(session)
+	if !inBubble || !inWater || vy <= 0 || vx != 0 || vz != 0 {
+		t.Fatalf("StepPlayerFluidAndBubbleColumn(upward) = (%v, %v, %v, bubble=%v, water=%v), want vy > 0, bubble=true",
+			vx, vy, vz, inBubble, inWater)
+	}
+	if fd := session.FallDistance(); fd != 0 {
+		t.Fatalf("expected FallDistance reset to 0 in bubble_column, got %v", fd)
+	}
+	if ft := srv.PlayerFireTicks(session); ft != 0 {
+		t.Fatalf("expected FireTicks extinguished to 0 in bubble_column, got %d", ft)
+	}
+	mu.Lock()
+	hasMotionPkt := false
+	for _, p := range sent {
+		if p.id == protocol.PlaySetEntityMotion {
+			hasMotionPkt = true
+			break
+		}
+	}
+	mu.Unlock()
+	if !hasMotionPkt {
+		t.Fatalf("expected PlaySetEntityMotion (0x65) packet when moving in bubble_column")
+	}
+
+	// 5. Player in a waterlogged block: FallDistance reset to 0 and fire extinguished.
+	wlSlab, _ := world.SetWaterlogged(slabSt, true)
+	cache.SetBlock(6, 65, 6, wlSlab)
+	session.SetFallDistance(9.0)
+	srv.SetPlayerFireTicks(session, 80)
+	srv.SetPlayerTransform(session, 6.5, 65.0, 6.5, 0, 0, true)
+
+	_, _, _, inBubble, inWater = srv.StepPlayerFluidAndBubbleColumn(session)
+	if inBubble || !inWater {
+		t.Fatalf("StepPlayerFluidAndBubbleColumn(waterlogged) = (bubble=%v, water=%v), want (false, true)", inBubble, inWater)
+	}
+	if fd := session.FallDistance(); fd != 0 {
+		t.Fatalf("expected FallDistance reset to 0 in waterlogged block, got %v", fd)
+	}
+	if ft := srv.PlayerFireTicks(session); ft != 0 {
+		t.Fatalf("expected FireTicks extinguished to 0 in waterlogged block, got %d", ft)
+	}
+}
+

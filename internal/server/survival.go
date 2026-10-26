@@ -47,6 +47,9 @@ type playerSurvivalState struct {
 	drawingHand       int32
 	ticksFrozen       int
 	freezeTickCounter int
+	bubbleVX          float64
+	bubbleVY          float64
+	bubbleVZ          float64
 }
 
 var playerSurvivalStates sync.Map // map[*PlayerSession]*playerSurvivalState
@@ -89,6 +92,38 @@ func (session *PlayerSession) FallDistance() float64 {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.fallDistance
+}
+
+// ResetFallDistance resets the player's accumulated fall distance to 0.
+func (session *PlayerSession) ResetFallDistance() {
+	if session == nil {
+		return
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.fallDistance = 0
+	st.mu.Unlock()
+}
+
+// SetFallDistance sets the player's accumulated fall distance.
+func (session *PlayerSession) SetFallDistance(dist float64) {
+	if session == nil {
+		return
+	}
+	if dist < 0 {
+		dist = 0
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.fallDistance = dist
+	st.mu.Unlock()
+}
+
+// ResetPlayerFallDistance resets session's accumulated fall distance to 0.
+func (s *Server) ResetPlayerFallDistance(session *PlayerSession) {
+	if session != nil {
+		session.ResetFallDistance()
+	}
 }
 
 // Health returns the player's current health points.
@@ -1276,6 +1311,16 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 		return 0
 	}
 
+	if cache := s.DimensionChunks(world.NormalizeDimension(snap.Dimension)); cache != nil {
+		bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(newY)), int(math.Floor(snap.Z))
+		if isWaterOrBubbleOrWaterloggedAt(cache, bx, by, bz) || isWaterOrBubbleOrWaterloggedAt(cache, bx, by+1, bz) {
+			st.mu.Lock()
+			st.fallDistance = 0
+			st.mu.Unlock()
+			return 0
+		}
+	}
+
 	dy := newY - oldY
 	jumped := false
 	fellFar := false
@@ -1459,6 +1504,12 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 	}
 
 	switch itemID {
+	case "minecraft:bucket":
+		if _, ok := s.UseEmptyBucketInAir(session, hand); ok {
+			return true
+		}
+		return false
+
 	case GoatHornItemID:
 		if s.UseGoatHornItem(session, hand, "") {
 			s.RecordItemUsed(session, itemID, 1)
@@ -2107,6 +2158,7 @@ func (s *Server) TickAllPlayersCampfireContactDamage() {
 	for _, sess := range sessions {
 		s.ApplyCampfireContactDamageToPlayer(sess)
 		s.StepPlayerPowderSnow(sess)
+		s.StepPlayerFluidAndBubbleColumn(sess)
 	}
 }
 
@@ -2216,13 +2268,14 @@ func (s *Server) CheckPlayersInFire() []FireContactDamage {
 	return out
 }
 
-// TickFire synchronizes fire/TNT gamerules to dimension caches and processes
+// TickFire synchronizes fire/TNT/fluid gamerules to dimension caches and processes
 // player fire contact damage on each server tick.
 func (s *Server) TickFire() {
 	if s == nil {
 		return
 	}
 	s.syncTNTAndFireRulesToCaches()
+	s.syncFluidConversionRulesToCaches()
 	_ = s.CheckPlayersInFire()
 }
 
@@ -3955,4 +4008,300 @@ func (s *Server) HandlePickItemFromEntityPacket(session *PlayerSession, r *proto
 	s.PickItemFromEntity(session, entityID, includeData)
 	return nil
 }
+
+var bucketFaceOffsets = [6][3]int{
+	{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0},
+}
+
+func isWaterOrBubbleOrWaterloggedAt(cache *world.Cache, x, y, z int) bool {
+	if cache == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return false
+	}
+	st := cache.GetBlock(x, y, z)
+	if st == world.StateWater || world.IsBubbleColumnBlock(st) || world.IsWaterlogged(st) {
+		return true
+	}
+	if kind, _, _, _, _, ok := world.ClassifyFluidState(st); ok && kind == world.FluidWater {
+		return true
+	}
+	return false
+}
+
+// StepPlayerFluidAndBubbleColumn checks whether session is inside a
+// `minecraft:bubble_column`, `minecraft:water`, or a `waterlogged="true"` block:
+//   - In `minecraft:bubble_column`: computes updated velocity via
+//     `cache.BubbleColumnVelocityAt`, resets `FallDistance` to `0`, extinguishes
+//     player fire ticks, and sends `PlaySetEntityMotion` to session.
+//   - In `water` or `waterlogged="true"` block: resets `FallDistance` to `0`
+//     and extinguishes player fire ticks (or evaporates waterlogged water in
+//     ultrawarm dimensions such as the Nether).
+func (s *Server) StepPlayerFluidAndBubbleColumn(session *PlayerSession) (vx, vy, vz float64, inBubbleColumn, inWater bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return 0, 0, 0, false, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return 0, 0, 0, false, false
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return 0, 0, 0, false, false
+	}
+	bx, by, bz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
+	st := getSurvivalState(session)
+
+	st.mu.Lock()
+	curVX, curVY, curVZ := st.bubbleVX, st.bubbleVY, st.bubbleVZ
+	st.mu.Unlock()
+
+	nx, ny, nz, ok := cache.BubbleColumnVelocityAt(bx, by, bz, curVX, curVY, curVZ)
+	if !ok && by+1 < world.MinY+world.WorldHeight {
+		nx, ny, nz, ok = cache.BubbleColumnVelocityAt(bx, by+1, bz, curVX, curVY, curVZ)
+	}
+	if ok {
+		st.mu.Lock()
+		st.fallDistance = 0
+		st.bubbleVX = nx
+		st.bubbleVY = ny
+		st.bubbleVZ = nz
+		st.mu.Unlock()
+		if s.PlayerFireTicks(session) > 0 {
+			s.SetPlayerFireTicks(session, 0)
+		}
+		if session.send != nil {
+			_ = session.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(snap.EntityID, nx, ny, nz))
+		}
+		return nx, ny, nz, true, true
+	}
+
+	st.mu.Lock()
+	st.bubbleVX = 0
+	st.bubbleVY = 0
+	st.bubbleVZ = 0
+	st.mu.Unlock()
+
+	evaporates := cache.IsWaterEvaporatingDimension()
+	for _, cy := range [2]int{by, by + 1} {
+		if cy < world.MinY || cy >= world.MinY+world.WorldHeight {
+			continue
+		}
+		blk := cache.GetBlock(bx, cy, bz)
+		if world.IsWaterlogged(blk) && evaporates {
+			if dry, changed := world.SetWaterlogged(blk, false); changed {
+				if applied, upd := cache.ApplyBlockWithUpdates(bx, cy, bz, dry); applied {
+					s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+					s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), PlaySoundPacketID,
+						EncodeSoundPacket("minecraft:block.fire.extinguish", SoundSourceBlocks, float64(bx)+0.5, float64(cy)+0.5, float64(bz)+0.5, 0.5, 2.6, 0))
+				}
+			}
+			continue
+		}
+		if isWaterOrBubbleOrWaterloggedAt(cache, bx, cy, bz) {
+			inWater = true
+		}
+	}
+
+	if inWater {
+		st.mu.Lock()
+		st.fallDistance = 0
+		st.mu.Unlock()
+		if s.PlayerFireTicks(session) > 0 {
+			s.SetPlayerFireTicks(session, 0)
+		}
+	}
+	return 0, 0, 0, false, inWater
+}
+
+func (s *Server) giveOrReplaceFilledBucket(session *PlayerSession, invSlot int, heldStack world.ItemStack, bucketItem string) world.ItemStack {
+	filledStack := world.NewNamedItemStack(bucketItem, 1)
+	if session == nil || invSlot < 0 || invSlot >= world.PlayerInventorySlots {
+		return filledStack
+	}
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	if snap.GameMode != GameModeCreative {
+		if heldStack.Count <= 1 {
+			session.SetInventorySlot(invSlot, filledStack)
+			if session.send != nil {
+				_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), invSlot, filledStack))
+			}
+		} else {
+			remStack := world.NewItemStack(heldStack.ResolvedItemID(), heldStack.Count-1)
+			session.SetInventorySlot(invSlot, remStack)
+			added, changedSlots := session.AddItemToInventory(filledStack)
+			if added <= 0 && s != nil {
+				_, _ = s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, filledStack)
+			}
+			if session.send != nil {
+				_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), invSlot, session.InventorySlot(invSlot)))
+				for _, cs := range changedSlots {
+					_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), cs, session.InventorySlot(cs)))
+				}
+			}
+		}
+	}
+	if s != nil {
+		s.RecordItemUsed(session, "minecraft:bucket", 1)
+		s.TriggerItemAcquired(session, filledStack)
+		s.TriggerInventoryChanged(session)
+	}
+	return filledStack
+}
+
+// UseFluidBucketOnBlock handles right-clicking block (x, y, z) on face (0..5)
+// with an empty bucket ("minecraft:bucket"), water bucket ("minecraft:water_bucket"),
+// or lava bucket ("minecraft:lava_bucket"):
+//   - "minecraft:bucket": calls cache.PickupFluidAt at (x, y, z) (and if not
+//     found, at the adjacent cell along face), broadcasts res.Changes and
+//     res.LightChanged, and gives the filled bucket to session.
+//   - "minecraft:water_bucket" / "minecraft:lava_bucket": resolves the target
+//     cell (waterlogging (x, y, z) when CanBlockBeWaterlogged and not sneaking,
+//     or placing at the adjacent cell along face), calls cache.PlaceFluidAt
+//     (handling water evaporation in the Nether and extinguishing fire/campfires),
+//     broadcasts res.Changes and res.LightChanged, and replaces the held bucket
+//     with "minecraft:bucket" in survival mode.
+func (s *Server) UseFluidBucketOnBlock(session *PlayerSession, hand int32, x, y, z int, face int32) (res world.BlockUpdateResult, evaporated bool, handled bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return res, false, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || snap.GameMode == GameModeAdventure {
+		return res, false, false
+	}
+	invSlot, heldStack := session.handSlotAndStack(hand)
+	if heldStack.IsEmpty() {
+		return res, false, false
+	}
+	itemID := canonicalItemName(heldStack.ResolvedID())
+	if itemID != "minecraft:bucket" && itemID != "minecraft:water_bucket" && itemID != "minecraft:lava_bucket" {
+		return res, false, false
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return res, false, false
+	}
+
+	if itemID == "minecraft:bucket" {
+		tx, ty, tz := x, y, z
+		bucketItem, ok, pickupRes := cache.PickupFluidAt(tx, ty, tz)
+		if !ok && face >= 0 && int(face) < len(bucketFaceOffsets) {
+			off := bucketFaceOffsets[face]
+			tx, ty, tz = x+off[0], y+off[1], z+off[2]
+			bucketItem, ok, pickupRes = cache.PickupFluidAt(tx, ty, tz)
+		}
+		if !ok {
+			return res, false, false
+		}
+		res = pickupRes
+		s.InvalidatePortalPOIs(dim, res.Changes)
+		if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+			s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+		}
+		s.giveOrReplaceFilledBucket(session, invSlot, heldStack, bucketItem)
+		s.EmitPlayerBlockVibration(session, GameEventFluidPickup, dim, tx, ty, tz, bucketItem)
+		return res, false, true
+	}
+
+	kind := world.FluidWater
+	if itemID == "minecraft:lava_bucket" {
+		kind = world.FluidLava
+	}
+	clickedState := cache.GetBlock(x, y, z)
+	tx, ty, tz := x, y, z
+	if kind == world.FluidWater && !session.IsSneaking() && world.CanBlockBeWaterlogged(clickedState) && !world.IsWaterlogged(clickedState) {
+		tx, ty, tz = x, y, z
+	} else if face >= 0 && int(face) < len(bucketFaceOffsets) {
+		off := bucketFaceOffsets[face]
+		tx, ty, tz = x+off[0], y+off[1], z+off[2]
+	}
+
+	prevTargetState := cache.GetBlock(tx, ty, tz)
+	if kind == world.FluidWater && !cache.IsWaterEvaporatingDimension() && IsCampfireBlock(prevTargetState) && CampfireStateLit(prevTargetState) {
+		s.ExtinguishCampfire(dim, tx, ty, tz, false)
+	}
+
+	placed, evap, placeRes := cache.PlaceFluidAt(tx, ty, tz, kind)
+	if !placed {
+		return res, false, false
+	}
+	res = placeRes
+	evaporated = evap
+	s.InvalidatePortalPOIs(dim, res.Changes)
+	if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+		s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+	}
+	if evaporated {
+		s.BroadcastDimensionChunk(dim, int32(tx>>4), int32(tz>>4), PlaySoundPacketID,
+			EncodeSoundPacket("minecraft:block.fire.extinguish", SoundSourceBlocks, float64(tx)+0.5, float64(ty)+0.5, float64(tz)+0.5, 0.5, 2.6, 0))
+	}
+	if snap.GameMode != GameModeCreative && invSlot >= 0 && invSlot < world.PlayerInventorySlots {
+		emptyBucket := world.NewNamedItemStack("minecraft:bucket", 1)
+		session.SetInventorySlot(invSlot, emptyBucket)
+		if session.send != nil {
+			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), invSlot, emptyBucket))
+		}
+	}
+	s.RecordItemUsed(session, itemID, 1)
+	s.TriggerInventoryChanged(session)
+	s.EmitPlayerBlockVibration(session, GameEventFluidPlace, dim, tx, ty, tz, itemID)
+	return res, evaporated, true
+}
+
+// UseEmptyBucketInAir raycasts up to 5 blocks from session's eye along their
+// look direction and picks up the first fluid source, bubble_column, or
+// waterlogged block via cache.PickupFluidAt.
+func (s *Server) UseEmptyBucketInAir(session *PlayerSession, hand int32) (res world.BlockUpdateResult, handled bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return res, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || snap.GameMode == GameModeAdventure {
+		return res, false
+	}
+	invSlot, heldStack := session.handSlotAndStack(hand)
+	if heldStack.IsEmpty() || canonicalItemName(heldStack.ResolvedID()) != "minecraft:bucket" {
+		return res, false
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return res, false
+	}
+	lx, ly, lz := ElytraLookVector(snap.Yaw, snap.Pitch)
+	eyeX, eyeY, eyeZ := snap.X, snap.Y+1.62, snap.Z
+	var lastBx, lastBy, lastBz int
+	hasLast := false
+	for step := 1; step <= 20; step++ {
+		dist := float64(step) * 0.25
+		bx := int(math.Floor(eyeX + lx*dist))
+		by := int(math.Floor(eyeY + ly*dist))
+		bz := int(math.Floor(eyeZ + lz*dist))
+		if hasLast && bx == lastBx && by == lastBy && bz == lastBz {
+			continue
+		}
+		lastBx, lastBy, lastBz = bx, by, bz
+		hasLast = true
+		if by < world.MinY || by >= world.MinY+world.WorldHeight {
+			continue
+		}
+		if bucketItem, ok, pickupRes := cache.PickupFluidAt(bx, by, bz); ok {
+			res = pickupRes
+			s.InvalidatePortalPOIs(dim, res.Changes)
+			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+				s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+			}
+			s.giveOrReplaceFilledBucket(session, invSlot, heldStack, bucketItem)
+			s.EmitPlayerBlockVibration(session, GameEventFluidPickup, dim, bx, by, bz, bucketItem)
+			return res, true
+		}
+		cur := cache.GetBlock(bx, by, bz)
+		if !isPassableBlock(cur) {
+			break
+		}
+	}
+	return res, false
+}
+
 

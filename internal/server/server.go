@@ -270,6 +270,8 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		stopCh:           make(chan struct{}),
 	}
 	if chunks != nil {
+		chunks.SetWaterSourceConversion(s.WaterSourceConversion())
+		chunks.SetLavaSourceConversion(s.LavaSourceConversion())
 		chunks.SetPressurePlateEntityCounter(func(x, y, z int) int {
 			return s.CountEntitiesAtBlock(world.DimensionOverworld, x, y, z)
 		})
