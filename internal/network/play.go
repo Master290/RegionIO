@@ -276,6 +276,12 @@ func (h *handler) sendContainerSetContent() error {
 					continue
 				}
 			}
+			if server.IsBundleItem(inv[i].ResolvedID()) {
+				if bundleItems := server.GetSlotBundleContents(h.session, i); len(bundleItems) > 0 {
+					server.EncodeSlotWithBundleContents(w, inv[i], bundleItems)
+					continue
+				}
+			}
 			if id := inv[i].ResolvedID(); server.IsBannerItem(id) || id == "minecraft:shield" {
 				pats := server.GetSlotBannerPatterns(h.session, i)
 				baseCol := server.GetSlotShieldBaseColor(h.session, i)
@@ -331,6 +337,12 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 		case server.FireworkStarItemID:
 			if exp, ok := server.GetSlotFireworkStar(h.session, slot); ok {
 				server.EncodeSlotWithFireworkStar(w, stack, exp)
+				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
+			}
+		}
+		if server.IsBundleItem(stack.ResolvedID()) {
+			if bundleItems := server.GetSlotBundleContents(h.session, slot); len(bundleItems) > 0 {
+				server.EncodeSlotWithBundleContents(w, stack, bundleItems)
 				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 			}
 		}
@@ -612,6 +624,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickCauldrons(nil)
 			h.srv.TickVehicles()
 			h.srv.TickPortals()
+			h.srv.TickMaps()
 			h.srv.TickPrimedTNT()
 			h.srv.TickDispenserProjectiles()
 			h.srv.TickAllPlayerStats()
@@ -1032,6 +1045,14 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
+				if _, handled := h.srv.UseBundleInAir(h.session, hand); handled {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if h.srv.OpenPlayerWrittenBook(h.session, hand) {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
 				if _, started := h.srv.StartUsingSpyglass(h.session, hand); started {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
@@ -1376,12 +1397,18 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayBundleItemSelectedSB:
+		if h.srv != nil && h.session != nil {
+			return h.srv.HandleBundleItemSelectedPacket(h.session, pkt.Body())
+		}
+		return nil
+
 	case protocol.PlayClientTickEnd, protocol.PlayChunkBatchReceivedSB,
 		protocol.PlayPongSB, protocol.PlayChatAckSB, protocol.PlayChatSessionUpdateSB,
 		protocol.PlayConfigurationAcknowledged, protocol.PlayCookieResponseSB,
 		protocol.PlayCustomPayload, protocol.PlayDebugSubscriptionRequestSB,
 		protocol.PlayResourcePackSB, protocol.PlayCustomClickActionSB,
-		protocol.PlayBundleItemSelectedSB, protocol.PlayJigsawGenerateSB,
+		protocol.PlayJigsawGenerateSB,
 		protocol.PlaySetCommandBlockSB, protocol.PlaySetCommandMinecartSB,
 		protocol.PlaySetJigsawBlockSB, protocol.PlaySetStructureBlockSB,
 		protocol.PlayTestInstanceBlockActionSB:
@@ -1807,6 +1834,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 			}
 			if !isAdventure {
+				if heldStack.ResolvedID() == server.BrushItemID && world.IsBrushableBlock(clickedState) {
+					if _, _, _, handled := h.srv.UsePlayerBrushOnBlock(h.session, hand, x, y, z, face); handled {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if heldStack.ResolvedID() == "minecraft:bucket" {
 					if _, _, handled := h.srv.UseFluidBucketOnBlock(h.session, hand, x, y, z, face); handled {
 						h.syncHotbarFromSession()

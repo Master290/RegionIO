@@ -1704,4 +1704,280 @@ func TestThrownSplashPotionRaycastAndWaterFireExtinguish(t *testing.T) {
 	}
 }
 
+func TestBundleWeightLimitsNestingPickupDropAndUseInAir(t *testing.T) {
+	// 1. Verify weight rules (64 / maxStackSize, nested bundle = 4 + inner, shulker disallowed).
+	if w := BundleSingleItemWeight("minecraft:cobblestone", nil); w != 1 {
+		t.Fatalf("expected cobblestone bundle weight 1, got %d", w)
+	}
+	if w := BundleSingleItemWeight("minecraft:ender_pearl", nil); w != 4 {
+		t.Fatalf("expected ender_pearl bundle weight 4, got %d", w)
+	}
+	if w := BundleSingleItemWeight("minecraft:diamond_sword", nil); w != 64 {
+		t.Fatalf("expected diamond_sword bundle weight 64, got %d", w)
+	}
+	nested := []world.ItemStack{world.NewNamedItemStack("minecraft:ender_pearl", 2)}
+	if w := BundleSingleItemWeight("minecraft:red_bundle", nested); w != 4+8 {
+		t.Fatalf("expected nested red_bundle weight 12 (4 + 2*4), got %d", w)
+	}
+	if CanInsertIntoBundle("minecraft:shulker_box") || CanInsertIntoBundle("minecraft:cyan_shulker_box") {
+		t.Fatalf("expected shulker boxes to be disallowed inside bundles")
+	}
+
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x95}, Name: "Packer"}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	srv.SetPlayerTransform(session, 0.5, 65.0, 0.5, 0, 0, true)
+	session.SetSelectedSlot(0)
+	hb0 := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hb0, world.NewNamedItemStack("minecraft:bundle", 1))
+
+	// 2. Right-click cobblestone (count 20) onto bundle in hb0 via HandleContainerClick.
+	session.SetCarriedItem(world.NewNamedItemStack("minecraft:cobblestone", 20))
+	if err := srv.HandleContainerClick(session, 0, hb0, 1, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick insert cobblestone: %v", err)
+	}
+	if !session.CarriedItem().IsEmpty() {
+		t.Fatalf("expected all 20 cobblestone inserted into bundle, carried=%+v", session.CarriedItem())
+	}
+	// Right-click a nested blue_bundle containing 2 ender pearls (weight = 4 + 8 = 12) onto the bundle in hb0.
+	session.SetCarriedItem(world.NewNamedItemStack("minecraft:blue_bundle", 1))
+	SetCarriedBundleContents(session, nested)
+	if err := srv.HandleContainerClick(session, 0, hb0, 1, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick insert nested bundle: %v", err)
+	}
+	if !session.CarriedItem().IsEmpty() {
+		t.Fatalf("expected nested blue_bundle inserted into bundle")
+	}
+	contents := GetSlotBundleContents(session, hb0)
+	if len(contents) != 2 {
+		t.Fatalf("expected 2 entries in bundle, got len=%d (%+v)", len(contents), contents)
+	}
+
+	// 3. Select index 1 (the cobblestone entry) via PlayBundleItemSelectedSB and eject via UseBundleInAir.
+	w := protocol.NewWriter(8)
+	w.VarInt(int32(hb0))
+	w.VarInt(1)
+	if err := srv.HandleBundleItemSelectedPacket(session, protocol.NewReader(w.Bytes())); err != nil {
+		t.Fatalf("HandleBundleItemSelectedPacket: %v", err)
+	}
+	if got := GetSlotBundleSelectedIndex(session, hb0); got != 1 {
+		t.Fatalf("expected bundle selected index 1, got %d", got)
+	}
+	dropped, handled := srv.UseBundleInAir(session, HandMain)
+	if !handled || dropped.ResolvedID() != "minecraft:cobblestone" || dropped.Count != 20 {
+		t.Fatalf("expected UseBundleInAir to eject 20 cobblestone, got handled=%v stack=%+v", handled, dropped)
+	}
+	// Clear the ejected cobblestone entity before testing bundle drop/pickup.
+	for _, ent := range srv.Entities().All() {
+		if ent.IsItem() {
+			srv.Entities().Remove(ent.ID)
+		}
+	}
+
+	// 4. Drop the bundle itself and pick it back up; verify contents survive.
+	entID, _ := srv.DropSelectedItem(session, true)
+	if entID <= 0 {
+		t.Fatalf("expected positive dropped bundle entity ID")
+	}
+	srv.Entities().Update(entID, func(e *world.Entity) {
+		e.X, e.Y, e.Z = 0.5, 65.0, 0.5
+		e.PickupDelay = 0
+	})
+	if picked := srv.TryPickupItems(session); picked != 1 {
+		t.Fatalf("expected to pick up 1 bundle, got %d", picked)
+	}
+	restored := GetSlotBundleContents(session, hb0)
+	if len(restored) != 1 || restored[0].ResolvedID() != "minecraft:blue_bundle" {
+		t.Fatalf("expected restored bundle to contain nested blue_bundle, got %+v", restored)
+	}
+}
+
+func TestBrushSuspiciousSandAndGravelLootWearAndSalvageSherd(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x96}, Name: "Archaeologist"}, func(id int32, body []byte) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	session.SetSelectedSlot(0)
+	hb0 := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hb0, world.NewNamedItemStack("minecraft:brush", 1))
+
+	bx, by, bz := 4, 65, 4
+	cache.SetBlock(bx, by, bz, world.BrushableBlockState("minecraft:suspicious_sand", 0))
+	cache.AddStructureBlockEntity(world.StructureBlockEntity{
+		ID:        "minecraft:brushable_block",
+		X:         bx,
+		Y:         by,
+		Z:         bz,
+		LootTable: world.ArchaeologyLootDesertPyramid,
+	})
+
+	// Steps 1..3 increment dusted: 0 -> 1 -> 2 -> 3.
+	for wantStage := 1; wantStage <= 3; wantStage++ {
+		stage, completed, popped, handled := srv.UsePlayerBrushOnBlock(session, HandMain, bx, by, bz, 1)
+		if !handled || completed || !popped.IsEmpty() || stage != wantStage {
+			t.Fatalf("step %d: got stage=%d completed=%v popped=%+v handled=%v", wantStage, stage, completed, popped, handled)
+		}
+	}
+
+	// Step 4 completes excavation, converts to sand, pops item, wears brush by 1, and grants salvage_sherd if sherd.
+	// Seed a deterministic pottery sherd in the StructureBlockEntity for the final brush step.
+	cache.AddStructureBlockEntity(world.StructureBlockEntity{
+		ID:        "minecraft:brushable_block",
+		X:         bx,
+		Y:         by,
+		Z:         bz,
+		LootTable: world.ArchaeologyLootDesertWell,
+		LootTableSeed: 1, // deterministic roll
+	})
+	_, completed, popped, handled := srv.UsePlayerBrushOnBlock(session, HandMain, bx, by, bz, 1)
+	if !handled || !completed || popped.IsEmpty() {
+		t.Fatalf("expected 4th brush step to complete and pop loot item, got completed=%v popped=%+v handled=%v", completed, popped, handled)
+	}
+	if gotBlock := world.BlockName(cache.GetBlock(bx, by, bz)); gotBlock != "minecraft:sand" {
+		t.Fatalf("expected suspicious_sand to turn into minecraft:sand, got %q", gotBlock)
+	}
+	if dmg := GetSlotItemMeta(session, hb0).Damage; dmg != 1 {
+		t.Fatalf("expected brush durability damage 1, got %d", dmg)
+	}
+}
+
+func TestCartographyLockingBookOpenAndCreativeMiddleClickClone(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = ""
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	var gotOpenBook0x37 bool
+	var mu sync.Mutex
+	session, err := srv.RegisterPlayer(Profile{UUID: [16]byte{0x97}, Name: "Cartographer"}, func(id int32, body []byte) error {
+		mu.Lock()
+		if id == protocol.PlayOpenBook {
+			gotOpenBook0x37 = true
+		}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+
+	// 1. Empty map -> filled_map, then lock on Cartography Table via HandleContainerClick.
+	srv.SetPlayerGameMode(session, GameModeSurvival)
+	session.SetSelectedSlot(0)
+	hb0 := world.HotbarContainerOffset + 0
+	session.SetInventorySlot(hb0, world.NewNamedItemStack(EmptyMapItemID, 1))
+	if !srv.UseEmptyMap(session, HandMain) {
+		t.Fatalf("expected UseEmptyMap to create filled_map")
+	}
+	mapID, ok := GetSlotMapID(session, hb0)
+	if !ok || mapID < 0 {
+		t.Fatalf("expected filled_map in hb0 to have valid MapID")
+	}
+
+	cartTable, _ := world.BlockStateByName("minecraft:cartography_table", nil)
+	cache.SetBlock(2, 65, 2, cartTable)
+	opened, cid, err := srv.InteractBlock(session, 2, 65, 2)
+	if err != nil || !opened {
+		t.Fatalf("InteractBlock(cartography_table): opened=%v err=%v", opened, err)
+	}
+	// Move filled_map into cartography slot 0 (from menu slot 30 = hotbar 0) and glass_pane into slot 1, then click result slot 2 via HandleContainerClick.
+	if err := srv.HandleContainerClick(session, cid, 30, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("pickup filled_map: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, CartographySlotMap, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("place filled_map in cartography slot 0: %v", err)
+	}
+	session.SetCarriedItem(world.NewNamedItemStack("minecraft:glass_pane", 1))
+	if err := srv.HandleContainerClick(session, cid, CartographySlotAdditional, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("place glass_pane in cartography slot 1: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, CartographySlotResult, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("take locked map from cartography slot 2: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, 30, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("place locked map back into hotbar: %v", err)
+	}
+	_ = srv.CloseCartographyContainer(session, cid, false)
+
+	lockedMapID, hasMap := GetSlotMapID(session, hb0)
+	if !hasMap {
+		t.Fatalf("expected locked map in hb0 to retain MapID")
+	}
+	md, exists := srv.GetMapData(lockedMapID)
+	if !exists || !md.Locked {
+		t.Fatalf("expected map %d to be locked after cartography table locking", lockedMapID)
+	}
+
+	// 2. Written book right-click via OpenPlayerWrittenBook sends protocol.PlayOpenBook (0x37).
+	session.SetInventorySlot(hb0, world.NewNamedItemStack(WrittenBookItemID, 1))
+	SetSlotWrittenBook(session, hb0, WrittenBookContent{
+		Title:  FilterableString{Raw: "Chronicle"},
+		Author: "Cartographer",
+		Pages:  []FilterableComponent{{Raw: TextComponent("Page 1")}},
+	})
+	if !srv.OpenPlayerWrittenBook(session, HandMain) {
+		t.Fatalf("expected OpenPlayerWrittenBook to return true")
+	}
+	mu.Lock()
+	openSent := gotOpenBook0x37
+	mu.Unlock()
+	if !openSent {
+		t.Fatalf("expected protocol.PlayOpenBook (0x37) packet when opening written_book")
+	}
+
+	// 3. Creative middle-click with includeData == true copies Banner patterns + CustomName.
+	srv.SetPlayerGameMode(session, GameModeCreative)
+	bannerSt, _ := world.BlockStateByName("minecraft:white_banner", map[string]string{"rotation": "0"})
+	cache.SetBlock(6, 65, 6, bannerSt)
+	srv.SetBannerAt(&BannerBlockEntity{
+		Dimension:  world.DimensionOverworld,
+		X:          6,
+		Y:          65,
+		Z:          6,
+		BaseColor:  "white",
+		CustomName: &ChatComponent{Text: "Royal Standard"},
+		Patterns: BannerPatternsComponent{
+			Layers: []BannerPatternLayer{{Pattern: "minecraft:cross", Color: "red"}},
+		},
+	})
+	session.SetInventorySlot(hb0, world.ItemStack{})
+	if !srv.PickItemFromBlock(session, 6, 65, 6, true) {
+		t.Fatalf("expected PickItemFromBlock(includeData=true) on banner to succeed")
+	}
+	pickedSlot := session.HeldInventorySlot()
+	if gotName := GetSlotItemMeta(session, pickedSlot).CustomName; gotName != "Royal Standard" {
+		t.Fatalf("expected picked banner CustomName %q, got %q", "Royal Standard", gotName)
+	}
+	if pats := GetSlotBannerPatterns(session, pickedSlot); len(pats.Layers) != 1 || pats.Layers[0].Color != "red" {
+		t.Fatalf("expected picked banner patterns copied, got %+v", pats)
+	}
+}
+
+
 

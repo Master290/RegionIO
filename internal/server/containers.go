@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"strings"
 	"sync"
 
 	"regionio/internal/nbt"
@@ -162,6 +163,11 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 		SetCarriedItemMeta(session, ItemMeta{})
 		SetCarriedPotionType(session, "")
 		SetCarriedArmorTrim(session, ArmorTrim{})
+		SetCarriedMapID(session, 0, false)
+		SetCarriedWritableBook(session, WritableBookContent{}, false)
+		SetCarriedWrittenBook(session, WrittenBookContent{}, false)
+		SetCarriedGoatHornInstrument(session, "")
+		SetCarriedBundleContents(session, nil)
 	}
 }
 
@@ -817,18 +823,37 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 				dropCount = 1
 			}
 			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
+			carriedMapID, hasCarriedMap := GetCarriedMapID(session)
+			carriedHorn := GetCarriedGoatHornInstrument(session)
+			carriedBundle := GetCarriedBundleContents(session)
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
 				SetCarriedItemMeta(session, ItemMeta{})
 				SetCarriedPotionType(session, "")
 				SetCarriedArmorTrim(session, ArmorTrim{})
+				SetCarriedMapID(session, 0, false)
+				SetCarriedWritableBook(session, WritableBookContent{}, false)
+				SetCarriedWrittenBook(session, WrittenBookContent{}, false)
+				SetCarriedGoatHornInstrument(session, "")
+				SetCarriedBundleContents(session, nil)
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
 			tr.mu.Unlock()
 			snap := session.Snapshot()
-			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			entID, _ := s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			if entID > 0 {
+				if hasCarriedMap && dropStack.ResolvedID() == FilledMapItemID {
+					s.AssociateDroppedMapEntity(entID, carriedMapID)
+				}
+				if carriedHorn != "" && dropStack.ResolvedID() == GoatHornItemID {
+					s.AssociateDroppedGoatHornEntity(entID, carriedHorn)
+				}
+				if len(carriedBundle) > 0 && IsBundleItem(dropStack.ResolvedID()) {
+					s.AssociateDroppedBundleEntity(entID, carriedBundle)
+				}
+			}
 			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 			return s.syncOpenContainer(session)
 		}
@@ -957,7 +982,13 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		return s.syncBrewingStandViewers(session, bx, by, bz)
 	case MenuTypeCartographyTable:
 		tr.mu.Unlock()
-		return s.HandleCartographyContainerClick(session, containerID, slot, button, mode)
+		if err := s.HandleCartographyContainerClick(session, containerID, slot, button, mode); err != nil {
+			return err
+		}
+		s.syncCartographyMapSlots(session, containerID)
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		return nil
 	case MenuTypeLoom:
 		tr.mu.Unlock()
 		err := s.HandleLoomClick(session, ContainerClick{
@@ -1461,6 +1492,9 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 		isArmorSlot := slot >= ArmorSlotHead && slot <= ArmorSlotFeet
 		switch mode {
 		case ContainerInputPickup:
+			if button == 1 && s.tryApplyBundlePickupClick(session, slot, slots, metas, &tr.carried) {
+				break
+			}
 			if isArmorSlot {
 				if HasBindingCurseOnSlot(session, slot) && !slots[slot].IsEmpty() {
 					return
@@ -1497,6 +1531,18 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			}
 			carriedMeta := GetCarriedItemMeta(session)
 			carriedTrim, _ := GetCarriedArmorTrim(session)
+			slotBundle := GetSlotBundleContents(session, slot)
+			carriedBundle := GetCarriedBundleContents(session)
+			slotMapID, hasSlotMap := GetSlotMapID(session, slot)
+			carriedMapID, hasCarriedMap := GetCarriedMapID(session)
+			slotHorn := GetSlotGoatHornInstrument(session, slot)
+			carriedHorn := GetCarriedGoatHornInstrument(session)
+			slotPotion := GetSlotPotionType(session, slot)
+			carriedPotion := GetCarriedPotionType(session)
+			slotWritable, hasSlotWritable := GetSlotWritableBook(session, slot)
+			carriedWritable, hasCarriedWritable := GetCarriedWritableBook(session)
+			slotWritten, hasSlotWritten := GetSlotWrittenBook(session, slot)
+			carriedWritten, hasCarriedWritten := GetCarriedWrittenBook(session)
 
 			if isArmorSlot && slots[slot].IsEmpty() && !tr.carried.IsEmpty() && tr.carried.Count > 1 {
 				slots[slot] = world.NewItemStack(tr.carried.ResolvedItemID(), 1)
@@ -1509,16 +1555,76 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 				switch {
 				case prevSlotEmpty && !slots[slot].IsEmpty():
 					trims[slot] = carriedTrim
+					SetSlotBundleContents(session, slot, carriedBundle)
+					SetSlotGoatHornInstrument(session, slot, carriedHorn)
+					SetSlotPotionType(session, slot, carriedPotion)
+					if hasCarriedMap {
+						SetSlotMapID(session, slot, carriedMapID)
+					} else {
+						ClearSlotMapID(session, slot)
+					}
+					if hasCarriedWritable {
+						SetSlotWritableBook(session, slot, carriedWritable)
+					} else {
+						ClearSlotWritableBook(session, slot)
+					}
+					if hasCarriedWritten {
+						SetSlotWrittenBook(session, slot, carriedWritten)
+					} else {
+						ClearSlotWrittenBook(session, slot)
+					}
 					if tr.carried.IsEmpty() {
 						carriedTrim = ArmorTrim{}
+						SetCarriedBundleContents(session, nil)
+						SetCarriedGoatHornInstrument(session, "")
+						SetCarriedPotionType(session, "")
+						SetCarriedMapID(session, 0, false)
+						SetCarriedWritableBook(session, WritableBookContent{}, false)
+						SetCarriedWrittenBook(session, WrittenBookContent{}, false)
 					}
 				case prevCarriedEmpty && !tr.carried.IsEmpty():
 					carriedTrim = slotTrim
+					SetCarriedBundleContents(session, slotBundle)
+					SetCarriedGoatHornInstrument(session, slotHorn)
+					SetCarriedPotionType(session, slotPotion)
+					SetCarriedMapID(session, slotMapID, hasSlotMap)
+					SetCarriedWritableBook(session, slotWritable, hasSlotWritable)
+					SetCarriedWrittenBook(session, slotWritten, hasSlotWritten)
 					if slots[slot].IsEmpty() {
 						trims[slot] = ArmorTrim{}
+						ClearSlotBundleContents(session, slot)
+						ClearSlotGoatHornInstrument(session, slot)
+						SetSlotPotionType(session, slot, "")
+						ClearSlotMapID(session, slot)
+						ClearSlotWritableBook(session, slot)
+						ClearSlotWrittenBook(session, slot)
 					}
 				case !slots[slot].IsEmpty() && !tr.carried.IsEmpty() && slots[slot].ResolvedItemID() != tr.carried.ResolvedItemID():
 					trims[slot], carriedTrim = carriedTrim, slotTrim
+					SetSlotBundleContents(session, slot, carriedBundle)
+					SetCarriedBundleContents(session, slotBundle)
+					SetSlotGoatHornInstrument(session, slot, carriedHorn)
+					SetCarriedGoatHornInstrument(session, slotHorn)
+					SetSlotPotionType(session, slot, carriedPotion)
+					SetCarriedPotionType(session, slotPotion)
+					if hasCarriedMap {
+						SetSlotMapID(session, slot, carriedMapID)
+					} else {
+						ClearSlotMapID(session, slot)
+					}
+					SetCarriedMapID(session, slotMapID, hasSlotMap)
+					if hasCarriedWritable {
+						SetSlotWritableBook(session, slot, carriedWritable)
+					} else {
+						ClearSlotWritableBook(session, slot)
+					}
+					SetCarriedWritableBook(session, slotWritable, hasSlotWritable)
+					if hasCarriedWritten {
+						SetSlotWrittenBook(session, slot, carriedWritten)
+					} else {
+						ClearSlotWrittenBook(session, slot)
+					}
+					SetCarriedWrittenBook(session, slotWritten, hasSlotWritten)
 				}
 				SetCarriedItemMeta(session, carriedMeta)
 				SetCarriedArmorTrim(session, carriedTrim)
@@ -1640,10 +1746,29 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 				slots[slot], slots[targetIdx] = slots[targetIdx], slots[slot]
 				metas[slot], metas[targetIdx] = metas[targetIdx], metas[slot]
 				trims[slot], trims[targetIdx] = trims[targetIdx], trims[slot]
+				swapPlayerSlotExtendedComponents(session, slot, targetIdx)
 			}
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+				maxStack := MaxItemStackSize
+				if IsBundleItem(slots[slot].ResolvedID()) || MaxItemDurability(slots[slot].ResolvedID()) > 0 {
+					maxStack = 1
+				}
+				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxStack)
+				SetCarriedItemMeta(session, metas[slot].Clone())
+				SetCarriedArmorTrim(session, trims[slot])
+				SetCarriedPotionType(session, GetSlotPotionType(session, slot))
+				if mapID, ok := GetSlotMapID(session, slot); ok {
+					SetCarriedMapID(session, mapID, true)
+				}
+				if wb, ok := GetSlotWritableBook(session, slot); ok {
+					SetCarriedWritableBook(session, wb, true)
+				}
+				if wrb, ok := GetSlotWrittenBook(session, slot); ok {
+					SetCarriedWrittenBook(session, wrb, true)
+				}
+				SetCarriedGoatHornInstrument(session, GetSlotGoatHornInstrument(session, slot))
+				SetCarriedBundleContents(session, GetSlotBundleContents(session, slot))
 			}
 		case ContainerInputThrow:
 			if isArmorSlot && HasBindingCurseOnSlot(session, slot) {
@@ -1655,16 +1780,33 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 					dropCount = slots[slot].Count
 				}
 				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+				slotBundle := GetSlotBundleContents(session, slot)
+				slotHorn := GetSlotGoatHornInstrument(session, slot)
+				slotMapID, hasSlotMap := GetSlotMapID(session, slot)
 				rem := slots[slot].Count - dropCount
 				if rem <= 0 {
 					slots[slot] = world.ItemStack{}
 					metas[slot] = ItemMeta{}
 					trims[slot] = ArmorTrim{}
+					ClearSlotBundleContents(session, slot)
+					ClearSlotGoatHornInstrument(session, slot)
+					ClearSlotMapID(session, slot)
 				} else {
 					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 				}
 				snap := session.Snapshot()
-				s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
+				entID, _ := s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
+				if entID > 0 {
+					if len(slotBundle) > 0 && IsBundleItem(dropStack.ResolvedID()) {
+						s.AssociateDroppedBundleEntity(entID, slotBundle)
+					}
+					if slotHorn != "" && dropStack.ResolvedID() == GoatHornItemID {
+						s.AssociateDroppedGoatHornEntity(entID, slotHorn)
+					}
+					if hasSlotMap && dropStack.ResolvedID() == FilledMapItemID {
+						s.AssociateDroppedMapEntity(entID, slotMapID)
+					}
+				}
 				s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 			}
 		case ContainerInputPickupAll:
@@ -2067,6 +2209,8 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 			openCopy.Result,
 		)
 		isLoom = true
+	case MenuTypeCartographyTable:
+		return s.syncCartographyContainer(session)
 	case MenuTypeStonecutter:
 		return s.syncStonecutterContainer(session)
 	case MenuTypeSmithing:
@@ -2135,6 +2279,12 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 	w.VarInt(stateID)
 	w.VarInt(int32(len(slots)))
 	for i, st := range slots {
+		if IsBundleItem(st.ResolvedID()) {
+			if items := GetSlotBundleContents(session, i); len(items) > 0 {
+				EncodeSlotWithBundleContents(w, st, items)
+				continue
+			}
+		}
 		switch st.ResolvedID() {
 		case FireworkRocketItemID:
 			if fw, ok := GetSlotFireworks(session, i); ok {
@@ -2144,6 +2294,20 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 		case FireworkStarItemID:
 			if exp, ok := GetSlotFireworkStar(session, i); ok {
 				EncodeSlotWithFireworkStar(w, st, exp)
+				continue
+			}
+		case FilledMapItemID:
+			if mapID, ok := GetSlotMapID(session, i); ok {
+				EncodeSlotWithMapID(w, st, mapID, true)
+				continue
+			}
+		case WritableBookItemID, WrittenBookItemID:
+			if wb, hasWB := GetSlotWritableBook(session, i); hasWB {
+				EncodeSlotWithBookContent(w, st, &wb, nil)
+				continue
+			}
+			if wrb, hasWRB := GetSlotWrittenBook(session, i); hasWRB {
+				EncodeSlotWithBookContent(w, st, nil, &wrb)
 				continue
 			}
 		}
@@ -2156,16 +2320,37 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 		}
 	}
 	encodedCarried := false
-	switch carried.ResolvedID() {
-	case FireworkRocketItemID:
-		if fw, ok := getCarriedFireworks(session); ok {
-			EncodeSlotWithFireworks(w, carried, fw)
+	if IsBundleItem(carried.ResolvedID()) {
+		if items := GetCarriedBundleContents(session); len(items) > 0 {
+			EncodeSlotWithBundleContents(w, carried, items)
 			encodedCarried = true
 		}
-	case FireworkStarItemID:
-		if exp, ok := getCarriedFireworkStar(session); ok {
-			EncodeSlotWithFireworkStar(w, carried, exp)
-			encodedCarried = true
+	}
+	if !encodedCarried {
+		switch carried.ResolvedID() {
+		case FireworkRocketItemID:
+			if fw, ok := getCarriedFireworks(session); ok {
+				EncodeSlotWithFireworks(w, carried, fw)
+				encodedCarried = true
+			}
+		case FireworkStarItemID:
+			if exp, ok := getCarriedFireworkStar(session); ok {
+				EncodeSlotWithFireworkStar(w, carried, exp)
+				encodedCarried = true
+			}
+		case FilledMapItemID:
+			if mapID, ok := GetCarriedMapID(session); ok {
+				EncodeSlotWithMapID(w, carried, mapID, true)
+				encodedCarried = true
+			}
+		case WritableBookItemID, WrittenBookItemID:
+			if wb, hasWB := GetCarriedWritableBook(session); hasWB {
+				EncodeSlotWithBookContent(w, carried, &wb, nil)
+				encodedCarried = true
+			} else if wrb, hasWRB := GetCarriedWrittenBook(session); hasWRB {
+				EncodeSlotWithBookContent(w, carried, nil, &wrb)
+				encodedCarried = true
+			}
 		}
 	}
 	if !encodedCarried {
@@ -2996,6 +3181,758 @@ func (s *Server) applyEquineContainerClickLocked(session *PlayerSession, tr *pla
 		session.SetInventorySlot(36+i, slots[equipAndChest+27+i])
 	}
 }
+
+func swapPlayerSlotExtendedComponents(session *PlayerSession, slotA, slotB int) {
+	if session == nil || slotA < 0 || slotA >= world.PlayerInventorySlots || slotB < 0 || slotB >= world.PlayerInventorySlots || slotA == slotB {
+		return
+	}
+	bundleA := GetSlotBundleContents(session, slotA)
+	bundleB := GetSlotBundleContents(session, slotB)
+	SetSlotBundleContents(session, slotA, bundleB)
+	SetSlotBundleContents(session, slotB, bundleA)
+
+	hornA := GetSlotGoatHornInstrument(session, slotA)
+	hornB := GetSlotGoatHornInstrument(session, slotB)
+	SetSlotGoatHornInstrument(session, slotA, hornB)
+	SetSlotGoatHornInstrument(session, slotB, hornA)
+
+	potA := GetSlotPotionType(session, slotA)
+	potB := GetSlotPotionType(session, slotB)
+	SetSlotPotionType(session, slotA, potB)
+	SetSlotPotionType(session, slotB, potA)
+
+	mapA, hasMapA := GetSlotMapID(session, slotA)
+	mapB, hasMapB := GetSlotMapID(session, slotB)
+	if hasMapB {
+		SetSlotMapID(session, slotA, mapB)
+	} else {
+		ClearSlotMapID(session, slotA)
+	}
+	if hasMapA {
+		SetSlotMapID(session, slotB, mapA)
+	} else {
+		ClearSlotMapID(session, slotB)
+	}
+
+	wbA, hasWBA := GetSlotWritableBook(session, slotA)
+	wbB, hasWBB := GetSlotWritableBook(session, slotB)
+	if hasWBB {
+		SetSlotWritableBook(session, slotA, wbB)
+	} else {
+		ClearSlotWritableBook(session, slotA)
+	}
+	if hasWBA {
+		SetSlotWritableBook(session, slotB, wbA)
+	} else {
+		ClearSlotWritableBook(session, slotB)
+	}
+
+	wrbA, hasWRBA := GetSlotWrittenBook(session, slotA)
+	wrbB, hasWRBB := GetSlotWrittenBook(session, slotB)
+	if hasWRBB {
+		SetSlotWrittenBook(session, slotA, wrbB)
+	} else {
+		ClearSlotWrittenBook(session, slotA)
+	}
+	if hasWRBA {
+		SetSlotWrittenBook(session, slotB, wrbA)
+	} else {
+		ClearSlotWrittenBook(session, slotB)
+	}
+}
+
+func (s *Server) syncCartographyContainer(session *PlayerSession) error {
+	if s == nil || session == nil || session.send == nil {
+		return nil
+	}
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	if tr.open == nil || tr.open.MenuType != MenuTypeCartographyTable {
+		tr.mu.Unlock()
+		return nil
+	}
+	cid := tr.open.ContainerID
+	mapSlot := tr.open.Crafting[0]
+	addSlot := tr.open.Crafting[1]
+	resSlot := tr.open.Result
+	carried := tr.carried
+	tr.mu.Unlock()
+
+	slots := s.buildCartographyMenuSlots(session, mapSlot, addSlot, resSlot)
+	stateID := session.NextContainerStateID()
+	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		return err
+	}
+	s.syncCartographyMapSlots(session, cid)
+	return nil
+}
+
+func (s *Server) syncCartographyMapSlots(session *PlayerSession, containerID int32) {
+	if s == nil || session == nil || session.send == nil {
+		return
+	}
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	if tr.open == nil || tr.open.ContainerID != containerID || tr.open.MenuType != MenuTypeCartographyTable {
+		tr.mu.Unlock()
+		return
+	}
+	mapSlot := tr.open.Crafting[0]
+	resSlot := tr.open.Result
+	tr.mu.Unlock()
+
+	mtr := getMapMetaTracker(session)
+	mtr.mu.Lock()
+	cartoMapID, hasCartoMap := mtr.cartoMapID, mtr.hasCartoMap
+	resMapID, hasResMap := mtr.resMapID, mtr.hasResMap
+	mtr.mu.Unlock()
+
+	if !mapSlot.IsEmpty() && mapSlot.ResolvedID() == FilledMapItemID && hasCartoMap {
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), CartographySlotMap, mapSlot, cartoMapID, true))
+	}
+	if !resSlot.IsEmpty() && resSlot.ResolvedID() == FilledMapItemID && hasResMap {
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), CartographySlotResult, resSlot, resMapID, true))
+	}
+}
+
+// --- Bundles (minecraft:bundle & 16 colored bundles, vanilla 26.1.2) ---
+
+const (
+	// DataComponentBundleContents is BuiltInRegistries.DATA_COMPONENT_TYPE index 50 ("minecraft:bundle_contents").
+	DataComponentBundleContents int32 = 50
+
+	// MaxBundleWeight is the maximum total weight a bundle can hold (64 weight units).
+	MaxBundleWeight int32 = 64
+
+	// BundleNestingBaseWeight is the base weight overhead of an empty nested bundle inside another bundle (4 units).
+	BundleNestingBaseWeight int32 = 4
+
+	// BundleItemID is the canonical item ID for the uncolored bundle.
+	BundleItemID = "minecraft:bundle"
+)
+
+// IsBundleItem reports whether itemID is `minecraft:bundle` or one of the 16 colored `minecraft:*_bundle` items.
+func IsBundleItem(itemID string) bool {
+	norm := canonicalResourceName(itemID)
+	switch norm {
+	case "minecraft:bundle",
+		"minecraft:white_bundle",
+		"minecraft:orange_bundle",
+		"minecraft:magenta_bundle",
+		"minecraft:light_blue_bundle",
+		"minecraft:yellow_bundle",
+		"minecraft:lime_bundle",
+		"minecraft:pink_bundle",
+		"minecraft:gray_bundle",
+		"minecraft:light_gray_bundle",
+		"minecraft:cyan_bundle",
+		"minecraft:purple_bundle",
+		"minecraft:blue_bundle",
+		"minecraft:brown_bundle",
+		"minecraft:green_bundle",
+		"minecraft:red_bundle",
+		"minecraft:black_bundle":
+		return true
+	default:
+		return false
+	}
+}
+
+// CanInsertIntoBundle reports whether an item of type itemID can be placed inside a bundle.
+// In vanilla 26.1.2, shulker boxes cannot be placed inside bundles, whereas nested bundles are allowed.
+func CanInsertIntoBundle(itemID string) bool {
+	norm := canonicalResourceName(itemID)
+	if norm == "" || norm == "minecraft:air" {
+		return false
+	}
+	if norm == "minecraft:shulker_box" || strings.HasSuffix(norm, "_shulker_box") {
+		return false
+	}
+	return true
+}
+
+// MaxStackSizeForBundleWeight returns the vanilla maximum stack size (1, 16, or 64)
+// of itemID for bundle weight calculation (`64 / maxStackSize`).
+func MaxStackSizeForBundleWeight(itemID string) int32 {
+	norm := canonicalResourceName(itemID)
+	if norm == "" {
+		return 64
+	}
+	if IsBundleItem(norm) || MaxItemDurability(norm) > 0 {
+		return 1
+	}
+	switch norm {
+	case "minecraft:enchanted_book",
+		"minecraft:writable_book",
+		"minecraft:knowledge_book",
+		"minecraft:potion",
+		"minecraft:splash_potion",
+		"minecraft:lingering_potion",
+		"minecraft:milk_bucket",
+		"minecraft:water_bucket",
+		"minecraft:lava_bucket",
+		"minecraft:powder_snow_bucket",
+		"minecraft:axolotl_bucket",
+		"minecraft:cod_bucket",
+		"minecraft:salmon_bucket",
+		"minecraft:tropical_fish_bucket",
+		"minecraft:pufferfish_bucket",
+		"minecraft:tadpole_bucket",
+		"minecraft:totem_of_undying",
+		"minecraft:spyglass",
+		"minecraft:goat_horn",
+		"minecraft:brush",
+		"minecraft:saddle",
+		"minecraft:mushroom_stew",
+		"minecraft:rabbit_stew",
+		"minecraft:beetroot_soup",
+		"minecraft:suspicious_stew",
+		"minecraft:cake",
+		"minecraft:Minecart",
+		"minecraft:minecart",
+		"minecraft:chest_minecart",
+		"minecraft:furnace_minecart",
+		"minecraft:tnt_minecart",
+		"minecraft:hopper_minecart":
+		return 1
+	case "minecraft:ender_pearl",
+		"minecraft:egg",
+		"minecraft:snowball",
+		"minecraft:honey_bottle",
+		"minecraft:bucket",
+		"minecraft:armor_stand",
+		"minecraft:written_book":
+		return 16
+	}
+	if strings.HasPrefix(norm, "minecraft:music_disc_") ||
+		strings.HasSuffix(norm, "_boat") ||
+		strings.HasSuffix(norm, "_raft") ||
+		strings.HasSuffix(norm, "_bed") ||
+		strings.HasSuffix(norm, "_horse_armor") ||
+		strings.HasSuffix(norm, "_banner_pattern") {
+		return 1
+	}
+	if strings.HasSuffix(norm, "_banner") || strings.HasSuffix(norm, "_sign") {
+		return 16
+	}
+	return 64
+}
+
+// BundleSingleItemWeight returns the weight (1..64) of a single item of type itemID.
+// For a nested bundle, weight is `4 + BundleTotalWeight(nestedContents)`.
+func BundleSingleItemWeight(itemID string, nestedContents []world.ItemStack) int32 {
+	if IsBundleItem(itemID) {
+		w := BundleNestingBaseWeight + BundleTotalWeight(nestedContents)
+		if w > MaxBundleWeight {
+			w = MaxBundleWeight
+		}
+		return w
+	}
+	maxStack := MaxStackSizeForBundleWeight(itemID)
+	if maxStack <= 1 {
+		return MaxBundleWeight
+	}
+	return MaxBundleWeight / maxStack
+}
+
+// BundleTotalWeight computes the total weight of all stacks stored inside a bundle.
+func BundleTotalWeight(items []world.ItemStack) int32 {
+	var total int32
+	for _, st := range items {
+		if st.IsEmpty() || st.Count <= 0 {
+			continue
+		}
+		unit := BundleSingleItemWeight(st.ResolvedID(), nil)
+		total += unit * st.Count
+	}
+	return total
+}
+
+type sessionBundleTracker struct {
+	mu          sync.Mutex
+	slotItems   [world.PlayerInventorySlots][]world.ItemStack
+	selectedIdx [world.PlayerInventorySlots]int
+	carried     []world.ItemStack
+}
+
+type serverDroppedBundleStore struct {
+	mu    sync.Mutex
+	items map[int32][]world.ItemStack
+}
+
+var (
+	playerBundles        sync.Map // map[*PlayerSession]*sessionBundleTracker
+	serverDroppedBundles sync.Map // map[*Server]*serverDroppedBundleStore
+)
+
+func getBundleTracker(session *PlayerSession) *sessionBundleTracker {
+	if session == nil {
+		return nil
+	}
+	if v, ok := playerBundles.Load(session); ok {
+		return v.(*sessionBundleTracker)
+	}
+	tr := &sessionBundleTracker{}
+	for i := range tr.selectedIdx {
+		tr.selectedIdx[i] = -1
+	}
+	actual, _ := playerBundles.LoadOrStore(session, tr)
+	return actual.(*sessionBundleTracker)
+}
+
+func (s *Server) droppedBundleStore() *serverDroppedBundleStore {
+	if s == nil {
+		return nil
+	}
+	if v, ok := serverDroppedBundles.Load(s); ok {
+		return v.(*serverDroppedBundleStore)
+	}
+	actual, _ := serverDroppedBundles.LoadOrStore(s, &serverDroppedBundleStore{
+		items: make(map[int32][]world.ItemStack),
+	})
+	return actual.(*serverDroppedBundleStore)
+}
+
+func cloneBundleItems(items []world.ItemStack) []world.ItemStack {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([]world.ItemStack, 0, len(items))
+	for _, st := range items {
+		if !st.IsEmpty() && st.Count > 0 {
+			out = append(out, world.NewItemStack(st.ResolvedItemID(), st.Count))
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// GetSlotBundleContents returns a copy of the items stored inside the bundle in slot (0..45).
+func GetSlotBundleContents(session *PlayerSession, slot int) []world.ItemStack {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return nil
+	}
+	tr := getBundleTracker(session)
+	tr.mu.Lock()
+	cp := cloneBundleItems(tr.slotItems[slot])
+	tr.mu.Unlock()
+	return cp
+}
+
+// SetSlotBundleContents sets the items stored inside the bundle in slot (0..45).
+func SetSlotBundleContents(session *PlayerSession, slot int, items []world.ItemStack) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getBundleTracker(session)
+	tr.mu.Lock()
+	tr.slotItems[slot] = cloneBundleItems(items)
+	if len(tr.slotItems[slot]) == 0 {
+		tr.selectedIdx[slot] = -1
+	} else if tr.selectedIdx[slot] >= len(tr.slotItems[slot]) {
+		tr.selectedIdx[slot] = len(tr.slotItems[slot]) - 1
+	}
+	tr.mu.Unlock()
+}
+
+// ClearSlotBundleContents clears any bundle contents and selected index on slot (0..45).
+func ClearSlotBundleContents(session *PlayerSession, slot int) {
+	SetSlotBundleContents(session, slot, nil)
+}
+
+// GetSlotBundleSelectedIndex returns the currently selected item index inside the bundle at slot (-1 if none).
+func GetSlotBundleSelectedIndex(session *PlayerSession, slot int) int {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return -1
+	}
+	tr := getBundleTracker(session)
+	tr.mu.Lock()
+	idx := tr.selectedIdx[slot]
+	tr.mu.Unlock()
+	return idx
+}
+
+// SetSlotBundleSelectedIndex sets the selected item index inside the bundle at slot.
+func SetSlotBundleSelectedIndex(session *PlayerSession, slot int, selectedIndex int) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getBundleTracker(session)
+	tr.mu.Lock()
+	if selectedIndex < 0 || selectedIndex >= len(tr.slotItems[slot]) {
+		tr.selectedIdx[slot] = -1
+	} else {
+		tr.selectedIdx[slot] = selectedIndex
+	}
+	tr.mu.Unlock()
+}
+
+// GetCarriedBundleContents returns a copy of the bundle contents on the player's cursor.
+func GetCarriedBundleContents(session *PlayerSession) []world.ItemStack {
+	if session == nil {
+		return nil
+	}
+	tr := getBundleTracker(session)
+	tr.mu.Lock()
+	cp := cloneBundleItems(tr.carried)
+	tr.mu.Unlock()
+	return cp
+}
+
+// SetCarriedBundleContents sets the bundle contents on the player's cursor.
+func SetCarriedBundleContents(session *PlayerSession, items []world.ItemStack) {
+	if session == nil {
+		return
+	}
+	tr := getBundleTracker(session)
+	tr.mu.Lock()
+	tr.carried = cloneBundleItems(items)
+	tr.mu.Unlock()
+}
+
+// AssociateDroppedBundleEntity records the bundle contents for a dropped bundle item entity.
+func (s *Server) AssociateDroppedBundleEntity(entityID int32, items []world.ItemStack) {
+	if s == nil || entityID <= 0 || len(items) == 0 {
+		return
+	}
+	st := s.droppedBundleStore()
+	st.mu.Lock()
+	st.items[entityID] = cloneBundleItems(items)
+	st.mu.Unlock()
+}
+
+// DroppedBundleContents returns the bundle contents associated with a dropped item entity.
+func (s *Server) DroppedBundleContents(entityID int32) ([]world.ItemStack, bool) {
+	if s == nil || entityID <= 0 {
+		return nil, false
+	}
+	st := s.droppedBundleStore()
+	st.mu.Lock()
+	items, ok := st.items[entityID]
+	cp := cloneBundleItems(items)
+	st.mu.Unlock()
+	return cp, ok && len(cp) > 0
+}
+
+// HandleBundleItemSelectedPacket decodes ServerboundBundleItemSelectedPacket (0x03 in protocol 775):
+// VarInt(slotId), VarInt(selectedItemIndex).
+func (s *Server) HandleBundleItemSelectedPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	slotID, err := r.VarInt()
+	if err != nil {
+		return err
+	}
+	selectedIdx, err := r.VarInt()
+	if err != nil {
+		return err
+	}
+	SetSlotBundleSelectedIndex(session, int(slotID), int(selectedIdx))
+	return nil
+}
+
+// EncodeBundleContentsComponent writes the payload of `DataComponentBundleContents` (50):
+// VarInt(len(items)), followed by each ItemStack.
+func EncodeBundleContentsComponent(w *protocol.Writer, items []world.ItemStack) {
+	w.VarInt(int32(len(items)))
+	for _, it := range items {
+		writeContainerItemStack(w, it)
+	}
+}
+
+// EncodeSlotWithBundleContents writes a protocol 775 ItemStack carrying a
+// `minecraft:bundle_contents` (50) component.
+func EncodeSlotWithBundleContents(w *protocol.Writer, stack world.ItemStack, items []world.ItemStack) {
+	if stack.IsEmpty() {
+		w.VarInt(0)
+		return
+	}
+	itemID := stack.ResolvedItemID()
+	if itemID <= 0 {
+		w.VarInt(0)
+		return
+	}
+	w.VarInt(stack.Count)
+	w.VarInt(itemID)
+	w.VarInt(1) // 1 added component
+	w.VarInt(0) // 0 removed components
+	w.VarInt(DataComponentBundleContents)
+	EncodeBundleContentsComponent(w, items)
+}
+
+func insertStackIntoBundleList(bundleItems []world.ItemStack, incoming world.ItemStack, incomingNested []world.ItemStack) (updated []world.ItemStack, inserted int32) {
+	if incoming.IsEmpty() || incoming.Count <= 0 || !CanInsertIntoBundle(incoming.ResolvedID()) {
+		return bundleItems, 0
+	}
+	curWeight := BundleTotalWeight(bundleItems)
+	unitWeight := BundleSingleItemWeight(incoming.ResolvedID(), incomingNested)
+	if unitWeight <= 0 || curWeight+unitWeight > MaxBundleWeight {
+		return bundleItems, 0
+	}
+	maxInsert := (MaxBundleWeight - curWeight) / unitWeight
+	if maxInsert <= 0 {
+		return bundleItems, 0
+	}
+	toInsert := incoming.Count
+	if toInsert > maxInsert {
+		toInsert = maxInsert
+	}
+	itemID := incoming.ResolvedItemID()
+	maxStack := MaxStackSizeForBundleWeight(incoming.ResolvedID())
+
+	out := cloneBundleItems(bundleItems)
+	rem := toInsert
+	if maxStack > 1 {
+		for i := range out {
+			if out[i].ResolvedItemID() == itemID && out[i].Count < maxStack {
+				space := maxStack - out[i].Count
+				add := rem
+				if add > space {
+					add = space
+				}
+				out[i] = world.NewItemStack(itemID, out[i].Count+add)
+				rem -= add
+				if rem <= 0 {
+					break
+				}
+			}
+		}
+	}
+	for rem > 0 {
+		add := rem
+		if add > maxStack {
+			add = maxStack
+		}
+		// Prepend newly inserted stack at index 0 (most-recently-added item is extracted first in vanilla).
+		out = append([]world.ItemStack{world.NewItemStack(itemID, add)}, out...)
+		rem -= add
+	}
+	return out, toInsert
+}
+
+func extractOneStackFromBundleList(bundleItems []world.ItemStack, selectedIdx int) (extracted world.ItemStack, remaining []world.ItemStack, ok bool) {
+	if len(bundleItems) == 0 {
+		return world.ItemStack{}, nil, false
+	}
+	idx := 0
+	if selectedIdx >= 0 && selectedIdx < len(bundleItems) {
+		idx = selectedIdx
+	}
+	extracted = bundleItems[idx]
+	remaining = make([]world.ItemStack, 0, len(bundleItems)-1)
+	remaining = append(remaining, bundleItems[:idx]...)
+	remaining = append(remaining, bundleItems[idx+1:]...)
+	return extracted, remaining, true
+}
+
+func (s *Server) tryApplyBundlePickupClick(
+	session *PlayerSession,
+	slot int,
+	slots []world.ItemStack,
+	metas []ItemMeta,
+	carried *world.ItemStack,
+) bool {
+	if session == nil || slot < 0 || slot >= len(slots) || carried == nil {
+		return false
+	}
+	slotStack := slots[slot]
+	curCarried := *carried
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	cx := int32(snap.X) >> 4
+	cz := int32(snap.Z) >> 4
+
+	// 1. Bundle in slot: right-clicking with carried item inserts into slot bundle;
+	//    right-clicking with empty cursor extracts selected/first item onto cursor.
+	if !slotStack.IsEmpty() && IsBundleItem(slotStack.ResolvedID()) && slotStack.Count == 1 {
+		bundleItems := GetSlotBundleContents(session, slot)
+		if !curCarried.IsEmpty() {
+			var nested []world.ItemStack
+			if IsBundleItem(curCarried.ResolvedID()) {
+				nested = GetCarriedBundleContents(session)
+			}
+			updated, inserted := insertStackIntoBundleList(bundleItems, curCarried, nested)
+			if inserted <= 0 {
+				return true
+			}
+			SetSlotBundleContents(session, slot, updated)
+			rem := curCarried.Count - inserted
+			if rem <= 0 {
+				*carried = world.ItemStack{}
+				SetCarriedItemMeta(session, ItemMeta{})
+				SetCarriedBundleContents(session, nil)
+			} else {
+				*carried = world.NewItemStack(curCarried.ResolvedItemID(), rem)
+			}
+			if s != nil {
+				s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+					EncodeSoundPacket("minecraft:item.bundle.insert", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+			}
+			return true
+		}
+		extracted, remItems, ok := extractOneStackFromBundleList(bundleItems, GetSlotBundleSelectedIndex(session, slot))
+		if !ok {
+			return false
+		}
+		SetSlotBundleContents(session, slot, remItems)
+		SetSlotBundleSelectedIndex(session, slot, -1)
+		*carried = extracted
+		SetCarriedItemMeta(session, ItemMeta{})
+		if s != nil {
+			s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket("minecraft:item.bundle.remove_one", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+		}
+		return true
+	}
+
+	// 2. Bundle on cursor: right-clicking a non-empty slot inserts from slot into cursor bundle;
+	//    right-clicking an empty slot extracts first item from cursor bundle into slot.
+	if !curCarried.IsEmpty() && IsBundleItem(curCarried.ResolvedID()) && curCarried.Count == 1 {
+		bundleItems := GetCarriedBundleContents(session)
+		if !slotStack.IsEmpty() {
+			var nested []world.ItemStack
+			if IsBundleItem(slotStack.ResolvedID()) {
+				nested = GetSlotBundleContents(session, slot)
+			}
+			updated, inserted := insertStackIntoBundleList(bundleItems, slotStack, nested)
+			if inserted <= 0 {
+				return true
+			}
+			SetCarriedBundleContents(session, updated)
+			rem := slotStack.Count - inserted
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+				metas[slot] = ItemMeta{}
+				ClearSlotBundleContents(session, slot)
+			} else {
+				slots[slot] = world.NewItemStack(slotStack.ResolvedItemID(), rem)
+			}
+			if s != nil {
+				s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+					EncodeSoundPacket("minecraft:item.bundle.remove_one", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+			}
+			return true
+		}
+		extracted, remItems, ok := extractOneStackFromBundleList(bundleItems, 0)
+		if !ok {
+			return false
+		}
+		SetCarriedBundleContents(session, remItems)
+		slots[slot] = extracted
+		metas[slot] = ItemMeta{}
+		if s != nil {
+			s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket("minecraft:item.bundle.remove_one", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+		}
+		return true
+	}
+	return false
+}
+
+type sessionCarriedBookTracker struct {
+	mu       sync.Mutex
+	writable *WritableBookContent
+	written  *WrittenBookContent
+}
+
+var playerCarriedBooks sync.Map // map[*PlayerSession]*sessionCarriedBookTracker
+
+func getCarriedBookTracker(session *PlayerSession) *sessionCarriedBookTracker {
+	if session == nil {
+		return nil
+	}
+	if v, ok := playerCarriedBooks.Load(session); ok {
+		return v.(*sessionCarriedBookTracker)
+	}
+	actual, _ := playerCarriedBooks.LoadOrStore(session, &sessionCarriedBookTracker{})
+	return actual.(*sessionCarriedBookTracker)
+}
+
+// ClearSlotWritableBook clears any WritableBookContent on player inventory slot (0..45).
+func ClearSlotWritableBook(session *PlayerSession, slot int) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getBookMetaTracker(session)
+	tr.mu.Lock()
+	tr.writable[slot] = nil
+	tr.mu.Unlock()
+}
+
+// ClearSlotWrittenBook clears any WrittenBookContent on player inventory slot (0..45).
+func ClearSlotWrittenBook(session *PlayerSession, slot int) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getBookMetaTracker(session)
+	tr.mu.Lock()
+	tr.written[slot] = nil
+	tr.mu.Unlock()
+}
+
+// GetCarriedWritableBook returns the WritableBookContent on the player's cursor, if any.
+func GetCarriedWritableBook(session *PlayerSession) (WritableBookContent, bool) {
+	if session == nil {
+		return WritableBookContent{}, false
+	}
+	tr := getCarriedBookTracker(session)
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.writable == nil {
+		return WritableBookContent{}, false
+	}
+	return tr.writable.Clone(), true
+}
+
+// SetCarriedWritableBook sets or clears the WritableBookContent on the player's cursor.
+func SetCarriedWritableBook(session *PlayerSession, content WritableBookContent, has bool) {
+	if session == nil {
+		return
+	}
+	tr := getCarriedBookTracker(session)
+	tr.mu.Lock()
+	if !has {
+		tr.writable = nil
+	} else {
+		cp := content.Clone()
+		tr.writable = &cp
+	}
+	tr.mu.Unlock()
+}
+
+// GetCarriedWrittenBook returns the WrittenBookContent on the player's cursor, if any.
+func GetCarriedWrittenBook(session *PlayerSession) (WrittenBookContent, bool) {
+	if session == nil {
+		return WrittenBookContent{}, false
+	}
+	tr := getCarriedBookTracker(session)
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.written == nil {
+		return WrittenBookContent{}, false
+	}
+	return tr.written.Clone(), true
+}
+
+// SetCarriedWrittenBook sets or clears the WrittenBookContent on the player's cursor.
+func SetCarriedWrittenBook(session *PlayerSession, content WrittenBookContent, has bool) {
+	if session == nil {
+		return
+	}
+	tr := getCarriedBookTracker(session)
+	tr.mu.Lock()
+	if !has {
+		tr.written = nil
+	} else {
+		cp := content.Clone()
+		tr.written = &cp
+	}
+	tr.mu.Unlock()
+}
+
 
 
 

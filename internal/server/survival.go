@@ -1096,6 +1096,13 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 				SetSlotMapID(session, slot, mapID)
 			}
 		}
+		hasBundleContents := false
+		if bundleItems, ok := s.DroppedBundleContents(live.ID); ok && len(bundleItems) > 0 {
+			hasBundleContents = true
+			for _, slot := range changedSlots {
+				SetSlotBundleContents(session, slot, bundleItems)
+			}
+		}
 		totalPickedUp += added
 		pickedStack := world.NewItemStack(live.Item.ResolvedItemID(), added)
 		if pickedStack.ID == "" {
@@ -1110,10 +1117,14 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 			EncodeTakeItemEntity(live.ID, session.EntityID, added))
 
 		if session.send != nil {
-			for _, slot := range changedSlots {
-				stateID := session.NextContainerStateID()
-				slotStack := session.InventorySlot(slot)
-				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, slotStack))
+			if hasBundleContents {
+				s.syncPlayerInventoryContainer(session)
+			} else {
+				for _, slot := range changedSlots {
+					stateID := session.NextContainerStateID()
+					slotStack := session.InventorySlot(slot)
+					_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, slotStack))
+				}
 			}
 		}
 
@@ -3650,6 +3661,7 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 	dropped := world.NewItemStack(cur.ResolvedItemID(), dropCount)
 	slotHornInst := GetSlotGoatHornInstrument(session, invSlot)
 	slotMapID, hasSlotMapID := GetSlotMapID(session, invSlot)
+	slotBundle := GetSlotBundleContents(session, invSlot)
 	slotMeta := GetSlotItemMeta(session, invSlot)
 	s.StopUsingSpyglass(session)
 
@@ -3662,6 +3674,9 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		ClearSlotBannerMeta(session, invSlot)
 		ClearSlotGoatHornInstrument(session, invSlot)
 		ClearSlotMapID(session, invSlot)
+		ClearSlotBundleContents(session, invSlot)
+		ClearSlotWritableBook(session, invSlot)
+		ClearSlotWrittenBook(session, invSlot)
 	} else {
 		session.SetInventorySlot(invSlot, world.NewItemStack(cur.ResolvedItemID(), rem))
 	}
@@ -3693,6 +3708,9 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		}
 		if hasSlotMapID && canonicalItemName(dropped.ResolvedID()) == FilledMapItemID {
 			s.AssociateDroppedMapEntity(entID, slotMapID)
+		}
+		if len(slotBundle) > 0 && IsBundleItem(dropped.ResolvedID()) {
+			s.AssociateDroppedBundleEntity(entID, slotBundle)
 		}
 	}
 	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)
@@ -3736,6 +3754,14 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 	offHorn := GetSlotGoatHornInstrument(session, offSlot)
 	mainMapID, hasMainMap := GetSlotMapID(session, mainSlot)
 	offMapID, hasOffMap := GetSlotMapID(session, offSlot)
+	mainBundle := GetSlotBundleContents(session, mainSlot)
+	offBundle := GetSlotBundleContents(session, offSlot)
+	mainBundleSel := GetSlotBundleSelectedIndex(session, mainSlot)
+	offBundleSel := GetSlotBundleSelectedIndex(session, offSlot)
+	mainWB, hasMainWB := GetSlotWritableBook(session, mainSlot)
+	offWB, hasOffWB := GetSlotWritableBook(session, offSlot)
+	mainWrB, hasMainWrB := GetSlotWrittenBook(session, mainSlot)
+	offWrB, hasOffWrB := GetSlotWrittenBook(session, offSlot)
 	s.StopUsingSpyglass(session)
 
 	session.SetInventorySlot(mainSlot, offStack)
@@ -3757,6 +3783,30 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 		SetSlotMapID(session, offSlot, mainMapID)
 	} else {
 		ClearSlotMapID(session, offSlot)
+	}
+	SetSlotBundleContents(session, mainSlot, offBundle)
+	SetSlotBundleContents(session, offSlot, mainBundle)
+	SetSlotBundleSelectedIndex(session, mainSlot, offBundleSel)
+	SetSlotBundleSelectedIndex(session, offSlot, mainBundleSel)
+	if hasOffWB {
+		SetSlotWritableBook(session, mainSlot, offWB)
+	} else {
+		ClearSlotWritableBook(session, mainSlot)
+	}
+	if hasMainWB {
+		SetSlotWritableBook(session, offSlot, mainWB)
+	} else {
+		ClearSlotWritableBook(session, offSlot)
+	}
+	if hasOffWrB {
+		SetSlotWrittenBook(session, mainSlot, offWrB)
+	} else {
+		ClearSlotWrittenBook(session, mainSlot)
+	}
+	if hasMainWrB {
+		SetSlotWrittenBook(session, offSlot, mainWrB)
+	} else {
+		ClearSlotWrittenBook(session, offSlot)
 	}
 	if hasOffStar {
 		SetSlotFireworkStar(session, mainSlot, offStar)
@@ -3786,6 +3836,7 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, mainSlot, offStack))
 		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, offSlot, mainStack))
 	}
+	s.syncPlayerInventoryContainer(session)
 	s.TriggerInventoryChanged(session)
 	return true
 }
@@ -3954,6 +4005,20 @@ func (s *Server) SelectOrPickItem(session *PlayerSession, itemName string) bool 
 			dstMeta := GetSlotItemMeta(session, targetSlot)
 			srcTrim, _ := GetSlotArmorTrim(session, srcSlot)
 			dstTrim, _ := GetSlotArmorTrim(session, targetSlot)
+			srcPotion := GetSlotPotionType(session, srcSlot)
+			dstPotion := GetSlotPotionType(session, targetSlot)
+			srcHorn := GetSlotGoatHornInstrument(session, srcSlot)
+			dstHorn := GetSlotGoatHornInstrument(session, targetSlot)
+			srcMapID, hasSrcMap := GetSlotMapID(session, srcSlot)
+			dstMapID, hasDstMap := GetSlotMapID(session, targetSlot)
+			srcBundle := GetSlotBundleContents(session, srcSlot)
+			dstBundle := GetSlotBundleContents(session, targetSlot)
+			srcBanner := GetSlotBannerPatterns(session, srcSlot)
+			dstBanner := GetSlotBannerPatterns(session, targetSlot)
+			srcWB, hasSrcWB := GetSlotWritableBook(session, srcSlot)
+			dstWB, hasDstWB := GetSlotWritableBook(session, targetSlot)
+			srcWrB, hasSrcWrB := GetSlotWrittenBook(session, srcSlot)
+			dstWrB, hasDstWrB := GetSlotWrittenBook(session, targetSlot)
 
 			session.SetInventorySlot(targetSlot, srcStack)
 			session.SetInventorySlot(srcSlot, dstStack)
@@ -3961,6 +4026,44 @@ func (s *Server) SelectOrPickItem(session *PlayerSession, itemName string) bool 
 			SetSlotItemMeta(session, srcSlot, dstMeta)
 			SetSlotArmorTrim(session, targetSlot, srcTrim)
 			SetSlotArmorTrim(session, srcSlot, dstTrim)
+			SetSlotPotionType(session, targetSlot, srcPotion)
+			SetSlotPotionType(session, srcSlot, dstPotion)
+			SetSlotGoatHornInstrument(session, targetSlot, srcHorn)
+			SetSlotGoatHornInstrument(session, srcSlot, dstHorn)
+			if hasSrcMap {
+				SetSlotMapID(session, targetSlot, srcMapID)
+			} else {
+				ClearSlotMapID(session, targetSlot)
+			}
+			if hasDstMap {
+				SetSlotMapID(session, srcSlot, dstMapID)
+			} else {
+				ClearSlotMapID(session, srcSlot)
+			}
+			SetSlotBundleContents(session, targetSlot, srcBundle)
+			SetSlotBundleContents(session, srcSlot, dstBundle)
+			SetSlotBannerPatterns(session, targetSlot, srcBanner)
+			SetSlotBannerPatterns(session, srcSlot, dstBanner)
+			if hasSrcWB {
+				SetSlotWritableBook(session, targetSlot, srcWB)
+			} else {
+				ClearSlotWritableBook(session, targetSlot)
+			}
+			if hasDstWB {
+				SetSlotWritableBook(session, srcSlot, dstWB)
+			} else {
+				ClearSlotWritableBook(session, srcSlot)
+			}
+			if hasSrcWrB {
+				SetSlotWrittenBook(session, targetSlot, srcWrB)
+			} else {
+				ClearSlotWrittenBook(session, targetSlot)
+			}
+			if hasDstWrB {
+				SetSlotWrittenBook(session, srcSlot, dstWrB)
+			} else {
+				ClearSlotWrittenBook(session, srcSlot)
+			}
 
 			session.SetSelectedSlot(int32(targetHB))
 			if session.send != nil {
@@ -3971,6 +4074,7 @@ func (s *Server) SelectOrPickItem(session *PlayerSession, itemName string) bool 
 				w.VarInt(int32(targetHB))
 				_ = session.send(protocol.PlaySetHeldSlot, w.Bytes())
 			}
+			s.syncPlayerInventoryContainer(session)
 			return true
 		}
 	}
@@ -3979,8 +4083,7 @@ func (s *Server) SelectOrPickItem(session *PlayerSession, itemName string) bool 
 	if snap.GameMode == GameModeCreative {
 		newStack := world.NewItemStack(itemID, 1)
 		session.SetInventorySlot(targetSlot, newStack)
-		SetSlotItemMeta(session, targetSlot, ItemMeta{})
-		SetSlotArmorTrim(session, targetSlot, ArmorTrim{})
+		clearAllPickedSlotComponents(s, session, targetSlot)
 		session.SetSelectedSlot(int32(targetHB))
 		if session.send != nil {
 			stateID := session.NextContainerStateID()
@@ -3994,7 +4097,54 @@ func (s *Server) SelectOrPickItem(session *PlayerSession, itemName string) bool 
 	return false
 }
 
+func clearAllPickedSlotComponents(s *Server, session *PlayerSession, slot int) {
+	SetSlotItemMeta(session, slot, ItemMeta{})
+	SetSlotArmorTrim(session, slot, ArmorTrim{})
+	SetSlotPotionType(session, slot, "")
+	ClearSlotGoatHornInstrument(session, slot)
+	ClearSlotMapID(session, slot)
+	ClearSlotBundleContents(session, slot)
+	ClearSlotBannerMeta(session, slot)
+	ClearSlotWritableBook(session, slot)
+	ClearSlotWrittenBook(session, slot)
+	if s != nil {
+		SetSlotDecoratedPotSherds(s, session, slot, DefaultDecoratedPotSherds())
+	}
+}
+
+func allocateCreativePickHotbarSlot(s *Server, session *PlayerSession, itemID int32) int {
+	inv := session.Inventory()
+	targetHB := int(session.SelectedSlot())
+	if targetHB < 0 || targetHB >= world.HotbarSlotCount {
+		targetHB = 0
+	}
+	targetSlot := world.HotbarContainerOffset + targetHB
+	if !inv[targetSlot].IsEmpty() {
+		for hb := 0; hb < world.HotbarSlotCount; hb++ {
+			sSlot := world.HotbarContainerOffset + hb
+			if inv[sSlot].IsEmpty() {
+				targetHB = hb
+				targetSlot = sSlot
+				break
+			}
+		}
+	}
+	newStack := world.NewItemStack(itemID, 1)
+	session.SetInventorySlot(targetSlot, newStack)
+	clearAllPickedSlotComponents(s, session, targetSlot)
+	session.SetSelectedSlot(int32(targetHB))
+	if session.send != nil {
+		w := protocol.NewWriter(2)
+		w.VarInt(int32(targetHB))
+		_ = session.send(protocol.PlaySetHeldSlot, w.Bytes())
+	}
+	return targetSlot
+}
+
 // PickItemFromBlock handles middle-click block picking at (x, y, z).
+// When includeData == true in Creative mode (Ctrl + Pick Block), block entity
+// data (Banner patterns & CustomName, DecoratedPot sherds, Furnace/Hopper/BrewingStand
+// CustomName) is copied onto the picked hotbar item.
 func (s *Server) PickItemFromBlock(session *PlayerSession, x, y, z int, includeData bool) bool {
 	if s == nil || session == nil {
 		return false
@@ -4008,11 +4158,61 @@ func (s *Server) PickItemFromBlock(session *PlayerSession, x, y, z int, includeD
 	if itemName == "" {
 		return false
 	}
-	_ = includeData
-	return s.SelectOrPickItem(session, itemName)
+	snap := session.Snapshot()
+	if !includeData || snap.GameMode != GameModeCreative {
+		return s.SelectOrPickItem(session, itemName)
+	}
+	itemID, ok := world.ItemNameToID(itemName)
+	if !ok || itemID <= 0 {
+		return false
+	}
+	targetSlot := allocateCreativePickHotbarSlot(s, session, itemID)
+	dim := world.NormalizeDimension(snap.Dimension)
+
+	if IsBannerBlock(state) {
+		if b, exists := s.GetBannerAt(dim, x, y, z); exists && b != nil {
+			SetSlotBannerPatterns(session, targetSlot, b.Patterns)
+			if b.CustomName != nil && b.CustomName.PlainText() != "" {
+				meta := GetSlotItemMeta(session, targetSlot)
+				meta.CustomName = b.CustomName.PlainText()
+				SetSlotItemMeta(session, targetSlot, meta)
+			}
+		}
+	}
+	if IsDecoratedPotBlock(state) {
+		if dp, exists := s.GetDecoratedPotAt(dim, x, y, z); exists && dp != nil {
+			SetSlotDecoratedPotSherds(s, session, targetSlot, dp.Sherds)
+		}
+	}
+	if fbe, exists := s.FurnaceAt(x, y, z); exists && fbe.CustomName != "" {
+		meta := GetSlotItemMeta(session, targetSlot)
+		meta.CustomName = fbe.CustomName
+		SetSlotItemMeta(session, targetSlot, meta)
+	}
+	if hbe, exists := s.HopperAt(dim, x, y, z); exists && hbe != nil && hbe.CustomName != "" {
+		meta := GetSlotItemMeta(session, targetSlot)
+		meta.CustomName = hbe.CustomName
+		SetSlotItemMeta(session, targetSlot, meta)
+	}
+	if bs, exists := s.BrewingStandAtInDim(dim, x, y, z); exists && bs.CustomName != "" {
+		meta := GetSlotItemMeta(session, targetSlot)
+		meta.CustomName = bs.CustomName
+		SetSlotItemMeta(session, targetSlot, meta)
+	}
+
+	if session.send != nil {
+		stateID := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, targetSlot, session.InventorySlot(targetSlot)))
+	}
+	s.syncPlayerInventoryContainer(session)
+	return true
 }
 
 // PickItemFromEntity handles middle-click entity picking for entityID.
+// For non-empty item frames (`minecraft:item_frame` / `minecraft:glow_item_frame`),
+// picks the framed item first; when includeData == true in Creative mode, also
+// copies entity/item-frame custom name, metadata, map ID, goat horn instrument,
+// or bundle contents.
 func (s *Server) PickItemFromEntity(session *PlayerSession, entityID int32, includeData bool) bool {
 	if s == nil || session == nil || s.entities == nil {
 		return false
@@ -4021,12 +4221,60 @@ func (s *Server) PickItemFromEntity(session *PlayerSession, entityID int32, incl
 	if ent == nil {
 		return false
 	}
-	itemName := pickEntityItemName(ent)
+	frameSt, isFrame := s.ItemFrameState(entityID)
+	hasFramedItem := isFrame && !frameSt.Item.IsEmpty()
+
+	var itemName string
+	if hasFramedItem {
+		itemName = frameSt.Item.ResolvedID()
+	} else {
+		itemName = pickEntityItemName(ent)
+	}
 	if itemName == "" {
 		return false
 	}
-	_ = includeData
-	return s.SelectOrPickItem(session, itemName)
+	snap := session.Snapshot()
+	if !includeData || snap.GameMode != GameModeCreative {
+		return s.SelectOrPickItem(session, itemName)
+	}
+	itemID, ok := world.ItemNameToID(itemName)
+	if !ok || itemID <= 0 {
+		return false
+	}
+	targetSlot := allocateCreativePickHotbarSlot(s, session, itemID)
+
+	if hasFramedItem {
+		if !frameSt.ItemMeta.IsEmpty() {
+			SetSlotItemMeta(session, targetSlot, frameSt.ItemMeta)
+		}
+		if frameSt.HasMapID {
+			SetSlotMapID(session, targetSlot, frameSt.MapID)
+		}
+	} else if ent.IsItem() {
+		if fishMeta, exists := s.DroppedFishingItemMeta(ent.ID); exists && !fishMeta.IsEmpty() {
+			SetSlotItemMeta(session, targetSlot, fishMeta)
+		}
+		if hornInst, exists := s.DroppedGoatHornInstrument(ent.ID); exists && hornInst != "" {
+			SetSlotGoatHornInstrument(session, targetSlot, hornInst)
+		}
+		if mapID, exists := s.DroppedMapEntityID(ent.ID); exists {
+			SetSlotMapID(session, targetSlot, mapID)
+		}
+		if bundleItems, exists := s.DroppedBundleContents(ent.ID); exists && len(bundleItems) > 0 {
+			SetSlotBundleContents(session, targetSlot, bundleItems)
+		}
+	} else if vst, exists := s.VehicleStateByID(ent.ID); exists && vst.CustomName != "" {
+		meta := GetSlotItemMeta(session, targetSlot)
+		meta.CustomName = vst.CustomName
+		SetSlotItemMeta(session, targetSlot, meta)
+	}
+
+	if session.send != nil {
+		stateID := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, targetSlot, session.InventorySlot(targetSlot)))
+	}
+	s.syncPlayerInventoryContainer(session)
+	return true
 }
 
 // HandlePickItemFromBlockPacket decodes ServerboundPickItemFromBlockPacket (0x24):
@@ -5015,6 +5263,214 @@ func (s *Server) UseBeverageOrThrownPotion(session *PlayerSession, hand int32) b
 		return false
 	}
 }
+
+// --- Bundle Use in Air (minecraft:bundle & colored *_bundle) ---
+
+// UseBundleInAir handles right-clicking (`use_item`) with a `minecraft:bundle`
+// (or any colored `*_bundle`) in `hand`: ejects the selected item stack (or the
+// first item stack if SelectedIndex < 0) from the bundle into the world in front
+// of the player, updates `SetSlotBundleContents`, plays `minecraft:item.bundle.drop_contents`,
+// syncs the player's inventory container (`DataComponentBundleContents = 50`),
+// and records `used:<bundle>`.
+func (s *Server) UseBundleInAir(session *PlayerSession, hand int32) (dropped world.ItemStack, handled bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return world.ItemStack{}, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return world.ItemStack{}, false
+	}
+	invSlot, held := session.handSlotAndStack(hand)
+	if held.IsEmpty() || !IsBundleItem(held.ResolvedID()) {
+		return world.ItemStack{}, false
+	}
+	contents := GetSlotBundleContents(session, invSlot)
+	if len(contents) == 0 {
+		return world.ItemStack{}, false
+	}
+	selIdx := GetSlotBundleSelectedIndex(session, invSlot)
+	if selIdx < 0 || selIdx >= len(contents) {
+		selIdx = 0
+	}
+	dropped = contents[selIdx]
+	nextContents := make([]world.ItemStack, 0, len(contents)-1)
+	nextContents = append(nextContents, contents[:selIdx]...)
+	nextContents = append(nextContents, contents[selIdx+1:]...)
+	SetSlotBundleContents(session, invSlot, nextContents)
+	if selIdx >= len(nextContents) {
+		SetSlotBundleSelectedIndex(session, invSlot, -1)
+	}
+
+	dim := world.NormalizeDimension(snap.Dimension)
+	yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
+	pitchRad := float64(snap.Pitch) * (math.Pi / 180.0)
+	dirX := -math.Sin(yawRad) * math.Cos(pitchRad)
+	dirZ := math.Cos(yawRad) * math.Cos(pitchRad)
+	spawnX := snap.X + dirX*0.3
+	spawnY := snap.Y + 1.3
+	spawnZ := snap.Z + dirZ*0.3
+
+	_, _ = s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, dropped)
+
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:item.bundle.drop_contents", SoundSourcePlayers, snap.X, snap.Y+1.0, snap.Z, 0.8, 0.8, 0))
+	s.syncPlayerInventoryContainer(session)
+	s.RecordItemUsed(session, canonicalItemName(held.ResolvedID()), 1)
+	s.TriggerInventoryChanged(session)
+	return dropped, true
+}
+
+// --- Brush on Suspicious Sand / Suspicious Gravel (minecraft:brush) ---
+
+// UsePlayerBrushOnBlock handles using a `minecraft:brush` in `hand` on a
+// `minecraft:suspicious_sand` or `minecraft:suspicious_gravel` block at `(x, y, z)`
+// on `face` (0..5):
+//   - Steps `dusted` (`0 -> 1 -> 2 -> 3`) and schedules a 40-tick `UpdateFalling`
+//     decay timer (`world.BrushableCooldownTicks`) so idle blocks reset back toward 0.
+//   - On the 4th brush step (`dusted == 3` -> completion), extracts the buried
+//     item from `cache.StructureBlockEntityAt(x, y, z)` (or evaluates its
+//     archaeology loot table via `world.EvaluateArchaeologyLoot`), removes the
+//     structure block entity, converts the block into `minecraft:sand` or
+//     `minecraft:gravel` (`world.BrushableBlockTurnsInto`), spawns the excavated
+//     item entity outside `face`, damages the brush by 1 durability in non-Creative
+//     mode, records `used:minecraft:brush`, and grants `minecraft:adventure/salvage_sherd`
+//     (`"has_sherd"`) when a pottery sherd (`*_pottery_sherd`) is excavated.
+func (s *Server) UsePlayerBrushOnBlock(session *PlayerSession, hand int32, x, y, z int, face int32) (dustedStage int, completed bool, poppedItem world.ItemStack, handled bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return 0, false, world.ItemStack{}, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || snap.GameMode == GameModeAdventure {
+		return 0, false, world.ItemStack{}, false
+	}
+	invSlot, held := session.handSlotAndStack(hand)
+	if held.IsEmpty() || canonicalItemName(held.ResolvedID()) != BrushItemID {
+		return 0, false, world.ItemStack{}, false
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return 0, false, world.ItemStack{}, false
+	}
+	curState := cache.GetBlock(x, y, z)
+	if !world.IsBrushableBlock(curState) {
+		return 0, false, world.ItemStack{}, false
+	}
+	curDusted, ok := world.BrushableBlockDustedStage(curState)
+	if !ok {
+		return 0, false, world.ItemStack{}, false
+	}
+	bname := world.BlockName(curState)
+	cx := int32(x >> 4)
+	cz := int32(z >> 4)
+
+	if curDusted < world.BrushableMaxDustedStage {
+		nextDusted := curDusted + 1
+		nextState := world.BrushableBlockState(bname, nextDusted)
+		if applied, upd := cache.ApplyBlockWithUpdates(x, y, z, nextState); applied {
+			s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+		}
+		cache.ScheduleBlockUpdate(x, y, z, world.UpdateFalling, world.BrushableCooldownTicks)
+		snd := "minecraft:item.brush.brushing.sand"
+		if bname == "minecraft:suspicious_gravel" {
+			snd = "minecraft:item.brush.brushing.gravel"
+		}
+		s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+			EncodeSoundPacket(snd, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+		return nextDusted, false, world.ItemStack{}, true
+	}
+
+	// Completion step (curDusted == 3 -> turns into sand/gravel and pops item).
+	if sbe, exists := cache.StructureBlockEntityAt(x, y, z); exists {
+		for _, slot := range sbe.Items {
+			if slot.ItemID != "" && slot.Count > 0 {
+				poppedItem = world.NewNamedItemStack(slot.ItemID, int32(slot.Count))
+				break
+			}
+		}
+		if poppedItem.IsEmpty() && sbe.LootTable != "" {
+			seed := sbe.LootTableSeed
+			if seed == 0 {
+				seed = int64(x)*3129871 ^ int64(z)*116129781 ^ int64(y)
+			}
+			poppedItem = world.EvaluateArchaeologyLoot(sbe.LootTable, seed)
+		}
+		cache.RemoveStructureBlockEntity(x, y, z)
+	}
+
+	turnsInto := world.BrushableBlockTurnsInto(curState)
+	if applied, upd := cache.ApplyBlockWithUpdates(x, y, z, turnsInto); applied {
+		s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+	}
+
+	if !poppedItem.IsEmpty() {
+		var off [3]int = [3]int{0, 1, 0}
+		if face >= 0 && int(face) < len(bucketFaceOffsets) {
+			off = bucketFaceOffsets[face]
+		}
+		spawnX := float64(x) + 0.5 + float64(off[0])*0.65
+		spawnY := float64(y) + 0.35 + float64(off[1])*0.65
+		spawnZ := float64(z) + 0.5 + float64(off[2])*0.65
+		s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, poppedItem)
+		if strings.HasSuffix(canonicalItemName(poppedItem.ResolvedID()), "_pottery_sherd") {
+			ensureItemUseAdvancementsRegistered()
+			s.GrantCriterion(session, "minecraft:adventure/salvage_sherd", "has_sherd")
+		}
+	}
+
+	completeSnd := "minecraft:item.brush.brushing.sand.complete"
+	if bname == "minecraft:suspicious_gravel" {
+		completeSnd = "minecraft:item.brush.brushing.gravel.complete"
+	}
+	s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(completeSnd, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+
+	if snap.GameMode != GameModeCreative && invSlot >= 0 && invSlot < world.PlayerInventorySlots {
+		if s.DamagePlayerItem(session, invSlot, 1) {
+			s.RecordItemBroken(session, BrushItemID)
+		}
+	}
+	s.RecordItemUsed(session, BrushItemID, 1)
+	return 0, true, poppedItem, true
+}
+
+// --- Written Book & Writable Book Right-Click Use ---
+
+// OpenPlayerWrittenBook handles right-clicking (`use_item`) with a
+// `minecraft:written_book` or `minecraft:writable_book` in `hand`:
+//   - For `minecraft:written_book`: resolves the slot's `WrittenBookContent`,
+//     syncs the slot (`DataComponentWrittenBookContent = 61`), sends
+//     `protocol.PlayOpenBook` (`0x37` in protocol 775) as well as `UseBookItem`,
+//     and records `used:minecraft:written_book`.
+//   - For `minecraft:writable_book`: syncs the slot (`DataComponentWritableBookContent = 60`)
+//     and records `used:minecraft:writable_book`.
+func (s *Server) OpenPlayerWrittenBook(session *PlayerSession, hand int32) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	_, held := session.handSlotAndStack(hand)
+	if held.IsEmpty() {
+		return false
+	}
+	switch canonicalItemName(held.ResolvedID()) {
+	case WrittenBookItemID:
+		_ = s.UseBookItem(session, hand)
+		if session.send != nil {
+			_ = session.send(protocol.PlayOpenBook, EncodeOpenBookPacket(hand))
+		}
+		s.RecordItemUsed(session, WrittenBookItemID, 1)
+		return true
+	case WritableBookItemID:
+		s.syncPlayerInventoryContainer(session)
+		s.RecordItemUsed(session, WritableBookItemID, 1)
+		return true
+	default:
+		return false
+	}
+}
+
 
 
 
