@@ -689,6 +689,18 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundPandaHurt, SoundSourceNeutral
 	case MobTypeOcelot:
 		return SoundOcelotHurt, SoundSourceNeutral
+	case MobTypePiglin:
+		return SoundPiglinHurt, SoundSourceHostile
+	case MobTypePiglinBrute:
+		return SoundPiglinBruteHurt, SoundSourceHostile
+	case MobTypeZombifiedPiglin:
+		return SoundZombifiedPiglinHurt, SoundSourceHostile
+	case MobTypeHoglin:
+		return SoundHoglinHurt, SoundSourceHostile
+	case MobTypeZoglin:
+		return SoundZoglinHurt, SoundSourceHostile
+	case MobTypeStrider:
+		return SoundStriderHurt, SoundSourceNeutral
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -760,6 +772,18 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundPandaDeath, SoundSourceNeutral
 	case MobTypeOcelot:
 		return SoundOcelotDeath, SoundSourceNeutral
+	case MobTypePiglin:
+		return SoundPiglinDeath, SoundSourceHostile
+	case MobTypePiglinBrute:
+		return SoundPiglinBruteDeath, SoundSourceHostile
+	case MobTypeZombifiedPiglin:
+		return SoundZombifiedPiglinDeath, SoundSourceHostile
+	case MobTypeHoglin:
+		return SoundHoglinDeath, SoundSourceHostile
+	case MobTypeZoglin:
+		return SoundZoglinDeath, SoundSourceHostile
+	case MobTypeStrider:
+		return SoundStriderDeath, SoundSourceNeutral
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -1196,6 +1220,8 @@ func (s *Server) applyDamageToMob(
 			s.OnWanderingTraderDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypePanda {
 			s.OnPandaDamaged(target.ID, attacker, 0)
+		} else if normTarget == MobTypePiglin || normTarget == MobTypePiglinBrute {
+			s.OnPiglinOrBruteDamaged(target.ID, attacker, 0)
 		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,

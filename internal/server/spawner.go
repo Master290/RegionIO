@@ -192,6 +192,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickBees(rng)
 		s.TickBeehives(rng)
 		s.TickFoxesPandasAndOcelots(rng)
+		s.TickPiglinsHoglinsAndStriders(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -319,22 +320,31 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			continue
 		}
 		if isPassableBlock(blockBelow) || blockBelow == world.StateWater {
-			if mem.attackCooldown > 0 {
-				mem.attackCooldown--
-			}
-			minFallVel := int16(-3000)
-			if snapshot.TypeName == MobTypeChicken {
-				minFallVel = ChickenMaxFallVelocity
-			}
-			s.entities.Update(snapshot.ID, func(e *world.Entity) {
-				e.OnGround = false
-				e.VelocityY -= 80
-				if e.VelocityY < minFallVel {
-					e.VelocityY = minFallVel
+			if snapshot.TypeName == MobTypeStrider && world.BlockName(blockBelow) == "minecraft:lava" {
+				// Striders walk on top of lava without sinking!
+				s.entities.Update(snapshot.ID, func(e *world.Entity) {
+					e.OnGround = true
+					e.VelocityY = 0
+					e.Y = float64(yBelow + 1)
+				})
+			} else {
+				if mem.attackCooldown > 0 {
+					mem.attackCooldown--
 				}
-				e.Y += float64(e.VelocityY) / 8000.0
-			})
-			continue
+				minFallVel := int16(-3000)
+				if snapshot.TypeName == MobTypeChicken {
+					minFallVel = ChickenMaxFallVelocity
+				}
+				s.entities.Update(snapshot.ID, func(e *world.Entity) {
+					e.OnGround = false
+					e.VelocityY -= 80
+					if e.VelocityY < minFallVel {
+						e.VelocityY = minFallVel
+					}
+					e.Y += float64(e.VelocityY) / 8000.0
+				})
+				continue
+			}
 		}
 
 		feetY := yBelow + 1
@@ -462,6 +472,13 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 						snapshot.ID, snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
 						snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 					)
+				}
+			} else if snapshot.TypeName == MobTypePiglin || snapshot.TypeName == MobTypePiglinBrute || snapshot.TypeName == MobTypeHoglin || snapshot.TypeName == MobTypeZoglin {
+				if mem.breedCooldown > 0 {
+					mem.breedCooldown--
+				}
+				if mem.inLoveTicks > 0 {
+					mem.inLoveTicks--
 				}
 			} else if snapshot.TypeName == MobTypeIronGolem {
 				if gst, ok := s.GetIronGolemState(snapshot.ID); !ok || gst.TargetMobID == 0 {

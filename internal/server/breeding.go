@@ -176,6 +176,10 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 		return IsPandaFoodItem(item)
 	case MobTypeOcelot:
 		return IsCatFoodItem(item)
+	case MobTypeHoglin:
+		return item == "minecraft:crimson_fungus"
+	case MobTypeStrider:
+		return item == "minecraft:warped_fungus"
 	default:
 		return false
 	}
@@ -190,7 +194,8 @@ func IsBreedableMob(typeName string) bool {
 		MobTypeHorse, MobTypeDonkey, MobTypeLlama, MobTypeTraderLlama,
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,
 		MobTypeFrog, MobTypeAxolotl, MobTypeGoat, MobTypeBee,
-		MobTypeFox, MobTypePanda, MobTypeOcelot:
+		MobTypeFox, MobTypePanda, MobTypeOcelot,
+		MobTypeHoglin, MobTypeStrider:
 		return true
 	default:
 		return false

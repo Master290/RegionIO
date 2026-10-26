@@ -900,6 +900,15 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 	case MobTypeFox, MobTypePanda, MobTypeOcelot:
 		handled, _ := s.InteractWithFoxPandaOrOcelot(session, targetEntityID, nil)
 		return handled, 0, nil
+	case MobTypePiglin:
+		handled := s.InteractWithPiglin(session, targetEntityID)
+		return handled, 0, nil
+	case MobTypeHoglin:
+		handled, _ := s.InteractWithHoglin(session, targetEntityID, nil)
+		return handled, 0, nil
+	case MobTypeStrider:
+		handled, _ := s.InteractWithStrider(session, targetEntityID, nil)
+		return handled, 0, nil
 	}
 	if IsPassiveAnimal(ent.TypeName) {
 		handled, _ := s.InteractWithAnimal(session, targetEntityID)

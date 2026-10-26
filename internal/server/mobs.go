@@ -187,6 +187,12 @@ var (
 		MobTypeFox:                 EntityTypeFoxID,
 		MobTypePanda:               EntityTypePandaID,
 		MobTypeOcelot:              EntityTypeOcelotID,
+		MobTypePiglin:              EntityTypePiglinID,
+		MobTypePiglinBrute:         EntityTypePiglinBruteID,
+		MobTypeZombifiedPiglin:     EntityTypeZombifiedPiglinID,
+		MobTypeHoglin:              EntityTypeHoglinID,
+		MobTypeZoglin:              EntityTypeZoglinID,
+		MobTypeStrider:             EntityTypeStriderID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -208,10 +214,10 @@ func AllPassiveAnimalTypes() []string {
 }
 
 // IsPassiveAnimal reports whether typeName is a breedable passive farm/wild animal
-// (pig, cow, sheep, chicken, bee, fox, panda, or ocelot).
+// (pig, cow, sheep, chicken, bee, fox, panda, ocelot, or strider).
 func IsPassiveAnimal(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot:
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot, MobTypeStrider:
 		return true
 	default:
 		return false
@@ -343,6 +349,18 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultPandaMaxHealth
 	case MobTypeOcelot:
 		return DefaultOcelotMaxHealth
+	case MobTypePiglin:
+		return DefaultPiglinMaxHealth
+	case MobTypePiglinBrute:
+		return DefaultPiglinBruteMaxHealth
+	case MobTypeZombifiedPiglin:
+		return DefaultZombifiedPiglinMaxHealth
+	case MobTypeHoglin:
+		return DefaultHoglinMaxHealth
+	case MobTypeZoglin:
+		return DefaultZoglinMaxHealth
+	case MobTypeStrider:
+		return DefaultStriderMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -380,6 +398,16 @@ func animalWanderSpeed(typeName string) float64 {
 		return PandaWanderSpeed
 	case MobTypeOcelot:
 		return OcelotWanderSpeed
+	case MobTypePiglin:
+		return PiglinWanderSpeed
+	case MobTypePiglinBrute:
+		return PiglinBruteSpeed
+	case MobTypeHoglin:
+		return HoglinWanderSpeed
+	case MobTypeZoglin:
+		return ZoglinChaseSpeed
+	case MobTypeStrider:
+		return StriderLandSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -471,6 +499,21 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeOcelot {
 		return s.SpawnOcelot(normDim, x, y, z, false)
+	}
+	if norm == MobTypePiglin {
+		return s.SpawnPiglin(normDim, x, y, z, false)
+	}
+	if norm == MobTypePiglinBrute {
+		return s.SpawnPiglinBrute(normDim, x, y, z)
+	}
+	if norm == MobTypeHoglin {
+		return s.SpawnHoglin(normDim, x, y, z, false)
+	}
+	if norm == MobTypeZoglin {
+		return s.SpawnZoglin(normDim, x, y, z, false)
+	}
+	if norm == MobTypeStrider {
+		return s.SpawnStrider(normDim, x, y, z, false)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
