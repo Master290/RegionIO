@@ -590,6 +590,32 @@ func EncodeFurnaceMinecartDataPacket(entityID int32, lit bool) []byte {
 	return w.Bytes()
 }
 
+// VehicleEntityDataPackets returns the PlaySetEntityData packets reflecting the
+// live wobble/hurt state, boat paddle/bubble-time state, or furnace minecart
+// lit state for entityID.
+func (s *Server) VehicleEntityDataPackets(entityID int32) [][]byte {
+	if s == nil || entityID <= 0 {
+		return nil
+	}
+	st, ok := s.VehicleStateByID(entityID)
+	if !ok {
+		return [][]byte{EncodeVehicleEntityDataPacket(entityID, 0, 1, 0.0)}
+	}
+	hurtDir := st.HurtDir
+	if hurtDir == 0 {
+		hurtDir = 1
+	}
+	pkts := [][]byte{
+		EncodeVehicleEntityDataPacket(entityID, st.HurtTime, hurtDir, st.Damage),
+	}
+	if IsBoatEntity(st.TypeName) && (st.LeftPaddle || st.RightPaddle || st.BubbleTime > 0) {
+		pkts = append(pkts, EncodeBoatPaddleDataPacket(entityID, st.LeftPaddle, st.RightPaddle, st.BubbleTime))
+	} else if st.TypeName == EntityTypeFurnaceMinecart && st.Fuel > 0 {
+		pkts = append(pkts, EncodeFurnaceMinecartDataPacket(entityID, true))
+	}
+	return pkts
+}
+
 // --- Spawning & State Accessors ---
 
 // SpawnVehicle spawns a minecart or boat/raft entity of typeName in dim at
@@ -963,9 +989,12 @@ func (s *Server) MountPlayerOnVehicle(session *PlayerSession, vehicleID int32) (
 	mgr.mu.Unlock()
 
 	s.SetPlayerTransform(session, ent.X, ent.Y, ent.Z, snap.Yaw, snap.Pitch, false)
+	session.SetFallDistance(0)
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
 	s.broadcastVehiclePassengers(dim, cp.X, cp.Z, vehicleID, passengersCopy)
+	s.checkBoatWithGoatAdvancement(vehicleID)
+	s.refreshVehicleDetectorRailComparators(vehicleID)
 	s.EmitVibration(VibrationEvent{
 		Dimension:      dim,
 		Type:           GameEventEntityMount,
@@ -1021,7 +1050,48 @@ func (s *Server) MountEntityOnVehicle(passengerEntityID, vehicleID int32) (seatI
 	})
 	cp := vehEnt.ChunkPos()
 	s.broadcastVehiclePassengers(vehEnt.EffectiveDimension(), cp.X, cp.Z, vehicleID, passengersCopy)
+	s.checkBoatWithGoatAdvancement(vehicleID)
+	s.refreshVehicleDetectorRailComparators(vehicleID)
 	return seatIndex, true
+}
+
+func (s *Server) checkBoatWithGoatAdvancement(vehicleID int32) {
+	if s == nil || s.entities == nil || vehicleID <= 0 {
+		return
+	}
+	mgr := s.vehicleManager()
+	mgr.mu.Lock()
+	st := mgr.vehicles[vehicleID]
+	if st == nil || !IsBoatEntity(st.TypeName) || len(st.Passengers) < 2 {
+		mgr.mu.Unlock()
+		return
+	}
+	passengers := make([]int32, len(st.Passengers))
+	copy(passengers, st.Passengers)
+	var sessions []*PlayerSession
+	for sess, vid := range mgr.byPassengerPlayer {
+		if vid == vehicleID && sess != nil {
+			sessions = append(sessions, sess)
+		}
+	}
+	mgr.mu.Unlock()
+	if len(sessions) == 0 {
+		return
+	}
+	hasGoat := false
+	for _, pid := range passengers {
+		if pid > 0 {
+			if ent := s.entities.Get(pid); ent != nil && canonicalResourceName(ent.TypeName) == "minecraft:goat" {
+				hasGoat = true
+				break
+			}
+		}
+	}
+	if hasGoat {
+		for _, sess := range sessions {
+			s.TriggerRideBoatWithGoat(sess)
+		}
+	}
 }
 
 // PlayerMountedCamel returns the entity ID of the Camel currently ridden by
@@ -1213,7 +1283,9 @@ func (s *Server) DismountPlayerVehicle(session *PlayerSession) bool {
 		}
 	}
 	s.SetPlayerTransform(session, dismountX, dismountY, dismountZ, snap.Yaw, snap.Pitch, true)
+	session.SetFallDistance(0)
 	s.broadcastVehiclePassengers(dim, cx, cz, vehicleID, passengersCopy)
+	s.refreshVehicleDetectorRailComparators(vehicleID)
 	s.EmitVibration(VibrationEvent{
 		Dimension:      dim,
 		Type:           GameEventEntityDismount,
@@ -1269,6 +1341,7 @@ func (s *Server) DismountAllVehiclePassengers(vehicleID int32) int {
 	for _, sess := range sessionsToDismount {
 		snap := sess.Snapshot()
 		s.SetPlayerTransform(sess, dx, dy, dz, snap.Yaw, snap.Pitch, true)
+		sess.SetFallDistance(0)
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,
 			Type:           GameEventEntityDismount,
@@ -1281,6 +1354,7 @@ func (s *Server) DismountAllVehiclePassengers(vehicleID int32) int {
 		})
 	}
 	s.broadcastVehiclePassengers(dim, cx, cz, vehicleID, nil)
+	s.refreshVehicleDetectorRailComparators(vehicleID)
 	return len(ejected)
 }
 
@@ -1657,9 +1731,11 @@ func (s *Server) syncVehiclePassengerPositions(vehicleID int32, vx, vy, vz float
 	mgr := s.vehicleManager()
 	mgr.mu.Lock()
 	st := mgr.vehicles[vehicleID]
+	var typeName string
 	var passengers []int32
 	var sessions []*PlayerSession
 	if st != nil {
+		typeName = st.TypeName
 		passengers = make([]int32, len(st.Passengers))
 		copy(passengers, st.Passengers)
 		for sess, vid := range mgr.byPassengerPlayer {
@@ -1672,7 +1748,16 @@ func (s *Server) syncVehiclePassengerPositions(vehicleID int32, vx, vy, vz float
 
 	for _, sess := range sessions {
 		ps := sess.Snapshot()
+		horizCm := int32(math.Round(math.Hypot(vx-ps.X, vz-ps.Z) * 100.0))
 		s.SetPlayerTransform(sess, vx, vy, vz, ps.Yaw, ps.Pitch, false)
+		sess.SetFallDistance(0)
+		if horizCm > 0 {
+			if IsBoatEntity(typeName) {
+				s.AwardCustomStat(sess, StatBoatOneCm, horizCm)
+			} else if IsMinecartEntity(typeName) {
+				s.AwardCustomStat(sess, StatMinecartOneCm, horizCm)
+			}
+		}
 	}
 	if s.entities != nil {
 		for _, pid := range passengers {
@@ -1688,6 +1773,85 @@ func (s *Server) syncVehiclePassengerPositions(vehicleID int32, vx, vy, vz float
 }
 
 // --- Minecart Rail Physics & Variants (3 & 4) ---
+
+// ResolveRailPlacementAt computes the placed rail block state (shape, curve,
+// ascending slope, and initial redstone powered state) at (x, y, z).
+func ResolveRailPlacementAt(cache *world.Cache, x, y, z int, baseState uint16, playerHorizFacing string) uint16 {
+	if !isRailBlock(baseState) {
+		return baseState
+	}
+	name := world.BlockName(baseState)
+	shape := "north_south"
+	if playerHorizFacing == "east" || playerHorizFacing == "west" {
+		shape = "east_west"
+	}
+
+	if cache != nil {
+		hasRailAt := func(rx, ry, rz int) bool {
+			if ry >= world.MinY && ry < world.MinY+world.WorldHeight && isRailBlock(cache.GetBlock(rx, ry, rz)) {
+				return true
+			}
+			if ry+1 < world.MinY+world.WorldHeight && isRailBlock(cache.GetBlock(rx, ry+1, rz)) {
+				return true
+			}
+			if ry-1 >= world.MinY && isRailBlock(cache.GetBlock(rx, ry-1, rz)) {
+				return true
+			}
+			return false
+		}
+		hasN := hasRailAt(x, y, z-1)
+		hasS := hasRailAt(x, y, z+1)
+		hasW := hasRailAt(x-1, y, z)
+		hasE := hasRailAt(x+1, y, z)
+
+		if (hasN || hasS) && !hasW && !hasE {
+			shape = "north_south"
+		} else if (hasW || hasE) && !hasN && !hasS {
+			shape = "east_west"
+		} else if name == "minecraft:rail" {
+			switch {
+			case hasS && hasE && !hasN && !hasW:
+				shape = "south_east"
+			case hasS && hasW && !hasN && !hasE:
+				shape = "south_west"
+			case hasN && hasW && !hasS && !hasE:
+				shape = "north_west"
+			case hasN && hasE && !hasS && !hasW:
+				shape = "north_east"
+			}
+		}
+
+		if y+1 < world.MinY+world.WorldHeight {
+			switch shape {
+			case "north_south":
+				if isRailBlock(cache.GetBlock(x, y+1, z-1)) {
+					shape = "ascending_north"
+				} else if isRailBlock(cache.GetBlock(x, y+1, z+1)) {
+					shape = "ascending_south"
+				}
+			case "east_west":
+				if isRailBlock(cache.GetBlock(x+1, y+1, z)) {
+					shape = "ascending_east"
+				} else if isRailBlock(cache.GetBlock(x-1, y+1, z)) {
+					shape = "ascending_west"
+				}
+			}
+		}
+	}
+
+	out := baseState
+	if st, ok := world.WithBlockProperty(out, "shape", shape); ok {
+		out = st
+	}
+	if cache != nil && (name == "minecraft:powered_rail" || name == "minecraft:activator_rail") {
+		if cache.IsBlockPowered(x, y, z) {
+			if st, ok := world.WithBlockProperty(out, "powered", "true"); ok {
+				out = st
+			}
+		}
+	}
+	return out
+}
 
 func railShapeProperty(state uint16) string {
 	_, props, ok := world.BlockStateProperties(state)
@@ -2050,10 +2214,19 @@ func (s *Server) activateDetectorRailAt(dim string, cache *world.Cache, x, y, z 
 		}
 		cpProps["powered"] = "true"
 		if nextState, ok := world.BlockStateByName("minecraft:detector_rail", cpProps); ok {
+			s.BindNoteBlockAndJukeboxRedstone(dim)
 			if valid, lc := cache.SetBlockWithLight(x, y, z, nextState); valid {
 				s.broadcastDimensionBlockChanges(dim, cache, []world.BlockChange{
 					{Pos: world.BlockPos{X: x, Y: y, Z: z}, OldState: railState, NewState: nextState},
 				}, lc)
+				if nbRes := cache.UpdateNeighbors(x, y, z); len(nbRes.Changes) > 0 || len(nbRes.LightChanged) > 0 {
+					s.broadcastDimensionBlockChanges(dim, cache, nbRes.Changes, nbRes.LightChanged)
+				}
+				if y > world.MinY {
+					if nbBelow := cache.UpdateNeighbors(x, y-1, z); len(nbBelow.Changes) > 0 || len(nbBelow.LightChanged) > 0 {
+						s.broadcastDimensionBlockChanges(dim, cache, nbBelow.Changes, nbBelow.LightChanged)
+					}
+				}
 				if compRes := s.UpdateComparatorsAt(dim, x, y, z); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
 					s.broadcastDimensionBlockChanges(dim, cache, compRes.Changes, compRes.LightChanged)
 				}
@@ -2117,10 +2290,19 @@ func (s *Server) tickDetectorRails() {
 			}
 			cpProps["powered"] = "false"
 			if nextState, ok := world.BlockStateByName("minecraft:detector_rail", cpProps); ok {
+				s.BindNoteBlockAndJukeboxRedstone(key.dim)
 				if valid, lc := cache.SetBlockWithLight(key.pos.X, key.pos.Y, key.pos.Z, nextState); valid {
 					s.broadcastDimensionBlockChanges(key.dim, cache, []world.BlockChange{
 						{Pos: key.pos, OldState: curState, NewState: nextState},
 					}, lc)
+					if nbRes := cache.UpdateNeighbors(key.pos.X, key.pos.Y, key.pos.Z); len(nbRes.Changes) > 0 || len(nbRes.LightChanged) > 0 {
+						s.broadcastDimensionBlockChanges(key.dim, cache, nbRes.Changes, nbRes.LightChanged)
+					}
+					if key.pos.Y > world.MinY {
+						if nbBelow := cache.UpdateNeighbors(key.pos.X, key.pos.Y-1, key.pos.Z); len(nbBelow.Changes) > 0 || len(nbBelow.LightChanged) > 0 {
+							s.broadcastDimensionBlockChanges(key.dim, cache, nbBelow.Changes, nbBelow.LightChanged)
+						}
+					}
 					if compRes := s.UpdateComparatorsAt(key.dim, key.pos.X, key.pos.Y, key.pos.Z); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
 						s.broadcastDimensionBlockChanges(key.dim, cache, compRes.Changes, compRes.LightChanged)
 					}
@@ -2130,6 +2312,32 @@ func (s *Server) tickDetectorRails() {
 				}
 			}
 		}
+	}
+}
+
+func (s *Server) refreshVehicleDetectorRailComparators(entityID int32) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || !IsMinecartEntity(ent.TypeName) {
+		return
+	}
+	dim := ent.EffectiveDimension()
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return
+	}
+	bx, by, bz := int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z))
+	if world.BlockName(cache.GetBlock(bx, by, bz)) != "minecraft:detector_rail" {
+		if by > world.MinY && world.BlockName(cache.GetBlock(bx, by-1, bz)) == "minecraft:detector_rail" {
+			by--
+		} else {
+			return
+		}
+	}
+	if compRes := s.UpdateComparatorsAt(dim, bx, by, bz); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
+		s.broadcastDimensionBlockChanges(dim, cache, compRes.Changes, compRes.LightChanged)
 	}
 }
 
@@ -2655,6 +2863,14 @@ func (s *Server) tickSingleMinecart(entityID int32, ent *world.Entity) {
 	// Evaluate detector/activator rail triggers at the new position.
 	s.evaluateMinecartRailTriggers(entityID)
 
+	// TNT minecart ignites when entering fire, soul_fire, or lava.
+	if typeName == EntityTypeTNTMinecart && cache != nil {
+		curName := world.BlockName(cache.GetBlock(int(math.Floor(nextX)), int(math.Floor(nextY)), int(math.Floor(nextZ))))
+		if curName == "minecraft:fire" || curName == "minecraft:soul_fire" || curName == "minecraft:lava" {
+			s.PrimeTNTMinecart(entityID, TNTMinecartDefaultFuseTicks)
+		}
+	}
+
 	// Empty moving rideable minecarts pick up nearby mobs on collision.
 	if typeName == EntityTypeMinecart && !hasPassengers && (vx*vx+vz*vz > 0.0025) {
 		s.tryPickupMobIntoVehicle(entityID, dim, nextX, nextY, nextZ)
@@ -2741,7 +2957,10 @@ func (s *Server) tickHopperMinecartItems(entityID int32, dim string, x, y, z flo
 		}
 	}
 
-	// 2. Invoke registered hopper hook (if Agent C registered one) for container/hopper block transfers.
+	// 2. Pull from container block/entity above (bx, by+1, bz) and push into hopper block below (bx, by-1, bz).
+	s.TickHopperMinecartTransfer(entityID, dim, x, y, z)
+
+	// 3. Invoke custom registered hopper hook if one is set.
 	if hook != nil {
 		hook(s, entityID, dim, x, y, z)
 	}
@@ -2762,9 +2981,11 @@ func (s *Server) tickSingleBoat(entityID int32, ent *world.Entity) {
 		mgr.mu.Unlock()
 		return
 	}
+	typeName := st.TypeName
+	passengerCount := len(st.Passengers)
 	var driverInput PlayerInput
 	var hasDriver bool
-	if len(st.Passengers) > 0 {
+	if passengerCount > 0 {
 		driverID := st.Passengers[0]
 		for sess, vid := range mgr.byPassengerPlayer {
 			if vid == entityID && (sess.EntityID == driverID || (sess.EntityID == 0 && driverID == -1)) {
@@ -2776,6 +2997,8 @@ func (s *Server) tickSingleBoat(entityID int32, ent *world.Entity) {
 	}
 	deltaRot := st.DeltaRot
 	submerged := st.Submerged
+	bubbleTime := st.BubbleTime
+	leftPaddle, rightPaddle := st.LeftPaddle, st.RightPaddle
 	mgr.mu.Unlock()
 
 	medium := s.ClassifyBoatMedium(dim, ent.X, ent.Y, ent.Z)
@@ -2792,8 +3015,11 @@ func (s *Server) tickSingleBoat(entityID int32, ent *world.Entity) {
 	case BoatMediumInWater:
 		submerged = 0
 		waterY := math.Floor(ent.Y) + 0.9
-		if cache != nil && world.BlockName(cache.GetBlock(int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z)))) != "minecraft:water" {
-			waterY = math.Floor(ent.Y-0.05) + 0.9
+		if cache != nil {
+			curName := world.BlockName(cache.GetBlock(int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z))))
+			if curName != "minecraft:water" && curName != "minecraft:bubble_column" {
+				waterY = math.Floor(ent.Y-0.05) + 0.9
+			}
 		}
 		vy = (waterY - ent.Y) * 0.2
 	case BoatMediumOnIce, BoatMediumOnBlueIce, BoatMediumOnLand:
@@ -2802,6 +3028,35 @@ func (s *Server) tickSingleBoat(entityID int32, ent *world.Entity) {
 	default:
 		submerged = 0
 		vy -= BoatGravity
+	}
+
+	// Bubble column rocking / upward bounce / whirlpool sinking.
+	var bubbleMetaChanged bool
+	if cache != nil {
+		bx, by, bz := int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z))
+		colState := cache.GetBlock(bx, by, bz)
+		if world.BlockName(colState) != "minecraft:bubble_column" {
+			colState = cache.GetBlock(bx, int(math.Floor(ent.Y-0.05)), bz)
+		}
+		if world.BlockName(colState) == "minecraft:bubble_column" {
+			bubbleTime++
+			bubbleMetaChanged = true
+			_, props, _ := world.BlockStateProperties(colState)
+			if props["drag"] == "true" {
+				vy -= 0.03
+				if bubbleTime >= 60 {
+					s.DismountAllVehiclePassengers(entityID)
+					vy -= 0.06
+				}
+			} else {
+				if vy < 0.06 {
+					vy = 0.06
+				}
+			}
+		} else if bubbleTime > 0 {
+			bubbleTime = 0
+			bubbleMetaChanged = true
+		}
 	}
 
 	// Apply driver steering input when mounted.
@@ -2846,8 +3101,15 @@ func (s *Server) tickSingleBoat(entityID int32, ent *world.Entity) {
 	if st := mgr.vehicles[entityID]; st != nil {
 		st.DeltaRot = deltaRot
 		st.Submerged = submerged
+		st.BubbleTime = bubbleTime
 	}
 	mgr.mu.Unlock()
+
+	if bubbleMetaChanged {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityData,
+			EncodeBoatPaddleDataPacket(entityID, leftPaddle, rightPaddle, bubbleTime))
+	}
 
 	nextX := ent.X + vx
 	nextY := ent.Y + vy
@@ -2895,6 +3157,11 @@ func (s *Server) tickSingleBoat(entityID int32, ent *world.Entity) {
 			cp := updated.ChunkPos()
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
 		}
+	}
+
+	// Boats with open passenger seats pick up nearby non-aquatic mobs on collision.
+	if passengerCount < MaxVehiclePassengers(typeName) && (vx*vx+vz*vz > 0.0025) {
+		s.tryPickupMobIntoVehicle(entityID, dim, nextX, nextY, nextZ)
 	}
 }
 
@@ -3100,6 +3367,7 @@ func (s *Server) SetVehicleContainerSlot(entityID int32, slot int, stack world.I
 		st.Items[slot] = world.NewItemStack(stack.ResolvedItemID(), stack.Count)
 	}
 	mgr.mu.Unlock()
+	s.refreshVehicleDetectorRailComparators(entityID)
 	return true
 }
 
@@ -3131,7 +3399,6 @@ func (s *Server) AddItemToVehicleInventory(entityID int32, stack world.ItemStack
 
 	mgr := s.vehicleManager()
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
 
 	remaining := stack.Count
 	var added int32
@@ -3160,6 +3427,10 @@ func (s *Server) AddItemToVehicleInventory(entityID int32, stack world.ItemStack
 			remaining -= take
 			added += take
 		}
+	}
+	mgr.mu.Unlock()
+	if added > 0 {
+		s.refreshVehicleDetectorRailComparators(entityID)
 	}
 	return added
 }

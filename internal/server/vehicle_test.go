@@ -591,3 +591,81 @@ func TestEquineInventoryScreenAndRidingHooks(t *testing.T) {
 	}
 }
 
+func TestBoatWithGoatAdvancementBubbleColumnAndRailPlacement(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	cache := srv.Chunks()
+
+	player, err := srv.RegisterPlayer(Profile{UUID: [16]byte{8, 1}, Name: "goat_captain"}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(player, GameModeSurvival)
+	srv.SetPlayerTransform(player, 90.5, 65.0, 90.5, 0, 0, true)
+
+	// 1. "Whatever Floats Your Goat!" advancement when riding a boat with a goat passenger.
+	boatID, _ := srv.SpawnVehicle(world.DimensionOverworld, "minecraft:oak_boat", 90.5, 65.0, 90.5, 0)
+	if boatID == 0 {
+		t.Fatal("SpawnVehicle oak_boat failed")
+	}
+	goatID := srv.entities.Add(&world.Entity{
+		TypeName:  "minecraft:goat",
+		Dimension: world.DimensionOverworld,
+		X:         90.5,
+		Y:         65.0,
+		Z:         90.5,
+	})
+	if _, ok := srv.MountPlayerOnVehicle(player, boatID); !ok {
+		t.Fatal("MountPlayerOnVehicle failed")
+	}
+	if _, ok := srv.MountEntityOnVehicle(goatID, boatID); !ok {
+		t.Fatal("MountEntityOnVehicle(goat) failed")
+	}
+	if got := srv.EntityMountedVehicle(goatID); got != boatID {
+		t.Fatalf("EntityMountedVehicle(goat) = %d, want %d", got, boatID)
+	}
+	if !player.HasCompletedAdvancement("minecraft:husbandry/ride_a_boat_with_a_goat") {
+		t.Fatal("expected minecraft:husbandry/ride_a_boat_with_a_goat to be granted when riding boat with a goat")
+	}
+	if !srv.DismountEntityFromVehicle(goatID) || srv.EntityMountedVehicle(goatID) != 0 {
+		t.Fatal("expected DismountEntityFromVehicle(goat) to dismount goat")
+	}
+
+	// 2. Whirlpool bubble column (drag=true) rocks boat (BubbleTime > 0) and ejects passengers at 60 ticks.
+	whirlpoolState, ok := world.BlockStateByName("minecraft:bubble_column", map[string]string{"drag": "true"})
+	if !ok {
+		t.Fatal("missing bubble_column[drag=true] state")
+	}
+	cache.SetBlock(90, 64, 90, whirlpoolState)
+	srv.entities.Update(boatID, func(e *world.Entity) {
+		e.X, e.Y, e.Z = 90.5, 64.9, 90.5
+	})
+	srv.TickVehicles()
+	if st, ok := srv.VehicleStateByID(boatID); !ok || st.BubbleTime <= 0 {
+		t.Fatalf("expected boat BubbleTime > 0 on bubble_column, got %+v", st)
+	}
+	if pkts := srv.VehicleEntityDataPackets(boatID); len(pkts) < 2 {
+		t.Fatalf("expected VehicleEntityDataPackets to include paddle/bubble packet, got %d packets", len(pkts))
+	}
+	for tick := 1; tick < 60; tick++ {
+		srv.TickVehicles()
+	}
+	if srv.PlayerMountedVehicle(player) != 0 {
+		t.Fatal("expected 60 ticks on whirlpool bubble_column to eject boat passengers")
+	}
+
+	// 3. ResolveRailPlacementAt: curves, slopes, and redstone power.
+	baseRail, _ := world.BlockStateByName("minecraft:rail", map[string]string{"shape": "north_south", "waterlogged": "false"})
+	cache.SetBlock(100, 65, 101, baseRail) // south neighbor
+	cache.SetBlock(101, 65, 100, baseRail) // east neighbor
+	curved := ResolveRailPlacementAt(cache, 100, 65, 100, baseRail, "north")
+	if sh := railShapeProperty(curved); sh != "south_east" {
+		t.Fatalf("ResolveRailPlacementAt curve shape = %q, want south_east", sh)
+	}
+	cache.SetBlock(106, 66, 100, baseRail) // raised east neighbor at Y+1
+	sloped := ResolveRailPlacementAt(cache, 105, 65, 100, baseRail, "east")
+	if sh := railShapeProperty(sloped); sh != "ascending_east" {
+		t.Fatalf("ResolveRailPlacementAt slope shape = %q, want ascending_east", sh)
+	}
+}
+
+

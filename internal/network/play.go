@@ -766,9 +766,11 @@ func (h *handler) syncVisibleEntities() error {
 				}
 			}
 			if entity.IsVehicle() && h.srv != nil {
-				if metaPkt := server.EncodeVehicleEntityDataPacket(entity.ID, 0, 1, 0.0); len(metaPkt) > 0 {
-					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
-						return err
+				for _, metaPkt := range h.srv.VehicleEntityDataPackets(entity.ID) {
+					if len(metaPkt) > 0 {
+						if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+							return err
+						}
 					}
 				}
 				if passengers := h.srv.VehiclePassengers(entity.ID); len(passengers) > 0 {
@@ -1094,6 +1096,10 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
+				if _, placed := h.srv.UseBoatItemInAir(h.session, hand); placed {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
 				_ = h.srv.UseProjectileItem(h.session, hand)
 			}
 			if err := h.srv.HandleUseItemPacket(h.session, pkt.Body()); err != nil {
@@ -1124,6 +1130,10 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 						}
 					} else if camelID := h.srv.PlayerMountedCamel(h.session); camelID > 0 && h.srv.CamelDriver(camelID) == h.session.EntityID && jumpBoost > 0 {
 						_, _, _, _ = h.srv.ExecuteCamelDash(camelID, int(jumpBoost))
+					} else if vid := h.srv.PlayerMountedVehicle(h.session); vid > 0 {
+						if st, ok := h.srv.VehicleStateByID(vid); ok && server.IsChestBoatEntity(st.TypeName) {
+							_, _ = h.srv.OpenVehicleContainer(h.session, vid)
+						}
 					}
 				}
 			}
@@ -2151,6 +2161,13 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					if fgState, ok := cache.ResolveFenceGatePlacementAt(px, py, pz, world.BlockName(state), server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)); ok {
 						state = fgState
 					}
+				}
+				if server.IsRailBlockState(state) {
+					playerFacing := "south"
+					if h.session != nil {
+						playerFacing = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
+					}
+					state = server.ResolveRailPlacementAt(cache, px, py, pz, state, playerFacing)
 				}
 				if world.CanBlockBeWaterlogged(state) {
 					if cache.IsWaterEvaporatingDimension() {
