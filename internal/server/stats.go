@@ -637,12 +637,16 @@ func (s *Server) SetPlayerStat(session *PlayerSession, category StatType, key st
 		value = 0
 	}
 	st.mu.Lock()
+	prev := st.values[statMapKey{category: category, key: canon}]
 	if value == 0 {
 		delete(st.values, statMapKey{category: category, key: canon})
 	} else {
 		st.values[statMapKey{category: category, key: canon}] = value
 	}
 	st.mu.Unlock()
+	if s != nil {
+		s.OnPlayerStatChanged(session, category, canon, value-prev, value)
+	}
 }
 
 // AwardPlayerStat adds delta to (category, key) for session and returns the new value.
@@ -666,6 +670,9 @@ func (s *Server) AwardPlayerStat(session *PlayerSession, category StatType, key 
 	}
 	st.values[mk] = next
 	st.mu.Unlock()
+	if s != nil {
+		s.OnPlayerStatChanged(session, category, canon, delta, next)
+	}
 	return next
 }
 
@@ -786,6 +793,27 @@ func (s *Server) RecordPlayerSleepInBed(session *PlayerSession) {
 	s.SetPlayerStat(session, StatTypeCustom, StatTimeSinceRest, 0)
 }
 
+var playerSwimmingMap sync.Map // map[*PlayerSession]bool
+
+// IsSwimming reports whether session is in the swimming pose.
+func (session *PlayerSession) IsSwimming() bool {
+	if session == nil {
+		return false
+	}
+	if v, ok := playerSwimmingMap.Load(session); ok {
+		return v.(bool)
+	}
+	return false
+}
+
+// SetSwimming sets whether session is in the swimming pose.
+func (session *PlayerSession) SetSwimming(swimming bool) {
+	if session == nil {
+		return
+	}
+	playerSwimmingMap.Store(session, swimming)
+}
+
 // RecordPlayerMovementStats updates movement distance stats (in centimeters) and jump count.
 func (s *Server) RecordPlayerMovementStats(
 	session *PlayerSession,
@@ -808,12 +836,85 @@ func (s *Server) RecordPlayerMovementStats(
 		// Ignore teleports.
 		return
 	}
+	horizCm := int32(math.Round(horizDist * 100.0))
+	dist3DCm := int32(math.Round(dist3D * 100.0))
+
+	// 1. Mounted vehicle movement stats (boat, minecart, horse/equine/camel, pig, strider, happy_ghast, nautilus).
+	if vehicleID := s.MountedVehicleOfEntity(session, session.EntityID); vehicleID > 0 {
+		if dist3DCm > 0 && s.entities != nil {
+			if ent := s.entities.Get(vehicleID); ent != nil {
+				vt := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(ent.TypeName)), "minecraft:")
+				switch {
+				case strings.Contains(vt, "boat") || strings.Contains(vt, "raft"):
+					s.AwardCustomStat(session, StatBoatOneCm, dist3DCm)
+				case strings.Contains(vt, "minecart"):
+					s.AwardCustomStat(session, StatMinecartOneCm, dist3DCm)
+				case vt == "pig":
+					s.AwardCustomStat(session, StatPigOneCm, dist3DCm)
+				case vt == "strider":
+					totalStriderCm := s.AwardCustomStat(session, StatStriderOneCm, dist3DCm)
+					s.TriggerRideStriderInLava(session, snap.Dimension, totalStriderCm)
+				case vt == "happy_ghast":
+					s.AwardCustomStat(session, StatHappyGhastOneCm, dist3DCm)
+				case vt == "nautilus" || vt == "zombie_nautilus":
+					s.AwardCustomStat(session, StatNautilusOneCm, dist3DCm)
+				case vt == "horse" || vt == "donkey" || vt == "mule" || vt == "skeleton_horse" || vt == "zombie_horse" || vt == "camel" || vt == "camel_husk" || vt == "llama" || vt == "trader_llama":
+					s.AwardCustomStat(session, StatHorseOneCm, dist3DCm)
+				}
+			}
+		}
+		return
+	}
 
 	if wasOnGround && !onGround && dy > 0.05 {
 		s.AwardCustomStat(session, StatJump, 1)
 	}
 
-	horizCm := int32(math.Round(horizDist * 100.0))
+	// 2. Elytra gliding (aviate_one_cm).
+	if session.IsFallFlying() {
+		if dist3DCm > 0 {
+			s.AwardCustomStat(session, StatAviateOneCm, dist3DCm)
+		}
+		return
+	}
+
+	// 3. Swimming & water / climbable checks.
+	if session.IsSwimming() {
+		if dist3DCm > 0 {
+			s.AwardCustomStat(session, StatSwimOneCm, dist3DCm)
+		}
+		return
+	}
+
+	cache := s.DimensionChunks(snap.Dimension)
+	bx, by, bz := int(math.Floor(newX)), int(math.Floor(newY)), int(math.Floor(newZ))
+	if cache != nil && by >= world.MinY && by < world.MinY+world.WorldHeight {
+		feetSt := cache.GetBlock(bx, by, bz)
+		feetName := strings.TrimPrefix(world.BlockName(feetSt), "minecraft:")
+		if dy > 0 && (feetName == "ladder" || feetName == "vine" || feetName == "scaffolding" ||
+			strings.HasSuffix(feetName, "_vines") || strings.HasSuffix(feetName, "_vines_plant")) {
+			climbCm := int32(math.Round(dy * 100.0))
+			if climbCm > 0 {
+				s.AwardCustomStat(session, StatClimbOneCm, climbCm)
+			}
+		}
+		feetWater := feetSt == world.StateWater || world.IsBubbleColumnBlock(feetSt) || world.IsWaterlogged(feetSt)
+		if feetWater && horizCm > 0 {
+			eyeY := int(math.Floor(newY + 1.62))
+			eyeWater := false
+			if eyeY >= world.MinY && eyeY < world.MinY+world.WorldHeight {
+				eyeSt := cache.GetBlock(bx, eyeY, bz)
+				eyeWater = eyeSt == world.StateWater || world.IsBubbleColumnBlock(eyeSt) || world.IsWaterlogged(eyeSt)
+			}
+			if eyeWater {
+				s.AwardCustomStat(session, StatWalkUnderWaterOneCm, dist3DCm)
+			} else {
+				s.AwardCustomStat(session, StatWalkOnWaterOneCm, horizCm)
+			}
+			return
+		}
+	}
+
 	if horizCm > 0 {
 		if onGround || wasOnGround {
 			switch {
@@ -834,6 +935,198 @@ func (s *Server) RecordPlayerMovementStats(
 		if fallCm > 0 {
 			s.AwardCustomStat(session, StatFallOneCm, fallCm)
 		}
+	}
+}
+
+// RecordShieldBlockedDamage increments minecraft:damage_blocked_by_shield in tenths of a health point.
+func (s *Server) RecordShieldBlockedDamage(session *PlayerSession, damagePoints float32) {
+	if s == nil || session == nil || damagePoints <= 0 {
+		return
+	}
+	if tenths := int32(math.Round(float64(damagePoints) * 10.0)); tenths > 0 {
+		s.AwardCustomStat(session, StatDamageBlockedByShield, tenths)
+	}
+}
+
+// RecordDamageAbsorbed increments minecraft:damage_absorbed (on victim) and/or
+// minecraft:damage_dealt_absorbed (on attacker) in tenths of a health point.
+func (s *Server) RecordDamageAbsorbed(victim, attacker *PlayerSession, absorbedPoints float32) {
+	if s == nil || absorbedPoints <= 0 {
+		return
+	}
+	tenths := int32(math.Round(float64(absorbedPoints) * 10.0))
+	if tenths <= 0 {
+		return
+	}
+	if victim != nil {
+		s.AwardCustomStat(victim, StatDamageAbsorbed, tenths)
+	}
+	if attacker != nil {
+		s.AwardCustomStat(attacker, StatDamageDealtAbsorbed, tenths)
+	}
+}
+
+// RecordDamageResisted increments minecraft:damage_resisted (on victim) and/or
+// minecraft:damage_dealt_resisted (on attacker) in tenths of a health point.
+func (s *Server) RecordDamageResisted(victim, attacker *PlayerSession, resistedPoints float32) {
+	if s == nil || resistedPoints <= 0 {
+		return
+	}
+	tenths := int32(math.Round(float64(resistedPoints) * 10.0))
+	if tenths <= 0 {
+		return
+	}
+	if victim != nil {
+		s.AwardCustomStat(victim, StatDamageResisted, tenths)
+	}
+	if attacker != nil {
+		s.AwardCustomStat(attacker, StatDamageDealtResisted, tenths)
+	}
+}
+
+// RecordFishCaught increments minecraft:fish_caught by 1.
+func (s *Server) RecordFishCaught(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatFishCaught, 1)
+	}
+}
+
+// RecordAnimalsBred increments minecraft:animals_bred by 1.
+func (s *Server) RecordAnimalsBred(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatAnimalsBred, 1)
+	}
+}
+
+// RecordTalkedToVillager increments minecraft:talked_to_villager by 1.
+func (s *Server) RecordTalkedToVillager(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatTalkedToVillager, 1)
+	}
+}
+
+// RecordTradedWithVillager increments minecraft:traded_with_villager by 1.
+func (s *Server) RecordTradedWithVillager(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatTradedWithVillager, 1)
+	}
+}
+
+// RecordEatCakeSlice increments minecraft:eat_cake_slice by 1.
+func (s *Server) RecordEatCakeSlice(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatEatCakeSlice, 1)
+	}
+}
+
+// RecordFillCauldron increments minecraft:fill_cauldron by 1.
+func (s *Server) RecordFillCauldron(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatFillCauldron, 1)
+	}
+}
+
+// RecordUseCauldron increments minecraft:use_cauldron by 1.
+func (s *Server) RecordUseCauldron(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatUseCauldron, 1)
+	}
+}
+
+// RecordCleanArmor increments minecraft:clean_armor by 1.
+func (s *Server) RecordCleanArmor(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatCleanArmor, 1)
+	}
+}
+
+// RecordCleanBanner increments minecraft:clean_banner by 1.
+func (s *Server) RecordCleanBanner(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatCleanBanner, 1)
+	}
+}
+
+// RecordCleanShulkerBox increments minecraft:clean_shulker_box by 1.
+func (s *Server) RecordCleanShulkerBox(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatCleanShulkerBox, 1)
+	}
+}
+
+// RecordNoteBlockPlayed increments minecraft:tune_noteblock (when tuned is true)
+// or minecraft:play_noteblock (when tuned is false) by 1.
+func (s *Server) RecordNoteBlockPlayed(session *PlayerSession, tuned bool) {
+	if s == nil || session == nil {
+		return
+	}
+	if tuned {
+		s.AwardCustomStat(session, StatTuneNoteBlock, 1)
+	} else {
+		s.AwardCustomStat(session, StatPlayNoteBlock, 1)
+	}
+}
+
+// RecordPotFlower increments minecraft:pot_flower by 1.
+func (s *Server) RecordPotFlower(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatPotFlower, 1)
+	}
+}
+
+// RecordPlayRecord increments minecraft:play_record by 1.
+func (s *Server) RecordPlayRecord(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatPlayRecord, 1)
+	}
+}
+
+// RecordEnchantItemStat increments minecraft:enchant_item by 1.
+func (s *Server) RecordEnchantItemStat(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatEnchantItem, 1)
+	}
+}
+
+// RecordBellRing increments minecraft:bell_ring by 1.
+func (s *Server) RecordBellRing(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatBellRing, 1)
+	}
+}
+
+// RecordRaidTrigger increments minecraft:raid_trigger by 1.
+func (s *Server) RecordRaidTrigger(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatRaidTrigger, 1)
+	}
+}
+
+// RecordRaidWin increments minecraft:raid_win by 1.
+func (s *Server) RecordRaidWin(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatRaidWin, 1)
+	}
+}
+
+// RecordTargetHitStat increments minecraft:target_hit by 1.
+func (s *Server) RecordTargetHitStat(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatTargetHit, 1)
+	}
+}
+
+// RecordLeaveGame increments minecraft:leave_game by 1.
+func (s *Server) RecordLeaveGame(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatLeaveGame, 1)
+	}
+}
+
+// RecordInteractWithCampfire increments minecraft:interact_with_campfire by 1.
+func (s *Server) RecordInteractWithCampfire(session *PlayerSession) {
+	if s != nil && session != nil {
+		s.AwardCustomStat(session, StatInteractWithCampfire, 1)
 	}
 }
 

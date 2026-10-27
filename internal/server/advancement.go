@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,6 +50,7 @@ const (
 	AdvancementBgAdventure = "minecraft:gui/advancements/backgrounds/adventure"
 	AdvancementBgHusbandry = "minecraft:gui/advancements/backgrounds/husbandry"
 	AdvancementBgNether    = "minecraft:gui/advancements/backgrounds/nether"
+	AdvancementBgEnd       = "minecraft:gui/advancements/backgrounds/end"
 )
 
 const advancementTimeFormat = "2006-01-02 15:04:05 -0700"
@@ -360,6 +362,11 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:lava_bucket", AdvancementFrameTask, "",
 		true, true, false, 4, 1, cLava, rLava, 0)
 
+	cObsidian, rObsidian := allOfCriteria("obsidian")
+	add("minecraft:story/form_obsidian", "minecraft:story/lava_bucket", "Ice Bucket Challenge", "Obtain a block of Obsidian",
+		"minecraft:obsidian", AdvancementFrameTask, "",
+		true, true, false, 5, 2, cObsidian, rObsidian, 0)
+
 	cIronPick, rIronPick := allOfCriteria("iron_pickaxe")
 	add("minecraft:story/iron_tools", "minecraft:story/smelt_iron", "Isn't It Iron Pick", "Upgrade your pickaxe",
 		"minecraft:iron_pickaxe", AdvancementFrameTask, "",
@@ -472,6 +479,131 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 		"minecraft:sculk_catalyst", AdvancementFrameChallenge, "",
 		true, true, false, 2, 1, cItSpreads, rItSpreads, 0)
 
+	cTotem, rTotem := allOfCriteria("used_totem")
+	add("minecraft:adventure/totem_of_undying", "minecraft:adventure/kill_a_mob", "Postmortal", "Use a Totem of Undying to cheat death",
+		"minecraft:totem_of_undying", AdvancementFrameGoal, "",
+		true, true, false, 2, -2, cTotem, rTotem, 0)
+
+	cShootArrow, rShootArrow := allOfCriteria("shot_arrow")
+	add("minecraft:adventure/shoot_arrow", "minecraft:adventure/kill_a_mob", "Take Aim", "Shoot something with an arrow",
+		"minecraft:bow", AdvancementFrameTask, "",
+		true, true, false, 2, 2, cShootArrow, rShootArrow, 0)
+
+	cSniperDuel, rSniperDuel := allOfCriteria("killed_skeleton")
+	add("minecraft:adventure/sniper_duel", "minecraft:adventure/shoot_arrow", "Sniper Duel", "Kill a Skeleton from at least 50 meters away",
+		"minecraft:arrow", AdvancementFrameChallenge, "",
+		true, true, false, 3, 2, cSniperDuel, rSniperDuel, 50)
+
+	cBullseye, rBullseye := allOfCriteria("bullseye")
+	add("minecraft:adventure/bullseye", "minecraft:adventure/shoot_arrow", "Bullseye", "Hit the bullseye of a Target block from at least 30 meters away",
+		"minecraft:target", AdvancementFrameChallenge, "",
+		true, true, false, 3, 3, cBullseye, rBullseye, 50)
+
+	cOlBetsy, rOlBetsy := allOfCriteria("shot_crossbow")
+	add("minecraft:adventure/ol_betsy", "minecraft:adventure/root", "Ol' Betsy", "Shoot a crossbow",
+		"minecraft:crossbow", AdvancementFrameTask, "",
+		true, true, false, 1, 4, cOlBetsy, rOlBetsy, 0)
+
+	cWhosPillager, rWhosPillager := allOfCriteria("kill_pillager")
+	add("minecraft:adventure/whos_the_pillager_now", "minecraft:adventure/ol_betsy", "Who's the Pillager Now?", "Give a Pillager a taste of their own medicine",
+		"minecraft:crossbow", AdvancementFrameTask, "",
+		true, true, false, 2, 4, cWhosPillager, rWhosPillager, 0)
+
+	cArbalistic, rArbalistic := allOfCriteria("arbalistic")
+	add("minecraft:adventure/arbalistic", "minecraft:adventure/ol_betsy", "Arbalistic", "Kill five unique mobs with one crossbow shot",
+		"minecraft:crossbow", AdvancementFrameChallenge, "",
+		true, true, true, 2, 5, cArbalistic, rArbalistic, 85)
+
+	cHoneySlide, rHoneySlide := allOfCriteria("honey_block_slide")
+	add("minecraft:adventure/honey_block_slide", "minecraft:adventure/root", "Sticky Situation", "Jump into a Honey Block to break your fall",
+		"minecraft:honey_block", AdvancementFrameTask, "",
+		true, true, false, 1, -2, cHoneySlide, rHoneySlide, 0)
+
+	cPowderSnowWalk, rPowderSnowWalk := allOfCriteria("walk_on_powder_snow_with_leather_boots")
+	add("minecraft:adventure/walk_on_powder_snow_with_leather_boots", "minecraft:adventure/sleep_in_bed", "Light as a Rabbit", "Walk on Powder Snow... without sinking in it",
+		"minecraft:leather_boots", AdvancementFrameTask, "",
+		true, true, false, 2, -3, cPowderSnowWalk, rPowderSnowWalk, 0)
+
+	cSurgeProt, rSurgeProt := allOfCriteria("lightning_rod_with_villager_no_fire")
+	add("minecraft:adventure/lightning_rod_with_villager_no_fire", "minecraft:adventure/root", "Surge Protector", "Protect a Villager from an undesired shock without starting a fire",
+		"minecraft:lightning_rod", AdvancementFrameTask, "",
+		true, true, false, 1, -3, cSurgeProt, rSurgeProt, 0)
+
+	cFallWorldHeight, rFallWorldHeight := allOfCriteria("fall_from_world_height")
+	add("minecraft:adventure/fall_from_world_height", "minecraft:adventure/sleep_in_bed", "Caves & Cliffs", "Free fall from the top of the world (build limit) to the bottom of the world and survive",
+		"minecraft:water_bucket", AdvancementFrameTask, "",
+		true, true, false, 2, -4, cFallWorldHeight, rFallWorldHeight, 0)
+
+	cSalvageSherd, rSalvageSherd := allOfCriteria("has_sherd")
+	add("minecraft:adventure/salvage_sherd", "minecraft:adventure/root", "Respecting the Remnants", "Brush a Suspicious block to obtain a Pottery Sherd",
+		"minecraft:brush", AdvancementFrameTask, "",
+		true, true, false, 1, -4, cSalvageSherd, rSalvageSherd, 0)
+
+	cCarefulRest, rCarefulRest := allOfCriteria("pot_crafted_using_only_sherds")
+	add("minecraft:adventure/craft_decorated_pot_using_only_sherds", "minecraft:adventure/salvage_sherd", "Careful Restoration", "Make a Decorated Pot out of 4 Pottery Sherds",
+		"minecraft:decorated_pot", AdvancementFrameTask, "",
+		true, true, false, 2, -5, cCarefulRest, rCarefulRest, 0)
+
+	cSpyParrot, rSpyParrot := allOfCriteria("look_at_parrot")
+	add("minecraft:adventure/spyglass_at_parrot", "minecraft:adventure/root", "Is It a Bird?", "Look at a Parrot through a Spyglass",
+		"minecraft:spyglass", AdvancementFrameTask, "",
+		true, true, false, 1, 5, cSpyParrot, rSpyParrot, 0)
+
+	cSpyGhast, rSpyGhast := allOfCriteria("look_at_ghast")
+	add("minecraft:adventure/spyglass_at_ghast", "minecraft:adventure/spyglass_at_parrot", "Is It a Balloon?", "Look at a Ghast through a Spyglass",
+		"minecraft:spyglass", AdvancementFrameTask, "",
+		true, true, false, 2, 6, cSpyGhast, rSpyGhast, 0)
+
+	cSpyDragon, rSpyDragon := allOfCriteria("look_at_dragon")
+	add("minecraft:adventure/spyglass_at_dragon", "minecraft:adventure/spyglass_at_ghast", "Is It a Plane?", "Look at the Ender Dragon through a Spyglass",
+		"minecraft:spyglass", AdvancementFrameTask, "",
+		true, true, false, 3, 6, cSpyDragon, rSpyDragon, 0)
+
+	cThrowTrident, rThrowTrident := allOfCriteria("shot_trident")
+	add("minecraft:adventure/throw_trident", "minecraft:adventure/kill_a_mob", "A Throwaway Joke", "Throw a Trident at something. Note: Throwing away your only weapon is not a good idea.",
+		"minecraft:trident", AdvancementFrameTask, "",
+		true, true, false, 2, 3, cThrowTrident, rThrowTrident, 0)
+
+	cVeryFright, rVeryFright := allOfCriteria("struck_villager")
+	add("minecraft:adventure/very_very_frightening", "minecraft:adventure/throw_trident", "Very Very Frightening", "Strike a Villager with lightning",
+		"minecraft:trident", AdvancementFrameTask, "",
+		true, true, false, 3, 4, cVeryFright, rVeryFright, 0)
+
+	cSummonGolem, rSummonGolem := allOfCriteria("summoned_golem")
+	add("minecraft:adventure/summon_iron_golem", "minecraft:adventure/trade", "Hired Help", "Summon an Iron Golem to help defend a village",
+		"minecraft:carved_pumpkin", AdvancementFrameGoal, "",
+		true, true, false, 2, 7, cSummonGolem, rSummonGolem, 0)
+
+	cReadPowerBook, rReadPowerBook := allOfCriteria("chiseled_bookshelf")
+	add("minecraft:adventure/read_power_from_chiseled_bookshelf", "minecraft:adventure/root", "The Power of Books", "Read the power signal of a Chiseled Bookshelf using a Comparator",
+		"minecraft:chiseled_bookshelf", AdvancementFrameTask, "",
+		true, true, false, 1, 6, cReadPowerBook, rReadPowerBook, 0)
+
+	cBrushArmadillo, rBrushArmadillo := allOfCriteria("brush_armadillo")
+	add("minecraft:adventure/brush_armadillo", "minecraft:adventure/root", "Isn't It Scute?", "Get Armadillo Scutes from an Armadillo using a Brush",
+		"minecraft:armadillo_scute", AdvancementFrameTask, "",
+		true, true, false, 1, 7, cBrushArmadillo, rBrushArmadillo, 0)
+
+	cCrafterCrafter, rCrafterCrafter := allOfCriteria("crafter_crafted_crafter")
+	add("minecraft:adventure/crafters_crafting_crafters", "minecraft:adventure/root", "Crafters Crafting Crafters", "Be near a Crafter when it crafts a Crafter",
+		"minecraft:crafter", AdvancementFrameTask, "",
+		true, true, false, 1, 8, cCrafterCrafter, rCrafterCrafter, 0)
+
+	cLightenUp, rLightenUp := allOfCriteria("lighten_up")
+	add("minecraft:adventure/lighten_up", "minecraft:adventure/root", "Lighten Up", "Scrape a Copper Bulb with an Axe to make it brighter",
+		"minecraft:copper_bulb", AdvancementFrameTask, "",
+		true, true, false, 1, 9, cLightenUp, rLightenUp, 0)
+
+	cWhoNeedsRockets, rWhoNeedsRockets := allOfCriteria("who_needs_rockets")
+	add("minecraft:adventure/who_needs_rockets", "minecraft:adventure/root", "Who Needs Rockets?", "Use a Wind Charge to launch yourself upward at least 8 blocks",
+		"minecraft:wind_charge", AdvancementFrameTask, "",
+		true, true, false, 1, 10, cWhoNeedsRockets, rWhoNeedsRockets, 0)
+
+	cOverOverkill, rOverOverkill := allOfCriteria("overoverkill")
+	add("minecraft:adventure/overoverkill", "minecraft:adventure/root", "Over-Overkill", "Deal 50 hearts of damage in a single hit using the Mace",
+		"minecraft:mace", AdvancementFrameChallenge, "",
+		true, true, false, 1, 11, cOverOverkill, rOverOverkill, 50)
+
 	// --- Husbandry tab (minecraft:husbandry/*) ---
 	cHusbRoot, rHusbRoot := allOfCriteria("consumed_item")
 	add("minecraft:husbandry/root", "", "Husbandry", "The world is full of friends and food",
@@ -502,6 +634,61 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 	add("minecraft:husbandry/fishy_business", "minecraft:husbandry/root", "Fishy Business", "Catch a fish",
 		"minecraft:fishing_rod", AdvancementFrameTask, "",
 		true, true, false, 1, 2, cFishy, rFishy, 0)
+
+	cBreed, rBreed := allOfCriteria("bred")
+	add("minecraft:husbandry/breed_an_animal", "minecraft:husbandry/root", "The Parrots and the Bats", "Breed two animals together",
+		"minecraft:wheat", AdvancementFrameTask, "",
+		true, true, false, 1, -1, cBreed, rBreed, 0)
+
+	cTame, rTame := allOfCriteria("tamed_animal")
+	add("minecraft:husbandry/tame_an_animal", "minecraft:husbandry/root", "Best Friends Forever", "Tame an animal",
+		"minecraft:lead", AdvancementFrameTask, "",
+		true, true, false, 1, 1, cTame, rTame, 0)
+
+	cSafeHoney, rSafeHoney := allOfCriteria("safely_harvest_honey")
+	add("minecraft:husbandry/safely_harvest_honey", "minecraft:husbandry/root", "Bee Our Guest", "Use a Campfire to collect Honey from a Beehive using a Bottle without aggravating the bees",
+		"minecraft:honey_bottle", AdvancementFrameTask, "",
+		true, true, false, 1, 3, cSafeHoney, rSafeHoney, 0)
+
+	cSilkNest, rSilkNest := allOfCriteria("silk_touch_nest")
+	add("minecraft:husbandry/silk_touch_nest", "minecraft:husbandry/root", "Total Beelocation", "Move a Bee Nest or Beehive, with 3 bees inside, using Silk Touch",
+		"minecraft:bee_nest", AdvancementFrameTask, "",
+		true, true, false, 1, 4, cSilkNest, rSilkNest, 0)
+
+	cWaxOn, rWaxOn := allOfCriteria("wax_on")
+	add("minecraft:husbandry/wax_on", "minecraft:husbandry/safely_harvest_honey", "Wax On", "Apply Honeycomb to a Copper block!",
+		"minecraft:honeycomb", AdvancementFrameTask, "",
+		true, true, false, 2, 3, cWaxOn, rWaxOn, 0)
+
+	cWaxOff, rWaxOff := allOfCriteria("wax_off")
+	add("minecraft:husbandry/wax_off", "minecraft:husbandry/wax_on", "Wax Off", "Scrape Wax off of a Copper block!",
+		"minecraft:stone_axe", AdvancementFrameTask, "",
+		true, true, false, 3, 3, cWaxOff, rWaxOff, 0)
+
+	cGlowSign, rGlowSign := allOfCriteria("make_a_sign_glow")
+	add("minecraft:husbandry/make_a_sign_glow", "minecraft:husbandry/root", "Glow and Behold!", "Make the text of any kind of sign glow",
+		"minecraft:glow_ink_sac", AdvancementFrameTask, "",
+		true, true, false, 1, 5, cGlowSign, rGlowSign, 0)
+
+	cBoatGoat, rBoatGoat := allOfCriteria("ride_a_boat_with_a_goat")
+	add("minecraft:husbandry/ride_a_boat_with_a_goat", "minecraft:husbandry/root", "Whatever Floats Your Goat!", "Get in a Boat and float with a Goat",
+		"minecraft:oak_boat", AdvancementFrameTask, "",
+		true, true, false, 1, 6, cBoatGoat, rBoatGoat, 0)
+
+	cTadpoleBucket, rTadpoleBucket := allOfCriteria("tadpole_bucket")
+	add("minecraft:husbandry/tadpole_in_a_bucket", "minecraft:husbandry/fishy_business", "Bukkit Bukkit", "Catch a Tadpole in a Bucket",
+		"minecraft:tadpole_bucket", AdvancementFrameTask, "",
+		true, true, false, 2, 2, cTadpoleBucket, rTadpoleBucket, 0)
+
+	cAxolotlBucket, rAxolotlBucket := allOfCriteria("axolotl_bucket")
+	add("minecraft:husbandry/axolotl_in_a_bucket", "minecraft:husbandry/fishy_business", "The Cutest Predator", "Catch an Axolotl in a Bucket",
+		"minecraft:axolotl_bucket", AdvancementFrameTask, "",
+		true, true, false, 2, 4, cAxolotlBucket, rAxolotlBucket, 0)
+
+	cSnifferEgg, rSnifferEgg := allOfCriteria("obtain_sniffer_egg")
+	add("minecraft:husbandry/obtain_sniffer_egg", "minecraft:husbandry/root", "Smells Interesting", "Obtain a Sniffer Egg",
+		"minecraft:sniffer_egg", AdvancementFrameTask, "",
+		true, true, true, 1, 7, cSnifferEgg, rSnifferEgg, 0)
 
 	// --- Nether tab (minecraft:nether/*) ---
 	cNetherRoot, rNetherRoot := allOfCriteria("entered_nether")
@@ -543,6 +730,87 @@ func buildVanillaAdvancementRegistry() *AdvancementRegistry {
 	add("minecraft:nether/create_full_beacon", "minecraft:nether/create_beacon", "Beaconator", "Bring a Beacon to full power",
 		"minecraft:beacon", AdvancementFrameGoal, "",
 		true, true, false, 2, 2, cFullBeacon, rFullBeacon, 0)
+
+	cReturnSender, rReturnSender := allOfCriteria("killed_ghast")
+	add("minecraft:nether/return_to_sender", "minecraft:nether/root", "Return to Sender", "Destroy a Ghast with a fireball",
+		"minecraft:fire_charge", AdvancementFrameChallenge, "",
+		true, true, false, 1, -2, cReturnSender, rReturnSender, 50)
+
+	cFastTravel, rFastTravel := allOfCriteria("travelled")
+	add("minecraft:nether/fast_travel", "minecraft:nether/root", "Subspace Bubble", "Use the Nether to travel 7 km in the Overworld",
+		"minecraft:map", AdvancementFrameChallenge, "",
+		true, true, false, 1, -3, cFastTravel, rFastTravel, 100)
+
+	cWitherSkull, rWitherSkull := allOfCriteria("wither_skeleton_skull")
+	add("minecraft:nether/get_wither_skull", "minecraft:nether/root", "Spooky Scary Skeleton", "Obtain a Wither Skeleton's skull",
+		"minecraft:wither_skeleton_skull", AdvancementFrameTask, "",
+		true, true, false, 1, 3, cWitherSkull, rWitherSkull, 0)
+
+	cSummonWither, rSummonWither := allOfCriteria("summoned")
+	add("minecraft:nether/summon_wither", "minecraft:nether/get_wither_skull", "Withering Heights", "Summon the Wither",
+		"minecraft:nether_star", AdvancementFrameTask, "",
+		true, true, false, 2, 3, cSummonWither, rSummonWither, 0)
+
+	cChargeAnchor, rChargeAnchor := allOfCriteria("charge_respawn_anchor")
+	add("minecraft:nether/charge_respawn_anchor", "minecraft:nether/root", "Not Quite \"Nine\" Lives", "Charge a Respawn Anchor to the maximum",
+		"minecraft:respawn_anchor", AdvancementFrameTask, "",
+		true, true, false, 1, 4, cChargeAnchor, rChargeAnchor, 0)
+
+	cUseLodestone, rUseLodestone := allOfCriteria("use_lodestone")
+	add("minecraft:nether/use_lodestone", "minecraft:nether/obtain_ancient_debris", "Country Lode, Take Me Home", "Use a Compass on a Lodestone",
+		"minecraft:lodestone", AdvancementFrameTask, "",
+		true, true, false, 2, -1, cUseLodestone, rUseLodestone, 0)
+
+	cRideStrider, rRideStrider := allOfCriteria("used_warped_fungus_on_a_stick")
+	add("minecraft:nether/ride_strider", "minecraft:nether/root", "This Boat Has Legs", "Ride a Strider with a Warped Fungus on a Stick",
+		"minecraft:warped_fungus_on_a_stick", AdvancementFrameTask, "",
+		true, true, false, 1, 5, cRideStrider, rRideStrider, 0)
+
+	cRideStriderLava, rRideStriderLava := allOfCriteria("ride_entity_distance")
+	add("minecraft:nether/ride_strider_in_overworld_lava", "minecraft:nether/ride_strider", "Feels Like Home", "Take a Strider for a loooong ride on a lava lake in the Overworld",
+		"minecraft:warped_fungus_on_a_stick", AdvancementFrameTask, "",
+		true, true, false, 2, 5, cRideStriderLava, rRideStriderLava, 0)
+
+	// --- End tab (minecraft:end/*) ---
+	cEndRoot, rEndRoot := allOfCriteria("entered_end")
+	add("minecraft:end/root", "", "The End", "Or the beginning?",
+		"minecraft:end_stone", AdvancementFrameTask, AdvancementBgEnd,
+		false, false, false, 0, 0, cEndRoot, rEndRoot, 0)
+
+	cKillDragon, rKillDragon := allOfCriteria("killed_dragon")
+	add("minecraft:end/kill_dragon", "minecraft:end/root", "Free the End", "Good luck",
+		"minecraft:dragon_head", AdvancementFrameTask, "",
+		true, true, false, 1, 0, cKillDragon, rKillDragon, 0)
+
+	cDragonEgg, rDragonEgg := allOfCriteria("dragon_egg")
+	add("minecraft:end/dragon_egg", "minecraft:end/kill_dragon", "The Next Generation", "Hold the Dragon Egg",
+		"minecraft:dragon_egg", AdvancementFrameGoal, "",
+		true, true, false, 2, -1, cDragonEgg, rDragonEgg, 0)
+
+	cEndGateway, rEndGateway := allOfCriteria("entered_end_gateway")
+	add("minecraft:end/enter_end_gateway", "minecraft:end/kill_dragon", "Remote Getaway", "Escape the island",
+		"minecraft:ender_pearl", AdvancementFrameTask, "",
+		true, true, false, 2, 0, cEndGateway, rEndGateway, 0)
+
+	cRespawnDragon, rRespawnDragon := allOfCriteria("summoned_dragon")
+	add("minecraft:end/respawn_dragon", "minecraft:end/kill_dragon", "The End... Again...", "Respawn the Ender Dragon",
+		"minecraft:end_crystal", AdvancementFrameGoal, "",
+		true, true, false, 2, 1, cRespawnDragon, rRespawnDragon, 0)
+
+	cDragonBreath, rDragonBreath := allOfCriteria("dragon_breath")
+	add("minecraft:end/dragon_breath", "minecraft:end/kill_dragon", "You Need a Mint", "Collect Dragon's Breath in a Glass Bottle",
+		"minecraft:dragon_breath", AdvancementFrameGoal, "",
+		true, true, false, 2, 2, cDragonBreath, rDragonBreath, 0)
+
+	cElytra, rElytra := allOfCriteria("elytra")
+	add("minecraft:end/elytra", "minecraft:end/enter_end_gateway", "Sky's the Limit", "Find Elytra",
+		"minecraft:elytra", AdvancementFrameGoal, "",
+		true, true, false, 3, 0, cElytra, rElytra, 0)
+
+	cLevitate, rLevitate := allOfCriteria("levitated")
+	add("minecraft:end/levitate", "minecraft:end/enter_end_gateway", "Great View From Up Here", "Levitate up 50 blocks from the attacks of a Shulker",
+		"minecraft:shulker_shell", AdvancementFrameChallenge, "",
+		true, true, false, 3, 1, cLevitate, rLevitate, 50)
 
 	reg := &AdvancementRegistry{
 		defs:     defs,
@@ -897,12 +1165,67 @@ func (s *Server) onAdvancementCompleted(session *PlayerSession, def *Advancement
 	if s != nil && def.RewardXP > 0 {
 		_ = s.AddPlayerExperience(session, def.RewardXP)
 	}
-	if s != nil && def.Display != nil && def.Display.AnnounceToChat {
+	if s != nil && len(def.RewardRecipes) > 0 {
+		s.UnlockRecipesByNames(session, def.RewardRecipes)
+	}
+	if s != nil && def.Display != nil && def.Display.AnnounceToChat && s.AnnounceAdvancements() {
 		msg := FormatAdvancementChatAnnouncement(session.Profile.Name, def)
 		if msg != "" {
 			s.BroadcastSystemChat(msg)
 		}
 	}
+}
+
+// AdvancementAncestors returns advancementID along with all its parent/ancestor
+// advancement IDs in root-first order (for `/advancement ... until|through`).
+func AdvancementAncestors(advancementID string) []string {
+	reg := DefaultAdvancementRegistry()
+	if reg == nil {
+		return nil
+	}
+	var chain []string
+	seen := make(map[string]bool)
+	cur := canonicalAdvancementID(advancementID)
+	for cur != "" && !seen[cur] {
+		seen[cur] = true
+		def, ok := reg.ByID(cur)
+		if !ok || def == nil {
+			break
+		}
+		chain = append(chain, def.ID)
+		cur = canonicalAdvancementID(def.ParentID)
+	}
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+	return chain
+}
+
+// AdvancementDescendants returns advancementID along with all its descendant
+// advancement IDs in breadth-first order (for `/advancement ... from|through`).
+func AdvancementDescendants(advancementID string) []string {
+	reg := DefaultAdvancementRegistry()
+	if reg == nil {
+		return nil
+	}
+	rootDef, ok := reg.ByID(advancementID)
+	if !ok || rootDef == nil {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]bool)
+	queue := []*AdvancementDef{rootDef}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur == nil || seen[cur.ID] {
+			continue
+		}
+		seen[cur.ID] = true
+		out = append(out, cur.ID)
+		queue = append(queue, reg.Children(cur.ID)...)
+	}
+	return out
 }
 
 // FormatAdvancementChatAnnouncement formats the vanilla chat message broadcast
@@ -1018,7 +1341,8 @@ func (s *Server) RevokeAllAdvancements(session *PlayerSession) int {
 // --- Gameplay Trigger Hooks ---
 
 // TriggerInventoryChanged evaluates all inventory_changed advancement criteria
-// against session's current inventory and cursor item.
+// against session's current inventory and cursor item, and unlocks any recipes
+// associated with held items.
 func (s *Server) TriggerInventoryChanged(session *PlayerSession) {
 	if session == nil {
 		return
@@ -1036,19 +1360,28 @@ func (s *Server) TriggerInventoryChanged(session *PlayerSession) {
 	for id := range present {
 		s.triggerItemIDPresent(session, id)
 	}
+	if s != nil {
+		s.UnlockRecipesForInventory(session)
+	}
 }
 
-// TriggerItemAcquired evaluates inventory_changed advancement criteria for a
-// newly acquired item stack.
+// TriggerItemAcquired evaluates inventory_changed advancement criteria and
+// recipe unlocks for a newly acquired item stack.
 func (s *Server) TriggerItemAcquired(session *PlayerSession, stack world.ItemStack) {
 	if session == nil || stack.IsEmpty() {
 		return
 	}
 	s.triggerItemIDPresent(session, stack.ResolvedID())
+	if s != nil {
+		s.UnlockRecipesForItem(session, stack)
+	}
 }
 
 func (s *Server) triggerItemIDPresent(session *PlayerSession, itemID string) {
 	name := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(itemID)), "minecraft:")
+	if strings.HasSuffix(name, "_pottery_sherd") {
+		s.GrantCriterion(session, "minecraft:adventure/salvage_sherd", "has_sherd")
+	}
 	switch name {
 	case "crafting_table":
 		s.GrantCriterion(session, "minecraft:story/root", "crafting_table")
@@ -1064,18 +1397,34 @@ func (s *Server) triggerItemIDPresent(session *PlayerSession, itemID string) {
 		s.GrantCriterion(session, "minecraft:story/iron_tools", "iron_pickaxe")
 	case "lava_bucket":
 		s.GrantCriterion(session, "minecraft:story/lava_bucket", "lava_bucket")
+	case "obsidian":
+		s.GrantCriterion(session, "minecraft:story/form_obsidian", "obsidian")
 	case "diamond":
 		s.GrantCriterion(session, "minecraft:story/mine_diamond", "diamond")
 	case "diamond_helmet", "diamond_chestplate", "diamond_leggings", "diamond_boots":
 		s.GrantCriterion(session, "minecraft:story/shiny_gear", name)
 	case "netherite_hoe":
 		s.GrantCriterion(session, "minecraft:husbandry/obtain_netherite_hoe", "netherite_hoe")
+	case "tadpole_bucket":
+		s.GrantCriterion(session, "minecraft:husbandry/tadpole_in_a_bucket", "tadpole_bucket")
+	case "axolotl_bucket":
+		s.GrantCriterion(session, "minecraft:husbandry/axolotl_in_a_bucket", "axolotl_bucket")
+	case "sniffer_egg":
+		s.GrantCriterion(session, "minecraft:husbandry/obtain_sniffer_egg", "obtain_sniffer_egg")
 	case "ancient_debris":
 		s.GrantCriterion(session, "minecraft:nether/obtain_ancient_debris", "ancient_debris")
 	case "netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots":
 		s.GrantCriterion(session, "minecraft:nether/netherite_armor", name)
 	case "blaze_rod":
 		s.GrantCriterion(session, "minecraft:nether/obtain_blaze_rod", "blaze_rod")
+	case "wither_skeleton_skull":
+		s.GrantCriterion(session, "minecraft:nether/get_wither_skull", "wither_skeleton_skull")
+	case "dragon_egg":
+		s.GrantCriterion(session, "minecraft:end/dragon_egg", "dragon_egg")
+	case "dragon_breath":
+		s.GrantCriterion(session, "minecraft:end/dragon_breath", "dragon_breath")
+	case "elytra":
+		s.GrantCriterion(session, "minecraft:end/elytra", "elytra")
 	}
 }
 
@@ -1103,6 +1452,9 @@ func (s *Server) TriggerEntityKilled(session *PlayerSession, entityType string) 
 	s.GrantCriterion(session, "minecraft:adventure/root", "killed_something")
 	s.GrantCriterion(session, "minecraft:adventure/kill_a_mob", et)
 	s.GrantCriterion(session, "minecraft:adventure/kill_all_mobs", et)
+	if et == "minecraft:ender_dragon" {
+		s.GrantCriterion(session, "minecraft:end/kill_dragon", "killed_dragon")
+	}
 }
 
 // TriggerKilledByEntity fires entity_killed_player advancement criteria when
@@ -1137,6 +1489,7 @@ func (s *Server) TriggerChangeDimension(session *PlayerSession, toDim string) {
 		s.GrantCriterion(session, "minecraft:nether/root", "entered_nether")
 	case world.DimensionEnd:
 		s.GrantCriterion(session, "minecraft:story/enter_the_end", "entered_end")
+		s.GrantCriterion(session, "minecraft:end/root", "entered_end")
 	}
 }
 
@@ -1372,6 +1725,331 @@ func (s *Server) TriggerCuredZombieVillagerByUUID(curerUUID [16]byte) {
 	if target != nil {
 		s.TriggerCuredZombieVillager(target)
 	}
+}
+
+// TriggerUsedEnderEye fires the minecraft:used_ender_eye / stronghold advancement
+// trigger ("Eye Spy", minecraft:story/follow_ender_eye) for session.
+func (s *Server) TriggerUsedEnderEye(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:story/follow_ender_eye", "in_stronghold")
+}
+
+// TriggerShotArrow fires the "Take Aim" (minecraft:adventure/shoot_arrow)
+// advancement trigger, and if targetEntityType is "minecraft:skeleton" at
+// distance >= 50.0 blocks, also fires "Sniper Duel" (minecraft:adventure/sniper_duel).
+func (s *Server) TriggerShotArrow(session *PlayerSession, targetEntityType string, killed bool, distance float64) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/shoot_arrow", "shot_arrow")
+	if killed && canonicalAdvancementID(targetEntityType) == "minecraft:skeleton" && distance >= 50.0 {
+		s.GrantCriterion(session, "minecraft:adventure/sniper_duel", "killed_skeleton")
+	}
+}
+
+// TriggerShotCrossbow fires the "Ol' Betsy" (minecraft:adventure/ol_betsy)
+// advancement trigger, and optionally "Who's the Pillager Now?" or "Arbalistic".
+func (s *Server) TriggerShotCrossbow(session *PlayerSession, killedTypes []string) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/ol_betsy", "shot_crossbow")
+	unique := make(map[string]bool, len(killedTypes))
+	for _, kt := range killedTypes {
+		canon := canonicalAdvancementID(kt)
+		if canon == "" {
+			continue
+		}
+		unique[canon] = true
+		if canon == "minecraft:pillager" {
+			s.GrantCriterion(session, "minecraft:adventure/whos_the_pillager_now", "kill_pillager")
+		}
+	}
+	if len(unique) >= 5 {
+		s.GrantCriterion(session, "minecraft:adventure/arbalistic", "arbalistic")
+	}
+}
+
+// TriggerTargetHit fires the minecraft:target_hit advancement trigger ("Bullseye",
+// minecraft:adventure/bullseye) when signalStrength == 15 and distance >= 30.0,
+// and increments the minecraft:target_hit custom statistic.
+func (s *Server) TriggerTargetHit(session *PlayerSession, signalStrength int, distance float64) {
+	if s == nil || session == nil {
+		return
+	}
+	s.RecordTargetHitStat(session)
+	if signalStrength >= 15 && distance >= 30.0 {
+		s.GrantCriterion(session, "minecraft:adventure/bullseye", "bullseye")
+	}
+}
+
+// TriggerSlideDownBlock fires the minecraft:slide_down_block advancement trigger
+// ("Sticky Situation", minecraft:adventure/honey_block_slide) when blockName is honey_block.
+func (s *Server) TriggerSlideDownBlock(session *PlayerSession, blockName string) {
+	if s == nil || session == nil {
+		return
+	}
+	if canonicalAdvancementID(blockName) == "minecraft:honey_block" {
+		s.GrantCriterion(session, "minecraft:adventure/honey_block_slide", "honey_block_slide")
+	}
+}
+
+// TriggerEnterBlock fires the minecraft:enter_block trigger for session:
+//   - Entering minecraft:water unlocks all vanilla boat & chest-boat recipes
+//   - Entering minecraft:honey_block triggers "Sticky Situation"
+func (s *Server) TriggerEnterBlock(session *PlayerSession, blockName string) {
+	if s == nil || session == nil {
+		return
+	}
+	switch canonicalAdvancementID(blockName) {
+	case "minecraft:water":
+		s.UnlockWaterBoatRecipes(session)
+	case "minecraft:honey_block":
+		s.GrantCriterion(session, "minecraft:adventure/honey_block_slide", "honey_block_slide")
+	}
+}
+
+// TriggerWalkOnPowderSnowWithLeatherBoots fires "Light as a Rabbit"
+// (minecraft:adventure/walk_on_powder_snow_with_leather_boots).
+func (s *Server) TriggerWalkOnPowderSnowWithLeatherBoots(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/walk_on_powder_snow_with_leather_boots", "walk_on_powder_snow_with_leather_boots")
+}
+
+// TriggerFallFromHeight fires "Caves & Cliffs" (minecraft:adventure/fall_from_world_height)
+// when session falls at least 379 blocks (e.g. from Y >= 319 to Y <= -60) and survives.
+func (s *Server) TriggerFallFromHeight(session *PlayerSession, startY, endY float64) {
+	if s == nil || session == nil || session.IsDead() {
+		return
+	}
+	if startY-endY >= 379.0 && startY >= 319.0 && endY <= -60.0 {
+		s.GrantCriterion(session, "minecraft:adventure/fall_from_world_height", "fall_from_world_height")
+	}
+}
+
+// TriggerLightningStrike fires "Surge Protector"
+// (minecraft:adventure/lightning_rod_with_villager_no_fire) when lightning strikes
+// a lightning rod with a villager nearby and no fire spawned.
+func (s *Server) TriggerLightningStrike(session *PlayerSession, hitLightningRod, villagerNearby, fireSpawned bool) {
+	if s == nil || session == nil {
+		return
+	}
+	if hitLightningRod && villagerNearby && !fireSpawned {
+		s.GrantCriterion(session, "minecraft:adventure/lightning_rod_with_villager_no_fire", "lightning_rod_with_villager_no_fire")
+	}
+}
+
+// TriggerThrownTridentHit fires "A Throwaway Joke" (minecraft:adventure/throw_trident)
+// and, if struckVillagerWithChanneling is true, "Very Very Frightening"
+// (minecraft:adventure/very_very_frightening).
+func (s *Server) TriggerThrownTridentHit(session *PlayerSession, struckVillagerWithChanneling bool) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/throw_trident", "shot_trident")
+	if struckVillagerWithChanneling {
+		s.GrantCriterion(session, "minecraft:adventure/very_very_frightening", "struck_villager")
+	}
+}
+
+// TriggerSummonedEntity fires the minecraft:summoned_entity advancement trigger
+// ("Hired Help" for iron_golem, "Withering Heights" for wither, "The End... Again..." for ender_dragon).
+func (s *Server) TriggerSummonedEntity(session *PlayerSession, entityType string) {
+	if s == nil || session == nil {
+		return
+	}
+	switch canonicalAdvancementID(entityType) {
+	case "minecraft:iron_golem":
+		s.GrantCriterion(session, "minecraft:adventure/summon_iron_golem", "summoned_golem")
+	case "minecraft:wither":
+		s.GrantCriterion(session, "minecraft:nether/summon_wither", "summoned")
+	case "minecraft:ender_dragon":
+		s.GrantCriterion(session, "minecraft:end/respawn_dragon", "summoned_dragon")
+	}
+}
+
+// TriggerCrafterRecipeCrafted fires the minecraft:crafter_recipe_crafted advancement
+// trigger ("Crafters Crafting Crafters", minecraft:adventure/crafters_crafting_crafters).
+func (s *Server) TriggerCrafterRecipeCrafted(session *PlayerSession, recipeID string) {
+	if s == nil || session == nil {
+		return
+	}
+	if canonicalAdvancementID(recipeID) == "minecraft:crafter" {
+		s.GrantCriterion(session, "minecraft:adventure/crafters_crafting_crafters", "crafter_crafted_crafter")
+	}
+}
+
+// TriggerBredAnimals fires the minecraft:bred_animals advancement trigger
+// ("The Parrots and the Bats", minecraft:husbandry/breed_an_animal) and increments
+// the minecraft:animals_bred statistic.
+func (s *Server) TriggerBredAnimals(session *PlayerSession, parentType string) {
+	if s == nil || session == nil {
+		return
+	}
+	s.RecordAnimalsBred(session)
+	s.GrantCriterion(session, "minecraft:husbandry/breed_an_animal", "bred")
+}
+
+// TriggerTamedAnimal fires the minecraft:tame_animal advancement trigger
+// ("Best Friends Forever", minecraft:husbandry/tame_an_animal).
+func (s *Server) TriggerTamedAnimal(session *PlayerSession, entityType string) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/tame_an_animal", "tamed_animal")
+}
+
+// TriggerSafelyHarvestHoney fires "Bee Our Guest" (minecraft:husbandry/safely_harvest_honey).
+func (s *Server) TriggerSafelyHarvestHoney(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/safely_harvest_honey", "safely_harvest_honey")
+}
+
+// TriggerSilkTouchBeeNest fires "Total Beelocation" (minecraft:husbandry/silk_touch_nest)
+// when beesCount >= 3.
+func (s *Server) TriggerSilkTouchBeeNest(session *PlayerSession, beesCount int) {
+	if s == nil || session == nil || beesCount < 3 {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/silk_touch_nest", "silk_touch_nest")
+}
+
+// TriggerWaxOn fires "Wax On" (minecraft:husbandry/wax_on).
+func (s *Server) TriggerWaxOn(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/wax_on", "wax_on")
+}
+
+// TriggerWaxOff fires "Wax Off" (minecraft:husbandry/wax_off).
+func (s *Server) TriggerWaxOff(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/wax_off", "wax_off")
+}
+
+// TriggerMakeSignGlow fires "Glow and Behold!" (minecraft:husbandry/make_a_sign_glow).
+func (s *Server) TriggerMakeSignGlow(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/make_a_sign_glow", "make_a_sign_glow")
+}
+
+// TriggerRideBoatWithGoat fires "Whatever Floats Your Goat!"
+// (minecraft:husbandry/ride_a_boat_with_a_goat).
+func (s *Server) TriggerRideBoatWithGoat(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:husbandry/ride_a_boat_with_a_goat", "ride_a_boat_with_a_goat")
+}
+
+// TriggerNetherTravel fires "Subspace Bubble" (minecraft:nether/fast_travel)
+// when the horizontal Overworld distance between Nether entry and exit is >= 7000 blocks.
+func (s *Server) TriggerNetherTravel(session *PlayerSession, entryOverworldX, entryOverworldZ, exitOverworldX, exitOverworldZ float64) {
+	if s == nil || session == nil {
+		return
+	}
+	if math.Hypot(exitOverworldX-entryOverworldX, exitOverworldZ-entryOverworldZ) >= 7000.0 {
+		s.GrantCriterion(session, "minecraft:nether/fast_travel", "travelled")
+	}
+}
+
+// TriggerChargeRespawnAnchor fires "Not Quite \"Nine\" Lives"
+// (minecraft:nether/charge_respawn_anchor) when charges >= 4.
+func (s *Server) TriggerChargeRespawnAnchor(session *PlayerSession, charges int) {
+	if s == nil || session == nil || charges < 4 {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:nether/charge_respawn_anchor", "charge_respawn_anchor")
+}
+
+// TriggerUseLodestone fires "Country Lode, Take Me Home" (minecraft:nether/use_lodestone).
+func (s *Server) TriggerUseLodestone(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:nether/use_lodestone", "use_lodestone")
+}
+
+// TriggerRideStrider fires "This Boat Has Legs" (minecraft:nether/ride_strider).
+func (s *Server) TriggerRideStrider(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:nether/ride_strider", "used_warped_fungus_on_a_stick")
+}
+
+// TriggerRideStriderInLava fires "Feels Like Home"
+// (minecraft:nether/ride_strider_in_overworld_lava) when total Overworld lava ride
+// distance reaches >= 50 blocks (5000 cm).
+func (s *Server) TriggerRideStriderInLava(session *PlayerSession, dim string, totalDistCm int32) {
+	if s == nil || session == nil {
+		return
+	}
+	if world.NormalizeDimension(dim) == world.DimensionOverworld && totalDistCm >= 5000 {
+		s.GrantCriterion(session, "minecraft:nether/ride_strider_in_overworld_lava", "ride_entity_distance")
+	}
+}
+
+// TriggerEnterEndGateway fires "Remote Getaway" (minecraft:end/enter_end_gateway).
+func (s *Server) TriggerEnterEndGateway(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:end/enter_end_gateway", "entered_end_gateway")
+}
+
+// TriggerLevitationDistance fires "Great View From Up Here" (minecraft:end/levitate)
+// when verticalBlocks >= 50.0.
+func (s *Server) TriggerLevitationDistance(session *PlayerSession, verticalBlocks float64) {
+	if s == nil || session == nil || verticalBlocks < 50.0 {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:end/levitate", "levitated")
+}
+
+// TriggerBrushArmadillo fires "Isn't It Scute?" (minecraft:adventure/brush_armadillo).
+func (s *Server) TriggerBrushArmadillo(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/brush_armadillo", "brush_armadillo")
+}
+
+// TriggerLightenUpCopperBulb fires "Lighten Up" (minecraft:adventure/lighten_up).
+func (s *Server) TriggerLightenUpCopperBulb(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/lighten_up", "lighten_up")
+}
+
+// TriggerWhoNeedsRockets fires "Who Needs Rockets?" (minecraft:adventure/who_needs_rockets)
+// when verticalRise >= 8.0 blocks after a wind charge launch.
+func (s *Server) TriggerWhoNeedsRockets(session *PlayerSession, verticalRise float64) {
+	if s == nil || session == nil || verticalRise < 8.0 {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/who_needs_rockets", "who_needs_rockets")
+}
+
+// TriggerMaceOverOverkill fires "Over-Overkill" (minecraft:adventure/overoverkill)
+// when damageDealt >= 100.0 (50 hearts) in a single Mace smash hit.
+func (s *Server) TriggerMaceOverOverkill(session *PlayerSession, damageDealt float32) {
+	if s == nil || session == nil || damageDealt < 100.0 {
+		return
+	}
+	s.GrantCriterion(session, "minecraft:adventure/overoverkill", "overoverkill")
 }
 
 // --- Persistence: Player NBT Compound & Vanilla JSON ---

@@ -268,3 +268,185 @@ func TestAdvancementNBTRoundTripAndJSONPersistence(t *testing.T) {
 		t.Fatalf("JSON file round-trip partial progress = %+v", prog3)
 	}
 }
+
+func TestAdvancementsRecipesStatisticsAndScoreboardRemainder26_1_2(t *testing.T) {
+	srv, _ := newTestEnchantServer(t)
+
+	var chatMessages []string
+	alice, err := srv.RegisterPlayer(Profile{UUID: OfflineUUID("AliceRem"), Name: "AliceRem"}, func(id int32, body []byte) error {
+		if id == protocol.PlaySystemChat && len(body) > 1 {
+			if tag, err := nbt.Unmarshal(body[:len(body)-1]); err == nil {
+				if s, ok := tag.(nbt.String); ok {
+					chatMessages = append(chatMessages, string(s))
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer(AliceRem): %v", err)
+	}
+	bob, _ := srv.RegisterPlayer(Profile{UUID: OfflineUUID("BobRem"), Name: "BobRem"}, nil)
+	_ = srv.GrantOp(alice.Profile)
+	_ = srv.SetPlayerGameMode(alice, GameModeSurvival)
+
+	// 1. Advancement triggers across Story / Adventure / Husbandry / Nether / End.
+	srv.TriggerUsedTotem(alice)
+	srv.TriggerShotArrow(alice, "minecraft:skeleton", true, 55.0)
+	srv.TriggerShotCrossbow(alice, []string{"minecraft:pillager", "minecraft:zombie", "minecraft:skeleton", "minecraft:spider", "minecraft:creeper"})
+	srv.TriggerTargetHit(alice, 15, 35.0)
+	srv.TriggerSlideDownBlock(alice, "minecraft:honey_block")
+	srv.TriggerWalkOnPowderSnowWithLeatherBoots(alice)
+	srv.TriggerFallFromHeight(alice, 320.0, -62.0)
+	srv.TriggerLightningStrike(alice, true, true, false)
+	srv.TriggerThrownTridentHit(alice, true)
+	srv.TriggerSummonedEntity(alice, "minecraft:iron_golem")
+	srv.TriggerSummonedEntity(alice, "minecraft:wither")
+	srv.TriggerSummonedEntity(alice, "minecraft:ender_dragon")
+	srv.TriggerCrafterRecipeCrafted(alice, "minecraft:crafter")
+	srv.TriggerBredAnimals(alice, "minecraft:cow")
+	srv.TriggerTamedAnimal(alice, "minecraft:wolf")
+	srv.TriggerSafelyHarvestHoney(alice)
+	srv.TriggerSilkTouchBeeNest(alice, 3)
+	srv.TriggerWaxOn(alice)
+	srv.TriggerWaxOff(alice)
+	srv.TriggerMakeSignGlow(alice)
+	srv.TriggerRideBoatWithGoat(alice)
+	srv.TriggerNetherTravel(alice, 0, 0, 7200, 0)
+	srv.TriggerChargeRespawnAnchor(alice, 4)
+	srv.TriggerUseLodestone(alice)
+	srv.TriggerRideStrider(alice)
+	srv.TriggerRideStriderInLava(alice, world.DimensionOverworld, 5200)
+	srv.TriggerChangeDimension(alice, world.DimensionEnd)
+	srv.TriggerEntityKilled(alice, "minecraft:ender_dragon")
+	srv.TriggerEnterEndGateway(alice)
+	srv.TriggerLevitationDistance(alice, 55.0)
+	srv.TriggerBrushArmadillo(alice)
+	srv.TriggerLightenUpCopperBulb(alice)
+	srv.TriggerWhoNeedsRockets(alice, 9.0)
+	srv.TriggerMaceOverOverkill(alice, 110.0)
+	srv.TriggerItemAcquired(alice, world.NewNamedItemStack("minecraft:obsidian", 1))
+	srv.TriggerItemAcquired(alice, world.NewNamedItemStack("minecraft:elytra", 1))
+	srv.TriggerItemAcquired(alice, world.NewNamedItemStack("minecraft:dragon_egg", 1))
+
+	for _, id := range []string{
+		"minecraft:story/form_obsidian",
+		"minecraft:adventure/totem_of_undying",
+		"minecraft:adventure/shoot_arrow",
+		"minecraft:adventure/sniper_duel",
+		"minecraft:adventure/ol_betsy",
+		"minecraft:adventure/whos_the_pillager_now",
+		"minecraft:adventure/arbalistic",
+		"minecraft:adventure/bullseye",
+		"minecraft:adventure/honey_block_slide",
+		"minecraft:adventure/walk_on_powder_snow_with_leather_boots",
+		"minecraft:adventure/fall_from_world_height",
+		"minecraft:adventure/lightning_rod_with_villager_no_fire",
+		"minecraft:adventure/throw_trident",
+		"minecraft:adventure/very_very_frightening",
+		"minecraft:adventure/summon_iron_golem",
+		"minecraft:adventure/crafters_crafting_crafters",
+		"minecraft:adventure/brush_armadillo",
+		"minecraft:adventure/lighten_up",
+		"minecraft:adventure/who_needs_rockets",
+		"minecraft:adventure/overoverkill",
+		"minecraft:husbandry/breed_an_animal",
+		"minecraft:husbandry/tame_an_animal",
+		"minecraft:husbandry/safely_harvest_honey",
+		"minecraft:husbandry/silk_touch_nest",
+		"minecraft:husbandry/wax_on",
+		"minecraft:husbandry/wax_off",
+		"minecraft:husbandry/make_a_sign_glow",
+		"minecraft:husbandry/ride_a_boat_with_a_goat",
+		"minecraft:nether/fast_travel",
+		"minecraft:nether/summon_wither",
+		"minecraft:nether/charge_respawn_anchor",
+		"minecraft:nether/use_lodestone",
+		"minecraft:nether/ride_strider",
+		"minecraft:nether/ride_strider_in_overworld_lava",
+		"minecraft:end/root",
+		"minecraft:end/kill_dragon",
+		"minecraft:end/dragon_egg",
+		"minecraft:end/enter_end_gateway",
+		"minecraft:end/respawn_dragon",
+		"minecraft:end/elytra",
+		"minecraft:end/levitate",
+	} {
+		if !alice.HasCompletedAdvancement(id) {
+			t.Fatalf("expected advancement %q to be completed", id)
+		}
+	}
+
+	// 2. /advancement (until|from|through) tree traversal and announceAdvancements=false.
+	srv.SetAnnounceAdvancements(false)
+	chatMessages = nil
+	_ = srv.HandleAdvancementCommand(alice, []string{"grant", "BobRem", "until", "minecraft:story/iron_tools"})
+	for _, id := range []string{"minecraft:story/root", "minecraft:story/mine_stone", "minecraft:story/upgrade_tools", "minecraft:story/smelt_iron", "minecraft:story/iron_tools"} {
+		if !bob.HasCompletedAdvancement(id) {
+			t.Fatalf("expected BobRem to have ancestor %q from 'until'", id)
+		}
+	}
+	if len(chatMessages) != 0 {
+		t.Fatalf("expected no chat messages when announceAdvancements=false, got %v", chatMessages)
+	}
+	_ = srv.HandleAdvancementCommand(alice, []string{"revoke", "BobRem", "from", "minecraft:story/upgrade_tools"})
+	if !bob.HasCompletedAdvancement("minecraft:story/mine_stone") || bob.HasCompletedAdvancement("minecraft:story/upgrade_tools") || bob.HasCompletedAdvancement("minecraft:story/iron_tools") {
+		t.Fatalf("unexpected state after revoke 'from' upgrade_tools")
+	}
+
+	// 3. Recipe book: entering water unlocks boats, doLimitedCrafting check.
+	srv.TriggerEnterBlock(bob, "minecraft:water")
+	if !bob.HasUnlockedRecipe("minecraft:oak_boat") {
+		t.Fatal("expected entering water to unlock minecraft:oak_boat")
+	}
+	srv.SetDoLimitedCrafting(true)
+	if !srv.CanPlayerCraftRecipe(bob, "minecraft:oak_boat") || srv.CanPlayerCraftRecipe(bob, "minecraft:beacon") {
+		t.Fatal("expected CanPlayerCraftRecipe to enforce doLimitedCrafting")
+	}
+	srv.SetDoLimitedCrafting(false)
+
+	// 4. Scoreboard compound stat criteria, state sync, and team sidebar resolution.
+	_, _ = srv.CreateObjective("jumps", "minecraft.custom:minecraft.jump", TextComponent("Jumps"))
+	_, _ = srv.CreateObjective("mined_stone", "minecraft.mined:minecraft.stone", TextComponent("Mined Stone"))
+	_, _ = srv.CreateObjective("deaths_obj", "deathCount", TextComponent("Deaths"))
+	_, _ = srv.CreateObjective("kills_obj", "totalKillCount", TextComponent("Kills"))
+	_, _ = srv.CreateObjective("food_obj", "food", TextComponent("Food"))
+
+	srv.RecordPlayerMovementStats(alice, 0, 64, 0, 1.0, 64.5, 0, true, false)
+	srv.RecordBlockMined(alice, "minecraft:stone")
+	srv.RecordPlayerDeath(alice)
+	srv.RecordEntityKilled(alice, "minecraft:zombie")
+	srv.SyncPlayerStateObjectives(alice)
+
+	if sc, _ := srv.GetScore("AliceRem", "jumps"); sc != 1 {
+		t.Fatalf("expected jumps score 1, got %d", sc)
+	}
+	if sc, _ := srv.GetScore("AliceRem", "mined_stone"); sc != 1 {
+		t.Fatalf("expected mined_stone score 1, got %d", sc)
+	}
+	if sc, _ := srv.GetScore("AliceRem", "deaths_obj"); sc != 1 {
+		t.Fatalf("expected deaths_obj score 1, got %d", sc)
+	}
+	if sc, _ := srv.GetScore("AliceRem", "kills_obj"); sc != 1 {
+		t.Fatalf("expected kills_obj score 1, got %d", sc)
+	}
+	if sc, _ := srv.GetScore("AliceRem", "food_obj"); sc != 20 {
+		t.Fatalf("expected food_obj score 20, got %d", sc)
+	}
+
+	// Team-colored sidebar slot resolution.
+	_, _ = srv.CreateTeam("red_team", TextComponent("Red Team"))
+	_, _ = srv.UpdateTeam("red_team", func(t *ScoreboardTeam) error {
+		t.Color = ChatColorRed
+		return nil
+	})
+	_, _ = srv.JoinTeam("red_team", "AliceRem")
+	_ = srv.SetDisplayObjective(DisplaySlotSidebar, "jumps")
+	_ = srv.SetDisplayObjective(DisplaySlotSidebarTeamRed, "kills_obj")
+	if slot, obj := srv.ResolveSidebarObjectiveForPlayer(alice); slot != DisplaySlotSidebarTeamRed || obj != "kills_obj" {
+		t.Fatalf("ResolveSidebarObjectiveForPlayer(alice) = (%d, %q), want (%d, 'kills_obj')", slot, obj, DisplaySlotSidebarTeamRed)
+	}
+	if slot, obj := srv.ResolveSidebarObjectiveForPlayer(bob); slot != DisplaySlotSidebar || obj != "jumps" {
+		t.Fatalf("ResolveSidebarObjectiveForPlayer(bob) = (%d, %q), want (%d, 'jumps')", slot, obj, DisplaySlotSidebar)
+	}
+}

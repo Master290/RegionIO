@@ -718,14 +718,51 @@ func EncodeUpdateRecipesPacket() []byte {
 		}
 	}
 
+	smithingTemplates := []string{
+		"minecraft:netherite_upgrade_smithing_template",
+		"minecraft:sentry_armor_trim_smithing_template",
+		"minecraft:dune_armor_trim_smithing_template",
+		"minecraft:coast_armor_trim_smithing_template",
+		"minecraft:wild_armor_trim_smithing_template",
+		"minecraft:ward_armor_trim_smithing_template",
+		"minecraft:eye_armor_trim_smithing_template",
+		"minecraft:vex_armor_trim_smithing_template",
+		"minecraft:tide_armor_trim_smithing_template",
+		"minecraft:snout_armor_trim_smithing_template",
+		"minecraft:rib_armor_trim_smithing_template",
+		"minecraft:spire_armor_trim_smithing_template",
+		"minecraft:wayfinder_armor_trim_smithing_template",
+		"minecraft:shaper_armor_trim_smithing_template",
+		"minecraft:silence_armor_trim_smithing_template",
+		"minecraft:raiser_armor_trim_smithing_template",
+		"minecraft:host_armor_trim_smithing_template",
+		"minecraft:flow_armor_trim_smithing_template",
+		"minecraft:bolt_armor_trim_smithing_template",
+	}
+	smithingBases := []string{
+		"minecraft:diamond_helmet", "minecraft:diamond_chestplate", "minecraft:diamond_leggings", "minecraft:diamond_boots",
+		"minecraft:diamond_sword", "minecraft:diamond_pickaxe", "minecraft:diamond_axe", "minecraft:diamond_shovel", "minecraft:diamond_hoe",
+		"minecraft:leather_helmet", "minecraft:leather_chestplate", "minecraft:leather_leggings", "minecraft:leather_boots",
+		"minecraft:chainmail_helmet", "minecraft:chainmail_chestplate", "minecraft:chainmail_leggings", "minecraft:chainmail_boots",
+		"minecraft:iron_helmet", "minecraft:iron_chestplate", "minecraft:iron_leggings", "minecraft:iron_boots",
+		"minecraft:golden_helmet", "minecraft:golden_chestplate", "minecraft:golden_leggings", "minecraft:golden_boots",
+		"minecraft:netherite_helmet", "minecraft:netherite_chestplate", "minecraft:netherite_leggings", "minecraft:netherite_boots",
+		"minecraft:turtle_helmet",
+	}
+	smithingAdditions := []string{
+		"minecraft:netherite_ingot", "minecraft:iron_ingot", "minecraft:copper_ingot", "minecraft:gold_ingot",
+		"minecraft:lapis_lazuli", "minecraft:emerald", "minecraft:diamond", "minecraft:redstone",
+		"minecraft:amethyst_shard", "minecraft:quartz", "minecraft:resin_brick",
+	}
+
 	sets := []propSet{
 		{key: "minecraft:furnace_input", items: collectIDs(furnaceInputs)},
 		{key: "minecraft:blast_furnace_input", items: collectIDs(blastInputs)},
 		{key: "minecraft:smoker_input", items: collectIDs(smokerInputs)},
 		{key: "minecraft:campfire_input", items: collectIDs(smokerInputs)},
-		{key: "minecraft:smithing_base", items: nil},
-		{key: "minecraft:smithing_template", items: nil},
-		{key: "minecraft:smithing_addition", items: nil},
+		{key: "minecraft:smithing_base", items: collectIDs(smithingBases)},
+		{key: "minecraft:smithing_template", items: collectIDs(smithingTemplates)},
+		{key: "minecraft:smithing_addition", items: collectIDs(smithingAdditions)},
 	}
 
 	w.VarInt(int32(len(sets)))
@@ -1149,6 +1186,36 @@ func (s *Server) UnlockRecipeOnCraft(session *PlayerSession, recipeName string, 
 	return count
 }
 
+// UnlockWaterBoatRecipes unlocks all vanilla 26.1.2 boat, raft, and chest-boat
+// crafting recipes when session enters water (`minecraft:enter_block` on `minecraft:water`).
+func (s *Server) UnlockWaterBoatRecipes(session *PlayerSession) int {
+	if session == nil {
+		return 0
+	}
+	return s.UnlockRecipesByNames(session, []string{
+		"minecraft:oak_boat", "minecraft:spruce_boat", "minecraft:birch_boat",
+		"minecraft:jungle_boat", "minecraft:acacia_boat", "minecraft:cherry_boat",
+		"minecraft:dark_oak_boat", "minecraft:mangrove_boat", "minecraft:pale_oak_boat",
+		"minecraft:bamboo_raft",
+		"minecraft:oak_chest_boat", "minecraft:spruce_chest_boat", "minecraft:birch_chest_boat",
+		"minecraft:jungle_chest_boat", "minecraft:acacia_chest_boat", "minecraft:cherry_chest_boat",
+		"minecraft:dark_oak_chest_boat", "minecraft:mangrove_chest_boat", "minecraft:pale_oak_chest_boat",
+		"minecraft:bamboo_chest_raft",
+	})
+}
+
+// CanPlayerCraftRecipe reports whether session is allowed to craft recipeName
+// under the current `doLimitedCrafting` game rule.
+func (s *Server) CanPlayerCraftRecipe(session *PlayerSession, recipeName string) bool {
+	if session == nil {
+		return false
+	}
+	if s != nil && s.DoLimitedCrafting() {
+		return session.HasUnlockedRecipe(recipeName)
+	}
+	return true
+}
+
 // HandleRecipeBookChangeSettings processes a serverbound
 // recipe_book_change_settings (0x2e) packet.
 func (s *Server) HandleRecipeBookChangeSettings(session *PlayerSession, bookType int32, isOpen, isFiltering bool) error {
@@ -1519,11 +1586,36 @@ func (s *Server) HandleAdvancementCommand(sender *PlayerSession, args []string) 
 			}
 			return fmt.Sprintf("Updated criterion %s on %s for %d player(s)", crit, def.ID, len(targets))
 		}
+		var advIDs []string
+		switch mode {
+		case "only":
+			advIDs = []string{def.ID}
+		case "from":
+			advIDs = AdvancementDescendants(def.ID)
+		case "until":
+			advIDs = AdvancementAncestors(def.ID)
+		case "through":
+			seen := make(map[string]bool)
+			for _, id := range AdvancementAncestors(def.ID) {
+				if !seen[id] {
+					seen[id] = true
+					advIDs = append(advIDs, id)
+				}
+			}
+			for _, id := range AdvancementDescendants(def.ID) {
+				if !seen[id] {
+					seen[id] = true
+					advIDs = append(advIDs, id)
+				}
+			}
+		}
 		for _, t := range targets {
-			if action == "grant" {
-				s.GrantAdvancement(t, def.ID)
-			} else {
-				s.RevokeAdvancement(t, def.ID)
+			for _, id := range advIDs {
+				if action == "grant" {
+					s.GrantAdvancement(t, id)
+				} else {
+					s.RevokeAdvancement(t, id)
+				}
 			}
 		}
 		if action == "grant" {

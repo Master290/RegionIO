@@ -113,6 +113,7 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	_ = h.srv.LoadPlayerAdvancementsFile(h.session)
+	_ = h.srv.LoadPlayerStatsFile(h.session)
 	if err := h.srv.SendInitialAdvancements(h.session); err != nil {
 		return err
 	}
@@ -138,6 +139,7 @@ func (h *handler) beginPlay() error {
 	h.srv.BroadcastPlayerInfoAdd(session)
 	_ = h.srv.SendFullTabListToPlayer(session)
 	_ = h.srv.SendFullScoreboardToPlayer(session)
+	h.srv.SyncPlayerStateObjectives(session)
 	h.srv.SendBossBarsOnPlayerJoin(session)
 	h.srv.BroadcastJoinMessage(session)
 	// Launch the background chunk streamer. It owns generation + sending so the
@@ -417,6 +419,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 				}
 			}
 			if inWater {
+				h.srv.TriggerEnterBlock(h.session, "minecraft:water")
 				h.srv.EmitPlayerMovementVibration(h.session, server.GameEventSwim, x, y, z)
 			} else if onGround {
 				h.srv.EmitPlayerMovementVibration(h.session, server.GameEventStep, x, y, z)

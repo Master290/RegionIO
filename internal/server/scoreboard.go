@@ -95,6 +95,10 @@ func ParseDisplaySlot(name string) (int32, bool) {
 	lower := strings.ToLower(strings.TrimSpace(name))
 	if lower == "belowname" {
 		lower = "below_name"
+	} else if strings.HasPrefix(lower, "sidebar_team_") {
+		lower = "sidebar.team." + strings.TrimPrefix(lower, "sidebar_team_")
+	} else if strings.HasPrefix(lower, "team_") {
+		lower = "sidebar.team." + strings.TrimPrefix(lower, "team_")
 	}
 	for i, s := range displaySlotNames {
 		if s == lower {
@@ -779,13 +783,46 @@ func (s *Server) IncrementCriteriaObjectives(holder, criteria string, delta int3
 	}
 }
 
+var playerAirSupplyMap sync.Map // map[*PlayerSession]int32
+
+// AirSupply returns session's current air supply in ticks (defaults to vanilla 300 ticks).
+func (session *PlayerSession) AirSupply() int32 {
+	if session == nil {
+		return 0
+	}
+	if v, ok := playerAirSupplyMap.Load(session); ok {
+		return v.(int32)
+	}
+	return 300
+}
+
+// SetAirSupply updates session's air supply in ticks.
+func (session *PlayerSession) SetAirSupply(ticks int32) {
+	if session == nil {
+		return
+	}
+	if ticks < -20 {
+		ticks = -20
+	}
+	if ticks > 300 {
+		ticks = 300
+	}
+	playerAirSupplyMap.Store(session, ticks)
+}
+
+// TotalArmorPoints returns the total armor defense points worn by session.
+func (session *PlayerSession) TotalArmorPoints() float32 {
+	def, _ := session.ArmorDefense()
+	return def
+}
+
 // SyncHealthObjectives updates any "health" criteria objectives for session.
 func (s *Server) SyncHealthObjectives(session *PlayerSession) {
 	if s == nil || session == nil {
 		return
 	}
 	snap := session.Snapshot()
-	hp := int32(math.Ceil(float64(snap.Health)))
+	hp := int32(math.Ceil(float64(snap.Health + session.AbsorptionHealth())))
 	if hp < 0 {
 		hp = 0
 	}
@@ -801,6 +838,160 @@ func (s *Server) SyncHealthObjectives(session *PlayerSession) {
 
 	for _, objName := range matching {
 		_, _ = s.SetScore(snap.Profile.Name, objName, hp)
+	}
+}
+
+// SyncPlayerStateObjectives synchronizes all state-based scoreboard criteria
+// ("health", "food", "level", "xp", "air", "armor") for session.
+func (s *Server) SyncPlayerStateObjectives(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	snap := session.Snapshot()
+	holder := snap.Profile.Name
+	if holder == "" {
+		return
+	}
+	hp := int32(math.Ceil(float64(snap.Health + session.AbsorptionHealth())))
+	if hp < 0 {
+		hp = 0
+	}
+	food := snap.FoodLevel
+	level := session.ExperienceLevel()
+	xp := session.TotalExperience()
+	air := session.AirSupply()
+	armor := int32(math.Round(float64(session.TotalArmorPoints())))
+
+	sb := s.scoreboard()
+	sb.mu.RLock()
+	type stateUpdate struct {
+		objName string
+		val     int32
+	}
+	var updates []stateUpdate
+	for name, obj := range sb.objectives {
+		if obj == nil {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(obj.Criteria)) {
+		case "health":
+			updates = append(updates, stateUpdate{name, hp})
+		case "food":
+			updates = append(updates, stateUpdate{name, food})
+		case "level":
+			updates = append(updates, stateUpdate{name, level})
+		case "xp", "experience":
+			updates = append(updates, stateUpdate{name, xp})
+		case "air":
+			updates = append(updates, stateUpdate{name, air})
+		case "armor":
+			updates = append(updates, stateUpdate{name, armor})
+		}
+	}
+	sb.mu.RUnlock()
+
+	for _, u := range updates {
+		_, _ = s.SetScore(holder, u.objName, u.val)
+	}
+}
+
+// ResolveSidebarObjectiveForPlayer returns the active sidebar display slot and
+// objective name for session, preferring the team-colored sidebar slot
+// (`sidebar.team.<color>`, slots 3..18) when session belongs to a colored team
+// with a non-empty sidebar objective, and falling back to `DisplaySlotSidebar` (1).
+func (s *Server) ResolveSidebarObjectiveForPlayer(session *PlayerSession) (slot int32, objectiveName string) {
+	if s == nil {
+		return DisplaySlotSidebar, ""
+	}
+	sb := s.scoreboard()
+	sb.mu.RLock()
+	defer sb.mu.RUnlock()
+	if session != nil {
+		if teamName := sb.memberTeam[session.Profile.Name]; teamName != "" {
+			if team := sb.teams[teamName]; team != nil && team.Color >= 0 && team.Color <= 15 {
+				teamSlot := DisplaySlotSidebarTeamBlack + team.Color
+				if int(teamSlot) < DisplaySlotCount && sb.displaySlots[teamSlot] != "" {
+					return teamSlot, sb.displaySlots[teamSlot]
+				}
+			}
+		}
+	}
+	return DisplaySlotSidebar, sb.displaySlots[DisplaySlotSidebar]
+}
+
+// RecordTeamKillObjectives increments any `teamkill.<victimColor>` objectives
+// for killer and any `killedByTeam.<killerColor>` objectives for victim.
+func (s *Server) RecordTeamKillObjectives(killer, victim *PlayerSession) {
+	if s == nil {
+		return
+	}
+	if killer != nil && victim != nil {
+		if vt, ok := s.PlayerTeam(victim.Profile.Name); ok && vt != nil && vt.Color >= 0 && vt.Color <= 15 {
+			cName := ChatColorName(vt.Color)
+			s.IncrementCriteriaObjectives(killer.Profile.Name, "teamkill."+cName, 1)
+		}
+		if kt, ok := s.PlayerTeam(killer.Profile.Name); ok && kt != nil && kt.Color >= 0 && kt.Color <= 15 {
+			cName := ChatColorName(kt.Color)
+			s.IncrementCriteriaObjectives(victim.Profile.Name, "killedByTeam."+cName, 1)
+		}
+	}
+}
+
+// OnPlayerStatChanged updates any scoreboard objectives whose criteria match the
+// changed player statistic (including compound `minecraft.<category>:minecraft.<key>`
+// criteria as well as `deathCount`, `playerKillCount`, and `totalKillCount`).
+func (s *Server) OnPlayerStatChanged(session *PlayerSession, category StatType, key string, delta, newValue int32) {
+	if s == nil || session == nil || session.Profile.Name == "" {
+		return
+	}
+	holder := session.Profile.Name
+	catShort := strings.TrimPrefix(category.String(), "minecraft:")
+	keyShort := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(key)), "minecraft:")
+	fullCompound := "minecraft." + catShort + ":minecraft." + keyShort
+	shortCompound := catShort + ":" + keyShort
+	midCompound := "minecraft." + catShort + ":" + keyShort
+
+	sb := s.scoreboard()
+	sb.mu.RLock()
+	var deltaObjs []string
+	var setObjs []string
+	for name, obj := range sb.objectives {
+		if obj == nil {
+			continue
+		}
+		crit := strings.ToLower(strings.TrimSpace(obj.Criteria))
+		if crit == fullCompound || crit == shortCompound || crit == midCompound {
+			if delta > 0 {
+				deltaObjs = append(deltaObjs, name)
+			} else {
+				setObjs = append(setObjs, name)
+			}
+			continue
+		}
+		if category == StatTypeCustom && delta > 0 {
+			switch key {
+			case StatDeaths:
+				if crit == "deathcount" {
+					deltaObjs = append(deltaObjs, name)
+				}
+			case StatPlayerKills:
+				if crit == "playerkillcount" || crit == "totalkillcount" {
+					deltaObjs = append(deltaObjs, name)
+				}
+			case StatMobKills:
+				if crit == "totalkillcount" {
+					deltaObjs = append(deltaObjs, name)
+				}
+			}
+		}
+	}
+	sb.mu.RUnlock()
+
+	for _, objName := range deltaObjs {
+		_, _ = s.AddScore(holder, objName, delta)
+	}
+	for _, objName := range setObjs {
+		_, _ = s.SetScore(holder, objName, newValue)
 	}
 }
 
