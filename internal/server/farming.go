@@ -67,9 +67,21 @@ func (s *Server) UseBoneMeal(session *PlayerSession, x, y, z int, slot int, rng 
 			return false, res
 		}
 	}
+	beforeState := cache.GetBlock(x, y, z)
 	consumed, res = cache.ApplyBoneMeal(x, y, z, rng)
 	if !consumed {
 		return false, res
+	}
+	if drops := world.BoneMealDropsForBlock(beforeState); len(drops) > 0 && s.DoTileDrops() {
+		dim := world.DimensionOverworld
+		if session != nil && session.Dimension() != "" {
+			dim = world.NormalizeDimension(session.Dimension())
+		}
+		for _, drop := range drops {
+			if !drop.IsEmpty() {
+				s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, drop)
+			}
+		}
 	}
 	if session != nil && slot >= 0 && slot < world.PlayerInventorySlots && session.Snapshot().GameMode != GameModeCreative {
 		held := session.InventorySlot(slot)
@@ -183,10 +195,7 @@ func (s *Server) CheckPlayerFarmlandTrample(session *PlayerSession, fallDistance
 	if snap.GameMode == GameModeSpectator {
 		return false, res
 	}
-	if rng == nil {
-		rng = rand.New(rand.NewSource(1))
-	}
-	if rng.Float64() >= fallDistance-0.5 {
+	if !world.CanEntityTrampleFarmland(true, true, 0.6, 1.8, fallDistance, rng) {
 		return false, res
 	}
 	cache := s.worldCacheForSession(session)
@@ -198,6 +207,126 @@ func (s *Server) CheckPlayerFarmlandTrample(session *PlayerSession, fallDistance
 	bz := int(math.Floor(snap.Z))
 	trampled, res = cache.TrampleFarmland(bx, by, bz)
 	return trampled, res
+}
+
+// CheckEntityFarmlandTrample checks whether a non-player mob/entity landing
+// after falling fallDistance blocks tramples farmland at its feet into dirt
+// (vanilla FarmBlock.fallOn: requires mobGriefing, bounding box volume
+// width*width*height > 0.512, and fallDistance > 0.5 && rng.Float64() < fallDistance - 0.5).
+func (s *Server) CheckEntityFarmlandTrample(entityID int32, width, height, fallDistance float64, rng *rand.Rand) (trampled bool, res world.BlockUpdateResult) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return false, res
+	}
+	if !world.CanEntityTrampleFarmland(false, s.MobGriefing(), width, height, fallDistance, rng) {
+		return false, res
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || ent.IsItem() {
+		return false, res
+	}
+	dim := world.NormalizeDimension(ent.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return false, res
+	}
+	bx := int(math.Floor(ent.X))
+	by := int(math.Floor(ent.Y - 0.2))
+	bz := int(math.Floor(ent.Z))
+	trampled, res = cache.TrampleFarmland(bx, by, bz)
+	if trampled {
+		s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+	}
+	return trampled, res
+}
+
+// CanFarmerVillagerWorkAt reports whether a Farmer villager can harvest a mature
+// crop or plant a seed at crop position (x, y, z) above farmland in dim,
+// respecting the mobGriefing gamerule.
+func (s *Server) CanFarmerVillagerWorkAt(dim string, x, y, z int, hasPlantableSeeds bool) (harvestable bool, plantable bool) {
+	if s == nil || !s.MobGriefing() {
+		return false, false
+	}
+	targetDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(targetDim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return false, false
+	}
+	return cache.CanFarmerWorkAt(x, y, z, hasPlantableSeeds)
+}
+
+// FarmerVillagerHarvestOrPlantAt executes a Farmer villager's `HarvestFarmland`
+// action at crop position (x, y, z) above `minecraft:farmland` in dim:
+//   - Requires `s.MobGriefing()` to be true.
+//   - Harvests mature `wheat`, `carrots`, `potatoes`, or `beetroots` and/or
+//     plants `seedStack` (`#minecraft:villager_plantable_seeds`).
+//   - Broadcasts resulting block changes to players in dim.
+func (s *Server) FarmerVillagerHarvestOrPlantAt(dim string, x, y, z int, seedStack world.ItemStack, rng *rand.Rand) (drops []world.ItemStack, updatedSeedStack world.ItemStack, changed bool, res world.BlockUpdateResult) {
+	updatedSeedStack = seedStack
+	if s == nil || !s.MobGriefing() {
+		return nil, updatedSeedStack, false, res
+	}
+	targetDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(targetDim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return nil, updatedSeedStack, false, res
+	}
+	var seedID string
+	if !seedStack.IsEmpty() {
+		seedID = seedStack.ResolvedID()
+	}
+	var consumedSeed bool
+	drops, consumedSeed, res, changed = cache.FarmerHarvestAndReplantAt(x, y, z, seedID, rng)
+	if !changed {
+		return nil, updatedSeedStack, false, res
+	}
+	if consumedSeed && !updatedSeedStack.IsEmpty() {
+		if updatedSeedStack.Count > 1 {
+			updatedSeedStack.Count--
+		} else {
+			updatedSeedStack = world.ItemStack{}
+		}
+	}
+	s.broadcastDimensionBlockChanges(targetDim, cache, res.Changes, res.LightChanged)
+	return drops, updatedSeedStack, true, res
+}
+
+// FarmerVillagerApplyBoneMealAt applies a Farmer villager's `UseBonemeal` action
+// to the crop at (x, y, z) in dim and broadcasts resulting block changes.
+func (s *Server) FarmerVillagerApplyBoneMealAt(dim string, x, y, z int, rng *rand.Rand) (consumed bool, res world.BlockUpdateResult) {
+	if s == nil {
+		return false, res
+	}
+	targetDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(targetDim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return false, res
+	}
+	beforeState := cache.GetBlock(x, y, z)
+	consumed, res = cache.ApplyBoneMeal(x, y, z, rng)
+	if !consumed {
+		return false, res
+	}
+	if drops := world.BoneMealDropsForBlock(beforeState); len(drops) > 0 && s.DoTileDrops() {
+		for _, drop := range drops {
+			if !drop.IsEmpty() {
+				s.SpawnItemEntityInDimension(targetDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, drop)
+			}
+		}
+	}
+	s.broadcastDimensionBlockChanges(targetDim, cache, res.Changes, res.LightChanged)
+	return true, res
 }
 
 // HarvestCropDrops returns the vanilla item stacks dropped when a crop, stem,

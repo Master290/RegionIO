@@ -194,3 +194,70 @@ func TestFishyBusinessAdvancementAndItemFrameComparatorSignal(t *testing.T) {
 	}
 }
 
+func TestServerBoneMealFlowerDropEntityTrampleAndFarmerVillagerHooks(t *testing.T) {
+	srv, cache := newTestEnchantServer(t)
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("VillagerKeeper"),
+		Name: "VillagerKeeper",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(sess, GameModeSurvival)
+	rng := rand.New(rand.NewSource(555))
+
+	// 1. Bone-mealing a tall flower (sunflower) consumes 1 bone meal and spawns a sunflower item entity.
+	sunflowerLower, _ := world.BlockStateIDByProperties("minecraft:sunflower", map[string]string{"half": "lower"})
+	sunflowerUpper, _ := world.BlockStateIDByProperties("minecraft:sunflower", map[string]string{"half": "upper"})
+	cache.SetBlock(4, world.FlatSurfaceY+1, 4, sunflowerLower)
+	cache.SetBlock(4, world.FlatSurfaceY+2, 4, sunflowerUpper)
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:bone_meal", 2))
+
+	beforeEntities := len(srv.entities.All())
+	consumed, _ := srv.UseBoneMeal(sess, 4, world.FlatSurfaceY+1, 4, 36, rng)
+	if !consumed {
+		t.Fatalf("expected UseBoneMeal on sunflower to succeed")
+	}
+	if sess.InventorySlot(36).Count != 1 {
+		t.Fatalf("bone_meal count = %d, want 1", sess.InventorySlot(36).Count)
+	}
+	if afterEntities := len(srv.entities.All()); afterEntities != beforeEntities+1 {
+		t.Fatalf("entities count = %d, want %d", afterEntities, beforeEntities+1)
+	}
+
+	// 2. CheckEntityFarmlandTrample respects volume > 0.512 and mobGriefing.
+	_, _ = cache.TillSoilAt(6, world.FlatSurfaceY, 6)
+	mobID, _ := srv.SpawnMobInDimension(world.DimensionOverworld, 6.5, float64(world.FlatSurfaceY+1), 6.5, "minecraft:cow")
+	if mobID == 0 {
+		t.Fatalf("expected SpawnMobInDimension to return non-zero entity ID")
+	}
+	// Small volume (0.4x0.7) does not trample.
+	if trampled, _ := srv.CheckEntityFarmlandTrample(mobID, 0.4, 0.7, 3.0, rng); trampled {
+		t.Fatalf("expected small bounding box not to trample farmland")
+	}
+	// Cow volume (0.9x1.4) tramples when mobGriefing is true.
+	if trampled, _ := srv.CheckEntityFarmlandTrample(mobID, 0.9, 1.4, 3.0, rng); !trampled {
+		t.Fatalf("expected cow-sized bounding box to trample farmland")
+	}
+	if cache.GetBlock(6, world.FlatSurfaceY, 6) != world.StateDirt {
+		t.Fatalf("expected trampled farmland at (6, FlatSurfaceY, 6) to become dirt")
+	}
+
+	// 3. Farmer Villager harvest/replant and bone-meal server hooks.
+	_, _ = cache.TillSoilAt(8, world.FlatSurfaceY, 8)
+	seedStack := world.NewNamedItemStack("minecraft:wheat_seeds", 3)
+	drops, updatedSeeds, changed, _ := srv.FarmerVillagerHarvestOrPlantAt(world.DimensionOverworld, 8, world.FlatSurfaceY+1, 8, seedStack, rng)
+	if !changed || len(drops) != 0 || updatedSeeds.Count != 2 {
+		t.Fatalf("FarmerVillagerHarvestOrPlantAt (plant) = (drops=%+v, seeds=%+v, changed=%v)", drops, updatedSeeds, changed)
+	}
+	// Farmer applies bonemeal until mature.
+	for i := 0; i < 4; i++ {
+		srv.FarmerVillagerApplyBoneMealAt(world.DimensionOverworld, 8, world.FlatSurfaceY+1, 8, rng)
+	}
+	// Farmer harvests mature wheat and replants 1 wheat_seeds.
+	drops, updatedSeeds, changed, _ = srv.FarmerVillagerHarvestOrPlantAt(world.DimensionOverworld, 8, world.FlatSurfaceY+1, 8, updatedSeeds, rng)
+	if !changed || len(drops) == 0 || updatedSeeds.Count != 1 {
+		t.Fatalf("FarmerVillagerHarvestOrPlantAt (harvest+replant) = (drops=%+v, seeds=%+v, changed=%v)", drops, updatedSeeds, changed)
+	}
+}
+
