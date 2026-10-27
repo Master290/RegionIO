@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"regionio/internal/protocol"
+	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -465,4 +466,85 @@ func TestFishingRainBiteSpeedupBobberPhysicsAndPlayerPull(t *testing.T) {
 		t.Fatalf("expected hooked player to be pulled closer: before=%.2f after=%.2f", beforeDist, afterDist)
 	}
 }
+
+func TestFishingStatsParticlesSubmergedPlantsAndRodBreak(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	setupWaterPool(srv.chunks, 8, 64, 8, 2, 2)
+
+	// 1. Submerged kelp and seagrass inside the 5x4x5 water volume preserve open-water status.
+	if seagrass, ok := world.BlockStateIDByProperties("minecraft:seagrass", nil); ok {
+		srv.chunks.SetBlock(9, 63, 9, seagrass)
+		if !srv.IsOpenWaterFishingAt(8, 64, 8) {
+			t.Fatal("expected submerged minecraft:seagrass to preserve open-water classification")
+		}
+		srv.chunks.SetBlock(9, 63, 9, world.StateWater)
+	}
+
+	// 2. Natural chunk biome detection for minecraft:jungle in IsJungleFishingAt without manual override.
+	if jungleIdx := registry.Index("minecraft:worldgen/biome", "minecraft:jungle"); jungleIdx >= 0 {
+		srv.chunks.SetBiomeAt(24, 64, 24, uint16(jungleIdx))
+		if !srv.IsJungleFishingAt(24, 64, 24) {
+			t.Fatal("expected IsJungleFishingAt to return true for chunk cell with minecraft:jungle biome")
+		}
+	}
+
+	// 3. Verify wake/splash particles, StatFishCaught, StatItemUsed, and StatItemBroken when rod breaks at 63/64 damage.
+	var sawParticles, sawMotion bool
+	session := newFishingTestPlayer(t, srv, "StatAngler", 4.5, 65.0, 4.5, func(pktID int32, _ []byte) error {
+		switch pktID {
+		case PlayLevelParticlesCB:
+			sawParticles = true
+		case protocol.PlaySetEntityMotion:
+			sawMotion = true
+		}
+		return nil
+	})
+
+	rod := world.NewNamedItemStack("minecraft:fishing_rod", 1)
+	hotbarSlot := world.HotbarContainerOffset + int(session.Snapshot().SelectedSlot)
+	session.SetInventorySlot(hotbarSlot, rod)
+	SetSlotItemMeta(session, hotbarSlot, ItemMeta{Damage: 63}) // 1 durability remaining (max 64)
+
+	rng := rand.New(rand.NewSource(2026))
+	if cast, _ := srv.UseFishingRodWithRand(session, 0, rng); !cast {
+		t.Fatal("expected cast")
+	}
+	if used := srv.GetPlayerStat(session, StatTypeUsed, FishingRodItemID); used != 1 {
+		t.Fatalf("StatTypeUsed(fishing_rod) after cast = %d, want 1", used)
+	}
+
+	bobber := srv.ActiveFishingBobber(session)
+	srv.entities.Update(bobber.EntityID, func(e *world.Entity) {
+		e.X, e.Y, e.Z = 8.5, 64.2, 8.5
+	})
+	srv.SetFishingBobberTimers(session, 0, 2, 0, true)
+
+	// Tick through approach -> bite.
+	for i := 0; i < 10; i++ {
+		srv.TickFishingBobbers(rng)
+		b := srv.ActiveFishingBobber(session)
+		if b != nil && b.Biting {
+			break
+		}
+	}
+	if !sawParticles || !sawMotion {
+		t.Fatalf("expected wake/splash particles (%v) and plunge motion packet (%v) on fish approach/bite", sawParticles, sawMotion)
+	}
+
+	// Reel in catch -> awards StatFishCaught and breaks the 63/64 rod!
+	_, wear := srv.UseFishingRodWithRand(session, 0, rng)
+	if wear != FishingWearCatch {
+		t.Fatalf("wear on catch = %d, want %d", wear, FishingWearCatch)
+	}
+	if caught := srv.GetPlayerStat(session, StatTypeCustom, StatFishCaught); caught != 1 {
+		t.Fatalf("StatFishCaught after catch = %d, want 1", caught)
+	}
+	if broken := srv.GetPlayerStat(session, StatTypeBroken, FishingRodItemID); broken != 1 {
+		t.Fatalf("StatTypeBroken(fishing_rod) after breaking at 64/64 = %d, want 1", broken)
+	}
+	if !session.InventorySlot(hotbarSlot).IsEmpty() {
+		t.Fatal("expected fishing rod slot to be empty after breaking at max durability")
+	}
+}
+
 

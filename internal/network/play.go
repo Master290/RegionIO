@@ -649,6 +649,7 @@ func (h *handler) serverTickLoop() {
 				h.srv.TickWithers(nil)
 				h.srv.TickEnderDragons(nil)
 				h.srv.TickWardens(nil)
+				h.srv.TickFishingBobbers(nil)
 			}
 			lastGameTime = nowGameTime
 		}
@@ -744,6 +745,13 @@ func (h *handler) syncVisibleEntities() error {
 			}
 			if entity.TypeName == server.MobTypeWarden && h.srv != nil {
 				if metaPkt := h.srv.WardenEntityDataPacket(entity.ID); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+			}
+			if entity.TypeName == server.EntityTypeFishingBobber && h.srv != nil {
+				if metaPkt := h.srv.FishingBobberEntityDataPacket(entity.ID); len(metaPkt) > 0 {
 					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
 						return err
 					}
@@ -870,6 +878,9 @@ func (h *handler) sendPlayerInfoRemove(uuid [16]byte) error {
 func (h *handler) sendAddEntity(e *world.Entity) error {
 	if h.srv != nil && server.IsDecorationEntity(e.TypeName) {
 		return h.conn.Send(protocol.PlayAddEntity, h.srv.EncodeDecorationAddEntityPacket(nil, e))
+	}
+	if h.srv != nil && e.TypeName == server.EntityTypeFishingBobber {
+		return h.conn.Send(protocol.PlayAddEntity, h.srv.EncodeFishingBobberAddEntityPacket(nil, e))
 	}
 	w := protocol.NewWriter(64)
 	w.VarInt(e.ID)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"regionio/internal/protocol"
+	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -198,8 +199,8 @@ func (s *Server) DroppedFishingItemMeta(entityID int32) (ItemMeta, bool) {
 	return meta, ok
 }
 
-// SetFishingJungleAt marks a block column (x, z) as a jungle biome for fishing
-// loot table evaluation (enabling bamboo drops from the junk table).
+// SetFishingJungleAt marks a block column (x, z) as a jungle (or non-jungle) biome
+// for fishing loot table evaluation (enabling bamboo drops from the junk table).
 func (s *Server) SetFishingJungleAt(x, z int, isJungle bool) {
 	if s == nil {
 		return
@@ -208,23 +209,43 @@ func (s *Server) SetFishingJungleAt(x, z int, isJungle bool) {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 	pos := world.BlockPos{X: x, Y: 0, Z: z}
-	if isJungle {
-		ft.jungleOverride[pos] = true
-	} else {
-		delete(ft.jungleOverride, pos)
-	}
+	ft.jungleOverride[pos] = isJungle
 }
 
-// IsJungleFishingAt reports whether (x, y, z) is in a jungle biome for fishing loot.
+// IsJungleFishingAt reports whether (x, y, z) in the Overworld is in a jungle
+// biome for fishing loot.
 func (s *Server) IsJungleFishingAt(x, y, z int) bool {
+	return s.IsJungleFishingInDim(world.DimensionOverworld, x, y, z)
+}
+
+// IsJungleFishingInDim reports whether (x, y, z) in dim is in a jungle biome
+// (#minecraft:is_jungle: jungle, sparse_jungle, bamboo_jungle) or has an explicit
+// SetFishingJungleAt override.
+func (s *Server) IsJungleFishingInDim(dim string, x, y, z int) bool {
 	if s == nil {
 		return false
 	}
 	ft := s.fishingTracker()
 	ft.mu.Lock()
-	isJ := ft.jungleOverride[world.BlockPos{X: x, Y: 0, Z: z}]
+	isJ, hasOverride := ft.jungleOverride[world.BlockPos{X: x, Y: 0, Z: z}]
 	ft.mu.Unlock()
-	return isJ
+	if hasOverride {
+		return isJ
+	}
+	cache := s.DimensionChunks(world.NormalizeDimension(dim))
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return false
+	}
+	biomeID := int(cache.GetBiomeAt(x, y, z))
+	for _, jb := range []string{"minecraft:jungle", "minecraft:sparse_jungle", "minecraft:bamboo_jungle"} {
+		if idx := registry.Index("minecraft:worldgen/biome", jb); idx >= 0 && biomeID == idx {
+			return true
+		}
+	}
+	return false
 }
 
 // PlayerFishingLuck computes the effective fishing luck parameter combining
@@ -501,6 +522,17 @@ func (s *Server) castFishingBobber(session *PlayerSession, hand int32, rodSlot i
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 			EncodeSoundPacket("minecraft:entity.fishing_bobber.throw", SoundSourceNeutral, spawnX, spawnY, spawnZ, 0.5, 0.4, 0))
 	}
+	s.RecordItemUsed(session, FishingRodItemID, 1)
+	s.EmitVibration(VibrationEvent{
+		Dimension:     dim,
+		Type:          GameEventProjectileShoot,
+		X:             snap.X,
+		Y:             snap.Y,
+		Z:             snap.Z,
+		Player:        session,
+		Sneaking:      session.IsSneaking(),
+		BlockOrItemID: FishingRodItemID,
+	})
 	return id
 }
 
@@ -557,11 +589,12 @@ func (s *Server) retrieveFishingBobber(session *PlayerSession, rodSlot int, rodS
 		}
 	} else if bobberCopy.NibbleTicks > 0 {
 		luck := PlayerFishingLuck(session, bobberCopy.LuckOfTheSea)
-		isJungle := s.IsJungleFishingAt(int(math.Floor(bx)), int(math.Floor(by)), int(math.Floor(bz)))
+		isJungle := s.IsJungleFishingInDim(dim, int(math.Floor(bx)), int(math.Floor(by)), int(math.Floor(bz)))
 		drop := RollFishingLoot(rng, luck, bobberCopy.OpenWater, isJungle)
 		ft.mu.Lock()
 		ft.lastCatch[session] = drop
 		ft.mu.Unlock()
+		s.RecordFishCaught(session)
 		s.TriggerFishingRodHooked(session)
 		if !drop.Stack.IsEmpty() {
 			itemEntID, itemEnt := s.SpawnItemEntityInDimension(dim, bx, by, bz, drop.Stack)
@@ -605,8 +638,26 @@ func (s *Server) retrieveFishingBobber(session *PlayerSession, rodSlot int, rodS
 	}
 
 	if reelDamage > 0 && !rodStack.IsEmpty() {
-		s.DamagePlayerItemWithRand(session, rodSlot, reelDamage, rng)
+		if broke := s.DamagePlayerItemWithRand(session, rodSlot, reelDamage, rng); broke {
+			s.RecordItemBroken(session, FishingRodItemID)
+			pCX := int32(int64(math.Floor(snap.X)) >> 4)
+			pCZ := int32(int64(math.Floor(snap.Z)) >> 4)
+			s.BroadcastDimensionChunk(dim, pCX, pCZ, PlaySoundPacketID,
+				EncodeSoundPacket("minecraft:entity.item.break", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.8, 1.0, 0))
+		}
 	}
+
+	s.RecordItemUsed(session, FishingRodItemID, 1)
+	s.EmitVibration(VibrationEvent{
+		Dimension:     dim,
+		Type:          GameEventItemInteractFinish,
+		X:             snap.X,
+		Y:             snap.Y,
+		Z:             snap.Z,
+		Player:        session,
+		Sneaking:      session.IsSneaking(),
+		BlockOrItemID: FishingRodItemID,
+	})
 
 	cpX := int32(int64(math.Floor(bx)) >> 4)
 	cpZ := int32(int64(math.Floor(bz)) >> 4)
@@ -893,16 +944,28 @@ func materializeFishingLootEntry(rng *rand.Rand, category FishingLootCategory, e
 }
 
 // IsOpenWaterFishingAt checks the 5x4x5 volume around (x, y, z) (dx in -2..2,
-// dy in -1..2, dz in -2..2) matching vanilla 26.1.2 FishingHook.calculateOpenWater:
+// dy in -1..2, dz in -2..2) in the Overworld matching vanilla 26.1.2 FishingHook.calculateOpenWater:
 //   - Each horizontal 5x1x5 layer must consist uniformly of either water blocks
 //     (INSIDE_WATER) or air/lily_pad blocks (ABOVE_WATER) with no solid/other blocks.
 //   - Layer dy = -1 must be INSIDE_WATER, and no INSIDE_WATER layer may appear
 //     above an ABOVE_WATER layer.
 func (s *Server) IsOpenWaterFishingAt(x, y, z int) bool {
-	if s == nil || s.chunks == nil {
+	return s.IsOpenWaterFishingInDim(world.DimensionOverworld, x, y, z)
+}
+
+// IsOpenWaterFishingInDim checks the 5x4x5 open-water volume around (x, y, z) in dim.
+func (s *Server) IsOpenWaterFishingInDim(dim string, x, y, z int) bool {
+	if s == nil {
 		return true
 	}
-	return CalculateOpenWaterAt(s.chunks, x, y, z)
+	cache := s.DimensionChunks(world.NormalizeDimension(dim))
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return true
+	}
+	return CalculateOpenWaterAt(cache, x, y, z)
 }
 
 type openWaterLayerType int8
@@ -977,15 +1040,17 @@ func classifyOpenWaterBlock(state uint16) openWaterLayerType {
 			return openWaterInvalid
 		}
 		return openWaterInside
-	case "minecraft:bubble_column":
+	case "minecraft:bubble_column",
+		"minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:seagrass", "minecraft:tall_seagrass":
 		return openWaterInside
 	default:
 		return openWaterInvalid
 	}
 }
 
-// CanSeeSkyAt reports whether the column at (x, y, z) has an unobstructed view
-// of the sky (either sky light == 15 or no non-air blocks above y up to the surface).
+// CanSeeSkyAt reports whether the column at (x, y, z) in the Overworld has an
+// unobstructed view of the sky (either sky light == 15 or no non-air blocks above y up to the surface).
 func (s *Server) CanSeeSkyAt(x, y, z int) bool {
 	if s == nil || s.chunks == nil {
 		return true
@@ -999,6 +1064,14 @@ func (s *Server) CanSeeSkyAt(x, y, z int) bool {
 		return true
 	}
 	return y >= topY
+}
+
+// CanSeeSkyInDim reports whether (x, y, z) in dim has an unobstructed view of the sky.
+func (s *Server) CanSeeSkyInDim(dim string, x, y, z int) bool {
+	if world.NormalizeDimension(dim) != world.DimensionOverworld {
+		return false
+	}
+	return s.CanSeeSkyAt(x, y, z)
 }
 
 // ComputeFishingBiteSpeed returns the per-tick countdown speed (0, 1, or 2) for
@@ -1082,10 +1155,11 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		return
 	}
 
+	dim := world.NormalizeDimension(st.Dimension)
 	bx := int(math.Floor(ent.X))
 	by := int(math.Floor(ent.Y))
 	bz := int(math.Floor(ent.Z))
-	inWater := s.isWaterBlockAt(bx, by, bz)
+	inWater := s.isWaterBlockInDim(dim, bx, by, bz)
 
 	var (
 		nextX             = ent.X
@@ -1094,9 +1168,11 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		nextOnGround      = ent.OnGround
 		broadcastData     bool
 		broadcastBiteEvt  bool
+		enteredWater      bool
+		approachParticle  bool
+		wakeX, wakeY, wakeZ float64
 		newHookedEntityID = st.HookedEntityID
 		newBiting         = st.Biting
-		dim               = st.Dimension
 	)
 
 	switch st.State {
@@ -1140,12 +1216,13 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 			st.VZ *= 0.3
 			nextOnGround = false
 			st.OnGround = false
+			enteredWater = true
 			break
 		}
 		candBX := int(math.Floor(candX))
 		candBY := int(math.Floor(candY))
 		candBZ := int(math.Floor(candZ))
-		if s.isWaterBlockAt(candBX, candBY, candBZ) {
+		if s.isWaterBlockInDim(dim, candBX, candBY, candBZ) {
 			nextX, nextY, nextZ = candX, candY, candZ
 			st.State = FishHookStateBobbing
 			st.VX *= 0.3
@@ -1153,7 +1230,8 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 			st.VZ *= 0.3
 			nextOnGround = false
 			st.OnGround = false
-		} else if s.chunks != nil && isSolidGroundBlock(s.chunks.GetBlock(candBX, candBY, candBZ)) {
+			enteredWater = true
+		} else if cache := s.DimensionChunks(dim); cache != nil && isSolidGroundBlock(cache.GetBlock(candBX, candBY, candBZ)) {
 			_, _ = s.OnProjectileBlockImpact(dim, candBX, candBY, candBZ, ent.X, ent.Y, ent.Z, candX, candY, candZ, entityID, EntityTypeFishingBobber)
 			nextOnGround = true
 			st.OnGround = true
@@ -1194,7 +1272,7 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		if st.VX != 0 || st.VZ != 0 {
 			driftX := ent.X + st.VX
 			driftZ := ent.Z + st.VZ
-			if s.isWaterBlockAt(int(math.Floor(driftX)), by, int(math.Floor(driftZ))) {
+			if s.isWaterBlockInDim(dim, int(math.Floor(driftX)), by, int(math.Floor(driftZ))) {
 				nextX = driftX
 				nextZ = driftZ
 				bx = int(math.Floor(nextX))
@@ -1205,31 +1283,43 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		}
 
 		// Buoyancy: if submerged under another water block above, float upward into the surface block.
-		if s.isWaterBlockAt(bx, by+1, bz) {
+		if s.isWaterBlockInDim(dim, bx, by+1, bz) {
 			st.VY = (st.VY + 0.08) * 0.6
 			nextY = ent.Y + st.VY
 			by = int(math.Floor(nextY))
 		}
 
-		st.OpenWater = s.IsOpenWaterFishingAt(bx, by, bz)
+		st.OpenWater = s.IsOpenWaterFishingInDim(dim, bx, by, bz)
 
 		prevBiting := st.Biting
-		s.stepCatchingFishLocked(st, bx, by, bz, rng)
+		s.stepCatchingFishLocked(st, dim, bx, by, bz, rng)
 		newBiting = st.Biting
+		if st.TimeUntilHooked > 0 && !newBiting {
+			rad := float64(st.FishAngle) * (math.Pi / 180.0)
+			dist := float64(st.TimeUntilHooked) * 0.1
+			wx := nextX + math.Sin(rad)*dist
+			wy := float64(by) + 1.0
+			wz := nextZ + math.Cos(rad)*dist
+			if s.isWaterBlockInDim(dim, int(math.Floor(wx)), by, int(math.Floor(wz))) {
+				approachParticle = true
+				wakeX, wakeY, wakeZ = wx, wy, wz
+			}
+		}
 		if newBiting != prevBiting {
 			broadcastData = true
 			if newBiting {
 				broadcastBiteEvt = true
 				st.VY = -0.2
 			}
-		} else if !newBiting && !s.isWaterBlockAt(bx, by+1, bz) {
+		} else if !newBiting && !s.isWaterBlockInDim(dim, bx, by+1, bz) {
 			st.VY = 0
 		}
 	}
 
-	vxFixed := clampVelocityComponent(st.VX)
-	vyFixed := clampVelocityComponent(st.VY)
-	vzFixed := clampVelocityComponent(st.VZ)
+	curVX, curVY, curVZ := st.VX, st.VY, st.VZ
+	vxFixed := clampVelocityComponent(curVX)
+	vyFixed := clampVelocityComponent(curVY)
+	vzFixed := clampVelocityComponent(curVZ)
 	ft.mu.Unlock()
 
 	s.entities.Update(entityID, func(e *world.Entity) {
@@ -1242,9 +1332,24 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		e.OnGround = nextOnGround
 	})
 
+	cpX := int32(int64(math.Floor(nextX)) >> 4)
+	cpZ := int32(int64(math.Floor(nextZ)) >> 4)
+	if enteredWater {
+		s.EmitVibration(VibrationEvent{
+			Dimension:     dim,
+			Type:          GameEventSplash,
+			X:             nextX,
+			Y:             nextY,
+			Z:             nextZ,
+			Player:        owner,
+			BlockOrItemID: EntityTypeFishingBobber,
+		})
+	}
+	if approachParticle {
+		s.BroadcastDimensionChunk(dim, cpX, cpZ, PlayLevelParticlesCB,
+			EncodeGenericParticlePacket("minecraft:bubble", wakeX, wakeY, wakeZ, 0.05, 0.05, 0.05, 0.02, 1, false))
+	}
 	if broadcastData || broadcastBiteEvt {
-		cpX := int32(int64(math.Floor(nextX)) >> 4)
-		cpZ := int32(int64(math.Floor(nextZ)) >> 4)
 		if broadcastData {
 			s.BroadcastDimensionChunk(dim, cpX, cpZ, PlaySetEntityDataCB,
 				EncodeFishingBobberDataPacket(entityID, newHookedEntityID, newBiting))
@@ -1252,16 +1357,29 @@ func (s *Server) tickSingleFishingBobber(entityID int32, rng *rand.Rand) {
 		if broadcastBiteEvt {
 			s.BroadcastDimensionChunk(dim, cpX, cpZ, protocol.PlayEntityEvent,
 				EncodeEntityEventPacket(entityID, EntityEventFishingHookReel))
+			s.BroadcastDimensionChunk(dim, cpX, cpZ, protocol.PlaySetEntityMotion,
+				EncodeSetEntityMotionPacket(entityID, curVX, curVY, curVZ))
 			s.BroadcastDimensionChunk(dim, cpX, cpZ, PlaySoundPacketID,
 				EncodeSoundPacket("minecraft:entity.fishing_bobber.splash", SoundSourceNeutral, nextX, nextY, nextZ, 0.25, 1.0, 0))
+			s.BroadcastDimensionChunk(dim, cpX, cpZ, PlayLevelParticlesCB,
+				EncodeGenericParticlePacket("minecraft:bubble", nextX, float64(by)+1.0, nextZ, 0.2, 0.1, 0.2, 0.1, 6, false))
+			s.EmitVibration(VibrationEvent{
+				Dimension:     dim,
+				Type:          GameEventSplash,
+				X:             nextX,
+				Y:             nextY,
+				Z:             nextZ,
+				Player:        owner,
+				BlockOrItemID: EntityTypeFishingBobber,
+			})
 		}
 	}
 }
 
 // stepCatchingFishLocked implements vanilla 26.1.2 FishingHook.catchingFish.
 // Caller must hold ft.mu.
-func (s *Server) stepCatchingFishLocked(st *FishingBobberState, bx, by, bz int, rng *rand.Rand) {
-	openSky := s.CanSeeSkyAt(bx, by+1, bz)
+func (s *Server) stepCatchingFishLocked(st *FishingBobberState, dim string, bx, by, bz int, rng *rand.Rand) {
+	openSky := s.CanSeeSkyInDim(dim, bx, by+1, bz)
 	speed := ComputeFishingBiteSpeed(s.IsRaining(), openSky, rng)
 
 	if st.NibbleTicks > 0 {
@@ -1333,11 +1451,32 @@ func (s *Server) shouldStopFishing(owner *PlayerSession, bobber *world.Entity, d
 }
 
 func (s *Server) isWaterBlockAt(x, y, z int) bool {
-	if s == nil || s.chunks == nil {
+	return s.isWaterBlockInDim(world.DimensionOverworld, x, y, z)
+}
+
+func (s *Server) isWaterBlockInDim(dim string, x, y, z int) bool {
+	if s == nil {
 		return false
 	}
-	state := s.chunks.GetBlock(x, y, z)
-	return state == world.StateWater || world.BlockName(state) == "minecraft:water" || world.BlockName(state) == "minecraft:bubble_column"
+	cache := s.DimensionChunks(world.NormalizeDimension(dim))
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return false
+	}
+	state := cache.GetBlock(x, y, z)
+	if state == world.StateWater || world.IsWaterlogged(state) {
+		return true
+	}
+	switch world.BlockName(state) {
+	case "minecraft:water", "minecraft:bubble_column",
+		"minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:seagrass", "minecraft:tall_seagrass":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) findHookableEntityAlongSegment(bobberID, ownerEntityID int32, dim string, x0, y0, z0, x1, y1, z1 float64) int32 {
