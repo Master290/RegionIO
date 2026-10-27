@@ -165,3 +165,154 @@ func TestFireSpreadBurnOutDoFireTickAndTNTIgnition(t *testing.T) {
 		t.Fatal("expected primed TNT block to be replaced with air")
 	}
 }
+
+func TestFireDirectionalAttachmentLavaSpreadAndHumidBiomes(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 10
+
+	oakPlanks, _ := BlockStateByName("minecraft:oak_planks", nil)
+	oakLeaves, _ := BlockStateByName("minecraft:oak_leaves", nil)
+	eyeblossom, _ := BlockStateByName("minecraft:open_eyeblossom", nil)
+	strippedCrimson, _ := BlockStateByName("minecraft:stripped_crimson_stem", nil)
+
+	if ig, br := BlockFlammability(eyeblossom); ig != 60 || br != 100 {
+		t.Fatalf("open_eyeblossom flammability = (%d, %d), want (60, 100)", ig, br)
+	}
+	if ig, br := BlockFlammability(strippedCrimson); ig != 0 || br != 0 {
+		t.Fatalf("stripped_crimson_stem flammability = (%d, %d), want (0, 0)", ig, br)
+	}
+
+	// 1. Fire on top of flammable oak_planks has all directional properties false.
+	c.SetBlock(10, y-1, 10, oakPlanks)
+	c.SetBlock(10, y, 9, oakPlanks)
+	stFloor := c.ResolveFireBlockStateAt(10, y, 10, 3)
+	propsFloor := BlockProperties(stFloor)
+	if propsFloor["north"] != "false" || propsFloor["up"] != "false" || propsFloor["age"] != "3" {
+		t.Fatalf("expected floor fire to have directional props false and age=3, got %+v", propsFloor)
+	}
+
+	// 2. Fire in mid-air (air below) attaches to adjacent flammable blocks (up and north).
+	c.SetBlock(20, y-1, 20, StateAir)
+	c.SetBlock(20, y+1, 20, oakLeaves)
+	c.SetBlock(20, y, 19, oakPlanks)
+	stAir := c.ResolveFireBlockStateAt(20, y, 20, 5)
+	propsAir := BlockProperties(stAir)
+	if propsAir["up"] != "true" || propsAir["north"] != "true" || propsAir["south"] != "false" || propsAir["age"] != "5" {
+		t.Fatalf("expected mid-air fire to have up=true north=true south=false age=5, got %+v", propsAir)
+	}
+
+	// 3. Rain extinguish chance and humid biomes.
+	if got := FireRainExtinguishChance(0); got < 0.199 || got > 0.201 {
+		t.Fatalf("FireRainExtinguishChance(0) = %v, want 0.20", got)
+	}
+	if got := FireRainExtinguishChance(15); got < 0.649 || got > 0.651 {
+		t.Fatalf("FireRainExtinguishChance(15) = %v, want 0.65", got)
+	}
+	if !IsIncreasedFireBurnoutBiome("minecraft:mangrove_swamp") || IsIncreasedFireBurnoutBiome("minecraft:plains") {
+		t.Fatal("unexpected IsIncreasedFireBurnoutBiome classification")
+	}
+
+	// 4. Lava random tick fire spread respects doFireTick and ignites nearby flammable blocks.
+	c.SetBlock(40, y, 40, StateLava)
+	for dx := -1; dx <= 1; dx++ {
+		for dz := -1; dz <= 1; dz++ {
+			if dx == 0 && dz == 0 {
+				continue
+			}
+			c.SetBlock(40+dx, y, 40+dz, oakPlanks)
+			c.SetBlock(40+dx, y+1, 40+dz, StateAir)
+		}
+	}
+	c.SetDoFireTick(false)
+	for i := 0; i < 20; i++ {
+		if ignited, _ := c.RandomTickLavaAt(40, y, 40, rand.New(rand.NewSource(int64(i)))); ignited {
+			t.Fatal("expected lava not to ignite nearby blocks when doFireTick=false")
+		}
+	}
+	c.SetDoFireTick(true)
+	ignitedAny := false
+	for i := 0; i < 30; i++ {
+		if ignited, _ := c.RandomTickLavaAt(40, y, 40, rand.New(rand.NewSource(int64(100+i)))); ignited {
+			ignitedAny = true
+			break
+		}
+	}
+	if !ignitedAny {
+		t.Fatal("expected lava random tick to ignite air above adjacent oak_planks when doFireTick=true")
+	}
+}
+
+func TestWorldSideNetherPortalIgnitionAndCollapse(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 5
+	obsidian, _ := BlockStateByName("minecraft:obsidian", nil)
+	cryingObsidian, _ := BlockStateByName("minecraft:crying_obsidian", nil)
+	soulSoil, _ := BlockStateByName("minecraft:soul_soil", nil)
+
+	// Build a standard 2x3 interior X-axis obsidian portal frame at x=10..13, y..y+4, z=10.
+	buildPortalFrameX := func(baseX, baseY, baseZ int, cornerAndFrame uint16) {
+		for dx := 0; dx <= 3; dx++ {
+			for dy := 0; dy <= 4; dy++ {
+				if dx == 0 || dx == 3 || dy == 0 || dy == 4 {
+					c.SetBlock(baseX+dx, baseY+dy, baseZ, cornerAndFrame)
+				} else {
+					c.SetBlock(baseX+dx, baseY+dy, baseZ, StateAir)
+				}
+			}
+		}
+	}
+
+	// 1. Placing fire inside the obsidian frame in the Overworld immediately lights all 6 portal blocks.
+	buildPortalFrameX(10, y, 10, obsidian)
+	fire0 := FireBlockState(0, false, false, false, false, false)
+	c.ApplyBlockWithUpdates(11, y+1, 10, fire0)
+	for dx := 1; dx <= 2; dx++ {
+		for dy := 1; dy <= 3; dy++ {
+			st := c.GetBlock(10+dx, y+dy, 10)
+			if !IsNetherPortalState(st) || BlockProperties(st)["axis"] != "x" {
+				t.Fatalf("expected minecraft:nether_portal[axis=x] at (%d,%d,10), got %s (%+v)",
+					10+dx, y+dy, BlockName(st), BlockProperties(st))
+			}
+		}
+	}
+	if len(c.PortalPOIs()) < 6 {
+		t.Fatalf("expected at least 6 registered Portal POIs after lighting portal, got %d", len(c.PortalPOIs()))
+	}
+
+	// 2. Breaking one obsidian frame block collapses all 6 nether_portal blocks to air and clears POIs.
+	c.BreakBlockWithUpdates(10, y+2, 10)
+	for dx := 1; dx <= 2; dx++ {
+		for dy := 1; dy <= 3; dy++ {
+			if c.GetBlock(10+dx, y+dy, 10) != StateAir {
+				t.Fatalf("expected portal block at (%d,%d,10) to collapse to air when obsidian frame broke", 10+dx, y+dy)
+			}
+		}
+	}
+	if len(c.PortalPOIs()) != 0 {
+		t.Fatalf("expected Portal POIs to be unregistered on portal collapse, got %d", len(c.PortalPOIs()))
+	}
+
+	// 3. Crying obsidian frame cannot light a Nether portal.
+	buildPortalFrameX(20, y, 10, cryingObsidian)
+	if _, _, lit := c.TryLightNetherPortalAt(21, y+1, 10); lit {
+		t.Fatal("expected crying_obsidian frame not to light a Nether portal")
+	}
+
+	// 4. In the_end, placing fire inside a valid obsidian frame does not light a Nether portal.
+	buildPortalFrameX(30, y, 10, obsidian)
+	c.SetFireDimension(DimensionEnd)
+	c.ApplyBlockWithUpdates(31, y+1, 10, fire0)
+	if IsNetherPortalState(c.GetBlock(31, y+1, 10)) {
+		t.Fatal("expected Nether portal not to light in minecraft:the_end")
+	}
+	c.SetFireDimension(DimensionOverworld)
+
+	// 5. Soul fire placed on a soul_soil bottom frame block still lights the portal if the rest is valid,
+	// or soul_fire placed inside an obsidian frame lights the portal.
+	buildPortalFrameX(40, y, 10, obsidian)
+	c.ApplyBlockWithUpdates(41, y+1, 10, SoulFireBlockState())
+	if !IsNetherPortalState(c.GetBlock(41, y+1, 10)) || !IsNetherPortalState(c.GetBlock(42, y+3, 10)) {
+		t.Fatal("expected soul_fire placed inside obsidian frame to light Nether portal")
+	}
+	_ = soulSoil
+}

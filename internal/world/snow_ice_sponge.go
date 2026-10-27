@@ -17,6 +17,10 @@ const (
 
 	// MaxFrostedIceAge is the maximum age (3) of `minecraft:frosted_ice` before it melts into water.
 	MaxFrostedIceAge = 3
+	// FrostedIceMinTickDelay is the minimum scheduled tick delay (20 ticks) for `minecraft:frosted_ice`.
+	FrostedIceMinTickDelay = 20
+	// FrostedIceMaxTickDelay is the maximum scheduled tick delay (40 ticks) for `minecraft:frosted_ice`.
+	FrostedIceMaxTickDelay = 40
 
 	// PowderSnowMinFreezeTicks is the vanilla TICKS_REQUIRED_TO_FREEZE (140 game ticks = 7s).
 	PowderSnowMinFreezeTicks = 140
@@ -24,6 +28,14 @@ const (
 	PowderSnowFreezeDamageIntervalTicks = 40
 	// PowderSnowFreezeDamage is the vanilla freeze damage (1.0 = half a heart) dealt every 40 ticks.
 	PowderSnowFreezeDamage float32 = 1.0
+	// PowderSnowFireSensitiveFreezeDamage is the freeze damage (5.0 = 2.5 hearts) dealt to #freeze_hurts_extra_types (blaze, strider, magma_cube).
+	PowderSnowFireSensitiveFreezeDamage float32 = 5.0
+	// PowderSnowHorizontalMultiplier is the horizontal movement multiplier (0.9) inside powder_snow.
+	PowderSnowHorizontalMultiplier float64 = 0.9
+	// PowderSnowVerticalMultiplier is the vertical movement multiplier (1.5) inside powder_snow.
+	PowderSnowVerticalMultiplier float64 = 1.5
+	// PowderSnowFallBreakCollisionThreshold is the fallDistance (> 2.5) at which powder_snow provides a 0.9-block landing shelf.
+	PowderSnowFallBreakCollisionThreshold float64 = 2.5
 
 	// SpongeMaxAbsorbDepth is the maximum BFS depth (6) for sponge water absorption.
 	SpongeMaxAbsorbDepth = 6
@@ -244,6 +256,73 @@ func (c *Cache) CountAdjacentFrostedIce(x, y, z int) int {
 	return count
 }
 
+// MaxLocalRawBrightnessAt returns the maximum raw brightness (max of sky light
+// and block light, 0..15) at (x, y, z) and its 6 adjacent neighbors, matching
+// vanilla LevelReader.getMaxLocalRawBrightness.
+func (c *Cache) MaxLocalRawBrightnessAt(x, y, z int) int {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return 0
+	}
+	sky, blk := c.EnsureLightAt(x, y, z)
+	best := int(sky)
+	if int(blk) > best {
+		best = int(blk)
+	}
+	for _, off := range sixNeighborOffsets {
+		ny := y + off[1]
+		if ny < c.minY() || ny >= c.maxY() {
+			continue
+		}
+		nSky, nBlk := c.EnsureLightAt(x+off[0], ny, z+off[2])
+		if int(nSky) > best {
+			best = int(nSky)
+		}
+		if int(nBlk) > best {
+			best = int(nBlk)
+		}
+	}
+	return best
+}
+
+// CanFrostedIceMeltByLightAt reports whether the raw brightness at (x, y, z)
+// exceeds `11 - age - lightOpacity(state)`, matching vanilla FrostedIceBlock.tick.
+func (c *Cache) CanFrostedIceMeltByLightAt(x, y, z, age int) bool {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false
+	}
+	state := c.GetBlock(x, y, z)
+	threshold := 11 - age - int(lightOpacity(state))
+	return c.MaxLocalRawBrightnessAt(x, y, z) > threshold
+}
+
+// ScheduleFrostedIceTickAt schedules a melting block update on `minecraft:frosted_ice`
+// at (x, y, z) in `20..40` game ticks (`Mth.nextInt(random, 20, 40)`).
+func (c *Cache) ScheduleFrostedIceTickAt(x, y, z int, rng *rand.Rand) int {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return 0
+	}
+	delay := FrostedIceMinTickDelay
+	if rng != nil {
+		delay += rng.Intn(FrostedIceMaxTickDelay - FrostedIceMinTickDelay + 1)
+	} else {
+		delay += int(uint(x*3129871^z*116129781^y) % uint(FrostedIceMaxTickDelay-FrostedIceMinTickDelay+1))
+	}
+	c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
+	return delay
+}
+
+func (c *Cache) stepFrostedIceUpdate(x, y, z int, res *BlockUpdateResult) {
+	if c == nil || !IsFrostedIceBlock(c.GetBlock(x, y, z)) {
+		return
+	}
+	fs := c.farmingState()
+	fs.mu.Lock()
+	seed := fs.rng.Int63()
+	fs.mu.Unlock()
+	_, upd := c.StepFrostedIceAt(c.FireDimension(), x, y, z, rand.New(rand.NewSource(seed)))
+	res.merge(upd)
+}
+
 func (c *Cache) slightlyMeltFrostedIceAt(dim string, x, y, z int, res *BlockUpdateResult) bool {
 	state := c.GetBlock(x, y, z)
 	age, ok := FrostedIceAge(state)
@@ -264,8 +343,10 @@ func (c *Cache) slightlyMeltFrostedIceAt(dim string, x, y, z int, res *BlockUpda
 
 // StepFrostedIceAt executes one melting step on a `minecraft:frosted_ice` block
 // at (x, y, z), matching vanilla `FrostedIceBlock.tick`:
-//   - Increments `age` (0 -> 1 -> 2 -> 3 -> water) when either a 1-in-3 roll
+//   - Increments `age` (0 -> 1 -> 2 -> 3 -> water) when brightness is sufficient
+//     (`MaxLocalRawBrightnessAt > 11 - age - opacity`) and either a 1-in-3 roll
 //     succeeds or fewer than 4 neighbors are `frosted_ice`.
+//   - Schedules the next 20..40 tick melt update when the block remains `frosted_ice`.
 //   - When a `frosted_ice` block reaches age 3 and melts into water, cascades
 //     `slightlyMelt` to any adjacent `frosted_ice` with fewer than 2 `frosted_ice` neighbors.
 func (c *Cache) StepFrostedIceAt(dim string, x, y, z int, rng *rand.Rand) (changed bool, res BlockUpdateResult) {
@@ -281,14 +362,17 @@ func (c *Cache) StepFrostedIceAt(dim string, x, y, z int, rng *rand.Rand) (chang
 		rng = rand.New(rand.NewSource(int64(x*3129871 ^ z*116129781 ^ y)))
 	}
 	adj := c.CountAdjacentFrostedIce(x, y, z)
-	if rng.Intn(3) != 0 && adj >= 4 {
+	if (rng.Intn(3) != 0 && adj >= 4) || !c.CanFrostedIceMeltByLightAt(x, y, z, age) {
+		c.ScheduleFrostedIceTickAt(x, y, z, rng)
 		return false, res
 	}
 	wasMax := age >= MaxFrostedIceAge
 	if !c.slightlyMeltFrostedIceAt(dim, x, y, z, &res) {
 		return false, res
 	}
-	if wasMax {
+	if !wasMax {
+		c.ScheduleFrostedIceTickAt(x, y, z, rng)
+	} else {
 		for _, off := range sixNeighborOffsets {
 			nx, ny, nz := x+off[0], y+off[1], z+off[2]
 			if ny < MinY || ny >= MinY+WorldHeight {
@@ -296,6 +380,9 @@ func (c *Cache) StepFrostedIceAt(dim string, x, y, z int, rng *rand.Rand) (chang
 			}
 			if IsFrostedIceBlock(c.GetBlock(nx, ny, nz)) && c.CountAdjacentFrostedIce(nx, ny, nz) < 2 {
 				c.slightlyMeltFrostedIceAt(dim, nx, ny, nz, &res)
+				if IsFrostedIceBlock(c.GetBlock(nx, ny, nz)) {
+					c.ScheduleFrostedIceTickAt(nx, ny, nz, rng)
+				}
 			}
 		}
 	}
@@ -304,7 +391,8 @@ func (c *Cache) StepFrostedIceAt(dim string, x, y, z int, rng *rand.Rand) (chang
 
 // ApplyFrostWalkerAround freezes exposed source water blocks at `y-1` within
 // horizontal Euclidean radius `min(16, 2 + level)` around `(x, y, z)` into
-// `minecraft:frosted_ice[age=0]`, matching the vanilla Frost Walker enchantment.
+// `minecraft:frosted_ice[age=0]` and schedules each block's initial 20..40 tick
+// melt update, matching the vanilla Frost Walker enchantment.
 func (c *Cache) ApplyFrostWalkerAround(x, y, z int, level int) (placed int, res BlockUpdateResult) {
 	if c == nil || level <= 0 || y <= MinY || y >= MinY+WorldHeight {
 		return 0, res
@@ -331,6 +419,7 @@ func (c *Cache) ApplyFrostWalkerAround(x, y, z int, level int) (placed int, res 
 			if kind, lvl, ok := isStandaloneFluidBlock(below); ok && kind == fluidWater && lvl == 0 {
 				if applied, upd := c.ApplyBlockWithUpdates(nx, y-1, nz, frosted0); applied {
 					res.merge(upd)
+					c.ScheduleFrostedIceTickAt(nx, y-1, nz, nil)
 					placed++
 				}
 			}
@@ -346,6 +435,25 @@ func IsPowderSnowBlock(state uint16) bool {
 	return state == StatePowderSnow || isBlockNamed(state, "minecraft:powder_snow")
 }
 
+func normalizeEntityIDForPowderSnow(entityType string) string {
+	id := strings.ToLower(strings.TrimSpace(entityType))
+	if id != "" && !strings.Contains(id, ":") {
+		id = "minecraft:" + id
+	}
+	return id
+}
+
+// IsPowderSnowWalkableMob reports whether `entityType` belongs to vanilla
+// `#minecraft:powder_snow_walkable_mobs` (`rabbit`, `endermite`, `silverfish`, `fox`).
+func IsPowderSnowWalkableMob(entityType string) bool {
+	switch normalizeEntityIDForPowderSnow(entityType) {
+	case "minecraft:rabbit", "minecraft:endermite", "minecraft:silverfish", "minecraft:fox":
+		return true
+	default:
+		return false
+	}
+}
+
 // CanEntityWalkOnPowderSnow reports whether an entity wearing `bootsItemID` on
 // its feet can walk on top of `minecraft:powder_snow` without sinking (true for
 // `minecraft:leather_boots`).
@@ -357,9 +465,56 @@ func CanEntityWalkOnPowderSnow(bootsItemID string) bool {
 	return id == "minecraft:leather_boots"
 }
 
+// CanEntityOrMobWalkOnPowderSnow reports whether an entity of `entityType`
+// wearing `bootsItemID` can walk on top of `minecraft:powder_snow` without
+// sinking (true for `#powder_snow_walkable_mobs` or `minecraft:leather_boots`).
+func CanEntityOrMobWalkOnPowderSnow(entityType, bootsItemID string) bool {
+	return IsPowderSnowWalkableMob(entityType) || CanEntityWalkOnPowderSnow(bootsItemID)
+}
+
+// CanStandOnPowderSnowSurface reports whether an entity at `entityFeetY` can
+// stand on the top surface of a `minecraft:powder_snow` block at `blockY`
+// (requires `CanEntityOrMobWalkOnPowderSnow`, `!descending`, and `entityFeetY >= blockY + 1`).
+func CanStandOnPowderSnowSurface(entityType, bootsItemID string, entityFeetY float64, blockY int, descending bool) bool {
+	if descending || !CanEntityOrMobWalkOnPowderSnow(entityType, bootsItemID) {
+		return false
+	}
+	return entityFeetY >= float64(blockY)+0.999
+}
+
+// ApplyPowderSnowMovement applies vanilla `PowderSnowBlock.entityInside`
+// movement slowing (`0.9` horizontal multiplier, `1.5` vertical damping) and
+// signals that `fallDistance` is negated (`negateFallDamage == true`).
+func ApplyPowderSnowMovement(vx, vy, vz float64) (nvx, nvy, nvz float64, negateFallDamage bool) {
+	return vx * PowderSnowHorizontalMultiplier, vy / PowderSnowVerticalMultiplier, vz * PowderSnowHorizontalMultiplier, true
+}
+
+// IsFreezeImmuneEntityType reports whether `entityType` belongs to vanilla
+// `#minecraft:freeze_immune_entity_types` (`stray`, `polar_bear`, `snow_golem`, `wither`).
+func IsFreezeImmuneEntityType(entityType string) bool {
+	switch normalizeEntityIDForPowderSnow(entityType) {
+	case "minecraft:stray", "minecraft:polar_bear", "minecraft:snow_golem", "minecraft:wither":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsFreezeHurtsExtraEntityType reports whether `entityType` belongs to vanilla
+// `#minecraft:freeze_hurts_extra_types` (`strider`, `blaze`, `magma_cube`),
+// which take `5.0` freeze damage instead of `1.0`.
+func IsFreezeHurtsExtraEntityType(entityType string) bool {
+	switch normalizeEntityIDForPowderSnow(entityType) {
+	case "minecraft:strider", "minecraft:blaze", "minecraft:magma_cube":
+		return true
+	default:
+		return false
+	}
+}
+
 // IsEntityFreezeImmuneByArmor reports whether wearing any of the 4 armor slots
 // grants immunity to `minecraft:powder_snow` freezing (true if any piece is
-// leather armor).
+// leather armor, including `leather_horse_armor`).
 func IsEntityFreezeImmuneByArmor(helmetID, chestplateID, leggingsID, bootsID string) bool {
 	for _, raw := range []string{helmetID, chestplateID, leggingsID, bootsID} {
 		id := strings.ToLower(strings.TrimSpace(raw))
@@ -368,11 +523,49 @@ func IsEntityFreezeImmuneByArmor(helmetID, chestplateID, leggingsID, bootsID str
 		}
 		switch id {
 		case "minecraft:leather_helmet", "minecraft:leather_chestplate",
-			"minecraft:leather_leggings", "minecraft:leather_boots":
+			"minecraft:leather_leggings", "minecraft:leather_boots",
+			"minecraft:leather_horse_armor":
 			return true
 		}
 	}
 	return false
+}
+
+// IsEntityFreezeImmune reports whether an entity of `entityType` with the given
+// armor slots is immune to `minecraft:powder_snow` freezing.
+func IsEntityFreezeImmune(entityType, helmetID, chestplateID, leggingsID, bootsID string) bool {
+	return IsFreezeImmuneEntityType(entityType) || IsEntityFreezeImmuneByArmor(helmetID, chestplateID, leggingsID, bootsID)
+}
+
+// PowderSnowFreezeDamageForEntity returns the freeze damage dealt every 40 ticks
+// when fully frozen (`0.0` for `#freeze_immune_entity_types`, `5.0` for
+// `#freeze_hurts_extra_types`, and `1.0` otherwise).
+func PowderSnowFreezeDamageForEntity(entityType string) float32 {
+	if IsFreezeImmuneEntityType(entityType) {
+		return 0
+	}
+	if IsFreezeHurtsExtraEntityType(entityType) {
+		return PowderSnowFireSensitiveFreezeDamage
+	}
+	return PowderSnowFreezeDamage
+}
+
+// PowderSnowFrozenPercent returns the normalized freeze progress in `0.0..1.0`
+// (`min(1.0, float32(ticksFrozen) / 140.0)`), matching `Entity.getPercentFrozen`.
+func PowderSnowFrozenPercent(ticksFrozen int) float32 {
+	if ticksFrozen <= 0 {
+		return 0
+	}
+	if ticksFrozen >= PowderSnowMinFreezeTicks {
+		return 1.0
+	}
+	return float32(ticksFrozen) / float32(PowderSnowMinFreezeTicks)
+}
+
+// PowderSnowFrozenSpeedMultiplier returns the movement speed multiplier
+// (`1.0` at 0 ticks down to `0.5` at 140 ticks, matching `LivingEntity.tryAddFrost`).
+func PowderSnowFrozenSpeedMultiplier(ticksFrozen int) float64 {
+	return 1.0 - 0.5*float64(PowderSnowFrozenPercent(ticksFrozen))
 }
 
 // StepPowderSnowFreezing computes the next `TicksFrozen` (0..140) for an entity
@@ -410,6 +603,44 @@ func (c *Cache) ExtinguishBurningEntityInPowderSnowAt(x, y, z int, entityOnFire,
 	}
 	applied, upd := c.ApplyBlockWithUpdates(x, y, z, StateAir)
 	return applied, upd
+}
+
+// PlacePowderSnowAt places a `minecraft:powder_snow` block at (x, y, z) (as if
+// emptying a `minecraft:powder_snow_bucket`) when the target cell is air or
+// fluid-replaceable.
+func (c *Cache) PlacePowderSnowAt(x, y, z int) (placed bool, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	cur := c.GetBlock(x, y, z)
+	if IsPowderSnowBlock(cur) {
+		return false, res
+	}
+	if !isAirState(cur) {
+		if _, _, standalone := isStandaloneFluidBlock(cur); !standalone && !IsBubbleColumnBlock(cur) && !c.canFluidReplace(x, y, z, fluidWater, cur) {
+			return false, res
+		}
+		c.propagateMultiBlockPartnerBreak(x, y, z, cur, &res)
+	}
+	applied, upd := c.ApplyBlockWithUpdates(x, y, z, StatePowderSnow)
+	res.merge(upd)
+	return applied, res
+}
+
+// PickupPowderSnowAt collects a `minecraft:powder_snow` block at (x, y, z)
+// into a `"minecraft:powder_snow_bucket"`, replacing the block with `StateAir`.
+func (c *Cache) PickupPowderSnowAt(x, y, z int) (bucketItem string, ok bool, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return "", false, res
+	}
+	if !IsPowderSnowBlock(c.GetBlock(x, y, z)) {
+		return "", false, res
+	}
+	applied, upd := c.ApplyBlockWithUpdates(x, y, z, StateAir)
+	if !applied {
+		return "", false, res
+	}
+	return "minecraft:powder_snow_bucket", true, upd
 }
 
 // --- Sponge & Wet Sponge (`minecraft:sponge`, `minecraft:wet_sponge`) ---

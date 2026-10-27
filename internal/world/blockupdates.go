@@ -352,6 +352,7 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 			c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			c.stepComposterUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			c.stepFrostedIceUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateFire:
 			c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		}
@@ -421,6 +422,11 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 		} else if isBlockNamed(oldState, "minecraft:piston") || isBlockNamed(oldState, "minecraft:sticky_piston") {
 			c.ClearPistonRuntimeAt(x, y, z)
 			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+		} else if isBlockNamed(oldState, "minecraft:nether_portal") {
+			c.UnregisterPortalPOI(BlockPos{X: x, Y: y, Z: z})
+		}
+		if isBlockNamed(newState, "minecraft:nether_portal") {
+			c.RegisterPortalPOI(BlockPos{X: x, Y: y, Z: z}, BlockProperties(newState)["axis"])
 		}
 	}
 	if !IsNoteBlock(newState) {
@@ -601,6 +607,15 @@ func (c *Cache) touchesWater(x, y, z int) bool {
 }
 
 func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
+	// BaseFireBlock.onPlace: placing fire or soul_fire inside a valid unlit obsidian
+	// frame in the Overworld or Nether immediately lights the Nether portal.
+	if IsAnyFireBlock(newState) && !IsAnyFireBlock(oldState) {
+		c.tryLightNetherPortalFromFireAt(x, y, z, res)
+	}
+	// FrostedIceBlock: schedule initial 20..40 tick melt update when frosted_ice is placed.
+	if IsFrostedIceBlock(newState) && !IsFrostedIceBlock(oldState) {
+		c.ScheduleFrostedIceTickAt(x, y, z, nil)
+	}
 	// Dry sponge absorbs nearby water on placement or when water touches it.
 	if isBlockNamed(newState, "minecraft:sponge") {
 		c.tryAbsorbWaterWithSponge(x, y, z, res)
@@ -1755,7 +1770,7 @@ func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *
 }
 
 func (c *Cache) canFluidReplace(x, y, z int, kind fluidKind, target uint16) bool {
-	if isAirState(target) {
+	if isAirState(target) || IsPowderSnowBlock(target) {
 		return true
 	}
 	if tKind, tLevel, ok := isStandaloneFluidBlock(target); ok {

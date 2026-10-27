@@ -14,11 +14,13 @@ const (
 )
 
 type cacheFireState struct {
-	mu          sync.Mutex
-	doFireTick  bool
-	raining     bool
-	dimension   string
-	rainColumns map[[2]int]bool // optional per-column rain override
+	mu           sync.Mutex
+	doFireTick   bool
+	raining      bool
+	humidDefault bool
+	dimension    string
+	rainColumns  map[[2]int]bool // optional per-column rain override
+	humidColumns map[[2]int]bool // optional per-column #increased_fire_burnout override
 }
 
 var cacheFireStates sync.Map // map[*Cache]*cacheFireState
@@ -116,6 +118,75 @@ func (c *Cache) SetFireDimension(dimension string) {
 	fs.mu.Lock()
 	fs.dimension = NormalizeDimension(dimension)
 	fs.mu.Unlock()
+}
+
+// IsIncreasedFireBurnoutBiome reports whether biomeName belongs to vanilla
+// #minecraft:increased_fire_burnout (humid/extreme biomes where fire burns out
+// faster and spreads at half rate).
+func IsIncreasedFireBurnoutBiome(biomeName string) bool {
+	b := strings.ToLower(strings.TrimSpace(biomeName))
+	b = strings.TrimPrefix(b, "minecraft:")
+	switch b {
+	case "bamboo_jungle", "jungle", "sparse_jungle",
+		"swamp", "mangrove_swamp", "mushroom_fields",
+		"snowy_slopes", "jagged_peaks", "frozen_peaks",
+		"lush_caves", "deep_dark":
+		return true
+	default:
+		return false
+	}
+}
+
+// SetIncreasedFireBurnout sets the default #increased_fire_burnout state on c.
+func (c *Cache) SetIncreasedFireBurnout(humid bool) {
+	if c == nil {
+		return
+	}
+	fs := c.fireState()
+	fs.mu.Lock()
+	fs.humidDefault = humid
+	fs.mu.Unlock()
+}
+
+// SetIncreasedFireBurnoutColumn sets a per-(x, z) column #increased_fire_burnout override on c.
+func (c *Cache) SetIncreasedFireBurnoutColumn(x, z int, humid bool) {
+	if c == nil {
+		return
+	}
+	fs := c.fireState()
+	fs.mu.Lock()
+	if fs.humidColumns == nil {
+		fs.humidColumns = make(map[[2]int]bool)
+	}
+	fs.humidColumns[[2]int{x, z}] = humid
+	fs.mu.Unlock()
+}
+
+// IsIncreasedFireBurnoutAt reports whether column (x, z) has #increased_fire_burnout active.
+func (c *Cache) IsIncreasedFireBurnoutAt(x, z int) bool {
+	if c == nil {
+		return false
+	}
+	fs := c.fireState()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.humidColumns != nil {
+		if v, ok := fs.humidColumns[[2]int{x, z}]; ok {
+			return v
+		}
+	}
+	return fs.humidDefault
+}
+
+// FireRainExtinguishChance returns vanilla FireBlock's per-tick probability
+// (0.20 + age * 0.03) that rain extinguishes a non-infinite fire block of the given age.
+func FireRainExtinguishChance(age int) float32 {
+	if age < 0 {
+		age = 0
+	} else if age > MaxFireAge {
+		age = MaxFireAge
+	}
+	return 0.20 + float32(age)*0.03
 }
 
 // IsFireBlock reports whether state is a normal minecraft:fire block.
@@ -255,8 +326,8 @@ func BlockFlammability(state uint16) (igniteOdds, burnOdds int) {
 	}
 	name := info.Name
 
-	// Nether wood (crimson / warped) never catches fire or burns.
-	if strings.HasPrefix(name, "minecraft:crimson_") || strings.HasPrefix(name, "minecraft:warped_") {
+	// Nether wood (crimson / warped, including stripped stems/hyphae) never catches fire or burns.
+	if strings.Contains(name, "crimson_") || strings.Contains(name, "warped_") {
 		return 0, 0
 	}
 	// Stone/brick/copper/nether_brick/deepslate/blackstone/quartz/prismarine/purpur/mud_brick/resin stairs, slabs, walls, fences never burn.
@@ -290,6 +361,9 @@ func BlockFlammability(state uint16) (igniteOdds, burnOdds int) {
 		"minecraft:dandelion", "minecraft:poppy", "minecraft:blue_orchid", "minecraft:allium",
 		"minecraft:azure_bluet", "minecraft:oxeye_daisy", "minecraft:cornflower",
 		"minecraft:lily_of_the_valley", "minecraft:wither_rose", "minecraft:torchflower",
+		"minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
+		"minecraft:firefly_bush", "minecraft:cactus_flower",
+		"minecraft:big_dripleaf", "minecraft:big_dripleaf_stem", "minecraft:small_dripleaf",
 		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
 		"minecraft:pitcher_plant", "minecraft:pink_petals", "minecraft:wildflowers",
 		"minecraft:hanging_roots", "minecraft:pale_hanging_moss", "minecraft:leaf_litter",
@@ -411,7 +485,7 @@ func (c *Cache) ResolveFireBlockStateAt(x, y, z int, age int) uint16 {
 	if y > MinY {
 		below = c.GetBlock(x, y-1, z)
 	}
-	if !IsFlammableBlock(below) && isSturdySupportBlock(below) {
+	if IsFlammableBlock(below) || isSturdySupportBlock(below) {
 		return FireBlockState(age, false, false, false, false, false)
 	}
 	up := y+1 < MinY+WorldHeight && IsFlammableBlock(c.GetBlock(x, y+1, z))
@@ -622,14 +696,19 @@ func (c *Cache) stepFireWithRand(x, y, z int, rng *rand.Rand, res *BlockUpdateRe
 	}
 
 	// 3. Burn out adjacent blocks (FireBlock.checkBurnOut).
+	humid := c.IsIncreasedFireBurnoutAt(x, z)
+	burnPenalty := 0
+	if humid {
+		burnPenalty = -50
+	}
 	for _, off := range sixNeighborOffsets {
 		nx, ny, nz := x+off[0], y+off[1], z+off[2]
 		if ny < MinY || ny >= MinY+WorldHeight {
 			continue
 		}
-		bound := 300
+		bound := 300 + burnPenalty
 		if off[1] != 0 {
-			bound = 250
+			bound = 250 + burnPenalty
 		}
 		c.tryBurnOutNeighbor(nx, ny, nz, bound, age, rng, res)
 	}
@@ -658,6 +737,9 @@ func (c *Cache) stepFireWithRand(x, y, z int, rng *rand.Rand, res *BlockUpdateRe
 				}
 				// Vanilla formula: chance = (igniteOdds + 40 + difficulty*7) / (age + 30)
 				chance := (igniteOdds + 40 + 2*7) / (age + 30)
+				if c.IsIncreasedFireBurnoutAt(tx, tz) {
+					chance /= 2
+				}
 				if chance <= 0 {
 					chance = 1
 				}
@@ -668,7 +750,9 @@ func (c *Cache) stepFireWithRand(x, y, z int, rng *rand.Rand, res *BlockUpdateRe
 					}
 					newFire := c.ResolveFireBlockStateAt(tx, ty, tz, spreadAge)
 					if newFire != StateAir && c.setBlockRecorded(tx, ty, tz, newFire, res) {
-						c.ScheduleBlockUpdate(tx, ty, tz, UpdateFire, FireTickDelay+rng.Intn(10))
+						if _, lit := c.tryLightNetherPortalFromFireAt(tx, ty, tz, res); !lit && IsFireBlock(newFire) {
+							c.ScheduleBlockUpdate(tx, ty, tz, UpdateFire, FireTickDelay+rng.Intn(10))
+						}
 					}
 				}
 			}
@@ -713,10 +797,181 @@ func (c *Cache) tryBurnOutNeighbor(x, y, z int, bound int, sourceFireAge int, rn
 	if c.setBlockRecorded(x, y, z, replacement, res) {
 		c.runNeighborSupportPass(x, y, z, res)
 		c.scheduleAround(x, y, z)
-		if IsFireBlock(replacement) {
-			c.ScheduleBlockUpdate(x, y, z, UpdateFire, FireTickDelay+rng.Intn(10))
+		if IsAnyFireBlock(replacement) {
+			if _, lit := c.tryLightNetherPortalFromFireAt(x, y, z, res); !lit && IsFireBlock(replacement) {
+				c.ScheduleBlockUpdate(x, y, z, UpdateFire, FireTickDelay+rng.Intn(10))
+			}
 		}
 		return true
 	}
 	return false
+}
+
+// RandomTickLavaAt executes one vanilla LavaFluid.randomTick at (x, y, z):
+//   - Requires gamerule doFireTick == true and a lava block at (x, y, z).
+//   - Picks n = rng.Intn(3):
+//     - If n > 0: steps n times by (rng.Intn(3)-1, +1, rng.Intn(3)-1), stopping
+//       early if blocked by a solid/motion-blocking block, and igniting air if
+//       any of its 6 neighbors is flammable.
+//     - If n == 0: makes 3 attempts at (x+dx, y, z+dz) in [-1..1]x[-1..1] to
+//       ignite the air cell directly above a flammable block at y.
+func (c *Cache) RandomTickLavaAt(x, y, z int, rng *rand.Rand) (ignited bool, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight || !c.DoFireTick() {
+		return false, res
+	}
+	if !isLavaBlock(c.GetBlock(x, y, z)) {
+		return false, res
+	}
+	if rng == nil {
+		rng = rand.New(rand.NewSource(int64(x*3129871^z*116129781^y) ^ 0x5DEECE66D))
+	}
+	steps := rng.Intn(3)
+	if steps > 0 {
+		px, py, pz := x, y, z
+		for i := 0; i < steps; i++ {
+			px += rng.Intn(3) - 1
+			py++
+			pz += rng.Intn(3) - 1
+			if py >= MinY+WorldHeight {
+				return ignited, res
+			}
+			st := c.GetBlock(px, py, pz)
+			if isAirState(st) {
+				if c.HasFlammableNeighbor(px, py, pz) && !c.IsRainingAroundFire(px, py, pz) {
+					fireSt := c.ResolveFireBlockStateAt(px, py, pz, 0)
+					if fireSt != StateAir {
+						if applied, upd := c.ApplyBlockWithUpdates(px, py, pz, fireSt); applied {
+							res.merge(upd)
+							return true, res
+						}
+					}
+				}
+			} else if blocksMotionOrFluid(st) || isSolidState(st) {
+				return ignited, res
+			}
+		}
+		return ignited, res
+	}
+	for k := 0; k < 3; k++ {
+		tx := x + rng.Intn(3) - 1
+		tz := z + rng.Intn(3) - 1
+		if y+1 >= MinY+WorldHeight {
+			continue
+		}
+		if isAirState(c.GetBlock(tx, y+1, tz)) && IsFlammableBlock(c.GetBlock(tx, y, tz)) && !c.IsRainingAroundFire(tx, y+1, tz) {
+			fireSt := c.ResolveFireBlockStateAt(tx, y+1, tz, 0)
+			if fireSt != StateAir {
+				if applied, upd := c.ApplyBlockWithUpdates(tx, y+1, tz, fireSt); applied {
+					res.merge(upd)
+					ignited = true
+				}
+			}
+		}
+	}
+	return ignited, res
+}
+
+// --- World-Side Nether Portal Frame Ignition (`BaseFireBlock.onPlace` & `PortalShape`) ---
+
+// CanLightNetherPortalInDimension reports whether a Nether portal can be lit in
+// dimension (true in the Overworld and Nether, false in the End, matching
+// vanilla BaseFireBlock.inPortalDimension).
+func CanLightNetherPortalInDimension(dimension string) bool {
+	norm := NormalizeDimension(dimension)
+	return norm == DimensionOverworld || norm == DimensionNether
+}
+
+func (c *Cache) portalShapeHasPortalBlocks(shape PortalShape) bool {
+	if c == nil {
+		return false
+	}
+	for _, pos := range shape.InteriorPositions() {
+		if IsNetherPortalState(c.GetBlock(pos.X, pos.Y, pos.Z)) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Cache) findUnlitPortalShapeAt(x, y, z int) (PortalShape, bool) {
+	if c == nil {
+		return PortalShape{}, false
+	}
+	if shape, ok := FindEmptyPortalShapeOnAxis(c, x, y, z, PortalAxisX); ok && !c.portalShapeHasPortalBlocks(shape) {
+		return shape, true
+	}
+	if shape, ok := FindEmptyPortalShapeOnAxis(c, x, y, z, PortalAxisZ); ok && !c.portalShapeHasPortalBlocks(shape) {
+		return shape, true
+	}
+	return PortalShape{}, false
+}
+
+func (c *Cache) findUnlitPortalShapeNear(x, y, z int) (PortalShape, bool) {
+	if shape, ok := c.findUnlitPortalShapeAt(x, y, z); ok {
+		return shape, true
+	}
+	for _, off := range sixNeighborOffsets {
+		if shape, ok := c.findUnlitPortalShapeAt(x+off[0], y+off[1], z+off[2]); ok {
+			return shape, true
+		}
+	}
+	return PortalShape{}, false
+}
+
+func (c *Cache) fillPortalShapeRecorded(shape PortalShape, res *BlockUpdateResult) bool {
+	if c == nil || shape.Width < MinPortalWidth || shape.Height < MinPortalHeight {
+		return false
+	}
+	axis := shape.Axis
+	if axis != PortalAxisZ {
+		axis = PortalAxisX
+	}
+	portalState, ok := nameToStateID("minecraft:nether_portal", map[string]string{"axis": axis})
+	if !ok {
+		return false
+	}
+	placedAny := false
+	for _, pos := range shape.InteriorPositions() {
+		if c.setBlockRecorded(pos.X, pos.Y, pos.Z, portalState, res) {
+			placedAny = true
+		} else if c.GetBlock(pos.X, pos.Y, pos.Z) == portalState {
+			c.RegisterPortalPOI(pos, axis)
+			placedAny = true
+		}
+	}
+	return placedAny
+}
+
+func (c *Cache) tryLightNetherPortalFromFireAt(x, y, z int, res *BlockUpdateResult) (PortalShape, bool) {
+	if c == nil || !CanLightNetherPortalInDimension(c.FireDimension()) {
+		return PortalShape{}, false
+	}
+	shape, ok := c.findUnlitPortalShapeAt(x, y, z)
+	if !ok {
+		return PortalShape{}, false
+	}
+	if !c.fillPortalShapeRecorded(shape, res) {
+		return PortalShape{}, false
+	}
+	return shape, true
+}
+
+// TryLightNetherPortalAt attempts to light a valid unlit obsidian Nether portal
+// frame (interior width 2..21, height 3..21) at or adjacent to (x, y, z) on c,
+// recording all block and lighting updates in the returned BlockUpdateResult.
+// Returns false if c's FireDimension does not allow Nether portals (e.g. the_end)
+// or if no complete unlit obsidian frame exists at (x, y, z).
+func (c *Cache) TryLightNetherPortalAt(x, y, z int) (PortalShape, BlockUpdateResult, bool) {
+	var res BlockUpdateResult
+	if c == nil || !CanLightNetherPortalInDimension(c.FireDimension()) {
+		return PortalShape{}, res, false
+	}
+	shape, ok := c.findUnlitPortalShapeNear(x, y, z)
+	if !ok {
+		return PortalShape{}, res, false
+	}
+	if !c.fillPortalShapeRecorded(shape, &res) {
+		return PortalShape{}, res, false
+	}
+	return shape, res, true
 }
