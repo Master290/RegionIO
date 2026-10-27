@@ -485,3 +485,287 @@ func TestLeafDistanceAndDecay(t *testing.T) {
 		t.Fatalf("expected persistent leaf not to decay")
 	}
 }
+
+func TestTorchflowerAndPitcherCropGrowthBonemealSurvivalAndDrops(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(2026))
+
+	// Hydrated farmland at (4, FlatSurfaceY, 4) and (6, FlatSurfaceY, 6).
+	c.SetBlock(5, FlatSurfaceY, 5, StateWater)
+	farmlandWet, _ := nameToStateID("minecraft:farmland", map[string]string{"moisture": "7"})
+	c.SetBlock(4, FlatSurfaceY, 4, farmlandWet)
+	c.SetBlock(6, FlatSurfaceY, 6, farmlandWet)
+
+	// 1. Plant torchflower_seeds -> torchflower_crop[age=0].
+	planted, blockName, _ := c.PlantCropItemAt(4, FlatSurfaceY, 4, 1, "minecraft:torchflower_seeds")
+	if !planted || blockName != "minecraft:torchflower_crop" {
+		t.Fatalf("PlantCropItemAt(torchflower_seeds) = (%v, %q), want (true, minecraft:torchflower_crop)", planted, blockName)
+	}
+	st0 := c.GetBlock(4, FlatSurfaceY+1, 4)
+	if drops := CropDropsForBlock(st0, 0, rng); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:torchflower_seeds" {
+		t.Fatalf("torchflower_crop[age=0] drops = %+v, want 1x torchflower_seeds", drops)
+	}
+
+	// Bone meal once -> age=1; bone meal again -> matures into minecraft:torchflower!
+	ok, _ := c.ApplyBoneMeal(4, FlatSurfaceY+1, 4, rng)
+	if !ok {
+		t.Fatalf("expected ApplyBoneMeal on torchflower_crop[age=0] to succeed")
+	}
+	info1, _ := stateByID(c.GetBlock(4, FlatSurfaceY+1, 4))
+	if info1.Name != "minecraft:torchflower_crop" || info1.Properties["age"] != "1" {
+		t.Fatalf("after 1st bonemeal, got %s[%v], want torchflower_crop[age=1]", info1.Name, info1.Properties)
+	}
+	ok, _ = c.ApplyBoneMeal(4, FlatSurfaceY+1, 4, rng)
+	if !ok {
+		t.Fatalf("expected ApplyBoneMeal on torchflower_crop[age=1] to succeed")
+	}
+	info2, _ := stateByID(c.GetBlock(4, FlatSurfaceY+1, 4))
+	if info2.Name != "minecraft:torchflower" {
+		t.Fatalf("after 2nd bonemeal, got %s, want minecraft:torchflower", info2.Name)
+	}
+	if drops := CropDropsForBlock(c.GetBlock(4, FlatSurfaceY+1, 4), 0, rng); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:torchflower" {
+		t.Fatalf("torchflower drops = %+v, want 1x torchflower", drops)
+	}
+
+	// 2. Plant pitcher_pod -> pitcher_crop[age=0,half=lower].
+	planted, blockName, _ = c.PlantCropItemAt(6, FlatSurfaceY, 6, 1, "minecraft:pitcher_pod")
+	if !planted || blockName != "minecraft:pitcher_crop" {
+		t.Fatalf("PlantCropItemAt(pitcher_pod) = (%v, %q), want (true, minecraft:pitcher_crop)", planted, blockName)
+	}
+
+	// Advance pitcher_crop to age=1 (still single-block lower half).
+	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+1, 6, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on pitcher_crop[age=0] to succeed")
+	}
+	pInfo1, _ := stateByID(c.GetBlock(6, FlatSurfaceY+1, 6))
+	if pInfo1.Properties["age"] != "1" || pInfo1.Properties["half"] != "lower" || !isAirState(c.GetBlock(6, FlatSurfaceY+2, 6)) {
+		t.Fatalf("pitcher_crop at age=1 unexpected state: %+v, upper=%d", pInfo1, c.GetBlock(6, FlatSurfaceY+2, 6))
+	}
+
+	// Advance pitcher_crop to age=2 -> becomes double-height (lower + upper)!
+	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+1, 6, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on pitcher_crop[age=1] to succeed")
+	}
+	pLower2, _ := stateByID(c.GetBlock(6, FlatSurfaceY+1, 6))
+	pUpper2, _ := stateByID(c.GetBlock(6, FlatSurfaceY+2, 6))
+	if pLower2.Properties["age"] != "2" || pLower2.Properties["half"] != "lower" ||
+		pUpper2.Name != "minecraft:pitcher_crop" || pUpper2.Properties["age"] != "2" || pUpper2.Properties["half"] != "upper" {
+		t.Fatalf("pitcher_crop at age=2 expected lower+upper age=2, got lower=%+v upper=%+v", pLower2, pUpper2)
+	}
+	// Unripe pitcher_crop drops pitcher_pod from lower half and nil from upper half.
+	if drops := CropDropsForBlock(c.GetBlock(6, FlatSurfaceY+1, 6), 0, rng); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:pitcher_pod" {
+		t.Fatalf("pitcher_crop[age=2,half=lower] drops = %+v, want 1x pitcher_pod", drops)
+	}
+	if drops := CropDropsForBlock(c.GetBlock(6, FlatSurfaceY+2, 6), 0, rng); len(drops) != 0 {
+		t.Fatalf("pitcher_crop[age=2,half=upper] drops = %+v, want nil", drops)
+	}
+
+	// Bone meal clicking the UPPER half at (6, FlatSurfaceY+2, 6) advances both halves to age=3 and then age=4!
+	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+2, 6, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on upper half of pitcher_crop[age=2] to succeed")
+	}
+	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+2, 6, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on upper half of pitcher_crop[age=3] to succeed")
+	}
+	pLower4, _ := stateByID(c.GetBlock(6, FlatSurfaceY+1, 6))
+	pUpper4, _ := stateByID(c.GetBlock(6, FlatSurfaceY+2, 6))
+	if pLower4.Properties["age"] != "4" || pUpper4.Properties["age"] != "4" {
+		t.Fatalf("pitcher_crop after maturing expected age=4 on both halves, got lower=%+v upper=%+v", pLower4, pUpper4)
+	}
+	if CanBoneMeal(c.GetBlock(6, FlatSurfaceY+1, 6)) || CanBoneMeal(c.GetBlock(6, FlatSurfaceY+2, 6)) {
+		t.Fatalf("expected pitcher_crop[age=4] not to accept further bone meal")
+	}
+	if drops := CropDropsForBlock(c.GetBlock(6, FlatSurfaceY+1, 6), 0, rng); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:pitcher_plant" {
+		t.Fatalf("pitcher_crop[age=4,half=lower] drops = %+v, want 1x pitcher_plant", drops)
+	}
+
+	// Breaking the upper half breaks the lower half as well.
+	c.BreakBlockWithUpdates(6, FlatSurfaceY+2, 6)
+	if !isAirState(c.GetBlock(6, FlatSurfaceY+1, 6)) || !isAirState(c.GetBlock(6, FlatSurfaceY+2, 6)) {
+		t.Fatalf("expected breaking upper half of pitcher_crop to remove lower half as well")
+	}
+}
+
+func TestBonemealMangroveGrassSeagrassPetalsTallFlowersAndDripleaf(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(777))
+
+	// 1. mangrove_leaves -> spawns hanging mangrove_propagule[age=0,hanging=true] below, then ages 0..4.
+	mLeaves, _ := nameToStateID("minecraft:mangrove_leaves", map[string]string{
+		"distance": "1", "persistent": "true", "waterlogged": "false",
+	})
+	c.SetBlock(4, FlatSurfaceY+3, 4, mLeaves)
+	if ok, _ := c.ApplyBoneMeal(4, FlatSurfaceY+3, 4, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on mangrove_leaves with air below to succeed")
+	}
+	propInfo, _ := stateByID(c.GetBlock(4, FlatSurfaceY+2, 4))
+	if propInfo.Name != "minecraft:mangrove_propagule" || propInfo.Properties["hanging"] != "true" || propInfo.Properties["age"] != "0" {
+		t.Fatalf("expected hanging mangrove_propagule[age=0] below mangrove_leaves, got %+v", propInfo)
+	}
+	for wantAge := 1; wantAge <= 4; wantAge++ {
+		if ok, _ := c.ApplyBoneMeal(4, FlatSurfaceY+2, 4, rng); !ok {
+			t.Fatalf("expected ApplyBoneMeal on hanging mangrove_propagule to advance to age=%d", wantAge)
+		}
+		pi, _ := stateByID(c.GetBlock(4, FlatSurfaceY+2, 4))
+		if pi.Properties["age"] != strconv.Itoa(wantAge) {
+			t.Fatalf("hanging mangrove_propagule age = %s, want %d", pi.Properties["age"], wantAge)
+		}
+	}
+	if CanBoneMeal(c.GetBlock(4, FlatSurfaceY+2, 4)) {
+		t.Fatalf("expected hanging mangrove_propagule at age=4 not to accept bone meal")
+	}
+
+	// 2. short_grass -> tall_grass; fern -> large_fern; short_dry_grass -> tall_dry_grass.
+	shortGrass, _ := nameToStateID("minecraft:short_grass", nil)
+	c.SetBlock(8, FlatSurfaceY+1, 8, shortGrass)
+	if ok, _ := c.ApplyBoneMeal(8, FlatSurfaceY+1, 8, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on short_grass to succeed")
+	}
+	if !isBlockNamed(c.GetBlock(8, FlatSurfaceY+1, 8), "minecraft:tall_grass") || !isBlockNamed(c.GetBlock(8, FlatSurfaceY+2, 8), "minecraft:tall_grass") {
+		t.Fatalf("expected short_grass to grow into double-height tall_grass")
+	}
+
+	shortDry, _ := nameToStateID("minecraft:short_dry_grass", nil)
+	c.SetBlock(10, FlatSurfaceY+1, 8, shortDry)
+	if ok, _ := c.ApplyBoneMeal(10, FlatSurfaceY+1, 8, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on short_dry_grass to succeed")
+	}
+	if !isBlockNamed(c.GetBlock(10, FlatSurfaceY+1, 8), "minecraft:tall_dry_grass") {
+		t.Fatalf("expected short_dry_grass to become tall_dry_grass")
+	}
+
+	// 3. seagrass -> tall_seagrass in 2-high source water.
+	c.SetBlock(12, FlatSurfaceY+1, 8, StateWater)
+	c.SetBlock(12, FlatSurfaceY+2, 8, StateWater)
+	seagrassState, _ := nameToStateID("minecraft:seagrass", nil)
+	c.SetBlock(12, FlatSurfaceY+1, 8, seagrassState)
+	if ok, _ := c.ApplyBoneMeal(12, FlatSurfaceY+1, 8, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on seagrass with water above to succeed")
+	}
+	if !isBlockNamed(c.GetBlock(12, FlatSurfaceY+1, 8), "minecraft:tall_seagrass") || !isBlockNamed(c.GetBlock(12, FlatSurfaceY+2, 8), "minecraft:tall_seagrass") {
+		t.Fatalf("expected seagrass to become double-height tall_seagrass")
+	}
+
+	// 4. pink_petals flower_amount 1..4 and item drop at 4; tall flower item drop.
+	petals1, _ := nameToStateID("minecraft:pink_petals", map[string]string{"facing": "north", "flower_amount": "1"})
+	c.SetBlock(14, FlatSurfaceY+1, 8, petals1)
+	for wantAmt := 2; wantAmt <= 4; wantAmt++ {
+		if ok, _ := c.ApplyBoneMeal(14, FlatSurfaceY+1, 8, rng); !ok {
+			t.Fatalf("expected ApplyBoneMeal on pink_petals to reach flower_amount=%d", wantAmt)
+		}
+	}
+	petals4 := c.GetBlock(14, FlatSurfaceY+1, 8)
+	if drops := BoneMealDropsForBlock(petals4); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:pink_petals" {
+		t.Fatalf("BoneMealDropsForBlock(pink_petals[4]) = %+v, want 1x pink_petals", drops)
+	}
+	sunflowerLower, _ := nameToStateID("minecraft:sunflower", map[string]string{"half": "lower"})
+	if drops := BoneMealDropsForBlock(sunflowerLower); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:sunflower" {
+		t.Fatalf("BoneMealDropsForBlock(sunflower) = %+v, want 1x sunflower", drops)
+	}
+
+	// 5. small_dripleaf -> big_dripleaf, and big_dripleaf extends upward.
+	clayState, _ := nameToStateID("minecraft:clay", nil)
+	smallDripLower, _ := nameToStateID("minecraft:small_dripleaf", map[string]string{"facing": "north", "half": "lower", "waterlogged": "false"})
+	smallDripUpper, _ := nameToStateID("minecraft:small_dripleaf", map[string]string{"facing": "north", "half": "upper", "waterlogged": "false"})
+	c.SetBlock(4, FlatSurfaceY, 12, clayState)
+	c.SetBlock(4, FlatSurfaceY+1, 12, smallDripLower)
+	c.SetBlock(4, FlatSurfaceY+2, 12, smallDripUpper)
+	if ok, _ := c.ApplyBoneMeal(4, FlatSurfaceY+1, 12, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on small_dripleaf to succeed")
+	}
+	if !isBlockNamed(c.GetBlock(4, FlatSurfaceY+1, 12), "minecraft:big_dripleaf_stem") {
+		t.Fatalf("expected base of grown small_dripleaf to be big_dripleaf_stem, got %s", BlockName(c.GetBlock(4, FlatSurfaceY+1, 12)))
+	}
+}
+
+func TestEntityFarmlandTramplePredicatesAndFarmerVillagerHelpers(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(1234))
+
+	// 1. CanEntityTrampleFarmland:
+	// - Player ignores mobGriefing=false
+	if !CanEntityTrampleFarmland(true, false, 0.6, 1.8, 3.0, rng) {
+		t.Fatalf("expected player with fallDistance=3.0 to trample farmland even when mobGriefing=false")
+	}
+	// - Non-player mob respects mobGriefing=false
+	if CanEntityTrampleFarmland(false, false, 0.9, 1.4, 3.0, rng) {
+		t.Fatalf("expected mob not to trample farmland when mobGriefing=false")
+	}
+	// - Small mob (chicken: 0.4 * 0.4 * 0.7 = 0.112 <= 0.512) cannot trample farmland
+	if CanEntityTrampleFarmland(false, true, 0.4, 0.7, 3.0, rng) {
+		t.Fatalf("expected small mob (volume <= 0.512) not to trample farmland")
+	}
+	// - Adult mob (cow: 0.9 * 0.9 * 1.4 = 1.134 > 0.512) tramples farmland when mobGriefing=true
+	if !CanEntityTrampleFarmland(false, true, 0.9, 1.4, 3.0, rng) {
+		t.Fatalf("expected cow-sized mob (volume > 0.512) to trample farmland when mobGriefing=true")
+	}
+
+	// 2. Farmer Villager harvest & replant helpers:
+	farmlandWet, _ := nameToStateID("minecraft:farmland", map[string]string{"moisture": "7"})
+	matureWheat, _ := nameToStateID("minecraft:wheat", map[string]string{"age": "7"})
+	c.SetBlock(6, FlatSurfaceY, 10, farmlandWet)
+	c.SetBlock(6, FlatSurfaceY+1, 10, matureWheat)
+
+	harvestable, plantable := c.CanFarmerWorkAt(6, FlatSurfaceY+1, 10, true)
+	if !harvestable || plantable {
+		t.Fatalf("CanFarmerWorkAt on mature wheat = (%v, %v), want (true, false)", harvestable, plantable)
+	}
+	drops, consumedSeed, _, changed := c.FarmerHarvestAndReplantAt(6, FlatSurfaceY+1, 10, "minecraft:wheat_seeds", rng)
+	if !changed || !consumedSeed || len(drops) == 0 {
+		t.Fatalf("FarmerHarvestAndReplantAt = (drops=%+v, consumedSeed=%v, changed=%v), want all true/non-empty", drops, consumedSeed, changed)
+	}
+	replantedInfo, _ := stateByID(c.GetBlock(6, FlatSurfaceY+1, 10))
+	if replantedInfo.Name != "minecraft:wheat" || replantedInfo.Properties["age"] != "0" {
+		t.Fatalf("expected replanted wheat[age=0], got %+v", replantedInfo)
+	}
+}
+
+func TestSaplingFlowerBeeNestAzaleaRootedDirtAndMegaSprucePodzol(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(4444))
+
+	// 1. Oak sapling with a nearby flower selects oak_bees_005 or fancy_oak_bees_005.
+	dandelion, _ := nameToStateID("minecraft:dandelion", nil)
+	c.SetBlock(9, FlatSurfaceY+1, 10, dandelion)
+	feat, _, _, _ := c.selectSaplingTreeFeature(8, FlatSurfaceY+1, 10, "minecraft:oak_sapling", rng)
+	if feat != "minecraft:oak_bees_005" && feat != "minecraft:fancy_oak_bees_005" {
+		t.Fatalf("selectSaplingTreeFeature with nearby flower = %q, want oak_bees_005 or fancy_oak_bees_005", feat)
+	}
+
+	// 2. Azalea grown into an oak tree converts dirt beneath the trunk to rooted_dirt.
+	azaleaState, _ := nameToStateID("minecraft:azalea", nil)
+	c.SetBlock(20, FlatSurfaceY+1, 20, azaleaState)
+	for i := 0; i < 20; i++ {
+		c.ApplyBoneMeal(20, FlatSurfaceY+1, 20, rng)
+		if isLogOrStemBlock(c.GetBlock(20, FlatSurfaceY+1, 20)) {
+			break
+		}
+	}
+	if !isBlockNamed(c.GetBlock(20, FlatSurfaceY, 20), "minecraft:rooted_dirt") {
+		t.Fatalf("expected azalea tree growth to convert soil at (20, FlatSurfaceY, 20) to rooted_dirt, got %s", BlockName(c.GetBlock(20, FlatSurfaceY, 20)))
+	}
+
+	// 3. 2x2 spruce_sapling grown into mega spruce converts nearby grass_block to podzol.
+	spruceSapling, _ := nameToStateID("minecraft:spruce_sapling", map[string]string{"stage": "1"})
+	c.SetBlock(36, FlatSurfaceY+1, 36, spruceSapling)
+	c.SetBlock(37, FlatSurfaceY+1, 36, spruceSapling)
+	c.SetBlock(36, FlatSurfaceY+1, 37, spruceSapling)
+	c.SetBlock(37, FlatSurfaceY+1, 37, spruceSapling)
+	for i := 0; i < 20; i++ {
+		c.ApplyBoneMeal(36, FlatSurfaceY+1, 36, rng)
+		if isLogOrStemBlock(c.GetBlock(36, FlatSurfaceY+1, 36)) {
+			break
+		}
+	}
+	foundPodzol := false
+	for dx := -3; dx <= 4 && !foundPodzol; dx++ {
+		for dz := -3; dz <= 4 && !foundPodzol; dz++ {
+			if isBlockNamed(c.GetBlock(36+dx, FlatSurfaceY, 36+dz), "minecraft:podzol") {
+				foundPodzol = true
+			}
+		}
+	}
+	if !foundPodzol {
+		t.Fatalf("expected 2x2 mega spruce tree growth to convert nearby grass_block to podzol")
+	}
+}

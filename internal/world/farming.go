@@ -97,6 +97,7 @@ func IsRandomTickableBlock(state uint16) bool {
 	name := info.Name
 	switch name {
 	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
+		"minecraft:torchflower_crop",
 		"minecraft:melon_stem", "minecraft:pumpkin_stem",
 		"minecraft:nether_wart", "minecraft:cocoa", "minecraft:sweet_berry_bush",
 		"minecraft:farmland",
@@ -111,6 +112,9 @@ func IsRandomTickableBlock(state uint16) bool {
 		"minecraft:budding_amethyst",
 		"minecraft:turtle_egg":
 		return true
+	case "minecraft:pitcher_crop":
+		age, err := strconv.Atoi(info.Properties["age"])
+		return err == nil && age < 4 && info.Properties["half"] == "lower"
 	case "minecraft:chorus_flower":
 		age, ok := ChorusFlowerAge(state)
 		return ok && age < ChorusFlowerMaxAge
@@ -320,6 +324,10 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 		c.randomTickStandardCrop(x, y, z, state, info, rng, res)
 	case "minecraft:beetroots":
 		c.randomTickBeetroot(x, y, z, state, info, rng, res)
+	case "minecraft:torchflower_crop":
+		c.randomTickTorchflowerCrop(x, y, z, state, info, rng, res)
+	case "minecraft:pitcher_crop":
+		c.randomTickPitcherCrop(x, y, z, state, info, rng, res)
 	case "minecraft:melon_stem", "minecraft:pumpkin_stem":
 		c.randomTickStem(x, y, z, state, info, rng, res)
 	case "minecraft:nether_wart":
@@ -457,6 +465,106 @@ func (c *Cache) randomTickBeetroot(x, y, z int, state uint16, info stateName, rn
 			c.setBlockRecorded(x, y, z, nextState, res)
 		}
 	}
+}
+
+func (c *Cache) randomTickTorchflowerCrop(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
+	if c.RawBrightnessAt(x, y+1, z) < 9 {
+		return
+	}
+	if rng.Intn(3) != 0 {
+		return
+	}
+	speed := c.CropGrowthSpeed(x, y, z, info.Name)
+	bound := int(25.0/speed) + 1
+	if bound < 1 {
+		bound = 1
+	}
+	if rng.Intn(bound) != 0 {
+		return
+	}
+	c.advanceTorchflowerCropAt(x, y, z, state, info, res)
+}
+
+func (c *Cache) advanceTorchflowerCropAt(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) bool {
+	age, err := strconv.Atoi(info.Properties["age"])
+	if err != nil {
+		return false
+	}
+	if age <= 0 {
+		if nextState, ok := withStateProperty(state, "age", "1"); ok {
+			return c.setBlockRecorded(x, y, z, nextState, res)
+		}
+		return false
+	}
+	if flowerState, ok := nameToStateID("minecraft:torchflower", nil); ok {
+		return c.setBlockRecorded(x, y, z, flowerState, res)
+	}
+	return false
+}
+
+func (c *Cache) randomTickPitcherCrop(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
+	if info.Properties["half"] != "lower" {
+		return
+	}
+	if c.RawBrightnessAt(x, y+1, z) < 9 {
+		return
+	}
+	age, err := strconv.Atoi(info.Properties["age"])
+	if err != nil || age >= 4 {
+		return
+	}
+	speed := c.CropGrowthSpeed(x, y, z, info.Name)
+	bound := int(25.0/speed) + 1
+	if bound < 1 {
+		bound = 1
+	}
+	if rng.Intn(bound) != 0 {
+		return
+	}
+	c.advancePitcherCropAt(x, y, z, age+1, res)
+}
+
+func (c *Cache) advancePitcherCropAt(x, lowerY, z int, targetAge int, res *BlockUpdateResult) bool {
+	if lowerY <= c.minY() || lowerY >= c.maxY() {
+		return false
+	}
+	if !isBlockNamed(c.GetBlock(x, lowerY-1, z), "minecraft:farmland") {
+		return false
+	}
+	if targetAge > 4 {
+		targetAge = 4
+	}
+	ageStr := strconv.Itoa(targetAge)
+	lowerState, okLower := nameToStateID("minecraft:pitcher_crop", map[string]string{
+		"age":  ageStr,
+		"half": "lower",
+	})
+	if !okLower {
+		return false
+	}
+	if targetAge < 2 {
+		return c.setBlockRecorded(x, lowerY, z, lowerState, res)
+	}
+	if lowerY+1 >= c.maxY() {
+		return false
+	}
+	above := c.GetBlock(x, lowerY+1, z)
+	if !isAirState(above) {
+		aInfo, ok := stateByID(above)
+		if !ok || aInfo.Name != "minecraft:pitcher_crop" || aInfo.Properties["half"] != "upper" {
+			return false
+		}
+	}
+	upperState, okUpper := nameToStateID("minecraft:pitcher_crop", map[string]string{
+		"age":  ageStr,
+		"half": "upper",
+	})
+	if !okUpper {
+		return false
+	}
+	c1 := c.setBlockRecorded(x, lowerY, z, lowerState, res)
+	c2 := c.setBlockRecorded(x, lowerY+1, z, upperState, res)
+	return c1 || c2
 }
 
 var stemDirections = [4]struct {
@@ -734,6 +842,32 @@ func (c *Cache) TrampleFarmland(x, y, z int) (bool, BlockUpdateResult) {
 	return ok, res
 }
 
+// FarmlandMinTrampleVolume is the minimum entity bounding-box volume
+// (`width * width * height > 0.512`) required to trample farmland in vanilla
+// `FarmBlock.fallOn`.
+const FarmlandMinTrampleVolume = 0.512
+
+// CanEntityTrampleFarmland reports whether a landing entity (player or mob)
+// tramples farmland on impact, matching vanilla `FarmBlock.fallOn`:
+//   - Requires `fallDistance > 0.5` and `rng.Float64() < fallDistance - 0.5`.
+//   - Non-player entities require `mobGriefing == true`.
+//   - Entity bounding-box volume (`width * width * height`) must exceed `0.512`.
+func CanEntityTrampleFarmland(isPlayer, mobGriefing bool, width, height, fallDistance float64, rng *rand.Rand) bool {
+	if fallDistance <= 0.5 {
+		return false
+	}
+	if !isPlayer && !mobGriefing {
+		return false
+	}
+	if width*width*height <= FarmlandMinTrampleVolume {
+		return false
+	}
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	return rng.Float64() < fallDistance-0.5
+}
+
 // TillSoilAt converts grass_block, dirt, or dirt_path (when air is above) into
 // minecraft:farmland[moisture=0], or coarse_dirt / rooted_dirt into
 // minecraft:dirt (vanilla HoeItem behavior).
@@ -960,11 +1094,20 @@ func (c *Cache) selectSaplingTreeFeature(x, y, z int, saplingName string, rng *r
 
 	switch saplingName {
 	case "minecraft:oak_sapling":
+		if c.hasFlowerNearSapling(x, y, z) {
+			if rng.Intn(10) == 0 {
+				return "minecraft:fancy_oak_bees_005", x, z, false
+			}
+			return "minecraft:oak_bees_005", x, z, false
+		}
 		if rng.Intn(10) == 0 {
 			return "minecraft:fancy_oak", x, z, false
 		}
 		return "minecraft:oak", x, z, false
 	case "minecraft:birch_sapling":
+		if c.hasFlowerNearSapling(x, y, z) {
+			return "minecraft:birch_bees_005", x, z, false
+		}
 		return "minecraft:birch", x, z, false
 	case "minecraft:spruce_sapling":
 		return "minecraft:spruce", x, z, false
@@ -973,6 +1116,9 @@ func (c *Cache) selectSaplingTreeFeature(x, y, z int, saplingName string, rng *r
 	case "minecraft:acacia_sapling":
 		return "minecraft:acacia", x, z, false
 	case "minecraft:cherry_sapling":
+		if c.hasFlowerNearSapling(x, y, z) {
+			return "minecraft:cherry_bees_005", x, z, false
+		}
 		return "minecraft:cherry", x, z, false
 	case "minecraft:dark_oak_sapling":
 		return "minecraft:dark_oak", x, z, false
@@ -984,6 +1130,48 @@ func (c *Cache) selectSaplingTreeFeature(x, y, z int, saplingName string, rng *r
 		return "minecraft:azalea_tree", x, z, false
 	}
 	return "", x, z, false
+}
+
+func (c *Cache) hasFlowerNearSapling(x, y, z int) bool {
+	if c == nil {
+		return false
+	}
+	for dy := -1; dy <= 1; dy++ {
+		ny := y + dy
+		if ny < c.minY() || ny >= c.maxY() {
+			continue
+		}
+		for dx := -2; dx <= 2; dx++ {
+			for dz := -2; dz <= 2; dz++ {
+				if isSaplingFlowerBlock(c.GetBlock(x+dx, ny, z+dz)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isSaplingFlowerBlock(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	if strings.HasSuffix(info.Name, "_tulip") {
+		return true
+	}
+	switch info.Name {
+	case "minecraft:dandelion", "minecraft:poppy", "minecraft:blue_orchid",
+		"minecraft:allium", "minecraft:azure_bluet", "minecraft:oxeye_daisy",
+		"minecraft:cornflower", "minecraft:lily_of_the_valley", "minecraft:wither_rose",
+		"minecraft:torchflower", "minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
+		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
+		"minecraft:pitcher_plant", "minecraft:pink_petals", "minecraft:wildflowers",
+		"minecraft:flowering_azalea", "minecraft:flowering_azalea_leaves",
+		"minecraft:mangrove_propagule", "minecraft:cherry_leaves":
+		return true
+	}
+	return false
 }
 
 func (c *Cache) growFallbackTree(x, y, z int, saplingName string, is2x2 bool, rng *rand.Rand, res *BlockUpdateResult) bool {
@@ -1004,7 +1192,25 @@ func (c *Cache) growFallbackTree(x, y, z int, saplingName string, is2x2 bool, rn
 		}
 	}
 	if y > c.minY() && isSoilOrFarmland(c.GetBlock(x, y-1, z)) {
-		c.setBlockRecorded(x, y-1, z, StateDirt, res)
+		underState := StateDirt
+		if saplingName == "minecraft:azalea" || saplingName == "minecraft:flowering_azalea" {
+			if rooted, ok := nameToStateID("minecraft:rooted_dirt", nil); ok {
+				underState = rooted
+			}
+		}
+		c.setBlockRecorded(x, y-1, z, underState, res)
+	}
+	if is2x2 && saplingName == "minecraft:spruce_sapling" && y > c.minY() {
+		if podzol, ok := nameToStateID("minecraft:podzol", map[string]string{"snowy": "false"}); ok {
+			for dx := -1; dx <= 2; dx++ {
+				for dz := -1; dz <= 2; dz++ {
+					ground := c.GetBlock(x+dx, y-1, z+dz)
+					if isBlockNamed(ground, "minecraft:grass_block") || isBlockNamed(ground, "minecraft:dirt") {
+						c.setBlockRecorded(x+dx, y-1, z+dz, podzol, res)
+					}
+				}
+			}
+		}
 	}
 	if is2x2 {
 		for dx := 0; dx <= 1; dx++ {
@@ -1122,9 +1328,21 @@ func CanBoneMeal(state uint16) bool {
 	case "minecraft:beetroots", "minecraft:sweet_berry_bush":
 		age, err := strconv.Atoi(info.Properties["age"])
 		return err == nil && age < 3
+	case "minecraft:torchflower_crop":
+		age, err := strconv.Atoi(info.Properties["age"])
+		return err == nil && age <= 1
+	case "minecraft:pitcher_crop":
+		age, err := strconv.Atoi(info.Properties["age"])
+		return err == nil && age < 4
 	case "minecraft:cocoa":
 		age, err := strconv.Atoi(info.Properties["age"])
 		return err == nil && age < 2
+	case "minecraft:mangrove_propagule":
+		if info.Properties["hanging"] == "true" {
+			age, err := strconv.Atoi(info.Properties["age"])
+			return err == nil && age < 4
+		}
+		return true
 	case "minecraft:grass_block",
 		"minecraft:moss_block", "minecraft:pale_moss_block",
 		"minecraft:crimson_nylium", "minecraft:warped_nylium", "minecraft:netherrack",
@@ -1133,15 +1351,41 @@ func CanBoneMeal(state uint16) bool {
 		"minecraft:glow_lichen", "minecraft:pale_hanging_moss",
 		"minecraft:weeping_vines", "minecraft:weeping_vines_plant",
 		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
-		"minecraft:azalea", "minecraft:flowering_azalea", "minecraft:mangrove_propagule",
+		"minecraft:azalea", "minecraft:flowering_azalea",
+		"minecraft:mangrove_leaves",
 		"minecraft:bamboo_sapling", "minecraft:bamboo",
 		"minecraft:kelp", "minecraft:kelp_plant",
-		"minecraft:brown_mushroom", "minecraft:red_mushroom":
+		"minecraft:brown_mushroom", "minecraft:red_mushroom",
+		"minecraft:short_grass", "minecraft:fern",
+		"minecraft:short_dry_grass", "minecraft:tall_dry_grass", "minecraft:bush",
+		"minecraft:seagrass", "minecraft:sea_pickle",
+		"minecraft:pink_petals", "minecraft:wildflowers",
+		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
+		"minecraft:small_dripleaf", "minecraft:big_dripleaf", "minecraft:big_dripleaf_stem":
 		return true
 	case "minecraft:cave_vines", "minecraft:cave_vines_plant":
 		return !CaveVinesHasBerries(state)
 	}
 	return strings.HasSuffix(info.Name, "_sapling")
+}
+
+// BoneMealDropsForBlock returns any item drops produced directly when bone meal
+// is applied to state (e.g. 1x tall flower on sunflower/lilac/rose_bush/peony,
+// or 1x pink_petals/wildflowers when flower_amount is already 4).
+func BoneMealDropsForBlock(state uint16) []ItemStack {
+	info, ok := stateByID(state)
+	if !ok {
+		return nil
+	}
+	switch info.Name {
+	case "minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony":
+		return []ItemStack{NewNamedItemStack(info.Name, 1)}
+	case "minecraft:pink_petals", "minecraft:wildflowers":
+		if info.Properties["flower_amount"] == "4" {
+			return []ItemStack{NewNamedItemStack(info.Name, 1)}
+		}
+	}
+	return nil
 }
 
 // ApplyBoneMeal applies bone meal to the block at (x, y, z). It returns
@@ -1189,6 +1433,31 @@ func (c *Cache) ApplyBoneMeal(x, y, z int, rng *rand.Rand) (consumed bool, res B
 		}
 		return true, res
 
+	case "minecraft:torchflower_crop":
+		c.advanceTorchflowerCropAt(x, y, z, state, info, &res)
+		return true, res
+
+	case "minecraft:pitcher_crop":
+		lowerY := y
+		if info.Properties["half"] == "upper" {
+			lowerY = y - 1
+		}
+		if lowerY < c.minY() {
+			return false, res
+		}
+		lInfo, ok := stateByID(c.GetBlock(x, lowerY, z))
+		if !ok || lInfo.Name != "minecraft:pitcher_crop" || lInfo.Properties["half"] != "lower" {
+			return false, res
+		}
+		age, err := strconv.Atoi(lInfo.Properties["age"])
+		if err != nil || age >= 4 {
+			return false, res
+		}
+		if !c.advancePitcherCropAt(x, lowerY, z, age+1, &res) {
+			return false, res
+		}
+		return true, res
+
 	case "minecraft:cocoa":
 		age, _ := strconv.Atoi(info.Properties["age"])
 		if age < 2 {
@@ -1207,10 +1476,187 @@ func (c *Cache) ApplyBoneMeal(x, y, z int, rng *rand.Rand) (consumed bool, res B
 		}
 		return true, res
 
-	case "minecraft:azalea", "minecraft:flowering_azalea", "minecraft:mangrove_propagule":
+	case "minecraft:mangrove_propagule":
+		if info.Properties["hanging"] == "true" {
+			age, err := strconv.Atoi(info.Properties["age"])
+			if err != nil || age >= 4 {
+				return false, res
+			}
+			if nextState, ok := withStateProperty(state, "age", strconv.Itoa(age+1)); ok {
+				c.setBlockRecorded(x, y, z, nextState, &res)
+			}
+			return true, res
+		}
 		if rng.Float64() < 0.45 {
 			c.AdvanceSapling(x, y, z, rng, &res)
 		}
+		return true, res
+
+	case "minecraft:mangrove_leaves":
+		if y <= c.minY() {
+			return false, res
+		}
+		below := c.GetBlock(x, y-1, z)
+		wl := "false"
+		if isSourceWater(below) {
+			wl = "true"
+		} else if !isAirState(below) {
+			return false, res
+		}
+		propState, ok := nameToStateID("minecraft:mangrove_propagule", map[string]string{
+			"age":         "0",
+			"hanging":     "true",
+			"stage":       "0",
+			"waterlogged": wl,
+		})
+		if !ok {
+			return false, res
+		}
+		c.setBlockRecorded(x, y-1, z, propState, &res)
+		return true, res
+
+	case "minecraft:azalea", "minecraft:flowering_azalea":
+		if rng.Float64() < 0.45 {
+			c.AdvanceSapling(x, y, z, rng, &res)
+		}
+		return true, res
+
+	case "minecraft:short_grass", "minecraft:fern":
+		if y+1 >= c.maxY() || !isAirState(c.GetBlock(x, y+1, z)) {
+			return false, res
+		}
+		tallName := "minecraft:tall_grass"
+		if info.Name == "minecraft:fern" {
+			tallName = "minecraft:large_fern"
+		}
+		lowerSt, okL := nameToStateID(tallName, map[string]string{"half": "lower"})
+		upperSt, okU := nameToStateID(tallName, map[string]string{"half": "upper"})
+		if !okL || !okU {
+			return false, res
+		}
+		c.setBlockRecorded(x, y, z, lowerSt, &res)
+		c.setBlockRecorded(x, y+1, z, upperSt, &res)
+		return true, res
+
+	case "minecraft:short_dry_grass":
+		if tallSt, ok := nameToStateID("minecraft:tall_dry_grass", nil); ok {
+			c.setBlockRecorded(x, y, z, tallSt, &res)
+			return true, res
+		}
+		return false, res
+
+	case "minecraft:tall_dry_grass", "minecraft:bush":
+		spreadName := info.Name
+		if info.Name == "minecraft:tall_dry_grass" {
+			spreadName = "minecraft:short_dry_grass"
+		}
+		spreadSt, ok := nameToStateID(spreadName, nil)
+		if !ok {
+			return false, res
+		}
+		for i := 0; i < 16; i++ {
+			tx := x + rng.Intn(3) - 1
+			ty := y + rng.Intn(3) - 1
+			tz := z + rng.Intn(3) - 1
+			if ty <= c.minY() || ty >= c.maxY() || !isAirState(c.GetBlock(tx, ty, tz)) {
+				continue
+			}
+			if canPlantSurviveOn(spreadName, c.GetBlock(tx, ty-1, tz)) {
+				c.setBlockRecorded(tx, ty, tz, spreadSt, &res)
+				break
+			}
+		}
+		return true, res
+
+	case "minecraft:seagrass":
+		if y+1 >= c.maxY() || !isSourceWater(c.GetBlock(x, y+1, z)) {
+			return false, res
+		}
+		lowerSt, okL := nameToStateID("minecraft:tall_seagrass", map[string]string{"half": "lower"})
+		upperSt, okU := nameToStateID("minecraft:tall_seagrass", map[string]string{"half": "upper"})
+		if !okL || !okU {
+			return false, res
+		}
+		c.setBlockRecorded(x, y, z, lowerSt, &res)
+		c.setBlockRecorded(x, y+1, z, upperSt, &res)
+		return true, res
+
+	case "minecraft:sea_pickle":
+		if info.Properties["waterlogged"] != "true" || y <= c.minY() || !IsLiveCoralBlock(c.GetBlock(x, y-1, z)) {
+			return false, res
+		}
+		if fullPickle, ok := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": "4", "waterlogged": "true"}); ok {
+			c.setBlockRecorded(x, y, z, fullPickle, &res)
+		}
+		return true, res
+
+	case "minecraft:pink_petals", "minecraft:wildflowers":
+		amt, _ := strconv.Atoi(info.Properties["flower_amount"])
+		if amt < 4 {
+			if nextSt, ok := withStateProperty(state, "flower_amount", strconv.Itoa(amt+1)); ok {
+				c.setBlockRecorded(x, y, z, nextSt, &res)
+			}
+		}
+		return true, res
+
+	case "minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony":
+		return true, res
+
+	case "minecraft:small_dripleaf":
+		facing := info.Properties["facing"]
+		if facing == "" {
+			facing = "north"
+		}
+		bottomY := y
+		if info.Properties["half"] == "upper" {
+			bottomY = y - 1
+		}
+		if bottomY < c.minY() || bottomY+1 >= c.maxY() {
+			return false, res
+		}
+		wl0 := strconv.FormatBool(hasWaterFluid(c.GetBlock(x, bottomY, z)))
+		wl1 := strconv.FormatBool(hasWaterFluid(c.GetBlock(x, bottomY+1, z)))
+		stemSt, okS := nameToStateID("minecraft:big_dripleaf_stem", map[string]string{"facing": facing, "waterlogged": wl0})
+		headSt, okH := nameToStateID("minecraft:big_dripleaf", map[string]string{"facing": facing, "tilt": "none", "waterlogged": wl1})
+		if !okS || !okH {
+			return false, res
+		}
+		c.setBlockRecorded(x, bottomY, z, stemSt, &res)
+		c.setBlockRecorded(x, bottomY+1, z, headSt, &res)
+		return true, res
+
+	case "minecraft:big_dripleaf", "minecraft:big_dripleaf_stem":
+		topY := y
+		for topY+1 < c.maxY() && (isBlockNamed(c.GetBlock(x, topY+1, z), "minecraft:big_dripleaf") || isBlockNamed(c.GetBlock(x, topY+1, z), "minecraft:big_dripleaf_stem")) {
+			topY++
+		}
+		if topY+1 >= c.maxY() {
+			return false, res
+		}
+		above := c.GetBlock(x, topY+1, z)
+		if !isAirState(above) && !isSourceWater(above) {
+			return false, res
+		}
+		topInfo, ok := stateByID(c.GetBlock(x, topY, z))
+		if !ok {
+			return false, res
+		}
+		facing := topInfo.Properties["facing"]
+		if facing == "" {
+			facing = "north"
+		}
+		wlCur := topInfo.Properties["waterlogged"]
+		if wlCur == "" {
+			wlCur = "false"
+		}
+		wlAbove := strconv.FormatBool(isSourceWater(above))
+		stemSt, okS := nameToStateID("minecraft:big_dripleaf_stem", map[string]string{"facing": facing, "waterlogged": wlCur})
+		headSt, okH := nameToStateID("minecraft:big_dripleaf", map[string]string{"facing": facing, "tilt": "none", "waterlogged": wlAbove})
+		if !okS || !okH {
+			return false, res
+		}
+		c.setBlockRecorded(x, topY, z, stemSt, &res)
+		c.setBlockRecorded(x, topY+1, z, headSt, &res)
 		return true, res
 
 	case "minecraft:grass_block":
@@ -1688,7 +2134,8 @@ func isFullOpaqueTurfCover(state uint16) bool {
 	}
 	switch info.Name {
 	case "minecraft:glass", "minecraft:tinted_glass", "minecraft:ice",
-		"minecraft:slime_block", "minecraft:honey_block", "minecraft:FARMLAND",
+		"minecraft:slime_block", "minecraft:honey_block", "minecraft:farmland", "minecraft:FARMLAND",
+		"minecraft:moving_piston", "minecraft:piston_head",
 		"minecraft:chest", "minecraft:ender_chest", "minecraft:trapped_chest",
 		"minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil",
 		"minecraft:enchanting_table", "minecraft:brewing_stand", "minecraft:grindstone",
@@ -2009,6 +2456,12 @@ func (c *Cache) PlantCropItemAt(x, y, z int, face int, itemName string) (planted
 	case "minecraft:pumpkin_seeds", "minecraft:pumpkin_stem":
 		blockName = "minecraft:pumpkin_stem"
 		props = map[string]string{"age": "0"}
+	case "minecraft:torchflower_seeds", "minecraft:torchflower_crop":
+		blockName = "minecraft:torchflower_crop"
+		props = map[string]string{"age": "0"}
+	case "minecraft:pitcher_pod", "minecraft:pitcher_crop":
+		blockName = "minecraft:pitcher_crop"
+		props = map[string]string{"age": "0", "half": "lower"}
 	case "minecraft:nether_wart":
 		blockName = "minecraft:nether_wart"
 		props = map[string]string{"age": "0"}
@@ -2138,8 +2591,157 @@ func CropDropsForBlock(state uint16, fortuneLevel int, rng *rand.Rand) []ItemSta
 			return []ItemStack{NewNamedItemStack("minecraft:sweet_berries", int32(2+rng.Intn(2)))}
 		}
 		return nil
+
+	case "minecraft:torchflower_crop":
+		return []ItemStack{NewNamedItemStack("minecraft:torchflower_seeds", 1)}
+
+	case "minecraft:torchflower":
+		return []ItemStack{NewNamedItemStack("minecraft:torchflower", 1)}
+
+	case "minecraft:pitcher_crop":
+		if info.Properties["half"] == "upper" {
+			return nil
+		}
+		if age >= 4 {
+			return []ItemStack{NewNamedItemStack("minecraft:pitcher_plant", 1)}
+		}
+		return []ItemStack{NewNamedItemStack("minecraft:pitcher_pod", 1)}
+
+	case "minecraft:pitcher_plant":
+		if info.Properties["half"] == "upper" {
+			return nil
+		}
+		return []ItemStack{NewNamedItemStack("minecraft:pitcher_plant", 1)}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 9. Farmer Villager AI Helpers (HarvestFarmland & UseBonemeal)
+// ---------------------------------------------------------------------------
+
+// IsMatureFarmerCropState reports whether state is a fully mature farmer-harvestable
+// crop (`wheat[age=7]`, `carrots[age=7]`, `potatoes[age=7]`, `beetroots[age=3]`).
+func IsMatureFarmerCropState(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	age, _ := strconv.Atoi(info.Properties["age"])
+	switch info.Name {
+	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes":
+		return age >= 7
+	case "minecraft:beetroots":
+		return age >= 3
+	default:
+		return false
+	}
+}
+
+// IsVillagerPlantableSeed reports whether itemName belongs to the vanilla
+// `#minecraft:villager_plantable_seeds` item tag (`wheat_seeds`, `potato`,
+// `carrot`, `beetroot_seeds`, `torchflower_seeds`, `pitcher_pod`).
+func IsVillagerPlantableSeed(itemName string) bool {
+	_, _, ok := FarmerPlantableSeedBlockState(itemName)
+	return ok
+}
+
+// FarmerPlantableSeedBlockState maps a `#minecraft:villager_plantable_seeds`
+// item ID to the initial crop block state placed on farmland.
+func FarmerPlantableSeedBlockState(itemName string) (uint16, string, bool) {
+	id := strings.TrimSpace(strings.ToLower(itemName))
+	if id == "" {
+		return StateAir, "", false
+	}
+	if !strings.Contains(id, ":") {
+		id = "minecraft:" + id
+	}
+	var blockName string
+	var props map[string]string
+	switch id {
+	case "minecraft:wheat_seeds":
+		blockName = "minecraft:wheat"
+		props = map[string]string{"age": "0"}
+	case "minecraft:carrot", "minecraft:carrots":
+		blockName = "minecraft:carrots"
+		props = map[string]string{"age": "0"}
+	case "minecraft:potato", "minecraft:potatoes":
+		blockName = "minecraft:potatoes"
+		props = map[string]string{"age": "0"}
+	case "minecraft:beetroot_seeds":
+		blockName = "minecraft:beetroots"
+		props = map[string]string{"age": "0"}
+	case "minecraft:torchflower_seeds":
+		blockName = "minecraft:torchflower_crop"
+		props = map[string]string{"age": "0"}
+	case "minecraft:pitcher_pod":
+		blockName = "minecraft:pitcher_crop"
+		props = map[string]string{"age": "0", "half": "lower"}
+	default:
+		return StateAir, "", false
+	}
+	st, ok := nameToStateID(blockName, props)
+	return st, blockName, ok
+}
+
+// CanFarmerWorkAt reports whether a Farmer villager can harvest a mature crop
+// or plant a seed at crop position (x, y, z) above `minecraft:farmland` at (x, y-1, z).
+func (c *Cache) CanFarmerWorkAt(x, y, z int, hasPlantableSeeds bool) (harvestable bool, plantable bool) {
+	if c == nil || y <= c.minY() || y >= c.maxY() {
+		return false, false
+	}
+	if !isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:farmland") {
+		return false, false
+	}
+	cur := c.GetBlock(x, y, z)
+	if IsMatureFarmerCropState(cur) {
+		return true, false
+	}
+	if hasPlantableSeeds && isAirState(cur) {
+		return false, true
+	}
+	return false, false
+}
+
+// FarmerHarvestAndReplantAt executes a Farmer villager's `HarvestFarmland` action
+// at crop position (x, y, z) above `minecraft:farmland` at (x, y-1, z):
+//   - If (x, y, z) holds a mature crop (`IsMatureFarmerCropState`), breaks it,
+//     returns its vanilla drops, and optionally replants `seedItemName` if
+//     valid (`consumedSeed == true`).
+//   - If (x, y, z) is air and `seedItemName` is a valid villager plantable seed,
+//     plants the initial crop state and returns `consumedSeed == true`.
+func (c *Cache) FarmerHarvestAndReplantAt(x, y, z int, seedItemName string, rng *rand.Rand) (drops []ItemStack, consumedSeed bool, res BlockUpdateResult, changed bool) {
+	if c == nil || y <= c.minY() || y >= c.maxY() {
+		return nil, false, res, false
+	}
+	if !isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:farmland") {
+		return nil, false, res, false
+	}
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	cur := c.GetBlock(x, y, z)
+	if IsMatureFarmerCropState(cur) {
+		drops = CropDropsForBlock(cur, 0, rng)
+		c.setBlockRecorded(x, y, z, StateAir, &res)
+		if plantState, _, ok := FarmerPlantableSeedBlockState(seedItemName); ok {
+			c.setBlockRecorded(x, y, z, plantState, &res)
+			consumedSeed = true
+		}
+		c.runNeighborSupportPass(x, y, z, &res)
+		c.scheduleAround(x, y, z)
+		return drops, consumedSeed, res, true
+	}
+	if isAirState(cur) {
+		if plantState, _, ok := FarmerPlantableSeedBlockState(seedItemName); ok {
+			if c.setBlockRecorded(x, y, z, plantState, &res) {
+				c.runNeighborSupportPass(x, y, z, &res)
+				c.scheduleAround(x, y, z)
+				return nil, true, res, true
+			}
+		}
+	}
+	return nil, false, res, false
 }
 
 // LeafDecayDrops computes vanilla item drops (sapling, sticks, apple) when a

@@ -1179,12 +1179,13 @@ func EvaluateBlockDrops(
 		return LeafDecayDrops(state, fortuneLevel, rng)
 	}
 
-	// Crops (`wheat`, `carrots`, `potatoes`, `beetroots`, `nether_wart`, `cocoa`, `sweet_berry_bush`, stems):
+	// Crops (`wheat`, `carrots`, `potatoes`, `beetroots`, `nether_wart`, `cocoa`, `sweet_berry_bush`, `torchflower_crop`, `pitcher_crop`, stems):
 	switch name {
 	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
 		"minecraft:melon_stem", "minecraft:attached_melon_stem",
 		"minecraft:pumpkin_stem", "minecraft:attached_pumpkin_stem",
-		"minecraft:nether_wart", "minecraft:cocoa", "minecraft:sweet_berry_bush":
+		"minecraft:nether_wart", "minecraft:cocoa", "minecraft:sweet_berry_bush",
+		"minecraft:torchflower_crop", "minecraft:pitcher_crop":
 		return CropDropsForBlock(state, fortuneLevel, rng)
 	}
 
@@ -1257,7 +1258,7 @@ func isDoubleHeightPlantName(name string) bool {
 	switch name {
 	case "minecraft:tall_grass", "minecraft:large_fern", "minecraft:tall_seagrass",
 		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
-		"minecraft:pitcher_plant":
+		"minecraft:pitcher_plant", "minecraft:pitcher_crop":
 		return true
 	default:
 		return false

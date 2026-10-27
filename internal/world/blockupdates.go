@@ -786,7 +786,7 @@ func (c *Cache) propagateMultiBlockPartnerBreak(x, y, z int, brokenState uint16,
 	if half != "lower" && half != "upper" {
 		return
 	}
-	if !isDoubleHeightBlock(info.Name) {
+	if !isDoubleHeightBlock(info.Name) && info.Name != "minecraft:pitcher_crop" {
 		return
 	}
 	partnerY := y + 1
@@ -1162,6 +1162,35 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 			}
 			return state, true
 		}
+	}
+
+	// 6b. Pitcher crop (single-block at age 0..1 with half=lower on farmland; double-height at age 2..4 with lower+upper).
+	if name == "minecraft:pitcher_crop" {
+		half := props["half"]
+		age, _ := strconv.Atoi(props["age"])
+		if half == "upper" {
+			if age < 2 || y <= MinY {
+				return replacement, false
+			}
+			bInfo, ok := stateByID(c.GetBlock(x, y-1, z))
+			if !ok || bInfo.Name != "minecraft:pitcher_crop" || bInfo.Properties["half"] != "lower" || bInfo.Properties["age"] != props["age"] {
+				return replacement, false
+			}
+			return state, true
+		}
+		if y <= MinY || !isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:farmland") {
+			return replacement, false
+		}
+		if age >= 2 {
+			if y+1 >= MinY+WorldHeight {
+				return replacement, false
+			}
+			uInfo, ok := stateByID(c.GetBlock(x, y+1, z))
+			if !ok || uInfo.Name != "minecraft:pitcher_crop" || uInfo.Properties["half"] != "upper" || uInfo.Properties["age"] != props["age"] {
+				return replacement, false
+			}
+		}
+		return state, true
 	}
 
 	// 7. Floor-supported plants & flora (short_grass, fern, flowers, saplings, mushrooms, crops, dead_bush, lily_pad, bamboo, etc.).
@@ -2254,6 +2283,7 @@ func isPlantRequiringSoil(name string) bool {
 		"minecraft:crimson_fungus", "minecraft:warped_fungus",
 		"minecraft:crimson_roots", "minecraft:warped_roots", "minecraft:nether_sprouts",
 		"minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
+		"minecraft:torchflower_crop",
 		"minecraft:melon_stem", "minecraft:pumpkin_stem",
 		"minecraft:attached_melon_stem", "minecraft:attached_pumpkin_stem",
 		"minecraft:azalea", "minecraft:flowering_azalea",
@@ -2291,6 +2321,7 @@ func canPlantSurviveOn(plantName string, below uint16) bool {
 	case "minecraft:brown_mushroom", "minecraft:red_mushroom":
 		return isSturdySupportBlock(below) || isSoilOrFarmland(below)
 	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
+		"minecraft:torchflower_crop", "minecraft:pitcher_crop",
 		"minecraft:melon_stem", "minecraft:pumpkin_stem",
 		"minecraft:attached_melon_stem", "minecraft:attached_pumpkin_stem":
 		return bInfo.Name == "minecraft:farmland"
