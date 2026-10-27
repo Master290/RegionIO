@@ -46,6 +46,7 @@ const (
 	StateRedSandstone uint16 = 13247
 	StateCalcite      uint16 = 24687
 	StatePowderSnow   uint16 = 24689
+	StateVoidAir      uint16 = 15292
 )
 
 // BiomePlains is the network ID (registry index) of minecraft:plains.
@@ -148,7 +149,7 @@ func (c *Chunk) ParityHeightmaps() [3][256]int16 {
 			}
 			for y := minY + height - 1; y >= minY; y-- {
 				state := c.getBlock(x, y, z)
-				if maps[0][idx] == int16(minY-1) && state != StateAir {
+				if maps[0][idx] == int16(minY-1) && !isAirState(state) {
 					maps[0][idx] = int16(y)
 				}
 				if maps[1][idx] == int16(minY-1) && blocksMotionOrFluid(state) {
@@ -431,7 +432,7 @@ func (c *Chunk) heightmaps() (surface, motion, motionNoLeaves [256]uint16) {
 				for ly := 15; ly >= 0; ly-- {
 					y := MinY + si*16 + ly
 					state := s[blockIndex(lx, y, lz)]
-					if state == StateAir {
+					if isAirState(state) {
 						continue
 					}
 					h := uint16(y + 1 - minY)
@@ -510,7 +511,7 @@ func (c *Chunk) writeSection(w *protocol.Writer, i int) {
 // Waterlogged blocks count, which is why the flag is per block state.
 func sectionCounts(s *[sectionVol]uint16) (nonEmpty, fluid uint16) {
 	for _, v := range s {
-		if v == StateAir {
+		if isAirState(v) {
 			continue
 		}
 		nonEmpty++

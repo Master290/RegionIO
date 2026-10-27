@@ -136,3 +136,70 @@ func TestCarverLavaFloor(t *testing.T) {
 		t.Errorf("%d air against %d lava below the lava level; deep tunnels should fill", deepAir, deepLava)
 	}
 }
+
+func TestCarverAquiferHeightmapAndCaveAirResiduals(t *testing.T) {
+	stateByIDOnce.Do(buildStateTable)
+	caveAirID, ok1 := nameToStateID("minecraft:cave_air", nil)
+	voidAirID, ok2 := nameToStateID("minecraft:void_air", nil)
+	if !ok1 || !ok2 {
+		t.Fatalf("missing cave_air or void_air in state table")
+	}
+	if StateCaveAir != caveAirID {
+		t.Fatalf("StateCaveAir = %d, want %d (minecraft:cave_air)", StateCaveAir, caveAirID)
+	}
+	if StateVoidAir != voidAirID {
+		t.Fatalf("StateVoidAir = %d, want %d (minecraft:void_air)", StateVoidAir, voidAirID)
+	}
+
+	// Verify heightmaps, sectionCounts, freezeWorldgenTopY, and Store.LoadVanillaHeightmaps
+	// ignore cave_air and void_air just like plain air (Heightmap.NOT_AIR = !state.isAir()).
+	c := NewChunk(0, 0, BiomePlains)
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			c.SetBlock(lx, 60, lz, StateStone)
+		}
+	}
+	c.SetBlock(0, 65, 0, StateCaveAir)
+	c.SetBlock(1, 66, 1, StateVoidAir)
+	c.SetBlock(2, 62, 2, StateOakLeaf)
+
+	pMaps := c.ParityHeightmaps()
+	if got := pMaps[0][0]; got != 60 {
+		t.Errorf("ParityHeightmaps WORLD_SURFACE under cave_air = %d, want 60", got)
+	}
+	if got := pMaps[0][1*16+1]; got != 60 {
+		t.Errorf("ParityHeightmaps WORLD_SURFACE under void_air = %d, want 60", got)
+	}
+
+	reg, err := newDecorationRegion([]*Chunk{c})
+	if err != nil {
+		t.Fatalf("newDecorationRegion: %v", err)
+	}
+	if got := reg.heightAt("WORLD_SURFACE_WG", 0, 0); got != 61 {
+		t.Errorf("WORLD_SURFACE_WG under cave_air = %d, want 61", got)
+	}
+	if got := reg.heightAt("WORLD_SURFACE", 0, 0); got != 61 {
+		t.Errorf("WORLD_SURFACE under cave_air = %d, want 61", got)
+	}
+
+	si := (65 - MinY) >> 4
+	if nonEmpty, _ := sectionCounts(c.sections[si]); nonEmpty != 0 {
+		t.Errorf("section with only cave_air/void_air reported nonEmptyBlockCount = %d, want 0", nonEmpty)
+	}
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.SaveChunk(c); err != nil {
+		t.Fatalf("SaveChunk: %v", err)
+	}
+	loadedMaps, err := store.LoadVanillaHeightmaps(0, 0)
+	if err != nil {
+		t.Fatalf("LoadVanillaHeightmaps: %v", err)
+	}
+	if loadedMaps != pMaps {
+		t.Errorf("LoadVanillaHeightmaps mismatch against ParityHeightmaps")
+	}
+}

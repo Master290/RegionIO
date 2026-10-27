@@ -282,6 +282,10 @@ func (s *Store) LoadVanillaHeightmaps(cx, cz int32) ([3][256]int16, error) {
 	if !ok {
 		return out, errors.New("world: vanilla Heightmaps is not a compound")
 	}
+	minY := MinY
+	if s.dimType != nil {
+		minY = int(s.dimType.MinY)
+	}
 	for kind, name := range []string{"WORLD_SURFACE", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"} {
 		tag, ok := compound.Get(name)
 		if !ok {
@@ -295,7 +299,7 @@ func (s *Store) LoadVanillaHeightmaps(cx, cz int32) ([3][256]int16, error) {
 			longIndex := index / 7
 			bitOffset := uint((index % 7) * 9)
 			value := (uint64(longs[longIndex]) >> bitOffset) & 0x1ff
-			out[kind][index] = int16(MinY + int(value) - 1)
+			out[kind][index] = int16(minY + int(value) - 1)
 		}
 	}
 	return out, nil
@@ -489,29 +493,23 @@ func sectionToNBT(c *Chunk, si int) *nbt.Compound {
 	return sec
 }
 
-// buildHeightmaps emits a minimal WORLD_SURFACE heightmap (the first non-air
-// block per column, packed 9 bits/value, 7 per long like vanilla). Other
-// heightmaps are omitted; vanilla recomputes what it needs.
+// buildHeightmaps emits the three client heightmaps (WORLD_SURFACE,
+// MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES), packed 9 bits/value, 7 per long
+// like vanilla.
 func buildHeightmaps(c *Chunk) *nbt.Compound {
-	const bits = 9
-	longs := make(nbt.LongArray, 37) // 256 values × 9 bits / 64 ≈ 36, +1
-	perLong := 64 / bits             // 7
-	minY := c.minY()
-	for x := 0; x < 16; x++ {
-		for z := 0; z < 16; z++ {
-			h := topNonAirY(c, x, z)
-			// heightmap value is (y - minY + 1); store absolute block count.
-			val := int64(h - minY + 1)
-			if val < 0 {
-				val = 0
-			}
-			idx := z*16 + x
-			longIdx := idx / perLong
-			bitOff := (idx % perLong) * bits
-			longs[longIdx] |= val << uint(bitOff)
+	surface, motion, motionNoLeaves := c.heightmaps()
+	packToNBT := func(h [256]uint16) nbt.LongArray {
+		packed := packHeightmap(h)
+		longs := make(nbt.LongArray, len(packed))
+		for i, v := range packed {
+			longs[i] = int64(v)
 		}
+		return longs
 	}
-	return nbt.NewCompound().Set("WORLD_SURFACE", longs)
+	return nbt.NewCompound().
+		Set("WORLD_SURFACE", packToNBT(surface)).
+		Set("MOTION_BLOCKING", packToNBT(motion)).
+		Set("MOTION_BLOCKING_NO_LEAVES", packToNBT(motionNoLeaves))
 }
 
 // topNonAirY returns the Y of the highest non-air block in column (x,z), or
@@ -524,7 +522,7 @@ func topNonAirY(c *Chunk, x, z int) int {
 			continue
 		}
 		for ly := 15; ly >= 0; ly-- {
-			if s[blockIndex(x, MinY+si*16+ly, z)] != StateAir {
+			if !isAirState(s[blockIndex(x, MinY+si*16+ly, z)]) {
 				return MinY + si*16 + ly
 			}
 		}

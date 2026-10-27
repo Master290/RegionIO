@@ -117,7 +117,7 @@ func freezeWorldgenTopY(chunk *Chunk) *worldgenTopY {
 				baseY := MinY + (si << 4)
 				for ly := 15; ly >= 0; ly-- {
 					state := sec[(ly<<8)|colOff]
-					if state == StateAir {
+					if isAirState(state) {
 						continue
 					}
 					y := baseY + ly
@@ -227,7 +227,7 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 		match := false
 		switch kind {
 		case "WORLD_SURFACE":
-			match = state != StateAir
+			match = !isAirState(state)
 		case "OCEAN_FLOOR":
 			match = stateFlags(state)&flagBlocksMotion != 0
 		case "MOTION_BLOCKING":

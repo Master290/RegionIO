@@ -76,3 +76,34 @@ func TestMthTrigParity(t *testing.T) {
 		t.Error("MthSin agrees with math.Sin to within 1e-6; the lookup table is gone")
 	}
 }
+
+func TestCarverHeightProvidersAndCaveAirState(t *testing.T) {
+	if want := defaultBlockIDs["minecraft:cave_air"]; blockCaveAir != want {
+		t.Fatalf("blockCaveAir = %d, want %d (minecraft:cave_air)", blockCaveAir, want)
+	}
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		lo   int
+		hi   int
+	}{
+		{"constant", `{"type":"minecraft:constant","value":{"absolute":42}}`, 42, 42},
+		{"uniform", `{"type":"minecraft:uniform","min_inclusive":{"above_bottom":8},"max_inclusive":{"absolute":47}}`, -56, 47},
+		{"biased_to_bottom", `{"type":"minecraft:biased_to_bottom","min_inclusive":{"absolute":0},"max_inclusive":{"absolute":60},"inner":4}`, 0, 60},
+		{"very_biased_to_bottom", `{"type":"minecraft:very_biased_to_bottom","min_inclusive":{"absolute":-32},"max_inclusive":{"absolute":32},"inner":8}`, -32, 32},
+		{"trapezoid", `{"type":"minecraft:trapezoid","min_inclusive":{"absolute":-16},"max_inclusive":{"absolute":48},"plateau":16}`, -16, 48},
+	} {
+		hp, err := parseHeightProvider([]byte(tc.raw))
+		if err != nil {
+			t.Fatalf("%s: parseHeightProvider failed: %v", tc.name, err)
+		}
+		rng := NewLegacy(12345)
+		for i := 0; i < 64; i++ {
+			y := hp.sample(rng, -64, 384)
+			if y < tc.lo || y > tc.hi {
+				t.Fatalf("%s sample %d = %d, out of [%d, %d]", tc.name, i, y, tc.lo, tc.hi)
+			}
+		}
+	}
+}

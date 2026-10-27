@@ -310,8 +310,7 @@ func isLavaState(state uint16) bool {
 // like vanilla's isAir()/isEmptyBlock - comparing against StateAir (plain
 // air) silently treats carved caves as solid.
 func isAirState(state uint16) bool {
-	stateByIDOnce.Do(buildStateTable)
-	return int(state) < totalBlockStates && stateSpecialTable[state]&specialAir != 0
+	return state == StateAir || state == StateCaveAir || state == StateVoidAir
 }
 
 func flattenBlockTagContains(set *worldgen.FeatureSet, tag, name string) bool {

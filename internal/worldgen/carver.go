@@ -113,14 +113,70 @@ func (u uniformHeight) sample(r RandomSource, minY, height int) int {
 	return randomBetweenInclusive(r, lo, hi)
 }
 
+type biasedToBottomHeight struct {
+	lo, hi     anchorJSON
+	inner      int
+	veryBiased bool
+}
+
+func (b biasedToBottomHeight) sample(r RandomSource, minY, height int) int {
+	lo := resolveAnchorY(b.lo, minY, height)
+	hi := resolveAnchorY(b.hi, minY, height)
+	inner := max(b.inner, 1)
+	if hi-lo-inner+1 <= 0 {
+		return lo
+	}
+	first := int(r.NextIntN(int32(hi - lo - inner + 1)))
+	if b.veryBiased {
+		return lo + int(r.NextIntN(int32(first+inner)))
+	}
+	return lo + int(r.NextIntN(int32(first+1))) + inner - 1
+}
+
+type trapezoidHeight struct {
+	lo, hi  anchorJSON
+	plateau int
+}
+
+func (t trapezoidHeight) sample(r RandomSource, minY, height int) int {
+	lo := resolveAnchorY(t.lo, minY, height)
+	hi := resolveAnchorY(t.hi, minY, height)
+	if lo > hi {
+		return lo
+	}
+	span := hi - lo
+	if t.plateau >= span {
+		return randomBetweenInclusive(r, lo, hi)
+	}
+	slope := (span - t.plateau) / 2
+	flat := span - slope
+	return lo + randomBetweenInclusive(r, 0, flat) + randomBetweenInclusive(r, 0, slope)
+}
+
 func parseHeightProvider(raw json.RawMessage) (heightProvider, error) {
 	var obj struct {
 		Type         string     `json:"type"`
+		Value        anchorJSON `json:"value"`
 		MinInclusive anchorJSON `json:"min_inclusive"`
 		MaxInclusive anchorJSON `json:"max_inclusive"`
+		Inner        int        `json:"inner"`
+		Plateau      int        `json:"plateau"`
 	}
-	if err := json.Unmarshal(raw, &obj); err == nil && obj.Type == "minecraft:uniform" {
-		return uniformHeight{obj.MinInclusive, obj.MaxInclusive}, nil
+	if err := json.Unmarshal(raw, &obj); err == nil && obj.Type != "" {
+		switch obj.Type {
+		case "minecraft:constant":
+			return constantHeight{obj.Value}, nil
+		case "minecraft:uniform":
+			return uniformHeight{obj.MinInclusive, obj.MaxInclusive}, nil
+		case "minecraft:biased_to_bottom":
+			return biasedToBottomHeight{lo: obj.MinInclusive, hi: obj.MaxInclusive, inner: obj.Inner, veryBiased: false}, nil
+		case "minecraft:very_biased_to_bottom":
+			return biasedToBottomHeight{lo: obj.MinInclusive, hi: obj.MaxInclusive, inner: obj.Inner, veryBiased: true}, nil
+		case "minecraft:trapezoid":
+			return trapezoidHeight{lo: obj.MinInclusive, hi: obj.MaxInclusive, plateau: obj.Plateau}, nil
+		default:
+			return nil, fmt.Errorf("carver: unsupported height provider %q", obj.Type)
+		}
 	}
 	var anchor anchorJSON
 	if err := json.Unmarshal(raw, &anchor); err != nil {
@@ -814,7 +870,7 @@ const (
 	blockGrass         uint16 = 9
 	blockMyceliumSnowy uint16 = 8918
 	blockMycelium      uint16 = 8919
-	blockCaveAir       uint16 = 12953
+	blockCaveAir       uint16 = 15293
 )
 
 func isSurfaceTop(state uint16) bool {

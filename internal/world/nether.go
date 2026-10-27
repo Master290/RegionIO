@@ -15,7 +15,7 @@ const (
 	StateSoulSand        uint16 = 6998
 	StateSoulSoil        uint16 = 6999
 	StateBasalt          uint16 = 7001
-	StateCaveAir         uint16 = 12953
+	StateCaveAir         uint16 = 15293
 	StateMagmaBlock      uint16 = 14845
 	StateNetherWartBlock uint16 = 14846
 	StateWarpedNylium    uint16 = 20957
