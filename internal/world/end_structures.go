@@ -20,6 +20,7 @@ type EndCityPiece struct {
 
 // EndCityStart holds the generated piece list and bounding box of an End City.
 type EndCityStart struct {
+	Seed   int64
 	ChunkX int32
 	ChunkZ int32
 	Origin [3]int
@@ -369,6 +370,9 @@ func EndCityGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Struct
 	var start *EndCityStart
 	if minY >= 60 && isStructureBiomeAllowed(od, sets, def, pos[0], pos[1], pos[2]) {
 		start = BuildEndCityStart(cx, cz, pos, rot, &r)
+		if start != nil {
+			start.Seed = seed
+		}
 	}
 	endCityCacheMu.Lock()
 	if len(endCityCache) >= maxEndCityCacheEntries {
@@ -377,6 +381,36 @@ func EndCityGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Struct
 	endCityCache[key] = start
 	endCityCacheMu.Unlock()
 	return start
+}
+
+func endCityLootSeed(worldSeed int64, x, y, z int) int64 {
+	posSeed := blockPosAsLong(x, y, z)
+	if worldSeed == 0 {
+		return posSeed
+	}
+	s := posSeed ^ (worldSeed * 6364136223846793005)
+	if s == 0 {
+		return posSeed
+	}
+	return s
+}
+
+func isEndCityRandomizableContainer(blockName string) (string, bool) {
+	switch normalizeResourceID(blockName) {
+	case "minecraft:chest":
+		return "minecraft:chest", true
+	case "minecraft:trapped_chest":
+		return "minecraft:trapped_chest", true
+	case "minecraft:barrel":
+		return "minecraft:barrel", true
+	case "minecraft:shulker_box":
+		return "minecraft:shulker_box", true
+	default:
+		if strings.HasSuffix(blockName, "_shulker_box") {
+			return "minecraft:shulker_box", true
+		}
+		return "", false
+	}
 }
 
 // PlaceEndCity renders all pieces of an EndCityStart that intersect chunk (cx, cz).
@@ -410,7 +444,7 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 			st := rotateTemplateState(b.State, piece.Rot)
 			setEndBlock(c, wx, wy, wz, st)
 			if b.NBT != nil {
-				if be, ok := extractTemplateBlockEntity(wx, wy, wz, b.BlockName, b.NBT, blockPosAsLong(wx, wy, wz)); ok {
+				if be, ok := extractTemplateBlockEntity(wx, wy, wz, b.BlockName, b.NBT, endCityLootSeed(start.Seed, wx, wy, wz)); ok {
 					c.AddStructureBlockEntity(be)
 				}
 			} else if be, ok := defaultBlockEntityForBlock(b.BlockName, wx, wy, wz); ok {
@@ -428,16 +462,24 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 			wx := piece.Pos[0] + rel[0]
 			wy := piece.Pos[1] + rel[1]
 			wz := piece.Pos[2] + rel[2]
+			if chunkBox.isInside(wx, wy, wz) {
+				setEndBlock(c, wx, wy, wz, StateAir)
+				c.RemoveStructureBlockEntity(wx, wy, wz)
+			}
 			if strings.HasPrefix(b.Marker, "Chest") {
 				if chunkBox.isInside(wx, wy-1, wz) {
-					c.AddStructureBlockEntity(StructureBlockEntity{
-						ID:            "minecraft:chest",
-						X:             wx,
-						Y:             wy - 1,
-						Z:             wz,
-						LootTable:     "minecraft:chests/end_city_treasure",
-						LootTableSeed: blockPosAsLong(wx, wy-1, wz),
-					})
+					belowState := getEndBlock(c, wx, wy-1, wz)
+					belowName := BlockName(belowState)
+					if beID, ok := isEndCityRandomizableContainer(belowName); ok {
+						c.AddStructureBlockEntity(StructureBlockEntity{
+							ID:            beID,
+							X:             wx,
+							Y:             wy - 1,
+							Z:             wz,
+							LootTable:     "minecraft:chests/end_city_treasure",
+							LootTableSeed: endCityLootSeed(start.Seed, wx, wy-1, wz),
+						})
+					}
 				}
 				continue
 			}

@@ -1,8 +1,10 @@
 package world
 
 import (
+	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"sync"
 
 	"regionio/internal/registry"
@@ -52,8 +54,11 @@ type endBlockIDs struct {
 	purpurPillar    uint16
 	endRod          uint16
 	endGateway      uint16
+	endPortal       uint16
+	dragonEgg       uint16
 	obsidian        uint16
 	fire            uint16
+	wallTorch       [4]uint16 // 0=north, 1=east, 2=south, 3=west
 	chorusFlower    [6]uint16
 	chorusPlant     [64]uint16 // bitmask: bit0=down, bit1=up, bit2=north, bit3=east, bit4=south, bit5=west
 	ironBars        [16]uint16 // bitmask: bit0=north, bit1=south, bit2=west, bit3=east
@@ -79,8 +84,19 @@ func loadEndBlocks() *endBlockIDs {
 		endBlocks.purpurPillar = def("minecraft:purpur_pillar", endBlocks.endStone)
 		endBlocks.endRod = def("minecraft:end_rod", StateAir)
 		endBlocks.endGateway = def("minecraft:end_gateway", StateBedrock)
+		endBlocks.endPortal = def("minecraft:end_portal", StateAir)
+		endBlocks.dragonEgg = def("minecraft:dragon_egg", StateBedrock)
 		endBlocks.obsidian = def("minecraft:obsidian", StateBedrock)
 		endBlocks.fire = def("minecraft:fire", StateAir)
+
+		defWallTorch := def("minecraft:wall_torch", StateAir)
+		for i, dir := range [4]string{"north", "east", "south", "west"} {
+			if id, ok := nameToStateID("minecraft:wall_torch", map[string]string{"facing": dir}); ok {
+				endBlocks.wallTorch[i] = id
+			} else {
+				endBlocks.wallTorch[i] = defWallTorch
+			}
+		}
 
 		defFlower := def("minecraft:chorus_flower", StateAir)
 		for age := 0; age <= 5; age++ {
@@ -370,19 +386,6 @@ func setEndBlock(c *Chunk, x, y, z int, state uint16) {
 	c.setBlockRaw(lx, y, lz, state)
 }
 
-func topEndNonAirY(c *Chunk, x, z int) int {
-	lx, lz := x-int(c.X)*16, z-int(c.Z)*16
-	if lx < 0 || lx > 15 || lz < 0 || lz > 15 {
-		return -1
-	}
-	for y := EndDimensionType.Height - 1; y >= endMinY; y-- {
-		if c.GetBlock(lx, y, lz) != StateAir {
-			return y
-		}
-	}
-	return -1
-}
-
 // PlaceEndIsland ports EndIslandFeature.place (26.1.2).
 func PlaceEndIsland(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
 	eb := loadEndBlocks()
@@ -534,9 +537,75 @@ func PlaceEndPlatform(c *Chunk) {
 	}
 }
 
-// PlaceEndGateway ports EndGatewayFeature.place (26.1.2).
+// EndSpawnPointPos is Vanilla's ServerLevel.END_SPAWN_POINT (100, 50, 0), used
+// as the exact return target for natural outer-island End gateways.
+var EndSpawnPointPos = [3]int{100, 50, 0}
+
+// NewEndGatewayBlockEntity constructs a StructureBlockEntity for a
+// minecraft:end_gateway block at (x, y, z) with optional exit target and
+// exact-teleport flag encoded in KeyItem/NormalConfig so it round-trips through Anvil NBT.
+func NewEndGatewayBlockEntity(x, y, z int, exitPortal *[3]int, exact bool) StructureBlockEntity {
+	var cfg string
+	if exitPortal != nil {
+		mode := "approx"
+		if exact {
+			mode = "exact"
+		}
+		cfg = fmt.Sprintf("minecraft:%d,%d,%d:%s", exitPortal[0], exitPortal[1], exitPortal[2], mode)
+	}
+	return StructureBlockEntity{
+		ID:           "minecraft:end_gateway",
+		X:            x,
+		Y:            y,
+		Z:            z,
+		NormalConfig: cfg,
+		KeyItem:      cfg,
+	}
+}
+
+// ParseEndGatewayBlockEntity decodes the exit portal coordinates and
+// exact-teleport flag from an End gateway StructureBlockEntity.
+func ParseEndGatewayBlockEntity(be StructureBlockEntity) (exitPortal [3]int, exact bool, hasExit bool) {
+	rawCfg := be.KeyItem
+	if rawCfg == "" {
+		rawCfg = be.NormalConfig
+	}
+	if be.ID != "minecraft:end_gateway" || rawCfg == "" {
+		return [3]int{}, false, false
+	}
+	raw := strings.TrimPrefix(rawCfg, "minecraft:")
+	parts := strings.SplitN(raw, ":", 2)
+	coords := strings.Split(parts[0], ",")
+	if len(coords) != 3 {
+		return [3]int{}, false, false
+	}
+	x, errX := strconv.Atoi(coords[0])
+	y, errY := strconv.Atoi(coords[1])
+	z, errZ := strconv.Atoi(coords[2])
+	if errX != nil || errY != nil || errZ != nil {
+		return [3]int{}, false, false
+	}
+	if len(parts) == 2 && parts[1] == "exact" {
+		exact = true
+	}
+	return [3]int{x, y, z}, exact, true
+}
+
+// PlaceEndGateway ports EndGatewayFeature.place (26.1.2) using the default
+// return gateway exit configuration (ServerLevel.END_SPAWN_POINT = (100, 50, 0), exact=true).
 func PlaceEndGateway(c *Chunk, ox, oy, oz int) bool {
+	return PlaceEndGatewayWithConfig(c, ox, oy, oz, &EndSpawnPointPos, true)
+}
+
+// PlaceEndGatewayWithConfig ports EndGatewayFeature.place (26.1.2) with an
+// explicit exit portal target and exact-teleport flag.
+func PlaceEndGatewayWithConfig(c *Chunk, ox, oy, oz int, exitPortal *[3]int, exact bool) bool {
 	eb := loadEndBlocks()
+	minX, maxX := int(c.X)*16, int(c.X)*16+15
+	minZ, maxZ := int(c.Z)*16, int(c.Z)*16+15
+	if ox+1 < minX || ox-1 > maxX || oz+1 < minZ || oz-1 > maxZ {
+		return false
+	}
 	for z := oz - 1; z <= oz+1; z++ {
 		for y := oy - 2; y <= oy+2; y++ {
 			for x := ox - 1; x <= ox+1; x++ {
@@ -546,6 +615,9 @@ func PlaceEndGateway(c *Chunk, ox, oy, oz int) bool {
 				capY := abs(y-oy) == 2
 				if sameX && sameY && sameZ {
 					setEndBlock(c, x, y, z, eb.endGateway)
+					if x >= minX && x <= maxX && z >= minZ && z <= maxZ && y >= endMinY && y < EndDimensionType.Height {
+						c.AddStructureBlockEntity(NewEndGatewayBlockEntity(x, y, z, exitPortal, exact))
+					}
 				} else if sameY {
 					setEndBlock(c, x, y, z, StateAir)
 				} else if capY && sameX && sameZ {
@@ -561,22 +633,304 @@ func PlaceEndGateway(c *Chunk, ox, oy, oz int) bool {
 	return true
 }
 
-// PlaceChorusPlant ports ChorusPlantFeature.place + ChorusFlowerBlock.generatePlant (26.1.2).
-func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
-	eb := loadEndBlocks()
-	if getEndBlock(c, ox, oy, oz) != StateAir || getEndBlock(c, ox, oy-1, oz) != eb.endStone {
+// EndPodiumOrigin computes the (0, y, 0) origin for the central End exit portal
+// (EndPodiumFeature) on the given End density router, matching EndDragonFight.spawnExitPortal.
+func EndPodiumOrigin(od *worldgen.OverworldDensity) [3]int {
+	if od == nil {
+		return [3]int{0, 64, 0}
+	}
+	y := EndFirstOccupiedHeight(od, 0, 0)
+	if y < 48 {
+		y = 64
+	}
+	return [3]int{0, y, 0}
+}
+
+// PlaceEndPodium ports EndPodiumFeature.place (26.1.2) centered at (ox, oy, oz).
+// When active is true, fills the inner basin with minecraft:end_portal; when false,
+// leaves the inner basin as air. Clips cleanly to chunk c so it can be applied
+// across all 4 chunks intersecting (0, oy, 0).
+func PlaceEndPodium(c *Chunk, ox, oy, oz int, active bool) bool {
+	if c == nil {
 		return false
 	}
-	overlay := make(map[[3]int]uint16)
-	getB := func(x, y, z int) uint16 {
-		if st, ok := overlay[[3]int{x, y, z}]; ok {
-			return st
-		}
-		return getEndBlock(c, x, y, z)
+	eb := loadEndBlocks()
+	minX, maxX := int(c.X)*16, int(c.X)*16+15
+	minZ, maxZ := int(c.Z)*16, int(c.Z)*16+15
+	if ox+4 < minX || ox-4 > maxX || oz+4 < minZ || oz-4 > maxZ {
+		return false
 	}
-	setB := func(x, y, z int, st uint16) {
-		overlay[[3]int{x, y, z}] = st
-		setEndBlock(c, x, y, z, st)
+	for dz := -4; dz <= 4; dz++ {
+		for dx := -4; dx <= 4; dx++ {
+			distSq := dx*dx + dz*dz
+			if distSq > 12 { // > 3.5^2
+				continue
+			}
+			wx, wz := ox+dx, oz+dz
+			for dy := -1; dy <= 32; dy++ {
+				wy := oy + dy
+				if dy < 0 {
+					if distSq <= 6 { // <= 2.5^2
+						setEndBlock(c, wx, wy, wz, StateBedrock)
+					} else {
+						setEndBlock(c, wx, wy, wz, eb.endStone)
+					}
+				} else if dy > 0 {
+					setEndBlock(c, wx, wy, wz, StateAir)
+				} else {
+					if distSq > 6 {
+						setEndBlock(c, wx, wy, wz, StateBedrock)
+					} else if active {
+						setEndBlock(c, wx, wy, wz, eb.endPortal)
+					} else {
+						setEndBlock(c, wx, wy, wz, StateAir)
+					}
+				}
+			}
+		}
+	}
+	for dy := 0; dy < 4; dy++ {
+		setEndBlock(c, ox, oy+dy, oz, StateBedrock)
+	}
+	torchY := oy + 2
+	// 0=north (dz=-1), 1=east (dx=+1), 2=south (dz=+1), 3=west (dx=-1)
+	setEndBlock(c, ox, torchY, oz-1, eb.wallTorch[0])
+	setEndBlock(c, ox+1, torchY, oz, eb.wallTorch[1])
+	setEndBlock(c, ox, torchY, oz+1, eb.wallTorch[2])
+	setEndBlock(c, ox-1, torchY, oz, eb.wallTorch[3])
+	return true
+}
+
+// EndRingGatewayOrder returns the deterministic 20-element ring gateway spawn
+// order for the given world seed (EndDragonFight gateways shuffle).
+func EndRingGatewayOrder(seed int64) [20]int {
+	var order [20]int
+	for i := 0; i < 20; i++ {
+		order[i] = i
+	}
+	r := worldgen.NewLegacy(seed)
+	for i := 20; i > 1; i-- {
+		j := int(r.NextIntN(int32(i)))
+		order[i-1], order[j] = order[j], order[i-1]
+	}
+	return order
+}
+
+// EndRingGatewayPos returns the world block coordinates (x, 75, z) for the
+// central-island ring gateway at slot (0..19), matching EndDragonFight.spawnNewGateway.
+func EndRingGatewayPos(slot int) [3]int {
+	slot = ((slot % 20) + 20) % 20
+	angle := 2.0 * (-math.Pi + 0.15707963267948966*float64(slot))
+	gx := int(math.Floor(96.0 * math.Cos(angle)))
+	gz := int(math.Floor(96.0 * math.Sin(angle)))
+	return [3]int{gx, 75, gz}
+}
+
+// EndGatewayExitTarget ports TheEndGatewayBlockEntity.findOrCreateValidTeleportPos (26.1.2):
+// given a central ring gateway at (gatewayX, gatewayZ), rays 1024 blocks outward along
+// the normalized direction vector, steps by 16 blocks across the void ring to the first
+// outer-island chunk with solid end_stone (y >= 30), and returns:
+//   - exitPos: safe landing block [x, topY+1, z]
+//   - returnGatewayPos: [x, topY+10, z] where the paired return gateway is placed
+//   - ok: true if a valid outer-island column was found
+func EndGatewayExitTarget(od *worldgen.OverworldDensity, gatewayX, gatewayZ int) (exitPos [3]int, returnGatewayPos [3]int, ok bool) {
+	if od == nil {
+		return [3]int{}, [3]int{}, false
+	}
+	length := math.Hypot(float64(gatewayX), float64(gatewayZ))
+	dirX, dirZ := 1.0, 0.0
+	if length > 1e-6 {
+		dirX = float64(gatewayX) / length
+		dirZ = float64(gatewayZ) / length
+	}
+	vx := dirX * 1024.0
+	vz := dirZ * 1024.0
+
+	chunkHasLand := func(cx, cz int) bool {
+		baseX, baseZ := cx*16, cz*16
+		for dz := 0; dz < 16; dz += 4 {
+			for dx := 0; dx < 16; dx += 4 {
+				if EndFirstOccupiedHeight(od, baseX+dx, baseZ+dz) >= 30 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	for steps := 16; steps > 0 && chunkHasLand(int(math.Floor(vx))>>4, int(math.Floor(vz))>>4); steps-- {
+		vx -= dirX * 16.0
+		vz -= dirZ * 16.0
+	}
+	for steps := 16; steps > 0 && !chunkHasLand(int(math.Floor(vx))>>4, int(math.Floor(vz))>>4); steps-- {
+		vx += dirX * 16.0
+		vz += dirZ * 16.0
+	}
+
+	targetCX := int(math.Floor(vx)) >> 4
+	targetCZ := int(math.Floor(vz)) >> 4
+	bestDistSq := math.MaxFloat64
+	bestPos := [3]int{}
+	found := false
+
+	searchChunk := func(cx, cz int) {
+		baseX, baseZ := cx*16, cz*16
+		for z := baseZ; z < baseZ+16; z++ {
+			for x := baseX; x < baseX+16; x++ {
+				topY := EndFirstOccupiedHeight(od, x, z)
+				if topY < 30 {
+					continue
+				}
+				dx := float64(x) + 0.5 - vx
+				dz := float64(z) + 0.5 - vz
+				dSq := dx*dx + dz*dz
+				if !found || dSq < bestDistSq || (dSq == bestDistSq && topY > bestPos[1]) {
+					bestDistSq = dSq
+					bestPos = [3]int{x, topY, z}
+					found = true
+				}
+			}
+		}
+	}
+
+	searchChunk(targetCX, targetCZ)
+	if !found {
+		for r := 1; r <= 4 && !found; r++ {
+			for dz := -r; dz <= r; dz++ {
+				for dx := -r; dx <= r; dx++ {
+					searchChunk(targetCX+dx, targetCZ+dz)
+				}
+			}
+		}
+	}
+	if !found {
+		return [3]int{}, [3]int{}, false
+	}
+	exitPos = [3]int{bestPos[0], bestPos[1] + 1, bestPos[2]}
+	returnGatewayPos = [3]int{bestPos[0], bestPos[1] + 10, bestPos[2]}
+	return exitPos, returnGatewayPos, true
+}
+
+type endDecorationEnv struct {
+	c        *Chunk
+	od       *worldgen.OverworldDensity
+	minX     int
+	maxX     int
+	minZ     int
+	maxZ     int
+	haloMinX int
+	haloMaxX int
+	haloMinZ int
+	haloMaxZ int
+	extra    map[[3]int]uint16
+	colTopY  map[[2]int]int
+}
+
+func newEndDecorationEnv(c *Chunk, od *worldgen.OverworldDensity) *endDecorationEnv {
+	minX := int(c.X) * 16
+	minZ := int(c.Z) * 16
+	return &endDecorationEnv{
+		c:        c,
+		od:       od,
+		minX:     minX,
+		maxX:     minX + 15,
+		minZ:     minZ,
+		maxZ:     minZ + 15,
+		haloMinX: minX - 16,
+		haloMaxX: minX + 31,
+		haloMinZ: minZ - 16,
+		haloMaxZ: minZ + 31,
+		extra:    make(map[[3]int]uint16, 64),
+		colTopY:  make(map[[2]int]int, 32),
+	}
+}
+
+func (e *endDecorationEnv) setBlock(x, y, z int, st uint16) {
+	if y < endMinY || y >= EndDimensionType.Height {
+		return
+	}
+	if x >= e.minX && x <= e.maxX && z >= e.minZ && z <= e.maxZ {
+		e.c.setBlockRaw(x-e.minX, y, z-e.minZ, st)
+		return
+	}
+	if x >= e.haloMinX && x <= e.haloMaxX && z >= e.haloMinZ && z <= e.haloMaxZ {
+		e.extra[[3]int{x, y, z}] = st
+		if blocksMotionOrFluid(st) {
+			if prev, ok := e.colTopY[[2]int{x, z}]; !ok || y > prev {
+				e.colTopY[[2]int{x, z}] = y
+			}
+		}
+	}
+}
+
+func (e *endDecorationEnv) terrainTopY(x, z int) int {
+	if top, ok := e.colTopY[[2]int{x, z}]; ok {
+		return top
+	}
+	top := -1
+	if e.od != nil {
+		top = EndFirstOccupiedHeight(e.od, x, z)
+	}
+	e.colTopY[[2]int{x, z}] = top
+	return top
+}
+
+func (e *endDecorationEnv) getBlock(x, y, z int, eb *endBlockIDs) uint16 {
+	if y < endMinY || y >= EndDimensionType.Height {
+		return StateAir
+	}
+	if x >= e.minX && x <= e.maxX && z >= e.minZ && z <= e.maxZ {
+		return e.c.GetBlock(x-e.minX, y, z-e.minZ)
+	}
+	if st, ok := e.extra[[3]int{x, y, z}]; ok {
+		return st
+	}
+	if e.od != nil && x >= e.haloMinX && x <= e.haloMaxX && z >= e.haloMinZ && z <= e.haloMaxZ {
+		if top := e.terrainTopY(x, z); top >= 0 && y <= top && y >= 16 {
+			return eb.endStone
+		}
+	}
+	return StateAir
+}
+
+func (e *endDecorationEnv) topMotionBlockingY(x, z int) int {
+	if x >= e.minX && x <= e.maxX && z >= e.minZ && z <= e.maxZ {
+		lx, lz := x-e.minX, z-e.minZ
+		for y := EndDimensionType.Height - 1; y >= endMinY; y-- {
+			if blocksMotionOrFluid(e.c.GetBlock(lx, y, lz)) {
+				return y
+			}
+		}
+		return -1
+	}
+	return e.terrainTopY(x, z)
+}
+
+// PlaceChorusPlant ports ChorusPlantFeature.place + ChorusFlowerBlock.generatePlant (26.1.2).
+func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
+	return placeChorusPlantInEnv(newEndDecorationEnv(c, nil), ox, oy, oz, r)
+}
+
+func placeChorusPlantInEnv(env *endDecorationEnv, ox, oy, oz int, r worldgen.RandomSource) bool {
+	eb := loadEndBlocks()
+	if env.getBlock(ox, oy, oz, eb) != StateAir || env.getBlock(ox, oy-1, oz, eb) != eb.endStone {
+		return false
+	}
+	isChorusConnectable := func(st uint16) bool {
+		if st == eb.endStone {
+			return true
+		}
+		for _, id := range eb.chorusPlant {
+			if st == id && id != StateAir {
+				return true
+			}
+		}
+		for _, id := range eb.chorusFlower {
+			if st == id && id != StateAir {
+				return true
+			}
+		}
+		return false
 	}
 	isChorusOrFlower := func(st uint16) bool {
 		for _, id := range eb.chorusPlant {
@@ -592,29 +946,29 @@ func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
 		return false
 	}
 	plantStateAt := func(x, y, z int) uint16 {
-		below := getB(x, y-1, z)
-		above := getB(x, y+1, z)
-		north := getB(x, y, z-1)
-		east := getB(x+1, y, z)
-		south := getB(x, y, z+1)
-		west := getB(x-1, y, z)
+		below := env.getBlock(x, y-1, z, eb)
+		above := env.getBlock(x, y+1, z, eb)
+		north := env.getBlock(x, y, z-1, eb)
+		east := env.getBlock(x+1, y, z, eb)
+		south := env.getBlock(x, y, z+1, eb)
+		west := env.getBlock(x-1, y, z, eb)
 		mask := 0
-		if isChorusOrFlower(below) || below == eb.endStone {
+		if isChorusConnectable(below) {
 			mask |= 1 // down
 		}
 		if isChorusOrFlower(above) {
 			mask |= 2 // up
 		}
-		if isChorusOrFlower(north) {
+		if isChorusConnectable(north) {
 			mask |= 4 // north
 		}
-		if isChorusOrFlower(east) {
+		if isChorusConnectable(east) {
 			mask |= 8 // east
 		}
-		if isChorusOrFlower(south) {
+		if isChorusConnectable(south) {
 			mask |= 16 // south
 		}
-		if isChorusOrFlower(west) {
+		if isChorusConnectable(west) {
 			mask |= 32 // west
 		}
 		return eb.chorusPlant[mask]
@@ -627,7 +981,7 @@ func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
 			if d == excludeDir {
 				continue
 			}
-			if getB(x+horizDX[d], y, z+horizDZ[d]) != StateAir {
+			if env.getBlock(x+horizDX[d], y, z+horizDZ[d], eb) != StateAir {
 				return false
 			}
 		}
@@ -644,8 +998,8 @@ func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
 			if !allNeighborsEmpty(tx, ty, tz, -1) {
 				return
 			}
-			setB(tx, ty, tz, plantStateAt(tx, ty, tz))
-			setB(tx, ty-1, tz, plantStateAt(tx, ty-1, tz))
+			env.setBlock(tx, ty, tz, plantStateAt(tx, ty, tz))
+			env.setBlock(tx, ty-1, tz, plantStateAt(tx, ty-1, tz))
 		}
 		branched := false
 		if depth < 4 {
@@ -657,24 +1011,42 @@ func PlaceChorusPlant(c *Chunk, ox, oy, oz int, r worldgen.RandomSource) bool {
 				dir := int(r.NextIntN(4))
 				nx, ny, nz := bx+horizDX[dir], by+height, bz+horizDZ[dir]
 				if abs(nx-ox) < 8 && abs(nz-oz) < 8 &&
-					getB(nx, ny, nz) == StateAir &&
-					getB(nx, ny-1, nz) == StateAir &&
+					env.getBlock(nx, ny, nz, eb) == StateAir &&
+					env.getBlock(nx, ny-1, nz, eb) == StateAir &&
 					allNeighborsEmpty(nx, ny, nz, oppDir[dir]) {
 					branched = true
-					setB(nx, ny, nz, plantStateAt(nx, ny, nz))
-					setB(bx, ny, bz, plantStateAt(bx, ny, bz))
+					env.setBlock(nx, ny, nz, plantStateAt(nx, ny, nz))
+					env.setBlock(bx, ny, bz, plantStateAt(bx, ny, bz))
 					growRecursive(nx, ny, nz, depth+1)
 				}
 			}
 		}
 		if !branched {
-			setB(bx, by+height, bz, eb.chorusFlower[5])
+			env.setBlock(bx, by+height, bz, eb.chorusFlower[5])
 		}
 	}
 
-	setB(ox, oy, oz, plantStateAt(ox, oy, oz))
+	env.setBlock(ox, oy, oz, plantStateAt(ox, oy, oz))
 	growRecursive(ox, oy, oz, 0)
 	return true
+}
+
+func placeEndIslandInEnv(env *endDecorationEnv, ox, oy, oz int, r worldgen.RandomSource) {
+	eb := loadEndBlocks()
+	f := float32(r.NextIntN(3)) + 4.0
+	for yOff := 0; f > 0.5; yOff-- {
+		minI := int(math.Floor(float64(-f)))
+		maxI := int(math.Ceil(float64(f)))
+		limit := (f + 1.0) * (f + 1.0)
+		for ix := minI; ix <= maxI; ix++ {
+			for iz := minI; iz <= maxI; iz++ {
+				if float32(ix*ix+iz*iz) <= limit {
+					env.setBlock(ox+ix, oy+yOff, oz+iz, eb.endStone)
+				}
+			}
+		}
+		f -= float32(r.NextIntN(2)) + 0.5
+	}
 }
 
 func endChunkBiomesHas(biomeName *[16][16]string, target string) bool {
@@ -684,27 +1056,33 @@ func endChunkBiomesHas(biomeName *[16][16]string, target string) bool {
 		biomeName[8][8] == target
 }
 
-func endNeighborChunkHasBiome(od *worldgen.OverworldDensity, ncx, ncz int32, target string) bool {
-	qx0, qz0 := int(ncx)*4, int(ncz)*4
-	return worldgen.EndBiomeAt(od.Erosion, qx0, 0, qz0) == target ||
-		worldgen.EndBiomeAt(od.Erosion, qx0+2, 0, qz0) == target ||
-		worldgen.EndBiomeAt(od.Erosion, qx0, 0, qz0+2) == target ||
-		worldgen.EndBiomeAt(od.Erosion, qx0+2, 0, qz0+2) == target
+func endChunkMayZoomToBiome(od *worldgen.OverworldDensity, ncx, ncz int32, target string) bool {
+	if od == nil {
+		return false
+	}
+	for dx := int32(-1); dx <= 1; dx++ {
+		for dz := int32(-1); dz <= 1; dz++ {
+			if worldgen.EndBiomeAt(od.Erosion, int(ncx+dx)*4, 0, int(ncz+dz)*4) == target {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.StructureSets, cx, cz int32, seed int64, biomeName *[16][16]string) {
 	PlaceEndStructuresInChunk(c, od, sets, seed, cx, cz)
 
-	baseX, baseZ := int(cx)*16, int(cz)*16
 	zoomSeed := obfuscateBiomeSeed(seed)
-
+	env := newEndDecorationEnv(c, od)
 	r := worldgen.NewWorldgenRandom(0)
 
 	// Step 0 (RAW_GENERATION, stage=0): end_island_decorated in small_end_islands.
-	// Check 3x3 chunk neighborhood so small islands near chunk borders aren't clipped.
+	// Replay across 3x3 chunk neighborhood so small islands near chunk borders aren't clipped
+	// and can support chorus plants or heightmap queries near chunk borders.
 	for ncx := cx - 1; ncx <= cx+1; ncx++ {
 		for ncz := cz - 1; ncz <= cz+1; ncz++ {
-			if !endNeighborChunkHasBiome(od, ncx, ncz, "minecraft:small_end_islands") {
+			if !endChunkMayZoomToBiome(od, ncx, ncz, "minecraft:small_end_islands") {
 				continue
 			}
 			nBaseX, nBaseZ := int(ncx)*16, int(ncz)*16
@@ -720,48 +1098,73 @@ func decorateEnd(c *Chunk, od *worldgen.OverworldDensity, sets *worldgen.Structu
 					pz := nBaseZ + int(r.NextIntN(16))
 					py := 55 + int(r.NextIntN(16))
 					if endZoomedBiomeAt(od, zoomSeed, px, py, pz) == "minecraft:small_end_islands" {
-						PlaceEndIsland(c, px, py, pz, r)
+						placeEndIslandInEnv(env, px, py, pz, r)
 					}
 				}
 			}
 		}
 	}
 
-	decSeed := r.SetDecorationSeed(seed, baseX, baseZ)
 	hasTheEnd := endChunkBiomesHas(biomeName, "minecraft:the_end")
-	hasHighlands := endChunkBiomesHas(biomeName, "minecraft:end_highlands")
 
 	// Step 4 (SURFACE_STRUCTURES, stage=4):
 	// - the_end: end_spike
-	// - end_highlands: end_gateway_return
+	// - end_highlands: end_gateway_return (3x5x3 cage can cross chunk borders by 1 block)
 	if hasTheEnd {
 		PlaceEndSpikes(c, seed)
 	}
-	if hasHighlands {
-		r.SetFeatureSeed(decSeed, 0, 4)
-		if r.NextFloat() < 1.0/float32(700) {
-			px := baseX + int(r.NextIntN(16))
-			pz := baseZ + int(r.NextIntN(16))
-			hmY := topEndNonAirY(c, px, pz) + 1
-			if hmY > 0 {
-				py := hmY + 3 + int(r.NextIntN(7))
-				if endZoomedBiomeAt(od, zoomSeed, px, py, pz) == "minecraft:end_highlands" {
-					PlaceEndGateway(c, px, py, pz)
+	for ncx := cx - 1; ncx <= cx+1; ncx++ {
+		for ncz := cz - 1; ncz <= cz+1; ncz++ {
+			if !endChunkMayZoomToBiome(od, ncx, ncz, "minecraft:end_highlands") {
+				continue
+			}
+			nBaseX, nBaseZ := int(ncx)*16, int(ncz)*16
+			decSeed := r.SetDecorationSeed(seed, nBaseX, nBaseZ)
+			r.SetFeatureSeed(decSeed, 0, 4)
+			if r.NextFloat() < 1.0/float32(700) {
+				px := nBaseX + int(r.NextIntN(16))
+				pz := nBaseZ + int(r.NextIntN(16))
+				if px+1 < env.minX || px-1 > env.maxX || pz+1 < env.minZ || pz-1 > env.maxZ {
+					continue
+				}
+				hmY := env.topMotionBlockingY(px, pz) + 1
+				if hmY > 0 {
+					py := hmY + 3 + int(r.NextIntN(7))
+					if endZoomedBiomeAt(od, zoomSeed, px, py, pz) == "minecraft:end_highlands" {
+						PlaceEndGatewayWithConfig(c, px, py, pz, &EndSpawnPointPos, true)
+					}
 				}
 			}
 		}
 	}
 
 	// Step 9 (VEGETAL_DECORATION, stage=9): chorus_plant in end_highlands.
-	if hasHighlands {
-		r.SetFeatureSeed(decSeed, 0, 9)
-		count := int(r.NextIntN(5))
-		for i := 0; i < count; i++ {
-			px := baseX + int(r.NextIntN(16))
-			pz := baseZ + int(r.NextIntN(16))
-			hmY := topEndNonAirY(c, px, pz) + 1
-			if hmY > 0 && endZoomedBiomeAt(od, zoomSeed, px, hmY, pz) == "minecraft:end_highlands" {
-				PlaceChorusPlant(c, px, hmY, pz, r)
+	// Replay across 3x3 chunk neighborhood because chorus trees branch up to 7 blocks horizontally.
+	for ncx := cx - 1; ncx <= cx+1; ncx++ {
+		for ncz := cz - 1; ncz <= cz+1; ncz++ {
+			if !endChunkMayZoomToBiome(od, ncx, ncz, "minecraft:end_highlands") {
+				continue
+			}
+			nBaseX, nBaseZ := int(ncx)*16, int(ncz)*16
+			decSeed := r.SetDecorationSeed(seed, nBaseX, nBaseZ)
+			r.SetFeatureSeed(decSeed, 0, 9)
+			count := int(r.NextIntN(5))
+			for i := 0; i < count; i++ {
+				px := nBaseX + int(r.NextIntN(16))
+				pz := nBaseZ + int(r.NextIntN(16))
+				if px+7 < env.minX || px-7 > env.maxX || pz+7 < env.minZ || pz-7 > env.maxZ {
+					// Even if this plant's branches cannot reach chunk c, if it succeeds
+					// it consumes RNG draws in growRecursive before the next i in the same chunk!
+					hmY := env.topMotionBlockingY(px, pz) + 1
+					if hmY > 0 && endZoomedBiomeAt(od, zoomSeed, px, hmY, pz) == "minecraft:end_highlands" {
+						placeChorusPlantInEnv(env, px, hmY, pz, r)
+					}
+					continue
+				}
+				hmY := env.topMotionBlockingY(px, pz) + 1
+				if hmY > 0 && endZoomedBiomeAt(od, zoomSeed, px, hmY, pz) == "minecraft:end_highlands" {
+					placeChorusPlantInEnv(env, px, hmY, pz, r)
+				}
 			}
 		}
 	}
