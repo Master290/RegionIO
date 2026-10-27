@@ -377,3 +377,116 @@ func TestCrossbowFireworkLoadAndShoot(t *testing.T) {
 			CrossbowFireworkDurabilityCost, cbMeta.Damage)
 	}
 }
+
+func TestElytraEquipSwapPoseVehicleAndMendingOrbPickup(t *testing.T) {
+	srv := newTestElytraServer(t)
+	player := addElytraTestPlayer(t, srv, "ElytraAce", 7, 0.5, 100.0, 0.5)
+	srv.SetPlayerTransform(player, 0.5, 100.0, 0.5, 0, 0, false)
+
+	mainSlot := world.HotbarContainerOffset + int(player.SelectedSlot())
+	player.SetInventorySlot(mainSlot, world.NewNamedItemStack(ElytraItemID, 1))
+	SetSlotItemMeta(player, mainSlot, ItemMeta{
+		Damage: 120,
+		Enchantments: map[string]int{
+			"minecraft:mending":    1,
+			"minecraft:unbreaking": 3,
+		},
+	})
+
+	// 1. Right-clicking in air with Elytra equips it into ArmorSlotChest (6).
+	if !srv.UseEquippableArmorOrElytra(player, HandMain) {
+		t.Fatalf("expected UseEquippableArmorOrElytra to equip Elytra into slot %d", ArmorSlotChest)
+	}
+	if !IsElytraItem(player.InventorySlot(ArmorSlotChest).ResolvedID()) {
+		t.Fatalf("expected Elytra in ArmorSlotChest, got %+v", player.InventorySlot(ArmorSlotChest))
+	}
+	if !player.InventorySlot(mainSlot).IsEmpty() {
+		t.Fatalf("expected main hand slot to be empty after equipping Elytra, got %+v", player.InventorySlot(mainSlot))
+	}
+	chestMeta := GetSlotItemMeta(player, ArmorSlotChest)
+	if chestMeta.Damage != 120 || chestMeta.EnchantmentLevel("minecraft:mending") != 1 {
+		t.Fatalf("expected equipped Elytra meta preserved, got %+v", chestMeta)
+	}
+
+	// 2. Right-clicking with a chestplate swaps with the equipped Elytra, unless Curse of Binding is present.
+	player.SetInventorySlot(mainSlot, world.NewNamedItemStack("minecraft:diamond_chestplate", 1))
+	SetSlotItemMeta(player, ArmorSlotChest, ItemMeta{
+		Damage: 120,
+		Enchantments: map[string]int{
+			"minecraft:binding_curse": 1,
+		},
+	})
+	if srv.UseEquippableArmorOrElytra(player, HandMain) {
+		t.Fatalf("expected Curse of Binding on chest slot to block right-click swap in Survival")
+	}
+	// Remove binding_curse and verify swap works.
+	SetSlotItemMeta(player, ArmorSlotChest, chestMeta)
+	if !srv.UseEquippableArmorOrElytra(player, HandMain) {
+		t.Fatalf("expected chestplate right-click to swap with Elytra")
+	}
+	if !IsElytraItem(player.InventorySlot(mainSlot).ResolvedID()) {
+		t.Fatalf("expected swapped Elytra in main hand, got %+v", player.InventorySlot(mainSlot))
+	}
+	// Swap Elytra back into ArmorSlotChest.
+	if !srv.UseEquippableArmorOrElytra(player, HandMain) {
+		t.Fatalf("expected Elytra right-click to swap back into ArmorSlotChest")
+	}
+
+	// 3. Start fall-flying and verify PoseFallFlying + EntitySharedFlagFallFlying metadata packet.
+	if !srv.StartPlayerFallFlying(player) {
+		t.Fatalf("expected StartPlayerFallFlying to succeed")
+	}
+	flagsPkt := srv.PlayerSharedFlagsAndPosePacketByEntityID(player.EntityID)
+	if len(flagsPkt) == 0 {
+		t.Fatalf("expected non-empty PlayerSharedFlagsAndPosePacketByEntityID while fall-flying")
+	}
+	decEntID, decFlags, decPose, err := DecodePlayerSharedFlagsAndPoseDataPacket(protocol.NewReader(flagsPkt))
+	if err != nil || decEntID != player.EntityID || decFlags&EntitySharedFlagFallFlying == 0 || decPose != PoseFallFlying {
+		t.Fatalf("decoded flags/pose = (id=%d, flags=0x%02x, pose=%d, err=%v), want flag 0x80 and PoseFallFlying=%d",
+			decEntID, decFlags, decPose, err, PoseFallFlying)
+	}
+
+	// 4. Mounting a vehicle stops fall-flying and prevents starting fall-flying while mounted.
+	boatID, boatEnt := srv.SpawnVehicle(world.DimensionOverworld, EntityTypeOakBoat, 0.5, 100.0, 0.5, 0)
+	if boatID == 0 || boatEnt == nil {
+		t.Fatalf("expected SpawnVehicle to succeed")
+	}
+	if handled, _, err := srv.InteractWithVehicle(player, boatID); err != nil || !handled {
+		t.Fatalf("expected InteractWithVehicle to succeed: handled=%v err=%v", handled, err)
+	}
+	srv.TickPlayerElytra(player)
+	if player.IsFallFlying() {
+		t.Fatalf("expected TickPlayerElytra to stop fall-flying when mounted in a vehicle")
+	}
+	if srv.CanPlayerStartFallFlying(player) {
+		t.Fatalf("expected CanPlayerStartFallFlying=false while mounted in a vehicle")
+	}
+	srv.DismountPlayerVehicle(player)
+
+	// 5. Damage Elytra to broken texture state (431/432) and verify Mending XP orb pickup restores usability.
+	SetSlotItemMeta(player, ArmorSlotChest, ItemMeta{
+		Damage: ElytraUsableMaxDamage,
+		Enchantments: map[string]int{
+			"minecraft:mending": 1,
+		},
+	})
+	if HasUsableChestElytra(player) {
+		t.Fatalf("expected broken Elytra (431/432) to be unusable")
+	}
+	// Put diamond_chestplate away so only the broken Mending Elytra is a Mending candidate.
+	player.SetInventorySlot(mainSlot, world.ItemStack{})
+	if orbID, orbEnt := srv.SpawnExperienceOrb(0.5, 100.0, 0.5, 10); orbID == 0 || orbEnt == nil {
+		t.Fatalf("expected SpawnExperienceOrb to succeed")
+	}
+	pickedXP := srv.PickupNearbyExperienceOrbs(player)
+	if pickedXP != 10 {
+		t.Fatalf("expected player to pick up 10 XP from orb, got %d", pickedXP)
+	}
+	repairedMeta := GetSlotItemMeta(player, ArmorSlotChest)
+	if repairedMeta.Damage != ElytraUsableMaxDamage-20 {
+		t.Fatalf("expected 10 XP orb to repair 20 durability on broken Elytra (431 -> 411), got %d", repairedMeta.Damage)
+	}
+	if !HasUsableChestElytra(player) {
+		t.Fatalf("expected Elytra repaired by Mending orb pickup to be usable again")
+	}
+}

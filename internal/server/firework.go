@@ -1097,6 +1097,9 @@ func (s *Server) UseFireworkRocketOnBlock(
 		return 0, false
 	}
 	id, _ := s.SpawnFireworkRocket(snap.Dimension, spawnX, spawnY, spawnZ, 0.001, 0.05, 0.001, fw, nil, session, false)
+	if id != 0 {
+		s.RecordItemUsed(session, FireworkRocketItemID, 1)
+	}
 	return id, id != 0
 }
 
@@ -1133,6 +1136,9 @@ func (s *Server) UseFireworkRocketInAir(session *PlayerSession, hand int32) (int
 	}
 
 	id, _ := s.SpawnFireworkRocket(snap.Dimension, snap.X, snap.Y, snap.Z, nvx, nvy, nvz, fw, session, session, false)
+	if id != 0 {
+		s.RecordItemUsed(session, FireworkRocketItemID, 1)
+	}
 	return id, id != 0
 }
 
@@ -1407,6 +1413,8 @@ func (s *Server) tickSingleFireworkRocket(entityID int32) {
 	}
 	newX, newY, newZ := st.X, st.Y, st.Z
 	vx, vy, vz := st.VX, st.VY, st.VZ
+	dim := st.Dimension
+	isAttached := st.AttachedPlayer != nil
 	mgr.mu.Unlock()
 
 	if s.entities != nil {
@@ -1422,6 +1430,18 @@ func (s *Server) tickSingleFireworkRocket(entityID int32) {
 
 	if explodeNow {
 		s.DetonateFireworkRocket(entityID)
+		return
+	}
+
+	cx := int32(int64(math.Floor(newX)) >> 4)
+	cz := int32(int64(math.Floor(newZ)) >> 4)
+	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetEntityMotion,
+		EncodeSetEntityMotionPacket(entityID, vx, vy, vz))
+	if !isAttached && s.entities != nil {
+		if ent := s.entities.Get(entityID); ent != nil {
+			s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlayTeleportEntity,
+				encodeTeleportEntityPacket(nil, ent))
+		}
 	}
 }
 

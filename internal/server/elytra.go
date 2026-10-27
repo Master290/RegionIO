@@ -197,7 +197,8 @@ func (s *Server) isPlayerInFluidForElytra(session *PlayerSession) bool {
 //   - Alive and not in Spectator mode
 //   - Airborne (!OnGround) and not already fall-flying
 //   - Not affected by Levitation (minecraft:levitation)
-//   - Not in water or lava
+//   - Not in water, lava, or bubble column
+//   - Not riding a vehicle/mount and not sleeping
 //   - Wearing an unbroken minecraft:elytra in ArmorSlotChest (slot 6)
 func (s *Server) CanPlayerStartFallFlying(session *PlayerSession) bool {
 	if session == nil || session.IsDead() {
@@ -213,20 +214,31 @@ func (s *Server) CanPlayerStartFallFlying(session *PlayerSession) bool {
 	if session.HasPlayerEffect(EffectLevitation) {
 		return false
 	}
-	if s.isPlayerInFluidForElytra(session) {
-		return false
+	if s != nil {
+		if s.isPlayerInFluidForElytra(session) {
+			return false
+		}
+		if s.PlayerMountedVehicle(session) > 0 || s.PlayerMountedEquine(session) > 0 || s.PlayerMountedCamel(session) > 0 {
+			return false
+		}
+		if s.IsPlayerSleeping(session) {
+			return false
+		}
 	}
 	return HasUsableChestElytra(session)
 }
 
 // ComputePlayerSharedFlags builds the Entity.DATA_SHARED_FLAGS_ID (index 0) byte
-// for session, combining sprinting (0x08), invisible (0x20), glowing (0x40),
-// and fall-flying (0x80).
+// for session, combining sneaking (0x02), sprinting (0x08), invisible (0x20),
+// glowing (0x40), and fall-flying (0x80).
 func ComputePlayerSharedFlags(session *PlayerSession) byte {
 	if session == nil {
 		return 0
 	}
 	var flags byte
+	if session.IsSneaking() {
+		flags |= EntitySharedFlagShiftKey
+	}
 	if session.IsSprinting() {
 		flags |= EntitySharedFlagSprinting
 	}
@@ -242,6 +254,23 @@ func ComputePlayerSharedFlags(session *PlayerSession) byte {
 	return flags
 }
 
+// ComputePlayerPose returns the net.minecraft.world.entity.Pose ordinal for session:
+//   - PoseFallFlying (1) when fall-flying with an Elytra
+//   - PoseCrouching (5) when sneaking on ground/air without fall-flying
+//   - PoseStanding (0) otherwise
+func ComputePlayerPose(session *PlayerSession) byte {
+	if session == nil {
+		return PoseStanding
+	}
+	if session.IsFallFlying() {
+		return PoseFallFlying
+	}
+	if session.IsSneaking() {
+		return PoseCrouching
+	}
+	return PoseStanding
+}
+
 // EncodePlayerSharedFlagsDataPacket encodes a clientbound PlaySetEntityData
 // (0x61) packet setting Entity.DATA_SHARED_FLAGS_ID (index 0, BYTE serializer 0)
 // to flags for entityID.
@@ -255,13 +284,95 @@ func EncodePlayerSharedFlagsDataPacket(entityID int32, flags byte) []byte {
 	return w.Bytes()
 }
 
+// EncodePlayerSharedFlagsAndPoseDataPacket encodes a clientbound PlaySetEntityData
+// (0x61) packet setting both Entity.DATA_SHARED_FLAGS_ID (index 0, BYTE serializer 0)
+// and Entity.DATA_POSE (index 6, POSE serializer 21) for entityID.
+func EncodePlayerSharedFlagsAndPoseDataPacket(entityID int32, flags, pose byte) []byte {
+	w := protocol.NewWriter(16)
+	w.VarInt(entityID)
+	w.Byte(EntityDataSharedFlagsID)
+	w.VarInt(EntityDataSerializerByte)
+	w.Byte(flags)
+	w.Byte(EntityDataPoseID)
+	w.VarInt(EntityDataSerializerPose)
+	w.VarInt(int32(pose))
+	w.Byte(0xFF)
+	return w.Bytes()
+}
+
+// DecodePlayerSharedFlagsAndPoseDataPacket decodes a PlaySetEntityData packet
+// produced by EncodePlayerSharedFlagsAndPoseDataPacket or EncodePlayerSharedFlagsDataPacket.
+func DecodePlayerSharedFlagsAndPoseDataPacket(r *protocol.Reader) (entityID int32, flags, pose byte, err error) {
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for r.Remaining() > 0 {
+		idx, err := r.ReadByte()
+		if err != nil {
+			return entityID, flags, pose, err
+		}
+		if idx == 0xFF {
+			break
+		}
+		ser, err := r.VarInt()
+		if err != nil {
+			return entityID, flags, pose, err
+		}
+		switch {
+		case idx == EntityDataSharedFlagsID && ser == EntityDataSerializerByte:
+			b, err := r.ReadByte()
+			if err != nil {
+				return entityID, flags, pose, err
+			}
+			flags = b
+		case idx == EntityDataPoseID && ser == EntityDataSerializerPose:
+			p, err := r.VarInt()
+			if err != nil {
+				return entityID, flags, pose, err
+			}
+			pose = byte(p)
+		default:
+			return entityID, flags, pose, nil
+		}
+	}
+	return entityID, flags, pose, nil
+}
+
+// PlayerSharedFlagsAndPosePacketByEntityID returns a PlaySetEntityData payload
+// with the player's shared flags and pose if entityID belongs to a connected
+// player with non-default flags or pose, or nil otherwise.
+func (s *Server) PlayerSharedFlagsAndPosePacketByEntityID(entityID int32) []byte {
+	if s == nil || entityID == 0 {
+		return nil
+	}
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && p.EntityID == entityID {
+			flags := ComputePlayerSharedFlags(p)
+			pose := ComputePlayerPose(p)
+			if s.IsPlayerSleeping(p) {
+				pose = PoseSleeping
+			}
+			if flags == 0 && pose == PoseStanding {
+				return nil
+			}
+			return EncodePlayerSharedFlagsAndPoseDataPacket(entityID, flags, pose)
+		}
+	}
+	return nil
+}
+
 func (s *Server) broadcastPlayerSharedFlags(session *PlayerSession) {
 	if session == nil {
 		return
 	}
 	snap := session.Snapshot()
 	flags := ComputePlayerSharedFlags(session)
-	pkt := EncodePlayerSharedFlagsDataPacket(snap.EntityID, flags)
+	pose := ComputePlayerPose(session)
+	if s != nil && s.IsPlayerSleeping(session) {
+		pose = PoseSleeping
+	}
+	pkt := EncodePlayerSharedFlagsAndPoseDataPacket(snap.EntityID, flags, pose)
 	if session.send != nil {
 		_ = session.send(PlaySetEntityDataCB, pkt)
 	}
@@ -447,7 +558,8 @@ func (s *Server) DamagePlayerElytra(session *PlayerSession, amount int32, rng *r
 
 	if session.send != nil {
 		stateID := session.NextContainerStateID()
-		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, ArmorSlotChest, stack))
+		trim, _ := GetSlotArmorTrim(session, ArmorSlotChest)
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlotWithMeta(0, stateID, ArmorSlotChest, stack, outMeta, trim))
 	}
 	if unusable && s != nil {
 		cx := int32(int64(math.Floor(snap.X)) >> 4)
@@ -456,6 +568,133 @@ func (s *Server) DamagePlayerElytra(session *PlayerSession, amount int32, rng *r
 			EncodeSoundPacket("minecraft:entity.item.break", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.8, 1.0, 0))
 	}
 	return outMeta.Damage, unusable
+}
+
+// EncodeContainerSlotWithMeta encodes a clientbound container_set_slot (0x14)
+// packet body including ItemMeta (damage, enchantments, repair_cost) and
+// optional ArmorTrim data components so the client updates durability bars
+// and broken_elytra texture state.
+func EncodeContainerSlotWithMeta(containerID, stateID int32, slot int, stack world.ItemStack, meta ItemMeta, trim ArmorTrim) []byte {
+	w := protocol.NewWriter(32)
+	w.VarInt(containerID)
+	w.VarInt(stateID)
+	w.Uint16(uint16(int16(slot)))
+	WriteSlotWithArmorTrim(w, stack, meta, trim)
+	return w.Bytes()
+}
+
+// UseEquippableArmorOrElytra handles right-clicking in air while holding an
+// equippable armor piece or `minecraft:elytra`, equipping or swapping it into
+// the corresponding armor slot (5..8) while respecting `minecraft:binding_curse`
+// in Survival/Adventure mode, synchronizing slots with full ItemMeta/ArmorTrim,
+// broadcasting equipment to chunk viewers, and playing the equip sound.
+func (s *Server) UseEquippableArmorOrElytra(session *PlayerSession, hand int32) bool {
+	if s == nil || session == nil || session.IsDead() {
+		return false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return false
+	}
+	handSlot, handStack := session.handSlotAndStack(hand)
+	if handSlot < 0 || handStack.IsEmpty() {
+		return false
+	}
+	itemName := canonicalItemName(handStack.ResolvedID())
+	if !IsElytraItem(itemName) && !IsArmorItem(itemName) {
+		return false
+	}
+	armorSlot, ok := WearableArmorSlotForItem(itemName)
+	if !ok || armorSlot < ArmorSlotHead || armorSlot > ArmorSlotFeet {
+		return false
+	}
+
+	existing := session.InventorySlot(armorSlot)
+	if !existing.IsEmpty() {
+		if HasBindingCurseOnSlot(session, armorSlot) || handStack.Count != 1 {
+			return false
+		}
+	}
+
+	handMeta := GetSlotItemMeta(session, handSlot)
+	handTrim, _ := GetSlotArmorTrim(session, handSlot)
+	existingMeta := GetSlotItemMeta(session, armorSlot)
+	existingTrim, _ := GetSlotArmorTrim(session, armorSlot)
+
+	var newHandStack world.ItemStack
+	var newHandMeta ItemMeta
+	var newHandTrim ArmorTrim
+	newArmorStack := world.NewItemStack(handStack.ResolvedItemID(), 1)
+	newArmorMeta := handMeta.Clone()
+	newArmorTrim := handTrim
+
+	if existing.IsEmpty() {
+		if handStack.Count > 1 {
+			newHandStack = world.NewItemStack(handStack.ResolvedItemID(), handStack.Count-1)
+			newHandMeta = handMeta.Clone()
+			newHandTrim = handTrim
+		}
+	} else {
+		newHandStack = existing
+		newHandMeta = existingMeta.Clone()
+		newHandTrim = existingTrim
+	}
+
+	session.SetInventorySlot(armorSlot, newArmorStack)
+	SetSlotItemMeta(session, armorSlot, newArmorMeta)
+	SetSlotArmorTrim(session, armorSlot, newArmorTrim)
+
+	session.SetInventorySlot(handSlot, newHandStack)
+	SetSlotItemMeta(session, handSlot, newHandMeta)
+	SetSlotArmorTrim(session, handSlot, newHandTrim)
+
+	if session.send != nil {
+		stateID := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlotWithMeta(0, stateID, armorSlot, newArmorStack, newArmorMeta, newArmorTrim))
+		stateID2 := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlotWithMeta(0, stateID2, handSlot, newHandStack, newHandMeta, newHandTrim))
+	}
+
+	snd := "minecraft:item.armor.equip_generic"
+	if IsElytraItem(itemName) {
+		snd = "minecraft:item.armor.equip_elytra"
+	}
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(snd, SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+	s.SendPlayerEquipmentPacket(session)
+	s.RecordItemUsed(session, itemName, 1)
+	return true
+}
+
+// SendPlayerEquipmentPacket broadcasts session's 6 equipment slots
+// (MainHand=0, OffHand=1, Feet=2, Legs=3, Chest=4, Head=5) to chunk viewers via
+// ClientboundSetEquipmentPacket (0x66).
+func (s *Server) SendPlayerEquipmentPacket(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	snap := session.Snapshot()
+	mainSlot := int(snap.SelectedSlot) + world.HotbarContainerOffset
+	invSlots := [6]int{mainSlot, OffHandContainerSlot, ArmorSlotFeet, ArmorSlotLegs, ArmorSlotChest, ArmorSlotHead}
+	w := protocol.NewWriter(64)
+	w.VarInt(snap.EntityID)
+	for eqSlot := 0; eqSlot < 6; eqSlot++ {
+		slotByte := byte(eqSlot)
+		if eqSlot < 5 {
+			slotByte |= 0x80
+		}
+		w.Byte(slotByte)
+		invIdx := invSlots[eqSlot]
+		st := session.InventorySlot(invIdx)
+		meta := GetSlotItemMeta(session, invIdx)
+		trim, _ := GetSlotArmorTrim(session, invIdx)
+		WriteSlotWithArmorTrim(w, st, meta, trim)
+	}
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, protocol.PlaySetEquipment, w.Bytes())
 }
 
 // RepairPlayerElytraWithMending repairs a damaged Mending-enchanted Elytra in
@@ -486,7 +725,8 @@ func (s *Server) RepairPlayerElytraWithMending(session *PlayerSession, xpPoints 
 
 	if session.send != nil {
 		stateID := session.NextContainerStateID()
-		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, ArmorSlotChest, stack))
+		trim, _ := GetSlotArmorTrim(session, ArmorSlotChest)
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlotWithMeta(0, stateID, ArmorSlotChest, stack, outMeta, trim))
 	}
 	xpUsed := (repaired + 1) / 2
 	rem := xpPoints - xpUsed
@@ -593,10 +833,10 @@ func (s *Server) HandlePlayerElytraMove(
 		surv.mu.Unlock()
 	}
 
-	if onGround {
+	if onGround || s.isPlayerInFluidForElytra(session) {
 		// If the player nose-dived into the ground at steep vertical speed (effVY <= -0.5),
 		// apply accumulated fall damage before clearing glide state.
-		if effVY <= ElytraSafeGlideFallSpeed {
+		if onGround && effVY <= ElytraSafeGlideFallSpeed {
 			fallDamage = s.HandlePlayerFall(session, oldY, newY, wasOnGround, true)
 		} else {
 			surv.mu.Lock()
@@ -610,7 +850,7 @@ func (s *Server) HandlePlayerElytraMove(
 
 // TickPlayerElytra advances one server tick of Elytra flight for session:
 //   - Validates that session can continue gliding (airborne, not levitating,
-//     not in fluid, wearing a usable unbroken Elytra in slot 6)
+//     not in fluid, not mounted/sleeping, wearing a usable unbroken Elytra in slot 6)
 //   - Advances glide physics velocity (StepElytraGlideVelocity)
 //   - Resets fallDistance to 1.0 when vertical speed vy > -0.5
 //   - Applies 1 durability damage every 20 flight ticks in survival/adventure mode
@@ -624,7 +864,8 @@ func (s *Server) TickPlayerElytra(session *PlayerSession) {
 	snap := session.Snapshot()
 	if session.IsDead() || snap.OnGround || snap.GameMode == GameModeSpectator ||
 		session.HasPlayerEffect(EffectLevitation) || s.isPlayerInFluidForElytra(session) ||
-		!HasUsableChestElytra(session) {
+		s.PlayerMountedVehicle(session) > 0 || s.PlayerMountedEquine(session) > 0 || s.PlayerMountedCamel(session) > 0 ||
+		s.IsPlayerSleeping(session) || !HasUsableChestElytra(session) {
 		s.StopPlayerFallFlying(session)
 		return
 	}

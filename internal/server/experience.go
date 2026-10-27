@@ -486,7 +486,8 @@ func (s *Server) RepairPlayerMendingItems(session *PlayerSession, points int32) 
 		remXP -= xpUsed
 		if s != nil && session.send != nil {
 			stateID := session.NextContainerStateID()
-			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, slot, stack))
+			trim, _ := GetSlotArmorTrim(session, slot)
+			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlotWithMeta(0, stateID, slot, stack, meta, trim))
 		}
 	}
 	if remXP < 0 {

@@ -400,13 +400,13 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	if h.session != nil {
 		_, _, _, _, inWater := h.srv.StepPlayerFluidAndBubbleColumn(h.session)
+		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
+		h.srv.RecordPlayerMovementStats(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		if h.session.IsFallFlying() {
 			h.srv.HandlePlayerElytraMove(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		} else {
 			h.srv.HandlePlayerFall(h.session, prev.Y, y, prev.OnGround, onGround)
 		}
-		h.srv.RecordPlayerMovementExhaustion(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
-		h.srv.RecordPlayerMovementStats(h.session, prev.X, prev.Y, prev.Z, x, y, z, prev.OnGround, onGround)
 		h.srv.TryPickupItems(h.session)
 		h.srv.PickupNearbyExperienceOrbs(h.session)
 		bx, by, bz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
@@ -651,6 +651,7 @@ func (h *handler) serverTickLoop() {
 				h.srv.TickWardens(nil)
 				h.srv.TickFishingBobbers(nil)
 				h.srv.TickExperienceOrbs()
+				h.srv.TickFireworkRockets()
 			}
 			lastGameTime = nowGameTime
 		}
@@ -765,6 +766,13 @@ func (h *handler) syncVisibleEntities() error {
 					}
 				}
 			}
+			if entity.TypeName == server.EntityTypeFireworkRocket && h.srv != nil {
+				if metaPkt := h.srv.FireworkRocketEntityDataPacket(entity.ID); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+			}
 			if entity.IsVehicle() && h.srv != nil {
 				for _, metaPkt := range h.srv.VehicleEntityDataPackets(entity.ID) {
 					if len(metaPkt) > 0 {
@@ -786,6 +794,11 @@ func (h *handler) syncVisibleEntities() error {
 						if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
 							return err
 						}
+					}
+				}
+				if flagsPkt := h.srv.PlayerSharedFlagsAndPosePacketByEntityID(entity.ID); len(flagsPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, flagsPkt); err != nil {
+						return err
 					}
 				}
 			}
@@ -1097,6 +1110,14 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 					return h.sendBlockChangedAck(seq)
 				}
 				if _, placed := h.srv.UseBoatItemInAir(h.session, hand); placed {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if _, boosted := h.srv.UseFireworkRocketInAir(h.session, hand); boosted {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+				if h.srv.UseEquippableArmorOrElytra(h.session, hand) {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
