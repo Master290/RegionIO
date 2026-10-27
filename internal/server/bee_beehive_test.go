@@ -2,8 +2,10 @@ package server
 
 import (
 	"math/rand"
+	"path/filepath"
 	"testing"
 
+	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
 
@@ -379,5 +381,247 @@ func TestBeehiveSilkTouchPreservesBeesAndGrantsAdvancement(t *testing.T) {
 	}
 	if angryCount != 3 {
 		t.Fatalf("expected 3 angry bees released when breaking nest without Silk Touch, got %d", angryCount)
+	}
+}
+
+func TestBeeBabyBreedingGrowthHiveAgingAndCustomName(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.DimensionChunks(dim)
+
+	// 1. DecodeBeeDataPacket round-trip.
+	origState := BeeState{
+		IsRolling:  true,
+		HasStung:   false,
+		HasNectar:  true,
+		AngerTicks: 640,
+	}
+	pkt := EncodeBeeDataPacket(77, true, origState)
+	decID, decBaby, decSt, err := DecodeBeeDataPacket(protocol.NewReader(pkt))
+	if err != nil {
+		t.Fatalf("DecodeBeeDataPacket error: %v", err)
+	}
+	if decID != 77 || !decBaby || !decSt.IsRolling || decSt.HasStung || !decSt.HasNectar || decSt.AngerTicks != 640 {
+		t.Fatalf("DecodeBeeDataPacket mismatch: id=%d baby=%v st=%+v", decID, decBaby, decSt)
+	}
+
+	// 2. Breed two adult bees with dandelion flowers via InteractWithBee.
+	player := newBeeTestPlayer(t, srv, "Beekeeper", 10.5, 65.0, 10.5)
+	bee1, _ := srv.SpawnBee(dim, 11.0, 65.5, 10.5, false)
+	bee2, _ := srv.SpawnBee(dim, 11.8, 65.5, 10.5, false)
+
+	slot0 := world.HotbarContainerOffset + int(player.Snapshot().SelectedSlot)
+	player.SetInventorySlot(slot0, world.NewNamedItemStack("minecraft:dandelion", 16))
+
+	handled1, off1 := srv.InteractWithBee(player, bee1)
+	if !handled1 || off1 != 0 {
+		t.Fatalf("expected 1st bee to enter love mode without immediate offspring, got (%v, %d)", handled1, off1)
+	}
+	handled2, babyID := srv.InteractWithBee(player, bee2)
+	if !handled2 || babyID <= 0 {
+		t.Fatalf("expected 2nd bee to complete breeding and spawn baby bee, got (%v, %d)", handled2, babyID)
+	}
+	if !srv.IsMobBaby(babyID) || srv.MobAge(babyID) != BabyMobGrowthTicks {
+		t.Fatalf("expected baby bee age=%d, got %d (isBaby=%v)", BabyMobGrowthTicks, srv.MobAge(babyID), srv.IsMobBaby(babyID))
+	}
+	if !player.HasCompletedAdvancement("minecraft:husbandry/breed_an_animal") {
+		t.Fatalf("expected breeding bees to grant minecraft:husbandry/breed_an_animal")
+	}
+
+	// 3. Feed the baby bee a flower to accelerate growth by 10% (-24000 -> -21600).
+	handledFeed, _ := srv.InteractWithBee(player, babyID)
+	if !handledFeed || srv.MobAge(babyID) != -21600 {
+		t.Fatalf("expected feeding baby bee to accelerate age to -21600, got (handled=%v, age=%d)", handledFeed, srv.MobAge(babyID))
+	}
+
+	// 4. Name the baby bee with a name_tag ("Buzzy"), put it in a hive with flower_pos sharing, and verify aging + name + flower_pos on exit.
+	player.SetInventorySlot(slot0, world.NewNamedItemStack("minecraft:name_tag", 1))
+	SetSlotItemMeta(player, slot0, ItemMeta{CustomName: "Buzzy"})
+	if ok, _ := srv.InteractWithBee(player, babyID); !ok || srv.BeeCustomName(babyID) != "Buzzy" {
+		t.Fatalf("expected name_tag on bee to set CustomName='Buzzy', got %q", srv.BeeCustomName(babyID))
+	}
+
+	hiveState, _ := world.BlockStateIDByProperties("minecraft:beehive", map[string]string{
+		"facing":      "north",
+		"honey_level": "0",
+	})
+	cache.SetBlock(12, 65, 12, hiveState)
+	cache.SetBlock(12, 65, 11, world.StateAir)
+
+	// Give bee1 a flower position, let bee1 and babyID enter the hive, then tick 600 times so they exit.
+	mgr := srv.BeeStates()
+	mgr.mu.Lock()
+	if st1 := mgr.bees[bee1]; st1 != nil {
+		st1.HasFlowerPos = true
+		st1.FlowerX, st1.FlowerY, st1.FlowerZ = 15, 65, 15
+	}
+	mgr.mu.Unlock()
+	if !srv.TryEnterBeehive(bee1, dim, 12, 65, 12) {
+		t.Fatalf("expected bee1 to enter beehive")
+	}
+	if fx, fy, fz, ok := srv.BeehiveFlowerPos(dim, 12, 65, 12); !ok || fx != 15 || fy != 65 || fz != 15 {
+		t.Fatalf("expected beehive to remember bee1's FlowerPos (15,65,15), got (%d,%d,%d, ok=%v)", fx, fy, fz, ok)
+	}
+	if !srv.TryEnterBeehive(babyID, dim, 12, 65, 12) {
+		t.Fatalf("expected babyID to enter beehive")
+	}
+
+	srv.SetWorldTime(1000, 1000)
+	rng := rand.New(rand.NewSource(99))
+	for i := 0; i < BeeMinOccupationTicksNoNectar; i++ {
+		srv.TickBeehives(rng)
+	}
+	if got := srv.BeehiveOccupantCount(dim, 12, 65, 12); got != 0 {
+		t.Fatalf("expected both bees to exit after %d ticks, got %d remaining", BeeMinOccupationTicksNoNectar, got)
+	}
+
+	var exitedBabyID int32
+	for _, ent := range srv.entities.AppendAll(nil) {
+		if canonicalResourceName(ent.TypeName) == MobTypeBee && srv.BeeCustomName(ent.ID) == "Buzzy" {
+			exitedBabyID = ent.ID
+			break
+		}
+	}
+	if exitedBabyID <= 0 {
+		t.Fatalf("expected named baby bee 'Buzzy' to be restored on hive exit")
+	}
+	// Age in hive should advance by 600 ticks: -21600 + 600 = -21000.
+	if gotAge := srv.MobAge(exitedBabyID); gotAge != -21000 {
+		t.Fatalf("expected baby bee age after 600 ticks in hive to be -21000, got %d", gotAge)
+	}
+	// Exited baby bee should also have received the shared FlowerPos (15, 65, 15) from the hive!
+	if st, ok := srv.BeeStateFor(exitedBabyID); !ok || !st.HasFlowerPos || st.FlowerX != 15 || st.FlowerY != 65 || st.FlowerZ != 15 {
+		t.Fatalf("expected exited bee to inherit hive FlowerPos (15,65,15), got %+v", st)
+	}
+}
+
+func TestBeeWitherRoseEyeblossomTallFlowersPitcherCropWaterAndPersistence(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.DimensionChunks(dim)
+	rng := rand.New(rand.NewSource(777))
+
+	// 1. Verify closed_eyeblossom is NOT pollinated by bees, while open_eyeblossom IS.
+	if IsBeeFlowerBlock("minecraft:closed_eyeblossom") {
+		t.Fatalf("expected minecraft:closed_eyeblossom not to be pollinated by bees in 26.1.2")
+	}
+	if !IsBeeFlowerBlock("minecraft:open_eyeblossom") {
+		t.Fatalf("expected minecraft:open_eyeblossom to be pollinated by bees in 26.1.2")
+	}
+
+	// 2. Pollinating wither_rose applies EffectWither to the bee.
+	witherRose, ok := world.BlockStateIDByProperties("minecraft:wither_rose", nil)
+	if !ok {
+		t.Fatalf("wither_rose state not found")
+	}
+	cache.SetBlock(60, 65, 60, witherRose)
+	beeWither, _ := srv.SpawnBee(dim, 60.5, 65.5, 60.5, false)
+	srv.TickBeeAI(srv.entities.Get(beeWither), cache, nil, rng)
+	if !srv.HasEntityEffect(beeWither, EffectWither) {
+		t.Fatalf("expected bee pollinating wither_rose to receive EffectWither")
+	}
+
+	// 3. Pollinating open_eyeblossom applies EffectPoison to the bee.
+	openEye, ok := world.BlockStateIDByProperties("minecraft:open_eyeblossom", nil)
+	if !ok {
+		t.Fatalf("open_eyeblossom state not found")
+	}
+	cache.SetBlock(70, 65, 70, openEye)
+	beeEye, _ := srv.SpawnBee(dim, 70.5, 65.5, 70.5, false)
+	srv.TickBeeAI(srv.entities.Get(beeEye), cache, nil, rng)
+	if !srv.HasEntityEffect(beeEye, EffectPoison) {
+		t.Fatalf("expected bee pollinating open_eyeblossom to receive EffectPoison")
+	}
+
+	// 4. Tall flowers (sunflower lower+upper) -> findNearbyBeeFlower targets upper half (y+1).
+	sunLower, _ := world.BlockStateIDByProperties("minecraft:sunflower", map[string]string{"half": "lower"})
+	sunUpper, _ := world.BlockStateIDByProperties("minecraft:sunflower", map[string]string{"half": "upper"})
+	cache.SetBlock(80, 65, 80, sunLower)
+	cache.SetBlock(80, 66, 80, sunUpper)
+	if fx, fy, fz, found := srv.findNearbyBeeFlower(cache, 80, 65, 80, 4); !found || fx != 80 || fy != 66 || fz != 80 {
+		t.Fatalf("expected findNearbyBeeFlower on tall sunflower to target upper half (80,66,80), got (%d,%d,%d, found=%v)", fx, fy, fz, found)
+	}
+
+	// 5. Torchflower crop at age=1 matures into minecraft:torchflower, and pitcher_crop at age=1 becomes double-height age=2.
+	srv.SetBeeHasNectar(beeWither, true)
+	tf1, _ := world.BlockStateIDByProperties("minecraft:torchflower_crop", map[string]string{"age": "1"})
+	cache.SetBlock(60, 64, 60, tf1)
+	if !srv.TryFertilizeCropUnderBee(beeWither) {
+		t.Fatalf("expected TryFertilizeCropUnderBee on torchflower_crop[age=1] to succeed")
+	}
+	if got := world.BlockName(cache.GetBlock(60, 64, 60)); got != "minecraft:torchflower" {
+		t.Fatalf("torchflower_crop[age=1] after bee fertilization = %q, want minecraft:torchflower", got)
+	}
+
+	pc1, _ := world.BlockStateIDByProperties("minecraft:pitcher_crop", map[string]string{"age": "1", "half": "lower"})
+	cache.SetBlock(60, 64, 60, pc1)
+	cache.SetBlock(60, 65, 60, world.StateAir)
+	if !srv.TryFertilizeCropUnderBee(beeWither) {
+		t.Fatalf("expected TryFertilizeCropUnderBee on pitcher_crop[age=1] to succeed")
+	}
+	lowerProps := world.BlockProperties(cache.GetBlock(60, 64, 60))
+	upperProps := world.BlockProperties(cache.GetBlock(60, 65, 60))
+	if lowerProps["age"] != "2" || lowerProps["half"] != "lower" || upperProps["age"] != "2" || upperProps["half"] != "upper" {
+		t.Fatalf("expected pitcher_crop[age=1] to become double-height age=2, got lower=%v upper=%v", lowerProps, upperProps)
+	}
+
+	// 6. Water submersion damage: 20 ticks submerged in water deals 1.0 damage.
+	cache.SetBlock(90, 65, 90, world.StateWater)
+	beeWater, _ := srv.SpawnBee(dim, 90.5, 65.2, 90.5, false)
+	hpBefore := srv.MobHealth(beeWater)
+	for i := 0; i < 20; i++ {
+		// Keep bee submerged at (90.5, 65.2, 90.5) for 20 ticks.
+		srv.entities.Update(beeWater, func(e *world.Entity) {
+			e.X, e.Y, e.Z = 90.5, 65.2, 90.5
+		})
+		srv.TickBeeAI(srv.entities.Get(beeWater), cache, nil, rng)
+	}
+	if hpAfter := srv.MobHealth(beeWater); hpAfter >= hpBefore {
+		t.Fatalf("expected bee submerged in water for 20 ticks to take damage: before=%v after=%v", hpBefore, hpAfter)
+	}
+
+	// 7. Worldgen tree-decorator StructureBlockEntity{ID: "minecraft:beehive"} hydration + NBT & file persistence.
+	nestState, _ := world.BlockStateIDByProperties("minecraft:bee_nest", map[string]string{
+		"facing":      "south",
+		"honey_level": "0",
+	})
+	cache.SetBlock(100, 65, 100, nestState)
+	cache.AddStructureBlockEntity(world.StructureBlockEntity{
+		ID: "minecraft:beehive",
+		X:  100,
+		Y:  65,
+		Z:  100,
+	})
+	if occCount := srv.BeehiveOccupantCount(dim, 100, 65, 100); occCount < 2 || occCount > 3 {
+		t.Fatalf("expected worldgen bee_nest StructureBlockEntity to hydrate 2..3 bees, got %d", occCount)
+	}
+	if _, stillThere := cache.StructureBlockEntityAt(100, 65, 100); stillThere {
+		t.Fatalf("expected consumed worldgen StructureBlockEntity at (100,65,100) to be removed after hydration")
+	}
+
+	// Chunk NBT round-trip.
+	srv.SetBeehiveFlowerPos(dim, 100, 65, 100, 102, 65, 102)
+	cx, cz := int32(100>>4), int32(100>>4)
+	nbtList := srv.UnloadChunkBeehiveBlockEntities(dim, cx, cz)
+	if len(nbtList) != 1 {
+		t.Fatalf("UnloadChunkBeehiveBlockEntities returned %d compounds, want 1", len(nbtList))
+	}
+	srv.LoadChunkBeehiveBlockEntitiesNBT(dim, nbtList)
+	if fx, fy, fz, ok := srv.BeehiveFlowerPos(dim, 100, 65, 100); !ok || fx != 102 || fy != 65 || fz != 102 {
+		t.Fatalf("restored chunk beehive FlowerPos = (%d,%d,%d, ok=%v), want (102,65,102, true)", fx, fy, fz, ok)
+	}
+
+	// File persistence round-trip across Server instances.
+	savePath := filepath.Join(t.TempDir(), "bees_and_hives.json")
+	if err := srv.SaveBeesAndBeehivesFile(savePath); err != nil {
+		t.Fatalf("SaveBeesAndBeehivesFile failed: %v", err)
+	}
+	srv2 := newSurvivalTestServer(t)
+	srv2.DimensionChunks(dim).SetBlock(100, 65, 100, nestState)
+	if err := srv2.LoadBeesAndBeehivesFile(savePath); err != nil {
+		t.Fatalf("LoadBeesAndBeehivesFile failed: %v", err)
+	}
+	if occCount2 := srv2.BeehiveOccupantCount(dim, 100, 65, 100); occCount2 < 2 {
+		t.Fatalf("expected restored beehive in srv2 to have >= 2 occupants, got %d", occCount2)
 	}
 }

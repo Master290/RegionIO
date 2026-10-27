@@ -1,13 +1,18 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
@@ -142,10 +147,15 @@ type BeeState struct {
 	HasFlowerPos               bool
 	FlowerX, FlowerY, FlowerZ  int
 	PollinatingTicks           int
+	PollinateAttemptTicks      int
 	PollinateCooldown          int
 	CropsGrownSincePollination int
 	StayOutOfHiveCountdown     int
 	CannotEnterHiveTicks       int
+	UnderWaterTicks            int
+	WanderTicks                int
+	WanderX, WanderY, WanderZ  float64
+	CustomName                 string
 }
 
 // BeehiveOccupant represents a single bee stored inside a `minecraft:beehive` or `minecraft:bee_nest`.
@@ -268,6 +278,35 @@ func (s *Server) SetBeeHasNectar(entityID int32, hasNectar bool) {
 	}
 }
 
+// SetBeeCustomName sets a custom name on a bee entity, preserved across beehive entry/exit.
+func (s *Server) SetBeeCustomName(entityID int32, customName string) bool {
+	if s == nil || s.entities == nil {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeBee {
+		return false
+	}
+	st := s.ensureBeeState(entityID)
+	if st == nil {
+		return false
+	}
+	mgr := s.BeeStates()
+	mgr.mu.Lock()
+	st.CustomName = strings.TrimSpace(customName)
+	mgr.mu.Unlock()
+	return true
+}
+
+// BeeCustomName returns the custom name of a bee entity, if any.
+func (s *Server) BeeCustomName(entityID int32) string {
+	st, ok := s.BeeStateFor(entityID)
+	if !ok {
+		return ""
+	}
+	return st.CustomName
+}
+
 // EncodeBeeDataPacket builds the ClientboundSetEntityDataPacket (0x63) payload for a `minecraft:bee` (ID 11).
 func EncodeBeeDataPacket(entityID int32, isBaby bool, st BeeState) []byte {
 	var flags byte
@@ -297,6 +336,77 @@ func EncodeBeeDataPacket(entityID int32, isBaby bool, st BeeState) []byte {
 	w.VarInt(int32(anger))
 	w.Byte(0xFF)
 	return w.Bytes()
+}
+
+// DecodeBeeDataPacket decodes a ClientboundSetEntityDataPacket (0x63) payload produced by EncodeBeeDataPacket.
+func DecodeBeeDataPacket(r *protocol.Reader) (entityID int32, isBaby bool, st BeeState, err error) {
+	if r == nil {
+		return 0, false, BeeState{}, errors.New("bee: nil protocol reader")
+	}
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, false, BeeState{}, err
+	}
+	st.EntityID = entityID
+	for {
+		idx, err := r.ReadByte()
+		if err != nil {
+			return 0, false, BeeState{}, err
+		}
+		if idx == 0xFF {
+			break
+		}
+		ser, err := r.VarInt()
+		if err != nil {
+			return 0, false, BeeState{}, err
+		}
+		switch idx {
+		case BeeMetaIndexBaby:
+			if ser != EntityDataSerializerBool {
+				return 0, false, BeeState{}, errors.New("bee: unexpected baby serializer")
+			}
+			isBaby, err = r.Bool()
+			if err != nil {
+				return 0, false, BeeState{}, err
+			}
+		case BeeMetaIndexFlags:
+			if ser != EntityDataSerializerByte {
+				return 0, false, BeeState{}, errors.New("bee: unexpected flags serializer")
+			}
+			flags, err := r.ReadByte()
+			if err != nil {
+				return 0, false, BeeState{}, err
+			}
+			st.IsRolling = (flags & BeeFlagIsRolling) != 0
+			st.HasStung = (flags & BeeFlagHasStung) != 0
+			st.HasNectar = (flags & BeeFlagHasNectar) != 0
+		case BeeMetaIndexAngerTime:
+			if ser != EntityDataSerializerInt {
+				return 0, false, BeeState{}, errors.New("bee: unexpected anger time serializer")
+			}
+			anger, err := r.VarInt()
+			if err != nil {
+				return 0, false, BeeState{}, err
+			}
+			st.AngerTicks = int(anger)
+		default:
+			return 0, false, BeeState{}, fmt.Errorf("bee: unexpected metadata index %d", idx)
+		}
+	}
+	return entityID, isBaby, st, nil
+}
+
+// BeeEntityDataPacket returns the encoded ClientboundSetEntityDataPacket (0x63) for an active bee entity.
+func (s *Server) BeeEntityDataPacket(entityID int32) []byte {
+	if s == nil || s.entities == nil {
+		return nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeBee {
+		return nil
+	}
+	st, _ := s.BeeStateFor(entityID)
+	return EncodeBeeDataPacket(entityID, s.IsMobBaby(entityID), st)
 }
 
 func (s *Server) broadcastBeeMetadata(ent *world.Entity) {
@@ -372,7 +482,19 @@ func IsBeeFlowerBlockState(state uint16) bool {
 	return IsBeeFlowerBlock(world.BlockName(state))
 }
 
+// IsTallBeeFlowerBlock reports whether stateName is a 2-block-tall flower whose upper half bees pollinate.
+func IsTallBeeFlowerBlock(stateName string) bool {
+	base := canonicalResourceName(strings.SplitN(stateName, "[", 2)[0])
+	switch base {
+	case "minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony", "minecraft:pitcher_plant":
+		return true
+	default:
+		return false
+	}
+}
+
 // IsBeeFlowerBlock returns true if stateName is a flower or flowering block that bees can pollinate in 26.1.2.
+// Note: `minecraft:closed_eyeblossom` is NOT pollinated by bees in 26.1.2 (only `minecraft:open_eyeblossom` is).
 func IsBeeFlowerBlock(stateName string) bool {
 	base := canonicalResourceName(strings.SplitN(stateName, "[", 2)[0])
 	switch base {
@@ -390,7 +512,6 @@ func IsBeeFlowerBlock(stateName string) bool {
 		"minecraft:lily_of_the_valley",
 		"minecraft:wither_rose",
 		"minecraft:torchflower",
-		"minecraft:closed_eyeblossom",
 		"minecraft:open_eyeblossom",
 		"minecraft:sunflower",
 		"minecraft:lilac",
@@ -430,10 +551,18 @@ func IsBeeFertilizableCropState(state uint16) (nextState uint16, canGrow bool) {
 		if age < 7 {
 			return world.WithBlockProperty(state, "age", strconv.Itoa(age+1))
 		}
-	case "minecraft:beetroots", "minecraft:torchflower_crop", "minecraft:sweet_berry_bush":
+	case "minecraft:beetroots", "minecraft:sweet_berry_bush":
 		age, _ := strconv.Atoi(props["age"])
 		if age < 3 {
 			return world.WithBlockProperty(state, "age", strconv.Itoa(age+1))
+		}
+	case "minecraft:torchflower_crop":
+		age, _ := strconv.Atoi(props["age"])
+		if age <= 0 {
+			return world.WithBlockProperty(state, "age", "1")
+		}
+		if age == 1 {
+			return world.BlockStateIDByProperties("minecraft:torchflower", nil)
 		}
 	case "minecraft:pitcher_crop":
 		age, _ := strconv.Atoi(props["age"])
@@ -559,6 +688,98 @@ func (s *Server) IsBeehiveSmokedByCampfire(dimension string, x, y, z int) bool {
 	return false
 }
 
+// HydrateNaturalBeehiveAt checks whether a worldgen `StructureBlockEntity` with
+// `ID == "minecraft:beehive"` exists at (x, y, z) in dimension (such as a natural
+// `minecraft:bee_nest` generated by `BeehiveDecorator` on oak/birch/cherry/mangrove trees)
+// and populates 2..3 adult bees inside the `BeehiveBlockEntity`, removing the consumed
+// `StructureBlockEntity` so it is only hydrated once.
+func (s *Server) HydrateNaturalBeehiveAt(dimension string, x, y, z int, rng *rand.Rand) *BeehiveBlockEntity {
+	if s == nil {
+		return nil
+	}
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache != nil {
+		if sbe, exists := cache.StructureBlockEntityAt(x, y, z); exists && canonicalResourceName(sbe.ID) == "minecraft:beehive" {
+			cache.RemoveStructureBlockEntity(x, y, z)
+			key := beeHivePosKey{Dimension: normDim, X: x, Y: y, Z: z}
+			mgr.mu.Lock()
+			be := mgr.hives[key]
+			if be == nil {
+				blockName := "minecraft:bee_nest"
+				if st := cache.GetBlock(x, y, z); IsBeehiveOrNestBlockState(st) {
+					blockName = canonicalResourceName(world.BlockName(st))
+				}
+				be = &BeehiveBlockEntity{
+					Dimension: normDim,
+					X:         x,
+					Y:         y,
+					Z:         z,
+					BlockName: blockName,
+				}
+				mgr.hives[key] = be
+			}
+			if len(be.Occupants) == 0 {
+				numBees := 2
+				if rng != nil {
+					numBees = 2 + rng.Intn(2)
+				} else {
+					numBees = 3
+				}
+				for i := 0; i < numBees && len(be.Occupants) < BeeMaxHiveOccupants; i++ {
+					ticksIn := 200 * (i + 1)
+					if rng != nil {
+						ticksIn = rng.Intn(599)
+					}
+					be.Occupants = append(be.Occupants, BeehiveOccupant{
+						TypeName:           MobTypeBee,
+						TicksInHive:        ticksIn,
+						MinOccupationTicks: BeeMinOccupationTicksNoNectar,
+						HasNectar:          false,
+						Health:             DefaultBeeMaxHealth,
+					})
+				}
+			}
+			mgr.mu.Unlock()
+			return be
+		}
+	}
+	return nil
+}
+
+// HydrateChunkNaturalBeehives scans a loaded chunk (cx, cz) in dimension for any
+// worldgen `StructureBlockEntity` with `ID == "minecraft:beehive"` and hydrates
+// each into a `BeehiveBlockEntity` containing 2..3 adult bees.
+func (s *Server) HydrateChunkNaturalBeehives(dimension string, cx, cz int32, rng *rand.Rand) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	baseX, baseZ := int(cx)<<4, int(cz)<<4
+	count := 0
+	for y := 50; y <= 140; y++ {
+		for lx := 0; lx < 16; lx++ {
+			for lz := 0; lz < 16; lz++ {
+				wx, wz := baseX+lx, baseZ+lz
+				if IsBeehiveOrNestBlockState(cache.GetBlock(wx, y, wz)) {
+					if s.HydrateNaturalBeehiveAt(normDim, wx, y, wz, rng) != nil {
+						count++
+					}
+				}
+			}
+		}
+	}
+	return count
+}
+
 // GetOrCreateBeehive returns (or creates) the BeehiveBlockEntity for a beehive/bee_nest at (x, y, z).
 func (s *Server) GetOrCreateBeehive(dimension string, x, y, z int) *BeehiveBlockEntity {
 	mgr := s.BeeStates()
@@ -566,6 +787,7 @@ func (s *Server) GetOrCreateBeehive(dimension string, x, y, z int) *BeehiveBlock
 		return nil
 	}
 	normDim := world.NormalizeDimension(dimension)
+	_ = s.HydrateNaturalBeehiveAt(normDim, x, y, z, nil)
 	key := beeHivePosKey{Dimension: normDim, X: x, Y: y, Z: z}
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
@@ -589,13 +811,44 @@ func (s *Server) GetOrCreateBeehive(dimension string, x, y, z int) *BeehiveBlock
 	return be
 }
 
+// BeehiveFlowerPos returns the remembered flower position of a beehive/bee_nest at (x, y, z), if any.
+func (s *Server) BeehiveFlowerPos(dimension string, x, y, z int) (fx, fy, fz int, ok bool) {
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return 0, 0, 0, false
+	}
+	key := beeHivePosKey{Dimension: world.NormalizeDimension(dimension), X: x, Y: y, Z: z}
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	be := mgr.hives[key]
+	if be == nil || be.FlowerPos == nil {
+		return 0, 0, 0, false
+	}
+	return be.FlowerPos[0], be.FlowerPos[1], be.FlowerPos[2], true
+}
+
+// SetBeehiveFlowerPos sets the remembered flower position of a beehive/bee_nest at (x, y, z).
+func (s *Server) SetBeehiveFlowerPos(dimension string, x, y, z, fx, fy, fz int) {
+	be := s.GetOrCreateBeehive(dimension, x, y, z)
+	if be == nil {
+		return
+	}
+	mgr := s.BeeStates()
+	mgr.mu.Lock()
+	pos := [3]int{fx, fy, fz}
+	be.FlowerPos = &pos
+	mgr.mu.Unlock()
+}
+
 // BeehiveOccupantCount returns the number of bees currently stored in the hive at (x, y, z).
 func (s *Server) BeehiveOccupantCount(dimension string, x, y, z int) int {
 	mgr := s.BeeStates()
 	if mgr == nil {
 		return 0
 	}
-	key := beeHivePosKey{Dimension: world.NormalizeDimension(dimension), X: x, Y: y, Z: z}
+	normDim := world.NormalizeDimension(dimension)
+	_ = s.HydrateNaturalBeehiveAt(normDim, x, y, z, nil)
+	key := beeHivePosKey{Dimension: normDim, X: x, Y: y, Z: z}
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
 	be := mgr.hives[key]
@@ -611,7 +864,9 @@ func (s *Server) BeehiveOccupants(dimension string, x, y, z int) []BeehiveOccupa
 	if mgr == nil {
 		return nil
 	}
-	key := beeHivePosKey{Dimension: world.NormalizeDimension(dimension), X: x, Y: y, Z: z}
+	normDim := world.NormalizeDimension(dimension)
+	_ = s.HydrateNaturalBeehiveAt(normDim, x, y, z, nil)
+	key := beeHivePosKey{Dimension: normDim, X: x, Y: y, Z: z}
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
 	be := mgr.hives[key]
@@ -661,13 +916,14 @@ func (s *Server) TryEnterBeehive(beeEntityID int32, dimension string, hx, hy, hz
 		return false
 	}
 	st, _ := s.BeeStateFor(beeEntityID)
-	if st.AngerTicks > 0 || st.CannotEnterHiveTicks > 0 || st.StayOutOfHiveCountdown > 0 {
+	if st.HasStung || st.AngerTicks > 0 || st.CannotEnterHiveTicks > 0 || st.StayOutOfHiveCountdown > 0 {
 		return false
 	}
 	mgr := s.BeeStates()
 	if mgr == nil {
 		return false
 	}
+	_ = s.HydrateNaturalBeehiveAt(normDim, hx, hy, hz, nil)
 	key := beeHivePosKey{Dimension: normDim, X: hx, Y: hy, Z: hz}
 	isBaby := s.IsMobBaby(beeEntityID)
 	ageTicks := s.MobAge(beeEntityID)
@@ -695,6 +951,10 @@ func (s *Server) TryEnterBeehive(beeEntityID int32, dimension string, hx, hy, hz
 		mgr.mu.Unlock()
 		return false
 	}
+	if st.HasFlowerPos {
+		fp := [3]int{st.FlowerX, st.FlowerY, st.FlowerZ}
+		be.FlowerPos = &fp
+	}
 	be.Occupants = append(be.Occupants, BeehiveOccupant{
 		TypeName:           MobTypeBee,
 		TicksInHive:        0,
@@ -703,6 +963,7 @@ func (s *Server) TryEnterBeehive(beeEntityID int32, dimension string, hx, hy, hz
 		Health:             hp,
 		IsBaby:             isBaby,
 		AgeTicks:           ageTicks,
+		CustomName:         st.CustomName,
 	})
 	delete(mgr.bees, beeEntityID)
 	mgr.mu.Unlock()
@@ -774,14 +1035,25 @@ func (s *Server) spawnBeeFromOccupant(dimension string, hx, hy, hz int, hiveStat
 			s.SetMobAge(beeID, newAge)
 		}
 	}
+	normDim := world.NormalizeDimension(dimension)
 	mgr := s.BeeStates()
 	if mgr != nil {
 		mgr.mu.Lock()
+		var sharedFlower *[3]int
+		if be := mgr.hives[beeHivePosKey{Dimension: normDim, X: hx, Y: hy, Z: hz}]; be != nil && be.FlowerPos != nil {
+			fp := *be.FlowerPos
+			sharedFlower = &fp
+		}
 		if st := mgr.bees[beeID]; st != nil {
-			st.HiveDimension = world.NormalizeDimension(dimension)
+			st.HiveDimension = normDim
 			st.HasHivePos = true
 			st.HiveX, st.HiveY, st.HiveZ = hx, hy, hz
 			st.StayOutOfHiveCountdown = 400
+			st.CustomName = occ.CustomName
+			if sharedFlower != nil {
+				st.HasFlowerPos = true
+				st.FlowerX, st.FlowerY, st.FlowerZ = sharedFlower[0], sharedFlower[1], sharedFlower[2]
+			}
 			if emergency {
 				st.HasNectar = occ.HasNectar
 			}
@@ -892,6 +1164,7 @@ func (s *Server) ReleaseBeesFromHive(dimension string, hx, hy, hz int, angerAtSe
 		return nil
 	}
 	normDim := world.NormalizeDimension(dimension)
+	_ = s.HydrateNaturalBeehiveAt(normDim, hx, hy, hz, rng)
 	key := beeHivePosKey{Dimension: normDim, X: hx, Y: hy, Z: hz}
 	var hiveState uint16
 	if cache := s.DimensionChunks(normDim); cache != nil {
@@ -1130,7 +1403,7 @@ func (s *Server) ConsumeHoneyBottle(session *PlayerSession) world.ItemStack {
 }
 
 // SerializeBeehiveItemMeta encodes a beehive's honey_level and occupants into a compact metadata string
-// for Silk Touch drops (`honey_level=<n>;bees=<hasNectar>,<ticks>,<minTicks>,<isBaby>|...`).
+// for Silk Touch drops (`honey_level=<n>;bees=<hasNectar>,<ticks>,<minTicks>,<isBaby>[,<ageTicks>,<customName>]|...`).
 func SerializeBeehiveItemMeta(honeyLevel int, occupants []BeehiveOccupant) string {
 	var parts []string
 	if honeyLevel > 0 {
@@ -1147,7 +1420,12 @@ func SerializeBeehiveItemMeta(honeyLevel int, occupants []BeehiveOccupant) strin
 			if occ.IsBaby {
 				bFlag = 1
 			}
-			beeStrs = append(beeStrs, fmt.Sprintf("%d,%d,%d,%d", nFlag, occ.TicksInHive, occ.MinOccupationTicks, bFlag))
+			safeName := strings.NewReplacer(";", "_", "|", "_", ",", "_").Replace(occ.CustomName)
+			if occ.AgeTicks != 0 || safeName != "" {
+				beeStrs = append(beeStrs, fmt.Sprintf("%d,%d,%d,%d,%d,%s", nFlag, occ.TicksInHive, occ.MinOccupationTicks, bFlag, occ.AgeTicks, safeName))
+			} else {
+				beeStrs = append(beeStrs, fmt.Sprintf("%d,%d,%d,%d", nFlag, occ.TicksInHive, occ.MinOccupationTicks, bFlag))
+			}
 		}
 		parts = append(parts, "bees="+strings.Join(beeStrs, "|"))
 	}
@@ -1201,6 +1479,14 @@ func ParseBeehiveItemMeta(meta string) (int, []BeehiveOccupant) {
 					occ.IsBaby = true
 					occ.AgeTicks = BabyMobGrowthTicks
 				}
+				if len(fields) >= 5 {
+					if age, err := strconv.Atoi(fields[4]); err == nil && age != 0 {
+						occ.AgeTicks = age
+					}
+				}
+				if len(fields) >= 6 {
+					occ.CustomName = fields[5]
+				}
 				if len(occupants) < BeeMaxHiveOccupants {
 					occupants = append(occupants, occ)
 				}
@@ -1235,7 +1521,7 @@ func (s *Server) OnBeehivePlaced(dimension string, x, y, z int, itemMetaStr stri
 // OnBeehiveBroken handles breaking a `minecraft:beehive` or `minecraft:bee_nest` at (x, y, z):
 //   - With Silk Touch: keeps all bees inside the dropped item (`droppedMetaStr`),
 //     does NOT anger bees, and grants `"minecraft:husbandry/silk_touch_nest"` ("Total Beelocation")
-//     when a `minecraft:bee_nest` with 3 bees is broken with Silk Touch.
+//     when a `minecraft:bee_nest` or `minecraft:beehive` with 3 bees is broken with Silk Touch.
 //   - Without Silk Touch: releases all stored bees and angers them + nearby bees within 22 blocks
 //     at the player (even if a campfire is underneath!). `bee_nest` drops nothing without Silk Touch;
 //     `beehive` drops `1x minecraft:beehive`.
@@ -1259,7 +1545,7 @@ func (s *Server) OnBeehiveBroken(session *PlayerSession, dimension string, x, y,
 			delete(mgr.hives, beeHivePosKey{Dimension: normDim, X: x, Y: y, Z: z})
 			mgr.mu.Unlock()
 		}
-		if session != nil && base == "minecraft:bee_nest" && len(occupants) == BeeMaxHiveOccupants {
+		if session != nil && (base == "minecraft:bee_nest" || base == "minecraft:beehive") && len(occupants) == BeeMaxHiveOccupants {
 			s.GrantCriterion(session, AdvancementSilkTouchNest, CriterionSilkTouchNest)
 		}
 		droppedMetaStr = SerializeBeehiveItemMeta(honeyLevel, occupants)
@@ -1316,6 +1602,7 @@ func (s *Server) AngerBeeAtPlayer(beeEntityID int32, targetSession *PlayerSessio
 	st.TargetMobID = 0
 	st.IsRolling = false
 	st.PollinatingTicks = 0
+	st.PollinateAttemptTicks = 0
 	mgr.mu.Unlock()
 	s.broadcastBeeMetadata(ent)
 	return true
@@ -1342,6 +1629,7 @@ func (s *Server) AngerBeeAtMob(beeEntityID, targetMobID int32, rng *rand.Rand) b
 	st.TargetSession = nil
 	st.IsRolling = false
 	st.PollinatingTicks = 0
+	st.PollinateAttemptTicks = 0
 	mgr.mu.Unlock()
 	s.broadcastBeeMetadata(ent)
 	return true
@@ -1563,11 +1851,47 @@ func (s *Server) TryFertilizeCropUnderBee(beeEntityID int32) bool {
 		if !canGrow {
 			continue
 		}
-		cache.SetBlock(bx, cy, bz, nextState)
-		w := protocol.NewWriter(12)
-		w.Position(bx, cy, bz)
-		w.VarInt(int32(nextState))
-		s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), protocol.PlayBlockUpdate, w.Bytes())
+		base := canonicalResourceName(world.BlockName(curState))
+		if base == "minecraft:pitcher_crop" {
+			props := world.BlockProperties(curState)
+			age, _ := strconv.Atoi(props["age"])
+			targetAge := age + 1
+			lowerY := cy
+			if props["half"] == "upper" {
+				lowerY = cy - 1
+			}
+			ageStr := strconv.Itoa(targetAge)
+			lowerState, okLower := world.BlockStateIDByProperties("minecraft:pitcher_crop", map[string]string{
+				"age":  ageStr,
+				"half": "lower",
+			})
+			if !okLower {
+				continue
+			}
+			cache.SetBlock(bx, lowerY, bz, lowerState)
+			wLower := protocol.NewWriter(12)
+			wLower.Position(bx, lowerY, bz)
+			wLower.VarInt(int32(lowerState))
+			s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), protocol.PlayBlockUpdate, wLower.Bytes())
+			if targetAge >= 2 && lowerY+1 < world.MinY+world.WorldHeight {
+				if upperState, okUpper := world.BlockStateIDByProperties("minecraft:pitcher_crop", map[string]string{
+					"age":  ageStr,
+					"half": "upper",
+				}); okUpper {
+					cache.SetBlock(bx, lowerY+1, bz, upperState)
+					wUpper := protocol.NewWriter(12)
+					wUpper.Position(bx, lowerY+1, bz)
+					wUpper.VarInt(int32(upperState))
+					s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), protocol.PlayBlockUpdate, wUpper.Bytes())
+				}
+			}
+		} else {
+			cache.SetBlock(bx, cy, bz, nextState)
+			w := protocol.NewWriter(12)
+			w.Position(bx, cy, bz)
+			w.VarInt(int32(nextState))
+			s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), protocol.PlayBlockUpdate, w.Bytes())
+		}
 		mgr.mu.Lock()
 		if st2 := mgr.bees[beeEntityID]; st2 != nil {
 			st2.CropsGrownSincePollination++
@@ -1604,11 +1928,24 @@ func (s *Server) findNearbyBeeFlower(cache *world.Cache, cx, cy, cz, radius int)
 				if distSq >= bestDistSq {
 					continue
 				}
-				if IsBeeFlowerBlockState(cache.GetBlock(cx+dx, y, cz+dz)) {
-					bestDistSq = distSq
-					fx, fy, fz = cx+dx, y, cz+dz
-					found = true
+				bx, bz := cx+dx, cz+dz
+				blk := cache.GetBlock(bx, y, bz)
+				if !IsBeeFlowerBlockState(blk) {
+					continue
 				}
+				targetY := y
+				if IsTallBeeFlowerBlock(world.BlockName(blk)) {
+					props := world.BlockProperties(blk)
+					if props["half"] == "lower" && y+1 < world.MinY+world.WorldHeight {
+						above := cache.GetBlock(bx, y+1, bz)
+						if IsTallBeeFlowerBlock(world.BlockName(above)) {
+							targetY = y + 1
+						}
+					}
+				}
+				bestDistSq = distSq
+				fx, fy, fz = bx, targetY, bz
+				found = true
 			}
 		}
 	}
@@ -1679,11 +2016,77 @@ func (s *Server) flyBeeToward(ent *world.Entity, tx, ty, tz, speed float64) {
 	})
 }
 
+func (s *Server) flyBeeIdleWander(ent *world.Entity, cache *world.Cache, st *BeeState, rng *rand.Rand) {
+	if s == nil || ent == nil || st == nil || rng == nil {
+		return
+	}
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return
+	}
+	mgr.mu.Lock()
+	if st.WanderTicks <= 0 || math.Hypot(st.WanderX-ent.X, st.WanderZ-ent.Z) < 0.5 {
+		dx := float64(rng.Intn(9)-4) + (rng.Float64() - 0.5)
+		dy := float64(rng.Intn(3)-1) * 0.5
+		dz := float64(rng.Intn(9)-4) + (rng.Float64() - 0.5)
+		wx := ent.X + dx
+		wy := ent.Y + dy
+		wz := ent.Z + dz
+		if cache != nil {
+			bx, by, bz := int(math.Floor(wx)), int(math.Floor(wy)), int(math.Floor(wz))
+			if by <= world.MinY+1 {
+				wy = float64(world.MinY + 2)
+			} else if by < world.MinY+world.WorldHeight && !isPassableBlock(cache.GetBlock(bx, by, bz)) {
+				wy = ent.Y + 0.5
+			}
+		}
+		st.WanderX, st.WanderY, st.WanderZ = wx, wy, wz
+		st.WanderTicks = 40 + rng.Intn(40)
+	}
+	st.WanderTicks--
+	wx, wy, wz := st.WanderX, st.WanderY, st.WanderZ
+	mgr.mu.Unlock()
+	s.flyBeeToward(ent, wx, wy, wz, BeeFlySpeed*0.5)
+}
+
+func (s *Server) findNearbyBeeInLove(bee *world.Entity, maxRange float64) (mate *world.Entity, ok bool) {
+	if s == nil || s.entities == nil || bee == nil {
+		return nil, false
+	}
+	dim := bee.EffectiveDimension()
+	maxSq := maxRange * maxRange
+	bestSq := maxSq
+	allEnts := s.entities.AppendAll(nil)
+	for i := range allEnts {
+		other := &allEnts[i]
+		if other.ID == bee.ID || canonicalResourceName(other.TypeName) != MobTypeBee || other.EffectiveDimension() != dim {
+			continue
+		}
+		if s.IsMobBaby(other.ID) || s.MobInLoveTicks(other.ID) <= 0 || s.MobBreedCooldown(other.ID) > 0 {
+			continue
+		}
+		dx := other.X - bee.X
+		dy := other.Y - bee.Y
+		dz := other.Z - bee.Z
+		dSq := dx*dx + dy*dy + dz*dz
+		if dSq <= bestSq {
+			bestSq = dSq
+			cp := *other
+			mate = &cp
+		}
+	}
+	return mate, mate != nil
+}
+
 // TickBeeAI advances one tick of AI for a `minecraft:bee` entity:
+//   - Water submersion damage (`UnderWaterTicks`: 1.0 damage every 20 ticks in water)
+//   - Leash constraint (`StepLeashConstraintForMob`)
 //   - Post-sting countdown (`HasStung == true` -> dies after 1000..1200 ticks)
 //   - Swarm anger pursuit & sting attack (`PerformBeeSting` / `PerformBeeStingOnMob`)
-//   - Returning to `beehive` / `bee_nest` at night, in rain, or with nectar (`HasNectar == true`)
+//   - Love-mode mating flight (`TryBreedMobWithNearbyMate`)
+//   - Temptation by player holding a flower
 //   - Crop fertilization while flying home with nectar (`TryFertilizeCropUnderBee`)
+//   - Returning to `beehive` / `bee_nest` at night, in rain, or with nectar (`HasNectar == true`)
 //   - Flower search & 400-tick pollination (`BeePollinateTargetTicks`)
 func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []playerTarget, rng *rand.Rand) {
 	if s == nil || ent == nil || canonicalResourceName(ent.TypeName) != MobTypeBee {
@@ -1697,6 +2100,26 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 	dim := ent.EffectiveDimension()
 	if cache == nil {
 		cache = s.DimensionChunks(dim)
+	}
+
+	// 0. Water submersion check (vanilla Bee.customServerAiStep: 1.0 damage every 20 ticks in water) + leash constraint.
+	_, _, fluidKind, submerged := s.EntitySubmergedFluidDepth(dim, ent.X, ent.Y, ent.Z)
+	dealWaterDmg := false
+	mgr.mu.Lock()
+	if submerged && fluidKind == world.FluidWater {
+		st.UnderWaterTicks++
+		if st.UnderWaterTicks >= 20 && st.UnderWaterTicks%20 == 0 {
+			dealWaterDmg = true
+		}
+	} else {
+		st.UnderWaterTicks = 0
+	}
+	mgr.mu.Unlock()
+	if dealWaterDmg {
+		s.applyDamageToMob(ent, 1.0, nil, 0, false, false)
+		if s.entities.Get(ent.ID) == nil {
+			return
+		}
 	}
 
 	// 1. Post-sting death timer (50..60 seconds after losing stinger).
@@ -1725,6 +2148,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 			return
 		}
 		mgr.mu.Unlock()
+		s.flyBeeIdleWander(ent, cache, st, rng)
 		return
 	}
 
@@ -1808,6 +2232,29 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 	}
 	mgr.mu.Unlock()
 
+	// 2.5. Love-mode mating flight for adult bees in love.
+	if !s.IsMobBaby(ent.ID) && s.MobInLoveTicks(ent.ID) > 0 {
+		if offspringID, bred := s.TryBreedMobWithNearbyMate(ent.ID, AnimalMateCloseDist, rng); bred {
+			if offspringID > 0 {
+				s.ensureBeeState(offspringID)
+				if babyEnt := s.entities.Get(offspringID); babyEnt != nil {
+					s.broadcastBeeMetadata(babyEnt)
+				}
+			}
+			return
+		}
+		if mate, ok := s.findNearbyBeeInLove(ent, 16.0); ok {
+			s.flyBeeToward(ent, mate.X, mate.Y, mate.Z, BeeFlySpeed)
+			if offspringID, bred := s.TryBreedMobWithNearbyMate(ent.ID, AnimalMateCloseDist, rng); bred && offspringID > 0 {
+				s.ensureBeeState(offspringID)
+				if babyEnt := s.entities.Get(offspringID); babyEnt != nil {
+					s.broadcastBeeMetadata(babyEnt)
+				}
+			}
+			return
+		}
+	}
+
 	// 3. Temptation by player holding a flower within 10 blocks.
 	if temptTarget, ok := findTemptingPlayer(targets, MobTypeBee, ent.X, ent.Y, ent.Z); ok {
 		if math.Hypot(temptTarget.x-ent.X, temptTarget.z-ent.Z) > 1.8 {
@@ -1844,7 +2291,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 			}
 		}
 		if !hasHive {
-			if fx, fy, fz, ok := s.findNearbyAvailableBeehive(dim, cache, int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z)), 12); ok {
+			if fx, fy, fz, ok := s.findNearbyAvailableBeehive(dim, cache, int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z)), BeeHiveSearchRadius); ok {
 				hasHive = true
 				hx, hy, hz = fx, fy, fz
 				mgr.mu.Lock()
@@ -1861,6 +2308,9 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				if s.TryEnterBeehive(ent.ID, dim, hx, hy, hz) {
 					return
 				}
+				mgr.mu.Lock()
+				st.CannotEnterHiveTicks = BeePollinateCooldownTicks
+				mgr.mu.Unlock()
 			} else {
 				s.flyBeeToward(ent, tx, ty, tz, BeeFlySpeed)
 				return
@@ -1882,6 +2332,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				mgr.mu.Lock()
 				st.HasFlowerPos = false
 				st.PollinatingTicks = 0
+				st.PollinateAttemptTicks = 0
 				if st.IsRolling {
 					st.IsRolling = false
 					mgr.mu.Unlock()
@@ -1898,6 +2349,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				mgr.mu.Lock()
 				st.HasFlowerPos = true
 				st.FlowerX, st.FlowerY, st.FlowerZ = fx, fy, fz
+				st.PollinateAttemptTicks = 0
 				mgr.mu.Unlock()
 			} else {
 				mgr.mu.Lock()
@@ -1909,31 +2361,69 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 			tx, ty, tz := float64(fx)+0.5, float64(fy)+0.6, float64(fz)+0.5
 			dist := math.Sqrt((tx-ent.X)*(tx-ent.X) + (ty-ent.Y)*(ty-ent.Y) + (tz-ent.Z)*(tz-ent.Z))
 			if dist <= 1.2 {
+				flowerBlockName := canonicalResourceName(world.BlockName(cache.GetBlock(fx, fy, fz)))
+				if flowerBlockName == "minecraft:wither_rose" {
+					s.ApplyWitherRoseContact(nil, ent.ID)
+				} else if flowerBlockName == "minecraft:open_eyeblossom" {
+					s.ApplyEntityEffectScaled(ent.ID, StatusEffectInstance{
+						ID:            EffectPoison,
+						Amplifier:     0,
+						Duration:      25,
+						ShowParticles: true,
+						ShowIcon:      true,
+					}, 1.0)
+				}
 				mgr.mu.Lock()
 				wasRolling := st.IsRolling
 				st.IsRolling = true
 				st.PollinatingTicks++
+				st.PollinateAttemptTicks++
 				done := st.PollinatingTicks >= BeePollinateTargetTicks
+				timedOut := !done && st.PollinateAttemptTicks >= BeePollinateMaxDurationTicks
 				if done {
 					st.HasNectar = true
 					st.IsRolling = false
 					st.PollinatingTicks = 0
+					st.PollinateAttemptTicks = 0
 					st.CropsGrownSincePollination = 0
+					st.PollinateCooldown = BeePollinateCooldownTicks
+				} else if timedOut {
+					st.IsRolling = false
+					st.PollinatingTicks = 0
+					st.PollinateAttemptTicks = 0
+					st.HasFlowerPos = false
 					st.PollinateCooldown = BeePollinateCooldownTicks
 				}
 				mgr.mu.Unlock()
-				if !wasRolling || done {
+				if !wasRolling || done || timedOut {
 					s.broadcastBeeMetadata(ent)
 				}
 				return
 			}
+			mgr.mu.Lock()
+			st.PollinateAttemptTicks++
+			if st.PollinateAttemptTicks >= BeePollinateMaxDurationTicks {
+				st.HasFlowerPos = false
+				st.PollinatingTicks = 0
+				st.PollinateAttemptTicks = 0
+				st.PollinateCooldown = BeePollinateCooldownTicks
+				mgr.mu.Unlock()
+				return
+			}
+			mgr.mu.Unlock()
 			s.flyBeeToward(ent, tx, ty, tz, BeeFlySpeed)
+			return
 		}
 	}
+
+	// 7. Idle wandering flight when no active goal is running.
+	s.flyBeeIdleWander(ent, cache, st, rng)
 }
 
-// InteractWithBee handles a player right-clicking a `minecraft:bee` with a flower item
-// (accelerating baby growth by 10% or entering love mode on adults to breed a baby bee).
+// InteractWithBee handles a player right-clicking a `minecraft:bee`:
+//   - With a named `minecraft:name_tag`: sets the bee's CustomName (preserved across hive entry/exit)
+//   - With a flower item (`IsBeeBreedItem`): accelerates baby growth by 10% (`FeedBabyMob`)
+//     or enters love mode on adults to breed a baby bee (`InteractWithAnimal`).
 func (s *Server) InteractWithBee(session *PlayerSession, entityID int32) (handled bool, offspringID int32) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return false, 0
@@ -1943,10 +2433,33 @@ func (s *Server) InteractWithBee(session *PlayerSession, entityID int32) (handle
 		return false, 0
 	}
 	held := session.HeldItem()
-	if held.IsEmpty() || !IsBeeBreedItem(held.ResolvedID()) {
+	if held.IsEmpty() {
 		return false, 0
 	}
-	return s.InteractWithAnimal(session, entityID)
+	heldID := canonicalResourceName(held.ResolvedID())
+	if heldID == "minecraft:name_tag" {
+		snap := session.Snapshot()
+		slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
+		meta := GetSlotItemMeta(session, slotIdx)
+		if strings.TrimSpace(meta.CustomName) != "" {
+			s.SetBeeCustomName(entityID, meta.CustomName)
+			consumeOneHeldItemInSurvival(session)
+			return true, 0
+		}
+		return false, 0
+	}
+	if !IsBeeBreedItem(heldID) {
+		return false, 0
+	}
+	handled, offspringID = s.InteractWithAnimal(session, entityID)
+	if handled && offspringID > 0 {
+		s.ensureBeeState(offspringID)
+		if babyEnt := s.entities.Get(offspringID); babyEnt != nil {
+			s.broadcastBeeMetadata(babyEnt)
+			s.SpawnExperienceOrbsInDimension(babyEnt.EffectiveDimension(), babyEnt.X, babyEnt.Y+0.25, babyEnt.Z, 4)
+		}
+	}
+	return handled, offspringID
 }
 
 // TickBees advances one tick of AI for all living `minecraft:bee` entities across all dimensions.
@@ -1964,4 +2477,416 @@ func (s *Server) TickBees(rng *rand.Rand) {
 		cache := s.DimensionChunks(ent.EffectiveDimension())
 		s.TickBeeAI(&ent, cache, targets, rng)
 	}
+}
+
+// --- Beehive BlockEntity NBT & File Persistence ---
+
+// EncodeBeehiveBlockEntityNBT encodes a `BeehiveBlockEntity` into a vanilla-compatible
+// `minecraft:beehive` block entity NBT compound (`id`, `x`, `y`, `z`, `block_name`, `flower_pos`, `bees`).
+func EncodeBeehiveBlockEntityNBT(be *BeehiveBlockEntity) *nbt.Compound {
+	if be == nil {
+		return nil
+	}
+	c := nbt.NewCompound()
+	c.Set("id", nbt.String("minecraft:beehive"))
+	c.Set("x", nbt.Int(int32(be.X)))
+	c.Set("y", nbt.Int(int32(be.Y)))
+	c.Set("z", nbt.Int(int32(be.Z)))
+	if be.BlockName != "" {
+		c.Set("block_name", nbt.String(be.BlockName))
+	}
+	if be.FlowerPos != nil {
+		c.Set("flower_pos", nbt.IntArray{int32(be.FlowerPos[0]), int32(be.FlowerPos[1]), int32(be.FlowerPos[2])})
+	}
+	beeTags := make([]nbt.Tag, 0, len(be.Occupants))
+	for _, occ := range be.Occupants {
+		bc := nbt.NewCompound()
+		typeName := occ.TypeName
+		if typeName == "" {
+			typeName = MobTypeBee
+		}
+		bc.Set("id", nbt.String(typeName))
+		bc.Set("ticks_in_hive", nbt.Int(int32(occ.TicksInHive)))
+		bc.Set("min_occupation_ticks", nbt.Int(int32(occ.MinOccupationTicks)))
+		var hasNectarByte int8
+		if occ.HasNectar {
+			hasNectarByte = 1
+		}
+		bc.Set("has_nectar", nbt.Byte(hasNectarByte))
+		var isBabyByte int8
+		if occ.IsBaby {
+			isBabyByte = 1
+		}
+		bc.Set("is_baby", nbt.Byte(isBabyByte))
+		bc.Set("age_ticks", nbt.Int(int32(occ.AgeTicks)))
+		bc.Set("health", nbt.Float(occ.Health))
+		if occ.CustomName != "" {
+			bc.Set("CustomName", nbt.String(occ.CustomName))
+		}
+		beeTags = append(beeTags, bc)
+	}
+	c.Set("bees", nbt.List{ElemID: nbt.TagCompound, Elems: beeTags})
+	return c
+}
+
+// DecodeBeehiveBlockEntityNBT decodes a `BeehiveBlockEntity` from a `minecraft:beehive` NBT compound.
+func DecodeBeehiveBlockEntityNBT(dimension string, comp *nbt.Compound) (*BeehiveBlockEntity, bool) {
+	if comp == nil {
+		return nil, false
+	}
+	idTag, ok := comp.Get("id")
+	if !ok {
+		return nil, false
+	}
+	idStr, ok := idTag.(nbt.String)
+	if !ok || canonicalResourceName(string(idStr)) != "minecraft:beehive" {
+		return nil, false
+	}
+	xTag, okX := comp.Get("x")
+	yTag, okY := comp.Get("y")
+	zTag, okZ := comp.Get("z")
+	xi, okX := xTag.(nbt.Int)
+	yi, okY := yTag.(nbt.Int)
+	zi, okZ := zTag.(nbt.Int)
+	if !okX || !okY || !okZ {
+		return nil, false
+	}
+	be := &BeehiveBlockEntity{
+		Dimension: world.NormalizeDimension(dimension),
+		X:         int(xi),
+		Y:         int(yi),
+		Z:         int(zi),
+		BlockName: "minecraft:beehive",
+	}
+	if bnTag, ok := comp.Get("block_name"); ok {
+		if bnStr, ok := bnTag.(nbt.String); ok && bnStr != "" {
+			be.BlockName = canonicalResourceName(string(bnStr))
+		}
+	}
+	if fpTag, ok := comp.Get("flower_pos"); ok {
+		if arr, ok := fpTag.(nbt.IntArray); ok && len(arr) == 3 {
+			fp := [3]int{int(arr[0]), int(arr[1]), int(arr[2])}
+			be.FlowerPos = &fp
+		}
+	}
+	if beesTag, ok := comp.Get("bees"); ok {
+		if list, ok := beesTag.(nbt.List); ok {
+			for _, elem := range list.Elems {
+				bc, ok := elem.(*nbt.Compound)
+				if !ok || bc == nil || len(be.Occupants) >= BeeMaxHiveOccupants {
+					continue
+				}
+				occ := BeehiveOccupant{
+					TypeName:           MobTypeBee,
+					MinOccupationTicks: BeeMinOccupationTicksNoNectar,
+					Health:             DefaultBeeMaxHealth,
+				}
+				if tTag, ok := bc.Get("ticks_in_hive"); ok {
+					if ti, ok := tTag.(nbt.Int); ok {
+						occ.TicksInHive = int(ti)
+					}
+				}
+				if mTag, ok := bc.Get("min_occupation_ticks"); ok {
+					if mi, ok := mTag.(nbt.Int); ok && mi > 0 {
+						occ.MinOccupationTicks = int(mi)
+					}
+				}
+				if nTag, ok := bc.Get("has_nectar"); ok {
+					if nb, ok := nTag.(nbt.Byte); ok && nb != 0 {
+						occ.HasNectar = true
+					}
+				}
+				if bTag, ok := bc.Get("is_baby"); ok {
+					if bb, ok := bTag.(nbt.Byte); ok && bb != 0 {
+						occ.IsBaby = true
+					}
+				}
+				if aTag, ok := bc.Get("age_ticks"); ok {
+					if ai, ok := aTag.(nbt.Int); ok {
+						occ.AgeTicks = int(ai)
+					}
+				}
+				if hTag, ok := bc.Get("health"); ok {
+					if hf, ok := hTag.(nbt.Float); ok && hf > 0 {
+						occ.Health = float32(hf)
+					}
+				}
+				if cnTag, ok := bc.Get("CustomName"); ok {
+					if cs, ok := cnTag.(nbt.String); ok {
+						occ.CustomName = string(cs)
+					}
+				}
+				be.Occupants = append(be.Occupants, occ)
+			}
+		}
+	}
+	return be, true
+}
+
+// ChunkBeehiveBlockEntitiesNBT returns NBT compounds for all `BeehiveBlockEntity`
+// instances in chunk (cx, cz) of dimension without removing them from memory.
+func (s *Server) ChunkBeehiveBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Compound {
+	mgr := s.BeeStates()
+	if s == nil || mgr == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dimension)
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	var out []*nbt.Compound
+	for key, be := range mgr.hives {
+		if key.Dimension != normDim || be == nil {
+			continue
+		}
+		if int32(key.X>>4) == cx && int32(key.Z>>4) == cz {
+			if c := EncodeBeehiveBlockEntityNBT(be); c != nil {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// UnloadChunkBeehiveBlockEntities removes and returns NBT compounds for all
+// `BeehiveBlockEntity` instances in chunk (cx, cz) of dimension.
+func (s *Server) UnloadChunkBeehiveBlockEntities(dimension string, cx, cz int32) []*nbt.Compound {
+	mgr := s.BeeStates()
+	if s == nil || mgr == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dimension)
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	var out []*nbt.Compound
+	for key, be := range mgr.hives {
+		if key.Dimension != normDim || be == nil {
+			continue
+		}
+		if int32(key.X>>4) == cx && int32(key.Z>>4) == cz {
+			if c := EncodeBeehiveBlockEntityNBT(be); c != nil {
+				out = append(out, c)
+			}
+			delete(mgr.hives, key)
+		}
+	}
+	return out
+}
+
+// LoadChunkBeehiveBlockEntitiesNBT restores `BeehiveBlockEntity` instances in dimension from chunk NBT compounds.
+func (s *Server) LoadChunkBeehiveBlockEntitiesNBT(dimension string, compounds []*nbt.Compound) {
+	mgr := s.BeeStates()
+	if s == nil || mgr == nil || len(compounds) == 0 {
+		return
+	}
+	normDim := world.NormalizeDimension(dimension)
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	for _, comp := range compounds {
+		be, ok := DecodeBeehiveBlockEntityNBT(normDim, comp)
+		if !ok || be == nil {
+			continue
+		}
+		key := beeHivePosKey{Dimension: normDim, X: be.X, Y: be.Y, Z: be.Z}
+		mgr.hives[key] = be
+	}
+}
+
+type persistedBeeSnapshot struct {
+	Dimension                  string  `json:"dimension"`
+	X                          float64 `json:"x"`
+	Y                          float64 `json:"y"`
+	Z                          float64 `json:"z"`
+	Yaw                        float32 `json:"yaw"`
+	Pitch                      float32 `json:"pitch"`
+	Health                     float32 `json:"health"`
+	IsBaby                     bool    `json:"is_baby,omitempty"`
+	AgeTicks                   int     `json:"age_ticks,omitempty"`
+	HasNectar                  bool    `json:"has_nectar,omitempty"`
+	HasStung                   bool    `json:"has_stung,omitempty"`
+	TimeSinceSting             int     `json:"time_since_sting,omitempty"`
+	DeathAfterStingTicks       int     `json:"death_after_sting_ticks,omitempty"`
+	HiveDimension              string  `json:"hive_dimension,omitempty"`
+	HasHivePos                 bool    `json:"has_hive_pos,omitempty"`
+	HiveX                      int     `json:"hive_x,omitempty"`
+	HiveY                      int     `json:"hive_y,omitempty"`
+	HiveZ                      int     `json:"hive_z,omitempty"`
+	HasFlowerPos               bool    `json:"has_flower_pos,omitempty"`
+	FlowerX                    int     `json:"flower_x,omitempty"`
+	FlowerY                    int     `json:"flower_y,omitempty"`
+	FlowerZ                    int     `json:"flower_z,omitempty"`
+	CropsGrownSincePollination int     `json:"crops_grown,omitempty"`
+	CustomName                 string  `json:"custom_name,omitempty"`
+}
+
+type persistedHiveSnapshot struct {
+	Dimension string            `json:"dimension"`
+	X         int               `json:"x"`
+	Y         int               `json:"y"`
+	Z         int               `json:"z"`
+	BlockName string            `json:"block_name"`
+	FlowerPos *[3]int           `json:"flower_pos,omitempty"`
+	Occupants []BeehiveOccupant `json:"occupants"`
+}
+
+type persistedBeesAndBeehivesFile struct {
+	Bees  []persistedBeeSnapshot  `json:"bees"`
+	Hives []persistedHiveSnapshot `json:"hives"`
+}
+
+// SaveBeesAndBeehivesFile saves all active `minecraft:bee` entities and `BeehiveBlockEntity`
+// occupants/flower positions to a JSON file so bees and beehives persist across server restarts.
+func (s *Server) SaveBeesAndBeehivesFile(path string) error {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return errors.New("bee: invalid server or file path")
+	}
+	mgr := s.BeeStates()
+	var payload persistedBeesAndBeehivesFile
+	if s.entities != nil {
+		allEnts := s.entities.AppendAll(nil)
+		for i := range allEnts {
+			ent := &allEnts[i]
+			if canonicalResourceName(ent.TypeName) != MobTypeBee {
+				continue
+			}
+			st, _ := s.BeeStateFor(ent.ID)
+			payload.Bees = append(payload.Bees, persistedBeeSnapshot{
+				Dimension:                  ent.EffectiveDimension(),
+				X:                          ent.X,
+				Y:                          ent.Y,
+				Z:                          ent.Z,
+				Yaw:                        ent.Yaw,
+				Pitch:                      ent.Pitch,
+				Health:                     s.MobHealth(ent.ID),
+				IsBaby:                     s.IsMobBaby(ent.ID),
+				AgeTicks:                   s.MobAge(ent.ID),
+				HasNectar:                  st.HasNectar,
+				HasStung:                   st.HasStung,
+				TimeSinceSting:             st.TimeSinceSting,
+				DeathAfterStingTicks:       st.DeathAfterStingTicks,
+				HiveDimension:              st.HiveDimension,
+				HasHivePos:                 st.HasHivePos,
+				HiveX:                      st.HiveX,
+				HiveY:                      st.HiveY,
+				HiveZ:                      st.HiveZ,
+				HasFlowerPos:               st.HasFlowerPos,
+				FlowerX:                    st.FlowerX,
+				FlowerY:                    st.FlowerY,
+				FlowerZ:                    st.FlowerZ,
+				CropsGrownSincePollination: st.CropsGrownSincePollination,
+				CustomName:                 st.CustomName,
+			})
+		}
+	}
+	if mgr != nil {
+		mgr.mu.RLock()
+		for _, be := range mgr.hives {
+			if be == nil {
+				continue
+			}
+			var fpCopy *[3]int
+			if be.FlowerPos != nil {
+				fp := *be.FlowerPos
+				fpCopy = &fp
+			}
+			occs := make([]BeehiveOccupant, len(be.Occupants))
+			copy(occs, be.Occupants)
+			payload.Hives = append(payload.Hives, persistedHiveSnapshot{
+				Dimension: be.Dimension,
+				X:         be.X,
+				Y:         be.Y,
+				Z:         be.Z,
+				BlockName: be.BlockName,
+				FlowerPos: fpCopy,
+				Occupants: occs,
+			})
+		}
+		mgr.mu.RUnlock()
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o644)
+}
+
+// LoadBeesAndBeehivesFile restores `minecraft:bee` entities and `BeehiveBlockEntity`
+// occupants/flower positions from a JSON file written by SaveBeesAndBeehivesFile.
+func (s *Server) LoadBeesAndBeehivesFile(path string) error {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return errors.New("bee: invalid server or file path")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var payload persistedBeesAndBeehivesFile
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return err
+	}
+	mgr := s.BeeStates()
+	if mgr != nil {
+		mgr.mu.Lock()
+		for _, hs := range payload.Hives {
+			normDim := world.NormalizeDimension(hs.Dimension)
+			key := beeHivePosKey{Dimension: normDim, X: hs.X, Y: hs.Y, Z: hs.Z}
+			var fpCopy *[3]int
+			if hs.FlowerPos != nil {
+				fp := *hs.FlowerPos
+				fpCopy = &fp
+			}
+			occs := make([]BeehiveOccupant, len(hs.Occupants))
+			copy(occs, hs.Occupants)
+			mgr.hives[key] = &BeehiveBlockEntity{
+				Dimension: normDim,
+				X:         hs.X,
+				Y:         hs.Y,
+				Z:         hs.Z,
+				BlockName: hs.BlockName,
+				FlowerPos: fpCopy,
+				Occupants: occs,
+			}
+		}
+		mgr.mu.Unlock()
+	}
+	for _, bs := range payload.Bees {
+		id, err := s.SpawnBee(bs.Dimension, bs.X, bs.Y, bs.Z, bs.IsBaby)
+		if err != nil || id <= 0 {
+			continue
+		}
+		if bs.Health > 0 {
+			s.SetMobHealth(id, bs.Health)
+		}
+		if bs.IsBaby && bs.AgeTicks < 0 {
+			s.SetMobAge(id, bs.AgeTicks)
+		}
+		if mgr != nil {
+			mgr.mu.Lock()
+			if st := mgr.bees[id]; st != nil {
+				st.HasNectar = bs.HasNectar
+				st.HasStung = bs.HasStung
+				st.TimeSinceSting = bs.TimeSinceSting
+				if bs.DeathAfterStingTicks > 0 {
+					st.DeathAfterStingTicks = bs.DeathAfterStingTicks
+				}
+				st.HiveDimension = bs.HiveDimension
+				st.HasHivePos = bs.HasHivePos
+				st.HiveX, st.HiveY, st.HiveZ = bs.HiveX, bs.HiveY, bs.HiveZ
+				st.HasFlowerPos = bs.HasFlowerPos
+				st.FlowerX, st.FlowerY, st.FlowerZ = bs.FlowerX, bs.FlowerY, bs.FlowerZ
+				st.CropsGrownSincePollination = bs.CropsGrownSincePollination
+				st.CustomName = bs.CustomName
+			}
+			mgr.mu.Unlock()
+		}
+		if ent := s.entities.Get(id); ent != nil {
+			s.broadcastBeeMetadata(ent)
+		}
+	}
+	return nil
 }
