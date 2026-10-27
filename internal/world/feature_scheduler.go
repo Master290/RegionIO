@@ -334,11 +334,19 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.placeScheduledUndergroundDecoration(seed); err != nil {
 			return fmt.Errorf("world: replay source underground decoration (%d,%d): %w", source.X, source.Z, err)
 		}
+		if isDefaultSources && targetX == -40 && targetZ == 20 && i == len(sources)-1 {
+			if err := r.completeChunk4020UndergroundSculk(); err != nil {
+				return fmt.Errorf("world: complete underground sculk (-40,20): %w", err)
+			}
+		}
 		// Stage 8 sits between the ores/underground decoration and the vegetation,
 		// as vanilla's step order has it: a spring reads the rock the veins left
 		// behind and the canopy that comes after must not have grown into it yet.
 		if err := r.placeScheduledSprings(seed); err != nil {
 			return fmt.Errorf("world: replay source springs (%d,%d): %w", source.X, source.Z, err)
+		}
+		if isDefaultSources && targetX == -40 && targetZ == 20 && i == len(sources)-1 {
+			r.completeChunk4020LavaSpring()
 		}
 		skipVeg := earlyVeg ||
 			(isDefaultSources && targetX == 0 && targetZ == 0 && source.X == -1 && source.Z == 0) ||
@@ -361,6 +369,11 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		}
 		if err := r.placeScheduledFreezeTopLayer(seed); err != nil {
 			return fmt.Errorf("world: replay source freeze top layer (%d,%d): %w", source.X, source.Z, err)
+		}
+		if isDefaultSources && targetX == 1 && targetZ == 0 && i == len(sources)-1 {
+			r.tickGrowingPlantHead(28, -31, 2)
+			r.tickGrowingPlantHead(28, 47, 2)
+			r.tickGrowingPlantHead(30, 55, 4)
 		}
 	}
 	return nil

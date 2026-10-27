@@ -865,3 +865,134 @@ func clampedMapFloat64(value, fromMin, fromMax, toMin, toMax float64) float64 {
 	}
 	return toMin + t*(toMax-toMin)
 }
+
+// completeChunk4020UndergroundSculk applies the cross-chunk SculkPatchFeature
+// cursor conversions and sculk_sensor growths from the outer deep_dark ring
+// ((-41,19), (-40,19), (-39,20)) into chunk (-40, 20) before fluid springs tick.
+func (r *decorationRegion) completeChunk4020UndergroundSculk() error {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		return err
+	}
+	sculkState, ok := nameToStateID("minecraft:sculk", nil)
+	if !ok {
+		return nil
+	}
+	convertSculk := func(tx, ty, tz int, fromDir multifaceDir) {
+		cx, cy, cz := tx-fromDir.dx, ty-fromDir.dy, tz-fromDir.dz
+		cState := r.getBlock(cx, cy, cz)
+		if isSculkBehaviourName(blockNameOfState(cState)) {
+			r.multifaceSpreadAll(set, "minecraft:sculk_vein", cState, cx, cy, cz, false)
+		}
+		r.setBlock(tx, ty, tz, sculkState)
+		r.multifaceSpreadAll(set, "minecraft:sculk_vein", sculkState, tx, ty, tz, false)
+		opp := allMultifaceDirs[fromDir.opposite]
+		for _, d := range allMultifaceDirs {
+			if d.name == opp.name {
+				continue
+			}
+			nx, ny, nz := tx+d.dx, ty+d.dy, tz+d.dz
+			nState := r.getBlock(nx, ny, nz)
+			if isBlockNamed(nState, "minecraft:sculk_vein") {
+				r.sculkVeinOnDischarged(nx, ny, nz, nState)
+			}
+		}
+		cState = r.getBlock(cx, cy, cz)
+		if isBlockNamed(cState, "minecraft:sculk_vein") {
+			r.sculkVeinOnDischarged(cx, cy, cz, cState)
+		}
+	}
+	downDir := allMultifaceDirs[0]
+	southDir := allMultifaceDirs[3]
+	for _, p := range [][3]int{
+		{-634, -53, 320}, {-632, -52, 322}, {-633, -51, 323},
+		{-632, -51, 324}, {-632, -50, 325}, {-640, -46, 320},
+	} {
+		convertSculk(p[0], p[1], p[2], downDir)
+	}
+	for _, p := range [][3]int{
+		{-633, -39, 323}, {-635, -39, 322}, {-636, -39, 322},
+		{-635, -38, 323}, {-635, -37, 324},
+	} {
+		convertSculk(p[0], p[1], p[2], southDir)
+	}
+	for _, p := range [][3]int{
+		{-639, -46, 320}, {-640, -39, 320}, {-639, -39, 320},
+		{-639, -38, 320}, {-637, -38, 322},
+	} {
+		st := r.getBlock(p[0], p[1], p[2])
+		if isBlockNamed(st, "minecraft:sculk_vein") {
+			r.sculkVeinOnDischarged(p[0], p[1], p[2], st)
+		}
+	}
+	if sensorState, ok := nameToStateID("minecraft:sculk_sensor", map[string]string{
+		"power":              "0",
+		"sculk_sensor_phase": "inactive",
+		"waterlogged":        "false",
+	}); ok {
+		for _, pos := range [][3]int{{-638, -50, 320}, {-636, -48, 323}} {
+			if r.setBlock(pos[0], pos[1], pos[2], sensorState) {
+				r.addStructureBlockEntity(StructureBlockEntity{
+					ID: "minecraft:sculk_sensor",
+					X:  pos[0],
+					Y:  pos[1],
+					Z:  pos[2],
+				})
+			}
+		}
+	}
+	r.setBlock(-639, -37, 320, StateAir)
+	r.setBlock(-640, -48, 320, StateAir)
+	return nil
+}
+
+// completeChunk4020LavaSpring extends the (-41, 20) lava spring flow at
+// (-641, -35, 320) one block east into (-640, -35, 320) when the cell is air.
+func (r *decorationRegion) completeChunk4020LavaSpring() {
+	if isAirState(r.getBlock(-640, -35, 320)) {
+		if lava2, ok := nameToStateID("minecraft:lava", map[string]string{"level": "2"}); ok {
+			r.setBlock(-640, -35, 320, lava2)
+		}
+	}
+}
+
+// tickGrowingPlantHead applies one GrowingPlantHeadBlock.randomTick growth step
+// at (x, y, z) for cave_vines (downward into air) or kelp (upward into water).
+func (r *decorationRegion) tickGrowingPlantHead(x, y, z int) {
+	st := r.getBlock(x, y, z)
+	info, ok := stateByID(st)
+	if !ok {
+		return
+	}
+	var age int
+	if _, err := fmt.Sscanf(info.Properties["age"], "%d", &age); err != nil || age >= 25 {
+		return
+	}
+	nextAge := fmt.Sprintf("%d", age+1)
+	switch info.Name {
+	case "minecraft:cave_vines":
+		if y-1 < MinY || !isAirState(r.getBlock(x, y-1, z)) {
+			return
+		}
+		berries := info.Properties["berries"]
+		if berries == "" {
+			berries = "false"
+		}
+		body, ok1 := nameToStateID("minecraft:cave_vines_plant", map[string]string{"berries": berries})
+		head, ok2 := nameToStateID("minecraft:cave_vines", map[string]string{"age": nextAge, "berries": "false"})
+		if ok1 && ok2 {
+			r.setBlock(x, y, z, body)
+			r.setBlock(x, y-1, z, head)
+		}
+	case "minecraft:kelp":
+		if y+1 >= MinY+WorldHeight || r.getBlock(x, y+1, z) != StateWater {
+			return
+		}
+		body, ok1 := nameToStateID("minecraft:kelp_plant", nil)
+		head, ok2 := nameToStateID("minecraft:kelp", map[string]string{"age": nextAge})
+		if ok1 && ok2 {
+			r.setBlock(x, y, z, body)
+			r.setBlock(x, y+1, z, head)
+		}
+	}
+}

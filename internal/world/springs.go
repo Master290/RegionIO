@@ -546,8 +546,26 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 	}
 
 	setAndNotify = func(x, y, z int, state uint16) {
+		prev := r.getBlock(x, y, z)
 		if !r.setBlockGlobal(x, y, z, state) {
 			return
+		}
+		if (isBlockNamed(prev, "minecraft:cave_vines") || isBlockNamed(prev, "minecraft:cave_vines_plant")) &&
+			!isBlockNamed(state, "minecraft:cave_vines") && !isBlockNamed(state, "minecraft:cave_vines_plant") &&
+			y+1 < MinY+WorldHeight {
+			above := r.getBlock(x, y+1, z)
+			if isBlockNamed(above, "minecraft:cave_vines_plant") {
+				berries := "false"
+				if info, ok := stateByID(above); ok && info.Properties["berries"] == "true" {
+					berries = "true"
+				}
+				if headState, ok := nameToStateID("minecraft:cave_vines", map[string]string{
+					"age":     "5",
+					"berries": berries,
+				}); ok {
+					r.setBlockGlobal(x, y+1, z, headState)
+				}
+			}
 		}
 		if isSpringFluidBlockState(state) {
 			if shouldSpreadLiquid(x, y, z) {

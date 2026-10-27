@@ -298,6 +298,19 @@ func TestChunk4020And4021SculkParityAndSourceOrdering(t *testing.T) {
 	if !ok {
 		t.Fatal("chunk (-40, 20) not found in land fixture")
 	}
+	mine4020 := gen(-40, 20)
+	for y := MinY; y < MinY+WorldHeight; y++ {
+		for lz := 0; lz < 16; lz++ {
+			for lx := 0; lx < 16; lx++ {
+				w := ch4020.at(lx, y, lz)
+				g := mine4020.GetBlock(lx, y, lz)
+				if w != g {
+					t.Fatalf("chunk (-40, 20) mismatch at (%d,%d,%d): got %s (%d), want %s (%d)",
+						-40*16+lx, y, 20*16+lz, stateLabel(g), g, stateLabel(w), w)
+				}
+			}
+		}
+	}
 	od, fluidPicker, veins, carver := vanillaGeneratorInputs(cap.seed)
 	baseMap := make(map[[2]int32]*Chunk)
 	for cx := int32(-42); cx <= -38; cx++ {
