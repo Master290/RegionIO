@@ -108,7 +108,8 @@ func IsRandomTickableBlock(state uint16) bool {
 		"minecraft:vine", "minecraft:cave_vines", "minecraft:weeping_vines", "minecraft:twisting_vines",
 		"minecraft:azalea", "minecraft:flowering_azalea",
 		"minecraft:mangrove_propagule",
-		"minecraft:budding_amethyst":
+		"minecraft:budding_amethyst",
+		"minecraft:turtle_egg":
 		return true
 	case "minecraft:chorus_flower":
 		age, ok := ChorusFlowerAge(state)
@@ -352,6 +353,9 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 		c.randomTickBuddingAmethyst(x, y, z, rng, res)
 	case "minecraft:chorus_flower":
 		c.randomTickChorusFlower(x, y, z, state, rng, res)
+	case "minecraft:turtle_egg":
+		_, _, _, upd := c.RandomTickTurtleEggAt(x, y, z, 21700, rng)
+		res.merge(upd)
 	default:
 		if strings.HasSuffix(name, "_sapling") {
 			c.randomTickSapling(x, y, z, state, info, rng, res)
