@@ -235,3 +235,171 @@ func TestPowderSnowMobsDamageMovementBucketsAndFluidFlush(t *testing.T) {
 		t.Fatal("expected flowing water to flush/replace adjacent powder_snow")
 	}
 }
+
+func TestSnowLayerSupportReplaceabilityCollisionAndAccumulation(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 5
+
+	// 1. CanBlockSupportSnowLayer parity (#snow_layer_cannot_survive_on, #snow_layer_can_survive_on, slabs/stairs).
+	ice, _ := BlockStateByName("minecraft:ice", nil)
+	packedIce, _ := BlockStateByName("minecraft:packed_ice", nil)
+	blueIce, _ := BlockStateByName("minecraft:blue_ice", nil)
+	barrier, _ := BlockStateByName("minecraft:barrier", nil)
+	honey, _ := BlockStateByName("minecraft:honey_block", nil)
+	soulSand, _ := BlockStateByName("minecraft:soul_sand", nil)
+	mud, _ := BlockStateByName("minecraft:mud", nil)
+	bottomSlab, _ := BlockStateByName("minecraft:oak_slab", map[string]string{"type": "bottom", "waterlogged": "false"})
+	topSlab, _ := BlockStateByName("minecraft:oak_slab", map[string]string{"type": "top", "waterlogged": "false"})
+	bottomStairs, _ := BlockStateByName("minecraft:oak_stairs", map[string]string{"facing": "north", "half": "bottom", "shape": "straight", "waterlogged": "false"})
+	topStairs, _ := BlockStateByName("minecraft:oak_stairs", map[string]string{"facing": "north", "half": "top", "shape": "straight", "waterlogged": "false"})
+
+	for _, bad := range []uint16{ice, packedIce, FrostedIceBlockState(0), barrier, SnowLayerBlockState(4), bottomSlab, bottomStairs} {
+		if CanBlockSupportSnowLayer(bad) {
+			t.Fatalf("expected %s not to support snow layers", BlockName(bad))
+		}
+	}
+	for _, good := range []uint16{blueIce, StateSnowBlock, honey, soulSand, mud, SnowLayerBlockState(8), topSlab, topStairs} {
+		if !CanBlockSupportSnowLayer(good) {
+			t.Fatalf("expected %s to support snow layers", BlockName(good))
+		}
+	}
+
+	// 2. Visual height vs collision height (layers=1 has 0.0 collision height, layers=8 has 0.875).
+	if got := SnowLayerCollisionHeight(SnowLayerBlockState(1)); got != 0 {
+		t.Fatalf("SnowLayerCollisionHeight(layers=1) = %v, want 0", got)
+	}
+	if got := SnowLayerCollisionHeight(SnowLayerBlockState(8)); got != 0.875 {
+		t.Fatalf("SnowLayerCollisionHeight(layers=8) = %v, want 0.875", got)
+	}
+	if got := SnowLayerVisualHeight(SnowLayerBlockState(4)); got != 0.5 {
+		t.Fatalf("SnowLayerVisualHeight(layers=4) = %v, want 0.5", got)
+	}
+
+	// 3. CanReplaceSnowLayerOnPlace: layers=1 is replaceable by any block; layers=1..7 stacks with minecraft:snow.
+	if rep, stack := CanReplaceSnowLayerOnPlace(SnowLayerBlockState(1), "minecraft:stone", 1); !rep || stack {
+		t.Fatalf("CanReplaceSnowLayerOnPlace(layers=1, stone) = (%v, %v), want (true, false)", rep, stack)
+	}
+	if rep, stack := CanReplaceSnowLayerOnPlace(SnowLayerBlockState(2), "minecraft:stone", 1); rep || stack {
+		t.Fatalf("CanReplaceSnowLayerOnPlace(layers=2, stone) = (%v, %v), want (false, false)", rep, stack)
+	}
+	if rep, stack := CanReplaceSnowLayerOnPlace(SnowLayerBlockState(3), "minecraft:snow", 1); !rep || !stack {
+		t.Fatalf("CanReplaceSnowLayerOnPlace(layers=3, snow) = (%v, %v), want (true, true)", rep, stack)
+	}
+
+	// 4. SnowAccumulationHeight gamerule and TryWeatherSnowAndFreezeAt.
+	c.SetBlock(10, y-1, 10, StateGrass)
+	c.SetBlock(10, y, 10, StateAir)
+	c.SetSnowAccumulationHeight(0)
+	if chg, _ := c.TryWeatherSnowAndFreezeAt(10, y, 10, "minecraft:snowy_plains"); chg {
+		t.Fatal("expected snowAccumulationHeight=0 to prevent snow accumulation")
+	}
+	c.SetSnowAccumulationHeight(3)
+	for want := 1; want <= 3; want++ {
+		if chg, _ := c.TryWeatherSnowAndFreezeAt(10, y, 10, "minecraft:snowy_plains"); !chg {
+			t.Fatalf("expected TryWeatherSnowAndFreezeAt to accumulate layer %d", want)
+		}
+		if layers, ok := SnowLayerCount(c.GetBlock(10, y, 10)); !ok || layers != want {
+			t.Fatalf("snow layers = %d (ok=%v), want %d", layers, ok, want)
+		}
+	}
+	if chg, _ := c.TryWeatherSnowAndFreezeAt(10, y, 10, "minecraft:snowy_plains"); chg {
+		t.Fatal("expected TryWeatherSnowAndFreezeAt to stop at snowAccumulationHeight=3")
+	}
+	c.SetSnowAccumulationHeight(DefaultSnowAccumulationHeight)
+
+	// 5. Exposed source water freezes in snowy biome when block light < 10, but not next to a torch.
+	c.SetBlock(15, y-1, 15, StateWater)
+	c.SetBlock(15, y, 15, StateAir)
+	if chg, _ := c.TryWeatherSnowAndFreezeAt(15, y, 15, "minecraft:snowy_plains"); !chg || !IsIceBlock(c.GetBlock(15, y-1, 15)) {
+		t.Fatalf("expected exposed water at (15,y-1,15) to freeze into ice, got %s", BlockName(c.GetBlock(15, y-1, 15)))
+	}
+}
+
+func TestIcePackedIceBlueIceSlipperinessAndRandomTickIntegration(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 5
+
+	ice, _ := BlockStateByName("minecraft:ice", nil)
+	packedIce, _ := BlockStateByName("minecraft:packed_ice", nil)
+	blueIce, _ := BlockStateByName("minecraft:blue_ice", nil)
+	soulSand, _ := BlockStateByName("minecraft:soul_sand", nil)
+
+	// 1. Random-tick eligibility and light melt predicates.
+	if !IsRandomTickableBlock(SnowLayerBlockState(1)) || !IsRandomTickableBlock(ice) || !IsRandomTickableBlock(FrostedIceBlockState(0)) {
+		t.Fatal("expected snow, ice, and frosted_ice to be random-tickable")
+	}
+	if IsRandomTickableBlock(packedIce) || IsRandomTickableBlock(blueIce) || IsRandomTickableBlock(StateSnowBlock) {
+		t.Fatal("expected packed_ice, blue_ice, and snow_block NOT to be random-tickable")
+	}
+	if DoesIceOrSnowMeltFromLight(packedIce) || DoesIceOrSnowMeltFromLight(blueIce) || DoesIceOrSnowMeltFromLight(StateSnowBlock) {
+		t.Fatal("expected packed_ice, blue_ice, and snow_block NOT to melt from light")
+	}
+
+	// 2. RandomTickBlockAt melts ice into water near a torch, while packed_ice and blue_ice stay intact.
+	c.SetBlock(20, y-1, 20, StateStone)
+	c.SetBlock(20, y, 20, ice)
+	c.SetBlock(20, y, 21, packedIce)
+	c.SetBlock(21, y, 20, blueIce)
+	torch, _ := BlockStateByName("minecraft:torch", nil)
+	c.ApplyBlockWithUpdates(20, y+1, 20, torch)
+	c.RandomTickBlockAt(20, y, 20)
+	if c.GetBlock(20, y, 20) != StateWater {
+		t.Fatalf("expected RandomTickBlockAt to melt ice under torch into StateWater, got %s", BlockName(c.GetBlock(20, y, 20)))
+	}
+	c.RandomTickBlockAt(20, y, 21)
+	c.RandomTickBlockAt(21, y, 20)
+	if !IsPackedIceBlock(c.GetBlock(20, y, 21)) || !IsBlueIceBlock(c.GetBlock(21, y, 20)) {
+		t.Fatal("expected packed_ice and blue_ice not to melt on random tick")
+	}
+
+	// 3. Slipperiness & EffectiveFrictionAt (soul_sand over blue_ice inherits 0.989).
+	if BlockSlipperiness(blueIce) != BlueIceBlockSlipperiness || BlockSlipperiness(packedIce) != StandardIceSlipperiness {
+		t.Fatalf("unexpected ice slipperiness values: blue=%v packed=%v", BlockSlipperiness(blueIce), BlockSlipperiness(packedIce))
+	}
+	c.SetBlock(25, y-1, 25, blueIce)
+	c.SetBlock(25, y, 25, soulSand)
+	if _, _, _, slip := c.EffectiveFrictionAt(25.5, float64(y)+0.875, 25.5); slip != BlueIceBlockSlipperiness {
+		t.Fatalf("EffectiveFrictionAt on soul_sand over blue_ice = %v, want %v", slip, BlueIceBlockSlipperiness)
+	}
+}
+
+func TestSpongeBubbleColumnTallSeagrassAndSnowGolemTrail(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 5
+
+	// 1. Sponge absorbs bubble_column and both halves of tall_seagrass cleanly to StateAir.
+	bubble, _ := BlockStateByName("minecraft:bubble_column", map[string]string{"drag": "false"})
+	tallLower, _ := BlockStateByName("minecraft:tall_seagrass", map[string]string{"half": "lower"})
+	tallUpper, _ := BlockStateByName("minecraft:tall_seagrass", map[string]string{"half": "upper"})
+	sponge, _ := BlockStateByName("minecraft:sponge", nil)
+
+	c.SetBlock(30, y-1, 30, StateStone)
+	c.SetBlock(31, y-1, 30, StateStone)
+	c.SetBlock(31, y, 30, bubble)
+	c.SetBlock(30, y, 31, tallLower)
+	c.SetBlock(30, y+1, 31, tallUpper)
+	c.ApplyBlockWithUpdates(30, y, 30, sponge)
+
+	if !IsWetSpongeBlock(c.GetBlock(30, y, 30)) {
+		t.Fatalf("expected sponge to become wet_sponge, got %s", BlockName(c.GetBlock(30, y, 30)))
+	}
+	if c.GetBlock(31, y, 30) != StateAir {
+		t.Fatalf("expected sponge to absorb bubble_column into StateAir, got %s", BlockName(c.GetBlock(31, y, 30)))
+	}
+	if c.GetBlock(30, y, 31) != StateAir || c.GetBlock(30, y+1, 31) != StateAir {
+		t.Fatalf("expected sponge to clear both halves of tall_seagrass to StateAir, got lower=%s upper=%s",
+			BlockName(c.GetBlock(30, y, 31)), BlockName(c.GetBlock(30, y+1, 31)))
+	}
+
+	// 2. Snow Golem snow trail placement and hot-biome melt predicate.
+	if !DoesSnowGolemMeltInBiome(DimensionNether, "minecraft:nether_wastes", y) ||
+		!DoesSnowGolemMeltInBiome(DimensionOverworld, "minecraft:desert", y) ||
+		DoesSnowGolemMeltInBiome(DimensionOverworld, "minecraft:snowy_plains", y) {
+		t.Fatal("unexpected DoesSnowGolemMeltInBiome result")
+	}
+	c.SetBlock(40, y-1, 40, StateGrass)
+	c.SetBlock(40, y, 40, StateAir)
+	if placed, _ := c.PlaceSnowGolemTrailAt(40.5, float64(y), 40.5, "minecraft:snowy_plains", true); placed == 0 || !IsSnowLayerBlock(c.GetBlock(40, y, 40)) {
+		t.Fatalf("expected PlaceSnowGolemTrailAt to place snow layer at (40,y,40), placed=%d", placed)
+	}
+}

@@ -110,7 +110,8 @@ func IsRandomTickableBlock(state uint16) bool {
 		"minecraft:azalea", "minecraft:flowering_azalea",
 		"minecraft:mangrove_propagule",
 		"minecraft:budding_amethyst",
-		"minecraft:turtle_egg":
+		"minecraft:turtle_egg",
+		"minecraft:snow", "minecraft:ice", "minecraft:frosted_ice":
 		return true
 	case "minecraft:pitcher_crop":
 		age, err := strconv.Atoi(info.Properties["age"])
@@ -363,6 +364,15 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 		c.randomTickChorusFlower(x, y, z, state, rng, res)
 	case "minecraft:turtle_egg":
 		_, _, _, upd := c.RandomTickTurtleEggAt(x, y, z, 21700, rng)
+		res.merge(upd)
+	case "minecraft:snow":
+		_, upd := c.RandomTickSnowLayerAt(x, y, z)
+		res.merge(upd)
+	case "minecraft:ice":
+		_, upd := c.RandomTickIceAt(c.FireDimension(), x, y, z)
+		res.merge(upd)
+	case "minecraft:frosted_ice":
+		_, upd := c.StepFrostedIceAt(c.FireDimension(), x, y, z, rng)
 		res.merge(upd)
 	default:
 		if strings.HasSuffix(name, "_sapling") {

@@ -1799,7 +1799,7 @@ func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *
 }
 
 func (c *Cache) canFluidReplace(x, y, z int, kind fluidKind, target uint16) bool {
-	if isAirState(target) || IsPowderSnowBlock(target) {
+	if isAirState(target) || IsPowderSnowBlock(target) || IsSnowLayerBlock(target) {
 		return true
 	}
 	if tKind, tLevel, ok := isStandaloneFluidBlock(target); ok {
@@ -2002,12 +2002,16 @@ func (c *Cache) obsidianOrCobblestone(lavaLevel int) uint16 {
 
 // tryAbsorbWaterWithSponge implements SpongeBlock.tryAbsorbWater: breadth-first
 // search up to depth 6 and 64 water cells (including standalone water,
-// waterlogged blocks, and kelp/seagrass), converting the sponge into
-// wet_sponge if at least one water cell was absorbed.
+// bubble_column, waterlogged blocks, and kelp/seagrass), converting the sponge
+// into wet_sponge if at least one water cell was absorbed.
 func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bool {
+	return c.absorbWaterWithSpongeCount(x, y, z, res) > 0
+}
+
+func (c *Cache) absorbWaterWithSpongeCount(x, y, z int, res *BlockUpdateResult) int {
 	wetSponge, ok := nameToStateID("minecraft:wet_sponge", nil)
 	if !ok {
-		return false
+		return 0
 	}
 	type node struct {
 		pos   BlockPos
@@ -2015,13 +2019,14 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 	}
 	type absorbedCell struct {
 		pos      BlockPos
+		oldState uint16
 		newState uint16
 	}
 	queue := []node{{pos: BlockPos{X: x, Y: y, Z: z}, depth: 0}}
 	visited := map[BlockPos]bool{{X: x, Y: y, Z: z}: true}
 	var absorbed []absorbedCell
 
-	for len(queue) > 0 && len(absorbed) < 64 {
+	for len(queue) > 0 && len(absorbed) < SpongeMaxAbsorbBlocks {
 		cur := queue[0]
 		queue = queue[1:]
 		for _, off := range sixNeighborOffsets {
@@ -2036,7 +2041,7 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 			if kind, _, ok := isStandaloneFluidBlock(st); ok && kind == fluidWater {
 				nextSt = StateAir
 				matched = true
-			} else if isRemovableAquaticPlant(st) {
+			} else if IsBubbleColumnBlock(st) || isRemovableAquaticPlant(st) {
 				nextSt = StateAir
 				matched = true
 			} else if isWaterloggedState(st) {
@@ -2046,27 +2051,43 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 				}
 			}
 			if matched {
-				absorbed = append(absorbed, absorbedCell{pos: np, newState: nextSt})
-				if len(absorbed) >= 64 {
+				absorbed = append(absorbed, absorbedCell{pos: np, oldState: st, newState: nextSt})
+				if len(absorbed) >= SpongeMaxAbsorbBlocks {
 					break
 				}
-				if cur.depth+1 < 6 {
+				if cur.depth+1 < SpongeMaxAbsorbDepth {
 					queue = append(queue, node{pos: np, depth: cur.depth + 1})
 				}
 			}
 		}
 	}
 	if len(absorbed) == 0 {
-		return false
+		return 0
 	}
 	c.setBlockRecorded(x, y, z, wetSponge, res)
+	var changedPositions []BlockPos
 	for _, cell := range absorbed {
 		if c.setBlockRecorded(cell.pos.X, cell.pos.Y, cell.pos.Z, cell.newState, res) {
-			c.runNeighborSupportPass(cell.pos.X, cell.pos.Y, cell.pos.Z, res)
-			c.scheduleAround(cell.pos.X, cell.pos.Y, cell.pos.Z)
+			changedPositions = append(changedPositions, cell.pos)
+			// If a tall_seagrass half was absorbed at the edge of the BFS, clear its partner half to Air (not Water).
+			if info, ok := stateByID(cell.oldState); ok && info.Name == "minecraft:tall_seagrass" {
+				partnerY := cell.pos.Y + 1
+				if info.Properties["half"] == "upper" {
+					partnerY = cell.pos.Y - 1
+				}
+				if partnerY >= MinY && partnerY < MinY+WorldHeight && isBlockNamed(c.GetBlock(cell.pos.X, partnerY, cell.pos.Z), "minecraft:tall_seagrass") {
+					if c.setBlockRecorded(cell.pos.X, partnerY, cell.pos.Z, StateAir, res) {
+						changedPositions = append(changedPositions, BlockPos{X: cell.pos.X, Y: partnerY, Z: cell.pos.Z})
+					}
+				}
+			}
 		}
 	}
-	return true
+	for _, pos := range changedPositions {
+		c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
+		c.scheduleAround(pos.X, pos.Y, pos.Z)
+	}
+	return len(absorbed)
 }
 
 func concretePowderToConcrete(state uint16) (uint16, bool) {
@@ -2385,12 +2406,7 @@ func canSupportFloorBlock(name string, below uint16) bool {
 			return true
 		}
 	case "minecraft:snow":
-		if isBlockNamed(below, "minecraft:ice") || isBlockNamed(below, "minecraft:packed_ice") {
-			return false
-		}
-		if bInfo, ok := stateByID(below); ok && bInfo.Name == "minecraft:snow" {
-			return bInfo.Properties["layers"] == "8"
-		}
+		return CanBlockSupportSnowLayer(below)
 	}
 	if IsChainBlock(below) {
 		return IsVerticalChainBlock(below) && strings.HasSuffix(name, "lantern")
