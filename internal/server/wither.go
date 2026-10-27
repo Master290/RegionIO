@@ -1186,6 +1186,26 @@ func (s *Server) tickSingleWitherSkull(skullID int32) {
 		}
 	}
 
+	// Check living non-undead mob collision (radius 1.25 blocks).
+	for _, mobEnt := range s.entities.AppendAll(nil) {
+		if mobEnt.ID == snap.EntityID || mobEnt.ID == snap.OwnerEntityID || mobEnt.IsItem() {
+			continue
+		}
+		if mobEnt.EffectiveDimension() != snap.Dimension || !IsValidWitherTargetMob(mobEnt.TypeName) {
+			continue
+		}
+		if s.MobHealth(mobEnt.ID) <= 0 {
+			continue
+		}
+		dx := mobEnt.X - snap.X
+		dy := (mobEnt.Y + 0.8) - snap.Y
+		dz := mobEnt.Z - snap.Z
+		if dx*dx+dy*dy+dz*dz <= 1.5625 {
+			s.impactWitherSkullOnMob(snap, mobEnt)
+			return
+		}
+	}
+
 	// Check solid block collision.
 	cache := s.DimensionChunks(snap.Dimension)
 	if cache != nil {
@@ -1233,6 +1253,44 @@ func (s *Server) impactWitherSkull(sk WitherSkullProjectile, directHitPlayer *Pl
 	}
 
 	s.TriggerWitherExplosion(sk.Dimension, sk.X, sk.Y, sk.Z, WitherSkullExplosionRadius, sk.Dangerous, sk.OwnerEntityID)
+}
+
+func (s *Server) impactWitherSkullOnMob(sk WitherSkullProjectile, targetMob world.Entity) {
+	s.removeWitherSkull(sk.EntityID, sk.Dimension, sk.X, sk.Z)
+
+	cache := s.DimensionChunks(sk.Dimension)
+	bx, by, bz := int(math.Floor(targetMob.X)), int(math.Floor(targetMob.Y)), int(math.Floor(targetMob.Z))
+	var preGround uint16
+	var hadValidRoseGround bool
+	if cache != nil {
+		preGround = cache.GetBlock(bx, by-1, bz)
+		hadValidRoseGround = CanPlaceWitherRoseOn(world.BlockName(preGround))
+	}
+
+	scaled := ScaleDamageByDifficulty(WitherSkullDirectDamage, s.Difficulty())
+	killed := s.applyDamageToMob(&targetMob, scaled, nil, 0.3, false, false)
+	if sk.OwnerEntityID > 0 {
+		s.HealWither(sk.OwnerEntityID, WitherSkullHitHealAmount)
+	}
+	if !killed {
+		diff := s.Difficulty()
+		var dur int32
+		if diff == DifficultyNormal {
+			dur = WitherEffectDurationNormal
+		} else if diff == DifficultyHard {
+			dur = WitherEffectDurationHard
+		}
+		if dur > 0 {
+			s.ApplyEntityEffectScaled(targetMob.ID, NewStatusEffectInstance(EffectWither, dur, WitherEffectAmplifier), 1.0)
+		}
+	}
+	s.TriggerWitherExplosion(sk.Dimension, sk.X, sk.Y, sk.Z, WitherSkullExplosionRadius, sk.Dangerous, sk.OwnerEntityID)
+	if killed {
+		if cache != nil && hadValidRoseGround && cache.GetBlock(bx, by-1, bz) == world.StateAir {
+			cache.SetBlock(bx, by-1, bz, preGround)
+		}
+		s.OnMobKilledByWither(sk.Dimension, targetMob.X, targetMob.Y, targetMob.Z)
+	}
 }
 
 func (s *Server) removeWitherSkull(skullID int32, dim string, x, z float64) {

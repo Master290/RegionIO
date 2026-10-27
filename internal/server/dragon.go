@@ -433,6 +433,7 @@ func (s *Server) SpawnEndSpikeCrystals() []int32 {
 	ids := make([]int32, 0, len(spikes))
 	for i, sp := range spikes {
 		if cache != nil {
+			RebuildEndSpikeTop(cache, sp)
 			cache.SetBlock(sp.CenterX, sp.Height, sp.CenterZ, world.StateBedrock)
 			if hasFire {
 				cache.SetBlock(sp.CenterX, sp.Height+1, sp.CenterZ, fireState)
@@ -982,15 +983,12 @@ func (s *Server) SpawnNextEndGateway() (world.BlockPos, bool) {
 	mgr.fight.GatewaysSpawned++
 	mgr.mu.Unlock()
 
-	angle := 2.0 * (-math.Pi + (math.Pi/float64(EnderDragonMaxGateways))*float64(idx))
-	gx := int(math.Floor(EnderDragonGatewayRadius * math.Cos(angle)))
-	gz := int(math.Floor(EnderDragonGatewayRadius * math.Sin(angle)))
-	gy := EnderDragonGatewayY
+	order := world.EndRingGatewayOrder(s.cfg.WorldSeed)
+	slot := order[idx]
+	gp := world.EndRingGatewayPos(slot)
+	gx, gy, gz := gp[0], gp[1], gp[2]
 
-	if cache := s.DimensionChunks(world.DimensionEnd); cache != nil {
-		changes := PlaceEndGatewayStructure(cache, gx, gy, gz)
-		s.broadcastDimensionBlockChanges(world.DimensionEnd, cache, changes, nil)
-	}
+	s.PlaceEndGatewayWithBlockEntity(gx, gy, gz, nil, false)
 	return world.BlockPos{X: gx, Y: gy, Z: gz}, true
 }
 
@@ -1244,6 +1242,7 @@ func (s *Server) TickEnderDragons(rng *rand.Rand) {
 	mgr.mu.RLock()
 	initDone := mgr.fight.Initialized
 	alive := mgr.fight.DragonAlive
+	respawning := mgr.fight.Respawning
 	mgr.mu.RUnlock()
 
 	if !initDone {
@@ -1255,6 +1254,9 @@ func (s *Server) TickEnderDragons(rng *rand.Rand) {
 		}
 	}
 
+	if respawning {
+		s.StepEnderDragonRespawnSequence()
+	}
 	if alive {
 		s.tickActiveEnderDragon(rng)
 	}
@@ -1489,6 +1491,7 @@ func (s *Server) tickActiveEnderDragon(rng *rand.Rand) {
 	s.SetMobHealth(dragonID, hp)
 	s.UpdateRuntimeBossBarHealth(barUUID, hp, maxHP)
 	s.SyncRuntimeBossBarPlayersInRange(barUUID, world.DimensionEnd, 0, 128, 0, EnderDragonBossBarRange)
+	s.DestroyDragonCollidingBlocks(nextX, nextY, nextZ)
 
 	for _, bu := range beamUpdates {
 		cx := int32(int64(math.Floor(bu.X)) >> 4)
