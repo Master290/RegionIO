@@ -521,8 +521,8 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		return false, 0, nil
 	case IsBedBlock(state):
 		dim := world.NormalizeDimension(session.Dimension())
+		headPos, footPos, hasPartner := ResolveBedPositions(cache, x, y, z)
 		if dt, _ := world.LookupDimensionType(dim); !dt.BedWorks {
-			headPos, footPos, hasPartner := ResolveBedPositions(cache, x, y, z)
 			s.WakePlayersInBedAt(dim, headPos.X, headPos.Y, headPos.Z)
 			if broken, upd := cache.BreakBlockWithUpdates(headPos.X, headPos.Y, headPos.Z); broken {
 				s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
@@ -534,6 +534,13 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 			}
 			s.ExplodeBlock(dim, headPos.X, headPos.Y, headPos.Z, 5.0, true)
 			return true, 0, nil
+		}
+		if vid, ok := s.BedOwnerAt(dim, headPos.X, headPos.Y, headPos.Z); ok && s.IsVillagerSleeping(vid) {
+			s.WakeSleepingVillager(vid)
+		} else if hasPartner {
+			if vid, ok := s.BedOwnerAt(dim, footPos.X, footPos.Y, footPos.Z); ok && s.IsVillagerSleeping(vid) {
+				s.WakeSleepingVillager(vid)
+			}
 		}
 		s.InteractBed(session, x, y, z)
 		return true, 0, nil
@@ -1040,10 +1047,36 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
 		return s.syncOpenContainer(session)
+	case MenuTypeMerchant:
+		entityID := int32(tr.open.BlockX)
+		beforeUses := s.totalVillagerOfferUses(entityID)
+		tr.mu.Unlock()
+		err := s.handleMerchantClick(session, containerID, slot, button, mode)
+		if afterUses := s.totalVillagerOfferUses(entityID); afterUses > beforeUses {
+			s.AwardCustomStat(session, StatTradedWithVillager, afterUses-beforeUses)
+		}
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		return err
 	default:
 		tr.mu.Unlock()
 		return nil
 	}
+}
+
+func (s *Server) totalVillagerOfferUses(entityID int32) int32 {
+	if s == nil || entityID <= 0 {
+		return 0
+	}
+	vs, ok := s.VillagerState(entityID)
+	if !ok {
+		return 0
+	}
+	var total int32
+	for _, off := range vs.Offers {
+		total += off.Uses
+	}
+	return total
 }
 
 func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContainerTracker, bx, by, bz, slot int, button int8, mode int32) {
@@ -2217,6 +2250,13 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		return s.syncSmithingContainer(session)
 	case MenuTypeBeacon:
 		return s.syncOpenBeacon(session)
+	case MenuTypeMerchant:
+		slots = s.buildMerchantMenuSlots(
+			session,
+			openCopy.Crafting[MerchantSlotPayment1],
+			openCopy.Crafting[MerchantSlotPayment2],
+			openCopy.Result,
+		)
 	default:
 		return nil
 	}

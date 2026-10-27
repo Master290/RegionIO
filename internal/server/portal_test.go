@@ -626,6 +626,190 @@ func TestPortalsRemainderFeatures(t *testing.T) {
 	}
 }
 
+func TestNetherFastTravelAndDimensionStateSync(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	var mu sync.Mutex
+	var gotSetXP, gotUpdateEffect bool
+	session, err := srv.RegisterPlayer(Profile{Name: "SubspaceTraveler", UUID: OfflineUUID("SubspaceTraveler")}, func(pktID int32, payload []byte) error {
+		mu.Lock()
+		switch pktID {
+		case PlaySetExperience:
+			gotSetXP = true
+		case PlayUpdateMobEffect:
+			gotUpdateEffect = true
+		}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = srv.SetPlayerExperience(session, 12, 216, 0.5)
+	_ = srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectFireResistance, 600, 0))
+
+	// Enter Nether from Overworld (10, 65, 10).
+	_ = srv.TeleportPlayer(session, 10.5, 65.0, 10.5, 0, 0)
+	resToNether, err := srv.TravelThroughNetherPortal(session)
+	if err != nil || !resToNether.Travelled || session.Dimension() != world.DimensionNether {
+		t.Fatalf("TravelThroughNetherPortal to Nether: %+v, err=%v", resToNether, err)
+	}
+	ex, ey, ez, okEntry := srv.EnteredNetherPosition(session)
+	if !okEntry || math.Abs(ex-10.5) > 0.01 || math.Abs(ey-65.0) > 0.01 || math.Abs(ez-10.5) > 0.01 {
+		t.Fatalf("EnteredNetherPosition = (%v,%v,%v,%v), want (10.5,65.0,10.5,true)", ex, ey, ez, okEntry)
+	}
+
+	mu.Lock()
+	gotSetXP = false
+	gotUpdateEffect = false
+	mu.Unlock()
+
+	// Move in Nether to (900, 65, 10) -> scales to (7200, 65, 80) in Overworld (> 7000 blocks).
+	srv.ClearPlayerPortalCooldown(session)
+	_ = srv.TeleportPlayer(session, 900.5, 65.0, 10.5, 0, 0)
+	resToOW, err := srv.TravelThroughNetherPortal(session)
+	if err != nil || !resToOW.Travelled || session.Dimension() != world.DimensionOverworld {
+		t.Fatalf("TravelThroughNetherPortal back to Overworld: %+v, err=%v", resToOW, err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:nether/fast_travel") {
+		t.Fatal("expected minecraft:nether/fast_travel ('Subspace Bubble') advancement after >= 7000 Overworld blocks via Nether")
+	}
+	mu.Lock()
+	xpSynced := gotSetXP
+	effectSynced := gotUpdateEffect
+	mu.Unlock()
+	if !xpSynced || !effectSynced {
+		t.Fatalf("expected ChangePlayerDimension to re-sync XP (%v) and active status effects (%v)", xpSynced, effectSynced)
+	}
+}
+
+func TestEndGatewayPacketsWorldgenHooksAndPostEndRespawn(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	var mu sync.Mutex
+	var blockEvents [][]byte
+	var blockEntityDatas [][]byte
+	session, err := srv.RegisterPlayer(Profile{Name: "EndHero", UUID: OfflineUUID("EndHero")}, func(pktID int32, payload []byte) error {
+		cp := append([]byte(nil), payload...)
+		mu.Lock()
+		switch pktID {
+		case PlayBlockEventCB:
+			blockEvents = append(blockEvents, cp)
+		case PlayBlockEntityDataCB:
+			blockEntityDatas = append(blockEntityDatas, cp)
+		}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.SetJoined(true)
+	_ = srv.ChangePlayerDimension(session, world.DimensionEnd, 100.5, 49.0, 0.5, 0, 0)
+
+	// 1. Place a worldgen return gateway with StructureBlockEntity via world.NewEndGatewayBlockEntity
+	// and verify SendChunkEndGatewayBlockEntitiesToSession + GetOrCreateEndGatewayAt parse its exit_portal.
+	endCache := srv.DimensionChunks(world.DimensionEnd)
+	placeEndGatewayCage(endCache, 40, 75, 40)
+	exitTarget := [3]int{100, 50, 0}
+	endCache.AddStructureBlockEntity(world.NewEndGatewayBlockEntity(40, 75, 40, &exitTarget, true))
+	srv.SendChunkEndGatewayBlockEntitiesToSession(session, world.DimensionEnd, int32(40>>4), int32(40>>4))
+
+	gw := srv.GetOrCreateEndGatewayAt(world.DimensionEnd, 40, 75, 40)
+	if gw == nil || !gw.HasExitPortal || gw.ExitPortal != (world.BlockPos{X: 100, Y: 50, Z: 0}) || !gw.ExactTeleport {
+		t.Fatalf("expected worldgen StructureBlockEntity exit_portal (100,50,0) exact=true, got %+v", gw)
+	}
+
+	mu.Lock()
+	initialBEDCount := len(blockEntityDatas)
+	mu.Unlock()
+	if initialBEDCount == 0 {
+		t.Fatal("expected SendChunkEndGatewayBlockEntitiesToSession to send PlayBlockEntityDataCB (0x06)")
+	}
+	bedReader := protocol.NewReader(blockEntityDatas[0])
+	bx, by, bz, _ := bedReader.Position()
+	beType, _ := bedReader.VarInt()
+	if bx != 40 || by != 75 || bz != 40 || beType != BlockEntityTypeEndGateway {
+		t.Fatalf("BlockEntityData pos=(%d,%d,%d) type=%d, want (40,75,40) type=%d", bx, by, bz, beType, BlockEntityTypeEndGateway)
+	}
+
+	// 2. TravelThroughEndGateway broadcasts BlockEvent with true BuiltInRegistries.BLOCK ID (> 0)
+	// and grants "Remote Getaway" (minecraft:end/enter_end_gateway).
+	srv.ClearPlayerPortalCooldown(session)
+	resGW, err := srv.TravelThroughEndGateway(session, 40, 75, 40)
+	if err != nil || !resGW.Travelled {
+		t.Fatalf("TravelThroughEndGateway: %+v, err=%v", resGW, err)
+	}
+	if !session.HasCompletedAdvancement("minecraft:end/enter_end_gateway") {
+		t.Fatal("expected minecraft:end/enter_end_gateway ('Remote Getaway') advancement")
+	}
+	mu.Lock()
+	evCount := len(blockEvents)
+	var lastEv []byte
+	if evCount > 0 {
+		lastEv = blockEvents[evCount-1]
+	}
+	mu.Unlock()
+	if evCount == 0 {
+		t.Fatal("expected PlayBlockEventCB for End gateway beam")
+	}
+	evR := protocol.NewReader(lastEv)
+	_, _, _, _ = evR.Position()
+	_, _ = evR.ReadByte()
+	_, _ = evR.ReadByte()
+	evBlockID, _ := evR.VarInt()
+	wantBlockID, okBlockID := world.BlockRegistryID("minecraft:end_gateway")
+	if !okBlockID || evBlockID <= 0 || evBlockID != wantBlockID {
+		t.Fatalf("End gateway BlockEvent blockID = %d, want %d (> 0)", evBlockID, wantBlockID)
+	}
+
+	// 3. EnsureEndExitPodium places active End exit portal in the inner basin (1, portalY, 0) and bedrock pillar at (0, portalY, 0).
+	portalY, okPodium := srv.EnsureEndExitPodium(true)
+	if !okPodium || !world.IsEndPortalState(endCache.GetBlock(1, portalY, 0)) || endCache.GetBlock(0, portalY, 0) != world.StateBedrock {
+		t.Fatalf("EnsureEndExitPodium(true): ok=%v portalY=%d basin=%s pillar=%s", okPodium, portalY, world.BlockName(endCache.GetBlock(1, portalY, 0)), world.BlockName(endCache.GetBlock(0, portalY, 0)))
+	}
+
+	// 4. Post-End-fight respawn: player with custom health, XP, inventory, and active effect
+	// enters the End exit portal for the first time (ShowEndCredits=true, HasPendingEndCreditsExit=true),
+	// then sends ClientCommandPerformRespawn (RespawnPlayer) -> preserves health, XP, inventory, and effects!
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+	srv.SetPlayerDimensionSpawnPoint(session, world.DimensionOverworld, 24, 65, 24, 90, 0, true)
+	srv.DamagePlayer(session, 6.0, "generic")
+	_ = srv.SetPlayerExperience(session, 30, 1395, 0.25)
+	_ = srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectRegeneration, 400, 1))
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:dragon_egg", 1))
+
+	srv.ClearPlayerPortalCooldown(session)
+	resExit, err := srv.TravelThroughEndPortal(session)
+	if err != nil || !resExit.Travelled || !resExit.ShowEndCredits {
+		t.Fatalf("TravelThroughEndPortal exit: %+v, err=%v", resExit, err)
+	}
+	if !srv.HasPendingEndCreditsExit(session) {
+		t.Fatal("expected HasPendingEndCreditsExit(session) == true after first End exit")
+	}
+	if err := srv.RespawnPlayer(session); err != nil {
+		t.Fatalf("RespawnPlayer after End credits: %v", err)
+	}
+	if srv.HasPendingEndCreditsExit(session) {
+		t.Fatal("expected HasPendingEndCreditsExit(session) == false after RespawnPlayer")
+	}
+	snap := session.Snapshot()
+	if snap.Dimension != world.DimensionOverworld || math.Abs(snap.X-24.5) > 0.01 || math.Abs(snap.Z-24.5) > 0.01 {
+		t.Fatalf("post-credits respawn pos = (%s, %.1f, %.1f, %.1f), want (overworld, 24.5, 65.0, 24.5)", snap.Dimension, snap.X, snap.Y, snap.Z)
+	}
+	if snap.Health != 14.0 {
+		t.Fatalf("expected post-credits RespawnPlayer to preserve health=14.0, got %v", snap.Health)
+	}
+	lvl, _, _ := session.Experience()
+	if lvl != 30 {
+		t.Fatalf("expected post-credits RespawnPlayer to preserve XP level=30, got %d", lvl)
+	}
+	if !session.HasPlayerEffect(EffectRegeneration) {
+		t.Fatal("expected post-credits RespawnPlayer to preserve active Regeneration effect")
+	}
+	if got := session.InventorySlot(world.HotbarContainerOffset); got.ResolvedID() != "minecraft:dragon_egg" || got.Count != 1 {
+		t.Fatalf("expected post-credits RespawnPlayer to preserve inventory dragon_egg, got %+v", got)
+	}
+}
+
 
 
 

@@ -288,3 +288,107 @@ func TestPlayerInventory2x2Crafting(t *testing.T) {
 		t.Fatalf("hotbar slot 0 after 2x2 quick craft = %+v, want 4x minecraft:oak_planks", got)
 	}
 }
+
+func TestVillagerTradingUIHooksBedWakeAndFeeding(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	col := &survivalPacketCollector{}
+	session, err := srv.RegisterPlayer(Profile{Name: "VillageTrader", UUID: OfflineUUID("VillageTrader")}, col.send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	if err := srv.SetPlayerGameMode(session, GameModeSurvival); err != nil {
+		t.Fatalf("SetPlayerGameMode: %v", err)
+	}
+	_ = srv.TeleportPlayer(session, 12.5, 65.0, 10.5, 0, 0)
+
+	// 1. Spawn a Librarian villager with a deterministic trade offer (1x emerald -> 1x diamond).
+	vid, err := srv.SpawnVillagerInDimension(world.DimensionOverworld, 10.5, 65.0, 10.5, VillagerTypePlains, VillagerProfessionLibrarian, 1)
+	if err != nil || vid <= 0 {
+		t.Fatalf("SpawnVillagerInDimension: %v", err)
+	}
+	srv.SetVillagerState(vid, VillagerState{
+		EntityID:     vid,
+		VillagerType: VillagerTypePlains,
+		Profession:   VillagerProfessionLibrarian,
+		Level:        1,
+		Offers: []MerchantOffer{
+			{
+				BaseCostA:       world.NewNamedItemStack("minecraft:emerald", 1),
+				Result:          world.NewNamedItemStack("minecraft:diamond", 1),
+				MaxUses:         12,
+				XP:              2,
+				PriceMultiplier: 0.05,
+			},
+		},
+	})
+
+	// 2. Interact via HandlePlayerInteractPacket (right-click) -> opens Merchant UI,
+	// increments StatTalkedToVillager, and rotates villager toward player.
+	w := protocol.NewWriter(16)
+	w.VarInt(vid)
+	w.VarInt(InteractActionInteract)
+	w.VarInt(0) // main hand
+	w.Bool(false)
+	if err := srv.HandlePlayerInteractPacket(session, protocol.NewReader(w.Bytes())); err != nil {
+		t.Fatalf("HandlePlayerInteractPacket: %v", err)
+	}
+	open := session.OpenContainer()
+	if open == nil || open.MenuType != MenuTypeMerchant {
+		t.Fatalf("expected open MenuTypeMerchant container, got %+v", open)
+	}
+	if got := srv.GetPlayerStat(session, StatTypeCustom, StatTalkedToVillager); got != 1 {
+		t.Fatalf("StatTalkedToVillager = %d, want 1", got)
+	}
+
+	// 3. Complete trade via HandleContainerClick (MenuTypeMerchant) -> grants "Diamonds!" advancement
+	// via TriggerInventoryChanged and increments StatTradedWithVillager.
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:emerald", 1))
+	if err := srv.SelectMerchantTrade(session, 0); err != nil {
+		t.Fatalf("SelectMerchantTrade: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, open.ContainerID, MerchantSlotResult, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick(MerchantSlotResult): %v", err)
+	}
+	if got := srv.GetPlayerStat(session, StatTypeCustom, StatTradedWithVillager); got != 1 {
+		t.Fatalf("StatTradedWithVillager = %d, want 1", got)
+	}
+	if !session.HasCompletedAdvancement("minecraft:story/mine_diamond") {
+		t.Fatal("expected acquiring diamond from villager trade via HandleContainerClick to grant minecraft:story/mine_diamond")
+	}
+	_ = srv.CloseMerchantContainer(session, open.ContainerID, false)
+
+	// 4. Feed villager 1x bread via sneaking HandlePlayerInteractPacket -> FoodLevel += 4 and consumes 1 bread.
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:bread", 2))
+	wFeed := protocol.NewWriter(16)
+	wFeed.VarInt(vid)
+	wFeed.VarInt(InteractActionInteract)
+	wFeed.VarInt(0)
+	wFeed.Bool(true) // sneaking
+	if err := srv.HandlePlayerInteractPacket(session, protocol.NewReader(wFeed.Bytes())); err != nil {
+		t.Fatalf("HandlePlayerInteractPacket(feed): %v", err)
+	}
+	if got := srv.VillagerFoodPoints(vid); got != 4 {
+		t.Fatalf("villager FoodPoints after 1x bread = %d, want 4", got)
+	}
+	if got := session.InventorySlot(world.HotbarContainerOffset); got.Count != 1 {
+		t.Fatalf("bread count after feeding = %d, want 1", got.Count)
+	}
+
+	// 5. Place a bed at (10, 65, 10)-(10, 65, 11), let the villager claim and sleep in it at night,
+	// then have the player right-click the bed via InteractBlock -> wakes the sleeping villager!
+	footBed, _ := world.BlockStateByName("minecraft:red_bed", map[string]string{"part": "foot", "facing": "south", "occupied": "false"})
+	headBed, _ := world.BlockStateByName("minecraft:red_bed", map[string]string{"part": "head", "facing": "south", "occupied": "false"})
+	srv.Chunks().SetBlock(10, 65, 10, footBed)
+	srv.Chunks().SetBlock(10, 65, 11, headBed)
+	srv.SetDayTime(13000)
+	srv.TickVillagers()
+	if !srv.IsVillagerSleeping(vid) {
+		t.Fatal("expected villager to be sleeping in bed at night")
+	}
+	if handled, _, err := srv.InteractBlock(session, 10, 65, 11); err != nil || !handled {
+		t.Fatalf("InteractBlock on villager-occupied bed: handled=%v, err=%v", handled, err)
+	}
+	if srv.IsVillagerSleeping(vid) {
+		t.Fatal("expected player right-clicking bed via InteractBlock to wake sleeping villager")
+	}
+}

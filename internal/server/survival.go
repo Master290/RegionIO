@@ -953,15 +953,60 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 				if handled, _, err := s.InteractWithVehicle(session, pkt.EntityID); handled || err != nil {
 					return err
 				}
-				if handled, err := s.InteractWithEquineEntity(session, pkt.EntityID, pkt.UsingSecondaryAction || session.IsSneaking()); handled || err != nil {
+				sneaking := pkt.UsingSecondaryAction || session.IsSneaking()
+				if handled, err := s.InteractWithEquineEntity(session, pkt.EntityID, sneaking); handled || err != nil {
 					return err
 				}
-				_, _, _ = s.InteractWithEntity(session, pkt.EntityID)
+				_, isVil := s.VillagerState(pkt.EntityID)
+				if sneaking && isVil && s.TryFeedVillager(session, pkt.EntityID) {
+					return nil
+				}
+				opened, _, _ := s.InteractWithEntity(session, pkt.EntityID)
+				if opened {
+					snap := session.Snapshot()
+					s.FaceVillagerTowardPlayer(pkt.EntityID, snap.X, snap.Z)
+					s.RecordTalkedToVillager(session)
+				} else if isVil {
+					s.TryFeedVillager(session, pkt.EntityID)
+				}
 				s.RefreshItemFrameComparators(pkt.EntityID)
 			}
 		}
 	}
 	return nil
+}
+
+// TryFeedVillager attempts to give 1 held villager food item (bread, carrot,
+// potato, beetroot) from session's main hand to a non-sleeping villager entity,
+// advancing its FoodLevel via AddVillagerFood and consuming 1 item in Survival.
+func (s *Server) TryFeedVillager(session *PlayerSession, entityID int32) bool {
+	if s == nil || session == nil || session.IsDead() || s.IsVillagerSleeping(entityID) {
+		return false
+	}
+	if _, ok := s.VillagerState(entityID); !ok {
+		return false
+	}
+	slot, stack := session.handSlotAndStack(0)
+	if stack.IsEmpty() {
+		return false
+	}
+	itemID := canonicalItemName(stack.ResolvedID())
+	if VillagerFoodValue(itemID) <= 0 {
+		return false
+	}
+	s.AddVillagerFood(entityID, itemID, 1)
+	if session.Snapshot().GameMode != GameModeCreative {
+		stack.Count--
+		if stack.Count <= 0 {
+			stack = world.ItemStack{}
+		}
+		_ = session.SetInventorySlot(slot, stack)
+		if session.send != nil {
+			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), slot, stack))
+		}
+		s.TriggerInventoryChanged(session)
+	}
+	return true
 }
 
 // InteractWithEquineEntity handles right-clicking an equine or llama entity:
@@ -1465,9 +1510,15 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	if s == nil || session == nil {
 		return errors.New("server: nil player session")
 	}
-	if !session.IsDead() && session.Dimension() == world.DimensionEnd {
-		_, err := s.TravelThroughEndPortal(session)
-		return err
+	if !session.IsDead() {
+		if session.Dimension() == world.DimensionEnd {
+			_, err := s.TravelThroughEndPortal(session)
+			return err
+		}
+		if s.CompleteEndCreditsExit(session) {
+			toDim, destX, destY, destZ, yaw, pitch := s.ResolveEndReturnSpawn(session)
+			return s.ChangePlayerDimension(session, toDim, destX, destY, destZ, yaw, pitch)
+		}
 	}
 
 	st := getSurvivalState(session)
@@ -1910,7 +1961,9 @@ func (s *Server) traceAndResolveProjectileShot(
 			bz := int(math.Floor(rz))
 			hitState := cache.GetBlock(bx, by, bz)
 			if world.IsBellBlock(hitState) {
-				s.RingBellAt(dim, bx, by, bz, "", projID, session)
+				if s.RingBellAt(dim, bx, by, bz, "", projID, session) {
+					s.OnVillageBellRung(dim, bx, by, bz)
+				}
 			}
 			if IsCampfireBlock(hitState) && itemID == "minecraft:arrow" && s.PlayerFireTicks(session) > 0 {
 				s.TryIgniteCampfireWithProjectile(dim, bx, by, bz, true)
@@ -2257,7 +2310,9 @@ func (s *Server) TickDispenserProjectiles() int {
 	}
 	ds.mu.Unlock()
 	for _, bh := range bellHits {
-		s.RingBellAt(bh.dim, bh.x, bh.y, bh.z, "", bh.projEntity, nil)
+		if s.RingBellAt(bh.dim, bh.x, bh.y, bh.z, "", bh.projEntity, nil) {
+			s.OnVillageBellRung(bh.dim, bh.x, bh.y, bh.z)
+		}
 	}
 	return ticked
 }

@@ -148,7 +148,9 @@ func (h *handler) beginPlay() error {
 	h.streamer = newStreamer(playerCache, h.conn, h.log, h.visibilityRadius())
 	h.streamer.onChunkSent = func(cx, cz int32) {
 		if h.srv != nil && h.session != nil {
-			h.srv.SendChunkBlockEntityPackets(h.session, h.session.Dimension(), cx, cz)
+			dim := h.session.Dimension()
+			h.srv.SendChunkBlockEntityPackets(h.session, dim, cx, cz)
+			h.srv.SendChunkEndGatewayBlockEntitiesToSession(h.session, dim, cx, cz)
 		}
 	}
 	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
@@ -530,6 +532,7 @@ func (h *handler) keepAliveLoop() {
 			_ = h.srv.CloseStonecutterContainer(h.session, 0, false)
 			_ = h.srv.CloseSmithingContainer(h.session, 0, false)
 			_ = h.srv.CloseCartographyContainer(h.session, 0, false)
+			_ = h.srv.CloseMerchantContainer(h.session, 0, false)
 			h.srv.OnPlayerQuitBossBars(h.session)
 			h.srv.BroadcastPlayerInfoRemove(h.session.Profile.UUID)
 			h.srv.BroadcastLeaveMessage(h.session)
@@ -641,6 +644,7 @@ func (h *handler) serverTickLoop() {
 				// entity status effects, raids, and boss fights here.
 				h.srv.TickAllPlayerEffects()
 				h.srv.TickAllEntityEffects()
+				h.srv.TickVillagers()
 				h.srv.TickRaids()
 				h.srv.TickWithers(nil)
 				h.srv.TickEnderDragons(nil)
@@ -1429,7 +1433,7 @@ func (h *handler) handleContainerClick(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
-		if err := h.srv.HandleMerchantContainerClick(h.session, click.ContainerID, int(click.Slot), click.Button, click.Mode); err != nil {
+		if err := h.srv.HandleContainerClick(h.session, click.ContainerID, int(click.Slot), click.Button, click.Mode); err != nil {
 			return err
 		}
 		h.syncHotbarFromSession()
@@ -1827,6 +1831,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			if world.IsBellBlock(clickedState) && !sneaking {
 				faceDir := server.BlockFaceDirectionName(face)
 				if h.srv.InteractBell(h.session, dim, x, y, z, faceDir, float64(cursorY)) {
+					h.srv.OnVillageBellRung(dim, x, y, z)
 					h.srv.AwardCustomStat(h.session, server.StatBellRing, 1)
 					return h.sendBlockChangedAck(seq)
 				}

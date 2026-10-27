@@ -559,6 +559,8 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 		_ = send(protocol.PlayAbilities, ab.Bytes())
 
 		_ = send(protocol.PlaySetHealth, EncodeSetHealth(health, food, saturation))
+		_ = s.SendPlayerExperience(session)
+		_ = s.SendPlayerActiveEffects(session)
 
 		heldW := protocol.NewWriter(4)
 		heldW.VarInt(selectedSlot)

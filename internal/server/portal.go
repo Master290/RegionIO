@@ -29,6 +29,9 @@ const (
 	LevelEventSoundEndPortalSpawn int32 = 1038
 	LevelEventEndPortalSpawn      int32 = LevelEventSoundEndPortalSpawn
 	GameEventWinGame              byte  = 4
+
+	// BlockEntityTypeEndGateway is BuiltInRegistries.BLOCK_ENTITY_TYPE index 22 ("minecraft:end_gateway").
+	BlockEntityTypeEndGateway int32 = 22
 )
 
 // PortalTravelResult summarizes the outcome of a player or entity portal transition.
@@ -53,6 +56,39 @@ type EndGatewayBlockEntity struct {
 	ExitPortal       world.BlockPos
 	HasExitPortal    bool
 	ExactTeleport    bool
+}
+
+// ToUpdateTagNBT builds the ClientboundBlockEntityDataPacket (0x06) NBT payload
+// for a minecraft:end_gateway block entity (Age, TeleportCooldown, exit_portal, ExactTeleport).
+func (gw *EndGatewayBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	c := nbt.NewCompound()
+	if gw == nil {
+		return c
+	}
+	c.Set("Age", nbt.Long(gw.Age))
+	if gw.TeleportCooldown > 0 {
+		c.Set("TeleportCooldown", nbt.Int(int32(gw.TeleportCooldown)))
+	}
+	if gw.HasExitPortal {
+		c.Set("exit_portal", nbt.IntArray([]int32{
+			int32(gw.ExitPortal.X),
+			int32(gw.ExitPortal.Y),
+			int32(gw.ExitPortal.Z),
+		}))
+	}
+	if gw.ExactTeleport {
+		c.Set("ExactTeleport", nbt.Byte(1))
+	}
+	return c
+}
+
+// EncodeEndGatewayBlockEntityPacket encodes ClientboundBlockEntityDataPacket (0x06)
+// for a minecraft:end_gateway block entity (BlockEntityTypeEndGateway = 22).
+func EncodeEndGatewayBlockEntityPacket(gw *EndGatewayBlockEntity) []byte {
+	if gw == nil {
+		return nil
+	}
+	return EncodeBlockEntityDataPacket(gw.X, gw.Y, gw.Z, BlockEntityTypeEndGateway, gw.ToUpdateTagNBT())
 }
 
 type serverPortalManager struct {
@@ -90,11 +126,16 @@ func (s *Server) portalManager() *serverPortalManager {
 }
 
 type playerPortalState struct {
-	mu             sync.Mutex
-	inPortal       bool
-	portalCooldown int
-	portalTime     int
-	seenCredits    bool
+	mu                 sync.Mutex
+	inPortal           bool
+	portalCooldown     int
+	portalTime         int
+	seenCredits        bool
+	pendingCreditsExit bool
+	hasEnteredNether   bool
+	enteredOverworldX  float64
+	enteredOverworldY  float64
+	enteredOverworldZ  float64
 }
 
 var playerPortals sync.Map // map[*PlayerSession]*playerPortalState
@@ -194,6 +235,45 @@ func (s *Server) SetPlayerSeenCredits(session *PlayerSession, seen bool) {
 	st.mu.Lock()
 	st.seenCredits = seen
 	st.mu.Unlock()
+}
+
+// HasPendingEndCreditsExit reports whether session is currently viewing the End Poem /
+// credits after stepping into the End exit portal for the first time and is awaiting
+// a client respawn packet (ClientCommandPerformRespawn).
+func (s *Server) HasPendingEndCreditsExit(session *PlayerSession) bool {
+	if session == nil {
+		return false
+	}
+	st := getPlayerPortalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.pendingCreditsExit
+}
+
+// CompleteEndCreditsExit consumes a pending End Poem / credits exit flag for session.
+func (s *Server) CompleteEndCreditsExit(session *PlayerSession) bool {
+	if session == nil {
+		return false
+	}
+	st := getPlayerPortalState(session)
+	st.mu.Lock()
+	wasPending := st.pendingCreditsExit
+	st.pendingCreditsExit = false
+	st.mu.Unlock()
+	return wasPending
+}
+
+// EnteredNetherPosition returns the Overworld coordinates where session most recently
+// entered a Nether portal (used by the "Subspace Bubble" / minecraft:nether/fast_travel
+// advancement when returning to the Overworld).
+func (s *Server) EnteredNetherPosition(session *PlayerSession) (x, y, z float64, ok bool) {
+	if session == nil {
+		return 0, 0, 0, false
+	}
+	st := getPlayerPortalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.enteredOverworldX, st.enteredOverworldY, st.enteredOverworldZ, st.hasEnteredNether
 }
 
 // PlayerNetherPortalWaitTicks returns the number of ticks a player must stand in
@@ -472,10 +552,22 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 	}
 
 	st := getPlayerPortalState(session)
+	var enteredOWX, enteredOWZ float64
+	var checkFastTravel bool
 	st.mu.Lock()
 	st.inPortal = true
 	st.portalCooldown = DefaultPortalCooldownTicks
 	st.portalTime = 0
+	if fromDim == world.DimensionOverworld && toDim == world.DimensionNether {
+		st.hasEnteredNether = true
+		st.enteredOverworldX = snap.X
+		st.enteredOverworldY = snap.Y
+		st.enteredOverworldZ = snap.Z
+	} else if fromDim == world.DimensionNether && toDim == world.DimensionOverworld && st.hasEnteredNether {
+		enteredOWX = st.enteredOverworldX
+		enteredOWZ = st.enteredOverworldZ
+		checkFastTravel = true
+	}
 	st.mu.Unlock()
 
 	if vID := s.PlayerMountedVehicle(session); vID > 0 {
@@ -491,6 +583,9 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, int(math.Floor(destX)), int(math.Floor(destY)), int(math.Floor(destZ)), 0, false))
 	}
 	s.TriggerChangeDimension(session, toDim)
+	if checkFastTravel {
+		s.TriggerNetherTravel(session, enteredOWX, enteredOWZ, destX, destZ)
+	}
 
 	return PortalTravelResult{
 		Travelled:     true,
@@ -547,6 +642,83 @@ func (s *Server) ResolveEndReturnSpawn(session *PlayerSession) (toDim string, de
 	return spawnDim, float64(snap.SpawnX) + 0.5, float64(snap.SpawnY), float64(snap.SpawnZ) + 0.5, snap.SpawnYaw, snap.SpawnPitch
 }
 
+// EnsureEndExitPodium places or updates the End exit fountain podium at (0, portalY, 0)
+// in minecraft:the_end using world.EndPodiumOrigin, and broadcasts block updates to players in the End.
+func (s *Server) EnsureEndExitPodium(active bool) (portalY int, ok bool) {
+	if s == nil {
+		return 0, false
+	}
+	endCache := s.DimensionChunks(world.DimensionEnd)
+	if endCache == nil {
+		return 0, false
+	}
+	origin := world.EndPodiumOrigin(nil)
+	portalY = origin[1]
+	if sy, okY := endCache.SafeSpawnY(0, 0); okY && sy >= 48 {
+		portalY = sy - 1
+	}
+	bedrock, okB := world.BlockStateByName("minecraft:bedrock", nil)
+	if !okB {
+		bedrock = world.StateBedrock
+	}
+	endStone, okS := world.BlockStateByName("minecraft:end_stone", nil)
+	if !okS {
+		endStone = 1
+	}
+	endPortal, okP := world.BlockStateByName("minecraft:end_portal", nil)
+	if !okP {
+		endPortal = bedrock
+	}
+	for dz := -4; dz <= 4; dz++ {
+		for dx := -4; dx <= 4; dx++ {
+			distSq := dx*dx + dz*dz
+			if distSq > 12 {
+				continue
+			}
+			for dy := -1; dy <= 4; dy++ {
+				wy := portalY + dy
+				switch {
+				case dy < 0:
+					if distSq <= 6 {
+						endCache.SetBlockWithLight(dx, wy, dz, bedrock)
+					} else {
+						endCache.SetBlockWithLight(dx, wy, dz, endStone)
+					}
+				case dy > 0:
+					endCache.SetBlockWithLight(dx, wy, dz, world.StateAir)
+				default:
+					if distSq > 6 {
+						endCache.SetBlockWithLight(dx, wy, dz, bedrock)
+					} else if active {
+						endCache.SetBlockWithLight(dx, wy, dz, endPortal)
+					} else {
+						endCache.SetBlockWithLight(dx, wy, dz, world.StateAir)
+					}
+				}
+			}
+		}
+	}
+	for dy := 0; dy < 4; dy++ {
+		endCache.SetBlockWithLight(0, portalY+dy, 0, bedrock)
+	}
+	for dy := -1; dy <= 4; dy++ {
+		for dx := -4; dx <= 4; dx++ {
+			for dz := -4; dz <= 4; dz++ {
+				if dx*dx+dz*dz > 12 {
+					continue
+				}
+				tx, ty, tz := dx, portalY+dy, dz
+				st := endCache.GetBlock(tx, ty, tz)
+				w := protocol.NewWriter(12)
+				w.Position(tx, ty, tz)
+				w.VarInt(int32(st))
+				s.BroadcastDimensionChunk(world.DimensionEnd, int32(tx>>4), int32(tz>>4), protocol.PlayBlockUpdate, w.Bytes())
+			}
+		}
+	}
+	return portalY, true
+}
+
 // TravelThroughEndPortal transports session to the obsidian spawn platform at
 // (100, 49, 0) in minecraft:the_end (or returns the player from the_end to their
 // bed/respawn anchor/Overworld spawn point, sends GameEvent WinGame, and marks SeenCredits = true).
@@ -565,6 +737,9 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 	if fromDim == world.DimensionEnd {
 		showCredits = !st.seenCredits
 		st.seenCredits = true
+		if showCredits {
+			st.pendingCreditsExit = true
+		}
 	}
 	st.mu.Unlock()
 
@@ -732,43 +907,64 @@ func (s *Server) GetOrCreateEndGatewayAt(dim string, gx, gy, gz int) *EndGateway
 
 	if !hasExit {
 		cache := s.DimensionChunks(normDim)
-		distSq := gx*gx + gz*gz
-		if normDim == world.DimensionEnd && distSq < 200*200 {
-			dist := math.Hypot(float64(gx), float64(gz))
-			ux, uz := 1.0, 0.0
-			if dist > 1e-6 {
-				ux = float64(gx) / dist
-				uz = float64(gz) / dist
-			}
-			outX := int(math.Round(ux * EndGatewayOuterIslandRadius))
-			outZ := int(math.Round(uz * EndGatewayOuterIslandRadius))
-			surfY := ensureOuterEndIslandSurface(cache, outX, outZ)
-
-			// Spawn paired return gateway 10 blocks above the outer island arrival point,
-			// offset by (+4, 0) so the player does not land directly inside it.
-			retX, retY, retZ := outX+4, surfY+8, outZ
-			placeEndGatewayCage(cache, retX, retY, retZ)
-			retKey := dimBlockKey{dim: normDim, pos: world.BlockPos{X: retX, Y: retY, Z: retZ}}
-
-			mgr.mu.Lock()
-			gw.ExitPortal = world.BlockPos{X: outX, Y: surfY, Z: outZ}
-			gw.HasExitPortal = true
-			if _, hasRet := mgr.gateways[retKey]; !hasRet {
-				mgr.gateways[retKey] = &EndGatewayBlockEntity{
-					Dimension:     normDim,
-					X:             retX,
-					Y:             retY,
-					Z:             retZ,
-					ExitPortal:    world.BlockPos{X: world.EndSpawnX, Y: world.EndSpawnY, Z: world.EndSpawnZ},
-					HasExitPortal: true,
+		// First check if worldgen / NewEndGatewayBlockEntity already attached a StructureBlockEntity at (gx, gy, gz).
+		if cache != nil {
+			if sbe, ok := cache.StructureBlockEntityAt(gx, gy, gz); ok {
+				if exitPos, exactSBE, hasSBEExit := world.ParseEndGatewayBlockEntity(sbe); hasSBEExit {
+					mgr.mu.Lock()
+					gw.ExitPortal = world.BlockPos{X: exitPos[0], Y: exitPos[1], Z: exitPos[2]}
+					gw.HasExitPortal = true
+					gw.ExactTeleport = exactSBE
+					hasExit = true
+					mgr.mu.Unlock()
 				}
 			}
-			mgr.mu.Unlock()
-		} else {
-			mgr.mu.Lock()
-			gw.ExitPortal = world.BlockPos{X: world.EndSpawnX, Y: world.EndSpawnY, Z: world.EndSpawnZ}
-			gw.HasExitPortal = true
-			mgr.mu.Unlock()
+		}
+		if !hasExit {
+			distSq := gx*gx + gz*gz
+			if normDim == world.DimensionEnd && distSq < 200*200 {
+				dist := math.Hypot(float64(gx), float64(gz))
+				ux, uz := 1.0, 0.0
+				if dist > 1e-6 {
+					ux = float64(gx) / dist
+					uz = float64(gz) / dist
+				}
+				outX := int(math.Round(ux * EndGatewayOuterIslandRadius))
+				outZ := int(math.Round(uz * EndGatewayOuterIslandRadius))
+				surfY := ensureOuterEndIslandSurface(cache, outX, outZ)
+
+				// Spawn paired return gateway 8 blocks above the outer island arrival point,
+				// offset by (+4, 0) so the player does not land directly inside it.
+				retX, retY, retZ := outX+4, surfY+8, outZ
+				placeEndGatewayCage(cache, retX, retY, retZ)
+				if cache != nil {
+					retExit := [3]int{world.EndSpawnX, world.EndSpawnY, world.EndSpawnZ}
+					ringExit := [3]int{outX, surfY, outZ}
+					cache.AddStructureBlockEntity(world.NewEndGatewayBlockEntity(retX, retY, retZ, &retExit, false))
+					cache.AddStructureBlockEntity(world.NewEndGatewayBlockEntity(gx, gy, gz, &ringExit, false))
+				}
+				retKey := dimBlockKey{dim: normDim, pos: world.BlockPos{X: retX, Y: retY, Z: retZ}}
+
+				mgr.mu.Lock()
+				gw.ExitPortal = world.BlockPos{X: outX, Y: surfY, Z: outZ}
+				gw.HasExitPortal = true
+				if _, hasRet := mgr.gateways[retKey]; !hasRet {
+					mgr.gateways[retKey] = &EndGatewayBlockEntity{
+						Dimension:     normDim,
+						X:             retX,
+						Y:             retY,
+						Z:             retZ,
+						ExitPortal:    world.BlockPos{X: world.EndSpawnX, Y: world.EndSpawnY, Z: world.EndSpawnZ},
+						HasExitPortal: true,
+					}
+				}
+				mgr.mu.Unlock()
+			} else {
+				mgr.mu.Lock()
+				gw.ExitPortal = world.BlockPos{X: world.EndSpawnX, Y: world.EndSpawnY, Z: world.EndSpawnZ}
+				gw.HasExitPortal = true
+				mgr.mu.Unlock()
+			}
 		}
 	}
 
@@ -785,10 +981,8 @@ func (s *Server) GetOrCreateEndGatewayAt(dim string, gx, gy, gz int) *EndGateway
 func DragonGatewayPositions() [EndDragonGatewayCount]world.BlockPos {
 	var out [EndDragonGatewayCount]world.BlockPos
 	for i := 0; i < EndDragonGatewayCount; i++ {
-		angle := 2.0 * (-math.Pi + 0.1*math.Pi*float64(i))
-		gx := int(math.Floor(EndDragonGatewayRingRadius * math.Cos(angle)))
-		gz := int(math.Floor(EndDragonGatewayRingRadius * math.Sin(angle)))
-		out[i] = world.BlockPos{X: gx, Y: EndDragonGatewayRingY, Z: gz}
+		pos := world.EndRingGatewayPos(i)
+		out[i] = world.BlockPos{X: pos[0], Y: pos[1], Z: pos[2]}
 	}
 	return out
 }
@@ -847,6 +1041,9 @@ func (s *Server) SpawnNextEndDragonGateway() (*EndGatewayBlockEntity, bool) {
 		}
 	}
 	gw := s.RegisterSpawnedEndGateway(pos.X, pos.Y, pos.Z)
+	if gw != nil {
+		s.BroadcastDimensionChunk(world.DimensionEnd, int32(pos.X>>4), int32(pos.Z>>4), PlayBlockEntityDataCB, EncodeEndGatewayBlockEntityPacket(gw))
+	}
 	return gw, gw != nil
 }
 
@@ -874,7 +1071,15 @@ func (s *Server) SetEndGatewayExit(dim string, gx, gy, gz int, exit world.BlockP
 	gw.ExitPortal = exit
 	gw.HasExitPortal = true
 	gw.ExactTeleport = exact
+	cp := *gw
 	mgr.mu.Unlock()
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		if world.IsEndGatewayState(cache.GetBlock(gx, gy, gz)) {
+			exitArr := [3]int{exit.X, exit.Y, exit.Z}
+			cache.AddStructureBlockEntity(world.NewEndGatewayBlockEntity(gx, gy, gz, &exitArr, exact))
+		}
+	}
+	s.BroadcastDimensionChunk(normDim, int32(gx>>4), int32(gz>>4), PlayBlockEntityDataCB, EncodeEndGatewayBlockEntityPacket(&cp))
 }
 
 // RemoveEndGatewayAt removes any tracked EndGatewayBlockEntity at (gx, gy, gz) in dim.
@@ -887,6 +1092,46 @@ func (s *Server) RemoveEndGatewayAt(dim string, gx, gy, gz int) {
 	mgr.mu.Lock()
 	delete(mgr.gateways, key)
 	mgr.mu.Unlock()
+}
+
+// SendChunkEndGatewayBlockEntitiesToSession sends ClientboundBlockEntityDataPacket (0x06)
+// for all End gateways in chunk (cx, cz) of dimension (discovering any chunk-embedded
+// StructureBlockEntities from worldgen on the fly).
+func (s *Server) SendChunkEndGatewayBlockEntitiesToSession(session *PlayerSession, dimension string, cx, cz int32) {
+	if s == nil || session == nil || session.send == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dimension)
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		minX, maxX := int(cx)*16, int(cx)*16+15
+		minZ, maxZ := int(cz)*16, int(cz)*16+15
+		for x := minX; x <= maxX; x++ {
+			for z := minZ; z <= maxZ; z++ {
+				for y := 48; y <= 84; y++ {
+					if sbe, ok := cache.StructureBlockEntityAt(x, y, z); ok && sbe.ID == "minecraft:end_gateway" {
+						_ = s.GetOrCreateEndGatewayAt(normDim, sbe.X, sbe.Y, sbe.Z)
+					}
+				}
+			}
+		}
+	}
+	mgr := s.portalManager()
+	mgr.mu.Lock()
+	var packets [][]byte
+	for _, gw := range mgr.gateways {
+		if gw == nil || gw.Dimension != normDim {
+			continue
+		}
+		if int32(gw.X>>4) == cx && int32(gw.Z>>4) == cz {
+			packets = append(packets, EncodeEndGatewayBlockEntityPacket(gw))
+		}
+	}
+	mgr.mu.Unlock()
+	for _, pkt := range packets {
+		if len(pkt) > 0 {
+			_ = session.send(PlayBlockEntityDataCB, pkt)
+		}
+	}
 }
 
 func resolveEndGatewayArrival(cache *world.Cache, gw *EndGatewayBlockEntity) (destX, destY, destZ float64) {
@@ -926,12 +1171,15 @@ func (s *Server) broadcastEndGatewayBeamEvent(dim string, gx, gy, gz int) {
 		return
 	}
 	normDim := world.NormalizeDimension(dim)
-	blockID := registry.Index("minecraft:block", "minecraft:end_gateway")
+	blockID, ok := world.BlockRegistryID("minecraft:end_gateway")
+	if !ok || blockID < 0 {
+		blockID = int32(registry.Index("minecraft:block", "minecraft:end_gateway"))
+	}
 	if blockID < 0 {
 		blockID = 0
 	}
 	s.BroadcastDimensionChunk(normDim, int32(gx>>4), int32(gz>>4), PlayBlockEventCB,
-		EncodeBlockEventPacket(gx, gy, gz, int32(blockID), 1, 0))
+		EncodeBlockEventPacket(gx, gy, gz, blockID, 1, 0))
 }
 
 // TravelThroughEndGateway teleports session through the minecraft:end_gateway block at (gx, gy, gz).
@@ -950,13 +1198,21 @@ func (s *Server) TravelThroughEndGateway(session *PlayerSession, gx, gy, gz int)
 	}
 	destX, destY, destZ := resolveEndGatewayArrival(cache, gw)
 
-	key := dimBlockKey{dim: world.NormalizeDimension(dim), pos: world.BlockPos{X: gx, Y: gy, Z: gz}}
+	normDim := world.NormalizeDimension(dim)
+	key := dimBlockKey{dim: normDim, pos: world.BlockPos{X: gx, Y: gy, Z: gz}}
 	mgr := s.portalManager()
+	var updatedGW *EndGatewayBlockEntity
 	mgr.mu.Lock()
 	if stored, ok := mgr.gateways[key]; ok {
 		stored.TeleportCooldown = DefaultEndGatewayCooldownTicks
+		cp := *stored
+		updatedGW = &cp
 	}
 	mgr.mu.Unlock()
+	if updatedGW != nil {
+		s.BroadcastDimensionChunk(normDim, int32(gx>>4), int32(gz>>4), PlayBlockEntityDataCB,
+			EncodeEndGatewayBlockEntityPacket(updatedGW))
+	}
 	s.broadcastEndGatewayBeamEvent(dim, gx, gy, gz)
 
 	st := getPlayerPortalState(session)
@@ -976,6 +1232,7 @@ func (s *Server) TravelThroughEndGateway(session *PlayerSession, gx, gy, gz int)
 			return PortalTravelResult{}, err
 		}
 	}
+	s.TriggerEnterEndGateway(session)
 	return PortalTravelResult{
 		Travelled:     true,
 		FromDimension: dim,
@@ -1209,6 +1466,7 @@ func (s *Server) ChangeVehicleDimensionWithPassengers(vehicleID int32, targetDim
 	seatY := y + 0.35
 	for _, pid := range passengers {
 		if pSession := s.playerByEntityID(pid); pSession != nil {
+			prevDim := pSession.Dimension()
 			pSnap := pSession.Snapshot()
 			pst := getPlayerPortalState(pSession)
 			pst.mu.Lock()
@@ -1217,6 +1475,9 @@ func (s *Server) ChangeVehicleDimensionWithPassengers(vehicleID int32, targetDim
 			pst.portalTime = 0
 			pst.mu.Unlock()
 			_ = s.ChangePlayerDimension(pSession, normTarget, x, seatY, z, yaw, pSnap.Pitch)
+			if prevDim != normTarget {
+				s.TriggerChangeDimension(pSession, normTarget)
+			}
 		} else if s.entities != nil && s.entities.Get(pid) != nil {
 			_ = s.ChangeEntityDimension(pid, normTarget, x, seatY, z, yaw, 0)
 		}
@@ -1291,9 +1552,31 @@ func (s *Server) CheckEntityPortal(entityID int32) (PortalTravelResult, error) {
 			return PortalTravelResult{}, nil
 		}
 		destX, destY, destZ := resolveEndGatewayArrival(cache, gw)
+		normDim := world.NormalizeDimension(fromDim)
+		key := dimBlockKey{dim: normDim, pos: world.BlockPos{X: bx, Y: gy, Z: bz}}
+		mgr := s.portalManager()
+		var updatedGW *EndGatewayBlockEntity
+		mgr.mu.Lock()
+		if stored, ok := mgr.gateways[key]; ok {
+			stored.TeleportCooldown = DefaultEndGatewayCooldownTicks
+			cp := *stored
+			updatedGW = &cp
+		}
+		mgr.mu.Unlock()
+		if updatedGW != nil {
+			s.BroadcastDimensionChunk(normDim, int32(bx>>4), int32(bz>>4), PlayBlockEntityDataCB,
+				EncodeEndGatewayBlockEntityPacket(updatedGW))
+		}
+		s.broadcastEndGatewayBeamEvent(fromDim, bx, gy, bz)
 		if ent.IsVehicle() {
+			passengers := s.VehiclePassengers(entityID)
 			if err := s.ChangeVehicleDimensionWithPassengers(entityID, fromDim, destX, destY, destZ, ent.Yaw); err != nil {
 				return PortalTravelResult{}, err
+			}
+			for _, pid := range passengers {
+				if pSession := s.playerByEntityID(pid); pSession != nil {
+					s.TriggerEnterEndGateway(pSession)
+				}
 			}
 		} else {
 			if err := s.ChangeEntityDimension(entityID, fromDim, destX, destY, destZ, ent.Yaw, ent.Pitch); err != nil {
