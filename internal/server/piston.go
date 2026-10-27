@@ -179,8 +179,14 @@ func (s *Server) BindPistonAndRedstoneHooks(dim string) *world.Cache {
 			if i < len(movedStates) && movedStates[i] != 0 {
 				st = movedStates[i]
 			}
-			if world.BlockName(st) == "minecraft:slime_block" {
+			bName := world.BlockName(st)
+			if bName == "minecraft:slime_block" {
 				slimePositions = append(slimePositions, pos)
+			} else if bName == "minecraft:honey_block" && facing != "up" && facing != "down" {
+				// Vanilla HoneyBlock drags entities standing on its top surface when moved horizontally.
+				dx, _, dz := DispenserFacingVector(facing)
+				srcTop := world.BlockPos{X: pos.X - dx, Y: pos.Y + 1, Z: pos.Z - dz}
+				checkPositions = append(checkPositions, srcTop)
 			}
 		}
 		if len(checkPositions) > 0 {
@@ -191,7 +197,16 @@ func (s *Server) BindPistonAndRedstoneHooks(dim string) *world.Cache {
 	cache.SetTripwireEntityCheck(func(x, y, z int) bool {
 		return len(s.playersInBlockBox(normDim, x, y, z)) > 0 ||
 			len(s.mobsInBlockBox(normDim, x, y, z)) > 0 ||
-			len(s.armorStandsInBlockBox(normDim, x, y, z)) > 0
+			len(s.armorStandsInBlockBox(normDim, x, y, z)) > 0 ||
+			len(s.itemsInBlockBox(normDim, x, y, z)) > 0
+	})
+
+	cache.SetPressurePlateEntityCounter(func(x, y, z int) int {
+		return s.CountPressurePlateEntitiesAt(normDim, x, y, z)
+	})
+
+	cache.SetButtonProjectileCheck(func(x, y, z int) bool {
+		return s.HasPersistentProjectileInBlock(normDim, x, y, z)
 	})
 
 	return cache
@@ -452,6 +467,132 @@ func (s *Server) BreakTripwireBlock(dim string, x, y, z int, toolItemID string) 
 	strStack := world.NewNamedItemStack("minecraft:string", 1)
 	if !strStack.IsEmpty() {
 		s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, strStack)
+	}
+	return true
+}
+
+// CountPressurePlateEntitiesAt returns the number of entities currently standing
+// on the pressure plate at (dim, x, y, z) that are eligible to activate that
+// plate type (stone and polished_blackstone plates count only players, mobs,
+// and armor stands; wooden and weighted pressure plates also count item entities).
+func (s *Server) CountPressurePlateEntitiesAt(dim string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return 0
+	}
+	state := cache.GetBlock(x, y, z)
+	count := len(s.playersInBlockBox(normDim, x, y, z)) +
+		len(s.mobsInBlockBox(normDim, x, y, z)) +
+		len(s.armorStandsInBlockBox(normDim, x, y, z))
+	if !world.IsMobOnlyPressurePlate(state) {
+		count += len(s.itemsInBlockBox(normDim, x, y, z))
+	}
+	return count
+}
+
+func (s *Server) itemsInBlockBox(dim string, x, y, z int) []int32 {
+	if s == nil || s.entities == nil {
+		return nil
+	}
+	normDim := normalizeHopperDim(dim)
+	minX, maxX := float64(x), float64(x+1)
+	minY, maxY := float64(y), float64(y+1)
+	minZ, maxZ := float64(z), float64(z+1)
+	all := s.entities.AppendAll(nil)
+	var out []int32
+	for i := range all {
+		e := &all[i]
+		if !e.IsItem() || e.IsExperienceOrb() || e.Item.IsEmpty() {
+			continue
+		}
+		if normalizeHopperDim(e.EffectiveDimension()) != normDim {
+			continue
+		}
+		if e.X+0.25 >= minX && e.X-0.25 <= maxX &&
+			e.Y+0.25 >= minY && e.Y <= maxY &&
+			e.Z+0.25 >= minZ && e.Z-0.25 <= maxZ {
+			out = append(out, e.ID)
+		}
+	}
+	return out
+}
+
+// OnEntityStepPressurePlate re-evaluates the pressure plate at (dim, x, y, z)
+// using the current entity count on the plate, updates its redstone state, and
+// broadcasts any resulting block changes. Returns true if the pressure plate is
+// active (entity count > 0 on a valid pressure plate).
+func (s *Server) OnEntityStepPressurePlate(dim string, x, y, z int) bool {
+	if s == nil {
+		return false
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.BindPistonAndRedstoneHooks(normDim)
+	if cache == nil {
+		return false
+	}
+	count := s.CountPressurePlateEntitiesAt(normDim, x, y, z)
+	changed, res := cache.UpdatePressurePlateEntities(x, y, z, count)
+	if len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+	}
+	return changed && count > 0
+}
+
+// HasPersistentProjectileInBlock reports whether at least one persistent
+// projectile (arrow, spectral_arrow, trident) currently intersects the block box
+// at (dim, x, y, z).
+func (s *Server) HasPersistentProjectileInBlock(dim string, x, y, z int) bool {
+	if s == nil || s.entities == nil {
+		return false
+	}
+	normDim := normalizeHopperDim(dim)
+	minX, maxX := float64(x), float64(x+1)
+	minY, maxY := float64(y), float64(y+1)
+	minZ, maxZ := float64(z), float64(z+1)
+	all := s.entities.AppendAll(nil)
+	for i := range all {
+		e := &all[i]
+		if normalizeHopperDim(e.EffectiveDimension()) != normDim {
+			continue
+		}
+		if !isPersistentTargetProjectile(e.TypeName) {
+			continue
+		}
+		if e.X+0.25 >= minX && e.X-0.25 <= maxX &&
+			e.Y+0.25 >= minY && e.Y-0.25 <= maxY &&
+			e.Z+0.25 >= minZ && e.Z-0.25 <= maxZ {
+			return true
+		}
+	}
+	return false
+}
+
+// HitButtonBlockWithProjectile activates a projectile-sensitive wooden/bamboo/nether
+// button at (dim, x, y, z) when struck by a persistent projectile (arrow,
+// spectral_arrow, trident). Stone and polished blackstone buttons ignore
+// projectiles and return false.
+func (s *Server) HitButtonBlockWithProjectile(dim string, x, y, z int, projectileType string) bool {
+	if s == nil || !isPersistentTargetProjectile(projectileType) {
+		return false
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.BindPistonAndRedstoneHooks(normDim)
+	if cache == nil {
+		return false
+	}
+	ok, res := cache.HitButtonWithProjectile(x, y, z)
+	if !ok {
+		return false
+	}
+	if len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 	}
 	return true
 }

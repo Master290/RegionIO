@@ -204,3 +204,82 @@ func TestServerRedstoneHooksTargetLightningRodDaylightAndTripwire(t *testing.T) 
 		t.Fatalf("hook after shears BreakTripwireBlock = %v, want attached=false, powered=false", hProps)
 	}
 }
+
+func TestServerHoneyTopEntityDragPressurePlateEntityFilterAndButtonProjectile(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	dim := world.DimensionOverworld
+	srv.BindPistonAndRedstoneHooks(dim)
+	y := world.FlatSurfaceY + 2
+
+	// 1. Horizontally moving honey_block drags an armor stand standing on top of it (at y+1):
+	stickySt, _ := world.BlockStateIDByProperties("minecraft:sticky_piston", map[string]string{
+		"facing":   "east",
+		"extended": "false",
+	})
+	honeySt, _ := world.BlockStateIDByProperties("minecraft:honey_block", nil)
+	leverSt, _ := world.BlockStateIDByProperties("minecraft:lever", map[string]string{
+		"face":    "wall",
+		"facing":  "north",
+		"powered": "false",
+	})
+	cache.ApplyBlockWithUpdates(100, y, 100, stickySt)
+	cache.ApplyBlockWithUpdates(101, y, 100, honeySt)
+	cache.ApplyBlockWithUpdates(100, y, 99, leverSt)
+
+	standID, err := srv.SpawnArmorStand(dim, 101.5, float64(y+1), 100.5, 0)
+	if err != nil {
+		t.Fatalf("SpawnArmorStand: %v", err)
+	}
+	cache.ToggleLever(100, y, 99)
+	cache.StepBlockUpdates(world.PistonTickDelay)
+
+	dragged := srv.entities.Get(standID)
+	if dragged == nil || dragged.X < 102.4 {
+		t.Fatalf("entity standing on top of horizontally moved honey_block should be dragged to X=102.5, got %+v", dragged)
+	}
+
+	// 2. Pressure plate entity filtering: dropped item activates oak_pressure_plate,
+	//    but is ignored by stone_pressure_plate:
+	yFloor := world.FlatSurfaceY + 1
+	oakPlate, _ := world.BlockStateIDByProperties("minecraft:oak_pressure_plate", map[string]string{"powered": "false"})
+	stonePlate, _ := world.BlockStateIDByProperties("minecraft:stone_pressure_plate", map[string]string{"powered": "false"})
+	cache.ApplyBlockWithUpdates(110, yFloor, 110, oakPlate)
+	cache.ApplyBlockWithUpdates(112, yFloor, 110, stonePlate)
+
+	srv.SpawnItemEntityInDimension(dim, 110.5, float64(yFloor)+0.1, 110.5, world.NewNamedItemStack("minecraft:cobblestone", 1))
+	srv.SpawnItemEntityInDimension(dim, 112.5, float64(yFloor)+0.1, 110.5, world.NewNamedItemStack("minecraft:cobblestone", 1))
+
+	if !srv.OnEntityStepPressurePlate(dim, 110, yFloor, 110) {
+		t.Fatal("expected dropped item to activate oak_pressure_plate")
+	}
+	if srv.OnEntityStepPressurePlate(dim, 112, yFloor, 110) {
+		t.Fatal("dropped item should NOT activate stone_pressure_plate")
+	}
+
+	// 3. HitButtonBlockWithProjectile: arrow activates oak_button and keeps it pressed while arrow entity remains:
+	oakBtn, _ := world.BlockStateIDByProperties("minecraft:oak_button", map[string]string{
+		"face":    "floor",
+		"facing":  "north",
+		"powered": "false",
+	})
+	stoneBtn, _ := world.BlockStateIDByProperties("minecraft:stone_button", map[string]string{
+		"face":    "floor",
+		"facing":  "north",
+		"powered": "false",
+	})
+	cache.ApplyBlockWithUpdates(120, yFloor, 120, oakBtn)
+	cache.ApplyBlockWithUpdates(122, yFloor, 120, stoneBtn)
+
+	if srv.HitButtonBlockWithProjectile(dim, 122, yFloor, 120, "minecraft:arrow") {
+		t.Fatal("stone_button should ignore arrow projectile hits")
+	}
+	if !srv.HitButtonBlockWithProjectile(dim, 120, yFloor, 120, "minecraft:arrow") {
+		t.Fatal("oak_button should activate when hit by arrow")
+	}
+}
