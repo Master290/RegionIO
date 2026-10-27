@@ -61,6 +61,46 @@ func (s *Server) SetDimensionRaining(dim string, raining bool) {
 	}
 }
 
+// RandomTickLavaInDimension executes one vanilla LavaFluid.randomTick at
+// (x, y, z) in dim and broadcasts any resulting fire ignitions or block changes.
+func (s *Server) RandomTickLavaInDimension(dim string, x, y, z int, rng *rand.Rand) bool {
+	if s == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return false
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindTNTAndFireMechanics(normDim)
+	if cache == nil {
+		return false
+	}
+	ignited, res := cache.RandomTickLavaAt(x, y, z, rng)
+	if len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+	}
+	return ignited
+}
+
+// TryLightNetherPortalInDimension attempts to light an unlit obsidian Nether
+// portal frame at or adjacent to (x, y, z) in dim and broadcasts all resulting
+// portal block and lighting updates.
+func (s *Server) TryLightNetherPortalInDimension(dim string, x, y, z int) (world.PortalShape, bool) {
+	if s == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return world.PortalShape{}, false
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindTNTAndFireMechanics(normDim)
+	if cache == nil {
+		return world.PortalShape{}, false
+	}
+	shape, res, ok := cache.TryLightNetherPortalAt(x, y, z)
+	if !ok {
+		return world.PortalShape{}, false
+	}
+	if len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+	}
+	return shape, true
+}
+
 // IgniteBlockWithItem handles a player right-clicking a block at (x, y, z) on
 // face ("up", "down", "north", "south", "east", "west") with `minecraft:flint_and_steel`
 // or `minecraft:fire_charge`:

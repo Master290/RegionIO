@@ -75,3 +75,80 @@ func TestServerFirePlacementSoulFireDamageAndExtinguish(t *testing.T) {
 		t.Fatal("expected fire on netherrack to remain lit during rain")
 	}
 }
+
+func TestServerNetherPortalLavaFireAndPowderSnowEntities(t *testing.T) {
+	srv := newDispenserTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindTNTAndFireMechanics(dim)
+	player, _ := addDispenserTestPlayer(t, srv, "PortalAndSnowTester")
+	y := 70
+
+	// 1. TryLightNetherPortalInDimension lights a 2x3 obsidian portal frame.
+	obsidian, _ := world.BlockStateByName("minecraft:obsidian", nil)
+	for dx := 0; dx <= 3; dx++ {
+		for dy := 0; dy <= 4; dy++ {
+			if dx == 0 || dx == 3 || dy == 0 || dy == 4 {
+				cache.SetBlock(30+dx, y+dy, 30, obsidian)
+			} else {
+				cache.SetBlock(30+dx, y+dy, 30, world.StateAir)
+			}
+		}
+	}
+	shape, lit := srv.TryLightNetherPortalInDimension(dim, 31, y+1, 30)
+	if !lit || shape.Width != 2 || shape.Height != 3 {
+		t.Fatalf("expected TryLightNetherPortalInDimension to light 2x3 portal, got lit=%v shape=%+v", lit, shape)
+	}
+	if !world.IsNetherPortalState(cache.GetBlock(31, y+1, 30)) {
+		t.Fatal("expected nether_portal block inside lit frame")
+	}
+
+	// 2. StepEntityPowderSnow: burning mob melts powder_snow, blaze takes 5.0 freeze damage, stray is immune.
+	cache.SetBlock(40, y, 40, world.StatePowderSnow)
+	blazeID, err := srv.SpawnMobInDimension(dim, 40.5, float64(y), 40.5, "minecraft:blaze")
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(blaze): %v", err)
+	}
+	srv.SetEntityFireTicks(blazeID, 60)
+	_, _, melted := srv.StepEntityPowderSnow(blazeID, false)
+	if !melted || cache.GetBlock(40, y, 40) != world.StateAir || srv.EntityFireTicks(blazeID) != 0 {
+		t.Fatalf("expected burning blaze to melt powder_snow and extinguish, got melted=%v fireTicks=%d",
+			melted, srv.EntityFireTicks(blazeID))
+	}
+
+	// Place powder_snow again and freeze the blaze to 140 ticks + 40 damage interval ticks -> 5.0 damage.
+	cache.SetBlock(40, y, 40, world.StatePowderSnow)
+	var sawExtraDmg float32
+	for i := 0; i < world.PowderSnowMinFreezeTicks+world.PowderSnowFreezeDamageIntervalTicks; i++ {
+		_, dmg, _ := srv.StepEntityPowderSnow(blazeID, false)
+		if dmg > 0 {
+			sawExtraDmg = dmg
+		}
+	}
+	if sawExtraDmg != world.PowderSnowFireSensitiveFreezeDamage {
+		t.Fatalf("expected blaze in powder_snow to take 5.0 freeze damage, got %v", sawExtraDmg)
+	}
+
+	// Stray is freeze-immune (ticksFrozen stays 0).
+	strayID, err := srv.SpawnMobInDimension(dim, 40.5, float64(y), 40.5, "minecraft:stray")
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(stray): %v", err)
+	}
+	ticksFrozen, dmg, _ := srv.StepEntityPowderSnow(strayID, false)
+	if ticksFrozen != 0 || dmg != 0 {
+		t.Fatalf("expected stray to be freeze-immune in powder_snow, got ticks=%d dmg=%v", ticksFrozen, dmg)
+	}
+
+	// 3. Burning projectile melts powder_snow.
+	cache.SetBlock(45, y, 45, world.StatePowderSnow)
+	if !srv.ExtinguishBurningProjectileInPowderSnow(dim, 45, y, 45, true, true) || cache.GetBlock(45, y, 45) != world.StateAir {
+		t.Fatal("expected burning projectile to melt powder_snow")
+	}
+
+	// 4. Walking on top of powder_snow with leather_boots grants "Light as a Rabbit".
+	cache.SetBlock(50, y-1, 50, world.StatePowderSnow)
+	srv.SetPlayerTransform(player, 50.5, float64(y), 50.5, 0, 0, true)
+	player.SetInventorySlot(ArmorSlotFeet, world.NewNamedItemStack("minecraft:leather_boots", 1))
+	if !srv.CheckPlayerWalkOnPowderSnowWithLeatherBoots(player) {
+		t.Fatal("expected CheckPlayerWalkOnPowderSnowWithLeatherBoots to succeed when standing on powder_snow with leather_boots")
+	}
+}
