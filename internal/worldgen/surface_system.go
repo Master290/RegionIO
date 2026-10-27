@@ -147,7 +147,7 @@ func (s *SurfaceSampler) FrozenOceanExtension(col []uint16, minSurfaceLevel int,
 	for n := startY; n >= floorY; n-- {
 		state := col[n-minY]
 		place := false
-		if state == stateAir && n < int(j) && random.NextDouble() <= 0.01 {
+		if state == stateAir && n < int(j) && random.NextDouble() > 0.01 {
 			place = true
 		} else if state == stateWater && n > int(g) && n < seaLevel && g != 0.0 && random.NextDouble() > 0.15 {
 			place = true

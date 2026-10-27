@@ -256,34 +256,65 @@ func TestColdEnoughToSnowAtAndSurfaceExtensions(t *testing.T) {
 		t.Error("ErodedBadlandsExtension did not raise any pillar across 10,000 test columns")
 	}
 
-	// FrozenOceanExtension places packed_ice (12914) or snow_block (6928) where iceberg noises exceed 1.8.
-	placedIceberg := false
-	for x := 0; x < 400; x += 2 {
-		for z := 0; z < 400; z += 2 {
+	// ErodedBadlandsExtension must abort when water sits above the first stone block.
+	for x := 0; x < 200; x += 2 {
+		for z := 0; z < 200; z += 2 {
 			var col [height]uint16
-			for y := minY; y <= 40; y++ {
+			for y := minY; y <= 60; y++ {
 				col[y-minY] = 1
 			}
-			for y := 41; y < 63; y++ {
+			for y := 61; y <= 63; y++ {
 				col[y-minY] = 86 // water
 			}
-			od.Surface.FrozenOceanExtension(col[:], 40, "minecraft:frozen_ocean", x, z, 63, minY, 63)
-			for _, s := range col {
+			if _, changed := od.Surface.ErodedBadlandsExtension(col[:], x, z, 64, minY); changed {
+				t.Fatalf("ErodedBadlandsExtension raised a pillar over water at (%d,%d)", x, z)
+			}
+		}
+	}
+
+	// FrozenOceanExtension places solid packed_ice (12914) and snow_block (6928)
+	// both above sea level (~99% density via nextDouble() > 0.01) and below sea level.
+	placedAboveSea, placedBelowSea, placedSnowCap := false, false, false
+	for x := 0; x < 600; x += 2 {
+		for z := 0; z < 600; z += 2 {
+			var col [height]uint16
+			for y := minY; y <= 30; y++ {
+				col[y-minY] = 1
+			}
+			for y := 31; y < 63; y++ {
+				col[y-minY] = 86 // water
+			}
+			od.Surface.FrozenOceanExtension(col[:], 30, "minecraft:frozen_ocean", x, z, 63, minY, 63)
+			aboveCount := 0
+			for y := 63; y < minY+height; y++ {
+				s := col[y-minY]
 				if s == 12914 || s == 6928 {
-					placedIceberg = true
+					aboveCount++
+				}
+				if s == 6928 {
+					placedSnowCap = true
+				}
+			}
+			if aboveCount >= 5 {
+				placedAboveSea = true
+			}
+			for y := 31; y < 63; y++ {
+				if col[y-minY] == 12914 {
+					placedBelowSea = true
 					break
 				}
 			}
-			if placedIceberg {
+			if placedAboveSea && placedBelowSea && placedSnowCap {
 				break
 			}
 		}
-		if placedIceberg {
+		if placedAboveSea && placedBelowSea && placedSnowCap {
 			break
 		}
 	}
-	if !placedIceberg {
-		t.Error("FrozenOceanExtension did not place any iceberg blocks across 40,000 test columns")
+	if !placedAboveSea || !placedBelowSea || !placedSnowCap {
+		t.Errorf("FrozenOceanExtension: placedAboveSea=%v, placedBelowSea=%v, placedSnowCap=%v, want all true",
+			placedAboveSea, placedBelowSea, placedSnowCap)
 	}
 }
 

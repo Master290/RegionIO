@@ -252,6 +252,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	zoomed := newZoomedBiomes(od, seed, cx, cz)
 	defer releaseZoomedBiomes(zoomed)
 
+	var heightChanged [16][16]bool
 	for lx := 0; lx < 16; lx++ {
 		wg.Add(1)
 		go func(lx int) {
@@ -264,7 +265,7 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 			}
 			for lz := 0; lz < 16; lz++ {
 				if ruleErr == nil {
-					applySurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
+					heightChanged[lx][lz] = applySurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
 						baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz])
 					continue
 				}
@@ -273,6 +274,13 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 		}(lx)
 	}
 	wg.Wait()
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			if heightChanged[lx][lz] {
+				surfTop[lx][lz], worldSurface[lx][lz] = refreshColumnSurfaceHeight(&columns[lx][lz])
+			}
+		}
+	}
 
 	// Carving sits between the surface pass and decoration, as it does in
 	// vanilla: it needs the surfaced blocks to retexture a cave mouth, and
@@ -479,7 +487,24 @@ func veinOrDefault(veins *worldgen.OreVeinifier, ctx worldgen.FunctionContext, x
 // One *rand.Rand is created per column (not per block) — bandlands/gradient
 // consume from it sequentially, which is correct because vanilla seeds those
 // per-column too. This avoids ~98k rand.New allocations per chunk.
-func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string) {
+func refreshColumnSurfaceHeight(col *[WorldHeight]uint16) (topSolid, worldSurf int) {
+	topSolid, worldSurf = -1, MinY-1
+	for i := WorldHeight - 1; i >= 0; i-- {
+		s := col[i]
+		if worldSurf == MinY-1 && s != StateAir {
+			worldSurf = MinY + i
+		}
+		if topSolid == -1 && isStoneState(s) {
+			topSolid = i
+		}
+		if worldSurf != MinY-1 && topSolid != -1 {
+			break
+		}
+	}
+	return topSolid, worldSurf
+}
+
+func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string) bool {
 	top := -1
 	for i := WorldHeight - 1; i >= 0; i-- {
 		if out[i] != StateAir {
@@ -488,7 +513,7 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 		}
 	}
 	if top < 0 {
-		return
+		return false
 	}
 	minY := MinY
 	topY := minY + top + 1
@@ -498,10 +523,12 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 	} else if sctx.BiomeFunc != nil {
 		surfaceBiome = sctx.BiomeFunc(wx, topY, wz)
 	}
+	changedHeight := false
 	if surfaceBiome == "minecraft:eroded_badlands" && od.Surface != nil {
 		if newTop, changed := od.Surface.ErodedBadlandsExtension(out[:], wx, wz, topY, minY); changed {
 			top = newTop
 			topY = minY + top + 1
+			changedHeight = true
 		}
 	}
 	// Column-constant surface quantities, refreshed once per column exactly as
@@ -559,11 +586,16 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 		// matched" leaves the default block alone.
 		if state, ok := rules.Apply(sctx); ok {
 			out[i] = state
+			if i == top && state == StateAir {
+				changedHeight = true
+			}
 		}
 	}
 	if (surfaceBiome == "minecraft:frozen_ocean" || surfaceBiome == "minecraft:deep_frozen_ocean") && od.Surface != nil {
 		od.Surface.FrozenOceanExtension(out[:], sctx.MinSurfaceLevel, surfaceBiome, wx, wz, topY, minY, SeaLevel)
+		changedHeight = true
 	}
+	return changedHeight
 }
 
 // isFluidState reports whether a raw terrain block is a fluid (SurfaceSystem

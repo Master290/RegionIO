@@ -2,6 +2,8 @@ package world
 
 import (
 	"testing"
+
+	"regionio/internal/worldgen"
 )
 
 // TestSurfaceVariesByBiome is the load-bearing correctness check for surface
@@ -47,4 +49,69 @@ func centreSurfaceBlock(ch *Chunk) (uint16, bool) {
 		}
 	}
 	return 0, false
+}
+
+func TestErodedBadlandsAndFrozenOceanColumnPass(t *testing.T) {
+	od, err := worldgen.LoadOverworldFinalDensity(12345)
+	if err != nil {
+		t.Fatalf("LoadOverworldFinalDensity: %v", err)
+	}
+	rules, err := od.SurfaceRule()
+	if err != nil {
+		t.Fatalf("SurfaceRule: %v", err)
+	}
+	sctx := rules.NewContext()
+	var ws [16][16]int
+
+	// 1. eroded_badlands column pass: raises stone pillar and stripes it via bandlands rule.
+	foundBandedPillar := false
+	for x := 0; x < 200 && !foundBandedPillar; x += 2 {
+		for z := 0; z < 200 && !foundBandedPillar; z += 2 {
+			var col [WorldHeight]uint16
+			for y := MinY; y <= 63; y++ {
+				col[y-MinY] = StateStone
+			}
+			ws[0][0] = 63
+			changed := applySurfaceRule(od, rules, sctx, &col, x, z, 0, 0, &ws, "minecraft:eroded_badlands")
+			if !changed {
+				continue
+			}
+			topSolid, worldSurf := refreshColumnSurfaceHeight(&col)
+			if worldSurf > 63 && topSolid == worldSurf-MinY {
+				// Top of the raised hoodoo should be striped terracotta/orange_terracotta/etc., not raw stone.
+				if col[topSolid] != StateStone && col[topSolid] != StateAir {
+					foundBandedPillar = true
+				}
+			}
+		}
+	}
+	if !foundBandedPillar {
+		t.Error("expected eroded_badlands column pass to raise a pillar and stripe it with terracotta bands")
+	}
+
+	// 2. frozen_ocean column pass: places packed_ice / snow_block iceberg above and below sea level.
+	foundIceberg := false
+	for x := 0; x < 600 && !foundIceberg; x += 2 {
+		for z := 0; z < 600 && !foundIceberg; z += 2 {
+			var col [WorldHeight]uint16
+			for y := MinY; y <= 35; y++ {
+				col[y-MinY] = StateStone
+			}
+			for y := 36; y < SeaLevel; y++ {
+				col[y-MinY] = StateWater
+			}
+			ws[0][0] = SeaLevel - 1
+			changed := applySurfaceRule(od, rules, sctx, &col, x, z, 0, 0, &ws, "minecraft:frozen_ocean")
+			if !changed {
+				continue
+			}
+			topSolid, worldSurf := refreshColumnSurfaceHeight(&col)
+			if worldSurf > SeaLevel && topSolid == worldSurf-MinY {
+				foundIceberg = true
+			}
+		}
+	}
+	if !foundIceberg {
+		t.Error("expected frozen_ocean column pass to raise an iceberg above sea level and refresh surface height")
+	}
 }
