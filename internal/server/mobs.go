@@ -203,6 +203,9 @@ var (
 		MobTypePufferfish:          EntityTypePufferfishID,
 		MobTypeGuardian:            EntityTypeGuardianID,
 		MobTypeElderGuardian:       EntityTypeElderGuardianID,
+		MobTypeVex:                 EntityTypeVexID,
+		EntityTypeEvokerFangs:      EntityTypeEvokerFangsID,
+		MobTypeIllusioner:          EntityTypeIllusionerID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -391,6 +394,10 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultGuardianMaxHealth
 	case MobTypeElderGuardian:
 		return DefaultElderGuardianMaxHealth
+	case MobTypeVex:
+		return DefaultVexMaxHealth
+	case MobTypeIllusioner:
+		return DefaultIllusionerMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -450,6 +457,10 @@ func animalWanderSpeed(typeName string) float64 {
 		return GuardianSwimSpeed
 	case MobTypeElderGuardian:
 		return ElderGuardianSwimSpeed
+	case MobTypeVex:
+		return VexFlySpeed
+	case MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeIllusioner, MobTypeWitch, MobTypeRavager:
+		return RaiderWanderSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -578,6 +589,12 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	if norm == MobTypeElderGuardian {
 		return s.SpawnElderGuardian(normDim, x, y, z)
 	}
+	if norm == MobTypeVex {
+		return s.SpawnVex(normDim, x, y, z, 0)
+	}
+	if norm == MobTypeIllusioner {
+		return s.SpawnIllusioner(normDim, x, y, z)
+	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
 		return 0, errors.New("server: unknown mob entity type " + norm)
@@ -591,6 +608,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 		Z:         z,
 		OnGround:  true,
 	})
+	if IsRaiderMobType(norm) || IsIllagerMob(norm) {
+		s.ensureIllagerOrRaiderState(id, norm, false)
+	}
 	if IsTameableMob(norm) {
 		_ = s.ensureTamedMobState(id, norm)
 		switch norm {

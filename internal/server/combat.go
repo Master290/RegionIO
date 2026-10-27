@@ -759,6 +759,20 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundGuardianHurt, SoundSourceHostile
 	case MobTypeElderGuardian:
 		return SoundElderGuardianHurt, SoundSourceHostile
+	case MobTypePillager:
+		return SoundPillagerHurt, SoundSourceHostile
+	case MobTypeVindicator:
+		return SoundVindicatorHurt, SoundSourceHostile
+	case MobTypeEvoker:
+		return SoundEvokerHurt, SoundSourceHostile
+	case MobTypeIllusioner:
+		return SoundIllusionerHurt, SoundSourceHostile
+	case MobTypeVex:
+		return SoundVexHurt, SoundSourceHostile
+	case MobTypeWitch:
+		return SoundWitchHurt, SoundSourceHostile
+	case MobTypeRavager:
+		return SoundRavagerHurt, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -862,6 +876,20 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundGuardianDeath, SoundSourceHostile
 	case MobTypeElderGuardian:
 		return SoundElderGuardianDeath, SoundSourceHostile
+	case MobTypePillager:
+		return SoundPillagerDeath, SoundSourceHostile
+	case MobTypeVindicator:
+		return SoundVindicatorDeath, SoundSourceHostile
+	case MobTypeEvoker:
+		return SoundEvokerDeath, SoundSourceHostile
+	case MobTypeIllusioner:
+		return SoundIllusionerDeath, SoundSourceHostile
+	case MobTypeVex:
+		return SoundVexDeath, SoundSourceHostile
+	case MobTypeWitch:
+		return SoundWitchDeath, SoundSourceHostile
+	case MobTypeRavager:
+		return SoundRavagerDeath, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -1785,6 +1813,29 @@ func (s *Server) OnProjectileBlockImpact(
 	onFire := projectileEntityID > 0 && s.IsEntityOnFire(projectileEntityID)
 	if world.IsTNTBlock(blk) {
 		_, _ = s.IgniteTNTWithProjectile(normDim, bx, by, bz, onFire, projectileType, nil)
+	}
+	if world.IsChorusFlowerBlock(blk) {
+		if drop, hitOK, res := cache.HitChorusFlowerWithProjectile(bx, by, bz); hitOK {
+			for _, ch := range res.Changes {
+				s.broadcastMobBlockUpdate(normDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+			}
+			s.broadcastMobBlockUpdate(normDim, bx, by, bz, cache.GetBlock(bx, by, bz))
+			if !drop.IsEmpty() {
+				_, _ = s.SpawnItemEntityInDimension(normDim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, drop)
+			}
+		} else {
+			drops := world.ChorusBlockDrops(blk, true, nil)
+			_, res := cache.ApplyBlockWithUpdates(bx, by, bz, world.StateAir)
+			for _, ch := range res.Changes {
+				s.broadcastMobBlockUpdate(normDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+			}
+			s.broadcastMobBlockUpdate(normDim, bx, by, bz, world.StateAir)
+			for _, d := range drops {
+				if !d.IsEmpty() {
+					_, _ = s.SpawnItemEntityInDimension(normDim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, d)
+				}
+			}
+		}
 	}
 	_ = s.HitBlockWithProjectileMechanism(normDim, bx, by, bz, projectileType, projectileEntityID)
 	if canonicalResourceName(projectileType) == "minecraft:fireball" {

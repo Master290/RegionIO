@@ -194,6 +194,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickFoxesPandasAndOcelots(rng)
 		s.TickPiglinsHoglinsAndStriders(rng)
 		s.TickAquaticMobs(rng)
+		s.TickIllagersWitchesRavagersAndVexes(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -271,7 +272,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning || snapshot.TypeName == EntityTypeEvokerFangs {
 			continue
 		}
 		if IsStandardProjectileEntityType(snapshot.TypeName) {
@@ -285,7 +286,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 					bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
 					if by >= world.MinY && by < world.MinY+world.WorldHeight {
 						blk := cache.GetBlock(bx, by, bz)
-						if (!isPassableBlock(blk) && blk != world.StateWater) || world.IsWoodenButtonBlock(blk) || world.IsBellBlock(blk) {
+						if (!isPassableBlock(blk) && blk != world.StateWater) || world.IsWoodenButtonBlock(blk) || world.IsBellBlock(blk) || world.IsChorusFlowerBlock(blk) {
 							_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, snapshot.X, snapshot.Y, snapshot.Z, nx, ny, nz, snapshot.ID, snapshot.TypeName)
 							s.entities.Update(snapshot.ID, func(e *world.Entity) {
 								e.X, e.Y, e.Z = nx, ny, nz
@@ -314,7 +315,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee {
+		if snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true
