@@ -490,3 +490,184 @@ func TestGoatScreamingRamHornSnapGoatHornUseLongJumpAndMilking(t *testing.T) {
 		t.Fatal("expected goat horn on cooldown not to play again")
 	}
 }
+
+func TestAllayFrogTadpoleAxolotlPolish2612(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.DimensionChunks(dim)
+	rng := rand.New(rand.NewSource(2026))
+	surfaceY := float64(world.FlatSurfaceY + 1)
+
+	player, err := srv.RegisterPlayer(Profile{
+		Name: "SwampAdventurer",
+		UUID: OfflineUUID("SwampAdventurer"),
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(player, GameModeSurvival)
+	srv.SetPlayerTransform(player, 100.5, surfaceY, 100.5, 0, 0, true)
+
+	// 1. Allay stack size limits, wool occlusion on Note Block, anti-recollect delay, and death drops.
+	if got := AllayMaxInventoryCountForItem("minecraft:diamond_sword"); got != 1 {
+		t.Fatalf("AllayMaxInventoryCountForItem(diamond_sword) = %d, want 1", got)
+	}
+	if got := AllayMaxInventoryCountForItem("minecraft:ender_pearl"); got != 16 {
+		t.Fatalf("AllayMaxInventoryCountForItem(ender_pearl) = %d, want 16", got)
+	}
+	if got := AllayMaxInventoryCountForItem("minecraft:diamond"); got != 64 {
+		t.Fatalf("AllayMaxInventoryCountForItem(diamond) = %d, want 64", got)
+	}
+
+	allayID, err := srv.SpawnAllay(dim, 100.5, surfaceY+1.0, 102.5)
+	if err != nil {
+		t.Fatalf("SpawnAllay: %v", err)
+	}
+	// Place a note_block at (100, surfaceY+1, 106) and a white_wool block in between at (100, surfaceY+1, 104).
+	if nbState, ok := world.BlockStateByName(NoteBlockName, nil); ok {
+		cache.SetBlock(100, int(surfaceY)+1, 106, nbState)
+	}
+	if woolState, ok := world.BlockStateByName("minecraft:white_wool", nil); ok {
+		cache.SetBlock(100, int(surfaceY)+1, 104, woolState)
+	}
+	if bound := srv.OnNoteBlockPlayedForAllays(dim, 100, int(surfaceY)+1, 106); bound != 0 {
+		t.Fatalf("expected wool occlusion to block Allay note_block binding, got bound=%d", bound)
+	}
+	cache.SetBlock(100, int(surfaceY)+1, 104, world.StateAir)
+	if bound := srv.OnNoteBlockPlayedForAllays(dim, 100, int(surfaceY)+1, 106); bound != 1 {
+		t.Fatalf("expected Allay to bind to unoccluded note_block, got bound=%d", bound)
+	}
+
+	// Give Allay an emerald, let it collect 2 emeralds, and verify DropAllayInventoryOnDeath drops both mainhand and inventory.
+	hotbar0 := int(world.HotbarContainerOffset)
+	player.SetInventorySlot(hotbar0, world.NewNamedItemStack("minecraft:emerald", 2))
+	srv.InteractWithAllay(player, allayID)
+	emEntID, _ := srv.SpawnItemEntityInDimension(dim, 100.5, surfaceY+1.0, 102.5, world.NewNamedItemStack("minecraft:emerald", 2))
+	srv.Entities().Update(emEntID, func(e *world.Entity) { e.PickupDelay = 0 })
+	srv.TickAllays(rng)
+	droppedOnDeath := srv.DropAllayInventoryOnDeath(allayID)
+	if len(droppedOnDeath) != 2 {
+		t.Fatalf("DropAllayInventoryOnDeath dropped %d item stacks, want 2 (mainhand + collected)", len(droppedOnDeath))
+	}
+
+	// 2. Frog fall damage reduction (-5 HP), Magma Cube splitting (drops magma_cream -> size 1 -> Frog eats -> Froglight),
+	// and gravid Frog seeking water in TickFrogs.
+	if got := ComputeFrogFallDamage(7.0); got != 0 {
+		t.Fatalf("ComputeFrogFallDamage(7.0) = %v, want 0", got)
+	}
+	if got := ComputeFrogFallDamage(10.0); got != 2.0 {
+		t.Fatalf("ComputeFrogFallDamage(10.0) = %v, want 2.0", got)
+	}
+
+	medCubeID, err := srv.SpawnMagmaCube(dim, 110.5, surfaceY, 100.5, 2)
+	if err != nil {
+		t.Fatalf("SpawnMagmaCube(size=2): %v", err)
+	}
+	childCubes, cubeLoot := srv.SplitSlimeOrMagmaCubeOnDeath(medCubeID, rng)
+	if len(childCubes) < 2 || len(cubeLoot) != 1 {
+		t.Fatalf("SplitSlimeOrMagmaCubeOnDeath(size=2) = (children=%d, loot=%d), want (>=2, 1 magma_cream)", len(childCubes), len(cubeLoot))
+	}
+	if lootEnt := srv.Entities().Get(cubeLoot[0]); lootEnt == nil || lootEnt.Item.ResolvedID() != MagmaCreamItemID {
+		t.Fatalf("expected size-2 magma_cube death to drop %s, got %+v", MagmaCreamItemID, lootEnt)
+	}
+	warmFrogID, _ := srv.SpawnFrog(dim, 110.5, surfaceY, 101.0, FrogVariantWarm)
+	_, froglightName, ateSmall := srv.FrogTongueEatEntity(warmFrogID, childCubes[0])
+	if !ateSmall || froglightName != PearlescentFroglightItemID {
+		t.Fatalf("warm Frog eating split size-1 magma_cube = (%v, %q), want (true, %q)", ateSmall, froglightName, PearlescentFroglightItemID)
+	}
+
+	// Gravid frog seeks water 5 blocks away and lays frogspawn in TickFrogs.
+	cache.SetBlock(125, int(surfaceY)-1, 100, world.StateWater)
+	cache.SetBlock(125, int(surfaceY), 100, world.StateAir)
+	frogA, _ := srv.SpawnFrog(dim, 120.5, surfaceY, 100.5, FrogVariantTemperate)
+	frogB, _ := srv.SpawnFrog(dim, 121.0, surfaceY, 100.5, FrogVariantTemperate)
+	srv.SetPlayerTransform(player, 120.5, surfaceY, 100.5, 0, 0, true)
+	player.SetInventorySlot(hotbar0, world.NewNamedItemStack(SlimeBallItemID, 4))
+	srv.InteractWithFrog(player, frogA)
+	_, immediateSpawn := srv.InteractWithFrog(player, frogB)
+	if immediateSpawn {
+		t.Fatal("expected gravid frog 5 blocks from water to walk to water before laying frogspawn")
+	}
+	for i := 0; i < 80; i++ {
+		srv.TickFrogs(rng)
+	}
+	if world.BlockName(cache.GetBlock(125, int(surfaceY), 100)) != FrogspawnBlockName {
+		t.Fatalf("expected gravid frog to lay %s at water block (125, %d, 100), got %s",
+			FrogspawnBlockName, int(surfaceY), world.BlockName(cache.GetBlock(125, int(surfaceY), 100)))
+	}
+
+	// 3. Tadpole SynchedEntityData packet, bucket advancement, and fleeing from Axolotl.
+	tadID, _ := srv.SpawnTadpole(dim, 130.5, surfaceY, 100.5)
+	tadPkt := EncodeTadpoleEntityDataPacket(tadID, true)
+	decTadID, decFromBucket, err := DecodeTadpoleEntityDataPacket(protocol.NewReader(tadPkt))
+	if err != nil || decTadID != tadID || !decFromBucket {
+		t.Fatalf("DecodeTadpoleEntityDataPacket = (%d, %v, %v), want (%d, true, nil)", decTadID, decFromBucket, err, tadID)
+	}
+	srv.SetPlayerTransform(player, 130.5, surfaceY, 100.5, 0, 0, true)
+	player.SetInventorySlot(hotbar0, world.NewNamedItemStack(WaterBucketItemID, 1))
+	if !srv.CatchTadpoleInBucket(player, tadID) {
+		t.Fatal("CatchTadpoleInBucket failed")
+	}
+	if !player.HasCompletedAdvancement("minecraft:husbandry/tadpole_in_a_bucket") {
+		t.Fatal("expected catching tadpole in bucket to grant minecraft:husbandry/tadpole_in_a_bucket")
+	}
+
+	// 4. Axolotl water-only Play Dead, combat priority (hostile over closer passive), player-assist reward, breeding, and bucket advancement.
+	dryAxID, _ := srv.SpawnAxolotl(dim, 140.5, surfaceY, 100.5, AxolotlVariantLucy, false)
+	if srv.OnAxolotlDamaged(dryAxID, 8.0, rng) {
+		t.Fatal("expected Axolotl on dry land not to play dead when damaged")
+	}
+	cache.SetBlock(140, int(surfaceY), 100, world.StateWater)
+	if !srv.OnAxolotlDamaged(dryAxID, 8.0, rng) || !srv.IsAxolotlPlayingDead(dryAxID) {
+		t.Fatal("expected Axolotl in water to play dead when taking heavy damage")
+	}
+
+	// Combat priority: spawn a combat-ready Axolotl with a passive cod 1.2 blocks away and a hostile drowned 1.6 blocks away.
+	cache.SetBlock(150, int(surfaceY), 100, world.StateWater)
+	combatAxID, _ := srv.SpawnAxolotl(dim, 150.5, surfaceY, 100.5, AxolotlVariantCyan, false)
+	nearCodID := srv.Entities().Add(&world.Entity{
+		TypeID:    28,
+		TypeName:  "minecraft:cod",
+		Dimension: dim,
+		X:         151.5,
+		Y:         surfaceY,
+		Z:         100.5,
+		OnGround:  true,
+	})
+	srv.SetMobHealth(nearCodID, 6.0)
+	hostileDrownedID := srv.Entities().Add(&world.Entity{
+		TypeID:    37,
+		TypeName:  "minecraft:drowned",
+		Dimension: dim,
+		X:         150.5,
+		Y:         surfaceY,
+		Z:         102.0,
+		OnGround:  true,
+	})
+	srv.SetMobHealth(hostileDrownedID, 20.0)
+	srv.TickAxolotls(rng)
+	axSt, _ := srv.GetAxolotlState(combatAxID)
+	if axSt.LastTargetedMobID != hostileDrownedID {
+		t.Fatalf("expected Axolotl to prioritize hostile drowned (%d) over closer passive cod (%d), got target %d",
+			hostileDrownedID, nearCodID, axSt.LastTargetedMobID)
+	}
+
+	// Player finishes off the drowned that the Axolotl was targeting -> receives Regeneration I and Mining Fatigue removal.
+	srv.SetPlayerTransform(player, 150.5, surfaceY, 100.5, 0, 0, true)
+	srv.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectMiningFatigue, 400, 0))
+	if !srv.OnMobKilledNearAxolotls(hostileDrownedID, player) {
+		t.Fatal("expected OnMobKilledNearAxolotls to reward player who slew Axolotl's target")
+	}
+	if _, hasFatigue := player.PlayerEffect(EffectMiningFatigue); hasFatigue {
+		t.Fatal("expected Mining Fatigue to be removed by OnMobKilledNearAxolotls")
+	}
+
+	// Catching Axolotl in water bucket grants minecraft:husbandry/axolotl_in_a_bucket.
+	player.SetInventorySlot(hotbar0, world.NewNamedItemStack(WaterBucketItemID, 1))
+	if !srv.CatchAxolotlInBucket(player, combatAxID) {
+		t.Fatal("CatchAxolotlInBucket failed")
+	}
+	if !player.HasCompletedAdvancement("minecraft:husbandry/axolotl_in_a_bucket") {
+		t.Fatal("expected catching Axolotl in bucket to grant minecraft:husbandry/axolotl_in_a_bucket")
+	}
+}

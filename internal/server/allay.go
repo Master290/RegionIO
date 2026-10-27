@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -324,13 +325,14 @@ func (s *Server) NotifyJukeboxPlayingForAllays(dimension string, x, y, z int, pl
 
 // OnNoteBlockPlayedForAllays notifies all Allays within 16 blocks of (x, y, z)
 // in dimension that a `minecraft:note_block` was played, binding them to deliver
-// collected items to that note block for 30 seconds (600 ticks).
+// collected items to that note block for 30 seconds (600 ticks) unless occluded by wool.
 // (Can be called directly by Agent C's note_block code.)
 func (s *Server) OnNoteBlockPlayedForAllays(dimension string, x, y, z int) int {
 	if s == nil || s.entities == nil {
 		return 0
 	}
 	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
 	maxDistSq := AllayNoteBlockRange * AllayNoteBlockRange
 	cx, cy, cz := float64(x)+0.5, float64(y)+0.5, float64(z)+0.5
 	mgr := s.allayManager()
@@ -348,6 +350,9 @@ func (s *Server) OnNoteBlockPlayedForAllays(dimension string, x, y, z int) int {
 		if dx*dx+dy*dy+dz*dz > maxDistSq {
 			continue
 		}
+		if cache != nil && IsVibrationOccluded(cache.GetBlock, cx, cy, cz, ent.X, ent.Y+0.4, ent.Z) {
+			continue
+		}
 		st := s.ensureAllayState(ent.ID)
 		if st == nil {
 			continue
@@ -360,6 +365,83 @@ func (s *Server) OnNoteBlockPlayedForAllays(dimension string, x, y, z int) int {
 		boundCount++
 	}
 	return boundCount
+}
+
+// AllayMaxInventoryCountForItem returns the maximum number of items of itemID
+// an Allay can carry in its 1-slot internal inventory (1 for unstackable tools/
+// gear/potions/buckets, 16 for 16-stackable items like ender_pearl/snowball/egg,
+// or 64 for standard stackable items).
+func AllayMaxInventoryCountForItem(itemID string) int32 {
+	name := strings.TrimPrefix(canonicalResourceName(itemID), "minecraft:")
+	switch name {
+	case "ender_pearl", "snowball", "egg", "honey_bottle", "armor_stand", "written_book":
+		return 16
+	case "totem_of_undying", "shield", "elytra", "trident", "mace", "bow", "crossbow",
+		"fishing_rod", "carrot_on_a_stick", "warped_fungus_on_a_stick", "shears",
+		"flint_and_steel", "brush", "spyglass", "goat_horn", "potion", "splash_potion",
+		"lingering_potion", "water_bucket", "lava_bucket", "milk_bucket", "powder_snow_bucket",
+		"axolotl_bucket", "tadpole_bucket", "cod_bucket", "salmon_bucket",
+		"tropical_fish_bucket", "pufferfish_bucket", "cake", "saddle":
+		return 1
+	}
+	if strings.HasSuffix(name, "_sword") || strings.HasSuffix(name, "_pickaxe") ||
+		strings.HasSuffix(name, "_axe") || strings.HasSuffix(name, "_shovel") ||
+		strings.HasSuffix(name, "_hoe") || strings.HasSuffix(name, "_helmet") ||
+		strings.HasSuffix(name, "_chestplate") || strings.HasSuffix(name, "_leggings") ||
+		strings.HasSuffix(name, "_boots") || strings.HasSuffix(name, "_horse_armor") ||
+		strings.HasPrefix(name, "music_disc_") || strings.HasSuffix(name, "_shulker_box") ||
+		name == "shulker_box" {
+		return 1
+	}
+	if strings.HasSuffix(name, "_sign") || strings.HasSuffix(name, "_banner") {
+		return 16
+	}
+	return AllayInventoryMaxStack
+}
+
+func cloneAllayItemStackWithCount(src world.ItemStack, count int32) world.ItemStack {
+	if count <= 0 || src.IsEmpty() {
+		return world.ItemStack{}
+	}
+	if idStr := src.ResolvedID(); idStr != "" {
+		return world.NewNamedItemStack(idStr, count)
+	}
+	return world.NewItemStack(src.ResolvedItemID(), count)
+}
+
+// DropAllayInventoryOnDeath drops the Allay's main-hand HeldItem and any
+// collected items in its internal inventory when the Allay dies.
+func (s *Server) DropAllayInventoryOnDeath(entityID int32) []int32 {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return nil
+	}
+	ent := s.entities.Get(entityID)
+	mgr := s.allayManager()
+	mgr.mu.Lock()
+	st, ok := mgr.allays[entityID]
+	delete(mgr.allays, entityID)
+	if !ok || st == nil || st.HeldItem.IsEmpty() {
+		mgr.mu.Unlock()
+		return nil
+	}
+	held := st.HeldItem
+	collected := st.CollectedCount
+	mgr.mu.Unlock()
+
+	if ent == nil {
+		return nil
+	}
+	dim := ent.EffectiveDimension()
+	var dropped []int32
+	if id, _ := s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, cloneAllayItemStackWithCount(held, held.Count)); id > 0 {
+		dropped = append(dropped, id)
+	}
+	if collected > 0 {
+		if id, _ := s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, cloneAllayItemStackWithCount(held, collected)); id > 0 {
+			dropped = append(dropped, id)
+		}
+	}
+	return dropped
 }
 
 // DuplicateAllay duplicates a dancing Allay when given a `minecraft:amethyst_shard`,
@@ -473,7 +555,7 @@ func (s *Server) InteractWithAllay(session *PlayerSession, entityID int32) (hand
 			mgr.mu.Unlock()
 			return false, 0
 		}
-		given := world.NewItemStack(held.ResolvedItemID(), 1)
+		given := cloneAllayItemStackWithCount(held, 1)
 		st.HeldItem = given
 		st.LikedPlayerUUID = session.Profile.UUID
 		st.HasLikedPlayer = true
@@ -501,10 +583,10 @@ func (s *Server) InteractWithAllay(session *PlayerSession, entityID int32) (hand
 	mgr.mu.Unlock()
 
 	totalReturn := returnedItem.Count + extraCount
-	returnStack := world.NewItemStack(returnedItem.ResolvedItemID(), totalReturn)
+	returnStack := cloneAllayItemStackWithCount(returnedItem, totalReturn)
 	added, _ := session.AddItemToInventory(returnStack)
 	if rem := totalReturn - added; rem > 0 {
-		s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, world.NewItemStack(returnedItem.ResolvedItemID(), rem))
+		s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, cloneAllayItemStackWithCount(returnedItem, rem))
 	}
 
 	s.broadcastAllayEquipment(ent, world.ItemStack{})
@@ -632,14 +714,18 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 			continue
 		}
 		wantID := canonicalResourceName(snap.HeldItem.ResolvedID())
+		maxInv := AllayMaxInventoryCountForItem(wantID)
 
-		// Look for matching dropped item entities within 32 blocks if inventory has room.
-		if snap.CollectedCount < AllayInventoryMaxStack {
+		// Look for matching dropped item entities within 32 blocks if inventory has room and not on throw cooldown.
+		if snap.CollectedCount < maxInv && snap.DeliveryDelayTicks <= 0 {
 			var bestItem *world.Entity
 			bestDistSq := AllayPickupRange * AllayPickupRange
 			for j := range allEnts {
 				cand := &allEnts[j]
 				if !cand.IsItem() || cand.EffectiveDimension() != dim || cand.Item.IsEmpty() {
+					continue
+				}
+				if cand.PickupDelay > 0 && cand.ID == snap.LastDeliveredEntityID {
 					continue
 				}
 				if canonicalResourceName(cand.Item.ResolvedID()) != wantID {
@@ -658,7 +744,7 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 				dist := math.Sqrt(bestDistSq)
 				if dist <= 1.6 {
 					// Pick up the dropped item entity!
-					space := AllayInventoryMaxStack - snap.CollectedCount
+					space := maxInv - snap.CollectedCount
 					take := bestItem.Item.Count
 					if take > space {
 						take = space
@@ -678,7 +764,7 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 							s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
 								encodeRemoveEntitiesPacket(nil, []int32{bestItem.ID}))
 						} else {
-							remStack := world.NewItemStack(bestItem.Item.ResolvedItemID(), bestItem.Item.Count-take)
+							remStack := cloneAllayItemStackWithCount(bestItem.Item, bestItem.Item.Count-take)
 							s.entities.Update(bestItem.ID, func(e *world.Entity) {
 								e.Item = remStack
 							})
@@ -692,34 +778,39 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 			}
 		}
 
-		// 4. Deliver collected items to bound Note Block (priority) or LikedPlayer.
-		if snap.CollectedCount > 0 && snap.DeliveryDelayTicks <= 0 {
-			var targetX, targetY, targetZ float64
-			hasTarget := false
-			if snap.NoteBlockListenTicks > 0 && snap.NoteBlockDimension == dim {
-				targetX = float64(snap.NoteBlockPos[0]) + 0.5
-				targetY = float64(snap.NoteBlockPos[1]) + 1.0
-				targetZ = float64(snap.NoteBlockPos[2]) + 0.5
-				hasTarget = true
-			} else if snap.HasLikedPlayer {
-				if owner := s.findPlayerByUUID(snap.LikedPlayerUUID); owner != nil && !owner.IsDead() {
-					osnap := owner.Snapshot()
-					if world.NormalizeDimension(osnap.Dimension) == dim {
-						targetX, targetY, targetZ = osnap.X, osnap.Y+1.0, osnap.Z
-						hasTarget = true
-					}
+		// 4. Deliver collected items to bound Note Block (priority) or LikedPlayer,
+		// or follow LikedPlayer / bound Note Block when idle.
+		var targetX, targetY, targetZ float64
+		hasTarget := false
+		deliverToNoteBlock := false
+		if snap.NoteBlockListenTicks > 0 && snap.NoteBlockDimension == dim {
+			targetX = float64(snap.NoteBlockPos[0]) + 0.5
+			targetY = float64(snap.NoteBlockPos[1]) + 1.0
+			targetZ = float64(snap.NoteBlockPos[2]) + 0.5
+			hasTarget = true
+			deliverToNoteBlock = true
+		} else if snap.HasLikedPlayer {
+			if owner := s.findPlayerByUUID(snap.LikedPlayerUUID); owner != nil && !owner.IsDead() {
+				osnap := owner.Snapshot()
+				if world.NormalizeDimension(osnap.Dimension) == dim {
+					targetX, targetY, targetZ = osnap.X, osnap.Y+1.0, osnap.Z
+					hasTarget = true
 				}
 			}
-			if hasTarget {
-				dx := targetX - ent.X
-				dy := targetY - ent.Y
-				dz := targetZ - ent.Z
-				dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+		}
+		if hasTarget {
+			dx := targetX - ent.X
+			dy := targetY - ent.Y
+			dz := targetZ - ent.Z
+			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+			if snap.CollectedCount > 0 && snap.DeliveryDelayTicks <= 0 {
 				if dist <= AllayDeliveryStopDist {
-					s.throwAllayCollectedItems(ent, st, targetX, targetY, targetZ)
+					s.throwAllayCollectedItems(ent, st, targetX, targetY, targetZ, deliverToNoteBlock)
 				} else {
 					s.flyAllayToward(ent, targetX, targetY, targetZ)
 				}
+			} else if snap.CollectedCount == 0 && dist > 4.0 && dist <= AllayFollowPlayerRange {
+				s.flyAllayToward(ent, targetX, targetY, targetZ)
 			}
 		}
 	}
@@ -753,7 +844,7 @@ func (s *Server) flyAllayToward(ent *world.Entity, tx, ty, tz float64) {
 	})
 }
 
-func (s *Server) throwAllayCollectedItems(ent *world.Entity, st *AllayBehaviorState, tx, ty, tz float64) {
+func (s *Server) throwAllayCollectedItems(ent *world.Entity, st *AllayBehaviorState, tx, ty, tz float64, toNoteBlock bool) {
 	if s == nil || ent == nil || st == nil {
 		return
 	}
@@ -763,8 +854,11 @@ func (s *Server) throwAllayCollectedItems(ent *world.Entity, st *AllayBehaviorSt
 		mgr.mu.Unlock()
 		return
 	}
-	dropStack := world.NewItemStack(st.HeldItem.ResolvedItemID(), st.CollectedCount)
+	dropStack := cloneAllayItemStackWithCount(st.HeldItem, st.CollectedCount)
 	st.CollectedCount = 0
+	st.DeliveryDelayTicks = AllayThrowCollectDelayTicks
+	hasLiked := st.HasLikedPlayer
+	likedUUID := st.LikedPlayerUUID
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
@@ -772,6 +866,15 @@ func (s *Server) throwAllayCollectedItems(ent *world.Entity, st *AllayBehaviorSt
 	mgr.mu.Lock()
 	st.LastDeliveredEntityID = dropID
 	mgr.mu.Unlock()
+
+	if hasLiked {
+		if owner := s.findPlayerByUUID(likedUUID); owner != nil && !owner.IsDead() {
+			s.GrantAdvancement(owner, "minecraft:husbandry/allay_deliver_item_to_player")
+			if toNoteBlock {
+				s.GrantAdvancement(owner, "minecraft:husbandry/allay_deliver_cake_to_note_block")
+			}
+		}
+	}
 
 	cp := ent.ChunkPos()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,

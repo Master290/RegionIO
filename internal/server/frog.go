@@ -43,8 +43,9 @@ const (
 	FrogVariantTemperate int32 = 1 // "minecraft:temperate" (Orange Frog -> ochre_froglight)
 	FrogVariantWarm      int32 = 2 // "minecraft:warm" (White Frog -> pearlescent_froglight)
 
-	// Items & blocks associated with Frogs.
+	// Items & blocks associated with Frogs, Slimes, and Magma Cubes.
 	SlimeBallItemID            = "minecraft:slime_ball"
+	MagmaCreamItemID           = "minecraft:magma_cream"
 	OchreFroglightItemID       = "minecraft:ochre_froglight"
 	VerdantFroglightItemID     = "minecraft:verdant_froglight"
 	PearlescentFroglightItemID = "minecraft:pearlescent_froglight"
@@ -560,6 +561,113 @@ func (s *Server) FrogTongueEatEntity(frogID, targetEntityID int32) (droppedItemE
 	return droppedItemEntityID, droppedItemName, true
 }
 
+// ComputeFrogFallDamage computes fall damage for a Frog in vanilla 26.1.2,
+// applying the -5.0 HP fall damage reduction (`max(0, ceil(fallDistance - 3) - 5)`).
+func ComputeFrogFallDamage(fallDistance float64) float32 {
+	raw := float32(math.Ceil(fallDistance-3.0)) - FrogFallDamageReduction
+	if raw <= 0 {
+		return 0
+	}
+	return raw
+}
+
+// ResolveSlimeOrMagmaCubeLoot returns the canonical item ID dropped when a
+// `minecraft:slime` or `minecraft:magma_cube` of size is killed or eaten by a Frog:
+//   - Small (size == 1) magma_cube eaten by a Frog -> variant Froglight (`ochre_froglight`, `verdant_froglight`, `pearlescent_froglight`)
+//   - Small (size == 1) slime eaten by a Frog or killed normally -> `minecraft:slime_ball`
+//   - Medium/large (size > 1) magma_cube killed normally -> `minecraft:magma_cream`
+func ResolveSlimeOrMagmaCubeLoot(typeName string, size int, eatenByFrog bool, frogVariant int32) string {
+	norm := canonicalResourceName(typeName)
+	if norm == MobTypeMagmaCube {
+		if eatenByFrog && size <= 1 {
+			return FroglightItemForVariant(frogVariant)
+		}
+		if !eatenByFrog && size > 1 {
+			return MagmaCreamItemID
+		}
+		return ""
+	}
+	if norm == MobTypeSlime {
+		if size <= 1 {
+			return SlimeBallItemID
+		}
+	}
+	return ""
+}
+
+// SplitSlimeOrMagmaCubeOnDeath handles the death of a `minecraft:slime` or
+// `minecraft:magma_cube` in normal combat:
+//   - If size > 1 (e.g., 4 -> 2, or 2 -> 1), removes the parent entity and
+//     spawns 2..4 child slimes/magma cubes of size/2 around its position; for
+//     `minecraft:magma_cube` with size > 1, also drops `minecraft:magma_cream`.
+//   - If size == 1, removes the entity and drops `minecraft:slime_ball` for a small slime.
+func (s *Server) SplitSlimeOrMagmaCubeOnDeath(entityID int32, rng *rand.Rand) (childIDs []int32, droppedItemIDs []int32) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return nil, nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return nil, nil
+	}
+	typeName := canonicalResourceName(ent.TypeName)
+	if typeName != MobTypeSlime && typeName != MobTypeMagmaCube {
+		return nil, nil
+	}
+	size := s.SlimeSize(entityID)
+	mgr := s.frogManager()
+	mgr.mu.Lock()
+	delete(mgr.slimeSizes, entityID)
+	mgr.mu.Unlock()
+
+	dim := ent.EffectiveDimension()
+	cp := ent.ChunkPos()
+	x, y, z := ent.X, ent.Y, ent.Z
+
+	s.entities.Remove(entityID)
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+		encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+
+	tr := s.entityTracker()
+	tr.mu.Lock()
+	delete(tr.mobStates, entityID)
+	tr.mu.Unlock()
+
+	lootID := ResolveSlimeOrMagmaCubeLoot(typeName, size, false, FrogVariantTemperate)
+	if lootID != "" {
+		dropStack := world.NewNamedItemStack(lootID, 1)
+		if !dropStack.IsEmpty() {
+			if itemEntID, _ := s.SpawnItemEntityInDimension(dim, x, y+0.25, z, dropStack); itemEntID > 0 {
+				droppedItemIDs = append(droppedItemIDs, itemEntID)
+			}
+		}
+	}
+
+	if size > 1 {
+		nextSize := size / 2
+		if nextSize < 1 {
+			nextSize = 1
+		}
+		count := 2
+		if rng != nil {
+			count = 2 + rng.Intn(3) // 2..4 children
+		} else {
+			count = 3
+		}
+		fallbackID := EntityTypeSlimeID
+		if typeName == MobTypeMagmaCube {
+			fallbackID = EntityTypeMagmaCubeID
+		}
+		for i := 0; i < count; i++ {
+			ox := float64((i%2)*2-1) * 0.35
+			oz := float64(((i/2)%2)*2-1) * 0.35
+			if cid, err := s.spawnSlimeOrMagmaCube(dim, x+ox, y, z+oz, nextSize, typeName, fallbackID); err == nil && cid > 0 {
+				childIDs = append(childIDs, cid)
+			}
+		}
+	}
+	return childIDs, droppedItemIDs
+}
+
 // ExecuteFrogJump performs a Frog hop/long-jump along its current facing yaw.
 func (s *Server) ExecuteFrogJump(frogID int32) (vx, vy, vz float64, jumped bool) {
 	if s == nil || s.entities == nil {
@@ -747,14 +855,53 @@ func (s *Server) InteractWithFrog(session *PlayerSession, entityID int32) (handl
 	bx := int(math.Floor(ent.X))
 	by := int(math.Floor(ent.Y))
 	bz := int(math.Floor(ent.Z))
+	if wx, wy, wz, foundWater := s.findNearbyFrogspawnWaterPos(dim, bx, by, bz, 3); foundWater {
+		bx, by, bz = wx, wy, wz
+	} else if _, _, _, distantWater := s.findNearbyFrogspawnWaterPos(dim, bx, by, bz, 8); distantWater {
+		// Gravid frog will walk/hop to the nearby water block in TickFrogs before laying frogspawn.
+		s.GrantCriterion(session, "minecraft:husbandry/breed_an_animal", "bred")
+		return true, false
+	}
 	if s.PlaceFrogspawn(dim, bx, by, bz, nil) {
 		mgr.mu.Lock()
 		st.Gravid = false
 		mgr.mu.Unlock()
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundFrogLaySpawn, SoundSourceNeutral, float64(bx)+0.5, float64(by), float64(bz)+0.5, 1.0, 1.0, 0))
 		s.GrantCriterion(session, "minecraft:husbandry/breed_an_animal", "bred")
 		return true, true
 	}
 	return true, false
+}
+
+func (s *Server) findNearbyFrogspawnWaterPos(dim string, cx, cy, cz, radius int) (wx, wy, wz int, ok bool) {
+	cache := s.DimensionChunks(world.NormalizeDimension(dim))
+	if cache == nil {
+		return 0, 0, 0, false
+	}
+	bestDistSq := (radius*2 + 1) * (radius*2 + 1) * 3
+	for dy := -2; dy <= 2; dy++ {
+		y := cy + dy
+		if y <= world.MinY || y >= world.MinY+world.WorldHeight {
+			continue
+		}
+		for dz := -radius; dz <= radius; dz++ {
+			for dx := -radius; dx <= radius; dx++ {
+				x := cx + dx
+				z := cz + dz
+				if cache.GetBlock(x, y-1, z) == world.StateWater && cache.GetBlock(x, y, z) == world.StateAir {
+					dSq := dx*dx + dy*dy + dz*dz
+					if dSq < bestDistSq {
+						bestDistSq = dSq
+						wx, wy, wz = x, y, z
+						ok = true
+					}
+				}
+			}
+		}
+	}
+	return wx, wy, wz, ok
 }
 
 // TickFrogs advances all `minecraft:frog` entities and tracked `minecraft:frogspawn`
@@ -782,6 +929,22 @@ func (s *Server) TickFrogs(rng *rand.Rand) {
 		if st.JumpCooldownTicks > 0 {
 			st.JumpCooldownTicks--
 		}
+		if st.CroakTicks > 0 {
+			st.CroakTicks--
+			if st.CroakTicks == 0 && st.Pose == PoseCroaking {
+				st.Pose = PoseStanding
+				snap := *st
+				mgr.mu.Unlock()
+				s.broadcastFrogState(ent, snap)
+				continue
+			}
+		} else if st.Pose == PoseLongJumping && ent.OnGround {
+			st.Pose = PoseStanding
+			snap := *st
+			mgr.mu.Unlock()
+			s.broadcastFrogState(ent, snap)
+			mgr.mu.Lock()
+		}
 		if st.TongueAnimTicks > 0 {
 			st.TongueAnimTicks--
 			if st.TongueAnimTicks == 0 {
@@ -793,15 +956,52 @@ func (s *Server) TickFrogs(rng *rand.Rand) {
 				continue
 			}
 		}
+		isGravid := st.Gravid
 		canTongue := st.TongueCooldownTicks <= 0
 		mgr.mu.Unlock()
+
+		dim := ent.EffectiveDimension()
+
+		// 1. Gravid frog seeks water surface within 8 blocks to lay frogspawn.
+		if isGravid {
+			bx := int(math.Floor(ent.X))
+			by := int(math.Floor(ent.Y))
+			bz := int(math.Floor(ent.Z))
+			if wx, wy, wz, found := s.findNearbyFrogspawnWaterPos(dim, bx, by, bz, 8); found {
+				tx := float64(wx) + 0.5
+				tz := float64(wz) + 0.5
+				dx := tx - ent.X
+				dz := tz - ent.Z
+				horiz := math.Hypot(dx, dz)
+				if horiz <= 1.8 {
+					if s.PlaceFrogspawn(dim, wx, wy, wz, rng) {
+						mgr.mu.Lock()
+						st.Gravid = false
+						mgr.mu.Unlock()
+						cp := ent.ChunkPos()
+						s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+							EncodeSoundPacket(SoundFrogLaySpawn, SoundSourceNeutral, tx, float64(wy), tz, 1.0, 1.0, 0))
+					}
+				} else {
+					nx := ent.X + (dx/horiz)*FrogChaseSpeed
+					nz := ent.Z + (dz/horiz)*FrogChaseSpeed
+					yaw := yawToward(dx, dz)
+					s.entities.Update(ent.ID, func(e *world.Entity) {
+						e.X = nx
+						e.Z = nz
+						e.Yaw = yaw
+						e.HeadYaw = yaw
+					})
+				}
+				continue
+			}
+		}
 
 		if !canTongue {
 			continue
 		}
 
-		// Search for small (size == 1) slime or magma_cube within FrogPreyChaseRange.
-		dim := ent.EffectiveDimension()
+		// 2. Search for small (size == 1) slime or magma_cube within FrogPreyChaseRange.
 		var bestPrey *world.Entity
 		bestDistSq := FrogPreyChaseRange * FrogPreyChaseRange
 		for j := range allEnts {
@@ -838,6 +1038,37 @@ func (s *Server) TickFrogs(rng *rand.Rand) {
 						e.HeadYaw = yaw
 					})
 				}
+			}
+			continue
+		}
+
+		// 3. Follow nearby player holding slime_ball within 10 blocks.
+		for _, sess := range s.onlinePlayersSnapshot() {
+			if sess == nil || sess.IsDead() {
+				continue
+			}
+			ps := sess.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeSpectator {
+				continue
+			}
+			held := sess.HeldItem()
+			if held.IsEmpty() || canonicalResourceName(held.ResolvedID()) != SlimeBallItemID {
+				continue
+			}
+			dx := ps.X - ent.X
+			dz := ps.Z - ent.Z
+			horiz := math.Hypot(dx, dz)
+			if horiz > 1.8 && horiz <= 10.0 {
+				nx := ent.X + (dx/horiz)*FrogWanderSpeed
+				nz := ent.Z + (dz/horiz)*FrogWanderSpeed
+				yaw := yawToward(dx, dz)
+				s.entities.Update(ent.ID, func(e *world.Entity) {
+					e.X = nx
+					e.Z = nz
+					e.Yaw = yaw
+					e.HeadYaw = yaw
+				})
+				break
 			}
 		}
 	}

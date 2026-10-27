@@ -340,9 +340,30 @@ func (s *Server) TriggerAxolotlPlayDead(entityID int32) bool {
 	return true
 }
 
+// IsAxolotlInWater reports whether the Axolotl with entityID is currently in water.
+func (s *Server) IsAxolotlInWater(entityID int32) bool {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return false
+	}
+	cache := s.DimensionChunks(ent.EffectiveDimension())
+	if cache == nil {
+		return true
+	}
+	bx := int(math.Floor(ent.X))
+	by := int(math.Floor(ent.Y))
+	bz := int(math.Floor(ent.Z))
+	return cache.GetBlock(bx, by, bz) == world.StateWater ||
+		cache.GetBlock(bx, by-1, bz) == world.StateWater ||
+		cache.FluidHeightAt(bx, by, bz) > 0
+}
+
 // OnAxolotlDamaged is invoked when an Axolotl takes damage; in vanilla 26.1.2,
-// if the Axolotl is damaged in water (or drops below 50% HP / rng 1-in-3), it
-// plays dead for 200 ticks and regenerates health.
+// if the Axolotl is damaged in water and drops below 50% HP, takes > 2.0 damage,
+// or passes a 1-in-3 random roll, it plays dead for 200 ticks and regenerates health.
 func (s *Server) OnAxolotlDamaged(entityID int32, damage float32, rng *rand.Rand) bool {
 	if s == nil || s.entities == nil || damage <= 0 {
 		return false
@@ -355,12 +376,17 @@ func (s *Server) OnAxolotlDamaged(entityID int32, damage float32, rng *rand.Rand
 	if curHP <= 0 {
 		return false
 	}
-	shouldPlayDead := curHP <= DefaultAxolotlMaxHealth*0.5 || damage >= curHP
-	if !shouldPlayDead && rng != nil && rng.Intn(3) == 0 {
-		shouldPlayDead = true
+	if !s.IsAxolotlInWater(entityID) {
+		return false
+	}
+	shouldPlayDead := curHP <= DefaultAxolotlMaxHealth*0.5 || damage > 2.0 || damage >= curHP
+	if !shouldPlayDead {
+		if rng == nil || rng.Intn(3) == 0 {
+			shouldPlayDead = true
+		}
 	}
 	if !shouldPlayDead {
-		shouldPlayDead = true
+		return false
 	}
 	return s.TriggerAxolotlPlayDead(entityID)
 }
@@ -383,7 +409,47 @@ func (s *Server) GrantAxolotlPlayerSupport(axolotlID int32, player *PlayerSessio
 	}
 	s.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectRegeneration, dur, 0))
 	s.RemovePlayerEffect(player, EffectMiningFatigue)
+	s.GrantAdvancement(player, "minecraft:husbandry/kill_axolotl_target")
 	return true
+}
+
+// OnMobKilledNearAxolotls checks whether any Axolotl within 20 blocks was
+// actively fighting mobID when killer slew it; if so, grants the Axolotl combat
+// assistance reward (Regeneration I + removal of Mining Fatigue) to killer.
+func (s *Server) OnMobKilledNearAxolotls(mobID int32, killer *PlayerSession) bool {
+	if s == nil || s.entities == nil || mobID <= 0 || killer == nil || killer.IsDead() {
+		return false
+	}
+	ps := killer.Snapshot()
+	dim := world.NormalizeDimension(ps.Dimension)
+	maxDistSq := AxolotlPlayerSupportRange * AxolotlPlayerSupportRange
+	mgr := s.axolotlManager()
+
+	var rewarded bool
+	for _, ent := range s.entities.AppendAll(nil) {
+		if canonicalResourceName(ent.TypeName) != MobTypeAxolotl || ent.EffectiveDimension() != dim {
+			continue
+		}
+		dx := ps.X - ent.X
+		dy := ps.Y - ent.Y
+		dz := ps.Z - ent.Z
+		if dx*dx+dy*dy+dz*dz > maxDistSq {
+			continue
+		}
+		mgr.mu.Lock()
+		st := mgr.axolotls[ent.ID]
+		wasTargeting := st != nil && st.LastTargetedMobID == mobID
+		if wasTargeting {
+			st.LastTargetedMobID = 0
+		}
+		mgr.mu.Unlock()
+		if wasTargeting {
+			if s.GrantAxolotlPlayerSupport(ent.ID, killer) {
+				rewarded = true
+			}
+		}
+	}
+	return rewarded
 }
 
 // AxolotlAttackAquaticMob performs an Axolotl melee attack (2.0 damage) against
@@ -507,6 +573,7 @@ func (s *Server) CatchAxolotlInBucket(session *PlayerSession, entityID int32) bo
 	} else {
 		_, _ = session.AddItemToInventory(axBucket)
 	}
+	s.TriggerItemAcquired(session, axBucket)
 
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundBucketFillAxolotl, SoundSourceNeutral, x, y, z, 1.0, 1.0, 0))
@@ -654,10 +721,25 @@ func (s *Server) InteractWithAxolotl(session *PlayerSession, entityID int32) (ha
 	replaceWithWaterBucket()
 
 	stA, _ := s.GetAxolotlState(entityID)
+	parentBVariant := stA.Variant
+	for _, other := range s.entities.AppendAll(nil) {
+		if other.ID == entityID || canonicalResourceName(other.TypeName) != MobTypeAxolotl || other.EffectiveDimension() != ent.EffectiveDimension() {
+			continue
+		}
+		odx := other.X - ent.X
+		ody := other.Y - ent.Y
+		odz := other.Z - ent.Z
+		if odx*odx+ody*ody+odz*odz <= AnimalBreedRange*AnimalBreedRange && s.MobInLoveTicks(other.ID) > 0 {
+			if stB, ok := s.GetAxolotlState(other.ID); ok {
+				parentBVariant = stB.Variant
+			}
+			break
+		}
+	}
 	babyID, bred := s.TryBreedMobWithNearbyMate(entityID, AnimalBreedRange, nil)
 	if bred && babyID > 0 {
 		// Assign inherited or rare-blue variant to the baby Axolotl.
-		childVar := RollAxolotlOffspringVariant(stA.Variant, stA.Variant, nil)
+		childVar := RollAxolotlOffspringVariant(stA.Variant, parentBVariant, nil)
 		childSt := s.ensureAxolotlState(babyID, childVar)
 		mgr := s.axolotlManager()
 		mgr.mu.Lock()
@@ -727,7 +809,18 @@ func (s *Server) TickAxolotls(rng *rand.Rand) {
 		}
 		canAttack := st.AttackCooldown <= 0
 		canHuntPassive := st.PassiveHuntCooldown <= 0
+		inWater := s.IsAxolotlInWater(ent.ID)
+		if inWater {
+			st.OutOfWaterTicks = 0
+		} else {
+			st.OutOfWaterTicks++
+		}
+		outTicks := st.OutOfWaterTicks
 		mgr.mu.Unlock()
+
+		if !inWater && outTicks > AxolotlMaxOutOfWaterTicks && outTicks%20 == 0 && s.MobHealth(ent.ID) > 1.0 {
+			_ = s.applyDamageToMob(ent, 1.0, nil, 0, false, true)
+		}
 
 		if !canAttack {
 			continue
@@ -784,6 +877,40 @@ func (s *Server) TickAxolotls(rng *rand.Rand) {
 					e.Yaw = yaw
 					e.HeadYaw = yaw
 				})
+			}
+			continue
+		}
+
+		// Follow nearby player holding tropical_fish_bucket within 10 blocks.
+		for _, sess := range s.onlinePlayersSnapshot() {
+			if sess == nil || sess.IsDead() {
+				continue
+			}
+			ps := sess.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeSpectator {
+				continue
+			}
+			held := sess.HeldItem()
+			if held.IsEmpty() || canonicalResourceName(held.ResolvedID()) != TropicalFishBucketItemID {
+				continue
+			}
+			dx := ps.X - ent.X
+			dy := ps.Y - ent.Y
+			dz := ps.Z - ent.Z
+			dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+			if dist > 1.8 && dist <= 10.0 {
+				nx := ent.X + (dx/dist)*AxolotlSwimSpeed
+				ny := ent.Y + (dy/dist)*AxolotlSwimSpeed
+				nz := ent.Z + (dz/dist)*AxolotlSwimSpeed
+				yaw := yawToward(dx, dz)
+				s.entities.Update(ent.ID, func(e *world.Entity) {
+					e.X = nx
+					e.Y = ny
+					e.Z = nz
+					e.Yaw = yaw
+					e.HeadYaw = yaw
+				})
+				break
 			}
 		}
 	}

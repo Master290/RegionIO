@@ -330,10 +330,53 @@ func (s *Server) CatchTadpoleInBucket(session *PlayerSession, entityID int32) bo
 	} else {
 		_, _ = session.AddItemToInventory(tadpoleBucket)
 	}
+	s.TriggerItemAcquired(session, tadpoleBucket)
 
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundBucketFillTadpole, SoundSourceNeutral, x, y, z, 1.0, 1.0, 0))
 	return true
+}
+
+// EncodeTadpoleEntityDataPacket encodes a ClientboundSetEntityDataPacket (0x63)
+// for a `minecraft:tadpole` entity with its FROM_BUCKET (index 16, BOOLEAN) flag.
+func EncodeTadpoleEntityDataPacket(entityID int32, fromBucket bool) []byte {
+	w := protocol.NewWriter(12)
+	w.VarInt(entityID)
+	w.Byte(EntityDataTadpoleFromBucketID)
+	w.VarInt(EntityDataSerializerBool)
+	w.Bool(fromBucket)
+	w.Byte(0xFF)
+	return w.Bytes()
+}
+
+// DecodeTadpoleEntityDataPacket decodes a ClientboundSetEntityDataPacket (0x63)
+// produced by EncodeTadpoleEntityDataPacket.
+func DecodeTadpoleEntityDataPacket(r *protocol.Reader) (entityID int32, fromBucket bool, err error) {
+	entityID, err = r.VarInt()
+	if err != nil {
+		return 0, false, err
+	}
+	for {
+		idx, err := r.ReadByte()
+		if err != nil {
+			return 0, false, err
+		}
+		if idx == 0xFF {
+			break
+		}
+		ser, err := r.VarInt()
+		if err != nil {
+			return 0, false, err
+		}
+		if idx != EntityDataTadpoleFromBucketID || ser != EntityDataSerializerBool {
+			return 0, false, errors.New("tadpole: unexpected SynchedEntityData entry")
+		}
+		fromBucket, err = r.Bool()
+		if err != nil {
+			return 0, false, err
+		}
+	}
+	return entityID, fromBucket, nil
 }
 
 // ReleaseTadpoleFromBucket empties a `minecraft:tadpole_bucket` held by session
@@ -380,6 +423,8 @@ func (s *Server) ReleaseTadpoleFromBucket(session *PlayerSession, dimension stri
 
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
+	s.BroadcastDimensionChunk(normDim, cx, cz, PlaySetEntityDataCB,
+		EncodeTadpoleEntityDataPacket(tid, true))
 	s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket(SoundBucketEmptyTadpole, SoundSourceNeutral, float64(x)+0.5, float64(y), float64(z)+0.5, 1.0, 1.0, 0))
 	return tid, true
@@ -451,21 +496,98 @@ func (s *Server) TickTadpoles(rng *rand.Rand) {
 			continue
 		}
 
-		// Simple water-seeking / flopping check.
+		// Water check, flopping out of water, fleeing from Axolotls, and following slime_ball players.
 		dim := ent.EffectiveDimension()
 		cache := s.DimensionChunks(dim)
+		inWater := false
 		if cache != nil {
 			bx := int(math.Floor(ent.X))
 			by := int(math.Floor(ent.Y))
 			bz := int(math.Floor(ent.Z))
-			inWater := cache.GetBlock(bx, by, bz) == world.StateWater || cache.GetBlock(bx, by-1, bz) == world.StateWater
+			inWater = cache.GetBlock(bx, by, bz) == world.StateWater ||
+				cache.GetBlock(bx, by-1, bz) == world.StateWater ||
+				cache.FluidHeightAt(bx, by, bz) > 0
 			mgr.mu.Lock()
 			if inWater {
 				st.OutOfWaterTicks = 0
 			} else {
 				st.OutOfWaterTicks++
 			}
+			outTicks := st.OutOfWaterTicks
 			mgr.mu.Unlock()
+
+			if !inWater {
+				if outTicks%10 == 0 {
+					cp := ent.ChunkPos()
+					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+						EncodeSoundPacket(SoundTadpoleFlop, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 0.6, 1.0, 0))
+				}
+				if outTicks > TadpoleMaxOutOfWaterTicks && outTicks%20 == 0 && s.MobHealth(ent.ID) > 1.0 {
+					_ = s.applyDamageToMob(ent, 1.0, nil, 0, false, true)
+				}
+			}
+		}
+
+		// Flee from nearby Axolotls within 8 blocks.
+		var nearestAx *world.Entity
+		bestAxDistSq := 64.0
+		for j := range allEnts {
+			cand := &allEnts[j]
+			if cand.ID == ent.ID || cand.EffectiveDimension() != dim || canonicalResourceName(cand.TypeName) != MobTypeAxolotl {
+				continue
+			}
+			dx := cand.X - ent.X
+			dz := cand.Z - ent.Z
+			dSq := dx*dx + dz*dz
+			if dSq < bestAxDistSq {
+				bestAxDistSq = dSq
+				nearestAx = cand
+			}
+		}
+		if nearestAx != nil && bestAxDistSq > 1e-4 {
+			dist := math.Sqrt(bestAxDistSq)
+			fx := (ent.X - nearestAx.X) / dist
+			fz := (ent.Z - nearestAx.Z) / dist
+			nx := ent.X + fx*(TadpoleSwimSpeed*1.25)
+			nz := ent.Z + fz*(TadpoleSwimSpeed*1.25)
+			yaw := yawToward(fx, fz)
+			s.entities.Update(ent.ID, func(e *world.Entity) {
+				e.X = nx
+				e.Z = nz
+				e.Yaw = yaw
+				e.HeadYaw = yaw
+			})
+			continue
+		}
+
+		// Follow nearby player holding slime_ball within 10 blocks.
+		for _, sess := range s.onlinePlayersSnapshot() {
+			if sess == nil || sess.IsDead() {
+				continue
+			}
+			ps := sess.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeSpectator {
+				continue
+			}
+			held := sess.HeldItem()
+			if held.IsEmpty() || canonicalResourceName(held.ResolvedID()) != SlimeBallItemID {
+				continue
+			}
+			dx := ps.X - ent.X
+			dz := ps.Z - ent.Z
+			horiz := math.Hypot(dx, dz)
+			if horiz > 1.4 && horiz <= 10.0 {
+				nx := ent.X + (dx/horiz)*TadpoleSwimSpeed
+				nz := ent.Z + (dz/horiz)*TadpoleSwimSpeed
+				yaw := yawToward(dx, dz)
+				s.entities.Update(ent.ID, func(e *world.Entity) {
+					e.X = nx
+					e.Z = nz
+					e.Yaw = yaw
+					e.HeadYaw = yaw
+				})
+				break
+			}
 		}
 	}
 }
