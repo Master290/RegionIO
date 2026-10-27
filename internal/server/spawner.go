@@ -195,6 +195,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickPiglinsHoglinsAndStriders(rng)
 		s.TickAquaticMobs(rng)
 		s.TickIllagersWitchesRavagersAndVexes(rng)
+		s.TickUndeadAndSilverfish(rng)
 		s.TickMobsInCauldrons()
 	}
 

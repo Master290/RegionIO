@@ -628,9 +628,19 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 			return []world.ItemStack{stack}
 		}
 	case MobTypeWitherSkeleton:
-		if stack := world.NewNamedItemStack("minecraft:bone", 1); !stack.IsEmpty() {
+		return RollWitherSkeletonDeathLoot(rng, 0, false)
+	case MobTypeHusk:
+		count := int32(1)
+		if rng != nil {
+			count = int32(1 + rng.Intn(2))
+		}
+		if stack := world.NewNamedItemStack("minecraft:rotten_flesh", count); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeDrowned:
+		return RollDrownedDeathLoot(rng, 0, true, UndeadGearState{})
+	case MobTypeStray:
+		return RollStrayDeathLoot(rng, true)
 	case MobTypeWarden:
 		if stack := world.NewNamedItemStack(SculkCatalystItemID, 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
@@ -773,6 +783,16 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundWitchHurt, SoundSourceHostile
 	case MobTypeRavager:
 		return SoundRavagerHurt, SoundSourceHostile
+	case MobTypeHusk:
+		return SoundHuskHurt, SoundSourceHostile
+	case MobTypeDrowned:
+		return SoundDrownedHurt, SoundSourceHostile
+	case MobTypeStray:
+		return SoundStrayHurt, SoundSourceHostile
+	case MobTypeWitherSkeleton:
+		return SoundWitherSkeletonHurt, SoundSourceHostile
+	case MobTypeSilverfish:
+		return SoundSilverfishHurt, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -890,6 +910,16 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundWitchDeath, SoundSourceHostile
 	case MobTypeRavager:
 		return SoundRavagerDeath, SoundSourceHostile
+	case MobTypeHusk:
+		return SoundHuskDeath, SoundSourceHostile
+	case MobTypeDrowned:
+		return SoundDrownedDeath, SoundSourceHostile
+	case MobTypeStray:
+		return SoundStrayDeath, SoundSourceHostile
+	case MobTypeWitherSkeleton:
+		return SoundWitherSkeletonDeath, SoundSourceHostile
+	case MobTypeSilverfish:
+		return SoundSilverfishDeath, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -1332,6 +1362,10 @@ func (s *Server) applyDamageToMob(
 			s.OnSquidDamaged(target.ID, attacker)
 		} else if normTarget == MobTypeGuardian || normTarget == MobTypeElderGuardian {
 			s.OnGuardianThornsRetaliate(target.ID, attacker)
+		} else if normTarget == MobTypeSilverfish {
+			s.OnSilverfishDamaged(target.ID)
+		} else if IsZombieFamilyMob(normTarget) && attacker != nil {
+			_, _ = s.TrySpawnZombieReinforcement(target.ID, attacker, nil, false)
 		}
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,

@@ -206,6 +206,10 @@ var (
 		MobTypeVex:                 EntityTypeVexID,
 		EntityTypeEvokerFangs:      EntityTypeEvokerFangsID,
 		MobTypeIllusioner:          EntityTypeIllusionerID,
+		MobTypeHusk:                EntityTypeHuskID,
+		MobTypeDrowned:             EntityTypeDrownedID,
+		MobTypeStray:               EntityTypeStrayID,
+		MobTypeSilverfish:          EntityTypeSilverfishID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -398,6 +402,14 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultVexMaxHealth
 	case MobTypeIllusioner:
 		return DefaultIllusionerMaxHealth
+	case MobTypeHusk:
+		return DefaultHuskMaxHealth
+	case MobTypeDrowned:
+		return DefaultDrownedMaxHealth
+	case MobTypeStray:
+		return DefaultStrayMaxHealth
+	case MobTypeSilverfish:
+		return DefaultSilverfishMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -461,6 +473,12 @@ func animalWanderSpeed(typeName string) float64 {
 		return VexFlySpeed
 	case MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeIllusioner, MobTypeWitch, MobTypeRavager:
 		return RaiderWanderSpeed
+	case MobTypeHusk, MobTypeDrowned:
+		return ZombieWanderSpeed
+	case MobTypeStray:
+		return SkeletonWanderSpeed
+	case MobTypeSilverfish:
+		return SilverfishWanderSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -595,6 +613,18 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	if norm == MobTypeIllusioner {
 		return s.SpawnIllusioner(normDim, x, y, z)
 	}
+	if norm == MobTypeHusk {
+		return s.SpawnHusk(normDim, x, y, z, false)
+	}
+	if norm == MobTypeDrowned {
+		return s.SpawnDrowned(normDim, x, y, z, false, false)
+	}
+	if norm == MobTypeStray {
+		return s.SpawnStray(normDim, x, y, z)
+	}
+	if norm == MobTypeSilverfish {
+		return s.SpawnSilverfish(normDim, x, y, z)
+	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
 		return 0, errors.New("server: unknown mob entity type " + norm)
@@ -610,6 +640,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	})
 	if IsRaiderMobType(norm) || IsIllagerMob(norm) {
 		s.ensureIllagerOrRaiderState(id, norm, false)
+	}
+	if IsZombieFamilyMob(norm) || IsSkeletonFamilyMob(norm) {
+		s.ensureUndeadState(id, norm, nil)
 	}
 	if IsTameableMob(norm) {
 		_ = s.ensureTamedMobState(id, norm)
