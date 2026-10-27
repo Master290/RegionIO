@@ -31,6 +31,18 @@ func (c *Cache) getObserverTracker() *observerTracker {
 	return actual.(*observerTracker)
 }
 
+func (c *Cache) clearObserverStateAt(pos BlockPos) {
+	if c == nil {
+		return
+	}
+	if v, ok := observerTrackers.Load(c); ok && v != nil {
+		tr := v.(*observerTracker)
+		tr.mu.Lock()
+		delete(tr.retriggerOnFinish, pos)
+		tr.mu.Unlock()
+	}
+}
+
 // IsObserverBlock reports whether state is a `minecraft:observer`.
 func IsObserverBlock(state uint16) bool {
 	return isBlockNamed(state, "minecraft:observer")

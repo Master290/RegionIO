@@ -836,4 +836,181 @@ func TestRedstoneLampRepeaterComparatorEdgeCases(t *testing.T) {
 	}
 }
 
+func hasProp(state uint16, key, val string) bool {
+	info, ok := stateByID(state)
+	return ok && info.Properties[key] == val
+}
+
+func TestRedstonePolishTargetTorchComparatorSubtractButtonProjectileAndTripwireEdges(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 1
+
+	wire0 := mustRedstoneState(t, "minecraft:redstone_wire", map[string]string{
+		"north": "none", "south": "none", "east": "none", "west": "none", "power": "0",
+	})
+
+	// 1. Target block hit by projectile inverts an attached redstone_torch and redstone_wall_torch,
+	//    and re-hitting refreshes the scheduled reset timer:
+	targetBlock := mustRedstoneState(t, "minecraft:target", map[string]string{"power": "0"})
+	standingTorch := mustRedstoneState(t, "minecraft:redstone_torch", map[string]string{"lit": "true"})
+	wallTorchEast := mustRedstoneState(t, "minecraft:redstone_wall_torch", map[string]string{
+		"facing": "east",
+		"lit":    "true",
+	})
+	c.ApplyBlockWithUpdates(160, y, 160, targetBlock)
+	c.ApplyBlockWithUpdates(160, y+1, 160, standingTorch)
+	c.ApplyBlockWithUpdates(161, y, 160, wallTorchEast)
+
+	pwr, _ := c.HitTargetBlock(160, y, 160, "north", 0.5, 0.5, 0.0, true) // arrow bullseye -> 15 for 20 ticks
+	if pwr != 15 {
+		t.Fatalf("expected bullseye target hit power 15, got %d", pwr)
+	}
+	if !hasProp(c.GetBlock(160, y+1, 160), "lit", "false") {
+		t.Fatalf("standing redstone_torch on hit target block should invert to lit=false, got %s", stateLabel(c.GetBlock(160, y+1, 160)))
+	}
+	if !hasProp(c.GetBlock(161, y, 160), "lit", "false") {
+		t.Fatalf("redstone_wall_torch attached to hit target block should invert to lit=false, got %s", stateLabel(c.GetBlock(161, y, 160)))
+	}
+
+	// Advance 15 ticks (out of 20), then hit again with an arrow: timer refreshes to 20 ticks!
+	c.StepBlockUpdates(15)
+	c.HitTargetBlock(160, y, 160, "north", 0.5, 0.5, 0.0, true)
+	c.StepBlockUpdates(10) // 25 ticks since first hit, 10 since second -> still powered!
+	if got := c.RedstonePowerAt(160, y, 160); got != 15 {
+		t.Fatalf("target block should remain at power 15 after timer refresh, got %d", got)
+	}
+	c.StepBlockUpdates(10) // 20 ticks since second hit -> resets to 0 and torches relight!
+	if got := c.RedstonePowerAt(160, y, 160); got != 0 {
+		t.Fatalf("target block should reset to 0 after 20 ticks, got %d", got)
+	}
+	if !hasProp(c.GetBlock(160, y+1, 160), "lit", "true") || !hasProp(c.GetBlock(161, y, 160), "lit", "true") {
+		t.Fatalf("torches attached to target block should relight after target resets")
+	}
+
+	// 2. Comparator non-zero analog output change in subtract mode & copper_bulb through solid block:
+	compSub := mustRedstoneState(t, "minecraft:comparator", map[string]string{
+		"facing":  "north",
+		"mode":    "subtract",
+		"powered": "false",
+	})
+	plateRear10 := mustRedstoneState(t, "minecraft:light_weighted_pressure_plate", map[string]string{"power": "10"})
+	plateSide0 := mustRedstoneState(t, "minecraft:light_weighted_pressure_plate", map[string]string{"power": "0"})
+	c.ApplyBlockWithUpdates(170, y, 169, plateRear10)
+	c.ApplyBlockWithUpdates(170, y, 170, compSub)
+	c.ApplyBlockWithUpdates(170, y, 171, wire0)
+	c.ApplyBlockWithUpdates(171, y, 170, wire0)
+	c.ApplyBlockWithUpdates(172, y, 170, plateSide0)
+
+	if got := c.RedstonePowerAt(170, y, 171); got != 10 {
+		t.Fatalf("comparator subtract output with side=0 = %d, want 10", got)
+	}
+	// Change plate at (172, y, 170) to power 7 -> wire at (171, y, 170) becomes 7 -> comparator output drops 10 -> 3
+	// even though comparator's `powered` boolean remains "true"!
+	plateSide7 := mustRedstoneState(t, "minecraft:light_weighted_pressure_plate", map[string]string{"power": "7"})
+	c.ApplyBlockWithUpdates(172, y, 170, plateSide7)
+	if got := c.RedstonePowerAt(170, y, 171); got != 3 {
+		t.Fatalf("comparator subtract output after side wire changes to 7 = %d, want 3", got)
+	}
+
+	// Copper bulb comparator reading through conductive solid block even when custom ComparatorSignalProvider is set:
+	c.SetComparatorSignalProvider(func(x, by, z int) int { return 0 })
+	defer c.SetComparatorSignalProvider(nil)
+	litBulb := mustRedstoneState(t, "minecraft:copper_bulb", map[string]string{"lit": "true", "powered": "false"})
+	compCmp := mustRedstoneState(t, "minecraft:comparator", map[string]string{
+		"facing":  "north",
+		"mode":    "compare",
+		"powered": "false",
+	})
+	c.ApplyBlockWithUpdates(175, y, 169, litBulb)
+	c.ApplyBlockWithUpdates(175, y, 170, StateStone)
+	c.ApplyBlockWithUpdates(175, y, 171, compCmp)
+	c.ApplyBlockWithUpdates(175, y, 172, wire0)
+	if got := c.RedstonePowerAt(175, y, 172); got != 15 {
+		t.Fatalf("comparator reading lit copper_bulb through stone block = %d, want 15", got)
+	}
+
+	// 3. Wooden button projectile activation + held down while arrow remains embedded, vs stone button ignoring arrows:
+	oakBtn := mustRedstoneState(t, "minecraft:oak_button", map[string]string{
+		"face":    "floor",
+		"facing":  "north",
+		"powered": "false",
+	})
+	stoneBtn := mustRedstoneState(t, "minecraft:stone_button", map[string]string{
+		"face":    "floor",
+		"facing":  "north",
+		"powered": "false",
+	})
+	c.ApplyBlockWithUpdates(180, y, 180, oakBtn)
+	c.ApplyBlockWithUpdates(182, y, 180, stoneBtn)
+
+	if ok, _ := c.HitButtonWithProjectile(182, y, 180); ok {
+		t.Fatalf("stone_button should ignore projectile hits")
+	}
+	arrowEmbedded := true
+	c.SetButtonProjectileCheck(func(bx, by, bz int) bool {
+		return bx == 180 && by == y && bz == 180 && arrowEmbedded
+	})
+	defer c.SetButtonProjectileCheck(nil)
+
+	if ok, _ := c.HitButtonWithProjectile(180, y, 180); !ok || c.RedstonePowerAt(180, y, 180) != 15 {
+		t.Fatalf("oak_button should power on when hit by projectile")
+	}
+	c.StepBlockUpdates(WoodButtonTickDelay)
+	if got := c.RedstonePowerAt(180, y, 180); got != 15 {
+		t.Fatalf("oak_button should stay powered at tick 30 while arrow is still embedded, got %d", got)
+	}
+	arrowEmbedded = false
+	c.StepBlockUpdates(WoodButtonTickDelay)
+	if got := c.RedstonePowerAt(180, y, 180); got != 0 {
+		t.Fatalf("oak_button should release once arrow is removed, got %d", got)
+	}
+
+	// 4. Breaking support block of an active lever updates downstream redstone wire:
+	leverWall := mustRedstoneState(t, "minecraft:lever", map[string]string{
+		"face":    "wall",
+		"facing":  "south",
+		"powered": "true",
+	})
+	c.ApplyBlockWithUpdates(190, y, 190, StateStone)
+	c.ApplyBlockWithUpdates(190, y, 191, leverWall) // attached to stone at (190, y, 190)
+	c.ApplyBlockWithUpdates(190, y, 189, wire0)     // powered through stone at (190, y, 190)
+	if got := c.RedstonePowerAt(190, y, 189); got != 15 {
+		t.Fatalf("wire behind lever-powered stone = %d, want 15", got)
+	}
+	c.BreakBlockWithUpdates(190, y, 190) // breaks stone -> lever pops off -> wire must drop to 0!
+	if got := c.RedstonePowerAt(190, y, 189); got != 0 {
+		t.Fatalf("wire after breaking lever support block = %d, want 0", got)
+	}
+
+	// 5. Breaking the wall behind a tripwire_hook detaches the tripwire line and partner hook:
+	hookEast := mustRedstoneState(t, "minecraft:tripwire_hook", map[string]string{
+		"facing":   "east",
+		"attached": "false",
+		"powered":  "false",
+	})
+	hookWest := mustRedstoneState(t, "minecraft:tripwire_hook", map[string]string{
+		"facing":   "west",
+		"attached": "false",
+		"powered":  "false",
+	})
+	tw := mustRedstoneState(t, "minecraft:tripwire", map[string]string{
+		"attached": "false", "disarmed": "false", "powered": "false",
+		"north": "false", "south": "false", "east": "false", "west": "false",
+	})
+	c.ApplyBlockWithUpdates(200, y, 200, StateStone)
+	c.ApplyBlockWithUpdates(204, y, 200, StateStone)
+	c.ApplyBlockWithUpdates(201, y, 200, hookEast)
+	c.ApplyBlockWithUpdates(203, y, 200, hookWest)
+	c.ApplyBlockWithUpdates(202, y, 200, tw)
+	if !hasProp(c.GetBlock(203, y, 200), "attached", "true") || !hasProp(c.GetBlock(202, y, 200), "attached", "true") {
+		t.Fatalf("tripwire line should be attached before wall break")
+	}
+	// Break the wall at (200, y, 200): hookEast at (201, y, 200) pops off, detaching wire and hookWest!
+	c.BreakBlockWithUpdates(200, y, 200)
+	if !hasProp(c.GetBlock(203, y, 200), "attached", "false") || !hasProp(c.GetBlock(202, y, 200), "attached", "false") {
+		t.Fatalf("partner hook and tripwire should detach when wall behind hook is broken, got hook=%s wire=%s",
+			stateLabel(c.GetBlock(203, y, 200)), stateLabel(c.GetBlock(202, y, 200)))
+	}
+}
+
 

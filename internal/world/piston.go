@@ -67,6 +67,19 @@ func (t *pistonRuntimeTracker) getOrCreate(pos BlockPos) *pistonStateEntry {
 	return e
 }
 
+// ClearPistonRuntimeAt removes any runtime state tracker entry for a piston at (x, y, z).
+func (c *Cache) ClearPistonRuntimeAt(x, y, z int) {
+	if c == nil {
+		return
+	}
+	if v, ok := pistonTrackers.Load(c); ok && v != nil {
+		tr := v.(*pistonRuntimeTracker)
+		tr.mu.Lock()
+		delete(tr.entries, BlockPos{X: x, Y: y, Z: z})
+		tr.mu.Unlock()
+	}
+}
+
 // SetPistonMoveEntitiesListener registers an optional callback invoked when a
 // piston extends or retracts so entities in the path of the piston head or
 // pushed blocks can be translated (and bounced when pushed by a slime block).
@@ -570,7 +583,13 @@ func (c *Cache) tryExtendPiston(x, y, z int, state uint16, facing string, isStic
 		if !isAirState(oldSt) {
 			c.notifyPistonDestroyBlock(dp, oldSt)
 			c.setBlockRecorded(dp.X, dp.Y, dp.Z, StateAir, res)
+			if isBlockNamed(oldSt, "minecraft:tripwire") || isBlockNamed(oldSt, "minecraft:tripwire_hook") {
+				c.recalculateTripwireAround(dp.X, dp.Y, dp.Z, oldSt, StateAir, res)
+			}
 			affected = append(affected, dp)
+			if sup, ok := redstoneSupportOf(dp.X, dp.Y, dp.Z, oldSt); ok {
+				affected = append(affected, sup)
+			}
 		}
 	}
 
@@ -606,12 +625,21 @@ func (c *Cache) tryExtendPiston(x, y, z int, state uint16, facing string, isStic
 	var movedPositions []BlockPos
 	var movedStates []uint16
 	for _, m := range moved {
+		c.CancelScheduledBlockUpdate(m.src.X, m.src.Y, m.src.Z, UpdateRedstone)
 		stToPlace := m.state
+		if isWaterloggedState(stToPlace) {
+			if unwaterlogged, ok := SetWaterlogged(stToPlace, false); ok {
+				stToPlace = unwaterlogged
+			}
+		}
 		// Moved observers emit a 2-tick pulse after movement completes.
 		if isBlockNamed(stToPlace, "minecraft:observer") {
+			c.clearObserverStateAt(m.src)
 			if unpowered, ok := withStateProperty(stToPlace, "powered", "false"); ok {
 				stToPlace = unpowered
 			}
+		} else if isBlockNamed(stToPlace, "minecraft:piston") || isBlockNamed(stToPlace, "minecraft:sticky_piston") {
+			c.ClearPistonRuntimeAt(m.src.X, m.src.Y, m.src.Z)
 		}
 		c.setBlockRecorded(m.dst.X, m.dst.Y, m.dst.Z, stToPlace, res)
 		affected = append(affected, m.dst)
@@ -704,7 +732,13 @@ func (c *Cache) retractPistonWithOption(x, y, z int, state uint16, facing string
 						if !isAirState(oldSt) {
 							c.notifyPistonDestroyBlock(dp, oldSt)
 							c.setBlockRecorded(dp.X, dp.Y, dp.Z, StateAir, res)
+							if isBlockNamed(oldSt, "minecraft:tripwire") || isBlockNamed(oldSt, "minecraft:tripwire_hook") {
+								c.recalculateTripwireAround(dp.X, dp.Y, dp.Z, oldSt, StateAir, res)
+							}
 							affected = append(affected, dp)
+							if sup, ok := redstoneSupportOf(dp.X, dp.Y, dp.Z, oldSt); ok {
+								affected = append(affected, sup)
+							}
 						}
 					}
 
@@ -733,11 +767,20 @@ func (c *Cache) retractPistonWithOption(x, y, z int, state uint16, facing string
 					var movedPositions []BlockPos
 					var movedStates []uint16
 					for _, m := range moved {
+						c.CancelScheduledBlockUpdate(m.src.X, m.src.Y, m.src.Z, UpdateRedstone)
 						stToPlace := m.state
+						if isWaterloggedState(stToPlace) {
+							if unwaterlogged, ok := SetWaterlogged(stToPlace, false); ok {
+								stToPlace = unwaterlogged
+							}
+						}
 						if isBlockNamed(stToPlace, "minecraft:observer") {
+							c.clearObserverStateAt(m.src)
 							if unpowered, ok := withStateProperty(stToPlace, "powered", "false"); ok {
 								stToPlace = unpowered
 							}
+						} else if isBlockNamed(stToPlace, "minecraft:piston") || isBlockNamed(stToPlace, "minecraft:sticky_piston") {
+							c.ClearPistonRuntimeAt(m.src.X, m.src.Y, m.src.Z)
 						}
 						c.setBlockRecorded(m.dst.X, m.dst.Y, m.dst.Z, stToPlace, res)
 						affected = append(affected, m.dst)

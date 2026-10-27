@@ -178,3 +178,54 @@ func TestNoteBlockTuning25TonesLeftClickRedstoneRisingEdgeAndMuffling(t *testing
 		t.Fatalf("expected muffled note_block not to play on redstone rising edge")
 	}
 }
+
+func TestNoteBlockCopperFamilyTrumpetsAndVerticalSync(t *testing.T) {
+	cases := []struct {
+		block string
+		want  string
+	}{
+		{"minecraft:copper_bulb", "trumpet"},
+		{"minecraft:exposed_copper_grate", "trumpet_exposed"},
+		{"minecraft:weathered_chiseled_copper", "trumpet_weathered"},
+		{"minecraft:oxidized_copper_chest", "trumpet_oxidized"},
+		{"minecraft:waxed_weathered_copper_trapdoor", "trumpet_weathered"},
+		{"minecraft:ancient_debris", "basedrum"},
+		{"minecraft:lodestone", "basedrum"},
+		{"minecraft:anvil", "basedrum"},
+		{"minecraft:crafter", "basedrum"},
+	}
+	for _, tc := range cases {
+		if got := NoteInstrumentForBlockName(tc.block); got != tc.want {
+			t.Errorf("NoteInstrumentForBlockName(%q) = %q, want %q", tc.block, got, tc.want)
+		}
+	}
+
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 2
+	nb := mustRedstoneState(t, "minecraft:note_block", map[string]string{
+		"instrument": "harp",
+		"note":       "0",
+		"powered":    "false",
+	})
+	c.ApplyBlockWithUpdates(30, y, 30, nb)
+
+	// Place oxidized_copper_block below -> instrument updates immediately to trumpet_oxidized.
+	oxCopper := mustRedstoneState(t, "minecraft:oxidized_copper", nil)
+	c.ApplyBlockWithUpdates(30, y-1, 30, oxCopper)
+	if inst, _, _, ok := c.NoteBlockPropertiesAt(30, y, 30); !ok || inst != "trumpet_oxidized" {
+		t.Fatalf("after placing oxidized_copper below, note_block instrument = %q, want trumpet_oxidized", inst)
+	}
+
+	// Place skeleton_skull on top (y+1) -> mob head overrides instrument to skeleton.
+	skull := mustRedstoneState(t, "minecraft:skeleton_skull", map[string]string{"rotation": "0"})
+	c.ApplyBlockWithUpdates(30, y+1, 30, skull)
+	if inst, _, _, ok := c.NoteBlockPropertiesAt(30, y, 30); !ok || inst != "skeleton" {
+		t.Fatalf("after placing skeleton_skull above, note_block instrument = %q, want skeleton", inst)
+	}
+
+	// Break skeleton_skull above -> instrument reverts to trumpet_oxidized from block below.
+	c.BreakBlockWithUpdates(30, y+1, 30)
+	if inst, _, _, ok := c.NoteBlockPropertiesAt(30, y, 30); !ok || inst != "trumpet_oxidized" {
+		t.Fatalf("after breaking skeleton_skull above, note_block instrument = %q, want trumpet_oxidized", inst)
+	}
+}

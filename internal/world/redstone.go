@@ -32,12 +32,14 @@ const (
 
 var (
 	pressurePlateCounters     sync.Map // map[*Cache]func(x, y, z int) int
+	buttonProjectileChecks    sync.Map // map[*Cache]func(x, y, z int) bool
+	tripwireEntityChecks      sync.Map // map[*Cache]TripwireEntityCheckFunc
 	comparatorSignalProviders sync.Map // map[*Cache]func(x, y, z int) int
 	jukeboxPowerProviders     sync.Map // map[*Cache]func(x, y, z int) int
 	dispenserFireListeners    sync.Map // map[*Cache]func(x, y, z int, isDropper bool)
 	crafterFireListeners      sync.Map // map[*Cache]func(x, y, z int)
 	railPowerChangeListeners  sync.Map // map[*Cache]func(x, y, z int, railName string, powered bool)
-	daylightContextProviders  sync.Map // map[*Cache]func(x, y, z int) (skyLight int, timeOfDay int64, raining, thundering bool)
+	daylightContextProviders  sync.Map // map[*Cache]DaylightContextProvider
 )
 
 // SetCrafterFireListener registers an optional callback invoked when a
@@ -115,6 +117,27 @@ func (c *Cache) countEntitiesOnPlate(x, y, z int) int {
 		}
 	}
 	return 0
+}
+
+// SetButtonProjectileCheck registers an optional callback used when a wooden /
+// projectile-sensitive button's scheduled release tick fires to check whether an
+// arrow or trident still intersects the button at (x, y, z). While true, the
+// button stays powered and re-schedules its release check.
+func (c *Cache) SetButtonProjectileCheck(fn func(x, y, z int) bool) {
+	if fn == nil {
+		buttonProjectileChecks.Delete(c)
+		return
+	}
+	buttonProjectileChecks.Store(c, fn)
+}
+
+func (c *Cache) hasProjectileInButton(x, y, z int) bool {
+	if v, ok := buttonProjectileChecks.Load(c); ok && v != nil {
+		if fn, ok := v.(func(int, int, int) bool); ok && fn != nil {
+			return fn(x, y, z)
+		}
+	}
+	return false
 }
 
 // SetComparatorSignalProvider registers an optional callback that returns the
@@ -278,6 +301,39 @@ func ButtonTickDelay(state uint16) int {
 		return StoneButtonTickDelay
 	default:
 		return WoodButtonTickDelay
+	}
+}
+
+// IsProjectileSensitiveButton reports whether state is a wooden, bamboo, or
+// nether button that can be activated and held down by arrows / tridents
+// (stone and polished_blackstone buttons ignore projectiles).
+func IsProjectileSensitiveButton(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok || !strings.HasSuffix(info.Name, "_button") {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:stone_button", "minecraft:polished_blackstone_button":
+		return false
+	default:
+		return true
+	}
+}
+
+// IsMobOnlyPressurePlate reports whether state is a stone or polished_blackstone
+// pressure plate, which in vanilla only activates for living entities / players /
+// armor stands (ignoring dropped items and arrows), whereas wooden and weighted
+// pressure plates count all entities including dropped items.
+func IsMobOnlyPressurePlate(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:stone_pressure_plate", "minecraft:polished_blackstone_pressure_plate":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -841,7 +897,7 @@ func (c *Cache) PressButton(x, y, z int) (bool, BlockUpdateResult) {
 	}
 	delay := ButtonTickDelay(state)
 	if info.Properties["powered"] == "true" {
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
+		c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
 		return true, res
 	}
 	nextState, ok := withStateProperty(state, "powered", "true")
@@ -849,11 +905,25 @@ func (c *Cache) PressButton(x, y, z int) (bool, BlockUpdateResult) {
 		return false, res
 	}
 	if c.setBlockRecorded(x, y, z, nextState, &res) {
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
+		c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
 		c.propagateRedstoneAround(x, y, z, state, nextState, &res)
 		return true, res
 	}
 	return false, res
+}
+
+// HitButtonWithProjectile activates a projectile-sensitive (wooden/bamboo/nether)
+// button at (x, y, z) when struck by an arrow or trident. Stone and polished
+// blackstone buttons ignore projectiles and return (false, empty).
+func (c *Cache) HitButtonWithProjectile(x, y, z int) (bool, BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, BlockUpdateResult{}
+	}
+	state := c.GetBlock(x, y, z)
+	if !IsProjectileSensitiveButton(state) {
+		return false, BlockUpdateResult{}
+	}
+	return c.PressButton(x, y, z)
 }
 
 // UpdatePressurePlateEntities updates the pressure plate at (x, y, z) for the
@@ -900,7 +970,7 @@ func (c *Cache) UpdatePressurePlateEntities(x, y, z, entityCount int) (bool, Blo
 		return false, res
 	}
 	if entityCount > 0 {
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, PressurePlateTickDelay)
+		c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, PressurePlateTickDelay)
 	}
 	if c.setBlockRecorded(x, y, z, nextState, &res) {
 		c.propagateRedstoneAround(x, y, z, state, nextState, &res)
@@ -1062,7 +1132,7 @@ func hasAnalogOutputSignal(state uint16) bool {
 		"minecraft:detector_rail":
 		return true
 	}
-	if IsCandleCakeBlockName(info.Name) {
+	if IsCandleCakeBlockName(info.Name) || IsCopperBulbBlock(state) || IsCopperGolemStatueBlock(state) || IsCopperChestBlock(state) {
 		return true
 	}
 	return strings.HasSuffix(info.Name, "shulker_box")
@@ -1201,6 +1271,8 @@ func (c *Cache) analogSignalAt(x, y, z int) int {
 	default:
 		if IsCandleCakeBlockName(info.Name) {
 			blockSig = FullCakeComparatorSignal
+		} else if IsCopperBulbBlock(state) || IsCopperGolemStatueBlock(state) || IsCopperChestBlock(state) {
+			blockSig = c.CopperBlockComparatorSignalAt(x, y, z)
 		}
 	}
 	if blockSig > sig {
@@ -1312,6 +1384,10 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 	switch {
 	case strings.HasSuffix(name, "_button"):
 		if props["powered"] == "true" {
+			if IsProjectileSensitiveButton(state) && c.hasProjectileInButton(x, y, z) {
+				c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, ButtonTickDelay(state))
+				return
+			}
 			if nextState, ok := withStateProperty(state, "powered", "false"); ok {
 				if c.setBlockRecorded(x, y, z, nextState, res) {
 					c.propagateRedstoneAround(x, y, z, state, nextState, res)
@@ -1453,6 +1529,7 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
 	toggledTorches := make(map[BlockPos]bool)
 	evaluatedComparators := make(map[BlockPos]int)
+	lastComparatorOutput := make(map[BlockPos]int)
 	seeds := []BlockPos{{X: x, Y: y, Z: z}}
 	if sup, ok := redstoneSupportOf(x, y, z, oldState); ok {
 		seeds = append(seeds, sup)
@@ -1460,12 +1537,25 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 	if sup, ok := redstoneSupportOf(x, y, z, newState); ok {
 		seeds = append(seeds, sup)
 	}
+	if res != nil {
+		for _, ch := range res.Changes {
+			seeds = append(seeds, ch.Pos)
+			if sup, ok := redstoneSupportOf(ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.OldState); ok {
+				seeds = append(seeds, sup)
+			}
+		}
+	}
 
 	for pass := 0; pass < 8 && len(seeds) > 0; pass++ {
 		wireChanged := c.recalculateWireNetworksAround(seeds, res)
-		allSeeds := make([]BlockPos, 0, len(seeds)+len(wireChanged))
+		allSeeds := make([]BlockPos, 0, len(seeds)+len(wireChanged)*2)
 		allSeeds = append(allSeeds, seeds...)
-		allSeeds = append(allSeeds, wireChanged...)
+		for _, wp := range wireChanged {
+			allSeeds = append(allSeeds, wp)
+			if wp.Y > MinY {
+				allSeeds = append(allSeeds, BlockPos{X: wp.X, Y: wp.Y - 1, Z: wp.Z})
+			}
+		}
 
 		candidates := c.collectMechanismCandidates(allSeeds)
 		var nextSeeds []BlockPos
@@ -1511,6 +1601,8 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 				if out > 0 {
 					wantPowered = "true"
 				}
+				prevOut, seenOut := lastComparatorOutput[pos]
+				outputChanged := !seenOut || prevOut != out
 				stateChanged := false
 				if info.Properties["powered"] != wantPowered {
 					if evaluatedComparators[pos] >= 2 {
@@ -1522,8 +1614,12 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 							stateChanged = true
 						}
 					}
+				} else if seenOut && prevOut != out && evaluatedComparators[pos] >= 2 {
+					c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, ComparatorTickDelay)
+					continue
 				}
-				if stateChanged || evaluatedComparators[pos] == 0 {
+				lastComparatorOutput[pos] = out
+				if stateChanged || outputChanged || evaluatedComparators[pos] == 0 {
 					evaluatedComparators[pos]++
 					outDX, outDZ := RepeaterOutputOffset(info.Properties["facing"])
 					nextSeeds = append(nextSeeds, pos)
@@ -1622,7 +1718,8 @@ func redstoneSupportOf(x, y, z int, state uint16) (BlockPos, bool) {
 			return BlockPos{X: x + dx, Y: y + dy, Z: z + dz}, true
 		}
 	}
-	if strings.HasSuffix(info.Name, "_pressure_plate") || info.Name == "minecraft:detector_rail" {
+	if strings.HasSuffix(info.Name, "_pressure_plate") || info.Name == "minecraft:detector_rail" ||
+		info.Name == "minecraft:lectern" || info.Name == "minecraft:sculk_sensor" || info.Name == "minecraft:calibrated_sculk_sensor" {
 		return BlockPos{X: x, Y: y - 1, Z: z}, true
 	}
 	if info.Name == "minecraft:repeater" || info.Name == "minecraft:comparator" {
@@ -1910,6 +2007,11 @@ func (c *Cache) isTorchSupportPowered(x, y, z int, info stateName) bool {
 	if sup.Y < MinY || sup.Y >= MinY+WorldHeight {
 		return false
 	}
+	// If the support block itself emits signal into the torch (e.g. a target block,
+	// daylight detector, or jukebox), the torch is inverted.
+	if c.emittedSignalFromSource(sup.X, sup.Y, sup.Z, x, y, z, false, false) > 0 {
+		return true
+	}
 	// Check if the support block receives power from any neighbor OTHER than this torch.
 	return c.bestNeighborSignalExcluding(sup.X, sup.Y, sup.Z, BlockPos{X: x, Y: y, Z: z}, true) > 0
 }
@@ -2141,7 +2243,7 @@ func (c *Cache) HitTargetBlock(x, y, z int, face string, hitX, hitY, hitZ float6
 	if isPersistentProjectile {
 		delay = TargetBlockArrowTickDelay
 	}
-	c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
+	c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, delay)
 	return power, res
 }
 
@@ -2166,7 +2268,7 @@ func (c *Cache) StrikeLightningRod(x, y, z int) (bool, BlockUpdateResult) {
 	if changed {
 		c.propagateRedstoneAround(x, y, z, state, nextState, &res)
 	}
-	c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, LightningRodTickDelay)
+	c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, LightningRodTickDelay)
 	return changed, res
 }
 
@@ -2247,6 +2349,13 @@ var (
 // SetDaylightContextProvider registers an optional callback for reading world
 // time and weather when evaluating daylight detectors.
 func (c *Cache) SetDaylightContextProvider(fn DaylightContextProvider) {
+	if c != nil {
+		if fn == nil {
+			daylightContextProviders.Delete(c)
+		} else {
+			daylightContextProviders.Store(c, fn)
+		}
+	}
 	daylightProviderMu.Lock()
 	daylightProvider = fn
 	daylightProviderMu.Unlock()
@@ -2337,6 +2446,13 @@ func (c *Cache) skyLightAt(x, y, z int) int {
 }
 
 func (c *Cache) currentDaylightContext() (int64, bool, bool) {
+	if c != nil {
+		if v, ok := daylightContextProviders.Load(c); ok && v != nil {
+			if fn, ok := v.(DaylightContextProvider); ok && fn != nil {
+				return fn()
+			}
+		}
+	}
 	daylightProviderMu.RLock()
 	fn := daylightProvider
 	daylightProviderMu.RUnlock()
@@ -2344,6 +2460,24 @@ func (c *Cache) currentDaylightContext() (int64, bool, bool) {
 		return fn()
 	}
 	return 6000, false, false
+}
+
+// UpdateDaylightDetectorsInColumn refreshes all `minecraft:daylight_detector`
+// blocks in the vertical column (x, z) using the cache's current sky light,
+// world time, and weather context.
+func (c *Cache) UpdateDaylightDetectorsInColumn(x, z int) BlockUpdateResult {
+	var res BlockUpdateResult
+	if c == nil || !c.DimensionType().HasSkylight {
+		return res
+	}
+	timeOfDay, isRaining, isThundering := c.currentDaylightContext()
+	for y := c.minY(); y < c.maxY(); y++ {
+		if isBlockNamed(c.GetBlock(x, y, z), "minecraft:daylight_detector") {
+			_, sub := c.UpdateDaylightDetectorAt(x, y, z, timeOfDay, isRaining, isThundering)
+			res.merge(sub)
+		}
+	}
+	return res
 }
 
 // UpdateDaylightDetectorAt recalculates and updates the `power` property of a
@@ -2429,12 +2563,26 @@ var (
 // SetTripwireEntityCheck registers an optional callback used when a tripwire's
 // scheduled tick re-evaluates whether entities are still standing on it.
 func (c *Cache) SetTripwireEntityCheck(fn TripwireEntityCheckFunc) {
+	if c != nil {
+		if fn == nil {
+			tripwireEntityChecks.Delete(c)
+		} else {
+			tripwireEntityChecks.Store(c, fn)
+		}
+	}
 	tripwireEntityMu.Lock()
 	tripwireEntityCheck = fn
 	tripwireEntityMu.Unlock()
 }
 
 func (c *Cache) hasEntityOnTripwire(x, y, z int) bool {
+	if c != nil {
+		if v, ok := tripwireEntityChecks.Load(c); ok && v != nil {
+			if fn, ok := v.(TripwireEntityCheckFunc); ok && fn != nil {
+				return fn(x, y, z)
+			}
+		}
+	}
 	tripwireEntityMu.RLock()
 	fn := tripwireEntityCheck
 	tripwireEntityMu.RUnlock()
@@ -2694,7 +2842,7 @@ func (c *Cache) UpdateTripwireEntities(x, y, z int, hasEntities bool) (bool, Blo
 		}
 	}
 	if hasEntities {
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, TripwireTickDelay)
+		c.RescheduleBlockUpdate(x, y, z, UpdateRedstone, TripwireTickDelay)
 	}
 	c.recalculateTripwireAround(x, y, z, state, curState, &res)
 	return changed, res
@@ -2758,7 +2906,7 @@ func isPistonDestroyOnPush(state uint16) bool {
 	if isAirState(state) {
 		return true
 	}
-	if _, _, isFluid := classifyFluidState(state); isFluid {
+	if _, _, isFluid := isStandaloneFluidBlock(state); isFluid || IsBubbleColumnBlock(state) {
 		return true
 	}
 	info, ok := stateByID(state)
@@ -2773,6 +2921,9 @@ func isPistonDestroyOnPush(state uint16) bool {
 		strings.HasSuffix(name, "_carpet") || strings.HasSuffix(name, "_bed") ||
 		strings.HasSuffix(name, "_candle") || strings.HasSuffix(name, "_amethyst_bud") ||
 		strings.HasSuffix(name, "_coral_fan") || strings.HasSuffix(name, "_coral_wall_fan") ||
+		(strings.HasSuffix(name, "_head") && name != "minecraft:piston_head") ||
+		strings.HasSuffix(name, "_skull") ||
+		IsCandleCakeBlockName(name) ||
 		IsCoralPlantOrFloorFanName(name) {
 		return true
 	}
@@ -2792,7 +2943,8 @@ func isPistonDestroyOnPush(state uint16) bool {
 		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
 		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:kelp", "minecraft:kelp_plant",
 		"minecraft:decorated_pot", "minecraft:amethyst_cluster", "minecraft:budding_amethyst",
-		"minecraft:lily_pad",
+		"minecraft:lily_pad", "minecraft:lantern", "minecraft:soul_lantern",
+		"minecraft:scaffolding", "minecraft:cake",
 		"minecraft:frogspawn", "minecraft:turtle_egg", "minecraft:sniffer_egg":
 		return true
 	}
@@ -2815,8 +2967,7 @@ func canPistonPushBlock(state uint16) bool {
 		return false
 	}
 	if strings.HasSuffix(name, "_sign") || strings.HasSuffix(name, "_banner") ||
-		strings.HasSuffix(name, "_hanging_sign") || strings.HasSuffix(name, "_head") ||
-		strings.HasSuffix(name, "_skull") {
+		strings.HasSuffix(name, "_hanging_sign") {
 		return false
 	}
 	switch name {

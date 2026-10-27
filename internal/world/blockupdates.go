@@ -200,6 +200,41 @@ func (c *Cache) ScheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTick
 	}
 }
 
+// RescheduleBlockUpdate queues or refreshes a block update at (x, y, z) to
+// execute after delayTicks game ticks (minimum 1), overwriting any existing
+// due tick for the same position and kind.
+func (c *Cache) RescheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTicks int) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return
+	}
+	if delayTicks < 1 {
+		delayTicks = 1
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	due := s.tick + uint64(delayTicks)
+	key := scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}
+	s.nextSeq++
+	s.pending[key] = scheduledUpdate{
+		pos:     key.pos,
+		kind:    kind,
+		dueTick: due,
+		seq:     s.nextSeq,
+	}
+}
+
+// CancelScheduledBlockUpdate removes any pending scheduled update of kind at (x, y, z).
+func (c *Cache) CancelScheduledBlockUpdate(x, y, z int, kind BlockUpdateKind) {
+	if c == nil {
+		return
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	delete(s.pending, scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind})
+	s.mu.Unlock()
+}
+
 // ApplyBlockWithUpdates sets the block at (x, y, z) to state, incrementally
 // updates lighting, runs immediate neighbor support/survival cascades and
 // contact reactions (concrete powder solidification, sponge absorption,
@@ -219,6 +254,18 @@ func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpd
 	if oldState != targetState {
 		res.appendChange(BlockPos{X: x, Y: y, Z: z}, oldState, targetState, lightChanged)
 		c.notifyObserversOfChangeAt(x, y, z, oldState, targetState)
+		if !isSameBlockType(oldState, targetState) {
+			if isBlockNamed(oldState, "minecraft:observer") {
+				c.clearObserverStateAt(BlockPos{X: x, Y: y, Z: z})
+				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+			} else if isBlockNamed(oldState, "minecraft:piston") || isBlockNamed(oldState, "minecraft:sticky_piston") {
+				c.ClearPistonRuntimeAt(x, y, z)
+				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+			}
+		}
+		if !IsNoteBlock(targetState) {
+			c.syncVerticalNoteBlocksAt(x, y, z, &res)
+		}
 	}
 	c.applyImmediatePostPlacement(x, y, z, oldState, targetState, &res)
 	return true, res
@@ -367,6 +414,18 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 	}
 	res.appendChange(BlockPos{X: x, Y: y, Z: z}, oldState, newState, light)
 	c.notifyObserversOfChangeAt(x, y, z, oldState, newState)
+	if !isSameBlockType(oldState, newState) {
+		if isBlockNamed(oldState, "minecraft:observer") {
+			c.clearObserverStateAt(BlockPos{X: x, Y: y, Z: z})
+			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+		} else if isBlockNamed(oldState, "minecraft:piston") || isBlockNamed(oldState, "minecraft:sticky_piston") {
+			c.ClearPistonRuntimeAt(x, y, z)
+			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+		}
+	}
+	if !IsNoteBlock(newState) {
+		c.syncVerticalNoteBlocksAt(x, y, z, res)
+	}
 	if newState != StateAir {
 		c.checkPoweredTNTAround(x, y, z, res)
 	}
@@ -792,6 +851,9 @@ func (c *Cache) runNeighborSupportPass(x, y, z int, res *BlockUpdateResult) {
 				}
 				if IsPointedDripstoneBlock(state) {
 					c.RecalculatePointedDripstoneColumnAround(cur.X, cur.Y, cur.Z, res)
+				}
+				if isBlockNamed(state, "minecraft:tripwire") || isBlockNamed(state, "minecraft:tripwire_hook") {
+					c.recalculateTripwireAround(cur.X, cur.Y, cur.Z, state, newState, res)
 				}
 				c.propagateMultiBlockPartnerBreak(cur.X, cur.Y, cur.Z, state, res)
 				c.scheduleAround(cur.X, cur.Y, cur.Z)
@@ -1548,7 +1610,13 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 			c.propagateMultiBlockPartnerBreak(nx, y, nz, target, res)
 		}
 		if c.setBlockRecorded(nx, y, nz, nextState, res) {
+			if isBlockNamed(target, "minecraft:tripwire") || isBlockNamed(target, "minecraft:tripwire_hook") {
+				c.recalculateTripwireAround(nx, y, nz, target, nextState, res)
+			}
 			c.runNeighborSupportPass(nx, y, nz, res)
+			if IsRedstoneComponent(target) {
+				c.propagateRedstoneAround(nx, y, nz, target, nextState, res)
+			}
 			c.scheduleAround(nx, y, nz)
 		}
 	}
@@ -1674,7 +1742,13 @@ func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *
 	}
 	falling := fluidStateForLevel(kind, 8)
 	if c.setBlockRecorded(x, y, z, falling, res) {
+		if isBlockNamed(below, "minecraft:tripwire") || isBlockNamed(below, "minecraft:tripwire_hook") {
+			c.recalculateTripwireAround(x, y, z, below, falling, res)
+		}
 		c.runNeighborSupportPass(x, y, z, res)
+		if IsRedstoneComponent(below) {
+			c.propagateRedstoneAround(x, y, z, below, falling, res)
+		}
 		c.scheduleAround(x, y, z)
 	}
 	return true

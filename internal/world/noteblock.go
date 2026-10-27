@@ -264,6 +264,18 @@ func NoteInstrumentForBlockName(name string) string {
 	}
 
 	// 3. Copper trumpet instruments (26.1.2).
+	if fam, stage, _, ok := ClassifyCopperBlockName(name); ok && fam.Kind != "" {
+		switch stage {
+		case CopperStageExposed:
+			return NoteInstrumentTrumpetExposed
+		case CopperStageWeathered:
+			return NoteInstrumentTrumpetWeathered
+		case CopperStageOxidized:
+			return NoteInstrumentTrumpetOxidized
+		default:
+			return NoteInstrumentTrumpet
+		}
+	}
 	switch short {
 	case "copper_block", "chiseled_copper", "cut_copper", "cut_copper_stairs", "cut_copper_slab",
 		"waxed_copper_block", "waxed_chiseled_copper", "waxed_cut_copper", "waxed_cut_copper_stairs", "waxed_cut_copper_slab":
@@ -364,10 +376,13 @@ func isBasedrumInstrumentBlock(short string) bool {
 		"polished_blackstone_bricks", "cracked_polished_blackstone_bricks",
 		"end_stone", "end_stone_bricks", "purpur_block", "purpur_pillar",
 		"quartz_block", "chiseled_quartz_block", "quartz_pillar", "quartz_bricks", "smooth_quartz",
-		"obsidian", "crying_obsidian", "respawn_anchor", "magma_block",
+		"obsidian", "crying_obsidian", "respawn_anchor", "magma_block", "ancient_debris", "lodestone",
 		"coal_block", "raw_iron_block", "raw_copper_block", "raw_gold_block", "lapis_block",
 		"diamond_block", "netherite_block", "amethyst_block", "budding_amethyst",
 		"terracotta", "furnace", "blast_furnace", "smoker", "dispenser", "dropper", "observer",
+		"piston", "sticky_piston", "crafter", "stonecutter", "grindstone",
+		"cauldron", "water_cauldron", "lava_cauldron", "powder_snow_cauldron",
+		"hopper", "brewing_stand", "decorated_pot", "anvil", "chipped_anvil", "damaged_anvil",
 		"spawner", "trial_spawner", "vault", "enchanting_table", "ender_chest", "end_portal_frame", "bedrock":
 		return true
 	}
@@ -488,6 +503,18 @@ func (c *Cache) syncNoteBlockInstrumentRecorded(x, y, z int, res *BlockUpdateRes
 		return false
 	}
 	return c.setBlockRecorded(x, y, z, nextState, res)
+}
+
+func (c *Cache) syncVerticalNoteBlocksAt(x, y, z int, res *BlockUpdateResult) {
+	if c == nil {
+		return
+	}
+	if y+1 < MinY+WorldHeight && IsNoteBlock(c.GetBlock(x, y+1, z)) {
+		c.syncNoteBlockInstrumentRecorded(x, y+1, z, res)
+	}
+	if y-1 >= MinY && IsNoteBlock(c.GetBlock(x, y-1, z)) {
+		c.syncNoteBlockInstrumentRecorded(x, y-1, z, res)
+	}
 }
 
 // PlayNoteBlockAt triggers the minecraft:note_block at (x, y, z) if it is not

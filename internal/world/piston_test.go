@@ -254,3 +254,83 @@ func TestStickyPistonOneTickObserverPulseSpitsAndRetrievesBlock(t *testing.T) {
 		t.Fatalf("cell (53,y,50) after 2nd observer pulse should be air, got %s", stateLabel(got))
 	}
 }
+
+func TestPistonQuasiConnectivityOverheadWireAndWaterloggedStripAndFragileDestroy(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 2
+
+	pistonEast := mustRedstoneState(t, "minecraft:piston", map[string]string{
+		"facing":   "east",
+		"extended": "false",
+	})
+	stickyEast := mustRedstoneState(t, "minecraft:sticky_piston", map[string]string{
+		"facing":   "east",
+		"extended": "false",
+	})
+	wire0 := mustRedstoneState(t, "minecraft:redstone_wire", map[string]string{
+		"north": "none", "south": "none", "east": "none", "west": "none", "power": "0",
+	})
+	leverWall := mustRedstoneState(t, "minecraft:lever", map[string]string{
+		"face":    "wall",
+		"facing":  "north",
+		"powered": "false",
+	})
+
+	// 1. Quasi-connectivity from redstone wire on top of a solid block at (61, y+2, 60)
+	//    powering stone at (61, y+1, 60) adjacent to the cell above the piston at (60, y, 60):
+	c.ApplyBlockWithUpdates(60, y, 60, pistonEast)
+	c.ApplyBlockWithUpdates(61, y+1, 60, StateStone)
+	c.ApplyBlockWithUpdates(61, y+2, 60, wire0)
+	c.ApplyBlockWithUpdates(61, y+1, 59, StateStone)
+	c.ApplyBlockWithUpdates(61, y+2, 59, wire0)
+	c.ApplyBlockWithUpdates(61, y+1, 58, leverWall)
+
+	c.ToggleLever(61, y+1, 58)
+	c.StepBlockUpdates(PistonTickDelay)
+	if !hasProp(c.GetBlock(60, y, 60), "extended", "true") {
+		t.Fatalf("piston at (60,y,60) should extend via QC from wire on solid block at (61,y+2,60), got %s", stateLabel(c.GetBlock(60, y, 60)))
+	}
+
+	c.ToggleLever(61, y+1, 58)
+	c.StepBlockUpdates(PistonTickDelay)
+	if !hasProp(c.GetBlock(60, y, 60), "extended", "false") {
+		t.Fatalf("piston at (60,y,60) should retract when overhead QC wire depowers, got %s", stateLabel(c.GetBlock(60, y, 60)))
+	}
+
+	// 2. Pushing and pulling a waterlogged slab strips waterlogged="false":
+	waterloggedSlab := mustRedstoneState(t, "minecraft:oak_slab", map[string]string{
+		"type":        "bottom",
+		"waterlogged": "true",
+	})
+	c.ApplyBlockWithUpdates(70, y, 70, stickyEast)
+	c.SetBlock(71, y, 70, waterloggedSlab)
+	c.ApplyBlockWithUpdates(70, y, 69, leverWall)
+
+	c.ToggleLever(70, y, 69)
+	c.StepBlockUpdates(PistonTickDelay)
+	pushedSlab := c.GetBlock(72, y, 70)
+	if !isBlockNamed(pushedSlab, "minecraft:oak_slab") || !hasProp(pushedSlab, "waterlogged", "false") {
+		t.Fatalf("pushed waterlogged slab at (72,y,70) = %s, want oak_slab[waterlogged=false]", stateLabel(pushedSlab))
+	}
+
+	// 3. Pushing fragile blocks (skeleton_skull, lantern, cake) destroys them and fires destroy listener:
+	skull := mustRedstoneState(t, "minecraft:skeleton_skull", map[string]string{"rotation": "0"})
+	var destroyed []uint16
+	c.SetPistonDestroyBlockListener(func(pos BlockPos, oldState uint16) {
+		destroyed = append(destroyed, oldState)
+	})
+	defer c.SetPistonDestroyBlockListener(nil)
+
+	c.ApplyBlockWithUpdates(80, y, 80, pistonEast)
+	c.SetBlock(81, y, 80, skull)
+	c.ApplyBlockWithUpdates(80, y, 79, leverWall)
+	c.ToggleLever(80, y, 79)
+	c.StepBlockUpdates(PistonTickDelay)
+
+	if len(destroyed) != 1 || destroyed[0] != skull {
+		t.Fatalf("expected skeleton_skull to be destroyed by piston push, got %v", destroyed)
+	}
+	if !isBlockNamed(c.GetBlock(81, y, 80), "minecraft:piston_head") {
+		t.Fatalf("expected piston_head at (81,y,80) after destroying skull, got %s", stateLabel(c.GetBlock(81, y, 80)))
+	}
+}
