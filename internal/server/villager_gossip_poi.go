@@ -1074,6 +1074,7 @@ func (s *Server) ZombifyVillager(villagerEntityID int32) (int32, bool) {
 		return 0, false
 	}
 	vs, _ := s.VillagerState(villagerEntityID)
+	wasBaby := s.IsMobBaby(villagerEntityID)
 	dim := ent.EffectiveDimension()
 	x, y, z := ent.X, ent.Y, ent.Z
 
@@ -1095,6 +1096,7 @@ func (s *Server) ZombifyVillager(villagerEntityID int32) (int32, bool) {
 	sm.mu.Unlock()
 
 	s.ReleaseVillagerWorkstation(villagerEntityID)
+	s.ReleaseVillagerBed(villagerEntityID)
 	s.closeMerchantScreensForVillager(villagerEntityID)
 
 	cp := ent.ChunkPos()
@@ -1105,6 +1107,9 @@ func (s *Server) ZombifyVillager(villagerEntityID int32) (int32, bool) {
 	zvID, err := s.SpawnZombieVillagerInDimension(dim, x, y, z, vs.Profession, vs.Level)
 	if err != nil {
 		return 0, false
+	}
+	if wasBaby {
+		s.SetMobBaby(zvID, true)
 	}
 	sm.mu.Lock()
 	if zv := sm.zombieVillagers[zvID]; zv != nil {
@@ -1285,6 +1290,7 @@ func (s *Server) CompleteZombieVillagerCure(entityID int32) (villagerID int32, o
 	sm := s.villagerSocial()
 	sm.mu.Lock()
 	zv := sm.zombieVillagers[entityID]
+	wasBabyCure := s.IsMobBaby(entityID)
 	delete(sm.zombieVillagers, entityID)
 	sm.mu.Unlock()
 
@@ -1346,6 +1352,9 @@ func (s *Server) CompleteZombieVillagerCure(entityID int32) (villagerID int32, o
 		}
 	}
 
+	if wasBabyCure {
+		s.SetMobBaby(vid, true)
+	}
 	s.ApplyEntityEffectScaled(vid, NewStatusEffectInstance(EffectNausea, ZombieVillagerNauseaTicks, 0), 1.0)
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:entity.zombie_villager.converted", SoundSourceNeutral, x, y, z, 2.0, 1.0, 0))

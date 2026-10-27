@@ -1309,12 +1309,14 @@ func (s *Server) applyDamageToMob(
 		}
 	}
 	wasBaby := mem.ageTicks < 0
+	oldHP := mem.health
 	mem.health -= damage
 	if mem.health <= 0 {
 		mem.health = 0
 		killed = true
 		delete(tr.mobStates, target.ID)
 	}
+	newHP := mem.health
 	tr.mu.Unlock()
 
 	dim := target.EffectiveDimension()
@@ -1364,6 +1366,8 @@ func (s *Server) applyDamageToMob(
 			s.OnGuardianThornsRetaliate(target.ID, attacker)
 		} else if normTarget == MobTypeSilverfish {
 			s.OnSilverfishDamaged(target.ID)
+		} else if normTarget == MobTypeIronGolem {
+			s.OnIronGolemDamaged(target.ID, oldHP, newHP, attacker)
 		} else if IsZombieFamilyMob(normTarget) && attacker != nil {
 			_, _ = s.TrySpawnZombieReinforcement(target.ID, attacker, nil, false)
 		}
@@ -1385,6 +1389,7 @@ func (s *Server) applyDamageToMob(
 			}
 			if normTarget == MobTypeVillager {
 				s.OnVillagerHurtByPlayer(target.ID, attacker)
+				s.ProvokeVillageIronGolemsNear(dim, target.X, target.Y, target.Z, attacker)
 			}
 			s.NotifyOwnerAttackedTarget(attacker, target.ID)
 		}
@@ -1437,6 +1442,7 @@ func (s *Server) applyDamageToMob(
 	}
 	if attacker != nil && canonicalResourceName(target.TypeName) == MobTypeVillager {
 		s.OnVillagerKilledByPlayer(target.ID, dim, deathX, deathY, deathZ, attacker)
+		s.ProvokeVillageIronGolemsNear(dim, deathX, deathY, deathZ, attacker)
 	}
 	eqDrops := s.OnEquineOrLlamaKilled(target.ID)
 	for _, eqDrop := range eqDrops {

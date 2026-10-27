@@ -704,6 +704,7 @@ func (s *Server) TickVillagers() {
 		if canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
 			continue
 		}
+		s.stepVillagerPolishTick(entityID, dayTime, gameTime)
 		if _, hadSite := s.VillagerJobSite(entityID); hadSite {
 			s.ValidateVillagerWorkstation(entityID)
 		}

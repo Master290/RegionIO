@@ -467,9 +467,13 @@ func (s *Server) InteractWithIronGolem(session *PlayerSession, entityID int32) b
 // Iron Golems defending a village (all hostile monsters except creepers).
 func IsIronGolemTargetableHostile(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypeZombie, MobTypeSkeleton, MobTypeSpider,
-		MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeRavager, MobTypeWitch,
-		MobTypeWitherSkeleton, MobTypePhantom, MobTypeWither:
+	case MobTypeZombie, MobTypeZombieVillager, MobTypeHusk, MobTypeDrowned,
+		MobTypeSkeleton, MobTypeStray, MobTypeBogged, "minecraft:parched", MobTypeWitherSkeleton,
+		MobTypeSpider, "minecraft:cave_spider", MobTypeSilverfish, "minecraft:endermite",
+		MobTypeSlime, MobTypeMagmaCube,
+		MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeRavager, MobTypeVex, MobTypeIllusioner, MobTypeWitch,
+		MobTypePhantom, MobTypeWither, "minecraft:blaze", "minecraft:breeze",
+		MobTypePiglin, MobTypePiglinBrute, MobTypeHoglin, MobTypeZoglin:
 		return true
 	default:
 		return false
@@ -703,6 +707,7 @@ func (s *Server) tickSingleIronGolem(golem *world.Entity, hostiles []world.Entit
 			st.TargetMobID = 0
 			mgr.mu.Unlock()
 		}
+		s.stepIronGolemPolishAndPlayerTarget(golem, curCooldown, rng)
 		return
 	}
 

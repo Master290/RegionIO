@@ -1698,6 +1698,15 @@ var wanderingTraderOrdinaryTrades = [][3]any{
 	{"minecraft:emerald", int32(3), "minecraft:slime_ball"},
 	{"minecraft:emerald", int32(5), "minecraft:oak_sapling"},
 	{"minecraft:emerald", int32(5), "minecraft:nautilus_shell"},
+	{"minecraft:emerald", int32(5), "minecraft:pale_oak_sapling"},
+	{"minecraft:emerald", int32(1), "minecraft:open_eyeblossom"},
+	{"minecraft:emerald", int32(1), "minecraft:pale_moss_block"},
+	{"minecraft:emerald", int32(1), "minecraft:pale_hanging_moss"},
+	{"minecraft:emerald", int32(1), "minecraft:wildflowers"},
+	{"minecraft:emerald", int32(1), "minecraft:bush"},
+	{"minecraft:emerald", int32(3), "minecraft:firefly_bush"},
+	{"minecraft:emerald", int32(1), "minecraft:cactus_flower"},
+	{"minecraft:emerald", int32(5), "minecraft:cherry_sapling"},
 }
 
 var wanderingTraderSpecialTrades = [][3]any{
