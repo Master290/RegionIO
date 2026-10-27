@@ -635,3 +635,202 @@ func TestTrialChambersTrailRuinsNetherAndEndLootAndMobs(t *testing.T) {
 		}
 	}
 }
+
+func TestStructureFeatureEdgeSweepAndLootSeedStability(t *testing.T) {
+	// 1. BlackstoneReplaceProcessor state preservation
+	{
+		cobbleStairs, ok := nameToStateID("minecraft:cobblestone_stairs", map[string]string{
+			"facing":      "east",
+			"half":        "top",
+			"shape":       "straight",
+			"waterlogged": "false",
+		})
+		if !ok {
+			t.Fatal("missing cobblestone_stairs state")
+		}
+		gotID, gotName := applyBlackstoneReplacement(cobbleStairs, "minecraft:cobblestone_stairs")
+		if gotName != "minecraft:blackstone_stairs" {
+			t.Fatalf("applyBlackstoneReplacement name = %q, want minecraft:blackstone_stairs", gotName)
+		}
+		wantStairs, ok := nameToStateID("minecraft:blackstone_stairs", map[string]string{
+			"facing":      "east",
+			"half":        "top",
+			"shape":       "straight",
+			"waterlogged": "false",
+		})
+		if !ok || gotID != wantStairs {
+			t.Fatalf("applyBlackstoneReplacement stateID = %d, want %d", gotID, wantStairs)
+		}
+	}
+
+	// 2. RottableBlocks filter in minecraft:block_rot
+	{
+		fs, err := worldgen.LoadFeatureSet()
+		if err != nil {
+			t.Fatalf("LoadFeatureSet: %v", err)
+		}
+		if !matchesRottableBlocks("minecraft:oxidized_copper", []string{"minecraft:oxidized_copper", "#minecraft:terracotta"}, fs) {
+			t.Errorf("expected minecraft:oxidized_copper to match rottable_blocks")
+		}
+		if matchesRottableBlocks("minecraft:tuff_bricks", []string{"minecraft:oxidized_copper"}, fs) {
+			t.Errorf("expected minecraft:tuff_bricks not to match rottable_blocks")
+		}
+	}
+
+	// 3. Beached Shipwreck cross-chunk Y-height & LootTableSeed order invariance
+	{
+		const seed int64 = 77777
+		buildAndPlace := func(reverse bool) ([]StructureBlockEntity, int) {
+			start := BuildShipwreckStart(seed, 0, 0, true)
+			start.Template = "shipwreck/with_mast"
+			region := buildFlatTestDecorationRegion(t, 0, 0, 2, 64, false)
+			// Add a slight slope across x so footprint columns matter.
+			sandID, _ := nameToStateID("minecraft:sand", nil)
+			for cx := int32(-1); cx <= 1; cx++ {
+				for cz := int32(-1); cz <= 1; cz++ {
+					ch := region.chunks[[2]int32{cx, cz}]
+					for x := 0; x < 16; x++ {
+						for z := 0; z < 16; z++ {
+							wx := int(cx)*16 + x
+							topY := 64 + (wx & 3)
+							for y := 60; y <= topY; y++ {
+								ch.SetBlock(x, y, z, sandID)
+							}
+						}
+					}
+				}
+			}
+			var coords [][2]int32
+			for cx := int32(-2); cx <= 2; cx++ {
+				for cz := int32(-2); cz <= 2; cz++ {
+					coords = append(coords, [2]int32{cx, cz})
+				}
+			}
+			if reverse {
+				for i, j := 0, len(coords)-1; i < j; i, j = i+1, j-1 {
+					coords[i], coords[j] = coords[j], coords[i]
+				}
+			}
+			starts := []*ShipwreckStart{start}
+			for _, c := range coords {
+				PlaceShipwrecksForChunk(region, starts, "minecraft:shipwreck_beached", seed, c[0], c[1])
+			}
+			return collectRegionBlockEntities(region), start.Pos[1]
+		}
+		besFwd, yFwd := buildAndPlace(false)
+		besRev, yRev := buildAndPlace(true)
+		if yFwd != yRev {
+			t.Fatalf("beached shipwreck Y depends on chunk order: forward=%d reverse=%d", yFwd, yRev)
+		}
+		if len(besFwd) == 0 || len(besFwd) != len(besRev) {
+			t.Fatalf("beached shipwreck block entities count forward=%d reverse=%d", len(besFwd), len(besRev))
+		}
+		fwdSeeds := map[[3]int]int64{}
+		for _, be := range besFwd {
+			fwdSeeds[[3]int{be.X, be.Y, be.Z}] = be.LootTableSeed
+		}
+		for _, be := range besRev {
+			pos := [3]int{be.X, be.Y, be.Z}
+			if got, ok := fwdSeeds[pos]; !ok || got != be.LootTableSeed {
+				t.Errorf("shipwreck chest at %v LootTableSeed mismatch: forward=%d reverse=%d", pos, got, be.LootTableSeed)
+			}
+		}
+
+		// Also verify single-chunk region doesn't sink shipwreck to MinY (-64) when footprint extends into unloaded chunk.
+		singleChunkStart := BuildShipwreckStart(seed, 0, 0, true)
+		singleChunkStart.Template = "shipwreck/with_mast"
+		singleRegion := buildFlatTestDecorationRegion(t, 0, 0, 0, 64, false)
+		PlaceShipwrecksForChunk(singleRegion, []*ShipwreckStart{singleChunkStart}, "minecraft:shipwreck_beached", seed, 0, 0)
+		if singleChunkStart.Pos[1] < 50 {
+			t.Errorf("single-chunk beached shipwreck sank to Y=%d, want >= 50", singleChunkStart.Pos[1])
+		}
+	}
+
+	// 4. Desert Pyramid & Jungle Temple cross-chunk height and LootTableSeed stability
+	{
+		const seed int64 = 424242
+		runPyramid := func(reverse bool) ([]StructureBlockEntity, int) {
+			start := BuildDesertPyramidStart(seed, 0, 0)
+			region := buildFlatTestDecorationRegion(t, 0, 0, 2, 66, false)
+			var coords [][2]int32
+			for cx := int32(-2); cx <= 2; cx++ {
+				for cz := int32(-2); cz <= 2; cz++ {
+					coords = append(coords, [2]int32{cx, cz})
+				}
+			}
+			if reverse {
+				for i, j := 0, len(coords)-1; i < j; i, j = i+1, j-1 {
+					coords[i], coords[j] = coords[j], coords[i]
+				}
+			}
+			starts := []*DesertPyramidStart{start}
+			for _, c := range coords {
+				PlaceDesertPyramidsForChunk(region, starts, seed, c[0], c[1])
+			}
+			return collectRegionBlockEntities(region), start.Piece.box.minY
+		}
+		besFwd, yFwd := runPyramid(false)
+		besRev, yRev := runPyramid(true)
+		if yFwd != yRev || yFwd < 50 {
+			t.Fatalf("desert pyramid minY forward=%d reverse=%d", yFwd, yRev)
+		}
+		fwdSeeds := map[[3]int]int64{}
+		for _, be := range besFwd {
+			fwdSeeds[[3]int{be.X, be.Y, be.Z}] = be.LootTableSeed
+		}
+		for _, be := range besRev {
+			pos := [3]int{be.X, be.Y, be.Z}
+			if got, ok := fwdSeeds[pos]; !ok || got != be.LootTableSeed {
+				t.Errorf("desert pyramid BE at %v LootTableSeed forward=%d reverse=%d", pos, got, be.LootTableSeed)
+			}
+		}
+	}
+
+	// 5. Jigsaw Trail Ruins & Trial Chambers cross-chunk CappedProcessor and LootTableSeed order invariance
+	{
+		sets, err := worldgen.LoadStructureSets()
+		if err != nil {
+			t.Fatalf("LoadStructureSets: %v", err)
+		}
+		flatSurface := func(x, z int, oceanFloor bool) int { return 64 }
+		def := sets.Structures["minecraft:trail_ruins"]
+		start, err := BuildJigsawStart(nil, sets, def, 2024, 0, 0, flatSurface)
+		if err != nil || start == nil {
+			t.Fatalf("BuildJigsawStart trail_ruins: %v", err)
+		}
+		runTrailRuins := func(reverse bool) map[[3]int]StructureBlockEntity {
+			region := buildFlatTestDecorationRegion(t, 0, 0, 2, 64, false)
+			var coords [][2]int32
+			for cx := int32(-2); cx <= 2; cx++ {
+				for cz := int32(-2); cz <= 2; cz++ {
+					coords = append(coords, [2]int32{cx, cz})
+				}
+			}
+			if reverse {
+				for i, j := 0, len(coords)-1; i < j; i, j = i+1, j-1 {
+					coords[i], coords[j] = coords[j], coords[i]
+				}
+			}
+			starts := []*JigsawStart{start}
+			for _, c := range coords {
+				PlaceJigsawStartsForChunk(region, starts, "minecraft:trail_ruins", 3, 2024, c[0], c[1])
+			}
+			out := map[[3]int]StructureBlockEntity{}
+			for _, be := range collectRegionBlockEntities(region) {
+				out[[3]int{be.X, be.Y, be.Z}] = be
+			}
+			return out
+		}
+		fwd := runTrailRuins(false)
+		rev := runTrailRuins(true)
+		if len(fwd) == 0 || len(fwd) != len(rev) {
+			t.Fatalf("trail_ruins block entities count forward=%d reverse=%d", len(fwd), len(rev))
+		}
+		for pos, a := range fwd {
+			b, ok := rev[pos]
+			if !ok || a.LootTable != b.LootTable || a.LootTableSeed != b.LootTableSeed {
+				t.Errorf("trail_ruins BE at %v mismatch: forward=%+v reverse=%+v", pos, a, b)
+			}
+		}
+	}
+}

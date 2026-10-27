@@ -1315,6 +1315,70 @@ func (r *decorationRegion) placeBlockPileFeature(random worldgen.RandomSource, o
 	}
 }
 
+var blackstoneReplacements = map[string]string{
+	"minecraft:cobblestone":              "minecraft:blackstone",
+	"minecraft:mossy_cobblestone":        "minecraft:blackstone",
+	"minecraft:stone":                    "minecraft:polished_blackstone",
+	"minecraft:stone_bricks":             "minecraft:polished_blackstone_bricks",
+	"minecraft:mossy_stone_bricks":       "minecraft:polished_blackstone_bricks",
+	"minecraft:cobblestone_stairs":       "minecraft:blackstone_stairs",
+	"minecraft:mossy_cobblestone_stairs": "minecraft:blackstone_stairs",
+	"minecraft:stone_stairs":             "minecraft:polished_blackstone_stairs",
+	"minecraft:stone_brick_stairs":       "minecraft:polished_blackstone_brick_stairs",
+	"minecraft:mossy_stone_brick_stairs": "minecraft:polished_blackstone_brick_stairs",
+	"minecraft:cobblestone_slab":         "minecraft:blackstone_slab",
+	"minecraft:mossy_cobblestone_slab":   "minecraft:blackstone_slab",
+	"minecraft:smooth_stone_slab":        "minecraft:polished_blackstone_slab",
+	"minecraft:stone_slab":               "minecraft:polished_blackstone_slab",
+	"minecraft:stone_brick_slab":         "minecraft:polished_blackstone_brick_slab",
+	"minecraft:mossy_stone_brick_slab":   "minecraft:polished_blackstone_brick_slab",
+	"minecraft:stone_brick_wall":         "minecraft:polished_blackstone_brick_wall",
+	"minecraft:mossy_stone_brick_wall":   "minecraft:polished_blackstone_brick_wall",
+	"minecraft:cobblestone_wall":         "minecraft:blackstone_wall",
+	"minecraft:mossy_cobblestone_wall":   "minecraft:blackstone_wall",
+	"minecraft:chiseled_stone_bricks":    "minecraft:chiseled_polished_blackstone",
+	"minecraft:cracked_stone_bricks":     "minecraft:cracked_polished_blackstone_bricks",
+	"minecraft:iron_bars":                "minecraft:chain",
+}
+
+func applyBlackstoneReplacement(curState uint16, curName string) (uint16, string) {
+	replName, ok := blackstoneReplacements[normalizeResourceID(curName)]
+	if !ok {
+		return curState, curName
+	}
+	if st, ok := stateByID(curState); ok && len(st.Properties) > 0 {
+		if id, ok := nameToStateID(replName, st.Properties); ok {
+			return id, replName
+		}
+	}
+	if id, ok := nameToStateID(replName, nil); ok {
+		return id, replName
+	}
+	return curState, curName
+}
+
+func matchesRottableBlocks(blockName string, rottable []string, fs *worldgen.FeatureSet) bool {
+	if len(rottable) == 0 {
+		return true
+	}
+	want := normalizeResourceID(blockName)
+	for _, entry := range rottable {
+		if strings.HasPrefix(entry, "#") {
+			if fs != nil {
+				tag := normalizeResourceID(strings.TrimPrefix(entry, "#"))
+				if blockTagContains(fs, tag, want) {
+					return true
+				}
+			}
+			continue
+		}
+		if normalizeResourceID(entry) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func placeJigsawElementInChunk(
 	region *decorationRegion,
 	reg *worldgen.JigsawDataRegistry,
@@ -1380,6 +1444,15 @@ func placeJigsawElementInChunk(
 		for _, orig := range pal.blocks {
 			rel := worldgen.TransformBlockPos(orig.Pos, "none", rotation, [3]int{0, 0, 0})
 			worldPos := [3]int{pos[0] + rel[0], pos[1] + rel[1], pos[2] + rel[2]}
+			// StructureTemplate.processBlockInfos filters by settings.getBoundingBox()
+			// (chunkBox) before running processBlock and CappedProcessor.
+			if worldPos[0] < chunkBox.minX || worldPos[0] > chunkBox.maxX ||
+				worldPos[2] < chunkBox.minZ || worldPos[2] > chunkBox.maxZ {
+				continue
+			}
+			if !terrainMatching && (worldPos[1] < chunkBox.minY || worldPos[1] > chunkBox.maxY) {
+				continue
+			}
 			curState := orig.State
 			curName := orig.BlockName
 
@@ -1401,7 +1474,7 @@ func placeJigsawElementInChunk(
 				curName = fName
 			}
 
-			// 3. Configured processBlock processors (RuleProcessor, BlockRotProcessor, ProtectedBlocksProcessor).
+			// 3. Configured processBlock processors (RuleProcessor, BlockRotProcessor, ProtectedBlocksProcessor, BlackstoneReplaceProcessor, BlockIgnoreProcessor).
 			discarded := false
 			var ruleLootTable string
 			var ruleLootSeed int64
@@ -1431,9 +1504,9 @@ func placeJigsawElementInChunk(
 						break
 					}
 				case "minecraft:block_rot":
-					if proc.Integrity < 1.0 {
+					if matchesRottableBlocks(curName, proc.RottableBlocks, fs) && proc.Integrity < 1.0 {
 						rotRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
-						if rotRng.NextFloat() > proc.Integrity {
+						if proc.Integrity <= 0.0 || rotRng.NextFloat() > proc.Integrity {
 							discarded = true
 						}
 					}
@@ -1445,6 +1518,16 @@ func placeJigsawElementInChunk(
 							if blockTagContains(fs, tag, exSt.Name) {
 								discarded = true
 							}
+						}
+					}
+				case "minecraft:blackstone_replace":
+					curState, curName = applyBlackstoneReplacement(curState, curName)
+				case "minecraft:block_ignore":
+					want := normalizeResourceID(curName)
+					for _, b := range proc.Blocks {
+						if normalizeResourceID(b.Name) == want {
+							discarded = true
+							break
 						}
 					}
 				}
@@ -1460,6 +1543,9 @@ func placeJigsawElementInChunk(
 			if terrainMatching {
 				surfY := region.heightAt("WORLD_SURFACE_WG", worldPos[0], worldPos[2])
 				worldPos[1] = (surfY - 1) + orig.Pos[1]
+				if worldPos[1] < chunkBox.minY || worldPos[1] > chunkBox.maxY {
+					continue
+				}
 			}
 
 			// 5. LegacySinglePoolElement runs BlockIgnoreProcessor.STRUCTURE_AND_AIR last.
@@ -1550,13 +1636,6 @@ func placeJigsawElementInChunk(
 				continue
 			}
 
-			// Clip to chunkBox.
-			if worldPos[0] < chunkBox.minX || worldPos[0] > chunkBox.maxX ||
-				worldPos[1] < chunkBox.minY || worldPos[1] > chunkBox.maxY ||
-				worldPos[2] < chunkBox.minZ || worldPos[2] > chunkBox.maxZ {
-				continue
-			}
-
 			stateToPlace := rotateTemplateState(curState, rotation)
 
 			// RandomizableContainer LootTableSeed draw on chunk's decoration random.
@@ -1564,7 +1643,7 @@ func placeJigsawElementInChunk(
 			// the placed block at worldPos still creates a matching BlockEntity.
 			keepTemplateNBT := orig.NBT != nil && orig.BlockName != "minecraft:jigsaw" && curName == orig.BlockName
 			var containerLootSeed int64
-			if keepTemplateNBT && orig.IsRandomizableContainer {
+			if keepTemplateNBT && orig.IsRandomizableContainer && ruleLootTable == "" {
 				containerLootSeed = random.NextLong()
 			}
 
@@ -1587,6 +1666,15 @@ func placeJigsawElementInChunk(
 			region.setBlockGlobal(worldPos[0], worldPos[1], worldPos[2], stateToPlace)
 
 			if ruleLootTable != "" {
+				if keepTemplateNBT {
+					if be, ok := extractTemplateBlockEntity(worldPos[0], worldPos[1], worldPos[2], curName, orig.NBT, ruleLootSeed); ok {
+						be.LootTable = ruleLootTable
+						be.LootTableSeed = ruleLootSeed
+						be.Items = nil
+						region.addStructureBlockEntity(be)
+						continue
+					}
+				}
 				beID := "minecraft:brushable_block"
 				if defBE, ok := defaultBlockEntityForBlock(curName, worldPos[0], worldPos[1], worldPos[2]); ok {
 					beID = defBE.ID

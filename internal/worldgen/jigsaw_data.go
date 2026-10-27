@@ -97,6 +97,7 @@ type ProcessorDef struct {
 	Integrity      float32            `json:"integrity"`
 	RottableBlocks []string           `json:"-"`
 	ProtectedTag   string             `json:"value"`
+	Blocks         []BlockState       `json:"blocks"`
 }
 
 func (p *ProcessorDef) UnmarshalJSON(data []byte) error {
@@ -108,6 +109,7 @@ func (p *ProcessorDef) UnmarshalJSON(data []byte) error {
 		Integrity      float32            `json:"integrity"`
 		RottableBlocks json.RawMessage    `json:"rottable_blocks"`
 		Value          string             `json:"value"`
+		Blocks         []BlockState       `json:"blocks"`
 	}
 	var r rawProc
 	if err := json.Unmarshal(data, &r); err != nil {
@@ -118,6 +120,7 @@ func (p *ProcessorDef) UnmarshalJSON(data []byte) error {
 	p.Delegate = r.Delegate
 	p.Integrity = r.Integrity
 	p.ProtectedTag = r.Value
+	p.Blocks = r.Blocks
 	if len(r.Limit) > 0 {
 		var n int
 		if err := json.Unmarshal(r.Limit, &n); err == nil {

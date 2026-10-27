@@ -98,7 +98,7 @@ func (p *scatteredPiece) updateAverageGroundHeight(region *decorationRegion, chu
 	count := 0
 	for z := p.box.minZ; z <= p.box.maxZ; z++ {
 		for x := p.box.minX; x <= p.box.maxX; x++ {
-			if msBoxContains(chunkBox, x, 64, z) {
+			if region.chunkAtBlock(x, z) != nil {
 				sumY += region.heightAt("MOTION_BLOCKING_NO_LEAVES", x, z)
 				count++
 			}
@@ -123,6 +123,9 @@ func (p *scatteredPiece) updateHeightPositionToLowestGroundHeight(region *decora
 	found := false
 	for z := p.box.minZ; z <= p.box.maxZ; z++ {
 		for x := p.box.minX; x <= p.box.maxX; x++ {
+			if region.chunkAtBlock(x, z) == nil {
+				continue
+			}
 			y := region.heightAt("MOTION_BLOCKING_NO_LEAVES", x, z)
 			if y < minY {
 				minY = y
@@ -776,6 +779,7 @@ type DesertPyramidStart struct {
 	ChunkX                 int32
 	ChunkZ                 int32
 	Piece                  scatteredPiece
+	HeightOffset           int
 	HasPlacedChest         [4]bool
 	PotentialSuspiciousPos [][3]int
 	RandomCollapsedRoofPos [3]int
@@ -787,10 +791,14 @@ func BuildDesertPyramidStart(seed int64, sx, sz int32) *DesertPyramidStart {
 	random := worldgen.NewLegacy(0)
 	random.SetLargeFeatureSeed(seed, int(sx), int(sz))
 	orientation := shHorizontalDirs[int(random.NextIntN(4))]
+	decRng, decSeed := worldgen.DecorationRandom(seed, int(sx), int(sz))
+	decRng.SetFeatureSeed(decSeed, worldgen.StructureIndexInStep("minecraft:desert_pyramid"), 4)
+	heightOffset := -int(decRng.NextIntN(3))
 	return &DesertPyramidStart{
-		ChunkX: sx,
-		ChunkZ: sz,
-		Piece:  newScatteredPiece(int(sx)*16, 64, int(sz)*16, 21, 15, 21, orientation),
+		ChunkX:       sx,
+		ChunkZ:       sz,
+		Piece:        newScatteredPiece(int(sx)*16, 64, int(sz)*16, 21, 15, 21, orientation),
+		HeightOffset: heightOffset,
 	}
 }
 
@@ -800,7 +808,7 @@ func DesertPyramidGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.
 		return nil, nil
 	}
 	set := sets.Sets["minecraft:desert_pyramids"]
-	if set == nil || !set.IsStartChunk(seed, sx, sz) {
+	if set == nil || !set.IsStartChunk(seed, sx, czFrom(sz)) {
 		return nil, nil
 	}
 	stub, ok := FindStructureSetStart(od, sets, "minecraft:desert_pyramids", seed, sx, sz)
@@ -813,9 +821,12 @@ func DesertPyramidGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.
 	return BuildDesertPyramidStart(seed, sx, sz), nil
 }
 
+func czFrom(sz int32) int32 { return sz }
+
 func postProcessDesertPyramid(region *decorationRegion, st *DesertPyramidStart, chunkBox msBox, random worldgen.RandomSource, seed int64) {
 	p := &st.Piece
-	if !p.updateHeightPositionToLowestGroundHeight(region, -int(random.NextIntN(3))) {
+	_ = random.NextIntN(3)
+	if !p.updateHeightPositionToLowestGroundHeight(region, st.HeightOffset) {
 		return
 	}
 

@@ -56,6 +56,7 @@ type ShipwreckStart struct {
 	Template       string
 	Rotation       int
 	IsBeached      bool
+	BeachedSink    int
 	Pos            [3]int
 	Box            msBox
 	HeightAdjusted bool
@@ -101,6 +102,9 @@ func BuildShipwreckStart(seed int64, sx, sz int32, isBeached bool) *ShipwreckSta
 	box.minY = MinY
 	box.maxY = MinY + WorldHeight - 1
 
+	sinkRng := worldgen.NewLegacy(worldgen.MthGetSeed(pos[0], pos[1], pos[2]) ^ seed)
+	beachedSink := int(sinkRng.NextIntN(3))
+
 	return &ShipwreckStart{
 		StructureName: name,
 		ChunkX:        sx,
@@ -108,6 +112,7 @@ func BuildShipwreckStart(seed int64, sx, sz int32, isBeached bool) *ShipwreckSta
 		Template:      tmplName,
 		Rotation:      rotation,
 		IsBeached:     isBeached,
+		BeachedSink:   beachedSink,
 		Pos:           pos,
 		Box:           box,
 	}
@@ -150,27 +155,32 @@ func placeShipwreckInChunk(region *decorationRegion, start *ShipwreckStart, chun
 			heightmap = "WORLD_SURFACE_WG"
 		}
 		minY := MinY + WorldHeight + 1
-		avgY := 0
-		ux, uy, uz := tmpl.size[0], tmpl.size[1], tmpl.size[2]
-		area := ux * uz
-		if area == 0 {
-			avgY = region.heightAt(heightmap, start.Pos[0], start.Pos[2])
-			minY = avgY
-		} else {
-			for z := start.Pos[2]; z < start.Pos[2]+uz; z++ {
-				for x := start.Pos[0]; x < start.Pos[0]+ux; x++ {
-					y := region.heightAt(heightmap, x, z)
-					avgY += y
-					if y < minY {
-						minY = y
-					}
+		sumY := 0
+		count := 0
+		uy := tmpl.size[1]
+		footprint := shipwreckBoundingBox(tmpl.size, start.Pos, start.Rotation)
+		for z := footprint.minZ; z <= footprint.maxZ; z++ {
+			for x := footprint.minX; x <= footprint.maxX; x++ {
+				if region.chunkAtBlock(x, z) == nil {
+					continue
+				}
+				y := region.heightAt(heightmap, x, z)
+				sumY += y
+				count++
+				if y < minY {
+					minY = y
 				}
 			}
-			avgY /= area
+		}
+		avgY := 64
+		if count > 0 {
+			avgY = sumY / count
+		} else {
+			minY = avgY
 		}
 		newY := avgY
 		if start.IsBeached {
-			newY = minY - uy/2 - int(random.NextIntN(3))
+			newY = minY - uy/2 - start.BeachedSink
 		}
 		start.Pos[1] = newY
 		start.HeightAdjusted = true
