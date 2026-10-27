@@ -497,8 +497,8 @@ func ComputeCopperOxidationChance(c *Cache, x, y, z int) float64 {
 	}
 	info, _ := stateByID(state)
 
-	// If this is a copper door, determine its partner half so we don't count the
-	// other half of the same door as a separate neighbor.
+	// If this is a copper door or double copper chest, determine its partner half
+	// so we don't count the other half of the same multi-block as a separate neighbor.
 	var skipPartner BlockPos
 	hasSkipPartner := false
 	if fam.Kind == "copper_door" {
@@ -507,6 +507,11 @@ func ComputeCopperOxidationChance(c *Cache, x, y, z int) float64 {
 			hasSkipPartner = true
 		} else if info.Properties["half"] == "upper" {
 			skipPartner = BlockPos{X: x, Y: y - 1, Z: z}
+			hasSkipPartner = true
+		}
+	} else if fam.Kind == "copper_chest" {
+		if pPos, ok := PartnerCopperChestPos(x, y, z, state); ok {
+			skipPartner = pPos
 			hasSkipPartner = true
 		}
 	}
@@ -539,11 +544,20 @@ func ComputeCopperOxidationChance(c *Cache, x, y, z int) float64 {
 				if !nOK || nWaxed {
 					continue
 				}
-				// Avoid double-counting the upper half of another copper door when its lower half is also in range.
+				// Avoid double-counting the upper half of another copper door or right half of a double copper chest
+				// when its primary half is also within Manhattan distance <= 4.
 				if nFam.Kind == "copper_door" {
 					if nInfo, ok := stateByID(nState); ok && nInfo.Properties["half"] == "upper" {
 						if absInt(dx)+absInt(dy-1)+absInt(dz) <= CopperOxidationScanDistance {
 							continue
+						}
+					}
+				} else if nFam.Kind == "copper_chest" {
+					if nInfo, ok := stateByID(nState); ok && nInfo.Properties["type"] == "right" {
+						if pPos, ok := PartnerCopperChestPos(nx, ny, nz, nState); ok {
+							if absInt(pPos.X-x)+absInt(pPos.Y-y)+absInt(pPos.Z-z) <= CopperOxidationScanDistance {
+								continue
+							}
 						}
 					}
 				}
@@ -620,9 +634,14 @@ func (c *Cache) TryOxidizeCopperOnRandomTick(x, y, z int, rng *rand.Rand) (uint1
 	if !ok || waxed || stage >= CopperStageOxidized {
 		return state, BlockUpdateResult{}, false
 	}
-	// Vanilla WeatheringCopperDoorBlock only runs randomTick on DoubleBlockHalf.LOWER.
+	// Vanilla WeatheringCopperDoorBlock only runs randomTick on DoubleBlockHalf.LOWER,
+	// and paired copper chests only tick on single or left half.
 	if fam.Kind == "copper_door" {
 		if info, ok := stateByID(state); ok && info.Properties["half"] == "upper" {
+			return state, BlockUpdateResult{}, false
+		}
+	} else if fam.Kind == "copper_chest" {
+		if info, ok := stateByID(state); ok && info.Properties["type"] == "right" {
 			return state, BlockUpdateResult{}, false
 		}
 	}
@@ -742,6 +761,25 @@ func (c *Cache) CleanCopperOnLightningStrike(x, y, z int, rng *rand.Rand) ([]Blo
 		if !cleanedSet[p] {
 			cleanedSet[p] = true
 			cleaned = append(cleaned, p)
+		}
+		st := c.GetBlock(p.X, p.Y, p.Z)
+		if IsCopperDoorBlock(st) {
+			if info, ok := stateByID(st); ok {
+				py := p.Y + 1
+				if info.Properties["half"] == "upper" {
+					py = p.Y - 1
+				}
+				partner := BlockPos{X: p.X, Y: py, Z: p.Z}
+				if py >= MinY && py < MinY+WorldHeight && IsCopperDoorBlock(c.GetBlock(partner.X, partner.Y, partner.Z)) && !cleanedSet[partner] {
+					cleanedSet[partner] = true
+					cleaned = append(cleaned, partner)
+				}
+			}
+		} else if IsCopperChestBlock(st) {
+			if partner, ok := PartnerCopperChestPos(p.X, p.Y, p.Z, st); ok && IsCopperChestBlock(c.GetBlock(partner.X, partner.Y, partner.Z)) && !cleanedSet[partner] {
+				cleanedSet[partner] = true
+				cleaned = append(cleaned, partner)
+			}
 		}
 	}
 
@@ -1396,6 +1434,27 @@ func (c *Cache) syncCopperDoorPartner(x, y, z int, newState uint16, res *BlockUp
 	props["powered"] = info.Properties["powered"]
 	if nextPartner, ok := nameToStateID(info.Name, props); ok && nextPartner != pState {
 		c.setBlockRecorded(x, partnerY, z, nextPartner, res)
+	}
+}
+
+func (c *Cache) syncCopperChestPartner(x, y, z int, newState uint16, res *BlockUpdateResult) {
+	if !IsCopperChestBlock(newState) {
+		return
+	}
+	partnerPos, ok := PartnerCopperChestPos(x, y, z, newState)
+	if !ok || partnerPos.Y < MinY || partnerPos.Y >= MinY+WorldHeight {
+		return
+	}
+	pState := c.GetBlock(partnerPos.X, partnerPos.Y, partnerPos.Z)
+	if !IsCopperChestBlock(pState) {
+		return
+	}
+	_, stage, waxed, ok := ClassifyCopperBlock(newState)
+	if !ok {
+		return
+	}
+	if nextPartner, ok := CopperBlockStateWithStageAndWax(pState, stage, waxed); ok && nextPartner != pState {
+		c.setBlockRecorded(partnerPos.X, partnerPos.Y, partnerPos.Z, nextPartner, res)
 	}
 }
 

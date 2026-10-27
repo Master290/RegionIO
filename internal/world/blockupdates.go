@@ -653,10 +653,12 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 	}
 
 	// Break double-block partner (doors, tall plants, extended pistons/heads) when one half is removed,
-	// or synchronize the partner half when a copper door is oxidized/waxed/scraped.
+	// or synchronize the partner half when a copper door or double copper chest is oxidized/waxed/scraped.
 	if !isSameBlockType(oldState, newState) {
 		if IsCopperDoorBlock(oldState) && IsCopperDoorBlock(newState) {
 			c.syncCopperDoorPartner(x, y, z, newState, res)
+		} else if IsCopperChestBlock(oldState) && IsCopperChestBlock(newState) {
+			c.syncCopperChestPartner(x, y, z, newState, res)
 		} else {
 			c.propagateMultiBlockPartnerBreak(x, y, z, oldState, res)
 		}

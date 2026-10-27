@@ -128,6 +128,18 @@ func IsRandomTickableBlock(state uint16) bool {
 	if strings.HasSuffix(name, "_leaves") {
 		return info.Properties["persistent"] == "false" && info.Properties["distance"] == "7"
 	}
+	if fam, stage, waxed, ok := ClassifyCopperBlock(state); ok {
+		if waxed || stage >= CopperStageOxidized {
+			return false
+		}
+		if fam.Kind == "copper_door" && info.Properties["half"] == "upper" {
+			return false
+		}
+		if fam.Kind == "copper_chest" && info.Properties["type"] == "right" {
+			return false
+		}
+		return true
+	}
 	return false
 }
 
@@ -379,6 +391,9 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 			c.randomTickSapling(x, y, z, state, info, rng, res)
 		} else if strings.HasSuffix(name, "_leaves") {
 			c.randomTickLeaves(x, y, z, state, info, res)
+		} else if CanCopperBlockOxidize(state) {
+			_, upd, _ := c.TryOxidizeCopperOnRandomTick(x, y, z, rng)
+			res.merge(upd)
 		}
 	}
 }

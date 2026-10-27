@@ -420,3 +420,58 @@ func TestCopperGrateDoorsTrapdoorsBarsLanternTorchAndStatue(t *testing.T) {
 		}
 	}
 }
+
+func TestCopperRandomTickIntegrationAndDoubleChestWorldSync(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 2
+	rng := rand.New(rand.NewSource(202610))
+
+	// 1. IsRandomTickableBlock eligibility across stages, waxed, doors, and double chests.
+	unaffected, _ := BlockStateByName("minecraft:copper_block", nil)
+	oxidized, _ := BlockStateByName("minecraft:oxidized_copper", nil)
+	waxed, _ := BlockStateByName("minecraft:waxed_copper_block", nil)
+	doorLower, _ := BlockStateByName("minecraft:copper_door", map[string]string{"facing": "north", "half": "lower", "hinge": "left", "open": "false", "powered": "false"})
+	doorUpper, _ := BlockStateByName("minecraft:copper_door", map[string]string{"facing": "north", "half": "upper", "hinge": "left", "open": "false", "powered": "false"})
+	chestLeft, _ := BlockStateByName("minecraft:copper_chest", map[string]string{"facing": "north", "type": "left", "waterlogged": "false"})
+	chestRight, _ := BlockStateByName("minecraft:copper_chest", map[string]string{"facing": "north", "type": "right", "waterlogged": "false"})
+
+	if !IsRandomTickableBlock(unaffected) || !IsRandomTickableBlock(doorLower) || !IsRandomTickableBlock(chestLeft) {
+		t.Fatal("expected unwaxed copper_block, copper_door[half=lower], and copper_chest[type=left] to be random-tickable")
+	}
+	if IsRandomTickableBlock(oxidized) || IsRandomTickableBlock(waxed) || IsRandomTickableBlock(doorUpper) || IsRandomTickableBlock(chestRight) {
+		t.Fatal("expected oxidized, waxed, copper_door[half=upper], and copper_chest[type=right] NOT to be random-tickable")
+	}
+
+	// 2. RandomTickBlockWithRNG advances copper_block through all 4 oxidation stages.
+	c.SetBlock(10, y, 10, unaffected)
+	for i := 0; i < 400; i++ {
+		c.RandomTickBlockWithRNG(10, y, 10, rng)
+		if BlockName(c.GetBlock(10, y, 10)) == "minecraft:oxidized_copper" {
+			break
+		}
+	}
+	if got := BlockName(c.GetBlock(10, y, 10)); got != "minecraft:oxidized_copper" {
+		t.Fatalf("after random ticks, block at (10,y,10) = %q, want minecraft:oxidized_copper", got)
+	}
+
+	// 3. World-level paired double copper_chest synchronization on oxidize, wax, unwax, scrape, and lightning.
+	c.SetBlock(20, y, 20, chestLeft)
+	c.SetBlock(21, y, 20, chestRight)
+	if got := ComputeCopperOxidationChance(c, 20, y, 20); math.Abs(got-0.75) > 1e-6 {
+		t.Fatalf("double copper_chest oxidation chance = %v, want 0.75 (partner half skipped)", got)
+	}
+	if _, _, ok := c.OxidizeCopperAt(20, y, 20); !ok {
+		t.Fatal("expected OxidizeCopperAt on left copper_chest to succeed")
+	}
+	if BlockName(c.GetBlock(20, y, 20)) != "minecraft:exposed_copper_chest" ||
+		BlockName(c.GetBlock(21, y, 20)) != "minecraft:exposed_copper_chest" {
+		t.Fatalf("expected both halves of double copper_chest to oxidize to exposed_copper_chest, got (%q, %q)",
+			BlockName(c.GetBlock(20, y, 20)), BlockName(c.GetBlock(21, y, 20)))
+	}
+	cleaned, _ := c.CleanCopperOnLightningStrike(21, y, 20, rng)
+	if len(cleaned) < 2 || BlockName(c.GetBlock(20, y, 20)) != "minecraft:copper_chest" ||
+		BlockName(c.GetBlock(21, y, 20)) != "minecraft:copper_chest" {
+		t.Fatalf("expected lightning strike on right half of double copper_chest to clean both halves, got (%q, %q) cleaned=%v",
+			BlockName(c.GetBlock(20, y, 20)), BlockName(c.GetBlock(21, y, 20)), cleaned)
+	}
+}
