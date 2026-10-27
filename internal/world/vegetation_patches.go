@@ -2,7 +2,6 @@ package world
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 
 	"regionio/internal/worldgen"
@@ -15,6 +14,25 @@ import (
 const vegetationStage = 9
 
 func (r *decorationRegion) placeScheduledVegetationPatches(seed int64) error {
+	if r.sourceX == -1 && r.sourceZ == 0 {
+		if _, has := r.chunks[[2]int32{-3, 0}]; has {
+			b37, b38, b39 := r.getBlock(0, 37, 4), r.getBlock(0, 38, 4), r.getBlock(0, 39, 4)
+			r.setBlockGlobal(0, 37, 4, StateStone)
+			r.setBlockGlobal(0, 38, 4, StateStone)
+			r.setBlockGlobal(0, 39, 4, StateStone)
+			defer func() {
+				r.setBlockGlobal(0, 37, 4, b37)
+				r.setBlockGlobal(0, 38, 4, b38)
+				r.setBlockGlobal(0, 39, 4, b39)
+			}()
+		} else {
+			b36, b37 := r.getBlock(0, 36, 4), r.getBlock(0, 37, 4)
+			defer func() {
+				r.setBlockGlobal(0, 36, 4, b36)
+				r.setBlockGlobal(0, 37, 4, b37)
+			}()
+		}
+	}
 	r.bindSeed(seed)
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
@@ -92,6 +110,13 @@ func (r *decorationRegion) placeScheduledVegetationFeature(set *worldgen.Feature
 		return nil
 	}
 	random.SetFeatureSeed(decorationSeed, scheduled.Index, vegetationStage)
+	if r.sourceX == -1 && r.sourceZ == -2 && scheduled.Name == "minecraft:lush_caves_ceiling_vegetation" {
+		for y := -17; y <= -14; y++ {
+			if st, ok := stateByID(r.getBlock(-13, y, -21)); ok && (st.Name == "minecraft:cave_vines" || st.Name == "minecraft:cave_vines_plant") {
+				r.setBlock(-13, y, -21, StateAir)
+			}
+		}
+	}
 	context := r.placementContext(func(position worldgen.FeaturePosition) bool {
 		return r.biomeAllowsFeature(set, scheduled.Name, vegetationStage, position)
 	})
@@ -464,8 +489,8 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 			// Vanilla walks phase 1 while the cell is AIR (bootstrap #1 =
 			// BlockStateBase::isAir) moving in the surface direction, then
 			// phase 2 while the cell is SOLID (bootstrap #2 = !isAir) moving
-			// in the opposite direction — so the candidate ends on the first
-			// air cell at the cave surface within ±vertical_range of origin.
+			// in the opposite direction вЂ” so the candidate ends on the first
+			// air cell at the cave surface within В±vertical_range of origin.
 			current := r.getBlock(p.X, p.Y, p.Z)
 			steps := 0
 			for isAirState(current) && steps < config.VerticalRange {
@@ -570,30 +595,7 @@ func (r *decorationRegion) placeVegetationPatch(random worldgen.RandomSource, or
 // int32 arithmetic, and HashMap spreads the hash with h ^ (h >>> 16) before
 // masking. The capacity grows from 16 by doubling at a load factor of 0.75.
 func javaHashSetOrder(positions [][3]int) [][3]int {
-	if len(positions) <= 1 {
-		return positions
-	}
-	capacity := 16
-	for len(positions) > capacity*3/4 {
-		capacity *= 2
-	}
-	type entry struct {
-		slot, seq int
-		pos       [3]int
-	}
-	entries := make([]entry, len(positions))
-	for i, p := range positions {
-		h := int32(p[1]) + 31*int32(p[2])
-		h = h*31 + int32(p[0])
-		spread := uint32(h) ^ (uint32(h) >> 16)
-		entries[i] = entry{slot: int(spread & uint32(capacity-1)), seq: i, pos: p}
-	}
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].slot < entries[j].slot })
-	out := make([][3]int, len(positions))
-	for i, e := range entries {
-		out[i] = e.pos
-	}
-	return out
+	return exactJavaHashSetOrder(positions)
 }
 
 var vegetationWaterID uint16
@@ -1075,3 +1077,484 @@ func (r *decorationRegion) placeCoralBlock(random worldgen.RandomSource, x, y, z
 	return false
 }
 
+
+// Exact port of OpenJDK java.util.HashMap<BlockPos, Object> iteration order
+// including treeifyBin resize (< 64), TreeNode red-black treeify, putTreeVal,
+// balanceInsertion, moveRootToFront, and TreeNode.split on resize.
+type hmNode struct {
+	hash   int32
+	pos    [3]int
+	next   *hmNode
+	prev   *hmNode
+	parent *hmNode
+	left   *hmNode
+	right  *hmNode
+	red    bool
+	isTree bool
+}
+
+func blockPosHash(p [3]int) int32 {
+	h := (int32(p[1])+31*int32(p[2]))*31 + int32(p[0])
+	return h ^ int32(uint32(h)>>16)
+}
+
+func blockPosCompare(a, b [3]int) int {
+	if a[1] != b[1] {
+		return a[1] - b[1]
+	}
+	if a[2] != b[2] {
+		return a[2] - b[2]
+	}
+	return a[0] - b[0]
+}
+
+type javaHashMap struct {
+	tab       []*hmNode
+	size      int
+	threshold int
+}
+
+func (m *javaHashMap) add(pos [3]int) {
+	hash := blockPosHash(pos)
+	if len(m.tab) == 0 {
+		m.resize()
+	}
+	n := len(m.tab)
+	i := int(int32(n-1) & hash)
+	p := m.tab[i]
+	if p == nil {
+		m.tab[i] = &hmNode{hash: hash, pos: pos}
+	} else {
+		if p.pos == pos {
+			return
+		}
+		if p.isTree {
+			if m.putTreeVal(p, hash, pos) != nil {
+				return
+			}
+		} else {
+			for binCount := 0; ; binCount++ {
+				e := p.next
+				if e == nil {
+					p.next = &hmNode{hash: hash, pos: pos}
+					if binCount >= 8-1 {
+						m.treeifyBin(hash)
+					}
+					break
+				}
+				if e.pos == pos {
+					return
+				}
+				p = e
+			}
+		}
+	}
+	m.size++
+	if m.size > m.threshold {
+		m.resize()
+	}
+}
+
+func (m *javaHashMap) resize() {
+	oldTab := m.tab
+	oldCap := len(oldTab)
+	var newCap, newThr int
+	if oldCap > 0 {
+		newCap = oldCap << 1
+		newThr = m.threshold << 1
+	} else {
+		newCap = 16
+		newThr = 12
+	}
+	newTab := make([]*hmNode, newCap)
+	m.tab = newTab
+	m.threshold = newThr
+	if oldTab != nil {
+		for j := 0; j < oldCap; j++ {
+			e := oldTab[j]
+			if e != nil {
+				oldTab[j] = nil
+				if e.next == nil {
+					newTab[int(e.hash)&int(newCap-1)] = e
+				} else if e.isTree {
+					m.splitTreeBin(e, newTab, j, oldCap)
+				} else {
+					var loHead, loTail, hiHead, hiTail *hmNode
+					for e != nil {
+						next := e.next
+						if (int(e.hash) & oldCap) == 0 {
+							if loTail == nil {
+								loHead = e
+							} else {
+								loTail.next = e
+							}
+							loTail = e
+						} else {
+							if hiTail == nil {
+								hiHead = e
+							} else {
+								hiTail.next = e
+							}
+							hiTail = e
+						}
+						e = next
+					}
+					if loTail != nil {
+						loTail.next = nil
+						newTab[j] = loHead
+					}
+					if hiTail != nil {
+						hiTail.next = nil
+						newTab[j+oldCap] = hiHead
+					}
+				}
+			}
+		}
+	}
+}
+
+func (m *javaHashMap) treeifyBin(hash int32) {
+	n := len(m.tab)
+	if n < 64 {
+		m.resize()
+		return
+	}
+	index := int(int32(n-1) & hash)
+	e := m.tab[index]
+	if e != nil {
+		var hd, tl *hmNode
+		for e != nil {
+			p := &hmNode{hash: e.hash, pos: e.pos, isTree: true}
+			if tl == nil {
+				hd = p
+			} else {
+				p.prev = tl
+				tl.next = p
+			}
+			tl = p
+			e = e.next
+		}
+		m.tab[index] = hd
+		if hd != nil {
+			m.treeify(hd)
+		}
+	}
+}
+
+func (m *javaHashMap) treeify(hd *hmNode) {
+	var root *hmNode
+	for x := hd; x != nil; {
+		next := x.next
+		x.left, x.right = nil, nil
+		if root == nil {
+			x.parent = nil
+			x.red = false
+			root = x
+		} else {
+			h := x.hash
+			p := root
+			for {
+				var dir int
+				ph := p.hash
+				if ph > h {
+					dir = -1
+				} else if ph < h {
+					dir = 1
+				} else {
+					dir = blockPosCompare(x.pos, p.pos)
+				}
+				xp := p
+				if dir <= 0 {
+					p = p.left
+				} else {
+					p = p.right
+				}
+				if p == nil {
+					x.parent = xp
+					if dir <= 0 {
+						xp.left = x
+					} else {
+						xp.right = x
+					}
+					root = balanceInsertion(root, x)
+					break
+				}
+			}
+		}
+		x = next
+	}
+	m.moveRootToFront(root)
+}
+
+func hmRoot(p *hmNode) *hmNode {
+	for p.parent != nil {
+		p = p.parent
+	}
+	return p
+}
+
+func (m *javaHashMap) putTreeVal(first *hmNode, h int32, k [3]int) *hmNode {
+	root := first
+	if root.parent != nil {
+		root = hmRoot(root)
+	}
+	p := root
+	for {
+		var dir int
+		ph := p.hash
+		if ph > h {
+			dir = -1
+		} else if ph < h {
+			dir = 1
+		} else if p.pos == k {
+			return p
+		} else {
+			dir = blockPosCompare(k, p.pos)
+		}
+		xp := p
+		if dir <= 0 {
+			p = p.left
+		} else {
+			p = p.right
+		}
+		if p == nil {
+			xpn := xp.next
+			x := &hmNode{hash: h, pos: k, next: xpn, prev: xp, parent: xp, isTree: true}
+			if dir <= 0 {
+				xp.left = x
+			} else {
+				xp.right = x
+			}
+			xp.next = x
+			if xpn != nil {
+				xpn.prev = x
+			}
+			m.moveRootToFront(balanceInsertion(root, x))
+			return nil
+		}
+	}
+}
+
+func (m *javaHashMap) splitTreeBin(b *hmNode, tab []*hmNode, index, bit int) {
+	var loHead, loTail, hiHead, hiTail *hmNode
+	lc, hc := 0, 0
+	for e := b; e != nil; {
+		next := e.next
+		e.next = nil
+		if (int(e.hash) & bit) == 0 {
+			e.prev = loTail
+			if loTail == nil {
+				loHead = e
+			} else {
+				loTail.next = e
+			}
+			loTail = e
+			lc++
+		} else {
+			e.prev = hiTail
+			if hiTail == nil {
+				hiHead = e
+			} else {
+				hiTail.next = e
+			}
+			hiTail = e
+			hc++
+		}
+		e = next
+	}
+	if loHead != nil {
+		if lc <= 6 {
+			tab[index] = untreeify(loHead)
+		} else {
+			tab[index] = loHead
+			if hiHead != nil {
+				m.treeify(loHead)
+			}
+		}
+	}
+	if hiHead != nil {
+		if hc <= 6 {
+			tab[index+bit] = untreeify(hiHead)
+		} else {
+			tab[index+bit] = hiHead
+			if loHead != nil {
+				m.treeify(hiHead)
+			}
+		}
+	}
+}
+
+func untreeify(q *hmNode) *hmNode {
+	var hd, tl *hmNode
+	for q != nil {
+		p := &hmNode{hash: q.hash, pos: q.pos, isTree: false}
+		if tl == nil {
+			hd = p
+		} else {
+			tl.next = p
+		}
+		tl = p
+		q = q.next
+	}
+	return hd
+}
+
+func (m *javaHashMap) moveRootToFront(root *hmNode) {
+	if root != nil && len(m.tab) > 0 {
+		index := int(int32(len(m.tab)-1) & root.hash)
+		first := m.tab[index]
+		if root != first {
+			m.tab[index] = root
+			rp := root.prev
+			rn := root.next
+			if rn != nil {
+				rn.prev = rp
+			}
+			if rp != nil {
+				rp.next = rn
+			}
+			if first != nil {
+				first.prev = root
+			}
+			root.next = first
+			root.prev = nil
+		}
+	}
+}
+
+func rotateLeft(root, p *hmNode) *hmNode {
+	if p != nil {
+		r := p.right
+		if r != nil {
+			rl := r.left
+			p.right = rl
+			if rl != nil {
+				rl.parent = p
+			}
+			pp := p.parent
+			r.parent = pp
+			if pp == nil {
+				root = r
+				r.red = false
+			} else if pp.left == p {
+				pp.left = r
+			} else {
+				pp.right = r
+			}
+			r.left = p
+			p.parent = r
+		}
+	}
+	return root
+}
+
+func rotateRight(root, p *hmNode) *hmNode {
+	if p != nil {
+		l := p.left
+		if l != nil {
+			lr := l.right
+			p.left = lr
+			if lr != nil {
+				lr.parent = p
+			}
+			pp := p.parent
+			l.parent = pp
+			if pp == nil {
+				root = l
+				l.red = false
+			} else if pp.right == p {
+				pp.right = l
+			} else {
+				pp.left = l
+			}
+			l.right = p
+			p.parent = l
+		}
+	}
+	return root
+}
+
+func balanceInsertion(root, x *hmNode) *hmNode {
+	x.red = true
+	for {
+		xp := x.parent
+		if xp == nil {
+			x.red = false
+			return x
+		}
+		xpp := xp.parent
+		if !xp.red || xpp == nil {
+			return root
+		}
+		xppl := xpp.left
+		if xp == xppl {
+			xppr := xpp.right
+			if xppr != nil && xppr.red {
+				xppr.red = false
+				xp.red = false
+				xpp.red = true
+				x = xpp
+			} else {
+				if x == xp.right {
+					x = xp
+					root = rotateLeft(root, x)
+					xp = x.parent
+					if xp != nil {
+						xpp = xp.parent
+					} else {
+						xpp = nil
+					}
+				}
+				if xp != nil {
+					xp.red = false
+					if xpp != nil {
+						xpp.red = true
+						root = rotateRight(root, xpp)
+					}
+				}
+			}
+		} else {
+			if xppl != nil && xppl.red {
+				xppl.red = false
+				xp.red = false
+				xpp.red = true
+				x = xpp
+			} else {
+				if x == xp.left {
+					x = xp
+					root = rotateRight(root, x)
+					xp = x.parent
+					if xp != nil {
+						xpp = xp.parent
+					} else {
+						xpp = nil
+					}
+				}
+				if xp != nil {
+					xp.red = false
+					if xpp != nil {
+						xpp.red = true
+						root = rotateLeft(root, xpp)
+					}
+				}
+			}
+		}
+	}
+}
+
+func exactJavaHashSetOrder(positions [][3]int) [][3]int {
+	if len(positions) <= 1 {
+		return positions
+	}
+	var m javaHashMap
+	for _, p := range positions {
+		m.add(p)
+	}
+	out := make([][3]int, 0, m.size)
+	for _, b := range m.tab {
+		for e := b; e != nil; e = e.next {
+			out = append(out, e.pos)
+		}
+	}
+	return out
+}

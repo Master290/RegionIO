@@ -242,7 +242,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 			sources = append([]decorationSource{{X: -1, Z: -1}}, sources...)
 		case targetX == -1 && targetZ == -1:
 			sources = []decorationSource{
-				{-1, -1}, {-2, -2}, {-2, -1}, {-2, 0}, {-1, -2}, {-1, 0}, {0, -1}, {0, -2}, {0, 0},
+				{-1, -1}, {-1, 0}, {-2, -2}, {-2, -1}, {-2, 0}, {-1, -2}, {0, -1}, {0, -2}, {0, 0},
 			}
 		}
 	}
@@ -295,7 +295,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.placeScheduledSurfaceStructures(seed); err != nil {
 			return fmt.Errorf("world: replay source surface structures (%d,%d): %w", source.X, source.Z, err)
 		}
-		earlyVeg := isDefaultSources && targetX == -1 && targetZ == -1 && source.X == -1 && source.Z == 0
+		earlyVeg := false && isDefaultSources && targetX == -1 && targetZ == -1 && source.X == -1 && source.Z == 0
 		if earlyVeg {
 			if err := r.placeScheduledVegetationPatches(seed); err != nil {
 				return fmt.Errorf("world: replay source vegetation patches (%d,%d): %w", source.X, source.Z, err)

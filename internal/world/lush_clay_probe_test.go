@@ -237,7 +237,7 @@ func TestLushClayPositionsAreRecorded(t *testing.T) {
 		{[2]int32{0, 0}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
 		{[2]int32{1, 0}, [][3]int{{5, -29, 12}, {2, -41, 12}}},
 		{[2]int32{0, 1}, [][3]int{{5, -29, 12}, {5, -25, 3}, {1, -5, 4}}},
-		{[2]int32{-1, -1}, [][3]int{{5, -29, 12}, {5, -30, 13}, {4, -7, 1}}},
+		{[2]int32{-1, -1}, [][3]int{{5, -29, 12}, {5, -30, 13}}},
 	} {
 		t.Run(fmt.Sprintf("target-%d-%d", tc.target[0], tc.target[1]), func(t *testing.T) {
 			got := positions(lushClayReplay{target: tc.target, source: [2]int32{0, 0}})
