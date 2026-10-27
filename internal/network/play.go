@@ -650,6 +650,7 @@ func (h *handler) serverTickLoop() {
 				h.srv.TickEnderDragons(nil)
 				h.srv.TickWardens(nil)
 				h.srv.TickFishingBobbers(nil)
+				h.srv.TickExperienceOrbs()
 			}
 			lastGameTime = nowGameTime
 		}
@@ -715,6 +716,13 @@ func (h *handler) syncVisibleEntities() error {
 			if entity.IsItem() && !entity.IsExperienceOrb() {
 				if err := h.conn.Send(protocol.PlaySetEntityData, server.EncodeItemEntityData(entity.ID, entity.Item)); err != nil {
 					return err
+				}
+			}
+			if entity.IsExperienceOrb() && h.srv != nil {
+				if metaPkt := h.srv.ExperienceOrbEntityDataPacket(entity.ID); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
 				}
 			}
 			if entity.IsVillager() && h.srv != nil {
@@ -881,6 +889,9 @@ func (h *handler) sendAddEntity(e *world.Entity) error {
 	}
 	if h.srv != nil && e.TypeName == server.EntityTypeFishingBobber {
 		return h.conn.Send(protocol.PlayAddEntity, h.srv.EncodeFishingBobberAddEntityPacket(nil, e))
+	}
+	if h.srv != nil && e.IsExperienceOrb() {
+		return h.conn.Send(protocol.PlayAddEntity, h.srv.EncodeExperienceOrbAddEntityPacket(nil, e))
 	}
 	w := protocol.NewWriter(64)
 	w.VarInt(e.ID)
@@ -1079,7 +1090,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
-				if h.srv.UseBeverageOrThrownPotion(h.session, hand) {
+				if h.srv.UseBeverageOrThrownPotion(h.session, hand) || h.srv.UseExperienceBottle(h.session, hand, nil) {
 					h.syncHotbarFromSession()
 					return h.sendBlockChangedAck(seq)
 				}
