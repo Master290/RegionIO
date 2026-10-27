@@ -43,7 +43,7 @@ func (r *decorationRegion) placeScheduledUndergroundDecoration(seed int64) error
 		}
 		switch configured.Type {
 		case "minecraft:ore", "minecraft:multiface_growth", "minecraft:sculk_patch",
-			"minecraft:dripstone_cluster", "minecraft:simple_random_selector":
+			"minecraft:dripstone_cluster", "minecraft:pointed_dripstone", "minecraft:simple_random_selector":
 		default:
 			noteNotReplayed(fmt.Sprintf("stage%d:%s", undergroundDecorationStage, configured.Type))
 			continue
@@ -97,6 +97,17 @@ func (r *decorationRegion) placeScheduledUndergroundDecoration(seed int64) error
 			}
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 				r.placeDripstoneCluster(set, random, position, config)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:pointed_dripstone":
+			config, err := set.PointedDripstone(placed.Feature)
+			if err != nil {
+				return err
+			}
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placePointedDripstone(set, random, position, config)
 				return nil
 			}); err != nil {
 				return err
@@ -720,7 +731,7 @@ func isDripstoneBase(set *worldgen.FeatureSet, state uint16) bool {
 }
 
 func (r *decorationRegion) growPointedDripstone(set *worldgen.FeatureSet, x, startY, z, tipDY, height int, mergeTips bool) {
-	if !isDripstoneBase(set, r.getBlock(x, startY-tipDY, z)) {
+	if height <= 0 || !isDripstoneBase(set, r.getBlock(x, startY-tipDY, z)) {
 		return
 	}
 	tipDir := "down"
@@ -729,8 +740,12 @@ func (r *decorationRegion) growPointedDripstone(set *worldgen.FeatureSet, x, sta
 	}
 	y := startY
 	placeOne := func(thickness string) {
+		cur := r.getBlock(x, y, z)
+		if !isDripstoneEmptyOrWater(cur) && !isBlockNamed(cur, "minecraft:pointed_dripstone") {
+			return
+		}
 		waterlogged := "false"
-		if isWaterState(r.getBlock(x, y, z)) {
+		if isWaterState(cur) {
 			waterlogged = "true"
 		}
 		if state, ok := nameToStateID("minecraft:pointed_dripstone", map[string]string{

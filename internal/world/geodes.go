@@ -135,7 +135,7 @@ func (r *decorationRegion) placeGeode(random worldgen.RandomSource, seed int64, 
 			offset: sampleGeodeInt(random, config.PointOffsetMin, config.PointOffsetMax),
 		}
 		state := r.getBlock(point.x, point.y, point.z)
-		if state == StateAir || invalidBlocks[state] {
+		if isAirState(state) || invalidBlocks[state] {
 			invalid++
 			if invalid > config.InvalidBlocksThreshold {
 				return false
@@ -215,7 +215,7 @@ func (r *decorationRegion) placeGeodeInnerPlacements(random worldgen.RandomSourc
 		for _, direction := range directions {
 			x, y, z := position[0]+direction.dx, position[1]+direction.dy, position[2]+direction.dz
 			current := r.getBlock(x, y, z)
-			if current != StateAir && !isWaterState(current) {
+			if !isAirState(current) && !isWaterState(current) {
 				continue
 			}
 			props := make(map[string]string, len(placement.Properties))

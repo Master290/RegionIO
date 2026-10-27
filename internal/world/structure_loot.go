@@ -926,10 +926,20 @@ func structureBlockEntitiesFromNBT(c *Chunk, root *nbt.Compound) {
 }
 
 // PlaceDesertWell ports net.minecraft.world.level.levelgen.feature.DesertWellFeature.place,
-// including the 2 minecraft:suspicious_sand blocks with BuiltInLootTables.DESERT_WELL_ARCHAEOLOGY.
+// including the foundation check, 5-sand cross layer at Y-1, and 2 minecraft:suspicious_sand
+// blocks with BuiltInLootTables.DESERT_WELL_ARCHAEOLOGY.
 func PlaceDesertWell(c *Chunk, ox, oy, oz int) bool {
+	return PlaceDesertWellWithRandom(c, worldgen.NewLegacy(blockPosAsLong(ox, oy, oz)), ox, oy, oz)
+}
+
+// PlaceDesertWellWithRandom ports DesertWellFeature.place using the provided RandomSource
+// to pick the 2 suspicious_sand positions at Y-1 and Y-2 beneath the 5 water cross positions.
+func PlaceDesertWellWithRandom(c *Chunk, random worldgen.RandomSource, ox, oy, oz int) bool {
 	if c == nil {
 		return false
+	}
+	if random == nil {
+		random = worldgen.NewLegacy(blockPosAsLong(ox, oy, oz))
 	}
 	stateByIDOnce.Do(buildStateTable)
 	sand, _ := nameToStateID("minecraft:sand", nil)
@@ -938,15 +948,23 @@ func PlaceDesertWell(c *Chunk, ox, oy, oz int) bool {
 	water, _ := nameToStateID("minecraft:water", map[string]string{"level": "0"})
 	suspiciousSand, _ := nameToStateID("minecraft:suspicious_sand", map[string]string{"dusted": "0"})
 
-	for oy > c.minY()+2 && c.GetBlock(ox&15, oy, oz&15) == StateAir {
+	oy++
+	for oy > c.minY()+2 && isAirState(c.GetBlock(ox&15, oy, oz&15)) {
 		oy--
 	}
 	cur := c.GetBlock(ox&15, oy, oz&15)
 	if cur != sand {
 		return false
 	}
+	for dx := -2; dx <= 2; dx++ {
+		for dz := -2; dz <= 2; dz++ {
+			if isAirState(c.GetBlock((ox+dx)&15, oy-1, (oz+dz)&15)) && isAirState(c.GetBlock((ox+dx)&15, oy-2, (oz+dz)&15)) {
+				return false
+			}
+		}
+	}
 
-	// Base sand + suspicious sand beneath water pool
+	// Base sandstone + water cross + 5-sand cross at oy-1
 	for dy := -2; dy <= 0; dy++ {
 		for dx := -2; dx <= 2; dx++ {
 			for dz := -2; dz <= 2; dz++ {
@@ -955,21 +973,13 @@ func PlaceDesertWell(c *Chunk, ox, oy, oz int) bool {
 		}
 	}
 	c.SetBlock(ox&15, oy, oz&15, water)
-	for _, d := range [4][2]int{{-1, 0}, {1, 0}, {0, -1}, {0, 1}} {
+	horiz := [4][2]int{{0, -1}, {1, 0}, {0, 1}, {-1, 0}}
+	for _, d := range horiz {
 		c.SetBlock((ox+d[0])&15, oy, (oz+d[1])&15, water)
 	}
-
-	// 2 suspicious_sand blocks placed below the well center and one offset
-	for _, sp := range [2][3]int{{ox, oy - 1, oz}, {ox, oy - 2, oz}} {
-		c.SetBlock(sp[0]&15, sp[1], sp[2]&15, suspiciousSand)
-		c.AddStructureBlockEntity(StructureBlockEntity{
-			ID:            "minecraft:brushable_block",
-			X:             sp[0],
-			Y:             sp[1],
-			Z:             sp[2],
-			LootTable:     "minecraft:archaeology/desert_well",
-			LootTableSeed: blockPosAsLong(sp[0], sp[1], sp[2]),
-		})
+	c.SetBlock(ox&15, oy-1, oz&15, sand)
+	for _, d := range horiz {
+		c.SetBlock((ox+d[0])&15, oy-1, (oz+d[1])&15, sand)
 	}
 
 	// Perimeter slabs and corner pillars + roof
@@ -999,6 +1009,30 @@ func PlaceDesertWell(c *Chunk, ox, oy, oz int) bool {
 		c.SetBlock((ox-1)&15, oy+dy, (oz+1)&15, sandstone)
 		c.SetBlock((ox+1)&15, oy+dy, (oz-1)&15, sandstone)
 		c.SetBlock((ox+1)&15, oy+dy, (oz+1)&15, sandstone)
+	}
+
+	// 2 suspicious_sand blocks placed at Y-1 and Y-2 under randomly chosen water cross positions
+	waterPositions := [5][3]int{
+		{ox, oy, oz},
+		{ox + 1, oy, oz},
+		{ox, oy, oz + 1},
+		{ox - 1, oy, oz},
+		{ox, oy, oz - 1},
+	}
+	p1 := waterPositions[int(random.NextIntN(5))]
+	p1[1] -= 1
+	p2 := waterPositions[int(random.NextIntN(5))]
+	p2[1] -= 2
+	for _, sp := range [2][3]int{p1, p2} {
+		c.SetBlock(sp[0]&15, sp[1], sp[2]&15, suspiciousSand)
+		c.AddStructureBlockEntity(StructureBlockEntity{
+			ID:            "minecraft:brushable_block",
+			X:             sp[0],
+			Y:             sp[1],
+			Z:             sp[2],
+			LootTable:     "minecraft:archaeology/desert_well",
+			LootTableSeed: blockPosAsLong(sp[0], sp[1], sp[2]),
+		})
 	}
 	return true
 }

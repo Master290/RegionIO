@@ -1053,3 +1053,154 @@ func TestJigsawFinalStateSNBTAndLecternBook(t *testing.T) {
 		t.Errorf("lectern BE = %+v", lBE)
 	}
 }
+
+func TestMiscFeaturesResidualParity(t *testing.T) {
+	stateByIDOnce.Do(buildStateTable)
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatalf("LoadFeatureSet: %v", err)
+	}
+
+	// 1. Fossils (fossil_upper + fossil_coal and fossil_lower + fossil_diamonds):
+	// Verify that overlay template's BlockIgnoreProcessor(AIR) and BlockRotProcessor(#replaceable_by_trees)
+	// preserve bone_block cells placed by the fossil template while adding coal_ore / deepslate_diamond_ore.
+	for _, featName := range []string{"minecraft:fossil_coal", "minecraft:fossil_diamonds"} {
+		cfg, err := set.Fossil(featName)
+		if err != nil {
+			t.Fatalf("set.Fossil(%s): %v", featName, err)
+		}
+		region := buildFlatTestDecorationRegion(t, 0, 0, 1, 64, false)
+		rng := worldgen.NewLegacy(123456)
+		if !region.placeFossil(set, rng, worldgen.FeaturePosition{X: 8, Y: 40, Z: 8}, cfg) {
+			t.Fatalf("placeFossil(%s) returned false", featName)
+		}
+		boneCount := 0
+		oreCount := 0
+		for x := -16; x < 32; x++ {
+			for z := -16; z < 32; z++ {
+				for y := MinY; y <= 60; y++ {
+					name := BlockName(region.getBlock(x, y, z))
+					switch name {
+					case "minecraft:bone_block":
+						boneCount++
+					case "minecraft:coal_ore", "minecraft:deepslate_coal_ore", "minecraft:deepslate_diamond_ore", "minecraft:diamond_ore":
+						oreCount++
+					}
+				}
+			}
+		}
+		if boneCount == 0 {
+			t.Errorf("%s placed 0 bone_block cells (overlay template overwrote bone blocks with air)", featName)
+		}
+		if oreCount == 0 {
+			t.Errorf("%s placed 0 ore cells from overlay template", featName)
+		}
+	}
+
+	// 2. Ocean Ruin 3-piece cold stack: ensure overwritten suspicious_gravel does not leave orphan brushable_block BEs.
+	{
+		const seed int64 = 7777
+		region := buildFlatTestDecorationRegion(t, 0, 0, 2, 48, true)
+		stub := &OceanRuinStub{
+			Rotation:  0,
+			BiomeType: "cold",
+			IsLarge:   false,
+			X:         0,
+			Z:         0,
+			Pieces: []oceanRuinPieceSpec{
+				{Template: "underwater_ruin/brick_1", Integrity: 0.8, IsLarge: false},
+				{Template: "underwater_ruin/cracked_1", Integrity: 0.7, IsLarge: false},
+				{Template: "underwater_ruin/mossy_1", Integrity: 0.5, IsLarge: false},
+			},
+		}
+		rng := worldgen.NewLegacy(seed)
+		if err := PlaceOceanRuinPieces(region, rng, stub, seed); err != nil {
+			t.Fatalf("PlaceOceanRuinPieces: %v", err)
+		}
+		for _, be := range collectRegionBlockEntities(region) {
+			if be.ID == "minecraft:brushable_block" {
+				blockName := BlockName(region.getBlock(be.X, be.Y, be.Z))
+				if blockName != "minecraft:suspicious_gravel" && blockName != "minecraft:suspicious_sand" {
+					t.Errorf("orphan brushable_block BE at (%d,%d,%d) on non-brushable block %q", be.X, be.Y, be.Z, blockName)
+				}
+			}
+		}
+	}
+
+	// 3. Geode inner placements into cave_air:
+	{
+		cfg, err := set.Geode("minecraft:amethyst_geode")
+		if err != nil {
+			t.Fatalf("set.Geode: %v", err)
+		}
+		region := buildFlatTestDecorationRegion(t, 0, 0, 1, 40, false)
+		caveAirID, ok := nameToStateID("minecraft:cave_air", nil)
+		if !ok {
+			t.Fatalf("missing minecraft:cave_air")
+		}
+		buddingID, _ := nameToStateID("minecraft:budding_amethyst", nil)
+		region.setBlock(8, 30, 8, buddingID)
+		region.setBlock(8, 31, 8, caveAirID)
+		cannotReplace := tagStateIDs(set, cfg.CannotReplaceTag)
+		rng := worldgen.NewLegacy(42)
+		region.placeGeodeInnerPlacements(rng, [][3]int{{8, 30, 8}}, cfg, cannotReplace)
+		placedName := BlockName(region.getBlock(8, 31, 8))
+		if placedName == "minecraft:cave_air" || placedName == "minecraft:air" {
+			t.Errorf("placeGeodeInnerPlacements did not place amethyst cluster/bud into cave_air, got %q", placedName)
+		}
+	}
+
+	// 4. Desert Well foundation check, 5-sand cross at Y-1, and 2 suspicious_sand BEs:
+	{
+		wellChunk := &Chunk{X: 0, Z: 0}
+		sandID, _ := nameToStateID("minecraft:sand", nil)
+		for x := 0; x < 16; x++ {
+			for z := 0; z < 16; z++ {
+				for y := 60; y <= 64; y++ {
+					wellChunk.SetBlock(x, y, z, sandID)
+				}
+			}
+		}
+		// Hollow out (6, 63, 6) and (6, 62, 6) so foundation check at (ox-2, oy-1..oy-2, oz-2) fails.
+		wellChunk.SetBlock(6, 63, 6, StateAir)
+		wellChunk.SetBlock(6, 62, 6, StateAir)
+		if PlaceDesertWell(wellChunk, 8, 64, 8) {
+			t.Errorf("PlaceDesertWell succeeded despite 2-deep air gap under foundation")
+		}
+		// Restore foundation and verify placement + 2 suspicious_sand BEs matching block states.
+		wellChunk.SetBlock(6, 63, 6, sandID)
+		wellChunk.SetBlock(6, 62, 6, sandID)
+		if !PlaceDesertWell(wellChunk, 8, 64, 8) {
+			t.Fatalf("PlaceDesertWell failed with valid foundation")
+		}
+		susCount := 0
+		for _, be := range wellChunk.StructureBlockEntities() {
+			if be.ID == "minecraft:brushable_block" && be.LootTable == "minecraft:archaeology/desert_well" {
+				if BlockName(wellChunk.GetBlock(be.X&15, be.Y, be.Z&15)) != "minecraft:suspicious_sand" {
+					t.Errorf("brushable_block BE at (%d,%d,%d) does not match suspicious_sand block", be.X, be.Y, be.Z)
+				}
+				susCount++
+			}
+		}
+		if susCount != 2 {
+			t.Errorf("desert well brushable_block count = %d, want 2", susCount)
+		}
+	}
+
+	// 5. Pointed Dripstone growth guard (does not overwrite solid stone):
+	{
+		region := buildFlatTestDecorationRegion(t, 0, 0, 1, 40, false)
+		dripBlock, _ := nameToStateID("minecraft:dripstone_block", nil)
+		stoneID, _ := nameToStateID("minecraft:stone", nil)
+		region.setBlock(8, 35, 8, dripBlock)
+		region.setBlock(8, 34, 8, StateAir)
+		region.setBlock(8, 33, 8, stoneID)
+		region.growPointedDripstone(set, 8, 34, 8, -1, 3, false)
+		if BlockName(region.getBlock(8, 34, 8)) != "minecraft:pointed_dripstone" {
+			t.Errorf("expected pointed_dripstone at (8,34,8), got %q", BlockName(region.getBlock(8, 34, 8)))
+		}
+		if BlockName(region.getBlock(8, 33, 8)) != "minecraft:stone" {
+			t.Errorf("growPointedDripstone overwrote solid stone at (8,33,8) with %q", BlockName(region.getBlock(8, 33, 8)))
+		}
+	}
+}

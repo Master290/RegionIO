@@ -396,6 +396,8 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 	}
 	type kept struct {
 		x, y, z, state int
+		lootTable      string
+		lootSeed       int64
 	}
 	var markers []marker
 	var survivors []kept
@@ -447,33 +449,32 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 		if stub.BiomeType == "cold" && c.state == int(ruinGravelID) {
 			c.state = int(ruinSuspiciousGrav)
 			converted++
-			lootSeed := worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
-			region.addStructureBlockEntity(StructureBlockEntity{
-				ID:            "minecraft:brushable_block",
-				X:             c.x,
-				Y:             c.y,
-				Z:             c.z,
-				LootTable:     "minecraft:archaeology/ocean_ruin_cold",
-				LootTableSeed: lootSeed,
-			})
+			c.lootTable = "minecraft:archaeology/ocean_ruin_cold"
+			c.lootSeed = worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
 		} else if stub.BiomeType == "warm" && c.state == int(ruinSandID) {
 			c.state = int(ruinSuspiciousSand)
 			converted++
-			lootSeed := worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
-			region.addStructureBlockEntity(StructureBlockEntity{
-				ID:            "minecraft:brushable_block",
-				X:             c.x,
-				Y:             c.y,
-				Z:             c.z,
-				LootTable:     "minecraft:archaeology/ocean_ruin_warm",
-				LootTableSeed: lootSeed,
-			})
+			c.lootTable = "minecraft:archaeology/ocean_ruin_warm"
+			c.lootSeed = worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
 		}
 	}
 	var written [][3]int
 	for _, c := range survivors {
-		region.setBlock(c.x, c.y, c.z, uint16(c.state))
-		written = append(written, [3]int{c.x, c.y, c.z})
+		if region.setBlock(c.x, c.y, c.z, uint16(c.state)) {
+			written = append(written, [3]int{c.x, c.y, c.z})
+			if c.lootTable != "" {
+				region.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:brushable_block",
+					X:             c.x,
+					Y:             c.y,
+					Z:             c.z,
+					LootTable:     c.lootTable,
+					LootTableSeed: c.lootSeed,
+				})
+			} else {
+				region.removeStructureBlockEntity(c.x, c.y, c.z)
+			}
+		}
 	}
 
 	// Data markers (handleDataMarker), after the placement pass, on the raw

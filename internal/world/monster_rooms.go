@@ -394,7 +394,14 @@ func (r *decorationRegion) placeFossil(set *worldgen.FeatureSet, random worldgen
 	case 3:
 		targetPos[2] += sx
 	}
-	box := getElementBoundingBox(worldgen.PoolElementDef{ElementType: "minecraft:single_pool_element", Location: config.FossilStructures[fossilIndex]}, targetPos, rotation)
+	box := msBox{
+		minX: lowCornerX,
+		minY: targetY,
+		minZ: lowCornerZ,
+		maxX: lowCornerX + rotSize[0] - 1,
+		maxY: targetY + rotSize[1] - 1,
+		maxZ: lowCornerZ + rotSize[2] - 1,
+	}
 	if r.countFossilEmptyCorners(box) > config.MaxEmptyCornersAllowed {
 		return false
 	}
@@ -440,6 +447,11 @@ func (r *decorationRegion) placeFossilTemplate(
 	for _, orig := range pal.blocks {
 		rel := worldgen.TransformBlockPos(orig.Pos, "none", rotation, [3]int{0, 0, 0})
 		worldPos := [3]int{targetPos[0] + rel[0], targetPos[1] + rel[1], targetPos[2] + rel[2]}
+		if worldPos[0] < boundingBox.minX || worldPos[0] > boundingBox.maxX ||
+			worldPos[1] < boundingBox.minY || worldPos[1] > boundingBox.maxY ||
+			worldPos[2] < boundingBox.minZ || worldPos[2] > boundingBox.maxZ {
+			continue
+		}
 		curState := orig.State
 		curName := orig.BlockName
 
@@ -447,9 +459,9 @@ func (r *decorationRegion) placeFossilTemplate(
 		for _, proc := range procs {
 			switch proc.ProcessorType {
 			case "minecraft:block_rot":
-				if proc.Integrity < 1.0 {
+				if matchesRottableBlocks(curName, proc.RottableBlocks, set) && proc.Integrity < 1.0 {
 					rotRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
-					if rotRng.NextFloat() > proc.Integrity {
+					if proc.Integrity <= 0.0 || rotRng.NextFloat() > proc.Integrity {
 						discarded = true
 					}
 				}
@@ -482,17 +494,20 @@ func (r *decorationRegion) placeFossilTemplate(
 						}
 					}
 				}
+			case "minecraft:block_ignore":
+				want := normalizeResourceID(curName)
+				for _, b := range proc.Blocks {
+					if normalizeResourceID(b.Name) == want {
+						discarded = true
+						break
+					}
+				}
 			}
 			if discarded {
 				break
 			}
 		}
 		if discarded || curName == "minecraft:structure_void" {
-			continue
-		}
-		if worldPos[0] < boundingBox.minX || worldPos[0] > boundingBox.maxX ||
-			worldPos[1] < boundingBox.minY || worldPos[1] > boundingBox.maxY ||
-			worldPos[2] < boundingBox.minZ || worldPos[2] > boundingBox.maxZ {
 			continue
 		}
 		stateToPlace := rotateTemplateState(curState, rotation)
