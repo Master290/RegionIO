@@ -402,6 +402,46 @@ func (s *Server) TryInteractCopperBlock(
 	return newStack, newMeta, "", false
 }
 
+// TryPlayerInteractCopperBlock handles a player right-clicking a copper block
+// at (x, y, z) using hotbar/offhand `slot`:
+//   - Waxes with `minecraft:honeycomb`, granting `minecraft:husbandry/wax_on`.
+//   - Unwaxes or scrapes with an axe, granting `minecraft:husbandry/wax_off` on unwax.
+//   - Toggles copper doors/trapdoors or cycles copper_golem_statue poses.
+//   - Updates and syncs the player's inventory slot and item durability.
+func (s *Server) TryPlayerInteractCopperBlock(session *PlayerSession, x, y, z int, slot int) (soundEvent string, handled bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return "", false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator {
+		return "", false
+	}
+	creative := snap.GameMode == GameModeCreative
+	dim := world.NormalizeDimension(snap.Dimension)
+	var held world.ItemStack
+	var meta ItemMeta
+	if slot >= 0 && slot < world.PlayerInventorySlots {
+		held = session.InventorySlot(slot)
+		meta = GetSlotItemMeta(session, slot)
+	}
+	newStack, newMeta, sound, ok := s.TryInteractCopperBlock(dim, x, y, z, held, meta, session.IsSneaking(), creative)
+	if !ok {
+		return "", false
+	}
+	if slot >= 0 && slot < world.PlayerInventorySlots {
+		session.SetInventorySlot(slot, newStack)
+		SetSlotItemMeta(session, slot, newMeta)
+		s.syncPlayerInventorySlot(session, slot)
+	}
+	switch sound {
+	case "minecraft:item.honeycomb.wax_on":
+		s.GrantCriterion(session, "minecraft:husbandry/wax_on", "wax_on")
+	case "minecraft:item.axe.wax_off":
+		s.GrantCriterion(session, "minecraft:husbandry/wax_off", "wax_off")
+	}
+	return sound, true
+}
+
 // RandomTickCopperBlockAt runs a full vanilla random-tick oxidation attempt at
 // (dim, x, y, z) (64/1125 pre-roll + Manhattan-4 neighborhood check) and
 // broadcasts any resulting state/light changes.

@@ -155,3 +155,45 @@ func TestServerLightningStrikeRedirectAndCopperBulbComparator(t *testing.T) {
 		t.Fatalf("comparator output behind lit copper_bulb = %d, want 15", cache.ComparatorOutputSignalAt(30, y, 31))
 	}
 }
+
+func TestPlayerCopperWaxOnAndWaxOffAdvancements(t *testing.T) {
+	srv, cache := newTestEnchantServer(t)
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("CopperSmith"),
+		Name: "CopperSmith",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(sess, GameModeSurvival)
+	y := world.FlatSurfaceY + 1
+
+	chiseled, _ := world.BlockStateByName("minecraft:chiseled_copper", nil)
+	cache.SetBlock(12, y, 12, chiseled)
+
+	// 1. Wax with honeycomb in slot 36 -> grants minecraft:husbandry/wax_on.
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:honeycomb", 2))
+	sound, ok := srv.TryPlayerInteractCopperBlock(sess, 12, y, 12, 36)
+	if !ok || sound != "minecraft:item.honeycomb.wax_on" {
+		t.Fatalf("TryPlayerInteractCopperBlock(honeycomb) = (%q, %v), want (wax_on, true)", sound, ok)
+	}
+	if sess.InventorySlot(36).Count != 1 {
+		t.Fatalf("honeycomb count = %d, want 1", sess.InventorySlot(36).Count)
+	}
+	if !sess.HasCompletedAdvancement("minecraft:husbandry/wax_on") {
+		t.Fatal("expected minecraft:husbandry/wax_on advancement to be granted")
+	}
+
+	// 2. Unwax with iron_axe in slot 37 -> grants minecraft:husbandry/wax_off.
+	sess.SetInventorySlot(37, world.NewNamedItemStack("minecraft:iron_axe", 1))
+	sound, ok = srv.TryPlayerInteractCopperBlock(sess, 12, y, 12, 37)
+	if !ok || sound != "minecraft:item.axe.wax_off" {
+		t.Fatalf("TryPlayerInteractCopperBlock(iron_axe) = (%q, %v), want (wax_off, true)", sound, ok)
+	}
+	if got := GetSlotItemMeta(sess, 37).Damage; got != 1 {
+		t.Fatalf("iron_axe damage = %d, want 1", got)
+	}
+	if !sess.HasCompletedAdvancement("minecraft:husbandry/wax_off") {
+		t.Fatal("expected minecraft:husbandry/wax_off advancement to be granted")
+	}
+}
