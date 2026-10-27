@@ -52,6 +52,7 @@ type playerSurvivalState struct {
 	bubbleVX          float64
 	bubbleVY          float64
 	bubbleVZ          float64
+	itemCooldowns     map[string]int
 }
 
 var playerSurvivalStates sync.Map // map[*PlayerSession]*playerSurvivalState
@@ -125,6 +126,57 @@ func (session *PlayerSession) SetFallDistance(dist float64) {
 func (s *Server) ResetPlayerFallDistance(session *PlayerSession) {
 	if session != nil {
 		session.ResetFallDistance()
+	}
+}
+
+// IsItemOnCooldown reports whether itemID (or its canonical cooldown group) is currently on cooldown for session.
+func (session *PlayerSession) IsItemOnCooldown(itemID string) bool {
+	if session == nil {
+		return false
+	}
+	key := canonicalResourceName(itemID)
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.itemCooldowns == nil {
+		return false
+	}
+	return st.itemCooldowns[key] > 0
+}
+
+// SetItemCooldown sets a cooldown in ticks for itemID on session.
+func (session *PlayerSession) SetItemCooldown(itemID string, ticks int) {
+	if session == nil {
+		return
+	}
+	key := canonicalResourceName(itemID)
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.itemCooldowns == nil {
+		st.itemCooldowns = make(map[string]int)
+	}
+	if ticks <= 0 {
+		delete(st.itemCooldowns, key)
+	} else {
+		st.itemCooldowns[key] = ticks
+	}
+}
+
+// TickItemCooldowns decrements active item cooldown timers by 1 tick.
+func (session *PlayerSession) TickItemCooldowns() {
+	if session == nil {
+		return
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for k, v := range st.itemCooldowns {
+		if v <= 1 {
+			delete(st.itemCooldowns, k)
+		} else {
+			st.itemCooldowns[k] = v - 1
+		}
 	}
 }
 
@@ -1567,8 +1619,17 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 		return false
 
 	case "minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl":
+		if itemID == "minecraft:ender_pearl" && session.IsItemOnCooldown("minecraft:ender_pearl") {
+			return false
+		}
 		if !s.consumeHandItemOne(session, hand) {
 			return false
+		}
+		if itemID == "minecraft:ender_pearl" {
+			session.SetItemCooldown("minecraft:ender_pearl", 20)
+			if session.send != nil {
+				_ = session.send(protocol.PlayCooldown, EncodeCooldownPacket("minecraft:ender_pearl", 20))
+			}
 		}
 		s.RecordItemUsed(session, itemID, 1)
 		cause := "thrown"
@@ -1854,9 +1915,37 @@ func (s *Server) traceAndResolveProjectileShot(
 			if IsCampfireBlock(hitState) && itemID == "minecraft:arrow" && s.PlayerFireTicks(session) > 0 {
 				s.TryIgniteCampfireWithProjectile(dim, bx, by, bz, true)
 			}
+			if IsDecoratedPotBlock(hitState) && s.ProjectilesCanBreakBlocks() {
+				s.HitDecoratedPotWithProjectile(dim, bx, by, bz, projID)
+				landX, landY, landZ = rx, ry, rz
+				break
+			}
+			if world.BlockName(hitState) == "minecraft:chorus_flower" && s.ProjectilesCanBreakBlocks() {
+				if valid, lc := cache.SetBlockWithLight(bx, by, bz, world.StateAir); valid {
+					s.BroadcastDimensionBlocks(dim, []world.BlockChange{
+						{Pos: world.BlockPos{X: bx, Y: by, Z: bz}, OldState: hitState, NewState: world.StateAir},
+					}, lc)
+					if s.DoTileDrops() {
+						if drop := world.NewNamedItemStack("minecraft:chorus_flower", 1); !drop.IsEmpty() {
+							s.SpawnItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, drop)
+						}
+					}
+				}
+				landX, landY, landZ = rx, ry, rz
+				break
+			}
 			if !isPassableBlock(hitState) {
 				landX, landY, landZ = rx, ry, rz
 				break
+			}
+		}
+	}
+
+	if itemID == "minecraft:ender_pearl" && !(session.IsDead() && s.EnderPearlsVanishOnDeath()) {
+		if _, travelled := s.CheckEnderPearlGateway(session, dim, landX, landY, landZ); !travelled {
+			_ = s.TeleportPlayer(session, landX, landY, landZ, snap.Yaw, snap.Pitch)
+			if snap.GameMode != GameModeCreative && snap.GameMode != GameModeSpectator {
+				s.DamagePlayerWithEffects(session, 5.0, "fall")
 			}
 		}
 	}
@@ -2781,6 +2870,55 @@ func (s *Server) DismountEntityCommand(riderPlayer *PlayerSession, riderEntityID
 	}
 	s.BroadcastDimensionChunk(dim, cx, cz, protocol.PlaySetPassengers, EncodeSetPassengersPacket(vehicleID, passengers))
 	return true
+}
+
+// MountedVehicleOfEntity returns the vehicle entity ID currently ridden by riderPlayer / riderEntityID.
+func (s *Server) MountedVehicleOfEntity(riderPlayer *PlayerSession, riderEntityID int32) int32 {
+	if s == nil {
+		return 0
+	}
+	if riderPlayer != nil {
+		riderEntityID = riderPlayer.EntityID
+		if v := s.PlayerMountedVehicle(riderPlayer); v > 0 {
+			return v
+		}
+		if v := s.PlayerMountedEquine(riderPlayer); v > 0 {
+			return v
+		}
+		if v := s.PlayerMountedCamel(riderPlayer); v > 0 {
+			return v
+		}
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	v := aux.entityMount[riderEntityID]
+	aux.mu.RUnlock()
+	return v
+}
+
+// PassengersOfEntity returns all passenger entity IDs currently riding vehicleEntityID.
+func (s *Server) PassengersOfEntity(vehicleEntityID int32) []int32 {
+	if s == nil || vehicleEntityID <= 0 {
+		return nil
+	}
+	seen := make(map[int32]bool)
+	var out []int32
+	for _, id := range s.VehiclePassengers(vehicleEntityID) {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	for r, v := range aux.entityMount {
+		if v == vehicleEntityID && r > 0 && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	aux.mu.RUnlock()
+	return out
 }
 
 // AddPlayerTag adds a scoreboard tag to session, returning false if already present.

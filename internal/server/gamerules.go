@@ -164,6 +164,7 @@ type GameRuleDef struct {
 
 var vanillaGameRules = []GameRuleDef{
 	// Boolean game rules
+	{Name: "allowEnteringNetherUsingPortals", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "announceAdvancements", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "blockExplosionDropDecay", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "commandBlockOutput", Type: GameRuleTypeBool, DefaultBool: true},
@@ -181,6 +182,7 @@ var vanillaGameRules = []GameRuleDef{
 	{Name: "doPatrolSpawning", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "doTileDrops", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "doTraderSpawning", Type: GameRuleTypeBool, DefaultBool: true},
+	{Name: "doVinesSpread", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "doWardenSpawning", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "doWeatherCycle", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "drowningDamage", Type: GameRuleTypeBool, DefaultBool: true},
@@ -192,6 +194,7 @@ var vanillaGameRules = []GameRuleDef{
 	{Name: "globalSoundEvents", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "keepInventory", Type: GameRuleTypeBool, DefaultBool: false},
 	{Name: "lavaSourceConversion", Type: GameRuleTypeBool, DefaultBool: false},
+	{Name: "locatorBar", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "logAdminCommands", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "mobExplosionDropDecay", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "mobGriefing", Type: GameRuleTypeBool, DefaultBool: true},
@@ -201,6 +204,7 @@ var vanillaGameRules = []GameRuleDef{
 	{Name: "reducedDebugInfo", Type: GameRuleTypeBool, DefaultBool: false},
 	{Name: "sendCommandFeedback", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "showDeathMessages", Type: GameRuleTypeBool, DefaultBool: true},
+	{Name: "spawnMonsters", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "spectatorsGenerateChunks", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "tntExplodes", Type: GameRuleTypeBool, DefaultBool: true},
 	{Name: "tntExplosionDropDecay", Type: GameRuleTypeBool, DefaultBool: false},
@@ -257,11 +261,13 @@ func AllGameRuleNames() []string {
 }
 
 type serverWorldSettings struct {
-	mu               sync.RWMutex
-	hardcore         bool
-	difficultyLocked bool
-	boolRules        map[string]bool
-	intRules         map[string]int
+	mu                sync.RWMutex
+	hardcore          bool
+	difficultyLocked  bool
+	hasDefaultGameMode bool
+	defaultGameMode   uint8
+	boolRules         map[string]bool
+	intRules          map[string]int
 }
 
 var serverWorldSettingsMap sync.Map // map[*Server]*serverWorldSettings
@@ -742,6 +748,186 @@ func (s *Server) LavaSourceConversion() bool { return s.GameRuleBool("lavaSource
 func (s *Server) SetLavaSourceConversion(v bool) {
 	s.SetGameRuleBool("lavaSourceConversion", v)
 }
+func (s *Server) CommandModificationBlockLimit() int {
+	v := s.GameRuleInt("commandModificationBlockLimit")
+	if v <= 0 {
+		return 32768
+	}
+	return v
+}
+func (s *Server) SetCommandModificationBlockLimit(v int) {
+	s.SetGameRuleInt("commandModificationBlockLimit", v)
+}
+func (s *Server) MaxCommandChainLength() int {
+	v := s.GameRuleInt("maxCommandChainLength")
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+func (s *Server) SetMaxCommandChainLength(v int) {
+	s.SetGameRuleInt("maxCommandChainLength", v)
+}
+func (s *Server) MaxCommandForkCount() int {
+	v := s.GameRuleInt("maxCommandForkCount")
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+func (s *Server) SetMaxCommandForkCount(v int) {
+	s.SetGameRuleInt("maxCommandForkCount", v)
+}
+func (s *Server) CommandBlockOutput() bool     { return s.GameRuleBool("commandBlockOutput") }
+func (s *Server) SetCommandBlockOutput(v bool) { s.SetGameRuleBool("commandBlockOutput", v) }
+func (s *Server) LogAdminCommands() bool       { return s.GameRuleBool("logAdminCommands") }
+func (s *Server) SetLogAdminCommands(v bool)   { s.SetGameRuleBool("logAdminCommands", v) }
+func (s *Server) EnderPearlsVanishOnDeath() bool {
+	return s.GameRuleBool("enderPearlsVanishOnDeath")
+}
+func (s *Server) SetEnderPearlsVanishOnDeath(v bool) {
+	s.SetGameRuleBool("enderPearlsVanishOnDeath", v)
+}
+func (s *Server) ProjectilesCanBreakBlocks() bool {
+	return s.GameRuleBool("projectilesCanBreakBlocks")
+}
+func (s *Server) SetProjectilesCanBreakBlocks(v bool) {
+	s.SetGameRuleBool("projectilesCanBreakBlocks", v)
+}
+func (s *Server) AllowEnteringNetherUsingPortals() bool {
+	return s.GameRuleBool("allowEnteringNetherUsingPortals")
+}
+func (s *Server) SetAllowEnteringNetherUsingPortals(v bool) {
+	s.SetGameRuleBool("allowEnteringNetherUsingPortals", v)
+}
+func (s *Server) PlayersNetherPortalDefaultDelay() int {
+	return s.GameRuleInt("playersNetherPortalDefaultDelay")
+}
+func (s *Server) SetPlayersNetherPortalDefaultDelay(v int) {
+	s.SetGameRuleInt("playersNetherPortalDefaultDelay", v)
+}
+func (s *Server) PlayersNetherPortalCreativeDelay() int {
+	return s.GameRuleInt("playersNetherPortalCreativeDelay")
+}
+func (s *Server) SetPlayersNetherPortalCreativeDelay(v int) {
+	s.SetGameRuleInt("playersNetherPortalCreativeDelay", v)
+}
+func (s *Server) MinecartMaxSpeed() int     { return s.GameRuleInt("minecartMaxSpeed") }
+func (s *Server) SetMinecartMaxSpeed(v int) { s.SetGameRuleInt("minecartMaxSpeed", v) }
+func (s *Server) SnowAccumulationHeight() int {
+	return s.GameRuleInt("snowAccumulationHeight")
+}
+func (s *Server) SetSnowAccumulationHeight(v int) {
+	s.SetGameRuleInt("snowAccumulationHeight", v)
+}
+func (s *Server) SpawnChunkRadius() int           { return s.GameRuleInt("spawnChunkRadius") }
+func (s *Server) SetSpawnChunkRadius(v int)       { s.SetGameRuleInt("spawnChunkRadius", v) }
+func (s *Server) ForgiveDeadPlayers() bool        { return s.GameRuleBool("forgiveDeadPlayers") }
+func (s *Server) SetForgiveDeadPlayers(v bool)    { s.SetGameRuleBool("forgiveDeadPlayers", v) }
+func (s *Server) UniversalAnger() bool            { return s.GameRuleBool("universalAnger") }
+func (s *Server) SetUniversalAnger(v bool)        { s.SetGameRuleBool("universalAnger", v) }
+func (s *Server) SpawnMonsters() bool             { return s.GameRuleBool("spawnMonsters") }
+func (s *Server) SetSpawnMonsters(v bool)         { s.SetGameRuleBool("spawnMonsters", v) }
+func (s *Server) LocatorBar() bool                { return s.GameRuleBool("locatorBar") }
+func (s *Server) SetLocatorBar(v bool)            { s.SetGameRuleBool("locatorBar", v) }
+func (s *Server) DoVinesSpread() bool             { return s.GameRuleBool("doVinesSpread") }
+func (s *Server) SetDoVinesSpread(v bool)         { s.SetGameRuleBool("doVinesSpread", v) }
+func (s *Server) DisableElytraMovementCheck() bool {
+	return s.GameRuleBool("disableElytraMovementCheck")
+}
+func (s *Server) SetDisableElytraMovementCheck(v bool) {
+	s.SetGameRuleBool("disableElytraMovementCheck", v)
+}
+func (s *Server) DisablePlayerMovementCheck() bool {
+	return s.GameRuleBool("disablePlayerMovementCheck")
+}
+func (s *Server) SetDisablePlayerMovementCheck(v bool) {
+	s.SetGameRuleBool("disablePlayerMovementCheck", v)
+}
+
+// DefaultGameMode returns the server's default game mode for new players (0=survival..3=spectator).
+func (s *Server) DefaultGameMode() uint8 {
+	if s == nil {
+		return GameModeSurvival
+	}
+	ws := s.worldSettings()
+	ws.mu.RLock()
+	has := ws.hasDefaultGameMode
+	mode := ws.defaultGameMode
+	ws.mu.RUnlock()
+	if has {
+		return mode
+	}
+	return GameModeSurvival
+}
+
+// SetDefaultGameMode sets the server's default game mode for new players.
+func (s *Server) SetDefaultGameMode(mode uint8) {
+	if s == nil || mode > GameModeSpectator {
+		return
+	}
+	ws := s.worldSettings()
+	ws.mu.Lock()
+	ws.hasDefaultGameMode = true
+	ws.defaultGameMode = mode
+	ws.mu.Unlock()
+	_ = s.SaveWorldSettingsFile()
+}
+
+var activePlayerEnderPearls sync.Map // map[*PlayerSession][]int32
+
+// RegisterPlayerEnderPearl records an in-flight ender pearl entity ID thrown by session.
+func (s *Server) RegisterPlayerEnderPearl(session *PlayerSession, entityID int32) {
+	if session == nil || entityID <= 0 {
+		return
+	}
+	var cur []int32
+	if v, ok := activePlayerEnderPearls.Load(session); ok {
+		cur = append(cur, v.([]int32)...)
+	}
+	cur = append(cur, entityID)
+	activePlayerEnderPearls.Store(session, cur)
+}
+
+// ActivePlayerEnderPearls returns the entity IDs of in-flight ender pearls thrown by session.
+func (s *Server) ActivePlayerEnderPearls(session *PlayerSession) []int32 {
+	if session == nil {
+		return nil
+	}
+	if v, ok := activePlayerEnderPearls.Load(session); ok {
+		src := v.([]int32)
+		out := make([]int32, len(src))
+		copy(out, src)
+		return out
+	}
+	return nil
+}
+
+// ClearPlayerEnderPearlsOnDeath vanishes any in-flight ender pearls thrown by
+// session when the enderPearlsVanishOnDeath game rule is true.
+func (s *Server) ClearPlayerEnderPearlsOnDeath(session *PlayerSession) int {
+	if s == nil || session == nil || !s.EnderPearlsVanishOnDeath() {
+		return 0
+	}
+	v, ok := activePlayerEnderPearls.LoadAndDelete(session)
+	if !ok {
+		return 0
+	}
+	ids := v.([]int32)
+	removed := 0
+	for _, id := range ids {
+		if s.entities != nil {
+			if s.entities.Get(id) != nil {
+				s.entities.Remove(id)
+				s.Broadcast(protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{id}))
+				removed++
+				continue
+			}
+		}
+		removed++
+	}
+	return removed
+}
 
 func (s *Server) syncFluidConversionRulesToCaches() {
 	if s == nil {
@@ -775,7 +961,11 @@ func (s *Server) syncFluidConversionRulesToCaches() {
 // at session's position, clearing session's inventory, carried cursor item, and
 // experience when keepInventory is false.
 func (s *Server) DropPlayerDeathInventoryAndXP(session *PlayerSession) (droppedItemIDs []int32, droppedXP int32) {
-	if s == nil || session == nil || s.KeepInventory() {
+	if s == nil || session == nil {
+		return nil, 0
+	}
+	s.ClearPlayerEnderPearlsOnDeath(session)
+	if s.KeepInventory() {
 		return nil, 0
 	}
 	snap := session.Snapshot()
@@ -860,6 +1050,7 @@ func (s *Server) SaveWorldSettingsNBT() *nbt.Compound {
 		hardcoreByte = 1
 	}
 	root.Set("hardcore", nbt.Byte(hardcoreByte))
+	root.Set("GameType", nbt.Int(int32(s.DefaultGameMode())))
 
 	rulesComp := nbt.NewCompound()
 	for _, def := range vanillaGameRules {
@@ -892,6 +1083,11 @@ func (s *Server) LoadWorldSettingsNBT(root *nbt.Compound) {
 	if tag, ok := root.Get("Difficulty"); ok {
 		if b, ok := tag.(nbt.Byte); ok && b >= 0 && b <= nbt.Byte(DifficultyHard) {
 			s.SetDifficulty(Difficulty(b))
+		}
+	}
+	if tag, ok := root.Get("GameType"); ok {
+		if gm, ok := tag.(nbt.Int); ok && gm >= 0 && gm <= nbt.Int(GameModeSpectator) {
+			s.SetDefaultGameMode(uint8(gm))
 		}
 	}
 	if tag, ok := root.Get("DifficultyLocked"); ok {

@@ -753,3 +753,138 @@ func TestCommandSuggestionsProtocol775(t *testing.T) {
 		t.Fatalf("DecodeCommandSuggestionsPacket = (%d, %d, %d, %v, %v)", gotID, gotStart, gotLen, gotSugg, err)
 	}
 }
+
+func TestCommandsAndGameRulesRemainder26_1_2(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	cfg.WorldSeed = 12345
+	srv, err := server.New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	alice, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{21}, Name: "Alice"}, func(int32, []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Alice): %v", err)
+	}
+	bob, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{22}, Name: "Bob"}, func(int32, []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Bob): %v", err)
+	}
+	_ = srv.GrantOp(alice.Profile)
+	_ = srv.TeleportPlayer(alice, 10, 64, 10, 0, 0)
+	_ = srv.TeleportPlayer(bob, 20, 64, 20, 0, 0)
+
+	// 1. /setblock, /fill, /clone with strict, #tag filters, SNBT CustomName, and commandModificationBlockLimit gamerule
+	if got := ExecuteCommand(srv, alice, `/setblock 10 64 10 minecraft:furnace{CustomName:"HotSmelter"} replace strict`); !strings.Contains(got, "Changed the block at 10, 64, 10") {
+		t.Fatalf("/setblock furnace SNBT strict = %q", got)
+	}
+	if f, ok := srv.FurnaceAt(10, 64, 10); !ok || f.CustomName != "HotSmelter" {
+		t.Fatalf("expected furnace CustomName 'HotSmelter', got ok=%v f=%+v", ok, f)
+	}
+	if got := ExecuteCommand(srv, alice, "/clone 10 64 10 10 64 10 12 64 10 replace normal strict"); !strings.Contains(got, "Successfully cloned 1 block(s)") {
+		t.Fatalf("/clone strict = %q", got)
+	}
+	if f2, ok := srv.FurnaceAt(12, 64, 10); !ok || f2.CustomName != "HotSmelter" {
+		t.Fatalf("expected cloned furnace CustomName 'HotSmelter' at (12,64,10), got ok=%v f=%+v", ok, f2)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/fill 0 64 0 2 64 0 minecraft:oak_planks strict")
+	if got := ExecuteCommand(srv, alice, "/fill 0 64 0 2 64 0 minecraft:stone replace #minecraft:planks strict"); !strings.Contains(got, "Successfully filled 3 block(s)") {
+		t.Fatalf("/fill replace #minecraft:planks strict = %q", got)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/gamerule commandModificationBlockLimit 4")
+	if got := ExecuteCommand(srv, alice, "/fill 0 64 0 4 64 0 minecraft:dirt"); !strings.Contains(got, "Too many blocks in the specified area (maximum 4, specified 5)") {
+		t.Fatalf("/fill commandModificationBlockLimit = %q", got)
+	}
+	_ = ExecuteCommand(srv, alice, "/gamerule commandModificationBlockLimit 32768")
+
+	// 2. /execute subcommands: positioned over, summon, on vehicle/passengers, store, if biome/loaded/data/items/predicate
+	_ = ExecuteCommand(srv, alice, "/setblock 30 70 30 minecraft:stone")
+	if got := ExecuteCommand(srv, alice, "/execute positioned 30 64 30 positioned over world_surface run setblock ~ ~ ~ minecraft:gold_block"); !strings.Contains(got, "Changed the block at 30, 71, 30") {
+		t.Fatalf("/execute positioned over world_surface = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute positioned 40 64 40 summon minecraft:pig run tag @s add summoned_pig"); !strings.Contains(got, "Added tag 'summoned_pig'") {
+		t.Fatalf("/execute summon = %q", got)
+	}
+	_ = ExecuteCommand(srv, alice, "/ride Bob mount @e[tag=summoned_pig,limit=1]")
+	if got := ExecuteCommand(srv, alice, "/execute as Bob on vehicle run tag @s add ridden_mount"); !strings.Contains(got, "Added tag 'ridden_mount'") {
+		t.Fatalf("/execute on vehicle = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute as @e[tag=summoned_pig,limit=1] on passengers run tag @s add riding_bob"); !strings.Contains(got, "Added tag 'riding_bob' to Bob") {
+		t.Fatalf("/execute on passengers = %q", got)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/scoreboard objectives add res dummy")
+	if got := ExecuteCommand(srv, alice, "/execute store result score Alice res run return 77"); !strings.Contains(got, "Returned 77") {
+		t.Fatalf("/execute store result score = %q", got)
+	}
+	if sc, ok := srv.GetScore("Alice", "res"); !ok || sc != 77 {
+		t.Fatalf("expected Alice score 77, got %d (ok=%v)", sc, ok)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute store result storage test:store val int 2 run return 15"); !strings.Contains(got, "Returned 15") {
+		t.Fatalf("/execute store result storage = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute if data storage test:store val"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if data storage = %q", got)
+	}
+	_ = ExecuteCommand(srv, alice, "/forceload add 10 10")
+	if got := ExecuteCommand(srv, alice, "/execute if loaded 10 64 10"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if loaded = %q", got)
+	}
+	_ = ExecuteCommand(srv, alice, "/give Alice minecraft:diamond_sword 1")
+	if got := ExecuteCommand(srv, alice, "/execute if items entity Alice container.* #minecraft:swords"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if items = %q", got)
+	}
+	_ = ExecuteCommand(srv, alice, "/weather rain 100")
+	if got := ExecuteCommand(srv, alice, "/execute if predicate minecraft:is_raining"); !strings.Contains(got, "Test passed") {
+		t.Fatalf("/execute if predicate = %q", got)
+	}
+
+	// 3. /xp negative add
+	_ = ExecuteCommand(srv, alice, "/xp set Alice 10 levels")
+	if got := ExecuteCommand(srv, alice, "/xp add Alice -4 levels"); !strings.Contains(got, "Took 4 experience levels") {
+		t.Fatalf("/xp add -4 levels = %q", got)
+	}
+	if alice.ExperienceLevel() != 6 {
+		t.Fatalf("expected Alice level 6, got %d", alice.ExperienceLevel())
+	}
+
+	// 4. /defaultgamemode, /spectate, /trigger, /rotate, /loot, /place, /random, /worldborder center ~ ~
+	if got := ExecuteCommand(srv, alice, "/defaultgamemode adventure"); !strings.Contains(got, "Adventure Mode") || srv.DefaultGameMode() != server.GameModeAdventure {
+		t.Fatalf("/defaultgamemode = %q (mode=%d)", got, srv.DefaultGameMode())
+	}
+	_ = ExecuteCommand(srv, alice, "/gamemode spectator Alice")
+	if got := ExecuteCommand(srv, alice, "/spectate Bob Alice"); !strings.Contains(got, "Alice is now spectating Bob") {
+		t.Fatalf("/spectate = %q", got)
+	}
+	_ = ExecuteCommand(srv, alice, "/scoreboard objectives add trig trigger")
+	_ = ExecuteCommand(srv, alice, "/scoreboard players enable Bob trig")
+	if got := ExecuteCommand(srv, bob, "/trigger trig add 5"); !strings.Contains(got, "Triggered [trig]") {
+		t.Fatalf("/trigger by non-op Bob = %q", got)
+	}
+	if sc, _ := srv.GetScore("Bob", "trig"); sc != 5 {
+		t.Fatalf("expected Bob trigger score 5, got %d", sc)
+	}
+	if got := ExecuteCommand(srv, bob, "/trigger trig add 1"); !strings.Contains(got, "cannot trigger this objective yet") {
+		t.Fatalf("expected locked trigger after use, got %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/rotate Bob 90 15"); !strings.Contains(got, "Rotated entity Bob") {
+		t.Fatalf("/rotate = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/loot give Bob loot minecraft:entities/zombie"); !strings.Contains(got, "Dropped") {
+		t.Fatalf("/loot give = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/place feature minecraft:oak 50 64 50"); !strings.Contains(got, "Placed feature") {
+		t.Fatalf("/place feature = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/random reset minecraft:test_seq 99 false false"); !strings.Contains(got, "Reset random sequence") {
+		t.Fatalf("/random reset = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/random value 1..10 minecraft:test_seq"); !strings.Contains(got, "Random value:") {
+		t.Fatalf("/random value = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, "/execute positioned 100 64 -200 run worldborder center ~ ~"); !strings.Contains(got, "100.00, -200.00") {
+		t.Fatalf("/execute worldborder center ~ ~ = %q", got)
+	}
+}
