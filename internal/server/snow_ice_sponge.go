@@ -353,3 +353,72 @@ func (s *Server) CheckPlayerWalkOnPowderSnowWithLeatherBoots(session *PlayerSess
 	s.TriggerWalkOnPowderSnowWithLeatherBoots(session)
 	return true
 }
+
+// ApplyPlayerFrostWalkerStep checks whether session is on the ground wearing
+// boots enchanted with `minecraft:frost_walker` (`level > 0`) and freezes
+// exposed source water within radius `min(16, 2 + level)` around the player's
+// feet into `minecraft:frosted_ice[age=0]`, broadcasting all block changes.
+func (s *Server) ApplyPlayerFrostWalkerStep(session *PlayerSession) (placed int, res world.BlockUpdateResult) {
+	if s == nil || session == nil || session.IsDead() {
+		return 0, res
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeSpectator || !snap.OnGround {
+		return 0, res
+	}
+	bootsMeta := GetSlotItemMeta(session, ArmorSlotFeet)
+	level := bootsMeta.EnchantmentLevel("minecraft:frost_walker")
+	if level <= 0 {
+		return 0, res
+	}
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return 0, res
+	}
+	bx := int(math.Floor(snap.X))
+	by := int(math.Floor(snap.Y))
+	bz := int(math.Floor(snap.Z))
+	placed, res = cache.ApplyFrostWalkerAround(bx, by, bz, level)
+	if placed > 0 {
+		s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+	}
+	return placed, res
+}
+
+// StepSnowGolemTrailAndHeat runs one server tick of Snow Golem biome heat
+// damage (`1.0` when `DoesSnowGolemMeltInBiome` is true) and snow trail
+// placement (`PlaceSnowGolemTrailAt` when `s.MobGriefing()` is true).
+func (s *Server) StepSnowGolemTrailAndHeat(entityID int32, biomeName string) (placedSnow int, heatDamage float32) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return 0, 0
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || ent.IsItem() {
+		return 0, 0
+	}
+	dim := world.NormalizeDimension(ent.Dimension)
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	by := int(math.Floor(ent.Y))
+	if world.DoesSnowGolemMeltInBiome(dim, biomeName, by) {
+		killed := s.applyDamageToMob(ent, 1.0, nil, 0, false, false)
+		if killed {
+			s.entities.Remove(entityID)
+		}
+		heatDamage = 1.0
+	}
+	if cache != nil && s.MobGriefing() {
+		placed, upd := cache.PlaceSnowGolemTrailAt(ent.X, ent.Y, ent.Z, biomeName, true)
+		if placed > 0 {
+			s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+			placedSnow = placed
+		}
+	}
+	return placedSnow, heatDamage
+}
