@@ -524,3 +524,78 @@ func TestSculkDiskPersistence(t *testing.T) {
 		t.Fatalf("reloaded SculkSensorComparatorSignalAt = %d, want 11", got)
 	}
 }
+
+func TestStepOnSculkSensorShriekerSneakAndUnderwaterCatalystSpread(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{10, 5, 5, 5},
+		Name: "StepAndSubmergedTester",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(sess, GameModeSurvival)
+
+	sx, sy, sz := 140, 65, 140
+	cache.SetBlock(sx, sy, sz, SculkSensorBlockState(SculkSensorPhaseInactive, 0, false))
+	cache.SetBlock(sx+3, sy, sz, SculkShriekerBlockState(false, false, false))
+
+	// 1. Sneaking step on sculk_shrieker is suppressed and grants Sneak 100!
+	sess.SetSneaking(true)
+	if srv.StepOnSculkShrieker(sess, sx+3, sy, sz) {
+		t.Fatal("expected sneaking StepOnSculkShrieker to be suppressed")
+	}
+	if !sess.HasCompletedAdvancement("minecraft:adventure/avoid_vibration") {
+		t.Fatal("expected sneaking StepOnSculkShrieker to grant minecraft:adventure/avoid_vibration")
+	}
+	sess.SetSneaking(false)
+
+	// 2. Direct non-sneaking StepOnSculkSensor activates sensor with power=15, freq=1, and relays to shrieker.
+	if !srv.StepOnSculkSensor(sess, sess.EntityID, sx, sy, sz, false) {
+		t.Fatal("expected StepOnSculkSensor to activate sensor")
+	}
+	phase, power, _, _, _, _ := ParseSculkSensorState(cache.GetBlock(sx, sy, sz))
+	if phase != SculkSensorPhaseActive || power != 15 {
+		t.Fatalf("after StepOnSculkSensor: phase=%s power=%d, want active/15", phase, power)
+	}
+	if freq := srv.SculkSensorComparatorSignalAt(dim, sx, sy, sz); freq != 1 {
+		t.Fatalf("after StepOnSculkSensor: comparator freq=%d, want 1", freq)
+	}
+	_, shrieking, _, _ := ParseSculkShriekerState(cache.GetBlock(sx+3, sy, sz))
+	if !shrieking {
+		t.Fatal("expected StepOnSculkSensor to relay to nearby sculk_shrieker")
+	}
+
+	// 3. Underwater sculk_catalyst mob death produces waterlogged sculk_vein and waterlogged activator.
+	cx, cy, cz := 160, 64, 160
+	stone := mustBlockState(t, "minecraft:stone")
+	for dx := -3; dx <= 3; dx++ {
+		for dz := -3; dz <= 3; dz++ {
+			cache.SetBlock(cx+dx, cy, cz+dz, stone)
+			cache.SetBlock(cx+dx, cy+1, cz+dz, world.StateWater)
+		}
+	}
+	cache.SetBlock(cx, cy, cz, SculkCatalystBlockState(false))
+	if !srv.TriggerSculkCatalystOnMobDeath(dim, float64(cx+1)+0.5, float64(cy+1), float64(cz)+0.5, 15, sess) {
+		t.Fatal("expected underwater sculk_catalyst to absorb mob death XP")
+	}
+	wlVein := 0
+	wlAct := 0
+	for dx := -3; dx <= 3; dx++ {
+		for dz := -3; dz <= 3; dz++ {
+			st := cache.GetBlock(cx+dx, cy+1, cz+dz)
+			if world.IsSculkVeinBlock(st) && world.IsWaterlogged(st) {
+				wlVein++
+			}
+			if (IsSculkSensorBlock(st) || IsSculkShriekerBlock(st)) && world.IsWaterlogged(st) {
+				wlAct++
+			}
+		}
+	}
+	if wlVein < 1 || wlAct < 1 {
+		t.Fatalf("expected underwater catalyst spread to create waterlogged veins (%d) and activators (%d)", wlVein, wlAct)
+	}
+}

@@ -482,264 +482,113 @@ func initSculkStates() {
 
 // SculkBlockState returns the block state ID for `minecraft:sculk`.
 func SculkBlockState() uint16 {
-	initSculkStates()
-	return stateSculk
+	return world.SculkBlockState()
 }
 
 // SculkCatalystBlockState returns the block state ID for `minecraft:sculk_catalyst`
 // with the given `bloom` property.
 func SculkCatalystBlockState(bloom bool) uint16 {
-	initSculkStates()
-	if bloom {
-		return stateCatalyst[1]
-	}
-	return stateCatalyst[0]
+	return world.SculkCatalystBlockState(bloom)
 }
 
 // ParseSculkCatalystState reports whether state is a `minecraft:sculk_catalyst`
 // and whether its `bloom` property is true.
 func ParseSculkCatalystState(state uint16) (bloom, ok bool) {
-	initSculkStates()
-	switch state {
-	case stateCatalyst[0]:
-		return false, state != world.StateAir
-	case stateCatalyst[1]:
-		return true, state != world.StateAir
-	default:
-		return false, false
-	}
+	return world.ParseSculkCatalystState(state)
 }
 
 // IsSculkCatalystBlock reports whether state is `minecraft:sculk_catalyst`.
 func IsSculkCatalystBlock(state uint16) bool {
-	_, ok := ParseSculkCatalystState(state)
-	return ok
+	return world.IsSculkCatalystBlock(state)
 }
 
 // SculkSensorBlockState returns the block state ID for `minecraft:sculk_sensor`.
 func SculkSensorBlockState(phase string, power int, waterlogged bool) uint16 {
-	initSculkStates()
-	switch phase {
-	case SculkSensorPhaseActive, SculkSensorPhaseCooldown:
-	default:
-		phase = SculkSensorPhaseInactive
-	}
-	if power < 0 {
-		power = 0
-	} else if power > 15 {
-		power = 15
-	}
-	wl := "false"
-	if waterlogged {
-		wl = "true"
-	}
-	st, _ := world.BlockStateIDByProperties("minecraft:sculk_sensor", map[string]string{
-		"power":              strconv.Itoa(power),
-		"sculk_sensor_phase": phase,
-		"waterlogged":        wl,
-	})
-	return st
+	return world.SculkSensorBlockState(phase, power, waterlogged)
 }
 
 // CalibratedSculkSensorBlockState returns the block state ID for
 // `minecraft:calibrated_sculk_sensor`.
 func CalibratedSculkSensorBlockState(facing, phase string, power int, waterlogged bool) uint16 {
-	initSculkStates()
-	switch facing {
-	case "north", "south", "west", "east":
-	default:
-		facing = "north"
-	}
-	switch phase {
-	case SculkSensorPhaseActive, SculkSensorPhaseCooldown:
-	default:
-		phase = SculkSensorPhaseInactive
-	}
-	if power < 0 {
-		power = 0
-	} else if power > 15 {
-		power = 15
-	}
-	wl := "false"
-	if waterlogged {
-		wl = "true"
-	}
-	st, _ := world.BlockStateIDByProperties("minecraft:calibrated_sculk_sensor", map[string]string{
-		"facing":             facing,
-		"power":              strconv.Itoa(power),
-		"sculk_sensor_phase": phase,
-		"waterlogged":        wl,
-	})
-	return st
+	return world.CalibratedSculkSensorBlockState(facing, phase, power, waterlogged)
 }
 
 // ParseSculkSensorState extracts the properties of a `minecraft:sculk_sensor`
 // or `minecraft:calibrated_sculk_sensor` block state.
 func ParseSculkSensorState(state uint16) (phase string, power int, waterlogged, calibrated bool, facing string, ok bool) {
-	initSculkStates()
-	m, exists := sensorMetaByState[state]
-	if !exists {
-		return "", 0, false, false, "", false
-	}
-	return m.phase, m.power, m.waterlogged, m.calibrated, m.facing, true
+	return world.ParseSculkSensorState(state)
 }
 
 // IsSculkSensorBlock reports whether state is `minecraft:sculk_sensor` or
 // `minecraft:calibrated_sculk_sensor`.
 func IsSculkSensorBlock(state uint16) bool {
-	initSculkStates()
-	_, ok := sensorMetaByState[state]
-	return ok
+	return world.IsSculkSensorBlock(state)
 }
 
 // IsCalibratedSculkSensorBlock reports whether state is `minecraft:calibrated_sculk_sensor`.
 func IsCalibratedSculkSensorBlock(state uint16) bool {
-	initSculkStates()
-	m, ok := sensorMetaByState[state]
-	return ok && m.calibrated
+	return world.IsCalibratedSculkSensorBlock(state)
 }
 
 // SculkShriekerBlockState returns the block state ID for `minecraft:sculk_shrieker`.
 func SculkShriekerBlockState(canSummon, shrieking, waterlogged bool) uint16 {
-	initSculkStates()
-	cs := "false"
-	if canSummon {
-		cs = "true"
-	}
-	sh := "false"
-	if shrieking {
-		sh = "true"
-	}
-	wl := "false"
-	if waterlogged {
-		wl = "true"
-	}
-	st, _ := world.BlockStateIDByProperties("minecraft:sculk_shrieker", map[string]string{
-		"can_summon":  cs,
-		"shrieking":   sh,
-		"waterlogged": wl,
-	})
-	return st
+	return world.SculkShriekerBlockState(canSummon, shrieking, waterlogged)
 }
 
 // ParseSculkShriekerState extracts the properties of a `minecraft:sculk_shrieker` block state.
 func ParseSculkShriekerState(state uint16) (canSummon, shrieking, waterlogged, ok bool) {
-	initSculkStates()
-	m, exists := shriekerMetaByState[state]
-	if !exists {
-		return false, false, false, false
-	}
-	return m.canSummon, m.shrieking, m.waterlogged, true
+	return world.ParseSculkShriekerState(state)
 }
 
 // IsSculkShriekerBlock reports whether state is `minecraft:sculk_shrieker`.
 func IsSculkShriekerBlock(state uint16) bool {
-	initSculkStates()
-	_, ok := shriekerMetaByState[state]
-	return ok
+	return world.IsSculkShriekerBlock(state)
 }
 
 // SculkVeinBlockState returns the block state ID for `minecraft:sculk_vein`
 // with the specified attached faces ("down", "up", "north", "south", "west", "east")
 // and waterlogged flag. At least one face must be true (defaults to "down": "true").
 func SculkVeinBlockState(faces map[string]bool, waterlogged bool) uint16 {
-	props := map[string]string{
-		"down":        "false",
-		"up":          "false",
-		"north":       "false",
-		"south":       "false",
-		"west":        "false",
-		"east":        "false",
-		"waterlogged": "false",
+	down := faces != nil && faces["down"]
+	up := faces != nil && faces["up"]
+	north := faces != nil && faces["north"]
+	south := faces != nil && faces["south"]
+	east := faces != nil && faces["east"]
+	west := faces != nil && faces["west"]
+	if !down && !up && !north && !south && !east && !west {
+		down = true
 	}
-	anyFace := false
-	for _, dir := range []string{"down", "up", "north", "south", "west", "east"} {
-		if faces != nil && faces[dir] {
-			props[dir] = "true"
-			anyFace = true
-		}
-	}
-	if !anyFace {
-		props["down"] = "true"
-	}
-	if waterlogged {
-		props["waterlogged"] = "true"
-	}
-	st, _ := world.BlockStateIDByProperties("minecraft:sculk_vein", props)
-	return st
+	return world.SculkVeinBlockState(down, up, north, south, east, west, waterlogged)
 }
 
 // IsSculkReplaceableBlock reports whether state is in vanilla `#minecraft:sculk_replaceable`
 // and can be converted into `minecraft:sculk` by a `sculk_catalyst`.
 func IsSculkReplaceableBlock(state uint16) bool {
-	initSculkStates()
-	return sculkReplaceableState[state]
+	return world.IsSculkReplaceableBlock(state)
 }
 
 // IsWoolBlock reports whether state is one of the 16 wool blocks (`*_wool`).
 func IsWoolBlock(state uint16) bool {
-	initSculkStates()
-	return woolOnlyByState[state]
+	return world.IsWoolBlock(state)
 }
 
 // IsWoolOrCarpetBlock reports whether state is a wool block (`*_wool`) or wool
 // carpet (`*_carpet`) in vanilla `#minecraft:dampens_vibrations` /
 // `#minecraft:occludes_vibration_signals`.
 func IsWoolOrCarpetBlock(state uint16) bool {
-	initSculkStates()
-	return woolOrCarpetByState[state]
+	return world.IsWoolOrCarpetBlock(state)
 }
 
 // IsWoolOrCarpetName reports whether blockOrItemName is a wool block or wool carpet.
 func IsWoolOrCarpetName(blockOrItemName string) bool {
-	short := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(blockOrItemName)), "minecraft:")
-	if short == "moss_carpet" || short == "pale_moss_carpet" {
-		return false
-	}
-	return strings.HasSuffix(short, "_wool") || strings.HasSuffix(short, "_carpet")
+	return world.IsWoolOrCarpetName(blockOrItemName)
 }
 
 // IsVibrationOccluded checks whether the straight line between (srcX, srcY, srcZ)
 // and (dstX, dstY, dstZ) passes through any wool or carpet block, matching
 // vanilla VibrationSystem.Listener.isOccluded.
 func IsVibrationOccluded(getBlock func(x, y, z int) uint16, srcX, srcY, srcZ, dstX, dstY, dstZ float64) bool {
-	if getBlock == nil {
-		return false
-	}
-	dx := dstX - srcX
-	dy := dstY - srcY
-	dz := dstZ - srcZ
-	dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-	if dist < 1e-4 {
-		return IsWoolOrCarpetBlock(getBlock(int(math.Floor(srcX)), int(math.Floor(srcY)), int(math.Floor(srcZ))))
-	}
-
-	dstBX, dstBY, dstBZ := int(math.Floor(dstX)), int(math.Floor(dstY)), int(math.Floor(dstZ))
-	steps := int(math.Ceil(dist * 8.0))
-	if steps < 4 {
-		steps = 4
-	}
-	lastX, lastY, lastZ := math.MinInt32, math.MinInt32, math.MinInt32
-	for i := 0; i <= steps; i++ {
-		t := float64(i) / float64(steps)
-		px := srcX + dx*t
-		py := srcY + dy*t
-		pz := srcZ + dz*t
-		bx := int(math.Floor(px))
-		by := int(math.Floor(py))
-		bz := int(math.Floor(pz))
-		if bx == lastX && by == lastY && bz == lastZ {
-			continue
-		}
-		lastX, lastY, lastZ = bx, by, bz
-		if bx == dstBX && by == dstBY && bz == dstBZ {
-			continue
-		}
-		if IsWoolOrCarpetBlock(getBlock(bx, by, bz)) {
-			return true
-		}
-	}
-	return false
+	return world.IsVibrationOccluded(getBlock, srcX, srcY, srcZ, dstX, dstY, dstZ)
 }
 
 // --- Sculk Runtime State, Pending Vibrations, Warning Tracker & Persistence ---
@@ -1104,6 +953,8 @@ func (s *Server) emitGameEventInternal(
 	srcID := source.EntityID
 	if srcID == 0 && source.Player != nil {
 		srcID = source.Player.EntityID
+	} else if source.Player == nil && srcID != 0 {
+		source.Player = s.playerByEntityID(srcID)
 	}
 	if srcID != 0 && s.IsWardenEntity(srcID) {
 		return 0
@@ -1533,6 +1384,9 @@ func (s *Server) tickSingleSculkSensor(k brewingKey) (changed bool, resonances [
 					playClickStart = !waterlogged
 					activatedFreq = vib.Frequency
 					activatedBy = vib.Player
+					if activatedBy == nil && vib.EntityID != 0 {
+						activatedBy = s.playerByEntityID(vib.EntityID)
+					}
 					changed = true
 				}
 			}
@@ -1677,9 +1531,14 @@ func (s *Server) relaySensorToNearbyShriekers(dim string, sx, sy, sz int, player
 }
 
 // StepOnSculkShrieker triggers a `minecraft:sculk_shrieker` at (x, y, z) when
-// session steps directly on top of it.
+// session steps directly on top of it (unless sneaking, in which case the step
+// is suppressed and "Sneak 100" `minecraft:adventure/avoid_vibration` is granted).
 func (s *Server) StepOnSculkShrieker(session *PlayerSession, x, y, z int) bool {
 	if s == nil || session == nil {
+		return false
+	}
+	if session.IsSneaking() {
+		s.TriggerAvoidVibration(session)
 		return false
 	}
 	dim := session.Dimension()
@@ -1687,6 +1546,118 @@ func (s *Server) StepOnSculkShrieker(session *PlayerSession, x, y, z int) bool {
 		dim = world.DimensionOverworld
 	}
 	return s.TriggerSculkShriekerAt(dim, x, y, z, session)
+}
+
+// StepOnSculkSensor handles an entity or player stepping directly on top of a
+// `minecraft:sculk_sensor` or `minecraft:calibrated_sculk_sensor` at (x, y, z)
+// (`SculkSensorBlock.stepOn` in vanilla 26.1.2):
+//   - If `sneaking` (or `session.IsSneaking()`) is true, suppresses activation
+//     and grants `minecraft:adventure/avoid_vibration` ("Sneak 100") to `session`.
+//   - Otherwise immediately activates an `inactive` sensor with `power=15` and
+//     `last_vibration_frequency=1` (`minecraft:step`), respecting calibrated
+//     frequency filtering, amethyst resonance, and shrieker relay.
+func (s *Server) StepOnSculkSensor(session *PlayerSession, entityID int32, x, y, z int, sneaking bool) bool {
+	if s == nil {
+		return false
+	}
+	if session != nil && session.IsSneaking() {
+		sneaking = true
+	}
+	if entityID == 0 && session != nil {
+		entityID = session.EntityID
+	}
+	if entityID != 0 && s.IsWardenEntity(entityID) {
+		return false
+	}
+	dim := world.DimensionOverworld
+	if session != nil && session.Dimension() != "" {
+		dim = session.Dimension()
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return false
+	}
+	bState := cache.GetBlock(x, y, z)
+	phase, _, waterlogged, calibrated, facing, ok := ParseSculkSensorState(bState)
+	if !ok || phase != SculkSensorPhaseInactive {
+		return false
+	}
+	if calibrated {
+		if calFilter := cache.CalibratedSculkSensorInputPower(x, y, z); calFilter > 0 && calFilter != 1 {
+			return false
+		}
+	}
+	if sneaking {
+		if session != nil {
+			s.TriggerAvoidVibration(session)
+		}
+		return false
+	}
+
+	s.EnsureWardenSummonHook()
+	st := s.sculkState()
+	st.mu.Lock()
+	s.ensureSculkLoadedLocked(st)
+	key := makeBrewingKey(normDim, x, y, z)
+	be := st.sensors[key]
+	if be != nil && be.Phase != SculkSensorPhaseInactive {
+		st.mu.Unlock()
+		return false
+	}
+	if be == nil {
+		be = &SculkSensorBlockEntity{
+			Dimension: normDim,
+			X:         x,
+			Y:         y,
+			Z:         z,
+		}
+		st.sensors[key] = be
+	}
+	be.Calibrated = calibrated
+	be.Phase = SculkSensorPhaseActive
+	if calibrated {
+		be.PhaseTicks = CalibratedSculkSensorActiveTicks
+	} else {
+		be.PhaseTicks = SculkSensorActiveTicks
+	}
+	be.Power = world.MaxRedstonePower
+	be.LastVibrationFrequency = 1
+	be.Pending = nil
+	st.mu.Unlock()
+
+	s.BindNoteBlockAndJukeboxRedstone(normDim)
+	var targetState uint16
+	if calibrated {
+		targetState = CalibratedSculkSensorBlockState(facing, SculkSensorPhaseActive, world.MaxRedstonePower, waterlogged)
+	} else {
+		targetState = SculkSensorBlockState(SculkSensorPhaseActive, world.MaxRedstonePower, waterlogged)
+	}
+	_, res := cache.ApplySculkSensorRedstoneState(x, y, z, targetState)
+	compRes := cache.UpdateComparatorsAround(x, y, z)
+	res.Changes = append(res.Changes, compRes.Changes...)
+	if len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+	}
+	if !waterlogged {
+		s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlaySoundPacketID,
+			EncodeSoundPacket(SoundSculkSensorClicking, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+	}
+	for _, am := range cache.FindAdjacentAmethystBlocks(x, y, z) {
+		ax, ay, az := am[0], am[1], am[2]
+		s.BroadcastDimensionChunk(normDim, int32(ax>>4), int32(az>>4), PlaySoundPacketID,
+			EncodeSoundPacket(SoundAmethystBlockResonate, SoundSourceBlocks, float64(ax)+0.5, float64(ay)+0.5, float64(az)+0.5, 1.0, 1.0, 0))
+		from := key
+		s.emitGameEventInternal(normDim, ResonateGameEvent(1), float64(ax)+0.5, float64(ay)+0.5, float64(az)+0.5, VibrationSource{
+			Player:   session,
+			EntityID: entityID,
+		}, &from)
+	}
+	if session != nil {
+		s.relaySensorToNearbyShriekers(normDim, x, y, z, session)
+	}
+	_ = s.SaveSculk()
+	return true
 }
 
 // TriggerSculkShriekerAt activates a `minecraft:sculk_shrieker` at (x, y, z) in dim:
@@ -1700,6 +1671,10 @@ func (s *Server) TriggerSculkShriekerAt(dim string, x, y, z int, player *PlayerS
 	if s == nil {
 		return false
 	}
+	if player != nil && player.Snapshot().GameMode == GameModeSpectator {
+		return false
+	}
+	s.EnsureWardenSummonHook()
 	normDim := world.NormalizeDimension(dim)
 	cache := s.DimensionChunks(normDim)
 	if cache == nil {
@@ -1904,9 +1879,16 @@ func (s *Server) applySculkShriekerDarkness(dim string, cx, cy, cz float64) {
 	}
 }
 
+func isPassableWardenSpawnCell(state uint16) bool {
+	if state == world.StateAir || state == world.StateWater || world.IsSculkVeinBlock(state) {
+		return true
+	}
+	return false
+}
+
 // FindWardenSpawnPosition searches the 11x13x11 volume around a `sculk_shrieker`
-// at (sx, sy, sz) in dim for a valid solid-supported 2x3x2 air space where a
-// Warden can emerge.
+// at (sx, sy, sz) in dim (ordered by proximity to the shrieker) for a valid
+// solid-supported 3-block-tall space where a Warden can emerge.
 func (s *Server) FindWardenSpawnPosition(dim string, sx, sy, sz int) (spawnX, spawnY, spawnZ float64, ok bool) {
 	if s == nil {
 		return 0, 0, 0, false
@@ -1915,6 +1897,11 @@ func (s *Server) FindWardenSpawnPosition(dim string, sx, sy, sz int) (spawnX, sp
 	if cache == nil {
 		return 0, 0, 0, false
 	}
+	type spawnCand struct {
+		x, y, z int
+		dist2   int
+	}
+	var cands []spawnCand
 	for dy := -6; dy <= 6; dy++ {
 		y := sy + dy
 		if y <= world.MinY || y+3 >= world.MinY+world.WorldHeight {
@@ -1927,16 +1914,38 @@ func (s *Server) FindWardenSpawnPosition(dim string, sx, sy, sz int) (spawnX, sp
 				}
 				x, z := sx+dx, sz+dz
 				below := cache.GetBlock(x, y-1, z)
-				if below == world.StateAir || IsSculkShriekerBlock(below) {
+				if below == world.StateAir || below == world.StateWater || below == world.StateLava ||
+					IsSculkShriekerBlock(below) || world.IsSculkVeinBlock(below) {
 					continue
 				}
-				if cache.GetBlock(x, y, z) == world.StateAir &&
-					cache.GetBlock(x, y+1, z) == world.StateAir &&
-					cache.GetBlock(x, y+2, z) == world.StateAir {
-					return float64(x) + 0.5, float64(y), float64(z) + 0.5, true
+				if isPassableWardenSpawnCell(cache.GetBlock(x, y, z)) &&
+					isPassableWardenSpawnCell(cache.GetBlock(x, y+1, z)) &&
+					isPassableWardenSpawnCell(cache.GetBlock(x, y+2, z)) {
+					cands = append(cands, spawnCand{
+						x:     x,
+						y:     y,
+						z:     z,
+						dist2: dx*dx + dy*dy*2 + dz*dz,
+					})
 				}
 			}
 		}
+	}
+	if len(cands) > 0 {
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].dist2 != cands[j].dist2 {
+				return cands[i].dist2 < cands[j].dist2
+			}
+			if cands[i].y != cands[j].y {
+				return cands[i].y > cands[j].y
+			}
+			if cands[i].z != cands[j].z {
+				return cands[i].z < cands[j].z
+			}
+			return cands[i].x < cands[j].x
+		})
+		best := cands[0]
+		return float64(best.x) + 0.5, float64(best.y), float64(best.z) + 0.5, true
 	}
 	return float64(sx) + 0.5, float64(sy) + 1.0, float64(sz) + 0.5, false
 }
@@ -2117,8 +2126,9 @@ func (s *Server) hasSculkReplaceableAround(cache *world.Cache, ox, oy, oz int) b
 	return false
 }
 
-// SpreadSculkCharge spreads `minecraft:sculk`, `minecraft:sculk_vein`, and
-// (when charge >= 10) rare `minecraft:sculk_sensor` / `minecraft:sculk_shrieker`
+// SpreadSculkCharge spreads `minecraft:sculk`, `minecraft:sculk_vein` (preserving
+// waterlogging underwater and discharging consumed vein faces), and (when
+// charge >= 10) rare `minecraft:sculk_sensor` / `minecraft:sculk_shrieker`
 // blocks around (originX, originY, originZ) in dim.
 // Returns the number of blocks converted to `minecraft:sculk`.
 func (s *Server) SpreadSculkCharge(dim string, originX, originY, originZ, charge int, rng *rand.Rand) int {
@@ -2130,149 +2140,11 @@ func (s *Server) SpreadSculkCharge(dim string, originX, originY, originZ, charge
 	if cache == nil {
 		return 0
 	}
-	sculkState := SculkBlockState()
-	if sculkState == world.StateAir {
-		return 0
+	converted, res := cache.SpreadSculkCatalystCharge(originX, originY, originZ, charge, rng)
+	if len(res.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 	}
-
-	// Collect candidate replaceable surface blocks sorted by distance from origin.
-	type candidate struct {
-		x, y, z int
-		dist2   int
-	}
-	maxRadius := 4
-	if charge >= 20 {
-		maxRadius = 6
-	}
-	var candidates []candidate
-	for dy := -3; dy <= 2; dy++ {
-		y := originY + dy
-		if y <= world.MinY || y+1 >= world.MinY+world.WorldHeight {
-			continue
-		}
-		for dz := -maxRadius; dz <= maxRadius; dz++ {
-			for dx := -maxRadius; dx <= maxRadius; dx++ {
-				x, z := originX+dx, originZ+dz
-				cur := cache.GetBlock(x, y, z)
-				if !IsSculkReplaceableBlock(cur) {
-					continue
-				}
-				// Prefer surface blocks exposed to air or water on at least one face.
-				if !isExposedToAirOrVein(cache, x, y, z) {
-					continue
-				}
-				d2 := dx*dx + dy*dy + dz*dz
-				candidates = append(candidates, candidate{x: x, y: y, z: z, dist2: d2})
-			}
-		}
-	}
-
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].dist2 != candidates[j].dist2 {
-			return candidates[i].dist2 < candidates[j].dist2
-		}
-		if candidates[i].y != candidates[j].y {
-			return candidates[i].y > candidates[j].y
-		}
-		if candidates[i].z != candidates[j].z {
-			return candidates[i].z < candidates[j].z
-		}
-		return candidates[i].x < candidates[j].x
-	})
-
-	maxBlocks := charge
-	if maxBlocks > len(candidates) {
-		maxBlocks = len(candidates)
-	}
-	converted := make([][3]int, 0, maxBlocks)
-	for i := 0; i < maxBlocks; i++ {
-		c := candidates[i]
-		if valid, lightChunks := cache.SetBlockWithLight(c.x, c.y, c.z, sculkState); valid {
-			s.broadcastBlockAndLightUpdate(c.x, c.y, c.z, sculkState, lightChunks)
-		} else {
-			cache.SetBlock(c.x, c.y, c.z, sculkState)
-		}
-		converted = append(converted, [3]int{c.x, c.y, c.z})
-	}
-
-	// Place sculk_vein on adjacent replaceable air cells bordering non-sculk solid blocks.
-	for _, pos := range converted {
-		s.placeSculkVeinsAround(cache, pos[0], pos[1], pos[2])
-	}
-
-	// When charge >= SculkActivatorChargeThreshold (10) and at least 1 sculk block
-	// was placed with air above it, potentially grow a sculk_sensor or sculk_shrieker[can_summon=false].
-	if charge >= SculkActivatorChargeThreshold && len(converted) > 0 {
-		shouldGrow := rng == nil || rng.Float32() < 0.25
-		if shouldGrow {
-			target := converted[len(converted)-1]
-			tx, ty, tz := target[0], target[1]+1, target[2]
-			if ty < world.MinY+world.WorldHeight && cache.GetBlock(tx, ty, tz) == world.StateAir {
-				var activatorState uint16
-				growShrieker := false
-				if rng != nil {
-					growShrieker = rng.Intn(10) == 0
-				} else if charge >= 50 {
-					growShrieker = true
-				}
-				if growShrieker {
-					activatorState = SculkShriekerBlockState(false, false, false)
-				} else {
-					activatorState = SculkSensorBlockState(SculkSensorPhaseInactive, 0, false)
-				}
-				if activatorState != world.StateAir {
-					if valid, lightChunks := cache.SetBlockWithLight(tx, ty, tz, activatorState); valid {
-						s.broadcastBlockAndLightUpdate(tx, ty, tz, activatorState, lightChunks)
-					} else {
-						cache.SetBlock(tx, ty, tz, activatorState)
-					}
-				}
-			}
-		}
-	}
-
-	return len(converted)
-}
-
-func isExposedToAirOrVein(cache *world.Cache, x, y, z int) bool {
-	offsets := [6][3]int{
-		{0, 1, 0}, {0, -1, 0},
-		{1, 0, 0}, {-1, 0, 0},
-		{0, 0, 1}, {0, 0, -1},
-	}
-	for _, off := range offsets {
-		ny := y + off[1]
-		if ny < world.MinY || ny >= world.MinY+world.WorldHeight {
-			continue
-		}
-		if cache.GetBlock(x+off[0], ny, z+off[2]) == world.StateAir {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) placeSculkVeinsAround(cache *world.Cache, sx, sy, sz int) {
-	sculkState := SculkBlockState()
-	horiz := [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
-	for _, off := range horiz {
-		nx, nz := sx+off[0], sz+off[1]
-		base := cache.GetBlock(nx, sy, nz)
-		if base == world.StateAir || base == sculkState || !IsSculkReplaceableBlock(base) {
-			continue
-		}
-		if sy+1 >= world.MinY+world.WorldHeight || cache.GetBlock(nx, sy+1, nz) != world.StateAir {
-			continue
-		}
-		veinState := SculkVeinBlockState(map[string]bool{"down": true}, false)
-		if veinState != world.StateAir {
-			if valid, lightChunks := cache.SetBlockWithLight(nx, sy+1, nz, veinState); valid {
-				s.broadcastBlockAndLightUpdate(nx, sy+1, nz, veinState, lightChunks)
-			} else {
-				cache.SetBlock(nx, sy+1, nz, veinState)
-			}
-		}
-	}
+	return converted
 }
 
 func (s *Server) tickSingleSculkCatalyst(k brewingKey) bool {
