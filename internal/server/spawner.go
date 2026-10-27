@@ -197,6 +197,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickAquaticMobs(rng)
 		s.TickIllagersWitchesRavagersAndVexes(rng)
 		s.TickUndeadAndSilverfish(rng)
+		s.TickEndermenAndEndermites(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -284,6 +285,14 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				vz := float64(snapshot.VelocityZ) / 8000.0
 				nx, ny, nz := snapshot.X+vx, snapshot.Y+vy, snapshot.Z+vz
 				dim := snapshot.EffectiveDimension()
+				for j := range t.allEntitiesBuf {
+					cand := &t.allEntitiesBuf[j]
+					if cand.ID != snapshot.ID && cand.EffectiveDimension() == dim && canonicalResourceName(cand.TypeName) == MobTypeEnderman {
+						if math.Abs(cand.X-nx) <= 1.0 && ny >= cand.Y-0.2 && ny <= cand.Y+EndermanHeight && math.Abs(cand.Z-nz) <= 1.0 {
+							s.TryEndermanDodgeProjectile(cand.ID, snapshot.TypeName, rng)
+						}
+					}
+				}
 				if cache := s.DimensionChunks(dim); cache != nil {
 					bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
 					if by >= world.MinY && by < world.MinY+world.WorldHeight {
@@ -317,7 +326,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex {
+		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true

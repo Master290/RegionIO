@@ -599,6 +599,8 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack("minecraft:phantom_membrane", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
+	case MobTypeEnderman:
+		return RollEndermanDeathLoot(rng, 0, world.StateAir)
 	case MobTypeParrot:
 		feathers := int32(1)
 		if rng != nil {
@@ -793,6 +795,10 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundWitherSkeletonHurt, SoundSourceHostile
 	case MobTypeSilverfish:
 		return SoundSilverfishHurt, SoundSourceHostile
+	case MobTypeEnderman:
+		return SoundEndermanHurt, SoundSourceHostile
+	case MobTypeEndermite:
+		return SoundEndermiteHurt, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -920,6 +926,10 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundWitherSkeletonDeath, SoundSourceHostile
 	case MobTypeSilverfish:
 		return SoundSilverfishDeath, SoundSourceHostile
+	case MobTypeEnderman:
+		return SoundEndermanDeath, SoundSourceHostile
+	case MobTypeEndermite:
+		return SoundEndermiteDeath, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -1366,6 +1376,12 @@ func (s *Server) applyDamageToMob(
 			s.OnGuardianThornsRetaliate(target.ID, attacker)
 		} else if normTarget == MobTypeSilverfish {
 			s.OnSilverfishDamaged(target.ID)
+		} else if normTarget == MobTypePhantom {
+			s.OnPhantomDamaged(target.ID)
+		} else if normTarget == MobTypeEnderman {
+			s.OnEndermanDamaged(target.ID, attacker, nil)
+		} else if normTarget == MobTypeEndermite {
+			s.OnEndermiteDamaged(target.ID, attacker)
 		} else if normTarget == MobTypeIronGolem {
 			s.OnIronGolemDamaged(target.ID, oldHP, newHP, attacker)
 		} else if IsZombieFamilyMob(normTarget) && attacker != nil {
@@ -1453,11 +1469,25 @@ func (s *Server) applyDamageToMob(
 			s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, fst.HeldItem)
 		}
 	}
+	if canonicalResourceName(target.TypeName) == MobTypePhantom {
+		s.OnPhantomKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeEnderman {
+		if carriedDrop, ok := s.OnEndermanKilled(target.ID); ok && s.DoMobLoot() {
+			s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, carriedDrop)
+		}
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeEndermite {
+		s.OnEndermiteKilled(target.ID)
+	}
 	s.entities.Remove(target.ID)
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
 
 	xpReward := MobXPReward(target.TypeName, wasBaby)
+	if xpReward == 0 && !wasBaby {
+		xpReward = EndermanOrEndermiteXPReward(target.TypeName)
+	}
 	consumed := false
 	if xpReward > 0 {
 		consumed = s.TriggerSculkCatalystOnMobDeath(dim, target.X, target.Y, target.Z, xpReward, attacker)

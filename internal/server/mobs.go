@@ -210,6 +210,8 @@ var (
 		MobTypeDrowned:             EntityTypeDrownedID,
 		MobTypeStray:               EntityTypeStrayID,
 		MobTypeSilverfish:          EntityTypeSilverfishID,
+		MobTypeEnderman:            EntityTypeEndermanID,
+		MobTypeEndermite:           EntityTypeEndermiteID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -410,6 +412,10 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultStrayMaxHealth
 	case MobTypeSilverfish:
 		return DefaultSilverfishMaxHealth
+	case MobTypeEnderman:
+		return DefaultEndermanMaxHealth
+	case MobTypeEndermite:
+		return DefaultEndermiteMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -479,6 +485,10 @@ func animalWanderSpeed(typeName string) float64 {
 		return SkeletonWanderSpeed
 	case MobTypeSilverfish:
 		return SilverfishWanderSpeed
+	case MobTypeEnderman:
+		return EndermanWanderSpeed
+	case MobTypeEndermite:
+		return EndermiteWanderSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -624,6 +634,12 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeSilverfish {
 		return s.SpawnSilverfish(normDim, x, y, z)
+	}
+	if norm == MobTypeEnderman {
+		return s.SpawnEnderman(normDim, x, y, z)
+	}
+	if norm == MobTypeEndermite {
+		return s.SpawnEndermite(normDim, x, y, z, false)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
