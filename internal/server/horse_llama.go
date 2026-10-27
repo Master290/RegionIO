@@ -1407,31 +1407,40 @@ func (s *Server) AutoFormLlamaCaravan(leadLlamaID int32) int {
 
 	allEnts := s.entities.AppendAll(nil)
 	linked := 0
-	for i := range allEnts {
-		if len(chain)+linked >= MaxLlamaCaravanLength {
-			break
-		}
-		cand := &allEnts[i]
-		if cand.ID == leadLlamaID || cand.ID == tailID || cand.EffectiveDimension() != dim {
-			continue
-		}
-		cType := canonicalResourceName(cand.TypeName)
-		if cType != MobTypeLlama && cType != MobTypeTraderLlama {
-			continue
-		}
-		if st, ok := s.GetTamedMobState(cand.ID); ok && st.CaravanHeadID > 0 {
-			continue
-		}
-		dx := cand.X - tailEnt.X
-		dy := cand.Y - tailEnt.Y
-		dz := cand.Z - tailEnt.Z
-		if dx*dx+dy*dy+dz*dz <= 6.5*6.5 {
-			if s.LinkLlamaCaravan(cand.ID, tailID) {
-				tailID = cand.ID
-				tailEnt = cand
-				linked++
+	for len(chain)+linked < MaxLlamaCaravanLength {
+		bestIdx := -1
+		bestDistSq := 6.5 * 6.5
+		for i := range allEnts {
+			cand := &allEnts[i]
+			if cand.ID == leadLlamaID || cand.ID == tailID || cand.EffectiveDimension() != dim {
+				continue
+			}
+			cType := canonicalResourceName(cand.TypeName)
+			if cType != MobTypeLlama && cType != MobTypeTraderLlama {
+				continue
+			}
+			if st, ok := s.GetTamedMobState(cand.ID); ok && st.CaravanHeadID > 0 {
+				continue
+			}
+			dx := cand.X - tailEnt.X
+			dy := cand.Y - tailEnt.Y
+			dz := cand.Z - tailEnt.Z
+			dSq := dx*dx + dy*dy + dz*dz
+			if dSq <= bestDistSq && (bestIdx < 0 || dSq < bestDistSq || (dSq == bestDistSq && cand.ID < allEnts[bestIdx].ID)) {
+				bestIdx = i
+				bestDistSq = dSq
 			}
 		}
+		if bestIdx < 0 {
+			break
+		}
+		cand := &allEnts[bestIdx]
+		if !s.LinkLlamaCaravan(cand.ID, tailID) {
+			break
+		}
+		tailID = cand.ID
+		tailEnt = cand
+		linked++
 	}
 	return linked
 }
@@ -1821,6 +1830,7 @@ func (s *Server) SpawnWanderingTrader(dimension string, x, y, z float64, withLla
 			mgr.mu.Lock()
 			est.TraderOwnerID = traderID
 			mgr.mu.Unlock()
+			s.LeashMobToEntity(lid, traderID)
 			llamaIDs = append(llamaIDs, lid)
 		}
 	}
@@ -2136,6 +2146,8 @@ func (s *Server) TickEquinesAndLlamas(rng *rand.Rand) {
 	}
 	s.TickLlamaSpits()
 	s.TickWanderingTraders(rng)
+	s.TickLeashedMobs()
+	s.TickLlamaCaravans()
 
 	mgr := s.equineManager()
 	mgr.mu.RLock()

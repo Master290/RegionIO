@@ -591,6 +591,17 @@ func (s *Server) InteractWithTameableMob(session *PlayerSession, entityID int32,
 		heldID = canonicalResourceName(held.ResolvedID())
 	}
 
+	if heldID == LeadItemID && !s.IsEntityLeashed(entityID) {
+		if s.LeashMobToPlayer(session, entityID) {
+			return true, 0
+		}
+	}
+	if heldID == "minecraft:shears" && s.IsEntityLeashed(entityID) {
+		if _, ok := s.ShearMobLeash(session, entityID); ok {
+			return true, 0
+		}
+	}
+
 	switch norm {
 	case MobTypeWolf:
 		return s.interactWithWolf(session, ent, heldID, rng)
@@ -921,11 +932,19 @@ func (s *Server) interactWithEquineOrLlama(session *PlayerSession, ent *world.En
 		}
 	}
 
-	// 3. Equipping horse armor on a tamed horse.
+	// 3. Equipping horse armor on a tamed horse (or dyeing worn leather_horse_armor).
 	if tamed && norm == MobTypeHorse && IsHorseArmorItem(heldID) && s.HorseArmorItem(ent.ID) == "" {
 		if s.EquipHorseArmor(ent.ID, world.NewNamedItemStack(heldID, 1)) {
 			consumeOneHeldItemInSurvival(session)
 			return true, 0
+		}
+	}
+	if tamed && norm == MobTypeHorse && s.HorseArmorItem(ent.ID) == "minecraft:leather_horse_armor" {
+		if dyeIdx, ok := DyeColorIndexByItemName(heldID); ok {
+			if _, dyed := s.DyeEquippedHorseArmor(ent.ID, dyeIdx); dyed {
+				consumeOneHeldItemInSurvival(session)
+				return true, 0
+			}
 		}
 	}
 

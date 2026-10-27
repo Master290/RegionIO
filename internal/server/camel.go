@@ -776,6 +776,21 @@ func (s *Server) InteractWithCamel(session *PlayerSession, entityID int32) (hand
 		}
 	}
 
+	// 1b. Lead / Shears (leash or shear saddle off an unridden Camel).
+	if itemID == LeadItemID && !s.IsEntityLeashed(entityID) {
+		if s.LeashMobToPlayer(session, entityID) {
+			return true, 0
+		}
+	}
+	if itemID == "minecraft:shears" {
+		if _, ok := s.ShearMobLeash(session, entityID); ok {
+			return true, 0
+		}
+		if _, ok := s.ShearCamelSaddle(session, entityID); ok {
+			return true, 0
+		}
+	}
+
 	// 2. Cactus -> baby growth boost (+10%), heal (+2.0 HP), or enter love mode & breed.
 	if itemID == CactusItemID {
 		if s.IsMobBaby(entityID) {
@@ -886,6 +901,7 @@ func (s *Server) TickCamels(rng *rand.Rand) {
 		if dashEnded {
 			s.broadcastCamelState(ent, snap)
 		}
+		s.syncCamelPassengers(ent, snap)
 		if dashReady {
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 				EncodeSoundPacket(SoundCamelDashReady, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
