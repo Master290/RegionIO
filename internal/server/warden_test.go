@@ -3,6 +3,7 @@ package server
 import (
 	"math"
 	"math/rand"
+	"path/filepath"
 	"testing"
 
 	"regionio/internal/protocol"
@@ -438,5 +439,214 @@ func TestWardenDeathDropsSculkCatalystAndCombatSculkHooks(t *testing.T) {
 	}
 	if freq := srv.SculkSensorLastFrequency(dim, 62, world.FlatSurfaceY+1, 60); freq != 15 {
 		t.Fatalf("sculk_sensor frequency after mob death = %d, want 15 (entity_die)", freq)
+	}
+}
+
+func TestWardenTickAndBroadcastSniffCycleAndSonicBoomStateMachine(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.DimensionChunks(dim)
+	rng := rand.New(rand.NewSource(99))
+	feetY := float64(world.FlatSurfaceY + 1)
+
+	stone := mustBlockState(t, "minecraft:stone")
+	for dx := -15; dx <= 15; dx++ {
+		for dz := -15; dz <= 15; dz++ {
+			cache.SetBlock(dx, world.FlatSurfaceY, dz, stone)
+			cache.SetBlock(dx, world.FlatSurfaceY+1, dz, world.StateAir)
+			cache.SetBlock(dx, world.FlatSurfaceY+2, dz, world.StateAir)
+		}
+	}
+
+	player, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{20, 6, 6, 6},
+		Name: "DeepDarkExplorer",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(player, GameModeSurvival)
+	srv.SetPlayerTransform(player, 5.0, feetY, 0.0, 0, 0, true)
+
+	// 1. Spawn a Warden in Emerging state and verify EntityTracker.TickAndBroadcast advances it without corrupting PoseEmerging.
+	wardenID, err := srv.SpawnWarden(dim, 0.5, feetY, 0.5, true)
+	if err != nil {
+		t.Fatalf("SpawnWarden: %v", err)
+	}
+	tr := srv.entityTracker()
+	for i := 0; i < 4; i++ {
+		tr.TickAndBroadcast(srv, rng)
+	}
+	midSt, ok := srv.GetWardenState(wardenID)
+	if !ok || midSt.Phase != WardenPhaseEmerging || midSt.Pose != PoseEmerging || midSt.PhaseTicks != WardenEmergingDurationTicks-4 {
+		t.Fatalf("after 4 TickAndBroadcast ticks, Warden state = (%s, pose=%d, phaseTicks=%d), want (emerging, EMERGING=%d, %d)",
+			midSt.Phase, midSt.Pose, midSt.PhaseTicks, PoseEmerging, WardenEmergingDurationTicks-4)
+	}
+	for i := 4; i < WardenEmergingDurationTicks; i++ {
+		srv.TickWardens(rng)
+	}
+	st, ok := srv.GetWardenState(wardenID)
+	if !ok || st.Phase != WardenPhaseCalm || st.Pose != PoseStanding {
+		t.Fatalf("after %d ticks, Warden state = (%s, pose=%d), want (calm, STANDING=0)", WardenEmergingDurationTicks, st.Phase, st.Pose)
+	}
+
+	// 2. Tick until SniffCooldown (100 ticks) expires -> Warden enters WardenPhaseSniffing (PoseSniffing=12) for 84 ticks,
+	// then completes sniff and smells the nearby player (+35 anger).
+	var sawSniffPose bool
+	for i := 0; i < WardenSniffIntervalTicks+WardenSniffDurationTicks+5; i++ {
+		srv.TickWardens(rng)
+		cur, _ := srv.GetWardenState(wardenID)
+		if cur.Phase == WardenPhaseSniffing && cur.Pose == PoseSniffing {
+			sawSniffPose = true
+		}
+		if srv.WardenSuspectAnger(wardenID, player.EntityID) >= WardenSniffAngerBoost {
+			break
+		}
+	}
+	if !sawSniffPose {
+		t.Fatal("expected Warden to enter WardenPhaseSniffing (PoseSniffing=12)")
+	}
+	if got := srv.WardenSuspectAnger(wardenID, player.EntityID); got < WardenSniffAngerBoost {
+		t.Fatalf("player anger after Warden sniff cycle = %d, want >= %d", got, WardenSniffAngerBoost)
+	}
+
+	// 3. Place player at (8.5, feetY, 0.5) behind a solid stone wall and provoke Warden into Chasing.
+	for y := world.FlatSurfaceY + 1; y <= world.FlatSurfaceY+4; y++ {
+		for dz := -3; dz <= 3; dz++ {
+			cache.SetBlock(4, y, dz, stone)
+		}
+	}
+	srv.SetPlayerTransform(player, 8.5, feetY, 0.5, 0, 0, true)
+	srv.HealPlayer(player, 20.0)
+	srv.AddWardenAnger(wardenID, player.EntityID, player, 8.5, feetY, 0.5, 90, true)
+
+	// Finish Roar (84 ticks).
+	for i := 0; i < WardenRoarDurationTicks; i++ {
+		srv.TickWardens(rng)
+	}
+	// Tick Chasing -> Warden is >4 blocks away from player, so it enters WardenPhaseSonicBoom (PoseShooting=16)
+	// and fires Sonic Boom at tick 34 through the wall!
+	var sawShootingPose bool
+	for i := 0; i < WardenSonicBoomTotalTicks+10; i++ {
+		srv.TickWardens(rng)
+		cur, _ := srv.GetWardenState(wardenID)
+		if cur.Phase == WardenPhaseSonicBoom && cur.Pose == PoseShooting {
+			sawShootingPose = true
+		}
+	}
+	if !sawShootingPose {
+		t.Fatal("expected Warden to enter WardenPhaseSonicBoom (PoseShooting=16)")
+	}
+	if player.Health() >= 20.0 {
+		t.Fatalf("expected Sonic Boom state machine to damage player through solid stone wall, health = %v", player.Health())
+	}
+	afterBoom, _ := srv.GetWardenState(wardenID)
+	if afterBoom.SonicBoomCooldown <= 0 {
+		t.Fatalf("expected SonicBoomCooldown > 0 after completing Sonic Boom, got %d", afterBoom.SonicBoomCooldown)
+	}
+
+	beamPts := ComputeWardenSonicBoomBeamPoints(0.5, feetY, 0.5, 8.5, feetY, 0.5)
+	if len(beamPts) < 8 {
+		t.Fatalf("ComputeWardenSonicBoomBeamPoints len = %d, want >= 8", len(beamPts))
+	}
+}
+
+func TestWardenSneakAdvancementTouchMobCombatAndPersistence(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.DimensionChunks(dim)
+	feetY := float64(world.FlatSurfaceY + 1)
+
+	player, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{20, 7, 7, 7},
+		Name: "SneakyExplorer",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(player, GameModeSurvival)
+	srv.SetPlayerTransform(player, 4.5, feetY, 0.5, 0, 0, true)
+
+	wardenID, err := srv.SpawnWarden(dim, 0.5, feetY, 0.5, false)
+	if err != nil {
+		t.Fatalf("SpawnWarden: %v", err)
+	}
+
+	// 1. Sneaking step within 16 blocks of an alive Warden does not alert the Warden AND grants minecraft:adventure/avoid_vibration ("Sneak 100").
+	srv.EmitVibration(VibrationEvent{
+		Dimension:      dim,
+		Type:           GameEventStep,
+		X:              4.5,
+		Y:              feetY,
+		Z:              0.5,
+		Player:         player,
+		SourceEntityID: player.EntityID,
+		Sneaking:       true,
+	})
+	if gotAnger := srv.WardenSuspectAnger(wardenID, player.EntityID); gotAnger != 0 {
+		t.Fatalf("Warden anger after sneaking step = %d, want 0", gotAnger)
+	}
+	if !player.HasCompletedAdvancement("minecraft:adventure/avoid_vibration") {
+		t.Fatal("expected sneaking near a Warden to grant advancement minecraft:adventure/avoid_vibration")
+	}
+
+	// 2. When a Warden is already within 48 blocks, triggering a can_summon sculk_shrieker (at 24 blocks away)
+	// does not increment the player's warning level.
+	cache.SetBlock(24, world.FlatSurfaceY+1, 0, SculkShriekerBlockState(true, false, false))
+	warnBefore := player.PlayerWarningLevel()
+	if !srv.StepOnSculkShrieker(player, 24, world.FlatSurfaceY+1, 0) {
+		t.Fatal("expected StepOnSculkShrieker to activate shrieker")
+	}
+	if warnAfter := player.PlayerWarningLevel(); warnAfter != warnBefore {
+		t.Fatalf("warning level changed from %d to %d despite alive Warden within 48 blocks", warnBefore, warnAfter)
+	}
+
+	// 3. Touch collision (+35 anger) and Mob-vs-Warden combat (DamageWardenFromEntity adds +100 hurt anger + 20 roar bonus = 120).
+	touchAnger, _ := srv.OnEntityCollideWithWarden(wardenID, player.EntityID)
+	if touchAnger != WardenTouchAngerBoost {
+		t.Fatalf("OnEntityCollideWithWarden anger = %d, want %d", touchAnger, WardenTouchAngerBoost)
+	}
+	if stage := srv.WardenAngerStageFor(wardenID); stage != WardenAngerStageCalm {
+		t.Fatalf("WardenAngerStageFor(35) = %s, want calm", stage)
+	}
+
+	golemID, err := srv.SpawnMobInDimension(dim, 2.5, feetY, 0.5, MobTypeIronGolem)
+	if err != nil {
+		t.Fatalf("SpawnMobInDimension(iron_golem): %v", err)
+	}
+	dealt, killed := srv.DamageWardenFromEntity(wardenID, 20.0, golemID)
+	if dealt != 20.0 || killed {
+		t.Fatalf("DamageWardenFromEntity = (%v, %v), want (20, false)", dealt, killed)
+	}
+	if golemAnger := srv.WardenSuspectAnger(wardenID, golemID); golemAnger != 120 {
+		t.Fatalf("Warden anger toward attacking Iron Golem = %d, want 120 (100 hurt + 20 roar)", golemAnger)
+	}
+	topID, topAnger, topIsPlayer, ok := srv.WardenTopSuspect(wardenID)
+	if !ok || topID != golemID || topAnger != 120 || topIsPlayer {
+		t.Fatalf("WardenTopSuspect = (%d, %d, isPlayer=%v, ok=%v), want (%d, 120, false, true)", topID, topAnger, topIsPlayer, ok, golemID)
+	}
+
+	// 4. SaveWardensFile / LoadWardensFile round-trip persistence.
+	savePath := filepath.Join(t.TempDir(), "wardens.json")
+	if err := srv.SaveWardensFile(savePath); err != nil {
+		t.Fatalf("SaveWardensFile: %v", err)
+	}
+
+	srv2 := newSurvivalTestServer(t)
+	if err := srv2.LoadWardensFile(savePath); err != nil {
+		t.Fatalf("LoadWardensFile: %v", err)
+	}
+	loadedState, ok := srv2.GetWardenState(wardenID)
+	if !ok {
+		t.Fatalf("expected Warden %d to be restored by LoadWardensFile", wardenID)
+	}
+	if loadedState.Health != DefaultWardenMaxHealth-20.0 {
+		t.Fatalf("restored Warden health = %v, want %v", loadedState.Health, DefaultWardenMaxHealth-20.0)
+	}
+	if got := srv2.WardenSuspectAnger(wardenID, golemID); got != 120 {
+		t.Fatalf("restored Warden anger toward golem = %d, want 120", got)
+	}
+	if !srv2.ClearWardenSuspect(wardenID, golemID) || srv2.WardenSuspectAnger(wardenID, golemID) != 0 {
+		t.Fatal("expected ClearWardenSuspect to remove suspect entry")
 	}
 }

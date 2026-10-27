@@ -1,9 +1,12 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -37,9 +40,10 @@ const (
 	WardenEmergingDurationTicks int     = 134  // 6.7s emerging animation
 	WardenDiggingDurationTicks  int     = 100  // 5.0s digging back into the ground
 	WardenCalmDigTimeoutTicks   int     = 1200 // 60.0s without anger/suspects before digging
-	WardenRoarDurationTicks     int     = 84   // 4.2s roar animation when crossing >= 80 anger
-	WardenSniffDurationTicks    int     = 84   // 4.2s sniffing animation
-	WardenSniffIntervalTicks    int     = 100  // 5.0s cooldown between idle sniffs
+	WardenRoarDurationTicks       int     = 84   // 4.2s roar animation when crossing >= 80 anger
+	WardenSniffDurationTicks      int     = 84   // 4.2s sniffing animation
+	WardenSniffIntervalTicks      int     = 100  // 5.0s cooldown between idle sniffs
+	WardenDisturbanceTimeoutTicks int     = 200  // 10.0s investigating a disturbance without reaching it before resetting
 
 	// Anger Management per suspect (0..150).
 	WardenMinAnger                    int = 0
@@ -191,6 +195,18 @@ func ClassifyWardenAnger(anger int) WardenAngerStage {
 	return WardenAngerStageCalm
 }
 
+// String returns a human-readable label ("calm", "agitated", or "angry") for s.
+func (s WardenAngerStage) String() string {
+	switch s {
+	case WardenAngerStageAngry:
+		return "angry"
+	case WardenAngerStageAgitated:
+		return "agitated"
+	default:
+		return "calm"
+	}
+}
+
 // WardenHeartbeatIntervalTicks returns the client/server heartbeat interval in
 // ticks corresponding to the Warden's synced client anger level (0..150):
 //   - Calm (0..39):      40 ticks (2.0s)
@@ -262,6 +278,7 @@ type WardenState struct {
 	DisturbanceX      float64
 	DisturbanceY      float64
 	DisturbanceZ      float64
+	DisturbanceTicks  int
 
 	ActiveTargetID       int32
 	ActiveTargetIsPlayer bool
@@ -309,28 +326,34 @@ func (s *Server) wardenManager() *serverWardenManager {
 	return actual.(*serverWardenManager)
 }
 
-// EnsureWardenSummonHook registers s.SummonWardenFromShrieker with Agent C's
-// sculk shrieker system if no custom hook has been set on s yet.
+// EnsureWardenSummonHook registers s.SummonWardenFromShrieker and
+// s.HasWardenWithinRadius with Agent C's sculk shrieker system if no custom
+// hooks have been set on s yet.
 func (s *Server) EnsureWardenSummonHook() {
 	if s == nil {
 		return
 	}
 	st := s.sculkState()
 	st.mu.Lock()
-	hasHook := st.wardenSummonHook != nil
+	hasSummon := st.wardenSummonHook != nil
+	hasPresent := st.wardenPresentHook != nil
 	st.mu.Unlock()
-	if !hasHook {
+	if !hasSummon {
 		s.SetWardenSummonHook(s.SummonWardenFromShrieker)
+	}
+	if !hasPresent {
+		s.SetWardenPresentHook(s.HasWardenWithinRadius)
 	}
 }
 
-// RegisterWardenSummonHook explicitly registers s.SummonWardenFromShrieker as
-// the server's Warden summon callback for sculk shriekers.
+// RegisterWardenSummonHook explicitly registers s.SummonWardenFromShrieker and
+// s.HasWardenWithinRadius as the server's Warden callbacks for sculk shriekers.
 func (s *Server) RegisterWardenSummonHook() {
 	if s == nil {
 		return
 	}
 	s.SetWardenSummonHook(s.SummonWardenFromShrieker)
+	s.SetWardenPresentHook(s.HasWardenWithinRadius)
 }
 
 // IsWardenEntity reports whether entityID belongs to an active minecraft:warden.
@@ -385,6 +408,10 @@ func (s *Server) EmitVibration(ev VibrationEvent) int {
 	ev.Dimension = dim
 	ev.SourceEntityID = srcID
 
+	// Notify any alive Wardens within 16 blocks first so ProjectileEntityID and
+	// full event context are preserved before EmitGameEvent's secondary broadcast.
+	s.NotifyWardensOfVibration(ev)
+
 	// Forward to sculk sensors & shriekers.
 	notifiedSensors := s.EmitGameEvent(dim, ev.Type, ev.X, ev.Y, ev.Z, VibrationSource{
 		Player:        ev.Player,
@@ -392,9 +419,6 @@ func (s *Server) EmitVibration(ev VibrationEvent) int {
 		Sneaking:      ev.Sneaking,
 		BlockOrItemID: ev.BlockOrItemID,
 	})
-
-	// Also notify any alive Wardens within 16 blocks in the same dimension.
-	s.NotifyWardensOfVibration(ev)
 	return notifiedSensors
 }
 
@@ -697,6 +721,85 @@ func (s *Server) WardenSuspectAnger(wardenID, suspectEntityID int32) int {
 	return 0
 }
 
+// WardenAngerStageFor returns the Warden's current overall WardenAngerStage
+// (Calm 0..39, Agitated 40..79, or Angry 80..150).
+func (s *Server) WardenAngerStageFor(wardenID int32) WardenAngerStage {
+	st, ok := s.GetWardenState(wardenID)
+	if !ok {
+		return WardenAngerStageCalm
+	}
+	return ClassifyWardenAnger(st.ClientAngerLevel)
+}
+
+// WardenTopSuspect returns the highest-priority suspect tracked by wardenID:
+// if an Angry (>= 80) target is active, returns that target; otherwise returns
+// the suspect with the highest anger level.
+func (s *Server) WardenTopSuspect(wardenID int32) (suspectID int32, anger int, isPlayer bool, ok bool) {
+	if s == nil || wardenID == 0 {
+		return 0, 0, false, false
+	}
+	mgr := s.wardenManager()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	st := mgr.wardens[wardenID]
+	if st == nil || len(st.Suspects) == 0 {
+		return 0, 0, false, false
+	}
+	if st.ActiveTargetID != 0 {
+		if entry := st.Suspects[st.ActiveTargetID]; entry != nil && entry.Anger > 0 {
+			return entry.EntityID, entry.Anger, entry.IsPlayer, true
+		}
+	}
+	var best *WardenSuspectEntry
+	for _, entry := range st.Suspects {
+		if entry == nil || entry.Anger <= 0 {
+			continue
+		}
+		if best == nil || entry.Anger > best.Anger ||
+			(entry.Anger == best.Anger && entry.IsPlayer && !best.IsPlayer) ||
+			(entry.Anger == best.Anger && entry.IsPlayer == best.IsPlayer && entry.EntityID < best.EntityID) {
+			best = entry
+		}
+	}
+	if best == nil {
+		return 0, 0, false, false
+	}
+	return best.EntityID, best.Anger, best.IsPlayer, true
+}
+
+// ClearWardenSuspect removes suspectEntityID from wardenID's AngerManagement
+// table and recomputes the Warden's active target and synced anger level.
+func (s *Server) ClearWardenSuspect(wardenID, suspectEntityID int32) bool {
+	if s == nil || wardenID == 0 || suspectEntityID == 0 {
+		return false
+	}
+	mgr := s.wardenManager()
+	mgr.mu.Lock()
+	st := mgr.wardens[wardenID]
+	if st == nil || len(st.Suspects) == 0 {
+		mgr.mu.Unlock()
+		return false
+	}
+	if _, exists := st.Suspects[suspectEntityID]; !exists {
+		mgr.mu.Unlock()
+		return false
+	}
+	delete(st.Suspects, suspectEntityID)
+	prevAnger := st.ClientAngerLevel
+	recomputeWardenTargetLocked(st)
+	syncNeeded := st.ClientAngerLevel != prevAnger
+	snap := st.Clone()
+	mgr.mu.Unlock()
+
+	if syncNeeded {
+		cx := int32(int64(math.Floor(snap.X)) >> 4)
+		cz := int32(int64(math.Floor(snap.Z)) >> 4)
+		s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
+			EncodeWardenEntityDataPacket(wardenID, snap.Pose, snap.ClientAngerLevel))
+	}
+	return true
+}
+
 // AddWardenAnger increases (or sets) a Warden's anger toward suspectEntityID by
 // delta, clamping to [0, 150], updating the active target (prioritizing players
 // among suspects with anger >= 80), and triggering PoseRoaring (+20 bonus anger)
@@ -770,6 +873,7 @@ func (s *Server) AddWardenAnger(
 	st.DisturbanceX = knownX
 	st.DisturbanceY = knownY
 	st.DisturbanceZ = knownZ
+	st.DisturbanceTicks = 0
 
 	// When crossing into Angry (>= 80) for the first time on this suspect, the
 	// Warden roars for 84 ticks and gains an additional +20 anger!
@@ -894,6 +998,9 @@ func (s *Server) NotifyWardensOfVibration(ev VibrationEvent) int {
 	if ev.Sneaking {
 		switch canonicalResourceName(ev.Type) {
 		case GameEventStep, GameEventSwim, GameEventHitGround:
+			if ev.Player != nil && s.hasUnoccludedWardenWithinRadius(normDim, ev.X, ev.Y, ev.Z, WardenVibrationListenRadius) {
+				s.TriggerAvoidVibration(ev.Player)
+			}
 			return 0
 		}
 	}
@@ -926,6 +1033,36 @@ func (s *Server) NotifyWardensOfVibration(ev VibrationEvent) int {
 		}
 	}
 	return notified
+}
+
+func (s *Server) hasUnoccludedWardenWithinRadius(dim string, x, y, z, radius float64) bool {
+	if s == nil || radius <= 0 {
+		return false
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	rSq := radius * radius
+
+	mgr := s.wardenManager()
+	mgr.mu.RLock()
+	defer mgr.mu.RUnlock()
+	for _, st := range mgr.wardens {
+		if st == nil || st.Health <= 0 || st.Dimension != normDim ||
+			st.Phase == WardenPhaseEmerging || st.Phase == WardenPhaseDigging {
+			continue
+		}
+		dx := x - st.X
+		dy := y - (st.Y + 1.4)
+		dz := z - st.Z
+		if dx*dx+dy*dy+dz*dz > rSq {
+			continue
+		}
+		if cache != nil && IsVibrationOccluded(cache.GetBlock, x, y, z, st.X, st.Y+1.4, st.Z) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (s *Server) notifySingleWardenVibration(
@@ -964,6 +1101,7 @@ func (s *Server) notifySingleWardenVibration(
 	st.DisturbanceX = ev.X
 	st.DisturbanceY = ev.Y
 	st.DisturbanceZ = ev.Z
+	st.DisturbanceTicks = 0
 	st.Yaw = yawToward(ev.X-st.X, ev.Z-st.Z)
 
 	// Interrupt sniffing when a fresh vibration is heard.
@@ -1228,6 +1366,34 @@ func (s *Server) AttackFromWarden(wardenID int32, targetEntityID int32) float32 
 	return 0
 }
 
+// ComputeWardenSonicBoomBeamPoints computes the 1-block-spaced 3D particle
+// coordinates along the Warden's Sonic Boom beam from the Warden's chest
+// (wx, wy+1.6, wz) toward the target's eye/body (tx, ty+1.0, tz), matching
+// vanilla SonicBoom.tick (steps 1..floor(dist)+7 along the normalized ray).
+func ComputeWardenSonicBoomBeamPoints(wx, wy, wz, tx, ty, tz float64) [][3]float64 {
+	startX, startY, startZ := wx, wy+1.6, wz
+	endX, endY, endZ := tx, ty+1.0, tz
+	dx := endX - startX
+	dy := endY - startY
+	dz := endZ - startZ
+	dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+	if dist < 1e-4 {
+		return [][3]float64{{startX, startY, startZ}}
+	}
+	ux, uy, uz := dx/dist, dy/dist, dz/dist
+	steps := int(math.Floor(dist)) + 7
+	out := make([][3]float64, 0, steps)
+	for i := 1; i <= steps; i++ {
+		f := float64(i)
+		out = append(out, [3]float64{
+			startX + ux*f,
+			startY + uy*f,
+			startZ + uz*f,
+		})
+	}
+	return out
+}
+
 // FireWardenSonicBoom fires the Warden's ranged sonic boom beam at targetEntityID.
 // Sonic Boom travels through solid walls, cannot be blocked by shields, bypasses
 // armor reduction (dealing 10.0 sonic/magic damage scaled by difficulty), and
@@ -1463,6 +1629,28 @@ func (s *Server) DamageWarden(entityID int32, damage float32, attacker *PlayerSe
 		s.IncrementCriteriaObjectives(attacker.Profile.Name, "totalKillCount", 1)
 	}
 	return damage, true
+}
+
+// DamageWardenFromEntity applies damage to an active Warden from a non-player
+// entity (such as an Iron Golem or projectile), adding +100 anger
+// (WardenHurtAngerBoost) toward attackerEntityID and triggering PoseRoaring if
+// the attacker crosses the Angry (>= 80) threshold.
+func (s *Server) DamageWardenFromEntity(entityID int32, damage float32, attackerEntityID int32) (dealt float32, killed bool) {
+	if s == nil || s.entities == nil || damage <= 0 {
+		return 0, false
+	}
+	if attackerPlayer := s.playerByEntityID(attackerEntityID); attackerPlayer != nil {
+		return s.DamageWarden(entityID, damage, attackerPlayer)
+	}
+	dealt, killed = s.DamageWarden(entityID, damage, nil)
+	if dealt > 0 && !killed && attackerEntityID != 0 && attackerEntityID != entityID {
+		var ax, ay, az float64
+		if ent := s.entities.Get(attackerEntityID); ent != nil {
+			ax, ay, az = ent.X, ent.Y, ent.Z
+		}
+		s.AddWardenAnger(entityID, attackerEntityID, nil, ax, ay, az, WardenHurtAngerBoost, true)
+	}
+	return dealt, killed
 }
 
 // TickWardens advances all active Wardens and player shield-disable timers by
@@ -1796,6 +1984,32 @@ func (s *Server) pruneInvalidWardenSuspectsLocked(st *WardenState) {
 	}
 }
 
+// OnEntityCollideWithWarden handles physical contact between wardenID and
+// otherEntityID (player or mob), adding +35 anger (WardenTouchAngerBoost) when
+// the Warden's anger toward otherEntityID is below the Angry threshold (80).
+func (s *Server) OnEntityCollideWithWarden(wardenID, otherEntityID int32) (newAnger int, roared bool) {
+	if s == nil || wardenID == 0 || otherEntityID == 0 || wardenID == otherEntityID {
+		return 0, false
+	}
+	if s.IsWardenEntity(otherEntityID) {
+		return 0, false
+	}
+	curAnger := s.WardenSuspectAnger(wardenID, otherEntityID)
+	if curAnger >= WardenAngryThreshold {
+		return curAnger, false
+	}
+	if p := s.playerByEntityID(otherEntityID); p != nil {
+		pSnap := p.Snapshot()
+		return s.AddWardenAnger(wardenID, otherEntityID, p, pSnap.X, pSnap.Y, pSnap.Z, WardenTouchAngerBoost, true)
+	}
+	if s.entities != nil {
+		if ent := s.entities.Get(otherEntityID); ent != nil {
+			return s.AddWardenAnger(wardenID, otherEntityID, nil, ent.X, ent.Y, ent.Z, WardenTouchAngerBoost, true)
+		}
+	}
+	return s.AddWardenAnger(wardenID, otherEntityID, nil, 0, 0, 0, WardenTouchAngerBoost, true)
+}
+
 func (s *Server) checkWardenTouchCollisions(st WardenState) {
 	rSq := WardenTouchCollisionRadius * WardenTouchCollisionRadius
 	for _, p := range s.onlinePlayersSnapshot() {
@@ -1813,6 +2027,27 @@ func (s *Server) checkWardenTouchCollisions(st WardenState) {
 		if dx*dx+dz*dz <= rSq && dy <= 2.5 {
 			if s.WardenSuspectAnger(st.EntityID, pSnap.EntityID) < WardenAngryThreshold {
 				s.AddWardenAnger(st.EntityID, pSnap.EntityID, p, pSnap.X, pSnap.Y, pSnap.Z, WardenTouchAngerBoost, true)
+			}
+		}
+	}
+	if s.entities != nil {
+		for _, ent := range s.entities.AppendAll(nil) {
+			if ent.ID == st.EntityID || ent.IsItem() || ent.IsExperienceOrb() ||
+				IsDecorationEntity(ent.TypeName) || ent.TypeName == EntityTypeFishingBobber ||
+				IsStandardProjectileEntityType(ent.TypeName) || IsWindChargeEntityType(ent.TypeName) ||
+				canonicalResourceName(ent.TypeName) == MobTypeWarden {
+				continue
+			}
+			if ent.EffectiveDimension() != st.Dimension {
+				continue
+			}
+			dx := ent.X - st.X
+			dy := math.Abs(ent.Y - st.Y)
+			dz := ent.Z - st.Z
+			if dx*dx+dz*dz <= rSq && dy <= 2.5 {
+				if s.WardenSuspectAnger(st.EntityID, ent.ID) < WardenAngryThreshold {
+					s.AddWardenAnger(st.EntityID, ent.ID, nil, ent.X, ent.Y, ent.Z, WardenTouchAngerBoost, true)
+				}
 			}
 		}
 	}
@@ -1892,8 +2127,17 @@ func (s *Server) stepWardenMovementAndCombat(entityID int32, st WardenState, rng
 		return
 	}
 	cur.X, cur.Y, cur.Z, cur.Yaw = nextX, nextY, nextZ, nextYaw
+	if cur.ActiveTargetID == 0 && cur.HasDisturbancePos {
+		cur.DisturbanceTicks++
+		if cur.DisturbanceTicks >= WardenDisturbanceTimeoutTicks {
+			clearedDisturbancePos = true
+		}
+	} else {
+		cur.DisturbanceTicks = 0
+	}
 	if clearedDisturbancePos {
 		cur.HasDisturbancePos = false
+		cur.DisturbanceTicks = 0
 		if cur.ActiveTargetID == 0 {
 			cur.Phase = WardenPhaseCalm
 		}
@@ -1934,6 +2178,96 @@ func (s *Server) stepWardenMovementAndCombat(entityID int32, st WardenState, rng
 	if attackTargetID != 0 {
 		s.AttackFromWarden(entityID, attackTargetID)
 	}
+}
+
+type wardenFilePayload struct {
+	Wardens []WardenState `json:"wardens"`
+}
+
+// SaveWardensFile serializes all active Wardens and their AngerManagement / pose
+// state to a JSON file at path.
+func (s *Server) SaveWardensFile(path string) error {
+	if s == nil {
+		return errors.New("server: nil server")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	payload := wardenFilePayload{
+		Wardens: s.ActiveWardens(),
+	}
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0o644)
+}
+
+// LoadWardensFile restores active Wardens and their AngerManagement / pose state
+// from a JSON file at path, spawning any missing world.Entity entries.
+func (s *Server) LoadWardensFile(path string) error {
+	if s == nil || s.entities == nil {
+		return errors.New("server: nil entity manager")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var payload wardenFilePayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return err
+	}
+
+	s.EnsureWardenSummonHook()
+	typeID := ResolveEntityTypeID(MobTypeWarden)
+	if typeID < 0 {
+		typeID = EntityTypeWardenID
+	}
+
+	mgr := s.wardenManager()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	for _, w := range payload.Wardens {
+		if w.Health <= 0 {
+			continue
+		}
+		normDim := world.NormalizeDimension(w.Dimension)
+		w.Dimension = normDim
+		if w.MaxHealth <= 0 {
+			w.MaxHealth = DefaultWardenMaxHealth
+		}
+		id := w.EntityID
+		if id == 0 || s.entities.Get(id) == nil {
+			id = s.entities.Add(&world.Entity{
+				ID:        w.EntityID,
+				TypeID:    typeID,
+				TypeName:  MobTypeWarden,
+				Dimension: normDim,
+				X:         w.X,
+				Y:         w.Y,
+				Z:         w.Z,
+				Yaw:       w.Yaw,
+				HeadYaw:   w.Yaw,
+				OnGround:  true,
+			})
+			w.EntityID = id
+		}
+		tr := s.entityTracker()
+		tr.mu.Lock()
+		mem := tr.mobStateFor(id, tr.aiTickID)
+		mem.healthInit = true
+		mem.health = w.Health
+		mem.lastHealth = w.Health
+		tr.mu.Unlock()
+
+		cloned := w.Clone()
+		mgr.wardens[id] = &cloned
+	}
+	return nil
 }
 
 // MobXPReward returns the vanilla 26.1.2 experience orb reward dropped when a
