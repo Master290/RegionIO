@@ -92,6 +92,10 @@ type TrialSpawnerMobSpawnHookFunc func(
 // whether a tracked mob `entityID` is still alive in `dim`.
 type TrialSpawnerMobAlivePredicateFunc func(dim string, entityID int32) bool
 
+// TrialSpawnerMobDespawnHookFunc is Agent A's optional callback invoked when a
+// trial spawner upgrades from normal to ominous and despawns its existing wave mobs.
+type TrialSpawnerMobDespawnHookFunc func(dim string, entityID int32)
+
 // TrialSpawnerBlockEntity holds the runtime and persistent state of a
 // `minecraft:trial_spawner` block.
 type TrialSpawnerBlockEntity struct {
@@ -133,14 +137,15 @@ type VaultBlockEntity struct {
 }
 
 type serverTrialVaultState struct {
-	mu           sync.Mutex
-	loadedDisk   bool
-	rng          *rand.Rand
-	nextSynthID  int32
-	spawners     map[brewingKey]*TrialSpawnerBlockEntity
-	vaults       map[brewingKey]*VaultBlockEntity
-	mobSpawnHook TrialSpawnerMobSpawnHookFunc
-	mobAliveHook TrialSpawnerMobAlivePredicateFunc
+	mu             sync.Mutex
+	loadedDisk     bool
+	rng            *rand.Rand
+	nextSynthID    int32
+	spawners       map[brewingKey]*TrialSpawnerBlockEntity
+	vaults         map[brewingKey]*VaultBlockEntity
+	mobSpawnHook   TrialSpawnerMobSpawnHookFunc
+	mobAliveHook   TrialSpawnerMobAlivePredicateFunc
+	mobDespawnHook TrialSpawnerMobDespawnHookFunc
 }
 
 var serverTrialVaultStates sync.Map // map[*Server]*serverTrialVaultState
@@ -183,99 +188,60 @@ func (s *Server) SetTrialSpawnerMobAliveHook(fn TrialSpawnerMobAlivePredicateFun
 	tv.mu.Unlock()
 }
 
+// SetTrialSpawnerMobDespawnHook registers Agent A's optional callback invoked
+// when a trial spawner upgrades to ominous and despawns its non-ominous mobs.
+func (s *Server) SetTrialSpawnerMobDespawnHook(fn TrialSpawnerMobDespawnHookFunc) {
+	if s == nil {
+		return
+	}
+	tv := s.trialVaultState()
+	tv.mu.Lock()
+	tv.mobDespawnHook = fn
+	tv.mu.Unlock()
+}
+
 // --- Block State Construction & Parsing ---
 
 // IsTrialSpawnerBlock reports whether state is `minecraft:trial_spawner`.
 func IsTrialSpawnerBlock(state uint16) bool {
-	return world.BlockName(state) == "minecraft:trial_spawner"
+	return world.IsTrialSpawnerBlock(state)
 }
 
 // ParseTrialSpawnerBlockState extracts `trial_spawner_state` and `ominous` from state.
 func ParseTrialSpawnerBlockState(state uint16) (spawnerState string, ominous bool, ok bool) {
-	if !IsTrialSpawnerBlock(state) {
-		return "", false, false
-	}
-	props := world.BlockProperties(state)
-	st := props["trial_spawner_state"]
-	if st == "" {
-		st = TrialSpawnerStateInactive
-	}
-	return st, props["ominous"] == "true", true
+	return world.ParseTrialSpawnerBlockState(state)
 }
 
 // MakeTrialSpawnerBlockState constructs the state ID for `minecraft:trial_spawner`.
 func MakeTrialSpawnerBlockState(spawnerState string, ominous bool) uint16 {
-	switch spawnerState {
-	case TrialSpawnerStateInactive,
-		TrialSpawnerStateWaitingForPlayers,
-		TrialSpawnerStateActive,
-		TrialSpawnerStateWaitingForRewardEjection,
-		TrialSpawnerStateEjectingReward,
-		TrialSpawnerStateCooldown:
-	default:
-		spawnerState = TrialSpawnerStateWaitingForPlayers
-	}
-	omStr := "false"
-	if ominous {
-		omStr = "true"
-	}
-	if id, ok := world.BlockStateIDByProperties("minecraft:trial_spawner", map[string]string{
-		"trial_spawner_state": spawnerState,
-		"ominous":             omStr,
-	}); ok {
-		return id
-	}
-	id, _ := world.BlockStateIDByProperties("minecraft:trial_spawner", nil)
-	return id
+	return world.MakeTrialSpawnerBlockState(spawnerState, ominous)
+}
+
+// ResolveTrialSpawnerPlacementState returns the initial block state for a placed
+// `minecraft:trial_spawner`.
+func ResolveTrialSpawnerPlacementState(ominous bool) uint16 {
+	return world.ResolveTrialSpawnerPlacementState(ominous)
 }
 
 // IsVaultBlock reports whether state is `minecraft:vault`.
 func IsVaultBlock(state uint16) bool {
-	return world.BlockName(state) == "minecraft:vault"
+	return world.IsVaultBlock(state)
 }
 
 // ParseVaultBlockState extracts `vault_state`, `facing`, and `ominous` from state.
 func ParseVaultBlockState(state uint16) (vaultState string, facing string, ominous bool, ok bool) {
-	if !IsVaultBlock(state) {
-		return "", "", false, false
-	}
-	props := world.BlockProperties(state)
-	vs := props["vault_state"]
-	if vs == "" {
-		vs = VaultStateInactive
-	}
-	fc := props["facing"]
-	if fc == "" {
-		fc = "north"
-	}
-	return vs, fc, props["ominous"] == "true", true
+	return world.ParseVaultBlockState(state)
 }
 
 // MakeVaultBlockState constructs the state ID for `minecraft:vault`.
 func MakeVaultBlockState(vaultState, facing string, ominous bool) uint16 {
-	switch vaultState {
-	case VaultStateInactive, VaultStateActive, VaultStateUnlocking, VaultStateEjecting:
-	default:
-		vaultState = VaultStateInactive
-	}
-	switch facing {
-	case "north", "south", "west", "east":
-	default:
-		facing = "north"
-	}
-	omStr := "false"
-	if ominous {
-		omStr = "true"
-	}
-	if id, ok := world.BlockStateIDByProperties("minecraft:vault", map[string]string{
-		"vault_state": vaultState,
-		"facing":      facing,
-		"ominous":     omStr,
-	}); ok {
-		return id
-	}
-	id, _ := world.BlockStateIDByProperties("minecraft:vault", nil)
-	return id
+	return world.MakeVaultBlockState(vaultState, facing, ominous)
+}
+
+// ResolveVaultPlacementState returns the initial block state for a player-placed
+// `minecraft:vault`, orienting its keyhole opposite to `playerHorizontalFacing`.
+func ResolveVaultPlacementState(playerHorizontalFacing string, ominous bool) uint16 {
+	return world.ResolveVaultPlacementState(playerHorizontalFacing, ominous)
 }
 
 func (s *Server) setTrialOrVaultBlockState(dim string, cache *world.Cache, x, y, z int, nextState uint16) {
@@ -443,6 +409,34 @@ func (s *Server) ApplyTrialOrVaultStructureBlockEntity(dim string, sbe world.Str
 	}
 }
 
+// HydrateChunkTrialSpawnersAndVaults inspects all `world.StructureBlockEntity`
+// entries on the loaded chunk (dim, cx, cz) and registers any `minecraft:trial_spawner`
+// or `minecraft:vault` block entities that have not yet been initialized.
+func (s *Server) HydrateChunkTrialSpawnersAndVaults(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	count := 0
+	for _, sbe := range sbes {
+		if sbe.ID != "minecraft:trial_spawner" && sbe.ID != "minecraft:vault" {
+			continue
+		}
+		if s.ApplyTrialOrVaultStructureBlockEntity(normDim, sbe) {
+			count++
+		}
+	}
+	return count
+}
+
 // ConfigureTrialSpawnerAt configures the normal/ominous config resource IDs and
 // fallback mob entity ID on the `minecraft:trial_spawner` at (dim, x, y, z).
 func (s *Server) ConfigureTrialSpawnerAt(dim string, x, y, z int, normalConfig, ominousConfig, spawnerEntityID string) {
@@ -465,6 +459,31 @@ func (s *Server) ConfigureTrialSpawnerAt(dim string, x, y, z int, normalConfig, 
 		}
 	}
 	tv.mu.Unlock()
+}
+
+// IsTrialSpawnerWaveMob reports whether `entityID` in `dim` is currently tracked
+// as an active wave mob of a `minecraft:trial_spawner`, returning the parent
+// spawner coordinates and whether the wave is ominous (hook for Agent A).
+func (s *Server) IsTrialSpawnerWaveMob(dim string, entityID int32) (spawnerX, spawnerY, spawnerZ int, ominous bool, ok bool) {
+	if s == nil || entityID <= 0 {
+		return 0, 0, 0, false, false
+	}
+	normDim := world.NormalizeDimension(dim)
+	tv := s.trialVaultState()
+	tv.mu.Lock()
+	defer tv.mu.Unlock()
+	s.ensureTrialVaultLoadedLocked(tv)
+	for _, be := range tv.spawners {
+		if be == nil || be.Dimension != normDim {
+			continue
+		}
+		for _, id := range be.CurrentMobs {
+			if id == entityID {
+				return be.X, be.Y, be.Z, be.Ominous, true
+			}
+		}
+	}
+	return 0, 0, 0, false, false
 }
 
 // NotifyTrialSpawnerMobDefeated removes `entityID` from the active wave mob list
@@ -672,6 +691,8 @@ func (s *Server) TickTrialSpawnersAndVaults() {
 	if s == nil {
 		return
 	}
+	s.discoverNearbyTrialSpawnersAndVaults()
+
 	tv := s.trialVaultState()
 	tv.mu.Lock()
 	s.ensureTrialVaultLoadedLocked(tv)
@@ -698,6 +719,73 @@ func (s *Server) TickTrialSpawnersAndVaults() {
 	}
 	if dirty {
 		_ = s.SaveTrialSpawnersAndVaults()
+	}
+}
+
+func (s *Server) discoverNearbyTrialSpawnersAndVaults() {
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		if p != nil && !p.IsDead() {
+			players = append(players, p)
+		}
+	}
+	s.playersMu.RUnlock()
+	if len(players) == 0 {
+		return
+	}
+
+	type dimChunk struct {
+		dim string
+		cx  int32
+		cz  int32
+	}
+	seenChunks := make(map[dimChunk]bool, len(players)*9)
+
+	for _, p := range players {
+		snap := p.Snapshot()
+		if snap.GameMode == GameModeSpectator {
+			continue
+		}
+		dim := world.NormalizeDimension(p.Dimension())
+		cache := s.DimensionChunks(dim)
+		if cache == nil {
+			continue
+		}
+		pcx := int32(int(math.Floor(snap.X)) >> 4)
+		pcz := int32(int(math.Floor(snap.Z)) >> 4)
+		for dz := int32(-1); dz <= 1; dz++ {
+			for dx := int32(-1); dx <= 1; dx++ {
+				dc := dimChunk{dim: dim, cx: pcx + dx, cz: pcz + dz}
+				if seenChunks[dc] {
+					continue
+				}
+				seenChunks[dc] = true
+				s.HydrateChunkTrialSpawnersAndVaults(dim, dc.cx, dc.cz)
+			}
+		}
+		// Also auto-discover any player-placed vault or trial_spawner within 4 blocks.
+		px, py, pz := int(math.Floor(snap.X)), int(math.Floor(snap.Y)), int(math.Floor(snap.Z))
+		for dy := -2; dy <= 3; dy++ {
+			y := py + dy
+			if y < world.MinY || y >= world.MinY+world.WorldHeight {
+				continue
+			}
+			for dz := -4; dz <= 4; dz++ {
+				for dx := -4; dx <= 4; dx++ {
+					x, z := px+dx, pz+dz
+					if !cache.IsChunkLoaded(int32(x>>4), int32(z>>4)) {
+						continue
+					}
+					st := cache.GetBlock(x, y, z)
+					if IsTrialSpawnerBlock(st) {
+						_ = s.EnsureTrialSpawnerAt(dim, x, y, z)
+					} else if IsVaultBlock(st) {
+						_ = s.EnsureVaultAt(dim, x, y, z)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -828,7 +916,14 @@ func (s *Server) tickSingleTrialSpawner(k brewingKey) bool {
 	}
 
 	sx, sy, sz := float64(k.x)+0.5, float64(k.y)+0.5, float64(k.z)+0.5
-	nearbyPlayers := s.playersWithinSphereInDim(k.dim, sx, sy, sz, TrialSpawnerRequiredPlayerRange, true)
+	rawPlayers := s.playersWithinSphereInDim(k.dim, sx, sy, sz, TrialSpawnerRequiredPlayerRange, true)
+	var nearbyPlayers []*PlayerSession
+	for _, p := range rawPlayers {
+		snap := p.Snapshot()
+		if cache.HasTrialSpawnerLineOfSight(sx, sy, sz, snap.X, snap.Y, snap.Z) {
+			nearbyPlayers = append(nearbyPlayers, p)
+		}
+	}
 	wantsOminous := s.checkPlayersForTrialOminousUpgrade(nearbyPlayers)
 
 	tv := s.trialVaultState()
@@ -840,15 +935,23 @@ func (s *Server) tickSingleTrialSpawner(k brewingKey) bool {
 	}
 	spawnHook := tv.mobSpawnHook
 	aliveHook := tv.mobAliveHook
+	despawnHook := tv.mobDespawnHook
 
 	changed := false
 	cx, cz := int32(k.x>>4), int32(k.z>>4)
 
-	// Prune any dead mobs if aliveHook is registered.
-	if aliveHook != nil && len(be.CurrentMobs) > 0 {
+	// Prune any dead mobs if aliveHook is registered (or if tracked in s.entities).
+	if len(be.CurrentMobs) > 0 {
 		alive := be.CurrentMobs[:0]
 		for _, id := range be.CurrentMobs {
-			if aliveHook(k.dim, id) {
+			stillAlive := true
+			if aliveHook != nil {
+				stillAlive = aliveHook(k.dim, id)
+			} else if id < 900000 && s.entities != nil {
+				ent := s.entities.Get(id)
+				stillAlive = ent != nil && ent.Health > 0
+			}
+			if stillAlive {
 				alive = append(alive, id)
 			} else {
 				changed = true
@@ -857,8 +960,10 @@ func (s *Server) tickSingleTrialSpawner(k brewingKey) bool {
 		be.CurrentMobs = alive
 	}
 
-	// Upgrading from non-ominous to ominous overrides cooldown and restarts the wave as ominous!
+	// Upgrading from non-ominous to ominous overrides cooldown, despawns existing
+	// non-ominous wave mobs, and restarts the wave as ominous!
 	if wantsOminous && !be.Ominous {
+		oldMobs := append([]int32(nil), be.CurrentMobs...)
 		be.Ominous = true
 		be.CooldownTicksRemaining = 0
 		be.TotalMobsSpawned = 0
@@ -868,8 +973,18 @@ func (s *Server) tickSingleTrialSpawner(k brewingKey) bool {
 			be.State = TrialSpawnerStateWaitingForPlayers
 		}
 		changed = true
+		tv.mu.Unlock()
+		for _, id := range oldMobs {
+			if s.entities != nil && id < 900000 {
+				s.entities.Remove(id)
+			}
+			if despawnHook != nil {
+				despawnHook(k.dim, id)
+			}
+		}
 		s.BroadcastDimensionChunk(k.dim, cx, cz, PlaySoundPacketID,
 			EncodeSoundPacket(SoundTrialSpawnerOminous, SoundSourceBlocks, sx, sy, sz, 1.0, 1.0, 0))
+		tv.mu.Lock()
 	}
 
 	switch be.State {
@@ -934,11 +1049,12 @@ func (s *Server) tickSingleTrialSpawner(k brewingKey) bool {
 				be.TicksUntilNextSpawn--
 			}
 			if be.TicksUntilNextSpawn <= 0 {
+				spawnX, spawnY, spawnZ, _ := cache.FindTrialSpawnerMobSpawnPosition(k.x, k.y, k.z, tv.rng)
 				var spawnedID int32
 				var spawnedOK bool
 				if spawnHook != nil {
 					tv.mu.Unlock()
-					spawnedID, spawnedOK = spawnHook(k.dim, k.x, k.y, k.z, entityID, equipTable, be.Ominous, sx, float64(k.y)+1.0, sz)
+					spawnedID, spawnedOK = spawnHook(k.dim, k.x, k.y, k.z, entityID, equipTable, be.Ominous, spawnX, spawnY, spawnZ)
 					tv.mu.Lock()
 				} else {
 					tv.nextSynthID++
@@ -1100,8 +1216,9 @@ func (s *Server) tickSingleVault(k brewingKey) bool {
 			if cnt <= 0 {
 				cnt = 1
 			}
+			ex, ey, ez, _, _, _ := world.VaultEjectPositionAndVelocity(k.x, k.y, k.z, be.Facing)
 			tv.mu.Unlock()
-			s.SpawnItemEntity(vx, float64(k.y)+1.0, vz, world.NewNamedItemStack(nextItem.ItemID, cnt))
+			s.SpawnItemEntity(ex, ey, ez, world.NewNamedItemStack(nextItem.ItemID, cnt))
 			s.BroadcastDimensionChunk(k.dim, cx, cz, PlaySoundPacketID,
 				EncodeSoundPacket(SoundVaultEjectItem, SoundSourceBlocks, vx, vy, vz, 1.0, 1.0, 0))
 			tv.mu.Lock()
@@ -1256,7 +1373,8 @@ func (s *Server) LoadTrialSpawnersAndVaults() error {
 
 // ExportChunkTrialSpawnersAndVaultsNBT exports all `minecraft:trial_spawner`
 // and `minecraft:vault` block entities in chunk (dim, cx, cz) as vanilla 26.1.2
-// Anvil `block_entities` NBT compounds.
+// Anvil `block_entities` NBT compounds (including nested `config` / `server_data`
+// / `shared_data` compounds as well as flat compatibility keys).
 func (s *Server) ExportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32) []*nbt.Compound {
 	if s == nil {
 		return nil
@@ -1285,6 +1403,14 @@ func (s *Server) ExportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32) 
 			}
 			if sp.SpawnerEntityID != "" {
 				c.Set("spawner_entity_id", nbt.String(sp.SpawnerEntityID))
+				c.Set("spawn_data", nbt.NewCompound().Set("entity", nbt.NewCompound().Set("id", nbt.String(sp.SpawnerEntityID))))
+			}
+			if len(sp.DetectedPlayers) > 0 {
+				dpElems := make([]nbt.Tag, 0, len(sp.DetectedPlayers))
+				for _, pk := range sp.DetectedPlayers {
+					dpElems = append(dpElems, nbt.String(pk))
+				}
+				c.Set("registered_players", nbt.List{ElemID: nbt.TagString, Elems: dpElems})
 			}
 			out = append(out, c)
 		}
@@ -1295,6 +1421,21 @@ func (s *Server) ExportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32) 
 			for _, pk := range v.RewardedPlayers {
 				pElems = append(pElems, nbt.String(pk))
 			}
+			rewardedList := nbt.List{ElemID: nbt.TagString, Elems: pElems}
+			cfgComp := nbt.NewCompound()
+			if v.LootTable != "" {
+				cfgComp.Set("loot_table", nbt.String(v.LootTable))
+			}
+			if v.KeyItem != "" {
+				cfgComp.Set("key_item", nbt.NewCompound().Set("id", nbt.String(v.KeyItem)).Set("count", nbt.Int(1)))
+			}
+			srvComp := nbt.NewCompound().
+				Set("rewarded_players", rewardedList).
+				Set("state_updating_resumes_at", nbt.Long(int64(v.StepTimerTicks)))
+			sharedComp := nbt.NewCompound()
+			if v.DisplayItem != "" {
+				sharedComp.Set("display_item", nbt.NewCompound().Set("id", nbt.String(v.DisplayItem)).Set("count", nbt.Int(1)))
+			}
 			c := nbt.NewCompound().
 				Set("id", nbt.String("minecraft:vault")).
 				Set("x", nbt.Int(int32(v.X))).
@@ -1303,7 +1444,10 @@ func (s *Server) ExportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32) 
 				Set("facing", nbt.String(v.Facing)).
 				Set("ominous", boolToNBTByte(v.Ominous)).
 				Set("state", nbt.String(v.State)).
-				Set("rewarded_players", nbt.List{ElemID: nbt.TagString, Elems: pElems})
+				Set("rewarded_players", rewardedList).
+				Set("config", cfgComp).
+				Set("server_data", srvComp).
+				Set("shared_data", sharedComp)
 			if v.LootTable != "" {
 				c.Set("loot_table", nbt.String(v.LootTable))
 			}
@@ -1317,8 +1461,34 @@ func (s *Server) ExportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32) 
 	return out
 }
 
+// UnloadChunkTrialSpawnersAndVaults exports and removes all `minecraft:trial_spawner`
+// and `minecraft:vault` block entities in chunk (dim, cx, cz).
+func (s *Server) UnloadChunkTrialSpawnersAndVaults(dim string, cx, cz int32) []*nbt.Compound {
+	if s == nil {
+		return nil
+	}
+	exported := s.ExportChunkTrialSpawnersAndVaultsNBT(dim, cx, cz)
+	normDim := world.NormalizeDimension(dim)
+	tv := s.trialVaultState()
+	tv.mu.Lock()
+	for k := range tv.spawners {
+		if k.dim == normDim && int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			delete(tv.spawners, k)
+		}
+	}
+	for k := range tv.vaults {
+		if k.dim == normDim && int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			delete(tv.vaults, k)
+		}
+	}
+	tv.mu.Unlock()
+	return exported
+}
+
 // ImportChunkTrialSpawnersAndVaultsNBT imports `minecraft:trial_spawner` and
-// `minecraft:vault` block entity NBT compounds for chunk (dim, cx, cz).
+// `minecraft:vault` block entity NBT compounds for chunk (dim, cx, cz),
+// supporting both flat keys and vanilla 26.1.2 nested `config` / `server_data`
+// / `shared_data` / `spawn_data` compounds.
 func (s *Server) ImportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32, compounds []*nbt.Compound) int {
 	if s == nil || len(compounds) == 0 {
 		return 0
@@ -1353,6 +1523,25 @@ func (s *Server) ImportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32, 
 			normCfg, _ := nbtGetString(c, "normal_config")
 			omCfg, _ := nbtGetString(c, "ominous_config")
 			entID, _ := nbtGetString(c, "spawner_entity_id")
+			if entID == "" {
+				if sdTag, ok := c.Get("spawn_data"); ok {
+					if sdc, ok := sdTag.(*nbt.Compound); ok {
+						if entTag, ok := sdc.Get("entity"); ok {
+							if ec, ok := entTag.(*nbt.Compound); ok {
+								entID, _ = nbtGetString(ec, "id")
+							}
+						}
+					}
+				}
+			}
+			var detected []string
+			if elems, ok := nbtGetListElems(c, "registered_players"); ok {
+				for _, e := range elems {
+					if str, ok := e.(nbt.String); ok && string(str) != "" {
+						detected = append(detected, string(str))
+					}
+				}
+			}
 			tv.spawners[key] = &TrialSpawnerBlockEntity{
 				Dimension:              normDim,
 				X:                      int(x),
@@ -1363,6 +1552,7 @@ func (s *Server) ImportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32, 
 				NormalConfig:           normCfg,
 				OminousConfig:          omCfg,
 				SpawnerEntityID:        entID,
+				DetectedPlayers:        detected,
 				TotalMobsSpawned:       int(tot),
 				CooldownTicksRemaining: int(cd),
 			}
@@ -1379,11 +1569,38 @@ func (s *Server) ImportChunkTrialSpawnersAndVaultsNBT(dim string, cx, cz int32, 
 			}
 			lt, _ := nbtGetString(c, "loot_table")
 			ki, _ := nbtGetString(c, "key_item")
+			if cfgTag, ok := c.Get("config"); ok {
+				if cfgComp, ok := cfgTag.(*nbt.Compound); ok {
+					if lt == "" {
+						lt, _ = nbtGetString(cfgComp, "loot_table")
+					}
+					if ki == "" {
+						if keyTag, ok := cfgComp.Get("key_item"); ok {
+							if kc, ok := keyTag.(*nbt.Compound); ok {
+								ki, _ = nbtGetString(kc, "id")
+							}
+						}
+					}
+				}
+			}
 			var rewarded []string
 			if elems, ok := nbtGetListElems(c, "rewarded_players"); ok {
 				for _, e := range elems {
 					if str, ok := e.(nbt.String); ok && string(str) != "" {
 						rewarded = append(rewarded, string(str))
+					}
+				}
+			}
+			if len(rewarded) == 0 {
+				if srvTag, ok := c.Get("server_data"); ok {
+					if srvComp, ok := srvTag.(*nbt.Compound); ok {
+						if elems, ok := nbtGetListElems(srvComp, "rewarded_players"); ok {
+							for _, e := range elems {
+								if str, ok := e.(nbt.String); ok && string(str) != "" {
+									rewarded = append(rewarded, string(str))
+								}
+							}
+						}
 					}
 				}
 			}

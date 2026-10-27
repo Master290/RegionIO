@@ -269,4 +269,89 @@ func TestTrialSpawnerAndVaultPersistenceRoundTrip(t *testing.T) {
 	if vSnap3 == nil || !vSnap3.Ominous || len(vSnap3.RewardedPlayers) != 1 || vSnap3.RewardedPlayers[0] != "heroa" || vSnap3.KeyItem != ItemOminousTrialKey {
 		t.Fatalf("NBT round-trip vault mismatch: %+v", vSnap3)
 	}
+
+	// 3. Test UnloadChunkTrialSpawnersAndVaults removes entries from memory after exporting.
+	unloaded := s3.UnloadChunkTrialSpawnersAndVaults(dim, 0, 0)
+	if len(unloaded) != 2 {
+		t.Fatalf("UnloadChunkTrialSpawnersAndVaults count = %d, want 2", len(unloaded))
+	}
+	if after := s3.ExportChunkTrialSpawnersAndVaultsNBT(dim, 0, 0); len(after) != 0 {
+		t.Fatalf("expected 0 entries after unload, got %d", len(after))
+	}
 }
+
+func TestTrialSpawnerLineOfSightOminousBottleAndAutoDiscovery(t *testing.T) {
+	dim := world.DimensionOverworld
+	s, cache := newBeaconTestServer(t)
+
+	sx, sy, sz := 16, 64, 16
+	cache.SetBlock(sx, sy, sz, MakeTrialSpawnerBlockState(TrialSpawnerStateWaitingForPlayers, false))
+	cache.AddChunkStructureBlockEntity(world.StructureBlockEntity{
+		ID:              "minecraft:trial_spawner",
+		X:               sx,
+		Y:               sy,
+		Z:               sz,
+		NormalConfig:    "minecraft:trial_chamber/breeze/normal",
+		OminousConfig:   "minecraft:trial_chamber/breeze/ominous",
+		SpawnerEntityID: "minecraft:breeze",
+	})
+
+	// Build an opaque wall at X=18 blocking line-of-sight between (16,64,16) and player at (20.5,64,16.5).
+	tuffBricks, _ := world.BlockStateIDByProperties("minecraft:tuff_bricks", nil)
+	for dy := 0; dy <= 2; dy++ {
+		for dz := -2; dz <= 2; dz++ {
+			cache.SetBlock(18, sy+dy, sz+dz, tuffBricks)
+		}
+	}
+
+	p := newBeaconTestPlayer(s, "OminousRunner", 20.5, 64.0, 16.5)
+
+	// 1. Tick auto-discovers the chunk's StructureBlockEntity, but wall blocks player detection!
+	s.TickTrialSpawnersAndVaults()
+	st, _, ok := ParseTrialSpawnerBlockState(cache.GetBlock(sx, sy, sz))
+	if !ok || st != TrialSpawnerStateWaitingForPlayers {
+		t.Fatalf("expected wall to block player detection: state=%q, want waiting_for_players", st)
+	}
+
+	// 2. Remove wall -> player is detected and 1st breeze spawns.
+	for dy := 0; dy <= 2; dy++ {
+		for dz := -2; dz <= 2; dz++ {
+			cache.SetBlock(18, sy+dy, sz+dz, world.StateAir)
+		}
+	}
+	s.TickTrialSpawnersAndVaults() // waiting_for_players -> active
+	s.TickTrialSpawnersAndVaults() // spawns 1st mob
+
+	spSnap := s.EnsureTrialSpawnerAt(dim, sx, sy, sz)
+	if spSnap == nil || len(spSnap.CurrentMobs) != 1 {
+		t.Fatalf("expected 1 active wave mob, got %+v", spSnap)
+	}
+	firstMobID := spSnap.CurrentMobs[0]
+	if gotSX, gotSY, gotSZ, gotOm, isWave := s.IsTrialSpawnerWaveMob(dim, firstMobID); !isWave || gotSX != sx || gotSY != sy || gotSZ != sz || gotOm {
+		t.Fatalf("IsTrialSpawnerWaveMob(%d) = (%d,%d,%d, om=%v, ok=%v), want (%d,%d,%d, false, true)",
+			firstMobID, gotSX, gotSY, gotSZ, gotOm, isWave, sx, sy, sz)
+	}
+
+	// 3. Drink ominous_bottle (amplifier 2 = Bad Omen III) -> next tick upgrades spawner to ominous,
+	// converts Bad Omen III to Trial Omen (54,000 ticks), and despawns the non-ominous wave mob!
+	var despawned []int32
+	s.SetTrialSpawnerMobDespawnHook(func(dimName string, entityID int32) {
+		despawned = append(despawned, entityID)
+	})
+	if !s.DrinkOminousBottleWithAmplifier(p, 2) {
+		t.Fatalf("DrinkOminousBottleWithAmplifier returned false")
+	}
+	if !p.HasPlayerEffect(EffectBadOmen) {
+		t.Fatalf("expected Bad Omen after DrinkOminousBottle")
+	}
+
+	s.TickTrialSpawnersAndVaults()
+	if len(despawned) != 1 || despawned[0] != firstMobID {
+		t.Fatalf("expected non-ominous mob %d to be despawned on ominous upgrade, got %v", firstMobID, despawned)
+	}
+	trialOmen, hasTrialOmen := p.PlayerEffect(EffectTrialOmen)
+	if !hasTrialOmen || trialOmen.Duration != TrialOmenBaseDurationTicks*3 {
+		t.Fatalf("expected Trial Omen duration %d, got %+v (ok=%v)", TrialOmenBaseDurationTicks*3, trialOmen, hasTrialOmen)
+	}
+}
+
