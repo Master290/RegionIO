@@ -1,6 +1,7 @@
 package world
 
 import (
+	"strconv"
 	"strings"
 
 	"regionio/internal/nbt"
@@ -494,6 +495,26 @@ func extractTemplateBlockEntity(worldX, worldY, worldZ int, blockName string, nc
 	if id == "minecraft:trial_spawner" {
 		be.NormalConfig = beNBTString(nc, "normal_config")
 		be.OminousConfig = beNBTString(nc, "ominous_config")
+		if be.NormalConfig == "" {
+			if ncTag, ok := nc.Get("normal_config"); ok {
+				if ncc, isComp := ncTag.(*nbt.Compound); isComp {
+					be.NormalConfig = "inline"
+					if be.SpawnerEntityID == "" {
+						be.SpawnerEntityID = extractTrialSpawnerInlineEntity(ncc)
+					}
+				}
+			}
+		}
+		if be.OminousConfig == "" {
+			if ocTag, ok := nc.Get("ominous_config"); ok {
+				if occ, isComp := ocTag.(*nbt.Compound); isComp {
+					be.OminousConfig = "inline"
+					if be.SpawnerEntityID == "" {
+						be.SpawnerEntityID = extractTrialSpawnerInlineEntity(occ)
+					}
+				}
+			}
+		}
 	}
 
 	// 5. Vault (config.loot_table, config.key_item.id).
@@ -525,7 +546,293 @@ func extractTemplateBlockEntity(worldX, worldY, worldZ int, blockName string, nc
 		}
 	}
 
+	// 6. Lectern book (e.g. Ancient City redstone lab / Village library).
+	if id == "minecraft:lectern" && len(be.Items) == 0 {
+		if bookTag, ok := nc.Get("Book"); ok {
+			if bc, isComp := bookTag.(*nbt.Compound); isComp {
+				itemID := beNBTString(bc, "id")
+				if itemID != "" {
+					cnt := beNBTInt(bc, "count", beNBTInt(bc, "Count", 1))
+					if cnt <= 0 {
+						cnt = 1
+					}
+					be.Items = append(be.Items, worldgen.LootItemStack{
+						Slot:   0,
+						ItemID: normalizeResourceID(itemID),
+						Count:  cnt,
+					})
+				}
+			}
+		}
+	}
+
 	return be, true
+}
+
+func extractTrialSpawnerInlineEntity(cfgComp *nbt.Compound) string {
+	if cfgComp == nil {
+		return ""
+	}
+	if spTag, ok := cfgComp.Get("spawn_potentials"); ok {
+		if list, isList := spTag.(nbt.List); isList {
+			for _, elem := range list.Elems {
+				ec, ok := elem.(*nbt.Compound)
+				if !ok {
+					continue
+				}
+				if dataTag, ok := ec.Get("data"); ok {
+					if dc, ok := dataTag.(*nbt.Compound); ok {
+						if entTag, ok := dc.Get("entity"); ok {
+							if entComp, ok := entTag.(*nbt.Compound); ok {
+								if id := beNBTString(entComp, "id"); id != "" {
+									return normalizeResourceID(id)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func mapToNBTCompound(m map[string]any) *nbt.Compound {
+	if len(m) == 0 {
+		return nil
+	}
+	comp := nbt.NewCompound()
+	for k, v := range m {
+		if tag := anyToNBTTag(v); tag != nil {
+			comp.Set(k, tag)
+		}
+	}
+	return comp
+}
+
+func anyToNBTTag(v any) nbt.Tag {
+	switch val := v.(type) {
+	case string:
+		return nbt.String(val)
+	case bool:
+		if val {
+			return nbt.Byte(1)
+		}
+		return nbt.Byte(0)
+	case float64:
+		return nbt.Int(int32(val))
+	case int:
+		return nbt.Int(int32(val))
+	case int64:
+		return nbt.Long(val)
+	case map[string]any:
+		return mapToNBTCompound(val)
+	case []any:
+		if len(val) == 0 {
+			return nbt.List{ElemID: nbt.TagEnd}
+		}
+		var elems []nbt.Tag
+		var elemID byte
+		for _, item := range val {
+			t := anyToNBTTag(item)
+			if t == nil {
+				continue
+			}
+			if elemID == 0 {
+				elemID = t.ID()
+			}
+			elems = append(elems, t)
+		}
+		return nbt.List{ElemID: elemID, Elems: elems}
+	}
+	return nil
+}
+
+// parseSNBTCompound parses a trailing SNBT compound string "{...}" from a jigsaw final_state.
+func parseSNBTCompound(s string) *nbt.Compound {
+	p := &snbtParser{s: strings.TrimSpace(s)}
+	v := p.parseValue()
+	if c, ok := v.(*nbt.Compound); ok {
+		return c
+	}
+	return nil
+}
+
+type snbtParser struct {
+	s string
+	i int
+}
+
+func (p *snbtParser) skipWS() {
+	for p.i < len(p.s) {
+		ch := p.s[p.i]
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			p.i++
+		} else {
+			break
+		}
+	}
+}
+
+func (p *snbtParser) parseValue() nbt.Tag {
+	p.skipWS()
+	if p.i >= len(p.s) {
+		return nil
+	}
+	switch p.s[p.i] {
+	case '{':
+		return p.parseCompound()
+	case '[':
+		return p.parseList()
+	case '"', '\'':
+		return nbt.String(p.parseQuoted())
+	default:
+		return p.parseScalar()
+	}
+}
+
+func (p *snbtParser) parseCompound() *nbt.Compound {
+	if p.i >= len(p.s) || p.s[p.i] != '{' {
+		return nil
+	}
+	p.i++
+	comp := nbt.NewCompound()
+	for {
+		p.skipWS()
+		if p.i >= len(p.s) {
+			break
+		}
+		if p.s[p.i] == '}' {
+			p.i++
+			break
+		}
+		if p.s[p.i] == ',' {
+			p.i++
+			continue
+		}
+		var key string
+		if p.s[p.i] == '"' || p.s[p.i] == '\'' {
+			key = p.parseQuoted()
+		} else {
+			start := p.i
+			for p.i < len(p.s) && p.s[p.i] != ':' && p.s[p.i] != '}' && p.s[p.i] != ' ' && p.s[p.i] != '\t' {
+				p.i++
+			}
+			key = p.s[start:p.i]
+		}
+		p.skipWS()
+		if p.i < len(p.s) && p.s[p.i] == ':' {
+			p.i++
+		}
+		val := p.parseValue()
+		if key != "" && val != nil {
+			comp.Set(key, val)
+		}
+		p.skipWS()
+		if p.i < len(p.s) && p.s[p.i] == ',' {
+			p.i++
+		}
+	}
+	return comp
+}
+
+func (p *snbtParser) parseList() nbt.List {
+	if p.i >= len(p.s) || p.s[p.i] != '[' {
+		return nbt.List{}
+	}
+	p.i++
+	// Skip optional array type prefix like [I; or [B; or [L;
+	if p.i+1 < len(p.s) && p.s[p.i+1] == ';' {
+		p.i += 2
+	}
+	var elems []nbt.Tag
+	var elemID byte
+	for {
+		p.skipWS()
+		if p.i >= len(p.s) {
+			break
+		}
+		if p.s[p.i] == ']' {
+			p.i++
+			break
+		}
+		if p.s[p.i] == ',' {
+			p.i++
+			continue
+		}
+		v := p.parseValue()
+		if v != nil {
+			if elemID == 0 {
+				elemID = v.ID()
+			}
+			elems = append(elems, v)
+		}
+		p.skipWS()
+		if p.i < len(p.s) && p.s[p.i] == ',' {
+			p.i++
+		}
+	}
+	return nbt.List{ElemID: elemID, Elems: elems}
+}
+
+func (p *snbtParser) parseQuoted() string {
+	quote := p.s[p.i]
+	p.i++
+	var sb strings.Builder
+	for p.i < len(p.s) {
+		ch := p.s[p.i]
+		p.i++
+		if ch == '\\' && p.i < len(p.s) {
+			sb.WriteByte(p.s[p.i])
+			p.i++
+			continue
+		}
+		if ch == quote {
+			break
+		}
+		sb.WriteByte(ch)
+	}
+	return sb.String()
+}
+
+func (p *snbtParser) parseScalar() nbt.Tag {
+	start := p.i
+	for p.i < len(p.s) {
+		ch := p.s[p.i]
+		if ch == ',' || ch == '}' || ch == ']' || ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			break
+		}
+		p.i++
+	}
+	tok := p.s[start:p.i]
+	switch tok {
+	case "true":
+		return nbt.Byte(1)
+	case "false":
+		return nbt.Byte(0)
+	}
+	if len(tok) > 1 {
+		last := tok[len(tok)-1]
+		numPart := tok[:len(tok)-1]
+		switch last {
+		case 'b', 'B':
+			if iv, err := strconv.ParseInt(numPart, 10, 8); err == nil {
+				return nbt.Byte(int8(iv))
+			}
+		case 's', 'S':
+			if iv, err := strconv.ParseInt(numPart, 10, 16); err == nil {
+				return nbt.Short(int16(iv))
+			}
+		case 'l', 'L':
+			if iv, err := strconv.ParseInt(numPart, 10, 64); err == nil {
+				return nbt.Long(iv)
+			}
+		}
+	}
+	if iv, err := strconv.ParseInt(tok, 10, 32); err == nil {
+		return nbt.Int(int32(iv))
+	}
+	return nbt.String(tok)
 }
 
 func structureBlockEntitiesToNBT(c *Chunk) nbt.List {

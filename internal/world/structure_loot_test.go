@@ -834,3 +834,222 @@ func TestStructureFeatureEdgeSweepAndLootSeedStability(t *testing.T) {
 		}
 	}
 }
+
+func TestMonsterRoomSpawnerAndLootParity(t *testing.T) {
+	mobs := MonsterRoomMobTypes()
+	if mobs != [4]string{"minecraft:skeleton", "minecraft:zombie", "minecraft:zombie", "minecraft:spider"} {
+		t.Fatalf("unexpected MonsterRoomMobTypes: %v", mobs)
+	}
+
+	region := buildFlatTestDecorationRegion(t, 0, 0, 1, 64, false)
+	stoneID, _ := nameToStateID("minecraft:stone", nil)
+	airID, _ := nameToStateID("minecraft:air", nil)
+	for x := -16; x < 32; x++ {
+		for z := -16; z < 32; z++ {
+			for y := 8; y <= 36; y++ {
+				region.setBlockGlobal(x, y, z, stoneID)
+			}
+		}
+	}
+	// Open a 1-block doorway so the dungeon placement check passes.
+	region.setBlockGlobal(8-4, 20, 8, airID)
+	region.setBlockGlobal(8-4, 21, 8, airID)
+	rng := worldgen.NewLegacy(777)
+	if !placeMonsterRoom(region, rng, 8, 20, 8) {
+		t.Fatalf("expected first monster room to place at (8,20,8)")
+	}
+	bes := collectRegionBlockEntities(region)
+	spawners := 0
+	chests := 0
+	for _, be := range bes {
+		switch be.ID {
+		case "minecraft:mob_spawner":
+			spawners++
+			if be.X != 8 || be.Y != 20 || be.Z != 8 {
+				t.Errorf("spawner at (%d,%d,%d), want (8,20,8)", be.X, be.Y, be.Z)
+			}
+			if be.SpawnerEntityID != "minecraft:skeleton" && be.SpawnerEntityID != "minecraft:zombie" && be.SpawnerEntityID != "minecraft:spider" {
+				t.Errorf("unexpected spawner entity %q", be.SpawnerEntityID)
+			}
+		case "minecraft:chest":
+			chests++
+			if be.LootTable != "minecraft:chests/simple_dungeon" || len(be.Items) == 0 {
+				t.Errorf("chest BE missing simple_dungeon loot: %+v", be)
+			}
+		}
+	}
+	if spawners != 1 || chests == 0 {
+		t.Fatalf("expected 1 spawner and >=1 chest, got spawners=%d chests=%d", spawners, chests)
+	}
+
+	// Verify that if an overlapping second monster room carves an unsupported wall cell to cave_air,
+	// any pre-existing block entity in that wall cell is removed cleanly.
+	probeRng := worldgen.NewLegacy(888)
+	j2 := int(probeRng.NextIntN(2)) + 2
+	wallX := 8 + j2 + 1
+	for x := -16; x < 32; x++ {
+		for z := -16; z < 32; z++ {
+			for y := 8; y <= 36; y++ {
+				region.setBlockGlobal(x, y, z, stoneID)
+			}
+		}
+	}
+	region.setBlockGlobal(wallX, 20, 8, airID)
+	region.setBlockGlobal(wallX, 21, 8, airID)
+	region.addStructureBlockEntity(StructureBlockEntity{
+		ID:        "minecraft:chest",
+		X:         wallX,
+		Y:         21,
+		Z:         8,
+		LootTable: "minecraft:chests/simple_dungeon",
+	})
+	if !placeMonsterRoom(region, worldgen.NewLegacy(888), 8, 20, 8) {
+		t.Fatalf("expected second monster room to place at (8,20,8)")
+	}
+	if ch := region.chunks[[2]int32{0, 0}]; ch != nil {
+		if _, exists := ch.StructureBlockEntityAt(wallX, 21, 8); exists {
+			t.Errorf("expected carved unsupported wall cell (%d,21,8) to remove stale block entity", wallX)
+		}
+	}
+}
+
+func TestMineshaftResidualSpawnerAndMinecartRepeatability(t *testing.T) {
+	const seed int64 = 12345
+	start := BuildMineshaftStart(seed, 0, 0, false)
+	if start == nil {
+		t.Fatalf("expected non-nil MineshaftStart")
+	}
+	for i := range start.Pieces {
+		if start.Pieces[i].kind == msKindCorridor {
+			start.Pieces[i].spider = true
+			start.Pieces[i].hasRails = true
+		}
+	}
+	starts := []*MineshaftStart{start}
+
+	// First run in a throwaway region (simulating neighbor 3x3 pre-pass).
+	preRegion := buildFlatTestDecorationRegion(t, 0, 0, 3, 64, false)
+	preRegion.bindSeed(seed)
+	for cx := int32(-3); cx <= 3; cx++ {
+		for cz := int32(-3); cz <= 3; cz++ {
+			PlaceMineshaftsForChunk(preRegion, starts, seed, cx, cz)
+		}
+	}
+
+	// Second run on a fresh region using the SAME *MineshaftStart pointer must still
+	// place identical cave_spider spawners and chest_minecarts.
+	region2 := buildFlatTestDecorationRegion(t, 0, 0, 3, 64, false)
+	region2.bindSeed(seed)
+	for cx := int32(-3); cx <= 3; cx++ {
+		for cz := int32(-3); cz <= 3; cz++ {
+			PlaceMineshaftsForChunk(region2, starts, seed, cx, cz)
+		}
+	}
+
+	bes1 := collectRegionBlockEntities(preRegion)
+	bes2 := collectRegionBlockEntities(region2)
+	if len(bes1) == 0 || len(bes1) != len(bes2) {
+		t.Fatalf("mineshaft cave_spider spawner count mismatch across repeated runs: %d vs %d", len(bes1), len(bes2))
+	}
+	ents1 := collectRegionEntities(preRegion)
+	ents2 := collectRegionEntities(region2)
+	if len(ents1) == 0 || len(ents1) != len(ents2) {
+		t.Fatalf("mineshaft chest_minecart count mismatch across repeated runs: %d vs %d", len(ents1), len(ents2))
+	}
+}
+
+func TestStrongholdPortalRoomFrameEdgesAndCachedSpawner(t *testing.T) {
+	const seed int64 = 12345
+	start := BuildStrongholdStart(seed, 0, 0)
+	if start == nil || start.PortalRoom == nil {
+		t.Fatalf("expected StrongholdStart with PortalRoom")
+	}
+	frames, interior, spawner, ok := StrongholdPortalRoomFrames(start)
+	if !ok {
+		t.Fatalf("StrongholdPortalRoomFrames returned ok=false")
+	}
+
+	starts := []*StrongholdStart{start}
+	// Run once on a throwaway region to simulate neighbor 3x3 pre-pass on cached StrongholdStart.
+	preRegion := buildFlatTestDecorationRegion(t, 0, 0, 6, 64, false)
+	for cx := int32(-6); cx <= 6; cx++ {
+		for cz := int32(-6); cz <= 6; cz++ {
+			PlaceStrongholdsForChunk(preRegion, starts, seed, cx, cz)
+		}
+	}
+
+	// Run a second time on a fresh region with the same cached StrongholdStart.
+	region := buildFlatTestDecorationRegion(t, 0, 0, 6, 64, false)
+	for cx := int32(-6); cx <= 6; cx++ {
+		for cz := int32(-6); cz <= 6; cz++ {
+			PlaceStrongholdsForChunk(region, starts, seed, cx, cz)
+		}
+	}
+
+	for i, fp := range frames {
+		if BlockName(region.getBlock(fp[0], fp[1], fp[2])) != "minecraft:end_portal_frame" {
+			t.Errorf("frame[%d] at %v = %q, want minecraft:end_portal_frame", i, fp, BlockName(region.getBlock(fp[0], fp[1], fp[2])))
+		}
+	}
+	if len(interior) != 9 {
+		t.Errorf("interior len = %d, want 9", len(interior))
+	}
+	if BlockName(region.getBlock(spawner[0], spawner[1], spawner[2])) != "minecraft:spawner" {
+		t.Errorf("spawner block at %v = %q, want minecraft:spawner", spawner, BlockName(region.getBlock(spawner[0], spawner[1], spawner[2])))
+	}
+	foundSpawnerBE := false
+	chests := 0
+	for _, be := range collectRegionBlockEntities(region) {
+		if be.ID == "minecraft:mob_spawner" && be.X == spawner[0] && be.Y == spawner[1] && be.Z == spawner[2] && be.SpawnerEntityID == "minecraft:silverfish" {
+			foundSpawnerBE = true
+		}
+		if be.ID == "minecraft:chest" && len(be.Items) > 0 {
+			chests++
+		}
+	}
+	if !foundSpawnerBE || chests == 0 {
+		t.Fatalf("after cached StrongholdStart re-run: foundSpawnerBE=%v chests=%d", foundSpawnerBE, chests)
+	}
+}
+
+func TestJigsawFinalStateSNBTAndLecternBook(t *testing.T) {
+	stateByIDOnce.Do(buildStateTable)
+
+	// 1. Trial Spawner final_state with SNBT
+	id, name, snbt, ok := parseFinalStateWithSNBT(`minecraft:trial_spawner[ominous=false,trial_spawner_state=inactive]{normal_config:"minecraft:trial_chamber/breeze/normal",ominous_config:"minecraft:trial_chamber/breeze/ominous"}`)
+	if !ok || id == 0 || name != "minecraft:trial_spawner" || snbt == nil {
+		t.Fatalf("parseFinalStateWithSNBT trial_spawner failed: id=%d name=%q snbt=%v ok=%v", id, name, snbt, ok)
+	}
+	be, valid := extractTemplateBlockEntity(10, 20, 30, name, snbt, 0)
+	if !valid {
+		t.Fatalf("extractTemplateBlockEntity trial_spawner valid=false")
+	}
+	populateBlockEntityLoot(&be)
+	if be.NormalConfig != "minecraft:trial_chamber/breeze/normal" || be.SpawnerEntityID != "minecraft:breeze" {
+		t.Errorf("trial_spawner BE = %+v", be)
+	}
+
+	// 2. Vault final_state with nested SNBT
+	_, vName, vSNBT, vOK := parseFinalStateWithSNBT(`minecraft:vault[facing=south,ominous=true,vault_state=inactive]{config:{key_item:{count:1,id:"minecraft:ominous_trial_key"},loot_table:"minecraft:chests/trial_chambers/reward_ominous"}}`)
+	if !vOK || vName != "minecraft:vault" || vSNBT == nil {
+		t.Fatalf("parseFinalStateWithSNBT vault failed")
+	}
+	vBE, vValid := extractTemplateBlockEntity(12, 20, 30, vName, vSNBT, 0)
+	if !vValid {
+		t.Fatalf("extractTemplateBlockEntity vault valid=false")
+	}
+	populateBlockEntityLoot(&vBE)
+	if vBE.KeyItem != "minecraft:ominous_trial_key" || vBE.LootTable != "minecraft:chests/trial_chambers/reward_ominous" || len(vBE.Items) == 0 {
+		t.Errorf("vault BE = %+v", vBE)
+	}
+
+	// 3. Lectern with Book (Ancient City / Village library)
+	_, lName, lSNBT, lOK := parseFinalStateWithSNBT(`minecraft:lectern[facing=north,has_book=true,powered=false]{Book:{Count:1b,id:"minecraft:written_book"}}`)
+	if !lOK || lName != "minecraft:lectern" || lSNBT == nil {
+		t.Fatalf("parseFinalStateWithSNBT lectern failed")
+	}
+	lBE, lValid := extractTemplateBlockEntity(14, 20, 30, lName, lSNBT, 0)
+	if !lValid || len(lBE.Items) != 1 || lBE.Items[0].ItemID != "minecraft:written_book" {
+		t.Errorf("lectern BE = %+v", lBE)
+	}
+}

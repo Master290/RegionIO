@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"regionio/internal/nbt"
 	"regionio/internal/worldgen"
 )
 
@@ -1082,8 +1083,19 @@ func VillageGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.Struct
 }
 
 func parseFinalStateString(finalState string) (uint16, string, bool) {
+	id, name, _, ok := parseFinalStateWithSNBT(finalState)
+	return id, name, ok
+}
+
+func parseFinalStateWithSNBT(finalState string) (uint16, string, *nbt.Compound, bool) {
+	finalState = strings.TrimSpace(finalState)
 	if finalState == "" {
-		return StateAir, "minecraft:air", true
+		return StateAir, "minecraft:air", nil, true
+	}
+	var snbtComp *nbt.Compound
+	if cb := strings.IndexByte(finalState, '{'); cb >= 0 && strings.HasSuffix(finalState, "}") {
+		snbtComp = parseSNBTCompound(finalState[cb:])
+		finalState = strings.TrimSpace(finalState[:cb])
 	}
 	name := finalState
 	var props map[string]string
@@ -1104,13 +1116,29 @@ func parseFinalStateString(finalState string) (uint16, string, bool) {
 		name = "minecraft:" + name
 	}
 	if name == "minecraft:structure_void" {
-		return 0, name, false
+		return 0, name, nil, false
 	}
 	id, ok := nameToStateID(name, props)
 	if !ok {
 		id, ok = nameToStateID(name, nil)
 	}
-	return id, name, ok
+	return id, name, snbtComp, ok
+}
+
+func isRandomizableContainerBlockName(name string) bool {
+	switch normalizeResourceID(name) {
+	case "minecraft:chest",
+		"minecraft:trapped_chest",
+		"minecraft:barrel",
+		"minecraft:dispenser",
+		"minecraft:dropper",
+		"minecraft:hopper",
+		"minecraft:crafter",
+		"minecraft:decorated_pot":
+		return true
+	default:
+		return strings.HasSuffix(name, "_shulker_box") || name == "minecraft:shulker_box"
+	}
 }
 
 func testRulePredicate(pred worldgen.RulePredicateDef, stateID uint16, rng worldgen.RandomSource, fs *worldgen.FeatureSet) bool {
@@ -1466,12 +1494,16 @@ func placeJigsawElementInChunk(
 				if orig.Jigsaw == nil {
 					continue
 				}
-				fID, fName, keep := parseFinalStateString(orig.Jigsaw.FinalState)
+				fID, fName, fSNBT, keep := parseFinalStateWithSNBT(orig.Jigsaw.FinalState)
 				if !keep {
 					continue
 				}
 				curState = fID
 				curName = fName
+				orig.BlockName = fName
+				orig.State = fID
+				orig.NBT = fSNBT
+				orig.IsRandomizableContainer = fSNBT != nil && beNBTString(fSNBT, "LootTable") != "" && isRandomizableContainerBlockName(fName)
 			}
 
 			// 3. Configured processBlock processors (RuleProcessor, BlockRotProcessor, ProtectedBlocksProcessor, BlackstoneReplaceProcessor, BlockIgnoreProcessor).
@@ -1497,9 +1529,19 @@ func placeJigsawElementInChunk(
 							curState = outID
 							curName = rule.OutputState.Name
 						}
-						if rule.BlockEntityModifier.Type == "minecraft:append_loot" && rule.BlockEntityModifier.LootTable != "" {
-							ruleLootTable = rule.BlockEntityModifier.LootTable
-							ruleLootSeed = ruleRng.NextLong()
+						switch rule.BlockEntityModifier.Type {
+						case "minecraft:append_loot":
+							if rule.BlockEntityModifier.LootTable != "" {
+								ruleLootTable = rule.BlockEntityModifier.LootTable
+								ruleLootSeed = ruleRng.NextLong()
+							}
+						case "minecraft:append_static":
+							if len(rule.BlockEntityModifier.Data) > 0 {
+								orig.NBT = mapToNBTCompound(rule.BlockEntityModifier.Data)
+								orig.BlockName = curName
+							}
+						case "minecraft:clear":
+							orig.NBT = nil
 						}
 						break
 					}
@@ -1611,9 +1653,21 @@ func placeJigsawElementInChunk(
 						sb.curState = outID
 						sb.curName = rule.OutputState.Name
 					}
-					if rule.BlockEntityModifier.Type == "minecraft:append_loot" && rule.BlockEntityModifier.LootTable != "" {
-						sb.ruleLootTable = rule.BlockEntityModifier.LootTable
-						sb.ruleLootSeed = ruleRng.NextLong()
+					switch rule.BlockEntityModifier.Type {
+					case "minecraft:append_loot":
+						if rule.BlockEntityModifier.LootTable != "" {
+							sb.ruleLootTable = rule.BlockEntityModifier.LootTable
+							sb.ruleLootSeed = ruleRng.NextLong()
+							changed = true
+						}
+					case "minecraft:append_static":
+						if len(rule.BlockEntityModifier.Data) > 0 {
+							sb.orig.NBT = mapToNBTCompound(rule.BlockEntityModifier.Data)
+							sb.orig.BlockName = sb.curName
+							changed = true
+						}
+					case "minecraft:clear":
+						sb.orig.NBT = nil
 						changed = true
 					}
 					if changed {

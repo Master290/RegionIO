@@ -73,10 +73,11 @@ type PosPredicateDef struct {
 	Axis          string  `json:"axis"`
 }
 
-// RuleBlockEntityModifierDef is a block_entity_modifier in a ProcessorRule (e.g. minecraft:append_loot).
+// RuleBlockEntityModifierDef is a block_entity_modifier in a ProcessorRule (e.g. minecraft:append_loot, minecraft:append_static, minecraft:clear).
 type RuleBlockEntityModifierDef struct {
-	Type      string `json:"type"`
-	LootTable string `json:"loot_table"`
+	Type      string         `json:"type"`
+	LootTable string         `json:"loot_table"`
+	Data      map[string]any `json:"data"`
 }
 
 // ProcessorRuleDef is one rule inside a RuleProcessor.

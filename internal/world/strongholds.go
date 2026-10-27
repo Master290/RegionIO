@@ -1314,12 +1314,10 @@ func shPostProcess(c *shContext, p *shPiece, random worldgen.RandomSource) {
 		for z := 2; z <= 4; z++ {
 			c.placeBlock(p, shStoneBrickSlab, 2, 1, z)
 		}
-		if !p.hasPlacedChest {
-			wx, wy, wz := p.worldX(3, 3), p.worldY(2), p.worldZ(3, 3)
-			if msBoxContains(c.chunkBox, wx, wy, wz) {
-				p.hasPlacedChest = true
-				c.createChest(p, random, 3, 2, 3)
-			}
+		wx, wy, wz := p.worldX(3, 3), p.worldY(2), p.worldZ(3, 3)
+		if msBoxContains(c.chunkBox, wx, wy, wz) {
+			p.hasPlacedChest = true
+			c.createChest(p, random, 3, 2, 3)
 		}
 
 	case shKindLibrary:
@@ -1462,17 +1460,35 @@ func shPostProcess(c *shContext, p *shPiece, random worldgen.RandomSource) {
 		c.placeBlock(p, shPortalFrame[3][hasEye[9]], 7, 3, 9)
 		c.placeBlock(p, shPortalFrame[3][hasEye[10]], 7, 3, 10)
 		c.placeBlock(p, shPortalFrame[3][hasEye[11]], 7, 3, 11)
-		if allEyes {
+		frameComplete := allEyes
+		if !frameComplete {
+			frameComplete = true
+			frameLocs := [12][2]int{
+				{4, 8}, {5, 8}, {6, 8},
+				{4, 12}, {5, 12}, {6, 12},
+				{3, 9}, {3, 10}, {3, 11},
+				{7, 9}, {7, 10}, {7, 11},
+			}
+			for _, fl := range frameLocs {
+				fwx, fwy, fwz := p.worldX(fl[0], fl[1]), p.worldY(3), p.worldZ(fl[0], fl[1])
+				st, ok := stateByID(c.region.getBlock(fwx, fwy, fwz))
+				if !ok || st.Name != "minecraft:end_portal_frame" || st.Properties["eye"] != "true" {
+					frameComplete = false
+					break
+				}
+			}
+		}
+		if frameComplete {
 			for x := 4; x <= 6; x++ {
 				for z := 9; z <= 11; z++ {
 					c.placeBlock(p, shEndPortal, x, 3, z)
 				}
 			}
 		}
-		if !p.hasPlacedSpawner {
-			wx, wy, wz := p.worldX(5, 6), p.worldY(3), p.worldZ(5, 6)
-			if msBoxContains(c.chunkBox, wx, wy, wz) {
-				p.hasPlacedSpawner = true
+		wx, wy, wz := p.worldX(5, 6), p.worldY(3), p.worldZ(5, 6)
+		if msBoxContains(c.chunkBox, wx, wy, wz) {
+			p.hasPlacedSpawner = true
+			if c.region.getBlock(wx, wy, wz) != shSpawner {
 				c.region.setBlockGlobal(wx, wy, wz, shSpawner)
 				c.region.addStructureBlockEntity(StructureBlockEntity{
 					ID:              "minecraft:mob_spawner",
@@ -1564,4 +1580,32 @@ func PlaceStrongholdsForChunk(region *decorationRegion, starts []*StrongholdStar
 // intersects the given chunk.
 func PlaceStrongholdStart(region *decorationRegion, start *StrongholdStart, seed int64, chunkX, chunkZ int32) {
 	PlaceStrongholdsForChunk(region, []*StrongholdStart{start}, seed, chunkX, chunkZ)
+}
+
+// StrongholdPortalRoomFrames returns the world coordinates of the 12 End Portal
+// frame blocks, the 9 interior End Portal blocks, and the silverfish spawner
+// for the PortalRoom piece of the given StrongholdStart.
+func StrongholdPortalRoomFrames(start *StrongholdStart) (frames [12][3]int, interior [9][3]int, spawner [3]int, ok bool) {
+	if start == nil || start.PortalRoom == nil {
+		return frames, interior, spawner, false
+	}
+	p := start.PortalRoom
+	frameLocs := [12][2]int{
+		{4, 8}, {5, 8}, {6, 8},
+		{4, 12}, {5, 12}, {6, 12},
+		{3, 9}, {3, 10}, {3, 11},
+		{7, 9}, {7, 10}, {7, 11},
+	}
+	for i, fl := range frameLocs {
+		frames[i] = [3]int{p.worldX(fl[0], fl[1]), p.worldY(3), p.worldZ(fl[0], fl[1])}
+	}
+	idx := 0
+	for x := 4; x <= 6; x++ {
+		for z := 9; z <= 11; z++ {
+			interior[idx] = [3]int{p.worldX(x, z), p.worldY(3), p.worldZ(x, z)}
+			idx++
+		}
+	}
+	spawner = [3]int{p.worldX(5, 6), p.worldY(3), p.worldZ(5, 6)}
+	return frames, interior, spawner, true
 }

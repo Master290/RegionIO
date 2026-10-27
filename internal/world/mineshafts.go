@@ -1179,6 +1179,7 @@ func (c *msContext) setPlanksBlock(p *msPiece, state uint16, x, y, z int) {
 func msCorridorPostProcess(c *msContext, p *msPiece, random worldgen.RandomSource) {
 	i2 := p.numSections*5 - 1
 	planks := msPlanks[c.typeIndex()]
+	hasPlacedSpider := false
 
 	c.generateBox(p, 0, 0, 0, 2, 1, i2, msCaveAir, msCaveAir)
 	c.generateMaybeBox(p, random, 0.8, 0, 2, 0, 2, 2, i2, msCaveAir, msCaveAir, false, false)
@@ -1203,11 +1204,11 @@ func msCorridorPostProcess(c *msContext, p *msPiece, random worldgen.RandomSourc
 		if random.NextIntN(100) == 0 {
 			c.createChest(p, random, 0, 0, n+1)
 		}
-		if p.spider && !p.hasPlacedSpider {
+		if p.spider && !hasPlacedSpider {
 			o := n - 1 + int(random.NextIntN(3))
 			wx, wy, wz := p.worldX(1, o), p.worldY(0), p.worldZ(1, o)
 			if msBoxContains(c.chunkBox, wx, wy, wz) && c.isInterior(p, 1, 0, o) {
-				p.hasPlacedSpider = true
+				hasPlacedSpider = true
 				c.region.setBlockGlobal(wx, wy, wz, msSpawner)
 				c.region.addStructureBlockEntity(StructureBlockEntity{
 					ID:              "minecraft:mob_spawner",

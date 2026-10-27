@@ -226,6 +226,7 @@ func placeMonsterRoom(r *decorationRegion, random worldgen.RandomSource, ox, oy,
 				}
 				if !monsterIsSolid(r.getBlock(bx, by-1, bz)) {
 					r.setBlock(bx, by, bz, monsterCaveAirID)
+					r.removeStructureBlockEntity(bx, by, bz)
 					continue
 				}
 				if !monsterIsSolid(current) || isMonsterChest(current) {
@@ -298,12 +299,7 @@ func placeMonsterRoom(r *decorationRegion, random worldgen.RandomSource, ox, oy,
 
 	// Pass 4 places the spawner at the center; picking its mob is one draw.
 	if r.monsterSafeSetBlock(ox, oy, oz, monsterSpawnerID) {
-		mobTypes := [4]string{
-			"minecraft:skeleton",
-			"minecraft:zombie",
-			"minecraft:zombie",
-			"minecraft:spider",
-		}
+		mobTypes := MonsterRoomMobTypes()
 		mobIdx := int(random.NextIntN(4)) // skeleton / zombie / zombie / spider
 		r.addStructureBlockEntity(StructureBlockEntity{
 			ID:              "minecraft:mob_spawner",
@@ -314,6 +310,17 @@ func placeMonsterRoom(r *decorationRegion, random worldgen.RandomSource, ox, oy,
 		})
 	}
 	return true
+}
+
+// MonsterRoomMobTypes returns Vanilla's 4-element dungeon spawner mob table
+// (25% skeleton, 50% zombie, 25% spider).
+func MonsterRoomMobTypes() [4]string {
+	return [4]string{
+		"minecraft:skeleton",
+		"minecraft:zombie",
+		"minecraft:zombie",
+		"minecraft:spider",
+	}
 }
 
 func isMonsterChest(state uint16) bool {

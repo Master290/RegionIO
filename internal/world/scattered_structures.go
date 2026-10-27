@@ -1055,8 +1055,8 @@ func postProcessDesertPyramid(region *decorationRegion, st *DesertPyramidStart, 
 		{1, -2, 0}, // WEST
 	}
 	for _, cd := range chestDirs {
-		if !st.HasPlacedChest[cd.idx2D] {
-			st.HasPlacedChest[cd.idx2D] = p.createChest(region, chunkBox, random, 10+cd.dx, -11, 10+cd.dz, "minecraft:chests/desert_pyramid")
+		if p.createChest(region, chunkBox, random, 10+cd.dx, -11, 10+cd.dz, "minecraft:chests/desert_pyramid") {
+			st.HasPlacedChest[cd.idx2D] = true
 		}
 	}
 
@@ -1090,6 +1090,7 @@ func postProcessDesertPyramid(region *decorationRegion, st *DesertPyramidStart, 
 	p.generateBox(region, chunkBox, 13, -1, 10, 19, -1, 11, cutSandstone, cutSandstone, true)
 	p.generateBox(region, chunkBox, 13, -1, 16, 19, -1, 16, cutSandstone, cutSandstone, true)
 
+	st.PotentialSuspiciousPos = st.PotentialSuspiciousPos[:0]
 	addSandPos := func(lx, ly, lz int) {
 		st.PotentialSuspiciousPos = append(st.PotentialSuspiciousPos, [3]int{
 			p.worldX(lx, lz), p.worldY(ly), p.worldZ(lx, lz),
@@ -1492,8 +1493,8 @@ func postProcessJungleTemple(region *decorationRegion, st *JungleTempleStart, ch
 	p.placeBlock(region, chunkBox, wireNW, 5, -3, 1)
 	p.placeBlock(region, chunkBox, wireEW, 4, -3, 1)
 	p.placeBlock(region, chunkBox, mossy, 3, -3, 1)
-	if !st.PlacedTrap1 {
-		st.PlacedTrap1 = p.createDispenser(region, chunkBox, random, 3, -2, 1, "north", "minecraft:chests/jungle_temple_dispenser")
+	if p.createDispenser(region, chunkBox, random, 3, -2, 1, "north", "minecraft:chests/jungle_temple_dispenser") {
+		st.PlacedTrap1 = true
 	}
 	p.placeBlock(region, chunkBox, vineS, 3, -2, 2)
 
@@ -1508,13 +1509,13 @@ func postProcessJungleTemple(region *decorationRegion, st *JungleTempleStart, ch
 	p.placeBlock(region, chunkBox, wireNSUp, 9, -3, 5)
 	p.placeBlock(region, chunkBox, mossy, 9, -3, 4)
 	p.placeBlock(region, chunkBox, wireNS, 9, -2, 4)
-	if !st.PlacedTrap2 {
-		st.PlacedTrap2 = p.createDispenser(region, chunkBox, random, 9, -2, 3, "west", "minecraft:chests/jungle_temple_dispenser")
+	if p.createDispenser(region, chunkBox, random, 9, -2, 3, "west", "minecraft:chests/jungle_temple_dispenser") {
+		st.PlacedTrap2 = true
 	}
 	p.placeBlock(region, chunkBox, vineE, 8, -1, 3)
 	p.placeBlock(region, chunkBox, vineE, 8, -2, 3)
-	if !st.PlacedMainChest {
-		st.PlacedMainChest = p.createChest(region, chunkBox, random, 8, -3, 3, "minecraft:chests/jungle_temple")
+	if p.createChest(region, chunkBox, random, 8, -3, 3, "minecraft:chests/jungle_temple") {
+		st.PlacedMainChest = true
 	}
 	p.placeBlock(region, chunkBox, mossy, 9, -3, 2)
 	p.placeBlock(region, chunkBox, mossy, 8, -3, 1)
@@ -1557,8 +1558,8 @@ func postProcessJungleTemple(region *decorationRegion, st *JungleTempleStart, ch
 	p.placeBlock(region, chunkBox, pistonW, 10, -2, 8)
 	p.placeBlock(region, chunkBox, pistonW, 10, -1, 8)
 	p.placeBlock(region, chunkBox, repeaterN, 10, -2, 10)
-	if !st.PlacedHiddenChest {
-		st.PlacedHiddenChest = p.createChest(region, chunkBox, random, 9, -3, 10, "minecraft:chests/jungle_temple")
+	if p.createChest(region, chunkBox, random, 9, -3, 10, "minecraft:chests/jungle_temple") {
+		st.PlacedHiddenChest = true
 	}
 }
 
