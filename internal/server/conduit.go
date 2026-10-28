@@ -142,7 +142,7 @@ func initConduitStates() {
 // IsConduitWaterBlockState reports whether state counts as water or a
 // waterlogged block for the 3x3x3 water volume around a conduit.
 func IsConduitWaterBlockState(state uint16) bool {
-	if state == world.StateWater {
+	if state == world.StateWater || world.IsConduitWaterOrWaterloggedState(state) {
 		return true
 	}
 	name := world.BlockName(state)
@@ -161,7 +161,7 @@ func IsConduitWaterBlockState(state uint16) bool {
 		}
 		return true
 	default:
-		return false
+		return world.IsWaterlogged(state)
 	}
 }
 
@@ -261,8 +261,7 @@ func (s *Server) IsPositionInWaterOrRain(dim string, x, y, z float64) bool {
 		if cache == nil {
 			return true
 		}
-		skyClear, _ := CheckBeaconSkyAndBeam(cache.GetBlock, bx, by, bz, BeaconDefaultMaxBuild)
-		return skyClear
+		return cache.IsSkyOpenToRainAt(bx, by, bz)
 	}
 	return false
 }
@@ -289,9 +288,11 @@ func IsHostileConduitTargetType(typeName string) bool {
 		"minecraft:husk",
 		"minecraft:zombie_villager",
 		"minecraft:zombified_piglin",
+		"minecraft:camel_husk",
 		"minecraft:skeleton",
 		"minecraft:stray",
 		"minecraft:bogged",
+		"minecraft:parched",
 		"minecraft:wither_skeleton",
 		"minecraft:creeper",
 		"minecraft:spider",
@@ -305,18 +306,24 @@ func IsHostileConduitTargetType(typeName string) bool {
 		"minecraft:pillager",
 		"minecraft:vindicator",
 		"minecraft:evoker",
+		"minecraft:illusioner",
 		"minecraft:ravager",
 		"minecraft:vex",
 		"minecraft:enderman",
 		"minecraft:endermite",
 		"minecraft:silverfish",
+		"minecraft:shulker",
 		"minecraft:blaze",
 		"minecraft:ghast",
 		"minecraft:hoglin",
 		"minecraft:zoglin",
 		"minecraft:piglin_brute",
 		"minecraft:warden",
-		"minecraft:breeze":
+		"minecraft:breeze",
+		"minecraft:creaking",
+		"minecraft:wither",
+		"minecraft:ender_dragon",
+		"minecraft:giant":
 		return true
 	default:
 		return false
@@ -806,6 +813,7 @@ func (s *Server) UpdateConduitAtInDim(dim string, x, y, z int) (ConduitBlockEnti
 	changed := prevActive != active || prevFrame != frameCount
 	if changed {
 		_ = s.SaveConduits()
+		s.BroadcastConduitBlockEntityData(normDim, x, y, z)
 	}
 	return cp, changed
 }
@@ -938,11 +946,15 @@ func (s *Server) AttackHostileMobsFromConduitInDim(dim string, bx, by, bz int) (
 	cs := s.conduitState()
 	cs.mu.Lock()
 	be := s.getOrCreateConduitLocked(cs, normDim, bx, by, bz)
+	prevTargetID := be.TargetEntityID
 	if chosen == nil {
 		be.TargetEntityID = 0
 		be.TargetUUID = [16]byte{}
 		be.HasTarget = false
 		cs.mu.Unlock()
+		if prevTargetID != 0 {
+			s.BroadcastConduitBlockEntityData(normDim, bx, by, bz)
+		}
 		return 0, 0
 	}
 	be.TargetEntityID = chosen.ID
@@ -964,6 +976,9 @@ func (s *Server) AttackHostileMobsFromConduitInDim(dim string, bx, by, bz int) (
 		cs.mu.Unlock()
 	}
 
+	if prevTargetID != targetID || killed {
+		s.BroadcastConduitBlockEntityData(normDim, bx, by, bz)
+	}
 	s.playBeaconSound(normDim, int(math.Floor(tx)), int(math.Floor(ty)), int(math.Floor(tz)), SoundConduitAttackTarget)
 	return targetID, ConduitAttackDamage
 }
@@ -1084,4 +1099,81 @@ func (s *Server) StartConduitTicker(ctx context.Context) <-chan struct{} {
 		}
 	}()
 	return done
+}
+
+// BroadcastConduitBlockEntityData broadcasts ClientboundBlockEntityDataPacket
+// (`0x06`, `BlockEntityTypeConduit = 26`) for the conduit at (dim, x, y, z).
+func (s *Server) BroadcastConduitBlockEntityData(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	be, ok := s.ConduitAtInDim(normDim, x, y, z)
+	if !ok {
+		return
+	}
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeConduit, EncodeConduitBlockEntityNBT(be))
+	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
+}
+
+// OnConduitPlaced registers or updates a `minecraft:conduit` block entity at
+// (dim, x, y, z), evaluates its 3x3x3 water surround and prismarine/sea_lantern
+// frame, and broadcasts its BE data.
+func (s *Server) OnConduitPlaced(dim string, x, y, z int) ConduitBlockEntity {
+	if s == nil {
+		return ConduitBlockEntity{}
+	}
+	normDim := world.NormalizeDimension(dim)
+	cs := s.conduitState()
+	cs.mu.Lock()
+	_ = s.getOrCreateConduitLocked(cs, normDim, x, y, z)
+	cs.mu.Unlock()
+
+	updated, _ := s.UpdateConduitAtInDim(normDim, x, y, z)
+	s.BroadcastConduitBlockEntityData(normDim, x, y, z)
+	return updated
+}
+
+// HydrateChunkConduits inspects all `world.StructureBlockEntity` entries on the
+// loaded chunk (dim, cx, cz) and registers any `minecraft:conduit` block entities.
+func (s *Server) HydrateChunkConduits(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	cs := s.conduitState()
+	cs.mu.Lock()
+	s.ensureConduitsLoadedLocked(cs)
+	var hydrated [][3]int
+	for _, sbe := range sbes {
+		if canonicalBeaconResource(sbe.ID) != "minecraft:conduit" {
+			continue
+		}
+		key := conduitKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := cs.conduits[key]; exists {
+			continue
+		}
+		cs.conduits[key] = &ConduitBlockEntity{
+			ID:        "minecraft:conduit",
+			Dimension: normDim,
+			X:         sbe.X,
+			Y:         sbe.Y,
+			Z:         sbe.Z,
+		}
+		hydrated = append(hydrated, [3]int{sbe.X, sbe.Y, sbe.Z})
+	}
+	cs.mu.Unlock()
+
+	for _, pos := range hydrated {
+		s.UpdateConduitAtInDim(normDim, pos[0], pos[1], pos[2])
+	}
+	return len(hydrated)
 }

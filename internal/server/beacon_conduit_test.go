@@ -367,3 +367,109 @@ func TestConduitFrameActivationEffectRadiusAndMobAttack(t *testing.T) {
 		t.Fatalf("ConduitFromNBT = %+v, ok=%v", decoded, ok)
 	}
 }
+
+func TestBeaconPlacementRawPacketAndConduitWaterloggedRainRules(t *testing.T) {
+	srv, _ := newTestEnchantServer(t)
+	cache := srv.DimensionChunks(world.DimensionOverworld)
+	bx, by, bz := 80, world.FlatSurfaceY+10, 80
+
+	// 1. Build a 1-tier emerald_block pyramid and place beacon via OnBeaconPlaced.
+	emeraldBlock, _ := world.BlockStateIDByProperties("minecraft:emerald_block", nil)
+	beaconBlock, _ := world.BlockStateIDByProperties("minecraft:beacon", nil)
+	for dx := -1; dx <= 1; dx++ {
+		for dz := -1; dz <= 1; dz++ {
+			cache.SetBlock(bx+dx, by-1, bz+dz, emeraldBlock)
+		}
+	}
+	cache.SetBlock(bx, by, bz, beaconBlock)
+
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("BeaconRawTester"),
+		Name: "BeaconRawTester",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	setTestPlayerPos(sess, float64(bx)+0.5, float64(by)+1.0, float64(bz)+0.5)
+
+	be := srv.OnBeaconPlaced(sess, world.DimensionOverworld, bx, by, bz, "Sky Beacon")
+	if be.Levels != 1 || be.CustomName != "Sky Beacon" {
+		t.Fatalf("OnBeaconPlaced = %+v, want Levels=1 CustomName=Sky Beacon", be)
+	}
+
+	// Placing stained glass above an active level-1 beacon should still report changed=true
+	// because BeamSections changed.
+	magentaGlass, _ := world.BlockStateIDByProperties("minecraft:magenta_stained_glass", nil)
+	cache.SetBlock(bx, by+2, bz, magentaGlass)
+	if updated, changed := srv.UpdateBeaconAt(bx, by, bz, sess); !changed || len(updated.BeamSections) != 2 {
+		t.Fatalf("expected UpdateBeaconAt after placing stained glass to report changed=true and 2 sections, got changed=%v sections=%+v", changed, updated.BeamSections)
+	}
+
+	// Test HandleSetBeaconRawPacket with gold_ingot payment item.
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:gold_ingot", 1))
+	cid, err := srv.OpenBeacon(sess, bx, by, bz)
+	if err != nil {
+		t.Fatalf("OpenBeacon: %v", err)
+	}
+	_ = srv.HandleBeaconClick(sess, ContainerClick{
+		ContainerID: cid,
+		Slot:        28,
+		Button:      0,
+		Mode:        ContainerInputQuickMove,
+	})
+	rawPkt := EncodeSetBeaconPacket(EffectHaste, "")
+	if err := srv.HandleSetBeaconRawPacket(sess, protocol.NewReader(rawPkt)); err != nil {
+		t.Fatalf("HandleSetBeaconRawPacket: %v", err)
+	}
+	if !sess.HasPlayerEffect(EffectHaste) {
+		t.Fatal("expected player to receive Haste I after HandleSetBeaconRawPacket")
+	}
+
+	// 2. Conduit with waterlogged blocks in 3x3x3 surround and rain blocked by glass roof.
+	cx, cy, cz := 110, world.FlatSurfaceY+10, 110
+	conduitSt, _ := world.MakeConduitBlockState(true)
+	wlStairs, _ := world.BlockStateIDByProperties("minecraft:prismarine_stairs", map[string]string{
+		"facing":      "north",
+		"half":        "bottom",
+		"shape":       "straight",
+		"waterlogged": "true",
+	})
+	cache.SetBlock(cx, cy, cz, conduitSt)
+	for dx := -1; dx <= 1; dx++ {
+		for dy := -1; dy <= 1; dy++ {
+			for dz := -1; dz <= 1; dz++ {
+				if dx == 0 && dy == 0 && dz == 0 {
+					continue
+				}
+				if dx == -1 && dy == -1 && dz == -1 {
+					cache.SetBlock(cx+dx, cy+dy, cz+dz, wlStairs)
+				} else {
+					cache.SetBlock(cx+dx, cy+dy, cz+dz, world.StateWater)
+				}
+			}
+		}
+	}
+	seaLantern, _ := world.BlockStateIDByProperties("minecraft:sea_lantern", nil)
+	for i, pos := range ConduitFramePositions(cx, cy, cz) {
+		if i < 16 {
+			cache.SetBlock(pos[0], pos[1], pos[2], seaLantern)
+		}
+	}
+	condBE := srv.OnConduitPlaced(world.DimensionOverworld, cx, cy, cz)
+	if !condBE.IsActive() || condBE.FrameCount != 16 {
+		t.Fatalf("expected conduit with waterlogged stairs in 3x3x3 surround to activate, got %+v", condBE)
+	}
+
+	// Rain rule: open sky during rain makes player wet, but a glass block above blocks rain!
+	rx, ry, rz := cx+10, cy, cz
+	cache.SetBlock(rx, ry, rz, world.StateAir)
+	srv.SetWeather(WeatherRain, 6000)
+	if !srv.IsPositionInWaterOrRain(world.DimensionOverworld, float64(rx)+0.5, float64(ry), float64(rz)+0.5) {
+		t.Fatal("expected open sky during rain to count as wet for conduit")
+	}
+	glassSt, _ := world.BlockStateIDByProperties("minecraft:glass", nil)
+	cache.SetBlock(rx, ry+3, rz, glassSt)
+	if srv.IsPositionInWaterOrRain(world.DimensionOverworld, float64(rx)+0.5, float64(ry), float64(rz)+0.5) {
+		t.Fatal("expected glass roof to block rain for conduit wetness")
+	}
+}

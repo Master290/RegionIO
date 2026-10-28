@@ -1224,11 +1224,11 @@ func EvaluateBlockDrops(
 		return []ItemStack{NewNamedItemStack(name, int32(cnt))}
 	}
 
-	// Default block drop via BlockDropItem:
+	// Default block drop via BlockDropItem (or named item stack for blocks without a legacy numeric item ID):
 	if drop, ok := BlockDropItem(state); ok && !drop.IsEmpty() {
 		return []ItemStack{drop}
 	}
-	return nil
+	return []ItemStack{NewNamedItemStack(name, 1)}
 }
 
 func rollFortuneFlintOrGildedChance(fortuneLevel int, rng *rand.Rand) bool {

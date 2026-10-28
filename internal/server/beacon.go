@@ -342,6 +342,7 @@ func CheckBeaconSkyAndBeam(getBlock func(x, y, z int) uint16, bx, by, bz, maxY i
 	}
 	white := [3]float32{1.0, 1.0, 1.0}
 	sections = []BeaconBeamSection{{Color: white, Height: 1}}
+	hasStained := false
 
 	for y := by + 1; y <= maxY; y++ {
 		st := getBlock(bx, y, bz)
@@ -355,8 +356,13 @@ func CheckBeaconSkyAndBeam(getBlock func(x, y, z int) uint16, bx, by, bz, maxY i
 		}
 		if glassCol, isStained := StainedGlassBeamColor(name); isStained {
 			last := &sections[len(sections)-1]
-			if len(sections) == 1 && last.Color == white && last.Height == 1 && y == by+1 {
-				last.Color = glassCol
+			if !hasStained {
+				hasStained = true
+				if len(sections) == 1 && last.Color == white && last.Height == 1 && y == by+1 {
+					last.Color = glassCol
+				} else {
+					sections = append(sections, BeaconBeamSection{Color: glassCol, Height: 1})
+				}
 			} else {
 				blended := [3]float32{
 					(last.Color[0] + glassCol[0]) * 0.5,
@@ -1009,6 +1015,8 @@ func (s *Server) UpdateBeaconAtInDim(dim string, x, y, z int, builder *PlayerSes
 		b.LastBuilder = builder
 	}
 	prevLevels := b.Levels
+	prevSections := make([]BeaconBeamSection, len(b.BeamSections))
+	copy(prevSections, b.BeamSections)
 	b.Levels = newLevels
 	b.BeamSections = beamSections
 	lastBuilder := b.LastBuilder
@@ -1024,11 +1032,25 @@ func (s *Server) UpdateBeaconAtInDim(dim string, x, y, z int, builder *PlayerSes
 		s.notifyConstructBeaconAdvancement(normDim, x, y, z, newLevels, lastBuilder)
 	}
 
-	if prevLevels != newLevels {
+	sectionsChanged := !equalBeaconBeamSections(prevSections, beamSections)
+	if prevLevels != newLevels || sectionsChanged {
 		_ = s.SaveBeacons()
 		s.broadcastBeaconDataToViewers(normDim, x, y, z)
+		s.BroadcastBeaconBlockEntityData(normDim, x, y, z)
 	}
-	return cp, prevLevels != newLevels
+	return cp, prevLevels != newLevels || sectionsChanged
+}
+
+func equalBeaconBeamSections(a, b []BeaconBeamSection) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // UpdateBeaconAt evaluates the pyramid and sky/beam state for the Overworld
@@ -1535,7 +1557,105 @@ func (s *Server) HandleSetBeaconPacket(session *PlayerSession, primaryEffectID, 
 	s.playBeaconSound(normDim, bx, by, bz, SoundBeaconPowerSelect)
 	s.ApplyBeaconEffectsAtInDim(normDim, bx, by, bz)
 	s.broadcastBeaconDataToViewers(normDim, bx, by, bz)
+	s.BroadcastBeaconBlockEntityData(normDim, bx, by, bz)
 	return s.syncOpenBeacon(session)
+}
+
+// HandleSetBeaconRawPacket decodes a ServerboundSetBeaconPacket (`0x34`) from
+// `r` and dispatches it to `HandleSetBeaconPacket(session, primaryID, secondaryID)`.
+func (s *Server) HandleSetBeaconRawPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil {
+		return nil
+	}
+	primaryID, secondaryID, err := DecodeSetBeaconPacket(r)
+	if err != nil {
+		return err
+	}
+	return s.HandleSetBeaconPacket(session, primaryID, secondaryID)
+}
+
+// BroadcastBeaconBlockEntityData broadcasts ClientboundBlockEntityDataPacket
+// (`0x06`, `BlockEntityTypeBeacon = 14`) for the beacon at (dim, x, y, z).
+func (s *Server) BroadcastBeaconBlockEntityData(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	be, ok := s.BeaconAtInDim(normDim, x, y, z)
+	if !ok {
+		return
+	}
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeBeacon, EncodeBeaconBlockEntityNBT(be))
+	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
+}
+
+// OnBeaconPlaced registers or updates a `minecraft:beacon` block entity at
+// (dim, x, y, z) when placed by `builder` (optionally with `customName`),
+// immediately evaluates its pyramid/beam state, and broadcasts its BE data.
+func (s *Server) OnBeaconPlaced(builder *PlayerSession, dim string, x, y, z int, customName string) BeaconBlockEntity {
+	if s == nil {
+		return BeaconBlockEntity{}
+	}
+	normDim := world.NormalizeDimension(dim)
+	bs := s.beaconState()
+	bs.mu.Lock()
+	be := s.getOrCreateBeaconLocked(bs, normDim, x, y, z)
+	if customName != "" {
+		be.CustomName = customName
+	}
+	if builder != nil {
+		be.LastBuilder = builder
+	}
+	bs.mu.Unlock()
+
+	updated, _ := s.UpdateBeaconAtInDim(normDim, x, y, z, builder)
+	s.BroadcastBeaconBlockEntityData(normDim, x, y, z)
+	return updated
+}
+
+// HydrateChunkBeacons inspects all `world.StructureBlockEntity` entries on the
+// loaded chunk (dim, cx, cz) and registers any `minecraft:beacon` block entities.
+func (s *Server) HydrateChunkBeacons(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	bs := s.beaconState()
+	bs.mu.Lock()
+	s.ensureBeaconsLoadedLocked(bs)
+	var hydrated [][3]int
+	for _, sbe := range sbes {
+		if canonicalBeaconResource(sbe.ID) != "minecraft:beacon" {
+			continue
+		}
+		key := beaconKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := bs.beacons[key]; exists {
+			continue
+		}
+		be := &BeaconBlockEntity{
+			ID:        "minecraft:beacon",
+			Dimension: normDim,
+			X:         sbe.X,
+			Y:         sbe.Y,
+			Z:         sbe.Z,
+		}
+		bs.beacons[key] = be
+		hydrated = append(hydrated, [3]int{sbe.X, sbe.Y, sbe.Z})
+	}
+	bs.mu.Unlock()
+
+	for _, pos := range hydrated {
+		s.UpdateBeaconAtInDim(normDim, pos[0], pos[1], pos[2], nil)
+	}
+	return len(hydrated)
 }
 
 func (s *Server) syncOpenBeacon(session *PlayerSession) error {
