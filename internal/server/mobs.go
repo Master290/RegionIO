@@ -205,6 +205,8 @@ var (
 		MobTypeElderGuardian:       EntityTypeElderGuardianID,
 		MobTypeShulker:             EntityTypeShulkerID,
 		EntityTypeShulkerBullet:    EntityTypeShulkerBulletID,
+		MobTypeCreaking:            EntityTypeCreakingID,
+		MobTypeRabbit:              EntityTypeRabbitID,
 		MobTypeVex:                 EntityTypeVexID,
 		EntityTypeEvokerFangs:      EntityTypeEvokerFangsID,
 		MobTypeIllusioner:          EntityTypeIllusionerID,
@@ -242,7 +244,7 @@ func AllPassiveAnimalTypes() []string {
 // (pig, cow, sheep, chicken, bee, fox, panda, ocelot, or strider).
 func IsPassiveAnimal(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot, MobTypeStrider:
+	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot, MobTypeStrider, MobTypeRabbit:
 		return true
 	default:
 		return false
@@ -408,6 +410,10 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultElderGuardianMaxHealth
 	case MobTypeShulker:
 		return DefaultShulkerMaxHealth
+	case MobTypeCreaking:
+		return DefaultCreakingMaxHealth
+	case MobTypeRabbit:
+		return DefaultRabbitMaxHealth
 	case MobTypeVex:
 		return DefaultVexMaxHealth
 	case MobTypeIllusioner:
@@ -636,6 +642,12 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeShulker {
 		return s.SpawnShulker(normDim, x, y, z)
+	}
+	if norm == MobTypeCreaking {
+		return s.SpawnCreaking(normDim, x, y, z)
+	}
+	if norm == MobTypeRabbit {
+		return s.SpawnRabbit(normDim, x, y, z, false, -1, nil)
 	}
 	if norm == MobTypeVex {
 		return s.SpawnVex(normDim, x, y, z, 0)
@@ -1680,7 +1692,7 @@ func IsFireImmuneMob(typeName string) bool {
 	switch canonicalResourceName(typeName) {
 	case MobTypeWither, MobTypeWitherSkeleton, MobTypeEnderDragon, MobTypeWarden,
 		MobTypeMagmaCube, "minecraft:blaze", "minecraft:ghast", "minecraft:strider",
-		"minecraft:zombified_piglin":
+		"minecraft:zombified_piglin", MobTypeCreaking:
 		return true
 	default:
 		return false

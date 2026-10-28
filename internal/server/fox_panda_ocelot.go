@@ -1232,6 +1232,20 @@ func (s *Server) inheritFoxPandaOcelotTraits(parentA, parentB, offspringID int32
 
 	case MobTypeOcelot:
 		s.SetOcelotTrusting(offspringID, true, causePlayer)
+
+	case MobTypeRabbit:
+		ra, _ := s.GetRabbitState(parentA)
+		rb, _ := s.GetRabbitState(parentB)
+		biome := "minecraft:plains"
+		if s.entities != nil {
+			if ent := s.entities.Get(offspringID); ent != nil {
+				if cache := s.DimensionChunks(ent.EffectiveDimension()); cache != nil {
+					biome = inferBiomeAtPosition(cache, int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z)))
+				}
+			}
+		}
+		babyVar := InheritRabbitVariant(ra.Variant, rb.Variant, biome, rng)
+		s.SetRabbitVariant(offspringID, babyVar)
 	}
 }
 
@@ -1307,18 +1321,23 @@ func (s *Server) tickSingleFox(entityID int32, rng *rand.Rand) {
 		fs.AttackCooldown--
 	}
 	// Eat held food item after FoxEatHeldTicks (600 ticks).
+	shouldEatHeld := false
 	if !fs.HeldItem.IsEmpty() && IsFoxEdibleMouthItem(fs.HeldItem.ResolvedID()) {
 		fs.EatTicks++
 		if fs.EatTicks >= FoxEatHeldTicks {
-			fs.HeldItem = world.ItemStack{}
-			fs.EatTicks = 0
-			cp := ent.ChunkPos()
-			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundFoxEat, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			shouldEatHeld = true
 		}
 	}
 	snap := *fs
 	mgr.mu.Unlock()
+
+	if shouldEatHeld {
+		s.EatFoxHeldItem(entityID, rng)
+		ent = s.entities.Get(entityID)
+		if ent == nil {
+			return
+		}
+	}
 
 	dim := ent.EffectiveDimension()
 	cache := s.DimensionChunks(dim)
@@ -1416,6 +1435,32 @@ func (s *Server) tickSingleFox(entityID int32, rng *rand.Rand) {
 	if (snap.Flags & FoxFlagSleeping) != 0 {
 		s.SetFoxSleeping(entityID, false)
 	}
+
+	// 5. Hunt nearby prey (chickens, rabbits, cod, salmon, tadpoles) within 8 blocks at night.
+	if snap.AttackCooldown <= 0 {
+		for i := range allEnts {
+			prey := &allEnts[i]
+			if prey.ID == entityID || prey.EffectiveDimension() != dim || !IsFoxPreyMob(prey.TypeName) {
+				continue
+			}
+			dx := prey.X - ent.X
+			dy := prey.Y - ent.Y
+			dz := prey.Z - ent.Z
+			dSq := dx*dx + dy*dy + dz*dz
+			if dSq <= FoxPounceRange*FoxPounceRange {
+				mgr.mu.Lock()
+				if cur := mgr.foxes[entityID]; cur != nil {
+					cur.AttackCooldown = 20
+				}
+				mgr.mu.Unlock()
+				s.TryFoxPounceHunt(entityID, prey.ID)
+				return
+			} else if dSq <= 64.0 {
+				s.stepEntityTowardPoint(ent, cache, feetY, prey.X, prey.Y, prey.Z, FoxHuntSpeed, 1.5)
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) tickSinglePanda(entityID int32, rng *rand.Rand) {
@@ -1475,11 +1520,51 @@ func (s *Server) tickSinglePanda(entityID int32, rng *rand.Rand) {
 		return
 	}
 
-	// 3. Playful pandas periodically roll (`PandaFlagRolling`).
+	// 3. Playful pandas periodically roll (`PandaFlagRolling`); Lazy pandas lie on back (`PandaFlagOnBack`).
 	if personality == PandaGenePlayful && rng != nil && rng.Intn(400) == 0 {
 		mgr.mu.Lock()
 		ps.Flags |= PandaFlagRolling
 		mgr.mu.Unlock()
+	} else if personality == PandaGeneLazy && rng != nil && rng.Intn(400) == 0 {
+		s.SetPandaLyingOnBack(entityID, true)
+	}
+
+	// 3b. Pick up nearby dropped bamboo or cake item entities when not already eating.
+	if snap.EatCounter <= 0 {
+		dim := ent.EffectiveDimension()
+		allEnts := s.entities.AppendAll(nil)
+		for i := range allEnts {
+			it := &allEnts[i]
+			if !it.IsItem() || it.EffectiveDimension() != dim || it.PickupDelay > 0 || !IsPandaFoodItem(it.Item.ResolvedID()) {
+				continue
+			}
+			dx := it.X - ent.X
+			dy := it.Y - ent.Y
+			dz := it.Z - ent.Z
+			if dx*dx+dy*dy+dz*dz <= 4.0 {
+				if it.Item.Count <= 1 {
+					s.entities.Remove(it.ID)
+					cp := it.ChunkPos()
+					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+						encodeRemoveEntitiesPacket(nil, []int32{it.ID}))
+				} else {
+					s.entities.Update(it.ID, func(e *world.Entity) {
+						e.Item.Count--
+					})
+				}
+				mgr.mu.Lock()
+				ps.Flags |= PandaFlagSitting
+				ps.EatCounter = 32
+				mainG, hiddenG, flags := ps.MainGene, ps.HiddenGene, ps.Flags
+				mgr.mu.Unlock()
+				cp := ent.ChunkPos()
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+					EncodePandaEntityDataPacket(entityID, mainG, hiddenG, flags, 32, 0, 0))
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundPandaEat, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+				break
+			}
+		}
 	}
 
 	// 4. Provoked / Aggressive panda attacking its target.

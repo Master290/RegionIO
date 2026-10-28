@@ -694,6 +694,10 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		return RollElderGuardianDeathLoot(rng, 0, false, true)
 	case MobTypeShulker:
 		return RollShulkerDeathLoot(rng, 0)
+	case MobTypeRabbit:
+		return RollRabbitDeathLoot(rng, 0, false)
+	case MobTypePanda:
+		return RollPandaDeathLoot(rng)
 	}
 	return nil
 }
@@ -776,6 +780,10 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundElderGuardianHurt, SoundSourceHostile
 	case MobTypeShulker:
 		return SoundShulkerHurt, SoundSourceHostile
+	case MobTypeCreaking:
+		return SoundCreakingSway, SoundSourceHostile
+	case MobTypeRabbit:
+		return SoundRabbitHurt, SoundSourceNeutral
 	case MobTypePillager:
 		return SoundPillagerHurt, SoundSourceHostile
 	case MobTypeVindicator:
@@ -917,6 +925,10 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundElderGuardianDeath, SoundSourceHostile
 	case MobTypeShulker:
 		return SoundShulkerDeath, SoundSourceHostile
+	case MobTypeCreaking:
+		return SoundCreakingDeath, SoundSourceHostile
+	case MobTypeRabbit:
+		return SoundRabbitDeath, SoundSourceNeutral
 	case MobTypePillager:
 		return SoundPillagerDeath, SoundSourceHostile
 	case MobTypeVindicator:
@@ -1316,6 +1328,11 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		damage = scaledDmg
 		kbStrength = 0
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeCreaking {
+		if invuln, _ := s.OnCreakingHit(target.ID, session, nil); invuln {
+			return 0, false
+		}
+	}
 
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
 	return damage, killed
@@ -1465,6 +1482,8 @@ func (s *Server) applyDamageToMob(
 			s.OnGuardianThornsRetaliate(target.ID, attacker)
 		} else if normTarget == MobTypeShulker {
 			s.OnShulkerDamaged(target.ID, newHP, DefaultShulkerMaxHealth, attacker, nil)
+		} else if normTarget == MobTypeRabbit {
+			s.OnRabbitDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypeSilverfish {
 			s.OnSilverfishDamaged(target.ID)
 		} else if normTarget == MobTypePhantom {
@@ -1530,6 +1549,9 @@ func (s *Server) applyDamageToMob(
 		return false
 	}
 
+	if canonicalResourceName(target.TypeName) == MobTypeFox && s.TryFoxUseTotemOfUndying(target.ID) {
+		return false
+	}
 	// Mob died: broadcast death event + sound, trigger death status effects, notify raid manager, remove entity, and spawn loot drops (adults only).
 	deathX, deathY, deathZ := target.X, target.Y, target.Z
 	deathSnd, deathSrc := mobDeathSound(target.TypeName)
@@ -1594,6 +1616,12 @@ func (s *Server) applyDamageToMob(
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeShulker {
 		s.OnShulkerKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeCreaking {
+		s.OnCreakingKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeRabbit {
+		s.OnRabbitKilled(target.ID)
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeStrider {
 		for _, sDrop := range s.OnStriderKilled(target.ID) {
