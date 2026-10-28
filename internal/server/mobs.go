@@ -203,6 +203,8 @@ var (
 		MobTypePufferfish:          EntityTypePufferfishID,
 		MobTypeGuardian:            EntityTypeGuardianID,
 		MobTypeElderGuardian:       EntityTypeElderGuardianID,
+		MobTypeShulker:             EntityTypeShulkerID,
+		EntityTypeShulkerBullet:    EntityTypeShulkerBulletID,
 		MobTypeVex:                 EntityTypeVexID,
 		EntityTypeEvokerFangs:      EntityTypeEvokerFangsID,
 		MobTypeIllusioner:          EntityTypeIllusionerID,
@@ -404,6 +406,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultGuardianMaxHealth
 	case MobTypeElderGuardian:
 		return DefaultElderGuardianMaxHealth
+	case MobTypeShulker:
+		return DefaultShulkerMaxHealth
 	case MobTypeVex:
 		return DefaultVexMaxHealth
 	case MobTypeIllusioner:
@@ -629,6 +633,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeElderGuardian {
 		return s.SpawnElderGuardian(normDim, x, y, z)
+	}
+	if norm == MobTypeShulker {
+		return s.SpawnShulker(normDim, x, y, z)
 	}
 	if norm == MobTypeVex {
 		return s.SpawnVex(normDim, x, y, z, 0)

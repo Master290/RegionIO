@@ -264,13 +264,23 @@ type FishBehaviorState struct {
 // GuardianBehaviorState holds the server-side state for a `minecraft:guardian`
 // or `minecraft:elder_guardian`.
 type GuardianBehaviorState struct {
-	EntityID          int32
-	IsElder           bool
-	Moving            bool
-	AttackTargetID    int32
-	LaserChargeTicks  int
-	FatigueCooldown   int
-	OutOfWaterTicks   int
+	EntityID            int32
+	IsElder             bool
+	Moving              bool
+	AttackTargetID      int32
+	LaserChargeTicks    int
+	FatigueCooldown     int
+	OutOfWaterTicks     int
+	SwimTimer           int
+	SwimDirX            float64
+	SwimDirY            float64
+	SwimDirZ            float64
+	HasHome             bool
+	HomeX               float64
+	HomeY               float64
+	HomeZ               float64
+	HomeRadius          float64
+	PersistenceRequired bool
 }
 
 // TurtleEggPlaceHook is an optional callback invoked when a pregnant turtle
@@ -2420,7 +2430,9 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 			continue
 		}
 
-		// Find nearest valid target (survival/adventure player or squid/glow_squid) within 15 blocks.
+		// Find nearest valid target (survival/adventure player, squid/glow_squid, or axolotl)
+		// within 15 blocks with unobstructed line-of-sight.
+		cache := s.DimensionChunks(dim)
 		maxDistSq := GuardianLaserRange * GuardianLaserRange
 		var bestPlayer *PlayerSession
 		var bestSquid *world.Entity
@@ -2441,7 +2453,7 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 			dy := snap.Y - ent.Y
 			dz := snap.Z - ent.Z
 			dSq := dx*dx + dy*dy + dz*dz
-			if dSq <= bestDistSq {
+			if dSq <= bestDistSq && HasGuardianLaserLineOfSight(cache, ent.X, ent.Y+0.425, ent.Z, snap.X, snap.Y+0.9, snap.Z) {
 				bestDistSq = dSq
 				bestPlayer = p
 			}
@@ -2455,14 +2467,14 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 					continue
 				}
 				onorm := canonicalResourceName(other.TypeName)
-				if onorm != MobTypeSquid && onorm != MobTypeGlowSquid {
+				if onorm != MobTypeSquid && onorm != MobTypeGlowSquid && onorm != MobTypeAxolotl {
 					continue
 				}
 				dx := other.X - ent.X
 				dy := other.Y - ent.Y
 				dz := other.Z - ent.Z
 				dSq := dx*dx + dy*dy + dz*dz
-				if dSq <= bestDistSq {
+				if dSq <= bestDistSq && HasGuardianLaserLineOfSight(cache, ent.X, ent.Y+0.425, ent.Z, other.X, other.Y+0.4, other.Z) {
 					bestDistSq = dSq
 					bestSquid = other
 				}
@@ -2478,10 +2490,16 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 
 		reqTicks := GuardianLaserChargeTicks
 		laserDmg := GuardianLaserDamage
+		magicDmg := GuardianMagicLaserDamage
+		swimSpeed := GuardianSwimSpeed
 		if isElder {
 			reqTicks = ElderGuardianLaserChargeTicks
 			laserDmg = ElderGuardianLaserDamage
+			magicDmg = ElderGuardianMagicLaserDamage
+			swimSpeed = ElderGuardianSwimSpeed
 		}
+
+		inWater := s.isEntityInWater(dim, ent.X, ent.Y, ent.Z)
 
 		mgr.mu.Lock()
 		st = mgr.guardians[id]
@@ -2492,7 +2510,14 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 		prevTarget := st.AttackTargetID
 		prevMoving := st.Moving
 		var fireLaser bool
+		var doFlop bool
+		var swimDX, swimDY, swimDZ float64
 		if targetID != 0 {
+			if inWater {
+				st.OutOfWaterTicks = 0
+			} else {
+				st.OutOfWaterTicks++
+			}
 			st.Moving = false // Extend spikes and lock laser beam onto target!
 			if st.AttackTargetID != targetID {
 				st.AttackTargetID = targetID
@@ -2508,6 +2533,49 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 		} else {
 			st.AttackTargetID = 0
 			st.LaserChargeTicks = 0
+			if inWater {
+				st.OutOfWaterTicks = 0
+				st.Moving = true // Retract spikes while cruising underwater
+				if st.SwimTimer <= 0 {
+					st.SwimTimer = 40
+					if rng != nil {
+						st.SwimTimer = 30 + rng.Intn(40)
+					}
+					if st.HasHome {
+						hdx := st.HomeX - ent.X
+						hdy := st.HomeY - ent.Y
+						hdz := st.HomeZ - ent.Z
+						hDist := math.Sqrt(hdx*hdx + hdy*hdy + hdz*hdz)
+						rad := st.HomeRadius
+						if rad <= 0 {
+							rad = ElderGuardianHomeRadius
+						}
+						if hDist > rad && hDist > 1e-4 {
+							st.SwimDirX = hdx / hDist
+							st.SwimDirY = hdy / hDist
+							st.SwimDirZ = hdz / hDist
+						}
+					}
+					if st.SwimDirX == 0 && st.SwimDirY == 0 && st.SwimDirZ == 0 {
+						angle := 0.0
+						if rng != nil {
+							angle = rng.Float64() * 2.0 * math.Pi
+						}
+						st.SwimDirX = math.Cos(angle)
+						st.SwimDirY = 0
+						st.SwimDirZ = math.Sin(angle)
+					}
+				} else {
+					st.SwimTimer--
+				}
+				swimDX, swimDY, swimDZ = st.SwimDirX*swimSpeed, st.SwimDirY*swimSpeed, st.SwimDirZ*swimSpeed
+			} else {
+				st.OutOfWaterTicks++
+				st.Moving = false // Spikes extended while flopping out of water on land
+				if st.OutOfWaterTicks == 1 || st.OutOfWaterTicks%GuardianFlopIntervalTicks == 0 {
+					doFlop = true
+				}
+			}
 		}
 		curTarget := st.AttackTargetID
 		curMoving := st.Moving
@@ -2523,9 +2591,46 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 				EncodeSoundPacket(SoundGuardianAttack, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 			if bestPlayer != nil {
 				s.AttackPlayerFromMob(id, ent.TypeName, ent.X, ent.Z, bestPlayer, laserDmg)
+				if !bestPlayer.IsDead() {
+					s.DamagePlayerWithEffects(bestPlayer, magicDmg, "indirect_magic")
+				}
 			} else if bestSquid != nil {
-				s.applyDamageToMob(bestSquid, laserDmg, nil, 0, false, false)
+				s.applyDamageToMob(bestSquid, laserDmg+magicDmg, nil, 0, false, false)
 			}
+		} else if curMoving && (swimDX != 0 || swimDY != 0 || swimDZ != 0) {
+			nx, ny, nz := ent.X+swimDX, ent.Y+swimDY, ent.Z+swimDZ
+			if cache == nil || s.isEntityInWater(dim, nx, ny, nz) {
+				s.entities.Update(id, func(e *world.Entity) {
+					e.X = nx
+					e.Y = ny
+					e.Z = nz
+					e.VelocityX = clampVelocityShort(swimDX)
+					e.VelocityY = clampVelocityShort(swimDY)
+					e.VelocityZ = clampVelocityShort(swimDZ)
+				})
+			} else {
+				mgr.mu.Lock()
+				if gst := mgr.guardians[id]; gst != nil {
+					gst.SwimDirX = -gst.SwimDirX
+					gst.SwimDirZ = -gst.SwimDirZ
+				}
+				mgr.mu.Unlock()
+			}
+		} else if doFlop {
+			flopSX, flopSZ := 0.0, 0.0
+			if rng != nil {
+				ang := rng.Float64() * 2.0 * math.Pi
+				flopSX = math.Cos(ang) * 0.15
+				flopSZ = math.Sin(ang) * 0.15
+			}
+			s.entities.Update(id, func(e *world.Entity) {
+				e.VelocityX = clampVelocityShort(flopSX)
+				e.VelocityY = clampVelocityShort(GuardianFlopVelocityY)
+				e.VelocityZ = clampVelocityShort(flopSZ)
+				e.OnGround = false
+			})
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(SoundGuardianFlop, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		}
 	}
 	_ = rng

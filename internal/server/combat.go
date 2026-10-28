@@ -689,22 +689,11 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 			return []world.ItemStack{stack}
 		}
 	case MobTypeGuardian:
-		shards := int32(1)
-		if rng != nil {
-			shards = int32(1 + rng.Intn(2)) // 1..2 prismarine_shard
-		}
-		if stack := world.NewNamedItemStack(PrismarineShardItemID, shards); !stack.IsEmpty() {
-			return []world.ItemStack{stack}
-		}
+		return RollGuardianDeathLoot(rng, 0, false, true)
 	case MobTypeElderGuardian:
-		var out []world.ItemStack
-		if s1 := world.NewNamedItemStack(PrismarineShardItemID, 2); !s1.IsEmpty() {
-			out = append(out, s1)
-		}
-		if s2 := world.NewNamedItemStack(WetSpongeItemID, 1); !s2.IsEmpty() {
-			out = append(out, s2)
-		}
-		return out
+		return RollElderGuardianDeathLoot(rng, 0, false, true)
+	case MobTypeShulker:
+		return RollShulkerDeathLoot(rng, 0)
 	}
 	return nil
 }
@@ -785,6 +774,8 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundGuardianHurt, SoundSourceHostile
 	case MobTypeElderGuardian:
 		return SoundElderGuardianHurt, SoundSourceHostile
+	case MobTypeShulker:
+		return SoundShulkerHurt, SoundSourceHostile
 	case MobTypePillager:
 		return SoundPillagerHurt, SoundSourceHostile
 	case MobTypeVindicator:
@@ -924,6 +915,8 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundGuardianDeath, SoundSourceHostile
 	case MobTypeElderGuardian:
 		return SoundElderGuardianDeath, SoundSourceHostile
+	case MobTypeShulker:
+		return SoundShulkerDeath, SoundSourceHostile
 	case MobTypePillager:
 		return SoundPillagerDeath, SoundSourceHostile
 	case MobTypeVindicator:
@@ -1255,6 +1248,12 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 		return 0, false
 	}
+	if canonicalResourceName(target.TypeName) == EntityTypeShulkerBullet {
+		if s.DestroyShulkerBullet(target.ID) {
+			return 1.0, true
+		}
+		return 0, false
+	}
 
 	heldSlot, heldStack := session.handSlotAndStack(HandMain)
 	baseDamage, _ := StackAttackStats(heldStack)
@@ -1308,6 +1307,14 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		if damage <= 0 {
 			return 0, false
 		}
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeShulker {
+		scaledDmg, deflected := s.ScaleShulkerDamage(target.ID, damage, false)
+		if deflected || scaledDmg <= 0 {
+			return 0, false
+		}
+		damage = scaledDmg
+		kbStrength = 0
 	}
 
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
@@ -1456,6 +1463,8 @@ func (s *Server) applyDamageToMob(
 			s.OnSquidDamaged(target.ID, attacker)
 		} else if normTarget == MobTypeGuardian || normTarget == MobTypeElderGuardian {
 			s.OnGuardianThornsRetaliate(target.ID, attacker)
+		} else if normTarget == MobTypeShulker {
+			s.OnShulkerDamaged(target.ID, newHP, DefaultShulkerMaxHealth, attacker, nil)
 		} else if normTarget == MobTypeSilverfish {
 			s.OnSilverfishDamaged(target.ID)
 		} else if normTarget == MobTypePhantom {
@@ -1580,6 +1589,12 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeHoglin || canonicalResourceName(target.TypeName) == MobTypeZoglin {
 		s.OnHoglinOrZoglinKilled(target.ID)
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeGuardian || canonicalResourceName(target.TypeName) == MobTypeElderGuardian {
+		s.OnGuardianOrElderKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeShulker {
+		s.OnShulkerKilled(target.ID)
+	}
 	if canonicalResourceName(target.TypeName) == MobTypeStrider {
 		for _, sDrop := range s.OnStriderKilled(target.ID) {
 			if s.DoMobLoot() {
@@ -1607,6 +1622,9 @@ func (s *Server) applyDamageToMob(
 	}
 	if xpReward == 0 {
 		xpReward = PiglinHoglinStriderXPReward(target.TypeName, wasBaby)
+	}
+	if xpReward == 0 && !wasBaby {
+		xpReward = int(GuardianElderShulkerXPReward(target.TypeName))
 	}
 	consumed := false
 	if xpReward > 0 {
