@@ -364,7 +364,7 @@ func (session *PlayerSession) IsBlockingWithShield() bool {
 // UseShield starts blocking with a shield when session uses a minecraft:shield
 // in hand (0 = main hand, 1 = offhand).
 func (s *Server) UseShield(session *PlayerSession, hand int32) bool {
-	if s == nil || session == nil || session.IsDead() || s.IsPlayerShieldDisabled(session) {
+	if s == nil || session == nil || session.IsDead() || s.IsPlayerShieldDisabled(session) || session.IsItemOnCooldown(ShieldItemID) {
 		return false
 	}
 	_, stack := session.handSlotAndStack(hand)
@@ -378,12 +378,14 @@ func (s *Server) UseShield(session *PlayerSession, hand int32) bool {
 // DeflectProjectileWithShield handles a shield deflecting an incoming projectile
 // for session, playing the shield block sound and firing TriggerDeflectedProjectile.
 func (s *Server) DeflectProjectileWithShield(session *PlayerSession) bool {
-	if s == nil || session == nil || !session.IsBlockingWithShield() {
+	if s == nil || session == nil || !session.IsBlockingWithShield() || s.IsPlayerShieldDisabled(session) || session.IsItemOnCooldown(ShieldItemID) {
 		return false
 	}
 	snap := session.Snapshot()
 	cx := int32(int64(math.Floor(snap.X)) >> 4)
 	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, protocol.PlayEntityEvent,
+		EncodeEntityEventPacket(snap.EntityID, EntityEventShieldBlock))
 	s.BroadcastChunk(cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:item.shield.block", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
 	s.TriggerDeflectedProjectile(session)
@@ -1048,6 +1050,7 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 		return 0
 	}
 	if isProjectileDamageCause(cause) && s.DeflectProjectileWithShield(session) {
+		s.DamageActiveShield(session, rawDamage)
 		return 0
 	}
 	switch cause {
@@ -1116,6 +1119,15 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 	if scaled <= 0 {
 		return 0
 	}
+	if target.IsBlockingWithShield() {
+		attackerItem := ""
+		if IsAxeWieldingMob(mobType) {
+			attackerItem = "minecraft:iron_axe"
+		}
+		if blocked, _ := s.TryBlockDamageWithShield(target, scaled, mobX, mobZ, true, attackerItem, false, 0); blocked {
+			return 0
+		}
+	}
 	dealt := s.DamagePlayerWithArmor(target, scaled, mobAttackCauseName(mobType))
 	if dealt <= 0 {
 		return 0
@@ -1162,8 +1174,15 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		if snap.GameMode != GameModeCreative && (dx*dx+dy*dy+dz*dz) > MaxMeleeAttackReach*MaxMeleeAttackReach {
 			return 0, false
 		}
-		baseDamage, _ := StackAttackStats(session.HeldItem())
+		heldSlot, heldStack := session.handSlotAndStack(HandMain)
+		baseDamage, _ := StackAttackStats(heldStack)
 		baseDamage += session.MeleeDamageBonus()
+		if heldSlot >= 0 {
+			meta := GetSlotItemMeta(session, heldSlot)
+			if imp := meta.EnchantmentLevel("minecraft:impaling"); imp > 0 {
+				baseDamage += ImpalingDamageBonus(imp, "minecraft:player", s.CanUseRiptide(victim))
+			}
+		}
 		scale := session.CurrentAttackStrengthScale(0.5)
 		session.ResetAttackCooldown()
 		if baseDamage <= 0 {
@@ -1174,7 +1193,12 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 			damage *= CriticalHitMultiplier
 		}
 		s.RecordAttackExhaustion(session)
-		dealt := s.DamagePlayerWithArmor(victim, damage, "player")
+		if victim.IsBlockingWithShield() {
+			if blocked, _ := s.TryBlockDamageWithShield(victim, damage, snap.X, snap.Z, true, heldStack.ResolvedID(), false, 0); blocked {
+				return 0, false
+			}
+		}
+		dealt := s.DamagePlayerWithArmorBypassShield(victim, damage, "player")
 		if dealt <= 0 {
 			return 0, false
 		}
@@ -1232,8 +1256,16 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		return 0, false
 	}
 
-	baseDamage, _ := StackAttackStats(session.HeldItem())
+	heldSlot, heldStack := session.handSlotAndStack(HandMain)
+	baseDamage, _ := StackAttackStats(heldStack)
 	baseDamage += session.MeleeDamageBonus()
+	if heldSlot >= 0 {
+		meta := GetSlotItemMeta(session, heldSlot)
+		if imp := meta.EnchantmentLevel("minecraft:impaling"); imp > 0 {
+			inWaterOrRain := s.IsEntityInWaterOrRainAt(target.EffectiveDimension(), target.X, target.Y, target.Z)
+			baseDamage += ImpalingDamageBonus(imp, target.TypeName, inWaterOrRain)
+		}
+	}
 	scale := session.CurrentAttackStrengthScale(0.5)
 	session.ResetAttackCooldown()
 	if baseDamage <= 0 {

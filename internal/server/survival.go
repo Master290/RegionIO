@@ -1238,6 +1238,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 				EncodeItemEntityData(live.ID, remaining))
 		}
 	}
+	totalPickedUp += s.TryPickupGroundedProjectiles(session)
 	if totalPickedUp > 0 {
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
@@ -1691,13 +1692,7 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 		return true
 
 	case "minecraft:bow", "minecraft:trident":
-		st := getSurvivalState(session)
-		if st != nil {
-			st.mu.Lock()
-			st.drawingWeapon = itemID
-			st.drawingHand = hand
-			st.mu.Unlock()
-		}
+		s.StartDrawingRangedWeapon(session, hand)
 		return false
 
 	case CrossbowItemID:
@@ -1717,9 +1712,9 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 					Sneaking:           session.IsSneaking(),
 					BlockOrItemID:      FireworkRocketItemID,
 				})
-			} else {
-				s.traceAndResolveProjectileShot(session, -1, "minecraft:arrow", 6.0, "arrow", 32.0)
 			}
+		} else {
+			s.StartDrawingRangedWeapon(session, hand)
 		}
 		return false
 
@@ -1743,9 +1738,9 @@ func (s *Server) UseProjectileItem(session *PlayerSession, hand int32) bool {
 	return false
 }
 
-// ReleaseProjectileWeapon handles PlayerActionReleaseUseItem for a drawn bow or
-// trident, consuming ammo/durability as appropriate, raycasting for block/mob/
-// armor-stand impact, and emitting GameEventProjectileShoot + GameEventProjectileLand.
+// ReleaseProjectileWeapon handles PlayerActionReleaseUseItem for a drawn bow,
+// trident, or progressively charged crossbow, consuming ammo/durability as
+// appropriate, resolving projectile trajectories, and emitting vibrations.
 func (s *Server) ReleaseProjectileWeapon(session *PlayerSession) bool {
 	if s == nil || session == nil || session.IsDead() {
 		return false
@@ -1761,98 +1756,74 @@ func (s *Server) ReleaseProjectileWeapon(session *PlayerSession) bool {
 		st.mu.Unlock()
 	}
 
-	slot, stack := session.handSlotAndStack(hand)
+	var (
+		drawTicks       int
+		explicitlyTimed bool
+	)
+	if ds := s.playerDrawState(session); ds != nil {
+		ds.mu.Lock()
+		if ds.active {
+			if weapon == "" {
+				weapon = ds.weapon
+				hand = ds.hand
+			}
+			drawTicks = ds.drawTicks
+			explicitlyTimed = ds.explicitlyTimed
+		} else if ds.explicitlyTimed {
+			drawTicks = ds.drawTicks
+			explicitlyTimed = true
+		}
+		ds.active = false
+		ds.weapon = ""
+		ds.drawTicks = 0
+		ds.explicitlyTimed = false
+		ds.mu.Unlock()
+	}
+
+	_, stack := session.handSlotAndStack(hand)
 	itemID := canonicalItemName(stack.ResolvedID())
-	if itemID != "minecraft:bow" && itemID != "minecraft:trident" {
-		slot, stack = session.handSlotAndStack(HandMain)
+	if itemID != BowItemID && itemID != TridentItemID && itemID != CrossbowItemID {
+		_, stack = session.handSlotAndStack(HandMain)
 		itemID = canonicalItemName(stack.ResolvedID())
-		if itemID != "minecraft:bow" && itemID != "minecraft:trident" {
-			slot, stack = session.handSlotAndStack(HandOffHand)
+		if itemID == BowItemID || itemID == TridentItemID || itemID == CrossbowItemID {
+			hand = HandMain
+		} else {
+			_, stack = session.handSlotAndStack(HandOffHand)
 			itemID = canonicalItemName(stack.ResolvedID())
+			if itemID == BowItemID || itemID == TridentItemID || itemID == CrossbowItemID {
+				hand = HandOffHand
+			}
 		}
 	}
-	if weapon == "" && (itemID == "minecraft:bow" || itemID == "minecraft:trident") {
+	if weapon == "" && (itemID == BowItemID || itemID == TridentItemID || itemID == CrossbowItemID) {
 		weapon = itemID
-	}
-	if weapon != "minecraft:bow" && weapon != "minecraft:trident" {
-		return false
 	}
 	if stack.IsEmpty() || canonicalItemName(stack.ResolvedID()) != weapon {
 		return false
 	}
 
-	snap := session.Snapshot()
-	if snap.GameMode == GameModeSpectator {
-		return false
-	}
+	switch weapon {
+	case CrossbowItemID:
+		if !explicitlyTimed && drawTicks <= 0 {
+			drawTicks = CrossbowBaseChargeTicks
+		}
+		return s.ReleaseCrossbowDraw(session, hand, drawTicks)
 
-	if weapon == "minecraft:bow" {
-		meta := GetSlotItemMeta(session, slot)
-		hasInfinity := meta.EnchantmentLevel("minecraft:infinity") > 0
-		if snap.GameMode != GameModeCreative {
-			ammoSlot := -1
-			var ammoStack world.ItemStack
-			for idx := 0; idx < world.PlayerInventorySlots; idx++ {
-				cand := session.InventorySlot(idx)
-				if isCrossbowArrowProjectile(cand) {
-					ammoSlot = idx
-					ammoStack = cand
-					break
-				}
-			}
-			if ammoSlot < 0 {
-				return false
-			}
-			if !hasInfinity || canonicalItemName(ammoStack.ResolvedID()) != "minecraft:arrow" {
-				var updated world.ItemStack
-				if ammoStack.Count > 1 {
-					updated = world.NewItemStack(ammoStack.ResolvedItemID(), ammoStack.Count-1)
-				}
-				session.SetInventorySlot(ammoSlot, updated)
-				if session.send != nil {
-					stID := session.NextContainerStateID()
-					_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stID, ammoSlot, updated))
-				}
-			}
-			s.DamagePlayerItem(session, slot, 1)
+	case BowItemID:
+		if !explicitlyTimed && drawTicks <= 0 {
+			drawTicks = BowFullChargeTicks
 		}
-		s.RecordItemUsed(session, weapon, 1)
-		dmg := float32(6.0)
-		if pwr := meta.EnchantmentLevel("minecraft:power"); pwr > 0 {
-			dmg += float32(pwr)*1.5 + 0.5
-		}
-		var projID int32 = -1
-		if s.entities != nil {
-			lx, ly, lz := ElytraLookVector(snap.Yaw, snap.Pitch)
-			typeID := registry.EntityTypeIndex(MobTypeArrow)
-			if typeID < 0 {
-				typeID = EntityTypeArrowID
-			}
-			projID = s.entities.Add(&world.Entity{
-				TypeID:    typeID,
-				TypeName:  MobTypeArrow,
-				Dimension: world.NormalizeDimension(snap.Dimension),
-				X:         snap.X,
-				Y:         snap.Y + 1.5,
-				Z:         snap.Z,
-				Yaw:       snap.Yaw,
-				Pitch:     snap.Pitch,
-				VelocityX: clampVelocityShort(lx * 3.0),
-				VelocityY: clampVelocityShort(ly * 3.0),
-				VelocityZ: clampVelocityShort(lz * 3.0),
-			})
-		}
-		s.traceAndResolveProjectileShot(session, projID, "minecraft:arrow", dmg, "arrow", 32.0)
-		return true
-	}
+		_, ok := s.ShootBow(session, hand, drawTicks, nil)
+		return ok
 
-	// Trident throw
-	if snap.GameMode != GameModeCreative {
-		s.DamagePlayerItem(session, slot, 1)
+	case TridentItemID:
+		if !explicitlyTimed && drawTicks <= 0 {
+			drawTicks = TridentMinChargeTicks
+		}
+		_, ok := s.ThrowTrident(session, hand, drawTicks)
+		return ok
 	}
-	s.RecordItemUsed(session, weapon, 1)
-	s.traceAndResolveProjectileShot(session, -1, "minecraft:trident", 8.0, "arrow", 32.0)
-	return true
+	return false
 }
 
 func (s *Server) traceAndResolveProjectileShot(

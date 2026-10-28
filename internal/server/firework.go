@@ -211,13 +211,17 @@ func (f FireworksComponent) Clone() FireworksComponent {
 // ChargedProjectile represents an ammo stack loaded into a `minecraft:crossbow`
 // (`minecraft:charged_projectiles` component).
 type ChargedProjectile struct {
-	Stack     world.ItemStack
-	Fireworks *FireworksComponent
+	Stack      world.ItemStack
+	Fireworks  *FireworksComponent
+	PotionType string
 }
 
 // Clone returns a deep copy of cp.
 func (cp ChargedProjectile) Clone() ChargedProjectile {
-	out := ChargedProjectile{Stack: cp.Stack}
+	out := ChargedProjectile{
+		Stack:      cp.Stack,
+		PotionType: cp.PotionType,
+	}
 	if cp.Fireworks != nil {
 		fw := cp.Fireworks.Clone()
 		out.Fireworks = &fw
@@ -1532,6 +1536,16 @@ func (s *Server) LoadCrossbowProjectile(session *PlayerSession, hand int32) bool
 				}
 			}
 		}
+		if ammoSlot < 0 {
+			for idx := 0; idx < 9; idx++ {
+				st := session.InventorySlot(idx)
+				if isCrossbowArrowProjectile(st) {
+					ammoSlot = idx
+					ammoStack = st
+					break
+				}
+			}
+		}
 		if ammoSlot < 0 && snap.GameMode == GameModeCreative {
 			ammoStack = world.NewNamedItemStack("minecraft:arrow", 1)
 		}
@@ -1546,13 +1560,16 @@ func (s *Server) LoadCrossbowProjectile(session *PlayerSession, hand int32) bool
 		projItem.ID = ammoStack.ResolvedID()
 	}
 	proj := ChargedProjectile{Stack: projItem}
-	if canonicalItemName(projItem.ResolvedID()) == FireworkRocketItemID && ammoSlot >= 0 {
+	projItemName := canonicalItemName(projItem.ResolvedID())
+	if projItemName == FireworkRocketItemID && ammoSlot >= 0 {
 		if fw, ok := GetSlotFireworks(session, ammoSlot); ok {
 			fwCopy := fw.Clone()
 			proj.Fireworks = &fwCopy
 		} else {
 			proj.Fireworks = &FireworksComponent{FlightDuration: DefaultFireworkFlightDuration}
 		}
+	} else if projItemName == TippedArrowItemID && ammoSlot >= 0 {
+		proj.PotionType = GetSlotArrowPotionType(session, ammoSlot)
 	}
 
 	// Consume 1 ammo item in survival/adventure mode.
@@ -1562,6 +1579,9 @@ func (s *Server) LoadCrossbowProjectile(session *PlayerSession, hand int32) bool
 			updated = world.NewItemStack(ammoStack.ResolvedItemID(), ammoStack.Count-1)
 		} else {
 			ClearSlotFireworks(session, ammoSlot)
+			if projItemName == TippedArrowItemID {
+				SetSlotPotionType(session, ammoSlot, "")
+			}
 		}
 		session.SetInventorySlot(ammoSlot, updated)
 		if session.send != nil {
@@ -1580,6 +1600,10 @@ func (s *Server) LoadCrossbowProjectile(session *PlayerSession, hand int32) bool
 		charged[i] = proj.Clone()
 	}
 	SetSlotChargedProjectiles(session, crossbowSlot, charged)
+	if session.send != nil {
+		stID := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stID, crossbowSlot, session.InventorySlot(crossbowSlot)))
+	}
 
 	cx := int32(int64(math.Floor(snap.X)) >> 4)
 	cz := int32(int64(math.Floor(snap.Z)) >> 4)
@@ -1628,15 +1652,20 @@ func (s *Server) ShootCrossbow(session *PlayerSession, hand int32) ([]int32, boo
 		return nil, false
 	}
 	ClearSlotChargedProjectiles(session, crossbowSlot)
+	cbMeta := GetSlotItemMeta(session, crossbowSlot)
+	piercingLevel := cbMeta.EnchantmentLevel("minecraft:piercing")
 
 	snap := session.Snapshot()
 	yawOffsets := []float32{0}
 	if len(charged) == 3 {
-		yawOffsets = []float32{0, -10.0, 10.0}
+		yawOffsets = []float32{0, -CrossbowMultishotAngleDeg, CrossbowMultishotAngleDeg}
 	}
 
-	var spawnedIDs []int32
-	durabilityCost := int32(0)
+	var (
+		spawnedIDs     []int32
+		killedMobTypes []string
+		durabilityCost int32
+	)
 
 	for i, proj := range charged {
 		yawOff := float32(0)
@@ -1646,7 +1675,8 @@ func (s *Server) ShootCrossbow(session *PlayerSession, hand int32) ([]int32, boo
 		shotYaw := snap.Yaw + yawOff
 		lx, ly, lz := ElytraLookVector(shotYaw, snap.Pitch)
 
-		if canonicalItemName(proj.Stack.ResolvedID()) == FireworkRocketItemID {
+		projItemID := canonicalItemName(proj.Stack.ResolvedID())
+		if projItemID == FireworkRocketItemID {
 			if i == 0 {
 				durabilityCost = CrossbowFireworkDurabilityCost
 			}
@@ -1668,14 +1698,19 @@ func (s *Server) ShootCrossbow(session *PlayerSession, hand int32) ([]int32, boo
 			vx := lx * CrossbowArrowShootPower
 			vy := ly * CrossbowArrowShootPower
 			vz := lz * CrossbowArrowShootPower
-			typeID := registry.EntityTypeIndex(MobTypeArrow)
+			entTypeName := MobTypeArrow
+			if projItemID == SpectralArrowItemID {
+				entTypeName = EntityTypeSpectralArrow
+			}
+			typeID := registry.EntityTypeIndex(entTypeName)
 			if typeID < 0 {
 				typeID = EntityTypeArrowID
 			}
+			var id int32 = -1
 			if s.entities != nil {
-				id := s.entities.Add(&world.Entity{
+				id = s.entities.Add(&world.Entity{
 					TypeID:    typeID,
-					TypeName:  MobTypeArrow,
+					TypeName:  entTypeName,
 					Dimension: world.NormalizeDimension(snap.Dimension),
 					X:         snap.X,
 					Y:         snap.Y + 1.5,
@@ -1688,12 +1723,37 @@ func (s *Server) ShootCrossbow(session *PlayerSession, hand int32) ([]int32, boo
 				})
 				spawnedIDs = append(spawnedIDs, id)
 			}
+			pickupRule := ArrowPickupAllowed
+			if i > 0 || snap.GameMode == GameModeCreative {
+				pickupRule = ArrowPickupCreativeOnly
+			}
+			killed := s.resolveArrowTrajectory(
+				session,
+				id,
+				projItemID,
+				proj.PotionType,
+				shotYaw,
+				snap.Pitch,
+				CrossbowArrowBaseDamage,
+				0,
+				false,
+				piercingLevel,
+				pickupRule,
+				32.0,
+			)
+			killedMobTypes = append(killedMobTypes, killed...)
 		}
 	}
 
 	if durabilityCost > 0 && (snap.GameMode == GameModeSurvival || snap.GameMode == GameModeAdventure) {
 		s.DamagePlayerItem(session, crossbowSlot, durabilityCost)
 	}
+	if session.send != nil {
+		stID := session.NextContainerStateID()
+		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stID, crossbowSlot, session.InventorySlot(crossbowSlot)))
+	}
+	s.RecordItemUsed(session, CrossbowItemID, 1)
+	s.TriggerShotCrossbow(session, killedMobTypes)
 
 	cx := int32(int64(math.Floor(snap.X)) >> 4)
 	cz := int32(int64(math.Floor(snap.Z)) >> 4)

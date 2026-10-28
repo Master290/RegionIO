@@ -633,6 +633,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickMaps()
 			h.srv.TickPrimedTNT()
 			h.srv.TickDispenserProjectiles()
+			h.srv.TickRangedWeaponsAndProjectiles()
 			h.srv.TickAllPlayerStats()
 			h.srv.TickAllBlockUpdates()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
