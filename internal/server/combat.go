@@ -605,6 +605,14 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		return RollBlazeDeathLoot(rng, 0, true)
 	case MobTypeGhast:
 		return RollGhastDeathLoot(rng, 0)
+	case MobTypeHoglin:
+		return RollHoglinDeathLoot(rng, 0, false)
+	case MobTypeZoglin:
+		return RollZoglinDeathLoot(rng, 0)
+	case MobTypeStrider:
+		return RollStriderDeathLoot(rng, 0, false)
+	case MobTypeZombifiedPiglin:
+		return RollZombifiedPiglinDeathLoot(rng, 0)
 	case MobTypeParrot:
 		feathers := int32(1)
 		if rng != nil {
@@ -1408,6 +1416,10 @@ func (s *Server) applyDamageToMob(
 			s.OnPandaDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypePiglin || normTarget == MobTypePiglinBrute {
 			s.OnPiglinOrBruteDamaged(target.ID, attacker, 0)
+		} else if normTarget == MobTypeZombifiedPiglin {
+			s.OnZombifiedPiglinDamaged(target.ID, attacker, 0)
+		} else if normTarget == MobTypeHoglin || normTarget == MobTypeZoglin {
+			s.OnHoglinOrZoglinDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypeSquid || normTarget == MobTypeGlowSquid {
 			s.OnSquidDamaged(target.ID, attacker)
 		} else if normTarget == MobTypeGuardian || normTarget == MobTypeElderGuardian {
@@ -1526,6 +1538,23 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeGhast {
 		s.OnGhastKilled(target.ID)
 	}
+	if canonicalResourceName(target.TypeName) == MobTypePiglin || canonicalResourceName(target.TypeName) == MobTypePiglinBrute {
+		for _, pDrop := range s.OnPiglinOrBruteKilled(target.ID) {
+			if s.DoMobLoot() {
+				s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, pDrop)
+			}
+		}
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeHoglin || canonicalResourceName(target.TypeName) == MobTypeZoglin {
+		s.OnHoglinOrZoglinKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeStrider {
+		for _, sDrop := range s.OnStriderKilled(target.ID) {
+			if s.DoMobLoot() {
+				s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, sDrop)
+			}
+		}
+	}
 	slimeSz := 0
 	isSlimeOrMagma := canonicalResourceName(target.TypeName) == MobTypeMagmaCube || canonicalResourceName(target.TypeName) == MobTypeSlime
 	if isSlimeOrMagma {
@@ -1543,6 +1572,9 @@ func (s *Server) applyDamageToMob(
 	}
 	if xpReward == 0 && !wasBaby {
 		xpReward = NetherHostileXPReward(target.TypeName, slimeSz)
+	}
+	if xpReward == 0 {
+		xpReward = PiglinHoglinStriderXPReward(target.TypeName, wasBaby)
 	}
 	consumed := false
 	if xpReward > 0 {

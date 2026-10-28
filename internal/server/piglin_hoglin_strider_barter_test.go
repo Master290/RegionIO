@@ -34,7 +34,7 @@ func TestPiglinBarterLootTableWeightsAndKeyOutcomes(t *testing.T) {
 	// 2. Iron Boots with Soul Speed (weight 8, roll 5..12).
 	bootStack, bootMeta, bootEntry := RollPiglinBarterLootByWeightRoll(5, rng)
 	if canonicalResourceName(bootStack.ResolvedID()) != "minecraft:iron_boots" || !bootEntry.SoulSpeedBoot {
-		t.Fatalf("roll 5 = (%v, %+v), want iron_boots with Soul Speed", bootStack, bootEntry)
+		t.Fatalf("roll 5 = (%v, %+v), want iron_boots with Soul Speed", bookStack, bootEntry)
 	}
 	if lvl := bootMeta.EnchantmentLevel(EnchantSoulSpeed); lvl < 1 || lvl > 3 {
 		t.Fatalf("iron_boots Soul Speed level = %d, want 1..3", lvl)
@@ -80,8 +80,20 @@ func TestPiglinZombificationBarterGoldCuriosityGoldArmorAndBrutes(t *testing.T) 
 	player := newBeeTestPlayer(t, srv, "NetherExplorer", 0, 64, 0)
 	rng := rand.New(rand.NewSource(77))
 
-	// 1. Piglin zombifies after 300 ticks in the Overworld.
-	overworldPiglinID, err := srv.SpawnPiglin(world.DimensionOverworld, 100, 64, 100, false)
+	// 0. Verify Piglin & PiglinBrute SynchedEntityData packet round-trips.
+	ppkt := EncodePiglinEntityDataPacket(10, true, false, true, true)
+	decPID, decImm, decBaby, decCross, decDance, err := DecodePiglinEntityDataPacket(ppkt)
+	if err != nil || decPID != 10 || !decImm || decBaby || !decCross || !decDance {
+		t.Fatalf("DecodePiglinEntityDataPacket = (%d, %v, %v, %v, %v, %v)", decPID, decImm, decBaby, decCross, decDance, err)
+	}
+	bpkt := EncodePiglinBruteEntityDataPacket(11, true)
+	decBID, decBImm, err := DecodePiglinBruteEntityDataPacket(bpkt)
+	if err != nil || decBID != 11 || !decBImm {
+		t.Fatalf("DecodePiglinBruteEntityDataPacket = (%d, %v, %v)", decBID, decBImm, err)
+	}
+
+	// 1. Piglin zombifies after 300 ticks in the Overworld, preserving weapon and applying Nausea.
+	overworldPiglinID, err := srv.SpawnPiglinWithWeapon(world.DimensionOverworld, 100, 64, 100, false, "minecraft:crossbow")
 	if err != nil || overworldPiglinID <= 0 {
 		t.Fatalf("SpawnPiglin(overworld) failed: %v", err)
 	}
@@ -91,28 +103,47 @@ func TestPiglinZombificationBarterGoldCuriosityGoldArmorAndBrutes(t *testing.T) 
 	if srv.entities.Get(overworldPiglinID) != nil {
 		t.Fatal("expected Overworld piglin to be removed upon zombification after 300 ticks")
 	}
-	foundZombified := false
+	var zombifiedID int32
 	for _, ent := range srv.entities.AppendAll(nil) {
 		if canonicalResourceName(ent.TypeName) == MobTypeZombifiedPiglin {
-			foundZombified = true
+			zombifiedID = ent.ID
 			if !srv.HasEntityEffect(ent.ID, EffectNausea) {
 				t.Fatal("expected newly zombified piglin to have EffectNausea")
+			}
+			zpSt, ok := srv.GetZombifiedPiglinState(ent.ID)
+			if !ok || canonicalResourceName(zpSt.MainHandItem.ResolvedID()) != "minecraft:crossbow" {
+				t.Fatalf("expected converted zombified_piglin to preserve crossbow, got %+v", zpSt)
 			}
 			break
 		}
 	}
-	if !foundZombified {
+	if zombifiedID <= 0 {
 		t.Fatal("expected zombified_piglin entity to be spawned after 300 ticks in Overworld")
 	}
 
-	// 2. In the Nether, Piglin barters gold_ingot and picks up dropped gold items.
+	// Verify Zombified Piglin group anger when attacked.
+	allyZPID, err := srv.SpawnZombifiedPiglin(world.DimensionOverworld, 105, 64, 100, false)
+	if err != nil || allyZPID <= 0 {
+		t.Fatalf("SpawnZombifiedPiglin failed: %v", err)
+	}
+	if alerted := srv.OnZombifiedPiglinDamaged(zombifiedID, player, 0); alerted < 2 {
+		t.Fatalf("expected OnZombifiedPiglinDamaged to alert nearby zombified piglins, got %d", alerted)
+	}
+	if zpAlly, ok := srv.GetZombifiedPiglinState(allyZPID); !ok || zpAlly.AngerTarget != player {
+		t.Fatalf("expected ally zombified_piglin to be angered at player, got %+v", zpAlly)
+	}
+
+	// 2. In the Nether, Piglin barters gold_ingot (granting "minecraft:nether/distract_piglin") and pockets admired gold items.
 	netherPiglinID, err := srv.SpawnPiglin(world.DimensionNether, 2, 64, 0, false)
 	if err != nil {
 		t.Fatalf("SpawnPiglin(nether) failed: %v", err)
 	}
-	player.SetInventorySlot(36, world.NewNamedItemStack("minecraft:gold_ingot", 2))
+	player.SetInventorySlot(36, world.NewNamedItemStack("minecraft:gold_ingot", 3))
 	if !srv.InteractWithPiglin(player, netherPiglinID) {
 		t.Fatal("expected InteractWithPiglin with gold_ingot to start bartering")
+	}
+	if !player.HasCompletedAdvancement("minecraft:nether/distract_piglin") {
+		t.Fatal("expected distracting piglin without gold armor to grant minecraft:nether/distract_piglin")
 	}
 	pst, ok := srv.GetPiglinState(netherPiglinID)
 	if !ok || !pst.Bartering || pst.AdmireTicks != PiglinBarterAdmireTicks {
@@ -123,13 +154,43 @@ func TestPiglinZombificationBarterGoldCuriosityGoldArmorAndBrutes(t *testing.T) 
 		t.Fatalf("CompletePiglinBarter failed: stack=%v id=%d ok=%v", barteredStack, droppedID, completed)
 	}
 
-	// Curiosity toward dropped gold item on the ground.
+	// Also verify natural 120-tick bartering completion via TickPiglinsHoglinsAndStriders.
+	if !srv.InteractWithPiglin(player, netherPiglinID) {
+		t.Fatal("expected second InteractWithPiglin to succeed")
+	}
+	for i := 0; i < PiglinBarterAdmireTicks; i++ {
+		srv.TickPiglinsHoglinsAndStriders(rng)
+	}
+	pstAfter, _ := srv.GetPiglinState(netherPiglinID)
+	if pstAfter.Bartering || pstAfter.AdmireTicks != 0 || !pstAfter.OffHandItem.IsEmpty() {
+		t.Fatalf("expected 120 ticks to complete bartering, got %+v", pstAfter)
+	}
+
+	// Curiosity toward dropped non-ingot gold item -> pockets into PiglinInventory after 120 ticks.
 	goldBell := world.NewNamedItemStack("minecraft:bell", 1)
 	if !srv.TryPiglinPickUpGoldItem(netherPiglinID, goldBell, player) {
 		t.Fatal("expected piglin to pick up and admire dropped gold bell")
 	}
+	for i := 0; i < PiglinBarterAdmireTicks; i++ {
+		srv.TickPiglinsHoglinsAndStriders(rng)
+	}
+	inv := srv.PiglinInventory(netherPiglinID)
+	if len(inv) != 1 || canonicalResourceName(inv[0].ResolvedID()) != "minecraft:bell" {
+		t.Fatalf("expected PiglinInventory to contain admired bell, got %v", inv)
+	}
 
-	// 3. Golden armor pacifies standard piglins unless player opens a guarded container or mines gold.
+	// 3. Soul fire repellent causes standard Piglin to retreat.
+	netherCache := srv.DimensionChunks(world.DimensionNether)
+	soulFire, ok := world.BlockStateByName("minecraft:soul_fire", nil)
+	if ok {
+		netherCache.SetBlock(3, 64, 0, soulFire)
+		if _, _, _, rep := srv.HasPiglinRepellentNear(world.DimensionNether, 2, 64, 0, PiglinRepellentRadius); !rep {
+			t.Fatal("expected HasPiglinRepellentNear to detect soul_fire")
+		}
+		netherCache.SetBlock(3, 64, 0, world.StateAir)
+	}
+
+	// 4. Golden armor pacifies standard piglins unless player opens a guarded container or mines gold.
 	if IsPlayerWearingGoldArmor(player) {
 		t.Fatal("expected player without golden armor to return IsPlayerWearingGoldArmor=false")
 	}
@@ -141,7 +202,7 @@ func TestPiglinZombificationBarterGoldCuriosityGoldArmorAndBrutes(t *testing.T) 
 		t.Fatalf("expected NotifyPiglinsPlayerOpenedGuardedBlock to anger nearby piglin, got %d", alerted)
 	}
 
-	// 4. Piglin Brute (50 HP, golden_axe) ignores gold armor and never barters.
+	// 5. Piglin Brute (50 HP, golden_axe, 20 XP) ignores gold armor, never barters, and anchors to bastion home.
 	bruteID, err := srv.SpawnPiglinBrute(world.DimensionNether, 4, 64, 0)
 	if err != nil || bruteID <= 0 {
 		t.Fatalf("SpawnPiglinBrute failed: %v", err)
@@ -152,12 +213,27 @@ func TestPiglinZombificationBarterGoldCuriosityGoldArmorAndBrutes(t *testing.T) 
 	if srv.InteractWithPiglin(player, bruteID) {
 		t.Fatal("expected Piglin Brute to reject bartering")
 	}
+	if xp := PiglinHoglinStriderXPReward(MobTypePiglinBrute, false); xp != PiglinBruteXPReward {
+		t.Fatalf("PiglinBrute XP reward = %d, want %d", xp, PiglinBruteXPReward)
+	}
 }
 
 func TestHoglinZombificationPanicRepellentsHuntAndBreeding(t *testing.T) {
 	srv := newSurvivalTestServer(t)
 	player := newBeeTestPlayer(t, srv, "HoglinHunter", 0, 64, 0)
 	rng := rand.New(rand.NewSource(55))
+
+	// 0. Verify Hoglin & Zoglin SynchedEntityData packet round-trips.
+	hpkt := EncodeHoglinEntityDataPacket(21, true)
+	decHID, decHImm, err := DecodeHoglinEntityDataPacket(hpkt)
+	if err != nil || decHID != 21 || !decHImm {
+		t.Fatalf("DecodeHoglinEntityDataPacket = (%d, %v, %v)", decHID, decHImm, err)
+	}
+	zpkt := EncodeZoglinEntityDataPacket(22, true)
+	decZID, decZBaby, err := DecodeZoglinEntityDataPacket(zpkt)
+	if err != nil || decZID != 22 || !decZBaby {
+		t.Fatalf("DecodeZoglinEntityDataPacket = (%d, %v, %v)", decZID, decZBaby, err)
+	}
 
 	// 1. Hoglin zombifies into Zoglin after 300 ticks in Overworld.
 	overworldHoglinID, err := srv.SpawnHoglin(world.DimensionOverworld, 100, 64, 100, false)
@@ -209,12 +285,49 @@ func TestHoglinZombificationPanicRepellentsHuntAndBreeding(t *testing.T) {
 	if !handled || babyHoglinID <= 0 {
 		t.Fatalf("expected Hoglin B to breed with Hoglin A, got handled=%v baby=%d", handled, babyHoglinID)
 	}
+
+	// 3. Piglins hunt adult Hoglins and perform a Victory Dance when the hunted Hoglin dies;
+	//    Baby Piglin mounts Baby Hoglin!
+	hunterA, _ := srv.SpawnPiglin(world.DimensionNether, 9, 64, 10, false)
+	hunterB, _ := srv.SpawnPiglin(world.DimensionNether, 9.5, 64, 10, false)
+	huntedID, started := srv.TryPiglinStartHoglinHunt(hunterA)
+	if !started || (huntedID != hoglinA && huntedID != hoglinB) {
+		t.Fatalf("expected 2 adult piglins to start hunting nearby adult hoglin, got started=%v huntedID=%d", started, huntedID)
+	}
+	srv.OnHoglinOrZoglinKilled(huntedID)
+	pStateA, _ := srv.GetPiglinState(hunterA)
+	pStateB, _ := srv.GetPiglinState(hunterB)
+	if !pStateA.Dancing || !pStateB.Dancing || pStateA.DanceTicks != PiglinCelebrateTicks {
+		t.Fatalf("expected hunting piglins to perform victory dance after hoglin kill, got A=%+v B=%+v", pStateA, pStateB)
+	}
+
+	babyPiglinID, _ := srv.SpawnPiglin(world.DimensionNether, 10.5, 64, 10, true)
+	if mountedHoglin, mounted := srv.TryBabyPiglinMountBabyHoglin(babyPiglinID); !mounted || mountedHoglin != babyHoglinID {
+		t.Fatalf("expected baby piglin to mount baby hoglin %d, got mounted=%v id=%d", babyHoglinID, mounted, mountedHoglin)
+	}
+
+	// 4. Verify Hoglin & Zoglin death loot (raw vs cooked_porkchop on fire).
+	cookedDrops := RollHoglinDeathLoot(rng, 1, true)
+	if len(cookedDrops) == 0 || canonicalResourceName(cookedDrops[0].ResolvedID()) != "minecraft:cooked_porkchop" {
+		t.Fatalf("expected on-fire Hoglin to drop cooked_porkchop, got %v", cookedDrops)
+	}
+	zogDrops := RollZoglinDeathLoot(rng, 0)
+	if len(zogDrops) == 0 || canonicalResourceName(zogDrops[0].ResolvedID()) != "minecraft:rotten_flesh" {
+		t.Fatalf("expected Zoglin to drop rotten_flesh, got %v", zogDrops)
+	}
 }
 
 func TestStriderLavaWalkingShiveringSaddleStickSteeringAndBreeding(t *testing.T) {
 	srv := newSurvivalTestServer(t)
 	player := newBeeTestPlayer(t, srv, "StriderRider", 0, 64, 0)
 	rng := rand.New(rand.NewSource(88))
+
+	// 0. Verify Strider SynchedEntityData packet round-trip.
+	spkt := EncodeStriderEntityDataPacket(31, 200, true, true)
+	decSID, decBoost, decShiver, decSaddle, err := DecodeStriderEntityDataPacket(spkt)
+	if err != nil || decSID != 31 || decBoost != 200 || !decShiver || !decSaddle {
+		t.Fatalf("DecodeStriderEntityDataPacket = (%d, %d, %v, %v, %v)", decSID, decBoost, decShiver, decSaddle, err)
+	}
 
 	// 1. Strider shivers outside lava, stops shivering and stands on top of lava.
 	striderA, err := srv.SpawnStrider(world.DimensionOverworld, 5, 64, 5, false)
@@ -235,7 +348,7 @@ func TestStriderLavaWalkingShiveringSaddleStickSteeringAndBreeding(t *testing.T)
 		t.Fatalf("expected strider over lava to have onLava=true shivering=false, got onLava=%v shivering=%v", onLava, shivering)
 	}
 
-	// 2. Equip saddle, mount player, steer with warped_fungus_on_a_stick, and boost speed.
+	// 2. Equip saddle, mount player, steer with warped_fungus_on_a_stick, and boost speed (damaging stick durability).
 	player.SetInventorySlot(36, world.NewNamedItemStack("minecraft:saddle", 1))
 	if handled, _ := srv.InteractWithStrider(player, striderA, rng); !handled || !srv.IsStriderSaddled(striderA) {
 		t.Fatal("expected equipping saddle on adult strider to succeed")
@@ -249,9 +362,18 @@ func TestStriderLavaWalkingShiveringSaddleStickSteeringAndBreeding(t *testing.T)
 	if !moved || (nx == 5 && nz == 5) {
 		t.Fatalf("expected SteerStriderWithWarpedFungusOnAStick to move strider, got moved=%v pos=(%v,%v)", moved, nx, nz)
 	}
+	if !player.HasCompletedAdvancement("minecraft:nether/ride_strider_in_overworld_lava") {
+		t.Fatal("expected riding strider on Overworld lava to grant minecraft:nether/ride_strider_in_overworld_lava")
+	}
 	boostTicks, boosted := srv.BoostStrider(player, striderA, rng)
 	if !boosted || boostTicks < StriderMinBoostTicks {
 		t.Fatalf("expected BoostStrider to set boost ticks >= %d, got %d (ok=%v)", StriderMinBoostTicks, boostTicks, boosted)
+	}
+	if !player.HasCompletedAdvancement("minecraft:nether/ride_strider") {
+		t.Fatal("expected boosting strider to grant minecraft:nether/ride_strider")
+	}
+	if meta := player.HeldItemMeta(); meta.Damage != 1 {
+		t.Fatalf("expected BoostStrider to damage warped_fungus_on_a_stick by 1, got %d", meta.Damage)
 	}
 
 	// 3. Breed two striders with warped_fungus.
@@ -261,6 +383,16 @@ func TestStriderLavaWalkingShiveringSaddleStickSteeringAndBreeding(t *testing.T)
 	_, babyStriderID := srv.InteractWithStrider(player, striderB, rng)
 	if babyStriderID <= 0 {
 		t.Fatal("expected striders fed warped_fungus to breed a baby strider")
+	}
+
+	// 4. Test Strider Jockey passenger variants (zombified_piglin rider and baby strider rider) + saddle drop on death.
+	jStriderID, jRiderID, err := srv.SpawnStriderJockey(world.DimensionNether, 20, 64, 20, MobTypeZombifiedPiglin, rng)
+	if err != nil || jStriderID <= 0 || jRiderID <= 0 || !srv.IsStriderSaddled(jStriderID) {
+		t.Fatalf("SpawnStriderJockey(zombified_piglin) failed: strider=%d rider=%d err=%v", jStriderID, jRiderID, err)
+	}
+	saddleDrops := srv.OnStriderKilled(jStriderID)
+	if len(saddleDrops) != 1 || canonicalResourceName(saddleDrops[0].ResolvedID()) != "minecraft:saddle" {
+		t.Fatalf("expected killed saddled strider to drop saddle, got %v", saddleDrops)
 	}
 }
 
@@ -319,4 +451,3 @@ func TestEntityFluidHeightAndBubbleColumnMobsItemsAndBoats(t *testing.T) {
 		t.Fatalf("tick 60: expected boat on bubble column to sink, got bc=%v sunk=%v vy=%v", bc, sunk, bvy)
 	}
 }
-

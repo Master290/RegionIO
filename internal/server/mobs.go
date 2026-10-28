@@ -597,6 +597,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	if norm == MobTypePiglinBrute {
 		return s.SpawnPiglinBrute(normDim, x, y, z)
 	}
+	if norm == MobTypeZombifiedPiglin {
+		return s.SpawnZombifiedPiglin(normDim, x, y, z, false)
+	}
 	if norm == MobTypeHoglin {
 		return s.SpawnHoglin(normDim, x, y, z, false)
 	}
