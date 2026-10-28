@@ -212,6 +212,10 @@ var (
 		MobTypeSilverfish:          EntityTypeSilverfishID,
 		MobTypeEnderman:            EntityTypeEndermanID,
 		MobTypeEndermite:           EntityTypeEndermiteID,
+		MobTypeBlaze:               EntityTypeBlazeID,
+		MobTypeGhast:               EntityTypeGhastID,
+		EntityTypeFireball:         EntityTypeFireballID,
+		EntityTypeSmallFireball:    EntityTypeSmallFireballID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -416,6 +420,12 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultEndermanMaxHealth
 	case MobTypeEndermite:
 		return DefaultEndermiteMaxHealth
+	case MobTypeBlaze:
+		return DefaultBlazeMaxHealth
+	case MobTypeGhast:
+		return DefaultGhastMaxHealth
+	case MobTypeMagmaCube, MobTypeSlime:
+		return float32(MagmaCubeSizeLarge * MagmaCubeSizeLarge)
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -640,6 +650,18 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeEndermite {
 		return s.SpawnEndermite(normDim, x, y, z, false)
+	}
+	if norm == MobTypeBlaze {
+		return s.SpawnBlaze(normDim, x, y, z)
+	}
+	if norm == MobTypeGhast {
+		return s.SpawnGhast(normDim, x, y, z)
+	}
+	if norm == MobTypeMagmaCube {
+		return s.SpawnMagmaCube(normDim, x, y, z, MagmaCubeSizeSmall)
+	}
+	if norm == MobTypeSlime {
+		return s.SpawnSlime(normDim, x, y, z, MagmaCubeSizeSmall)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
@@ -1038,6 +1060,18 @@ func stepHostileCreeperAI(
 		mem.repathCooldown--
 	}
 
+	if mem.creeperIgnited {
+		if mem.creeperSwellDir != 1 {
+			mem.creeperSwellDir = 1
+			swellChanged = true
+		}
+		mem.creeperFuseTicks++
+		if mem.creeperFuseTicks >= CreeperFuseDurationTicks {
+			return x, float64(feetY), z, yaw, swellChanged, true
+		}
+		return x, float64(feetY), z, yaw, swellChanged, false
+	}
+
 	target, found := selectTargetWithinRange(targets, x, float64(feetY), z, CreeperAggroRange)
 	if !found {
 		if mem.creeperFuseTicks > 0 {
@@ -1130,7 +1164,8 @@ func ComputeCreeperExplosionDamage(dist, radius float64) float32 {
 
 var creeperChargedMap sync.Map // map[int32]bool
 
-// SetCreeperCharged sets whether the creeper with entityID is charged (explosion radius 6.0 instead of 3.0).
+// SetCreeperCharged sets whether the creeper with entityID is charged (explosion radius 6.0 instead of 3.0)
+// and broadcasts Creeper.DATA_IS_POWERED (index 18) to nearby viewers.
 func (s *Server) SetCreeperCharged(entityID int32, charged bool) {
 	if entityID <= 0 {
 		return
@@ -1139,6 +1174,15 @@ func (s *Server) SetCreeperCharged(entityID int32, charged bool) {
 		creeperChargedMap.Store(entityID, true)
 	} else {
 		creeperChargedMap.Delete(entityID)
+	}
+	if s != nil && s.entities != nil {
+		if ent := s.entities.Get(entityID); ent != nil && canonicalResourceName(ent.TypeName) == MobTypeCreeper {
+			_, swellDir := s.CreeperFuseState(entityID)
+			ignited := s.IsCreeperIgnited(entityID)
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEntityData,
+				EncodeCreeperEntityDataPacket(entityID, int32(swellDir), charged, ignited))
+		}
 	}
 }
 
@@ -1204,7 +1248,8 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 	cz := int32(int64(math.Floor(z)) >> 4)
 
 	radius := CreeperExplosionRadius
-	if s.IsCreeperCharged(entityID) {
+	wasCharged := s.IsCreeperCharged(entityID)
+	if wasCharged {
 		radius = ChargedCreeperExplosionRadius
 	}
 	s.SetCreeperCharged(entityID, false)
@@ -1216,6 +1261,27 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 		}
 		s.entities.Remove(entityID)
 		s.BroadcastChunk(cx, cz, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+	}
+
+	type preMobSnap struct {
+		id       int32
+		typeName string
+		x, y, z  float64
+	}
+	var preMobs []preMobSnap
+	if s.entities != nil {
+		maxDiam := radius * 2.0
+		for _, m := range s.entities.All() {
+			if m.ID == entityID || m.IsItem() || m.IsExperienceOrb() || m.EffectiveDimension() != dim {
+				continue
+			}
+			if s.MobHealth(m.ID) <= 0 {
+				continue
+			}
+			if math.Hypot(m.X-x, m.Z-z) <= maxDiam+2.0 {
+				preMobs = append(preMobs, preMobSnap{id: m.ID, typeName: m.TypeName, x: m.X, y: m.Y, z: m.Z})
+			}
+		}
 	}
 
 	canGrief := s.MobGriefing() && s.CreeperBlockGriefing()
@@ -1232,6 +1298,25 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 		CausesFire:     false,
 		BreakBlocks:    &canGrief,
 	})
+
+	if s.entities != nil {
+		for _, pm := range preMobs {
+			if s.MobHealth(pm.id) <= 0 {
+				s.entities.Remove(pm.id)
+				mcpX := int32(int64(math.Floor(pm.x)) >> 4)
+				mcpZ := int32(int64(math.Floor(pm.z)) >> 4)
+				s.BroadcastDimensionChunk(dim, mcpX, mcpZ, protocol.PlayRemoveEntities,
+					encodeRemoveEntitiesPacket(nil, []int32{pm.id}))
+				if wasCharged && s.DoMobLoot() {
+					if skullID, ok := CreeperHeadDropForVictim(pm.typeName); ok && skullID != "" {
+						if stack := world.NewNamedItemStack(skullID, 1); !stack.IsEmpty() {
+							_, _ = s.SpawnItemEntityInDimension(dim, pm.x, pm.y+0.25, pm.z, stack)
+						}
+					}
+				}
+			}
+		}
+	}
 	return res.PlayersDamaged
 }
 

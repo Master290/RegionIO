@@ -601,6 +601,10 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		}
 	case MobTypeEnderman:
 		return RollEndermanDeathLoot(rng, 0, world.StateAir)
+	case MobTypeBlaze:
+		return RollBlazeDeathLoot(rng, 0, true)
+	case MobTypeGhast:
+		return RollGhastDeathLoot(rng, 0)
 	case MobTypeParrot:
 		feathers := int32(1)
 		if rng != nil {
@@ -799,6 +803,14 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return SoundEndermanHurt, SoundSourceHostile
 	case MobTypeEndermite:
 		return SoundEndermiteHurt, SoundSourceHostile
+	case MobTypeBlaze:
+		return SoundBlazeHurt, SoundSourceHostile
+	case MobTypeGhast:
+		return SoundGhastHurt, SoundSourceHostile
+	case MobTypeMagmaCube:
+		return SoundMagmaCubeHurt, SoundSourceHostile
+	case MobTypeSlime:
+		return SoundSlimeHurt, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseHurt, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -930,6 +942,14 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return SoundEndermanDeath, SoundSourceHostile
 	case MobTypeEndermite:
 		return SoundEndermiteDeath, SoundSourceHostile
+	case MobTypeBlaze:
+		return SoundBlazeDeath, SoundSourceHostile
+	case MobTypeGhast:
+		return SoundGhastDeath, SoundSourceHostile
+	case MobTypeMagmaCube:
+		return SoundMagmaCubeDeath, SoundSourceHostile
+	case MobTypeSlime:
+		return SoundSlimeDeath, SoundSourceHostile
 	case MobTypeHorse:
 		return SoundHorseDeath, SoundSourceNeutral
 	case MobTypeDonkey:
@@ -1197,6 +1217,12 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 		return 0, false
 	}
+	if canonicalResourceName(target.TypeName) == EntityTypeFireball {
+		if s.DeflectGhastFireball(target.ID, session) {
+			return 1.0, false
+		}
+		return 0, false
+	}
 
 	baseDamage, _ := StackAttackStats(session.HeldItem())
 	baseDamage += session.MeleeDamageBonus()
@@ -1269,6 +1295,15 @@ func (s *Server) applyDamageToMob(
 			return false
 		}
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeMagmaCube {
+		armor := MagmaCubeArmorPoints(s.SlimeSize(target.ID))
+		if armor > 0 {
+			damage = DamageAfterArmor(damage, float32(armor), 0)
+			if damage <= 0 {
+				return false
+			}
+		}
+	}
 	if canonicalResourceName(target.TypeName) == MobTypeWolf && s.HasWolfArmor(target.ID) {
 		if absorbed, _, _ := s.AbsorbWolfDamageWithArmor(target.ID, damage, false); absorbed {
 			if attacker != nil {
@@ -1314,6 +1349,9 @@ func (s *Server) applyDamageToMob(
 		mem.healthInit = true
 		if IsEquineOrLlamaMob(target.TypeName) {
 			mem.health = s.EquineMaxHealth(target.ID)
+		} else if canonicalResourceName(target.TypeName) == MobTypeMagmaCube || canonicalResourceName(target.TypeName) == MobTypeSlime {
+			sz := s.SlimeSize(target.ID)
+			mem.health = float32(sz * sz)
 		} else {
 			mem.health = MobMaxHealth(target.TypeName)
 		}
@@ -1382,6 +1420,8 @@ func (s *Server) applyDamageToMob(
 			s.OnEndermanDamaged(target.ID, attacker, nil)
 		} else if normTarget == MobTypeEndermite {
 			s.OnEndermiteDamaged(target.ID, attacker)
+		} else if normTarget == MobTypeBlaze {
+			s.OnBlazeDamaged(target.ID, attacker)
 		} else if normTarget == MobTypeIronGolem {
 			s.OnIronGolemDamaged(target.ID, oldHP, newHP, attacker)
 		} else if IsZombieFamilyMob(normTarget) && attacker != nil {
@@ -1480,13 +1520,29 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeEndermite {
 		s.OnEndermiteKilled(target.ID)
 	}
-	s.entities.Remove(target.ID)
-	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
-		encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
+	if canonicalResourceName(target.TypeName) == MobTypeBlaze {
+		s.OnBlazeKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeGhast {
+		s.OnGhastKilled(target.ID)
+	}
+	slimeSz := 0
+	isSlimeOrMagma := canonicalResourceName(target.TypeName) == MobTypeMagmaCube || canonicalResourceName(target.TypeName) == MobTypeSlime
+	if isSlimeOrMagma {
+		slimeSz = s.SlimeSize(target.ID)
+		_, _ = s.SplitSlimeOrMagmaCubeOnDeath(target.ID, nil)
+	} else {
+		s.entities.Remove(target.ID)
+		s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
+			encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
+	}
 
 	xpReward := MobXPReward(target.TypeName, wasBaby)
 	if xpReward == 0 && !wasBaby {
 		xpReward = EndermanOrEndermiteXPReward(target.TypeName)
+	}
+	if xpReward == 0 && !wasBaby {
+		xpReward = NetherHostileXPReward(target.TypeName, slimeSz)
 	}
 	consumed := false
 	if xpReward > 0 {

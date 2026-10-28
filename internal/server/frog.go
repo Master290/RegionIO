@@ -443,10 +443,12 @@ func (s *Server) spawnSlimeOrMagmaCube(dimension string, x, y, z float64, size i
 	mgr.mu.Lock()
 	mgr.slimeSizes[id] = size
 	mgr.mu.Unlock()
+	_ = s.ensureMagmaOrSlimeState(id, typeName, normDim)
 
 	if ent := s.entities.Get(id); ent != nil {
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlaySetEntityData, EncodeSlimeSizeDataPacket(id, int32(size)))
 	}
 	return id, nil
 }
@@ -478,6 +480,15 @@ func (s *Server) SetSlimeSize(entityID int32, size int) {
 	mgr.mu.Lock()
 	mgr.slimeSizes[entityID] = size
 	mgr.mu.Unlock()
+	if s.entities != nil {
+		if ent := s.entities.Get(entityID); ent != nil {
+			_ = s.ensureMagmaOrSlimeState(entityID, ent.TypeName, ent.EffectiveDimension())
+			s.SetMobHealth(entityID, float32(size*size))
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEntityData,
+				EncodeSlimeSizeDataPacket(entityID, int32(size)))
+		}
+	}
 }
 
 // IsSmallFrogPrey reports whether target is a small (size == 1) `minecraft:slime`
@@ -531,6 +542,11 @@ func (s *Server) FrogTongueEatEntity(frogID, targetEntityID int32) (droppedItemE
 	snap := *st
 	delete(mgr.slimeSizes, targetEntityID)
 	mgr.mu.Unlock()
+	if bg := s.netherHostileManager(); bg != nil {
+		bg.mu.Lock()
+		delete(bg.magmaCubes, targetEntityID)
+		bg.mu.Unlock()
+	}
 
 	dim := frogEnt.EffectiveDimension()
 	cp := frogEnt.ChunkPos()
@@ -618,6 +634,11 @@ func (s *Server) SplitSlimeOrMagmaCubeOnDeath(entityID int32, rng *rand.Rand) (c
 	mgr.mu.Lock()
 	delete(mgr.slimeSizes, entityID)
 	mgr.mu.Unlock()
+	if bg := s.netherHostileManager(); bg != nil {
+		bg.mu.Lock()
+		delete(bg.magmaCubes, entityID)
+		bg.mu.Unlock()
+	}
 
 	dim := ent.EffectiveDimension()
 	cp := ent.ChunkPos()

@@ -198,6 +198,7 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickIllagersWitchesRavagersAndVexes(rng)
 		s.TickUndeadAndSilverfish(rng)
 		s.TickEndermenAndEndermites(rng)
+		s.TickBlazesGhastsAndMagmaCubes(rng)
 		s.TickMobsInCauldrons()
 	}
 
@@ -275,7 +276,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning || snapshot.TypeName == EntityTypeEvokerFangs {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning || snapshot.TypeName == EntityTypeEvokerFangs || IsFireballEntityType(snapshot.TypeName) {
 			continue
 		}
 		if IsStandardProjectileEntityType(snapshot.TypeName) {
@@ -326,11 +327,16 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite {
+		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite || snapshot.TypeName == MobTypeBlaze || snapshot.TypeName == MobTypeGhast || snapshot.TypeName == MobTypeMagmaCube || snapshot.TypeName == MobTypeSlime {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true
-				mem.health = ResolveMobMaxHealth(snapshot.TypeName)
+				if snapshot.TypeName == MobTypeMagmaCube || snapshot.TypeName == MobTypeSlime {
+					sz := s.SlimeSize(snapshot.ID)
+					mem.health = float32(sz * sz)
+				} else {
+					mem.health = ResolveMobMaxHealth(snapshot.TypeName)
+				}
 				mem.lastHealth = mem.health
 			}
 			if mem.breedCooldown > 0 {

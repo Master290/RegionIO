@@ -2067,6 +2067,7 @@ func (s *Server) SpawnLightningBolt(dimension string, x, y, z float64, rng *rand
 	if !redirected {
 		_, _ = s.TrySpawnSkeletonTrapOnLightning(normDim, strikeX, strikeY, strikeZ, false, rng)
 	}
+	_ = s.ChargeCreepersNearLightning(normDim, strikeX, strikeY, strikeZ)
 	return entityID, strikeX, strikeY, strikeZ, redirected
 }
 
