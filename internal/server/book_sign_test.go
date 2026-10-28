@@ -254,6 +254,100 @@ func TestLecternPlaceReadPageTurnTakeBookAndComparator(t *testing.T) {
 	}
 }
 
+func TestLecternRedstonePulseLiveComparatorAndDroppedBookMeta(t *testing.T) {
+	srv := newTestMapServer(t)
+	dim := world.DimensionOverworld
+	srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	stoneSt := testBlockStateByName("minecraft:stone")
+	srv.chunks.SetBlock(20, 64, 20, stoneSt)
+	srv.chunks.SetBlock(21, 64, 20, stoneSt)
+	srv.chunks.SetBlock(20, 64, 21, stoneSt)
+
+	lecternSt := MakeLecternBlockState("north", false, false)
+	srv.chunks.SetBlock(20, 65, 20, lecternSt)
+
+	compSt, _ := world.BlockStateIDByProperties("minecraft:comparator", map[string]string{
+		"facing":  "west",
+		"mode":    "compare",
+		"powered": "false",
+	})
+	srv.chunks.SetBlock(21, 65, 20, compSt)
+
+	wireSt, _ := world.BlockStateIDByProperties("minecraft:redstone_wire", map[string]string{
+		"power": "0",
+	})
+	srv.chunks.SetBlock(20, 65, 21, wireSt)
+
+	alice, _, _ := newTestMapPlayer(srv, "Alice", 20, 65, 20, 0)
+	hotbar0 := world.HotbarContainerOffset
+	alice.SetInventorySlot(hotbar0, world.NewNamedItemStack(WritableBookItemID, 1))
+	SetSlotWritableBook(alice, hotbar0, WritableBookContent{
+		Pages: []FilterableString{
+			{Raw: "Page 1"},
+			{Raw: "Page 2"},
+			{Raw: "Page 3"},
+		},
+	})
+
+	// 1. Place 3-page writable_book on lectern -> live comparator at (21, 65, 20) updates to signal 1
+	if !srv.InteractWithLectern(alice, 0, 20, 65, 20) {
+		t.Fatal("expected InteractWithLectern to place writable_book on lectern")
+	}
+	if got := srv.chunks.ComparatorOutputSignalAt(21, 65, 20); got != 1 {
+		t.Fatalf("after placing book: live ComparatorOutputSignalAt = %d, want 1", got)
+	}
+
+	// 2. Open lectern and turn to page 1 (middle page of 3 -> signal 8) -> triggers 2-tick powered=true pulse
+	srv.InteractWithLectern(alice, 0, 20, 65, 20)
+	if handled, err := srv.HandleLecternButtonClick(alice, 0, LecternButtonNextPage); !handled || err != nil {
+		t.Fatalf("HandleLecternButtonClick(NextPage): handled=%v err=%v", handled, err)
+	}
+	_, hasBook, powered, ok := ParseLecternBlockState(srv.chunks.GetBlock(20, 65, 20))
+	if !ok || !hasBook || !powered {
+		t.Fatalf("expected lectern state has_book=true powered=true on page turn, got ok=%v hasBook=%v powered=%v", ok, hasBook, powered)
+	}
+	if got := srv.chunks.ComparatorOutputSignalAt(21, 65, 20); got != 8 {
+		t.Fatalf("after turning to page 1/3: ComparatorOutputSignalAt = %d, want 8", got)
+	}
+
+	// Advance 1 tick -> still powered; advance 2nd tick -> pulse ends (powered=false), comparator remains 8
+	if srv.AdvanceLecternPulses(1) != 0 {
+		t.Fatal("expected pulse to remain active after 1 tick")
+	}
+	if srv.AdvanceLecternPulses(1) != 1 {
+		t.Fatal("expected pulse to finish on 2nd tick")
+	}
+	_, hasBook, powered, _ = ParseLecternBlockState(srv.chunks.GetBlock(20, 65, 20))
+	if !hasBook || powered {
+		t.Fatalf("expected has_book=true powered=false after 2 ticks, got hasBook=%v powered=%v", hasBook, powered)
+	}
+	if got := srv.chunks.ComparatorOutputSignalAt(21, 65, 20); got != 8 {
+		t.Fatalf("after pulse ends: ComparatorOutputSignalAt = %d, want 8", got)
+	}
+
+	// 3. RemoveLecternAt (simulating block break) -> drops book with preserved WritableBookContent and resets comparator
+	droppedItem, droppedWB, droppedWRB, hadBook := srv.RemoveLecternAt(dim, 20, 65, 20)
+	if !hadBook {
+		t.Fatal("expected RemoveLecternAt to return hadBook=true")
+	}
+	srv.chunks.ApplyBlockWithUpdates(20, 65, 20, 0)
+	if got := srv.chunks.ComparatorOutputSignalAt(21, 65, 20); got != 0 {
+		t.Fatalf("after breaking lectern: ComparatorOutputSignalAt = %d, want 0", got)
+	}
+	eid, _ := srv.SpawnBookItemEntityInDimension(dim, 20.5, 65.5, 20.5, droppedItem, droppedWB, droppedWRB)
+	if eid == 0 {
+		t.Fatal("expected SpawnBookItemEntityInDimension to spawn item entity")
+	}
+	if !ApplyDroppedBookEntityMetaToSlot(alice, hotbar0, eid) {
+		t.Fatal("expected ApplyDroppedBookEntityMetaToSlot to restore dropped book metadata")
+	}
+	restoredWB, wbOK := GetSlotWritableBook(alice, hotbar0)
+	if !wbOK || len(restoredWB.Pages) != 3 || restoredWB.Pages[2].Raw != "Page 3" {
+		t.Fatalf("expected dropped writable_book to preserve 3 pages, got ok=%v wb=%+v", wbOK, restoredWB)
+	}
+}
+
 func TestSignsPlacementUpdateDyeGlowInkWaxingAndPersistence(t *testing.T) {
 	srv := newTestMapServer(t)
 	srv.cfg.WorldDir = t.TempDir()

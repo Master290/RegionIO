@@ -600,6 +600,145 @@ func SwapSlotBookMetas(session *PlayerSession, slotA, slotB int) {
 	tr.mu.Unlock()
 }
 
+// SyncPlayerSlotBookPacket sends a PlayContainerSetSlot (0x14) packet for player
+// inventory `slot` (0..45), attaching DataComponentWritableBookContent (60) or
+// DataComponentWrittenBookContent (61) when present.
+func SyncPlayerSlotBookPacket(session *PlayerSession, slot int) {
+	if session == nil || session.send == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	stack := session.InventorySlot(slot)
+	var wrtPtr *WritableBookContent
+	var sgnPtr *WrittenBookContent
+	if wb, ok := GetSlotWritableBook(session, slot); ok {
+		wrtPtr = &wb
+	}
+	if sb, ok := GetSlotWrittenBook(session, slot); ok {
+		sgnPtr = &sb
+	}
+	stateID := session.NextContainerStateID()
+	_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithBook(0, stateID, slot, stack, wrtPtr, sgnPtr))
+}
+
+type droppedBookEntityMeta struct {
+	writable *WritableBookContent
+	written  *WrittenBookContent
+}
+
+var droppedBookEntityMetas sync.Map // map[int32]droppedBookEntityMeta
+
+// SetDroppedBookEntityMeta associates WritableBookContent or WrittenBookContent
+// with a dropped item entity ID so its pages/title/author survive being dropped
+// from a broken lectern, chiseled bookshelf, or full player inventory.
+func SetDroppedBookEntityMeta(entityID int32, writable *WritableBookContent, written *WrittenBookContent) {
+	if entityID <= 0 {
+		return
+	}
+	if writable == nil && written == nil {
+		droppedBookEntityMetas.Delete(entityID)
+		return
+	}
+	var entry droppedBookEntityMeta
+	if writable != nil {
+		cp := writable.Clone()
+		entry.writable = &cp
+	}
+	if written != nil {
+		cp := written.Clone()
+		entry.written = &cp
+	}
+	droppedBookEntityMetas.Store(entityID, entry)
+}
+
+// GetDroppedBookEntityMeta returns the WritableBookContent / WrittenBookContent
+// associated with a dropped item entity ID, if any.
+func GetDroppedBookEntityMeta(entityID int32) (*WritableBookContent, *WrittenBookContent, bool) {
+	if entityID <= 0 {
+		return nil, nil, false
+	}
+	v, ok := droppedBookEntityMetas.Load(entityID)
+	if !ok {
+		return nil, nil, false
+	}
+	entry := v.(droppedBookEntityMeta)
+	var wrtOut *WritableBookContent
+	var sgnOut *WrittenBookContent
+	if entry.writable != nil {
+		cp := entry.writable.Clone()
+		wrtOut = &cp
+	}
+	if entry.written != nil {
+		cp := entry.written.Clone()
+		sgnOut = &cp
+	}
+	return wrtOut, sgnOut, wrtOut != nil || sgnOut != nil
+}
+
+// TakeDroppedBookEntityMeta removes and returns the WritableBookContent /
+// WrittenBookContent associated with a dropped item entity ID.
+func TakeDroppedBookEntityMeta(entityID int32) (*WritableBookContent, *WrittenBookContent, bool) {
+	if entityID <= 0 {
+		return nil, nil, false
+	}
+	v, ok := droppedBookEntityMetas.LoadAndDelete(entityID)
+	if !ok {
+		return nil, nil, false
+	}
+	entry := v.(droppedBookEntityMeta)
+	var wrtOut *WritableBookContent
+	var sgnOut *WrittenBookContent
+	if entry.writable != nil {
+		cp := entry.writable.Clone()
+		wrtOut = &cp
+	}
+	if entry.written != nil {
+		cp := entry.written.Clone()
+		sgnOut = &cp
+	}
+	return wrtOut, sgnOut, wrtOut != nil || sgnOut != nil
+}
+
+// ApplyDroppedBookEntityMetaToSlot transfers any stored book content from a
+// picked-up item entity `entityID` onto `session`'s inventory `slot` and syncs
+// the slot component packet to the client.
+func ApplyDroppedBookEntityMetaToSlot(session *PlayerSession, slot int, entityID int32) bool {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots || entityID <= 0 {
+		return false
+	}
+	wrt, sgn, ok := TakeDroppedBookEntityMeta(entityID)
+	if !ok {
+		return false
+	}
+	if wrt != nil {
+		SetSlotWritableBook(session, slot, *wrt)
+	}
+	if sgn != nil {
+		SetSlotWrittenBook(session, slot, *sgn)
+	}
+	SyncPlayerSlotBookPacket(session, slot)
+	return true
+}
+
+// SpawnBookItemEntityInDimension spawns a dropped book item entity in `dim` at
+// `(x, y, z)` and attaches any `writable` / `written` book content to the
+// spawned entity ID.
+func (s *Server) SpawnBookItemEntityInDimension(
+	dim string,
+	x, y, z float64,
+	stack world.ItemStack,
+	writable *WritableBookContent,
+	written *WrittenBookContent,
+) (int32, *world.Entity) {
+	if s == nil || stack.IsEmpty() {
+		return 0, nil
+	}
+	id, ent := s.SpawnItemEntityInDimension(dim, x, y, z, stack)
+	if id > 0 && (writable != nil || written != nil) {
+		SetDroppedBookEntityMeta(id, writable, written)
+	}
+	return id, ent
+}
+
 // --- ServerboundEditBookPacket (0x18) & ClientboundOpenBookPacket (0x3a) ---
 
 // EncodeEditBookPacket encodes a ServerboundEditBookPacket (0x18, protocol 775):

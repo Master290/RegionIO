@@ -123,3 +123,107 @@ func TestChiseledBookshelfSixSlotsHitCoordinateSelectionAndPlayerInteraction(t *
 		t.Fatalf("loaded chiseled bookshelf mismatch: %+v", cbLoaded)
 	}
 }
+
+func TestChiseledBookshelfWritableWrittenBookSyncAndOffhand(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	dim := world.DimensionOverworld
+	srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	bsSt := ChiseledBookshelfBlockState("south", [6]bool{})
+	cache.SetBlock(60, 65, 60, bsSt)
+
+	player, err := srv.RegisterPlayer(Profile{UUID: [16]byte{7, 2}, Name: "author"}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(player, GameModeSurvival)
+
+	// 1. Insert a 2-page writable_book from main hand (hand=0) into slot 2 (top-right on south face: x=0.85, y=0.75, z=1.0).
+	player.SetInventorySlot(36, world.NewNamedItemStack(WritableBookItemID, 1))
+	SetSlotWritableBook(player, 36, WritableBookContent{
+		Pages: []FilterableString{
+			{Raw: "Chapter 1: Redstone"},
+			{Raw: "Chapter 2: Comparators"},
+		},
+	})
+	if handled, _ := srv.InteractChiseledBookshelfWithHand(player, dim, 60, 65, 60, 0, "south", 0.85, 0.75, 1.0); !handled {
+		t.Fatal("expected InteractChiseledBookshelfWithHand(hand=0) to insert writable_book into slot 2")
+	}
+	if !player.InventorySlot(36).IsEmpty() {
+		t.Fatal("expected writable_book consumed from main hand")
+	}
+	if wb, _, wbOK := GetChiseledBookshelfSlotBookContent(dim, 60, 65, 60, 2); !wbOK || wb == nil || len(wb.Pages) != 2 || wb.Pages[1].Raw != "Chapter 2: Comparators" {
+		t.Fatalf("expected slot 2 to store 2-page WritableBookContent, got ok=%v wb=%+v", wbOK, wb)
+	}
+
+	// 2. Insert a signed written_book from off-hand (hand=1, slot 45) into slot 3 (bottom-left on south face: x=0.15, y=0.25, z=1.0).
+	const offhandSlot = 45
+	player.SetInventorySlot(offhandSlot, world.NewNamedItemStack(WrittenBookItemID, 1))
+	SetSlotWrittenBook(player, offhandSlot, WrittenBookContent{
+		Title:      FilterableString{Raw: "Chronicles"},
+		Author:     "author",
+		Generation: BookGenerationCopyOfOriginal,
+		Pages: []FilterableComponent{
+			{Raw: TextComponent("Page One")},
+			{Raw: TextComponent("Page Two")},
+			{Raw: TextComponent("Page Three")},
+		},
+		Resolved: true,
+	})
+	if handled, _ := srv.InteractChiseledBookshelfWithHand(player, dim, 60, 65, 60, 1, "south", 0.15, 0.25, 1.0); !handled {
+		t.Fatal("expected InteractChiseledBookshelfWithHand(hand=1) to insert written_book from offhand into slot 3")
+	}
+	if !player.InventorySlot(offhandSlot).IsEmpty() {
+		t.Fatal("expected written_book consumed from offhand")
+	}
+	if got := srv.ComparatorSignalAt(dim, 60, 65, 60); got != 4 {
+		t.Fatalf("expected ComparatorSignalAt = 4 after interacting with slot 3, got %d", got)
+	}
+
+	// 3. Verify persistence via chunk NBT round-trip into a second Server instance.
+	cx, cz := int32(60>>4), int32(60>>4)
+	chunkTags := srv.ChunkChiseledBookshelfBlockEntitiesNBT(dim, cx, cz)
+	if len(chunkTags) != 1 {
+		t.Fatalf("expected 1 chunk chiseled_bookshelf NBT entry, got %d", len(chunkTags))
+	}
+	TakeChiseledBookshelfSlotBookContent(dim, 60, 65, 60, 2)
+	TakeChiseledBookshelfSlotBookContent(dim, 60, 65, 60, 3)
+
+	srv2, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache srv2: %v", err)
+	}
+	srv2.LoadChunkChiseledBookshelfBlockEntitiesNBT(dim, chunkTags)
+
+	// 4. Remove slot 2 and slot 3 on srv2 and verify WritableBookContent and WrittenBookContent are restored to player inventory.
+	player2, err := srv2.RegisterPlayer(Profile{UUID: [16]byte{7, 3}, Name: "reader"}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer reader: %v", err)
+	}
+	_ = srv2.SetPlayerGameMode(player2, GameModeSurvival)
+
+	if handled, _ := srv2.InteractChiseledBookshelf(player2, dim, 60, 65, 60, "south", 0.85, 0.75, 1.0); !handled {
+		t.Fatal("expected InteractChiseledBookshelf to remove writable_book from slot 2")
+	}
+	wbRestored, ok := GetSlotWritableBook(player2, 36)
+	if !ok || len(wbRestored.Pages) != 2 || wbRestored.Pages[0].Raw != "Chapter 1: Redstone" {
+		t.Fatalf("expected restored WritableBookContent in slot 36, got ok=%v wb=%+v", ok, wbRestored)
+	}
+
+	// Slot 36 is now occupied by writable_book, so removing slot 3 places written_book into slot 37.
+	if handled, _ := srv2.InteractChiseledBookshelf(player2, dim, 60, 65, 60, "south", 0.15, 0.25, 1.0); !handled {
+		t.Fatal("expected InteractChiseledBookshelf to remove written_book from slot 3")
+	}
+	wrbRestored, ok := GetSlotWrittenBook(player2, 37)
+	if !ok || wrbRestored.Title.Raw != "Chronicles" || wrbRestored.Author != "author" ||
+		wrbRestored.Generation != BookGenerationCopyOfOriginal || len(wrbRestored.Pages) != 3 {
+		t.Fatalf("expected restored WrittenBookContent in slot 37, got ok=%v wrb=%+v", ok, wrbRestored)
+	}
+}
+

@@ -7,11 +7,146 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
+
+type chiseledBookshelfBookSlotKey struct {
+	dim  string
+	x    int
+	y    int
+	z    int
+	slot int
+}
+
+type chiseledBookshelfBookSlotContent struct {
+	writable *WritableBookContent
+	written  *WrittenBookContent
+}
+
+var (
+	chiseledBookshelfBookSlotsMu sync.RWMutex
+	chiseledBookshelfBookSlots   = make(map[chiseledBookshelfBookSlotKey]chiseledBookshelfBookSlotContent)
+)
+
+// SetChiseledBookshelfSlotBookContent stores or clears the WritableBookContent /
+// WrittenBookContent on slot (0..5) of the `minecraft:chiseled_bookshelf` at (dim, x, y, z).
+func SetChiseledBookshelfSlotBookContent(dim string, x, y, z, slot int, writable *WritableBookContent, written *WrittenBookContent) {
+	if slot < 0 || slot >= ChiseledBookshelfSlotCount {
+		return
+	}
+	key := chiseledBookshelfBookSlotKey{
+		dim:  normalizeHopperDim(dim),
+		x:    x,
+		y:    y,
+		z:    z,
+		slot: slot,
+	}
+	chiseledBookshelfBookSlotsMu.Lock()
+	defer chiseledBookshelfBookSlotsMu.Unlock()
+	if writable == nil && written == nil {
+		delete(chiseledBookshelfBookSlots, key)
+		return
+	}
+	var entry chiseledBookshelfBookSlotContent
+	if writable != nil {
+		cp := writable.Clone()
+		entry.writable = &cp
+	}
+	if written != nil {
+		cp := written.Clone()
+		entry.written = &cp
+	}
+	chiseledBookshelfBookSlots[key] = entry
+}
+
+// GetChiseledBookshelfSlotBookContent returns a copy of the WritableBookContent /
+// WrittenBookContent stored on slot (0..5) of the `minecraft:chiseled_bookshelf` at (dim, x, y, z).
+func GetChiseledBookshelfSlotBookContent(dim string, x, y, z, slot int) (*WritableBookContent, *WrittenBookContent, bool) {
+	if slot < 0 || slot >= ChiseledBookshelfSlotCount {
+		return nil, nil, false
+	}
+	key := chiseledBookshelfBookSlotKey{
+		dim:  normalizeHopperDim(dim),
+		x:    x,
+		y:    y,
+		z:    z,
+		slot: slot,
+	}
+	chiseledBookshelfBookSlotsMu.RLock()
+	entry, ok := chiseledBookshelfBookSlots[key]
+	chiseledBookshelfBookSlotsMu.RUnlock()
+	if !ok {
+		return nil, nil, false
+	}
+	var wrtOut *WritableBookContent
+	var sgnOut *WrittenBookContent
+	if entry.writable != nil {
+		cp := entry.writable.Clone()
+		wrtOut = &cp
+	}
+	if entry.written != nil {
+		cp := entry.written.Clone()
+		sgnOut = &cp
+	}
+	return wrtOut, sgnOut, wrtOut != nil || sgnOut != nil
+}
+
+// TakeChiseledBookshelfSlotBookContent removes and returns the WritableBookContent /
+// WrittenBookContent stored on slot (0..5) of the `minecraft:chiseled_bookshelf` at (dim, x, y, z).
+func TakeChiseledBookshelfSlotBookContent(dim string, x, y, z, slot int) (*WritableBookContent, *WrittenBookContent, bool) {
+	if slot < 0 || slot >= ChiseledBookshelfSlotCount {
+		return nil, nil, false
+	}
+	key := chiseledBookshelfBookSlotKey{
+		dim:  normalizeHopperDim(dim),
+		x:    x,
+		y:    y,
+		z:    z,
+		slot: slot,
+	}
+	chiseledBookshelfBookSlotsMu.Lock()
+	entry, ok := chiseledBookshelfBookSlots[key]
+	if ok {
+		delete(chiseledBookshelfBookSlots, key)
+	}
+	chiseledBookshelfBookSlotsMu.Unlock()
+	if !ok {
+		return nil, nil, false
+	}
+	var wrtOut *WritableBookContent
+	var sgnOut *WrittenBookContent
+	if entry.writable != nil {
+		cp := entry.writable.Clone()
+		wrtOut = &cp
+	}
+	if entry.written != nil {
+		cp := entry.written.Clone()
+		sgnOut = &cp
+	}
+	return wrtOut, sgnOut, wrtOut != nil || sgnOut != nil
+}
+
+// ResolveChiseledBookshelfPlacementState returns the initial block state for a
+// player-placed `minecraft:chiseled_bookshelf`, orienting its front (`facing`)
+// opposite to `playerHorizontalFacing` with all 6 slots unoccupied.
+func ResolveChiseledBookshelfPlacementState(playerHorizontalFacing string) uint16 {
+	opp := "north"
+	switch strings.ToLower(strings.TrimSpace(playerHorizontalFacing)) {
+	case "north":
+		opp = "south"
+	case "south":
+		opp = "north"
+	case "west":
+		opp = "east"
+	case "east":
+		opp = "west"
+	}
+	return ChiseledBookshelfBlockState(opp, [ChiseledBookshelfSlotCount]bool{})
+}
 
 // --- Chiseled Bookshelf Block State Helpers ---
 
@@ -161,6 +296,24 @@ func (s *Server) InteractChiseledBookshelf(
 	clickedFace string,
 	hitX, hitY, hitZ float64,
 ) (handled bool, res world.BlockUpdateResult) {
+	if handled, res = s.InteractChiseledBookshelfWithHand(session, dim, x, y, z, 0, clickedFace, hitX, hitY, hitZ); handled {
+		return true, res
+	}
+	return s.InteractChiseledBookshelfWithHand(session, dim, x, y, z, 1, clickedFace, hitX, hitY, hitZ)
+}
+
+// InteractChiseledBookshelfWithHand handles a player right-clicking a
+// `minecraft:chiseled_bookshelf` at (dim, x, y, z) with `hand` (0 = main hand,
+// 1 = off-hand) on `clickedFace` at `(hitX, hitY, hitZ)`, preserving
+// `WritableBookContent`, `WrittenBookContent`, and `ItemMeta` across insert and remove.
+func (s *Server) InteractChiseledBookshelfWithHand(
+	session *PlayerSession,
+	dim string,
+	x, y, z int,
+	hand int32,
+	clickedFace string,
+	hitX, hitY, hitZ float64,
+) (handled bool, res world.BlockUpdateResult) {
 	if s == nil {
 		return false, res
 	}
@@ -196,11 +349,12 @@ func (s *Server) InteractChiseledBookshelf(
 
 	// Case 1: Target slot is occupied -> remove book from slot.
 	if !curBook.IsEmpty() && curBook.Count > 0 {
+		wrt, sgn, _ := TakeChiseledBookshelfSlotBookContent(normDim, x, y, z, slot)
 		s.SetChiseledBookshelfSlot(normDim, x, y, z, slot, world.ItemStack{}, ItemMeta{})
 		if session != nil {
-			s.giveChiseledBookshelfBookToPlayer(session, normDim, x, y, z, curBook, curMeta)
+			s.giveChiseledBookshelfBookToPlayer(session, normDim, x, y, z, curBook, curMeta, wrt, sgn)
 		} else {
-			s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, curBook)
+			_, _ = s.SpawnBookItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, curBook, wrt, sgn)
 		}
 		soundName := "minecraft:block.chiseled_bookshelf.pickup"
 		if canonicalResourceName(curBook.ResolvedID()) == "minecraft:enchanted_book" {
@@ -219,21 +373,47 @@ func (s *Server) InteractChiseledBookshelf(
 		return true, res
 	}
 
-	// Case 2: Target slot is empty -> insert 1 held book if valid.
+	// Case 2: Target slot is empty -> insert 1 held book from `hand` if valid.
 	if session == nil {
 		return false, res
 	}
-	held := session.HeldItem()
+	handSlot, held := session.handSlotAndStack(hand)
 	if !IsChiseledBookshelfBook(held) {
 		return false, res
 	}
-	heldMeta := session.HeldItemMeta()
+	heldMeta := GetSlotItemMeta(session, handSlot)
+	var wrtPtr *WritableBookContent
+	var sgnPtr *WrittenBookContent
+	if wb, hasWB := GetSlotWritableBook(session, handSlot); hasWB {
+		wrtPtr = &wb
+	}
+	if sb, hasSB := GetSlotWrittenBook(session, handSlot); hasSB {
+		sgnPtr = &sb
+	}
+
 	singleBook := world.NewNamedItemStack(held.ResolvedID(), 1)
 	if !s.SetChiseledBookshelfSlot(normDim, x, y, z, slot, singleBook, heldMeta) {
 		return false, res
 	}
+	SetChiseledBookshelfSlotBookContent(normDim, x, y, z, slot, wrtPtr, sgnPtr)
 
-	s.ConsumeHeldItem(session, 1)
+	snap := session.Snapshot()
+	if snap.GameMode != GameModeCreative {
+		rem := held.Count - 1
+		if rem <= 0 {
+			session.SetInventorySlot(handSlot, world.ItemStack{})
+			SetSlotItemMeta(session, handSlot, ItemMeta{})
+			ClearSlotBookMeta(session, handSlot)
+		} else {
+			session.SetInventorySlot(handSlot, world.NewItemStack(held.ResolvedItemID(), rem))
+		}
+		if wrtPtr != nil || sgnPtr != nil {
+			SyncPlayerSlotBookPacket(session, handSlot)
+		} else if session.send != nil {
+			stateID := session.NextContainerStateID()
+			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, handSlot, session.InventorySlot(handSlot)))
+		}
+	}
 
 	soundName := "minecraft:block.chiseled_bookshelf.insert"
 	if canonicalResourceName(singleBook.ResolvedID()) == "minecraft:enchanted_book" {
@@ -252,49 +432,70 @@ func (s *Server) InteractChiseledBookshelf(
 	return true, res
 }
 
-func (s *Server) giveChiseledBookshelfBookToPlayer(session *PlayerSession, dim string, bx, by, bz int, book world.ItemStack, meta ItemMeta) {
+func (s *Server) giveChiseledBookshelfBookToPlayer(
+	session *PlayerSession,
+	dim string,
+	bx, by, bz int,
+	book world.ItemStack,
+	meta ItemMeta,
+	writable *WritableBookContent,
+	written *WrittenBookContent,
+) {
 	if session == nil || book.IsEmpty() {
 		return
 	}
-	heldSlot := int(world.HotbarContainerOffset + session.Snapshot().SelectedSlot)
-	if session.InventorySlot(heldSlot).IsEmpty() {
-		session.SetInventorySlot(heldSlot, book)
+	assignSlot := func(targetSlot int) {
+		session.SetInventorySlot(targetSlot, book)
 		if !meta.IsEmpty() {
-			SetSlotItemMeta(session, heldSlot, meta)
+			SetSlotItemMeta(session, targetSlot, meta)
+		}
+		if writable != nil {
+			SetSlotWritableBook(session, targetSlot, *writable)
+		}
+		if written != nil {
+			SetSlotWrittenBook(session, targetSlot, *written)
 		}
 		if session.send != nil {
 			stateID := session.NextContainerStateID()
-			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, heldSlot, book))
+			if writable != nil || written != nil {
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithBook(0, stateID, targetSlot, book, writable, written))
+			} else {
+				_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, targetSlot, book))
+			}
 		}
+	}
+
+	heldSlot := int(world.HotbarContainerOffset + session.Snapshot().SelectedSlot)
+	if session.InventorySlot(heldSlot).IsEmpty() {
+		assignSlot(heldSlot)
 		return
 	}
 	inv := session.Inventory()
 	for _, r := range [][2]int{{36, 45}, {9, 36}} {
 		for i := r[0]; i < r[1]; i++ {
 			if inv[i].IsEmpty() {
-				session.SetInventorySlot(i, book)
-				if !meta.IsEmpty() {
-					SetSlotItemMeta(session, i, meta)
-				}
-				if session.send != nil {
-					stateID := session.NextContainerStateID()
-					_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, i, book))
-				}
+				assignSlot(i)
 				return
 			}
 		}
 	}
-	s.SpawnItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, book)
+	_, _ = s.SpawnBookItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, book, writable, written)
 }
 
 // --- Breaking & NBT Persistence ---
 
-// RemoveChiseledBookshelfAt removes the `ChiseledBookshelfBlockEntity` at
-// (dim, x, y, z) when the block is broken and returns all stored books (each of
-// which drops in vanilla even without Silk Touch).
-func (s *Server) RemoveChiseledBookshelfAt(dim string, x, y, z int) (drops []world.ItemStack, metas []ItemMeta, existed bool) {
+// RemoveChiseledBookshelfWithBooksAt removes the `ChiseledBookshelfBlockEntity` at
+// (dim, x, y, z) when the block is broken and returns all stored books along with
+// their ItemMeta and WritableBookContent / WrittenBookContent.
+func (s *Server) RemoveChiseledBookshelfWithBooksAt(dim string, x, y, z int) (
+	drops []world.ItemStack,
+	metas []ItemMeta,
+	writables []*WritableBookContent,
+	writtens []*WrittenBookContent,
+	existed bool,
+) {
 	if s == nil {
-		return nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	normDim := normalizeHopperDim(dim)
 	key := hopperBlockKey{dim: normDim, x: x, y: y, z: z}
@@ -306,16 +507,61 @@ func (s *Server) RemoveChiseledBookshelfAt(dim string, x, y, z int) (drops []wor
 	}
 	hs.mu.Unlock()
 	if !ok || cb == nil {
-		return nil, nil, false
+		for i := 0; i < ChiseledBookshelfSlotCount; i++ {
+			_, _, _ = TakeChiseledBookshelfSlotBookContent(normDim, x, y, z, i)
+		}
+		return nil, nil, nil, nil, false
 	}
 	for i := 0; i < ChiseledBookshelfSlotCount; i++ {
+		wrt, sgn, _ := TakeChiseledBookshelfSlotBookContent(normDim, x, y, z, i)
 		if !cb.Slots[i].IsEmpty() && cb.Slots[i].Count > 0 {
 			drops = append(drops, cb.Slots[i])
 			metas = append(metas, cb.SlotMeta[i].Clone())
+			writables = append(writables, wrt)
+			writtens = append(writtens, sgn)
 		}
 	}
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
-	return drops, metas, true
+	return drops, metas, writables, writtens, true
+}
+
+// RemoveChiseledBookshelfAt removes the `ChiseledBookshelfBlockEntity` at
+// (dim, x, y, z) when the block is broken and returns all stored books (each of
+// which drops in vanilla even without Silk Touch).
+func (s *Server) RemoveChiseledBookshelfAt(dim string, x, y, z int) (drops []world.ItemStack, metas []ItemMeta, existed bool) {
+	drops, metas, _, _, existed = s.RemoveChiseledBookshelfWithBooksAt(dim, x, y, z)
+	return drops, metas, existed
+}
+
+// HydrateChunkChiseledBookshelves inspects all `world.StructureBlockEntity`
+// entries on the loaded chunk (dim, cx, cz) and populates any
+// `minecraft:chiseled_bookshelf` block entities.
+func (s *Server) HydrateChunkChiseledBookshelves(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	count := 0
+	for _, sbe := range sbes {
+		if sbe.ID != "minecraft:chiseled_bookshelf" {
+			continue
+		}
+		for _, it := range sbe.Items {
+			if it.Slot >= 0 && it.Slot < ChiseledBookshelfSlotCount && it.ItemID != "" {
+				_ = s.SetChiseledBookshelfSlot(normDim, sbe.X, sbe.Y, sbe.Z, it.Slot, world.NewNamedItemStack(it.ItemID, 1), ItemMeta{})
+			}
+		}
+		count++
+	}
+	return count
 }
 
 // ToNBT serializes the ChiseledBookshelfBlockEntity into a vanilla-compatible NBT compound.
@@ -323,9 +569,10 @@ func (cb *ChiseledBookshelfBlockEntity) ToNBT() *nbt.Compound {
 	if cb == nil {
 		return nbt.NewCompound()
 	}
+	normDim := normalizeHopperDim(cb.Dimension)
 	comp := nbt.NewCompound()
 	comp.Set("id", nbt.String("minecraft:chiseled_bookshelf"))
-	comp.Set("Dimension", nbt.String(normalizeHopperDim(cb.Dimension)))
+	comp.Set("Dimension", nbt.String(normDim))
 	comp.Set("x", nbt.Int(int32(cb.X)))
 	comp.Set("y", nbt.Int(int32(cb.Y)))
 	comp.Set("z", nbt.Int(int32(cb.Z)))
@@ -345,6 +592,14 @@ func (cb *ChiseledBookshelfBlockEntity) ToNBT() *nbt.Compound {
 			metaComp := nbt.NewCompound()
 			encodeItemMetaToNBT(metaComp, cb.SlotMeta[i])
 			entry.Set("Meta", metaComp)
+		}
+		if wrt, sgn, hasBookMeta := GetChiseledBookshelfSlotBookContent(normDim, cb.X, cb.Y, cb.Z, i); hasBookMeta {
+			if wrt != nil {
+				entry.Set("writable_book_content", wrt.ToNBT())
+			}
+			if sgn != nil {
+				entry.Set("written_book_content", sgn.ToNBT())
+			}
 		}
 		itemEntries = append(itemEntries, entry)
 	}
@@ -371,8 +626,9 @@ func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelf
 	if !okLast {
 		lastSlot = -1
 	}
+	normDim := normalizeHopperDim(dim)
 	cb := &ChiseledBookshelfBlockEntity{
-		Dimension:          normalizeHopperDim(dim),
+		Dimension:          normDim,
 		X:                  int(x),
 		Y:                  int(y),
 		Z:                  int(z),
@@ -399,6 +655,31 @@ func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelf
 				cb.SlotMeta[slot] = decodeItemMetaFromNBT(metaComp)
 			}
 		}
+		var wrtPtr *WritableBookContent
+		var sgnPtr *WrittenBookContent
+		if wc, ok := nbtCompoundTag(entry, "writable_book_content"); ok && wc != nil {
+			parsed := WritableBookContentFromNBT(wc)
+			wrtPtr = &parsed
+		}
+		if sc, ok := nbtCompoundTag(entry, "written_book_content"); ok && sc != nil {
+			parsed := WrittenBookContentFromNBT(sc)
+			sgnPtr = &parsed
+		}
+		if comps, ok := nbtCompoundTag(entry, "components"); ok && comps != nil {
+			if wrtPtr == nil {
+				if wc, ok := nbtCompoundTag(comps, "minecraft:writable_book_content"); ok && wc != nil {
+					parsed := WritableBookContentFromNBT(wc)
+					wrtPtr = &parsed
+				}
+			}
+			if sgnPtr == nil {
+				if sc, ok := nbtCompoundTag(comps, "minecraft:written_book_content"); ok && sc != nil {
+					parsed := WrittenBookContentFromNBT(sc)
+					sgnPtr = &parsed
+				}
+			}
+		}
+		SetChiseledBookshelfSlotBookContent(normDim, cb.X, cb.Y, cb.Z, slot, wrtPtr, sgnPtr)
 	}
 	return cb, true
 }

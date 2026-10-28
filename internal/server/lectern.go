@@ -24,19 +24,24 @@ const (
 	LecternButtonNextPage     int32 = 2
 	LecternButtonTakeBook     int32 = 3
 	LecternButtonPageJumpBase int32 = 100
+
+	// LecternPageTurnPulseTicks is the 2-game-tick (1 redstone tick) pulse duration
+	// during which `powered=true` is held on `minecraft:lectern` after a page turn.
+	LecternPageTurnPulseTicks = 2
 )
 
 // LecternBlockEntity represents a minecraft:lectern block entity holding a book and current page.
 type LecternBlockEntity struct {
-	Dimension string
-	X         int
-	Y         int
-	Z         int
-	Book      world.ItemStack
-	Writable  *WritableBookContent
-	Written   *WrittenBookContent
-	Page      int32
-	PageCount int32
+	Dimension           string
+	X                   int
+	Y                   int
+	Z                   int
+	Book                world.ItemStack
+	Writable            *WritableBookContent
+	Written             *WrittenBookContent
+	Page                int32
+	PageCount           int32
+	PulseTicksRemaining int
 }
 
 // Clone returns a deep copy of l.
@@ -45,13 +50,14 @@ func (l *LecternBlockEntity) Clone() *LecternBlockEntity {
 		return nil
 	}
 	cp := &LecternBlockEntity{
-		Dimension: l.Dimension,
-		X:         l.X,
-		Y:         l.Y,
-		Z:         l.Z,
-		Book:      l.Book,
-		Page:      l.Page,
-		PageCount: l.PageCount,
+		Dimension:           l.Dimension,
+		X:                   l.X,
+		Y:                   l.Y,
+		Z:                   l.Z,
+		Book:                l.Book,
+		Page:                l.Page,
+		PageCount:           l.PageCount,
+		PulseTicksRemaining: l.PulseTicksRemaining,
 	}
 	if l.Writable != nil {
 		w := l.Writable.Clone()
@@ -112,29 +118,88 @@ func IsLecternBlock(state uint16) bool {
 	return world.BlockName(state) == "minecraft:lectern"
 }
 
+// ParseLecternBlockState extracts `facing`, `has_book`, and `powered` from a
+// `minecraft:lectern` block state ID.
+func ParseLecternBlockState(state uint16) (facing string, hasBook, powered, ok bool) {
+	if !IsLecternBlock(state) {
+		return "", false, false, false
+	}
+	props := world.BlockProperties(state)
+	facing = strings.ToLower(strings.TrimSpace(props["facing"]))
+	if facing == "" {
+		facing = "north"
+	}
+	return facing, props["has_book"] == "true", props["powered"] == "true", true
+}
+
+// MakeLecternBlockState constructs the block state ID for `minecraft:lectern`.
+func MakeLecternBlockState(facing string, hasBook, powered bool) uint16 {
+	switch strings.ToLower(strings.TrimSpace(facing)) {
+	case "north", "south", "west", "east":
+		facing = strings.ToLower(strings.TrimSpace(facing))
+	default:
+		facing = "north"
+	}
+	hbStr := "false"
+	if hasBook {
+		hbStr = "true"
+	}
+	pwStr := "false"
+	if powered {
+		pwStr = "true"
+	}
+	if id, ok := world.BlockStateIDByProperties("minecraft:lectern", map[string]string{
+		"facing":   facing,
+		"has_book": hbStr,
+		"powered":  pwStr,
+	}); ok {
+		return id
+	}
+	return blockBaseStateByName("minecraft:lectern")
+}
+
+// ResolveLecternPlacementState returns the initial block state for a placed
+// `minecraft:lectern`, orienting its front (`facing`) opposite to
+// `playerHorizontalFacing` so it faces the player (`LecternBlock.getStateForPlacement`).
+func ResolveLecternPlacementState(playerHorizontalFacing string, hasBook bool) uint16 {
+	opp := "north"
+	switch strings.ToLower(strings.TrimSpace(playerHorizontalFacing)) {
+	case "north":
+		opp = "south"
+	case "south":
+		opp = "north"
+	case "west":
+		opp = "east"
+	case "east":
+		opp = "west"
+	}
+	return MakeLecternBlockState(opp, hasBook, false)
+}
+
 // LecternStateWithBook returns the lectern block state with has_book adjusted
 // while preserving its facing & powered offset.
 // In vanilla 26.1.2 block states for minecraft:lectern:
 // properties are facing (north/south/west/east, stride 4), has_book (true=0, false=1, stride 2),
 // powered (true=0, false=1, stride 1). Default state (from ItemToBlock) has facing=north, has_book=false, powered=false.
 func LecternStateWithBook(state uint16, hasBook bool) uint16 {
-	if !IsLecternBlock(state) {
+	facing, _, powered, ok := ParseLecternBlockState(state)
+	if !ok {
 		return state
 	}
-	base := blockBaseStateByName("minecraft:lectern")
-	if base == world.StateAir || state < base || state >= base+16 {
-		return state
-	}
-	offset := state - base // 0..15: (facing*4) + (has_book?0:2) + (powered?0:1)
-	facingAndPowered := offset &^ 2
 	if !hasBook {
-		facingAndPowered |= 2
+		powered = false
 	}
-	cand := base + facingAndPowered
-	if IsLecternBlock(cand) {
-		return cand
+	return MakeLecternBlockState(facing, hasBook, powered)
+}
+
+// LecternStateWithPowered returns the lectern block state with `powered` adjusted
+// while preserving its `facing` and `has_book` properties.
+func LecternStateWithPowered(state uint16, powered bool) uint16 {
+	facing, hasBook, _, ok := ParseLecternBlockState(state)
+	if !ok {
+		return state
 	}
-	return state
+	return MakeLecternBlockState(facing, hasBook, powered)
 }
 
 // ToNBT serializes LecternBlockEntity into a vanilla block_entities NBT compound.
@@ -255,19 +320,115 @@ func (s *Server) lecternStore() *serverLecternStore {
 }
 
 // GetLecternAt returns a copy of the LecternBlockEntity at (dimension, x, y, z), if present.
+// If the chunk has a generated `minecraft:lectern` StructureBlockEntity or a
+// `minecraft:lectern[has_book=true]` block state that has not yet been hydrated,
+// it initializes the lectern entity automatically.
 func (s *Server) GetLecternAt(dimension string, x, y, z int) (*LecternBlockEntity, bool) {
 	if s == nil {
 		return nil, false
 	}
-	key := blockPosDimKey{dim: world.NormalizeDimension(dimension), x: x, y: y, z: z}
+	normDim := world.NormalizeDimension(dimension)
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
 	st := s.lecternStore()
 	st.mu.RLock()
 	lec := st.lecterns[key].Clone()
 	st.mu.RUnlock()
-	if lec == nil {
-		return nil, false
+	if lec != nil {
+		return lec, true
 	}
-	return lec, true
+	if hydrated := s.tryHydrateLecternAt(normDim, x, y, z); hydrated != nil {
+		return hydrated, true
+	}
+	return nil, false
+}
+
+func (s *Server) tryHydrateLecternAt(normDim string, x, y, z int) *LecternBlockEntity {
+	cache := s.chunksForDimension(normDim)
+	if cache == nil || !cache.IsChunkLoaded(int32(x>>4), int32(z>>4)) {
+		return nil
+	}
+	blockState := cache.GetBlock(x, y, z)
+	_, hasBookProp, _, isLectern := ParseLecternBlockState(blockState)
+	if !isLectern {
+		return nil
+	}
+
+	var bookItem world.ItemStack
+	for _, sbe := range cache.LoadedChunkStructureBlockEntities(int32(x>>4), int32(z>>4)) {
+		if sbe.X == x && sbe.Y == y && sbe.Z == z && sbe.ID == "minecraft:lectern" {
+			if len(sbe.Items) > 0 && sbe.Items[0].ItemID != "" {
+				bookItem = world.NewNamedItemStack(sbe.Items[0].ItemID, 1)
+			}
+			break
+		}
+	}
+	if bookItem.IsEmpty() && hasBookProp {
+		bookItem = world.NewNamedItemStack(WritableBookItemID, 1)
+	}
+	if bookItem.IsEmpty() {
+		return nil
+	}
+
+	lec := &LecternBlockEntity{
+		Dimension: normDim,
+		X:         x,
+		Y:         y,
+		Z:         z,
+		Book:      bookItem,
+		Page:      0,
+		PageCount: 1,
+	}
+	if bookItem.ResolvedID() == WrittenBookItemID {
+		defWritten := WrittenBookContent{
+			Title:    FilterableString{Raw: "Book"},
+			Author:   "Unknown",
+			Pages:    []FilterableComponent{{Raw: TextComponent("")}},
+			Resolved: true,
+		}
+		lec.Written = &defWritten
+	} else {
+		defWritable := WritableBookContent{
+			Pages: []FilterableString{{Raw: ""}},
+		}
+		lec.Writable = &defWritable
+	}
+
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
+	st := s.lecternStore()
+	st.mu.Lock()
+	if existing := st.lecterns[key]; existing != nil {
+		cp := existing.Clone()
+		st.mu.Unlock()
+		return cp
+	}
+	st.lecterns[key] = lec
+	cp := lec.Clone()
+	st.mu.Unlock()
+	return cp
+}
+
+// HydrateChunkLecterns inspects all `world.StructureBlockEntity` entries on the
+// loaded chunk (dim, cx, cz) and registers any `minecraft:lectern` block entities.
+func (s *Server) HydrateChunkLecterns(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.chunksForDimension(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	count := 0
+	for _, sbe := range sbes {
+		if sbe.ID != "minecraft:lectern" {
+			continue
+		}
+		if s.tryHydrateLecternAt(normDim, sbe.X, sbe.Y, sbe.Z) != nil {
+			count++
+		}
+	}
+	return count
 }
 
 // SetLecternAt stores or updates the LecternBlockEntity at (lec.Dimension, lec.X, lec.Y, lec.Z).
@@ -300,6 +461,77 @@ func (s *Server) LecternComparatorSignalAt(x, y, z int) int {
 	return s.GetLecternComparatorOutput(world.DimensionOverworld, x, y, z)
 }
 
+func (s *Server) applyLecternBlockStateAndNotify(dim string, x, y, z int, hasBook, powered bool) {
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
+	if cache != nil {
+		curState := cache.GetBlock(x, y, z)
+		if IsLecternBlock(curState) {
+			facing, _, _, _ := ParseLecternBlockState(curState)
+			if !hasBook {
+				powered = false
+			}
+			newState := MakeLecternBlockState(facing, hasBook, powered)
+			if newState != curState {
+				_, res := cache.ApplyBlockWithUpdates(x, y, z, newState)
+				s.broadcastBlockUpdateInDim(normDim, x, y, z, newState)
+				for _, ch := range res.Changes {
+					s.broadcastBlockUpdateInDim(normDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+				}
+			}
+		}
+	}
+	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
+}
+
+// BroadcastLecternBlockEntityData broadcasts ClientboundBlockEntityDataPacket
+// (0x06, BlockEntityTypeLectern = 31) for the lectern at (dim, x, y, z).
+func (s *Server) BroadcastLecternBlockEntityData(dim string, x, y, z int, lec *LecternBlockEntity) {
+	if s == nil {
+		return
+	}
+	var comp *nbt.Compound
+	if lec != nil {
+		comp = lec.ToNBT()
+	} else {
+		comp = (&LecternBlockEntity{Dimension: dim, X: x, Y: y, Z: z}).ToNBT()
+	}
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeLectern, comp)
+	s.BroadcastDimensionChunk(world.NormalizeDimension(dim), int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
+}
+
+// TickLecterns advances any active 2-tick lectern page-turn redstone pulses by 1 game tick.
+func (s *Server) TickLecterns() {
+	s.AdvanceLecternPulses(1)
+}
+
+// AdvanceLecternPulses advances active lectern page-turn redstone pulses by `ticks`
+// game ticks, resetting `powered=false` when a lectern's pulse timer expires.
+func (s *Server) AdvanceLecternPulses(ticks int) int {
+	if s == nil || ticks <= 0 {
+		return 0
+	}
+	st := s.lecternStore()
+	st.mu.Lock()
+	var expired []blockPosDimKey
+	for key, lec := range st.lecterns {
+		if lec == nil || lec.PulseTicksRemaining <= 0 {
+			continue
+		}
+		lec.PulseTicksRemaining -= ticks
+		if lec.PulseTicksRemaining <= 0 {
+			lec.PulseTicksRemaining = 0
+			expired = append(expired, key)
+		}
+	}
+	st.mu.Unlock()
+
+	for _, key := range expired {
+		s.applyLecternBlockStateAndNotify(key.dim, key.x, key.y, key.z, true, false)
+	}
+	return len(expired)
+}
+
 // PlaceBookOnLectern places a writable_book or written_book from session's hand
 // onto an empty lectern at (x, y, z). Returns true if the book was placed.
 func (s *Server) PlaceBookOnLectern(session *PlayerSession, hand int32, x, y, z int) bool {
@@ -317,7 +549,7 @@ func (s *Server) PlaceBookOnLectern(session *PlayerSession, hand int32, x, y, z 
 
 	snap := session.Snapshot()
 	dim := world.NormalizeDimension(snap.Dimension)
-	cache := s.chunksForDimension(dim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(dim)
 	if cache != nil {
 		blockState := cache.GetBlock(x, y, z)
 		if blockState != world.StateAir && !IsLecternBlock(blockState) {
@@ -370,6 +602,7 @@ func (s *Server) PlaceBookOnLectern(session *PlayerSession, hand int32, x, y, z 
 		}
 	}
 	st.lecterns[key] = lec
+	lecCopy := lec.Clone()
 	st.mu.Unlock()
 
 	// Consume 1 book from player's hand in survival/adventure mode.
@@ -381,27 +614,24 @@ func (s *Server) PlaceBookOnLectern(session *PlayerSession, hand int32, x, y, z 
 		} else {
 			session.SetInventorySlot(slot, world.NewItemStack(held.ResolvedItemID(), rem))
 		}
-		if session.send != nil {
-			stateID := session.NextContainerStateID()
-			_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, session.InventorySlot(slot)))
-		}
+		SyncPlayerSlotBookPacket(session, slot)
 	}
 
-	if cache != nil {
-		curState := cache.GetBlock(x, y, z)
-		if IsLecternBlock(curState) {
-			newState := LecternStateWithBook(curState, true)
-			if newState != curState {
-				cache.SetBlock(x, y, z, newState)
-				s.broadcastBlockUpdateInDim(dim, x, y, z, newState)
-			}
-		}
-	}
+	s.applyLecternBlockStateAndNotify(dim, x, y, z, true, false)
+	s.BroadcastLecternBlockEntityData(dim, x, y, z, lecCopy)
 
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	s.BroadcastChunk(cx, cz, PlaySoundPacketID,
+	s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:item.book.put", SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+	s.EmitVibration(VibrationEvent{
+		Dimension: dim,
+		Type:      GameEventBlockChange,
+		X:         float64(x) + 0.5,
+		Y:         float64(y) + 0.5,
+		Z:         float64(z) + 0.5,
+		Player:    session,
+	})
 	return true
 }
 
@@ -411,7 +641,7 @@ func (s *Server) broadcastBlockUpdateInDim(dim string, x, y, z int, state uint16
 	w.VarInt(int32(state))
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	s.BroadcastChunk(cx, cz, protocol.PlayBlockUpdate, w.Bytes())
+	s.BroadcastDimensionChunk(world.NormalizeDimension(dim), cx, cz, protocol.PlayBlockUpdate, w.Bytes())
 }
 
 // OpenLecternScreen opens the MenuTypeLectern (17) UI for a lectern holding a book at (x, y, z),
@@ -423,6 +653,7 @@ func (s *Server) OpenLecternScreen(session *PlayerSession, x, y, z int) bool {
 	}
 	snap := session.Snapshot()
 	dim := world.NormalizeDimension(snap.Dimension)
+	_, _ = s.GetLecternAt(dim, x, y, z)
 	key := blockPosDimKey{dim: dim, x: x, y: y, z: z}
 
 	st := s.lecternStore()
@@ -507,10 +738,10 @@ func (s *Server) CloseLecternIfOpen(session *PlayerSession) {
 
 // HandleLecternButtonClick processes ServerboundContainerButtonClickPacket (0x11)
 // when session has a lectern open:
-//   - buttonID == 1 (LecternButtonPrevPage): decrements Page
-//   - buttonID == 2 (LecternButtonNextPage): increments Page
+//   - buttonID == 1 (LecternButtonPrevPage): decrements Page, pulses `powered=true` (2 ticks), updates comparators
+//   - buttonID == 2 (LecternButtonNextPage): increments Page, pulses `powered=true` (2 ticks), updates comparators
 //   - buttonID == 3 (LecternButtonTakeBook): takes the book into player's inventory and closes the lectern UI
-//   - buttonID >= 100 (LecternButtonPageJumpBase): jumps to page (buttonID - 100)
+//   - buttonID >= 100 (LecternButtonPageJumpBase): jumps to page (buttonID - 100), pulses `powered=true` (2 ticks), updates comparators
 func (s *Server) HandleLecternButtonClick(session *PlayerSession, containerID, buttonID int32) (bool, error) {
 	if s == nil || session == nil || session.IsDead() {
 		return false, nil
@@ -531,23 +762,41 @@ func (s *Server) HandleLecternButtonClick(session *PlayerSession, containerID, b
 
 	switch {
 	case buttonID == LecternButtonPrevPage:
+		prevPage := lec.Page
 		if lec.Page > 0 {
 			lec.Page--
 		}
+		pageChanged := lec.Page != prevPage
+		if pageChanged {
+			lec.PulseTicksRemaining = LecternPageTurnPulseTicks
+		}
 		newPage := int16(lec.Page)
+		lecCopy := lec.Clone()
 		viewers := s.lecternViewersLocked(st, open.key)
 		st.mu.Unlock()
 		s.broadcastLecternPageToViewers(viewers, newPage, open.key)
+		if pageChanged {
+			s.onLecternPageChanged(open.key, lecCopy, session)
+		}
 		return true, nil
 
 	case buttonID == LecternButtonNextPage:
+		prevPage := lec.Page
 		if lec.Page+1 < lec.PageCount {
 			lec.Page++
 		}
+		pageChanged := lec.Page != prevPage
+		if pageChanged {
+			lec.PulseTicksRemaining = LecternPageTurnPulseTicks
+		}
 		newPage := int16(lec.Page)
+		lecCopy := lec.Clone()
 		viewers := s.lecternViewersLocked(st, open.key)
 		st.mu.Unlock()
 		s.broadcastLecternPageToViewers(viewers, newPage, open.key)
+		if pageChanged {
+			s.onLecternPageChanged(open.key, lecCopy, session)
+		}
 		return true, nil
 
 	case buttonID >= LecternButtonPageJumpBase:
@@ -558,53 +807,105 @@ func (s *Server) HandleLecternButtonClick(session *PlayerSession, containerID, b
 		if lec.PageCount > 0 && targetPage >= lec.PageCount {
 			targetPage = lec.PageCount - 1
 		}
+		pageChanged := lec.Page != targetPage
 		lec.Page = targetPage
+		if pageChanged {
+			lec.PulseTicksRemaining = LecternPageTurnPulseTicks
+		}
 		newPage := int16(lec.Page)
+		lecCopy := lec.Clone()
 		viewers := s.lecternViewersLocked(st, open.key)
 		st.mu.Unlock()
 		s.broadcastLecternPageToViewers(viewers, newPage, open.key)
+		if pageChanged {
+			s.onLecternPageChanged(open.key, lecCopy, session)
+		}
 		return true, nil
 
 	case buttonID == LecternButtonTakeBook:
-		takenBook := lec.Book
-		takenWritable := lec.Writable
-		takenWritten := lec.Written
-		delete(st.lecterns, open.key)
-		viewers := s.lecternViewersLocked(st, open.key)
-		for _, v := range viewers {
-			delete(st.openBy, v.session)
-		}
 		st.mu.Unlock()
-
-		// Give the book back to session.
-		s.giveBookToPlayer(session, takenBook, takenWritable, takenWritten)
-
-		// Update block state to has_book=false.
-		if cache := s.chunksForDimension(open.key.dim); cache != nil {
-			curState := cache.GetBlock(open.key.x, open.key.y, open.key.z)
-			if IsLecternBlock(curState) {
-				newState := LecternStateWithBook(curState, false)
-				if newState != curState {
-					cache.SetBlock(open.key.x, open.key.y, open.key.z, newState)
-					s.broadcastBlockUpdateInDim(open.key.dim, open.key.x, open.key.y, open.key.z, newState)
-				}
-			}
-		}
-
-		// Close lectern screen for all viewers of this lectern.
-		for _, v := range viewers {
-			if v.session != nil && v.session.send != nil {
-				w := protocol.NewWriter(4)
-				w.VarInt(v.containerID)
-				_ = v.session.send(protocol.PlayContainerClose, w.Bytes())
-			}
-		}
+		_, _, _, _ = s.TakeBookFromLectern(session, open.key.dim, open.key.x, open.key.y, open.key.z)
 		return true, nil
 
 	default:
 		st.mu.Unlock()
 		return true, nil
 	}
+}
+
+func (s *Server) onLecternPageChanged(key blockPosDimKey, lecCopy *LecternBlockEntity, session *PlayerSession) {
+	s.applyLecternBlockStateAndNotify(key.dim, key.x, key.y, key.z, true, true)
+	s.BroadcastLecternBlockEntityData(key.dim, key.x, key.y, key.z, lecCopy)
+	s.EmitVibration(VibrationEvent{
+		Dimension: key.dim,
+		Type:      GameEventBlockChange,
+		X:         float64(key.x) + 0.5,
+		Y:         float64(key.y) + 0.5,
+		Z:         float64(key.z) + 0.5,
+		Player:    session,
+	})
+}
+
+// TakeBookFromLectern removes the book from the lectern at (dim, x, y, z),
+// gives it to `session` (if non-nil) with its WritableBookContent / WrittenBookContent,
+// updates the lectern block state (`has_book=false, powered=false`) and comparators,
+// and closes the lectern screen for any open viewers.
+func (s *Server) TakeBookFromLectern(session *PlayerSession, dim string, x, y, z int) (world.ItemStack, *WritableBookContent, *WrittenBookContent, bool) {
+	if s == nil {
+		return world.ItemStack{}, nil, nil, false
+	}
+	normDim := world.NormalizeDimension(dim)
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
+	st := s.lecternStore()
+	st.mu.Lock()
+	lec := st.lecterns[key]
+	if lec == nil || !lec.HasBook() {
+		st.mu.Unlock()
+		return world.ItemStack{}, nil, nil, false
+	}
+	takenBook := lec.Book
+	var takenWritable *WritableBookContent
+	if lec.Writable != nil {
+		cp := lec.Writable.Clone()
+		takenWritable = &cp
+	}
+	var takenWritten *WrittenBookContent
+	if lec.Written != nil {
+		cp := lec.Written.Clone()
+		takenWritten = &cp
+	}
+	delete(st.lecterns, key)
+	viewers := s.lecternViewersLocked(st, key)
+	for _, v := range viewers {
+		delete(st.openBy, v.session)
+	}
+	st.mu.Unlock()
+
+	if session != nil {
+		s.giveBookToPlayer(session, takenBook, takenWritable, takenWritten)
+	} else {
+		_, _ = s.SpawnBookItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+1.0, float64(z)+0.5, takenBook, takenWritable, takenWritten)
+	}
+
+	s.applyLecternBlockStateAndNotify(normDim, x, y, z, false, false)
+	s.BroadcastLecternBlockEntityData(normDim, x, y, z, nil)
+	s.EmitVibration(VibrationEvent{
+		Dimension: normDim,
+		Type:      GameEventBlockChange,
+		X:         float64(x) + 0.5,
+		Y:         float64(y) + 0.5,
+		Z:         float64(z) + 0.5,
+		Player:    session,
+	})
+
+	for _, v := range viewers {
+		if v.session != nil && v.session.send != nil {
+			w := protocol.NewWriter(4)
+			w.VarInt(v.containerID)
+			_ = v.session.send(protocol.PlayContainerClose, w.Bytes())
+		}
+	}
+	return takenBook, takenWritable, takenWritten, true
 }
 
 type lecternViewerEntry struct {
@@ -630,12 +931,27 @@ func (s *Server) broadcastLecternPageToViewers(viewers []lecternViewerEntry, pag
 	}
 	cx := int32(key.x >> 4)
 	cz := int32(key.z >> 4)
-	s.BroadcastChunk(cx, cz, PlaySoundPacketID,
+	s.BroadcastDimensionChunk(key.dim, cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket("minecraft:item.book.page_turn", SoundSourceBlocks, float64(key.x)+0.5, float64(key.y)+0.5, float64(key.z)+0.5, 1.0, 1.0, 0))
 }
 
 func (s *Server) giveBookToPlayer(session *PlayerSession, book world.ItemStack, writable *WritableBookContent, written *WrittenBookContent) {
 	if session == nil || book.IsEmpty() {
+		return
+	}
+	heldSlot := int(world.HotbarContainerOffset + session.Snapshot().SelectedSlot)
+	if session.InventorySlot(heldSlot).IsEmpty() {
+		session.SetInventorySlot(heldSlot, book)
+		if writable != nil {
+			SetSlotWritableBook(session, heldSlot, *writable)
+		}
+		if written != nil {
+			SetSlotWrittenBook(session, heldSlot, *written)
+		}
+		if session.send != nil {
+			stateID := session.NextContainerStateID()
+			_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithBook(0, stateID, heldSlot, book, writable, written))
+		}
 		return
 	}
 	inv := session.Inventory()
@@ -666,7 +982,7 @@ func (s *Server) giveBookToPlayer(session *PlayerSession, book world.ItemStack, 
 		return
 	}
 	snap := session.Snapshot()
-	_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.25, snap.Z, book)
+	_, _ = s.SpawnBookItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.25, snap.Z, book, writable, written)
 }
 
 // RemoveLecternAt removes any stored LecternBlockEntity at (dimension, x, y, z)
@@ -675,7 +991,8 @@ func (s *Server) RemoveLecternAt(dimension string, x, y, z int) (world.ItemStack
 	if s == nil {
 		return world.ItemStack{}, nil, nil, false
 	}
-	key := blockPosDimKey{dim: world.NormalizeDimension(dimension), x: x, y: y, z: z}
+	normDim := world.NormalizeDimension(dimension)
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
 	st := s.lecternStore()
 	st.mu.Lock()
 	lec, exists := st.lecterns[key]
@@ -689,6 +1006,8 @@ func (s *Server) RemoveLecternAt(dimension string, x, y, z int) (world.ItemStack
 		delete(st.openBy, v.session)
 	}
 	st.mu.Unlock()
+
+	s.applyLecternBlockStateAndNotify(normDim, x, y, z, false, false)
 
 	for _, v := range viewers {
 		if v.session != nil && v.session.send != nil {
