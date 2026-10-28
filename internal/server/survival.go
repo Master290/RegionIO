@@ -1203,6 +1203,14 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 				s.TakeDroppedOminousBottleAmplifier(live.ID)
 			}
 		}
+		if potionType, ok := s.DroppedPotionEntityType(live.ID); ok && IsPotionOrTippedArrowItem(live.Item) {
+			for _, slot := range changedSlots {
+				SetSlotPotionType(session, slot, potionType)
+			}
+			if added >= live.Item.Count {
+				s.TakeDroppedPotionEntityType(live.ID)
+			}
+		}
 		hasBundleContents := false
 		if bundleItems, ok := s.DroppedBundleContents(live.ID); ok && len(bundleItems) > 0 {
 			hasBundleContents = true
@@ -1230,7 +1238,7 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 				for _, slot := range changedSlots {
 					stateID := session.NextContainerStateID()
 					slotStack := session.InventorySlot(slot)
-					_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, slotStack))
+					_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(0, stateID, slot, slotStack, GetSlotPotionType(session, slot)))
 				}
 			}
 		}
@@ -3837,6 +3845,7 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 	slotMapID, hasSlotMapID := GetSlotMapID(session, invSlot)
 	slotBundle := GetSlotBundleContents(session, invSlot)
 	slotMeta := GetSlotItemMeta(session, invSlot)
+	slotPotion := GetSlotPotionType(session, invSlot)
 	isOminousBottle := IsOminousBottleItem(cur)
 	slotOminousAmp := GetSlotOminousBottleAmplifier(session, invSlot)
 	s.StopUsingSpyglass(session)
@@ -3859,7 +3868,7 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 	}
 
 	if session.send != nil {
-		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), invSlot, session.InventorySlot(invSlot)))
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(0, session.NextContainerStateID(), invSlot, session.InventorySlot(invSlot), GetSlotPotionType(session, invSlot)))
 	}
 	s.TriggerInventoryChanged(session)
 
@@ -3891,6 +3900,9 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		}
 		if isOminousBottle {
 			s.AssociateDroppedOminousBottleAmplifier(entID, slotOminousAmp)
+		}
+		if slotPotion != "" && IsPotionOrTippedArrowItem(dropped) {
+			s.AssociateDroppedPotionEntity(entID, slotPotion)
 		}
 	}
 	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)

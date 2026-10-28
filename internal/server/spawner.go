@@ -46,6 +46,7 @@ func (s *Server) StartSpawning(ctx context.Context, log *slog.Logger) {
 	_ = s.LoadBannersFile()
 	_ = s.LoadDragonFightFile()
 	_ = s.LoadRaids()
+	_ = s.LoadBrewingStands()
 	go s.entityTickLoop(ctx, log)
 	go s.mobSpawnLoop(ctx)
 }
@@ -59,6 +60,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 		select {
 		case <-ctx.Done():
 			_ = s.SaveFurnaces()
+			_ = s.SaveBrewingStands()
 			_ = s.SaveDecorationsFile()
 			_ = s.SaveAllMaps()
 			_ = s.SaveScoreboardFile()
@@ -76,6 +78,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 					if err := s.SaveWorldTime(); err != nil && log != nil {
 						log.Warn("saving world clock", "err", err)
 					}
+					_ = s.SaveBrewingStands()
 					_ = s.SaveDecorationsFile()
 					_ = s.SaveAllMaps()
 					_ = s.SaveScoreboardFile()
@@ -89,6 +92,8 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			s.TickWeather(rng)
 			s.TrySkipNightBySleep()
 			s.TickAllPlayersHunger()
+			s.TickBrewingStands()
+			s.TickLingeringClouds()
 			s.TickVillagers()
 			s.TickRaids()
 			s.TickMaps()

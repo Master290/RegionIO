@@ -617,6 +617,7 @@ func (h *handler) serverTickLoop() {
 				h.srv.DespawnHostileMobs()
 			}
 			h.srv.TickBrewingStands()
+			h.srv.TickLingeringClouds()
 			h.srv.TickHoppers()
 			h.srv.TickCrafters()
 			h.srv.TickCampfires()

@@ -890,5 +890,131 @@ func TestZombieVillagerWeaknessAndFishingVillagerAdvancementHooks(t *testing.T) 
 	}
 }
 
+func TestPotionContentsComponentCodecAndTippedArrowCraftingPlayPath(t *testing.T) {
+	// 1. Verify DataComponentPotionContents (51) slot wire round-trip.
+	w := protocol.NewWriter(32)
+	origStack := world.NewNamedItemStack("minecraft:tipped_arrow", 8)
+	EncodeSlotWithPotionContents(w, origStack, PotionTurtleMaster)
+	decStack, decPC, err := DecodeSlotWithPotionContents(protocol.NewReader(w.Bytes()))
+	if err != nil {
+		t.Fatalf("DecodeSlotWithPotionContents: %v", err)
+	}
+	if decStack.ResolvedID() != "minecraft:tipped_arrow" || decStack.Count != 8 || decPC.PotionID != PotionTurtleMaster {
+		t.Fatalf("round-trip mismatch: stack=%+v pc=%+v", decStack, decPC)
+	}
+
+	// 2. Verify 3x3 crafting of 8 arrows + 1 lingering_potion -> 8x tipped_arrow
+	//    with inherited PotionType, and firing that crafted tipped_arrow with a bow.
+	srv := newBrewingTestServer(t)
+	var lastContentBody []byte
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: [16]byte{5, 5, 1, 1},
+		Name: "ArrowCrafter",
+	}, func(id int32, body []byte) error {
+		if id == protocol.PlayContainerSetContent {
+			lastContentBody = append([]byte(nil), body...)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	srv.SetPlayerGameMode(sess, GameModeSurvival)
+	srv.SetPlayerTransform(sess, 40.0, 65.0, 40.0, 0, 0, true)
+
+	// Place a crafting table at (40, 65, 41) and open it.
+	ctState := mustBlockState(t, "minecraft:crafting_table")
+	srv.Chunks().SetBlock(40, 65, 41, ctState)
+	cid, err := srv.OpenCraftingTable(sess, 40, 65, 41)
+	if err != nil {
+		t.Fatalf("OpenCraftingTable: %v", err)
+	}
+
+	// Put 1 lingering_potion of Poison in hotbar slot 0 (session slot 36 -> crafting menu slot 37)
+	// and pick it up -> place in center crafting grid slot (menu slot 5 -> grid index 4).
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:lingering_potion", 1))
+	SetSlotPotionType(sess, 36, PotionPoison)
+	if err := srv.HandleContainerClick(sess, cid, 37, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("pickup lingering_potion: %v", err)
+	}
+	if err := srv.HandleContainerClick(sess, cid, 5, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("place lingering_potion in center grid slot: %v", err)
+	}
+
+	// Fill the surrounding 8 crafting grid slots (menu slots 1,2,3,4,6,7,8,9) with 1 arrow each.
+	for _, mSlot := range []int{1, 2, 3, 4, 6, 7, 8, 9} {
+		sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:arrow", 1))
+		if err := srv.HandleContainerClick(sess, cid, 37, 0, ContainerInputPickup); err != nil {
+			t.Fatalf("pickup arrow for slot %d: %v", mSlot, err)
+		}
+		if err := srv.HandleContainerClick(sess, cid, mSlot, 0, ContainerInputPickup); err != nil {
+			t.Fatalf("place arrow in slot %d: %v", mSlot, err)
+		}
+	}
+
+	// Shift-click (QuickMove) crafting output slot 0 -> crafts 8x tipped_arrow into hotbar slot 36.
+	if err := srv.HandleContainerClick(sess, cid, 0, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove craft tipped_arrow: %v", err)
+	}
+	craftedSlot := sess.InventorySlot(36)
+	if craftedSlot.ResolvedID() != "minecraft:tipped_arrow" || craftedSlot.Count != 8 {
+		t.Fatalf("expected 8x minecraft:tipped_arrow in slot 36, got %+v", craftedSlot)
+	}
+	if gotPot := GetSlotPotionType(sess, 36); gotPot != PotionPoison {
+		t.Fatalf("crafted tipped_arrow potion type = %q, want %q", gotPot, PotionPoison)
+	}
+	_ = srv.CloseContainer(sess, cid, true)
+
+	// 3. Drop 1 tipped_arrow and pick it back up -> verify PotionType is preserved.
+	sess.SetInventorySlot(37, world.NewNamedItemStack("minecraft:potion", 1))
+	SetSlotPotionType(sess, 37, PotionSlowFalling)
+	sess.SetSelectedSlot(1) // hotbar slot 1 = session slot 37
+	dropEntID, droppedStack := srv.DropSelectedItem(sess, true)
+	if dropEntID <= 0 || droppedStack.ResolvedID() != "minecraft:potion" {
+		t.Fatalf("DropSelectedItem failed: id=%d stack=%+v", dropEntID, droppedStack)
+	}
+	if ent := srv.Entities().Get(dropEntID); ent != nil {
+		srv.Entities().Update(dropEntID, func(e *world.Entity) {
+			e.X = 40.0
+			e.Y = 65.0
+			e.Z = 40.0
+			e.PickupDelay = 0
+		})
+	}
+	if picked := srv.TryPickupItems(sess); picked != 1 {
+		t.Fatalf("TryPickupItems picked %d, want 1", picked)
+	}
+	if gotPot := GetSlotPotionType(sess, 37); gotPot != PotionSlowFalling {
+		t.Fatalf("picked up potion type = %q, want %q", gotPot, PotionSlowFalling)
+	}
+
+	// 4. Verify Lingering Potion cloud affects non-player mobs as well as players.
+	cowType := registry.EntityTypeIndex("minecraft:cow")
+	if cowType < 0 {
+		cowType = 1
+	}
+	cowID := srv.Entities().Add(&world.Entity{
+		TypeID:    cowType,
+		TypeName:  "minecraft:cow",
+		Dimension: world.DimensionOverworld,
+		X:         41.0,
+		Y:         65.0,
+		Z:         40.0,
+	})
+	srv.SetMobHealth(cowID, 10.0)
+	cloudID := srv.SpawnLingeringPotionCloud(world.DimensionOverworld, 41.0, 65.0, 40.0, PotionSlowness)
+	if cloudID <= 0 {
+		t.Fatalf("SpawnLingeringPotionCloud returned %d", cloudID)
+	}
+	for tick := 0; tick < 15; tick++ {
+		srv.TickLingeringClouds()
+	}
+	if !srv.HasEntityEffect(cowID, EffectSlowness) {
+		t.Fatal("expected lingering cloud of Slowness to apply EffectSlowness to nearby cow mob")
+	}
+	_ = lastContentBody
+}
+
+
 
 

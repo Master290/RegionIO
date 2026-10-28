@@ -66,6 +66,7 @@ type OpenContainerState struct {
 	VehicleEntityID int32
 	Crafting        [CraftingGridSlotCount]world.ItemStack
 	CraftingStars   [CraftingGridSlotCount]FireworkExplosion
+	CraftingPotions [CraftingGridSlotCount]string
 	Result          world.ItemStack
 	EnchantSlots    [2]world.ItemStack
 	CombinerInputs  [2]world.ItemStack
@@ -744,7 +745,10 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		closedX, closedY, closedZ = tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		for i := range tr.open.Crafting {
 			if !tr.open.Crafting[i].IsEmpty() {
-				returnItems = append(returnItems, returnEntry{stack: tr.open.Crafting[i]})
+				returnItems = append(returnItems, returnEntry{
+					stack:  tr.open.Crafting[i],
+					potion: tr.open.CraftingPotions[i],
+				})
 			}
 		}
 		metaTr := getItemMetaTracker(session)
@@ -836,6 +840,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			carriedMapID, hasCarriedMap := GetCarriedMapID(session)
 			carriedHorn := GetCarriedGoatHornInstrument(session)
 			carriedBundle := GetCarriedBundleContents(session)
+			carriedPotion := GetCarriedPotionType(session)
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
@@ -862,6 +867,9 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 				}
 				if len(carriedBundle) > 0 && IsBundleItem(dropStack.ResolvedID()) {
 					s.AssociateDroppedBundleEntity(entID, carriedBundle)
+				}
+				if carriedPotion != "" && IsPotionOrTippedArrowItem(dropStack) {
+					s.AssociateDroppedPotionEntity(entID, carriedPotion)
 				}
 			}
 			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
@@ -985,7 +993,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		return s.syncOpenContainer(session)
 	case MenuTypeBrewingStand:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
-		s.applyBrewingStandContainerClickLocked(session, tr, bx, by, bz, slot, button, mode)
+		s.applyBrewingStandClickLocked(session, tr, bx, by, bz, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
@@ -1361,6 +1369,9 @@ func matchCraftingWithFireworks(
 		if potOut, _, matched := MatchDecoratedPotRecipe(grid); matched {
 			return potOut, nil, nil, true
 		}
+		if tippedOut, _, matched := MatchTippedArrowRecipe(grid[:9], ""); matched {
+			return tippedOut, nil, nil, true
+		}
 	}
 	if res, _, ok := MatchCraftingGrid(grid, width, height); ok {
 		return res, nil, nil, true
@@ -1386,25 +1397,62 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 	}
 	slots := s.buildCraftingMenuSlots(session, tr.open.Crafting, tr.open.Result)
 	gridStars := make([]FireworkExplosion, CraftingGridSlotCount)
+	var slotPotions [CraftingMenuSlotCount]string
 	for i := 0; i < CraftingGridSlotCount; i++ {
 		if len(tr.open.CraftingStars[i].Colors) > 0 || len(tr.open.CraftingStars[i].FadeColors) > 0 {
 			gridStars[i] = tr.open.CraftingStars[i].Clone()
 		} else if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
 			gridStars[i] = exp
 		}
+		if tr.open.CraftingPotions[i] != "" {
+			slotPotions[1+i] = tr.open.CraftingPotions[i]
+		} else if IsPotionOrTippedArrowItem(slots[1+i]) {
+			slotPotions[1+i] = GetSlotPotionType(session, 1+i)
+		}
 	}
+	for i := 0; i < 27; i++ {
+		slotPotions[10+i] = GetSlotPotionType(session, 9+i)
+	}
+	for i := 0; i < 9; i++ {
+		slotPotions[37+i] = GetSlotPotionType(session, 36+i)
+	}
+	carriedPotion := GetCarriedPotionType(session)
 
 	if slot == 0 {
 		// Crafting output slot.
 		_, matchedRec, _ := MatchCraftingGrid(slots[1:10], 3, 3)
+		_, tippedPotion, isTippedArrow := MatchTippedArrowRecipe(slots[1:10], slotPotions[1+4])
+		if isTippedArrow && mode == ContainerInputPickup && !tr.carried.IsEmpty() {
+			if tr.carried.ResolvedID() == "minecraft:tipped_arrow" && carriedPotion != "" && carriedPotion != tippedPotion {
+				return
+			}
+		}
+		var prevInvCounts [CraftingMenuSlotCount]int32
+		for idx := 10; idx < 46; idx++ {
+			prevInvCounts[idx] = slots[idx].Count
+		}
 		if crafted := s.clickCraftingOutput(session, slots, 1, 9, 3, 3, 10, 46, gridStars, func(menuSlot int) int {
 			return menuSlot - 1
 		}, &tr.carried, mode); !crafted.IsEmpty() {
+			if isTippedArrow {
+				switch mode {
+				case ContainerInputPickup:
+					carriedPotion = tippedPotion
+				case ContainerInputQuickMove:
+					for idx := 10; idx < 46; idx++ {
+						if slots[idx].Count > prevInvCounts[idx] {
+							slotPotions[idx] = tippedPotion
+						}
+					}
+				}
+			}
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 			recName := ""
 			if matchedRec != nil {
 				recName = matchedRec.Name
+			} else if isTippedArrow {
+				recName = "minecraft:tipped_arrow"
 			}
 			s.UnlockRecipeOnCraft(session, recName, crafted)
 		}
@@ -1413,6 +1461,8 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 		case ContainerInputPickup:
 			prevSlotEmpty := slots[slot].IsEmpty()
 			prevCarriedEmpty := tr.carried.IsEmpty()
+			prevSlotID := slots[slot].ResolvedItemID()
+			prevCarriedID := tr.carried.ResolvedItemID()
 			var slotStar *FireworkExplosion
 			var slotFW *FireworksComponent
 			if slot >= 1 && slot <= 9 {
@@ -1439,6 +1489,22 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 			}
 
 			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+
+			if prevSlotEmpty && !slots[slot].IsEmpty() {
+				slotPotions[slot] = carriedPotion
+				if tr.carried.IsEmpty() {
+					carriedPotion = ""
+				}
+			} else if prevCarriedEmpty && !tr.carried.IsEmpty() {
+				carriedPotion = slotPotions[slot]
+				if slots[slot].IsEmpty() {
+					slotPotions[slot] = ""
+				}
+			} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() && prevSlotID != prevCarriedID {
+				slotPotions[slot], carriedPotion = carriedPotion, slotPotions[slot]
+			} else if tr.carried.IsEmpty() {
+				carriedPotion = ""
+			}
 
 			var newSlotStar *FireworkExplosion
 			var newSlotFW *FireworksComponent
@@ -1487,6 +1553,12 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 			setCarriedFireworks(session, newCFW)
 
 		case ContainerInputQuickMove:
+			movedPotion := slotPotions[slot]
+			wasPotionItem := IsPotionOrTippedArrowItem(slots[slot])
+			var prevCounts [CraftingMenuSlotCount]int32
+			for idx := 0; idx < CraftingMenuSlotCount; idx++ {
+				prevCounts[idx] = slots[idx].Count
+			}
 			if slot >= 1 && slot <= 9 {
 				// Crafting grid -> player inventory
 				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 37, 46)
@@ -1498,14 +1570,26 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 				// Hotbar -> main inventory
 				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 10, 37)
 			}
+			if wasPotionItem {
+				for idx := 1; idx < CraftingMenuSlotCount; idx++ {
+					if idx != slot && slots[idx].Count > prevCounts[idx] {
+						slotPotions[idx] = movedPotion
+					}
+				}
+				if slots[slot].IsEmpty() {
+					slotPotions[slot] = ""
+				}
+			}
 		case ContainerInputSwap:
 			if button >= 0 && button < 9 {
 				hotbarIdx := 37 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+				slotPotions[slot], slotPotions[hotbarIdx] = slotPotions[hotbarIdx], slotPotions[slot]
 			}
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+				carriedPotion = slotPotions[slot]
 			}
 		case ContainerInputThrow:
 			if !slots[slot].IsEmpty() {
@@ -1514,14 +1598,19 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 					dropCount = slots[slot].Count
 				}
 				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+				droppedPotion := slotPotions[slot]
 				rem := slots[slot].Count - dropCount
 				if rem <= 0 {
 					slots[slot] = world.ItemStack{}
+					slotPotions[slot] = ""
 				} else {
 					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 				}
 				snap := session.Snapshot()
-				s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
+				entID, _ := s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
+				if entID > 0 && IsPotionOrTippedArrowItem(dropStack) && droppedPotion != "" {
+					s.AssociateDroppedPotionEntity(entID, droppedPotion)
+				}
 				s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 			}
 		case ContainerInputPickupAll:
@@ -1532,6 +1621,11 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 	// Write back crafting grid (1..9), recompute result (0), and write back player inventory (10..45).
 	for i := 0; i < CraftingGridSlotCount; i++ {
 		tr.open.Crafting[i] = slots[1+i]
+		if tr.open.Crafting[i].IsEmpty() || !IsPotionOrTippedArrowItem(tr.open.Crafting[i]) {
+			tr.open.CraftingPotions[i] = ""
+		} else {
+			tr.open.CraftingPotions[i] = slotPotions[1+i]
+		}
 		if tr.open.Crafting[i].IsEmpty() {
 			tr.open.CraftingStars[i] = FireworkExplosion{}
 		} else if len(tr.open.CraftingStars[i].Colors) == 0 && len(tr.open.CraftingStars[i].FadeColors) == 0 {
@@ -1559,10 +1653,13 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 	}
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[10+i])
+		SetSlotPotionType(session, 9+i, slotPotions[10+i])
 	}
 	for i := 0; i < 9; i++ {
 		session.SetInventorySlot(36+i, slots[37+i])
+		SetSlotPotionType(session, 36+i, slotPotions[37+i])
 	}
+	SetCarriedPotionType(session, carriedPotion)
 }
 
 func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) {
@@ -2317,8 +2414,7 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	case MenuTypeGrindstone:
 		slots = s.buildCombinerMenuSlots(session, openCopy.CombinerInputs, openCopy.Result)
 	case MenuTypeBrewingStand:
-		slots = s.buildBrewingStandMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
-		isBrewingStand = true
+		return s.syncOpenBrewingStand(session)
 	case MenuTypeLoom:
 		slots = s.buildLoomMenuSlots(
 			session,
@@ -2349,6 +2445,9 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	stateID := session.NextContainerStateID()
 	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried)); err != nil {
 		return err
+	}
+	if openCopy.MenuType == MenuTypeCrafting && !openCopy.Result.IsEmpty() && IsPotionOrTippedArrowItem(openCopy.Result) {
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(openCopy.ContainerID, session.NextContainerStateID(), 0, openCopy.Result, openCopy.CraftingPotions[4]))
 	}
 	if openCopy.MenuType == MenuTypeGeneric9x3 && openCopy.VehicleEntityID == 0 {
 		s.syncChestMapSlots(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
@@ -2414,6 +2513,10 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 				continue
 			}
 		}
+		if IsPotionOrTippedArrowItem(st) {
+			EncodeSlotWithPotionContents(w, st, GetSlotPotionType(session, i))
+			continue
+		}
 		switch st.ResolvedID() {
 		case FireworkRocketItemID:
 			if fw, ok := GetSlotFireworks(session, i); ok {
@@ -2454,6 +2557,10 @@ func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
 			EncodeSlotWithBundleContents(w, carried, items)
 			encodedCarried = true
 		}
+	}
+	if !encodedCarried && IsPotionOrTippedArrowItem(carried) {
+		EncodeSlotWithPotionContents(w, carried, GetCarriedPotionType(session))
+		encodedCarried = true
 	}
 	if !encodedCarried {
 		switch carried.ResolvedID() {

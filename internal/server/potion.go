@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -25,6 +26,10 @@ const (
 	// DefaultPotionWaterColorRGB is the default water bottle RGB color (0x385DC6 = -13083194).
 	DefaultPotionWaterColorRGB int32 = 0x385DC6
 
+	// DataComponentPotionContents is the BuiltInRegistries.DATA_COMPONENT_TYPE index
+	// for "minecraft:potion_contents" in Minecraft 26.1.2 (protocol 775).
+	DataComponentPotionContents int32 = 51
+
 	// Vanilla LevelEvent IDs for splash/lingering potion impact particles + glass break sound.
 	LevelEventParticlesSpellPotionBreak   int32 = 2002
 	LevelEventParticlesInstantPotionBreak int32 = 2007
@@ -33,6 +38,7 @@ const (
 	SoundSplashPotionBreak    = "minecraft:entity.splash_potion.break"
 	SoundSplashPotionThrow    = "minecraft:entity.splash_potion.throw"
 	SoundLingeringPotionThrow = "minecraft:entity.lingering_potion.throw"
+	SoundGenericDrink         = "minecraft:entity.generic.drink"
 )
 
 // Canonical vanilla 26.1.2 potion identifiers (BuiltInRegistries.POTION).
@@ -144,6 +150,11 @@ func (r *PotionRegistry) ByIndex(index int32) (*PotionDef, bool) {
 // PotionByID looks up a potion in DefaultPotionRegistry by ID.
 func PotionByID(id string) (*PotionDef, bool) {
 	return DefaultPotionRegistry().ByID(id)
+}
+
+// PotionByIndex looks up a potion in DefaultPotionRegistry by 0-based registry index.
+func PotionByIndex(index int32) (*PotionDef, bool) {
+	return DefaultPotionRegistry().ByIndex(index)
 }
 
 // PotionEffects returns a copy of the status effects granted by potionID.
@@ -334,6 +345,344 @@ func IsMilkBucketItem(stack world.ItemStack) bool {
 	return !stack.IsEmpty() && stack.ResolvedID() == "minecraft:milk_bucket"
 }
 
+// IsPotionOrTippedArrowItem reports whether stack carries a `minecraft:potion_contents`
+// component (`minecraft:potion`, `minecraft:splash_potion`, `minecraft:lingering_potion`,
+// or `minecraft:tipped_arrow`).
+func IsPotionOrTippedArrowItem(stack world.ItemStack) bool {
+	if stack.IsEmpty() {
+		return false
+	}
+	switch stack.ResolvedID() {
+	case "minecraft:potion", "minecraft:splash_potion", "minecraft:lingering_potion", "minecraft:tipped_arrow":
+		return true
+	default:
+		return false
+	}
+}
+
+// PotionContentsComponent represents the protocol 775 `minecraft:potion_contents`
+// (DataComponentPotionContents = 51) data component payload.
+type PotionContentsComponent struct {
+	PotionID      string
+	HasColor      bool
+	CustomColor   int32
+	CustomEffects []StatusEffectInstance
+	CustomName    string
+}
+
+// EncodePotionContentsComponent writes the protocol 775 `PotionContents.STREAM_CODEC`
+// payload for DataComponentPotionContents (51):
+//   - Bool(hasPotion) + [if true: VarInt(potionRegistryIndex)]
+//   - Bool(hasCustomColor) + [if true: Int32(customColor)]
+//   - VarInt(len(customEffects)) + MobEffectInstance[len]
+//   - Bool(hasCustomName) + [if true: String(customName)]
+func EncodePotionContentsComponent(w *protocol.Writer, pc PotionContentsComponent) {
+	potID := strings.TrimSpace(pc.PotionID)
+	if potID != "" {
+		if def, ok := PotionByID(potID); ok {
+			w.Bool(true)
+			w.VarInt(def.RegistryIndex)
+		} else {
+			w.Bool(true)
+			w.VarInt(0) // fallback to water (index 0)
+		}
+	} else {
+		w.Bool(false)
+	}
+	if pc.HasColor {
+		w.Bool(true)
+		w.Int32(pc.CustomColor)
+	} else {
+		w.Bool(false)
+	}
+	w.VarInt(int32(len(pc.CustomEffects)))
+	for _, eff := range pc.CustomEffects {
+		effIdx := int32(0)
+		if def, ok := MobEffectByID(eff.ID); ok {
+			effIdx = def.RegistryIndex
+		}
+		w.VarInt(effIdx)
+		w.VarInt(eff.Amplifier)
+		w.VarInt(eff.Duration)
+		w.Bool(eff.Ambient)
+		w.Bool(eff.ShowParticles)
+		w.Bool(eff.ShowIcon)
+		w.Bool(false) // no hiddenEffect
+	}
+	if pc.CustomName != "" {
+		w.Bool(true)
+		w.String(pc.CustomName)
+	} else {
+		w.Bool(false)
+	}
+}
+
+// DecodePotionContentsComponent reads the protocol 775 `PotionContents.STREAM_CODEC`
+// payload for DataComponentPotionContents (51).
+func DecodePotionContentsComponent(r *protocol.Reader) (PotionContentsComponent, error) {
+	var pc PotionContentsComponent
+	hasPotion, err := r.Bool()
+	if err != nil {
+		return pc, err
+	}
+	if hasPotion {
+		regIdx, err := r.VarInt()
+		if err != nil {
+			return pc, err
+		}
+		if def, ok := PotionByIndex(regIdx); ok {
+			pc.PotionID = def.ID
+		} else {
+			pc.PotionID = PotionWater
+		}
+	}
+	hasColor, err := r.Bool()
+	if err != nil {
+		return pc, err
+	}
+	if hasColor {
+		col, err := r.Int32()
+		if err != nil {
+			return pc, err
+		}
+		pc.HasColor = true
+		pc.CustomColor = col
+	}
+	effCount, err := r.VarInt()
+	if err != nil {
+		return pc, err
+	}
+	if effCount < 0 || effCount > 64 {
+		return pc, fmt.Errorf("server: invalid potion custom effect count %d", effCount)
+	}
+	for i := int32(0); i < effCount; i++ {
+		effIdx, err := r.VarInt()
+		if err != nil {
+			return pc, err
+		}
+		amp, err := r.VarInt()
+		if err != nil {
+			return pc, err
+		}
+		dur, err := r.VarInt()
+		if err != nil {
+			return pc, err
+		}
+		ambient, err := r.Bool()
+		if err != nil {
+			return pc, err
+		}
+		showPart, err := r.Bool()
+		if err != nil {
+			return pc, err
+		}
+		showIcon, err := r.Bool()
+		if err != nil {
+			return pc, err
+		}
+		hasHidden, err := r.Bool()
+		if err != nil {
+			return pc, err
+		}
+		if hasHidden {
+			return pc, fmt.Errorf("server: nested hiddenEffect not supported in DecodePotionContentsComponent")
+		}
+		effID := EffectSpeed
+		if def, ok := MobEffectByIndex(effIdx); ok {
+			effID = def.ID
+		}
+		pc.CustomEffects = append(pc.CustomEffects, StatusEffectInstance{
+			ID:            effID,
+			Amplifier:     amp,
+			Duration:      dur,
+			Ambient:       ambient,
+			ShowParticles: showPart,
+			ShowIcon:      showIcon,
+		})
+	}
+	hasName, err := r.Bool()
+	if err != nil {
+		return pc, err
+	}
+	if hasName {
+		name, err := r.String()
+		if err != nil {
+			return pc, err
+		}
+		pc.CustomName = name
+	}
+	return pc, nil
+}
+
+// EncodeSlotWithPotionContents writes a protocol 775 ItemStack carrying a
+// `minecraft:potion_contents` (DataComponentPotionContents = 51) component.
+func EncodeSlotWithPotionContents(w *protocol.Writer, stack world.ItemStack, potionID string) {
+	if stack.IsEmpty() {
+		w.VarInt(0)
+		return
+	}
+	itemID := stack.ResolvedItemID()
+	if itemID <= 0 {
+		w.VarInt(0)
+		return
+	}
+	pot := canonicalPotionID(potionID)
+	if pot == "" {
+		pot = PotionWater
+	}
+	w.VarInt(stack.Count)
+	w.VarInt(itemID)
+	w.VarInt(1) // 1 added component
+	w.VarInt(0) // 0 removed components
+	w.VarInt(DataComponentPotionContents)
+	EncodePotionContentsComponent(w, PotionContentsComponent{PotionID: pot})
+}
+
+// DecodeSlotWithPotionContents reads a protocol 775 ItemStack carrying a
+// `minecraft:potion_contents` (51) component.
+func DecodeSlotWithPotionContents(r *protocol.Reader) (world.ItemStack, PotionContentsComponent, error) {
+	count, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, PotionContentsComponent{}, err
+	}
+	if count <= 0 {
+		return world.ItemStack{}, PotionContentsComponent{}, nil
+	}
+	itemID, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, PotionContentsComponent{}, err
+	}
+	added, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, PotionContentsComponent{}, err
+	}
+	removed, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, PotionContentsComponent{}, err
+	}
+	var pc PotionContentsComponent
+	for i := int32(0); i < added; i++ {
+		compType, err := r.VarInt()
+		if err != nil {
+			return world.ItemStack{}, PotionContentsComponent{}, err
+		}
+		if compType != DataComponentPotionContents {
+			return world.ItemStack{}, PotionContentsComponent{}, fmt.Errorf("server: unexpected component %d in DecodeSlotWithPotionContents", compType)
+		}
+		pc, err = DecodePotionContentsComponent(r)
+		if err != nil {
+			return world.ItemStack{}, PotionContentsComponent{}, err
+		}
+	}
+	for i := int32(0); i < removed; i++ {
+		if _, err := r.VarInt(); err != nil {
+			return world.ItemStack{}, PotionContentsComponent{}, err
+		}
+	}
+	return world.NewItemStack(itemID, count), pc, nil
+}
+
+func encodeContainerSetSlotWithPotion(containerID, stateID int32, slot int, stack world.ItemStack, potionID string) []byte {
+	w := protocol.NewWriter(32)
+	w.VarInt(containerID)
+	w.VarInt(stateID)
+	w.Uint16(uint16(int16(slot)))
+	if IsPotionOrTippedArrowItem(stack) {
+		EncodeSlotWithPotionContents(w, stack, potionID)
+	} else {
+		writeContainerItemStack(w, stack)
+	}
+	return w.Bytes()
+}
+
+// MatchTippedArrowRecipe implements vanilla 26.1.2 TippedArrowRecipe:
+//   - 3x3 crafting grid (len(grid) == 9)
+//   - Slots 0, 1, 2, 3, 5, 6, 7, 8 must each contain minecraft:arrow
+//   - Center slot 4 must contain minecraft:lingering_potion
+//   - Produces 8x minecraft:tipped_arrow inheriting the lingering potion's PotionType.
+func MatchTippedArrowRecipe(grid []world.ItemStack, centerPotionType string) (world.ItemStack, string, bool) {
+	if len(grid) != 9 {
+		return world.ItemStack{}, "", false
+	}
+	if grid[4].IsEmpty() || grid[4].ResolvedID() != "minecraft:lingering_potion" {
+		return world.ItemStack{}, "", false
+	}
+	for i := 0; i < 9; i++ {
+		if i == 4 {
+			continue
+		}
+		if grid[i].IsEmpty() || grid[i].ResolvedID() != "minecraft:arrow" {
+			return world.ItemStack{}, "", false
+		}
+	}
+	pot := canonicalPotionID(centerPotionType)
+	if pot == "" {
+		pot = PotionWater
+	}
+	return world.NewNamedItemStack("minecraft:tipped_arrow", 8), pot, true
+}
+
+type serverDroppedPotionTracker struct {
+	mu      sync.Mutex
+	potions map[int32]string
+}
+
+var serverDroppedPotions sync.Map // map[*Server]*serverDroppedPotionTracker
+
+func (s *Server) droppedPotionTracker() *serverDroppedPotionTracker {
+	if s == nil {
+		return nil
+	}
+	if v, ok := serverDroppedPotions.Load(s); ok {
+		return v.(*serverDroppedPotionTracker)
+	}
+	actual, _ := serverDroppedPotions.LoadOrStore(s, &serverDroppedPotionTracker{
+		potions: make(map[int32]string),
+	})
+	return actual.(*serverDroppedPotionTracker)
+}
+
+// AssociateDroppedPotionEntity records the canonical potion ID (e.g. "minecraft:poison")
+// for a spawned potion or tipped_arrow item entity so picking it up restores its PotionType.
+func (s *Server) AssociateDroppedPotionEntity(itemEntityID int32, potionID string) {
+	if s == nil || itemEntityID <= 0 || potionID == "" {
+		return
+	}
+	tr := s.droppedPotionTracker()
+	tr.mu.Lock()
+	tr.potions[itemEntityID] = canonicalPotionID(potionID)
+	tr.mu.Unlock()
+}
+
+// DroppedPotionEntityType returns the canonical potion ID associated with a
+// dropped potion or tipped_arrow item entity, if any.
+func (s *Server) DroppedPotionEntityType(itemEntityID int32) (string, bool) {
+	if s == nil || itemEntityID <= 0 {
+		return "", false
+	}
+	tr := s.droppedPotionTracker()
+	tr.mu.Lock()
+	pot, ok := tr.potions[itemEntityID]
+	tr.mu.Unlock()
+	return pot, ok
+}
+
+// TakeDroppedPotionEntityType removes and returns the canonical potion ID
+// associated with a dropped potion or tipped_arrow item entity, if any.
+func (s *Server) TakeDroppedPotionEntityType(itemEntityID int32) (string, bool) {
+	if s == nil || itemEntityID <= 0 {
+		return "", false
+	}
+	tr := s.droppedPotionTracker()
+	tr.mu.Lock()
+	pot, ok := tr.potions[itemEntityID]
+	if ok {
+		delete(tr.potions, itemEntityID)
+	}
+	tr.mu.Unlock()
+	return pot, ok
+}
+
 type playerPotionMetaTracker struct {
 	mu          sync.Mutex
 	invPotions  [world.PlayerInventorySlots]string
@@ -354,14 +703,14 @@ func getPotionMetaTracker(session *PlayerSession) *playerPotionMetaTracker {
 }
 
 // GetSlotPotionType returns the canonical potion ID (e.g. "minecraft:healing")
-// stored on player inventory slot (0..45). For a potion item with no explicit
-// type set, it defaults to "minecraft:water".
+// stored on player inventory slot (0..45) for a potion or tipped_arrow item.
+// With no explicit type set, it defaults to "minecraft:water".
 func GetSlotPotionType(session *PlayerSession, slot int) string {
 	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
 		return ""
 	}
 	st := session.InventorySlot(slot)
-	if !IsPotionItem(st) {
+	if !IsPotionOrTippedArrowItem(st) {
 		return ""
 	}
 	tr := getPotionMetaTracker(session)
@@ -390,10 +739,10 @@ func SetSlotPotionType(session *PlayerSession, slot int, potionID string) {
 	tr.mu.Unlock()
 }
 
-// GetCarriedPotionType returns the canonical potion ID for the potion on the
-// player's cursor.
+// GetCarriedPotionType returns the canonical potion ID for the potion or
+// tipped_arrow on the player's cursor.
 func GetCarriedPotionType(session *PlayerSession) string {
-	if session == nil || !IsPotionItem(session.CarriedItem()) {
+	if session == nil || !IsPotionOrTippedArrowItem(session.CarriedItem()) {
 		return ""
 	}
 	tr := getPotionMetaTracker(session)
@@ -446,6 +795,12 @@ func (s *Server) DrinkPotion(session *PlayerSession, hand int32) bool {
 		s.ApplyPlayerEffect(session, eff)
 	}
 
+	snap := session.Snapshot()
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundGenericDrink, SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.5, 0.9, 0))
+
 	s.consumeBeverageContainer(session, slot, stack, "minecraft:glass_bottle")
 	s.TriggerConsumeItem(session, stack)
 	return true
@@ -482,6 +837,11 @@ func (s *Server) DrinkMilkBucket(session *PlayerSession, hand int32) (cleared in
 		return 0, false
 	}
 	cleared = s.ClearPlayerEffects(session)
+	snap := session.Snapshot()
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundGenericDrink, SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.5, 0.9, 0))
 	s.consumeBeverageContainer(session, slot, stack, "minecraft:bucket")
 	s.TriggerConsumeItem(session, stack)
 	return cleared, true
@@ -538,7 +898,7 @@ func (s *Server) consumeBeverageContainer(session *PlayerSession, slot int, stac
 		_ = session.send(protocol.PlayEntityEvent, EncodeEntityEventPacket(session.EntityID, EntityEventUseItemComplete))
 		stateID := session.NextContainerStateID()
 		updated := session.InventorySlot(slot)
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, updated))
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(0, stateID, slot, updated, GetSlotPotionType(session, slot)))
 	}
 }
 
@@ -559,6 +919,10 @@ func (s *Server) ThrowSplashPotion(session *PlayerSession, hand int32) bool {
 		potionID = PotionWater
 	}
 	snap := session.Snapshot()
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundSplashPotionThrow, SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.5, 0.4, 0))
 	s.consumeThrownPotionSlot(session, slot, stack)
 	s.ApplySplashPotionAt(snap.Dimension, snap.X, snap.Y, snap.Z, potionID, session.EntityID)
 	return true
@@ -752,7 +1116,8 @@ func (s *Server) consumeThrownPotionSlot(session *PlayerSession, slot int, stack
 	}
 	if session.send != nil {
 		stateID := session.NextContainerStateID()
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, session.InventorySlot(slot)))
+		updated := session.InventorySlot(slot)
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(0, stateID, slot, updated, GetSlotPotionType(session, slot)))
 	}
 }
 
@@ -826,6 +1191,10 @@ func (s *Server) ThrowLingeringPotion(session *PlayerSession, hand int32) (int32
 		potionID = PotionWater
 	}
 	snap := session.Snapshot()
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundLingeringPotionThrow, SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.5, 0.4, 0))
 	s.consumeThrownPotionSlot(session, slot, stack)
 	cloudID := s.SpawnLingeringPotionCloud(snap.Dimension, snap.X, snap.Y, snap.Z, potionID)
 	return cloudID, cloudID > 0
@@ -1012,6 +1381,62 @@ func (s *Server) TickLingeringClouds() int {
 				st.mu.Unlock()
 			}
 		}
+
+		// Also affect living non-player entities inside the lingering cloud.
+		if s.entities != nil {
+			cx := int32(int64(math.Floor(snapCloud.X)) >> 4)
+			cz := int32(int64(math.Floor(snapCloud.Z)) >> 4)
+			ents := s.entities.AppendInChunkRange(nil, cx, cz, 1)
+			for i := range ents {
+				ent := &ents[i]
+				if ent.EffectiveDimension() != snapCloud.Dimension || ent.IsItem() || ent.IsExperienceOrb() {
+					continue
+				}
+				if _, onCooldown := snapCloud.victimNextUse[ent.ID]; onCooldown {
+					continue
+				}
+				dx := ent.X - snapCloud.X
+				dz := ent.Z - snapCloud.Z
+				dy := ent.Y - snapCloud.Y
+				if dx*dx+dz*dz > radiusSq || dy < -1.0 || dy > 2.0 {
+					continue
+				}
+
+				victimHit := false
+				for _, eff := range snapCloud.Effects {
+					def, valid := MobEffectByID(eff.ID)
+					if !valid {
+						continue
+					}
+					if def.Instantaneous {
+						if s.ApplyEntityEffectScaled(ent.ID, eff, 0.5) {
+							victimHit = true
+						}
+					} else {
+						lingeringEff := eff.Clone()
+						lingeringEff.Duration = eff.Duration / 4
+						if lingeringEff.Duration > 0 && s.ApplyEntityEffectScaled(ent.ID, lingeringEff, 1.0) {
+							victimHit = true
+						}
+					}
+				}
+
+				if victimHit {
+					appliedCount++
+					st.mu.Lock()
+					if live, exists := st.clouds[id]; exists {
+						live.victimNextUse[ent.ID] = live.Age + LingeringCloudReapplyDelayTicks
+						if live.RadiusOnUse != 0 {
+							live.Radius += live.RadiusOnUse
+							if live.Radius < LingeringCloudMinRadius {
+								delete(st.clouds, id)
+							}
+						}
+					}
+					st.mu.Unlock()
+				}
+			}
+		}
 	}
 	return appliedCount
 }
@@ -1027,7 +1452,7 @@ func SavePotionMetaToPlayerCompound(session *PlayerSession, root *nbt.Compound) 
 	var elems []nbt.Tag
 	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
 		st := session.InventorySlot(slot)
-		if !IsPotionItem(st) {
+		if !IsPotionOrTippedArrowItem(st) {
 			continue
 		}
 		pType := GetSlotPotionType(session, slot)

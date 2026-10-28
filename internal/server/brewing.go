@@ -1213,9 +1213,12 @@ func (s *Server) DropBrewingStandContentsInDim(dim string, x, y, z int) {
 	}
 
 	if b != nil {
-		for _, st := range b.Items {
+		for i, st := range b.Items {
 			if !st.IsEmpty() {
-				s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, st)
+				entID, _ := s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, st)
+				if entID > 0 && i < 3 && IsPotionItem(st) && b.PotionTypes[i] != "" {
+					s.AssociateDroppedPotionEntity(entID, b.PotionTypes[i])
+				}
 			}
 		}
 		_ = s.SaveBrewingStands()
@@ -1709,7 +1712,7 @@ func (s *Server) OpenBrewingStand(session *PlayerSession, x, y, z int) (int32, e
 		}
 		slots := s.buildBrewingStandMenuSlots(session, x, y, z)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, s.encodeBrewingStandContainerContent(session, cid, stateID, x, y, z, slots, carried)); err != nil {
 			return cid, err
 		}
 		if err := s.sendBrewingStandDataProperties(session, cid, x, y, z); err != nil {
@@ -1717,6 +1720,47 @@ func (s *Server) OpenBrewingStand(session *PlayerSession, x, y, z int) (int32, e
 		}
 	}
 	return cid, nil
+}
+
+func (s *Server) encodeBrewingStandContainerContent(
+	session *PlayerSession,
+	containerID, stateID int32,
+	x, y, z int,
+	slots []world.ItemStack,
+	carried world.ItemStack,
+) []byte {
+	dim := world.DimensionOverworld
+	if session != nil && session.Dimension() != "" {
+		dim = session.Dimension()
+	}
+	stand, _ := s.BrewingStandAtInDim(dim, x, y, z)
+
+	w := protocol.NewWriter(32 + len(slots)*14)
+	w.VarInt(containerID)
+	w.VarInt(stateID)
+	w.VarInt(int32(len(slots)))
+	for i, st := range slots {
+		if IsPotionOrTippedArrowItem(st) {
+			var pot string
+			switch {
+			case i < 3:
+				pot = stand.PotionTypes[i]
+			case i >= 5 && i < 32 && session != nil:
+				pot = GetSlotPotionType(session, 9+(i-5))
+			case i >= 32 && i < 41 && session != nil:
+				pot = GetSlotPotionType(session, 36+(i-32))
+			}
+			EncodeSlotWithPotionContents(w, st, pot)
+			continue
+		}
+		writeContainerItemStack(w, st)
+	}
+	if IsPotionOrTippedArrowItem(carried) && session != nil {
+		EncodeSlotWithPotionContents(w, carried, GetCarriedPotionType(session))
+	} else {
+		writeContainerItemStack(w, carried)
+	}
+	return w.Bytes()
 }
 
 func (s *Server) buildBrewingStandMenuSlots(session *PlayerSession, x, y, z int) []world.ItemStack {
@@ -1771,6 +1815,7 @@ func (s *Server) HandleBrewingStandClick(session *PlayerSession, click Container
 				dropCount = 1
 			}
 			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
+			droppedPotion := GetCarriedPotionType(session)
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
@@ -1779,7 +1824,10 @@ func (s *Server) HandleBrewingStandClick(session *PlayerSession, click Container
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
 			snap := session.Snapshot()
-			s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			entID, _ := s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			if entID > 0 && IsPotionOrTippedArrowItem(dropStack) && droppedPotion != "" {
+				s.AssociateDroppedPotionEntity(entID, droppedPotion)
+			}
 		}
 		tr.mu.Unlock()
 		return s.syncBrewingStandViewers(session, bx, by, bz)
@@ -1871,6 +1919,8 @@ func (s *Server) applyBrewingStandClickLocked(
 		default:
 			prevSlotEmpty := slots[slot].IsEmpty()
 			prevCarriedEmpty := tr.carried.IsEmpty()
+			prevSlotID := slots[slot].ResolvedItemID()
+			prevCarriedID := tr.carried.ResolvedItemID()
 			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
 			if prevSlotEmpty && !slots[slot].IsEmpty() {
 				slotPotions[slot] = carriedPotion
@@ -1882,8 +1932,10 @@ func (s *Server) applyBrewingStandClickLocked(
 				if slots[slot].IsEmpty() {
 					slotPotions[slot] = ""
 				}
-			} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() {
+			} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() && prevSlotID != prevCarriedID {
 				slotPotions[slot], carriedPotion = carriedPotion, slotPotions[slot]
+			} else if tr.carried.IsEmpty() {
+				carriedPotion = ""
 			}
 		}
 
@@ -1892,16 +1944,23 @@ func (s *Server) applyBrewingStandClickLocked(
 			// Move from brewing stand slot (0..4) -> player inventory (5..40).
 			movedPotion := slotPotions[slot]
 			wasBottleSlot := slot < 3 && IsPotionItem(slots[slot])
-			for dst := 5; dst < BrewingStandMenuSlotCount && !slots[slot].IsEmpty(); dst++ {
-				if slots[dst].IsEmpty() {
-					slots[dst] = slots[slot]
-					slotPotions[dst] = movedPotion
-					slots[slot] = world.ItemStack{}
-					slotPotions[slot] = ""
-					if wasBottleSlot && movedPotion != "" && movedPotion != PotionWater {
-						s.TriggerBrewedPotion(session, movedPotion)
+			if IsPotionItem(slots[slot]) {
+				for dst := 5; dst < BrewingStandMenuSlotCount && !slots[slot].IsEmpty(); dst++ {
+					if slots[dst].IsEmpty() {
+						slots[dst] = slots[slot]
+						slotPotions[dst] = movedPotion
+						slots[slot] = world.ItemStack{}
+						slotPotions[slot] = ""
+						if wasBottleSlot && movedPotion != "" && movedPotion != PotionWater {
+							s.TriggerBrewedPotion(session, movedPotion)
+						}
+						break
 					}
-					break
+				}
+			} else {
+				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 5, BrewingStandMenuSlotCount)
+				if slots[slot].IsEmpty() {
+					slotPotions[slot] = ""
 				}
 			}
 		} else {
@@ -1980,7 +2039,10 @@ func (s *Server) applyBrewingStandClickLocked(
 				s.TriggerBrewedPotion(session, droppedPotion)
 			}
 			snap := session.Snapshot()
-			s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			entID, _ := s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			if entID > 0 && IsPotionOrTippedArrowItem(dropStack) && droppedPotion != "" {
+				s.AssociateDroppedPotionEntity(entID, droppedPotion)
+			}
 		}
 	}
 
@@ -2039,7 +2101,7 @@ func (s *Server) syncOpenBrewingStand(session *PlayerSession) error {
 	slots := s.buildBrewingStandMenuSlots(session, open.BlockX, open.BlockY, open.BlockZ)
 	carried := session.CarriedItem()
 	stateID := session.NextContainerStateID()
-	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(open.ContainerID, stateID, slots, carried)); err != nil {
+	if err := session.send(protocol.PlayContainerSetContent, s.encodeBrewingStandContainerContent(session, open.ContainerID, stateID, open.BlockX, open.BlockY, open.BlockZ, slots, carried)); err != nil {
 		return err
 	}
 	return s.sendBrewingStandDataProperties(session, open.ContainerID, open.BlockX, open.BlockY, open.BlockZ)
