@@ -1204,3 +1204,137 @@ func TestMiscFeaturesResidualParity(t *testing.T) {
 		}
 	}
 }
+
+func TestAncientCityAndTrialChambersResidualParity(t *testing.T) {
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil {
+		t.Fatalf("LoadStructureSets: %v", err)
+	}
+	flatSurface := func(x, z int, oceanFloor bool) int { return 64 }
+
+	// 1. Verify StructureIndexInStep resolves underground_decoration structures (ancient_city, fortress, nether_fossil) and underground_structures (trial_chambers).
+	{
+		// In underground_decoration sorted order: ancient_city (0), fortress (1), nether_fossil (2).
+		if got := worldgen.StructureIndexInStep("minecraft:ancient_city"); got != 0 {
+			t.Errorf("StructureIndexInStep(minecraft:ancient_city) = %d, want 0", got)
+		}
+		if got := worldgen.StructureIndexInStep("minecraft:fortress"); got != 1 {
+			t.Errorf("StructureIndexInStep(minecraft:fortress) = %d, want 1", got)
+		}
+		if got := worldgen.StructureIndexInStep("minecraft:nether_fossil"); got != 2 {
+			t.Errorf("StructureIndexInStep(minecraft:nether_fossil) = %d, want 2", got)
+		}
+		if got := worldgen.StructureIndexInStep("minecraft:trial_chambers"); got != 4 {
+			t.Errorf("StructureIndexInStep(minecraft:trial_chambers) = %d, want 4", got)
+		}
+	}
+
+	// 2. Ancient City placement at step 7 (underground_decoration), chest loot, sculk BEs, and cross-chunk LootTableSeed invariance.
+	{
+		def := sets.Structures["minecraft:ancient_city"]
+		if def == nil {
+			t.Fatal("missing structure definition minecraft:ancient_city")
+		}
+		const seed int64 = 12345
+		start, err := BuildJigsawStart(nil, sets, def, seed, 0, 0, flatSurface)
+		if err != nil || start == nil {
+			t.Fatalf("BuildJigsawStart(ancient_city): %v", err)
+		}
+
+		runAncientCity := func(reverse bool) map[[3]int]StructureBlockEntity {
+			region := buildFlatTestDecorationRegion(t, 0, 0, 4, 64, false)
+			var coords [][2]int32
+			for cx := int32(-4); cx <= 4; cx++ {
+				for cz := int32(-4); cz <= 4; cz++ {
+					coords = append(coords, [2]int32{cx, cz})
+				}
+			}
+			if reverse {
+				for i, j := 0, len(coords)-1; i < j; i, j = i+1, j-1 {
+					coords[i], coords[j] = coords[j], coords[i]
+				}
+			}
+			starts := []*JigsawStart{start}
+			for _, c := range coords {
+				PlaceJigsawStartsForChunk(region, starts, "minecraft:ancient_city", 7, seed, c[0], c[1])
+			}
+			out := map[[3]int]StructureBlockEntity{}
+			for _, be := range collectRegionBlockEntities(region) {
+				out[[3]int{be.X, be.Y, be.Z}] = be
+			}
+			return out
+		}
+
+		fwd := runAncientCity(false)
+		rev := runAncientCity(true)
+		if len(fwd) == 0 || len(fwd) != len(rev) {
+			t.Fatalf("ancient_city block entities count forward=%d reverse=%d", len(fwd), len(rev))
+		}
+		ancientChests := 0
+		sculkBEs := 0
+		for pos, a := range fwd {
+			b, ok := rev[pos]
+			if !ok || a.ID != b.ID || a.LootTable != b.LootTable || a.LootTableSeed != b.LootTableSeed {
+				t.Errorf("ancient_city BE at %v mismatch across chunk order: forward=%+v reverse=%+v", pos, a, b)
+			}
+			if a.ID == "minecraft:chest" && (a.LootTable == "minecraft:chests/ancient_city" || a.LootTable == "minecraft:chests/ancient_city_ice_box") && len(a.Items) > 0 {
+				ancientChests++
+			}
+			if a.ID == "minecraft:sculk_shrieker" || a.ID == "minecraft:sculk_sensor" || a.ID == "minecraft:sculk_catalyst" {
+				sculkBEs++
+			}
+		}
+		if ancientChests == 0 {
+			t.Errorf("ancient_city placed 0 populated chests")
+		}
+		if sculkBEs == 0 {
+			t.Errorf("ancient_city placed 0 sculk block entities (shrieker/sensor/catalyst)")
+		}
+	}
+
+	// 3. Trial Chambers cross-chunk BE & LootTableSeed order invariance (vault, trial_spawner, decorated_pot, chest/barrel/dispenser).
+	{
+		def := sets.Structures["minecraft:trial_chambers"]
+		const seed int64 = 1000
+		start, err := BuildJigsawStart(nil, sets, def, seed, 0, 0, flatSurface)
+		if err != nil || start == nil {
+			t.Fatalf("BuildJigsawStart(trial_chambers): %v", err)
+		}
+		centerCX := int32((start.Box.minX + start.Box.maxX) / 32)
+		centerCZ := int32((start.Box.minZ + start.Box.maxZ) / 32)
+		runTrialChambers := func(reverse bool) map[[3]int]StructureBlockEntity {
+			region := buildFlatTestDecorationRegion(t, centerCX, centerCZ, 3, 64, false)
+			var coords [][2]int32
+			for cx := centerCX - 3; cx <= centerCX+3; cx++ {
+				for cz := centerCZ - 3; cz <= centerCZ+3; cz++ {
+					coords = append(coords, [2]int32{cx, cz})
+				}
+			}
+			if reverse {
+				for i, j := 0, len(coords)-1; i < j; i, j = i+1, j-1 {
+					coords[i], coords[j] = coords[j], coords[i]
+				}
+			}
+			starts := []*JigsawStart{start}
+			for _, c := range coords {
+				PlaceJigsawStartsForChunk(region, starts, "minecraft:trial_chambers", 3, seed, c[0], c[1])
+			}
+			out := map[[3]int]StructureBlockEntity{}
+			for _, be := range collectRegionBlockEntities(region) {
+				out[[3]int{be.X, be.Y, be.Z}] = be
+			}
+			return out
+		}
+		fwd := runTrialChambers(false)
+		rev := runTrialChambers(true)
+		if len(fwd) == 0 || len(fwd) != len(rev) {
+			t.Fatalf("trial_chambers block entities count forward=%d reverse=%d", len(fwd), len(rev))
+		}
+		for pos, a := range fwd {
+			b, ok := rev[pos]
+			if !ok || a.ID != b.ID || a.LootTable != b.LootTable || a.LootTableSeed != b.LootTableSeed || a.KeyItem != b.KeyItem || a.SpawnerEntityID != b.SpawnerEntityID {
+				t.Errorf("trial_chambers BE at %v mismatch across chunk order: forward=%+v reverse=%+v", pos, a, b)
+			}
+		}
+	}
+}

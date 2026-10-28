@@ -268,7 +268,7 @@ func TestRemainingJigsawStructures(t *testing.T) {
 		wantBlock string
 	}{
 		{"minecraft:pillager_outpost", 4, "minecraft:dark_oak_planks"},
-		{"minecraft:ancient_city", 3, "minecraft:deepslate_bricks"},
+		{"minecraft:ancient_city", 7, "minecraft:deepslate_bricks"},
 		{"minecraft:trail_ruins", 3, "minecraft:mud_bricks"},
 		{"minecraft:trial_chambers", 3, "minecraft:tuff_bricks"},
 	}

@@ -233,6 +233,9 @@ func (d *treeDecoration) runDecorators(set *worldgen.FeatureSet, decorators []wo
 				return err
 			}
 		case "minecraft:creaking_heart":
+			if len(decorator.Fields) != 1 {
+				return &unmodelledPart{kind: "tree_decorator", name: decorator.Type}
+			}
 			probability, ok := decorator.Float("probability")
 			if !ok {
 				return fmt.Errorf("world: creaking_heart decorator has no readable probability")
@@ -696,12 +699,16 @@ func (d *treeDecoration) hasRequiredEmptyBlocks(leaf treePlacement, dir [3]int, 
 	return true
 }
 
-// placeCreakingHeart is CreakingHeartDecorator.place: one nextFloat() >= probability
-// gate, Util.shuffledCopy over logs, then the first log whose 6 axis neighbours are all
-// logs is replaced by a dormant natural creaking_heart.
+// placeCreakingHeart is CreakingHeartDecorator.place: if logs is empty, return
+// without drawing; otherwise one nextFloat() >= probability gate, Util.shuffledCopy
+// over logs, then the first log whose 6 axis neighbours are all #minecraft:logs is
+// replaced by a dormant natural creaking_heart.
 func (d *treeDecoration) placeCreakingHeart(probability float32) error {
+	if len(d.logs) == 0 {
+		return nil
+	}
 	random := d.t.random
-	if random.NextFloat() >= probability || len(d.logs) == 0 {
+	if random.NextFloat() >= probability {
 		return nil
 	}
 	heartPlacements := make([]treePlacement, len(d.logs))

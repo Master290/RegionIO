@@ -467,7 +467,7 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	}
 	if len(ancientCities) > 0 {
 		for _, key := range regionChunks {
-			PlaceJigsawStartsForChunk(r, ancientCities, "minecraft:ancient_city", 3, seed, key[0], key[1])
+			PlaceJigsawStartsForChunk(r, ancientCities, "minecraft:ancient_city", 7, seed, key[0], key[1])
 		}
 	}
 	for _, key := range regionChunks {

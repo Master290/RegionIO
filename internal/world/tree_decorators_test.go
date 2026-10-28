@@ -591,3 +591,131 @@ func TestTrunkVineAndAttachedToLogsDecorators(t *testing.T) {
 	}
 }
 
+// TestCreakingHeartDrawsNothingWithoutLogs verifies CreakingHeartDecorator.place's
+// early exit: if (logs.isEmpty()) return; runs before random.nextFloat() >= probability,
+// so an empty log list spends zero RNG draws even when probability == 1.0.
+func TestCreakingHeartDrawsNothingWithoutLogs(t *testing.T) {
+	stone := mustState("minecraft:stone", nil)
+	planter := decoratorPlacer(t, "minecraft:pale_oak_creaking", func(int, int) uint16 { return stone })
+	planter.config.Decorators = []worldgen.TreeDecorator{planter.config.Decorators[1]} // minecraft:creaking_heart
+	before := drawStream(planter.random)
+
+	planter2 := decoratorPlacer(t, "minecraft:pale_oak_creaking", func(int, int) uint16 { return stone })
+	planter2.config.Decorators = []worldgen.TreeDecorator{planter2.config.Decorators[1]}
+	if err := planter2.placeDecorators(planter2.set); err != nil {
+		t.Fatal(err)
+	}
+	if got := drawStream(planter2.random); got != before {
+		t.Errorf("creaking_heart without logs consumed RNG draws: got %v, want %v", got, before)
+	}
+}
+
+// TestPaleOakCreakingAndPaleMossDecoratorsGolden tests full placement of
+// minecraft:pale_oak_creaking, minecraft:pale_oak, and minecraft:pale_oak_bonemeal:
+//   - dark_oak_trunk_placer + dark_oak_foliage_placer placing pale_oak_log and pale_oak_leaves
+//   - creaking_heart decorator replacing an interior log surrounded on all 6 faces by
+//     #minecraft:logs with minecraft:creaking_heart[axis=y,creaking_heart_state=dormant,natural=true]
+//     and recording a StructureBlockEntity{ID: "minecraft:creaking_heart"}
+//   - pale_moss decorator placing pale_moss_block, pale_moss_carpet, and pale_hanging_moss
+//     chains (tip=false body cells above a tip=true terminal cell).
+func TestPaleOakCreakingAndPaleMossDecoratorsGolden(t *testing.T) {
+	grass := mustState("minecraft:grass_block", map[string]string{"snowy": "false"})
+	dirt := mustState("minecraft:dirt", nil)
+
+	var foundHeart, foundMossBlock, foundMossCarpet, foundHangingBody, foundHangingTip bool
+	for seed := int64(1); seed <= 32; seed++ {
+		set, err := worldgen.LoadFeatureSet()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := set.Tree("minecraft:pale_oak_creaking")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chunkList []*Chunk
+		chunks := make(map[[2]int32]*Chunk, 9)
+		for cx := int32(-1); cx <= 1; cx++ {
+			for cz := int32(-1); cz <= 1; cz++ {
+				ch := NewChunk(cx, cz, BiomePlains)
+				for x := 0; x < 16; x++ {
+					for z := 0; z < 16; z++ {
+						for y := 65; y < 70; y++ {
+							ch.SetBlock(x, y, z, dirt)
+						}
+						ch.SetBlock(x, 70, z, grass)
+					}
+				}
+				chunks[[2]int32{cx, cz}] = ch
+				chunkList = append(chunkList, ch)
+			}
+		}
+		r, err := newDecorationRegion(chunkList)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.setSource(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		rng := worldgen.NewXoroshiro(seed)
+		ResetNotReplayed()
+		if err := r.placeTree(set, rng, worldgen.FeaturePosition{X: 8, Y: 71, Z: 8}, cfg); err != nil {
+			t.Fatalf("seed %d placeTree(pale_oak_creaking): %v", seed, err)
+		}
+		if counts := NotReplayed(); len(counts) > 0 {
+			t.Fatalf("seed %d had unmodelled parts: %v", seed, counts)
+		}
+
+		for x := -8; x < 24; x++ {
+			for z := -8; z < 24; z++ {
+				for y := 66; y <= 86; y++ {
+					st, ok := stateByID(r.getBlock(x, y, z))
+					if !ok {
+						continue
+					}
+					switch st.Name {
+					case "minecraft:creaking_heart":
+						foundHeart = true
+						if st.Properties["axis"] != "y" || st.Properties["creaking_heart_state"] != "dormant" || st.Properties["natural"] != "true" {
+							t.Errorf("creaking_heart at (%d,%d,%d) has properties %v, want axis=y,creaking_heart_state=dormant,natural=true",
+								x, y, z, st.Properties)
+						}
+						// All 6 axis neighbours must still be logs (#minecraft:logs).
+						for _, dir := range [6][3]int{{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}} {
+							nb, _ := stateByID(r.getBlock(x+dir[0], y+dir[1], z+dir[2]))
+							if nb.Name != "minecraft:pale_oak_log" {
+								t.Errorf("creaking_heart neighbour at (%d,%d,%d) is %q, want minecraft:pale_oak_log",
+									x+dir[0], y+dir[1], z+dir[2], nb.Name)
+							}
+						}
+						ch := chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
+						if be, ok := ch.StructureBlockEntityAt(x, y, z); !ok || be.ID != "minecraft:creaking_heart" {
+							t.Errorf("missing minecraft:creaking_heart block entity at (%d,%d,%d): got %+v, ok=%v", x, y, z, be, ok)
+						}
+					case "minecraft:pale_moss_block":
+						foundMossBlock = true
+					case "minecraft:pale_moss_carpet":
+						foundMossCarpet = true
+					case "minecraft:pale_hanging_moss":
+						if st.Properties["tip"] == "false" {
+							foundHangingBody = true
+							below, _ := stateByID(r.getBlock(x, y-1, z))
+							if below.Name != "minecraft:pale_hanging_moss" {
+								t.Errorf("pale_hanging_moss[tip=false] at (%d,%d,%d) has %q below, want pale_hanging_moss", x, y, z, below.Name)
+							}
+						} else if st.Properties["tip"] == "true" {
+							foundHangingTip = true
+						}
+					}
+				}
+			}
+		}
+		if foundHeart && foundMossBlock && foundMossCarpet && foundHangingBody && foundHangingTip {
+			break
+		}
+	}
+	if !foundHeart || !foundMossBlock || !foundMossCarpet || !foundHangingBody || !foundHangingTip {
+		t.Fatalf("pale_oak_creaking missing expected blocks: heart=%v mossBlock=%v mossCarpet=%v hangingBody=%v hangingTip=%v",
+			foundHeart, foundMossBlock, foundMossCarpet, foundHangingBody, foundHangingTip)
+	}
+}
+

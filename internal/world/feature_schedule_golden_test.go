@@ -153,3 +153,144 @@ func TestLushCavesClayPlacementChainGolden(t *testing.T) {
 		t.Errorf("lush_caves_clay wraps %q, want minecraft:lush_caves_clay", placed.Feature)
 	}
 }
+
+func TestPaleGardenScheduleAndFullChunkReplay(t *testing.T) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Verify Pale Garden stage-9 feature list matches vanilla 26.1.2 datapack.
+	wantPaleGardenStage9 := []string{
+		"minecraft:glow_lichen",
+		"minecraft:pale_garden_vegetation",
+		"minecraft:pale_moss_patch",
+		"minecraft:pale_garden_flowers",
+		"minecraft:flower_pale_garden",
+		"minecraft:patch_grass_forest",
+		"minecraft:patch_pumpkin",
+		"minecraft:patch_sugar_cane",
+		"minecraft:patch_firefly_bush_near_water",
+	}
+	got := set.Biomes["minecraft:pale_garden"].Features[vegetationStage]
+	if len(got) != len(wantPaleGardenStage9) {
+		t.Fatalf("pale_garden stage %d has %d features, want %d: %v",
+			vegetationStage, len(got), len(wantPaleGardenStage9), got)
+	}
+	for i, want := range wantPaleGardenStage9 {
+		if got[i] != want {
+			t.Errorf("pale_garden stage %d feature %d = %q, want %q", vegetationStage, i, got[i], want)
+		}
+	}
+
+	// 2. Verify Pale Garden base temperature is 0.7 and biome parameter table contains pale_garden.
+	if temp := worldgen.TemperatureAt("minecraft:pale_garden", 0, 63, 0, 63); temp != 0.7 {
+		t.Errorf("TemperatureAt(pale_garden) = %v, want 0.7", temp)
+	}
+	foundInBiomeOrder := false
+	for _, b := range possibleBiomeOrder() {
+		if b == "minecraft:pale_garden" {
+			foundInBiomeOrder = true
+			break
+		}
+	}
+	if !foundInBiomeOrder {
+		t.Fatal("minecraft:pale_garden missing from possibleBiomeOrder()")
+	}
+
+	// 3. Replay all Pale Garden stage-9 features over a 3x3 chunk region with Overworld
+	// grass_block/dirt surface rules, verifying zero unmodelled gaps and presence of
+	// pale_oak_log, pale_oak_leaves, pale_moss_block, pale_moss_carpet, pale_hanging_moss,
+	// closed_eyeblossom, and creaking_heart (+ block entity).
+	schedule, err := set.FeatureSchedule(possibleBiomeOrder(), []string{"minecraft:pale_garden"}, vegetationStage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(schedule) != len(wantPaleGardenStage9) {
+		t.Fatalf("pale_garden schedule len = %d, want %d", len(schedule), len(wantPaleGardenStage9))
+	}
+
+	grass := mustState("minecraft:grass_block", map[string]string{"snowy": "false"})
+	dirt := mustState("minecraft:dirt", nil)
+	stone := mustState("minecraft:stone", nil)
+
+	counts := map[string]int{}
+	heartBEs := 0
+	paleGardenBiome := biomeID("minecraft:pale_garden")
+	for seed := int64(100); seed < 116; seed++ {
+		var chunkList []*Chunk
+		for cz := int32(-1); cz <= 1; cz++ {
+			for cx := int32(-1); cx <= 1; cx++ {
+				ch := NewChunk(cx, cz, paleGardenBiome)
+				for x := 0; x < 16; x++ {
+					for z := 0; z < 16; z++ {
+						for y := 0; y < 60; y++ {
+							ch.SetBlock(x, y, z, stone)
+						}
+						for y := 60; y < 64; y++ {
+							ch.SetBlock(x, y, z, dirt)
+						}
+						ch.SetBlock(x, 64, z, grass)
+					}
+				}
+				chunkList = append(chunkList, ch)
+			}
+		}
+		r, err := newDecorationRegion(chunkList)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.setSource(0, 0); err != nil {
+			t.Fatal(err)
+		}
+		ResetNotReplayed()
+		if err := r.placeScheduledVegetationPatches(seed); err != nil {
+			t.Fatalf("seed %d placeScheduledVegetationPatches: %v", seed, err)
+		}
+		if gaps := NotReplayed(); len(gaps) > 0 {
+			t.Fatalf("seed %d pale_garden stage-9 replay had NotReplayed gaps: %v", seed, gaps)
+		}
+		for _, ch := range chunkList {
+			for _, be := range ch.StructureBlockEntities() {
+				if be.ID == "minecraft:creaking_heart" {
+					heartBEs++
+				}
+			}
+		}
+		for x := -16; x < 32; x++ {
+			for z := -16; z < 32; z++ {
+				for y := 60; y <= 84; y++ {
+					name := BlockName(r.getBlock(x, y, z))
+					counts[name]++
+				}
+			}
+		}
+		if counts["minecraft:pale_oak_log"] > 0 &&
+			counts["minecraft:pale_oak_leaves"] > 0 &&
+			counts["minecraft:pale_moss_block"] > 0 &&
+			counts["minecraft:pale_moss_carpet"] > 0 &&
+			counts["minecraft:pale_hanging_moss"] > 0 &&
+			counts["minecraft:closed_eyeblossom"] > 0 &&
+			counts["minecraft:creaking_heart"] > 0 &&
+			heartBEs > 0 {
+			break
+		}
+	}
+
+	for _, wantBlock := range []string{
+		"minecraft:pale_oak_log",
+		"minecraft:pale_oak_leaves",
+		"minecraft:pale_moss_block",
+		"minecraft:pale_moss_carpet",
+		"minecraft:pale_hanging_moss",
+		"minecraft:closed_eyeblossom",
+		"minecraft:creaking_heart",
+	} {
+		if counts[wantBlock] == 0 {
+			t.Errorf("pale_garden stage-9 replay placed 0 %s blocks (counts=%v)", wantBlock, counts)
+		}
+	}
+	if heartBEs == 0 {
+		t.Errorf("pale_garden stage-9 replay recorded 0 minecraft:creaking_heart block entities")
+	}
+}

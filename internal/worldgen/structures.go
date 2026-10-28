@@ -789,6 +789,9 @@ func StructureIndexInStep(structureName string) int {
 	if i, ok := structureIndexCache["underground_structures/"+name]; ok {
 		return i
 	}
+	if i, ok := structureIndexCache["underground_decoration/"+name]; ok {
+		return i
+	}
 	if i, ok := structureIndexCache["strongholds/"+name]; ok {
 		return i
 	}
