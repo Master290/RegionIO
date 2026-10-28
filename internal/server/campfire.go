@@ -22,6 +22,9 @@ const (
 	CampfireRegularDamage         = float32(1.0)
 	CampfireSoulDamage            = float32(2.0)
 	LevelEventSoundExtinguishFire = int32(1009)
+
+	// BlockEntityTypeCampfire is BuiltInRegistries.BLOCK_ENTITY_TYPE index 33 ("minecraft:campfire").
+	BlockEntityTypeCampfire int32 = 33
 )
 
 // CampfireAction describes the result of a player interacting with a campfire.
@@ -342,17 +345,38 @@ func (s *Server) PlaceFoodOnCampfire(dim string, x, y, z int, stack world.ItemSt
 
 	cs := s.campfireState()
 	cs.mu.Lock()
-	defer cs.mu.Unlock()
 	be := s.getOrCreateCampfireLocked(cs, normDim, x, y, z, "")
+	placedSlot := -1
 	for slot := 0; slot < CampfireSlotCount; slot++ {
 		if be.Items[slot].IsEmpty() {
 			be.Items[slot] = world.NewItemStack(stack.ResolvedItemID(), 1)
 			be.CookingProgress[slot] = 0
 			be.CookingTime[slot] = cookTime
-			return slot, true
+			placedSlot = slot
+			break
 		}
 	}
+	cs.mu.Unlock()
+	if placedSlot >= 0 {
+		s.BroadcastCampfireBlockEntityData(normDim, x, y, z)
+		return placedSlot, true
+	}
 	return -1, false
+}
+
+// BroadcastCampfireBlockEntityData broadcasts ClientboundBlockEntityDataPacket
+// (`0x06`, `BlockEntityTypeCampfire = 33`) for the campfire at (dim, x, y, z).
+func (s *Server) BroadcastCampfireBlockEntityData(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := normalizeCampfireDim(dim)
+	be, ok := s.CampfireAt(normDim, x, y, z)
+	if !ok {
+		return
+	}
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeCampfire, EncodeCampfireBlockEntityNBT(be))
+	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
 }
 
 // ExtinguishCampfire extinguishes a campfire at (dim, x, y, z), optionally
@@ -412,6 +436,9 @@ func (s *Server) ExtinguishCampfire(dim string, x, y, z int, waterlogged bool) b
 	}
 	for _, st := range dropped {
 		_, _ = s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.4, float64(z)+0.5, st)
+	}
+	if len(dropped) > 0 {
+		s.BroadcastCampfireBlockEntityData(normDim, x, y, z)
 	}
 	if wasLit {
 		s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayLevelEventCB,
@@ -479,15 +506,27 @@ func (s *Server) UpdateCampfireSignalFire(dim string, x, y, z int) bool {
 	return wantSignal
 }
 
-// InteractCampfire handles a player right-clicking a campfire at (x, y, z):
+// InteractCampfire handles a player right-clicking a campfire at (x, y, z),
+// checking main hand (0) first and falling back to off-hand (1).
+func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (CampfireAction, bool) {
+	if act, ok := s.InteractCampfireWithHand(session, 0, x, y, z); ok {
+		return act, true
+	}
+	return s.InteractCampfireWithHand(session, 1, x, y, z)
+}
+
+// InteractCampfireWithHand handles a player right-clicking a campfire at (x, y, z)
+// with `hand` (0 = main hand, 1 = off-hand):
 //   - Raw food matching `minecraft:campfire_cooking`: places 1 item onto an empty
 //     campfire slot (0..3), consumes 1 item in Survival/Adventure, and increments
 //     `minecraft:interact_with_campfire`.
 //   - Shovel (`*_shovel`) on a lit campfire: extinguishes the campfire, drops
 //     any cooking items, and damages the shovel by 1 durability.
+//   - `minecraft:water_bucket` on a non-waterlogged campfire: waterlogs and
+//     extinguishes the campfire, dropping any cooking items and returning `minecraft:bucket`.
 //   - `minecraft:flint_and_steel` or `minecraft:fire_charge` on an unlit,
 //     non-waterlogged campfire: relights the campfire (`lit="true"`).
-func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (CampfireAction, bool) {
+func (s *Server) InteractCampfireWithHand(session *PlayerSession, hand int32, x, y, z int) (CampfireAction, bool) {
 	if s == nil || session == nil || session.IsDead() {
 		return CampfireActionNone, false
 	}
@@ -500,7 +539,7 @@ func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (Campfire
 	if !IsCampfireBlock(state) {
 		return CampfireActionNone, false
 	}
-	held := session.HeldItem()
+	slot, held := session.handSlotAndStack(hand)
 	if held.IsEmpty() {
 		return CampfireActionNone, false
 	}
@@ -511,7 +550,11 @@ func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (Campfire
 	if CanCookOnCampfire(held) {
 		if _, ok := s.PlaceFoodOnCampfire(dim, x, y, z, held); ok {
 			if !creative {
-				_, _, _ = s.ConsumeHeldItem(session, 1)
+				if held.Count <= 1 {
+					session.SetInventorySlot(slot, world.ItemStack{})
+				} else {
+					session.SetInventorySlot(slot, world.NewItemStack(held.ResolvedItemID(), held.Count-1))
+				}
 			}
 			s.AwardCustomStat(session, StatInteractWithCampfire, 1)
 			s.EmitPlayerBlockVibration(session, GameEventBlockChange, dim, x, y, z, world.BlockName(state))
@@ -524,7 +567,9 @@ func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (Campfire
 	if IsShovelItem(heldID) && CampfireStateLit(state) {
 		if s.ExtinguishCampfire(dim, x, y, z, false) {
 			if !creative {
-				s.DamageHeldItem(session, 1)
+				if hand == 0 {
+					s.DamageHeldItem(session, 1)
+				}
 			}
 			s.EmitPlayerBlockVibration(session, GameEventBlockChange, dim, x, y, z, world.BlockName(state))
 			return CampfireActionExtinguished, true
@@ -532,15 +577,33 @@ func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (Campfire
 		return CampfireActionNone, false
 	}
 
-	// 3. Relight unlit, non-waterlogged campfire with flint_and_steel or fire_charge.
+	// 3. Waterlog and extinguish campfire with a water_bucket.
+	if heldID == "minecraft:water_bucket" && !CampfireStateWaterlogged(state) {
+		if s.ExtinguishCampfire(dim, x, y, z, true) {
+			if !creative {
+				replaceOrGiveBucketItem(session, slot, held, world.NewNamedItemStack("minecraft:bucket", 1))
+			}
+			s.EmitPlayerBlockVibration(session, GameEventBlockChange, dim, x, y, z, world.BlockName(state))
+			return CampfireActionExtinguished, true
+		}
+		return CampfireActionNone, false
+	}
+
+	// 4. Relight unlit, non-waterlogged campfire with flint_and_steel or fire_charge.
 	if (heldID == "minecraft:flint_and_steel" || heldID == "minecraft:fire_charge") &&
 		!CampfireStateLit(state) && !CampfireStateWaterlogged(state) {
 		if s.LightCampfire(dim, x, y, z) {
 			if !creative {
 				if heldID == "minecraft:flint_and_steel" {
-					s.DamageHeldItem(session, 1)
+					if hand == 0 {
+						s.DamageHeldItem(session, 1)
+					}
 				} else {
-					_, _, _ = s.ConsumeHeldItem(session, 1)
+					if held.Count <= 1 {
+						session.SetInventorySlot(slot, world.ItemStack{})
+					} else {
+						session.SetInventorySlot(slot, world.NewItemStack(held.ResolvedItemID(), held.Count-1))
+					}
 				}
 			}
 			s.EmitPlayerBlockVibration(session, GameEventBlockChange, dim, x, y, z, world.BlockName(state))
@@ -551,26 +614,59 @@ func (s *Server) InteractCampfire(session *PlayerSession, x, y, z int) (Campfire
 	return CampfireActionNone, false
 }
 
+// ExtinguishCampfireWithWaterSplash extinguishes any lit campfire at (x, y, z)
+// and its 4 horizontal neighbors in dim when a water-based splash or lingering
+// potion (`PotionWater`, `PotionMundane`, `PotionThick`, `PotionAwkward`) impacts.
+func (s *Server) ExtinguishCampfireWithWaterSplash(dim string, x, y, z int, potionType string) int {
+	if s == nil {
+		return 0
+	}
+	switch canonicalPotionID(potionType) {
+	case "", PotionWater, PotionMundane, PotionThick, PotionAwkward:
+	default:
+		return 0
+	}
+	normDim := normalizeCampfireDim(dim)
+	offsets := [][3]int{
+		{0, 0, 0},
+		{1, 0, 0},
+		{-1, 0, 0},
+		{0, 0, 1},
+		{0, 0, -1},
+	}
+	extinguished := 0
+	for _, off := range offsets {
+		if s.ExtinguishCampfire(normDim, x+off[0], y+off[1], z+off[2], false) {
+			extinguished++
+		}
+	}
+	return extinguished
+}
+
 // TickCampfireAt advances the campfire block entity at (dim, x, y, z) by one
 // game tick, matching vanilla 26.1.2 CampfireBlockEntity.cookTick (when lit)
 // and CampfireBlockEntity.cooldownTick (when unlit). When a slot reaches its
 // cooking time (600 ticks), the cooked result is spawned as an ItemEntity in
-// the world and returned in cooked.
+// the world and returned in cooked. If the campfire block has become waterlogged,
+// any uncooked items in its slots are immediately doused and dropped into the world.
 func (s *Server) TickCampfireAt(dim string, x, y, z int) (cooked []world.ItemStack, changed bool) {
 	if s == nil {
 		return nil, false
 	}
 	normDim := normalizeCampfireDim(dim)
 	isLit := true
+	isWaterlogged := false
 	if cache := s.DimensionChunks(normDim); cache != nil {
 		state := cache.GetBlock(x, y, z)
 		if !IsCampfireBlock(state) {
 			s.dropAndRemoveCampfireEntity(normDim, x, y, z)
 			return nil, false
 		}
-		isLit = CampfireStateLit(state) && !CampfireStateWaterlogged(state)
+		isWaterlogged = CampfireStateWaterlogged(state)
+		isLit = CampfireStateLit(state) && !isWaterlogged
 	}
 
+	var dousedDrops []world.ItemStack
 	cs := s.campfireState()
 	cs.mu.Lock()
 	s.ensureCampfiresLoadedLocked(cs)
@@ -580,7 +676,17 @@ func (s *Server) TickCampfireAt(dim string, x, y, z int) (cooked []world.ItemSta
 		return nil, false
 	}
 
-	if isLit {
+	if isWaterlogged {
+		for slot := 0; slot < CampfireSlotCount; slot++ {
+			if !be.Items[slot].IsEmpty() {
+				dousedDrops = append(dousedDrops, be.Items[slot])
+				be.Items[slot] = world.ItemStack{}
+				be.CookingProgress[slot] = 0
+				be.CookingTime[slot] = 0
+				changed = true
+			}
+		}
+	} else if isLit {
 		for slot := 0; slot < CampfireSlotCount; slot++ {
 			st := be.Items[slot]
 			if st.IsEmpty() {
@@ -619,8 +725,14 @@ func (s *Server) TickCampfireAt(dim string, x, y, z int) (cooked []world.ItemSta
 	}
 	cs.mu.Unlock()
 
+	for _, item := range dousedDrops {
+		_, _ = s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.4, float64(z)+0.5, item)
+	}
 	for _, item := range cooked {
 		_, _ = s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.4, float64(z)+0.5, item)
+	}
+	if len(dousedDrops) > 0 || len(cooked) > 0 {
+		s.BroadcastCampfireBlockEntityData(normDim, x, y, z)
 	}
 	return cooked, changed
 }
@@ -1140,4 +1252,106 @@ func (s *Server) LoadChunkCampfireBlockEntitiesNBT(dim string, list []*nbt.Compo
 	}
 	return len(loaded)
 }
+
+// ApplyCampfireContactDamageToEntity checks whether the mob/entity `entityID`
+// in `dim` is standing on a lit `minecraft:campfire` (1.0 damage) or
+// `minecraft:soul_campfire` (2.0 damage) and applies contact damage.
+func (s *Server) ApplyCampfireContactDamageToEntity(dim string, entityID int32) (float32, bool) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return 0, false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || ent.IsItem() {
+		return 0, false
+	}
+	normDim := normalizeCampfireDim(dim)
+	bx := int(math.Floor(ent.X))
+	by := int(math.Floor(ent.Y))
+	bz := int(math.Floor(ent.Z))
+	dmg, ok := s.CampfireContactDamageAt(normDim, bx, by, bz)
+	if !ok || dmg <= 0 {
+		return 0, false
+	}
+	killed := s.applyDamageToMob(ent, dmg, nil, 0, false, false)
+	if killed {
+		s.entities.Remove(entityID)
+	}
+	return dmg, true
+}
+
+// CampfireSmokeSignalInfoAt returns the smoke particle, flame particle, ember
+// particle, max smoke height (`10` for normal, `24` for hay-bale signal fire),
+// unobstructed reachable height, `signal_fire` flag, and whether the campfire
+// at (dim, x, y, z) is actively smoking.
+func (s *Server) CampfireSmokeSignalInfoAt(dim string, x, y, z int) (smokeParticle, flameParticle, emberParticle string, maxSmokeHeight, reachableHeight int, signalFire, active bool) {
+	if s == nil {
+		return "", "", "", 0, 0, false, false
+	}
+	normDim := normalizeCampfireDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return "", "", "", 0, 0, false, false
+	}
+	st := cache.GetBlock(x, y, z)
+	_, _, _, signalFire, _, _ = world.ParseCampfireBlockState(st)
+	smokeParticle, flameParticle, emberParticle, maxSmokeHeight, active = world.CampfireSmokeAndParticleInfo(st)
+	if !active {
+		return "", "", "", 0, 0, signalFire, false
+	}
+	reachableHeight = cache.CampfireReachableSmokeHeightAt(x, y, z)
+	return smokeParticle, flameParticle, emberParticle, maxSmokeHeight, reachableHeight, signalFire, true
+}
+
+// HydrateChunkCampfires inspects all `world.StructureBlockEntity` entries on the
+// loaded chunk (dim, cx, cz) and registers any `minecraft:campfire` or
+// `minecraft:soul_campfire` block entities.
+func (s *Server) HydrateChunkCampfires(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := normalizeCampfireDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	cs := s.campfireState()
+	cs.mu.Lock()
+	s.ensureCampfiresLoadedLocked(cs)
+	var hydrated []CampfireBlockEntity
+	for _, sbe := range sbes {
+		if !IsCampfireBlockID(sbe.ID) {
+			continue
+		}
+		key := campfireKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := cs.campfires[key]; exists {
+			continue
+		}
+		be := CampfireBlockEntity{
+			ID:        canonicalResourceName(sbe.ID),
+			Dimension: normDim,
+			X:         sbe.X,
+			Y:         sbe.Y,
+			Z:         sbe.Z,
+		}
+		for _, entry := range sbe.Items {
+			if entry.Slot >= 0 && int(entry.Slot) < CampfireSlotCount && entry.ItemID != "" {
+				be.Items[entry.Slot] = world.NewNamedItemStack(entry.ItemID, 1)
+				be.CookingTime[entry.Slot] = int16(CampfireDefaultCookTime)
+			}
+		}
+		cs.campfires[key] = &be
+		hydrated = append(hydrated, be)
+	}
+	cs.mu.Unlock()
+
+	for _, be := range hydrated {
+		s.UpdateCampfireSignalFire(be.Dimension, be.X, be.Y, be.Z)
+	}
+	return len(hydrated)
+}
+
 

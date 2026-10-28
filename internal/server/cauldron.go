@@ -610,18 +610,64 @@ func (s *Server) InteractCauldronAt(session *PlayerSession, x, y, z int, invento
 	return s.InteractCauldronAtInDim(session, dim, x, y, z, inventorySlot)
 }
 
+// InteractCauldronWithHand handles a player right-clicking a cauldron at
+// (x, y, z) in session's dimension with `hand` (0 = main hand, 1 = off-hand).
+func (s *Server) InteractCauldronWithHand(session *PlayerSession, hand int32, x, y, z int) (handled bool, nextState uint16) {
+	if s == nil || session == nil || session.IsDead() {
+		return false, world.StateAir
+	}
+	slot, _ := session.handSlotAndStack(hand)
+	return s.InteractCauldronAt(session, x, y, z, slot)
+}
+
+// InteractCauldronBothHands tries interacting with the cauldron at (x, y, z)
+// using the player's main hand (0) first, falling back to off-hand (1).
+func (s *Server) InteractCauldronBothHands(session *PlayerSession, x, y, z int) (handled bool, nextState uint16) {
+	if handled, nextState = s.InteractCauldronWithHand(session, 0, x, y, z); handled {
+		return true, nextState
+	}
+	return s.InteractCauldronWithHand(session, 1, x, y, z)
+}
+
 func (s *Server) setCauldronBlockAndNotify(dim string, cache *world.Cache, x, y, z int, nextState uint16, soundName string) {
 	if cache == nil {
 		return
 	}
+	normDim := world.NormalizeDimension(dim)
+	if s != nil {
+		s.BindNoteBlockAndJukeboxRedstone(normDim)
+	}
 	if valid, lightChunks := cache.SetBlockWithLight(x, y, z, nextState); valid {
-		s.broadcastBlockAndLightUpdate(x, y, z, nextState, lightChunks)
+		if normDim == world.DimensionOverworld {
+			s.broadcastBlockAndLightUpdate(x, y, z, nextState, lightChunks)
+		} else {
+			s.broadcastDimensionBlockChanges(normDim, cache, []world.BlockChange{{
+				Pos:      world.BlockPos{X: x, Y: y, Z: z},
+				NewState: nextState,
+			}}, lightChunks)
+		}
 	} else {
 		cache.SetBlock(x, y, z, nextState)
+		if s != nil {
+			s.broadcastBlockUpdateInDim(normDim, x, y, z, nextState)
+		}
 	}
-	cache.UpdateComparatorsAround(x, y, z)
-	if soundName != "" {
-		s.playBeaconSound(dim, x, y, z, soundName)
+	compRes := cache.UpdateComparatorsAround(x, y, z)
+	if s != nil {
+		if len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
+			s.broadcastDimensionBlockChanges(normDim, cache, compRes.Changes, compRes.LightChanged)
+		}
+		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
+		if soundName != "" {
+			s.playBeaconSound(normDim, x, y, z, soundName)
+		}
+		s.EmitVibration(VibrationEvent{
+			Dimension: normDim,
+			Type:      GameEventBlockChange,
+			X:         float64(x) + 0.5,
+			Y:         float64(y) + 0.5,
+			Z:         float64(z) + 0.5,
+		})
 	}
 }
 
@@ -802,13 +848,68 @@ func FindDripstoneFluidAboveCauldron(getBlock func(x, y, z int) uint16, x, y, z 
 	}
 
 	fluidState := getBlock(x, ceilingY+1, z)
-	if fluidState == world.StateWater || world.BlockName(fluidState) == "minecraft:water" {
+	if fluidState == world.StateWater || world.BlockName(fluidState) == "minecraft:water" || world.IsWaterlogged(fluidState) {
 		return "water"
 	}
 	if fluidState == world.StateLava || world.BlockName(fluidState) == "minecraft:lava" {
 		return "lava"
 	}
 	return ""
+}
+
+// TickChunkCauldronsPrecipitation runs one weather precipitation check on chunk
+// (cx, cz) in dim (`ServerLevel.tickPrecipitation`), picking a column `(x, z)`,
+// finding `TopWeatherSurfaceYAt(x, z) - 1`, and filling an exposed cauldron with
+// `"snow"` (in cold biomes) or `"rain"` (in temperate/warm rainy biomes).
+func (s *Server) TickChunkCauldronsPrecipitation(
+	dim string,
+	cx, cz int32,
+	biomeAt func(x, y, z int) string,
+	rng *rand.Rand,
+	force bool,
+) (filled bool, bx, by, bz int, nextState uint16) {
+	if s == nil {
+		return false, 0, 0, 0, world.StateAir
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return false, 0, 0, 0, world.StateAir
+	}
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	if !force && rng.Intn(16) != 0 {
+		return false, 0, 0, 0, world.StateAir
+	}
+	bx = int(cx)*16 + rng.Intn(16)
+	bz = int(cz)*16 + rng.Intn(16)
+	topY := cache.TopWeatherSurfaceYAt(bx, bz)
+	by = topY - 1
+	if by < world.MinY {
+		return false, bx, by, bz, world.StateAir
+	}
+	biome := "minecraft:plains"
+	if biomeAt != nil {
+		if b := biomeAt(bx, topY, bz); b != "" {
+			biome = b
+		}
+	}
+	if world.BiomeHasNoPrecipitation(biome) {
+		return false, bx, by, bz, cache.GetBlock(bx, by, bz)
+	}
+	prec := "rain"
+	if world.CanBiomeSnowOrFreeze(biome, topY) {
+		prec = "snow"
+	}
+	filled, nextState = s.TryFillCauldronFromPrecipitation(normDim, bx, by, bz, prec, rng, force)
+	return filled, bx, by, bz, nextState
+}
+
+// RandomTickCauldronDripstoneAt executes a random-tick pointed dripstone check
+// above the cauldron at (x, y, z) in dim.
+func (s *Server) RandomTickCauldronDripstoneAt(dim string, x, y, z int, rng *rand.Rand) (filled bool, nextState uint16) {
+	return s.TryFillCauldronFromDripstone(dim, x, y, z, rng, false)
 }
 
 // TryFillCauldronFromDripstone checks if a pointed_dripstone stalactite with a

@@ -488,3 +488,54 @@ func TestCauldronWashDyedWolfArmorMeta(t *testing.T) {
 		t.Fatalf("expected wolf_armor Damage=5 to be preserved after washing, got %d", washedMeta.Damage)
 	}
 }
+
+func TestCauldronOffhandAndTickChunkPrecipitation(t *testing.T) {
+	dim := world.DimensionOverworld
+	s, cache := newBeaconTestServer(t)
+	s.BindNoteBlockAndJukeboxRedstone(dim)
+	session := newBeaconTestPlayer(s, "OffhandCauldron", 4.5, 64, 4.5)
+
+	x, y, z := 4, 64, 4
+	cache.SetBlock(x, y-1, z, mustBlockState(t, "minecraft:stone"))
+	cache.SetBlock(x+1, y-1, z, mustBlockState(t, "minecraft:stone"))
+	cache.SetBlock(x, y, z, EmptyCauldronBlockState())
+
+	compSt, _ := world.BlockStateIDByProperties("minecraft:comparator", map[string]string{
+		"facing":  "west",
+		"mode":    "compare",
+		"powered": "false",
+	})
+	cache.SetBlock(x+1, y, z, compSt)
+
+	// 1. Off-hand (hand=1, slot 45) water bottle fills cauldron to level 1 and updates live comparator to 1.
+	const offhandSlot = 45
+	session.SetInventorySlot(offhandSlot, world.NewNamedItemStack("minecraft:potion", 1))
+	SetSlotPotionType(session, offhandSlot, PotionWater)
+
+	if handled, _ := s.InteractCauldronBothHands(session, x, y, z); !handled {
+		t.Fatal("expected InteractCauldronBothHands to use off-hand water bottle")
+	}
+	if gotSig := cache.ComparatorOutputSignalAt(x+1, y, z); gotSig != 1 {
+		t.Fatalf("after off-hand water bottle: ComparatorOutputSignalAt = %d, want 1", gotSig)
+	}
+	if held := session.InventorySlot(offhandSlot); held.ResolvedID() != "minecraft:glass_bottle" {
+		t.Fatalf("expected glass_bottle in offhand, got %q", held.ResolvedID())
+	}
+
+	// 2. TickChunkCauldronsPrecipitation fills exposed cauldron in chunk (0, 0).
+	for cx := 0; cx < 16; cx++ {
+		for cz := 0; cz < 16; cz++ {
+			cache.SetBlock(cx, y, cz, EmptyCauldronBlockState())
+		}
+	}
+	filled, bx, by, bz, nextSt := s.TickChunkCauldronsPrecipitation(dim, 0, 0, func(x, y, z int) string {
+		return "minecraft:snowy_plains"
+	}, rand.New(rand.NewSource(7)), true)
+	if !filled || by != y {
+		t.Fatalf("expected TickChunkCauldronsPrecipitation(force=true) to fill cauldron at y=%d, got filled=%v pos=(%d,%d,%d)", y, filled, bx, by, bz)
+	}
+	if kind, lvl, ok := ParseCauldronState(nextSt); !ok || kind != CauldronKindPowderSnow || lvl != 1 {
+		t.Fatalf("expected powder_snow_cauldron[level=1], got kind=%q lvl=%d", kind, lvl)
+	}
+}
+

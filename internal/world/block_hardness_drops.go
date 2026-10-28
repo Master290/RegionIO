@@ -1069,6 +1069,9 @@ func EvaluateBlockDrops(
 		}
 		return []ItemStack{NewNamedItemStack("minecraft:obsidian", 8)}
 
+	case "minecraft:cauldron", "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron":
+		return []ItemStack{NewNamedItemStack("minecraft:cauldron", 1)}
+
 	case "minecraft:campfire":
 		if hasSilkTouch {
 			return []ItemStack{NewNamedItemStack("minecraft:campfire", 1)}

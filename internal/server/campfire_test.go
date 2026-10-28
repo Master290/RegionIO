@@ -267,3 +267,72 @@ func TestCampfireBreakDropsAndNBTPersistence(t *testing.T) {
 		t.Fatalf("reloaded CampfireBlockEntity = %+v", got)
 	}
 }
+
+func TestCampfireWaterSplashWaterBucketDowseOffhandAndSmokeSignal(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	col := &survivalPacketCollector{}
+	session, err := srv.RegisterPlayer(Profile{Name: "CampTester", UUID: OfflineUUID("CampTester")}, col.send)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	dim := world.DimensionOverworld
+	cx, cy, cz := 20, world.FlatSurfaceY+2, 20
+
+	// 1. Place hay_block at (cx, cy-1, cz) and campfire at (cx, cy, cz) -> verify smoke signal height 24.
+	hayID, _ := world.ItemNameToID("minecraft:hay_block")
+	hayState, _ := world.ItemToBlock(hayID)
+	srv.Chunks().ApplyBlockWithUpdates(cx, cy-1, cz, hayState)
+	placeCampfireBlockForTest(t, srv, "minecraft:campfire", cx, cy, cz)
+
+	smokeP, flameP, _, maxH, reachH, sigFire, active := srv.CampfireSmokeSignalInfoAt(dim, cx, cy, cz)
+	if !active || !sigFire || smokeP != "minecraft:campfire_signal_smoke" || flameP != "minecraft:flame" || maxH != 24 || reachH != 24 {
+		t.Fatalf("unexpected CampfireSmokeSignalInfoAt over hay_block: smoke=%q flame=%q maxH=%d reachH=%d sig=%v active=%v",
+			smokeP, flameP, maxH, reachH, sigFire, active)
+	}
+
+	// 2. Place raw cod from off-hand (hand=1, slot 45) -> places food into slot 0.
+	const offhandSlot = 45
+	session.SetInventorySlot(offhandSlot, world.NewNamedItemStack("minecraft:cod", 1))
+	if act, ok := srv.InteractCampfire(session, cx, cy, cz); !ok || act != CampfireActionPlacedFood {
+		t.Fatalf("expected InteractCampfire to place food from off-hand, got (%v, %v)", act, ok)
+	}
+	if !session.InventorySlot(offhandSlot).IsEmpty() {
+		t.Fatal("expected raw cod consumed from off-hand")
+	}
+
+	// 3. Splash water bottle at (cx, cy, cz) extinguishes campfire and drops raw cod.
+	if ext := srv.ExtinguishCampfireWithWaterSplash(dim, cx, cy, cz, PotionWater); ext != 1 {
+		t.Fatalf("ExtinguishCampfireWithWaterSplash = %d, want 1", ext)
+	}
+	if CampfireStateLit(srv.Chunks().GetBlock(cx, cy, cz)) {
+		t.Fatal("expected campfire to be unlit after water splash")
+	}
+	if !srv.CampfireSlots(dim, cx, cy, cz)[0].IsEmpty() {
+		t.Fatal("expected cooking slot 0 to be emptied on splash water dowse")
+	}
+
+	// 4. Relight with fire_charge, place raw chicken, then waterlog with water_bucket.
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:fire_charge", 1))
+	if act, ok := srv.InteractCampfire(session, cx, cy, cz); !ok || act != CampfireActionLit {
+		t.Fatalf("expected fire_charge to relight campfire, got (%v, %v)", act, ok)
+	}
+	srv.PlaceFoodOnCampfire(dim, cx, cy, cz, world.NewNamedItemStack("minecraft:chicken", 1))
+
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:water_bucket", 1))
+	if act, ok := srv.InteractCampfire(session, cx, cy, cz); !ok || act != CampfireActionExtinguished {
+		t.Fatalf("expected water_bucket on campfire to waterlog and extinguish, got (%v, %v)", act, ok)
+	}
+	wlSt := srv.Chunks().GetBlock(cx, cy, cz)
+	if CampfireStateLit(wlSt) || !CampfireStateWaterlogged(wlSt) {
+		t.Fatalf("expected lit=false waterlogged=true after water_bucket, got %v", world.BlockProperties(wlSt))
+	}
+	if held := session.InventorySlot(world.HotbarContainerOffset); held.ResolvedID() != "minecraft:bucket" {
+		t.Fatalf("expected minecraft:bucket after pouring water_bucket on campfire, got %q", held.ResolvedID())
+	}
+	if !srv.CampfireSlots(dim, cx, cy, cz)[0].IsEmpty() {
+		t.Fatal("expected cooking slot 0 to be emptied when waterlogged by water_bucket")
+	}
+}
+

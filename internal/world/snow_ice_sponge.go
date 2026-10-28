@@ -1170,6 +1170,11 @@ func (c *Cache) TickChunkWeatherPrecipitation(cx, cz int32, biomeAt func(x, y, z
 		}
 	}
 	_, res = c.TryWeatherSnowAndFreezeAt(x, y, z, biome)
+	if y > c.minY() && IsCauldronBlockState(c.GetBlock(x, y-1, z)) {
+		if filled, _, cauldRes := c.TryWeatherFillCauldronAt(x, y-1, z, biome, rng, false); filled {
+			res.merge(cauldRes)
+		}
+	}
 	return res
 }
 

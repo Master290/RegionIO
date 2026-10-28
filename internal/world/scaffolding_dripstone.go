@@ -664,6 +664,7 @@ func (c *Cache) TryDripFromPointedDripstoneAt(x, y, z int, res *BlockUpdateResul
 			if found {
 				if res != nil {
 					if c.setBlockRecorded(x, cy, z, next, res) {
+						c.propagateRedstoneAround(x, cy, z, target, next, res)
 						c.scheduleAround(x, cy, z)
 						return true
 					}
@@ -685,6 +686,7 @@ func (c *Cache) TryDripFromPointedDripstoneAt(x, y, z int, res *BlockUpdateResul
 			if found {
 				if res != nil {
 					if c.setBlockRecorded(x, cy, z, next, res) {
+						c.propagateRedstoneAround(x, cy, z, target, next, res)
 						c.scheduleAround(x, cy, z)
 						return true
 					}
