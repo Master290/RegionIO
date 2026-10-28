@@ -479,4 +479,148 @@ func TestNetherCrossChunk3x3Decoration(t *testing.T) {
 	}
 }
 
+func TestDeltaAndBasaltColumnsDoNotOverwriteFortressBlocks(t *testing.T) {
+	fb := getNFBlocks()
+	fortressStates := []struct {
+		name  string
+		state uint16
+	}{
+		{"nether_bricks", fb.bricks},
+		{"nether_brick_fence", fb.fenceNS},
+		{"nether_brick_stairs", fb.brickStairs[0]},
+		{"nether_wart", fb.netherWart},
+		{"chest", fb.chest[0]},
+		{"spawner", fb.spawner},
+	}
+
+	for _, fs := range fortressStates {
+		if !deltaCannotReplace(fs.state) {
+			t.Errorf("deltaCannotReplace(%s=%d) = false, want true", fs.name, fs.state)
+		}
+		if !basaltCannotPlaceOn(fs.state) {
+			t.Errorf("basaltCannotPlaceOn(%s=%d) = false, want true", fs.name, fs.state)
+		}
+
+		// Verify PlaceDeltaFeature preserves the fortress block when surrounded by netherrack.
+		c := NewDimensionChunk(0, 0, biomeID("minecraft:basalt_deltas"), NetherDimensionType)
+		for lx := 0; lx < 16; lx++ {
+			for lz := 0; lz < 16; lz++ {
+				for y := 30; y <= 40; y++ {
+					c.SetBlock(lx, y, lz, StateNetherrack)
+				}
+			}
+		}
+		c.SetBlock(8, 40, 8, fs.state)
+		PlaceDeltaFeature(c, 8, 40, 8, worldgen.NewXoroshiro(42), StateLava, StateMagmaBlock, 3, 7, 0, 2)
+		if got := c.GetBlock(8, 40, 8); got != fs.state {
+			t.Errorf("PlaceDeltaFeature overwrote fortress block %s: got %d, want %d", fs.name, got, fs.state)
+		}
+
+		// Verify PlaceBasaltColumns rejects placing on top of the fortress block.
+		cCol := NewDimensionChunk(0, 0, biomeID("minecraft:basalt_deltas"), NetherDimensionType)
+		cCol.SetBlock(8, 40, 8, fs.state)
+		if PlaceBasaltColumns(cCol, 8, 41, 8, worldgen.NewXoroshiro(42), 1, 2, 3, 6) {
+			t.Errorf("PlaceBasaltColumns placed column on forbidden fortress block %s", fs.name)
+		}
+	}
+}
+
+func countNetherChunkMatching(c *Chunk, pred func(uint16) bool) int {
+	n := 0
+	for y := 0; y < 128; y++ {
+		for z := 0; z < 16; z++ {
+			for x := 0; x < 16; x++ {
+				if pred(c.GetBlock(x, y, z)) {
+					n++
+				}
+			}
+		}
+	}
+	return n
+}
+
+func TestNetherSproutsCrimsonRootsAndFirePatches(t *testing.T) {
+	nb := loadNetherBlocks()
+
+	// 1. PlaceNetherSprouts on warped_nylium.
+	wc := NewDimensionChunk(0, 0, biomeID("minecraft:warped_forest"), NetherDimensionType)
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			wc.SetBlock(lx, 59, lz, StateWarpedNylium)
+		}
+	}
+	if !PlaceNetherSprouts(wc, 8, 60, 8, worldgen.NewXoroshiro(77), 8, 4) {
+		t.Fatal("PlaceNetherSprouts returned false on warped_nylium floor")
+	}
+	if sprouts := countNetherChunkMatching(wc, func(st uint16) bool { return st == nb.netherSprouts }); sprouts == 0 {
+		t.Fatal("PlaceNetherSprouts placed 0 nether_sprouts blocks")
+	}
+
+	// 2. placeNetherCrimsonRootsPatchRegion on soul_soil in soul_sand_valley.
+	sc := NewDimensionChunk(0, 0, biomeID("minecraft:soul_sand_valley"), NetherDimensionType)
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			sc.SetBlock(lx, 49, lz, StateSoulSoil)
+		}
+	}
+	if !placeNetherCrimsonRootsPatchRegion(singleChunkNetherRegion(sc), 8, 50, 8, worldgen.NewXoroshiro(88), nb.crimsonRoots) {
+		t.Fatal("placeNetherCrimsonRootsPatchRegion returned false on soul_soil floor")
+	}
+	if roots := countNetherChunkMatching(sc, func(st uint16) bool { return st == nb.crimsonRoots }); roots == 0 {
+		t.Fatal("placeNetherCrimsonRootsPatchRegion placed 0 crimson_roots blocks")
+	}
+
+	// 3. placeNetherFirePatchRegion on netherrack and soul_soil.
+	fc := NewDimensionChunk(0, 0, biomeID("minecraft:soul_sand_valley"), NetherDimensionType)
+	for lx := 0; lx < 16; lx++ {
+		for lz := 0; lz < 16; lz++ {
+			if lx < 8 {
+				fc.SetBlock(lx, 49, lz, StateNetherrack)
+			} else {
+				fc.SetBlock(lx, 49, lz, StateSoulSoil)
+			}
+		}
+	}
+	if !placeNetherFirePatchRegion(singleChunkNetherRegion(fc), 8, 50, 8, worldgen.NewXoroshiro(99), nb.fire, nb.soulFire, true) {
+		t.Fatal("placeNetherFirePatchRegion returned false")
+	}
+	fires := countNetherChunkMatching(fc, func(st uint16) bool { return st == nb.fire })
+	soulFires := countNetherChunkMatching(fc, func(st uint16) bool { return st == nb.soulFire })
+	if fires == 0 || soulFires == 0 {
+		t.Fatalf("expected both fire (%d) and soul_fire (%d) to be placed", fires, soulFires)
+	}
+}
+
+func TestNetherFeatureSchedulerPath(t *testing.T) {
+	const seed int64 = 424242
+	od, carver, _ := netherGeneratorInputs(seed)
+
+	var chunks []*Chunk
+	for cx := int32(-1); cx <= 1; cx++ {
+		for cz := int32(-1); cz <= 1; cz++ {
+			bt := generateNetherBaseTerrain(od, carver, seed, cx, cz)
+			chunks = append(chunks, bt.c)
+		}
+	}
+	reg, err := newDecorationRegion(chunks)
+	if err != nil {
+		t.Fatalf("newDecorationRegion: %v", err)
+	}
+	if !reg.isNetherRegion() {
+		t.Fatal("expected reg.isNetherRegion() == true for Nether chunks")
+	}
+	if err := reg.replayScheduledOres(od, seed, 0, 0); err != nil {
+		t.Fatalf("replayScheduledOres on Nether region: %v", err)
+	}
+	center := reg.chunks[[2]int32{0, 0}]
+	nb := loadNetherBlocks()
+	ores := countNetherChunkMatching(center, func(st uint16) bool {
+		return st == nb.quartzOre || st == nb.goldOre || st == StateMagmaBlock || st == StateGlowstone
+	})
+	if ores == 0 {
+		t.Fatal("expected Nether feature_scheduler path to place Nether ores/glowstone in center chunk")
+	}
+}
+
+
 

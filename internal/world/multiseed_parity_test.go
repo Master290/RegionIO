@@ -404,8 +404,10 @@ func verifyNetherForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64)
 	t.Helper()
 	od, carver, _ := netherGeneratorInputs(seed)
 
-	// Verify all 5 Nether biomes appear on this seed.
+	// 1. Verify all 5 Nether biomes appear on this seed and record a sample chunk for basalt_deltas.
 	seenBiomes := make(map[string]bool)
+	var deltasCX, deltasCZ int32
+	hasDeltasChunk := false
 	netherTable := worldgen.NetherBiomeTable()
 	for cx := int32(-48); cx <= 48; cx += 3 {
 		for cz := int32(-48); cz <= 48; cz += 3 {
@@ -414,6 +416,10 @@ func verifyNetherForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64)
 			b := netherTable.FindBiome(worldgen.NewTargetPoint(
 				s2D.Temperature, s2D.Humidity, s2D.Continentalness, s2D.Erosion, s2D.Weirdness, 0))
 			seenBiomes[b] = true
+			if b == "minecraft:basalt_deltas" && !hasDeltasChunk {
+				deltasCX, deltasCZ = cx, cz
+				hasDeltasChunk = true
+			}
 		}
 	}
 	for _, want := range []string{
@@ -428,8 +434,38 @@ func verifyNetherForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64)
 		}
 	}
 
-	// Find a Fortress and a Bastion Remnant on this seed and verify their placement & contents.
+	// 2. Verify basalt_deltas CountOnEveryLayer (delta, small/large basalt columns, basalt/blackstone blobs)
+	// and carver CAVE_AIR / LAVA aquifer boundary on this seed.
+	if hasDeltasChunk {
+		dch := generateNetherChunk(od, carver, sets, seed, deltasCX, deltasCZ)
+		var basaltCnt, blackstoneCnt, magmaCnt int
+		for y := 1; y < 127; y++ {
+			for z := 0; z < 16; z++ {
+				for x := 0; x < 16; x++ {
+					switch dch.GetBlock(x, y, z) {
+					case StateBasalt:
+						basaltCnt++
+					case StateBlackstone:
+						blackstoneCnt++
+					case StateMagmaBlock:
+						magmaCnt++
+					case StateCaveAir:
+						if y < NetherLavaSeaLevel {
+							t.Errorf("seed %d: CAVE_AIR below Nether lava sea level at (%d,%d,%d)", seed, x, y, z)
+						}
+					}
+				}
+			}
+		}
+		if basaltCnt == 0 || blackstoneCnt == 0 || magmaCnt == 0 {
+			t.Errorf("seed %d basalt_deltas chunk (%d,%d): basalt=%d blackstone=%d magma=%d",
+				seed, deltasCX, deltasCZ, basaltCnt, blackstoneCnt, magmaCnt)
+		}
+	}
+
+	// 3. Find a Fortress and a Bastion Remnant on this seed and verify their placement & contents.
 	var foundFortress, foundBastion bool
+	fb := getNFBlocks()
 	for sx := int32(-32); sx <= 32; sx++ {
 		for sz := int32(-32); sz <= 32; sz++ {
 			stub, ok := FindStructureSetStart(od, sets, "minecraft:nether_complexes", seed, sx, sz)
@@ -440,9 +476,27 @@ func verifyNetherForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64)
 			case "minecraft:fortress":
 				if !foundFortress {
 					foundFortress = true
+					fort := BuildNetherFortressStart(seed, sx, sz)
+					if fort == nil || len(fort.Pieces) == 0 {
+						t.Fatalf("seed %d: BuildNetherFortressStart(%d,%d) returned empty start", seed, sx, sz)
+					}
 					ch := generateNetherChunk(od, carver, sets, seed, sx, sz)
 					if ch == nil {
 						t.Fatalf("seed %d: Nether fortress chunk (%d,%d) nil", seed, sx, sz)
+					}
+					// Verify fortress bricks survive decoration (DeltaFeature / BasaltColumnsFeature cannot overwrite them).
+					bricks := 0
+					for y := 32; y < 100; y++ {
+						for z := 0; z < 16; z++ {
+							for x := 0; x < 16; x++ {
+								if ch.GetBlock(x, y, z) == fb.bricks {
+									bricks++
+								}
+							}
+						}
+					}
+					if bricks == 0 {
+						t.Errorf("seed %d: Nether fortress start chunk (%d,%d) has 0 nether_bricks", seed, sx, sz)
 					}
 				}
 			case "minecraft:bastion_remnant":
@@ -464,6 +518,45 @@ func verifyNetherForSeed(t *testing.T, sets *worldgen.StructureSets, seed int64)
 	}
 	if !foundFortress || !foundBastion {
 		t.Errorf("seed %d Nether complexes: fortress=%v bastion=%v", seed, foundFortress, foundBastion)
+	}
+
+	// 4. Find a Nether Fossil and a Ruined Portal Nether on this seed and verify placement.
+	var foundFossil, foundPortal bool
+	nb := loadNetherBlocks()
+	for sx := int32(-24); sx <= 24 && (!foundFossil || !foundPortal); sx++ {
+		for sz := int32(-24); sz <= 24 && (!foundFossil || !foundPortal); sz++ {
+			if !foundFossil {
+				if fStub := NetherFossilGenerationPoint(od, sets, seed, sx, sz); fStub != nil {
+					foundFossil = true
+					fc := NewDimensionChunk(int32(fStub.X>>4), int32(fStub.Z>>4), biomeID("minecraft:soul_sand_valley"), NetherDimensionType)
+					if n := PlaceNetherFossil(fc, fStub, seed, int32(fStub.X>>4), int32(fStub.Z>>4)); n == 0 {
+						t.Errorf("seed %d: PlaceNetherFossil at (%d,%d,%d) placed 0 blocks", seed, fStub.X, fStub.Y, fStub.Z)
+					}
+					bones := 0
+					for y := max(0, fStub.Box.minY); y <= min(127, fStub.Box.maxY); y++ {
+						for z := 0; z < 16; z++ {
+							for x := 0; x < 16; x++ {
+								st := fc.GetBlock(x, y, z)
+								if st == nb.boneBlock || stateByIDTable[st].Name == "minecraft:bone_block" || stateByIDTable[st].Name == "minecraft:dried_ghast" {
+									bones++
+								}
+							}
+						}
+					}
+					if bones == 0 {
+						t.Errorf("seed %d: NetherFossil at (%d,%d,%d) placed 0 bone_block/dried_ghast blocks", seed, fStub.X, fStub.Y, fStub.Z)
+					}
+				}
+			}
+			if !foundPortal {
+				if pStub, err := RuinedPortalGenerationPoint(od, sets, seed, sx, sz); err == nil && pStub != nil {
+					foundPortal = true
+				}
+			}
+		}
+	}
+	if !foundFossil || !foundPortal {
+		t.Errorf("seed %d Nether fossil=%v ruined_portal_nether=%v", seed, foundFossil, foundPortal)
 	}
 }
 

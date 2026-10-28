@@ -104,12 +104,14 @@ func netherFossilVariantPoint(od *worldgen.OverworldDensity, sets *worldgen.Stru
 	y := 32 + int(r.NextIntN(94))
 
 	// Scan NoiseColumn at (x, z) downward while y > seaLevel.
+	// Vanilla 26.1.2 NetherFossilStructure.findGenerationPoint:
+	//   if (cur.isAir() && (below.is(Blocks.SOUL_SAND) || below.isFaceSturdy(..., Direction.UP))) break;
 	col := netherNoiseColumn(od, x, z)
 	for y > seaLevel {
 		cur := col[y]
 		y--
 		below := col[y]
-		if cur == StateAir && below == StateNetherrack {
+		if cur == StateAir && (below == StateNetherrack || below == StateSoulSand || below == StateSoulSoil || below == StateBasalt || below == StateBlackstone) {
 			break
 		}
 	}
@@ -247,7 +249,7 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 			case 3:
 				facing = "west"
 			}
-			if ghastState, ok := nameToStateID("minecraft:dried_ghast", map[string]string{"facing": facing, "waterlogged": "false"}); ok {
+			if ghastState, ok := nameToStateID("minecraft:dried_ghast", map[string]string{"facing": facing, "hydration": "0", "waterlogged": "false"}); ok {
 				c.SetBlock(gx&15, gy, gz&15, ghastState)
 				placed++
 			}

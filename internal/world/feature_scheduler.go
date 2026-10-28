@@ -229,10 +229,55 @@ func (r *decorationRegion) hasSourceNeighborhood(sourceX, sourceZ int32) bool {
 	return true
 }
 
+func (r *decorationRegion) isNetherRegion() bool {
+	if r == nil {
+		return false
+	}
+	for _, c := range r.chunks {
+		if c != nil {
+			return c.minY() == netherMinY && c.noSkylight
+		}
+	}
+	return false
+}
+
+func (r *decorationRegion) replayScheduledNetherWithSources(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32, sources []decorationSource) error {
+	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
+		return fmt.Errorf("world: nether structure starts (%d,%d): %w", targetX, targetZ, err)
+	}
+	nreg := &netherRegion{
+		centerX:  targetX,
+		centerZ:  targetZ,
+		chunkMap: r.chunks,
+	}
+	biomeGrids := make(map[[2]int32]*[16][16]string, len(r.chunks))
+	for key, c := range r.chunks {
+		if c != nil {
+			biomeGrids[key] = extractNetherChunkBiomes(c, od)
+		}
+	}
+	for _, source := range sources {
+		if err := r.setSource(source.X, source.Z); err != nil {
+			return err
+		}
+		grid := biomeGrids[[2]int32{source.X, source.Z}]
+		if grid == nil {
+			if c := r.chunks[[2]int32{source.X, source.Z}]; c != nil {
+				grid = extractNetherChunkBiomes(c, od)
+			}
+		}
+		decorateNetherRegionSource(nreg, source.X, source.Z, seed, grid)
+	}
+	return nil
+}
+
 // replayScheduledOresWithSources is replayScheduledOres with the source order supplied,
 // so a measurement can compare orders without a production path depending on the choice.
 // Passing decorationSources(targetX, targetZ) reproduces it exactly.
 func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32, sources []decorationSource) error {
+	if r.isNetherRegion() {
+		return r.replayScheduledNetherWithSources(od, seed, targetX, targetZ, sources)
+	}
 	isDefaultSources := sameDecorationSources(sources, decorationSources(targetX, targetZ))
 	if isDefaultSources {
 		switch {
@@ -391,6 +436,10 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	sets, err := worldgen.LoadStructureSets()
 	if err != nil {
 		return err
+	}
+	if r.isNetherRegion() {
+		PlaceNetherStructuresInRegion(r, od, sets, seed, targetX, targetZ)
+		return nil
 	}
 	// Step 3 (underground_structures): ancient_city (0), buried_treasure (1),
 	// mineshaft / mineshaft_mesa (2, 3), trail_ruins (4), trial_chambers (5).
