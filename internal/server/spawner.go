@@ -45,6 +45,7 @@ func (s *Server) StartSpawning(ctx context.Context, log *slog.Logger) {
 	_ = s.LoadSignsAndLecternsFile()
 	_ = s.LoadBannersFile()
 	_ = s.LoadDragonFightFile()
+	_ = s.LoadRaids()
 	go s.entityTickLoop(ctx, log)
 	go s.mobSpawnLoop(ctx)
 }
@@ -65,6 +66,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			_ = s.SaveSignsAndLecternsFile()
 			_ = s.SaveBannersFile()
 			_ = s.SaveDragonFightFile()
+			_ = s.SaveRaids()
 			return
 		case <-ticker.C:
 			// The world clock, weather cycle, and sleep check ride this 20 TPS loop.
@@ -81,12 +83,14 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 					_ = s.SaveSignsAndLecternsFile()
 					_ = s.SaveBannersFile()
 					_ = s.SaveDragonFightFile()
+					_ = s.SaveRaids()
 				}
 			}
 			s.TickWeather(rng)
 			s.TrySkipNightBySleep()
 			s.TickAllPlayersHunger()
 			s.TickVillagers()
+			s.TickRaids()
 			s.TickMaps()
 			tracker.TickAndBroadcast(s, rng)
 		}

@@ -647,6 +647,7 @@ func (h *handler) serverTickLoop() {
 				h.srv.TickAllEntityEffects()
 				h.srv.TickVillagers()
 				h.srv.TickRaids()
+				h.srv.TickIllagersWitchesRavagersAndVexes(nil)
 				h.srv.TickWithers(nil)
 				h.srv.TickEnderDragons(nil)
 				h.srv.TickWardens(nil)
@@ -756,6 +757,18 @@ func (h *handler) syncVisibleEntities() error {
 			if entity.TypeName == server.MobTypeWarden && h.srv != nil {
 				if metaPkt := h.srv.WardenEntityDataPacket(entity.ID); len(metaPkt) > 0 {
 					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+			}
+			if (server.IsRaiderMobType(entity.TypeName) || entity.TypeName == server.MobTypeVex) && h.srv != nil {
+				if metaPkt := h.srv.RaiderEntityDataPacket(entity.ID); len(metaPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEntityData, metaPkt); err != nil {
+						return err
+					}
+				}
+				if eqPkt := h.srv.RaiderEquipmentPacket(entity.ID); len(eqPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEquipment, eqPkt); err != nil {
 						return err
 					}
 				}

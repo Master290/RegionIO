@@ -254,6 +254,111 @@ func clearSlotOminousBottleAmplifier(session *PlayerSession, slot int) {
 	tr.mu.Unlock()
 }
 
+// SwapSlotOminousBottleAmplifier swaps any tracked ominous_bottle amplifier
+// metadata between slotA and slotB on session.
+func SwapSlotOminousBottleAmplifier(session *PlayerSession, slotA, slotB int) {
+	if session == nil || slotA == slotB ||
+		slotA < 0 || slotA >= world.PlayerInventorySlots ||
+		slotB < 0 || slotB >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getOminousBottleMeta(session)
+	tr.mu.Lock()
+	tr.amplifiers[slotA], tr.amplifiers[slotB] = tr.amplifiers[slotB], tr.amplifiers[slotA]
+	tr.hasCustom[slotA], tr.hasCustom[slotB] = tr.hasCustom[slotB], tr.hasCustom[slotA]
+	tr.mu.Unlock()
+}
+
+// AssociateDroppedOminousBottleAmplifier records the Bad Omen amplifier (0..4)
+// on a spawned ominous_bottle item entity so picking it up restores the amplifier.
+func (s *Server) AssociateDroppedOminousBottleAmplifier(itemEntityID int32, amplifier int32) {
+	if s == nil || itemEntityID <= 0 {
+		return
+	}
+	amp := clampBadOmenAmplifier(amplifier)
+	rm := s.raidManager()
+	rm.mu.Lock()
+	if rm.droppedOminousBottles == nil {
+		rm.droppedOminousBottles = make(map[int32]int32)
+	}
+	rm.droppedOminousBottles[itemEntityID] = amp
+	rm.mu.Unlock()
+}
+
+// DroppedOminousBottleAmplifier returns the Bad Omen amplifier (0..4) associated
+// with a dropped ominous_bottle item entity, if any.
+func (s *Server) DroppedOminousBottleAmplifier(itemEntityID int32) (int32, bool) {
+	if s == nil || itemEntityID <= 0 {
+		return 0, false
+	}
+	rm := s.raidManager()
+	rm.mu.Lock()
+	amp, ok := rm.droppedOminousBottles[itemEntityID]
+	rm.mu.Unlock()
+	return clampBadOmenAmplifier(amp), ok
+}
+
+// TakeDroppedOminousBottleAmplifier removes and returns the Bad Omen amplifier
+// (0..4) associated with a dropped ominous_bottle item entity, if any.
+func (s *Server) TakeDroppedOminousBottleAmplifier(itemEntityID int32) (int32, bool) {
+	if s == nil || itemEntityID <= 0 {
+		return 0, false
+	}
+	rm := s.raidManager()
+	rm.mu.Lock()
+	amp, ok := rm.droppedOminousBottles[itemEntityID]
+	if ok {
+		delete(rm.droppedOminousBottles, itemEntityID)
+	}
+	rm.mu.Unlock()
+	return clampBadOmenAmplifier(amp), ok
+}
+
+// SetGrantBadOmenOnCaptainKill configures whether killing a Raid/Patrol Captain
+// also directly grants or upgrades EffectBadOmen on the killer in addition to
+// dropping an ominous_bottle.
+func (s *Server) SetGrantBadOmenOnCaptainKill(enabled bool) {
+	if s == nil {
+		return
+	}
+	rm := s.raidManager()
+	rm.mu.Lock()
+	rm.grantBadOmenOnCaptainKill = enabled
+	rm.mu.Unlock()
+}
+
+// GrantBadOmenOnCaptainKill reports whether killing a Raid/Patrol Captain
+// directly grants EffectBadOmen on the killer.
+func (s *Server) GrantBadOmenOnCaptainKill() bool {
+	if s == nil {
+		return false
+	}
+	rm := s.raidManager()
+	rm.mu.Lock()
+	enabled := rm.grantBadOmenOnCaptainKill
+	rm.mu.Unlock()
+	return enabled
+}
+
+// GrantBadOmenFromCaptainKill grants or upgrades EffectBadOmen (120000 ticks = 100m,
+// clamped to amplifier 0..4 = Bad Omen I..V) on session when killing a captain.
+func (s *Server) GrantBadOmenFromCaptainKill(session *PlayerSession, captainAmplifier int32) int32 {
+	if s == nil || session == nil || session.IsDead() {
+		return 0
+	}
+	amp := clampBadOmenAmplifier(captainAmplifier)
+	if existing, ok := session.PlayerEffect(EffectBadOmen); ok {
+		next := existing.Amplifier + 1
+		if amp > next {
+			next = amp
+		}
+		amp = clampBadOmenAmplifier(next)
+	}
+	eff := NewStatusEffectInstance(EffectBadOmen, OminousBottleDurationTicks, amp)
+	s.ApplyPlayerEffect(session, eff)
+	return amp
+}
+
 func clampBadOmenAmplifier(amp int32) int32 {
 	if amp < 0 {
 		return 0
@@ -367,9 +472,51 @@ func (s *Server) FindVillageCenterNear(dim string, x, y, z, radius float64) (cen
 		}
 	}
 
-	// If no villagers were found nearby, also check for bed blocks within a
+	// Also include any claimed villager beds and claimed workstations in normDim within radius.
+	if sm := s.villagerSocial(); sm != nil {
+		sm.mu.Lock()
+		for _, site := range sm.bedByEntity {
+			if world.NormalizeDimension(site.Dimension) != normDim {
+				continue
+			}
+			sx := float64(site.Pos.X) + 0.5
+			sy := float64(site.Pos.Y)
+			sz := float64(site.Pos.Z) + 0.5
+			dx := sx - x
+			dy := sy - y
+			dz := sz - z
+			if dx*dx+dy*dy+dz*dz <= rSq {
+				bedCount++
+				sumX += sx
+				sumY += sy
+				sumZ += sz
+				weight++
+			}
+		}
+		for _, site := range sm.jobSiteByEntity {
+			if world.NormalizeDimension(site.Dimension) != normDim {
+				continue
+			}
+			sx := float64(site.Pos.X) + 0.5
+			sy := float64(site.Pos.Y)
+			sz := float64(site.Pos.Z) + 0.5
+			dx := sx - x
+			dy := sy - y
+			dz := sz - z
+			if dx*dx+dy*dy+dz*dz <= rSq {
+				sumX += sx
+				sumY += sy
+				sumZ += sz
+				weight++
+			}
+		}
+		sm.mu.Unlock()
+	}
+
+	// If no villagers or claimed POIs were found nearby, also check for bed blocks within a
 	// compact neighborhood around (x, y, z) so bed POIs can anchor a village.
-	if villagerCount == 0 && s.chunks != nil && normDim == world.DimensionOverworld {
+	cache := s.DimensionChunks(normDim)
+	if weight == 0 && cache != nil {
 		bedScanH := int(math.Min(radius, 8))
 		bedScanV := 4
 		bx0 := int(math.Floor(x))
@@ -386,7 +533,7 @@ func (s *Server) FindVillageCenterNear(dim string, x, y, z, radius float64) (cen
 						continue
 					}
 					bx, bz := bx0+dx, bz0+dz
-					if isBedBlockState(s.chunks.GetBlock(bx, by, bz)) {
+					if isBedBlockState(cache.GetBlock(bx, by, bz)) {
 						bedCount++
 						sumX += float64(bx) + 0.5
 						sumY += float64(by)
@@ -612,12 +759,14 @@ type raidOmenPending struct {
 }
 
 type serverRaidManager struct {
-	mu          sync.Mutex
-	nextRaidID  int32
-	raids       map[int32]*Raid
-	raiderIndex map[int32]*RaiderState       // entityID -> RaiderState (both raid members and patrol captains)
-	omenCenters map[[16]byte]raidOmenPending // player UUID -> pending Raid Omen village center
-	rng         *rand.Rand
+	mu                        sync.Mutex
+	nextRaidID                int32
+	raids                     map[int32]*Raid
+	raiderIndex               map[int32]*RaiderState       // entityID -> RaiderState (both raid members and patrol captains)
+	omenCenters               map[[16]byte]raidOmenPending // player UUID -> pending Raid Omen village center
+	droppedOminousBottles     map[int32]int32              // itemEntityID -> Bad Omen amplifier (0..4)
+	grantBadOmenOnCaptainKill bool
+	rng                       *rand.Rand
 }
 
 var serverRaids sync.Map // map[*Server]*serverRaidManager
@@ -627,10 +776,11 @@ func (s *Server) raidManager() *serverRaidManager {
 		return v.(*serverRaidManager)
 	}
 	actual, _ := serverRaids.LoadOrStore(s, &serverRaidManager{
-		raids:       make(map[int32]*Raid),
-		raiderIndex: make(map[int32]*RaiderState),
-		omenCenters: make(map[[16]byte]raidOmenPending),
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		raids:                 make(map[int32]*Raid),
+		raiderIndex:           make(map[int32]*RaiderState),
+		omenCenters:           make(map[[16]byte]raidOmenPending),
+		droppedOminousBottles: make(map[int32]int32),
+		rng:                   rand.New(rand.NewSource(time.Now().UnixNano())),
 	})
 	return actual.(*serverRaidManager)
 }
@@ -745,6 +895,7 @@ func (s *Server) SpawnRaiderMob(x, y, z float64, typeName string, isCaptain bool
 
 	maxHP := RaiderMaxHealth(norm)
 	s.SetMobHealth(entityID, maxHP)
+	s.ensureIllagerOrRaiderState(entityID, norm, isCaptain)
 
 	rm := s.raidManager()
 	rm.mu.Lock()
@@ -790,16 +941,17 @@ func (s *Server) MarkRaidCaptain(entityID int32, badOmenAmplifier int32) {
 		return
 	}
 	amp := clampBadOmenAmplifier(badOmenAmplifier)
+	typeName := MobTypePillager
+	if s.entities != nil {
+		if ent := s.entities.Get(entityID); ent != nil {
+			typeName = canonicalResourceName(ent.TypeName)
+		}
+	}
+	s.ensureIllagerOrRaiderState(entityID, typeName, true)
 	rm := s.raidManager()
 	rm.mu.Lock()
 	rs, ok := rm.raiderIndex[entityID]
 	if !ok || rs == nil {
-		typeName := MobTypePillager
-		if s.entities != nil {
-			if ent := s.entities.Get(entityID); ent != nil {
-				typeName = canonicalResourceName(ent.TypeName)
-			}
-		}
 		rs = &RaiderState{
 			EntityID:  entityID,
 			TypeName:  typeName,
@@ -820,12 +972,323 @@ func (s *Server) IsRaidCaptain(entityID int32) (isCaptain bool, badOmenAmplifier
 	}
 	rm := s.raidManager()
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rs, ok := rm.raiderIndex[entityID]
-	if !ok || rs == nil || !rs.IsCaptain {
-		return false, 0
+	if ok && rs != nil && rs.IsCaptain {
+		amp := rs.BadOmenAmplifier
+		rm.mu.Unlock()
+		return true, amp
 	}
-	return true, rs.BadOmenAmplifier
+	rm.mu.Unlock()
+	if s.IsIllagerCaptain(entityID) {
+		return true, 0
+	}
+	return false, 0
+}
+
+// IsIllagerCaptain reports whether entityID is marked as a captain in the
+// server's illager behavior tracker.
+func (s *Server) IsIllagerCaptain(entityID int32) bool {
+	if s == nil || entityID <= 0 {
+		return false
+	}
+	st, ok := s.GetIllagerState(entityID)
+	return ok && st.IsCaptain
+}
+
+// RaiderEntityDataPacket returns the SynchedEntityData packet payload for a
+// raider/illager/witch/vex entity (celebrating flag, crossbow charge, spell
+// casting, witch potion drinking, vex charging), or nil if not applicable.
+func (s *Server) RaiderEntityDataPacket(entityID int32) []byte {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return nil
+	}
+	norm := canonicalResourceName(ent.TypeName)
+	switch norm {
+	case MobTypePillager:
+		mgr := s.illagerManager()
+		mgr.mu.RLock()
+		st := mgr.illagers[entityID]
+		celebrating := false
+		charging := false
+		if st != nil {
+			celebrating = st.Celebrating
+			charging = st.ChargingCrossbow
+		}
+		mgr.mu.RUnlock()
+		return EncodePillagerDataPacket(entityID, celebrating, charging)
+	case MobTypeVindicator, MobTypeEvoker, MobTypeIllusioner:
+		mgr := s.illagerManager()
+		mgr.mu.RLock()
+		st := mgr.illagers[entityID]
+		celebrating := false
+		spell := byte(IllagerSpellNone)
+		if st != nil {
+			celebrating = st.Celebrating
+			spell = st.ActiveSpell
+		}
+		mgr.mu.RUnlock()
+		return EncodeSpellcasterDataPacket(entityID, celebrating, spell)
+	case MobTypeWitch:
+		mgr := s.illagerManager()
+		mgr.mu.RLock()
+		st := mgr.witches[entityID]
+		drinking := false
+		if st != nil {
+			drinking = st.Drinking
+		}
+		mgr.mu.RUnlock()
+		return EncodeWitchDataPacket(entityID, false, drinking)
+	case MobTypeVex:
+		mgr := s.illagerManager()
+		mgr.mu.RLock()
+		st := mgr.vexes[entityID]
+		charging := false
+		if st != nil {
+			charging = st.Charging
+		}
+		mgr.mu.RUnlock()
+		return EncodeVexDataPacket(entityID, charging)
+	default:
+		return nil
+	}
+}
+
+// RaiderEquipmentPacket returns the PlaySetEquipment packet payload for an
+// illager/raider/vex (mainhand crossbow/iron_axe/iron_sword and Ominous Banner
+// on head when the entity is a Raid or Patrol Captain), or nil if none.
+func (s *Server) RaiderEquipmentPacket(entityID int32) []byte {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return nil
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return nil
+	}
+	norm := canonicalResourceName(ent.TypeName)
+	switch norm {
+	case MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeIllusioner:
+		isCap, _ := s.IsRaidCaptain(entityID)
+		return EncodeIllagerEquipmentPacket(entityID, DefaultIllagerMainHandWeapon(norm), isCap)
+	case MobTypeVex:
+		return EncodeIllagerEquipmentPacket(entityID, DefaultIllagerMainHandWeapon(MobTypeVex), false)
+	default:
+		return nil
+	}
+}
+
+// SetRaiderCelebrating sets the Celebrating state on an illager or witch and
+// broadcasts its updated SynchedEntityData packet to nearby viewers.
+func (s *Server) SetRaiderCelebrating(entityID int32, celebrating bool) {
+	if s == nil || s.entities == nil || entityID <= 0 {
+		return
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return
+	}
+	norm := canonicalResourceName(ent.TypeName)
+	mgr := s.illagerManager()
+	mgr.mu.Lock()
+	switch norm {
+	case MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeIllusioner:
+		if st := mgr.illagers[entityID]; st != nil {
+			st.Celebrating = celebrating
+		}
+	}
+	mgr.mu.Unlock()
+	if pkt := s.RaiderEntityDataPacket(entityID); len(pkt) > 0 {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySetEntityDataCB, pkt)
+	}
+}
+
+// TrySpawnNaturalIllagerPatrol attempts to spawn a natural Overworld pillager
+// patrol (captain with Ominous Banner + 1..4 pillager followers) 24..48 blocks
+// from an eligible Overworld player who is not inside a village, respecting
+// Peaceful difficulty and the doPatrolSpawning game rule.
+func (s *Server) TrySpawnNaturalIllagerPatrol(rng *rand.Rand) (patrolID int32, memberIDs []int32, ok bool) {
+	if s == nil || s.entities == nil {
+		return 0, nil, false
+	}
+	diff := s.Difficulty()
+	if diff == DifficultyPeaceful || !s.GameRuleBool("doPatrolSpawning") {
+		return 0, nil, false
+	}
+	if rng == nil {
+		rm := s.raidManager()
+		rm.mu.Lock()
+		rng = rm.rng
+		rm.mu.Unlock()
+	}
+
+	var targetPlayer *PlayerSession
+	for _, sess := range s.onlinePlayersSnapshot() {
+		if sess == nil || sess.IsDead() {
+			continue
+		}
+		snap := sess.Snapshot()
+		if snap.GameMode == GameModeSpectator || world.NormalizeDimension(snap.Dimension) != world.DimensionOverworld {
+			continue
+		}
+		if _, _, _, _, _, inVillage := s.FindVillageCenterNear(world.DimensionOverworld, snap.X, snap.Y, snap.Z, VillageDetectionRadius); inVillage {
+			continue
+		}
+		targetPlayer = sess
+		break
+	}
+	if targetPlayer == nil {
+		return 0, nil, false
+	}
+	snap := targetPlayer.Snapshot()
+
+	// Avoid spawning another patrol if one is already active near this player.
+	mgr := s.illagerManager()
+	mgr.mu.RLock()
+	for _, pat := range mgr.patrols {
+		if pat == nil || world.NormalizeDimension(pat.Dimension) != world.DimensionOverworld {
+			continue
+		}
+		if lead := s.entities.Get(pat.LeaderID); lead != nil {
+			dx := lead.X - snap.X
+			dz := lead.Z - snap.Z
+			if dx*dx+dz*dz <= 64.0*64.0 {
+				mgr.mu.RUnlock()
+				return 0, nil, false
+			}
+		}
+	}
+	mgr.mu.RUnlock()
+
+	const (
+		patrolSpawnMinRadius = 24.0
+		patrolSpawnMaxRadius = 48.0
+	)
+	dist := patrolSpawnMinRadius
+	if rng != nil {
+		dist += rng.Float64() * (patrolSpawnMaxRadius - patrolSpawnMinRadius)
+	}
+	angle := 0.0
+	if rng != nil {
+		angle = rng.Float64() * 2.0 * math.Pi
+	}
+	sx := snap.X + math.Cos(angle)*dist
+	sz := snap.Z + math.Sin(angle)*dist
+	sy := s.findRaidSpawnY(int(math.Floor(sx)), int(math.Floor(snap.Y)), int(math.Floor(sz)))
+
+	memberCount := 2
+	switch diff {
+	case DifficultyNormal:
+		memberCount = 3
+	case DifficultyHard:
+		memberCount = 4
+	}
+	pid, _, ids, err := s.SpawnIllagerPatrol(world.DimensionOverworld, sx, sy, sz, memberCount, 0, rng)
+	if err != nil || pid <= 0 || len(ids) == 0 {
+		return 0, nil, false
+	}
+	s.MarkRaidCaptain(ids[0], 0)
+	return pid, ids, true
+}
+
+// StepIllagerPatrols advances active pillager patrols: promotes surviving
+// followers or banner pickers when a patrol leader dies, and marches the patrol
+// leader toward its patrol waypoint when not engaged in combat.
+func (s *Server) StepIllagerPatrols() {
+	if s == nil || s.entities == nil {
+		return
+	}
+	mgr := s.illagerManager()
+	mgr.mu.RLock()
+	if len(mgr.patrols) == 0 {
+		mgr.mu.RUnlock()
+		return
+	}
+	patrolIDs := make([]int32, 0, len(mgr.patrols))
+	for id := range mgr.patrols {
+		patrolIDs = append(patrolIDs, id)
+	}
+	mgr.mu.RUnlock()
+
+	for _, pid := range patrolIDs {
+		mgr.mu.Lock()
+		pat, exists := mgr.patrols[pid]
+		if !exists || pat == nil {
+			mgr.mu.Unlock()
+			continue
+		}
+		alive := make([]int32, 0, len(pat.MemberIDs))
+		for _, mid := range pat.MemberIDs {
+			if ent := s.entities.Get(mid); ent != nil && s.MobHealth(mid) > 0 {
+				alive = append(alive, mid)
+			}
+		}
+		if len(alive) == 0 {
+			delete(mgr.patrols, pid)
+			mgr.mu.Unlock()
+			continue
+		}
+		pat.MemberIDs = alive
+		leaderID := pat.LeaderID
+		leaderAlive := false
+		for _, mid := range alive {
+			if mid == leaderID {
+				leaderAlive = true
+				break
+			}
+		}
+		targetX, targetZ := pat.TargetX, pat.TargetZ
+		dim := pat.Dimension
+		mgr.mu.Unlock()
+
+		if !leaderAlive {
+			promoted := int32(0)
+			for _, mid := range alive {
+				if s.TryPromoteRaiderFromDroppedBanner(mid) {
+					promoted = mid
+					break
+				}
+			}
+			if promoted == 0 {
+				promoted = alive[0]
+				s.PromoteRaiderToCaptain(promoted, 0)
+			}
+			s.MarkRaidCaptain(promoted, 0)
+			mgr.mu.Lock()
+			if live := mgr.patrols[pid]; live != nil {
+				live.LeaderID = promoted
+			}
+			mgr.mu.Unlock()
+			leaderID = promoted
+		}
+
+		leaderEnt := s.entities.Get(leaderID)
+		if leaderEnt == nil {
+			continue
+		}
+		// Only march along the waypoint if no survival player is within aggro range.
+		targets := s.appendPlayerTargets(nil)
+		if _, engaged := selectTargetWithinRange(targets, leaderEnt.X, leaderEnt.Y, leaderEnt.Z, RaiderAggroRange); engaged {
+			continue
+		}
+		dx := targetX - leaderEnt.X
+		dz := targetZ - leaderEnt.Z
+		if dx*dx+dz*dz <= 6.25 {
+			mgr.mu.Lock()
+			if live := mgr.patrols[pid]; live != nil {
+				live.TargetX = leaderEnt.X + 24.0
+				live.TargetZ = leaderEnt.Z + 24.0
+				targetX, targetZ = live.TargetX, live.TargetZ
+			}
+			mgr.mu.Unlock()
+		}
+		cache := s.DimensionChunks(dim)
+		feetY := int(math.Floor(leaderEnt.Y + 0.01))
+		s.stepEntityTowardPoint(leaderEnt, cache, feetY, targetX, leaderEnt.Y, targetZ, RaiderChaseSpeed*0.75, 1.5)
+	}
 }
 
 // RaidLootDropsForRaider returns the vanilla item drops for a killed raider of
@@ -889,7 +1352,7 @@ func (s *Server) CheckPlayerBadOmenInVillage(session *PlayerSession) (converted 
 	if s == nil || session == nil || session.IsDead() {
 		return false, 0, 0, 0
 	}
-	if s.Difficulty() == DifficultyPeaceful {
+	if s.Difficulty() == DifficultyPeaceful || s.GameRuleBool("disableRaids") {
 		return false, 0, 0, 0
 	}
 	snap := session.Snapshot()
@@ -936,7 +1399,7 @@ func (s *Server) TriggerRaidFromBadOmen(session *PlayerSession) (*Raid, bool) {
 	if s == nil || session == nil || session.IsDead() {
 		return nil, false
 	}
-	if s.Difficulty() == DifficultyPeaceful {
+	if s.Difficulty() == DifficultyPeaceful || s.GameRuleBool("disableRaids") {
 		return nil, false
 	}
 	snap := session.Snapshot()
@@ -989,7 +1452,7 @@ func (s *Server) TriggerRaidFromBadOmen(session *PlayerSession) (*Raid, bool) {
 // merges the incoming omenLevel (1..5) into an existing ongoing raid within
 // DefaultRaidRadius (96 blocks), initializing and synchronizing the Raid Boss Bar.
 func (s *Server) StartOrAbsorbRaid(dim string, centerX, centerY, centerZ float64, omenLevel int, starter *PlayerSession) *Raid {
-	if s == nil || s.Difficulty() == DifficultyPeaceful {
+	if s == nil || s.Difficulty() == DifficultyPeaceful || s.GameRuleBool("disableRaids") {
 		return nil
 	}
 	if omenLevel < 1 {
@@ -1277,35 +1740,56 @@ func (s *Server) OnRaiderKilled(entityID int32, killer *PlayerSession) bool {
 		return false
 	}
 	var entPos [3]float64
+	entDim := world.DimensionOverworld
+	var entTypeName string
 	hasPos := false
 	if s.entities != nil {
 		if ent := s.entities.Get(entityID); ent != nil {
 			entPos = [3]float64{ent.X, ent.Y, ent.Z}
+			entDim = ent.EffectiveDimension()
+			entTypeName = canonicalResourceName(ent.TypeName)
 			hasPos = true
 			// Ensure entity is removed if not already removed by combat.go.
 			cp := ent.ChunkPos()
 			s.entities.Remove(entityID)
-			s.BroadcastChunk(cp.X, cp.Z, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+			s.BroadcastDimensionChunk(entDim, cp.X, cp.Z, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
 		}
 	} else if killer != nil {
 		snap := killer.Snapshot()
 		entPos = [3]float64{snap.X, snap.Y, snap.Z}
+		entDim = world.NormalizeDimension(snap.Dimension)
 		hasPos = true
 	}
+
+	illagerCap := s.IsIllagerCaptain(entityID)
 
 	rm := s.raidManager()
 	rm.mu.Lock()
 	rs, tracked := rm.raiderIndex[entityID]
-	if !tracked || rs == nil {
+	if (!tracked || rs == nil) && !illagerCap && !IsRaiderMobType(entTypeName) {
 		rm.mu.Unlock()
 		return false
 	}
 	delete(rm.raiderIndex, entityID)
 
-	raidID := rs.RaidID
-	isCaptain := rs.IsCaptain
-	omenAmp := rs.BadOmenAmplifier
-	typeName := rs.TypeName
+	var raidID int32
+	isCaptain := illagerCap
+	var omenAmp int32
+	typeName := entTypeName
+	if tracked && rs != nil {
+		raidID = rs.RaidID
+		if rs.IsCaptain {
+			isCaptain = true
+		}
+		omenAmp = rs.BadOmenAmplifier
+		if rs.TypeName != "" {
+			typeName = rs.TypeName
+		}
+	}
+	if typeName == "" {
+		typeName = MobTypePillager
+	}
+	directGrant := rm.grantBadOmenOnCaptainKill
 
 	if raidID > 0 {
 		if r, ok := rm.raids[raidID]; ok && r != nil {
@@ -1320,7 +1804,10 @@ func (s *Server) OnRaiderKilled(entityID int32, killer *PlayerSession) bool {
 	if hasPos {
 		drops := RaidLootDropsForRaider(typeName, isCaptain, omenAmp, rm.rng)
 		for _, drop := range drops {
-			s.SpawnItemEntity(entPos[0], entPos[1]+0.25, entPos[2], drop)
+			dropID, _ := s.SpawnItemEntityInDimension(entDim, entPos[0], entPos[1]+0.25, entPos[2], drop)
+			if isCaptain && IsOminousBottleItem(drop) && dropID > 0 {
+				s.AssociateDroppedOminousBottleAmplifier(dropID, omenAmp)
+			}
 		}
 	}
 
@@ -1328,6 +1815,9 @@ func (s *Server) OnRaiderKilled(entityID int32, killer *PlayerSession) bool {
 		s.TriggerEntityKilled(killer, typeName)
 		if isCaptain {
 			s.TriggerVoluntaryExile(killer)
+			if directGrant {
+				s.GrantBadOmenFromCaptainKill(killer, omenAmp)
+			}
 		}
 	}
 
@@ -1424,6 +1914,114 @@ func (s *Server) grantRaidVictoryRewards(dim string, cx, cy, cz float64, badOmen
 		s.ApplyPlayerEffect(p, eff)
 		s.TriggerHeroOfTheVillage(p)
 	}
+
+	// Villagers in the village celebrate victory with happy particles, celebration sounds, and fireworks.
+	chunkX := int32(int64(math.Floor(cx)) >> 4)
+	chunkZ := int32(int64(math.Floor(cz)) >> 4)
+	s.BroadcastDimensionChunk(normDim, chunkX, chunkZ, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:entity.firework_rocket.launch", SoundSourceNeutral, cx, cy+1.0, cz, 3.0, 1.0, 0))
+	s.BroadcastDimensionChunk(normDim, chunkX, chunkZ, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:entity.firework_rocket.blast", SoundSourceNeutral, cx, cy+6.0, cz, 3.0, 1.0, 0))
+
+	if s.entities != nil {
+		for _, ent := range s.entities.AppendAll(nil) {
+			if ent.TypeName != MobTypeVillager || ent.EffectiveDimension() != normDim {
+				continue
+			}
+			dx := ent.X - cx
+			dy := ent.Y - cy
+			dz := ent.Z - cz
+			if dx*dx+dy*dy+dz*dz <= rSq {
+				cp := ent.ChunkPos()
+				s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayEntityEvent,
+					EncodeEntityEventPacket(ent.ID, EntityEventVillagerHappy))
+				s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket("minecraft:entity.villager.celebrate", SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			}
+		}
+	}
+}
+
+func (s *Server) celebrateRaidDefeatRaiders(raidID int32) {
+	if s == nil || s.entities == nil {
+		return
+	}
+	rm := s.raidManager()
+	rm.mu.Lock()
+	r, ok := rm.raids[raidID]
+	if !ok || r == nil {
+		rm.mu.Unlock()
+		return
+	}
+	ids := make([]int32, 0, len(r.Raiders))
+	for eid := range r.Raiders {
+		ids = append(ids, eid)
+	}
+	rm.mu.Unlock()
+
+	for _, eid := range ids {
+		s.SetRaiderCelebrating(eid, true)
+		if ent := s.entities.Get(eid); ent != nil {
+			snd := SoundPillagerCelebrate
+			switch canonicalResourceName(ent.TypeName) {
+			case MobTypeVindicator:
+				snd = SoundVindicatorCelebrate
+			case MobTypeEvoker:
+				snd = SoundEvokerCelebrate
+			case MobTypeWitch:
+				snd = SoundWitchCelebrate
+			case MobTypeRavager:
+				snd = SoundRavagerCelebrate
+			}
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(snd, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		}
+	}
+}
+
+func (s *Server) stepHeroOfTheVillageGifts() {
+	if s == nil || s.entities == nil {
+		return
+	}
+	var heroes []*PlayerSession
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && !p.IsDead() && p.HasPlayerEffect(EffectHeroOfTheVillage) {
+			heroes = append(heroes, p)
+		}
+	}
+	if len(heroes) == 0 {
+		return
+	}
+	rm := s.raidManager()
+	rm.mu.Lock()
+	rng := rm.rng
+	rm.mu.Unlock()
+
+	vp := s.villagerPolish()
+	for _, ent := range s.entities.AppendAll(nil) {
+		if ent.TypeName != MobTypeVillager {
+			continue
+		}
+		vp.mu.Lock()
+		ve := vp.ensureVillagerLocked(ent.ID)
+		if ve.GiftCooldown > 0 {
+			ve.GiftCooldown--
+		}
+		vp.mu.Unlock()
+
+		for _, hero := range heroes {
+			if _, ok := s.TryThrowHeroOfTheVillageGift(ent.ID, hero, rng); ok {
+				cp := ent.ChunkPos()
+				dim := ent.EffectiveDimension()
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+					EncodeEntityEventPacket(ent.ID, EntityEventVillagerHappy))
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket("minecraft:entity.villager.celebrate", SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+				break
+			}
+		}
+	}
 }
 
 // StopRaid stops and removes the raid with raidID, removing its runtime boss bar.
@@ -1458,21 +2056,25 @@ func (s *Server) StopRaid(raidID int32) bool {
 // TickRaids advances the server's raid system by one game tick:
 //  1. Checks online players for Bad Omen inside villages (converting to Raid Omen)
 //     and triggers/absorbs a raid when Raid Omen finishes its countdown.
-//  2. Updates all active raids: checks Peaceful stop, village loss (Defeat),
-//     pre-wave warmup -> wave spawn, raider health/death reconciliation, raider
-//     movement & combat AI, wave completion -> next wave or Victory, and post-raid
-//     cleanup.
+//  2. Steps active Pillager Patrols and Hero of the Village gift throwing.
+//  3. Updates all active raids: checks Peaceful/disableRaids stop, village loss
+//     (Defeat), pre-wave warmup -> wave spawn, raider health/death reconciliation,
+//     raider movement & combat AI, wave completion -> next wave or Victory, and
+//     post-raid cleanup.
 func (s *Server) TickRaids() {
 	if s == nil {
 		return
 	}
 
-	if s.Difficulty() == DifficultyPeaceful {
+	if s.Difficulty() == DifficultyPeaceful || s.GameRuleBool("disableRaids") {
 		for _, r := range s.ActiveRaids() {
 			s.StopRaid(r.ID)
 		}
 		return
 	}
+
+	s.StepIllagerPatrols()
+	s.stepHeroOfTheVillageGifts()
 
 	// 1. Check online players for Bad Omen -> Raid Omen and expiring Raid Omen -> Raid start.
 	for _, p := range s.onlinePlayersSnapshot() {
@@ -1548,12 +2150,17 @@ func (s *Server) tickSingleRaid(raidID int32) {
 
 	// Check if the village still has at least one living villager or bed.
 	if groupsSpawned > 0 && !s.HasVillagePresenceAt(dim, cx, cy, cz, DefaultRaidRadius) {
+		becameDefeat := false
 		rm.mu.Lock()
 		if live, exists := rm.raids[raidID]; exists && live != nil && live.Status == RaidStatusOngoing {
 			live.Status = RaidStatusDefeat
 			live.PostEndTicks = 0
+			becameDefeat = true
 		}
 		rm.mu.Unlock()
+		if becameDefeat {
+			s.celebrateRaidDefeatRaiders(raidID)
+		}
 		s.syncRaidBossBar(raidID)
 		return
 	}
@@ -1595,9 +2202,13 @@ func (s *Server) stepRaidRaidersAI(raidID int32, dim string, centerX, centerY, c
 		rm.mu.Unlock()
 		return
 	}
+	hasAliveCaptain := false
 	raiderList := make([]*RaiderState, 0, len(r.Raiders))
 	for _, rs := range r.Raiders {
 		if rs != nil {
+			if rs.IsCaptain {
+				hasAliveCaptain = true
+			}
 			cp := *rs
 			raiderList = append(raiderList, &cp)
 		}
@@ -1615,6 +2226,13 @@ func (s *Server) stepRaidRaidersAI(raidID int32, dim string, centerX, centerY, c
 		hp := s.MobHealth(rs.EntityID)
 		if hp <= 0 {
 			continue
+		}
+
+		// If the raid wave's captain died and dropped an Ominous Banner, allow a
+		// surviving illager to pick up the banner and become the new wave captain.
+		if !hasAliveCaptain && !rs.IsCaptain && s.TryPromoteRaiderFromDroppedBanner(rs.EntityID) {
+			s.MarkRaidCaptain(rs.EntityID, 0)
+			hasAliveCaptain = true
 		}
 
 		// Determine goal: nearest survival player within RaiderAggroRange, or village center.

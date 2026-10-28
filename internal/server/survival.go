@@ -851,15 +851,17 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 			} else {
 				killed = true
 				s.SetMobHealth(targetEntityID, 0)
+				s.OnEntityDiedWithEffects(target.ID)
 				deathSnd, deathSrc := mobDeathSound(target.TypeName)
 				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 					EncodeSoundPacket(deathSnd, deathSrc, target.X, target.Y, target.Z, 1.0, 1.0, 0))
 				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, protocol.PlayEntityEvent,
 					EncodeEntityEventPacket(target.ID, EntityEventDeath))
+				raiderHandled := s.OnRaiderKilled(target.ID, session)
 				s.entities.Remove(target.ID)
 				s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
 					encodeRemoveEntitiesPacket(nil, []int32{target.ID}))
-				if s.DoMobLoot() {
+				if !raiderHandled && s.DoMobLoot() {
 					for _, drop := range MobLootDrops(target.TypeName, nil) {
 						s.SpawnItemEntityInDimension(target.EffectiveDimension(), target.X, target.Y+0.25, target.Z, drop)
 					}
@@ -1191,6 +1193,14 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 		if mapID, ok := s.DroppedMapEntityID(live.ID); ok {
 			for _, slot := range changedSlots {
 				SetSlotMapID(session, slot, mapID)
+			}
+		}
+		if omenAmp, ok := s.DroppedOminousBottleAmplifier(live.ID); ok && IsOminousBottleItem(live.Item) {
+			for _, slot := range changedSlots {
+				SetSlotOminousBottleAmplifier(session, slot, omenAmp)
+			}
+			if added >= live.Item.Count {
+				s.TakeDroppedOminousBottleAmplifier(live.ID)
 			}
 		}
 		hasBundleContents := false
@@ -3827,6 +3837,8 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 	slotMapID, hasSlotMapID := GetSlotMapID(session, invSlot)
 	slotBundle := GetSlotBundleContents(session, invSlot)
 	slotMeta := GetSlotItemMeta(session, invSlot)
+	isOminousBottle := IsOminousBottleItem(cur)
+	slotOminousAmp := GetSlotOminousBottleAmplifier(session, invSlot)
 	s.StopUsingSpyglass(session)
 
 	rem := cur.Count - dropCount
@@ -3841,6 +3853,7 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		ClearSlotBundleContents(session, invSlot)
 		ClearSlotWritableBook(session, invSlot)
 		ClearSlotWrittenBook(session, invSlot)
+		clearSlotOminousBottleAmplifier(session, invSlot)
 	} else {
 		session.SetInventorySlot(invSlot, world.NewItemStack(cur.ResolvedItemID(), rem))
 	}
@@ -3875,6 +3888,9 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		}
 		if len(slotBundle) > 0 && IsBundleItem(dropped.ResolvedID()) {
 			s.AssociateDroppedBundleEntity(entID, slotBundle)
+		}
+		if isOminousBottle {
+			s.AssociateDroppedOminousBottleAmplifier(entID, slotOminousAmp)
 		}
 	}
 	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)
@@ -3994,6 +4010,7 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 	}
 	SetSlotBannerPatterns(session, mainSlot, offBanner)
 	SetSlotBannerPatterns(session, offSlot, mainBanner)
+	SwapSlotOminousBottleAmplifier(session, mainSlot, offSlot)
 
 	if session.send != nil {
 		stateID := session.NextContainerStateID()

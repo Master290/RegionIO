@@ -916,6 +916,9 @@ func (s *Server) SelectMerchantTrade(session *PlayerSession, tradeIndex int) err
 		return nil
 	}
 	entityID := int32(tr.open.BlockX)
+	if ent := s.entities.Get(entityID); ent == nil || canonicalResourceName(ent.TypeName) != MobTypeWanderingTrader {
+		s.UpdateVillagerSpecialPricesForPlayer(session, entityID)
+	}
 	vs, ok := s.VillagerState(entityID)
 	if !ok || tradeIndex < 0 || tradeIndex >= len(vs.Offers) {
 		tr.mu.Unlock()
@@ -1059,6 +1062,9 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	}
 
 	entityID := int32(tr.open.BlockX)
+	if ent := s.entities.Get(entityID); ent == nil || canonicalResourceName(ent.TypeName) != MobTypeWanderingTrader {
+		s.UpdateVillagerSpecialPricesForPlayer(session, entityID)
+	}
 	vs := s.ensureVillagerState(entityID)
 	if vs == nil {
 		tr.mu.Unlock()

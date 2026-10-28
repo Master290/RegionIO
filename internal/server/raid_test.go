@@ -354,3 +354,225 @@ func TestRaidDefeatWhenVillageLostAndNBTPersistence(t *testing.T) {
 		t.Fatalf("bossbar title on defeat = %q, want Raid - Defeat", bar.Name.Text)
 	}
 }
+
+func TestPillagerPatrolPlayPathOminousBottlePickupAndBannerPromotion(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	srv.SetDifficulty(DifficultyNormal)
+
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("PatrolHunter"),
+		Name: "PatrolHunter",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	sess.mu.Lock()
+	sess.position = [3]float64{100.5, 5.0, 100.5}
+	sess.mu.Unlock()
+
+	// Disable doPatrolSpawning -> natural patrol should not spawn.
+	srv.SetGameRuleBool("doPatrolSpawning", false)
+	if _, _, ok := srv.TrySpawnNaturalIllagerPatrol(nil); ok {
+		t.Fatal("expected TrySpawnNaturalIllagerPatrol to respect doPatrolSpawning=false")
+	}
+
+	// Enable doPatrolSpawning -> natural patrol spawns with captain + followers.
+	srv.SetGameRuleBool("doPatrolSpawning", true)
+	patrolID, members, ok := srv.TrySpawnNaturalIllagerPatrol(nil)
+	if !ok || patrolID <= 0 || len(members) < 2 {
+		t.Fatalf("TrySpawnNaturalIllagerPatrol = (%d, %v, %v), want patrol with >=2 members", patrolID, members, ok)
+	}
+	leaderID := members[0]
+	followerID := members[1]
+
+	isCap, _ := srv.IsRaidCaptain(leaderID)
+	if !isCap || !srv.IsIllagerCaptain(leaderID) {
+		t.Fatalf("expected patrol leader %d to be marked captain in both raid and illager trackers", leaderID)
+	}
+	if eqPkt := srv.RaiderEquipmentPacket(leaderID); len(eqPkt) == 0 {
+		t.Fatal("expected non-empty RaiderEquipmentPacket (crossbow + Ominous Banner) for patrol captain")
+	}
+	if metaPkt := srv.RaiderEntityDataPacket(leaderID); len(metaPkt) == 0 {
+		t.Fatal("expected non-empty RaiderEntityDataPacket for patrol captain")
+	}
+
+	// Set custom Bad Omen III (amplifier 2) on the captain, move captain near player, and kill with enchanted sword.
+	srv.MarkRaidCaptain(leaderID, 2)
+	srv.entities.Update(leaderID, func(e *world.Entity) {
+		e.X = 101.5
+		e.Y = 5.0
+		e.Z = 100.5
+	})
+	// Position follower right where the banner will drop so StepIllagerPatrols promotes it via banner pickup.
+	srv.entities.Update(followerID, func(e *world.Entity) {
+		e.X = 101.5
+		e.Y = 5.0
+		e.Z = 100.5
+	})
+
+	sword := world.NewNamedItemStack("minecraft:netherite_sword", 1)
+	sess.SetInventorySlot(36, sword)
+	SetSlotItemMeta(sess, 36, ItemMeta{
+		Enchantments: map[string]int{EnchantSharpness: 5},
+	})
+	srv.SetMobHealth(leaderID, 10.0)
+	if _, killed := srv.AttackEntityWithEnchantments(sess, leaderID); !killed {
+		t.Fatal("expected enchanted sword strike to kill patrol captain")
+	}
+	if !sess.HasCompletedAdvancement("minecraft:adventure/voluntary_exile") {
+		t.Fatal("expected minecraft:adventure/voluntary_exile advancement after killing patrol captain with enchanted sword")
+	}
+
+	// StepIllagerPatrols should promote the surviving follower to captain after picking up the dropped banner.
+	srv.StepIllagerPatrols()
+	if isFolCap, _ := srv.IsRaidCaptain(followerID); !isFolCap {
+		t.Fatal("expected surviving patrol follower to be promoted to captain after leader death")
+	}
+
+	// Move player onto the dropped ominous_bottle and pick it up: slot amplifier (2 = Bad Omen III) must be preserved.
+	sess.SetInventorySlot(36, world.ItemStack{})
+	sess.mu.Lock()
+	sess.position = [3]float64{101.5, 5.0, 100.5}
+	sess.mu.Unlock()
+	if picked := srv.TryPickupItems(sess); picked <= 0 {
+		t.Fatal("expected player to pick up dropped patrol captain loot")
+	}
+
+	bottleSlot := -1
+	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
+		if IsOminousBottleItem(sess.InventorySlot(slot)) {
+			bottleSlot = slot
+			break
+		}
+	}
+	if bottleSlot < 0 {
+		t.Fatal("expected picked-up ominous_bottle in player inventory")
+	}
+	if gotAmp := GetSlotOminousBottleAmplifier(sess, bottleSlot); gotAmp != 2 {
+		t.Fatalf("picked-up ominous_bottle amplifier = %d, want 2 (Bad Omen III)", gotAmp)
+	}
+
+	// Move ominous_bottle to hotbar slot 36, swap to offhand and back, drop and re-pickup, then drink.
+	if bottleSlot != 36 {
+		sess.SetInventorySlot(36, sess.InventorySlot(bottleSlot))
+		SetSlotOminousBottleAmplifier(sess, 36, GetSlotOminousBottleAmplifier(sess, bottleSlot))
+		sess.SetInventorySlot(bottleSlot, world.ItemStack{})
+		clearSlotOminousBottleAmplifier(sess, bottleSlot)
+	}
+	if !srv.SwapHeldWithOffhand(sess) {
+		t.Fatal("SwapHeldWithOffhand failed")
+	}
+	if gotAmp := GetSlotOminousBottleAmplifier(sess, OffHandContainerSlot); gotAmp != 2 {
+		t.Fatalf("offhand ominous_bottle amplifier after swap = %d, want 2", gotAmp)
+	}
+	if !srv.DrinkOminousBottle(sess, HandOffHand) {
+		t.Fatal("DrinkOminousBottle from offhand failed")
+	}
+	eff, hasBadOmen := sess.PlayerEffect(EffectBadOmen)
+	if !hasBadOmen || eff.Amplifier != 2 {
+		t.Fatalf("Bad Omen after drinking captain's ominous_bottle = %+v (ok=%v), want amplifier=2", eff, hasBadOmen)
+	}
+}
+
+func TestHeroOfTheVillageTradeExecutionAndAutomaticVillagerGifts(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	srv.SetDifficulty(DifficultyEasy)
+
+	var packets []int32
+	sess, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("HeroTrader"),
+		Name: "HeroTrader",
+	}, func(pktID int32, payload []byte) error {
+		packets = append(packets, pktID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	sess.mu.Lock()
+	sess.position = [3]float64{50.5, 5.0, 50.5}
+	sess.mu.Unlock()
+
+	villagerID, err := srv.SpawnVillager(52.0, 5.0, 50.5, VillagerProfessionFarmer, 1)
+	if err != nil {
+		t.Fatalf("SpawnVillager: %v", err)
+	}
+	// Configure an offer costing 20 emeralds -> 1 bread so Hero of the Village V (55% discount -> -11) reduces cost to 9 emeralds.
+	vs, _ := srv.VillagerState(villagerID)
+	vs.Offers = []MerchantOffer{
+		{
+			Name:            "minecraft:farmer/bread_bundle",
+			BaseCostA:       world.NewNamedItemStack("minecraft:emerald", 20),
+			Result:          world.NewNamedItemStack("minecraft:bread", 4),
+			MaxUses:         16,
+			PriceMultiplier: 0.05,
+			XP:              2,
+		},
+	}
+	srv.SetVillagerState(villagerID, vs)
+
+	// Grant Hero of the Village V (amplifier 4) to the player.
+	srv.ApplyPlayerEffect(sess, NewStatusEffectInstance(EffectHeroOfTheVillage, HeroOfTheVillageDurationTicks, 4))
+
+	// Give player 12 emeralds (enough for discounted cost 9, not enough for base cost 20).
+	sess.SetInventorySlot(36, world.NewNamedItemStack("minecraft:emerald", 12))
+
+	cid, err := srv.OpenMerchant(sess, villagerID)
+	if err != nil {
+		t.Fatalf("OpenMerchant: %v", err)
+	}
+	if err := srv.SelectMerchantTrade(sess, 0); err != nil {
+		t.Fatalf("SelectMerchantTrade: %v", err)
+	}
+	if err := srv.HandleMerchantContainerClick(sess, cid, MerchantSlotResult, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleMerchantContainerClick: %v", err)
+	}
+	if carried := sess.CarriedItem(); carried.IsEmpty() || carried.ResolvedID() != "minecraft:bread" || carried.Count != 4 {
+		t.Fatalf("carried item after Hero of the Village trade = %+v, want 4x minecraft:bread", carried)
+	}
+	_ = srv.CloseMerchantContainer(sess, cid, false)
+
+	// Remaining emeralds in player inventory should be 12 - 9 = 3.
+	var remEmeralds int32
+	for i := 0; i < world.PlayerInventorySlots; i++ {
+		st := sess.InventorySlot(i)
+		if st.ResolvedID() == "minecraft:emerald" {
+			remEmeralds += st.Count
+		}
+	}
+	if remEmeralds != 3 {
+		t.Fatalf("remaining emeralds after Hero V discounted trade = %d, want 3 (20 - 11 = 9 cost)", remEmeralds)
+	}
+
+	// TickRaids should also trigger the nearby employed farmer to throw a Hero of the Village gift item entity.
+	beforeEnts := len(srv.entities.All())
+	srv.TickRaids()
+	afterEnts := len(srv.entities.All())
+	if afterEnts <= beforeEnts {
+		t.Fatalf("expected nearby farmer villager to throw a Hero of the Village gift item during TickRaids (entities %d -> %d)", beforeEnts, afterEnts)
+	}
+
+	// Verify disableRaids gamerule stops an active raid.
+	raid := srv.StartOrAbsorbRaid(world.DimensionOverworld, 52.0, 5.0, 50.5, 1, sess)
+	if raid == nil {
+		t.Fatal("expected raid to start when disableRaids=false")
+	}
+	srv.SetGameRuleBool("disableRaids", true)
+	srv.TickRaids()
+	if _, stillActive := srv.RaidByID(raid.ID); stillActive {
+		t.Fatal("expected active raid to stop when disableRaids=true")
+	}
+}
+
