@@ -228,4 +228,34 @@ func TestNoteBlockCopperFamilyTrumpetsAndVerticalSync(t *testing.T) {
 	if inst, _, _, ok := c.NoteBlockPropertiesAt(30, y, 30); !ok || inst != "trumpet_oxidized" {
 		t.Fatalf("after breaking skeleton_skull above, note_block instrument = %q, want trumpet_oxidized", inst)
 	}
+
+	// Placing a note_block directly beneath an existing note_block updates the upper note_block to "bass".
+	c.ApplyBlockWithUpdates(30, y-1, 30, nb)
+	if inst, _, _, ok := c.NoteBlockPropertiesAt(30, y, 30); !ok || inst != "bass" {
+		t.Fatalf("after placing note_block below, upper note_block instrument = %q, want bass", inst)
+	}
+	if got := NoteInstrumentForBlockName("minecraft:creaking_heart"); got != "bass" {
+		t.Fatalf("NoteInstrumentForBlockName(creaking_heart) = %q, want bass", got)
+	}
+
+	// Verify ShouldPassNoteBlockUseForTopHead and Jukebox helpers.
+	if !ShouldPassNoteBlockUseForTopHead("minecraft:creeper_head", "up") {
+		t.Fatal("expected ShouldPassNoteBlockUseForTopHead(creeper_head, up) == true")
+	}
+	if ShouldPassNoteBlockUseForTopHead("minecraft:creeper_head", "north") {
+		t.Fatal("expected ShouldPassNoteBlockUseForTopHead(creeper_head, north) == false")
+	}
+	if ShouldPassNoteBlockUseForTopHead("minecraft:stone", "up") {
+		t.Fatal("expected ShouldPassNoteBlockUseForTopHead(stone, up) == false")
+	}
+	jbTrue, ok := MakeJukeboxBlockState(true)
+	if !ok {
+		t.Fatal("MakeJukeboxBlockState(true) failed")
+	}
+	if hasRec, isJB := ParseJukeboxBlockState(jbTrue); !isJB || !hasRec {
+		t.Fatalf("ParseJukeboxBlockState(jbTrue) = (%v, %v), want (true, true)", hasRec, isJB)
+	}
+	if sig, ok := JukeboxComparatorOutputForDisc("minecraft:music_disc_creator_music_box"); !ok || sig != 11 {
+		t.Fatalf("JukeboxComparatorOutputForDisc(creator_music_box) = (%d, %v), want (11, true)", sig, ok)
+	}
 }

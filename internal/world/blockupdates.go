@@ -263,7 +263,7 @@ func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpd
 				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
 			}
 		}
-		if !IsNoteBlock(targetState) {
+		if !IsNoteBlock(targetState) || !IsNoteBlock(oldState) {
 			c.syncVerticalNoteBlocksAt(x, y, z, &res)
 		}
 	}
@@ -429,7 +429,7 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 			c.RegisterPortalPOI(BlockPos{X: x, Y: y, Z: z}, BlockProperties(newState)["axis"])
 		}
 	}
-	if !IsNoteBlock(newState) {
+	if !IsNoteBlock(newState) || !IsNoteBlock(oldState) {
 		c.syncVerticalNoteBlocksAt(x, y, z, res)
 	}
 	if newState != StateAir {

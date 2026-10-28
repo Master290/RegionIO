@@ -2,6 +2,7 @@ package server
 
 import (
 	"strings"
+	"sync"
 
 	"regionio/internal/protocol"
 	"regionio/internal/world"
@@ -259,6 +260,11 @@ func (s *Server) BroadcastNoteBlockPlay(dim string, x, y, z, note int, instrumen
 	// 2. ClientboundSoundPacket (0x75) with SoundSourceRecords (2), volume=3.0,
 	// and pitch = 2^((note-12)/12) for tunable instruments (or 1.0 for mob heads).
 	soundName := world.NoteBlockInstrumentSound(instrument)
+	if instrument == world.NoteInstrumentCustomHead {
+		if customSound, ok := s.SkullNoteBlockSoundAt(targetDim, x, y+1, z); ok && customSound != "" {
+			soundName = customSound
+		}
+	}
 	pitch := float32(1.0)
 	if world.IsNoteInstrumentTunable(instrument) {
 		pitch = world.NoteBlockPitch(note)
@@ -279,10 +285,65 @@ func (s *Server) BroadcastNoteBlockPlay(dim string, x, y, z, note int, instrumen
 	s.OnNoteBlockPlayedForAllays(targetDim, x, y, z)
 }
 
+type serverSkullSoundStore struct {
+	mu     sync.RWMutex
+	sounds map[blockPosDimKey]string
+}
+
+var skullSoundStores sync.Map // map[*Server]*serverSkullSoundStore
+
+func (s *Server) skullSoundStore() *serverSkullSoundStore {
+	if v, ok := skullSoundStores.Load(s); ok {
+		return v.(*serverSkullSoundStore)
+	}
+	st := &serverSkullSoundStore{
+		sounds: make(map[blockPosDimKey]string),
+	}
+	actual, _ := skullSoundStores.LoadOrStore(s, st)
+	return actual.(*serverSkullSoundStore)
+}
+
+// SetSkullNoteBlockSound sets or clears the custom `note_block_sound` SoundEvent
+// on a `minecraft:player_head` / `minecraft:player_wall_head` block entity at (dim, x, y, z).
+func (s *Server) SetSkullNoteBlockSound(dim string, x, y, z int, soundEvent string) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
+	st := s.skullSoundStore()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	trimmed := strings.TrimSpace(soundEvent)
+	if trimmed == "" {
+		delete(st.sounds, key)
+		return
+	}
+	if !strings.Contains(trimmed, ":") {
+		trimmed = "minecraft:" + strings.ToLower(trimmed)
+	}
+	st.sounds[key] = trimmed
+}
+
+// SkullNoteBlockSoundAt returns the custom `note_block_sound` SoundEvent for a
+// player skull at (dim, x, y, z), if configured.
+func (s *Server) SkullNoteBlockSoundAt(dim string, x, y, z int) (string, bool) {
+	if s == nil {
+		return "", false
+	}
+	normDim := world.NormalizeDimension(dim)
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
+	st := s.skullSoundStore()
+	st.mu.RLock()
+	snd, ok := st.sounds[key]
+	st.mu.RUnlock()
+	return snd, ok && snd != ""
+}
+
 // InteractNoteBlock handles a player right-clicking a minecraft:note_block at
 // (x, y, z): increments its note (0..24), updates its instrument from the
-// vertical neighbors, and broadcasts the note sound/particle/block-event if the
-// block above is air (or a mob head).
+// vertical neighbors, broadcasts the updated block state, and broadcasts the
+// note sound/particle/block-event if the block above is air (or a mob head).
 func (s *Server) InteractNoteBlock(session *PlayerSession, x, y, z int) (handled bool, res world.BlockUpdateResult) {
 	if s == nil {
 		return false, res
@@ -293,12 +354,35 @@ func (s *Server) InteractNoteBlock(session *PlayerSession, x, y, z int) (handled
 			dim = d
 		}
 	}
-	cache := s.BindNoteBlockAndJukeboxRedstone(dim)
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
 	if cache == nil || !world.IsNoteBlock(cache.GetBlock(x, y, z)) {
 		return false, res
 	}
 	_, _, _, res = cache.TuneNoteBlock(x, y, z)
+	for _, ch := range res.Changes {
+		s.broadcastBlockUpdateInDim(normDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+	}
 	return true, res
+}
+
+// InteractNoteBlockOnFace handles a player right-clicking `face` of a
+// `minecraft:note_block` at `(x, y, z)` with `hand`:
+//   - If `face == "up"` and the player is holding a mob head (`#minecraft:note_block_top_instruments`),
+//     returns `(false, res)` (`InteractionResult.PASS` in vanilla `NoteBlock.useItemOn`)
+//     so that the mob head can be placed directly on top of the note block without sneaking.
+//   - Otherwise delegates to `s.InteractNoteBlock(session, x, y, z)`.
+func (s *Server) InteractNoteBlockOnFace(session *PlayerSession, hand int32, face string, x, y, z int) (handled bool, res world.BlockUpdateResult) {
+	if s == nil {
+		return false, res
+	}
+	if session != nil {
+		_, held := session.handSlotAndStack(hand)
+		if !held.IsEmpty() && world.ShouldPassNoteBlockUseForTopHead(held.ResolvedID(), face) {
+			return false, res
+		}
+	}
+	return s.InteractNoteBlock(session, x, y, z)
 }
 
 // AttackNoteBlock handles a player left-clicking (attacking) a
@@ -314,10 +398,38 @@ func (s *Server) AttackNoteBlock(session *PlayerSession, x, y, z int) (handled b
 			dim = d
 		}
 	}
-	cache := s.BindNoteBlockAndJukeboxRedstone(dim)
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
 	if cache == nil || !world.IsNoteBlock(cache.GetBlock(x, y, z)) {
 		return false, res
 	}
 	_, _, _, res = cache.AttackNoteBlock(x, y, z)
+	for _, ch := range res.Changes {
+		s.broadcastBlockUpdateInDim(normDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+	}
 	return true, res
+}
+
+// OnNoteBlockPlaced resolves and applies the initial `minecraft:note_block`
+// state at `(dim, x, y, z)` (`instrument` from `y+1` / `y-1`, `note=0`,
+// `powered` from adjacent redstone) and broadcasts any resulting block updates.
+func (s *Server) OnNoteBlockPlaced(dim string, x, y, z int) (uint16, world.BlockUpdateResult) {
+	var res world.BlockUpdateResult
+	if s == nil {
+		return 0, res
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
+	if cache == nil {
+		return 0, res
+	}
+	st, ok := cache.ResolveNoteBlockPlacementStateAt(x, y, z)
+	if !ok {
+		return 0, res
+	}
+	_, res = cache.ApplyBlockWithUpdates(x, y, z, st)
+	for _, ch := range res.Changes {
+		s.broadcastBlockUpdateInDim(normDim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+	}
+	return cache.GetBlock(x, y, z), res
 }

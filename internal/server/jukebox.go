@@ -16,7 +16,15 @@ import (
 
 // JukeboxEndPaddingTicks is the vanilla 20-tick (1 second) padding added after
 // floor/ceil(length_in_seconds * 20) before JukeboxSong.hasFinished returns true.
-const JukeboxEndPaddingTicks int64 = 20
+const (
+	JukeboxEndPaddingTicks int64 = 20
+
+	// BlockEntityTypeJukebox is BuiltInRegistries.BLOCK_ENTITY_TYPE index 5 ("minecraft:jukebox").
+	BlockEntityTypeJukebox int32 = 5
+
+	// GameEventJukeboxStopPlay is the vanilla GameEvent ID emitted when a jukebox stops playing.
+	GameEventJukeboxStopPlay = "minecraft:jukebox_stop_play"
+)
 
 var (
 	jukeboxBlockStatesOnce     sync.Once
@@ -675,6 +683,9 @@ func (s *Server) InsertJukeboxDisc(dimension string, x, y, z int, disc world.Ite
 		compRes := cache.UpdateComparatorsAround(x, y, z)
 		res.Changes = append(res.Changes, compRes.Changes...)
 		s.broadcastBlockUpdateInDim(dim, x, y, z, trueState)
+		for _, ch := range res.Changes {
+			s.broadcastBlockUpdateInDim(dim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+		}
 	}
 
 	// Broadcast LevelEvent 1010 (PLAY_JUKEBOX_SONG) with the jukebox_song registry index.
@@ -682,10 +693,12 @@ func (s *Server) InsertJukeboxDisc(dimension string, x, y, z int, disc world.Ite
 	if songIdx >= 0 {
 		cx := int32(x >> 4)
 		cz := int32(z >> 4)
-		s.BroadcastChunk(cx, cz, PlayLevelEventCB,
+		s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
 			EncodeLevelEventPacket(LevelEventPlayJukeboxSong, x, y, z, songIdx, false))
 	}
 
+	s.BroadcastJukeboxBlockEntityData(dim, x, y, z)
+	s.EmitGameEvent(dim, GameEventJukeboxPlay, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
 	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, true)
 	s.notifyJukeboxParrots(dim, x, y, z)
 
@@ -750,14 +763,19 @@ func (s *Server) EjectJukeboxDisc(dimension string, x, y, z int) (world.ItemStac
 		}
 		compRes := cache.UpdateComparatorsAround(x, y, z)
 		res.Changes = append(res.Changes, compRes.Changes...)
+		for _, ch := range res.Changes {
+			s.broadcastBlockUpdateInDim(dim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+		}
 	}
 
 	// Broadcast LevelEvent 1011 (STOP_JUKEBOX_SONG).
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	s.BroadcastChunk(cx, cz, PlayLevelEventCB,
+	s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
 		EncodeLevelEventPacket(LevelEventStopJukeboxSong, x, y, z, 0, false))
 
+	s.BroadcastJukeboxBlockEntityData(dim, x, y, z)
+	s.EmitGameEvent(dim, GameEventJukeboxStopPlay, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
 	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, false)
 	s.notifyJukeboxParrots(dim, x, y, z)
 
@@ -821,7 +839,11 @@ func (s *Server) InteractJukebox(session *PlayerSession, hand int32, x, y, z int
 		if rem <= 0 {
 			session.SetInventorySlot(slot, world.ItemStack{})
 		} else {
-			session.SetInventorySlot(slot, world.NewItemStack(held.ResolvedItemID(), rem))
+			next := world.NewItemStack(held.ResolvedItemID(), rem)
+			if next.IsEmpty() {
+				next = world.NewNamedItemStack(held.ResolvedID(), rem)
+			}
+			session.SetInventorySlot(slot, next)
 		}
 		s.syncPlayerInventorySlot(session, slot)
 	}
@@ -847,7 +869,7 @@ func (s *Server) BreakJukeboxAt(dimension string, x, y, z int) (world.ItemStack,
 }
 
 // TickJukeboxes advances all actively playing jukeboxes by 1 server tick (50ms):
-//   - Emits a note particle above the jukebox every 20 ticks (matching JukeboxSongPlayer.tick).
+//   - Emits a note particle and `jukebox_play` game event above the jukebox every 20 ticks (matching JukeboxSongPlayer.tick).
 //   - When ticks_since_song_started reaches song.LengthInTicks() + 20, stops active
 //     playback (Playing = false), broadcasts LevelEvent 1011, and updates adjacent
 //     redstone (dropping direct redstone power from 15 to 0 while keeping has_record=true
@@ -900,17 +922,19 @@ func (s *Server) TickJukeboxes() {
 	for _, p := range particles {
 		cx := int32(p.key.x >> 4)
 		cz := int32(p.key.z >> 4)
-		s.BroadcastChunk(cx, cz, PlayLevelParticlesCB,
+		s.BroadcastDimensionChunk(p.key.dim, cx, cz, PlayLevelParticlesCB,
 			EncodeNoteParticlePacket(float64(p.key.x)+0.5, float64(p.key.y)+1.2, float64(p.key.z)+0.5, p.note))
+		s.EmitGameEvent(p.key.dim, GameEventJukeboxPlay, float64(p.key.x)+0.5, float64(p.key.y)+0.5, float64(p.key.z)+0.5, VibrationSource{})
 	}
 
 	if len(finished) > 0 {
 		for _, f := range finished {
 			cx := int32(f.key.x >> 4)
 			cz := int32(f.key.z >> 4)
-			s.BroadcastChunk(cx, cz, PlayLevelEventCB,
+			s.BroadcastDimensionChunk(f.key.dim, cx, cz, PlayLevelEventCB,
 				EncodeLevelEventPacket(LevelEventStopJukeboxSong, f.key.x, f.key.y, f.key.z, 0, false))
 
+			s.EmitGameEvent(f.key.dim, GameEventJukeboxStopPlay, float64(f.key.x)+0.5, float64(f.key.y)+0.5, float64(f.key.z)+0.5, VibrationSource{})
 			s.NotifyJukeboxPlayingForAllays(f.key.dim, f.key.x, f.key.y, f.key.z, false)
 			s.notifyJukeboxParrots(f.key.dim, f.key.x, f.key.y, f.key.z)
 
@@ -918,8 +942,14 @@ func (s *Server) TickJukeboxes() {
 				// Re-trigger redstone propagation around the jukebox now that its
 				// direct redstone signal dropped from 15 to 0, while keeping
 				// has_record=true on the block state.
-				_ = cache.UpdateNeighbors(f.key.x, f.key.y, f.key.z)
-				_ = cache.UpdateComparatorsAround(f.key.x, f.key.y, f.key.z)
+				nbRes := cache.UpdateNeighbors(f.key.x, f.key.y, f.key.z)
+				compRes := cache.UpdateComparatorsAround(f.key.x, f.key.y, f.key.z)
+				for _, ch := range nbRes.Changes {
+					s.broadcastBlockUpdateInDim(f.key.dim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+				}
+				for _, ch := range compRes.Changes {
+					s.broadcastBlockUpdateInDim(f.key.dim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+				}
 			}
 		}
 		_ = s.SaveJukeboxes()
@@ -942,6 +972,9 @@ func (s *Server) HopperTryInsertIntoJukebox(dimension string, x, y, z int, stack
 	var out world.ItemStack
 	if rem > 0 {
 		out = world.NewItemStack(stack.ResolvedItemID(), rem)
+		if out.IsEmpty() {
+			out = world.NewNamedItemStack(stack.ResolvedID(), rem)
+		}
 	}
 	return true, out, insRes
 }
@@ -981,16 +1014,96 @@ func (s *Server) HopperTryExtractFromJukebox(dimension string, x, y, z int) (wor
 		}
 		compRes := cache.UpdateComparatorsAround(x, y, z)
 		res.Changes = append(res.Changes, compRes.Changes...)
+		for _, ch := range res.Changes {
+			s.broadcastBlockUpdateInDim(dim, ch.Pos.X, ch.Pos.Y, ch.Pos.Z, ch.NewState)
+		}
 	}
 
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
-	s.BroadcastChunk(cx, cz, PlayLevelEventCB,
+	s.BroadcastDimensionChunk(dim, cx, cz, PlayLevelEventCB,
 		EncodeLevelEventPacket(LevelEventStopJukeboxSong, x, y, z, 0, false))
 
+	s.BroadcastJukeboxBlockEntityData(dim, x, y, z)
+	s.EmitGameEvent(dim, GameEventJukeboxStopPlay, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
 	s.NotifyJukeboxPlayingForAllays(dim, x, y, z, false)
 	s.notifyJukeboxParrots(dim, x, y, z)
 
 	_ = s.SaveJukeboxes()
 	return disc, true, res
+}
+
+// BroadcastJukeboxBlockEntityData broadcasts ClientboundBlockEntityDataPacket
+// (`0x06`, `BlockEntityTypeJukebox = 5`) for the jukebox at (dimension, x, y, z).
+func (s *Server) BroadcastJukeboxBlockEntityData(dimension string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	dim := world.NormalizeDimension(dimension)
+	jb, ok := s.GetJukeboxAt(dim, x, y, z)
+	if !ok || jb == nil {
+		jb = &JukeboxBlockEntity{
+			Dimension: dim,
+			X:         x,
+			Y:         y,
+			Z:         z,
+		}
+	}
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeJukebox, jb.ToNBT())
+	s.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
+}
+
+// HydrateChunkJukeboxes inspects all `world.StructureBlockEntity` entries on the
+// loaded chunk (dim, cx, cz) and registers any `minecraft:jukebox` block entities.
+func (s *Server) HydrateChunkJukeboxes(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	st := s.jukeboxStore()
+	st.mu.Lock()
+	var hydrated []*JukeboxBlockEntity
+	for _, sbe := range sbes {
+		if canonicalResourceName(sbe.ID) != "minecraft:jukebox" {
+			continue
+		}
+		key := blockPosDimKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := st.jukeboxes[key]; exists {
+			continue
+		}
+		var disc world.ItemStack
+		for _, item := range sbe.Items {
+			if item.ItemID != "" && item.Count > 0 {
+				disc = world.NewNamedItemStack(item.ItemID, int32(item.Count))
+				break
+			}
+		}
+		if disc.IsEmpty() || !IsMusicDiscItem(disc) {
+			continue
+		}
+		jb := &JukeboxBlockEntity{
+			Dimension:  normDim,
+			X:          sbe.X,
+			Y:          sbe.Y,
+			Z:          sbe.Z,
+			RecordItem: disc,
+			Playing:    false,
+		}
+		st.jukeboxes[key] = jb
+		hydrated = append(hydrated, jb.Clone())
+	}
+	st.mu.Unlock()
+
+	for _, jb := range hydrated {
+		s.syncLoadedJukeboxBlockState(jb)
+	}
+	return len(hydrated)
 }

@@ -20,6 +20,9 @@ const (
 	DecoratedPotWobbleNone     DecoratedPotWobbleStyle = 0
 	DecoratedPotWobblePositive DecoratedPotWobbleStyle = 1 // BlockEvent param 0
 	DecoratedPotWobbleNegative DecoratedPotWobbleStyle = 2 // BlockEvent param 1
+
+	// BlockEntityTypeDecoratedPot is BuiltInRegistries.BLOCK_ENTITY_TYPE index 42 ("minecraft:decorated_pot").
+	BlockEntityTypeDecoratedPot int32 = 42
 )
 
 // All 23 vanilla pottery sherds in Minecraft 26.1.2 (`#minecraft:decorated_pot_sherds`).
@@ -393,6 +396,7 @@ func (s *Server) PlaceDecoratedPotAt(dim string, x, y, z int, facing string, she
 	cp := dp.Clone()
 	st.mu.Unlock()
 
+	s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return cp, res
 }
@@ -431,6 +435,7 @@ func (s *Server) SetDecoratedPotSherds(dim string, x, y, z int, sherds [4]string
 	dp := s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
 	dp.Sherds = normalizePotSherds(sherds)
 	st.mu.Unlock()
+	s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 	return true
 }
 
@@ -462,6 +467,7 @@ func (s *Server) SetDecoratedPotItem(dim string, x, y, z int, stack world.ItemSt
 		dp.Meta = meta.Clone()
 	}
 	st.mu.Unlock()
+	s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
 }
@@ -540,7 +546,7 @@ func (s *Server) InteractDecoratedPot(session *PlayerSession, dim string, x, y, 
 			newCount = 1
 			dp.Item = world.NewNamedItemStack(held.ResolvedID(), 1)
 			dp.Meta = heldMeta.Clone()
-		} else if dp.Item.ResolvedItemID() == held.ResolvedItemID() && itemMetaEqual(dp.Meta, heldMeta) && dp.Item.Count < maxStack {
+		} else if canonicalResourceName(dp.Item.ResolvedID()) == canonicalResourceName(held.ResolvedID()) && itemMetaEqual(dp.Meta, heldMeta) && dp.Item.Count < maxStack {
 			canInsert = true
 			newCount = dp.Item.Count + 1
 			dp.Item = world.NewNamedItemStack(held.ResolvedID(), newCount)
@@ -559,6 +565,7 @@ func (s *Server) InteractDecoratedPot(session *PlayerSession, dim string, x, y, 
 			pitch := float32(0.7) + float32(0.5)*(float32(newCount)/float32(maxStack))
 			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
 				EncodeSoundPacket("minecraft:block.decorated_pot.insert", SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, pitch, 0))
+			s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 			s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 			s.EmitVibration(VibrationEvent{
 				Dimension: normDim,
@@ -647,12 +654,14 @@ func (s *Server) HopperInsertIntoDecoratedPot(dim string, x, y, z int, stack wor
 		dp.Item = single
 		dp.Meta = meta.Clone()
 		st.mu.Unlock()
+		s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 		return true
 	}
-	if dp.Item.ResolvedItemID() == single.ResolvedItemID() && itemMetaEqual(dp.Meta, meta) && dp.Item.Count < maxStack {
+	if canonicalResourceName(dp.Item.ResolvedID()) == canonicalResourceName(single.ResolvedID()) && itemMetaEqual(dp.Meta, meta) && dp.Item.Count < maxStack {
 		dp.Item = world.NewNamedItemStack(stack.ResolvedID(), dp.Item.Count+1)
 		st.mu.Unlock()
+		s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 		return true
 	}
@@ -1098,4 +1107,58 @@ func (s *Server) LoadChunkDecoratedPotBlockEntitiesNBT(dim string, list []*nbt.C
 	}
 	return len(loaded)
 }
+
+// BroadcastDecoratedPotBlockEntityData broadcasts ClientboundBlockEntityDataPacket
+// (`0x06`, `BlockEntityTypeDecoratedPot = 42`) for the decorated pot at (dim, x, y, z).
+func (s *Server) BroadcastDecoratedPotBlockEntityData(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := normalizeHopperDim(dim)
+	dp, ok := s.GetDecoratedPotAt(normDim, x, y, z)
+	if !ok || dp == nil {
+		return
+	}
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeDecoratedPot, dp.ToNBT())
+	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
+}
+
+// HydrateChunkDecoratedPots inspects all `world.StructureBlockEntity` entries on
+// the loaded chunk (dim, cx, cz) and registers any `minecraft:decorated_pot` block entities.
+func (s *Server) HydrateChunkDecoratedPots(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	st := s.decoratedPotStore()
+	st.mu.Lock()
+	var hydrated [][3]int
+	for _, sbe := range sbes {
+		if canonicalResourceName(sbe.ID) != "minecraft:decorated_pot" {
+			continue
+		}
+		key := hopperBlockKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := st.pots[key]; exists {
+			continue
+		}
+		_ = s.getOrCreateDecoratedPotLocked(st, normDim, sbe.X, sbe.Y, sbe.Z)
+		hydrated = append(hydrated, [3]int{sbe.X, sbe.Y, sbe.Z})
+	}
+	st.mu.Unlock()
+
+	for _, pos := range hydrated {
+		s.BindNoteBlockAndJukeboxRedstone(normDim)
+		s.updateHopperComparatorsAndBroadcast(normDim, pos[0], pos[1], pos[2])
+	}
+	return len(hydrated)
+}
+
 

@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"regionio/internal/nbt"
+	"regionio/internal/protocol"
 	"regionio/internal/world"
 )
 
@@ -205,6 +206,7 @@ func (s *Server) ToggleCrafterSlotDisabled(dim string, x, y, z, slot int) (disab
 	hs.mu.Unlock()
 
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
+	_ = s.SyncCrafterViewers(nil, x, y, z)
 	return nowDisabled, true
 }
 
@@ -240,6 +242,7 @@ func (s *Server) SetCrafterDisabledSlotMask(dim string, x, y, z int, mask uint16
 	}
 	hs.mu.Unlock()
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
+	_ = s.SyncCrafterViewers(nil, x, y, z)
 }
 
 // RemoveCrafterAt removes the `CrafterBlockEntity` at (dim, x, y, z) when the
@@ -403,6 +406,7 @@ func (s *Server) DispenseFromCrafter(dim string, x, y, z int) (world.ItemStack, 
 	tm.mu.Unlock()
 
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
+	_ = s.SyncCrafterViewers(nil, x, y, z)
 	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayLevelEventCB,
 		EncodeLevelEventPacket(LevelEventCrafterCraft, x, y, z, 0, false))
 	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayLevelEventCB,
@@ -1000,4 +1004,108 @@ func (s *Server) LoadChunkCrafterBlockEntitiesNBT(dim string, list []*nbt.Compou
 	}
 	return len(loaded)
 }
+
+// EncodeContainerSlotStateChangedPacket encodes a ServerboundContainerSlotStateChangedPacket
+// (`0x12` in protocol 775): VarInt(slotIndex), VarInt(containerID), Bool(enabled).
+func EncodeContainerSlotStateChangedPacket(slotIndex, containerID int32, enabled bool) []byte {
+	w := protocol.NewWriter(12)
+	w.VarInt(slotIndex)
+	w.VarInt(containerID)
+	w.Bool(enabled)
+	return w.Bytes()
+}
+
+// DecodeContainerSlotStateChangedPacket decodes a ServerboundContainerSlotStateChangedPacket
+// (`0x12` in protocol 775): VarInt(slotIndex), VarInt(containerID), Bool(enabled).
+func DecodeContainerSlotStateChangedPacket(r *protocol.Reader) (slotIndex, containerID int32, enabled bool, err error) {
+	slotIndex, err = r.VarInt()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	containerID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	enabled, err = r.Bool()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return slotIndex, containerID, enabled, nil
+}
+
+// HandleContainerSlotStateChangedPacket processes a ServerboundContainerSlotStateChangedPacket
+// (`0x12`) from `session` when a `CrafterMenu` (`CrafterMenuType`) is open,
+// setting slot `slotIndex` (`0..8`) disabled (`!enabled`) and syncing viewers.
+func (s *Server) HandleContainerSlotStateChangedPacket(session *PlayerSession, r *protocol.Reader) error {
+	if s == nil || session == nil || r == nil || session.IsDead() {
+		return nil
+	}
+	slotIdx, cid, enabled, err := DecodeContainerSlotStateChangedPacket(r)
+	if err != nil {
+		return err
+	}
+	open := session.OpenContainer()
+	if open == nil || open.ContainerID != cid || open.MenuType != CrafterMenuType {
+		return nil
+	}
+	if slotIdx < 0 || int(slotIdx) >= CrafterSlotCount {
+		return nil
+	}
+	dim := normalizeHopperDim(session.Dimension())
+	bx, by, bz := open.BlockX, open.BlockY, open.BlockZ
+	// Only empty slots can be disabled.
+	if !enabled {
+		if cr, ok := s.GetCrafterAt(dim, bx, by, bz); ok && cr != nil {
+			if !cr.Slots[slotIdx].IsEmpty() && cr.Slots[slotIdx].Count > 0 {
+				return s.SyncCrafterViewers(session, bx, by, bz)
+			}
+		}
+	}
+	s.SetCrafterSlotDisabled(dim, bx, by, bz, int(slotIdx), !enabled)
+	return s.SyncCrafterViewers(session, bx, by, bz)
+}
+
+// HydrateChunkCrafters inspects all `world.StructureBlockEntity` entries on the
+// loaded chunk (dim, cx, cz) and registers any `minecraft:crafter` block entities.
+func (s *Server) HydrateChunkCrafters(dim string, cx, cz int32) int {
+	if s == nil {
+		return 0
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return 0
+	}
+	sbes := cache.LoadedChunkStructureBlockEntities(cx, cz)
+	if len(sbes) == 0 {
+		return 0
+	}
+	hs := s.hopperState()
+	hs.mu.Lock()
+	var hydrated [][3]int
+	for _, sbe := range sbes {
+		if canonicalResourceName(sbe.ID) != "minecraft:crafter" {
+			continue
+		}
+		key := hopperBlockKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := hs.crafters[key]; exists {
+			continue
+		}
+		cr := s.getOrCreateCrafterLocked(hs, normDim, sbe.X, sbe.Y, sbe.Z)
+		for _, item := range sbe.Items {
+			if item.Slot >= 0 && int(item.Slot) < CrafterSlotCount && item.ItemID != "" && item.Count > 0 {
+				cr.Slots[item.Slot] = world.NewNamedItemStack(item.ItemID, int32(item.Count))
+			}
+		}
+		hydrated = append(hydrated, [3]int{sbe.X, sbe.Y, sbe.Z})
+	}
+	hs.mu.Unlock()
+
+	for _, pos := range hydrated {
+		s.BindNoteBlockAndJukeboxRedstone(normDim)
+		s.updateHopperComparatorsAndBroadcast(normDim, pos[0], pos[1], pos[2])
+	}
+	return len(hydrated)
+}
+
 

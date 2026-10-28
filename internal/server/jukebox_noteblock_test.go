@@ -349,3 +349,78 @@ func TestServerNoteBlockPacketsAndInteractions(t *testing.T) {
 		t.Fatalf("LevelEvent decoded (type=%d, data=%d, global=%v, err=%v)", evType, evData, global, err)
 	}
 }
+
+func TestNoteBlockTopHeadPassCustomSkullSoundAndPotCrafterResidual(t *testing.T) {
+	srv := newTestJukeboxServer(t)
+	cache := srv.BindNoteBlockAndJukeboxRedstone(world.DimensionOverworld)
+	session := newTestJukeboxSession(t, srv, GameModeSurvival)
+	y := world.FlatSurfaceY + 2
+
+	// 1. OnNoteBlockPlaced above emerald_block resolves instrument="bit".
+	emeraldSt, _ := world.BlockStateIDByProperties("minecraft:emerald_block", nil)
+	cache.SetBlock(70, y-1, 70, emeraldSt)
+	placedNB, _ := srv.OnNoteBlockPlaced(world.DimensionOverworld, 70, y, 70)
+	inst, note, _, ok := cache.NoteBlockPropertiesAt(70, y, 70)
+	if !ok || placedNB == 0 || inst != world.NoteInstrumentBit || note != 0 {
+		t.Fatalf("OnNoteBlockPlaced got (inst=%q, note=%d, ok=%v), want (bit, 0, true)", inst, note, ok)
+	}
+
+	// 2. InteractNoteBlockOnFace with a mob head on "up" passes through (handled=false),
+	// whereas clicking "north" or with an empty hand tunes the note block.
+	session.SetInventorySlot(36, world.NewNamedItemStack("minecraft:player_head", 1))
+	if handled, _ := srv.InteractNoteBlockOnFace(session, 0, "up", 70, y, 70); handled {
+		t.Fatal("expected InteractNoteBlockOnFace with player_head on face=up to pass through (handled=false)")
+	}
+	if handled, _ := srv.InteractNoteBlockOnFace(session, 0, "north", 70, y, 70); !handled {
+		t.Fatal("expected InteractNoteBlockOnFace on face=north to tune the note block")
+	}
+
+	// 3. Place player_head at (70, y+1, 70) with custom note_block_sound.
+	playerHeadSt, _ := world.BlockStateIDByProperties("minecraft:player_head", map[string]string{"rotation": "0"})
+	cache.ApplyBlockWithUpdates(70, y+1, 70, playerHeadSt)
+	srv.SetSkullNoteBlockSound(world.DimensionOverworld, 70, y+1, 70, "minecraft:entity.warden.roar")
+	if snd, hasSnd := srv.SkullNoteBlockSoundAt(world.DimensionOverworld, 70, y+1, 70); !hasSnd || snd != "minecraft:entity.warden.roar" {
+		t.Fatalf("SkullNoteBlockSoundAt = (%q, %v), want (minecraft:entity.warden.roar, true)", snd, hasSnd)
+	}
+
+	// 4. Decorated pot must NOT stack two different named sherds that both have ItemID==0.
+	srv.PlaceDecoratedPotAt(world.DimensionOverworld, 80, y, 80, "north", DefaultDecoratedPotSherds())
+	session.SetInventorySlot(36, world.NewNamedItemStack("minecraft:angler_pottery_sherd", 2))
+	if ins, wob := srv.InteractDecoratedPot(session, world.DimensionOverworld, 80, y, 80); !ins || !wob {
+		t.Fatalf("first angler_pottery_sherd insert = (%v, %v), want (true, true)", ins, wob)
+	}
+	// Try inserting a DIFFERENT sherd (archer_pottery_sherd) -> must fail with negative wobble!
+	session.SetInventorySlot(36, world.NewNamedItemStack("minecraft:archer_pottery_sherd", 1))
+	if ins, wob := srv.InteractDecoratedPot(session, world.DimensionOverworld, 80, y, 80); ins || !wob {
+		t.Fatalf("mismatched archer_pottery_sherd insert = (%v, %v), want (false, true)", ins, wob)
+	}
+	// Inserting a second angler_pottery_sherd succeeds -> count becomes 2.
+	session.SetInventorySlot(36, world.NewNamedItemStack("minecraft:angler_pottery_sherd", 1))
+	if ins, _ := srv.InteractDecoratedPot(session, world.DimensionOverworld, 80, y, 80); !ins {
+		t.Fatal("expected second matching angler_pottery_sherd insert to succeed")
+	}
+	if dp, ok := srv.GetDecoratedPotAt(world.DimensionOverworld, 80, y, 80); !ok || dp.Item.Count != 2 || dp.Item.ResolvedID() != "minecraft:angler_pottery_sherd" {
+		t.Fatalf("decorated pot item = %+v, want 2x angler_pottery_sherd", dp)
+	}
+
+	// 5. Crafter HandleContainerSlotStateChangedPacket (0x12) toggles slot disabled state.
+	cache.ApplyBlockWithUpdates(90, y, 90, CrafterBlockState("north_up", false, false))
+	cid, err := srv.OpenCrafter(session, 90, y, 90)
+	if err != nil {
+		t.Fatalf("OpenCrafter: %v", err)
+	}
+	pktDisable := EncodeContainerSlotStateChangedPacket(4, cid, false)
+	if err := srv.HandleContainerSlotStateChangedPacket(session, protocol.NewReader(pktDisable)); err != nil {
+		t.Fatalf("HandleContainerSlotStateChangedPacket(disable): %v", err)
+	}
+	if !srv.IsCrafterSlotDisabled(world.DimensionOverworld, 90, y, 90, 4) {
+		t.Fatal("expected crafter slot 4 to be disabled after packet with enabled=false")
+	}
+	pktEnable := EncodeContainerSlotStateChangedPacket(4, cid, true)
+	if err := srv.HandleContainerSlotStateChangedPacket(session, protocol.NewReader(pktEnable)); err != nil {
+		t.Fatalf("HandleContainerSlotStateChangedPacket(enable): %v", err)
+	}
+	if srv.IsCrafterSlotDisabled(world.DimensionOverworld, 90, y, 90, 4) {
+		t.Fatal("expected crafter slot 4 to be enabled after packet with enabled=true")
+	}
+}

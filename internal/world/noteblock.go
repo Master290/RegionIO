@@ -328,7 +328,7 @@ func isBassInstrumentBlock(short string) bool {
 	case "note_block", "jukebox", "bookshelf", "chiseled_bookshelf", "chest", "trapped_chest",
 		"crafting_table", "Cartography_table", "cartography_table", "fletching_table",
 		"smithing_table", "loom", "barrel", "lectern", "composter", "daylight_detector",
-		"campfire", "soul_campfire", "bee_nest", "beehive", "mangrove_roots",
+		"campfire", "soul_campfire", "bee_nest", "beehive", "mangrove_roots", "creaking_heart",
 		"brown_mushroom_block", "red_mushroom_block", "mushroom_stem",
 		"bamboo_mosaic", "bamboo_mosaic_slab", "bamboo_mosaic_stairs", "bamboo_block", "stripped_bamboo_block":
 		return true
@@ -625,4 +625,122 @@ func (c *Cache) SetBiomeAt(x, y, z int, biome uint16) bool {
 	c.mu.Unlock()
 	return true
 }
+
+// IsNoteBlockTopInstrumentItem reports whether itemName belongs to the vanilla
+// `#minecraft:note_block_top_instruments` item tag (`zombie_head`, `skeleton_skull`,
+// `creeper_head`, `dragon_head`, `wither_skeleton_skull`, `piglin_head`, `player_head`).
+func IsNoteBlockTopInstrumentItem(itemName string) bool {
+	short := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(itemName)), "minecraft:")
+	switch short {
+	case "zombie_head",
+		"skeleton_skull",
+		"creeper_head",
+		"dragon_head",
+		"wither_skeleton_skull",
+		"piglin_head",
+		"player_head":
+		return true
+	default:
+		return false
+	}
+}
+
+// ShouldPassNoteBlockUseForTopHead reports whether right-clicking a
+// `minecraft:note_block` on `face` while holding `itemName` should pass through
+// (`InteractionResult.PASS` in vanilla `NoteBlock.useItemOn`) so that a mob head
+// can be placed directly on top (`face == "up"`) of the note block without sneaking.
+func ShouldPassNoteBlockUseForTopHead(itemName, face string) bool {
+	return strings.EqualFold(strings.TrimSpace(face), "up") && IsNoteBlockTopInstrumentItem(itemName)
+}
+
+// MakeNoteBlockState returns the block state ID for `minecraft:note_block` with
+// the given `instrument`, `note` (0..24), and `powered` flag.
+func MakeNoteBlockState(instrument string, note int, powered bool) (uint16, bool) {
+	if instrument == "" {
+		instrument = NoteInstrumentHarp
+	}
+	if note < 0 {
+		note = 0
+	} else if note >= NoteBlockNoteCount {
+		note = NoteBlockNoteCount - 1
+	}
+	powStr := "false"
+	if powered {
+		powStr = "true"
+	}
+	return nameToStateID("minecraft:note_block", map[string]string{
+		"instrument": instrument,
+		"note":       strconv.Itoa(note),
+		"powered":    powStr,
+	})
+}
+
+// ResolveNoteBlockPlacementStateAt computes the initial block state for a newly
+// placed `minecraft:note_block` at `(x, y, z)` (`instrument` from `y+1` / `y-1`,
+// `note=0`, `powered` from adjacent redstone power).
+func (c *Cache) ResolveNoteBlockPlacementStateAt(x, y, z int) (uint16, bool) {
+	inst := NoteInstrumentHarp
+	powered := false
+	if c != nil {
+		inst = c.ResolveNoteBlockInstrumentAt(x, y, z)
+		powered = c.IsBlockPowered(x, y, z)
+	}
+	return MakeNoteBlockState(inst, 0, powered)
+}
+
+// ParseJukeboxBlockState extracts the `has_record` property from a
+// `minecraft:jukebox` block state.
+func ParseJukeboxBlockState(state uint16) (hasRecord bool, ok bool) {
+	info, valid := stateByID(state)
+	if !valid || info.Name != "minecraft:jukebox" {
+		return false, false
+	}
+	return info.Properties["has_record"] == "true", true
+}
+
+// MakeJukeboxBlockState returns the block state ID for `minecraft:jukebox` with
+// `has_record` set to `"true"` or `"false"`.
+func MakeJukeboxBlockState(hasRecord bool) (uint16, bool) {
+	val := "false"
+	if hasRecord {
+		val = "true"
+	}
+	return nameToStateID("minecraft:jukebox", map[string]string{"has_record": val})
+}
+
+var worldJukeboxDiscComparatorOutputs = map[string]int{
+	"minecraft:music_disc_13":                1,
+	"minecraft:music_disc_cat":               2,
+	"minecraft:music_disc_blocks":            3,
+	"minecraft:music_disc_chirp":             4,
+	"minecraft:music_disc_far":               5,
+	"minecraft:music_disc_mall":              6,
+	"minecraft:music_disc_mellohi":           7,
+	"minecraft:music_disc_stal":              8,
+	"minecraft:music_disc_strad":             9,
+	"minecraft:music_disc_lava_chicken":      9,
+	"minecraft:music_disc_ward":              10,
+	"minecraft:music_disc_tears":             10,
+	"minecraft:music_disc_11":                11,
+	"minecraft:music_disc_creator_music_box": 11,
+	"minecraft:music_disc_wait":              12,
+	"minecraft:music_disc_creator":           12,
+	"minecraft:music_disc_pigstep":           13,
+	"minecraft:music_disc_precipice":         13,
+	"minecraft:music_disc_otherside":         14,
+	"minecraft:music_disc_relic":             14,
+	"minecraft:music_disc_5":                 15,
+}
+
+// JukeboxComparatorOutputForDisc returns the vanilla 26.1.2 comparator analog
+// signal (`1..15`) for any of the 21 music disc items.
+func JukeboxComparatorOutputForDisc(itemName string) (int, bool) {
+	name := strings.ToLower(strings.TrimSpace(itemName))
+	if name != "" && !strings.Contains(name, ":") {
+		name = "minecraft:" + name
+	}
+	sig, ok := worldJukeboxDiscComparatorOutputs[name]
+	return sig, ok
+}
+
 
