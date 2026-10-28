@@ -318,3 +318,52 @@ func TestColdEnoughToSnowAtAndSurfaceExtensions(t *testing.T) {
 	}
 }
 
+func TestBiomeTemperatureAndPrecipitationParity(t *testing.T) {
+	// High-altitude cooling above seaLevel+17 (y > 80 when seaLevel = 63):
+	// windswept_hills (baseTemp = 0.2) is warm at y=80, cold enough to snow at y=160.
+	if ColdEnoughToSnowAt("minecraft:windswept_hills", 0, 80, 0, 63) {
+		t.Error("windswept_hills at y=80 should not be cold enough to snow")
+	}
+	if !ColdEnoughToSnowAt("minecraft:windswept_hills", 0, 160, 0, 63) {
+		t.Error("windswept_hills at y=160 should be cold enough to snow")
+	}
+	if !ShouldSnowAt("minecraft:windswept_hills", 0, 160, 0, 63) {
+		t.Error("windswept_hills at y=160 has precipitation and should snow")
+	}
+
+	// Arid biomes with has_precipitation=false never snow even if cooled below 0.15
+	// at extreme altitude, matching Biome.shouldSnow -> getPrecipitationAt.
+	for _, noPrecip := range []string{
+		"minecraft:desert",
+		"minecraft:savanna",
+		"minecraft:savanna_plateau",
+		"minecraft:windswept_savanna",
+		"minecraft:badlands",
+		"minecraft:eroded_badlands",
+		"minecraft:wooded_badlands",
+		"minecraft:the_end",
+		"minecraft:nether_wastes",
+	} {
+		if BiomeHasPrecipitation(noPrecip) {
+			t.Errorf("BiomeHasPrecipitation(%q) = true, want false", noPrecip)
+		}
+		if ShouldSnowAt(noPrecip, 0, 2000, 0, 63) {
+			t.Errorf("ShouldSnowAt(%q, y=2000) = true, want false (has_precipitation=false)", noPrecip)
+		}
+	}
+
+	// SurfaceRules$Temperature evaluates ColdEnoughToSnowAt(biome, x, preliminarySurfaceLevel(x,z)+8, z, seaLevel).
+	// On frozen_ocean, warm patches (0.2) stay above 0.15 at low preliminary surface (e.g. y=63+8=71),
+	// whereas high preliminary surface (e.g. y=130+8=138) cools even a warm patch below 0.15.
+	warmPatchX, warmPatchZ := 0, 0
+	if !ShouldMeltFrozenOceanIcebergSlightly("minecraft:frozen_ocean", warmPatchX, warmPatchZ, 63) {
+		t.Fatalf("expected (%d,%d) to be a warm patch on frozen_ocean", warmPatchX, warmPatchZ)
+	}
+	if ColdEnoughToSnowAt("minecraft:frozen_ocean", warmPatchX, 63+8, warmPatchZ, 63) {
+		t.Error("frozen_ocean warm patch at y=71 should not be cold enough to snow")
+	}
+	if !ColdEnoughToSnowAt("minecraft:frozen_ocean", warmPatchX, 130+8, warmPatchZ, 63) {
+		t.Error("frozen_ocean warm patch at y=138 should cool below 0.15 and be cold enough to snow")
+	}
+}
+

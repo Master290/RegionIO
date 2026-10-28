@@ -372,7 +372,7 @@ func (r *decorationRegion) placeScheduledFreezeTopLayer(seed int64) error {
 					r.setBlock(x, belowY, z, iceID)
 				}
 			}
-			if y >= MinY && y < MinY+WorldHeight && belowY >= MinY && worldgen.ColdEnoughToSnowAt(biome, x, y, z, SeaLevel) {
+			if y >= MinY && y < MinY+WorldHeight && belowY >= MinY && worldgen.ShouldSnowAt(biome, x, y, z, SeaLevel) {
 				at := r.getBlock(x, y, z)
 				below := r.getBlock(x, belowY, z)
 				if isAirState(at) && snowLayerCanSurviveOn(below, set) {

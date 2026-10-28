@@ -1,8 +1,12 @@
 package worldgen
 
-import "math"
+import (
+	"math"
+	"slices"
+)
 
-// simplexNoise is the 2D path of vanilla's SimplexNoise.
+// simplexNoise ports net.minecraft.world.level.levelgen.synth.SimplexNoise
+// (both 2D getValue(x, y) and 3D getValue(x, y, z)).
 type simplexNoise struct {
 	xo, yo, zo float64
 	p          [256]int
@@ -48,6 +52,56 @@ func (n *simplexNoise) value2D(x, y float64) float64 {
 		simplexCorner(g1, x1, y1, 0.5) + simplexCorner(g2i, x2, y2, 0.5))
 }
 
+func (n *simplexNoise) value3D(x, y, z float64) float64 {
+	const f3 = 1.0 / 3.0
+	const g3 = 1.0 / 6.0
+	s := (x + y + z) * f3
+	i := int(math.Floor(x + s))
+	j := int(math.Floor(y + s))
+	k := int(math.Floor(z + s))
+	t := float64(i+j+k) * g3
+	x0 := x - (float64(i) - t)
+	y0 := y - (float64(j) - t)
+	z0 := z - (float64(k) - t)
+	var i1, j1, k1, i2, j2, k2 int
+	if x0 >= y0 {
+		if y0 >= z0 {
+			i1, j1, k1, i2, j2, k2 = 1, 0, 0, 1, 1, 0
+		} else if x0 >= z0 {
+			i1, j1, k1, i2, j2, k2 = 1, 0, 0, 1, 0, 1
+		} else {
+			i1, j1, k1, i2, j2, k2 = 0, 0, 1, 1, 0, 1
+		}
+	} else if y0 < z0 {
+		i1, j1, k1, i2, j2, k2 = 0, 0, 1, 0, 1, 1
+	} else if x0 < z0 {
+		i1, j1, k1, i2, j2, k2 = 0, 1, 0, 0, 1, 1
+	} else {
+		i1, j1, k1, i2, j2, k2 = 0, 1, 0, 1, 1, 0
+	}
+	x1 := x0 - float64(i1) + g3
+	y1 := y0 - float64(j1) + g3
+	z1 := z0 - float64(k1) + g3
+	x2 := x0 - float64(i2) + 2.0*g3
+	y2 := y0 - float64(j2) + 2.0*g3
+	z2 := z0 - float64(k2) + 2.0*g3
+	x3 := x0 - 1.0 + 3.0*g3
+	y3 := y0 - 1.0 + 3.0*g3
+	z3 := z0 - 1.0 + 3.0*g3
+	ii := i & 255
+	jj := j & 255
+	kk := k & 255
+	gi0 := n.perm(ii+n.perm(jj+n.perm(kk))) % 12
+	gi1 := n.perm(ii+i1+n.perm(jj+j1+n.perm(kk+k1))) % 12
+	gi2 := n.perm(ii+i2+n.perm(jj+j2+n.perm(kk+k2))) % 12
+	gi3 := n.perm(ii+1+n.perm(jj+1+n.perm(kk+1))) % 12
+	n0 := simplexCorner3D(gi0, x0, y0, z0, 0.6)
+	n1 := simplexCorner3D(gi1, x1, y1, z1, 0.6)
+	n2 := simplexCorner3D(gi2, x2, y2, z2, 0.6)
+	n3 := simplexCorner3D(gi3, x3, y3, z3, 0.6)
+	return 32.0 * (n0 + n1 + n2 + n3)
+}
+
 func simplexCorner(gradientIndex int, x, y, radius float64) float64 {
 	attenuation := radius - x*x - y*y
 	if attenuation < 0 {
@@ -56,6 +110,16 @@ func simplexCorner(gradientIndex int, x, y, radius float64) float64 {
 	attenuation *= attenuation
 	g := gradient[gradientIndex]
 	return attenuation * attenuation * (g[0]*x + g[1]*y)
+}
+
+func simplexCorner3D(gradientIndex int, x, y, z, radius float64) float64 {
+	attenuation := radius - x*x - y*y - z*z
+	if attenuation < 0 {
+		return 0
+	}
+	attenuation *= attenuation
+	g := gradient[gradientIndex]
+	return attenuation * attenuation * (g[0]*x + g[1]*y + g[2]*z)
 }
 
 // PerlinSimplexNoise ports net.minecraft.world.level.levelgen.synth.PerlinSimplexNoise.
@@ -68,20 +132,25 @@ type PerlinSimplexNoise struct {
 	highestFreqValueFactor float64
 }
 
-// NewPerlinSimplexNoise constructs a PerlinSimplexNoise from a sorted, unique
-// non-positive/zero octave list (such as [0] or [-2, -1, 0]).
+// NewPerlinSimplexNoise constructs a PerlinSimplexNoise from an octave list
+// matching PerlinSimplexNoise(RandomSource, List<Integer>).
 func NewPerlinSimplexNoise(random RandomSource, octaves []int) *PerlinSimplexNoise {
-	hasOctave := func(target int) bool {
-		for _, o := range octaves {
-			if o == target {
-				return true
-			}
-		}
-		return false
+	sorted := slices.Clone(octaves)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+	if len(sorted) == 0 {
+		panic("worldgen: PerlinSimplexNoise requires at least one octave")
 	}
-	i := -octaves[0]
-	j := octaves[len(octaves)-1]
+	hasOctave := func(target int) bool {
+		_, ok := slices.BinarySearch(sorted, target)
+		return ok
+	}
+	i := -sorted[0]
+	j := sorted[len(sorted)-1]
 	k := i + j + 1
+	if k < 1 {
+		panic("worldgen: PerlinSimplexNoise total number of octaves needs to be >= 1")
+	}
 	simplex := newSimplexNoise(random)
 	l := j
 	noiseLevels := make([]*simplexNoise, k)
@@ -93,6 +162,17 @@ func NewPerlinSimplexNoise(random RandomSource, octaves []int) *PerlinSimplexNoi
 			noiseLevels[m] = newSimplexNoise(random)
 		} else {
 			random.ConsumeCount(262)
+		}
+	}
+	if j > 0 {
+		n := int64(simplex.value3D(simplex.xo, simplex.yo, simplex.zo) * 9.223372036854776e18)
+		random2 := NewLegacy(n)
+		for o := l - 1; o >= 0; o-- {
+			if o < k && hasOctave(l-o) {
+				noiseLevels[o] = newSimplexNoise(random2)
+			} else {
+				random2.ConsumeCount(262)
+			}
 		}
 	}
 	return &PerlinSimplexNoise{
@@ -126,6 +206,16 @@ var (
 	frozenTemperatureNoise = NewPerlinSimplexNoise(NewLegacy(3456), []int{-2, -1, 0})
 	biomeInfoNoise         = NewPerlinSimplexNoise(NewLegacy(2345), []int{0})
 )
+
+// TemperatureNoise is Biome.TEMPERATURE_NOISE.getValue(x, z, false).
+func TemperatureNoise(x, z float64) float64 {
+	return temperatureNoise.GetValue(x, z, false)
+}
+
+// FrozenTemperatureNoise is Biome.FROZEN_TEMPERATURE_NOISE.getValue(x, z, false).
+func FrozenTemperatureNoise(x, z float64) float64 {
+	return frozenTemperatureNoise.GetValue(x, z, false)
+}
 
 // BiomeInfoNoise is Biome.BIOME_INFO_NOISE.getValue(x, z, false). It is
 // world-seed independent and drives noise-based vegetation attempt counts.

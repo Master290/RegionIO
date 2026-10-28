@@ -1439,10 +1439,14 @@ func placeJigsawElementInChunk(
 		}
 		if fs != nil {
 			fpos := worldgen.FeaturePosition{X: pos[0], Y: pos[1], Z: pos[2]}
-			if placed, ok := fs.Placed["minecraft:"+clean]; ok {
-				_ = region.placeConfiguredVegetation(fs, random, fpos, placed.Feature, region.placementContext(nil))
+			placedName := "minecraft:" + clean
+			if placed, ok := fs.Placed[placedName]; ok {
+				ctx := region.placementContext(nil)
+				_ = fs.ForEachPlacementPosition(placedName, random, fpos, ctx, func(p worldgen.FeaturePosition) error {
+					return region.placeConfiguredVegetation(fs, random, p, placed.Feature, ctx)
+				})
 			} else {
-				_ = region.placeConfiguredVegetation(fs, random, fpos, "minecraft:"+clean, region.placementContext(nil))
+				_ = region.placeConfiguredVegetation(fs, random, fpos, placedName, region.placementContext(nil))
 			}
 		}
 		return

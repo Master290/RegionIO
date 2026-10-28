@@ -137,6 +137,44 @@ func ColdEnoughToSnowAt(biome string, x, y, z, seaLevel int) bool {
 	return !WarmEnoughToRainAt(biome, x, y, z, seaLevel)
 }
 
+// biomeNoPrecipitation lists all biomes in data/minecraft/worldgen/biome/*.json
+// with "has_precipitation": false in vanilla 26.1.2.
+var biomeNoPrecipitation = map[string]bool{
+	"minecraft:badlands":          true,
+	"minecraft:basalt_deltas":     true,
+	"minecraft:crimson_forest":    true,
+	"minecraft:desert":            true,
+	"minecraft:end_barrens":       true,
+	"minecraft:end_highlands":     true,
+	"minecraft:end_midlands":      true,
+	"minecraft:eroded_badlands":   true,
+	"minecraft:nether_wastes":     true,
+	"minecraft:savanna":           true,
+	"minecraft:savanna_plateau":   true,
+	"minecraft:small_end_islands": true,
+	"minecraft:soul_sand_valley":  true,
+	"minecraft:the_end":           true,
+	"minecraft:the_void":          true,
+	"minecraft:warped_forest":     true,
+	"minecraft:windswept_savanna": true,
+	"minecraft:wooded_badlands":   true,
+}
+
+// BiomeHasPrecipitation ports Biome.hasPrecipitation().
+func BiomeHasPrecipitation(biome string) bool {
+	if _, ok := biomeTemperature[biome]; !ok {
+		return false
+	}
+	return !biomeNoPrecipitation[biome]
+}
+
+// ShouldSnowAt ports the biome precipitation check of Biome.shouldSnow:
+// Biome.getPrecipitationAt(pos, seaLevel) == Biome.Precipitation.SNOW, which
+// requires both hasPrecipitation() and coldEnoughToSnow(pos, seaLevel).
+func ShouldSnowAt(biome string, x, y, z, seaLevel int) bool {
+	return BiomeHasPrecipitation(biome) && ColdEnoughToSnowAt(biome, x, y, z, seaLevel)
+}
+
 // ShouldMeltFrozenOceanIcebergSlightly ports
 // Biome.shouldMeltFrozenOceanIcebergSlightly(BlockPos, int seaLevel).
 func ShouldMeltFrozenOceanIcebergSlightly(biome string, x, z, seaLevel int) bool {

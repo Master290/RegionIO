@@ -309,3 +309,137 @@ func TestRemainingJigsawStructures(t *testing.T) {
 		t.Logf("%s: pieces=%d %s=%d", tc.name, len(start.Pieces), tc.wantBlock, counts[tc.wantBlock])
 	}
 }
+
+func TestVillageAndOutpostJigsawResidualAndFreezeTopLayer(t *testing.T) {
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil {
+		t.Fatalf("LoadStructureSets: %v", err)
+	}
+	reg, err := worldgen.LoadJigsawDataRegistry()
+	if err != nil {
+		t.Fatalf("LoadJigsawDataRegistry: %v", err)
+	}
+	fs := mustFeatureSet(t)
+	flatSurface := func(x, z int, oceanFloor bool) int {
+		return 64
+	}
+
+	villages := []struct {
+		name      string
+		wantBlock string
+	}{
+		{"minecraft:village_plains", "minecraft:oak_planks"},
+		{"minecraft:village_desert", "minecraft:sandstone"},
+		{"minecraft:village_savanna", "minecraft:acacia_planks"},
+		{"minecraft:village_snowy", "minecraft:snow_block"},
+		{"minecraft:village_taiga", "minecraft:spruce_planks"},
+	}
+	for _, v := range villages {
+		def := sets.Structures[v.name]
+		if def == nil {
+			t.Fatalf("missing village definition %s", v.name)
+		}
+		start, err := BuildJigsawStart(nil, nil, def, 424242, 0, 0, flatSurface)
+		if err != nil {
+			t.Fatalf("BuildJigsawStart(%s): %v", v.name, err)
+		}
+		if start == nil || len(start.Pieces) < 5 {
+			t.Fatalf("%s generated %v pieces, want >= 5", v.name, start)
+		}
+		region := buildFlatTestDecorationRegion(t, 0, 0, 4, 64, false)
+		for cx := int32(-4); cx <= 4; cx++ {
+			for cz := int32(-4); cz <= 4; cz++ {
+				PlaceJigsawStartsForChunk(region, []*JigsawStart{start}, v.name, 4, 424242, cx, cz)
+			}
+		}
+		counts := countBlocksInBox(region, start.Box)
+		if counts["minecraft:jigsaw"] > 0 || counts["minecraft:structure_block"] > 0 {
+			t.Errorf("%s left jigsaw=%d structure_block=%d", v.name, counts["minecraft:jigsaw"], counts["minecraft:structure_block"])
+		}
+		if counts[v.wantBlock] == 0 {
+			t.Errorf("%s placed 0 %s", v.name, v.wantBlock)
+		}
+	}
+
+	// FeaturePoolElement must execute the PlacedFeature's placement modifiers
+	// (count + random_offset + block_predicate_filter) rather than placing once at origin.
+	berryRegion := buildFlatTestDecorationRegion(t, 0, 0, 1, 63, false)
+	grassID, ok := nameToStateID("minecraft:grass_block", map[string]string{"snowy": "false"})
+	if !ok {
+		t.Fatal("missing grass_block state")
+	}
+	for x := -16; x < 32; x++ {
+		for z := -16; z < 32; z++ {
+			berryRegion.setBlockGlobal(x, 63, z, grassID)
+		}
+	}
+	chunkBox := msBox{minX: 0, minY: MinY, minZ: 0, maxX: 15, maxY: MinY + WorldHeight - 1, maxZ: 15}
+	placeJigsawElementInChunk(
+		berryRegion,
+		reg,
+		fs,
+		worldgen.PoolElementDef{
+			ElementType: "minecraft:feature_pool_element",
+			Feature:     "minecraft:patch_berry_bush",
+			Projection:  "rigid",
+		},
+		[3]int{8, 64, 8},
+		0,
+		chunkBox,
+		worldgen.NewLegacy(13579),
+		"apply_waterlogging",
+	)
+	berryCounts := countBlocksInBox(berryRegion, msBox{minX: 0, minY: 60, minZ: 0, maxX: 15, maxY: 70, maxZ: 15})
+	if berryCounts["minecraft:sweet_berry_bush"] < 2 {
+		t.Errorf("feature_pool_element patch_berry_bush placed %d sweet_berry_bush, want >= 2 via PlacedFeature modifiers",
+			berryCounts["minecraft:sweet_berry_bush"])
+	}
+
+	// freeze_top_layer must use height-adjusted temperature above seaLevel+17:
+	// windswept_hills (baseTemp=0.2) is warm at y=64 (no ice/snow), but cools
+	// below 0.15 at y=160 (water freezes to ice, snow[layers=1] is placed, and
+	// grass_block below becomes snowy=true).
+	hillsID := biomeIDByName("minecraft:windswept_hills")
+	lowRegion := buildFlatTestDecorationRegion(t, 0, 0, 1, 63, false)
+	highRegion := buildFlatTestDecorationRegion(t, 0, 0, 1, 159, false)
+	for _, r := range []*decorationRegion{lowRegion, highRegion} {
+		for _, ch := range r.chunks {
+			for qx := 0; qx < 4; qx++ {
+				for qy := 0; qy < SectionCount*4; qy++ {
+					for qz := 0; qz < 4; qz++ {
+						ch.SetBiome(qx*4, MinY+qy*4, qz*4, hillsID)
+					}
+				}
+			}
+		}
+	}
+	lowRegion.setBlock(2, 63, 2, grassID)
+	lowRegion.setBlock(3, 63, 3, StateWater)
+	if err := lowRegion.placeScheduledFreezeTopLayer(12345); err != nil {
+		t.Fatalf("placeScheduledFreezeTopLayer(low): %v", err)
+	}
+	if got := lowRegion.getBlock(3, 63, 3); got != StateWater {
+		t.Errorf("windswept_hills at y=64 water block = %d, want StateWater (%d)", got, StateWater)
+	}
+	if got := lowRegion.getBlock(2, 64, 2); got != StateAir {
+		t.Errorf("windswept_hills at y=64 air above grass = %d, want StateAir", got)
+	}
+
+	highRegion.setBlock(2, 159, 2, grassID)
+	highRegion.setBlock(3, 159, 3, StateWater)
+	if err := highRegion.placeScheduledFreezeTopLayer(12345); err != nil {
+		t.Fatalf("placeScheduledFreezeTopLayer(high): %v", err)
+	}
+	iceID, _ := nameToStateID("minecraft:ice", nil)
+	snowID, _ := nameToStateID("minecraft:snow", map[string]string{"layers": "1"})
+	snowyGrassID, _ := nameToStateID("minecraft:grass_block", map[string]string{"snowy": "true"})
+	if got := highRegion.getBlock(3, 159, 3); got != iceID {
+		t.Errorf("windswept_hills at y=160 water block = %d, want ice (%d)", got, iceID)
+	}
+	if got := highRegion.getBlock(2, 160, 2); got != snowID {
+		t.Errorf("windswept_hills at y=160 block above grass = %d, want snow[layers=1] (%d)", got, snowID)
+	}
+	if got := highRegion.getBlock(2, 159, 2); got != snowyGrassID {
+		t.Errorf("windswept_hills at y=159 grass block = %d, want grass_block[snowy=true] (%d)", got, snowyGrassID)
+	}
+}

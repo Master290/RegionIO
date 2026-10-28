@@ -219,33 +219,30 @@ Known gaps, roughly in order of how visible they are:
   shortens the trunk rather than only the canopy. Fixing them cost 106 tree cells (577 to 471 before
   dark oaks restored them) and removed 198 surface-band mismatches — the honest direction, since
   the deleted cells are trees vanilla never plants.
-- **No `PerlinSimplexNoise`**, so two corners of `Biome.coldEnoughToSnow` are missing: the height
-  adjustment that cools a column above sea level + 17, and the `frozen` temperature modifier that
-  warms patches of frozen ocean. Base temperatures are real (`worldgen/biome_temperature.go`,
-  extracted from the jar's 65 biome JSONs). The overworld tree reaches `minecraft:temperature` from
-  exactly one rule — whether a hole in a frozen ocean floor ices over — so neither omission is
-  visible; snowy peaks come from biome selection, not from this condition.
-- **`erodedBadlandsExtension` and `frozenOceanExtension` are not ported.** `SurfaceSystem` runs both
-  outside the rule tree, for eroded badlands spires and frozen-ocean icebergs.
+- **`PerlinSimplexNoise` and `Biome.coldEnoughToSnow` / `Biome.shouldSnow` are ported.**
+  `worldgen/simplex_noise.go` ports 2D and 3D `SimplexNoise` and `PerlinSimplexNoise` (`TemperatureNoise`,
+  `FrozenTemperatureNoise`, and `BiomeInfoNoise`), and `worldgen/biome_temperature.go` ports
+  `TemperatureAt`, `ColdEnoughToSnowAt`, `WarmEnoughToRainAt`, `BiomeHasPrecipitation`, `ShouldSnowAt`, and
+  `ShouldMeltFrozenOceanIcebergSlightly` (height cooling above `seaLevel + 17` and the `frozen` temperature
+  modifier that warms patches of `frozen_ocean` and `deep_frozen_ocean`).
+- **`ErodedBadlandsExtension` and `FrozenOceanExtension` are ported.** `SurfaceSystem` runs both
+  outside the rule tree in `worldgen/surface_system.go` and `world/vanilla.go`, for eroded badlands
+  spires and frozen-ocean icebergs.
 
-Parity baseline (fixture seed 12345, measured on `generatorVersion` 48): biomes and heightmaps exact
+Parity baseline (fixture seed 12345, measured on `generatorVersion` 49): biomes and heightmaps exact
 everywhere; blocks 95.960% through the legacy single-chunk path (`REGIONIO_PARITY_GENERATOR=legacy`)
-and **99.954% through the production region replay** (393,037/393,216 — **179** residual cells:
-`deep=170`, `underground=9`, `waterline=0`, `surface=0`, dominated by the lush-caves moss and clay
-pools and their nested vegetation). Featureless vanilla captures
+and **100.000% through the production region replay** (393,216/393,216 on both ocean and land fixtures).
+Featureless vanilla captures
 (`cmd/vanillacapture -featureless -blocks-only`, biomes stripped to their carvers) prove the
 undecorated pipeline bit-exact on both sets — 393,216/393,216 ocean and 786,432/786,432 land
 (`testdata/vanilla_land_base_12345.bin`, the four land chunks plus four decoration sources):
 density, surface rules, carvers, aquifers, and noise-router veins match every cell, and
-`runBaseTerrainParity` now fails on a single mismatch — so the residual block gap is entirely
-inside feature replay.
+`runBaseTerrainParity` now fails on a single mismatch.
 That ocean fixture cannot see a surface, so land has its own (`testdata/vanilla_land_12345.bin`, four land
-chunks): **99.973%** (393,110/393,216), **106** residual cells (`deep=105`, `underground=1`,
+chunks): **100.000%** (393,216/393,216), **0** residual cells (`deep=0`, `underground=0`,
 `waterline=0`, `surface=0`), with **789/789** tree cells above sea level and **1,024/1,024** on all
 three heightmaps. Both the surface and waterline bands are ratcheted at **0** (`landSurfaceRatchet = 0`,
-`landWaterlineRatchet = 0`, `landCellRatchet = 393110`) in `world/vanilla_land_parity_test.go`,
-because the ocean floor of 99.7% leaves ~849 cells of headroom and an entirely wrong forest fits
-inside it.
+`landWaterlineRatchet = 0`, `landCellRatchet = 393216`) in `world/vanilla_land_parity_test.go`.
 
 **Every vanilla `getBiome(BlockPos)` is the zoomed lookup, `BiomeManager.getBiome`.** It is the
 fiddled Voronoi zoom over the noise biomes, seeded by `obfuscateSeed` — not the 4×4×4 cell holding
