@@ -623,6 +623,8 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	carried := tr.carried
 	tr.mu.Unlock()
 
+	s.HydrateChestExplorerMaps(x, y, z, "buried_treasure")
+
 	if session.send != nil {
 		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, "Chest")); err != nil {
 			return cid, err
@@ -632,6 +634,7 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
 		}
+		s.syncChestMapSlots(session, cid, x, y, z)
 	}
 	return cid, nil
 }
@@ -992,7 +995,6 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 		if err := s.HandleCartographyContainerClick(session, containerID, slot, button, mode); err != nil {
 			return err
 		}
-		s.syncCartographyMapSlots(session, containerID)
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
 		return nil
@@ -1083,13 +1085,71 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 	if slot < 0 || slot >= ChestMenuSlotCount {
 		return
 	}
+	s.HydrateChestExplorerMaps(bx, by, bz, "buried_treasure")
 	slots := s.buildChestMenuSlots(session, bx, by, bz)
+
+	var slotMapIDs [ChestMenuSlotCount]int32
+	var hasSlotMaps [ChestMenuSlotCount]bool
+	for i := 0; i < ChestSlotCount; i++ {
+		if id, ok := s.GetChestSlotMapID(bx, by, bz, i); ok && slots[i].ResolvedID() == FilledMapItemID {
+			slotMapIDs[i], hasSlotMaps[i] = id, true
+		}
+	}
+	for i := 0; i < 27; i++ {
+		if id, ok := GetSlotMapID(session, 9+i); ok && slots[27+i].ResolvedID() == FilledMapItemID {
+			slotMapIDs[27+i], hasSlotMaps[27+i] = id, true
+		}
+	}
+	for i := 0; i < 9; i++ {
+		if id, ok := GetSlotMapID(session, 36+i); ok && slots[54+i].ResolvedID() == FilledMapItemID {
+			slotMapIDs[54+i], hasSlotMaps[54+i] = id, true
+		}
+	}
+	carriedMapID, hasCarriedMap := GetCarriedMapID(session)
 
 	switch mode {
 	case ContainerInputPickup:
+		prevSlotEmpty := slots[slot].IsEmpty()
+		prevCarriedEmpty := tr.carried.IsEmpty()
 		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+		if prevSlotEmpty && !slots[slot].IsEmpty() {
+			slotMapIDs[slot], hasSlotMaps[slot] = carriedMapID, hasCarriedMap
+			if tr.carried.IsEmpty() {
+				carriedMapID, hasCarriedMap = 0, false
+			}
+		} else if prevCarriedEmpty && !tr.carried.IsEmpty() {
+			carriedMapID, hasCarriedMap = slotMapIDs[slot], hasSlotMaps[slot]
+			if slots[slot].IsEmpty() {
+				slotMapIDs[slot], hasSlotMaps[slot] = 0, false
+			}
+		} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() {
+			slotMapIDs[slot], carriedMapID = carriedMapID, slotMapIDs[slot]
+			hasSlotMaps[slot], hasCarriedMap = hasCarriedMap, hasSlotMaps[slot]
+		}
 	case ContainerInputQuickMove:
-		if slot < ChestSlotCount {
+		if slots[slot].ResolvedID() == FilledMapItemID && hasSlotMaps[slot] {
+			movedID := slotMapIDs[slot]
+			var ranges [][2]int
+			if slot < ChestSlotCount {
+				ranges = [][2]int{{54, 63}, {27, 54}}
+			} else {
+				ranges = [][2]int{{0, ChestSlotCount}}
+			}
+			for _, r := range ranges {
+				for dst := r[0]; dst < r[1]; dst++ {
+					if slots[dst].IsEmpty() {
+						slots[dst] = slots[slot]
+						slotMapIDs[dst], hasSlotMaps[dst] = movedID, true
+						slots[slot] = world.ItemStack{}
+						slotMapIDs[slot], hasSlotMaps[slot] = 0, false
+						break
+					}
+				}
+				if slots[slot].IsEmpty() {
+					break
+				}
+			}
+		} else if slot < ChestSlotCount {
 			// Chest -> Player inventory (prefer hotbar 54..62, then main 27..53)
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 63)
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 27, 54)
@@ -1101,10 +1161,15 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 		if button >= 0 && button < 9 {
 			hotbarIdx := 54 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			slotMapIDs[slot], slotMapIDs[hotbarIdx] = slotMapIDs[hotbarIdx], slotMapIDs[slot]
+			hasSlotMaps[slot], hasSlotMaps[hotbarIdx] = hasSlotMaps[hotbarIdx], hasSlotMaps[slot]
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+			if slots[slot].ResolvedID() == FilledMapItemID && hasSlotMaps[slot] {
+				carriedMapID, hasCarriedMap = slotMapIDs[slot], true
+			}
 		}
 	case ContainerInputThrow:
 		if !slots[slot].IsEmpty() {
@@ -1113,30 +1178,51 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 				dropCount = slots[slot].Count
 			}
 			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			droppedMapID, hadMap := slotMapIDs[slot], hasSlotMaps[slot]
 			rem := slots[slot].Count - dropCount
 			if rem <= 0 {
 				slots[slot] = world.ItemStack{}
+				slotMapIDs[slot], hasSlotMaps[slot] = 0, false
 			} else {
 				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 			}
 			snap := session.Snapshot()
-			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			entID, _ := s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			if dropStack.ResolvedID() == FilledMapItemID && hadMap && entID != 0 {
+				s.AssociateDroppedMapEntity(entID, droppedMapID)
+			}
 			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
 		}
 	case ContainerInputPickupAll:
 		applyPickupAllSlice(slots, &tr.carried, 0)
 	}
 
-	// Write back chest slots (0..26) and player inventory slots (27..62).
+	// Write back chest slots (0..26) and player inventory slots (27..62) along with mapID metadata.
 	for i := 0; i < ChestSlotCount; i++ {
 		s.SetChestSlot(bx, by, bz, i, slots[i])
+		if !slots[i].IsEmpty() && slots[i].ResolvedID() == FilledMapItemID && hasSlotMaps[i] {
+			s.SetChestSlotMapID(bx, by, bz, i, slotMapIDs[i])
+		} else {
+			s.ClearChestSlotMapID(bx, by, bz, i)
+		}
 	}
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[27+i])
+		if !slots[27+i].IsEmpty() && slots[27+i].ResolvedID() == FilledMapItemID && hasSlotMaps[27+i] {
+			SetSlotMapID(session, 9+i, slotMapIDs[27+i])
+		} else {
+			ClearSlotMapID(session, 9+i)
+		}
 	}
 	for i := 0; i < 9; i++ {
 		session.SetInventorySlot(36+i, slots[54+i])
+		if !slots[54+i].IsEmpty() && slots[54+i].ResolvedID() == FilledMapItemID && hasSlotMaps[54+i] {
+			SetSlotMapID(session, 36+i, slotMapIDs[54+i])
+		} else {
+			ClearSlotMapID(session, 36+i)
+		}
 	}
+	SetCarriedMapID(session, carriedMapID, !tr.carried.IsEmpty() && tr.carried.ResolvedID() == FilledMapItemID && hasCarriedMap)
 }
 
 // WearableArmorSlotForItem returns the player inventory armor slot index
@@ -2264,6 +2350,9 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried)); err != nil {
 		return err
 	}
+	if openCopy.MenuType == MenuTypeGeneric9x3 && openCopy.VehicleEntityID == 0 {
+		s.syncChestMapSlots(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+	}
 	if isCrafter {
 		return s.sendCrafterDataProperties(session, openCopy.ContainerID, session.Dimension(), openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	}
@@ -3319,19 +3408,76 @@ func (s *Server) syncCartographyMapSlots(session *PlayerSession, containerID int
 	}
 	mapSlot := tr.open.Crafting[0]
 	resSlot := tr.open.Result
+	carried := tr.carried
 	tr.mu.Unlock()
 
 	mtr := getMapMetaTracker(session)
 	mtr.mu.Lock()
 	cartoMapID, hasCartoMap := mtr.cartoMapID, mtr.hasCartoMap
 	resMapID, hasResMap := mtr.resMapID, mtr.hasResMap
+	resPostProc, hasResPostProc := mtr.resPostProc, mtr.hasResPostProc
+	carriedMapID, hasCarried := mtr.carriedMapID, mtr.hasCarried
 	mtr.mu.Unlock()
 
 	if !mapSlot.IsEmpty() && mapSlot.ResolvedID() == FilledMapItemID && hasCartoMap {
 		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), CartographySlotMap, mapSlot, cartoMapID, true))
 	}
 	if !resSlot.IsEmpty() && resSlot.ResolvedID() == FilledMapItemID && hasResMap {
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), CartographySlotResult, resSlot, resMapID, true))
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapIDAndPostProcessing(containerID, session.NextContainerStateID(), CartographySlotResult, resSlot, resMapID, true, resPostProc, hasResPostProc))
+	}
+	if !carried.IsEmpty() && carried.ResolvedID() == FilledMapItemID && hasCarried {
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(-1, session.NextContainerStateID(), -1, carried, carriedMapID, true))
+	}
+	inv := session.Inventory()
+	for menuSlot := 3; menuSlot < CartographyMenuSlotCount; menuSlot++ {
+		invSlot := 9 + (menuSlot - 3)
+		st := inv[invSlot]
+		if !st.IsEmpty() && st.ResolvedID() == FilledMapItemID {
+			if id, ok := GetSlotMapID(session, invSlot); ok {
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), menuSlot, st, id, true))
+			}
+		}
+	}
+}
+
+func (s *Server) syncChestMapSlots(session *PlayerSession, containerID int32, bx, by, bz int) {
+	if s == nil || session == nil || session.send == nil {
+		return
+	}
+	chest := s.ChestSlots(bx, by, bz)
+	for i := 0; i < ChestSlotCount; i++ {
+		if !chest[i].IsEmpty() && chest[i].ResolvedID() == FilledMapItemID {
+			if id, ok := s.GetChestSlotMapID(bx, by, bz, i); ok {
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), i, chest[i], id, true))
+				if data, exists := s.GetMapData(id); exists && data != nil {
+					s.refreshMapDecorations(data)
+					_ = session.send(PlayMapItemDataCB, EncodeMapItemDataPacket(id, data.Scale, data.Locked, data.DecorationList(), data.FullMapColorPatch()))
+				}
+			}
+		}
+	}
+	inv := session.Inventory()
+	for i := 0; i < 27; i++ {
+		st := inv[9+i]
+		if !st.IsEmpty() && st.ResolvedID() == FilledMapItemID {
+			if id, ok := GetSlotMapID(session, 9+i); ok {
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), 27+i, st, id, true))
+			}
+		}
+	}
+	for i := 0; i < 9; i++ {
+		st := inv[36+i]
+		if !st.IsEmpty() && st.ResolvedID() == FilledMapItemID {
+			if id, ok := GetSlotMapID(session, 36+i); ok {
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(containerID, session.NextContainerStateID(), 54+i, st, id, true))
+			}
+		}
+	}
+	carried := session.CarriedItem()
+	if !carried.IsEmpty() && carried.ResolvedID() == FilledMapItemID {
+		if id, ok := GetCarriedMapID(session); ok {
+			_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(-1, session.NextContainerStateID(), -1, carried, id, true))
+		}
 	}
 }
 

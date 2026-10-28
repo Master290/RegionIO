@@ -1356,18 +1356,63 @@ func encodeContainerSetSlotWithMapID(containerID, stateID int32, slot int, stack
 	return w.Bytes()
 }
 
+// EncodeSlotWithMapIDAndPostProcessing writes a protocol 775 Slot carrying DataComponentMapID (46)
+// and optional DataComponentMapPostProcessing (48: Lock=0, Scale=1) when stack is a filled_map.
+func EncodeSlotWithMapIDAndPostProcessing(w *protocol.Writer, stack world.ItemStack, mapID int32, hasMapID bool, postProc int32, hasPostProc bool) {
+	itemID := stack.ResolvedItemID()
+	if stack.IsEmpty() || itemID <= 0 {
+		w.VarInt(0)
+		return
+	}
+	w.VarInt(stack.Count)
+	w.VarInt(itemID)
+	if stack.ResolvedID() != FilledMapItemID || (!hasMapID && !hasPostProc) {
+		w.VarInt(0)
+		w.VarInt(0)
+		return
+	}
+	added := int32(0)
+	if hasMapID {
+		added++
+	}
+	if hasPostProc {
+		added++
+	}
+	w.VarInt(added)
+	w.VarInt(0)
+	if hasMapID {
+		w.VarInt(DataComponentMapID)
+		w.VarInt(mapID)
+	}
+	if hasPostProc {
+		w.VarInt(DataComponentMapPostProcessing)
+		w.VarInt(postProc)
+	}
+}
+
+func encodeContainerSetSlotWithMapIDAndPostProcessing(containerID, stateID int32, slot int, stack world.ItemStack, mapID int32, hasMapID bool, postProc int32, hasPostProc bool) []byte {
+	w := protocol.NewWriter(28)
+	w.VarInt(containerID)
+	w.VarInt(stateID)
+	w.Uint16(uint16(slot))
+	EncodeSlotWithMapIDAndPostProcessing(w, stack, mapID, hasMapID, postProc, hasPostProc)
+	return w.Bytes()
+}
+
 // --- Per-Player Inventory MapID Tracker ---
 
 type sessionMapMetaTracker struct {
-	mu           sync.Mutex
-	slotMapID    [world.PlayerInventorySlots]int32
-	hasSlotMap   [world.PlayerInventorySlots]bool
-	carriedMapID int32
-	hasCarried   bool
-	cartoMapID   int32
-	hasCartoMap  bool
-	resMapID     int32
-	hasResMap    bool
+	mu             sync.Mutex
+	slotMapID      [world.PlayerInventorySlots]int32
+	hasSlotMap     [world.PlayerInventorySlots]bool
+	carriedMapID   int32
+	hasCarried     bool
+	cartoMapID     int32
+	hasCartoMap    bool
+	resMapID       int32
+	hasResMap      bool
+	resPostProc    int32
+	hasResPostProc bool
 }
 
 var playerMapMetas sync.Map // map[*PlayerSession]*sessionMapMetaTracker
@@ -1455,11 +1500,17 @@ type mapHoldingProgress struct {
 	sentFull bool
 }
 
+type chestMapSlotKey struct {
+	x, y, z int
+	slot    int
+}
+
 type serverMapStore struct {
 	mu          sync.RWMutex
 	maps        map[int32]*MapItemSavedData
 	nextMapID   int32
 	itemEntMaps map[int32]int32 // dropped item entityID -> mapID
+	chestMaps   map[chestMapSlotKey]int32
 	holding     map[*PlayerSession]map[int32]*mapHoldingProgress
 
 	worldgenOnce sync.Once
@@ -1480,6 +1531,7 @@ func (s *Server) mapStore() *serverMapStore {
 		maps:        make(map[int32]*MapItemSavedData),
 		nextMapID:   0,
 		itemEntMaps: make(map[int32]int32),
+		chestMaps:   make(map[chestMapSlotKey]int32),
 		holding:     make(map[*PlayerSession]map[int32]*mapHoldingProgress),
 		odBySeed:    make(map[int64]*worldgen.OverworldDensity),
 	}
@@ -1756,8 +1808,8 @@ func (s *Server) UpdateMapTerrainAt(dimension string, entityX, entityZ float64, 
 				}
 			}
 
-			// Check if any tracked banners at (worldBaseX, worldBaseZ) were removed.
-			s.checkMapBannersAt(cache, data, worldBaseX, worldBaseZ)
+			// Check if any tracked banners inside this pixel's block cell were removed.
+			s.checkMapBannersAt(cache, data, worldBaseX, worldBaseZ, blocksPerPixel)
 
 			waterDepth := waterDepthTotal / (blocksPerPixel * blocksPerPixel)
 
@@ -1878,6 +1930,12 @@ func (s *Server) ToggleMapBanner(dimension string, mapID int32, x, y, z int, cus
 	if !ok || data == nil {
 		return false
 	}
+	if customName == "" {
+		if b, hasB := s.GetBannerAt(dimension, x, y, z); hasB && b != nil && b.CustomName != nil {
+			customName = b.CustomName.PlainText()
+		}
+	}
+
 	data.mu.Lock()
 	defer data.mu.Unlock()
 	if data.Locked || world.NormalizeDimension(dimension) != world.NormalizeDimension(data.Dimension) {
@@ -1943,7 +2001,11 @@ func (s *Server) UseMapItemOn(session *PlayerSession, hand int32, x, y, z int) b
 		return false
 	}
 	snap := session.Snapshot()
-	if !s.ToggleMapBanner(snap.Dimension, mapID, x, y, z, "") {
+	bannerName := ""
+	if b, hasB := s.GetBannerAt(snap.Dimension, x, y, z); hasB && b != nil && b.CustomName != nil {
+		bannerName = b.CustomName.PlainText()
+	}
+	if !s.ToggleMapBanner(snap.Dimension, mapID, x, y, z, bannerName) {
 		return false
 	}
 	if data, exists := s.GetMapData(mapID); exists && session.send != nil {
@@ -1954,14 +2016,60 @@ func (s *Server) UseMapItemOn(session *PlayerSession, hand int32, x, y, z int) b
 	return true
 }
 
-func (s *Server) checkMapBannersAt(cache *world.Cache, data *MapItemSavedData, x, z int) {
+// RemoveBannerMarkersAt removes any tracked banner marker at (x, y, z) across all unlocked
+// maps in dimension, returning the number of maps updated.
+func (s *Server) RemoveBannerMarkersAt(dimension string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	st := s.mapStore()
+	if st == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dimension)
+	st.mu.RLock()
+	maps := make([]*MapItemSavedData, 0, len(st.maps))
+	for _, d := range st.maps {
+		if d != nil {
+			maps = append(maps, d)
+		}
+	}
+	st.mu.RUnlock()
+
+	removedCount := 0
+	for _, data := range maps {
+		data.mu.Lock()
+		if !data.Locked && world.NormalizeDimension(data.Dimension) == normDim {
+			changed := false
+			for key, b := range data.Banners {
+				if b.X == x && b.Y == y && b.Z == z {
+					delete(data.Banners, key)
+					delete(data.Decorations, key)
+					data.Dirty = true
+					changed = true
+				}
+			}
+			if changed {
+				removedCount++
+			}
+		}
+		data.mu.Unlock()
+	}
+	return removedCount
+}
+
+func (s *Server) checkMapBannersAt(cache *world.Cache, data *MapItemSavedData, worldBaseX, worldBaseZ, blocksPerPixel int) {
 	if cache == nil || data == nil {
 		return
+	}
+	if blocksPerPixel < 1 {
+		blocksPerPixel = 1
 	}
 	data.mu.Lock()
 	defer data.mu.Unlock()
 	for key, b := range data.Banners {
-		if b.X == x && b.Z == z {
+		if b.X >= worldBaseX && b.X < worldBaseX+blocksPerPixel &&
+			b.Z >= worldBaseZ && b.Z < worldBaseZ+blocksPerPixel {
 			st := cache.GetBlock(b.X, b.Y, b.Z)
 			if color, ok := BannerBlockColor(st); !ok || color != b.Color {
 				delete(data.Banners, key)
@@ -2113,6 +2221,11 @@ func playerCarriesMapID(session *PlayerSession, mapID int32) bool {
 			}
 		}
 	}
+	if session.CarriedItem().ResolvedID() == FilledMapItemID {
+		if id, ok := GetCarriedMapID(session); ok && id == mapID {
+			return true
+		}
+	}
 	return false
 }
 
@@ -2206,6 +2319,33 @@ func (s *Server) TickMaps() {
 			patch := s.UpdateMapTerrainForPlayer(p, data)
 			s.refreshMapDecorations(data)
 			s.sendMapUpdateToPlayer(st, p, data, patch)
+		}
+		// Also sync any filled_map in other inventory slots or cursor (vanilla MapItem.inventoryTick).
+		inv := p.Inventory()
+		for slot := 0; slot < world.PlayerInventorySlots; slot++ {
+			if inv[slot].ResolvedID() != FilledMapItemID {
+				continue
+			}
+			mapID, ok := GetSlotMapID(p, slot)
+			if !ok || seen[mapID] {
+				continue
+			}
+			seen[mapID] = true
+			data, exists := s.GetMapData(mapID)
+			if !exists || data == nil {
+				continue
+			}
+			s.refreshMapDecorations(data)
+			s.sendMapUpdateToPlayer(st, p, data, nil)
+		}
+		if p.CarriedItem().ResolvedID() == FilledMapItemID {
+			if mapID, ok := GetCarriedMapID(p); ok && !seen[mapID] {
+				seen[mapID] = true
+				if data, exists := s.GetMapData(mapID); exists && data != nil {
+					s.refreshMapDecorations(data)
+					s.sendMapUpdateToPlayer(st, p, data, nil)
+				}
+			}
 		}
 		// Also sync maps displayed in item frames in the player's dimension.
 		pDim := world.NormalizeDimension(p.Snapshot().Dimension)
@@ -2547,6 +2687,147 @@ func (s *Server) CreateWoodlandExplorerMap(originX, originZ int) (*MapItemSavedD
 // CreateTrialChambersMap creates a trial chambers explorer map (scale 2, trial_chambers marker).
 func (s *Server) CreateTrialChambersMap(originX, originZ int) (*MapItemSavedData, world.ItemStack, bool) {
 	return s.CreateExplorerMap(originX, originZ, "minecraft:trial_chambers", MapDecorationTrialChambers, 2)
+}
+
+// CreateExplorerMapForTradeOffer resolves a Cartographer villager trade offer or loot kind
+// (such as "minecraft:cartographer/3/ocean_monument_map", "woodland_mansion_map", "trial_chamber_map",
+// "buried_treasure", "jungle_explorer_map", "swamp_explorer_map", or village map trades) into the
+// target structure set, MapDecorationType icon, and custom display name, and generates the Explorer Map.
+func (s *Server) CreateExplorerMapForTradeOffer(offerOrKind string, originX, originZ int) (*MapItemSavedData, world.ItemStack, string) {
+	if s == nil {
+		return nil, world.ItemStack{}, ""
+	}
+	low := strings.ToLower(strings.TrimSpace(offerOrKind))
+	structureSet := "minecraft:ocean_monuments"
+	decorType := MapDecorationMonument
+	displayName := "Ocean Explorer Map"
+
+	switch {
+	case strings.Contains(low, "mansion") || strings.Contains(low, "woodland"):
+		structureSet = "minecraft:woodland_mansions"
+		decorType = MapDecorationMansion
+		displayName = "Woodland Explorer Map"
+	case strings.Contains(low, "trial"):
+		structureSet = "minecraft:trial_chambers"
+		decorType = MapDecorationTrialChambers
+		displayName = "Trial Explorer Map"
+	case strings.Contains(low, "treasure") || strings.Contains(low, "buried"):
+		structureSet = "minecraft:buried_treasures"
+		decorType = MapDecorationRedX
+		displayName = "Buried Treasure Map"
+	case strings.Contains(low, "jungle"):
+		structureSet = "minecraft:jungle_temples"
+		decorType = MapDecorationJungleTemple
+		displayName = "Jungle Explorer Map"
+	case strings.Contains(low, "swamp"):
+		structureSet = "minecraft:swamp_huts"
+		decorType = MapDecorationSwampHut
+		displayName = "Swamp Explorer Map"
+	case strings.Contains(low, "desert_village"):
+		structureSet = "minecraft:village_desert"
+		decorType = MapDecorationVillageDesert
+		displayName = "Desert Village Map"
+	case strings.Contains(low, "plains_village"):
+		structureSet = "minecraft:village_plains"
+		decorType = MapDecorationVillagePlains
+		displayName = "Plains Village Map"
+	case strings.Contains(low, "savanna_village"):
+		structureSet = "minecraft:village_savanna"
+		decorType = MapDecorationVillageSavanna
+		displayName = "Savanna Village Map"
+	case strings.Contains(low, "snowy_village"):
+		structureSet = "minecraft:village_snowy"
+		decorType = MapDecorationVillageSnowy
+		displayName = "Snowy Village Map"
+	case strings.Contains(low, "taiga_village"):
+		structureSet = "minecraft:village_taiga"
+		decorType = MapDecorationVillageTaiga
+		displayName = "Taiga Village Map"
+	case strings.Contains(low, "monument") || strings.Contains(low, "ocean"):
+		structureSet = "minecraft:ocean_monuments"
+		decorType = MapDecorationMonument
+		displayName = "Ocean Explorer Map"
+	}
+
+	data, stack, _ := s.CreateExplorerMap(originX, originZ, structureSet, decorType, 2)
+	return data, stack, displayName
+}
+
+// GetChestSlotMapID returns the mapID associated with a filled_map in chest (x, y, z) at slot (0..26).
+func (s *Server) GetChestSlotMapID(x, y, z, slot int) (int32, bool) {
+	st := s.mapStore()
+	if st == nil || slot < 0 || slot >= ChestSlotCount {
+		return 0, false
+	}
+	st.mu.RLock()
+	id, ok := st.chestMaps[chestMapSlotKey{x: x, y: y, z: z, slot: slot}]
+	st.mu.RUnlock()
+	return id, ok
+}
+
+// SetChestSlotMapID associates mapID with a filled_map in chest (x, y, z) at slot (0..26).
+func (s *Server) SetChestSlotMapID(x, y, z, slot int, mapID int32) {
+	st := s.mapStore()
+	if st == nil || slot < 0 || slot >= ChestSlotCount {
+		return
+	}
+	st.mu.Lock()
+	st.chestMaps[chestMapSlotKey{x: x, y: y, z: z, slot: slot}] = mapID
+	st.mu.Unlock()
+}
+
+// ClearChestSlotMapID removes any mapID association for chest (x, y, z) at slot (0..26).
+func (s *Server) ClearChestSlotMapID(x, y, z, slot int) {
+	st := s.mapStore()
+	if st == nil || slot < 0 || slot >= ChestSlotCount {
+		return
+	}
+	st.mu.Lock()
+	delete(st.chestMaps, chestMapSlotKey{x: x, y: y, z: z, slot: slot})
+	st.mu.Unlock()
+}
+
+// PopulateChestExplorerMap generates an Explorer or Buried Treasure Map of mapType around (x, z),
+// places the resulting filled_map into chest (x, y, z) at slot (0..26), and records its mapID.
+func (s *Server) PopulateChestExplorerMap(x, y, z, slot int, mapType string) (*MapItemSavedData, int32, bool) {
+	if s == nil || slot < 0 || slot >= ChestSlotCount {
+		return nil, 0, false
+	}
+	if strings.TrimSpace(mapType) == "" {
+		mapType = "buried_treasure"
+	}
+	data, stack, _ := s.CreateExplorerMapForTradeOffer(mapType, x, z)
+	if data == nil || stack.IsEmpty() {
+		return nil, 0, false
+	}
+	s.SetChestSlot(x, y, z, slot, stack)
+	s.SetChestSlotMapID(x, y, z, slot, data.MapID)
+	return data, data.MapID, true
+}
+
+// HydrateChestExplorerMaps scans chest (x, y, z) and allocates an Explorer / Buried Treasure Map
+// for any minecraft:filled_map slot that does not yet have an associated mapID.
+func (s *Server) HydrateChestExplorerMaps(x, y, z int, defaultMapType string) int {
+	if s == nil {
+		return 0
+	}
+	if strings.TrimSpace(defaultMapType) == "" {
+		defaultMapType = "buried_treasure"
+	}
+	slots := s.ChestSlots(x, y, z)
+	hydrated := 0
+	for i := 0; i < ChestSlotCount; i++ {
+		if slots[i].ResolvedID() != FilledMapItemID {
+			continue
+		}
+		if _, hasID := s.GetChestSlotMapID(x, y, z, i); hasID {
+			continue
+		}
+		if _, _, ok := s.PopulateChestExplorerMap(x, y, z, i, defaultMapType); ok {
+			hydrated++
+		}
+	}
+	return hydrated
 }
 
 // --- NBT & Disk Persistence (data/map_<id>.dat and data/idcounts.dat) ---

@@ -651,3 +651,277 @@ func TestMapPersistenceToDisk(t *testing.T) {
 	nbtComp := srv2.SaveDecorationsToNBT()
 	_ = nbt.MarshalNamed("", nbtComp)
 }
+
+func TestUseMapItemOnNamedBannerBlockEntityAndRemove(t *testing.T) {
+	srv := newTestMapServer(t)
+	session, _, _ := newTestMapPlayer(srv, "BannerExplorer", 0, 64, 0, 0)
+
+	mapData, mapStack := srv.CreateNewMap(0, 0, 0, true, false, world.DimensionOverworld)
+	session.SetInventorySlot(36, mapStack)
+	SetSlotMapID(session, 36, mapData.MapID)
+
+	blueBannerState := testBlockStateByName("minecraft:blue_banner")
+	srv.chunks.SetBlock(12, 65, 12, blueBannerState)
+	cn := TextComponent("Citadel Outpost")
+	srv.SetBannerAt(&BannerBlockEntity{
+		Dimension:  world.DimensionOverworld,
+		X:          12,
+		Y:          65,
+		Z:          12,
+		BaseColor:  "blue",
+		CustomName: &cn,
+	})
+
+	if !srv.UseMapItemOn(session, HandMain, 12, 65, 12) {
+		t.Fatal("expected UseMapItemOn to toggle named banner marker onto map")
+	}
+
+	srv.refreshMapDecorations(mapData)
+	decos := mapData.DecorationList()
+	var foundBanner *MapDecoration
+	for i := range decos {
+		if decos[i].Type == MapDecorationBannerBlue {
+			foundBanner = &decos[i]
+			break
+		}
+	}
+	if foundBanner == nil {
+		t.Fatalf("expected MapDecorationBannerBlue on map, got %+v", decos)
+	}
+	if foundBanner.CustomName != "Citadel Outpost" {
+		t.Fatalf("expected banner marker CustomName = %q, got %q", "Citadel Outpost", foundBanner.CustomName)
+	}
+
+	if removed := srv.RemoveBannerMarkersAt(world.DimensionOverworld, 12, 65, 12); removed != 1 {
+		t.Fatalf("expected RemoveBannerMarkersAt to remove 1 map marker, got %d", removed)
+	}
+	srv.refreshMapDecorations(mapData)
+	for _, d := range mapData.DecorationList() {
+		if d.Type == MapDecorationBannerBlue {
+			t.Fatalf("expected banner marker to be removed after RemoveBannerMarkersAt")
+		}
+	}
+}
+
+func TestCartographerTradeExplorerMapPlayPath(t *testing.T) {
+	srv := newTestMapServer(t)
+	session, pktsPtr, mu := newTestMapPlayer(srv, "CartoBuyer", 0, 64, 0, 0)
+
+	villagerID, err := srv.SpawnMob(2, 64, 2, MobTypeVillager)
+	if err != nil {
+		t.Fatalf("SpawnMob Villager: %v", err)
+	}
+	vs := srv.ensureVillagerState(villagerID)
+
+	vtr := srv.villagerTracker()
+	vtr.mu.Lock()
+	vs.Profession = VillagerProfessionCartographer
+	vs.Level = 3
+	vs.Offers = []MerchantOffer{
+		{
+			Name:            "minecraft:cartographer/3/ocean_monument_map",
+			BaseCostA:       world.NewNamedItemStack("minecraft:emerald", 13),
+			CostB:           world.NewNamedItemStack("minecraft:compass", 1),
+			Result:          world.NewNamedItemStack(FilledMapItemID, 1),
+			Uses:            0,
+			MaxUses:         12,
+			XP:              10,
+			PriceMultiplier: 0.2,
+		},
+		{
+			Name:            "minecraft:cartographer/4/woodland_mansion_map",
+			BaseCostA:       world.NewNamedItemStack("minecraft:emerald", 14),
+			CostB:           world.NewNamedItemStack("minecraft:compass", 1),
+			Result:          world.NewNamedItemStack(FilledMapItemID, 1),
+			Uses:            0,
+			MaxUses:         12,
+			XP:              15,
+			PriceMultiplier: 0.2,
+		},
+	}
+	vtr.mu.Unlock()
+
+	session.SetInventorySlot(36, world.NewNamedItemStack("minecraft:emerald", 32))
+	session.SetInventorySlot(37, world.NewNamedItemStack("minecraft:compass", 2))
+
+	cid, err := srv.OpenMerchant(session, villagerID)
+	if err != nil {
+		t.Fatalf("OpenMerchant: %v", err)
+	}
+	mu.Lock()
+	*pktsPtr = nil
+	mu.Unlock()
+
+	// Select offer 0 (Ocean Explorer Map) -> shifts 32 emeralds + 2 compasses from slots 36..37 into payment slots 0..1.
+	if err := srv.SelectMerchantTrade(session, 0); err != nil {
+		t.Fatalf("SelectMerchantTrade: %v", err)
+	}
+	// QuickMove purchase from MerchantSlotResult (slot 2) into first empty hotbar slot (slot 36).
+	if err := srv.HandleContainerClick(session, cid, MerchantSlotResult, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick MerchantSlotResult QuickMove: %v", err)
+	}
+
+	if session.InventorySlot(36).ResolvedID() != FilledMapItemID {
+		t.Fatalf("expected filled_map in hotbar slot 36, got %+v", session.InventorySlot(36))
+	}
+	oceanMapID, ok := GetSlotMapID(session, 36)
+	if !ok {
+		t.Fatal("expected GetSlotMapID(session, 36) to be set after Cartographer trade")
+	}
+	if meta := GetSlotItemMeta(session, 36); meta.CustomName != "Ocean Explorer Map" {
+		t.Fatalf("expected CustomName = %q, got %q", "Ocean Explorer Map", meta.CustomName)
+	}
+	oceanData, exists := srv.GetMapData(oceanMapID)
+	if !exists || oceanData == nil || oceanData.Scale != 2 || !oceanData.UnlimitedTracking {
+		t.Fatalf("unexpected ocean explorer map data: %+v", oceanData)
+	}
+	var sawMonument bool
+	for _, d := range oceanData.DecorationList() {
+		if d.Type == MapDecorationMonument {
+			sawMonument = true
+		}
+	}
+	if !sawMonument {
+		t.Fatalf("expected MapDecorationMonument on traded ocean explorer map, got %+v", oceanData.DecorationList())
+	}
+
+	// Now select offer 1 (Woodland Explorer Map) and purchase via Pickup onto cursor.
+	if err := srv.SelectMerchantTrade(session, 1); err != nil {
+		t.Fatalf("SelectMerchantTrade(1): %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, MerchantSlotResult, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick MerchantSlotResult Pickup: %v", err)
+	}
+	mansionMapID, hasCarried := GetCarriedMapID(session)
+	if !hasCarried || mansionMapID == oceanMapID {
+		t.Fatalf("expected distinct carried mapID for Woodland Explorer Map, got (%d, %v)", mansionMapID, hasCarried)
+	}
+	if meta := GetCarriedItemMeta(session); meta.CustomName != "Woodland Explorer Map" {
+		t.Fatalf("expected carried CustomName = %q, got %q", "Woodland Explorer Map", meta.CustomName)
+	}
+	mansionData, exists := srv.GetMapData(mansionMapID)
+	if !exists || mansionData == nil {
+		t.Fatalf("expected Woodland Explorer Map data for mapID %d", mansionMapID)
+	}
+	var sawMansion bool
+	for _, d := range mansionData.DecorationList() {
+		if d.Type == MapDecorationMansion {
+			sawMansion = true
+		}
+	}
+	if !sawMansion {
+		t.Fatalf("expected MapDecorationMansion on traded woodland explorer map, got %+v", mansionData.DecorationList())
+	}
+
+	// Verify PlayMapItemDataCB (0x32) was sent to the buyer.
+	mu.Lock()
+	pkts := append([]mapTestCapturedPacket(nil), (*pktsPtr)...)
+	mu.Unlock()
+	var sawMapPkt bool
+	for _, p := range pkts {
+		if p.id == PlayMapItemDataCB {
+			sawMapPkt = true
+			break
+		}
+	}
+	if !sawMapPkt {
+		t.Fatal("expected PlayMapItemDataCB (0x32) packet when purchasing Explorer Map from Cartographer")
+	}
+}
+
+func TestChestLootExplorerMapHydrationAndPickup(t *testing.T) {
+	srv := newTestMapServer(t)
+	session, _, _ := newTestMapPlayer(srv, "TreasureHunter", 10, 64, 10, 0)
+
+	// Place an unhydrated filled_map into a chest at (10, 64, 12), simulating a shipwreck map chest.
+	srv.SetChestSlot(10, 64, 12, 0, world.NewNamedItemStack(FilledMapItemID, 1))
+
+	cid, err := srv.OpenChest(session, 10, 64, 12)
+	if err != nil {
+		t.Fatalf("OpenChest: %v", err)
+	}
+
+	chestMapID, ok := srv.GetChestSlotMapID(10, 64, 12, 0)
+	if !ok {
+		t.Fatal("expected OpenChest to hydrate buried treasure mapID on chest slot 0")
+	}
+	btData, exists := srv.GetMapData(chestMapID)
+	if !exists || btData == nil || !btData.UnlimitedTracking {
+		t.Fatalf("expected hydrated buried treasure map data for mapID %d, got %+v", chestMapID, btData)
+	}
+
+	// Shift-click chest slot 0 into player's hotbar slot 36.
+	if err := srv.HandleContainerClick(session, cid, 0, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick chest slot 0 QuickMove: %v", err)
+	}
+	if session.InventorySlot(36).ResolvedID() != FilledMapItemID {
+		t.Fatalf("expected filled_map moved to player hotbar slot 36, got %+v", session.InventorySlot(36))
+	}
+	invMapID, ok := GetSlotMapID(session, 36)
+	if !ok || invMapID != chestMapID {
+		t.Fatalf("expected player slot 36 mapID = %d, got (%d, %v)", chestMapID, invMapID, ok)
+	}
+}
+
+func TestCartographyTablePreviewPostProcessingAndSwap(t *testing.T) {
+	srv := newTestMapServer(t)
+	session, pktsPtr, mu := newTestMapPlayer(srv, "CartoPreviewer", 0, 64, 0, 0)
+
+	baseMap, _ := srv.CreateNewMap(0, 0, 0, true, false, world.DimensionOverworld)
+	session.SetInventorySlot(36, world.NewNamedItemStack(FilledMapItemID, 1))
+	SetSlotMapID(session, 36, baseMap.MapID)
+	session.SetInventorySlot(37, world.NewNamedItemStack(PaperItemID, 1))
+
+	cid, err := srv.OpenCartographyTable(session, 0, 64, 0)
+	if err != nil {
+		t.Fatalf("OpenCartographyTable: %v", err)
+	}
+
+	// Swap hotbar key 0 (slot 36 -> CartographySlotMap = 0) and hotbar key 1 (slot 37 -> CartographySlotAdditional = 1).
+	if err := srv.HandleContainerClick(session, cid, CartographySlotMap, 0, ContainerInputSwap); err != nil {
+		t.Fatalf("HandleContainerClick Swap map slot: %v", err)
+	}
+	mu.Lock()
+	*pktsPtr = nil
+	mu.Unlock()
+	if err := srv.HandleContainerClick(session, cid, CartographySlotAdditional, 1, ContainerInputSwap); err != nil {
+		t.Fatalf("HandleContainerClick Swap additional slot: %v", err)
+	}
+
+	// Verify the PlayContainerSetSlot packet for CartographySlotResult (slot 2) includes
+	// both DataComponentMapID (46) and DataComponentMapPostProcessing (48 = MapPostProcessingScale = 1).
+	mu.Lock()
+	pkts := append([]mapTestCapturedPacket(nil), (*pktsPtr)...)
+	mu.Unlock()
+	var sawResultPreview bool
+	for _, p := range pkts {
+		if p.id != protocol.PlayContainerSetSlot {
+			continue
+		}
+		r := protocol.NewReader(p.body)
+		winID, _ := r.VarInt()
+		_, _ = r.VarInt() // stateID
+		slotIdx, _ := r.Uint16()
+		if winID != cid || int(slotIdx) != CartographySlotResult {
+			continue
+		}
+		count, _ := r.VarInt()
+		itemID, _ := r.VarInt()
+		added, _ := r.VarInt()
+		removed, _ := r.VarInt()
+		if count != 1 || itemID <= 0 || added != 2 || removed != 0 {
+			t.Fatalf("unexpected CartographySlotResult preview components: count=%d itemID=%d added=%d removed=%d", count, itemID, added, removed)
+		}
+		comp1, _ := r.VarInt()
+		val1, _ := r.VarInt()
+		comp2, _ := r.VarInt()
+		val2, _ := r.VarInt()
+		if comp1 != DataComponentMapID || val1 != baseMap.MapID || comp2 != DataComponentMapPostProcessing || val2 != MapPostProcessingScale {
+			t.Fatalf("unexpected CartographySlotResult component values: (%d=%d, %d=%d)", comp1, val1, comp2, val2)
+		}
+		sawResultPreview = true
+	}
+	if !sawResultPreview {
+		t.Fatal("expected PlayContainerSetSlot for CartographySlotResult with DataComponentMapID and DataComponentMapPostProcessing")
+	}
+}

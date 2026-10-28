@@ -152,6 +152,8 @@ func (s *Server) OpenCartographyTable(session *PlayerSession, bx, by, bz int) (i
 	mtr.hasCartoMap = false
 	mtr.resMapID = 0
 	mtr.hasResMap = false
+	mtr.resPostProc = 0
+	mtr.hasResPostProc = false
 	mtr.mu.Unlock()
 
 	tr := getContainerTracker(session)
@@ -177,6 +179,7 @@ func (s *Server) OpenCartographyTable(session *PlayerSession, bx, by, bz int) (i
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
 		}
+		s.syncCartographyMapSlots(session, cid)
 	}
 	return cid, nil
 }
@@ -210,6 +213,7 @@ func (s *Server) CloseCartographyContainer(session *PlayerSession, containerID i
 	mtr.cartoMapID, mtr.hasCartoMap = 0, false
 	mtr.carriedMapID, mtr.hasCarried = 0, false
 	mtr.resMapID, mtr.hasResMap = 0, false
+	mtr.resPostProc, mtr.hasResPostProc = 0, false
 	mtr.mu.Unlock()
 
 	snap := session.Snapshot()
@@ -296,6 +300,7 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 
 	var craftedData *MapItemSavedData
 	var craftedMapID int32
+	var craftedCount int32
 	crafted := false
 
 	switch {
@@ -314,7 +319,7 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 			}
 			carried = resStack
 			carriedMapID, hasCarriedMap = resMapID, true
-			craftedData, craftedMapID, crafted = resData, resMapID, true
+			craftedData, craftedMapID, craftedCount, crafted = resData, resMapID, resStack.Count, true
 			mapSlotStack = decrementStack(mapSlotStack, 1)
 			if mapSlotStack.IsEmpty() {
 				cartoMapID, hasCartoMap = 0, false
@@ -339,7 +344,7 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 				if ok {
 					session.SetInventorySlot(targetInvSlot, resStack)
 					SetSlotMapID(session, targetInvSlot, resMapID)
-					craftedData, craftedMapID, crafted = resData, resMapID, true
+					craftedData, craftedMapID, craftedCount, crafted = resData, resMapID, resStack.Count, true
 					mapSlotStack = decrementStack(mapSlotStack, 1)
 					if mapSlotStack.IsEmpty() {
 						cartoMapID, hasCartoMap = 0, false
@@ -351,7 +356,14 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 
 	case slot == CartographySlotMap:
 		if mode == ContainerInputPickup {
-			if carried.IsEmpty() || carried.ResolvedID() == FilledMapItemID {
+			if button == 1 && mapSlotStack.IsEmpty() && !carried.IsEmpty() && carried.ResolvedID() == FilledMapItemID {
+				mapSlotStack = world.NewItemStack(carried.ResolvedItemID(), 1)
+				cartoMapID, hasCartoMap = carriedMapID, hasCarriedMap
+				carried = decrementStack(carried, 1)
+				if carried.IsEmpty() {
+					carriedMapID, hasCarriedMap = 0, false
+				}
+			} else if carried.IsEmpty() || carried.ResolvedID() == FilledMapItemID {
 				mapSlotStack, carried = carried, mapSlotStack
 				cartoMapID, carriedMapID = carriedMapID, cartoMapID
 				hasCartoMap, hasCarriedMap = hasCarriedMap, hasCartoMap
@@ -374,16 +386,38 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 					break
 				}
 			}
+		} else if mode == ContainerInputSwap && button >= 0 && button < 9 {
+			hotbarSlot := 36 + int(button)
+			hotbarStack := session.InventorySlot(hotbarSlot)
+			if hotbarStack.IsEmpty() || hotbarStack.ResolvedID() == FilledMapItemID {
+				hbMapID, hasHBMap := GetSlotMapID(session, hotbarSlot)
+				session.SetInventorySlot(hotbarSlot, mapSlotStack)
+				if !mapSlotStack.IsEmpty() && hasCartoMap {
+					SetSlotMapID(session, hotbarSlot, cartoMapID)
+				} else {
+					ClearSlotMapID(session, hotbarSlot)
+				}
+				mapSlotStack = hotbarStack
+				cartoMapID, hasCartoMap = hbMapID, hasHBMap
+			}
 		}
 
 	case slot == CartographySlotAdditional:
 		if mode == ContainerInputPickup {
 			if carried.IsEmpty() || isValidCartographyAdditionalItem(carried) {
-				addSlotStack, carried = carried, addSlotStack
+				addSlotStack, carried = applyPickupSlot(addSlotStack, carried, button)
 			}
 		} else if mode == ContainerInputQuickMove && !addSlotStack.IsEmpty() {
 			added, _ := session.AddItemToInventory(addSlotStack)
 			addSlotStack = decrementStack(addSlotStack, added)
+		} else if mode == ContainerInputSwap && button >= 0 && button < 9 {
+			hotbarSlot := 36 + int(button)
+			hotbarStack := session.InventorySlot(hotbarSlot)
+			if hotbarStack.IsEmpty() || isValidCartographyAdditionalItem(hotbarStack) {
+				session.SetInventorySlot(hotbarSlot, addSlotStack)
+				ClearSlotMapID(session, hotbarSlot)
+				addSlotStack = hotbarStack
+			}
 		}
 
 	case slot >= 3 && slot < CartographyMenuSlotCount:
@@ -406,30 +440,59 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 				ClearSlotMapID(session, invSlot)
 			}
 		} else if mode == ContainerInputPickup {
-			session.SetInventorySlot(invSlot, carried)
-			if !carried.IsEmpty() && carried.ResolvedID() == FilledMapItemID && hasCarriedMap {
-				SetSlotMapID(session, invSlot, carriedMapID)
+			if button == 1 && invStack.IsEmpty() && !carried.IsEmpty() && carried.Count > 1 {
+				session.SetInventorySlot(invSlot, world.NewItemStack(carried.ResolvedItemID(), 1))
+				if carried.ResolvedID() == FilledMapItemID && hasCarriedMap {
+					SetSlotMapID(session, invSlot, carriedMapID)
+				} else {
+					ClearSlotMapID(session, invSlot)
+				}
+				carried = decrementStack(carried, 1)
 			} else {
-				ClearSlotMapID(session, invSlot)
+				session.SetInventorySlot(invSlot, carried)
+				if !carried.IsEmpty() && carried.ResolvedID() == FilledMapItemID && hasCarriedMap {
+					SetSlotMapID(session, invSlot, carriedMapID)
+				} else {
+					ClearSlotMapID(session, invSlot)
+				}
+				carried = invStack
+				carriedMapID, hasCarriedMap = invMapID, hasInvMap
 			}
-			carried = invStack
-			carriedMapID, hasCarriedMap = invMapID, hasInvMap
+		} else if mode == ContainerInputSwap && button >= 0 && button < 9 {
+			hotbarSlot := 36 + int(button)
+			if invSlot != hotbarSlot {
+				hbStack := session.InventorySlot(hotbarSlot)
+				session.SetInventorySlot(invSlot, hbStack)
+				session.SetInventorySlot(hotbarSlot, invStack)
+				swapPlayerSlotExtendedComponents(session, invSlot, hotbarSlot)
+			}
 		}
 	}
 
 	var resSlotStack world.ItemStack
 	var resMapID int32
 	var hasResMap bool
+	var resPostProc int32
+	var hasResPostProc bool
 	if outcome, valid := s.EvaluateCartographyOperation(mapSlotStack, cartoMapID, hasCartoMap, addSlotStack); valid {
 		resSlotStack = outcome.ResultStack
 		resMapID = outcome.SourceMapID
 		hasResMap = true
+		switch outcome.Operation {
+		case CartographyOpScale:
+			resPostProc = MapPostProcessingScale
+			hasResPostProc = true
+		case CartographyOpLock:
+			resPostProc = MapPostProcessingLock
+			hasResPostProc = true
+		}
 	}
 
 	mtr.mu.Lock()
 	mtr.cartoMapID, mtr.hasCartoMap = cartoMapID, hasCartoMap
 	mtr.carriedMapID, mtr.hasCarried = carriedMapID, hasCarriedMap
 	mtr.resMapID, mtr.hasResMap = resMapID, hasResMap
+	mtr.resPostProc, mtr.hasResPostProc = resPostProc, hasResPostProc
 	mtr.mu.Unlock()
 
 	tr.mu.Lock()
@@ -441,10 +504,15 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 	}
 	tr.mu.Unlock()
 
+	if crafted && craftedCount > 0 {
+		s.RecordItemCrafted(session, FilledMapItemID, craftedCount)
+	}
+
 	if session.send != nil {
 		slots := s.buildCartographyMenuSlots(session, mapSlotStack, addSlotStack, resSlotStack)
 		stateID := session.NextContainerStateID()
 		_ = session.send(protocol.PlayContainerSetContent, EncodeContainerContent(containerID, stateID, slots, carried))
+		s.syncCartographyMapSlots(session, containerID)
 		if crafted && craftedData != nil {
 			s.refreshMapDecorations(craftedData)
 			pkt := EncodeMapItemDataPacket(craftedMapID, craftedData.Scale, craftedData.Locked, craftedData.DecorationList(), craftedData.FullMapColorPatch())

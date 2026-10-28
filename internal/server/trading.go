@@ -1072,15 +1072,39 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 
 	traded := false
 	var xpGained int32
+	var tradedExplorerMap *MapItemSavedData
+	var tradedExplorerName string
+	tradedExplorerInvSlot := -1
+	tradedExplorerOnCursor := false
+
+	originX, originZ := 0, 0
+	if ent := s.entities.Get(entityID); ent != nil {
+		originX = int(math.Floor(ent.X))
+		originZ = int(math.Floor(ent.Z))
+	} else {
+		snap := session.Snapshot()
+		originX = int(math.Floor(snap.X))
+		originZ = int(math.Floor(snap.Z))
+	}
 
 	if slot == MerchantSlotResult {
 		// Result slot (slot 2): only taking out is allowed.
 		offerIdx, ok := s.recomputeMerchantResultLocked(tr, vs.Offers)
 		if ok && offerIdx >= 0 && offerIdx < len(vs.Offers) {
+			res := vs.Offers[offerIdx].Result
+			isExplorerMapOffer := res.ResolvedID() == FilledMapItemID
+			offerName := vs.Offers[offerIdx].Name
 			switch mode {
 			case ContainerInputPickup:
-				res := vs.Offers[offerIdx].Result
-				if canAddMerchantResultToCursor(tr.carried, res) {
+				if isExplorerMapOffer {
+					if tr.carried.IsEmpty() {
+						tr.carried = world.NewItemStack(res.ResolvedItemID(), 1)
+						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
+						traded = true
+						tradedExplorerMap, _, tradedExplorerName = s.CreateExplorerMapForTradeOffer(offerName, originX, originZ)
+						tradedExplorerOnCursor = true
+					}
+				} else if canAddMerchantResultToCursor(tr.carried, res) {
 					if tr.carried.IsEmpty() {
 						tr.carried = world.NewItemStack(res.ResolvedItemID(), res.Count)
 					} else {
@@ -1090,20 +1114,42 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 					traded = true
 				}
 			case ContainerInputQuickMove:
-				for !vs.Offers[offerIdx].IsOutOfStock() &&
-					vs.Offers[offerIdx].MatchesPayment(slots[MerchantSlotPayment1], slots[MerchantSlotPayment2]) {
-					res := vs.Offers[offerIdx].Result
-					// Try merging into hotbar (30..38) then main inventory (3..29).
-					testSlots := make([]world.ItemStack, len(slots))
-					copy(testSlots, slots)
-					rem := mergeIntoSlotSlice(testSlots, res, 30, 39)
-					rem = mergeIntoSlotSlice(testSlots, rem, 3, 30)
-					if !rem.IsEmpty() {
-						break
+				if isExplorerMapOffer {
+					targetMenuSlot := -1
+					for _, r := range [][2]int{{30, 39}, {3, 30}} {
+						for i := r[0]; i < r[1]; i++ {
+							if slots[i].IsEmpty() {
+								targetMenuSlot = i
+								break
+							}
+						}
+						if targetMenuSlot >= 0 {
+							break
+						}
 					}
-					slots = testSlots
-					xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
-					traded = true
+					if targetMenuSlot >= 0 {
+						slots[targetMenuSlot] = world.NewItemStack(res.ResolvedItemID(), 1)
+						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
+						traded = true
+						tradedExplorerMap, _, tradedExplorerName = s.CreateExplorerMapForTradeOffer(offerName, originX, originZ)
+						tradedExplorerInvSlot = 9 + (targetMenuSlot - 3)
+					}
+				} else {
+					for !vs.Offers[offerIdx].IsOutOfStock() &&
+						vs.Offers[offerIdx].MatchesPayment(slots[MerchantSlotPayment1], slots[MerchantSlotPayment2]) {
+						res := vs.Offers[offerIdx].Result
+						// Try merging into hotbar (30..38) then main inventory (3..29).
+						testSlots := make([]world.ItemStack, len(slots))
+						copy(testSlots, slots)
+						rem := mergeIntoSlotSlice(testSlots, res, 30, 39)
+						rem = mergeIntoSlotSlice(testSlots, rem, 3, 30)
+						if !rem.IsEmpty() {
+							break
+						}
+						slots = testSlots
+						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
+						traded = true
+					}
 				}
 			}
 		}
@@ -1162,6 +1208,19 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	tr.open.Crafting[0] = slots[MerchantSlotPayment1]
 	tr.open.Crafting[1] = slots[MerchantSlotPayment2]
 	writeBackMerchantPlayerSlots(session, slots)
+	if tradedExplorerMap != nil {
+		if tradedExplorerOnCursor {
+			SetCarriedMapID(session, tradedExplorerMap.MapID, true)
+			if tradedExplorerName != "" {
+				SetCarriedItemMeta(session, ItemMeta{CustomName: tradedExplorerName})
+			}
+		} else if tradedExplorerInvSlot >= 0 {
+			SetSlotMapID(session, tradedExplorerInvSlot, tradedExplorerMap.MapID)
+			if tradedExplorerName != "" {
+				SetSlotItemMeta(session, tradedExplorerInvSlot, ItemMeta{CustomName: tradedExplorerName})
+			}
+		}
+	}
 
 	isWanderingTrader := false
 	if ent := s.entities.Get(entityID); ent != nil && canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
@@ -1228,6 +1287,17 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 		stateID := session.NextContainerStateID()
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return err
+		}
+		if tradedExplorerMap != nil {
+			s.refreshMapDecorations(tradedExplorerMap)
+			mapPkt := EncodeMapItemDataPacket(tradedExplorerMap.MapID, tradedExplorerMap.Scale, tradedExplorerMap.Locked, tradedExplorerMap.DecorationList(), tradedExplorerMap.FullMapColorPatch())
+			_ = session.send(PlayMapItemDataCB, mapPkt)
+			if tradedExplorerOnCursor {
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(-1, session.NextContainerStateID(), -1, carried, tradedExplorerMap.MapID, true))
+			} else if tradedExplorerInvSlot >= 9 && tradedExplorerInvSlot < 45 {
+				menuSlot := 3 + (tradedExplorerInvSlot - 9)
+				_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(cid, session.NextContainerStateID(), menuSlot, slots[menuSlot], tradedExplorerMap.MapID, true))
+			}
 		}
 		if traded {
 			var effOffers []MerchantOffer
