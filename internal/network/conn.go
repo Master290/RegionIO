@@ -157,6 +157,12 @@ func (c *Conn) SendFramed(frame []byte) error {
 	return c.sendFrame(frame, true)
 }
 
+// Flush waits until all previously enqueued packets have been written by the
+// connection's writer goroutine.
+func (c *Conn) Flush() error {
+	return c.sendFrame(nil, true)
+}
+
 func (c *Conn) sendFrame(frame []byte, wait bool) error {
 	packet := outboundPacket{frame: frame}
 	if wait {
@@ -201,7 +207,10 @@ func (c *Conn) writeLoop() {
 	for {
 		select {
 		case packet := <-c.outbound:
-			err := c.writeFrame(packet.frame)
+			var err error
+			if len(packet.frame) > 0 {
+				err = c.writeFrame(packet.frame)
+			}
 			c.outboundMu.Lock()
 			c.pendingBytes -= len(packet.frame)
 			c.outboundMu.Unlock()

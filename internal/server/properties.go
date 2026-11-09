@@ -31,6 +31,23 @@ func FormatUUID(u [16]byte) string {
 		u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }
 
+// ParseUUID parses a canonical 36-char dashed or 32-char hex UUID string.
+func ParseUUID(s string) ([16]byte, error) {
+	var out [16]byte
+	cleaned := strings.ReplaceAll(strings.TrimSpace(s), "-", "")
+	if len(cleaned) != 32 {
+		return out, fmt.Errorf("invalid UUID length %d", len(cleaned))
+	}
+	for i := 0; i < 16; i++ {
+		b, err := strconv.ParseUint(cleaned[i*2:i*2+2], 16, 8)
+		if err != nil {
+			return out, fmt.Errorf("invalid UUID hex at byte %d: %w", i, err)
+		}
+		out[i] = byte(b)
+	}
+	return out, nil
+}
+
 // ParseProperties reads a server.properties-formatted stream and applies the
 // recognized keys onto base. Unknown keys are ignored so vanilla files load
 // without error; malformed values for known keys return an error.
@@ -113,6 +130,74 @@ func ParseProperties(r io.Reader, base Config) (Config, error) {
 				return base, fmt.Errorf("server.properties:%d: invalid hardcore %q", lineNo, val)
 			}
 			cfg.Hardcore = b
+		case "enforce-secure-chat":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid enforce-secure-chat %q", lineNo, val)
+			}
+			cfg.EnforceSecureChat = b
+		case "hide-online-players":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid hide-online-players %q", lineNo, val)
+			}
+			cfg.HideOnlinePlayers = b
+		case "accepts-transfers":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid accepts-transfers %q", lineNo, val)
+			}
+			cfg.AcceptsTransfers = b
+		case "resource-pack":
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				if cfg.ResourcePack == nil {
+					cfg.ResourcePack = &ResourcePackInfo{}
+				}
+				cfg.ResourcePack.URL = trimmed
+			}
+		case "resource-pack-id":
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				u, err := ParseUUID(trimmed)
+				if err != nil {
+					return base, fmt.Errorf("server.properties:%d: invalid resource-pack-id %q", lineNo, val)
+				}
+				if cfg.ResourcePack == nil {
+					cfg.ResourcePack = &ResourcePackInfo{}
+				}
+				cfg.ResourcePack.ID = u
+			}
+		case "resource-pack-sha1":
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				if cfg.ResourcePack == nil {
+					cfg.ResourcePack = &ResourcePackInfo{}
+				}
+				cfg.ResourcePack.Hash = trimmed
+			}
+		case "require-resource-pack":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid require-resource-pack %q", lineNo, val)
+			}
+			if cfg.ResourcePack == nil {
+				cfg.ResourcePack = &ResourcePackInfo{}
+			}
+			cfg.ResourcePack.Required = b
+		case "resource-pack-prompt":
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				if cfg.ResourcePack == nil {
+					cfg.ResourcePack = &ResourcePackInfo{}
+				}
+				if comp, err := ParseChatComponentJSON(trimmed); err == nil {
+					cfg.ResourcePack.Prompt = &comp
+				} else {
+					comp := TextComponent(trimmed)
+					cfg.ResourcePack.Prompt = &comp
+				}
+			}
+		case "bug-report-link":
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				cfg.BugReportLink = trimmed
+			}
 		}
 	}
 	if err := scanner.Err(); err != nil {

@@ -2630,8 +2630,8 @@ func (s *Server) SummonEntityCommand(dim, typeName string, x, y, z float64) (*wo
 // PlayStopSoundCB is ClientboundStopSoundPacket (0x76 in protocol 775).
 const PlayStopSoundCB int32 = 0x76
 
-// PlayTransferCB is ClientboundTransferPacket (0x7f in protocol 775).
-const PlayTransferCB int32 = 0x7f
+// PlayTransferCB is ClientboundTransferPacket (0x81 in protocol 775).
+const PlayTransferCB int32 = protocol.PlayTransfer
 
 // PlayUpdateAttributesCB is ClientboundUpdateAttributesPacket (0x83 in protocol 775).
 const PlayUpdateAttributesCB int32 = 0x83
@@ -3545,6 +3545,38 @@ func (s *Server) KickPlayer(session *PlayerSession, reason string) {
 	s.UnregisterPlayer(session)
 }
 
+// IsPlayerBanned reports whether name is in the banned players list.
+func (s *Server) IsPlayerBanned(name string) (BanEntry, bool) {
+	if s == nil {
+		return BanEntry{}, false
+	}
+	key := strings.ToLower(strings.TrimSpace(name))
+	if key == "" {
+		return BanEntry{}, false
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	entry, ok := aux.bannedPlayers[key]
+	return entry, ok
+}
+
+// IsIPBanned reports whether ip is in the banned IP list.
+func (s *Server) IsIPBanned(ip string) (BanEntry, bool) {
+	if s == nil {
+		return BanEntry{}, false
+	}
+	key := strings.ToLower(strings.TrimSpace(ip))
+	if key == "" {
+		return BanEntry{}, false
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	entry, ok := aux.bannedIPs[key]
+	return entry, ok
+}
+
 // BanPlayer adds name to the banned players list and kicks them if online.
 func (s *Server) BanPlayer(name, reason string) bool {
 	if s == nil {
@@ -3565,6 +3597,9 @@ func (s *Server) BanPlayer(name, reason string) bool {
 	}
 	aux.bannedPlayers[key] = BanEntry{Target: strings.TrimSpace(name), Reason: reason}
 	aux.mu.Unlock()
+	if s.cfg.BannedPlayersFile != "" {
+		_ = SaveBannedPlayersFile(s.cfg.BannedPlayersFile, s.BannedPlayers())
+	}
 	if online := s.PlayerByName(name); online != nil {
 		s.KickPlayer(online, "You are banned from this server. Reason: "+reason)
 	}
@@ -3579,11 +3614,15 @@ func (s *Server) PardonPlayer(name string) bool {
 	key := strings.ToLower(strings.TrimSpace(name))
 	aux := s.cmdAux()
 	aux.mu.Lock()
-	defer aux.mu.Unlock()
 	if _, exists := aux.bannedPlayers[key]; !exists {
+		aux.mu.Unlock()
 		return false
 	}
 	delete(aux.bannedPlayers, key)
+	aux.mu.Unlock()
+	if s.cfg.BannedPlayersFile != "" {
+		_ = SaveBannedPlayersFile(s.cfg.BannedPlayersFile, s.BannedPlayers())
+	}
 	return true
 }
 
@@ -3616,11 +3655,15 @@ func (s *Server) BanIP(ip, reason string) bool {
 	}
 	aux := s.cmdAux()
 	aux.mu.Lock()
-	defer aux.mu.Unlock()
 	if _, exists := aux.bannedIPs[key]; exists {
+		aux.mu.Unlock()
 		return false
 	}
 	aux.bannedIPs[key] = BanEntry{Target: strings.TrimSpace(ip), Reason: reason}
+	aux.mu.Unlock()
+	if s.cfg.BannedIPsFile != "" {
+		_ = SaveBannedIPsFile(s.cfg.BannedIPsFile, s.BannedIPs())
+	}
 	return true
 }
 
@@ -3632,11 +3675,15 @@ func (s *Server) PardonIP(ip string) bool {
 	key := strings.ToLower(strings.TrimSpace(ip))
 	aux := s.cmdAux()
 	aux.mu.Lock()
-	defer aux.mu.Unlock()
 	if _, exists := aux.bannedIPs[key]; !exists {
+		aux.mu.Unlock()
 		return false
 	}
 	delete(aux.bannedIPs, key)
+	aux.mu.Unlock()
+	if s.cfg.BannedIPsFile != "" {
+		_ = SaveBannedIPsFile(s.cfg.BannedIPsFile, s.BannedIPs())
+	}
 	return true
 }
 
@@ -3655,15 +3702,12 @@ func (s *Server) BannedIPs() []BanEntry {
 	return out
 }
 
-// TransferPlayer sends a ClientboundTransferPacket (0x7f) to session.
+// TransferPlayer sends a ClientboundTransferPacket (0x81) to session.
 func (s *Server) TransferPlayer(session *PlayerSession, host string, port int) {
 	if session == nil || session.send == nil {
 		return
 	}
-	w := protocol.NewWriter(len(host) + 8)
-	w.String(host)
-	w.VarInt(int32(port))
-	_ = session.send(PlayTransferCB, w.Bytes())
+	_ = session.send(PlayTransferCB, EncodeTransferPacket(host, int32(port)))
 }
 
 // CommandStorage returns or initializes the NBT compound for command storage id.

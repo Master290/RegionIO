@@ -38,12 +38,22 @@ type ProfileProperty struct {
 	Signature string // empty if unsigned
 }
 
+// RemoteChatSession holds a player's signed chat session public key data
+// (ServerboundChatSessionUpdatePacket 0x0a / PlayerInfoUpdate INITIALIZE_CHAT 0x02).
+type RemoteChatSession struct {
+	SessionID           [16]byte
+	ExpiresAtEpochMilli int64
+	PublicKeyBytes      []byte
+	KeySignature        []byte
+}
+
 // TabListEntry holds the fields for one player entry in
 // ClientboundPlayerInfoUpdatePacket (0x46).
 type TabListEntry struct {
 	UUID        [16]byte
 	Name        string
 	Properties  []ProfileProperty
+	ChatSession *RemoteChatSession
 	GameMode    uint8
 	Listed      bool
 	LatencyMs   int32
@@ -53,6 +63,7 @@ type TabListEntry struct {
 }
 
 type playerTabMeta struct {
+	chatSession *RemoteChatSession
 	listed      bool
 	latencyMs   int32
 	displayName *ChatComponent
@@ -125,6 +136,12 @@ func (s *Server) BuildTabListEntry(session *PlayerSession) TabListEntry {
 		entry.LatencyMs = meta.latencyMs
 		entry.ListOrder = meta.listOrder
 		entry.ShowHat = meta.showHat
+		if meta.chatSession != nil {
+			cs := *meta.chatSession
+			cs.PublicKeyBytes = append([]byte(nil), meta.chatSession.PublicKeyBytes...)
+			cs.KeySignature = append([]byte(nil), meta.chatSession.KeySignature...)
+			entry.ChatSession = &cs
+		}
 		if meta.displayName != nil {
 			cp := *meta.displayName
 			entry.DisplayName = &cp
@@ -257,6 +274,62 @@ func (s *Server) SetPlayerTabListOrder(session *PlayerSession, order int32) {
 	s.Broadcast(PlayPlayerInfoUpdateCB, EncodePlayerInfoUpdatePacket(PlayerInfoActionUpdateListOrder, []TabListEntry{entry}))
 }
 
+// SetPlayerTabListShowHat updates whether session's outer skin hat layer is
+// shown in the tab list and broadcasts UPDATE_HAT (0x80) to all players.
+func (s *Server) SetPlayerTabListShowHat(session *PlayerSession, showHat bool) {
+	if s == nil || session == nil {
+		return
+	}
+	st := s.tabListState()
+	st.mu.Lock()
+	meta := st.ensureLocked(session.Profile.UUID)
+	meta.showHat = showHat
+	st.mu.Unlock()
+
+	entry := s.BuildTabListEntry(session)
+	s.Broadcast(PlayPlayerInfoUpdateCB, EncodePlayerInfoUpdatePacket(PlayerInfoActionUpdateHat, []TabListEntry{entry}))
+}
+
+// SetPlayerChatSession stores (or clears when nil) session's RemoteChatSession
+// and broadcasts INITIALIZE_CHAT (0x02) to all connected players.
+func (s *Server) SetPlayerChatSession(session *PlayerSession, cs *RemoteChatSession) {
+	if s == nil || session == nil {
+		return
+	}
+	st := s.tabListState()
+	st.mu.Lock()
+	meta := st.ensureLocked(session.Profile.UUID)
+	if cs != nil {
+		cp := *cs
+		cp.PublicKeyBytes = append([]byte(nil), cs.PublicKeyBytes...)
+		cp.KeySignature = append([]byte(nil), cs.KeySignature...)
+		meta.chatSession = &cp
+	} else {
+		meta.chatSession = nil
+	}
+	st.mu.Unlock()
+
+	entry := s.BuildTabListEntry(session)
+	s.Broadcast(PlayPlayerInfoUpdateCB, EncodePlayerInfoUpdatePacket(PlayerInfoActionInitializeChat, []TabListEntry{entry}))
+}
+
+// PlayerChatSession returns a copy of session's RemoteChatSession, or nil if none is active.
+func (s *Server) PlayerChatSession(session *PlayerSession) *RemoteChatSession {
+	if s == nil || session == nil {
+		return nil
+	}
+	st := s.tabListState()
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	if meta := st.players[session.Profile.UUID]; meta != nil && meta.chatSession != nil {
+		cp := *meta.chatSession
+		cp.PublicKeyBytes = append([]byte(nil), meta.chatSession.PublicKeyBytes...)
+		cp.KeySignature = append([]byte(nil), meta.chatSession.KeySignature...)
+		return &cp
+	}
+	return nil
+}
+
 // BroadcastPlayerGameModeUpdate broadcasts UPDATE_GAME_MODE for session to all
 // connected players.
 func (s *Server) BroadcastPlayerGameModeUpdate(session *PlayerSession) {
@@ -345,7 +418,15 @@ func EncodePlayerInfoUpdatePacket(actions byte, entries []TabListEntry) []byte {
 			}
 		}
 		if actions&PlayerInfoActionInitializeChat != 0 {
-			w.Bool(false) // no signed chat session
+			if e.ChatSession != nil {
+				w.Bool(true)
+				w.UUID(e.ChatSession.SessionID)
+				w.Int64(e.ChatSession.ExpiresAtEpochMilli)
+				writeProtocolByteArray(w, e.ChatSession.PublicKeyBytes)
+				writeProtocolByteArray(w, e.ChatSession.KeySignature)
+			} else {
+				w.Bool(false)
+			}
 		}
 		if actions&PlayerInfoActionUpdateGameMode != 0 {
 			w.VarInt(int32(e.GameMode))
@@ -433,26 +514,27 @@ func DecodePlayerInfoUpdatePacket(r *protocol.Reader) (actions byte, entries []T
 				return 0, nil, err
 			}
 			if hasChat {
-				// Skip session UUID + profile public key if present.
-				if _, err := r.UUID(); err != nil {
-					return 0, nil, err
-				}
-				if _, err := r.Int64(); err != nil {
-					return 0, nil, err
-				}
-				pubLen, err := r.VarInt()
+				sessionID, err := r.UUID()
 				if err != nil {
 					return 0, nil, err
 				}
-				if _, err := readProtocolBytes(r, int(pubLen)); err != nil {
-					return 0, nil, err
-				}
-				sigLen, err := r.VarInt()
+				expiresAt, err := r.Int64()
 				if err != nil {
 					return 0, nil, err
 				}
-				if _, err := readProtocolBytes(r, int(sigLen)); err != nil {
+				pubKey, err := readProtocolByteArray(r, 512)
+				if err != nil {
 					return 0, nil, err
+				}
+				keySig, err := readProtocolByteArray(r, 4096)
+				if err != nil {
+					return 0, nil, err
+				}
+				entry.ChatSession = &RemoteChatSession{
+					SessionID:           sessionID,
+					ExpiresAtEpochMilli: expiresAt,
+					PublicKeyBytes:      pubKey,
+					KeySignature:        keySig,
 				}
 			}
 		}

@@ -47,9 +47,25 @@ func (h *handler) handleLogin(pkt protocol.Packet) error {
 			"name", h.conn.Profile.Name,
 			"uuid", uuidString(h.conn.Profile.UUID))
 		return h.beginConfiguration()
+	case protocol.CookieResponseLogin:
+		key, payload, err := server.DecodeCookieResponsePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		h.setCookie(key, payload)
+		return nil
+	case protocol.LoginPluginResponse:
+		return nil
 	default:
 		return errors.New("unexpected packet in login state")
 	}
+}
+
+func (h *handler) sendLoginDisconnect(reason server.ChatComponent) {
+	if h == nil || h.conn == nil {
+		return
+	}
+	_ = h.conn.Send(protocol.LoginDisconnectID, server.EncodeLoginDisconnectPacket(reason))
 }
 
 func (h *handler) handleLoginStart(pkt protocol.Packet) error {
@@ -57,7 +73,16 @@ func (h *handler) handleLoginStart(pkt protocol.Packet) error {
 		return errors.New("unexpected login start packet")
 	}
 	if h.protocolVersion != protocol.ProtocolVersion {
+		if h.protocolVersion < protocol.ProtocolVersion {
+			h.sendLoginDisconnect(server.TranslatableComponent("multiplayer.disconnect.outdated_client", server.TextComponent(protocol.GameVersion)))
+		} else {
+			h.sendLoginDisconnect(server.TranslatableComponent("multiplayer.disconnect.incompatible", server.TextComponent(protocol.GameVersion)))
+		}
 		return fmt.Errorf("unsupported protocol %d, want %d", h.protocolVersion, protocol.ProtocolVersion)
+	}
+	if h.handshakeIntent == protocol.NextStateTransfer && h.srv != nil && !h.srv.Config().AcceptsTransfers {
+		h.sendLoginDisconnect(server.TranslatableComponent("multiplayer.disconnect.transfers_disabled"))
+		return server.ErrTransfersDisabled
 	}
 	r := pkt.Body()
 	name, err := r.String()
@@ -65,6 +90,7 @@ func (h *handler) handleLoginStart(pkt protocol.Packet) error {
 		return err
 	}
 	if !validPlayerName(name) {
+		h.sendLoginDisconnect(server.TranslatableComponent("multiplayer.disconnect.illegal_characters"))
 		return errors.New("invalid login name")
 	}
 	// The client also sends a UUID; in offline mode we derive our own, and in
@@ -158,6 +184,14 @@ func (h *handler) handleEncryptionResponse(pkt protocol.Packet) error {
 }
 
 func (h *handler) finishLogin() error {
+	if h.srv != nil {
+		if comp, err := h.srv.CheckLoginAccess(h.conn.Profile, h.remoteIP()); err != nil {
+			if comp != nil {
+				h.sendLoginDisconnect(*comp)
+			}
+			return err
+		}
+	}
 	// Negotiate compression before Login Success so that packet (and every
 	// later one) is sent in the compressed format.
 	if t := h.srv.Config().CompressionThreshold; t >= 0 {

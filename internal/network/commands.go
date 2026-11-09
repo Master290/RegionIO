@@ -387,9 +387,19 @@ func (h *handler) sendCommands() error {
 }
 
 func (h *handler) handleChatCommand(pkt protocol.Packet) error {
-	cmd, err := pkt.Body().String()
-	if err != nil {
-		return err
+	var cmd string
+	if pkt.ID == protocol.PlayChatCommandSigned {
+		signedCmd, err := server.DecodeServerboundChatCommandSignedPacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		cmd = signedCmd.Command
+	} else {
+		var err error
+		cmd, err = pkt.Body().String()
+		if err != nil {
+			return err
+		}
 	}
 	h.log.Info("command", "player", h.conn.Profile.Name, "cmd", cmd)
 	reply := ExecuteCommand(h.srv, h.session, cmd)

@@ -707,9 +707,11 @@ func TestCommandsBatch2(t *testing.T) {
 
 
 func TestCommandSuggestionsProtocol775(t *testing.T) {
-	srv, err := server.New(server.DefaultConfig())
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = ""
+	srv, err := server.NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("NewWithCache: %v", err)
 	}
 	alice, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{11}, Name: "Alice"}, func(int32, []byte) error { return nil })
 	if err != nil {

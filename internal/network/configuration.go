@@ -22,6 +22,18 @@ func (h *handler) beginConfiguration() error {
 	if err := h.sendEnabledFeatures(); err != nil {
 		return err
 	}
+	if h.srv != nil {
+		if links := h.srv.ServerLinks(); len(links) > 0 {
+			if err := h.conn.Send(protocol.ConfigServerLinks, server.EncodeServerLinksPacket(links)); err != nil {
+				return err
+			}
+		}
+		if rp := h.srv.ResourcePack(); rp != nil {
+			if err := h.conn.Send(protocol.ConfigResourcePackPush, server.EncodeResourcePackPushPacket(*rp)); err != nil {
+				return err
+			}
+		}
+	}
 	return h.sendKnownPacks()
 }
 
@@ -59,9 +71,40 @@ func (h *handler) handleConfiguration(pkt protocol.Packet) error {
 	case protocol.ConfigKnownPacksServer:
 		return h.handleKnownPacks(pkt)
 
-	case protocol.ConfigKeepAliveServer, protocol.ConfigPong,
-		protocol.ConfigResourcePackResp, protocol.ConfigCookieResponse,
-		protocol.ConfigCustomClickAction, protocol.ConfigAcceptCodeOfConduct:
+	case protocol.ConfigCookieResponse:
+		key, payload, err := server.DecodeCookieResponsePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		h.setCookie(key, payload)
+		return nil
+
+	case protocol.ConfigKeepAliveServer:
+		return h.handleKeepAlive(pkt)
+
+	case protocol.ConfigPong:
+		if _, err := pkt.Body().Int32(); err != nil {
+			return err
+		}
+		return nil
+
+	case protocol.ConfigResourcePackResp:
+		id, action, err := server.DecodeResourcePackResponsePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		h.lastPackID = id
+		h.lastPackAction = action
+		h.hasPackStatus = true
+		if h.srv != nil {
+			if rp := h.srv.ResourcePack(); rp != nil && rp.Required && rp.NormalizedID() == id && server.IsResourcePackTerminalFailure(action) {
+				_ = h.conn.Send(protocol.ConfigDisconnect, server.EncodeDisconnectPacket(server.TranslatableComponent("multiplayer.requiredTexturePrompt.disconnect")))
+				return errors.New("network: required resource pack declined or failed in configuration")
+			}
+		}
+		return nil
+
+	case protocol.ConfigCustomClickAction, protocol.ConfigAcceptCodeOfConduct:
 		h.log.Debug("configuration packet ignored", "id", pkt.ID)
 		return nil
 

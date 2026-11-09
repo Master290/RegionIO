@@ -29,9 +29,16 @@ func (h *handler) beginPlay() error {
 	wx, wy, wz, wyaw := h.srv.WorldSpawn()
 	session, err := h.srv.RegisterPlayerPending(h.conn.Profile, h.conn.Enqueue)
 	if err != nil {
+		_ = h.conn.Send(protocol.PlayDisconnect, server.EncodeDisconnectPacket(server.FormatDisconnectReason(err, "")))
 		return err
 	}
 	h.session = session
+	for k, v := range h.cookies {
+		h.srv.SetPlayerCookie(session, k, v)
+	}
+	if h.hasPackStatus {
+		h.srv.HandlePlayerResourcePackResponse(session, h.lastPackID, h.lastPackAction)
+	}
 	for i := range h.hotbar {
 		h.hotbar[i] = -1 // empty
 	}
@@ -71,7 +78,7 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	h.srv.SendDifficultyToPlayer(session)
-	_ = h.conn.Send(protocol.PlayServerData, server.EncodeServerDataPacket(h.srv.Config().MOTD, nil))
+	_ = h.conn.Send(protocol.PlayServerData, server.EncodeServerDataPacket(h.srv.Config().MOTD, h.srv.FaviconBytes()))
 	if h.srv.ReducedDebugInfo() {
 		_ = h.conn.Send(protocol.PlayEntityEvent, server.EncodeEntityEventPacket(session.EntityID, server.EntityEventReducedDebugInfo))
 	}
@@ -142,6 +149,7 @@ func (h *handler) beginPlay() error {
 	h.srv.SyncPlayerStateObjectives(session)
 	h.srv.SendBossBarsOnPlayerJoin(session)
 	h.srv.BroadcastJoinMessage(session)
+	_ = h.conn.Flush()
 	// Launch the background chunk streamer. It owns generation + sending so the
 	// read loop stays free; requestRecenter is a non-blocking push.
 	playerCache := h.srv.PlayerChunks(session)
@@ -889,20 +897,19 @@ func chunksWithin(ax, az, bx, bz float64, radius int) bool {
 }
 
 func (h *handler) sendPlayerInfoAdd(profile server.Profile) error {
-	w := protocol.NewWriter(64)
-	w.Byte(0xff) // All eight initialization actions, fixed 8-bit EnumSet.
-	w.VarInt(1)
-	w.UUID(profile.UUID)
-	w.String(profile.Name)
-	w.VarInt(0)   // profile properties
-	w.Bool(false) // no signed chat session
-	w.VarInt(1)   // creative game mode
-	w.Bool(true)  // listed
-	w.VarInt(0)   // latency
-	w.Bool(false) // no custom display name
-	w.VarInt(0)   // list order
-	w.Bool(true)  // show hat
-	return h.conn.SendWriter(protocol.PlayPlayerInfoUpdate, w)
+	entry := server.TabListEntry{
+		UUID:     profile.UUID,
+		Name:     profile.Name,
+		GameMode: server.GameModeCreative,
+		Listed:   true,
+		ShowHat:  true,
+	}
+	if h.srv != nil {
+		if p := h.srv.PlayerByName(profile.Name); p != nil {
+			entry = h.srv.BuildTabListEntry(p)
+		}
+	}
+	return h.conn.Send(protocol.PlayPlayerInfoUpdate, server.EncodePlayerInfoUpdatePacket(server.PlayerInfoActionAll, []server.TabListEntry{entry}))
 }
 
 func (h *handler) sendPlayerInfoRemove(uuid [16]byte) error {
@@ -979,25 +986,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		return nil
 
 	case protocol.PlayKeepAliveServer:
-		id, err := pkt.Body().Int64()
-		if err != nil {
-			return err
-		}
-		h.keepAliveMu.Lock()
-		valid := h.keepAlivePending && id == h.keepAliveID
-		sentAt := h.keepAliveSent
-		if valid {
-			h.keepAlivePending = false
-		}
-		h.keepAliveMu.Unlock()
-		if !valid {
-			return errors.New("unexpected keep-alive response")
-		}
-		if h.srv != nil && h.session != nil && !sentAt.IsZero() {
-			h.srv.SetPlayerLatency(h.session, int32(time.Since(sentAt).Milliseconds()))
-		}
-		h.log.Debug("keep-alive ack", "id", id)
-		return nil
+		return h.handleKeepAlive(pkt)
 
 	case protocol.PlayPlayerLoaded:
 		h.log.Info("player loaded into world", "name", h.conn.Profile.Name)
@@ -1478,11 +1467,48 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
+	case protocol.PlayChatSessionUpdateSB:
+		cs, err := server.DecodeChatSessionUpdatePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		if h.srv != nil && h.session != nil {
+			h.srv.SetPlayerChatSession(h.session, &cs)
+		}
+		return nil
+
+	case protocol.PlayChatAckSB:
+		if _, err := server.DecodeChatAckPacket(pkt.Body()); err != nil {
+			return err
+		}
+		return nil
+
+	case protocol.PlayCookieResponseSB:
+		key, payload, err := server.DecodeCookieResponsePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		h.setCookie(key, payload)
+		return nil
+
+	case protocol.PlayResourcePackSB:
+		id, action, err := server.DecodeResourcePackResponsePacket(pkt.Body())
+		if err != nil {
+			return err
+		}
+		h.lastPackID = id
+		h.lastPackAction = action
+		h.hasPackStatus = true
+		if h.srv != nil && h.srv.HandlePlayerResourcePackResponse(h.session, id, action) {
+			return errors.New("network: required resource pack declined or failed")
+		}
+		return nil
+
 	case protocol.PlayClientTickEnd, protocol.PlayChunkBatchReceivedSB,
-		protocol.PlayPongSB, protocol.PlayChatAckSB, protocol.PlayChatSessionUpdateSB,
-		protocol.PlayConfigurationAcknowledged, protocol.PlayCookieResponseSB,
+		protocol.PlayPongSB,
+		protocol.PlayConfigurationAcknowledged,
 		protocol.PlayCustomPayload, protocol.PlayDebugSubscriptionRequestSB,
-		protocol.PlayResourcePackSB, protocol.PlayCustomClickActionSB,
+		protocol.PlayCustomClickActionSB,
 		protocol.PlayJigsawGenerateSB,
 		protocol.PlaySetCommandBlockSB, protocol.PlaySetCommandMinecartSB,
 		protocol.PlaySetJigsawBlockSB, protocol.PlaySetStructureBlockSB,
@@ -1585,13 +1611,41 @@ func (h *handler) handleClientCommand(pkt protocol.Packet) error {
 	return nil
 }
 
-// handleChat reads a chat message (only the leading text field is needed) and
-// broadcasts it via the server's formatted chat system.
-func (h *handler) handleChat(pkt protocol.Packet) error {
-	msg, err := pkt.Body().String()
+func (h *handler) handleKeepAlive(pkt protocol.Packet) error {
+	id, err := pkt.Body().Int64()
 	if err != nil {
 		return err
 	}
+	h.keepAliveMu.Lock()
+	valid := h.keepAlivePending && id == h.keepAliveID
+	sentAt := h.keepAliveSent
+	if valid {
+		h.keepAlivePending = false
+	}
+	h.keepAliveMu.Unlock()
+	if !valid {
+		return errors.New("unexpected keep-alive response")
+	}
+	if h.srv != nil && h.session != nil && !sentAt.IsZero() {
+		h.srv.SetPlayerLatency(h.session, int32(time.Since(sentAt).Milliseconds()))
+	}
+	h.log.Debug("keep-alive ack", "id", id)
+	return nil
+}
+
+// handleChat reads a ServerboundChatPacket (0x09) and broadcasts it via the
+// server's formatted chat system. When enforce-secure-chat is enabled, unsigned
+// messages disconnect the client with multiplayer.disconnect.unsigned_chat.
+func (h *handler) handleChat(pkt protocol.Packet) error {
+	chatMsg, err := server.DecodeServerboundChatPacket(pkt.Body())
+	if err != nil {
+		return err
+	}
+	if h.srv != nil && h.srv.Config().EnforceSecureChat && chatMsg.Signature == nil {
+		_ = h.conn.Send(protocol.PlayDisconnect, server.EncodeDisconnectPacket(server.TranslatableComponent("multiplayer.disconnect.unsigned_chat")))
+		return errors.New("network: unsigned chat rejected by enforce-secure-chat")
+	}
+	msg := chatMsg.Message
 	line := "<" + h.conn.Profile.Name + "> " + msg
 	h.log.Info("chat", "msg", line)
 	if h.srv != nil && h.session != nil {

@@ -970,6 +970,494 @@ func DecodeDisguisedChatPacket(r *protocol.Reader) (message ChatComponent, chatT
 	return message, chatTypeIndex, senderName, targetName, err
 }
 
+// FilterMaskType values for ClientboundPlayerChatPacket (Vanilla 26.1.2 FilterMask$Type).
+const (
+	FilterMaskTypePassThrough       int32 = 0 // PASS_THROUGH
+	FilterMaskTypeFullyFiltered     int32 = 1 // FULLY_FILTERED
+	FilterMaskTypePartiallyFiltered int32 = 2 // PARTIALLY_FILTERED
+)
+
+// ChatFilterMask represents net.minecraft.network.chat.FilterMask.
+type ChatFilterMask struct {
+	Type int32
+	Mask []int64 // non-empty only when Type == FilterMaskTypePartiallyFiltered
+}
+
+// PackedMessageSignature represents net.minecraft.network.chat.MessageSignature$Packed.
+// When ID == -1, FullSignature holds the 256-byte signature; when ID >= 0, ID is
+// the MessageSignatureCache index (encoded on wire as VarInt(ID + 1)).
+type PackedMessageSignature struct {
+	ID            int32
+	FullSignature [256]byte
+}
+
+// LastSeenMessagesUpdate represents net.minecraft.network.chat.LastSeenMessages$Update
+// sent in ServerboundChatPacket (0x09) and ServerboundChatCommandSignedPacket (0x08).
+type LastSeenMessagesUpdate struct {
+	Offset       int32
+	Acknowledged [3]byte // FixedBitSet(20) = ceil(20/8) = 3 bytes
+	Checksum     byte
+}
+
+// ServerboundChatMessage represents ServerboundChatPacket (Play 0x09).
+type ServerboundChatMessage struct {
+	Message             string
+	TimestampEpochMilli int64
+	Salt                int64
+	Signature           *[256]byte
+	LastSeen            LastSeenMessagesUpdate
+}
+
+// ArgumentSignatureEntry represents one entry in ArgumentSignatures (max 8 entries, name max 16 chars).
+type ArgumentSignatureEntry struct {
+	Name      string
+	Signature [256]byte
+}
+
+// ServerboundSignedCommand represents ServerboundChatCommandSignedPacket (Play 0x08).
+type ServerboundSignedCommand struct {
+	Command             string
+	TimestampEpochMilli int64
+	Salt                int64
+	ArgumentSignatures  []ArgumentSignatureEntry
+	LastSeen            LastSeenMessagesUpdate
+}
+
+// PlayerChatPacket represents ClientboundPlayerChatPacket (Play 0x41 in protocol 775).
+type PlayerChatPacket struct {
+	GlobalIndex         int32
+	Sender              [16]byte
+	Index               int32
+	Signature           *[256]byte
+	Content             string
+	TimestampEpochMilli int64
+	Salt                int64
+	LastSeen            []PackedMessageSignature
+	UnsignedContent     *ChatComponent
+	FilterMask          ChatFilterMask
+	ChatTypeIndex       int32
+	SenderName          ChatComponent
+	TargetName          *ChatComponent
+}
+
+// EncodeChatSessionUpdatePacket encodes ServerboundChatSessionUpdatePacket (Play 0x0a).
+func EncodeChatSessionUpdatePacket(cs RemoteChatSession) []byte {
+	w := protocol.NewWriter(32 + len(cs.PublicKeyBytes) + len(cs.KeySignature))
+	w.UUID(cs.SessionID)
+	w.Int64(cs.ExpiresAtEpochMilli)
+	writeProtocolByteArray(w, cs.PublicKeyBytes)
+	writeProtocolByteArray(w, cs.KeySignature)
+	return w.Bytes()
+}
+
+// DecodeChatSessionUpdatePacket decodes ServerboundChatSessionUpdatePacket (Play 0x0a).
+// Wire layout (26.1.2 RemoteChatSession$Data.read / ProfilePublicKey$Data):
+//   - UUID(sessionId)
+//   - Int64(expiresAtEpochMilli)
+//   - ByteArray(max 512)(publicKeyBytes)
+//   - ByteArray(max 4096)(keySignature)
+func DecodeChatSessionUpdatePacket(r *protocol.Reader) (RemoteChatSession, error) {
+	var cs RemoteChatSession
+	id, err := r.UUID()
+	if err != nil {
+		return cs, err
+	}
+	expiresAt, err := r.Int64()
+	if err != nil {
+		return cs, err
+	}
+	pubKey, err := readProtocolByteArray(r, 512)
+	if err != nil {
+		return cs, err
+	}
+	keySig, err := readProtocolByteArray(r, 4096)
+	if err != nil {
+		return cs, err
+	}
+	return RemoteChatSession{
+		SessionID:           id,
+		ExpiresAtEpochMilli: expiresAt,
+		PublicKeyBytes:      pubKey,
+		KeySignature:        keySig,
+	}, nil
+}
+
+// EncodeServerboundChatPacket encodes ServerboundChatPacket (Play 0x09).
+func EncodeServerboundChatPacket(msg ServerboundChatMessage) []byte {
+	w := protocol.NewWriter(64 + len(msg.Message))
+	w.String(msg.Message)
+	w.Int64(msg.TimestampEpochMilli)
+	w.Int64(msg.Salt)
+	if msg.Signature != nil {
+		w.Bool(true)
+		w.Raw(msg.Signature[:])
+	} else {
+		w.Bool(false)
+	}
+	writeLastSeenUpdate(w, msg.LastSeen)
+	return w.Bytes()
+}
+
+// DecodeServerboundChatPacket decodes ServerboundChatPacket (Play 0x09).
+// If only the message string is present (used by minimal unit tests), the
+// remaining fields default to zero values.
+func DecodeServerboundChatPacket(r *protocol.Reader) (ServerboundChatMessage, error) {
+	var out ServerboundChatMessage
+	text, err := r.String()
+	if err != nil {
+		return out, err
+	}
+	if len([]rune(text)) > 256 {
+		return out, fmt.Errorf("chat message exceeds 256 characters")
+	}
+	out.Message = text
+	if r.Remaining() == 0 {
+		return out, nil
+	}
+	ts, err := r.Int64()
+	if err != nil {
+		return out, err
+	}
+	salt, err := r.Int64()
+	if err != nil {
+		return out, err
+	}
+	hasSig, err := r.Bool()
+	if err != nil {
+		return out, err
+	}
+	out.TimestampEpochMilli = ts
+	out.Salt = salt
+	if hasSig {
+		sigBytes, err := readProtocolBytes(r, 256)
+		if err != nil {
+			return out, err
+		}
+		var sig [256]byte
+		copy(sig[:], sigBytes)
+		out.Signature = &sig
+	}
+	if r.Remaining() > 0 {
+		ls, err := readLastSeenUpdate(r)
+		if err != nil {
+			return out, err
+		}
+		out.LastSeen = ls
+	}
+	return out, nil
+}
+
+// EncodeServerboundChatCommandSignedPacket encodes ServerboundChatCommandSignedPacket (Play 0x08).
+func EncodeServerboundChatCommandSignedPacket(cmd ServerboundSignedCommand) []byte {
+	w := protocol.NewWriter(64 + len(cmd.Command) + len(cmd.ArgumentSignatures)*264)
+	w.String(cmd.Command)
+	w.Int64(cmd.TimestampEpochMilli)
+	w.Int64(cmd.Salt)
+	w.VarInt(int32(len(cmd.ArgumentSignatures)))
+	for _, entry := range cmd.ArgumentSignatures {
+		w.String(entry.Name)
+		w.Raw(entry.Signature[:])
+	}
+	writeLastSeenUpdate(w, cmd.LastSeen)
+	return w.Bytes()
+}
+
+// DecodeServerboundChatCommandSignedPacket decodes ServerboundChatCommandSignedPacket (Play 0x08).
+func DecodeServerboundChatCommandSignedPacket(r *protocol.Reader) (ServerboundSignedCommand, error) {
+	var out ServerboundSignedCommand
+	cmd, err := r.String()
+	if err != nil {
+		return out, err
+	}
+	out.Command = cmd
+	if r.Remaining() == 0 {
+		return out, nil
+	}
+	ts, err := r.Int64()
+	if err != nil {
+		return out, err
+	}
+	salt, err := r.Int64()
+	if err != nil {
+		return out, err
+	}
+	sigCount, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	if sigCount < 0 || sigCount > 8 {
+		return out, fmt.Errorf("invalid argument signatures count %d (max 8)", sigCount)
+	}
+	out.TimestampEpochMilli = ts
+	out.Salt = salt
+	if sigCount > 0 {
+		out.ArgumentSignatures = make([]ArgumentSignatureEntry, 0, sigCount)
+		for i := int32(0); i < sigCount; i++ {
+			name, err := r.String()
+			if err != nil {
+				return out, err
+			}
+			if len(name) > 16 {
+				return out, fmt.Errorf("argument signature name exceeds 16 chars")
+			}
+			sigBytes, err := readProtocolBytes(r, 256)
+			if err != nil {
+				return out, err
+			}
+			var sig [256]byte
+			copy(sig[:], sigBytes)
+			out.ArgumentSignatures = append(out.ArgumentSignatures, ArgumentSignatureEntry{
+				Name:      name,
+				Signature: sig,
+			})
+		}
+	}
+	if r.Remaining() > 0 {
+		ls, err := readLastSeenUpdate(r)
+		if err != nil {
+			return out, err
+		}
+		out.LastSeen = ls
+	}
+	return out, nil
+}
+
+// EncodeChatAckPacket encodes ServerboundChatAckPacket (Play 0x06).
+func EncodeChatAckPacket(offset int32) []byte {
+	w := protocol.NewWriter(5)
+	w.VarInt(offset)
+	return w.Bytes()
+}
+
+// DecodeChatAckPacket decodes ServerboundChatAckPacket (Play 0x06).
+func DecodeChatAckPacket(r *protocol.Reader) (int32, error) {
+	offset, err := r.VarInt()
+	if err != nil {
+		return 0, err
+	}
+	if offset < 0 {
+		return offset, fmt.Errorf("negative chat ack offset %d", offset)
+	}
+	return offset, nil
+}
+
+func writeLastSeenUpdate(w *protocol.Writer, ls LastSeenMessagesUpdate) {
+	w.VarInt(ls.Offset)
+	w.Raw(ls.Acknowledged[:])
+	w.Byte(ls.Checksum)
+}
+
+func readLastSeenUpdate(r *protocol.Reader) (LastSeenMessagesUpdate, error) {
+	var out LastSeenMessagesUpdate
+	offset, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	ackBytes, err := readProtocolBytes(r, 3)
+	if err != nil {
+		return out, err
+	}
+	checksum, err := r.ReadByte()
+	if err != nil {
+		return out, err
+	}
+	out.Offset = offset
+	copy(out.Acknowledged[:], ackBytes)
+	out.Checksum = checksum
+	return out, nil
+}
+
+// EncodePlayerChatPacket encodes ClientboundPlayerChatPacket (Play 0x41 in protocol 775)
+// supporting both signed and unsigned messages, packed LastSeen signatures, and FilterMask.
+func EncodePlayerChatPacket(pkt PlayerChatPacket) []byte {
+	w := protocol.NewWriter(160 + len(pkt.Content))
+	w.VarInt(pkt.GlobalIndex)
+	w.UUID(pkt.Sender)
+	w.VarInt(pkt.Index)
+	if pkt.Signature != nil {
+		w.Bool(true)
+		w.Raw(pkt.Signature[:])
+	} else {
+		w.Bool(false)
+	}
+	w.String(pkt.Content)
+	w.Int64(pkt.TimestampEpochMilli)
+	w.Int64(pkt.Salt)
+	w.VarInt(int32(len(pkt.LastSeen)))
+	for _, ls := range pkt.LastSeen {
+		writePackedMessageSignature(w, ls)
+	}
+	if pkt.UnsignedContent != nil {
+		w.Bool(true)
+		w.Raw(pkt.UnsignedContent.MarshalNBT())
+	} else {
+		w.Bool(false)
+	}
+	w.VarInt(pkt.FilterMask.Type)
+	if pkt.FilterMask.Type == FilterMaskTypePartiallyFiltered {
+		w.VarInt(int32(len(pkt.FilterMask.Mask)))
+		for _, word := range pkt.FilterMask.Mask {
+			w.Int64(word)
+		}
+	}
+	writeChatTypeBound(w, pkt.ChatTypeIndex, pkt.SenderName, pkt.TargetName)
+	return w.Bytes()
+}
+
+// DecodePlayerChatPacket decodes ClientboundPlayerChatPacket (Play 0x41 in protocol 775).
+func DecodePlayerChatPacket(r *protocol.Reader) (PlayerChatPacket, error) {
+	var out PlayerChatPacket
+	globalIdx, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	sender, err := r.UUID()
+	if err != nil {
+		return out, err
+	}
+	index, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	hasSig, err := r.Bool()
+	if err != nil {
+		return out, err
+	}
+	out.GlobalIndex = globalIdx
+	out.Sender = sender
+	out.Index = index
+	if hasSig {
+		sigBytes, err := readProtocolBytes(r, 256)
+		if err != nil {
+			return out, err
+		}
+		var sig [256]byte
+		copy(sig[:], sigBytes)
+		out.Signature = &sig
+	}
+	content, err := r.String()
+	if err != nil {
+		return out, err
+	}
+	if len([]rune(content)) > 256 {
+		return out, fmt.Errorf("player chat content exceeds 256 chars")
+	}
+	ts, err := r.Int64()
+	if err != nil {
+		return out, err
+	}
+	salt, err := r.Int64()
+	if err != nil {
+		return out, err
+	}
+	lsCount, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	if lsCount < 0 || lsCount > 20 {
+		return out, fmt.Errorf("invalid last seen messages count %d (max 20)", lsCount)
+	}
+	out.Content = content
+	out.TimestampEpochMilli = ts
+	out.Salt = salt
+	if lsCount > 0 {
+		out.LastSeen = make([]PackedMessageSignature, 0, lsCount)
+		for i := int32(0); i < lsCount; i++ {
+			pSig, err := readPackedMessageSignature(r)
+			if err != nil {
+				return out, err
+			}
+			out.LastSeen = append(out.LastSeen, pSig)
+		}
+	}
+	hasUnsigned, err := r.Bool()
+	if err != nil {
+		return out, err
+	}
+	if hasUnsigned {
+		uc, err := ReadChatComponentNBT(r)
+		if err != nil {
+			return out, err
+		}
+		out.UnsignedContent = &uc
+	}
+	fmType, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	if fmType < FilterMaskTypePassThrough || fmType > FilterMaskTypePartiallyFiltered {
+		return out, fmt.Errorf("invalid filter mask type %d", fmType)
+	}
+	out.FilterMask.Type = fmType
+	if fmType == FilterMaskTypePartiallyFiltered {
+		wordCount, err := r.VarInt()
+		if err != nil {
+			return out, err
+		}
+		if wordCount < 0 || wordCount > 64 {
+			return out, fmt.Errorf("invalid filter mask bitset length %d", wordCount)
+		}
+		out.FilterMask.Mask = make([]int64, wordCount)
+		for i := int32(0); i < wordCount; i++ {
+			word, err := r.Int64()
+			if err != nil {
+				return out, err
+			}
+			out.FilterMask.Mask[i] = word
+		}
+	}
+	ctIdx, senderName, targetName, err := readChatTypeBound(r)
+	if err != nil {
+		return out, err
+	}
+	out.ChatTypeIndex = ctIdx
+	out.SenderName = senderName
+	out.TargetName = targetName
+	return out, nil
+}
+
+// EncodeDeleteChatPacket encodes ClientboundDeleteChatPacket (Play 0x1f in protocol 775).
+func EncodeDeleteChatPacket(sig PackedMessageSignature) []byte {
+	w := protocol.NewWriter(260)
+	writePackedMessageSignature(w, sig)
+	return w.Bytes()
+}
+
+// DecodeDeleteChatPacket decodes ClientboundDeleteChatPacket (Play 0x1f in protocol 775).
+func DecodeDeleteChatPacket(r *protocol.Reader) (PackedMessageSignature, error) {
+	return readPackedMessageSignature(r)
+}
+
+func writePackedMessageSignature(w *protocol.Writer, sig PackedMessageSignature) {
+	if sig.ID < 0 {
+		w.VarInt(0) // id + 1 == 0 -> full 256-byte signature follows
+		w.Raw(sig.FullSignature[:])
+	} else {
+		w.VarInt(sig.ID + 1)
+	}
+}
+
+func readPackedMessageSignature(r *protocol.Reader) (PackedMessageSignature, error) {
+	rawID, err := r.VarInt()
+	if err != nil {
+		return PackedMessageSignature{}, err
+	}
+	id := rawID - 1
+	if id == -1 {
+		sigBytes, err := readProtocolBytes(r, 256)
+		if err != nil {
+			return PackedMessageSignature{}, err
+		}
+		var full [256]byte
+		copy(full[:], sigBytes)
+		return PackedMessageSignature{ID: -1, FullSignature: full}, nil
+	}
+	if id < -1 {
+		return PackedMessageSignature{}, fmt.Errorf("invalid packed signature id %d", id)
+	}
+	return PackedMessageSignature{ID: id}, nil
+}
+
 // EncodeUnsignedPlayerChatPacket encodes ClientboundPlayerChatPacket (0x41 in
 // protocol 775) for an unsigned chat message.
 func EncodeUnsignedPlayerChatPacket(
@@ -984,24 +1472,19 @@ func EncodeUnsignedPlayerChatPacket(
 	senderName ChatComponent,
 	targetName *ChatComponent,
 ) []byte {
-	w := protocol.NewWriter(128)
-	w.VarInt(globalIndex)
-	w.UUID(senderUUID)
-	w.VarInt(index)
-	w.Bool(false) // HasSignature = false
-	w.String(plainContent)
-	w.Int64(timestampMs)
-	w.Int64(salt)
-	w.VarInt(0) // PreviousMessages count = 0
-	if unsignedContent != nil {
-		w.Bool(true)
-		w.Raw(unsignedContent.MarshalNBT())
-	} else {
-		w.Bool(false)
-	}
-	w.VarInt(0) // FilterMask = PASS_THROUGH (0)
-	writeChatTypeBound(w, chatTypeIndex, senderName, targetName)
-	return w.Bytes()
+	return EncodePlayerChatPacket(PlayerChatPacket{
+		GlobalIndex:         globalIndex,
+		Sender:              senderUUID,
+		Index:               index,
+		Content:             plainContent,
+		TimestampEpochMilli: timestampMs,
+		Salt:                salt,
+		UnsignedContent:     unsignedContent,
+		FilterMask:          ChatFilterMask{Type: FilterMaskTypePassThrough},
+		ChatTypeIndex:       chatTypeIndex,
+		SenderName:          senderName,
+		TargetName:          targetName,
+	})
 }
 
 func writeChatTypeBound(w *protocol.Writer, chatTypeIndex int32, senderName ChatComponent, targetName *ChatComponent) {

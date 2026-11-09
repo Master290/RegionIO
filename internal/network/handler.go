@@ -35,6 +35,11 @@ type handler struct {
 	knownEntities   map[int32]visibleEntity
 	spawnY          float64
 	protocolVersion int32
+	handshakeIntent int32
+	cookies         map[string][]byte
+	lastPackID      [16]byte
+	lastPackAction  int32
+	hasPackStatus   bool
 
 	keepAliveMu      sync.Mutex
 	keepAlivePending bool
@@ -120,6 +125,7 @@ func (h *handler) handleHandshake(pkt protocol.Packet) error {
 	h.log.Debug("handshake",
 		"protocol", protoVer, "addr", addr, "port", port, "next", next)
 	h.protocolVersion = protoVer
+	h.handshakeIntent = next
 
 	switch next {
 	case protocol.NextStateStatus:
@@ -156,5 +162,33 @@ func (h *handler) handleStatus(pkt protocol.Packet) error {
 
 	default:
 		return errors.New("unexpected packet in status state")
+	}
+}
+
+func (h *handler) remoteIP() string {
+	if h == nil || h.conn == nil || h.conn.raw == nil || h.conn.raw.RemoteAddr() == nil {
+		return ""
+	}
+	addrStr := h.conn.raw.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(addrStr); err == nil {
+		return host
+	}
+	return addrStr
+}
+
+func (h *handler) setCookie(key string, payload []byte) {
+	if h == nil {
+		return
+	}
+	if h.cookies == nil {
+		h.cookies = make(map[string][]byte)
+	}
+	if payload == nil {
+		delete(h.cookies, key)
+	} else {
+		h.cookies[key] = append([]byte(nil), payload...)
+	}
+	if h.srv != nil && h.session != nil {
+		h.srv.SetPlayerCookie(h.session, key, payload)
 	}
 }

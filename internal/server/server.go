@@ -43,6 +43,22 @@ type Config struct {
 	// OpsFile and WhitelistFile are optional paths to ops.json and whitelist.json.
 	OpsFile       string
 	WhitelistFile string
+	// BannedPlayersFile is an optional path to banned-players.json.
+	BannedPlayersFile string
+	// BannedIPsFile is an optional path to banned-ips.json.
+	BannedIPsFile string
+	// EnforceSecureChat sets enforcesSecureChat in StatusJSON and requires signed chat when true.
+	EnforceSecureChat bool
+	// HideOnlinePlayers omits the player sample list from StatusJSON when true.
+	HideOnlinePlayers bool
+	// AcceptsTransfers controls whether login handshakes with NextStateTransfer (3) are accepted.
+	AcceptsTransfers bool
+	// Favicon is an optional "data:image/png;base64,..." string included in StatusJSON.
+	Favicon string
+	// BugReportLink is an optional bug-report URL from server.properties.
+	BugReportLink string
+	// ResourcePack configures an optional server resource pack pushed during Configuration.
+	ResourcePack *ResourcePackInfo
 	// CompressionThreshold is the minimum uncompressed packet size (bytes) that
 	// triggers zlib compression. Negative disables compression entirely.
 	CompressionThreshold int
@@ -88,6 +104,7 @@ func DefaultConfig() Config {
 		MaxViewDistance: 2,
 		Difficulty:      "normal",
 		Hardcore:        false,
+		AcceptsTransfers: true,
 	}
 }
 
@@ -187,9 +204,11 @@ type PlayerSnapshot struct {
 }
 
 var (
-	ErrServerFull      = errors.New("server: player limit reached")
-	ErrDuplicatePlayer = errors.New("server: player is already connected")
-	ErrNotWhitelisted  = errors.New("server: player is not whitelisted")
+	ErrServerFull        = errors.New("server: player limit reached")
+	ErrDuplicatePlayer   = errors.New("server: player is already connected")
+	ErrNotWhitelisted    = errors.New("server: player is not whitelisted")
+	ErrIPBanned          = errors.New("server: IP address is banned")
+	ErrTransfersDisabled = errors.New("server: transfers are disabled")
 )
 
 // New constructs a Server from cfg. When cfg.WorldDir is set, the world is
@@ -288,6 +307,20 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 	}
 	if entries, err := LoadWhitelistFile(cfg.WhitelistFile); err == nil {
 		s.SetWhitelist(entries)
+	}
+	if cfg.BannedPlayersFile != "" {
+		if entries, err := LoadBannedPlayersFile(cfg.BannedPlayersFile); err == nil {
+			for _, b := range entries {
+				s.BanPlayer(b.Target, b.Reason)
+			}
+		}
+	}
+	if cfg.BannedIPsFile != "" {
+		if entries, err := LoadBannedIPsFile(cfg.BannedIPsFile); err == nil {
+			for _, b := range entries {
+				s.BanIP(b.Target, b.Reason)
+			}
+		}
 	}
 	// Resume the world clock where it was saved, so a restart does not throw
 	// the sky back to dawn.
@@ -2479,6 +2512,9 @@ func (s *Server) RemoveWhitelist(name string) error {
 }
 
 func (s *Server) checkAccess(profile Profile) error {
+	if _, banned := s.IsPlayerBanned(profile.Name); banned {
+		return ErrPlayerBanned
+	}
 	key := strings.ToLower(strings.TrimSpace(profile.Name))
 	s.aclMu.RLock()
 	enforce := s.enforceWhitelist
@@ -2489,6 +2525,43 @@ func (s *Server) checkAccess(profile Profile) error {
 		return ErrNotWhitelisted
 	}
 	return nil
+}
+
+// CheckLoginAccess verifies whether profile connecting from remoteIP is allowed
+// to join, returning a vanilla disconnect ChatComponent and error if rejected.
+func (s *Server) CheckLoginAccess(profile Profile, remoteIP string) (*ChatComponent, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if ban, banned := s.IsPlayerBanned(profile.Name); banned {
+		comp := FormatDisconnectReason(ErrPlayerBanned, ban.Reason)
+		return &comp, ErrPlayerBanned
+	}
+	if remoteIP != "" {
+		if ban, banned := s.IsIPBanned(remoteIP); banned {
+			comp := FormatDisconnectReason(ErrIPBanned, ban.Reason)
+			return &comp, ErrIPBanned
+		}
+	}
+	if err := s.checkAccess(profile); err != nil {
+		comp := FormatDisconnectReason(err, "")
+		return &comp, err
+	}
+	s.playersMu.RLock()
+	nameKey := strings.ToLower(profile.Name)
+	_, dupUUID := s.players[profile.UUID]
+	_, dupName := s.playerNames[nameKey]
+	count := len(s.players)
+	s.playersMu.RUnlock()
+	if dupUUID || dupName {
+		comp := FormatDisconnectReason(ErrDuplicatePlayer, "")
+		return &comp, ErrDuplicatePlayer
+	}
+	if s.cfg.MaxPlayers > 0 && count >= s.cfg.MaxPlayers && !s.opBypassesLimit(profile.Name) {
+		comp := FormatDisconnectReason(ErrServerFull, "")
+		return &comp, ErrServerFull
+	}
+	return nil, nil
 }
 
 func (s *Server) opBypassesLimit(name string) bool {
@@ -2610,11 +2683,11 @@ func (s *Server) Store() *world.Store { return s.store }
 // statusResponse mirrors the JSON shape the client expects for the server-list
 // ping. Field names and nesting are part of the protocol contract.
 type statusResponse struct {
-	Version     statusVersion `json:"version"`
-	Players     statusPlayers `json:"players"`
-	Description statusText    `json:"description"`
-	// EnforcesSecureChat is read by the client; false keeps unsigned chat working.
-	EnforcesSecureChat bool `json:"enforcesSecureChat"`
+	Version            statusVersion `json:"version"`
+	Players            statusPlayers `json:"players"`
+	Description        statusText    `json:"description"`
+	Favicon            string        `json:"favicon,omitempty"`
+	EnforcesSecureChat bool          `json:"enforcesSecureChat"`
 }
 
 type statusVersion struct {
@@ -2622,17 +2695,161 @@ type statusVersion struct {
 	Protocol int    `json:"protocol"`
 }
 
+// StatusPlayerSample represents one entry in players.sample of the server status response.
+type StatusPlayerSample struct {
+	Name string `json:"name"`
+	ID   string `json:"id"`
+}
+
 type statusPlayers struct {
-	Max    int `json:"max"`
-	Online int `json:"online"`
+	Max    int                  `json:"max"`
+	Online int                  `json:"online"`
+	Sample []StatusPlayerSample `json:"sample,omitempty"`
 }
 
 type statusText struct {
 	Text string `json:"text"`
 }
 
+// FaviconURI returns the "data:image/png;base64,..." status icon URI if configured.
+func (s *Server) FaviconURI() string {
+	if s == nil {
+		return ""
+	}
+	s.aclMu.RLock()
+	fav := s.cfg.Favicon
+	s.aclMu.RUnlock()
+	return fav
+}
+
+// FaviconBytes returns the raw PNG icon bytes for ClientboundServerDataPacket (0x56).
+func (s *Server) FaviconBytes() []byte {
+	if s == nil {
+		return nil
+	}
+	s.aclMu.RLock()
+	fav := s.cfg.Favicon
+	s.aclMu.RUnlock()
+	if fav != "" {
+		if decoded, err := ParseFaviconDataURI(fav); err == nil {
+			return decoded
+		}
+	}
+	return nil
+}
+
+// SetFaviconPNG sets the server icon PNG bytes at runtime.
+func (s *Server) SetFaviconPNG(png []byte) {
+	if s == nil {
+		return
+	}
+	s.aclMu.Lock()
+	if len(png) > 0 {
+		s.cfg.Favicon = FormatFaviconDataURI(png)
+	} else {
+		s.cfg.Favicon = ""
+	}
+	s.aclMu.Unlock()
+}
+
+var serverLinksStore sync.Map // map[*Server][]ServerLinkEntry
+
+// ServerLinks returns the configured server links for ClientboundServerLinksPacket.
+func (s *Server) ServerLinks() []ServerLinkEntry {
+	if s == nil {
+		return nil
+	}
+	if v, ok := serverLinksStore.Load(s); ok {
+		links := v.([]ServerLinkEntry)
+		return append([]ServerLinkEntry(nil), links...)
+	}
+	s.aclMu.RLock()
+	bugURL := s.cfg.BugReportLink
+	s.aclMu.RUnlock()
+	if bugURL != "" {
+		return []ServerLinkEntry{NewKnownServerLink(ServerLinkBugReport, bugURL)}
+	}
+	return nil
+}
+
+// ResourcePack returns a copy of the configured server ResourcePackInfo, or nil.
+func (s *Server) ResourcePack() *ResourcePackInfo {
+	if s == nil {
+		return nil
+	}
+	s.aclMu.RLock()
+	defer s.aclMu.RUnlock()
+	if s.cfg.ResourcePack == nil || s.cfg.ResourcePack.URL == "" {
+		return nil
+	}
+	cp := *s.cfg.ResourcePack
+	if s.cfg.ResourcePack.Prompt != nil {
+		p := *s.cfg.ResourcePack.Prompt
+		cp.Prompt = &p
+	}
+	return &cp
+}
+
+// SetResourcePack sets or clears the server's configured ResourcePackInfo.
+func (s *Server) SetResourcePack(rp *ResourcePackInfo) {
+	if s == nil {
+		return
+	}
+	s.aclMu.Lock()
+	if rp != nil {
+		cp := *rp
+		if rp.Prompt != nil {
+			p := *rp.Prompt
+			cp.Prompt = &p
+		}
+		s.cfg.ResourcePack = &cp
+	} else {
+		s.cfg.ResourcePack = nil
+	}
+	s.aclMu.Unlock()
+}
+
+// SetServerLinks updates the server links and broadcasts ClientboundServerLinksPacket (0x89) to joined players.
+func (s *Server) SetServerLinks(links []ServerLinkEntry) {
+	if s == nil {
+		return
+	}
+	cp := append([]ServerLinkEntry(nil), links...)
+	serverLinksStore.Store(s, cp)
+	s.Broadcast(protocol.PlayServerLinks, EncodeServerLinksPacket(cp))
+}
+
 // StatusJSON returns the marshaled status response for the server-list ping.
 func (s *Server) StatusJSON(onlinePlayers int) ([]byte, error) {
+	var sample []StatusPlayerSample
+	hide := s.cfg.HideOnlinePlayers
+	if !hide {
+		online := s.onlinePlayersSnapshot()
+		if len(online) > 12 {
+			online = online[:12]
+		}
+		for _, p := range online {
+			if p == nil {
+				continue
+			}
+			info := s.PlayerClientInformation(p)
+			if !info.AllowsListing {
+				sample = append(sample, StatusPlayerSample{
+					Name: "Anonymous Player",
+					ID:   "00000000-0000-0000-0000-000000000000",
+				})
+			} else {
+				sample = append(sample, StatusPlayerSample{
+					Name: p.Profile.Name,
+					ID:   FormatUUID(p.Profile.UUID),
+				})
+			}
+		}
+	}
+	onlineCount := onlinePlayers
+	if hide {
+		onlineCount = 0
+	}
 	resp := statusResponse{
 		Version: statusVersion{
 			Name:     protocol.GameVersion,
@@ -2640,10 +2857,12 @@ func (s *Server) StatusJSON(onlinePlayers int) ([]byte, error) {
 		},
 		Players: statusPlayers{
 			Max:    s.cfg.MaxPlayers,
-			Online: onlinePlayers,
+			Online: onlineCount,
+			Sample: sample,
 		},
 		Description:        statusText{Text: s.cfg.MOTD},
-		EnforcesSecureChat: false,
+		Favicon:            s.FaviconURI(),
+		EnforcesSecureChat: s.cfg.EnforceSecureChat,
 	}
 	return json.Marshal(resp)
 }
