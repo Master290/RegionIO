@@ -954,12 +954,21 @@ func (s *Server) applyFurnaceClickLocked(session *PlayerSession, tr *playerConta
 		}
 
 	case ContainerInputSwap:
-		if button >= 0 && button < 9 && slot != world.FurnaceSlotOutput {
-			hotbarIdx := 30 + int(button)
-			if slot == world.FurnaceSlotFuel && !slots[hotbarIdx].IsEmpty() && !CanPlaceInFurnaceFuelSlot(slots[hotbarIdx]) {
-				break
+		if slot != world.FurnaceSlotOutput {
+			if button >= 0 && button < 9 {
+				hotbarIdx := 30 + int(button)
+				if slot == world.FurnaceSlotFuel && !slots[hotbarIdx].IsEmpty() && !CanPlaceInFurnaceFuelSlot(slots[hotbarIdx]) {
+					break
+				}
+				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			} else if button == 40 {
+				offStack := session.InventorySlot(OffHandContainerSlot)
+				if slot == world.FurnaceSlotFuel && !offStack.IsEmpty() && !CanPlaceInFurnaceFuelSlot(offStack) {
+					break
+				}
+				slots[slot], offStack = offStack, slots[slot]
+				session.SetInventorySlot(OffHandContainerSlot, offStack)
 			}
-			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 		}
 
 	case ContainerInputClone:

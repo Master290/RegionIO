@@ -96,6 +96,17 @@ type serverChestState struct {
 	chests map[chestKey]*[ChestSlotCount]world.ItemStack
 }
 
+// QuickCraft (drag mode 5) type and header constants matching AbstractContainerMenu.
+const (
+	QuickCraftTypeCharitable int8 = 0 // Left-drag: split carried stack evenly across dragged slots
+	QuickCraftTypeGreedy     int8 = 1 // Right-drag: place 1 item per dragged slot
+	QuickCraftTypeClone      int8 = 2 // Middle-drag (Creative): place max-stack clone per dragged slot
+
+	QuickCraftHeaderStart    int8 = 0 // Start drag
+	QuickCraftHeaderContinue int8 = 1 // Add slot to drag
+	QuickCraftHeaderEnd      int8 = 2 // End drag and distribute items
+)
+
 type playerContainerTracker struct {
 	mu            sync.Mutex
 	nextWindow    int32
@@ -105,6 +116,9 @@ type playerContainerTracker struct {
 	invCraftStars [4]FireworkExplosion
 	invResult     world.ItemStack
 	enderChest    [ChestSlotCount]world.ItemStack
+	dragStatus    int8
+	dragType      int8
+	dragSlots     []int
 }
 
 var (
@@ -1289,6 +1303,9 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		}
 	}
 	tr.invResult = world.ItemStack{}
+	tr.dragStatus = 0
+	tr.dragType = 0
+	tr.dragSlots = nil
 	session.SetInventorySlot(0, world.ItemStack{})
 	for i := 1; i <= 4; i++ {
 		session.SetInventorySlot(i, world.ItemStack{})
@@ -1337,6 +1354,31 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	return nil
 }
 
+// HandleContainerClickWithState processes a slot click while checking whether the
+// client's stateID matches the server's current ContainerStateID. On mismatch, a
+// full container + cursor item resync is guaranteed after applying the click
+// (matching ServerGamePacketListenerImpl.handleContainerClick in 26.1.2).
+func (s *Server) HandleContainerClickWithState(session *PlayerSession, containerID, stateID int32, slot int, button int8, mode int32) error {
+	if s == nil || session == nil || session.IsDead() {
+		return nil
+	}
+	stateMismatch := stateID != session.ContainerStateID()
+	prevStateID := session.ContainerStateID()
+	err := s.HandleContainerClick(session, containerID, slot, button, mode)
+	if err != nil {
+		return err
+	}
+	if stateMismatch {
+		if session.ContainerStateID() == prevStateID {
+			if err := s.syncOpenContainer(session); err != nil {
+				return err
+			}
+		}
+		return s.SendSetCursorItem(session)
+	}
+	return nil
+}
+
 // HandleContainerClick processes a slot click on either the player's inventory
 // container (containerID == 0) or the currently open chest / crafting table
 // container, updating authoritative slot contents and synchronizing the client.
@@ -1344,11 +1386,23 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	if s == nil || session == nil || session.IsDead() {
 		return nil
 	}
+	if session.Snapshot().GameMode == GameModeSpectator {
+		return s.syncOpenContainer(session)
+	}
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
 
-	// Clicking outside the window (-999) with Pickup drops carried item(s).
-	if slot == -999 && mode == ContainerInputPickup {
+	if mode == ContainerInputQuickCraft {
+		return s.handleQuickCraftClickLocked(session, tr, containerID, slot, button)
+	}
+	if tr.dragStatus != 0 {
+		tr.dragStatus = 0
+		tr.dragType = 0
+		tr.dragSlots = nil
+	}
+
+	// Clicking outside the window (-999) with Pickup or Throw drops carried item(s).
+	if slot == -999 && (mode == ContainerInputPickup || mode == ContainerInputThrow) {
 		if !tr.carried.IsEmpty() {
 			dropCount := tr.carried.Count
 			if button == 1 {
@@ -1699,6 +1753,18 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 			slotMapIDs[slot], slotMapIDs[hotbarIdx] = slotMapIDs[hotbarIdx], slotMapIDs[slot]
 			hasSlotMaps[slot], hasSlotMaps[hotbarIdx] = hasSlotMaps[hotbarIdx], hasSlotMaps[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			offMapID, hasOffMap := GetSlotMapID(session, OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			slotMapIDs[slot], offMapID = offMapID, slotMapIDs[slot]
+			hasSlotMaps[slot], hasOffMap = hasOffMap, hasSlotMaps[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
+			if !offStack.IsEmpty() && offStack.ResolvedID() == FilledMapItemID && hasOffMap {
+				SetSlotMapID(session, OffHandContainerSlot, offMapID)
+			} else {
+				ClearSlotMapID(session, OffHandContainerSlot)
+			}
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -1813,21 +1879,29 @@ func applyPickupAllSlice(slots []world.ItemStack, carried *world.ItemStack, minS
 	if carried.Count >= maxStack {
 		return
 	}
-	for i := minSlot; i < len(slots) && carried.Count < maxStack; i++ {
-		st := slots[i]
-		if st.IsEmpty() || st.ResolvedItemID() != itemID {
-			continue
-		}
-		space := maxStack - carried.Count
-		take := st.Count
-		if take > space {
-			take = space
-		}
-		*carried = world.NewItemStack(itemID, carried.Count+take)
-		if st.Count-take <= 0 {
-			slots[i] = world.ItemStack{}
-		} else {
-			slots[i] = world.NewItemStack(itemID, st.Count-take)
+	// Vanilla AbstractContainerMenu.doClick (PICKUP_ALL) performs 2 passes:
+	// Pass 0 collects only from partial stacks (st.Count < maxStack);
+	// Pass 1 collects from any remaining matching stacks (including full stacks).
+	for pass := 0; pass < 2 && carried.Count < maxStack; pass++ {
+		for i := minSlot; i < len(slots) && carried.Count < maxStack; i++ {
+			st := slots[i]
+			if st.IsEmpty() || st.ResolvedItemID() != itemID {
+				continue
+			}
+			if pass == 0 && st.Count >= maxStack {
+				continue
+			}
+			space := maxStack - carried.Count
+			take := st.Count
+			if take > space {
+				take = space
+			}
+			*carried = world.NewItemStack(itemID, carried.Count+take)
+			if st.Count-take <= 0 {
+				slots[i] = world.ItemStack{}
+			} else {
+				slots[i] = world.NewItemStack(itemID, st.Count-take)
+			}
 		}
 	}
 }
@@ -2113,6 +2187,13 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 				hotbarIdx := 37 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 				slotPotions[slot], slotPotions[hotbarIdx] = slotPotions[hotbarIdx], slotPotions[slot]
+			} else if button == 40 {
+				offStack := session.InventorySlot(OffHandContainerSlot)
+				offPotion := GetSlotPotionType(session, OffHandContainerSlot)
+				slots[slot], offStack = offStack, slots[slot]
+				slotPotions[slot], offPotion = offPotion, slotPotions[slot]
+				session.SetInventorySlot(OffHandContainerSlot, offStack)
+				SetSlotPotionType(session, OffHandContainerSlot, offPotion)
 			}
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -2560,26 +2641,31 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 				if MaxItemDurability(tr.carried.ResolvedID()) > 0 || tr.carried.ResolvedID() == "minecraft:enchanted_book" {
 					maxStack = 1
 				}
-				for i := 1; i < world.PlayerInventorySlots && tr.carried.Count < maxStack; i++ {
-					if i >= ArmorSlotHead && i <= ArmorSlotFeet && HasBindingCurseOnSlot(session, i) {
-						continue
-					}
-					st := slots[i]
-					if st.IsEmpty() || st.ResolvedItemID() != itemID || !metas[i].IsEmpty() {
-						continue
-					}
-					space := maxStack - tr.carried.Count
-					take := st.Count
-					if take > space {
-						take = space
-					}
-					tr.carried = world.NewItemStack(itemID, tr.carried.Count+take)
-					if st.Count-take <= 0 {
-						slots[i] = world.ItemStack{}
-						metas[i] = ItemMeta{}
-						trims[i] = ArmorTrim{}
-					} else {
-						slots[i] = world.NewItemStack(itemID, st.Count-take)
+				for pass := 0; pass < 2 && tr.carried.Count < maxStack; pass++ {
+					for i := 1; i < world.PlayerInventorySlots && tr.carried.Count < maxStack; i++ {
+						if i >= ArmorSlotHead && i <= ArmorSlotFeet && HasBindingCurseOnSlot(session, i) {
+							continue
+						}
+						st := slots[i]
+						if st.IsEmpty() || st.ResolvedItemID() != itemID || !metas[i].IsEmpty() {
+							continue
+						}
+						if pass == 0 && st.Count >= maxStack {
+							continue
+						}
+						space := maxStack - tr.carried.Count
+						take := st.Count
+						if take > space {
+							take = space
+						}
+						tr.carried = world.NewItemStack(itemID, tr.carried.Count+take)
+						if st.Count-take <= 0 {
+							slots[i] = world.ItemStack{}
+							metas[i] = ItemMeta{}
+							trims[i] = ArmorTrim{}
+						} else {
+							slots[i] = world.NewItemStack(itemID, st.Count-take)
+						}
 					}
 				}
 			}
@@ -3227,6 +3313,10 @@ func (s *Server) applyDoubleChestClickLocked(
 		if button >= 0 && button < 9 {
 			hotbarIdx := 81 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -3294,6 +3384,10 @@ func (s *Server) applyEnderChestClickLocked(
 		if button >= 0 && button < 9 {
 			hotbarIdx := 54 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -3585,6 +3679,10 @@ func (s *Server) applyVehicleChestClickLocked(session *PlayerSession, tr *player
 		if button >= 0 && button < 9 {
 			hotbarIdx := 54 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -3640,6 +3738,10 @@ func (s *Server) applyVehicleHopperClickLocked(session *PlayerSession, tr *playe
 		if button >= 0 && button < 9 {
 			hotbarIdx := 32 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -3793,6 +3895,13 @@ func (s *Server) applyCrafterClickLocked(session *PlayerSession, tr *playerConta
 				s.SetCrafterSlotDisabled(dim, bx, by, bz, slot, false)
 			}
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			if slot < CrafterSlotCount && !offStack.IsEmpty() && s.IsCrafterSlotDisabled(dim, bx, by, bz, slot) {
+				s.SetCrafterSlotDisabled(dim, bx, by, bz, slot, false)
+			}
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -4933,6 +5042,437 @@ func SetCarriedWrittenBook(session *PlayerSession, content WrittenBookContent, h
 	}
 	tr.mu.Unlock()
 }
+
+// QuickcraftType extracts the drag type ((button >> 2) & 3) from a QuickCraft click button.
+func QuickcraftType(button int8) int8 {
+	return (button >> 2) & 3
+}
+
+// QuickcraftHeader extracts the drag phase header (button & 3) from a QuickCraft click button.
+func QuickcraftHeader(button int8) int8 {
+	return button & 3
+}
+
+// QuickcraftMask packs a QuickCraft header (0..2) and drag type (0..2) into a button byte.
+func QuickcraftMask(header, dragType int8) int8 {
+	return (header & 3) | ((dragType & 3) << 2)
+}
+
+// IsValidQuickcraftType reports whether dragType is allowed for gameMode
+// (matching AbstractContainerMenu.isValidQuickcraftType in 26.1.2).
+func IsValidQuickcraftType(dragType int8, gameMode uint8) bool {
+	if dragType == QuickCraftTypeClone {
+		return gameMode == GameModeCreative
+	}
+	return dragType == QuickCraftTypeCharitable || dragType == QuickCraftTypeGreedy
+}
+
+// QuickCraftPlaceCount computes the number of items placed into each dragged slot
+// (matching AbstractContainerMenu.getQuickCraftPlaceCount in 26.1.2).
+func QuickCraftPlaceCount(numSlots int, dragType int8, carried world.ItemStack) int32 {
+	if carried.IsEmpty() || numSlots <= 0 {
+		return 0
+	}
+	maxStack := MaxStackSizeForBundleWeight(carried.ResolvedID())
+	switch dragType {
+	case QuickCraftTypeCharitable:
+		return carried.Count / int32(numSlots)
+	case QuickCraftTypeGreedy:
+		return 1
+	case QuickCraftTypeClone:
+		return maxStack
+	default:
+		return carried.Count
+	}
+}
+
+// ResetContainerQuickCraft clears any in-progress QuickCraft drag on session.
+func ResetContainerQuickCraft(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.dragStatus = 0
+	tr.dragType = 0
+	tr.dragSlots = nil
+	tr.mu.Unlock()
+}
+
+func isQuickCraftResultOrInvalidSlot(session *PlayerSession, tr *playerContainerTracker, containerID int32, slot int, carried world.ItemStack) bool {
+	if slot < 0 || carried.IsEmpty() {
+		return true
+	}
+	if containerID == 0 {
+		if slot == 0 || slot >= world.PlayerInventorySlots {
+			return true
+		}
+		if slot >= ArmorSlotHead && slot <= ArmorSlotFeet {
+			if HasBindingCurseOnSlot(session, slot) {
+				return true
+			}
+			if ws, ok := WearableArmorSlotForItem(carried.ResolvedID()); !ok || ws != slot {
+				return true
+			}
+		}
+		return false
+	}
+	if tr.open == nil || tr.open.ContainerID != containerID {
+		return true
+	}
+	switch tr.open.MenuType {
+	case MenuTypeGeneric9x3:
+		return slot >= ChestMenuSlotCount
+	case MenuTypeGeneric9x6:
+		return slot >= DoubleChestMenuSlotCount
+	case MenuTypeHopper:
+		return slot >= HopperMenuSlotCount
+	case MenuTypeGeneric3x3:
+		return slot >= 45
+	case CrafterMenuType:
+		return slot == CrafterMenuResultSlot || slot >= CrafterMenuSlotCount
+	case MenuTypeCrafting:
+		return slot == 0 || slot >= CraftingMenuSlotCount
+	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
+		if slot == world.FurnaceSlotOutput || slot >= FurnaceMenuSlotCount {
+			return true
+		}
+		if slot == world.FurnaceSlotFuel && !CanPlaceInFurnaceFuelSlot(carried) {
+			return true
+		}
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) handleQuickCraftClickLocked(session *PlayerSession, tr *playerContainerTracker, containerID int32, slot int, button int8) error {
+	oldStatus := tr.dragStatus
+	header := QuickcraftHeader(button)
+	dragType := QuickcraftType(button)
+	gm := session.Snapshot().GameMode
+
+	if oldStatus == 0 {
+		if header == QuickCraftHeaderStart && IsValidQuickcraftType(dragType, gm) && !tr.carried.IsEmpty() {
+			tr.dragStatus = 1
+			tr.dragType = dragType
+			tr.dragSlots = tr.dragSlots[:0]
+		} else {
+			tr.dragStatus = 0
+			tr.dragType = 0
+			tr.dragSlots = nil
+		}
+		tr.mu.Unlock()
+		return nil
+	}
+
+	if header == QuickCraftHeaderContinue {
+		if oldStatus == 1 && dragType == tr.dragType && !tr.carried.IsEmpty() && !isQuickCraftResultOrInvalidSlot(session, tr, containerID, slot, tr.carried) {
+			already := false
+			for _, existing := range tr.dragSlots {
+				if existing == slot {
+					already = true
+					break
+				}
+			}
+			maxStack := MaxStackSizeForBundleWeight(tr.carried.ResolvedID())
+			if !already && (tr.dragType == QuickCraftTypeClone || int32(len(tr.dragSlots)+1) <= tr.carried.Count) && maxStack > 1 {
+				tr.dragSlots = append(tr.dragSlots, slot)
+			} else if !already && len(tr.dragSlots) == 0 && maxStack == 1 {
+				tr.dragSlots = append(tr.dragSlots, slot)
+			}
+		} else if header != QuickCraftHeaderContinue || oldStatus != 1 || dragType != tr.dragType {
+			tr.dragStatus = 0
+			tr.dragType = 0
+			tr.dragSlots = nil
+		}
+		tr.mu.Unlock()
+		return nil
+	}
+
+	if header == QuickCraftHeaderEnd {
+		dragSlots := append([]int(nil), tr.dragSlots...)
+		finalType := tr.dragType
+		tr.dragStatus = 0
+		tr.dragType = 0
+		tr.dragSlots = nil
+
+		if oldStatus != 1 || tr.carried.IsEmpty() || len(dragSlots) == 0 {
+			tr.mu.Unlock()
+			return s.syncOpenContainer(session)
+		}
+		if len(dragSlots) == 1 && finalType != QuickCraftTypeClone {
+			singleSlot := dragSlots[0]
+			tr.mu.Unlock()
+			return s.HandleContainerClick(session, containerID, singleSlot, finalType, ContainerInputPickup)
+		}
+		if finalType == QuickCraftTypeClone && gm != GameModeCreative {
+			tr.mu.Unlock()
+			return s.syncOpenContainer(session)
+		}
+
+		s.applyQuickCraftDistributeLocked(session, tr, containerID, dragSlots, finalType)
+		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		if containerID == 0 {
+			return s.syncPlayerInventoryContainer(session)
+		}
+		return s.syncOpenContainer(session)
+	}
+
+	tr.dragStatus = 0
+	tr.dragType = 0
+	tr.dragSlots = nil
+	tr.mu.Unlock()
+	return nil
+}
+
+func distributeQuickCraftOnSlice(slots []world.ItemStack, carried *world.ItemStack, dragSlots []int, dragType int8, slotMaxStack func(slot int, defaultMax int32) int32) {
+	if carried == nil || carried.IsEmpty() || len(dragSlots) == 0 {
+		return
+	}
+	origCarried := *carried
+	itemID := origCarried.ResolvedItemID()
+	defaultMax := MaxStackSizeForBundleWeight(origCarried.ResolvedID())
+	placePerSlot := QuickCraftPlaceCount(len(dragSlots), dragType, origCarried)
+	if placePerSlot <= 0 {
+		return
+	}
+	remaining := origCarried.Count
+	for _, sl := range dragSlots {
+		if sl < 0 || sl >= len(slots) {
+			continue
+		}
+		cur := slots[sl]
+		if !cur.IsEmpty() && cur.ResolvedItemID() != itemID {
+			continue
+		}
+		maxForSlot := defaultMax
+		if slotMaxStack != nil {
+			maxForSlot = slotMaxStack(sl, defaultMax)
+		}
+		curCount := int32(0)
+		if !cur.IsEmpty() {
+			curCount = cur.Count
+		}
+		if curCount >= maxForSlot {
+			continue
+		}
+		add := placePerSlot
+		if curCount+add > maxForSlot {
+			add = maxForSlot - curCount
+		}
+		if dragType != QuickCraftTypeClone {
+			if add > remaining {
+				add = remaining
+			}
+			remaining -= add
+		}
+		if add > 0 {
+			slots[sl] = world.NewItemStack(itemID, curCount+add)
+		}
+	}
+	if dragType != QuickCraftTypeClone {
+		if remaining <= 0 {
+			*carried = world.ItemStack{}
+		} else {
+			*carried = world.NewItemStack(itemID, remaining)
+		}
+	}
+}
+
+func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *playerContainerTracker, containerID int32, dragSlots []int, dragType int8) {
+	if containerID == 0 {
+		for i := 0; i < 4; i++ {
+			if tr.invCraft[i].IsEmpty() {
+				tr.invCraft[i] = session.InventorySlot(1 + i)
+			}
+		}
+		slots := s.buildPlayerMenuSlots(session, tr.invCraft, tr.invResult)
+		carriedMeta := GetCarriedItemMeta(session)
+		carriedTrim, _ := GetCarriedArmorTrim(session)
+		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, func(sl int, def int32) int32 {
+			if sl >= ArmorSlotHead && sl <= ArmorSlotFeet {
+				return 1
+			}
+			return def
+		})
+		for _, sl := range dragSlots {
+			if sl >= 1 && sl < world.PlayerInventorySlots && !slots[sl].IsEmpty() {
+				SetSlotItemMeta(session, sl, carriedMeta.Clone())
+				if carriedTrim.IsValid() {
+					SetSlotArmorTrim(session, sl, carriedTrim)
+				}
+			}
+		}
+		if tr.carried.IsEmpty() {
+			SetCarriedItemMeta(session, ItemMeta{})
+			SetCarriedArmorTrim(session, ArmorTrim{})
+		}
+		for i := 0; i < 4; i++ {
+			tr.invCraft[i] = slots[1+i]
+		}
+		if res, _, _, ok := matchCraftingWithFireworks(tr.invCraft[:], 2, 2, tr.invCraftStars[:]); ok {
+			tr.invResult = res
+		} else {
+			tr.invResult = world.ItemStack{}
+		}
+		slots[0] = tr.invResult
+		for i := 0; i < world.PlayerInventorySlots; i++ {
+			session.SetInventorySlot(i, slots[i])
+		}
+		return
+	}
+
+	if tr.open == nil || tr.open.ContainerID != containerID {
+		return
+	}
+	switch tr.open.MenuType {
+	case MenuTypeGeneric9x3:
+		if tr.open.VehicleEntityID != 0 {
+			vehID := tr.open.VehicleEntityID
+			slots := s.buildVehicleChestMenuSlots(session, vehID)
+			distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+			for i := 0; i < ChestSlotCount; i++ {
+				s.SetVehicleContainerSlot(vehID, i, slots[i])
+			}
+			for i := 0; i < 27; i++ {
+				session.SetInventorySlot(9+i, slots[27+i])
+			}
+			for i := 0; i < 9; i++ {
+				session.SetInventorySlot(36+i, slots[54+i])
+			}
+			return
+		}
+		if tr.open.IsEnderChest {
+			slots := s.buildEnderChestMenuSlots(session)
+			distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+			for i := 0; i < ChestSlotCount; i++ {
+				tr.enderChest[i] = slots[i]
+			}
+			for i := 0; i < 27; i++ {
+				session.SetInventorySlot(9+i, slots[27+i])
+			}
+			for i := 0; i < 9; i++ {
+				session.SetInventorySlot(36+i, slots[54+i])
+			}
+			return
+		}
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		slots := s.buildChestMenuSlots(session, bx, by, bz)
+		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		for i := 0; i < ChestSlotCount; i++ {
+			s.SetChestSlot(bx, by, bz, i, slots[i])
+		}
+		for i := 0; i < 27; i++ {
+			session.SetInventorySlot(9+i, slots[27+i])
+		}
+		for i := 0; i < 9; i++ {
+			session.SetInventorySlot(36+i, slots[54+i])
+		}
+	case MenuTypeGeneric9x6:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		px, py, pz := tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
+		slots := s.buildDoubleChestMenuSlots(session, bx, by, bz, px, py, pz)
+		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		for i := 0; i < ChestSlotCount; i++ {
+			s.SetChestSlot(bx, by, bz, i, slots[i])
+			s.SetChestSlot(px, py, pz, i, slots[ChestSlotCount+i])
+		}
+		for i := 0; i < 27; i++ {
+			session.SetInventorySlot(9+i, slots[54+i])
+		}
+		for i := 0; i < 9; i++ {
+			session.SetInventorySlot(36+i, slots[81+i])
+		}
+	case MenuTypeCrafting:
+		slots := s.buildCraftingMenuSlots(session, tr.open.Crafting, tr.open.Result)
+		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		for i := 0; i < CraftingGridSlotCount; i++ {
+			tr.open.Crafting[i] = slots[1+i]
+		}
+		if res, _, _, ok := matchCraftingWithFireworks(tr.open.Crafting[:], 3, 3, tr.open.CraftingStars[:]); ok {
+			tr.open.Result = res
+		} else {
+			tr.open.Result = world.ItemStack{}
+		}
+		for i := 0; i < 27; i++ {
+			session.SetInventorySlot(9+i, slots[10+i])
+		}
+		for i := 0; i < 9; i++ {
+			session.SetInventorySlot(36+i, slots[37+i])
+		}
+	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		slots := s.buildFurnaceMenuSlots(session, bx, by, bz)
+		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		for i := 0; i < FurnaceSlotCount; i++ {
+			s.SetFurnaceSlot(bx, by, bz, i, slots[i])
+		}
+		for i := 0; i < 27; i++ {
+			session.SetInventorySlot(9+i, slots[3+i])
+		}
+		for i := 0; i < 9; i++ {
+			session.SetInventorySlot(36+i, slots[30+i])
+		}
+	}
+}
+
+// EncodeSetCursorItemPacket encodes ClientboundSetCursorItemPacket (0x60 in protocol 775):
+// ItemStack.OPTIONAL_STREAM_CODEC.
+func EncodeSetCursorItemPacket(stack world.ItemStack) []byte {
+	w := protocol.NewWriter(16)
+	writeContainerItemStack(w, stack)
+	return w.Bytes()
+}
+
+// DecodeSetCursorItemPacket decodes ClientboundSetCursorItemPacket (0x60 in protocol 775).
+func DecodeSetCursorItemPacket(r *protocol.Reader) (world.ItemStack, error) {
+	return readContainerItemStack(r)
+}
+
+// EncodeSetPlayerInventoryPacket encodes ClientboundSetPlayerInventoryPacket (0x6c in protocol 775):
+// VarInt(slot), ItemStack.OPTIONAL_STREAM_CODEC(contents).
+func EncodeSetPlayerInventoryPacket(slot int32, stack world.ItemStack) []byte {
+	w := protocol.NewWriter(20)
+	w.VarInt(slot)
+	writeContainerItemStack(w, stack)
+	return w.Bytes()
+}
+
+// DecodeSetPlayerInventoryPacket decodes ClientboundSetPlayerInventoryPacket (0x6c in protocol 775).
+func DecodeSetPlayerInventoryPacket(r *protocol.Reader) (int32, world.ItemStack, error) {
+	if r == nil {
+		return 0, world.ItemStack{}, errors.New("server: nil reader")
+	}
+	slot, err := r.VarInt()
+	if err != nil {
+		return 0, world.ItemStack{}, err
+	}
+	st, err := readContainerItemStack(r)
+	if err != nil {
+		return 0, world.ItemStack{}, err
+	}
+	return slot, st, nil
+}
+
+// SendSetCursorItem sends ClientboundSetCursorItemPacket (0x60) for session's carried cursor item.
+func (s *Server) SendSetCursorItem(session *PlayerSession) error {
+	if session == nil || session.send == nil {
+		return nil
+	}
+	return session.send(protocol.PlaySetCursorItem, EncodeSetCursorItemPacket(session.CarriedItem()))
+}
+
+// SendSetPlayerInventorySlot sends ClientboundSetPlayerInventoryPacket (0x6c) for a player inventory slot.
+func (s *Server) SendSetPlayerInventorySlot(session *PlayerSession, slot int32, stack world.ItemStack) error {
+	if session == nil || session.send == nil {
+		return nil
+	}
+	return session.send(protocol.PlaySetPlayerInventory, EncodeSetPlayerInventoryPacket(slot, stack))
+}
+
 
 
 

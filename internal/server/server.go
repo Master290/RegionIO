@@ -1729,6 +1729,16 @@ func (session *PlayerSession) NextContainerStateID() int32 {
 	return session.containerStateID
 }
 
+// ContainerStateID returns the current container state sequence ID without incrementing.
+func (session *PlayerSession) ContainerStateID() int32 {
+	if session == nil {
+		return 0
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.containerStateID
+}
+
 // SetPlayerSpawnPoint records the player's respawn position.
 func (s *Server) SetPlayerSpawnPoint(session *PlayerSession, x, y, z int32, yaw, pitch float32, forced bool) {
 	if session == nil {
@@ -2154,6 +2164,59 @@ func (s *Server) SetSpectatorCamera(session *PlayerSession, targetEntityID int32
 		_ = session.send(protocol.PlaySetCamera, EncodeSetCameraPacket(targetEntityID))
 	}
 	return true
+}
+
+// TickSpectatorCamera synchronizes a Spectator player's position with their
+// attached camera entity, or detaches the camera back to session.EntityID if
+// the target entity is removed, dead, in another dimension, or the player is sneaking
+// (matching ServerPlayer.tick in vanilla 26.1.2).
+func (s *Server) TickSpectatorCamera(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	snap := session.Snapshot()
+	if snap.GameMode != GameModeSpectator {
+		return
+	}
+	camID := session.CameraEntityID()
+	if camID == 0 || camID == session.EntityID {
+		return
+	}
+	if session.IsSneaking() {
+		s.SetSpectatorCamera(session, session.EntityID)
+		return
+	}
+
+	normDim := world.NormalizeDimension(snap.Dimension)
+	var targetX, targetY, targetZ float64
+	var targetYaw, targetPitch float32
+	alive := false
+
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && p.EntityID == camID {
+			ps := p.Snapshot()
+			if !p.IsDead() && world.NormalizeDimension(ps.Dimension) == normDim {
+				targetX, targetY, targetZ = ps.X, ps.Y, ps.Z
+				targetYaw, targetPitch = ps.Yaw, ps.Pitch
+				alive = true
+			}
+			break
+		}
+	}
+	if !alive && s.entities != nil {
+		if ent := s.entities.Get(camID); ent != nil && !ent.IsItem() && !ent.IsExperienceOrb() && ent.EffectiveDimension() == normDim {
+			targetX, targetY, targetZ = ent.X, ent.Y, ent.Z
+			targetYaw, targetPitch = ent.Yaw, ent.Pitch
+			alive = true
+		}
+	}
+	if !alive {
+		s.SetSpectatorCamera(session, session.EntityID)
+		return
+	}
+	if math.Abs(snap.X-targetX) > 1e-4 || math.Abs(snap.Y-targetY) > 1e-4 || math.Abs(snap.Z-targetZ) > 1e-4 {
+		_ = s.TeleportPlayer(session, targetX, targetY, targetZ, targetYaw, targetPitch)
+	}
 }
 
 // HandleTeleportToEntityPacket processes ServerboundTeleportToEntityPacket (0x3d):

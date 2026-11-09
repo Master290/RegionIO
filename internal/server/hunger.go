@@ -256,6 +256,7 @@ type playerHungerState struct {
 	mu                  sync.Mutex
 	exhaustion          float32
 	tickTimer           int32
+	peacefulTick        int32
 	sprinting           bool
 	usingItem           bool
 	usingHand           int32
@@ -703,8 +704,36 @@ func (s *Server) TickPlayerHunger(session *PlayerSession) {
 	st.mu.Lock()
 	exhaustion := st.exhaustion
 	tickTimer := st.tickTimer
+	st.peacefulTick++
+	peacefulTick := st.peacefulTick
 
 	stateChanged := false
+
+	// 0. ServerPlayer.tickRegeneration (vanilla 26.1.2): in Peaceful difficulty with
+	// naturalRegeneration enabled, heal +1.0 HP and +1.0 saturation every 20 ticks,
+	// and restore +1 food level every 10 ticks when food < 20.
+	if diff == DifficultyPeaceful && naturalRegen {
+		if peacefulTick%20 == 0 {
+			if health > 0 && health < world.DefaultPlayerHealth {
+				health += 1.0
+				if health > world.DefaultPlayerHealth {
+					health = world.DefaultPlayerHealth
+				}
+				stateChanged = true
+			}
+			if sat < MaxSaturationLevel {
+				sat += 1.0
+				if sat > MaxSaturationLevel {
+					sat = MaxSaturationLevel
+				}
+				stateChanged = true
+			}
+		}
+		if peacefulTick%10 == 0 && food < MaxFoodLevel {
+			food++
+			stateChanged = true
+		}
+	}
 
 	// 1. Drain exhaustion in 4.0-unit steps (FoodData.tick lines 10..78).
 	for exhaustion > ExhaustionDropThreshold {
@@ -826,6 +855,7 @@ func (s *Server) TickAllPlayersHunger() {
 	for _, p := range players {
 		s.tickPlayerCombatCooldown(p)
 		s.TickPlayerHunger(p)
+		s.TickSpectatorCamera(p)
 	}
 	s.TickAllEntityEffects()
 	s.TickLingeringClouds()

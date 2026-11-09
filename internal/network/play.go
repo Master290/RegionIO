@@ -1527,7 +1527,7 @@ func (h *handler) handleContainerClick(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
-		if err := h.srv.HandleContainerClick(h.session, click.ContainerID, int(click.Slot), click.Button, click.Mode); err != nil {
+		if err := h.srv.HandleContainerClickWithState(h.session, click.ContainerID, click.StateID, int(click.Slot), click.Button, click.Mode); err != nil {
 			return err
 		}
 		h.syncHotbarFromSession()

@@ -195,6 +195,32 @@ var vanillaArmor = map[string]ArmorStats{
 	"minecraft:turtle_helmet": {Defense: 2, Toughness: 0, Slot: ArmorSlotHead},
 }
 
+// IsSwordItem reports whether itemName is one of the 7 vanilla 26.1.2 swords
+// eligible for sweep attacks (`#minecraft:swords`).
+func IsSwordItem(itemName string) bool {
+	switch normalizeFoodItemID(itemName) {
+	case "minecraft:wooden_sword",
+		"minecraft:golden_sword",
+		"minecraft:stone_sword",
+		"minecraft:copper_sword",
+		"minecraft:iron_sword",
+		"minecraft:diamond_sword",
+		"minecraft:netherite_sword":
+		return true
+	default:
+		return false
+	}
+}
+
+// SweepingDamageRatio returns the vanilla Sweeping Edge damage ratio:
+// level / (level + 1) for level > 0, or 0 for level <= 0.
+func SweepingDamageRatio(level int32) float32 {
+	if level <= 0 {
+		return 0
+	}
+	return float32(level) / float32(level+1)
+}
+
 // ItemAttackStats returns the total main-hand attack damage and attack speed for
 // itemName (defaults to 1.0 damage and 4.0 attack speed for unarmed/non-weapons).
 func ItemAttackStats(itemName string) (damage, attackSpeed float32) {
@@ -1352,7 +1378,72 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 	}
 
+	isSweep := isStrong && !isCrit && !isSprinting && snap.OnGround && IsSwordItem(heldStack.ResolvedID())
+	var sweepCandidateIDs []int32
+	if isSweep {
+		targetDim := target.EffectiveDimension()
+		for _, ent := range s.entities.All() {
+			if ent.ID == target.ID || ent.ID == snap.EntityID || ent.IsItem() || ent.IsExperienceOrb() {
+				continue
+			}
+			if IsDecorationEntity(ent.TypeName) || IsVehicleEntity(ent.TypeName) {
+				continue
+			}
+			if ent.TypeName == EntityTypeArmorStand {
+				if as, ok := s.ArmorStandState(ent.ID); ok && as.IsMarker() {
+					continue
+				}
+			}
+			if ent.EffectiveDimension() != targetDim {
+				continue
+			}
+			if math.Abs(ent.X-target.X) <= 1.5 && math.Abs(ent.Z-target.Z) <= 1.5 && math.Abs(ent.Y-target.Y) <= 1.0 {
+				ddx := ent.X - snap.X
+				ddy := ent.Y - snap.Y
+				ddz := ent.Z - snap.Z
+				if ddx*ddx+ddy*ddy+ddz*ddz < 9.0 {
+					sweepCandidateIDs = append(sweepCandidateIDs, ent.ID)
+				}
+			}
+		}
+	}
+
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
+
+	if isSweep {
+		var sweepLevel int32
+		if heldSlot >= 0 {
+			sweepLevel = int32(GetSlotItemMeta(session, heldSlot).EnchantmentLevel(EnchantSweepingEdge))
+		}
+		sweepDamage := float32(1.0) + SweepingDamageRatio(sweepLevel)*baseDamage
+		yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
+		px := snap.X - math.Sin(yawRad)
+		py := snap.Y + 0.9
+		pz := snap.Z + math.Cos(yawRad)
+		chunkPos := target.ChunkPos()
+		s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, PlaySoundPacketID,
+			EncodeSoundPacket("minecraft:entity.player.attack.sweep", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+		s.BroadcastDimensionChunk(target.EffectiveDimension(), chunkPos.X, chunkPos.Z, PlayLevelParticlesCB,
+			EncodeGenericParticlePacket("minecraft:sweep_attack", px, py, pz, 0, 0, 0, 0, 0, false))
+		for _, sweepID := range sweepCandidateIDs {
+			sweepEnt := s.entities.Get(sweepID)
+			if sweepEnt == nil {
+				continue
+			}
+			sweepKilled := s.applyDamageToMob(sweepEnt, sweepDamage, session, BaseKnockbackStrength, false, false)
+			s.RecordPlayerDamageDealt(session, sweepDamage)
+			if sweepKilled {
+				s.RecordEntityKilled(session, sweepEnt.TypeName)
+				s.TriggerEntityKilled(session, sweepEnt.TypeName)
+				if s.DoMobLoot() {
+					if xp := mobKillXPPoints(sweepEnt.TypeName); xp > 0 {
+						s.SpawnExperienceOrbsInDimension(sweepEnt.EffectiveDimension(), sweepEnt.X, sweepEnt.Y+0.25, sweepEnt.Z, xp)
+					}
+				}
+			}
+		}
+	}
+
 	return damage, killed
 }
 
