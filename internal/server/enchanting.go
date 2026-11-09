@@ -450,8 +450,11 @@ type sessionItemMetaTracker struct {
 	invMeta      [world.PlayerInventorySlots]ItemMeta
 	carriedMeta  ItemMeta
 	enchantMeta  [2]ItemMeta
+	enchantTrim  [2]ArmorTrim
 	combinerMeta [2]ItemMeta
+	combinerTrim [2]ArmorTrim
 	resultMeta   ItemMeta
+	resultTrim   ArmorTrim
 }
 
 var playerItemMetas sync.Map // map[*PlayerSession]*sessionItemMetaTracker
@@ -490,6 +493,11 @@ func SetSlotItemMeta(session *PlayerSession, slot int, meta ItemMeta) {
 	tr.mu.Lock()
 	tr.invMeta[slot] = meta.Clone()
 	tr.mu.Unlock()
+}
+
+// ClearSlotItemMeta removes any ItemMeta associated with player inventory slot (0..45).
+func ClearSlotItemMeta(session *PlayerSession, slot int) {
+	SetSlotItemMeta(session, slot, ItemMeta{})
 }
 
 // GetCarriedItemMeta returns the ItemMeta for the item on the player's cursor.
@@ -1312,9 +1320,9 @@ func (s *Server) OpenEnchantingTable(session *PlayerSession, x, y, z int) (int32
 	metaTr := getItemMetaTracker(session)
 	metaTr.mu.Lock()
 	metaTr.enchantMeta = [2]ItemMeta{}
+	metaTr.enchantTrim = [2]ArmorTrim{}
 	metaTr.mu.Unlock()
 
-	seed := session.EnchantmentSeed()
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
@@ -1329,19 +1337,13 @@ func (s *Server) OpenEnchantingTable(session *PlayerSession, x, y, z int) (int32
 		LevelClues:   [3]int16{-1, -1, -1},
 	}
 	tr.open = open
-	carried := tr.carried
 	tr.mu.Unlock()
 
 	if session.send != nil {
 		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeEnchantment, "Enchant")); err != nil {
 			return cid, err
 		}
-		slots := s.buildEnchantingMenuSlots(session, [2]world.ItemStack{})
-		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
-			return cid, err
-		}
-		if err := s.sendEnchantingDataProperties(session, cid, [3]int16{}, int16(seed), [3]int16{-1, -1, -1}, [3]int16{-1, -1, -1}); err != nil {
+		if err := s.syncOpenContainer(session); err != nil {
 			return cid, err
 		}
 	}
@@ -1413,27 +1415,34 @@ func (s *Server) applyEnchantingTableClickLocked(session *PlayerSession, tr *pla
 	}
 	slots := s.buildEnchantingMenuSlots(session, tr.open.EnchantSlots)
 	metas := buildEnchantingMenuMetas(session)
+	trims := buildEnchantingMenuTrims(session)
 
 	switch mode {
 	case ContainerInputPickup:
 		carriedMeta := GetCarriedItemMeta(session)
-		slots[slot], metas[slot], tr.carried, carriedMeta = applyPickupSlotWithMeta(slots[slot], metas[slot], tr.carried, carriedMeta, button)
+		carriedTrim, _ := GetCarriedArmorTrim(session)
+		slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim = applyPickupSlotWithMetaAndTrim(
+			slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim, button,
+		)
 		SetCarriedItemMeta(session, carriedMeta)
+		SetCarriedArmorTrim(session, carriedTrim)
 	case ContainerInputQuickMove:
 		if slot < EnchantingInputSlotCount {
-			slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 29, 38)
-			slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 2, 29)
+			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 29, 38)
+			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 2, 29)
 		} else {
 			st := slots[slot]
 			if st.ResolvedID() == "minecraft:lapis_lazuli" {
-				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, st, metas[slot], 1, 2)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, st, metas[slot], trims[slot], 1, 2)
 			} else if slots[0].IsEmpty() && st.Count >= 1 {
 				one := world.NewItemStack(st.ResolvedItemID(), 1)
 				slots[0] = one
 				metas[0] = metas[slot].Clone()
+				trims[0] = trims[slot]
 				if st.Count <= 1 {
 					slots[slot] = world.ItemStack{}
 					metas[slot] = ItemMeta{}
+					trims[slot] = ArmorTrim{}
 				} else {
 					slots[slot] = world.NewItemStack(st.ResolvedItemID(), st.Count-1)
 				}
@@ -1444,12 +1453,14 @@ func (s *Server) applyEnchantingTableClickLocked(session *PlayerSession, tr *pla
 			hotbarIdx := 29 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 			metas[slot], metas[hotbarIdx] = metas[hotbarIdx], metas[slot]
+			trims[slot], trims[hotbarIdx] = trims[hotbarIdx], trims[slot]
 		}
 	}
 
 	tr.open.EnchantSlots[0] = slots[0]
 	tr.open.EnchantSlots[1] = slots[1]
 	writeBackEnchantingMenuMetas(session, slots, metas)
+	writeBackEnchantingMenuTrims(session, slots, trims)
 	s.recomputeEnchantingOffersLocked(session, tr)
 }
 
@@ -1467,6 +1478,26 @@ func buildEnchantingMenuMetas(session *PlayerSession) []ItemMeta {
 	}
 	metaTr.mu.Unlock()
 	return metas
+}
+
+func buildEnchantingMenuTrims(session *PlayerSession) []ArmorTrim {
+	trims := make([]ArmorTrim, EnchantingMenuSlotCount)
+	metaTr := getItemMetaTracker(session)
+	metaTr.mu.Lock()
+	trims[0] = metaTr.enchantTrim[0]
+	trims[1] = metaTr.enchantTrim[1]
+	metaTr.mu.Unlock()
+	for i := 0; i < 27; i++ {
+		if t, ok := GetSlotArmorTrim(session, 9+i); ok {
+			trims[2+i] = t
+		}
+	}
+	for i := 0; i < 9; i++ {
+		if t, ok := GetSlotArmorTrim(session, 36+i); ok {
+			trims[29+i] = t
+		}
+	}
+	return trims
 }
 
 func writeBackEnchantingMenuMetas(session *PlayerSession, slots []world.ItemStack, metas []ItemMeta) {
@@ -1500,6 +1531,33 @@ func writeBackEnchantingMenuMetas(session *PlayerSession, slots []world.ItemStac
 		}
 	}
 	metaTr.mu.Unlock()
+}
+
+func writeBackEnchantingMenuTrims(session *PlayerSession, slots []world.ItemStack, trims []ArmorTrim) {
+	metaTr := getItemMetaTracker(session)
+	metaTr.mu.Lock()
+	for i := 0; i < 2; i++ {
+		if slots[i].IsEmpty() {
+			metaTr.enchantTrim[i] = ArmorTrim{}
+		} else {
+			metaTr.enchantTrim[i] = trims[i]
+		}
+	}
+	metaTr.mu.Unlock()
+	for i := 0; i < 27; i++ {
+		if slots[2+i].IsEmpty() {
+			ClearSlotArmorTrim(session, 9+i)
+		} else {
+			SetSlotArmorTrim(session, 9+i, trims[2+i])
+		}
+	}
+	for i := 0; i < 9; i++ {
+		if slots[29+i].IsEmpty() {
+			ClearSlotArmorTrim(session, 36+i)
+		} else {
+			SetSlotArmorTrim(session, 36+i, trims[29+i])
+		}
+	}
 }
 
 // DecodeContainerButtonClickPacket parses a protocol 775 serverbound
@@ -1616,14 +1674,30 @@ func applyPickupSlotWithMeta(
 	carriedMeta ItemMeta,
 	button int8,
 ) (newSlot world.ItemStack, newSlotMeta ItemMeta, newCarried world.ItemStack, newCarriedMeta ItemMeta) {
+	newSlot, newSlotMeta, _, newCarried, newCarriedMeta, _ = applyPickupSlotWithMetaAndTrim(
+		slotStack, slotMeta, ArmorTrim{}, carried, carriedMeta, ArmorTrim{}, button,
+	)
+	return newSlot, newSlotMeta, newCarried, newCarriedMeta
+}
+
+func applyPickupSlotWithMetaAndTrim(
+	slotStack world.ItemStack,
+	slotMeta ItemMeta,
+	slotTrim ArmorTrim,
+	carried world.ItemStack,
+	carriedMeta ItemMeta,
+	carriedTrim ArmorTrim,
+	button int8,
+) (newSlot world.ItemStack, newSlotMeta ItemMeta, newSlotTrim ArmorTrim, newCarried world.ItemStack, newCarriedMeta ItemMeta, newCarriedTrim ArmorTrim) {
 	if !slotStack.IsEmpty() && !carried.IsEmpty() &&
 		slotStack.ResolvedItemID() == carried.ResolvedItemID() &&
-		(!slotMeta.IsEmpty() || !carriedMeta.IsEmpty()) {
-		// Items with distinct non-empty metadata cannot stack together; swap them on left-click.
+		(!slotMeta.IsEmpty() || !carriedMeta.IsEmpty() || slotTrim.IsValid() || carriedTrim.IsValid() ||
+			MaxItemDurability(slotStack.ResolvedID()) > 0 || slotStack.ResolvedID() == "minecraft:enchanted_book") {
+		// Items with distinct non-empty metadata/trim or non-stackable items cannot stack together; swap them on left-click.
 		if button == 0 {
-			return carried, carriedMeta.Clone(), slotStack, slotMeta.Clone()
+			return carried, carriedMeta.Clone(), carriedTrim, slotStack, slotMeta.Clone(), slotTrim
 		}
-		return slotStack, slotMeta, carried, carriedMeta
+		return slotStack, slotMeta, slotTrim, carried, carriedMeta, carriedTrim
 	}
 
 	newSlot, newCarried = applyPickupSlot(slotStack, carried, button)
@@ -1631,29 +1705,37 @@ func applyPickupSlotWithMeta(
 	case slotStack.IsEmpty() && !carried.IsEmpty():
 		if !newSlot.IsEmpty() {
 			newSlotMeta = carriedMeta.Clone()
+			newSlotTrim = carriedTrim
 		}
 		if !newCarried.IsEmpty() {
 			newCarriedMeta = carriedMeta.Clone()
+			newCarriedTrim = carriedTrim
 		}
 	case !slotStack.IsEmpty() && carried.IsEmpty():
 		if !newSlot.IsEmpty() {
 			newSlotMeta = slotMeta.Clone()
+			newSlotTrim = slotTrim
 		}
 		if !newCarried.IsEmpty() {
 			newCarriedMeta = slotMeta.Clone()
+			newCarriedTrim = slotTrim
 		}
 	case !slotStack.IsEmpty() && !carried.IsEmpty() && slotStack.ResolvedItemID() != carried.ResolvedItemID():
 		newSlotMeta = carriedMeta.Clone()
+		newSlotTrim = carriedTrim
 		newCarriedMeta = slotMeta.Clone()
+		newCarriedTrim = slotTrim
 	default:
 		if !newSlot.IsEmpty() {
 			newSlotMeta = slotMeta.Clone()
+			newSlotTrim = slotTrim
 		}
 		if !newCarried.IsEmpty() {
 			newCarriedMeta = carriedMeta.Clone()
+			newCarriedTrim = carriedTrim
 		}
 	}
-	return newSlot, newSlotMeta, newCarried, newCarriedMeta
+	return newSlot, newSlotMeta, newSlotTrim, newCarried, newCarriedMeta, newCarriedTrim
 }
 
 func mergeIntoSlotSliceWithMeta(
@@ -1663,12 +1745,26 @@ func mergeIntoSlotSliceWithMeta(
 	meta ItemMeta,
 	start, end int,
 ) (world.ItemStack, ItemMeta) {
+	trims := make([]ArmorTrim, len(slots))
+	rem, remMeta, _ := mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, stack, meta, ArmorTrim{}, start, end)
+	return rem, remMeta
+}
+
+func mergeIntoSlotSliceWithMetaAndTrim(
+	slots []world.ItemStack,
+	metas []ItemMeta,
+	trims []ArmorTrim,
+	stack world.ItemStack,
+	meta ItemMeta,
+	trim ArmorTrim,
+	start, end int,
+) (world.ItemStack, ItemMeta, ArmorTrim) {
 	if stack.IsEmpty() || start >= end {
-		return stack, meta
+		return stack, meta, trim
 	}
 	itemID := stack.ResolvedItemID()
 	maxStack := MaxItemStackSize
-	if MaxItemDurability(stack.ResolvedID()) > 0 || !meta.IsEmpty() || stack.ResolvedID() == "minecraft:enchanted_book" {
+	if MaxItemDurability(stack.ResolvedID()) > 0 || !meta.IsEmpty() || trim.IsValid() || stack.ResolvedID() == "minecraft:enchanted_book" {
 		maxStack = 1
 	}
 	remaining := stack.Count
@@ -1676,7 +1772,7 @@ func mergeIntoSlotSliceWithMeta(
 	if maxStack > 1 {
 		for i := start; i < end && remaining > 0; i++ {
 			cur := slots[i]
-			if cur.IsEmpty() || cur.ResolvedItemID() != itemID || !metas[i].IsEmpty() || cur.Count >= maxStack {
+			if cur.IsEmpty() || cur.ResolvedItemID() != itemID || !metas[i].IsEmpty() || (i < len(trims) && trims[i].IsValid()) || cur.Count >= maxStack {
 				continue
 			}
 			space := maxStack - cur.Count
@@ -1698,10 +1794,13 @@ func mergeIntoSlotSliceWithMeta(
 		}
 		slots[i] = world.NewItemStack(itemID, take)
 		metas[i] = meta.Clone()
+		if i < len(trims) {
+			trims[i] = trim
+		}
 		remaining -= take
 	}
 	if remaining <= 0 {
-		return world.ItemStack{}, ItemMeta{}
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}
 	}
-	return world.NewItemStack(itemID, remaining), meta
+	return world.NewItemStack(itemID, remaining), meta, trim
 }

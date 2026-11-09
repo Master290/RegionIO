@@ -1359,6 +1359,8 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 		return c.ToggleTrapdoor(x, y, z)
 	case strings.HasSuffix(info.Name, "_door"):
 		return c.ToggleDoor(x, y, z)
+	case info.Name == "minecraft:moving_piston":
+		return c.InteractMovingPistonBlockAt(x, y, z)
 	default:
 		return false, BlockUpdateResult{}
 	}

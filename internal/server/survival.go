@@ -425,6 +425,10 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			}
 			return false, 0
 		}
+		if status == PlayerActionStartDestroyBlock && world.IsDragonEggBlock(prevState) {
+			s.TeleportDragonEggBlock(dim, x, y, z, nil)
+			return false, 0
+		}
 		if status != PlayerActionStopDestroyBlock &&
 			!(status == PlayerActionStartDestroyBlock && world.IsInstantBreakBlock(prevState)) {
 			return false, 0

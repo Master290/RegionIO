@@ -334,3 +334,203 @@ func TestPistonQuasiConnectivityOverheadWireAndWaterloggedStripAndFragileDestroy
 		t.Fatalf("expected piston_head at (81,y,80) after destroying skull, got %s", stateLabel(c.GetBlock(81, y, 80)))
 	}
 }
+
+func TestMovingPistonBlockAndPistonMovingBlockEntityLifecycleAndNBT(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 2
+
+	// 1. Verify all 12 states of `minecraft:moving_piston` (6 facings x 2 types: normal/sticky).
+	facings := []string{"down", "up", "north", "south", "west", "east"}
+	seenStates := make(map[uint16]bool)
+	for _, f := range facings {
+		for _, sticky := range []bool{false, true} {
+			st := MovingPistonBlockState(f, sticky)
+			if st == StateAir || !IsMovingPistonBlock(st) {
+				t.Fatalf("MovingPistonBlockState(%q, %v) = %d (%s), want valid moving_piston state", f, sticky, st, stateLabel(st))
+			}
+			if canPistonPushBlock(st) {
+				t.Fatalf("moving_piston state %s should not be pushable by another piston", stateLabel(st))
+			}
+			seenStates[st] = true
+		}
+	}
+	if len(seenStates) != 12 {
+		t.Fatalf("distinct minecraft:moving_piston states = %d, want 12", len(seenStates))
+	}
+
+	// 2. PistonMovingBlockEntity NBT round-trip (`id: "minecraft:piston"`, `blockState`, `facing`, `progress`, `extending`, `source`).
+	waterloggedSlab := mustRedstoneState(t, "minecraft:oak_slab", map[string]string{
+		"type":        "bottom",
+		"waterlogged": "true",
+	})
+	be := NewPistonMovingBlockEntity(10, y, 10, waterloggedSlab, "east", true, false)
+	be.Progress = 0.5
+	be.ProgressO = 0.5
+	nbtComp := be.ToNBT()
+	if _, ok := nbtComp.Get("id"); !ok {
+		t.Fatal("missing id tag in PistonMovingBlockEntity.ToNBT()")
+	}
+	decoded, err := PistonMovingBlockEntityFromNBT(nbtComp)
+	if err != nil {
+		t.Fatalf("PistonMovingBlockEntityFromNBT: %v", err)
+	}
+	if decoded.X != 10 || decoded.Y != y || decoded.Z != 10 ||
+		decoded.MovedState != waterloggedSlab || decoded.Facing != "east" ||
+		!decoded.Extending || decoded.IsSourcePiston || decoded.Progress != 0.5 {
+		t.Fatalf("decoded PistonMovingBlockEntity mismatch: got %+v, want %+v", *decoded, be)
+	}
+	if dir := decoded.MovementDirection(); dir != "east" {
+		t.Fatalf("MovementDirection (extending east) = %q, want east", dir)
+	}
+	retractBE := NewPistonMovingBlockEntity(10, y, 10, StateStone, "east", false, false)
+	if dir := retractBE.MovementDirection(); dir != "west" {
+		t.Fatalf("MovementDirection (retracting east) = %q, want west", dir)
+	}
+
+	// 3. 2-tick progression (`0.0 -> 0.5 -> 1.0 -> finalize`) on `Cache`:
+	//    waterlogged oak_slab strips `waterlogged=false` when finalized!
+	stepBE := NewPistonMovingBlockEntity(15, y, 15, waterloggedSlab, "south", true, false)
+	c.SetPistonMovingBlockEntity(stepBE)
+	if !IsMovingPistonBlock(c.GetBlock(15, y, 15)) {
+		t.Fatalf("expected moving_piston at (15,y,15), got %s", stateLabel(c.GetBlock(15, y, 15)))
+	}
+	if sbe, ok := c.BlockEntityAt(15, y, 15); !ok || sbe.ID != PistonBlockEntityID {
+		t.Fatalf("expected chunk StructureBlockEntity %q at (15,y,15), got (%+v, %v)", PistonBlockEntityID, sbe, ok)
+	}
+	if moved, ok := c.MovingPistonMovedStateAt(15, y, 15); !ok || moved != waterloggedSlab {
+		t.Fatalf("MovingPistonMovedStateAt = (%s, %v), want oak_slab[waterlogged=true]", stateLabel(moved), ok)
+	}
+
+	// Tick 1: progress advances 0.0 -> 0.5, not yet finalized.
+	if fin, _ := c.StepPistonMovingBlockEntityAt(15, y, 15); fin {
+		t.Fatal("StepPistonMovingBlockEntityAt tick 1 should not finalize (progress 0.0 -> 0.5)")
+	}
+	curBE, ok := c.GetPistonMovingBlockEntityAt(15, y, 15)
+	if !ok || curBE.Progress != 0.5 || curBE.ProgressO != 0.0 {
+		t.Fatalf("after tick 1: PistonMovingBlockEntity = %+v, want Progress=0.5, ProgressO=0.0", curBE)
+	}
+
+	// Tick 2: progress advances 0.5 -> 1.0, not yet finalized until progressO >= 1.0.
+	if fin, _ := c.StepPistonMovingBlockEntityAt(15, y, 15); fin {
+		t.Fatal("StepPistonMovingBlockEntityAt tick 2 should advance progress to 1.0")
+	}
+	curBE, ok = c.GetPistonMovingBlockEntityAt(15, y, 15)
+	if !ok || curBE.Progress != 1.0 || curBE.ProgressO != 0.5 {
+		t.Fatalf("after tick 2: PistonMovingBlockEntity = %+v, want Progress=1.0, ProgressO=0.5", curBE)
+	}
+
+	// Finalization tick (progressO == 1.0): replaces moving_piston with oak_slab[waterlogged=false] and removes block entity!
+	if fin, _ := c.StepPistonMovingBlockEntityAt(15, y, 15); !fin {
+		t.Fatal("StepPistonMovingBlockEntityAt when progress==1.0 should finalize")
+	}
+	finalPlaced := c.GetBlock(15, y, 15)
+	if !isBlockNamed(finalPlaced, "minecraft:oak_slab") || !hasProp(finalPlaced, "waterlogged", "false") {
+		t.Fatalf("finalized block at (15,y,15) = %s, want oak_slab[waterlogged=false]", stateLabel(finalPlaced))
+	}
+	if _, exists := c.GetPistonMovingBlockEntityAt(15, y, 15); exists {
+		t.Fatal("expected PistonMovingBlockEntity to be removed after finalization")
+	}
+
+	// 4. FinalTickPistonMovingBlockEntityAt immediately finalizes a source sticky piston head:
+	stickyHead := mustRedstoneState(t, "minecraft:piston_head", map[string]string{
+		"facing": "north",
+		"short":  "false",
+		"type":   "sticky",
+	})
+	srcBE := NewPistonMovingBlockEntity(18, y, 18, stickyHead, "north", true, true)
+	c.SetPistonMovingBlockEntity(srcBE)
+	c.FinalTickPistonMovingBlockEntityAt(18, y, 18)
+	if got := c.GetBlock(18, y, 18); got != stickyHead {
+		t.Fatalf("FinalTickPistonMovingBlockEntityAt source extending = %s, want %s", stateLabel(got), stateLabel(stickyHead))
+	}
+
+	// 5. Breaking `minecraft:moving_piston` also removes its adjacent extended `PistonBaseBlock`
+	//    at `pos.relative(facing.getOpposite())` (MovingPistonBlock.destroy):
+	extPistonEast := mustRedstoneState(t, "minecraft:sticky_piston", map[string]string{
+		"facing":   "east",
+		"extended": "true",
+	})
+	c.SetBlock(20, y, 20, extPistonEast)
+	c.SetPistonMovingBlockEntity(NewPistonMovingBlockEntity(21, y, 20, stickyHead, "east", true, true))
+	c.BreakBlockWithUpdates(21, y, 20)
+	if got := c.GetBlock(21, y, 20); got != StateAir {
+		t.Fatalf("broken moving_piston cell (21,y,20) = %s, want air", stateLabel(got))
+	}
+	if got := c.GetBlock(20, y, 20); got != StateAir {
+		t.Fatalf("extended piston base at (20,y,20) should be destroyed when moving_piston at (21,y,20) breaks, got %s", stateLabel(got))
+	}
+
+	// 6. Right-clicking an orphan `minecraft:moving_piston` (without a PistonMovingBlockEntity)
+	//    via InteractRedstoneBlock removes it (MovingPistonBlock.useWithoutItem):
+	c.SetBlock(25, y, 25, MovingPistonBlockState("up", false))
+	consumed, _ := c.InteractRedstoneBlock(25, y, 25)
+	if !consumed || c.GetBlock(25, y, 25) != StateAir {
+		t.Fatalf("InteractRedstoneBlock on orphan moving_piston = (consumed=%v, block=%s), want (true, air)", consumed, stateLabel(c.GetBlock(25, y, 25)))
+	}
+}
+
+func TestImmovableBlocksAndFallingBlocksAnvilAndDragonEgg(t *testing.T) {
+	c := NewCache(-1, GenerateFlat)
+	y := FlatSurfaceY + 2
+
+	pistonEast := mustRedstoneState(t, "minecraft:piston", map[string]string{
+		"facing":   "east",
+		"extended": "false",
+	})
+	lever := mustRedstoneState(t, "minecraft:lever", map[string]string{
+		"face":    "wall",
+		"facing":  "north",
+		"powered": "false",
+	})
+
+	// 1. Immovable blocks in vanilla 26.1.2 cannot be pushed by pistons:
+	immovableNames := []string{
+		"minecraft:obsidian",
+		"minecraft:crying_obsidian",
+		"minecraft:respawn_anchor",
+		"minecraft:reinforced_deepslate",
+		"minecraft:bedrock",
+		"minecraft:end_portal_frame",
+		"minecraft:enchanting_table",
+		"minecraft:chest",
+		"minecraft:furnace",
+		"minecraft:dispenser",
+		"minecraft:dropper",
+		"minecraft:hopper",
+	}
+	for i, bName := range immovableNames {
+		bx := 100 + i*4
+		st, ok := BlockStateByName(bName, nil)
+		if !ok {
+			t.Fatalf("missing block state for %s", bName)
+		}
+		if canPistonPushBlock(st) {
+			t.Fatalf("canPistonPushBlock(%s) = true, want false", bName)
+		}
+		c.ApplyBlockWithUpdates(bx, y, 10, pistonEast)
+		c.SetBlock(bx+1, y, 10, st)
+		c.ApplyBlockWithUpdates(bx, y, 9, lever)
+		c.ToggleLever(bx, y, 9)
+		c.StepBlockUpdates(PistonTickDelay)
+		if hasProp(c.GetBlock(bx, y, 10), "extended", "true") {
+			t.Fatalf("piston should NOT extend into immovable block %s", bName)
+		}
+	}
+
+	// 2. Falling blocks: sand, red_sand, gravel, anvil, dragon_egg all fall through air onto solid ground,
+	//    and anvil degrades after sufficient fall distance!
+	fallGroundY := FlatSurfaceY
+	dragonEgg, ok := BlockStateByName("minecraft:dragon_egg", nil)
+	if !ok || !IsFallingBlock(dragonEgg) || !IsDragonEggBlock(dragonEgg) {
+		t.Fatalf("dragon_egg state = (%d, %v), IsFalling=%v, IsDragonEgg=%v", dragonEgg, ok, IsFallingBlock(dragonEgg), IsDragonEggBlock(dragonEgg))
+	}
+	c.ApplyBlockWithUpdates(120, fallGroundY+5, 40, dragonEgg)
+	c.FlushBlockUpdates(20)
+	if got := c.GetBlock(120, fallGroundY+1, 40); got != dragonEgg {
+		t.Fatalf("dragon_egg after falling from y+5 = %s at y+1, want dragon_egg", stateLabel(got))
+	}
+	if got := c.GetBlock(120, fallGroundY+5, 40); got != StateAir {
+		t.Fatalf("old dragon_egg pos y+5 = %s, want air", stateLabel(got))
+	}
+}
+

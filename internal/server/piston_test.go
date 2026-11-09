@@ -283,3 +283,56 @@ func TestServerHoneyTopEntityDragPressurePlateEntityFilterAndButtonProjectile(t 
 		t.Fatal("oak_button should activate when hit by arrow")
 	}
 }
+
+func TestDragonEggInteractAndSurvivalAttackTeleport(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	y := world.FlatSurfaceY + 1
+
+	eggState, ok := world.BlockStateByName("minecraft:dragon_egg", nil)
+	if !ok {
+		t.Fatal("missing minecraft:dragon_egg state")
+	}
+	cache.SetBlock(10, y, 10, eggState)
+
+	player, _ := addDispenserTestPlayer(t, srv, "EggClicker")
+	srv.SetPlayerTransform(player, 10.5, float64(y), 10.5, 0, 0, true)
+
+	// 1. Right-clicking (InteractBlock) on `minecraft:dragon_egg` teleports it to a nearby air block!
+	opened, _, err := srv.InteractBlock(player, 10, y, 10)
+	if err != nil || !opened {
+		t.Fatalf("InteractBlock on dragon_egg = (opened=%v, err=%v), want (true, nil)", opened, err)
+	}
+	if cache.GetBlock(10, y, 10) != world.StateAir {
+		t.Fatal("expected dragon_egg at (10,y,10) to teleport away on right-click")
+	}
+
+	// Find where it teleported, then test Survival left-click (PlayerActionStartDestroyBlock):
+	var foundPos world.BlockPos
+	found := false
+	for dx := -15; dx <= 15 && !found; dx++ {
+		for dy := -7; dy <= 7 && !found; dy++ {
+			for dz := -15; dz <= 15 && !found; dz++ {
+				if world.IsDragonEggBlock(cache.GetBlock(10+dx, y+dy, 10+dz)) {
+					foundPos = world.BlockPos{X: 10 + dx, Y: y + dy, Z: 10 + dz}
+					found = true
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected to find teleported dragon_egg within +-15/+-7")
+	}
+
+	// 2. Left-clicking (starting to mine) `minecraft:dragon_egg` in Survival teleports it instead of breaking it!
+	srv.BreakBlock(player, foundPos.X, foundPos.Y, foundPos.Z, PlayerActionStartDestroyBlock)
+	if cache.GetBlock(foundPos.X, foundPos.Y, foundPos.Z) != world.StateAir {
+		t.Fatalf("expected dragon_egg at %+v to teleport away on survival PlayerActionStartDestroyBlock", foundPos)
+	}
+}
+

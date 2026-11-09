@@ -758,7 +758,10 @@ func (c *Cache) propagateMultiBlockPartnerBreak(x, y, z int, brokenState uint16,
 				hx, hy, hz := x+dx, y+dy, z+dz
 				if hy >= MinY && hy < MinY+WorldHeight {
 					hState := c.GetBlock(hx, hy, hz)
-					if hInfo, ok := stateByID(hState); ok && hInfo.Name == "minecraft:piston_head" && hInfo.Properties["facing"] == info.Properties["facing"] {
+					if hInfo, ok := stateByID(hState); ok &&
+						(hInfo.Name == "minecraft:piston_head" || hInfo.Name == "minecraft:moving_piston") &&
+						hInfo.Properties["facing"] == info.Properties["facing"] {
+						c.RemovePistonMovingBlockEntityAt(hx, hy, hz)
 						if c.setBlockRecorded(hx, hy, hz, StateAir, res) {
 							c.scheduleAround(hx, hy, hz)
 						}
@@ -767,15 +770,19 @@ func (c *Cache) propagateMultiBlockPartnerBreak(x, y, z int, brokenState uint16,
 			}
 		}
 		return
-	case "minecraft:piston_head":
+	case "minecraft:piston_head", "minecraft:moving_piston":
+		if info.Name == "minecraft:moving_piston" {
+			c.RemovePistonMovingBlockEntityAt(x, y, z)
+		}
 		if dx, dy, dz, ok := directionOffset3D(info.Properties["facing"]); ok {
 			bx, by, bz := x-dx, y-dy, z-dz
 			if by >= MinY && by < MinY+WorldHeight {
 				bState := c.GetBlock(bx, by, bz)
 				if bInfo, ok := stateByID(bState); ok &&
 					(bInfo.Name == "minecraft:piston" || bInfo.Name == "minecraft:sticky_piston") &&
-					bInfo.Properties["facing"] == info.Properties["facing"] &&
+					(info.Name == "minecraft:moving_piston" || bInfo.Properties["facing"] == info.Properties["facing"]) &&
 					bInfo.Properties["extended"] == "true" {
+					c.ClearPistonRuntimeAt(bx, by, bz)
 					if c.setBlockRecorded(bx, by, bz, StateAir, res) {
 						c.scheduleAround(bx, by, bz)
 					}
@@ -1281,6 +1288,11 @@ func IsFallingBlock(state uint16) bool {
 		return true
 	}
 	return strings.HasSuffix(info.Name, "_concrete_powder")
+}
+
+// IsDragonEggBlock reports whether state is `minecraft:dragon_egg`.
+func IsDragonEggBlock(state uint16) bool {
+	return isBlockNamed(state, "minecraft:dragon_egg")
 }
 
 // isFreeToFallThrough mirrors FallingBlock.isFree(BlockState): air, fire,

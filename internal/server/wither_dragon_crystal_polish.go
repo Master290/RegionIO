@@ -789,6 +789,9 @@ func (s *Server) TeleportDragonEggBlock(dim string, x, y, z int, rng *rand.Rand)
 		if cache.GetBlock(tx, ty, tz) == world.StateAir {
 			cache.SetBlock(x, y, z, world.StateAir)
 			cache.SetBlock(tx, ty, tz, eggState)
+			if ty > world.MinY && cache.GetBlock(tx, ty-1, tz) == world.StateAir {
+				cache.ScheduleBlockUpdate(tx, ty, tz, world.UpdateFalling, world.FallingBlockTickDelay)
+			}
 			changes := []world.BlockChange{
 				{Pos: world.BlockPos{X: x, Y: y, Z: z}, NewState: world.StateAir},
 				{Pos: world.BlockPos{X: tx, Y: ty, Z: tz}, NewState: eggState},

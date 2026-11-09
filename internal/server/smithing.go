@@ -31,17 +31,23 @@ const (
 	SmithingContainerSlotCount = 4
 	SmithingMenuSlotCount      = 40 // 4 smithing slots (0..3) + 27 main inventory (4..30) + 9 hotbar (31..39)
 
-	// DataComponentTrim is BuiltInRegistries.DATA_COMPONENT_TYPE index 62 ("minecraft:trim").
-	DataComponentTrim int32 = 62
-
 	// DataComponentDamageID is BuiltInRegistries.DATA_COMPONENT_TYPE index 3 ("minecraft:damage").
 	DataComponentDamageID int32 = 3
+
+	// DataComponentCustomNameID is BuiltInRegistries.DATA_COMPONENT_TYPE index 6 ("minecraft:custom_name").
+	DataComponentCustomNameID int32 = 6
 
 	// DataComponentEnchantmentsID is BuiltInRegistries.DATA_COMPONENT_TYPE index 13 ("minecraft:enchantments").
 	DataComponentEnchantmentsID int32 = 13
 
-	// DataComponentRepairCostID is BuiltInRegistries.DATA_COMPONENT_TYPE index 16 ("minecraft:repair_cost").
-	DataComponentRepairCostID int32 = 16
+	// DataComponentRepairCostID is BuiltInRegistries.DATA_COMPONENT_TYPE index 19 ("minecraft:repair_cost").
+	DataComponentRepairCostID int32 = 19
+
+	// DataComponentStoredEnchantmentsID is BuiltInRegistries.DATA_COMPONENT_TYPE index 42 ("minecraft:stored_enchantments").
+	DataComponentStoredEnchantmentsID int32 = 42
+
+	// DataComponentTrim is BuiltInRegistries.DATA_COMPONENT_TYPE index 56 ("minecraft:trim").
+	DataComponentTrim int32 = 56
 
 	SmithingTableBlockID = "minecraft:smithing_table"
 )
@@ -269,7 +275,7 @@ func DecodeArmorTrimPayload(raw []byte) (ArmorTrim, error) {
 }
 
 // WriteSlotWithArmorTrim writes a protocol 775 ItemStack slot with optional ItemMeta
-// (damage, enchantments, repair_cost) and `minecraft:trim` (component 62).
+// (damage, custom_name, enchantments/stored_enchantments, repair_cost) and `minecraft:trim` (component 56).
 func WriteSlotWithArmorTrim(w *protocol.Writer, stack world.ItemStack, meta ItemMeta, trim ArmorTrim) {
 	itemID := stack.ResolvedItemID()
 	if stack.IsEmpty() || itemID <= 0 {
@@ -290,6 +296,9 @@ func WriteSlotWithArmorTrim(w *protocol.Writer, stack world.ItemStack, meta Item
 		cw.VarInt(meta.Damage)
 		comps = append(comps, rawComp{id: DataComponentDamageID, data: cw.Bytes()})
 	}
+	if meta.CustomName != "" {
+		comps = append(comps, rawComp{id: DataComponentCustomNameID, data: TextComponent(meta.CustomName).MarshalNBT()})
+	}
 	if meta.HasEnchantments() {
 		sorted := meta.SortedEnchantments()
 		cw := protocol.NewWriter(4 + len(sorted)*4)
@@ -303,7 +312,11 @@ func WriteSlotWithArmorTrim(w *protocol.Writer, stack world.ItemStack, meta Item
 			cw.VarInt(idx)
 			cw.VarInt(int32(inst.Level))
 		}
-		comps = append(comps, rawComp{id: DataComponentEnchantmentsID, data: cw.Bytes()})
+		enchCompID := DataComponentEnchantmentsID
+		if stack.ResolvedID() == "minecraft:enchanted_book" {
+			enchCompID = DataComponentStoredEnchantmentsID
+		}
+		comps = append(comps, rawComp{id: enchCompID, data: cw.Bytes()})
 	}
 	if meta.RepairCost > 0 {
 		cw := protocol.NewWriter(4)
@@ -324,11 +337,108 @@ func WriteSlotWithArmorTrim(w *protocol.Writer, stack world.ItemStack, meta Item
 	}
 }
 
-// EncodeSlotWithArmorTrim encodes a Slot (stack + ItemMeta + `minecraft:trim` component 62) into a byte slice.
+// EncodeSlotWithArmorTrim encodes a Slot (stack + ItemMeta + `minecraft:trim` component 56) into a byte slice.
 func EncodeSlotWithArmorTrim(stack world.ItemStack, meta ItemMeta, trim ArmorTrim) []byte {
 	w := protocol.NewWriter(32)
 	WriteSlotWithArmorTrim(w, stack, meta, trim)
 	return w.Bytes()
+}
+
+// ReadSlotWithArmorTrim decodes a protocol 775 Slot written by WriteSlotWithArmorTrim.
+func ReadSlotWithArmorTrim(r *protocol.Reader) (world.ItemStack, ItemMeta, ArmorTrim, error) {
+	count, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+	}
+	if count <= 0 {
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, nil
+	}
+	itemID, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+	}
+	stack := world.NewItemStack(itemID, count)
+
+	addedCount, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+	}
+	removedCount, err := r.VarInt()
+	if err != nil {
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+	}
+
+	var meta ItemMeta
+	var trim ArmorTrim
+	reg := DefaultEnchantmentRegistry()
+	byIdx := make(map[int]string, len(reg.defs))
+	for _, d := range reg.defs {
+		byIdx[d.RegistryIndex] = d.ID
+	}
+
+	for i := int32(0); i < addedCount; i++ {
+		compID, err := r.VarInt()
+		if err != nil {
+			return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+		}
+		switch compID {
+		case DataComponentDamageID:
+			dmg, err := r.VarInt()
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			meta.Damage = dmg
+		case DataComponentCustomNameID:
+			chatComp, err := ReadChatComponentNBT(r)
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			meta.CustomName = chatComp.PlainText()
+		case DataComponentEnchantmentsID, DataComponentStoredEnchantmentsID:
+			enchCount, err := r.VarInt()
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			for j := int32(0); j < enchCount; j++ {
+				eIdx, err := r.VarInt()
+				if err != nil {
+					return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+				}
+				lvl, err := r.VarInt()
+				if err != nil {
+					return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+				}
+				if id, ok := byIdx[int(eIdx)]; ok && lvl > 0 {
+					meta.SetEnchantment(id, int(lvl))
+				}
+			}
+		case DataComponentRepairCostID:
+			rc, err := r.VarInt()
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			meta.RepairCost = rc
+		case DataComponentTrim:
+			t, err := DecodeArmorTrimComponent(r)
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			trim = t
+		default:
+			return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, fmt.Errorf("smithing: unsupported slot component ID %d", compID)
+		}
+	}
+	for i := int32(0); i < removedCount; i++ {
+		if _, err := r.VarInt(); err != nil {
+			return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+		}
+	}
+	return stack, meta, trim, nil
+}
+
+// DecodeSlotWithArmorTrim decodes a Slot byte slice produced by EncodeSlotWithArmorTrim.
+func DecodeSlotWithArmorTrim(raw []byte) (world.ItemStack, ItemMeta, ArmorTrim, error) {
+	return ReadSlotWithArmorTrim(protocol.NewReader(raw))
 }
 
 // ArmorTrimToNBT serializes an ArmorTrim to its vanilla NBT compound representation
@@ -885,17 +995,13 @@ func (s *Server) OpenSmithingTable(session *PlayerSession, bx, by, bz int) (int3
 		BlockY:      by,
 		BlockZ:      bz,
 	}
-	carried := tr.carried
 	tr.mu.Unlock()
 
 	if session.send != nil {
 		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeSmithing, "Upgrade Gear")); err != nil {
 			return cid, err
 		}
-		var inputs [SmithingInputSlotCount]world.ItemStack
-		slots := s.buildSmithingMenuSlots(session, inputs, world.ItemStack{})
-		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := s.syncSmithingContainer(session); err != nil {
 			return cid, err
 		}
 	}

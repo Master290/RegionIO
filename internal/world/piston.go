@@ -31,6 +31,7 @@ type pistonStateEntry struct {
 type pistonRuntimeTracker struct {
 	mu              sync.Mutex
 	entries         map[BlockPos]*pistonStateEntry
+	movingBlocks    map[BlockPos]PistonMovingBlockEntity
 	inShortPulseEnd bool
 }
 
@@ -52,7 +53,8 @@ func (c *Cache) pistonTracker() *pistonRuntimeTracker {
 		return v.(*pistonRuntimeTracker)
 	}
 	created := &pistonRuntimeTracker{
-		entries: make(map[BlockPos]*pistonStateEntry),
+		entries:      make(map[BlockPos]*pistonStateEntry),
+		movingBlocks: make(map[BlockPos]PistonMovingBlockEntity),
 	}
 	actual, _ := pistonTrackers.LoadOrStore(c, created)
 	return actual.(*pistonRuntimeTracker)
@@ -1032,4 +1034,534 @@ func DecodePistonRuntimeNBT(list nbt.List) []PistonRuntimeEntrySnapshot {
 	}
 	return out
 }
+
+// --- MovingPistonBlock (`minecraft:moving_piston`) & PistonMovingBlockEntity (`id: "minecraft:piston"`) ---
+
+// PistonBlockEntityID is the block entity type ID for `minecraft:moving_piston`
+// in vanilla 26.1.2 (`BlockEntityType.PISTON` = `"minecraft:piston"`).
+const PistonBlockEntityID = "minecraft:piston"
+
+// IsMovingPistonBlock reports whether state is `minecraft:moving_piston`.
+func IsMovingPistonBlock(state uint16) bool {
+	return isBlockNamed(state, "minecraft:moving_piston")
+}
+
+// MovingPistonBlockState returns the block state ID for
+// `minecraft:moving_piston[facing=...,type=normal|sticky]`.
+func MovingPistonBlockState(facing string, isSticky bool) uint16 {
+	normFacing := strings.ToLower(strings.TrimSpace(facing))
+	switch normFacing {
+	case "down", "up", "north", "south", "west", "east":
+	default:
+		normFacing = "north"
+	}
+	pType := "normal"
+	if isSticky {
+		pType = "sticky"
+	}
+	if st, ok := nameToStateID("minecraft:moving_piston", map[string]string{
+		"facing": normFacing,
+		"type":   pType,
+	}); ok {
+		return st
+	}
+	return StateAir
+}
+
+// PistonDirection3DData maps a 6-way direction ("down", "up", "north", "south",
+// "west", "east") to its vanilla Direction 3D data value (0..5), used in
+// PistonMovingBlockEntity NBT ("facing": Direction.LEGACY_ID_CODEC).
+func PistonDirection3DData(facing string) int32 {
+	switch strings.ToLower(strings.TrimSpace(facing)) {
+	case "down":
+		return 0
+	case "up":
+		return 1
+	case "north":
+		return 2
+	case "south":
+		return 3
+	case "west":
+		return 4
+	case "east":
+		return 5
+	default:
+		return 0
+	}
+}
+
+// PistonDirectionFrom3DData maps a vanilla Direction 3D data value (0..5) to
+// its direction name ("down", "up", "north", "south", "west", "east").
+func PistonDirectionFrom3DData(id int32) string {
+	switch id {
+	case 0:
+		return "down"
+	case 1:
+		return "up"
+	case 2:
+		return "north"
+	case 3:
+		return "south"
+	case 4:
+		return "west"
+	case 5:
+		return "east"
+	default:
+		return "down"
+	}
+}
+
+// PistonMovingBlockEntity represents a `PistonMovingBlockEntity` (`id: "minecraft:piston"`)
+// attached to a `minecraft:moving_piston` block in vanilla 26.1.2.
+type PistonMovingBlockEntity struct {
+	X, Y, Z        int
+	MovedState     uint16
+	Facing         string
+	Extending      bool
+	IsSourcePiston bool
+	Progress       float32
+	ProgressO      float32
+	LastTicked     uint64
+}
+
+// NewPistonMovingBlockEntity constructs a PistonMovingBlockEntity matching
+// vanilla MovingPistonBlock.newMovingBlockEntity.
+func NewPistonMovingBlockEntity(x, y, z int, movedState uint16, facing string, extending, isSourcePiston bool) PistonMovingBlockEntity {
+	normFacing := strings.ToLower(strings.TrimSpace(facing))
+	if normFacing == "" {
+		normFacing = "north"
+	}
+	return PistonMovingBlockEntity{
+		X:              x,
+		Y:              y,
+		Z:              z,
+		MovedState:     movedState,
+		Facing:         normFacing,
+		Extending:      extending,
+		IsSourcePiston: isSourcePiston,
+	}
+}
+
+// MovementDirection returns the direction in which the block is moving:
+// `Facing` when extending, or `oppositeDirection(Facing)` when retracting,
+// matching vanilla PistonMovingBlockEntity.getMovementDirection().
+func (be PistonMovingBlockEntity) MovementDirection() string {
+	if be.Extending {
+		return be.Facing
+	}
+	return oppositeDirection(be.Facing)
+}
+
+// FinalBlockState computes the final block state placed when the moving piston
+// block entity finishes its 2-tick interpolation, matching vanilla
+// PistonMovingBlockEntity.tick / finalTick:
+//   - If IsSourcePiston && !Extending -> StateAir
+//   - If IsSourcePiston && Extending -> minecraft:piston_head[facing=Facing,short=false,type=normal|sticky]
+//   - If !IsSourcePiston && IsMovingPistonBlock(MovedState) -> StateAir
+//   - Otherwise -> stripWaterloggedForPistonMove(MovedState)
+func (be PistonMovingBlockEntity) FinalBlockState() uint16 {
+	if be.IsSourcePiston {
+		if !be.Extending {
+			return StateAir
+		}
+		pType := "normal"
+		if info, ok := stateByID(be.MovedState); ok {
+			if info.Name == "minecraft:sticky_piston" || info.Properties["type"] == "sticky" {
+				pType = "sticky"
+			}
+		}
+		if st, ok := nameToStateID("minecraft:piston_head", map[string]string{
+			"facing": be.Facing,
+			"short":  "false",
+			"type":   pType,
+		}); ok {
+			return st
+		}
+		return be.MovedState
+	}
+	if IsMovingPistonBlock(be.MovedState) {
+		return StateAir
+	}
+	if isWaterloggedState(be.MovedState) {
+		if unwaterlogged, ok := SetWaterlogged(be.MovedState, false); ok {
+			return unwaterlogged
+		}
+	}
+	return be.MovedState
+}
+
+// ToNBT serializes the PistonMovingBlockEntity into a vanilla 26.1.2 block entity
+// NBT compound (`id: "minecraft:piston"`, `x`, `y`, `z`, `blockState`, `facing`,
+// `progress`, `extending`, `source`).
+func (be PistonMovingBlockEntity) ToNBT() *nbt.Compound {
+	stateComp := nbt.NewCompound()
+	if info, ok := stateByID(be.MovedState); ok && info.Name != "" {
+		stateComp.Set("Name", nbt.String(info.Name))
+		if len(info.Properties) > 0 {
+			propsComp := nbt.NewCompound()
+			keys := make([]string, 0, len(info.Properties))
+			for k := range info.Properties {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				propsComp.Set(k, nbt.String(info.Properties[k]))
+			}
+			stateComp.Set("Properties", propsComp)
+		}
+	} else {
+		stateComp.Set("Name", nbt.String("minecraft:air"))
+	}
+
+	var extByte, srcByte int8
+	if be.Extending {
+		extByte = 1
+	}
+	if be.IsSourcePiston {
+		srcByte = 1
+	}
+	savedProgress := be.ProgressO
+	if savedProgress == 0 && be.Progress > 0 {
+		savedProgress = be.Progress
+	}
+
+	return nbt.NewCompound().
+		Set("id", nbt.String(PistonBlockEntityID)).
+		Set("x", nbt.Int(int32(be.X))).
+		Set("y", nbt.Int(int32(be.Y))).
+		Set("z", nbt.Int(int32(be.Z))).
+		Set("blockState", stateComp).
+		Set("facing", nbt.Int(PistonDirection3DData(be.Facing))).
+		Set("progress", nbt.Float(savedProgress)).
+		Set("extending", nbt.Byte(extByte)).
+		Set("source", nbt.Byte(srcByte))
+}
+
+// PistonMovingBlockEntityFromNBT deserializes a PistonMovingBlockEntity from a
+// vanilla 26.1.2 `minecraft:piston` block entity NBT compound.
+func PistonMovingBlockEntityFromNBT(c *nbt.Compound) (*PistonMovingBlockEntity, error) {
+	if c == nil {
+		return &PistonMovingBlockEntity{MovedState: StateAir, Facing: "down"}, nil
+	}
+	movedState := StateAir
+	if bsTag, ok := c.Get("blockState"); ok {
+		if bsComp, ok := bsTag.(*nbt.Compound); ok && bsComp != nil {
+			var blockName string
+			if nTag, ok := bsComp.Get("Name"); ok {
+				if ns, ok := nTag.(nbt.String); ok {
+					blockName = string(ns)
+				}
+			}
+			var props map[string]string
+			if pTag, ok := bsComp.Get("Properties"); ok {
+				if pComp, ok := pTag.(*nbt.Compound); ok && pComp != nil && pComp.Len() > 0 {
+					props = make(map[string]string, pComp.Len())
+					for _, k := range pComp.Keys() {
+						if tv, ok := pComp.Get(k); ok {
+							if sv, ok := tv.(nbt.String); ok {
+								props[k] = string(sv)
+							}
+						}
+					}
+				}
+			}
+			if blockName != "" {
+				if st, ok := nameToStateID(blockName, props); ok {
+					movedState = st
+				} else if st, ok := BlockStateByName(blockName, props); ok {
+					movedState = st
+				}
+			}
+		}
+	}
+
+	facing := "down"
+	if fTag, ok := c.Get("facing"); ok {
+		switch v := fTag.(type) {
+		case nbt.Int:
+			facing = PistonDirectionFrom3DData(int32(v))
+		case nbt.Byte:
+			facing = PistonDirectionFrom3DData(int32(v))
+		case nbt.Short:
+			facing = PistonDirectionFrom3DData(int32(v))
+		case nbt.String:
+			facing = strings.ToLower(strings.TrimSpace(string(v)))
+		}
+	}
+
+	var progress float32
+	if pTag, ok := c.Get("progress"); ok {
+		switch v := pTag.(type) {
+		case nbt.Float:
+			progress = float32(v)
+		case nbt.Double:
+			progress = float32(v)
+		}
+	}
+	if progress < 0 {
+		progress = 0
+	} else if progress > 1 {
+		progress = 1
+	}
+
+	var extending, isSource bool
+	if eTag, ok := c.Get("extending"); ok {
+		if b, ok := eTag.(nbt.Byte); ok {
+			extending = b != 0
+		}
+	}
+	if sTag, ok := c.Get("source"); ok {
+		if b, ok := sTag.(nbt.Byte); ok {
+			isSource = b != 0
+		}
+	}
+
+	return &PistonMovingBlockEntity{
+		X:              int(nbtAsInt(c, "x")),
+		Y:              int(nbtAsInt(c, "y")),
+		Z:              int(nbtAsInt(c, "z")),
+		MovedState:     movedState,
+		Facing:         facing,
+		Extending:      extending,
+		IsSourcePiston: isSource,
+		Progress:       progress,
+		ProgressO:      progress,
+	}, nil
+}
+
+// SetPistonMovingBlockEntity places a `minecraft:moving_piston` block at
+// (be.X, be.Y, be.Z) (if not already present) and registers its
+// `PistonMovingBlockEntity` (`id: "minecraft:piston"`) in runtime storage and
+// on the chunk's StructureBlockEntities.
+func (c *Cache) SetPistonMovingBlockEntity(be PistonMovingBlockEntity) {
+	if c == nil || be.Y < MinY || be.Y >= MinY+WorldHeight {
+		return
+	}
+	if be.Facing == "" {
+		be.Facing = "north"
+	} else {
+		be.Facing = strings.ToLower(strings.TrimSpace(be.Facing))
+	}
+	isSticky := false
+	if info, ok := stateByID(be.MovedState); ok {
+		if info.Name == "minecraft:sticky_piston" || info.Properties["type"] == "sticky" {
+			isSticky = true
+		}
+	}
+	cur := c.GetBlock(be.X, be.Y, be.Z)
+	if !IsMovingPistonBlock(cur) {
+		if mpState := MovingPistonBlockState(be.Facing, isSticky); mpState != StateAir {
+			c.SetBlock(be.X, be.Y, be.Z, mpState)
+		}
+	}
+	pos := BlockPos{X: be.X, Y: be.Y, Z: be.Z}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	if tr.movingBlocks == nil {
+		tr.movingBlocks = make(map[BlockPos]PistonMovingBlockEntity)
+	}
+	tr.movingBlocks[pos] = be
+	tr.mu.Unlock()
+
+	c.AddChunkStructureBlockEntity(StructureBlockEntity{
+		ID: PistonBlockEntityID,
+		X:  be.X,
+		Y:  be.Y,
+		Z:  be.Z,
+	})
+}
+
+// GetPistonMovingBlockEntityAt returns the `PistonMovingBlockEntity` at (x, y, z), if any.
+func (c *Cache) GetPistonMovingBlockEntityAt(x, y, z int) (PistonMovingBlockEntity, bool) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return PistonMovingBlockEntity{}, false
+	}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	be, ok := tr.movingBlocks[BlockPos{X: x, Y: y, Z: z}]
+	tr.mu.Unlock()
+	return be, ok
+}
+
+// RemovePistonMovingBlockEntityAt removes the `PistonMovingBlockEntity` at (x, y, z).
+func (c *Cache) RemovePistonMovingBlockEntityAt(x, y, z int) bool {
+	if c == nil {
+		return false
+	}
+	pos := BlockPos{X: x, Y: y, Z: z}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	_, existed := tr.movingBlocks[pos]
+	delete(tr.movingBlocks, pos)
+	tr.mu.Unlock()
+
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
+	c.mu.Unlock()
+	if ch != nil {
+		if sbe, ok := ch.StructureBlockEntityAt(x, y, z); ok && sbe.ID == PistonBlockEntityID {
+			ch.RemoveStructureBlockEntity(x, y, z)
+		}
+	}
+	return existed
+}
+
+// StepPistonMovingBlockEntityAt advances the `PistonMovingBlockEntity` at
+// (x, y, z) by 1 game tick, matching vanilla PistonMovingBlockEntity.tick:
+//   - Copies `ProgressO = Progress`.
+//   - If `ProgressO >= 1.0`, removes the block entity and replaces
+//     `minecraft:moving_piston` with `FinalBlockState()` (or `StateAir`),
+//     propagating neighbor, observer, and redstone updates.
+//   - Otherwise increments `Progress` by `0.5` (clamped to `1.0`) and translates
+//     colliding entities along `MovementDirection()`.
+func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	pos := BlockPos{X: x, Y: y, Z: z}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	be, ok := tr.movingBlocks[pos]
+	if !ok {
+		tr.mu.Unlock()
+		return false, res
+	}
+	be.LastTicked++
+	be.ProgressO = be.Progress
+	if be.ProgressO >= 1.0 {
+		delete(tr.movingBlocks, pos)
+		tr.mu.Unlock()
+		c.RemovePistonMovingBlockEntityAt(x, y, z)
+
+		curState := c.GetBlock(x, y, z)
+		if IsMovingPistonBlock(curState) {
+			if be.MovedState == StateAir {
+				c.setBlockRecorded(x, y, z, StateAir, &res)
+			} else {
+				finalState := be.FinalBlockState()
+				if c.setBlockRecorded(x, y, z, finalState, &res) {
+					c.scheduleAround(x, y, z)
+					c.notifyObserversOfChangeAt(x, y, z, curState, finalState)
+					c.propagateRedstoneAround(x, y, z, curState, finalState, &res)
+					if isBlockNamed(finalState, "minecraft:observer") {
+						c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ObserverTickDelay)
+					}
+				}
+			}
+		}
+		return true, res
+	}
+
+	wasZero := be.ProgressO == 0
+	be.Progress += 0.5
+	if be.Progress >= 1.0 {
+		be.Progress = 1.0
+	}
+	tr.movingBlocks[pos] = be
+	tr.mu.Unlock()
+
+	if wasZero {
+		c.notifyPistonMoveEntities(pos, be.MovementDirection(), be.Extending, []BlockPos{pos}, []uint16{be.MovedState})
+	}
+	return false, res
+}
+
+// FinalTickPistonMovingBlockEntityAt immediately finalizes a
+// `PistonMovingBlockEntity` at (x, y, z) if `ProgressO < 1.0`, matching vanilla
+// PistonMovingBlockEntity.finalTick().
+func (c *Cache) FinalTickPistonMovingBlockEntityAt(x, y, z int) BlockUpdateResult {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return res
+	}
+	be, ok := c.GetPistonMovingBlockEntityAt(x, y, z)
+	if !ok {
+		return res
+	}
+	c.RemovePistonMovingBlockEntityAt(x, y, z)
+	if be.ProgressO < 1.0 {
+		curState := c.GetBlock(x, y, z)
+		if IsMovingPistonBlock(curState) {
+			finalState := be.FinalBlockState()
+			if c.setBlockRecorded(x, y, z, finalState, &res) {
+				c.scheduleAround(x, y, z)
+				c.notifyObserversOfChangeAt(x, y, z, curState, finalState)
+				c.propagateRedstoneAround(x, y, z, curState, finalState, &res)
+			}
+		}
+	}
+	return res
+}
+
+// DestroyMovingPistonBlockAt breaks a `minecraft:moving_piston` at (x, y, z)
+// and, matching vanilla MovingPistonBlock.destroy, also removes an adjacent
+// extended `minecraft:piston` or `minecraft:sticky_piston` at
+// `pos.relative(facing.getOpposite())`.
+func (c *Cache) DestroyMovingPistonBlockAt(x, y, z int) BlockUpdateResult {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return res
+	}
+	curState := c.GetBlock(x, y, z)
+	info, ok := stateByID(curState)
+	if !ok || info.Name != "minecraft:moving_piston" {
+		return res
+	}
+	facing := info.Properties["facing"]
+	c.RemovePistonMovingBlockEntityAt(x, y, z)
+	if c.setBlockRecorded(x, y, z, StateAir, &res) {
+		c.scheduleAround(x, y, z)
+	}
+	if dx, dy, dz, ok := directionOffset3D(oppositeDirection(facing)); ok {
+		bx, by, bz := x+dx, y+dy, z+dz
+		if by >= MinY && by < MinY+WorldHeight {
+			bState := c.GetBlock(bx, by, bz)
+			if bInfo, ok := stateByID(bState); ok &&
+				(bInfo.Name == "minecraft:piston" || bInfo.Name == "minecraft:sticky_piston") &&
+				bInfo.Properties["extended"] == "true" {
+				c.ClearPistonRuntimeAt(bx, by, bz)
+				if c.setBlockRecorded(bx, by, bz, StateAir, &res) {
+					c.scheduleAround(bx, by, bz)
+					c.notifyObserversOfChangeAt(bx, by, bz, bState, StateAir)
+					c.propagateRedstoneAround(bx, by, bz, bState, StateAir, &res)
+				}
+			}
+		}
+	}
+	c.notifyObserversOfChangeAt(x, y, z, curState, StateAir)
+	c.propagateRedstoneAround(x, y, z, curState, StateAir, &res)
+	return res
+}
+
+// InteractMovingPistonBlockAt handles right-clicking a `minecraft:moving_piston`
+// at (x, y, z), matching vanilla MovingPistonBlock.useWithoutItem:
+// if there is no `PistonMovingBlockEntity` at (x, y, z), removes the orphan
+// `moving_piston` block and returns (true, res); otherwise returns (false, empty).
+func (c *Cache) InteractMovingPistonBlockAt(x, y, z int) (bool, BlockUpdateResult) {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, res
+	}
+	curState := c.GetBlock(x, y, z)
+	if !IsMovingPistonBlock(curState) {
+		return false, res
+	}
+	if _, hasBE := c.GetPistonMovingBlockEntityAt(x, y, z); !hasBE {
+		_, res = c.ApplyBlockWithUpdates(x, y, z, StateAir)
+		return true, res
+	}
+	return false, res
+}
+
+// MovingPistonMovedStateAt returns the underlying `MovedState` of a
+// `PistonMovingBlockEntity` at (x, y, z) (used by MovingPistonBlock.getDrops
+// and getCloneItemStack).
+func (c *Cache) MovingPistonMovedStateAt(x, y, z int) (uint16, bool) {
+	be, ok := c.GetPistonMovingBlockEntityAt(x, y, z)
+	if !ok || be.MovedState == StateAir {
+		return StateAir, false
+	}
+	return be.MovedState, true
+}
+
 
