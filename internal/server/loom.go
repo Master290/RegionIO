@@ -262,6 +262,31 @@ func (s *Server) HandleLoomClick(session *PlayerSession, click ContainerClick) e
 	}
 
 	slot := int(click.Slot)
+	if slot == -999 && (click.Mode == ContainerInputPickup || click.Mode == ContainerInputThrow) {
+		if !tr.carried.IsEmpty() {
+			dropCount := tr.carried.Count
+			if click.Button == 1 {
+				dropCount = 1
+			}
+			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
+			rem := tr.carried.Count - dropCount
+			if rem <= 0 {
+				tr.carried = world.ItemStack{}
+				btr := getBannerMetaTracker(session)
+				btr.mu.Lock()
+				btr.carriedPatterns = BannerPatternsComponent{}
+				btr.mu.Unlock()
+			} else {
+				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
+			}
+			tr.mu.Unlock()
+			snap := session.Snapshot()
+			_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			return nil
+		}
+		tr.mu.Unlock()
+		return nil
+	}
 	if slot < 0 || slot >= LoomMenuSlotCount {
 		tr.mu.Unlock()
 		return nil
@@ -351,6 +376,7 @@ func (s *Server) HandleLoomClick(session *PlayerSession, click ContainerClick) e
 			clicked := slots[slot]
 			clickedPats := slotPats[slot]
 			if !clicked.IsEmpty() {
+				prevCount := clicked.Count
 				switch {
 				case IsBannerItem(clicked.ResolvedID()):
 					slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, clicked, clickedPats, LoomSlotBanner, LoomSlotBanner+1)
@@ -358,12 +384,70 @@ func (s *Server) HandleLoomClick(session *PlayerSession, click ContainerClick) e
 					slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, clicked, clickedPats, LoomSlotDye, LoomSlotDye+1)
 				case func() bool { _, ok := IsBannerPatternItem(clicked.ResolvedID()); return ok }():
 					slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, clicked, clickedPats, LoomSlotPattern, LoomSlotPattern+1)
-				case slot >= 4 && slot < 31:
-					slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, clicked, clickedPats, 31, 40)
-				case slot >= 31 && slot < 40:
-					slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, clicked, clickedPats, 4, 31)
+				}
+				if slots[slot].Count == prevCount {
+					if slot >= 4 && slot < 31 {
+						slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, slots[slot], slotPats[slot], 31, 40)
+					} else if slot >= 31 && slot < 40 {
+						slots[slot], slotPats[slot] = mergeBannerIntoMenuSlice(slots, slotPats, slots[slot], slotPats[slot], 4, 31)
+					}
 				}
 			}
+		}
+
+	case click.Mode == ContainerInputSwap:
+		if click.Button >= 0 && click.Button < 9 {
+			hotbarIdx := 31 + int(click.Button)
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			slotPats[slot], slotPats[hotbarIdx] = slotPats[hotbarIdx], slotPats[slot]
+		} else if click.Button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			btr.mu.Lock()
+			offPats := btr.slotPatterns[OffHandContainerSlot].Clone()
+			btr.mu.Unlock()
+			slots[slot], offStack = offStack, slots[slot]
+			slotPats[slot], offPats = offPats, slotPats[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
+			btr.mu.Lock()
+			if offStack.IsEmpty() {
+				btr.slotPatterns[OffHandContainerSlot] = BannerPatternsComponent{}
+			} else {
+				btr.slotPatterns[OffHandContainerSlot] = offPats.Clone()
+			}
+			btr.mu.Unlock()
+		}
+
+	case click.Mode == ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && carried.IsEmpty() && !slots[slot].IsEmpty() {
+			maxSt := MaxItemStackSize
+			if IsBannerItem(slots[slot].ResolvedID()) {
+				maxSt = 16
+			}
+			carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxSt)
+			carriedPats = slotPats[slot].Clone()
+		}
+
+	case click.Mode == ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if click.Button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+				slotPats[slot] = BannerPatternsComponent{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+		}
+
+	case click.Mode == ContainerInputPickupAll:
+		if len(carriedPats.Layers) == 0 {
+			applyPickupAllSlice(slots, &carried, 0)
 		}
 	}
 

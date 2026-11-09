@@ -1050,6 +1050,33 @@ func (s *Server) HandleMerchantContainerClick(session *PlayerSession, containerI
 }
 
 func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, slot int, button int8, mode int32) error {
+	if slot == -999 && (mode == ContainerInputPickup || mode == ContainerInputThrow) {
+		tr := getContainerTracker(session)
+		tr.mu.Lock()
+		if tr.open == nil || tr.open.ContainerID != containerID || tr.open.MenuType != MenuTypeMerchant {
+			tr.mu.Unlock()
+			return nil
+		}
+		if !tr.carried.IsEmpty() {
+			dropCount := tr.carried.Count
+			if button == 1 {
+				dropCount = 1
+			}
+			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
+			rem := tr.carried.Count - dropCount
+			if rem <= 0 {
+				tr.carried = world.ItemStack{}
+			} else {
+				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
+			}
+			tr.mu.Unlock()
+			snap := session.Snapshot()
+			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			return nil
+		}
+		tr.mu.Unlock()
+		return nil
+	}
 	if slot < 0 || slot >= MerchantMenuSlotCount {
 		return nil
 	}
@@ -1192,7 +1219,13 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 			if button >= 0 && button < 9 {
 				hotbarIdx := 30 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			} else if button == 40 {
+				offStack := session.InventorySlot(OffHandContainerSlot)
+				slots[slot], offStack = offStack, slots[slot]
+				session.SetInventorySlot(OffHandContainerSlot, offStack)
 			}
+		case ContainerInputPickupAll:
+			applyPickupAllSlice(slots, &tr.carried, 0)
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)

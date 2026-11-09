@@ -1294,6 +1294,56 @@ func (s *Server) HandleSmithingClick(session *PlayerSession, click ContainerClic
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 				slotMeta[slot], slotMeta[hotbarIdx] = slotMeta[hotbarIdx], slotMeta[slot]
 				slotTrim[slot], slotTrim[hotbarIdx] = slotTrim[hotbarIdx], slotTrim[slot]
+			} else if button == 40 {
+				offStack := session.InventorySlot(OffHandContainerSlot)
+				offMeta := GetSlotItemMeta(session, OffHandContainerSlot)
+				offTrim, _ := GetSlotArmorTrim(session, OffHandContainerSlot)
+				slots[slot], offStack = offStack, slots[slot]
+				slotMeta[slot], offMeta = offMeta, slotMeta[slot]
+				slotTrim[slot], offTrim = offTrim, slotTrim[slot]
+				session.SetInventorySlot(OffHandContainerSlot, offStack)
+				if offStack.IsEmpty() {
+					SetSlotItemMeta(session, OffHandContainerSlot, ItemMeta{})
+					ClearSlotArmorTrim(session, OffHandContainerSlot)
+				} else {
+					SetSlotItemMeta(session, OffHandContainerSlot, offMeta)
+					SetSlotArmorTrim(session, OffHandContainerSlot, offTrim)
+				}
+			}
+
+		case ContainerInputClone:
+			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+				maxSt := MaxItemStackSize
+				if MaxItemDurability(slots[slot].ResolvedID()) > 0 || slots[slot].ResolvedID() == "minecraft:enchanted_book" {
+					maxSt = 1
+				}
+				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxSt)
+				SetCarriedItemMeta(session, slotMeta[slot].Clone())
+				SetCarriedArmorTrim(session, slotTrim[slot])
+			}
+
+		case ContainerInputThrow:
+			if !slots[slot].IsEmpty() {
+				dropCount := int32(1)
+				if button == 1 {
+					dropCount = slots[slot].Count
+				}
+				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+				rem := slots[slot].Count - dropCount
+				if rem <= 0 {
+					slots[slot] = world.ItemStack{}
+					slotMeta[slot] = ItemMeta{}
+					slotTrim[slot] = ArmorTrim{}
+				} else {
+					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+				}
+				snap := session.Snapshot()
+				_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.25, snap.Z, dropStack)
+			}
+
+		case ContainerInputPickupAll:
+			if GetCarriedItemMeta(session).IsEmpty() {
+				applyPickupAllSlice(slots, &tr.carried, 0)
 			}
 		}
 	}

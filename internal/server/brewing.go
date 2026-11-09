@@ -1964,10 +1964,12 @@ func (s *Server) applyBrewingStandClickLocked(
 				}
 			}
 		} else {
-			// Move from player inventory (5..40) -> brewing stand (fuel, ingredient, or bottle).
+			// Move from player inventory (5..40) -> brewing stand (fuel, ingredient, or bottle),
+			// or fallback between main inventory (5..32) and hotbar (32..41).
 			clicked := slots[slot]
 			clickedPotion := slotPotions[slot]
 			if !clicked.IsEmpty() {
+				prevCount := clicked.Count
 				switch {
 				case IsBrewingFuel(clicked):
 					slots[slot] = mergeIntoSlotSlice(slots, clicked, BrewingStandSlotFuel, BrewingStandSlotFuel+1)
@@ -1985,6 +1987,37 @@ func (s *Server) applyBrewingStandClickLocked(
 							} else {
 								slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 							}
+						}
+					}
+				}
+				if slots[slot].Count == prevCount {
+					if slot >= 5 && slot < 32 {
+						if IsPotionItem(slots[slot]) {
+							for dst := 32; dst < BrewingStandMenuSlotCount && !slots[slot].IsEmpty(); dst++ {
+								if slots[dst].IsEmpty() {
+									slots[dst] = slots[slot]
+									slotPotions[dst] = clickedPotion
+									slots[slot] = world.ItemStack{}
+									slotPotions[slot] = ""
+									break
+								}
+							}
+						} else {
+							slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 32, BrewingStandMenuSlotCount)
+						}
+					} else if slot >= 32 && slot < BrewingStandMenuSlotCount {
+						if IsPotionItem(slots[slot]) {
+							for dst := 5; dst < 32 && !slots[slot].IsEmpty(); dst++ {
+								if slots[dst].IsEmpty() {
+									slots[dst] = slots[slot]
+									slotPotions[dst] = clickedPotion
+									slots[slot] = world.ItemStack{}
+									slotPotions[slot] = ""
+									break
+								}
+							}
+						} else {
+							slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 5, 32)
 						}
 					}
 				}
@@ -2011,6 +2044,32 @@ func (s *Server) applyBrewingStandClickLocked(
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 				slotPotions[slot], slotPotions[hotbarIdx] = slotPotions[hotbarIdx], slotPotions[slot]
 			}
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			offPotion := GetSlotPotionType(session, OffHandContainerSlot)
+			canSwap := true
+			switch {
+			case slot >= 0 && slot < 3:
+				canSwap = offStack.IsEmpty() || (CanPlaceInBrewingBottleSlot(offStack) && offStack.Count == 1)
+			case slot == BrewingStandSlotIngredient:
+				canSwap = offStack.IsEmpty() || IsBrewingIngredient(offStack)
+			case slot == BrewingStandSlotFuel:
+				canSwap = offStack.IsEmpty() || IsBrewingFuel(offStack)
+			}
+			if canSwap {
+				if slot < 3 && IsPotionItem(slots[slot]) && slotPotions[slot] != "" && slotPotions[slot] != PotionWater {
+					s.TriggerBrewedPotion(session, slotPotions[slot])
+				}
+				slots[slot], offStack = offStack, slots[slot]
+				slotPotions[slot], offPotion = offPotion, slotPotions[slot]
+				session.SetInventorySlot(OffHandContainerSlot, offStack)
+				SetSlotPotionType(session, OffHandContainerSlot, offPotion)
+			}
+		}
+
+	case ContainerInputPickupAll:
+		if !IsPotionItem(tr.carried) {
+			applyPickupAllSlice(slots, &tr.carried, 0)
 		}
 
 	case ContainerInputClone:

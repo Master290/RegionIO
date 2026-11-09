@@ -900,7 +900,17 @@ func applyCombinerNonResultClick(
 			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 30, 39)
 			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 3, 30)
 		} else if slot >= 3 {
-			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 0, 2)
+			prevCount := slots[slot].Count
+			if tr == nil || tr.open == nil || tr.open.MenuType != MenuTypeGrindstone || CanPlaceInGrindstoneInput(slots[slot], metas[slot]) {
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 0, 2)
+			}
+			if slots[slot].Count == prevCount {
+				if slot < 30 {
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 30, 39)
+				} else if slot < 39 {
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 3, 30)
+				}
+			}
 		}
 	case ContainerInputSwap:
 		if button >= 0 && button < 9 {
@@ -908,6 +918,50 @@ func applyCombinerNonResultClick(
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 			metas[slot], metas[hotbarIdx] = metas[hotbarIdx], metas[slot]
 			trims[slot], trims[hotbarIdx] = trims[hotbarIdx], trims[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			offMeta := GetSlotItemMeta(session, OffHandContainerSlot)
+			offTrim, _ := GetSlotArmorTrim(session, OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			metas[slot], offMeta = offMeta, metas[slot]
+			trims[slot], offTrim = offTrim, trims[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
+			if offStack.IsEmpty() {
+				SetSlotItemMeta(session, OffHandContainerSlot, ItemMeta{})
+				ClearSlotArmorTrim(session, OffHandContainerSlot)
+			} else {
+				SetSlotItemMeta(session, OffHandContainerSlot, offMeta)
+				SetSlotArmorTrim(session, OffHandContainerSlot, offTrim)
+			}
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			maxSt := MaxItemStackSize
+			if MaxItemDurability(slots[slot].ResolvedID()) > 0 || slots[slot].ResolvedID() == "minecraft:enchanted_book" {
+				maxSt = 1
+			}
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxSt)
+			SetCarriedItemMeta(session, metas[slot].Clone())
+			SetCarriedArmorTrim(session, trims[slot])
+		}
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+				metas[slot] = ItemMeta{}
+				trims[slot] = ArmorTrim{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+		}
+	case ContainerInputPickupAll:
+		if GetCarriedItemMeta(session).IsEmpty() {
+			applyPickupAllSlice(slots, &tr.carried, 0)
 		}
 	}
 }

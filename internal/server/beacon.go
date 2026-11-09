@@ -1464,7 +1464,36 @@ func (s *Server) applyBeaconClickLocked(
 		if button >= 0 && button < 9 && slot != BeaconSlotPayment {
 			hotbarIdx := 28 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 && slot != BeaconSlotPayment {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
+
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+		}
+
+	case ContainerInputPickupAll:
+		applyPickupAllSlice(slots, &tr.carried, 0)
 	}
 
 	tr.open.Crafting[0] = slots[BeaconSlotPayment]

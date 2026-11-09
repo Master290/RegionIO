@@ -276,6 +276,34 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 	if s == nil || session == nil || session.IsDead() {
 		return nil
 	}
+	if slot == -999 && (mode == ContainerInputPickup || mode == ContainerInputThrow) {
+		tr := getContainerTracker(session)
+		tr.mu.Lock()
+		if tr.open == nil || tr.open.ContainerID != containerID || tr.open.MenuType != MenuTypeCartographyTable {
+			tr.mu.Unlock()
+			return nil
+		}
+		if !tr.carried.IsEmpty() {
+			dropCount := tr.carried.Count
+			if button == 1 {
+				dropCount = 1
+			}
+			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
+			rem := tr.carried.Count - dropCount
+			if rem <= 0 {
+				tr.carried = world.ItemStack{}
+				SetCarriedMapID(session, 0, false)
+			} else {
+				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
+			}
+			tr.mu.Unlock()
+			snap := session.Snapshot()
+			_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			return nil
+		}
+		tr.mu.Unlock()
+		return nil
+	}
 	if slot < 0 || slot >= CartographyMenuSlotCount {
 		return nil
 	}
@@ -438,6 +466,20 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 				addSlotStack = invStack
 				session.SetInventorySlot(invSlot, world.ItemStack{})
 				ClearSlotMapID(session, invSlot)
+			} else {
+				dstStart, dstEnd := 36, 45
+				if invSlot >= 36 {
+					dstStart, dstEnd = 9, 36
+				}
+				inv := session.Inventory()
+				for dst := dstStart; dst < dstEnd; dst++ {
+					if inv[dst].IsEmpty() {
+						session.SetInventorySlot(dst, invStack)
+						session.SetInventorySlot(invSlot, world.ItemStack{})
+						swapPlayerSlotExtendedComponents(session, invSlot, dst)
+						break
+					}
+				}
 			}
 		} else if mode == ContainerInputPickup {
 			if button == 1 && invStack.IsEmpty() && !carried.IsEmpty() && carried.Count > 1 {
@@ -458,14 +500,39 @@ func (s *Server) HandleCartographyContainerClick(session *PlayerSession, contain
 				carried = invStack
 				carriedMapID, hasCarriedMap = invMapID, hasInvMap
 			}
-		} else if mode == ContainerInputSwap && button >= 0 && button < 9 {
-			hotbarSlot := 36 + int(button)
-			if invSlot != hotbarSlot {
-				hbStack := session.InventorySlot(hotbarSlot)
-				session.SetInventorySlot(invSlot, hbStack)
-				session.SetInventorySlot(hotbarSlot, invStack)
-				swapPlayerSlotExtendedComponents(session, invSlot, hotbarSlot)
+		} else if mode == ContainerInputSwap {
+			if button >= 0 && button < 9 {
+				hotbarSlot := 36 + int(button)
+				if invSlot != hotbarSlot {
+					hbStack := session.InventorySlot(hotbarSlot)
+					session.SetInventorySlot(invSlot, hbStack)
+					session.SetInventorySlot(hotbarSlot, invStack)
+					swapPlayerSlotExtendedComponents(session, invSlot, hotbarSlot)
+				}
+			} else if button == 40 {
+				offStack := session.InventorySlot(OffHandContainerSlot)
+				session.SetInventorySlot(invSlot, offStack)
+				session.SetInventorySlot(OffHandContainerSlot, invStack)
+				swapPlayerSlotExtendedComponents(session, invSlot, OffHandContainerSlot)
 			}
+		} else if mode == ContainerInputClone {
+			if session.Snapshot().GameMode == GameModeCreative && carried.IsEmpty() && !invStack.IsEmpty() {
+				carried = world.NewItemStack(invStack.ResolvedItemID(), MaxItemStackSize)
+				carriedMapID, hasCarriedMap = invMapID, hasInvMap
+			}
+		} else if mode == ContainerInputThrow && !invStack.IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = invStack.Count
+			}
+			dropStack := world.NewItemStack(invStack.ResolvedItemID(), dropCount)
+			rem := decrementStack(invStack, dropCount)
+			session.SetInventorySlot(invSlot, rem)
+			if rem.IsEmpty() {
+				ClearSlotMapID(session, invSlot)
+			}
+			snap := session.Snapshot()
+			_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.5, snap.Z, dropStack)
 		}
 	}
 

@@ -509,7 +509,15 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 			} else if slot >= 2 {
 				clicked := slots[slot]
 				if DefaultStonecutterBook().CanStonecut(clicked) {
+					prev := clicked.Count
 					slots[slot] = mergeIntoSlotSlice(slots, clicked, StonecutterSlotInput, StonecutterSlotInput+1)
+					if slots[slot].Count == prev {
+						if slot < 29 {
+							slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 29, 38)
+						} else if slot < 38 {
+							slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 2, 29)
+						}
+					}
 				} else if slot >= 2 && slot < 29 {
 					slots[slot] = mergeIntoSlotSlice(slots, clicked, 29, 38)
 				} else if slot >= 29 && slot < 38 {
@@ -521,7 +529,36 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 			if button >= 0 && button < 9 {
 				hotbarIdx := 29 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			} else if button == 40 {
+				offStack := session.InventorySlot(OffHandContainerSlot)
+				slots[slot], offStack = offStack, slots[slot]
+				session.SetInventorySlot(OffHandContainerSlot, offStack)
 			}
+
+		case ContainerInputClone:
+			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+			}
+
+		case ContainerInputThrow:
+			if !slots[slot].IsEmpty() {
+				dropCount := int32(1)
+				if button == 1 {
+					dropCount = slots[slot].Count
+				}
+				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+				rem := slots[slot].Count - dropCount
+				if rem <= 0 {
+					slots[slot] = world.ItemStack{}
+				} else {
+					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+				}
+				snap := session.Snapshot()
+				_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.25, snap.Z, dropStack)
+			}
+
+		case ContainerInputPickupAll:
+			applyPickupAllSlice(slots, &tr.carried, 0)
 		}
 	}
 

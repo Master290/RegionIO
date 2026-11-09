@@ -4089,9 +4089,14 @@ func execDamage(srv *server.Server, ctx CommandContext, args []string) string {
 	}
 
 	if target.IsPlayer() {
-		if cause == "out_of_world" || cause == "generic_kill" || cause == "kill" {
+		switch cause {
+		case "out_of_world", "generic_kill", "kill":
 			srv.DamagePlayer(target.Player, float32(amt), cause)
-		} else {
+		case "mob", "mob_attack", "player", "player_attack", "arrow", "trident",
+			"explosion", "player_explosion", "fireball", "spit", "sting",
+			"cactus", "sweet_berry_bush", "falling_block", "falling_anvil", "falling_stalactite":
+			srv.DamagePlayerWithArmorBypassShield(target.Player, float32(amt), cause)
+		default:
 			srv.DamagePlayerWithEffects(target.Player, float32(amt), cause)
 		}
 	} else if target.Entity.ID > 0 {

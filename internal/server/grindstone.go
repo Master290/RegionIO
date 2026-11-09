@@ -36,6 +36,17 @@ func IsGrindstoneBlock(state uint16) bool {
 	return world.BlockName(state) == "minecraft:grindstone"
 }
 
+// CanPlaceInGrindstoneInput reports whether stack with meta is valid for a
+// Grindstone input slot (0 or 1): damageable items, enchanted books, or any
+// item carrying enchantments (matching vanilla GrindstoneMenu input slot mayPlace).
+func CanPlaceInGrindstoneInput(stack world.ItemStack, meta ItemMeta) bool {
+	if stack.IsEmpty() {
+		return false
+	}
+	id := canonicalResourceName(stack.ResolvedID())
+	return MaxItemDurability(id) > 0 || id == "minecraft:enchanted_book" || meta.HasEnchantments()
+}
+
 // GrindstoneBlockState returns the block state ID for minecraft:grindstone with
 // the given face ("floor", "wall", "ceiling") and facing ("north", "south", "west", "east").
 func GrindstoneBlockState(face, facing string) uint16 {

@@ -2853,6 +2853,31 @@ func (s *Server) HandleHopperClick(session *PlayerSession, open *OpenContainerSt
 	if s == nil || session == nil || open == nil {
 		return nil
 	}
+	if slot == -999 && (mode == ContainerInputPickup || mode == ContainerInputThrow) {
+		tr := getContainerTracker(session)
+		tr.mu.Lock()
+		if !tr.carried.IsEmpty() {
+			dropCount := tr.carried.Count
+			if button == 1 {
+				dropCount = 1
+			}
+			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
+			rem := tr.carried.Count - dropCount
+			if rem <= 0 {
+				tr.carried = world.ItemStack{}
+			} else {
+				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
+			}
+			tr.mu.Unlock()
+			snap := session.Snapshot()
+			dim := normalizeHopperDim(session.Dimension())
+			s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+			return nil
+		}
+		tr.mu.Unlock()
+		return nil
+	}
 	if slot < 0 || slot >= HopperBlockMenuSlotCount {
 		return nil
 	}
@@ -2871,13 +2896,27 @@ func (s *Server) HandleHopperClick(session *PlayerSession, open *OpenContainerSt
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 32, 41)
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 5, 32)
 		} else {
+			prevCount := slots[slot].Count
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, HopperBlockSlotCount)
+			if slots[slot].Count == prevCount && prevCount > 0 {
+				if slot >= 5 && slot < 32 {
+					slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 32, 41)
+				} else if slot >= 32 && slot < 41 {
+					slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 5, 32)
+				}
+			}
 		}
 	case ContainerInputSwap:
 		if button >= 0 && button < 9 {
 			hotbarIdx := 32 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		} else if button == 40 {
+			offStack := session.InventorySlot(OffHandContainerSlot)
+			slots[slot], offStack = offStack, slots[slot]
+			session.SetInventorySlot(OffHandContainerSlot, offStack)
 		}
+	case ContainerInputPickupAll:
+		applyPickupAllSlice(slots, &tr.carried, 0)
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)

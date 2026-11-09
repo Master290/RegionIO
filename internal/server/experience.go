@@ -449,6 +449,13 @@ func (s *Server) AddPlayerExperienceLevels(session *PlayerSession, deltaLevels i
 // filter). Each 1 XP point repairs up to 2 durability damage. Repaired slots
 // are synchronized to the client via PlayContainerSetSlot.
 func (s *Server) RepairPlayerMendingItems(session *PlayerSession, points int32) (remainingXP, repairedDurability int32) {
+	return s.RepairPlayerMendingItemsWithRng(session, points, nil)
+}
+
+// RepairPlayerMendingItemsWithRng repairs damaged Mending-enchanted items in
+// session's 6 equipment slots, selecting eligible damaged Mending slots in a
+// randomized order using rng (or the global PRNG when rng == nil).
+func (s *Server) RepairPlayerMendingItemsWithRng(session *PlayerSession, points int32, rng *rand.Rand) (remainingXP, repairedDurability int32) {
 	if session == nil || points <= 0 {
 		return points, 0
 	}
@@ -459,7 +466,30 @@ func (s *Server) RepairPlayerMendingItems(session *PlayerSession, points int32) 
 			mainSlot = int(snap.SelectedSlot)
 		}
 	}
-	candidateSlots := []int{mainSlot, 45, 5, 6, 7, 8}
+	allSlots := []int{mainSlot, 45, 5, 6, 7, 8}
+	candidateSlots := make([]int, 0, len(allSlots))
+	for _, slot := range allSlots {
+		stack := session.InventorySlot(slot)
+		if stack.IsEmpty() {
+			continue
+		}
+		meta := GetSlotItemMeta(session, slot)
+		if meta.Damage <= 0 || meta.EnchantmentLevel("minecraft:mending") <= 0 {
+			continue
+		}
+		candidateSlots = append(candidateSlots, slot)
+	}
+	if len(candidateSlots) > 1 {
+		if rng != nil {
+			rng.Shuffle(len(candidateSlots), func(i, j int) {
+				candidateSlots[i], candidateSlots[j] = candidateSlots[j], candidateSlots[i]
+			})
+		} else {
+			rand.Shuffle(len(candidateSlots), func(i, j int) {
+				candidateSlots[i], candidateSlots[j] = candidateSlots[j], candidateSlots[i]
+			})
+		}
+	}
 	remXP := points
 
 	for _, slot := range candidateSlots {

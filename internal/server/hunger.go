@@ -2,6 +2,7 @@ package server
 
 import (
 	"math"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -910,6 +911,9 @@ func (s *Server) StartEating(session *PlayerSession, hand int32) bool {
 	if !ok || !session.CanEat(props) {
 		return false
 	}
+	if normalizeFoodItemID(stack.ResolvedID()) == "minecraft:chorus_fruit" && session.IsItemOnCooldown("minecraft:chorus_fruit") {
+		return false
+	}
 
 	st := getHungerState(session)
 	st.mu.Lock()
@@ -1001,6 +1005,9 @@ func (s *Server) consumeFoodFromHand(session *PlayerSession, hand int32) bool {
 	slot, stack := session.handSlotAndStack(hand)
 	props, ok := FoodPropertiesForStack(stack)
 	if !ok || !session.CanEat(props) {
+		return false
+	}
+	if normalizeFoodItemID(stack.ResolvedID()) == "minecraft:chorus_fruit" && session.IsItemOnCooldown("minecraft:chorus_fruit") {
 		return false
 	}
 
@@ -1122,11 +1129,94 @@ func (s *Server) applyConsumedFoodEffects(session *PlayerSession, stack world.It
 		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectPoison, 1200, 1))
 		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectHunger, 300, 2))
 		s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectNausea, 300, 0))
+	case "minecraft:chorus_fruit":
+		s.TeleportPlayerWithChorusFruit(session, nil)
+		session.SetItemCooldown("minecraft:chorus_fruit", 20)
+		if session.send != nil {
+			_ = session.send(protocol.PlayCooldown, EncodeCooldownPacket("minecraft:chorus_fruit", 20))
+		}
 	default:
 		if props.HungerEffectChance >= 0.8 {
 			s.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectHunger, 600, 0))
 		}
 	}
+}
+
+// TeleportPlayerWithChorusFruit implements TeleportRandomlyConsumeEffect for a
+// player eating minecraft:chorus_fruit: dismounts any vehicle, attempts up to
+// 16 random candidate positions within ±8 blocks horizontally and ±8 blocks
+// vertically to find solid non-fluid ground with 2 passable blocks above,
+// resets fall distance, and broadcasts SoundChorusFruitTeleport + GameEventTeleport.
+func (s *Server) TeleportPlayerWithChorusFruit(session *PlayerSession, rng *rand.Rand) (newX, newY, newZ float64, teleported bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return 0, 0, 0, false
+	}
+	s.DismountPlayerVehicle(session)
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	cache := s.DimensionChunks(dim)
+	r := rng
+	if r == nil {
+		r = rand.New(rand.NewSource(int64(math.Float64bits(snap.X+snap.Z+snap.Y)) ^ 0x5deece66d))
+	}
+
+	minY := world.MinY + 1
+	maxY := world.MinY + world.WorldHeight - 2
+	for attempt := 0; attempt < 16; attempt++ {
+		tx := snap.X + (r.Float64()-0.5)*16.0
+		tz := snap.Z + (r.Float64()-0.5)*16.0
+		ty := int(math.Floor(snap.Y)) + r.Intn(16) - 8
+		if ty < minY {
+			ty = minY
+		}
+		if ty > maxY {
+			ty = maxY
+		}
+		bx := int(math.Floor(tx))
+		bz := int(math.Floor(tz))
+		if cache == nil {
+			continue
+		}
+		for ty > minY && isPassableBlock(cache.GetBlock(bx, ty-1, bz)) {
+			ty--
+		}
+		below := cache.GetBlock(bx, ty-1, bz)
+		feet := cache.GetBlock(bx, ty, bz)
+		head := cache.GetBlock(bx, ty+1, bz)
+		belowName := world.BlockName(below)
+		feetName := world.BlockName(feet)
+		headName := world.BlockName(head)
+		isBelowLiquid := belowName == "minecraft:water" || belowName == "minecraft:lava" || world.IsWaterlogged(below)
+		isFeetLiquid := feetName == "minecraft:water" || feetName == "minecraft:lava" || world.IsWaterlogged(feet)
+		isHeadLiquid := headName == "minecraft:water" || headName == "minecraft:lava" || world.IsWaterlogged(head)
+		if !isPassableBlock(below) && !isBelowLiquid &&
+			isPassableBlock(feet) && !isFeetLiquid &&
+			isPassableBlock(head) && !isHeadLiquid {
+			newX, newY, newZ = tx, float64(ty), tz
+			teleported = true
+			break
+		}
+	}
+	if !teleported {
+		return snap.X, snap.Y, snap.Z, false
+	}
+
+	session.ResetFallDistance()
+	_ = s.TeleportPlayer(session, newX, newY, newZ, snap.Yaw, snap.Pitch)
+	cx := int32(int64(math.Floor(newX)) >> 4)
+	cz := int32(int64(math.Floor(newZ)) >> 4)
+	s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundChorusFruitTeleport, SoundSourcePlayers, newX, newY, newZ, 1.0, 1.0, 0))
+	s.EmitVibration(VibrationEvent{
+		Dimension:      dim,
+		Type:           GameEventTeleport,
+		X:              snap.X,
+		Y:              snap.Y,
+		Z:              snap.Z,
+		Player:         session,
+		SourceEntityID: snap.EntityID,
+	})
+	return newX, newY, newZ, true
 }
 
 // DecodeUseItemPacket decodes a serverbound use_item (0x43) packet body:
@@ -1172,8 +1262,10 @@ func (s *Server) HandleUseItemPacket(session *PlayerSession, r *protocol.Reader)
 		if _, boosted := s.UseFireworkRocketInAir(session, hand); !boosted && !s.UseCrossbow(session, hand) {
 			if !s.StartEating(session, hand) && !s.UsePotionOrMilkItem(session, hand) {
 				if !s.UseEmptyMap(session, hand) && !s.UseBookItem(session, hand) {
-					if cast, wear := s.UseFishingRod(session, hand); !cast && wear == 0 {
-						s.UseShield(session, hand)
+					if !s.UseExperienceBottle(session, hand, nil) && !s.UseProjectileItem(session, hand) {
+						if cast, wear := s.UseFishingRod(session, hand); !cast && wear == 0 {
+							s.UseShield(session, hand)
+						}
 					}
 				}
 			}

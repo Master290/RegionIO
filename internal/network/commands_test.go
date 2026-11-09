@@ -1136,3 +1136,74 @@ func TestCommandsCreativeInventoryCraftingBookAndTradesParity26_1_2(t *testing.T
 		t.Fatal("expected experience orb entity spawn (PlayAddEntity) after completing villager trade")
 	}
 }
+
+func TestEffectXPGameRuleAttributeAndDamageCommandsParity(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	srv, err := server.NewWithCache(cfg, world.NewCache(256, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	alice, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{41}, Name: "Alice"}, func(int32, []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Alice): %v", err)
+	}
+	_ = srv.GrantOp(alice.Profile)
+	_ = srv.SetPlayerGameMode(alice, server.GameModeSurvival)
+	srv.SetPlayerTransform(alice, 0, 65, 0, 0, 0, true)
+
+	// 1. /effect give and /effect clear
+	out := ExecuteCommand(srv, alice, "/effect give @s minecraft:speed 30 1")
+	if !alice.HasPlayerEffect(server.EffectSpeed) {
+		t.Fatalf("expected /effect give to apply speed, out=%q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/effect clear @s minecraft:speed")
+	if alice.HasPlayerEffect(server.EffectSpeed) {
+		t.Fatal("expected /effect clear to remove speed")
+	}
+
+	// 2. /xp add / set / query
+	_ = ExecuteCommand(srv, alice, "/xp set @s 5 levels")
+	if alice.ExperienceLevel() != 5 {
+		t.Fatalf("expected level 5 after /xp set, got %d", alice.ExperienceLevel())
+	}
+	baseXP := alice.TotalExperience()
+	_ = ExecuteCommand(srv, alice, "/xp add @s 20 points")
+	if alice.TotalExperience() <= baseXP {
+		t.Fatalf("expected total XP > %d after /xp add 20 points, got %d", baseXP, alice.TotalExperience())
+	}
+	qOut := ExecuteCommand(srv, alice, "/xp query @s levels")
+	if !strings.Contains(qOut, "5") && !strings.Contains(qOut, "6") {
+		t.Fatalf("expected /xp query levels to report 5 or 6, got %q", qOut)
+	}
+
+	// 3. /gamerule query and set (keepInventory, doImmediateRespawn)
+	_ = ExecuteCommand(srv, alice, "/gamerule keepInventory true")
+	if !srv.KeepInventory() {
+		t.Fatal("expected keepInventory=true after /gamerule keepInventory true")
+	}
+	_ = ExecuteCommand(srv, alice, "/gamerule doImmediateRespawn true")
+	if !srv.DoImmediateRespawn() {
+		t.Fatal("expected doImmediateRespawn=true after /gamerule doImmediateRespawn true")
+	}
+
+	// 4. /attribute base set and modifier add/value get
+	_ = ExecuteCommand(srv, alice, "/attribute @s minecraft:knockback_resistance base set 0.2")
+	_ = ExecuteCommand(srv, alice, "/attribute @s minecraft:knockback_resistance modifier add test:kb_bonus 0.3 add_value")
+	if math.Abs(srv.PlayerKnockbackResistance(alice)-0.5) > 1e-6 {
+		t.Fatalf("expected PlayerKnockbackResistance = 0.5 from base+modifier, got %v", srv.PlayerKnockbackResistance(alice))
+	}
+
+	// 5. /damage with physical cause ("mob") respects worn armor defense & toughness, while "out_of_world" bypasses armor
+	alice.SetInventorySlot(server.ArmorSlotHead, world.NewNamedItemStack("minecraft:diamond_helmet", 1))
+	alice.SetInventorySlot(server.ArmorSlotChest, world.NewNamedItemStack("minecraft:diamond_chestplate", 1))
+	alice.SetInventorySlot(server.ArmorSlotLegs, world.NewNamedItemStack("minecraft:diamond_leggings", 1))
+	alice.SetInventorySlot(server.ArmorSlotFeet, world.NewNamedItemStack("minecraft:diamond_boots", 1))
+	srv.HealPlayer(alice, 20.0)
+	_ = ExecuteCommand(srv, alice, "/damage @s 3.0 mob")
+	// Full diamond armor reduces 3.0 mob damage to 0.69 -> HP = 19.31.
+	if math.Abs(float64(alice.Health()-19.31)) > 1e-2 {
+		t.Fatalf("expected /damage @s 3.0 mob with full diamond armor to leave HP=19.31, got %v", alice.Health())
+	}
+}
+

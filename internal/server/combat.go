@@ -327,11 +327,63 @@ func ScaleDamageByDifficulty(damage float32, diff Difficulty) float32 {
 	}
 }
 
+// KnockbackResistance returns the total knockback resistance in [0.0, 1.0]
+// granted by worn Netherite armor in container slots 5..8 (0.1 per piece).
+func (session *PlayerSession) KnockbackResistance() float64 {
+	if session == nil {
+		return 0
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	var kbRes float64
+	for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
+		stack := session.inventory[slot]
+		if stack.IsEmpty() {
+			continue
+		}
+		switch normalizeFoodItemID(stack.ResolvedID()) {
+		case "minecraft:netherite_helmet",
+			"minecraft:netherite_chestplate",
+			"minecraft:netherite_leggings",
+			"minecraft:netherite_boots":
+			kbRes += 0.1
+		}
+	}
+	if kbRes > 1.0 {
+		kbRes = 1.0
+	}
+	return kbRes
+}
+
+// PlayerKnockbackResistance returns session's effective knockback resistance in
+// [0.0, 1.0], combining worn Netherite armor (0.1 per piece) with any
+// minecraft:knockback_resistance attribute modifiers on the player.
+func (s *Server) PlayerKnockbackResistance(session *PlayerSession) float64 {
+	if session == nil {
+		return 0
+	}
+	res := session.KnockbackResistance()
+	if s != nil {
+		if attrTotal, err := s.GetTargetAttributeTotal(session, 0, "minecraft:knockback_resistance"); err == nil && attrTotal > 0 {
+			res += attrTotal
+		}
+	}
+	if res < 0 {
+		return 0
+	}
+	if res > 1.0 {
+		return 1.0
+	}
+	return res
+}
+
 type playerCombatState struct {
 	mu                   sync.Mutex
 	attackStrengthTicker int
 	lastSelectedSlot     int32
 	shieldBlocking       bool
+	invulnerableTicks    int
+	lastHurtDamage       float32
 }
 
 var playerCombatStates sync.Map // map[*PlayerSession]*playerCombatState
@@ -531,7 +583,183 @@ func (s *Server) tickPlayerCombatCooldown(session *PlayerSession) {
 	} else if st.attackStrengthTicker < 10000 {
 		st.attackStrengthTicker++
 	}
+	if st.invulnerableTicks > 0 {
+		st.invulnerableTicks--
+		if st.invulnerableTicks <= 0 {
+			st.invulnerableTicks = 0
+			st.lastHurtDamage = 0
+		}
+	}
 	st.mu.Unlock()
+}
+
+// DefaultInvulnerableTicks is the vanilla 26.1.2 LivingEntity.invulnerableTime
+// duration (20 ticks, with a 10-tick damage-immunity half-period).
+const (
+	DefaultInvulnerableTicks     = 20
+	InvulnerableHalfPeriodTicks  = 10
+)
+
+// InvulnerableTicks returns session's remaining damage invulnerability ticks (0..20).
+func (session *PlayerSession) InvulnerableTicks() int {
+	if session == nil {
+		return 0
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.invulnerableTicks
+}
+
+// SetInvulnerableTicks sets session's remaining damage invulnerability ticks.
+func (session *PlayerSession) SetInvulnerableTicks(ticks int) {
+	if session == nil {
+		return
+	}
+	if ticks < 0 {
+		ticks = 0
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	st.invulnerableTicks = ticks
+	if ticks == 0 {
+		st.lastHurtDamage = 0
+	}
+	st.mu.Unlock()
+}
+
+// LastHurtDamage returns the raw damage amount recorded on session's most recent
+// hit during its current invulnerability window.
+func (session *PlayerSession) LastHurtDamage() float32 {
+	if session == nil {
+		return 0
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.lastHurtDamage
+}
+
+// SetLastHurtDamage sets the raw damage amount recorded for session's current
+// invulnerability window.
+func (session *PlayerSession) SetLastHurtDamage(dmg float32) {
+	if session == nil {
+		return
+	}
+	if dmg < 0 {
+		dmg = 0
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	st.lastHurtDamage = dmg
+	st.mu.Unlock()
+}
+
+// EvaluateInvulnerabilityDamage implements vanilla 26.1.2 LivingEntity.hurtServer
+// invulnerability window logic (invulnerableTime = 20, half-period = 10):
+//   - Bypasses invulnerability for out_of_world / generic_kill / kill.
+//   - When invulnerableTicks > 10: rejects hits with rawDamage <= lastHurt;
+//     for stronger hits (rawDamage > lastHurt), deals only (rawDamage - lastHurt)
+//     and updates lastHurt to rawDamage.
+//   - When invulnerableTicks <= 10: deals full rawDamage and starts a new
+//     20-tick window with lastHurt = rawDamage.
+func EvaluateInvulnerabilityDamage(rawDamage float32, cause string, invulnerableTicks int, lastHurt float32) (effectiveRaw float32, newInvulnerableTicks int, newLastHurt float32, allowed bool) {
+	if rawDamage <= 0 {
+		return 0, invulnerableTicks, lastHurt, false
+	}
+	switch cause {
+	case "out_of_world", "generic_kill", "kill":
+		return rawDamage, invulnerableTicks, lastHurt, true
+	}
+	if invulnerableTicks > InvulnerableHalfPeriodTicks {
+		if rawDamage <= lastHurt {
+			return 0, invulnerableTicks, lastHurt, false
+		}
+		return rawDamage - lastHurt, invulnerableTicks, rawDamage, true
+	}
+	return rawDamage, DefaultInvulnerableTicks, rawDamage, true
+}
+
+// DamagePlayerWithInvulnerability applies rawDamage to session while enforcing
+// the 20-tick invulnerability period (and lastHurt difference upgrade) before
+// delegating to DamagePlayerWithArmor.
+func (s *Server) DamagePlayerWithInvulnerability(session *PlayerSession, rawDamage float32, cause string) float32 {
+	if s == nil || session == nil || rawDamage <= 0 || session.IsDead() {
+		return 0
+	}
+	st := getCombatState(session)
+	st.mu.Lock()
+	effRaw, nextTicks, nextLastHurt, ok := EvaluateInvulnerabilityDamage(rawDamage, cause, st.invulnerableTicks, st.lastHurtDamage)
+	if !ok {
+		st.mu.Unlock()
+		return 0
+	}
+	st.invulnerableTicks = nextTicks
+	st.lastHurtDamage = nextLastHurt
+	st.mu.Unlock()
+	if cause == "out_of_world" || cause == "generic_kill" || cause == "kill" {
+		s.DamagePlayer(session, effRaw, cause)
+		return effRaw
+	}
+	return s.DamagePlayerWithArmor(session, effRaw, cause)
+}
+
+// ApplyThornsRetaliation evaluates worn armor slots (5..8) on target for the
+// minecraft:thorns enchantment (level L > 0: 0.15*L trigger chance per piece,
+// 1..4 damage or L-10 when L > 10, plus 2 durability wear on the triggering
+// armor piece) and applies the resulting thorns damage to attackerMobID or
+// attackerPlayer.
+func (s *Server) ApplyThornsRetaliation(target *PlayerSession, attackerMobID int32, attackerPlayer *PlayerSession, rng *rand.Rand) float32 {
+	if s == nil || target == nil {
+		return 0
+	}
+	r := rng
+	if r == nil {
+		r = rand.New(rand.NewSource(int64(target.EntityID)*31 + int64(attackerMobID)*17 + 1))
+	}
+	var totalThornsDamage float32
+	for slot := ArmorSlotHead; slot <= ArmorSlotFeet; slot++ {
+		stack := target.InventorySlot(slot)
+		if stack.IsEmpty() {
+			continue
+		}
+		meta := GetSlotItemMeta(target, slot)
+		lvl := meta.EnchantmentLevel("minecraft:thorns")
+		if lvl <= 0 {
+			continue
+		}
+		chance := 0.15 * float64(lvl)
+		if r.Float64() >= chance {
+			continue
+		}
+		var dmg int32
+		if lvl > 10 {
+			dmg = int32(lvl - 10)
+		} else {
+			dmg = int32(1 + r.Intn(4))
+		}
+		if dmg > 0 {
+			totalThornsDamage += float32(dmg)
+		}
+		s.DamagePlayerItemWithRand(target, slot, 2, r)
+	}
+	if totalThornsDamage <= 0 {
+		return 0
+	}
+	snap := target.Snapshot()
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket("minecraft:enchant.thorns.hit", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+	if attackerMobID > 0 && s.entities != nil {
+		if mob := s.entities.Get(attackerMobID); mob != nil {
+			s.applyDamageToMob(mob, totalThornsDamage, target, 0, false, false)
+		}
+	}
+	if attackerPlayer != nil && !attackerPlayer.IsDead() {
+		s.DamagePlayerWithEffects(attackerPlayer, totalThornsDamage, "thorns")
+	}
+	return totalThornsDamage
 }
 
 // ComputeKnockback computes the horizontal (vx, vz) and vertical (vy) knockback
@@ -1215,9 +1443,11 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 	} else if mobID > 0 {
 		s.NotifyOwnerDamagedByMob(target, mobID)
 		s.NotifyTrustedPlayerAttacked(target, mobID)
+		s.ApplyThornsRetaliation(target, mobID, nil, nil)
 	}
 	snap := target.Snapshot()
-	vx, vy, vz := ComputeKnockback(mobX, mobZ, 0, snap.X, snap.Z, BaseKnockbackStrength)
+	kbStrength := BaseKnockbackStrength * (1.0 - s.PlayerKnockbackResistance(target))
+	vx, vy, vz := ComputeKnockback(mobX, mobZ, 0, snap.X, snap.Z, kbStrength)
 	if target.send != nil {
 		_ = target.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(target.EntityID, vx, vy, vz))
 	}
@@ -1279,6 +1509,7 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		if dealt <= 0 {
 			return 0, false
 		}
+		s.ApplyThornsRetaliation(victim, 0, session, nil)
 		if victim.IsDead() {
 			s.IncrementCriteriaObjectives(session.Profile.Name, "playerKillCount", 1)
 			s.IncrementCriteriaObjectives(session.Profile.Name, "totalKillCount", 1)
