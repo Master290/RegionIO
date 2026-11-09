@@ -107,23 +107,47 @@ type scheduledUpdateKey struct {
 	kind BlockUpdateKind
 }
 
+// TickPriority represents the execution priority of a scheduled block or fluid
+// tick within the same game tick (`net.minecraft.world.ticks.TickPriority`).
+// Lower numeric values execute first.
+type TickPriority int8
+
+const (
+	TickPriorityExtremelyHigh TickPriority = -3 // EXTREMELY_HIGH (-3): diode facing another diode
+	TickPriorityVeryHigh      TickPriority = -2 // VERY_HIGH (-2): repeater turning off
+	TickPriorityHigh          TickPriority = -1 // HIGH (-1): repeater turning on, or comparator facing another diode
+	TickPriorityNormal        TickPriority = 0  // NORMAL (0): default priority
+	TickPriorityLow           TickPriority = 1  // LOW (1)
+	TickPriorityVeryLow       TickPriority = 2  // VERY_LOW (2)
+	TickPriorityExtremelyLow  TickPriority = 3  // EXTREMELY_LOW (3)
+
+	// DefaultMaxChainedNeighborUpdates matches vanilla `max-chained-neighbor-updates`
+	// in `server.properties` (`CollectingNeighborUpdater`).
+	DefaultMaxChainedNeighborUpdates = 1000000
+)
+
 type scheduledUpdate struct {
-	pos     BlockPos
-	kind    BlockUpdateKind
-	dueTick uint64
-	seq     uint64
+	pos      BlockPos
+	kind     BlockUpdateKind
+	dueTick  uint64
+	priority TickPriority
+	seq      uint64
 }
 
 // BlockUpdateScheduler manages the per-world tick queue for gravity, fluid flow,
 // and neighbor block updates on a Cache.
 type BlockUpdateScheduler struct {
-	c            *Cache
-	mu           sync.Mutex
-	tick         uint64
-	nextSeq      uint64
-	pending      map[scheduledUpdateKey]scheduledUpdate
-	fallDist     map[BlockPos]int
-	anvilLanding FallingAnvilLandingHook
+	c                         *Cache
+	mu                        sync.Mutex
+	tick                      uint64
+	nextSeq                   uint64
+	pending                   map[scheduledUpdateKey]scheduledUpdate
+	fallDist                  map[BlockPos]int
+	anvilLanding              FallingAnvilLandingHook
+	maxChainedNeighborUpdates int
+	chainedDepth              int
+	chainedCount              int
+	suppressedNeighborUpdates int
 }
 
 var cacheSchedulers sync.Map // map[*Cache]*BlockUpdateScheduler
@@ -136,9 +160,10 @@ func (c *Cache) BlockUpdates() *BlockUpdateScheduler {
 		return s.(*BlockUpdateScheduler)
 	}
 	created := &BlockUpdateScheduler{
-		c:        c,
-		pending:  make(map[scheduledUpdateKey]scheduledUpdate),
-		fallDist: make(map[BlockPos]int),
+		c:                         c,
+		pending:                   make(map[scheduledUpdateKey]scheduledUpdate),
+		fallDist:                  make(map[BlockPos]int),
+		maxChainedNeighborUpdates: DefaultMaxChainedNeighborUpdates,
 	}
 	actual, _ := cacheSchedulers.LoadOrStore(c, created)
 	return actual.(*BlockUpdateScheduler)
@@ -174,10 +199,18 @@ func (c *Cache) PendingBlockUpdates() int {
 }
 
 // ScheduleBlockUpdate queues a block update at (x, y, z) to execute after
-// delayTicks game ticks (minimum 1). Duplicate schedules for the same position
-// and kind keep the earliest due tick.
+// delayTicks game ticks (minimum 1) with TickPriorityNormal. Duplicate schedules
+// for the same position and kind keep the earliest due tick.
 func (c *Cache) ScheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTicks int) {
-	if y < MinY || y >= MinY+WorldHeight {
+	c.ScheduleBlockUpdateWithPriority(x, y, z, kind, delayTicks, TickPriorityNormal)
+}
+
+// ScheduleBlockUpdateWithPriority queues a block update at (x, y, z) to execute
+// after delayTicks game ticks (minimum 1) with the given TickPriority. Duplicate
+// schedules for the same position and kind keep the earliest due tick (upgrading
+// priority when scheduled for the same due tick with a higher priority).
+func (c *Cache) ScheduleBlockUpdateWithPriority(x, y, z int, kind BlockUpdateKind, delayTicks int, priority TickPriority) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
 		return
 	}
 	if delayTicks < 1 {
@@ -188,22 +221,39 @@ func (c *Cache) ScheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTick
 	defer s.mu.Unlock()
 	due := s.tick + uint64(delayTicks)
 	key := scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}
-	if existing, ok := s.pending[key]; ok && existing.dueTick <= due {
-		return
+	if existing, ok := s.pending[key]; ok {
+		if existing.dueTick < due {
+			return
+		}
+		if existing.dueTick == due {
+			if priority < existing.priority {
+				existing.priority = priority
+				s.pending[key] = existing
+			}
+			return
+		}
 	}
 	s.nextSeq++
 	s.pending[key] = scheduledUpdate{
-		pos:     key.pos,
-		kind:    kind,
-		dueTick: due,
-		seq:     s.nextSeq,
+		pos:      key.pos,
+		kind:     kind,
+		dueTick:  due,
+		priority: priority,
+		seq:      s.nextSeq,
 	}
 }
 
 // RescheduleBlockUpdate queues or refreshes a block update at (x, y, z) to
-// execute after delayTicks game ticks (minimum 1), overwriting any existing
-// due tick for the same position and kind.
+// execute after delayTicks game ticks (minimum 1) with TickPriorityNormal,
+// overwriting any existing due tick for the same position and kind.
 func (c *Cache) RescheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTicks int) {
+	c.RescheduleBlockUpdateWithPriority(x, y, z, kind, delayTicks, TickPriorityNormal)
+}
+
+// RescheduleBlockUpdateWithPriority queues or refreshes a block update at
+// (x, y, z) to execute after delayTicks game ticks (minimum 1) with the given
+// TickPriority, overwriting any existing due tick for the same position and kind.
+func (c *Cache) RescheduleBlockUpdateWithPriority(x, y, z int, kind BlockUpdateKind, delayTicks int, priority TickPriority) {
 	if c == nil || y < MinY || y >= MinY+WorldHeight {
 		return
 	}
@@ -217,11 +267,28 @@ func (c *Cache) RescheduleBlockUpdate(x, y, z int, kind BlockUpdateKind, delayTi
 	key := scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}
 	s.nextSeq++
 	s.pending[key] = scheduledUpdate{
-		pos:     key.pos,
-		kind:    kind,
-		dueTick: due,
-		seq:     s.nextSeq,
+		pos:      key.pos,
+		kind:     kind,
+		dueTick:  due,
+		priority: priority,
+		seq:      s.nextSeq,
 	}
+}
+
+// ScheduledBlockUpdatePriority returns the TickPriority of the pending scheduled
+// update of kind at (x, y, z), or (0, false) if none is queued.
+func (c *Cache) ScheduledBlockUpdatePriority(x, y, z int, kind BlockUpdateKind) (TickPriority, bool) {
+	if c == nil {
+		return 0, false
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.pending[scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}]
+	if !ok {
+		return 0, false
+	}
+	return u.priority, true
 }
 
 // CancelScheduledBlockUpdate removes any pending scheduled update of kind at (x, y, z).
@@ -260,6 +327,9 @@ func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpd
 				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
 			} else if isBlockNamed(oldState, "minecraft:piston") || isBlockNamed(oldState, "minecraft:sticky_piston") {
 				c.ClearPistonRuntimeAt(x, y, z)
+				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+			} else if isBlockNamed(oldState, "minecraft:redstone_torch") || isBlockNamed(oldState, "minecraft:redstone_wall_torch") {
+				c.ResetRedstoneTorchBurnoutAt(x, y, z)
 				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
 			} else if IsCommandBlock(oldState) && !IsCommandBlock(targetState) {
 				c.RemoveCommandBlockEntityAt(x, y, z)
@@ -331,6 +401,9 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 	sort.Slice(due, func(i, j int) bool {
 		if due[i].dueTick != due[j].dueTick {
 			return due[i].dueTick < due[j].dueTick
+		}
+		if due[i].priority != due[j].priority {
+			return due[i].priority < due[j].priority
 		}
 		return due[i].seq < due[j].seq
 	})
@@ -429,6 +502,9 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
 		} else if isBlockNamed(oldState, "minecraft:piston") || isBlockNamed(oldState, "minecraft:sticky_piston") {
 			c.ClearPistonRuntimeAt(x, y, z)
+			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+		} else if isBlockNamed(oldState, "minecraft:redstone_torch") || isBlockNamed(oldState, "minecraft:redstone_wall_torch") {
+			c.ResetRedstoneTorchBurnoutAt(x, y, z)
 			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
 		} else if isBlockNamed(oldState, "minecraft:nether_portal") {
 			c.UnregisterPortalPOI(BlockPos{X: x, Y: y, Z: z})
@@ -627,6 +703,11 @@ func (c *Cache) touchesWater(x, y, z int) bool {
 }
 
 func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
+	if !c.enterChainedNeighborUpdatePass() {
+		return
+	}
+	defer c.exitChainedNeighborUpdatePass()
+
 	// BaseFireBlock.onPlace: placing fire or soul_fire inside a valid unlit obsidian
 	// frame in the Overworld or Nether immediately lights the Nether portal.
 	if IsAnyFireBlock(newState) && !IsAnyFireBlock(oldState) {
@@ -916,6 +997,9 @@ func (c *Cache) runNeighborSupportPass(x, y, z int, res *BlockUpdateResult) {
 		cur := queue[0]
 		queue = queue[1:]
 		delete(seen, cur)
+		if cur != self && !c.allowChainedNeighborUpdate() {
+			break
+		}
 
 		state := c.GetBlock(cur.X, cur.Y, cur.Z)
 		if isAirState(state) {
@@ -2586,7 +2670,7 @@ func (c *Cache) scheduledEntryFromUpdateLocked(s *BlockUpdateScheduler, u schedu
 		Z:            u.pos.Z,
 		Kind:         u.kind,
 		Delay:        delay,
-		Priority:     0,
+		Priority:     int(u.priority),
 		BlockID:      blockID,
 		FallDistance: s.fallDist[u.pos],
 	}
@@ -2664,10 +2748,11 @@ func (c *Cache) ImportScheduledBlockTicks(entries []ScheduledBlockTickEntry) int
 		}
 		s.nextSeq++
 		s.pending[key] = scheduledUpdate{
-			pos:     pos,
-			kind:    e.Kind,
-			dueTick: due,
-			seq:     s.nextSeq,
+			pos:      pos,
+			kind:     e.Kind,
+			dueTick:  due,
+			priority: TickPriority(e.Priority),
+			seq:      s.nextSeq,
 		}
 		if e.Kind == UpdateFalling && e.FallDistance > 0 {
 			s.fallDist[pos] = e.FallDistance

@@ -1130,6 +1130,11 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 		soundEvent = LevelEventSoundLaunchProjectile
 		consumeOne = true
 
+	case itemID == "minecraft:trident":
+		s.dispenseTridentProjectile(normDim, x, y, z, facing, rng)
+		soundEvent = LevelEventSoundLaunchProjectile
+		consumeOne = true
+
 	case itemID == "minecraft:snowball" || itemID == "minecraft:egg" || itemID == "minecraft:wind_charge":
 		s.dispenseThrownProjectile(normDim, x, y, z, facing, itemID, rng)
 		soundEvent = LevelEventSoundLaunchProjectile
@@ -1342,6 +1347,26 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			single := world.NewNamedItemStack("minecraft:glowstone", 1)
 			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
 			consumeOne = true
+		}
+
+	// 12c. Spawn Eggs (`*_spawn_egg`).
+	case isDispenserSpawnEgg(itemID):
+		if s.dispenseSpawnEgg(normDim, fx, fy, fz, facing, itemID) > 0 {
+			consumeOne = true
+		} else {
+			succeeded = false
+			soundEvent = LevelEventSoundFailDispense
+			emitSmoke = false
+		}
+
+	// 12d. Armor Stand (`minecraft:armor_stand`).
+	case itemID == "minecraft:armor_stand":
+		if s.dispenseArmorStand(normDim, cache, fx, fy, fz, facing) > 0 {
+			consumeOne = true
+		} else {
+			succeeded = false
+			soundEvent = LevelEventSoundFailDispense
+			emitSmoke = false
 		}
 
 	// 13. Default behavior: eject 1 item into the world.
@@ -2671,6 +2696,14 @@ func (s *Server) dispenseShears(dim string, cache *world.Cache, fx, fy, fz int, 
 			if _, sheared := s.ShearBogged(nil, ent.ID, rng); sheared {
 				return true
 			}
+		case MobTypeMooshroom:
+			if s.dispenseShearMooshroom(dim, ent) {
+				return true
+			}
+		case MobTypeCopperGolem:
+			if s.dispenseShearCopperGolem(dim, ent) {
+				return true
+			}
 		case MobTypeWolf:
 			if _, _, sheared := s.RemoveWolfArmorWithShears(nil, ent.ID); sheared {
 				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
@@ -3483,6 +3516,205 @@ func (s *Server) LoadChunkDispenserBlockEntitiesNBT(dim string, list []*nbt.Comp
 		s.BindNoteBlockAndJukeboxRedstone(normDim)
 	}
 	return loaded
+}
+
+func (s *Server) dispenseTridentProjectile(dim string, x, y, z int, facing string, rng *rand.Rand) int32 {
+	px, py, pz := DispenserDispensePosition(x, y, z, facing, true)
+	vx, vy, vz := DispenserProjectileVelocity(facing, DispenserDefaultProjectilePower, DispenserDefaultProjectileUncertainty, rng)
+	entID := s.spawnDispenserProjectileEntity(dim, EntityTypeTrident, px, py, pz, vx, vy, vz)
+	proj := &DispenserProjectile{
+		EntityID:   entID,
+		TypeName:   EntityTypeTrident,
+		Dimension:  dim,
+		X:          px,
+		Y:          py,
+		Z:          pz,
+		VX:         vx,
+		VY:         vy,
+		VZ:         vz,
+		BaseDamage: 8.0,
+		MaxTicks:   200,
+	}
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	ds.projectiles[entID] = proj
+	ds.mu.Unlock()
+	s.EmitGameEvent(dim, GameEventProjectileShoot, px, py, pz, VibrationSource{EntityID: entID})
+	return entID
+}
+
+func isDispenserSpawnEgg(itemID string) bool {
+	return strings.HasSuffix(canonicalResourceName(itemID), "_spawn_egg")
+}
+
+// MobTypeForSpawnEgg resolves a `minecraft:*_spawn_egg` item ID to its spawned
+// entity resource location (e.g. `"minecraft:pig_spawn_egg"` -> `"minecraft:pig"`).
+func MobTypeForSpawnEgg(itemID string) (string, bool) {
+	norm := canonicalResourceName(itemID)
+	if !strings.HasSuffix(norm, "_spawn_egg") {
+		return "", false
+	}
+	mobName := strings.TrimSuffix(norm, "_spawn_egg")
+	if mobName == "" || mobName == "minecraft:" {
+		return "", false
+	}
+	return mobName, true
+}
+
+func (s *Server) dispenseSpawnEgg(dim string, fx, fy, fz int, facing, itemID string) int32 {
+	if s == nil || s.entities == nil || fy < world.MinY || fy >= world.MinY+world.WorldHeight {
+		return 0
+	}
+	mobType, ok := MobTypeForSpawnEgg(itemID)
+	if !ok {
+		return 0
+	}
+	normDim := normalizeDispenserDim(dim)
+	spawnX := float64(fx) + 0.5
+	spawnY := float64(fy)
+	if facing == "down" {
+		spawnY -= 0.5
+	}
+	spawnZ := float64(fz) + 0.5
+	if id, err := s.SpawnMobInDimension(normDim, spawnX, spawnY, spawnZ, mobType); err == nil && id > 0 {
+		s.EmitGameEvent(normDim, GameEventEntityPlace, spawnX, spawnY, spawnZ, VibrationSource{EntityID: id})
+		return id
+	}
+	typeID := ResolveEntityTypeID(mobType)
+	if typeID < 0 {
+		typeID = EntityTypePigID
+	}
+	id := s.entities.Add(&world.Entity{
+		TypeID:    typeID,
+		TypeName:  mobType,
+		Dimension: normDim,
+		X:         spawnX,
+		Y:         spawnY,
+		Z:         spawnZ,
+		OnGround:  true,
+	})
+	s.SetMobHealth(id, 20.0)
+	if spawned := s.entities.Get(id); spawned != nil {
+		cp := spawned.ChunkPos()
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, spawned))
+	}
+	s.EmitGameEvent(normDim, GameEventEntityPlace, spawnX, spawnY, spawnZ, VibrationSource{EntityID: id})
+	return id
+}
+
+func (s *Server) dispenseArmorStand(dim string, cache *world.Cache, fx, fy, fz int, facing string) int32 {
+	if s == nil || s.entities == nil || cache == nil || fy < world.MinY || fy+1 >= world.MinY+world.WorldHeight {
+		return 0
+	}
+	if !isDispenserFluidReplaceable(cache.GetBlock(fx, fy, fz)) || !isDispenserFluidReplaceable(cache.GetBlock(fx, fy+1, fz)) {
+		return 0
+	}
+	if len(s.mobsInBlockBox(dim, fx, fy, fz)) > 0 || len(s.mobsInBlockBox(dim, fx, fy+1, fz)) > 0 ||
+		len(s.armorStandsInBlockBox(dim, fx, fy, fz)) > 0 || len(s.armorStandsInBlockBox(dim, fx, fy+1, fz)) > 0 {
+		return 0
+	}
+	normDim := normalizeDispenserDim(dim)
+	var yaw float32
+	switch facing {
+	case "north":
+		yaw = 0 // faces south (180 degrees opposite north)
+	case "south":
+		yaw = 180 // faces north
+	case "west":
+		yaw = -90 // faces east
+	case "east":
+		yaw = 90 // faces west
+	}
+	typeID := ResolveEntityTypeID(EntityTypeArmorStand)
+	if typeID < 0 {
+		typeID = EntityTypeArmorStandID
+	}
+	spawnX := float64(fx) + 0.5
+	spawnY := float64(fy)
+	spawnZ := float64(fz) + 0.5
+	id := s.entities.Add(&world.Entity{
+		TypeID:    typeID,
+		TypeName:  EntityTypeArmorStand,
+		Dimension: normDim,
+		X:         spawnX,
+		Y:         spawnY,
+		Z:         spawnZ,
+		Yaw:       yaw,
+		HeadYaw:   yaw,
+		OnGround:  true,
+	})
+	s.SetMobHealth(id, 20.0)
+	if spawned := s.entities.Get(id); spawned != nil {
+		cp := spawned.ChunkPos()
+		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, spawned))
+	}
+	s.EmitGameEvent(normDim, GameEventEntityPlace, spawnX, spawnY, spawnZ, VibrationSource{EntityID: id})
+	return id
+}
+
+func (s *Server) dispenseShearMooshroom(dim string, ent *world.Entity) bool {
+	if s == nil || ent == nil || s.IsMobBaby(ent.ID) {
+		return false
+	}
+	normDim := normalizeDispenserDim(dim)
+	curHP := s.MobHealth(ent.ID)
+	if curHP <= 0 {
+		curHP = 10.0
+	}
+	if s.entities != nil {
+		s.entities.Remove(ent.ID)
+	}
+	cp := ent.ChunkPos()
+	s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{ent.ID}))
+
+	// Spawn 5 red_mushroom items and convert to a `minecraft:cow` at the same position.
+	s.SpawnItemEntityInDimension(normDim, ent.X, ent.Y+0.5, ent.Z, world.NewNamedItemStack("minecraft:red_mushroom", 5))
+	cowID, err := s.SpawnMobInDimension(normDim, ent.X, ent.Y, ent.Z, MobTypeCow)
+	if err != nil || cowID <= 0 {
+		cowTypeID := ResolveEntityTypeID(MobTypeCow)
+		if cowTypeID < 0 {
+			cowTypeID = 28
+		}
+		cowID = s.entities.Add(&world.Entity{
+			TypeID:    cowTypeID,
+			TypeName:  MobTypeCow,
+			Dimension: normDim,
+			X:         ent.X,
+			Y:         ent.Y,
+			Z:         ent.Z,
+			Yaw:       ent.Yaw,
+			Pitch:     ent.Pitch,
+			HeadYaw:   ent.HeadYaw,
+			OnGround:  ent.OnGround,
+		})
+	}
+	s.SetMobHealth(cowID, curHP)
+	s.EmitGameEvent(normDim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: cowID})
+	return true
+}
+
+func (s *Server) dispenseShearCopperGolem(dim string, ent *world.Entity) bool {
+	if s == nil || ent == nil {
+		return false
+	}
+	normDim := normalizeDispenserDim(dim)
+	ex := s.ensureCopperGolemExtra(ent.ID)
+	bt := s.batNautilusTracker()
+	bt.mu.Lock()
+	ant := ex.AntennaItem
+	if !ant.IsEmpty() {
+		ex.AntennaItem = world.ItemStack{}
+	}
+	bt.mu.Unlock()
+	if ant.IsEmpty() {
+		return false
+	}
+	s.SpawnItemEntityInDimension(normDim, ent.X, ent.Y+1.5, ent.Z, ant)
+	cp := ent.ChunkPos()
+	s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySoundPacketID,
+		EncodeSoundPacket(SoundCopperGolemShear, SoundSourceBlocks, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	s.EmitGameEvent(normDim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
+	return true
 }
 
 func init() {

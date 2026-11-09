@@ -231,13 +231,15 @@ func (c *Cache) isPistonPowered(x, y, z int, facing string) bool {
 // --- Vanilla PistonStructureResolver (12-Block Limit + Slime/Honey Adhesion) ---
 
 type pistonStructureResolver struct {
-	c         *Cache
-	pistonPos BlockPos
-	startPos  BlockPos
-	pushDir   string
+	c          *Cache
+	pistonPos  BlockPos
+	startPos   BlockPos
+	pistonDir  string
+	pushDir    string
+	extending  bool
 	dx, dy, dz int
-	toPush    []BlockPos
-	toDestroy []BlockPos
+	toPush     []BlockPos
+	toDestroy  []BlockPos
 }
 
 // ResolvePistonStructure runs the vanilla `PistonStructureResolver` algorithm
@@ -260,6 +262,8 @@ func (c *Cache) ResolvePistonStructure(x, y, z int, facing string, extending boo
 	r := &pistonStructureResolver{
 		c:         c,
 		pistonPos: BlockPos{X: x, Y: y, Z: z},
+		pistonDir: facing,
+		extending: extending,
 	}
 	if extending {
 		r.pushDir = facing
@@ -303,12 +307,12 @@ func (r *pistonStructureResolver) resolve() bool {
 	if isAirState(startState) {
 		return true
 	}
-	if !CanPistonPushBlockInDirection(startState, r.pushDir, true, r.pushDir) {
+	if !CanPistonPushBlockInDirection(startState, r.pushDir, false, r.pistonDir) {
+		if r.extending && isPistonDestroyOnPush(startState) {
+			r.addDestroy(r.startPos)
+			return true
+		}
 		return false
-	}
-	if isPistonDestroyOnPush(startState) {
-		r.addDestroy(r.startPos)
-		return true
 	}
 	if !r.addBlockLine(r.startPos, r.pushDir) {
 		return false
@@ -333,7 +337,7 @@ func (r *pistonStructureResolver) addBlockLine(origin BlockPos, branchDir string
 	if isAirState(curState) || origin == r.pistonPos {
 		return true
 	}
-	if !CanPistonPushBlockInDirection(curState, r.pushDir, false, branchDir) {
+	if !CanPistonPushBlockInDirection(curState, branchDir, false, r.pushDir) {
 		return true
 	}
 	if r.indexOfPush(origin) >= 0 {
@@ -585,6 +589,7 @@ func (c *Cache) tryExtendPiston(x, y, z int, state uint16, facing string, isStic
 		if !isAirState(oldSt) {
 			c.notifyPistonDestroyBlock(dp, oldSt)
 			c.setBlockRecorded(dp.X, dp.Y, dp.Z, StateAir, res)
+			c.propagateMultiBlockPartnerBreak(dp.X, dp.Y, dp.Z, oldSt, res)
 			if isBlockNamed(oldSt, "minecraft:tripwire") || isBlockNamed(oldSt, "minecraft:tripwire_hook") {
 				c.recalculateTripwireAround(dp.X, dp.Y, dp.Z, oldSt, StateAir, res)
 			}

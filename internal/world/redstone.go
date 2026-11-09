@@ -1524,9 +1524,10 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 					c.propagateRedstoneAround(x, y, z, curState, s2, res)
 				}
 			}
-			// If the input pulse already ended before this tick fired, schedule the turn-off tick.
+			// If the input pulse already ended before this tick fired, schedule the turn-off tick
+			// with TickPriorityVeryHigh (-2), matching DiodeBlock.tick in vanilla 26.1.2.
 			if !shouldTurnOn {
-				c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, RepeaterDelayTicks(curState))
+				c.ScheduleBlockUpdateWithPriority(x, y, z, UpdateRedstone, RepeaterDelayTicks(curState), TickPriorityVeryHigh)
 			}
 		}
 
@@ -1568,6 +1569,9 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 // comparators, schedules repeater delays, and updates doors, trapdoors, lamps,
 // note blocks, dispensers, droppers, crafters, and pistons affected by a change at (x, y, z).
 func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, res *BlockUpdateResult) {
+	if !c.allowChainedNeighborUpdate() {
+		return
+	}
 	toggledTorches := make(map[BlockPos]bool)
 	evaluatedComparators := make(map[BlockPos]int)
 	lastComparatorOutput := make(map[BlockPos]int)
@@ -1615,6 +1619,12 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 				wantLit := !c.isTorchSupportPowered(pos.X, pos.Y, pos.Z, info)
 				curLit := info.Properties["lit"] == "true"
 				if wantLit != curLit {
+					if wantLit && c.IsRedstoneTorchBurnedOutAt(pos.X, pos.Y, pos.Z) {
+						if !c.HasPendingBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone) {
+							c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, RedstoneTorchBurnoutRestartDelay)
+						}
+						continue
+					}
 					if toggledTorches[pos] {
 						// Prevent infinite combinational oscillation; schedule delayed flip.
 						c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, RedstoneTorchTickDelay)
@@ -1627,6 +1637,11 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 					}
 					if nextSt, ok := withStateProperty(st, "lit", litStr); ok {
 						if c.setBlockRecorded(pos.X, pos.Y, pos.Z, nextSt, res) {
+							if !wantLit {
+								if _, burnedOut := c.RecordRedstoneTorchToggleAt(pos.X, pos.Y, pos.Z); burnedOut {
+									c.RescheduleBlockUpdateWithPriority(pos.X, pos.Y, pos.Z, UpdateRedstone, RedstoneTorchBurnoutRestartDelay, TickPriorityNormal)
+								}
+							}
 							nextSeeds = append(nextSeeds, pos)
 							nextSeeds = append(nextSeeds, BlockPos{X: pos.X, Y: pos.Y + 1, Z: pos.Z})
 						}
@@ -1647,7 +1662,7 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 				stateChanged := false
 				if info.Properties["powered"] != wantPowered {
 					if evaluatedComparators[pos] >= 2 {
-						c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, ComparatorTickDelay)
+						c.ScheduleBlockUpdateWithPriority(pos.X, pos.Y, pos.Z, UpdateRedstone, ComparatorTickDelay, c.ComparatorTickPriority(pos.X, pos.Y, pos.Z, st))
 						continue
 					}
 					if nextSt, ok := withStateProperty(st, "powered", wantPowered); ok {
@@ -1656,7 +1671,7 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 						}
 					}
 				} else if seenOut && prevOut != out && evaluatedComparators[pos] >= 2 {
-					c.ScheduleBlockUpdate(pos.X, pos.Y, pos.Z, UpdateRedstone, ComparatorTickDelay)
+					c.ScheduleBlockUpdateWithPriority(pos.X, pos.Y, pos.Z, UpdateRedstone, ComparatorTickDelay, c.ComparatorTickPriority(pos.X, pos.Y, pos.Z, st))
 					continue
 				}
 				lastComparatorOutput[pos] = out
@@ -2080,6 +2095,12 @@ func (c *Cache) evaluateRedstoneTorchAt(x, y, z int, state uint16, info stateNam
 	if wantLit == curLit {
 		return false
 	}
+	if wantLit && c.IsRedstoneTorchBurnedOutAt(x, y, z) {
+		if !c.HasPendingBlockUpdate(x, y, z, UpdateRedstone) {
+			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, RedstoneTorchBurnoutRestartDelay)
+		}
+		return false
+	}
 	litStr := "false"
 	if wantLit {
 		litStr = "true"
@@ -2088,7 +2109,15 @@ func (c *Cache) evaluateRedstoneTorchAt(x, y, z int, state uint16, info stateNam
 	if !ok {
 		return false
 	}
-	return c.setBlockRecorded(x, y, z, nextState, res)
+	if !c.setBlockRecorded(x, y, z, nextState, res) {
+		return false
+	}
+	if !wantLit {
+		if _, burnedOut := c.RecordRedstoneTorchToggleAt(x, y, z); burnedOut {
+			c.RescheduleBlockUpdateWithPriority(x, y, z, UpdateRedstone, RedstoneTorchBurnoutRestartDelay, TickPriorityNormal)
+		}
+	}
+	return true
 }
 
 func (c *Cache) repeaterInputSignal(x, y, z int, facing string) int {
@@ -2151,7 +2180,7 @@ func (c *Cache) evaluateRepeaterOnNeighbor(x, y, z int, state uint16, info state
 	isPowered := info.Properties["powered"] == "true"
 	shouldTurnOn := c.repeaterInputSignal(x, y, z, facing) > 0
 	if isPowered != shouldTurnOn {
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, RepeaterDelayTicks(curState))
+		c.ScheduleBlockUpdateWithPriority(x, y, z, UpdateRedstone, RepeaterDelayTicks(curState), c.RepeaterTickPriority(x, y, z, curState))
 	}
 }
 
@@ -2972,7 +3001,7 @@ func isPistonDestroyOnPush(state uint16) bool {
 		return false
 	}
 	name := info.Name
-	if isPlantRequiringSoil(name) {
+	if isPlantRequiringSoil(name) || isLeafBlock(state) || IsCopperGolemStatueBlock(state) {
 		return true
 	}
 	if strings.HasSuffix(name, "_button") || strings.HasSuffix(name, "_pressure_plate") ||
@@ -2981,6 +3010,10 @@ func isPistonDestroyOnPush(state uint16) bool {
 		strings.HasSuffix(name, "_coral_fan") || strings.HasSuffix(name, "_coral_wall_fan") ||
 		(strings.HasSuffix(name, "_head") && name != "minecraft:piston_head") ||
 		strings.HasSuffix(name, "_skull") ||
+		(strings.HasSuffix(name, "_door") && !strings.HasSuffix(name, "_trapdoor")) ||
+		strings.HasSuffix(name, "shulker_box") ||
+		strings.HasSuffix(name, "_lantern") ||
+		strings.HasPrefix(name, "minecraft:potted_") ||
 		IsCandleCakeBlockName(name) ||
 		IsCoralPlantOrFloorFanName(name) {
 		return true
@@ -2989,9 +3022,10 @@ func isPistonDestroyOnPush(state uint16) bool {
 	case "minecraft:fire", "minecraft:soul_fire", "minecraft:cobweb", "minecraft:snow",
 		"minecraft:torch", "minecraft:wall_torch", "minecraft:soul_torch", "minecraft:soul_wall_torch",
 		"minecraft:redstone_torch", "minecraft:redstone_wall_torch",
+		"minecraft:copper_torch", "minecraft:copper_wall_torch",
 		"minecraft:redstone_wire", "minecraft:repeater", "minecraft:comparator",
 		"minecraft:lever", "minecraft:tripwire", "minecraft:tripwire_hook",
-		"minecraft:ladder", "minecraft:vine", "minecraft:glow_lichen",
+		"minecraft:ladder", "minecraft:vine", "minecraft:glow_lichen", "minecraft:sculk_vein", "minecraft:resin_clump",
 		"minecraft:tall_grass", "minecraft:large_fern", "minecraft:sunflower",
 		"minecraft:lilac", "minecraft:rose_bush", "minecraft:peony", "minecraft:pitcher_plant",
 		"minecraft:Chorus_plant", "minecraft:chorus_plant", "minecraft:chorus_flower",
@@ -2999,7 +3033,18 @@ func isPistonDestroyOnPush(state uint16) bool {
 		"minecraft:cave_vines", "minecraft:cave_vines_plant",
 		"minecraft:weeping_vines", "minecraft:weeping_vines_plant",
 		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
-		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:cactus_flower", "minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:bamboo", "minecraft:bamboo_sapling", "minecraft:sea_pickle",
+		"minecraft:cocoa", "minecraft:nether_wart",
+		"minecraft:pumpkin", "minecraft:carved_pumpkin", "minecraft:jack_o_lantern", "minecraft:melon",
+		"minecraft:flower_pot", "minecraft:candle", "minecraft:bell", "minecraft:dragon_egg",
+		"minecraft:suspicious_sand", "minecraft:suspicious_gravel", "minecraft:structure_void",
+		"minecraft:moss_block", "minecraft:pale_moss_block", "minecraft:pale_hanging_moss",
+		"minecraft:azalea", "minecraft:flowering_azalea",
+		"minecraft:big_dripleaf", "minecraft:big_dripleaf_stem", "minecraft:small_dripleaf",
+		"minecraft:pink_petals", "minecraft:wildflowers", "minecraft:leaf_litter",
+		"minecraft:short_dry_grass", "minecraft:tall_dry_grass", "minecraft:bush", "minecraft:firefly_bush",
+		"minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
 		"minecraft:decorated_pot", "minecraft:amethyst_cluster", "minecraft:budding_amethyst",
 		"minecraft:lily_pad", "minecraft:lantern", "minecraft:soul_lantern",
 		"minecraft:scaffolding", "minecraft:cake",
@@ -3025,7 +3070,11 @@ func canPistonPushBlock(state uint16) bool {
 		return false
 	}
 	if strings.HasSuffix(name, "_sign") || strings.HasSuffix(name, "_banner") ||
-		strings.HasSuffix(name, "_hanging_sign") {
+		strings.HasSuffix(name, "_hanging_sign") || strings.HasSuffix(name, "_shelf") ||
+		strings.HasSuffix(name, "shulker_box") {
+		return false
+	}
+	if IsCopperChestBlock(state) || IsCopperGolemStatueBlock(state) {
 		return false
 	}
 	switch name {
@@ -3038,8 +3087,9 @@ func canPistonPushBlock(state uint16) bool {
 		"minecraft:spawner", "minecraft:trial_spawner", "minecraft:vault",
 		"minecraft:enchanting_table", "minecraft:ender_chest", "minecraft:beacon",
 		"minecraft:conduit", "minecraft:lodestone", "minecraft:grindstone",
+		"minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil",
 		"minecraft:lectern", "minecraft:sculk_catalyst", "minecraft:sculk_shrieker",
-		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
+		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor", "minecraft:creaking_heart",
 		"minecraft:piston_head", "minecraft:moving_piston",
 		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker",
 		"minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel",
@@ -3379,7 +3429,7 @@ func (c *Cache) RecoverChunkActiveBlockTicks(cx, cz int32) int {
 				isPowered := props["powered"] == "true"
 				shouldTurnOn := c.repeaterInputSignal(cb.x, cb.y, cb.z, props["facing"]) > 0
 				if isPowered != shouldTurnOn && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
-					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, RepeaterDelayTicks(cb.state))
+					c.ScheduleBlockUpdateWithPriority(cb.x, cb.y, cb.z, UpdateRedstone, RepeaterDelayTicks(cb.state), c.RepeaterTickPriority(cb.x, cb.y, cb.z, cb.state))
 					recovered++
 				}
 			}
@@ -3388,7 +3438,7 @@ func (c *Cache) RecoverChunkActiveBlockTicks(cx, cz int32) int {
 			isPowered := props["powered"] == "true"
 			out := c.computeComparatorOutput(cb.x, cb.y, cb.z, info)
 			if isPowered != (out > 0) && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
-				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, ComparatorTickDelay)
+				c.ScheduleBlockUpdateWithPriority(cb.x, cb.y, cb.z, UpdateRedstone, ComparatorTickDelay, c.ComparatorTickPriority(cb.x, cb.y, cb.z, cb.state))
 				recovered++
 			}
 
