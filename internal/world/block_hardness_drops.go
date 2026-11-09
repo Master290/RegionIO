@@ -359,8 +359,21 @@ func EffectiveToolForBlock(state uint16) ToolCategory {
 	case "minecraft:vine", "minecraft:glow_lichen":
 		return ToolAxe
 	}
-	if strings.HasSuffix(name, "_wool") {
+	if strings.HasSuffix(name, "_wool") || HasBlockNameTag(name, "minecraft:wool") {
 		return ToolShears
+	}
+
+	if HasBlockNameTag(name, "minecraft:mineable/pickaxe") {
+		return ToolPickaxe
+	}
+	if HasBlockNameTag(name, "minecraft:mineable/axe") {
+		return ToolAxe
+	}
+	if HasBlockNameTag(name, "minecraft:mineable/shovel") {
+		return ToolShovel
+	}
+	if HasBlockNameTag(name, "minecraft:mineable/hoe") {
+		return ToolHoe
 	}
 
 	// Shovel (`#minecraft:mineable/shovel`)
@@ -437,6 +450,9 @@ func isWoodenBlockName(name string) bool {
 }
 
 func isPickaxeMineableBlockName(name string) bool {
+	if HasBlockNameTag(name, "minecraft:mineable/pickaxe") {
+		return true
+	}
 	switch name {
 	case "minecraft:stone", "minecraft:cobblestone", "minecraft:mossy_cobblestone", "minecraft:smooth_stone",
 		"minecraft:granite", "minecraft:polished_granite", "minecraft:diorite", "minecraft:polished_diorite",
@@ -503,6 +519,9 @@ func MinimumToolTierForBlock(state uint16) ToolTier {
 	name := info.Name
 
 	// #minecraft:needs_diamond_tool
+	if HasBlockNameTag(name, "minecraft:needs_diamond_tool") {
+		return TierDiamond
+	}
 	switch name {
 	case "minecraft:obsidian", "minecraft:crying_obsidian", "minecraft:netherite_block",
 		"minecraft:respawn_anchor", "minecraft:ancient_debris":
@@ -510,6 +529,9 @@ func MinimumToolTierForBlock(state uint16) ToolTier {
 	}
 
 	// #minecraft:needs_iron_tool
+	if HasBlockNameTag(name, "minecraft:needs_iron_tool") {
+		return TierIron
+	}
 	switch name {
 	case "minecraft:diamond_ore", "minecraft:deepslate_diamond_ore", "minecraft:diamond_block",
 		"minecraft:emerald_ore", "minecraft:deepslate_emerald_ore", "minecraft:emerald_block",
@@ -519,14 +541,14 @@ func MinimumToolTierForBlock(state uint16) ToolTier {
 	}
 
 	// #minecraft:needs_stone_tool
+	if HasBlockNameTag(name, "minecraft:needs_stone_tool") {
+		return TierStoneCopper
+	}
 	switch name {
 	case "minecraft:iron_ore", "minecraft:deepslate_iron_ore", "minecraft:iron_block", "minecraft:raw_iron_block",
 		"minecraft:copper_ore", "minecraft:deepslate_copper_ore", "minecraft:raw_copper_block",
 		"minecraft:lapis_ore", "minecraft:deepslate_lapis_ore", "minecraft:lapis_block",
-		"minecraft:lightning_rod":
-		return TierStoneCopper
-	}
-	if strings.Contains(name, "copper") && name != "minecraft:copper_torch" && name != "minecraft:copper_wall_torch" {
+		"minecraft:lightning_rod", "minecraft:crafter":
 		return TierStoneCopper
 	}
 
@@ -608,10 +630,10 @@ func ToolSpeedMultiplierOnBlock(state uint16, toolItemID string) float64 {
 	case ToolNone:
 		return 1.0
 	case ToolShears:
-		if name == "minecraft:cobweb" || strings.HasSuffix(name, "_leaves") {
+		if name == "minecraft:cobweb" || strings.HasSuffix(name, "_leaves") || HasBlockNameTag(name, "minecraft:leaves") {
 			return 15.0
 		}
-		if strings.HasSuffix(name, "_wool") {
+		if strings.HasSuffix(name, "_wool") || HasBlockNameTag(name, "minecraft:wool") {
 			return 5.0
 		}
 		if name == "minecraft:vine" || name == "minecraft:glow_lichen" {
@@ -622,14 +644,35 @@ func ToolSpeedMultiplierOnBlock(state uint16, toolItemID string) float64 {
 		if name == "minecraft:cobweb" {
 			return 15.0
 		}
-		if name == "minecraft:bamboo" || name == "minecraft:bamboo_sapling" {
+		if name == "minecraft:bamboo" || name == "minecraft:bamboo_sapling" || HasBlockNameTag(name, "minecraft:sword_instantly_mines") {
 			return 60.0
 		}
-		if strings.HasSuffix(name, "_leaves") || name == "minecraft:melon" ||
+		if HasBlockNameTag(name, "minecraft:sword_efficient") ||
+			strings.HasSuffix(name, "_leaves") || name == "minecraft:melon" ||
 			name == "minecraft:pumpkin" || name == "minecraft:carved_pumpkin" ||
 			name == "minecraft:jack_o_lantern" || name == "minecraft:vine" ||
 			name == "minecraft:cocoa" || name == "minecraft:chorus_plant" || name == "minecraft:chorus_flower" {
 			return 1.5
+		}
+		return 1.0
+	case ToolPickaxe:
+		if HasBlockNameTag(name, "minecraft:mineable/pickaxe") || EffectiveToolForBlock(state) == ToolPickaxe {
+			return spec.BaseSpeed
+		}
+		return 1.0
+	case ToolAxe:
+		if HasBlockNameTag(name, "minecraft:mineable/axe") || EffectiveToolForBlock(state) == ToolAxe {
+			return spec.BaseSpeed
+		}
+		return 1.0
+	case ToolShovel:
+		if HasBlockNameTag(name, "minecraft:mineable/shovel") || EffectiveToolForBlock(state) == ToolShovel {
+			return spec.BaseSpeed
+		}
+		return 1.0
+	case ToolHoe:
+		if HasBlockNameTag(name, "minecraft:mineable/hoe") || EffectiveToolForBlock(state) == ToolHoe {
+			return spec.BaseSpeed
 		}
 		return 1.0
 	default:

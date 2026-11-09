@@ -116,9 +116,21 @@ func (s *Server) TillBlockWithHoe(session *PlayerSession, x, y, z int, slot int,
 			return false, res
 		}
 	}
-	tilled, res = cache.TillSoilAt(x, y, z)
+	var drops []world.ItemStack
+	tilled, drops, res = cache.TillSoilWithDropsAt(x, y, z)
 	if !tilled {
 		return false, res
+	}
+	if len(drops) > 0 && s.DoTileDrops() {
+		dim := world.DimensionOverworld
+		if session != nil && session.Dimension() != "" {
+			dim = world.NormalizeDimension(session.Dimension())
+		}
+		for _, drop := range drops {
+			if !drop.IsEmpty() {
+				s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, drop)
+			}
+		}
 	}
 	if session != nil && slot >= 0 && slot < world.PlayerInventorySlots && session.Snapshot().GameMode != GameModeCreative {
 		s.DamagePlayerItemWithRand(session, slot, 1, rng)
