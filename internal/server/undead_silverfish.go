@@ -187,10 +187,10 @@ func IsZombieFamilyMob(typeName string) bool {
 }
 
 // IsSkeletonFamilyMob reports whether typeName is a Skeleton-family mob
-// (`skeleton`, `stray`, `bogged`, or `wither_skeleton`).
+// (`skeleton`, `stray`, `bogged`, `parched`, or `wither_skeleton`).
 func IsSkeletonFamilyMob(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypeSkeleton, MobTypeStray, MobTypeBogged, MobTypeWitherSkeleton:
+	case MobTypeSkeleton, MobTypeStray, MobTypeBogged, MobTypeParched, MobTypeWitherSkeleton:
 		return true
 	default:
 		return false
@@ -205,7 +205,7 @@ func IsUndeadMobType(typeName string) bool {
 		return true
 	}
 	switch norm {
-	case MobTypePhantom, MobTypeWither, MobTypeZoglin, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeZombieNautilus:
+	case MobTypePhantom, MobTypeWither, MobTypeZoglin, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeZombieNautilus, MobTypeCamelHusk:
 		return true
 	default:
 		return false

@@ -225,6 +225,9 @@ var (
 		MobTypeBat:                 EntityTypeBatID,
 		MobTypeNautilus:            EntityTypeNautilusID,
 		MobTypeZombieNautilus:      EntityTypeZombieNautilusID,
+		MobTypeHappyGhast:          EntityTypeHappyGhastID,
+		MobTypeParched:             EntityTypeParchedID,
+		MobTypeCamelHusk:           EntityTypeCamelHuskID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -451,6 +454,10 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultNautilusMaxHealth
 	case MobTypeZombieNautilus:
 		return DefaultZombieNautilusMaxHealth
+	case MobTypeHappyGhast:
+		return DefaultHappyGhastMaxHealth
+	case MobTypeParched:
+		return DefaultParchedMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -719,6 +726,15 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeZombieNautilus {
 		return s.SpawnZombieNautilus(normDim, x, y, z, ZombieNautilusVariantTemperate)
+	}
+	if norm == MobTypeHappyGhast {
+		return s.SpawnHappyGhast(normDim, x, y, z, false)
+	}
+	if norm == MobTypeParched {
+		return s.SpawnParched(normDim, x, y, z)
+	}
+	if norm == MobTypeCamelHusk {
+		return s.SpawnCamelHusk(normDim, x, y, z)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {

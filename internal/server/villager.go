@@ -881,6 +881,14 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 		handled, _ := s.InteractWithCamel(session, targetEntityID)
 		return handled, 0, nil
 	}
+	if canonicalResourceName(ent.TypeName) == MobTypeCamelHusk {
+		handled, _ := s.InteractWithCamelHusk(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeHappyGhast {
+		handled, _ := s.InteractWithHappyGhast(session, targetEntityID)
+		return handled, 0, nil
+	}
 	if canonicalResourceName(ent.TypeName) == MobTypeBogged {
 		handled := s.InteractWithBogged(session, targetEntityID)
 		return handled, 0, nil
