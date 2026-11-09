@@ -419,6 +419,21 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 		}
 	}
 
+	var metaBySlot map[int]*nbt.Compound
+	if d.SlotItemMetas != nil && len(d.SlotItemMetas.Elems) > 0 {
+		metaBySlot = make(map[int]*nbt.Compound, len(d.SlotItemMetas.Elems))
+		for _, el := range d.SlotItemMetas.Elems {
+			ec, ok := el.(*nbt.Compound)
+			if !ok || ec == nil {
+				continue
+			}
+			sb, okS := nbtGetByte(ec, "Slot")
+			if okS {
+				metaBySlot[int(uint8(sb))] = ec
+			}
+		}
+	}
+
 	invElems := make([]nbt.Tag, 0)
 	for slot, stack := range d.Inventory {
 		if stack.IsEmpty() {
@@ -450,6 +465,36 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 				comps = nbt.NewCompound()
 			}
 			comps.Set("minecraft:firework_explosion", sc)
+		}
+		if mc := metaBySlot[slot]; mc != nil {
+			if dmg, ok := nbtGetInt(mc, "Damage"); ok && dmg > 0 {
+				if comps == nil {
+					comps = nbt.NewCompound()
+				}
+				comps.Set("minecraft:damage", nbt.Int(dmg))
+			}
+			if rc, ok := nbtGetInt(mc, "RepairCost"); ok && rc > 0 {
+				if comps == nil {
+					comps = nbt.NewCompound()
+				}
+				comps.Set("minecraft:repair_cost", nbt.Int(rc))
+			}
+			if cn, ok := nbtGetString(mc, "CustomName"); ok && cn != "" {
+				if comps == nil {
+					comps = nbt.NewCompound()
+				}
+				comps.Set("minecraft:custom_name", nbt.String(cn))
+			}
+			if ec, ok := nbtGetCompound(mc, "Enchantments"); ok && ec != nil && len(ec.Keys()) > 0 {
+				if comps == nil {
+					comps = nbt.NewCompound()
+				}
+				if stack.ResolvedID() == "minecraft:enchanted_book" {
+					comps.Set("minecraft:stored_enchantments", ec)
+				} else {
+					comps.Set("minecraft:enchantments", ec)
+				}
+			}
 		}
 		if comps != nil {
 			itemComp.Set("components", comps)
@@ -749,6 +794,7 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	var invTrimElems []nbt.Tag
 	var invFwElems []nbt.Tag
 	var invStarElems []nbt.Tag
+	var invMetaElems []nbt.Tag
 	if invList, ok := nbtGetList(root, "Inventory"); ok {
 		for _, elem := range invList.Elems {
 			comp, ok := elem.(*nbt.Compound)
@@ -818,6 +864,46 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 						Set("Slot", nbt.Byte(int8(slotIdx))).
 						Set("Explosion", sc)
 					invStarElems = append(invStarElems, entry)
+				}
+				var metaEntry *nbt.Compound
+				ensureMetaEntry := func() *nbt.Compound {
+					if metaEntry == nil {
+						metaEntry = nbt.NewCompound().Set("Slot", nbt.Byte(int8(slotIdx)))
+					}
+					return metaEntry
+				}
+				if dmg, ok := nbtGetInt(comps, "minecraft:damage"); ok && dmg > 0 {
+					ensureMetaEntry().Set("Damage", nbt.Int(dmg))
+				}
+				if rc, ok := nbtGetInt(comps, "minecraft:repair_cost"); ok && rc > 0 {
+					ensureMetaEntry().Set("RepairCost", nbt.Int(rc))
+				}
+				if cn, ok := nbtGetString(comps, "minecraft:custom_name"); ok && cn != "" {
+					ensureMetaEntry().Set("CustomName", nbt.String(cn))
+				} else if cnComp, ok := nbtGetCompound(comps, "minecraft:custom_name"); ok && cnComp != nil {
+					if txt, ok := nbtGetString(cnComp, "text"); ok && txt != "" {
+						ensureMetaEntry().Set("CustomName", nbt.String(txt))
+					}
+				}
+				for _, enchKey := range []string{"minecraft:enchantments", "minecraft:stored_enchantments"} {
+					if ec, ok := nbtGetCompound(comps, enchKey); ok && ec != nil {
+						src := ec
+						if levels, ok := nbtGetCompound(ec, "levels"); ok && levels != nil {
+							src = levels
+						}
+						enchOut := nbt.NewCompound()
+						for _, k := range src.Keys() {
+							if lv, ok := nbtGetInt(src, k); ok && lv > 0 {
+								enchOut.Set(k, nbt.Int(lv))
+							}
+						}
+						if len(enchOut.Keys()) > 0 {
+							ensureMetaEntry().Set("Enchantments", enchOut)
+						}
+					}
+				}
+				if metaEntry != nil {
+					invMetaElems = append(invMetaElems, metaEntry)
 				}
 			}
 		}
@@ -914,6 +1000,11 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	if sim, ok := nbtGetList(root, "SlotItemMetas"); ok && sim != nil {
 		cp := *sim
 		d.SlotItemMetas = &cp
+	} else if len(invMetaElems) > 0 {
+		d.SlotItemMetas = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  invMetaElems,
+		}
 	}
 	if abComp, ok := nbtGetCompound(root, "abilities"); ok && abComp != nil {
 		ab := DefaultPlayerAbilities(d.GameMode)

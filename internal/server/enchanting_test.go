@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
 	"regionio/internal/world"
@@ -559,6 +560,285 @@ func TestEnchantingBookshelfObstructionByBlocksAndItemsAndOffers(t *testing.T) {
 			t.Fatalf("slot %d clues = (id=%d, lvl=%d), want valid clue",
 				slot, offers[slot].ClueEnchantID, offers[slot].ClueLevel)
 		}
+	}
+}
+
+func TestEnchantingAnvilGrindstoneSmithingFullPlayPathWireAndPersistence(t *testing.T) {
+	// 1. Verify vanilla 26.1.2 data component IDs and wire Slot round-trip.
+	if DataComponentDamageID != 3 || DataComponentCustomNameID != 6 ||
+		DataComponentEnchantmentsID != 13 || DataComponentRepairCostID != 19 ||
+		DataComponentStoredEnchantmentsID != 42 || DataComponentTrim != 56 {
+		t.Fatalf("unexpected data component IDs: dmg=%d name=%d ench=%d rc=%d stored=%d trim=%d",
+			DataComponentDamageID, DataComponentCustomNameID, DataComponentEnchantmentsID,
+			DataComponentRepairCostID, DataComponentStoredEnchantmentsID, DataComponentTrim)
+	}
+
+	chestplate := world.NewNamedItemStack("minecraft:diamond_chestplate", 1)
+	wantTrim := ArmorTrim{Material: "minecraft:amethyst", Pattern: "minecraft:silence"}
+	wantMeta := ItemMeta{
+		Damage:     42,
+		CustomName: "Vanguard Plate",
+		RepairCost: 3,
+	}
+	wantMeta.SetEnchantment("minecraft:protection", 4)
+	wantMeta.SetEnchantment("minecraft:unbreaking", 3)
+
+	rawSlot := EncodeSlotWithArmorTrim(chestplate, wantMeta, wantTrim)
+	gotStack, gotMeta, gotTrim, err := DecodeSlotWithArmorTrim(rawSlot)
+	if err != nil {
+		t.Fatalf("DecodeSlotWithArmorTrim(chestplate): %v", err)
+	}
+	if gotStack.ResolvedID() != "minecraft:diamond_chestplate" || gotMeta.Damage != 42 ||
+		gotMeta.CustomName != "Vanguard Plate" || gotMeta.RepairCost != 3 ||
+		gotMeta.EnchantmentLevel("minecraft:protection") != 4 ||
+		gotMeta.EnchantmentLevel("minecraft:unbreaking") != 3 ||
+		gotTrim != wantTrim {
+		t.Fatalf("round-trip chestplate mismatch: stack=%+v meta=%+v trim=%+v", gotStack, gotMeta, gotTrim)
+	}
+
+	ebook := world.NewNamedItemStack("minecraft:enchanted_book", 1)
+	var bookMeta ItemMeta
+	bookMeta.SetEnchantment("minecraft:mending", 1)
+	rawBook := EncodeSlotWithArmorTrim(ebook, bookMeta, ArmorTrim{})
+	gotBook, gotBookMeta, _, err := DecodeSlotWithArmorTrim(rawBook)
+	if err != nil {
+		t.Fatalf("DecodeSlotWithArmorTrim(enchanted_book): %v", err)
+	}
+	if gotBook.ResolvedID() != "minecraft:enchanted_book" || gotBookMeta.EnchantmentLevel("minecraft:mending") != 1 {
+		t.Fatalf("round-trip enchanted_book mismatch: stack=%+v meta=%+v", gotBook, gotBookMeta)
+	}
+
+	// 2. Full 4-menu play path: Smithing Table (trim) -> Enchanting Table -> Anvil -> Grindstone -> Smithing Table (netherite).
+	srv, cache := newTestEnchantServer(t)
+	bx, by, bz := 40, 64, 40
+	for dy := 0; dy <= 2; dy++ {
+		for dz := -3; dz <= 3; dz++ {
+			for dx := -3; dx <= 3; dx++ {
+				cache.SetBlock(bx+dx, by+dy, bz+dz, world.StateAir)
+			}
+		}
+	}
+	placeNamedBlock(t, cache, bx, by, bz, "minecraft:enchanting_table")
+	for _, off := range EnchantingBookshelfOffsets() {
+		placeNamedBlock(t, cache, bx+off[0], by+off[1], bz+off[2], "minecraft:bookshelf")
+	}
+	placeNamedBlock(t, cache, bx+4, by, bz, "minecraft:smithing_table")
+	placeNamedBlock(t, cache, bx+5, by, bz, "minecraft:anvil")
+	placeNamedBlock(t, cache, bx+6, by, bz, "minecraft:grindstone")
+
+	type sentPkt struct {
+		id   int32
+		body []byte
+	}
+	var pkts []sentPkt
+	session, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("FullPathTester"),
+		Name: "FullPathTester",
+	}, func(packetID int32, payload []byte) error {
+		cp := make([]byte, len(payload))
+		copy(cp, payload)
+		pkts = append(pkts, sentPkt{id: packetID, body: cp})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.TeleportPlayer(session, float64(bx)+0.5, float64(by), float64(bz)+0.5, 0, 0)
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+	_ = srv.AddPlayerExperienceLevels(session, 40)
+	session.SetEnchantmentSeed(13579)
+
+	// Step A: Smithing Table - apply Silence + Amethyst trim to diamond chestplate.
+	session.SetInventorySlot(36, world.NewNamedItemStack("minecraft:silence_armor_trim_smithing_template", 1))
+	session.SetInventorySlot(37, world.NewNamedItemStack("minecraft:diamond_chestplate", 1))
+	session.SetInventorySlot(38, world.NewNamedItemStack("minecraft:amethyst_shard", 1))
+	cid, err := srv.OpenSmithingTable(session, bx+4, by, bz)
+	if err != nil {
+		t.Fatalf("OpenSmithingTable: %v", err)
+	}
+	// Quick-move template (menu slot 31 -> slot 0), armor (menu slot 32 -> slot 1), material (menu slot 33 -> slot 2).
+	for _, mSlot := range []int{31, 32, 33} {
+		if err := srv.HandleContainerClick(session, cid, mSlot, 0, ContainerInputQuickMove); err != nil {
+			t.Fatalf("HandleContainerClick smithing input %d: %v", mSlot, err)
+		}
+	}
+	// Take trimmed chestplate from result slot 3 -> hotbar slot 36.
+	if err := srv.HandleContainerClick(session, cid, SmithingSlotResult, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick smithing result: %v", err)
+	}
+	if err := srv.CloseContainer(session, cid, true); err != nil {
+		t.Fatalf("CloseContainer smithing: %v", err)
+	}
+	trimAfterSmithing, okTrim := GetSlotArmorTrim(session, 36)
+	if !okTrim || trimAfterSmithing != wantTrim {
+		t.Fatalf("after Smithing trim: slot 36 trim = %+v (ok=%v), want %+v", trimAfterSmithing, okTrim, wantTrim)
+	}
+
+	// Step B: Enchanting Table - enchant the trimmed diamond chestplate and verify trim is preserved.
+	session.SetInventorySlot(37, world.NewNamedItemStack("minecraft:lapis_lazuli", 16))
+	cid, err = srv.OpenEnchantingTable(session, bx, by, bz)
+	if err != nil {
+		t.Fatalf("OpenEnchantingTable: %v", err)
+	}
+	// Quick-move trimmed chestplate (menu slot 29 -> enchant slot 0) and lapis (menu slot 30 -> enchant slot 1).
+	if err := srv.HandleContainerClick(session, cid, 29, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove chestplate into enchanting table: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, 30, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove lapis into enchanting table: %v", err)
+	}
+	pkts = nil
+	if err := srv.HandleContainerButtonClick(session, cid, 2); err != nil {
+		t.Fatalf("HandleContainerButtonClick(2): %v", err)
+	}
+	// Decode the PlayContainerSetContent packet from enchanting table and verify slot 0 has both enchantments and trim!
+	var foundEnchantWire bool
+	for _, p := range pkts {
+		if p.id != protocol.PlayContainerSetContent {
+			continue
+		}
+		r := protocol.NewReader(p.body)
+		_, _ = r.VarInt() // containerID
+		_, _ = r.VarInt() // stateID
+		nSlots, err := r.VarInt()
+		if err != nil || nSlots < 1 {
+			t.Fatalf("invalid PlayContainerSetContent header: nSlots=%d err=%v", nSlots, err)
+		}
+		s0, m0, t0, err := ReadSlotWithArmorTrim(r)
+		if err != nil {
+			t.Fatalf("ReadSlotWithArmorTrim(enchant slot 0): %v", err)
+		}
+		if s0.ResolvedID() == "minecraft:diamond_chestplate" && m0.HasEnchantments() && t0 == wantTrim {
+			foundEnchantWire = true
+		}
+	}
+	if !foundEnchantWire {
+		t.Fatalf("expected PlayContainerSetContent after enchanting to carry enchanted + trimmed diamond_chestplate in slot 0")
+	}
+	if err := srv.CloseContainer(session, cid, true); err != nil {
+		t.Fatalf("CloseContainer enchanting: %v", err)
+	}
+	enchMeta := GetSlotItemMeta(session, 36)
+	trimAfterEnchant, okTrim := GetSlotArmorTrim(session, 36)
+	if !enchMeta.HasEnchantments() || !okTrim || trimAfterEnchant != wantTrim {
+		t.Fatalf("after CloseContainer(enchanting): meta=%+v trim=%+v (ok=%v)", enchMeta, trimAfterEnchant, okTrim)
+	}
+
+	// Step C: Anvil - unit-repair + rename the enchanted trimmed chestplate, preserving trim.
+	enchMeta.Damage = 157 // 528/4 = 132 repaired by 1 diamond -> 25 damage remaining
+	SetSlotItemMeta(session, 36, enchMeta)
+	session.SetInventorySlot(37, world.NewNamedItemStack("minecraft:diamond", 1))
+	cid, err = srv.OpenAnvil(session, bx+5, by, bz)
+	if err != nil {
+		t.Fatalf("OpenAnvil: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, 30, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove chestplate into anvil: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, 31, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove diamond into anvil: %v", err)
+	}
+	if err := srv.HandleRenameItem(session, "Runed Chestplate"); err != nil {
+		t.Fatalf("HandleRenameItem: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, AnvilSlotResult, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove anvil result: %v", err)
+	}
+	if err := srv.CloseContainer(session, cid, true); err != nil {
+		t.Fatalf("CloseContainer anvil: %v", err)
+	}
+	anvilMeta := GetSlotItemMeta(session, 36)
+	trimAfterAnvil, okTrim := GetSlotArmorTrim(session, 36)
+	if anvilMeta.CustomName != "Runed Chestplate" || anvilMeta.Damage != 25 || anvilMeta.RepairCost != 1 || !anvilMeta.HasEnchantments() || !okTrim || trimAfterAnvil != wantTrim {
+		t.Fatalf("after Anvil repair+rename: meta=%+v trim=%+v (ok=%v)", anvilMeta, trimAfterAnvil, okTrim)
+	}
+
+	// Step D: Grindstone - disenchant the chestplate, keeping CustomName and ArmorTrim while clearing enchantments & RepairCost.
+	cid, err = srv.OpenGrindstone(session, bx+6, by, bz)
+	if err != nil {
+		t.Fatalf("OpenGrindstone: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, 30, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove chestplate into grindstone: %v", err)
+	}
+	if err := srv.HandleContainerClick(session, cid, GrindstoneSlotResult, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("QuickMove grindstone result: %v", err)
+	}
+	if err := srv.CloseContainer(session, cid, true); err != nil {
+		t.Fatalf("CloseContainer grindstone: %v", err)
+	}
+	grindMeta := GetSlotItemMeta(session, 36)
+	trimAfterGrind, okTrim := GetSlotArmorTrim(session, 36)
+	if grindMeta.HasEnchantments() || grindMeta.RepairCost != 0 || grindMeta.CustomName != "Runed Chestplate" || grindMeta.Damage != 25 || !okTrim || trimAfterGrind != wantTrim {
+		t.Fatalf("after Grindstone: meta=%+v trim=%+v (ok=%v)", grindMeta, trimAfterGrind, okTrim)
+	}
+
+	// Step E: Smithing Table - upgrade the trimmed & named diamond chestplate to netherite_chestplate.
+	session.SetInventorySlot(37, world.NewNamedItemStack("minecraft:netherite_upgrade_smithing_template", 1))
+	session.SetInventorySlot(38, world.NewNamedItemStack("minecraft:netherite_ingot", 1))
+	cid, err = srv.OpenSmithingTable(session, bx+4, by, bz)
+	if err != nil {
+		t.Fatalf("OpenSmithingTable(upgrade): %v", err)
+	}
+	// Move template (32 -> 0), chestplate (31 -> 1), netherite_ingot (33 -> 2).
+	for _, mSlot := range []int{32, 31, 33} {
+		if err := srv.HandleContainerClick(session, cid, mSlot, 0, ContainerInputQuickMove); err != nil {
+			t.Fatalf("HandleContainerClick smithing upgrade input %d: %v", mSlot, err)
+		}
+	}
+	if err := srv.HandleContainerClick(session, cid, SmithingSlotResult, 0, ContainerInputQuickMove); err != nil {
+		t.Fatalf("HandleContainerClick smithing upgrade result: %v", err)
+	}
+	if err := srv.CloseContainer(session, cid, true); err != nil {
+		t.Fatalf("CloseContainer smithing upgrade: %v", err)
+	}
+	finalStack := session.InventorySlot(36)
+	finalMeta := GetSlotItemMeta(session, 36)
+	finalTrim, okTrim := GetSlotArmorTrim(session, 36)
+	if finalStack.ResolvedID() != "minecraft:netherite_chestplate" ||
+		finalMeta.CustomName != "Runed Chestplate" || finalMeta.Damage != 25 ||
+		!okTrim || finalTrim != wantTrim {
+		t.Fatalf("after Smithing netherite upgrade: stack=%+v meta=%+v trim=%+v (ok=%v)",
+			finalStack, finalMeta, finalTrim, okTrim)
+	}
+
+	// Step F: Persistence round-trip via PlayerDataToCompound / PlayerDataFromCompound
+	// (including pure vanilla Inventory[i].components fallback when SlotItemMetas is absent).
+	finalMeta.SetEnchantment("minecraft:protection", 4)
+	finalMeta.RepairCost = 3
+	SetSlotItemMeta(session, 36, finalMeta)
+	pd := session.PlayerData()
+	comp := world.PlayerDataToCompound(pd)
+	strippedComp := nbt.NewCompound()
+	for _, k := range comp.Keys() {
+		if k == "SlotItemMetas" || k == "SlotArmorTrims" {
+			continue
+		}
+		if v, ok := comp.Get(k); ok {
+			strippedComp.Set(k, v)
+		}
+	}
+	restoredPD, err := world.PlayerDataFromCompound(strippedComp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	session2, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("RestoredTester"),
+		Name: "RestoredTester",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(RestoredTester): %v", err)
+	}
+	session2.ApplyPlayerData(restoredPD)
+
+	restoredMeta := GetSlotItemMeta(session2, 36)
+	restoredTrim, okRestoredTrim := GetSlotArmorTrim(session2, 36)
+	if session2.InventorySlot(36).ResolvedID() != "minecraft:netherite_chestplate" ||
+		restoredMeta.Damage != 25 || restoredMeta.CustomName != "Runed Chestplate" ||
+		restoredMeta.RepairCost != 3 || restoredMeta.EnchantmentLevel("minecraft:protection") != 4 ||
+		!okRestoredTrim || restoredTrim != wantTrim {
+		t.Fatalf("restored from Inventory.components mismatch: stack=%+v meta=%+v trim=%+v (ok=%v)",
+			session2.InventorySlot(36), restoredMeta, restoredTrim, okRestoredTrim)
 	}
 }
 

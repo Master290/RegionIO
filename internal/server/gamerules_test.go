@@ -62,6 +62,9 @@ func TestDifficultyParseAndPackets(t *testing.T) {
 }
 
 func newGameRulesTestServer(cfg Config) *Server {
+	if cfg.WorldDir == "world" {
+		cfg.WorldDir = ""
+	}
 	return newServerState(cfg, nil, nil, world.NewEntityManager())
 }
 

@@ -241,7 +241,9 @@ func (s *Server) OpenGrindstone(session *PlayerSession, x, y, z int) (int32, err
 	metaTr := getItemMetaTracker(session)
 	metaTr.mu.Lock()
 	metaTr.combinerMeta = [2]ItemMeta{}
+	metaTr.combinerTrim = [2]ArmorTrim{}
 	metaTr.resultMeta = ItemMeta{}
+	metaTr.resultTrim = ArmorTrim{}
 	metaTr.mu.Unlock()
 
 	tr := getContainerTracker(session)
@@ -255,16 +257,13 @@ func (s *Server) OpenGrindstone(session *PlayerSession, x, y, z int) (int32, err
 		BlockY:      y,
 		BlockZ:      z,
 	}
-	carried := tr.carried
 	tr.mu.Unlock()
 
 	if session.send != nil {
 		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGrindstone, "Repair & Disenchant")); err != nil {
 			return cid, err
 		}
-		slots := s.buildCombinerMenuSlots(session, [2]world.ItemStack{}, world.ItemStack{})
-		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := s.syncOpenContainer(session); err != nil {
 			return cid, err
 		}
 	}
@@ -279,6 +278,8 @@ func (s *Server) recomputeGrindstoneStateLocked(session *PlayerSession, tr *play
 	metaTr.mu.Lock()
 	topMeta := metaTr.combinerMeta[0].Clone()
 	botMeta := metaTr.combinerMeta[1].Clone()
+	topTrim := metaTr.combinerTrim[0]
+	botTrim := metaTr.combinerTrim[1]
 	metaTr.mu.Unlock()
 
 	res, ok := ComputeGrindstoneResult(
@@ -291,12 +292,22 @@ func (s *Server) recomputeGrindstoneStateLocked(session *PlayerSession, tr *play
 		tr.open.Result = world.ItemStack{}
 		metaTr.mu.Lock()
 		metaTr.resultMeta = ItemMeta{}
+		metaTr.resultTrim = ArmorTrim{}
 		metaTr.mu.Unlock()
 		return GrindstoneResult{}, false
 	}
 	tr.open.Result = res.Output
+	var outTrim ArmorTrim
+	if !res.Output.IsEmpty() && res.Output.ResolvedID() != "minecraft:book" {
+		if !tr.open.CombinerInputs[0].IsEmpty() {
+			outTrim = topTrim
+		} else {
+			outTrim = botTrim
+		}
+	}
 	metaTr.mu.Lock()
 	metaTr.resultMeta = res.OutputMeta.Clone()
+	metaTr.resultTrim = outTrim
 	metaTr.mu.Unlock()
 	return res, true
 }
@@ -308,6 +319,8 @@ func (s *Server) applyGrindstoneClickLocked(session *PlayerSession, tr *playerCo
 	curRes, ok := s.recomputeGrindstoneStateLocked(session, tr)
 	slots := s.buildCombinerMenuSlots(session, tr.open.CombinerInputs, tr.open.Result)
 	metas := buildCombinerMenuMetas(session)
+	trims := buildCombinerMenuTrims(session)
+	resTrim := trims[2]
 
 	if slot == GrindstoneSlotResult {
 		if !ok || curRes.Output.IsEmpty() {
@@ -319,11 +332,12 @@ func (s *Server) applyGrindstoneClickLocked(session *PlayerSession, tr *playerCo
 			if tr.carried.IsEmpty() {
 				tr.carried = curRes.Output
 				SetCarriedItemMeta(session, curRes.OutputMeta)
+				SetCarriedArmorTrim(session, resTrim)
 				canTake = true
 			}
 		case ContainerInputQuickMove:
-			rem, _ := mergeIntoSlotSliceWithMeta(slots, metas, curRes.Output, curRes.OutputMeta, 30, 39)
-			rem, _ = mergeIntoSlotSliceWithMeta(slots, metas, rem, curRes.OutputMeta, 3, 30)
+			rem, remMeta, remTrim := mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, curRes.Output, curRes.OutputMeta, resTrim, 30, 39)
+			rem, _, _ = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, rem, remMeta, remTrim, 3, 30)
 			if rem.IsEmpty() {
 				canTake = true
 			}
@@ -334,10 +348,13 @@ func (s *Server) applyGrindstoneClickLocked(session *PlayerSession, tr *playerCo
 
 		slots[0] = world.ItemStack{}
 		metas[0] = ItemMeta{}
+		trims[0] = ArmorTrim{}
 		slots[1] = world.ItemStack{}
 		metas[1] = ItemMeta{}
+		trims[1] = ArmorTrim{}
 		slots[2] = world.ItemStack{}
 		metas[2] = ItemMeta{}
+		trims[2] = ArmorTrim{}
 		tookResult = true
 		xpAward = curRes.XPAward
 		dim := world.NormalizeDimension(session.Dimension())
@@ -345,12 +362,13 @@ func (s *Server) applyGrindstoneClickLocked(session *PlayerSession, tr *playerCo
 		s.BroadcastDimensionChunk(dim, int32(bx>>4), int32(bz>>4), PlayLevelEventCB,
 			EncodeLevelEventPacket(LevelEventSoundGrindstoneUsed, bx, by, bz, 0, false))
 	} else {
-		applyCombinerNonResultClick(session, tr, slots, metas, slot, button, mode)
+		applyCombinerNonResultClick(session, tr, slots, metas, trims, slot, button, mode)
 	}
 
 	tr.open.CombinerInputs[0] = slots[0]
 	tr.open.CombinerInputs[1] = slots[1]
 	writeBackCombinerMenuMetas(session, slots, metas)
+	writeBackCombinerMenuTrims(session, slots, trims)
 	s.recomputeGrindstoneStateLocked(session, tr)
 	return tookResult, xpAward
 }
