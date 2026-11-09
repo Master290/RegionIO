@@ -1689,7 +1689,7 @@ func ExecuteCommandWithContext(srv *server.Server, ctx CommandContext, rawLine s
 			return "You do not have permission to use this command"
 		}
 		return execRide(srv, ctx, parsed.Args)
-	case "spreadplayers", "spreadimpact":
+	case "spreadplayers":
 		if !srv.HasAdminPermission(permSender) {
 			return "You do not have permission to use this command"
 		}

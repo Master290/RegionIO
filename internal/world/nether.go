@@ -1765,28 +1765,32 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 	}
 	baseX, baseZ := int(cx)*16, int(cz)*16
 	nb := loadNetherBlocks()
-	r := worldgen.NewXoroshiro(seed ^ int64(cx)*341873128712 ^ int64(cz)*132897987541)
+	r, decSeed := worldgen.DecorationRandom(seed, int(cx), int(cz))
 
 	hasBasaltDeltas := netherChunkHasBiome(biomeName, "minecraft:basalt_deltas")
 	hasSoulSandValley := netherChunkHasBiome(biomeName, "minecraft:soul_sand_valley")
 	hasCrimsonForest := netherChunkHasBiome(biomeName, "minecraft:crimson_forest")
 	hasWarpedForest := netherChunkHasBiome(biomeName, "minecraft:warped_forest")
 
-	// 1. Biome-specific terrain features (deltas, basalt columns, basalt pillars, blobs).
+	// 1. Biome-specific terrain features (stage 2 basalt_pillar; stage 4 delta & basalt columns; stage 7 blobs).
 	if hasBasaltDeltas {
-		// delta: count_on_every_layer = 40
+		// delta: stage 4 index 0, count_on_every_layer = 40
+		r.SetFeatureSeed(decSeed, 0, 4)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 40, r, biomeName, "minecraft:basalt_deltas", func(ox, oy, oz int) {
 			placeDeltaFeatureRegion(reg, ox, oy, oz, r, StateLava, StateMagmaBlock, 3, 7, 0, 2)
 		})
-		// small_basalt_columns: count_on_every_layer = 4, reach = 1, height = 1..4
+		// small_basalt_columns: stage 4 index 1, count_on_every_layer = 4, reach = 1, height = 1..4
+		r.SetFeatureSeed(decSeed, 1, 4)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 4, r, biomeName, "minecraft:basalt_deltas", func(ox, oy, oz int) {
 			placeBasaltColumnsRegion(reg, ox, oy, oz, r, 1, 1, 1, 4)
 		})
-		// large_basalt_columns: count_on_every_layer = 2, reach = 2..3, height = 5..10
+		// large_basalt_columns: stage 4 index 2, count_on_every_layer = 2, reach = 2..3, height = 5..10
+		r.SetFeatureSeed(decSeed, 2, 4)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 2, r, biomeName, "minecraft:basalt_deltas", func(ox, oy, oz int) {
 			placeBasaltColumnsRegion(reg, ox, oy, oz, r, 2, 3, 5, 10)
 		})
-		// basalt_blobs: count = 75, y = 0..127
+		// basalt_blobs: stage 7 index 0, count = 75, y = 0..127
+		r.SetFeatureSeed(decSeed, 0, 7)
 		for i := 0; i < 75; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(128))
@@ -1795,7 +1799,8 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 				placeReplaceBlobsRegion(reg, ox, oy, oz, r, StateNetherrack, StateBasalt, 3, 7)
 			}
 		}
-		// blackstone_blobs: count = 25, y = 0..127
+		// blackstone_blobs: stage 7 index 1, count = 25, y = 0..127
+		r.SetFeatureSeed(decSeed, 1, 7)
 		for i := 0; i < 25; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(128))
@@ -1806,7 +1811,8 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 		}
 	}
 	if hasSoulSandValley {
-		// basalt_pillar: count = 10, y = 0..127
+		// basalt_pillar: stage 2 index 0, count = 10, y = 0..127
+		r.SetFeatureSeed(decSeed, 0, 2)
 		for i := 0; i < 10; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(128))
@@ -1815,7 +1821,8 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 				placeBasaltPillarRegion(reg, ox, oy, oz, r)
 			}
 		}
-		// patch_crimson_roots (placed_feature/patch_crimson_roots.json): y = 0..127, 96 tries with xz_spread=7, y_spread=3.
+		// patch_crimson_roots: stage 7 index 5, y = 0..127, 96 tries with xz_spread=7, y_spread=3.
+		r.SetFeatureSeed(decSeed, 5, 7)
 		{
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(128))
@@ -1824,11 +1831,13 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 				placeNetherCrimsonRootsPatchRegion(reg, ox, oy, oz, r, nb.crimsonRoots)
 			}
 		}
-		// ore_soul_sand: count = 12, y = 0..31, size = 12
+		// ore_soul_sand: stage 7 index 8, count = 12, y = 0..31, size = 12
+		r.SetFeatureSeed(decSeed, 8, 7)
 		placeNetherOreVeinForBiomeRegion(reg, r, baseX, baseZ, StateSoulSand, 12, 0, 31, 12, biomeName, "minecraft:soul_sand_valley", false)
 	}
 
-	// 2. Ceiling glowstone clusters (glowstone_extra + glowstone).
+	// 2. Stage 7 ceiling glowstone clusters (glowstone_extra + glowstone).
+	r.SetFeatureSeed(decSeed, 3, 7)
 	extraGlow := int(r.NextIntN(int32(r.NextIntN(10) + 1)))
 	for i := 0; i < extraGlow; i++ {
 		ox := baseX + int(r.NextIntN(16))
@@ -1836,6 +1845,7 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 		oz := baseZ + int(r.NextIntN(16))
 		placeGlowstoneBlobRegion(reg, ox, oy, oz, r)
 	}
+	r.SetFeatureSeed(decSeed, 4, 7)
 	for i := 0; i < 10; i++ {
 		ox := baseX + int(r.NextIntN(16))
 		oy := int(r.NextIntN(128))
@@ -1843,24 +1853,34 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 		placeGlowstoneBlobRegion(reg, ox, oy, oz, r)
 	}
 
-	// 3. Nether ores (ellipsoid OreFeature for quartz, gold, magma, gravel, blackstone;
+	// 3. Stage 7 Nether ores (ellipsoid OreFeature for quartz, gold, magma, gravel, blackstone;
 	// ScatteredOreFeature for ancient debris; 2x gold/quartz in basalt_deltas).
+	r.SetFeatureSeed(decSeed, 12, 7)
 	placeNetherOreVeinRegion(reg, r, baseX, baseZ, nb.quartzOre, 16, 10, 117, 14, biomeName, false)
+	r.SetFeatureSeed(decSeed, 11, 7)
 	placeNetherOreVeinRegion(reg, r, baseX, baseZ, nb.goldOre, 10, 10, 117, 10, biomeName, false)
 	if hasBasaltDeltas {
 		// ore_quartz_deltas (32) and ore_gold_deltas (20) add +16 quartz and +10 gold veins in basalt_deltas.
+		r.SetFeatureSeed(decSeed, 13, 7)
 		placeNetherOreVeinRegion(reg, r, baseX, baseZ, nb.quartzOre, 16, 10, 117, 14, biomeName, true)
+		r.SetFeatureSeed(decSeed, 14, 7)
 		placeNetherOreVeinRegion(reg, r, baseX, baseZ, nb.goldOre, 10, 10, 117, 10, biomeName, true)
 	}
+	r.SetFeatureSeed(decSeed, 7, 7)
 	placeNetherOreVeinRegion(reg, r, baseX, baseZ, StateMagmaBlock, 4, 27, 36, 33, biomeName, false)
+	r.SetFeatureSeed(decSeed, 9, 7)
 	placeNetherOreVeinForBiomeRegion(reg, r, baseX, baseZ, StateGravel, 2, 5, 41, 33, biomeName, "minecraft:basalt_deltas", true)
+	r.SetFeatureSeed(decSeed, 10, 7)
 	placeNetherOreVeinForBiomeRegion(reg, r, baseX, baseZ, StateBlackstone, 2, 5, 31, 33, biomeName, "minecraft:basalt_deltas", true)
 	// Ancient debris: 1 large scattered vein (size 3) in trapezoid [8..24] and 1 small scattered vein (size 2) in uniform [8..119].
+	r.SetFeatureSeed(decSeed, 15, 7)
 	placeNetherScatteredOreRegion(reg, r, baseX, baseZ, nb.ancientDebris, 1, 8, 24, 3, true)
+	r.SetFeatureSeed(decSeed, 16, 7)
 	placeNetherScatteredOreRegion(reg, r, baseX, baseZ, nb.ancientDebris, 1, 8, 119, 2, false)
 
-	// 4. Crimson & Warped forest fungi, vegetation, and vines (with per-position biome checks).
+	// 4. Stage 9 Crimson & Warped forest fungi, vegetation, and vines (with per-position biome checks).
 	if hasCrimsonForest {
+		r.SetFeatureSeed(decSeed, 3, 9)
 		for i := 0; i < 10; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(128))
@@ -1869,23 +1889,29 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 				placeWeepingVinesRegion(reg, ox, oy, oz, r)
 			}
 		}
+		r.SetFeatureSeed(decSeed, 4, 9)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 8, r, biomeName, "minecraft:crimson_forest", func(ox, oy, oz int) {
 			placeHugeFungusRegion(reg, ox, oy, oz, r, true)
 		})
+		r.SetFeatureSeed(decSeed, 5, 9)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 6, r, biomeName, "minecraft:crimson_forest", func(ox, oy, oz int) {
 			placeNetherForestVegetationRegion(reg, ox, oy, oz, r, true, 8, 4)
 		})
 	}
 	if hasWarpedForest {
+		r.SetFeatureSeed(decSeed, 6, 9)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 8, r, biomeName, "minecraft:warped_forest", func(ox, oy, oz int) {
 			placeHugeFungusRegion(reg, ox, oy, oz, r, false)
 		})
+		r.SetFeatureSeed(decSeed, 7, 9)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 5, r, biomeName, "minecraft:warped_forest", func(ox, oy, oz int) {
 			placeNetherForestVegetationRegion(reg, ox, oy, oz, r, false, 8, 4)
 		})
+		r.SetFeatureSeed(decSeed, 8, 9)
 		netherCountOnEveryLayer(reg, baseX, baseZ, 4, r, biomeName, "minecraft:warped_forest", func(ox, oy, oz int) {
 			placeNetherSproutsRegion(reg, ox, oy, oz, r, 8, 4)
 		})
+		r.SetFeatureSeed(decSeed, 9, 9)
 		for i := 0; i < 10; i++ {
 			ox := baseX + int(r.NextIntN(16))
 			oy := int(r.NextIntN(128))
@@ -1901,12 +1927,14 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 	if hasBasaltDeltas {
 		openSpringCount, closedSpringCount = 16, 32
 	}
+	r.SetFeatureSeed(decSeed, 2, 7)
 	for i := 0; i < openSpringCount; i++ {
 		ox := baseX + int(r.NextIntN(16))
 		oy := int(r.NextIntN(120)) + 4
 		oz := baseZ + int(r.NextIntN(16))
 		placeNetherSpringRegion(reg, ox, oy, oz, false)
 	}
+	r.SetFeatureSeed(decSeed, 6, 7)
 	for i := 0; i < closedSpringCount; i++ {
 		ox := baseX + int(r.NextIntN(16))
 		oy := int(r.NextIntN(108)) + 10
@@ -1914,6 +1942,7 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 		placeNetherSpringRegion(reg, ox, oy, oz, true)
 	}
 	// Step 9 spring_lava (count = 20, very_biased_to_bottom in [0..119], inner = 8).
+	r.SetFeatureSeed(decSeed, 0, 9)
 	for i := 0; i < 20; i++ {
 		ox := baseX + int(r.NextIntN(16))
 		inner := int(r.NextIntN(112)) + 8
@@ -1924,12 +1953,14 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 			placeNetherSpringRegion(reg, ox, oy, oz, false)
 		}
 	}
+	r.SetFeatureSeed(decSeed, 1, 9)
 	if r.NextIntN(2) == 0 {
 		ox := baseX + int(r.NextIntN(16))
 		oy := int(r.NextIntN(128))
 		oz := baseZ + int(r.NextIntN(16))
 		placeNetherMushroomPatchRegion(reg, ox, oy, oz, r, nb.brownMushroom)
 	}
+	r.SetFeatureSeed(decSeed, 2, 9)
 	if r.NextIntN(2) == 0 {
 		ox := baseX + int(r.NextIntN(16))
 		oy := int(r.NextIntN(128))
@@ -1937,8 +1968,9 @@ func decorateNetherRegionSource(reg *netherRegion, cx, cz int32, seed int64, bio
 		placeNetherMushroomPatchRegion(reg, ox, oy, oz, r, nb.redMushroom)
 	}
 
-	// 6. Fire and soul fire patches (placed_feature/patch_fire.json & patch_soul_fire.json:
+	// 6. Stage 7 fire and soul fire patches (placed_feature/patch_fire.json & patch_soul_fire.json:
 	// count = 0..5, y = 4..123, 96 tries with trapezoid xz_spread=7, y_spread=3).
+	r.SetFeatureSeed(decSeed, 17, 7)
 	firePatchCount := int(r.NextIntN(6))
 	for i := 0; i < firePatchCount; i++ {
 		ox := baseX + int(r.NextIntN(16))

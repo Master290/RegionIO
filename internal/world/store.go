@@ -33,10 +33,9 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-// Version 52: BonusChestFeature (minecraft:bonus_chest with
-// minecraft:chests/spawn_bonus_chest loot and surrounding torches) and full
-// multi-biome decoration, geode, and ore vein parity verification (vanilla 26.1.2).
-const generatorVersion = 52
+// Version 53: Nether DecorationRandom / SetFeatureSeed stage parity and full
+// Overworld, Nether, and End biome ID and chunk block-hash parity verification (vanilla 26.1.2).
+const generatorVersion = 53
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

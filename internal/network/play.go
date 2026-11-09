@@ -404,15 +404,6 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	var prev server.PlayerSnapshot
 	if h.session != nil {
 		prev = h.session.Snapshot()
-		if (prev.GameMode == server.GameModeSurvival || prev.GameMode == server.GameModeAdventure) &&
-			(prev.X != 0 || prev.Y != 0 || prev.Z != 0) && !h.session.IsFallFlying() {
-			dx := x - prev.X
-			dz := z - prev.Z
-			if dx*dx+dz*dz > 100.0*100.0 {
-				_ = h.sendPlayerPosition(0)
-				return nil
-			}
-		}
 	}
 	h.srv.SetPlayerTransform(h.session, x, y, z, yaw, pitch, onGround)
 	if h.session != nil {
@@ -836,7 +827,7 @@ func (h *handler) syncVisibleEntities() error {
 			}
 		} else if known != current {
 			entity := current.entity
-			if err := h.sendEntityDeltaOrTeleport(known, current); err != nil {
+			if err := h.sendEntityTeleportState(&entity, current.onGround); err != nil {
 				return err
 			}
 			if byte(known.entity.HeadYaw*256.0/360.0) != byte(entity.HeadYaw*256.0/360.0) {
@@ -956,59 +947,6 @@ func (h *handler) sendAddEntity(e *world.Entity) error {
 	return h.conn.SendWriter(protocol.PlayAddEntity, w)
 }
 
-func encodeEntityFixedCoord(v float64) int64 {
-	return int64(math.Round(v * 4096.0))
-}
-
-func (h *handler) sendEntityDeltaOrTeleport(known, current visibleEntity) error {
-	entity := current.entity
-	dx := encodeEntityFixedCoord(entity.X) - encodeEntityFixedCoord(known.entity.X)
-	dy := encodeEntityFixedCoord(entity.Y) - encodeEntityFixedCoord(known.entity.Y)
-	dz := encodeEntityFixedCoord(entity.Z) - encodeEntityFixedCoord(known.entity.Z)
-	curYaw := byte(entity.Yaw * 256.0 / 360.0)
-	curPitch := byte(entity.Pitch * 256.0 / 360.0)
-	prevYaw := byte(known.entity.Yaw * 256.0 / 360.0)
-	prevPitch := byte(known.entity.Pitch * 256.0 / 360.0)
-	moved := dx != 0 || dy != 0 || dz != 0
-	rotated := curYaw != prevYaw || curPitch != prevPitch
-	groundChanged := current.onGround != known.onGround
-	velChanged := entity.VelocityX != known.entity.VelocityX ||
-		entity.VelocityY != known.entity.VelocityY ||
-		entity.VelocityZ != known.entity.VelocityZ
-
-	if dx < math.MinInt16 || dx > math.MaxInt16 ||
-		dy < math.MinInt16 || dy > math.MaxInt16 ||
-		dz < math.MinInt16 || dz > math.MaxInt16 {
-		return h.sendEntityTeleportState(&entity, current.onGround)
-	}
-
-	if moved && rotated {
-		if err := h.conn.Send(protocol.PlayMoveEntityPosRot, server.EncodeMoveEntityPosRotPacket(entity.ID, int16(dx), int16(dy), int16(dz), curYaw, curPitch, current.onGround)); err != nil {
-			return err
-		}
-	} else if moved {
-		if err := h.conn.Send(protocol.PlayMoveEntityPos, server.EncodeMoveEntityPosPacket(entity.ID, int16(dx), int16(dy), int16(dz), current.onGround)); err != nil {
-			return err
-		}
-	} else if rotated || groundChanged {
-		if err := h.conn.Send(protocol.PlayMoveEntityRot, server.EncodeMoveEntityRotPacket(entity.ID, curYaw, curPitch, current.onGround)); err != nil {
-			return err
-		}
-	}
-
-	if velChanged {
-		if err := h.conn.Send(protocol.PlaySetEntityMotion, server.EncodeSetEntityMotionPacket(
-			entity.ID,
-			float64(entity.VelocityX)/8000.0,
-			float64(entity.VelocityY)/8000.0,
-			float64(entity.VelocityZ)/8000.0,
-		)); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (h *handler) sendEntityTeleport(e *world.Entity) error {
 	return h.sendEntityTeleportState(e, true)
 }
@@ -1038,9 +976,6 @@ func (h *handler) sendRemoveEntity(id int32) error {
 // handlePlay dispatches serverbound play packets. Most are tolerated for now;
 // teleport and keep-alive are acknowledged/logged.
 func (h *handler) handlePlay(pkt protocol.Packet) error {
-	if err := h.checkPacketRateLimit(time.Now()); err != nil {
-		return err
-	}
 	switch pkt.ID {
 	case protocol.PlayAcceptTeleport:
 		id, err := pkt.Body().VarInt()
@@ -1138,9 +1073,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 
 	case server.PlayInteractSB:
 		if h.srv != nil {
-			if err := h.srv.HandlePlayerInteractPacket(h.session, pkt.Body()); err != nil {
-				return err
-			}
+			_ = h.srv.HandlePlayerInteractPacket(h.session, pkt.Body())
 			h.syncHotbarFromSession()
 		}
 		return nil
@@ -1148,12 +1081,7 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 	case server.PlayUseItemSB:
 		if h.srv != nil && h.session != nil {
 			_ = h.srv.TryCollectDragonBreath(h.session)
-			if hand, seq, yaw, pitch, err := server.DecodeUseItemPacket(pkt.Body()); err == nil {
-				if (hand != server.HandMain && hand != server.HandOffHand) ||
-					math.IsNaN(float64(yaw)) || math.IsNaN(float64(pitch)) ||
-					math.IsInf(float64(yaw), 0) || math.IsInf(float64(pitch), 0) {
-					return errors.New("use_item: invalid packet fields")
-				}
+			if hand, seq, _, _, err := server.DecodeUseItemPacket(pkt.Body()); err == nil {
 				invSlot := h.session.HeldInventorySlot()
 				if hand == server.HandOffHand {
 					invSlot = server.OffHandContainerSlot
@@ -1709,9 +1637,6 @@ func (h *handler) handleKeepAlive(pkt protocol.Packet) error {
 // server's formatted chat system. When enforce-secure-chat is enabled, unsigned
 // messages disconnect the client with multiplayer.disconnect.unsigned_chat.
 func (h *handler) handleChat(pkt protocol.Packet) error {
-	if err := h.checkChatRateLimit(time.Now()); err != nil {
-		return err
-	}
 	chatMsg, err := server.DecodeServerboundChatPacket(pkt.Body())
 	if err != nil {
 		return err
@@ -1808,9 +1733,6 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	}
 
 	if h.srv != nil {
-		if h.session != nil && !h.srv.CanInteractWithBlock(h.session, x, y, z) {
-			return h.sendBlockChangedAck(seq)
-		}
 		canModifyWorld := h.session == nil || (h.session.Snapshot().GameMode != server.GameModeSpectator && h.session.Snapshot().GameMode != server.GameModeAdventure)
 		if canModifyWorld && status == server.PlayerActionStartDestroyBlock && int(faceByte) < len(faceOffsets) {
 			dim := world.DimensionOverworld
@@ -1936,21 +1858,8 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	if hand != server.HandMain && hand != server.HandOffHand {
-		return errors.New("use_item_on: invalid hand")
-	}
-	if face < 0 || face > 5 {
-		return errors.New("use_item_on: invalid block face")
-	}
-	if math.IsNaN(float64(cursorX)) || math.IsNaN(float64(cursorY)) || math.IsNaN(float64(cursorZ)) ||
-		math.IsInf(float64(cursorX), 0) || math.IsInf(float64(cursorY), 0) || math.IsInf(float64(cursorZ), 0) {
-		return errors.New("use_item_on: invalid cursor coordinates")
-	}
 
 	if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSpectator {
-		return h.sendBlockChangedAck(seq)
-	}
-	if h.srv != nil && h.session != nil && !h.srv.CanInteractWithBlock(h.session, x, y, z) {
 		return h.sendBlockChangedAck(seq)
 	}
 	isAdventure := h.session != nil && h.session.Snapshot().GameMode == server.GameModeAdventure

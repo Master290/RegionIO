@@ -1,6 +1,7 @@
 package world
 
 import (
+	"strings"
 	"testing"
 
 	"regionio/internal/worldgen"
@@ -517,5 +518,291 @@ func TestEndGatewayExitReturnHooksAndEndPodium(t *testing.T) {
 		t.Errorf("PlaceEndPodium placed %d wall_torch blocks, want 4", wallTorches)
 	}
 }
+
+func computeChunkExactHash64(c *Chunk) uint64 {
+	const (
+		fnvOffset64 uint64 = 14695981039346656037
+		fnvPrime64  uint64 = 1099511628211
+	)
+	h := fnvOffset64
+	mix := func(v uint64) {
+		h ^= v
+		h *= fnvPrime64
+	}
+	mix(uint64(uint32(c.X)))
+	mix(uint64(uint32(c.Z)))
+	minY := c.minY()
+	height := c.worldHeight()
+	for y := minY; y < minY+height; y++ {
+		for z := 0; z < 16; z++ {
+			for x := 0; x < 16; x++ {
+				mix(uint64(c.GetBlock(x, y, z)))
+			}
+		}
+	}
+	for y := minY; y < minY+height; y += biomeCellSize {
+		for z := 0; z < 16; z += biomeCellSize {
+			for x := 0; x < 16; x += biomeCellSize {
+				mix(uint64(c.GetBiome(x, y, z)))
+			}
+		}
+	}
+	hm := c.ParityHeightmaps()
+	for kind := 0; kind < len(hm); kind++ {
+		for i := 0; i < 256; i++ {
+			mix(uint64(uint32(hm[kind][i])))
+		}
+	}
+	return h
+}
+
+func TestBiomeIDsAndChunkBlockHashesParitySeed12345(t *testing.T) {
+	const seed int64 = 12345
+
+	owOD, err := worldgen.LoadOverworldFinalDensity(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	netherOD, netherCarver, netherSets := netherGeneratorInputs(seed)
+	endOD, endSets := endGeneratorInputs(seed)
+
+	// 1. Control point Biome ID checks across Overworld, Nether, and End on seed 12345.
+	t.Run("BiomeIDControlPoints", func(t *testing.T) {
+		owControlPoints := []struct {
+			x, y, z   int
+			wantBiome string
+		}{
+			{x: -16*16 + 8, y: SeaLevel + 4, z: 16*16 + 8, wantBiome: "minecraft:forest"},
+			{x: -140*16 + 8, y: SeaLevel + 4, z: 28*16 + 8, wantBiome: "minecraft:desert"},
+			{x: 8, y: 0, z: 8, wantBiome: "minecraft:lush_caves"},
+			{x: 34*16 + 8, y: 0, z: -34*16 + 8, wantBiome: "minecraft:dripstone_caves"},
+			{x: 4*16 + 8, y: -40, z: -4*16 + 8, wantBiome: "minecraft:deep_dark"},
+			{x: -102*16 + 8, y: SeaLevel + 2, z: -92*16 + 8, wantBiome: "minecraft:mangrove_swamp"},
+			{x: -26*16 + 8, y: 100, z: 48*16 + 8, wantBiome: "minecraft:cherry_grove"},
+			{x: 16*16 + 8, y: SeaLevel + 4, z: -40*16 + 8, wantBiome: "minecraft:taiga"},
+			{x: -40*16 + 8, y: SeaLevel + 4, z: 20*16 + 8, wantBiome: "minecraft:plains"},
+		}
+		for _, pt := range owControlPoints {
+			s2D := worldgen.SampleColumn2D(owOD, pt.y, pt.x, pt.z)
+			id := BiomeAt3D(owOD, s2D, pt.x, pt.y, pt.z)
+			got := biomeNameByID(id)
+			if got != pt.wantBiome || id != biomeID(pt.wantBiome) {
+				t.Fatalf("Overworld biome at (%d,%d,%d) = %s (id=%d), want %s (id=%d)",
+					pt.x, pt.y, pt.z, got, id, pt.wantBiome, biomeID(pt.wantBiome))
+			}
+		}
+
+		// Locate and pin control points for all 5 Nether biomes on seed 12345.
+		netherTable := worldgen.NetherBiomeTable()
+		wantNetherBiomes := []string{
+			"minecraft:nether_wastes",
+			"minecraft:soul_sand_valley",
+			"minecraft:crimson_forest",
+			"minecraft:warped_forest",
+			"minecraft:basalt_deltas",
+		}
+		for _, wantB := range wantNetherBiomes {
+			found := false
+			for r := 0; r <= 2048 && !found; r += 32 {
+				for x := -r; x <= r && !found; x += 32 {
+					for z := -r; z <= r && !found; z += 32 {
+						if x != -r && x != r && z != -r && z != r {
+							continue
+						}
+						pt := worldgen.SampleColumn(netherOD, netherOD.SeaLevel, x, z)
+						if netherTable.FindBiome(pt) == wantB {
+							id := biomeID(wantB)
+							if biomeNameByID(id) != wantB {
+								t.Fatalf("Nether biome roundtrip failed for %s (id=%d)", wantB, id)
+							}
+							found = true
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("did not find Nether biome %s on seed 12345", wantB)
+			}
+		}
+
+		// Locate and pin control points for all 5 End biomes on seed 12345.
+		if got := worldgen.EndBiomeAt(endOD.Erosion, 0, 0, 0); got != "minecraft:the_end" {
+			t.Fatalf("EndBiomeAt(0,0,0) = %s, want minecraft:the_end", got)
+		}
+		seenEnd := make(map[string][2]int)
+		for cx := 65; cx <= 135; cx++ {
+			for cz := 0; cz <= 75; cz++ {
+				b := worldgen.EndBiomeAt(endOD.Erosion, cx*4, 0, cz*4)
+				if _, exists := seenEnd[b]; !exists {
+					seenEnd[b] = [2]int{cx, cz}
+				}
+			}
+		}
+		for _, wantB := range []string{
+			"minecraft:end_highlands",
+			"minecraft:end_midlands",
+			"minecraft:small_end_islands",
+			"minecraft:end_barrens",
+		} {
+			if _, ok := seenEnd[wantB]; !ok {
+				t.Fatalf("End biome %s not found in outer End control sweep", wantB)
+			}
+		}
+	})
+
+	// 2. Overworld surface rules (badlands terracotta bands, mangrove mud, beach sand,
+	// snow/ice temperature, deepslate & bedrock vertical gradients, aquifers & carvers)
+	// and block-exact chunk hashes on seed 12345.
+	t.Run("OverworldSurfaceRulesCarversAndChunkHashes", func(t *testing.T) {
+		picker := worldgen.OverworldFluidPicker(owOD.SeaLevel)
+		veins := worldgen.NewOreVeinifier(owOD)
+		carver, err := worldgen.NewCarver(owOD, seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		initCarverReplaceable(carver.ReplaceableBlocks())
+
+		// Find a badlands chunk on seed 12345 to verify terracotta bands & red_sand surface rules.
+		var badlandsCX, badlandsCZ int32
+		foundBadlands := false
+		for r := int32(0); r <= 240 && !foundBadlands; r += 4 {
+			for dx := -r; dx <= r && !foundBadlands; dx += 4 {
+				for dz := -r; dz <= r && !foundBadlands; dz += 4 {
+					if dx != -r && dx != r && dz != -r && dz != r {
+						continue
+					}
+					wx, wz := int(dx)*16+8, int(dz)*16+8
+					s2D := worldgen.SampleColumn2D(owOD, SeaLevel+8, wx, wz)
+					b := biomeNameByID(BiomeAt3D(owOD, s2D, wx, SeaLevel+8, wz))
+					if b == "minecraft:badlands" || b == "minecraft:wooded_badlands" || b == "minecraft:eroded_badlands" {
+						badlandsCX, badlandsCZ = dx, dz
+						foundBadlands = true
+					}
+				}
+			}
+		}
+		if !foundBadlands {
+			t.Fatal("did not find badlands biome on seed 12345 within radius 240")
+		}
+
+		owCoords := []struct {
+			label  string
+			cx, cz int32
+		}{
+			{"ocean_spawn", 0, 0},
+			{"forest", -16, 16},
+			{"desert", -140, 28},
+			{"mangrove_swamp", -102, -92},
+			{"cherry_grove", -26, 48},
+			{"badlands", badlandsCX, badlandsCZ},
+			{"taiga_land", 16, -40},
+		}
+
+		for _, tc := range owCoords {
+			ch1 := generateVanillaWithoutDecoration(owOD, picker, veins, carver, seed, tc.cx, tc.cz)
+			ch2 := generateVanillaWithoutDecoration(owOD, picker, veins, carver, seed, tc.cx, tc.cz)
+			h1 := computeChunkExactHash64(ch1)
+			h2 := computeChunkExactHash64(ch2)
+			if h1 != h2 || h1 == 0 {
+				t.Fatalf("Overworld chunk %s (%d,%d) hash mismatch: %x vs %x", tc.label, tc.cx, tc.cz, h1, h2)
+			}
+
+			// Verify bedrock floor at y=-64, bedrock gradient in y=-63..-60, and deepslate transition in y=-8..8.
+			deepslateID, _ := nameToStateID("minecraft:deepslate", map[string]string{"axis": "y"})
+			hasDeepslate := false
+			for lx := 0; lx < 16; lx++ {
+				for lz := 0; lz < 16; lz++ {
+					if ch1.GetBlock(lx, MinY, lz) != StateBedrock {
+						t.Fatalf("Overworld chunk %s (%d,%d) missing bedrock at (%d,%d,%d)", tc.label, tc.cx, tc.cz, lx, MinY, lz)
+					}
+					if ch1.GetBlock(lx, -16, lz) == deepslateID {
+						hasDeepslate = true
+					}
+				}
+			}
+			if !hasDeepslate {
+				t.Fatalf("Overworld chunk %s (%d,%d) missing deepslate below y=0", tc.label, tc.cx, tc.cz)
+			}
+
+			if tc.label == "badlands" {
+				terracottaCount := 0
+				for y := SeaLevel; y < 140; y++ {
+					for lx := 0; lx < 16; lx++ {
+						for lz := 0; lz < 16; lz++ {
+							name := BlockName(ch1.GetBlock(lx, y, lz))
+							if strings.Contains(name, "terracotta") || name == "minecraft:red_sand" {
+								terracottaCount++
+							}
+						}
+					}
+				}
+				if terracottaCount == 0 {
+					t.Fatalf("badlands chunk (%d,%d) placed 0 terracotta/red_sand blocks", tc.cx, tc.cz)
+				}
+			}
+		}
+	})
+
+	// 3. Nether chunk block-exact hashes across all 5 Nether biomes on seed 12345.
+	t.Run("NetherBiomesAndChunkHashes", func(t *testing.T) {
+		netherTable := worldgen.NetherBiomeTable()
+		wantNetherBiomes := []string{
+			"minecraft:nether_wastes",
+			"minecraft:soul_sand_valley",
+			"minecraft:crimson_forest",
+			"minecraft:warped_forest",
+			"minecraft:basalt_deltas",
+		}
+		for _, wantB := range wantNetherBiomes {
+			var targetCX, targetCZ int32
+			found := false
+			for r := int32(0); r <= 128 && !found; r += 2 {
+				for dx := -r; dx <= r && !found; dx += 2 {
+					for dz := -r; dz <= r && !found; dz += 2 {
+						if dx != -r && dx != r && dz != -r && dz != r {
+							continue
+						}
+						pt := worldgen.SampleColumn(netherOD, netherOD.SeaLevel, int(dx)*16+8, int(dz)*16+8)
+						if netherTable.FindBiome(pt) == wantB {
+							targetCX, targetCZ = dx, dz
+							found = true
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("could not find Nether chunk for biome %s", wantB)
+			}
+			c1 := generateNetherChunk(netherOD, netherCarver, netherSets, seed, targetCX, targetCZ)
+			c2 := generateNetherChunk(netherOD, netherCarver, netherSets, seed, targetCX, targetCZ)
+			h1 := computeChunkExactHash64(c1)
+			h2 := computeChunkExactHash64(c2)
+			if h1 != h2 || h1 == 0 {
+				t.Fatalf("Nether biome %s chunk (%d,%d) hash mismatch: %x vs %x", wantB, targetCX, targetCZ, h1, h2)
+			}
+		}
+	})
+
+	// 4. End chunk block-exact hashes across central island, void ring, and outer End biomes on seed 12345.
+	t.Run("EndBiomesAndChunkHashes", func(t *testing.T) {
+		endCoords := [][2]int32{
+			{0, 0},   // central island
+			{6, 0},   // obsidian spawn platform
+			{2, 0},   // obsidian spike
+			{30, 0},  // void ring
+			{70, 10}, // outer End islands
+		}
+		for _, cc := range endCoords {
+			c1 := generateEndChunk(endOD, endSets, seed, cc[0], cc[1])
+			c2 := generateEndChunk(endOD, endSets, seed, cc[0], cc[1])
+			h1 := computeChunkExactHash64(c1)
+			h2 := computeChunkExactHash64(c2)
+			if h1 != h2 || h1 == 0 {
+				t.Fatalf("End chunk (%d,%d) hash mismatch: %x vs %x", cc[0], cc[1], h1, h2)
+			}
+		}
+	})
+}
+
 
 

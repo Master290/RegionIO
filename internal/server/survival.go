@@ -934,20 +934,8 @@ func (s *Server) HandlePlayerInteractPacket(session *PlayerSession, r *protocol.
 	if err != nil {
 		return err
 	}
-	if pkt.Action == InteractActionInteractAt {
-		if math.IsNaN(float64(pkt.TargetX)) || math.IsNaN(float64(pkt.TargetY)) || math.IsNaN(float64(pkt.TargetZ)) ||
-			math.IsInf(float64(pkt.TargetX), 0) || math.IsInf(float64(pkt.TargetY), 0) || math.IsInf(float64(pkt.TargetZ), 0) {
-			return fmt.Errorf("interact: invalid target coordinates")
-		}
-	}
-	if pkt.Action != InteractActionAttack && pkt.Hand != HandMain && pkt.Hand != HandOffHand {
-		return fmt.Errorf("interact: invalid hand %d", pkt.Hand)
-	}
 	if s != nil && session != nil {
 		isSpectator := session.Snapshot().GameMode == GameModeSpectator
-		if !isSpectator && !s.CanInteractWithEntity(session, pkt.EntityID) {
-			return nil
-		}
 		switch pkt.Action {
 		case InteractActionAttack:
 			if isSpectator {
