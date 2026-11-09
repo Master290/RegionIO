@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -805,6 +808,7 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 		}
 		dealt, killed := s.AttackEntity(session, targetEntityID)
 		if dealt > 0 {
+			s.SetEntityAttacker(targetEntityID, session.EntityID)
 			s.RecordPlayerDamageDealt(session, dealt)
 			s.DamageHeldItem(session, 1)
 		}
@@ -847,6 +851,7 @@ func (s *Server) AttackEntityWithEnchantments(session *PlayerSession, targetEnti
 	if dealt <= 0 {
 		return 0, false
 	}
+	s.SetEntityAttacker(targetEntityID, session.EntityID)
 	s.DamageHeldItem(session, 1)
 
 	if bonus > 0 {
@@ -1626,15 +1631,15 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		ab.Float32(0.1)
 		_ = send(protocol.PlayAbilities, ab.Bytes())
 		_ = send(protocol.PlaySetHealth, EncodeSetHealth(world.DefaultPlayerHealth, world.DefaultPlayerFoodLevel, world.DefaultPlayerSaturation))
+		_ = send(protocol.PlaySetEntityData, s.PlayerAvatarEntityDataPacketByEntityID(session.EntityID))
+		_ = s.SendPlayerAttributes(session)
 
 		heldW := protocol.NewWriter(4)
 		heldW.VarInt(selectedSlot)
 		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
 
 		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
-		if s.KeepInventory() {
-			_ = s.SendPlayerExperience(session)
-		}
+		_ = s.SendPlayerExperience(session)
 		s.SendWorldBorderToPlayer(session)
 		s.SendDifficultyToPlayer(session)
 	}
@@ -2839,6 +2844,12 @@ type attributeInstance struct {
 	Modifiers map[string]AttributeModifier
 }
 
+// ScheduledFunctionEntry represents a pending /schedule function task.
+type ScheduledFunctionEntry struct {
+	Function      string
+	ExecuteAtTick int64
+}
+
 type serverCommandAuxState struct {
 	mu                sync.RWMutex
 	playerTags        map[[16]byte]map[string]bool
@@ -2846,6 +2857,10 @@ type serverCommandAuxState struct {
 	playerAttrs       map[[16]byte]map[string]*attributeInstance
 	entityAttrs       map[int32]map[string]*attributeInstance
 	entityMount       map[int32]int32 // riderEntityID -> vehicleEntityID
+	entityAttacker    map[int32]int32 // victimEntityID -> attackerEntityID
+	entityTarget      map[int32]int32 // mobEntityID -> targetEntityID
+	entityOwner       map[int32]int32 // entityID -> ownerEntityID
+	entityOrigin      map[int32]int32 // entityID -> originEntityID
 	forceLoadedChunks map[string]map[[2]int32]bool
 	tickRate          float32
 	tickFrozen        bool
@@ -2854,6 +2869,9 @@ type serverCommandAuxState struct {
 	bannedPlayers     map[string]BanEntry
 	bannedIPs         map[string]BanEntry
 	commandStorage    map[string]*nbt.Compound
+	functions         map[string][]string
+	schedules         []ScheduledFunctionEntry
+	scheduledRunner   func(fnName string)
 }
 
 var serverAuxStates sync.Map // map[*Server]*serverCommandAuxState
@@ -2871,11 +2889,16 @@ func (s *Server) cmdAux() *serverCommandAuxState {
 		playerAttrs:       make(map[[16]byte]map[string]*attributeInstance),
 		entityAttrs:       make(map[int32]map[string]*attributeInstance),
 		entityMount:       make(map[int32]int32),
+		entityAttacker:    make(map[int32]int32),
+		entityTarget:      make(map[int32]int32),
+		entityOwner:       make(map[int32]int32),
+		entityOrigin:      make(map[int32]int32),
 		forceLoadedChunks: make(map[string]map[[2]int32]bool),
 		tickRate:          20.0,
 		bannedPlayers:     make(map[string]BanEntry),
 		bannedIPs:         make(map[string]BanEntry),
 		commandStorage:    make(map[string]*nbt.Compound),
+		functions:         make(map[string][]string),
 	}
 	actual, _ := serverAuxStates.LoadOrStore(s, initSt)
 	return actual.(*serverCommandAuxState)
@@ -3160,36 +3183,187 @@ func (s *Server) HasEntityTag(entityID int32, tag string) bool {
 }
 
 var defaultAttributeBases = map[string]float64{
-	"minecraft:max_health":               20.0,
-	"minecraft:follow_range":             32.0,
-	"minecraft:knockback_resistance":     0.0,
-	"minecraft:movement_speed":           0.1,
-	"minecraft:flying_speed":             0.4,
-	"minecraft:attack_damage":            1.0,
-	"minecraft:attack_knockback":         0.0,
-	"minecraft:attack_speed":             4.0,
-	"minecraft:armor":                    0.0,
-	"minecraft:armor_toughness":          0.0,
-	"minecraft:fall_damage_multiplier":   1.0,
-	"minecraft:luck":                     0.0,
-	"minecraft:max_absorption":           0.0,
-	"minecraft:safe_fall_distance":       3.0,
-	"minecraft:scale":                    1.0,
-	"minecraft:step_height":              0.6,
-	"minecraft:gravity":                  0.08,
-	"minecraft:jump_strength":            0.42,
-	"minecraft:burning_time":             1.0,
+	"minecraft:armor":                          0.0,
+	"minecraft:armor_toughness":                0.0,
+	"minecraft:attack_damage":                  1.0,
+	"minecraft:attack_knockback":               0.0,
+	"minecraft:attack_speed":                   4.0,
+	"minecraft:block_break_speed":              1.0,
+	"minecraft:block_interaction_range":        4.5,
+	"minecraft:burning_time":                   1.0,
+	"minecraft:camera_distance":                4.0,
 	"minecraft:explosion_knockback_resistance": 0.0,
-	"minecraft:movement_efficiency":      0.0,
-	"minecraft:oxygen_bonus":             0.0,
-	"minecraft:water_movement_efficiency": 0.0,
-	"minecraft:block_interaction_range":  4.5,
-	"minecraft:entity_interaction_range": 3.0,
-	"minecraft:block_break_speed":        1.0,
-	"minecraft:mining_efficiency":        0.0,
-	"minecraft:sneaking_speed":           0.3,
-	"minecraft:submerged_mining_speed":   0.2,
-	"minecraft:sweeping_damage_ratio":    0.0,
+	"minecraft:entity_interaction_range":       3.0,
+	"minecraft:fall_damage_multiplier":         1.0,
+	"minecraft:flying_speed":                   0.4,
+	"minecraft:follow_range":                   32.0,
+	"minecraft:gravity":                        0.08,
+	"minecraft:jump_strength":                  0.42,
+	"minecraft:knockback_resistance":           0.0,
+	"minecraft:luck":                           0.0,
+	"minecraft:max_absorption":                 0.0,
+	"minecraft:max_health":                     20.0,
+	"minecraft:mining_efficiency":              0.0,
+	"minecraft:movement_efficiency":            0.0,
+	"minecraft:movement_speed":                 0.1,
+	"minecraft:oxygen_bonus":                   0.0,
+	"minecraft:safe_fall_distance":             3.0,
+	"minecraft:scale":                          1.0,
+	"minecraft:sneaking_speed":                 0.3,
+	"minecraft:spawn_reinforcements":           0.0,
+	"minecraft:step_height":                    0.6,
+	"minecraft:submerged_mining_speed":         0.2,
+	"minecraft:sweeping_damage_ratio":          0.0,
+	"minecraft:tempt_range":                    10.0,
+	"minecraft:water_movement_efficiency":      0.0,
+	"minecraft:waypoint_transmit_range":        0.0,
+	"minecraft:waypoint_receive_range":         0.0,
+}
+
+// attributeRegistryIDs maps canonical attribute names to BuiltInRegistries.ATTRIBUTE
+// numeric IDs in Minecraft 26.1.2 (protocol 775), verified from Attributes.class.
+var attributeRegistryIDs = map[string]int32{
+	"minecraft:armor":                          0,
+	"minecraft:armor_toughness":                1,
+	"minecraft:attack_damage":                  2,
+	"minecraft:attack_knockback":               3,
+	"minecraft:attack_speed":                   4,
+	"minecraft:block_break_speed":              5,
+	"minecraft:block_interaction_range":        6,
+	"minecraft:burning_time":                   7,
+	"minecraft:camera_distance":                8,
+	"minecraft:explosion_knockback_resistance": 9,
+	"minecraft:entity_interaction_range":       10,
+	"minecraft:fall_damage_multiplier":         11,
+	"minecraft:flying_speed":                   12,
+	"minecraft:follow_range":                   13,
+	"minecraft:gravity":                        14,
+	"minecraft:jump_strength":                  15,
+	"minecraft:knockback_resistance":           16,
+	"minecraft:luck":                           17,
+	"minecraft:max_absorption":                 18,
+	"minecraft:max_health":                     19,
+	"minecraft:mining_efficiency":              20,
+	"minecraft:movement_efficiency":            21,
+	"minecraft:movement_speed":                 22,
+	"minecraft:oxygen_bonus":                   23,
+	"minecraft:safe_fall_distance":             24,
+	"minecraft:scale":                          25,
+	"minecraft:sneaking_speed":                 26,
+	"minecraft:spawn_reinforcements":           27,
+	"minecraft:step_height":                    28,
+	"minecraft:submerged_mining_speed":         29,
+	"minecraft:sweeping_damage_ratio":          30,
+	"minecraft:tempt_range":                    31,
+	"minecraft:water_movement_efficiency":      32,
+	"minecraft:waypoint_transmit_range":        33,
+	"minecraft:waypoint_receive_range":         34,
+}
+
+// AttributeSnapshotEntry represents one AttributeSnapshot in ClientboundUpdateAttributesPacket (0x83).
+type AttributeSnapshotEntry struct {
+	AttributeID int32
+	Base        float64
+	Modifiers   []AttributeModifier
+}
+
+// AttributeRegistryID returns the 26.1.2 BuiltInRegistries.ATTRIBUTE ID for attr.
+func AttributeRegistryID(attr string) (int32, bool) {
+	canon, _, ok := CanonicalAttributeName(attr)
+	if !ok {
+		return 0, false
+	}
+	id, ok := attributeRegistryIDs[canon]
+	return id, ok
+}
+
+// EncodeUpdateAttributesPacket encodes a 26.1.2 ClientboundUpdateAttributesPacket (0x83).
+func EncodeUpdateAttributesPacket(entityID int32, attrs []AttributeSnapshotEntry) []byte {
+	w := protocol.NewWriter(32 + len(attrs)*24)
+	w.VarInt(entityID)
+	w.VarInt(int32(len(attrs)))
+	for _, a := range attrs {
+		w.VarInt(a.AttributeID)
+		w.Float64(a.Base)
+		w.VarInt(int32(len(a.Modifiers)))
+		for _, m := range a.Modifiers {
+			w.String(m.ID)
+			w.Float64(m.Amount)
+			w.VarInt(int32(m.Operation))
+		}
+	}
+	return w.Bytes()
+}
+
+var defaultPlayerSyncedAttributes = []string{
+	"minecraft:armor",
+	"minecraft:armor_toughness",
+	"minecraft:attack_damage",
+	"minecraft:attack_speed",
+	"minecraft:block_break_speed",
+	"minecraft:block_interaction_range",
+	"minecraft:entity_interaction_range",
+	"minecraft:fall_damage_multiplier",
+	"minecraft:gravity",
+	"minecraft:jump_strength",
+	"minecraft:knockback_resistance",
+	"minecraft:luck",
+	"minecraft:max_health",
+	"minecraft:movement_speed",
+	"minecraft:safe_fall_distance",
+	"minecraft:scale",
+	"minecraft:step_height",
+}
+
+// SendPlayerAttributes sends ClientboundUpdateAttributesPacket (0x83) with the
+// player's current attribute base values and modifiers.
+func (s *Server) SendPlayerAttributes(session *PlayerSession) error {
+	if s == nil || session == nil || session.send == nil {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	customMap := aux.playerAttrs[session.Profile.UUID]
+	seen := make(map[string]bool, len(defaultPlayerSyncedAttributes)+len(customMap))
+	entries := make([]AttributeSnapshotEntry, 0, len(defaultPlayerSyncedAttributes)+len(customMap))
+	addEntry := func(canon string) {
+		if seen[canon] {
+			return
+		}
+		id, ok := attributeRegistryIDs[canon]
+		if !ok {
+			return
+		}
+		seen[canon] = true
+		base := defaultAttributeBases[canon]
+		var mods []AttributeModifier
+		if customMap != nil {
+			if inst := customMap[canon]; inst != nil {
+				base = inst.Base
+				if len(inst.Modifiers) > 0 {
+					mods = make([]AttributeModifier, 0, len(inst.Modifiers))
+					for _, m := range inst.Modifiers {
+						mods = append(mods, m)
+					}
+					sort.Slice(mods, func(i, j int) bool { return mods[i].ID < mods[j].ID })
+				}
+			}
+		}
+		entries = append(entries, AttributeSnapshotEntry{
+			AttributeID: id,
+			Base:        base,
+			Modifiers:   mods,
+		})
+	}
+	for _, attr := range defaultPlayerSyncedAttributes {
+		addEntry(attr)
+	}
+	for attr := range customMap {
+		addEntry(attr)
+	}
+	aux.mu.RUnlock()
+	sort.Slice(entries, func(i, j int) bool { return entries[i].AttributeID < entries[j].AttributeID })
+	return session.send(protocol.PlayUpdateAttributes, EncodeUpdateAttributesPacket(session.EntityID, entries))
 }
 
 // CanonicalAttributeName normalizes an attribute identifier (supporting both
@@ -3385,6 +3559,27 @@ func (s *Server) GetTargetAttributeModifierValue(session *PlayerSession, entityI
 }
 
 func (s *Server) syncAttributeChange(session *PlayerSession, entityID int32, canonAttr string, total float64) {
+	if session != nil && session.send != nil {
+		if attrID, ok := attributeRegistryIDs[canonAttr]; ok {
+			aux := s.cmdAux()
+			aux.mu.RLock()
+			base := defaultAttributeBases[canonAttr]
+			var mods []AttributeModifier
+			if m := aux.playerAttrs[session.Profile.UUID]; m != nil {
+				if inst := m[canonAttr]; inst != nil {
+					base = inst.Base
+					for _, mod := range inst.Modifiers {
+						mods = append(mods, mod)
+					}
+					sort.Slice(mods, func(i, j int) bool { return mods[i].ID < mods[j].ID })
+				}
+			}
+			aux.mu.RUnlock()
+			_ = session.send(protocol.PlayUpdateAttributes, EncodeUpdateAttributesPacket(session.EntityID, []AttributeSnapshotEntry{
+				{AttributeID: attrID, Base: base, Modifiers: mods},
+			}))
+		}
+	}
 	if canonAttr == "minecraft:max_health" {
 		if session != nil {
 			snap := session.Snapshot()
@@ -3404,6 +3599,372 @@ func (s *Server) syncAttributeChange(session *PlayerSession, entityID int32, can
 			}
 		}
 	}
+}
+
+// SetEntityAttacker records the last entity ID that attacked victimEntityID.
+func (s *Server) SetEntityAttacker(victimEntityID, attackerEntityID int32) {
+	if s == nil || victimEntityID <= 0 {
+		return
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	if attackerEntityID <= 0 {
+		delete(aux.entityAttacker, victimEntityID)
+	} else {
+		aux.entityAttacker[victimEntityID] = attackerEntityID
+	}
+	aux.mu.Unlock()
+}
+
+// EntityAttacker returns the last attacker entity ID for victimEntityID, or 0.
+func (s *Server) EntityAttacker(victimEntityID int32) int32 {
+	if s == nil || victimEntityID <= 0 {
+		return 0
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	id := aux.entityAttacker[victimEntityID]
+	aux.mu.RUnlock()
+	return id
+}
+
+// SetEntityTarget sets the current combat target entity ID for mobEntityID.
+func (s *Server) SetEntityTarget(mobEntityID, targetEntityID int32) {
+	if s == nil || mobEntityID <= 0 {
+		return
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	if targetEntityID <= 0 {
+		delete(aux.entityTarget, mobEntityID)
+	} else {
+		aux.entityTarget[mobEntityID] = targetEntityID
+	}
+	aux.mu.Unlock()
+}
+
+// EntityTarget returns the current combat target entity ID for mobEntityID, or 0.
+func (s *Server) EntityTarget(mobEntityID int32) int32 {
+	if s == nil || mobEntityID <= 0 {
+		return 0
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	id := aux.entityTarget[mobEntityID]
+	aux.mu.RUnlock()
+	if id > 0 {
+		return id
+	}
+	if st, ok := s.GetTamedMobState(mobEntityID); ok {
+		if st.TargetEntityID > 0 {
+			return st.TargetEntityID
+		}
+		if st.TargetPlayer != nil {
+			return st.TargetPlayer.EntityID
+		}
+	}
+	return 0
+}
+
+// SetEntityOwner sets the owner entity ID for entityID.
+func (s *Server) SetEntityOwner(entityID, ownerEntityID int32) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	if ownerEntityID <= 0 {
+		delete(aux.entityOwner, entityID)
+	} else {
+		aux.entityOwner[entityID] = ownerEntityID
+	}
+	aux.mu.Unlock()
+}
+
+// EntityOwner returns the owner entity ID for entityID (checking explicit owner
+// and tamed mob owner UUID), or 0.
+func (s *Server) EntityOwner(entityID int32) int32 {
+	if s == nil || entityID <= 0 {
+		return 0
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	id := aux.entityOwner[entityID]
+	aux.mu.RUnlock()
+	if id > 0 {
+		return id
+	}
+	if ownerUUID, ok := s.MobOwnerUUID(entityID); ok {
+		for _, snap := range s.PlayerSnapshots() {
+			if snap.Profile.UUID == ownerUUID {
+				return snap.EntityID
+			}
+		}
+	}
+	return 0
+}
+
+// SetEntityOrigin sets the origin (shooter/thrower/dropper) entity ID for entityID.
+func (s *Server) SetEntityOrigin(entityID, originEntityID int32) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	if originEntityID <= 0 {
+		delete(aux.entityOrigin, entityID)
+	} else {
+		aux.entityOrigin[entityID] = originEntityID
+	}
+	aux.mu.Unlock()
+}
+
+// EntityOrigin returns the origin entity ID for entityID, or 0.
+func (s *Server) EntityOrigin(entityID int32) int32 {
+	if s == nil || entityID <= 0 {
+		return 0
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	id := aux.entityOrigin[entityID]
+	aux.mu.RUnlock()
+	return id
+}
+
+// EntityLeasher returns the leash holder entity ID for entityID, or 0.
+func (s *Server) EntityLeasher(entityID int32) int32 {
+	if s == nil || entityID <= 0 {
+		return 0
+	}
+	return s.LeashHolderID(entityID)
+}
+
+func normalizeFunctionName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(name, "#")))
+	if n == "" {
+		return ""
+	}
+	if !strings.Contains(n, ":") {
+		n = "minecraft:" + n
+	}
+	return n
+}
+
+func cleanFunctionLines(lines []string) []string {
+	out := make([]string, 0, len(lines))
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "/") {
+			line = strings.TrimSpace(line[1:])
+		}
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// RegisterFunction registers a command function (.mcfunction) under name.
+func (s *Server) RegisterFunction(name string, lines []string) {
+	if s == nil {
+		return
+	}
+	norm := normalizeFunctionName(name)
+	if norm == "" {
+		return
+	}
+	cleaned := cleanFunctionLines(lines)
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	aux.functions[norm] = cleaned
+	aux.mu.Unlock()
+}
+
+// GetFunction returns the command lines for function name, checking in-memory
+// registered functions first and then <WorldDir>/datapacks/*/data/<ns>/function(s)/<path>.mcfunction.
+func (s *Server) GetFunction(name string) ([]string, bool) {
+	if s == nil {
+		return nil, false
+	}
+	norm := normalizeFunctionName(name)
+	if norm == "" {
+		return nil, false
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	lines, ok := aux.functions[norm]
+	aux.mu.RUnlock()
+	if ok {
+		cp := make([]string, len(lines))
+		copy(cp, lines)
+		return cp, true
+	}
+	if s.cfg.WorldDir != "" {
+		parts := strings.SplitN(norm, ":", 2)
+		if len(parts) == 2 {
+			ns, relPath := parts[0], filepath.FromSlash(parts[1]+".mcfunction")
+			for _, subDir := range []string{"function", "functions"} {
+				pattern := filepath.Join(s.cfg.WorldDir, "datapacks", "*", "data", ns, subDir, relPath)
+				if matches, err := filepath.Glob(pattern); err == nil && len(matches) > 0 {
+					if raw, err := os.ReadFile(matches[len(matches)-1]); err == nil {
+						parsed := cleanFunctionLines(strings.Split(string(raw), "\n"))
+						s.RegisterFunction(norm, parsed)
+						return parsed, true
+					}
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+// FunctionNames returns all registered function identifiers sorted alphabetically.
+func (s *Server) FunctionNames() []string {
+	if s == nil {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	out := make([]string, 0, len(aux.functions))
+	for k := range aux.functions {
+		out = append(out, k)
+	}
+	aux.mu.RUnlock()
+	sort.Strings(out)
+	return out
+}
+
+// ScheduleFunction schedules a function to run at WorldAge() + delayTicks.
+// When appendMode is false ("replace"), existing schedules for the same function are replaced.
+func (s *Server) ScheduleFunction(name string, delayTicks int64, appendMode bool) (int64, error) {
+	if s == nil {
+		return 0, errors.New("server unavailable")
+	}
+	if delayTicks <= 0 {
+		return 0, errors.New("Time cannot be 0 ticks or negative")
+	}
+	norm := normalizeFunctionName(name)
+	if norm == "" {
+		return 0, errors.New("Invalid function name")
+	}
+	now, _ := s.WorldTime()
+	targetTick := now + delayTicks
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	if !appendMode {
+		filtered := aux.schedules[:0]
+		for _, e := range aux.schedules {
+			if e.Function != norm {
+				filtered = append(filtered, e)
+			}
+		}
+		aux.schedules = filtered
+	}
+	aux.schedules = append(aux.schedules, ScheduledFunctionEntry{
+		Function:      norm,
+		ExecuteAtTick: targetTick,
+	})
+	sort.SliceStable(aux.schedules, func(i, j int) bool {
+		return aux.schedules[i].ExecuteAtTick < aux.schedules[j].ExecuteAtTick
+	})
+	aux.mu.Unlock()
+	return targetTick, nil
+}
+
+// ClearScheduledFunction removes all pending schedules for function name, returning the count removed.
+func (s *Server) ClearScheduledFunction(name string) int {
+	if s == nil {
+		return 0
+	}
+	norm := normalizeFunctionName(name)
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	removed := 0
+	filtered := aux.schedules[:0]
+	for _, e := range aux.schedules {
+		if e.Function == norm {
+			removed++
+		} else {
+			filtered = append(filtered, e)
+		}
+	}
+	aux.schedules = filtered
+	return removed
+}
+
+// ScheduledFunctions returns a copy of all pending scheduled function entries.
+func (s *Server) ScheduledFunctions() []ScheduledFunctionEntry {
+	if s == nil {
+		return nil
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	defer aux.mu.RUnlock()
+	out := make([]ScheduledFunctionEntry, len(aux.schedules))
+	copy(out, aux.schedules)
+	return out
+}
+
+// PopDueScheduledFunctions removes and returns all scheduled function names whose
+// ExecuteAtTick <= current WorldAge().
+func (s *Server) PopDueScheduledFunctions() []string {
+	if s == nil {
+		return nil
+	}
+	now, _ := s.WorldTime()
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	defer aux.mu.Unlock()
+	if len(aux.schedules) == 0 {
+		return nil
+	}
+	var due []string
+	var rem []ScheduledFunctionEntry
+	for _, e := range aux.schedules {
+		if e.ExecuteAtTick <= now {
+			due = append(due, e.Function)
+		} else {
+			rem = append(rem, e)
+		}
+	}
+	aux.schedules = rem
+	return due
+}
+
+// SetScheduledFunctionRunner registers a callback invoked by RunDueScheduledFunctions.
+func (s *Server) SetScheduledFunctionRunner(runner func(fnName string)) {
+	if s == nil {
+		return
+	}
+	aux := s.cmdAux()
+	aux.mu.Lock()
+	aux.scheduledRunner = runner
+	aux.mu.Unlock()
+}
+
+// RunDueScheduledFunctions pops and executes all scheduled functions due at or before WorldAge().
+func (s *Server) RunDueScheduledFunctions() int {
+	if s == nil {
+		return 0
+	}
+	due := s.PopDueScheduledFunctions()
+	if len(due) == 0 {
+		return 0
+	}
+	aux := s.cmdAux()
+	aux.mu.RLock()
+	runner := aux.scheduledRunner
+	aux.mu.RUnlock()
+	if runner != nil {
+		for _, fn := range due {
+			runner(fn)
+		}
+	}
+	return len(due)
 }
 
 // SetChunkForceLoaded sets or clears the force-loaded status of chunk (cx, cz) in dim.

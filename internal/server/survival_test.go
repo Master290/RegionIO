@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -1978,6 +1980,127 @@ func TestCartographyLockingBookOpenAndCreativeMiddleClickClone(t *testing.T) {
 		t.Fatalf("expected picked banner patterns copied, got %+v", pats)
 	}
 }
+
+func TestIssue21AttributesFunctionsSchedulesAndPlayerDataRoundTrip(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.WorldDir = tmpDir
+	srv, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	// 1. Verify all 35 vanilla 26.1.2 BuiltInRegistries.ATTRIBUTE IDs (0..34)
+	if id, ok := AttributeRegistryID("minecraft:armor"); !ok || id != 0 {
+		t.Fatalf("AttributeRegistryID(armor) = (%d, %v), want (0, true)", id, ok)
+	}
+	if id, ok := AttributeRegistryID("minecraft:max_health"); !ok || id != 19 {
+		t.Fatalf("AttributeRegistryID(max_health) = (%d, %v), want (19, true)", id, ok)
+	}
+	if id, ok := AttributeRegistryID("minecraft:waypoint_receive_range"); !ok || id != 34 {
+		t.Fatalf("AttributeRegistryID(waypoint_receive_range) = (%d, %v), want (34, true)", id, ok)
+	}
+
+	var mu sync.Mutex
+	var gotUpdateAttributes bool
+	var gotSetEntityData bool
+	prof := Profile{UUID: OfflineUUID("Issue21Player"), Name: "Issue21Player"}
+	session, err := srv.RegisterPlayer(prof, func(id int32, body []byte) error {
+		mu.Lock()
+		if id == protocol.PlayUpdateAttributes {
+			gotUpdateAttributes = true
+		}
+		if id == protocol.PlaySetEntityData {
+			gotSetEntityData = true
+		}
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	// Setting an attribute base sends PlayUpdateAttributes (0x83)
+	if err := srv.SetTargetAttributeBase(session, session.EntityID, "minecraft:movement_speed", 0.2); err != nil {
+		t.Fatalf("SetTargetAttributeBase: %v", err)
+	}
+	mu.Lock()
+	sawAttr := gotUpdateAttributes
+	gotUpdateAttributes = false
+	gotSetEntityData = false
+	mu.Unlock()
+	if !sawAttr {
+		t.Fatal("expected PlayUpdateAttributes (0x83) after SetTargetAttributeBase")
+	}
+
+	// ChangePlayerDimension sends both PlaySetEntityData and PlayUpdateAttributes
+	if err := srv.ChangePlayerDimension(session, world.DimensionNether, 8.5, 65.0, 8.5, 45, 10); err != nil {
+		t.Fatalf("ChangePlayerDimension: %v", err)
+	}
+	mu.Lock()
+	sawAttrDim := gotUpdateAttributes
+	sawDataDim := gotSetEntityData
+	mu.Unlock()
+	if !sawAttrDim || !sawDataDim {
+		t.Fatalf("expected ChangePlayerDimension to send PlayUpdateAttributes (%v) and PlaySetEntityData (%v)", sawAttrDim, sawDataDim)
+	}
+
+	// 2. Datapack .mcfunction loading from <WorldDir>/datapacks/*/data/<ns>/function/*.mcfunction
+	fnDir := filepath.Join(tmpDir, "datapacks", "pack1", "data", "custom", "function")
+	if err := os.MkdirAll(fnDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(fnDir, "greet.mcfunction"), []byte("# comment\n/say hi\nsay bye\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	lines, ok := srv.GetFunction("custom:greet")
+	if !ok || len(lines) != 2 || lines[0] != "say hi" || lines[1] != "say bye" {
+		t.Fatalf("GetFunction(custom:greet) = (%v, %v), want ([say hi, say bye], true)", lines, ok)
+	}
+
+	// 3. Full PlayerData save/load round-trip (dimension, spawn point, XP, ender chest, effects, advancements, stats, recipe book)
+	srv.SetPlayerDimensionSpawnPoint(session, world.DimensionNether, 10, 64, 10, 90, 0, true)
+	_ = srv.SetPlayerExperience(session, 12, 250, 0.75)
+	session.SetEnderChestSlot(0, world.NewNamedItemStack("minecraft:ender_pearl", 8))
+	_ = srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectFireResistance, 600, 0))
+	_ = srv.GrantAdvancement(session, "minecraft:nether/obtain_blaze_rod")
+	srv.RecordBlockMined(session, "minecraft:netherrack")
+	_ = srv.UnlockRecipesByNames(session, []string{"minecraft:blaze_powder"})
+
+	savedComp := world.PlayerDataToCompound(session.PlayerData())
+	loadedPD, err := world.PlayerDataFromCompound(savedComp)
+	if err != nil {
+		t.Fatalf("PlayerDataFromCompound: %v", err)
+	}
+	srv.UnregisterPlayer(session)
+
+	session2, err := srv.RegisterPlayer(prof, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer (rejoin): %v", err)
+	}
+	session2.ApplyPlayerData(loadedPD)
+	snap2 := session2.Snapshot()
+	if snap2.Dimension != world.DimensionNether || !snap2.HasSpawn || snap2.SpawnX != 10 {
+		t.Fatalf("restored dimension/spawn = (%s, hasSpawn=%v, x=%d), want (the_nether, true, 10)", snap2.Dimension, snap2.HasSpawn, snap2.SpawnX)
+	}
+	if session2.ExperienceLevel() != 12 {
+		t.Fatalf("restored XP level = %d, want 12", session2.ExperienceLevel())
+	}
+	if ec0 := session2.EnderChestSlot(0); ec0.ResolvedID() != "minecraft:ender_pearl" || ec0.Count != 8 {
+		t.Fatalf("restored ender chest slot 0 = %+v, want 8x ender_pearl", ec0)
+	}
+	if !session2.HasPlayerEffect(EffectFireResistance) {
+		t.Fatal("expected Fire Resistance effect restored on rejoin")
+	}
+	if !session2.HasCompletedAdvancement("minecraft:nether/obtain_blaze_rod") {
+		t.Fatal("expected advancement minecraft:nether/obtain_blaze_rod restored on rejoin")
+	}
+	if !session2.HasUnlockedRecipe("minecraft:blaze_powder") {
+		t.Fatal("expected unlocked recipe minecraft:blaze_powder restored on rejoin")
+	}
+}
+
 
 
 

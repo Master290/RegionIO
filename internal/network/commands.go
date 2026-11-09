@@ -1759,6 +1759,16 @@ func ExecuteCommandWithContext(srv *server.Server, ctx CommandContext, rawLine s
 			return "You do not have permission to use this command"
 		}
 		return execData(srv, ctx, parsed.Args)
+	case "function":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execFunction(srv, ctx, parsed.Args)
+	case "schedule":
+		if !srv.HasAdminPermission(permSender) {
+			return "You do not have permission to use this command"
+		}
+		return execSchedule(srv, ctx, parsed.Args)
 	default:
 		if reply, handled := execItemAndStatusWithContext(srv, ctx, effectivePlayer, parsed.Name, parsed.Args); handled {
 			return reply
@@ -2660,7 +2670,11 @@ func evalExecuteCondition(srv *server.Server, ctx CommandContext, args []string)
 		if len(args) < 2 {
 			return false, 0, 0, "Usage: /execute (if|unless) function <name>"
 		}
-		return true, 1, 2, ""
+		ok, count := evalExecuteFunction(srv, ctx, args[1])
+		if ok {
+			return true, count, 2, ""
+		}
+		return false, 0, 2, ""
 
 	default:
 		return false, 0, 0, fmt.Sprintf("Unknown condition type %q", kind)
@@ -4055,6 +4069,7 @@ func execDamage(srv *server.Server, ctx CommandContext, args []string) string {
 			idx++
 		}
 	}
+	var attackerID, sourceID int32
 	if idx < len(args) {
 		sub := strings.ToLower(strings.TrimSpace(args[idx]))
 		switch sub {
@@ -4073,6 +4088,7 @@ func execDamage(srv *server.Server, ctx CommandContext, args []string) string {
 			if err != nil || len(atk) != 1 {
 				return "Attacker entity not found"
 			}
+			attackerID = atk[0].EntityID()
 			idx += 2
 			if idx < len(args) {
 				if idx+2 != len(args) || !strings.EqualFold(args[idx], "from") {
@@ -4082,9 +4098,18 @@ func execDamage(srv *server.Server, ctx CommandContext, args []string) string {
 				if err != nil || len(src) != 1 {
 					return "Source entity not found"
 				}
+				sourceID = src[0].EntityID()
 			}
 		default:
 			return "Usage: /damage <target> <amount> [<damageType>] [at <location> | by <entity> [from <cause>]]"
+		}
+	}
+	if victimID := target.EntityID(); victimID > 0 {
+		if sourceID > 0 {
+			srv.SetEntityOrigin(attackerID, sourceID)
+			srv.SetEntityAttacker(victimID, sourceID)
+		} else if attackerID > 0 {
+			srv.SetEntityAttacker(victimID, attackerID)
 		}
 	}
 
@@ -4269,6 +4294,13 @@ func execSummon(srv *server.Server, ctx CommandContext, args []string) string {
 			return err.Error()
 		}
 		return fmt.Sprintf("Unable to summon %s", args[0])
+	}
+	if len(args) >= 5 {
+		snbt := strings.Join(args[4:], " ")
+		parsed := parseSimpleSNBTCompound(snbt)
+		store := srv.CommandStorage(fmt.Sprintf("entity:%d", ent.ID))
+		mergeNBTCompounds(store, parsed)
+		applyEntityNBTToServer(srv, ent.ID, store)
 	}
 	return fmt.Sprintf("Summoned new %s", ent.TypeName)
 }
@@ -5348,9 +5380,87 @@ func execTransfer(srv *server.Server, ctx CommandContext, args []string) string 
 	return fmt.Sprintf("Transferring %d players to %s:%d", len(players), host, port)
 }
 
+func splitTopLevelSNBT(s string) []string {
+	var parts []string
+	var cur strings.Builder
+	depthBrace := 0
+	depthBracket := 0
+	inQuote := false
+	var quoteCh byte
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if inQuote {
+			cur.WriteByte(ch)
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				cur.WriteByte(s[i])
+				continue
+			}
+			if ch == quoteCh {
+				inQuote = false
+			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			inQuote = true
+			quoteCh = ch
+			cur.WriteByte(ch)
+			continue
+		}
+		switch ch {
+		case '{':
+			depthBrace++
+		case '}':
+			if depthBrace > 0 {
+				depthBrace--
+			}
+		case '[':
+			depthBracket++
+		case ']':
+			if depthBracket > 0 {
+				depthBracket--
+			}
+		case ',':
+			if depthBrace == 0 && depthBracket == 0 {
+				parts = append(parts, strings.TrimSpace(cur.String()))
+				cur.Reset()
+				continue
+			}
+		}
+		cur.WriteByte(ch)
+	}
+	if tail := strings.TrimSpace(cur.String()); tail != "" {
+		parts = append(parts, tail)
+	}
+	return parts
+}
+
 func parseSimpleSNBTValue(raw string) nbt.Tag {
 	s := strings.TrimSpace(raw)
-	if strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) && len(s) >= 2 {
+	if strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") {
+		return parseSimpleSNBTCompound(s)
+	}
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		inner := strings.TrimSpace(s[1 : len(s)-1])
+		if idx := strings.IndexByte(inner, ';'); idx == 1 && (inner[0] == 'B' || inner[0] == 'I' || inner[0] == 'L') {
+			inner = strings.TrimSpace(inner[2:])
+		}
+		if inner == "" {
+			return &nbt.List{}
+		}
+		items := splitTopLevelSNBT(inner)
+		elems := make([]nbt.Tag, 0, len(items))
+		var elemID byte
+		for _, item := range items {
+			el := parseSimpleSNBTValue(item)
+			if elemID == 0 && el != nil {
+				elemID = el.ID()
+			}
+			elems = append(elems, el)
+		}
+		return &nbt.List{ElemID: elemID, Elems: elems}
+	}
+	if (strings.HasPrefix(s, `"`) && strings.HasSuffix(s, `"`) || strings.HasPrefix(s, `'`) && strings.HasSuffix(s, `'`)) && len(s) >= 2 {
 		return nbt.String(s[1 : len(s)-1])
 	}
 	if strings.EqualFold(s, "true") {
@@ -5402,13 +5512,13 @@ func parseSimpleSNBTCompound(raw string) *nbt.Compound {
 	if s == "" {
 		return c
 	}
-	for _, pair := range strings.Split(s, ",") {
+	for _, pair := range splitTopLevelSNBT(s) {
 		pair = strings.TrimSpace(pair)
 		colon := strings.IndexByte(pair, ':')
 		if colon <= 0 {
 			continue
 		}
-		k := strings.Trim(strings.TrimSpace(pair[:colon]), `"`)
+		k := strings.Trim(strings.TrimSpace(pair[:colon]), `"'`)
 		v := strings.TrimSpace(pair[colon+1:])
 		c.Set(k, parseSimpleSNBTValue(v))
 	}
@@ -5433,6 +5543,15 @@ func formatNBTTagSNBT(t nbt.Tag) string {
 		return fmt.Sprintf("%gd", float64(v))
 	case nbt.String:
 		return fmt.Sprintf("%q", string(v))
+	case *nbt.List:
+		if v == nil || len(v.Elems) == 0 {
+			return "[]"
+		}
+		parts := make([]string, len(v.Elems))
+		for i, el := range v.Elems {
+			parts[i] = formatNBTTagSNBT(el)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
 	case *nbt.Compound:
 		if v == nil {
 			return "{}"
@@ -5449,72 +5568,400 @@ func formatNBTTagSNBT(t nbt.Tag) string {
 	}
 }
 
+func nbtNumericValue(tag nbt.Tag) (float64, bool) {
+	switch v := tag.(type) {
+	case nbt.Byte:
+		return float64(v), true
+	case nbt.Short:
+		return float64(v), true
+	case nbt.Int:
+		return float64(v), true
+	case nbt.Long:
+		return float64(v), true
+	case nbt.Float:
+		return float64(v), true
+	case nbt.Double:
+		return float64(v), true
+	default:
+		return 0, false
+	}
+}
+
+func cloneNBTTag(tag nbt.Tag) nbt.Tag {
+	switch v := tag.(type) {
+	case *nbt.Compound:
+		if v == nil {
+			return nbt.NewCompound()
+		}
+		out := nbt.NewCompound()
+		for _, k := range v.Keys() {
+			if elem, ok := v.Get(k); ok {
+				out.Set(k, cloneNBTTag(elem))
+			}
+		}
+		return out
+	case *nbt.List:
+		if v == nil {
+			return &nbt.List{}
+		}
+		elems := make([]nbt.Tag, len(v.Elems))
+		for i, el := range v.Elems {
+			elems[i] = cloneNBTTag(el)
+		}
+		return &nbt.List{ElemID: v.ElemID, Elems: elems}
+	default:
+		return tag
+	}
+}
+
+func mergeNBTCompounds(dst, src *nbt.Compound) {
+	if dst == nil || src == nil {
+		return
+	}
+	for _, k := range src.Keys() {
+		val, ok := src.Get(k)
+		if !ok {
+			continue
+		}
+		if srcSub, ok := val.(*nbt.Compound); ok {
+			if dstExisting, has := dst.Get(k); has {
+				if dstSub, ok := dstExisting.(*nbt.Compound); ok {
+					mergeNBTCompounds(dstSub, srcSub)
+					continue
+				}
+			}
+		}
+		dst.Set(k, cloneNBTTag(val))
+	}
+}
+
+func splitNBTPathSegments(path string) []string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	var segs []string
+	var cur strings.Builder
+	inQuotes := false
+	var quoteCh byte
+	for i := 0; i < len(path); i++ {
+		ch := path[i]
+		if inQuotes {
+			if ch == quoteCh {
+				inQuotes = false
+			} else {
+				cur.WriteByte(ch)
+			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			inQuotes = true
+			quoteCh = ch
+			continue
+		}
+		if ch == '.' {
+			if cur.Len() > 0 {
+				segs = append(segs, cur.String())
+				cur.Reset()
+			}
+			continue
+		}
+		cur.WriteByte(ch)
+	}
+	if cur.Len() > 0 {
+		segs = append(segs, cur.String())
+	}
+	return segs
+}
+
+func parseSegmentIndex(seg string) (key string, idx int, hasIdx bool) {
+	open := strings.IndexByte(seg, '[')
+	close := strings.LastIndexByte(seg, ']')
+	if open < 0 || close <= open {
+		return seg, 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(seg[open+1 : close]))
+	if err != nil {
+		return seg, 0, false
+	}
+	return seg[:open], n, true
+}
+
+func getNBTPath(root *nbt.Compound, path string) (nbt.Tag, bool) {
+	if root == nil {
+		return nil, false
+	}
+	segs := splitNBTPathSegments(path)
+	if len(segs) == 0 {
+		return root, true
+	}
+	var cur nbt.Tag = root
+	for _, seg := range segs {
+		key, idx, hasIdx := parseSegmentIndex(seg)
+		if key != "" {
+			comp, ok := cur.(*nbt.Compound)
+			if !ok || comp == nil {
+				return nil, false
+			}
+			next, ok := comp.Get(key)
+			if !ok {
+				return nil, false
+			}
+			cur = next
+		}
+		if hasIdx {
+			list, ok := cur.(*nbt.List)
+			if !ok || list == nil {
+				return nil, false
+			}
+			resolvedIdx := idx
+			if resolvedIdx < 0 {
+				resolvedIdx = len(list.Elems) + resolvedIdx
+			}
+			if resolvedIdx < 0 || resolvedIdx >= len(list.Elems) {
+				return nil, false
+			}
+			cur = list.Elems[resolvedIdx]
+		}
+	}
+	return cur, true
+}
+
+func setNBTPath(root *nbt.Compound, path string, val nbt.Tag) bool {
+	if root == nil {
+		return false
+	}
+	segs := splitNBTPathSegments(path)
+	if len(segs) == 0 {
+		return false
+	}
+	cur := root
+	for i := 0; i < len(segs)-1; i++ {
+		key, idx, hasIdx := parseSegmentIndex(segs[i])
+		if hasIdx {
+			nextTag, ok := cur.Get(key)
+			if !ok {
+				return false
+			}
+			list, ok := nextTag.(*nbt.List)
+			if !ok || list == nil {
+				return false
+			}
+			rIdx := idx
+			if rIdx < 0 {
+				rIdx = len(list.Elems) + rIdx
+			}
+			if rIdx < 0 || rIdx >= len(list.Elems) {
+				return false
+			}
+			sub, ok := list.Elems[rIdx].(*nbt.Compound)
+			if !ok || sub == nil {
+				return false
+			}
+			cur = sub
+			continue
+		}
+		nextTag, ok := cur.Get(key)
+		if !ok {
+			sub := nbt.NewCompound()
+			cur.Set(key, sub)
+			cur = sub
+			continue
+		}
+		sub, ok := nextTag.(*nbt.Compound)
+		if !ok || sub == nil {
+			sub = nbt.NewCompound()
+			cur.Set(key, sub)
+		}
+		cur = sub
+	}
+	lastKey, idx, hasIdx := parseSegmentIndex(segs[len(segs)-1])
+	if hasIdx {
+		nextTag, ok := cur.Get(lastKey)
+		if !ok {
+			return false
+		}
+		list, ok := nextTag.(*nbt.List)
+		if !ok || list == nil {
+			return false
+		}
+		rIdx := idx
+		if rIdx < 0 {
+			rIdx = len(list.Elems) + rIdx
+		}
+		if rIdx < 0 || rIdx >= len(list.Elems) {
+			return false
+		}
+		list.Elems[rIdx] = cloneNBTTag(val)
+		return true
+	}
+	cur.Set(lastKey, cloneNBTTag(val))
+	return true
+}
+
+func removeNBTPath(root *nbt.Compound, path string) bool {
+	if root == nil {
+		return false
+	}
+	segs := splitNBTPathSegments(path)
+	if len(segs) == 0 {
+		return false
+	}
+	cur := root
+	for i := 0; i < len(segs)-1; i++ {
+		key, _, hasIdx := parseSegmentIndex(segs[i])
+		if hasIdx {
+			return false
+		}
+		nextTag, ok := cur.Get(key)
+		if !ok {
+			return false
+		}
+		sub, ok := nextTag.(*nbt.Compound)
+		if !ok || sub == nil {
+			return false
+		}
+		cur = sub
+	}
+	lastKey, idx, hasIdx := parseSegmentIndex(segs[len(segs)-1])
+	if hasIdx {
+		nextTag, ok := cur.Get(lastKey)
+		if !ok {
+			return false
+		}
+		list, ok := nextTag.(*nbt.List)
+		if !ok || list == nil {
+			return false
+		}
+		rIdx := idx
+		if rIdx < 0 {
+			rIdx = len(list.Elems) + rIdx
+		}
+		if rIdx < 0 || rIdx >= len(list.Elems) {
+			return false
+		}
+		list.Elems = append(list.Elems[:rIdx], list.Elems[rIdx+1:]...)
+		return true
+	}
+	if _, ok := cur.Get(lastKey); !ok {
+		return false
+	}
+	rebuilt := nbt.NewCompound()
+	for _, k := range cur.Keys() {
+		if k == lastKey {
+			continue
+		}
+		if v, ok := cur.Get(k); ok {
+			rebuilt.Set(k, v)
+		}
+	}
+	*cur = *rebuilt
+	return true
+}
+
+func applyEntityNBTToServer(srv *server.Server, entityID int32, root *nbt.Compound) {
+	if srv == nil || entityID <= 0 || root == nil {
+		return
+	}
+	if hpTag, ok := root.Get("Health"); ok {
+		if hp, ok := nbtNumericValue(hpTag); ok && hp >= 0 {
+			srv.SetMobHealth(entityID, float32(hp))
+		}
+	}
+	if tagsTag, ok := root.Get("Tags"); ok {
+		if list, ok := tagsTag.(*nbt.List); ok && list != nil {
+			for _, old := range srv.EntityTags(entityID) {
+				srv.RemoveEntityTag(entityID, old)
+			}
+			for _, el := range list.Elems {
+				if s, ok := el.(nbt.String); ok && string(s) != "" {
+					srv.AddEntityTag(entityID, string(s))
+				}
+			}
+		}
+	}
+}
+
+func resolveDataTargetCompound(srv *server.Server, ctx CommandContext, args []string, startIdx int) (kind string, holderLabel string, root *nbt.Compound, isPlayer bool, entityID int32, nextIdx int, errMsg string) {
+	if startIdx >= len(args) {
+		return "", "", nil, false, 0, startIdx, "Missing data target type (block|entity|storage)"
+	}
+	kind = strings.ToLower(strings.TrimSpace(args[startIdx]))
+	idx := startIdx + 1
+	switch kind {
+	case "storage":
+		if idx >= len(args) {
+			return "", "", nil, false, 0, idx, "Usage: ... storage <target> ..."
+		}
+		storageID := args[idx]
+		idx++
+		return kind, fmt.Sprintf("storage %s", storageID), srv.CommandStorage(storageID), false, 0, idx, ""
+
+	case "entity":
+		if idx >= len(args) {
+			return "", "", nil, false, 0, idx, "Usage: ... entity <target> ..."
+		}
+		targets, err := ResolveTargets(srv, ctx, args[idx])
+		if err != nil || len(targets) == 0 {
+			return "", "", nil, false, 0, idx, "No entity was found"
+		}
+		if len(targets) > 1 {
+			return "", "", nil, false, 0, idx, "Only one entity is allowed"
+		}
+		idx++
+		t := targets[0]
+		holderLabel = t.Name()
+		if t.IsPlayer() {
+			return kind, holderLabel, buildEntityDataCompound(srv, t), true, t.EntityID(), idx, ""
+		}
+		store := srv.CommandStorage(fmt.Sprintf("entity:%d", t.Entity.ID))
+		x, y, z := t.Position()
+		store.Set("id", nbt.String(t.TypeName()))
+		store.Set("Dimension", nbt.String(t.Dimension()))
+		store.Set("Pos", &nbt.List{ElemID: nbt.TagDouble, Elems: []nbt.Tag{nbt.Double(x), nbt.Double(y), nbt.Double(z)}})
+		store.Set("Health", nbt.Float(srv.MobHealth(t.Entity.ID)))
+		if tags := srv.EntityTags(t.Entity.ID); len(tags) > 0 {
+			elems := make([]nbt.Tag, len(tags))
+			for i, tg := range tags {
+				elems[i] = nbt.String(tg)
+			}
+			store.Set("Tags", &nbt.List{ElemID: nbt.TagString, Elems: elems})
+		}
+		return kind, holderLabel, store, false, t.Entity.ID, idx, ""
+
+	case "block":
+		if idx+3 > len(args) {
+			return "", "", nil, false, 0, idx, "Usage: ... block <x> <y> <z> ..."
+		}
+		bx, by, bz, err := resolveConditionBlockPos(ctx, args[idx], args[idx+1], args[idx+2])
+		if err != nil {
+			return "", "", nil, false, 0, idx, fmt.Sprintf("Invalid block position: %v", err)
+		}
+		idx += 3
+		holderLabel = fmt.Sprintf("%d, %d, %d", bx, by, bz)
+		storageKey := fmt.Sprintf("block:%s:%d:%d:%d", world.NormalizeDimension(ctx.Dimension), bx, by, bz)
+		store := srv.CommandStorage(storageKey)
+		store.Set("x", nbt.Int(int32(bx)))
+		store.Set("y", nbt.Int(int32(by)))
+		store.Set("z", nbt.Int(int32(bz)))
+		if cache := srv.DimensionChunks(ctx.Dimension); cache != nil {
+			store.Set("id", nbt.String(world.BlockName(cache.GetBlock(bx, by, bz))))
+		}
+		return kind, holderLabel, store, false, 0, idx, ""
+
+	default:
+		return "", "", nil, false, 0, idx, "Usage: /data (get|merge|remove|modify) (block|entity|storage) ..."
+	}
+}
+
 func execData(srv *server.Server, ctx CommandContext, args []string) string {
 	if len(args) < 3 {
 		return "Usage: /data (get|merge|remove|modify) (block <x> <y> <z> | entity <target> | storage <target>) ..."
 	}
 	sub := strings.ToLower(strings.TrimSpace(args[0]))
-	kind := strings.ToLower(strings.TrimSpace(args[1]))
-	idx := 2
-	var holderLabel string
-	var root *nbt.Compound
-	var isPlayerTarget bool
-
-	switch kind {
-	case "storage":
-		storageID := args[idx]
-		idx++
-		holderLabel = fmt.Sprintf("storage %s", storageID)
-		root = srv.CommandStorage(storageID)
-
-	case "entity":
-		targets, err := ResolveTargets(srv, ctx, args[idx])
-		if err != nil || len(targets) == 0 {
-			return "No entity was found"
-		}
-		if len(targets) > 1 {
-			return "Only one entity is allowed"
-		}
-		idx++
-		t := targets[0]
-		holderLabel = t.Name()
-		isPlayerTarget = t.IsPlayer()
-		root = nbt.NewCompound()
-		x, y, z := t.Position()
-		root.Set("id", nbt.String(t.TypeName()))
-		root.Set("Dimension", nbt.String(t.Dimension()))
-		root.Set("Pos", &nbt.List{ElemID: nbt.TagDouble, Elems: []nbt.Tag{nbt.Double(x), nbt.Double(y), nbt.Double(z)}})
-		if t.IsPlayer() {
-			snap := t.Player.Snapshot()
-			root.Set("Health", nbt.Float(snap.Health))
-			root.Set("foodLevel", nbt.Int(snap.FoodLevel))
-			root.Set("XpLevel", nbt.Int(t.Player.ExperienceLevel()))
-			root.Set("SelectedItemSlot", nbt.Int(snap.SelectedSlot))
-		} else {
-			root.Set("Health", nbt.Float(srv.MobHealth(t.Entity.ID)))
-		}
-
-	case "block":
-		if idx+3 > len(args) {
-			return "Usage: /data <op> block <x> <y> <z> ..."
-		}
-		bx, by, bz, err := resolveConditionBlockPos(ctx, args[idx], args[idx+1], args[idx+2])
-		if err != nil {
-			return fmt.Sprintf("Invalid block position: %v", err)
-		}
-		idx += 3
-		holderLabel = fmt.Sprintf("%d, %d, %d", bx, by, bz)
-		storageKey := fmt.Sprintf("block:%s:%d:%d:%d", world.NormalizeDimension(ctx.Dimension), bx, by, bz)
-		root = srv.CommandStorage(storageKey)
-		root.Set("x", nbt.Int(int32(bx)))
-		root.Set("y", nbt.Int(int32(by)))
-		root.Set("z", nbt.Int(int32(bz)))
-		if cache := srv.DimensionChunks(ctx.Dimension); cache != nil {
-			root.Set("id", nbt.String(world.BlockName(cache.GetBlock(bx, by, bz))))
-		}
-
-	default:
-		return "Usage: /data (get|merge|remove|modify) (block|entity|storage) ..."
+	_, holderLabel, root, isPlayerTarget, entityID, idx, errMsg := resolveDataTargetCompound(srv, ctx, args, 1)
+	if errMsg != "" {
+		return errMsg
 	}
 
 	switch sub {
@@ -5523,9 +5970,21 @@ func execData(srv *server.Server, ctx CommandContext, args []string) string {
 			return fmt.Sprintf("%s has the following entity/block/storage data: %s", holderLabel, formatNBTTagSNBT(root))
 		}
 		path := args[idx]
-		tag, ok := root.Get(path)
+		tag, ok := getNBTPath(root, path)
 		if !ok {
 			return fmt.Sprintf("Found no elements matching %s", path)
+		}
+		if idx+1 < len(args) {
+			scale, err := strconv.ParseFloat(strings.TrimSpace(args[idx+1]), 64)
+			if err != nil || math.IsNaN(scale) || math.IsInf(scale, 0) {
+				return fmt.Sprintf("Invalid scale %q", args[idx+1])
+			}
+			numVal, ok := nbtNumericValue(tag)
+			if !ok {
+				return fmt.Sprintf("Cannot scale non-numeric tag at %s", path)
+			}
+			scaled := int64(math.Floor(numVal * scale))
+			return fmt.Sprintf("%s has the following data at %s after scale %s: %d", holderLabel, path, args[idx+1], scaled)
 		}
 		return fmt.Sprintf("%s has the following data at %s: %s", holderLabel, path, formatNBTTagSNBT(tag))
 
@@ -5538,10 +5997,9 @@ func execData(srv *server.Server, ctx CommandContext, args []string) string {
 		}
 		snbt := strings.Join(args[idx:], " ")
 		parsed := parseSimpleSNBTCompound(snbt)
-		for _, k := range parsed.Keys() {
-			if val, ok := parsed.Get(k); ok {
-				root.Set(k, val)
-			}
+		mergeNBTCompounds(root, parsed)
+		if entityID > 0 {
+			applyEntityNBTToServer(srv, entityID, root)
 		}
 		return fmt.Sprintf("Modified data of %s", holderLabel)
 
@@ -5553,19 +6011,12 @@ func execData(srv *server.Server, ctx CommandContext, args []string) string {
 			return "Usage: /data remove (block|entity|storage) <target> <path>"
 		}
 		path := args[idx]
-		if _, ok := root.Get(path); !ok {
+		if !removeNBTPath(root, path) {
 			return fmt.Sprintf("Nothing changed; %s does not exist", path)
 		}
-		rebuilt := nbt.NewCompound()
-		for _, k := range root.Keys() {
-			if k == path {
-				continue
-			}
-			if val, ok := root.Get(k); ok {
-				rebuilt.Set(k, val)
-			}
+		if entityID > 0 {
+			applyEntityNBTToServer(srv, entityID, root)
 		}
-		*root = *rebuilt
 		return fmt.Sprintf("Modified data of %s", holderLabel)
 
 	case "modify":
@@ -5573,11 +6024,164 @@ func execData(srv *server.Server, ctx CommandContext, args []string) string {
 			return "Unable to modify player data"
 		}
 		if idx+3 > len(args) {
-			return "Usage: /data modify (block|entity|storage) <target> <path> set value <value>"
+			return "Usage: /data modify (block|entity|storage) <target> <path> (set|merge|append|prepend|insert <index>) (value <value>|from ...|string ...)"
 		}
-		path := args[idx]
-		valStr := strings.Join(args[idx+3:], " ")
-		root.Set(path, parseSimpleSNBTValue(valStr))
+		targetPath := args[idx]
+		op := strings.ToLower(strings.TrimSpace(args[idx+1]))
+		srcIdx := idx + 2
+		insertIndex := 0
+		if op == "insert" {
+			if srcIdx >= len(args) {
+				return "Usage: /data modify ... insert <index> (value|from|string) ..."
+			}
+			parsedIdx, err := strconv.Atoi(args[srcIdx])
+			if err != nil {
+				return fmt.Sprintf("Invalid insert index %q", args[srcIdx])
+			}
+			insertIndex = parsedIdx
+			srcIdx++
+		}
+		if srcIdx >= len(args) {
+			return "Usage: /data modify ... (value <snbt>|from ...|string ...)"
+		}
+		srcMode := strings.ToLower(strings.TrimSpace(args[srcIdx]))
+		srcIdx++
+		var valTag nbt.Tag
+		switch srcMode {
+		case "value":
+			if srcIdx >= len(args) {
+				return "Usage: /data modify ... value <snbt>"
+			}
+			valStr := strings.Join(args[srcIdx:], " ")
+			valTag = parseSimpleSNBTValue(valStr)
+
+		case "from":
+			_, _, srcRoot, _, _, afterSrcIdx, srcErr := resolveDataTargetCompound(srv, ctx, args, srcIdx)
+			if srcErr != "" {
+				return srcErr
+			}
+			if afterSrcIdx < len(args) {
+				found, ok := getNBTPath(srcRoot, args[afterSrcIdx])
+				if !ok {
+					return fmt.Sprintf("Found no elements matching %s", args[afterSrcIdx])
+				}
+				valTag = cloneNBTTag(found)
+			} else {
+				valTag = cloneNBTTag(srcRoot)
+			}
+
+		case "string":
+			_, _, srcRoot, _, _, afterSrcIdx, srcErr := resolveDataTargetCompound(srv, ctx, args, srcIdx)
+			if srcErr != "" {
+				return srcErr
+			}
+			var strVal string
+			if afterSrcIdx < len(args) {
+				found, ok := getNBTPath(srcRoot, args[afterSrcIdx])
+				if !ok {
+					return fmt.Sprintf("Found no elements matching %s", args[afterSrcIdx])
+				}
+				if s, ok := found.(nbt.String); ok {
+					strVal = string(s)
+				} else {
+					strVal = formatNBTTagSNBT(found)
+				}
+				afterSrcIdx++
+			} else {
+				strVal = formatNBTTagSNBT(srcRoot)
+			}
+			startPos := 0
+			endPos := len(strVal)
+			if afterSrcIdx < len(args) {
+				if v, err := strconv.Atoi(args[afterSrcIdx]); err == nil {
+					if v < 0 {
+						v = len(strVal) + v
+					}
+					startPos = v
+				}
+				afterSrcIdx++
+			}
+			if afterSrcIdx < len(args) {
+				if v, err := strconv.Atoi(args[afterSrcIdx]); err == nil {
+					if v < 0 {
+						v = len(strVal) + v
+					}
+					endPos = v
+				}
+			}
+			if startPos < 0 {
+				startPos = 0
+			}
+			if endPos > len(strVal) {
+				endPos = len(strVal)
+			}
+			if startPos > endPos {
+				return "Invalid string slice bounds"
+			}
+			valTag = nbt.String(strVal[startPos:endPos])
+
+		default:
+			return fmt.Sprintf("Unknown /data modify source %q (expected value, from, or string)", srcMode)
+		}
+
+		switch op {
+		case "set":
+			if !setNBTPath(root, targetPath, valTag) {
+				return fmt.Sprintf("Unable to set %s", targetPath)
+			}
+		case "merge":
+			srcComp, ok := valTag.(*nbt.Compound)
+			if !ok || srcComp == nil {
+				return "Expected compound tag for /data modify ... merge"
+			}
+			existing, ok := getNBTPath(root, targetPath)
+			if !ok {
+				setNBTPath(root, targetPath, srcComp)
+			} else if dstComp, ok := existing.(*nbt.Compound); ok && dstComp != nil {
+				mergeNBTCompounds(dstComp, srcComp)
+			} else {
+				return fmt.Sprintf("Target path %s is not a compound", targetPath)
+			}
+		case "append", "prepend", "insert":
+			var list *nbt.List
+			if existing, ok := getNBTPath(root, targetPath); ok {
+				l, ok := existing.(*nbt.List)
+				if !ok || l == nil {
+					return fmt.Sprintf("Target path %s is not a list", targetPath)
+				}
+				list = l
+			} else {
+				list = &nbt.List{ElemID: valTag.ID()}
+				setNBTPath(root, targetPath, list)
+			}
+			if list.ElemID == 0 && valTag != nil {
+				list.ElemID = valTag.ID()
+			}
+			cloned := cloneNBTTag(valTag)
+			switch op {
+			case "append":
+				list.Elems = append(list.Elems, cloned)
+			case "prepend":
+				list.Elems = append([]nbt.Tag{cloned}, list.Elems...)
+			case "insert":
+				pos := insertIndex
+				if pos < 0 {
+					pos = len(list.Elems) + pos + 1
+				}
+				if pos < 0 {
+					pos = 0
+				}
+				if pos > len(list.Elems) {
+					pos = len(list.Elems)
+				}
+				list.Elems = append(list.Elems[:pos], append([]nbt.Tag{cloned}, list.Elems[pos:]...)...)
+			}
+		default:
+			return fmt.Sprintf("Unknown /data modify operation %q", op)
+		}
+		if entityID > 0 {
+			applyEntityNBTToServer(srv, entityID, root)
+		}
 		return fmt.Sprintf("Modified data of %s", holderLabel)
 
 	default:
@@ -5717,9 +6321,58 @@ func resolveExecuteOnRelation(srv *server.Server, ctx CommandContext, rel string
 		}
 		return nil, true
 
-	case "attacker", "target", "leasher", "origin", "owner":
+	case "attacker":
 		if !hasSelf {
 			return nil, true
+		}
+		if aid := srv.EntityAttacker(self.EntityID()); aid > 0 {
+			if t, ok := findTargetByEntityID(srv, aid); ok {
+				return []CommandTarget{t}, true
+			}
+		}
+		return nil, true
+
+	case "target":
+		if !hasSelf {
+			return nil, true
+		}
+		if tid := srv.EntityTarget(self.EntityID()); tid > 0 {
+			if t, ok := findTargetByEntityID(srv, tid); ok {
+				return []CommandTarget{t}, true
+			}
+		}
+		return nil, true
+
+	case "leasher":
+		if !hasSelf {
+			return nil, true
+		}
+		if lid := srv.EntityLeasher(self.EntityID()); lid > 0 {
+			if t, ok := findTargetByEntityID(srv, lid); ok {
+				return []CommandTarget{t}, true
+			}
+		}
+		return nil, true
+
+	case "origin":
+		if !hasSelf {
+			return nil, true
+		}
+		if oid := srv.EntityOrigin(self.EntityID()); oid > 0 {
+			if t, ok := findTargetByEntityID(srv, oid); ok {
+				return []CommandTarget{t}, true
+			}
+		}
+		return nil, true
+
+	case "owner":
+		if !hasSelf {
+			return nil, true
+		}
+		if oid := srv.EntityOwner(self.EntityID()); oid > 0 {
+			if t, ok := findTargetByEntityID(srv, oid); ok {
+				return []CommandTarget{t}, true
+			}
 		}
 		return nil, true
 
@@ -5739,6 +6392,7 @@ func evaluateReplySuccessAndResult(reply string) (success int32, result int32) {
 		"unable to", "nothing changed", "test failed", "failed", "too many",
 		"that position is out of", "source and destination can not", "only one",
 		"you do not have permission", "error:", "target has no", "target(s) do not",
+		"found no elements", "missing ",
 	} {
 		if strings.HasPrefix(lower, failPrefix) {
 			return 0, 0
@@ -5760,6 +6414,14 @@ func evaluateReplySuccessAndResult(reply string) (success int32, result int32) {
 		if v, err := strconv.ParseInt(tok, 10, 32); err == nil {
 			return 1, int32(v)
 		}
+		if len(tok) > 1 {
+			lastCh := tok[len(tok)-1]
+			if lastCh == 'b' || lastCh == 'B' || lastCh == 's' || lastCh == 'S' || lastCh == 'l' || lastCh == 'L' || lastCh == 'f' || lastCh == 'F' || lastCh == 'd' || lastCh == 'D' {
+				if f, err := strconv.ParseFloat(tok[:len(tok)-1], 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+					return 1, int32(math.Floor(f))
+				}
+			}
+		}
 	}
 	return 1, 1
 }
@@ -5769,19 +6431,230 @@ func storeScaledNBTValue(comp *nbt.Compound, path string, nbtType string, rawVal
 		return
 	}
 	scaled := float64(rawVal) * scale
+	var tag nbt.Tag
 	switch strings.ToLower(strings.TrimSpace(nbtType)) {
 	case "byte":
-		comp.Set(path, nbt.Byte(int8(scaled)))
+		tag = nbt.Byte(int8(scaled))
 	case "short":
-		comp.Set(path, nbt.Short(int16(scaled)))
+		tag = nbt.Short(int16(scaled))
 	case "long":
-		comp.Set(path, nbt.Long(int64(scaled)))
+		tag = nbt.Long(int64(scaled))
 	case "float":
-		comp.Set(path, nbt.Float(float32(scaled)))
+		tag = nbt.Float(float32(scaled))
 	case "double":
-		comp.Set(path, nbt.Double(scaled))
+		tag = nbt.Double(scaled)
 	default:
-		comp.Set(path, nbt.Int(int32(scaled)))
+		tag = nbt.Int(int32(scaled))
+	}
+	setNBTPath(comp, path, tag)
+}
+
+func formatMacroValue(tag nbt.Tag) string {
+	switch v := tag.(type) {
+	case nbt.String:
+		return string(v)
+	case nbt.Byte:
+		return strconv.Itoa(int(v))
+	case nbt.Short:
+		return strconv.Itoa(int(v))
+	case nbt.Int:
+		return strconv.FormatInt(int64(v), 10)
+	case nbt.Long:
+		return strconv.FormatInt(int64(v), 10)
+	case nbt.Float:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32)
+	case nbt.Double:
+		return strconv.FormatFloat(float64(v), 'f', -1, 64)
+	default:
+		return formatNBTTagSNBT(tag)
+	}
+}
+
+func substituteFunctionMacros(line string, macroArgs *nbt.Compound) (string, error) {
+	var out strings.Builder
+	i := 0
+	for i < len(line) {
+		idx := strings.Index(line[i:], "$(")
+		if idx < 0 {
+			out.WriteString(line[i:])
+			break
+		}
+		out.WriteString(line[i : i+idx])
+		start := i + idx + 2
+		end := strings.IndexByte(line[start:], ')')
+		if end < 0 {
+			return "", fmt.Errorf("Unclosed macro variable in %q", line)
+		}
+		key := strings.TrimSpace(line[start : start+end])
+		if macroArgs == nil {
+			return "", fmt.Errorf("Missing macro arguments for $(%s)", key)
+		}
+		val, ok := getNBTPath(macroArgs, key)
+		if !ok {
+			return "", fmt.Errorf("Missing macro argument %q", key)
+		}
+		out.WriteString(formatMacroValue(val))
+		i = start + end + 1
+	}
+	return out.String(), nil
+}
+
+func runFunctionLines(srv *server.Server, ctx CommandContext, fnName string, macroArgs *nbt.Compound) (executed int, returned bool, returnSuccess bool, returnVal int32, errMsg string) {
+	lines, ok := srv.GetFunction(fnName)
+	if !ok {
+		return 0, false, false, 0, fmt.Sprintf("Unknown function %s", fnName)
+	}
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "$") {
+			subLine, err := substituteFunctionMacros(strings.TrimSpace(line[1:]), macroArgs)
+			if err != nil {
+				return executed, false, false, 0, err.Error()
+			}
+			line = subLine
+		}
+		reply := ExecuteCommandWithContext(srv, ctx, line)
+		executed++
+		lowerCmd := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "/")))
+		if lowerCmd == "return" || strings.HasPrefix(lowerCmd, "return ") {
+			succ, res := evaluateReplySuccessAndResult(reply)
+			return executed, true, succ > 0, res, ""
+		}
+	}
+	return executed, false, true, int32(executed), ""
+}
+
+func evalExecuteFunction(srv *server.Server, ctx CommandContext, name string) (bool, int) {
+	norm := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(name, "#")))
+	if !strings.Contains(norm, ":") {
+		norm = "minecraft:" + norm
+	}
+	_, returned, retSucc, retVal, errMsg := runFunctionLines(srv, ctx, norm, nil)
+	if errMsg != "" {
+		return false, 0
+	}
+	if returned {
+		if !retSucc || retVal <= 0 {
+			return false, 0
+		}
+		return true, int(retVal)
+	}
+	return true, 1
+}
+
+func ensureScheduledFunctionRunner(srv *server.Server) {
+	if srv == nil {
+		return
+	}
+	srv.SetScheduledFunctionRunner(func(fnName string) {
+		ctx := NewCommandContext(srv, nil)
+		_, _, _, _, _ = runFunctionLines(srv, ctx, fnName, nil)
+	})
+}
+
+func execFunction(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 1 {
+		return "Usage: /function <name> [<arguments>|with (block <pos>|entity <target>|storage <source>) [<path>]]"
+	}
+	ensureScheduledFunctionRunner(srv)
+	fnName := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(args[0], "#")))
+	if !strings.Contains(fnName, ":") {
+		fnName = "minecraft:" + fnName
+	}
+	var macroArgs *nbt.Compound
+	if len(args) > 1 {
+		if strings.EqualFold(args[1], "with") {
+			_, _, srcRoot, _, _, afterIdx, errMsg := resolveDataTargetCompound(srv, ctx, args, 2)
+			if errMsg != "" {
+				return errMsg
+			}
+			if afterIdx < len(args) {
+				tag, ok := getNBTPath(srcRoot, args[afterIdx])
+				if !ok {
+					return fmt.Sprintf("Found no elements matching %s", args[afterIdx])
+				}
+				comp, ok := tag.(*nbt.Compound)
+				if !ok || comp == nil {
+					return fmt.Sprintf("Path %s is not a compound tag", args[afterIdx])
+				}
+				macroArgs = comp
+			} else {
+				macroArgs = srcRoot
+			}
+		} else {
+			snbt := strings.Join(args[1:], " ")
+			macroArgs = parseSimpleSNBTCompound(snbt)
+		}
+	}
+	executed, returned, retSucc, retVal, errMsg := runFunctionLines(srv, ctx, fnName, macroArgs)
+	if errMsg != "" {
+		return errMsg
+	}
+	if returned {
+		if !retSucc {
+			return fmt.Sprintf("Function %s failed", fnName)
+		}
+		return fmt.Sprintf("Returned %d", retVal)
+	}
+	return fmt.Sprintf("Executed %d command(s) from function '%s'", executed, fnName)
+}
+
+func execSchedule(srv *server.Server, ctx CommandContext, args []string) string {
+	if len(args) < 2 {
+		return "Usage: /schedule (function <function> <time> [append|replace] | clear <function>)"
+	}
+	ensureScheduledFunctionRunner(srv)
+	sub := strings.ToLower(strings.TrimSpace(args[0]))
+	switch sub {
+	case "function":
+		if len(args) < 3 || len(args) > 4 {
+			return "Usage: /schedule function <function> <time> [append|replace]"
+		}
+		fnName := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(args[1], "#")))
+		if !strings.Contains(fnName, ":") {
+			fnName = "minecraft:" + fnName
+		}
+		ticks, err := ParseTimeValue(args[2], false)
+		if err != nil || ticks <= 0 {
+			return fmt.Sprintf("Invalid schedule time %q (must be > 0)", args[2])
+		}
+		appendMode := false
+		if len(args) == 4 {
+			mode := strings.ToLower(strings.TrimSpace(args[3]))
+			switch mode {
+			case "append":
+				appendMode = true
+			case "replace":
+				appendMode = false
+			default:
+				return fmt.Sprintf("Invalid schedule mode %q (expected append or replace)", args[3])
+			}
+		}
+		targetTick, err := srv.ScheduleFunction(fnName, ticks, appendMode)
+		if err != nil {
+			return err.Error()
+		}
+		return fmt.Sprintf("Scheduled function %s in %d tick(s) at gametime %d", fnName, ticks, targetTick)
+
+	case "clear":
+		if len(args) != 2 {
+			return "Usage: /schedule clear <function>"
+		}
+		fnName := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(args[1], "#")))
+		if !strings.Contains(fnName, ":") {
+			fnName = "minecraft:" + fnName
+		}
+		removed := srv.ClearScheduledFunction(fnName)
+		if removed == 0 {
+			return fmt.Sprintf("No scheduled function %s was found", fnName)
+		}
+		return fmt.Sprintf("Removed %d schedule(s) for %s", removed, fnName)
+
+	default:
+		return "Usage: /schedule (function <function> <time> [append|replace] | clear <function>)"
 	}
 }
 
@@ -5911,7 +6784,9 @@ func execExecuteStore(srv *server.Server, ctx CommandContext, args []string) str
 		}
 		if !targets[0].IsPlayer() && targets[0].Entity.ID > 0 {
 			storageKey := fmt.Sprintf("entity:%d", targets[0].Entity.ID)
-			storeScaledNBTValue(srv.CommandStorage(storageKey), path, nbtType, val, scale)
+			store := srv.CommandStorage(storageKey)
+			storeScaledNBTValue(store, path, nbtType, val, scale)
+			applyEntityNBTToServer(srv, targets[0].Entity.ID, store)
 		}
 		return reply
 
@@ -7111,10 +7986,10 @@ var allVanillaCommandNames = []string{
 	"advancement", "attribute", "ban", "ban-ip", "banlist", "bossbar",
 	"clear", "clone", "damage", "data", "defaultgamemode", "deop",
 	"difficulty", "effect", "enchant", "execute", "experience",
-	"fill", "fillbiome", "forceload", "gamemode", "gamerule", "give",
+	"fill", "fillbiome", "forceload", "function", "gamemode", "gamerule", "give",
 	"help", "item", "kick", "kill", "list", "locate", "loot", "me",
 	"msg", "op", "pardon", "pardon-ip", "particle", "place", "playsound",
-	"random", "recipe", "return", "ride", "rotate", "save-all", "say", "scoreboard",
+	"random", "recipe", "return", "ride", "rotate", "save-all", "say", "schedule", "scoreboard",
 	"seed", "setblock", "setworldspawn", "spawnpoint", "spectate",
 	"spreadplayers", "stop", "stopsound", "summon", "tag", "team",
 	"teammsg", "teleport", "tell", "tellraw", "tick", "time", "title",
@@ -7330,6 +8205,22 @@ func ComputeCommandSuggestions(srv *server.Server, sender *server.PlayerSession,
 	case "rotate":
 		if argIdx == 1 {
 			candidates = onlinePlayers()
+		}
+	case "function":
+		if argIdx == 1 && srv != nil {
+			candidates = srv.FunctionNames()
+		} else if argIdx == 2 {
+			candidates = []string{"with"}
+		} else if argIdx == 3 && strings.EqualFold(fields[2], "with") {
+			candidates = []string{"block", "entity", "storage"}
+		}
+	case "schedule":
+		if argIdx == 1 {
+			candidates = []string{"clear", "function"}
+		} else if argIdx == 2 && srv != nil {
+			candidates = srv.FunctionNames()
+		} else if argIdx == 4 && strings.EqualFold(fields[1], "function") {
+			candidates = []string{"append", "replace"}
 		}
 	}
 

@@ -1207,3 +1207,164 @@ func TestEffectXPGameRuleAttributeAndDamageCommandsParity(t *testing.T) {
 	}
 }
 
+func TestIssue21ExecuteDataFunctionScheduleScoreboardAndDimensionPlayerData(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	srv, err := server.NewWithCache(cfg, world.NewCache(256, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	var sentPkts []int32
+	alice, err := srv.RegisterPlayer(server.Profile{Name: "Alice", UUID: [16]byte{21}}, func(pktID int32, _ []byte) error {
+		sentPkts = append(sentPkts, pktID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.GrantOp(alice.Profile)
+	_ = srv.SetPlayerGameMode(alice, server.GameModeSurvival)
+	srv.SetPlayerTransform(alice, 0, 65, 0, 0, 0, true)
+
+	// 1. Dimension change & Respawn packets (Respawn, GameEvent, PlayerPosition, SetEntityData, UpdateAttributes, UpdateMobEffect, SetExperience, SetHealth)
+	_ = srv.SetPlayerExperience(alice, 7, 100, 0.5)
+	_ = srv.ApplyPlayerEffect(alice, server.NewStatusEffectInstance(server.EffectSpeed, 200, 0))
+	sentPkts = nil
+	if err := srv.ChangePlayerDimension(alice, world.DimensionNether, 12, 64, 12, 90, 0); err != nil {
+		t.Fatalf("ChangePlayerDimension: %v", err)
+	}
+	hasPkt := func(id int32) bool {
+		for _, p := range sentPkts {
+			if p == id {
+				return true
+			}
+		}
+		return false
+	}
+	for _, wantID := range []int32{
+		protocol.PlayRespawn,
+		protocol.PlayGameEvent,
+		protocol.PlayPlayerPosition,
+		protocol.PlaySetEntityData,
+		protocol.PlayUpdateAttributes,
+		protocol.PlayUpdateMobEffect,
+		protocol.PlaySetExperience,
+		protocol.PlaySetHealth,
+	} {
+		if !hasPkt(wantID) {
+			t.Fatalf("ChangePlayerDimension missing packet 0x%02x in %v", wantID, sentPkts)
+		}
+	}
+	_ = srv.ChangePlayerDimension(alice, world.DimensionOverworld, 0, 65, 0, 0, 0)
+
+	// 2. /data (get with scale, nested paths, merge, modify set/merge/append/prepend/insert/from/string, remove on storage, entity, block)
+	_ = ExecuteCommand(srv, alice, "/data merge storage test:bag {stats:{score:12,label:\"hello_world\"},items:[1,2]}")
+	out := ExecuteCommand(srv, alice, "/data get storage test:bag stats.score 10")
+	if !strings.Contains(out, "120") {
+		t.Fatalf("expected scaled /data get 12*10=120, got %q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/data modify storage test:bag items append value 3")
+	_ = ExecuteCommand(srv, alice, "/data modify storage test:bag items prepend value 0")
+	_ = ExecuteCommand(srv, alice, "/data modify storage test:bag items insert 2 value 99")
+	out = ExecuteCommand(srv, alice, "/data get storage test:bag items[2]")
+	if !strings.Contains(out, "99") {
+		t.Fatalf("expected items[2] == 99 after insert, got %q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/data modify storage test:bag copied set from storage test:bag stats.score")
+	out = ExecuteCommand(srv, alice, "/data get storage test:bag copied")
+	if !strings.Contains(out, "12") {
+		t.Fatalf("expected copied == 12 from /data modify ... from, got %q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/data modify storage test:bag sliced set string storage test:bag stats.label 0 5")
+	out = ExecuteCommand(srv, alice, "/data get storage test:bag sliced")
+	if !strings.Contains(out, "hello") || strings.Contains(out, "world") {
+		t.Fatalf("expected sliced == \"hello\", got %q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/data remove storage test:bag stats.label")
+	out = ExecuteCommand(srv, alice, "/data get storage test:bag stats.label")
+	if !strings.Contains(out, "Found no elements") {
+		t.Fatalf("expected removed path to be missing, got %q", out)
+	}
+
+	// /data on entity syncs Health and Tags
+	_ = ExecuteCommand(srv, alice, "/summon minecraft:pig 2 65 2 {Health:6.0f}")
+	out = ExecuteCommand(srv, alice, "/data get entity @e[type=pig,limit=1] Health 2")
+	if !strings.Contains(out, "12") {
+		t.Fatalf("expected pig Health 6.0 * 2 = 12, got %q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/data merge entity @e[type=pig,limit=1] {Health:4.0f}")
+	out = ExecuteCommand(srv, alice, "/data get entity @e[type=pig,limit=1] Health")
+	if !strings.Contains(out, "4") {
+		t.Fatalf("expected pig Health updated to 4.0f, got %q", out)
+	}
+
+	// 3. /execute on (attacker, target, leasher, owner, origin)
+	pigs, _ := ResolveTargets(srv, NewCommandContext(srv, alice), "@e[type=pig,limit=1]")
+	if len(pigs) != 1 {
+		t.Fatalf("expected 1 pig entity")
+	}
+	pigID := pigs[0].EntityID()
+	_ = ExecuteCommand(srv, alice, "/damage @e[type=pig,limit=1] 1.0 generic by @s")
+	srv.SetEntityTarget(pigID, alice.EntityID)
+	srv.SetEntityOwner(pigID, alice.EntityID)
+	srv.SetEntityOrigin(pigID, alice.EntityID)
+	_ = srv.LeashMobToPlayer(alice, pigID)
+
+	for _, rel := range []string{"attacker", "target", "leasher", "owner", "origin"} {
+		cmd := "/execute as @e[type=pig,limit=1] on " + rel + " run tag @s add rel_" + rel
+		_ = ExecuteCommand(srv, alice, cmd)
+		if !srv.HasPlayerTag(alice, "rel_"+rel) {
+			t.Fatalf("expected /execute on %s to resolve Alice and add tag rel_%s", rel, rel)
+		}
+	}
+
+	// 4. /function (including macros and /return) and /schedule
+	srv.RegisterFunction("test:inc_score", []string{
+		"/scoreboard objectives add fn_obj dummy",
+		"/scoreboard players add Alice fn_obj 5",
+		"/return 42",
+	})
+	_ = ExecuteCommand(srv, alice, "/scoreboard objectives add fn_ret dummy")
+	_ = ExecuteCommand(srv, alice, "/execute store result score Alice fn_ret run function test:inc_score")
+	if sc, _ := srv.GetScore("Alice", "fn_obj"); sc != 5 {
+		t.Fatalf("expected fn_obj score = 5 after function, got %d", sc)
+	}
+	if retSc, _ := srv.GetScore("Alice", "fn_ret"); retSc != 42 {
+		t.Fatalf("expected stored return value = 42 from function, got %d", retSc)
+	}
+	// /execute if function
+	_ = ExecuteCommand(srv, alice, "/execute if function test:inc_score run scoreboard players add Alice fn_obj 10")
+	if sc, _ := srv.GetScore("Alice", "fn_obj"); sc != 20 {
+		t.Fatalf("expected fn_obj score = 20 after /execute if function, got %d", sc)
+	}
+	// Macro function with inline compound & with storage
+	srv.RegisterFunction("test:macro_add", []string{
+		"$/scoreboard players add $(holder) fn_obj $(delta)",
+	})
+	_ = ExecuteCommand(srv, alice, "/function test:macro_add {holder:\"Alice\",delta:7}")
+	if sc, _ := srv.GetScore("Alice", "fn_obj"); sc != 27 {
+		t.Fatalf("expected fn_obj score = 27 after macro function, got %d", sc)
+	}
+	_ = ExecuteCommand(srv, alice, "/data merge storage test:margs {holder:\"Alice\",delta:3}")
+	_ = ExecuteCommand(srv, alice, "/function test:macro_add with storage test:margs")
+	if sc, _ := srv.GetScore("Alice", "fn_obj"); sc != 30 {
+		t.Fatalf("expected fn_obj score = 30 after macro function with storage, got %d", sc)
+	}
+
+	// /schedule function and /schedule clear
+	_ = ExecuteCommand(srv, alice, "/schedule function test:inc_score 10t")
+	if len(srv.ScheduledFunctions()) != 1 {
+		t.Fatalf("expected 1 scheduled function, got %d", len(srv.ScheduledFunctions()))
+	}
+	_ = ExecuteCommand(srv, alice, "/schedule clear test:inc_score")
+	if len(srv.ScheduledFunctions()) != 0 {
+		t.Fatalf("expected 0 scheduled functions after /schedule clear, got %d", len(srv.ScheduledFunctions()))
+	}
+	_ = ExecuteCommand(srv, alice, "/schedule function test:inc_score 5t replace")
+	srv.AdvanceWorldTicks(5)
+	if sc, _ := srv.GetScore("Alice", "fn_obj"); sc != 35 {
+		t.Fatalf("expected scheduled function to run after 5 ticks (score=35), got %d", sc)
+	}
+}
+
+

@@ -128,6 +128,26 @@ func (s *Server) WorldTime() (gameTime, dayTime int64) {
 func (s *Server) SetWorldTime(gameTime, dayTime int64) {
 	s.clock.gameTime.Store(gameTime)
 	s.clock.dayTime.Store(dayTime)
+	s.RunDueScheduledFunctions()
+}
+
+// AdvanceWorldTicks advances gameTime (and dayTime if DaylightCycle is enabled)
+// by ticks and executes any due scheduled functions.
+func (s *Server) AdvanceWorldTicks(ticks int64) (gameTime, dayTime int64) {
+	if s == nil || ticks <= 0 {
+		if s == nil {
+			return 0, 0
+		}
+		return s.WorldTime()
+	}
+	gameTime = s.clock.gameTime.Add(ticks)
+	if s.DaylightCycle() {
+		dayTime = s.clock.dayTime.Add(ticks)
+	} else {
+		dayTime = s.clock.dayTime.Load()
+	}
+	s.RunDueScheduledFunctions()
+	return gameTime, dayTime
 }
 
 // DaylightCycle reports whether doDaylightCycle is enabled (true by default).
@@ -199,6 +219,7 @@ func (s *Server) advanceWorldTime() (gameTime, dayTime int64) {
 	}
 	s.TickFurnaces()
 	s.TickRaids()
+	s.RunDueScheduledFunctions()
 	return gameTime, dayTime
 }
 

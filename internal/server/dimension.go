@@ -559,6 +559,8 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 		_ = send(protocol.PlayAbilities, ab.Bytes())
 
 		_ = send(protocol.PlaySetHealth, EncodeSetHealth(health, food, saturation))
+		_ = send(protocol.PlaySetEntityData, s.PlayerAvatarEntityDataPacketByEntityID(session.EntityID))
+		_ = s.SendPlayerAttributes(session)
 		_ = s.SendPlayerExperience(session)
 		_ = s.SendPlayerActiveEffects(session)
 
