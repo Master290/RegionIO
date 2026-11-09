@@ -36,7 +36,7 @@ func (r *decorationRegion) placeScheduledSurfaceStructures(seed int64) error {
 			continue
 		}
 		switch configured.Type {
-		case "minecraft:desert_well", "minecraft:spike", "minecraft:disk", "minecraft:blue_ice":
+		case "minecraft:desert_well", "minecraft:spike", "minecraft:disk", "minecraft:blue_ice", "minecraft:bonus_chest":
 		default:
 			noteNotReplayed(fmt.Sprintf("stage%d:%s", surfaceStructuresStage, configured.Type))
 			continue
@@ -49,6 +49,13 @@ func (r *decorationRegion) placeScheduledSurfaceStructures(seed int64) error {
 		case "minecraft:desert_well":
 			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
 				r.placeDesertWell(random, position)
+				return nil
+			}); err != nil {
+				return err
+			}
+		case "minecraft:bonus_chest":
+			if err := set.ForEachPlacementPosition(scheduled.Name, random, origin, context, func(position worldgen.FeaturePosition) error {
+				r.placeBonusChest(random, position)
 				return nil
 			}); err != nil {
 				return err
@@ -327,3 +334,64 @@ func (r *decorationRegion) placeBlueIce(random worldgen.RandomSource, origin wor
 	}
 	return true
 }
+
+// placeBonusChest ports net.minecraft.world.level.levelgen.feature.BonusChestFeature.place
+// (26.1.2 bytecode). It shuffles the 16 X and 16 Z coordinates of the chunk
+// containing origin via Util.toShuffledList, scans MOTION_BLOCKING_NO_LEAVES
+// until it finds an empty or collision-free cell, places minecraft:chest with
+// BuiltInLootTables.SPAWN_BONUS_CHEST ("minecraft:chests/spawn_bonus_chest")
+// and a random.NextLong() seed, and places surviving minecraft:torch blocks on
+// its four horizontal neighbors (N, E, S, W).
+func (r *decorationRegion) placeBonusChest(random worldgen.RandomSource, origin worldgen.FeaturePosition) bool {
+	chestState, ok1 := nameToStateID("minecraft:chest", map[string]string{
+		"facing":      "north",
+		"type":        "single",
+		"waterlogged": "false",
+	})
+	torchState, ok2 := nameToStateID("minecraft:torch", nil)
+	if !ok1 || !ok2 {
+		return false
+	}
+	minX := (origin.X >> 4) << 4
+	minZ := (origin.Z >> 4) << 4
+	var xs, zs [16]int
+	for i := 0; i < 16; i++ {
+		xs[i] = minX + i
+		zs[i] = minZ + i
+	}
+	for i := 16; i > 1; i-- {
+		j := int(random.NextIntN(int32(i)))
+		xs[i-1], xs[j] = xs[j], xs[i-1]
+	}
+	for i := 16; i > 1; i-- {
+		j := int(random.NextIntN(int32(i)))
+		zs[i-1], zs[j] = zs[j], zs[i-1]
+	}
+	horiz := [4][2]int{{0, -1}, {1, 0}, {0, 1}, {-1, 0}}
+	for _, x := range xs {
+		for _, z := range zs {
+			y := r.heightAt("MOTION_BLOCKING_NO_LEAVES", x, z)
+			cur := r.getBlock(x, y, z)
+			if isAirState(cur) || stateFlags(cur)&flagBlocksMotion == 0 {
+				r.setBlockGlobal(x, y, z, chestState)
+				r.addStructureBlockEntity(StructureBlockEntity{
+					ID:            "minecraft:chest",
+					X:             x,
+					Y:             y,
+					Z:             z,
+					LootTable:     "minecraft:chests/spawn_bonus_chest",
+					LootTableSeed: random.NextLong(),
+				})
+				for _, d := range horiz {
+					tx, tz := x+d[0], z+d[1]
+					if y > MinY && isFaceSturdy(r.getBlock(tx, y-1, tz)) {
+						r.setBlockGlobal(tx, y, tz, torchState)
+					}
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+

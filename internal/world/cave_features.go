@@ -210,6 +210,8 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 			return false
 		}
 		return r.placeSeaPickle(random, position, config, set)
+	case "minecraft:bonus_chest":
+		return r.placeBonusChest(random, position)
 	}
 	noteNotReplayed("nested:" + configured.Type)
 	return false
