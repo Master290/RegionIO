@@ -18,9 +18,10 @@ import (
 
 // Player inventory container layout constants (container ID 0).
 const (
-	PlayerInventorySlots  = 46
-	HotbarSlotCount       = 9
-	HotbarContainerOffset = 36
+	PlayerInventorySlots   = 46
+	PlayerEnderChestSlots  = 27
+	HotbarSlotCount        = 9
+	HotbarContainerOffset  = 36
 
 	DefaultPlayerHealth     float32 = 20.0
 	DefaultPlayerFoodLevel  int32   = 20
@@ -278,6 +279,7 @@ type PlayerData struct {
 	XpSeed             int32
 	SelectedSlot       int32
 	Inventory          [PlayerInventorySlots]ItemStack
+	EnderItems         [PlayerEnderChestSlots]ItemStack
 	SpawnX             int32
 	SpawnY             int32
 	SpawnZ             int32
@@ -529,6 +531,30 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	root.Set("Inventory", nbt.List{
 		ElemID: elemID,
 		Elems:  invElems,
+	})
+
+	enderElems := make([]nbt.Tag, 0)
+	for slot, stack := range d.EnderItems {
+		if stack.IsEmpty() {
+			continue
+		}
+		itemComp := nbt.NewCompound()
+		itemComp.Set("Slot", nbt.Byte(int8(slot)))
+		itemComp.Set("id", nbt.String(stack.ResolvedID()))
+		itemComp.Set("count", nbt.Int(stack.Count))
+		itemComp.Set("Count", nbt.Byte(int8(stack.Count)))
+		if itemID := stack.ResolvedItemID(); itemID > 0 {
+			itemComp.Set("item_id", nbt.Int(itemID))
+		}
+		enderElems = append(enderElems, itemComp)
+	}
+	enderElemID := byte(nbt.TagCompound)
+	if len(enderElems) == 0 {
+		enderElemID = nbt.TagEnd
+	}
+	root.Set("EnderItems", nbt.List{
+		ElemID: enderElemID,
+		Elems:  enderElems,
 	})
 
 	if d.HasSpawn || d.SpawnX != 0 || d.SpawnY != 0 || d.SpawnZ != 0 || d.SpawnForced {
@@ -936,6 +962,58 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 				if metaEntry != nil {
 					invMetaElems = append(invMetaElems, metaEntry)
 				}
+			}
+		}
+	}
+
+	if enderList, ok := nbtGetList(root, "EnderItems"); ok {
+		for _, elem := range enderList.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok {
+				continue
+			}
+			slotIdx := -1
+			if sb, ok := nbtGetByte(comp, "Slot"); ok {
+				slotIdx = int(uint8(sb))
+			} else if si, ok := nbtGetInt(comp, "Slot"); ok {
+				slotIdx = int(si)
+			}
+			if slotIdx < 0 || slotIdx >= PlayerEnderChestSlots {
+				continue
+			}
+			var count int32
+			if c, ok := nbtGetInt(comp, "count"); ok {
+				count = c
+			} else if cb, ok := nbtGetByte(comp, "count"); ok {
+				count = int32(uint8(cb))
+			} else if cb, ok := nbtGetByte(comp, "Count"); ok {
+				count = int32(uint8(cb))
+			} else if ci, ok := nbtGetInt(comp, "Count"); ok {
+				count = ci
+			}
+			if count <= 0 {
+				continue
+			}
+			idStr, _ := nbtGetString(comp, "id")
+			idStr = normalizeItemName(idStr)
+			var itemID int32 = -1
+			if rawID, ok := nbtGetInt(comp, "item_id"); ok && rawID > 0 {
+				itemID = rawID
+			} else if idStr != "" {
+				if resolved, ok := ItemNameToID(idStr); ok {
+					itemID = resolved
+				}
+			}
+			if idStr == "" && itemID > 0 {
+				idStr = ItemIDToName(itemID)
+			}
+			if idStr == "minecraft:air" || (idStr == "" && itemID <= 0) {
+				continue
+			}
+			d.EnderItems[slotIdx] = ItemStack{
+				ItemID: itemID,
+				ID:     idStr,
+				Count:  count,
 			}
 		}
 	}

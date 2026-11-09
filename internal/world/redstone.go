@@ -664,6 +664,16 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 		}
 		return 0
 
+	case "minecraft:trapped_chest":
+		sig := clampPower(c.TrappedChestOpenCountAt(sx, sy, sz))
+		if sig <= 0 {
+			return 0
+		}
+		if !directOnly || (tx == sx && ty == sy-1 && tz == sz) {
+			return sig
+		}
+		return 0
+
 	case "minecraft:lever":
 		if props["powered"] != "true" {
 			return 0
@@ -3492,5 +3502,242 @@ func (c *Cache) LoadChunkRedstoneRuntime(cx, cz int32, comp *nbt.Compound) int {
 	restored += c.RecoverChunkActiveBlockTicks(cx, cz)
 	return restored
 }
+
+type trappedChestOpenKey struct {
+	c       *Cache
+	x, y, z int
+}
+
+var trappedChestOpenCounts sync.Map // map[trappedChestOpenKey]int
+
+// IsTrappedChestBlock reports whether state is a minecraft:trapped_chest.
+func IsTrappedChestBlock(state uint16) bool {
+	return BlockName(state) == "minecraft:trapped_chest"
+}
+
+// IsBarrelBlock reports whether state is a minecraft:barrel.
+func IsBarrelBlock(state uint16) bool {
+	return BlockName(state) == "minecraft:barrel"
+}
+
+// IsEnderChestBlock reports whether state is a minecraft:ender_chest.
+func IsEnderChestBlock(state uint16) bool {
+	return BlockName(state) == "minecraft:ender_chest"
+}
+
+// IsPairableChestBlock reports whether state is a chest block that can form a
+// double chest (minecraft:chest, minecraft:trapped_chest, or a copper_chest).
+func IsPairableChestBlock(state uint16) bool {
+	switch BlockName(state) {
+	case "minecraft:chest", "minecraft:trapped_chest":
+		return true
+	default:
+		return IsCopperChestBlock(state)
+	}
+}
+
+func sameChestFamily(a, b uint16) bool {
+	nameA := BlockName(a)
+	nameB := BlockName(b)
+	if nameA == "" || nameB == "" {
+		return false
+	}
+	if nameA == nameB {
+		return (nameA == "minecraft:chest" || nameA == "minecraft:trapped_chest") || IsCopperChestBlock(a)
+	}
+	return IsCopperChestBlock(a) && IsCopperChestBlock(b)
+}
+
+// IsChestBlockedAbove reports whether a chest or ender_chest at (x, y, z) is
+// blocked from opening by a redstone-conductive solid block at (x, y+1, z),
+// matching vanilla ChestBlock.isBlockedChestByBlock.
+func (c *Cache) IsChestBlockedAbove(x, y, z int) bool {
+	if c == nil || y+1 < MinY || y+1 >= MinY+WorldHeight {
+		return false
+	}
+	return isConductiveSolidBlock(c.GetBlock(x, y+1, z))
+}
+
+// DoubleChestConnectedOffset returns the (dx, dz) offset toward the partner half
+// of a chest with the given facing and chestType ("left" or "right"), and
+// whether this half is the first half (slots 0..26, which in vanilla
+// ChestBlock.getBlockType is ChestType.RIGHT).
+func DoubleChestConnectedOffset(facing, chestType string) (dx, dz int, thisFirst bool, ok bool) {
+	if chestType != "left" && chestType != "right" {
+		return 0, 0, false, false
+	}
+	thisFirst = chestType == "right"
+	switch facing {
+	case "north":
+		if chestType == "left" {
+			return 1, 0, thisFirst, true
+		}
+		return -1, 0, thisFirst, true
+	case "south":
+		if chestType == "left" {
+			return -1, 0, thisFirst, true
+		}
+		return 1, 0, thisFirst, true
+	case "west":
+		if chestType == "left" {
+			return 0, -1, thisFirst, true
+		}
+		return 0, 1, thisFirst, true
+	case "east":
+		if chestType == "left" {
+			return 0, 1, thisFirst, true
+		}
+		return 0, -1, thisFirst, true
+	default:
+		return 0, 0, false, false
+	}
+}
+
+// DoubleChestPartnerAt returns the partner chest coordinates (px, py, pz) if
+// the chest at (x, y, z) is paired as a double chest ("left" or "right") with
+// a matching partner half. thisFirst is true when (x, y, z) is the first 27
+// slots (type="right" in vanilla ChestBlock.getBlockType).
+func (c *Cache) DoubleChestPartnerAt(x, y, z int) (px, py, pz int, thisFirst bool, ok bool) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return 0, 0, 0, false, false
+	}
+	state := c.GetBlock(x, y, z)
+	if !IsPairableChestBlock(state) {
+		return 0, 0, 0, false, false
+	}
+	info, ok := stateByID(state)
+	if !ok {
+		return 0, 0, 0, false, false
+	}
+	chestType := info.Properties["type"]
+	facing := info.Properties["facing"]
+	dx, dz, first, ok := DoubleChestConnectedOffset(facing, chestType)
+	if !ok {
+		return 0, 0, 0, false, false
+	}
+	px, py, pz = x+dx, y, z+dz
+	pState := c.GetBlock(px, py, pz)
+	if !sameChestFamily(state, pState) {
+		return 0, 0, 0, false, false
+	}
+	pInfo, ok := stateByID(pState)
+	if !ok || pInfo.Properties["facing"] != facing {
+		return 0, 0, 0, false, false
+	}
+	wantPartnerType := "right"
+	if chestType == "right" {
+		wantPartnerType = "left"
+	}
+	if pInfo.Properties["type"] != wantPartnerType {
+		return 0, 0, 0, false, false
+	}
+	return px, py, pz, first, true
+}
+
+// ResolveChestPlacementStateAt resolves the placed state for a chest,
+// trapped_chest, or copper_chest at (x, y, z) given the player's horizontal
+// look direction and sneaking flag, and returns the updated partner state if
+// the placed chest pairs with an adjacent single chest of the same family.
+func (c *Cache) ResolveChestPlacementStateAt(
+	x, y, z int,
+	baseState uint16,
+	playerHorizLookDir string,
+	sneaking bool,
+) (placedState uint16, partnerPos BlockPos, partnerState uint16, hasPartner bool) {
+	placedState = baseState
+	if !IsPairableChestBlock(baseState) {
+		return placedState, BlockPos{}, 0, false
+	}
+	chestFacing := oppositeDirection(playerHorizLookDir)
+	if chestFacing == "" {
+		chestFacing = "north"
+	}
+	if st, ok := WithBlockProperty(placedState, "facing", chestFacing); ok {
+		placedState = st
+	}
+	if st, ok := WithBlockProperty(placedState, "type", "single"); ok {
+		placedState = st
+	}
+	if c == nil || sneaking || y < MinY || y >= MinY+WorldHeight {
+		return placedState, BlockPos{}, 0, false
+	}
+	for _, candidateType := range []string{"left", "right"} {
+		dx, dz, _, ok := DoubleChestConnectedOffset(chestFacing, candidateType)
+		if !ok {
+			continue
+		}
+		nx, nz := x+dx, z+dz
+		nState := c.GetBlock(nx, y, nz)
+		if !sameChestFamily(placedState, nState) {
+			continue
+		}
+		nInfo, ok := stateByID(nState)
+		if !ok || nInfo.Properties["facing"] != chestFacing || nInfo.Properties["type"] != "single" {
+			continue
+		}
+		partnerType := "right"
+		if candidateType == "right" {
+			partnerType = "left"
+		}
+		thisPaired, ok1 := WithBlockProperty(placedState, "type", candidateType)
+		partnerPaired, ok2 := WithBlockProperty(nState, "type", partnerType)
+		if ok1 && ok2 {
+			return thisPaired, BlockPos{X: nx, Y: y, Z: nz}, partnerPaired, true
+		}
+	}
+	return placedState, BlockPos{}, 0, false
+}
+
+// TrappedChestOpenCountAt returns the current viewer count for a trapped_chest
+// at (x, y, z) (or 0 if none / not a trapped_chest).
+func (c *Cache) TrappedChestOpenCountAt(x, y, z int) int {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return 0
+	}
+	if !IsTrappedChestBlock(c.GetBlock(x, y, z)) {
+		return 0
+	}
+	if v, ok := trappedChestOpenCounts.Load(trappedChestOpenKey{c: c, x: x, y: y, z: z}); ok {
+		if n, ok := v.(int); ok && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// SetTrappedChestOpenCount sets the active viewer count on a trapped_chest at
+// (x, y, z) (and its paired double-chest partner, if any) and propagates
+// redstone updates at (x, y, z) and (x, y-1, z), matching
+// TrappedChestBlockEntity.signalOpenCount in vanilla 26.1.2.
+func (c *Cache) SetTrappedChestOpenCount(x, y, z, count int) BlockUpdateResult {
+	var res BlockUpdateResult
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return res
+	}
+	if count < 0 {
+		count = 0
+	}
+	updateOne := func(tx, ty, tz int) {
+		key := trappedChestOpenKey{c: c, x: tx, y: ty, z: tz}
+		if count == 0 {
+			trappedChestOpenCounts.Delete(key)
+		} else {
+			trappedChestOpenCounts.Store(key, count)
+		}
+		st := c.GetBlock(tx, ty, tz)
+		c.propagateRedstoneAround(tx, ty, tz, st, st, &res)
+		if ty-1 >= MinY {
+			belowSt := c.GetBlock(tx, ty-1, tz)
+			c.propagateRedstoneAround(tx, ty-1, tz, belowSt, belowSt, &res)
+		}
+	}
+	px, py, pz, _, hasPartner := c.DoubleChestPartnerAt(x, y, z)
+	updateOne(x, y, z)
+	if hasPartner {
+		updateOne(px, py, pz)
+	}
+	return res
+}
+
 
 

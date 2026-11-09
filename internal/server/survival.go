@@ -2159,8 +2159,13 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 		if st, ok := world.WithBlockProperty(baseState, "facing", world.ObserverFacingForPlacement(lookDir)); ok {
 			return st
 		}
-	case "minecraft:piston", "minecraft:sticky_piston":
+	case "minecraft:piston", "minecraft:sticky_piston", "minecraft:barrel":
 		if st, ok := world.WithBlockProperty(baseState, "facing", oppLookDir); ok {
+			return st
+		}
+	case "minecraft:chest", "minecraft:trapped_chest", "minecraft:ender_chest",
+		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker":
+		if st, ok := world.WithBlockProperty(baseState, "facing", oppHorizFacing); ok {
 			return st
 		}
 	case "minecraft:lightning_rod":
@@ -2188,6 +2193,12 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 		}
 		if st := world.BellBlockState(attachment, bellFacing, false); st != 0 {
 			return st
+		}
+	default:
+		if world.IsFenceGateBlock(baseState) {
+			if st, ok := world.WithBlockProperty(baseState, "facing", horizLookDir); ok {
+				return st
+			}
 		}
 	}
 	return baseState

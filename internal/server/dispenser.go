@@ -507,7 +507,23 @@ func (s *Server) ContainerComparatorSignalAt(dim string, x, y, z int) int {
 	state := cache.GetBlock(x, y, z)
 	name := world.BlockName(state)
 	switch {
-	case IsChestBlock(state) || name == "minecraft:trapped_chest" || name == "minecraft:barrel":
+	case IsChestBlock(state) || world.IsCopperChestBlock(state):
+		if px, py, pz, thisFirst, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
+			thisSlots := s.ChestSlots(x, y, z)
+			partnerSlots := s.ChestSlots(px, py, pz)
+			var combined [ChestSlotCount * 2]world.ItemStack
+			if thisFirst {
+				copy(combined[0:ChestSlotCount], thisSlots[:])
+				copy(combined[ChestSlotCount:ChestSlotCount*2], partnerSlots[:])
+			} else {
+				copy(combined[0:ChestSlotCount], partnerSlots[:])
+				copy(combined[ChestSlotCount:ChestSlotCount*2], thisSlots[:])
+			}
+			return CalculateContainerComparatorSignal(combined[:])
+		}
+		slots := s.ChestSlots(x, y, z)
+		return CalculateContainerComparatorSignal(slots[:])
+	case name == "minecraft:barrel":
 		slots := s.ChestSlots(x, y, z)
 		return CalculateContainerComparatorSignal(slots[:])
 	case IsShulkerBoxItemOrBlock(name):

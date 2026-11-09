@@ -13,7 +13,8 @@ import (
 // MenuType registry IDs in BuiltInRegistries.MENU (protocol 775 / 26.1.2).
 const (
 	MenuTypeHorse        int32 = -2 // Equine/llama inventory screen (opened via PlayHorseScreenOpen 0x29)
-	MenuTypeGeneric9x3   int32 = 2  // Single chest (27 chest slots + 36 player slots)
+	MenuTypeGeneric9x3   int32 = 2  // Single chest / barrel / ender chest (27 chest slots + 36 player slots)
+	MenuTypeGeneric9x6   int32 = 5  // Double chest (54 chest slots + 36 player slots)
 	MenuTypeAnvil        int32 = 8  // Anvil (2 input + 1 result + 36 player slots)
 	MenuTypeBlastFurnace int32 = 10 // Blast furnace (3 furnace slots + 36 player slots)
 	MenuTypeCrafting     int32 = 12 // Crafting table (1 result + 9 grid + 36 player slots)
@@ -37,14 +38,16 @@ const (
 
 // Container slot layout constants.
 const (
-	ChestSlotCount        = 27
-	ChestMenuSlotCount    = 63 // 27 chest + 27 main inventory + 9 hotbar
-	HopperSlotCount       = 5
-	HopperMenuSlotCount   = 41 // 5 hopper + 27 main inventory + 9 hotbar
-	CraftingGridSlotCount = 9
-	CraftingMenuSlotCount = 46 // 1 result + 9 grid + 27 main inventory + 9 hotbar
-	FurnaceSlotCount      = world.FurnaceSlotCount
-	FurnaceMenuSlotCount  = 39 // 3 furnace + 27 main inventory + 9 hotbar
+	ChestSlotCount           = 27
+	ChestMenuSlotCount       = 63 // 27 chest + 27 main inventory + 9 hotbar
+	DoubleChestSlotCount     = 54
+	DoubleChestMenuSlotCount = 90 // 54 chest + 27 main inventory + 9 hotbar
+	HopperSlotCount          = 5
+	HopperMenuSlotCount      = 41 // 5 hopper + 27 main inventory + 9 hotbar
+	CraftingGridSlotCount    = 9
+	CraftingMenuSlotCount    = 46 // 1 result + 9 grid + 27 main inventory + 9 hotbar
+	FurnaceSlotCount         = world.FurnaceSlotCount
+	FurnaceMenuSlotCount     = 39 // 3 furnace + 27 main inventory + 9 hotbar
 )
 
 // ContainerClick holds the decoded fields of a serverbound container_click packet.
@@ -60,9 +63,16 @@ type ContainerClick struct {
 type OpenContainerState struct {
 	ContainerID     int32
 	MenuType        int32
+	Dimension       string
 	BlockX          int
 	BlockY          int
 	BlockZ          int
+	PartnerX        int
+	PartnerY        int
+	PartnerZ        int
+	HasPartner      bool
+	IsEnderChest    bool
+	IsBarrel        bool
 	VehicleEntityID int32
 	Crafting        [CraftingGridSlotCount]world.ItemStack
 	CraftingStars   [CraftingGridSlotCount]FireworkExplosion
@@ -94,6 +104,7 @@ type playerContainerTracker struct {
 	invCraft      [4]world.ItemStack
 	invCraftStars [4]FireworkExplosion
 	invResult     world.ItemStack
+	enderChest    [ChestSlotCount]world.ItemStack
 }
 
 var (
@@ -207,7 +218,72 @@ func (s *Server) SetChestSlot(x, y, z, slot int, stack world.ItemStack) bool {
 		arr[slot] = world.NewItemStack(stack.ResolvedItemID(), stack.Count)
 	}
 	cs.mu.Unlock()
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		cache := s.DimensionChunks(dim)
+		if cache == nil {
+			continue
+		}
+		st := cache.GetBlock(x, y, z)
+		if IsChestBlock(st) || IsBarrelBlock(st) || IsShulkerBoxItemOrBlock(world.BlockName(st)) {
+			s.updateDispenserComparatorsAndBroadcast(dim, x, y, z)
+			if px, py, pz, _, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
+				s.updateDispenserComparatorsAndBroadcast(dim, px, py, pz)
+			}
+		}
+	}
 	return true
+}
+
+// EnderChestSlots returns a copy of the player's personal 27-slot ender chest inventory.
+func (session *PlayerSession) EnderChestSlots() [ChestSlotCount]world.ItemStack {
+	if session == nil {
+		return [ChestSlotCount]world.ItemStack{}
+	}
+	tr := getContainerTracker(session)
+	if tr.mu.TryLock() {
+		defer tr.mu.Unlock()
+	}
+	return tr.enderChest
+}
+
+// EnderChestSlot returns a single slot (0..26) from the player's personal ender chest inventory.
+func (session *PlayerSession) EnderChestSlot(slot int) world.ItemStack {
+	if session == nil || slot < 0 || slot >= ChestSlotCount {
+		return world.ItemStack{}
+	}
+	tr := getContainerTracker(session)
+	if tr.mu.TryLock() {
+		defer tr.mu.Unlock()
+	}
+	return tr.enderChest[slot]
+}
+
+// SetEnderChestSlot updates a single slot (0..26) in the player's personal ender chest inventory.
+func (session *PlayerSession) SetEnderChestSlot(slot int, stack world.ItemStack) bool {
+	if session == nil || slot < 0 || slot >= ChestSlotCount {
+		return false
+	}
+	tr := getContainerTracker(session)
+	if tr.mu.TryLock() {
+		defer tr.mu.Unlock()
+	}
+	if stack.IsEmpty() {
+		tr.enderChest[slot] = world.ItemStack{}
+	} else {
+		tr.enderChest[slot] = world.NewItemStack(stack.ResolvedItemID(), stack.Count)
+	}
+	return true
+}
+
+// SetEnderChestSlots replaces the player's personal 27-slot ender chest inventory.
+func (session *PlayerSession) SetEnderChestSlots(slots [ChestSlotCount]world.ItemStack) {
+	if session == nil {
+		return
+	}
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.enderChest = slots
+	tr.mu.Unlock()
 }
 
 // DropChestContents removes any stored chest inventory at (x, y, z) and spawns
@@ -232,14 +308,54 @@ func (s *Server) DropChestContents(x, y, z int) {
 	}
 }
 
-// IsChestBlock reports whether state is a chest block.
+// IsChestBlock reports whether state is a chest block (chest, trapped_chest, or copper_chest).
 func IsChestBlock(state uint16) bool {
 	switch world.BlockName(state) {
 	case "minecraft:chest", "minecraft:trapped_chest":
 		return true
 	default:
-		return false
+		return world.IsCopperChestBlock(state)
 	}
+}
+
+// IsBarrelBlock reports whether state is a barrel block.
+func IsBarrelBlock(state uint16) bool {
+	return world.IsBarrelBlock(state)
+}
+
+// IsEnderChestBlock reports whether state is an ender_chest block.
+func IsEnderChestBlock(state uint16) bool {
+	return world.IsEnderChestBlock(state)
+}
+
+// PlaceChestAt places a chest, trapped_chest, or copper_chest at (x, y, z) for
+// session, pairing it into a double chest ("left" / "right") when placed
+// without sneaking adjacent to a matching single chest with the same facing.
+func (s *Server) PlaceChestAt(session *PlayerSession, x, y, z int, baseState uint16) (uint16, bool) {
+	if s == nil || session == nil {
+		return 0, false
+	}
+	dim := world.NormalizeDimension(session.Dimension())
+	cache := s.DimensionChunks(dim)
+	if cache == nil {
+		return 0, false
+	}
+	snap := session.Snapshot()
+	horizLookDir := HorizontalFacingFromYaw(snap.Yaw)
+	placedState, partnerPos, partnerState, hasPartner := cache.ResolveChestPlacementStateAt(
+		x, y, z, baseState, horizLookDir, session.IsSneaking(),
+	)
+	applied, res := cache.ApplyBlockWithUpdates(x, y, z, placedState)
+	if !applied {
+		return 0, false
+	}
+	s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
+	if hasPartner {
+		if pApplied, pRes := cache.ApplyBlockWithUpdates(partnerPos.X, partnerPos.Y, partnerPos.Z, partnerState); pApplied {
+			s.broadcastDimensionBlockChanges(dim, cache, pRes.Changes, pRes.LightChanged)
+		}
+	}
+	return placedState, true
 }
 
 // IsCraftingTableBlock reports whether state is a crafting_table block.
@@ -434,13 +550,48 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	blockName := world.BlockName(state)
 	switch {
 	case IsChestBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		if cache.IsChestBlockedAbove(x, y, z) {
+			return true, 0, nil
+		}
+		if px, py, pz, _, ok := cache.DoubleChestPartnerAt(x, y, z); ok && cache.IsChestBlockedAbove(px, py, pz) {
+			return true, 0, nil
+		}
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenChest(session, x, y, z)
 		if err == nil {
 			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
 		}
 		return err == nil, cid, err
+	case IsBarrelBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		s.RecordContainerOpenStat(session, blockName)
+		cid, err := s.OpenBarrel(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
+		return err == nil, cid, err
+	case IsEnderChestBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		if cache.IsChestBlockedAbove(x, y, z) {
+			return true, 0, nil
+		}
+		s.RecordContainerOpenStat(session, blockName)
+		cid, err := s.OpenEnderChest(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
+		return err == nil, cid, err
 	case IsCraftingTableBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenCraftingTable(session, x, y, z)
 		if err == nil {
@@ -448,6 +599,9 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		}
 		return err == nil, cid, err
 	case IsFurnaceBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenFurnace(session, x, y, z)
 		if err == nil {
@@ -664,12 +818,98 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 	}
 }
 
-// OpenChest opens the 27-slot chest screen at (x, y, z) for session and sends
-// open_screen + container_set_content.
+// OpenChest opens the 27-slot single chest or 54-slot double chest screen at
+// (x, y, z) for session and sends open_screen + container_set_content.
 func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	if s == nil || session == nil {
 		return 0, errors.New("server: nil session")
 	}
+	dim := world.NormalizeDimension(session.Dimension())
+	cache := s.DimensionChunks(dim)
+	if cache != nil && cache.IsChestBlockedAbove(x, y, z) {
+		return 0, errors.New("server: chest is blocked above")
+	}
+	firstX, firstY, firstZ := x, y, z
+	secondX, secondY, secondZ := 0, 0, 0
+	hasPartner := false
+	if cache != nil {
+		if px, py, pz, thisFirst, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
+			if cache.IsChestBlockedAbove(px, py, pz) {
+				return 0, errors.New("server: double chest partner is blocked above")
+			}
+			hasPartner = true
+			if thisFirst {
+				secondX, secondY, secondZ = px, py, pz
+			} else {
+				firstX, firstY, firstZ = px, py, pz
+				secondX, secondY, secondZ = x, y, z
+			}
+		}
+	}
+
+	_ = s.CloseContainer(session, 0, false)
+
+	menuType := MenuTypeGeneric9x3
+	title := "Chest"
+	if hasPartner {
+		menuType = MenuTypeGeneric9x6
+		title = "Large Chest"
+	}
+
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.nextWindow = (tr.nextWindow % 100) + 1
+	cid := tr.nextWindow
+	tr.open = &OpenContainerState{
+		ContainerID: cid,
+		MenuType:    menuType,
+		Dimension:   dim,
+		BlockX:      firstX,
+		BlockY:      firstY,
+		BlockZ:      firstZ,
+		PartnerX:    secondX,
+		PartnerY:    secondY,
+		PartnerZ:    secondZ,
+		HasPartner:  hasPartner,
+	}
+	carried := tr.carried
+	tr.mu.Unlock()
+
+	s.HydrateChestExplorerMaps(firstX, firstY, firstZ, "buried_treasure")
+	if hasPartner {
+		s.HydrateChestExplorerMaps(secondX, secondY, secondZ, "buried_treasure")
+	}
+	s.updateContainerViewerState(dim, firstX, firstY, firstZ)
+
+	if session.send != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, menuType, title)); err != nil {
+			return cid, err
+		}
+		var slots []world.ItemStack
+		if hasPartner {
+			slots = s.buildDoubleChestMenuSlots(session, firstX, firstY, firstZ, secondX, secondY, secondZ)
+		} else {
+			slots = s.buildChestMenuSlots(session, firstX, firstY, firstZ)
+		}
+		stateID := session.NextContainerStateID()
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+			return cid, err
+		}
+		if !hasPartner {
+			s.syncChestMapSlots(session, cid, firstX, firstY, firstZ)
+		}
+	}
+	return cid, nil
+}
+
+// OpenBarrel opens the 27-slot barrel screen at (x, y, z) for session,
+// sets open="true" on the barrel block state, and sends open_screen +
+// container_set_content.
+func (s *Server) OpenBarrel(session *PlayerSession, x, y, z int) (int32, error) {
+	if s == nil || session == nil {
+		return 0, errors.New("server: nil session")
+	}
+	dim := world.NormalizeDimension(session.Dimension())
 	_ = s.CloseContainer(session, 0, false)
 
 	tr := getContainerTracker(session)
@@ -679,17 +919,19 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	tr.open = &OpenContainerState{
 		ContainerID: cid,
 		MenuType:    MenuTypeGeneric9x3,
+		Dimension:   dim,
 		BlockX:      x,
 		BlockY:      y,
 		BlockZ:      z,
+		IsBarrel:    true,
 	}
 	carried := tr.carried
 	tr.mu.Unlock()
 
-	s.HydrateChestExplorerMaps(x, y, z, "buried_treasure")
+	s.updateContainerViewerState(dim, x, y, z)
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, "Chest")); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, "Barrel")); err != nil {
 			return cid, err
 		}
 		slots := s.buildChestMenuSlots(session, x, y, z)
@@ -697,7 +939,49 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
 		}
-		s.syncChestMapSlots(session, cid, x, y, z)
+	}
+	return cid, nil
+}
+
+// OpenEnderChest opens the player's personal 27-slot ender chest screen at
+// (x, y, z) for session and sends open_screen + container_set_content.
+func (s *Server) OpenEnderChest(session *PlayerSession, x, y, z int) (int32, error) {
+	if s == nil || session == nil {
+		return 0, errors.New("server: nil session")
+	}
+	dim := world.NormalizeDimension(session.Dimension())
+	if cache := s.DimensionChunks(dim); cache != nil && cache.IsChestBlockedAbove(x, y, z) {
+		return 0, errors.New("server: ender chest is blocked above")
+	}
+	_ = s.CloseContainer(session, 0, false)
+
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	tr.nextWindow = (tr.nextWindow % 100) + 1
+	cid := tr.nextWindow
+	tr.open = &OpenContainerState{
+		ContainerID:  cid,
+		MenuType:     MenuTypeGeneric9x3,
+		Dimension:    dim,
+		BlockX:       x,
+		BlockY:       y,
+		BlockZ:       z,
+		IsEnderChest: true,
+	}
+	carried := tr.carried
+	tr.mu.Unlock()
+
+	s.updateContainerViewerState(dim, x, y, z)
+
+	if session.send != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, "Ender Chest")); err != nil {
+			return cid, err
+		}
+		slots := s.buildEnderChestMenuSlots(session)
+		stateID := session.NextContainerStateID()
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+			return cid, err
+		}
 	}
 	return cid, nil
 }
@@ -745,6 +1029,128 @@ func (s *Server) buildChestMenuSlots(session *PlayerSession, x, y, z int) []worl
 	copy(slots[27:54], inv[9:36])
 	copy(slots[54:63], inv[36:45])
 	return slots
+}
+
+func (s *Server) buildDoubleChestMenuSlots(session *PlayerSession, x1, y1, z1, x2, y2, z2 int) []world.ItemStack {
+	first := s.ChestSlots(x1, y1, z1)
+	second := s.ChestSlots(x2, y2, z2)
+	inv := session.Inventory()
+	slots := make([]world.ItemStack, DoubleChestMenuSlotCount)
+	copy(slots[0:27], first[:])
+	copy(slots[27:54], second[:])
+	copy(slots[54:81], inv[9:36])
+	copy(slots[81:90], inv[36:45])
+	return slots
+}
+
+func (s *Server) buildEnderChestMenuSlots(session *PlayerSession) []world.ItemStack {
+	ec := session.EnderChestSlots()
+	inv := session.Inventory()
+	slots := make([]world.ItemStack, ChestMenuSlotCount)
+	copy(slots[0:27], ec[:])
+	copy(slots[27:54], inv[9:36])
+	copy(slots[54:63], inv[36:45])
+	return slots
+}
+
+// ContainerViewerCountAt returns the number of active non-spectator players
+// currently viewing the container block at (dim, x, y, z) (or its paired
+// double-chest half).
+func (s *Server) ContainerViewerCountAt(dim string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	px, py, pz := 0, 0, 0
+	hasPartner := false
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		if partnerX, partnerY, partnerZ, _, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
+			px, py, pz = partnerX, partnerY, partnerZ
+			hasPartner = true
+		}
+	}
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, sess := range s.players {
+		sessions = append(sessions, sess)
+	}
+	s.playersMu.RUnlock()
+
+	count := 0
+	for _, sess := range sessions {
+		if sess == nil || sess.IsDead() || sess.Snapshot().GameMode == GameModeSpectator {
+			continue
+		}
+		open := sess.OpenContainer()
+		if open == nil || open.VehicleEntityID != 0 {
+			continue
+		}
+		openDim := world.NormalizeDimension(open.Dimension)
+		if openDim == "" {
+			openDim = world.NormalizeDimension(sess.Dimension())
+		}
+		if openDim != normDim {
+			continue
+		}
+		if open.MenuType != MenuTypeGeneric9x3 && open.MenuType != MenuTypeGeneric9x6 {
+			continue
+		}
+		matchesThis := open.BlockX == x && open.BlockY == y && open.BlockZ == z
+		matchesPartner := (open.HasPartner && open.PartnerX == x && open.PartnerY == y && open.PartnerZ == z) ||
+			(hasPartner && open.BlockX == px && open.BlockY == py && open.BlockZ == pz)
+		if matchesThis || matchesPartner {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *Server) updateContainerViewerState(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return
+	}
+	state := cache.GetBlock(x, y, z)
+	name := world.BlockName(state)
+	openCount := s.ContainerViewerCountAt(normDim, x, y, z)
+	switch {
+	case name == "minecraft:barrel":
+		wantOpen := "false"
+		if openCount > 0 {
+			wantOpen = "true"
+		}
+		if nextSt, ok := world.WithBlockProperty(state, "open", wantOpen); ok && nextSt != state {
+			if applied, res := cache.ApplyBlockWithUpdates(x, y, z, nextSt); applied {
+				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+			}
+		}
+	case IsChestBlock(state) || name == "minecraft:ender_chest":
+		actionParam := byte(0)
+		if openCount > 255 {
+			actionParam = 255
+		} else if openCount > 0 {
+			actionParam = byte(openCount)
+		}
+		blockID, _ := world.BlockRegistryID(name)
+		s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEventCB,
+			EncodeBlockEventPacket(x, y, z, blockID, 1, actionParam))
+		if px, py, pz, _, hasPartner := cache.DoubleChestPartnerAt(x, y, z); hasPartner {
+			pState := cache.GetBlock(px, py, pz)
+			pBlockID, _ := world.BlockRegistryID(world.BlockName(pState))
+			s.BroadcastDimensionChunk(normDim, int32(px>>4), int32(pz>>4), PlayBlockEventCB,
+				EncodeBlockEventPacket(px, py, pz, pBlockID, 1, actionParam))
+		}
+		if name == "minecraft:trapped_chest" {
+			res := cache.SetTrappedChestOpenCount(x, y, z, openCount)
+			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
+				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
+			}
+		}
+	}
 }
 
 func (s *Server) buildCraftingMenuSlots(session *PlayerSession, grid [CraftingGridSlotCount]world.ItemStack, result world.ItemStack) []world.ItemStack {
@@ -801,10 +1207,12 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	closedID := containerID
 	hadOpen := false
 	var closedX, closedY, closedZ int
+	var closedDim string
 	if tr.open != nil && (containerID == 0 || containerID == tr.open.ContainerID) {
 		hadOpen = true
 		closedID = tr.open.ContainerID
 		closedX, closedY, closedZ = tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		closedDim = tr.open.Dimension
 		var smithingMetas [3]ItemMeta
 		var smithingTrims [3]ArmorTrim
 		if tr.open.MenuType == MenuTypeSmithing {
@@ -876,7 +1284,11 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	tr.mu.Unlock()
 
 	if hadOpen {
-		s.EmitPlayerBlockVibration(session, GameEventContainerClose, session.Dimension(), closedX, closedY, closedZ, "")
+		if closedDim == "" {
+			closedDim = session.Dimension()
+		}
+		s.updateContainerViewerState(closedDim, closedX, closedY, closedZ)
+		s.EmitPlayerBlockVibration(session, GameEventContainerClose, closedDim, closedX, closedY, closedZ, "")
 	}
 
 	snap := session.Snapshot()
@@ -996,8 +1408,23 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			s.UnlockRecipesForInventory(session)
 			return s.syncVehicleContainerViewers(session, vehID)
 		}
+		if tr.open.IsEnderChest {
+			s.applyEnderChestClickLocked(session, tr, slot, button, mode)
+			tr.mu.Unlock()
+			s.TriggerInventoryChanged(session)
+			s.UnlockRecipesForInventory(session)
+			return s.syncOpenContainer(session)
+		}
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		s.applyChestClickLocked(session, tr, bx, by, bz, slot, button, mode)
+		tr.mu.Unlock()
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+		return s.syncChestViewers(session, bx, by, bz)
+	case MenuTypeGeneric9x6:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		px, py, pz := tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
+		s.applyDoubleChestClickLocked(session, tr, bx, by, bz, px, py, pz, slot, button, mode)
 		tr.mu.Unlock()
 		s.TriggerInventoryChanged(session)
 		s.UnlockRecipesForInventory(session)
@@ -2476,9 +2903,17 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	case MenuTypeGeneric9x3:
 		if openCopy.VehicleEntityID != 0 {
 			slots = s.buildVehicleChestMenuSlots(session, openCopy.VehicleEntityID)
+		} else if openCopy.IsEnderChest {
+			slots = s.buildEnderChestMenuSlots(session)
 		} else {
 			slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 		}
+	case MenuTypeGeneric9x6:
+		slots = s.buildDoubleChestMenuSlots(
+			session,
+			openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ,
+			openCopy.PartnerX, openCopy.PartnerY, openCopy.PartnerZ,
+		)
 	case MenuTypeHopper:
 		if openCopy.VehicleEntityID != 0 {
 			slots = s.buildVehicleHopperMenuSlots(session, openCopy.VehicleEntityID)
@@ -2566,7 +3001,7 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	if openCopy.MenuType == MenuTypeCrafting && !openCopy.Result.IsEmpty() && IsPotionOrTippedArrowItem(openCopy.Result) {
 		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(openCopy.ContainerID, session.NextContainerStateID(), 0, openCopy.Result, openCopy.CraftingPotions[4]))
 	}
-	if openCopy.MenuType == MenuTypeGeneric9x3 && openCopy.VehicleEntityID == 0 {
+	if openCopy.MenuType == MenuTypeGeneric9x3 && openCopy.VehicleEntityID == 0 && !openCopy.IsEnderChest {
 		s.syncChestMapSlots(session, openCopy.ContainerID, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 	}
 	if isCrafter {
@@ -2739,8 +3174,10 @@ func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {
 	var firstErr error
 	for _, sess := range sessions {
 		open := sess.OpenContainer()
-		if open != nil && open.MenuType == MenuTypeGeneric9x3 &&
-			open.BlockX == bx && open.BlockY == by && open.BlockZ == bz {
+		if open != nil && !open.IsEnderChest &&
+			(open.MenuType == MenuTypeGeneric9x3 || open.MenuType == MenuTypeGeneric9x6) &&
+			((open.BlockX == bx && open.BlockY == by && open.BlockZ == bz) ||
+				(open.HasPartner && open.PartnerX == bx && open.PartnerY == by && open.PartnerZ == bz)) {
 			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -2751,6 +3188,138 @@ func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {
 		}
 	}
 	return firstErr
+}
+
+func (s *Server) applyDoubleChestClickLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	x1, y1, z1, x2, y2, z2, slot int,
+	button int8,
+	mode int32,
+) {
+	if slot < 0 || slot >= DoubleChestMenuSlotCount {
+		return
+	}
+	slots := s.buildDoubleChestMenuSlots(session, x1, y1, z1, x2, y2, z2)
+	switch mode {
+	case ContainerInputPickup:
+		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+	case ContainerInputQuickMove:
+		if slot < DoubleChestSlotCount {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 81, 90)
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 81)
+		} else {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, DoubleChestSlotCount)
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 81 + int(button)
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			_, _ = s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+		}
+	case ContainerInputPickupAll:
+		applyPickupAllSlice(slots, &tr.carried, 0)
+	}
+	for i := 0; i < ChestSlotCount; i++ {
+		s.SetChestSlot(x1, y1, z1, i, slots[i])
+		s.SetChestSlot(x2, y2, z2, i, slots[ChestSlotCount+i])
+	}
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[54+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[81+i])
+	}
+}
+
+func (s *Server) applyEnderChestClickLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	slot int,
+	button int8,
+	mode int32,
+) {
+	if slot < 0 || slot >= ChestMenuSlotCount {
+		return
+	}
+	slots := make([]world.ItemStack, ChestMenuSlotCount)
+	copy(slots[0:27], tr.enderChest[:])
+	inv := session.Inventory()
+	copy(slots[27:54], inv[9:36])
+	copy(slots[54:63], inv[36:45])
+
+	switch mode {
+	case ContainerInputPickup:
+		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+	case ContainerInputQuickMove:
+		if slot < ChestSlotCount {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 63)
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 27, 54)
+		} else {
+			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, ChestSlotCount)
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 54 + int(button)
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		}
+	case ContainerInputThrow:
+		if !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Count
+			}
+			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
+			rem := slots[slot].Count - dropCount
+			if rem <= 0 {
+				slots[slot] = world.ItemStack{}
+			} else {
+				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
+			}
+			snap := session.Snapshot()
+			_, _ = s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
+			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+		}
+	case ContainerInputPickupAll:
+		applyPickupAllSlice(slots, &tr.carried, 0)
+	}
+	for i := 0; i < ChestSlotCount; i++ {
+		if slots[i].IsEmpty() {
+			tr.enderChest[i] = world.ItemStack{}
+		} else {
+			tr.enderChest[i] = world.NewItemStack(slots[i].ResolvedItemID(), slots[i].Count)
+		}
+	}
+	for i := 0; i < 27; i++ {
+		session.SetInventorySlot(9+i, slots[27+i])
+	}
+	for i := 0; i < 9; i++ {
+		session.SetInventorySlot(36+i, slots[54+i])
+	}
 }
 
 func (s *Server) applyBrewingStandContainerClickLocked(

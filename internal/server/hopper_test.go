@@ -695,3 +695,269 @@ func TestAllayNoteBlockAndJukeboxHooks(t *testing.T) {
 	}
 }
 
+func TestTrappedChestRedstoneSignalAndDownwardStrongPower(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	stoneSt, _ := world.BlockStateByName("minecraft:stone", nil)
+	// Solid floor for redstone wires
+	for x := 198; x <= 204; x++ {
+		for z := 198; z <= 204; z++ {
+			cache.SetBlock(x, 63, z, stoneSt)
+		}
+	}
+	// Conductive stone directly below trapped chest at (200, 64, 200),
+	// and stone support for adjacent wire at (201, 64, 200).
+	cache.SetBlock(200, 64, 200, stoneSt)
+	cache.SetBlock(201, 64, 200, stoneSt)
+
+	trappedSt, ok := world.BlockStateIDByProperties("minecraft:trapped_chest", map[string]string{
+		"facing": "north", "type": "single", "waterlogged": "false",
+	})
+	if !ok {
+		t.Fatal("missing minecraft:trapped_chest state")
+	}
+	cache.ApplyBlockWithUpdates(200, 65, 200, trappedSt)
+
+	wireSt, _ := world.BlockStateByName("minecraft:redstone_wire", nil)
+	// Adjacent wire at same Y (weak signal from trapped_chest)
+	cache.ApplyBlockWithUpdates(201, 65, 200, wireSt)
+	// Wire adjacent to the stone block below the trapped_chest (strong downward signal through stone!)
+	cache.ApplyBlockWithUpdates(200, 64, 201, wireSt)
+
+	p1, _ := addDispenserTestPlayer(t, srv, "TrappedViewer1")
+	p2, _ := addDispenserTestPlayer(t, srv, "TrappedViewer2")
+
+	// 1 viewer opens trapped chest -> power = 1
+	if _, err := srv.OpenChest(p1, 200, 65, 200); err != nil {
+		t.Fatalf("p1 OpenChest: %v", err)
+	}
+	if got := world.BlockProperties(cache.GetBlock(201, 65, 200))["power"]; got != "1" {
+		t.Fatalf("expected adjacent wire power=1 with 1 viewer, got %q", got)
+	}
+	if got := world.BlockProperties(cache.GetBlock(200, 64, 201))["power"]; got != "1" {
+		t.Fatalf("expected wire powered through stone below trapped_chest to have power=1, got %q", got)
+	}
+
+	// 2nd viewer opens trapped chest -> power = 2
+	if _, err := srv.OpenChest(p2, 200, 65, 200); err != nil {
+		t.Fatalf("p2 OpenChest: %v", err)
+	}
+	if got := world.BlockProperties(cache.GetBlock(201, 65, 200))["power"]; got != "2" {
+		t.Fatalf("expected adjacent wire power=2 with 2 viewers, got %q", got)
+	}
+	if got := world.BlockProperties(cache.GetBlock(200, 64, 201))["power"]; got != "2" {
+		t.Fatalf("expected downward strong-powered wire power=2 with 2 viewers, got %q", got)
+	}
+
+	// Clamp check: 20 viewers -> power clamped to 15
+	cache.SetTrappedChestOpenCount(200, 65, 200, 20)
+	if got := world.BlockProperties(cache.GetBlock(201, 65, 200))["power"]; got != "15" {
+		t.Fatalf("expected adjacent wire power=15 when openCount=20, got %q", got)
+	}
+
+	// Close both viewers -> power returns to 0
+	_ = srv.CloseContainer(p1, 0, false)
+	_ = srv.CloseContainer(p2, 0, false)
+	if got := world.BlockProperties(cache.GetBlock(201, 65, 200))["power"]; got != "0" {
+		t.Fatalf("expected adjacent wire power=0 after all viewers close, got %q", got)
+	}
+	if got := world.BlockProperties(cache.GetBlock(200, 64, 201))["power"]; got != "0" {
+		t.Fatalf("expected downward wire power=0 after all viewers close, got %q", got)
+	}
+}
+
+func TestDoubleChestPlacementBreakUIAndComparator(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	stoneSt, _ := world.BlockStateByName("minecraft:stone", nil)
+	for x := 208; x <= 216; x++ {
+		for z := 208; z <= 216; z++ {
+			cache.SetBlock(x, 63, z, stoneSt)
+		}
+	}
+
+	player, _ := addDispenserTestPlayer(t, srv, "ChestBuilder")
+	// Yaw = 0 -> looking south -> chest faces north
+	player.mu.Lock()
+	player.position = [3]float64{210.5, 64.0, 210.5}
+	player.yaw = 0
+	player.pitch = 0
+	player.onGround = true
+	player.mu.Unlock()
+
+	baseChest, _ := world.BlockStateByName("minecraft:chest", nil)
+	// Place first chest at (210, 64, 210) -> single north-facing chest
+	st1, ok := srv.PlaceChestAt(player, 210, 64, 210, baseChest)
+	if !ok {
+		t.Fatal("PlaceChestAt first chest failed")
+	}
+	if props := world.BlockProperties(st1); props["facing"] != "north" || props["type"] != "single" {
+		t.Fatalf("expected first chest facing=north type=single, got %v", props)
+	}
+
+	// Place second chest at (211, 64, 210) (east of first) without sneaking -> pairs into double chest!
+	// For north-facing chests: west (210) has type="left" (connected +X), east (211) has type="right" (connected -X).
+	st2, ok := srv.PlaceChestAt(player, 211, 64, 210, baseChest)
+	if !ok {
+		t.Fatal("PlaceChestAt second chest failed")
+	}
+	if props := world.BlockProperties(st2); props["facing"] != "north" || props["type"] != "right" {
+		t.Fatalf("expected east chest facing=north type=right, got %v", props)
+	}
+	if props := world.BlockProperties(cache.GetBlock(210, 64, 210)); props["type"] != "left" {
+		t.Fatalf("expected west partner chest to update to type=left, got %v", props)
+	}
+
+	// Opening either half opens MenuTypeGeneric9x6 (90 slots), where right (211) is 0..26 and left (210) is 27..53.
+	srv.SetChestSlot(211, 64, 210, 0, world.NewNamedItemStack("minecraft:diamond", 10))
+	srv.SetChestSlot(210, 64, 210, 0, world.NewNamedItemStack("minecraft:emerald", 20))
+
+	cid, err := srv.OpenChest(player, 210, 64, 210)
+	if err != nil || cid == 0 {
+		t.Fatalf("OpenChest on double chest: cid=%d err=%v", cid, err)
+	}
+	open := player.OpenContainer()
+	if open == nil || open.MenuType != MenuTypeGeneric9x6 || !open.HasPartner {
+		t.Fatalf("expected MenuTypeGeneric9x6 with HasPartner=true, got %+v", open)
+	}
+	// Click slot 27 (first slot of left chest = 20 emeralds) to pick it up, and place into slot 1 of right chest.
+	if err := srv.HandleContainerClick(player, cid, 27, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick slot 27: %v", err)
+	}
+	if err := srv.HandleContainerClick(player, cid, 1, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick slot 1: %v", err)
+	}
+	if got := srv.ChestSlots(211, 64, 210)[1]; got.ResolvedID() != "minecraft:emerald" || got.Count != 20 {
+		t.Fatalf("expected 20 emeralds moved to right chest slot 1, got %+v", got)
+	}
+	_ = srv.CloseContainer(player, cid, false)
+
+	// Comparator signal across 54 slots: fill 27 slots of the right chest with 64 cobblestone each.
+	// Across 54 total slots, 27/54 = 0.5 -> floor(0.5 * 14) + 1 = 8 (whereas a 27-slot single chest would be 15).
+	for i := 0; i < 27; i++ {
+		srv.SetChestSlot(211, 64, 210, i, world.NewNamedItemStack("minecraft:cobblestone", 64))
+		srv.SetChestSlot(210, 64, 210, i, world.ItemStack{})
+	}
+	if sig := srv.ContainerComparatorSignalAt(dim, 210, 64, 210); sig != 8 {
+		t.Fatalf("expected double chest comparator signal=8 for 27/54 full slots, got %d", sig)
+	}
+	if sig := srv.ContainerComparatorSignalAt(dim, 211, 64, 210); sig != 8 {
+		t.Fatalf("expected double chest partner comparator signal=8 for 27/54 full slots, got %d", sig)
+	}
+
+	// Solid block above either half blocks opening the double chest.
+	cache.ApplyBlockWithUpdates(211, 65, 210, stoneSt)
+	if _, err := srv.OpenChest(player, 210, 64, 210); err == nil {
+		t.Fatal("expected OpenChest to fail when partner half is blocked by solid block above")
+	}
+	cache.ApplyBlockWithUpdates(211, 65, 210, world.StateAir)
+
+	// Breaking the east half (211, 64, 210) reverts the west half (210, 64, 210) to type="single".
+	cache.BreakBlockWithUpdates(211, 64, 210)
+	if props := world.BlockProperties(cache.GetBlock(210, 64, 210)); props["type"] != "single" {
+		t.Fatalf("expected remaining chest at (210,64,210) to revert to type=single, got %v", props)
+	}
+}
+
+func TestBarrelOpenStateAndEnderChestPerPlayerPersistenceAndBedBreak(t *testing.T) {
+	srv := newBrewingTestServer(t)
+	dim := world.DimensionOverworld
+	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
+
+	stoneSt, _ := world.BlockStateByName("minecraft:stone", nil)
+	barrelSt, ok := world.BlockStateIDByProperties("minecraft:barrel", map[string]string{
+		"facing": "north", "open": "false",
+	})
+	if !ok {
+		t.Fatal("missing minecraft:barrel state")
+	}
+	cache.ApplyBlockWithUpdates(220, 64, 220, barrelSt)
+	// Place a solid stone block directly above the barrel: barrel must still open!
+	cache.ApplyBlockWithUpdates(220, 65, 220, stoneSt)
+
+	p1, _ := addDispenserTestPlayer(t, srv, "BarrelUser1")
+	p2, _ := addDispenserTestPlayer(t, srv, "BarrelUser2")
+
+	opened, cid, err := srv.InteractBlock(p1, 220, 64, 220)
+	if !opened || err != nil || cid == 0 {
+		t.Fatalf("expected barrel to open even with solid stone above, opened=%v cid=%d err=%v", opened, cid, err)
+	}
+	if got := world.BlockProperties(cache.GetBlock(220, 64, 220))["open"]; got != "true" {
+		t.Fatalf("expected barrel open=true while viewed, got %q", got)
+	}
+	_ = srv.CloseContainer(p1, cid, false)
+	if got := world.BlockProperties(cache.GetBlock(220, 64, 220))["open"]; got != "false" {
+		t.Fatalf("expected barrel open=false after viewer closes, got %q", got)
+	}
+
+	// Ender chest at (225, 64, 225): blocked when stone is above, per-player isolated, and persisted in PlayerData.
+	enderSt, ok := world.BlockStateIDByProperties("minecraft:ender_chest", map[string]string{
+		"facing": "north", "waterlogged": "false",
+	})
+	if !ok {
+		t.Fatal("missing minecraft:ender_chest state")
+	}
+	cache.ApplyBlockWithUpdates(225, 64, 225, enderSt)
+	cache.ApplyBlockWithUpdates(225, 65, 225, stoneSt)
+	if _, err := srv.OpenEnderChest(p1, 225, 64, 225); err == nil {
+		t.Fatal("expected OpenEnderChest to be blocked by conductive stone above")
+	}
+	cache.ApplyBlockWithUpdates(225, 65, 225, world.StateAir)
+
+	ecID1, err := srv.OpenEnderChest(p1, 225, 64, 225)
+	if err != nil || ecID1 == 0 {
+		t.Fatalf("p1 OpenEnderChest: %v", err)
+	}
+	p1.SetCarriedItem(world.NewNamedItemStack("minecraft:nether_star", 3))
+	if err := srv.HandleContainerClick(p1, ecID1, 0, 0, ContainerInputPickup); err != nil {
+		t.Fatalf("p1 ender chest click: %v", err)
+	}
+	_ = srv.CloseContainer(p1, ecID1, false)
+
+	// p2 opens the same ender_chest block -> sees empty slot 0
+	ecID2, err := srv.OpenEnderChest(p2, 225, 64, 225)
+	if err != nil || ecID2 == 0 {
+		t.Fatalf("p2 OpenEnderChest: %v", err)
+	}
+	if !p2.EnderChestSlot(0).IsEmpty() {
+		t.Fatalf("expected p2 ender chest slot 0 to be empty, got %+v", p2.EnderChestSlot(0))
+	}
+	_ = srv.CloseContainer(p2, ecID2, false)
+
+	// PlayerData NBT round-trip for p1 preserves EnderItems
+	rawNBT, err := world.MarshalPlayerDataNBT(p1.PlayerData())
+	if err != nil {
+		t.Fatalf("MarshalPlayerDataNBT: %v", err)
+	}
+	decodedPD, err := world.UnmarshalPlayerDataNBT(rawNBT)
+	if err != nil {
+		t.Fatalf("UnmarshalPlayerDataNBT: %v", err)
+	}
+	pRestored, _ := addDispenserTestPlayer(t, srv, "RestoredEnderUser")
+	pRestored.ApplyPlayerData(decodedPD)
+	if got := pRestored.EnderChestSlot(0); got.ResolvedID() != "minecraft:nether_star" || got.Count != 3 {
+		t.Fatalf("expected restored EnderItems[0] = 3 nether_star, got %+v", got)
+	}
+
+	// Bed multi-block partner break: breaking the head half removes the foot half.
+	footSt, _ := world.BlockStateIDByProperties("minecraft:red_bed", map[string]string{
+		"facing": "north", "occupied": "false", "part": "foot",
+	})
+	headSt, _ := world.BlockStateIDByProperties("minecraft:red_bed", map[string]string{
+		"facing": "north", "occupied": "false", "part": "head",
+	})
+	cache.SetBlock(230, 63, 230, stoneSt)
+	cache.SetBlock(230, 63, 229, stoneSt)
+	cache.SetBlock(230, 64, 230, footSt)
+	cache.SetBlock(230, 64, 229, headSt)
+	cache.BreakBlockWithUpdates(230, 64, 229)
+	if got := cache.GetBlock(230, 64, 230); got != world.StateAir {
+		t.Fatalf("expected breaking bed head at (230,64,229) to break foot partner at (230,64,230), got state %d (%s)", got, world.BlockName(got))
+	}
+}
+
+

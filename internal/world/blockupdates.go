@@ -791,6 +791,55 @@ func (c *Cache) propagateMultiBlockPartnerBreak(x, y, z int, brokenState uint16,
 		}
 		return
 	}
+	if IsPairableChestBlock(brokenState) {
+		trappedChestOpenCounts.Delete(trappedChestOpenKey{c: c, x: x, y: y, z: z})
+		if info.Name == "minecraft:trapped_chest" && y-1 >= MinY {
+			belowSt := c.GetBlock(x, y-1, z)
+			c.propagateRedstoneAround(x, y-1, z, belowSt, belowSt, res)
+		}
+		chestType := info.Properties["type"]
+		facing := info.Properties["facing"]
+		if dx, dz, _, ok := DoubleChestConnectedOffset(facing, chestType); ok {
+			px, py, pz := x+dx, y, z+dz
+			pState := c.GetBlock(px, py, pz)
+			if sameChestFamily(brokenState, pState) {
+				if pInfo, ok := stateByID(pState); ok && pInfo.Properties["facing"] == facing {
+					wantPartnerType := "right"
+					if chestType == "right" {
+						wantPartnerType = "left"
+					}
+					if pInfo.Properties["type"] == wantPartnerType {
+						if singleSt, ok := withStateProperty(pState, "type", "single"); ok {
+							if c.setBlockRecorded(px, py, pz, singleSt, res) {
+								c.propagateRedstoneAround(px, py, pz, pState, singleSt, res)
+							}
+						}
+					}
+				}
+			}
+		}
+		return
+	}
+	if strings.HasSuffix(info.Name, "_bed") {
+		part := info.Properties["part"]
+		facing := info.Properties["facing"]
+		if dx, _, dz, ok := directionOffset3D(facing); ok && (part == "foot" || part == "head") {
+			px, pz := x+dx, z+dz
+			wantPartnerPart := "head"
+			if part == "head" {
+				px, pz = x-dx, z-dz
+				wantPartnerPart = "foot"
+			}
+			pState := c.GetBlock(px, y, pz)
+			if pInfo, ok := stateByID(pState); ok && pInfo.Name == info.Name && pInfo.Properties["part"] == wantPartnerPart {
+				if c.setBlockRecorded(px, y, pz, StateAir, res) {
+					c.scheduleAround(px, y, pz)
+					c.propagateRedstoneAround(px, y, pz, pState, StateAir, res)
+				}
+			}
+		}
+		return
+	}
 	half := info.Properties["half"]
 	if half != "lower" && half != "upper" {
 		return

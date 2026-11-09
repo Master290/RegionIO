@@ -1087,6 +1087,7 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	}
 	session.hasSpawn = d.HasSpawn
 	session.mu.Unlock()
+	session.SetEnderChestSlots(d.EnderItems)
 
 	effRoot := nbt.NewCompound()
 	if d.ActiveEffects != nil {
@@ -1549,6 +1550,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		pst.mu.Unlock()
 	}
 	abilities := session.Abilities()
+	enderItems := session.EnderChestSlots()
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -1569,6 +1571,7 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		XpSeed:             xpSeed,
 		SelectedSlot:       session.selectedSlot,
 		Inventory:          session.inventory,
+		EnderItems:         enderItems,
 		SpawnX:             session.spawnX,
 		SpawnY:             session.spawnY,
 		SpawnZ:             session.spawnZ,
