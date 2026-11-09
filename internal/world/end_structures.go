@@ -422,6 +422,7 @@ func PlaceEndCity(c *Chunk, start *EndCityStart, cx, cz int32) {
 	if !start.Box.intersects(chunkBox) {
 		return
 	}
+	recordStructureStartInChunk(c, endCityStartRecord(start))
 	for _, piece := range start.Pieces {
 		if len(piece.Blocks) == 0 || !piece.Box.intersects(chunkBox) {
 			continue

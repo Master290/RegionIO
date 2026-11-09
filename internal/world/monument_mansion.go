@@ -1737,6 +1737,7 @@ func PlaceOceanMonumentsForChunk(region *decorationRegion, starts []*OceanMonume
 		for _, cand := range candidates {
 			if cand.key == key {
 				postProcessOceanMonument(region, cand.start, chunkBox, random)
+				recordStructureStartInRegion(region, oceanMonumentStartRecord(cand.start))
 				break
 			}
 		}
@@ -3212,6 +3213,7 @@ func PlaceWoodlandMansionsForChunk(region *decorationRegion, starts []*WoodlandM
 					}
 				}
 				afterPlaceWoodlandMansion(region, cand.start, chunkBox)
+				recordStructureStartInRegion(region, woodlandMansionStartRecord(cand.start))
 				break
 			}
 		}

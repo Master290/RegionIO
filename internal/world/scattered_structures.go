@@ -596,6 +596,7 @@ func PlaceIgloosForChunk(region *decorationRegion, starts []*IglooStart, seed in
 						placeIglooPieceInChunk(region, piece, chunkBox, random)
 					}
 				}
+				recordStructureStartInRegion(region, iglooStartRecord(cand.start))
 				break
 			}
 		}
@@ -764,6 +765,7 @@ func PlaceSwampHutsForChunk(region *decorationRegion, starts []*SwampHutStart, s
 		for _, cand := range candidates {
 			if cand.key == key {
 				postProcessSwampHut(region, &cand.start.Piece, chunkBox)
+				recordStructureStartInRegion(region, swampHutStartRecord(cand.start))
 				break
 			}
 		}
@@ -1256,6 +1258,7 @@ func PlaceDesertPyramidsForChunk(region *decorationRegion, starts []*DesertPyram
 			if cand.key == key {
 				postProcessDesertPyramid(region, cand.start, chunkBox, random, seed)
 				afterPlaceDesertPyramid(region, cand.start, chunkBox, seed)
+				recordStructureStartInRegion(region, desertPyramidStartRecord(cand.start))
 				break
 			}
 		}
@@ -1596,6 +1599,7 @@ func PlaceJungleTemplesForChunk(region *decorationRegion, starts []*JungleTemple
 		for _, cand := range candidates {
 			if cand.key == key {
 				postProcessJungleTemple(region, cand.start, chunkBox, random)
+				recordStructureStartInRegion(region, jungleTempleStartRecord(cand.start))
 				break
 			}
 		}

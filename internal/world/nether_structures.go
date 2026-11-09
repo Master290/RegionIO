@@ -211,6 +211,7 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 	if !stub.Box.intersects(chunkBox) {
 		return 0
 	}
+	recordStructureStartInChunk(c, netherFossilStartRecord(stub))
 	blocks, _, err := loadTemplateCached(stub.Template)
 	if err != nil {
 		return 0
@@ -855,6 +856,7 @@ func PlaceNetherFortress(c *Chunk, start *NetherFortressStart, cx, cz int32) {
 			piece.postProcess(c, chunkBox)
 		}
 	}
+	recordStructureStartInChunk(c, netherFortressStartRecord(start))
 }
 
 func (p *NetherFortressPiece) postProcess(c *Chunk, chunkBox msBox) {

@@ -135,13 +135,22 @@ type RuinedPortalSetup struct {
 	Weight                float32 `json:"weight"`
 }
 
+// StructureSpawnOverride mirrors net.minecraft.world.level.levelgen.structure.StructureSpawnOverride:
+// BoundingBox is "piece" or "full", and Spawns is the weighted list of mob spawner entries
+// (empty slice suppresses natural spawning of that category inside the bounding box).
+type StructureSpawnOverride struct {
+	BoundingBox string             `json:"bounding_box"`
+	Spawns      []BiomeSpawnerData `json:"spawns"`
+}
+
 // StructureDef is one entry of data/minecraft/worldgen/structure.
 type StructureDef struct {
-	Name              string              `json:"-"`
-	Type              string              `json:"type"`
-	Biomes            string              `json:"biomes"`
-	Step              string              `json:"step"`
-	TerrainAdaptation string              `json:"terrain_adaptation"`
+	Name              string                            `json:"-"`
+	Type              string                            `json:"type"`
+	Biomes            string                            `json:"biomes"`
+	Step              string                            `json:"step"`
+	TerrainAdaptation string                            `json:"terrain_adaptation"`
+	SpawnOverrides    map[string]StructureSpawnOverride `json:"spawn_overrides"`
 	// BiomeTemp is the ocean-ruin variant discriminator: "cold" | "warm".
 	BiomeTemp          string              `json:"biome_temp"`
 	LargeProbability   float32             `json:"large_probability"`
@@ -214,26 +223,27 @@ func (d *StructureDef) SampleStartHeight(random RandomSource) int {
 
 func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 	var doc struct {
-		Type                    string              `json:"type"`
-		Biomes                  string              `json:"biomes"`
-		Step                    string              `json:"step"`
-		TerrainAdaptation       string              `json:"terrain_adaptation"`
-		BiomeTemp               string              `json:"biome_temp"`
-		LargeProbability        float32             `json:"large_probability"`
-		ClusterProbability      float32             `json:"cluster_probability"`
-		MineshaftType           string              `json:"mineshaft_type"`
-		IsBeached               bool                `json:"is_beached"`
-		Setups                  []RuinedPortalSetup `json:"setups"`
-		StartPool               string              `json:"start_pool"`
-		StartJigsawName         string              `json:"start_jigsaw_name"`
-		Size                    int                 `json:"size"`
-		MaxDistanceFromCenter   int                 `json:"max_distance_from_center"`
-		ProjectStartToHeightmap string              `json:"project_start_to_heightmap"`
-		UseExpansionHack        bool                `json:"use_expansion_hack"`
-		StartHeight             json.RawMessage     `json:"start_height"`
-		DimensionPadding        int                 `json:"dimension_padding"`
-		LiquidSettings          string              `json:"liquid_settings"`
-		PoolAliases             json.RawMessage     `json:"pool_aliases"`
+		Type                    string                            `json:"type"`
+		Biomes                  string                            `json:"biomes"`
+		Step                    string                            `json:"step"`
+		TerrainAdaptation       string                            `json:"terrain_adaptation"`
+		SpawnOverrides          map[string]StructureSpawnOverride `json:"spawn_overrides"`
+		BiomeTemp               string                            `json:"biome_temp"`
+		LargeProbability        float32                           `json:"large_probability"`
+		ClusterProbability      float32                           `json:"cluster_probability"`
+		MineshaftType           string                            `json:"mineshaft_type"`
+		IsBeached               bool                              `json:"is_beached"`
+		Setups                  []RuinedPortalSetup               `json:"setups"`
+		StartPool               string                            `json:"start_pool"`
+		StartJigsawName         string                            `json:"start_jigsaw_name"`
+		Size                    int                               `json:"size"`
+		MaxDistanceFromCenter   int                               `json:"max_distance_from_center"`
+		ProjectStartToHeightmap string                            `json:"project_start_to_heightmap"`
+		UseExpansionHack        bool                              `json:"use_expansion_hack"`
+		StartHeight             json.RawMessage                   `json:"start_height"`
+		DimensionPadding        int                               `json:"dimension_padding"`
+		LiquidSettings          string                            `json:"liquid_settings"`
+		PoolAliases             json.RawMessage                   `json:"pool_aliases"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
@@ -245,6 +255,7 @@ func decodeStructureDef(name string, raw []byte) (*StructureDef, error) {
 		Biomes:                  strings.TrimPrefix(doc.Biomes, "minecraft:"),
 		Step:                    doc.Step,
 		TerrainAdaptation:       doc.TerrainAdaptation,
+		SpawnOverrides:          doc.SpawnOverrides,
 		Setups:                  doc.Setups,
 		BiomeTemp:               doc.BiomeTemp,
 		LargeProbability:        doc.LargeProbability,

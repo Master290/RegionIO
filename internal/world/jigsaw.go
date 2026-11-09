@@ -1942,6 +1942,7 @@ func PlaceJigsawStartsForChunk(region *decorationRegion, starts []*JigsawStart, 
 		if !msBoxesIntersect(st.Box, chunkBox) {
 			continue
 		}
+		recordStructureStartInRegion(region, jigsawStartRecord(st))
 		hasIntersecting := false
 		for _, p := range st.Pieces {
 			if msBoxesIntersect(p.Box, chunkBox) {
@@ -1972,6 +1973,7 @@ func PlaceJigsawStartsForChunk(region *decorationRegion, starts []*JigsawStart, 
 					}
 					placeJigsawElementInChunk(region, reg, fs, piece.Element, piece.Pos, piece.Rotation, chunkBox, random, piece.LiquidSettings)
 				}
+				recordStructureStartInRegion(region, jigsawStartRecord(cand.start))
 				break
 			}
 		}

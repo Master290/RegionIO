@@ -95,12 +95,15 @@ type Chunk struct {
 	biome          uint16 // fallback uniform biome when biomes[si] is nil
 
 	// Custom dimension vertical bounds (when customBounds is true, e.g. Nether/End 0..256).
-	customBounds  bool
-	dimMinY       int
-	dimHeight     int
-	noSkylight    bool
-	blockEntities []StructureBlockEntity
-	entities      []StructureEntity
+	customBounds       bool
+	dimMinY            int
+	dimHeight          int
+	noSkylight         bool
+	blockEntities      []StructureBlockEntity
+	entities           []StructureEntity
+	structureStarts    []StructureStartRecord
+	intersectingStarts []StructureStartRecord
+	structureRefs      map[string][][2]int32
 }
 
 func (c *Chunk) minY() int {
@@ -347,6 +350,20 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 	if len(c.entities) > 0 {
 		clone.entities = make([]StructureEntity, len(c.entities))
 		copy(clone.entities, c.entities)
+	}
+	if len(c.structureStarts) > 0 {
+		clone.structureStarts = cloneStructureStarts(c.structureStarts)
+	}
+	if len(c.intersectingStarts) > 0 {
+		clone.intersectingStarts = cloneStructureStarts(c.intersectingStarts)
+	}
+	if len(c.structureRefs) > 0 {
+		clone.structureRefs = make(map[string][][2]int32, len(c.structureRefs))
+		for k, v := range c.structureRefs {
+			cp := make([][2]int32, len(v))
+			copy(cp, v)
+			clone.structureRefs[k] = cp
+		}
 	}
 	return clone, revision
 }

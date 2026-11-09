@@ -289,6 +289,7 @@ func PlaceShipwrecksForChunk(region *decorationRegion, starts []*ShipwreckStart,
 		for _, cand := range candidates {
 			if cand.key == key {
 				placeShipwreckInChunk(region, cand.start, chunkBox, random)
+				recordStructureStartInRegion(region, shipwreckStartRecord(cand.start))
 				break
 			}
 		}
@@ -354,6 +355,7 @@ func BuriedTreasureGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen
 // PlaceBuriedTreasureInChunk executes BuriedTreasurePiece.postProcess for chunk (chunkX, chunkZ).
 func PlaceBuriedTreasureInChunk(region *decorationRegion, seed int64, chunkX, chunkZ int32) {
 	initBuriedTreasureStates()
+	recordStructureStartInRegion(region, buriedTreasureStartRecord(chunkX, chunkZ))
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
 	random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep("minecraft:buried_treasure"), 3)
 

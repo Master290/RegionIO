@@ -27,16 +27,17 @@ var ruinedPortalGiants = []string{
 
 // RuinedPortalStub is everything findGenerationPoint decides.
 type RuinedPortalStub struct {
-	X, Y, Z    int
-	Template   string
-	Rotation   int // none, cw90, cw180, ccw90
-	Mirror     string
-	AirPocket  bool
-	Mossiness  float32
-	Overgrown  bool
-	Vines      bool
-	Cold       bool // resolved by the caller; needs the biome at the stub
-	Blackstone bool
+	StructureName string
+	X, Y, Z       int
+	Template      string
+	Rotation      int // none, cw90, cw180, ccw90
+	Mirror        string
+	AirPocket     bool
+	Mossiness     float32
+	Overgrown     bool
+	Vines         bool
+	Cold          bool // resolved by the caller; needs the biome at the stub
+	Blackstone    bool
 	// Placement is the setup's placement key (on_land_surface,
 	// on_ocean_floor, partly_buried, ...); spreadNetherrack runs only for
 	// the surface placements.
@@ -255,6 +256,7 @@ func RuinedPortalGenerationPoint(od *worldgen.OverworldDensity, sets *worldgen.S
 		variantRandom.SetLargeFeatureSeed(seed, int(sx), int(sz))
 		stub := ruinedPortalVariantPoint(od, sets, seed, sx, sz, def, &variantRandom)
 		if stub != nil {
+			stub.StructureName = normalizeResourceID(set.Structures[entry].Structure)
 			return stub, nil
 		}
 		// Vanilla removes the failed entry and redraws from the pick stream.

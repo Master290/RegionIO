@@ -33,10 +33,10 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-// Version 54: Overworld spawn_target Climate.SpawnFinder + PlayerSpawnFinder,
-// biome spawn tables (spawners, spawn_costs, creature_spawn_probability),
-// structure/biome locate and heightmap/lighting/generation-order parity (vanilla 26.1.2).
-const generatorVersion = 54
+// Version 55: StructureStart and References Anvil NBT persistence,
+// spawn_overrides parsing and NaturalSpawner.mobsAt + isInNetherFortressBounds
+// structure spawn overrides parity across all 34 vanilla structures (vanilla 26.1.2).
+const generatorVersion = 55
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.
@@ -415,7 +415,7 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 	root.Set("Heightmaps", buildHeightmaps(c))
 	// Required-but-empty fields so vanilla loads the chunk without complaints.
 	root.Set("block_entities", structureBlockEntitiesToNBT(c))
-	root.Set("structures", nbt.NewCompound())
+	root.Set("structures", structuresToNBT(c))
 
 	return root
 }
@@ -646,6 +646,7 @@ func nbtToChunkVersioned(root *nbt.Compound, regionX, regionZ, localX, localZ in
 		readLightSection(c, si, sc)
 	}
 	structureBlockEntitiesFromNBT(c, root)
+	structuresFromNBT(c, root)
 	return c, nil
 }
 

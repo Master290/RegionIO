@@ -723,6 +723,7 @@ func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart,
 			if st.Box != (msBox{}) && !msBoxesIntersect(st.Box, chunkBox) {
 				continue
 			}
+			recordStructureStartInRegion(region, mineshaftStartRecord(st))
 			hasIntersectingPiece := false
 			for _, p := range st.Pieces {
 				if msBoxesIntersect(p.box, chunkBox) {
@@ -759,6 +760,7 @@ func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart,
 						}
 						msPostProcess(ctx, piece, random)
 					}
+					recordStructureStartInRegion(region, mineshaftStartRecord(c.start))
 					break
 				}
 			}

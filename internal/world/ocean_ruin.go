@@ -325,6 +325,7 @@ func PlaceOceanRuinPieces(region *decorationRegion, random *worldgen.Legacy, stu
 		written = append(written, w...)
 	}
 	applyOceanRuinPhysics(region, written)
+	recordStructureStartInRegion(region, oceanRuinStartRecord(stub))
 	return nil
 }
 

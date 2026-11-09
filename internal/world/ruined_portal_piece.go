@@ -93,6 +93,7 @@ func PlaceRuinedPortalPiece(region *decorationRegion, stub *RuinedPortalStub, se
 	// In Vanilla RuinedPortalPiece.postProcess:
 	// if (!chunkBox.isInside(templateBox.getCenter())) return;
 	// Exactly one chunk contains templateBox.getCenter() and runs postProcess.
+	recordStructureStartInRegion(region, ruinedPortalStartRecord(stub))
 	if region.chunks[[2]int32{portalChunkX, portalChunkZ}] == nil {
 		return nil
 	}

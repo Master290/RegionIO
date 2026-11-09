@@ -1570,6 +1570,7 @@ func PlaceStrongholdsForChunk(region *decorationRegion, starts []*StrongholdStar
 					}
 					shPostProcess(ctx, piece, random)
 				}
+				recordStructureStartInRegion(region, strongholdStartRecord(cand.start))
 				break
 			}
 		}
