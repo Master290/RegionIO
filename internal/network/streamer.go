@@ -33,9 +33,10 @@ type streamer struct {
 
 	recenter chan recenterReq
 
-	switchMu     sync.Mutex
-	pendingCache *world.Cache
-	resetPending bool
+	switchMu          sync.Mutex
+	pendingCache      *world.Cache
+	resetPending      bool
+	pendingViewRadius int
 
 	// The loaded-set and current center are owned solely by the streamer's run
 	// goroutine — no other goroutine reads or writes them.
@@ -133,17 +134,42 @@ func (s *streamer) switchDimension(cache *world.Cache, cx, cz int32) {
 	s.requestRecenter(cx, cz)
 }
 
+// setViewDistance updates the streamer's viewRadius dynamically on the fly and
+// queues a recenter on (cx, cz) so newly in-range chunks are streamed and
+// out-of-range chunks receive PlayForgetLevelChunk.
+func (s *streamer) setViewDistance(viewDistance int, cx, cz int32) {
+	if s == nil {
+		return
+	}
+	if viewDistance < 2 {
+		viewDistance = defaultViewRadius
+	}
+	if viewDistance > 16 {
+		viewDistance = 16
+	}
+	s.switchMu.Lock()
+	s.pendingViewRadius = viewDistance
+	s.switchMu.Unlock()
+	s.requestRecenter(cx, cz)
+}
+
 func (s *streamer) hasPendingSwitch() bool {
 	s.switchMu.Lock()
-	pending := s.resetPending
+	pending := s.resetPending || s.pendingViewRadius > 0
 	s.switchMu.Unlock()
 	return pending
 }
 
 func (s *streamer) applyPendingSwitch() {
 	s.switchMu.Lock()
+	newViewRadius := s.pendingViewRadius
+	s.pendingViewRadius = 0
 	if !s.resetPending {
 		s.switchMu.Unlock()
+		if newViewRadius > 0 {
+			s.viewRadius = newViewRadius
+			s.genRadius = newViewRadius + 1
+		}
 		return
 	}
 	newCache := s.pendingCache
@@ -151,6 +177,10 @@ func (s *streamer) applyPendingSwitch() {
 	s.resetPending = false
 	s.switchMu.Unlock()
 
+	if newViewRadius > 0 {
+		s.viewRadius = newViewRadius
+		s.genRadius = newViewRadius + 1
+	}
 	if s.tickets != nil {
 		s.tickets.Close()
 		s.tickets = nil
@@ -352,6 +382,9 @@ func (s *streamer) latestRecenter() (recenterReq, bool) {
 		case latest = <-s.recenter:
 			found = true
 		default:
+			if found && s.hasCenter && latest.cx == s.centerX && latest.cz == s.centerZ && !s.hasPendingSwitch() {
+				return recenterReq{}, false
+			}
 			return latest, found
 		}
 	}
