@@ -46,9 +46,65 @@ type handler struct {
 	keepAliveID      int64
 	keepAliveSent    time.Time
 
+	rateLimitMaxPerSec int
+	rateWindowStart    time.Time
+	ratePacketCount    int
+	chatRateLimit      bool
+	chatSpamPoints     int
+	lastChatAt         time.Time
+
 	// Creative inventory state for block placement.
 	heldSlot int32    // selected hotbar index (0-8)
 	hotbar   [9]int32 // item network IDs per hotbar slot (-1 = empty)
+}
+
+var (
+	// ErrPacketRateLimitExceeded is returned when a connection exceeds its configured packet rate limit.
+	ErrPacketRateLimitExceeded = errors.New("network: packet rate limit exceeded")
+	// ErrChatSpamDisconnect is returned when a player exceeds the vanilla chat/command spam threshold.
+	ErrChatSpamDisconnect = errors.New("network: disconnect.spam")
+)
+
+func (h *handler) checkPacketRateLimit(now time.Time) error {
+	if h == nil || h.rateLimitMaxPerSec <= 0 {
+		return nil
+	}
+	if h.rateWindowStart.IsZero() || now.Sub(h.rateWindowStart) >= time.Second {
+		h.rateWindowStart = now
+		h.ratePacketCount = 0
+	}
+	h.ratePacketCount++
+	if h.ratePacketCount > h.rateLimitMaxPerSec {
+		if h.conn != nil && h.conn.State() == protocol.StatePlay {
+			_ = h.conn.Send(protocol.PlayDisconnect, server.EncodeDisconnectPacket(server.TranslatableComponent("disconnect.exceeded_packet_rate")))
+		}
+		return ErrPacketRateLimitExceeded
+	}
+	return nil
+}
+
+func (h *handler) checkChatRateLimit(now time.Time) error {
+	if h == nil || !h.chatRateLimit {
+		return nil
+	}
+	if !h.lastChatAt.IsZero() {
+		elapsedTicks := int(now.Sub(h.lastChatAt) / (50 * time.Millisecond))
+		if elapsedTicks > 0 {
+			h.chatSpamPoints -= elapsedTicks
+			if h.chatSpamPoints < 0 {
+				h.chatSpamPoints = 0
+			}
+		}
+	}
+	h.lastChatAt = now
+	h.chatSpamPoints += 20
+	if h.chatSpamPoints > 200 {
+		if h.conn != nil && h.conn.State() == protocol.StatePlay {
+			_ = h.conn.Send(protocol.PlayDisconnect, server.EncodeDisconnectPacket(server.TranslatableComponent("disconnect.spam")))
+		}
+		return ErrChatSpamDisconnect
+	}
+	return nil
 }
 
 // serve runs the read/dispatch loop for a single connection. It owns the

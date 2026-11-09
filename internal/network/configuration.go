@@ -2,6 +2,7 @@ package network
 
 import (
 	"errors"
+	"math"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -144,6 +145,15 @@ func (h *handler) handleClientInformation(pkt protocol.Packet) error {
 	pendingHandlerClientInfo.Store(h, info)
 	if h.srv != nil && h.session != nil {
 		h.srv.SetPlayerClientInformation(h.session, info, h.conn != nil && h.conn.State() == protocol.StatePlay)
+	}
+	if h.streamer != nil {
+		var cx, cz int32
+		if h.session != nil {
+			snap := h.session.Snapshot()
+			cx = int32(int64(math.Floor(snap.X)) >> 4)
+			cz = int32(int64(math.Floor(snap.Z)) >> 4)
+		}
+		h.streamer.setViewDistance(vdInt, cx, cz)
 	}
 
 	h.log.Info("client information",
