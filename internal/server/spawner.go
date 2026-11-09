@@ -575,7 +575,9 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 
 		if exploded {
 			delete(t.mobStates, snapshot.ID)
+			t.mu.Unlock()
 			s.TriggerCreeperExplosion(snapshot.ID, nextX, nextY, nextZ)
+			t.mu.Lock()
 			continue
 		}
 

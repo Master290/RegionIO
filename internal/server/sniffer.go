@@ -17,36 +17,61 @@ const (
 	MobTypeSniffer      = "minecraft:sniffer"
 	EntityTypeSnifferID = 119
 
-	DefaultSnifferMaxHealth float32 = 14.0
-	SnifferWanderSpeed      float64 = 0.08
-	SnifferSearchSpeed      float64 = 0.095
-	SnifferHealAmount       float32 = 2.0
+	DefaultSnifferMaxHealth        float32 = 14.0
+	SnifferMovementSpeed           float64 = 0.1
+	SnifferSearchSpeedMultiplier   float64 = 1.25
+	SnifferWanderSpeed             float64 = 0.08
+	SnifferSearchSpeed             float64 = 0.095
+	SnifferHealAmount              float32 = 2.0
+	SnifferDeathXP                 int     = 2
+	SnifferMaxHeadYRot             int     = 50
+	SnifferWidth                   float64 = 1.9
+	SnifferHeight                  float64 = 1.75
+	SnifferEyeHeight               float64 = 1.05
+	SnifferDiggingWidth            float64 = 1.9
+	SnifferDiggingHeight           float64 = 1.35 // 1.75 - 0.4
+	SnifferDiggingEyeHeight        float64 = 0.81
+	SnifferBabyScale               float64 = 0.45
+	SnifferHeadForwardOffset       float64 = 2.25
+	SnifferHeadVerticalOffset      float64 = 0.2
+	SnifferBabyScentingPitch       float32 = 1.3
+	SnifferAdultScentingPitch      float32 = 1.0
+	EntityEventSnifferDigging      byte    = 63
+	LevelEventSnifferEggMossPlace  int32   = 3009
+	SnifferEggRandomHatchOffsetMax int     = 300
 
 	// Snifflet (baby sniffer) takes 40 minutes (-48000 ticks, twice normal baby duration) to mature.
 	SniffletGrowthTicks = -48000
 
-	// Sniffer scenting, searching, and digging cycle constants (in ticks at 20 TPS).
-	SnifferSniffCooldownTicks     = 9600 // 8 minutes between digs
-	SnifferScentingDurationTicks  = 160  // 8.0s scenting animation
-	SnifferSearchingMaxTicks      = 400  // 20.0s max walk time to target dig block
-	SnifferDiggingDurationTicks   = 160  // 8.0s digging animation
-	SnifferDigSeedDropTick        = 120  // 6.0s into digging when seed pops out
-	SnifferRisingDurationTicks    = 40   // 2.0s rising/happy animation after dig
-	SnifferSearchHorizontalRadius = 20
-	SnifferSearchVerticalRadius   = 3
-	SnifferExploredMemoryLimit    = 20
+	// Sniffer scenting, sniffing, searching, digging, rising, and feeling_happy constants (in ticks at 20 TPS).
+	SnifferSniffCooldownTicks       = 9600 // 8 minutes between digs
+	SnifferScentingMinDurationTicks = 40   // SnifferAi$Scenting min duration (2.0s)
+	SnifferScentingMaxDurationTicks = 80   // SnifferAi$Scenting max duration (4.0s)
+	SnifferSniffingMinDurationTicks = 40   // SnifferAi$Sniffing min duration (2.0s)
+	SnifferSniffingMaxDurationTicks = 80   // SnifferAi$Sniffing max duration (4.0s)
+	SnifferScentingDurationTicks    = 160  // combined scenting (80t) + sniffing (80t) pre-search duration
+	SnifferSearchingMaxTicks        = 400  // 20.0s max walk time to target dig block
+	SnifferDiggingDurationTicks     = 160  // 8.0s digging animation (160..180 in SnifferAi$Digging)
+	SnifferDiggingMaxDurationTicks  = 180
+	SnifferDigSeedDropTick          = 120 // 6.0s into digging when seed pops out (DIGGING_DROP_SEED_OFFSET_TICKS)
+	SnifferRisingDurationTicks      = 40  // 2.0s rising animation after dig (SnifferAi$FinishedDigging)
+	SnifferHappyMinDurationTicks    = 40  // SnifferAi$FeelingHappy min duration (2.0s)
+	SnifferHappyMaxDurationTicks    = 100 // SnifferAi$FeelingHappy max duration (5.0s)
+	SnifferSearchHorizontalRadius   = 20
+	SnifferSearchVerticalRadius     = 3
+	SnifferExploredMemoryLimit      = 20
 
 	// Sniffer Egg block & hatching constants.
-	SnifferEggBlockName              = "minecraft:sniffer_egg"
-	SnifferEggItemID                 = "minecraft:sniffer_egg"
-	TorchflowerSeedsItemID           = "minecraft:torchflower_seeds"
-	PitcherPodItemID                 = "minecraft:pitcher_pod"
-	MossBlockName                    = "minecraft:moss_block"
-	SnifferEggMaxHatchStage          = 2
-	SnifferEggNormalStageTicks       = 8000  // ~6m40s per stage -> 24000 ticks (~20m) total
-	SnifferEggMossBoostedStageTicks  = 4000  // ~3m20s per stage -> 12000 ticks (~10m) total on moss_block
-	SnifferEggNormalTotalHatchTicks  = 24000 // 3 stages * 8000 ticks
-	SnifferEggMossBoostedTotalTicks  = 12000 // 3 stages * 4000 ticks
+	SnifferEggBlockName             = "minecraft:sniffer_egg"
+	SnifferEggItemID                = "minecraft:sniffer_egg"
+	TorchflowerSeedsItemID          = "minecraft:torchflower_seeds"
+	PitcherPodItemID                = "minecraft:pitcher_pod"
+	MossBlockName                   = "minecraft:moss_block"
+	SnifferEggMaxHatchStage         = 2
+	SnifferEggNormalStageTicks      = 8000  // ~6m40s per stage -> 24000 ticks (~20m) total
+	SnifferEggMossBoostedStageTicks = 4000  // ~3m20s per stage -> 12000 ticks (~10m) total on moss_block
+	SnifferEggNormalTotalHatchTicks = 24000 // 3 stages * 8000 ticks
+	SnifferEggMossBoostedTotalTicks = 12000 // 3 stages * 4000 ticks
 
 	// SynchedEntityData indices and serializers for Sniffer in 26.1.2 (protocol 775).
 	EntityDataSnifferStateID          byte  = 17 // Sniffer.DATA_STATE (SNIFFER_STATE serializer = 26)
@@ -64,6 +89,7 @@ const (
 	SoundSnifferSearching    = "minecraft:entity.sniffer.searching"
 	SoundSnifferDiggingStart = "minecraft:entity.sniffer.digging_start"
 	SoundSnifferDigging      = "minecraft:entity.sniffer.digging"
+	SoundSnifferDiggingStop  = "minecraft:entity.sniffer.digging_stop"
 	SoundSnifferDropSeed     = "minecraft:entity.sniffer.drop_seed"
 	SoundSnifferHappy        = "minecraft:entity.sniffer.happy"
 	SoundSnifferEggPlop      = "minecraft:block.sniffer_egg.plop"
@@ -128,6 +154,81 @@ func (s *Server) snifferManager() *serverSnifferManager {
 		eggs:     make(map[snifferEggPosKey]*SnifferEggTrackerState),
 	})
 	return actual.(*serverSnifferManager)
+}
+
+// SnifferStateName returns the vanilla name for a SnifferState ordinal.
+func SnifferStateName(state SnifferState) string {
+	switch state {
+	case SnifferStateFeelingHappy:
+		return "feeling_happy"
+	case SnifferStateScenting:
+		return "scenting"
+	case SnifferStateSniffing:
+		return "sniffing"
+	case SnifferStateSearching:
+		return "searching"
+	case SnifferStateDigging:
+		return "digging"
+	case SnifferStateRising:
+		return "rising"
+	default:
+		return "idling"
+	}
+}
+
+// SnifferDimensionsForState returns the vanilla bounding box width, height, and
+// eye height for a Sniffer (`DIGGING_DIMENSIONS = 1.9 x 1.35, eye 0.81` when
+// digging, `1.9 x 1.75, eye 1.05` otherwise; scaled by `0.45` if baby).
+func SnifferDimensionsForState(state SnifferState, isBaby bool) (width, height, eyeHeight float64) {
+	width = SnifferWidth
+	height = SnifferHeight
+	eyeHeight = SnifferEyeHeight
+	if state == SnifferStateDigging {
+		width = SnifferDiggingWidth
+		height = SnifferDiggingHeight
+		eyeHeight = SnifferDiggingEyeHeight
+	}
+	if isBaby {
+		width *= SnifferBabyScale
+		height *= SnifferBabyScale
+		eyeHeight *= SnifferBabyScale
+	}
+	return width, height, eyeHeight
+}
+
+// SnifferHeadPosition computes vanilla `Sniffer.getHeadPosition()`:
+// `position().add(getForward().scale(2.25))` with `y + 0.2`.
+func SnifferHeadPosition(x, y, z float64, yawDeg float32) (hx, hy, hz float64) {
+	rad := float64(yawDeg) * (math.Pi / 180.0)
+	hx = x - math.Sin(rad)*SnifferHeadForwardOffset
+	hy = y + SnifferHeadVerticalOffset
+	hz = z + math.Cos(rad)*SnifferHeadForwardOffset
+	return hx, hy, hz
+}
+
+// SnifferHeadBlock computes vanilla `Sniffer.getHeadBlock()`:
+// `BlockPos.containing(getHeadPosition())`.
+func SnifferHeadBlock(x, y, z float64, yawDeg float32) [3]int {
+	hx, hy, hz := SnifferHeadPosition(x, y, z, yawDeg)
+	return [3]int{int(math.Floor(hx)), int(math.Floor(hy)), int(math.Floor(hz))}
+}
+
+// CanSnifferSniff implements vanilla `Sniffer.canSniff()`:
+// `!isTempted() && !isPanicking() && !isInWater() && !isInLove() && onGround() && !isPassenger() && !isLeashed()`.
+func CanSnifferSniff(isTempted, isPanicking, inWater, inLove, onGround, isPassenger, isLeashed bool) bool {
+	return !isTempted && !isPanicking && !inWater && !inLove && onGround && !isPassenger && !isLeashed
+}
+
+// CanSnifferDig implements vanilla `Sniffer.canDig()`:
+// `!isPanicking() && !isTempted() && !isBaby() && !isInWater() && onGround() && !isPassenger() && canDig(headBlock.below())`.
+func CanSnifferDig(isPanicking, isTempted, isBaby, inWater, onGround, isPassenger, headBelowDiggable bool) bool {
+	return !isPanicking && !isTempted && !isBaby && !inWater && onGround && !isPassenger && headBelowDiggable
+}
+
+// CanSnifferStateMate reports whether a Sniffer in `state` is eligible to mate
+// according to vanilla `Sniffer.canMate` (`IDLING`, `SCENTING`, or `FEELING_HAPPY`).
+func CanSnifferStateMate(state SnifferState) bool {
+	return state == SnifferStateIdling || state == SnifferStateScenting || state == SnifferStateFeelingHappy
 }
 
 // IsSnifferDiggableBlock reports whether blockName is in the vanilla 26.1.2
@@ -529,8 +630,111 @@ func (s *Server) CompleteSnifferDig(entityID int32, rng *rand.Rand) (world.ItemS
 	return loot, true
 }
 
+// TransitionSnifferToState implements vanilla `Sniffer.transitionTo(State)`:
+// updates `DATA_STATE`, sets `DATA_DROP_SEED_AT_TICK` and broadcasts entity event
+// `63` when entering `DIGGING`, and plays the appropriate transition sound
+// (`SNIFFER_HAPPY`, `SNIFFER_SCENTING` with 1.3f pitch for baby, `SNIFFER_SNIFFING`,
+// `SNIFFER_DIGGING_STOP`).
+func (s *Server) TransitionSnifferToState(entityID int32, next SnifferState) bool {
+	if s == nil || s.entities == nil {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeSniffer {
+		return false
+	}
+	st := s.ensureSnifferState(entityID)
+	if st == nil {
+		return false
+	}
+	dropSeedAtTick := int32(0)
+	if next == SnifferStateDigging {
+		dropSeedAtTick = int32(SnifferDigSeedDropTick)
+	}
+	mgr := s.snifferManager()
+	mgr.mu.Lock()
+	st.State = next
+	st.DropSeedAtTick = dropSeedAtTick
+	switch next {
+	case SnifferStateFeelingHappy:
+		st.StateTicks = SnifferHappyMinDurationTicks
+	case SnifferStateScenting:
+		st.StateTicks = SnifferScentingMaxDurationTicks
+	case SnifferStateSniffing:
+		st.StateTicks = SnifferSniffingMaxDurationTicks
+	case SnifferStateSearching:
+		st.StateTicks = SnifferSearchingMaxTicks
+	case SnifferStateDigging:
+		st.StateTicks = SnifferDiggingDurationTicks
+		st.SeedDropped = false
+	case SnifferStateRising:
+		st.StateTicks = SnifferRisingDurationTicks
+	default:
+		st.StateTicks = 0
+	}
+	mgr.mu.Unlock()
+
+	dim := ent.EffectiveDimension()
+	cp := ent.ChunkPos()
+	s.broadcastSnifferState(ent, next, dropSeedAtTick)
+
+	switch next {
+	case SnifferStateFeelingHappy:
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundSnifferHappy, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	case SnifferStateScenting:
+		pitch := SnifferAdultScentingPitch
+		if s.IsMobBaby(entityID) {
+			pitch = SnifferBabyScentingPitch
+		}
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundSnifferScenting, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, pitch, 0))
+	case SnifferStateSniffing:
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundSnifferSniffing, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	case SnifferStateDigging:
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+			EncodeEntityEventPacket(entityID, EntityEventSnifferDigging))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundSnifferDiggingStart, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	case SnifferStateRising:
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundSnifferDiggingStop, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	}
+	return true
+}
+
+// OnSnifferDamaged interrupts active sniffing/searching/digging when a Sniffer
+// takes damage and enters panic (`Sniffer.canSniff` / `Sniffer.canDig`).
+func (s *Server) OnSnifferDamaged(entityID int32) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	st, ok := s.GetSnifferState(entityID)
+	if !ok {
+		return
+	}
+	if st.State == SnifferStateScenting || st.State == SnifferStateSniffing || st.State == SnifferStateSearching || st.State == SnifferStateDigging {
+		s.TransitionSnifferToState(entityID, SnifferStateIdling)
+	}
+}
+
+// OnSnifferKilled transitions the Sniffer to `IDLING` (`Sniffer.die`) and
+// cleans up server-side state on death.
+func (s *Server) OnSnifferKilled(entityID int32) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	s.TransitionSnifferToState(entityID, SnifferStateIdling)
+	mgr := s.snifferManager()
+	mgr.mu.Lock()
+	delete(mgr.sniffers, entityID)
+	mgr.mu.Unlock()
+}
+
 // TickSniffers advances all Sniffer entities by one tick, managing scenting,
-// searching movement toward a diggable block, digging, seed dropping, and rising.
+// sniffing, searching movement toward a diggable block, digging, seed dropping,
+// rising, and feeling happy.
 func (s *Server) TickSniffers(rng *rand.Rand) {
 	if s == nil || s.entities == nil {
 		return
@@ -573,6 +777,29 @@ func (s *Server) TickSniffers(rng *rand.Rand) {
 			}
 		case SnifferStateScenting:
 			curTicks--
+			if curTicks == SnifferSniffingMaxDurationTicks {
+				mgr.mu.Lock()
+				st.State = SnifferStateSniffing
+				st.StateTicks = curTicks
+				mgr.mu.Unlock()
+				s.broadcastSnifferState(ent, SnifferStateSniffing, 0)
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundSnifferSniffing, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			} else if curTicks <= 0 {
+				mgr.mu.Lock()
+				st.State = SnifferStateSearching
+				st.StateTicks = SnifferSearchingMaxTicks
+				mgr.mu.Unlock()
+				s.broadcastSnifferState(ent, SnifferStateSearching, 0)
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundSnifferSearching, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			} else {
+				mgr.mu.Lock()
+				st.StateTicks = curTicks
+				mgr.mu.Unlock()
+			}
+		case SnifferStateSniffing:
+			curTicks--
 			if curTicks <= 0 {
 				mgr.mu.Lock()
 				st.State = SnifferStateSearching
@@ -609,6 +836,8 @@ func (s *Server) TickSniffers(rng *rand.Rand) {
 					st.SeedDropped = false
 					mgr.mu.Unlock()
 					s.broadcastSnifferState(ent, SnifferStateDigging, dropTick)
+					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+						EncodeEntityEventPacket(ent.ID, EntityEventSnifferDigging))
 					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 						EncodeSoundPacket(SoundSnifferDiggingStart, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 					continue
@@ -673,13 +902,28 @@ func (s *Server) TickSniffers(rng *rand.Rand) {
 				mgr.mu.Unlock()
 				s.broadcastSnifferState(ent, SnifferStateRising, 0)
 				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundSnifferDiggingStop, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			} else {
+				mgr.mu.Lock()
+				st.StateTicks = curTicks
+				mgr.mu.Unlock()
+			}
+		case SnifferStateRising:
+			curTicks--
+			if curTicks <= 0 {
+				mgr.mu.Lock()
+				st.State = SnifferStateFeelingHappy
+				st.StateTicks = SnifferHappyMinDurationTicks
+				mgr.mu.Unlock()
+				s.broadcastSnifferState(ent, SnifferStateFeelingHappy, 0)
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 					EncodeSoundPacket(SoundSnifferHappy, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 			} else {
 				mgr.mu.Lock()
 				st.StateTicks = curTicks
 				mgr.mu.Unlock()
 			}
-		case SnifferStateRising, SnifferStateFeelingHappy:
+		case SnifferStateFeelingHappy:
 			curTicks--
 			if curTicks <= 0 {
 				mgr.mu.Lock()
@@ -696,8 +940,48 @@ func (s *Server) TickSniffers(rng *rand.Rand) {
 	}
 }
 
+var snifferAdvancementsOnce sync.Once
+
+// TriggerFeedSnifflet fires the vanilla 26.1.2 advancement "Little Sniffs"
+// (`minecraft:husbandry/feed_snifflet`, criterion `"feed_snifflet"`).
+func (s *Server) TriggerFeedSnifflet(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	snifferAdvancementsOnce.Do(func() {
+		reg := DefaultAdvancementRegistry()
+		if reg == nil {
+			return
+		}
+		id := "minecraft:husbandry/feed_snifflet"
+		if _, exists := reg.byID[id]; !exists {
+			def := &AdvancementDef{
+				ID:       id,
+				ParentID: "minecraft:husbandry/obtain_sniffer_egg",
+				Display: &AdvancementDisplay{
+					Title:          "Little Sniffs",
+					Description:    "Feed a Snifflet",
+					IconItem:       TorchflowerSeedsItemID,
+					Frame:          AdvancementFrameTask,
+					ShowToast:      true,
+					AnnounceToChat: true,
+					Hidden:         true,
+				},
+				Criteria:            []string{"feed_snifflet"},
+				Requirements:        [][]string{{"feed_snifflet"}},
+				SendsTelemetryEvent: true,
+			}
+			reg.defs = append(reg.defs, def)
+			reg.byID[id] = def
+			reg.children[def.ParentID] = append(reg.children[def.ParentID], def)
+		}
+	})
+	s.GrantCriterion(session, "minecraft:husbandry/feed_snifflet", "feed_snifflet")
+}
+
 // InteractWithSniffer handles a player right-clicking a Sniffer with torchflower_seeds:
-//   - If the Sniffer is a baby (Snifflet), speeds up its growth by 10%.
+//   - If the Sniffer is a baby (Snifflet), speeds up its growth by 10% and grants
+//     "Little Sniffs" (`minecraft:husbandry/feed_snifflet`).
 //   - If damaged, heals 2.0 HP (1 heart).
 //   - If an adult at full health (or after healing) and not on breeding cooldown,
 //     enters love mode; when another Sniffer in love is within AnimalBreedRange,
@@ -727,6 +1011,9 @@ func (s *Server) InteractWithSniffer(session *PlayerSession, entityID int32) (ha
 
 	if s.IsMobBaby(entityID) {
 		fed, _ := s.FeedBabyMob(session, entityID, TorchflowerSeedsItemID)
+		if fed {
+			s.TriggerFeedSnifflet(session)
+		}
 		return fed, 0
 	}
 

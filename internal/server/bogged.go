@@ -17,6 +17,9 @@ const (
 
 	// Vanilla 26.1.2 Bogged has 16 HP (8 hearts), less than a regular Skeleton (20 HP).
 	DefaultBoggedMaxHealth float32 = 16.0
+	BoggedMovementSpeed    float64 = 0.25
+	BoggedDeathXP          int     = 5
+	BoggedHeight           float64 = 1.99
 
 	// Bogged movement and ranged bow combat parameters.
 	BoggedChaseSpeed             float64 = 0.14
@@ -27,7 +30,9 @@ const (
 	BoggedShootCooldownTicks     int     = 70 // 3.5s on Easy/Normal (vs 40 ticks / 2.0s for Skeleton)
 	BoggedHardShootCooldownTicks int     = 50 // 2.5s on Hard difficulty
 	BoggedArrowBaseDamage        float32 = 3.0
-	BoggedPoisonDurationTicks    int32   = 80 // 4.0s of Poison I (amplifier 0) on arrow hit
+	BoggedPoisonDurationTicks    int32   = 100 // 5.0s (100 ticks) of Poison I (amplifier 0) in Bogged.getArrow
+	BoggedPoisonAmplifier        byte    = 0
+	BoggedTippedArrowMaxLimit    int32   = 1 // limit: 1 in data/minecraft/loot_table/entities/bogged.json
 
 	// Bogged shearing constants.
 	BoggedShearMushroomCount  = 2
@@ -35,6 +40,7 @@ const (
 	BrownMushroomItemID       = "minecraft:brown_mushroom"
 	ShearsItemID              = "minecraft:shears"
 	BoggedShearsMaxDurability = int32(238)
+	BoggedNBTShearedKey       = "sheared"
 
 	// SynchedEntityData index for Bogged.DATA_SHEARED in 26.1.2 (protocol 775).
 	EntityDataBoggedShearedID byte = 16 // BOOLEAN serializer = 8
@@ -125,17 +131,39 @@ func RollBoggedShearMushrooms(rng *rand.Rand) []world.ItemStack {
 }
 
 // RollBoggedDeathLoot rolls the vanilla 26.1.2 entities/bogged loot table:
-// 1..2 bones, 1..2 arrows, and (when killed by a player or with 50% chance)
-// 1 tipped_arrow (Poison).
+// 0..2 bones, 0..2 arrows, and (when killed by a player) 0..1 tipped_arrow (Poison).
 func RollBoggedDeathLoot(rng *rand.Rand, killedByPlayer bool) []world.ItemStack {
+	return RollBoggedDeathLootWithLooting(rng, killedByPlayer, 0)
+}
+
+// RollBoggedDeathLootWithLooting rolls the vanilla 26.1.2 `entities/bogged.json`
+// loot table with Looting level:
+//   - Pool 1: `0..2` `minecraft:arrow` + `lootingLevel * uniform(0..1)`
+//   - Pool 2: `0..2` `minecraft:bone` + `lootingLevel * uniform(0..1)`
+//   - Pool 3 (`killed_by_player`): `0..1` `minecraft:tipped_arrow` (Poison) +
+//     `lootingLevel * uniform(0..1)`, capped at `limit: 1`.
+func RollBoggedDeathLootWithLooting(rng *rand.Rand, killedByPlayer bool, lootingLevel int32) []world.ItemStack {
 	bones := int32(1)
 	arrows := int32(1)
-	dropTipped := killedByPlayer
+	tipped := int32(0)
+	if killedByPlayer {
+		tipped = 1
+	}
 	if rng != nil {
 		bones = int32(1 + rng.Intn(2))
 		arrows = int32(1 + rng.Intn(2))
+		for l := int32(0); l < lootingLevel; l++ {
+			bones += int32(rng.Intn(2))
+			arrows += int32(rng.Intn(2))
+		}
 		if killedByPlayer {
-			dropTipped = rng.Intn(2) == 0
+			tipped = int32(rng.Intn(2))
+			for l := int32(0); l < lootingLevel; l++ {
+				tipped += int32(rng.Intn(2))
+			}
+			if tipped > BoggedTippedArrowMaxLimit {
+				tipped = BoggedTippedArrowMaxLimit
+			}
 		}
 	}
 	var out []world.ItemStack
@@ -145,12 +173,65 @@ func RollBoggedDeathLoot(rng *rand.Rand, killedByPlayer bool) []world.ItemStack 
 	if a := world.NewNamedItemStack("minecraft:arrow", arrows); !a.IsEmpty() {
 		out = append(out, a)
 	}
-	if dropTipped {
-		if ta := world.NewNamedItemStack("minecraft:tipped_arrow", 1); !ta.IsEmpty() {
+	if tipped > 0 {
+		if ta := world.NewNamedItemStack("minecraft:tipped_arrow", tipped); !ta.IsEmpty() {
 			out = append(out, ta)
 		}
 	}
 	return out
+}
+
+// BoggedAttackIntervalForDifficulty returns the vanilla Bogged bow attack
+// interval (50 ticks on Hard, 70 ticks on Easy/Normal).
+func BoggedAttackIntervalForDifficulty(difficulty Difficulty) int {
+	if difficulty == DifficultyHard {
+		return BoggedHardShootCooldownTicks
+	}
+	return BoggedShootCooldownTicks
+}
+
+// EncodeBoggedShearedNBT encodes the Bogged `"sheared"` NBT field.
+func EncodeBoggedShearedNBT(sheared bool) map[string]any {
+	return map[string]any{BoggedNBTShearedKey: sheared}
+}
+
+// DecodeBoggedShearedNBT reads the Bogged `"sheared"` boolean from an NBT map.
+func DecodeBoggedShearedNBT(nbtMap map[string]any) bool {
+	if nbtMap == nil {
+		return false
+	}
+	switch v := nbtMap[BoggedNBTShearedKey].(type) {
+	case bool:
+		return v
+	case byte:
+		return v != 0
+	case int8:
+		return v != 0
+	case int32:
+		return v != 0
+	case int:
+		return v != 0
+	}
+	return false
+}
+
+// ReadyForBoggedShearing implements vanilla `Bogged.readyForShearing()`:
+// returns true when the entity is an alive, unsheared Bogged.
+func (s *Server) ReadyForBoggedShearing(entityID int32) bool {
+	if s == nil || s.entities == nil {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeBogged {
+		return false
+	}
+	return !s.IsBoggedSheared(entityID) && s.MobHealth(entityID) > 0
+}
+
+// OnBoggedKilled cleans up any state when a Bogged dies.
+func (s *Server) OnBoggedKilled(entityID int32) {
+	_ = s
+	_ = entityID
 }
 
 // SpawnBogged spawns a Bogged entity at (x, y, z) in dimension with 16.0 HP.
@@ -230,6 +311,9 @@ func (s *Server) ShearBogged(session *PlayerSession, entityID int32, rng *rand.R
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeBogged {
 		return nil, false
 	}
+	if s.MobHealth(entityID) <= 0 {
+		return nil, false
+	}
 	tr := s.entityTracker()
 	tr.mu.Lock()
 	mem := tr.mobStateFor(entityID, tr.aiTickID)
@@ -244,7 +328,7 @@ func (s *Server) ShearBogged(session *PlayerSession, entityID int32, rng *rand.R
 	cp := ent.ChunkPos()
 	dropped = RollBoggedShearMushrooms(rng)
 	for _, stack := range dropped {
-		s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.5, ent.Z, stack)
+		s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+BoggedHeight, ent.Z, stack)
 	}
 
 	if session != nil {
@@ -254,7 +338,10 @@ func (s *Server) ShearBogged(session *PlayerSession, entityID int32, rng *rand.R
 			held := session.InventorySlot(slotIdx)
 			if !held.IsEmpty() && canonicalResourceName(held.ResolvedID()) == ShearsItemID {
 				meta := GetSlotItemMeta(session, slotIdx)
-				meta.Damage++
+				unbreakingLvl := meta.EnchantmentLevel("minecraft:unbreaking")
+				if unbreakingLvl <= 0 || rng == nil || rng.Intn(int(unbreakingLvl)+1) == 0 {
+					meta.Damage++
+				}
 				if meta.Damage >= BoggedShearsMaxDurability {
 					session.SetInventorySlot(slotIdx, world.ItemStack{})
 					SetSlotItemMeta(session, slotIdx, ItemMeta{})

@@ -16,9 +16,17 @@ const (
 	MobTypeArmadillo      = "minecraft:armadillo"
 	EntityTypeArmadilloID = 4
 
-	DefaultArmadilloMaxHealth   float32 = 12.0
-	ArmadilloWanderSpeed        float64 = 0.085
-	ArmadilloPanicDurationTicks int     = 60
+	DefaultArmadilloMaxHealth     float32 = 12.0
+	ArmadilloMovementSpeed        float64 = 0.14
+	ArmadilloWanderSpeed          float64 = 0.085
+	ArmadilloPanicSpeedMultiplier float64 = 2.0
+	ArmadilloBabyScale            float32 = 0.6
+	ArmadilloMaxHeadRotExtent     float32 = 32.5
+	ArmadilloDefaultMaxHeadYRot   int     = 32
+	ArmadilloPickupReach          int     = 0
+	ArmadilloDeathXP              int     = 2
+	ArmadilloPanicDurationTicks   int     = 60
+	ArmadilloMinSpawnLightLevel   int     = 8
 
 	// Armadillo items and durability constants.
 	ArmadilloScuteItemID         = "minecraft:armadillo_scute"
@@ -31,12 +39,21 @@ const (
 	ArmadilloScuteShedMinTicks = 6000
 	ArmadilloScuteShedMaxTicks = 12000
 
-	// Rolling/curling state durations and threat detection radii.
-	ArmadilloRollingDurationTicks   = 10 // 0.5s curling animation
-	ArmadilloScaredMinDurationTicks = 60 // 3.0s minimum curled duration after threat leaves
-	ArmadilloUnrollingDurationTicks = 20 // 1.0s uncurling animation
-	ArmadilloThreatHorizontalRange  = 7.0
-	ArmadilloThreatVerticalRange    = 2.0
+	// Rolling/curling state durations and threat detection radii (Armadillo, ArmadilloState, ArmadilloBallUp).
+	ArmadilloRollingDurationTicks         = 10   // 0.5s curling animation (ROLLING.animationDuration = 10)
+	ArmadilloScaredAnimationDurationTicks = 50   // 2.5s scared animation (SCARED.animationDuration = 50)
+	ArmadilloScaredMinDurationTicks       = 60   // minimum curled duration after threat leaves
+	ArmadilloUnrollingDurationTicks       = 30   // 1.5s uncurling animation (UNROLLING.animationDuration = 30)
+	ArmadilloBallUpStayInStateTicks       = 6000 // 5 minutes max in ArmadilloBallUp
+	ArmadilloDangerMemoryTicks            = 80   // SCARE_CHECK_INTERVAL = 80
+	ArmadilloDangerThresholdTicks         = 75   // DANGER_DETECTED_RECENTLY_DANGER_THRESHOLD = 75
+	ArmadilloPeekMinDelayTicks            = 100
+	ArmadilloPeekMaxDelayTicks            = 400
+	ArmadilloThreatHorizontalRange        = 7.0
+	ArmadilloThreatVerticalRange          = 2.0
+
+	// EntityEvent ID for Armadillo peek animation in 26.1.2.
+	EntityEventArmadilloPeek byte = 64
 
 	// SynchedEntityData index and serializer for Armadillo in 26.1.2 (protocol 775).
 	EntityDataArmadilloStateID         byte  = 17 // Armadillo.ARMADILLO_STATE (ARMADILLO_STATE serializer = 27)
@@ -70,11 +87,127 @@ const (
 
 // ArmadilloBehaviorState holds the server-side AI state for an Armadillo entity.
 type ArmadilloBehaviorState struct {
-	EntityID       int32
-	State          ArmadilloState
-	StateTicks     int
-	ScuteShedTimer int
-	PanicTicks     int
+	EntityID           int32
+	State              ArmadilloState
+	StateTicks         int
+	InStateTicks       int64
+	NextPeekTimer      int
+	ScuteShedTimer     int
+	PanicTicks         int
+	LastHurtByEntityID int32
+}
+
+// ArmadilloStateName returns the vanilla serialized name (`"idle"`, `"rolling"`,
+// `"scared"`, `"unrolling"`) for an ArmadilloState.
+func ArmadilloStateName(state ArmadilloState) string {
+	switch state {
+	case ArmadilloStateRolling:
+		return "rolling"
+	case ArmadilloStateScared:
+		return "scared"
+	case ArmadilloStateUnrolling:
+		return "unrolling"
+	default:
+		return "idle"
+	}
+}
+
+// ArmadilloStateFromName parses a vanilla serialized ArmadilloState name.
+func ArmadilloStateFromName(name string) (ArmadilloState, bool) {
+	switch name {
+	case "idle":
+		return ArmadilloStateIdle, true
+	case "rolling":
+		return ArmadilloStateRolling, true
+	case "scared":
+		return ArmadilloStateScared, true
+	case "unrolling":
+		return ArmadilloStateUnrolling, true
+	default:
+		return ArmadilloStateIdle, false
+	}
+}
+
+// IsArmadilloStateThreatened reports whether `state.isThreatened()` is true in
+// vanilla (`ROLLING`, `SCARED`, `UNROLLING`).
+func IsArmadilloStateThreatened(state ArmadilloState) bool {
+	return state == ArmadilloStateRolling || state == ArmadilloStateScared || state == ArmadilloStateUnrolling
+}
+
+// ArmadilloStateAnimationDuration returns `state.animationDuration()` in ticks:
+// `0` for IDLE, `10` for ROLLING, `50` for SCARED, `30` for UNROLLING.
+func ArmadilloStateAnimationDuration(state ArmadilloState) int {
+	switch state {
+	case ArmadilloStateRolling:
+		return ArmadilloRollingDurationTicks
+	case ArmadilloStateScared:
+		return ArmadilloScaredAnimationDurationTicks
+	case ArmadilloStateUnrolling:
+		return ArmadilloUnrollingDurationTicks
+	default:
+		return 0
+	}
+}
+
+// ShouldArmadilloHideInShell implements vanilla `ArmadilloState.shouldHideInShell(long)`
+// verified against `Armadillo$ArmadilloState$1..4.class`:
+//   - IDLE: `false`
+//   - ROLLING: `inStateTicks > 5`
+//   - SCARED: `true`
+//   - UNROLLING: `inStateTicks < 26`
+func ShouldArmadilloHideInShell(state ArmadilloState, inStateTicks int64) bool {
+	switch state {
+	case ArmadilloStateRolling:
+		return inStateTicks > 5
+	case ArmadilloStateScared:
+		return true
+	case ArmadilloStateUnrolling:
+		return inStateTicks < 26
+	default:
+		return false
+	}
+}
+
+// ArmadilloMaxHeadYRot returns `Armadillo.getMaxHeadYRot()`: `0` when scared/curled,
+// otherwise `32` (`Math.round(32.5F)`).
+func ArmadilloMaxHeadYRot(scared bool) int {
+	if scared {
+		return 0
+	}
+	return ArmadilloDefaultMaxHeadYRot
+}
+
+// CanArmadilloStayRolledUp implements vanilla `Armadillo.canStayRolledUp()`:
+// `!isPanicking() && !isInLiquid() && !isLeashed() && !isPassenger() && !isVehicle()`.
+func CanArmadilloStayRolledUp(isPanicking, inLiquid, isLeashed, isPassenger, isVehicle bool) bool {
+	return !isPanicking && !inLiquid && !isLeashed && !isPassenger && !isVehicle
+}
+
+// IsArmadilloSpawnableOnBlock reports whether `blockName` is in
+// `#minecraft:armadillo_spawnable_on` (`#minecraft:animals_spawnable_on`,
+// `#minecraft:badlands_terracotta`, `minecraft:red_sand`, `minecraft:coarse_dirt`).
+func IsArmadilloSpawnableOnBlock(blockName string) bool {
+	switch canonicalResourceName(blockName) {
+	case "minecraft:grass_block",
+		"minecraft:red_sand",
+		"minecraft:coarse_dirt",
+		"minecraft:terracotta",
+		"minecraft:white_terracotta",
+		"minecraft:yellow_terracotta",
+		"minecraft:orange_terracotta",
+		"minecraft:red_terracotta",
+		"minecraft:brown_terracotta",
+		"minecraft:light_gray_terracotta":
+		return true
+	default:
+		return false
+	}
+}
+
+// CheckArmadilloSpawnRules implements vanilla `Armadillo.checkArmadilloSpawnRules`:
+// block below in `#minecraft:armadillo_spawnable_on` and raw brightness > 8.
+func CheckArmadilloSpawnRules(belowBlockName string, rawBrightness int) bool {
+	return IsArmadilloSpawnableOnBlock(belowBlockName) && rawBrightness > ArmadilloMinSpawnLightLevel
 }
 
 type serverArmadilloManager struct {
@@ -289,8 +422,65 @@ func (s *Server) SpawnArmadillo(dimension string, x, y, z float64, baby bool) (i
 	return id, nil
 }
 
+// CanArmadilloEntityStayRolledUp checks whether the armadillo with entityID
+// satisfies vanilla `Armadillo.canStayRolledUp()` (not in liquid, not leashed,
+// not a passenger or vehicle).
+func (s *Server) CanArmadilloEntityStayRolledUp(entityID int32) bool {
+	if s == nil || s.entities == nil {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeArmadillo {
+		return false
+	}
+	inLiquid := false
+	if cache := s.DimensionChunks(ent.EffectiveDimension()); cache != nil {
+		bx := int(math.Floor(ent.X))
+		by := int(math.Floor(ent.Y))
+		bz := int(math.Floor(ent.Z))
+		blk := cache.GetBlock(bx, by, bz)
+		if blk == world.StateWater || world.BlockName(blk) == "minecraft:lava" {
+			inLiquid = true
+		}
+	}
+	isLeashed := s.IsEntityLeashed(entityID)
+	return CanArmadilloStayRolledUp(false, inLiquid, isLeashed, false, false)
+}
+
+// BeginRollUpArmadillo starts the 10-tick `ArmadilloStateRolling` curling
+// transition (`IDLE -> ROLLING -> SCARED`), resetting love, broadcasting
+// `ARMADILLO_STATE = ROLLING`, and playing `SoundArmadilloRoll`.
+func (s *Server) BeginRollUpArmadillo(entityID int32) bool {
+	if s == nil || s.entities == nil || !s.CanArmadilloEntityStayRolledUp(entityID) {
+		return false
+	}
+	ent := s.entities.Get(entityID)
+	if ent == nil {
+		return false
+	}
+	st := s.ensureArmadilloState(entityID)
+	if st == nil {
+		return false
+	}
+	s.SetMobInLove(entityID, 0, nil)
+	mgr := s.armadilloManager()
+	mgr.mu.Lock()
+	st.State = ArmadilloStateRolling
+	st.StateTicks = ArmadilloRollingDurationTicks
+	st.InStateTicks = 0
+	mgr.mu.Unlock()
+
+	cp := ent.ChunkPos()
+	dim := ent.EffectiveDimension()
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+		EncodeArmadilloEntityDataPacket(entityID, ArmadilloStateRolling))
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+		EncodeSoundPacket(SoundArmadilloRoll, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	return true
+}
+
 // RollUpArmadillo causes the armadillo with entityID to curl into its shell
-// (transitioning to SCARED and broadcasting ARMADILLO_STATE metadata + sound).
+// (transitioning to SCARED, resetting love, and broadcasting ARMADILLO_STATE metadata + sound).
 func (s *Server) RollUpArmadillo(entityID int32) bool {
 	if s == nil || s.entities == nil {
 		return false
@@ -299,23 +489,20 @@ func (s *Server) RollUpArmadillo(entityID int32) bool {
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeArmadillo {
 		return false
 	}
-	// Armadillos cannot stay rolled up while submerged in water.
-	if cache := s.DimensionChunks(ent.EffectiveDimension()); cache != nil {
-		bx := int(math.Floor(ent.X))
-		by := int(math.Floor(ent.Y))
-		bz := int(math.Floor(ent.Z))
-		if cache.GetBlock(bx, by, bz) == world.StateWater {
-			return false
-		}
+	if !s.CanArmadilloEntityStayRolledUp(entityID) {
+		return false
 	}
 	st := s.ensureArmadilloState(entityID)
 	if st == nil {
 		return false
 	}
+	s.SetMobInLove(entityID, 0, nil)
 	mgr := s.armadilloManager()
 	mgr.mu.Lock()
 	st.State = ArmadilloStateScared
 	st.StateTicks = ArmadilloScaredMinDurationTicks
+	st.InStateTicks = 0
+	st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + ArmadilloPeekMinDelayTicks
 	mgr.mu.Unlock()
 
 	cp := ent.ChunkPos()
@@ -344,6 +531,7 @@ func (s *Server) UnrollArmadillo(entityID int32) bool {
 	mgr.mu.Lock()
 	st.State = ArmadilloStateIdle
 	st.StateTicks = 0
+	st.InStateTicks = 0
 	mgr.mu.Unlock()
 
 	cp := ent.ChunkPos()
@@ -377,28 +565,69 @@ func (s *Server) OnArmadilloDamaged(entityID int32) {
 	s.RollUpArmadillo(entityID)
 }
 
-// HasArmadilloThreatNearby reports whether an undead mob or a sprinting/mounted
-// player is within 7.0 horizontal x 2.0 vertical blocks of (x, y, z) in dim.
+// OnArmadilloEnvironmentalPanicDamage handles vanilla `Armadillo.actuallyHurt` /
+// `ArmadilloPanic` when an armadillo takes environmental panic damage (fire,
+// lava, drowning, freeze): forces the armadillo to unroll (`rollOut()`) and panic.
+func (s *Server) OnArmadilloEnvironmentalPanicDamage(entityID int32) {
+	if s == nil {
+		return
+	}
+	st := s.ensureArmadilloState(entityID)
+	if st != nil {
+		mgr := s.armadilloManager()
+		mgr.mu.Lock()
+		st.PanicTicks = ArmadilloPanicDurationTicks
+		mgr.mu.Unlock()
+	}
+	tr := s.entityTracker()
+	tr.mu.Lock()
+	if mem := tr.mobStates[entityID]; mem != nil {
+		mem.panicTicks = ArmadilloPanicDurationTicks
+	}
+	tr.mu.Unlock()
+	s.UnrollArmadillo(entityID)
+}
+
+// OnArmadilloKilled cleans up server-side state when an armadillo dies.
+func (s *Server) OnArmadilloKilled(entityID int32) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	mgr := s.armadilloManager()
+	mgr.mu.Lock()
+	delete(mgr.armadillos, entityID)
+	mgr.mu.Unlock()
+}
+
+// HasArmadilloThreatNearby reports whether an undead mob, `lastHurtByMob`, or a
+// sprinting/mounted non-spectator player is within 7.0 horizontal x 2.0 vertical
+// blocks of (x, y, z) in dim (`Armadillo.isScaredBy`).
 func (s *Server) HasArmadilloThreatNearby(dim string, armadilloID int32, x, y, z float64) bool {
 	if s == nil {
 		return false
 	}
 	normDim := world.NormalizeDimension(dim)
 	maxHorizSq := ArmadilloThreatHorizontalRange * ArmadilloThreatHorizontalRange
+	var lastHurtBy int32
+	if st, ok := s.GetArmadilloState(armadilloID); ok {
+		lastHurtBy = st.LastHurtByEntityID
+	}
 
-	// 1. Check sprinting Survival/Adventure players within 7x2x7.
+	// 1. Check sprinting or mounted players within 7x2x7.
 	for _, sess := range s.onlinePlayersSnapshot() {
 		if sess == nil || sess.IsDead() {
 			continue
 		}
 		snap := sess.Snapshot()
-		if snap.GameMode == GameModeSpectator || snap.GameMode == GameModeCreative || snap.Health <= 0 {
+		if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
 			continue
 		}
 		if world.NormalizeDimension(snap.Dimension) != normDim {
 			continue
 		}
-		if !sess.IsSprinting() {
+		isMounted := s.MountedVehicleOfEntity(sess, 0) != 0 || s.PlayerMountedVehicle(sess) != 0
+		isLastHurt := lastHurtBy != 0 && snap.EntityID == lastHurtBy
+		if !sess.IsSprinting() && !isMounted && !isLastHurt {
 			continue
 		}
 		dx := snap.X - x
@@ -409,7 +638,7 @@ func (s *Server) HasArmadilloThreatNearby(dim string, armadilloID int32, x, y, z
 		}
 	}
 
-	// 2. Check undead mobs within 7x2x7.
+	// 2. Check undead mobs (or lastHurtByMob) within 7x2x7.
 	if s.entities != nil {
 		allEnts := s.entities.AppendAll(nil)
 		for i := range allEnts {
@@ -417,7 +646,7 @@ func (s *Server) HasArmadilloThreatNearby(dim string, armadilloID int32, x, y, z
 			if other.ID == armadilloID || other.EffectiveDimension() != normDim {
 				continue
 			}
-			if !IsArmadilloThreatMob(other.TypeName) {
+			if !IsArmadilloThreatMob(other.TypeName) && (lastHurtBy == 0 || other.ID != lastHurtBy) {
 				continue
 			}
 			dx := other.X - x
@@ -431,15 +660,19 @@ func (s *Server) HasArmadilloThreatNearby(dim string, armadilloID int32, x, y, z
 	return false
 }
 
-// BrushArmadillo uses a minecraft:brush on the armadillo with entityID,
-// dropping 1 minecraft:armadillo_scute item entity and applying 16 durability
-// wear to the brush in Survival/Adventure mode.
+// BrushArmadillo uses a minecraft:brush on the adult armadillo with entityID,
+// dropping 1 minecraft:armadillo_scute item entity, applying 16 durability
+// wear to the brush in Survival/Adventure mode, and granting "Isn't It Scute?".
+// Baby armadillos cannot be brushed (`Armadillo.brushOffScute`).
 func (s *Server) BrushArmadillo(session *PlayerSession, entityID int32, rng *rand.Rand) (scuteEntityID int32, brushed bool) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return 0, false
 	}
 	ent := s.entities.Get(entityID)
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeArmadillo {
+		return 0, false
+	}
+	if s.IsMobBaby(entityID) {
 		return 0, false
 	}
 	snap := session.Snapshot()
@@ -480,6 +713,7 @@ func (s *Server) BrushArmadillo(session *PlayerSession, entityID int32, rng *ran
 		}
 	}
 
+	s.TriggerBrushArmadillo(session)
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundArmadilloBrush, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	s.EmitVibration(VibrationEvent{
@@ -570,10 +804,15 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 		}
 		dim := ent.EffectiveDimension()
 		cp := ent.ChunkPos()
+		if st.State != ArmadilloStateIdle && !s.CanArmadilloEntityStayRolledUp(ent.ID) {
+			s.UnrollArmadillo(ent.ID)
+			continue
+		}
 		threatNearby := s.HasArmadilloThreatNearby(dim, ent.ID, ent.X, ent.Y, ent.Z)
 
 		mgr := s.armadilloManager()
 		mgr.mu.Lock()
+		st.InStateTicks++
 		if st.PanicTicks > 0 {
 			st.PanicTicks--
 		}
@@ -600,12 +839,16 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 		curState := st.State
 		var broadcastState ArmadilloState
 		shouldBroadcast := false
+		fromRolling := false
+		shouldPeek := false
 
 		switch curState {
 		case ArmadilloStateIdle:
 			if threatNearby {
 				st.State = ArmadilloStateScared
 				st.StateTicks = ArmadilloScaredMinDurationTicks
+				st.InStateTicks = 0
+				st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + ArmadilloPeekMinDelayTicks
 				broadcastState = ArmadilloStateScared
 				shouldBroadcast = true
 			}
@@ -614,10 +857,24 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 			if st.StateTicks <= 0 {
 				st.State = ArmadilloStateScared
 				st.StateTicks = ArmadilloScaredMinDurationTicks
+				st.InStateTicks = 0
+				st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + ArmadilloPeekMinDelayTicks
 				broadcastState = ArmadilloStateScared
 				shouldBroadcast = true
+				fromRolling = true
 			}
 		case ArmadilloStateScared:
+			if st.NextPeekTimer > 0 {
+				st.NextPeekTimer--
+				if st.NextPeekTimer == 0 && ent.OnGround {
+					shouldPeek = true
+					delay := ArmadilloPeekMinDelayTicks
+					if rng != nil {
+						delay += rng.Intn(ArmadilloPeekMaxDelayTicks - ArmadilloPeekMinDelayTicks + 1)
+					}
+					st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + delay
+				}
+			}
 			if threatNearby {
 				st.StateTicks = ArmadilloScaredMinDurationTicks
 			} else {
@@ -625,6 +882,7 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 				if st.StateTicks <= 0 {
 					st.State = ArmadilloStateUnrolling
 					st.StateTicks = ArmadilloUnrollingDurationTicks
+					st.InStateTicks = 0
 					broadcastState = ArmadilloStateUnrolling
 					shouldBroadcast = true
 				}
@@ -633,6 +891,7 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 			if threatNearby {
 				st.State = ArmadilloStateScared
 				st.StateTicks = ArmadilloScaredMinDurationTicks
+				st.InStateTicks = 0
 				broadcastState = ArmadilloStateScared
 				shouldBroadcast = true
 			} else {
@@ -640,6 +899,7 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 				if st.StateTicks <= 0 {
 					st.State = ArmadilloStateIdle
 					st.StateTicks = 0
+					st.InStateTicks = 0
 					broadcastState = ArmadilloStateIdle
 					shouldBroadcast = true
 				}
@@ -647,6 +907,12 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 		}
 		mgr.mu.Unlock()
 
+		if shouldPeek {
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(ent.ID, EntityEventArmadilloPeek))
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(SoundArmadilloPeek, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		}
 		if shedScute {
 			scute := world.NewNamedItemStack(ArmadilloScuteItemID, 1)
 			if !scute.IsEmpty() {
@@ -660,8 +926,12 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 				EncodeArmadilloEntityDataPacket(ent.ID, broadcastState))
 			switch broadcastState {
 			case ArmadilloStateScared:
+				snd := SoundArmadilloRoll
+				if fromRolling && ent.OnGround {
+					snd = SoundArmadilloLand
+				}
 				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-					EncodeSoundPacket(SoundArmadilloRoll, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+					EncodeSoundPacket(snd, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 			case ArmadilloStateUnrolling:
 				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 					EncodeSoundPacket(SoundArmadilloUnrollStart, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))

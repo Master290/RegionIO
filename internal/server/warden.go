@@ -2284,15 +2284,16 @@ func MobXPReward(typeName string, isBaby bool) int {
 		return int(WitherDeathXP)
 	case MobTypeRavager:
 		return 20
-	case MobTypeEvoker:
+	case MobTypeEvoker, MobTypeBreeze:
 		return 10
-	case MobTypeZombie, MobTypeSkeleton, MobTypeCreeper, MobTypeSpider,
+	case MobTypeZombie, MobTypeSkeleton, MobTypeBogged, MobTypeCreeper, MobTypeSpider,
 		MobTypePhantom, MobTypePillager, MobTypeVindicator, MobTypeWitch,
 		MobTypeWarden, MobTypeWitherSkeleton:
 		return 5
 	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken,
 		MobTypeWolf, MobTypeCat, MobTypeParrot,
-		MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama:
+		MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeLlama, MobTypeTraderLlama,
+		MobTypeArmadillo, MobTypeSniffer, MobTypeCamel:
 		return 2
 	default:
 		return 0

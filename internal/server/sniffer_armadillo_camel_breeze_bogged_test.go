@@ -577,3 +577,241 @@ func TestBoggedPoisonArrowsShearingMushroomsAndLoot(t *testing.T) {
 		t.Fatalf("expected RollBoggedDeathLoot(killedByPlayer=true) to include bone, arrow, and tipped_arrow, got %+v", loot)
 	}
 }
+
+func TestBreezeBoggedArmadilloSnifferVanilla2612Polish(t *testing.T) {
+	srv := newSurvivalTestServer(t)
+	rng := rand.New(rand.NewSource(2612))
+
+	// --- 1. Breeze vanilla 26.1.2 state transitions, helpers & Trial Spawner integration ---
+	if !CanBreezeAttackTarget("minecraft:player") || !CanBreezeAttackTarget(MobTypeIronGolem) || CanBreezeAttackTarget(MobTypeZombie) {
+		t.Fatal("CanBreezeAttackTarget mismatch: expected player and iron_golem only")
+	}
+	if !IsBreezeInvulnerableTo(MobTypeBreeze, false) || !IsBreezeInvulnerableTo("", true) || IsBreezeInvulnerableTo("minecraft:player", false) {
+		t.Fatal("IsBreezeInvulnerableTo mismatch")
+	}
+	if !WithinBreezeInnerCircleRange(10.2, 64.0, 10.2, 13.0, 70.0, 10.5) {
+		t.Fatal("expected target within 4h x 10v of block center to be inside Breeze inner circle")
+	}
+	if WithinBreezeInnerCircleRange(10.2, 64.0, 10.2, 15.5, 64.0, 10.5) {
+		t.Fatal("expected target > 4 blocks horizontally to be outside Breeze inner circle")
+	}
+	if gotY := BreezeFiringYPosition(64.0); math.Abs(gotY-65.185) > 1e-4 {
+		t.Fatalf("BreezeFiringYPosition(64.0) = %v, want 65.185", gotY)
+	}
+	if gotPassY := BreezeShootTargetY(64.0, 2.0, true); math.Abs(gotPassY-65.6) > 1e-4 {
+		t.Fatalf("BreezeShootTargetY(passenger=true) = %v, want 65.6", gotPassY)
+	}
+	if gotInacc := BreezeShootInaccuracy(2); gotInacc != -3 {
+		t.Fatalf("BreezeShootInaccuracy(Normal=2) = %v, want -3", gotInacc)
+	}
+	if !IsBreezeStuck(true, false, false) || !IsBreezeStuck(false, true, false) || !IsBreezeStuck(false, false, true) || IsBreezeStuck(false, false, false) {
+		t.Fatal("IsBreezeStuck mismatch")
+	}
+	if BreezeAmbientSound(true, true) != "" || BreezeAmbientSound(true, false) != SoundBreezeIdleGround || BreezeAmbientSound(false, true) != SoundBreezeIdleAir {
+		t.Fatal("BreezeAmbientSound mismatch")
+	}
+	if drops := RollBreezeDeathLoot(rng, false, 3); len(drops) != 0 {
+		t.Fatalf("expected RollBreezeDeathLoot(killedByPlayer=false) to be empty, got %+v", drops)
+	}
+	if drops := RollBreezeDeathLoot(rng, true, 3); len(drops) != 1 || drops[0].Count < 4 || drops[0].Count > 8 {
+		t.Fatalf("expected RollBreezeDeathLoot(killedByPlayer=true, looting=3) to drop 4..8 breeze_rod, got %+v", drops)
+	}
+	if gotXP := MobXPReward(MobTypeBreeze, false); gotXP != BreezeDeathXP {
+		t.Fatalf("MobXPReward(breeze) = %d, want %d", gotXP, BreezeDeathXP)
+	}
+
+	// Verify CanBreezeJumpFromPosition checks honey_block below and 4 air/water blocks above.
+	honeyState, ok := world.BlockStateByName("minecraft:honey_block", nil)
+	if !ok {
+		t.Fatal("expected minecraft:honey_block state")
+	}
+	for y := 64; y <= 68; y++ {
+		srv.chunks.SetBlock(30, y, 30, world.StateAir)
+	}
+	srv.chunks.SetBlock(30, 63, 30, world.StateStone)
+	if !CanBreezeJumpFromPosition(srv.chunks, 30, 64, 30) {
+		t.Fatal("expected Breeze to be able to jump from stone with 4 air blocks above")
+	}
+	srv.chunks.SetBlock(30, 63, 30, honeyState)
+	if CanBreezeJumpFromPosition(srv.chunks, 30, 64, 30) {
+		t.Fatal("expected honey_block below to prevent Breeze long jump")
+	}
+	srv.chunks.SetBlock(30, 63, 30, world.StateStone)
+	srv.chunks.SetBlock(30, 67, 30, world.StateStone) // 3 blocks up (within 1..4)
+	if CanBreezeJumpFromPosition(srv.chunks, 30, 64, 30) {
+		t.Fatal("expected ceiling at +3 to prevent Breeze long jump")
+	}
+	srv.chunks.SetBlock(30, 67, 30, world.StateAir)
+
+	// Trial Spawner integration with Breeze:
+	srv.EnableTrialSpawnerEntityIntegration()
+	spawnedWaveBreezeID, spawnedOK := srv.SpawnTrialSpawnerWaveMob(
+		world.DimensionOverworld, 30, 64, 30, MobTypeBreeze, "", false, 30.5, 64.0, 30.5)
+	if !spawnedOK || spawnedWaveBreezeID <= 0 {
+		t.Fatalf("SpawnTrialSpawnerWaveMob(breeze) = (%d, %v), want (>0, true)", spawnedWaveBreezeID, spawnedOK)
+	}
+	srv.OnBreezeDamaged(spawnedWaveBreezeID)
+	bst, _ := srv.GetBreezeState(spawnedWaveBreezeID)
+	if bst.LongJumpCooldownTicks != BreezeJumpCooldownWhenHurtTicks {
+		t.Fatalf("LongJumpCooldownTicks after hurt = %d, want %d", bst.LongJumpCooldownTicks, BreezeJumpCooldownWhenHurtTicks)
+	}
+
+	// --- 2. Bogged vanilla 26.1.2 poison duration, difficulty intervals, NBT, and Looting limit ---
+	if BoggedPoisonDurationTicks != 100 {
+		t.Fatalf("BoggedPoisonDurationTicks = %d, want 100 (5.0s)", BoggedPoisonDurationTicks)
+	}
+	if BoggedAttackIntervalForDifficulty(DifficultyNormal) != 70 || BoggedAttackIntervalForDifficulty(DifficultyHard) != 50 {
+		t.Fatal("BoggedAttackIntervalForDifficulty mismatch")
+	}
+	nbtMap := EncodeBoggedShearedNBT(true)
+	if !DecodeBoggedShearedNBT(nbtMap) || DecodeBoggedShearedNBT(EncodeBoggedShearedNBT(false)) {
+		t.Fatal("EncodeBoggedShearedNBT / DecodeBoggedShearedNBT round-trip failed")
+	}
+	for i := 0; i < 20; i++ {
+		drops := RollBoggedDeathLootWithLooting(rng, true, 3)
+		for _, st := range drops {
+			if st.ResolvedID() == "minecraft:tipped_arrow" && st.Count > BoggedTippedArrowMaxLimit {
+				t.Fatalf("tipped_arrow count %d exceeded vanilla limit %d", st.Count, BoggedTippedArrowMaxLimit)
+			}
+		}
+	}
+
+	// --- 3. Armadillo vanilla 26.1.2 state machine, hide-in-shell timings, baby brush rejection & advancement ---
+	for _, tc := range []struct {
+		state   ArmadilloState
+		name    string
+		threat  bool
+		animDur int
+		hideAt0 bool
+		hideAt6 bool
+	}{
+		{ArmadilloStateIdle, "idle", false, 0, false, false},
+		{ArmadilloStateRolling, "rolling", true, 10, false, true},
+		{ArmadilloStateScared, "scared", true, 50, true, true},
+		{ArmadilloStateUnrolling, "unrolling", true, 30, true, true},
+	} {
+		if got := ArmadilloStateName(tc.state); got != tc.name {
+			t.Fatalf("ArmadilloStateName(%d) = %q, want %q", tc.state, got, tc.name)
+		}
+		if parsed, ok := ArmadilloStateFromName(tc.name); !ok || parsed != tc.state {
+			t.Fatalf("ArmadilloStateFromName(%q) = (%d, %v), want (%d, true)", tc.name, parsed, ok, tc.state)
+		}
+		if IsArmadilloStateThreatened(tc.state) != tc.threat {
+			t.Fatalf("IsArmadilloStateThreatened(%s) = %v, want %v", tc.name, !tc.threat, tc.threat)
+		}
+		if gotDur := ArmadilloStateAnimationDuration(tc.state); gotDur != tc.animDur {
+			t.Fatalf("ArmadilloStateAnimationDuration(%s) = %d, want %d", tc.name, gotDur, tc.animDur)
+		}
+		if ShouldArmadilloHideInShell(tc.state, 0) != tc.hideAt0 || ShouldArmadilloHideInShell(tc.state, 6) != tc.hideAt6 {
+			t.Fatalf("ShouldArmadilloHideInShell(%s) mismatch", tc.name)
+		}
+	}
+	if ShouldArmadilloHideInShell(ArmadilloStateUnrolling, 26) {
+		t.Fatal("expected UNROLLING at tick 26 to return shouldHideInShell=false")
+	}
+	if ArmadilloMaxHeadYRot(true) != 0 || ArmadilloMaxHeadYRot(false) != 32 {
+		t.Fatal("ArmadilloMaxHeadYRot mismatch")
+	}
+	if !CheckArmadilloSpawnRules("minecraft:red_sand", 9) || !CheckArmadilloSpawnRules("minecraft:terracotta", 12) || CheckArmadilloSpawnRules("minecraft:stone", 15) || CheckArmadilloSpawnRules("minecraft:grass_block", 8) {
+		t.Fatal("CheckArmadilloSpawnRules mismatch")
+	}
+
+	// Verify IDLE -> ROLLING (10t) -> SCARED -> environmental panic unroll -> IDLE.
+	armID, err := srv.SpawnArmadillo(world.DimensionOverworld, 40.5, 64.0, 40.5, false)
+	if err != nil {
+		t.Fatalf("SpawnArmadillo failed: %v", err)
+	}
+	if !srv.BeginRollUpArmadillo(armID) {
+		t.Fatal("expected BeginRollUpArmadillo to succeed")
+	}
+	ast, _ := srv.GetArmadilloState(armID)
+	if ast.State != ArmadilloStateRolling {
+		t.Fatalf("state after BeginRollUpArmadillo = %d, want ROLLING (%d)", ast.State, ArmadilloStateRolling)
+	}
+	for i := 0; i < ArmadilloRollingDurationTicks; i++ {
+		srv.TickArmadillos(rng)
+	}
+	ast, _ = srv.GetArmadilloState(armID)
+	if ast.State != ArmadilloStateScared {
+		t.Fatalf("state after %d rolling ticks = %d, want SCARED (%d)", ArmadilloRollingDurationTicks, ast.State, ArmadilloStateScared)
+	}
+	srv.OnArmadilloEnvironmentalPanicDamage(armID)
+	if srv.IsArmadilloRolledUp(armID) {
+		t.Fatal("expected environmental panic damage to unroll armadillo to IDLE")
+	}
+
+	// Baby armadillo cannot be brushed; adult armadillo brushing grants advancement.
+	babyArmID, err := srv.SpawnArmadillo(world.DimensionOverworld, 41.5, 64.0, 40.5, true)
+	if err != nil {
+		t.Fatalf("SpawnArmadillo(baby) failed: %v", err)
+	}
+	player := newSurvivalTestSession(srv, 1009, "PolishHero")
+	srv.SetPlayerTransform(player, 40.5, 64.0, 41.0, 0, 0, true)
+	hotbar := world.HotbarContainerOffset + int(player.Snapshot().SelectedSlot)
+	player.SetInventorySlot(hotbar, world.NewNamedItemStack(BrushItemID, 1))
+	if scuteID, brushed := srv.BrushArmadillo(player, babyArmID, rng); brushed || scuteID != 0 {
+		t.Fatalf("expected BrushArmadillo on baby to be rejected, got (%d, %v)", scuteID, brushed)
+	}
+	if scuteID, brushed := srv.BrushArmadillo(player, armID, rng); !brushed || scuteID == 0 {
+		t.Fatalf("expected BrushArmadillo on adult to succeed, got (%d, %v)", scuteID, brushed)
+	}
+
+	// --- 4. Sniffer vanilla 26.1.2 state machine (SCENTING -> SNIFFING -> SEARCHING), dimensions, head block & feed_snifflet ---
+	if w, h, eye := SnifferDimensionsForState(SnifferStateDigging, false); math.Abs(w-1.9) > 1e-4 || math.Abs(h-1.35) > 1e-4 || math.Abs(eye-0.81) > 1e-4 {
+		t.Fatalf("SnifferDimensionsForState(DIGGING) = (%v, %v, %v), want (1.9, 1.35, 0.81)", w, h, eye)
+	}
+	hb := SnifferHeadBlock(0.5, 64.0, 0.5, 0)
+	if hb[2] != 2 { // 0.5 + cos(0)*2.25 = 2.75 -> floor = 2
+		t.Fatalf("SnifferHeadBlock(0.5, 64.0, 0.5, yaw=0) = %v, want Z=2", hb)
+	}
+	if !CanSnifferStateMate(SnifferStateIdling) || !CanSnifferStateMate(SnifferStateScenting) || !CanSnifferStateMate(SnifferStateFeelingHappy) || CanSnifferStateMate(SnifferStateDigging) {
+		t.Fatal("CanSnifferStateMate mismatch")
+	}
+	if !CanSnifferSniff(false, false, false, false, true, false, false) || CanSnifferSniff(true, false, false, false, true, false, false) {
+		t.Fatal("CanSnifferSniff mismatch")
+	}
+	if !CanSnifferDig(false, false, false, false, true, false, true) || CanSnifferDig(false, false, true, false, true, false, true) {
+		t.Fatal("CanSnifferDig mismatch")
+	}
+
+	grassState, _ := world.BlockStateByName("minecraft:grass_block", nil)
+	for dx := -2; dx <= 2; dx++ {
+		for dz := -2; dz <= 2; dz++ {
+			srv.chunks.SetBlock(50+dx, 63, 50+dz, grassState)
+			srv.chunks.SetBlock(50+dx, 64, 50+dz, world.StateAir)
+		}
+	}
+	snifferID, err := srv.SpawnSniffer(world.DimensionOverworld, 50.5, 64.0, 50.5, false)
+	if err != nil {
+		t.Fatalf("SpawnSniffer failed: %v", err)
+	}
+	if !srv.TriggerSnifferScenting(snifferID, rng) {
+		t.Fatal("TriggerSnifferScenting failed")
+	}
+	// Advance 80 ticks: Sniffer transitions from SCENTING to SNIFFING!
+	for i := 0; i < SnifferScentingMaxDurationTicks; i++ {
+		srv.TickSniffers(rng)
+	}
+	sst, _ := srv.GetSnifferState(snifferID)
+	if sst.State != SnifferStateSniffing {
+		t.Fatalf("expected Sniffer to transition SCENTING -> SNIFFING after %d ticks, got state=%s (%d)",
+			SnifferScentingMaxDurationTicks, SnifferStateName(sst.State), sst.State)
+	}
+	// Damaging Sniffer while sniffing interrupts it back to IDLING.
+	srv.OnSnifferDamaged(snifferID)
+	sst, _ = srv.GetSnifferState(snifferID)
+	if sst.State != SnifferStateIdling {
+		t.Fatalf("expected OnSnifferDamaged to interrupt sniffing back to IDLING, got %s", SnifferStateName(sst.State))
+	}
+
+	// Feeding a baby Snifflet torchflower_seeds via InteractWithSniffer accelerates growth and triggers feed_snifflet.
+	sniffletID, err := srv.SpawnSnifflet(world.DimensionOverworld, 51.5, 64.0, 50.5)
+	if err != nil {
+		t.Fatalf("SpawnSnifflet failed: %v", err)
+	}
+	srv.SetPlayerTransform(player, 51.5, 64.0, 51.0, 0, 0, true)
+	player.SetInventorySlot(hotbar, world.NewNamedItemStack(TorchflowerSeedsItemID, 2))
+	if handled, _ := srv.InteractWithSniffer(player, sniffletID); !handled {
+		t.Fatal("expected InteractWithSniffer on Snifflet with torchflower_seeds to succeed")
+	}
+}

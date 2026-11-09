@@ -1460,6 +1460,10 @@ func (s *Server) applyDamageToMob(
 		normTarget := canonicalResourceName(target.TypeName)
 		if normTarget == MobTypeArmadillo {
 			s.OnArmadilloDamaged(target.ID)
+		} else if normTarget == MobTypeBreeze {
+			s.OnBreezeDamaged(target.ID)
+		} else if normTarget == MobTypeSniffer {
+			s.OnSnifferDamaged(target.ID)
 		} else if normTarget == MobTypeCamel {
 			s.OnCamelDamaged(target.ID)
 		} else if normTarget == MobTypeAxolotl {
@@ -1623,6 +1627,19 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeRabbit {
 		s.OnRabbitKilled(target.ID)
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeBreeze {
+		s.OnBreezeKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeBogged {
+		s.OnBoggedKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeArmadillo {
+		s.OnArmadilloKilled(target.ID)
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeSniffer {
+		s.OnSnifferKilled(target.ID)
+	}
+	_ = s.NotifyTrialSpawnerMobDefeated(dim, 0, 0, 0, target.ID)
 	if canonicalResourceName(target.TypeName) == MobTypeStrider {
 		for _, sDrop := range s.OnStriderKilled(target.ID) {
 			if s.DoMobLoot() {
