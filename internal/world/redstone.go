@@ -359,6 +359,8 @@ func isRedstoneComponentName(name string) bool {
 		"minecraft:trapped_chest", "minecraft:lectern", "minecraft:observer",
 		"minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor",
 		"minecraft:dispenser", "minecraft:dropper", "minecraft:hopper", "minecraft:crafter",
+		"minecraft:command_block", "minecraft:repeating_command_block", "minecraft:chain_command_block",
+		"minecraft:structure_block",
 		"minecraft:detector_rail", "minecraft:powered_rail", "minecraft:activator_rail":
 		return true
 	}
@@ -390,7 +392,9 @@ func isConductiveSolidBlock(state uint16) bool {
 		name != "minecraft:dropper" &&
 		name != "minecraft:crafter" &&
 		name != "minecraft:redstone_lamp" &&
-		name != "minecraft:target" {
+		name != "minecraft:target" &&
+		!IsCommandBlockName(name) &&
+		name != "minecraft:structure_block" {
 		return false
 	}
 	if strings.HasSuffix(name, "_glass") || strings.HasSuffix(name, "_stained_glass") ||
@@ -1156,6 +1160,7 @@ func hasAnalogOutputSignal(state uint16) bool {
 		"minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel",
 		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker",
 		"minecraft:chiseled_bookshelf", "minecraft:decorated_pot", "minecraft:crafter",
+		"minecraft:command_block", "minecraft:repeating_command_block", "minecraft:chain_command_block",
 		"minecraft:detector_rail":
 		return true
 	}
@@ -1296,7 +1301,9 @@ func (c *Cache) analogSignalAt(x, y, z int) int {
 			blockSig = MaxRedstonePower
 		}
 	default:
-		if IsCandleCakeBlockName(info.Name) {
+		if IsCommandBlockName(info.Name) {
+			blockSig = c.CommandBlockComparatorSignalAt(x, y, z)
+		} else if IsCandleCakeBlockName(info.Name) {
 			blockSig = FullCakeComparatorSignal
 		} else if IsCopperBulbBlock(state) || IsCopperGolemStatueBlock(state) || IsCopperChestBlock(state) {
 			blockSig = c.CopperBlockComparatorSignalAt(x, y, z)
@@ -1550,6 +1557,9 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 
 	case name == "minecraft:crafter":
 		c.fireCrafterAt(x, y, z)
+
+	case IsCommandBlockName(name):
+		c.stepCommandBlockUpdate(x, y, z, state, info, res)
 	}
 }
 
@@ -1686,6 +1696,12 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 
 			case info.Name == "minecraft:crafter":
 				c.evaluateCrafterRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
+			case IsCommandBlockName(info.Name):
+				c.evaluateCommandBlockRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
+			case info.Name == "minecraft:structure_block":
+				c.evaluateStructureBlockRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
 			case info.Name == "minecraft:hopper":
 				c.evaluateHopperRedstone(pos.X, pos.Y, pos.Z, st, info, res)
@@ -3393,6 +3409,12 @@ func (c *Cache) RecoverChunkActiveBlockTicks(cx, cz int32) int {
 		case name == "minecraft:fire":
 			if !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateFire) {
 				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFire, FireTickDelay)
+				recovered++
+			}
+
+		case name == "minecraft:repeating_command_block":
+			if be, ok := c.CommandBlockEntityAt(cb.x, cb.y, cb.z); ok && (be.Auto || be.Powered) && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone) {
+				c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateRedstone, CommandBlockTickDelay)
 				recovered++
 			}
 

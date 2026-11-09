@@ -261,6 +261,13 @@ func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpd
 			} else if isBlockNamed(oldState, "minecraft:piston") || isBlockNamed(oldState, "minecraft:sticky_piston") {
 				c.ClearPistonRuntimeAt(x, y, z)
 				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+			} else if IsCommandBlock(oldState) && !IsCommandBlock(targetState) {
+				c.RemoveCommandBlockEntityAt(x, y, z)
+				c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
+			} else if IsStructureBlock(oldState) && !IsStructureBlock(targetState) {
+				c.RemoveStructureBlockDataAt(x, y, z)
+			} else if IsJigsawBlock(oldState) && !IsJigsawBlock(targetState) {
+				c.RemoveJigsawBlockEntityAt(x, y, z)
 			}
 		}
 		if !IsNoteBlock(targetState) || !IsNoteBlock(oldState) {

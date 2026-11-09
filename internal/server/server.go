@@ -687,6 +687,9 @@ func (s *Server) ChunkBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Co
 	out = append(out, s.ChunkSculkBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkCopperBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkBellBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ExportChunkTrialSpawnersAndVaultsNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkBrushableBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkCommandStructureJigsawSpawnerBlockEntitiesNBT(dim, cx, cz)...)
 	return out
 }
 
@@ -716,6 +719,9 @@ func (s *Server) UnloadChunkBlockEntities(dimension string, cx, cz int32) []*nbt
 	out = append(out, s.UnloadChunkSculk(dim, cx, cz)...)
 	out = append(out, s.UnloadChunkCopperBlockEntities(dim, cx, cz)...)
 	out = append(out, s.UnloadChunkBells(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkTrialSpawnersAndVaults(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkBrushableBlocks(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkCommandStructureJigsawSpawnerBlockEntities(dim, cx, cz)...)
 	return out
 }
 
@@ -752,6 +758,9 @@ func (s *Server) LoadChunkBlockEntitiesNBT(dimension string, list nbt.List) {
 	s.LoadChunkSculkBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkCopperBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkBellBlockEntitiesNBT(dim, compounds)
+	s.ImportChunkTrialSpawnersAndVaultsNBT(dim, 0, 0, compounds)
+	s.LoadChunkBrushableBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkCommandStructureJigsawSpawnerBlockEntitiesNBT(dim, compounds)
 }
 
 // ExportChunkRedstoneRuntimeNBT exports scheduled block/fluid ticks, piston
