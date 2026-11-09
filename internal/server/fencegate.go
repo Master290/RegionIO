@@ -38,12 +38,10 @@ func (s *Server) InteractFenceGate(
 		return false, false
 	}
 	s.broadcastDimensionBlockChanges(targetDim, cache, upd.Changes, upd.LightChanged)
-	nowOpen := world.BlockProperties(cache.GetBlock(x, y, z))["open"] == "true"
+	curState := cache.GetBlock(x, y, z)
+	nowOpen := world.BlockProperties(curState)["open"] == "true"
 
-	soundName := "minecraft:block.fence_gate.close"
-	if nowOpen {
-		soundName = "minecraft:block.fence_gate.open"
-	}
+	soundName := world.FenceGateToggleSound(curState, nowOpen)
 	cx, cz := int32(x>>4), int32(z>>4)
 	s.BroadcastDimensionChunk(targetDim, cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket(soundName, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
@@ -102,16 +100,54 @@ func (s *Server) InteractDoorWithPartner(
 		}
 	}
 
-	soundName := "minecraft:block.wooden_door.close"
-	if world.IsCopperDoorBlock(oldState) {
-		if nowOpen {
-			soundName = "minecraft:block.copper_door.open"
-		} else {
-			soundName = "minecraft:block.copper_door.close"
-		}
-	} else if nowOpen {
-		soundName = "minecraft:block.wooden_door.open"
+	soundName := world.DoorToggleSound(oldState, nowOpen)
+	cx, cz := int32(x>>4), int32(z>>4)
+	s.BroadcastDimensionChunk(targetDim, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(soundName, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
+	s.EmitVibration(VibrationEvent{
+		Dimension: targetDim,
+		Type:      GameEventBlockChange,
+		X:         float64(x) + 0.5,
+		Y:         float64(y) + 0.5,
+		Z:         float64(z) + 0.5,
+		Player:    session,
+	})
+	return nowOpen, true
+}
+
+// InteractTrapdoor toggles a non-iron trapdoor at (dim, x, y, z), broadcasting
+// block updates, playing its `BlockSetType` open/close sound, and emitting a
+// `block_change` vibration.
+func (s *Server) InteractTrapdoor(
+	session *PlayerSession,
+	dim string,
+	x, y, z int,
+) (opened bool, toggled bool) {
+	if s == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return false, false
 	}
+	targetDim := normalizeDispenserDim(dim)
+	if session != nil && dim == "" {
+		if d := session.Dimension(); d != "" {
+			targetDim = normalizeDispenserDim(d)
+		}
+	}
+	cache := s.DimensionChunks(targetDim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return false, false
+	}
+	oldState := cache.GetBlock(x, y, z)
+	changed, upd := cache.ToggleTrapdoor(x, y, z)
+	if !changed {
+		return false, false
+	}
+	s.broadcastDimensionBlockChanges(targetDim, cache, upd.Changes, upd.LightChanged)
+	nowOpen := world.BlockProperties(cache.GetBlock(x, y, z))["open"] == "true"
+
+	soundName := world.TrapdoorToggleSound(oldState, nowOpen)
 	cx, cz := int32(x>>4), int32(z>>4)
 	s.BroadcastDimensionChunk(targetDim, cx, cz, PlaySoundPacketID,
 		EncodeSoundPacket(soundName, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
@@ -167,4 +203,36 @@ func (s *Server) HitBlockWithProjectileMechanism(
 		}
 	}
 	return false
+}
+
+// InteractWithLightBlock cycles the `level` property (0 -> 1 -> ... -> 15 -> 0)
+// of a `minecraft:light` block at (dim, x, y, z), matching vanilla 26.1.2
+// `LightBlock.useWithoutItem`, and broadcasts the block/lighting changes.
+func (s *Server) InteractWithLightBlock(
+	session *PlayerSession,
+	dim string,
+	x, y, z int,
+) (newLevel int, ok bool) {
+	if s == nil || y < world.MinY || y >= world.MinY+world.WorldHeight {
+		return 0, false
+	}
+	targetDim := normalizeDispenserDim(dim)
+	if session != nil && dim == "" {
+		if d := session.Dimension(); d != "" {
+			targetDim = normalizeDispenserDim(d)
+		}
+	}
+	cache := s.DimensionChunks(targetDim)
+	if cache == nil {
+		cache = s.chunks
+	}
+	if cache == nil {
+		return 0, false
+	}
+	lvl, _, cycled, upd := cache.CycleLightBlockLevelAt(x, y, z)
+	if !cycled {
+		return 0, false
+	}
+	s.broadcastDimensionBlockChanges(targetDim, cache, upd.Changes, upd.LightChanged)
+	return lvl, true
 }

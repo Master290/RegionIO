@@ -59,4 +59,18 @@ func TestServerFenceGateDoubleDoorAndProjectileMechanisms(t *testing.T) {
 	if world.BlockProperties(cache.GetBlock(10, y, 10))["powered"] != "true" {
 		t.Fatalf("expected lever powered=true after wind_charge hit")
 	}
+
+	// 4. InteractTrapdoor toggles trapdoor and InteractWithLightBlock cycles light level.
+	trapSt, _ := world.BlockStateByName("minecraft:cherry_trapdoor", map[string]string{
+		"facing": "north", "half": "bottom", "open": "false", "powered": "false", "waterlogged": "false",
+	})
+	cache.SetBlock(12, y, 12, trapSt)
+	if opened, toggled := s.InteractTrapdoor(nil, world.DimensionOverworld, 12, y, 12); !toggled || !opened {
+		t.Fatalf("expected InteractTrapdoor to open cherry_trapdoor, got opened=%v toggled=%v", opened, toggled)
+	}
+
+	cache.SetBlock(14, y, 14, world.MakeLightBlockState(7, false))
+	if newLvl, ok := s.InteractWithLightBlock(nil, world.DimensionOverworld, 14, y, 14); !ok || newLvl != 8 {
+		t.Fatalf("expected InteractWithLightBlock to cycle 7 -> 8, got newLvl=%d ok=%v", newLvl, ok)
+	}
 }

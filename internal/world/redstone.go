@@ -365,7 +365,9 @@ func isRedstoneComponentName(name string) bool {
 	return strings.HasSuffix(name, "_button") ||
 		strings.HasSuffix(name, "_pressure_plate") ||
 		strings.HasSuffix(name, "_door") ||
-		strings.HasSuffix(name, "_trapdoor")
+		strings.HasSuffix(name, "_trapdoor") ||
+		strings.HasSuffix(name, "_fence_gate") ||
+		strings.HasSuffix(name, "lightning_rod")
 }
 
 // isConductiveSolidBlock reports whether state is an opaque/solid full block
@@ -470,7 +472,7 @@ func (c *Cache) RedstonePowerAt(x, y, z int) int {
 		p, _ := strconv.Atoi(info.Properties["power"])
 		return clampPower(p)
 	}
-	if strings.HasSuffix(info.Name, "_button") || strings.HasSuffix(info.Name, "_pressure_plate") {
+	if strings.HasSuffix(info.Name, "_button") || strings.HasSuffix(info.Name, "_pressure_plate") || strings.HasSuffix(info.Name, "lightning_rod") {
 		if info.Properties["powered"] == "true" {
 			return MaxRedstonePower
 		}
@@ -785,6 +787,21 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 					return p
 				}
 				return 0
+			}
+		}
+		return 0
+	}
+
+	if strings.HasSuffix(name, "lightning_rod") {
+		if props["powered"] != "true" {
+			return 0
+		}
+		if !directOnly {
+			return MaxRedstonePower
+		}
+		if dx, dy, dz, ok := directionOffset3D(oppositeDirection(props["facing"])); ok {
+			if tx == sx+dx && ty == sy+dy && tz == sz+dz {
+				return MaxRedstonePower
 			}
 		}
 		return 0
@@ -1369,6 +1386,8 @@ func (c *Cache) InteractRedstoneBlock(x, y, z int) (bool, BlockUpdateResult) {
 		return c.ToggleTrapdoor(x, y, z)
 	case strings.HasSuffix(info.Name, "_door"):
 		return c.ToggleDoor(x, y, z)
+	case strings.HasSuffix(info.Name, "_fence_gate"):
+		return c.ToggleFenceGate(x, y, z, "")
 	case info.Name == "minecraft:moving_piston":
 		return c.InteractMovingPistonBlockAt(x, y, z)
 	default:
@@ -1449,7 +1468,7 @@ func (c *Cache) stepRedstoneUpdate(x, y, z int, res *BlockUpdateResult) {
 			}
 		}
 
-	case name == "minecraft:lightning_rod":
+	case strings.HasSuffix(name, "lightning_rod"):
 		if props["powered"] == "true" {
 			if nextState, ok := withStateProperty(state, "powered", "false"); ok {
 				if c.setBlockRecorded(x, y, z, nextState, res) {
@@ -1644,6 +1663,9 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 			case strings.HasSuffix(info.Name, "_trapdoor"):
 				c.evaluateTrapdoorRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 
+			case strings.HasSuffix(info.Name, "_fence_gate"):
+				c.evaluateFenceGateRedstone(pos.X, pos.Y, pos.Z, st, info, res)
+
 			case info.Name == "minecraft:redstone_lamp":
 				if c.IsBlockPowered(pos.X, pos.Y, pos.Z) {
 					if info.Properties["lit"] != "true" {
@@ -1733,7 +1755,7 @@ func redstoneSupportOf(x, y, z int, state uint16) (BlockPos, bool) {
 		bx, by, bz := ObserverOutputPos(x, y, z, info.Properties["facing"])
 		return BlockPos{X: bx, Y: by, Z: bz}, true
 	}
-	if info.Name == "minecraft:lightning_rod" {
+	if strings.HasSuffix(info.Name, "lightning_rod") {
 		if dx, dy, dz, ok := directionOffset3D(oppositeDirection(info.Properties["facing"])); ok {
 			return BlockPos{X: x + dx, Y: y + dy, Z: z + dz}, true
 		}
@@ -1986,7 +2008,7 @@ func canWireConnectHorizontally(neighborState uint16, dirFromWireToNeighbor stri
 	case "minecraft:observer":
 		return info.Properties["facing"] == dirFromWireToNeighbor
 	}
-	return strings.HasSuffix(name, "_button") || strings.HasSuffix(name, "_pressure_plate")
+	return strings.HasSuffix(name, "_button") || strings.HasSuffix(name, "_pressure_plate") || strings.HasSuffix(name, "lightning_rod")
 }
 
 func (c *Cache) collectMechanismCandidates(seeds []BlockPos) []BlockPos {
@@ -2277,7 +2299,7 @@ func (c *Cache) StrikeLightningRod(x, y, z int) (bool, BlockUpdateResult) {
 	}
 	state := c.GetBlock(x, y, z)
 	info, ok := stateByID(state)
-	if !ok || info.Name != "minecraft:lightning_rod" {
+	if !ok || !strings.HasSuffix(info.Name, "lightning_rod") {
 		return false, res
 	}
 	nextState, ok := withStateProperty(state, "powered", "true")
@@ -2337,7 +2359,7 @@ func (c *Cache) FindNearestLightningRod(centerX, centerY, centerZ, radius int) (
 			for z := z0; z <= z1; z++ {
 				for x := x0; x <= x1; x++ {
 					st := ch.getBlock(x, y, z)
-					if st == StateAir || !isBlockNamed(st, "minecraft:lightning_rod") {
+					if st == StateAir || !IsLightningRodBlock(st) {
 						continue
 					}
 					dx := x - centerX

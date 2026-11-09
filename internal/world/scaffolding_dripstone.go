@@ -963,3 +963,60 @@ func (c *Cache) ResolveLanternPlacementAt(x, y, z int, state uint16) uint16 {
 	}
 	return state
 }
+
+// ---------------------------------------------------------------------------
+// 4. Climbable Blocks (`#minecraft:climbable` + Open Trapdoor above Ladder)
+// ---------------------------------------------------------------------------
+
+// IsClimbableBlock reports whether state belongs to the vanilla 26.1.2
+// `#minecraft:climbable` block tag (`ladder`, `vine`, `scaffolding`,
+// `weeping_vines`, `weeping_vines_plant`, `twisting_vines`,
+// `twisting_vines_plant`, `cave_vines`, `cave_vines_plant`).
+func IsClimbableBlock(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:ladder",
+		"minecraft:vine",
+		"minecraft:scaffolding",
+		"minecraft:weeping_vines",
+		"minecraft:weeping_vines_plant",
+		"minecraft:twisting_vines",
+		"minecraft:twisting_vines_plant",
+		"minecraft:cave_vines",
+		"minecraft:cave_vines_plant":
+		return true
+	default:
+		return false
+	}
+}
+
+// IsClimbableAt reports whether an entity at block position (x, y, z) can climb,
+// matching vanilla 26.1.2 `LivingEntity.onClimbable()`:
+//   - Any block in `#minecraft:climbable` (`IsClimbableBlock`).
+//   - Any open `*_trapdoor` (`open="true"`) directly above a `minecraft:ladder`
+//     at (x, y-1, z) whose `facing` matches the trapdoor's `facing`
+//     (`LivingEntity.trapDoorUsableAsLadder`).
+func (c *Cache) IsClimbableAt(x, y, z int) bool {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false
+	}
+	state := c.GetBlock(x, y, z)
+	if IsClimbableBlock(state) {
+		return true
+	}
+	info, ok := stateByID(state)
+	if !ok || !strings.HasSuffix(info.Name, "_trapdoor") || info.Properties["open"] != "true" {
+		return false
+	}
+	if y <= MinY {
+		return false
+	}
+	belowInfo, ok := stateByID(c.GetBlock(x, y-1, z))
+	if !ok || belowInfo.Name != "minecraft:ladder" {
+		return false
+	}
+	return belowInfo.Properties["facing"] != "" && belowInfo.Properties["facing"] == info.Properties["facing"]
+}

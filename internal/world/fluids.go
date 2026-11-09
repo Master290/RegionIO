@@ -2,6 +2,7 @@ package world
 
 import (
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -670,4 +671,131 @@ func (c *Cache) SkyLightAt(x, y, z int) int {
 	}
 	sky, _ := c.EnsureLightAt(x, y, z)
 	return int(sky)
+}
+
+// ---------------------------------------------------------------------------
+// Light Block (`minecraft:light`) — Vanilla 26.1.2 `LightBlock`
+// ---------------------------------------------------------------------------
+
+// IsLightBlock reports whether state is `minecraft:light`.
+func IsLightBlock(state uint16) bool {
+	return isBlockNamed(state, "minecraft:light")
+}
+
+// LightBlockLevel returns the `level` property (0..15) of a `minecraft:light`
+// block state.
+func LightBlockLevel(state uint16) (int, bool) {
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:light" {
+		return 0, false
+	}
+	lvl, err := strconv.Atoi(info.Properties["level"])
+	if err != nil || lvl < 0 || lvl > 15 {
+		return 15, true
+	}
+	return lvl, true
+}
+
+// MakeLightBlockState returns the block state ID for `minecraft:light` with
+// the given light `level` (clamped to 0..15) and `waterlogged` flag.
+func MakeLightBlockState(level int, waterlogged bool) uint16 {
+	if level < 0 {
+		level = 0
+	} else if level > 15 {
+		level = 15
+	}
+	if st, ok := nameToStateID("minecraft:light", map[string]string{
+		"level":       strconv.Itoa(level),
+		"waterlogged": boolToProp(waterlogged),
+	}); ok {
+		return st
+	}
+	st, _ := nameToStateID("minecraft:light", nil)
+	return st
+}
+
+// CycleLightBlockLevelAt cycles the `level` property of a `minecraft:light`
+// block at (x, y, z) (`(level + 1) % 16`: 0 -> 1 -> ... -> 15 -> 0), matching
+// vanilla 26.1.2 `LightBlock.useWithoutItem`, and updates block lighting.
+func (c *Cache) CycleLightBlockLevelAt(x, y, z int) (newLevel int, newState uint16, ok bool, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return 0, StateAir, false, res
+	}
+	state := c.GetBlock(x, y, z)
+	info, valid := stateByID(state)
+	if !valid || info.Name != "minecraft:light" {
+		return 0, state, false, res
+	}
+	curLevel, _ := strconv.Atoi(info.Properties["level"])
+	nextLevel := (curLevel + 1) & 15
+	waterlogged := info.Properties["waterlogged"] == "true"
+	nextState := MakeLightBlockState(nextLevel, waterlogged)
+	if nextState == StateAir {
+		return curLevel, state, false, res
+	}
+	c.setBlockRecorded(x, y, z, nextState, &res)
+	return nextLevel, nextState, true, res
+}
+
+// ---------------------------------------------------------------------------
+// Slime Block (`minecraft:slime_block`) & Cobweb (`minecraft:cobweb`) Physics
+// ---------------------------------------------------------------------------
+
+// IsSlimeBlock reports whether state is `minecraft:slime_block`.
+func IsSlimeBlock(state uint16) bool {
+	return isBlockNamed(state, "minecraft:slime_block")
+}
+
+// SlimeBlockFallDamageMultiplier returns the fall-damage multiplier when landing
+// on `minecraft:slime_block` (0.0 when not sneaking, 1.0 when sneaking),
+// matching vanilla 26.1.2 `SlimeBlock.fallOn`.
+func SlimeBlockFallDamageMultiplier(sneaking bool) float32 {
+	if sneaking {
+		return 1.0
+	}
+	return 0.0
+}
+
+// ApplySlimeBlockBounce applies vanilla 26.1.2 `SlimeBlock.bounceUp`
+// (`updateEntityMovementAfterFallOn`) to an entity's velocity `(vx, vy, vz)`:
+//   - If sneaking (`isSuppressingBounce`) or `vy >= 0`, no bounce occurs.
+//   - Otherwise `vy` is inverted and scaled by `1.0` for living entities or
+//     `0.8` for non-living entities.
+func ApplySlimeBlockBounce(vx, vy, vz float64, isLiving, sneaking bool) (nx, ny, nz float64, bounced bool) {
+	if sneaking || vy >= 0.0 {
+		return vx, vy, vz, false
+	}
+	factor := 0.8
+	if isLiving {
+		factor = 1.0
+	}
+	return vx, -vy * factor, vz, true
+}
+
+// ApplySlimeBlockStepSlowdown applies vanilla 26.1.2 `SlimeBlock.stepOn`
+// horizontal velocity damping when walking on `minecraft:slime_block` without
+// sneaking (`abs(vy) < 0.1` -> scale X/Z by `0.4 + abs(vy) * 0.2`).
+func ApplySlimeBlockStepSlowdown(vx, vy, vz float64, sneaking bool) (nx, ny, nz float64) {
+	absVY := math.Abs(vy)
+	if !sneaking && absVY < 0.1 {
+		scale := 0.4 + absVY*0.2
+		return vx * scale, vy, vz * scale
+	}
+	return vx, vy, vz
+}
+
+// IsCobwebBlock reports whether state is `minecraft:cobweb`.
+func IsCobwebBlock(state uint16) bool {
+	return isBlockNamed(state, "minecraft:cobweb")
+}
+
+// CobwebMotionMultiplier returns the vanilla 26.1.2 `WebBlock.entityInside`
+// stuck-in-block motion multiplier `(mx, my, mz)`:
+//   - `(0.5, 0.25, 0.5)` when the living entity has `minecraft:weaving`.
+//   - `(0.25, 0.05, 0.25)` otherwise.
+func CobwebMotionMultiplier(hasWeavingEffect bool) (mx, my, mz float64) {
+	if hasWeavingEffect {
+		return 0.5, 0.25, 0.5
+	}
+	return 0.25, 0.05, 0.25
 }

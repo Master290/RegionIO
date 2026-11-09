@@ -341,3 +341,135 @@ func (c *Cache) ActivateBlockByWindChargeAt(x, y, z int) (activated bool, res Bl
 		return false, res
 	}
 }
+
+// --- Door, Trapdoor, and Fence Gate Sounds (Vanilla 26.1.2 `BlockSetType` / `WoodType`) ---
+
+// DoorToggleSound returns the vanilla 26.1.2 `BlockSetType` sound event name
+// (`doorOpen` when opened is true, `doorClose` when false) for the door block
+// state (supporting iron, copper, cherry, bamboo, crimson/warped nether wood,
+// and standard wooden doors).
+func DoorToggleSound(state uint16, opened bool) string {
+	info, ok := stateByID(state)
+	if !ok {
+		if opened {
+			return "minecraft:block.wooden_door.open"
+		}
+		return "minecraft:block.wooden_door.close"
+	}
+	if IsCopperDoorBlock(state) {
+		if opened {
+			return "minecraft:block.copper_door.open"
+		}
+		return "minecraft:block.copper_door.close"
+	}
+	switch info.Name {
+	case "minecraft:iron_door":
+		if opened {
+			return "minecraft:block.iron_door.open"
+		}
+		return "minecraft:block.iron_door.close"
+	case "minecraft:cherry_door":
+		if opened {
+			return "minecraft:block.cherry_wood_door.open"
+		}
+		return "minecraft:block.cherry_wood_door.close"
+	case "minecraft:bamboo_door":
+		if opened {
+			return "minecraft:block.bamboo_wood_door.open"
+		}
+		return "minecraft:block.bamboo_wood_door.close"
+	case "minecraft:crimson_door", "minecraft:warped_door":
+		if opened {
+			return "minecraft:block.nether_wood_door.open"
+		}
+		return "minecraft:block.nether_wood_door.close"
+	default:
+		if opened {
+			return "minecraft:block.wooden_door.open"
+		}
+		return "minecraft:block.wooden_door.close"
+	}
+}
+
+// TrapdoorToggleSound returns the vanilla 26.1.2 `BlockSetType` sound event
+// name (`trapdoorOpen` when opened is true, `trapdoorClose` when false) for the
+// trapdoor block state (supporting iron, copper, cherry, bamboo, crimson/warped
+// nether wood, and standard wooden trapdoors).
+func TrapdoorToggleSound(state uint16, opened bool) string {
+	info, ok := stateByID(state)
+	if !ok {
+		if opened {
+			return "minecraft:block.wooden_trapdoor.open"
+		}
+		return "minecraft:block.wooden_trapdoor.close"
+	}
+	if IsCopperTrapdoorBlock(state) {
+		if opened {
+			return "minecraft:block.copper_trapdoor.open"
+		}
+		return "minecraft:block.copper_trapdoor.close"
+	}
+	switch info.Name {
+	case "minecraft:iron_trapdoor":
+		if opened {
+			return "minecraft:block.iron_trapdoor.open"
+		}
+		return "minecraft:block.iron_trapdoor.close"
+	case "minecraft:cherry_trapdoor":
+		if opened {
+			return "minecraft:block.cherry_wood_trapdoor.open"
+		}
+		return "minecraft:block.cherry_wood_trapdoor.close"
+	case "minecraft:bamboo_trapdoor":
+		if opened {
+			return "minecraft:block.bamboo_wood_trapdoor.open"
+		}
+		return "minecraft:block.bamboo_wood_trapdoor.close"
+	case "minecraft:crimson_trapdoor", "minecraft:warped_trapdoor":
+		if opened {
+			return "minecraft:block.nether_wood_trapdoor.open"
+		}
+		return "minecraft:block.nether_wood_trapdoor.close"
+	default:
+		if opened {
+			return "minecraft:block.wooden_trapdoor.open"
+		}
+		return "minecraft:block.wooden_trapdoor.close"
+	}
+}
+
+// FenceGateToggleSound returns the vanilla 26.1.2 `WoodType` sound event name
+// (`fenceGateOpen` when opened is true, `fenceGateClose` when false) for the
+// fence gate block state (supporting cherry, bamboo, crimson/warped nether
+// wood, and standard wooden fence gates).
+func FenceGateToggleSound(state uint16, opened bool) string {
+	info, ok := stateByID(state)
+	if !ok {
+		if opened {
+			return "minecraft:block.fence_gate.open"
+		}
+		return "minecraft:block.fence_gate.close"
+	}
+	switch info.Name {
+	case "minecraft:cherry_fence_gate":
+		if opened {
+			return "minecraft:block.cherry_wood_fence_gate.open"
+		}
+		return "minecraft:block.cherry_wood_fence_gate.close"
+	case "minecraft:bamboo_fence_gate":
+		if opened {
+			return "minecraft:block.bamboo_wood_fence_gate.open"
+		}
+		return "minecraft:block.bamboo_wood_fence_gate.close"
+	case "minecraft:crimson_fence_gate", "minecraft:warped_fence_gate":
+		if opened {
+			return "minecraft:block.nether_wood_fence_gate.open"
+		}
+		return "minecraft:block.nether_wood_fence_gate.close"
+	default:
+		if opened {
+			return "minecraft:block.fence_gate.open"
+		}
+		return "minecraft:block.fence_gate.close"
+	}
+}
