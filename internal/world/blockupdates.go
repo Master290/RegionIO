@@ -353,6 +353,7 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 			c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			c.stepComposterUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			c.stepFrostedIceUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			c.stepEyeblossomUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		case UpdateFire:
 			c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 		}

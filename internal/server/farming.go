@@ -375,3 +375,55 @@ func (s *Server) UpdateComparatorsAt(dim string, x, y, z int) world.BlockUpdateR
 	return s.UpdateItemFrameComparatorsAt(dim, x, y, z)
 }
 
+// CarvePumpkinWithShears carves a `minecraft:pumpkin` at (x, y, z) into
+// `minecraft:carved_pumpkin` when a player uses `minecraft:shears` on face
+// (0=down, 1=up, 2=north, 3=south, 4=west, 5=east), drops `4x minecraft:pumpkin_seeds`,
+// damages the shears in non-Creative mode, and emits `GameEventShear`
+// (`PumpkinBlock.useItemOn`).
+func (s *Server) CarvePumpkinWithShears(session *PlayerSession, x, y, z int, face int, hand int32) bool {
+	if s == nil || session == nil {
+		return false
+	}
+	invSlot, held := session.handSlotAndStack(hand)
+	if held.IsEmpty() || held.ResolvedID() != "minecraft:shears" {
+		return false
+	}
+	snap := session.Snapshot()
+	dim := session.Dimension()
+	cache := s.worldCacheForSession(session)
+	if cache == nil {
+		return false
+	}
+	var clickedFace string
+	switch face {
+	case 2:
+		clickedFace = "north"
+	case 3:
+		clickedFace = "south"
+	case 4:
+		clickedFace = "west"
+	case 5:
+		clickedFace = "east"
+	case 0:
+		clickedFace = "down"
+	default:
+		clickedFace = "up"
+	}
+	playerFacing := HorizontalFacingFromYaw(snap.Yaw)
+	_, seeds, ok, upd := cache.CarvePumpkinAt(x, y, z, clickedFace, playerFacing)
+	if !ok {
+		return false
+	}
+	s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
+	if !seeds.IsEmpty() {
+		s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, seeds)
+	}
+	s.RecordItemUsed(session, "minecraft:shears", 1)
+	if snap.GameMode != GameModeCreative {
+		s.DamagePlayerItem(session, invSlot, 1)
+	}
+	s.EmitPlayerBlockVibration(session, GameEventShear, dim, x, y, z, "minecraft:carved_pumpkin")
+	return true
+}
+
+

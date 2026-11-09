@@ -1,6 +1,7 @@
 package world
 
 import (
+	"math/rand"
 	"strconv"
 	"strings"
 )
@@ -443,3 +444,127 @@ func (c *Cache) stepComposterUpdate(x, y, z int, res *BlockUpdateResult) {
 		c.scheduleAround(x, y, z)
 	}
 }
+
+// CompostChanceForItem returns the vanilla 26.1.2 composting probability
+// (`ComposterBlock.bootStrap`: 0.30, 0.50, 0.65, 0.85, or 1.00) for itemID,
+// or 0 if the item is not compostable.
+func CompostChanceForItem(itemID string) float32 {
+	norm := strings.ToLower(strings.TrimSpace(itemID))
+	if norm == "" {
+		return 0
+	}
+	if !strings.Contains(norm, ":") {
+		norm = "minecraft:" + norm
+	}
+	// Check explicit overrides before suffix wildcards (`flowering_azalea_leaves` is 0.50 in vanilla, not 0.30).
+	if norm == "minecraft:flowering_azalea_leaves" {
+		return 0.50
+	}
+	if strings.HasSuffix(norm, "_leaves") || strings.HasSuffix(norm, "_sapling") || strings.HasSuffix(norm, "_seeds") {
+		return 0.30
+	}
+	switch norm {
+	case "minecraft:short_grass", "minecraft:kelp", "minecraft:dried_kelp",
+		"minecraft:moss_carpet", "minecraft:pale_moss_carpet",
+		"minecraft:seagrass", "minecraft:small_dripleaf",
+		"minecraft:sweet_berries", "minecraft:glow_berries",
+		"minecraft:hanging_roots", "minecraft:pale_hanging_moss",
+		"minecraft:mangrove_propagule", "minecraft:mangrove_roots",
+		"minecraft:pink_petals", "minecraft:pitcher_pod",
+		"minecraft:short_dry_grass", "minecraft:tall_dry_grass",
+		"minecraft:bush", "minecraft:firefly_bush",
+		"minecraft:leaf_litter", "minecraft:wildflowers", "minecraft:cactus_flower":
+		return 0.30
+	case "minecraft:dried_kelp_block", "minecraft:tall_grass",
+		"minecraft:cactus", "minecraft:sugar_cane",
+		"minecraft:vine", "minecraft:nether_sprouts",
+		"minecraft:weeping_vines", "minecraft:twisting_vines",
+		"minecraft:melon_slice", "minecraft:glow_lichen":
+		return 0.50
+	case "minecraft:apple", "minecraft:beetroot", "minecraft:carrot", "minecraft:cocoa_beans",
+		"minecraft:potato", "minecraft:wheat", "minecraft:melon", "minecraft:pumpkin", "minecraft:carved_pumpkin",
+		"minecraft:sea_pickle", "minecraft:brown_mushroom", "minecraft:red_mushroom",
+		"minecraft:mushroom_stem", "minecraft:nether_wart",
+		"minecraft:crimson_fungus", "minecraft:warped_fungus",
+		"minecraft:crimson_roots", "minecraft:warped_roots",
+		"minecraft:lily_pad", "minecraft:fern", "minecraft:large_fern",
+		"minecraft:dandelion", "minecraft:poppy", "minecraft:blue_orchid", "minecraft:allium",
+		"minecraft:azure_bluet", "minecraft:red_tulip", "minecraft:orange_tulip",
+		"minecraft:white_tulip", "minecraft:pink_tulip", "minecraft:oxeye_daisy",
+		"minecraft:cornflower", "minecraft:lily_of_the_valley", "minecraft:wither_rose",
+		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
+		"minecraft:moss_block", "minecraft:pale_moss_block", "minecraft:azalea", "minecraft:big_dripleaf",
+		"minecraft:shroomlight", "minecraft:spore_blossom",
+		"minecraft:open_eyeblossom", "minecraft:closed_eyeblossom":
+		return 0.65
+	case "minecraft:baked_potato", "minecraft:bread", "minecraft:cookie", "minecraft:hay_block",
+		"minecraft:nether_wart_block", "minecraft:warped_wart_block", "minecraft:flowering_azalea",
+		"minecraft:red_mushroom_block", "minecraft:brown_mushroom_block",
+		"minecraft:torchflower", "minecraft:pitcher_plant":
+		return 0.85
+	case "minecraft:cake", "minecraft:pumpkin_pie":
+		return 1.00
+	default:
+		return 0
+	}
+}
+
+// CompostItemAt attempts to add 1 compostable item (`itemID`) to a
+// `minecraft:composter` at (x, y, z) when `level < 7` (`ComposterBlock.addItem`):
+//   - At `level == 0`, always increments to `level == 1`.
+//   - At `level 1..6`, increments to `level + 1` with probability `CompostChanceForItem(itemID)`.
+//   - When reaching `level == 7`, schedules a 20-tick block update to mature to `level == 8`.
+func (c *Cache) CompostItemAt(x, y, z int, itemID string, rng *rand.Rand) (consumed bool, increased bool, newLevel int, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return false, false, 0, res
+	}
+	chance := CompostChanceForItem(itemID)
+	if chance <= 0 {
+		return false, false, 0, res
+	}
+	cur := c.GetBlock(x, y, z)
+	lvl, ok := ComposterLevel(cur)
+	if !ok || lvl >= ComposterMaxFillLevel {
+		return false, false, lvl, res
+	}
+	if rng == nil {
+		fs := c.farmingState()
+		fs.mu.Lock()
+		rng = rand.New(rand.NewSource(fs.rng.Int63()))
+		fs.mu.Unlock()
+	}
+	nextLvl := lvl
+	if lvl == 0 || rng.Float64() < float64(chance) {
+		nextLvl = lvl + 1
+		increased = true
+	}
+	if increased {
+		nextState := MakeComposterBlockState(nextLvl)
+		_, res = c.ApplyBlockWithUpdates(x, y, z, nextState)
+		if nextLvl == ComposterMaxFillLevel {
+			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ComposterReadyTickDelay)
+		}
+	}
+	return true, increased, nextLvl, res
+}
+
+// ExtractComposterAt extracts `1x minecraft:bone_meal` from a ready
+// `minecraft:composter[level=8]` at (x, y, z) and resets its `level` to `0`
+// (`ComposterBlock.extractProduce`).
+func (c *Cache) ExtractComposterAt(x, y, z int) (boneMeal ItemStack, ok bool, res BlockUpdateResult) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return ItemStack{}, false, res
+	}
+	cur := c.GetBlock(x, y, z)
+	lvl, isComposter := ComposterLevel(cur)
+	if !isComposter || lvl != ComposterReadyLevel {
+		return ItemStack{}, false, res
+	}
+	resetState := MakeComposterBlockState(0)
+	applied, upd := c.ApplyBlockWithUpdates(x, y, z, resetState)
+	if !applied {
+		return ItemStack{}, false, res
+	}
+	return NewNamedItemStack("minecraft:bone_meal", 1), true, upd
+}
+

@@ -312,37 +312,7 @@ func (s *Server) transferIntoComposterAt(dim string, cache *world.Cache, x, y, z
 }
 
 func compostChanceForItem(itemID string) float32 {
-	norm := canonicalResourceName(itemID)
-	if strings.HasSuffix(norm, "_leaves") || strings.HasSuffix(norm, "_sapling") || strings.HasSuffix(norm, "_seeds") {
-		return 0.3
-	}
-	switch norm {
-	case "minecraft:short_grass", "minecraft:kelp", "minecraft:moss_carpet", "minecraft:seagrass",
-		"minecraft:small_dripleaf", "minecraft:sweet_berries", "minecraft:glow_berries", "minecraft:hanging_roots":
-		return 0.3
-	case "minecraft:dried_kelp", "minecraft:tall_grass", "minecraft:cactus", "minecraft:sugar_cane",
-		"minecraft:vine", "minecraft:nether_sprouts", "minecraft:weeping_vines", "minecraft:twisting_vines",
-		"minecraft:melon_slice", "minecraft:glow_lichen":
-		return 0.5
-	case "minecraft:apple", "minecraft:beetroot", "minecraft:carrot", "minecraft:cocoa_beans",
-		"minecraft:potato", "minecraft:wheat", "minecraft:melon", "minecraft:pumpkin", "minecraft:carved_pumpkin",
-		"minecraft:sea_pickle", "minecraft:brown_mushroom", "minecraft:red_mushroom",
-		"minecraft:crimson_fungus", "minecraft:warped_fungus", "minecraft:lily_pad",
-		"minecraft:fern", "minecraft:large_fern", "minecraft:dandelion", "minecraft:poppy",
-		"minecraft:blue_orchid", "minecraft:allium", "minecraft:azure_bluet", "minecraft:oxeye_daisy",
-		"minecraft:cornflower", "minecraft:lily_of_the_valley", "minecraft:wither_rose",
-		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
-		"minecraft:moss_block", "minecraft:azalea", "minecraft:big_dripleaf", "minecraft:shroomlight":
-		return 0.65
-	case "minecraft:baked_potato", "minecraft:bread", "minecraft:cookie", "minecraft:hay_block",
-		"minecraft:nether_wart_block", "minecraft:warped_wart_block", "minecraft:flowering_azalea",
-		"minecraft:red_mushroom_block", "minecraft:brown_mushroom_block":
-		return 0.85
-	case "minecraft:cake", "minecraft:pumpkin_pie":
-		return 1.0
-	default:
-		return 0
-	}
+	return world.CompostChanceForItem(itemID)
 }
 
 func oppositeDropperDirection(facing string) string {

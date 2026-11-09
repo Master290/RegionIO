@@ -769,3 +769,337 @@ func TestSaplingFlowerBeeNestAzaleaRootedDirtAndMegaSprucePodzol(t *testing.T) {
 		t.Fatalf("expected 2x2 mega spruce tree growth to convert nearby grass_block to podzol")
 	}
 }
+
+func TestMushroomRandomTickSpreadAndLightSurvival(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(7001))
+
+	brownMushroom, ok := nameToStateID("minecraft:brown_mushroom", nil)
+	if !ok {
+		t.Fatal("missing minecraft:brown_mushroom state")
+	}
+	redMushroom, ok := nameToStateID("minecraft:red_mushroom", nil)
+	if !ok {
+		t.Fatal("missing minecraft:red_mushroom state")
+	}
+	if !IsRandomTickableBlock(brownMushroom) || !IsRandomTickableBlock(redMushroom) {
+		t.Fatal("expected brown_mushroom and red_mushroom to be random-tickable")
+	}
+
+	// 1. Under open sky (raw brightness 15), mushroom cannot survive on normal stone,
+	//    but CAN survive on #minecraft:overrides_mushroom_light_requirement (mycelium/podzol).
+	c.SetBlock(10, FlatSurfaceY, 10, StateStone)
+	if c.CanMushroomSurviveAt(10, FlatSurfaceY+1, 10) {
+		t.Fatal("expected mushroom not to survive on stone at sky light 15")
+	}
+	c.SetBlock(10, FlatSurfaceY, 10, StateMycelium)
+	if !c.CanMushroomSurviveAt(10, FlatSurfaceY+1, 10) {
+		t.Fatal("expected mushroom to survive on mycelium even at sky light 15")
+	}
+
+	// 2. Fill a 9x9 mycelium patch around (20, FlatSurfaceY, 20) and random-tick a
+	//    brown_mushroom until it spreads, then verify the 5-mushroom cap in 9x3x9.
+	for dx := -4; dx <= 4; dx++ {
+		for dz := -4; dz <= 4; dz++ {
+			c.SetBlock(20+dx, FlatSurfaceY, 20+dz, StateMycelium)
+		}
+	}
+	c.SetBlock(20, FlatSurfaceY+1, 20, brownMushroom)
+	for i := 0; i < 400; i++ {
+		c.RandomTickBlockWithRNG(20, FlatSurfaceY+1, 20, rng)
+	}
+	count := 0
+	for dx := -4; dx <= 4; dx++ {
+		for dz := -4; dz <= 4; dz++ {
+			for dy := -1; dy <= 1; dy++ {
+				if isBlockNamed(c.GetBlock(20+dx, FlatSurfaceY+1+dy, 20+dz), "minecraft:brown_mushroom") {
+					count++
+				}
+			}
+		}
+	}
+	if count < 2 {
+		t.Fatalf("expected brown_mushroom to spread on mycelium via random ticks, got count=%d", count)
+	}
+
+	// Place 5 red_mushrooms in the 9x3x9 box around (40, FlatSurfaceY+1, 40) and verify no 6th mushroom spreads.
+	for dx := -4; dx <= 4; dx++ {
+		for dz := -4; dz <= 4; dz++ {
+			c.SetBlock(40+dx, FlatSurfaceY, 40+dz, StateMycelium)
+		}
+	}
+	coords := [][2]int{{40, 40}, {39, 40}, {41, 40}, {40, 39}, {40, 41}}
+	for _, pt := range coords {
+		c.SetBlock(pt[0], FlatSurfaceY+1, pt[1], redMushroom)
+	}
+	for i := 0; i < 300; i++ {
+		c.RandomTickBlockWithRNG(40, FlatSurfaceY+1, 40, rng)
+	}
+	redCount := 0
+	for dx := -4; dx <= 4; dx++ {
+		for dz := -4; dz <= 4; dz++ {
+			for dy := -1; dy <= 1; dy++ {
+				if isBlockNamed(c.GetBlock(40+dx, FlatSurfaceY+1+dy, 40+dz), "minecraft:red_mushroom") {
+					redCount++
+				}
+			}
+		}
+	}
+	if redCount != 5 {
+		t.Fatalf("expected 5-mushroom cap to prevent further spread in 9x3x9 box, got %d", redCount)
+	}
+}
+
+func TestCactusFlowerGrowthAtAge8SmallAndTall(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	cactusAge8, ok := nameToStateID("minecraft:cactus", map[string]string{"age": "8"})
+	if !ok {
+		t.Fatal("missing minecraft:cactus[age=8]")
+	}
+	cactusAge0, _ := nameToStateID("minecraft:cactus", map[string]string{"age": "0"})
+
+	// 1. Height-1 cactus at age=8 has 10% chance to grow cactus_flower and always advances to age=9.
+	c.SetBlock(10, FlatSurfaceY, 10, StateSand)
+	grewSmallFlower := false
+	for trial := int64(1); trial <= 100; trial++ {
+		c.SetBlock(10, FlatSurfaceY+1, 10, cactusAge8)
+		c.SetBlock(10, FlatSurfaceY+2, 10, StateAir)
+		c.RandomTickBlockWithRNG(10, FlatSurfaceY+1, 10, rand.New(rand.NewSource(trial)))
+		info, _ := stateByID(c.GetBlock(10, FlatSurfaceY+1, 10))
+		if info.Properties["age"] != "9" {
+			t.Fatalf("expected height-1 cactus at age 8 to advance to age 9, got %s", info.Properties["age"])
+		}
+		if isBlockNamed(c.GetBlock(10, FlatSurfaceY+2, 10), "minecraft:cactus_flower") {
+			grewSmallFlower = true
+			break
+		}
+	}
+	if !grewSmallFlower {
+		t.Fatal("expected height-1 cactus at age 8 to grow minecraft:cactus_flower within 100 trials")
+	}
+
+	// 2. Height-3 cactus at age=8 has 25% chance to grow cactus_flower at y+4 and ages up to 15 without growing a 4th cactus block.
+	c.SetBlock(14, FlatSurfaceY, 14, StateSand)
+	c.SetBlock(14, FlatSurfaceY+1, 14, cactusAge0)
+	c.SetBlock(14, FlatSurfaceY+2, 14, cactusAge0)
+	grewTallFlower := false
+	for trial := int64(1); trial <= 50; trial++ {
+		c.SetBlock(14, FlatSurfaceY+3, 14, cactusAge8)
+		c.SetBlock(14, FlatSurfaceY+4, 14, StateAir)
+		c.RandomTickBlockWithRNG(14, FlatSurfaceY+3, 14, rand.New(rand.NewSource(trial)))
+		if isBlockNamed(c.GetBlock(14, FlatSurfaceY+4, 14), "minecraft:cactus_flower") {
+			grewTallFlower = true
+			break
+		}
+	}
+	if !grewTallFlower {
+		t.Fatal("expected height-3 cactus at age 8 to grow minecraft:cactus_flower within 50 trials")
+	}
+}
+
+func TestSeaPicklePlacementStackingAndBonemealSpread(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(9911))
+
+	// 1. PlaceOrStackSeaPickleAt stacks 1 -> 2 -> 3 -> 4 in source water.
+	c.SetBlock(8, FlatSurfaceY+1, 8, StateWater)
+	for want := 1; want <= 4; want++ {
+		st, ok, _ := c.PlaceOrStackSeaPickleAt(8, FlatSurfaceY+1, 8)
+		if !ok {
+			t.Fatalf("PlaceOrStackSeaPickleAt step %d failed", want)
+		}
+		info, _ := stateByID(st)
+		if info.Properties["pickles"] != strconv.Itoa(want) || info.Properties["waterlogged"] != "true" {
+			t.Fatalf("step %d: got %+v", want, info.Properties)
+		}
+	}
+	if _, ok, _ := c.PlaceOrStackSeaPickleAt(8, FlatSurfaceY+1, 8); ok {
+		t.Fatal("expected 5th sea_pickle stack attempt to fail when already at 4")
+	}
+
+	// 2. Dead (unwaterlogged) sea_pickle is not a valid bonemeal target; live waterlogged sea_pickle on live coral block spreads in 5x5 diamond.
+	deadPickle, _ := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": "1", "waterlogged": "false"})
+	livePickle, _ := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": "1", "waterlogged": "true"})
+	if CanBoneMeal(deadPickle) {
+		t.Fatal("expected dead (waterlogged=false) sea_pickle not to be a valid bonemeal target")
+	}
+	if !CanBoneMeal(livePickle) {
+		t.Fatal("expected waterlogged sea_pickle to be a valid bonemeal target")
+	}
+
+	tubeCoralBlock, _ := nameToStateID("minecraft:tube_coral_block", nil)
+	for dx := -2; dx <= 2; dx++ {
+		for dz := -2; dz <= 2; dz++ {
+			c.SetBlock(20+dx, FlatSurfaceY, 20+dz, tubeCoralBlock)
+			c.SetBlock(20+dx, FlatSurfaceY+1, 20+dz, StateWater)
+		}
+	}
+	c.SetBlock(20, FlatSurfaceY+1, 20, livePickle)
+	consumed, _ := c.ApplyBoneMeal(20, FlatSurfaceY+1, 20, rng)
+	if !consumed {
+		t.Fatal("expected ApplyBoneMeal on waterlogged sea_pickle above coral block to succeed")
+	}
+	centerInfo, _ := stateByID(c.GetBlock(20, FlatSurfaceY+1, 20))
+	if centerInfo.Properties["pickles"] != "4" {
+		t.Fatalf("expected center sea_pickle to reach pickles=4, got %s", centerInfo.Properties["pickles"])
+	}
+	spreadCount := 0
+	for dx := -2; dx <= 2; dx++ {
+		for dz := -2; dz <= 2; dz++ {
+			if dx == 0 && dz == 0 {
+				continue
+			}
+			if isBlockNamed(c.GetBlock(20+dx, FlatSurfaceY+1, 20+dz), "minecraft:sea_pickle") {
+				spreadCount++
+			}
+		}
+	}
+	if spreadCount == 0 {
+		t.Fatal("expected bonemeal on sea_pickle above live coral to spread sea pickles to surrounding water blocks")
+	}
+}
+
+func TestEyeblossomDayNightAndWaveCascade(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(12345))
+
+	closedEye, _ := nameToStateID("minecraft:closed_eyeblossom", nil)
+	openEye, _ := nameToStateID("minecraft:open_eyeblossom", nil)
+	pottedClosed, _ := nameToStateID("minecraft:potted_closed_eyeblossom", nil)
+	if !IsRandomTickableBlock(closedEye) || !IsRandomTickableBlock(openEye) || !IsRandomTickableBlock(pottedClosed) {
+		t.Fatal("expected open/closed/potted eyeblossom blocks to be random-tickable")
+	}
+
+	// Place a center closed_eyeblossom at (10, FlatSurfaceY+1, 10) and two neighbors within the 7x5x7 cascade box.
+	c.SetBlock(10, FlatSurfaceY+1, 10, closedEye)
+	c.SetBlock(12, FlatSurfaceY+1, 10, closedEye)
+	c.SetBlock(10, FlatSurfaceY+1, 13, closedEye)
+	c.SetBlock(15, FlatSurfaceY+1, 15, pottedClosed)
+
+	// Night random tick opens center and schedules cascade ticks on the two neighbors.
+	changed, _ := c.RandomTickEyeblossomAt(10, FlatSurfaceY+1, 10, true, rng)
+	if !changed || c.GetBlock(10, FlatSurfaceY+1, 10) != openEye {
+		t.Fatal("expected closed_eyeblossom to open on night random tick")
+	}
+	c.FlushBlockUpdates(60)
+	if c.GetBlock(12, FlatSurfaceY+1, 10) != openEye || c.GetBlock(10, FlatSurfaceY+1, 13) != openEye {
+		t.Fatal("expected neighbor closed_eyeblossoms in 7x5x7 box to open via scheduled wave cascade")
+	}
+
+	// Potted closed eyeblossom also opens at night.
+	pChanged, _ := c.RandomTickEyeblossomAt(15, FlatSurfaceY+1, 15, true, rng)
+	if !pChanged || !isBlockNamed(c.GetBlock(15, FlatSurfaceY+1, 15), "minecraft:potted_open_eyeblossom") {
+		t.Fatal("expected potted_closed_eyeblossom to transform to potted_open_eyeblossom at night")
+	}
+
+	// Day random tick closes them back.
+	changed, _ = c.RandomTickEyeblossomAt(10, FlatSurfaceY+1, 10, false, rng)
+	if !changed || c.GetBlock(10, FlatSurfaceY+1, 10) != closedEye {
+		t.Fatal("expected open_eyeblossom to close on day random tick")
+	}
+	c.FlushBlockUpdates(60)
+	if c.GetBlock(12, FlatSurfaceY+1, 10) != closedEye {
+		t.Fatal("expected neighbor open_eyeblossom to close via scheduled wave cascade")
+	}
+}
+
+func TestCarvePumpkinBeehiveHoneyBlockAndComposter2612(t *testing.T) {
+	c := NewCache(256, GenerateFlat)
+	rng := rand.New(rand.NewSource(888))
+
+	// 1. CarvePumpkinAt: horizontal face uses clickedFace; top face uses opposite of player facing.
+	pumpkin, _ := nameToStateID("minecraft:pumpkin", nil)
+	c.SetBlock(5, FlatSurfaceY+1, 5, pumpkin)
+	carvedSt, seeds, ok, _ := c.CarvePumpkinAt(5, FlatSurfaceY+1, 5, "east", "north")
+	if !ok || seeds.ResolvedID() != "minecraft:pumpkin_seeds" || seeds.Count != 4 {
+		t.Fatalf("CarvePumpkinAt failed: ok=%v seeds=%+v", ok, seeds)
+	}
+	info, _ := stateByID(carvedSt)
+	if info.Name != "minecraft:carved_pumpkin" || info.Properties["facing"] != "east" {
+		t.Fatalf("expected carved_pumpkin[facing=east], got %+v", info)
+	}
+
+	c.SetBlock(6, FlatSurfaceY+1, 5, pumpkin)
+	carvedTop, _, ok, _ := c.CarvePumpkinAt(6, FlatSurfaceY+1, 5, "up", "north")
+	topInfo, _ := stateByID(carvedTop)
+	if !ok || topInfo.Properties["facing"] != "south" {
+		t.Fatalf("expected top-clicked pumpkin with north-facing player to face south, got %+v", topInfo)
+	}
+
+	// 2. Beehive placement, honey_level, and harvest with campfire smoke check.
+	litCampfire, _ := MakeCampfireBlockState("minecraft:campfire", "north", true, false, false)
+	c.SetBlock(10, FlatSurfaceY+1, 10, litCampfire)
+	hiveFull, ok := ResolveBeehivePlacementState("minecraft:beehive", "south", 5)
+	if !ok {
+		t.Fatal("ResolveBeehivePlacementState failed")
+	}
+	c.SetBlock(10, FlatSurfaceY+3, 10, hiveFull)
+	if lvl, ok := BeehiveHoneyLevel(hiveFull); !ok || lvl != 5 {
+		t.Fatalf("BeehiveHoneyLevel = (%d, %v), want (5, true)", lvl, ok)
+	}
+	comb, resetSt, smokey, ok, _ := c.HarvestBeehiveAt(10, FlatSurfaceY+3, 10, "minecraft:shears")
+	if !ok || !smokey || comb.ResolvedID() != "minecraft:honeycomb" || comb.Count != 3 {
+		t.Fatalf("HarvestBeehiveAt(shears) = (item=%+v, smokey=%v, ok=%v)", comb, smokey, ok)
+	}
+	if lvl, _ := BeehiveHoneyLevel(resetSt); lvl != 0 {
+		t.Fatalf("expected honey_level reset to 0, got %d", lvl)
+	}
+
+	// 3. HoneyBlock slide detection and velocity clamping.
+	if !IsEntitySlidingDownHoneyBlock(0, 64, 0, 1.25, 64.5, 0.5, 0.3, -0.20, false) {
+		t.Fatal("expected entity against side of honey_block with vy=-0.20 to be sliding down")
+	}
+	nx, ny, nz, throttled := ApplyHoneyBlockSlideVelocity(0.4, -0.20, -0.2)
+	if !throttled || ny != HoneyBlockMaxSlideDownYDelta || nx != 0.1 || nz != -0.05 {
+		t.Fatalf("ApplyHoneyBlockSlideVelocity = (%v, %v, %v, %v)", nx, ny, nz, throttled)
+	}
+
+	// 4. Exact 26.1.2 ComposterBlock.bootStrap probabilities & CompostItemAt / ExtractComposterAt.
+	if got := CompostChanceForItem("minecraft:dried_kelp"); got != 0.30 {
+		t.Fatalf("dried_kelp chance = %v, want 0.30", got)
+	}
+	if got := CompostChanceForItem("minecraft:tall_dry_grass"); got != 0.30 {
+		t.Fatalf("tall_dry_grass chance = %v, want 0.30", got)
+	}
+	if got := CompostChanceForItem("minecraft:cactus_flower"); got != 0.30 {
+		t.Fatalf("cactus_flower chance = %v, want 0.30", got)
+	}
+	if got := CompostChanceForItem("minecraft:dried_kelp_block"); got != 0.50 {
+		t.Fatalf("dried_kelp_block chance = %v, want 0.50", got)
+	}
+	if got := CompostChanceForItem("minecraft:flowering_azalea_leaves"); got != 0.50 {
+		t.Fatalf("flowering_azalea_leaves chance = %v, want 0.50", got)
+	}
+	if got := CompostChanceForItem("minecraft:mushroom_stem"); got != 0.65 {
+		t.Fatalf("mushroom_stem chance = %v, want 0.65", got)
+	}
+	if got := CompostChanceForItem("minecraft:nether_wart"); got != 0.65 {
+		t.Fatalf("nether_wart chance = %v, want 0.65", got)
+	}
+	if got := CompostChanceForItem("minecraft:red_tulip"); got != 0.65 {
+		t.Fatalf("red_tulip chance = %v, want 0.65", got)
+	}
+	if got := CompostChanceForItem("minecraft:cake"); got != 1.00 {
+		t.Fatalf("cake chance = %v, want 1.00", got)
+	}
+
+	c.SetBlock(16, FlatSurfaceY+1, 16, MakeComposterBlockState(0))
+	for i := 0; i < 7; i++ {
+		consumed, increased, lvl, _ := c.CompostItemAt(16, FlatSurfaceY+1, 16, "minecraft:pumpkin_pie", rng)
+		if !consumed || !increased || lvl != i+1 {
+			t.Fatalf("step %d: CompostItemAt = (%v, %v, %d)", i+1, consumed, increased, lvl)
+		}
+	}
+	c.StepBlockUpdates(ComposterReadyTickDelay)
+	if lvl, _ := ComposterLevel(c.GetBlock(16, FlatSurfaceY+1, 16)); lvl != ComposterReadyLevel {
+		t.Fatalf("expected composter to mature to level 8 after 20 ticks, got %d", lvl)
+	}
+	bm, ok, _ := c.ExtractComposterAt(16, FlatSurfaceY+1, 16)
+	if !ok || bm.ResolvedID() != "minecraft:bone_meal" || bm.Count != 1 {
+		t.Fatalf("ExtractComposterAt = (%+v, %v)", bm, ok)
+	}
+	if lvl, _ := ComposterLevel(c.GetBlock(16, FlatSurfaceY+1, 16)); lvl != 0 {
+		t.Fatalf("expected composter level to reset to 0 after extraction, got %d", lvl)
+	}
+}
+

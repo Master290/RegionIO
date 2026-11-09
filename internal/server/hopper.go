@@ -1012,46 +1012,7 @@ func (s *Server) HopperExtractFromCrafter(dim string, x, y, z int) (world.ItemSt
 // CompostChanceForItem returns the vanilla 26.1.2 composting probability
 // (0.30, 0.50, 0.65, 0.85, or 1.00) for itemID, or 0 if not compostable.
 func CompostChanceForItem(itemID string) float32 {
-	norm := canonicalResourceName(itemID)
-	if norm == "" {
-		return 0
-	}
-	if strings.HasSuffix(norm, "_leaves") || strings.HasSuffix(norm, "_sapling") || strings.HasSuffix(norm, "_seeds") {
-		return 0.30
-	}
-	switch norm {
-	case "minecraft:short_grass", "minecraft:kelp", "minecraft:moss_carpet", "minecraft:pale_moss_carpet",
-		"minecraft:seagrass", "minecraft:small_dripleaf", "minecraft:sweet_berries", "minecraft:glow_berries",
-		"minecraft:hanging_roots", "minecraft:pale_hanging_moss", "minecraft:mangrove_propagule",
-		"minecraft:Mangrove_roots", "minecraft:mangrove_roots", "minecraft:pink_petals", "minecraft:pitcher_pod",
-		"minecraft:torchflower_seeds", "minecraft:short_dry_grass", "minecraft:bush", "minecraft:firefly_bush",
-		"minecraft:leaf_litter", "minecraft:wildflowers":
-		return 0.30
-	case "minecraft:dried_kelp", "minecraft:tall_grass", "minecraft:cactus", "minecraft:sugar_cane",
-		"minecraft:vine", "minecraft:nether_sprouts", "minecraft:weeping_vines", "minecraft:twisting_vines",
-		"minecraft:melon_slice", "minecraft:glow_lichen", "minecraft:tall_dry_grass", "minecraft:cactus_flower":
-		return 0.50
-	case "minecraft:apple", "minecraft:beetroot", "minecraft:carrot", "minecraft:cocoa_beans",
-		"minecraft:potato", "minecraft:wheat", "minecraft:melon", "minecraft:pumpkin", "minecraft:carved_pumpkin",
-		"minecraft:sea_pickle", "minecraft:brown_mushroom", "minecraft:red_mushroom",
-		"minecraft:crimson_fungus", "minecraft:warped_fungus", "minecraft:lily_pad",
-		"minecraft:fern", "minecraft:large_fern", "minecraft:dandelion", "minecraft:poppy",
-		"minecraft:blue_orchid", "minecraft:allium", "minecraft:azure_bluet", "minecraft:oxeye_daisy",
-		"minecraft:cornflower", "minecraft:lily_of_the_valley", "minecraft:wither_rose",
-		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
-		"minecraft:moss_block", "minecraft:pale_moss_block", "minecraft:azalea", "minecraft:big_dripleaf",
-		"minecraft:shroomlight", "minecraft:spore_blossom", "minecraft:open_eyeblossom", "minecraft:closed_eyeblossom":
-		return 0.65
-	case "minecraft:baked_potato", "minecraft:bread", "minecraft:cookie", "minecraft:hay_block",
-		"minecraft:nether_wart_block", "minecraft:warped_wart_block", "minecraft:flowering_azalea",
-		"minecraft:red_mushroom_block", "minecraft:brown_mushroom_block",
-		"minecraft:torchflower", "minecraft:pitcher_plant", "minecraft:dried_kelp_block":
-		return 0.85
-	case "minecraft:cake", "minecraft:pumpkin_pie":
-		return 1.00
-	default:
-		return 0
-	}
+	return world.CompostChanceForItem(itemID)
 }
 
 // HopperInsertIntoComposter attempts to insert 1 compostable item into the

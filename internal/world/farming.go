@@ -1,6 +1,7 @@
 package world
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -17,6 +18,7 @@ const DefaultRandomTickSpeed = 3
 type cacheFarmingState struct {
 	mu              sync.Mutex
 	randomTickSpeed int
+	isNight         bool
 	rng             *rand.Rand
 }
 
@@ -77,6 +79,31 @@ func (c *Cache) SetRandomTickSeed(seed int64) {
 	fs.mu.Unlock()
 }
 
+// DayTimeIsNight reports whether the Cache's configured day/night state is
+// currently night (used for open_eyeblossom / closed_eyeblossom state changes).
+func (c *Cache) DayTimeIsNight() bool {
+	if c == nil {
+		return false
+	}
+	fs := c.farmingState()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.isNight
+}
+
+// SetDayTimeIsNight configures whether the Cache's day/night state is currently
+// night (used by open_eyeblossom / closed_eyeblossom random ticks and scheduled
+// cascade ticks).
+func (c *Cache) SetDayTimeIsNight(isNight bool) {
+	if c == nil {
+		return
+	}
+	fs := c.farmingState()
+	fs.mu.Lock()
+	fs.isNight = isNight
+	fs.mu.Unlock()
+}
+
 // IsRandomTickableBlock reports whether state participates in vanilla random
 // ticks (crops, stems, farmland, saplings, sugar cane, cactus, bamboo, kelp,
 // nether wart, cocoa, sweet berry bush, grass block, mycelium, non-persistent
@@ -104,6 +131,9 @@ func IsRandomTickableBlock(state uint16) bool {
 		"minecraft:sugar_cane", "minecraft:cactus",
 		"minecraft:bamboo_sapling", "minecraft:bamboo",
 		"minecraft:kelp",
+		"minecraft:brown_mushroom", "minecraft:red_mushroom",
+		"minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
+		"minecraft:potted_open_eyeblossom", "minecraft:potted_closed_eyeblossom",
 		"minecraft:grass_block", "minecraft:mycelium",
 		"minecraft:crimson_nylium", "minecraft:warped_nylium",
 		"minecraft:vine", "minecraft:cave_vines", "minecraft:weeping_vines", "minecraft:twisting_vines",
@@ -354,11 +384,16 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 	case "minecraft:sugar_cane":
 		c.randomTickSugarCane(x, y, z, state, info, res)
 	case "minecraft:cactus":
-		c.randomTickCactus(x, y, z, state, info, res)
+		c.randomTickCactus(x, y, z, state, info, rng, res)
 	case "minecraft:bamboo_sapling", "minecraft:bamboo":
 		c.randomTickBamboo(x, y, z, state, info, rng, res)
 	case "minecraft:kelp":
 		c.randomTickKelp(x, y, z, state, info, rng, res)
+	case "minecraft:brown_mushroom", "minecraft:red_mushroom":
+		c.randomTickMushroom(x, y, z, state, rng, res)
+	case "minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
+		"minecraft:potted_open_eyeblossom", "minecraft:potted_closed_eyeblossom":
+		c.randomTickEyeblossom(x, y, z, state, info, c.DayTimeIsNight(), rng, res)
 	case "minecraft:grass_block", "minecraft:mycelium":
 		c.randomTickSpreadingTurf(x, y, z, state, info, rng, res)
 	case "minecraft:crimson_nylium", "minecraft:warped_nylium":
@@ -1383,11 +1418,13 @@ func CanBoneMeal(state uint16) bool {
 		"minecraft:brown_mushroom", "minecraft:red_mushroom",
 		"minecraft:short_grass", "minecraft:fern",
 		"minecraft:short_dry_grass", "minecraft:tall_dry_grass", "minecraft:bush",
-		"minecraft:seagrass", "minecraft:sea_pickle",
+		"minecraft:seagrass",
 		"minecraft:pink_petals", "minecraft:wildflowers",
 		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
 		"minecraft:small_dripleaf", "minecraft:big_dripleaf", "minecraft:big_dripleaf_stem":
 		return true
+	case "minecraft:sea_pickle":
+		return info.Properties["waterlogged"] == "true"
 	case "minecraft:cave_vines", "minecraft:cave_vines_plant":
 		return !CaveVinesHasBerries(state)
 	}
@@ -1607,8 +1644,47 @@ func (c *Cache) ApplyBoneMeal(x, y, z int, rng *rand.Rand) (consumed bool, res B
 		return true, res
 
 	case "minecraft:sea_pickle":
-		if info.Properties["waterlogged"] != "true" || y <= c.minY() || !IsLiveCoralBlock(c.GetBlock(x, y-1, z)) {
+		if info.Properties["waterlogged"] != "true" {
 			return false, res
+		}
+		if y <= c.minY() || !IsLiveCoralBlock(c.GetBlock(x, y-1, z)) {
+			return true, res
+		}
+		// Vanilla SeaPickleBlock.performBonemeal:
+		// 1. Scans the 5x5 horizontal diamond around (x, y, z) (jSpan = 1, 3, 5, 3, 1
+		//    for i = 0..4, ty in y..y-1), placing 1..4 waterlogged sea pickles in
+		//    source water above live coral blocks with 1/6 probability.
+		// 2. Sets the target sea_pickle at (x, y, z) to pickles=4, waterlogged=true.
+		jSpan := 1
+		count := 0
+		baseX := x - 2
+		for i := 0; i < 5; i++ {
+			for j := 0; j < jSpan; j++ {
+				topY := y + 2 - 1
+				for ty := topY - 2; ty < topY; ty++ {
+					tx := baseX + i
+					tz := z - count + j
+					if tx == x && ty == y && tz == z {
+						continue
+					}
+					if ty <= c.minY() || ty >= c.maxY() {
+						continue
+					}
+					if rng.Intn(6) == 0 && isSourceWater(c.GetBlock(tx, ty, tz)) && IsLiveCoralBlock(c.GetBlock(tx, ty-1, tz)) {
+						pickles := strconv.Itoa(1 + rng.Intn(4))
+						if spreadPickle, ok := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": pickles, "waterlogged": "true"}); ok {
+							c.setBlockRecorded(tx, ty, tz, spreadPickle, &res)
+						}
+					}
+				}
+			}
+			if count < 2 {
+				jSpan += 2
+				count++
+			} else {
+				jSpan -= 2
+				count--
+			}
 		}
 		if fullPickle, ok := nameToStateID("minecraft:sea_pickle", map[string]string{"pickles": "4", "waterlogged": "true"}); ok {
 			c.setBlockRecorded(x, y, z, fullPickle, &res)
@@ -1936,7 +2012,23 @@ func (c *Cache) randomTickSugarCane(x, y, z int, state uint16, info stateName, r
 	}
 }
 
-func (c *Cache) randomTickCactus(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
+// CactusMaxHeight is the maximum natural growth height of a cactus column (3 blocks).
+const CactusMaxHeight = 3
+
+// CactusAttemptFlowerAge is the cactus age (8) at which a random tick attempts
+// to grow a `minecraft:cactus_flower` above the cactus in vanilla 26.1.2
+// (`CactusBlock.ATTEMPT_GROW_CACTUS_FLOWER_AGE`).
+const CactusAttemptFlowerAge = 8
+
+// CactusFlowerSmallChance (10%) and CactusFlowerTallChance (25%) are the
+// probabilities of growing a `minecraft:cactus_flower` when a cactus reaches
+// age 8 at height < 3 vs height >= 3 in vanilla 26.1.2.
+const (
+	CactusFlowerSmallChance = 0.10
+	CactusFlowerTallChance  = 0.25
+)
+
+func (c *Cache) randomTickCactus(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
 	if y+1 >= c.maxY() || !isAirState(c.GetBlock(x, y+1, z)) {
 		return
 	}
@@ -1944,19 +2036,31 @@ func (c *Cache) randomTickCactus(x, y, z int, state uint16, info stateName, res 
 	for y-height >= c.minY() && isBlockNamed(c.GetBlock(x, y-height, z), "minecraft:cactus") {
 		height++
 	}
-	if height >= 3 {
+	age, _ := strconv.Atoi(info.Properties["age"])
+	if height >= CactusMaxHeight && age >= 15 {
 		return
 	}
-	age, _ := strconv.Atoi(info.Properties["age"])
-	if age >= 15 {
+	if age == CactusAttemptFlowerAge && c.canCactusSurviveAt(x, y+1, z) {
+		chance := CactusFlowerSmallChance
+		if height >= CactusMaxHeight {
+			chance = CactusFlowerTallChance
+		}
+		if rng.Float64() <= chance {
+			if flowerState, ok := nameToStateID("minecraft:cactus_flower", nil); ok {
+				c.setBlockRecorded(x, y+1, z, flowerState, res)
+			}
+		}
+	} else if age >= 15 && height < CactusMaxHeight {
 		freshCactus, ok := nameToStateID("minecraft:cactus", map[string]string{"age": "0"})
 		if !ok {
 			return
 		}
-		c.setBlockRecorded(x, y, z, freshCactus, res)
 		c.setBlockRecorded(x, y+1, z, freshCactus, res)
+		c.setBlockRecorded(x, y, z, freshCactus, res)
 		c.runNeighborSupportPass(x, y+1, z, res)
-	} else {
+		return
+	}
+	if age < 15 {
 		if nextState, ok := withStateProperty(state, "age", strconv.Itoa(age+1)); ok {
 			c.setBlockRecorded(x, y, z, nextState, res)
 		}
@@ -2846,4 +2950,503 @@ func leafToSaplingItemName(leafName string) string {
 	}
 	return ""
 }
+
+// canCactusSurviveAt reports whether a `minecraft:cactus` block can survive at
+// (x, y, z): requires `cactus`, `sand`, or `red_sand` below and no solid,
+// cactus, or lava horizontal neighbors (`CactusBlock.canSurvive`).
+func (c *Cache) canCactusSurviveAt(x, y, z int) bool {
+	if c == nil || y <= c.minY() || y >= c.maxY() {
+		return false
+	}
+	below := c.GetBlock(x, y-1, z)
+	if !isBlockNamed(below, "minecraft:cactus") && !isBlockNamed(below, "minecraft:sand") && !isBlockNamed(below, "minecraft:red_sand") {
+		return false
+	}
+	for _, off := range horizontalOffsets {
+		h := c.GetBlock(x+off[0], y, z+off[2])
+		if isSolidState(h) || isBlockNamed(h, "minecraft:cactus") || isLavaBlock(h) {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// 10. Mushroom Spread (`MushroomBlock.randomTick` & `canSurvive`)
+// ---------------------------------------------------------------------------
+
+// MushroomMaxSpreadBrightness is the maximum raw brightness (< 13, i.e. 0..12)
+// under which a mushroom can survive on a normal solid block when the block
+// below is not in `#minecraft:overrides_mushroom_light_requirement`.
+const MushroomMaxSpreadBrightness = 13
+
+// MushroomMaxClusterCount is the maximum number of same-type mushrooms allowed
+// in the 9x3x9 box (`[-4..4] x [-1..1] x [-4..4]`) around a mushroom for it to
+// spread during a random tick (`MushroomBlock.randomTick`).
+const MushroomMaxClusterCount = 5
+
+// IsMushroomLightOverrideSoil reports whether state belongs to
+// `#minecraft:overrides_mushroom_light_requirement` (`mycelium`, `podzol`,
+// `crimson_nylium`, `warped_nylium`).
+func IsMushroomLightOverrideSoil(state uint16) bool {
+	if state == StateMycelium {
+		return true
+	}
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:mycelium", "minecraft:podzol", "minecraft:crimson_nylium", "minecraft:warped_nylium":
+		return true
+	}
+	return false
+}
+
+// CanMushroomSurviveAt reports whether `minecraft:brown_mushroom` or
+// `minecraft:red_mushroom` can survive at (x, y, z) (`MushroomBlock.canSurvive`):
+//   - Requires y in bounds (`y > minY && y < maxY`).
+//   - If the block at (x, y-1, z) is in `#minecraft:overrides_mushroom_light_requirement`,
+//     survives at any light level.
+//   - Otherwise requires `RawBrightnessAt(x, y, z) < 13` and a solid full block below.
+func (c *Cache) CanMushroomSurviveAt(x, y, z int) bool {
+	if c == nil || y <= c.minY() || y >= c.maxY() {
+		return false
+	}
+	below := c.GetBlock(x, y-1, z)
+	if IsMushroomLightOverrideSoil(below) {
+		return true
+	}
+	return c.RawBrightnessAt(x, y, z) < MushroomMaxSpreadBrightness && isSturdySupportBlock(below)
+}
+
+func (c *Cache) randomTickMushroom(x, y, z int, state uint16, rng *rand.Rand, res *BlockUpdateResult) {
+	if rng.Intn(25) != 0 {
+		return
+	}
+	info, ok := stateByID(state)
+	if !ok || (info.Name != "minecraft:brown_mushroom" && info.Name != "minecraft:red_mushroom") {
+		return
+	}
+
+	remaining := MushroomMaxClusterCount
+	for dx := -4; dx <= 4; dx++ {
+		for dz := -4; dz <= 4; dz++ {
+			for dy := -1; dy <= 1; dy++ {
+				ny := y + dy
+				if ny < c.minY() || ny >= c.maxY() {
+					continue
+				}
+				if isBlockNamed(c.GetBlock(x+dx, ny, z+dz), info.Name) {
+					remaining--
+					if remaining <= 0 {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	px, py, pz := x, y, z
+	cx := px + rng.Intn(3) - 1
+	cy := py + rng.Intn(2) - rng.Intn(2)
+	cz := pz + rng.Intn(3) - 1
+	for k := 0; k < 4; k++ {
+		if cy > c.minY() && cy < c.maxY() && isAirState(c.GetBlock(cx, cy, cz)) && c.CanMushroomSurviveAt(cx, cy, cz) {
+			px, py, pz = cx, cy, cz
+		}
+		cx = px + rng.Intn(3) - 1
+		cy = py + rng.Intn(2) - rng.Intn(2)
+		cz = pz + rng.Intn(3) - 1
+	}
+	if cy > c.minY() && cy < c.maxY() && isAirState(c.GetBlock(cx, cy, cz)) && c.CanMushroomSurviveAt(cx, cy, cz) {
+		c.setBlockRecorded(cx, cy, cz, state, res)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 11. Eyeblossom (`open_eyeblossom`, `closed_eyeblossom`, potted variants)
+// ---------------------------------------------------------------------------
+
+// IsEyeblossomBlock reports whether state is `minecraft:open_eyeblossom`,
+// `minecraft:closed_eyeblossom`, `minecraft:potted_open_eyeblossom`, or
+// `minecraft:potted_closed_eyeblossom`.
+func IsEyeblossomBlock(state uint16) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
+		"minecraft:potted_open_eyeblossom", "minecraft:potted_closed_eyeblossom":
+		return true
+	}
+	return false
+}
+
+// RandomTickEyeblossomAt executes an eyeblossom random tick at (x, y, z) for
+// the given day/night state (`isNight == true` opens closed_eyeblossom;
+// `isNight == false` closes open_eyeblossom), and for non-potted eyeblossoms
+// schedules wave cascade ticks on matching eyeblossoms in the 7x5x7
+// (`[-3..3] x [-2..2] x [-3..3]`) box (`EyeblossomBlock.tryChangingState`).
+func (c *Cache) RandomTickEyeblossomAt(x, y, z int, isNight bool, rng *rand.Rand) (changed bool, res BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false, res
+	}
+	c.SetDayTimeIsNight(isNight)
+	if rng == nil {
+		rng = rand.New(rand.NewSource(1))
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok {
+		return false, res
+	}
+	changed = c.tryChangeEyeblossomState(x, y, z, state, info, isNight, true, rng, &res)
+	return changed, res
+}
+
+func (c *Cache) randomTickEyeblossom(x, y, z int, state uint16, info stateName, isNight bool, rng *rand.Rand, res *BlockUpdateResult) {
+	c.tryChangeEyeblossomState(x, y, z, state, info, isNight, true, rng, res)
+}
+
+func (c *Cache) stepEyeblossomUpdate(x, y, z int, res *BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok {
+		return
+	}
+	switch info.Name {
+	case "minecraft:open_eyeblossom", "minecraft:closed_eyeblossom":
+		fs := c.farmingState()
+		fs.mu.Lock()
+		isNight := fs.isNight
+		rng := rand.New(rand.NewSource(fs.rng.Int63()))
+		fs.mu.Unlock()
+		c.tryChangeEyeblossomState(x, y, z, state, info, isNight, false, rng, res)
+	}
+}
+
+func (c *Cache) tryChangeEyeblossomState(x, y, z int, state uint16, info stateName, isNight, cascade bool, rng *rand.Rand, res *BlockUpdateResult) bool {
+	// Vanilla EyeblossomBlock / FlowerPotBlock: only changes state in natural dimensions (Overworld).
+	if dim := c.FireDimension(); dim == DimensionNether || dim == DimensionEnd {
+		return false
+	}
+	var isOpen bool
+	var targetName string
+	isPotted := false
+	switch info.Name {
+	case "minecraft:open_eyeblossom":
+		isOpen = true
+		targetName = "minecraft:closed_eyeblossom"
+	case "minecraft:closed_eyeblossom":
+		isOpen = false
+		targetName = "minecraft:open_eyeblossom"
+	case "minecraft:potted_open_eyeblossom":
+		isOpen = true
+		isPotted = true
+		targetName = "minecraft:potted_closed_eyeblossom"
+	case "minecraft:potted_closed_eyeblossom":
+		isOpen = false
+		isPotted = true
+		targetName = "minecraft:potted_open_eyeblossom"
+	default:
+		return false
+	}
+	if isOpen == isNight {
+		return false
+	}
+	nextState, ok := nameToStateID(targetName, nil)
+	if !ok {
+		return false
+	}
+	if !c.setBlockRecorded(x, y, z, nextState, res) {
+		return false
+	}
+	if cascade && !isPotted {
+		if rng == nil {
+			rng = rand.New(rand.NewSource(1))
+		}
+		for dy := -2; dy <= 2; dy++ {
+			ny := y + dy
+			if ny < c.minY() || ny >= c.maxY() {
+				continue
+			}
+			for dz := -3; dz <= 3; dz++ {
+				for dx := -3; dx <= 3; dx++ {
+					if dx == 0 && dy == 0 && dz == 0 {
+						continue
+					}
+					nx, nz := x+dx, z+dz
+					if c.GetBlock(nx, ny, nz) != state {
+						continue
+					}
+					dist := math.Sqrt(float64(dx*dx + dy*dy + dz*dz))
+					minDelay := int(dist * 5.0)
+					maxDelay := int(dist * 10.0)
+					delay := minDelay
+					if maxDelay > minDelay {
+						delay += rng.Intn(maxDelay - minDelay + 1)
+					}
+					if delay < 1 {
+						delay = 1
+					}
+					c.ScheduleBlockUpdate(nx, ny, nz, UpdateRedstone, delay)
+				}
+			}
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// 12. Sea Pickle Placement & Stacking (`SeaPickleBlock.getStateForPlacement`)
+// ---------------------------------------------------------------------------
+
+// PlaceOrStackSeaPickleAt places a new `minecraft:sea_pickle` (`pickles=1`) or
+// increments an existing `minecraft:sea_pickle` (`pickles` 1 -> 2 -> 3 -> 4) at
+// (x, y, z), setting `waterlogged` from target source water (`SeaPickleBlock`).
+func (c *Cache) PlaceOrStackSeaPickleAt(x, y, z int) (newState uint16, ok bool, res BlockUpdateResult) {
+	if c == nil || y <= c.minY() || y >= c.maxY() {
+		return StateAir, false, res
+	}
+	cur := c.GetBlock(x, y, z)
+	if info, okInfo := stateByID(cur); okInfo && info.Name == "minecraft:sea_pickle" {
+		cnt, _ := strconv.Atoi(info.Properties["pickles"])
+		if cnt < 1 {
+			cnt = 1
+		}
+		if cnt >= 4 {
+			return cur, false, res
+		}
+		next, okNext := withStateProperty(cur, "pickles", strconv.Itoa(cnt+1))
+		if !okNext {
+			return StateAir, false, res
+		}
+		applied, upd := c.ApplyBlockWithUpdates(x, y, z, next)
+		return next, applied, upd
+	}
+	if !isAirState(cur) && !isSourceWater(cur) {
+		return StateAir, false, res
+	}
+	wl := strconv.FormatBool(isSourceWater(cur))
+	targetState, okSt := nameToStateID("minecraft:sea_pickle", map[string]string{
+		"pickles":     "1",
+		"waterlogged": wl,
+	})
+	if !okSt {
+		return StateAir, false, res
+	}
+	if _, survives := c.evaluateBlockSurvival(x, y, z, targetState); !survives {
+		return StateAir, false, res
+	}
+	applied, upd := c.ApplyBlockWithUpdates(x, y, z, targetState)
+	return targetState, applied, upd
+}
+
+// ---------------------------------------------------------------------------
+// 13. Pumpkin Carving (`PumpkinBlock.useItemOn`)
+// ---------------------------------------------------------------------------
+
+// CarvePumpkinAt converts a `minecraft:pumpkin` at (x, y, z) into
+// `minecraft:carved_pumpkin[facing=...]` and returns `4x minecraft:pumpkin_seeds`,
+// matching vanilla `PumpkinBlock.useItemOn`:
+//   - If `clickedFace` is a horizontal direction (`north`, `south`, `west`, `east`),
+//     uses `clickedFace`.
+//   - Otherwise (`up` or `down`), uses the opposite of `playerHorizontalFacing`.
+func (c *Cache) CarvePumpkinAt(x, y, z int, clickedFace, playerHorizontalFacing string) (carvedState uint16, seeds ItemStack, ok bool, res BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return StateAir, ItemStack{}, false, res
+	}
+	if !isBlockNamed(c.GetBlock(x, y, z), "minecraft:pumpkin") {
+		return StateAir, ItemStack{}, false, res
+	}
+	facing := strings.ToLower(strings.TrimSpace(clickedFace))
+	switch facing {
+	case "north", "south", "west", "east":
+	default:
+		switch strings.ToLower(strings.TrimSpace(playerHorizontalFacing)) {
+		case "north":
+			facing = "south"
+		case "south":
+			facing = "north"
+		case "west":
+			facing = "east"
+		case "east":
+			facing = "west"
+		default:
+			facing = "north"
+		}
+	}
+	nextState, okSt := nameToStateID("minecraft:carved_pumpkin", map[string]string{"facing": facing})
+	if !okSt {
+		return StateAir, ItemStack{}, false, res
+	}
+	applied, upd := c.ApplyBlockWithUpdates(x, y, z, nextState)
+	if !applied {
+		return StateAir, ItemStack{}, false, res
+	}
+	return nextState, NewNamedItemStack("minecraft:pumpkin_seeds", 4), true, upd
+}
+
+// ---------------------------------------------------------------------------
+// 14. Beehive / Bee Nest & Honey Block Helpers (`BeehiveBlock` & `HoneyBlock`)
+// ---------------------------------------------------------------------------
+
+// BeehiveMaxHoneyLevel is the maximum `honey_level` property (5) on
+// `minecraft:beehive` and `minecraft:bee_nest` (`BeehiveBlock.MAX_HONEY_LEVELS`).
+const BeehiveMaxHoneyLevel = 5
+
+// HoneyBlockFallDamageMultiplier is the fall damage multiplier (0.2, i.e. 80%
+// reduction) when landing on `minecraft:honey_block` (`HoneyBlock.fallOn`).
+const HoneyBlockFallDamageMultiplier = 0.2
+
+// HoneyBlockMaxSlideDownYDelta is the terminal vertical velocity (`-0.05` pre-drag,
+// `-0.049` post-drag) when an entity slides down the side of a `minecraft:honey_block`.
+const HoneyBlockMaxSlideDownYDelta = -0.05
+
+// IsBeehiveOrBeeNestBlock reports whether state is `minecraft:beehive` or
+// `minecraft:bee_nest`.
+func IsBeehiveOrBeeNestBlock(state uint16) bool {
+	info, ok := stateByID(state)
+	return ok && (info.Name == "minecraft:beehive" || info.Name == "minecraft:bee_nest")
+}
+
+// BeehiveHoneyLevel returns the `honey_level` property (0..5) of a `beehive`
+// or `bee_nest` block state.
+func BeehiveHoneyLevel(state uint16) (int, bool) {
+	info, ok := stateByID(state)
+	if !ok || (info.Name != "minecraft:beehive" && info.Name != "minecraft:bee_nest") {
+		return 0, false
+	}
+	lvl, err := strconv.Atoi(info.Properties["honey_level"])
+	if err != nil || lvl < 0 || lvl > BeehiveMaxHoneyLevel {
+		return 0, false
+	}
+	return lvl, true
+}
+
+// MakeBeehiveState constructs the state ID for `minecraft:beehive` or
+// `minecraft:bee_nest` with the given `facing` and `honey_level` (clamped to 0..5).
+func MakeBeehiveState(blockName, facing string, honeyLevel int) (uint16, bool) {
+	norm := strings.ToLower(strings.TrimSpace(blockName))
+	if norm != "" && !strings.HasPrefix(norm, "minecraft:") {
+		norm = "minecraft:" + norm
+	}
+	if norm != "minecraft:beehive" && norm != "minecraft:bee_nest" {
+		return StateAir, false
+	}
+	f := strings.ToLower(strings.TrimSpace(facing))
+	switch f {
+	case "north", "south", "west", "east":
+	default:
+		f = "north"
+	}
+	if honeyLevel < 0 {
+		honeyLevel = 0
+	}
+	if honeyLevel > BeehiveMaxHoneyLevel {
+		honeyLevel = BeehiveMaxHoneyLevel
+	}
+	return nameToStateID(norm, map[string]string{
+		"facing":      f,
+		"honey_level": strconv.Itoa(honeyLevel),
+	})
+}
+
+// ResolveBeehivePlacementState returns the placement state for `beehive` or
+// `bee_nest` facing opposite to `playerHorizontalFacing` (`BeehiveBlock.getStateForPlacement`).
+func ResolveBeehivePlacementState(blockName, playerHorizontalFacing string, honeyLevel int) (uint16, bool) {
+	var facing string
+	switch strings.ToLower(strings.TrimSpace(playerHorizontalFacing)) {
+	case "north":
+		facing = "south"
+	case "south":
+		facing = "north"
+	case "west":
+		facing = "east"
+	case "east":
+		facing = "west"
+	default:
+		facing = "north"
+	}
+	return MakeBeehiveState(blockName, facing, honeyLevel)
+}
+
+// HarvestBeehiveAt harvests a full (`honey_level == 5`) `minecraft:beehive` or
+// `minecraft:bee_nest` at (x, y, z) using `toolName` (`minecraft:shears` ->
+// `3x minecraft:honeycomb`; `minecraft:glass_bottle` -> `1x minecraft:honey_bottle`),
+// resets `honey_level` to `0`, and reports whether a lit campfire is underneath
+// (`smokey == c.HasUnobstructedLitCampfireBelow(x, y, z, 5)`).
+func (c *Cache) HarvestBeehiveAt(x, y, z int, toolName string) (harvested ItemStack, resetState uint16, smokey bool, ok bool, res BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return ItemStack{}, StateAir, false, false, res
+	}
+	cur := c.GetBlock(x, y, z)
+	lvl, isHive := BeehiveHoneyLevel(cur)
+	if !isHive || lvl < BeehiveMaxHoneyLevel {
+		return ItemStack{}, StateAir, false, false, res
+	}
+	normTool := strings.ToLower(strings.TrimSpace(toolName))
+	if normTool != "" && !strings.HasPrefix(normTool, "minecraft:") {
+		normTool = "minecraft:" + normTool
+	}
+	switch normTool {
+	case "minecraft:shears":
+		harvested = NewNamedItemStack("minecraft:honeycomb", 3)
+	case "minecraft:glass_bottle":
+		harvested = NewNamedItemStack("minecraft:honey_bottle", 1)
+	default:
+		return ItemStack{}, StateAir, false, false, res
+	}
+	nextState, okSt := withStateProperty(cur, "honey_level", "0")
+	if !okSt {
+		return ItemStack{}, StateAir, false, false, res
+	}
+	applied, upd := c.ApplyBlockWithUpdates(x, y, z, nextState)
+	if !applied {
+		return ItemStack{}, StateAir, false, false, res
+	}
+	return harvested, nextState, c.HasUnobstructedLitCampfireBelow(x, y, z, 5), true, upd
+}
+
+// IsHoneyBlock reports whether state is `minecraft:honey_block`.
+func IsHoneyBlock(state uint16) bool {
+	return isBlockNamed(state, "minecraft:honey_block")
+}
+
+// IsEntitySlidingDownHoneyBlock reports whether an entity at `(ex, ey, ez)`
+// with half-width `bbHalfWidth` and vertical velocity `vy` is sliding down the
+// side of a `minecraft:honey_block` at `(bx, by, bz)` (`HoneyBlock.isSlidingDown`).
+func IsEntitySlidingDownHoneyBlock(bx, by, bz int, ex, ey, ez, bbHalfWidth, vy float64, onGround bool) bool {
+	if onGround {
+		return false
+	}
+	if ey > float64(by)+0.9375-1e-7 {
+		return false
+	}
+	if vy >= -0.08 {
+		return false
+	}
+	dx := math.Abs(float64(bx)+0.5 - ex)
+	dz := math.Abs(float64(bz)+0.5 - ez)
+	overlap := 0.4375 + bbHalfWidth
+	return dx+1e-7 > overlap || dz+1e-7 > overlap
+}
+
+// ApplyHoneyBlockSlideVelocity clamps an entity's downward velocity when
+// sliding down a `minecraft:honey_block`, matching vanilla `HoneyBlock.doSlideMovement`:
+// when `vy < -0.13`, horizontal velocity `(vx, vz)` is scaled by `-0.05 / vy`
+// and `vy` is clamped to `-0.05`.
+func ApplyHoneyBlockSlideVelocity(vx, vy, vz float64) (nx, ny, nz float64, throttled bool) {
+	if vy < -0.13 {
+		scale := HoneyBlockMaxSlideDownYDelta / vy
+		return vx * scale, HoneyBlockMaxSlideDownYDelta, vz * scale, true
+	}
+	return vx, HoneyBlockMaxSlideDownYDelta, vz, false
+}
+
 

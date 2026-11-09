@@ -261,3 +261,35 @@ func TestServerBoneMealFlowerDropEntityTrampleAndFarmerVillagerHooks(t *testing.
 	}
 }
 
+func TestServerCarvePumpkinWithShears(t *testing.T) {
+	srv, cache := newTestEnchantServer(t)
+	pumpkinSt, ok := world.BlockStateIDByProperties("minecraft:pumpkin", nil)
+	if !ok {
+		t.Fatal("missing minecraft:pumpkin state")
+	}
+	cache.SetBlock(4, world.FlatSurfaceY+1, 4, pumpkinSt)
+
+	session, err := srv.RegisterPlayer(Profile{
+		UUID: OfflineUUID("PumpkinCarver"),
+		Name: "PumpkinCarver",
+	}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+	slot, _ := session.handSlotAndStack(0)
+	session.SetInventorySlot(slot, world.NewNamedItemStack("minecraft:shears", 1))
+
+	if !srv.CarvePumpkinWithShears(session, 4, world.FlatSurfaceY+1, 4, 3, 0) {
+		t.Fatal("expected CarvePumpkinWithShears on south face (face=3) to succeed")
+	}
+	got := cache.GetBlock(4, world.FlatSurfaceY+1, 4)
+	if world.BlockName(got) != "minecraft:carved_pumpkin" || world.BlockProperties(got)["facing"] != "south" {
+		t.Fatalf("expected carved_pumpkin[facing=south], got %s %v", world.BlockName(got), world.BlockProperties(got))
+	}
+	if dmg := GetSlotItemMeta(session, slot).Damage; dmg != 1 {
+		t.Fatalf("expected shears damage = 1 after carving pumpkin, got %d", dmg)
+	}
+}
+
+
