@@ -142,7 +142,7 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 	mob := canonicalResourceName(typeName)
 	item := canonicalResourceName(itemName)
 	switch mob {
-	case MobTypeCow, MobTypeSheep:
+	case MobTypeCow, MobTypeMooshroom, MobTypeSheep:
 		return item == "minecraft:wheat"
 	case MobTypePig:
 		return item == "minecraft:carrot" || item == "minecraft:potato" || item == "minecraft:beetroot"
@@ -193,7 +193,7 @@ func IsBreedingFoodForMob(typeName, itemName string) bool {
 // baby offspring.
 func IsBreedableMob(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypeCow, MobTypeSheep, MobTypePig, MobTypeChicken,
+	case MobTypeCow, MobTypeMooshroom, MobTypeSheep, MobTypePig, MobTypeChicken,
 		MobTypeWolf, MobTypeCat,
 		MobTypeHorse, MobTypeDonkey, MobTypeLlama, MobTypeTraderLlama,
 		MobTypeSniffer, MobTypeArmadillo, MobTypeCamel,

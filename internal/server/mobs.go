@@ -220,6 +220,7 @@ var (
 		MobTypeGhast:               EntityTypeGhastID,
 		EntityTypeFireball:         EntityTypeFireballID,
 		EntityTypeSmallFireball:    EntityTypeSmallFireballID,
+		MobTypeMooshroom:           EntityTypeMooshroomID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -241,10 +242,10 @@ func AllPassiveAnimalTypes() []string {
 }
 
 // IsPassiveAnimal reports whether typeName is a breedable passive farm/wild animal
-// (pig, cow, sheep, chicken, bee, fox, panda, ocelot, or strider).
+// (pig, cow, mooshroom, sheep, chicken, bee, fox, panda, ocelot, rabbit, or strider).
 func IsPassiveAnimal(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypePig, MobTypeCow, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot, MobTypeStrider, MobTypeRabbit:
+	case MobTypePig, MobTypeCow, MobTypeMooshroom, MobTypeSheep, MobTypeChicken, MobTypeBee, MobTypeFox, MobTypePanda, MobTypeOcelot, MobTypeStrider, MobTypeRabbit:
 		return true
 	default:
 		return false
@@ -300,6 +301,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultPigMaxHealth
 	case MobTypeCow:
 		return DefaultCowMaxHealth
+	case MobTypeMooshroom:
+		return DefaultMooshroomMaxHealth
 	case MobTypeSheep:
 		return DefaultSheepMaxHealth
 	case MobTypeChicken:
@@ -443,7 +446,7 @@ func ResolveMobMaxHealth(typeName string) float32 {
 
 func animalWanderSpeed(typeName string) float64 {
 	switch canonicalResourceName(typeName) {
-	case MobTypeCow:
+	case MobTypeCow, MobTypeMooshroom:
 		return CowWanderSpeed
 	case MobTypeSheep:
 		return SheepWanderSpeed
@@ -685,6 +688,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	if norm == MobTypeSlime {
 		return s.SpawnSlime(normDim, x, y, z, MagmaCubeSizeSmall)
 	}
+	if norm == MobTypeMooshroom {
+		return s.SpawnMooshroom(normDim, x, y, z, MooshroomVariantRed, false)
+	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
 		return 0, errors.New("server: unknown mob entity type " + norm)
@@ -820,7 +826,7 @@ func IsAnimalBreedingFood(typeName, itemName string) bool {
 	mob := canonicalResourceName(typeName)
 	item := canonicalResourceName(itemName)
 	switch mob {
-	case MobTypeCow, MobTypeSheep:
+	case MobTypeCow, MobTypeMooshroom, MobTypeSheep:
 		return item == "minecraft:wheat"
 	case MobTypePig:
 		return item == "minecraft:carrot" || item == "minecraft:potato" || item == "minecraft:beetroot"
@@ -1446,8 +1452,8 @@ func (s *Server) stepPassiveAnimalAI(
 	norm := canonicalResourceName(typeName)
 	baseSpeed := animalWanderSpeed(norm)
 
-	// Chicken egg-laying timer.
-	if norm == MobTypeChicken {
+	// Chicken egg-laying timer (skipped for chicken jockeys).
+	if norm == MobTypeChicken && !s.IsChickenJockey(entityID) {
 		if mem.eggTimer <= 0 {
 			mem.eggTimer = ChickenEggMinTicks
 			if rng != nil {
@@ -1462,7 +1468,8 @@ func (s *Server) stepPassiveAnimalAI(
 				mem.eggTimer = ChickenEggMinTicks
 			}
 			if s != nil {
-				eggStack := world.NewNamedItemStack("minecraft:egg", 1)
+				eggItemID := ChickenEggItemForVariant(s.ChickenVariant(entityID))
+				eggStack := world.NewNamedItemStack(eggItemID, 1)
 				if !eggStack.IsEmpty() {
 					s.SpawnItemEntity(x, float64(feetY)+0.25, z, eggStack)
 					cx := int32(int64(math.Floor(x)) >> 4)
@@ -1483,7 +1490,7 @@ func (s *Server) stepPassiveAnimalAI(
 			if s != nil {
 				cx := int32(int64(math.Floor(x)) >> 4)
 				cz := int32(int64(math.Floor(z)) >> 4)
-				s.BroadcastChunk(cx, cz, PlaySetEntityDataCB, EncodeSheepWoolDataPacket(entityID, 0, false))
+				s.BroadcastChunk(cx, cz, PlaySetEntityDataCB, EncodeSheepWoolDataPacket(entityID, s.SheepColor(entityID), false))
 			}
 		}
 	}
@@ -1591,28 +1598,29 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 		}
 	}
 
-	// 2. Sheep shearing with shears.
+	// 2. Sheep shearing with shears or dyeing with a dye item.
 	if mobType == MobTypeSheep && heldID == "minecraft:shears" {
-		tr := s.entityTracker()
-		tr.mu.Lock()
-		mem := tr.mobStateFor(entityID, tr.aiTickID)
-		alreadySheared := mem.sheared
-		if !alreadySheared {
-			mem.sheared = true
-			mem.woolRegrowTimer = 0
+		_, sheared := s.ShearSheepColored(session, entityID, nil)
+		return sheared, 0
+	}
+	if mobType == MobTypeSheep {
+		if _, isDye := DyeColorIndexByItemName(heldID); isDye {
+			return s.DyeSheep(session, entityID, heldID), 0
 		}
-		tr.mu.Unlock()
-		if !alreadySheared {
-			wool := world.NewNamedItemStack("minecraft:white_wool", 2)
-			if !wool.IsEmpty() {
-				s.SpawnItemEntity(ent.X, ent.Y+0.5, ent.Z, wool)
-			}
-			s.BroadcastChunk(cp.X, cp.Z, PlaySetEntityDataCB, EncodeSheepWoolDataPacket(entityID, 0, true))
-			s.BroadcastChunk(cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket("minecraft:entity.sheep.shear", SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-			return true, 0
-		}
-		return false, 0
+	}
+
+	// 2b. Mooshroom interactions (bowl, bucket, shears, small flowers on brown mooshroom).
+	if mobType == MobTypeMooshroom && heldID != "minecraft:wheat" {
+		return s.InteractWithMooshroom(session, entityID, heldID), 0
+	}
+
+	// 2c. Pig saddle equipping and carrot_on_a_stick speed boost.
+	if mobType == MobTypePig && heldID == "minecraft:saddle" {
+		return s.EquipPigSaddle(session, entityID), 0
+	}
+	if mobType == MobTypePig && heldID == CarrotOnAStickItemID {
+		_, ok := s.BoostPig(session, entityID, nil)
+		return ok, 0
 	}
 
 	// 3. Breeding food -> feed baby to speed up growth by 10%, or enter love mode for adults.
@@ -1681,6 +1689,16 @@ func (s *Server) InteractWithAnimal(session *PlayerSession, entityID int32) (han
 		midY := math.Max(ent.Y, mateY)
 		midZ := (ent.Z + mateZ) * 0.5
 		offspringID, _ = s.SpawnBabyMob(dim, midX, midY, midZ, mobType)
+		if offspringID > 0 {
+			switch mobType {
+			case MobTypeSheep:
+				babyColor := MixSheepBreedColor(s.SheepColor(entityID), s.SheepColor(mateID), nil)
+				s.SetSheepColor(offspringID, babyColor)
+			case MobTypeMooshroom:
+				babyVariant := BreedMooshroomOffspringVariant(s.MooshroomVariant(entityID), s.MooshroomVariant(mateID), nil)
+				s.SetMooshroomVariant(offspringID, babyVariant)
+			}
+		}
 		s.GrantCriterion(session, "minecraft:husbandry/breed_an_animal", "bred")
 	}
 	return true, offspringID

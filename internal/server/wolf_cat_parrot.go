@@ -1049,11 +1049,7 @@ func (s *Server) TryDeliverCatMorningGift(owner *PlayerSession, forceGift bool, 
 		return world.ItemStack{}, 0, false
 	}
 
-	itemIdx := 0
-	if rng != nil {
-		itemIdx = rng.Intn(len(catMorningGiftLootItems))
-	}
-	giftItem = world.NewNamedItemStack(catMorningGiftLootItems[itemIdx], 1)
+	giftItem = RollCatMorningGiftLoot(rng)
 	droppedEntityID, _ = s.SpawnItemEntityInDimension(dim, oSnap.X, oSnap.Y+0.3, oSnap.Z, giftItem)
 
 	s.SetCatLyingOnBed(chosenCat.ID, false, false)
@@ -1238,16 +1234,18 @@ func (s *Server) IsParrotDancing(entityID int32) bool {
 func ParrotImitationSoundForMob(mobType string) (string, bool) {
 	norm := strings.TrimPrefix(canonicalResourceName(mobType), "minecraft:")
 	switch norm {
-	case "blaze", "bogged", "breeze", "creaking", "creeper", "drowned",
+	case "blaze", "bogged", "breeze", "camel_husk", "creaking", "creeper", "drowned",
 		"elder_guardian", "ender_dragon", "endermite", "evoker", "ghast",
-		"guardian", "hoglin", "husk", "illusioner", "magma_cube", "phantom",
+		"guardian", "hoglin", "husk", "illusioner", "magma_cube", "parched", "phantom",
 		"piglin", "piglin_brute", "pillager", "ravager", "shulker",
 		"silverfish", "skeleton", "slime", "spider", "stray", "vex",
 		"vindicator", "warden", "witch", "wither", "wither_skeleton",
-		"zoglin", "zombie", "zombie_villager":
+		"zoglin", "zombie", "zombie_horse", "zombie_nautilus", "zombie_villager":
 		return "minecraft:entity.parrot.imitate." + norm, true
 	case "cave_spider":
 		return "minecraft:entity.parrot.imitate.spider", true
+	case "happy_ghast":
+		return "minecraft:empty", true
 	default:
 		return "", false
 	}
@@ -1275,7 +1273,7 @@ func (s *Server) TryParrotImitateNearbyMob(entityID int32, rng *rand.Rand) (soun
 			continue
 		}
 		snd, ok := ParrotImitationSoundForMob(other.TypeName)
-		if !ok {
+		if !ok || snd == "" || snd == "minecraft:empty" {
 			continue
 		}
 		dx := other.X - ent.X

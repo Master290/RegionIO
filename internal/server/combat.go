@@ -698,6 +698,10 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		return RollRabbitDeathLoot(rng, 0, false)
 	case MobTypePanda:
 		return RollPandaDeathLoot(rng)
+	case MobTypeMooshroom:
+		return RollMooshroomDeathLoot(rng, 0, false)
+	case MobTypeGoat:
+		return RollGoatDeathLoot(rng, 0, false)
 	}
 	return nil
 }
