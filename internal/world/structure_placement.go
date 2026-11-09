@@ -412,7 +412,7 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 		if lowestY < 60 {
 			return [3]int{}, false
 		}
-		stubX, stubY, stubZ := int(cx)*16+8, lowestY+1, int(cz)*16+8
+		stubX, stubY, stubZ := x, lowestY, z
 		if !isStructureBiomeAllowed(od, sets, def, stubX, stubY, stubZ) {
 			return [3]int{}, false
 		}
@@ -455,27 +455,7 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 		return endCityVariantPoint(od, sets, def, variantRandom, cx, cz)
 
 	case "minecraft:jigsaw":
-		startY := def.SampleStartHeight(variantRandom)
-		stubX, stubZ := int(cx)*16, int(cz)*16
-		stubY := startY
-		if def.ProjectStartToHeightmap != "" {
-			oceanFloor := def.ProjectStartToHeightmap == "OCEAN_FLOOR_WG"
-			firstFreeY := preCarveFirstOccupiedHeight(od, seed, stubX, stubZ, oceanFloor) + 1
-			stubY = startY + firstFreeY
-		}
-		if def.DimensionPadding > 0 {
-			dimMinY, dimHeight := MinY, WorldHeight
-			if od != nil && od.Height > 0 {
-				dimMinY, dimHeight = od.MinY, od.Height
-			}
-			if stubY < dimMinY+def.DimensionPadding || stubY > dimMinY+dimHeight-def.DimensionPadding {
-				return [3]int{}, false
-			}
-		}
-		if !isStructureBiomeAllowed(od, sets, def, stubX, stubY, stubZ) {
-			return [3]int{}, false
-		}
-		return [3]int{stubX, stubY, stubZ}, true
+		return jigsawGenerationStubPos(od, sets, def, seed, cx, cz, variantRandom)
 
 	default:
 		stubX, stubY, stubZ := int(cx)*16+8, SeaLevel, int(cz)*16+8

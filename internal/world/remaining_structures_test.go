@@ -443,3 +443,189 @@ func TestVillageAndOutpostJigsawResidualAndFreezeTopLayer(t *testing.T) {
 		t.Errorf("windswept_hills at y=159 grass block = %d, want grass_block[snowy=true] (%d)", got, snowyGrassID)
 	}
 }
+
+func TestOceanMonumentWoodlandMansionPillagerOutpostSeed12345Parity(t *testing.T) {
+	const seed = int64(12345)
+	od, _, _, _ := vanillaGeneratorInputs(seed)
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil {
+		t.Fatalf("LoadStructureSets: %v", err)
+	}
+
+	// 1. Start positions on seed=12345 across all three structure sets.
+	findFirstValidStart := func(setName string, maxRegions int32) *StructureStartStub {
+		set := sets.Sets[setName]
+		if set == nil || set.Placement == nil || set.Placement.RandomSpread == nil {
+			t.Fatalf("missing random_spread set %s", setName)
+		}
+		spread := set.Placement.RandomSpread
+		cand00 := spread.PotentialChunk(seed, 0, 0)
+		if cand00[0] < 0 || int(cand00[0]) >= spread.Spacing-spread.Separation ||
+			cand00[1] < 0 || int(cand00[1]) >= spread.Spacing-spread.Separation {
+			t.Fatalf("%s cell (0,0) candidate %v out of bounds [0, %d)",
+				setName, cand00, spread.Spacing-spread.Separation)
+		}
+		for rx := -maxRegions; rx <= maxRegions; rx++ {
+			for rz := -maxRegions; rz <= maxRegions; rz++ {
+				cand := spread.PotentialChunk(seed, rx*int32(spread.Spacing), rz*int32(spread.Spacing))
+				if !set.IsStartChunk(seed, cand[0], cand[1]) {
+					continue
+				}
+				stub, ok := FindStructureSetStart(od, sets, setName, seed, cand[0], cand[1])
+				if !ok || stub == nil {
+					continue
+				}
+				def := sets.Structures[stub.StructureName]
+				if def == nil || !isStructureBiomeAllowed(od, sets, def, stub.StubPos[0], stub.StubPos[1], stub.StubPos[2]) {
+					t.Fatalf("%s start at %v stubPos %v failed biome check for %s", setName, cand, stub.StubPos, stub.StructureName)
+				}
+				return stub
+			}
+		}
+		t.Fatalf("did not find any valid start for %s in [-%d..%d] regions on seed %d", setName, maxRegions, maxRegions, seed)
+		return nil
+	}
+
+	monStub := findFirstValidStart("minecraft:ocean_monuments", 8)
+	outStub := findFirstValidStart("minecraft:pillager_outposts", 8)
+	manStub := findFirstValidStart("minecraft:woodland_mansions", 8)
+	if monStub.StructureName != "minecraft:monument" ||
+		outStub.StructureName != "minecraft:pillager_outpost" ||
+		manStub.StructureName != "minecraft:mansion" {
+		t.Fatalf("unexpected structure names: mon=%s out=%s man=%s",
+			monStub.StructureName, outStub.StructureName, manStub.StructureName)
+	}
+	t.Logf("seed=12345 starts: monument=(%d,%d stub=%v) pillager_outpost=(%d,%d stub=%v) mansion=(%d,%d stub=%v)",
+		monStub.ChunkX, monStub.ChunkZ, monStub.StubPos,
+		outStub.ChunkX, outStub.ChunkZ, outStub.StubPos,
+		manStub.ChunkX, manStub.ChunkZ, manStub.StubPos)
+
+	// 2. Ocean Monument piece contents on seed=12345 (CoreRoom, Penthouse, WingRoom, SimpleTopRoom, EntryRoom).
+	monStart := BuildOceanMonumentStart(seed, monStub.ChunkX, monStub.ChunkZ)
+	if monStart == nil {
+		t.Fatal("BuildOceanMonumentStart returned nil")
+	}
+	monRegion := buildFlatTestDecorationRegion(t, monStub.ChunkX, monStub.ChunkZ, 3, 35, true)
+	for cx := monStub.ChunkX - 3; cx <= monStub.ChunkX+3; cx++ {
+		for cz := monStub.ChunkZ - 3; cz <= monStub.ChunkZ+3; cz++ {
+			PlaceOceanMonumentsForChunk(monRegion, []*OceanMonumentStart{monStart}, seed, cx, cz)
+		}
+	}
+	monCounts := countBlocksInBox(monRegion, monStart.Piece.box)
+	if monCounts["minecraft:gold_block"] != 8 {
+		t.Errorf("OceanMonument CoreRoom gold_block = %d, want 8", monCounts["minecraft:gold_block"])
+	}
+	if monCounts["minecraft:wet_sponge"] == 0 {
+		t.Errorf("OceanMonument SimpleTopRoom wet_sponge = 0, want > 0")
+	}
+	if monCounts["minecraft:prismarine"] == 0 || monCounts["minecraft:prismarine_bricks"] == 0 ||
+		monCounts["minecraft:dark_prismarine"] == 0 || monCounts["minecraft:sea_lantern"] == 0 {
+		t.Errorf("OceanMonument missing core blocks: %v", monCounts)
+	}
+	elderCount, guardianCount := 0, 0
+	for _, ent := range collectRegionEntities(monRegion) {
+		switch ent.ID {
+		case "minecraft:elder_guardian":
+			elderCount++
+		case "minecraft:guardian":
+			guardianCount++
+		}
+	}
+	if elderCount != 3 || guardianCount == 0 {
+		t.Errorf("OceanMonument entities: elder_guardian=%d (want 3), guardian=%d (want > 0)", elderCount, guardianCount)
+	}
+
+	// 3. Woodland Mansion piece contents on seed=12345 (entrance, rooms, chests, entities, foundation).
+	manStart := BuildWoodlandMansionStart(seed, manStub.ChunkX, manStub.ChunkZ, manStub.StubPos)
+	if manStart == nil || len(manStart.Pieces) < 100 {
+		t.Fatalf("WoodlandMansion start=%v pieces=%d, want >= 100", manStart, len(manStart.Pieces))
+	}
+	manRegion := buildFlatTestDecorationRegion(t, manStub.ChunkX, manStub.ChunkZ, 6, manStub.StubPos[1]-3, false)
+	for cx := manStub.ChunkX - 6; cx <= manStub.ChunkX+6; cx++ {
+		for cz := manStub.ChunkZ - 6; cz <= manStub.ChunkZ+6; cz++ {
+			PlaceWoodlandMansionsForChunk(manRegion, []*WoodlandMansionStart{manStart}, seed, cx, cz)
+		}
+	}
+	manCounts := countBlocksInBox(manRegion, msBox{
+		minX: manStart.Box.minX, minY: manStub.StubPos[1] - 3, minZ: manStart.Box.minZ,
+		maxX: manStart.Box.maxX, maxY: manStart.Box.maxY, maxZ: manStart.Box.maxZ,
+	})
+	if manCounts["minecraft:dark_oak_planks"] == 0 || manCounts["minecraft:birch_planks"] == 0 ||
+		manCounts["minecraft:cobblestone"] == 0 {
+		t.Errorf("WoodlandMansion missing primary blocks: %v", manCounts)
+	}
+	// Verify cobblestone foundation was extended below minY down to terrain.
+	foundationCobble := 0
+	cobbyID, _ := nameToStateID("minecraft:cobblestone", nil)
+	for x := manStart.Box.minX; x <= manStart.Box.maxX; x++ {
+		for z := manStart.Box.minZ; z <= manStart.Box.maxZ; z++ {
+			if manRegion.getBlock(x, manStart.Box.minY-1, z) == cobbyID {
+				foundationCobble++
+			}
+		}
+	}
+	if foundationCobble == 0 {
+		t.Errorf("WoodlandMansion afterPlace placed 0 cobblestone foundation blocks at y=%d", manStart.Box.minY-1)
+	}
+	manChests, evokers, vindicators := 0, 0, 0
+	for _, be := range collectRegionBlockEntities(manRegion) {
+		if be.ID == "minecraft:chest" && len(be.Items) > 0 {
+			manChests++
+		}
+	}
+	for _, ent := range collectRegionEntities(manRegion) {
+		switch ent.ID {
+		case "minecraft:evoker":
+			evokers++
+		case "minecraft:vindicator":
+			vindicators++
+		}
+	}
+	if manChests == 0 || evokers == 0 || vindicators == 0 {
+		t.Errorf("WoodlandMansion lootChests=%d evokers=%d vindicators=%d, all want > 0",
+			manChests, evokers, vindicators)
+	}
+
+	// 4. Pillager Outpost piece contents on seed=12345 (watchtower, chest loot, ominous banner, pillagers).
+	outDef := sets.Structures["minecraft:pillager_outpost"]
+	if outDef == nil {
+		t.Fatal("missing minecraft:pillager_outpost definition")
+	}
+	outStart, err := BuildJigsawStart(nil, nil, outDef, seed, outStub.ChunkX, outStub.ChunkZ, func(x, z int, oceanFloor bool) int {
+		return 64
+	})
+	if err != nil || outStart == nil || len(outStart.Pieces) == 0 {
+		t.Fatalf("BuildJigsawStart(pillager_outpost): start=%v err=%v", outStart, err)
+	}
+	outRegion := buildFlatTestDecorationRegion(t, outStub.ChunkX, outStub.ChunkZ, 3, 64, false)
+	for cx := outStub.ChunkX - 3; cx <= outStub.ChunkX+3; cx++ {
+		for cz := outStub.ChunkZ - 3; cz <= outStub.ChunkZ+3; cz++ {
+			PlaceJigsawStartsForChunk(outRegion, []*JigsawStart{outStart}, "minecraft:pillager_outpost", 4, seed, cx, cz)
+		}
+	}
+	outCounts := countBlocksInBox(outRegion, outStart.Box)
+	if outCounts["minecraft:dark_oak_planks"] == 0 || outCounts["minecraft:cobblestone"] == 0 ||
+		outCounts["minecraft:chest"] == 0 {
+		t.Errorf("PillagerOutpost watchtower missing expected blocks: %v", outCounts)
+	}
+	outChests, outBanners, outPillagers := 0, 0, 0
+	for _, be := range collectRegionBlockEntities(outRegion) {
+		switch be.ID {
+		case "minecraft:chest":
+			if len(be.Items) > 0 {
+				outChests++
+			}
+		case "minecraft:banner":
+			outBanners++
+		}
+	}
+	for _, ent := range collectRegionEntities(outRegion) {
+		if ent.ID == "minecraft:pillager" {
+			outPillagers++
+		}
+	}
+	if outChests == 0 || outBanners == 0 || outPillagers == 0 {
+		t.Errorf("PillagerOutpost lootChests=%d banners=%d pillagers=%d, all want > 0",
+			outChests, outBanners, outPillagers)
+	}
+}

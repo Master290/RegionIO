@@ -379,12 +379,9 @@ func extractTemplateBlockEntity(worldX, worldY, worldZ int, blockName string, nc
 	}
 	id := beNBTString(nc, "id")
 	if id == "" {
-		switch normalizeResourceID(blockName) {
-		case "minecraft:spawner":
-			id = "minecraft:mob_spawner"
-		case "minecraft:suspicious_sand", "minecraft:suspicious_gravel":
-			id = "minecraft:brushable_block"
-		default:
+		if defBE, ok := defaultBlockEntityForBlock(blockName, worldX, worldY, worldZ); ok {
+			id = defBE.ID
+		} else {
 			id = normalizeResourceID(blockName)
 		}
 	} else {

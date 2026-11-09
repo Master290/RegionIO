@@ -33,10 +33,11 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-// Version 49: full 2D/3D PerlinSimplexNoise + Biome.shouldSnow precipitation
-// check in freeze_top_layer + FeaturePoolElement PlacedFeature modifier stream
-// in village/jigsaw placement.
-const generatorVersion = 49
+// Version 50: full Ocean Monument room graph + all 11 room pieces, full
+// Woodland Mansion grid + template piece placer + stair/door/chest/banner
+// mirror + cobblestone foundation, and Pillager Outpost jigsaw stub/banner/mob
+// parity (vanilla 26.1.2).
+const generatorVersion = 50
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

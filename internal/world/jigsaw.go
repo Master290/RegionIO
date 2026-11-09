@@ -3,6 +3,7 @@ package world
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -605,6 +606,96 @@ func lookupPoolAlias(aliases map[string]string, pool string) string {
 		}
 	}
 	return norm
+}
+
+// jigsawGenerationStubPos ports the start-element placement and biome check of
+// JigsawStructure.findGenerationPoint + JigsawPlacement.addPieces.
+func jigsawGenerationStubPos(
+	od *worldgen.OverworldDensity,
+	sets *worldgen.StructureSets,
+	def *worldgen.StructureDef,
+	seed int64,
+	chunkX, chunkZ int32,
+	random worldgen.RandomSource,
+) ([3]int, bool) {
+	if def == nil {
+		return [3]int{}, false
+	}
+	reg, err := worldgen.LoadJigsawDataRegistry()
+	if err != nil {
+		return [3]int{}, false
+	}
+	if random == nil {
+		r := worldgen.NewLegacy(0)
+		r.SetLargeFeatureSeed(seed, int(chunkX), int(chunkZ))
+		random = r
+	}
+
+	startY := def.SampleStartHeight(random)
+	startPos := [3]int{int(chunkX) * 16, startY, int(chunkZ) * 16}
+	poolAliases := resolvePoolAliases(def.PoolAliases, startPos, seed)
+
+	rotation := int(random.NextIntN(4))
+	startPool := reg.GetPool(lookupPoolAlias(poolAliases, def.StartPool))
+	if startPool == nil || len(startPool.Expanded) == 0 {
+		return [3]int{}, false
+	}
+	startElem := startPool.Expanded[int(random.NextIntN(int32(len(startPool.Expanded))))]
+	if startElem.ElementType == "minecraft:empty_pool_element" {
+		return [3]int{}, false
+	}
+
+	anchorPos := startPos
+	if def.StartJigsawName != "" {
+		wantName := normalizeResourceID(def.StartJigsawName)
+		jigsaws := getShuffledJigsawBlocks(startElem, startPos, rotation, random)
+		found := false
+		for _, j := range jigsaws {
+			if j.Name == wantName {
+				anchorPos = j.WorldPos
+				found = true
+				break
+			}
+		}
+		if !found {
+			return [3]int{}, false
+		}
+	}
+
+	offsetToAnchor := [3]int{anchorPos[0] - startPos[0], anchorPos[1] - startPos[1], anchorPos[2] - startPos[2]}
+	piecePos := [3]int{startPos[0] - offsetToAnchor[0], startPos[1] - offsetToAnchor[1], startPos[2] - offsetToAnchor[2]}
+	bb := getElementBoundingBox(startElem, piecePos, rotation)
+
+	centerX := (bb.maxX + bb.minX) / 2
+	centerZ := (bb.maxZ + bb.minZ) / 2
+	targetY := piecePos[1]
+	if def.ProjectStartToHeightmap != "" {
+		oceanFloor := strings.Contains(def.ProjectStartToHeightmap, "OCEAN_FLOOR")
+		targetY = startPos[1] + preCarveFirstOccupiedHeight(od, seed, centerX, centerZ, oceanFloor) + 1
+	}
+	oldGroundY := bb.minY + 1
+	dy := targetY - oldGroundY
+	bb.minY += dy
+	bb.maxY += dy
+
+	dimMinY := MinY
+	dimHeight := WorldHeight
+	if od != nil && od.Height > 0 {
+		dimMinY = od.MinY
+		dimHeight = od.Height
+	}
+	if def.DimensionPadding > 0 {
+		if bb.minY < dimMinY+def.DimensionPadding || bb.maxY > dimMinY+dimHeight-1-def.DimensionPadding {
+			return [3]int{}, false
+		}
+	}
+
+	stubY := targetY + offsetToAnchor[1]
+	stubPos := [3]int{centerX, stubY, centerZ}
+	if !isStructureBiomeAllowed(od, sets, def, stubPos[0], stubPos[1], stubPos[2]) {
+		return [3]int{}, false
+	}
+	return stubPos, true
 }
 
 // BuildJigsawStart ports JigsawStructure.findGenerationPoint and JigsawPlacement.addPieces.
@@ -1255,6 +1346,15 @@ func rotateTemplateState(state uint16, rotation int) uint16 {
 		}
 		changed = true
 	}
+	if rotStr, hasRot := props["rotation"]; hasRot {
+		if rVal, err := strconv.Atoi(rotStr); err == nil {
+			nr := (rVal + rot*4) & 15
+			if nr != rVal {
+				props["rotation"] = strconv.Itoa(nr)
+				changed = true
+			}
+		}
+	}
 	if !changed {
 		return state
 	}
@@ -1785,6 +1885,30 @@ func placeJigsawElementInChunk(
 				Rotation:            rotation,
 				PersistenceRequired: true,
 			})
+		}
+
+		// Pillager Outpost watchtower spawns persistent pillagers (spawn_overrides in pillager_outpost.json).
+		if strings.TrimPrefix(elem.Location, "minecraft:") == "pillager_outpost/watchtower" {
+			for _, localPos := range [][3]int{{7, 1, 7}, {7, 15, 7}} {
+				relBlock := worldgen.TransformBlockPos(localPos, "none", rotation, [3]int{0, 0, 0})
+				wBlock := [3]int{pos[0] + relBlock[0], pos[1] + relBlock[1], pos[2] + relBlock[2]}
+				if wBlock[0] < chunkBox.minX || wBlock[0] > chunkBox.maxX ||
+					wBlock[1] < chunkBox.minY || wBlock[1] > chunkBox.maxY ||
+					wBlock[2] < chunkBox.minZ || wBlock[2] > chunkBox.maxZ {
+					continue
+				}
+				region.addStructureEntity(StructureEntity{
+					ID:                  "minecraft:pillager",
+					X:                   float64(wBlock[0]) + 0.5,
+					Y:                   float64(wBlock[1]),
+					Z:                   float64(wBlock[2]) + 0.5,
+					BlockX:              wBlock[0],
+					BlockY:              wBlock[1],
+					BlockZ:              wBlock[2],
+					Rotation:            rotation,
+					PersistenceRequired: true,
+				})
+			}
 		}
 	}
 }
