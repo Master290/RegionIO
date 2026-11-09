@@ -228,6 +228,9 @@ var (
 		MobTypeHappyGhast:          EntityTypeHappyGhastID,
 		MobTypeParched:             EntityTypeParchedID,
 		MobTypeCamelHusk:           EntityTypeCamelHuskID,
+		MobTypePolarBear:           EntityTypePolarBearID,
+		MobTypeGiant:               EntityTypeGiantID,
+		EntityTypeMannequin:        EntityTypeMannequinID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -458,6 +461,12 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultHappyGhastMaxHealth
 	case MobTypeParched:
 		return DefaultParchedMaxHealth
+	case MobTypePolarBear:
+		return DefaultPolarBearMaxHealth
+	case MobTypeGiant:
+		return DefaultGiantMaxHealth
+	case EntityTypeMannequin:
+		return DefaultMannequinMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}

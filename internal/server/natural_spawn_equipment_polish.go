@@ -148,7 +148,7 @@ func BiomeSpawnTableForCategory2612(biomeName string, cat MobCategory2612) []Bio
 		case MobCategoryCreature:
 			return []BiomeSpawnEntry2612{
 				{TypeName: MobTypeRabbit, Weight: 10, MinCount: 2, MaxCount: 3},
-				{TypeName: "minecraft:polar_bear", Weight: 1, MinCount: 1, MaxCount: 2},
+				{TypeName: MobTypePolarBear, Weight: 1, MinCount: 1, MaxCount: 2},
 			}
 		case MobCategoryMonster:
 			zhWeight := 5
