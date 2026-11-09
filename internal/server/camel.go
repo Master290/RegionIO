@@ -357,7 +357,7 @@ func (s *Server) SetCamelSaddled(entityID int32, saddled bool) bool {
 		return false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel || s.IsMobBaby(entityID) {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) || s.IsMobBaby(entityID) {
 		return false
 	}
 	st := s.ensureCamelState(entityID)
@@ -370,7 +370,7 @@ func (s *Server) SetCamelSaddled(entityID int32, saddled bool) bool {
 	snap := *st
 	mgr.mu.Unlock()
 
-	if tamedSt := s.ensureTamedMobState(entityID, MobTypeCamel); tamedSt != nil {
+	if tamedSt := s.ensureTamedMobState(entityID, canonicalResourceName(ent.TypeName)); tamedSt != nil {
 		tmgr := s.tamedManager()
 		tmgr.mu.Lock()
 		tamedSt.Tamed = true
@@ -381,8 +381,12 @@ func (s *Server) SetCamelSaddled(entityID int32, saddled bool) bool {
 	s.broadcastCamelState(ent, snap)
 	if saddled {
 		cp := ent.ChunkPos()
+		saddleSound := SoundCamelSaddle
+		if canonicalResourceName(ent.TypeName) == MobTypeCamelHusk {
+			saddleSound = SoundCamelHuskSaddle
+		}
 		s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(SoundCamelSaddle, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			EncodeSoundPacket(saddleSound, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	}
 	return true
 }
@@ -400,7 +404,7 @@ func (s *Server) SitDownCamel(entityID int32) bool {
 		return false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) {
 		return false
 	}
 	st := s.ensureCamelState(entityID)
@@ -427,8 +431,12 @@ func (s *Server) SitDownCamel(entityID int32) bool {
 
 	s.broadcastCamelState(ent, snap)
 	cp := ent.ChunkPos()
+	sitSound := SoundCamelSit
+	if canonicalResourceName(ent.TypeName) == MobTypeCamelHusk {
+		sitSound = SoundCamelHuskSit
+	}
 	s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
-		EncodeSoundPacket(SoundCamelSit, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		EncodeSoundPacket(sitSound, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	return true
 }
 
@@ -439,7 +447,7 @@ func (s *Server) StandUpCamel(entityID int32) bool {
 		return false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) {
 		return false
 	}
 	st := s.ensureCamelState(entityID)
@@ -465,8 +473,12 @@ func (s *Server) StandUpCamel(entityID int32) bool {
 
 	s.broadcastCamelState(ent, snap)
 	cp := ent.ChunkPos()
+	standSound := SoundCamelStand
+	if canonicalResourceName(ent.TypeName) == MobTypeCamelHusk {
+		standSound = SoundCamelHuskStand
+	}
 	s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
-		EncodeSoundPacket(SoundCamelStand, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		EncodeSoundPacket(standSound, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	return true
 }
 
@@ -500,7 +512,7 @@ func (s *Server) MountCamel(session *PlayerSession, camelID int32) (seatIndex in
 		return -1, false
 	}
 	ent := s.entities.Get(camelID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel || s.IsMobBaby(camelID) {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) || s.IsMobBaby(camelID) {
 		return -1, false
 	}
 	st := s.ensureCamelState(camelID)
@@ -540,7 +552,7 @@ func (s *Server) DismountCamel(session *PlayerSession, camelID int32) bool {
 		return false
 	}
 	ent := s.entities.Get(camelID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) {
 		return false
 	}
 	st := s.ensureCamelState(camelID)
@@ -585,7 +597,7 @@ func (s *Server) ExecuteCamelDash(entityID int32, jumpPower int) (vx, vy, vz flo
 		return 0, 0, 0, false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel || s.IsMobBaby(entityID) {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) || s.IsMobBaby(entityID) {
 		return 0, 0, 0, false
 	}
 	st := s.ensureCamelState(entityID)
@@ -750,9 +762,10 @@ func (s *Server) InteractWithCamel(session *PlayerSession, entityID int32) (hand
 		return false, 0
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeCamel {
+	if ent == nil || !IsCamelOrCamelHuskType(ent.TypeName) {
 		return false, 0
 	}
+	isCamelHusk := canonicalResourceName(ent.TypeName) == MobTypeCamelHusk
 	dx := ent.X - snap.X
 	dy := ent.Y - snap.Y
 	dz := ent.Z - snap.Z
@@ -768,7 +781,7 @@ func (s *Server) InteractWithCamel(session *PlayerSession, entityID int32) (hand
 	dim := ent.EffectiveDimension()
 	cp := ent.ChunkPos()
 
-	// 1. Equip saddle on unsaddled adult Camel.
+	// 1. Equip saddle on unsaddled adult Camel / Camel Husk.
 	if itemID == SaddleItemID && !s.IsMobBaby(entityID) && !s.IsCamelSaddled(entityID) {
 		if s.SetCamelSaddled(entityID, true) {
 			consumeOneHeldItemInSurvival(session)
@@ -778,8 +791,10 @@ func (s *Server) InteractWithCamel(session *PlayerSession, entityID int32) (hand
 
 	// 1b. Lead / Shears (leash or shear saddle off an unridden Camel).
 	if itemID == LeadItemID && !s.IsEntityLeashed(entityID) {
-		if s.LeashMobToPlayer(session, entityID) {
-			return true, 0
+		if !isCamelHusk || s.CanCamelHuskBeLeashed(entityID) {
+			if s.LeashMobToPlayer(session, entityID) {
+				return true, 0
+			}
 		}
 	}
 	if itemID == "minecraft:shears" {
@@ -791,8 +806,25 @@ func (s *Server) InteractWithCamel(session *PlayerSession, entityID int32) (hand
 		}
 	}
 
-	// 2. Cactus -> baby growth boost (+10%), heal (+2.0 HP), or enter love mode & breed.
-	if itemID == CactusItemID {
+	// 2a. Camel Husk food (#minecraft:camel_husk_food = minecraft:rabbit_foot) heals +2.0 HP (never breeds).
+	if isCamelHusk && IsCamelHuskFoodItem(itemID) {
+		curHP := s.MobHealth(entityID)
+		if curHP > 0 && curHP < DefaultCamelMaxHealth {
+			newHP := curHP + CamelCactusHealAmount
+			if newHP > DefaultCamelMaxHealth {
+				newHP = DefaultCamelMaxHealth
+			}
+			s.SetMobHealth(entityID, newHP)
+			consumeOneHeldItemInSurvival(session)
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(SoundCamelHuskEat, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			return true, 0
+		}
+		return false, 0
+	}
+
+	// 2. Cactus -> baby growth boost (+10%), heal (+2.0 HP), or enter love mode & breed (regular Camel only).
+	if !isCamelHusk && itemID == CactusItemID {
 		if s.IsMobBaby(entityID) {
 			fed, _ := s.FeedBabyMob(session, entityID, CactusItemID)
 			return fed, 0
@@ -855,7 +887,7 @@ func (s *Server) TickCamels(rng *rand.Rand) {
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		ent := &allEnts[i]
-		if canonicalResourceName(ent.TypeName) != MobTypeCamel {
+		if !IsCamelOrCamelHuskType(ent.TypeName) {
 			continue
 		}
 		st := s.ensureCamelState(ent.ID)

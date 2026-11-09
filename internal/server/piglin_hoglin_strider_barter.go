@@ -78,7 +78,7 @@ const (
 	StriderLavaSpeed                = 0.175
 	StriderBoostSpeedMult           = 1.55
 	StriderMinBoostTicks            = 140
-	StriderMaxBoostTicks            = 420
+	StriderMaxBoostTicks            = 980 // 140 + random.nextInt(841) in ItemBasedSteering.boost (vanilla 26.1.2)
 	StriderWaterDamage              = float32(1.0)
 	StriderWaterDamageIntervalTicks = 20
 	WarpedFungusOnAStickMaxDamage   = 100

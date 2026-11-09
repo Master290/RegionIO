@@ -545,12 +545,18 @@ func EquineFoodStats(mobType, itemName string) (heal float32, temperGain int, ok
 			return 0, 0, false
 		}
 	}
+	if mob == MobTypeZombieHorse {
+		if item == "minecraft:red_mushroom" {
+			return 3.0, 3, true
+		}
+		return 0, 0, false
+	}
 	switch item {
 	case "minecraft:wheat":
 		return 2.0, 3, true
 	case "minecraft:sugar":
 		return 1.0, 3, true
-	case "minecraft:apple":
+	case "minecraft:apple", "minecraft:carrot":
 		return 3.0, 3, true
 	case "minecraft:golden_carrot":
 		return 4.0, 5, true
@@ -932,14 +938,14 @@ func (s *Server) interactWithEquineOrLlama(session *PlayerSession, ent *world.En
 		}
 	}
 
-	// 3. Equipping horse armor on a tamed horse (or dyeing worn leather_horse_armor).
-	if tamed && norm == MobTypeHorse && IsHorseArmorItem(heldID) && s.HorseArmorItem(ent.ID) == "" {
+	// 3. Equipping horse armor on a tamed horse or zombie_horse (or dyeing worn leather_horse_armor).
+	if tamed && (norm == MobTypeHorse || norm == MobTypeZombieHorse) && IsHorseArmorItem(heldID) && s.HorseArmorItem(ent.ID) == "" {
 		if s.EquipHorseArmor(ent.ID, world.NewNamedItemStack(heldID, 1)) {
 			consumeOneHeldItemInSurvival(session)
 			return true, 0
 		}
 	}
-	if tamed && norm == MobTypeHorse && s.HorseArmorItem(ent.ID) == "minecraft:leather_horse_armor" {
+	if tamed && (norm == MobTypeHorse || norm == MobTypeZombieHorse) && s.HorseArmorItem(ent.ID) == "minecraft:leather_horse_armor" {
 		if dyeIdx, ok := DyeColorIndexByItemName(heldID); ok {
 			if _, dyed := s.DyeEquippedHorseArmor(ent.ID, dyeIdx); dyed {
 				consumeOneHeldItemInSurvival(session)

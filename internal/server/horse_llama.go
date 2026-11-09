@@ -41,7 +41,7 @@ const (
 	DonkeyJumpStrength     float64 = 0.5
 	SkeletonHorseMaxHealth float32 = 15.0
 	SkeletonHorseSpeed     float64 = 0.2
-	ZombieHorseMaxHealth   float32 = 15.0
+	ZombieHorseMaxHealth   float32 = 25.0
 	ZombieHorseSpeed       float64 = 0.2
 	WanderingTraderMaxHP   float32 = 20.0
 	LlamaMovementSpeed     float64 = 0.175
@@ -740,8 +740,8 @@ func (s *Server) ensureEquineState(entityID int32, typeName string, rng *rand.Ra
 		st.JumpStrength = RollHorseJumpStrength(rng)
 	case MobTypeZombieHorse:
 		st.MaxHealth = ZombieHorseMaxHealth
-		st.MovementSpeed = ZombieHorseSpeed
-		st.JumpStrength = RollHorseJumpStrength(rng)
+		st.MovementSpeed = RollZombieHorseMovementSpeed(rng)
+		st.JumpStrength = RollZombieHorseJumpStrength(rng)
 	case MobTypeLlama, MobTypeTraderLlama:
 		st.MaxHealth = RollEquineMaxHealth(rng)
 		st.MovementSpeed = LlamaMovementSpeed
@@ -847,14 +847,18 @@ func (s *Server) EquipHorseArmor(entityID int32, armorStack world.ItemStack) boo
 		return false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeHorse || s.IsMobBaby(entityID) {
+	if ent == nil || s.IsMobBaby(entityID) {
+		return false
+	}
+	norm := canonicalResourceName(ent.TypeName)
+	if norm != MobTypeHorse && norm != MobTypeZombieHorse {
 		return false
 	}
 	itemID := canonicalResourceName(armorStack.ResolvedID())
 	if !IsHorseArmorItem(itemID) {
 		return false
 	}
-	st := s.ensureEquineState(entityID, MobTypeHorse, nil)
+	st := s.ensureEquineState(entityID, norm, nil)
 	mgr := s.equineManager()
 	mgr.mu.Lock()
 	if !st.ArmorItem.IsEmpty() {
@@ -880,10 +884,14 @@ func (s *Server) RemoveHorseArmor(entityID int32) (world.ItemStack, bool) {
 		return world.ItemStack{}, false
 	}
 	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeHorse {
+	if ent == nil {
 		return world.ItemStack{}, false
 	}
-	st := s.ensureEquineState(entityID, MobTypeHorse, nil)
+	norm := canonicalResourceName(ent.TypeName)
+	if norm != MobTypeHorse && norm != MobTypeZombieHorse {
+		return world.ItemStack{}, false
+	}
+	st := s.ensureEquineState(entityID, norm, nil)
 	mgr := s.equineManager()
 	mgr.mu.Lock()
 	if st.ArmorItem.IsEmpty() {
@@ -2630,7 +2638,7 @@ func (s *Server) ShearEquineOrLlamaEquipment(session *PlayerSession, entityID in
 	if norm == MobTypeLlama || norm == MobTypeTraderLlama {
 		return s.ShearLlamaCarpet(entityID)
 	}
-	if norm == MobTypeHorse {
+	if norm == MobTypeHorse || norm == MobTypeZombieHorse {
 		if dropped, ok := s.RemoveHorseArmor(entityID); ok {
 			if !dropped.IsEmpty() {
 				s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.5, ent.Z, dropped)

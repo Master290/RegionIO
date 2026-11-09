@@ -311,7 +311,7 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultSnifferMaxHealth
 	case MobTypeArmadillo:
 		return DefaultArmadilloMaxHealth
-	case MobTypeCamel:
+	case MobTypeCamel, MobTypeCamelHusk:
 		return DefaultCamelMaxHealth
 	case MobTypeAllay:
 		return DefaultAllayMaxHealth
@@ -456,7 +456,7 @@ func animalWanderSpeed(typeName string) float64 {
 		return SnifferWanderSpeed
 	case MobTypeArmadillo:
 		return ArmadilloWanderSpeed
-	case MobTypeCamel:
+	case MobTypeCamel, MobTypeCamelHusk:
 		return CamelWalkSpeed
 	case MobTypeAllay:
 		return AllayFlySpeed
@@ -570,6 +570,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeCamel {
 		return s.SpawnCamel(normDim, x, y, z, false)
+	}
+	if norm == MobTypeCamelHusk {
+		return s.SpawnCamelHusk(normDim, x, y, z)
 	}
 	if norm == MobTypeBreeze {
 		return s.SpawnBreeze(normDim, x, y, z)
