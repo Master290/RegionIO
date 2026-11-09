@@ -888,3 +888,249 @@ func TestCommandsAndGameRulesRemainder26_1_2(t *testing.T) {
 		t.Fatalf("/execute worldborder center ~ ~ = %q", got)
 	}
 }
+
+func TestCommandsCreativeInventoryCraftingBookAndTradesParity26_1_2(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	srv, err := server.NewWithCache(cfg, world.NewCache(256, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	type sentPkt struct {
+		id   int32
+		body []byte
+	}
+	var alicePkts []sentPkt
+	alice, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{31}, Name: "Alice"}, func(id int32, body []byte) error {
+		cp := make([]byte, len(body))
+		copy(cp, body)
+		alicePkts = append(alicePkts, sentPkt{id: id, body: cp})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Alice): %v", err)
+	}
+	bob, err := srv.RegisterPlayer(server.Profile{UUID: [16]byte{32}, Name: "Bob"}, func(int32, []byte) error { return nil })
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Bob): %v", err)
+	}
+	_ = srv.GrantOp(alice.Profile)
+	srv.SetPlayerTransform(alice, 0, 70, 0, 0, 0, true)
+	srv.SetPlayerTransform(bob, 4, 70, 4, 0, 0, true)
+
+	// 1. Suggestions for /effect, /give, /enchant, /xp, /time, /weather, /difficulty, /gamerule, /tp, /gamemode
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/effect "); len(s) != 2 || s[0] != "clear" || s[1] != "give" {
+		t.Fatalf("ComputeCommandSuggestions('/effect ') = %v, want [clear give]", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/effect give Alice minecraft:sp"); len(s) == 0 || s[0] != "minecraft:speed" {
+		t.Fatalf("ComputeCommandSuggestions('/effect give Alice minecraft:sp') = %v", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/effect give Alice minecraft:speed inf"); len(s) != 1 || s[0] != "infinite" {
+		t.Fatalf("ComputeCommandSuggestions('/effect give ... inf') = %v, want [infinite]", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/give Alice minecraft:diamond_sw"); len(s) == 0 || s[0] != "minecraft:diamond_sword" {
+		t.Fatalf("ComputeCommandSuggestions('/give Alice minecraft:diamond_sw') = %v", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/enchant Alice minecraft:sharp"); len(s) != 1 || s[0] != "minecraft:sharpness" {
+		t.Fatalf("ComputeCommandSuggestions('/enchant Alice minecraft:sharp') = %v", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/xp "); len(s) != 3 || s[0] != "add" || s[1] != "query" || s[2] != "set" {
+		t.Fatalf("ComputeCommandSuggestions('/xp ') = %v, want [add query set]", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/xp add Alice 10 l"); len(s) != 1 || s[0] != "levels" {
+		t.Fatalf("ComputeCommandSuggestions('/xp add Alice 10 l') = %v, want [levels]", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/time set n"); len(s) != 2 || s[0] != "night" || s[1] != "noon" {
+		t.Fatalf("ComputeCommandSuggestions('/time set n') = %v", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/weather "); len(s) != 3 || s[0] != "clear" || s[1] != "rain" || s[2] != "thunder" {
+		t.Fatalf("ComputeCommandSuggestions('/weather ') = %v", s)
+	}
+	if _, _, s := ComputeCommandSuggestions(srv, alice, "/difficulty p"); len(s) != 1 || s[0] != "peaceful" {
+		t.Fatalf("ComputeCommandSuggestions('/difficulty p') = %v", s)
+	}
+
+	// 2. Permission checks for non-op Bob vs /execute as Bob run by op Alice
+	if got := ExecuteCommand(srv, bob, "/gamemode creative"); !strings.Contains(got, "permission") {
+		t.Fatalf("non-op /gamemode = %q", got)
+	}
+	if got := ExecuteCommand(srv, bob, "/give @s minecraft:diamond 1"); !strings.Contains(got, "permission") {
+		t.Fatalf("non-op /give = %q", got)
+	}
+	if got := ExecuteCommand(srv, alice, `/execute as Bob run give @s minecraft:diamond_chestplate[damage=12,custom_name="BobPlate",enchantments={"minecraft:protection":4},trim={material:"minecraft:amethyst",pattern:"minecraft:silence"}] 1`); !strings.Contains(got, "Bob") {
+		t.Fatalf("op /execute as Bob run give = %q", got)
+	}
+	bobSlot := int(world.HotbarContainerOffset)
+	if bob.InventorySlot(bobSlot).ResolvedID() != "minecraft:diamond_chestplate" {
+		t.Fatalf("Bob hotbar 0 = %v, want diamond_chestplate", bob.InventorySlot(bobSlot))
+	}
+	bobMeta := server.GetSlotItemMeta(bob, bobSlot)
+	bobTrim, hasBobTrim := server.GetSlotArmorTrim(bob, bobSlot)
+	if bobMeta.Damage != 12 || bobMeta.CustomName != "BobPlate" || bobMeta.EnchantmentLevel("minecraft:protection") != 4 || !hasBobTrim || bobTrim.Pattern != "minecraft:silence" {
+		t.Fatalf("Bob chestplate meta=%+v trim=%+v", bobMeta, bobTrim)
+	}
+
+	// Verify /give sends PlayContainerSetSlot with full ItemMeta & ArmorTrim components on wire
+	alicePkts = nil
+	if got := ExecuteCommand(srv, alice, `/give @s minecraft:diamond_sword[damage=7,custom_name="Blade",enchantments={"minecraft:sharpness":5}] 1`); !strings.Contains(got, "Alice") {
+		t.Fatalf("/give Alice sword = %q", got)
+	}
+	foundSetSlotWithMeta := false
+	for _, p := range alicePkts {
+		if p.id == protocol.PlayContainerSetSlot {
+			r := protocol.NewReader(p.body)
+			_, _ = r.VarInt() // containerID
+			_, _ = r.VarInt() // stateID
+			_, _ = r.Uint16() // slot
+			st, meta, _, err := server.ReadSlotWithArmorTrim(r)
+			if err == nil && st.ResolvedID() == "minecraft:diamond_sword" && meta.Damage == 7 && meta.CustomName == "Blade" && meta.EnchantmentLevel("minecraft:sharpness") == 5 {
+				foundSetSlotWithMeta = true
+				break
+			}
+		}
+	}
+	if !foundSetSlotWithMeta {
+		t.Fatal("expected /give to send PlayContainerSetSlot carrying damage, custom_name, and enchantments components")
+	}
+
+	// 3. Creative inventory (ServerboundSetCreativeModeSlotPacket):
+	//    - Creative tab / Saved Hotbar item with components (ItemMeta + ArmorTrim) in slot 37
+	//    - Dropping item outside creative inventory (slot = -1) spawns item entity
+	//    - Rejected when in Survival mode
+	_ = srv.SetPlayerGameMode(alice, server.GameModeCreative)
+	alicePkts = nil
+	creativePkt := server.EncodeCreativeSlotPacket(
+		int16(world.HotbarContainerOffset+1),
+		world.NewNamedItemStack("minecraft:netherite_helmet", 1),
+		server.ItemMeta{Damage: 3, CustomName: "SavedCrown", Enchantments: map[string]int{"minecraft:unbreaking": 3}},
+		server.ArmorTrim{Material: "minecraft:gold", Pattern: "minecraft:ward"},
+		"",
+	)
+	slot, st, accepted, err := srv.HandleSetCreativeModeSlot(alice, protocol.NewReader(creativePkt))
+	if err != nil || !accepted || slot != int(world.HotbarContainerOffset+1) || st.ResolvedID() != "minecraft:netherite_helmet" {
+		t.Fatalf("HandleSetCreativeModeSlot(creative) = (%d, %v, %v, %v)", slot, st, accepted, err)
+	}
+	gotCreativeMeta := server.GetSlotItemMeta(alice, slot)
+	gotCreativeTrim, hasCreativeTrim := server.GetSlotArmorTrim(alice, slot)
+	if gotCreativeMeta.CustomName != "SavedCrown" || gotCreativeMeta.EnchantmentLevel("minecraft:unbreaking") != 3 || !hasCreativeTrim || gotCreativeTrim.Pattern != "minecraft:ward" {
+		t.Fatalf("creative slot meta=%+v trim=%+v", gotCreativeMeta, gotCreativeTrim)
+	}
+	planksPkt := server.EncodeCreativeSlotPacket(int16(world.HotbarContainerOffset+2), world.NewNamedItemStack("minecraft:oak_planks", 16), server.ItemMeta{}, server.ArmorTrim{}, "")
+	_, _, planksAccepted, err := srv.HandleSetCreativeModeSlot(alice, protocol.NewReader(planksPkt))
+	if err != nil || !planksAccepted || !alice.HasUnlockedRecipe("minecraft:crafting_table") {
+		t.Fatalf("expected creative slot placement of oak_planks to unlock minecraft:crafting_table (accepted=%v err=%v)", planksAccepted, err)
+	}
+
+	// Creative drop (slot == -1) spawns item entity in world
+	dropPkt := server.EncodeCreativeSlotPacket(-1, world.NewNamedItemStack("minecraft:emerald", 8), server.ItemMeta{}, server.ArmorTrim{}, "")
+	_, droppedSt, dropAccepted, err := srv.HandleSetCreativeModeSlot(alice, protocol.NewReader(dropPkt))
+	if err != nil || !dropAccepted || droppedSt.Count != 8 {
+		t.Fatalf("HandleSetCreativeModeSlot(slot=-1) = (%v, %v, %v)", droppedSt, dropAccepted, err)
+	}
+
+	// Survival mode rejects ServerboundSetCreativeModeSlotPacket
+	_ = srv.SetPlayerGameMode(alice, server.GameModeSurvival)
+	survPkt := server.EncodeCreativeSlotPacket(int16(world.HotbarContainerOffset+3), world.NewNamedItemStack("minecraft:bedrock", 64), server.ItemMeta{}, server.ArmorTrim{}, "")
+	_, _, survAccepted, _ := srv.HandleSetCreativeModeSlot(alice, protocol.NewReader(survPkt))
+	if survAccepted || !alice.InventorySlot(int(world.HotbarContainerOffset+3)).IsEmpty() {
+		t.Fatal("expected HandleSetCreativeModeSlot to be rejected in Survival mode")
+	}
+
+	// 4. Crafting book: PlaceRecipe (2x2 craft + ghost recipe when missing ingredients)
+	dispID, ok := server.DisplayIDForRecipe("minecraft:crafting_table")
+	if !ok {
+		t.Fatal("DisplayIDForRecipe(minecraft:crafting_table) not found")
+	}
+	if err := srv.HandlePlaceRecipe(alice, 0, dispID, false); err != nil {
+		t.Fatalf("HandlePlaceRecipe(crafting_table): %v", err)
+	}
+	if alice.InventorySlot(0).ResolvedID() != "minecraft:crafting_table" {
+		t.Fatalf("expected 2x2 craft result minecraft:crafting_table in slot 0, got %v", alice.InventorySlot(0))
+	}
+	// Missing ingredient -> PlayPlaceGhostRecipe (0x3f)
+	srv.UnlockRecipesByNames(alice, []string{"minecraft:flint_and_steel"})
+	ghostDispID, ok := server.DisplayIDForRecipe("minecraft:flint_and_steel")
+	if !ok {
+		t.Fatal("DisplayIDForRecipe(minecraft:flint_and_steel) not found")
+	}
+	alicePkts = nil
+	if err := srv.HandlePlaceRecipe(alice, 0, ghostDispID, false); err != nil {
+		t.Fatalf("HandlePlaceRecipe(flint_and_steel ghost): %v", err)
+	}
+	foundGhost := false
+	for _, p := range alicePkts {
+		if p.id == protocol.PlayPlaceGhostRecipe {
+			foundGhost = true
+			break
+		}
+	}
+	if !foundGhost {
+		t.Fatal("expected PlayPlaceGhostRecipe (0x3f) when ingredients are missing")
+	}
+
+	// 5. Villager & Wandering Trader trades: offer sync, reputation/Hero discount, XP orbs, and container stateID/carried sync
+	vID, err := srv.SpawnVillager(2, 70, 2, "minecraft:farmer", 1)
+	if err != nil || vID <= 0 {
+		t.Fatalf("SpawnVillager failed: id=%d err=%v", vID, err)
+	}
+	srv.AddVillagerGossip(vID, alice.Profile.UUID, server.GossipMajorPositive, 20)
+	_ = ExecuteCommand(srv, alice, "/effect give @s minecraft:hero_of_the_village 30 0")
+	alicePkts = nil
+	cid, err := srv.OpenMerchant(alice, vID)
+	if err != nil || cid <= 0 {
+		t.Fatalf("OpenMerchant: cid=%d err=%v", cid, err)
+	}
+	vs, ok := srv.VillagerState(vID)
+	if !ok || len(vs.Offers) == 0 {
+		t.Fatal("expected villager to have trade offers")
+	}
+	offer0 := vs.Offers[0]
+	if offer0.SpecialPriceDiff >= 0 && offer0.BaseCostA.Count > 1 {
+		t.Fatalf("expected negative SpecialPriceDiff from gossip + Hero of the Village, got %d", offer0.SpecialPriceDiff)
+	}
+	// Put required payment items into Alice's inventory, select trade 0, and click result slot 2
+	costA := offer0.AdjustedCostA()
+	alice.SetInventorySlot(9, world.NewItemStack(costA.ResolvedItemID(), 64))
+	if !offer0.CostB.IsEmpty() {
+		alice.SetInventorySlot(10, world.NewItemStack(offer0.CostB.ResolvedItemID(), 64))
+	}
+	if err := srv.SelectMerchantTrade(alice, 0); err != nil {
+		t.Fatalf("SelectMerchantTrade: %v", err)
+	}
+	alicePkts = nil
+	if err := srv.HandleContainerClick(alice, cid, server.MerchantSlotResult, 0, server.ContainerInputPickup); err != nil {
+		t.Fatalf("HandleContainerClick(MerchantSlotResult): %v", err)
+	}
+	if alice.CarriedItem().ResolvedItemID() != offer0.Result.ResolvedItemID() {
+		t.Fatalf("carried item after trade = %v, want %v", alice.CarriedItem(), offer0.Result)
+	}
+	foundContentSync := false
+	foundOffersUpdate := false
+	foundXPOrbSpawn := false
+	for _, p := range alicePkts {
+		if p.id == protocol.PlayContainerSetContent {
+			r := protocol.NewReader(p.body)
+			gotCID, _ := r.VarInt()
+			gotStateID, _ := r.VarInt()
+			if gotCID == cid && gotStateID > 0 {
+				foundContentSync = true
+			}
+		}
+		if p.id == server.PlayMerchantOffersCB {
+			foundOffersUpdate = true
+		}
+		if p.id == protocol.PlayAddEntity {
+			foundXPOrbSpawn = true
+		}
+	}
+	if !foundContentSync {
+		t.Fatal("expected PlayContainerSetContent with valid containerId and stateId after trade click")
+	}
+	if !foundOffersUpdate {
+		t.Fatal("expected PlayMerchantOffersCB (0x34) after completing villager trade")
+	}
+	if !foundXPOrbSpawn {
+		t.Fatal("expected experience orb entity spawn (PlayAddEntity) after completing villager trade")
+	}
+}

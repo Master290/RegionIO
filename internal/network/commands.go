@@ -6101,37 +6101,59 @@ func expandSelectorTokenToPlayerNames(srv *server.Server, ctx CommandContext, to
 
 func execItemAndStatusWithContext(srv *server.Server, ctx CommandContext, effectivePlayer *server.PlayerSession, cmdName string, args []string) (string, bool) {
 	lower := strings.ToLower(strings.TrimSpace(cmdName))
+	permSender := effectivePlayer
+	if effectivePlayer != nil && !srv.HasAdminPermission(effectivePlayer) && srv.HasAdminPermission(ctx.Sender) {
+		permSender = ctx.Sender
+	}
 	switch lower {
-	case "give", "enchant":
+	case "give", "enchant", "clear":
+		if len(args) == 0 && lower == "clear" && effectivePlayer != nil {
+			return srv.HandleItemAndStatusCommand(permSender, cmdName, []string{effectivePlayer.Profile.Name})
+		}
 		if len(args) >= 1 && strings.HasPrefix(args[0], "@") {
 			sessions, err := ResolveTargetSessions(srv, ctx, args[0])
-			if err == nil && len(sessions) == 1 {
-				cp := make([]string, len(args))
-				copy(cp, args)
-				cp[0] = sessions[0].Profile.Name
-				return srv.HandleItemAndStatusCommand(effectivePlayer, cmdName, cp)
+			if err == nil && len(sessions) > 0 {
+				if len(sessions) == 1 {
+					cp := make([]string, len(args))
+					copy(cp, args)
+					cp[0] = sessions[0].Profile.Name
+					return srv.HandleItemAndStatusCommand(permSender, cmdName, cp)
+				}
+				var lastReply string
+				for _, sess := range sessions {
+					cp := make([]string, len(args))
+					copy(cp, args)
+					cp[0] = sess.Profile.Name
+					lastReply, _ = srv.HandleItemAndStatusCommand(permSender, cmdName, cp)
+				}
+				return lastReply, true
 			}
 		}
-	case "clear":
-		if len(args) >= 1 && strings.HasPrefix(args[0], "@") {
-			sessions, err := ResolveTargetSessions(srv, ctx, args[0])
-			if err == nil && len(sessions) == 1 {
-				cp := make([]string, len(args))
-				copy(cp, args)
-				cp[0] = sessions[0].Profile.Name
-				return srv.HandleItemAndStatusCommand(effectivePlayer, cmdName, cp)
-			}
-		}
+		return srv.HandleItemAndStatusCommand(permSender, cmdName, args)
 	case "effect":
+		if len(args) == 1 && strings.EqualFold(args[0], "clear") && effectivePlayer != nil {
+			return srv.HandleItemAndStatusCommand(permSender, cmdName, []string{"clear", effectivePlayer.Profile.Name})
+		}
 		if len(args) >= 2 && strings.HasPrefix(args[1], "@") {
 			sessions, err := ResolveTargetSessions(srv, ctx, args[1])
-			if err == nil && len(sessions) == 1 {
-				cp := make([]string, len(args))
-				copy(cp, args)
-				cp[1] = sessions[0].Profile.Name
-				return srv.HandleItemAndStatusCommand(effectivePlayer, cmdName, cp)
+			if err == nil && len(sessions) > 0 {
+				if len(sessions) == 1 {
+					cp := make([]string, len(args))
+					copy(cp, args)
+					cp[1] = sessions[0].Profile.Name
+					return srv.HandleItemAndStatusCommand(permSender, cmdName, cp)
+				}
+				var lastReply string
+				for _, sess := range sessions {
+					cp := make([]string, len(args))
+					copy(cp, args)
+					cp[1] = sess.Profile.Name
+					lastReply, _ = srv.HandleItemAndStatusCommand(permSender, cmdName, cp)
+				}
+				return lastReply, true
 			}
 		}
+		return srv.HandleItemAndStatusCommand(permSender, cmdName, args)
 	case "item":
 		cp := make([]string, len(args))
 		copy(cp, args)
@@ -6146,9 +6168,9 @@ func execItemAndStatusWithContext(srv *server.Server, ctx CommandContext, effect
 				cp[2] = sessions[0].Profile.Name
 			}
 		}
-		return srv.HandleItemAndStatusCommand(effectivePlayer, cmdName, cp)
+		return srv.HandleItemAndStatusCommand(permSender, cmdName, cp)
 	}
-	return srv.HandleItemAndStatusCommand(effectivePlayer, cmdName, args)
+	return srv.HandleItemAndStatusCommand(permSender, cmdName, args)
 }
 
 func execSocialAndScoreboardWithContext(srv *server.Server, ctx CommandContext, effectivePlayer *server.PlayerSession, cmdName string, args []string) (string, bool) {
@@ -7180,9 +7202,69 @@ func ComputeCommandSuggestions(srv *server.Server, sender *server.PlayerSession,
 		} else if argIdx == 2 && (fields[1] == "add" || fields[1] == "remove") {
 			candidates = onlinePlayers()
 		}
-	case "tp", "teleport", "kill", "op", "deop", "kick", "ban", "spawnpoint", "spectate", "msg", "tell", "w", "give", "clear", "effect", "enchant":
+	case "tp", "teleport", "kill", "op", "deop", "kick", "ban", "spawnpoint", "spectate", "msg", "tell", "w":
 		if argIdx == 1 {
 			candidates = onlinePlayers()
+		} else if argIdx == 2 && (cmdName == "tp" || cmdName == "teleport") {
+			candidates = onlinePlayers()
+		}
+	case "give", "clear":
+		if argIdx == 1 {
+			candidates = onlinePlayers()
+		} else if argIdx == 2 {
+			candidates = server.AllKnownItemNames()
+		}
+	case "enchant":
+		if argIdx == 1 {
+			candidates = onlinePlayers()
+		} else if argIdx == 2 {
+			defs := server.DefaultEnchantmentRegistry().All()
+			candidates = make([]string, 0, len(defs))
+			for _, d := range defs {
+				candidates = append(candidates, d.ID)
+			}
+		}
+	case "effect":
+		if argIdx == 1 {
+			candidates = []string{"clear", "give"}
+		} else if argIdx == 2 {
+			candidates = onlinePlayers()
+		} else if argIdx == 3 {
+			candidates = []string{
+				"minecraft:absorption", "minecraft:bad_omen", "minecraft:blindness",
+				"minecraft:conduit_power", "minecraft:darkness", "minecraft:dolphins_grace",
+				"minecraft:fire_resistance", "minecraft:glowing", "minecraft:haste",
+				"minecraft:health_boost", "minecraft:hero_of_the_village", "minecraft:hunger",
+				"minecraft:infested", "minecraft:instant_damage", "minecraft:instant_health",
+				"minecraft:invisibility", "minecraft:jump_boost", "minecraft:levitation",
+				"minecraft:luck", "minecraft:mining_fatigue", "minecraft:nausea",
+				"minecraft:night_vision", "minecraft:oozing", "minecraft:poison",
+				"minecraft:raid_omen", "minecraft:regeneration", "minecraft:resistance",
+				"minecraft:saturation", "minecraft:slow_falling", "minecraft:slowness",
+				"minecraft:speed", "minecraft:strength", "minecraft:trial_omen",
+				"minecraft:unluck", "minecraft:water_breathing", "minecraft:weakness",
+				"minecraft:weaving", "minecraft:wind_charged", "minecraft:wither",
+			}
+		} else if argIdx == 4 && strings.EqualFold(fields[1], "give") {
+			candidates = []string{"infinite"}
+		}
+	case "xp", "experience":
+		if argIdx == 1 {
+			candidates = []string{"add", "query", "set"}
+		} else if argIdx == 2 {
+			candidates = onlinePlayers()
+		} else if argIdx == 3 && strings.EqualFold(fields[1], "query") {
+			candidates = []string{"levels", "points"}
+		} else if argIdx == 4 && (strings.EqualFold(fields[1], "add") || strings.EqualFold(fields[1], "set")) {
+			candidates = []string{"levels", "points"}
+		}
+	case "recipe":
+		if argIdx == 1 {
+			candidates = []string{"give", "take"}
+		} else if argIdx == 2 {
+			candidates = onlinePlayers()
+		} else if argIdx == 3 {
+			candidates = []string{"*"}
 		}
 	case "help":
 		if argIdx == 1 {

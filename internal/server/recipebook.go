@@ -1309,6 +1309,8 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 		returnStacksToInventory(session, tr.open.Crafting[:9])
 		for i := range tr.open.Crafting {
 			tr.open.Crafting[i] = world.ItemStack{}
+			tr.open.CraftingPotions[i] = ""
+			tr.open.CraftingStars[i] = FireworkExplosion{}
 		}
 		tr.open.Result = world.ItemStack{}
 	} else {
@@ -1320,10 +1322,13 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 			}
 			existing[i] = st
 			tr.invCraft[i] = world.ItemStack{}
+			tr.invCraftStars[i] = FireworkExplosion{}
 			session.SetInventorySlot(1+i, world.ItemStack{})
+			clearAllSlotMetadata(session, 1+i)
 		}
 		tr.invResult = world.ItemStack{}
 		session.SetInventorySlot(0, world.ItemStack{})
+		clearAllSlotMetadata(session, 0)
 		returnStacksToInventory(session, existing[:])
 	}
 
@@ -1363,6 +1368,9 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 	// Commit updated player storage (9..44) and crafting grid slots.
 	for i := 0; i < 36; i++ {
 		session.SetInventorySlot(9+i, storage[i])
+		if storage[i].IsEmpty() {
+			clearAllSlotMetadata(session, 9+i)
+		}
 	}
 	result, _, _ := MatchCraftingGrid(newGrid, gridW, gridH)
 	if isTable {

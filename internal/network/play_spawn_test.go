@@ -99,10 +99,6 @@ func TestPlayerJoinRestoresSavedPlayerDataAndInventory(t *testing.T) {
 		cancel1()
 		t.Fatalf("onPlayerMove: %v", err)
 	}
-	if err := srv.SetPlayerGameMode(h1.session, server.GameModeSurvival); err != nil {
-		cancel1()
-		t.Fatalf("SetPlayerGameMode: %v", err)
-	}
 	srv.SetPlayerHealth(h1.session, 14.5, 16, 3.5)
 	srv.SetPlayerSpawnPoint(h1.session, 100, 70, -50, 90.0, 0.0, true)
 
@@ -114,7 +110,12 @@ func TestPlayerJoinRestoresSavedPlayerDataAndInventory(t *testing.T) {
 	}
 	_ = rec1.take(t)
 
-	// Put 32x minecraft:stone into container slot 39 (hotbar slot 3) via PlaySetCreativeSlot.
+	// Put 32x minecraft:stone into container slot 39 (hotbar slot 3) via PlaySetCreativeSlot while in Creative mode.
+	if err := srv.SetPlayerGameMode(h1.session, server.GameModeCreative); err != nil {
+		cancel1()
+		t.Fatalf("SetPlayerGameMode(Creative): %v", err)
+	}
+	_ = rec1.take(t)
 	slotW := protocol.NewWriter(16)
 	slotW.Uint16(uint16(world.HotbarContainerOffset + 3))
 	slotW.VarInt(32)
@@ -131,6 +132,10 @@ func TestPlayerJoinRestoresSavedPlayerDataAndInventory(t *testing.T) {
 	if blockState, ok := h1.heldBlock(); !ok || blockState != world.StateStone {
 		cancel1()
 		t.Fatalf("heldBlock() = (%d, %v), want (%d, true)", blockState, ok, world.StateStone)
+	}
+	if err := srv.SetPlayerGameMode(h1.session, server.GameModeSurvival); err != nil {
+		cancel1()
+		t.Fatalf("SetPlayerGameMode: %v", err)
 	}
 
 	cancel1()

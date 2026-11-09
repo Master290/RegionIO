@@ -20,6 +20,7 @@ type ParsedItemSpec struct {
 	ItemID        string
 	NumericID     int32
 	Meta          ItemMeta
+	Trim          ArmorTrim
 	PotionType    string
 	MapID         int32
 	HasMapID      bool
@@ -29,6 +30,7 @@ type ParsedItemSpec struct {
 	HasNameSpec   bool
 	HasEnchSpec   bool
 	HasPotionSpec bool
+	HasTrimSpec   bool
 }
 
 // ParseItemArgument parses an item argument token (with optional `[k=v,...]`
@@ -154,9 +156,60 @@ func parseItemComponentsBracket(spec *ParsedItemSpec, compPart string) error {
 				return err
 			}
 			spec.HasEnchSpec = true
+
+		case "trim":
+			trim, err := parseArmorTrimComponentValue(val)
+			if err != nil {
+				return err
+			}
+			spec.Trim = trim
+			spec.HasTrimSpec = true
 		}
 	}
 	return nil
+}
+
+func parseArmorTrimComponentValue(raw string) (ArmorTrim, error) {
+	s := strings.TrimSpace(raw)
+	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
+		return ArmorTrim{}, fmt.Errorf("invalid trim component %q", raw)
+	}
+	var obj map[string]string
+	if err := json.Unmarshal([]byte(s), &obj); err == nil {
+		trim := ArmorTrim{
+			Material: canonicalItemName(obj["material"]),
+			Pattern:  canonicalItemName(obj["pattern"]),
+		}
+		if !trim.IsValid() {
+			return ArmorTrim{}, fmt.Errorf("invalid trim material/pattern in %q", raw)
+		}
+		return trim, nil
+	}
+	inner := strings.TrimSpace(s[1 : len(s)-1])
+	var mat, pat string
+	for _, pair := range splitTopLevelCSV(inner) {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		sep := strings.IndexAny(pair, ":=")
+		if sep <= 0 {
+			return ArmorTrim{}, fmt.Errorf("invalid trim entry %q", pair)
+		}
+		k := strings.ToLower(trimMatchingQuotes(strings.TrimSpace(pair[:sep])))
+		v := trimMatchingQuotes(strings.TrimSpace(pair[sep+1:]))
+		switch k {
+		case "material":
+			mat = canonicalItemName(v)
+		case "pattern":
+			pat = canonicalItemName(v)
+		}
+	}
+	trim := ArmorTrim{Material: mat, Pattern: pat}
+	if !trim.IsValid() {
+		return ArmorTrim{}, fmt.Errorf("invalid trim material/pattern in %q", raw)
+	}
+	return trim, nil
 }
 
 func parseEnchantmentsComponentValue(meta *ItemMeta, raw string) error {
@@ -294,6 +347,11 @@ func applySpecMetadataToSlot(session *PlayerSession, slot int, spec ParsedItemSp
 		return
 	}
 	SetSlotItemMeta(session, slot, spec.Meta)
+	if spec.Trim.IsValid() {
+		SetSlotArmorTrim(session, slot, spec.Trim)
+	} else {
+		ClearSlotArmorTrim(session, slot)
+	}
 	if spec.PotionType != "" {
 		SetSlotPotionType(session, slot, spec.PotionType)
 	} else {
@@ -318,9 +376,15 @@ func clearAllSlotMetadata(session *PlayerSession, slot int) {
 		return
 	}
 	SetSlotItemMeta(session, slot, ItemMeta{})
+	ClearSlotArmorTrim(session, slot)
 	SetSlotPotionType(session, slot, "")
 	ClearSlotMapID(session, slot)
 	ClearSlotBookMeta(session, slot)
+	ClearSlotBundleContents(session, slot)
+	ClearSlotFireworkStar(session, slot)
+	ClearSlotFireworks(session, slot)
+	ClearSlotLodestoneTracker(session, slot)
+	ClearSlotGoatHornInstrument(session, slot)
 }
 
 func slotHasCustomMetadata(session *PlayerSession, slot int) bool {
@@ -328,6 +392,9 @@ func slotHasCustomMetadata(session *PlayerSession, slot int) bool {
 		return false
 	}
 	if !GetSlotItemMeta(session, slot).IsEmpty() {
+		return true
+	}
+	if _, ok := GetSlotArmorTrim(session, slot); ok {
 		return true
 	}
 	if GetSlotPotionType(session, slot) != "" {
@@ -342,28 +409,94 @@ func slotHasCustomMetadata(session *PlayerSession, slot int) bool {
 	if _, ok := GetSlotWrittenBook(session, slot); ok {
 		return true
 	}
+	if len(GetSlotBundleContents(session, slot)) > 0 {
+		return true
+	}
+	if _, ok := GetSlotLodestoneTracker(session, slot); ok {
+		return true
+	}
 	return false
+}
+
+// EncodePlayerSlotSetPacket encodes a protocol 775 ClientboundContainerSetSlotPacket (0x14)
+// for player inventory container 0 at `slot` (0..45) including all item data components.
+func EncodePlayerSlotSetPacket(session *PlayerSession, slot int) []byte {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return nil
+	}
+	st := session.InventorySlot(slot)
+	stateID := session.NextContainerStateID()
+	if IsBundleItem(st.ResolvedID()) {
+		if items := GetSlotBundleContents(session, slot); len(items) > 0 {
+			w := protocol.NewWriter(32 + len(items)*8)
+			w.VarInt(0)
+			w.VarInt(stateID)
+			w.Uint16(uint16(int16(slot)))
+			EncodeSlotWithBundleContents(w, st, items)
+			return w.Bytes()
+		}
+	}
+	if IsPotionOrTippedArrowItem(st) {
+		return encodeContainerSetSlotWithPotion(0, stateID, slot, st, GetSlotPotionType(session, slot))
+	}
+	switch st.ResolvedID() {
+	case FireworkRocketItemID:
+		if fw, ok := GetSlotFireworks(session, slot); ok {
+			w := protocol.NewWriter(48)
+			w.VarInt(0)
+			w.VarInt(stateID)
+			w.Uint16(uint16(int16(slot)))
+			EncodeSlotWithFireworks(w, st, fw)
+			return w.Bytes()
+		}
+	case FireworkStarItemID:
+		if exp, ok := GetSlotFireworkStar(session, slot); ok {
+			w := protocol.NewWriter(48)
+			w.VarInt(0)
+			w.VarInt(stateID)
+			w.Uint16(uint16(int16(slot)))
+			EncodeSlotWithFireworkStar(w, st, exp)
+			return w.Bytes()
+		}
+	case CompassItemID:
+		if lt, ok := GetSlotLodestoneTracker(session, slot); ok {
+			w := protocol.NewWriter(48)
+			w.VarInt(0)
+			w.VarInt(stateID)
+			w.Uint16(uint16(int16(slot)))
+			EncodeSlotWithLodestoneTracker(w, st, &lt)
+			return w.Bytes()
+		}
+	}
+	if wb, ok := GetSlotWritableBook(session, slot); ok {
+		return encodeContainerSetSlotWithBook(0, stateID, slot, st, &wb, nil)
+	}
+	if wr, ok := GetSlotWrittenBook(session, slot); ok {
+		return encodeContainerSetSlotWithBook(0, stateID, slot, st, nil, &wr)
+	}
+	if mapID, ok := GetSlotMapID(session, slot); ok {
+		return encodeContainerSetSlotWithMapID(0, stateID, slot, st, mapID, true)
+	}
+	meta := GetSlotItemMeta(session, slot)
+	trim, hasTrim := GetSlotArmorTrim(session, slot)
+	if !meta.IsEmpty() || hasTrim {
+		w := protocol.NewWriter(48)
+		w.VarInt(0)
+		w.VarInt(stateID)
+		w.Uint16(uint16(int16(slot)))
+		WriteSlotWithArmorTrim(w, st, meta, trim)
+		return w.Bytes()
+	}
+	return EncodeContainerSlot(0, stateID, slot, st)
 }
 
 func sendPlayerSlotUpdate(session *PlayerSession, slot int) {
 	if session == nil || session.send == nil || slot < 0 || slot >= world.PlayerInventorySlots {
 		return
 	}
-	st := session.InventorySlot(slot)
-	stateID := session.NextContainerStateID()
-	if wb, ok := GetSlotWritableBook(session, slot); ok {
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithBook(0, stateID, slot, st, &wb, nil))
-		return
+	if pkt := EncodePlayerSlotSetPacket(session, slot); len(pkt) > 0 {
+		_ = session.send(protocol.PlayContainerSetSlot, pkt)
 	}
-	if wr, ok := GetSlotWrittenBook(session, slot); ok {
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithBook(0, stateID, slot, st, nil, &wr))
-		return
-	}
-	if mapID, ok := GetSlotMapID(session, slot); ok {
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithMapID(0, stateID, slot, st, mapID, true))
-		return
-	}
-	_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, slot, st))
 }
 
 // GivePlayerItemSpec adds count items described by spec to session's inventory,
@@ -373,7 +506,7 @@ func (s *Server) GivePlayerItemSpec(session *PlayerSession, spec ParsedItemSpec,
 		return 0
 	}
 	maxStack := MaxStackSizeForSpec(spec)
-	hasCustomMeta := !spec.Meta.IsEmpty() || spec.PotionType != "" || spec.HasMapID || spec.WritableBook != nil || spec.WrittenBook != nil
+	hasCustomMeta := !spec.Meta.IsEmpty() || spec.Trim.IsValid() || spec.PotionType != "" || spec.HasMapID || spec.WritableBook != nil || spec.WrittenBook != nil
 
 	remaining := count
 	var changedSlots []int
@@ -440,6 +573,7 @@ func (s *Server) GivePlayerItemSpec(session *PlayerSession, spec ParsedItemSpec,
 			EncodeSoundPacket("minecraft:entity.item.pickup", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 0.2, 1.4, 0))
 	}
 	s.TriggerInventoryChanged(session)
+	s.UnlockRecipesForItem(session, world.NewItemStack(spec.NumericID, 1))
 	return count
 }
 
@@ -523,6 +657,11 @@ func slotMatchesClearFilter(session *PlayerSession, slot int, st world.ItemStack
 	}
 	if filter.HasMapID {
 		if mid, ok := GetSlotMapID(session, slot); !ok || mid != filter.MapID {
+			return false
+		}
+	}
+	if filter.HasTrimSpec {
+		if trim, ok := GetSlotArmorTrim(session, slot); !ok || trim != filter.Trim {
 			return false
 		}
 	}
@@ -1730,4 +1869,350 @@ func (s *Server) HandleItemAndStatusCommand(sender *PlayerSession, cmdName strin
 	default:
 		return "", false
 	}
+}
+
+// AllKnownItemNames returns a sorted slice of all registered canonical item IDs.
+func AllKnownItemNames() []string {
+	_ = DefaultRecipeBook()
+	var names []string
+	seen := make(map[string]bool, 1500)
+	for id := int32(1); id <= 1600; id++ {
+		name := world.ItemIDToName(id)
+		if name == "" || name == "minecraft:air" || strings.HasPrefix(name, "minecraft:item_") || seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names
+}
+
+// CreativeSlotItem holds a decoded ItemStack and its data components from a
+// protocol 775 ServerboundSetCreativeModeSlotPacket (0x37).
+type CreativeSlotItem struct {
+	Stack           world.ItemStack
+	Meta            ItemMeta
+	Trim            ArmorTrim
+	PotionType      string
+	MapID           int32
+	HasMapID        bool
+	BundleItems     []world.ItemStack
+	WritableBook    WritableBookContent
+	HasWritableBook bool
+	WrittenBook     WrittenBookContent
+	HasWrittenBook  bool
+	Lodestone       LodestoneTracker
+	HasLodestone    bool
+	FireworkStar    FireworkExplosion
+	HasFireworkStar bool
+	Fireworks       FireworksComponent
+	HasFireworks    bool
+}
+
+// DecodeCreativeSlotItemStack decodes the ItemStack and optional data component
+// patch from a ServerboundSetCreativeModeSlotPacket reader.
+func DecodeCreativeSlotItemStack(r *protocol.Reader) (CreativeSlotItem, error) {
+	var out CreativeSlotItem
+	if r == nil {
+		return out, fmt.Errorf("nil reader")
+	}
+	count, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	if count <= 0 {
+		return out, nil
+	}
+	itemID, err := r.VarInt()
+	if err != nil {
+		return out, err
+	}
+	out.Stack = world.NewItemStack(itemID, count)
+	if r.Remaining() == 0 {
+		return out, nil
+	}
+	addedCount, err := r.VarInt()
+	if err != nil {
+		return out, nil
+	}
+	removedCount, err := r.VarInt()
+	if err != nil {
+		return out, nil
+	}
+	for i := int32(0); i < addedCount && r.Remaining() > 0; i++ {
+		compID, err := r.VarInt()
+		if err != nil {
+			break
+		}
+		switch compID {
+		case DataComponentDamageID:
+			dmg, err := r.VarInt()
+			if err != nil {
+				return out, nil
+			}
+			out.Meta.Damage = dmg
+		case DataComponentCustomNameID:
+			chatComp, err := ReadChatComponentNBT(r)
+			if err != nil {
+				return out, nil
+			}
+			out.Meta.CustomName = chatComp.PlainText()
+		case DataComponentEnchantmentsID, DataComponentStoredEnchantmentsID:
+			encCount, err := r.VarInt()
+			if err != nil {
+				return out, nil
+			}
+			if encCount > 0 {
+				for j := int32(0); j < encCount; j++ {
+					encNumID, err := r.VarInt()
+					if err != nil {
+						return out, nil
+					}
+					lvl, err := r.VarInt()
+					if err != nil {
+						return out, nil
+					}
+					if def, ok := EnchantmentByIndex(int(encNumID)); ok && lvl > 0 {
+						out.Meta.SetEnchantment(def.ID, int(lvl))
+					}
+				}
+			}
+		case DataComponentRepairCostID:
+			rc, err := r.VarInt()
+			if err != nil {
+				return out, nil
+			}
+			out.Meta.RepairCost = rc
+		case DataComponentTrim:
+			t, err := DecodeArmorTrimComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.Trim = t
+		case DataComponentPotionContents:
+			pc, err := DecodePotionContentsComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.PotionType = pc.PotionID
+		case DataComponentMapID:
+			mid, err := r.VarInt()
+			if err != nil {
+				return out, nil
+			}
+			out.MapID = mid
+			out.HasMapID = true
+		case DataComponentMapPostProcessing:
+			_, _ = r.VarInt()
+		case DataComponentBundleContents:
+			itemCount, err := r.VarInt()
+			if err != nil || itemCount < 0 || itemCount > 64 {
+				return out, nil
+			}
+			items := make([]world.ItemStack, 0, itemCount)
+			for j := int32(0); j < itemCount; j++ {
+				it, err := readContainerItemStack(r)
+				if err != nil {
+					return out, nil
+				}
+				if !it.IsEmpty() {
+					items = append(items, it)
+				}
+			}
+			out.BundleItems = items
+		case DataComponentWritableBookContent:
+			wb, err := DecodeWritableBookContentComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.WritableBook = wb
+			out.HasWritableBook = true
+		case DataComponentWrittenBookContent:
+			wrb, err := DecodeWrittenBookContentComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.WrittenBook = wrb
+			out.HasWrittenBook = true
+		case DataComponentLodestoneTracker:
+			lt, err := DecodeLodestoneTrackerComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.Lodestone = lt
+			out.HasLodestone = true
+		case DataComponentFireworkExplosion:
+			exp, err := DecodeFireworkExplosionComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.FireworkStar = exp
+			out.HasFireworkStar = true
+		case DataComponentFireworks:
+			fw, err := DecodeFireworksComponent(r)
+			if err != nil {
+				return out, nil
+			}
+			out.Fireworks = fw
+			out.HasFireworks = true
+		default:
+			// Unknown component in untrusted creative packet: stop reading further components.
+			return out, nil
+		}
+	}
+	for i := int32(0); i < removedCount && r.Remaining() > 0; i++ {
+		if _, err := r.VarInt(); err != nil {
+			break
+		}
+	}
+	return out, nil
+}
+
+// EncodeCreativeSlotPacket encodes a protocol 775 ServerboundSetCreativeModeSlotPacket (0x37)
+// body with ItemMeta, ArmorTrim, or PotionContents components.
+func EncodeCreativeSlotPacket(slot int16, stack world.ItemStack, meta ItemMeta, trim ArmorTrim, potionID string) []byte {
+	w := protocol.NewWriter(48)
+	w.Uint16(uint16(slot))
+	if stack.IsEmpty() {
+		w.VarInt(0)
+		return w.Bytes()
+	}
+	if IsPotionOrTippedArrowItem(stack) && potionID != "" {
+		EncodeSlotWithPotionContents(w, stack, potionID)
+		return w.Bytes()
+	}
+	WriteSlotWithArmorTrim(w, stack, meta, trim)
+	return w.Bytes()
+}
+
+// HandleSetCreativeModeSlot processes a protocol 775 ServerboundSetCreativeModeSlotPacket (0x37)
+// matching vanilla 26.1.2 ServerGamePacketListenerImpl.handleSetCreativeModeSlot:
+//   - Only accepted when session is in Creative mode (player.hasInfiniteMaterials()).
+//   - Valid inventory slots are 1..45 (2x2 craft grid 1..4, armor 5..8, main 9..35, hotbar 36..44, offhand 45);
+//     preserves item components from creative tabs, search tab, and saved hotbars, unlocks recipes,
+//     and broadcasts PlayContainerSetSlot with full components.
+//   - When slot < 0 (e.g. -1) and stack is non-empty with valid count (1..64), spawns a dropped item
+//     entity in the world (player.drop(itemStack, true)).
+func (s *Server) HandleSetCreativeModeSlot(session *PlayerSession, r *protocol.Reader) (slot int, stack world.ItemStack, accepted bool, err error) {
+	slot, stack, accepted, err = s.ApplyCreativeModeSlot(session, r)
+	if err != nil || !accepted {
+		return slot, stack, accepted, err
+	}
+	if slot >= 1 && slot < world.PlayerInventorySlots {
+		sendPlayerSlotUpdate(session, slot)
+	}
+	return slot, stack, true, nil
+}
+
+// ApplyCreativeModeSlot applies the state mutations of a protocol 775
+// ServerboundSetCreativeModeSlotPacket (0x37) without sending the slot update packet,
+// allowing network handlers to transmit PlayContainerSetSlot synchronously over conn.
+func (s *Server) ApplyCreativeModeSlot(session *PlayerSession, r *protocol.Reader) (slot int, stack world.ItemStack, accepted bool, err error) {
+	if r == nil {
+		return 0, world.ItemStack{}, false, fmt.Errorf("nil reader")
+	}
+	slotRaw, err := r.Uint16()
+	if err != nil {
+		return 0, world.ItemStack{}, false, err
+	}
+	slot = int(int16(slotRaw))
+	item, err := DecodeCreativeSlotItemStack(r)
+	if err != nil {
+		return slot, world.ItemStack{}, false, err
+	}
+	stack = item.Stack
+	if s == nil || session == nil {
+		return slot, stack, false, nil
+	}
+	snap := session.Snapshot()
+	if snap.GameMode != GameModeCreative || session.IsDead() {
+		return slot, world.ItemStack{}, false, nil
+	}
+
+	validSlot := slot >= 1 && slot < world.PlayerInventorySlots
+	validCount := stack.IsEmpty() || (stack.Count > 0 && stack.Count <= MaxItemStackSize)
+
+	if validSlot && validCount {
+		clearAllSlotMetadata(session, slot)
+		session.SetInventorySlot(slot, stack)
+		if !stack.IsEmpty() {
+			if !item.Meta.IsEmpty() {
+				SetSlotItemMeta(session, slot, item.Meta)
+			}
+			if item.Trim.IsValid() {
+				SetSlotArmorTrim(session, slot, item.Trim)
+			}
+			if item.PotionType != "" {
+				SetSlotPotionType(session, slot, item.PotionType)
+			}
+			if item.HasMapID {
+				SetSlotMapID(session, slot, item.MapID)
+			}
+			if len(item.BundleItems) > 0 {
+				SetSlotBundleContents(session, slot, item.BundleItems)
+			}
+			if item.HasWritableBook {
+				SetSlotWritableBook(session, slot, item.WritableBook)
+			}
+			if item.HasWrittenBook {
+				SetSlotWrittenBook(session, slot, item.WrittenBook)
+			}
+			if item.HasLodestone {
+				SetSlotLodestoneTracker(session, slot, item.Lodestone)
+			}
+			if item.HasFireworkStar {
+				SetSlotFireworkStar(session, slot, item.FireworkStar)
+			}
+			if item.HasFireworks {
+				SetSlotFireworks(session, slot, item.Fireworks)
+			}
+		}
+
+		if slot >= 1 && slot <= 4 {
+			tr := getContainerTracker(session)
+			tr.mu.Lock()
+			for i := 0; i < 4; i++ {
+				tr.invCraft[i] = session.InventorySlot(1 + i)
+				if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
+					tr.invCraftStars[i] = exp
+				} else {
+					tr.invCraftStars[i] = FireworkExplosion{}
+				}
+			}
+			if res, _, _, ok := matchCraftingWithFireworks(tr.invCraft[:], 2, 2, tr.invCraftStars[:]); ok {
+				tr.invResult = res
+			} else {
+				tr.invResult = world.ItemStack{}
+			}
+			session.SetInventorySlot(0, tr.invResult)
+			tr.mu.Unlock()
+			sendPlayerSlotUpdate(session, 0)
+		}
+
+		s.TriggerInventoryChanged(session)
+		if !stack.IsEmpty() {
+			s.UnlockRecipesForItem(session, stack)
+		}
+		return slot, stack, true, nil
+	}
+
+	if slot < 0 && validCount && !stack.IsEmpty() {
+		dim := world.NormalizeDimension(snap.Dimension)
+		entID, _ := s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, stack)
+		if entID > 0 {
+			if item.HasMapID && stack.ResolvedID() == FilledMapItemID {
+				s.AssociateDroppedMapEntity(entID, item.MapID)
+			}
+			if len(item.BundleItems) > 0 && IsBundleItem(stack.ResolvedID()) {
+				s.AssociateDroppedBundleEntity(entID, item.BundleItems)
+			}
+			if item.PotionType != "" && IsPotionOrTippedArrowItem(stack) {
+				s.AssociateDroppedPotionEntity(entID, item.PotionType)
+			}
+		}
+		s.RecordItemDropped(session, stack.ResolvedID(), stack.Count)
+		return slot, stack, true, nil
+	}
+
+	return slot, world.ItemStack{}, false, nil
 }

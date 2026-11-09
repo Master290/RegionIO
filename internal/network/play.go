@@ -1703,9 +1703,30 @@ const hotbarInvStart = world.HotbarContainerOffset
 
 // handleCreativeSlot records the item a creative player placed into a slot so we
 // know what block to place and keeps the player's container synchronized.
-// The packet is: Short slot, then an item stack (VarInt count; if non-empty,
-// VarInt item id followed by components we ignore).
+// Matches vanilla 26.1.2 ServerGamePacketListenerImpl.handleSetCreativeModeSlot.
 func (h *handler) handleCreativeSlot(pkt protocol.Packet) error {
+	if h.srv != nil && h.session != nil {
+		slot, stack, accepted, err := h.srv.ApplyCreativeModeSlot(h.session, pkt.Body())
+		if err != nil {
+			return err
+		}
+		if accepted && slot >= 1 && slot < world.PlayerInventorySlots {
+			if hotbarIdx := slot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
+				if stack.IsEmpty() {
+					h.hotbar[hotbarIdx] = -1
+				} else {
+					h.hotbar[hotbarIdx] = stack.ResolvedItemID()
+				}
+			}
+			if h.conn != nil {
+				if slotPkt := server.EncodePlayerSlotSetPacket(h.session, slot); len(slotPkt) > 0 {
+					return h.conn.Send(protocol.PlayContainerSetSlot, slotPkt)
+				}
+			}
+		}
+		return nil
+	}
+
 	r := pkt.Body()
 	slotRaw, err := r.Uint16()
 	if err != nil {
@@ -1732,19 +1753,8 @@ func (h *handler) handleCreativeSlot(pkt protocol.Packet) error {
 			h.hotbar[hotbarIdx] = stack.ResolvedItemID()
 		}
 	}
-	if slot >= 0 && slot < world.PlayerInventorySlots {
-		if h.session != nil {
-			h.session.SetInventorySlot(slot, stack)
-			if h.srv != nil {
-				h.srv.TriggerInventoryChanged(h.session)
-				h.srv.UnlockRecipesForItem(h.session, stack)
-			}
-		}
-		if h.conn != nil {
-			if err := h.sendContainerSetSlot(slot, stack); err != nil {
-				return err
-			}
-		}
+	if slot >= 1 && slot < world.PlayerInventorySlots && h.conn != nil {
+		return h.sendContainerSetSlot(slot, stack)
 	}
 	return nil
 }

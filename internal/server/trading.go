@@ -1077,6 +1077,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	slots := s.buildMerchantMenuSlots(session, tr.open.Crafting[0], tr.open.Crafting[1], tr.open.Result)
 
 	traded := false
+	var tradesCompleted int32
 	var xpGained int32
 	var tradedExplorerMap *MapItemSavedData
 	var tradedExplorerName string
@@ -1107,6 +1108,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 						tr.carried = world.NewItemStack(res.ResolvedItemID(), 1)
 						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 						traded = true
+						tradesCompleted++
 						tradedExplorerMap, _, tradedExplorerName = s.CreateExplorerMapForTradeOffer(offerName, originX, originZ)
 						tradedExplorerOnCursor = true
 					}
@@ -1118,6 +1120,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 					}
 					xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 					traded = true
+					tradesCompleted++
 				}
 			case ContainerInputQuickMove:
 				if isExplorerMapOffer {
@@ -1137,6 +1140,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 						slots[targetMenuSlot] = world.NewItemStack(res.ResolvedItemID(), 1)
 						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 						traded = true
+						tradesCompleted++
 						tradedExplorerMap, _, tradedExplorerName = s.CreateExplorerMapForTradeOffer(offerName, originX, originZ)
 						tradedExplorerInvSlot = 9 + (targetMenuSlot - 3)
 					}
@@ -1155,6 +1159,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 						slots = testSlots
 						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 						traded = true
+						tradesCompleted++
 					}
 				}
 			}
@@ -1234,13 +1239,26 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	}
 
 	leveledUp := false
-	if traded && !isWanderingTrader {
-		vs.XP += xpGained
-		for CanVillagerLevelUp(vs.Level, vs.XP) {
-			vs.Level++
-			leveledUp = true
-			newOffers := DefaultTradeBook().RollOffers(vs.Profession, vs.Level, vtr.rng)
-			vs.Offers = append(vs.Offers, newOffers...)
+	var playerXPReward int32
+	if traded {
+		for i := int32(0); i < tradesCompleted; i++ {
+			if vtr.rng != nil {
+				playerXPReward += 3 + int32(vtr.rng.Intn(4))
+			} else {
+				playerXPReward += 4
+			}
+		}
+		if !isWanderingTrader {
+			vs.XP += xpGained
+			for CanVillagerLevelUp(vs.Level, vs.XP) {
+				vs.Level++
+				leveledUp = true
+				newOffers := DefaultTradeBook().RollOffers(vs.Profession, vs.Level, vtr.rng)
+				vs.Offers = append(vs.Offers, newOffers...)
+			}
+			if leveledUp {
+				playerXPReward += 5
+			}
 		}
 	}
 
@@ -1262,8 +1280,16 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 		if !isWanderingTrader {
 			s.OnVillagerTradedWithPlayer(entityID, session)
 		}
+		if tradesCompleted > 0 {
+			s.AwardCustomStat(session, StatTradedWithVillager, tradesCompleted)
+		}
 		s.TriggerVillagerTrade(session)
+		snap := session.Snapshot()
+		orbDim := world.NormalizeDimension(snap.Dimension)
+		orbX, orbY, orbZ := snap.X, snap.Y+0.5, snap.Z
 		if ent := s.entities.Get(entityID); ent != nil {
+			orbDim = ent.EffectiveDimension()
+			orbX, orbY, orbZ = ent.X, ent.Y+0.5, ent.Z
 			cp := ent.ChunkPos()
 			yesSnd := "minecraft:entity.villager.yes"
 			if isWanderingTrader {
@@ -1286,6 +1312,9 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 					s.SetMobHealth(entityID, nextHP)
 				}
 			}
+		}
+		if playerXPReward > 0 {
+			s.SpawnExperienceOrbsInDimension(orbDim, orbX, orbY, orbZ, playerXPReward)
 		}
 	}
 
