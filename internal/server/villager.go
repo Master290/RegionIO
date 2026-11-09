@@ -857,6 +857,18 @@ func (s *Server) InteractWithEntity(session *PlayerSession, targetEntityID int32
 		handled := s.InteractWithIronGolem(session, targetEntityID)
 		return handled, 0, nil
 	}
+	if canonicalResourceName(ent.TypeName) == MobTypeSnowGolem {
+		sheared, _ := s.InteractWithSnowGolem(session, targetEntityID)
+		return sheared, 0, nil
+	}
+	if canonicalResourceName(ent.TypeName) == MobTypeCopperGolem {
+		_, handled := s.InteractWithCopperGolem2612(session, targetEntityID)
+		return handled, 0, nil
+	}
+	if IsNautilusMobType(ent.TypeName) {
+		handled, _, _ := s.InteractWithNautilus(session, targetEntityID, nil)
+		return handled, 0, nil
+	}
 	if canonicalResourceName(ent.TypeName) == MobTypeSniffer {
 		handled, _ := s.InteractWithSniffer(session, targetEntityID)
 		return handled, 0, nil

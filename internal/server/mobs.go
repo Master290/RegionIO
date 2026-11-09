@@ -222,6 +222,9 @@ var (
 		EntityTypeSmallFireball:    EntityTypeSmallFireballID,
 		MobTypeMooshroom:           EntityTypeMooshroomID,
 		MobTypeCaveSpider:          EntityTypeCaveSpiderID,
+		MobTypeBat:                 EntityTypeBatID,
+		MobTypeNautilus:            EntityTypeNautilusID,
+		MobTypeZombieNautilus:      EntityTypeZombieNautilusID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -442,6 +445,12 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultGhastMaxHealth
 	case MobTypeMagmaCube, MobTypeSlime:
 		return float32(MagmaCubeSizeLarge * MagmaCubeSizeLarge)
+	case MobTypeBat:
+		return DefaultBatMaxHealth
+	case MobTypeNautilus:
+		return DefaultNautilusMaxHealth
+	case MobTypeZombieNautilus:
+		return DefaultZombieNautilusMaxHealth
 	default:
 		return DefaultMobMaxHealth
 	}
@@ -701,6 +710,15 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeCaveSpider {
 		return s.SpawnCaveSpider(normDim, x, y, z)
+	}
+	if norm == MobTypeBat {
+		return s.SpawnBat(normDim, x, y, z, true)
+	}
+	if norm == MobTypeNautilus {
+		return s.SpawnNautilus(normDim, x, y, z, false)
+	}
+	if norm == MobTypeZombieNautilus {
+		return s.SpawnZombieNautilus(normDim, x, y, z, ZombieNautilusVariantTemperate)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {

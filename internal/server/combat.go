@@ -738,6 +738,14 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		return RollRavagerDeathLoot2612()
 	case MobTypeWitch:
 		return RollWitchDeathLoot2612(rng, 0)
+	case MobTypeBat:
+		return RollBatDeathLoot2612()
+	case MobTypeSnowGolem:
+		return RollSnowGolemDeathLoot2612(rng)
+	case MobTypeNautilus:
+		return RollNautilusDeathLoot2612(true, 0, rng)
+	case MobTypeZombieNautilus:
+		return RollZombieNautilusDeathLoot2612(true, 0, rng)
 	}
 	return nil
 }
@@ -884,6 +892,16 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.ender_dragon.hurt", SoundSourceHostile
 	case MobTypeSpider, MobTypeCaveSpider:
 		return "minecraft:entity.spider.hurt", SoundSourceHostile
+	case MobTypeBat:
+		return SoundBatHurt, SoundSourceNeutral
+	case MobTypeSnowGolem:
+		return SoundSnowGolemHurt, SoundSourceNeutral
+	case MobTypeCopperGolem:
+		return SoundCopperGolemHurt, SoundSourceNeutral
+	case MobTypeNautilus:
+		return SoundNautilusHurt, SoundSourceNeutral
+	case MobTypeZombieNautilus:
+		return SoundZombieNautilusHurt, SoundSourceNeutral
 	default:
 		return "minecraft:entity.generic.hurt", SoundSourceNeutral
 	}
@@ -1031,6 +1049,16 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.ender_dragon.death", SoundSourceHostile
 	case MobTypeSpider, MobTypeCaveSpider:
 		return "minecraft:entity.spider.death", SoundSourceHostile
+	case MobTypeBat:
+		return SoundBatDeath, SoundSourceNeutral
+	case MobTypeSnowGolem:
+		return SoundSnowGolemDeath, SoundSourceNeutral
+	case MobTypeCopperGolem:
+		return SoundCopperGolemDeath, SoundSourceNeutral
+	case MobTypeNautilus:
+		return SoundNautilusDeath, SoundSourceNeutral
+	case MobTypeZombieNautilus:
+		return SoundZombieNautilusDeath, SoundSourceNeutral
 	default:
 		return "minecraft:entity.generic.death", SoundSourceNeutral
 	}
@@ -1461,6 +1489,9 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeWarden {
 		_, killed = s.DamageWarden(target.ID, damage, attacker)
 		return killed
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeBat {
+		s.WakeBatOnHurt(target.ID)
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeHorse {
 		damage = s.ReduceHorseDamageByArmor(target.ID, damage)

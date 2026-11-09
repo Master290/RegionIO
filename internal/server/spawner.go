@@ -182,7 +182,10 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 		s.TickBabyMobs()
 		s.TickTamedMobs(rng)
 		s.TickIronGolems(rng)
+		s.TickSnowGolems(rng)
 		s.TickCopperGolems(rng)
+		s.TickBats(rng)
+		s.TickNautiluses(rng)
 		s.TickVillagerGolemSpawning(rng)
 		s.TickPhantomSpawner(rng)
 		s.TickPhantoms(rng)
@@ -339,7 +342,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite || snapshot.TypeName == MobTypeBlaze || snapshot.TypeName == MobTypeGhast || snapshot.TypeName == MobTypeMagmaCube || snapshot.TypeName == MobTypeSlime {
+		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite || snapshot.TypeName == MobTypeBlaze || snapshot.TypeName == MobTypeGhast || snapshot.TypeName == MobTypeMagmaCube || snapshot.TypeName == MobTypeSlime || snapshot.TypeName == MobTypeBat || snapshot.TypeName == MobTypeNautilus || snapshot.TypeName == MobTypeZombieNautilus {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true

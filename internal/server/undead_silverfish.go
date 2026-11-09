@@ -205,7 +205,7 @@ func IsUndeadMobType(typeName string) bool {
 		return true
 	}
 	switch norm {
-	case MobTypePhantom, MobTypeWither, MobTypeZoglin, MobTypeSkeletonHorse, MobTypeZombieHorse:
+	case MobTypePhantom, MobTypeWither, MobTypeZoglin, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeZombieNautilus:
 		return true
 	default:
 		return false
