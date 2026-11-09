@@ -566,7 +566,7 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		if stack := world.NewNamedItemStack("minecraft:mutton", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
-	case "minecraft:spider":
+	case "minecraft:spider", MobTypeCaveSpider:
 		if stack := world.NewNamedItemStack("minecraft:string", 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
 		}
@@ -702,6 +702,16 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 		return RollMooshroomDeathLoot(rng, 0, false)
 	case MobTypeGoat:
 		return RollGoatDeathLoot(rng, 0, false)
+	case MobTypeEvoker:
+		return RollEvokerDeathLoot2612(true, rng, 0)
+	case MobTypeVindicator:
+		return RollVindicatorDeathLoot2612(true, rng, 0)
+	case MobTypePillager:
+		return RollPillagerDeathLoot2612(rng, 0)
+	case MobTypeRavager:
+		return RollRavagerDeathLoot2612()
+	case MobTypeWitch:
+		return RollWitchDeathLoot2612(rng, 0)
 	}
 	return nil
 }
@@ -846,6 +856,8 @@ func mobHurtSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.wither.hurt", SoundSourceHostile
 	case MobTypeEnderDragon:
 		return "minecraft:entity.ender_dragon.hurt", SoundSourceHostile
+	case MobTypeSpider, MobTypeCaveSpider:
+		return "minecraft:entity.spider.hurt", SoundSourceHostile
 	default:
 		return "minecraft:entity.generic.hurt", SoundSourceNeutral
 	}
@@ -991,6 +1003,8 @@ func mobDeathSound(typeName string) (sound string, source int32) {
 		return "minecraft:entity.wither.death", SoundSourceHostile
 	case MobTypeEnderDragon:
 		return "minecraft:entity.ender_dragon.death", SoundSourceHostile
+	case MobTypeSpider, MobTypeCaveSpider:
+		return "minecraft:entity.spider.death", SoundSourceHostile
 	default:
 		return "minecraft:entity.generic.death", SoundSourceNeutral
 	}
@@ -1674,6 +1688,9 @@ func (s *Server) applyDamageToMob(
 	}
 	if xpReward == 0 && !wasBaby {
 		xpReward = int(GuardianElderShulkerXPReward(target.TypeName))
+	}
+	if xpReward == 0 {
+		xpReward = HostileBossPolishXPReward(target.TypeName, wasBaby)
 	}
 	consumed := false
 	if xpReward > 0 {

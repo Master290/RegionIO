@@ -371,7 +371,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			mem.lastHealth = mem.health
 		} else if mem.health < mem.lastHealth {
 			mem.lastHealth = mem.health
-			if snapshot.TypeName == MobTypeSpider {
+			if IsSpiderFamilyMob(snapshot.TypeName) {
 				mem.provoked = true
 			} else if IsPassiveAnimal(snapshot.TypeName) || snapshot.TypeName == MobTypeArmadillo || IsEquineOrLlamaMob(snapshot.TypeName) {
 				mem.panicTicks = AnimalPanicDurationTicks
@@ -488,7 +488,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				)
 				swellDir = mem.creeperSwellDir
 			}
-		case MobTypeSpider:
+		case MobTypeSpider, MobTypeCaveSpider:
 			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderAI(
 				s.chunks, rng, mem, t.playerTargets,
 				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
@@ -620,7 +620,11 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			}
 		}
 		if attackTarget != nil && !attackTarget.IsDead() {
-			s.AttackPlayerFromMob(snapshot.ID, snapshot.TypeName, nextX, nextZ, attackTarget, attackDmg)
+			if snapshot.TypeName == MobTypeCaveSpider {
+				s.AttackPlayerFromCaveSpider(snapshot.ID, nextX, nextZ, attackTarget)
+			} else {
+				s.AttackPlayerFromMob(snapshot.ID, snapshot.TypeName, nextX, nextZ, attackTarget, attackDmg)
+			}
 		}
 	}
 

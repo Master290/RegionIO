@@ -221,6 +221,7 @@ var (
 		EntityTypeFireball:         EntityTypeFireballID,
 		EntityTypeSmallFireball:    EntityTypeSmallFireballID,
 		MobTypeMooshroom:           EntityTypeMooshroomID,
+		MobTypeCaveSpider:          EntityTypeCaveSpiderID,
 	}
 	creeperGriefingDisabled atomic.Bool
 )
@@ -295,6 +296,8 @@ func ResolveMobMaxHealth(typeName string) float32 {
 		return DefaultCreeperMaxHealth
 	case MobTypeSpider:
 		return DefaultSpiderMaxHealth
+	case MobTypeCaveSpider:
+		return DefaultCaveSpiderMaxHealth
 	case MobTypeBreeze:
 		return DefaultBreezeMaxHealth
 	case MobTypePig:
@@ -512,6 +515,8 @@ func animalWanderSpeed(typeName string) float64 {
 		return EndermanWanderSpeed
 	case MobTypeEndermite:
 		return EndermiteWanderSpeed
+	case MobTypeSpider, MobTypeCaveSpider:
+		return SpiderWanderSpeed
 	case MobTypeVillager, MobTypeWanderingTrader:
 		return VillagerWanderSpeed
 	case MobTypeHorse, MobTypeDonkey, MobTypeMule, MobTypeSkeletonHorse, MobTypeZombieHorse, MobTypeLlama, MobTypeTraderLlama:
@@ -693,6 +698,9 @@ func (s *Server) SpawnMobInDimension(dimension string, x, y, z float64, typeName
 	}
 	if norm == MobTypeMooshroom {
 		return s.SpawnMooshroom(normDim, x, y, z, MooshroomVariantRed, false)
+	}
+	if norm == MobTypeCaveSpider {
+		return s.SpawnCaveSpider(normDim, x, y, z)
 	}
 	typeID := ResolveEntityTypeID(norm)
 	if typeID < 0 {
@@ -1372,6 +1380,26 @@ func (s *Server) stepHostileSpiderAI(
 	}
 	if mem.repathCooldown > 0 {
 		mem.repathCooldown--
+	}
+
+	if s != nil {
+		if _, ax, _, az, armOK := s.HasUnrolledArmadilloNearSpider(world.DimensionOverworld, x, float64(feetY), z, SpiderArmadilloAvoidRange); armOK {
+			awayX := x - ax
+			awayZ := z - az
+			dist := math.Hypot(awayX, awayZ)
+			if dist < 1e-4 {
+				awayX, dist = 1.0, 1.0
+			}
+			tx := x + (awayX/dist)*SpiderChaseSpeed
+			tz := z + (awayZ/dist)*SpiderChaseSpeed
+			nextYaw = yawToward(awayX, awayZ)
+			if chunks != nil {
+				if nx, ny, nz, stepOK := tryApplyHorizontalStep(chunks, x, feetY, z, tx, tz); stepOK {
+					return nx, float64(ny), nz, nextYaw, nil, false
+				}
+			}
+			return tx, float64(feetY), tz, nextYaw, nil, false
+		}
 	}
 
 	if !s.IsSpiderHostile(x, feetY, z, mem.provoked) {
