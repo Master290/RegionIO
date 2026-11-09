@@ -356,7 +356,16 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 		}
 		return [3]int{int(cx)*16 + 8, start.Pieces[0].box.minY, int(cz)*16}, true
 
-	case "minecraft:buried_treasure", "minecraft:swamp_hut", "minecraft:igloo":
+	case "minecraft:buried_treasure":
+		stubX := int(cx)*16 + 8
+		stubZ := int(cz)*16 + 8
+		stubY := preCarveFirstOccupiedHeight(od, seed, stubX, stubZ, true)
+		if !isStructureBiomeAllowed(od, sets, def, stubX, stubY, stubZ) {
+			return [3]int{}, false
+		}
+		return [3]int{stubX, stubY, stubZ}, true
+
+	case "minecraft:swamp_hut", "minecraft:igloo":
 		stubX := int(cx)*16 + 8
 		stubZ := int(cz)*16 + 8
 		stubY := preCarveFirstOccupiedHeight(od, seed, stubX, stubZ, false)
@@ -380,10 +389,11 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 			return [3]int{}, false
 		}
 		stubX, stubZ := int(cx)*16+8, int(cz)*16+8
-		if !isStructureBiomeAllowed(od, sets, def, stubX, lowestY, stubZ) {
+		stubY := preCarveFirstOccupiedHeight(od, seed, stubX, stubZ, false)
+		if !isStructureBiomeAllowed(od, sets, def, stubX, stubY, stubZ) {
 			return [3]int{}, false
 		}
-		return [3]int{stubX, lowestY, stubZ}, true
+		return [3]int{stubX, stubY, stubZ}, true
 
 	case "minecraft:jungle_temple":
 		lowestY := preCarveLowestY(od, seed, int(cx)*16, int(cz)*16, 12, 15)
@@ -391,10 +401,11 @@ func evaluateStructureGenerationPoint(od *worldgen.OverworldDensity, sets *world
 			return [3]int{}, false
 		}
 		stubX, stubZ := int(cx)*16+8, int(cz)*16+8
-		if !isStructureBiomeAllowed(od, sets, def, stubX, lowestY, stubZ) {
+		stubY := preCarveFirstOccupiedHeight(od, seed, stubX, stubZ, false)
+		if !isStructureBiomeAllowed(od, sets, def, stubX, stubY, stubZ) {
 			return [3]int{}, false
 		}
-		return [3]int{stubX, lowestY, stubZ}, true
+		return [3]int{stubX, stubY, stubZ}, true
 
 	case "minecraft:woodland_mansion":
 		rotation := int(variantRandom.NextIntN(4))

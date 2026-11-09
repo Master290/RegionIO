@@ -629,3 +629,500 @@ func TestOceanMonumentWoodlandMansionPillagerOutpostSeed12345Parity(t *testing.T
 			outChests, outBanners, outPillagers)
 	}
 }
+
+func TestRemainingStructuresSeed12345StartsAndPieceContentsParity(t *testing.T) {
+	const seed = int64(12345)
+	od, _, _, _ := vanillaGeneratorInputs(seed)
+	sets, err := worldgen.LoadStructureSets()
+	if err != nil {
+		t.Fatalf("LoadStructureSets: %v", err)
+	}
+	nd, err := worldgen.LoadNetherFinalDensity(seed)
+	if err != nil {
+		t.Fatalf("LoadNetherFinalDensity: %v", err)
+	}
+	ed, err := worldgen.LoadEndFinalDensity(seed)
+	if err != nil {
+		t.Fatalf("LoadEndFinalDensity: %v", err)
+	}
+
+	// -------------------------------------------------------------------------
+	// 1. Start positions on seed=12345 across all Issue #23 structure sets
+	// -------------------------------------------------------------------------
+	findOverworldStart := func(setName, wantStructure string, maxRadius int32) *StructureStartStub {
+		set := sets.Sets[setName]
+		if set == nil {
+			t.Fatalf("missing structure set %s", setName)
+		}
+		wantDef := sets.Structures[wantStructure]
+		if set.Placement != nil && set.Placement.RandomSpread != nil && set.Placement.RandomSpread.Spacing > 1 {
+			spread := set.Placement.RandomSpread
+			for rx := -maxRadius; rx <= maxRadius; rx++ {
+				for rz := -maxRadius; rz <= maxRadius; rz++ {
+					cand := spread.PotentialChunk(seed, rx*int32(spread.Spacing), rz*int32(spread.Spacing))
+					if !set.IsStartChunk(seed, cand[0], cand[1]) {
+						continue
+					}
+					if wantDef != nil && !isStructureBiomeAllowed(od, sets, wantDef, int(cand[0])*16+8, 64, int(cand[1])*16+8) {
+						continue
+					}
+					stub, ok := FindStructureSetStart(od, sets, setName, seed, cand[0], cand[1])
+					if !ok || stub == nil {
+						continue
+					}
+					if wantStructure != "" && stub.StructureName != wantStructure {
+						continue
+					}
+					return stub
+				}
+			}
+		} else {
+			for cx := -maxRadius; cx <= maxRadius; cx++ {
+				for cz := -maxRadius; cz <= maxRadius; cz++ {
+					if !set.IsStartChunk(seed, cx, cz) {
+						continue
+					}
+					if wantDef != nil && !isStructureBiomeAllowed(od, sets, wantDef, int(cx)*16+8, 64, int(cz)*16+8) {
+						continue
+					}
+					stub, ok := FindStructureSetStart(od, sets, setName, seed, cx, cz)
+					if !ok || stub == nil {
+						continue
+					}
+					if wantStructure != "" && stub.StructureName != wantStructure {
+						continue
+					}
+					return stub
+				}
+			}
+		}
+		t.Fatalf("did not find start for set %s (want=%s) within radius %d on seed %d", setName, wantStructure, maxRadius, seed)
+		return nil
+	}
+
+	// Nether starts: fortress, bastion_remnant, nether_fossil, ruined_portal_nether
+	var fortStub, bastStub *StructureStartStub
+	netherSpread := sets.Sets["minecraft:nether_complexes"].Placement.RandomSpread
+	for rx := int32(-6); rx <= 6 && (fortStub == nil || bastStub == nil); rx++ {
+		for rz := int32(-6); rz <= 6 && (fortStub == nil || bastStub == nil); rz++ {
+			cand := netherSpread.PotentialChunk(seed, rx*int32(netherSpread.Spacing), rz*int32(netherSpread.Spacing))
+			stub, ok := FindStructureSetStart(nd, sets, "minecraft:nether_complexes", seed, cand[0], cand[1])
+			if !ok || stub == nil {
+				continue
+			}
+			if stub.StructureName == "minecraft:fortress" && fortStub == nil {
+				fortStub = stub
+			} else if stub.StructureName == "minecraft:bastion_remnant" && bastStub == nil {
+				bastStub = stub
+			}
+		}
+	}
+	if fortStub == nil || bastStub == nil {
+		t.Fatalf("missing nether_complexes starts on seed 12345: fortress=%v bastion=%v", fortStub, bastStub)
+	}
+
+	var nFossilStub *NetherFossilStub
+	for cx := int32(-30); cx <= 30 && nFossilStub == nil; cx++ {
+		for cz := int32(-30); cz <= 30 && nFossilStub == nil; cz++ {
+			if stub := NetherFossilGenerationPoint(nd, sets, seed, cx, cz); stub != nil {
+				nFossilStub = stub
+			}
+		}
+	}
+	if nFossilStub == nil {
+		t.Fatalf("did not find valid nether_fossil start on seed 12345")
+	}
+
+	var nPortalStub *RuinedPortalStub
+	for cx := int32(-25); cx <= 25 && nPortalStub == nil; cx++ {
+		for cz := int32(-25); cz <= 25 && nPortalStub == nil; cz++ {
+			stub, err := RuinedPortalGenerationPoint(nd, sets, seed, cx, cz)
+			if err == nil && stub != nil {
+				nPortalStub = stub
+			}
+		}
+	}
+	if nPortalStub == nil {
+		t.Fatalf("did not find valid ruined_portal_nether start on seed 12345")
+	}
+
+	// End City start (and find one with a Ship for piece contents verification)
+	var endCityStart, endCityWithShip *EndCityStart
+	endSpread := sets.Sets["minecraft:end_cities"].Placement.RandomSpread
+	for rx := int32(-12); rx <= 12 && (endCityStart == nil || endCityWithShip == nil); rx++ {
+		for rz := int32(-12); rz <= 12 && (endCityStart == nil || endCityWithShip == nil); rz++ {
+			cand := endSpread.PotentialChunk(seed, rx*int32(endSpread.Spacing), rz*int32(endSpread.Spacing))
+			st := EndCityGenerationPoint(ed, sets, seed, cand[0], cand[1])
+			if st == nil {
+				continue
+			}
+			if endCityStart == nil {
+				endCityStart = st
+			}
+			for _, p := range st.Pieces {
+				if p.Name == "ship" {
+					endCityWithShip = st
+					break
+				}
+			}
+		}
+	}
+	if endCityStart == nil || endCityWithShip == nil {
+		t.Fatalf("missing end_city start (%v) or end_city with ship (%v) on seed 12345", endCityStart, endCityWithShip)
+	}
+
+	// Stronghold start (concentric rings)
+	rings := sets.StrongholdRingPositions(seed, nil)
+	if len(rings) != 128 {
+		t.Fatalf("StrongholdRingPositions count = %d, want 128", len(rings))
+	}
+
+	// Overworld structure starts on seed=12345
+	rpStub := findOverworldStart("minecraft:ruined_portals", "", 4)
+	swOceanStub := findOverworldStart("minecraft:shipwrecks", "minecraft:shipwreck", 6)
+	swBeachStub := findOverworldStart("minecraft:shipwrecks", "minecraft:shipwreck_beached", 12)
+	orColdStub := findOverworldStart("minecraft:ocean_ruins", "minecraft:ocean_ruin_cold", 6)
+	orWarmStub := findOverworldStart("minecraft:ocean_ruins", "minecraft:ocean_ruin_warm", 12)
+	btStub := findOverworldStart("minecraft:buried_treasures", "minecraft:buried_treasure", 120)
+	dpStub := findOverworldStart("minecraft:desert_pyramids", "minecraft:desert_pyramid", 20)
+	jtStub := findOverworldStart("minecraft:jungle_temples", "minecraft:jungle_pyramid", 20)
+	igStub := findOverworldStart("minecraft:igloos", "minecraft:igloo", 20)
+	shStub := findOverworldStart("minecraft:swamp_huts", "minecraft:swamp_hut", 20)
+	msNormStub := findOverworldStart("minecraft:mineshafts", "minecraft:mineshaft", 20)
+	msMesaStub := findOverworldStart("minecraft:mineshafts", "minecraft:mineshaft_mesa", 350)
+	trStub := findOverworldStart("minecraft:trail_ruins", "minecraft:trail_ruins", 20)
+
+	t.Logf("seed=12345 starts: fortress=(%d,%d) bastion=(%d,%d) nether_fossil=(%d,%d,%d) end_city=(%d,%d ship=%d,%d) ruined_portal=(%d,%d) shipwreck=(%d,%d / beached=%d,%d) ocean_ruin=(cold=%d,%d / warm=%d,%d) buried_treasure=(%d,%d) desert_pyramid=(%d,%d) jungle_pyramid=(%d,%d) igloo=(%d,%d) swamp_hut=(%d,%d) mineshaft=(%d,%d / mesa=%d,%d) trail_ruins=(%d,%d)",
+		fortStub.ChunkX, fortStub.ChunkZ, bastStub.ChunkX, bastStub.ChunkZ,
+		nFossilStub.X, nFossilStub.Y, nFossilStub.Z,
+		endCityStart.ChunkX, endCityStart.ChunkZ, endCityWithShip.ChunkX, endCityWithShip.ChunkZ,
+		rpStub.ChunkX, rpStub.ChunkZ,
+		swOceanStub.ChunkX, swOceanStub.ChunkZ, swBeachStub.ChunkX, swBeachStub.ChunkZ,
+		orColdStub.ChunkX, orColdStub.ChunkZ, orWarmStub.ChunkX, orWarmStub.ChunkZ,
+		btStub.ChunkX, btStub.ChunkZ, dpStub.ChunkX, dpStub.ChunkZ,
+		jtStub.ChunkX, jtStub.ChunkZ, igStub.ChunkX, igStub.ChunkZ,
+		shStub.ChunkX, shStub.ChunkZ, msNormStub.ChunkX, msNormStub.ChunkZ,
+		msMesaStub.ChunkX, msMesaStub.ChunkZ, trStub.ChunkX, trStub.ChunkZ)
+
+	// -------------------------------------------------------------------------
+	// 2. Piece contents (blocks, block entities/loot, entities)
+	// -------------------------------------------------------------------------
+
+	// 2a. Nether Fortress (find a start on seed=12345 that includes nfMonsterThrone and cover its full Box)
+	fortStart := BuildNetherFortressStart(seed, fortStub.ChunkX, fortStub.ChunkZ)
+	hasThrone := func(st *NetherFortressStart) bool {
+		if st == nil {
+			return false
+		}
+		for _, p := range st.Pieces {
+			if p.kind == nfMonsterThrone {
+				return true
+			}
+		}
+		return false
+	}
+	for off := int32(1); !hasThrone(fortStart) && off < 30; off++ {
+		cand := BuildNetherFortressStart(seed, fortStub.ChunkX+off, fortStub.ChunkZ)
+		if hasThrone(cand) {
+			fortStart = cand
+			break
+		}
+	}
+	if fortStart == nil || !hasThrone(fortStart) {
+		t.Fatalf("BuildNetherFortressStart failed to produce nfMonsterThrone: %v", fortStart)
+	}
+	fortMinCX, fortMaxCX := int32(fortStart.Box.minX>>4), int32(fortStart.Box.maxX>>4)
+	fortMinCZ, fortMaxCZ := int32(fortStart.Box.minZ>>4), int32(fortStart.Box.maxZ>>4)
+	fortCenterCX, fortCenterCZ := (fortMinCX+fortMaxCX)/2, (fortMinCZ+fortMaxCZ)/2
+	fortRadius := max(fortMaxCX-fortCenterCX, fortMaxCZ-fortCenterCZ) + 1
+	fortRegion := buildFlatTestDecorationRegion(t, fortCenterCX, fortCenterCZ, fortRadius, 45, false)
+	for cx := fortMinCX; cx <= fortMaxCX; cx++ {
+		for cz := fortMinCZ; cz <= fortMaxCZ; cz++ {
+			if ch := fortRegion.chunks[[2]int32{cx, cz}]; ch != nil {
+				PlaceNetherFortress(ch, fortStart, cx, cz)
+			}
+		}
+	}
+	fortCounts := countBlocksInBox(fortRegion, fortStart.Box)
+	if fortCounts["minecraft:nether_bricks"] == 0 || fortCounts["minecraft:nether_brick_fence"] == 0 ||
+		fortCounts["minecraft:spawner"] == 0 {
+		t.Errorf("NetherFortress missing blocks: %v", fortCounts)
+	}
+	fortSpawners, fortChests, fortMobs := 0, 0, 0
+	for _, be := range collectRegionBlockEntities(fortRegion) {
+		switch be.ID {
+		case "minecraft:mob_spawner":
+			if be.SpawnerEntityID == "minecraft:blaze" {
+				fortSpawners++
+			}
+		case "minecraft:chest":
+			if len(be.Items) > 0 {
+				fortChests++
+			}
+		}
+	}
+	for _, ent := range collectRegionEntities(fortRegion) {
+		if ent.ID == "minecraft:wither_skeleton" || ent.ID == "minecraft:blaze" {
+			fortMobs++
+		}
+	}
+	if fortSpawners == 0 || fortMobs == 0 {
+		t.Errorf("NetherFortress blazeSpawners=%d fortChests=%d fortMobs=%d", fortSpawners, fortChests, fortMobs)
+	}
+
+	// 2b. Bastion Remnant
+	bastDef := sets.Structures["minecraft:bastion_remnant"]
+	bastStart, err := BuildJigsawStart(nil, nil, bastDef, seed, bastStub.ChunkX, bastStub.ChunkZ, func(x, z int, oceanFloor bool) int {
+		return 33
+	})
+	if err != nil || bastStart == nil || len(bastStart.Pieces) == 0 {
+		t.Fatalf("BuildJigsawStart(bastion_remnant): %v, err=%v", bastStart, err)
+	}
+	bastRegion := buildFlatTestDecorationRegion(t, bastStub.ChunkX, bastStub.ChunkZ, 4, 32, false)
+	for cx := bastStub.ChunkX - 4; cx <= bastStub.ChunkX+4; cx++ {
+		for cz := bastStub.ChunkZ - 4; cz <= bastStub.ChunkZ+4; cz++ {
+			PlaceJigsawStartsForChunk(bastRegion, []*JigsawStart{bastStart}, "minecraft:bastion_remnant", 4, seed, cx, cz)
+		}
+	}
+	bastCounts := countBlocksInBox(bastRegion, bastStart.Box)
+	if bastCounts["minecraft:blackstone"] == 0 || (bastCounts["minecraft:gilded_blackstone"] == 0 && bastCounts["minecraft:gold_block"] == 0) {
+		t.Errorf("BastionRemnant missing blackstone/gold: %v", bastCounts)
+	}
+	bastChests, bastPiglins := 0, 0
+	for _, be := range collectRegionBlockEntities(bastRegion) {
+		if be.ID == "minecraft:chest" && len(be.Items) > 0 {
+			bastChests++
+		}
+	}
+	for _, ent := range collectRegionEntities(bastRegion) {
+		if ent.ID == "minecraft:piglin" || ent.ID == "minecraft:piglin_brute" {
+			bastPiglins++
+		}
+	}
+	if bastChests == 0 || bastPiglins == 0 {
+		t.Errorf("BastionRemnant chests=%d piglins=%d, want > 0", bastChests, bastPiglins)
+	}
+
+	// 2c. End City + Ship (cover the entire EndCityWithShip Box so the ship chunk is included)
+	ecMinCX, ecMaxCX := int32(endCityWithShip.Box.minX>>4), int32(endCityWithShip.Box.maxX>>4)
+	ecMinCZ, ecMaxCZ := int32(endCityWithShip.Box.minZ>>4), int32(endCityWithShip.Box.maxZ>>4)
+	ecCenterCX, ecCenterCZ := (ecMinCX+ecMaxCX)/2, (ecMinCZ+ecMaxCZ)/2
+	ecRadius := max(ecMaxCX-ecCenterCX, ecMaxCZ-ecCenterCZ) + 1
+	ecRegion := buildFlatTestDecorationRegion(t, ecCenterCX, ecCenterCZ, ecRadius, 60, false)
+	for cx := ecMinCX; cx <= ecMaxCX; cx++ {
+		for cz := ecMinCZ; cz <= ecMaxCZ; cz++ {
+			if ch := ecRegion.chunks[[2]int32{cx, cz}]; ch != nil {
+				PlaceEndCity(ch, endCityWithShip, cx, cz)
+			}
+		}
+	}
+	ecCounts := countBlocksInBox(ecRegion, endCityWithShip.Box)
+	if ecCounts["minecraft:purpur_block"] == 0 || ecCounts["minecraft:end_stone_bricks"] == 0 ||
+		ecCounts["minecraft:brewing_stand"] == 0 {
+		t.Errorf("EndCity+Ship missing blocks: %v", ecCounts)
+	}
+	ecChests, ecShulkers, ecElytraFrames := 0, 0, 0
+	for _, be := range collectRegionBlockEntities(ecRegion) {
+		if be.ID == "minecraft:chest" && (len(be.Items) > 0 || be.LootTable == "minecraft:chests/end_city_treasure") {
+			ecChests++
+		}
+	}
+	for _, ent := range collectRegionEntities(ecRegion) {
+		switch ent.ID {
+		case "minecraft:shulker":
+			ecShulkers++
+		case "minecraft:item_frame":
+			if ent.Item == "minecraft:elytra" {
+				ecElytraFrames++
+			}
+		}
+	}
+	if ecChests == 0 || ecShulkers == 0 || ecElytraFrames != 1 {
+		t.Errorf("EndCity+Ship chests=%d shulkers=%d elytraFrames=%d (want 1)", ecChests, ecShulkers, ecElytraFrames)
+	}
+
+	// 2d. Stronghold + PortalRoom
+	shStart := BuildStrongholdStart(seed, rings[0][0], rings[0][1])
+	if shStart == nil || shStart.PortalRoom == nil {
+		t.Fatalf("BuildStrongholdStart failed at ring[0]=%v", rings[0])
+	}
+	pr := shStart.PortalRoom
+	prCX, prCZ := int32(pr.box.minX>>4), int32(pr.box.minZ>>4)
+	shRegion := buildFlatTestDecorationRegion(t, prCX, prCZ, 4, 55, false)
+	for cx := prCX - 4; cx <= prCX+4; cx++ {
+		for cz := prCZ - 4; cz <= prCZ+4; cz++ {
+			PlaceStrongholdStart(shRegion, shStart, seed, cx, cz)
+		}
+	}
+	prCounts := countBlocksInBox(shRegion, pr.box)
+	if prCounts["minecraft:end_portal_frame"] != 12 || prCounts["minecraft:spawner"] != 1 || prCounts["minecraft:lava"] < 15 {
+		t.Errorf("Stronghold PortalRoom blocks: frames=%d spawner=%d lava=%d",
+			prCounts["minecraft:end_portal_frame"], prCounts["minecraft:spawner"], prCounts["minecraft:lava"])
+	}
+
+	// 2e. Ruined Portal (on seed 12345 at chunk (1,0))
+	rp10, err := RuinedPortalGenerationPoint(od, sets, seed, 1, 0)
+	if err != nil || rp10 == nil {
+		t.Fatalf("RuinedPortalGenerationPoint(1,0): %v, %v", rp10, err)
+	}
+	rpRegion := buildFlatTestDecorationRegion(t, 1, 0, 2, 12, false)
+	if err := PlaceRuinedPortalPiece(rpRegion, rp10, seed, 1, 0); err != nil {
+		t.Fatalf("PlaceRuinedPortalPiece: %v", err)
+	}
+	rpCounts := countBlocksInBox(rpRegion, msBox{minX: 0, minY: 0, minZ: -16, maxX: 48, maxY: 40, maxZ: 32})
+	if rpCounts["minecraft:obsidian"]+rpCounts["minecraft:crying_obsidian"] == 0 ||
+		rpCounts["minecraft:netherrack"] == 0 || rpCounts["minecraft:chest"] == 0 {
+		t.Errorf("RuinedPortal missing blocks: %v", rpCounts)
+	}
+
+	// 2f. Ocean Ruin (warm with suspicious_sand + chest) & Buried Treasure & Shipwreck
+	warmStub, warmRng, err := OceanRuinGenerationPoint(od, sets, seed, orWarmStub.ChunkX, orWarmStub.ChunkZ)
+	if err != nil || warmStub == nil {
+		t.Fatalf("OceanRuinGenerationPoint(warm): %v, %v", warmStub, err)
+	}
+	orRegion := buildFlatTestDecorationRegion(t, orWarmStub.ChunkX, orWarmStub.ChunkZ, 2, 48, true)
+	if err := orRegion.setSource(orWarmStub.ChunkX, orWarmStub.ChunkZ); err != nil {
+		t.Fatalf("setSource: %v", err)
+	}
+	if err := PlaceOceanRuinPieces(orRegion, warmRng, warmStub, seed); err != nil {
+		t.Fatalf("PlaceOceanRuinPieces: %v", err)
+	}
+	orBrushable, orChests := 0, 0
+	for _, be := range collectRegionBlockEntities(orRegion) {
+		switch be.ID {
+		case "minecraft:brushable_block":
+			orBrushable++
+		case "minecraft:chest":
+			if len(be.Items) > 0 {
+				orChests++
+			}
+		}
+	}
+	if orBrushable == 0 || orChests == 0 {
+		t.Errorf("OceanRuin (warm) brushable=%d chests=%d, want > 0", orBrushable, orChests)
+	}
+
+	// Buried Treasure loot verification
+	btRegion := buildFlatTestDecorationRegion(t, btStub.ChunkX, btStub.ChunkZ, 1, 56, true)
+	PlaceBuriedTreasureInChunk(btRegion, seed, btStub.ChunkX, btStub.ChunkZ)
+	btChests := 0
+	for _, be := range collectRegionBlockEntities(btRegion) {
+		if be.ID == "minecraft:chest" && len(be.Items) > 0 {
+			btChests++
+		}
+	}
+	if btChests != 1 {
+		t.Errorf("BuriedTreasure loot chests = %d, want 1", btChests)
+	}
+
+	// 2g. Igloo (entities + loot), Swamp Hut (witch + cat), Desert Pyramid & Jungle Temple (loot)
+	var igWithBase *IglooStart
+	for s := int64(0); s < 50 && igWithBase == nil; s++ {
+		st := BuildIglooStart(seed+s, igStub.ChunkX, igStub.ChunkZ)
+		if len(st.Pieces) > 1 {
+			igWithBase = st
+		}
+	}
+	igRegion := buildFlatTestDecorationRegion(t, igStub.ChunkX, igStub.ChunkZ, 2, 64, false)
+	for cx := igStub.ChunkX - 1; cx <= igStub.ChunkX+1; cx++ {
+		for cz := igStub.ChunkZ - 1; cz <= igStub.ChunkZ+1; cz++ {
+			PlaceIgloosForChunk(igRegion, []*IglooStart{igWithBase}, seed, cx, cz)
+		}
+	}
+	igVillager, igZombieVillager, igChest := 0, 0, 0
+	for _, ent := range collectRegionEntities(igRegion) {
+		switch ent.ID {
+		case "minecraft:villager":
+			igVillager++
+		case "minecraft:zombie_villager":
+			igZombieVillager++
+		}
+	}
+	for _, be := range collectRegionBlockEntities(igRegion) {
+		if be.ID == "minecraft:chest" && len(be.Items) > 0 {
+			igChest++
+		}
+	}
+	if igVillager != 1 || igZombieVillager != 1 || igChest != 1 {
+		t.Errorf("Igloo basement villager=%d zombie_villager=%d chest=%d, want 1,1,1",
+			igVillager, igZombieVillager, igChest)
+	}
+
+	shutStart := BuildSwampHutStart(seed, shStub.ChunkX, shStub.ChunkZ)
+	shutRegion := buildFlatTestDecorationRegion(t, shStub.ChunkX, shStub.ChunkZ, 2, 62, false)
+	for cx := shStub.ChunkX - 1; cx <= shStub.ChunkX+1; cx++ {
+		for cz := shStub.ChunkZ - 1; cz <= shStub.ChunkZ+1; cz++ {
+			PlaceSwampHutsForChunk(shutRegion, []*SwampHutStart{shutStart}, seed, cx, cz)
+		}
+	}
+	witches, cats := 0, 0
+	for _, ent := range collectRegionEntities(shutRegion) {
+		switch ent.ID {
+		case "minecraft:witch":
+			witches++
+		case "minecraft:cat":
+			cats++
+		}
+	}
+	if witches != 1 || cats != 1 {
+		t.Errorf("SwampHut witch=%d cat=%d, want 1,1", witches, cats)
+	}
+
+	// 2h. Mineshaft (spawner + chest_minecart)
+	msStart := BuildMineshaftStart(seed, msNormStub.ChunkX, msNormStub.ChunkZ, false)
+	msRegion := buildFlatTestDecorationRegion(t, msNormStub.ChunkX, msNormStub.ChunkZ, 4, 80, false)
+	msRegion.bindSeed(seed)
+	for cx := msNormStub.ChunkX - 4; cx <= msNormStub.ChunkX+4; cx++ {
+		for cz := msNormStub.ChunkZ - 4; cz <= msNormStub.ChunkZ+4; cz++ {
+			PlaceMineshaftStart(msRegion, msStart, seed, cx, cz)
+		}
+	}
+	msCounts := countBlocksInBox(msRegion, msStart.Box)
+	if msCounts["minecraft:oak_planks"] == 0 || msCounts["minecraft:rail"] == 0 || msCounts["minecraft:cobweb"] == 0 {
+		t.Errorf("Mineshaft missing blocks: %v", msCounts)
+	}
+	msMinecarts := 0
+	for _, ent := range collectRegionEntities(msRegion) {
+		if ent.ID == "minecraft:chest_minecart" && ent.LootTable == "minecraft:chests/abandoned_mineshaft" {
+			msMinecarts++
+		}
+	}
+	if msMinecarts == 0 {
+		t.Errorf("Mineshaft placed 0 chest_minecart entities")
+	}
+
+	// 2i. Overworld Fossil (placeFossil) & Nether Fossil (PlaceNetherFossil)
+	fossilRegion := buildFlatTestDecorationRegion(t, 0, 0, 1, 50, false)
+	if err := fossilRegion.setSource(0, 0); err != nil {
+		t.Fatalf("setSource: %v", err)
+	}
+	fs := mustFeatureSet(t)
+	fossilCfg, err := fs.Fossil("minecraft:fossil_coal")
+	if err != nil {
+		t.Fatalf("fs.Fossil: %v", err)
+	}
+	if !fossilRegion.placeFossil(fs, worldgen.NewLegacy(seed), worldgen.FeaturePosition{X: 4, Y: 40, Z: 4}, fossilCfg) {
+		t.Errorf("placeFossil returned false in solid stone region")
+	}
+	fCounts := countBlocksInBox(fossilRegion, msBox{minX: -16, minY: MinY, minZ: -16, maxX: 31, maxY: 50, maxZ: 31})
+	if fCounts["minecraft:bone_block"] == 0 {
+		t.Errorf("Overworld placeFossil placed 0 bone_block: %v", fCounts)
+	}
+
+	nfCX, nfCZ := int32(nFossilStub.X>>4), int32(nFossilStub.Z>>4)
+	nfRegion := buildFlatTestDecorationRegion(t, nfCX, nfCZ, 1, nFossilStub.Y-1, false)
+	for cx := nfCX - 1; cx <= nfCX+1; cx++ {
+		for cz := nfCZ - 1; cz <= nfCZ+1; cz++ {
+			if ch := nfRegion.chunks[[2]int32{cx, cz}]; ch != nil {
+				PlaceNetherFossil(ch, nFossilStub, seed, cx, cz)
+			}
+		}
+	}
+	nfCounts := countBlocksInBox(nfRegion, msBox{
+		minX: nFossilStub.X - 8, minY: nFossilStub.Y - 2, minZ: nFossilStub.Z - 8,
+		maxX: nFossilStub.X + 16, maxY: nFossilStub.Y + 16, maxZ: nFossilStub.Z + 16,
+	})
+	if nfCounts["minecraft:bone_block"] == 0 {
+		t.Errorf("PlaceNetherFossil placed 0 bone_block: %v", nfCounts)
+	}
+}

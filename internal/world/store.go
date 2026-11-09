@@ -33,11 +33,12 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-// Version 50: full Ocean Monument room graph + all 11 room pieces, full
-// Woodland Mansion grid + template piece placer + stair/door/chest/banner
-// mirror + cobblestone foundation, and Pillager Outpost jigsaw stub/banner/mob
-// parity (vanilla 26.1.2).
-const generatorVersion = 50
+// Version 51: BuriedTreasure OCEAN_FLOOR_WG and SinglePieceStructure
+// (DesertPyramid / JungleTemple) WORLD_SURFACE_WG generation-point parity,
+// plus full verification of Fortress, Bastion, End City, Stronghold, Ruined
+// Portal, Shipwreck, Ocean Ruin, Buried Treasure, Temples, Mineshaft, Trail
+// Ruins, and Overworld/Nether Fossils (vanilla 26.1.2).
+const generatorVersion = 51
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.
