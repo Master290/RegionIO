@@ -1373,7 +1373,7 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 	if effective <= 0 {
 		return 0
 	}
-	s.DamagePlayerWithEffects(session, afterArmor, cause)
+	died := s.DamagePlayerWithEffects(session, afterArmor, cause)
 	s.RecordDamageExhaustion(session)
 	s.SyncHealthObjectives(session)
 	s.EmitVibration(VibrationEvent{
@@ -1385,7 +1385,7 @@ func (s *Server) DamagePlayerWithArmor(session *PlayerSession, rawDamage float32
 		Player:         session,
 		SourceEntityID: snap.EntityID,
 	})
-	if session.IsDead() {
+	if died {
 		s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
 		s.EmitVibration(VibrationEvent{
 			Dimension:      snap.Dimension,
@@ -1433,11 +1433,12 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 			return 0
 		}
 	}
+	deathsBefore := s.GetPlayerStat(target, StatTypeCustom, StatDeaths)
 	dealt := s.DamagePlayerWithArmor(target, scaled, mobAttackCauseName(mobType))
 	if dealt <= 0 {
 		return 0
 	}
-	if target.IsDead() {
+	if target.IsDead() || s.GetPlayerStat(target, StatTypeCustom, StatDeaths) > deathsBefore {
 		s.TriggerKilledByEntity(target, mobType)
 		s.BroadcastDeathMessage(target, mobAttackCauseName(mobType), mobType)
 	} else if mobID > 0 {
@@ -1505,12 +1506,13 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 				return 0, false
 			}
 		}
+		deathsBefore := s.GetPlayerStat(victim, StatTypeCustom, StatDeaths)
 		dealt := s.DamagePlayerWithArmorBypassShield(victim, damage, "player")
 		if dealt <= 0 {
 			return 0, false
 		}
 		s.ApplyThornsRetaliation(victim, 0, session, nil)
-		if victim.IsDead() {
+		if victim.IsDead() || s.GetPlayerStat(victim, StatTypeCustom, StatDeaths) > deathsBefore {
 			s.IncrementCriteriaObjectives(session.Profile.Name, "playerKillCount", 1)
 			s.IncrementCriteriaObjectives(session.Profile.Name, "totalKillCount", 1)
 			s.BroadcastDeathMessage(victim, "player", session.Profile.Name)

@@ -8222,6 +8222,86 @@ func ComputeCommandSuggestions(srv *server.Server, sender *server.PlayerSession,
 		} else if argIdx == 4 && strings.EqualFold(fields[1], "function") {
 			candidates = []string{"append", "replace"}
 		}
+	case "summon":
+		if argIdx == 1 {
+			candidates = []string{
+				"minecraft:allay", "minecraft:armadillo", "minecraft:armor_stand", "minecraft:axolotl",
+				"minecraft:bat", "minecraft:bee", "minecraft:blaze", "minecraft:boat", "minecraft:bogged",
+				"minecraft:breeze", "minecraft:camel", "minecraft:cat", "minecraft:cave_spider",
+				"minecraft:chest_minecart", "minecraft:chicken", "minecraft:cod", "minecraft:copper_golem",
+				"minecraft:cow", "minecraft:creaking", "minecraft:creeper", "minecraft:dolphin",
+				"minecraft:donkey", "minecraft:drowned", "minecraft:elder_guardian", "minecraft:end_crystal",
+				"minecraft:ender_dragon", "minecraft:enderman", "minecraft:endermite", "minecraft:evoker",
+				"minecraft:experience_orb", "minecraft:firework_rocket", "minecraft:fox", "minecraft:frog",
+				"minecraft:ghast", "minecraft:glow_squid", "minecraft:goat", "minecraft:guardian",
+				"minecraft:hoglin", "minecraft:horse", "minecraft:husk", "minecraft:iron_golem",
+				"minecraft:item", "minecraft:item_frame", "minecraft:lightning_bolt", "minecraft:llama",
+				"minecraft:magma_cube", "minecraft:minecart", "minecraft:mooshroom", "minecraft:mule",
+				"minecraft:nautilus", "minecraft:ocelot", "minecraft:painting", "minecraft:panda",
+				"minecraft:parrot", "minecraft:phantom", "minecraft:pig", "minecraft:piglin",
+				"minecraft:piglin_brute", "minecraft:pillager", "minecraft:polar_bear", "minecraft:pufferfish",
+				"minecraft:rabbit", "minecraft:ravager", "minecraft:salmon", "minecraft:sheep",
+				"minecraft:shulker", "minecraft:silverfish", "minecraft:skeleton", "minecraft:skeleton_horse",
+				"minecraft:slime", "minecraft:sniffer", "minecraft:snow_golem", "minecraft:spider",
+				"minecraft:squid", "minecraft:stray", "minecraft:strider", "minecraft:tadpole",
+				"minecraft:tnt", "minecraft:trader_llama", "minecraft:trident", "minecraft:tropical_fish",
+				"minecraft:turtle", "minecraft:vex", "minecraft:villager", "minecraft:vindicator",
+				"minecraft:wandering_trader", "minecraft:warden", "minecraft:witch", "minecraft:wither",
+				"minecraft:wither_skeleton", "minecraft:wolf", "minecraft:zoglin", "minecraft:zombie",
+				"minecraft:zombie_horse", "minecraft:zombie_nautilus", "minecraft:zombie_villager",
+				"minecraft:zombified_piglin",
+			}
+		} else if argIdx >= 2 && argIdx <= 4 {
+			candidates = []string{"~"}
+		}
+	case "fill":
+		if argIdx >= 1 && argIdx <= 6 {
+			candidates = []string{"~"}
+		} else if argIdx == 7 {
+			candidates = server.AllKnownItemNames()
+		} else if argIdx == 8 {
+			candidates = []string{"destroy", "hollow", "keep", "outline", "replace"}
+		}
+	case "clone":
+		if argIdx >= 1 && argIdx <= 9 {
+			candidates = []string{"~"}
+		} else if argIdx == 10 {
+			candidates = []string{"filtered", "masked", "replace"}
+		} else if argIdx == 11 {
+			candidates = []string{"force", "move", "normal"}
+		}
+	case "attribute":
+		if argIdx == 1 {
+			candidates = onlinePlayers()
+		} else if argIdx == 2 {
+			candidates = []string{
+				"minecraft:armor", "minecraft:armor_toughness", "minecraft:attack_damage",
+				"minecraft:attack_speed", "minecraft:block_interaction_range",
+				"minecraft:entity_interaction_range", "minecraft:fall_damage_multiplier",
+				"minecraft:gravity", "minecraft:jump_strength", "minecraft:knockback_resistance",
+				"minecraft:luck", "minecraft:max_health", "minecraft:movement_speed",
+				"minecraft:safe_fall_distance", "minecraft:scale", "minecraft:step_height",
+			}
+		} else if argIdx == 3 {
+			candidates = []string{"base", "get", "modifier"}
+		} else if argIdx == 4 {
+			switch strings.ToLower(fields[3]) {
+			case "base":
+				candidates = []string{"get", "reset", "set"}
+			case "modifier":
+				candidates = []string{"add", "remove", "value"}
+			}
+		} else if argIdx == 7 && len(fields) > 4 && strings.EqualFold(fields[3], "modifier") && strings.EqualFold(fields[4], "add") {
+			candidates = []string{"add_multiplied_base", "add_multiplied_total", "add_value"}
+		}
+	case "advancement":
+		if argIdx == 1 {
+			candidates = []string{"grant", "revoke"}
+		} else if argIdx == 2 {
+			candidates = onlinePlayers()
+		} else if argIdx == 3 {
+			candidates = []string{"everything", "from", "only", "through", "until"}
+		}
 	}
 
 	for _, c := range candidates {

@@ -357,13 +357,14 @@ func itemCategories(itemName string) []ItemCategory {
 	return cats
 }
 
-// ItemMeta holds per-stack durability damage, enchantments, custom anvil name,
-// and prior-work penalty cost.
+// ItemMeta holds per-stack durability damage, enchantments, stored enchantments
+// (for enchanted_book), custom anvil name, and prior-work penalty cost.
 type ItemMeta struct {
-	Damage       int32
-	Enchantments map[string]int
-	CustomName   string
-	RepairCost   int32
+	Damage             int32
+	Enchantments       map[string]int
+	StoredEnchantments map[string]int
+	CustomName         string
+	RepairCost         int32
 }
 
 // Clone returns a deep copy of m.
@@ -381,12 +382,20 @@ func (m ItemMeta) Clone() ItemMeta {
 			}
 		}
 	}
+	if len(m.StoredEnchantments) > 0 {
+		cp.StoredEnchantments = make(map[string]int, len(m.StoredEnchantments))
+		for k, v := range m.StoredEnchantments {
+			if v > 0 {
+				cp.StoredEnchantments[canonicalEnchantmentID(k)] = v
+			}
+		}
+	}
 	return cp
 }
 
-// IsEmpty reports whether m carries no damage, enchantments, custom name, or repair cost.
+// IsEmpty reports whether m carries no damage, enchantments, stored enchantments, custom name, or repair cost.
 func (m ItemMeta) IsEmpty() bool {
-	return m.Damage == 0 && len(m.Enchantments) == 0 && m.CustomName == "" && m.RepairCost == 0
+	return m.Damage == 0 && len(m.Enchantments) == 0 && len(m.StoredEnchantments) == 0 && m.CustomName == "" && m.RepairCost == 0
 }
 
 // HasEnchantments reports whether m has at least one enchantment with level > 0.
@@ -426,6 +435,35 @@ func (m *ItemMeta) SetEnchantment(enchantID string, level int) {
 		m.Enchantments = make(map[string]int)
 	}
 	m.Enchantments[key] = level
+}
+
+// StoredEnchantmentLevel returns the level of enchantID in StoredEnchantments on m, or 0 if not present.
+func (m ItemMeta) StoredEnchantmentLevel(enchantID string) int {
+	if len(m.StoredEnchantments) == 0 {
+		return 0
+	}
+	return m.StoredEnchantments[canonicalEnchantmentID(enchantID)]
+}
+
+// SetStoredEnchantment sets or removes (when level <= 0) a stored enchantment on m.
+func (m *ItemMeta) SetStoredEnchantment(enchantID string, level int) {
+	if m == nil {
+		return
+	}
+	key := canonicalEnchantmentID(enchantID)
+	if key == "" {
+		return
+	}
+	if level <= 0 {
+		if m.StoredEnchantments != nil {
+			delete(m.StoredEnchantments, key)
+		}
+		return
+	}
+	if m.StoredEnchantments == nil {
+		m.StoredEnchantments = make(map[string]int)
+	}
+	m.StoredEnchantments[key] = level
 }
 
 // SortedEnchantments returns all active enchantments on m sorted by canonical ID.

@@ -461,14 +461,23 @@ func (s *Server) SavePlayerData(session *PlayerSession) error {
 	}
 	advErr := s.SavePlayerAdvancementsFile(session)
 	statsErr := s.SavePlayerStatsFile(session)
-	if s.store == nil {
-		if advErr != nil {
-			return advErr
+	if s.store != nil {
+		if err := s.store.SavePlayerData(session.Profile.UUID, session.PlayerData()); err != nil {
+			return err
 		}
-		return statsErr
-	}
-	if err := s.store.SavePlayerData(session.Profile.UUID, session.PlayerData()); err != nil {
-		return err
+	} else if s.cfg.WorldDir != "" {
+		playerDir := filepath.Join(s.cfg.WorldDir, "playerdata")
+		if err := os.MkdirAll(playerDir, 0o755); err != nil {
+			return err
+		}
+		encoded, err := world.MarshalPlayerDataNBT(session.PlayerData())
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(playerDir, world.FormatPlayerUUID(session.Profile.UUID)+".dat")
+		if err := os.WriteFile(target, encoded, 0o644); err != nil {
+			return err
+		}
 	}
 	if advErr != nil {
 		return advErr
@@ -939,6 +948,14 @@ func (s *Server) registerPlayer(profile Profile, send PacketSender, joined bool)
 			persisted = loaded
 			hasSaved = true
 		}
+	} else if s.cfg.WorldDir != "" {
+		target := filepath.Join(s.cfg.WorldDir, "playerdata", world.FormatPlayerUUID(profile.UUID)+".dat")
+		if raw, err := os.ReadFile(target); err == nil {
+			if loaded, err := world.UnmarshalPlayerDataNBT(raw); err == nil {
+				persisted = loaded
+				hasSaved = true
+			}
+		}
 	}
 	s.playersMu.Lock()
 	defer s.playersMu.Unlock()
@@ -1310,8 +1327,78 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 					}
 				}
 			}
+			if stEnchTag, ok := comp.Get("StoredEnchantments"); ok {
+				if stEnchComp, ok := stEnchTag.(*nbt.Compound); ok && stEnchComp != nil {
+					for _, k := range stEnchComp.Keys() {
+						if lvlTag, ok := stEnchComp.Get(k); ok {
+							if lv, ok := lvlTag.(nbt.Int); ok && lv > 0 {
+								meta.SetStoredEnchantment(k, int(lv))
+							}
+						}
+					}
+				}
+			}
 			if !meta.IsEmpty() {
 				SetSlotItemMeta(session, slot, meta)
+			}
+			if wbTag, ok := comp.Get("WritableBook"); ok {
+				if wbComp, ok := wbTag.(*nbt.Compound); ok && wbComp != nil {
+					SetSlotWritableBook(session, slot, WritableBookContentFromNBT(wbComp))
+				}
+			}
+			if wrbTag, ok := comp.Get("WrittenBook"); ok {
+				if wrbComp, ok := wrbTag.(*nbt.Compound); ok && wrbComp != nil {
+					SetSlotWrittenBook(session, slot, WrittenBookContentFromNBT(wrbComp))
+				}
+			}
+			if dyedTag, ok := comp.Get("DyedColor"); ok {
+				if dv, ok := dyedTag.(nbt.Int); ok {
+					SetSlotDyedColor(session, slot, int32(dv))
+				}
+			}
+			if instTag, ok := comp.Get("Instrument"); ok {
+				if iv, ok := instTag.(nbt.String); ok && iv != "" {
+					SetSlotGoatHornInstrument(session, slot, string(iv))
+				}
+			}
+			if cpTag, ok := comp.Get("ChargedProjectiles"); ok {
+				if cpList, ok := cpTag.(nbt.List); ok && len(cpList.Elems) > 0 {
+					var projs []ChargedProjectile
+					for _, pe := range cpList.Elems {
+						pc, ok := pe.(*nbt.Compound)
+						if !ok || pc == nil {
+							continue
+						}
+						idTag, _ := pc.Get("id")
+						idStr, _ := idTag.(nbt.String)
+						if idStr == "" {
+							continue
+						}
+						cnt := int32(1)
+						if cTag, ok := pc.Get("count"); ok {
+							if cv, ok := cTag.(nbt.Int); ok && cv > 0 {
+								cnt = int32(cv)
+							}
+						}
+						proj := ChargedProjectile{Stack: world.NewNamedItemStack(string(idStr), cnt)}
+						if pTag, ok := pc.Get("potion"); ok {
+							if pv, ok := pTag.(nbt.String); ok {
+								proj.PotionType = string(pv)
+							}
+						}
+						if fwTag, ok := pc.Get("fireworks"); ok {
+							if fwc, ok := fwTag.(*nbt.Compound); ok && fwc != nil {
+								if fw, ok := ReadFireworksNBT(fwc); ok {
+									proj.Fireworks = &fw
+								}
+							}
+						}
+						projs = append(projs, proj)
+					}
+					if len(projs) > 0 {
+						SetSlotChargedProjectiles(session, slot, projs)
+					}
+				}
 			}
 		}
 	}
@@ -1524,7 +1611,13 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 				}
 			}
 		}
-		if meta := GetSlotItemMeta(session, slot); !meta.IsEmpty() {
+		meta := GetSlotItemMeta(session, slot)
+		wb, hasWB := GetSlotWritableBook(session, slot)
+		wrb, hasWRB := GetSlotWrittenBook(session, slot)
+		dyedRGB, hasDyed := GetSlotDyedColor(session, slot)
+		instrument := GetSlotGoatHornInstrument(session, slot)
+		chargedProjs := GetSlotChargedProjectiles(session, slot)
+		if !meta.IsEmpty() || hasWB || hasWRB || hasDyed || instrument != "" || len(chargedProjs) > 0 {
 			entry := nbt.NewCompound().Set("Slot", nbt.Byte(int8(slot)))
 			if meta.Damage > 0 {
 				entry.Set("Damage", nbt.Int(meta.Damage))
@@ -1543,6 +1636,48 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 					}
 				}
 				entry.Set("Enchantments", enchComp)
+			}
+			if len(meta.StoredEnchantments) > 0 {
+				stEnchComp := nbt.NewCompound()
+				for k, lvl := range meta.StoredEnchantments {
+					if lvl > 0 {
+						stEnchComp.Set(k, nbt.Int(int32(lvl)))
+					}
+				}
+				entry.Set("StoredEnchantments", stEnchComp)
+			}
+			if hasWB {
+				entry.Set("WritableBook", wb.ToNBT())
+			}
+			if hasWRB {
+				entry.Set("WrittenBook", wrb.ToNBT())
+			}
+			if hasDyed {
+				entry.Set("DyedColor", nbt.Int(dyedRGB))
+			}
+			if instrument != "" {
+				entry.Set("Instrument", nbt.String(instrument))
+			}
+			if len(chargedProjs) > 0 {
+				cpElems := make([]nbt.Tag, 0, len(chargedProjs))
+				for _, cp := range chargedProjs {
+					pc := nbt.NewCompound().
+						Set("id", nbt.String(cp.Stack.ResolvedID())).
+						Set("count", nbt.Int(cp.Stack.Count))
+					if cp.PotionType != "" {
+						pc.Set("potion", nbt.String(cp.PotionType))
+					}
+					if cp.Fireworks != nil {
+						if fwc := WriteFireworksNBT(*cp.Fireworks); fwc != nil {
+							pc.Set("fireworks", fwc)
+						}
+					}
+					cpElems = append(cpElems, pc)
+				}
+				entry.Set("ChargedProjectiles", nbt.List{
+					ElemID: nbt.TagCompound,
+					Elems:  cpElems,
+				})
 			}
 			itemMetaElems = append(itemMetaElems, entry)
 		}

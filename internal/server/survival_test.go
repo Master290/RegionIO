@@ -2101,6 +2101,189 @@ func TestIssue21AttributesFunctionsSchedulesAndPlayerDataRoundTrip(t *testing.T)
 	}
 }
 
+func TestIssue30RespawnHungerEnchantmentsAndPlayerDataPersistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.WorldDir = tmpDir
+	srv, err := NewWithCache(cfg, world.NewCache(-1, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+
+	var (
+		mu         sync.Mutex
+		combatKill bool
+	)
+	prof := Profile{
+		UUID: [16]byte{0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f},
+		Name: "Issue30Tester",
+	}
+	sendFn := func(packetID int32, payload []byte) error {
+		mu.Lock()
+		if packetID == protocol.PlayPlayerCombatKill {
+			combatKill = true
+		}
+		mu.Unlock()
+		return nil
+	}
+	session, err := srv.RegisterPlayer(prof, sendFn)
+	if err != nil {
+		t.Fatalf("RegisterPlayer: %v", err)
+	}
+	_ = srv.SetPlayerGameMode(session, GameModeSurvival)
+
+	hb0 := world.HotbarContainerOffset
+
+	// 1. Respawn anchor in the Nether: consumes 1 charge on respawn
+	netherCache := srv.DimensionChunks(world.DimensionNether)
+	anchorState, ok := world.BlockStateByName("minecraft:respawn_anchor", map[string]string{"charges": "4"})
+	if !ok {
+		t.Fatal("missing respawn_anchor[charges=4] state")
+	}
+	netherCache.SetBlock(20, 64, 20, anchorState)
+	netherCache.SetBlock(20, 65, 20, world.StateAir)
+	netherCache.SetBlock(20, 66, 20, world.StateAir)
+	srv.SetPlayerDimensionSpawnPoint(session, world.DimensionNether, 20, 64, 20, 0, 0, false)
+
+	srv.SetKeepInventory(true)
+	session.SetInventorySlot(hb0, world.NewNamedItemStack("minecraft:diamond_sword", 1))
+	srv.DamagePlayer(session, 100.0, "fall")
+	if !session.IsDead() {
+		t.Fatal("expected player to be dead before RespawnPlayer")
+	}
+	if err := srv.RespawnPlayer(session); err != nil {
+		t.Fatalf("RespawnPlayer: %v", err)
+	}
+	snap := session.Snapshot()
+	if snap.Dimension != world.DimensionNether {
+		t.Fatalf("respawn dimension = %q, want %q", snap.Dimension, world.DimensionNether)
+	}
+	afterAnchor := netherCache.GetBlock(20, 64, 20)
+	if _, props, _ := world.BlockStateProperties(afterAnchor); props["charges"] != "3" {
+		t.Fatalf("expected respawn_anchor charges decremented to 3, got %v", props)
+	}
+	if session.InventorySlot(hb0).ResolvedID() != "minecraft:diamond_sword" {
+		t.Fatal("expected diamond_sword preserved with keepInventory=true")
+	}
+
+	// 2. doImmediateRespawn in combat death (AttackPlayerFromMob) skips PlayPlayerCombatKill and increments deathCount
+	srv.SetDoImmediateRespawn(true)
+	_, _ = srv.CreateObjective("deaths_obj", "deathCount", TextComponent("Deaths"))
+	mu.Lock()
+	combatKill = false
+	mu.Unlock()
+	srv.AttackPlayerFromMob(0, MobTypeZombie, snap.X+1, snap.Z, session, 100.0)
+	mu.Lock()
+	sawCombatKill := combatKill
+	mu.Unlock()
+	if sawCombatKill {
+		t.Fatal("expected PlayPlayerCombatKill to be skipped when doImmediateRespawn=true")
+	}
+	if session.IsDead() || session.Health() != world.DefaultPlayerHealth {
+		t.Fatalf("expected immediate respawn to full health, got dead=%v health=%v", session.IsDead(), session.Health())
+	}
+	if sc, _ := srv.GetScore(prof.Name, "deaths_obj"); sc < 1 {
+		t.Fatalf("expected deaths_obj >= 1 after immediate-respawn combat death, got %d", sc)
+	}
+	srv.SetDoImmediateRespawn(false)
+
+	// 3. Item consumption: honey bottle (clears poison)
+	_ = srv.ApplyPlayerEffect(session, NewStatusEffectInstance(EffectPoison, 200, 0))
+	if !session.HasPlayerEffect(EffectPoison) {
+		t.Fatal("expected Poison active before drinking honey bottle")
+	}
+	session.SetSelectedSlot(0)
+	session.SetInventorySlot(hb0, world.NewNamedItemStack("minecraft:honey_bottle", 1))
+	if !srv.EatHeldItem(session) {
+		t.Fatal("EatHeldItem(honey_bottle) failed")
+	}
+	if session.HasPlayerEffect(EffectPoison) {
+		t.Fatal("expected honey_bottle consumption to cure Poison")
+	}
+
+	// 4. Full PlayerData disk persistence including StoredEnchantments, WritableBook, WrittenBook,
+	// DyedColor, GoatHornInstrument, ChargedProjectiles, ArmorTrim, and Potion
+	enchBookSlot := hb0 + 1
+	session.SetInventorySlot(enchBookSlot, world.NewNamedItemStack("minecraft:enchanted_book", 1))
+	SetSlotItemMeta(session, enchBookSlot, ItemMeta{
+		StoredEnchantments: map[string]int{"minecraft:mending": 1, "minecraft:unbreaking": 3},
+	})
+
+	writableSlot := hb0 + 2
+	session.SetInventorySlot(writableSlot, world.NewNamedItemStack("minecraft:writable_book", 1))
+	SetSlotWritableBook(session, writableSlot, WritableBookContent{
+		Pages: []FilterableString{{Raw: "Page one"}, {Raw: "Page two"}},
+	})
+
+	writtenSlot := hb0 + 3
+	session.SetInventorySlot(writtenSlot, world.NewNamedItemStack("minecraft:written_book", 1))
+	SetSlotWrittenBook(session, writtenSlot, WrittenBookContent{
+		Title:      FilterableString{Raw: "Chronicle"},
+		Author:     prof.Name,
+		Generation: 1,
+		Pages:      []FilterableComponent{{Raw: TextComponent("Chapter 1")}},
+		Resolved:   true,
+	})
+
+	dyedSlot := ArmorSlotChest
+	session.SetInventorySlot(dyedSlot, world.NewNamedItemStack("minecraft:leather_chestplate", 1))
+	SetSlotDyedColor(session, dyedSlot, 0x336699)
+	SetSlotArmorTrim(session, dyedSlot, ArmorTrim{
+		Pattern:  "minecraft:spire",
+		Material: "minecraft:netherite",
+	})
+
+	hornSlot := hb0 + 4
+	session.SetInventorySlot(hornSlot, world.NewNamedItemStack("minecraft:goat_horn", 1))
+	SetSlotGoatHornInstrument(session, hornSlot, "minecraft:sing_goat_horn")
+
+	crossbowSlot := hb0 + 5
+	session.SetInventorySlot(crossbowSlot, world.NewNamedItemStack("minecraft:crossbow", 1))
+	SetSlotChargedProjectiles(session, crossbowSlot, []ChargedProjectile{
+		{Stack: world.NewNamedItemStack("minecraft:arrow", 1)},
+	})
+
+	potionSlot := hb0 + 6
+	session.SetInventorySlot(potionSlot, world.NewNamedItemStack("minecraft:potion", 1))
+	SetSlotPotionType(session, potionSlot, "minecraft:swiftness")
+
+	// UnregisterPlayer saves playerdata/<uuid>.dat, advancements/<uuid>.json, stats/<uuid>.json to disk
+	srv.UnregisterPlayer(session)
+
+	sessionReloaded, err := srv.RegisterPlayer(prof, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer after disk save: %v", err)
+	}
+
+	gotBookMeta := GetSlotItemMeta(sessionReloaded, enchBookSlot)
+	if gotBookMeta.StoredEnchantments["minecraft:mending"] != 1 || gotBookMeta.StoredEnchantments["minecraft:unbreaking"] != 3 {
+		t.Fatalf("reloaded StoredEnchantments = %v, want mending:1 unbreaking:3", gotBookMeta.StoredEnchantments)
+	}
+	if wbContent, ok := GetSlotWritableBook(sessionReloaded, writableSlot); !ok || len(wbContent.Pages) != 2 || wbContent.Pages[0].Raw != "Page one" || wbContent.Pages[1].Raw != "Page two" {
+		t.Fatalf("reloaded WritableBook = (%+v, %v), want [Page one, Page two]", wbContent, ok)
+	}
+	wb, ok := GetSlotWrittenBook(sessionReloaded, writtenSlot)
+	if !ok || wb.Title.Raw != "Chronicle" || wb.Author != prof.Name || wb.Generation != 1 || !wb.Resolved || len(wb.Pages) != 1 || wb.Pages[0].Raw.PlainText() != "Chapter 1" {
+		t.Fatalf("reloaded WrittenBook = (%+v, %v)", wb, ok)
+	}
+	if col, hasCol := GetSlotDyedColor(sessionReloaded, dyedSlot); !hasCol || col != 0x336699 {
+		t.Fatalf("reloaded DyedColor = (0x%x, %v), want (0x336699, true)", col, hasCol)
+	}
+	if trim, hasTrim := GetSlotArmorTrim(sessionReloaded, dyedSlot); !hasTrim || trim.Pattern != "minecraft:spire" || trim.Material != "minecraft:netherite" {
+		t.Fatalf("reloaded ArmorTrim = (%+v, %v), want spire/netherite", trim, hasTrim)
+	}
+	if inst := GetSlotGoatHornInstrument(sessionReloaded, hornSlot); inst != "minecraft:sing_goat_horn" {
+		t.Fatalf("reloaded GoatHornInstrument = %q, want minecraft:sing_goat_horn", inst)
+	}
+	if projs := GetSlotChargedProjectiles(sessionReloaded, crossbowSlot); len(projs) != 1 || projs[0].Stack.ResolvedID() != "minecraft:arrow" {
+		t.Fatalf("reloaded ChargedProjectiles = %+v, want [1x arrow]", projs)
+	}
+	if pot := GetSlotPotionType(sessionReloaded, potionSlot); pot != "minecraft:swiftness" {
+		t.Fatalf("reloaded PotionType = %q, want minecraft:swiftness", pot)
+	}
+}
+
+
 
 
 

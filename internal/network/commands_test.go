@@ -1367,4 +1367,138 @@ func TestIssue21ExecuteDataFunctionScheduleScoreboardAndDimensionPlayerData(t *t
 	}
 }
 
+func TestIssue30AllCommandsSelectorsPermissionsAndSuggestions(t *testing.T) {
+	cfg := server.DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	srv, err := server.NewWithCache(cfg, world.NewCache(256, world.GenerateFlat))
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	alice, err := srv.RegisterPlayer(server.Profile{Name: "Alice", UUID: [16]byte{30}}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Alice): %v", err)
+	}
+	bob, err := srv.RegisterPlayer(server.Profile{Name: "Bob", UUID: [16]byte{31}}, nil)
+	if err != nil {
+		t.Fatalf("RegisterPlayer(Bob): %v", err)
+	}
+	_ = srv.GrantOp(alice.Profile)
+	_ = srv.SetPlayerGameMode(alice, server.GameModeSurvival)
+	_ = srv.SetPlayerGameMode(bob, server.GameModeSurvival)
+	srv.SetPlayerTransform(alice, 0, 65, 0, 0, 0, true)
+	srv.SetPlayerTransform(bob, 4, 65, 4, 0, 0, true)
+
+	// 1. Operator levels & permissions: non-op (level 0) cannot run level-2/3/4 commands
+	if out := ExecuteCommand(srv, bob, "/give @s minecraft:diamond 1"); !strings.Contains(strings.ToLower(out), "permission") {
+		t.Fatalf("expected non-op Bob to be denied /give, got %q", out)
+	}
+	// Grant Bob op via Alice (level 4), then set Bob's op level to 2: Bob can run /give (level 2)
+	_ = ExecuteCommand(srv, alice, "/op Bob")
+	srv.SetOps([]server.OpEntry{
+		{Name: "Alice", Level: 4},
+		{Name: "Bob", Level: 2},
+	})
+	if out := ExecuteCommand(srv, bob, "/give @s minecraft:emerald 4"); !strings.Contains(out, "Gave 4") {
+		t.Fatalf("expected op-level-2 Bob to run /give, got %q", out)
+	}
+
+	// 2. Verify all 17 commands from Issue #30:
+	// /give, /summon, /fill, /clone, /tp, /effect, /enchant, /attribute,
+	// /loot, /place, /random, /tick, /time, /weather, /whitelist, /ban, /op
+	_ = ExecuteCommand(srv, alice, "/give @a[distance=..50,limit=2,sort=nearest] minecraft:diamond_sword 1")
+	if alice.InventorySlot(world.HotbarContainerOffset).ResolvedID() != "minecraft:diamond_sword" {
+		t.Fatalf("expected Alice slot 0 = diamond_sword, got %s", alice.InventorySlot(world.HotbarContainerOffset).ResolvedID())
+	}
+
+	_ = ExecuteCommand(srv, alice, "/enchant @s minecraft:sharpness 5")
+	if lvl := server.GetSlotItemMeta(alice, world.HotbarContainerOffset).EnchantmentLevel("minecraft:sharpness"); lvl != 5 {
+		t.Fatalf("expected sharpness 5 after /enchant, got %d", lvl)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/effect give @s minecraft:speed 30 1 true")
+	if !alice.HasPlayerEffect(server.EffectSpeed) {
+		t.Fatal("expected Speed effect after /effect give")
+	}
+
+	_ = ExecuteCommand(srv, alice, "/attribute @s minecraft:max_health base set 24")
+	if out := ExecuteCommand(srv, alice, "/attribute @s minecraft:max_health base get"); !strings.Contains(out, "24") {
+		t.Fatalf("expected /attribute base get to report 24, got %q", out)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/summon minecraft:zombie 12 65 12 {CustomName:\"Zed\"}")
+	zombies, err := ResolveTargets(srv, NewCommandContext(srv, alice), "@e[type=minecraft:zombie,distance=..30]")
+	if err != nil || len(zombies) == 0 {
+		t.Fatalf("expected @e[type=minecraft:zombie] to resolve summoned zombie, got len=%d err=%v", len(zombies), err)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/fill 0 70 0 2 70 2 minecraft:gold_block")
+	_ = ExecuteCommand(srv, alice, "/clone 0 70 0 2 70 2 10 70 10 replace force")
+	if got := world.BlockName(srv.Chunks().GetBlock(11, 70, 11)); got != "minecraft:gold_block" {
+		t.Fatalf("expected cloned block at (11,70,11) = minecraft:gold_block, got %s", got)
+	}
+
+	_ = ExecuteCommand(srv, alice, "/tp @s 15 66 15 90 0")
+	if snap := alice.Snapshot(); int(snap.X) != 15 || int(snap.Y) != 66 || int(snap.Z) != 15 {
+		t.Fatalf("expected Alice teleported to (15,66,15), got (%v,%v,%v)", snap.X, snap.Y, snap.Z)
+	}
+
+	if out := ExecuteCommand(srv, alice, "/loot give @s loot minecraft:chests/simple_dungeon"); !strings.Contains(out, "Dropped") && !strings.Contains(out, "Gave") {
+		t.Fatalf("unexpected /loot give output: %q", out)
+	}
+	if out := ExecuteCommand(srv, alice, "/place feature minecraft:oak 20 65 20"); !strings.Contains(out, "Placed") {
+		t.Fatalf("unexpected /place feature output: %q", out)
+	}
+	if out := ExecuteCommand(srv, alice, "/random value 1..6"); !strings.Contains(out, "Random value") {
+		t.Fatalf("unexpected /random value output: %q", out)
+	}
+	_ = ExecuteCommand(srv, alice, "/tick rate 20")
+	_ = ExecuteCommand(srv, alice, "/time set noon")
+	_ = ExecuteCommand(srv, alice, "/weather clear 6000")
+	_ = ExecuteCommand(srv, alice, "/whitelist add Bob")
+	if !srv.IsWhitelisted("Bob") {
+		t.Fatal("expected Bob whitelisted after /whitelist add Bob")
+	}
+	_ = ExecuteCommand(srv, alice, "/ban Griefer99 Griefing")
+	if _, banned := srv.IsPlayerBanned("Griefer99"); !banned {
+		t.Fatal("expected Griefer99 banned after /ban")
+	}
+
+	// 3. Command suggestions (ComputeCommandSuggestions) for Issue #30 commands
+	suggestionCases := []struct {
+		input string
+		want  string
+	}{
+		{"/summon minecraft:z", "minecraft:zombie"},
+		{"/fill ~ ~ ~ ~ ~ ~ minecraft:stone h", "hollow"},
+		{"/clone ~ ~ ~ ~ ~ ~ ~ ~ ~ m", "masked"},
+		{"/attribute Alice minecraft:m", "minecraft:max_health"},
+		{"/attribute Alice minecraft:max_health b", "base"},
+		{"/attribute Alice minecraft:max_health base s", "set"},
+		{"/advancement g", "grant"},
+		{"/enchant Alice minecraft:s", "minecraft:sharpness"},
+		{"/effect give Alice minecraft:s", "minecraft:speed"},
+		{"/loot g", "give"},
+		{"/place f", "feature"},
+		{"/random r", "roll"},
+		{"/tick f", "freeze"},
+		{"/time s", "set"},
+		{"/weather t", "thunder"},
+		{"/whitelist r", "reload"},
+	}
+	for _, tc := range suggestionCases {
+		_, _, got := ComputeCommandSuggestions(srv, alice, tc.input)
+		found := false
+		for _, s := range got {
+			if s == tc.want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("ComputeCommandSuggestions(%q) = %v, missing %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+
 
