@@ -2277,6 +2277,27 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						state = fgState
 					}
 				}
+				if world.IsStairsBlock(state) {
+					playerFacing := "north"
+					if h.session != nil {
+						playerFacing = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
+					}
+					state = cache.ResolveStairsPlacementAt(px, py, pz, state, playerFacing, server.BlockFaceDirectionName(face), float64(cursorY))
+				} else if world.IsSlabBlock(state) {
+					state, _ = cache.ResolveSlabPlacementAt(px, py, pz, state, server.BlockFaceDirectionName(face), float64(cursorY))
+				} else if world.IsFenceBlock(state) {
+					state = cache.ResolveFenceStateAt(px, py, pz, state)
+				} else if world.IsPaneOrBarsBlock(state) {
+					state = cache.ResolvePaneOrBarsStateAt(px, py, pz, state)
+				} else if world.IsWallBlock(state) {
+					state = cache.ResolveWallStateAt(px, py, pz, state)
+				} else if world.IsSkullOrHeadBlock(state) {
+					var yaw float32
+					if h.session != nil {
+						yaw = h.session.Snapshot().Yaw
+					}
+					state = cache.ResolveSkullPlacementAt(px, py, pz, state, server.BlockFaceDirectionName(face), yaw)
+				}
 				if server.IsRailBlockState(state) {
 					playerFacing := "south"
 					if h.session != nil {
@@ -2319,7 +2340,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 				if placed {
 					blockName := world.BlockName(state)
-					if world.IsWaterlogged(state) || blockName == "minecraft:soul_sand" || blockName == "minecraft:magma_block" {
+					if world.IsWaterlogged(state) || blockName == "minecraft:soul_sand" || blockName == "minecraft:magma_block" ||
+						world.IsStairsBlock(state) || world.IsFenceBlock(state) || world.IsPaneOrBarsBlock(state) ||
+						world.IsWallBlock(state) || world.IsFenceGateBlock(state) {
 						if nbRes := cache.UpdateNeighbors(px, py, pz); len(nbRes.Changes) > 0 || len(nbRes.LightChanged) > 0 {
 							h.broadcastBlockChanges(dim, cache, nbRes)
 						}

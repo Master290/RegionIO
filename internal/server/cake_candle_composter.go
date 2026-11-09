@@ -127,6 +127,10 @@ func (s *Server) InteractWithCakeCandleOrComposter(
 		act, _, handled := s.InteractWithComposter(session, normDim, x, y, z, hand)
 		return act, handled
 	}
+	if world.IsFlowerPotBlock(state) {
+		act, _, handled := s.InteractWithFlowerPot(session, normDim, x, y, z, hand)
+		return act, handled
+	}
 	return "", false
 }
 
@@ -400,3 +404,66 @@ func (s *Server) InteractWithComposter(
 		EncodeLevelEventPacket(LevelEventComposterFill, x, y, z, 0, false))
 	return "fill_fail", world.ItemStack{}, true
 }
+
+// InteractWithFlowerPot handles a player right-clicking `minecraft:flower_pot`
+// or any of the 38 `minecraft:potted_*` blocks at (x, y, z) in dim:
+//   - On an empty `minecraft:flower_pot` while holding a pottable plant/sapling/
+//     fungus/roots/mushroom/cactus/bamboo/azalea/fern/flower: plants the item,
+//     consumes 1 item in non-creative mode, increments `minecraft:pot_flower`,
+//     and emits `GameEventBlockChange` (`action = "plant"`).
+//   - On a `minecraft:potted_*` block when not holding another pottable item:
+//     extracts the plant back into the player's hand/inventory (or drops it in
+//     the world if full), reverts the block to `minecraft:flower_pot`, and emits
+//     `GameEventBlockChange` (`action = "extract"`).
+func (s *Server) InteractWithFlowerPot(
+	session *PlayerSession,
+	dim string,
+	x, y, z int,
+	hand int32,
+) (action string, extracted world.ItemStack, ok bool) {
+	if s == nil || session == nil || session.IsDead() {
+		return "", world.ItemStack{}, false
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.BindNoteBlockAndJukeboxRedstone(normDim)
+	if cache == nil {
+		return "", world.ItemStack{}, false
+	}
+	state := cache.GetBlock(x, y, z)
+	if !world.IsFlowerPotBlock(state) {
+		return "", world.ItemStack{}, false
+	}
+	slot, held := session.handSlotAndStack(hand)
+	heldID := ""
+	if !held.IsEmpty() {
+		heldID = held.ResolvedID()
+	}
+	_, planted, extractedItem, upd := cache.InteractFlowerPotAt(x, y, z, heldID)
+	if planted {
+		consumeOneHandItemOrDamageIgniter(s, session, slot, held, false)
+		s.RecordPotFlower(session)
+		s.broadcastDimensionBlockChanges(normDim, cache, upd.Changes, upd.LightChanged)
+		s.EmitGameEvent(normDim, GameEventBlockChange, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{Player: session})
+		return "plant", world.ItemStack{}, true
+	}
+	if extractedItem != "" {
+		plantStack := world.NewNamedItemStack(extractedItem, 1)
+		if held.IsEmpty() && slot >= 0 && slot < world.PlayerInventorySlots {
+			session.SetInventorySlot(slot, plantStack)
+			session.mu.Lock()
+			send := session.send
+			session.mu.Unlock()
+			if send != nil {
+				stID := session.NextContainerStateID()
+				_ = send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stID, slot, plantStack))
+			}
+		} else if rem, _ := session.AddItemToInventory(plantStack); rem > 0 {
+			_, _ = s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, plantStack)
+		}
+		s.broadcastDimensionBlockChanges(normDim, cache, upd.Changes, upd.LightChanged)
+		s.EmitGameEvent(normDim, GameEventBlockChange, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{Player: session})
+		return "extract", plantStack, true
+	}
+	return "", world.ItemStack{}, false
+}
+

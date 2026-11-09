@@ -231,3 +231,49 @@ func TestSculkShriekerWardenPresentSuppressionAndPlayerPlacedState(t *testing.T)
 	}
 	s.OnBreakSculkShriekerAt(dim, x, y, z, cache.GetBlock(x, y, z))
 }
+
+func TestFlowerPotServerInteractAndStat(t *testing.T) {
+	s, cache := newBeaconTestServer(t)
+	session := newBeaconTestPlayer(s, "PotTester", 50.5, 64.0, 50.5)
+
+	x, y, z := 50, 64, 50
+	cache.SetBlock(x, y-1, z, world.StateStone)
+	emptyPot, ok := world.BlockStateByName("minecraft:flower_pot", nil)
+	if !ok {
+		t.Fatal("missing minecraft:flower_pot")
+	}
+	cache.SetBlock(x, y, z, emptyPot)
+
+	// Hold 2 blue_orchid in hotbar slot 0 and plant 1 via InteractBlock.
+	session.SetSelectedSlot(0)
+	session.SetInventorySlot(world.HotbarContainerOffset, world.NewNamedItemStack("minecraft:blue_orchid", 2))
+
+	handled, _, err := s.InteractBlock(session, x, y, z)
+	if err != nil || !handled {
+		t.Fatalf("InteractBlock(flower_pot) = handled:%v err:%v", handled, err)
+	}
+	if got := world.BlockName(cache.GetBlock(x, y, z)); got != "minecraft:potted_blue_orchid" {
+		t.Fatalf("block after planting = %q, want minecraft:potted_blue_orchid", got)
+	}
+	if rem := session.InventorySlot(world.HotbarContainerOffset).Count; rem != 1 {
+		t.Fatalf("held blue_orchid count after planting = %d, want 1", rem)
+	}
+	if stat := s.GetPlayerStat(session, StatTypeCustom, StatPotFlower); stat != 1 {
+		t.Fatalf("StatPotFlower = %d, want 1", stat)
+	}
+
+	// Clear hand and right-click potted_blue_orchid to extract it back into hotbar slot 0.
+	session.SetInventorySlot(world.HotbarContainerOffset, world.ItemStack{})
+	handled, _, err = s.InteractBlock(session, x, y, z)
+	if err != nil || !handled {
+		t.Fatalf("InteractBlock(potted_blue_orchid) = handled:%v err:%v", handled, err)
+	}
+	if got := world.BlockName(cache.GetBlock(x, y, z)); got != "minecraft:flower_pot" {
+		t.Fatalf("block after extraction = %q, want minecraft:flower_pot", got)
+	}
+	gotSlot := session.InventorySlot(world.HotbarContainerOffset)
+	if gotSlot.ResolvedID() != "minecraft:blue_orchid" || gotSlot.Count != 1 {
+		t.Fatalf("extracted item in hand = %+v, want 1x minecraft:blue_orchid", gotSlot)
+	}
+}
+

@@ -2200,6 +2200,32 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 				return st
 			}
 		}
+		if world.IsStairsBlock(baseState) {
+			half := "bottom"
+			if faceName == "down" {
+				half = "top"
+			}
+			if st, ok := world.BlockStateIDByProperties(world.BlockName(baseState), map[string]string{
+				"facing":      horizLookDir,
+				"half":        half,
+				"shape":       "straight",
+				"waterlogged": "false",
+			}); ok {
+				return st
+			}
+		}
+		if world.IsSlabBlock(baseState) && faceName == "down" {
+			if st, ok := world.WithBlockProperty(baseState, "type", "top"); ok {
+				return st
+			}
+		}
+		if world.IsSkullOrHeadBlock(baseState) {
+			var cache *world.Cache
+			if s != nil && session != nil {
+				cache = s.PlayerChunks(session)
+			}
+			return cache.ResolveSkullPlacementAt(0, 0, 0, baseState, faceName, yaw)
+		}
 	}
 	return baseState
 }

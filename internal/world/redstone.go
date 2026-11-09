@@ -1676,6 +1676,14 @@ func (c *Cache) propagateRedstoneAround(x, y, z int, oldState, newState uint16, 
 			case info.Name == "minecraft:piston" || info.Name == "minecraft:sticky_piston":
 				pistonChanged := c.evaluatePistonRedstone(pos.X, pos.Y, pos.Z, st, info, res)
 				nextSeeds = append(nextSeeds, pistonChanged...)
+
+			case IsSkullOrHeadBlockName(info.Name):
+				wantPowered := boolToProp(c.IsBlockPowered(pos.X, pos.Y, pos.Z))
+				if info.Properties["powered"] != wantPowered {
+					if nextSt, ok := withStateProperty(st, "powered", wantPowered); ok {
+						c.setBlockRecorded(pos.X, pos.Y, pos.Z, nextSt, res)
+					}
+				}
 			}
 		}
 

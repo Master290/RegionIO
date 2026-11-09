@@ -1197,6 +1197,19 @@ func EvaluateBlockDrops(
 		return []ItemStack{NewNamedItemStack(name, 2)}
 	}
 
+	// Potted plants drop 1 flower_pot + 1 plant item:
+	if plantItem, isPotted := ItemForPottedBlock(state); isPotted {
+		return []ItemStack{
+			NewNamedItemStack("minecraft:flower_pot", 1),
+			NewNamedItemStack(plantItem, 1),
+		}
+	}
+
+	// Wall skulls/heads drop their standing skull/head item:
+	if skullItem, isSkull := SkullItemForBlock(state); isSkull {
+		return []ItemStack{NewNamedItemStack(skullItem, 1)}
+	}
+
 	// Multi-count stackable blocks (`candles`, `sea_pickle`, `pink_petals`, `wildflowers`, `leaf_litter`):
 	if strings.HasSuffix(name, "_candle") || name == "minecraft:candle" {
 		cnt, err := strconv.Atoi(info.Properties["candles"])

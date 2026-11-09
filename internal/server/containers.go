@@ -813,6 +813,18 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 			s.broadcastDimensionBlockChanges(world.NormalizeDimension(session.Dimension()), cache, res.Changes, res.LightChanged)
 		}
 		return ok, 0, nil
+	case world.IsFlowerPotBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		_, _, ok := s.InteractWithFlowerPot(session, session.Dimension(), x, y, z, 0)
+		return ok, 0, nil
+	case world.IsCakeBlock(state) || world.IsCandleCakeBlock(state) || world.IsCandleBlock(state) || blockName == "minecraft:composter":
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		_, ok := s.InteractWithCakeCandleOrComposter(session, session.Dimension(), x, y, z, 0)
+		return ok, 0, nil
 	default:
 		return false, 0, nil
 	}

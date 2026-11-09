@@ -499,8 +499,20 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 		}
 		return cur
 	}
-	if IsCopperBarsBlock(state) {
-		return c.ResolveCopperBarsStateAt(x, y, z, state)
+	if IsStairsBlock(state) {
+		return c.ResolveStairsStateAt(x, y, z, state)
+	}
+	if IsFenceBlock(state) {
+		return c.ResolveFenceStateAt(x, y, z, state)
+	}
+	if IsPaneOrBarsBlock(state) {
+		return c.ResolvePaneOrBarsStateAt(x, y, z, state)
+	}
+	if IsWallBlock(state) {
+		return c.ResolveWallStateAt(x, y, z, state)
+	}
+	if IsSkullOrHeadBlock(state) {
+		return c.ResolveSkullRedstoneStateAt(x, y, z, state)
 	}
 	if IsFenceGateBlock(state) {
 		state = c.ResolveFenceGateStateAt(x, y, z, state)
@@ -1047,8 +1059,20 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		return resolved, true
 	}
 
-	if IsCopperBarsBlock(state) {
-		return c.ResolveCopperBarsStateAt(x, y, z, state), true
+	if IsStairsBlock(state) {
+		return c.ResolveStairsStateAt(x, y, z, state), true
+	}
+
+	if IsFenceBlock(state) {
+		return c.ResolveFenceStateAt(x, y, z, state), true
+	}
+
+	if IsPaneOrBarsBlock(state) {
+		return c.ResolvePaneOrBarsStateAt(x, y, z, state), true
+	}
+
+	if IsWallBlock(state) {
+		return c.ResolveWallStateAt(x, y, z, state), true
 	}
 
 	if IsFenceGateBlock(state) {

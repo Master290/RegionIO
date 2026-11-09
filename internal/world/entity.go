@@ -173,6 +173,9 @@ func IsInstantBreakBlock(state uint16) bool {
 	if !ok || st.Name == "" {
 		return false
 	}
+	if strings.HasPrefix(st.Name, "minecraft:potted_") || st.Name == "minecraft:flower_pot" {
+		return true
+	}
 	for _, suffix := range []string{"_sapling", "_flower", "_tulip", "_mushroom", "_torch"} {
 		if strings.HasSuffix(st.Name, suffix) {
 			return true
