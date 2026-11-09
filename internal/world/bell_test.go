@@ -68,6 +68,124 @@ func TestBellAttachmentSurvivalAndDoubleWallTransition(t *testing.T) {
 	}
 }
 
+func TestBellStatesAndChunkBlockEntityRegistration(t *testing.T) {
+	seen := make(map[uint16]bool)
+	for _, att := range []string{BellAttachFloor, BellAttachCeiling, BellAttachSingleWall, BellAttachDoubleWall} {
+		for _, dir := range []string{"north", "south", "west", "east"} {
+			for _, pow := range []bool{false, true} {
+				st := BellBlockState(att, dir, pow)
+				if st == StateAir || !IsBellBlock(st) {
+					t.Fatalf("invalid bell state for att=%s dir=%s pow=%v: %d", att, dir, pow, st)
+				}
+				seen[st] = true
+			}
+		}
+	}
+	if len(seen) != 32 {
+		t.Fatalf("expected 32 distinct minecraft:bell states, got %d", len(seen))
+	}
+
+	c := NewCache(-1, GenerateFlat)
+	c.SetBlockWithLight(4, 64, 4, BellBlockState(BellAttachFloor, "north", false))
+	be, ok := c.BlockEntityAt(4, 64, 4)
+	if !ok || be.ID != "minecraft:bell" {
+		t.Fatalf("expected SetBlockWithLight on bell to register minecraft:bell block entity, got ok=%v be=%+v", ok, be)
+	}
+	c.SetBlockWithLight(4, 64, 4, StateAir)
+	if _, ok := c.BlockEntityAt(4, 64, 4); ok {
+		t.Fatalf("expected breaking bell to remove minecraft:bell block entity from chunk")
+	}
+}
+
+func TestRespawnAnchorStatesLightComparatorAndWaterCheck(t *testing.T) {
+	wantScale := [5]int{0, 3, 7, 11, 15}
+	seen := make(map[uint16]bool)
+	for charges := 0; charges <= 4; charges++ {
+		st := RespawnAnchorBlockState(charges)
+		if st == StateAir || !IsRespawnAnchorBlock(st) {
+			t.Fatalf("expected valid respawn_anchor state for charges=%d, got %d", charges, st)
+		}
+		seen[st] = true
+		if got := RespawnAnchorCharges(st); got != charges {
+			t.Fatalf("RespawnAnchorCharges(charges=%d) = %d", charges, got)
+		}
+		if scale := RespawnAnchorScaledChargeLevel(st, 15); scale != wantScale[charges] {
+			t.Fatalf("RespawnAnchorScaledChargeLevel(charges=%d, 15) = %d, want %d", charges, scale, wantScale[charges])
+		}
+		if light := RespawnAnchorLightEmission(charges); int(light) != wantScale[charges] {
+			t.Fatalf("RespawnAnchorLightEmission(%d) = %d, want %d", charges, light, wantScale[charges])
+		}
+		if runtimeLight := LightEmission(st); int(runtimeLight) != wantScale[charges] {
+			t.Fatalf("LightEmission(respawn_anchor[charges=%d]) = %d, want %d", charges, runtimeLight, wantScale[charges])
+		}
+	}
+	if len(seen) != 5 {
+		t.Fatalf("expected 5 distinct minecraft:respawn_anchor states, got %d", len(seen))
+	}
+
+	c := NewCache(-1, GenerateFlat)
+	c.SetBlock(10, 64, 10, RespawnAnchorBlockState(4))
+	if c.IsRespawnAnchorExplosionInWater(10, 64, 10) {
+		t.Fatalf("expected dry respawn anchor not to be in water")
+	}
+
+	// Horizontal water source at (11, 64, 10) -> inWater = true.
+	c.SetBlock(11, 64, 10, StateWater)
+	if !c.IsRespawnAnchorExplosionInWater(10, 64, 10) {
+		t.Fatalf("expected horizontal water source neighbor to mark respawn anchor explosion in water")
+	}
+	c.SetBlock(11, 64, 10, StateAir)
+
+	// Flowing water level 7 (amount 1 < 2) at (11, 64, 10) -> inWater = false.
+	c.SetBlock(11, 64, 10, WaterBlockState(7))
+	if c.IsRespawnAnchorExplosionInWater(10, 64, 10) {
+		t.Fatalf("expected flowing water level 7 (amount 1) not to flow into respawn anchor")
+	}
+
+	// Flowing water level 7 above at (10, 65, 10) -> inWater = true (any water above).
+	c.SetBlock(11, 64, 10, StateAir)
+	c.SetBlock(10, 65, 10, WaterBlockState(7))
+	if !c.IsRespawnAnchorExplosionInWater(10, 64, 10) {
+		t.Fatalf("expected any water fluid at y+1 to mark respawn anchor explosion in water")
+	}
+}
+
+func TestLodestoneBlockStateAndTrackerNBTTick(t *testing.T) {
+	st := LodestoneBlockState()
+	if st == StateAir || !IsLodestoneBlock(st) {
+		t.Fatalf("expected valid minecraft:lodestone state, got %d", st)
+	}
+
+	c := NewCache(-1, GenerateFlat)
+	c.SetBlock(20, 70, 30, st)
+
+	lt := NewLodestoneTracker(DimensionOverworld, 20, 70, 30, true)
+	nbtComp := lt.ToNBT()
+	decoded, ok := LodestoneTrackerFromNBT(nbtComp)
+	if !ok || decoded != lt {
+		t.Fatalf("LodestoneTracker NBT roundtrip mismatch: got (%+v, %v), want %+v", decoded, ok, lt)
+	}
+
+	// While lodestone block exists, Tick keeps HasTarget=true.
+	ticked, changed := lt.Tick(DimensionOverworld, c)
+	if changed || !ticked.HasTarget {
+		t.Fatalf("expected LodestoneTracker.Tick with intact lodestone to remain unchanged, got (%+v, %v)", ticked, changed)
+	}
+
+	// Untracked tracker does not clear target when lodestone is broken.
+	c.SetBlock(20, 70, 30, StateAir)
+	untracked := NewLodestoneTracker(DimensionOverworld, 20, 70, 30, false)
+	if afterUntracked, ch := untracked.Tick(DimensionOverworld, c); ch || !afterUntracked.HasTarget {
+		t.Fatalf("expected untracked LodestoneTracker to keep target when lodestone is missing, got (%+v, %v)", afterUntracked, ch)
+	}
+
+	// Tracked tracker clears target when lodestone is broken in same dimension.
+	afterTracked, ch := lt.Tick(DimensionOverworld, c)
+	if !ch || afterTracked.HasTarget {
+		t.Fatalf("expected tracked LodestoneTracker to clear target when lodestone is broken, got (%+v, %v)", afterTracked, ch)
+	}
+}
+
 func TestBellDirectionHitRulesAndRedstoneRisingEdge(t *testing.T) {
 	// 1. Floor bell facing north rings along north/south, not east/west.
 	floorNorth := BellBlockState(BellAttachFloor, "north", false)

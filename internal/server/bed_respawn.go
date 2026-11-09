@@ -756,6 +756,18 @@ func RespawnAnchorState(charges int) (uint16, bool) {
 	})
 }
 
+// RespawnAnchorScaledChargeLevel returns floor(charges / 4.0 * scale) matching
+// vanilla 26.1.2 RespawnAnchorBlock.getScaledChargeLevel(state, scale).
+func RespawnAnchorScaledChargeLevel(state uint16, scale int) int {
+	return world.RespawnAnchorScaledChargeLevel(state, scale)
+}
+
+// RespawnAnchorLightEmission returns the runtime block light emission (0, 3, 7, 11, 15)
+// for a minecraft:respawn_anchor with the given charge count (0..4).
+func RespawnAnchorLightEmission(charges int) int {
+	return int(world.RespawnAnchorLightEmission(charges))
+}
+
 // IsGlowstoneItem reports whether stack is a minecraft:glowstone block item.
 func IsGlowstoneItem(stack world.ItemStack) bool {
 	return !stack.IsEmpty() && stack.ResolvedID() == "minecraft:glowstone"
@@ -793,6 +805,10 @@ func (s *Server) ChargeRespawnAnchor(session *PlayerSession, dim string, x, y, z
 	s.broadcastDimensionBlockChanges(dim, cache, []world.BlockChange{
 		{Pos: world.BlockPos{X: x, Y: y, Z: z}, OldState: state, NewState: nextState},
 	}, lightChunks)
+	if compRes := cache.UpdateComparatorsAround(x, y, z); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
+		s.broadcastDimensionBlockChanges(dim, cache, compRes.Changes, compRes.LightChanged)
+	}
+	s.EmitPlayerBlockVibration(session, GameEventBlockChange, dim, x, y, z, "minecraft:respawn_anchor")
 
 	cx := int32(x >> 4)
 	cz := int32(z >> 4)
@@ -812,7 +828,8 @@ func (s *Server) ChargeRespawnAnchor(session *PlayerSession, dim string, x, y, z
 //   - Otherwise, if charges == 0: returns false (no interaction).
 //   - Otherwise (charges > 0): in dimensions where RespawnAnchorWorks is true
 //     (the Nether), sets the player's respawn point to (x, y, z); outside the
-//     Nether, removes the anchor and triggers a 5.0-power explosion.
+//     Nether, removes the anchor and triggers a 5.0-power explosion (damped when
+//     adjacent to flowing/source water or water above).
 func (s *Server) InteractRespawnAnchor(session *PlayerSession, x, y, z int) bool {
 	if s == nil || session == nil || session.IsDead() {
 		return false
@@ -857,19 +874,20 @@ func (s *Server) InteractRespawnAnchor(session *PlayerSession, x, y, z int) bool
 		s.SetPlayerDimensionSpawnPoint(session, dim, int32(x), int32(y), int32(z), snap.Yaw, snap.Pitch, false)
 		if spawnChanged {
 			_ = s.SendSystemChat(session, MsgRespawnPointSet)
+			cx := int32(x >> 4)
+			cz := int32(z >> 4)
+			s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket("minecraft:block.respawn_anchor.set_spawn", SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
 		}
-		cx := int32(x >> 4)
-		cz := int32(z >> 4)
-		s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
-			EncodeSoundPacket("minecraft:block.respawn_anchor.set_spawn", SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 1.0, 1.0, 0))
 		return true
 	}
 
-	// Explode when used outside the Nether.
+	// Explode when used outside the Nether (water-damped if surrounded/covered by water).
+	inWater := cache.IsRespawnAnchorExplosionInWater(x, y, z)
 	if broken, upd := cache.BreakBlockWithUpdates(x, y, z); broken {
 		s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
 	}
-	s.TriggerRespawnPointExplosion(session, dim, x, y, z)
+	s.TriggerRespawnPointExplosionInWater(session, dim, x, y, z, inWater)
 	return true
 }
 
@@ -877,6 +895,14 @@ func (s *Server) InteractRespawnAnchor(session *PlayerSession, x, y, z int) bool
 // in dim (caused by using a bed in Nether/End or a respawn anchor outside the Nether),
 // destroying nearby fragile blocks and damaging nearby players with cause "bad_respawn_point".
 func (s *Server) TriggerRespawnPointExplosion(activator *PlayerSession, dim string, bx, by, bz int) (playersDamaged, blocksDestroyed int) {
+	return s.TriggerRespawnPointExplosionInWater(activator, dim, bx, by, bz, false)
+}
+
+// TriggerRespawnPointExplosionInWater triggers a 5.0-power respawn-point explosion at
+// (bx+0.5, by+0.5, bz+0.5) in dim. When inWater is true (matching RespawnAnchorBlock$1
+// water-damped blast resistance), surrounding blocks are not destroyed while entity
+// explosion damage still occurs.
+func (s *Server) TriggerRespawnPointExplosionInWater(activator *PlayerSession, dim string, bx, by, bz int, inWater bool) (playersDamaged, blocksDestroyed int) {
 	if s == nil {
 		return 0, 0
 	}
@@ -899,8 +925,8 @@ func (s *Server) TriggerRespawnPointExplosion(activator *PlayerSession, dim stri
 		Player:    activator,
 	})
 
-	// 1. Destroy nearby fragile blocks within radius 3 in dim.
-	if cache := s.DimensionChunks(dim); cache != nil && s.CreeperBlockGriefing() {
+	// 1. Destroy nearby fragile blocks within radius 3 in dim (unless damped by water).
+	if cache := s.DimensionChunks(dim); cache != nil && !inWater && s.CreeperBlockGriefing() {
 		dt, _ := world.LookupDimensionType(dim)
 		minY := dt.MinY + 1
 		maxY := dt.MinY + dt.Height - 1
@@ -937,6 +963,9 @@ func (s *Server) TriggerRespawnPointExplosion(activator *PlayerSession, dim stri
 					if valid, lc := cache.SetBlockWithLight(tx, ty, tz, world.StateAir); valid {
 						blocksDestroyed++
 						s.OnWorkstationBlockBroken(dim, tx, ty, tz)
+						if world.IsLodestoneBlock(st) {
+							s.OnLodestoneBlockBroken(dim, tx, ty, tz)
+						}
 						changes = append(changes, world.BlockChange{
 							Pos:      world.BlockPos{X: tx, Y: ty, Z: tz},
 							OldState: st,
@@ -1194,6 +1223,9 @@ func (s *Server) ResolvePlayerRespawn(session *PlayerSession) (dim string, x, y,
 							s.broadcastDimensionBlockChanges(spawnDim, cache, []world.BlockChange{
 								{Pos: world.BlockPos{X: sx, Y: sy, Z: sz}, OldState: state, NewState: nextState},
 							}, lc)
+							if compRes := cache.UpdateComparatorsAround(sx, sy, sz); len(compRes.Changes) > 0 || len(compRes.LightChanged) > 0 {
+								s.broadcastDimensionBlockChanges(spawnDim, cache, compRes.Changes, compRes.LightChanged)
+							}
 						}
 					}
 					cx := int32(sx >> 4)

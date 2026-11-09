@@ -653,6 +653,7 @@ func (s *Server) ChunkBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Co
 	out = append(out, s.ChunkConduitBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkSculkBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkCopperBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkBellBlockEntitiesNBT(dim, cx, cz)...)
 	return out
 }
 
@@ -681,6 +682,7 @@ func (s *Server) UnloadChunkBlockEntities(dimension string, cx, cz int32) []*nbt
 	out = append(out, s.UnloadChunkConduits(dim, cx, cz)...)
 	out = append(out, s.UnloadChunkSculk(dim, cx, cz)...)
 	out = append(out, s.UnloadChunkCopperBlockEntities(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkBells(dim, cx, cz)...)
 	return out
 }
 
@@ -716,6 +718,7 @@ func (s *Server) LoadChunkBlockEntitiesNBT(dimension string, list nbt.List) {
 	s.LoadChunkJukeboxBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkSculkBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkCopperBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkBellBlockEntitiesNBT(dim, compounds)
 }
 
 // ExportChunkRedstoneRuntimeNBT exports scheduled block/fluid ticks, piston
@@ -1195,6 +1198,30 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 			}
 		}
 	}
+	if d.SlotLodestoneTrackers != nil {
+		for _, elem := range d.SlotLodestoneTrackers.Elems {
+			comp, ok := elem.(*nbt.Compound)
+			if !ok || comp == nil {
+				continue
+			}
+			slotTag, ok1 := comp.Get("Slot")
+			ltTag, ok2 := comp.Get("LodestoneTracker")
+			if !ok1 || !ok2 {
+				continue
+			}
+			sb, ok1 := slotTag.(nbt.Byte)
+			lc, ok2 := ltTag.(*nbt.Compound)
+			if !ok1 || !ok2 || lc == nil {
+				continue
+			}
+			slot := int(uint8(sb))
+			if slot >= 0 && slot < world.PlayerInventorySlots {
+				if lt, ok := ReadLodestoneTrackerNBT(lc); ok {
+					SetSlotLodestoneTracker(session, slot, lt)
+				}
+			}
+		}
+	}
 	if d.SlotItemMetas != nil {
 		for _, elem := range d.SlotItemMetas.Elems {
 			comp, ok := elem.(*nbt.Compound)
@@ -1399,6 +1426,8 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	var fwElems []nbt.Tag
 	var slotFireworkStars *nbt.List
 	var starElems []nbt.Tag
+	var slotLodestoneTrackers *nbt.List
+	var lodestoneElems []nbt.Tag
 	var slotItemMetas *nbt.List
 	var itemMetaElems []nbt.Tag
 	for slot := 0; slot < world.PlayerInventorySlots; slot++ {
@@ -1439,6 +1468,16 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 						Set("Slot", nbt.Byte(int8(slot))).
 						Set("Explosion", ec)
 					starElems = append(starElems, entry)
+				}
+			}
+		}
+		if IsCompassItem(st) {
+			if lt, ok := GetSlotLodestoneTracker(session, slot); ok {
+				if lc := WriteLodestoneTrackerNBT(lt); lc != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slot))).
+						Set("LodestoneTracker", lc)
+					lodestoneElems = append(lodestoneElems, entry)
 				}
 			}
 		}
@@ -1487,6 +1526,12 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		slotFireworkStars = &nbt.List{
 			ElemID: nbt.TagCompound,
 			Elems:  starElems,
+		}
+	}
+	if len(lodestoneElems) > 0 {
+		slotLodestoneTrackers = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  lodestoneElems,
 		}
 	}
 	if len(itemMetaElems) > 0 {
@@ -1539,9 +1584,10 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		SlotPotions:        slotPotions,
 		SlotMaps:           slotMaps,
 		SlotArmorTrims:     slotArmorTrims,
-		SlotFireworks:      slotFireworks,
-		SlotFireworkStars:  slotFireworkStars,
-		SlotItemMetas:      slotItemMetas,
+		SlotFireworks:         slotFireworks,
+		SlotFireworkStars:     slotFireworkStars,
+		SlotLodestoneTrackers: slotLodestoneTrackers,
+		SlotItemMetas:         slotItemMetas,
 		Abilities:          &abilities,
 		WardenSpawnTracker: wstComp,
 		PortalCooldown:     portalCooldown,
@@ -1569,6 +1615,9 @@ func (session *PlayerSession) SetInventorySlot(slot int, stack world.ItemStack) 
 	session.mu.Lock()
 	session.inventory[slot] = stack
 	session.mu.Unlock()
+	if stack.IsEmpty() || !IsCompassItem(stack) {
+		ClearSlotLodestoneTracker(session, slot)
+	}
 	return true
 }
 

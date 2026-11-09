@@ -293,13 +293,14 @@ type PlayerData struct {
 	SlotPotions        *nbt.List
 	SlotMaps           *nbt.List
 	SlotArmorTrims     *nbt.List
-	SlotFireworks      *nbt.List
-	SlotFireworkStars  *nbt.List
-	SlotItemMetas      *nbt.List
-	Abilities          *PlayerAbilities
-	WardenSpawnTracker *nbt.Compound
-	PortalCooldown     int32
-	SeenCredits        bool
+	SlotFireworks         *nbt.List
+	SlotFireworkStars     *nbt.List
+	SlotLodestoneTrackers *nbt.List
+	SlotItemMetas         *nbt.List
+	Abilities             *PlayerAbilities
+	WardenSpawnTracker    *nbt.Compound
+	PortalCooldown        int32
+	SeenCredits           bool
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -418,7 +419,21 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 			}
 		}
 	}
-
+	var lodestoneBySlot map[int]*nbt.Compound
+	if d.SlotLodestoneTrackers != nil && len(d.SlotLodestoneTrackers.Elems) > 0 {
+		lodestoneBySlot = make(map[int]*nbt.Compound, len(d.SlotLodestoneTrackers.Elems))
+		for _, el := range d.SlotLodestoneTrackers.Elems {
+			ec, ok := el.(*nbt.Compound)
+			if !ok || ec == nil {
+				continue
+			}
+			sb, okS := nbtGetByte(ec, "Slot")
+			lc, okL := nbtGetCompound(ec, "LodestoneTracker")
+			if okS && okL && lc != nil {
+				lodestoneBySlot[int(uint8(sb))] = lc
+			}
+		}
+	}
 	var metaBySlot map[int]*nbt.Compound
 	if d.SlotItemMetas != nil && len(d.SlotItemMetas.Elems) > 0 {
 		metaBySlot = make(map[int]*nbt.Compound, len(d.SlotItemMetas.Elems))
@@ -465,6 +480,12 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 				comps = nbt.NewCompound()
 			}
 			comps.Set("minecraft:firework_explosion", sc)
+		}
+		if lc := lodestoneBySlot[slot]; lc != nil {
+			if comps == nil {
+				comps = nbt.NewCompound()
+			}
+			comps.Set("minecraft:lodestone_tracker", lc)
 		}
 		if mc := metaBySlot[slot]; mc != nil {
 			if dmg, ok := nbtGetInt(mc, "Damage"); ok && dmg > 0 {
@@ -558,6 +579,9 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	}
 	if d.SlotFireworkStars != nil && len(d.SlotFireworkStars.Elems) > 0 {
 		root.Set("SlotFireworkStars", *d.SlotFireworkStars)
+	}
+	if d.SlotLodestoneTrackers != nil && len(d.SlotLodestoneTrackers.Elems) > 0 {
+		root.Set("SlotLodestoneTrackers", *d.SlotLodestoneTrackers)
 	}
 	if d.SlotItemMetas != nil && len(d.SlotItemMetas.Elems) > 0 {
 		root.Set("SlotItemMetas", *d.SlotItemMetas)
@@ -794,6 +818,7 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	var invTrimElems []nbt.Tag
 	var invFwElems []nbt.Tag
 	var invStarElems []nbt.Tag
+	var invLodestoneElems []nbt.Tag
 	var invMetaElems []nbt.Tag
 	if invList, ok := nbtGetList(root, "Inventory"); ok {
 		for _, elem := range invList.Elems {
@@ -864,6 +889,12 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 						Set("Slot", nbt.Byte(int8(slotIdx))).
 						Set("Explosion", sc)
 					invStarElems = append(invStarElems, entry)
+				}
+				if lc, ok := nbtGetCompound(comps, "minecraft:lodestone_tracker"); ok && lc != nil {
+					entry := nbt.NewCompound().
+						Set("Slot", nbt.Byte(int8(slotIdx))).
+						Set("LodestoneTracker", lc)
+					invLodestoneElems = append(invLodestoneElems, entry)
 				}
 				var metaEntry *nbt.Compound
 				ensureMetaEntry := func() *nbt.Compound {
@@ -995,6 +1026,15 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 		d.SlotFireworkStars = &nbt.List{
 			ElemID: nbt.TagCompound,
 			Elems:  invStarElems,
+		}
+	}
+	if slt, ok := nbtGetList(root, "SlotLodestoneTrackers"); ok && slt != nil {
+		cp := *slt
+		d.SlotLodestoneTrackers = &cp
+	} else if len(invLodestoneElems) > 0 {
+		d.SlotLodestoneTrackers = &nbt.List{
+			ElemID: nbt.TagCompound,
+			Elems:  invLodestoneElems,
 		}
 	}
 	if sim, ok := nbtGetList(root, "SlotItemMetas"); ok && sim != nil {

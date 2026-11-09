@@ -358,6 +358,12 @@ func (s *Server) DetonateExplosion(opts ExplosionOptions) ExplosionResult {
 			}
 
 			s.OnWorkstationBlockBroken(dim, pos.X, pos.Y, pos.Z)
+			if world.IsLodestoneBlock(st) {
+				s.OnLodestoneBlockBroken(dim, pos.X, pos.Y, pos.Z)
+			}
+			if world.IsBellBlock(st) {
+				s.RemoveBellBlockEntityAt(dim, pos.X, pos.Y, pos.Z)
+			}
 			if ok, upd := cache.BreakBlockWithUpdates(pos.X, pos.Y, pos.Z); ok {
 				result.DestroyedBlocks = append(result.DestroyedBlocks, pos)
 				appendUpdate(upd)

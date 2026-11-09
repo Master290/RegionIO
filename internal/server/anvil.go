@@ -597,9 +597,7 @@ func (s *Server) OpenAnvil(session *PlayerSession, x, y, z int) (int32, error) {
 	metaTr := getItemMetaTracker(session)
 	metaTr.mu.Lock()
 	metaTr.combinerMeta = [2]ItemMeta{}
-	metaTr.combinerTrim = [2]ArmorTrim{}
 	metaTr.resultMeta = ItemMeta{}
-	metaTr.resultTrim = ArmorTrim{}
 	metaTr.mu.Unlock()
 
 	tr := getContainerTracker(session)
@@ -613,13 +611,19 @@ func (s *Server) OpenAnvil(session *PlayerSession, x, y, z int) (int32, error) {
 		BlockY:      y,
 		BlockZ:      z,
 	}
+	carried := tr.carried
 	tr.mu.Unlock()
 
 	if session.send != nil {
 		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeAnvil, "Repair & Name")); err != nil {
 			return cid, err
 		}
-		if err := s.syncOpenContainer(session); err != nil {
+		slots := s.buildCombinerMenuSlots(session, [2]world.ItemStack{}, world.ItemStack{})
+		stateID := session.NextContainerStateID()
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+			return cid, err
+		}
+		if err := session.send(protocol.PlayContainerSetData, EncodeContainerSetData(cid, AnvilDataLevelCost, 0)); err != nil {
 			return cid, err
 		}
 	}
@@ -677,27 +681,6 @@ func buildCombinerMenuMetas(session *PlayerSession) []ItemMeta {
 	return metas
 }
 
-func buildCombinerMenuTrims(session *PlayerSession) []ArmorTrim {
-	trims := make([]ArmorTrim, AnvilMenuSlotCount)
-	metaTr := getItemMetaTracker(session)
-	metaTr.mu.Lock()
-	trims[0] = metaTr.combinerTrim[0]
-	trims[1] = metaTr.combinerTrim[1]
-	trims[2] = metaTr.resultTrim
-	metaTr.mu.Unlock()
-	for i := 0; i < 27; i++ {
-		if t, ok := GetSlotArmorTrim(session, 9+i); ok {
-			trims[3+i] = t
-		}
-	}
-	for i := 0; i < 9; i++ {
-		if t, ok := GetSlotArmorTrim(session, 36+i); ok {
-			trims[30+i] = t
-		}
-	}
-	return trims
-}
-
 func writeBackCombinerMenuMetas(session *PlayerSession, slots []world.ItemStack, metas []ItemMeta) {
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[3+i])
@@ -736,38 +719,6 @@ func writeBackCombinerMenuMetas(session *PlayerSession, slots []world.ItemStack,
 	metaTr.mu.Unlock()
 }
 
-func writeBackCombinerMenuTrims(session *PlayerSession, slots []world.ItemStack, trims []ArmorTrim) {
-	metaTr := getItemMetaTracker(session)
-	metaTr.mu.Lock()
-	for i := 0; i < 2; i++ {
-		if slots[i].IsEmpty() {
-			metaTr.combinerTrim[i] = ArmorTrim{}
-		} else {
-			metaTr.combinerTrim[i] = trims[i]
-		}
-	}
-	if slots[2].IsEmpty() {
-		metaTr.resultTrim = ArmorTrim{}
-	} else {
-		metaTr.resultTrim = trims[2]
-	}
-	metaTr.mu.Unlock()
-	for i := 0; i < 27; i++ {
-		if slots[3+i].IsEmpty() {
-			ClearSlotArmorTrim(session, 9+i)
-		} else {
-			SetSlotArmorTrim(session, 9+i, trims[3+i])
-		}
-	}
-	for i := 0; i < 9; i++ {
-		if slots[30+i].IsEmpty() {
-			ClearSlotArmorTrim(session, 36+i)
-		} else {
-			SetSlotArmorTrim(session, 36+i, trims[30+i])
-		}
-	}
-}
-
 func (s *Server) recomputeAnvilStateLocked(session *PlayerSession, tr *playerContainerTracker) AnvilResult {
 	if tr == nil || tr.open == nil || tr.open.MenuType != MenuTypeAnvil {
 		return AnvilResult{}
@@ -776,7 +727,6 @@ func (s *Server) recomputeAnvilStateLocked(session *PlayerSession, tr *playerCon
 	metaTr.mu.Lock()
 	leftMeta := metaTr.combinerMeta[0].Clone()
 	rightMeta := metaTr.combinerMeta[1].Clone()
-	leftTrim := metaTr.combinerTrim[0]
 	metaTr.mu.Unlock()
 
 	creative := session.Snapshot().GameMode == GameModeCreative
@@ -793,11 +743,6 @@ func (s *Server) recomputeAnvilStateLocked(session *PlayerSession, tr *playerCon
 
 	metaTr.mu.Lock()
 	metaTr.resultMeta = res.OutputMeta.Clone()
-	if res.Output.IsEmpty() {
-		metaTr.resultTrim = ArmorTrim{}
-	} else {
-		metaTr.resultTrim = leftTrim
-	}
 	metaTr.mu.Unlock()
 	return res
 }
@@ -809,8 +754,6 @@ func (s *Server) applyAnvilClickLocked(session *PlayerSession, tr *playerContain
 	curRes := s.recomputeAnvilStateLocked(session, tr)
 	slots := s.buildCombinerMenuSlots(session, tr.open.CombinerInputs, tr.open.Result)
 	metas := buildCombinerMenuMetas(session)
-	trims := buildCombinerMenuTrims(session)
-	resTrim := trims[2]
 
 	if slot == AnvilSlotResult {
 		if curRes.Output.IsEmpty() || curRes.LevelCost <= 0 {
@@ -827,15 +770,13 @@ func (s *Server) applyAnvilClickLocked(session *PlayerSession, tr *playerContain
 			if tr.carried.IsEmpty() {
 				tr.carried = curRes.Output
 				SetCarriedItemMeta(session, curRes.OutputMeta)
-				SetCarriedArmorTrim(session, resTrim)
 				canTake = true
 			}
 		case ContainerInputQuickMove:
-			rem, remMeta, remTrim := mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, curRes.Output, curRes.OutputMeta, resTrim, 30, 39)
-			rem, remMeta, remTrim = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, rem, remMeta, remTrim, 3, 30)
+			rem, remMeta := mergeIntoSlotSliceWithMeta(slots, metas, curRes.Output, curRes.OutputMeta, 30, 39)
+			rem, remMeta = mergeIntoSlotSliceWithMeta(slots, metas, rem, remMeta, 3, 30)
 			if rem.IsEmpty() {
 				_ = remMeta
-				_ = remTrim
 				canTake = true
 			}
 		}
@@ -846,32 +787,28 @@ func (s *Server) applyAnvilClickLocked(session *PlayerSession, tr *playerContain
 		// Consume left input and required right input count.
 		slots[0] = world.ItemStack{}
 		metas[0] = ItemMeta{}
-		trims[0] = ArmorTrim{}
 		if !slots[1].IsEmpty() {
 			if curRes.RepairItemCountCost > 0 && slots[1].Count > curRes.RepairItemCountCost {
 				slots[1] = world.NewItemStack(slots[1].ResolvedItemID(), slots[1].Count-curRes.RepairItemCountCost)
 			} else {
 				slots[1] = world.ItemStack{}
 				metas[1] = ItemMeta{}
-				trims[1] = ArmorTrim{}
 			}
 		}
 		slots[2] = world.ItemStack{}
 		metas[2] = ItemMeta{}
-		trims[2] = ArmorTrim{}
 		tr.open.AnvilRename = ""
 		tookResult = true
 		if !creative {
 			costPaid = curRes.LevelCost
 		}
 	} else {
-		applyCombinerNonResultClick(session, tr, slots, metas, trims, slot, button, mode)
+		applyCombinerNonResultClick(session, tr, slots, metas, slot, button, mode)
 	}
 
 	tr.open.CombinerInputs[0] = slots[0]
 	tr.open.CombinerInputs[1] = slots[1]
 	writeBackCombinerMenuMetas(session, slots, metas)
-	writeBackCombinerMenuTrims(session, slots, trims)
 	s.recomputeAnvilStateLocked(session, tr)
 	return tookResult, costPaid, anvilBroke
 }
@@ -881,7 +818,6 @@ func applyCombinerNonResultClick(
 	tr *playerContainerTracker,
 	slots []world.ItemStack,
 	metas []ItemMeta,
-	trims []ArmorTrim,
 	slot int,
 	button int8,
 	mode int32,
@@ -889,25 +825,20 @@ func applyCombinerNonResultClick(
 	switch mode {
 	case ContainerInputPickup:
 		carriedMeta := GetCarriedItemMeta(session)
-		carriedTrim, _ := GetCarriedArmorTrim(session)
-		slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim = applyPickupSlotWithMetaAndTrim(
-			slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim, button,
-		)
+		slots[slot], metas[slot], tr.carried, carriedMeta = applyPickupSlotWithMeta(slots[slot], metas[slot], tr.carried, carriedMeta, button)
 		SetCarriedItemMeta(session, carriedMeta)
-		SetCarriedArmorTrim(session, carriedTrim)
 	case ContainerInputQuickMove:
 		if slot < 2 {
-			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 30, 39)
-			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 3, 30)
+			slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 30, 39)
+			slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 3, 30)
 		} else if slot >= 3 {
-			slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 0, 2)
+			slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 0, 2)
 		}
 	case ContainerInputSwap:
 		if button >= 0 && button < 9 {
 			hotbarIdx := 30 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 			metas[slot], metas[hotbarIdx] = metas[hotbarIdx], metas[slot]
-			trims[slot], trims[hotbarIdx] = trims[hotbarIdx], trims[slot]
 		}
 	}
 }

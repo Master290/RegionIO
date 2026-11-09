@@ -169,6 +169,7 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 		SetCarriedWrittenBook(session, WrittenBookContent{}, false)
 		SetCarriedGoatHornInstrument(session, "")
 		SetCarriedBundleContents(session, nil)
+		SetCarriedLodestoneTracker(session, LodestoneTracker{}, false)
 	}
 }
 
@@ -272,29 +273,6 @@ func EncodeContainerContent(containerID, stateID int32, slots []world.ItemStack,
 		writeContainerItemStack(w, st)
 	}
 	writeContainerItemStack(w, carried)
-	return w.Bytes()
-}
-
-// EncodeContainerContentWithMetaAndTrim encodes a clientbound container_set_content (0x12)
-// packet body including ItemMeta (damage, custom_name, enchantments, stored_enchantments,
-// repair_cost) and ArmorTrim components for each slot and the carried stack.
-func EncodeContainerContentWithMetaAndTrim(containerID, stateID int32, slots []world.ItemStack, metas []ItemMeta, trims []ArmorTrim, carried world.ItemStack, carriedMeta ItemMeta, carriedTrim ArmorTrim) []byte {
-	w := protocol.NewWriter(32 + len(slots)*16)
-	w.VarInt(containerID)
-	w.VarInt(stateID)
-	w.VarInt(int32(len(slots)))
-	for i, st := range slots {
-		var meta ItemMeta
-		if i < len(metas) {
-			meta = metas[i]
-		}
-		var trim ArmorTrim
-		if i < len(trims) {
-			trim = trims[i]
-		}
-		WriteSlotWithArmorTrim(w, st, meta, trim)
-	}
-	WriteSlotWithArmorTrim(w, carried, carriedMeta, carriedTrim)
 	return w.Bytes()
 }
 
@@ -573,14 +551,37 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		charges := RespawnAnchorCharges(state)
 		if !(IsGlowstoneItem(session.HeldItem()) && charges < MaxRespawnAnchorCharges) && charges > 0 {
 			if dt, _ := world.LookupDimensionType(dim); !dt.RespawnAnchorWorks {
+				inWater := cache.IsRespawnAnchorExplosionInWater(x, y, z)
 				if broken, upd := cache.BreakBlockWithUpdates(x, y, z); broken {
 					s.broadcastDimensionBlockChanges(dim, cache, upd.Changes, upd.LightChanged)
 				}
-				s.ExplodeBlock(dim, x, y, z, 5.0, true)
+				breakBlocks := !inWater
+				s.DetonateExplosion(ExplosionOptions{
+					Dimension:   dim,
+					X:           float64(x) + 0.5,
+					Y:           float64(y) + 0.5,
+					Z:           float64(z) + 0.5,
+					Radius:      5.0,
+					Category:    ExplosionSourceBlock,
+					DamageCause: "bad_respawn_point",
+					Activator:   session,
+					CausesFire:  !inWater,
+					BreakBlocks: &breakBlocks,
+				})
 				return true, 0, nil
 			}
 		}
 		return s.InteractRespawnAnchor(session, x, y, z), 0, nil
+	case world.IsLodestoneBlock(state):
+		return s.UseCompassOnLodestone(session, 0, x, y, z), 0, nil
+	case world.IsBellBlock(state):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		if s.InteractBell(session, session.Dimension(), x, y, z, world.DefaultBellRingDirection(state), 0.5) {
+			return true, 0, nil
+		}
+		return false, 0, nil
 	case IsDispenserOrDropperBlock(state):
 		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
 			return false, 0, nil
@@ -766,31 +767,11 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		hadOpen = true
 		closedID = tr.open.ContainerID
 		closedX, closedY, closedZ = tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
-		var smithingMetas [3]ItemMeta
-		var smithingTrims [3]ArmorTrim
-		if tr.open.MenuType == MenuTypeSmithing {
-			if ts := getPlayerArmorTrimState(session); ts != nil {
-				ts.mu.Lock()
-				smithingMetas = ts.smithingInputMeta
-				smithingTrims = ts.smithingInputTrim
-				ts.smithingInputMeta = [SmithingInputSlotCount]ItemMeta{}
-				ts.smithingInputTrim = [SmithingInputSlotCount]ArmorTrim{}
-				ts.mu.Unlock()
-			}
-		}
 		for i := range tr.open.Crafting {
 			if !tr.open.Crafting[i].IsEmpty() {
-				var cMeta ItemMeta
-				var cTrim ArmorTrim
-				if tr.open.MenuType == MenuTypeSmithing && i < 3 {
-					cMeta = smithingMetas[i].Clone()
-					cTrim = smithingTrims[i]
-				}
 				returnItems = append(returnItems, returnEntry{
 					stack:  tr.open.Crafting[i],
-					meta:   cMeta,
 					potion: tr.open.CraftingPotions[i],
-					trim:   cTrim,
 				})
 			}
 		}
@@ -801,10 +782,8 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 				returnItems = append(returnItems, returnEntry{
 					stack: tr.open.EnchantSlots[i],
 					meta:  metaTr.enchantMeta[i].Clone(),
-					trim:  metaTr.enchantTrim[i],
 				})
 				metaTr.enchantMeta[i] = ItemMeta{}
-				metaTr.enchantTrim[i] = ArmorTrim{}
 			}
 		}
 		for i := range tr.open.CombinerInputs {
@@ -812,14 +791,11 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 				returnItems = append(returnItems, returnEntry{
 					stack: tr.open.CombinerInputs[i],
 					meta:  metaTr.combinerMeta[i].Clone(),
-					trim:  metaTr.combinerTrim[i],
 				})
 				metaTr.combinerMeta[i] = ItemMeta{}
-				metaTr.combinerTrim[i] = ArmorTrim{}
 			}
 		}
 		metaTr.resultMeta = ItemMeta{}
-		metaTr.resultTrim = ArmorTrim{}
 		metaTr.mu.Unlock()
 		tr.open = nil
 	}
@@ -843,13 +819,6 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	snap := session.Snapshot()
 	for _, entry := range returnItems {
 		st := entry.stack
-		if entry.potion == "" && (!entry.meta.IsEmpty() || entry.trim.IsValid()) {
-			rem := returnStackWithMetaAndTrimToInventory(session, st, entry.meta, entry.trim)
-			if rem > 0 {
-				s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
-			}
-			continue
-		}
 		added, changedSlots := session.AddItemToInventory(st)
 		if !entry.meta.IsEmpty() && len(changedSlots) > 0 {
 			SetSlotItemMeta(session, changedSlots[0], entry.meta)
@@ -2429,9 +2398,6 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		return s.syncPlayerInventoryContainer(session)
 	}
 	var slots []world.ItemStack
-	var slotMetas []ItemMeta
-	var slotTrims []ArmorTrim
-	hasMetaAndTrim := false
 	isFurnace := false
 	isEnchant := false
 	isAnvil := false
@@ -2465,21 +2431,12 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		isFurnace = true
 	case MenuTypeEnchantment:
 		slots = s.buildEnchantingMenuSlots(session, openCopy.EnchantSlots)
-		slotMetas = buildEnchantingMenuMetas(session)
-		slotTrims = buildEnchantingMenuTrims(session)
-		hasMetaAndTrim = true
 		isEnchant = true
 	case MenuTypeAnvil:
 		slots = s.buildCombinerMenuSlots(session, openCopy.CombinerInputs, openCopy.Result)
-		slotMetas = buildCombinerMenuMetas(session)
-		slotTrims = buildCombinerMenuTrims(session)
-		hasMetaAndTrim = true
 		isAnvil = true
 	case MenuTypeGrindstone:
 		slots = s.buildCombinerMenuSlots(session, openCopy.CombinerInputs, openCopy.Result)
-		slotMetas = buildCombinerMenuMetas(session)
-		slotTrims = buildCombinerMenuTrims(session)
-		hasMetaAndTrim = true
 	case MenuTypeBrewingStand:
 		return s.syncOpenBrewingStand(session)
 	case MenuTypeLoom:
@@ -2510,23 +2467,7 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 		return nil
 	}
 	stateID := session.NextContainerStateID()
-	var contentPkt []byte
-	if hasMetaAndTrim {
-		carriedTrim, _ := GetCarriedArmorTrim(session)
-		contentPkt = EncodeContainerContentWithMetaAndTrim(
-			openCopy.ContainerID,
-			stateID,
-			slots,
-			slotMetas,
-			slotTrims,
-			carried,
-			GetCarriedItemMeta(session),
-			carriedTrim,
-		)
-	} else {
-		contentPkt = EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried)
-	}
-	if err := session.send(protocol.PlayContainerSetContent, contentPkt); err != nil {
+	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(openCopy.ContainerID, stateID, slots, carried)); err != nil {
 		return err
 	}
 	if openCopy.MenuType == MenuTypeCrafting && !openCopy.Result.IsEmpty() && IsPotionOrTippedArrowItem(openCopy.Result) {

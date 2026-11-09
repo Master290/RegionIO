@@ -614,6 +614,12 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 	s.OnSculkBlockBroken(dim, x, y, z, prevState)
 	s.OnWorkstationBlockBroken(dim, x, y, z)
+	if world.IsLodestoneBlock(prevState) {
+		s.OnLodestoneBlockBroken(dim, x, y, z)
+	}
+	if world.IsBellBlock(prevState) {
+		s.RemoveBellBlockEntityAt(dim, x, y, z)
+	}
 	s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
 	var bannerDrop world.ItemStack
 	var hasBannerDrop bool
@@ -2164,6 +2170,19 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 			hookFacing = faceName
 		}
 		if st, ok := world.WithBlockProperty(baseState, "facing", hookFacing); ok {
+			return st
+		}
+	case "minecraft:bell":
+		attachment := "floor"
+		bellFacing := horizLookDir
+		switch faceName {
+		case "down":
+			attachment = "ceiling"
+		case "north", "south", "west", "east":
+			attachment = "single_wall"
+			bellFacing = oppositeDropperDirection(faceName)
+		}
+		if st := world.BellBlockState(attachment, bellFacing, false); st != 0 {
 			return st
 		}
 	}

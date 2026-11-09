@@ -1305,6 +1305,29 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			consumeOne = true
 		}
 
+	// 12b. Glowstone (Charging Respawn Anchor).
+	case itemID == "minecraft:glowstone":
+		frontState := cache.GetBlock(fx, fy, fz)
+		if IsRespawnAnchorBlock(frontState) {
+			if RespawnAnchorCharges(frontState) < MaxRespawnAnchorCharges {
+				if _, ok := s.ChargeRespawnAnchor(nil, normDim, fx, fy, fz); ok {
+					consumeOne = true
+				} else {
+					succeeded = false
+					soundEvent = LevelEventSoundFailDispense
+					emitSmoke = false
+				}
+			} else {
+				succeeded = false
+				soundEvent = LevelEventSoundFailDispense
+				emitSmoke = false
+			}
+		} else {
+			single := world.NewNamedItemStack("minecraft:glowstone", 1)
+			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			consumeOne = true
+		}
+
 	// 13. Default behavior: eject 1 item into the world.
 	default:
 		single := world.NewItemStack(item.ResolvedItemID(), 1)

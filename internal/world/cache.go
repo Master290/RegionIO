@@ -1123,9 +1123,15 @@ func (c *Cache) SetBlockWithLight(x, y, z int, state uint16) (bool, []ChunkPos) 
 			return false, nil
 		}
 	}
+	prevState := ch.GetBlock(x, y, z)
 	_, changed := ch.setBlock(x, y, z, state)
 	if !changed {
 		return true, nil
+	}
+	if IsBellBlock(state) && !IsBellBlock(prevState) {
+		ch.AddStructureBlockEntity(StructureBlockEntity{ID: "minecraft:bell", X: x, Y: y, Z: z})
+	} else if !IsBellBlock(state) && IsBellBlock(prevState) {
+		ch.RemoveStructureBlockEntity(x, y, z)
 	}
 	lightChanged, err := c.updateLightAfterBlockLocked(x, y, z, live)
 	if err != nil {

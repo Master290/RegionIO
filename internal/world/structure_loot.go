@@ -80,6 +80,9 @@ func populateBlockEntityLoot(be *StructureBlockEntity) {
 	if be.KeyItem != "" {
 		be.KeyItem = normalizeResourceID(be.KeyItem)
 	}
+	if be.LootTable == "" && be.ID != "minecraft:trial_spawner" {
+		return
+	}
 	reg, err := worldgen.LoadLootAndSpawnerRegistry()
 	if err != nil || reg == nil {
 		return

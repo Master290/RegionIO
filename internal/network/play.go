@@ -1899,8 +1899,6 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 			if world.IsBellBlock(clickedState) && !sneaking {
 				faceDir := server.BlockFaceDirectionName(face)
 				if h.srv.InteractBell(h.session, dim, x, y, z, faceDir, float64(cursorY)) {
-					h.srv.OnVillageBellRung(dim, x, y, z)
-					h.srv.AwardCustomStat(h.session, server.StatBellRing, 1)
 					return h.sendBlockChangedAck(seq)
 				}
 			}
@@ -1910,6 +1908,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 			}
 			if !isAdventure {
+				if world.IsLodestoneBlock(clickedState) && server.IsCompassItem(heldStack) {
+					if h.srv.UseCompassOnLodestone(h.session, hand, x, y, z) {
+						h.syncHotbarFromSession()
+						return h.sendBlockChangedAck(seq)
+					}
+				}
 				if heldStack.ResolvedID() == server.BrushItemID && world.IsBrushableBlock(clickedState) {
 					if _, _, _, handled := h.srv.UsePlayerBrushOnBlock(h.session, hand, x, y, z, face); handled {
 						h.syncHotbarFromSession()
@@ -2193,6 +2197,17 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				if h.srv != nil {
 					state = h.srv.ResolvePlacedBlockState(h.session, state, face)
 				}
+				if world.IsBellBlock(state) {
+					playerFacing := "north"
+					if h.session != nil {
+						playerFacing = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
+					}
+					bellSt, ok := cache.ResolveBellPlacementState(px, py, pz, server.BlockFaceDirectionName(face), playerFacing)
+					if !ok {
+						return h.sendBlockChangedAck(seq)
+					}
+					state = bellSt
+				}
 				if world.IsFenceGateBlock(state) && h.session != nil {
 					if fgState, ok := cache.ResolveFenceGatePlacementAt(px, py, pz, world.BlockName(state), server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)); ok {
 						state = fgState
@@ -2267,6 +2282,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					if server.IsBeaconBlock(state) && h.srv != nil {
 						h.srv.UpdateBeaconAtInDim(dim, px, py, pz, h.session)
+					}
+					if world.IsBellBlock(state) && h.srv != nil {
+						h.srv.EnsureBellBlockEntityAt(dim, px, py, pz)
 					}
 					if server.IsConduitBlock(state) && h.srv != nil {
 						h.srv.UpdateConduitAtInDim(dim, px, py, pz)
