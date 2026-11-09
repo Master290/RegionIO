@@ -1,5 +1,7 @@
 package worldgen
 
+import "math"
+
 // This file samples the climate density functions into a TargetPoint for the
 // biome finder. The climate router keys are 2D (flat_cache + y_scale=0) except
 // depth, which is 3D. For per-chunk surface biome selection we fix depth to
@@ -60,5 +62,62 @@ func computeOrZero(df DensityFunction, ctx FunctionContext) float64 {
 		return 0
 	}
 	return df.Compute(ctx)
+}
+
+// SpawnPositionAndFitness ports Climate$SpawnFinder.getSpawnPositionAndFitness
+// from vanilla 26.1.2: evaluates the climate sampler at QuartPos.fromBlock(blockX, 0, blockZ),
+// zeroes the depth coordinate, finds the minimum fitDistance across od.SpawnTarget,
+// and returns minFitness * 2048^2 + blockX^2 + blockZ^2.
+func (od *OverworldDensity) SpawnPositionAndFitness(blockX, blockZ int) int64 {
+	if od == nil || len(od.SpawnTarget) == 0 {
+		return int64(blockX)*int64(blockX) + int64(blockZ)*int64(blockZ)
+	}
+	qx := (blockX >> 2) << 2
+	qz := (blockZ >> 2) << 2
+	s2D := SampleColumn2D(od, 0, qx, qz)
+	zeroDepthPoint := NewTargetPoint(s2D.Temperature, s2D.Humidity, s2D.Continentalness, s2D.Erosion, s2D.Weirdness, 0.0)
+	minFitness := int64(math.MaxInt64)
+	for _, p := range od.SpawnTarget {
+		d := fitDistance(zeroDepthPoint, p.Ranges, p.Offset)
+		if d < minFitness {
+			minFitness = d
+		}
+	}
+	distBias := int64(blockX)*int64(blockX) + int64(blockZ)*int64(blockZ)
+	return minFitness*2048*2048 + distBias
+}
+
+// FindSpawnTarget ports net.minecraft.world.level.biome.Climate$SpawnFinder
+// from vanilla 26.1.2: starts at (0, 0), runs radialSearch(2048.0f, 512.0f),
+// then radialSearch(512.0f, 32.0f), and returns the best (x, z, fitness).
+func (od *OverworldDensity) FindSpawnTarget() (x, z int, fitness int64) {
+	if od == nil || len(od.SpawnTarget) == 0 {
+		return 0, 0, 0
+	}
+	bestX, bestZ := 0, 0
+	bestFit := od.SpawnPositionAndFitness(0, 0)
+
+	radialSearch := func(maxRadius, radiusIncrement float32) {
+		var angle float32
+		radius := radiusIncrement
+		originX, originZ := bestX, bestZ
+		for radius <= maxRadius {
+			cx := originX + int(math.Sin(float64(angle))*float64(radius))
+			cz := originZ + int(math.Cos(float64(angle))*float64(radius))
+			candFit := od.SpawnPositionAndFitness(cx, cz)
+			if candFit < bestFit {
+				bestX, bestZ, bestFit = cx, cz, candFit
+			}
+			angle += radiusIncrement / radius
+			if float64(angle) > 6.283185307179586 {
+				angle = 0
+				radius += radiusIncrement
+			}
+		}
+	}
+
+	radialSearch(2048.0, 512.0)
+	radialSearch(512.0, 32.0)
+	return bestX, bestZ, bestFit
 }
 

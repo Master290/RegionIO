@@ -1189,9 +1189,87 @@ func DecorationRandom(seed int64, chunkX, chunkZ int) (*WorldgenRandom, int64) {
 	return random, decorationSeed
 }
 
+type BiomeSpawnerData struct {
+	Type     string `json:"type"`
+	Weight   int    `json:"weight"`
+	MinCount int    `json:"minCount"`
+	MaxCount int    `json:"maxCount"`
+}
+
+type BiomeMobSpawnCost struct {
+	EnergyBudget float64 `json:"energy_budget"`
+	Charge       float64 `json:"charge"`
+}
+
+// DefaultCreatureSpawnProbability matches MobSpawnSettings.DEFAULT_CREATURE_SPAWN_PROBABILITY (0.1f)
+// in vanilla 26.1.2 when creature_spawn_probability is omitted from a biome JSON.
+const DefaultCreatureSpawnProbability = 0.1
+
 type BiomeGeneration struct {
-	Carvers  json.RawMessage `json:"carvers"`
-	Features [][]string      `json:"features"`
+	Carvers                  json.RawMessage               `json:"carvers"`
+	Features                 [][]string                    `json:"features"`
+	CreatureSpawnProbability *float64                      `json:"creature_spawn_probability"`
+	Spawners                 map[string][]BiomeSpawnerData `json:"spawners"`
+	SpawnCosts               map[string]BiomeMobSpawnCost  `json:"spawn_costs"`
+	Temperature              float64                       `json:"temperature"`
+	Downfall                 float64                       `json:"downfall"`
+	HasPrecipitation         bool                          `json:"has_precipitation"`
+}
+
+// CreatureProbability returns the biome's creature_spawn_probability or
+// DefaultCreatureSpawnProbability (0.1) if unset.
+func (b BiomeGeneration) CreatureProbability() float64 {
+	if b.CreatureSpawnProbability != nil {
+		return *b.CreatureSpawnProbability
+	}
+	return DefaultCreatureSpawnProbability
+}
+
+// MobsForCategory returns the weighted spawner entries for the given MobCategory
+// (e.g. "monster", "creature", "ambient", "axolotls", "underground_water_creature",
+// "water_creature", "water_ambient", "misc").
+func (b BiomeGeneration) MobsForCategory(category string) []BiomeSpawnerData {
+	if b.Spawners == nil {
+		return nil
+	}
+	return b.Spawners[category]
+}
+
+// SelectSpawner picks a weighted spawner entry for category using rng.
+func (b BiomeGeneration) SelectSpawner(category string, rng RandomSource) (BiomeSpawnerData, bool) {
+	entries := b.MobsForCategory(category)
+	totalWeight := 0
+	for _, e := range entries {
+		if e.Weight > 0 {
+			totalWeight += e.Weight
+		}
+	}
+	if totalWeight <= 0 {
+		return BiomeSpawnerData{}, false
+	}
+	roll := int(rng.NextIntN(int32(totalWeight)))
+	for _, e := range entries {
+		if e.Weight <= 0 {
+			continue
+		}
+		roll -= e.Weight
+		if roll < 0 {
+			return e, true
+		}
+	}
+	return entries[len(entries)-1], true
+}
+
+// MobSpawnCost returns the MobSpawnCost (energy_budget, charge) for entityType if present.
+func (b BiomeGeneration) MobSpawnCost(entityType string) (BiomeMobSpawnCost, bool) {
+	if b.SpawnCosts == nil {
+		return BiomeMobSpawnCost{}, false
+	}
+	if !strings.Contains(entityType, ":") {
+		entityType = "minecraft:" + entityType
+	}
+	cost, ok := b.SpawnCosts[entityType]
+	return cost, ok
 }
 
 var (

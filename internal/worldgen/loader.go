@@ -51,6 +51,7 @@ type OverworldDensity struct {
 	Height          int
 	AquifersEnabled bool
 	OreVeinsEnabled bool
+	SpawnTarget     []BiomeParameter
 
 	// AquiferRandom places the aquifer cell centres; OreRandom rolls the
 	// per-position ore-vein draws.
@@ -85,10 +86,15 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 			MinY   int `json:"min_y"`
 			Height int `json:"height"`
 		} `json:"noise"`
-		AquifersEnabled bool `json:"aquifers_enabled"`
-		OreVeinsEnabled bool `json:"ore_veins_enabled"`
+		AquifersEnabled bool              `json:"aquifers_enabled"`
+		OreVeinsEnabled bool              `json:"ore_veins_enabled"`
+		SpawnTarget     []json.RawMessage `json:"spawn_target"`
 	}
 	if err := l.readJSON("data/overworld.json", &settings); err != nil {
+		return nil, err
+	}
+	spawnTargets, err := parseSpawnTargets(settings.SpawnTarget)
+	if err != nil {
 		return nil, err
 	}
 	var node any
@@ -106,6 +112,7 @@ func LoadOverworldFinalDensity(seed int64) (*OverworldDensity, error) {
 		Height:          settings.Noise.Height,
 		AquifersEnabled: settings.AquifersEnabled,
 		OreVeinsEnabled: settings.OreVeinsEnabled,
+		SpawnTarget:     spawnTargets,
 		AquiferRandom:   l.rs.AquiferRandom(),
 		OreRandom:       l.rs.OreRandom(),
 		prelim:          newLevelCache(),
@@ -380,6 +387,66 @@ func LoadEndFinalDensity(seed int64) (*OverworldDensity, error) {
 	return od, nil
 }
 
+
+func parseClimateAxisRange(raw json.RawMessage) (ClimateRange, error) {
+	if len(raw) == 0 {
+		return ClimateRange{}, nil
+	}
+	var single float64
+	if err := json.Unmarshal(raw, &single); err == nil {
+		q := Quantize(single)
+		return ClimateRange{Min: q, Max: q}, nil
+	}
+	var pair [2]float64
+	if err := json.Unmarshal(raw, &pair); err != nil {
+		return ClimateRange{}, err
+	}
+	return ClimateRange{Min: Quantize(pair[0]), Max: Quantize(pair[1])}, nil
+}
+
+func parseSpawnTargets(rawList []json.RawMessage) ([]BiomeParameter, error) {
+	if len(rawList) == 0 {
+		return nil, nil
+	}
+	out := make([]BiomeParameter, 0, len(rawList))
+	for _, raw := range rawList {
+		var entry struct {
+			Temperature     json.RawMessage `json:"temperature"`
+			Humidity        json.RawMessage `json:"humidity"`
+			Continentalness json.RawMessage `json:"continentalness"`
+			Erosion         json.RawMessage `json:"erosion"`
+			Depth           json.RawMessage `json:"depth"`
+			Weirdness       json.RawMessage `json:"weirdness"`
+			Offset          float64         `json:"offset"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return nil, fmt.Errorf("parse spawn_target: %w", err)
+		}
+		var bp BiomeParameter
+		var err error
+		if bp.Ranges[0], err = parseClimateAxisRange(entry.Temperature); err != nil {
+			return nil, err
+		}
+		if bp.Ranges[1], err = parseClimateAxisRange(entry.Humidity); err != nil {
+			return nil, err
+		}
+		if bp.Ranges[2], err = parseClimateAxisRange(entry.Continentalness); err != nil {
+			return nil, err
+		}
+		if bp.Ranges[3], err = parseClimateAxisRange(entry.Erosion); err != nil {
+			return nil, err
+		}
+		if bp.Ranges[4], err = parseClimateAxisRange(entry.Depth); err != nil {
+			return nil, err
+		}
+		if bp.Ranges[5], err = parseClimateAxisRange(entry.Weirdness); err != nil {
+			return nil, err
+		}
+		bp.Offset = Quantize(entry.Offset)
+		out = append(out, bp)
+	}
+	return out, nil
+}
 
 func (l *Loader) readJSON(path string, v any) error {
 	b, err := dataFS.ReadFile(path)
