@@ -37,7 +37,13 @@ const dataVersion26 = 4790
 // extreme build heights (y = -64, y = 319), and edge/string seeds (0, negative
 // int64 bounds, WorldOptions.parseSeed / String.hashCode UTF-16, 32-bit int
 // narrowing in Mth.getSeed and WorldgenRandom seed mixers) (vanilla 26.1.2).
-const generatorVersion = 56
+// Version 57: Mangrove swamp and cherry grove generation parity: UpwardsBranchingTrunkPlacer
+// branch loop condition, per-step and end-of-branch foliage attachments, and
+// can_grow_through in validTreePos; MangrovePropaguleBlock floor (clay) and hanging
+// (mangrove_leaves) survival in would_survive and vegetation patches; BeehiveDecorator
+// bee occupant block entity data and NBT persistence; surface water height refresh
+// when top stone becomes fluid (vanilla 26.1.2).
+const generatorVersion = 57
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

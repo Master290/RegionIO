@@ -594,7 +594,7 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 		// matched" leaves the default block alone.
 		if state, ok := rules.Apply(sctx); ok {
 			out[i] = state
-			if i == top && state == StateAir {
+			if i == top && !isStoneState(state) {
 				changedHeight = true
 			}
 		}

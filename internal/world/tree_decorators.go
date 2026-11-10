@@ -330,16 +330,24 @@ func (d *treeDecoration) placeBeehive(probability float32) error {
 			return fmt.Errorf("world: minecraft:bee_nest is not a known block state")
 		}
 		d.t.r.setBlock(c.x, c.y, c.z, state)
-		d.t.r.addStructureBlockEntity(StructureBlockEntity{
-			ID: "minecraft:beehive",
-			X:  c.x,
-			Y:  c.y,
-			Z:  c.z,
-		})
-		// lambda$place$3: 2 + nextInt(2) bees, each with a nextInt(599) species roll.
-		for i, n := 0, 2+int(random.NextIntN(2)); i < n; i++ {
-			random.NextIntN(599)
+		// lambda$place$3: 2 + nextInt(2) bees, each created via BeehiveBlockEntity.Occupant.create(random.nextInt(599))
+		// with entity_data={id:"minecraft:bee"}, ticks_in_hive=0..598, min_ticks_in_hive=600.
+		beeCount := 2 + int(random.NextIntN(2))
+		bees := make([]BeehiveOccupant, beeCount)
+		for i := 0; i < beeCount; i++ {
+			bees[i] = BeehiveOccupant{
+				EntityID:       "minecraft:bee",
+				TicksInHive:    int(random.NextIntN(599)),
+				MinTicksInHive: 600,
+			}
 		}
+		d.t.r.addStructureBlockEntity(StructureBlockEntity{
+			ID:   "minecraft:beehive",
+			X:    c.x,
+			Y:    c.y,
+			Z:    c.z,
+			Bees: bees,
+		})
 		return nil
 	}
 	return nil

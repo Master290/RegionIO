@@ -748,7 +748,13 @@ func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePositio
 		return !isAirState(below)
 	}
 	state, ok := stateByID(below)
-	return ok && flattenBlockTagContains(set, "minecraft:supports_vegetation", state.Name)
+	if !ok {
+		return false
+	}
+	if name == "minecraft:mangrove_propagule" {
+		return flattenBlockTagContains(set, "minecraft:supports_mangrove_propagule", state.Name)
+	}
+	return flattenBlockTagContains(set, "minecraft:supports_vegetation", state.Name)
 }
 
 // placeBamboo ports BambooFeature.place (26.1.2 bytecode).

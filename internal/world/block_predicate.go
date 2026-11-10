@@ -29,6 +29,7 @@ type compiledBlockPredicate struct {
 	typ              string
 	offset           [3]int
 	surviveStateName string
+	surviveHanging   bool
 	direction        string
 	blocks           []string
 	tag              string
@@ -84,6 +85,7 @@ func parseBlockPredicate(raw json.RawMessage) *compiledBlockPredicate {
 			"minecraft:cherry_sapling", "minecraft:pale_oak_sapling", "minecraft:mangrove_propagule",
 			"minecraft:firefly_bush":
 			p.surviveStateName = value.State.Name
+			p.surviveHanging = value.State.Properties["hanging"] == "true"
 		default:
 			p.err = fmt.Errorf("world: would_survive for %q has no survival rule modelled; the states that use it in the pack are the nine saplings, the mangrove propagule, the firefly bush, sugar cane and cactus", value.State.Name)
 		}
@@ -213,8 +215,16 @@ func (r *decorationRegion) evalBlockPredicate(set *worldgen.FeatureSet, p *compi
 			}
 			return true, nil
 		default:
+			if p.surviveStateName == "minecraft:mangrove_propagule" && p.surviveHanging {
+				if position.Y >= MinY+WorldHeight-1 {
+					return false, nil
+				}
+				above, ok := stateByID(r.getBlock(position.X, position.Y+1, position.Z))
+				return ok && flattenBlockTagContains(set, "minecraft:supports_hanging_mangrove_propagule", above.Name), nil
+			}
 			// VegetationBlock.canSurvive, which is mayPlaceOn of the block below, which
-			// is membership of #minecraft:supports_vegetation. These ten are every tree
+			// is membership of #minecraft:supports_vegetation (or #minecraft:supports_mangrove_propagule
+			// for non-hanging mangrove_propagule). These ten are every tree
 			// chain's placement filter: with the position-contents test that used to sit
 			// in front of them, no tree in a plains or taiga chunk could ever be placed.
 			return r.canVegetationSurvive(position, p.surviveStateName, set), nil

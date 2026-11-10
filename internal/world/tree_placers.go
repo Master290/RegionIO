@@ -607,6 +607,13 @@ func (t *treePlacer) isFree(x, y, z int) bool {
 	if t.validTreePos(x, y, z) {
 		return true
 	}
+	if t.config.TrunkPlacer.Type == "minecraft:upwards_branching_trunk_placer" {
+		if raw, ok := t.config.TrunkPlacer.Fields["can_grow_through"]; ok {
+			if list, err := parseBlockListOrTag(raw); err == nil && t.matchesBlockListOrTag(x, y, z, list) {
+				return true
+			}
+		}
+	}
 	name, ok := stateByID(t.stateAt(x, y, z))
 	return ok && flattenBlockTagContains(t.set, "minecraft:logs", name.Name)
 }
@@ -1529,28 +1536,34 @@ func (t *treePlacer) placeUpwardsBranch(
 	growThroughList []string,
 	attachments *[]trunkAttachment,
 ) error {
-	yPos := cy
-	eySet := false
-	ey := 0
-	for j := branchPos; j < t.trunkHeight && branchSteps > 0 && j >= 1; j, branchSteps = j+1, branchSteps-1 {
-		yPos++
-		bx := x + dir[0]*j
-		bz := z + dir[1]*j
-		placed, err := t.placeLogUpwardsBranching(bx, yPos, bz, growThroughList)
-		if err != nil {
-			return err
-		}
-		if placed {
-			ey = yPos + 1
-			eySet = true
+	yPos := cy + branchPos
+	xPos := x
+	zPos := z
+	for j := branchPos; j < t.trunkHeight && branchSteps > 0; j, branchSteps = j+1, branchSteps-1 {
+		if j >= 1 {
+			placementY := cy + j
+			xPos += dir[0]
+			zPos += dir[1]
+			yPos = placementY
+			placed, err := t.placeLogUpwardsBranching(xPos, placementY, zPos, growThroughList)
+			if err != nil {
+				return err
+			}
+			if placed {
+				yPos = placementY + 1
+			}
+			*attachments = append(*attachments, trunkAttachment{
+				x: xPos,
+				y: placementY,
+				z: zPos,
+			})
 		}
 	}
-	if eySet {
-		*attachments = append(*attachments, trunkAttachment{
-			x: x + dir[0]*branchPos,
-			y: ey,
-			z: z + dir[1]*branchPos,
-		})
+	if yPos-cy > 1 {
+		*attachments = append(*attachments,
+			trunkAttachment{x: xPos, y: yPos, z: zPos},
+			trunkAttachment{x: xPos, y: yPos - 2, z: zPos},
+		)
 	}
 	return nil
 }
