@@ -1250,33 +1250,41 @@ func (s *Server) EncodePlayerLoginPacket(session *PlayerSession, viewDistance in
 		dim = snap.Dimension
 	}
 	maxPlayers := int32(20)
-	var seed int64
+	var hashedSeed int64
 	isHardcore := false
 	reducedDebug := false
 	enableRespawnScreen := true
 	limitedCrafting := false
+	enforcesSecureChat := false
+	if viewDistance <= 0 {
+		viewDistance = 4
+	}
+	simDistance := viewDistance
 	if s != nil {
 		maxPlayers = int32(s.cfg.MaxPlayers)
-		seed = s.cfg.WorldSeed
+		hashedSeed = ObfuscateBiomeSeed(s.cfg.WorldSeed)
 		isHardcore = s.IsHardcore()
 		reducedDebug = s.ReducedDebugInfo()
 		enableRespawnScreen = !s.DoImmediateRespawn()
 		limitedCrafting = s.DoLimitedCrafting()
+		enforcesSecureChat = s.cfg.EnforceSecureChat
+		if sd := int32(s.SimulationDistance()); sd > 0 {
+			simDistance = sd
+		}
 	}
-	if viewDistance <= 0 {
-		viewDistance = 4
-	}
-	return EncodePlayLoginPacketWithFlags(
+	return EncodePlayLoginPacketFull(
 		entityID,
 		gameMode,
 		dim,
 		maxPlayers,
 		viewDistance,
-		seed,
+		simDistance,
+		hashedSeed,
 		isHardcore,
 		reducedDebug,
 		enableRespawnScreen,
 		limitedCrafting,
+		enforcesSecureChat,
 	)
 }
 

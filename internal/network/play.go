@@ -94,7 +94,13 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	_ = h.conn.Send(protocol.PlayChunkCacheRadius, server.EncodeSetChunkCacheRadiusPacket(int32(h.visibilityRadius())))
-	_ = h.conn.Send(protocol.PlaySetSimulationDistance, server.EncodeSetSimulationDistancePacket(int32(h.visibilityRadius())))
+	simDist := int32(h.visibilityRadius())
+	if h.srv != nil {
+		if sd := int32(h.srv.SimulationDistance()); sd > 0 {
+			simDist = sd
+		}
+	}
+	_ = h.conn.Send(protocol.PlaySetSimulationDistance, server.EncodeSetSimulationDistancePacket(simDist))
 	if cInfo := h.srv.PlayerClientInformation(session); cInfo.MainHand != server.PlayerMainHandRight || cInfo.ModelCustomisation != server.DefaultPlayerSkinParts {
 		_ = h.conn.Send(protocol.PlaySetEntityData, server.EncodePlayerAvatarEntityDataPacket(session.EntityID, cInfo.MainHand, cInfo.ModelCustomisation))
 	}
@@ -105,6 +111,9 @@ func (h *handler) beginPlay() error {
 		return err
 	}
 	if err := h.sendSetHeldSlot(snap.SelectedSlot); err != nil {
+		return err
+	}
+	if err := h.srv.SendInitialRecipeBook(h.session); err != nil {
 		return err
 	}
 	if err := h.sendContainerSetContent(); err != nil {
@@ -129,9 +138,6 @@ func (h *handler) beginPlay() error {
 			return err
 		}
 	}
-	if err := h.srv.SendInitialRecipeBook(h.session); err != nil {
-		return err
-	}
 	h.srv.TriggerInventoryChanged(h.session)
 	h.srv.UnlockRecipesForInventory(h.session)
 	if err := h.sendCommands(); err != nil {
@@ -154,6 +160,7 @@ func (h *handler) beginPlay() error {
 	// read loop stays free; requestRecenter is a non-blocking push.
 	playerCache := h.srv.PlayerChunks(session)
 	h.streamer = newStreamer(playerCache, h.conn, h.log, h.visibilityRadius())
+	h.streamer.centerX, h.streamer.centerZ, h.streamer.hasCenter = startCX, startCZ, true
 	h.streamer.onChunkSent = func(cx, cz int32) {
 		if h.srv != nil && h.session != nil {
 			dim := h.session.Dimension()
@@ -464,7 +471,11 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 	if h.streamer != nil {
-		h.streamer.requestRecenter(cx, cz)
+		prevCX := int32(int64(math.Floor(prev.X)) >> 4)
+		prevCZ := int32(int64(math.Floor(prev.Z)) >> 4)
+		if h.session == nil || cx != prevCX || cz != prevCZ {
+			h.streamer.requestRecenter(cx, cz)
+		}
 	}
 	return nil
 }
@@ -1576,7 +1587,17 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		}
 		return nil
 
-	case protocol.PlayClientTickEnd, protocol.PlayChunkBatchReceivedSB,
+	case protocol.PlayChunkBatchReceivedSB:
+		desired, err := pkt.Body().Float32()
+		if err != nil {
+			return err
+		}
+		if h.streamer != nil {
+			h.streamer.onChunkBatchReceived(desired)
+		}
+		return nil
+
+	case protocol.PlayClientTickEnd,
 		protocol.PlayPongSB,
 		protocol.PlayConfigurationAcknowledged,
 		protocol.PlayCustomPayload, protocol.PlayDebugSubscriptionRequestSB,

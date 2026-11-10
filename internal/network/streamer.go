@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"log/slog"
+	"math"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -37,6 +38,14 @@ type streamer struct {
 	pendingCache      *world.Cache
 	resetPending      bool
 	pendingViewRadius int
+	pendingCenterX    int32
+	pendingCenterZ    int32
+	hasPendingCenter  bool
+
+	batchMu                  sync.Mutex
+	desiredChunksPerTick     float32
+	unacknowledgedBatches    int
+	maxUnacknowledgedBatches int
 
 	// The loaded-set and current center are owned solely by the streamer's run
 	// goroutine — no other goroutine reads or writes them.
@@ -78,15 +87,17 @@ func newStreamer(cache *world.Cache, conn *Conn, log *slog.Logger, viewDistance 
 		pool = 2
 	}
 	s := &streamer{
-		cache:      cache,
-		conn:       conn,
-		log:        log,
-		recenter:   make(chan recenterReq, 4),
-		loaded:     make(map[[2]int32]bool),
-		resident:   make(map[[2]int32]bool),
-		viewRadius: viewDistance,
-		genRadius:  viewDistance + 1,
-		poolSize:   pool,
+		cache:                    cache,
+		conn:                     conn,
+		log:                      log,
+		recenter:                 make(chan recenterReq, 4),
+		loaded:                   make(map[[2]int32]bool),
+		resident:                 make(map[[2]int32]bool),
+		viewRadius:               viewDistance,
+		genRadius:                viewDistance + 1,
+		poolSize:                 pool,
+		desiredChunksPerTick:     9.0,
+		maxUnacknowledgedBatches: 1,
 	}
 	if cache != nil {
 		s.tickets = cache.NewTicketSet()
@@ -125,6 +136,9 @@ func (s *streamer) switchDimension(cache *world.Cache, cx, cz int32) {
 	s.switchMu.Lock()
 	s.pendingCache = cache
 	s.resetPending = true
+	s.pendingCenterX = cx
+	s.pendingCenterZ = cz
+	s.hasPendingCenter = true
 	s.switchMu.Unlock()
 
 	s.residentMu.Lock()
@@ -132,6 +146,27 @@ func (s *streamer) switchDimension(cache *world.Cache, cx, cz int32) {
 	s.residentMu.Unlock()
 
 	s.requestRecenter(cx, cz)
+}
+
+// onChunkBatchReceived records a ServerboundChunkBatchReceivedPacket (0x0b)
+// acknowledgement from the client, clamping desiredChunksPerTick to [0.01, 64.0]
+// and updating unacknowledged batch counters (vanilla PlayerChunkSender.onChunkBatchReceivedByClient).
+func (s *streamer) onChunkBatchReceived(desiredChunksPerTick float32) {
+	if s == nil {
+		return
+	}
+	if math.IsNaN(float64(desiredChunksPerTick)) || desiredChunksPerTick < 0.01 {
+		desiredChunksPerTick = 0.01
+	} else if desiredChunksPerTick > 64.0 {
+		desiredChunksPerTick = 64.0
+	}
+	s.batchMu.Lock()
+	if s.unacknowledgedBatches > 0 {
+		s.unacknowledgedBatches--
+	}
+	s.desiredChunksPerTick = desiredChunksPerTick
+	s.maxUnacknowledgedBatches = 10
+	s.batchMu.Unlock()
 }
 
 // setViewDistance updates the streamer's viewRadius dynamically on the fly and
@@ -175,11 +210,17 @@ func (s *streamer) applyPendingSwitch() {
 	newCache := s.pendingCache
 	s.pendingCache = nil
 	s.resetPending = false
+	hasPendCenter := s.hasPendingCenter
+	pendCX, pendCZ := s.pendingCenterX, s.pendingCenterZ
+	s.hasPendingCenter = false
 	s.switchMu.Unlock()
 
 	if newViewRadius > 0 {
 		s.viewRadius = newViewRadius
 		s.genRadius = newViewRadius + 1
+	}
+	if hasPendCenter {
+		s.centerX, s.centerZ, s.hasCenter = pendCX, pendCZ, true
 	}
 	if s.tickets != nil {
 		s.tickets.Close()
@@ -226,9 +267,12 @@ func (s *streamer) run(ctx context.Context) {
 // It is the only place `loaded`/`centerX`/`centerZ` are mutated.
 func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterReq, bool) {
 	s.applyPendingSwitch()
+	centerChanged := !s.hasCenter || s.centerX != cx || s.centerZ != cz
 	s.centerX, s.centerZ, s.hasCenter = cx, cz, true
 
-	s.sendChunkCacheCenter(cx, cz)
+	if centerChanged {
+		s.sendChunkCacheCenter(cx, cz)
+	}
 
 	// Build the desired set: everything within genRadius (the union of what we
 	// send + the pre-gen ring). Sent = within viewRadius; pre-gen = the ring.
@@ -462,6 +506,7 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 	}()
 	generated := make(map[[2]int32]frameResult, len(pending))
 	nextIdx := 0
+	batchSent := int32(0)
 	failed := false
 	for r := range results {
 		if r.err != nil {
@@ -486,6 +531,12 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 				break
 			}
 			if s.conn != nil {
+				if batchSent == 0 {
+					if err := s.conn.Send(protocol.PlayChunkBatchStart, nil); err != nil {
+						failed = true
+						break
+					}
+				}
 				if err := s.conn.SendFramed(ready.frame); err != nil {
 					if s.log != nil {
 						s.log.Debug("streamer send failed", "cx", ready.cx, "cz", ready.cz, "err", err)
@@ -494,6 +545,7 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 					break
 				}
 			}
+			batchSent++
 			s.loaded[[2]int32{j.cx, j.cz}] = true
 			s.setResident([2]int32{j.cx, j.cz}, true)
 			if s.onChunkSent != nil {
@@ -501,6 +553,14 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 			}
 			nextIdx++
 		}
+	}
+	if batchSent > 0 && s.conn != nil {
+		s.batchMu.Lock()
+		s.unacknowledgedBatches++
+		s.batchMu.Unlock()
+		fin := protocol.NewWriter(5)
+		fin.VarInt(batchSent)
+		_ = s.conn.SendWriter(protocol.PlayChunkBatchFinished, fin)
 	}
 }
 

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"math"
 	"sync"
@@ -10,6 +12,15 @@ import (
 	"regionio/internal/registry"
 	"regionio/internal/world"
 )
+
+// ObfuscateBiomeSeed implements vanilla 26.1.2 BiomeManager.obfuscateSeed(long):
+// Hashing.sha256().hashLong(seed).asLong() (little-endian int64 SHA-256 first 8 bytes).
+func ObfuscateBiomeSeed(seed int64) int64 {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(seed))
+	sum := sha256.Sum256(buf[:])
+	return int64(binary.LittleEndian.Uint64(sum[:8]))
+}
 
 type serverDimensionState struct {
 	mu       sync.Mutex
@@ -308,6 +319,36 @@ func EncodePlayLoginPacketWithFlags(
 	hashedSeed int64,
 	isHardcore, reducedDebugInfo, enableRespawnScreen, doLimitedCrafting bool,
 ) []byte {
+	return EncodePlayLoginPacketFull(
+		entityID,
+		gameMode,
+		dim,
+		maxPlayers,
+		viewDistance,
+		viewDistance,
+		hashedSeed,
+		isHardcore,
+		reducedDebugInfo,
+		enableRespawnScreen,
+		doLimitedCrafting,
+		false,
+	)
+}
+
+// EncodePlayLoginPacketFull encodes the clientbound play login (0x31) packet
+// body for protocol 775 (26.1.2) with explicit simulationDistance, hardcore,
+// gamerule flags, and enforcesSecureChat.
+func EncodePlayLoginPacketFull(
+	entityID int32,
+	gameMode uint8,
+	dim string,
+	maxPlayers, viewDistance, simulationDistance int32,
+	hashedSeed int64,
+	isHardcore, reducedDebugInfo, enableRespawnScreen, doLimitedCrafting, enforcesSecureChat bool,
+) []byte {
+	if simulationDistance <= 0 {
+		simulationDistance = viewDistance
+	}
 	normDim := world.NormalizeDimension(dim)
 	dimTypeIdx := DimensionTypeRegistryIndex(normDim)
 	dt, _ := world.LookupDimensionType(normDim)
@@ -328,7 +369,7 @@ func EncodePlayLoginPacketWithFlags(
 
 	w.VarInt(maxPlayers)
 	w.VarInt(viewDistance)
-	w.VarInt(viewDistance)
+	w.VarInt(simulationDistance)
 	w.Bool(reducedDebugInfo)
 	w.Bool(enableRespawnScreen)
 	w.Bool(doLimitedCrafting)
@@ -344,7 +385,7 @@ func EncodePlayLoginPacketWithFlags(
 	w.Bool(false) // has last death location
 	w.VarInt(0)   // portal cooldown
 	w.VarInt(int32(dt.SeaLevel))
-	w.Bool(false) // enforces secure chat
+	w.Bool(enforcesSecureChat)
 
 	return w.Bytes()
 }
@@ -496,7 +537,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 			defer session.SetJoined(true)
 		}
 		// 1. ClientboundRespawnPacket (with KEEP_ALL_DATA = 0x03 for dimension change).
-		respawnPkt := EncodeDimensionRespawnPacket(normTarget, mode, s.cfg.WorldSeed, protocol.RespawnKeepAllData)
+		respawnPkt := EncodeDimensionRespawnPacket(normTarget, mode, ObfuscateBiomeSeed(s.cfg.WorldSeed), protocol.RespawnKeepAllData)
 		if err := send(protocol.PlayRespawn, respawnPkt); err != nil {
 			return err
 		}
