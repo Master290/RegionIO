@@ -805,7 +805,8 @@ func stepHostileZombieAI(
 	}
 
 	vertDist := math.Abs(target.y - nextY)
-	if horizDist <= ZombieAttackReach && vertDist <= ZombieAttackVerticalReach && mem.attackCooldown <= 0 {
+	if horizDist <= ZombieAttackReach && vertDist <= ZombieAttackVerticalReach && mem.attackCooldown <= 0 &&
+		hasCreeperLineOfSight(chunks, nextX, nextY, nextZ, target.x, target.y, target.z) {
 		mem.attackCooldown = ZombieAttackCooldownTicks
 		attackTarget = target.session
 	}

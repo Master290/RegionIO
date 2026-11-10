@@ -688,11 +688,8 @@ func (s *Server) StepZombieWaterConversion(entityID int32, ticks int) (converted
 			st.ConversionTicks = ZombieDrownedConversionTicks
 			startedConversion = true
 		}
-	} else if st.InWaterTicks > 0 {
-		st.InWaterTicks -= ticks
-		if st.InWaterTicks < 0 {
-			st.InWaterTicks = 0
-		}
+	} else {
+		st.InWaterTicks = 0
 	}
 	gearCopy := *st
 	mgr.mu.Unlock()
@@ -879,13 +876,14 @@ func (s *Server) ShootDrownedTridentAtPlayer(drownedID int32, target *PlayerSess
 
 // TrySpawnZombieReinforcement implements vanilla `Zombie.hurtServer`
 // reinforcement spawning: when a Zombie-family mob takes non-lethal damage on
-// Normal or Hard difficulty, rolls `ReinforcementChance` (or forces spawn when
-// `force` is true) to spawn a reinforcement `minecraft:zombie` `7..40` blocks away!
+// Hard difficulty (`DifficultyHard`), rolls `ReinforcementChance` (or forces
+// spawn when `force` is true) to spawn a reinforcement `minecraft:zombie`
+// `7..40` blocks away, applying the `-0.05` penalty to both caller and callee!
 func (s *Server) TrySpawnZombieReinforcement(damagedZombieID int32, attacker *PlayerSession, rng *rand.Rand, force bool) (reinforcementID int32, spawned bool) {
 	if s == nil || s.entities == nil {
 		return 0, false
 	}
-	if !force && s.Difficulty() < DifficultyNormal {
+	if !force && s.Difficulty() != DifficultyHard {
 		return 0, false
 	}
 	ent := s.entities.Get(damagedZombieID)
@@ -908,11 +906,25 @@ func (s *Server) TrySpawnZombieReinforcement(damagedZombieID int32, attacker *Pl
 		mgr.mu.Unlock()
 		return 0, false
 	}
-	st.ReinforcementChance -= ZombieReinforcementPenalty
-	if st.ReinforcementChance < 0 {
-		st.ReinforcementChance = 0
-	}
 	mgr.mu.Unlock()
+
+	applyReinforcementPenalties := func(calleeID int32) {
+		s.ensureUndeadState(calleeID, MobTypeZombie, rng)
+		mgr.mu.Lock()
+		if callerSt := mgr.undead[damagedZombieID]; callerSt != nil {
+			callerSt.ReinforcementChance -= ZombieReinforcementPenalty
+			if callerSt.ReinforcementChance < 0 {
+				callerSt.ReinforcementChance = 0
+			}
+		}
+		if calleeSt := mgr.undead[calleeID]; calleeSt != nil {
+			calleeSt.ReinforcementChance -= ZombieReinforcementPenalty
+			if calleeSt.ReinforcementChance < 0 {
+				calleeSt.ReinforcementChance = 0
+			}
+		}
+		mgr.mu.Unlock()
+	}
 
 	dim := ent.EffectiveDimension()
 	cache := s.DimensionChunks(dim)
@@ -943,6 +955,7 @@ func (s *Server) TrySpawnZombieReinforcement(damagedZombieID int32, attacker *Pl
 		}
 		id, err := s.SpawnMobInDimension(dim, float64(cx)+0.5, float64(cy), float64(cz)+0.5, MobTypeZombie)
 		if err == nil && id > 0 {
+			applyReinforcementPenalties(id)
 			return id, true
 		}
 	}
@@ -950,6 +963,7 @@ func (s *Server) TrySpawnZombieReinforcement(damagedZombieID int32, attacker *Pl
 	if force {
 		id, err := s.SpawnMobInDimension(dim, ent.X+8.0, ent.Y, ent.Z, MobTypeZombie)
 		if err == nil && id > 0 {
+			applyReinforcementPenalties(id)
 			return id, true
 		}
 	}

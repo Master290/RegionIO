@@ -1460,6 +1460,14 @@ func (s *Server) stepHostileSpiderAI(
 		}
 	}
 
+	// In vanilla Spider.SpiderAttackGoal.canContinueToUse(), a spider chasing in
+	// bright daylight (`getLightLevelDependentMagicValue() >= 0.5F`, light >= 12)
+	// has a 1/100 (`random.nextInt(100) == 0`) chance per tick to lose its target.
+	if mem.provoked && mem.state == mobStateChase && !s.IsSpiderHostile(x, feetY, z, false) {
+		if rng != nil && rng.Intn(SpiderDaylightDeaggroDenominator) == 0 {
+			mem.provoked = false
+		}
+	}
 	if !s.IsSpiderHostile(x, feetY, z, mem.provoked) {
 		if mem.state == mobStateChase {
 			mem.state = mobStateIdle

@@ -623,7 +623,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 		s.entities.Update(snapshot.ID, func(e *world.Entity) {
 			e.OnGround = !leaped
 			if leaped {
-				e.VelocityY = 2400
+				e.VelocityY = 3200
 			} else {
 				e.VelocityY = 0
 			}
