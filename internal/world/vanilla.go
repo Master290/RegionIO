@@ -22,6 +22,14 @@ const (
 
 type cornerGrid [cellsXZ + 1][cellsY + 1][cellsXZ + 1]float64
 
+// ParseWorldSeed ports WorldOptions.parseSeed(String) from vanilla 26.1.2:
+// trims ASCII control/whitespace (<= ' '), returns (0, false) if empty,
+// parses a signed 64-bit decimal integer (Long.parseLong), or falls back to
+// int64(String.hashCode()) over UTF-16 code units.
+func ParseWorldSeed(raw string) (int64, bool) {
+	return worldgen.ParseWorldSeed(raw)
+}
+
 // NewVanillaGenerator returns a generator backed by the real overworld
 // final_density tree for the given seed, plus a simplified cosmetic pass
 // (beaches and trees) layered on the bit-accurate terrain.

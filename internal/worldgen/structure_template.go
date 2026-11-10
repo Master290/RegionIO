@@ -444,7 +444,7 @@ func TransformEntityPos(pos [3]float64, mirror string, rotation int, pivot [3]in
 //	l = l*l*42317861 + l*11
 //	return l >> 16
 func MthGetSeed(x, y, z int) int64 {
-	l := int64(int32(x)*3129871) ^ int64(z)*116129781 ^ int64(int32(y))
+	l := int64(int32(x)*3129871) ^ int64(int32(z))*116129781 ^ int64(int32(y))
 	l = l*l*42317861 + l*11
 	return l >> 16
 }

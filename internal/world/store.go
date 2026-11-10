@@ -33,10 +33,11 @@ const dataVersion26 = 4790
 // first time it ran: chunkAt prefers the store over the generator, so the
 // already-explored area around spawn keeps its old terrain and every later fix
 // looks like it did nothing in exactly the place you are standing.
-// Version 55: StructureStart and References Anvil NBT persistence,
-// spawn_overrides parsing and NaturalSpawner.mobsAt + isInNetherFortressBounds
-// structure spawn overrides parity across all 34 vanilla structures (vanilla 26.1.2).
-const generatorVersion = 55
+// Version 56: Generation parity at far coordinates (±1M, ±10M, ±29,999,984),
+// extreme build heights (y = -64, y = 319), and edge/string seeds (0, negative
+// int64 bounds, WorldOptions.parseSeed / String.hashCode UTF-16, 32-bit int
+// narrowing in Mth.getSeed and WorldgenRandom seed mixers) (vanilla 26.1.2).
+const generatorVersion = 56
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

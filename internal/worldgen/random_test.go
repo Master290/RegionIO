@@ -144,3 +144,102 @@ func TestXoroshiroWorldgenDecorationVector(t *testing.T) {
 		t.Fatalf("nextDouble = %.17f, want 0.6041286197351282", got)
 	}
 }
+
+func TestParseWorldSeedAndJavaStringHashCode(t *testing.T) {
+	// Empty or whitespace-only strings return (0, false) like WorldOptions.parseSeed.
+	for _, blank := range []string{"", " ", "   ", "\t\n\r "} {
+		if seed, ok := ParseWorldSeed(blank); ok || seed != 0 {
+			t.Errorf("ParseWorldSeed(%q) = (%d, %v), want (0, false)", blank, seed, ok)
+		}
+	}
+
+	cases := []struct {
+		raw  string
+		want int64
+	}{
+		{"0", 0},
+		{"  0  ", 0},
+		{"-1", -1},
+		{"-9223372036854775808", math.MinInt64},
+		{"9223372036854775807", math.MaxInt64},
+		// Classic string seeds hashed via java.lang.String.hashCode():
+		{"North Carolina", -343522682},
+		{"pollinating sandboxes", 0}, // Famous zero-hash string seed in Minecraft
+		{"minecraft", 695073197},
+		{"ddnqavb", 1524020650},
+		// Out-of-range int64 strings fall back to String.hashCode():
+		{"9223372036854775808", int64(JavaStringHashCode("9223372036854775808"))},
+		{"-9223372036854775809", int64(JavaStringHashCode("-9223372036854775809"))},
+		// Non-ASCII UTF-16 code units (BMP Cyrillic and supplementary surrogate pair):
+		{"Привет", 1177014952},
+		{"🌍", 1773137}, // U+1F30D -> UTF-16 surrogates 0xD83C (55356), 0xDF0D (57101) -> 31*55356 + 57101 = 1773137
+	}
+	for _, tc := range cases {
+		got, ok := ParseWorldSeed(tc.raw)
+		if !ok {
+			t.Errorf("ParseWorldSeed(%q) ok = false, want true", tc.raw)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("ParseWorldSeed(%q) = %d, want %d", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestMthGetSeedAndWorldgenRandomFarCoords(t *testing.T) {
+	coords := [][3]int{
+		{0, -64, 0},
+		{0, 319, 0},
+		{1_000_000, 64, -1_000_000},
+		{-10_000_000, -64, 10_000_000},
+		{29_999_984, 319, -29_999_984},
+	}
+	for _, c := range coords {
+		s1 := positionSeed(c[0], c[1], c[2])
+		s2 := MthGetSeed(c[0], c[1], c[2])
+		if s1 != s2 {
+			t.Fatalf("positionSeed(%v) = %d != MthGetSeed = %d", c, s1, s2)
+		}
+		// Adding 2^32 to any coordinate must wrap identically to Java's 32-bit int parameter.
+		sWrapped := positionSeed(c[0]+(1<<32), c[1]-(1<<32), c[2]+(1<<32))
+		if s1 != sWrapped {
+			t.Fatalf("positionSeed 32-bit wrap mismatch at %v: %d vs %d", c, s1, sWrapped)
+		}
+	}
+
+	// Verify WorldgenRandom and Legacy seed mixers narrow coordinates to int32.
+	for _, seed := range []int64{0, -1, math.MinInt64, math.MaxInt64} {
+		var l1, l2 Legacy
+		d1 := l1.SetDecorationSeed(seed, 29_999_984, -29_999_984)
+		d2 := l2.SetDecorationSeed(seed, 29_999_984+(1<<32), -29_999_984-(1<<32))
+		if d1 != d2 {
+			t.Fatalf("Legacy.SetDecorationSeed 32-bit wrap mismatch for seed %d: %d vs %d", seed, d1, d2)
+		}
+		l1.SetLargeFeatureWithSalt(seed, 1_874_999, -1_874_999, 14357617)
+		l2.SetLargeFeatureWithSalt(seed, 1_874_999+(1<<32), -1_874_999-(1<<32), 14357617)
+		if l1.NextLong() != l2.NextLong() {
+			t.Fatalf("Legacy.SetLargeFeatureWithSalt 32-bit wrap mismatch for seed %d", seed)
+		}
+	}
+}
+
+func TestEndIslandFarCoordsInt32OverflowParity(t *testing.T) {
+	df := NewEndIslandDF(0)
+	// At (1_000_000, 0), ix = 125_000, iz = 0 -> int32(ix*ix + iz*iz) = -1554869184 < 0
+	// -> Mth.sqrt(negative) = NaN -> EndBiomeAt falls through to minecraft:end_barrens.
+	vNan := df.Compute(FunctionContext{X: 1_000_000, Y: 64, Z: 0})
+	if !math.IsNaN(vNan) {
+		t.Fatalf("EndIslandDF at (1_000_000, 0) = %v, want NaN (vanilla MC-159283 int32 overflow)", vNan)
+	}
+	if b := EndBiomeAt(df, 1_000_000>>2, 16, 0); b != "minecraft:end_barrens" {
+		t.Fatalf("EndBiomeAt at (1_000_000, 0) = %q, want minecraft:end_barrens", b)
+	}
+
+	// At (1_000_000, 1_000_000), ix = 125_000, iz = 125_000 -> int32(ix*ix + iz*iz) = +1185228928 >= 0
+	// -> finite height value in an End ring.
+	vFinite := df.Compute(FunctionContext{X: 1_000_000, Y: 64, Z: 1_000_000})
+	if math.IsNaN(vFinite) || math.IsInf(vFinite, 0) {
+		t.Fatalf("EndIslandDF at (1_000_000, 1_000_000) = %v, want finite value", vFinite)
+	}
+}
+

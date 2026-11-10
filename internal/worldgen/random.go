@@ -15,6 +15,9 @@ import (
 	"encoding/binary"
 	"math"
 	"math/bits"
+	"strconv"
+	"strings"
+	"unicode/utf16"
 )
 
 // md5Seed mirrors RandomSupport.seedFromHashOf: the MD5 digest of name split
@@ -76,7 +79,7 @@ type PositionalRandomFactory interface {
 // positionSeed is Mth.getSeed: a scrambled hash of a block position, used to
 // seed positional random factories.
 func positionSeed(x, y, z int) int64 {
-	l := int64(int32(x)*3129871) ^ int64(z)*116129781 ^ int64(y)
+	l := int64(int32(x)*3129871) ^ int64(int32(z))*116129781 ^ int64(int32(y))
 	l = l*l*42317861 + l*11
 	return l >> 16
 }
@@ -267,7 +270,7 @@ func (r *Legacy) SetLargeFeatureSeed(seed int64, chunkX, chunkZ int) {
 	r.SetSeed(seed)
 	a := r.NextLong()
 	b := r.NextLong()
-	r.SetSeed(int64(chunkX)*a ^ int64(chunkZ)*b ^ seed)
+	r.SetSeed(int64(int32(chunkX))*a ^ int64(int32(chunkZ))*b ^ seed)
 }
 
 // SetLargeFeatureWithSalt is WorldgenRandom.setLargeFeatureWithSalt: one
@@ -275,7 +278,7 @@ func (r *Legacy) SetLargeFeatureSeed(seed int64, chunkX, chunkZ int) {
 // multipliers and the formula is what every random-spread structure placement
 // and legacy frequency reducer reads.
 func (r *Legacy) SetLargeFeatureWithSalt(seed int64, chunkX, chunkZ, salt int) {
-	r.SetSeed(int64(chunkX)*341873128712 + int64(chunkZ)*132897987541 + seed + int64(salt))
+	r.SetSeed(int64(int32(chunkX))*341873128712 + int64(int32(chunkZ))*132897987541 + seed + int64(int32(salt)))
 }
 
 // SetDecorationSeed is WorldgenRandom.setDecorationSeed. It returns the seed
@@ -285,14 +288,22 @@ func (r *Legacy) SetDecorationSeed(seed int64, blockX, blockZ int) int64 {
 	r.SetSeed(seed)
 	a := r.NextLong() | 1
 	b := r.NextLong() | 1
-	decorationSeed := int64(blockX)*a + int64(blockZ)*b ^ seed
+	decorationSeed := int64(int32(blockX))*a + int64(int32(blockZ))*b ^ seed
 	r.SetSeed(decorationSeed)
 	return decorationSeed
 }
 
 // SetFeatureSeed selects one configured feature in one decoration stage.
 func (r *Legacy) SetFeatureSeed(decorationSeed int64, featureIndex, stage int) {
-	r.SetSeed(decorationSeed + int64(featureIndex) + int64(10000*stage))
+	r.SetSeed(decorationSeed + int64(int32(featureIndex)) + int64(int32(10000*int32(stage))))
+}
+
+// SeedSlimeChunk ports WorldgenRandom.seedSlimeChunk(int chunkX, int chunkZ, long seed, long salt).
+func SeedSlimeChunk(chunkX, chunkZ int, worldSeed, salt int64) RandomSource {
+	cx := int32(chunkX)
+	cz := int32(chunkZ)
+	s := (worldSeed + int64(cx*cx*4987142) + int64(cx*5947611) + int64(cz*cz)*4392871 + int64(cz*389711)) ^ salt
+	return NewLegacy(s)
 }
 
 // next returns the top `b` bits of the next LCG state.
@@ -406,13 +417,24 @@ func (r *WorldgenRandom) SetDecorationSeed(seed int64, blockX, blockZ int) int64
 	r.SetSeed(seed)
 	a := r.NextLong() | 1
 	b := r.NextLong() | 1
-	decorationSeed := int64(blockX)*a + int64(blockZ)*b ^ seed
+	decorationSeed := int64(int32(blockX))*a + int64(int32(blockZ))*b ^ seed
 	r.SetSeed(decorationSeed)
 	return decorationSeed
 }
 
 func (r *WorldgenRandom) SetFeatureSeed(decorationSeed int64, featureIndex, stage int) {
-	r.SetSeed(decorationSeed + int64(featureIndex) + int64(10000*stage))
+	r.SetSeed(decorationSeed + int64(int32(featureIndex)) + int64(int32(10000*int32(stage))))
+}
+
+func (r *WorldgenRandom) SetLargeFeatureSeed(seed int64, chunkX, chunkZ int) {
+	r.SetSeed(seed)
+	a := r.NextLong()
+	b := r.NextLong()
+	r.SetSeed(int64(int32(chunkX))*a ^ int64(int32(chunkZ))*b ^ seed)
+}
+
+func (r *WorldgenRandom) SetLargeFeatureWithSalt(seed int64, chunkX, chunkZ, salt int) {
+	r.SetSeed(int64(int32(chunkX))*341873128712 + int64(int32(chunkZ))*132897987541 + seed + int64(int32(salt)))
 }
 
 func (r *WorldgenRandom) next(bits uint) int32 {
@@ -476,10 +498,41 @@ func (r *WorldgenRandom) ForkPositional() PositionalRandomFactory {
 	return r.source.ForkPositional()
 }
 
-func javaStringHashCode(s string) int32 {
+// JavaStringHashCode ports java.lang.String.hashCode(), which computes a
+// 32-bit polynomial rolling hash (multiplier 31) over UTF-16 code units.
+func JavaStringHashCode(s string) int32 {
 	var h int32
-	for i := 0; i < len(s); i++ {
-		h = 31*h + int32(s[i])
+	for _, r := range s {
+		if r <= 0xFFFF {
+			h = 31*h + int32(uint16(r))
+		} else {
+			r1, r2 := utf16.EncodeRune(r)
+			h = 31*h + int32(uint16(r1))
+			h = 31*h + int32(uint16(r2))
+		}
 	}
 	return h
+}
+
+func javaStringHashCode(s string) int32 {
+	return JavaStringHashCode(s)
+}
+
+// ParseWorldSeed ports WorldOptions.parseSeed(String) from vanilla 26.1.2:
+//  1. Trims leading and trailing characters <= ' ' (Java String.trim()).
+//  2. If the trimmed string is empty, returns (0, false) (OptionalLong.empty()).
+//  3. Attempts signed 64-bit base-10 integer parsing (Long.parseLong).
+//  4. On NumberFormatException (non-numeric or out of int64 range), returns
+//     int64(String.hashCode()) sign-extended from int32 to int64.
+func ParseWorldSeed(raw string) (int64, bool) {
+	trimmed := strings.TrimFunc(raw, func(r rune) bool {
+		return r <= ' '
+	})
+	if trimmed == "" {
+		return 0, false
+	}
+	if v, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return v, true
+	}
+	return int64(JavaStringHashCode(trimmed)), true
 }
