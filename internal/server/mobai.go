@@ -69,6 +69,9 @@ type mobMemory struct {
 	creeperFuseTicks int
 	creeperSwellDir int8
 	creeperIgnited  bool
+	creeperMaxSwell        int
+	creeperExplosionRadius int
+	creeperCustomRadiusSet bool
 	provoked        bool
 	panicTicks      int
 	inLoveTicks      int

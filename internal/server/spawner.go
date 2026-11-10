@@ -452,19 +452,49 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 			)
 			attackDmg = ZombieAttackDamage
 		case MobTypeSkeleton:
-			nextX, nextY, nextZ, nextYaw, shootTarget = stepHostileSkeletonAI(
-				s.chunks, rng, mem, t.playerTargets,
-				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
-			)
+			if !s.IsSkeletonHoldingBow(snapshot.ID) {
+				nextX, nextY, nextZ, nextYaw, attackTarget = stepHostileZombieAI(
+					s.chunks, rng, mem, t.playerTargets,
+					snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+				)
+				attackDmg = ZombieAttackDamage
+			} else {
+				nextX, nextY, nextZ, nextYaw, shootTarget = stepHostileSkeletonAI(
+					s.chunks, rng, mem, t.playerTargets,
+					snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+				)
+				if shootTarget != nil && s.Difficulty() == DifficultyHard {
+					mem.attackCooldown = SkeletonHardAttackIntervalTicks
+				}
+			}
 		case MobTypeBogged:
-			nextX, nextY, nextZ, nextYaw, shootTarget = s.stepHostileBoggedAI(
-				s.chunks, rng, mem, t.playerTargets,
-				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
-			)
+			if !s.IsSkeletonHoldingBow(snapshot.ID) {
+				nextX, nextY, nextZ, nextYaw, attackTarget = stepHostileZombieAI(
+					s.chunks, rng, mem, t.playerTargets,
+					snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+				)
+				attackDmg = ZombieAttackDamage
+			} else {
+				nextX, nextY, nextZ, nextYaw, shootTarget = s.stepHostileBoggedAI(
+					s.chunks, rng, mem, t.playerTargets,
+					snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
+				)
+			}
 		case MobTypeCreeper:
 			if _, fx, _, fz, ok := s.HasCatOrOcelotNearPosition(snapshot.EffectiveDimension(), snapshot.X, float64(feetY), snapshot.Z, CatCreeperRepelRange); ok {
-				if mem.creeperFuseTicks > 0 || mem.creeperSwellDir != 0 {
-					mem.creeperFuseTicks = 0
+				if mem.creeperFuseTicks > 0 {
+					if mem.creeperSwellDir != -1 {
+						mem.creeperSwellDir = -1
+						swellChanged = true
+					}
+					mem.creeperFuseTicks--
+					if mem.creeperFuseTicks <= 0 {
+						mem.creeperFuseTicks = 0
+						mem.creeperSwellDir = 0
+						swellChanged = true
+					}
+					swellDir = mem.creeperSwellDir
+				} else if mem.creeperSwellDir != 0 {
 					mem.creeperSwellDir = 0
 					swellChanged = true
 					swellDir = 0
@@ -476,8 +506,12 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 					awayX = 1.0
 					dist = 1.0
 				}
-				tx := snapshot.X + (awayX/dist)*CreeperChaseSpeed
-				tz := snapshot.Z + (awayZ/dist)*CreeperChaseSpeed
+				speedMod := CreeperAvoidCatWalkSpeedModifier
+				if dist*dist < CreeperAvoidCatSprintDistSqThreshold {
+					speedMod = CreeperAvoidCatSprintSpeedModifier
+				}
+				tx := snapshot.X + (awayX/dist)*(CreeperChaseSpeed*speedMod)
+				tz := snapshot.Z + (awayZ/dist)*(CreeperChaseSpeed*speedMod)
 				nextYaw = yawToward(awayX, awayZ)
 				if s.chunks != nil {
 					if nx, ny, nz, stepOK := tryApplyHorizontalStep(s.chunks, snapshot.X, feetY, snapshot.Z, tx, tz); stepOK {

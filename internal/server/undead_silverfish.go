@@ -1043,23 +1043,28 @@ func (s *Server) StepSkeletonPowderSnowConversion(entityID int32, ticks int) (st
 	}
 
 	startedConversion := false
+	stoppedConversion := false
 	finishConversion := false
-	if st.Converting {
-		st.ConversionTicks -= ticks
-		if st.ConversionTicks <= 0 {
-			finishConversion = true
+	if inPowderSnow {
+		if st.Converting {
+			st.ConversionTicks -= ticks
+			if st.ConversionTicks <= 0 {
+				finishConversion = true
+			}
+		} else {
+			st.InPowderSnowTicks += ticks
+			if st.InPowderSnowTicks >= SkeletonPowderSnowFreezeTicks {
+				st.Converting = true
+				st.ConversionTicks = SkeletonStrayConversionTicks
+				startedConversion = true
+			}
 		}
-	} else if inPowderSnow {
-		st.InPowderSnowTicks += ticks
-		if st.InPowderSnowTicks >= SkeletonPowderSnowFreezeTicks {
-			st.Converting = true
-			st.ConversionTicks = SkeletonStrayConversionTicks
-			startedConversion = true
-		}
-	} else if st.InPowderSnowTicks > 0 {
-		st.InPowderSnowTicks -= ticks
-		if st.InPowderSnowTicks < 0 {
-			st.InPowderSnowTicks = 0
+	} else {
+		st.InPowderSnowTicks = 0
+		st.ConversionTicks = 0
+		if st.Converting {
+			st.Converting = false
+			stoppedConversion = true
 		}
 	}
 	gearCopy := *st
@@ -1070,6 +1075,9 @@ func (s *Server) StepSkeletonPowderSnowConversion(entityID int32, ticks int) (st
 	if startedConversion {
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 			EncodeSkeletonConversionDataPacket(entityID, true))
+	} else if stoppedConversion {
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+			EncodeSkeletonConversionDataPacket(entityID, false))
 	}
 	if !finishConversion {
 		return 0, false
@@ -1660,20 +1668,38 @@ func (s *Server) tickHostileUndeadCombat(ent *world.Entity, norm string, rng *ra
 		}
 
 	case MobTypeStray:
-		if horizDist > SkeletonIdealStopDist {
-			nx := ent.X + (dx/horizDist)*SkeletonChaseSpeed
-			nz := ent.Z + (dz/horizDist)*SkeletonChaseSpeed
-			s.entities.Update(ent.ID, func(e *world.Entity) {
-				e.X, e.Z, e.Yaw, e.HeadYaw = nx, nz, yaw, yaw
-			})
-		}
-		if dist3D <= SkeletonBowRange && cd <= 0 {
-			mgr.mu.Lock()
-			if st := mgr.undead[ent.ID]; st != nil {
-				st.AttackCooldown = SkeletonShootCooldownTicks
+		if !s.IsSkeletonHoldingBow(ent.ID) {
+			if horizDist > ZombieAttackStopDist {
+				nx := ent.X + (dx/horizDist)*(SkeletonChaseSpeed*SkeletonMeleeAttackSpeedModifier)
+				nz := ent.Z + (dz/horizDist)*(SkeletonChaseSpeed*SkeletonMeleeAttackSpeedModifier)
+				s.entities.Update(ent.ID, func(e *world.Entity) {
+					e.X, e.Z, e.Yaw, e.HeadYaw = nx, nz, yaw, yaw
+				})
 			}
-			mgr.mu.Unlock()
-			s.ShootStrayArrowAtPlayer(ent.ID, ent.X, ent.Y, ent.Z, target)
+			if horizDist <= ZombieAttackReach && math.Abs(dy) <= ZombieAttackVerticalReach && cd <= 0 {
+				mgr.mu.Lock()
+				if st := mgr.undead[ent.ID]; st != nil {
+					st.AttackCooldown = ZombieAttackCooldownTicks
+				}
+				mgr.mu.Unlock()
+				s.AttackPlayerFromMob(ent.ID, MobTypeStray, ent.X, ent.Z, target, ZombieAttackDamage)
+			}
+		} else {
+			if horizDist > SkeletonIdealStopDist {
+				nx := ent.X + (dx/horizDist)*SkeletonChaseSpeed
+				nz := ent.Z + (dz/horizDist)*SkeletonChaseSpeed
+				s.entities.Update(ent.ID, func(e *world.Entity) {
+					e.X, e.Z, e.Yaw, e.HeadYaw = nx, nz, yaw, yaw
+				})
+			}
+			if dist3D <= SkeletonBowRange && cd <= 0 {
+				mgr.mu.Lock()
+				if st := mgr.undead[ent.ID]; st != nil {
+					st.AttackCooldown = SkeletonAttackIntervalForDifficulty(MobTypeStray, s.Difficulty())
+				}
+				mgr.mu.Unlock()
+				s.ShootStrayArrowAtPlayer(ent.ID, ent.X, ent.Y, ent.Z, target)
+			}
 		}
 
 	case MobTypeWitherSkeleton:

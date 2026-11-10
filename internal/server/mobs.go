@@ -1142,13 +1142,18 @@ func stepHostileCreeperAI(
 		mem.repathCooldown--
 	}
 
+	maxSwell := CreeperFuseDurationTicks
+	if mem.creeperMaxSwell > 0 {
+		maxSwell = mem.creeperMaxSwell
+	}
+
 	if mem.creeperIgnited {
 		if mem.creeperSwellDir != 1 {
 			mem.creeperSwellDir = 1
 			swellChanged = true
 		}
 		mem.creeperFuseTicks++
-		if mem.creeperFuseTicks >= CreeperFuseDurationTicks {
+		if mem.creeperFuseTicks >= maxSwell {
 			return x, float64(feetY), z, yaw, swellChanged, true
 		}
 		return x, float64(feetY), z, yaw, swellChanged, false
@@ -1189,14 +1194,15 @@ func stepHostileCreeperAI(
 		nextYaw = yaw
 	}
 
-	// Determine swell direction: ignite at <= 3.0 blocks, continue swelling while <= 7.0 blocks.
-	if dist <= CreeperIgniteRange || (mem.creeperSwellDir > 0 && dist <= CreeperCancelRange) {
+	// Determine swell direction: ignite at <= 3.0 blocks, continue swelling while <= 7.0 blocks with line of sight.
+	hasLOS := hasCreeperLineOfSight(chunks, x, float64(feetY), z, target.x, target.y, target.z)
+	if hasLOS && (dist <= CreeperIgniteRange || (mem.creeperSwellDir > 0 && dist <= CreeperCancelRange)) {
 		if mem.creeperSwellDir != 1 {
 			mem.creeperSwellDir = 1
 			swellChanged = true
 		}
 		mem.creeperFuseTicks++
-		if mem.creeperFuseTicks >= CreeperFuseDurationTicks {
+		if mem.creeperFuseTicks >= maxSwell {
 			return x, float64(feetY), z, nextYaw, swellChanged, true
 		}
 		// Creepers stand still while actively swelling.
@@ -1329,12 +1335,18 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
 
-	radius := CreeperExplosionRadius
+	_, baseRadius := s.GetCreeperCustomConfig(entityID)
+	radius := float64(baseRadius)
 	wasCharged := s.IsCreeperCharged(entityID)
 	if wasCharged {
-		radius = ChargedCreeperExplosionRadius
+		radius *= float64(CreeperChargedRadiusMultiplier)
 	}
 	s.SetCreeperCharged(entityID, false)
+
+	var activeEffects []StatusEffectInstance
+	if entityID > 0 {
+		activeEffects = s.EntityEffects(entityID)
+	}
 
 	dim := world.DimensionOverworld
 	if s.entities != nil && entityID > 0 {
@@ -1343,6 +1355,9 @@ func (s *Server) TriggerCreeperExplosion(entityID int32, x, y, z float64) (playe
 		}
 		s.entities.Remove(entityID)
 		s.BroadcastChunk(cx, cz, protocol.PlayRemoveEntities, encodeRemoveEntitiesPacket(nil, []int32{entityID}))
+	}
+	if len(activeEffects) > 0 {
+		s.SpawnCreeperLingeringCloud(dim, x, y, z, activeEffects)
 	}
 
 	type preMobSnap struct {
