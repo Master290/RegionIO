@@ -4007,9 +4007,15 @@ func (s *Server) SetChunkForceLoaded(dim string, cx, cz int32, forced bool) bool
 	}
 	aux.mu.Unlock()
 	if forced {
+		s.AddChunkTicket(normDim, cx, cz, TicketTypeForced, TicketLevelForced, 0)
 		if cache := s.DimensionChunks(normDim); cache != nil {
 			_ = cache.GetBlock(int(cx)*16, 64, int(cz)*16)
 		}
+	} else {
+		s.RemoveChunkTicket(normDim, cx, cz, TicketTypeForced)
+	}
+	if changed {
+		_ = s.SaveForceLoadedChunksFile()
 	}
 	return changed
 }
@@ -4052,9 +4058,20 @@ func (s *Server) ClearForceLoadedChunks(dim string) int {
 	normDim := world.NormalizeDimension(dim)
 	aux := s.cmdAux()
 	aux.mu.Lock()
-	defer aux.mu.Unlock()
-	n := len(aux.forceLoadedChunks[normDim])
+	old := aux.forceLoadedChunks[normDim]
+	coords := make([][2]int32, 0, len(old))
+	for k := range old {
+		coords = append(coords, k)
+	}
+	n := len(old)
 	delete(aux.forceLoadedChunks, normDim)
+	aux.mu.Unlock()
+	for _, c := range coords {
+		s.RemoveChunkTicket(normDim, c[0], c[1], TicketTypeForced)
+	}
+	if n > 0 {
+		_ = s.SaveForceLoadedChunksFile()
+	}
 	return n
 }
 

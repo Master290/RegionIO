@@ -198,6 +198,146 @@ func ParseProperties(r io.Reader, base Config) (Config, error) {
 			if trimmed := strings.TrimSpace(val); trimmed != "" {
 				cfg.BugReportLink = trimmed
 			}
+		case "simulation-distance":
+			sd, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || sd < 2 || sd > 32 {
+				return base, fmt.Errorf("server.properties:%d: invalid simulation-distance %q", lineNo, val)
+			}
+			cfg.SimulationDistance = sd
+		case "gamemode":
+			gm := strings.ToLower(strings.TrimSpace(val))
+			switch gm {
+			case "0", "survival", "s":
+				cfg.Gamemode = "survival"
+			case "1", "creative", "c":
+				cfg.Gamemode = "creative"
+			case "2", "adventure", "a":
+				cfg.Gamemode = "adventure"
+			case "3", "spectator", "sp":
+				cfg.Gamemode = "spectator"
+			default:
+				return base, fmt.Errorf("server.properties:%d: invalid gamemode %q", lineNo, val)
+			}
+		case "force-gamemode":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid force-gamemode %q", lineNo, val)
+			}
+			cfg.ForceGamemode = b
+		case "pvp":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid pvp %q", lineNo, val)
+			}
+			cfg.PvP = b
+		case "allow-flight":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid allow-flight %q", lineNo, val)
+			}
+			cfg.AllowFlight = b
+		case "spawn-protection":
+			sp, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || sp < 0 {
+				return base, fmt.Errorf("server.properties:%d: invalid spawn-protection %q", lineNo, val)
+			}
+			cfg.SpawnProtection = sp
+		case "max-world-size":
+			mws, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || mws < 1 || mws > 29999984 {
+				return base, fmt.Errorf("server.properties:%d: invalid max-world-size %q", lineNo, val)
+			}
+			cfg.MaxWorldSize = mws
+		case "max-tick-time":
+			mtt, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid max-tick-time %q", lineNo, val)
+			}
+			cfg.MaxTickTime = mtt
+		case "rate-limit":
+			rl, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || rl < 0 {
+				return base, fmt.Errorf("server.properties:%d: invalid rate-limit %q", lineNo, val)
+			}
+			cfg.RateLimit = rl
+		case "enable-rcon":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid enable-rcon %q", lineNo, val)
+			}
+			cfg.EnableRCON = b
+		case "rcon.port":
+			port, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || port < 1 || port > 65535 {
+				return base, fmt.Errorf("server.properties:%d: invalid rcon.port %q", lineNo, val)
+			}
+			cfg.RCONPort = port
+		case "rcon.password":
+			cfg.RCONPassword = val
+		case "broadcast-rcon-to-ops":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid broadcast-rcon-to-ops %q", lineNo, val)
+			}
+			cfg.BroadcastRCONToOps = b
+		case "enable-query":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid enable-query %q", lineNo, val)
+			}
+			cfg.EnableQuery = b
+		case "query.port":
+			port, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || port < 1 || port > 65535 {
+				return base, fmt.Errorf("server.properties:%d: invalid query.port %q", lineNo, val)
+			}
+			cfg.QueryPort = port
+		case "enable-status":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid enable-status %q", lineNo, val)
+			}
+			cfg.EnableStatus = b
+		case "sync-chunk-writes":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid sync-chunk-writes %q", lineNo, val)
+			}
+			cfg.SyncChunkWrites = b
+		case "generate-structures":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid generate-structures %q", lineNo, val)
+			}
+			cfg.GenerateStructures = b
+		case "level-type":
+			if trimmed := strings.TrimSpace(val); trimmed != "" {
+				cfg.LevelType = trimmed
+			}
+		case "op-permission-level":
+			lvl, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || lvl < 1 || lvl > 4 {
+				return base, fmt.Errorf("server.properties:%d: invalid op-permission-level %q", lineNo, val)
+			}
+			cfg.OpPermissionLevel = lvl
+		case "function-permission-level":
+			lvl, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || lvl < 1 || lvl > 4 {
+				return base, fmt.Errorf("server.properties:%d: invalid function-permission-level %q", lineNo, val)
+			}
+			cfg.FunctionPermissionLevel = lvl
+		case "player-idle-timeout":
+			to, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || to < 0 {
+				return base, fmt.Errorf("server.properties:%d: invalid player-idle-timeout %q", lineNo, val)
+			}
+			cfg.PlayerIdleTimeout = to
+		case "prevent-proxy-connections":
+			b, err := strconv.ParseBool(strings.TrimSpace(val))
+			if err != nil {
+				return base, fmt.Errorf("server.properties:%d: invalid prevent-proxy-connections %q", lineNo, val)
+			}
+			cfg.PreventProxyConnections = b
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -287,32 +427,110 @@ func WriteProperties(w io.Writer, cfg Config) error {
 	if diff == "" {
 		diff = "normal"
 	}
+	gm := cfg.Gamemode
+	if gm == "" {
+		gm = "survival"
+	}
+	simDist := cfg.SimulationDistance
+	if simDist < 2 {
+		simDist = 10
+	}
+	rconPort := cfg.RCONPort
+	if rconPort <= 0 {
+		rconPort = 25575
+	}
+	queryPort := cfg.QueryPort
+	if queryPort <= 0 {
+		queryPort = 25565
+	}
+	maxWorldSize := cfg.MaxWorldSize
+	if maxWorldSize <= 0 {
+		maxWorldSize = 29999984
+	}
+	lvlType := cfg.LevelType
+	if lvlType == "" {
+		lvlType = "minecraft:normal"
+	}
+	opLvl := cfg.OpPermissionLevel
+	if opLvl < 1 || opLvl > 4 {
+		opLvl = 4
+	}
+	fnLvl := cfg.FunctionPermissionLevel
+	if fnLvl < 1 || fnLvl > 4 {
+		fnLvl = 2
+	}
 	_, err := fmt.Fprintf(w,
 		"#Minecraft server properties\n"+
 			"server-ip=%s\n"+
 			"server-port=%d\n"+
 			"level-name=%s\n"+
 			"level-seed=%d\n"+
+			"level-type=%s\n"+
+			"generate-structures=%t\n"+
 			"view-distance=%d\n"+
+			"simulation-distance=%d\n"+
 			"max-players=%d\n"+
 			"motd=%s\n"+
 			"online-mode=%t\n"+
 			"white-list=%t\n"+
 			"network-compression-threshold=%d\n"+
 			"difficulty=%s\n"+
-			"hardcore=%t\n",
+			"gamemode=%s\n"+
+			"force-gamemode=%t\n"+
+			"hardcore=%t\n"+
+			"pvp=%t\n"+
+			"allow-flight=%t\n"+
+			"spawn-protection=%d\n"+
+			"max-world-size=%d\n"+
+			"max-tick-time=%d\n"+
+			"rate-limit=%d\n"+
+			"enable-rcon=%t\n"+
+			"rcon.port=%d\n"+
+			"rcon.password=%s\n"+
+			"broadcast-rcon-to-ops=%t\n"+
+			"enable-query=%t\n"+
+			"query.port=%d\n"+
+			"enable-status=%t\n"+
+			"sync-chunk-writes=%t\n"+
+			"op-permission-level=%d\n"+
+			"function-permission-level=%d\n"+
+			"player-idle-timeout=%d\n"+
+			"prevent-proxy-connections=%t\n",
 		cfg.Host,
 		cfg.Port,
 		cfg.WorldDir,
 		cfg.WorldSeed,
+		lvlType,
+		cfg.GenerateStructures,
 		cfg.MaxViewDistance,
+		simDist,
 		cfg.MaxPlayers,
 		strings.ReplaceAll(cfg.MOTD, "\n", `\n`),
 		cfg.OnlineMode,
 		cfg.EnforceWhitelist,
 		cfg.CompressionThreshold,
 		diff,
+		gm,
+		cfg.ForceGamemode,
 		cfg.Hardcore,
+		cfg.PvP,
+		cfg.AllowFlight,
+		cfg.SpawnProtection,
+		maxWorldSize,
+		cfg.MaxTickTime,
+		cfg.RateLimit,
+		cfg.EnableRCON,
+		rconPort,
+		cfg.RCONPassword,
+		cfg.BroadcastRCONToOps,
+		cfg.EnableQuery,
+		queryPort,
+		cfg.EnableStatus,
+		cfg.SyncChunkWrites,
+		opLvl,
+		fnLvl,
+		cfg.PlayerIdleTimeout,
+		cfg.PreventProxyConnections,
 	)
 	return err
 }

@@ -82,29 +82,84 @@ type Config struct {
 	// GenWorkers configures the parallel chunk generation worker pool size
 	// (0 = default max(1, runtime.NumCPU()-1)).
 	GenWorkers int
+	// SimulationDistance sets the server simulation distance in chunks (2..32).
+	SimulationDistance int
+	// Gamemode sets the default game mode ("survival", "creative", "adventure", "spectator").
+	Gamemode string
+	// ForceGamemode forces joining players into the default game mode when true.
+	ForceGamemode bool
+	// PvP controls whether player-versus-player combat is enabled.
+	PvP bool
+	// AllowFlight controls whether survival flight anti-cheat is relaxed.
+	AllowFlight bool
+	// SpawnProtection sets the radius around world spawn protected from non-op edits.
+	SpawnProtection int
+	// MaxWorldSize sets the maximum world border radius in blocks.
+	MaxWorldSize int
+	// MaxTickTime sets the maximum milliseconds a single tick may take before watchdog alert (-1 disables).
+	MaxTickTime int64
+	// RateLimit sets the packet rate limit per second per player (0 = default cap).
+	RateLimit int
+	// EnableRCON enables the Source RCON TCP administration server.
+	EnableRCON bool
+	// RCONPort sets the TCP port for RCON (default 25575).
+	RCONPort int
+	// RCONPassword sets the password required to authenticate with RCON.
+	RCONPassword string
+	// BroadcastRCONToOps controls whether RCON command output is broadcast to online operators.
+	BroadcastRCONToOps bool
+	// EnableQuery enables the GS4 UDP query server.
+	EnableQuery bool
+	// QueryPort sets the UDP port for GS4 query (default 25565).
+	QueryPort int
+	// EnableStatus controls whether the server responds to status/MOTD pings.
+	EnableStatus bool
+	// SyncChunkWrites controls whether chunk writes are flushed synchronously.
+	SyncChunkWrites bool
+	// GenerateStructures controls whether worldgen structures are generated.
+	GenerateStructures bool
+	// LevelType sets the world preset type (e.g. "minecraft:normal", "minecraft:flat").
+	LevelType string
+	// OpPermissionLevel sets the default permission level granted by /op (1..4, default 4).
+	OpPermissionLevel int
+	// FunctionPermissionLevel sets the permission level granted to datapack functions (1..4, default 2).
+	FunctionPermissionLevel int
+	// PlayerIdleTimeout sets the idle kick timeout in minutes (0 = disabled).
+	PlayerIdleTimeout int
+	// PreventProxyConnections disconnects players whose IP differs from session auth.
+	PreventProxyConnections bool
 }
 
 // DefaultConfig returns sensible defaults matching vanilla expectations.
 func DefaultConfig() Config {
 	return Config{
-		Host:                 "0.0.0.0",
-		Port:                 25565,
-		MOTD:                 "RegionIO — a Minecraft server in Go",
-		MaxPlayers:           20,
-		CompressionThreshold: 256,
-		// WorldSeed defaults to 0 for backward compatibility; operators override
-		// it via the REGIONIO_SEED env var or the -seed flag.
-		WorldSeed: 0,
-		// WorldDir defaults to "world" so the world persists by default;
-		// set to "" for a throwaway in-memory world.
-		WorldDir: "world",
-		// MaxCachedChunks keeps the live cache near 200MB at the default; the
-		// streamer's pre-gen ring and player view distance comfortably fit.
-		MaxCachedChunks: 1024,
-		MaxViewDistance: 2,
-		Difficulty:      "normal",
-		Hardcore:        false,
-		AcceptsTransfers: true,
+		Host:                    "0.0.0.0",
+		Port:                    25565,
+		MOTD:                    "RegionIO — a Minecraft server in Go",
+		MaxPlayers:              20,
+		CompressionThreshold:    256,
+		WorldSeed:               0,
+		WorldDir:                "world",
+		MaxCachedChunks:         1024,
+		MaxViewDistance:         2,
+		SimulationDistance:      10,
+		Difficulty:              "normal",
+		Hardcore:                false,
+		AcceptsTransfers:        true,
+		Gamemode:                "survival",
+		PvP:                     true,
+		SpawnProtection:         16,
+		MaxWorldSize:            29999984,
+		MaxTickTime:             60000,
+		RCONPort:                25575,
+		BroadcastRCONToOps:      true,
+		QueryPort:               25565,
+		EnableStatus:            true,
+		SyncChunkWrites:         true,
+		GenerateStructures:      true,
+		LevelType:               "minecraft:normal",
+		OpPermissionLevel:       4,
+		FunctionPermissionLevel: 2,
 	}
 }
 
@@ -336,12 +391,36 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 	if cfg.Hardcore {
 		s.SetHardcore(true)
 	}
+	if cfg.SimulationDistance >= 2 && cfg.SimulationDistance <= 32 {
+		s.SetSimulationDistance(cfg.SimulationDistance)
+	}
+	if cfg.Gamemode != "" {
+		ws := s.worldSettings()
+		ws.mu.Lock()
+		switch strings.ToLower(strings.TrimSpace(cfg.Gamemode)) {
+		case "0", "survival", "s":
+			ws.hasDefaultGameMode = true
+			ws.defaultGameMode = GameModeSurvival
+		case "1", "creative", "c":
+			ws.hasDefaultGameMode = true
+			ws.defaultGameMode = GameModeCreative
+		case "2", "adventure", "a":
+			ws.hasDefaultGameMode = true
+			ws.defaultGameMode = GameModeAdventure
+		case "3", "spectator", "sp":
+			ws.hasDefaultGameMode = true
+			ws.defaultGameMode = GameModeSpectator
+		}
+		ws.mu.Unlock()
+	}
 	s.RegisterWardenSummonHook()
 	if store != nil {
 		_ = s.LoadFurnaces()
 	}
 	if cfg.WorldDir != "" {
 		_ = s.LoadWorldSettingsFile()
+		_ = s.LoadLevelDat()
+		_ = s.LoadForceLoadedChunksFile()
 		_ = s.LoadDecorationsFile()
 		_ = s.LoadAllMaps()
 		_ = s.LoadScoreboardFile()
@@ -600,6 +679,12 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveWorldSettingsFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveLevelDat(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveForceLoadedChunksFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveWorldTime(); err != nil && firstErr == nil {

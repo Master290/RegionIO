@@ -66,7 +66,14 @@ var (
 )
 
 func (h *handler) checkPacketRateLimit(now time.Time) error {
-	if h == nil || h.rateLimitMaxPerSec <= 0 {
+	if h == nil {
+		return nil
+	}
+	limit := h.rateLimitMaxPerSec
+	if limit == 0 && h.srv != nil {
+		limit = h.srv.Config().RateLimit
+	}
+	if limit <= 0 {
 		return nil
 	}
 	if h.rateWindowStart.IsZero() || now.Sub(h.rateWindowStart) >= time.Second {
@@ -74,7 +81,7 @@ func (h *handler) checkPacketRateLimit(now time.Time) error {
 		h.ratePacketCount = 0
 	}
 	h.ratePacketCount++
-	if h.ratePacketCount > h.rateLimitMaxPerSec {
+	if h.ratePacketCount > limit {
 		if h.conn != nil && h.conn.State() == protocol.StatePlay {
 			_ = h.conn.Send(protocol.PlayDisconnect, server.EncodeDisconnectPacket(server.TranslatableComponent("disconnect.exceeded_packet_rate")))
 		}
@@ -198,6 +205,9 @@ func (h *handler) handleHandshake(pkt protocol.Packet) error {
 func (h *handler) handleStatus(pkt protocol.Packet) error {
 	switch pkt.ID {
 	case protocol.StatusRequestID:
+		if h.srv != nil && !h.srv.StatusEnabled() {
+			return nil
+		}
 		jsonBytes, err := h.srv.StatusJSON(h.srv.PlayerCount())
 		if err != nil {
 			return err
