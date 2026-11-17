@@ -3678,7 +3678,7 @@ func loadFeatureSet(data []byte) (*FeatureSet, error) {
 			if err := json.Unmarshal(raw, &tag); err != nil {
 				return nil, fmt.Errorf("worldgen: block tag %s: %w", name, err)
 			}
-			set.BlockTags[name] = tag.Values
+			set.BlockTags[blockTagResourceName(file.Name)] = tag.Values
 		}
 	}
 	if len(set.Configured) < 200 || len(set.Placed) < 250 || len(set.Biomes) < 60 {
@@ -3749,6 +3749,17 @@ func (s *FeatureSet) prewarmInlineFeatures() {
 func resourceName(file string) string {
 	base := strings.TrimSuffix(path.Base(file), ".json")
 	return "minecraft:" + base
+}
+
+func blockTagResourceName(file string) string {
+	if prefix, rel, ok := strings.Cut(file, "/tags/block/"); ok {
+		ns := path.Base(prefix)
+		if ns == "" || ns == "." || ns == "/" {
+			ns = "minecraft"
+		}
+		return ns + ":" + strings.TrimSuffix(rel, ".json")
+	}
+	return resourceName(file)
 }
 
 // fieldIn reports whether name appears in a measured field set.

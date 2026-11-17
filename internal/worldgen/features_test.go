@@ -55,6 +55,16 @@ func TestFeatureDatapackLoadsAndLinks(t *testing.T) {
 	if len(set.BlockTags["minecraft:stone_ore_replaceables"]) == 0 {
 		t.Fatal("stone_ore_replaceables tag missing")
 	}
+	for _, subDirTag := range []string{
+		"minecraft:mineable/axe",
+		"minecraft:mineable/pickaxe",
+		"minecraft:mineable/shovel",
+		"minecraft:mineable/hoe",
+	} {
+		if len(set.BlockTags[subDirTag]) == 0 {
+			t.Fatalf("subdirectory block tag %s missing from FeatureSet.BlockTags", subDirTag)
+		}
+	}
 	ore, err := set.Ore("minecraft:ore_diamond_small")
 	if err != nil || ore.Size != 4 || len(ore.Targets) != 2 {
 		t.Fatalf("diamond config = %+v, err=%v", ore, err)

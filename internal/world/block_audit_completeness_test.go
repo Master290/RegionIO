@@ -2,7 +2,10 @@ package world
 
 import (
 	"math/rand"
+	"strings"
 	"testing"
+
+	"regionio/internal/worldgen"
 )
 
 func TestAuditBlockRegistryCompletenessAgainstVanilla26_1_2(t *testing.T) {
@@ -104,6 +107,140 @@ func TestVanilla26_1_2BlockTagsCompletenessAndToolTiers(t *testing.T) {
 	scaffolding, _ := DefaultBlockStateID("minecraft:scaffolding")
 	if !IsClimbableBlock(ladder) || !IsClimbableBlock(scaffolding) || IsClimbableBlock(StateStone) {
 		t.Fatal("unexpected IsClimbableBlock result")
+	}
+}
+
+func TestEnsureBlockTagsLoadedExpandsNestedSubtags26_1_2(t *testing.T) {
+	set, err := worldgen.LoadFeatureSet()
+	if err != nil || set == nil {
+		t.Fatalf("LoadFeatureSet failed: %v", err)
+	}
+
+	allTags := AllBlockTagNames()
+	if len(allTags) != 248 {
+		t.Fatalf("len(AllBlockTagNames()) = %d, want 248", len(allTags))
+	}
+
+	for _, tag := range allTags {
+		names := BlockNamesInTag(tag)
+		wantRaw := flattenBlockTag(set, tag, nil)
+		wantSet := make(map[string]bool, len(wantRaw))
+		for _, rawName := range wantRaw {
+			wantSet[normalizeResourceID(rawName)] = true
+		}
+		if len(names) != len(wantSet) {
+			t.Fatalf("tag %s: len(BlockNamesInTag) = %d, want %d expanded unique blocks (got=%v)", tag, len(names), len(wantSet), names)
+		}
+
+		wantStateCount := 0
+		for _, bName := range names {
+			if strings.Contains(bName, "#") {
+				t.Fatalf("tag %s contains unexpanded subtag reference %q", tag, bName)
+			}
+			defID, ok := DefaultBlockStateID(bName)
+			if !ok {
+				t.Fatalf("tag %s contains unknown block %q", tag, bName)
+			}
+			if !wantSet[bName] {
+				t.Fatalf("tag %s contains unexpected block %q", tag, bName)
+			}
+			if !HasBlockNameTag(bName, tag) || !HasBlockTag(defID, tag) {
+				t.Fatalf("HasBlockNameTag/HasBlockTag(%s, %s) = false, want true", bName, tag)
+			}
+			wantStateCount += len(BlockStateIDsForBlock(bName))
+		}
+		if gotStates := len(BlockStatesInTag(tag)); gotStates != wantStateCount {
+			t.Fatalf("tag %s: len(BlockStatesInTag) = %d, want %d", tag, gotStates, wantStateCount)
+		}
+	}
+
+	// Exact expanded counts from Vanilla 26.1.2 data/minecraft/tags/block/*.json:
+	wantExpandedCounts := []struct {
+		tag  string
+		want int
+	}{
+		{"minecraft:enderman_holdable", 45},
+		{"minecraft:mineable/axe", 286},
+		{"minecraft:mineable/pickaxe", 482},
+		{"minecraft:mineable/shovel", 36},
+		{"minecraft:mineable/hoe", 29},
+		{"minecraft:needs_stone_tool", 91},
+		{"minecraft:sword_efficient", 22},
+		{"minecraft:logs", 44},
+		{"minecraft:flowers", 31},
+	}
+	for _, tc := range wantExpandedCounts {
+		if got := len(BlockNamesInTag(tc.tag)); got != tc.want {
+			t.Fatalf("len(BlockNamesInTag(%q)) = %d, want %d", tc.tag, got, tc.want)
+		}
+	}
+
+	// Multi-level nested subtags (e.g. mineable/axe -> #logs -> #logs_that_burn -> #oak_logs -> oak_log):
+	nestedMembers := []struct {
+		block string
+		tag   string
+	}{
+		{"minecraft:dandelion", "minecraft:enderman_holdable"},
+		{"minecraft:open_eyeblossom", "minecraft:enderman_holdable"},
+		{"minecraft:grass_block", "minecraft:enderman_holdable"},
+		{"minecraft:pale_moss_block", "minecraft:enderman_holdable"},
+		{"minecraft:oak_planks", "minecraft:mineable/axe"},
+		{"minecraft:oak_log", "minecraft:mineable/axe"},
+		{"minecraft:crimson_stem", "minecraft:mineable/axe"},
+		{"minecraft:oak_shelf", "minecraft:mineable/axe"},
+		{"minecraft:white_banner", "minecraft:mineable/axe"},
+		{"minecraft:oak_hanging_sign", "minecraft:mineable/axe"},
+		{"minecraft:copper_chest", "minecraft:needs_stone_tool"},
+		{"minecraft:exposed_lightning_rod", "minecraft:needs_stone_tool"},
+		{"minecraft:white_concrete_powder", "minecraft:mineable/shovel"},
+		{"minecraft:oak_leaves", "minecraft:mineable/hoe"},
+	}
+	for _, tc := range nestedMembers {
+		st, ok := DefaultBlockStateID(tc.block)
+		if !ok {
+			t.Fatalf("missing block %s", tc.block)
+		}
+		if !HasBlockTag(st, tc.tag) {
+			t.Fatalf("expected %s to match expanded tag %s", tc.block, tc.tag)
+		}
+	}
+
+	// Copper chest and oxidized/exposed lightning rods come from #copper_chests / #lightning_rods in needs_stone_tool:
+	copperChest, _ := DefaultBlockStateID("minecraft:copper_chest")
+	exposedRod, _ := DefaultBlockStateID("minecraft:exposed_lightning_rod")
+	if MinimumToolTierForBlock(copperChest) != TierStoneCopper {
+		t.Fatalf("MinimumToolTierForBlock(copper_chest) = %v, want TierStoneCopper", MinimumToolTierForBlock(copperChest))
+	}
+	if MinimumToolTierForBlock(exposedRod) != TierStoneCopper {
+		t.Fatalf("MinimumToolTierForBlock(exposed_lightning_rod) = %v, want TierStoneCopper", MinimumToolTierForBlock(exposedRod))
+	}
+
+	// Rails, stone buttons, lanterns, and copper golem statues are in #mineable/pickaxe via subtags
+	// (pickaxe speeds up breaking) but do NOT set requiresCorrectToolForDrops() in Vanilla 26.1.2 Blocks.class:
+	for _, nonReq := range []string{
+		"minecraft:rail",
+		"minecraft:powered_rail",
+		"minecraft:stone_button",
+		"minecraft:lantern",
+		"minecraft:copper_golem_statue",
+	} {
+		st, _ := DefaultBlockStateID(nonReq)
+		if EffectiveToolForBlock(st) != ToolPickaxe {
+			t.Fatalf("EffectiveToolForBlock(%s) = %v, want ToolPickaxe", nonReq, EffectiveToolForBlock(st))
+		}
+		if RequiresCorrectToolForDrops(st) {
+			t.Fatalf("RequiresCorrectToolForDrops(%s) = true, want false (hand-harvestable in Vanilla 26.1.2)", nonReq)
+		}
+	}
+
+	// Cycle guard in expandBlockTagNames must terminate cleanly without infinite recursion:
+	cyclic := map[string][]string{
+		"minecraft:a": {"#minecraft:b", "minecraft:stone"},
+		"minecraft:b": {"#minecraft:a", "minecraft:dirt"},
+	}
+	gotCyclic := expandBlockTagNames(cyclic, "#minecraft:a", make(map[string]bool))
+	if len(gotCyclic) != 2 || gotCyclic[0] != "minecraft:dirt" || gotCyclic[1] != "minecraft:stone" {
+		t.Fatalf("expandBlockTagNames on cyclic graph = %v, want [minecraft:dirt minecraft:stone]", gotCyclic)
 	}
 }
 

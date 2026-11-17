@@ -188,6 +188,33 @@ func normalizeTagName(tag string) string {
 	return t
 }
 
+func expandBlockTagNames(rawByTag map[string][]string, tag string, visiting map[string]bool) []string {
+	norm := normalizeTagName(tag)
+	if norm == "" || visiting[norm] {
+		return nil
+	}
+	visiting[norm] = true
+	defer delete(visiting, norm)
+
+	rawEntries := rawByTag[norm]
+	if len(rawEntries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(rawEntries))
+	for _, raw := range rawEntries {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			out = append(out, expandBlockTagNames(rawByTag, trimmed[1:], visiting)...)
+		} else if nb := normalizeResourceID(trimmed); nb != "" {
+			out = append(out, nb)
+		}
+	}
+	return out
+}
+
 func ensureBlockTagsLoaded() {
 	blockTagsOnce.Do(func() {
 		stateByIDOnce.Do(buildStateTable)
@@ -198,19 +225,26 @@ func ensureBlockTagsLoaded() {
 			blockTagToStateIDs = make(map[string][]uint16)
 			return
 		}
-		blockTagNames = make([]string, 0, len(set.BlockTags))
-		blockTagToNames = make(map[string][]string, len(set.BlockTags))
-		blockTagToNameSet = make(map[string]map[string]bool, len(set.BlockTags))
-		blockTagToStateIDs = make(map[string][]uint16, len(set.BlockTags))
-
+		rawByNormTag := make(map[string][]string, len(set.BlockTags))
 		for tag, rawNames := range set.BlockTags {
 			normTag := normalizeTagName(tag)
+			if normTag != "" {
+				rawByNormTag[normTag] = rawNames
+			}
+		}
+
+		blockTagNames = make([]string, 0, len(rawByNormTag))
+		blockTagToNames = make(map[string][]string, len(rawByNormTag))
+		blockTagToNameSet = make(map[string]map[string]bool, len(rawByNormTag))
+		blockTagToStateIDs = make(map[string][]uint16, len(rawByNormTag))
+
+		for normTag := range rawByNormTag {
 			blockTagNames = append(blockTagNames, normTag)
-			nameSet := make(map[string]bool, len(rawNames))
-			names := make([]string, 0, len(rawNames))
+			expanded := expandBlockTagNames(rawByNormTag, normTag, make(map[string]bool))
+			nameSet := make(map[string]bool, len(expanded))
+			names := make([]string, 0, len(expanded))
 			var states []uint16
-			for _, bName := range rawNames {
-				nb := normalizeResourceID(bName)
+			for _, nb := range expanded {
 				if !nameSet[nb] {
 					nameSet[nb] = true
 					names = append(names, nb)

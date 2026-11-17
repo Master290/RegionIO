@@ -580,7 +580,12 @@ func RequiresCorrectToolForDrops(state uint16) bool {
 		"minecraft:infested_chiseled_stone_bricks", "minecraft:infested_deepslate":
 		return false
 	}
-	if strings.HasSuffix(name, "_shulker_box") {
+	if strings.HasSuffix(name, "_shulker_box") ||
+		HasBlockNameTag(name, "minecraft:shulker_boxes") ||
+		HasBlockNameTag(name, "minecraft:rails") ||
+		HasBlockNameTag(name, "minecraft:stone_buttons") ||
+		HasBlockNameTag(name, "minecraft:lanterns") ||
+		HasBlockNameTag(name, "minecraft:copper_golem_statues") {
 		return false
 	}
 	return isPickaxeMineableBlockName(name)
