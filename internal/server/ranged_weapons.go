@@ -614,21 +614,39 @@ func (s *Server) resolveArrowTrajectory(
 			nearby := s.entities.AppendInChunkRange(nil, cx, cz, 1)
 			for i := range nearby {
 				ent := &nearby[i]
+				canonEntType := canonicalResourceName(ent.TypeName)
 				if ent.ID == snap.EntityID || ent.ID == projID || hitEntities[ent.ID] ||
 					ent.IsItem() || ent.IsExperienceOrb() ||
 					ent.TypeName == EntityTypeFireworkRocket || IsHangingEntity(ent.TypeName) ||
-					IsStandardProjectileEntityType(ent.TypeName) {
+					(IsStandardProjectileEntityType(ent.TypeName) && canonEntType != EntityTypeFireball) {
 					continue
 				}
 				if ent.EffectiveDimension() != dim {
 					continue
 				}
+				minHitY := ent.Y - 0.2
 				maxHitY := ent.Y + 2.0
-				if canonicalResourceName(ent.TypeName) == MobTypeEnderman {
+				hitHalfW := 0.8
+				if canonEntType == MobTypeEnderman {
 					maxHitY = ent.Y + EndermanHeight
+				} else if canonEntType == EntityTypeFireball {
+					minHitY = ent.Y - 1.0
+					maxHitY = ent.Y + 2.0
+					hitHalfW = 1.0
 				}
-				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= maxHitY && math.Abs(ent.Z-rz) <= 0.8 {
+				if math.Abs(ent.X-rx) <= hitHalfW && ry >= minHitY && ry <= maxHitY && math.Abs(ent.Z-rz) <= hitHalfW {
 					hitEntities[ent.ID] = true
+					if canonEntType == EntityTypeFireball {
+						if s.DeflectGhastFireballByProjectile2612(ent.ID, session, lx, ly, lz) {
+							consumedArrowOnHit = piercingLevel <= 0
+							entityHits++
+							if entityHits >= maxEntityHits {
+								landX, landY, landZ = rx, ry, rz
+								break
+							}
+							continue
+						}
+					}
 					if ent.TypeName == EntityTypeArmorStand {
 						dmg := damage
 						if dmg <= 0 {
@@ -1558,21 +1576,32 @@ func (s *Server) resolveTridentTrajectory(
 			nearby := s.entities.AppendInChunkRange(nil, cx, cz, 1)
 			for i := range nearby {
 				ent := &nearby[i]
+				canonEntType := canonicalResourceName(ent.TypeName)
 				if ent.ID == snap.EntityID || ent.ID == projID || ent.IsItem() || ent.IsExperienceOrb() ||
 					ent.TypeName == EntityTypeFireworkRocket || IsHangingEntity(ent.TypeName) ||
-					IsStandardProjectileEntityType(ent.TypeName) {
+					(IsStandardProjectileEntityType(ent.TypeName) && canonEntType != EntityTypeFireball) {
 					continue
 				}
 				if ent.EffectiveDimension() != dim {
 					continue
 				}
+				minHitY := ent.Y - 0.2
 				maxHitY := ent.Y + 2.0
-				if canonicalResourceName(ent.TypeName) == MobTypeEnderman {
+				hitHalfW := 0.8
+				if canonEntType == MobTypeEnderman {
 					maxHitY = ent.Y + EndermanHeight
+				} else if canonEntType == EntityTypeFireball {
+					minHitY = ent.Y - 1.0
+					maxHitY = ent.Y + 2.0
+					hitHalfW = 1.0
 				}
-				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= maxHitY && math.Abs(ent.Z-rz) <= 0.8 {
+				if math.Abs(ent.X-rx) <= hitHalfW && ry >= minHitY && ry <= maxHitY && math.Abs(ent.Z-rz) <= hitHalfW {
 					hitAnyEntity = true
 					landX, landY, landZ = rx, ry, rz
+					if canonEntType == EntityTypeFireball {
+						s.DeflectGhastFireballByProjectile2612(ent.ID, session, lx, ly, lz)
+						break
+					}
 					if ent.TypeName == EntityTypeArmorStand {
 						s.DamageArmorStand(ent.ID, TridentThrownBaseDamage, "trident", session)
 						break

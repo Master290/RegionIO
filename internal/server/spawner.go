@@ -167,14 +167,34 @@ func NewEntityTracker() *EntityTracker {
 	}
 }
 
+type deferredProjectileHit2612 struct {
+	kind              uint8 // 1 = snowball->blaze, 2 = projectile->fireball
+	projectileID      int32
+	targetID          int32
+	vx, vy, vz        float64
+	consumeProjectile bool
+}
+
 // TickAndBroadcast steps all entities in s and broadcasts resulting visibility
 // and delta-movement packets.
 func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 	t.mu.Lock()
-	t.stepEntitiesLocked(s, rng)
+	projHits := t.stepEntitiesLocked(s, rng)
 	t.mu.Unlock()
 
 	if s != nil {
+		for _, h := range projHits {
+			switch h.kind {
+			case 1:
+				s.OnBlazeHitBySnowball(h.targetID, nil)
+				s.despawnHostileEntityByID(h.projectileID)
+			case 2:
+				s.DeflectGhastFireballByProjectile2612(h.targetID, nil, h.vx, h.vy, h.vz)
+				if h.consumeProjectile {
+					s.despawnHostileEntityByID(h.projectileID)
+				}
+			}
+		}
 		s.TickWithers(rng)
 		s.TickEnderDragons(rng)
 		s.TickWardens(rng)
@@ -231,7 +251,8 @@ func (t *EntityTracker) Sync(s *Server) {
 	t.mu.Unlock()
 }
 
-func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
+func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferredProjectileHit2612 {
+	var projHits []deferredProjectileHit2612
 	t.aiTickID++
 	aiTick := t.aiTickID
 	t.playerTargets = s.appendPlayerTargets(t.playerTargets[:0])
@@ -303,13 +324,46 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 				vz := float64(snapshot.VelocityZ) / 8000.0
 				nx, ny, nz := snapshot.X+vx, snapshot.Y+vy, snapshot.Z+vz
 				dim := snapshot.EffectiveDimension()
+				hitProjectileTarget := false
+				projCanon := canonicalResourceName(snapshot.TypeName)
 				for j := range t.allEntitiesBuf {
 					cand := &t.allEntitiesBuf[j]
-					if cand.ID != snapshot.ID && cand.EffectiveDimension() == dim && canonicalResourceName(cand.TypeName) == MobTypeEnderman {
+					if cand.ID == snapshot.ID || cand.EffectiveDimension() != dim {
+						continue
+					}
+					candCanon := canonicalResourceName(cand.TypeName)
+					if candCanon == MobTypeEnderman {
 						if math.Abs(cand.X-nx) <= 1.0 && ny >= cand.Y-0.2 && ny <= cand.Y+EndermanHeight && math.Abs(cand.Z-nz) <= 1.0 {
 							s.TryEndermanDodgeProjectile(cand.ID, snapshot.TypeName, rng)
 						}
+					} else if candCanon == MobTypeBlaze && projCanon == "minecraft:snowball" {
+						if math.Abs(cand.X-nx) <= 0.8 && ny >= cand.Y-0.2 && ny <= cand.Y+BlazeHeight2612 && math.Abs(cand.Z-nz) <= 0.8 {
+							projHits = append(projHits, deferredProjectileHit2612{
+								kind:         1,
+								projectileID: snapshot.ID,
+								targetID:     cand.ID,
+							})
+							hitProjectileTarget = true
+							break
+						}
+					} else if candCanon == EntityTypeFireball {
+						if math.Abs(cand.X-nx) <= 1.0 && ny >= cand.Y-1.0 && ny <= cand.Y+2.0 && math.Abs(cand.Z-nz) <= 1.0 {
+							projHits = append(projHits, deferredProjectileHit2612{
+								kind:              2,
+								projectileID:      snapshot.ID,
+								targetID:          cand.ID,
+								vx:                vx,
+								vy:                vy,
+								vz:                vz,
+								consumeProjectile: projCanon == "minecraft:snowball" || projCanon == "minecraft:egg",
+							})
+							hitProjectileTarget = true
+							break
+						}
 					}
+				}
+				if hitProjectileTarget {
+					continue
 				}
 				if cache := s.DimensionChunks(dim); cache != nil {
 					bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
@@ -670,6 +724,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) {
 	t.pruneMobStates(aiTick)
 	s.TickFishingBobbers(rng)
 	s.TickDecorations()
+	return projHits
 }
 
 func (s *Server) appendViewerTargets(dst []viewerTarget) []viewerTarget {

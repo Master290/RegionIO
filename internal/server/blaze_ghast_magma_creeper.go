@@ -47,7 +47,7 @@ const (
 	BlazePostBurstCooldownTicks     int     = 100 // 5.0s cooldown after 3-shot burst
 	BlazeBurstFireballCount         int     = 3
 	BlazeWaterDamage                float32 = 1.0
-	BlazeWaterDamageIntervalTicks   int     = 20
+	BlazeWaterDamageIntervalTicks   int     = BlazeWaterHurtCooldownTicks2612 // 10 ticks (invulnerableTime 20 -> 10)
 	BlazeSnowballDamage             float32 = 3.0
 	BlazeSmokeIntervalTicks         int     = 2
 	BlazeSmokeParticleID                    = "minecraft:large_smoke"
@@ -128,17 +128,21 @@ const (
 // BlazeState tracks hovering, fire-charge state (`DATA_FLAGS_ID`), 3-fireball
 // burst progress, smoke emission, and water damage timer for a `minecraft:blaze`.
 type BlazeState struct {
-	EntityID         int32
-	Dimension        string
-	Charged          bool
-	AttackStep       int // 0=cooldown, 1=charging, 2..4=firing 3 small_fireballs
-	AttackTime       int
-	AttackCooldown   int
-	WaterDamageTimer int
-	SmokeEmitted     int
-	FireballsShot    int
-	TargetPlayer     *PlayerSession
-	TickCounter      int
+	EntityID                   int32
+	Dimension                  string
+	Charged                    bool
+	AttackStep                 int // 0=cooldown, 1=charging (60t), 2..4=firing 3 small_fireballs (6t each)
+	AttackTime                 int
+	AttackCooldown             int
+	LastSeen                   int
+	AllowedHeightOffset        float64
+	NextHeightOffsetChangeTick int
+	VY                         float64
+	WaterDamageTimer           int
+	SmokeEmitted               int
+	FireballsShot              int
+	TargetPlayer               *PlayerSession
+	TickCounter                int
 }
 
 // GhastState tracks floating waypoints, `DATA_IS_CHARGING`, cry/warn/shoot
@@ -149,9 +153,11 @@ type GhastState struct {
 	Charging       bool
 	ChargeTicks    int
 	ExplosionPower int
+	HasWanted      bool
 	WaypointX      float64
 	WaypointY      float64
 	WaypointZ      float64
+	VX, VY, VZ     float64
 	MoveCooldown   int
 	CryCount       int
 	TargetPlayer   *PlayerSession
@@ -499,10 +505,11 @@ func (s *Server) SpawnBlaze(dimension string, x, y, z float64) (int32, error) {
 	mgr := s.netherHostileManager()
 	mgr.mu.Lock()
 	mgr.blazes[id] = &BlazeState{
-		EntityID:   id,
-		Dimension:  normDim,
-		AttackStep: 0,
-		AttackTime: 20,
+		EntityID:            id,
+		Dimension:           normDim,
+		AttackStep:          0,
+		AttackTime:          0,
+		AllowedHeightOffset: BlazeDefaultAllowedHeightOffset2612,
 	}
 	mgr.mu.Unlock()
 
@@ -904,6 +911,8 @@ func (s *Server) DeflectGhastFireball(fireballID int32, player *PlayerSession) b
 	st.VZ = vz
 	st.Deflected = true
 	st.DeflectedBy = player
+	st.ShooterID = pSnap.EntityID
+	st.ShooterType = "minecraft:player"
 	mgr.mu.Unlock()
 
 	yaw := yawToward(vx, vz)
@@ -1250,6 +1259,17 @@ func (s *Server) despawnHostileEntityByID(entityID int32) {
 	s.entities.Remove(entityID)
 }
 
+func (s *Server) isBlazeTouchingWaterOrRain2612(dim string, x, y, z float64) bool {
+	minBY := int(math.Floor(y))
+	maxBY := int(math.Floor(y + BlazeHeight2612 - 0.01))
+	for by := minBY; by <= maxBY; by++ {
+		if s.IsEndermanInWaterOrRain(dim, x, float64(by)+0.1, z) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) tickSingleBlaze(entityID int32, rng *rand.Rand) {
 	ent := s.entities.Get(entityID)
 	mgr := s.netherHostileManager()
@@ -1267,10 +1287,7 @@ func (s *Server) tickSingleBlaze(entityID int32, rng *rand.Rand) {
 	if st.WaterDamageTimer > 0 {
 		st.WaterDamageTimer--
 	}
-	if st.AttackTime > 0 {
-		st.AttackTime--
-	}
-	// Blazes continuously emit large_smoke particles, especially when on fire/charged.
+	st.AttackTime-- // BlazeAttackGoal.tick: --this.attackTime
 	if st.TickCounter%BlazeSmokeIntervalTicks == 0 {
 		st.SmokeEmitted++
 	}
@@ -1278,12 +1295,13 @@ func (s *Server) tickSingleBlaze(entityID int32, rng *rand.Rand) {
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
+	cache := s.DimensionChunks(dim)
 
-	// 1. Water or rain contact damages Blaze by 1.0 every 20 ticks.
-	if s.IsEndermanInWaterOrRain(dim, ent.X, ent.Y, ent.Z) && snap.WaterDamageTimer <= 0 {
+	// 1. Water or rain contact (`isSensitiveToWater()` -> 1.0 HP every 10 ticks).
+	if s.isBlazeTouchingWaterOrRain2612(dim, ent.X, ent.Y, ent.Z) && snap.WaterDamageTimer <= 0 {
 		mgr.mu.Lock()
 		if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
-			cur.WaterDamageTimer = BlazeWaterDamageIntervalTicks
+			cur.WaterDamageTimer = BlazeWaterDamageIntervalTicks - 1
 		}
 		mgr.mu.Unlock()
 		if s.applyDamageToMob(ent, BlazeWaterDamage, nil, 0, false, false) {
@@ -1304,97 +1322,159 @@ func (s *Server) tickSingleBlaze(entityID int32, rng *rand.Rand) {
 		mgr.mu.Unlock()
 	}
 
-	if target == nil || target.IsDead() {
+	hasTarget := target != nil && !target.IsDead()
+	var tSnap PlayerSnapshot
+	var targetEyeY float64
+	if hasTarget {
+		tSnap = target.Snapshot()
+		targetEyeY = tSnap.Y + 1.62
+	}
+
+	// 3. Vertical hover (`Blaze.customServerAiStep` + `Blaze.aiStep`: 100-tick `allowedHeightOffset`, ascent `+0.3*(0.3-vy)`, slow fall `vy *= 0.6`).
+	newVY, newAllowedOffset, newNextOffsetTick := StepBlazeVerticalHover2612(
+		snap.VY,
+		ent.OnGround,
+		ent.Y,
+		hasTarget,
+		targetEyeY,
+		snap.AllowedHeightOffset,
+		snap.NextHeightOffsetChangeTick,
+		rng,
+	)
+	mgr.mu.Lock()
+	if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
+		cur.AllowedHeightOffset = newAllowedOffset
+		cur.NextHeightOffsetChangeTick = newNextOffsetTick
+		cur.VY = newVY
+	}
+	mgr.mu.Unlock()
+
+	if !hasTarget {
 		if snap.Charged {
 			s.SetBlazeCharged(entityID, false)
 		}
+		mgr.mu.Lock()
+		if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
+			cur.AttackStep = 0
+			cur.LastSeen = 0
+		}
+		mgr.mu.Unlock()
 		return
 	}
 
-	tSnap := target.Snapshot()
 	dx := tSnap.X - ent.X
-	dy := (tSnap.Y + 1.0) - (ent.Y + 0.9)
+	dyRaw := tSnap.Y - ent.Y
 	dz := tSnap.Z - ent.Z
-	distSq := dx*dx + dy*dy + dz*dz
-	dist := math.Sqrt(distSq)
+	d0 := dx*dx + dyRaw*dyRaw + dz*dz
 
-	// 3. Melee contact attack if within 2.0 blocks.
-	if dist <= BlazeMeleeAttackReach && snap.AttackCooldown <= 0 {
-		s.AttackPlayerFromMob(entityID, MobTypeBlaze, ent.X, ent.Z, target, BlazeMeleeAttackDamage)
-		mgr.mu.Lock()
-		if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
-			cur.AttackCooldown = BlazeAttackCooldownTicks
-		}
-		mgr.mu.Unlock()
+	hasLOS := hasColliderLineOfSight2612(cache, ent.X, ent.Y+BlazeEyeHeight2612, ent.Z, tSnap.X, targetEyeY, tSnap.Z)
+	newLastSeen := 0
+	if !hasLOS {
+		newLastSeen = snap.LastSeen + 1
 	}
+	mgr.mu.Lock()
+	if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
+		cur.LastSeen = newLastSeen
+	}
+	mgr.mu.Unlock()
 
-	// 4. BlazeAttackGoal state machine:
-	//   - AttackStep == 0: cooldown before charging; when AttackTime <= 0 -> AttackStep = 1, SetBlazeCharged(true), AttackTime = 60
-	//   - AttackStep == 1: 60-tick fiery charge-up; when AttackTime <= 0 -> AttackStep = 2, AttackTime = 6
-	//   - AttackStep == 2..4: fires 1 small_fireball every 6 ticks (3 fireballs total); after 3rd shot -> AttackStep = 0, SetBlazeCharged(false), AttackTime = 100
-	if snap.AttackTime <= 0 {
-		switch snap.AttackStep {
-		case 0:
-			s.SetBlazeCharged(entityID, true)
+	var vx, vz float64
+	newYaw := ent.Yaw
+
+	// 4. `BlazeAttackGoal.tick()` (`blaze_2612.txt:482-691`):
+	if d0 < BlazeMeleeDistSqThreshold2612 {
+		// Branch A (`d0 < 4.0D` = 2.0 blocks): melee attack (20-tick cooldown) + move toward target; requires LOS!
+		if !hasLOS {
+			return
+		}
+		if snap.AttackTime <= 0 {
+			s.AttackPlayerFromMob(entityID, MobTypeBlaze, ent.X, ent.Z, target, BlazeMeleeAttackDamage)
 			mgr.mu.Lock()
 			if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
-				cur.AttackStep = 1
-				cur.AttackTime = BlazeChargeWarmupTicks
+				cur.AttackTime = BlazeAttackCooldownTicks
 			}
 			mgr.mu.Unlock()
-		case 1, 2, 3:
-			_, _ = s.SpawnBlazeSmallFireball(dim, entityID, ent.X, ent.Y+1.1, ent.Z, dx, dy, dz)
+		}
+		horizDist := math.Hypot(dx, dz)
+		if horizDist > 1e-4 {
+			step := BlazeFlySpeed
+			if step > horizDist {
+				step = horizDist
+			}
+			vx = (dx / horizDist) * step
+			vz = (dz / horizDist) * step
+			newYaw = yawToward(dx, dz)
+		}
+	} else if d0 < BlazeAggroRange*BlazeAggroRange && hasLOS {
+		// Branch B (`d0 < followDist^2 && hasLineOfSight`): 4-step burst state machine!
+		if snap.AttackTime <= 0 {
 			nextStep := snap.AttackStep + 1
-			nextTime := BlazeBurstShotIntervalTicks
-			if nextStep > BlazeBurstFireballCount {
+			var nextTime int
+			if nextStep == 1 {
+				nextTime = BlazeChargeWarmupTicks // 60
+				s.SetBlazeCharged(entityID, true)
+			} else if nextStep <= 4 {
+				nextTime = BlazeBurstShotIntervalTicks // 6 (steps 2, 3, 4 all set attackTime = 6!)
+			} else {
+				nextTime = BlazePostBurstCooldownTicks // 100
 				nextStep = 0
-				nextTime = BlazePostBurstCooldownTicks
 				s.SetBlazeCharged(entityID, false)
+			}
+			shotFired := 0
+			if nextStep > 1 {
+				dirX, dirY, dirZ, _ := ComputeBlazeFireballDirection2612(ent.X, ent.Y, ent.Z, tSnap.X, tSnap.Y, tSnap.Z, 1.8, rng)
+				_, _ = s.SpawnBlazeSmallFireball(dim, entityID, ent.X, ent.Y+BlazeSmallFireballSpawnOffsetY2612, ent.Z, dirX, dirY, dirZ)
+				shotFired = 1
 			}
 			mgr.mu.Lock()
 			if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
 				cur.AttackStep = nextStep
 				cur.AttackTime = nextTime
-				cur.FireballsShot++
+				cur.FireballsShot += shotFired
+			}
+			mgr.mu.Unlock()
+		}
+		if math.Hypot(dx, dz) > 1e-4 {
+			newYaw = RotlerpDegrees2612(ent.Yaw, yawToward(dx, dz), 10.0)
+		}
+	} else if newLastSeen < BlazeLostSightChaseMaxTicks2612 {
+		// Branch C (`!hasLOS` and `lastSeen < 5`): advance toward target to regain line of sight!
+		horizDist := math.Hypot(dx, dz)
+		if horizDist > 1e-4 {
+			vx = (dx / horizDist) * BlazeFlySpeed
+			vz = (dz / horizDist) * BlazeFlySpeed
+			newYaw = yawToward(dx, dz)
+		}
+	}
+
+	nextX := ent.X + vx
+	nextY := ent.Y + newVY
+	nextZ := ent.Z + vz
+	onGround := false
+	if cache != nil {
+		belowY := int(math.Floor(nextY - 0.01))
+		bx, bz := int(math.Floor(nextX)), int(math.Floor(nextZ))
+		if belowY >= world.MinY && belowY < world.MinY+world.WorldHeight && !isPassableBlock(cache.GetBlock(bx, belowY, bz)) && nextY < float64(belowY+1) {
+			nextY = float64(belowY + 1)
+			newVY = 0
+			onGround = true
+			mgr.mu.Lock()
+			if cur, ok := mgr.blazes[entityID]; ok && cur != nil {
+				cur.VY = 0
 			}
 			mgr.mu.Unlock()
 		}
 	}
-
-	// 5. Hover / flight path movement: while charged or below target eye level,
-	// hover upward and advance along its fiery path toward the target.
-	nextX, nextY, nextZ := ent.X, ent.Y, ent.Z
-	desiredY := tSnap.Y + BlazeHoverHeightOffset
-	var vy float64
-	if ent.Y < desiredY {
-		vy = BlazeHoverVerticalSpeed
-		if ent.Y+vy > desiredY {
-			vy = desiredY - ent.Y
-		}
-		nextY += vy
-	} else if ent.Y > desiredY+1.5 {
-		vy = -BlazeHoverVerticalSpeed * 0.5
-		nextY += vy
-	}
-	var vx, vz float64
-	horizDist := math.Hypot(dx, dz)
-	if horizDist > 3.0 {
-		vx = (dx / horizDist) * BlazeFlySpeed
-		vz = (dz / horizDist) * BlazeFlySpeed
-		nextX += vx
-		nextZ += vz
-	}
-	yaw := yawToward(dx, dz)
 	s.entities.Update(entityID, func(e *world.Entity) {
 		e.X = nextX
 		e.Y = nextY
 		e.Z = nextZ
-		e.Yaw = yaw
-		e.HeadYaw = yaw
+		e.Yaw = newYaw
+		e.HeadYaw = newYaw
 		e.VelocityX = clampVelocityShort(vx)
-		e.VelocityY = clampVelocityShort(vy)
+		e.VelocityY = clampVelocityShort(newVY)
 		e.VelocityZ = clampVelocityShort(vz)
-		e.OnGround = false
+		e.OnGround = onGround
 	})
 }
 
@@ -1409,19 +1489,17 @@ func (s *Server) tickSingleGhast(entityID int32, rng *rand.Rand) {
 		return
 	}
 	st.TickCounter++
-	if st.MoveCooldown > 0 {
-		st.MoveCooldown--
-	}
 	snap := *st
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
+	cache := s.DimensionChunks(dim)
 
 	// 1. Periodic ambient crying sound (`minecraft:entity.ghast.ambient`).
 	if snap.TickCounter%80 == 0 {
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(SoundGhastAmbient, SoundSourceHostile, ent.X, ent.Y, ent.Z, 10.0, 1.0, 0))
+			EncodeSoundPacket(SoundGhastAmbient, SoundSourceHostile, ent.X, ent.Y, ent.Z, 5.0, 1.0, 0))
 		mgr.mu.Lock()
 		if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
 			cur.CryCount++
@@ -1429,79 +1507,187 @@ func (s *Server) tickSingleGhast(entityID int32, rng *rand.Rand) {
 		mgr.mu.Unlock()
 	}
 
-	// 2. Acquire nearest survival/adventure target player within 64 blocks with line of sight.
-	target := snap.TargetPlayer
-	if target == nil || target.IsDead() || world.NormalizeDimension(target.Dimension()) != dim ||
-		target.Snapshot().GameMode == GameModeCreative || target.Snapshot().GameMode == GameModeSpectator {
-		target = s.findNearestWitherTarget(dim, ent.X, ent.Y, ent.Z, GhastAggroRange)
-		mgr.mu.Lock()
-		if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
-			cur.TargetPlayer = target
+	// 2. Free flight (`RandomFloatAroundGoal` ±16 blocks + `GhastMoveControl` 4x4x4 AABB sweep every `2..6` ticks):
+	hasWanted := snap.HasWanted
+	wx, wy, wz := snap.WaypointX, snap.WaypointY, snap.WaypointZ
+	if hasWanted {
+		ddx, ddy, ddz := wx-ent.X, wy-ent.Y, wz-ent.Z
+		dSq := ddx*ddx + ddy*ddy + ddz*ddz
+		if dSq < GhastRandomFloatMinDistSq2612 || dSq > GhastRandomFloatMaxDistSq2612 {
+			hasWanted = false
 		}
-		mgr.mu.Unlock()
+	}
+	if !hasWanted {
+		if rng != nil {
+			wx = ent.X + float64((rng.Float32()*2.0-1.0)*float32(GhastRandomFloatRadius2612))
+			wy = ent.Y + float64((rng.Float32()*2.0-1.0)*float32(GhastRandomFloatRadius2612))
+			wz = ent.Z + float64((rng.Float32()*2.0-1.0)*float32(GhastRandomFloatRadius2612))
+		} else {
+			wx, wy, wz = ent.X+4.0, ent.Y+1.0, ent.Z
+		}
+		minFlightY := float64(world.FlatSurfaceY + 2)
+		if wy < minFlightY {
+			wy = ent.Y + math.Abs(ent.Y-wy)
+		}
+		hasWanted = true
 	}
 
+	moveCD := snap.MoveCooldown
+	vx, vy, vz := snap.VX, snap.VY, snap.VZ
+	if hasWanted {
+		moveCD--
+		if moveCD <= 0 {
+			stepAdd := 3
+			if rng != nil {
+				stepAdd = GhastCourseCooldownMinTicks2612 + rng.Intn(GhastCourseCooldownMaxTicks2612-GhastCourseCooldownMinTicks2612+1)
+			}
+			moveCD += stepAdd
+			ddx, ddy, ddz := wx-ent.X, wy-ent.Y, wz-ent.Z
+			dist := math.Sqrt(ddx*ddx + ddy*ddy + ddz*ddz)
+			if dist > 1e-6 && CanGhastBoxReach2612(cache, ent.X, ent.Y, ent.Z, wx, wy, wz) {
+				vx += (ddx / dist) * GhastMoveImpulsePerStep2612
+				vy += (ddy / dist) * GhastMoveImpulsePerStep2612
+				vz += (ddz / dist) * GhastMoveImpulsePerStep2612
+			} else {
+				hasWanted = false
+			}
+		}
+	}
+
+	nx, ny, nz := ent.X+vx, ent.Y+vy, ent.Z+vz
+	if !CanGhastBoxReach2612(cache, ent.X, ent.Y, ent.Z, nx, ny, nz) {
+		nx, ny, nz = ent.X, ent.Y, ent.Z
+		vx, vy, vz = 0, 0, 0
+		hasWanted = false
+	}
+	nextVX := vx * GhastFlyingAirInertia2612
+	nextVY := vy * GhastFlyingAirInertia2612
+	nextVZ := vz * GhastFlyingAirInertia2612
+
+	// 3. Acquire nearest survival/adventure target player within FOLLOW_RANGE (100 blocks, |dy| <= 4.0 on initial acquisition).
+	target := snap.TargetPlayer
+	if target != nil {
+		if target.IsDead() || world.NormalizeDimension(target.Dimension()) != dim {
+			target = nil
+		} else {
+			ts := target.Snapshot()
+			dxT, dyT, dzT := ts.X-nx, ts.Y-ny, ts.Z-nz
+			if ts.GameMode == GameModeCreative || ts.GameMode == GameModeSpectator ||
+				dxT*dxT+dyT*dyT+dzT*dzT > GhastFollowRange2612*GhastFollowRange2612 {
+				target = nil
+			}
+		}
+	}
+	if target == nil {
+		bestSq := GhastFollowRange2612 * GhastFollowRange2612
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p == nil || p.IsDead() {
+				continue
+			}
+			ps := p.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeCreative || ps.GameMode == GameModeSpectator {
+				continue
+			}
+			if math.Abs(ps.Y-ny) > 4.0 {
+				continue
+			}
+			dxT, dyT, dzT := ps.X-nx, ps.Y-ny, ps.Z-nz
+			dSq := dxT*dxT + dyT*dyT + dzT*dzT
+			if dSq <= bestSq {
+				bestSq = dSq
+				target = p
+			}
+		}
+	}
+
+	// 4. `GhastLookGoal` (`Ghast.faceMovementDirection`):
+	yaw := ent.Yaw
+	if target != nil && !target.IsDead() {
+		ts := target.Snapshot()
+		dxT, dyT, dzT := ts.X-nx, ts.Y-ny, ts.Z-nz
+		if dxT*dxT+dyT*dyT+dzT*dzT < GhastShootMaxDistSqr2612 && math.Hypot(dxT, dzT) > 1e-5 {
+			yaw = yawToward(dxT, dzT)
+		}
+	} else if math.Hypot(vx, vz) > 1e-5 {
+		yaw = yawToward(vx, vz)
+	}
+
+	s.entities.Update(entityID, func(e *world.Entity) {
+		e.X = nx
+		e.Y = ny
+		e.Z = nz
+		e.Yaw = yaw
+		e.HeadYaw = yaw
+		e.VelocityX = clampVelocityShort(vx)
+		e.VelocityY = clampVelocityShort(vy)
+		e.VelocityZ = clampVelocityShort(vz)
+		e.OnGround = false
+	})
+
+	mgr.mu.Lock()
+	if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
+		cur.HasWanted = hasWanted
+		cur.WaypointX = wx
+		cur.WaypointY = wy
+		cur.WaypointZ = wz
+		cur.VX = nextVX
+		cur.VY = nextVY
+		cur.VZ = nextVZ
+		cur.MoveCooldown = moveCD
+		cur.TargetPlayer = target
+	}
+	mgr.mu.Unlock()
+
+	// 5. `GhastShootFireballGoal` (`chargeTime` starts at 0, warn at 10, `DATA_IS_CHARGING = (chargeTime > 10)`, shoot at 20 -> reset -40):
 	if target != nil && !target.IsDead() {
 		tSnap := target.Snapshot()
-		dx := tSnap.X - ent.X
-		dy := (tSnap.Y + 0.8) - (ent.Y + 2.0)
-		dz := tSnap.Z - ent.Z
-		dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-		hasLOS := dist <= GhastAggroRange && s.hasLineOfSightBetween(s.DimensionChunks(dim), ent.X, ent.Y+2.0, ent.Z, tSnap.X, tSnap.Y+1.0, tSnap.Z)
+		dx := tSnap.X - nx
+		dy := tSnap.Y - ny
+		dz := tSnap.Z - nz
+		distSq := dx*dx + dy*dy + dz*dz
+		hasLOS := distSq < GhastShootMaxDistSqr2612 &&
+			hasColliderLineOfSight2612(cache, nx, ny+GhastEyeHeight2612, nz, tSnap.X, tSnap.Y+1.62, tSnap.Z)
 
-		yaw := yawToward(dx, dz)
-		s.entities.Update(entityID, func(e *world.Entity) {
-			e.Yaw = yaw
-			e.HeadYaw = yaw
-		})
-
+		charge := snap.ChargeTicks
 		if hasLOS {
-			charge := snap.ChargeTicks + 1
-			cp := ent.ChunkPos()
+			charge++
+			cp := world.ChunkPos{X: int32(int64(math.Floor(nx)) >> 4), Z: int32(int64(math.Floor(nz)) >> 4)}
 			if charge == GhastChargeWarnTicks {
-				s.SetGhastCharging(entityID, true)
 				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-					EncodeSoundPacket(SoundGhastWarn, SoundSourceHostile, ent.X, ent.Y, ent.Z, 10.0, 1.0, 0))
+					EncodeSoundPacket(SoundGhastWarn, SoundSourceHostile, nx, ny, nz, 10.0, 1.0, 0))
 				mgr.mu.Lock()
 				if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
 					cur.CryCount++
 				}
 				mgr.mu.Unlock()
 			}
-			if charge >= GhastChargeFireTicks {
-				horiz := math.Hypot(dx, dz)
-				spawnX, spawnY, spawnZ := ent.X, ent.Y+1.5, ent.Z
-				if horiz > 1e-4 {
-					spawnX += (dx / horiz) * 2.0
-					spawnZ += (dz / horiz) * 2.0
-				}
-				_, _ = s.SpawnGhastFireball(dim, entityID, spawnX, spawnY, spawnZ, dx, dy, dz, snap.ExplosionPower)
-				s.SetGhastCharging(entityID, false)
-				charge = GhastPostShotCooldownTicks
+			if charge == GhastChargeFireTicks {
+				spawnX, spawnY, spawnZ, dirX, dirY, dirZ := ComputeGhastFireballSpawnAndAim2612(
+					nx, ny, nz, yaw, 0, tSnap.X, tSnap.Y, tSnap.Z, 1.8,
+				)
+				_, _ = s.SpawnGhastFireball(dim, entityID, spawnX, spawnY, spawnZ, dirX, dirY, dirZ, snap.ExplosionPower)
+				charge = GhastPostShotCooldownTicks // -40
 			}
-			mgr.mu.Lock()
-			if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
-				cur.ChargeTicks = charge
-			}
-			mgr.mu.Unlock()
-			return
-		}
-	}
-
-	// Lost sight or no target: decay charge and clear DATA_IS_CHARGING.
-	if snap.ChargeTicks > 0 || snap.Charging {
-		nextCharge := snap.ChargeTicks - 1
-		if nextCharge < 0 {
-			nextCharge = 0
+		} else if charge > 0 {
+			charge--
 		}
 		mgr.mu.Lock()
 		if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
-			cur.ChargeTicks = nextCharge
+			cur.ChargeTicks = charge
 		}
 		mgr.mu.Unlock()
-		if nextCharge < GhastChargeWarnTicks && snap.Charging {
-			s.SetGhastCharging(entityID, false)
-		}
+		s.SetGhastCharging(entityID, charge > GhastChargeWarnTicks)
+		return
+	}
+
+	// No target (`GhastShootFireballGoal.stop()`):
+	mgr.mu.Lock()
+	if cur, ok := mgr.ghasts[entityID]; ok && cur != nil {
+		cur.ChargeTicks = 0
+	}
+	mgr.mu.Unlock()
+	if snap.Charging {
+		s.SetGhastCharging(entityID, false)
 	}
 }
 
