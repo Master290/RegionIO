@@ -69,9 +69,9 @@ const (
 	MagmaCubeSizeLarge         int     = 4
 	MagmaCubeAggroRange        float64 = 16.0
 	MagmaCubeBaseJumpDelayMin  int     = 40
-	MagmaCubeBaseJumpDelayMax  int     = 100
-	MagmaCubeLavaJumpVelocity  float64 = 0.28
-	MagmaCubeJumpBaseVelocityY float64 = 0.42
+	MagmaCubeBaseJumpDelayMax  int     = 116 // (10..29) * 4
+	MagmaCubeLavaJumpVelocity  float64 = MagmaCubeLavaJumpBase2612
+	MagmaCubeJumpBaseVelocityY float64 = SlimeBaseJumpPower2612
 	MagmaCubeArmorPerSize      int     = 3 // 3 * size armor points (3, 6, 12)
 
 	// Item and advancement IDs.
@@ -176,15 +176,18 @@ type FireballProjectileState struct {
 // MagmaCubeState tracks jump delay, lava swimming, and melee cooldown for an
 // active `minecraft:magma_cube` or `minecraft:slime`.
 type MagmaCubeState struct {
-	EntityID       int32
-	TypeName       string
-	Dimension      string
-	JumpDelay      int
-	AttackCooldown int
-	InLava         bool
-	JumpCount      int
-	TargetPlayer   *PlayerSession
-	TickCounter    int
+	EntityID          int32
+	TypeName          string
+	Dimension         string
+	JumpDelay         int
+	AttackCooldown    int
+	InLava            bool
+	JumpCount         int
+	WantedYaw         float32
+	NextRandomizeTime int
+	GrowTiredTimer    int
+	TargetPlayer      *PlayerSession
+	TickCounter       int
 }
 
 type netherHostileManager struct {
@@ -1027,11 +1030,16 @@ func (s *Server) ensureMagmaOrSlimeState(entityID int32, typeName, dimension str
 	if st, ok := mgr.magmaCubes[entityID]; ok && st != nil {
 		return st
 	}
+	canon := canonicalResourceName(typeName)
+	initDelay := 15
+	if canon == MobTypeMagmaCube {
+		initDelay = 60
+	}
 	st := &MagmaCubeState{
 		EntityID:  entityID,
-		TypeName:  canonicalResourceName(typeName),
+		TypeName:  canon,
 		Dimension: world.NormalizeDimension(dimension),
-		JumpDelay: 20,
+		JumpDelay: initDelay,
 	}
 	mgr.magmaCubes[entityID] = st
 	return st
@@ -1662,12 +1670,20 @@ func (s *Server) tickSingleMagmaCubeOrSlime(entityID int32, rng *rand.Rand) {
 		mgr.mu.Unlock()
 		return
 	}
+	_, noAI, silent, _ := s.GetSlimeOrMagmaCubeCustomProps2612(entityID)
+	if noAI {
+		mgr.mu.Unlock()
+		return
+	}
 	st.TickCounter++
 	if st.JumpDelay > 0 {
 		st.JumpDelay--
 	}
 	if st.AttackCooldown > 0 {
 		st.AttackCooldown--
+	}
+	if st.GrowTiredTimer > 0 {
+		st.GrowTiredTimer--
 	}
 	snap := *st
 	mgr.mu.Unlock()
@@ -1676,22 +1692,38 @@ func (s *Server) tickSingleMagmaCubeOrSlime(entityID int32, rng *rand.Rand) {
 	isMagma := snap.TypeName == MobTypeMagmaCube
 	size := s.SlimeSize(entityID)
 
-	// 1. Check lava immersion: Magma Cubes float and jump upward in lava!
+	// 1. Check lava / water immersion (`SlimeFloatGoal` 80% per-tick jump + `MagmaCube.jumpInLiquid(LAVA)` = `0.22 + 0.05*size`).
 	cache := s.DimensionChunks(dim)
 	inLava := false
+	inWater := false
 	if cache != nil {
 		bx, by, bz := int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z))
-		if world.BlockName(cache.GetBlock(bx, by, bz)) == "minecraft:lava" {
+		blk := cache.GetBlock(bx, by, bz)
+		blkName := canonicalResourceName(world.BlockName(blk))
+		if blkName == "minecraft:lava" {
 			inLava = true
+		} else if blk == world.StateWater || cache.FluidHeightAt(bx, by, bz) > 0 {
+			inWater = true
 		}
 	}
 	if isMagma && inLava {
-		vy := MagmaCubeLavaJumpVelocity + float64(size)*0.04
-		s.entities.Update(entityID, func(e *world.Entity) {
-			e.Y += vy
-			e.VelocityY = clampVelocityShort(vy)
-			e.OnGround = false
-		})
+		if !snap.InLava || rng == nil || rng.Float32() < SlimeFloatGoalJumpChance2612 {
+			vy := ComputeMagmaCubeLavaJumpVelocity2612(size)
+			s.entities.Update(entityID, func(e *world.Entity) {
+				e.Y += vy
+				e.VelocityY = clampVelocityShort(vy)
+				e.OnGround = false
+			})
+		}
+	} else if inWater {
+		if rng == nil || rng.Float32() < SlimeFloatGoalJumpChance2612 {
+			vy := SlimeWaterJumpDeltaY2612
+			s.entities.Update(entityID, func(e *world.Entity) {
+				e.Y += vy
+				e.VelocityY = clampVelocityShort(vy)
+				e.OnGround = false
+			})
+		}
 	}
 	mgr.mu.Lock()
 	if cur, ok := mgr.magmaCubes[entityID]; ok && cur != nil {
@@ -1699,51 +1731,118 @@ func (s *Server) tickSingleMagmaCubeOrSlime(entityID int32, rng *rand.Rand) {
 	}
 	mgr.mu.Unlock()
 
-	// 2. Acquire nearest survival/adventure target player within 16 blocks.
+	ent = s.entities.Get(entityID)
+	if ent == nil {
+		return
+	}
+
+	// 2. Acquire nearest survival/adventure target player within 16 blocks with `|player.Y - slime.Y| <= 4.0`
+	//    (`Slime.registerGoals` selector + `SlimeAttackGoal.growTiredTimer = 300`).
 	target := snap.TargetPlayer
-	if target == nil || target.IsDead() || world.NormalizeDimension(target.Dimension()) != dim ||
-		target.Snapshot().GameMode == GameModeCreative || target.Snapshot().GameMode == GameModeSpectator {
-		target = s.findNearestWitherTarget(dim, ent.X, ent.Y, ent.Z, MagmaCubeAggroRange)
+	if target != nil {
+		if target.IsDead() || world.NormalizeDimension(target.Dimension()) != dim {
+			target = nil
+		} else {
+			ts := target.Snapshot()
+			dx, dy, dz := ts.X-ent.X, ts.Y-ent.Y, ts.Z-ent.Z
+			if ts.GameMode == GameModeCreative || ts.GameMode == GameModeSpectator ||
+				dx*dx+dy*dy+dz*dz > MagmaCubeAggroRange*MagmaCubeAggroRange || snap.GrowTiredTimer <= 0 {
+				target = nil
+			}
+		}
+	}
+	if target == nil {
+		bestDistSq := MagmaCubeAggroRange * MagmaCubeAggroRange
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p == nil || p.IsDead() {
+				continue
+			}
+			ps := p.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeCreative || ps.GameMode == GameModeSpectator {
+				continue
+			}
+			if math.Abs(ps.Y-ent.Y) > SlimeTargetMaxVerticalDiff2612 {
+				continue
+			}
+			dx, dy, dz := ps.X-ent.X, ps.Y-ent.Y, ps.Z-ent.Z
+			dSq := dx*dx + dy*dy + dz*dz
+			if dSq <= bestDistSq {
+				bestDistSq = dSq
+				target = p
+			}
+		}
 		mgr.mu.Lock()
 		if cur, ok := mgr.magmaCubes[entityID]; ok && cur != nil {
 			cur.TargetPlayer = target
+			if target != nil {
+				cur.GrowTiredTimer = SlimeAttackGrowTiredTicks2612
+			}
 		}
 		mgr.mu.Unlock()
 	}
 
-	// 3. Hop/jump toward target when JumpDelay reaches 0.
+	// 2b. Rotation (`SlimeAttackGoal`: `lookAt(target, 10.0F, 10.0F)` vs `SlimeRandomDirectionGoal` + `SlimeMoveControl` `rotlerp 90.0F`).
+	curYaw := ent.Yaw
+	if target != nil && !target.IsDead() {
+		tSnap := target.Snapshot()
+		dx := tSnap.X - ent.X
+		dz := tSnap.Z - ent.Z
+		if math.Hypot(dx, dz) > 1e-4 {
+			goalYaw := yawToward(dx, dz)
+			curYaw = RotlerpDegrees2612(ent.Yaw, goalYaw, SlimeAttackLookMaxTurnDeg2612)
+		}
+		mgr.mu.Lock()
+		if cur, ok := mgr.magmaCubes[entityID]; ok && cur != nil {
+			cur.WantedYaw = curYaw
+		}
+		mgr.mu.Unlock()
+	} else {
+		nextRand := snap.NextRandomizeTime - 1
+		wantedYaw := snap.WantedYaw
+		if nextRand <= 0 {
+			if rng != nil {
+				nextRand = SlimeRandomDirMinTicks2612 + rng.Intn(SlimeRandomDirMaxTicks2612-SlimeRandomDirMinTicks2612+1)
+				wantedYaw = float32(rng.Intn(360)) - 180.0
+			} else {
+				nextRand = 60
+			}
+		}
+		curYaw = RotlerpDegrees2612(ent.Yaw, wantedYaw, SlimeMoveControlMaxTurnDeg2612)
+		mgr.mu.Lock()
+		if cur, ok := mgr.magmaCubes[entityID]; ok && cur != nil {
+			cur.WantedYaw = wantedYaw
+			cur.NextRandomizeTime = nextRand
+		}
+		mgr.mu.Unlock()
+	}
+	s.entities.Update(entityID, func(e *world.Entity) {
+		e.Yaw = curYaw
+		e.HeadYaw = curYaw
+	})
+	ent = s.entities.Get(entityID)
+	if ent == nil {
+		return
+	}
+
+	// 3. Hop/jump along facing yaw when JumpDelay reaches 0 (`SlimeMoveControl.tick` + `jumpFromGround`).
 	if snap.JumpDelay <= 0 {
-		nextDelay := 20
-		if rng != nil {
-			nextDelay = MagmaCubeBaseJumpDelayMin + rng.Intn(MagmaCubeBaseJumpDelayMax-MagmaCubeBaseJumpDelayMin+1)
+		hasTarget := target != nil && !target.IsDead()
+		nextDelay := RollSlimeJumpDelay2612(isMagma, size, hasTarget, rng)
+		_, hopSpeed, _, _, _ := SlimeAttributesBySize2612(isMagma, size)
+		if inLava || inWater {
+			hopSpeed *= SlimeFloatSpeedModifier2612
 		}
-		if target != nil {
-			nextDelay /= 3
-			if nextDelay < 6 {
-				nextDelay = 6
-			}
-		}
-		var stepX, stepZ float64
-		yaw := ent.Yaw
-		if target != nil && !target.IsDead() {
+		if hasTarget {
 			tSnap := target.Snapshot()
-			dx := tSnap.X - ent.X
-			dz := tSnap.Z - ent.Z
-			hDist := math.Hypot(dx, dz)
-			if hDist > 1e-4 {
-				hopSpeed := 0.25 + float64(size)*0.04
-				if hopSpeed > hDist {
-					hopSpeed = hDist
-				}
-				stepX = (dx / hDist) * hopSpeed
-				stepZ = (dz / hDist) * hopSpeed
-				yaw = yawToward(dx, dz)
+			hDist := math.Hypot(tSnap.X-ent.X, tSnap.Z-ent.Z)
+			if hopSpeed > hDist {
+				hopSpeed = hDist
 			}
 		}
-		jumpVY := MagmaCubeJumpBaseVelocityY
-		if isMagma {
-			jumpVY += float64(size) * 0.1
-		}
+		rad := float64(curYaw) * (math.Pi / 180.0)
+		stepX := -math.Sin(rad) * hopSpeed
+		stepZ := math.Cos(rad) * hopSpeed
+		jumpVY := ComputeSlimeJumpVelocityY2612(isMagma, size)
 		nextX := ent.X + stepX
 		nextZ := ent.Z + stepZ
 		nextY := ent.Y
@@ -1757,19 +1856,19 @@ func (s *Server) tickSingleMagmaCubeOrSlime(entityID int32, rng *rand.Rand) {
 			e.X = nextX
 			e.Y = nextY
 			e.Z = nextZ
-			e.Yaw = yaw
-			e.HeadYaw = yaw
+			e.Yaw = curYaw
+			e.HeadYaw = curYaw
 			e.VelocityX = clampVelocityShort(stepX)
 			e.VelocityY = clampVelocityShort(jumpVY)
 			e.VelocityZ = clampVelocityShort(stepZ)
 		})
-		jumpSnd := SoundSlimeJump
-		if isMagma {
-			jumpSnd = SoundMagmaCubeJump
+		if !silent {
+			_, _, _, jumpSnd := SlimeSoundSet2612(isMagma, size)
+			vol := float32(0.4 * float64(size))
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(jumpSnd, SoundSourceHostile, nextX, nextY, nextZ, vol, 1.0, 0))
 		}
-		cp := ent.ChunkPos()
-		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(jumpSnd, SoundSourceHostile, nextX, nextY, nextZ, 0.8, 1.0, 0))
 		mgr.mu.Lock()
 		if cur, ok := mgr.magmaCubes[entityID]; ok && cur != nil {
 			cur.JumpDelay = nextDelay
@@ -1778,7 +1877,7 @@ func (s *Server) tickSingleMagmaCubeOrSlime(entityID int32, rng *rand.Rand) {
 		mgr.mu.Unlock()
 	}
 
-	// 4. Melee contact damage against target player (Magma Cubes deal damage even at size 1!).
+	// 4. Melee contact damage (`Slime.dealDamage`: requires `isDealsDamage()` + melee range + `hasLineOfSight`!).
 	if target != nil && !target.IsDead() && snap.AttackCooldown <= 0 {
 		ent = s.entities.Get(entityID)
 		if ent == nil {
@@ -1796,8 +1895,14 @@ func (s *Server) tickSingleMagmaCubeOrSlime(entityID int32, rng *rand.Rand) {
 			dx := tSnap.X - ent.X
 			dy := tSnap.Y - ent.Y
 			dz := tSnap.Z - ent.Z
-			if dx*dx+dy*dy+dz*dz <= reach*reach {
+			if dx*dx+dy*dy+dz*dz <= reach*reach &&
+				hasColliderLineOfSight2612(cache, ent.X, ent.Y+SlimeBaseEyeHeight2612*float64(size), ent.Z, tSnap.X, tSnap.Y+1.62, tSnap.Z) {
 				s.AttackPlayerFromMob(entityID, snap.TypeName, ent.X, ent.Z, target, dmg)
+				if !silent {
+					cp := ent.ChunkPos()
+					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+						EncodeSoundPacket(SoundSlimeAttack, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+				}
 				mgr.mu.Lock()
 				if cur, ok := mgr.magmaCubes[entityID]; ok && cur != nil {
 					cur.AttackCooldown = 20

@@ -32,17 +32,17 @@ const (
 	EndermanAttackReach              float64 = 2.2
 	EndermanAttackCooldownTicks      int     = 20
 	EndermanWanderSpeed              float64 = 0.10
-	EndermanChaseSpeed               float64 = 0.30
+	EndermanChaseSpeed               float64 = EndermanAggressiveMovementSpeed2612 // 0.30 base + 0.15 SPEED_MODIFIER_ATTACKING = 0.45
 	EndermanStareRange               float64 = 64.0
 	EndermanEyeHeight                float64 = 2.55
 	EndermanHeight                   float64 = 2.9
 	EndermanStareConeTolerance       float64 = 0.025
 	EndermanTeleportHorizontalRange  int     = 32
-	EndermanTeleportVerticalRange    int     = 16
+	EndermanTeleportVerticalRange    int     = 32 // EnderMan.teleport(): random.nextInt(64) - 32
 	EndermanWaterDamage              float32 = 1.0
-	EndermanWaterDamageIntervalTicks int     = 20
+	EndermanWaterDamageIntervalTicks int     = EndermanWaterHurtCooldownTicks2612 // 10 ticks (invulnerableTime 20 -> 10)
 	EndermanAngerDurationTicks       int     = 400
-	EndermanBlockActionCooldownTicks int     = 40
+	EndermanBlockActionCooldownTicks int     = 0
 
 	// Endermite combat, movement, pearl spawn chance, and lifetime parameters.
 	EndermiteAttackDamage          float32 = 2.0
@@ -88,9 +88,13 @@ type EndermanState struct {
 	CarriedBlockState   uint16
 	Creepy              bool
 	StaredAt            bool
+	FrozenByStare       bool
 	TargetPlayer        *PlayerSession
 	TargetMobEntityID   int32
 	AngerTicks          int
+	TeleportTime        int
+	LastStareSoundTick  int
+	TargetChangeTick    int
 	AttackCooldown      int
 	WaterDamageTimer    int
 	BlockActionCooldown int
@@ -259,6 +263,7 @@ func (s *Server) SpawnEnderman(dimension string, x, y, z float64) (int32, error)
 	mgr.endermen[id] = &EndermanState{
 		EntityID:            id,
 		Dimension:           normDim,
+		LastStareSoundTick:  -EndermanCreepyStareSoundCooldown2612,
 		BlockActionCooldown: EndermanBlockActionCooldownTicks,
 		LastRecordedHealth:  DefaultEndermanMaxHealth,
 	}
@@ -416,38 +421,13 @@ func (s *Server) IsPlayerStaringAtEnderman(session *PlayerSession, entityID int3
 }
 
 func (s *Server) hasLineOfSightBetween(cache *world.Cache, x0, y0, z0, x1, y1, z1 float64) bool {
-	if cache == nil {
-		return true
-	}
-	dx := x1 - x0
-	dy := y1 - y0
-	dz := z1 - z0
-	dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-	if dist <= 0.5 {
-		return true
-	}
-	steps := int(math.Ceil(dist * 2.0))
-	for i := 1; i < steps; i++ {
-		t := float64(i) / float64(steps)
-		bx := int(math.Floor(x0 + dx*t))
-		by := int(math.Floor(y0 + dy*t))
-		bz := int(math.Floor(z0 + dz*t))
-		if by < world.MinY || by >= world.MinY+world.WorldHeight {
-			continue
-		}
-		blk := cache.GetBlock(bx, by, bz)
-		blkName := world.BlockName(blk)
-		if !isPassableBlock(blk) && !strings.Contains(blkName, "glass") && !strings.Contains(blkName, "leaves") {
-			return false
-		}
-	}
-	return true
+	return hasColliderLineOfSight2612(cache, x0, y0, z0, x1, y1, z1)
 }
 
 // ProvokeEndermanByStare angers the Enderman with entityID toward player due to
 // eye contact, setting `Creepy = true` and `StaredAt = true`, broadcasting
-// `minecraft:entity.enderman.stare` + `minecraft:entity.enderman.scream`, and
-// syncing entity data.
+// `minecraft:entity.enderman.stare` (subject to 400-tick DELAY_BETWEEN_CREEPY_STARE_SOUND)
+// + `minecraft:entity.enderman.scream`, and syncing entity data.
 func (s *Server) ProvokeEndermanByStare(entityID int32, player *PlayerSession) bool {
 	if s == nil || s.entities == nil || player == nil || player.IsDead() {
 		return false
@@ -463,20 +443,27 @@ func (s *Server) ProvokeEndermanByStare(entityID int32, player *PlayerSession) b
 		mgr.mu.Unlock()
 		return false
 	}
-	firstStare := !st.StaredAt
+	playStare := !st.StaredAt && (st.TickCounter >= st.LastStareSoundTick+EndermanCreepyStareSoundCooldown2612)
+	if playStare {
+		st.LastStareSoundTick = st.TickCounter
+	}
+	if st.TargetPlayer != player {
+		st.TargetChangeTick = st.TickCounter
+	}
 	st.TargetPlayer = player
 	st.TargetMobEntityID = 0
 	st.Creepy = true
 	st.StaredAt = true
-	st.AngerTicks = EndermanAngerDurationTicks
+	st.TeleportTime = 0
+	st.AngerTicks = EndermanPersistentAngerMaxTicks2612
 	carried := st.CarriedBlockState
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
 	cp := ent.ChunkPos()
-	if firstStare {
+	if playStare {
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(SoundEndermanStare, SoundSourceHostile, ent.X, ent.Y, ent.Z, 2.5, 1.0, 0))
+			EncodeSoundPacket(SoundEndermanStare, SoundSourceHostile, ent.X, ent.Y+EndermanEyeHeight, ent.Z, 2.5, 1.0, 0))
 	}
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundEndermanScream, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
@@ -590,19 +577,21 @@ func (s *Server) TeleportEndermanTo(entityID int32, targetX, targetY, targetZ fl
 		EncodeSoundPacket(SoundEndermanTeleport, SoundSourceHostile, oldX, oldY, oldZ, 1.0, 1.0, 0))
 	s.BroadcastDimensionChunk(dim, newCP.X, newCP.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundEndermanTeleport, SoundSourceHostile, targetX, float64(by), targetZ, 1.0, 1.0, 0))
+	// Vanilla EnderMan.teleport(x,y,z) emits GameEvent.TELEPORT at the pre-teleport origin (`vec3 = this.position()`).
 	s.EmitVibration(VibrationEvent{
 		Dimension:      dim,
 		Type:           GameEventTeleport,
-		X:              targetX,
-		Y:              float64(by),
-		Z:              targetZ,
+		X:              oldX,
+		Y:              oldY,
+		Z:              oldZ,
 		SourceEntityID: entityID,
 	})
 	return true
 }
 
 // TeleportEndermanRandomly attempts to teleport the Enderman with entityID to a
-// dry solid surface within 32 blocks horizontally and 16 blocks vertically.
+// dry solid surface within 32 blocks horizontally and [-32, +31] blocks vertically
+// (`EnderMan.teleport()`: `(nextDouble()-0.5)*64`, `nextInt(64)-32`, up to 64 attempts).
 func (s *Server) TeleportEndermanRandomly(entityID int32, rng *rand.Rand) (newX, newY, newZ float64, teleported bool) {
 	if s == nil || s.entities == nil {
 		return 0, 0, 0, false
@@ -617,20 +606,20 @@ func (s *Server) TeleportEndermanRandomly(entityID int32, rng *rand.Rand) (newX,
 	originBY := int(math.Floor(ent.Y))
 	originBZ := int(math.Floor(ent.Z))
 
-	// 1. Try random candidate offsets (vanilla 32-block horizontal, 16-block vertical range).
+	// 1. Try up to 64 random candidate offsets (`EnderMan.teleport()`).
 	if rng != nil {
-		for attempt := 0; attempt < 32; attempt++ {
-			dx := rng.Intn(2*EndermanTeleportHorizontalRange+1) - EndermanTeleportHorizontalRange
-			dz := rng.Intn(2*EndermanTeleportHorizontalRange+1) - EndermanTeleportHorizontalRange
-			if dx == 0 && dz == 0 {
-				dx = 4
+		for attempt := 0; attempt < EndermanProjectileTeleportAttempts; attempt++ {
+			candX := ent.X + (rng.Float64()-0.5)*float64(2*EndermanTeleportHorizontalRange)
+			candY := ent.Y + float64(rng.Intn(2*EndermanTeleportVerticalRange)-EndermanTeleportVerticalRange)
+			candZ := ent.Z + (rng.Float64()-0.5)*float64(2*EndermanTeleportHorizontalRange)
+			candBX := int(math.Floor(candX))
+			candBY := int(math.Floor(candY))
+			candBZ := int(math.Floor(candZ))
+			if candBX == originBX && candBZ == originBZ {
+				candBX += 4
 			}
-			dy := rng.Intn(2*EndermanTeleportVerticalRange+1) - EndermanTeleportVerticalRange
-			candBX := originBX + dx
-			candBY := originBY + dy
-			candBZ := originBZ + dz
 
-			// Drop down to the nearest solid ground in the column if starting in air.
+			// Drop down to the nearest motion-blocking ground in the column if starting in air.
 			if cache != nil {
 				for candBY > world.MinY+1 && isPassableBlock(cache.GetBlock(candBX, candBY-1, candBZ)) {
 					candBY--
@@ -742,33 +731,16 @@ func (s *Server) OnWaterSplashHitEnderman(entityID int32, rng *rand.Rand) (dealt
 }
 
 // IsEndermanHoldableBlockName reports whether blockName belongs to the vanilla
-// 26.1.2 `#minecraft:enderman_holdable` block tag.
+// 26.1.2 `#minecraft:enderman_holdable` block tag (45 blocks from the embedded
+// 26.1.2 datapack, including `minecraft:golden_dandelion` and excluding `minecraft:netherrack`).
 func IsEndermanHoldableBlockName(blockName string) bool {
-	norm := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(blockName)), "minecraft:")
-	switch norm {
-	case "dirt", "grass_block", "podzol", "coarse_dirt", "mycelium", "rooted_dirt",
-		"mud", "muddy_mangrove_roots", "moss_block", "pale_moss_block",
-		"sand", "red_sand", "gravel", "clay",
-		"dandelion", "poppy", "blue_orchid", "allium", "azure_bluet",
-		"red_tulip", "orange_tulip", "white_tulip", "pink_tulip",
-		"oxeye_daisy", "cornflower", "lily_of_the_valley", "wither_rose",
-		"torchflower", "closed_eyeblossom", "open_eyeblossom", "cactus_flower",
-		"brown_mushroom", "red_mushroom", "crimson_fungus", "warped_fungus",
-		"crimson_roots", "warped_roots", "crimson_nylium", "warped_nylium",
-		"netherrack", "pumpkin", "carved_pumpkin", "melon", "cactus", "tnt":
-		return true
-	default:
-		return false
-	}
+	return HasFlattenedBlockNameTag2612(blockName, "minecraft:enderman_holdable")
 }
 
 // IsEndermanHoldableBlock reports whether block state `state` belongs to the
 // vanilla 26.1.2 `#minecraft:enderman_holdable` block tag.
 func IsEndermanHoldableBlock(state uint16) bool {
-	if state == world.StateAir {
-		return false
-	}
-	return IsEndermanHoldableBlockName(world.BlockName(state))
+	return HasFlattenedBlockTag2612(state, "minecraft:enderman_holdable")
 }
 
 // EndermanCarriedBlock returns the block state currently carried by the
@@ -811,7 +783,8 @@ func (s *Server) SetEndermanCarriedBlock(entityID int32, state uint16) bool {
 
 // TryEndermanPickUpBlock attempts to make the Enderman with entityID pick up the
 // `#minecraft:enderman_holdable` block at (bx, by, bz) in its dimension.
-// Requires `mobGriefing=true` and that the Enderman is not already carrying a block.
+// Requires `mobGriefing=true`, unobstructed `OUTLINE` raycast from `(blockX+0.5, by+0.5, blockZ+0.5)`,
+// and stores `block.defaultBlockState()` (`EnderMan$EndermanTakeBlockGoal.tick`).
 func (s *Server) TryEndermanPickUpBlock(entityID int32, bx, by, bz int) bool {
 	if s == nil || s.entities == nil || !s.MobGriefing() {
 		return false
@@ -829,6 +802,15 @@ func (s *Server) TryEndermanPickUpBlock(entityID int32, bx, by, bz int) bool {
 	if !IsEndermanHoldableBlock(state) {
 		return false
 	}
+	endermanBX := int(math.Floor(ent.X))
+	endermanBZ := int(math.Floor(ent.Z))
+	if !CanEndermanPickUpBlockRaycast2612(cache, endermanBX, endermanBZ, bx, by, bz) {
+		return false
+	}
+	carryState := state
+	if defState, ok := world.DefaultBlockStateID(world.BlockName(state)); ok && defState != world.StateAir {
+		carryState = defState
+	}
 
 	mgr := s.endermanManager()
 	mgr.mu.Lock()
@@ -838,7 +820,7 @@ func (s *Server) TryEndermanPickUpBlock(entityID int32, bx, by, bz int) bool {
 		return false
 	}
 	if valid, lc := cache.SetBlockWithLight(bx, by, bz, world.StateAir); valid {
-		st.CarriedBlockState = state
+		st.CarriedBlockState = carryState
 		st.BlockActionCooldown = EndermanBlockActionCooldownTicks
 		creepy := st.Creepy
 		staredAt := st.StaredAt
@@ -849,7 +831,7 @@ func (s *Server) TryEndermanPickUpBlock(entityID int32, bx, by, bz int) bool {
 		}, lc)
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
-			EncodeEndermanEntityDataPacket(entityID, state, creepy, staredAt))
+			EncodeEndermanEntityDataPacket(entityID, carryState, creepy, staredAt))
 		s.EmitVibration(VibrationEvent{
 			Dimension:      dim,
 			Type:           GameEventBlockDestroy,
@@ -865,9 +847,8 @@ func (s *Server) TryEndermanPickUpBlock(entityID int32, bx, by, bz int) bool {
 }
 
 // TryEndermanPlaceBlock attempts to make the Enderman with entityID place its
-// carried block at (bx, by, bz) in its dimension.
-// Requires `mobGriefing=true`, `CarriedBlockState != 0`, air at (bx, by, bz),
-// and a solid non-fluid block at (bx, by-1, bz).
+// carried block at (bx, by, bz) in its dimension, validating `EnderMan$EndermanLeaveBlockGoal.canPlaceBlock`
+// (air destination, non-air non-bedrock full-collision support block below, `canSurvive`, and empty 1x1x1 entity AABB).
 func (s *Server) TryEndermanPlaceBlock(entityID int32, bx, by, bz int) bool {
 	if s == nil || s.entities == nil || !s.MobGriefing() {
 		return false
@@ -881,15 +862,19 @@ func (s *Server) TryEndermanPlaceBlock(entityID int32, bx, by, bz int) bool {
 	if cache == nil || by <= world.MinY || by >= world.MinY+world.WorldHeight {
 		return false
 	}
-	if cache.GetBlock(bx, by, bz) != world.StateAir {
-		return false
+
+	mgr := s.endermanManager()
+	mgr.mu.RLock()
+	stRead, ok := mgr.endermen[entityID]
+	var carriedCheck uint16
+	if ok && stRead != nil {
+		carriedCheck = stRead.CarriedBlockState
 	}
-	below := cache.GetBlock(bx, by-1, bz)
-	if isPassableBlock(below) || below == world.StateWater || world.BlockName(below) == "minecraft:lava" {
+	mgr.mu.RUnlock()
+	if carriedCheck == world.StateAir || !s.CanEndermanPlaceBlock2612(dim, entityID, bx, by, bz, carriedCheck) {
 		return false
 	}
 
-	mgr := s.endermanManager()
 	mgr.mu.Lock()
 	st, ok := mgr.endermen[entityID]
 	if !ok || st == nil || st.CarriedBlockState == world.StateAir {
@@ -926,6 +911,7 @@ func (s *Server) TryEndermanPlaceBlock(entityID int32, bx, by, bz int) bool {
 
 // OnEndermanDamaged handles an Enderman taking melee or environmental damage:
 //   - Provokes the Enderman against attacker (if non-nil survival/adventure player).
+//   - When `attacker == nil` (non-LivingEntity damage), teleports away with 9/10 probability (`random.nextInt(10) != 0`).
 //   - Updates LastRecordedHealth so TickEndermenAndEndermites stays in sync.
 func (s *Server) OnEndermanDamaged(entityID int32, attacker *PlayerSession, rng *rand.Rand) bool {
 	if s == nil || s.entities == nil {
@@ -949,10 +935,13 @@ func (s *Server) OnEndermanDamaged(entityID int32, attacker *PlayerSession, rng 
 	if attacker != nil && !attacker.IsDead() {
 		aSnap := attacker.Snapshot()
 		if aSnap.GameMode != GameModeCreative && aSnap.GameMode != GameModeSpectator {
+			if st.TargetPlayer != attacker {
+				st.TargetChangeTick = st.TickCounter
+			}
 			st.TargetPlayer = attacker
 			st.TargetMobEntityID = 0
 			st.Creepy = true
-			st.AngerTicks = EndermanAngerDurationTicks
+			st.AngerTicks = EndermanPersistentAngerMaxTicks2612
 			carried = st.CarriedBlockState
 			creepy = st.Creepy
 			staredAt = st.StaredAt
@@ -960,6 +949,10 @@ func (s *Server) OnEndermanDamaged(entityID int32, attacker *PlayerSession, rng 
 		}
 	}
 	mgr.mu.Unlock()
+
+	if attacker == nil && (rng == nil || rng.Intn(EndermanNonLivingTeleportDenominator) != 0) {
+		s.TeleportEndermanRandomly(entityID, rng)
+	}
 
 	if syncNeeded {
 		cp := ent.ChunkPos()
@@ -1248,10 +1241,9 @@ func (s *Server) tickSingleEnderman(entityID int32, rng *rand.Rand) {
 	if st.BlockActionCooldown > 0 {
 		st.BlockActionCooldown--
 	}
-	if st.AngerTicks > 0 {
+	if st.AngerTicks > 0 && st.TargetPlayer == nil {
 		st.AngerTicks--
 		if st.AngerTicks == 0 {
-			st.TargetPlayer = nil
 			st.TargetMobEntityID = 0
 			st.Creepy = false
 			st.StaredAt = false
@@ -1274,12 +1266,13 @@ func (s *Server) tickSingleEnderman(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	// 2. Water / Rain contact: deals 1.0 water damage and immediately teleports away.
+	// 2. Water / Rain contact (`isSensitiveToWater()` in `LivingEntity.aiStep`):
+	//    deals 1.0 water damage every 10 ticks (`invulnerableTime > 10` from 20) and teleports away!
 	if s.IsEndermanInWaterOrRain(dim, ent.X, ent.Y, ent.Z) {
 		if snap.WaterDamageTimer <= 0 {
 			mgr.mu.Lock()
 			if cur, ok := mgr.endermen[entityID]; ok && cur != nil {
-				cur.WaterDamageTimer = EndermanWaterDamageIntervalTicks
+				cur.WaterDamageTimer = EndermanWaterDamageIntervalTicks - 1
 			}
 			mgr.mu.Unlock()
 			killed := s.applyDamageToMob(ent, EndermanWaterDamage, nil, 0, false, false)
@@ -1293,9 +1286,37 @@ func (s *Server) tickSingleEnderman(entityID int32, rng *rand.Rand) {
 			}
 			mgr.mu.Unlock()
 		}
-		s.TeleportEndermanRandomly(entityID, rng)
+		if rng == nil || rng.Intn(EndermanNonLivingTeleportDenominator) != 0 {
+			s.TeleportEndermanRandomly(entityID, rng)
+		}
 		ent = s.entities.Get(entityID)
 		if ent == nil {
+			return
+		}
+	}
+
+	// 2b. Daylight de-aggression (`EnderMan.customServerAiStep`):
+	//     when `isBrightOutside()` and `tickCount >= targetChangeTime + 600` (`MIN_DEAGGRESSION_TIME`),
+	//     under open sky, clears target and teleports away!
+	if snap.TargetPlayer != nil && dim == world.DimensionOverworld && !s.IsNight() && !s.IsThundering() &&
+		snap.TickCounter >= snap.TargetChangeTick+EndermanMinDeaggressionTicks2612 {
+		cache := s.DimensionChunks(dim)
+		bx, by, bz := int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z))
+		if s.HasOpenSkyAbove(cache, bx, by, bz) && (rng == nil || rng.Float32()*30.0 < 1.2) {
+			mgr.mu.Lock()
+			if cur, ok := mgr.endermen[entityID]; ok && cur != nil {
+				cur.TargetPlayer = nil
+				cur.Creepy = false
+				cur.StaredAt = false
+				cur.FrozenByStare = false
+				cur.TeleportTime = 0
+				snap = *cur
+			}
+			mgr.mu.Unlock()
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+				EncodeEndermanEntityDataPacket(entityID, snap.CarriedBlockState, false, false))
+			s.TeleportEndermanRandomly(entityID, rng)
 			return
 		}
 	}
@@ -1364,16 +1385,78 @@ func (s *Server) tickSingleEnderman(entityID int32, rng *rand.Rand) {
 
 	if snap.TargetPlayer != nil && !snap.TargetPlayer.IsDead() {
 		pSnap := snap.TargetPlayer.Snapshot()
-		if world.NormalizeDimension(pSnap.Dimension) != dim || pSnap.GameMode == GameModeCreative || pSnap.GameMode == GameModeSpectator {
+		dx0 := pSnap.X - ent.X
+		dy0 := pSnap.Y - ent.Y
+		dz0 := pSnap.Z - ent.Z
+		distSq := dx0*dx0 + dy0*dy0 + dz0*dz0
+		if world.NormalizeDimension(pSnap.Dimension) != dim ||
+			pSnap.GameMode == GameModeCreative || pSnap.GameMode == GameModeSpectator ||
+			distSq > EndermanStareRange*EndermanStareRange {
 			mgr.mu.Lock()
 			if cur, ok := mgr.endermen[entityID]; ok && cur != nil {
 				cur.TargetPlayer = nil
 				cur.Creepy = false
 				cur.StaredAt = false
+				cur.FrozenByStare = false
+				cur.TeleportTime = 0
 			}
 			mgr.mu.Unlock()
 			return
 		}
+
+		// Vanilla EndermanLookForPlayerGoal.tick() + EndermanFreezeWhenLookedAt:
+		//   - When stared at:
+		//       * if distanceToSqr < 16.0 (< 4.0 blocks): teleport() away!
+		//       * reset teleportTime = 0
+		//       * if distanceToSqr <= 256.0 (<= 16.0 blocks): freeze navigation & look at player!
+		//   - When NOT stared at:
+		//       * if distanceToSqr > 256.0 (> 16.0 blocks): increment teleportTime; at >= 30, teleportTowards(target)!
+		staring := s.IsPlayerStaringAtEnderman(snap.TargetPlayer, entityID)
+		if staring {
+			if distSq < EndermanCloseStareTeleportDistSqr {
+				s.TeleportEndermanRandomly(entityID, rng)
+			}
+			frozen := distSq <= EndermanFreezeStareMaxDistSqr
+			mgr.mu.Lock()
+			if cur, ok := mgr.endermen[entityID]; ok && cur != nil {
+				cur.TeleportTime = 0
+				cur.FrozenByStare = frozen
+			}
+			mgr.mu.Unlock()
+			if frozen {
+				if curEnt := s.entities.Get(entityID); curEnt != nil {
+					lookYaw := yawToward(pSnap.X-curEnt.X, pSnap.Z-curEnt.Z)
+					s.entities.Update(entityID, func(e *world.Entity) {
+						e.Yaw = lookYaw
+						e.HeadYaw = lookYaw
+						e.VelocityX = 0
+						e.VelocityZ = 0
+					})
+				}
+				return
+			}
+		} else {
+			newTPTime := snap.TeleportTime
+			if distSq > EndermanTeleportTowardsMinDistSqr {
+				newTPTime++
+				if newTPTime >= EndermanTeleportTowardsDelayTicks {
+					if _, _, _, okTP := s.TeleportEndermanTowards2612(entityID, pSnap.X, pSnap.Y+1.62, pSnap.Z, rng); okTP {
+						newTPTime = 0
+					}
+				}
+			}
+			mgr.mu.Lock()
+			if cur, ok := mgr.endermen[entityID]; ok && cur != nil {
+				cur.FrozenByStare = false
+				cur.TeleportTime = newTPTime
+			}
+			mgr.mu.Unlock()
+			ent = s.entities.Get(entityID)
+			if ent == nil {
+				return
+			}
+		}
+
 		s.stepEndermanTowardPoint(entityID, ent, pSnap.X, pSnap.Y, pSnap.Z, EndermanChaseSpeed)
 		ent = s.entities.Get(entityID)
 		if ent != nil && snap.AttackCooldown <= 0 {
@@ -1392,17 +1475,20 @@ func (s *Server) tickSingleEnderman(entityID int32, rng *rand.Rand) {
 		return
 	}
 
-	// 6. Idle AI: occasional block pickup or placement when mobGriefing=true.
+	// 6. Idle AI (`EndermanTakeBlockGoal` 1/20 & `EndermanLeaveBlockGoal` 1/2000) when mobGriefing=true.
 	if snap.BlockActionCooldown <= 0 && s.MobGriefing() && rng != nil {
-		bx := int(math.Floor(ent.X)) + rng.Intn(3) - 1
-		by := int(math.Floor(ent.Y)) + rng.Intn(3) - 1
-		bz := int(math.Floor(ent.Z)) + rng.Intn(3) - 1
 		if snap.CarriedBlockState == world.StateAir {
-			if rng.Intn(20) == 0 {
+			if rng.Intn(EndermanTakeBlockRollDenominator2612) == 0 {
+				bx := int(math.Floor(ent.X - 2.0 + rng.Float64()*4.0))
+				by := int(math.Floor(ent.Y + rng.Float64()*3.0))
+				bz := int(math.Floor(ent.Z - 2.0 + rng.Float64()*4.0))
 				s.TryEndermanPickUpBlock(entityID, bx, by, bz)
 			}
 		} else {
-			if rng.Intn(80) == 0 {
+			if rng.Intn(EndermanLeaveBlockRollDenom2612) == 0 {
+				bx := int(math.Floor(ent.X - 1.0 + rng.Float64()*2.0))
+				by := int(math.Floor(ent.Y + rng.Float64()*2.0))
+				bz := int(math.Floor(ent.Z - 1.0 + rng.Float64()*2.0))
 				s.TryEndermanPlaceBlock(entityID, bx, by, bz)
 			}
 		}

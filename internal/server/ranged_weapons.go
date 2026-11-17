@@ -623,7 +623,11 @@ func (s *Server) resolveArrowTrajectory(
 				if ent.EffectiveDimension() != dim {
 					continue
 				}
-				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= ent.Y+2.0 && math.Abs(ent.Z-rz) <= 0.8 {
+				maxHitY := ent.Y + 2.0
+				if canonicalResourceName(ent.TypeName) == MobTypeEnderman {
+					maxHitY = ent.Y + EndermanHeight
+				}
+				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= maxHitY && math.Abs(ent.Z-rz) <= 0.8 {
 					hitEntities[ent.ID] = true
 					if ent.TypeName == EntityTypeArmorStand {
 						dmg := damage
@@ -647,8 +651,8 @@ func (s *Server) resolveArrowTrajectory(
 					}
 					normType := canonicalResourceName(ent.TypeName)
 					if normType == MobTypeEnderman {
-						// Endermen dodge/reflect arrows and cannot be hit by projectiles.
-						s.OnEndermanDamaged(ent.ID, session, nil)
+						// Vanilla EnderMan.hurtServer: immune to IS_PROJECTILE; dodges via teleport() without aggroing!
+						s.TryEndermanDodgeProjectile(ent.ID, arrowItemID, nil)
 						entityHits = maxEntityHits
 						break
 					}
@@ -1562,7 +1566,11 @@ func (s *Server) resolveTridentTrajectory(
 				if ent.EffectiveDimension() != dim {
 					continue
 				}
-				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= ent.Y+2.0 && math.Abs(ent.Z-rz) <= 0.8 {
+				maxHitY := ent.Y + 2.0
+				if canonicalResourceName(ent.TypeName) == MobTypeEnderman {
+					maxHitY = ent.Y + EndermanHeight
+				}
+				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= maxHitY && math.Abs(ent.Z-rz) <= 0.8 {
 					hitAnyEntity = true
 					landX, landY, landZ = rx, ry, rz
 					if ent.TypeName == EntityTypeArmorStand {
@@ -1575,7 +1583,7 @@ func (s *Server) resolveTridentTrajectory(
 					}
 					normType := canonicalResourceName(ent.TypeName)
 					if normType == MobTypeEnderman {
-						s.OnEndermanDamaged(ent.ID, session, nil)
+						s.TryEndermanDodgeProjectile(ent.ID, "minecraft:trident", nil)
 						break
 					}
 					inWaterOrRain := s.IsEntityInWaterOrRainAt(dim, ent.X, ent.Y, ent.Z)

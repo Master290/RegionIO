@@ -630,6 +630,11 @@ func (s *Server) SplitSlimeOrMagmaCubeOnDeath(entityID int32, rng *rand.Rand) (c
 		return nil, nil
 	}
 	size := s.SlimeSize(entityID)
+	slimeSplitPropsMu.Lock()
+	inheritedProps, hasInheritedProps := slimeSplitPropsByEntity[entityID]
+	delete(slimeSplitPropsByEntity, entityID)
+	slimeSplitPropsMu.Unlock()
+
 	mgr := s.frogManager()
 	mgr.mu.Lock()
 	delete(mgr.slimeSizes, entityID)
@@ -670,7 +675,7 @@ func (s *Server) SplitSlimeOrMagmaCubeOnDeath(entityID int32, rng *rand.Rand) (c
 		}
 		count := 2
 		if rng != nil {
-			count = 2 + rng.Intn(3) // 2..4 children
+			count = 2 + rng.Intn(3) // 2..4 children (`Slime.remove`)
 		} else {
 			count = 3
 		}
@@ -679,9 +684,20 @@ func (s *Server) SplitSlimeOrMagmaCubeOnDeath(entityID int32, rng *rand.Rand) (c
 			fallbackID = EntityTypeMagmaCubeID
 		}
 		for i := 0; i < count; i++ {
-			ox := float64((i%2)*2-1) * 0.35
-			oz := float64(((i/2)%2)*2-1) * 0.35
-			if cid, err := s.spawnSlimeOrMagmaCube(dim, x+ox, y, z+oz, nextSize, typeName, fallbackID); err == nil && cid > 0 {
+			ox, dy, oz := ComputeSlimeSplitChildOffset2612(size, i)
+			if cid, err := s.spawnSlimeOrMagmaCube(dim, x+ox, y+dy, z+oz, nextSize, typeName, fallbackID); err == nil && cid > 0 {
+				if rng != nil {
+					childYaw := rng.Float32()*360.0 - 180.0
+					s.entities.Update(cid, func(e *world.Entity) {
+						e.Yaw = childYaw
+						e.HeadYaw = childYaw
+					})
+				}
+				if hasInheritedProps {
+					slimeSplitPropsMu.Lock()
+					slimeSplitPropsByEntity[cid] = inheritedProps
+					slimeSplitPropsMu.Unlock()
+				}
 				childIDs = append(childIDs, cid)
 			}
 		}

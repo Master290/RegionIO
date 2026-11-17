@@ -2024,7 +2024,9 @@ func (s *Server) applyDamageToMob(
 	isSlimeOrMagma := canonicalResourceName(target.TypeName) == MobTypeMagmaCube || canonicalResourceName(target.TypeName) == MobTypeSlime
 	if isSlimeOrMagma {
 		slimeSz = s.SlimeSize(target.ID)
-		_, _ = s.SplitSlimeOrMagmaCubeOnDeath(target.ID, nil)
+		gameTime, _ := s.WorldTime()
+		splitRng := rand.New(rand.NewSource(int64(target.ID)*1103515245 + gameTime + 12345))
+		_, _ = s.SplitSlimeOrMagmaCubeOnDeath(target.ID, splitRng)
 	} else {
 		s.entities.Remove(target.ID)
 		s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayRemoveEntities,
