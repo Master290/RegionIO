@@ -1221,8 +1221,13 @@ func (s *Server) ApplyEntityEffectScaled(entityID int32, inst StatusEffectInstan
 		}
 		return true
 
-	case EffectRegeneration, EffectPoison:
+	case EffectRegeneration:
 		if undead {
+			return false
+		}
+
+	case EffectPoison:
+		if undead || IsSpiderFamilyMob(ent.TypeName) {
 			return false
 		}
 	}

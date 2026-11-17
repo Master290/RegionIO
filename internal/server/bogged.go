@@ -150,8 +150,8 @@ func RollBoggedDeathLootWithLooting(rng *rand.Rand, killedByPlayer bool, looting
 		tipped = 1
 	}
 	if rng != nil {
-		bones = int32(1 + rng.Intn(2))
-		arrows = int32(1 + rng.Intn(2))
+		bones = int32(rng.Intn(3))
+		arrows = int32(rng.Intn(3))
 		for l := int32(0); l < lootingLevel; l++ {
 			bones += int32(rng.Intn(2))
 			arrows += int32(rng.Intn(2))
@@ -372,35 +372,19 @@ func (s *Server) ShearBogged(session *PlayerSession, entityID int32, rng *rand.R
 	return dropped, true
 }
 
-// InteractWithBogged handles a player right-clicking a Bogged with shears.
+// InteractWithBogged handles a player right-clicking a Bogged with shears
+// (checking main hand first, then off hand, matching `Bogged.mobInteract`).
 func (s *Server) InteractWithBogged(session *PlayerSession, entityID int32) bool {
-	if s == nil || s.entities == nil || session == nil || session.IsDead() {
-		return false
+	if _, ok := s.InteractWithBoggedHand(session, entityID, 0, nil); ok {
+		return true
 	}
-	snap := session.Snapshot()
-	if snap.GameMode == GameModeSpectator || snap.Health <= 0 {
-		return false
-	}
-	ent := s.entities.Get(entityID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeBogged {
-		return false
-	}
-	dx := ent.X - snap.X
-	dy := ent.Y - snap.Y
-	dz := ent.Z - snap.Z
-	if snap.GameMode != GameModeCreative && (dx*dx+dy*dy+dz*dz) > MaxMeleeAttackReach*MaxMeleeAttackReach {
-		return false
-	}
-	held := session.HeldItem()
-	if held.IsEmpty() || canonicalResourceName(held.ResolvedID()) != ShearsItemID {
-		return false
-	}
-	_, ok := s.ShearBogged(session, entityID, nil)
+	_, ok := s.InteractWithBoggedHand(session, entityID, 1, nil)
 	return ok
 }
 
 // ShootBoggedArrowAtPlayer fires a poison arrow from a Bogged at target:
-// plays shoot sound, applies ranged arrow damage, and inflicts Poison I (4.0s / 80 ticks)
+// plays shoot sound, applies ranged arrow damage, and inflicts Poison I (5.0s / 100 ticks
+// per `Bogged.getArrow` `new MobEffectInstance(MobEffects.POISON, 100)` in `26.1.2.jar`)
 // if the arrow was not deflected by a shield.
 func (s *Server) ShootBoggedArrowAtPlayer(boggedID int32, bogX, bogY, bogZ float64, target *PlayerSession) float32 {
 	if s == nil || target == nil || target.IsDead() {
@@ -460,7 +444,8 @@ func (s *Server) stepHostileBoggedAI(
 	)
 
 	dist3D := math.Sqrt((target.x-nextX)*(target.x-nextX) + (target.y-nextY)*(target.y-nextY) + (target.z-nextZ)*(target.z-nextZ))
-	if dist3D <= BoggedBowRange && mem.attackCooldown <= 0 {
+	hasLOS := hasCreeperLineOfSight(chunks, nextX, nextY, nextZ, target.x, target.y, target.z)
+	if hasLOS && dist3D <= BoggedBowRange && mem.attackCooldown <= 0 {
 		shootTarget = target.session
 		cooldown := BoggedShootCooldownTicks
 		if s != nil && s.Difficulty() == DifficultyHard {

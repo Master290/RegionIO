@@ -1730,6 +1730,9 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeBat {
 		s.WakeBatOnHurt(target.ID)
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeBreeze {
+		s.OnBreezeDamaged(target.ID)
+	}
 	if canonicalResourceName(target.TypeName) == MobTypeHorse {
 		damage = s.ReduceHorseDamageByArmor(target.ID, damage)
 		if damage <= 0 {

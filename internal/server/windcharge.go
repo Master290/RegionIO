@@ -22,14 +22,14 @@ const (
 
 	// Flight speed and item cooldown.
 	WindChargeFlightSpeed       float64 = 1.50
-	BreezeWindChargeFlightSpeed float64 = 0.72
-	WindChargeItemCooldownTicks int64   = 10  // 0.5s cooldown between player throws
-	WindChargeMaxLifetimeTicks  int     = 200 // 10.0s max flight duration
+	BreezeWindChargeFlightSpeed float64 = 0.70 // Shoot.PROJECTILE_MOVEMENT_SCALE = 0.7F
+	WindChargeItemCooldownTicks int64   = 10   // 0.5s cooldown between player throws
+	WindChargeMaxLifetimeTicks  int     = 200  // 10.0s max flight duration
 	WindChargeHitboxRadius      float64 = 0.65
 
-	// Direct-hit damage and wind-burst knockback parameters.
+	// Direct-hit damage and wind-burst knockback parameters (WindCharge.RADIUS = 1.2F, BreezeWindCharge.RADIUS = 3.0F).
 	WindChargeDirectHitDamage     float32 = 1.0 // 0.5 heart on direct entity impact; 0 splash damage
-	WindChargeBurstRadius         float64 = 2.5
+	WindChargeBurstRadius         float64 = 1.2
 	BreezeWindChargeBurstRadius   float64 = 3.0
 	WindChargeHorizontalKnockback float64 = 1.20
 	WindChargeVerticalKnockback   float64 = 0.65
@@ -293,11 +293,13 @@ func (s *Server) DeflectWindCharge(entityID int32, dirX, dirY, dirZ float64, new
 	return true
 }
 
-// DetonateWindCharge triggers the wind burst of a Wind Charge at its current
-// position (or at directHitEntityID), dealing 1.0 HP direct-hit damage to
-// directHitEntityID, applying radial + upward knockback to all nearby entities
-// and players, and toggling non-iron doors, trapdoors, fence gates, levers,
-// buttons, bells, and lit candles within the burst radius.
+// DetonateWindCharge triggers the wind burst of a Wind Charge (`radius = 1.2`,
+// `knockbackMultiplier = 1.22`) or Breeze Wind Charge (`radius = 3.0`,
+// `knockbackMultiplier = 1.0`) at its current position, dealing 1.0 HP direct-hit
+// damage to directHitEntityID (`0` splash damage), applying `ServerExplosion`
+// radial + upward knockback within `2 * radius`, and triggering interactive blocks
+// (`DoorBlock`, `TrapDoorBlock`, `FenceGateBlock`, `ButtonBlock`, `LeverBlock`,
+// `BellBlock`, `AbstractCandleBlock`) per `26.1.2.jar`.
 func (s *Server) DetonateWindCharge(entityID int32, directHitEntityID int32) (knockedEntities int, toggledBlocks [][3]int) {
 	if s == nil || s.entities == nil {
 		return 0, nil
@@ -322,6 +324,10 @@ func (s *Server) DetonateWindCharge(entityID int32, directHitEntityID int32) (kn
 		shooterID = st.ShooterEntityID
 	}
 	shooterPlayer := s.playerByEntityID(shooterID)
+	var shooterEntityType string
+	if shooterEnt := s.entities.Get(shooterID); shooterEnt != nil {
+		shooterEntityType = shooterEnt.TypeName
+	}
 
 	// Remove the wind charge projectile entity.
 	s.entities.Remove(entityID)
@@ -344,12 +350,16 @@ func (s *Server) DetonateWindCharge(entityID int32, directHitEntityID int32) (kn
 		SourceEntityID: shooterID,
 	})
 
-	// 1. Direct-hit entity damage (1.0 HP).
+	// 1. Direct-hit entity damage (1.0 HP `wind_charge`; `end_crystal` cannot be hit,
+	// and `Breeze.isInvulnerableTo` ignores damage from another Breeze).
 	if directHitEntityID != 0 {
 		if hitPlayer := s.playerByEntityID(directHitEntityID); hitPlayer != nil {
 			s.DamagePlayerWithArmor(hitPlayer, WindChargeDirectHitDamage, "wind_charge")
 		} else if hitEnt := s.entities.Get(directHitEntityID); hitEnt != nil && !hitEnt.IsItem() && !hitEnt.IsExperienceOrb() {
-			s.applyDamageToMob(hitEnt, WindChargeDirectHitDamage, shooterPlayer, 0, false, false)
+			hitType := canonicalResourceName(hitEnt.TypeName)
+			if hitType != "minecraft:end_crystal" && !(hitType == MobTypeBreeze && IsBreezeInvulnerableTo(shooterEntityType, false)) {
+				s.applyDamageToMob(hitEnt, WindChargeDirectHitDamage, shooterPlayer, 0, false, false)
+			}
 		}
 	}
 
@@ -357,9 +367,9 @@ func (s *Server) DetonateWindCharge(entityID int32, directHitEntityID int32) (kn
 	if isBreeze {
 		burstRadius = BreezeWindChargeBurstRadius
 	}
-	maxDistSq := burstRadius * burstRadius
+	cache := s.DimensionChunks(dim)
 
-	// 2. Apply wind-burst knockback to nearby players.
+	// 2. Apply `ServerExplosion.hurtEntities()` wind-burst knockback to nearby players (0 splash damage).
 	for _, sess := range s.onlinePlayersSnapshot() {
 		if sess == nil || sess.IsDead() {
 			continue
@@ -371,74 +381,64 @@ func (s *Server) DetonateWindCharge(entityID int32, directHitEntityID int32) (kn
 		if world.NormalizeDimension(snap.Dimension) != dim {
 			continue
 		}
-		dx := snap.X - bx
-		dy := (snap.Y + 0.9) - by
-		dz := snap.Z - bz
-		distSq := dx*dx + dy*dy + dz*dz
-		if distSq > maxDistSq {
+		creativeFlying := snap.GameMode == GameModeCreative && sess.IsFlying()
+		dvx, dvy, dvz, affected := ComputeWindChargeEntityImpulse2612(
+			cache, bx, by, bz,
+			snap.X, snap.Y, snap.Z, 1.62,
+			isBreeze, creativeFlying, sess.KnockbackResistance(),
+		)
+		if !affected {
 			continue
 		}
-		dist := math.Sqrt(distSq)
-		atten := 1.0 - (dist / (burstRadius + 0.5))
-		if atten < 0.25 {
-			atten = 0.25
-		}
-		horizDist := math.Hypot(dx, dz)
-		var vx, vz float64
-		if horizDist > 1e-4 {
-			vx = (dx / horizDist) * WindChargeHorizontalKnockback * atten
-			vz = (dz / horizDist) * WindChargeHorizontalKnockback * atten
-		}
-		vy := WindChargeVerticalKnockback * (0.7 + 0.3*atten)
-		// Reset fall distance so wind-charge rocket jumps do not accumulate fall damage above the launch height.
 		if st := getSurvivalState(sess); st != nil {
 			st.mu.Lock()
 			st.fallDistance = 0
 			st.mu.Unlock()
 		}
 		if sess.send != nil {
-			_ = sess.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(sess.EntityID, vx, vy, vz))
+			_ = sess.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(sess.EntityID, dvx, dvy, dvz))
 		}
 		knockedEntities++
 	}
 
-	// 3. Apply wind-burst knockback to nearby mobs.
+	// 3. Apply `ServerExplosion.hurtEntities()` wind-burst knockback to nearby mobs/entities (0 splash damage).
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		other := &allEnts[i]
-		if other.ID == entityID || other.EffectiveDimension() != dim || other.IsExperienceOrb() || IsDecorationEntity(other.TypeName) {
+		if other.ID == entityID || other.EffectiveDimension() != dim || other.IsExperienceOrb() ||
+			IsDecorationEntity(other.TypeName) || IsWindChargeEntityType(other.TypeName) ||
+			canonicalResourceName(other.TypeName) == "minecraft:end_crystal" {
 			continue
 		}
-		dx := other.X - bx
-		dy := (other.Y + 0.5) - by
-		dz := other.Z - bz
-		distSq := dx*dx + dy*dy + dz*dz
-		if distSq > maxDistSq {
+		eyeH := 0.85
+		if spec, ok := LookupMobCompletenessSpec2612(other.TypeName); ok && spec.EyeHeight > 0 {
+			eyeH = spec.EyeHeight
+		} else if other.IsItem() {
+			eyeH = 0.2125
+		}
+		var kbRes float64
+		if attr, ok := ResolveMobHitboxAndAttributes2612(other.TypeName); ok {
+			kbRes = attr.KnockbackResistance
+		}
+		dvx, dvy, dvz, affected := ComputeWindChargeEntityImpulse2612(
+			cache, bx, by, bz,
+			other.X, other.Y, other.Z, eyeH,
+			isBreeze, false, kbRes,
+		)
+		if !affected {
 			continue
 		}
-		dist := math.Sqrt(distSq)
-		atten := 1.0 - (dist / (burstRadius + 0.5))
-		if atten < 0.25 {
-			atten = 0.25
-		}
-		horizDist := math.Hypot(dx, dz)
-		var vx, vz float64
-		if horizDist > 1e-4 {
-			vx = (dx / horizDist) * WindChargeHorizontalKnockback * atten
-			vz = (dz / horizDist) * WindChargeHorizontalKnockback * atten
-		} else {
-			vx = 0.4 * atten
-		}
-		vy := WindChargeVerticalKnockback * atten
+		vx := float64(other.VelocityX)/8000.0 + dvx
+		vy := float64(other.VelocityY)/8000.0 + dvy
+		vz := float64(other.VelocityZ)/8000.0 + dvz
 		velX := clampVelocityShort(vx)
 		velY := clampVelocityShort(vy)
 		velZ := clampVelocityShort(vz)
 
-		cache := s.DimensionChunks(dim)
 		feetY := int(math.Floor(other.Y + 0.01))
-		nx := other.X + vx*0.5
+		nx := other.X + dvx*0.5
 		ny := other.Y
-		nz := other.Z + vz*0.5
+		nz := other.Z + dvz*0.5
 		if cache != nil && !other.IsItem() {
 			if stepX, stepY, stepZ, ok := tryApplyHorizontalStep(cache, other.X, feetY, other.Z, nx, nz); ok {
 				nx, ny, nz = stepX, float64(stepY), stepZ
@@ -460,15 +460,23 @@ func (s *Server) DetonateWindCharge(entityID int32, directHitEntityID int32) (kn
 		knockedEntities++
 	}
 
-	// 4. Toggle interactive blocks (doors, trapdoors, fence gates, levers, buttons, bells, candles) within burstRadius.
-	toggledBlocks = s.InteractWindChargeWithBlocks(dim, bx, by, bz, burstRadius)
+	// 4. `ServerExplosion.canTriggerBlocks()`: for `BREEZE_WIND_CHARGE`, requires `GameRules.MOB_GRIEFING`!
+	if !isBreeze || s.MobGriefing() {
+		toggledBlocks = s.InteractWindChargeWithBlocks(dim, bx, by, bz, burstRadius)
+	}
 	return knockedEntities, toggledBlocks
 }
 
-// InteractWindChargeWithBlocks toggles non-iron doors, non-iron trapdoors,
-// fence gates, levers, buttons, bells, and lit candles within radius of (cx, cy, cz)
-// in dimension, invoking the registered WindChargeRedstoneHookFunc for each
-// modified block.
+// InteractWindChargeWithBlocks triggers interactive blocks (`onExplosionHit` with
+// `Explosion.canTriggerBlocks() == true` in `26.1.2.jar`):
+//   - Non-iron unpowered doors (`BlockSetType.canOpenByWindCharge() && !POWERED`)
+//   - Non-iron unpowered trapdoors (`BlockSetType.canOpenByWindCharge() && !POWERED`)
+//   - Unpowered fence gates (`!POWERED`)
+//   - Unpowered buttons (`!POWERED -> press`)
+//   - Levers (`pull` toggle)
+//   - Bells (`attemptToRing`)
+//   - Lit candles and candle cakes (`AbstractCandleBlock`: `LIT -> extinguish`)
+// Rays respect `#minecraft:blocks_wind_charge_explosions` (`barrier`, `bedrock`).
 func (s *Server) InteractWindChargeWithBlocks(dimension string, cx, cy, cz, radius float64) [][3]int {
 	if s == nil {
 		return nil
@@ -484,140 +492,126 @@ func (s *Server) InteractWindChargeWithBlocks(dimension string, cx, cy, cz, radi
 	hook := mgr.redstoneHook
 	mgr.mu.RUnlock()
 
-	rInt := int(math.Ceil(radius))
-	bx0 := int(math.Floor(cx))
-	by0 := int(math.Floor(cy))
-	bz0 := int(math.Floor(cz))
-	maxDistSq := radius * radius
-
+	explodedPositions := CalculateWindChargeExplodedPositions2612(cache, cx, cy, cz, radius)
 	visitedDoors := make(map[[3]int]bool)
 	var toggled [][3]int
 
-	for dy := -rInt; dy <= rInt; dy++ {
-		by := by0 + dy
-		if by < world.MinY || by >= world.MinY+world.WorldHeight {
+	for _, pos := range explodedPositions {
+		bx, by, bz := pos[0], pos[1], pos[2]
+		state := cache.GetBlock(bx, by, bz)
+		if state == world.StateAir {
 			continue
 		}
-		for dx := -rInt; dx <= rInt; dx++ {
-			bx := bx0 + dx
-			for dz := -rInt; dz <= rInt; dz++ {
-				bz := bz0 + dz
-				distSq := (float64(bx)+0.5-cx)*(float64(bx)+0.5-cx) +
-					(float64(by)+0.5-cy)*(float64(by)+0.5-cy) +
-					(float64(bz)+0.5-cz)*(float64(bz)+0.5-cz)
-				if distSq > maxDistSq {
-					continue
+		name, props, ok := world.BlockStateProperties(state)
+		if !ok || name == "" {
+			continue
+		}
+
+		switch {
+		// 1. Non-iron unpowered doors (`DoorBlock.onExplosionHit`: `canOpenByWindCharge && !POWERED`).
+		case strings.HasSuffix(name, "_door") && name != "minecraft:iron_door":
+			if props["powered"] == "true" {
+				continue
+			}
+			lowerY := by
+			if props["half"] == "upper" {
+				lowerY = by - 1
+			}
+			doorKey := [3]int{bx, lowerY, bz}
+			if visitedDoors[doorKey] {
+				continue
+			}
+			visitedDoors[doorKey] = true
+			newOpen := "true"
+			if props["open"] == "true" {
+				newOpen = "false"
+			}
+			if nextSt, valid := withCopiedBlockProp(name, props, "open", newOpen); valid {
+				cache.SetBlock(bx, by, bz, nextSt)
+				s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
+				otherY := lowerY + 1
+				if by == lowerY+1 {
+					otherY = lowerY
 				}
-				state := cache.GetBlock(bx, by, bz)
-				if state == world.StateAir {
-					continue
+				if otherY >= world.MinY && otherY < world.MinY+world.WorldHeight {
+					otherSt := cache.GetBlock(bx, otherY, bz)
+					if oName, oProps, oOK := world.BlockStateProperties(otherSt); oOK && oName == name {
+						if nextOther, v2 := withCopiedBlockProp(oName, oProps, "open", newOpen); v2 {
+							cache.SetBlock(bx, otherY, bz, nextOther)
+							s.broadcastMobBlockUpdate(normDim, bx, otherY, bz, nextOther)
+						}
+					}
 				}
-				name, props, ok := world.BlockStateProperties(state)
-				if !ok || name == "" {
-					continue
+				toggled = append(toggled, doorKey)
+				if hook != nil {
+					hook(normDim, bx, by, bz, name, state, nextSt)
 				}
+			}
 
-				switch {
-				// 1. Non-iron doors (_door, except iron_door).
-				case strings.HasSuffix(name, "_door") && name != "minecraft:iron_door":
-					lowerY := by
-					if props["half"] == "upper" {
-						lowerY = by - 1
-					}
-					doorKey := [3]int{bx, lowerY, bz}
-					if visitedDoors[doorKey] {
-						continue
-					}
-					visitedDoors[doorKey] = true
-					newOpen := "true"
-					if props["open"] == "true" {
-						newOpen = "false"
-					}
-					if nextSt, valid := withCopiedBlockProp(name, props, "open", newOpen); valid {
-						cache.SetBlock(bx, by, bz, nextSt)
-						s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
-						// Also update the matching upper/lower door half if present.
-						otherY := lowerY + 1
-						if by == lowerY+1 {
-							otherY = lowerY
-						}
-						if otherY >= world.MinY && otherY < world.MinY+world.WorldHeight {
-							otherSt := cache.GetBlock(bx, otherY, bz)
-							if oName, oProps, oOK := world.BlockStateProperties(otherSt); oOK && oName == name {
-								if nextOther, v2 := withCopiedBlockProp(oName, oProps, "open", newOpen); v2 {
-									cache.SetBlock(bx, otherY, bz, nextOther)
-									s.broadcastMobBlockUpdate(normDim, bx, otherY, bz, nextOther)
-								}
-							}
-						}
-						toggled = append(toggled, doorKey)
-						if hook != nil {
-							hook(normDim, bx, by, bz, name, state, nextSt)
-						}
-					}
+		// 2. Non-iron unpowered trapdoors and unpowered fence gates (`!POWERED`).
+		case (strings.HasSuffix(name, "_trapdoor") && name != "minecraft:iron_trapdoor") ||
+			strings.HasSuffix(name, "_fence_gate"):
+			if props["powered"] == "true" {
+				continue
+			}
+			newOpen := "true"
+			if props["open"] == "true" {
+				newOpen = "false"
+			}
+			if nextSt, valid := withCopiedBlockProp(name, props, "open", newOpen); valid {
+				cache.SetBlock(bx, by, bz, nextSt)
+				s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
+				toggled = append(toggled, [3]int{bx, by, bz})
+				if hook != nil {
+					hook(normDim, bx, by, bz, name, state, nextSt)
+				}
+			}
 
-				// 2. Non-iron trapdoors (_trapdoor, except iron_trapdoor) and fence gates (_fence_gate).
-				case (strings.HasSuffix(name, "_trapdoor") && name != "minecraft:iron_trapdoor") ||
-					strings.HasSuffix(name, "_fence_gate"):
-					newOpen := "true"
-					if props["open"] == "true" {
-						newOpen = "false"
-					}
-					if nextSt, valid := withCopiedBlockProp(name, props, "open", newOpen); valid {
-						cache.SetBlock(bx, by, bz, nextSt)
-						s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
-						toggled = append(toggled, [3]int{bx, by, bz})
-						if hook != nil {
-							hook(normDim, bx, by, bz, name, state, nextSt)
-						}
-					}
+		// 3. Lever (`minecraft:lever`) -> flips `powered` `true <-> false`.
+		case name == "minecraft:lever":
+			newPowered := "true"
+			if props["powered"] == "true" {
+				newPowered = "false"
+			}
+			if nextSt, valid := withCopiedBlockProp(name, props, "powered", newPowered); valid {
+				cache.SetBlock(bx, by, bz, nextSt)
+				s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
+				toggled = append(toggled, [3]int{bx, by, bz})
+				if hook != nil {
+					hook(normDim, bx, by, bz, name, state, nextSt)
+				}
+			}
 
-				// 3. Lever (minecraft:lever) -> flips powered true <-> false.
-				case name == "minecraft:lever":
-					newPowered := "true"
-					if props["powered"] == "true" {
-						newPowered = "false"
-					}
-					if nextSt, valid := withCopiedBlockProp(name, props, "powered", newPowered); valid {
-						cache.SetBlock(bx, by, bz, nextSt)
-						s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
-						toggled = append(toggled, [3]int{bx, by, bz})
-						if hook != nil {
-							hook(normDim, bx, by, bz, name, state, nextSt)
-						}
-					}
-
-				// 4. Buttons (_button) -> presses unpowered button (powered = true).
-				case strings.HasSuffix(name, "_button"):
-					if props["powered"] != "true" {
-						if nextSt, valid := withCopiedBlockProp(name, props, "powered", "true"); valid {
-							cache.SetBlock(bx, by, bz, nextSt)
-							s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
-							toggled = append(toggled, [3]int{bx, by, bz})
-							if hook != nil {
-								hook(normDim, bx, by, bz, name, state, nextSt)
-							}
-						}
-					}
-
-				// 5. Bell (minecraft:bell) -> rings bell.
-				case name == "minecraft:bell":
-					s.BroadcastDimensionChunk(normDim, int32(bx>>4), int32(bz>>4), PlaySoundPacketID,
-						EncodeSoundPacket("minecraft:block.bell.use", SoundSourceBlocks, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, 2.0, 1.0, 0))
+		// 4. Buttons (`_button`) -> presses unpowered button (`powered = true`).
+		case strings.HasSuffix(name, "_button"):
+			if props["powered"] != "true" {
+				if nextSt, valid := withCopiedBlockProp(name, props, "powered", "true"); valid {
+					cache.SetBlock(bx, by, bz, nextSt)
+					s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
 					toggled = append(toggled, [3]int{bx, by, bz})
 					if hook != nil {
-						hook(normDim, bx, by, bz, name, state, state)
+						hook(normDim, bx, by, bz, name, state, nextSt)
 					}
+				}
+			}
 
-				// 6. Lit candles (_candle) -> extinguishes (lit = false).
-				case strings.HasSuffix(name, "_candle") || name == "minecraft:candle":
-					if props["lit"] == "true" {
-						if nextSt, valid := withCopiedBlockProp(name, props, "lit", "false"); valid {
-							cache.SetBlock(bx, by, bz, nextSt)
-							s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
-							toggled = append(toggled, [3]int{bx, by, bz})
-						}
-					}
+		// 5. Bell (`minecraft:bell`) -> rings bell.
+		case name == "minecraft:bell":
+			s.BroadcastDimensionChunk(normDim, int32(bx>>4), int32(bz>>4), PlaySoundPacketID,
+				EncodeSoundPacket("minecraft:block.bell.use", SoundSourceBlocks, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, 2.0, 1.0, 0))
+			toggled = append(toggled, [3]int{bx, by, bz})
+			if hook != nil {
+				hook(normDim, bx, by, bz, name, state, state)
+			}
+
+		// 6. Lit candles and candle cakes (`AbstractCandleBlock`) -> extinguishes (`lit = false`).
+		case strings.HasSuffix(name, "_candle") || name == "minecraft:candle" ||
+			strings.HasSuffix(name, "_candle_cake") || name == "minecraft:candle_cake":
+			if props["lit"] == "true" {
+				if nextSt, valid := withCopiedBlockProp(name, props, "lit", "false"); valid {
+					cache.SetBlock(bx, by, bz, nextSt)
+					s.broadcastMobBlockUpdate(normDim, bx, by, bz, nextSt)
+					toggled = append(toggled, [3]int{bx, by, bz})
 				}
 			}
 		}
@@ -706,7 +700,8 @@ func (s *Server) TickWindCharges() {
 			allEnts := s.entities.AppendAll(nil)
 			for i := range allEnts {
 				other := &allEnts[i]
-				if other.ID == id || other.EffectiveDimension() != dim || other.IsItem() || other.IsExperienceOrb() || IsWindChargeEntityType(other.TypeName) {
+				if other.ID == id || other.EffectiveDimension() != dim || other.IsItem() || other.IsExperienceOrb() ||
+					IsWindChargeEntityType(other.TypeName) || canonicalResourceName(other.TypeName) == "minecraft:end_crystal" {
 					continue
 				}
 				if other.ID == shooterID && age <= 5 {
@@ -727,7 +722,7 @@ func (s *Server) TickWindCharges() {
 			continue
 		}
 
-		// Check collision with non-air blocks.
+		// Check collision with non-air blocks (`AbstractWindCharge.onHitBlock` offsets center by `hitNormal * 0.25`).
 		cache := s.DimensionChunks(dim)
 		if cache != nil {
 			bx := int(math.Floor(nextX))
@@ -740,8 +735,15 @@ func (s *Server) TickWindCharges() {
 			blk := cache.GetBlock(bx, by, bz)
 			if (!isPassableBlock(blk) && blk != world.StateWater) || world.IsChorusFlowerBlock(blk) {
 				_, _ = s.OnProjectileBlockImpact(dim, bx, by, bz, ent.X, ent.Y, ent.Z, nextX, nextY, nextZ, id, ent.TypeName)
+				vMag := math.Sqrt(vx*vx + vy*vy + vz*vz)
+				detX, detY, detZ := nextX, nextY, nextZ
+				if vMag > 1e-6 {
+					detX = ent.X + (nextX-ent.X)*0.5 - (vx/vMag)*WindChargeBlockHitNormalOffset
+					detY = ent.Y + (nextY-ent.Y)*0.5 - (vy/vMag)*WindChargeBlockHitNormalOffset
+					detZ = ent.Z + (nextZ-ent.Z)*0.5 - (vz/vMag)*WindChargeBlockHitNormalOffset
+				}
 				s.entities.Update(id, func(e *world.Entity) {
-					e.X, e.Y, e.Z = nextX, nextY, nextZ
+					e.X, e.Y, e.Z = detX, detY, detZ
 				})
 				s.DetonateWindCharge(id, 0)
 				continue

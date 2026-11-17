@@ -193,6 +193,19 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 				if h.consumeProjectile {
 					s.despawnHostileEntityByID(h.projectileID)
 				}
+			case 3:
+				if projEnt := s.entities.Get(h.projectileID); projEnt != nil {
+					if ox, oy, oz, defl := s.TryDeflectProjectileByBreeze(h.targetID, projEnt.TypeName, h.vx, h.vy, h.vz); defl {
+						s.entities.Update(h.projectileID, func(e *world.Entity) {
+							e.VelocityX = clampVelocityShort(ox)
+							e.VelocityY = clampVelocityShort(oy)
+							e.VelocityZ = clampVelocityShort(oz)
+						})
+						cp := projEnt.ChunkPos()
+						s.BroadcastDimensionChunk(projEnt.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEntityMotion,
+							EncodeSetEntityMotionPacket(h.projectileID, ox, oy, oz))
+					}
+				}
 			}
 		}
 		s.TickWithers(rng)
@@ -335,6 +348,19 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferred
 					if candCanon == MobTypeEnderman {
 						if math.Abs(cand.X-nx) <= 1.0 && ny >= cand.Y-0.2 && ny <= cand.Y+EndermanHeight && math.Abs(cand.Z-nz) <= 1.0 {
 							s.TryEndermanDodgeProjectile(cand.ID, snapshot.TypeName, rng)
+						}
+					} else if candCanon == MobTypeBreeze && CanBreezeDeflectProjectile(projCanon) {
+						if math.Abs(cand.X-nx) <= 0.7 && ny >= cand.Y-0.2 && ny <= cand.Y+BreezeHeight+0.2 && math.Abs(cand.Z-nz) <= 0.7 {
+							projHits = append(projHits, deferredProjectileHit2612{
+								kind:         3,
+								projectileID: snapshot.ID,
+								targetID:     cand.ID,
+								vx:           vx,
+								vy:           vy,
+								vz:           vz,
+							})
+							hitProjectileTarget = true
+							break
 						}
 					} else if candCanon == MobTypeBlaze && projCanon == "minecraft:snowball" {
 						if math.Abs(cand.X-nx) <= 0.8 && ny >= cand.Y-0.2 && ny <= cand.Y+BlazeHeight2612 && math.Abs(cand.Z-nz) <= 0.8 {
@@ -582,8 +608,8 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferred
 				swellDir = mem.creeperSwellDir
 			}
 		case MobTypeSpider, MobTypeCaveSpider:
-			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderAI(
-				s.chunks, rng, mem, t.playerTargets,
+			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderFamilyAI(
+				snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
 				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 			)
 			attackDmg = SpiderAttackDamage

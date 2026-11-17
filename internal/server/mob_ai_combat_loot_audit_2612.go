@@ -576,8 +576,8 @@ func LookupMobRangedAttackSpec2612(mobType string, difficulty Difficulty) (MobRa
 		return MobRangedAttackSpec2612{
 			ProjectileEntityType: BreezeWindChargeEntityType,
 			MaxRange:             16.0,
-			CooldownTicks:        30,
-			ProjectileSpeed:      1.2,
+			CooldownTicks:        10,
+			ProjectileSpeed:      0.7,
 		}, true
 	}
 	return MobRangedAttackSpec2612{}, false

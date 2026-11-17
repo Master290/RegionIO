@@ -1826,15 +1826,15 @@ func CalculateMobXPReward2612(typeName string, isBaby bool, naturallySpawnedEqui
 		base = 50
 	case MobTypePiglinBrute, MobTypeRavager:
 		base = 20
-	case MobTypeBlaze, MobTypeGuardian, MobTypeElderGuardian, MobTypeEvoker, MobTypeHusk, MobTypeSkeleton, MobTypeZombie:
-		if norm == MobTypeBlaze || norm == MobTypeGuardian || norm == MobTypeElderGuardian || norm == MobTypeEvoker {
+	case MobTypeBlaze, MobTypeBreeze, MobTypeGuardian, MobTypeElderGuardian, MobTypeEvoker, MobTypeHusk, MobTypeSkeleton, MobTypeZombie:
+		if norm == MobTypeBlaze || norm == MobTypeBreeze || norm == MobTypeGuardian || norm == MobTypeElderGuardian || norm == MobTypeEvoker {
 			base = 10
 		} else {
 			base = 5
 		}
 	case MobTypeCreeper, MobTypeSpider, MobTypeCaveSpider, MobTypeEnderman,
 		MobTypeDrowned, MobTypeStray, MobTypeBogged, MobTypeParched, MobTypeWitherSkeleton,
-		MobTypeGhast, MobTypePhantom, MobTypeBreeze, MobTypeWitch, MobTypeVindicator,
+		MobTypeGhast, MobTypePhantom, MobTypeWitch, MobTypeVindicator,
 		MobTypePillager, MobTypeVex, MobTypeIllusioner, MobTypeShulker,
 		MobTypePiglin, MobTypeZombifiedPiglin, MobTypeHoglin, MobTypeZoglin,
 		MobTypeSilverfish, MobTypeWarden, MobTypeZombieNautilus, MobTypeCamelHusk:

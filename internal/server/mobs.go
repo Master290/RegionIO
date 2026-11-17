@@ -1430,6 +1430,21 @@ func (s *Server) stepHostileSpiderAI(
 	z float64,
 	yaw float32,
 ) (nextX, nextY, nextZ float64, nextYaw float32, attackTarget *PlayerSession, leaped bool) {
+	return s.stepHostileSpiderFamilyAI(MobTypeSpider, chunks, rng, mem, targets, x, feetY, z, yaw)
+}
+
+func (s *Server) stepHostileSpiderFamilyAI(
+	spiderType string,
+	chunks *world.Cache,
+	rng *rand.Rand,
+	mem *mobMemory,
+	targets []playerTarget,
+	x float64,
+	feetY int,
+	z float64,
+	yaw float32,
+) (nextX, nextY, nextZ float64, nextYaw float32, attackTarget *PlayerSession, leaped bool) {
+	width, height, _ := SpiderDimensionsForType2612(spiderType)
 	if mem.attackCooldown > 0 {
 		mem.attackCooldown--
 	}
@@ -1452,7 +1467,7 @@ func (s *Server) stepHostileSpiderAI(
 			tz := z + (awayZ/dist)*SpiderChaseSpeed
 			nextYaw = yawToward(awayX, awayZ)
 			if chunks != nil {
-				if nx, ny, nz, stepOK := tryApplyHorizontalStep(chunks, x, feetY, z, tx, tz); stepOK {
+				if nx, ny, nz, stepOK := tryApplyHorizontalStepSized2612(chunks, x, feetY, z, tx, tz, width, height); stepOK {
 					return nx, float64(ny), nz, nextYaw, nil, false
 				}
 			}
@@ -1504,10 +1519,10 @@ func (s *Server) stepHostileSpiderAI(
 		leaped = true
 	}
 
-	nextX, nextY, nextZ, nextYaw = stepHostileChaseToward(
+	nextX, nextY, nextZ, nextYaw = stepHostileChaseTowardSized2612(
 		chunks, mem, x, feetY, z, yaw,
 		target.x, target.y, target.z,
-		speed, SpiderAttackStopDist,
+		speed, SpiderAttackStopDist, width, height,
 	)
 
 	finalDX := target.x - nextX

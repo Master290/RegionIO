@@ -99,7 +99,7 @@ type playerTarget struct {
 // attacks (or explodes near) players.
 func IsHostileMob(typeName string) bool {
 	switch typeName {
-	case MobTypeZombie, MobTypeSkeleton, MobTypeBogged, MobTypeCreeper, MobTypeSpider, MobTypePhantom, MobTypeBreeze,
+	case MobTypeZombie, MobTypeSkeleton, MobTypeBogged, MobTypeCreeper, MobTypeSpider, MobTypeCaveSpider, MobTypePhantom, MobTypeBreeze,
 		MobTypeBlaze, MobTypeGhast, MobTypeMagmaCube, MobTypeSlime:
 		return true
 	default:

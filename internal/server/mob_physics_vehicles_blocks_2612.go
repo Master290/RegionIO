@@ -317,7 +317,9 @@ func LookupBlockMovementPhysics2612(blockName, mobType string, isSneaking, hasSo
 		}
 	case "minecraft:cobweb":
 		p.ResetsFallDistance = true
-		if hasWeavingEffect || normMob == MobTypeSpider || normMob == MobTypeCaveSpider {
+		if normMob == MobTypeSpider || normMob == MobTypeCaveSpider {
+			// `Spider.makeStuckInBlock`: spiders and cave spiders ignore cobweb slowdown completely (1.0, 1.0, 1.0).
+		} else if hasWeavingEffect {
 			p.InsideStuckX = 0.5
 			p.InsideStuckY = 0.25
 			p.InsideStuckZ = 0.5

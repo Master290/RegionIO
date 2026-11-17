@@ -241,7 +241,7 @@ func (s *Server) ensureUndeadState(entityID int32, typeName string, rng *rand.Ra
 		ReinforcementChance: DefaultZombieReinforcementChance,
 	}
 	switch norm {
-	case MobTypeSkeleton, MobTypeStray:
+	case MobTypeSkeleton, MobTypeStray, MobTypeBogged, MobTypeParched:
 		st.MainHand = world.NewNamedItemStack("minecraft:bow", 1)
 	case MobTypeWitherSkeleton:
 		st.MainHand = world.NewNamedItemStack(ItemStoneSword, 1)
