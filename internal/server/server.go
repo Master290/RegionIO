@@ -3693,6 +3693,13 @@ func (s *Server) TickDimensionBlockUpdates(dim string) world.BlockUpdateResult {
 	if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 	}
+	if len(res.Drops) > 0 && s.DoTileDrops() {
+		for _, d := range res.Drops {
+			if !d.Stack.IsEmpty() {
+				s.SpawnItemEntityInDimension(normDim, float64(d.Pos.X)+0.5, float64(d.Pos.Y)+0.5, float64(d.Pos.Z)+0.5, d.Stack)
+			}
+		}
+	}
 	s.ProcessFallingBlockLandings(normDim, res.Landings, nil)
 	return res
 }

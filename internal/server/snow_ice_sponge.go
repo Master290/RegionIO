@@ -35,8 +35,12 @@ func (s *Server) PlaceWetSpongeAt(dim string, x, y, z int) (finalState uint16, d
 	if applied, upd := cache.ApplyBlockWithUpdates(x, y, z, wetSponge); applied {
 		s.broadcastDimensionBlockChanges(targetDim, cache, upd.Changes, upd.LightChanged)
 	}
-	if dried, upd := cache.DryWetSpongeInNetherAt(targetDim, x, y, z); dried {
+	alreadyDried := world.IsSpongeBlock(cache.GetBlock(x, y, z))
+	dried, upd := cache.DryWetSpongeInNetherAt(targetDim, x, y, z)
+	if dried {
 		s.broadcastDimensionBlockChanges(targetDim, cache, upd.Changes, upd.LightChanged)
+	}
+	if alreadyDried || dried {
 		cx, cz := int32(x>>4), int32(z>>4)
 		s.BroadcastDimensionChunk(targetDim, cx, cz, PlayLevelEventCB,
 			EncodeLevelEventPacket(LevelEventLavaExtinguish, x, y, z, 0, false))

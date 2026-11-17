@@ -439,6 +439,16 @@ func chunkToNBT(c *Chunk) *nbt.Compound {
 	// Required-but-empty fields so vanilla loads the chunk without complaints.
 	root.Set("block_entities", structureBlockEntitiesToNBT(c))
 	root.Set("structures", structuresToNBT(c))
+	var blockTickEntries, fluidTickEntries []ScheduledBlockTickEntry
+	for _, e := range c.persistedTicks {
+		if e.Kind == UpdateFluid {
+			fluidTickEntries = append(fluidTickEntries, e)
+		} else {
+			blockTickEntries = append(blockTickEntries, e)
+		}
+	}
+	root.Set("block_ticks", EncodeScheduledBlockTicksNBT(blockTickEntries))
+	root.Set("fluid_ticks", EncodeScheduledBlockTicksNBT(fluidTickEntries))
 
 	return root
 }
@@ -670,6 +680,16 @@ func nbtToChunkVersioned(root *nbt.Compound, regionX, regionZ, localX, localZ in
 	}
 	structureBlockEntitiesFromNBT(c, root)
 	structuresFromNBT(c, root)
+	if btTag, ok := root.Get("block_ticks"); ok {
+		if list, ok := btTag.(nbt.List); ok {
+			c.persistedTicks = append(c.persistedTicks, DecodeScheduledBlockTicksNBT(list, false)...)
+		}
+	}
+	if ftTag, ok := root.Get("fluid_ticks"); ok {
+		if list, ok := ftTag.(nbt.List); ok {
+			c.persistedTicks = append(c.persistedTicks, DecodeScheduledBlockTicksNBT(list, true)...)
+		}
+	}
 	return c, nil
 }
 

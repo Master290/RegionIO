@@ -106,6 +106,7 @@ type Chunk struct {
 	structureStarts    []StructureStartRecord
 	intersectingStarts []StructureStartRecord
 	structureRefs      map[string][][2]int32
+	persistedTicks     []ScheduledBlockTickEntry
 }
 
 func (c *Chunk) minY() int {
@@ -366,6 +367,10 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 	}
 	if len(c.intersectingStarts) > 0 {
 		clone.intersectingStarts = cloneStructureStarts(c.intersectingStarts)
+	}
+	if len(c.persistedTicks) > 0 {
+		clone.persistedTicks = make([]ScheduledBlockTickEntry, len(c.persistedTicks))
+		copy(clone.persistedTicks, c.persistedTicks)
 	}
 	if len(c.structureRefs) > 0 {
 		clone.structureRefs = make(map[string][][2]int32, len(c.structureRefs))

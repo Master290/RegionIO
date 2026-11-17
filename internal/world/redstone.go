@@ -3489,11 +3489,7 @@ func (c *Cache) RecoverChunkActiveBlockTicks(cx, cz int32) int {
 					}
 				}
 				if needsTick && !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateFluid) {
-					delay := WaterTickDelay
-					if kind == fluidLava {
-						delay = LavaTickDelay
-					}
-					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFluid, delay)
+					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFluid, c.fluidTickDelayFor(kind))
 					recovered++
 				}
 			}

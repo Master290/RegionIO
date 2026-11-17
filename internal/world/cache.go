@@ -420,6 +420,9 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	delete(c.loads, key)
 	close(pending.done)
 	c.mu.Unlock()
+	if fromStore && loadErr == nil && ch != nil && len(ch.persistedTicks) > 0 {
+		c.ImportChunkScheduledBlockTicks(cx, cz, ch.persistedTicks)
+	}
 	return ch, loadErr
 }
 
@@ -457,15 +460,20 @@ func (c *Cache) chunkAtCanonicalErr(cx, cz int32) (*Chunk, error) {
 	if c.store != nil {
 		loaded, err := c.store.LoadChunk(cx, cz)
 		if err == nil {
+			inserted := false
 			c.mu.Lock()
 			if existing := c.chunks[key]; existing != nil {
 				loaded = existing
 			} else {
 				c.chunks[key] = loaded
 				c.touch(key)
+				inserted = true
 			}
 			c.evictIfNeeded()
 			c.mu.Unlock()
+			if inserted && loaded != nil && len(loaded.persistedTicks) > 0 {
+				c.ImportChunkScheduledBlockTicks(cx, cz, loaded.persistedTicks)
+			}
 			return loaded, nil
 		}
 		if !errors.Is(err, ErrChunkNotFound) {
@@ -1202,15 +1210,38 @@ func (c *Cache) StartAutosave(ctx context.Context, log *slog.Logger, interval ti
 
 // flushDirty saves every chunk currently marked dirty or newly generated and clears the sets.
 func (c *Cache) flushDirty() error {
+	var pendingTickChunks [][2]int32
+	if rawSched, hasSched := cacheSchedulers.Load(c); hasSched {
+		sched := rawSched.(*BlockUpdateScheduler)
+		sched.mu.Lock()
+		if len(sched.pending) > 0 {
+			seenTickChunk := make(map[[2]int32]bool)
+			for _, u := range sched.pending {
+				ck := [2]int32{int32(u.pos.X >> 4), int32(u.pos.Z >> 4)}
+				if !seenTickChunk[ck] {
+					seenTickChunk[ck] = true
+					pendingTickChunks = append(pendingTickChunks, ck)
+				}
+			}
+		}
+		sched.mu.Unlock()
+	}
+
 	c.mu.Lock()
-	keys := make([][2]int32, 0, len(c.dirty)+len(c.unsavedGen))
-	seen := make(map[[2]int32]bool, len(c.dirty)+len(c.unsavedGen))
+	keys := make([][2]int32, 0, len(c.dirty)+len(c.unsavedGen)+len(pendingTickChunks))
+	seen := make(map[[2]int32]bool, len(c.dirty)+len(c.unsavedGen)+len(pendingTickChunks))
 	for k := range c.dirty {
 		seen[k] = true
 		keys = append(keys, k)
 	}
 	for k := range c.unsavedGen {
 		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	for _, k := range pendingTickChunks {
+		if !seen[k] && c.chunks[k] != nil {
 			seen[k] = true
 			keys = append(keys, k)
 		}
@@ -1232,6 +1263,9 @@ func (c *Cache) flushDirty() error {
 			continue
 		}
 		snapshot, savedRevision := ch.snapshot()
+		if _, hasSched := cacheSchedulers.Load(c); hasSched {
+			snapshot.persistedTicks = c.ExportChunkScheduledBlockTicks(k[0], k[1])
+		}
 		if err := c.store.saveSnapshot(snapshot); err != nil {
 			if firstErr == nil {
 				firstErr = err

@@ -618,6 +618,7 @@ func hasEmptyCollisionShape(state uint16, name string, props map[string]string) 
 	}
 	switch name {
 	case "minecraft:air", "minecraft:cave_air", "minecraft:void_air",
+		"minecraft:powder_snow",
 		"minecraft:fire", "minecraft:soul_fire",
 		"minecraft:light", "minecraft:structure_void", "minecraft:moving_piston",
 		"minecraft:nether_portal", "minecraft:end_portal", "minecraft:end_gateway",

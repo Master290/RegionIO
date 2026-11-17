@@ -2,9 +2,11 @@ package world
 
 import (
 	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // FluidKind identifies a runtime fluid type in Vanilla 26.1.2.
@@ -28,6 +30,8 @@ type cacheFluidRules struct {
 	mu                    sync.RWMutex
 	waterSourceConversion bool
 	lavaSourceConversion  bool
+	rngMu                 sync.Mutex
+	rng                   *rand.Rand
 }
 
 var cacheFluidRuleMap sync.Map // map[*Cache]*cacheFluidRules
@@ -39,9 +43,33 @@ func (c *Cache) fluidRules() *cacheFluidRules {
 	created := &cacheFluidRules{
 		waterSourceConversion: true,  // Vanilla 26.1.2 default for waterSourceConversion
 		lavaSourceConversion:  false, // Vanilla 26.1.2 default for lavaSourceConversion
+		rng:                   rand.New(rand.NewSource(1)),
 	}
 	actual, _ := cacheFluidRuleMap.LoadOrStore(c, created)
 	return actual.(*cacheFluidRules)
+}
+
+// SetFluidRandomSeed resets the PRNG used by fluid ticks on c (e.g.
+// `LavaFluid.getSpreadDelay`'s 1-in-4 roll), allowing deterministic tick-by-tick tests.
+func (c *Cache) SetFluidRandomSeed(seed int64) {
+	if c == nil {
+		return
+	}
+	r := c.fluidRules()
+	r.rngMu.Lock()
+	r.rng = rand.New(rand.NewSource(seed))
+	r.rngMu.Unlock()
+}
+
+func (c *Cache) fluidRandIntn(n int) int {
+	if c == nil || n <= 1 {
+		return 0
+	}
+	r := c.fluidRules()
+	r.rngMu.Lock()
+	val := r.rng.Intn(n)
+	r.rngMu.Unlock()
+	return val
 }
 
 // WaterSourceConversion reports whether the `waterSourceConversion` gamerule is
@@ -136,6 +164,177 @@ func (c *Cache) fluidSlopeDistanceFor(kind fluidKind) int {
 		return 2
 	}
 	return 4
+}
+
+// fluidSpreadDelay implements Vanilla 26.1.2 `FlowingFluid.getSpreadDelay` /
+// `LavaFluid.getSpreadDelay`: when non-empty, non-falling flowing lava increases
+// its fluid height (`newLevel < oldLevel`) and `random.nextInt(4) != 0`, the
+// spread delay is quadrupled (`120` ticks in Overworld, `40` ticks in Nether).
+func (c *Cache) fluidSpreadDelay(kind fluidKind, oldLevel, newLevel int) int {
+	delay := c.fluidTickDelayFor(kind)
+	if kind == fluidLava && oldLevel > 0 && oldLevel < 8 && newLevel >= 0 && newLevel < 8 && newLevel < oldLevel {
+		if c.fluidRandIntn(4) != 0 {
+			delay *= 4
+		}
+	}
+	return delay
+}
+
+func isFullUnitCubeBoxes(boxes []AABB) bool {
+	if len(boxes) != 1 {
+		return false
+	}
+	b := boxes[0]
+	const eps = 1e-7
+	return b.MinX <= eps && b.MinY <= eps && b.MinZ <= eps &&
+		b.MaxX >= 1.0-eps && b.MaxY >= 1.0-eps && b.MaxZ >= 1.0-eps
+}
+
+func addBoundaryFaceBits(mask *[4]uint64, boxes []AABB, dx, dy, dz int) {
+	const eps = 1e-7
+	for _, b := range boxes {
+		var uMin, uMax, vMin, vMax float64
+		switch {
+		case dx < 0: // -X face (MinX == 0), plane (Y, Z)
+			if b.MinX > eps {
+				continue
+			}
+			uMin, uMax, vMin, vMax = b.MinY, b.MaxY, b.MinZ, b.MaxZ
+		case dx > 0: // +X face (MaxX == 1), plane (Y, Z)
+			if b.MaxX < 1.0-eps {
+				continue
+			}
+			uMin, uMax, vMin, vMax = b.MinY, b.MaxY, b.MinZ, b.MaxZ
+		case dy < 0: // -Y face (MinY == 0), plane (X, Z)
+			if b.MinY > eps {
+				continue
+			}
+			uMin, uMax, vMin, vMax = b.MinX, b.MaxX, b.MinZ, b.MaxZ
+		case dy > 0: // +Y face (MaxY == 1), plane (X, Z)
+			if b.MaxY < 1.0-eps {
+				continue
+			}
+			uMin, uMax, vMin, vMax = b.MinX, b.MaxX, b.MinZ, b.MaxZ
+		case dz < 0: // -Z face (MinZ == 0), plane (X, Y)
+			if b.MinZ > eps {
+				continue
+			}
+			uMin, uMax, vMin, vMax = b.MinX, b.MaxX, b.MinY, b.MaxY
+		case dz > 0: // +Z face (MaxZ == 1), plane (X, Y)
+			if b.MaxZ < 1.0-eps {
+				continue
+			}
+			uMin, uMax, vMin, vMax = b.MinX, b.MaxX, b.MinY, b.MaxY
+		default:
+			continue
+		}
+		for vi := 0; vi < 16; vi++ {
+			vc := (float64(vi) + 0.5) / 16.0
+			if vc < vMin-eps || vc > vMax+eps {
+				continue
+			}
+			for ui := 0; ui < 16; ui++ {
+				uc := (float64(ui) + 0.5) / 16.0
+				if uc >= uMin-eps && uc <= uMax+eps {
+					bit := vi*16 + ui
+					mask[bit>>6] |= uint64(1) << uint(bit&63)
+				}
+			}
+		}
+	}
+}
+
+type fluidStateShape struct {
+	fullCube bool
+	empty    bool
+	faceMask [6][4]uint64 // 0:-X, 1:+X, 2:-Y, 3:+Y, 4:-Z, 5:+Z
+}
+
+var (
+	fluidShapeEmpty    = &fluidStateShape{empty: true}
+	fluidShapeFullCube = &fluidStateShape{fullCube: true}
+	fluidStateShapes   [totalBlockStates]atomic.Pointer[fluidStateShape]
+)
+
+func getFluidStateShape(state uint16) *fluidStateShape {
+	if isAirState(state) {
+		return fluidShapeEmpty
+	}
+	if int(state) < totalBlockStates {
+		if cached := fluidStateShapes[state].Load(); cached != nil {
+			return cached
+		}
+	}
+	boxes := BlockCollisionBoxes(state)
+	var computed *fluidStateShape
+	switch {
+	case len(boxes) == 0:
+		computed = fluidShapeEmpty
+	case isFullUnitCubeBoxes(boxes):
+		computed = fluidShapeFullCube
+	default:
+		s := &fluidStateShape{}
+		addBoundaryFaceBits(&s.faceMask[0], boxes, -1, 0, 0)
+		addBoundaryFaceBits(&s.faceMask[1], boxes, 1, 0, 0)
+		addBoundaryFaceBits(&s.faceMask[2], boxes, 0, -1, 0)
+		addBoundaryFaceBits(&s.faceMask[3], boxes, 0, 1, 0)
+		addBoundaryFaceBits(&s.faceMask[4], boxes, 0, 0, -1)
+		addBoundaryFaceBits(&s.faceMask[5], boxes, 0, 0, 1)
+		computed = s
+	}
+	if int(state) < totalBlockStates {
+		fluidStateShapes[state].Store(computed)
+	}
+	return computed
+}
+
+func fluidDirIndices(dx, dy, dz int) (fromIdx, toIdx int) {
+	switch {
+	case dx < 0 && dy == 0 && dz == 0:
+		return 0, 1
+	case dx > 0 && dy == 0 && dz == 0:
+		return 1, 0
+	case dx == 0 && dy < 0 && dz == 0:
+		return 2, 3
+	case dx == 0 && dy > 0 && dz == 0:
+		return 3, 2
+	case dx == 0 && dy == 0 && dz < 0:
+		return 4, 5
+	case dx == 0 && dy == 0 && dz > 0:
+		return 5, 4
+	default:
+		return -1, -1
+	}
+}
+
+// canFluidPassThroughWall mirrors Vanilla 26.1.2 `FlowingFluid.canPassThroughWall`:
+// checks whether the collision shapes of `fromState` (on its `(dx,dy,dz)` face)
+// and `toState` (on its opposite `(-dx,-dy,-dz)` face) leave any unoccluded gap
+// (`!Shapes.mergedFaceOccludes(fromShape, toShape, dir)`).
+func canFluidPassThroughWall(dx, dy, dz int, fromState, toState uint16) bool {
+	if isAirState(fromState) && isAirState(toState) {
+		return true
+	}
+	toShape := getFluidStateShape(toState)
+	if toShape.fullCube {
+		return false
+	}
+	fromShape := getFluidStateShape(fromState)
+	if fromShape.fullCube {
+		return false
+	}
+	if fromShape.empty && toShape.empty {
+		return true
+	}
+	fi, ti := fluidDirIndices(dx, dy, dz)
+	if fi < 0 {
+		return true
+	}
+	const allOnes = ^uint64(0)
+	return (fromShape.faceMask[fi][0]|toShape.faceMask[ti][0]) != allOnes ||
+		(fromShape.faceMask[fi][1]|toShape.faceMask[ti][1]) != allOnes ||
+		(fromShape.faceMask[fi][2]|toShape.faceMask[ti][2]) != allOnes ||
+		(fromShape.faceMask[fi][3]|toShape.faceMask[ti][3]) != allOnes
 }
 
 // WaterBlockState returns the block state ID for `minecraft:water[level=L]` (0..15).
@@ -512,6 +711,7 @@ func (c *Cache) UpdateBubbleColumnFrom(x, startY, z int, res *BlockUpdateResult)
 		want := desiredBubbleColumnStateForBelow(c.GetBlock(x, y-1, z))
 		if cur != want {
 			if c.setBlockRecorded(x, y, z, want, res) {
+				c.scheduleAround(x, y, z)
 				changedAny = true
 			}
 		}

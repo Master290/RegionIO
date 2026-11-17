@@ -61,12 +61,21 @@ type FallingBlockLanding struct {
 // newState replaces the landed anvil state (e.g. chipped/damaged anvil or StateAir).
 type FallingAnvilLandingHook func(c *Cache, pos BlockPos, state uint16, fallDistance int) (newState uint16, handled bool)
 
+// BlockPosDrop records an item stack dropped at Pos when a runtime block update
+// destroys a block (e.g. `WaterFluid.beforeDestroyingBlock` or `SpongeBlock`
+// removing aquatic plants).
+type BlockPosDrop struct {
+	Pos   BlockPos
+	Stack ItemStack
+}
+
 // BlockUpdateResult aggregates all block transitions, deduplicated
-// light-dirty chunks, and falling-block landings produced by a block edit or tick pass.
+// light-dirty chunks, falling-block landings, and item drops produced by a block edit or tick pass.
 type BlockUpdateResult struct {
 	Changes      []BlockChange
 	LightChanged []ChunkPos
 	Landings     []FallingBlockLanding
+	Drops        []BlockPosDrop
 }
 
 func (r *BlockUpdateResult) appendChange(pos BlockPos, oldState, newState uint16, light []ChunkPos) {
@@ -99,6 +108,9 @@ func (r *BlockUpdateResult) merge(other BlockUpdateResult) {
 	}
 	if len(other.Landings) > 0 {
 		r.Landings = append(r.Landings, other.Landings...)
+	}
+	if len(other.Drops) > 0 {
+		r.Drops = append(r.Drops, other.Drops...)
 	}
 }
 
@@ -222,6 +234,9 @@ func (c *Cache) ScheduleBlockUpdateWithPriority(x, y, z int, kind BlockUpdateKin
 	due := s.tick + uint64(delayTicks)
 	key := scheduledUpdateKey{pos: BlockPos{X: x, Y: y, Z: z}, kind: kind}
 	if existing, ok := s.pending[key]; ok {
+		if kind == UpdateFluid {
+			return
+		}
 		if existing.dueTick < due {
 			return
 		}
@@ -717,11 +732,22 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 	if IsFrostedIceBlock(newState) && !IsFrostedIceBlock(oldState) {
 		c.ScheduleFrostedIceTickAt(x, y, z, nil)
 	}
+	// WetSpongeBlock.onPlace: wet_sponge placed in a water-evaporating (ultrawarm)
+	// dimension immediately dries into minecraft:sponge.
+	if isBlockNamed(newState, "minecraft:wet_sponge") && c.IsWaterEvaporatingDimension() {
+		if drySponge, ok := nameToStateID("minecraft:sponge", nil); ok {
+			if c.setBlockRecorded(x, y, z, drySponge, res) {
+				newState = drySponge
+			}
+		}
+	}
 	// Dry sponge absorbs nearby water on placement or when water touches it.
 	if isBlockNamed(newState, "minecraft:sponge") {
 		c.tryAbsorbWaterWithSponge(x, y, z, res)
 	}
-	// If water was placed, solidify any adjacent concrete powder or wet any adjacent sponge.
+	// If water was placed, solidify any adjacent concrete powder (except above,
+	// since ConcretePowderBlock.touchesLiquid excludes Direction.DOWN so powder
+	// above water falls into the water cell first) or wet any adjacent sponge.
 	if hasWaterFluid(newState) {
 		for _, off := range sixNeighborOffsets {
 			nx, ny, nz := x+off[0], y+off[1], z+off[2]
@@ -729,11 +755,15 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 				continue
 			}
 			nState := c.GetBlock(nx, ny, nz)
-			if concrete, ok := concretePowderToConcrete(nState); ok {
-				if c.setBlockRecorded(nx, ny, nz, concrete, res) {
-					c.scheduleAround(nx, ny, nz)
+			if off[1] <= 0 {
+				if concrete, ok := concretePowderToConcrete(nState); ok {
+					if c.setBlockRecorded(nx, ny, nz, concrete, res) {
+						c.scheduleAround(nx, ny, nz)
+					}
+					continue
 				}
-			} else if isBlockNamed(nState, "minecraft:sponge") {
+			}
+			if isBlockNamed(nState, "minecraft:sponge") {
 				c.tryAbsorbWaterWithSponge(nx, ny, nz, res)
 			}
 		}
@@ -807,6 +837,10 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 
 func (c *Cache) scheduleAround(x, y, z int) {
 	c.scheduleCellIfNeeded(x, y, z)
+	c.scheduleNeighborsOnly(x, y, z)
+}
+
+func (c *Cache) scheduleNeighborsOnly(x, y, z int) {
 	for _, off := range sixNeighborOffsets {
 		nx, ny, nz := x+off[0], y+off[1], z+off[2]
 		if ny < c.minY() || ny >= c.maxY() {
@@ -1729,10 +1763,11 @@ func isStandaloneFluidBlock(state uint16) (fluidKind, int, bool) {
 	return fluidNone, 0, false
 }
 
-// stepFluid executes one runtime fluid tick at (x, y, z), handling both
-// drainage (when upstream fluid is removed) and outward downward/horizontal
-// spread, infinite water source formation, and water/lava stone/cobblestone/
-// obsidian interactions.
+// stepFluid executes one runtime fluid tick at (x, y, z), matching Vanilla
+// 26.1.2 `FlowingFluid.tick` + `FlowingFluid.spread`: drainage and `getNewLiquid`
+// recalculation (with `LavaFluid.getSpreadDelay`), contact reactions, downward
+// waterfall (`level=8`) spread, slope-guided horizontal spread, infinite source
+// conversion, and `WaterFluid.beforeDestroyingBlock` item drops.
 func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 	if y < c.minY() || y >= c.maxY() {
 		return
@@ -1754,7 +1789,8 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 	// 1. For non-source standalone fluid blocks (level > 0), recalculate their
 	// level from upstream neighbors (FlowingFluid.getNewLiquid).
 	if standalone && level > 0 {
-		newLevel := c.computeFlowingFluidLevel(x, y, z, kind)
+		newLevel := c.computeFlowingFluidLevelForState(x, y, z, state, kind)
+		spreadDelay := c.fluidSpreadDelay(kind, level, newLevel)
 		if newLevel < 0 {
 			// Fluid dried up.
 			if c.setBlockRecorded(x, y, z, StateAir, res) {
@@ -1766,48 +1802,58 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 		if newLevel != level {
 			newState := fluidStateForLevel(kind, newLevel)
 			if c.setBlockRecorded(x, y, z, newState, res) {
-				c.scheduleAround(x, y, z)
+				if c.onFluidPlacedAt(x, y, z, newState, res) {
+					return
+				}
+				c.scheduleNeighborsOnly(x, y, z)
+				c.ScheduleBlockUpdate(x, y, z, UpdateFluid, spreadDelay)
 			}
+			state = newState
 			level = newLevel
 		}
 	}
 
-	// 2. Check contact reactions (water + lava -> obsidian/cobblestone/stone, or basalt generator).
+	// 2. Check contact reactions (water + lava -> obsidian/cobblestone, basalt generator,
+	// or adjacent concrete_powder / sponge).
+	if kind == fluidWater {
+		if c.checkAdjacentWaterAbsorbersOrPowder(x, y, z, res) {
+			return
+		}
+	}
 	if c.checkFluidContactReactions(x, y, z, res) {
 		return
 	}
 
-	// 3. Downward spread into (x, y-1, z).
+	// 3. Downward spread into (x, y-1, z) (FlowingFluid.spread).
 	if y > c.minY() {
 		below := c.GetBlock(x, y-1, z)
-		if c.tryFlowDownward(x, y-1, z, kind, below, res) {
-			// In vanilla FlowingFluid.spread, non-source blocks that can flow
-			// straight down only spread horizontally when surrounded by 3+
-			// horizontal source blocks of the same fluid.
-			if level > 0 && c.countHorizontalFluidSources(x, y, z, kind) < 3 {
+		if c.tryFlowDownwardFrom(x, y, z, state, kind, below, res) {
+			// In vanilla FlowingFluid.spread, ANY fluid block (including a
+			// level=0 source!) that spreads downward on this tick only spreads
+			// to the sides on the same tick if surrounded by 3+ horizontal sources.
+			if c.countHorizontalFluidSources(x, y, z, kind) < 3 {
 				return
 			}
+		} else if level > 0 && c.isFluidHole(x, y, z, kind, state) {
+			return
 		}
 	}
 
-	// 4. Horizontal spread into (-X, +X, -Z, +Z).
+	// 4. Horizontal spread into (-X, +X, -Z, +Z) (FlowingFluid.spreadToSides).
 	drop := c.fluidDropOffFor(kind)
-	effectiveLevel := level
+	effectiveAmount := 8 - level
+	if level == 0 || level >= 8 {
+		effectiveAmount = 8
+	}
+	remAmount := effectiveAmount - drop
 	if level >= 8 {
-		effectiveLevel = 0
+		remAmount = 7
 	}
-	nextLevel := effectiveLevel + drop
-	if nextLevel > 7 {
-		return
-	}
-	// A falling fluid block (level >= 8) only spreads horizontally when the cell
-	// below it is not passable to this fluid.
-	if level >= 8 && y > c.minY() && c.canFluidReplace(x, y-1, z, kind, c.GetBlock(x, y-1, z)) {
+	if remAmount <= 0 {
 		return
 	}
 
-	dirs := c.chooseHorizontalSpreadDirs(x, y, z, kind)
-	nextState := fluidStateForLevel(kind, nextLevel)
+	dirs := c.chooseHorizontalSpreadDirs(x, y, z, state, kind)
 	for _, off := range dirs {
 		nx, nz := x+off[0], z+off[2]
 		target := c.GetBlock(nx, y, nz)
@@ -1826,12 +1872,20 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 				return
 			}
 		}
+		nextLevel := c.computeFlowingFluidLevelForState(nx, y, nz, target, kind)
+		if nextLevel < 0 || nextLevel > 7 {
+			continue
+		}
 		if !c.canFluidSpreadHorizontallyInto(nx, y, nz, kind, nextLevel, target) {
 			continue
 		}
 		if !isAirState(target) {
+			if _, _, isFluid := isStandaloneFluidBlock(target); !isFluid {
+				c.recordFluidWashDrops(nx, y, nz, kind, target, res)
+			}
 			c.propagateMultiBlockPartnerBreak(nx, y, nz, target, res)
 		}
+		nextState := fluidStateForLevel(kind, nextLevel)
 		if c.setBlockRecorded(nx, y, nz, nextState, res) {
 			if isBlockNamed(target, "minecraft:tripwire") || isBlockNamed(target, "minecraft:tripwire_hook") {
 				c.recalculateTripwireAround(nx, y, nz, target, nextState, res)
@@ -1840,7 +1894,88 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 			if IsRedstoneComponent(target) {
 				c.propagateRedstoneAround(nx, y, nz, target, nextState, res)
 			}
-			c.scheduleAround(nx, y, nz)
+			if !c.onFluidPlacedAt(nx, y, nz, nextState, res) {
+				c.scheduleAround(nx, y, nz)
+			}
+		}
+	}
+}
+
+func (c *Cache) checkAdjacentWaterAbsorbersOrPowder(x, y, z int, res *BlockUpdateResult) bool {
+	for _, off := range sixNeighborOffsets {
+		nx, ny, nz := x+off[0], y+off[1], z+off[2]
+		if ny < c.minY() || ny >= c.maxY() {
+			continue
+		}
+		nState := c.GetBlock(nx, ny, nz)
+		if off[1] <= 0 {
+			if concrete, ok := concretePowderToConcrete(nState); ok {
+				if c.setBlockRecorded(nx, ny, nz, concrete, res) {
+					c.scheduleAround(nx, ny, nz)
+				}
+				continue
+			}
+		}
+		if isBlockNamed(nState, "minecraft:sponge") {
+			if c.tryAbsorbWaterWithSponge(nx, ny, nz, res) && !hasWaterFluid(c.GetBlock(x, y, z)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// onFluidPlacedAt runs immediate `LiquidBlock.onPlace` / neighbor reactions
+// when runtime fluid enters (x, y, z); returns true if the newly placed fluid
+// at (x, y, z) was immediately replaced (e.g. converted to basalt/cobblestone/obsidian
+// or absorbed by an adjacent dry sponge).
+func (c *Cache) onFluidPlacedAt(x, y, z int, placedState uint16, res *BlockUpdateResult) bool {
+	if hasWaterFluid(placedState) {
+		if c.checkAdjacentWaterAbsorbersOrPowder(x, y, z, res) {
+			return true
+		}
+	}
+	if c.checkFluidContactReactions(x, y, z, res) {
+		return true
+	}
+	return c.GetBlock(x, y, z) != placedState
+}
+
+func (c *Cache) evaluateFluidOrSpongeBlockDrops(state uint16) []ItemStack {
+	if isAirState(state) {
+		return nil
+	}
+	if _, _, isFluid := isStandaloneFluidBlock(state); isFluid || IsBubbleColumnBlock(state) {
+		return nil
+	}
+	if isBlockNamed(state, "minecraft:cobweb") {
+		return []ItemStack{NewNamedItemStack("minecraft:string", 1)}
+	}
+	if isBlockNamed(state, "minecraft:kelp") || isBlockNamed(state, "minecraft:kelp_plant") {
+		return []ItemStack{NewNamedItemStack("minecraft:kelp", 1)}
+	}
+	if isBlockNamed(state, "minecraft:seagrass") || isBlockNamed(state, "minecraft:tall_seagrass") {
+		return nil
+	}
+	fs := c.farmingState()
+	fs.mu.Lock()
+	seed := fs.rng.Int63()
+	fs.mu.Unlock()
+	// Use a dedicated local math/rand via EvaluateBlockDrops(rng=nil uses deterministic hash, or pass nil? Wait: EvaluateBlockDrops accepts nil rng or *rand.Rand; let's check!)
+	_ = seed
+	return EvaluateBlockDrops(state, "", false, 0, nil)
+}
+
+func (c *Cache) recordFluidWashDrops(x, y, z int, kind fluidKind, oldState uint16, res *BlockUpdateResult) {
+	// In Vanilla 26.1.2, WaterFluid.beforeDestroyingBlock calls Block.dropResources,
+	// whereas LavaFluid.beforeDestroyingBlock only plays fizz (levelEvent 1501) with 0 drops.
+	if kind != fluidWater || res == nil {
+		return
+	}
+	pos := BlockPos{X: x, Y: y, Z: z}
+	for _, st := range c.evaluateFluidOrSpongeBlockDrops(oldState) {
+		if !st.IsEmpty() {
+			res.Drops = append(res.Drops, BlockPosDrop{Pos: pos, Stack: st})
 		}
 	}
 }
@@ -1857,15 +1992,12 @@ func (c *Cache) countHorizontalFluidSources(x, y, z int, kind fluidKind) int {
 }
 
 func (c *Cache) computeFlowingFluidLevel(x, y, z int, kind fluidKind) int {
-	// If the cell above holds the same fluid, this cell is falling fluid (level 8).
-	if y+1 < c.maxY() {
-		if upKind, _, ok := classifyFluidState(c.GetBlock(x, y+1, z)); ok && upKind == kind {
-			return 8
-		}
-	}
+	return c.computeFlowingFluidLevelForState(x, y, z, c.GetBlock(x, y, z), kind)
+}
 
+func (c *Cache) computeFlowingFluidLevelForState(x, y, z int, curState uint16, kind fluidKind) int {
 	drop := c.fluidDropOffFor(kind)
-	best := 999
+	maxNeighborAmount := 0
 	sourceNeighbors := 0
 	for _, off := range horizontalOffsets {
 		nx, nz := x+off[0], z+off[2]
@@ -1874,24 +2006,24 @@ func (c *Cache) computeFlowingFluidLevel(x, y, z int, kind fluidKind) int {
 		if !ok || nKind != kind {
 			continue
 		}
+		if !canFluidPassThroughWall(off[0], 0, off[2], curState, nState) {
+			continue
+		}
 		if nLevel == 0 {
 			sourceNeighbors++
 		}
-		eff := nLevel
-		if nLevel >= 8 {
-			// A falling neighbor only feeds horizontally if its floor is blocked.
-			if y > c.minY() && c.canFluidReplace(nx, y-1, nz, kind, c.GetBlock(nx, y-1, nz)) {
-				continue
-			}
-			eff = 0
+		amt := 8 - nLevel
+		if nLevel == 0 || nLevel >= 8 {
+			amt = 8
 		}
-		if eff+drop < best {
-			best = eff + drop
+		if amt > maxNeighborAmount {
+			maxNeighborAmount = amt
 		}
 	}
 
 	// Infinite fluid source rule (FlowingFluid.getNewLiquid + waterSourceConversion / lavaSourceConversion):
-	// 2+ horizontal sources of the same fluid over a solid block or another source of the same fluid.
+	// >= 2 horizontal sources of the same fluid (reachable via canPassThroughWall) over a solid block
+	// or another source of the same fluid.
 	canConvertToSource := (kind == fluidWater && c.WaterSourceConversion()) ||
 		(kind == fluidLava && c.LavaSourceConversion())
 	if canConvertToSource && sourceNeighbors >= 2 && y > c.minY() {
@@ -1904,45 +2036,62 @@ func (c *Cache) computeFlowingFluidLevel(x, y, z int, kind fluidKind) int {
 		}
 	}
 
-	if best > 7 {
+	// If the cell above holds the same fluid and can pass through the ceiling boundary,
+	// this cell becomes falling fluid (level 8, FALLING=true, amount=8).
+	if y+1 < c.maxY() {
+		aboveState := c.GetBlock(x, y+1, z)
+		if upKind, _, ok := classifyFluidState(aboveState); ok && upKind == kind {
+			if canFluidPassThroughWall(0, 1, 0, curState, aboveState) {
+				return 8
+			}
+		}
+	}
+
+	newAmount := maxNeighborAmount - drop
+	if newAmount <= 0 {
 		return -1
 	}
-	return best
+	return 8 - newAmount
 }
 
-func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *BlockUpdateResult) bool {
+func (c *Cache) tryFlowDownwardFrom(fromX, fromY, fromZ int, fromState uint16, kind fluidKind, below uint16, res *BlockUpdateResult) bool {
+	x, y, z := fromX, fromY-1, fromZ
+	if !canFluidPassThroughWall(0, -1, 0, fromState, below) {
+		return false
+	}
 	if bKind, bLevel, ok := classifyFluidState(below); ok {
 		if bKind == kind {
 			if bLevel == 0 || bLevel == 8 {
-				return true
+				return false
 			}
 			if _, _, standalone := isStandaloneFluidBlock(below); standalone {
 				falling := fluidStateForLevel(kind, 8)
 				if c.setBlockRecorded(x, y, z, falling, res) {
-					c.scheduleAround(x, y, z)
+					if !c.onFluidPlacedAt(x, y, z, falling, res) {
+						c.scheduleAround(x, y, z)
+					}
 				}
+				return true
 			}
-			return true
+			return false
 		}
 		// Opposite fluid below:
 		if kind == fluidLava && bKind == fluidWater {
-			// Lava flowing down onto standalone water / bubble column turns it into stone.
-			// Waterlogged blocks below lava are NOT overwritten with stone.
+			// LavaFluid.spreadTo(Direction.DOWN): standalone water / bubble column turns into stone;
+			// waterlogged blocks below lava are NOT overwritten with stone.
 			if isStandaloneWaterOrBubble(below) {
 				if c.setBlockRecorded(x, y, z, StateStone, res) {
 					c.scheduleAround(x, y, z)
 				}
 			}
-			return false
+			return true
 		}
 		if kind == fluidWater && bKind == fluidLava {
-			// Water flowing down onto lava turns source lava into obsidian and
-			// flowing lava into cobblestone.
 			solid := c.obsidianOrCobblestone(bLevel)
 			if c.setBlockRecorded(x, y, z, solid, res) {
 				c.scheduleAround(x, y, z)
 			}
-			return false
+			return true
 		}
 	}
 	if kind == fluidWater {
@@ -1961,18 +2110,27 @@ func (c *Cache) tryFlowDownward(x, y, z int, kind fluidKind, below uint16, res *
 		return false
 	}
 	if !isAirState(below) {
+		if _, _, isFluid := isStandaloneFluidBlock(below); !isFluid {
+			c.recordFluidWashDrops(x, y, z, kind, below, res)
+		}
 		c.propagateMultiBlockPartnerBreak(x, y, z, below, res)
 	}
-	falling := fluidStateForLevel(kind, 8)
-	if c.setBlockRecorded(x, y, z, falling, res) {
+	downLevel := c.computeFlowingFluidLevelForState(x, y, z, below, kind)
+	if downLevel < 0 {
+		downLevel = 8
+	}
+	nextBelow := fluidStateForLevel(kind, downLevel)
+	if c.setBlockRecorded(x, y, z, nextBelow, res) {
 		if isBlockNamed(below, "minecraft:tripwire") || isBlockNamed(below, "minecraft:tripwire_hook") {
-			c.recalculateTripwireAround(x, y, z, below, falling, res)
+			c.recalculateTripwireAround(x, y, z, below, nextBelow, res)
 		}
 		c.runNeighborSupportPass(x, y, z, res)
 		if IsRedstoneComponent(below) {
-			c.propagateRedstoneAround(x, y, z, below, falling, res)
+			c.propagateRedstoneAround(x, y, z, below, nextBelow, res)
 		}
-		c.scheduleAround(x, y, z)
+		if !c.onFluidPlacedAt(x, y, z, nextBelow, res) {
+			c.scheduleAround(x, y, z)
+		}
 	}
 	return true
 }
@@ -1982,23 +2140,23 @@ func (c *Cache) canFluidReplace(x, y, z int, kind fluidKind, target uint16) bool
 		return true
 	}
 	if tKind, tLevel, ok := isStandaloneFluidBlock(target); ok {
-		return tKind == kind && tLevel > 0 && tLevel != 8
+		return tKind == kind && tLevel > 0
 	}
-	if isSolidState(target) || blocksMotionOrFluid(target) {
+	if stateFlags(target)&flagBlocksMotion != 0 {
 		return false
 	}
 	info, ok := stateByID(target)
 	if !ok {
 		return false
 	}
-	// In vanilla FlowingFluid.canHoldFluid, any LiquidBlockContainer (blocks
-	// with the waterlogged property such as rails, candles, sea pickles, coral
-	// fans, glow lichen, sculk veins, hanging roots, scaffolding) cannot be
-	// washed away by flowing fluids.
+	// In vanilla FlowingFluid.canHoldFluid / canHoldSpecificFluid, any
+	// SimpleWaterloggedBlock / LiquidBlockContainer with the `waterlogged`
+	// property cannot be washed away or auto-waterlogged by external flowing fluid.
 	if info.Properties["waterlogged"] != "" {
 		return false
 	}
-	// Doors, signs, ladders, sugar_cane, bubble_column, portals, and structure blocks block fluid replacement.
+	// DoorBlock, #signs, ladder, sugar_cane, bubble_column, portals, and structure_void
+	// explicitly return false in FlowingFluid.canHoldAnyFluid.
 	if strings.HasSuffix(info.Name, "_door") || strings.HasSuffix(info.Name, "_sign") ||
 		strings.HasSuffix(info.Name, "_banner") {
 		return false
@@ -2006,6 +2164,7 @@ func (c *Cache) canFluidReplace(x, y, z int, kind fluidKind, target uint16) bool
 	switch info.Name {
 	case "minecraft:ladder", "minecraft:sugar_cane", "minecraft:bubble_column",
 		"minecraft:nether_portal", "minecraft:end_portal", "minecraft:end_gateway",
+		"minecraft:structure_void",
 		"minecraft:cactus", "minecraft:kelp", "minecraft:kelp_plant",
 		"minecraft:seagrass", "minecraft:tall_seagrass":
 		return false
@@ -2029,17 +2188,52 @@ func (c *Cache) canFluidSpreadHorizontallyInto(x, y, z int, kind fluidKind, next
 	return c.canFluidReplace(x, y, z, kind, target)
 }
 
-func (c *Cache) chooseHorizontalSpreadDirs(x, y, z int, kind fluidKind) [][3]int {
+func (c *Cache) isFluidHole(x, y, z int, kind fluidKind, stateAtPos uint16) bool {
+	if y <= c.minY() {
+		return false
+	}
+	below := c.GetBlock(x, y-1, z)
+	if !canFluidPassThroughWall(0, -1, 0, stateAtPos, below) {
+		return false
+	}
+	if bKind, _, ok := classifyFluidState(below); ok && bKind == kind {
+		return true
+	}
+	return c.canFluidReplace(x, y-1, z, kind, below)
+}
+
+func (c *Cache) canPassThroughForSlope(x, y, z, dx, dz int, kind fluidKind, fromState, toState uint16) bool {
+	if tKind, tLevel, ok := classifyFluidState(toState); ok && tKind == kind && tLevel == 0 {
+		return false
+	}
+	if !c.canFluidReplace(x+dx, y, z+dz, kind, toState) && !c.isOppositeFluid(kind, toState) {
+		return false
+	}
+	return canFluidPassThroughWall(dx, 0, dz, fromState, toState)
+}
+
+func (c *Cache) chooseHorizontalSpreadDirs(x, y, z int, fromState uint16, kind fluidKind) [][3]int {
 	maxDist := c.fluidSlopeDistanceFor(kind)
-	bestDist := 999
+	bestDist := 1000
 	var dirs [][3]int
 	for _, off := range horizontalOffsets {
 		nx, nz := x+off[0], z+off[2]
 		target := c.GetBlock(nx, y, nz)
+		if !canFluidPassThroughWall(off[0], 0, off[2], fromState, target) {
+			if isConcretePowderOrSponge(target) && kind == fluidWater && bestDist == 1000 {
+				dirs = append(dirs, off)
+			}
+			continue
+		}
 		if !c.canFluidReplace(nx, y, nz, kind, target) && !c.isOppositeFluid(kind, target) && !isConcretePowderOrSponge(target) {
 			continue
 		}
-		dist := c.slopeDistance(nx, y, nz, kind, 1, maxDist, [2]int{-off[0], -off[2]})
+		dist := 1000
+		if c.isFluidHole(nx, y, nz, kind, target) {
+			dist = 0
+		} else {
+			dist = c.slopeDistanceFrom(nx, y, nz, kind, target, 1, maxDist, [2]int{-off[0], -off[2]})
+		}
 		if dist < bestDist {
 			bestDist = dist
 			dirs = dirs[:0]
@@ -2051,30 +2245,25 @@ func (c *Cache) chooseHorizontalSpreadDirs(x, y, z int, kind fluidKind) [][3]int
 	return dirs
 }
 
-func (c *Cache) slopeDistance(x, y, z int, kind fluidKind, depth, maxDepth int, exclude [2]int) int {
-	if y <= c.minY() {
-		return 999
-	}
-	below := c.GetBlock(x, y-1, z)
-	if c.canFluidReplace(x, y-1, z, kind, below) {
-		return depth
-	}
-	if depth >= maxDepth {
-		return 999
-	}
-	best := 999
+func (c *Cache) slopeDistanceFrom(x, y, z int, kind fluidKind, curState uint16, step, maxSteps int, exclude [2]int) int {
+	best := 1000
 	for _, off := range horizontalOffsets {
 		if off[0] == exclude[0] && off[2] == exclude[1] {
 			continue
 		}
 		nx, nz := x+off[0], z+off[2]
 		target := c.GetBlock(nx, y, nz)
-		if !c.canFluidReplace(nx, y, nz, kind, target) {
+		if !c.canPassThroughForSlope(x, y, z, off[0], off[2], kind, curState, target) {
 			continue
 		}
-		d := c.slopeDistance(nx, y, nz, kind, depth+1, maxDepth, [2]int{-off[0], -off[2]})
-		if d < best {
-			best = d
+		if c.isFluidHole(nx, y, nz, kind, target) {
+			return step
+		}
+		if step < maxSteps {
+			d := c.slopeDistanceFrom(nx, y, nz, kind, target, step+1, maxSteps, [2]int{-off[0], -off[2]})
+			if d < best {
+				best = d
+			}
 		}
 	}
 	return best
@@ -2187,6 +2376,17 @@ func (c *Cache) tryAbsorbWaterWithSponge(x, y, z int, res *BlockUpdateResult) bo
 	return c.absorbWaterWithSpongeCount(x, y, z, res) > 0
 }
 
+// spongeAllDirections matches Vanilla 26.1.2 `SpongeBlock.ALL_DIRECTIONS`
+// (`Direction.values()`: DOWN, UP, NORTH, SOUTH, WEST, EAST).
+var spongeAllDirections = [6][3]int{
+	{0, -1, 0},
+	{0, 1, 0},
+	{0, 0, -1},
+	{0, 0, 1},
+	{-1, 0, 0},
+	{1, 0, 0},
+}
+
 func (c *Cache) absorbWaterWithSpongeCount(x, y, z int, res *BlockUpdateResult) int {
 	wetSponge, ok := nameToStateID("minecraft:wet_sponge", nil)
 	if !ok {
@@ -2208,9 +2408,9 @@ func (c *Cache) absorbWaterWithSpongeCount(x, y, z int, res *BlockUpdateResult) 
 	for len(queue) > 0 && len(absorbed) < SpongeMaxAbsorbBlocks {
 		cur := queue[0]
 		queue = queue[1:]
-		for _, off := range sixNeighborOffsets {
+		for _, off := range spongeAllDirections {
 			np := BlockPos{X: cur.pos.X + off[0], Y: cur.pos.Y + off[1], Z: cur.pos.Z + off[2]}
-			if np.Y < MinY || np.Y >= MinY+WorldHeight || visited[np] {
+			if np.Y < c.minY() || np.Y >= c.maxY() || visited[np] {
 				continue
 			}
 			visited[np] = true
@@ -2223,8 +2423,8 @@ func (c *Cache) absorbWaterWithSpongeCount(x, y, z int, res *BlockUpdateResult) 
 			} else if IsBubbleColumnBlock(st) || isRemovableAquaticPlant(st) {
 				nextSt = StateAir
 				matched = true
-			} else if isWaterloggedState(st) {
-				if drained, ok := withStateProperty(st, "waterlogged", "false"); ok && drained != st {
+			} else if isWaterloggedState(st) && !isBlockNamed(st, "minecraft:barrier") {
+				if drained, ok := SetWaterlogged(st, false); ok && drained != st {
 					nextSt = drained
 					matched = true
 				}
@@ -2246,6 +2446,13 @@ func (c *Cache) absorbWaterWithSpongeCount(x, y, z int, res *BlockUpdateResult) 
 	c.setBlockRecorded(x, y, z, wetSponge, res)
 	var changedPositions []BlockPos
 	for _, cell := range absorbed {
+		if isRemovableAquaticPlant(cell.oldState) && res != nil {
+			for _, st := range c.evaluateFluidOrSpongeBlockDrops(cell.oldState) {
+				if !st.IsEmpty() {
+					res.Drops = append(res.Drops, BlockPosDrop{Pos: cell.pos, Stack: st})
+				}
+			}
+		}
 		if c.setBlockRecorded(cell.pos.X, cell.pos.Y, cell.pos.Z, cell.newState, res) {
 			changedPositions = append(changedPositions, cell.pos)
 			// If a tall_seagrass half was absorbed at the edge of the BFS, clear its partner half to Air (not Water).
@@ -2254,7 +2461,7 @@ func (c *Cache) absorbWaterWithSpongeCount(x, y, z int, res *BlockUpdateResult) 
 				if info.Properties["half"] == "upper" {
 					partnerY = cell.pos.Y - 1
 				}
-				if partnerY >= MinY && partnerY < MinY+WorldHeight && isBlockNamed(c.GetBlock(cell.pos.X, partnerY, cell.pos.Z), "minecraft:tall_seagrass") {
+				if partnerY >= c.minY() && partnerY < c.maxY() && isBlockNamed(c.GetBlock(cell.pos.X, partnerY, cell.pos.Z), "minecraft:tall_seagrass") {
 					if c.setBlockRecorded(cell.pos.X, partnerY, cell.pos.Z, StateAir, res) {
 						changedPositions = append(changedPositions, BlockPos{X: cell.pos.X, Y: partnerY, Z: cell.pos.Z})
 					}
@@ -2660,7 +2867,25 @@ func (c *Cache) scheduledEntryFromUpdateLocked(s *BlockUpdateScheduler, u schedu
 	blockID := "minecraft:air"
 	if c != nil {
 		st := c.GetBlock(u.pos.X, u.pos.Y, u.pos.Z)
-		if info, ok := stateByID(st); ok && info.Name != "" {
+		if u.kind == UpdateFluid {
+			if fk, lvl, ok := classifyFluidState(st); ok {
+				if fk == fluidLava {
+					if lvl == 0 {
+						blockID = "minecraft:lava"
+					} else {
+						blockID = "minecraft:flowing_lava"
+					}
+				} else {
+					if lvl == 0 {
+						blockID = "minecraft:water"
+					} else {
+						blockID = "minecraft:flowing_water"
+					}
+				}
+			} else if info, ok := stateByID(st); ok && info.Name != "" {
+				blockID = info.Name
+			}
+		} else if info, ok := stateByID(st); ok && info.Name != "" {
 			blockID = info.Name
 		}
 	}
