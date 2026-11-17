@@ -442,14 +442,20 @@ func (s *Server) ShulkerBoxSlots(dim string, x, y, z int) [ChestSlotCount]world.
 		return [ChestSlotCount]world.ItemStack{}
 	}
 	normDim := normalizeDispenserDim(dim)
+	slots := s.ChestSlotsInDim(normDim, x, y, z)
+	for i := 0; i < ChestSlotCount; i++ {
+		if !slots[i].IsEmpty() {
+			return slots
+		}
+	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
 	arr := ds.shulkerBoxes[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
-	if arr == nil {
-		return [ChestSlotCount]world.ItemStack{}
+	ds.mu.Unlock()
+	if arr != nil {
+		return *arr
 	}
-	return *arr
+	return slots
 }
 
 // SetShulkerBoxSlots stores the 27-slot inventory for a placed shulker box
@@ -459,12 +465,23 @@ func (s *Server) SetShulkerBoxSlots(dim string, x, y, z int, slots [ChestSlotCou
 		return
 	}
 	normDim := normalizeDispenserDim(dim)
-	ds := s.dispenserState()
-	ds.mu.Lock()
-	cp := slots
-	ds.shulkerBoxes[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}] = &cp
-	ds.mu.Unlock()
-	s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
+	ss := s.storageState()
+	ss.mu.Lock()
+	be := s.getOrCreateStorageLocked(ss, normDim, x, y, z, "minecraft:shulker_box")
+	be.ID = "minecraft:shulker_box"
+	be.LootTable = ""
+	be.LootTableSeed = 0
+	be.Slots = slots
+	for i := 0; i < ChestSlotCount; i++ {
+		if slots[i].IsEmpty() || slots[i].Count <= 0 {
+			be.SlotMeta[i] = ItemMeta{}
+			be.SlotPotions[i] = ""
+			be.SlotShulker[i] = nil
+			be.SlotComponents[i] = nil
+		}
+	}
+	ss.mu.Unlock()
+	s.notifyStorageComparators(normDim, x, y, z)
 }
 
 // DispenserComparatorSignalAt returns the vanilla redstone comparator signal
@@ -509,8 +526,8 @@ func (s *Server) ContainerComparatorSignalAt(dim string, x, y, z int) int {
 	switch {
 	case IsChestBlock(state) || world.IsCopperChestBlock(state):
 		if px, py, pz, thisFirst, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
-			thisSlots := s.ChestSlots(x, y, z)
-			partnerSlots := s.ChestSlots(px, py, pz)
+			thisSlots := s.ChestSlotsInDim(normDim, x, y, z)
+			partnerSlots := s.ChestSlotsInDim(normDim, px, py, pz)
 			var combined [ChestSlotCount * 2]world.ItemStack
 			if thisFirst {
 				copy(combined[0:ChestSlotCount], thisSlots[:])
@@ -521,18 +538,16 @@ func (s *Server) ContainerComparatorSignalAt(dim string, x, y, z int) int {
 			}
 			return CalculateContainerComparatorSignal(combined[:])
 		}
-		slots := s.ChestSlots(x, y, z)
+		slots := s.ChestSlotsInDim(normDim, x, y, z)
 		return CalculateContainerComparatorSignal(slots[:])
 	case name == "minecraft:barrel":
-		slots := s.ChestSlots(x, y, z)
+		slots := s.ChestSlotsInDim(normDim, x, y, z)
 		return CalculateContainerComparatorSignal(slots[:])
 	case IsShulkerBoxItemOrBlock(name):
 		slots := s.ShulkerBoxSlots(normDim, x, y, z)
-		if sig := CalculateContainerComparatorSignal(slots[:]); sig > 0 {
-			return sig
-		}
-		cSlots := s.ChestSlots(x, y, z)
-		return CalculateContainerComparatorSignal(cSlots[:])
+		return CalculateContainerComparatorSignal(slots[:])
+	case name == "minecraft:beehive", name == "minecraft:bee_nest":
+		return BeehiveHoneyLevelState(state)
 	case IsFurnaceBlock(state):
 		slots := s.FurnaceSlots(x, y, z)
 		return CalculateContainerComparatorSignal(slots[:])

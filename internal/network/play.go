@@ -2469,6 +2469,11 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				placed := false
 				if server.IsBedBlock(state) && h.srv != nil {
 					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)
+				} else if server.IsChestBlock(state) && h.srv != nil && h.session != nil {
+					if finalSt, ok := h.srv.PlaceChestAt(h.session, px, py, pz, state); ok {
+						state = finalSt
+						placed = true
+					}
 				} else if server.IsDecoratedPotBlock(state) && h.srv != nil {
 					sherds := h.srv.LastCraftedDecoratedPotSherds()
 					if h.session != nil {
@@ -2553,6 +2558,18 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
 							h.srv.SetHopperCustomName(dim, px, py, pz, customName)
 						}
+					}
+					if server.IsBarrelBlock(state) && h.srv != nil && h.session != nil {
+						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
+							h.srv.SetStorageCustomName(dim, px, py, pz, customName)
+						}
+					}
+					if server.IsShulkerBoxItemOrBlock(blockName) && h.srv != nil {
+						invSlot := -1
+						if h.session != nil {
+							invSlot = h.session.HeldInventorySlot()
+						}
+						h.srv.OnShulkerBoxPlacedFromSlot(h.session, invSlot, dim, px, py, pz)
 					}
 					if blockName == "minecraft:sniffer_egg" && h.srv != nil {
 						h.srv.PlaceSnifferEgg(dim, px, py, pz)

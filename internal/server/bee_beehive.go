@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -160,28 +161,37 @@ type BeeState struct {
 
 // BeehiveOccupant represents a single bee stored inside a `minecraft:beehive` or `minecraft:bee_nest`.
 type BeehiveOccupant struct {
-	TypeName           string  `json:"id"`
-	TicksInHive        int     `json:"ticks_in_hive"`
-	MinOccupationTicks int     `json:"min_occupation_ticks"`
-	HasNectar          bool    `json:"has_nectar"`
-	Health             float32 `json:"health,omitempty"`
-	IsBaby             bool    `json:"is_baby,omitempty"`
-	AgeTicks           int     `json:"age_ticks,omitempty"`
-	CustomName         string  `json:"custom_name,omitempty"`
+	TypeName           string        `json:"id"`
+	TicksInHive        int           `json:"ticks_in_hive"`
+	MinOccupationTicks int           `json:"min_occupation_ticks"`
+	HasNectar          bool          `json:"has_nectar"`
+	Health             float32       `json:"health,omitempty"`
+	IsBaby             bool          `json:"is_baby,omitempty"`
+	AgeTicks           int           `json:"age_ticks,omitempty"`
+	CustomName         string        `json:"custom_name,omitempty"`
+	EntityData         *nbt.Compound `json:"-"`
 }
 
 // BeehiveBlockEntity stores the server-side block entity state for a `minecraft:beehive` or `minecraft:bee_nest`.
 type BeehiveBlockEntity struct {
-	Dimension string
-	X, Y, Z   int
-	BlockName string
-	Occupants []BeehiveOccupant
-	FlowerPos *[3]int
+	Dimension     string
+	X, Y, Z       int
+	BlockName     string
+	Occupants     []BeehiveOccupant
+	FlowerPos     *[3]int
+	ComponentsTag *nbt.Compound
+}
+
+type beeChunkKey struct {
+	dim    string
+	cx, cz int32
 }
 
 // BeeStateManager manages active `minecraft:bee` entities and `minecraft:beehive` / `minecraft:bee_nest` block entities.
 type BeeStateManager struct {
 	mu          sync.RWMutex
+	loadedStore bool
+	loadedChunk map[beeChunkKey]bool
 	bees        map[int32]*BeeState
 	hives       map[beeHivePosKey]*BeehiveBlockEntity
 	droppedMeta map[string]string
@@ -202,6 +212,7 @@ func (s *Server) BeeStates() *BeeStateManager {
 	mgr := beeManagers[s]
 	if mgr == nil {
 		mgr = &BeeStateManager{
+			loadedChunk: make(map[beeChunkKey]bool),
 			bees:        make(map[int32]*BeeState),
 			hives:       make(map[beeHivePosKey]*BeehiveBlockEntity),
 			droppedMeta: make(map[string]string),
@@ -702,6 +713,7 @@ func (s *Server) HydrateNaturalBeehiveAt(dimension string, x, y, z int, rng *ran
 		return nil
 	}
 	normDim := world.NormalizeDimension(dimension)
+	s.ensureChunkBeehivesLoaded(normDim, int32(x>>4), int32(z>>4))
 	cache := s.DimensionChunks(normDim)
 	if cache != nil {
 		if sbe, exists := cache.StructureBlockEntityAt(x, y, z); exists && canonicalResourceName(sbe.ID) == "minecraft:beehive" {
@@ -724,24 +736,48 @@ func (s *Server) HydrateNaturalBeehiveAt(dimension string, x, y, z int, rng *ran
 				mgr.hives[key] = be
 			}
 			if len(be.Occupants) == 0 {
-				numBees := 2
-				if rng != nil {
-					numBees = 2 + rng.Intn(2)
-				} else {
-					numBees = 3
-				}
-				for i := 0; i < numBees && len(be.Occupants) < BeeMaxHiveOccupants; i++ {
-					ticksIn := 200 * (i + 1)
-					if rng != nil {
-						ticksIn = rng.Intn(599)
+				if len(sbe.Bees) > 0 {
+					for _, sb := range sbe.Bees {
+						if len(be.Occupants) >= BeeMaxHiveOccupants {
+							break
+						}
+						entID := sb.EntityID
+						if entID == "" {
+							entID = MobTypeBee
+						}
+						minTicks := sb.MinTicksInHive
+						if minTicks <= 0 {
+							minTicks = BeeMinOccupationTicksNoNectar
+						}
+						be.Occupants = append(be.Occupants, BeehiveOccupant{
+							TypeName:           canonicalResourceName(entID),
+							TicksInHive:        sb.TicksInHive,
+							MinOccupationTicks: minTicks,
+							Health:             DefaultBeeMaxHealth,
+							EntityData:         nbt.NewCompound().Set("id", nbt.String(canonicalResourceName(entID))),
+						})
 					}
-					be.Occupants = append(be.Occupants, BeehiveOccupant{
-						TypeName:           MobTypeBee,
-						TicksInHive:        ticksIn,
-						MinOccupationTicks: BeeMinOccupationTicksNoNectar,
-						HasNectar:          false,
-						Health:             DefaultBeeMaxHealth,
-					})
+				} else {
+					numBees := 2
+					if rng != nil {
+						numBees = 2 + rng.Intn(2)
+					} else {
+						numBees = 3
+					}
+					for i := 0; i < numBees && len(be.Occupants) < BeeMaxHiveOccupants; i++ {
+						ticksIn := 200 * (i + 1)
+						if rng != nil {
+							ticksIn = rng.Intn(599)
+						}
+						be.Occupants = append(be.Occupants, BeehiveOccupant{
+							TypeName:           MobTypeBee,
+							TicksInHive:        ticksIn,
+							MinOccupationTicks: BeeMinOccupationTicksNoNectar,
+							HasNectar:          false,
+							Health:             DefaultBeeMaxHealth,
+							EntityData:         nbt.NewCompound().Set("id", nbt.String(MobTypeBee)),
+						})
+					}
 				}
 			}
 			mgr.mu.Unlock()
@@ -817,7 +853,9 @@ func (s *Server) BeehiveFlowerPos(dimension string, x, y, z int) (fx, fy, fz int
 	if mgr == nil {
 		return 0, 0, 0, false
 	}
-	key := beeHivePosKey{Dimension: world.NormalizeDimension(dimension), X: x, Y: y, Z: z}
+	normDim := world.NormalizeDimension(dimension)
+	s.ensureChunkBeehivesLoaded(normDim, int32(x>>4), int32(z>>4))
+	key := beeHivePosKey{Dimension: normDim, X: x, Y: y, Z: z}
 	mgr.mu.RLock()
 	defer mgr.mu.RUnlock()
 	be := mgr.hives[key]
@@ -874,7 +912,10 @@ func (s *Server) BeehiveOccupants(dimension string, x, y, z int) []BeehiveOccupa
 		return nil
 	}
 	out := make([]BeehiveOccupant, len(be.Occupants))
-	copy(out, be.Occupants)
+	for i := range be.Occupants {
+		out[i] = be.Occupants[i]
+		out[i].EntityData = world.CloneNBTCompound(be.Occupants[i].EntityData)
+	}
 	return out
 }
 
@@ -955,6 +996,22 @@ func (s *Server) TryEnterBeehive(beeEntityID int32, dimension string, hx, hy, hz
 		fp := [3]int{st.FlowerX, st.FlowerY, st.FlowerZ}
 		be.FlowerPos = &fp
 	}
+	entData := nbt.NewCompound().
+		Set("id", nbt.String(MobTypeBee)).
+		Set("Health", nbt.Float(hp)).
+		Set("Age", nbt.Int(int32(ageTicks)))
+	if st.HasNectar {
+		entData.Set("HasNectar", nbt.Byte(1))
+	} else {
+		entData.Set("HasNectar", nbt.Byte(0))
+	}
+	entData.Set("HasStung", nbt.Byte(0))
+	if st.HasFlowerPos {
+		entData.Set("flower_pos", nbt.IntArray{int32(st.FlowerX), int32(st.FlowerY), int32(st.FlowerZ)})
+	}
+	if st.CustomName != "" {
+		entData.Set("CustomName", nbt.String(st.CustomName))
+	}
 	be.Occupants = append(be.Occupants, BeehiveOccupant{
 		TypeName:           MobTypeBee,
 		TicksInHive:        0,
@@ -964,6 +1021,7 @@ func (s *Server) TryEnterBeehive(beeEntityID int32, dimension string, hx, hy, hz
 		IsBaby:             isBaby,
 		AgeTicks:           ageTicks,
 		CustomName:         st.CustomName,
+		EntityData:         entData,
 	})
 	delete(mgr.bees, beeEntityID)
 	mgr.mu.Unlock()
@@ -1074,6 +1132,7 @@ func (s *Server) TickBeehives(rng *rand.Rand) {
 	if s == nil || mgr == nil {
 		return
 	}
+	s.ensureBeehivesLoaded()
 	type releaseItem struct {
 		dim       string
 		x, y, z   int
@@ -2481,8 +2540,109 @@ func (s *Server) TickBees(rng *rand.Rand) {
 
 // --- Beehive BlockEntity NBT & File Persistence ---
 
-// EncodeBeehiveBlockEntityNBT encodes a `BeehiveBlockEntity` into a vanilla-compatible
-// `minecraft:beehive` block entity NBT compound (`id`, `x`, `y`, `z`, `block_name`, `flower_pos`, `bees`).
+func isBeehiveBlockEntityID(id string) bool {
+	return canonicalResourceName(id) == "minecraft:beehive"
+}
+
+// vanillaIgnoredBeeEntityTags mirrors BeehiveBlockEntity.IGNORED_BEE_TAGS in
+// Minecraft 26.1.2 (26 transient entity tags stripped when storing a bee inside
+// a beehive's `entity_data` TypedEntityData).
+var vanillaIgnoredBeeEntityTags = map[string]bool{
+	"Air":                        true,
+	"drop_chances":               true,
+	"equipment":                  true,
+	"Brain":                      true,
+	"CanPickUpLoot":              true,
+	"DeathTime":                  true,
+	"fall_distance":              true,
+	"FallFlying":                 true,
+	"Fire":                       true,
+	"HurtByTimestamp":            true,
+	"HurtTime":                   true,
+	"LeftHanded":                 true,
+	"Motion":                     true,
+	"NoGravity":                  true,
+	"OnGround":                   true,
+	"PortalCooldown":             true,
+	"Pos":                        true,
+	"Rotation":                   true,
+	"sleeping_pos":               true,
+	"CannotEnterHiveTicks":       true,
+	"TicksSincePollination":      true,
+	"CropsGrownSincePollination": true,
+	"hive_pos":                   true,
+	"Passengers":                 true,
+	"leash":                      true,
+	"UUID":                       true,
+}
+
+func cloneBeeEntityDataFiltered(src *nbt.Compound) *nbt.Compound {
+	dst := nbt.NewCompound()
+	if src == nil {
+		return dst
+	}
+	for _, k := range src.Keys() {
+		if vanillaIgnoredBeeEntityTags[k] {
+			continue
+		}
+		if v, ok := src.Get(k); ok && v != nil {
+			dst.Set(k, world.CloneNBTTag(v))
+		}
+	}
+	return dst
+}
+
+func encodeBeeOccupantEntityData(occ BeehiveOccupant) *nbt.Compound {
+	var ed *nbt.Compound
+	if occ.EntityData != nil {
+		ed = cloneBeeEntityDataFiltered(occ.EntityData)
+	} else {
+		ed = nbt.NewCompound()
+	}
+	typeName := occ.TypeName
+	if typeName == "" {
+		typeName = MobTypeBee
+	}
+	ed.Set("id", nbt.String(canonicalResourceName(typeName)))
+
+	if occ.EntityData == nil {
+		if occ.HasNectar {
+			ed.Set("HasNectar", nbt.Byte(1))
+		}
+		if occ.Health > 0 && occ.Health != DefaultBeeMaxHealth {
+			ed.Set("Health", nbt.Float(occ.Health))
+		}
+		if occ.IsBaby || occ.AgeTicks != 0 {
+			age := occ.AgeTicks
+			if occ.IsBaby && age >= 0 {
+				age = -24000
+			}
+			ed.Set("Age", nbt.Int(int32(age)))
+		}
+		if occ.CustomName != "" {
+			ed.Set("CustomName", nbt.String(occ.CustomName))
+		}
+	} else {
+		if occ.HasNectar {
+			ed.Set("HasNectar", nbt.Byte(1))
+		} else if _, hasKey := ed.Get("HasNectar"); hasKey {
+			ed.Set("HasNectar", nbt.Byte(0))
+		}
+		if occ.CustomName != "" {
+			if _, hasCN := ed.Get("CustomName"); !hasCN {
+				ed.Set("CustomName", nbt.String(occ.CustomName))
+			}
+		}
+	}
+	return ed
+}
+
+// EncodeBeehiveBlockEntityNBT encodes a `BeehiveBlockEntity` into an exact
+// vanilla 26.1.2 `minecraft:beehive` block entity NBT compound:
+//   - `id`: `"minecraft:beehive"` (used for BOTH `beehive` and `bee_nest` in 26.1.2)
+//   - `x`, `y`, `z`, `keepPacked: 0b`
+//   - `bees`: list of `{entity_data, ticks_in_hive, min_ticks_in_hive}`
+//   - optional `flower_pos`: `IntArray[3]`
 func EncodeBeehiveBlockEntityNBT(be *BeehiveBlockEntity) *nbt.Compound {
 	if be == nil {
 		return nil
@@ -2492,44 +2652,39 @@ func EncodeBeehiveBlockEntityNBT(be *BeehiveBlockEntity) *nbt.Compound {
 	c.Set("x", nbt.Int(int32(be.X)))
 	c.Set("y", nbt.Int(int32(be.Y)))
 	c.Set("z", nbt.Int(int32(be.Z)))
-	if be.BlockName != "" {
-		c.Set("block_name", nbt.String(be.BlockName))
-	}
+	c.Set("keepPacked", nbt.Byte(0))
 	if be.FlowerPos != nil {
 		c.Set("flower_pos", nbt.IntArray{int32(be.FlowerPos[0]), int32(be.FlowerPos[1]), int32(be.FlowerPos[2])})
 	}
 	beeTags := make([]nbt.Tag, 0, len(be.Occupants))
 	for _, occ := range be.Occupants {
 		bc := nbt.NewCompound()
-		typeName := occ.TypeName
-		if typeName == "" {
-			typeName = MobTypeBee
-		}
-		bc.Set("id", nbt.String(typeName))
+		bc.Set("entity_data", encodeBeeOccupantEntityData(occ))
 		bc.Set("ticks_in_hive", nbt.Int(int32(occ.TicksInHive)))
-		bc.Set("min_occupation_ticks", nbt.Int(int32(occ.MinOccupationTicks)))
-		var hasNectarByte int8
-		if occ.HasNectar {
-			hasNectarByte = 1
+		minTicks := occ.MinOccupationTicks
+		if minTicks <= 0 {
+			if occ.HasNectar {
+				minTicks = BeeMinOccupationTicksNectar
+			} else {
+				minTicks = BeeMinOccupationTicksNoNectar
+			}
 		}
-		bc.Set("has_nectar", nbt.Byte(hasNectarByte))
-		var isBabyByte int8
-		if occ.IsBaby {
-			isBabyByte = 1
-		}
-		bc.Set("is_baby", nbt.Byte(isBabyByte))
-		bc.Set("age_ticks", nbt.Int(int32(occ.AgeTicks)))
-		bc.Set("health", nbt.Float(occ.Health))
-		if occ.CustomName != "" {
-			bc.Set("CustomName", nbt.String(occ.CustomName))
-		}
+		bc.Set("min_ticks_in_hive", nbt.Int(int32(minTicks)))
 		beeTags = append(beeTags, bc)
 	}
-	c.Set("bees", nbt.List{ElemID: nbt.TagCompound, Elems: beeTags})
+	elemID := byte(nbt.TagEnd)
+	if len(beeTags) > 0 {
+		elemID = nbt.TagCompound
+	}
+	c.Set("bees", nbt.List{ElemID: elemID, Elems: beeTags})
+	if be.ComponentsTag != nil && be.ComponentsTag.Len() > 0 {
+		c.Set("components", world.CloneNBTCompound(be.ComponentsTag))
+	}
 	return c
 }
 
-// DecodeBeehiveBlockEntityNBT decodes a `BeehiveBlockEntity` from a `minecraft:beehive` NBT compound.
+// DecodeBeehiveBlockEntityNBT decodes a `BeehiveBlockEntity` from a vanilla
+// 26.1.2 `minecraft:beehive` NBT compound.
 func DecodeBeehiveBlockEntityNBT(dimension string, comp *nbt.Compound) (*BeehiveBlockEntity, bool) {
 	if comp == nil {
 		return nil, false
@@ -2569,6 +2724,11 @@ func DecodeBeehiveBlockEntityNBT(dimension string, comp *nbt.Compound) (*Beehive
 			be.FlowerPos = &fp
 		}
 	}
+	if rawComp, ok := comp.Get("components"); ok {
+		if cc, isComp := rawComp.(*nbt.Compound); isComp && cc != nil && cc.Len() > 0 {
+			be.ComponentsTag = world.CloneNBTCompound(cc)
+		}
+	}
 	if beesTag, ok := comp.Get("bees"); ok {
 		if list, ok := beesTag.(nbt.List); ok {
 			for _, elem := range list.Elems {
@@ -2586,34 +2746,76 @@ func DecodeBeehiveBlockEntityNBT(dimension string, comp *nbt.Compound) (*Beehive
 						occ.TicksInHive = int(ti)
 					}
 				}
-				if mTag, ok := bc.Get("min_occupation_ticks"); ok {
+				if mTag, ok := bc.Get("min_ticks_in_hive"); ok {
 					if mi, ok := mTag.(nbt.Int); ok && mi > 0 {
 						occ.MinOccupationTicks = int(mi)
 					}
-				}
-				if nTag, ok := bc.Get("has_nectar"); ok {
-					if nb, ok := nTag.(nbt.Byte); ok && nb != 0 {
-						occ.HasNectar = true
+				} else if mLegacy, ok := bc.Get("min_occupation_ticks"); ok {
+					if mi, ok := mLegacy.(nbt.Int); ok && mi > 0 {
+						occ.MinOccupationTicks = int(mi)
 					}
 				}
-				if bTag, ok := bc.Get("is_baby"); ok {
-					if bb, ok := bTag.(nbt.Byte); ok && bb != 0 {
-						occ.IsBaby = true
+				if edTag, ok := bc.Get("entity_data"); ok {
+					if edComp, isComp := edTag.(*nbt.Compound); isComp && edComp != nil {
+						occ.EntityData = cloneBeeEntityDataFiltered(edComp)
+						if idVal, ok := nbtGetString(edComp, "id"); ok && idVal != "" {
+							occ.TypeName = canonicalResourceName(idVal)
+						}
+						if nTag, ok := edComp.Get("HasNectar"); ok {
+							if nb, ok := nTag.(nbt.Byte); ok && nb != 0 {
+								occ.HasNectar = true
+							}
+						}
+						if hTag, ok := edComp.Get("Health"); ok {
+							switch hv := hTag.(type) {
+							case nbt.Float:
+								if hv > 0 {
+									occ.Health = float32(hv)
+								}
+							case nbt.Double:
+								if hv > 0 {
+									occ.Health = float32(hv)
+								}
+							}
+						}
+						if aTag, ok := edComp.Get("Age"); ok {
+							if ai, ok := aTag.(nbt.Int); ok {
+								occ.AgeTicks = int(ai)
+								if ai < 0 {
+									occ.IsBaby = true
+								}
+							}
+						}
+						if cnTag, ok := edComp.Get("CustomName"); ok && cnTag != nil {
+							occ.CustomName = world.ExtractCustomNameFromNBTTag(cnTag)
+						}
 					}
-				}
-				if aTag, ok := bc.Get("age_ticks"); ok {
-					if ai, ok := aTag.(nbt.Int); ok {
-						occ.AgeTicks = int(ai)
+				} else {
+					if idVal, ok := nbtGetString(bc, "id"); ok && idVal != "" {
+						occ.TypeName = canonicalResourceName(idVal)
 					}
-				}
-				if hTag, ok := bc.Get("health"); ok {
-					if hf, ok := hTag.(nbt.Float); ok && hf > 0 {
-						occ.Health = float32(hf)
+					if nTag, ok := bc.Get("has_nectar"); ok {
+						if nb, ok := nTag.(nbt.Byte); ok && nb != 0 {
+							occ.HasNectar = true
+						}
 					}
-				}
-				if cnTag, ok := bc.Get("CustomName"); ok {
-					if cs, ok := cnTag.(nbt.String); ok {
-						occ.CustomName = string(cs)
+					if bTag, ok := bc.Get("is_baby"); ok {
+						if bb, ok := bTag.(nbt.Byte); ok && bb != 0 {
+							occ.IsBaby = true
+						}
+					}
+					if aTag, ok := bc.Get("age_ticks"); ok {
+						if ai, ok := aTag.(nbt.Int); ok {
+							occ.AgeTicks = int(ai)
+						}
+					}
+					if hTag, ok := bc.Get("health"); ok {
+						if hf, ok := hTag.(nbt.Float); ok && hf > 0 {
+							occ.Health = float32(hf)
+						}
+					}
+					if cnTag, ok := bc.Get("CustomName"); ok && cnTag != nil {
+						occ.CustomName = world.ExtractCustomNameFromNBTTag(cnTag)
 					}
 				}
 				be.Occupants = append(be.Occupants, occ)
@@ -2621,6 +2823,141 @@ func DecodeBeehiveBlockEntityNBT(dimension string, comp *nbt.Compound) (*Beehive
 		}
 	}
 	return be, true
+}
+
+func (s *Server) ensureBeehivesLoaded() {
+	if s == nil {
+		return
+	}
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return
+	}
+	mgr.mu.RLock()
+	already := mgr.loadedStore
+	mgr.mu.RUnlock()
+	if already {
+		return
+	}
+	mgr.mu.Lock()
+	if mgr.loadedStore {
+		mgr.mu.Unlock()
+		return
+	}
+	mgr.loadedStore = true
+	var loadedPositions [][3]int
+	if store := s.activeFurnaceStore(); store != nil {
+		if comps, err := store.LoadAllBlockEntities(isBeehiveBlockEntityID); err == nil {
+			for _, comp := range comps {
+				be, ok := DecodeBeehiveBlockEntityNBT(world.DimensionOverworld, comp)
+				if !ok || be == nil {
+					continue
+				}
+				key := beeHivePosKey{Dimension: world.DimensionOverworld, X: be.X, Y: be.Y, Z: be.Z}
+				if _, exists := mgr.hives[key]; !exists {
+					mgr.hives[key] = be
+				}
+				mgr.loadedChunk[beeChunkKey{dim: world.DimensionOverworld, cx: int32(be.X >> 4), cz: int32(be.Z >> 4)}] = true
+				loadedPositions = append(loadedPositions, [3]int{be.X, be.Y, be.Z})
+			}
+		}
+	}
+	mgr.mu.Unlock()
+	if len(loadedPositions) > 0 {
+		if cache := s.DimensionChunks(world.DimensionOverworld); cache != nil && cache.IsChunkLoaded(int32(loadedPositions[0][0]>>4), int32(loadedPositions[0][2]>>4)) {
+			for _, pos := range loadedPositions {
+				if cache.IsChunkLoaded(int32(pos[0]>>4), int32(pos[2]>>4)) {
+					cache.RemoveStructureBlockEntity(pos[0], pos[1], pos[2])
+				}
+			}
+		}
+	}
+}
+
+func (s *Server) ensureChunkBeehivesLoaded(dimension string, cx, cz int32) {
+	if s == nil {
+		return
+	}
+	s.ensureBeehivesLoaded()
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dimension)
+	ck := beeChunkKey{dim: normDim, cx: cx, cz: cz}
+	mgr.mu.RLock()
+	already := mgr.loadedChunk[ck]
+	mgr.mu.RUnlock()
+	if already {
+		return
+	}
+	cache := s.DimensionChunks(normDim)
+	var comps []*nbt.Compound
+	if cache != nil {
+		comps, _ = cache.LoadChunkBlockEntities(cx, cz, isBeehiveBlockEntityID)
+	}
+	mgr.mu.Lock()
+	if mgr.loadedChunk[ck] {
+		mgr.mu.Unlock()
+		return
+	}
+	mgr.loadedChunk[ck] = true
+	var removeSBE [][3]int
+	for _, comp := range comps {
+		be, ok := DecodeBeehiveBlockEntityNBT(normDim, comp)
+		if !ok || be == nil {
+			continue
+		}
+		if cache != nil && cache.IsChunkLoaded(cx, cz) {
+			if st := cache.GetBlock(be.X, be.Y, be.Z); IsBeehiveOrNestBlockState(st) {
+				be.BlockName = canonicalResourceName(world.BlockName(st))
+			}
+		}
+		key := beeHivePosKey{Dimension: normDim, X: be.X, Y: be.Y, Z: be.Z}
+		if _, exists := mgr.hives[key]; !exists {
+			mgr.hives[key] = be
+		}
+		removeSBE = append(removeSBE, [3]int{be.X, be.Y, be.Z})
+	}
+	mgr.mu.Unlock()
+	if cache != nil {
+		for _, pos := range removeSBE {
+			cache.RemoveStructureBlockEntity(pos[0], pos[1], pos[2])
+		}
+	}
+}
+
+func (s *Server) scanLoadedChunkBeehiveBlocks(dimension string, cx, cz int32) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil || !cache.IsChunkLoaded(cx, cz) {
+		return
+	}
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return
+	}
+	for _, entry := range cache.LoadedChunkMatchingBlocks(cx, cz, IsBeehiveOrNestBlockState) {
+		wx, y, wz, st := entry[0], entry[1], entry[2], uint16(entry[3])
+		_ = s.HydrateNaturalBeehiveAt(normDim, wx, y, wz, nil)
+		key := beeHivePosKey{Dimension: normDim, X: wx, Y: y, Z: wz}
+		mgr.mu.Lock()
+		if existing := mgr.hives[key]; existing == nil {
+			mgr.hives[key] = &BeehiveBlockEntity{
+				Dimension: normDim,
+				X:         wx,
+				Y:         y,
+				Z:         wz,
+				BlockName: canonicalResourceName(world.BlockName(st)),
+			}
+		} else {
+			existing.BlockName = canonicalResourceName(world.BlockName(st))
+		}
+		mgr.mu.Unlock()
+	}
 }
 
 // ChunkBeehiveBlockEntitiesNBT returns NBT compounds for all `BeehiveBlockEntity`
@@ -2631,45 +2968,105 @@ func (s *Server) ChunkBeehiveBlockEntitiesNBT(dimension string, cx, cz int32) []
 		return nil
 	}
 	normDim := world.NormalizeDimension(dimension)
+	s.ensureChunkBeehivesLoaded(normDim, cx, cz)
+	s.scanLoadedChunkBeehiveBlocks(normDim, cx, cz)
+
+	cache := s.DimensionChunks(normDim)
+	chunkLoaded := cache != nil && cache.IsChunkLoaded(cx, cz)
+
 	mgr.mu.RLock()
-	defer mgr.mu.RUnlock()
-	var out []*nbt.Compound
+	var keys []beeHivePosKey
 	for key, be := range mgr.hives {
 		if key.Dimension != normDim || be == nil {
 			continue
 		}
-		if int32(key.X>>4) == cx && int32(key.Z>>4) == cz {
-			if c := EncodeBeehiveBlockEntityNBT(be); c != nil {
-				out = append(out, c)
+		if int32(key.X>>4) != cx || int32(key.Z>>4) != cz {
+			continue
+		}
+		if chunkLoaded {
+			st := cache.GetBlock(key.X, key.Y, key.Z)
+			if st != world.StateAir && !IsBeehiveOrNestBlockState(st) {
+				continue
 			}
 		}
+		keys = append(keys, key)
 	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Y != keys[j].Y {
+			return keys[i].Y < keys[j].Y
+		}
+		if keys[i].X != keys[j].X {
+			return keys[i].X < keys[j].X
+		}
+		return keys[i].Z < keys[j].Z
+	})
+	out := make([]*nbt.Compound, 0, len(keys))
+	for _, key := range keys {
+		if c := EncodeBeehiveBlockEntityNBT(mgr.hives[key]); c != nil {
+			out = append(out, c)
+		}
+	}
+	mgr.mu.RUnlock()
 	return out
 }
 
+// SaveChunkBeehives writes all `minecraft:beehive` block entities in chunk
+// (cx, cz) of dimension into the chunk's Anvil `block_entities` list.
+func (s *Server) SaveChunkBeehives(dimension string, cx, cz int32) error {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return nil
+	}
+	comps := s.ChunkBeehiveBlockEntitiesNBT(normDim, cx, cz)
+	return cache.SaveChunkBlockEntities(cx, cz, isBeehiveBlockEntityID, comps)
+}
+
 // UnloadChunkBeehiveBlockEntities removes and returns NBT compounds for all
-// `BeehiveBlockEntity` instances in chunk (cx, cz) of dimension.
+// `BeehiveBlockEntity` instances in chunk (cx, cz) of dimension, persisting them
+// to the chunk's `block_entities` list first.
 func (s *Server) UnloadChunkBeehiveBlockEntities(dimension string, cx, cz int32) []*nbt.Compound {
 	mgr := s.BeeStates()
 	if s == nil || mgr == nil {
 		return nil
 	}
 	normDim := world.NormalizeDimension(dimension)
+	out := s.ChunkBeehiveBlockEntitiesNBT(normDim, cx, cz)
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		_ = cache.SaveChunkBlockEntities(cx, cz, isBeehiveBlockEntityID, out)
+	}
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
-	var out []*nbt.Compound
-	for key, be := range mgr.hives {
-		if key.Dimension != normDim || be == nil {
-			continue
-		}
-		if int32(key.X>>4) == cx && int32(key.Z>>4) == cz {
-			if c := EncodeBeehiveBlockEntityNBT(be); c != nil {
-				out = append(out, c)
-			}
+	for key := range mgr.hives {
+		if key.Dimension == normDim && int32(key.X>>4) == cx && int32(key.Z>>4) == cz {
 			delete(mgr.hives, key)
 		}
 	}
+	mgr.loadedChunk[beeChunkKey{dim: normDim, cx: cx, cz: cz}] = true
+	mgr.mu.Unlock()
 	return out
+}
+
+// ReloadChunkBeehives reloads `BeehiveBlockEntity` instances in chunk (cx, cz)
+// of dimension from the chunk's Anvil `block_entities` list.
+func (s *Server) ReloadChunkBeehives(dimension string, cx, cz int32) error {
+	mgr := s.BeeStates()
+	if s == nil || mgr == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dimension)
+	mgr.mu.Lock()
+	for key := range mgr.hives {
+		if key.Dimension == normDim && int32(key.X>>4) == cx && int32(key.Z>>4) == cz {
+			delete(mgr.hives, key)
+		}
+	}
+	delete(mgr.loadedChunk, beeChunkKey{dim: normDim, cx: cx, cz: cz})
+	mgr.mu.Unlock()
+	s.ensureChunkBeehivesLoaded(normDim, cx, cz)
+	return nil
 }
 
 // LoadChunkBeehiveBlockEntitiesNBT restores `BeehiveBlockEntity` instances in dimension from chunk NBT compounds.
@@ -2679,16 +3076,88 @@ func (s *Server) LoadChunkBeehiveBlockEntitiesNBT(dimension string, compounds []
 		return
 	}
 	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
+	var removeSBE [][3]int
 	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
 	for _, comp := range compounds {
 		be, ok := DecodeBeehiveBlockEntityNBT(normDim, comp)
 		if !ok || be == nil {
 			continue
 		}
+		if cache != nil && cache.IsChunkLoaded(int32(be.X>>4), int32(be.Z>>4)) {
+			if st := cache.GetBlock(be.X, be.Y, be.Z); IsBeehiveOrNestBlockState(st) {
+				be.BlockName = canonicalResourceName(world.BlockName(st))
+			}
+		}
 		key := beeHivePosKey{Dimension: normDim, X: be.X, Y: be.Y, Z: be.Z}
 		mgr.hives[key] = be
+		mgr.loadedChunk[beeChunkKey{dim: normDim, cx: int32(be.X >> 4), cz: int32(be.Z >> 4)}] = true
+		removeSBE = append(removeSBE, [3]int{be.X, be.Y, be.Z})
 	}
+	mgr.mu.Unlock()
+	if cache != nil {
+		for _, pos := range removeSBE {
+			cache.RemoveStructureBlockEntity(pos[0], pos[1], pos[2])
+		}
+	}
+}
+
+// SaveBeehives flushes all `minecraft:beehive` block entities across all
+// dimensions into their chunks' Anvil `block_entities` lists.
+func (s *Server) SaveBeehives() error {
+	if s == nil {
+		return nil
+	}
+	s.ensureBeehivesLoaded()
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return nil
+	}
+	chunks := make(map[beeChunkKey]struct{})
+	mgr.mu.RLock()
+	for ck := range mgr.loadedChunk {
+		chunks[ck] = struct{}{}
+	}
+	for k := range mgr.hives {
+		chunks[beeChunkKey{dim: k.Dimension, cx: int32(k.X >> 4), cz: int32(k.Z >> 4)}] = struct{}{}
+	}
+	mgr.mu.RUnlock()
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		if cache := s.loadedDimensionCache(dim); cache != nil {
+			for _, coord := range cache.LoadedChunkCoords() {
+				ck := beeChunkKey{dim: dim, cx: coord[0], cz: coord[1]}
+				if _, ok := chunks[ck]; ok {
+					continue
+				}
+				if len(cache.LoadedChunkMatchingBlocks(coord[0], coord[1], IsBeehiveOrNestBlockState)) > 0 {
+					chunks[ck] = struct{}{}
+				}
+			}
+		}
+	}
+	var firstErr error
+	for ck := range chunks {
+		if err := s.SaveChunkBeehives(ck.dim, ck.cx, ck.cz); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// LoadBeehives loads persisted `minecraft:beehive` block entities from the world store.
+func (s *Server) LoadBeehives() error {
+	if s == nil {
+		return nil
+	}
+	mgr := s.BeeStates()
+	if mgr == nil {
+		return nil
+	}
+	mgr.mu.Lock()
+	mgr.loadedStore = false
+	mgr.mu.Unlock()
+	s.ensureBeehivesLoaded()
+	return nil
 }
 
 type persistedBeeSnapshot struct {

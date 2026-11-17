@@ -420,6 +420,8 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 	}
 	s.RegisterWardenSummonHook()
 	if store != nil {
+		_ = s.LoadStorageContainers()
+		_ = s.LoadBeehives()
 		_ = s.LoadFurnaces()
 		_ = s.LoadBrewingStands()
 		_ = s.LoadHoppers()
@@ -449,6 +451,8 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadHoppers()
 		_ = s.LoadFurnaces()
 		_ = s.LoadCampfires()
+		_ = s.LoadStorageContainers()
+		_ = s.LoadBeehives()
 		_ = s.LoadCrafters()
 		_ = s.LoadChiseledBookshelves()
 		_ = s.LoadDecoratedPots()
@@ -603,6 +607,12 @@ func (s *Server) SaveAll() error {
 		}
 	}
 	if err := s.SaveAllDimensions(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveStorageContainers(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveBeehives(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveFurnaces(); err != nil && firstErr == nil {
@@ -775,6 +785,8 @@ func (s *Server) ChunkBlockEntitiesNBT(dimension string, cx, cz int32) []*nbt.Co
 	dim := world.NormalizeDimension(dimension)
 	out := s.ChunkSignAndLecternBlockEntitiesNBT(dim, cx, cz)
 	out = append(out, s.ChunkBannerBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkStorageBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.ChunkBeehiveBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkHopperBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkDispenserBlockEntitiesNBT(dim, cx, cz)...)
 	out = append(out, s.ChunkFurnaceBlockEntitiesNBT(dim, cx, cz)...)
@@ -804,6 +816,8 @@ func (s *Server) UnloadChunkBlockEntities(dimension string, cx, cz int32) []*nbt
 	dim := world.NormalizeDimension(dimension)
 	out := s.ChunkSignAndLecternBlockEntitiesNBT(dim, cx, cz)
 	out = append(out, s.ChunkBannerBlockEntitiesNBT(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkStorageContainers(dim, cx, cz)...)
+	out = append(out, s.UnloadChunkBeehiveBlockEntities(dim, cx, cz)...)
 	out = append(out, s.UnloadChunkHoppers(dim, cx, cz)...)
 	out = append(out, s.UnloadChunkDispensers(dim, cx, cz)...)
 	out = append(out, s.ChunkFurnaceBlockEntitiesNBT(dim, cx, cz)...)
@@ -848,6 +862,8 @@ func (s *Server) LoadChunkBlockEntitiesNBT(dimension string, list nbt.List) {
 	if len(compounds) == 0 {
 		return
 	}
+	s.LoadChunkStorageBlockEntitiesNBT(dim, compounds)
+	s.LoadChunkBeehiveBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkHopperBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkDispenserBlockEntitiesNBT(dim, compounds)
 	s.LoadChunkFurnaceBlockEntitiesNBT(dim, compounds)
@@ -1003,6 +1019,8 @@ func (s *Server) OnChunkLoaded(dimension string, cx, cz int32) {
 	if dim == world.DimensionOverworld {
 		_ = s.ReloadChunkFurnaces(cx, cz)
 	}
+	_ = s.ReloadChunkStorageContainers(dim, cx, cz)
+	_ = s.ReloadChunkBeehives(dim, cx, cz)
 }
 
 // Config returns the active configuration.

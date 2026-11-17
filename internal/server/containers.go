@@ -195,7 +195,28 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 		SetCarriedGoatHornInstrument(session, "")
 		SetCarriedBundleContents(session, nil)
 		SetCarriedLodestoneTracker(session, LodestoneTracker{}, false)
+		SetCarriedShulkerBoxData(session, nil)
 	}
+}
+
+func (s *Server) resolveLegacyStorageDim(x, y, z int) string {
+	if s == nil {
+		return world.DimensionOverworld
+	}
+	if ow := s.loadedDimensionCache(world.DimensionOverworld); ow != nil && ow.IsChunkLoaded(int32(x>>4), int32(z>>4)) {
+		if _, ok := StorageBlockEntityIDForBlockName(world.BlockName(ow.GetBlock(x, y, z))); ok {
+			return world.DimensionOverworld
+		}
+	}
+	for _, dim := range []string{world.DimensionNether, world.DimensionEnd} {
+		cache := s.loadedDimensionCache(dim)
+		if cache != nil && cache.IsChunkLoaded(int32(x>>4), int32(z>>4)) {
+			if _, ok := StorageBlockEntityIDForBlockName(world.BlockName(cache.GetBlock(x, y, z))); ok {
+				return dim
+			}
+		}
+	}
+	return world.DimensionOverworld
 }
 
 // ChestSlots returns a copy of the 27 slots stored in the chest at (x, y, z).
@@ -203,14 +224,7 @@ func (s *Server) ChestSlots(x, y, z int) [ChestSlotCount]world.ItemStack {
 	if s == nil {
 		return [ChestSlotCount]world.ItemStack{}
 	}
-	cs := s.chestState()
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	arr := cs.chests[chestKey{x, y, z}]
-	if arr == nil {
-		return [ChestSlotCount]world.ItemStack{}
-	}
-	return *arr
+	return s.ChestSlotsInDim(s.resolveLegacyStorageDim(x, y, z), x, y, z)
 }
 
 // SetChestSlot updates a single slot (0..26) in the chest at (x, y, z).
@@ -218,34 +232,7 @@ func (s *Server) SetChestSlot(x, y, z, slot int, stack world.ItemStack) bool {
 	if s == nil || slot < 0 || slot >= ChestSlotCount {
 		return false
 	}
-	cs := s.chestState()
-	cs.mu.Lock()
-	key := chestKey{x, y, z}
-	arr := cs.chests[key]
-	if arr == nil {
-		arr = &[ChestSlotCount]world.ItemStack{}
-		cs.chests[key] = arr
-	}
-	if stack.IsEmpty() {
-		arr[slot] = world.ItemStack{}
-	} else {
-		arr[slot] = world.NewItemStack(stack.ResolvedItemID(), stack.Count)
-	}
-	cs.mu.Unlock()
-	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
-		cache := s.DimensionChunks(dim)
-		if cache == nil {
-			continue
-		}
-		st := cache.GetBlock(x, y, z)
-		if IsChestBlock(st) || IsBarrelBlock(st) || IsShulkerBoxItemOrBlock(world.BlockName(st)) {
-			s.updateDispenserComparatorsAndBroadcast(dim, x, y, z)
-			if px, py, pz, _, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
-				s.updateDispenserComparatorsAndBroadcast(dim, px, py, pz)
-			}
-		}
-	}
-	return true
+	return s.SetChestSlotInDim(s.resolveLegacyStorageDim(x, y, z), x, y, z, slot, stack)
 }
 
 // EnderChestSlots returns a copy of the player's personal 27-slot ender chest inventory.
@@ -306,20 +293,7 @@ func (s *Server) DropChestContents(x, y, z int) {
 	if s == nil {
 		return
 	}
-	cs := s.chestState()
-	cs.mu.Lock()
-	key := chestKey{x, y, z}
-	arr := cs.chests[key]
-	delete(cs.chests, key)
-	cs.mu.Unlock()
-	if arr == nil {
-		return
-	}
-	for _, st := range arr {
-		if !st.IsEmpty() {
-			s.SpawnItemEntity(float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, st)
-		}
-	}
+	s.DropChestContentsInDim(s.resolveLegacyStorageDim(x, y, z), x, y, z)
 }
 
 // IsChestBlock reports whether state is a chest block (chest, trapped_chest, or copper_chest).
@@ -369,6 +343,12 @@ func (s *Server) PlaceChestAt(session *PlayerSession, x, y, z int, baseState uin
 			s.broadcastDimensionBlockChanges(dim, cache, pRes.Changes, pRes.LightChanged)
 		}
 	}
+	if invSlot := session.HeldInventorySlot(); invSlot >= 0 {
+		if customName := GetSlotItemMeta(session, invSlot).CustomName; customName != "" {
+			s.SetStorageCustomName(dim, x, y, z, customName)
+		}
+	}
+	s.notifyStorageComparators(dim, x, y, z)
 	return placedState, true
 }
 
@@ -585,6 +565,16 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		}
 		s.RecordContainerOpenStat(session, blockName)
 		cid, err := s.OpenBarrel(session, x, y, z)
+		if err == nil {
+			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
+		}
+		return err == nil, cid, err
+	case IsShulkerBoxItemOrBlock(blockName):
+		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
+			return false, 0, nil
+		}
+		s.RecordContainerOpenStat(session, blockName)
+		cid, err := s.OpenShulkerBox(session, x, y, z)
 		if err == nil {
 			s.EmitPlayerBlockVibration(session, GameEventContainerOpen, session.Dimension(), x, y, z, blockName)
 		}
@@ -873,6 +863,15 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 		}
 	}
 
+	if be, ok := s.StorageBlockEntityAt(dim, firstX, firstY, firstZ); ok && be != nil && !s.CheckStorageUnlocked(session, be.Lock) {
+		return 0, errors.New("server: container is locked")
+	}
+	if hasPartner {
+		if pbe, ok := s.StorageBlockEntityAt(dim, secondX, secondY, secondZ); ok && pbe != nil && !s.CheckStorageUnlocked(session, pbe.Lock) {
+			return 0, errors.New("server: container is locked")
+		}
+	}
+
 	_ = s.CloseContainer(session, 0, false)
 
 	menuType := MenuTypeGeneric9x3
@@ -880,6 +879,13 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	if hasPartner {
 		menuType = MenuTypeGeneric9x6
 		title = "Large Chest"
+		if be1, ok := s.StorageBlockEntityAt(dim, firstX, firstY, firstZ); ok && be1 != nil && be1.CustomName != "" {
+			title = be1.CustomName
+		} else if be2, ok := s.StorageBlockEntityAt(dim, secondX, secondY, secondZ); ok && be2 != nil && be2.CustomName != "" {
+			title = be2.CustomName
+		}
+	} else if be, ok := s.StorageBlockEntityAt(dim, firstX, firstY, firstZ); ok && be != nil && be.CustomName != "" {
+		title = be.CustomName
 	}
 
 	tr := getContainerTracker(session)
@@ -901,6 +907,10 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	carried := tr.carried
 	tr.mu.Unlock()
 
+	_ = s.ChestSlotsInDim(dim, firstX, firstY, firstZ)
+	if hasPartner {
+		_ = s.ChestSlotsInDim(dim, secondX, secondY, secondZ)
+	}
 	s.HydrateChestExplorerMaps(firstX, firstY, firstZ, "buried_treasure")
 	if hasPartner {
 		s.HydrateChestExplorerMaps(secondX, secondY, secondZ, "buried_treasure")
@@ -913,9 +923,9 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 		}
 		var slots []world.ItemStack
 		if hasPartner {
-			slots = s.buildDoubleChestMenuSlots(session, firstX, firstY, firstZ, secondX, secondY, secondZ)
+			slots = s.buildDoubleChestMenuSlotsInDim(session, dim, firstX, firstY, firstZ, secondX, secondY, secondZ)
 		} else {
-			slots = s.buildChestMenuSlots(session, firstX, firstY, firstZ)
+			slots = s.buildChestMenuSlotsInDim(session, dim, firstX, firstY, firstZ)
 		}
 		stateID := session.NextContainerStateID()
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
@@ -936,7 +946,15 @@ func (s *Server) OpenBarrel(session *PlayerSession, x, y, z int) (int32, error) 
 		return 0, errors.New("server: nil session")
 	}
 	dim := world.NormalizeDimension(session.Dimension())
+	if be, ok := s.StorageBlockEntityAt(dim, x, y, z); ok && be != nil && !s.CheckStorageUnlocked(session, be.Lock) {
+		return 0, errors.New("server: container is locked")
+	}
 	_ = s.CloseContainer(session, 0, false)
+
+	title := "Barrel"
+	if be, ok := s.StorageBlockEntityAt(dim, x, y, z); ok && be != nil && be.CustomName != "" {
+		title = be.CustomName
+	}
 
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
@@ -954,13 +972,14 @@ func (s *Server) OpenBarrel(session *PlayerSession, x, y, z int) (int32, error) 
 	carried := tr.carried
 	tr.mu.Unlock()
 
+	_ = s.ChestSlotsInDim(dim, x, y, z)
 	s.updateContainerViewerState(dim, x, y, z)
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, "Barrel")); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, title)); err != nil {
 			return cid, err
 		}
-		slots := s.buildChestMenuSlots(session, x, y, z)
+		slots := s.buildChestMenuSlotsInDim(session, dim, x, y, z)
 		stateID := session.NextContainerStateID()
 		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
 			return cid, err
@@ -1048,7 +1067,15 @@ func (s *Server) OpenCraftingTable(session *PlayerSession, x, y, z int) (int32, 
 }
 
 func (s *Server) buildChestMenuSlots(session *PlayerSession, x, y, z int) []world.ItemStack {
-	chest := s.ChestSlots(x, y, z)
+	dim := world.DimensionOverworld
+	if session != nil && session.Dimension() != "" {
+		dim = session.Dimension()
+	}
+	return s.buildChestMenuSlotsInDim(session, dim, x, y, z)
+}
+
+func (s *Server) buildChestMenuSlotsInDim(session *PlayerSession, dim string, x, y, z int) []world.ItemStack {
+	chest := s.ChestSlotsInDim(dim, x, y, z)
 	inv := session.Inventory()
 	slots := make([]world.ItemStack, ChestMenuSlotCount)
 	copy(slots[0:27], chest[:])
@@ -1058,8 +1085,16 @@ func (s *Server) buildChestMenuSlots(session *PlayerSession, x, y, z int) []worl
 }
 
 func (s *Server) buildDoubleChestMenuSlots(session *PlayerSession, x1, y1, z1, x2, y2, z2 int) []world.ItemStack {
-	first := s.ChestSlots(x1, y1, z1)
-	second := s.ChestSlots(x2, y2, z2)
+	dim := world.DimensionOverworld
+	if session != nil && session.Dimension() != "" {
+		dim = session.Dimension()
+	}
+	return s.buildDoubleChestMenuSlotsInDim(session, dim, x1, y1, z1, x2, y2, z2)
+}
+
+func (s *Server) buildDoubleChestMenuSlotsInDim(session *PlayerSession, dim string, x1, y1, z1, x2, y2, z2 int) []world.ItemStack {
+	first := s.ChestSlotsInDim(dim, x1, y1, z1)
+	second := s.ChestSlotsInDim(dim, x2, y2, z2)
 	inv := session.Inventory()
 	slots := make([]world.ItemStack, DoubleChestMenuSlotCount)
 	copy(slots[0:27], first[:])
@@ -1118,7 +1153,7 @@ func (s *Server) ContainerViewerCountAt(dim string, x, y, z int) int {
 		if openDim != normDim {
 			continue
 		}
-		if open.MenuType != MenuTypeGeneric9x3 && open.MenuType != MenuTypeGeneric9x6 {
+		if open.MenuType != MenuTypeGeneric9x3 && open.MenuType != MenuTypeGeneric9x6 && open.MenuType != MenuTypeShulkerBox {
 			continue
 		}
 		matchesThis := open.BlockX == x && open.BlockY == y && open.BlockZ == z
@@ -1154,7 +1189,7 @@ func (s *Server) updateContainerViewerState(dim string, x, y, z int) {
 				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 			}
 		}
-	case IsChestBlock(state) || name == "minecraft:ender_chest":
+	case IsChestBlock(state) || name == "minecraft:ender_chest" || IsShulkerBoxItemOrBlock(name):
 		actionParam := byte(0)
 		if openCount > 255 {
 			actionParam = 255
@@ -1209,26 +1244,30 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	}
 	s.CloseLecternIfOpen(session)
 	type returnEntry struct {
-		stack  world.ItemStack
-		meta   ItemMeta
-		potion string
-		trim   ArmorTrim
+		stack   world.ItemStack
+		meta    ItemMeta
+		potion  string
+		trim    ArmorTrim
+		shulker *ShulkerBoxItemData
 	}
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
 	var returnItems []returnEntry
 	if !tr.carried.IsEmpty() {
 		carriedTrim, _ := GetCarriedArmorTrim(session)
+		carriedShulker, _ := GetCarriedShulkerBoxData(session)
 		returnItems = append(returnItems, returnEntry{
-			stack:  tr.carried,
-			meta:   GetCarriedItemMeta(session),
-			potion: GetCarriedPotionType(session),
-			trim:   carriedTrim,
+			stack:   tr.carried,
+			meta:    GetCarriedItemMeta(session),
+			potion:  GetCarriedPotionType(session),
+			trim:    carriedTrim,
+			shulker: carriedShulker,
 		})
 		tr.carried = world.ItemStack{}
 		SetCarriedItemMeta(session, ItemMeta{})
 		SetCarriedPotionType(session, "")
 		SetCarriedArmorTrim(session, ArmorTrim{})
+		SetCarriedShulkerBoxData(session, nil)
 	}
 	closedID := containerID
 	hadOpen := false
@@ -1323,7 +1362,7 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	snap := session.Snapshot()
 	for _, entry := range returnItems {
 		st := entry.stack
-		if entry.potion == "" && (!entry.meta.IsEmpty() || entry.trim.IsValid()) {
+		if entry.shulker == nil && entry.potion == "" && (!entry.meta.IsEmpty() || entry.trim.IsValid()) {
 			rem := returnStackWithMetaAndTrimToInventory(session, st, entry.meta, entry.trim)
 			if rem > 0 {
 				s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
@@ -1340,8 +1379,14 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		if entry.trim.IsValid() && len(changedSlots) > 0 {
 			SetSlotArmorTrim(session, changedSlots[0], entry.trim)
 		}
+		if entry.shulker != nil && len(changedSlots) > 0 {
+			SetSlotShulkerBoxData(session, changedSlots[0], entry.shulker)
+		}
 		if rem := st.Count - added; rem > 0 {
-			s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
+			entID, _ := s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
+			if entID > 0 && entry.shulker != nil && IsShulkerBoxItemOrBlock(st.ResolvedID()) {
+				s.AssociateDroppedShulkerBoxEntity(entID, entry.shulker)
+			}
 		}
 	}
 
@@ -1413,6 +1458,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 			carriedHorn := GetCarriedGoatHornInstrument(session)
 			carriedBundle := GetCarriedBundleContents(session)
 			carriedPotion := GetCarriedPotionType(session)
+			carriedShulker, hasCarriedShulker := GetCarriedShulkerBoxData(session)
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
@@ -1424,6 +1470,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 				SetCarriedWrittenBook(session, WrittenBookContent{}, false)
 				SetCarriedGoatHornInstrument(session, "")
 				SetCarriedBundleContents(session, nil)
+				SetCarriedShulkerBoxData(session, nil)
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
@@ -1442,6 +1489,9 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 				}
 				if carriedPotion != "" && IsPotionOrTippedArrowItem(dropStack) {
 					s.AssociateDroppedPotionEntity(entID, carriedPotion)
+				}
+				if hasCarriedShulker && IsShulkerBoxItemOrBlock(dropStack.ResolvedID()) {
+					s.AssociateDroppedShulkerBoxEntity(entID, carriedShulker)
 				}
 			}
 			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
@@ -1465,7 +1515,7 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 	}
 
 	switch tr.open.MenuType {
-	case MenuTypeGeneric9x3:
+	case MenuTypeGeneric9x3, MenuTypeShulkerBox:
 		if tr.open.VehicleEntityID != 0 {
 			vehID := tr.open.VehicleEntityID
 			s.applyVehicleChestClickLocked(session, tr, vehID, slot, button, mode)
@@ -1675,8 +1725,20 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 	if slot < 0 || slot >= ChestMenuSlotCount {
 		return
 	}
-	s.HydrateChestExplorerMaps(bx, by, bz, "buried_treasure")
-	slots := s.buildChestMenuSlots(session, bx, by, bz)
+	openDim := world.DimensionOverworld
+	isShulker := false
+	if tr.open != nil {
+		if tr.open.Dimension != "" {
+			openDim = tr.open.Dimension
+		}
+		isShulker = tr.open.MenuType == MenuTypeShulkerBox
+	} else if session != nil && session.Dimension() != "" {
+		openDim = session.Dimension()
+	}
+	if !isShulker {
+		s.HydrateChestExplorerMaps(bx, by, bz, "buried_treasure")
+	}
+	slots := s.buildChestMenuSlotsInDim(session, openDim, bx, by, bz)
 
 	var slotMapIDs [ChestMenuSlotCount]int32
 	var hasSlotMaps [ChestMenuSlotCount]bool
@@ -1699,6 +1761,10 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 
 	switch mode {
 	case ContainerInputPickup:
+		// ShulkerBoxSlot.mayPlace: prevent placing a shulker box inside a shulker box.
+		if isShulker && slot < ChestSlotCount && !tr.carried.IsEmpty() && IsShulkerBoxItemOrBlock(tr.carried.ResolvedID()) {
+			break
+		}
 		prevSlotEmpty := slots[slot].IsEmpty()
 		prevCarriedEmpty := tr.carried.IsEmpty()
 		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
@@ -1743,18 +1809,24 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 			// Chest -> Player inventory (prefer hotbar 54..62, then main 27..53)
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 63)
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 27, 54)
-		} else {
+		} else if !isShulker || !IsShulkerBoxItemOrBlock(slots[slot].ResolvedID()) {
 			// Player inventory -> Chest (0..26)
 			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, ChestSlotCount)
 		}
 	case ContainerInputSwap:
 		if button >= 0 && button < 9 {
 			hotbarIdx := 54 + int(button)
+			if isShulker && slot < ChestSlotCount && !slots[hotbarIdx].IsEmpty() && IsShulkerBoxItemOrBlock(slots[hotbarIdx].ResolvedID()) {
+				break
+			}
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
 			slotMapIDs[slot], slotMapIDs[hotbarIdx] = slotMapIDs[hotbarIdx], slotMapIDs[slot]
 			hasSlotMaps[slot], hasSlotMaps[hotbarIdx] = hasSlotMaps[hotbarIdx], hasSlotMaps[slot]
 		} else if button == 40 {
 			offStack := session.InventorySlot(OffHandContainerSlot)
+			if isShulker && slot < ChestSlotCount && !offStack.IsEmpty() && IsShulkerBoxItemOrBlock(offStack.ResolvedID()) {
+				break
+			}
 			offMapID, hasOffMap := GetSlotMapID(session, OffHandContainerSlot)
 			slots[slot], offStack = offStack, slots[slot]
 			slotMapIDs[slot], offMapID = offMapID, slotMapIDs[slot]
@@ -1768,7 +1840,11 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 		}
 	case ContainerInputClone:
 		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+			maxStack := int32(MaxItemStackSize)
+			if IsShulkerBoxItemOrBlock(slots[slot].ResolvedID()) {
+				maxStack = 1
+			}
+			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxStack)
 			if slots[slot].ResolvedID() == FilledMapItemID && hasSlotMaps[slot] {
 				carriedMapID, hasCarriedMap = slotMapIDs[slot], true
 			}
@@ -1801,7 +1877,7 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 
 	// Write back chest slots (0..26) and player inventory slots (27..62) along with mapID metadata.
 	for i := 0; i < ChestSlotCount; i++ {
-		s.SetChestSlot(bx, by, bz, i, slots[i])
+		s.SetChestSlotInDim(openDim, bx, by, bz, i, slots[i])
 		if !slots[i].IsEmpty() && slots[i].ResolvedID() == FilledMapItemID && hasSlotMaps[i] {
 			s.SetChestSlotMapID(bx, by, bz, i, slotMapIDs[i])
 		} else {
@@ -2998,17 +3074,18 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	isLoom := false
 	isCrafter := false
 	switch openCopy.MenuType {
-	case MenuTypeGeneric9x3:
+	case MenuTypeGeneric9x3, MenuTypeShulkerBox:
 		if openCopy.VehicleEntityID != 0 {
 			slots = s.buildVehicleChestMenuSlots(session, openCopy.VehicleEntityID)
 		} else if openCopy.IsEnderChest {
 			slots = s.buildEnderChestMenuSlots(session)
 		} else {
-			slots = s.buildChestMenuSlots(session, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
+			slots = s.buildChestMenuSlotsInDim(session, openCopy.Dimension, openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ)
 		}
 	case MenuTypeGeneric9x6:
-		slots = s.buildDoubleChestMenuSlots(
+		slots = s.buildDoubleChestMenuSlotsInDim(
 			session,
+			openCopy.Dimension,
 			openCopy.BlockX, openCopy.BlockY, openCopy.BlockZ,
 			openCopy.PartnerX, openCopy.PartnerY, openCopy.PartnerZ,
 		)
@@ -3273,7 +3350,7 @@ func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {
 	for _, sess := range sessions {
 		open := sess.OpenContainer()
 		if open != nil && !open.IsEnderChest &&
-			(open.MenuType == MenuTypeGeneric9x3 || open.MenuType == MenuTypeGeneric9x6) &&
+			(open.MenuType == MenuTypeGeneric9x3 || open.MenuType == MenuTypeGeneric9x6 || open.MenuType == MenuTypeShulkerBox) &&
 			((open.BlockX == bx && open.BlockY == by && open.BlockZ == bz) ||
 				(open.HasPartner && open.PartnerX == bx && open.PartnerY == by && open.PartnerZ == bz)) {
 			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
@@ -3298,7 +3375,13 @@ func (s *Server) applyDoubleChestClickLocked(
 	if slot < 0 || slot >= DoubleChestMenuSlotCount {
 		return
 	}
-	slots := s.buildDoubleChestMenuSlots(session, x1, y1, z1, x2, y2, z2)
+	openDim := world.DimensionOverworld
+	if tr.open != nil && tr.open.Dimension != "" {
+		openDim = tr.open.Dimension
+	} else if session != nil && session.Dimension() != "" {
+		openDim = session.Dimension()
+	}
+	slots := s.buildDoubleChestMenuSlotsInDim(session, openDim, x1, y1, z1, x2, y2, z2)
 	switch mode {
 	case ContainerInputPickup:
 		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
@@ -3343,8 +3426,8 @@ func (s *Server) applyDoubleChestClickLocked(
 		applyPickupAllSlice(slots, &tr.carried, 0)
 	}
 	for i := 0; i < ChestSlotCount; i++ {
-		s.SetChestSlot(x1, y1, z1, i, slots[i])
-		s.SetChestSlot(x2, y2, z2, i, slots[ChestSlotCount+i])
+		s.SetChestSlotInDim(openDim, x1, y1, z1, i, slots[i])
+		s.SetChestSlotInDim(openDim, x2, y2, z2, i, slots[ChestSlotCount+i])
 	}
 	for i := 0; i < 27; i++ {
 		session.SetInventorySlot(9+i, slots[54+i])
@@ -5123,6 +5206,14 @@ func isQuickCraftResultOrInvalidSlot(session *PlayerSession, tr *playerContainer
 	switch tr.open.MenuType {
 	case MenuTypeGeneric9x3:
 		return slot >= ChestMenuSlotCount
+	case MenuTypeShulkerBox:
+		if slot >= ChestMenuSlotCount {
+			return true
+		}
+		if slot < ChestSlotCount && IsShulkerBoxItemOrBlock(carried.ResolvedID()) {
+			return true
+		}
+		return false
 	case MenuTypeGeneric9x6:
 		return slot >= DoubleChestMenuSlotCount
 	case MenuTypeHopper:
@@ -5329,7 +5420,7 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 		return
 	}
 	switch tr.open.MenuType {
-	case MenuTypeGeneric9x3:
+	case MenuTypeGeneric9x3, MenuTypeShulkerBox:
 		if tr.open.VehicleEntityID != 0 {
 			vehID := tr.open.VehicleEntityID
 			slots := s.buildVehicleChestMenuSlots(session, vehID)
@@ -5360,10 +5451,14 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 			return
 		}
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
-		slots := s.buildChestMenuSlots(session, bx, by, bz)
+		openDim := tr.open.Dimension
+		if openDim == "" && session != nil {
+			openDim = session.Dimension()
+		}
+		slots := s.buildChestMenuSlotsInDim(session, openDim, bx, by, bz)
 		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
 		for i := 0; i < ChestSlotCount; i++ {
-			s.SetChestSlot(bx, by, bz, i, slots[i])
+			s.SetChestSlotInDim(openDim, bx, by, bz, i, slots[i])
 		}
 		for i := 0; i < 27; i++ {
 			session.SetInventorySlot(9+i, slots[27+i])
@@ -5374,11 +5469,15 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 	case MenuTypeGeneric9x6:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		px, py, pz := tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
-		slots := s.buildDoubleChestMenuSlots(session, bx, by, bz, px, py, pz)
+		openDim := tr.open.Dimension
+		if openDim == "" && session != nil {
+			openDim = session.Dimension()
+		}
+		slots := s.buildDoubleChestMenuSlotsInDim(session, openDim, bx, by, bz, px, py, pz)
 		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
 		for i := 0; i < ChestSlotCount; i++ {
-			s.SetChestSlot(bx, by, bz, i, slots[i])
-			s.SetChestSlot(px, py, pz, i, slots[ChestSlotCount+i])
+			s.SetChestSlotInDim(openDim, bx, by, bz, i, slots[i])
+			s.SetChestSlotInDim(openDim, px, py, pz, i, slots[ChestSlotCount+i])
 		}
 		for i := 0; i < 27; i++ {
 			session.SetInventorySlot(9+i, slots[54+i])

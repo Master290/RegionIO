@@ -148,7 +148,7 @@ func (s *Server) tryDropperTransferIntoContainer(
 		return s.HopperInsertIntoDispenser(dim, fx, fy, fz, single, meta, potionType)
 
 	case IsChestBlock(frontState) || frontName == "minecraft:trapped_chest" || frontName == "minecraft:barrel":
-		return s.transferIntoChestAt(fx, fy, fz, single)
+		return s.transferIntoChestAtInDim(dim, fx, fy, fz, single)
 
 	case IsShulkerBoxItemOrBlock(frontName):
 		// Vanilla ShulkerBoxBlockEntity.canPlaceItemThroughFace: shulker boxes cannot be nested inside shulker boxes!
@@ -190,10 +190,14 @@ func (s *Server) tryDropperTransferIntoContainer(
 }
 
 func (s *Server) transferIntoChestAt(x, y, z int, single world.ItemStack) bool {
+	return s.transferIntoChestAtInDim(s.resolveLegacyStorageDim(x, y, z), x, y, z, single)
+}
+
+func (s *Server) transferIntoChestAtInDim(dim string, x, y, z int, single world.ItemStack) bool {
 	if s == nil || single.IsEmpty() {
 		return false
 	}
-	slots := s.ChestSlots(x, y, z)
+	slots := s.ChestSlotsInDim(dim, x, y, z)
 	maxStack := DispenserItemMaxStackSize(single)
 	itemID := single.ResolvedItemID()
 
@@ -201,7 +205,7 @@ func (s *Server) transferIntoChestAt(x, y, z int, single world.ItemStack) bool {
 		for i := 0; i < ChestSlotCount; i++ {
 			cur := slots[i]
 			if !cur.IsEmpty() && cur.ResolvedItemID() == itemID && cur.Count < maxStack {
-				s.SetChestSlot(x, y, z, i, world.NewItemStack(itemID, cur.Count+1))
+				s.SetChestSlotInDim(dim, x, y, z, i, world.NewItemStack(itemID, cur.Count+1))
 				_ = s.syncChestViewers(nil, x, y, z)
 				return true
 			}
@@ -209,7 +213,7 @@ func (s *Server) transferIntoChestAt(x, y, z int, single world.ItemStack) bool {
 	}
 	for i := 0; i < ChestSlotCount; i++ {
 		if slots[i].IsEmpty() {
-			s.SetChestSlot(x, y, z, i, single)
+			s.SetChestSlotInDim(dim, x, y, z, i, single)
 			_ = s.syncChestViewers(nil, x, y, z)
 			return true
 		}

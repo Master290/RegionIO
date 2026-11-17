@@ -1406,6 +1406,7 @@ func doubleChestPartnerPos(cache *world.Cache, x, y, z int, state uint16) (px, p
 }
 
 func (s *Server) hopperInsertIntoChestOrBarrel(dim string, cache *world.Cache, x, y, z int, state uint16, single world.ItemStack) bool {
+	normDim := normalizeHopperDim(dim)
 	if pX, pY, pZ, thisFirst, isDouble := doubleChestPartnerPos(cache, x, y, z, state); isDouble {
 		type chestCoord struct{ x, y, z int }
 		halves := [2]chestCoord{{x, y, z}, {pX, pY, pZ}}
@@ -1416,12 +1417,12 @@ func (s *Server) hopperInsertIntoChestOrBarrel(dim string, cache *world.Cache, x
 		itemID := single.ResolvedItemID()
 		if maxStack > 1 {
 			for _, h := range halves {
-				slots := s.ChestSlots(h.x, h.y, h.z)
+				slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
 				for i := 0; i < ChestSlotCount; i++ {
 					cur := slots[i]
 					if !cur.IsEmpty() && cur.ResolvedItemID() == itemID && cur.Count < maxStack {
-						s.SetChestSlot(h.x, h.y, h.z, i, world.NewItemStack(itemID, cur.Count+1))
-						s.updateHopperComparatorsAndBroadcast(dim, h.x, h.y, h.z)
+						s.SetChestSlotInDim(normDim, h.x, h.y, h.z, i, world.NewItemStack(itemID, cur.Count+1))
+						s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
 						_ = s.syncChestViewers(nil, h.x, h.y, h.z)
 						return true
 					}
@@ -1429,11 +1430,11 @@ func (s *Server) hopperInsertIntoChestOrBarrel(dim string, cache *world.Cache, x
 			}
 		}
 		for _, h := range halves {
-			slots := s.ChestSlots(h.x, h.y, h.z)
+			slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
 			for i := 0; i < ChestSlotCount; i++ {
 				if slots[i].IsEmpty() {
-					s.SetChestSlot(h.x, h.y, h.z, i, single)
-					s.updateHopperComparatorsAndBroadcast(dim, h.x, h.y, h.z)
+					s.SetChestSlotInDim(normDim, h.x, h.y, h.z, i, single)
+					s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
 					_ = s.syncChestViewers(nil, h.x, h.y, h.z)
 					return true
 				}
@@ -1442,14 +1443,15 @@ func (s *Server) hopperInsertIntoChestOrBarrel(dim string, cache *world.Cache, x
 		return false
 	}
 
-	if s.transferIntoChestAt(x, y, z, single) {
-		s.updateHopperComparatorsAndBroadcast(dim, x, y, z)
+	if s.transferIntoChestAtInDim(normDim, x, y, z, single) {
+		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 		return true
 	}
 	return false
 }
 
 func (s *Server) hopperExtractFromChestOrBarrel(dim string, cache *world.Cache, x, y, z int, state uint16, canAccept func(world.ItemStack, ItemMeta, string) bool) (world.ItemStack, bool) {
+	normDim := normalizeHopperDim(dim)
 	if pX, pY, pZ, thisFirst, isDouble := doubleChestPartnerPos(cache, x, y, z, state); isDouble {
 		type chestCoord struct{ x, y, z int }
 		halves := [2]chestCoord{{x, y, z}, {pX, pY, pZ}}
@@ -1457,7 +1459,7 @@ func (s *Server) hopperExtractFromChestOrBarrel(dim string, cache *world.Cache, 
 			halves = [2]chestCoord{{pX, pY, pZ}, {x, y, z}}
 		}
 		for _, h := range halves {
-			slots := s.ChestSlots(h.x, h.y, h.z)
+			slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
 			for i := 0; i < ChestSlotCount; i++ {
 				cur := slots[i]
 				if cur.IsEmpty() || cur.Count <= 0 {
@@ -1468,11 +1470,11 @@ func (s *Server) hopperExtractFromChestOrBarrel(dim string, cache *world.Cache, 
 					continue
 				}
 				if cur.Count <= 1 {
-					s.SetChestSlot(h.x, h.y, h.z, i, world.ItemStack{})
+					s.SetChestSlotInDim(normDim, h.x, h.y, h.z, i, world.ItemStack{})
 				} else {
-					s.SetChestSlot(h.x, h.y, h.z, i, world.NewItemStack(cur.ResolvedItemID(), cur.Count-1))
+					s.SetChestSlotInDim(normDim, h.x, h.y, h.z, i, world.NewItemStack(cur.ResolvedItemID(), cur.Count-1))
 				}
-				s.updateHopperComparatorsAndBroadcast(dim, h.x, h.y, h.z)
+				s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
 				_ = s.syncChestViewers(nil, h.x, h.y, h.z)
 				return single, true
 			}
@@ -1480,7 +1482,7 @@ func (s *Server) hopperExtractFromChestOrBarrel(dim string, cache *world.Cache, 
 		return world.ItemStack{}, false
 	}
 
-	slots := s.ChestSlots(x, y, z)
+	slots := s.ChestSlotsInDim(normDim, x, y, z)
 	for i := 0; i < ChestSlotCount; i++ {
 		cur := slots[i]
 		if cur.IsEmpty() || cur.Count <= 0 {
@@ -1491,11 +1493,11 @@ func (s *Server) hopperExtractFromChestOrBarrel(dim string, cache *world.Cache, 
 			continue
 		}
 		if cur.Count <= 1 {
-			s.SetChestSlot(x, y, z, i, world.ItemStack{})
+			s.SetChestSlotInDim(normDim, x, y, z, i, world.ItemStack{})
 		} else {
-			s.SetChestSlot(x, y, z, i, world.NewItemStack(cur.ResolvedItemID(), cur.Count-1))
+			s.SetChestSlotInDim(normDim, x, y, z, i, world.NewItemStack(cur.ResolvedItemID(), cur.Count-1))
 		}
-		s.updateHopperComparatorsAndBroadcast(dim, x, y, z)
+		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 		_ = s.syncChestViewers(nil, x, y, z)
 		return single, true
 	}

@@ -1175,3 +1175,57 @@ func (s *Store) saveSidecarFurnacesLocked(all []FurnaceBlockEntity) error {
 	}
 	return os.Rename(tmpName, s.furnaceSidecarPath())
 }
+
+// LoadedChunkCoords returns a snapshot of all currently loaded chunk coordinates
+// in c.
+func (c *Cache) LoadedChunkCoords() [][2]int32 {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.chunks) == 0 {
+		return nil
+	}
+	out := make([][2]int32, 0, len(c.chunks))
+	for k := range c.chunks {
+		out = append(out, k)
+	}
+	return out
+}
+
+// LoadedChunkMatchingBlocks scans only non-empty sections of an already-loaded
+// chunk (cx, cz) under a single read lock and returns [4]int{worldX, worldY, worldZ, int(state)}
+// for every non-air block satisfying match.
+func (c *Cache) LoadedChunkMatchingBlocks(cx, cz int32, match func(state uint16) bool) [][4]int {
+	if c == nil || match == nil {
+		return nil
+	}
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch == nil {
+		return nil
+	}
+	baseX, baseZ := int(cx)<<4, int(cz)<<4
+	var out [][4]int
+	ch.mu.RLock()
+	for si, sec := range ch.sections {
+		if sec == nil {
+			continue
+		}
+		secBaseY := MinY + si*16
+		for idx, st := range sec {
+			if st == StateAir || !match(st) {
+				continue
+			}
+			lx := idx & 15
+			lz := (idx >> 4) & 15
+			ly := (idx >> 8) & 15
+			out = append(out, [4]int{baseX + lx, secBaseY + ly, baseZ + lz, int(st)})
+		}
+	}
+	ch.mu.RUnlock()
+	return out
+}
+

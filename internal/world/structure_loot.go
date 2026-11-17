@@ -896,10 +896,13 @@ func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 			Set("id", nbt.String(be.ID)).
 			Set("x", nbt.Int(be.X)).
 			Set("y", nbt.Int(be.Y)).
-			Set("z", nbt.Int(be.Z))
+			Set("z", nbt.Int(be.Z)).
+			Set("keepPacked", nbt.Byte(0))
 		if be.LootTable != "" {
 			comp.Set("LootTable", nbt.String(be.LootTable))
-			comp.Set("LootTableSeed", nbt.Long(be.LootTableSeed))
+			if be.LootTableSeed != 0 {
+				comp.Set("LootTableSeed", nbt.Long(be.LootTableSeed))
+			}
 		}
 		if be.SpawnerEntityID != "" {
 			comp.Set("SpawnData", nbt.NewCompound().Set("entity", nbt.NewCompound().Set("id", nbt.String(be.SpawnerEntityID))))
@@ -920,7 +923,7 @@ func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 			}
 			comp.Set("sherds", sherds)
 		}
-		if len(be.Items) > 0 {
+		if be.LootTable == "" && len(be.Items) > 0 {
 			items := nbt.List{ElemID: nbt.TagCompound}
 			for _, it := range be.Items {
 				ic := nbt.NewCompound().
@@ -928,14 +931,21 @@ func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 					Set("id", nbt.String(it.ItemID)).
 					Set("count", nbt.Int(it.Count))
 				if it.PotionID != "" {
-					ic.Set("Potion", nbt.String(it.PotionID))
+					ic.Set("components", nbt.NewCompound().Set(
+						"minecraft:potion_contents",
+						nbt.NewCompound().Set("potion", nbt.String(normalizeResourceID(it.PotionID))),
+					))
 				}
 				items.Elems = append(items.Elems, ic)
 			}
 			comp.Set("Items", items)
 		}
-		if len(be.Bees) > 0 {
-			bees := nbt.List{ElemID: nbt.TagCompound}
+		if be.ID == "minecraft:beehive" || len(be.Bees) > 0 {
+			elemID := byte(nbt.TagEnd)
+			if len(be.Bees) > 0 {
+				elemID = nbt.TagCompound
+			}
+			bees := nbt.List{ElemID: elemID}
 			for _, b := range be.Bees {
 				entID := b.EntityID
 				if entID == "" {

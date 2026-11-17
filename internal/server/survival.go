@@ -420,6 +420,10 @@ func (session *PlayerSession) AddItemToInventory(stack world.ItemStack) (added i
 		return 0, nil
 	}
 	remaining := stack.Count
+	maxStack := int32(MaxItemStackSize)
+	if IsShulkerBoxItemOrBlock(stack.ResolvedID()) {
+		maxStack = 1
+	}
 
 	session.mu.Lock()
 	defer session.mu.Unlock()
@@ -428,10 +432,10 @@ func (session *PlayerSession) AddItemToInventory(stack world.ItemStack) (added i
 	mergeSlotRange := func(start, end int) {
 		for slot := start; slot < end && remaining > 0; slot++ {
 			cur := session.inventory[slot]
-			if cur.IsEmpty() || cur.ResolvedItemID() != itemID || cur.Count >= MaxItemStackSize {
+			if cur.IsEmpty() || cur.ResolvedItemID() != itemID || cur.Count >= maxStack {
 				continue
 			}
-			space := MaxItemStackSize - cur.Count
+			space := maxStack - cur.Count
 			take := remaining
 			if take > space {
 				take = space
@@ -443,8 +447,10 @@ func (session *PlayerSession) AddItemToInventory(stack world.ItemStack) (added i
 			changedSlots = append(changedSlots, slot)
 		}
 	}
-	mergeSlotRange(world.HotbarContainerOffset, world.HotbarContainerOffset+world.HotbarSlotCount)
-	mergeSlotRange(9, world.HotbarContainerOffset)
+	if maxStack > 1 {
+		mergeSlotRange(world.HotbarContainerOffset, world.HotbarContainerOffset+world.HotbarSlotCount)
+		mergeSlotRange(9, world.HotbarContainerOffset)
+	}
 
 	// 2. Fill empty slots: hotbar first, then main inventory.
 	fillEmptyRange := func(start, end int) {
@@ -453,8 +459,8 @@ func (session *PlayerSession) AddItemToInventory(stack world.ItemStack) (added i
 				continue
 			}
 			take := remaining
-			if take > MaxItemStackSize {
-				take = MaxItemStackSize
+			if take > maxStack {
+				take = maxStack
 			}
 			session.inventory[slot] = world.NewItemStack(itemID, take)
 			remaining -= take
@@ -773,8 +779,8 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsBedBlock(prevState) {
 		s.BreakBedPartner(dim, cache, x, y, z, prevState)
 	}
-	if IsChestBlock(prevState) || world.IsCopperChestBlock(prevState) {
-		s.DropChestContents(x, y, z)
+	if IsChestBlock(prevState) || world.IsCopperChestBlock(prevState) || IsBarrelBlock(prevState) {
+		s.DropChestContentsInDim(dim, x, y, z)
 	}
 	if IsDispenserOrDropperBlock(prevState) {
 		s.BreakDispenserOrDropper(dim, x, y, z)
@@ -800,8 +806,10 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			}
 		}
 	}
-	if IsShulkerBoxItemOrBlock(world.BlockName(prevState)) {
-		s.BreakShulkerBox(dim, x, y, z)
+	isShulkerBox := IsShulkerBoxItemOrBlock(world.BlockName(prevState))
+	var shulkerDropData *ShulkerBoxItemData
+	if isShulkerBox {
+		shulkerDropData = s.TakeShulkerBoxDropData(dim, x, y, z)
 	}
 	if IsFurnaceBlock(prevState) {
 		s.DropFurnaceContents(x, y, z)
@@ -865,6 +873,23 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		if !s.DoTileDrops() {
 			return true, 0
 		}
+		if isShulkerBox {
+			shDrop := world.NewNamedItemStack(world.BlockName(prevState), 1)
+			if !shDrop.IsEmpty() {
+				dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, shDrop)
+				if dropID > 0 && shulkerDropData != nil && !shulkerDropData.IsEmpty() {
+					s.AssociateDroppedShulkerBoxEntity(dropID, shulkerDropData)
+					if shulkerDropData.CustomName != "" {
+						ft := s.fishingTracker()
+						ft.mu.Lock()
+						ft.droppedMeta[dropID] = ItemMeta{CustomName: shulkerDropData.CustomName}
+						ft.mu.Unlock()
+					}
+				}
+				return true, dropID
+			}
+			return true, 0
+		}
 		if IsCampfireBlock(prevState) {
 			return true, 0
 		}
@@ -911,6 +936,23 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		}
 		if drop, ok := ApplyBlockDropEnchantments(prevState, toolMeta, nil); ok {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
+			return true, dropID
+		}
+	} else if mode == GameModeCreative && isShulkerBox && shulkerDropData != nil && (shulkerDropData.HasAnyItems() || shulkerDropData.LootTable != "") {
+		// Vanilla ShulkerBoxBlock.playerWillDestroy: breaking a non-empty (or loot-seeded)
+		// shulker box in Creative mode still drops the filled shulker box item entity.
+		shDrop := world.NewNamedItemStack(world.BlockName(prevState), 1)
+		if !shDrop.IsEmpty() {
+			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, shDrop)
+			if dropID > 0 {
+				s.AssociateDroppedShulkerBoxEntity(dropID, shulkerDropData)
+				if shulkerDropData.CustomName != "" {
+					ft := s.fishingTracker()
+					ft.mu.Lock()
+					ft.droppedMeta[dropID] = ItemMeta{CustomName: shulkerDropData.CustomName}
+					ft.mu.Unlock()
+				}
+			}
 			return true, dropID
 		}
 	}
@@ -1374,6 +1416,10 @@ func (s *Server) ConsumeHeldItem(session *PlayerSession, count int32) (slot int,
 	stateID := session.containerStateID
 	send := session.send
 	session.mu.Unlock()
+	if updated.IsEmpty() {
+		ClearSlotShulkerBoxData(session, slot)
+		SetSlotItemMeta(session, slot, ItemMeta{})
+	}
 
 	if send != nil {
 		_ = send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, updated))
@@ -1458,6 +1504,19 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 			hasBundleContents = true
 			for _, slot := range changedSlots {
 				SetSlotBundleContents(session, slot, bundleItems)
+			}
+		}
+		if shData, ok := s.DroppedShulkerBoxItemData(live.ID); ok && IsShulkerBoxItemOrBlock(live.Item.ResolvedID()) {
+			for _, slot := range changedSlots {
+				SetSlotShulkerBoxData(session, slot, shData)
+				if shData.CustomName != "" {
+					meta := GetSlotItemMeta(session, slot)
+					meta.CustomName = shData.CustomName
+					SetSlotItemMeta(session, slot, meta)
+				}
+			}
+			if added >= live.Item.Count {
+				s.TakeDroppedShulkerBoxItemData(live.ID)
 			}
 		}
 		totalPickedUp += added
@@ -2484,6 +2543,11 @@ func (s *Server) ResolvePlacedBlockState(session *PlayerSession, baseState uint1
 			return st
 		}
 	default:
+		if IsShulkerBoxItemOrBlock(world.BlockName(baseState)) {
+			if st, ok := world.WithBlockProperty(baseState, "facing", faceName); ok {
+				return st
+			}
+		}
 		if world.IsFenceGateBlock(baseState) {
 			if st, ok := world.WithBlockProperty(baseState, "facing", horizLookDir); ok {
 				return st
@@ -2549,16 +2613,7 @@ func (s *Server) BreakShulkerBox(dim string, x, y, z int) {
 	if s == nil {
 		return
 	}
-	normDim := normalizeDispenserDim(dim)
-	ds := s.dispenserState()
-	ds.mu.Lock()
-	delete(ds.shulkerBoxes, dispenserBlockKey{dim: normDim, x: x, y: y, z: z})
-	ds.mu.Unlock()
-	cs := s.chestState()
-	cs.mu.Lock()
-	delete(cs.chests, chestKey{x, y, z})
-	cs.mu.Unlock()
-	s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
+	_ = s.TakeShulkerBoxDropData(dim, x, y, z)
 }
 
 func (s *Server) refreshRemovedItemFrameComparators(st ItemFrameState) {
@@ -4812,6 +4867,7 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 	slotBundle := GetSlotBundleContents(session, invSlot)
 	slotMeta := GetSlotItemMeta(session, invSlot)
 	slotPotion := GetSlotPotionType(session, invSlot)
+	slotShulker, hasSlotShulker := GetSlotShulkerBoxData(session, invSlot)
 	isOminousBottle := IsOminousBottleItem(cur)
 	slotOminousAmp := GetSlotOminousBottleAmplifier(session, invSlot)
 	s.StopUsingSpyglass(session)
@@ -4828,6 +4884,7 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		ClearSlotBundleContents(session, invSlot)
 		ClearSlotWritableBook(session, invSlot)
 		ClearSlotWrittenBook(session, invSlot)
+		ClearSlotShulkerBoxData(session, invSlot)
 		clearSlotOminousBottleAmplifier(session, invSlot)
 	} else {
 		session.SetInventorySlot(invSlot, world.NewItemStack(cur.ResolvedItemID(), rem))
@@ -4869,6 +4926,9 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		}
 		if slotPotion != "" && IsPotionOrTippedArrowItem(dropped) {
 			s.AssociateDroppedPotionEntity(entID, slotPotion)
+		}
+		if hasSlotShulker && IsShulkerBoxItemOrBlock(dropped.ResolvedID()) {
+			s.AssociateDroppedShulkerBoxEntity(entID, slotShulker)
 		}
 	}
 	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)
@@ -4920,12 +4980,16 @@ func (s *Server) SwapHeldWithOffhand(session *PlayerSession) bool {
 	offWB, hasOffWB := GetSlotWritableBook(session, offSlot)
 	mainWrB, hasMainWrB := GetSlotWrittenBook(session, mainSlot)
 	offWrB, hasOffWrB := GetSlotWrittenBook(session, offSlot)
+	mainShulker, _ := GetSlotShulkerBoxData(session, mainSlot)
+	offShulker, _ := GetSlotShulkerBoxData(session, offSlot)
 	s.StopUsingSpyglass(session)
 
 	session.SetInventorySlot(mainSlot, offStack)
 	session.SetInventorySlot(offSlot, mainStack)
 	SetSlotItemMeta(session, mainSlot, offMeta)
 	SetSlotItemMeta(session, offSlot, mainMeta)
+	SetSlotShulkerBoxData(session, mainSlot, offShulker)
+	SetSlotShulkerBoxData(session, offSlot, mainShulker)
 	SetSlotPotionType(session, mainSlot, offPotion)
 	SetSlotPotionType(session, offSlot, mainPotion)
 	SetSlotArmorTrim(session, mainSlot, offTrim)
@@ -5358,6 +5422,16 @@ func (s *Server) PickItemFromBlock(session *PlayerSession, x, y, z int, includeD
 		meta.CustomName = bs.CustomName
 		SetSlotItemMeta(session, targetSlot, meta)
 	}
+	if sbe, exists := s.StorageBlockEntityAt(dim, x, y, z); exists && sbe != nil {
+		if sbe.CustomName != "" {
+			meta := GetSlotItemMeta(session, targetSlot)
+			meta.CustomName = sbe.CustomName
+			SetSlotItemMeta(session, targetSlot, meta)
+		}
+		if IsShulkerBoxItemOrBlock(world.BlockName(state)) {
+			SetSlotShulkerBoxData(session, targetSlot, ShulkerBoxDataFromBlockEntity(sbe))
+		}
+	}
 
 	if session.send != nil {
 		stateID := session.NextContainerStateID()
@@ -5421,6 +5495,9 @@ func (s *Server) PickItemFromEntity(session *PlayerSession, entityID int32, incl
 		}
 		if bundleItems, exists := s.DroppedBundleContents(ent.ID); exists && len(bundleItems) > 0 {
 			SetSlotBundleContents(session, targetSlot, bundleItems)
+		}
+		if shData, exists := s.DroppedShulkerBoxItemData(ent.ID); exists && IsShulkerBoxItemOrBlock(itemName) {
+			SetSlotShulkerBoxData(session, targetSlot, shData)
 		}
 	} else if vst, exists := s.VehicleStateByID(ent.ID); exists && vst.CustomName != "" {
 		meta := GetSlotItemMeta(session, targetSlot)
