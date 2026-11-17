@@ -421,6 +421,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 			r.tickGrowingPlantHead(30, 55, 4)
 		}
 	}
+	r.runPostProcessing(nil)
 	return nil
 }
 
@@ -489,8 +490,9 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 	}
 	if len(mineshafts) > 0 {
 		for _, key := range regionChunks {
-			PlaceMineshaftsForChunk(r, mineshafts, seed, key[0], key[1])
+			placeMineshaftsForChunk(r, mineshafts, seed, key[0], key[1], false)
 		}
+		r.runPostProcessing(nil)
 	}
 	for _, ugJigsaw := range []struct {
 		setID  string

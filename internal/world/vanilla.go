@@ -261,31 +261,61 @@ func generateBaseTerrain(od *worldgen.OverworldDensity, fluidPicker worldgen.Flu
 	defer releaseZoomedBiomes(zoomed)
 
 	var heightChanged [16][16]bool
-	for lx := 0; lx < 16; lx++ {
-		wg.Add(1)
-		go func(lx int) {
-			defer wg.Done()
-			var sctx *worldgen.SurfaceContext
-			if ruleErr == nil {
-				sctx = surfaceRule.AcquireContext()
-				sctx.BiomeGetter = zoomed
-				defer worldgen.ReleaseSurfaceContext(sctx)
-			}
+	needsSequentialSurface := false
+	if ruleErr == nil {
+		for lx := 0; lx < 16 && !needsSequentialSurface; lx++ {
 			for lz := 0; lz < 16; lz++ {
-				if ruleErr == nil {
-					heightChanged[lx][lz] = applySurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
-						baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz])
-					continue
+				topY := worldSurface[lx][lz] + 1
+				if topY < MinY {
+					topY = MinY
 				}
-				fillLegacySurface(&columns[lx][lz], surfTop[lx][lz], newColumnRand(baseX+lx, baseZ+lz, int(seed)))
+				b := zoomed.BiomeAt(baseX+lx, topY, baseZ+lz)
+				if b == "minecraft:eroded_badlands" || b == "minecraft:frozen_ocean" || b == "minecraft:deep_frozen_ocean" {
+					needsSequentialSurface = true
+					break
+				}
 			}
-		}(lx)
+		}
 	}
-	wg.Wait()
-	for lx := 0; lx < 16; lx++ {
-		for lz := 0; lz < 16; lz++ {
-			if heightChanged[lx][lz] {
-				surfTop[lx][lz], worldSurface[lx][lz] = refreshColumnSurfaceHeight(&columns[lx][lz])
+	if needsSequentialSurface {
+		sctx := surfaceRule.AcquireContext()
+		sctx.BiomeGetter = zoomed
+		defer worldgen.ReleaseSurfaceContext(sctx)
+		for lx := 0; lx < 16; lx++ {
+			for lz := 0; lz < 16; lz++ {
+				if applySurfaceRuleColumn(od, surfaceRule, sctx, &columns[lx][lz],
+					baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz], true) {
+					surfTop[lx][lz], worldSurface[lx][lz] = refreshColumnSurfaceHeight(&columns[lx][lz])
+				}
+			}
+		}
+	} else {
+		for lx := 0; lx < 16; lx++ {
+			wg.Add(1)
+			go func(lx int) {
+				defer wg.Done()
+				var sctx *worldgen.SurfaceContext
+				if ruleErr == nil {
+					sctx = surfaceRule.AcquireContext()
+					sctx.BiomeGetter = zoomed
+					defer worldgen.ReleaseSurfaceContext(sctx)
+				}
+				for lz := 0; lz < 16; lz++ {
+					if ruleErr == nil {
+						heightChanged[lx][lz] = applySurfaceRule(od, surfaceRule, sctx, &columns[lx][lz],
+							baseX+lx, baseZ+lz, lx, lz, &worldSurface, biomeName[lx][lz])
+						continue
+					}
+					fillLegacySurface(&columns[lx][lz], surfTop[lx][lz], newColumnRand(baseX+lx, baseZ+lz, int(seed)))
+				}
+			}(lx)
+		}
+		wg.Wait()
+		for lx := 0; lx < 16; lx++ {
+			for lz := 0; lz < 16; lz++ {
+				if heightChanged[lx][lz] {
+					surfTop[lx][lz], worldSurface[lx][lz] = refreshColumnSurfaceHeight(&columns[lx][lz])
+				}
 			}
 		}
 	}
@@ -513,6 +543,10 @@ func refreshColumnSurfaceHeight(col *[WorldHeight]uint16) (topSolid, worldSurf i
 }
 
 func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string) bool {
+	return applySurfaceRuleColumn(od, rules, sctx, out, wx, wz, lx, lz, worldSurface, biomeName, false)
+}
+
+func applySurfaceRuleColumn(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRuleSet, sctx *worldgen.SurfaceContext, out *[WorldHeight]uint16, wx, wz, lx, lz int, worldSurface *[16][16]int, biomeName string, liveWorldSurface bool) bool {
 	top := -1
 	for i := WorldHeight - 1; i >= 0; i-- {
 		if out[i] != StateAir {
@@ -537,6 +571,9 @@ func applySurfaceRule(od *worldgen.OverworldDensity, rules *worldgen.SurfaceRule
 			top = newTop
 			topY = minY + top + 1
 			changedHeight = true
+			if liveWorldSurface {
+				worldSurface[lx][lz] = minY + top
+			}
 		}
 	}
 	// Column-constant surface quantities, refreshed once per column exactly as

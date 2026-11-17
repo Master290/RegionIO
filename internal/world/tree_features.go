@@ -461,12 +461,15 @@ func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worl
 	}
 	r.setBlock(origin.X, origin.Y, origin.Z, stumpState)
 	placedLogs := []treePlacement{{x: origin.X, y: origin.Y, z: origin.Z, isLog: true}}
+	tp := &treePlacer{r: r, set: set, random: random}
 	defer func() {
-		(&treePlacer{r: r, set: set, placements: placedLogs}).applyLeafDistance()
+		tp.placements = placedLogs
+		settled := tp.applyLeafDistance()
+		tp.updateShapeAtEdge(settled)
 	}()
 	if len(config.StumpDecorators) > 0 {
 		dec := &treeDecoration{
-			t:    &treePlacer{r: r, set: set, random: random},
+			t:    tp,
 			logs: []treePlacement{{x: origin.X, y: origin.Y, z: origin.Z, isLog: true}},
 		}
 		if err := dec.runDecorators(set, config.StumpDecorators); err != nil {
@@ -538,7 +541,7 @@ func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worl
 			logs[i] = treePlacement{x: p[0], y: p[1], z: p[2], isLog: true}
 		}
 		dec := &treeDecoration{
-			t:    &treePlacer{r: r, set: set, random: random},
+			t:    tp,
 			logs: logs,
 		}
 		if err := dec.runDecorators(set, config.LogDecorators); err != nil {

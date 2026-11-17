@@ -188,44 +188,11 @@ func (r *decorationRegion) evalBlockPredicate(set *worldgen.FeatureSet, p *compi
 		// stands there, which is why the check below must not look at the cell itself.
 		switch p.surviveStateName {
 		case "minecraft:sugar_cane":
-			below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
-			if !ok {
-				return false, nil
-			}
-			if below.Name == "minecraft:sugar_cane" {
-				return true, nil
-			}
-			if !flattenBlockTagContains(set, "minecraft:dirt", below.Name) &&
-				below.Name != "minecraft:sand" && below.Name != "minecraft:red_sand" && below.Name != "minecraft:podzol" {
-				return false, nil
-			}
-			for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
-				nx, nz := position.X+d[0], position.Z+d[1]
-				nb := r.getBlock(nx, position.Y-1, nz)
-				neighbor, ok := stateByID(nb)
-				if ok && (neighbor.Name == "minecraft:frosted_ice") {
-					return true, nil
-				}
-				if isWaterState(nb) {
-					return true, nil
-				}
-			}
-			return false, nil
+			return r.canSugarCaneSurvive(position, set), nil
 		case "minecraft:cactus":
-			// CactusBlock.canSurvive: no solid neighbour and no lava neighbour in any
-			// horizontal direction. The block below is not examined at all, which is
-			// the opposite of every other state that uses this predicate.
-			for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
-				neighbor := r.getBlock(position.X+d[0], position.Y, position.Z+d[1])
-				if isSolidState(neighbor) {
-					return false, nil
-				}
-				if name, ok := stateByID(neighbor); ok &&
-					(name.Name == "minecraft:lava" || name.Name == "minecraft:flowing_lava") {
-					return false, nil
-				}
-			}
-			return true, nil
+			return r.canCactusSurvive(position, set), nil
+		case "minecraft:cactus_flower":
+			return r.canCactusFlowerSurvive(position, set), nil
 		default:
 			if p.surviveStateName == "minecraft:mangrove_propagule" && p.surviveHanging {
 				if position.Y >= MinY+WorldHeight-1 {
@@ -337,4 +304,83 @@ func isAirState(state uint16) bool {
 
 func flattenBlockTagContains(set *worldgen.FeatureSet, tag, name string) bool {
 	return getCachedBlockTag(set, tag).set[name]
+}
+
+// canSugarCaneSurvive mirrors SugarCaneBlock.canSurvive (26.1.2 bytecode):
+// below is sugar_cane or in #minecraft:supports_sugar_cane (which in 26.1.2 includes
+// #minecraft:substrate_overworld such as grass_block/dirt/mud/moss and #minecraft:sand),
+// and at least one horizontal neighbor of pos.below() has water fluid or
+// #minecraft:supports_sugar_cane_adjacently (frosted_ice).
+func (r *decorationRegion) canSugarCaneSurvive(position worldgen.FeaturePosition, set *worldgen.FeatureSet) bool {
+	if position.Y <= MinY {
+		return false
+	}
+	below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
+	if !ok {
+		return false
+	}
+	if below.Name == "minecraft:sugar_cane" {
+		return true
+	}
+	if !flattenBlockTagContains(set, "minecraft:supports_sugar_cane", below.Name) {
+		return false
+	}
+	for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+		nx, nz := position.X+d[0], position.Z+d[1]
+		nb := r.getBlock(nx, position.Y-1, nz)
+		if isWaterState(nb) {
+			return true
+		}
+		if neighbor, ok := stateByID(nb); ok && flattenBlockTagContains(set, "minecraft:supports_sugar_cane_adjacently", neighbor.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// canCactusSurvive mirrors CactusBlock.canSurvive (26.1.2 bytecode):
+// no horizontal neighbor is solid or lava fluid, the block below is cactus or in
+// #minecraft:supports_cactus (#minecraft:sand), and the block above is not liquid().
+func (r *decorationRegion) canCactusSurvive(position worldgen.FeaturePosition, set *worldgen.FeatureSet) bool {
+	for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
+		neighbor := r.getBlock(position.X+d[0], position.Y, position.Z+d[1])
+		if isSolidState(neighbor) || isLavaState(neighbor) {
+			return false
+		}
+	}
+	if position.Y <= MinY {
+		return false
+	}
+	below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
+	if !ok {
+		return false
+	}
+	if below.Name != "minecraft:cactus" && !flattenBlockTagContains(set, "minecraft:supports_cactus", below.Name) {
+		return false
+	}
+	return !isLiquidBlockState(r.getBlock(position.X, position.Y+1, position.Z))
+}
+
+// canCactusFlowerSurvive mirrors CactusFlowerBlock.mayPlaceOn (26.1.2 bytecode):
+// below is in #minecraft:support_override_cactus_flower (cactus, farmland) or
+// presents a center-sturdy upward face.
+func (r *decorationRegion) canCactusFlowerSurvive(position worldgen.FeaturePosition, set *worldgen.FeatureSet) bool {
+	if position.Y <= MinY {
+		return false
+	}
+	belowID := r.getBlock(position.X, position.Y-1, position.Z)
+	below, ok := stateByID(belowID)
+	if !ok {
+		return false
+	}
+	if flattenBlockTagContains(set, "minecraft:support_override_cactus_flower", below.Name) {
+		return true
+	}
+	if isFaceSturdy(belowID) {
+		return true
+	}
+	return IsFenceBlock(belowID) || IsWallBlock(belowID) ||
+		below.Name == "minecraft:hopper" ||
+		(below.Properties["type"] == "top") ||
+		(below.Properties["half"] == "top" && below.Properties["shape"] != "")
 }

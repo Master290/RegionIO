@@ -111,14 +111,14 @@ func parseLakeConfig(raw json.RawMessage) (lakeFeatureConfig, error) {
 }
 
 // isLiquidBlockState mirrors BlockState.liquid(): a block-level property true
-// only for real fluid blocks (water, lava) — a waterlogged chest is NOT
-// liquid, the same distinction FallingBlock.isFree makes.
+// only for real liquid blocks (water, lava, bubble_column) — a waterlogged chest
+// is NOT liquid, the same distinction FallingBlock.isFree and CactusBlock make.
 func isLiquidBlockState(state uint16) bool {
 	if state == 0 {
 		return false
 	}
 	n, ok := stateByID(state)
-	return ok && (n.Name == "minecraft:water" || n.Name == "minecraft:lava")
+	return ok && (n.Name == "minecraft:water" || n.Name == "minecraft:lava" || n.Name == "minecraft:bubble_column")
 }
 
 // placeLake ports LakeFeature.place for one origin. The volume is 16 x 8 x 16

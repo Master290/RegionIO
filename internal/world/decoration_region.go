@@ -50,10 +50,12 @@ type decorationRegion struct {
 	// biomeZoomSeed is BiomeManager.obfuscateSeed(worldSeed), which getBiome needs
 	// and the chunks alone cannot supply. Every stage entry point that receives the
 	// world seed binds it; see bindSeed.
-	biomeZoomSeed  int64
-	biomeWorldSeed int64
-	biomeZoomBound bool
-	regionRandoms  map[[2]int32]worldgen.RandomSource
+	biomeZoomSeed        int64
+	biomeWorldSeed       int64
+	biomeZoomBound       bool
+	regionRandoms        map[[2]int32]worldgen.RandomSource
+	postProcessPositions [][3]int
+	postProcessSeen      map[[3]int]struct{}
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
@@ -411,4 +413,88 @@ func abs32(value int32) int32 {
 		return -value
 	}
 	return value
+}
+
+func (r *decorationRegion) markForPostProcessing(x, y, z int) {
+	if r == nil || y < MinY || y >= MinY+WorldHeight || r.chunkAtBlock(x, z) == nil {
+		return
+	}
+	if r.postProcessSeen == nil {
+		r.postProcessSeen = make(map[[3]int]struct{})
+	}
+	pos := [3]int{x, y, z}
+	if _, exists := r.postProcessSeen[pos]; exists {
+		return
+	}
+	r.postProcessSeen[pos] = struct{}{}
+	r.postProcessPositions = append(r.postProcessPositions, pos)
+}
+
+func (r *decorationRegion) fenceConnectsTo(fenceName string, nx, ny, nz int, dirToNeighbor string) bool {
+	nb := r.getBlock(nx, ny, nz)
+	if isAirState(nb) {
+		return false
+	}
+	if IsFenceBlock(nb) {
+		return sameFenceMaterialGroup(fenceName, BlockName(nb))
+	}
+	if IsFenceGateBlock(nb) {
+		gateFacing := BlockProperties(nb)["facing"]
+		return horizontalAxis(gateFacing) != "" && horizontalAxis(gateFacing) != horizontalAxis(dirToNeighbor)
+	}
+	if isConnectionExceptionBlock(nb) {
+		return false
+	}
+	return isFaceSturdy(nb)
+}
+
+func (r *decorationRegion) resolvedFenceState(x, y, z int, state uint16) uint16 {
+	info, ok := stateByID(state)
+	if !ok || !IsFenceBlock(state) {
+		return state
+	}
+	wl := info.Properties["waterlogged"]
+	if wl == "" {
+		wl = "false"
+	}
+	props := map[string]string{
+		"north":       boolToProp(r.fenceConnectsTo(info.Name, x, y, z-1, "north")),
+		"east":        boolToProp(r.fenceConnectsTo(info.Name, x+1, y, z, "east")),
+		"south":       boolToProp(r.fenceConnectsTo(info.Name, x, y, z+1, "south")),
+		"west":        boolToProp(r.fenceConnectsTo(info.Name, x-1, y, z, "west")),
+		"waterlogged": wl,
+	}
+	if resolved, ok := nameToStateID(info.Name, props); ok {
+		return resolved
+	}
+	return state
+}
+
+// runPostProcessing replays StructurePiece SHAPE_CHECK_BLOCKS shape updates
+// (LevelChunk.postProcessGeneration -> Block.updateFromNeighbourShapes) for
+// marked fences and wall torches against final neighborhood blocks.
+func (r *decorationRegion) runPostProcessing(_ *worldgen.FeatureSet) {
+	if r == nil || len(r.postProcessPositions) == 0 {
+		return
+	}
+	for _, pos := range r.postProcessPositions {
+		x, y, z := pos[0], pos[1], pos[2]
+		cur := r.getBlock(x, y, z)
+		info, ok := stateByID(cur)
+		if !ok {
+			continue
+		}
+		switch {
+		case info.Name == "minecraft:oak_fence" || info.Name == "minecraft:dark_oak_fence":
+			if next := r.resolvedFenceState(x, y, z, cur); next != cur {
+				r.setBlockGlobal(x, y, z, next)
+			}
+		case info.Name == "minecraft:wall_torch":
+			if sup, ok := wallSupportPos(x, y, z, info.Name, info.Properties); ok {
+				if !isFaceSturdy(r.getBlock(sup.X, sup.Y, sup.Z)) {
+					r.setBlockGlobal(x, y, z, StateAir)
+				}
+			}
+		}
+	}
 }

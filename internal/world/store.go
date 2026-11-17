@@ -53,7 +53,13 @@ const dataVersion26 = 4790
 // (minecraft:worldgen_region_random), TreeFeature decorator-before-updateLeaves order
 // with StructureTemplate.updateShapeAtEdge boundary propagation, and StructureBlockEntity
 // write-radius and overwrite cleanup (vanilla 26.1.2).
-const generatorVersion = 59
+// Version 60: Savanna and badlands generation parity: cactus/cactus_flower/sugar_cane
+// survival rules (26.1.2 tags, horizontal lava/solids, and liquid-above check
+// including bubble_column), sequential eroded_badlands spire worldSurface updates
+// for SteepMaterialCondition, SHAPE_CHECK_BLOCKS post-processing for mineshaft
+// fences/torches, fillPillarDownOrChainUp chain support and direction continuation,
+// and FallenTreeFeature updateShapeAtEdge propagation (vanilla 26.1.2).
+const generatorVersion = 60
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

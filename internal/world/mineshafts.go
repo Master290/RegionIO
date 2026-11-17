@@ -2,6 +2,7 @@ package world
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"regionio/internal/worldgen"
@@ -573,7 +574,6 @@ var (
 	msFence        [2]uint16
 	msFenceWest    [2]uint16
 	msFenceEast    [2]uint16
-	msFenceByMask  [2][16]uint16
 )
 
 func msTypeIndex(mesa bool) int {
@@ -613,22 +613,6 @@ func initMineshaftStates() {
 		msFenceWest[1] = must("minecraft:dark_oak_fence", map[string]string{"west": "true"})
 		msFenceEast[0] = must("minecraft:oak_fence", map[string]string{"east": "true"})
 		msFenceEast[1] = must("minecraft:dark_oak_fence", map[string]string{"east": "true"})
-		for mesa := 0; mesa < 2; mesa++ {
-			name := "minecraft:oak_fence"
-			if mesa == 1 {
-				name = "minecraft:dark_oak_fence"
-			}
-			for mask := 0; mask < 16; mask++ {
-				props := map[string]string{
-					"north":       fmt.Sprintf("%t", mask&1 != 0),
-					"east":        fmt.Sprintf("%t", mask&2 != 0),
-					"south":       fmt.Sprintf("%t", mask&4 != 0),
-					"west":        fmt.Sprintf("%t", mask&8 != 0),
-					"waterlogged": "false",
-				}
-				msFenceByMask[mesa][mask] = must(name, props)
-			}
-		}
 	})
 }
 
@@ -703,6 +687,10 @@ func BuildMineshaftStart(seed int64, sx, sz int32, mesa bool) *MineshaftStart {
 // in the exact order determined by vanilla's StructureManager/LongOpenHashSet,
 // running normal mineshafts (index 2) followed by mesa mineshafts (index 3) in step 3.
 func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart, seed int64, chunkX, chunkZ int32) {
+	placeMineshaftsForChunk(region, starts, seed, chunkX, chunkZ, true)
+}
+
+func placeMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart, seed int64, chunkX, chunkZ int32, runPostProcess bool) {
 	if len(starts) == 0 {
 		return
 	}
@@ -765,6 +753,9 @@ func PlaceMineshaftsForChunk(region *decorationRegion, starts []*MineshaftStart,
 				}
 			}
 		}
+	}
+	if runPostProcess {
+		region.runPostProcessing(nil)
 	}
 }
 
@@ -915,7 +906,20 @@ func (c *msContext) placeBlock(p *msPiece, state uint16, x, y, z int) {
 	if !c.canBeReplaced(p, wx, wy, wz) {
 		return
 	}
-	c.region.setBlockGlobal(wx, wy, wz, msTransformState(state, p.orientation))
+	transformed := msTransformState(state, p.orientation)
+	if c.region.setBlockGlobal(wx, wy, wz, transformed) && msIsShapeCheckBlock(transformed) {
+		c.region.markForPostProcessing(wx, wy, wz)
+	}
+}
+
+func msIsShapeCheckBlock(state uint16) bool {
+	if state == 0 {
+		return false
+	}
+	if IsFenceBlock(state) {
+		return true
+	}
+	return BlockName(state) == "minecraft:wall_torch"
 }
 
 func (c *msContext) canBeReplaced(p *msPiece, wx, wy, wz int) bool {
@@ -1281,37 +1285,14 @@ func (c *msContext) placeSupportFence(p *msPiece, x, y1, y2, z int) {
 		if !c.canBeReplaced(p, wx, wy, wz) {
 			continue
 		}
-		c.region.setBlockGlobal(wx, wy, wz, c.fenceState(wx, wy, wz))
+		if c.region.setBlockGlobal(wx, wy, wz, c.fenceState(wx, wy, wz)) {
+			c.region.markForPostProcessing(wx, wy, wz)
+		}
 	}
-}
-
-func msFenceConnects(region *decorationRegion, x, y, z int) bool {
-	st := region.getBlock(x, y, z)
-	if msFaceSturdy(st) {
-		return true
-	}
-	val, ok := stateByID(st)
-	if !ok {
-		return false
-	}
-	return val.Name == "minecraft:oak_fence" || val.Name == "minecraft:dark_oak_fence"
 }
 
 func (c *msContext) fenceState(wx, wy, wz int) uint16 {
-	var mask int
-	if msFenceConnects(c.region, wx, wy, wz-1) { // north
-		mask |= 1
-	}
-	if msFenceConnects(c.region, wx+1, wy, wz) { // east
-		mask |= 2
-	}
-	if msFenceConnects(c.region, wx, wy, wz+1) { // south
-		mask |= 4
-	}
-	if msFenceConnects(c.region, wx-1, wy, wz) { // west
-		mask |= 8
-	}
-	return msFenceByMask[c.typeIndex()][mask]
+	return c.region.resolvedFenceState(wx, wy, wz, msFence[c.typeIndex()])
 }
 
 func (c *msContext) placeDoubleLowerOrUpperSupport(p *msPiece, x, y, z int) {
@@ -1322,6 +1303,21 @@ func (c *msContext) placeDoubleLowerOrUpperSupport(p *msPiece, x, y, z int) {
 	if c.getBlock(p, x+2, y, z) == planks {
 		c.fillPillarDownOrChainUp(p, msLog[c.typeIndex()], x+2, y, z)
 	}
+}
+
+func msCanHangChainBelow(state uint16) bool {
+	if msIsFallingBlock(state) {
+		return false
+	}
+	if msFaceSturdy(state) || IsVerticalChainBlock(state) {
+		return true
+	}
+	info, ok := stateByID(state)
+	if !ok || strings.HasSuffix(info.Name, "_fence_gate") {
+		return false
+	}
+	return strings.HasSuffix(info.Name, "_fence") || strings.HasSuffix(info.Name, "_wall") ||
+		info.Name == "minecraft:iron_bars" || IsCopperBarsBlock(state)
 }
 
 func (c *msContext) fillPillarDownOrChainUp(p *msPiece, state uint16, x, y, z int) {
@@ -1335,25 +1331,21 @@ func (c *msContext) fillPillarDownOrChainUp(p *msPiece, state uint16, x, y, z in
 		if down {
 			cur := c.region.getBlock(wx, startY-i, wz)
 			repl := msReplaceableByStructures(cur) && !isLavaState(cur)
-			if !repl {
-				if msFaceSturdy(cur) {
-					c.fillColumnBetween(p, state, wx, wz, startY-i+1, startY)
-				}
+			if !repl && msFaceSturdy(cur) {
+				c.fillColumnBetween(p, state, wx, wz, startY-i+1, startY)
 				return
 			}
-			down = i <= 20 && startY-i > MinY+1
+			down = i <= 20 && repl && startY-i > MinY+1
 		}
 		if up {
 			cur := c.region.getBlock(wx, startY+i, wz)
 			repl := msReplaceableByStructures(cur)
-			if !repl {
-				if msFaceSturdy(cur) && !msIsFallingBlock(cur) {
-					c.region.setBlockGlobal(wx, startY+1, wz, msFence[c.typeIndex()])
-					c.fillColumnBetween(p, msIronChain, wx, wz, startY+2, startY+i)
-				}
+			if !repl && msCanHangChainBelow(cur) {
+				c.region.setBlockGlobal(wx, startY+1, wz, msFence[c.typeIndex()])
+				c.fillColumnBetween(p, msIronChain, wx, wz, startY+2, startY+i)
 				return
 			}
-			up = i <= 50 && startY+i < MinY+WorldHeight
+			up = i <= 50 && repl && startY+i < MinY+WorldHeight-1
 		}
 	}
 }

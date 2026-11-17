@@ -332,6 +332,15 @@ func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePositi
 		below, ok := stateByID(belowID)
 		return ok && (below.Name == "minecraft:ice" || below.Name == "minecraft:frosted_ice")
 	}
+	if name == "minecraft:sugar_cane" {
+		return r.canSugarCaneSurvive(position, set)
+	}
+	if name == "minecraft:cactus" {
+		return r.canCactusSurvive(position, set)
+	}
+	if name == "minecraft:cactus_flower" {
+		return r.canCactusFlowerSurvive(position, set)
+	}
 	if name == "minecraft:melon" || name == "minecraft:pumpkin" {
 		return true
 	}
