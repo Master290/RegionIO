@@ -87,7 +87,7 @@ func (h *handler) beginPlay() error {
 	if err := h.sendGameEvent(protocol.GameEventStartWaitingChunks, 0); err != nil {
 		return err
 	}
-	if err := h.sendPlayerPosition(1); err != nil {
+	if err := h.sendPlayerPosition(session.NextTeleportID()); err != nil {
 		return err
 	}
 	if err := h.sendChunkCacheCenter(startCX, startCZ); err != nil {
@@ -169,6 +169,7 @@ func (h *handler) beginPlay() error {
 		}
 	}
 	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
+	h.srv.SetPlayerDimensionPrepareFunc(session, h.streamer.prepareDimensionSwitch)
 	h.srv.SetPlayerDimensionSwitchFunc(session, h.streamer.switchDimension)
 	h.srv.SetPlayerEntitySyncFunc(session, func() {
 		_ = h.syncVisibleEntities()
@@ -470,7 +471,7 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 			h.srv.ApplyPlayerFrostWalker(h.session, bx, by, bz)
 		}
 		h.srv.StepPlayerPowderSnow(h.session)
-		res, err := h.srv.CheckPlayerPortal(h.session)
+		res, err := h.srv.HandlePlayerMovePortal(h.session)
 		if err != nil {
 			return err
 		}
@@ -538,6 +539,13 @@ func (h *handler) sendGameEvent(event byte, value float32) error {
 // sendPlayerPosition teleports the player to their current/spawn position.
 // The client must echo the teleport ID back via accept_teleportation.
 func (h *handler) sendPlayerPosition(teleportID int32) error {
+	if teleportID <= 0 {
+		if h.session != nil {
+			teleportID = h.session.NextTeleportID()
+		} else {
+			teleportID = 1
+		}
+	}
 	x, y, z := spawnX, h.spawnY, spawnZ
 	yaw, pitch := float32(0), float32(0)
 	if h.session != nil {
@@ -638,20 +646,34 @@ func (h *handler) serverTickLoop() {
 	if h.srv == nil {
 		return
 	}
-	if _, loaded := activeServerTickLoops.LoadOrStore(h.srv, true); loaded {
+	loopDone := make(chan struct{})
+	if _, loaded := activeServerTickLoops.LoadOrStore(h.srv, loopDone); loaded {
 		return
 	}
-	defer activeServerTickLoops.Delete(h.srv)
+	defer func() {
+		activeServerTickLoops.Delete(h.srv)
+		close(loopDone)
+	}()
 
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
+	stopCh := h.srv.StopCh()
 	lastGameTime, _ := h.srv.WorldTime()
 	for {
 		select {
 		case <-h.ctx.Done():
 			return
+		case <-stopCh:
+			return
 		case <-ticker.C:
+			select {
+			case <-h.ctx.Done():
+				return
+			case <-stopCh:
+				return
+			default:
+			}
 			if h.srv.Difficulty() == server.DifficultyPeaceful {
 				h.srv.DespawnHostileMobs()
 			}
@@ -879,6 +901,11 @@ func (h *handler) syncVisibleEntities() error {
 						return err
 					}
 				}
+				if eqPkt := h.srv.PlayerEquipmentPacketByEntityID(entity.ID); len(eqPkt) > 0 {
+					if err := h.conn.Send(protocol.PlaySetEquipment, eqPkt); err != nil {
+						return err
+					}
+				}
 			}
 		} else if known != current {
 			entity := current.entity
@@ -1092,6 +1119,9 @@ func (h *handler) handlePlay(pkt protocol.Packet) error {
 		id, err := pkt.Body().VarInt()
 		if err != nil {
 			return err
+		}
+		if h.session != nil {
+			h.session.AcknowledgeTeleport(id)
 		}
 		h.log.Debug("teleport confirmed", "id", id)
 		return nil

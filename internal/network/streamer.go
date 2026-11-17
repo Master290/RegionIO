@@ -34,7 +34,10 @@ type streamer struct {
 
 	recenter chan recenterReq
 
+	batchSendMu sync.Mutex
+
 	switchMu          sync.Mutex
+	switching         bool
 	pendingCache      *world.Cache
 	resetPending      bool
 	pendingViewRadius int
@@ -126,6 +129,24 @@ func (s *streamer) requestRecenter(cx, cz int32) {
 	}
 }
 
+// prepareDimensionSwitch halts any in-flight old-dimension chunk batch writes
+// synchronously before PlayRespawn is sent so old-dimension packets never arrive
+// after ClientboundRespawnPacket.
+func (s *streamer) prepareDimensionSwitch() {
+	if s == nil {
+		return
+	}
+	s.batchSendMu.Lock()
+	s.switchMu.Lock()
+	s.switching = true
+	s.switchMu.Unlock()
+	s.batchSendMu.Unlock()
+
+	s.residentMu.Lock()
+	s.resident = make(map[[2]int32]bool)
+	s.residentMu.Unlock()
+}
+
 // switchDimension switches the streamer to a new dimension chunk cache, clears
 // client chunk residency (since ClientboundRespawnPacket resets client chunks),
 // and queues a recenter on (cx, cz).
@@ -134,12 +155,17 @@ func (s *streamer) switchDimension(cache *world.Cache, cx, cz int32) {
 		return
 	}
 	s.switchMu.Lock()
+	s.switching = false
 	s.pendingCache = cache
 	s.resetPending = true
 	s.pendingCenterX = cx
 	s.pendingCenterZ = cz
 	s.hasPendingCenter = true
 	s.switchMu.Unlock()
+
+	s.batchMu.Lock()
+	s.unacknowledgedBatches = 0
+	s.batchMu.Unlock()
 
 	s.residentMu.Lock()
 	s.resident = make(map[[2]int32]bool)
@@ -190,7 +216,7 @@ func (s *streamer) setViewDistance(viewDistance int, cx, cz int32) {
 
 func (s *streamer) hasPendingSwitch() bool {
 	s.switchMu.Lock()
-	pending := s.resetPending || s.pendingViewRadius > 0
+	pending := s.switching || s.resetPending || s.pendingViewRadius > 0
 	s.switchMu.Unlock()
 	return pending
 }
@@ -210,6 +236,7 @@ func (s *streamer) applyPendingSwitch() {
 	newCache := s.pendingCache
 	s.pendingCache = nil
 	s.resetPending = false
+	s.switching = false
 	hasPendCenter := s.hasPendingCenter
 	pendCX, pendCZ := s.pendingCenterX, s.pendingCenterZ
 	s.hasPendingCenter = false
@@ -267,6 +294,9 @@ func (s *streamer) run(ctx context.Context) {
 // It is the only place `loaded`/`centerX`/`centerZ` are mutated.
 func (s *streamer) processRecenter(ctx context.Context, cx, cz int32) (recenterReq, bool) {
 	s.applyPendingSwitch()
+	if s.hasPendingSwitch() {
+		return recenterReq{}, false
+	}
 	centerChanged := !s.hasCenter || s.centerX != cx || s.centerZ != cz
 	s.centerX, s.centerZ, s.hasCenter = cx, cz, true
 
@@ -506,7 +536,7 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 	}()
 	generated := make(map[[2]int32]frameResult, len(pending))
 	nextIdx := 0
-	batchSent := int32(0)
+	toWrite := make([]frameResult, 0, len(pending))
 	failed := false
 	for r := range results {
 		if r.err != nil {
@@ -530,37 +560,62 @@ func (s *streamer) parallelSend(ctx context.Context, keys [][2]int32) {
 			if !ok {
 				break
 			}
-			if s.conn != nil {
-				if batchSent == 0 {
-					if err := s.conn.Send(protocol.PlayChunkBatchStart, nil); err != nil {
-						failed = true
-						break
-					}
-				}
-				if err := s.conn.SendFramed(ready.frame); err != nil {
-					if s.log != nil {
-						s.log.Debug("streamer send failed", "cx", ready.cx, "cz", ready.cz, "err", err)
-					}
-					failed = true
-					break
-				}
-			}
-			batchSent++
-			s.loaded[[2]int32{j.cx, j.cz}] = true
-			s.setResident([2]int32{j.cx, j.cz}, true)
-			if s.onChunkSent != nil {
-				s.onChunkSent(j.cx, j.cz)
-			}
+			toWrite = append(toWrite, ready)
 			nextIdx++
 		}
 	}
-	if batchSent > 0 && s.conn != nil {
+	if len(toWrite) == 0 {
+		return
+	}
+	if s.conn == nil {
+		for _, ready := range toWrite {
+			key := [2]int32{ready.cx, ready.cz}
+			s.loaded[key] = true
+			s.setResident(key, true)
+			if s.onChunkSent != nil {
+				s.onChunkSent(ready.cx, ready.cz)
+			}
+		}
+		return
+	}
+
+	s.batchSendMu.Lock()
+	if s.hasPendingSwitch() {
+		s.batchSendMu.Unlock()
+		return
+	}
+	batchSent := int32(0)
+	sentCoords := make([][2]int32, 0, len(toWrite))
+	if err := s.conn.Send(protocol.PlayChunkBatchStart, nil); err != nil {
+		s.batchSendMu.Unlock()
+		return
+	}
+	for _, ready := range toWrite {
+		if err := s.conn.SendFramed(ready.frame); err != nil {
+			if s.log != nil {
+				s.log.Debug("streamer send failed", "cx", ready.cx, "cz", ready.cz, "err", err)
+			}
+			break
+		}
+		batchSent++
+		key := [2]int32{ready.cx, ready.cz}
+		s.loaded[key] = true
+		s.setResident(key, true)
+		sentCoords = append(sentCoords, key)
+	}
+	if batchSent > 0 {
 		s.batchMu.Lock()
 		s.unacknowledgedBatches++
 		s.batchMu.Unlock()
 		fin := protocol.NewWriter(5)
 		fin.VarInt(batchSent)
 		_ = s.conn.SendWriter(protocol.PlayChunkBatchFinished, fin)
+	}
+	s.batchSendMu.Unlock()
+	if s.onChunkSent != nil {
+		for _, c := range sentCoords {
+			s.onChunkSent(c[0], c[1])
+		}
 	}
 }
 

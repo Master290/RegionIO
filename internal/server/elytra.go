@@ -697,6 +697,60 @@ func (s *Server) SendPlayerEquipmentPacket(session *PlayerSession) {
 	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, protocol.PlaySetEquipment, w.Bytes())
 }
 
+// PlayerEquipmentPacketByEntityID returns a ClientboundSetEquipmentPacket (0x66)
+// payload containing all non-empty equipment slots of entityID, or nil if all
+// slots are empty or entityID does not belong to an online player.
+func (s *Server) PlayerEquipmentPacketByEntityID(entityID int32) []byte {
+	if s == nil || entityID == 0 {
+		return nil
+	}
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p == nil || p.EntityID != entityID {
+			continue
+		}
+		snap := p.Snapshot()
+		mainSlot := int(snap.SelectedSlot) + world.HotbarContainerOffset
+		invSlots := [6]int{mainSlot, OffHandContainerSlot, ArmorSlotFeet, ArmorSlotLegs, ArmorSlotChest, ArmorSlotHead}
+		type eqItem struct {
+			eqSlot byte
+			stack  world.ItemStack
+			meta   ItemMeta
+			trim   ArmorTrim
+		}
+		items := make([]eqItem, 0, 6)
+		for eqSlot := 0; eqSlot < 6; eqSlot++ {
+			invIdx := invSlots[eqSlot]
+			st := p.InventorySlot(invIdx)
+			if st.IsEmpty() {
+				continue
+			}
+			meta := GetSlotItemMeta(p, invIdx)
+			trim, _ := GetSlotArmorTrim(p, invIdx)
+			items = append(items, eqItem{
+				eqSlot: byte(eqSlot),
+				stack:  st,
+				meta:   meta,
+				trim:   trim,
+			})
+		}
+		if len(items) == 0 {
+			return nil
+		}
+		w := protocol.NewWriter(64)
+		w.VarInt(entityID)
+		for i, item := range items {
+			slotByte := item.eqSlot
+			if i < len(items)-1 {
+				slotByte |= 0x80
+			}
+			w.Byte(slotByte)
+			WriteSlotWithArmorTrim(w, item.stack, item.meta, item.trim)
+		}
+		return w.Bytes()
+	}
+	return nil
+}
+
 // RepairPlayerElytraWithMending repairs a damaged Mending-enchanted Elytra in
 // session's chest slot (ArmorSlotChest = 6) using up to xpPoints experience
 // (2 durability repaired per 1 XP point), returning the durability repaired and

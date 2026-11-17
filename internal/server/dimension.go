@@ -29,9 +29,10 @@ type serverDimensionState struct {
 }
 
 type playerDimensionState struct {
-	mu          sync.RWMutex
-	dimension   string
-	switchDimFn func(cache *world.Cache, cx, cz int32)
+	mu           sync.RWMutex
+	dimension    string
+	switchDimFn  func(cache *world.Cache, cx, cz int32)
+	prepareDimFn func()
 }
 
 var (
@@ -250,6 +251,30 @@ func getPlayerDimSwitchFunc(session *PlayerSession) func(cache *world.Cache, cx,
 	return fn
 }
 
+// SetPlayerDimensionPrepareFunc binds a callback invoked immediately before
+// sending PlayRespawn during a dimension switch so in-flight old-dimension
+// chunk batches are halted and cannot interleave after PlayRespawn.
+func (s *Server) SetPlayerDimensionPrepareFunc(session *PlayerSession, fn func()) {
+	if session == nil {
+		return
+	}
+	st := getPlayerDimState(session)
+	st.mu.Lock()
+	st.prepareDimFn = fn
+	st.mu.Unlock()
+}
+
+func getPlayerDimPrepareFunc(session *PlayerSession) func() {
+	if session == nil {
+		return nil
+	}
+	st := getPlayerDimState(session)
+	st.mu.RLock()
+	fn := st.prepareDimFn
+	st.mu.RUnlock()
+	return fn
+}
+
 // DimensionTypeRegistryIndex resolves the synced minecraft:dimension_type
 // registry index for dim (0 = overworld, 1 = overworld_caves, 2 = the_end, 3 = the_nether).
 func DimensionTypeRegistryIndex(dim string) int32 {
@@ -341,6 +366,8 @@ type CommonSpawnInfoOptions struct {
 	HasLastDeathLocation bool
 	LastDeathDimension   string
 	LastDeathPos         [3]int32
+	HasPrevGameMode      bool
+	PrevGameMode         uint8
 	PortalCooldown       int32
 	IsDebug              bool
 	IsFlat               bool
@@ -431,7 +458,11 @@ func EncodePlayLoginPacketWithOptions(
 	w.Bool(enableRespawnScreen)
 	w.Bool(doLimitedCrafting)
 
-	writeCommonPlayerSpawnInfo(w, dim, hashedSeed, gameMode, 0xFF, opts)
+	prevGM := byte(0xFF)
+	if opts.HasPrevGameMode && opts.PrevGameMode <= GameModeSpectator {
+		prevGM = opts.PrevGameMode
+	}
+	writeCommonPlayerSpawnInfo(w, dim, hashedSeed, gameMode, prevGM, opts)
 	w.Bool(enforcesSecureChat)
 
 	return w.Bytes()
@@ -447,7 +478,9 @@ func EncodeDimensionRespawnPacket(dim string, gameMode uint8, hashedSeed int64, 
 // packet body for protocol 775 including CommonSpawnInfoOptions.
 func EncodeDimensionRespawnPacketWithOptions(dim string, gameMode uint8, hashedSeed int64, dataToKeep byte, opts CommonSpawnInfoOptions) []byte {
 	prevGameMode := byte(0xFF)
-	if dataToKeep != 0 {
+	if opts.HasPrevGameMode && opts.PrevGameMode <= GameModeSpectator {
+		prevGameMode = opts.PrevGameMode
+	} else if dataToKeep != 0 {
 		prevGameMode = gameMode
 	}
 
@@ -458,8 +491,8 @@ func EncodeDimensionRespawnPacketWithOptions(dim string, gameMode uint8, hashedS
 }
 
 // EncodeSessionRespawnPacket encodes ClientboundRespawnPacket (0x52) for session
-// using the server's obfuscated biome seed, session's last death location, and
-// portal cooldown.
+// using the server's obfuscated biome seed, session's previous game mode, last
+// death location, and portal cooldown.
 func (s *Server) EncodeSessionRespawnPacket(session *PlayerSession, dim string, gameMode uint8, dataToKeep byte) []byte {
 	var opts CommonSpawnInfoOptions
 	var hashedSeed int64
@@ -470,6 +503,10 @@ func (s *Server) EncodeSessionRespawnPacket(session *PlayerSession, dim string, 
 		}
 	}
 	if session != nil {
+		if prevGM, ok := session.PreviousGameMode(); ok {
+			opts.HasPrevGameMode = true
+			opts.PrevGameMode = prevGM
+		}
 		if deathDim, deathPos, ok := session.LastDeathLocation(); ok {
 			opts.HasLastDeathLocation = true
 			opts.LastDeathDimension = deathDim
@@ -538,11 +575,16 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 		_ = s.CloseContainer(session, open.ContainerID, true)
 	}
 
-	// Reset fall distance so changing dimensions never causes fall damage on arrival.
+	// Reset fall distance and bump respawnSeq for entity trackers.
 	st := getSurvivalState(session)
 	st.mu.Lock()
 	st.fallDistance = 0
+	st.respawnSeq++
 	st.mu.Unlock()
+
+	if prepFn := getPlayerDimPrepareFunc(session); prepFn != nil {
+		prepFn()
+	}
 
 	destCache := s.DimensionChunks(normTarget)
 	if normTarget == world.DimensionEnd && destCache != nil {
@@ -576,8 +618,27 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 	// Remove player entity from viewers in the old dimension.
 	oldCX := int32(int64(math.Floor(oldX)) >> 4)
 	oldCZ := int32(int64(math.Floor(oldZ)) >> 4)
-	s.BroadcastDimensionChunk(oldDim, oldCX, oldCZ, protocol.PlayRemoveEntities,
-		encodeRemoveEntitiesPacket(nil, []int32{session.EntityID}))
+	removeBody := encodeRemoveEntitiesPacket(nil, []int32{session.EntityID})
+	s.playersMu.RLock()
+	oldViewers := make([]*PlayerSession, 0, len(s.players))
+	for _, player := range s.players {
+		if player != nil && player.IsJoined() && player.Profile.UUID != session.Profile.UUID {
+			oldViewers = append(oldViewers, player)
+		}
+	}
+	s.playersMu.RUnlock()
+	for _, viewer := range oldViewers {
+		if viewer.Dimension() != oldDim || hasEntitySyncHandler(viewer) {
+			continue
+		}
+		vSnap := viewer.Snapshot()
+		vcx := int32(int64(math.Floor(vSnap.X)) >> 4)
+		vcz := int32(int64(math.Floor(vSnap.Z)) >> 4)
+		if chunkDistance(vcx, vcz, oldCX, oldCZ) <= int32(vSnap.ViewDistance) && viewer.send != nil {
+			_ = viewer.send(protocol.PlayRemoveEntities, removeBody)
+		}
+	}
+	s.NotifyNearbyEntityTrackers(oldDim, oldCX, oldCZ)
 
 	cx := int32(int64(math.Floor(x)) >> 4)
 	cz := int32(int64(math.Floor(z)) >> 4)
@@ -599,38 +660,20 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 			return err
 		}
 
-		// 2. GameEvent START_WAITING_FOR_LEVEL_CHUNKS (13).
-		ev := protocol.NewWriter(5)
-		ev.Byte(protocol.GameEventStartWaitingChunks)
-		ev.Float32(0)
-		if err := send(protocol.PlayGameEvent, ev.Bytes()); err != nil {
-			return err
-		}
+		// 2. ChangeDifficulty.
+		s.SendDifficultyToPlayer(session)
 
-		// 3. ChunkCacheCenter for the new dimension's arrival chunk.
-		centerW := protocol.NewWriter(8)
-		centerW.VarInt(cx)
-		centerW.VarInt(cz)
-		_ = send(protocol.PlayChunkCacheCenter, centerW.Bytes())
+		// 3. PlayerAbilities.
+		_ = send(protocol.PlayAbilities, EncodePlayerAbilitiesPacket(session.Abilities()))
 
-		// 4. DefaultSpawnPosition.
-		defSpawnW := protocol.NewWriter(40)
-		if hasSpawn {
-			defSpawnW.String(world.NormalizeDimension(spawnDim))
-			defSpawnW.Position(int(spawnX), int(spawnY), int(spawnZ))
-			defSpawnW.Float32(spawnYaw)
-			defSpawnW.Float32(spawnPitch)
-		} else {
-			defSpawnW.String(world.DimensionOverworld)
-			defSpawnW.Position(8, world.SeaLevel+1, 8)
-			defSpawnW.Float32(0)
-			defSpawnW.Float32(0)
-		}
-		_ = send(protocol.PlayDefaultSpawnPos, defSpawnW.Bytes())
+		// 4. SetHeldSlot.
+		heldW := protocol.NewWriter(4)
+		heldW.VarInt(selectedSlot)
+		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
 
-		// 5. PlayerPosition in the new dimension.
+		// 5. PlayerPosition with incrementing teleportID.
 		posW := protocol.NewWriter(64)
-		posW.VarInt(1)
+		posW.VarInt(session.NextTeleportID())
 		posW.Float64(x).Float64(y).Float64(z)
 		posW.Float64(0).Float64(0).Float64(0)
 		posW.Float32(yaw)
@@ -640,36 +683,47 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 			return err
 		}
 
-		// 6. Re-sync abilities, health, held slot, inventory, and time.
-		var abilityFlags byte
-		switch mode {
-		case GameModeCreative:
-			abilityFlags = 0x0F
-		case GameModeSpectator:
-			abilityFlags = 0x07
-		default:
-			abilityFlags = 0x00
+		// 6. GameEvent START_WAITING_FOR_LEVEL_CHUNKS (13).
+		ev := protocol.NewWriter(5)
+		ev.Byte(protocol.GameEventStartWaitingChunks)
+		ev.Float32(0)
+		if err := send(protocol.PlayGameEvent, ev.Bytes()); err != nil {
+			return err
 		}
-		ab := protocol.NewWriter(9)
-		ab.Byte(abilityFlags)
-		ab.Float32(0.05)
-		ab.Float32(0.1)
-		_ = send(protocol.PlayAbilities, ab.Bytes())
 
-		_ = send(protocol.PlaySetHealth, EncodeSetHealth(health, food, saturation))
+		// 7. ChunkCacheCenter for the new dimension's arrival chunk.
+		centerW := protocol.NewWriter(8)
+		centerW.VarInt(cx)
+		centerW.VarInt(cz)
+		_ = send(protocol.PlayChunkCacheCenter, centerW.Bytes())
+
+		// 8. WorldBorder & SetTime.
+		s.SendWorldBorderToPlayer(session)
+		_ = send(protocol.PlaySetTime, s.SetTimePacket())
+
+		// 9. DefaultSpawnPosition.
+		defSpawnW := protocol.NewWriter(40)
+		if hasSpawn {
+			defSpawnW.String(world.NormalizeDimension(spawnDim))
+			defSpawnW.Position(int(spawnX), int(spawnY), int(spawnZ))
+			defSpawnW.Float32(spawnYaw)
+			defSpawnW.Float32(spawnPitch)
+		} else {
+			wx, wy, wz, wyaw := s.WorldSpawn()
+			defSpawnW.String(world.DimensionOverworld)
+			defSpawnW.Position(wx, wy, wz)
+			defSpawnW.Float32(wyaw)
+			defSpawnW.Float32(0)
+		}
+		_ = send(protocol.PlayDefaultSpawnPos, defSpawnW.Bytes())
+
+		// 10. ContainerSetContent, ActiveEffects, EntityData, Attributes, Experience, SetHealth.
+		_ = s.syncPlayerInventoryContainer(session)
+		_ = s.SendPlayerActiveEffects(session)
 		_ = send(protocol.PlaySetEntityData, s.PlayerAvatarEntityDataPacketByEntityID(session.EntityID))
 		_ = s.SendPlayerAttributes(session)
 		_ = s.SendPlayerExperience(session)
-		_ = s.SendPlayerActiveEffects(session)
-
-		heldW := protocol.NewWriter(4)
-		heldW.VarInt(selectedSlot)
-		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
-
-		_ = s.syncPlayerInventoryContainer(session)
-		_ = send(protocol.PlaySetTime, s.SetTimePacket())
-		s.SendWorldBorderToPlayer(session)
-		s.SendDifficultyToPlayer(session)
+		_ = send(protocol.PlaySetHealth, EncodeSetHealth(health, food, saturation))
 	}
 
 	if switchDim != nil {
@@ -677,6 +731,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 	} else if recenter != nil {
 		recenter(cx, cz)
 	}
+	s.NotifyNearbyEntityTrackers(normTarget, cx, cz)
 
 	s.TriggerChangeDimension(session, normTarget)
 	_ = s.SavePlayerData(session)

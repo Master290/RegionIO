@@ -210,6 +210,17 @@ func (s *Server) SetPlayerEntitySyncFunc(session *PlayerSession, fn func()) {
 	st.mu.Unlock()
 }
 
+func hasEntitySyncHandler(session *PlayerSession) bool {
+	if session == nil {
+		return false
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	ok := st.entitySyncFn != nil
+	st.mu.Unlock()
+	return ok
+}
+
 // NotifyNearbyEntityTrackers immediately invokes registered entity visibility
 // sync callbacks for joined players in dim whose view covers chunk (cx, cz).
 func (s *Server) NotifyNearbyEntityTrackers(dim string, cx, cz int32) {
@@ -1846,13 +1857,27 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		return errors.New("server: nil player session")
 	}
 	if !session.IsDead() {
+		if s.CompleteEndCreditsExit(session) {
+			prevDim := session.Dimension()
+			s.clearHiddenForEndCredits(session)
+			toDim, destX, destY, destZ, yaw, pitch, invalidHome := s.resolveEndReturnSpawnWithCheck(session)
+			if invalidHome && session.send != nil {
+				ev := protocol.NewWriter(5)
+				ev.Byte(protocol.GameEventNoRespawnBlockAvailable)
+				ev.Float32(0)
+				_ = session.send(protocol.PlayGameEvent, ev.Bytes())
+			}
+			if err := s.ChangePlayerDimension(session, toDim, destX, destY, destZ, yaw, pitch); err != nil {
+				return err
+			}
+			if world.NormalizeDimension(prevDim) != world.NormalizeDimension(toDim) {
+				s.TriggerChangeDimension(session, toDim)
+			}
+			return nil
+		}
 		if session.Dimension() == world.DimensionEnd {
 			_, err := s.TravelThroughEndPortal(session)
 			return err
-		}
-		if s.CompleteEndCreditsExit(session) {
-			toDim, destX, destY, destZ, yaw, pitch := s.ResolveEndReturnSpawn(session)
-			return s.ChangePlayerDimension(session, toDim, destX, destY, destZ, yaw, pitch)
 		}
 	}
 

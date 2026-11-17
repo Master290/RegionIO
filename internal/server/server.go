@@ -206,6 +206,10 @@ type PlayerSession struct {
 	onGround         bool
 	viewDist         int
 	gameMode         uint8
+	hasPrevGameMode  bool
+	prevGameMode     uint8
+	nextTeleportID   int32
+	ackedTeleportID  int32
 	health           float32
 	foodLevel        int32
 	foodSaturation   float32
@@ -1180,8 +1184,14 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 		pst.mu.Lock()
 		if d.PortalCooldown > 0 {
 			pst.portalCooldown = int(d.PortalCooldown)
+		} else {
+			pst.portalCooldown = 0
 		}
 		pst.seenCredits = d.SeenCredits
+		pst.hasEnteredNether = d.HasEnteredNether
+		pst.enteredOverworldX = d.EnteredNetherPos[0]
+		pst.enteredOverworldY = d.EnteredNetherPos[1]
+		pst.enteredOverworldZ = d.EnteredNetherPos[2]
 		pst.mu.Unlock()
 	}
 	if st := getPlayerXPState(session); st != nil {
@@ -1216,6 +1226,12 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	session.onGround = d.OnGround
 	if d.GameMode <= GameModeSpectator {
 		session.gameMode = d.GameMode
+	}
+	session.hasPrevGameMode = d.HasPrevGameMode && d.PrevGameMode <= GameModeSpectator
+	if session.hasPrevGameMode {
+		session.prevGameMode = d.PrevGameMode
+	} else {
+		session.prevGameMode = 0
 	}
 	ab := world.DefaultPlayerAbilities(session.gameMode)
 	if d.Abilities != nil {
@@ -1847,10 +1863,14 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	}
 	var portalCooldown int32
 	var seenCredits bool
+	var hasEnteredNether bool
+	var enteredNetherPos [3]float64
 	if pst := getPlayerPortalState(session); pst != nil {
 		pst.mu.Lock()
 		portalCooldown = int32(pst.portalCooldown)
 		seenCredits = pst.seenCredits
+		hasEnteredNether = pst.hasEnteredNether
+		enteredNetherPos = [3]float64{pst.enteredOverworldX, pst.enteredOverworldY, pst.enteredOverworldZ}
 		pst.mu.Unlock()
 	}
 	abilities := session.Abilities()
@@ -1907,6 +1927,10 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		HasLastDeathLocation: hasDeathLoc,
 		LastDeathDimension:   deathDim,
 		LastDeathPos:         deathPos,
+		HasPrevGameMode:      session.hasPrevGameMode,
+		PrevGameMode:         session.prevGameMode,
+		HasEnteredNether:     hasEnteredNether,
+		EnteredNetherPos:     enteredNetherPos,
 	}
 }
 
@@ -2097,7 +2121,7 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 		return PlayerSnapshot{}
 	}
 	dim := session.Dimension()
-	removedAfterDeath := session.RemovedAfterDeath()
+	removedAfterDeath := session.RemovedAfterDeath() || session.HiddenForEndCredits()
 	respawnSeq := session.RespawnSeq()
 	session.mu.RLock()
 	fs := session.flySpeed
@@ -2288,6 +2312,52 @@ func (s *Server) PlayerByName(name string) *PlayerSession {
 
 // TeleportPlayer updates session's server-side coordinates, sends the
 // clientbound player_position packet, and recenters the player's chunk view.
+// PreviousGameMode returns the player's previous game mode, if set.
+func (session *PlayerSession) PreviousGameMode() (uint8, bool) {
+	if session == nil {
+		return 0, false
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.prevGameMode, session.hasPrevGameMode
+}
+
+// NextTeleportID allocates and returns the next monotonically increasing
+// teleport synchronization ID for PlayPlayerPosition.
+func (session *PlayerSession) NextTeleportID() int32 {
+	if session == nil {
+		return 1
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.nextTeleportID <= 0 || session.nextTeleportID == math.MaxInt32 {
+		session.nextTeleportID = 1
+	} else {
+		session.nextTeleportID++
+	}
+	return session.nextTeleportID
+}
+
+// AcknowledgeTeleport records a client-acknowledged teleport ID from PlayAcceptTeleport.
+func (session *PlayerSession) AcknowledgeTeleport(id int32) {
+	if session == nil {
+		return
+	}
+	session.mu.Lock()
+	session.ackedTeleportID = id
+	session.mu.Unlock()
+}
+
+// LastAckedTeleportID returns the most recent teleport ID acknowledged by the client.
+func (session *PlayerSession) LastAckedTeleportID() int32 {
+	if session == nil {
+		return 0
+	}
+	session.mu.RLock()
+	defer session.mu.RUnlock()
+	return session.ackedTeleportID
+}
+
 func (s *Server) TeleportPlayer(session *PlayerSession, x, y, z float64, yaw, pitch float32) error {
 	if session == nil {
 		return errors.New("server: nil player session")
@@ -2314,7 +2384,7 @@ func (s *Server) TeleportPlayer(session *PlayerSession, x, y, z float64, yaw, pi
 	_ = session.send(protocol.PlayChunkCacheCenter, centerW.Bytes())
 
 	w := protocol.NewWriter(64)
-	w.VarInt(1)
+	w.VarInt(session.NextTeleportID())
 	w.Float64(x).Float64(y).Float64(z)
 	w.Float64(0).Float64(0).Float64(0)
 	w.Float32(yaw)
@@ -2559,6 +2629,10 @@ func (s *Server) SetPlayerGameMode(session *PlayerSession, mode uint8) error {
 	session.mu.Lock()
 	prevMode := session.gameMode
 	prevCam := session.cameraEntityID
+	if prevMode != mode {
+		session.hasPrevGameMode = true
+		session.prevGameMode = prevMode
+	}
 	session.gameMode = mode
 	switch mode {
 	case GameModeSpectator:

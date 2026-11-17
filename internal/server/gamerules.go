@@ -1274,6 +1274,10 @@ func (s *Server) EncodePlayerLoginPacket(session *PlayerSession, viewDistance in
 	}
 	var opts CommonSpawnInfoOptions
 	if session != nil {
+		if prevGM, ok := session.PreviousGameMode(); ok {
+			opts.HasPrevGameMode = true
+			opts.PrevGameMode = prevGM
+		}
 		if deathDim, deathPos, ok := session.LastDeathLocation(); ok {
 			opts.HasLastDeathLocation = true
 			opts.LastDeathDimension = deathDim

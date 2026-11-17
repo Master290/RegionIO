@@ -308,6 +308,10 @@ type PlayerData struct {
 	HasLastDeathLocation  bool
 	LastDeathDimension    string
 	LastDeathPos          [3]int32
+	HasPrevGameMode       bool
+	PrevGameMode          uint8
+	HasEnteredNether      bool
+	EnteredNetherPos      [3]float64
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -360,6 +364,9 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 		root.Set("OnGround", nbt.Byte(0))
 	}
 	root.Set("playerGameType", nbt.Int(int32(d.GameMode)))
+	if d.HasPrevGameMode && d.PrevGameMode <= 3 {
+		root.Set("previousPlayerGameType", nbt.Int(int32(d.PrevGameMode)))
+	}
 
 	health := d.Health
 	if d.Dead {
@@ -674,6 +681,16 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	if d.SeenCredits {
 		root.Set("seenCredits", nbt.Byte(1))
 	}
+	if d.HasEnteredNether {
+		root.Set("entered_nether_pos", nbt.List{
+			ElemID: nbt.TagDouble,
+			Elems: []nbt.Tag{
+				nbt.Double(d.EnteredNetherPos[0]),
+				nbt.Double(d.EnteredNetherPos[1]),
+				nbt.Double(d.EnteredNetherPos[2]),
+			},
+		})
+	}
 	if d.HasLastDeathLocation {
 		ldl := nbt.NewCompound()
 		ldl.Set("dimension", nbt.String(NormalizeDimension(d.LastDeathDimension)))
@@ -819,6 +836,13 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 		d.GameMode = uint8(gm)
 	} else if gmByte, ok := nbtGetByte(root, "playerGameType"); ok && gmByte >= 0 && gmByte <= 3 {
 		d.GameMode = uint8(gmByte)
+	}
+	if pgm, ok := nbtGetInt(root, "previousPlayerGameType"); ok && pgm >= 0 && pgm <= 3 {
+		d.HasPrevGameMode = true
+		d.PrevGameMode = uint8(pgm)
+	} else if pgmByte, ok := nbtGetByte(root, "previousPlayerGameType"); ok && pgmByte >= 0 && pgmByte <= 3 {
+		d.HasPrevGameMode = true
+		d.PrevGameMode = uint8(pgmByte)
 	}
 
 	if h, ok := nbtGetFloat(root, "Health"); ok {
@@ -1188,6 +1212,15 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	}
 	if sc, ok := nbtGetByte(root, "seenCredits"); ok && sc != 0 {
 		d.SeenCredits = true
+	}
+	if enList, ok := nbtGetList(root, "entered_nether_pos"); ok && len(enList.Elems) == 3 {
+		x0, ok0 := enList.Elems[0].(nbt.Double)
+		y0, ok1 := enList.Elems[1].(nbt.Double)
+		z0, ok2 := enList.Elems[2].(nbt.Double)
+		if ok0 && ok1 && ok2 {
+			d.HasEnteredNether = true
+			d.EnteredNetherPos = [3]float64{float64(x0), float64(y0), float64(z0)}
+		}
 	}
 	if ldl, ok := nbtGetCompound(root, "LastDeathLocation"); ok && ldl != nil {
 		dimStr, okDim := nbtGetString(ldl, "dimension")

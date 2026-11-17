@@ -126,16 +126,17 @@ func (s *Server) portalManager() *serverPortalManager {
 }
 
 type playerPortalState struct {
-	mu                 sync.Mutex
-	inPortal           bool
-	portalCooldown     int
-	portalTime         int
-	seenCredits        bool
-	pendingCreditsExit bool
-	hasEnteredNether   bool
-	enteredOverworldX  float64
-	enteredOverworldY  float64
-	enteredOverworldZ  float64
+	mu                  sync.Mutex
+	inPortal            bool
+	portalCooldown      int
+	portalTime          int
+	seenCredits         bool
+	pendingCreditsExit  bool
+	hiddenForEndCredits bool
+	hasEnteredNether    bool
+	enteredOverworldX   float64
+	enteredOverworldY   float64
+	enteredOverworldZ   float64
 }
 
 var playerPortals sync.Map // map[*PlayerSession]*playerPortalState
@@ -187,6 +188,9 @@ func (s *Server) SetPlayerPortalCooldown(session *PlayerSession, ticks int) {
 	st := getPlayerPortalState(session)
 	st.mu.Lock()
 	st.portalCooldown = ticks
+	if ticks == 0 {
+		st.inPortal = false
+	}
 	st.mu.Unlock()
 }
 
@@ -263,6 +267,28 @@ func (s *Server) CompleteEndCreditsExit(session *PlayerSession) bool {
 	return wasPending
 }
 
+// HiddenForEndCredits reports whether session is currently hidden from End
+// observers while viewing the End Poem / credits before PERFORM_RESPAWN.
+func (session *PlayerSession) HiddenForEndCredits() bool {
+	if session == nil {
+		return false
+	}
+	st := getPlayerPortalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.hiddenForEndCredits
+}
+
+func (s *Server) clearHiddenForEndCredits(session *PlayerSession) {
+	if session == nil {
+		return
+	}
+	st := getPlayerPortalState(session)
+	st.mu.Lock()
+	st.hiddenForEndCredits = false
+	st.mu.Unlock()
+}
+
 // EnteredNetherPosition returns the Overworld coordinates where session most recently
 // entered a Nether portal (used by the "Subspace Bubble" / minecraft:nether/fast_travel
 // advancement when returning to the Overworld).
@@ -278,12 +304,12 @@ func (s *Server) EnteredNetherPosition(session *PlayerSession) (x, y, z float64,
 
 // PlayerNetherPortalWaitTicks returns the number of ticks a player must stand in
 // a Nether portal before travelling, controlled by playersNetherPortalDefaultDelay
-// (default 80 in Survival/Adventure) and playersNetherPortalCreativeDelay (default 1 in Creative).
+// (default 80 in Survival/Adventure) and playersNetherPortalCreativeDelay (default 1 in Creative/Invulnerable).
 func (s *Server) PlayerNetherPortalWaitTicks(session *PlayerSession) int {
 	if session == nil {
 		return 80
 	}
-	if session.Snapshot().GameMode == GameModeCreative {
+	if session.Snapshot().GameMode == GameModeCreative || session.Abilities().Invulnerable {
 		if s != nil {
 			if v := s.GameRuleInt("playersNetherPortalCreativeDelay"); v >= 0 {
 				return v
@@ -491,6 +517,106 @@ func (s *Server) UseEyeOfEnderOnFrame(session *PlayerSession, x, y, z int) (plac
 	return true, activated, placed, nil
 }
 
+func (s *Server) findOrCreatePortalWithinWorldBorder(cache *world.Cache, dim string, targetX, targetY, targetZ int, axis string) (world.PortalShape, bool) {
+	if s == nil || s.WorldBorder() == nil || cache == nil {
+		return world.FindOrCreatePortal(cache, dim, targetX, targetY, targetZ, axis)
+	}
+	wb := s.WorldBorder()
+	shapeWithinBorder := func(sh world.PortalShape) bool {
+		sx, _, sz := sh.SpawnPosition()
+		if !wb.IsWithinBounds(sx, sz) {
+			return false
+		}
+		for _, pos := range sh.InteriorPositions() {
+			if !wb.IsBlockWithinBounds(pos.X, pos.Z) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if cand, ok := world.FindClosestPortal(cache, dim, targetX, targetY, targetZ); ok && shapeWithinBorder(cand) {
+		return cand, false
+	}
+
+	normDim := world.NormalizeDimension(dim)
+	radius := world.OverworldPortalSearchRadius
+	if normDim == world.DimensionNether {
+		radius = world.NetherPortalSearchRadius
+	}
+	minY := -64
+	maxY := 320
+	if dt, ok := world.LookupDimensionType(normDim); ok {
+		minY = dt.MinY
+		maxY = dt.MinY + dt.Height
+	}
+	var (
+		bestShape world.PortalShape
+		bestDist  = math.MaxFloat64
+		found     bool
+	)
+	for _, poi := range cache.PortalPOIsInRadius(targetX, targetZ, radius) {
+		if poi.Pos.Y < minY || poi.Pos.Y >= maxY {
+			continue
+		}
+		if !wb.IsBlockWithinBounds(poi.Pos.X, poi.Pos.Z) {
+			continue
+		}
+		st := cache.GetBlock(poi.Pos.X, poi.Pos.Y, poi.Pos.Z)
+		if !world.IsNetherPortalState(st) {
+			continue
+		}
+		sh, ok := world.FindCompletePortalShape(cache, poi.Pos.X, poi.Pos.Y, poi.Pos.Z)
+		if !ok {
+			_, props, _ := world.BlockStateProperties(st)
+			pAxis := props["axis"]
+			if pAxis != world.PortalAxisZ {
+				pAxis = world.PortalAxisX
+			}
+			sh = world.PortalShape{
+				Axis:       pAxis,
+				BottomLeft: poi.Pos,
+				Width:      world.MinPortalWidth,
+				Height:     world.MinPortalHeight,
+			}
+		}
+		if !shapeWithinBorder(sh) {
+			continue
+		}
+		dx := float64(poi.Pos.X - targetX)
+		dy := float64(poi.Pos.Y - targetY)
+		dz := float64(poi.Pos.Z - targetZ)
+		dist := dx*dx + dy*dy + dz*dz
+		if !found || dist < bestDist || (dist == bestDist && sh.BottomLeft.Y < bestShape.BottomLeft.Y) {
+			bestShape = sh
+			bestDist = dist
+			found = true
+		}
+	}
+	if found {
+		return bestShape, false
+	}
+
+	stepX, stepZ := 1, 0
+	if axis == world.PortalAxisZ {
+		stepX, stepZ = 0, 1
+	}
+	cx0, _, cz0 := wb.ClampToBounds(float64(targetX), float64(targetY), float64(targetZ))
+	bx, bz := int(math.Floor(cx0)), int(math.Floor(cz0))
+	if !wb.IsBlockWithinBounds(bx+stepX, bz+stepZ) || !wb.IsWithinBounds(float64(bx+stepX)+0.5, float64(bz+stepZ)+0.5) {
+		shiftX := bx - stepX
+		shiftZ := bz - stepZ
+		if wb.IsBlockWithinBounds(shiftX, shiftZ) {
+			bx, bz = shiftX, shiftZ
+		} else {
+			cxs, _, czs := wb.ClampToBounds(float64(shiftX), float64(targetY), float64(shiftZ))
+			bx, bz = int(math.Floor(cxs)), int(math.Floor(czs))
+		}
+	}
+	created := world.CreateNetherPortal(cache, dim, bx, targetY, bz, axis)
+	return created, true
+}
+
 // TravelThroughNetherPortal transports session between minecraft:overworld and
 // minecraft:the_nether using vanilla 8:1 coordinate scaling, searching for an
 // existing destination portal within range or creating a new one if none exists.
@@ -533,6 +659,9 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 	}
 
 	scaledX, scaledY, scaledZ, _ := world.ScalePortalCoordinates(fromDim, toDim, snap.X, snap.Y, snap.Z)
+	if wb := s.WorldBorder(); wb != nil {
+		scaledX, scaledY, scaledZ = wb.ClampToBounds(scaledX, scaledY, scaledZ)
+	}
 	targetX := int(math.Floor(scaledX))
 	targetY := int(math.Floor(scaledY))
 	targetZ := int(math.Floor(scaledZ))
@@ -542,8 +671,11 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 		return PortalTravelResult{}, errors.New("server: nil destination dimension cache")
 	}
 
-	shape, created := world.FindOrCreatePortal(destCache, toDim, targetX, targetY, targetZ, axis)
+	shape, created := s.findOrCreatePortalWithinWorldBorder(destCache, toDim, targetX, targetY, targetZ, axis)
 	destX, destY, destZ := shape.SpawnPosition()
+	if wb := s.WorldBorder(); wb != nil {
+		destX, destY, destZ = wb.ClampToBounds(destX, destY, destZ)
+	}
 	destYaw := snap.Yaw
 	if hasSrcShape {
 		relAcross, relUp := srcShape.RelativeOffset(snap.X, snap.Y, snap.Z)
@@ -580,7 +712,7 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 		}
 	}
 	if session.send != nil {
-		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, int(math.Floor(destX)), int(math.Floor(destY)), int(math.Floor(destZ)), 0, false))
+		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, 0, 0, 0, 0, false))
 	}
 	s.TriggerChangeDimension(session, toDim)
 	if checkFastTravel {
@@ -607,6 +739,11 @@ func (s *Server) TravelThroughNetherPortal(session *PlayerSession) (PortalTravel
 //     and falls back to world spawn.
 //   - Default unforced world spawn -> world spawn coordinates.
 func (s *Server) ResolveEndReturnSpawn(session *PlayerSession) (toDim string, destX, destY, destZ float64, yaw, pitch float32) {
+	toDim, destX, destY, destZ, yaw, pitch, _ = s.resolveEndReturnSpawnWithCheck(session)
+	return toDim, destX, destY, destZ, yaw, pitch
+}
+
+func (s *Server) resolveEndReturnSpawnWithCheck(session *PlayerSession) (toDim string, destX, destY, destZ float64, yaw, pitch float32, invalidHome bool) {
 	wx, wy, wz, wyaw := s.WorldSpawn()
 	toDim = world.DimensionOverworld
 	destX = float64(wx) + 0.5
@@ -615,7 +752,7 @@ func (s *Server) ResolveEndReturnSpawn(session *PlayerSession) (toDim string, de
 	yaw = wyaw
 	pitch = 0
 	if s == nil || session == nil {
-		return toDim, destX, destY, destZ, yaw, pitch
+		return toDim, destX, destY, destZ, yaw, pitch, false
 	}
 	snap := session.Snapshot()
 	if !snap.HasSpawn {
@@ -624,22 +761,22 @@ func (s *Server) ResolveEndReturnSpawn(session *PlayerSession) (toDim string, de
 				destY = float64(sy)
 			}
 		}
-		return toDim, destX, destY, destZ, yaw, pitch
+		return toDim, destX, destY, destZ, yaw, pitch, false
 	}
 	spawnDim := world.NormalizeDimension(snap.SpawnDimension)
 	if snap.SpawnForced {
-		return spawnDim, float64(snap.SpawnX) + 0.5, float64(snap.SpawnY), float64(snap.SpawnZ) + 0.5, snap.SpawnYaw, snap.SpawnPitch
+		return spawnDim, float64(snap.SpawnX) + 0.5, float64(snap.SpawnY), float64(snap.SpawnZ) + 0.5, snap.SpawnYaw, snap.SpawnPitch, false
 	}
 	// Check if the player's saved spawn is at a bed or respawn anchor, or was moved away from default world spawn.
 	spawnCache := s.DimensionChunks(spawnDim)
 	if spawnCache != nil {
 		blk := spawnCache.GetBlock(int(snap.SpawnX), int(snap.SpawnY), int(snap.SpawnZ))
 		if IsBedBlock(blk) || IsRespawnAnchorBlock(blk) {
-			rDim, rx, ry, rz, ryaw, rpitch, _, _ := s.ResolvePlayerRespawn(session)
-			return rDim, rx, ry, rz, ryaw, rpitch
+			rDim, rx, ry, rz, ryaw, rpitch, _, inv := s.ResolvePlayerRespawn(session)
+			return rDim, rx, ry, rz, ryaw, rpitch, inv
 		}
 	}
-	return spawnDim, float64(snap.SpawnX) + 0.5, float64(snap.SpawnY), float64(snap.SpawnZ) + 0.5, snap.SpawnYaw, snap.SpawnPitch
+	return spawnDim, float64(snap.SpawnX) + 0.5, float64(snap.SpawnY), float64(snap.SpawnZ) + 0.5, snap.SpawnYaw, snap.SpawnPitch, false
 }
 
 // EnsureEndExitPodium places or updates the End exit fountain podium at (0, portalY, 0)
@@ -657,6 +794,15 @@ func (s *Server) EnsureEndExitPodium(active bool) (portalY int, ok bool) {
 	if sy, okY := endCache.SafeSpawnY(0, 0); okY && sy >= 48 {
 		portalY = sy - 1
 	}
+	mgr := s.dragonManager()
+	mgr.mu.Lock()
+	mgr.fight.Initialized = true
+	mgr.fight.PortalY = portalY
+	if active {
+		mgr.fight.DragonKilled = true
+		mgr.fight.PreviouslyKilled = true
+	}
+	mgr.mu.Unlock()
 	bedrock, okB := world.BlockStateByName("minecraft:bedrock", nil)
 	if !okB {
 		bedrock = world.StateBedrock
@@ -796,7 +942,7 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 		}
 	}
 	if session.send != nil {
-		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, int(math.Floor(destX)), int(math.Floor(destY)), int(math.Floor(destZ)), 0, false))
+		_ = session.send(PlayLevelEventCB, EncodeLevelEventPacket(LevelEventPortalTravel, 0, 0, 0, 0, false))
 	}
 	s.TriggerChangeDimension(session, toDim)
 	return PortalTravelResult{
@@ -806,6 +952,105 @@ func (s *Server) TravelThroughEndPortal(session *PlayerSession) (PortalTravelRes
 		DestX:         destX,
 		DestY:         destY,
 		DestZ:         destZ,
+	}, nil
+}
+
+// enterEndPortalFromGameplay handles stepping into minecraft:end_portal during
+// live gameplay, matching vanilla ServerPlayer.changeDimension / showEndCredits:
+//   - First exit from minecraft:the_end (!seenCredits): sets seenCredits=true,
+//     pendingCreditsExit=true, hiddenForEndCredits=true, hides the player from
+//     End observers, and sends ONLY PlayGameEvent(WIN_GAME, 1.0) while waiting
+//     for ClientCommand(PERFORM_RESPAWN) via RespawnPlayer.
+//   - Subsequent exits from minecraft:the_end (seenCredits already true):
+//     transfers directly to ResolveEndReturnSpawn without WIN_GAME or PERFORM_RESPAWN.
+//   - Entering from non-End dimensions delegates to TravelThroughEndPortal.
+func (s *Server) enterEndPortalFromGameplay(session *PlayerSession) (PortalTravelResult, error) {
+	if s == nil || session == nil {
+		return PortalTravelResult{}, errors.New("server: nil player session")
+	}
+	if session.Dimension() != world.DimensionEnd {
+		return s.TravelThroughEndPortal(session)
+	}
+
+	st := getPlayerPortalState(session)
+	st.mu.Lock()
+	st.inPortal = true
+	st.portalCooldown = DefaultPortalCooldownTicks
+	st.portalTime = 0
+	showCredits := !st.seenCredits
+	st.seenCredits = true
+	if showCredits {
+		st.pendingCreditsExit = true
+		st.hiddenForEndCredits = true
+	}
+	st.mu.Unlock()
+
+	if showCredits {
+		s.DismountPlayerVehicle(session)
+		snap := session.Snapshot()
+		cx := int32(int64(math.Floor(snap.X)) >> 4)
+		cz := int32(int64(math.Floor(snap.Z)) >> 4)
+		removeBody := encodeRemoveEntitiesPacket(nil, []int32{session.EntityID})
+		s.playersMu.RLock()
+		viewers := make([]*PlayerSession, 0, len(s.players))
+		for _, player := range s.players {
+			if player != nil && player.IsJoined() && player.Profile.UUID != session.Profile.UUID {
+				viewers = append(viewers, player)
+			}
+		}
+		s.playersMu.RUnlock()
+		for _, viewer := range viewers {
+			if viewer.Dimension() != world.DimensionEnd || hasEntitySyncHandler(viewer) {
+				continue
+			}
+			vSnap := viewer.Snapshot()
+			vcx := int32(int64(math.Floor(vSnap.X)) >> 4)
+			vcz := int32(int64(math.Floor(vSnap.Z)) >> 4)
+			if chunkDistance(vcx, vcz, cx, cz) <= int32(vSnap.ViewDistance) && viewer.send != nil {
+				_ = viewer.send(protocol.PlayRemoveEntities, removeBody)
+			}
+		}
+		s.NotifyNearbyEntityTrackers(world.DimensionEnd, cx, cz)
+
+		if session.send != nil {
+			ev := protocol.NewWriter(5)
+			ev.Byte(protocol.GameEventWinGame)
+			ev.Float32(1.0)
+			_ = session.send(protocol.PlayGameEvent, ev.Bytes())
+		}
+		return PortalTravelResult{
+			Travelled:      true,
+			FromDimension:  world.DimensionEnd,
+			ToDimension:    world.DimensionEnd,
+			ShowEndCredits: true,
+		}, nil
+	}
+
+	toDim, destX, destY, destZ, yaw, pitch, invalidHome := s.resolveEndReturnSpawnWithCheck(session)
+	if invalidHome && session.send != nil {
+		ev := protocol.NewWriter(5)
+		ev.Byte(protocol.GameEventNoRespawnBlockAvailable)
+		ev.Float32(0)
+		_ = session.send(protocol.PlayGameEvent, ev.Bytes())
+	}
+	if vID := s.PlayerMountedVehicle(session); vID > 0 {
+		if err := s.ChangeVehicleDimensionWithPassengers(vID, toDim, destX, destY, destZ, yaw); err != nil {
+			return PortalTravelResult{}, err
+		}
+	} else {
+		if err := s.ChangePlayerDimension(session, toDim, destX, destY, destZ, yaw, pitch); err != nil {
+			return PortalTravelResult{}, err
+		}
+	}
+	s.TriggerChangeDimension(session, toDim)
+	return PortalTravelResult{
+		Travelled:      true,
+		FromDimension:  world.DimensionEnd,
+		ToDimension:    toDim,
+		DestX:          destX,
+		DestY:          destY,
+		DestZ:          destZ,
+		ShowEndCredits: false,
 	}, nil
 }
 
@@ -1317,6 +1562,58 @@ func (s *Server) CheckPlayerPortal(session *PlayerSession) (PortalTravelResult, 
 	return s.TravelThroughNetherPortal(session)
 }
 
+// HandlePlayerMovePortal inspects portal blocks at session's position during a
+// movement packet. Instant portals (End portal / End gateway) trigger on contact
+// when not blocked by pendingCreditsExit, inPortal, or portalCooldown; Nether portals
+// wait for 20 TPS TickPlayerPortal warmup (80 ticks in Survival, 1 in Creative).
+func (s *Server) HandlePlayerMovePortal(session *PlayerSession) (PortalTravelResult, error) {
+	if s == nil || session == nil || session.IsDead() {
+		return PortalTravelResult{}, nil
+	}
+	cache := s.PlayerChunks(session)
+	if cache == nil {
+		return PortalTravelResult{}, nil
+	}
+	snap := session.Snapshot()
+	bx := int(math.Floor(snap.X))
+	by := int(math.Floor(snap.Y))
+	bz := int(math.Floor(snap.Z))
+
+	feetName := world.BlockName(cache.GetBlock(bx, by, bz))
+	bodyName := world.BlockName(cache.GetBlock(bx, by+1, bz))
+
+	inNetherPortal := feetName == "minecraft:nether_portal" || bodyName == "minecraft:nether_portal"
+	inEndPortal := feetName == "minecraft:end_portal" || bodyName == "minecraft:end_portal"
+	inEndGateway := feetName == "minecraft:end_gateway" || bodyName == "minecraft:end_gateway"
+
+	st := getPlayerPortalState(session)
+	if !inNetherPortal && !inEndPortal && !inEndGateway {
+		st.mu.Lock()
+		st.inPortal = false
+		st.mu.Unlock()
+		return PortalTravelResult{}, nil
+	}
+
+	st.mu.Lock()
+	blocked := st.pendingCreditsExit || st.inPortal || st.portalCooldown > 0
+	st.mu.Unlock()
+	if blocked {
+		return PortalTravelResult{}, nil
+	}
+
+	if inEndGateway {
+		gy := by
+		if feetName != "minecraft:end_gateway" && bodyName == "minecraft:end_gateway" {
+			gy = by + 1
+		}
+		return s.TravelThroughEndGateway(session, bx, gy, bz)
+	}
+	if inEndPortal {
+		return s.enterEndPortalFromGameplay(session)
+	}
+	return PortalTravelResult{}, nil
+}
+
 // TickPlayerPortal advances one 20 TPS tick of portal warmup/cooldown for session:
 //   - Outside a portal: resets inPortal=false, decays portalTime by 4/tick (down to 0),
 //     and decrements portalCooldown by 1/tick (down to 0).
@@ -1363,7 +1660,10 @@ func (s *Server) TickPlayerPortal(session *PlayerSession) (PortalTravelResult, e
 	}
 
 	st.mu.Lock()
-	if st.inPortal || st.portalCooldown > 0 {
+	if st.pendingCreditsExit || st.inPortal || st.portalCooldown > 0 {
+		if st.portalCooldown > 0 {
+			st.portalCooldown = DefaultPortalCooldownTicks
+		}
 		st.mu.Unlock()
 		return PortalTravelResult{}, nil
 	}
@@ -1377,7 +1677,7 @@ func (s *Server) TickPlayerPortal(session *PlayerSession) (PortalTravelResult, e
 	}
 	if inEndPortal {
 		st.mu.Unlock()
-		return s.TravelThroughEndPortal(session)
+		return s.enterEndPortalFromGameplay(session)
 	}
 	st.portalTime++
 	curTime := st.portalTime
@@ -1646,12 +1946,18 @@ func (s *Server) CheckEntityPortal(entityID int32) (PortalTravelResult, error) {
 		}
 	}
 	scaledX, scaledY, scaledZ, _ := world.ScalePortalCoordinates(fromDim, toDim, ent.X, ent.Y, ent.Z)
+	if wb := s.WorldBorder(); wb != nil {
+		scaledX, scaledY, scaledZ = wb.ClampToBounds(scaledX, scaledY, scaledZ)
+	}
 	destCache := s.DimensionChunks(toDim)
 	if destCache == nil {
 		return PortalTravelResult{}, nil
 	}
-	shape, created := world.FindOrCreatePortal(destCache, toDim, int(math.Floor(scaledX)), int(math.Floor(scaledY)), int(math.Floor(scaledZ)), axis)
+	shape, created := s.findOrCreatePortalWithinWorldBorder(destCache, toDim, int(math.Floor(scaledX)), int(math.Floor(scaledY)), int(math.Floor(scaledZ)), axis)
 	destX, destY, destZ := shape.SpawnPosition()
+	if wb := s.WorldBorder(); wb != nil {
+		destX, destY, destZ = wb.ClampToBounds(destX, destY, destZ)
+	}
 	if ent.IsVehicle() {
 		if err := s.ChangeVehicleDimensionWithPassengers(entityID, toDim, destX, destY, destZ, ent.Yaw); err != nil {
 			return PortalTravelResult{}, err
