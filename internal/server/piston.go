@@ -92,7 +92,7 @@ func PistonFragileBlockDropItem(state uint16) (world.ItemStack, bool) {
 		return world.ItemStack{}, false
 	case "minecraft:redstone_wire":
 		return world.NewNamedItemStack("minecraft:redstone", 1), true
-	case "minecraft:tripwire":
+	case "minecraft:cobweb", "minecraft:tripwire":
 		return world.NewNamedItemStack("minecraft:string", 1), true
 	case "minecraft:wall_torch":
 		return world.NewNamedItemStack("minecraft:torch", 1), true
@@ -100,6 +100,8 @@ func PistonFragileBlockDropItem(state uint16) (world.ItemStack, bool) {
 		return world.NewNamedItemStack("minecraft:soul_torch", 1), true
 	case "minecraft:redstone_wall_torch":
 		return world.NewNamedItemStack("minecraft:redstone_torch", 1), true
+	case "minecraft:copper_wall_torch":
+		return world.NewNamedItemStack("minecraft:copper_torch", 1), true
 	case "minecraft:cave_vines", "minecraft:cave_vines_plant":
 		props := world.BlockProperties(state)
 		if props["berries"] == "true" {
@@ -112,6 +114,15 @@ func PistonFragileBlockDropItem(state uint16) (world.ItemStack, bool) {
 		if props["part"] == "head" {
 			return world.ItemStack{}, false
 		}
+	}
+	if strings.HasSuffix(name, "_door") && !strings.HasSuffix(name, "_trapdoor") {
+		props := world.BlockProperties(state)
+		if props["half"] == "upper" {
+			return world.ItemStack{}, false
+		}
+	}
+	if drops := world.EvaluateBlockDrops(state, "", false, 0, nil); len(drops) > 0 && !drops[0].IsEmpty() {
+		return drops[0], true
 	}
 	st := world.NewNamedItemStack(name, 1)
 	if st.IsEmpty() {
@@ -144,17 +155,14 @@ func (s *Server) BindPistonAndRedstoneHooks(dim string) *world.Cache {
 		}
 	})
 
-	cache.SetPistonMoveEntitiesListener(func(pistonPos world.BlockPos, facing string, extending bool, movedBlocks []world.BlockPos, movedStates []uint16) {
-		pistonState := cache.GetBlock(pistonPos.X, pistonPos.Y, pistonPos.Z)
+	cache.SetPistonBlockEventListener(func(pistonPos world.BlockPos, isSticky bool, actionID byte, facing string) {
 		blockID := PistonBlockID
-		if world.BlockName(pistonState) == "minecraft:sticky_piston" {
+		if isSticky {
 			blockID = StickyPistonBlockID
 		}
-		actionID := byte(0) // 0 = extend, 1 = retract
 		soundName := "minecraft:block.piston.extend"
 		gameEvent := GameEventBlockActivate
-		if !extending {
-			actionID = 1
+		if actionID != world.PistonTriggerExtend {
 			soundName = "minecraft:block.piston.contract"
 			gameEvent = GameEventBlockDeactivate
 		}
@@ -165,15 +173,12 @@ func (s *Server) BindPistonAndRedstoneHooks(dim string) *world.Cache {
 		s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
 			EncodeSoundPacket(soundName, SoundSourceBlocks, float64(pistonPos.X)+0.5, float64(pistonPos.Y)+0.5, float64(pistonPos.Z)+0.5, 0.5, 0.75, 0))
 		s.EmitGameEvent(normDim, gameEvent, float64(pistonPos.X)+0.5, float64(pistonPos.Y)+0.5, float64(pistonPos.Z)+0.5, VibrationSource{})
+	})
 
+	cache.SetPistonMoveEntitiesListener(func(pistonPos world.BlockPos, facing string, extending bool, movedBlocks []world.BlockPos, movedStates []uint16) {
 		var checkPositions []world.BlockPos
 		var slimePositions []world.BlockPos
 		checkPositions = append(checkPositions, movedBlocks...)
-		if extending {
-			dx, dy, dz := DispenserFacingVector(facing)
-			headPos := world.BlockPos{X: pistonPos.X + dx, Y: pistonPos.Y + dy, Z: pistonPos.Z + dz}
-			checkPositions = append(checkPositions, headPos)
-		}
 		for i, pos := range movedBlocks {
 			st := cache.GetBlock(pos.X, pos.Y, pos.Z)
 			if i < len(movedStates) && movedStates[i] != 0 {
@@ -282,6 +287,17 @@ func (s *Server) PushEntitiesWithPiston(dim, facing string, movedPositions, slim
 						ent.X += float64(dx)
 						ent.Y += float64(dy)
 						ent.Z += float64(dz)
+						if isSlime {
+							if dx != 0 {
+								ent.VelocityX = int16(dx * 8000)
+							}
+							if dy != 0 {
+								ent.VelocityY = int16(dy * 8000)
+							}
+							if dz != 0 {
+								ent.VelocityZ = int16(dz * 8000)
+							}
+						}
 					})
 					if isSlime {
 						velState.mu.Lock()

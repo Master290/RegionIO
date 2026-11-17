@@ -336,3 +336,60 @@ func TestDragonEggInteractAndSurvivalAttackTeleport(t *testing.T) {
 	}
 }
 
+func TestServerPistonSlimeBounceVsHoneyNoBounceAndBlockEventParity2612(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.WorldDir = t.TempDir()
+	cache := world.NewCache(-1, world.GenerateFlat)
+	srv, err := NewWithCache(cfg, cache)
+	if err != nil {
+		t.Fatalf("NewWithCache: %v", err)
+	}
+	dim := world.DimensionOverworld
+	srv.BindPistonAndRedstoneHooks(dim)
+	y := world.FlatSurfaceY + 2
+
+	stickyUp, _ := world.BlockStateIDByProperties("minecraft:sticky_piston", map[string]string{
+		"facing":   "up",
+		"extended": "false",
+	})
+	slimeSt, _ := world.BlockStateIDByProperties("minecraft:slime_block", nil)
+	honeySt, _ := world.BlockStateIDByProperties("minecraft:honey_block", nil)
+	redstoneBlock, _ := world.BlockStateIDByProperties("minecraft:redstone_block", nil)
+
+	// 1. Upward slime_block launcher imparts +1.0 Y velocity impulse (`VelocityY == 8000` and `[0, 1, 0]`):
+	cache.SetBlock(10, y, 10, stickyUp)
+	cache.SetBlock(10, y+1, 10, slimeSt)
+	slimeStandID, err := srv.SpawnArmorStand(dim, 10.5, float64(y+2), 10.5, 0)
+	if err != nil {
+		t.Fatalf("SpawnArmorStand slime: %v", err)
+	}
+	cache.ApplyBlockWithUpdates(10, y-1, 10, redstoneBlock)
+	cache.StepBlockUpdates(world.PistonTickDelay)
+
+	slimeEnt := srv.entities.Get(slimeStandID)
+	if slimeEnt == nil || slimeEnt.Y < float64(y+3)-0.1 {
+		t.Fatalf("expected upward slime launcher to push entity to y+3, got %+v", slimeEnt)
+	}
+	if vel, ok := srv.LastPistonSlimeVelocity(slimeStandID); !ok || vel != [3]float64{0, 1, 0} || slimeEnt.VelocityY != 8000 {
+		t.Fatalf("expected upward slime bounce [0,1,0] (VelocityY=8000), got vel=(%v,%v) VelocityY=%d", vel, ok, slimeEnt.VelocityY)
+	}
+
+	// 2. Upward honey_block pushes entity out of moving_piston path WITHOUT bounce impulse!
+	cache.SetBlock(20, y, 10, stickyUp)
+	cache.SetBlock(20, y+1, 10, honeySt)
+	honeyStandID, err := srv.SpawnArmorStand(dim, 20.5, float64(y+2), 10.5, 0)
+	if err != nil {
+		t.Fatalf("SpawnArmorStand honey: %v", err)
+	}
+	cache.ApplyBlockWithUpdates(20, y-1, 10, redstoneBlock)
+	cache.StepBlockUpdates(world.PistonTickDelay)
+
+	honeyEnt := srv.entities.Get(honeyStandID)
+	if honeyEnt == nil || honeyEnt.Y < float64(y+3)-0.1 {
+		t.Fatalf("expected upward honey_block to push entity to y+3, got %+v", honeyEnt)
+	}
+	if vel, ok := srv.LastPistonSlimeVelocity(honeyStandID); ok || honeyEnt.VelocityY != 0 {
+		t.Fatalf("expected honey_block to impart ZERO bounce impulse, got vel=(%v,%v) VelocityY=%d", vel, ok, honeyEnt.VelocityY)
+	}
+}
+

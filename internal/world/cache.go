@@ -420,8 +420,11 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	delete(c.loads, key)
 	close(pending.done)
 	c.mu.Unlock()
-	if fromStore && loadErr == nil && ch != nil && len(ch.persistedTicks) > 0 {
-		c.ImportChunkScheduledBlockTicks(cx, cz, ch.persistedTicks)
+	if fromStore && loadErr == nil && ch != nil {
+		if len(ch.persistedTicks) > 0 {
+			c.ImportChunkScheduledBlockTicks(cx, cz, ch.persistedTicks)
+		}
+		c.importChunkPistonBlockEntitiesFromChunk(ch)
 	}
 	return ch, loadErr
 }
@@ -471,8 +474,11 @@ func (c *Cache) chunkAtCanonicalErr(cx, cz int32) (*Chunk, error) {
 			}
 			c.evictIfNeeded()
 			c.mu.Unlock()
-			if inserted && loaded != nil && len(loaded.persistedTicks) > 0 {
-				c.ImportChunkScheduledBlockTicks(cx, cz, loaded.persistedTicks)
+			if inserted && loaded != nil {
+				if len(loaded.persistedTicks) > 0 {
+					c.ImportChunkScheduledBlockTicks(cx, cz, loaded.persistedTicks)
+				}
+				c.importChunkPistonBlockEntitiesFromChunk(loaded)
 			}
 			return loaded, nil
 		}
@@ -1211,20 +1217,24 @@ func (c *Cache) StartAutosave(ctx context.Context, log *slog.Logger, interval ti
 // flushDirty saves every chunk currently marked dirty or newly generated and clears the sets.
 func (c *Cache) flushDirty() error {
 	var pendingTickChunks [][2]int32
+	seenTickChunk := make(map[[2]int32]bool)
 	if rawSched, hasSched := cacheSchedulers.Load(c); hasSched {
 		sched := rawSched.(*BlockUpdateScheduler)
 		sched.mu.Lock()
-		if len(sched.pending) > 0 {
-			seenTickChunk := make(map[[2]int32]bool)
-			for _, u := range sched.pending {
-				ck := [2]int32{int32(u.pos.X >> 4), int32(u.pos.Z >> 4)}
-				if !seenTickChunk[ck] {
-					seenTickChunk[ck] = true
-					pendingTickChunks = append(pendingTickChunks, ck)
-				}
+		for _, u := range sched.pending {
+			ck := [2]int32{int32(u.pos.X >> 4), int32(u.pos.Z >> 4)}
+			if !seenTickChunk[ck] {
+				seenTickChunk[ck] = true
+				pendingTickChunks = append(pendingTickChunks, ck)
 			}
 		}
 		sched.mu.Unlock()
+	}
+	for _, ck := range c.activeMovingPistonChunks() {
+		if !seenTickChunk[ck] {
+			seenTickChunk[ck] = true
+			pendingTickChunks = append(pendingTickChunks, ck)
+		}
 	}
 
 	c.mu.Lock()
@@ -1266,6 +1276,7 @@ func (c *Cache) flushDirty() error {
 		if _, hasSched := cacheSchedulers.Load(c); hasSched {
 			snapshot.persistedTicks = c.ExportChunkScheduledBlockTicks(k[0], k[1])
 		}
+		c.syncChunkPistonBlockEntitiesToSnapshot(k[0], k[1], snapshot)
 		if err := c.store.saveSnapshot(snapshot); err != nil {
 			if firstErr == nil {
 				firstErr = err

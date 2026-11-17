@@ -3005,7 +3005,7 @@ func isPistonDestroyOnPush(state uint16) bool {
 		return true
 	}
 	if strings.HasSuffix(name, "_button") || strings.HasSuffix(name, "_pressure_plate") ||
-		strings.HasSuffix(name, "_carpet") || strings.HasSuffix(name, "_bed") ||
+		strings.HasSuffix(name, "_bed") ||
 		strings.HasSuffix(name, "_candle") || strings.HasSuffix(name, "_amethyst_bud") ||
 		strings.HasSuffix(name, "_coral_fan") || strings.HasSuffix(name, "_coral_wall_fan") ||
 		(strings.HasSuffix(name, "_head") && name != "minecraft:piston_head") ||
@@ -3020,6 +3020,7 @@ func isPistonDestroyOnPush(state uint16) bool {
 	}
 	switch name {
 	case "minecraft:fire", "minecraft:soul_fire", "minecraft:cobweb", "minecraft:snow",
+		"minecraft:moss_carpet", "minecraft:pale_moss_carpet",
 		"minecraft:torch", "minecraft:wall_torch", "minecraft:soul_torch", "minecraft:soul_wall_torch",
 		"minecraft:redstone_torch", "minecraft:redstone_wall_torch",
 		"minecraft:copper_torch", "minecraft:copper_wall_torch",
@@ -3027,15 +3028,16 @@ func isPistonDestroyOnPush(state uint16) bool {
 		"minecraft:lever", "minecraft:tripwire", "minecraft:tripwire_hook",
 		"minecraft:ladder", "minecraft:vine", "minecraft:glow_lichen", "minecraft:sculk_vein", "minecraft:resin_clump",
 		"minecraft:tall_grass", "minecraft:large_fern", "minecraft:sunflower",
-		"minecraft:lilac", "minecraft:rose_bush", "minecraft:peony", "minecraft:pitcher_plant",
+		"minecraft:lilac", "minecraft:rose_bush", "minecraft:peony", "minecraft:pitcher_plant", "minecraft:pitcher_crop",
 		"minecraft:Chorus_plant", "minecraft:chorus_plant", "minecraft:chorus_flower",
 		"minecraft:pointed_dripstone", "minecraft:hanging_roots", "minecraft:spore_blossom",
 		"minecraft:cave_vines", "minecraft:cave_vines_plant",
 		"minecraft:weeping_vines", "minecraft:weeping_vines_plant",
 		"minecraft:twisting_vines", "minecraft:twisting_vines_plant",
 		"minecraft:sugar_cane", "minecraft:cactus", "minecraft:cactus_flower", "minecraft:kelp", "minecraft:kelp_plant",
-		"minecraft:bamboo", "minecraft:bamboo_sapling", "minecraft:sea_pickle",
-		"minecraft:cocoa", "minecraft:nether_wart",
+		"minecraft:seagrass", "minecraft:tall_seagrass",
+		"minecraft:bamboo", "minecraft:bamboo_sapling", "minecraft:mangrove_propagule", "minecraft:sea_pickle",
+		"minecraft:cocoa", "minecraft:nether_wart", "minecraft:golden_dandelion",
 		"minecraft:pumpkin", "minecraft:carved_pumpkin", "minecraft:jack_o_lantern", "minecraft:melon",
 		"minecraft:flower_pot", "minecraft:candle", "minecraft:bell", "minecraft:dragon_egg",
 		"minecraft:suspicious_sand", "minecraft:suspicious_gravel", "minecraft:structure_void",
@@ -3048,7 +3050,7 @@ func isPistonDestroyOnPush(state uint16) bool {
 		"minecraft:decorated_pot", "minecraft:amethyst_cluster", "minecraft:budding_amethyst",
 		"minecraft:lily_pad", "minecraft:lantern", "minecraft:soul_lantern",
 		"minecraft:scaffolding", "minecraft:cake",
-		"minecraft:frogspawn", "minecraft:turtle_egg", "minecraft:sniffer_egg":
+		"minecraft:frogspawn", "minecraft:turtle_egg":
 		return true
 	}
 	return false
@@ -3081,6 +3083,7 @@ func canPistonPushBlock(state uint16) bool {
 	case "minecraft:bedrock", "minecraft:obsidian", "minecraft:crying_obsidian",
 		"minecraft:respawn_anchor", "minecraft:reinforced_deepslate",
 		"minecraft:barrier", "minecraft:light", "minecraft:structure_block",
+		"minecraft:test_block", "minecraft:test_instance_block",
 		"minecraft:command_block", "minecraft:chain_command_block", "minecraft:repeating_command_block",
 		"minecraft:jigsaw", "minecraft:end_portal_frame", "minecraft:end_portal",
 		"minecraft:end_gateway", "minecraft:nether_portal",
@@ -3571,6 +3574,7 @@ func (c *Cache) UnloadChunkRedstoneRuntime(cx, cz int32) *nbt.Compound {
 	root.Set("block_ticks", EncodeScheduledBlockTicksNBT(blockEntries))
 	root.Set("fluid_ticks", EncodeScheduledBlockTicksNBT(fluidEntries))
 	root.Set("piston_runtime", EncodePistonRuntimeNBT(c.UnloadChunkPistonRuntime(cx, cz)))
+	root.Set("moving_pistons", EncodeMovingPistonsNBT(c.UnloadChunkMovingPistons(cx, cz)))
 	root.Set("observer_runtime", EncodeObserverRuntimeNBT(c.UnloadChunkObservers(cx, cz)))
 	return root
 }
@@ -3589,6 +3593,11 @@ func (c *Cache) LoadChunkRedstoneRuntime(cx, cz int32, comp *nbt.Compound) int {
 		if prTag, ok := comp.Get("piston_runtime"); ok {
 			if list, ok := prTag.(nbt.List); ok {
 				restored += c.ImportPistonRuntimeEntries(DecodePistonRuntimeNBT(list))
+			}
+		}
+		if mpTag, ok := comp.Get("moving_pistons"); ok {
+			if list, ok := mpTag.(nbt.List); ok {
+				restored += c.ImportMovingPistonsNBT(list)
 			}
 		}
 		if orTag, ok := comp.Get("observer_runtime"); ok {

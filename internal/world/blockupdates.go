@@ -152,6 +152,7 @@ type BlockUpdateScheduler struct {
 	c                         *Cache
 	mu                        sync.Mutex
 	tick                      uint64
+	inTick                    bool
 	nextSeq                   uint64
 	pending                   map[scheduledUpdateKey]scheduledUpdate
 	fallDist                  map[BlockPos]int
@@ -394,13 +395,26 @@ func (c *Cache) UpdateNeighbors(x, y, z int) BlockUpdateResult {
 	return res
 }
 
+func (c *Cache) isHandlingBlockTick() bool {
+	if c == nil {
+		return false
+	}
+	s := c.BlockUpdates()
+	s.mu.Lock()
+	v := s.inTick
+	s.mu.Unlock()
+	return v
+}
+
 // TickBlockUpdates advances the block update scheduler by one game tick and
-// executes all updates due on or before that tick.
+// executes all updates due on or before that tick, followed by active
+// `PistonMovingBlockEntity` (`minecraft:moving_piston`) progression.
 func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 	s := c.BlockUpdates()
 	s.mu.Lock()
 	s.tick++
 	now := s.tick
+	s.inTick = true
 	var due []scheduledUpdate
 	for k, u := range s.pending {
 		if u.dueTick <= now {
@@ -410,49 +424,54 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 	}
 	s.mu.Unlock()
 
-	if len(due) == 0 {
-		return BlockUpdateResult{}
-	}
-	sort.Slice(due, func(i, j int) bool {
-		if due[i].dueTick != due[j].dueTick {
-			return due[i].dueTick < due[j].dueTick
+	var res BlockUpdateResult
+	if len(due) > 0 {
+		sort.Slice(due, func(i, j int) bool {
+			if due[i].dueTick != due[j].dueTick {
+				return due[i].dueTick < due[j].dueTick
+			}
+			if due[i].priority != due[j].priority {
+				return due[i].priority < due[j].priority
+			}
+			return due[i].seq < due[j].seq
+		})
+		if len(due) > maxUpdatesPerTick {
+			s.mu.Lock()
+			for _, extra := range due[maxUpdatesPerTick:] {
+				key := scheduledUpdateKey{pos: extra.pos, kind: extra.kind}
+				if _, exists := s.pending[key]; !exists {
+					s.pending[key] = extra
+				}
+			}
+			s.mu.Unlock()
+			due = due[:maxUpdatesPerTick]
 		}
-		if due[i].priority != due[j].priority {
-			return due[i].priority < due[j].priority
-		}
-		return due[i].seq < due[j].seq
-	})
-	if len(due) > maxUpdatesPerTick {
-		s.mu.Lock()
-		for _, extra := range due[maxUpdatesPerTick:] {
-			key := scheduledUpdateKey{pos: extra.pos, kind: extra.kind}
-			if _, exists := s.pending[key]; !exists {
-				s.pending[key] = extra
+
+		for _, u := range due {
+			switch u.kind {
+			case UpdateNeighbor:
+				c.runNeighborSupportPass(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			case UpdateFalling:
+				c.stepFallingBlock(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			case UpdateFluid:
+				c.stepFluid(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			case UpdateRedstone:
+				c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+				c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+				c.stepComposterUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+				c.stepFrostedIceUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+				c.stepEyeblossomUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+			case UpdateFire:
+				c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			}
 		}
-		s.mu.Unlock()
-		due = due[:maxUpdatesPerTick]
 	}
 
-	var res BlockUpdateResult
-	for _, u := range due {
-		switch u.kind {
-		case UpdateNeighbor:
-			c.runNeighborSupportPass(u.pos.X, u.pos.Y, u.pos.Z, &res)
-		case UpdateFalling:
-			c.stepFallingBlock(u.pos.X, u.pos.Y, u.pos.Z, &res)
-		case UpdateFluid:
-			c.stepFluid(u.pos.X, u.pos.Y, u.pos.Z, &res)
-		case UpdateRedstone:
-			c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
-			c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
-			c.stepComposterUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
-			c.stepFrostedIceUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
-			c.stepEyeblossomUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
-		case UpdateFire:
-			c.stepFireUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
-		}
-	}
+	s.mu.Lock()
+	s.inTick = false
+	s.mu.Unlock()
+
+	c.stepAllMovingPistons(now, &res)
 	return res
 }
 
@@ -467,11 +486,11 @@ func (c *Cache) StepBlockUpdates(ticks int) BlockUpdateResult {
 	return total
 }
 
-// FlushBlockUpdates advances ticks until no scheduled updates remain or
-// maxTicks is reached.
+// FlushBlockUpdates advances ticks until no scheduled updates or moving pistons
+// remain or maxTicks is reached.
 func (c *Cache) FlushBlockUpdates(maxTicks int) BlockUpdateResult {
 	var total BlockUpdateResult
-	for i := 0; i < maxTicks && c.PendingBlockUpdates() > 0; i++ {
+	for i := 0; i < maxTicks && (c.PendingBlockUpdates() > 0 || c.ActiveMovingPistonCount() > 0); i++ {
 		step := c.TickBlockUpdates()
 		total.merge(step)
 	}
@@ -1107,12 +1126,21 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 			return StateAir, false
 		}
 		bx, by, bz := x-dx, y-dy, z-dz
-		if by < MinY || by >= MinY+WorldHeight {
+		if by < c.minY() || by >= c.maxY() {
 			return StateAir, false
 		}
 		bInfo, ok := stateByID(c.GetBlock(bx, by, bz))
-		if !ok || (bInfo.Name != "minecraft:piston" && bInfo.Name != "minecraft:sticky_piston") ||
-			bInfo.Properties["facing"] != props["facing"] || bInfo.Properties["extended"] != "true" {
+		if !ok {
+			return StateAir, false
+		}
+		if bInfo.Name == "minecraft:moving_piston" && bInfo.Properties["facing"] == props["facing"] {
+			return state, true
+		}
+		needBase := "minecraft:piston"
+		if props["type"] == "sticky" {
+			needBase = "minecraft:sticky_piston"
+		}
+		if bInfo.Name != needBase || bInfo.Properties["facing"] != props["facing"] || bInfo.Properties["extended"] != "true" {
 			return StateAir, false
 		}
 		return state, true
@@ -2690,11 +2718,12 @@ func isPlantRequiringSoil(name string) bool {
 		"minecraft:crimson_fungus", "minecraft:warped_fungus",
 		"minecraft:crimson_roots", "minecraft:warped_roots", "minecraft:nether_sprouts",
 		"minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
-		"minecraft:torchflower_crop",
+		"minecraft:torchflower_crop", "minecraft:pitcher_crop",
 		"minecraft:melon_stem", "minecraft:pumpkin_stem",
 		"minecraft:attached_melon_stem", "minecraft:attached_pumpkin_stem",
 		"minecraft:azalea", "minecraft:flowering_azalea",
-		"minecraft:bamboo", "minecraft:bamboo_sapling",
+		"minecraft:bamboo", "minecraft:bamboo_sapling", "minecraft:mangrove_propagule",
+		"minecraft:golden_dandelion",
 		"minecraft:lily_pad", "minecraft:seagrass":
 		return true
 	}

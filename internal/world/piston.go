@@ -9,8 +9,16 @@ import (
 )
 
 // PistonTickDelay is the vanilla duration (2 game ticks = 1 redstone tick)
-// for a piston or sticky piston to extend or retract.
+// for a piston or sticky piston to extend or retract (`TICKS_TO_EXTEND = 2`).
 const PistonTickDelay = 2
+
+// Vanilla `PistonBaseBlock` BlockEvent trigger IDs (`TRIGGER_EXTEND`,
+// `TRIGGER_CONTRACT`, `TRIGGER_DROP`).
+const (
+	PistonTriggerExtend   byte = 0
+	PistonTriggerContract byte = 1
+	PistonTriggerDrop     byte = 2
+)
 
 type pistonActionKind uint8
 
@@ -44,6 +52,7 @@ func (c *Cache) setInShortPulseEnd(v bool) {
 
 var (
 	pistonTrackers             sync.Map // map[*Cache]*pistonRuntimeTracker
+	pistonBlockEventHandlers   sync.Map // map[*Cache]func(pistonPos BlockPos, isSticky bool, actionID byte, facing string)
 	pistonMoveEntitiesHandlers sync.Map // map[*Cache]func(pistonPos BlockPos, dir string, extending bool, movedBlocks []BlockPos, movedStates []uint16)
 	pistonDestroyBlockHandlers sync.Map // map[*Cache]func(pos BlockPos, oldState uint16)
 )
@@ -82,9 +91,29 @@ func (c *Cache) ClearPistonRuntimeAt(x, y, z int) {
 	}
 }
 
+// SetPistonBlockEventListener registers an optional callback invoked once per
+// piston `BlockEvent` (`actionID`: 0 = extend, 1 = retract, 2 = drop/retract)
+// so the server can broadcast `ClientboundBlockEventPacket`, piston sounds, and
+// game events at `pistonPos`.
+func (c *Cache) SetPistonBlockEventListener(fn func(pistonPos BlockPos, isSticky bool, actionID byte, facing string)) {
+	if fn == nil {
+		pistonBlockEventHandlers.Delete(c)
+		return
+	}
+	pistonBlockEventHandlers.Store(c, fn)
+}
+
+func (c *Cache) notifyPistonBlockEvent(pistonPos BlockPos, isSticky bool, actionID byte, facing string) {
+	if v, ok := pistonBlockEventHandlers.Load(c); ok && v != nil {
+		if fn, ok := v.(func(BlockPos, bool, byte, string)); ok && fn != nil {
+			fn(pistonPos, isSticky, actionID, facing)
+		}
+	}
+}
+
 // SetPistonMoveEntitiesListener registers an optional callback invoked when a
-// piston extends or retracts so entities in the path of the piston head or
-// pushed blocks can be translated (and bounced when pushed by a slime block).
+// `moving_piston` (`PistonMovingBlockEntity`) translates so colliding entities
+// (and entities stuck to horizontal honey blocks) are pushed and bounced on slime.
 func (c *Cache) SetPistonMoveEntitiesListener(fn func(pistonPos BlockPos, dir string, extending bool, movedBlocks []BlockPos, movedStates []uint16)) {
 	if fn == nil {
 		pistonMoveEntitiesHandlers.Delete(c)
@@ -103,7 +132,7 @@ func (c *Cache) notifyPistonMoveEntities(pistonPos BlockPos, dir string, extendi
 
 // SetPistonDestroyBlockListener registers an optional callback invoked when a
 // fragile block (`PushReaction.DESTROY`, such as plants, torches, redstone
-// components, or `minecraft:decorated_pot`) is broken by a pushing piston.
+// components, shulker boxes, or `minecraft:decorated_pot`) is broken by a pushing piston.
 func (c *Cache) SetPistonDestroyBlockListener(fn func(pos BlockPos, oldState uint16)) {
 	if fn == nil {
 		pistonDestroyBlockHandlers.Delete(c)
@@ -112,10 +141,32 @@ func (c *Cache) SetPistonDestroyBlockListener(fn func(pos BlockPos, oldState uin
 	pistonDestroyBlockHandlers.Store(c, fn)
 }
 
-func (c *Cache) notifyPistonDestroyBlock(pos BlockPos, oldState uint16) {
+func (c *Cache) notifyOrRecordPistonDestroyDrops(pos BlockPos, oldState uint16, res *BlockUpdateResult) {
 	if v, ok := pistonDestroyBlockHandlers.Load(c); ok && v != nil {
 		if fn, ok := v.(func(BlockPos, uint16)); ok && fn != nil {
 			fn(pos, oldState)
+			return
+		}
+	}
+	if res == nil || isAirState(oldState) {
+		return
+	}
+	info, ok := stateByID(oldState)
+	if !ok {
+		return
+	}
+	if strings.HasSuffix(info.Name, "_bed") && info.Properties["part"] == "head" {
+		return
+	}
+	if strings.HasSuffix(info.Name, "_door") && !strings.HasSuffix(info.Name, "_trapdoor") && info.Properties["half"] == "upper" {
+		return
+	}
+	if isDoubleHeightPlantName(info.Name) && info.Properties["half"] == "upper" {
+		return
+	}
+	for _, st := range c.evaluateFluidOrSpongeBlockDrops(oldState) {
+		if !st.IsEmpty() {
+			res.Drops = append(res.Drops, BlockPosDrop{Pos: pos, Stack: st})
 		}
 	}
 }
@@ -174,25 +225,68 @@ func CanStickToStickyBlock(state uint16) bool {
 }
 
 // CanPistonPushBlockInDirection reports whether `state` can be moved in
-// `moveDir` when the piston's own action direction is `pistonActionDir` and
-// whether fragile blocks are allowed to break (`allowDestroy`), matching
-// vanilla `PistonBaseBlock.isPushable`.
+// `moveDir` when the cause direction is `pistonActionDir` and whether fragile
+// blocks are allowed to break (`allowDestroy`), matching vanilla `PistonBaseBlock.isPushable`.
 func CanPistonPushBlockInDirection(state uint16, moveDir string, allowDestroy bool, pistonActionDir string) bool {
 	if isAirState(state) {
 		return true
 	}
+	info, ok := stateByID(state)
+	if !ok || info.Name == "" {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:obsidian", "minecraft:crying_obsidian",
+		"minecraft:respawn_anchor", "minecraft:reinforced_deepslate":
+		return false
+	case "minecraft:piston", "minecraft:sticky_piston":
+		return info.Properties["extended"] != "true"
+	}
+	// Unbreakable (-1.0f) and PushReaction.BLOCK blocks are never pushable, even if allowDestroy is true.
+	if isPistonUnbreakableOrBlockReaction(info.Name) {
+		return false
+	}
 	if isPistonDestroyOnPush(state) {
 		return allowDestroy
 	}
-	if !canPistonPushBlock(state) {
-		return false
-	}
 	if IsGlazedTerracotta(state) {
-		// PUSH_ONLY: glazed terracotta can only be pushed directly in the
-		// piston's movement direction, never pulled or branched via slime/honey.
 		return moveDir == pistonActionDir
 	}
-	return true
+	return canPistonPushBlock(state)
+}
+
+func isPistonUnbreakableOrBlockReaction(name string) bool {
+	switch name {
+	case "minecraft:bedrock", "minecraft:barrier", "minecraft:light",
+		"minecraft:command_block", "minecraft:chain_command_block", "minecraft:repeating_command_block",
+		"minecraft:structure_block", "minecraft:jigsaw",
+		"minecraft:test_block", "minecraft:test_instance_block",
+		"minecraft:end_portal_frame", "minecraft:end_portal", "minecraft:end_gateway", "minecraft:nether_portal",
+		"minecraft:moving_piston", "minecraft:piston_head",
+		"minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil",
+		"minecraft:grindstone", "minecraft:lodestone":
+		return true
+	}
+	return false
+}
+
+// CanPistonPushBlockAt mirrors vanilla 26.1.2 `PistonBaseBlock.isPushable`,
+// enforcing dimension Y limits (`minY..maxY-1` and blocking pushes out of
+// `minY` downward or `maxY-1` upward) in addition to block push reactions.
+func (c *Cache) CanPistonPushBlockAt(x, y, z int, state uint16, moveDir string, allowDestroy bool, pistonActionDir string) bool {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false
+	}
+	if isAirState(state) {
+		return true
+	}
+	if moveDir == "down" && y == c.minY() {
+		return false
+	}
+	if moveDir == "up" && y == c.maxY()-1 {
+		return false
+	}
+	return CanPistonPushBlockInDirection(state, moveDir, allowDestroy, pistonActionDir)
 }
 
 // --- Quasi-Connectivity & Power Check ---
@@ -203,7 +297,7 @@ func CanPistonPushBlockInDirection(state uint16, moveDir string, allowDestroy bo
 //  2. Via quasi-connectivity at (x, y+1, z) from any neighbor other than the
 //     piston itself, matching vanilla `PistonBaseBlock.getNeighborSignal`.
 func (c *Cache) IsPistonPowered(x, y, z int, facing string) bool {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return false
 	}
 	frontDX, frontDY, frontDZ, ok := directionOffset3D(facing)
@@ -216,7 +310,7 @@ func (c *Cache) IsPistonPowered(x, y, z int, facing string) bool {
 	}
 	// Quasi-connectivity: check if the cell directly above the piston (x, y+1, z)
 	// would be powered by any of its 5 neighbors (excluding the piston at (x, y, z)).
-	if y+1 < MinY+WorldHeight {
+	if y+1 < c.maxY() {
 		if c.bestNeighborSignalExcluding(x, y+1, z, BlockPos{X: x, Y: y, Z: z}, true) > 0 {
 			return true
 		}
@@ -300,19 +394,19 @@ func (r *pistonStructureResolver) addDestroy(pos BlockPos) {
 }
 
 func (r *pistonStructureResolver) resolve() bool {
-	if r.startPos.Y < MinY || r.startPos.Y >= MinY+WorldHeight {
+	if r.startPos.Y < r.c.minY() || r.startPos.Y >= r.c.maxY() {
 		return false
 	}
 	startState := r.c.GetBlock(r.startPos.X, r.startPos.Y, r.startPos.Z)
-	if isAirState(startState) {
-		return true
-	}
-	if !CanPistonPushBlockInDirection(startState, r.pushDir, false, r.pistonDir) {
-		if r.extending && isPistonDestroyOnPush(startState) {
+	if !r.c.CanPistonPushBlockAt(r.startPos.X, r.startPos.Y, r.startPos.Z, startState, r.pushDir, false, r.pistonDir) {
+		if r.extending && !isAirState(startState) && isPistonDestroyOnPush(startState) {
 			r.addDestroy(r.startPos)
 			return true
 		}
 		return false
+	}
+	if isAirState(startState) {
+		return true
 	}
 	if !r.addBlockLine(r.startPos, r.pushDir) {
 		return false
@@ -330,17 +424,17 @@ func (r *pistonStructureResolver) resolve() bool {
 }
 
 func (r *pistonStructureResolver) addBlockLine(origin BlockPos, branchDir string) bool {
-	if origin.Y < MinY || origin.Y >= MinY+WorldHeight {
-		return false
+	if origin.Y < r.c.minY() || origin.Y >= r.c.maxY() {
+		return true
 	}
 	curState := r.c.GetBlock(origin.X, origin.Y, origin.Z)
-	if isAirState(curState) || origin == r.pistonPos {
+	if isAirState(curState) {
 		return true
 	}
-	if !CanPistonPushBlockInDirection(curState, branchDir, false, r.pushDir) {
+	if !r.c.CanPistonPushBlockAt(origin.X, origin.Y, origin.Z, curState, r.pushDir, false, branchDir) {
 		return true
 	}
-	if r.indexOfPush(origin) >= 0 {
+	if origin == r.pistonPos || r.indexOfPush(origin) >= 0 {
 		return true
 	}
 
@@ -350,16 +444,19 @@ func (r *pistonStructureResolver) addBlockLine(origin BlockPos, branchDir string
 		return false
 	}
 	prevState := curState
+	oppPushDir := oppositeDirection(r.pushDir)
 	for IsStickyBlock(prevState) {
 		bx := origin.X - r.dx*lineCount
 		by := origin.Y - r.dy*lineCount
 		bz := origin.Z - r.dz*lineCount
 		backPos := BlockPos{X: bx, Y: by, Z: bz}
-		if by < MinY || by >= MinY+WorldHeight || backPos == r.pistonPos {
+		if by < r.c.minY() || by >= r.c.maxY() || backPos == r.pistonPos {
 			break
 		}
 		backState := r.c.GetBlock(bx, by, bz)
-		if isAirState(backState) || !CanBlocksStickToEachOther(prevState, backState) || !CanStickToStickyBlock(backState) {
+		if isAirState(backState) ||
+			!CanBlocksStickToEachOther(prevState, backState) ||
+			!r.c.CanPistonPushBlockAt(bx, by, bz, backState, r.pushDir, false, oppPushDir) {
 			break
 		}
 		prevState = backState
@@ -388,9 +485,6 @@ func (r *pistonStructureResolver) addBlockLine(origin BlockPos, branchDir string
 		fy := origin.Y + r.dy*step
 		fz := origin.Z + r.dz*step
 		fwdPos := BlockPos{X: fx, Y: fy, Z: fz}
-		if fy < MinY || fy >= MinY+WorldHeight {
-			return false
-		}
 		if existingIdx := r.indexOfPush(fwdPos); existingIdx >= 0 {
 			r.reorderListAtCollision(addedCount, existingIdx)
 			for i := 0; i <= existingIdx+addedCount && i < len(r.toPush); i++ {
@@ -404,11 +498,14 @@ func (r *pistonStructureResolver) addBlockLine(origin BlockPos, branchDir string
 			return true
 		}
 
+		if fy < r.c.minY() || fy >= r.c.maxY() {
+			return false
+		}
 		fwdState := r.c.GetBlock(fx, fy, fz)
 		if isAirState(fwdState) {
 			return true
 		}
-		if fwdPos == r.pistonPos || !CanPistonPushBlockInDirection(fwdState, r.pushDir, true, r.pushDir) {
+		if fwdPos == r.pistonPos || !r.c.CanPistonPushBlockAt(fx, fy, fz, fwdState, r.pushDir, true, r.pushDir) {
 			return false
 		}
 		if isPistonDestroyOnPush(fwdState) {
@@ -439,7 +536,7 @@ var allSixDirections = [6]string{"down", "up", "north", "south", "west", "east"}
 func (r *pistonStructureResolver) addBranchingBlocks(pos BlockPos) bool {
 	stateA := r.c.GetBlock(pos.X, pos.Y, pos.Z)
 	for _, dir := range allSixDirections {
-		// Only branch perpendicular to the push axis.
+		// Only branch perpendicular to the push axis (`dir.getAxis() != pushDirection.getAxis()`).
 		if dir == r.pushDir || dir == oppositeDirection(r.pushDir) {
 			continue
 		}
@@ -448,11 +545,11 @@ func (r *pistonStructureResolver) addBranchingBlocks(pos BlockPos) bool {
 			continue
 		}
 		nb := BlockPos{X: pos.X + bdx, Y: pos.Y + bdy, Z: pos.Z + bdz}
-		if nb.Y < MinY || nb.Y >= MinY+WorldHeight || nb == r.pistonPos {
+		if nb.Y < r.c.minY() || nb.Y >= r.c.maxY() {
 			continue
 		}
 		stateB := r.c.GetBlock(nb.X, nb.Y, nb.Z)
-		if isAirState(stateB) || !CanBlocksStickToEachOther(stateA, stateB) || !CanStickToStickyBlock(stateB) {
+		if !CanBlocksStickToEachOther(stateB, stateA) {
 			continue
 		}
 		if !r.addBlockLine(nb, dir) {
@@ -462,7 +559,7 @@ func (r *pistonStructureResolver) addBranchingBlocks(pos BlockPos) bool {
 	return true
 }
 
-// --- Piston Evaluation, Tick-Based Extension/Retraction, & Sticky Block Spitting ---
+// --- Piston Evaluation (`checkIfExtend`), `triggerEvent`, & `moveBlocks` ---
 
 func (c *Cache) evaluatePistonRedstone(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) []BlockPos {
 	facing := info.Properties["facing"]
@@ -471,228 +568,63 @@ func (c *Cache) evaluatePistonRedstone(x, y, z int, state uint16, info stateName
 	}
 	isExtended := info.Properties["extended"] == "true"
 	isPowered := c.IsPistonPowered(x, y, z, facing)
-	now := c.CurrentBlockTick()
-	pos := BlockPos{X: x, Y: y, Z: z}
-
-	tr := c.pistonTracker()
-	tr.mu.Lock()
-	entry := tr.getOrCreate(pos)
 
 	if isPowered && !isExtended {
-		// Check if structure can actually extend before scheduling.
-		if _, _, ok := c.ResolvePistonStructure(x, y, z, facing, true); !ok {
-			tr.mu.Unlock()
-			return nil
+		if _, _, ok := c.ResolvePistonStructure(x, y, z, facing, true); ok {
+			return c.triggerPistonEvent(x, y, z, state, info, PistonTriggerExtend, facing, res)
 		}
-		if entry.pendingAction != pistonActionExtend {
-			entry.pulseStartTick = now
-			entry.pendingAction = pistonActionExtend
-			entry.spitOnRetract = false
-		}
-		tr.mu.Unlock()
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, PistonTickDelay)
 		return nil
 	}
 
 	if !isPowered && isExtended {
-		if entry.pendingAction != pistonActionRetract {
-			entry.pendingAction = pistonActionRetract
-			// Vanilla 1-tick / Observer pulse sticky-piston block spitting:
-			// If this piston pushed at least one block during its extension AND
-			// lost power within < PistonTickDelay (1 game tick) or on the falling edge
-			// of a 2-tick Observer pulse, the sticky piston drops ("spits out") its block!
-			if entry.pushedOnThisPulse && now >= entry.pulseStartTick &&
-				(now-entry.pulseStartTick < uint64(PistonTickDelay) || (tr.inShortPulseEnd && now-entry.pulseStartTick <= uint64(PistonTickDelay))) {
-				entry.spitOnRetract = true
-			} else {
-				entry.spitOnRetract = false
+		dx, dy, dz, ok := directionOffset3D(facing)
+		if !ok {
+			return nil
+		}
+		actionID := PistonTriggerContract
+		f2x, f2y, f2z := x+2*dx, y+2*dy, z+2*dz
+		if f2y >= c.minY() && f2y < c.maxY() {
+			f2State := c.GetBlock(f2x, f2y, f2z)
+			if f2Info, ok := stateByID(f2State); ok &&
+				f2Info.Name == "minecraft:moving_piston" &&
+				f2Info.Properties["facing"] == facing {
+				if pmbe, hasBE := c.GetPistonMovingBlockEntityAt(f2x, f2y, f2z); hasBE && pmbe.Extending {
+					now := c.CurrentBlockTick()
+					if pmbe.ProgressO < 0.5 || pmbe.LastTicked == now || c.isHandlingBlockTick() {
+						actionID = PistonTriggerDrop
+					}
+				}
 			}
 		}
-		tr.mu.Unlock()
-		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, PistonTickDelay)
-		return nil
+		return c.triggerPistonEvent(x, y, z, state, info, actionID, facing, res)
 	}
 
-	if !isPowered && !isExtended && entry.pendingAction == pistonActionExtend {
-		// Short 1-tick pulse ended before the 2-tick extension completed:
-		// mark spitOnRetract so the sticky piston extends and spits its block!
-		entry.spitOnRetract = true
-	}
-	tr.mu.Unlock()
 	return nil
 }
 
 func (c *Cache) stepPistonUpdate(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
-	facing := info.Properties["facing"]
-	if facing == "" {
-		facing = "north"
-	}
-	isSticky := info.Name == "minecraft:sticky_piston"
-	isExtended := info.Properties["extended"] == "true"
-	isPowered := c.IsPistonPowered(x, y, z, facing)
-	now := c.CurrentBlockTick()
-	pos := BlockPos{X: x, Y: y, Z: z}
-
-	tr := c.pistonTracker()
-	tr.mu.Lock()
-	entry := tr.getOrCreate(pos)
-	action := entry.pendingAction
-	spit := entry.spitOnRetract
-	entry.pendingAction = pistonActionNone
-	tr.mu.Unlock()
-
-	if !isExtended && (isPowered || action == pistonActionExtend) {
-		affected := c.tryExtendPiston(x, y, z, state, facing, isSticky, res)
-		if len(affected) > 0 {
-			for _, p := range affected {
-				c.propagateRedstoneAround(p.X, p.Y, p.Z, c.GetBlock(p.X, p.Y, p.Z), c.GetBlock(p.X, p.Y, p.Z), res)
-			}
-		}
-		// If the input pulse already turned off during extension (1-tick pulse),
-		// schedule immediate retraction with block spitting!
-		if !c.IsPistonPowered(x, y, z, facing) {
-			tr.mu.Lock()
-			e := tr.getOrCreate(pos)
-			e.pendingAction = pistonActionRetract
-			if e.pushedOnThisPulse && now-e.pulseStartTick <= uint64(PistonTickDelay) {
-				e.spitOnRetract = true
-			}
-			tr.mu.Unlock()
-			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, PistonTickDelay)
-		}
-		return
-	}
-
-	if isExtended && (!isPowered || action == pistonActionRetract) {
-		affected := c.retractPistonWithOption(x, y, z, state, facing, isSticky, spit, res)
-		for _, p := range affected {
-			c.propagateRedstoneAround(p.X, p.Y, p.Z, c.GetBlock(p.X, p.Y, p.Z), c.GetBlock(p.X, p.Y, p.Z), res)
-		}
+	// Legacy scheduled piston ticks (e.g. imported from older runtime snapshots)
+	// re-run checkIfExtend cleanly.
+	affected := c.evaluatePistonRedstone(x, y, z, state, info, res)
+	for _, p := range affected {
+		cur := c.GetBlock(p.X, p.Y, p.Z)
+		c.propagateRedstoneAround(p.X, p.Y, p.Z, cur, cur, res)
 	}
 }
 
 func (c *Cache) tryExtendPiston(x, y, z int, state uint16, facing string, isSticky bool, res *BlockUpdateResult) []BlockPos {
-	dx, dy, dz, ok := directionOffset3D(facing)
+	movedAffected, ok := c.pistonMoveBlocks(x, y, z, facing, isSticky, true, c.currentMovingPistonCreatedTick(), res)
 	if !ok {
 		return nil
 	}
-	toPush, toDestroy, canExtend := c.ResolvePistonStructure(x, y, z, facing, true)
-	if !canExtend {
-		return nil
-	}
-
-	var affected []BlockPos
-
-	// 1. Break fragile blocks in `toDestroy`.
-	for _, dp := range toDestroy {
-		oldSt := c.GetBlock(dp.X, dp.Y, dp.Z)
-		if !isAirState(oldSt) {
-			c.notifyPistonDestroyBlock(dp, oldSt)
-			c.setBlockRecorded(dp.X, dp.Y, dp.Z, StateAir, res)
-			c.propagateMultiBlockPartnerBreak(dp.X, dp.Y, dp.Z, oldSt, res)
-			if isBlockNamed(oldSt, "minecraft:tripwire") || isBlockNamed(oldSt, "minecraft:tripwire_hook") {
-				c.recalculateTripwireAround(dp.X, dp.Y, dp.Z, oldSt, StateAir, res)
-			}
-			affected = append(affected, dp)
-			if sup, ok := redstoneSupportOf(dp.X, dp.Y, dp.Z, oldSt); ok {
-				affected = append(affected, sup)
-			}
-		}
-	}
-
-	// 2. Snapshot states of all blocks in `toPush` and sort from farthest to
-	// nearest along `(dx, dy, dz)` so no block overwrites an unmoved block.
-	type movedBlock struct {
-		src   BlockPos
-		dst   BlockPos
-		state uint16
-	}
-	moved := make([]movedBlock, len(toPush))
-	dstSet := make(map[BlockPos]bool, len(toPush)+1)
-	for i, p := range toPush {
-		dst := BlockPos{X: p.X + dx, Y: p.Y + dy, Z: p.Z + dz}
-		moved[i] = movedBlock{
-			src:   p,
-			dst:   dst,
-			state: c.GetBlock(p.X, p.Y, p.Z),
-		}
-		dstSet[dst] = true
-	}
-	sort.SliceStable(moved, func(i, j int) bool {
-		projI := moved[i].src.X*dx + moved[i].src.Y*dy + moved[i].src.Z*dz
-		projJ := moved[j].src.X*dx + moved[j].src.Y*dy + moved[j].src.Z*dz
-		return projI > projJ
-	})
-
-	hx, hy, hz := x+dx, y+dy, z+dz
-	headPos := BlockPos{X: hx, Y: hy, Z: hz}
-	dstSet[headPos] = true
-
-	// Clear any source positions that won't be overwritten by another moved block or the piston head.
-	var movedPositions []BlockPos
-	var movedStates []uint16
-	for _, m := range moved {
-		c.CancelScheduledBlockUpdate(m.src.X, m.src.Y, m.src.Z, UpdateRedstone)
-		stToPlace := m.state
-		if isWaterloggedState(stToPlace) {
-			if unwaterlogged, ok := SetWaterlogged(stToPlace, false); ok {
-				stToPlace = unwaterlogged
-			}
-		}
-		// Moved observers emit a 2-tick pulse after movement completes.
-		if isBlockNamed(stToPlace, "minecraft:observer") {
-			c.clearObserverStateAt(m.src)
-			if unpowered, ok := withStateProperty(stToPlace, "powered", "false"); ok {
-				stToPlace = unpowered
-			}
-		} else if isBlockNamed(stToPlace, "minecraft:piston") || isBlockNamed(stToPlace, "minecraft:sticky_piston") {
-			c.ClearPistonRuntimeAt(m.src.X, m.src.Y, m.src.Z)
-		}
-		c.setBlockRecorded(m.dst.X, m.dst.Y, m.dst.Z, stToPlace, res)
-		affected = append(affected, m.dst)
-		movedPositions = append(movedPositions, m.dst)
-		movedStates = append(movedStates, stToPlace)
-		if isBlockNamed(stToPlace, "minecraft:observer") {
-			c.ScheduleBlockUpdate(m.dst.X, m.dst.Y, m.dst.Z, UpdateRedstone, ObserverTickDelay)
-		}
-	}
-	for _, m := range moved {
-		if !dstSet[m.src] {
-			c.setBlockRecorded(m.src.X, m.src.Y, m.src.Z, StateAir, res)
-			affected = append(affected, m.src)
-		}
-	}
-
-	// 3. Place `minecraft:piston_head` at (hx, hy, hz) and set `extended="true"` on the piston base.
-	headType := "normal"
-	if isSticky {
-		headType = "sticky"
-	}
-	headState, ok := nameToStateID("minecraft:piston_head", map[string]string{
-		"facing": facing,
-		"type":   headType,
-		"short":  "false",
-	})
-	if !ok {
-		return nil
-	}
-	c.setBlockRecorded(hx, hy, hz, headState, res)
-	affected = append(affected, headPos)
-
+	affected := append([]BlockPos(nil), movedAffected...)
+	pistonPos := BlockPos{X: x, Y: y, Z: z}
 	if extState, ok := withStateProperty(state, "extended", "true"); ok {
 		c.setBlockRecorded(x, y, z, extState, res)
-		affected = append(affected, BlockPos{X: x, Y: y, Z: z})
+		c.notifyObserversOfChangeAt(x, y, z, state, extState)
+		affected = append(affected, pistonPos)
 	}
-
-	tr := c.pistonTracker()
-	tr.mu.Lock()
-	entry := tr.getOrCreate(BlockPos{X: x, Y: y, Z: z})
-	entry.lastExtendedTick = c.CurrentBlockTick()
-	entry.pushedOnThisPulse = len(toPush) > 0
-	tr.mu.Unlock()
-
-	c.notifyPistonMoveEntities(BlockPos{X: x, Y: y, Z: z}, facing, true, movedPositions, movedStates)
-
+	c.notifyPistonBlockEvent(pistonPos, isSticky, PistonTriggerExtend, facing)
 	for _, pos := range affected {
 		c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
 		c.scheduleAround(pos.X, pos.Y, pos.Z)
@@ -705,129 +637,324 @@ func (c *Cache) retractPiston(x, y, z int, state uint16, facing string, isSticky
 }
 
 func (c *Cache) retractPistonWithOption(x, y, z int, state uint16, facing string, isSticky bool, spitBlock bool, res *BlockUpdateResult) []BlockPos {
+	info, _ := stateByID(state)
+	actionID := PistonTriggerContract
+	if spitBlock {
+		actionID = PistonTriggerDrop
+	}
+	return c.triggerPistonEvent(x, y, z, state, info, actionID, facing, res)
+}
+
+func (c *Cache) currentMovingPistonCreatedTick() uint64 {
+	if c.isHandlingBlockTick() {
+		return c.CurrentBlockTick()
+	}
+	return 0
+}
+
+// triggerPistonEvent ports vanilla 26.1.2 `PistonBaseBlock.triggerEvent`.
+func (c *Cache) triggerPistonEvent(x, y, z int, state uint16, info stateName, actionID byte, paramFacing string, res *BlockUpdateResult) []BlockPos {
+	curAtBase := c.GetBlock(x, y, z)
+	curInfo, ok := stateByID(curAtBase)
+	if !ok || (curInfo.Name != "minecraft:piston" && curInfo.Name != "minecraft:sticky_piston") {
+		return nil
+	}
+	state = curAtBase
+	info = curInfo
+	if actionID == PistonTriggerExtend && info.Properties["extended"] == "true" {
+		return nil
+	}
+	if (actionID == PistonTriggerContract || actionID == PistonTriggerDrop) && info.Properties["extended"] != "true" {
+		return nil
+	}
+	facing := info.Properties["facing"]
+	if facing == "" {
+		facing = "north"
+	}
+	isSticky := info.Name == "minecraft:sticky_piston"
 	dx, dy, dz, ok := directionOffset3D(facing)
 	if !ok {
 		return nil
 	}
-	var affected []BlockPos
-	if retractedState, ok := withStateProperty(state, "extended", "false"); ok {
-		c.setBlockRecorded(x, y, z, retractedState, res)
-		affected = append(affected, BlockPos{X: x, Y: y, Z: z})
-	}
 
-	hx, hy, hz := x+dx, y+dy, z+dz
-	if hy >= MinY && hy < MinY+WorldHeight {
-		headState := c.GetBlock(hx, hy, hz)
-		if isBlockNamed(headState, "minecraft:piston_head") {
-			c.setBlockRecorded(hx, hy, hz, StateAir, res)
-			affected = append(affected, BlockPos{X: hx, Y: hy, Z: hz})
+	// Re-verify signal (`PistonBaseBlock.triggerEvent` lines 324-351):
+	hasSignal := c.IsPistonPowered(x, y, z, facing)
+	if hasSignal && (actionID == PistonTriggerContract || actionID == PistonTriggerDrop) {
+		if extState, ok := withStateProperty(state, "extended", "true"); ok {
+			c.setBlockRecorded(x, y, z, extState, res)
 		}
+		return nil
+	}
+	if !hasSignal && actionID == PistonTriggerExtend {
+		return nil
 	}
 
-	if isSticky && !spitBlock {
-		pullDir := oppositeDirection(facing)
-		pdx, pdy, pdz := -dx, -dy, -dz
-		px, py, pz := x+2*dx, y+2*dy, z+2*dz
-		if py >= MinY && py < MinY+WorldHeight {
-			pulledFront := c.GetBlock(px, py, pz)
-			// Glazed terracotta and fragile blocks cannot be pulled by a sticky piston.
-			if !isAirState(pulledFront) && !isPistonDestroyOnPush(pulledFront) && !IsGlazedTerracotta(pulledFront) && canPistonPushBlock(pulledFront) {
-				toPull, toDestroy, canPull := c.ResolvePistonStructure(x, y, z, facing, false)
-				if canPull && len(toPull) > 0 {
-					for _, dp := range toDestroy {
-						oldSt := c.GetBlock(dp.X, dp.Y, dp.Z)
-						if !isAirState(oldSt) {
-							c.notifyPistonDestroyBlock(dp, oldSt)
-							c.setBlockRecorded(dp.X, dp.Y, dp.Z, StateAir, res)
-							if isBlockNamed(oldSt, "minecraft:tripwire") || isBlockNamed(oldSt, "minecraft:tripwire_hook") {
-								c.recalculateTripwireAround(dp.X, dp.Y, dp.Z, oldSt, StateAir, res)
-							}
-							affected = append(affected, dp)
-							if sup, ok := redstoneSupportOf(dp.X, dp.Y, dp.Z, oldSt); ok {
-								affected = append(affected, sup)
-							}
-						}
-					}
+	var affected []BlockPos
+	pistonPos := BlockPos{X: x, Y: y, Z: z}
+	createdTick := c.currentMovingPistonCreatedTick()
 
-					type movedBlock struct {
-						src   BlockPos
-						dst   BlockPos
-						state uint16
-					}
-					moved := make([]movedBlock, len(toPull))
-					dstSet := make(map[BlockPos]bool, len(toPull))
-					for i, p := range toPull {
-						dst := BlockPos{X: p.X + pdx, Y: p.Y + pdy, Z: p.Z + pdz}
-						moved[i] = movedBlock{
-							src:   p,
-							dst:   dst,
-							state: c.GetBlock(p.X, p.Y, p.Z),
-						}
-						dstSet[dst] = true
-					}
-					sort.SliceStable(moved, func(i, j int) bool {
-						projI := moved[i].src.X*pdx + moved[i].src.Y*pdy + moved[i].src.Z*pdz
-						projJ := moved[j].src.X*pdx + moved[j].src.Y*pdy + moved[j].src.Z*pdz
-						return projI > projJ
-					})
+	if actionID == PistonTriggerExtend {
+		movedAffected, ok := c.pistonMoveBlocks(x, y, z, facing, isSticky, true, createdTick, res)
+		if !ok {
+			return nil
+		}
+		affected = append(affected, movedAffected...)
+		if extState, ok := withStateProperty(state, "extended", "true"); ok {
+			c.setBlockRecorded(x, y, z, extState, res)
+			c.notifyObserversOfChangeAt(x, y, z, state, extState)
+			affected = append(affected, pistonPos)
+		}
+		c.notifyPistonBlockEvent(pistonPos, isSticky, PistonTriggerExtend, facing)
+		for _, pos := range affected {
+			c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
+			c.scheduleAround(pos.X, pos.Y, pos.Z)
+		}
+		return affected
+	}
 
-					var movedPositions []BlockPos
-					var movedStates []uint16
-					for _, m := range moved {
-						c.CancelScheduledBlockUpdate(m.src.X, m.src.Y, m.src.Z, UpdateRedstone)
-						stToPlace := m.state
-						if isWaterloggedState(stToPlace) {
-							if unwaterlogged, ok := SetWaterlogged(stToPlace, false); ok {
-								stToPlace = unwaterlogged
-							}
-						}
-						if isBlockNamed(stToPlace, "minecraft:observer") {
-							c.clearObserverStateAt(m.src)
-							if unpowered, ok := withStateProperty(stToPlace, "powered", "false"); ok {
-								stToPlace = unpowered
-							}
-						} else if isBlockNamed(stToPlace, "minecraft:piston") || isBlockNamed(stToPlace, "minecraft:sticky_piston") {
-							c.ClearPistonRuntimeAt(m.src.X, m.src.Y, m.src.Z)
-						}
-						c.setBlockRecorded(m.dst.X, m.dst.Y, m.dst.Z, stToPlace, res)
-						affected = append(affected, m.dst)
-						movedPositions = append(movedPositions, m.dst)
-						movedStates = append(movedStates, stToPlace)
-						if isBlockNamed(stToPlace, "minecraft:observer") {
-							c.ScheduleBlockUpdate(m.dst.X, m.dst.Y, m.dst.Z, UpdateRedstone, ObserverTickDelay)
-						}
-					}
-					for _, m := range moved {
-						if !dstSet[m.src] {
-							c.setBlockRecorded(m.src.X, m.src.Y, m.src.Z, StateAir, res)
-							affected = append(affected, m.src)
-						}
-					}
-					c.notifyPistonMoveEntities(BlockPos{X: x, Y: y, Z: z}, pullDir, false, movedPositions, movedStates)
-				}
+	if actionID == PistonTriggerContract || actionID == PistonTriggerDrop {
+		hx, hy, hz := x+dx, y+dy, z+dz
+		headPos := BlockPos{X: hx, Y: hy, Z: hz}
+		if hy >= c.minY() && hy < c.maxY() {
+			if headBE, hasHeadBE := c.GetPistonMovingBlockEntityAt(hx, hy, hz); hasHeadBE {
+				c.finalizeMovingPistonEarly(hx, hy, hz, headBE, res)
+				affected = append(affected, headPos)
 			}
 		}
+
+		// Place retracting source `moving_piston` at the piston base `(x, y, z)` itself:
+		baseFacing := paramFacing
+		if baseFacing == "" {
+			baseFacing = facing
+		}
+		retractedBase, ok := nameToStateID(info.Name, map[string]string{
+			"facing":   baseFacing,
+			"extended": "false",
+		})
+		if !ok {
+			retractedBase = state
+		}
+		mpBaseState := MovingPistonBlockState(facing, isSticky)
+		c.setBlockRecorded(x, y, z, mpBaseState, res)
+		baseBE := NewPistonMovingBlockEntity(x, y, z, retractedBase, facing, false, true)
+		baseBE.createdInTick = createdTick
+		c.setPistonMovingBlockEntityInternal(baseBE, false)
+		c.notifyObserversOfChangeAt(x, y, z, state, mpBaseState)
+		affected = append(affected, pistonPos)
+
+		if isSticky {
+			f2x, f2y, f2z := x+2*dx, y+2*dy, z+2*dz
+			f2Pos := BlockPos{X: f2x, Y: f2y, Z: f2z}
+			dropped := false
+			if f2y >= c.minY() && f2y < c.maxY() {
+				f2State := c.GetBlock(f2x, f2y, f2z)
+				if IsMovingPistonBlock(f2State) {
+					if pmbe2, hasBE := c.GetPistonMovingBlockEntityAt(f2x, f2y, f2z); hasBE &&
+						pmbe2.Facing == facing && pmbe2.Extending {
+						// Sticky piston short-pulse block spitting (`pmbe.finalTick()`):
+						// finalize the extending block at `pos + 2*facing` in place and
+						// retract the head without pulling it back!
+						c.finalizeMovingPistonEarly(f2x, f2y, f2z, pmbe2, res)
+						affected = append(affected, f2Pos)
+						dropped = true
+					}
+				}
+				if !dropped {
+					pullDir := oppositeDirection(facing)
+					if actionID == PistonTriggerContract &&
+						!isAirState(f2State) &&
+						c.CanPistonPushBlockAt(f2x, f2y, f2z, f2State, pullDir, false, facing) &&
+						(!isPistonDestroyOnPush(f2State) && !IsGlazedTerracotta(f2State)) {
+						pulledAffected, _ := c.pistonMoveBlocks(x, y, z, facing, isSticky, false, createdTick, res)
+						affected = append(affected, pulledAffected...)
+					} else if hy >= c.minY() && hy < c.maxY() {
+						oldHead := c.GetBlock(hx, hy, hz)
+						if !isAirState(oldHead) {
+							c.RemovePistonMovingBlockEntityAt(hx, hy, hz)
+							c.setBlockRecorded(hx, hy, hz, StateAir, res)
+							c.notifyObserversOfChangeAt(hx, hy, hz, oldHead, StateAir)
+							affected = append(affected, headPos)
+						}
+					}
+				}
+			}
+		} else if hy >= c.minY() && hy < c.maxY() {
+			oldHead := c.GetBlock(hx, hy, hz)
+			if !isAirState(oldHead) {
+				c.RemovePistonMovingBlockEntityAt(hx, hy, hz)
+				c.setBlockRecorded(hx, hy, hz, StateAir, res)
+				c.notifyObserversOfChangeAt(hx, hy, hz, oldHead, StateAir)
+				affected = append(affected, headPos)
+			}
+		}
+
+		c.notifyPistonBlockEvent(pistonPos, isSticky, actionID, facing)
+		for _, pos := range affected {
+			c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
+			c.scheduleAround(pos.X, pos.Y, pos.Z)
+		}
+		return affected
 	}
 
-	tr := c.pistonTracker()
-	tr.mu.Lock()
-	entry := tr.getOrCreate(BlockPos{X: x, Y: y, Z: z})
-	entry.pushedOnThisPulse = false
-	entry.spitOnRetract = false
-	tr.mu.Unlock()
+	return nil
+}
 
-	for _, pos := range affected {
-		c.runNeighborSupportPass(pos.X, pos.Y, pos.Z, res)
-		c.scheduleAround(pos.X, pos.Y, pos.Z)
+// finalizeMovingPistonEarly ports `PistonMovingBlockEntity.finalTick()` as
+// invoked inside `PistonBaseBlock.triggerEvent`: source pistons become `AIR`,
+// while non-source moving blocks immediately place their `MovedState`.
+func (c *Cache) finalizeMovingPistonEarly(x, y, z int, be PistonMovingBlockEntity, res *BlockUpdateResult) {
+	c.RemovePistonMovingBlockEntityAt(x, y, z)
+	curState := c.GetBlock(x, y, z)
+	if !IsMovingPistonBlock(curState) {
+		return
 	}
-	return affected
+	var nextState uint16
+	if be.IsSourcePiston {
+		nextState = StateAir
+	} else {
+		nextState = be.FinalBlockState()
+	}
+	if c.setBlockRecorded(x, y, z, nextState, res) {
+		c.scheduleAround(x, y, z)
+		c.notifyObserversOfChangeAt(x, y, z, curState, nextState)
+		if isBlockNamed(nextState, "minecraft:observer") {
+			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ObserverTickDelay)
+		}
+	}
+}
+
+// pistonMoveBlocks ports vanilla 26.1.2 `PistonBaseBlock.moveBlocks`.
+func (c *Cache) pistonMoveBlocks(x, y, z int, facing string, isSticky, extending bool, createdTick uint64, res *BlockUpdateResult) ([]BlockPos, bool) {
+	fdx, fdy, fdz, ok := directionOffset3D(facing)
+	if !ok {
+		return nil, false
+	}
+	hx, hy, hz := x+fdx, y+fdy, z+fdz
+	headPos := BlockPos{X: hx, Y: hy, Z: hz}
+
+	// When retracting, clear `piston_head` at `pos.relative(facing)` before resolving!
+	if !extending && hy >= c.minY() && hy < c.maxY() {
+		if isBlockNamed(c.GetBlock(hx, hy, hz), "minecraft:piston_head") {
+			c.setBlockRecorded(hx, hy, hz, StateAir, res)
+		}
+	}
+
+	toPush, toDestroy, canMove := c.ResolvePistonStructure(x, y, z, facing, extending)
+	if !canMove {
+		return []BlockPos{headPos}, false
+	}
+
+	moveDir := facing
+	mdx, mdy, mdz := fdx, fdy, fdz
+	if !extending {
+		moveDir = oppositeDirection(facing)
+		mdx, mdy, mdz = -fdx, -fdy, -fdz
+	}
+	_ = moveDir
+
+	origStates := make([]uint16, len(toPush))
+	origMap := make(map[BlockPos]uint16, len(toPush))
+	for i, p := range toPush {
+		st := c.GetBlock(p.X, p.Y, p.Z)
+		origStates[i] = st
+		origMap[p] = st
+	}
+
+	var affected []BlockPos
+
+	// 1. Destroy fragile `toDestroy` blocks in reverse order (`size-1 .. 0`) with loot drops.
+	for i := len(toDestroy) - 1; i >= 0; i-- {
+		dp := toDestroy[i]
+		oldSt := c.GetBlock(dp.X, dp.Y, dp.Z)
+		if isAirState(oldSt) {
+			continue
+		}
+		c.notifyOrRecordPistonDestroyDrops(dp, oldSt, res)
+		c.setBlockRecorded(dp.X, dp.Y, dp.Z, StateAir, res)
+		c.propagateMultiBlockPartnerBreak(dp.X, dp.Y, dp.Z, oldSt, res)
+		if isBlockNamed(oldSt, "minecraft:tripwire") || isBlockNamed(oldSt, "minecraft:tripwire_hook") {
+			c.recalculateTripwireAround(dp.X, dp.Y, dp.Z, oldSt, StateAir, res)
+		}
+		c.notifyObserversOfChangeAt(dp.X, dp.Y, dp.Z, oldSt, StateAir)
+		affected = append(affected, dp)
+		if sup, ok := redstoneSupportOf(dp.X, dp.Y, dp.Z, oldSt); ok {
+			affected = append(affected, sup)
+		}
+	}
+
+	// 2. Move `toPush` blocks in reverse order (`size-1 .. 0`), placing
+	// `minecraft:moving_piston` + `PistonMovingBlockEntity` at each destination.
+	mpDefault := MovingPistonBlockState(facing, false)
+	for i := len(toPush) - 1; i >= 0; i-- {
+		src := toPush[i]
+		dst := BlockPos{X: src.X + mdx, Y: src.Y + mdy, Z: src.Z + mdz}
+		delete(origMap, dst)
+
+		c.CancelScheduledBlockUpdate(src.X, src.Y, src.Z, UpdateRedstone)
+		movedSt := origStates[i]
+		if isBlockNamed(movedSt, "minecraft:observer") {
+			c.clearObserverStateAt(src)
+			if unpowered, ok := withStateProperty(movedSt, "powered", "false"); ok {
+				movedSt = unpowered
+			}
+		} else if isBlockNamed(movedSt, "minecraft:piston") || isBlockNamed(movedSt, "minecraft:sticky_piston") {
+			c.ClearPistonRuntimeAt(src.X, src.Y, src.Z)
+		}
+
+		prevDst := c.GetBlock(dst.X, dst.Y, dst.Z)
+		c.setBlockRecorded(dst.X, dst.Y, dst.Z, mpDefault, res)
+		be := NewPistonMovingBlockEntity(dst.X, dst.Y, dst.Z, movedSt, facing, extending, false)
+		be.createdInTick = createdTick
+		c.setPistonMovingBlockEntityInternal(be, false)
+		c.notifyObserversOfChangeAt(dst.X, dst.Y, dst.Z, prevDst, mpDefault)
+		affected = append(affected, dst)
+	}
+
+	// 3. When extending, place source `moving_piston` (`piston_head`) at `headPos`.
+	if extending {
+		delete(origMap, headPos)
+		headType := "normal"
+		if isSticky {
+			headType = "sticky"
+		}
+		headState, ok := nameToStateID("minecraft:piston_head", map[string]string{
+			"facing": facing,
+			"type":   headType,
+			"short":  "false",
+		})
+		if !ok {
+			return affected, false
+		}
+		mpHead := MovingPistonBlockState(facing, isSticky)
+		prevHead := c.GetBlock(hx, hy, hz)
+		c.setBlockRecorded(hx, hy, hz, mpHead, res)
+		headBE := NewPistonMovingBlockEntity(hx, hy, hz, headState, facing, true, true)
+		headBE.createdInTick = createdTick
+		c.setPistonMovingBlockEntityInternal(headBE, false)
+		c.notifyObserversOfChangeAt(hx, hy, hz, prevHead, mpHead)
+		affected = append(affected, headPos)
+	}
+
+	// 4. Clear any source positions not overwritten by a destination `moving_piston`.
+	for i := len(toPush) - 1; i >= 0; i-- {
+		src := toPush[i]
+		if oldSrcSt, stillUncovered := origMap[src]; stillUncovered {
+			c.setBlockRecorded(src.X, src.Y, src.Z, StateAir, res)
+			c.notifyObserversOfChangeAt(src.X, src.Y, src.Z, oldSrcSt, StateAir)
+			affected = append(affected, src)
+			if sup, ok := redstoneSupportOf(src.X, src.Y, src.Z, oldSrcSt); ok {
+				affected = append(affected, sup)
+			}
+			delete(origMap, src)
+		}
+	}
+
+	return affected, true
 }
 
 // --- Piston Runtime State Persistence & Chunk Unload/Reload ---
 
-// PistonRuntimeEntrySnapshot captures the in-flight state of a piston or
-// sticky piston at (X, Y, Z) so that pending 2-tick extensions/retractions and
-// 1-tick sticky-piston block-spitting state survive save/reload and chunk unload/reload.
+// PistonRuntimeEntrySnapshot captures the runtime state of a piston at (X, Y, Z).
 type PistonRuntimeEntrySnapshot struct {
 	X, Y, Z           int
 	PulseStartTick    uint64
@@ -882,8 +1009,7 @@ func (c *Cache) ExportPistonRuntimeEntries() []PistonRuntimeEntrySnapshot {
 	return out
 }
 
-// ImportPistonRuntimeEntries restores piston runtime tracker entries onto c
-// and re-schedules any pending 2-tick piston action if not already queued.
+// ImportPistonRuntimeEntries restores piston runtime tracker entries onto c.
 func (c *Cache) ImportPistonRuntimeEntries(entries []PistonRuntimeEntrySnapshot) int {
 	if c == nil || len(entries) == 0 {
 		return 0
@@ -893,7 +1019,7 @@ func (c *Cache) ImportPistonRuntimeEntries(entries []PistonRuntimeEntrySnapshot)
 	var toSchedule []BlockPos
 	imported := 0
 	for _, snap := range entries {
-		if snap.Y < MinY || snap.Y >= MinY+WorldHeight {
+		if snap.Y < c.minY() || snap.Y >= c.maxY() {
 			continue
 		}
 		pos := BlockPos{X: snap.X, Y: snap.Y, Z: snap.Z}
@@ -1127,6 +1253,7 @@ type PistonMovingBlockEntity struct {
 	Progress       float32
 	ProgressO      float32
 	LastTicked     uint64
+	createdInTick  uint64
 }
 
 // NewPistonMovingBlockEntity constructs a PistonMovingBlockEntity matching
@@ -1159,14 +1286,22 @@ func (be PistonMovingBlockEntity) MovementDirection() string {
 
 // FinalBlockState computes the final block state placed when the moving piston
 // block entity finishes its 2-tick interpolation, matching vanilla
-// PistonMovingBlockEntity.tick / finalTick:
-//   - If IsSourcePiston && !Extending -> StateAir
-//   - If IsSourcePiston && Extending -> minecraft:piston_head[facing=Facing,short=false,type=normal|sticky]
-//   - If !IsSourcePiston && IsMovingPistonBlock(MovedState) -> StateAir
-//   - Otherwise -> stripWaterloggedForPistonMove(MovedState)
+// PistonMovingBlockEntity.tick:
+//   - If IsSourcePiston && !Extending:
+//     - if MovedState is a piston base (`piston` / `sticky_piston`), returns `extended="false"`;
+//     - otherwise returns `StateAir`.
+//   - If IsSourcePiston && Extending -> `minecraft:piston_head[facing=Facing,short=false,type=normal|sticky]`
+//   - If !IsSourcePiston && IsMovingPistonBlock(MovedState) -> `StateAir`
+//   - Otherwise -> `MovedState` with `waterlogged` stripped to `"false"`.
 func (be PistonMovingBlockEntity) FinalBlockState() uint16 {
 	if be.IsSourcePiston {
 		if !be.Extending {
+			if isBlockNamed(be.MovedState, "minecraft:piston") || isBlockNamed(be.MovedState, "minecraft:sticky_piston") {
+				if retracted, ok := withStateProperty(be.MovedState, "extended", "false"); ok {
+					return retracted
+				}
+				return be.MovedState
+			}
 			return StateAir
 		}
 		pType := "normal"
@@ -1334,12 +1469,99 @@ func PistonMovingBlockEntityFromNBT(c *nbt.Compound) (*PistonMovingBlockEntity, 
 	}, nil
 }
 
+// ActiveMovingPistonCount returns the number of active `PistonMovingBlockEntity`
+// instances currently tracked on c.
+func (c *Cache) ActiveMovingPistonCount() int {
+	if c == nil {
+		return 0
+	}
+	v, ok := pistonTrackers.Load(c)
+	if !ok || v == nil {
+		return 0
+	}
+	tr := v.(*pistonRuntimeTracker)
+	tr.mu.Lock()
+	n := len(tr.movingBlocks)
+	tr.mu.Unlock()
+	return n
+}
+
+func (c *Cache) activeMovingPistonChunks() [][2]int32 {
+	if c == nil {
+		return nil
+	}
+	v, ok := pistonTrackers.Load(c)
+	if !ok || v == nil {
+		return nil
+	}
+	tr := v.(*pistonRuntimeTracker)
+	tr.mu.Lock()
+	seen := make(map[[2]int32]bool)
+	var out [][2]int32
+	for pos := range tr.movingBlocks {
+		ck := [2]int32{int32(pos.X >> 4), int32(pos.Z >> 4)}
+		if !seen[ck] {
+			seen[ck] = true
+			out = append(out, ck)
+		}
+	}
+	tr.mu.Unlock()
+	return out
+}
+
+func upsertRawBlockEntityOnChunk(ch *Chunk, comp *nbt.Compound, x, y, z int) {
+	if ch == nil || comp == nil {
+		return
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	for i, existing := range ch.rawBlockEntities {
+		if existing != nil &&
+			int(nbtAsInt(existing, "x")) == x &&
+			int(nbtAsInt(existing, "y")) == y &&
+			int(nbtAsInt(existing, "z")) == z {
+			ch.rawBlockEntities[i] = CloneNBTCompound(comp)
+			return
+		}
+	}
+	ch.rawBlockEntities = append(ch.rawBlockEntities, CloneNBTCompound(comp))
+}
+
+func removePistonRawBlockEntityFromChunk(ch *Chunk, x, y, z int) {
+	if ch == nil {
+		return
+	}
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	dst := ch.rawBlockEntities[:0]
+	for _, existing := range ch.rawBlockEntities {
+		if existing == nil {
+			continue
+		}
+		if int(nbtAsInt(existing, "x")) == x &&
+			int(nbtAsInt(existing, "y")) == y &&
+			int(nbtAsInt(existing, "z")) == z {
+			if idTag, ok := existing.Get("id"); ok {
+				if idStr, ok := idTag.(nbt.String); ok && (string(idStr) == PistonBlockEntityID || string(idStr) == "piston") {
+					continue
+				}
+			}
+		}
+		dst = append(dst, existing)
+	}
+	ch.rawBlockEntities = dst
+}
+
 // SetPistonMovingBlockEntity places a `minecraft:moving_piston` block at
 // (be.X, be.Y, be.Z) (if not already present) and registers its
 // `PistonMovingBlockEntity` (`id: "minecraft:piston"`) in runtime storage and
-// on the chunk's StructureBlockEntities.
+// on the chunk's block_entities.
 func (c *Cache) SetPistonMovingBlockEntity(be PistonMovingBlockEntity) {
-	if c == nil || be.Y < MinY || be.Y >= MinY+WorldHeight {
+	c.setPistonMovingBlockEntityInternal(be, true)
+}
+
+func (c *Cache) setPistonMovingBlockEntityInternal(be PistonMovingBlockEntity, ensureBlock bool) {
+	if c == nil || be.Y < c.minY() || be.Y >= c.maxY() {
 		return
 	}
 	if be.Facing == "" {
@@ -1347,16 +1569,18 @@ func (c *Cache) SetPistonMovingBlockEntity(be PistonMovingBlockEntity) {
 	} else {
 		be.Facing = strings.ToLower(strings.TrimSpace(be.Facing))
 	}
-	isSticky := false
-	if info, ok := stateByID(be.MovedState); ok {
-		if info.Name == "minecraft:sticky_piston" || info.Properties["type"] == "sticky" {
-			isSticky = true
+	if ensureBlock {
+		isSticky := false
+		if info, ok := stateByID(be.MovedState); ok {
+			if info.Name == "minecraft:sticky_piston" || info.Properties["type"] == "sticky" {
+				isSticky = true
+			}
 		}
-	}
-	cur := c.GetBlock(be.X, be.Y, be.Z)
-	if !IsMovingPistonBlock(cur) {
-		if mpState := MovingPistonBlockState(be.Facing, isSticky); mpState != StateAir {
-			c.SetBlock(be.X, be.Y, be.Z, mpState)
+		cur := c.GetBlock(be.X, be.Y, be.Z)
+		if !IsMovingPistonBlock(cur) {
+			if mpState := MovingPistonBlockState(be.Facing, isSticky); mpState != StateAir {
+				c.SetBlock(be.X, be.Y, be.Z, mpState)
+			}
 		}
 	}
 	pos := BlockPos{X: be.X, Y: be.Y, Z: be.Z}
@@ -1374,11 +1598,19 @@ func (c *Cache) SetPistonMovingBlockEntity(be PistonMovingBlockEntity) {
 		Y:  be.Y,
 		Z:  be.Z,
 	})
+	cx, cz := int32(be.X>>4), int32(be.Z>>4)
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch != nil {
+		upsertRawBlockEntityOnChunk(ch, be.ToNBT(), be.X, be.Y, be.Z)
+		c.markDirty(cx, cz)
+	}
 }
 
 // GetPistonMovingBlockEntityAt returns the `PistonMovingBlockEntity` at (x, y, z), if any.
 func (c *Cache) GetPistonMovingBlockEntityAt(x, y, z int) (PistonMovingBlockEntity, bool) {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return PistonMovingBlockEntity{}, false
 	}
 	tr := c.pistonTracker()
@@ -1400,15 +1632,180 @@ func (c *Cache) RemovePistonMovingBlockEntityAt(x, y, z int) bool {
 	delete(tr.movingBlocks, pos)
 	tr.mu.Unlock()
 
+	cx, cz := int32(x>>4), int32(z>>4)
 	c.mu.Lock()
-	ch := c.chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
+	ch := c.chunks[[2]int32{cx, cz}]
 	c.mu.Unlock()
 	if ch != nil {
 		if sbe, ok := ch.StructureBlockEntityAt(x, y, z); ok && sbe.ID == PistonBlockEntityID {
 			ch.RemoveStructureBlockEntity(x, y, z)
 		}
+		removePistonRawBlockEntityFromChunk(ch, x, y, z)
+		c.markDirty(cx, cz)
 	}
 	return existed
+}
+
+// stepAllMovingPistons advances all active `PistonMovingBlockEntity` instances
+// on `c` by one tick during `TickBlockUpdates()`:
+//   - Tick 1: `Progress` advances `0.0 -> 0.5` and colliding / honey-stuck entities are pushed.
+//   - Tick 2: `Progress` advances `0.5 -> 1.0`, finalizes all completed `moving_piston`
+//     cells in two phases (placing final states first, then running survival/shape,
+//     scheduled tick, observer, and redstone updates), and removes their block entities.
+func (c *Cache) stepAllMovingPistons(now uint64, res *BlockUpdateResult) {
+	if c == nil {
+		return
+	}
+	v, ok := pistonTrackers.Load(c)
+	if !ok || v == nil {
+		return
+	}
+	tr := v.(*pistonRuntimeTracker)
+	tr.mu.Lock()
+	if len(tr.movingBlocks) == 0 {
+		tr.mu.Unlock()
+		return
+	}
+	snapshot := make([]PistonMovingBlockEntity, 0, len(tr.movingBlocks))
+	for _, be := range tr.movingBlocks {
+		snapshot = append(snapshot, be)
+	}
+	tr.mu.Unlock()
+
+	// Sort lower Y first so supporting blocks finalize before blocks resting on top of them.
+	sort.Slice(snapshot, func(i, j int) bool {
+		if snapshot[i].Y != snapshot[j].Y {
+			return snapshot[i].Y < snapshot[j].Y
+		}
+		if snapshot[i].Z != snapshot[j].Z {
+			return snapshot[i].Z < snapshot[j].Z
+		}
+		return snapshot[i].X < snapshot[j].X
+	})
+
+	type entityMoveNotice struct {
+		pos        BlockPos
+		dir        string
+		extending  bool
+		movedState uint16
+	}
+	type finalizedCell struct {
+		pos        BlockPos
+		oldMPState uint16
+		finalState uint16
+		movedState uint16
+	}
+
+	var entityNotices []entityMoveNotice
+	var toFinalize []PistonMovingBlockEntity
+
+	tr.mu.Lock()
+	for _, item := range snapshot {
+		pos := BlockPos{X: item.X, Y: item.Y, Z: item.Z}
+		be, stillPresent := tr.movingBlocks[pos]
+		if !stillPresent {
+			continue
+		}
+		if be.createdInTick != 0 && be.createdInTick == now {
+			continue
+		}
+		if be.Progress < 0.5 {
+			be.ProgressO = be.Progress
+			be.Progress = 0.5
+			be.LastTicked = now
+			tr.movingBlocks[pos] = be
+			entityNotices = append(entityNotices, entityMoveNotice{
+				pos:        pos,
+				dir:        be.MovementDirection(),
+				extending:  be.Extending,
+				movedState: be.MovedState,
+			})
+		} else {
+			toFinalize = append(toFinalize, be)
+			entityNotices = append(entityNotices, entityMoveNotice{
+				pos:        pos,
+				dir:        be.MovementDirection(),
+				extending:  be.Extending,
+				movedState: be.MovedState,
+			})
+		}
+	}
+	tr.mu.Unlock()
+
+	// Sync chunk rawBlockEntities & dirty flag for midpoint (0.5) updates.
+	for _, n := range entityNotices {
+		if be, ok := c.GetPistonMovingBlockEntityAt(n.pos.X, n.pos.Y, n.pos.Z); ok && be.Progress < 1.0 {
+			cx, cz := int32(be.X>>4), int32(be.Z>>4)
+			c.mu.Lock()
+			ch := c.chunks[[2]int32{cx, cz}]
+			c.mu.Unlock()
+			if ch != nil {
+				upsertRawBlockEntityOnChunk(ch, be.ToNBT(), be.X, be.Y, be.Z)
+				c.markDirty(cx, cz)
+			}
+		}
+		c.notifyPistonMoveEntities(n.pos, n.dir, n.extending, []BlockPos{n.pos}, []uint16{n.movedState})
+	}
+
+	if len(toFinalize) == 0 {
+		return
+	}
+
+	// Phase A: Remove finalizing PistonMovingBlockEntities and place all FinalBlockStates.
+	var finalized []finalizedCell
+	for _, be := range toFinalize {
+		if _, stillThere := c.GetPistonMovingBlockEntityAt(be.X, be.Y, be.Z); !stillThere {
+			continue
+		}
+		c.RemovePistonMovingBlockEntityAt(be.X, be.Y, be.Z)
+		curState := c.GetBlock(be.X, be.Y, be.Z)
+		if !IsMovingPistonBlock(curState) {
+			continue
+		}
+		finalState := be.FinalBlockState()
+		if c.setBlockRecorded(be.X, be.Y, be.Z, finalState, res) {
+			finalized = append(finalized, finalizedCell{
+				pos:        BlockPos{X: be.X, Y: be.Y, Z: be.Z},
+				oldMPState: curState,
+				finalState: finalState,
+				movedState: be.MovedState,
+			})
+		}
+	}
+
+	// Phase B: Survival/shape updates (`Block.updateFromNeighbourShapes` / `updateOrDestroy`),
+	// scheduled fluid/falling ticks, observer notifications, and redstone propagation.
+	for _, fc := range finalized {
+		x, y, z := fc.pos.X, fc.pos.Y, fc.pos.Z
+		cur := c.GetBlock(x, y, z)
+		if cur == fc.finalState && !isAirState(cur) {
+			if updated, stays := c.evaluateBlockSurvival(x, y, z, cur); !stays {
+				c.notifyOrRecordPistonDestroyDrops(fc.pos, cur, res)
+				c.setBlockRecorded(x, y, z, updated, res)
+				cur = updated
+			} else if updated != cur {
+				c.setBlockRecorded(x, y, z, updated, res)
+				cur = updated
+			}
+		}
+		c.runNeighborSupportPass(x, y, z, res)
+		c.scheduleAround(x, y, z)
+		c.notifyObserversOfChangeAt(x, y, z, fc.oldMPState, cur)
+		c.propagateRedstoneAround(x, y, z, fc.oldMPState, cur, res)
+		if isBlockNamed(cur, "minecraft:observer") {
+			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ObserverTickDelay)
+		} else if info, ok := stateByID(cur); ok &&
+			(info.Name == "minecraft:piston" || info.Name == "minecraft:sticky_piston") &&
+			info.Properties["extended"] == "false" {
+			// PistonBaseBlock.onPlace: a piston finishing retraction or pushed into
+			// place immediately checks if it is powered and extends if able.
+			pChanged := c.evaluatePistonRedstone(x, y, z, cur, info, res)
+			for _, p := range pChanged {
+				st := c.GetBlock(p.X, p.Y, p.Z)
+				c.propagateRedstoneAround(p.X, p.Y, p.Z, st, st, res)
+			}
+		}
+	}
 }
 
 // StepPistonMovingBlockEntityAt advances the `PistonMovingBlockEntity` at
@@ -1420,7 +1817,7 @@ func (c *Cache) RemovePistonMovingBlockEntityAt(x, y, z int) bool {
 //   - Otherwise increments `Progress` by `0.5` (clamped to `1.0`) and translates
 //     colliding entities along `MovementDirection()`.
 func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res BlockUpdateResult) {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return false, res
 	}
 	pos := BlockPos{X: x, Y: y, Z: z}
@@ -1431,7 +1828,7 @@ func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res 
 		tr.mu.Unlock()
 		return false, res
 	}
-	be.LastTicked++
+	be.LastTicked = c.CurrentBlockTick()
 	be.ProgressO = be.Progress
 	if be.ProgressO >= 1.0 {
 		delete(tr.movingBlocks, pos)
@@ -1445,6 +1842,7 @@ func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res 
 			} else {
 				finalState := be.FinalBlockState()
 				if c.setBlockRecorded(x, y, z, finalState, &res) {
+					c.runNeighborSupportPass(x, y, z, &res)
 					c.scheduleAround(x, y, z)
 					c.notifyObserversOfChangeAt(x, y, z, curState, finalState)
 					c.propagateRedstoneAround(x, y, z, curState, finalState, &res)
@@ -1457,7 +1855,6 @@ func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res 
 		return true, res
 	}
 
-	wasZero := be.ProgressO == 0
 	be.Progress += 0.5
 	if be.Progress >= 1.0 {
 		be.Progress = 1.0
@@ -1465,9 +1862,16 @@ func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res 
 	tr.movingBlocks[pos] = be
 	tr.mu.Unlock()
 
-	if wasZero {
-		c.notifyPistonMoveEntities(pos, be.MovementDirection(), be.Extending, []BlockPos{pos}, []uint16{be.MovedState})
+	cx, cz := int32(x>>4), int32(z>>4)
+	c.mu.Lock()
+	ch := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if ch != nil {
+		upsertRawBlockEntityOnChunk(ch, be.ToNBT(), x, y, z)
+		c.markDirty(cx, cz)
 	}
+
+	c.notifyPistonMoveEntities(pos, be.MovementDirection(), be.Extending, []BlockPos{pos}, []uint16{be.MovedState})
 	return false, res
 }
 
@@ -1476,7 +1880,7 @@ func (c *Cache) StepPistonMovingBlockEntityAt(x, y, z int) (finalized bool, res 
 // PistonMovingBlockEntity.finalTick().
 func (c *Cache) FinalTickPistonMovingBlockEntityAt(x, y, z int) BlockUpdateResult {
 	var res BlockUpdateResult
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return res
 	}
 	be, ok := c.GetPistonMovingBlockEntityAt(x, y, z)
@@ -1504,7 +1908,7 @@ func (c *Cache) FinalTickPistonMovingBlockEntityAt(x, y, z int) BlockUpdateResul
 // `pos.relative(facing.getOpposite())`.
 func (c *Cache) DestroyMovingPistonBlockAt(x, y, z int) BlockUpdateResult {
 	var res BlockUpdateResult
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return res
 	}
 	curState := c.GetBlock(x, y, z)
@@ -1519,7 +1923,7 @@ func (c *Cache) DestroyMovingPistonBlockAt(x, y, z int) BlockUpdateResult {
 	}
 	if dx, dy, dz, ok := directionOffset3D(oppositeDirection(facing)); ok {
 		bx, by, bz := x+dx, y+dy, z+dz
-		if by >= MinY && by < MinY+WorldHeight {
+		if by >= c.minY() && by < c.maxY() {
 			bState := c.GetBlock(bx, by, bz)
 			if bInfo, ok := stateByID(bState); ok &&
 				(bInfo.Name == "minecraft:piston" || bInfo.Name == "minecraft:sticky_piston") &&
@@ -1544,7 +1948,7 @@ func (c *Cache) DestroyMovingPistonBlockAt(x, y, z int) BlockUpdateResult {
 // `moving_piston` block and returns (true, res); otherwise returns (false, empty).
 func (c *Cache) InteractMovingPistonBlockAt(x, y, z int) (bool, BlockUpdateResult) {
 	var res BlockUpdateResult
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return false, res
 	}
 	curState := c.GetBlock(x, y, z)
@@ -1569,4 +1973,161 @@ func (c *Cache) MovingPistonMovedStateAt(x, y, z int) (uint16, bool) {
 	return be.MovedState, true
 }
 
+// --- Chunk `.mca` & Redstone Runtime Persistence for `PistonMovingBlockEntity` ---
 
+func (c *Cache) syncChunkPistonBlockEntitiesToSnapshot(cx, cz int32, snapshot *Chunk) {
+	if c == nil || snapshot == nil {
+		return
+	}
+	// Strip any stale `minecraft:piston` entries on snapshot first.
+	dstRaw := snapshot.rawBlockEntities[:0]
+	for _, rawBE := range snapshot.rawBlockEntities {
+		if rawBE == nil {
+			continue
+		}
+		if idTag, ok := rawBE.Get("id"); ok {
+			if idStr, ok := idTag.(nbt.String); ok && (string(idStr) == PistonBlockEntityID || string(idStr) == "piston") {
+				continue
+			}
+		}
+		dstRaw = append(dstRaw, rawBE)
+	}
+	snapshot.rawBlockEntities = dstRaw
+
+	dstStruct := snapshot.blockEntities[:0]
+	for _, sbe := range snapshot.blockEntities {
+		if sbe.ID == PistonBlockEntityID || sbe.ID == "piston" {
+			continue
+		}
+		dstStruct = append(dstStruct, sbe)
+	}
+	snapshot.blockEntities = dstStruct
+
+	v, ok := pistonTrackers.Load(c)
+	if !ok || v == nil {
+		return
+	}
+	tr := v.(*pistonRuntimeTracker)
+	tr.mu.Lock()
+	var active []PistonMovingBlockEntity
+	for pos, be := range tr.movingBlocks {
+		if int32(pos.X>>4) == cx && int32(pos.Z>>4) == cz {
+			active = append(active, be)
+		}
+	}
+	tr.mu.Unlock()
+
+	sort.Slice(active, func(i, j int) bool {
+		if active[i].Y != active[j].Y {
+			return active[i].Y < active[j].Y
+		}
+		if active[i].Z != active[j].Z {
+			return active[i].Z < active[j].Z
+		}
+		return active[i].X < active[j].X
+	})
+	for _, be := range active {
+		snapshot.blockEntities = append(snapshot.blockEntities, StructureBlockEntity{
+			ID: PistonBlockEntityID,
+			X:  be.X,
+			Y:  be.Y,
+			Z:  be.Z,
+		})
+		snapshot.rawBlockEntities = append(snapshot.rawBlockEntities, be.ToNBT())
+	}
+}
+
+func (c *Cache) importChunkPistonBlockEntitiesFromChunk(ch *Chunk) {
+	if c == nil || ch == nil {
+		return
+	}
+	ch.mu.Lock()
+	rawList := make([]*nbt.Compound, len(ch.rawBlockEntities))
+	copy(rawList, ch.rawBlockEntities)
+	ch.mu.Unlock()
+
+	for _, rawBE := range rawList {
+		if rawBE == nil {
+			continue
+		}
+		idTag, ok := rawBE.Get("id")
+		if !ok {
+			continue
+		}
+		idStr, ok := idTag.(nbt.String)
+		if !ok || (string(idStr) != PistonBlockEntityID && string(idStr) != "piston") {
+			continue
+		}
+		decoded, err := PistonMovingBlockEntityFromNBT(rawBE)
+		if err != nil || decoded == nil {
+			continue
+		}
+		c.setPistonMovingBlockEntityInternal(*decoded, false)
+	}
+}
+
+// UnloadChunkMovingPistons extracts and removes all `PistonMovingBlockEntity`
+// entries in chunk `(cx, cz)`.
+func (c *Cache) UnloadChunkMovingPistons(cx, cz int32) []PistonMovingBlockEntity {
+	if c == nil {
+		return nil
+	}
+	tr := c.pistonTracker()
+	tr.mu.Lock()
+	var out []PistonMovingBlockEntity
+	for pos, be := range tr.movingBlocks {
+		if int32(pos.X>>4) == cx && int32(pos.Z>>4) == cz {
+			out = append(out, be)
+			delete(tr.movingBlocks, pos)
+		}
+	}
+	tr.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Y != out[j].Y {
+			return out[i].Y < out[j].Y
+		}
+		if out[i].Z != out[j].Z {
+			return out[i].Z < out[j].Z
+		}
+		return out[i].X < out[j].X
+	})
+	return out
+}
+
+// EncodeMovingPistonsNBT encodes a slice of `PistonMovingBlockEntity` into a
+// compound NBT list using exact vanilla `minecraft:piston` tags.
+func EncodeMovingPistonsNBT(entries []PistonMovingBlockEntity) nbt.List {
+	if len(entries) == 0 {
+		return nbt.List{ElemID: nbt.TagEnd}
+	}
+	elems := make([]nbt.Tag, 0, len(entries))
+	for _, be := range entries {
+		elems = append(elems, be.ToNBT())
+	}
+	return nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  elems,
+	}
+}
+
+// ImportMovingPistonsNBT decodes and registers `PistonMovingBlockEntity`
+// entries onto `c` from an NBT list.
+func (c *Cache) ImportMovingPistonsNBT(list nbt.List) int {
+	if c == nil || len(list.Elems) == 0 {
+		return 0
+	}
+	count := 0
+	for _, elem := range list.Elems {
+		comp, ok := elem.(*nbt.Compound)
+		if !ok || comp == nil {
+			continue
+		}
+		decoded, err := PistonMovingBlockEntityFromNBT(comp)
+		if err != nil || decoded == nil {
+			continue
+		}
+		c.setPistonMovingBlockEntityInternal(*decoded, false)
+		count++
+	}
+	return count
+}
