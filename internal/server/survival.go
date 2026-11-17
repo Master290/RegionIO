@@ -13,7 +13,6 @@ import (
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
-	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -43,19 +42,26 @@ const (
 )
 
 type playerSurvivalState struct {
-	mu                sync.Mutex
-	fallDistance      float64
-	dead              bool
-	drawingWeapon     string
-	drawingHand       int32
-	usingSpyglass     bool
-	spyglassHand      int32
-	ticksFrozen       int
-	freezeTickCounter int
-	bubbleVX          float64
-	bubbleVY          float64
-	bubbleVZ          float64
-	itemCooldowns     map[string]int
+	mu                   sync.Mutex
+	fallDistance         float64
+	dead                 bool
+	deathTicks           int
+	removedAfterDeath    bool
+	hasLastDeathLocation bool
+	lastDeathDim         string
+	lastDeathPos         [3]int32
+	respawnSeq           uint32
+	entitySyncFn         func()
+	drawingWeapon        string
+	drawingHand          int32
+	usingSpyglass        bool
+	spyglassHand         int32
+	ticksFrozen          int
+	freezeTickCounter    int
+	bubbleVX             float64
+	bubbleVY             float64
+	bubbleVZ             float64
+	itemCooldowns        map[string]int
 }
 
 var playerSurvivalStates sync.Map // map[*PlayerSession]*playerSurvivalState
@@ -87,6 +93,215 @@ func (session *PlayerSession) IsDead() bool {
 		return false
 	}
 	return true
+}
+
+// SetLastDeathLocation records the player's most recent death GlobalPos.
+func (session *PlayerSession) SetLastDeathLocation(dim string, x, y, z int32) {
+	if session == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.hasLastDeathLocation = true
+	st.lastDeathDim = normDim
+	st.lastDeathPos = [3]int32{x, y, z}
+	st.mu.Unlock()
+}
+
+// LastDeathLocation returns the player's most recent death GlobalPos, if recorded.
+func (session *PlayerSession) LastDeathLocation() (dim string, pos [3]int32, ok bool) {
+	if session == nil {
+		return "", [3]int32{}, false
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.lastDeathDim, st.lastDeathPos, st.hasLastDeathLocation
+}
+
+// ClearLastDeathLocation clears the player's recorded last death location.
+func (session *PlayerSession) ClearLastDeathLocation() {
+	if session == nil {
+		return
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.hasLastDeathLocation = false
+	st.lastDeathDim = ""
+	st.lastDeathPos = [3]int32{}
+	st.mu.Unlock()
+}
+
+// DeathTicks returns the elapsed ticks since death for a dead player session.
+func (session *PlayerSession) DeathTicks() int {
+	if session == nil {
+		return 0
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.deathTicks
+}
+
+// SetDeathState restores dead/death-tick state from persistent playerdata.
+func (session *PlayerSession) SetDeathState(dead bool, deathTicks int) {
+	if session == nil {
+		return
+	}
+	if deathTicks < 0 {
+		deathTicks = 0
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.dead = dead
+	if dead {
+		st.deathTicks = deathTicks
+		st.removedAfterDeath = deathTicks >= 20
+	} else {
+		st.deathTicks = 0
+		st.removedAfterDeath = false
+	}
+	st.mu.Unlock()
+}
+
+// RemovedAfterDeath reports whether a dead player has completed their 20-tick
+// death animation and should no longer be visible to nearby entity trackers.
+func (session *PlayerSession) RemovedAfterDeath() bool {
+	if session == nil {
+		return false
+	}
+	if session.Health() > 0 {
+		st := getSurvivalState(session)
+		st.mu.Lock()
+		st.dead = false
+		st.deathTicks = 0
+		st.removedAfterDeath = false
+		st.mu.Unlock()
+		return false
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.dead && st.removedAfterDeath
+}
+
+// RespawnSeq returns a monotonically increasing counter bumped on each respawn
+// so entity trackers know to remove and re-add the player entity for viewers.
+func (session *PlayerSession) RespawnSeq() uint32 {
+	if session == nil {
+		return 0
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.respawnSeq
+}
+
+// SetPlayerEntitySyncFunc registers a callback invoked to immediately flush
+// entity visibility updates when nearby players die or respawn.
+func (s *Server) SetPlayerEntitySyncFunc(session *PlayerSession, fn func()) {
+	if session == nil {
+		return
+	}
+	st := getSurvivalState(session)
+	st.mu.Lock()
+	st.entitySyncFn = fn
+	st.mu.Unlock()
+}
+
+// NotifyNearbyEntityTrackers immediately invokes registered entity visibility
+// sync callbacks for joined players in dim whose view covers chunk (cx, cz).
+func (s *Server) NotifyNearbyEntityTrackers(dim string, cx, cz int32) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, player := range s.players {
+		if player != nil && player.IsJoined() {
+			players = append(players, player)
+		}
+	}
+	s.playersMu.RUnlock()
+
+	var fns []func()
+	for _, player := range players {
+		if player.Dimension() != normDim {
+			continue
+		}
+		snap := player.Snapshot()
+		pcx := int32(int64(math.Floor(snap.X)) >> 4)
+		pcz := int32(int64(math.Floor(snap.Z)) >> 4)
+		if chunkDistance(pcx, pcz, cx, cz) <= int32(snap.ViewDistance) {
+			st := getSurvivalState(player)
+			st.mu.Lock()
+			fn := st.entitySyncFn
+			st.mu.Unlock()
+			if fn != nil {
+				fns = append(fns, fn)
+			}
+		}
+	}
+	for _, fn := range fns {
+		fn()
+	}
+}
+
+// EncodePlayerDeathEntityDataPacket encodes a clientbound set_entity_data packet
+// setting DATA_POSE = PoseDying (7) and DATA_HEALTH_ID = 0.0 for a dying player.
+func EncodePlayerDeathEntityDataPacket(entityID int32) []byte {
+	w := protocol.NewWriter(24)
+	w.VarInt(entityID)
+	w.Byte(EntityDataPoseID)
+	w.VarInt(EntityDataSerializerPose)
+	w.VarInt(int32(PoseDying))
+	w.Byte(EntityDataLivingHealthID)
+	w.VarInt(EntityDataSerializerFloat)
+	w.Float32(0.0)
+	w.Byte(0xFF)
+	return w.Bytes()
+}
+
+// TickAllPlayerDeaths advances vanilla 20-tick death timers on dead players,
+// broadcasting death poof particles (EntityEventPoof=60) and updating trackers.
+func (s *Server) TickAllPlayerDeaths() {
+	if s == nil {
+		return
+	}
+	s.playersMu.RLock()
+	players := make([]*PlayerSession, 0, len(s.players))
+	for _, p := range s.players {
+		if p != nil && p.IsJoined() {
+			players = append(players, p)
+		}
+	}
+	s.playersMu.RUnlock()
+
+	for _, p := range players {
+		if !p.IsDead() {
+			continue
+		}
+		st := getSurvivalState(p)
+		st.mu.Lock()
+		st.deathTicks++
+		reachedPoof := st.deathTicks == 20 && !st.removedAfterDeath
+		if reachedPoof {
+			st.removedAfterDeath = true
+		}
+		st.mu.Unlock()
+
+		if reachedPoof {
+			snap := p.Snapshot()
+			dim := world.NormalizeDimension(snap.Dimension)
+			cx := int32(int64(math.Floor(snap.X)) >> 4)
+			cz := int32(int64(math.Floor(snap.Z)) >> 4)
+			s.BroadcastDimensionChunkExcept(dim, cx, cz, p.Profile.UUID, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(snap.EntityID, EntityEventPoof))
+			s.NotifyNearbyEntityTrackers(dim, cx, cz)
+		}
+	}
 }
 
 // FallDistance returns the distance accumulated during the player's current fall.
@@ -271,7 +486,7 @@ func (s *Server) SpawnItemEntityInDimension(dim string, x, y, z float64, stack w
 	}
 	dim = world.NormalizeDimension(dim)
 	normalized := world.NewItemStack(itemID, stack.Count)
-	typeID := registry.EntityTypeIndex(world.ItemEntityTypeName)
+	typeID := ResolveEntityTypeID(world.ItemEntityTypeName)
 	if typeID < 0 {
 		typeID = 0
 	}
@@ -1382,29 +1597,6 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 		newHealth = 1.0
 	}
 
-	if died {
-		s.StopUsingSpyglass(session)
-		s.RecordPlayerDeath(session)
-		s.OnPlayerDiedWithEffects(session)
-		s.DespawnPlayerFishingBobber(session)
-		s.DismountPlayerVehicle(session)
-		_ = s.CloseContainer(session, 0, true)
-		st := getSurvivalState(session)
-		st.mu.Lock()
-		st.dead = true
-		st.fallDistance = 0
-		st.mu.Unlock()
-		if !s.KeepInventory() {
-			s.DropPlayerDeathInventoryAndXP(session)
-		}
-		if s.IsHardcore() {
-			session.mu.Lock()
-			session.gameMode = GameModeSpectator
-			session.mu.Unlock()
-			s.BroadcastPlayerGameModeUpdate(session)
-		}
-	}
-
 	cx := int32(int64(math.Floor(pos[0])) >> 4)
 	cz := int32(int64(math.Floor(pos[2])) >> 4)
 	hurtPayload := EncodeHurtAnimation(entityID, 0)
@@ -1416,6 +1608,27 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	s.SyncHealthObjectives(session)
 
 	if died {
+		s.StopUsingSpyglass(session)
+		s.RecordPlayerDeath(session)
+		s.OnPlayerDiedWithEffects(session)
+		s.DespawnPlayerFishingBobber(session)
+		s.DismountPlayerVehicle(session)
+		_ = s.CloseContainer(session, 0, true)
+
+		bx := int32(math.Floor(pos[0]))
+		by := int32(math.Floor(pos[1]))
+		bz := int32(math.Floor(pos[2]))
+		st := getSurvivalState(session)
+		st.mu.Lock()
+		st.dead = true
+		st.deathTicks = 0
+		st.removedAfterDeath = false
+		st.fallDistance = 0
+		st.hasLastDeathLocation = true
+		st.lastDeathDim = world.NormalizeDimension(dim)
+		st.lastDeathPos = [3]int32{bx, by, bz}
+		st.mu.Unlock()
+
 		if name == "" {
 			name = "Player"
 		}
@@ -1434,8 +1647,12 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 				deathMsg = fmt.Sprintf("%s died", name)
 			}
 		}
+		killPacketMsg := deathMsg
+		if !s.ShowDeathMessages() {
+			killPacketMsg = ""
+		}
 		if send != nil && !s.DoImmediateRespawn() {
-			_ = send(protocol.PlayPlayerCombatKill, EncodePlayerCombatKill(entityID, deathMsg))
+			_ = send(protocol.PlayPlayerCombatKill, EncodePlayerCombatKill(entityID, killPacketMsg))
 		}
 		if !isCombatDeathCause(cause) {
 			s.IncrementCriteriaObjectives(session.Profile.Name, "deathCount", 1)
@@ -1449,6 +1666,19 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 					s.BroadcastDeathMessage(session, cause, "")
 				}
 			}
+		}
+		if !s.KeepInventory() {
+			s.DropPlayerDeathInventoryAndXP(session)
+		}
+		s.BroadcastDimensionChunkExcept(dim, cx, cz, session.Profile.UUID, protocol.PlayEntityEvent,
+			EncodeEntityEventPacket(entityID, EntityEventDeath))
+		s.BroadcastDimensionChunkExcept(dim, cx, cz, session.Profile.UUID, protocol.PlaySetEntityData,
+			EncodePlayerDeathEntityDataPacket(entityID))
+		if s.IsHardcore() {
+			session.mu.Lock()
+			session.gameMode = GameModeSpectator
+			session.mu.Unlock()
+			s.BroadcastPlayerGameModeUpdate(session)
 		}
 		if s.DoImmediateRespawn() && !s.IsHardcore() {
 			_ = s.RespawnPlayer(session)
@@ -1567,10 +1797,18 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		}
 	}
 
+	prevSnap := session.Snapshot()
+	prevDim := world.NormalizeDimension(prevSnap.Dimension)
+	prevCX := int32(int64(math.Floor(prevSnap.X)) >> 4)
+	prevCZ := int32(int64(math.Floor(prevSnap.Z)) >> 4)
+
 	st := getSurvivalState(session)
 	st.mu.Lock()
 	st.dead = false
+	st.deathTicks = 0
+	st.removedAfterDeath = false
 	st.fallDistance = 0
+	st.respawnSeq++
 	st.mu.Unlock()
 
 	session.SetFoodExhaustion(0)
@@ -1584,7 +1822,6 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	s.WakePlayerFromBed(session)
 	s.ClearPlayerEffects(session)
 
-	prevDim := session.Dimension()
 	isHC := s.IsHardcore()
 	session.mu.Lock()
 	session.health = world.DefaultPlayerHealth
@@ -1595,12 +1832,6 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 	}
 	mode := session.gameMode
 	selectedSlot := session.selectedSlot
-	inv := session.inventory
-	session.containerStateID++
-	if session.containerStateID <= 0 {
-		session.containerStateID = 1
-	}
-	stateID := session.containerStateID
 	send := session.send
 	session.mu.Unlock()
 
@@ -1608,26 +1839,61 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		s.BroadcastPlayerGameModeUpdate(session)
 	}
 
-	targetDim, targetX, targetY, targetZ, targetYaw, targetPitch, _, _ := s.ResolvePlayerRespawn(session)
+	targetDim, targetX, targetY, targetZ, targetYaw, targetPitch, _, invalidHome := s.ResolvePlayerRespawn(session)
 	session.SetDimension(targetDim)
 	targetCache := s.DimensionChunks(targetDim)
-
-	if send != nil {
-		if err := send(protocol.PlayRespawn, EncodeDimensionRespawnPacket(targetDim, mode, s.cfg.WorldSeed, 0)); err != nil {
-			return err
-		}
-	}
 	targetCX := int32(int64(math.Floor(targetX)) >> 4)
 	targetCZ := int32(int64(math.Floor(targetZ)) >> 4)
-	if prevDim != targetDim {
+
+	if send != nil {
+		if invalidHome {
+			ev := protocol.NewWriter(5)
+			ev.Byte(protocol.GameEventNoRespawnBlockAvailable)
+			ev.Float32(0)
+			if err := send(protocol.PlayGameEvent, ev.Bytes()); err != nil {
+				return err
+			}
+		}
+		if err := send(protocol.PlayRespawn, s.EncodeSessionRespawnPacket(session, targetDim, mode, protocol.RespawnKeepNothing)); err != nil {
+			return err
+		}
+		if prevDim != targetDim {
+			ev := protocol.NewWriter(5)
+			ev.Byte(protocol.GameEventStartWaitingChunks)
+			ev.Float32(0)
+			if err := send(protocol.PlayGameEvent, ev.Bytes()); err != nil {
+				return err
+			}
+			if switchFn := getPlayerDimSwitchFunc(session); switchFn != nil && targetCache != nil {
+				switchFn(targetCache, targetCX, targetCZ)
+			}
+		}
+	} else if prevDim != targetDim {
 		if switchFn := getPlayerDimSwitchFunc(session); switchFn != nil && targetCache != nil {
 			switchFn(targetCache, targetCX, targetCZ)
 		}
 	}
+
 	if err := s.TeleportPlayer(session, targetX, targetY, targetZ, targetYaw, targetPitch); err != nil {
 		return err
 	}
+
 	if send != nil {
+		defDim := world.DimensionOverworld
+		wx, wy, wz, wyaw := s.WorldSpawn()
+		defX, defY, defZ, defYaw, defPitch := wx, wy, wz, wyaw, float32(0)
+		if snap := session.Snapshot(); snap.HasSpawn {
+			defDim = world.NormalizeDimension(snap.SpawnDimension)
+			defX, defY, defZ = int(snap.SpawnX), int(snap.SpawnY), int(snap.SpawnZ)
+			defYaw, defPitch = snap.SpawnYaw, snap.SpawnPitch
+		}
+		_ = send(protocol.PlayDefaultSpawnPos, EncodeDefaultSpawnPosPacket(defDim, defX, defY, defZ, defYaw, defPitch))
+		s.SendDifficultyToPlayer(session)
+		_ = s.SendPlayerExperience(session)
+		_ = s.SendPlayerActiveEffects(session)
+		s.SendWorldBorderToPlayer(session)
+		_ = send(protocol.PlaySetTime, s.SetTimePacket())
+
 		var abilityFlags byte
 		switch mode {
 		case GameModeCreative:
@@ -1642,19 +1908,25 @@ func (s *Server) RespawnPlayer(session *PlayerSession) error {
 		ab.Float32(0.05)
 		ab.Float32(0.1)
 		_ = send(protocol.PlayAbilities, ab.Bytes())
-		_ = send(protocol.PlaySetHealth, EncodeSetHealth(world.DefaultPlayerHealth, world.DefaultPlayerFoodLevel, world.DefaultPlayerSaturation))
-		_ = send(protocol.PlaySetEntityData, s.PlayerAvatarEntityDataPacketByEntityID(session.EntityID))
-		_ = s.SendPlayerAttributes(session)
 
 		heldW := protocol.NewWriter(4)
 		heldW.VarInt(selectedSlot)
 		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
 
-		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
-		_ = s.SendPlayerExperience(session)
-		s.SendWorldBorderToPlayer(session)
-		s.SendDifficultyToPlayer(session)
+		_ = send(protocol.PlaySetEntityData, s.PlayerAvatarEntityDataPacketByEntityID(session.EntityID))
+		_ = s.SendPlayerAttributes(session)
+		_ = s.syncPlayerInventoryContainer(session)
+		_ = send(protocol.PlaySetHealth, EncodeSetHealth(world.DefaultPlayerHealth, world.DefaultPlayerFoodLevel, world.DefaultPlayerSaturation))
 	}
+
+	if prevDim != targetDim {
+		s.BroadcastDimensionChunkExcept(prevDim, prevCX, prevCZ, session.Profile.UUID, protocol.PlayRemoveEntities,
+			encodeRemoveEntitiesPacket(nil, []int32{session.EntityID}))
+		s.NotifyNearbyEntityTrackers(prevDim, prevCX, prevCZ)
+	} else if prevCX != targetCX || prevCZ != targetCZ {
+		s.NotifyNearbyEntityTrackers(prevDim, prevCX, prevCZ)
+	}
+	s.NotifyNearbyEntityTrackers(targetDim, targetCX, targetCZ)
 	return nil
 }
 

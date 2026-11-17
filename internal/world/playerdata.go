@@ -303,6 +303,11 @@ type PlayerData struct {
 	WardenSpawnTracker    *nbt.Compound
 	PortalCooldown        int32
 	SeenCredits           bool
+	Dead                  bool
+	DeathTime             int16
+	HasLastDeathLocation  bool
+	LastDeathDimension    string
+	LastDeathPos          [3]int32
 }
 
 // DefaultPlayerData returns the initial persistent state for a newly spawned player.
@@ -357,10 +362,18 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	root.Set("playerGameType", nbt.Int(int32(d.GameMode)))
 
 	health := d.Health
-	if health <= 0 {
-		health = DefaultPlayerHealth
+	if d.Dead {
+		if health < 0 {
+			health = 0
+		}
+		root.Set("Health", nbt.Float(health))
+		root.Set("DeathTime", nbt.Short(d.DeathTime))
+	} else {
+		if health <= 0 {
+			health = DefaultPlayerHealth
+		}
+		root.Set("Health", nbt.Float(health))
 	}
-	root.Set("Health", nbt.Float(health))
 	root.Set("foodLevel", nbt.Int(d.FoodLevel))
 	root.Set("foodSaturationLevel", nbt.Float(d.FoodSaturation))
 	root.Set("foodExhaustionLevel", nbt.Float(d.FoodExhaustion))
@@ -661,6 +674,12 @@ func PlayerDataToCompound(d PlayerData) *nbt.Compound {
 	if d.SeenCredits {
 		root.Set("seenCredits", nbt.Byte(1))
 	}
+	if d.HasLastDeathLocation {
+		ldl := nbt.NewCompound()
+		ldl.Set("dimension", nbt.String(NormalizeDimension(d.LastDeathDimension)))
+		ldl.Set("pos", nbt.IntArray([]int32{d.LastDeathPos[0], d.LastDeathPos[1], d.LastDeathPos[2]}))
+		root.Set("LastDeathLocation", ldl)
+	}
 
 	return root
 }
@@ -804,6 +823,12 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 
 	if h, ok := nbtGetFloat(root, "Health"); ok {
 		d.Health = h
+		if h <= 0 {
+			d.Dead = true
+		}
+	}
+	if dt, ok := nbtGetShort(root, "DeathTime"); ok && dt > 0 {
+		d.DeathTime = dt
 	}
 	if food, ok := nbtGetInt(root, "foodLevel"); ok {
 		d.FoodLevel = food
@@ -1163,6 +1188,15 @@ func PlayerDataFromCompound(root *nbt.Compound) (PlayerData, error) {
 	}
 	if sc, ok := nbtGetByte(root, "seenCredits"); ok && sc != 0 {
 		d.SeenCredits = true
+	}
+	if ldl, ok := nbtGetCompound(root, "LastDeathLocation"); ok && ldl != nil {
+		dimStr, okDim := nbtGetString(ldl, "dimension")
+		posArr, okPos := nbtGetIntArray(ldl, "pos")
+		if okDim && okPos && len(posArr) == 3 {
+			d.HasLastDeathLocation = true
+			d.LastDeathDimension = NormalizeDimension(dimStr)
+			d.LastDeathPos = [3]int32{posArr[0], posArr[1], posArr[2]}
+		}
 	}
 
 	return d, nil

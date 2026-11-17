@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"regionio/internal/protocol"
-	"regionio/internal/registry"
 	"regionio/internal/world"
 )
 
@@ -22,7 +21,7 @@ const ExperienceOrbEntityTypeName = "minecraft:experience_orb"
 // DefaultExperienceOrbTypeID is the vanilla 26.1.2 BuiltInRegistries.ENTITY_TYPE
 // numeric ID for minecraft:experience_orb used when not present in the minimal
 // built-in table.
-const DefaultExperienceOrbTypeID = 44
+const DefaultExperienceOrbTypeID = 49
 
 // ExperienceBottleItemID is the canonical item ID for Bottle o' Enchanting.
 const ExperienceBottleItemID = "minecraft:experience_bottle"
@@ -679,7 +678,7 @@ func (s *Server) SpawnExperienceOrbInDimension(dim string, x, y, z float64, valu
 		return 0, nil
 	}
 	dim = world.NormalizeDimension(dim)
-	typeID := registry.EntityTypeIndex(ExperienceOrbEntityTypeName)
+	typeID := ResolveEntityTypeID(ExperienceOrbEntityTypeName)
 	if typeID < 0 {
 		typeID = DefaultExperienceOrbTypeID
 	}

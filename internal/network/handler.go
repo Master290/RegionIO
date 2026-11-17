@@ -33,6 +33,7 @@ type handler struct {
 	session         *server.PlayerSession
 	knownPlayers    map[[16]byte]bool
 	knownEntities   map[int32]visibleEntity
+	entitySyncMu    sync.Mutex
 	spawnY          float64
 	protocolVersion int32
 	handshakeIntent int32

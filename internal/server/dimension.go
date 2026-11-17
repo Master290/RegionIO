@@ -335,6 +335,38 @@ func EncodePlayLoginPacketWithFlags(
 	)
 }
 
+// CommonSpawnInfoOptions configures optional fields inside protocol 775
+// CommonPlayerSpawnInfo (login and respawn packets).
+type CommonSpawnInfoOptions struct {
+	HasLastDeathLocation bool
+	LastDeathDimension   string
+	LastDeathPos         [3]int32
+	PortalCooldown       int32
+	IsDebug              bool
+	IsFlat               bool
+}
+
+func writeCommonPlayerSpawnInfo(w *protocol.Writer, dim string, hashedSeed int64, gameMode, prevGameMode byte, opts CommonSpawnInfoOptions) {
+	normDim := world.NormalizeDimension(dim)
+	dimTypeIdx := DimensionTypeRegistryIndex(normDim)
+	dt, _ := world.LookupDimensionType(normDim)
+
+	w.VarInt(dimTypeIdx)
+	w.String(normDim)
+	w.Int64(hashedSeed)
+	w.Byte(gameMode)
+	w.Byte(prevGameMode)
+	w.Bool(opts.IsDebug)
+	w.Bool(opts.IsFlat)
+	w.Bool(opts.HasLastDeathLocation)
+	if opts.HasLastDeathLocation {
+		w.String(world.NormalizeDimension(opts.LastDeathDimension))
+		w.Position(int(opts.LastDeathPos[0]), int(opts.LastDeathPos[1]), int(opts.LastDeathPos[2]))
+	}
+	w.VarInt(opts.PortalCooldown)
+	w.VarInt(int32(dt.SeaLevel))
+}
+
 // EncodePlayLoginPacketFull encodes the clientbound play login (0x31) packet
 // body for protocol 775 (26.1.2) with explicit simulationDistance, hardcore,
 // gamerule flags, and enforcesSecureChat.
@@ -346,12 +378,37 @@ func EncodePlayLoginPacketFull(
 	hashedSeed int64,
 	isHardcore, reducedDebugInfo, enableRespawnScreen, doLimitedCrafting, enforcesSecureChat bool,
 ) []byte {
+	return EncodePlayLoginPacketWithOptions(
+		entityID,
+		gameMode,
+		dim,
+		maxPlayers,
+		viewDistance,
+		simulationDistance,
+		hashedSeed,
+		isHardcore,
+		reducedDebugInfo,
+		enableRespawnScreen,
+		doLimitedCrafting,
+		enforcesSecureChat,
+		CommonSpawnInfoOptions{},
+	)
+}
+
+// EncodePlayLoginPacketWithOptions encodes the clientbound play login (0x31)
+// packet body for protocol 775 (26.1.2) including CommonSpawnInfoOptions.
+func EncodePlayLoginPacketWithOptions(
+	entityID int32,
+	gameMode uint8,
+	dim string,
+	maxPlayers, viewDistance, simulationDistance int32,
+	hashedSeed int64,
+	isHardcore, reducedDebugInfo, enableRespawnScreen, doLimitedCrafting, enforcesSecureChat bool,
+	opts CommonSpawnInfoOptions,
+) []byte {
 	if simulationDistance <= 0 {
 		simulationDistance = viewDistance
 	}
-	normDim := world.NormalizeDimension(dim)
-	dimTypeIdx := DimensionTypeRegistryIndex(normDim)
-	dt, _ := world.LookupDimensionType(normDim)
 
 	w := protocol.NewWriter(128)
 	w.Int32(entityID)
@@ -374,17 +431,7 @@ func EncodePlayLoginPacketFull(
 	w.Bool(enableRespawnScreen)
 	w.Bool(doLimitedCrafting)
 
-	// CommonPlayerSpawnInfo
-	w.VarInt(dimTypeIdx)
-	w.String(normDim)
-	w.Int64(hashedSeed)
-	w.Byte(gameMode)
-	w.Byte(0xFF)  // previous game mode (-1 = none)
-	w.Bool(false) // is debug
-	w.Bool(false) // is flat
-	w.Bool(false) // has last death location
-	w.VarInt(0)   // portal cooldown
-	w.VarInt(int32(dt.SeaLevel))
+	writeCommonPlayerSpawnInfo(w, dim, hashedSeed, gameMode, 0xFF, opts)
 	w.Bool(enforcesSecureChat)
 
 	return w.Bytes()
@@ -393,27 +440,43 @@ func EncodePlayLoginPacketFull(
 // EncodeDimensionRespawnPacket encodes a clientbound respawn (0x52) packet body
 // for protocol 775 (CommonPlayerSpawnInfo + dataToKeep) for the target dimension.
 func EncodeDimensionRespawnPacket(dim string, gameMode uint8, hashedSeed int64, dataToKeep byte) []byte {
-	normDim := world.NormalizeDimension(dim)
-	dimTypeIdx := DimensionTypeRegistryIndex(normDim)
-	dt, _ := world.LookupDimensionType(normDim)
+	return EncodeDimensionRespawnPacketWithOptions(dim, gameMode, hashedSeed, dataToKeep, CommonSpawnInfoOptions{})
+}
+
+// EncodeDimensionRespawnPacketWithOptions encodes a clientbound respawn (0x52)
+// packet body for protocol 775 including CommonSpawnInfoOptions.
+func EncodeDimensionRespawnPacketWithOptions(dim string, gameMode uint8, hashedSeed int64, dataToKeep byte, opts CommonSpawnInfoOptions) []byte {
 	prevGameMode := byte(0xFF)
 	if dataToKeep != 0 {
 		prevGameMode = gameMode
 	}
 
-	w := protocol.NewWriter(64)
-	w.VarInt(dimTypeIdx)
-	w.String(normDim)
-	w.Int64(hashedSeed)
-	w.Byte(gameMode)
-	w.Byte(prevGameMode)
-	w.Bool(false) // is debug
-	w.Bool(false) // is flat
-	w.Bool(false) // has last death location
-	w.VarInt(0)   // portal cooldown
-	w.VarInt(int32(dt.SeaLevel))
+	w := protocol.NewWriter(80)
+	writeCommonPlayerSpawnInfo(w, dim, hashedSeed, gameMode, prevGameMode, opts)
 	w.Byte(dataToKeep)
 	return w.Bytes()
+}
+
+// EncodeSessionRespawnPacket encodes ClientboundRespawnPacket (0x52) for session
+// using the server's obfuscated biome seed, session's last death location, and
+// portal cooldown.
+func (s *Server) EncodeSessionRespawnPacket(session *PlayerSession, dim string, gameMode uint8, dataToKeep byte) []byte {
+	var opts CommonSpawnInfoOptions
+	var hashedSeed int64
+	if s != nil {
+		hashedSeed = ObfuscateBiomeSeed(s.cfg.WorldSeed)
+		if session != nil {
+			opts.PortalCooldown = int32(s.PlayerPortalCooldown(session))
+		}
+	}
+	if session != nil {
+		if deathDim, deathPos, ok := session.LastDeathLocation(); ok {
+			opts.HasLastDeathLocation = true
+			opts.LastDeathDimension = deathDim
+			opts.LastDeathPos = deathPos
+		}
+	}
+	return EncodeDimensionRespawnPacketWithOptions(dim, gameMode, hashedSeed, dataToKeep, opts)
 }
 
 // BroadcastDimensionChunk sends a packet only to players in dim whose chunk
@@ -499,7 +562,6 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 	food := session.foodLevel
 	saturation := session.foodSaturation
 	selectedSlot := session.selectedSlot
-	inv := session.inventory
 	hasSpawn := session.hasSpawn
 	spawnX, spawnY, spawnZ := session.spawnX, session.spawnY, session.spawnZ
 	spawnYaw, spawnPitch := session.spawnYaw, session.spawnPitch
@@ -507,11 +569,6 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 	if spawnDim == "" {
 		spawnDim = world.DimensionOverworld
 	}
-	session.containerStateID++
-	if session.containerStateID <= 0 {
-		session.containerStateID = 1
-	}
-	stateID := session.containerStateID
 	recenter := session.recenterFn
 	send := session.send
 	session.mu.Unlock()
@@ -537,7 +594,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 			defer session.SetJoined(true)
 		}
 		// 1. ClientboundRespawnPacket (with KEEP_ALL_DATA = 0x03 for dimension change).
-		respawnPkt := EncodeDimensionRespawnPacket(normTarget, mode, ObfuscateBiomeSeed(s.cfg.WorldSeed), protocol.RespawnKeepAllData)
+		respawnPkt := s.EncodeSessionRespawnPacket(session, normTarget, mode, protocol.RespawnKeepAllData)
 		if err := send(protocol.PlayRespawn, respawnPkt); err != nil {
 			return err
 		}
@@ -609,7 +666,7 @@ func (s *Server) ChangePlayerDimension(session *PlayerSession, targetDim string,
 		heldW.VarInt(selectedSlot)
 		_ = send(protocol.PlaySetHeldSlot, heldW.Bytes())
 
-		_ = send(protocol.PlayContainerSetContent, encodeContainerSetContentPacket(stateID, inv))
+		_ = s.syncPlayerInventoryContainer(session)
 		_ = send(protocol.PlaySetTime, s.SetTimePacket())
 		s.SendWorldBorderToPlayer(session)
 		s.SendDifficultyToPlayer(session)

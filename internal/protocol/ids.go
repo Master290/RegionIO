@@ -292,17 +292,18 @@ const (
 
 // Built-in entity_type registry IDs (protocol 775).
 const (
-	EntityTypeExperienceOrb = 44
+	EntityTypeExperienceOrb = 49
 	EntityTypeVillager      = 139
 )
 
 // GameEvent sub-IDs carried by the clientbound game_event packet.
 const (
-	GameEventChangeGameMode      = 3
-	GameEventWinGame             = 4
-	GameEventEnableRespawnScreen = 11
-	GameEventLimitedCrafting     = 12
-	GameEventStartWaitingChunks  = 13
+	GameEventNoRespawnBlockAvailable = 0
+	GameEventChangeGameMode          = 3
+	GameEventWinGame                 = 4
+	GameEventEnableRespawnScreen     = 11
+	GameEventLimitedCrafting         = 12
+	GameEventStartWaitingChunks      = 13
 )
 
 // ClientboundRespawnPacket dataToKeep bitflags (protocol 775).

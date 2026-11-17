@@ -170,6 +170,9 @@ func (h *handler) beginPlay() error {
 	}
 	h.srv.SetPlayerRecenterFunc(session, h.streamer.requestRecenter)
 	h.srv.SetPlayerDimensionSwitchFunc(session, h.streamer.switchDimension)
+	h.srv.SetPlayerEntitySyncFunc(session, func() {
+		_ = h.syncVisibleEntities()
+	})
 	go h.streamer.run(h.ctx)
 	h.streamer.requestRecenter(startCX, startCZ)
 	go h.keepAliveLoop()
@@ -246,7 +249,11 @@ func (h *handler) sendSetHeldSlot(slot int32) error {
 
 func (h *handler) sendSetHealth(health float32, food int32, saturation float32) error {
 	if health <= 0 {
-		health = world.DefaultPlayerHealth
+		if h.session != nil && h.session.IsDead() {
+			health = 0
+		} else {
+			health = world.DefaultPlayerHealth
+		}
 	}
 	w := protocol.NewWriter(16)
 	w.Float32(health)
@@ -407,6 +414,9 @@ func (h *handler) onPlayerMove(x, y, z float64, yaw, pitch float32, onGround boo
 	}
 	if math.Abs(x) > maxPlayerXZ || math.Abs(z) > maxPlayerXZ || math.Abs(y) > maxPlayerY {
 		return errors.New("player position outside world bounds")
+	}
+	if h.session != nil && h.session.IsDead() {
+		return nil
 	}
 	var prev server.PlayerSnapshot
 	if h.session != nil {
@@ -598,8 +608,9 @@ func (h *handler) keepAliveLoop() {
 // visibleEntity is the comparable state retained by one client's visibility
 // tracker. OnGround is separate because mobs currently always use true.
 type visibleEntity struct {
-	entity   world.Entity
-	onGround bool
+	entity     world.Entity
+	onGround   bool
+	respawnSeq uint32
 }
 
 // entitySyncLoop maintains tab-list membership and chunk-scoped entity state.
@@ -664,6 +675,7 @@ func (h *handler) serverTickLoop() {
 			h.srv.TickDispenserProjectiles()
 			h.srv.TickRangedWeaponsAndProjectiles()
 			h.srv.TickAllPlayerStats()
+			h.srv.TickAllPlayerDeaths()
 			h.srv.TickAllBlockUpdates()
 			if res := h.srv.TickRandomBlocks(); len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				h.broadcastBlockChanges(world.DimensionOverworld, h.srv.Chunks(), res)
@@ -695,6 +707,9 @@ func (h *handler) syncVisibleEntities() error {
 	if h.session == nil {
 		return nil
 	}
+	h.entitySyncMu.Lock()
+	defer h.entitySyncMu.Unlock()
+
 	if h.knownPlayers == nil {
 		h.knownPlayers = make(map[[16]byte]bool)
 	}
@@ -703,6 +718,10 @@ func (h *handler) syncVisibleEntities() error {
 	}
 
 	viewer := h.session.Snapshot()
+	radius := viewer.ViewDistance
+	if radius <= 0 {
+		radius = h.visibilityRadius()
+	}
 	players := h.srv.PlayerSnapshots()
 	currentPlayers := make(map[[16]byte]bool, len(players))
 	for _, player := range players {
@@ -716,10 +735,14 @@ func (h *handler) syncVisibleEntities() error {
 	}
 
 	currentEntities := make(map[int32]visibleEntity)
+	deadPlayers := make(map[int32]bool)
 	for _, player := range players {
-		if player.EntityID == viewer.EntityID || !playerVisible(viewer, player, h.visibilityRadius()) ||
+		if player.EntityID == viewer.EntityID || player.RemovedAfterDeath || !playerVisible(viewer, player, radius) ||
 			!h.entityChunkResident(player.X, player.Z) {
 			continue
+		}
+		if player.Health <= 0 {
+			deadPlayers[player.EntityID] = true
 		}
 		currentEntities[player.EntityID] = visibleEntity{
 			entity: world.Entity{
@@ -729,17 +752,24 @@ func (h *handler) syncVisibleEntities() error {
 				Yaw: player.Yaw, Pitch: player.Pitch, HeadYaw: player.Yaw,
 				Dimension: world.NormalizeDimension(player.Dimension),
 			},
-			onGround: player.OnGround,
+			onGround:   player.OnGround,
+			respawnSeq: player.RespawnSeq,
 		}
 	}
 	for _, entity := range h.srv.Entities().All() {
-		if entityVisible(viewer, entity, h.visibilityRadius()) && h.entityChunkResident(entity.X, entity.Z) {
+		if entityVisible(viewer, entity, radius) && h.entityChunkResident(entity.X, entity.Z) {
 			currentEntities[entity.ID] = visibleEntity{entity: entity, onGround: true}
 		}
 	}
 
 	for id, current := range currentEntities {
 		known, exists := h.knownEntities[id]
+		if exists && known.respawnSeq != current.respawnSeq {
+			if err := h.sendRemoveEntity(id); err != nil {
+				return err
+			}
+			exists = false
+		}
 		if !exists {
 			entity := current.entity
 			if err := h.sendAddEntity(&entity); err != nil {
@@ -841,6 +871,11 @@ func (h *handler) syncVisibleEntities() error {
 				}
 				if flagsPkt := h.srv.PlayerSharedFlagsAndPosePacketByEntityID(entity.ID); len(flagsPkt) > 0 {
 					if err := h.conn.Send(protocol.PlaySetEntityData, flagsPkt); err != nil {
+						return err
+					}
+				}
+				if deadPlayers[entity.ID] {
+					if err := h.conn.Send(protocol.PlaySetEntityData, server.EncodePlayerDeathEntityDataPacket(entity.ID)); err != nil {
 						return err
 					}
 				}
@@ -1690,13 +1725,16 @@ func (h *handler) handleClientCommand(pkt protocol.Packet) error {
 	if h.srv != nil && h.session != nil {
 		switch action {
 		case server.ClientCommandPerformRespawn:
+			if !h.session.IsDead() &&
+				h.session.Dimension() != world.DimensionEnd &&
+				!h.srv.HasPendingEndCreditsExit(h.session) {
+				return nil
+			}
 			if err := h.srv.RespawnPlayer(h.session); err != nil {
 				return err
 			}
-			if h.conn != nil {
-				snap := h.session.Snapshot()
-				return h.sendSetHealth(snap.Health, snap.FoodLevel, snap.FoodSaturation)
-			}
+			h.syncHotbarFromSession()
+			return nil
 		case server.ClientCommandRequestStats:
 			return h.srv.HandleRequestStats(h.session)
 		}

@@ -254,8 +254,10 @@ type PlayerSnapshot struct {
 	Flying         bool
 	FlySpeed       float32
 	WalkSpeed      float32
-	CameraEntityID int32
-	LoadedFromDisk bool
+	CameraEntityID    int32
+	LoadedFromDisk    bool
+	RemovedAfterDeath bool
+	RespawnSeq        uint32
 }
 
 var (
@@ -1184,6 +1186,11 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 		root.Set("recipeBook", d.RecipeBook)
 		LoadRecipeBookFromPlayerCompound(session, root)
 	}
+	if d.HasLastDeathLocation {
+		session.SetLastDeathLocation(d.LastDeathDimension, d.LastDeathPos[0], d.LastDeathPos[1], d.LastDeathPos[2])
+	} else {
+		session.ClearLastDeathLocation()
+	}
 	session.mu.Lock()
 	session.position = d.Pos
 	session.yaw = d.Yaw
@@ -1211,7 +1218,13 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	}
 	session.flySpeed = ab.FlySpeed
 	session.walkSpeed = ab.WalkSpeed
-	if d.Health > 0 {
+	if d.Dead {
+		if d.Health < 0 {
+			session.health = 0
+		} else {
+			session.health = d.Health
+		}
+	} else if d.Health > 0 {
 		session.health = d.Health
 	} else {
 		session.health = world.DefaultPlayerHealth
@@ -1237,6 +1250,11 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 	}
 	session.hasSpawn = d.HasSpawn
 	session.mu.Unlock()
+	if d.Dead {
+		session.SetDeathState(true, int(d.DeathTime))
+	} else {
+		session.SetDeathState(false, 0)
+	}
 	session.SetEnderChestSlots(d.EnderItems)
 
 	effRoot := nbt.NewCompound()
@@ -1819,6 +1837,9 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 	}
 	abilities := session.Abilities()
 	enderItems := session.EnderChestSlots()
+	isDead := session.IsDead()
+	deathTicks := session.DeathTicks()
+	deathDim, deathPos, hasDeathLoc := session.LastDeathLocation()
 	session.mu.RLock()
 	defer session.mu.RUnlock()
 	return world.PlayerData{
@@ -1859,10 +1880,15 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 		SlotFireworkStars:     slotFireworkStars,
 		SlotLodestoneTrackers: slotLodestoneTrackers,
 		SlotItemMetas:         slotItemMetas,
-		Abilities:          &abilities,
-		WardenSpawnTracker: wstComp,
-		PortalCooldown:     portalCooldown,
-		SeenCredits:        seenCredits,
+		Abilities:            &abilities,
+		WardenSpawnTracker:   wstComp,
+		PortalCooldown:       portalCooldown,
+		SeenCredits:          seenCredits,
+		Dead:                 isDead,
+		DeathTime:            int16(deathTicks),
+		HasLastDeathLocation: hasDeathLoc,
+		LastDeathDimension:   deathDim,
+		LastDeathPos:         deathPos,
 	}
 }
 
@@ -2053,6 +2079,8 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 		return PlayerSnapshot{}
 	}
 	dim := session.Dimension()
+	removedAfterDeath := session.RemovedAfterDeath()
+	respawnSeq := session.RespawnSeq()
 	session.mu.RLock()
 	fs := session.flySpeed
 	if fs <= 0 {
@@ -2090,8 +2118,10 @@ func (session *PlayerSession) Snapshot() PlayerSnapshot {
 		Flying:         session.flying || session.gameMode == GameModeSpectator,
 		FlySpeed:       fs,
 		WalkSpeed:      ws,
-		CameraEntityID: session.cameraEntityID,
-		LoadedFromDisk: session.loadedFromDisk,
+		CameraEntityID:    session.cameraEntityID,
+		LoadedFromDisk:    session.loadedFromDisk,
+		RemovedAfterDeath: removedAfterDeath,
+		RespawnSeq:        respawnSeq,
 	}
 	session.mu.RUnlock()
 	return snapshot

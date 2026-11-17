@@ -1272,7 +1272,18 @@ func (s *Server) EncodePlayerLoginPacket(session *PlayerSession, viewDistance in
 			simDistance = sd
 		}
 	}
-	return EncodePlayLoginPacketFull(
+	var opts CommonSpawnInfoOptions
+	if session != nil {
+		if deathDim, deathPos, ok := session.LastDeathLocation(); ok {
+			opts.HasLastDeathLocation = true
+			opts.LastDeathDimension = deathDim
+			opts.LastDeathPos = deathPos
+		}
+		if s != nil {
+			opts.PortalCooldown = int32(s.PlayerPortalCooldown(session))
+		}
+	}
+	return EncodePlayLoginPacketWithOptions(
 		entityID,
 		gameMode,
 		dim,
@@ -1285,6 +1296,7 @@ func (s *Server) EncodePlayerLoginPacket(session *PlayerSession, viewDistance in
 		enableRespawnScreen,
 		limitedCrafting,
 		enforcesSecureChat,
+		opts,
 	)
 }
 
