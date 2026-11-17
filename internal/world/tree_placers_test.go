@@ -241,13 +241,14 @@ func TestCanopySilhouettesAreThePlacersOwn(t *testing.T) {
   y= 80 n= 1 ..........#..........`,
 		},
 		{
-			// giant trunk + mega pine crown: two columns of trunk, rows counted in
+			// giant trunk + mega pine crown: 2x2 trunk up to height-2 and only (0,0)
+			// on the top trunk row (y=92, GiantTrunkPlacer i < height-1), rows counted in
 			// absolute y, width following the 3.5-slope with the even-row bump.
 			config: "minecraft:mega_pine",
 			want: `trunk=22 foliageHeight=3 foliageRadius=0
   y= 90 n=40 .......###TT###......
   y= 91 n=20 ........##TT##.......
-  y= 92 n= 8 .........#TT#........
+  y= 92 n=11 .........#T##........
   y= 93 n= 4 ..........##.........`,
 		},
 		{

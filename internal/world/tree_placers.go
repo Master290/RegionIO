@@ -650,23 +650,11 @@ func (t *treePlacer) placeTrunk(x, y, z int) error {
 		// radius offset 0 and doubleTrunk false, and consumes no draws.
 		attachments = []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z}}
 	case "minecraft:giant_trunk_placer":
-		corners := [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}}
-		for _, c := range corners {
-			if err := t.placeBelowTrunk(x+c[0], y-1, z+c[1]); err != nil {
-				return err
-			}
+		var err error
+		attachments, err = t.placeGiantTrunk(x, y, z)
+		if err != nil {
+			return err
 		}
-		for i := 0; i < t.trunkHeight; i++ {
-			for _, c := range corners {
-				if err := t.placeLogIfFreeAt(x+c[0], y+i, z+c[1]); err != nil {
-					return err
-				}
-			}
-		}
-		// new FoliageAttachment(pos.above(height), 0, true): the offset is 0, not 1.
-		// A double trunk widens its rows through placeLeavesRow's extra column, and
-		// nothing else, so adding a radius here would square the canopy twice.
-		attachments = []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, doubleTrunk: true}}
 	case "minecraft:fancy_trunk_placer":
 		var err error
 		attachments, err = t.placeFancyTrunk(x, y, z)
@@ -1148,9 +1136,11 @@ func (t *treePlacer) placeFoliage(at trunkAttachment, offset int) error {
 			}
 		}
 	case "minecraft:jungle_foliage_placer":
-		leafHeight := 1 + int(t.random.NextIntN(2))
+		var leafHeight int
 		if at.doubleTrunk {
 			leafHeight = t.foliageHeight
+		} else {
+			leafHeight = 1 + int(t.random.NextIntN(2))
 		}
 		for rowY := offset; rowY >= offset-leafHeight; rowY-- {
 			radius := t.foliageRadius + at.radiusExtra + 1 - rowY
@@ -1274,22 +1264,39 @@ func (t *treePlacer) placeForkingTrunk(x, y, z int) ([]trunkAttachment, error) {
 	return attachments, nil
 }
 
-// placeMegaJungleTrunk is MegaJungleTrunkPlacer.placeTrunk.
-func (t *treePlacer) placeMegaJungleTrunk(x, y, z int) ([]trunkAttachment, error) {
-	corners := [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}}
-	for _, c := range corners {
+// placeGiantTrunk is GiantTrunkPlacer.placeTrunk: below-trunk blocks in
+// (0,0), (1,0), (0,1), (1,1) order, then for each row i < trunkHeight, (0,i,0)
+// always and (1,i,0), (1,i,1), (0,i,1) only when i < trunkHeight - 1.
+func (t *treePlacer) placeGiantTrunk(x, y, z int) ([]trunkAttachment, error) {
+	for _, c := range [][2]int{{0, 0}, {1, 0}, {0, 1}, {1, 1}} {
 		if err := t.placeBelowTrunk(x+c[0], y-1, z+c[1]); err != nil {
 			return nil, err
 		}
 	}
 	for i := 0; i < t.trunkHeight; i++ {
-		for _, c := range corners {
-			if err := t.placeLogIfFreeAt(x+c[0], y+i, z+c[1]); err != nil {
-				return nil, err
+		if err := t.placeLogIfFreeAt(x, y+i, z); err != nil {
+			return nil, err
+		}
+		if i < t.trunkHeight-1 {
+			for _, c := range [][2]int{{1, 0}, {1, 1}, {0, 1}} {
+				if err := t.placeLogIfFreeAt(x+c[0], y+i, z+c[1]); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
-	attachments := []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, doubleTrunk: true}}
+	// new FoliageAttachment(pos.above(height), 0, true): the offset is 0, not 1.
+	// A double trunk widens its rows through placeLeavesRow's extra column, and
+	// nothing else, so adding a radius here would square the canopy twice.
+	return []trunkAttachment{{x: x, y: y + t.trunkHeight, z: z, doubleTrunk: true}}, nil
+}
+
+// placeMegaJungleTrunk is MegaJungleTrunkPlacer.placeTrunk.
+func (t *treePlacer) placeMegaJungleTrunk(x, y, z int) ([]trunkAttachment, error) {
+	attachments, err := t.placeGiantTrunk(x, y, z)
+	if err != nil {
+		return nil, err
+	}
 	for branchHeight := t.trunkHeight - 2 - int(t.random.NextIntN(4)); branchHeight > t.trunkHeight/2; branchHeight -= 2 + int(t.random.NextIntN(4)) {
 		angle := t.random.NextFloat() * (float32(math.Pi) * 2.0)
 		bx, bz := 0, 0

@@ -33,6 +33,7 @@ type compiledBlockPredicate struct {
 	direction        string
 	blocks           []string
 	tag              string
+	matchEmpty       bool
 	matchWater       bool
 	matchLava        bool
 	child            *compiledBlockPredicate
@@ -68,7 +69,7 @@ func parseBlockPredicate(raw json.RawMessage) *compiledBlockPredicate {
 		offset: predicate.Offset,
 	}
 	switch predicate.Type {
-	case "minecraft:true", "minecraft:solid", "minecraft:inside_world_bounds":
+	case "minecraft:true", "minecraft:solid", "minecraft:inside_world_bounds", "minecraft:replaceable":
 		return p
 	case "minecraft:would_survive":
 		var value struct {
@@ -122,6 +123,9 @@ func parseBlockPredicate(raw json.RawMessage) *compiledBlockPredicate {
 			return p
 		}
 		for _, fluid := range fluids {
+			if fluid == "minecraft:empty" {
+				p.matchEmpty = true
+			}
 			if fluid == "minecraft:water" || fluid == "minecraft:flowing_water" {
 				p.matchWater = true
 			}
@@ -170,6 +174,14 @@ func (r *decorationRegion) evalBlockPredicate(set *worldgen.FeatureSet, p *compi
 		// opaque cubes (stone/moss/clay) and NOT the small-collision plants
 		// (moss_carpet fails both tests in vanilla but blocks motion).
 		return isSolidState(r.getBlock(position.X, position.Y, position.Z)), nil
+	case "minecraft:replaceable":
+		// ReplaceablePredicate = BlockState.canBeReplaced() (BlockBehaviour.Properties.replaceable),
+		// which in 26.1.2 is true for every state of the exact 29 blocks in #minecraft:replaceable.
+		state, ok := stateByID(r.getBlock(position.X, position.Y, position.Z))
+		if !ok {
+			return false, nil
+		}
+		return flattenBlockTagContains(set, "minecraft:replaceable", state.Name), nil
 	case "minecraft:would_survive":
 		// WouldSurvivePredicate: `state.canSurvive(level, pos)` - a question about the
 		// named state, asked of a position that normally holds air. It never asks what
@@ -257,7 +269,7 @@ func (r *decorationRegion) evalBlockPredicate(set *worldgen.FeatureSet, p *compi
 	case "minecraft:matching_fluids":
 		state := r.getBlock(position.X, position.Y, position.Z)
 		if stateFlags(state)&flagFluid == 0 {
-			return false, nil
+			return p.matchEmpty, nil
 		}
 		if p.matchWater && isWaterState(state) {
 			return true, nil

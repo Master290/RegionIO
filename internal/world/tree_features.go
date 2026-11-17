@@ -465,6 +465,10 @@ func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worl
 		return err
 	}
 	r.setBlock(origin.X, origin.Y, origin.Z, stumpState)
+	placedLogs := []treePlacement{{x: origin.X, y: origin.Y, z: origin.Z, isLog: true}}
+	defer func() {
+		(&treePlacer{r: r, set: set, placements: placedLogs}).applyLeafDistance()
+	}()
 	if len(config.StumpDecorators) > 0 {
 		dec := &treeDecoration{
 			t:    &treePlacer{r: r, set: set, random: random},
@@ -530,6 +534,7 @@ func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worl
 		}
 		r.setBlock(px, py, pz, state)
 		rawLogs = append(rawLogs, [3]int{px, py, pz})
+		placedLogs = append(placedLogs, treePlacement{x: px, y: py, z: pz, isLog: true})
 	}
 	if len(config.LogDecorators) > 0 {
 		ordered := javaHashSetOrder(rawLogs)

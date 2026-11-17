@@ -43,7 +43,12 @@ const dataVersion26 = 4790
 // (mangrove_leaves) survival in would_survive and vegetation patches; BeehiveDecorator
 // bee occupant block entity data and NBT persistence; surface water height refresh
 // when top stone becomes fluid (vanilla 26.1.2).
-const generatorVersion = 57
+// Version 58: Jungle, sparse jungle, and bamboo jungle generation parity:
+// GiantTrunkPlacer / MegaJungleTrunkPlacer top-row log placement, MegaJungleFoliagePlacer
+// doubleTrunk RNG draw order, ReplaceablePredicate and empty-fluid MatchingFluidsPredicate
+// for patch_melon / patch_melon_sparse, and multi-hop leaf distance propagation across
+// touching canopies and fallen trees (vanilla 26.1.2).
+const generatorVersion = 58
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

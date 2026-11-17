@@ -49,9 +49,6 @@ func (t *treePlacer) applyLeafDistance() {
 			logs[c] = true
 		}
 	}
-	if len(leaves) == 0 {
-		return
-	}
 	// Also expand to existing neighbor leaves touching this tree's leaves or logs,
 	// so that a newly grown trunk or canopy propagates lower distance into them.
 	existing := map[pos3]bool{}
@@ -72,6 +69,9 @@ func (t *treePlacer) applyLeafDistance() {
 	for n := range existing {
 		leaves[n] = true
 	}
+	if len(leaves) == 0 {
+		return
+	}
 
 	distance := map[pos3]int{}
 	frontier := make([]pos3, 0, len(leaves))
@@ -90,12 +90,13 @@ func (t *treePlacer) applyLeafDistance() {
 	for c := range leaves {
 		frontier = append(frontier, c)
 	}
-	// Relax until stable. Eight passes bound a chain of leaves whose distance reaches 7,
-	// which is the most the property can hold, so this terminates by construction rather
-	// than by hoping the graph is small.
+	// Relax until stable, expanding into existing world leaves whenever a newly
+	// placed log or leaf strictly reduces their stored distance (up to distance 6).
 	for pass := 0; pass < 8; pass++ {
 		changed := false
-		for _, c := range frontier {
+		limit := len(frontier)
+		for i := 0; i < limit; i++ {
+			c := frontier[i]
 			best := distance[c]
 			for _, n := range t.leafNeighbours(c) {
 				if d, ok := t.neighbourLeafDistance(n, logs, distance); ok && d+1 < best {
@@ -108,6 +109,20 @@ func (t *treePlacer) applyLeafDistance() {
 			if best != distance[c] {
 				distance[c] = best
 				changed = true
+			}
+			if best < 6 {
+				for _, n := range t.leafNeighbours(c) {
+					if leaves[n] || !t.isLeafState(t.stateAt(n.x, n.y, n.z)) {
+						continue
+					}
+					if best+1 < t.leafStoredDistance(n) {
+						leaves[n] = true
+						existing[n] = true
+						distance[n] = best + 1
+						frontier = append(frontier, n)
+						changed = true
+					}
+				}
 			}
 		}
 		if !changed {
