@@ -48,7 +48,12 @@ const dataVersion26 = 4790
 // doubleTrunk RNG draw order, ReplaceablePredicate and empty-fluid MatchingFluidsPredicate
 // for patch_melon / patch_melon_sparse, and multi-hop leaf distance propagation across
 // touching canopies and fallen trees (vanilla 26.1.2).
-const generatorVersion = 58
+// Version 59: Pale garden and dark forest generation parity: MossyCarpetBlock.placeAt
+// wall-side connections and bottom=false toppers via WorldGenRegion.getRandom()
+// (minecraft:worldgen_region_random), TreeFeature decorator-before-updateLeaves order
+// with StructureTemplate.updateShapeAtEdge boundary propagation, and StructureBlockEntity
+// write-radius and overwrite cleanup (vanilla 26.1.2).
+const generatorVersion = 59
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

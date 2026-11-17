@@ -73,6 +73,7 @@ type treePlacer struct {
 	// rebuilds its logs and leaves lists from exactly this, and both AlterGround-
 	// Decorator and BeehiveDecorator read y values out of the lists.
 	placements    []treePlacement
+	decorations   []pos3
 	leafPositions map[[3]int]bool
 
 	// trunkHeight, foliageHeight and foliageRadius are sampled in that order by

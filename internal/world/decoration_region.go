@@ -53,6 +53,7 @@ type decorationRegion struct {
 	biomeZoomSeed  int64
 	biomeWorldSeed int64
 	biomeZoomBound bool
+	regionRandoms  map[[2]int32]worldgen.RandomSource
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
@@ -178,6 +179,7 @@ func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
 	if chunk == nil {
 		return false
 	}
+	clearOverwrittenBlockEntity(chunk, x, y, z, state)
 	chunk.SetBlock(x&15, y, z&15, state)
 	return true
 }
@@ -194,8 +196,28 @@ func (r *decorationRegion) setBlockGlobal(x, y, z int, state uint16) bool {
 	if chunk == nil {
 		return false
 	}
+	clearOverwrittenBlockEntity(chunk, x, y, z, state)
 	chunk.SetBlock(x&15, y, z&15, state)
 	return true
+}
+
+func clearOverwrittenBlockEntity(chunk *Chunk, x, y, z int, newState uint16) {
+	if len(chunk.blockEntities) == 0 {
+		return
+	}
+	if chunk.GetBlock(x&15, y, z&15) == newState {
+		return
+	}
+	existing, hasExisting := chunk.StructureBlockEntityAt(x, y, z)
+	if !hasExisting {
+		return
+	}
+	if st, ok := stateByID(newState); ok {
+		if defBE, hasDef := defaultBlockEntityForBlock(st.Name, x, y, z); hasDef && defBE.ID == existing.ID {
+			return
+		}
+	}
+	chunk.RemoveStructureBlockEntity(x, y, z)
 }
 
 // heightAt mirrors WorldGenRegion.getHeight: one above the highest matching
@@ -251,6 +273,23 @@ func (r *decorationRegion) bindSeed(seed int64) {
 	r.biomeWorldSeed = seed
 	r.biomeZoomSeed = obfuscateBiomeSeed(seed)
 	r.biomeZoomBound = true
+	r.regionRandoms = nil
+}
+
+// regionRandom returns WorldGenRegion.getRandom() for the current source chunk.
+// In vanilla 26.1.2 this stream is distinct from FeaturePlaceContext.random() and is
+// consumed by SimpleBlockFeature when placing MossyCarpetBlock (pale_moss_carpet).
+func (r *decorationRegion) regionRandom() worldgen.RandomSource {
+	if r.regionRandoms == nil {
+		r.regionRandoms = make(map[[2]int32]worldgen.RandomSource, 9)
+	}
+	key := [2]int32{r.sourceX, r.sourceZ}
+	rng, ok := r.regionRandoms[key]
+	if !ok {
+		rng = worldgen.WorldGenRegionRandom(r.biomeWorldSeed, r.sourceX, r.sourceZ)
+		r.regionRandoms[key] = rng
+	}
+	return rng
 }
 
 // getBiome is WorldGenRegion.getBiome, i.e. LevelReader.getBiome ->

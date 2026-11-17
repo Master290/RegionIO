@@ -673,6 +673,9 @@ func (r *decorationRegion) placeSimpleBlockFeature(random worldgen.RandomSource,
 	if !ok || !r.simpleBlockCanSurvive(position, chosen.Name, set) {
 		return false
 	}
+	if chosen.Name == "minecraft:pale_moss_carpet" {
+		return r.placePaleMossCarpet(position, set)
+	}
 	// DoublePlantBlock.placeAt path: any lower-half state places both halves,
 	// copying waterlogged from the target cells via DoublePlantBlock.copyWaterloggedFrom.
 	if chosen.Properties["half"] == "lower" {
@@ -755,6 +758,156 @@ func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePositio
 		return flattenBlockTagContains(set, "minecraft:supports_mangrove_propagule", state.Name)
 	}
 	return flattenBlockTagContains(set, "minecraft:supports_vegetation", state.Name)
+}
+
+var paleMossHorizDirs = [4]struct {
+	name   string
+	dx, dz int
+}{
+	{"north", 0, -1},
+	{"east", 1, 0},
+	{"south", 0, 1},
+	{"west", -1, 0},
+}
+
+// paleMossCarpetUpdatedState ports MossyCarpetBlock.getUpdatedState: computes
+// wall-side connections (none/low/tall) against adjacent blocks matching
+// canMultifaceAttachTo and upper/lower pale_moss_carpet neighbors in exact
+// Direction.Plane.HORIZONTAL (north, east, south, west) order.
+func (r *decorationRegion) paleMossCarpetUpdatedState(x, y, z int, bottom bool, curSides [4]string, createSides bool) (uint16, [4]string, bool) {
+	create := createSides || bottom
+	var aboveFetched, belowFetched bool
+	var aboveID, belowID uint16
+	var sides [4]string
+	for i, dir := range paleMossHorizDirs {
+		side := "none"
+		if canMultifaceAttachTo(r.getBlock(x+dir.dx, y, z+dir.dz)) {
+			if create {
+				side = "low"
+			} else {
+				side = curSides[i]
+			}
+		}
+		if side == "low" {
+			if !aboveFetched {
+				aboveID = r.getBlock(x, y+1, z)
+				aboveFetched = true
+			}
+			if aboveSt, ok := stateByID(aboveID); ok &&
+				aboveSt.Name == "minecraft:pale_moss_carpet" &&
+				aboveSt.Properties["bottom"] == "false" &&
+				aboveSt.Properties[dir.name] != "none" {
+				side = "tall"
+			}
+			if !bottom {
+				if !belowFetched {
+					belowID = r.getBlock(x, y-1, z)
+					belowFetched = true
+				}
+				if belowSt, ok := stateByID(belowID); ok &&
+					belowSt.Name == "minecraft:pale_moss_carpet" &&
+					belowSt.Properties[dir.name] == "none" {
+					side = "none"
+				}
+			}
+		}
+		sides[i] = side
+	}
+	state, ok := nameToStateID("minecraft:pale_moss_carpet", map[string]string{
+		"bottom": strconv.FormatBool(bottom),
+		"north":  sides[0],
+		"east":   sides[1],
+		"south":  sides[2],
+		"west":   sides[3],
+	})
+	return state, sides, ok
+}
+
+// createPaleMossTopperWithSideChance ports MossyCarpetBlock.createTopperWithSideChance:
+// consumes nextBoolean from regionRandom (WorldGenRegion.getRandom) for each
+// wall-supported horizontal direction above pos, without drawing if pos.above()
+// is non-replaceable or already holds a bottom=true pale_moss_carpet.
+func (r *decorationRegion) createPaleMossTopperWithSideChance(pos worldgen.FeaturePosition, set *worldgen.FeatureSet) uint16 {
+	existingAbove := r.getBlock(pos.X, pos.Y+1, pos.Z)
+	aboveSt, aboveOK := stateByID(existingAbove)
+	isCarpet := aboveOK && aboveSt.Name == "minecraft:pale_moss_carpet"
+	isCarpetBottom := isCarpet && aboveSt.Properties["bottom"] == "true"
+	canReplace := isAirState(existingAbove) || (aboveOK && flattenBlockTagContains(set, "minecraft:replaceable", aboveSt.Name))
+	if isCarpetBottom || (!isCarpet && !canReplace) {
+		return StateAir
+	}
+	_, topperSides, ok := r.paleMossCarpetUpdatedState(pos.X, pos.Y+1, pos.Z, false, [4]string{"none", "none", "none", "none"}, true)
+	if !ok {
+		return StateAir
+	}
+	rng := r.regionRandom()
+	for i := 0; i < 4; i++ {
+		if topperSides[i] != "none" && !rng.NextBoolean() {
+			topperSides[i] = "none"
+		}
+	}
+	if topperSides[0] == "none" && topperSides[1] == "none" && topperSides[2] == "none" && topperSides[3] == "none" {
+		return StateAir
+	}
+	topperID, ok := nameToStateID("minecraft:pale_moss_carpet", map[string]string{
+		"bottom": "false",
+		"north":  topperSides[0],
+		"east":   topperSides[1],
+		"south":  topperSides[2],
+		"west":   topperSides[3],
+	})
+	if !ok || topperID == existingAbove {
+		return StateAir
+	}
+	return topperID
+}
+
+// placePaleMossCarpet ports MossyCarpetBlock.placeAt invoked by SimpleBlockFeature.
+func (r *decorationRegion) placePaleMossCarpet(pos worldgen.FeaturePosition, set *worldgen.FeatureSet) bool {
+	baseID, baseSides, ok := r.paleMossCarpetUpdatedState(pos.X, pos.Y, pos.Z, true, [4]string{"none", "none", "none", "none"}, true)
+	if !ok {
+		return false
+	}
+	r.setBlock(pos.X, pos.Y, pos.Z, baseID)
+	topperID := r.createPaleMossTopperWithSideChance(pos, set)
+	if topperID != StateAir {
+		r.setBlock(pos.X, pos.Y+1, pos.Z, topperID)
+		if reUpdatedID, _, ok := r.paleMossCarpetUpdatedState(pos.X, pos.Y, pos.Z, true, baseSides, true); ok {
+			r.setBlock(pos.X, pos.Y, pos.Z, reUpdatedID)
+		}
+	}
+	return true
+}
+
+// paleMossCarpetUpdateShape ports MossyCarpetBlock.updateShape (zero RNG draws).
+func (r *decorationRegion) paleMossCarpetUpdateShape(x, y, z int, curID uint16, st stateName) uint16 {
+	bottom := st.Properties["bottom"] == "true"
+	var canSurvive bool
+	if y <= MinY {
+		canSurvive = false
+	} else if bottom {
+		canSurvive = !isAirState(r.getBlock(x, y-1, z))
+	} else {
+		belowSt, ok := stateByID(r.getBlock(x, y-1, z))
+		canSurvive = ok && belowSt.Name == "minecraft:pale_moss_carpet" && belowSt.Properties["bottom"] == "true"
+	}
+	if !canSurvive {
+		return StateAir
+	}
+	curSides := [4]string{
+		st.Properties["north"],
+		st.Properties["east"],
+		st.Properties["south"],
+		st.Properties["west"],
+	}
+	updatedID, newSides, ok := r.paleMossCarpetUpdatedState(x, y, z, bottom, curSides, false)
+	if !ok {
+		return curID
+	}
+	if !bottom && newSides[0] == "none" && newSides[1] == "none" && newSides[2] == "none" && newSides[3] == "none" {
+		return StateAir
+	}
+	return updatedID
 }
 
 // placeBamboo ports BambooFeature.place (26.1.2 bytecode).

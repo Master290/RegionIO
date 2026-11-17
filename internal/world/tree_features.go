@@ -80,29 +80,24 @@ func (r *decorationRegion) placeTreeWithResult(set *worldgen.FeatureSet, random 
 	if err := planter.placeTrunk(position.X, trunkOriginY, position.Z); err != nil {
 		return false, err
 	}
-	// Leaves are written at their registry default and LeavesBlock works the distance
-	// out afterwards, one neighbour at a time until nothing moves; a saved region is a
-	// world whose queued leaf ticks have already run, so settling the property here is
-	// what makes the capture comparable.
-	planter.applyLeafDistance()
-	// TreeFeature.place runs the decorators after doPlace has finished, over what the
-	// tree recorded - which is why they see the trunk's own cell below the floor as a
-	// log.
-	//
-	// An un-modelled decorator is an error at the decorator boundary and a counted gap
-	// here, not a reason to remove the tree. That split is measured, not stylistic:
-	// vetoing the whole tree over place_on_ground - the leaf litter under birches,
-	// still un-ported - deleted 101 trees from the four land chunks and took the
-	// surface band from 945 mismatches back up to 1,362. A trunk and canopy are
-	// already in the world by the time decorators run, so refusing at that point
-	// destroys work vanilla keeps.
+	if len(planter.placements) == 0 {
+		return false, nil
+	}
+	// TreeFeature.place runs decorators before updateLeaves and
+	// StructureTemplate.updateShapeAtEdge, recording decorator positions into
+	// the shape box so leaf distance and boundary shape updates match vanilla.
 	err := planter.placeDecorators(set)
 	var part *unmodelledPart
 	if errors.As(err, &part) && part.kind == "tree_decorator" {
 		noteNotReplayed(part.kind + ":" + part.name)
-		return true, nil
+		err = nil
 	}
-	return len(planter.placements) > 0, err
+	if err != nil {
+		return false, err
+	}
+	settledLeaves := planter.applyLeafDistance()
+	planter.updateShapeAtEdge(settledLeaves)
+	return len(planter.placements) > 0, nil
 }
 
 // maxFreeTreeHeight is TreeFeature.getMaxFreeTreeHeight: the tallest prefix of the

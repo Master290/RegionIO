@@ -536,3 +536,18 @@ func ParseWorldSeed(raw string) (int64, bool) {
 	}
 	return int64(JavaStringHashCode(trimmed)), true
 }
+
+// WorldGenRegionRandom ports WorldGenRegion.<init>'s this.random initialization
+// in vanilla 26.1.2:
+//
+//	randomState.getOrCreateRandomFactory("minecraft:worldgen_region_random")
+//	  .at(center.getPos().getWorldPosition())
+//
+// where ChunkPos.getWorldPosition() is (chunkX << 4, 0, chunkZ << 4).
+func WorldGenRegionRandom(worldSeed int64, chunkX, chunkZ int32) RandomSource {
+	return NewXoroshiro(worldSeed).
+		ForkPositional().
+		FromHashOf("minecraft:worldgen_region_random").
+		ForkPositional().
+		At(int(chunkX)<<4, 0, int(chunkZ)<<4)
+}

@@ -88,6 +88,11 @@ func (t *treePlacer) placeDecorators(set *worldgen.FeatureSet) error {
 	return newTreeDecoration(t).runDecorators(set, t.config.Decorators)
 }
 
+func (d *treeDecoration) setDecorationBlock(x, y, z int, state uint16) bool {
+	d.t.decorations = append(d.t.decorations, pos3{x, y, z})
+	return d.t.r.setBlock(x, y, z, state)
+}
+
 func (d *treeDecoration) runDecorators(set *worldgen.FeatureSet, decorators []worldgen.TreeDecorator) error {
 	for _, decorator := range decorators {
 		switch decorator.Type {
@@ -329,7 +334,9 @@ func (d *treeDecoration) placeBeehive(probability float32) error {
 		if !ok {
 			return fmt.Errorf("world: minecraft:bee_nest is not a known block state")
 		}
-		d.t.r.setBlock(c.x, c.y, c.z, state)
+		if !d.setDecorationBlock(c.x, c.y, c.z, state) {
+			return nil
+		}
 		// lambda$place$3: 2 + nextInt(2) bees, each created via BeehiveBlockEntity.Occupant.create(random.nextInt(599))
 		// with entity_data={id:"minecraft:bee"}, ticks_in_hive=0..598, min_ticks_in_hive=600.
 		beeCount := 2 + int(random.NextIntN(2))
@@ -414,7 +421,7 @@ func (d *treeDecoration) paintGround(set *worldgen.FeatureSet, spec worldgen.Sta
 			return err
 		}
 		if ok {
-			d.t.r.setBlock(x, y+offset, z, state)
+			d.setDecorationBlock(x, y+offset, z, state)
 			return nil
 		}
 		if !d.isAir(x, y+offset, z) && offset < 0 {
@@ -468,7 +475,7 @@ func (d *treeDecoration) placeOnGround(set *worldgen.FeatureSet, spec worldgen.S
 		if err != nil {
 			return err
 		}
-		d.t.r.setBlock(x, aboveY, z, state)
+		d.setDecorationBlock(x, aboveY, z, state)
 	}
 	return nil
 }
@@ -516,7 +523,7 @@ func (d *treeDecoration) placeVine(x, y, z int, face string) error {
 	if !ok {
 		return fmt.Errorf("world: minecraft:vine is not a known block state")
 	}
-	d.t.r.setBlock(x, y, z, state)
+	d.setDecorationBlock(x, y, z, state)
 	return nil
 }
 
@@ -555,7 +562,7 @@ func (d *treeDecoration) placeAttachedToLogs(set *worldgen.FeatureSet, spec worl
 			if err != nil {
 				return err
 			}
-			d.t.r.setBlock(tx, ty, tz, state)
+			d.setDecorationBlock(tx, ty, tz, state)
 		}
 	}
 	return nil
@@ -637,7 +644,7 @@ func (d *treeDecoration) placeCocoa(probability float32) error {
 					if !ok {
 						return fmt.Errorf("world: minecraft:cocoa is not a known block state")
 					}
-					d.t.r.setBlock(cx, cy, cz, state)
+					d.setDecorationBlock(cx, cy, cz, state)
 				}
 			}
 		}
@@ -685,7 +692,7 @@ func (d *treeDecoration) placeAttachedToLeaves(set *worldgen.FeatureSet, spec wo
 			if err != nil {
 				return err
 			}
-			d.t.r.setBlock(px, py, pz, state)
+			d.setDecorationBlock(px, py, pz, state)
 			for dy := -exclY; dy <= exclY; dy++ {
 				for dz := -exclXZ; dz <= exclXZ; dz++ {
 					for dx := -exclXZ; dx <= exclXZ; dx++ {
@@ -740,13 +747,14 @@ func (d *treeDecoration) placeCreakingHeart(probability float32) error {
 			if !ok {
 				return fmt.Errorf("world: minecraft:creaking_heart is not a known block state")
 			}
-			d.t.r.setBlock(pos.x, pos.y, pos.z, state)
-			d.t.r.addStructureBlockEntity(StructureBlockEntity{
-				ID: "minecraft:creaking_heart",
-				X:  pos.x,
-				Y:  pos.y,
-				Z:  pos.z,
-			})
+			if d.setDecorationBlock(pos.x, pos.y, pos.z, state) {
+				d.t.r.addStructureBlockEntity(StructureBlockEntity{
+					ID: "minecraft:creaking_heart",
+					X:  pos.x,
+					Y:  pos.y,
+					Z:  pos.z,
+				})
+			}
 			return nil
 		}
 	}
@@ -805,10 +813,10 @@ func (d *treeDecoration) addMossHanger(x, y, z int) error {
 	}
 	cy := y
 	for d.isAir(x, cy-1, z) && float64(random.NextFloat()) >= 0.5 {
-		d.t.r.setBlock(x, cy, z, bodyState)
+		d.setDecorationBlock(x, cy, z, bodyState)
 		cy--
 	}
-	d.t.r.setBlock(x, cy, z, tipState)
+	d.setDecorationBlock(x, cy, z, tipState)
 	return nil
 }
 

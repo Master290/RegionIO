@@ -1,6 +1,12 @@
 package world
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+	"strconv"
+
+	"regionio/internal/worldgen"
+)
 
 // pos3 is one region cell.
 type pos3 struct{ x, y, z int }
@@ -21,14 +27,10 @@ type pos3 struct{ x, y, z int }
 // its earlier neighbours happened to have, which for the canopies of a spruce chain is
 // the difference between matching 23 of 194 cells and matching the rest.
 
-// applyLeafDistance settles the distance property of every leaf this tree wrote.
-//
-// The work is bounded to the tree's own cells, widened by one shell, because a leaf's
-// value depends on the leaf next to it: a canopy that touches a neighbouring tree's
-// canopy would keep the outer leaves stale. That is recorded in the notes as the known
-// limit of this pass rather than fixed by iterating the whole region, which would make a
-// single tree cost proportional to the world.
-func (t *treePlacer) applyLeafDistance() {
+// applyLeafDistance settles the distance property of every leaf this tree wrote
+// and returns the settled distance map so TreeFeature.updateShapeAtEdge can
+// identify leaves within distance 1..6.
+func (t *treePlacer) applyLeafDistance() map[pos3]int {
 	leaves := map[pos3]bool{}
 	logs := map[pos3]bool{}
 	for _, p := range t.placements {
@@ -70,7 +72,7 @@ func (t *treePlacer) applyLeafDistance() {
 		leaves[n] = true
 	}
 	if len(leaves) == 0 {
-		return
+		return nil
 	}
 
 	distance := map[pos3]int{}
@@ -147,6 +149,159 @@ func (t *treePlacer) applyLeafDistance() {
 		if updated != state {
 			t.r.setBlock(c.x, c.y, c.z, updated)
 		}
+	}
+	return distance
+}
+
+var treeEdgeDirs = [6]struct {
+	name     string
+	opposite string
+	dx       int
+	dy       int
+	dz       int
+}{
+	{"down", "up", 0, -1, 0},
+	{"up", "down", 0, 1, 0},
+	{"north", "south", 0, 0, -1},
+	{"south", "north", 0, 0, 1},
+	{"west", "east", -1, 0, 0},
+	{"east", "west", 1, 0, 0},
+}
+
+// updateShapeAtEdge ports TreeFeature.lambda$place$4 ->
+// StructureTemplate.updateShapeAtEdge: notifies block shapes along the exterior
+// boundary of (roots U decorations U logs U leaves[distance<=6]) so overwritten
+// double plants / pale_moss_carpet toppers clean up and adjacent wall faces update.
+func (t *treePlacer) updateShapeAtEdge(settledLeaves map[pos3]int) {
+	if len(t.placements) == 0 && len(t.decorations) == 0 {
+		return
+	}
+	minX, maxX := 0, 0
+	minY, maxY := 0, 0
+	minZ, maxZ := 0, 0
+	hasBounds := false
+	expandBox := func(c pos3) {
+		if !hasBounds {
+			minX, maxX = c.x, c.x
+			minY, maxY = c.y, c.y
+			minZ, maxZ = c.z, c.z
+			hasBounds = true
+			return
+		}
+		if c.x < minX {
+			minX = c.x
+		}
+		if c.x > maxX {
+			maxX = c.x
+		}
+		if c.y < minY {
+			minY = c.y
+		}
+		if c.y > maxY {
+			maxY = c.y
+		}
+		if c.z < minZ {
+			minZ = c.z
+		}
+		if c.z > maxZ {
+			maxZ = c.z
+		}
+	}
+
+	inside := make(map[pos3]bool, len(t.placements)+len(t.decorations))
+	insideOrder := make([]pos3, 0, len(t.placements)+len(t.decorations))
+	addInside := func(c pos3) {
+		if inside[c] {
+			return
+		}
+		inside[c] = true
+		insideOrder = append(insideOrder, c)
+	}
+	for _, p := range t.placements {
+		c := pos3{p.x, p.y, p.z}
+		expandBox(c)
+		if p.isRoot || p.isLog {
+			addInside(c)
+		}
+	}
+	for _, c := range t.decorations {
+		expandBox(c)
+		addInside(c)
+	}
+	for c, dist := range settledLeaves {
+		if dist >= 1 && dist <= 6 &&
+			c.x >= minX && c.x <= maxX &&
+			c.y >= minY && c.y <= maxY &&
+			c.z >= minZ && c.z <= maxZ {
+			addInside(c)
+		}
+	}
+	sort.Slice(insideOrder, func(i, j int) bool {
+		if insideOrder[i].x != insideOrder[j].x {
+			return insideOrder[i].x < insideOrder[j].x
+		}
+		if insideOrder[i].y != insideOrder[j].y {
+			return insideOrder[i].y < insideOrder[j].y
+		}
+		return insideOrder[i].z < insideOrder[j].z
+	})
+	for _, posA := range insideOrder {
+		for _, dir := range treeEdgeDirs {
+			posB := pos3{posA.x + dir.dx, posA.y + dir.dy, posA.z + dir.dz}
+			if inside[posB] {
+				continue
+			}
+			if newA, changed := t.r.treeEdgeUpdatedState(t.set, posA, dir.name, posB); changed {
+				t.r.setBlock(posA.x, posA.y, posA.z, newA)
+			}
+			if newB, changed := t.r.treeEdgeUpdatedState(t.set, posB, dir.opposite, posA); changed {
+				t.r.setBlock(posB.x, posB.y, posB.z, newB)
+			}
+		}
+	}
+}
+
+func (r *decorationRegion) treeEdgeUpdatedState(set *worldgen.FeatureSet, pos pos3, dir string, neighborPos pos3) (uint16, bool) {
+	curID := r.getBlock(pos.x, pos.y, pos.z)
+	if isAirState(curID) {
+		return 0, false
+	}
+	st, ok := stateByID(curID)
+	if !ok {
+		return 0, false
+	}
+	switch {
+	case st.Name == "minecraft:pale_moss_carpet":
+		updatedID := r.paleMossCarpetUpdateShape(pos.x, pos.y, pos.z, curID, st)
+		return updatedID, updatedID != curID
+	case st.Name == "minecraft:pale_hanging_moss":
+		if dir == "up" {
+			above := r.getBlock(pos.x, pos.y+1, pos.z)
+			if !canMultifaceAttachTo(above) && !isBlockNamed(above, "minecraft:pale_hanging_moss") {
+				return StateAir, true
+			}
+		}
+		wantTip := strconv.FormatBool(!isBlockNamed(r.getBlock(pos.x, pos.y-1, pos.z), "minecraft:pale_hanging_moss"))
+		if st.Properties["tip"] != wantTip {
+			if updatedID, ok := nameToStateID("minecraft:pale_hanging_moss", map[string]string{"tip": wantTip}); ok && updatedID != curID {
+				return updatedID, true
+			}
+		}
+		return 0, false
+	case st.Properties["half"] == "lower" || st.Properties["half"] == "upper":
+		half := st.Properties["half"]
+		if (dir == "up" || dir == "down") && ((half == "lower") == (dir == "up")) {
+			nb, nbOK := stateByID(r.getBlock(neighborPos.x, neighborPos.y, neighborPos.z))
+			if !nbOK || nb.Name != st.Name || nb.Properties["half"] == half {
+				return StateAir, true
+			}
+		}
+		if half == "lower" && dir == "down" && !r.simpleBlockCanSurvive(worldgen.FeaturePosition{X: pos.x, Y: pos.y, Z: pos.z}, st.Name, set) {
+			return StateAir, true
+		}
+		return 0, false
+	default:
+		return 0, false
 	}
 }
 
