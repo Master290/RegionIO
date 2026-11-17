@@ -430,6 +430,22 @@ func (r *decorationRegion) markForPostProcessing(x, y, z int) {
 	r.postProcessPositions = append(r.postProcessPositions, pos)
 }
 
+// markAboveForPostProcessing ports Feature.markAboveForPostProcessing: walks up
+// to two blocks above (x, y, z), stopping as soon as an air block is reached,
+// and marks each occupied cell for post-processing.
+func (r *decorationRegion) markAboveForPostProcessing(x, y, z int) {
+	for dy := 1; dy <= 2; dy++ {
+		ay := y + dy
+		if ay < MinY || ay >= MinY+WorldHeight {
+			return
+		}
+		if isAirState(r.getBlock(x, ay, z)) {
+			return
+		}
+		r.markForPostProcessing(x, ay, z)
+	}
+}
+
 func (r *decorationRegion) fenceConnectsTo(fenceName string, nx, ny, nz int, dirToNeighbor string) bool {
 	nb := r.getBlock(nx, ny, nz)
 	if isAirState(nb) {
@@ -470,10 +486,10 @@ func (r *decorationRegion) resolvedFenceState(x, y, z int, state uint16) uint16 
 	return state
 }
 
-// runPostProcessing replays StructurePiece SHAPE_CHECK_BLOCKS shape updates
-// (LevelChunk.postProcessGeneration -> Block.updateFromNeighbourShapes) for
-// marked fences and wall torches against final neighborhood blocks.
-func (r *decorationRegion) runPostProcessing(_ *worldgen.FeatureSet) {
+// runPostProcessing replays StructurePiece SHAPE_CHECK_BLOCKS and Feature
+// markAboveForPostProcessing shape updates (LevelChunk.postProcessGeneration ->
+// Block.updateFromNeighbourShapes) against final neighborhood blocks.
+func (r *decorationRegion) runPostProcessing(set *worldgen.FeatureSet) {
 	if r == nil || len(r.postProcessPositions) == 0 {
 		return
 	}
@@ -494,6 +510,13 @@ func (r *decorationRegion) runPostProcessing(_ *worldgen.FeatureSet) {
 				if !isFaceSturdy(r.getBlock(sup.X, sup.Y, sup.Z)) {
 					r.setBlockGlobal(x, y, z, StateAir)
 				}
+			}
+		case info.Name == "minecraft:snow":
+			if set == nil {
+				set, _ = worldgen.LoadFeatureSet()
+			}
+			if set != nil && !snowLayerCanSurviveOn(r.getBlock(x, y-1, z), set) {
+				r.setBlockGlobal(x, y, z, StateAir)
 			}
 		}
 	}

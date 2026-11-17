@@ -399,20 +399,17 @@ func (r *decorationRegion) placeIceberg(random worldgen.RandomSource, origin wor
 	ellipseA := 11 - int(random.NextIntN(5))
 	ellipseC := 3 + int(random.NextIntN(3))
 	isEllipse := random.NextDouble() > 0.7
-	var overhangHeight int
+	var height int
 	if isEllipse {
-		overhangHeight = int(random.NextIntN(6)) + 6
+		height = int(random.NextIntN(6)) + 6
 	} else {
-		overhangHeight = int(random.NextIntN(15)) + 3
+		height = int(random.NextIntN(15)) + 3
 	}
-	var underWaterHeight int
 	if !isEllipse && random.NextDouble() > 0.9 {
-		underWaterHeight = int(random.NextIntN(19)) + 7
-	} else {
-		underWaterHeight = int(random.NextIntN(8)) + 7
+		height += int(random.NextIntN(19)) + 7
 	}
-	height := min(overhangHeight+int(random.NextIntN(11)), 18)
-	width := min(overhangHeight+int(random.NextIntN(7))-int(random.NextIntN(5)), 11)
+	underWaterHeight := min(height+int(random.NextIntN(11)), 18)
+	width := min(height+int(random.NextIntN(7))-int(random.NextIntN(5)), 11)
 	a := 11
 	if isEllipse {
 		a = ellipseA
@@ -510,12 +507,12 @@ func (r *decorationRegion) carveIceberg(radius, yOff int, globalOrigin worldgen.
 				if isIcebergBlockState(cur) || blockNameEquals(cur, "minecraft:snow_block") {
 					if underWater {
 						if waterID, ok := nameToStateID("minecraft:water", map[string]string{"level": "0"}); ok {
-							r.setBlockGlobal(px, py, pz, waterID)
+							r.setBlock(px, py, pz, waterID)
 						}
 					} else {
-						r.setBlockGlobal(px, py, pz, StateAir)
+						r.setBlock(px, py, pz, StateAir)
 						if blockNameEquals(r.getBlock(px, py+1, pz), "minecraft:snow") {
-							r.setBlockGlobal(px, py+1, pz, StateAir)
+							r.setBlock(px, py+1, pz, StateAir)
 						}
 					}
 				}
@@ -556,11 +553,11 @@ func (r *decorationRegion) setIcebergBlock(px, py, pz int, random worldgen.Rando
 		}
 		if snowOnTop && !blockNameEquals(cur, "minecraft:water") && float64(hDiff) <= float64(random.NextIntN(int32(max(1, height/divisor))))+float64(height)*0.6 && randomness {
 			if snowID, ok := nameToStateID("minecraft:snow_block", nil); ok {
-				r.setBlockGlobal(px, py, pz, snowID)
+				r.setBlock(px, py, pz, snowID)
 				return
 			}
 		}
-		r.setBlockGlobal(px, py, pz, mainBlockState)
+		r.setBlock(px, py, pz, mainBlockState)
 	}
 }
 
@@ -636,28 +633,28 @@ func (r *decorationRegion) smoothIceberg(origin worldgen.FeaturePosition, width,
 			for yOff := 0; yOff <= height; yOff++ {
 				px, py, pz := origin.X+x, origin.Y+yOff, origin.Z+z
 				cur := r.getBlock(px, py, pz)
-				if isIcebergBlockState(cur) || blockNameEquals(cur, "minecraft:snow") {
-					if isAirState(r.getBlock(px, py-1, pz)) {
-						r.setBlockGlobal(px, py, pz, StateAir)
-						r.setBlockGlobal(px, py+1, pz, StateAir)
-					} else if isIcebergBlockState(cur) {
-						sides := [4]uint16{
-							r.getBlock(px-1, py, pz),
-							r.getBlock(px+1, py, pz),
-							r.getBlock(px, py, pz-1),
-							r.getBlock(px, py, pz+1),
-						}
-						counter := 0
-						for _, s := range sides {
-							if !isIcebergBlockState(s) {
-								counter++
+					if isIcebergBlockState(cur) || blockNameEquals(cur, "minecraft:snow") {
+						if isAirState(r.getBlock(px, py-1, pz)) {
+							r.setBlock(px, py, pz, StateAir)
+							r.setBlock(px, py+1, pz, StateAir)
+						} else if isIcebergBlockState(cur) {
+							sides := [4]uint16{
+								r.getBlock(px-1, py, pz),
+								r.getBlock(px+1, py, pz),
+								r.getBlock(px, py, pz-1),
+								r.getBlock(px, py, pz+1),
+							}
+							counter := 0
+							for _, s := range sides {
+								if !isIcebergBlockState(s) {
+									counter++
+								}
+							}
+							if counter >= 3 {
+								r.setBlock(px, py, pz, StateAir)
 							}
 						}
-						if counter >= 3 {
-							r.setBlockGlobal(px, py, pz, StateAir)
-						}
 					}
-				}
 			}
 		}
 	}

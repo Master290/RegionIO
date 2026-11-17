@@ -36,10 +36,12 @@ func (r *decorationRegion) placeDisk(set *worldgen.FeatureSet, random worldgen.R
 			if dx*dx+dz*dz > radius*radius {
 				continue
 			}
+			placedAbove := false
 			for y := position.Y + config.HalfHeight; y >= position.Y-config.HalfHeight; y-- {
 				x, z := position.X+dx, position.Z+dz
 				current := r.getBlock(x, y, z)
 				if !targets[current] {
+					placedAbove = false
 					continue
 				}
 				placeState := fallback
@@ -53,7 +55,12 @@ func (r *decorationRegion) placeDisk(set *worldgen.FeatureSet, random worldgen.R
 						break
 					}
 				}
-				r.setBlock(x, y, z, placeState)
+				if r.setBlock(x, y, z, placeState) {
+					if !placedAbove {
+						r.markAboveForPostProcessing(x, y, z)
+					}
+					placedAbove = true
+				}
 			}
 		}
 	}

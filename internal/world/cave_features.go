@@ -386,7 +386,7 @@ func (r *decorationRegion) placeScheduledFreezeTopLayer(seed int64) error {
 			if y >= MinY && y < MinY+WorldHeight && belowY >= MinY && worldgen.ShouldSnowAt(biome, x, y, z, SeaLevel) {
 				at := r.getBlock(x, y, z)
 				below := r.getBlock(x, belowY, z)
-				if isAirState(at) && snowLayerCanSurviveOn(below, set) {
+				if (isAirState(at) || blockNameEquals(at, "minecraft:snow")) && snowLayerCanSurviveOn(below, set) {
 					r.setBlock(x, y, z, snowID)
 					if belowState, ok := stateByID(below); ok && belowState.Properties["snowy"] == "false" {
 						props := make(map[string]string, len(belowState.Properties))
@@ -406,16 +406,31 @@ func (r *decorationRegion) placeScheduledFreezeTopLayer(seed int64) error {
 }
 
 func snowLayerCanSurviveOn(below uint16, set *worldgen.FeatureSet) bool {
+	if isAirState(below) {
+		return false
+	}
 	s, ok := stateByID(below)
 	if !ok {
 		return false
 	}
-	if flattenBlockTagContains(set, "minecraft:snow_layer_cannot_survive_on", s.Name) {
+	if flattenBlockTagContains(set, "minecraft:cannot_support_snow_layer", s.Name) {
 		return false
 	}
-	if flattenBlockTagContains(set, "minecraft:snow_layer_can_survive_on", s.Name) {
+	if flattenBlockTagContains(set, "minecraft:support_override_snow_layer", s.Name) {
 		return true
 	}
-	return isFaceSturdy(below)
+	switch s.Name {
+	case "minecraft:snow":
+		return s.Properties["layers"] == "8"
+	case "minecraft:powder_snow", "minecraft:scaffolding", "minecraft:cactus",
+		"minecraft:chorus_plant", "minecraft:chorus_flower", "minecraft:bamboo":
+		return false
+	case "minecraft:frosted_ice":
+		return true
+	}
+	if stateFlags(below)&flagLeaves != 0 {
+		return true
+	}
+	return CanBlockSupportSnowLayer(below)
 }
 

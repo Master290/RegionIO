@@ -59,7 +59,13 @@ const dataVersion26 = 4790
 // for SteepMaterialCondition, SHAPE_CHECK_BLOCKS post-processing for mineshaft
 // fences/torches, fillPillarDownOrChainUp chain support and direction continuation,
 // and FallenTreeFeature updateShapeAtEdge propagation (vanilla 26.1.2).
-const generatorVersion = 60
+// Version 61: Cold and mountain biome generation parity: 26.1.2 snow layer survival
+// tags (#cannot_support_snow_layer / #support_override_snow_layer), leaf canopy snow
+// and powder_snow/scaffolding exclusion in freeze_top_layer, IcebergFeature height vs
+// underWaterHeight swap and RNG stream fix, DiskFeature markAboveForPostProcessing snow
+// cleanup over ice_patch, and ±1-chunk write guards for icebergs/spikes/blue_ice
+// (vanilla 26.1.2).
+const generatorVersion = 61
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

@@ -227,7 +227,7 @@ func (r *decorationRegion) placeSpike(set *worldgen.FeatureSet, random worldgen.
 					canRepP, _ = r.testBlockPredicate(set, config.CanReplace, posP)
 				}
 				if canRepP {
-					r.setBlockGlobal(posP.X, posP.Y, posP.Z, spikeState)
+					r.setBlock(posP.X, posP.Y, posP.Z, spikeState)
 				}
 				if yOff != 0 && newWidth > 1 {
 					posN := worldgen.FeaturePosition{X: origin.X + xo, Y: origin.Y - yOff, Z: origin.Z + zo}
@@ -237,7 +237,7 @@ func (r *decorationRegion) placeSpike(set *worldgen.FeatureSet, random worldgen.
 						canRepN, _ = r.testBlockPredicate(set, config.CanReplace, posN)
 					}
 					if canRepN {
-						r.setBlockGlobal(posN.X, posN.Y, posN.Z, spikeState)
+						r.setBlock(posN.X, posN.Y, posN.Z, spikeState)
 					}
 				}
 			}
@@ -265,7 +265,7 @@ func (r *decorationRegion) placeSpike(set *worldgen.FeatureSet, random worldgen.
 				if !canRep {
 					break
 				}
-				r.setBlockGlobal(cursor.X, cursor.Y, cursor.Z, spikeState)
+				r.setBlock(cursor.X, cursor.Y, cursor.Z, spikeState)
 				cursor.Y--
 				runLength--
 				if runLength <= 0 {
@@ -305,7 +305,7 @@ func (r *decorationRegion) placeBlueIce(random worldgen.RandomSource, origin wor
 	if !ok {
 		return false
 	}
-	r.setBlockGlobal(origin.X, origin.Y, origin.Z, blueIceID)
+	r.setBlock(origin.X, origin.Y, origin.Z, blueIceID)
 	for i := 0; i < 200; i++ {
 		yOff := int(random.NextIntN(5)) - int(random.NextIntN(6))
 		xzDiff := 3
@@ -327,7 +327,7 @@ func (r *decorationRegion) placeBlueIce(random worldgen.RandomSource, origin wor
 		}
 		for _, d := range dirs {
 			if r.getBlock(px+d[0], py+d[1], pz+d[2]) == blueIceID {
-				r.setBlockGlobal(px, py, pz, blueIceID)
+				r.setBlock(px, py, pz, blueIceID)
 				break
 			}
 		}
