@@ -226,9 +226,49 @@ func (s *Server) TeleportPlayerThroughEndGateway(session *PlayerSession, gx, gy,
 
 // --- 2. Guarded Spike Iron Bars, End Crystal Damage & Staged Respawn Sequence ---
 
+var (
+	endSpikeIronBarsOnce   sync.Once
+	endSpikeIronBarsStates [16]uint16
+	endSpikeHasIronBars    bool
+)
+
+func loadEndSpikeIronBarsStates2612() ([16]uint16, bool) {
+	endSpikeIronBarsOnce.Do(func() {
+		tf := func(v bool) string {
+			if v {
+				return "true"
+			}
+			return "false"
+		}
+		fallback, okFallback := world.BlockStateByName("minecraft:iron_bars", nil)
+		for mask := 0; mask < 16; mask++ {
+			st, ok := world.BlockStateByName("minecraft:iron_bars", map[string]string{
+				"north":       tf(mask&1 != 0),
+				"south":       tf(mask&2 != 0),
+				"west":        tf(mask&4 != 0),
+				"east":        tf(mask&8 != 0),
+				"waterlogged": "false",
+			})
+			if !ok {
+				st = fallback
+				ok = okFallback
+			}
+			if ok {
+				endSpikeIronBarsStates[mask] = st
+				endSpikeHasIronBars = true
+			}
+		}
+	})
+	return endSpikeIronBarsStates, endSpikeHasIronBars
+}
+
 // RebuildEndSpikeTop reconstructs the top of an End obsidian pillar from
-// `world.EndSpike`, including the obsidian cap, bedrock base, fire block, and
-// (when `sp.Guarded == true`) the 5x4x5 `minecraft:iron_bars` cage around the crystal.
+// `world.EndSpike` matching `EndSpikeFeature.placeSpike` in vanilla 26.1.2:
+//   - Obsidian cap at `y = sp.Height - 1` (`y < sp.Height` in `EndSpikeFeature`)
+//   - Bedrock crystal base at `(sp.CenterX, sp.Height, sp.CenterZ)` and fire at `Height + 1`
+//   - Connected 5x4x5 `minecraft:iron_bars` cage (`north/south/west/east`) when `sp.Guarded == true`
+//   - Skips unchanged blocks (`cache.GetBlock == st`) so intact worldgen spikes execute
+//     zero `cache.SetBlockWithLight` / `lightMu` updates!
 func RebuildEndSpikeTop(cache *world.Cache, sp world.EndSpike) []world.BlockChange {
 	if cache == nil {
 		return nil
@@ -238,21 +278,11 @@ func RebuildEndSpikeTop(cache *world.Cache, sp world.EndSpike) []world.BlockChan
 		obsidian = world.StateBedrock
 	}
 	fireState, hasFire := world.BlockStateByName("minecraft:fire", nil)
-	barsState, hasBars := world.BlockStateByName("minecraft:iron_bars", map[string]string{
-		"east":        "false",
-		"north":       "false",
-		"south":       "false",
-		"waterlogged": "false",
-		"west":        "false",
-	})
-	if !hasBars {
-		barsState, hasBars = world.BlockStateByName("minecraft:iron_bars", nil)
-	}
+	barStates, hasBars := loadEndSpikeIronBarsStates2612()
 
-	var changes []world.BlockChange
+	var pending []world.BlockChange
 	setB := func(x, y, z int, st uint16) {
-		cache.SetBlock(x, y, z, st)
-		changes = append(changes, world.BlockChange{
+		pending = append(pending, world.BlockChange{
 			Pos:      world.BlockPos{X: x, Y: y, Z: z},
 			NewState: st,
 		})
@@ -263,31 +293,58 @@ func RebuildEndSpikeTop(cache *world.Cache, sp world.EndSpike) []world.BlockChan
 		for dx := -sp.Radius; dx <= sp.Radius; dx++ {
 			if dx*dx+dz*dz <= rSq {
 				setB(sp.CenterX+dx, sp.Height-1, sp.CenterZ+dz, obsidian)
-				setB(sp.CenterX+dx, sp.Height, sp.CenterZ+dz, obsidian)
 			}
 		}
 	}
 
-	if sp.Guarded && hasBars {
-		for dx := -2; dx <= 2; dx++ {
-			for dz := -2; dz <= 2; dz++ {
-				edgeX := dx == -2 || dx == 2
-				edgeZ := dz == -2 || dz == 2
-				for dy := 0; dy <= 3; dy++ {
+	ext := sp.Radius
+	if sp.Guarded && ext < 2 {
+		ext = 2
+	}
+	for dy := 0; dy <= 3; dy++ {
+		by := sp.Height + dy
+		for dz := -ext; dz <= ext; dz++ {
+			for dx := -ext; dx <= ext; dx++ {
+				inRadius := dx*dx+dz*dz <= rSq
+				if dx == 0 && dz == 0 && dy == 0 {
+					setB(sp.CenterX, by, sp.CenterZ, world.StateBedrock)
+					continue
+				}
+				if dx == 0 && dz == 0 && dy == 1 && hasFire {
+					setB(sp.CenterX, by, sp.CenterZ, fireState)
+					continue
+				}
+				if sp.Guarded && hasBars && dx >= -2 && dx <= 2 && dz >= -2 && dz <= 2 {
+					edgeX := dx == -2 || dx == 2
+					edgeZ := dz == -2 || dz == 2
 					topY := dy == 3
 					if edgeX || edgeZ || topY {
-						setB(sp.CenterX+dx, sp.Height+dy, sp.CenterZ+dz, barsState)
+						connNS := edgeX || topY
+						connWE := edgeZ || topY
+						mask := 0
+						if connNS && dz != -2 {
+							mask |= 1 // north
+						}
+						if connNS && dz != 2 {
+							mask |= 2 // south
+						}
+						if connWE && dx != -2 {
+							mask |= 4 // west
+						}
+						if connWE && dx != 2 {
+							mask |= 8 // east
+						}
+						setB(sp.CenterX+dx, by, sp.CenterZ+dz, barStates[mask])
+						continue
 					}
+				}
+				if inRadius && by > 65 {
+					setB(sp.CenterX+dx, by, sp.CenterZ+dz, world.StateAir)
 				}
 			}
 		}
 	}
-
-	setB(sp.CenterX, sp.Height, sp.CenterZ, world.StateBedrock)
-	if hasFire {
-		setB(sp.CenterX, sp.Height+1, sp.CenterZ, fireState)
-	}
-	return changes
+	return cache.SetBlocksBatch(pending)
 }
 
 // SetEndCrystalBeamTarget updates the beam target position (`DATA_BEAM_TARGET`)
@@ -504,7 +561,7 @@ func (s *Server) StepEnderDragonRespawnSequence() (spawnedDragonID int32, comple
 			encodeRemoveEntitiesPacket(nil, portalCrystals))
 	}
 
-	s.SpawnEndSpikeCrystals()
+	s.spawnEndSpikeCrystalEntities()
 	dragonID, err := s.SpawnEnderDragon(0.5, float64(portalY)+24.0, 0.5)
 	if err != nil {
 		return 0, false

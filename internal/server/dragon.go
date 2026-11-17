@@ -263,13 +263,28 @@ func PlaceEndPodium(cache *world.Cache, originY int, active bool, placeDragonEgg
 		}
 	}
 
-	var changes []world.BlockChange
+	var pending []world.BlockChange
 	setB := func(x, y, z int, st uint16) {
-		cache.SetBlock(x, y, z, st)
-		changes = append(changes, world.BlockChange{
+		pending = append(pending, world.BlockChange{
 			Pos:      world.BlockPos{X: x, Y: y, Z: z},
 			NewState: st,
 		})
+	}
+
+	torchStates := map[[2]int]uint16{}
+	torchDirs := []struct {
+		dx, dz int
+		facing string
+	}{
+		{-1, 0, "west"},
+		{1, 0, "east"},
+		{0, -1, "north"},
+		{0, 1, "south"},
+	}
+	for _, td := range torchDirs {
+		if st, ok := world.BlockStateByName("minecraft:wall_torch", map[string]string{"facing": td.facing}); ok {
+			torchStates[[2]int{td.dx, td.dz}] = st
+		}
 	}
 
 	// Inner radius = 2.5 (sq = 6.25), outer radius = 3.5 (sq = 12.25).
@@ -281,6 +296,16 @@ func PlaceEndPodium(cache *world.Cache, originY int, active bool, placeDragonEgg
 			}
 			for dy := -1; dy <= 3; dy++ {
 				by := originY + dy
+				if dx == 0 && dz == 0 && dy >= 0 {
+					setB(0, by, 0, world.StateBedrock)
+					continue
+				}
+				if dy == 2 {
+					if tSt, isTorch := torchStates[[2]int{dx, dz}]; isTorch {
+						setB(dx, by, dz, tSt)
+						continue
+					}
+				}
 				if distSq <= 6.25 {
 					if dy < 0 {
 						setB(dx, by, dz, world.StateBedrock)
@@ -300,34 +325,13 @@ func PlaceEndPodium(cache *world.Cache, originY int, active bool, placeDragonEgg
 		}
 	}
 
-	// Central 4-block bedrock column at (0, originY..originY+3, 0).
-	for dy := 0; dy < 4; dy++ {
-		setB(0, originY+dy, 0, world.StateBedrock)
-	}
-
-	// 4 wall torches around (0, originY+2, 0).
-	torchDirs := []struct {
-		dx, dz int
-		facing string
-	}{
-		{-1, 0, "west"},
-		{1, 0, "east"},
-		{0, -1, "north"},
-		{0, 1, "south"},
-	}
-	for _, td := range torchDirs {
-		if st, ok := world.BlockStateByName("minecraft:wall_torch", map[string]string{"facing": td.facing}); ok {
-			setB(td.dx, originY+2, td.dz, st)
-		}
-	}
-
 	if placeDragonEgg {
 		if eggState, ok := world.BlockStateByName(DragonEggBlockID, nil); ok {
 			setB(0, originY+4, 0, eggState)
 		}
 	}
 
-	return changes
+	return cache.SetBlocksBatch(pending)
 }
 
 // PlaceEndGatewayStructure places a 3x5x3 End Gateway structure centered at
@@ -340,10 +344,9 @@ func PlaceEndGatewayStructure(cache *world.Cache, ox, oy, oz int) []world.BlockC
 	if !ok {
 		gatewayState = world.StateBedrock
 	}
-	var changes []world.BlockChange
+	var pending []world.BlockChange
 	setB := func(x, y, z int, st uint16) {
-		cache.SetBlock(x, y, z, st)
-		changes = append(changes, world.BlockChange{
+		pending = append(pending, world.BlockChange{
 			Pos:      world.BlockPos{X: x, Y: y, Z: z},
 			NewState: st,
 		})
@@ -370,7 +373,7 @@ func PlaceEndGatewayStructure(cache *world.Cache, ox, oy, oz int) []world.BlockC
 			}
 		}
 	}
-	return changes
+	return cache.SetBlocksBatch(pending)
 }
 
 // StartEndDragonFight initializes the EndDragonFight in minecraft:the_end if not
@@ -401,8 +404,9 @@ func (s *Server) StartEndDragonFight() (int32, error) {
 		s.broadcastDimensionBlockChanges(world.DimensionEnd, cache, changes, nil)
 	}
 
-	// Spawn 10 End Crystals on top of the obsidian pillars from world.EndSpikesForSeed.
-	s.SpawnEndSpikeCrystals()
+	// Register the 10 End Crystals on top of the obsidian pillars from world.EndSpikesForSeed
+	// (matching vanilla EnderDragonFight initial start where EndSpikeFeature already generated the pillars).
+	s.spawnEndSpikeCrystalEntities()
 
 	// Spawn the Ender Dragon above the exit portal.
 	return s.SpawnEnderDragon(0.5, float64(portalY)+24.0, 0.5)
@@ -410,14 +414,29 @@ func (s *Server) StartEndDragonFight() (int32, error) {
 
 // SpawnEndSpikeCrystals spawns (or respawns) the 10 End Crystals on top of the
 // obsidian pillars returned by world.EndSpikesForSeed(s.cfg.WorldSeed) in
-// minecraft:the_end.
+// minecraft:the_end, repairing any missing spike-top blocks without redundant
+// SetBlockWithLight updates on already-intact worldgen spikes.
 func (s *Server) SpawnEndSpikeCrystals() []int32 {
 	if s == nil || s.entities == nil {
 		return nil
 	}
 	spikes := world.EndSpikesForSeed(s.cfg.WorldSeed)
-	cache := s.DimensionChunks(world.DimensionEnd)
-	fireState, hasFire := world.BlockStateByName("minecraft:fire", nil)
+	if cache := s.DimensionChunks(world.DimensionEnd); cache != nil {
+		for _, sp := range spikes {
+			changes := RebuildEndSpikeTop(cache, sp)
+			if len(changes) > 0 {
+				s.broadcastDimensionBlockChanges(world.DimensionEnd, cache, changes, nil)
+			}
+		}
+	}
+	return s.spawnEndSpikeCrystalEntities()
+}
+
+func (s *Server) spawnEndSpikeCrystalEntities() []int32 {
+	if s == nil || s.entities == nil {
+		return nil
+	}
+	spikes := world.EndSpikesForSeed(s.cfg.WorldSeed)
 
 	// Remove any existing spike crystals before spawning fresh ones.
 	mgr := s.dragonManager()
@@ -432,13 +451,6 @@ func (s *Server) SpawnEndSpikeCrystals() []int32 {
 
 	ids := make([]int32, 0, len(spikes))
 	for i, sp := range spikes {
-		if cache != nil {
-			RebuildEndSpikeTop(cache, sp)
-			cache.SetBlock(sp.CenterX, sp.Height, sp.CenterZ, world.StateBedrock)
-			if hasFire {
-				cache.SetBlock(sp.CenterX, sp.Height+1, sp.CenterZ, fireState)
-			}
-		}
 		x := float64(sp.CenterX) + 0.5
 		y := float64(sp.Height + 1)
 		z := float64(sp.CenterZ) + 0.5
@@ -1230,28 +1242,149 @@ func (s *Server) TryCollectDragonBreath(session *PlayerSession) bool {
 	return true
 }
 
+func hasActiveExitPortal2612(cache *world.Cache) (portalY int, found bool) {
+	if cache == nil {
+		return 0, false
+	}
+	offsets := [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}
+	for y := 100; y >= 40; y-- {
+		for _, off := range offsets {
+			if world.BlockName(cache.GetBlock(off[0], y, off[1])) == EndPortalBlockID {
+				return y, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (s *Server) findExistingEnderDragonEntity2612() *world.Entity {
+	if s == nil || s.entities == nil {
+		return nil
+	}
+	for _, ent := range s.entities.AppendAll(nil) {
+		if canonicalResourceName(ent.TypeName) == MobTypeEnderDragon &&
+			ent.EffectiveDimension() == world.DimensionEnd {
+			cp := ent
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (s *Server) attachExistingEnderDragon2612(ent *world.Entity, previouslyKilled bool, portalY int) {
+	if s == nil || ent == nil {
+		return
+	}
+	hp := s.MobHealth(ent.ID)
+	if hp <= 0 {
+		hp = DefaultEnderDragonMaxHealth
+		s.SetMobHealth(ent.ID, hp)
+	}
+	bar := s.CreateEntityBossBar(
+		ent.ID,
+		ChatComponent{Translate: "entity.minecraft.ender_dragon"},
+		BossBarColorPink,
+		BossBarOverlayProgress,
+		false,
+		true,
+		true,
+	)
+	s.UpdateRuntimeBossBarHealth(bar.UUID, hp, DefaultEnderDragonMaxHealth)
+	s.SyncRuntimeBossBarPlayersInRange(bar.UUID, world.DimensionEnd, 0, 128, 0, EnderDragonBossBarRange)
+
+	mgr := s.dragonManager()
+	mgr.mu.Lock()
+	if portalY > 0 {
+		mgr.fight.PortalY = portalY
+	} else if mgr.fight.PortalY <= 0 {
+		mgr.fight.PortalY = s.ResolveEndPortalY()
+	}
+	mgr.fight.Initialized = true
+	mgr.fight.DragonEntityID = ent.ID
+	mgr.fight.DragonAlive = true
+	mgr.fight.DragonKilled = false
+	if previouslyKilled {
+		mgr.fight.PreviouslyKilled = true
+	}
+	mgr.fight.Health = hp
+	mgr.fight.MaxHealth = DefaultEnderDragonMaxHealth
+	mgr.fight.BossBarUUID = bar.UUID
+	mgr.mu.Unlock()
+}
+
 // TickEnderDragons steps the EndDragonFight manager, active Ender Dragon phase
 // machine, End Crystal healing beam, Dragon Fireballs, and Dragon's Breath clouds
-// by one game tick (20 TPS).
+// by one game tick (20 TPS), matching `EnderDragonFight.tick()` & `scanState()` in 26.1.2.
 func (s *Server) TickEnderDragons(rng *rand.Rand) {
 	if s == nil || s.entities == nil {
 		return
 	}
-	// Auto-start the End Dragon fight when a player enters minecraft:the_end for the first time.
 	mgr := s.dragonManager()
 	mgr.mu.RLock()
 	initDone := mgr.fight.Initialized
 	alive := mgr.fight.DragonAlive
+	killed := mgr.fight.DragonKilled
 	respawning := mgr.fight.Respawning
+	portalY := mgr.fight.PortalY
 	mgr.mu.RUnlock()
 
-	if !initDone {
-		for _, p := range s.onlinePlayersSnapshot() {
-			if p != nil && !p.IsDead() && world.NormalizeDimension(p.Snapshot().Dimension) == world.DimensionEnd {
-				_, _ = s.StartEndDragonFight()
-				break
-			}
+	hasPlayerInEnd := false
+	for _, p := range s.onlinePlayersSnapshot() {
+		if p != nil && !p.IsDead() && world.NormalizeDimension(p.Snapshot().Dimension) == world.DimensionEnd {
+			hasPlayerInEnd = true
+			break
 		}
+	}
+
+	if !initDone && hasPlayerInEnd {
+		// Vanilla `EnderDragonFight.scanState()`: check if an active Exit Portal already exists
+		// before starting a fresh fight so legacy/untracked killed-dragon worlds keep their portal!
+		endCache := s.DimensionChunks(world.DimensionEnd)
+		if foundY, hasActivePortal := hasActiveExitPortal2612(endCache); hasActivePortal {
+			if existing := s.findExistingEnderDragonEntity2612(); existing != nil {
+				s.attachExistingEnderDragon2612(existing, true, foundY)
+			} else {
+				mgr.mu.Lock()
+				mgr.fight.Initialized = true
+				mgr.fight.PreviouslyKilled = true
+				mgr.fight.DragonKilled = true
+				mgr.fight.DragonAlive = false
+				mgr.fight.DragonEntityID = 0
+				mgr.fight.PortalY = foundY
+				mgr.mu.Unlock()
+				_ = s.SaveDragonFightFile()
+			}
+		} else {
+			_, _ = s.StartEndDragonFight()
+		}
+		mgr.mu.RLock()
+		alive = mgr.fight.DragonAlive
+		respawning = mgr.fight.Respawning
+		mgr.mu.RUnlock()
+	} else if initDone && !killed && !alive && !respawning && hasPlayerInEnd {
+		// Vanilla `EnderDragonFight.tick()` -> `findOrCreateDragon()` when restarting mid-fight (`dragonKilled == false`).
+		if existing := s.findExistingEnderDragonEntity2612(); existing != nil {
+			s.attachExistingEnderDragon2612(existing, false, portalY)
+		} else {
+			if portalY <= 0 {
+				portalY = s.ResolveEndPortalY()
+			}
+			if endCache := s.DimensionChunks(world.DimensionEnd); endCache != nil {
+				if _, hasActive := hasActiveExitPortal2612(endCache); !hasActive {
+					changes := PlaceEndPodium(endCache, portalY, false, false)
+					if len(changes) > 0 {
+						s.broadcastDimensionBlockChanges(world.DimensionEnd, endCache, changes, nil)
+					}
+				}
+			}
+			if len(s.EndCrystalsInDimension(world.DimensionEnd)) == 0 {
+				s.spawnEndSpikeCrystalEntities()
+			}
+			_, _ = s.SpawnEnderDragon(0.5, float64(portalY)+24.0, 0.5)
+		}
+		mgr.mu.RLock()
+		alive = mgr.fight.DragonAlive
+		mgr.mu.RUnlock()
 	}
 
 	if respawning {
@@ -1699,12 +1832,17 @@ func (s *Server) dragonFightFilePath() string {
 	return filepath.Join(s.cfg.WorldDir, "data", "end_dragon_fight.dat")
 }
 
-// SaveDragonFightToNBT serializes the EndDragonFight state into an NBT compound.
+// SaveDragonFightToNBT serializes the EndDragonFight state into an NBT compound,
+// writing both RegionIO's `DragonFight` keys and vanilla 26.1.2 `EnderDragonFight.CODEC`
+// keys (`needs_state_scanning`, `dragon_killed`, `previously_killed`, `exit_portal_location`).
 func (s *Server) SaveDragonFightToNBT() *nbt.Compound {
 	st := s.GetEnderDragonFightState()
 	root := nbt.NewCompound()
 	root.Set("DataVersion", nbt.Int(mapDataVersion26_1_2))
-	var killedByte, prevKilledByte byte
+	var needsScanByte, killedByte, prevKilledByte byte
+	if !st.Initialized {
+		needsScanByte = 1
+	}
 	if st.DragonKilled {
 		killedByte = 1
 	}
@@ -1712,48 +1850,129 @@ func (s *Server) SaveDragonFightToNBT() *nbt.Compound {
 		prevKilledByte = 1
 	}
 	fightTag := nbt.NewCompound().
+		Set("NeedsStateScanning", nbt.Byte(needsScanByte)).
 		Set("DragonKilled", nbt.Byte(killedByte)).
 		Set("PreviouslyKilled", nbt.Byte(prevKilledByte)).
 		Set("PortalY", nbt.Int(int32(st.PortalY))).
-		Set("GatewaysSpawned", nbt.Int(int32(st.GatewaysSpawned)))
+		Set("GatewaysSpawned", nbt.Int(int32(st.GatewaysSpawned))).
+		Set("needs_state_scanning", nbt.Byte(needsScanByte)).
+		Set("dragon_killed", nbt.Byte(killedByte)).
+		Set("previously_killed", nbt.Byte(prevKilledByte))
+	if st.PortalY > 0 {
+		fightTag.Set("exit_portal_location", nbt.IntArray{0, int32(st.PortalY), 0})
+	}
 	root.Set("DragonFight", fightTag)
 	return root
 }
 
-// LoadDragonFightFromNBT restores the EndDragonFight state from an NBT compound.
+func readDragonFightNBTBool2612(comp *nbt.Compound, keys ...string) (val bool, ok bool) {
+	for _, k := range keys {
+		t, exists := comp.Get(k)
+		if !exists {
+			continue
+		}
+		switch v := t.(type) {
+		case nbt.Byte:
+			return v != 0, true
+		case nbt.Int:
+			return v != 0, true
+		}
+	}
+	return false, false
+}
+
+// LoadDragonFightFromNBT restores the EndDragonFight state from an NBT compound
+// (`DragonFight` or vanilla 26.1.2 `data` compound), ensuring `fight.Initialized`
+// (`!needs_state_scanning`) is restored so restarting with `DragonKilled=true`
+// or `PreviouslyKilled=true` never restarts the fight or wipes the active exit portal!
 func (s *Server) LoadDragonFightFromNBT(root *nbt.Compound) {
 	if s == nil || root == nil {
 		return
 	}
-	tag, ok := root.Get("DragonFight")
-	if !ok {
+	var comp *nbt.Compound
+	if tag, ok := root.Get("DragonFight"); ok {
+		comp, _ = tag.(*nbt.Compound)
+	}
+	if comp == nil {
+		if tag, ok := root.Get("data"); ok {
+			comp, _ = tag.(*nbt.Compound)
+		}
+	}
+	if comp == nil {
+		if _, ok := root.Get("DragonKilled"); ok {
+			comp = root
+		} else if _, ok := root.Get("dragon_killed"); ok {
+			comp = root
+		} else if _, ok := root.Get("NeedsStateScanning"); ok {
+			comp = root
+		} else if _, ok := root.Get("needs_state_scanning"); ok {
+			comp = root
+		}
+	}
+	if comp == nil {
 		return
 	}
-	comp, ok := tag.(*nbt.Compound)
-	if !ok || comp == nil {
-		return
-	}
+
 	mgr := s.dragonManager()
 	mgr.mu.Lock()
-	if b, ok := comp.Get("DragonKilled"); ok {
-		if v, ok := b.(nbt.Byte); ok {
-			mgr.fight.DragonKilled = v != 0
-		}
+	if killed, ok := readDragonFightNBTBool2612(comp, "DragonKilled", "dragon_killed"); ok {
+		mgr.fight.DragonKilled = killed
 	}
-	if b, ok := comp.Get("PreviouslyKilled"); ok {
-		if v, ok := b.(nbt.Byte); ok {
-			mgr.fight.PreviouslyKilled = v != 0
-		}
+	if prevKilled, ok := readDragonFightNBTBool2612(comp, "PreviouslyKilled", "previously_killed"); ok {
+		mgr.fight.PreviouslyKilled = prevKilled
 	}
 	if p, ok := comp.Get("PortalY"); ok {
 		if v, ok := p.(nbt.Int); ok && v > 0 {
 			mgr.fight.PortalY = int(v)
+		}
+	} else if loc, ok := comp.Get("exit_portal_location"); ok {
+		switch lv := loc.(type) {
+		case nbt.IntArray:
+			if len(lv) >= 3 && lv[1] > 0 {
+				mgr.fight.PortalY = int(lv[1])
+			}
+		case *nbt.Compound:
+			if yTag, ok := lv.Get("Y"); ok {
+				if yInt, ok := yTag.(nbt.Int); ok && yInt > 0 {
+					mgr.fight.PortalY = int(yInt)
+				}
+			}
 		}
 	}
 	if g, ok := comp.Get("GatewaysSpawned"); ok {
 		if v, ok := g.(nbt.Int); ok && v >= 0 {
 			mgr.fight.GatewaysSpawned = int(v)
 		}
+	} else if gw, ok := comp.Get("gateways"); ok {
+		rem := -1
+		switch gv := gw.(type) {
+		case nbt.List:
+			rem = len(gv.Elems)
+		case *nbt.List:
+			if gv != nil {
+				rem = len(gv.Elems)
+			}
+		case nbt.IntArray:
+			rem = len(gv)
+		}
+		if rem >= 0 && rem <= EnderDragonMaxGateways {
+			mgr.fight.GatewaysSpawned = EnderDragonMaxGateways - rem
+		}
+	}
+
+	if needsScan, hasNeedsScan := readDragonFightNBTBool2612(comp, "NeedsStateScanning", "needs_state_scanning"); hasNeedsScan {
+		mgr.fight.Initialized = !needsScan
+	}
+	if mgr.fight.DragonKilled || mgr.fight.PreviouslyKilled || mgr.fight.GatewaysSpawned > 0 {
+		mgr.fight.Initialized = true
+	}
+	if mgr.fight.DragonKilled {
+		mgr.fight.DragonAlive = false
+		mgr.fight.DragonEntityID = 0
+		mgr.fight.Health = 0
+		mgr.fight.Respawning = false
+		mgr.fight.RespawnTicks = 0
+		mgr.fight.RespawnCrystalIDs = nil
 	}
 	mgr.mu.Unlock()
 }
