@@ -69,7 +69,7 @@ const (
 	HoglinAttackDamage    = float32(6.0)
 	HoglinBabyAttackDmg   = float32(0.5)
 	HoglinFlingVelocityY  = 0.40
-	HoglinRepellentRadius = 7
+	HoglinRepellentRadius = 8
 
 	ZoglinChaseSpeed   = 0.17
 	ZoglinAttackDamage = float32(6.0)
@@ -109,8 +109,8 @@ const (
 	EntityDataStriderSuffocatingID byte = 18 // Strider.DATA_SUFFOCATING (BOOLEAN serializer 8 — shivering outside lava)
 	EntityDataStriderSaddleID      byte = 19 // Strider.DATA_SADDLE_ID (BOOLEAN serializer 8)
 
-	// Total weight of vanilla 26.1.2 gameplay/piglin_bartering loot table.
-	PiglinBarterTotalWeight = 459
+	// Total weight of vanilla 26.1.2 gameplay/piglin_bartering loot table (19 entries).
+	PiglinBarterTotalWeight = 469
 
 	// Canonical sound effects for Piglin, Piglin Brute, Hoglin, Zoglin, and Strider.
 	SoundPiglinAdmiringItem           = "minecraft:entity.piglin.admiring_item"
@@ -145,7 +145,7 @@ const (
 )
 
 // PiglinBarterEntry describes one weighted entry in the vanilla 26.1.2
-// `gameplay/piglin_bartering` loot table (total weight = 459 across 18 entries).
+// `gameplay/piglin_bartering` loot table (total weight = 469 across 19 entries).
 type PiglinBarterEntry struct {
 	ItemID        string
 	Weight        int
@@ -166,6 +166,7 @@ var vanillaPiglinBarterTable = []PiglinBarterEntry{
 	{ItemID: "minecraft:potion", Weight: 10, MinCount: 1, MaxCount: 1, WaterBottle: true},
 	{ItemID: "minecraft:iron_nugget", Weight: 10, MinCount: 10, MaxCount: 36},
 	{ItemID: "minecraft:ender_pearl", Weight: 10, MinCount: 2, MaxCount: 4},
+	{ItemID: "minecraft:dried_ghast", Weight: 10, MinCount: 1, MaxCount: 1},
 	{ItemID: "minecraft:string", Weight: 20, MinCount: 3, MaxCount: 9},
 	{ItemID: "minecraft:quartz", Weight: 20, MinCount: 5, MaxCount: 12},
 	{ItemID: "minecraft:obsidian", Weight: 40, MinCount: 1, MaxCount: 1},
@@ -179,8 +180,8 @@ var vanillaPiglinBarterTable = []PiglinBarterEntry{
 	{ItemID: "minecraft:blackstone", Weight: 40, MinCount: 8, MaxCount: 16},
 }
 
-// PiglinBarterLootTable returns a copy of the 18-entry vanilla 26.1.2
-// `gameplay/piglin_bartering` loot table (total weight 459).
+// PiglinBarterLootTable returns a copy of the 19-entry vanilla 26.1.2
+// `gameplay/piglin_bartering` loot table (total weight 469).
 func PiglinBarterLootTable() []PiglinBarterEntry {
 	out := make([]PiglinBarterEntry, len(vanillaPiglinBarterTable))
 	copy(out, vanillaPiglinBarterTable)
@@ -266,14 +267,19 @@ type PiglinState struct {
 	Baby                  bool
 	ImmuneToZombification bool
 	TimeInOverworld       int
+	Shaking               bool
 	ChargingCrossbow      bool
 	CrossbowChargeTicks   int
+	CrossbowHoldTicks     int
 	Dancing               bool
 	DanceTicks            int
 	MainHandItem          world.ItemStack
 	OffHandItem           world.ItemStack
 	Inventory             []world.ItemStack
 	AdmireTicks           int
+	AdmiringDisabledTicks int
+	BabyAvoidTicks        int
+	BabyAvoidPlayer       *PlayerSession
 	Bartering             bool
 	BarterPlayer          *PlayerSession
 	AngerTarget           *PlayerSession
@@ -317,6 +323,7 @@ type HoglinState struct {
 	TargetPlayer          *PlayerSession
 	TargetMobID           int32
 	AttackCooldown        int
+	AttackAnimationTicks  int
 	RiderEntityIDs        []int32
 }
 
@@ -432,21 +439,23 @@ func IsPlayerWearingGoldArmor(session *PlayerSession) bool {
 }
 
 // IsPiglinLovedGoldItem reports whether itemID belongs to `#minecraft:piglin_loved`
-// (items that attract piglins and distract them on pickup).
+// in Minecraft 26.1.2 (`data/minecraft/tags/item/piglin_loved.json`).
 func IsPiglinLovedGoldItem(itemID string) bool {
 	switch canonicalResourceName(itemID) {
 	case "minecraft:gold_ingot", "minecraft:gold_block", "minecraft:raw_gold",
-		"minecraft:raw_gold_block", "minecraft:gold_nugget", "minecraft:gold_ore",
+		"minecraft:raw_gold_block", "minecraft:gold_ore",
 		"minecraft:deepslate_gold_ore", "minecraft:nether_gold_ore",
 		"minecraft:gilded_blackstone", "minecraft:golden_apple",
 		"minecraft:enchanted_golden_apple", "minecraft:golden_carrot",
 		"minecraft:glistering_melon_slice", "minecraft:golden_helmet",
 		"minecraft:golden_chestplate", "minecraft:golden_leggings",
 		"minecraft:golden_boots", "minecraft:golden_sword",
-		"minecraft:golden_pickaxe", "minecraft:golden_axe",
-		"minecraft:golden_shovel", "minecraft:golden_hoe",
-		"minecraft:golden_horse_armor", "minecraft:light_weighted_pressure_plate",
-		"minecraft:bell", "minecraft:clock":
+		"minecraft:golden_spear", "minecraft:golden_pickaxe",
+		"minecraft:golden_axe", "minecraft:golden_shovel",
+		"minecraft:golden_hoe", "minecraft:golden_horse_armor",
+		"minecraft:golden_nautilus_armor", "minecraft:golden_dandelion",
+		"minecraft:light_weighted_pressure_plate", "minecraft:bell",
+		"minecraft:clock":
 		return true
 	default:
 		return false
@@ -484,10 +493,10 @@ func IsPiglinRepellentBlock(blockName string) bool {
 	}
 }
 
-// HasPiglinRepellentNear checks whether any `#minecraft:piglin_repellents` block
-// (`soul_fire`, `soul_torch`, `soul_lantern`, `soul_campfire`) or any
-// `minecraft:zombified_piglin` / `minecraft:zoglin` entity is within `radius`
-// (default 8) of (x, y, z) in dimension.
+// HasPiglinRepellentNear checks whether any valid `#minecraft:piglin_repellents`
+// block (`BlockPos.findClosestMatch(..., radius, 4, isValidRepellent)`: `soul_fire`,
+// `soul_torch`, `soul_wall_torch`, `soul_lantern`, or lit `soul_campfire[lit=true]`)
+// or any `minecraft:zombified_piglin` / `minecraft:zoglin` entity is near (x, y, z).
 func (s *Server) HasPiglinRepellentNear(dimension string, x, y, z float64, radius int) (rx, ry, rz float64, found bool) {
 	if s == nil {
 		return 0, 0, 0, false
@@ -497,11 +506,11 @@ func (s *Server) HasPiglinRepellentNear(dimension string, x, y, z float64, radiu
 	}
 	normDim := world.NormalizeDimension(dimension)
 	cache := s.DimensionChunks(normDim)
-	bestDistSq := float64(radius*radius) + 1.0
+	bestDistSq := 1e18
 
 	if cache != nil {
 		cx, cy, cz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
-		for dy := -3; dy <= 3; dy++ {
+		for dy := -PiglinRepellentRangeV2612; dy <= PiglinRepellentRangeV2612; dy++ {
 			by := cy + dy
 			if by < world.MinY || by >= world.MinY+world.WorldHeight {
 				continue
@@ -510,12 +519,12 @@ func (s *Server) HasPiglinRepellentNear(dimension string, x, y, z float64, radiu
 				bx := cx + dx
 				for dz := -radius; dz <= radius; dz++ {
 					bz := cz + dz
-					if !IsPiglinRepellentBlock(world.BlockName(cache.GetBlock(bx, by, bz))) {
+					if !IsValidPiglinRepellentState2612(cache.GetBlock(bx, by, bz)) {
 						continue
 					}
 					fx, fy, fz := float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5
 					dSq := (fx-x)*(fx-x) + (fy-y)*(fy-y) + (fz-z)*(fz-z)
-					if dSq <= float64(radius*radius) && dSq < bestDistSq {
+					if dSq < bestDistSq {
 						bestDistSq = dSq
 						rx, ry, rz = fx, fy, fz
 						found = true
@@ -527,7 +536,11 @@ func (s *Server) HasPiglinRepellentNear(dimension string, x, y, z float64, radiu
 
 	if s.entities != nil {
 		allEnts := s.entities.AppendAll(nil)
-		maxDistSq := float64(radius * radius)
+		entRadius := float64(radius)
+		if radius == PiglinRepellentRadius {
+			entRadius = PiglinZombifiedAvoidDist2612 // `PiglinAi.isNearZombified`: 6.0 blocks
+		}
+		maxDistSq := entRadius * entRadius
 		for i := range allEnts {
 			ent := &allEnts[i]
 			if ent.EffectiveDimension() != normDim {
@@ -1270,9 +1283,10 @@ func (s *Server) TryBabyPiglinMountBabyHoglin(babyPiglinID int32) (hoglinID int3
 }
 
 // ZombifyPiglin converts a `minecraft:piglin` or `minecraft:piglin_brute` into a
-// `minecraft:zombified_piglin` at the same position, preserving baby state and
-// main-hand weapon (`golden_sword`, `crossbow`, `golden_axe`) and applying
-// Nausea (`200` ticks) per vanilla `AbstractPiglin.finishConversion`.
+// `minecraft:zombified_piglin` at the same position, preserving baby state,
+// armor, main-hand weapon, CustomName, and PersistenceRequired, dropping any
+// admired offhand item and pocket inventory on the ground, and applying Nausea
+// (`200` ticks) per vanilla `Piglin.finishConversion` + `ConversionType.SINGLE`.
 func (s *Server) ZombifyPiglin(entityID int32) (zombifiedID int32, ok bool) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return 0, false
@@ -1290,6 +1304,30 @@ func (s *Server) ZombifyPiglin(entityID int32) (zombifiedID int32, ok bool) {
 	x, y, z := ent.X, ent.Y, ent.Z
 	yaw, pitch := ent.Yaw, ent.Pitch
 	cp := ent.ChunkPos()
+
+	customName := s.GetMobCustomName2612(entityID)
+	persist := s.IsMobPersistenceRequired2612(entityID)
+	var savedArmor [4]world.ItemStack
+	armorSlots := [4]int{EquipmentSlotFeet, EquipmentSlotLegs, EquipmentSlotChest, EquipmentSlotHead}
+	for i, slot := range armorSlots {
+		savedArmor[i] = s.MobEquipment(entityID, slot)
+		if !savedArmor[i].IsEmpty() {
+			s.SetMobEquipment(entityID, slot, world.ItemStack{})
+		}
+	}
+
+	// `Piglin.finishConversion`: `cancelAdmiring` drops any admired offhand item,
+	// and `inventory.removeAllItems()` drops all pocketed items at the Piglin's position!
+	if norm == MobTypePiglin {
+		if !ps.OffHandItem.IsEmpty() {
+			s.SpawnItemEntityInDimension(dim, x, y+0.25, z, ps.OffHandItem)
+		}
+		for _, invStack := range ps.Inventory {
+			if !invStack.IsEmpty() {
+				s.SpawnItemEntityInDimension(dim, x, y+0.25, z, invStack)
+			}
+		}
+	}
 
 	nm := s.netherMobs()
 	nm.mu.Lock()
@@ -1333,9 +1371,6 @@ func (s *Server) ZombifyPiglin(entityID int32) (zombifiedID int32, ok bool) {
 	tr.mu.Unlock()
 
 	weapon := ps.MainHandItem
-	if weapon.IsEmpty() && !ps.Baby {
-		weapon = world.NewNamedItemStack("minecraft:golden_sword", 1)
-	}
 	nm.mu.Lock()
 	nm.zombifiedPiglins[zombifiedID] = &ZombifiedPiglinState{
 		EntityID:     zombifiedID,
@@ -1344,6 +1379,21 @@ func (s *Server) ZombifyPiglin(entityID int32) (zombifiedID int32, ok bool) {
 		MainHandItem: weapon,
 	}
 	nm.mu.Unlock()
+
+	if customName != "" {
+		s.SetMobCustomName2612(zombifiedID, customName)
+	}
+	if persist {
+		s.SetMobPersistenceRequired2612(zombifiedID, true)
+	}
+	if !weapon.IsEmpty() {
+		s.SetMobEquipment(zombifiedID, EquipmentSlotMainHand, weapon)
+	}
+	for i, slot := range armorSlots {
+		if !savedArmor[i].IsEmpty() {
+			s.SetMobEquipment(zombifiedID, slot, savedArmor[i])
+		}
+	}
 
 	if zEnt := s.entities.Get(zombifiedID); zEnt != nil {
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, zEnt))
@@ -1365,9 +1415,11 @@ func (s *Server) ZombifyPiglin(entityID int32) (zombifiedID int32, ok bool) {
 	return zombifiedID, true
 }
 
-// StartPiglinBartering starts a piglin bartering (or admiring a gold item) for
-// `PiglinBarterAdmireTicks` (120 ticks = 6s). Only adult `minecraft:piglin` can
-// barter `minecraft:gold_ingot`; `minecraft:piglin_brute` never barters.
+// StartPiglinBartering starts a piglin bartering (or admiring a `#piglin_loved`
+// item) for `PiglinBarterAdmireTicks` (120 ticks = 6s). Only adult `minecraft:piglin`
+// barters `minecraft:gold_ingot` (`Bartering = true`); baby piglins also pick up
+// and admire `#piglin_loved` items (including dropped `gold_ingot`) in offhand
+// without rolling barter loot.
 func (s *Server) StartPiglinBartering(entityID int32, player *PlayerSession, itemStack world.ItemStack) bool {
 	if s == nil || s.entities == nil || entityID <= 0 || itemStack.IsEmpty() {
 		return false
@@ -1383,24 +1435,26 @@ func (s *Server) StartPiglinBartering(entityID int32, player *PlayerSession, ite
 	ps := s.ensurePiglinState(entityID)
 	nm := s.netherMobs()
 	nm.mu.Lock()
-	if ps.Baby || s.IsMobBaby(entityID) {
-		if itemID != "minecraft:gold_ingot" && ps.OffHandItem.IsEmpty() {
-			ps.OffHandItem = world.NewItemStack(itemStack.ResolvedItemID(), 1)
-			ps.AdmireTicks = PiglinBarterAdmireTicks
-			mainH := ps.MainHandItem
-			offH := ps.OffHandItem
-			nm.mu.Unlock()
-			cp := ent.ChunkPos()
-			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEquipment,
-				EncodePiglinEquipmentPacket(entityID, mainH, offH))
-			return true
-		}
+	if ps.AdmiringDisabledTicks > 0 && (player != nil || ps.AngerTarget != nil || ps.AngerMobID != 0) {
 		nm.mu.Unlock()
 		return false
 	}
-	if !ps.OffHandItem.IsEmpty() && ps.AdmireTicks > 0 {
+	if !ps.OffHandItem.IsEmpty() {
 		nm.mu.Unlock()
 		return false
+	}
+	if ps.Baby || s.IsMobBaby(entityID) {
+		ps.OffHandItem = world.NewItemStack(itemStack.ResolvedItemID(), 1)
+		ps.AdmireTicks = PiglinBarterAdmireTicks
+		ps.Bartering = false
+		ps.BarterPlayer = nil
+		mainH := ps.MainHandItem
+		offH := ps.OffHandItem
+		nm.mu.Unlock()
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEquipment,
+			EncodePiglinEquipmentPacket(entityID, mainH, offH))
+		return true
 	}
 	wasAngryAtPlayer := player != nil && (ps.AngerTarget == player || !IsPlayerWearingGoldArmor(player))
 	ps.OffHandItem = world.NewItemStack(itemStack.ResolvedItemID(), 1)
@@ -1429,10 +1483,10 @@ func (s *Server) StartPiglinBartering(entityID int32, player *PlayerSession, ite
 	return true
 }
 
-// CompletePiglinBarter finishes an active piglin barter (or forces immediate
+// CompletePiglinBarter finishes an active adult piglin barter (or forces immediate
 // completion), consuming the held `minecraft:gold_ingot`, rolling an item from
-// `gameplay/piglin_bartering`, and spawning the bartered item entity in the world
-// (tossed toward the bartering player if present).
+// `gameplay/piglin_bartering`, and throwing the item entity via exact vanilla
+// `PiglinAi.throwItems` + `BehaviorUtils.throwItem` (`getEyeY() - 0.3F`, speed `0.3`).
 func (s *Server) CompletePiglinBarter(entityID int32, rng *rand.Rand) (barteredStack world.ItemStack, barteredMeta ItemMeta, droppedEntityID int32, ok bool) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return world.ItemStack{}, ItemMeta{}, 0, false
@@ -1444,7 +1498,7 @@ func (s *Server) CompletePiglinBarter(entityID int32, rng *rand.Rand) (barteredS
 	ps := s.ensurePiglinState(entityID)
 	nm := s.netherMobs()
 	nm.mu.Lock()
-	if !ps.Bartering && canonicalResourceName(ps.OffHandItem.ResolvedID()) != "minecraft:gold_ingot" {
+	if ps.Baby || (!ps.Bartering && canonicalResourceName(ps.OffHandItem.ResolvedID()) != "minecraft:gold_ingot") {
 		nm.mu.Unlock()
 		return world.ItemStack{}, ItemMeta{}, 0, false
 	}
@@ -1457,33 +1511,67 @@ func (s *Server) CompletePiglinBarter(entityID int32, rng *rand.Rand) (barteredS
 	nm.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
+	cache := s.DimensionChunks(dim)
 	cp := ent.ChunkPos()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEquipment,
 		EncodePiglinEquipmentPacket(entityID, mainH, world.ItemStack{}))
 
-	barteredStack, barteredMeta, _ = RollPiglinBarterLoot(rng)
-	spawnX, spawnY, spawnZ := ent.X, ent.Y+0.6, ent.Z
-	droppedEntityID, _ = s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, barteredStack)
-	if droppedEntityID > 0 && barterPlayer != nil && !barterPlayer.IsDead() {
+	// Find `NEAREST_VISIBLE_PLAYER` within 16 blocks (preferring `barterPlayer` if visible & in range).
+	hasTargetPos := false
+	var targetX, targetY, targetZ float64
+	const maxPlayerSq = PiglinAggroRange * PiglinAggroRange
+	if barterPlayer != nil && !barterPlayer.IsDead() {
 		pSnap := barterPlayer.Snapshot()
-		dx := pSnap.X - ent.X
-		dz := pSnap.Z - ent.Z
-		dist := math.Hypot(dx, dz)
-		if dist > 1e-4 {
-			vx := (dx / dist) * 0.2
-			vz := (dz / dist) * 0.2
-			s.entities.Update(droppedEntityID, func(e *world.Entity) {
-				e.VelocityX = clampVelocityShort(vx)
-				e.VelocityY = clampVelocityShort(0.15)
-				e.VelocityZ = clampVelocityShort(vz)
-			})
+		if pSnap.GameMode != GameModeSpectator && world.NormalizeDimension(pSnap.Dimension) == dim {
+			dx, dy, dz := pSnap.X-ent.X, pSnap.Y-ent.Y, pSnap.Z-ent.Z
+			if dx*dx+dy*dy+dz*dz <= maxPlayerSq &&
+				hasColliderLineOfSight2612(cache, ent.X, ent.Y+PiglinEyeHeightAdult2612, ent.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z) {
+				hasTargetPos = true
+				targetX, targetY, targetZ = pSnap.X, pSnap.Y, pSnap.Z
+			}
 		}
+	}
+	if !hasTargetPos {
+		bestSq := maxPlayerSq + 1.0
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p == nil || p.IsDead() {
+				continue
+			}
+			pSnap := p.Snapshot()
+			if pSnap.GameMode == GameModeSpectator || world.NormalizeDimension(pSnap.Dimension) != dim {
+				continue
+			}
+			dx, dy, dz := pSnap.X-ent.X, pSnap.Y-ent.Y, pSnap.Z-ent.Z
+			dSq := dx*dx + dy*dy + dz*dz
+			if dSq <= maxPlayerSq && dSq < bestSq &&
+				hasColliderLineOfSight2612(cache, ent.X, ent.Y+PiglinEyeHeightAdult2612, ent.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z) {
+				bestSq = dSq
+				hasTargetPos = true
+				targetX, targetY, targetZ = pSnap.X, pSnap.Y, pSnap.Z
+			}
+		}
+	}
+
+	barteredStack, barteredMeta, _ = RollPiglinBarterLoot(rng)
+	spawnX, spawnY, spawnZ, vx, vy, vz := ComputePiglinThrowVelocity2612(
+		ent.X, ent.Y, ent.Z, PiglinEyeHeightAdult2612, hasTargetPos, targetX, targetY, targetZ, rng,
+	)
+	droppedEntityID, _ = s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, barteredStack)
+	if droppedEntityID > 0 {
+		s.entities.Update(droppedEntityID, func(e *world.Entity) {
+			e.PickupDelay = PiglinDefaultPickupDelayTicks2612
+			e.VelocityX = clampVelocityShort(vx)
+			e.VelocityY = clampVelocityShort(vy)
+			e.VelocityZ = clampVelocityShort(vz)
+		})
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityMotion,
+			EncodeSetEntityMotionPacket(droppedEntityID, vx, vy, vz))
 	}
 	return barteredStack, barteredMeta, droppedEntityID, droppedEntityID > 0
 }
 
-// InteractWithPiglin handles a player right-clicking a `minecraft:piglin` with
-// `minecraft:gold_ingot` to initiate bartering.
+// InteractWithPiglin handles a player right-clicking an adult `minecraft:piglin`
+// with `minecraft:gold_ingot` to initiate bartering (`PiglinAi.mobInteract` + `canAdmire`).
 func (s *Server) InteractWithPiglin(session *PlayerSession, entityID int32) bool {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return false
@@ -1496,6 +1584,10 @@ func (s *Server) InteractWithPiglin(session *PlayerSession, entityID int32) bool
 	if held.IsEmpty() || canonicalResourceName(held.ResolvedID()) != "minecraft:gold_ingot" {
 		return false
 	}
+	ps, ok := s.GetPiglinState(entityID)
+	if ok && (ps.Baby || s.IsMobBaby(entityID) || ps.AdmiringDisabledTicks > 0 || !ps.OffHandItem.IsEmpty() || ps.AdmireTicks > 0) {
+		return false
+	}
 	if !s.StartPiglinBartering(entityID, session, held) {
 		return false
 	}
@@ -1503,23 +1595,35 @@ func (s *Server) InteractWithPiglin(session *PlayerSession, entityID int32) bool
 	return true
 }
 
-// TryPiglinPickUpGoldItem attempts to make a piglin pick up a gold-related item
-// stack from the ground, starting bartering if it is `minecraft:gold_ingot`.
+// TryPiglinPickUpGoldItem attempts to make a piglin pick up a `#piglin_loved`
+// item (or `minecraft:gold_nugget`) stack from the ground.
 func (s *Server) TryPiglinPickUpGoldItem(entityID int32, stack world.ItemStack, thrower *PlayerSession) bool {
 	if s == nil || entityID <= 0 || stack.IsEmpty() {
 		return false
 	}
-	if !IsPiglinLovedGoldItem(stack.ResolvedID()) {
+	itemID := canonicalResourceName(stack.ResolvedID())
+	if itemID == "minecraft:gold_nugget" {
+		ent := s.entities.Get(entityID)
+		if ent == nil || canonicalResourceName(ent.TypeName) != MobTypePiglin {
+			return false
+		}
+		ps := s.ensurePiglinState(entityID)
+		nm := s.netherMobs()
+		nm.mu.Lock()
+		defer nm.mu.Unlock()
+		if len(ps.Inventory) >= PiglinInventorySlots {
+			return false
+		}
+		ps.Inventory = append(ps.Inventory, stack)
+		return true
+	}
+	if !IsPiglinLovedGoldItem(itemID) {
 		return false
 	}
 	return s.StartPiglinBartering(entityID, thrower, stack)
 }
 
-// NotifyPiglinsPlayerOpenedGuardedBlock alerts all adult piglins within 16 blocks
-// in dimension when a player opens a guarded container (chest, barrel, shulker_box,
-// ender_chest, trapped_chest) or breaks a gold block, making them angry at `player`
-// for `PiglinAngerDurationTicks` (600 ticks) even if wearing gold armor!
-func (s *Server) NotifyPiglinsPlayerOpenedGuardedBlock(dimension string, x, y, z int, player *PlayerSession) int {
+func (s *Server) angerNearbyPiglins2612(dimension string, x, y, z int, player *PlayerSession, requireVisibility bool) int {
 	if s == nil || s.entities == nil || player == nil || player.IsDead() {
 		return 0
 	}
@@ -1528,6 +1632,7 @@ func (s *Server) NotifyPiglinsPlayerOpenedGuardedBlock(dimension string, x, y, z
 		return 0
 	}
 	normDim := world.NormalizeDimension(dimension)
+	cache := s.DimensionChunks(normDim)
 	const maxDistSq = PiglinAggroRange * PiglinAggroRange
 	bx, by, bz := float64(x)+0.5, float64(y)+0.5, float64(z)+0.5
 	alerted := 0
@@ -1542,27 +1647,43 @@ func (s *Server) NotifyPiglinsPlayerOpenedGuardedBlock(dimension string, x, y, z
 		if ent == nil || ent.EffectiveDimension() != normDim {
 			continue
 		}
-		dx := ent.X - bx
-		dy := ent.Y - by
-		dz := ent.Z - bz
-		if dx*dx+dy*dy+dz*dz <= maxDistSq {
-			ps.AngerTarget = player
-			ps.AngerTicks = PiglinAngerDurationTicks
-			alerted++
+		dxP, dyP, dzP := ent.X-pSnap.X, ent.Y-pSnap.Y, ent.Z-pSnap.Z
+		dxB, dyB, dzB := ent.X-bx, ent.Y-by, ent.Z-bz
+		inRange := (dxP*dxP+dyP*dyP+dzP*dzP <= maxDistSq) || (dxB*dxB+dyB*dyB+dzB*dzB <= maxDistSq)
+		if !inRange {
+			continue
 		}
+		if requireVisibility && !hasColliderLineOfSight2612(cache, ent.X, ent.Y+PiglinEyeHeightAdult2612, ent.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z) {
+			continue
+		}
+		ps.AngerTarget = player
+		ps.AngerTicks = PiglinAngerDurationTicks
+		alerted++
 	}
 	nm.mu.Unlock()
 	return alerted
 }
 
-// NotifyPiglinsPlayerMinedGoldBlock is an alias for NotifyPiglinsPlayerOpenedGuardedBlock
-// when a player mines a gold-related block (`gold_block`, `nether_gold_ore`, `gilded_blackstone`, etc.).
-func (s *Server) NotifyPiglinsPlayerMinedGoldBlock(dimension string, x, y, z int, player *PlayerSession) int {
-	return s.NotifyPiglinsPlayerOpenedGuardedBlock(dimension, x, y, z, player)
+// NotifyPiglinsPlayerOpenedGuardedBlock implements `PiglinAi.angerNearbyPiglins(level, player, true)`
+// when a player opens a guarded container (`chest`, `trapped_chest`, `copper_chest`,
+// `barrel`, `shulker_box`, `ender_chest`), requiring line-of-sight (`BehaviorUtils.canSee`)
+// and angering visible adult Piglins/Brutes within 16 blocks for 600 ticks even through gold armor!
+func (s *Server) NotifyPiglinsPlayerOpenedGuardedBlock(dimension string, x, y, z int, player *PlayerSession) int {
+	return s.angerNearbyPiglins2612(dimension, x, y, z, player, true)
 }
 
-// OnPiglinOrBruteDamaged provokes the hit piglin/brute and alerts nearby adult
-// piglins and piglin brutes within 16 blocks to attack `attacker`.
+// NotifyPiglinsPlayerMinedGoldBlock implements `PiglinAi.angerNearbyPiglins(level, player, false)`
+// (`Block.playerWillDestroy`) when a player breaks a `#minecraft:guarded_by_piglins`
+// block — does NOT require line-of-sight!
+func (s *Server) NotifyPiglinsPlayerMinedGoldBlock(dimension string, x, y, z int, player *PlayerSession) int {
+	return s.angerNearbyPiglins2612(dimension, x, y, z, player, false)
+}
+
+// OnPiglinOrBruteDamaged implements `PiglinAi.wasHurtBy` / `PiglinBruteAi.wasHurtBy`:
+//   - Cancels admiring/dancing on the hurt Piglin (`stopHoldingOffHandItem(false)`),
+//     sets `ADMIRING_DISABLED = 400` ticks when hurt by a player, and makes baby
+//     Piglins flee for `100` ticks;
+//   - Alerts nearby adult Piglins and Piglin Brutes within 16 blocks (`600` ticks anger).
 func (s *Server) OnPiglinOrBruteDamaged(entityID int32, attacker *PlayerSession, attackerMobID int32) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return
@@ -1575,8 +1696,34 @@ func (s *Server) OnPiglinOrBruteDamaged(entityID int32, attacker *PlayerSession,
 	const maxDistSq = PiglinAggroRange * PiglinAggroRange
 	_ = s.ensurePiglinState(entityID)
 
+	var clearOffhandMain world.ItemStack
+	broadcastClearOffhand := false
+
 	nm := s.netherMobs()
 	nm.mu.Lock()
+	if selfPS, ok := nm.piglins[entityID]; ok && selfPS != nil && selfPS.TypeName == MobTypePiglin {
+		if !selfPS.OffHandItem.IsEmpty() {
+			offID := canonicalResourceName(selfPS.OffHandItem.ResolvedID())
+			if !selfPS.Baby && offID != "minecraft:gold_ingot" && len(selfPS.Inventory) < PiglinInventorySlots {
+				selfPS.Inventory = append(selfPS.Inventory, selfPS.OffHandItem)
+			}
+			selfPS.OffHandItem = world.ItemStack{}
+			clearOffhandMain = selfPS.MainHandItem
+			broadcastClearOffhand = true
+		}
+		selfPS.AdmireTicks = 0
+		selfPS.Bartering = false
+		selfPS.BarterPlayer = nil
+		selfPS.Dancing = false
+		selfPS.DanceTicks = 0
+		if attacker != nil {
+			selfPS.AdmiringDisabledTicks = PiglinAdmiringDisabledTicks2612
+		}
+		if selfPS.Baby {
+			selfPS.BabyAvoidTicks = PiglinBabyFleeHurtTicks2612
+			selfPS.BabyAvoidPlayer = attacker
+		}
+	}
 	for id, ps := range nm.piglins {
 		if ps == nil || ps.Baby {
 			continue
@@ -1595,6 +1742,12 @@ func (s *Server) OnPiglinOrBruteDamaged(entityID int32, attacker *PlayerSession,
 		}
 	}
 	nm.mu.Unlock()
+
+	if broadcastClearOffhand {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEquipment,
+			EncodePiglinEquipmentPacket(entityID, clearOffhandMain, world.ItemStack{}))
+	}
 }
 
 // OnPiglinOrBruteKilled cleans up state when a Piglin or Piglin Brute dies and
@@ -1899,7 +2052,8 @@ func (s *Server) SetHoglinImmuneToZombification(entityID int32, immune bool) boo
 }
 
 // ZombifyHoglin converts a `minecraft:hoglin` into a `minecraft:zoglin` at the
-// same position, preserving baby state and applying Nausea (`200` ticks).
+// same position, preserving baby state, yaw/pitch, CustomName, and PersistenceRequired,
+// and applying Nausea (`200` ticks).
 func (s *Server) ZombifyHoglin(entityID int32) (zoglinID int32, ok bool) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return 0, false
@@ -1912,7 +2066,10 @@ func (s *Server) ZombifyHoglin(entityID int32) (zoglinID int32, ok bool) {
 	baby := hs.Baby || s.IsMobBaby(entityID)
 	dim := ent.EffectiveDimension()
 	x, y, z := ent.X, ent.Y, ent.Z
+	yaw, pitch := ent.Yaw, ent.Pitch
 	cp := ent.ChunkPos()
+	customName := s.GetMobCustomName2612(entityID)
+	persist := s.IsMobPersistenceRequired2612(entityID)
 
 	nm := s.netherMobs()
 	nm.mu.Lock()
@@ -1931,6 +2088,17 @@ func (s *Server) ZombifyHoglin(entityID int32) (zoglinID int32, ok bool) {
 	zoglinID, err := s.SpawnZoglin(dim, x, y, z, baby)
 	if err != nil || zoglinID <= 0 {
 		return 0, false
+	}
+	s.entities.Update(zoglinID, func(e *world.Entity) {
+		e.Yaw = yaw
+		e.HeadYaw = yaw
+		e.Pitch = pitch
+	})
+	if customName != "" {
+		s.SetMobCustomName2612(zoglinID, customName)
+	}
+	if persist {
+		s.SetMobPersistenceRequired2612(zoglinID, true)
 	}
 	s.ApplyEntityEffectScaled(zoglinID, NewStatusEffectInstance(EffectNausea, 200, 0), 1.0)
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
@@ -2047,10 +2215,10 @@ func IsHoglinRepellentBlock(blockName string) bool {
 	}
 }
 
-// HasHoglinRepellentNear checks whether any hoglin repellent block
-// (`warped_fungus`, `potted_warped_fungus`, `nether_portal`, `respawn_anchor`)
-// or `minecraft:armor_stand` entity is within `radius` (default 7) of (x, y, z)
-// in dimension, returning the nearest repellent coordinates.
+// HasHoglinRepellentNear implements `HoglinSpecificSensor.findNearestRepellent`
+// (`BlockPos.findClosestMatch(blockPosition(), 8, 4, state -> state.is(HOGLIN_REPELLENTS))`),
+// checking `#minecraft:hoglin_repellents` (`warped_fungus`, `potted_warped_fungus`,
+// `nether_portal`, `respawn_anchor`) within `[-radius..+radius] x [-4..+4] x [-radius..+radius]`.
 func (s *Server) HasHoglinRepellentNear(dimension string, x, y, z float64, radius int) (rx, ry, rz float64, found bool) {
 	if s == nil {
 		return 0, 0, 0, false
@@ -2060,11 +2228,11 @@ func (s *Server) HasHoglinRepellentNear(dimension string, x, y, z float64, radiu
 	}
 	normDim := world.NormalizeDimension(dimension)
 	cache := s.DimensionChunks(normDim)
-	bestDistSq := float64(radius*radius) + 1.0
+	bestDistSq := 1e18
 
 	if cache != nil {
 		cx, cy, cz := int(math.Floor(x)), int(math.Floor(y)), int(math.Floor(z))
-		for dy := -3; dy <= 3; dy++ {
+		for dy := -HoglinRepellentRangeV2612; dy <= HoglinRepellentRangeV2612; dy++ {
 			by := cy + dy
 			if by < world.MinY || by >= world.MinY+world.WorldHeight {
 				continue
@@ -2078,7 +2246,7 @@ func (s *Server) HasHoglinRepellentNear(dimension string, x, y, z float64, radiu
 					}
 					fx, fy, fz := float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5
 					dSq := (fx-x)*(fx-x) + (fy-y)*(fy-y) + (fz-z)*(fz-z)
-					if dSq <= float64(radius*radius) && dSq < bestDistSq {
+					if dSq < bestDistSq {
 						bestDistSq = dSq
 						rx, ry, rz = fx, fy, fz
 						found = true
@@ -2087,29 +2255,12 @@ func (s *Server) HasHoglinRepellentNear(dimension string, x, y, z float64, radiu
 			}
 		}
 	}
-
-	if s.entities != nil {
-		allEnts := s.entities.AppendAll(nil)
-		maxDistSq := float64(radius * radius)
-		for i := range allEnts {
-			ent := &allEnts[i]
-			if ent.EffectiveDimension() != normDim || canonicalResourceName(ent.TypeName) != EntityTypeArmorStand {
-				continue
-			}
-			dSq := (ent.X-x)*(ent.X-x) + (ent.Y-y)*(ent.Y-y) + (ent.Z-z)*(ent.Z-z)
-			if dSq <= maxDistSq && dSq < bestDistSq {
-				bestDistSq = dSq
-				rx, ry, rz = ent.X, ent.Y, ent.Z
-				found = true
-			}
-		}
-	}
 	return rx, ry, rz, found
 }
 
 // InteractWithHoglin handles feeding a `minecraft:hoglin` with
 // `minecraft:crimson_fungus` to breed or accelerate baby growth (only when not
-// panicking from a nearby repellent).
+// panicking from a nearby repellent), setting `PersistenceRequired` per `Hoglin.mobInteract`.
 func (s *Server) InteractWithHoglin(session *PlayerSession, entityID int32, rng *rand.Rand) (handled bool, offspringID int32) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return false, 0
@@ -2127,12 +2278,19 @@ func (s *Server) InteractWithHoglin(session *PlayerSession, entityID int32, rng 
 	}
 	if s.IsMobBaby(entityID) {
 		fed, _ := s.FeedBabyMob(session, entityID, "minecraft:crimson_fungus")
+		if fed {
+			s.SetMobPersistenceRequired2612(entityID, true)
+		}
 		return fed, 0
 	}
 	if s.MobBreedCooldown(entityID) <= 0 && s.MobInLoveTicks(entityID) <= 0 {
 		consumeOneHeldItemInSurvival(session)
+		s.SetMobPersistenceRequired2612(entityID, true)
 		s.SetMobInLove(entityID, AnimalLoveDurationTicks, session)
 		offspringID, _ = s.TryBreedMobWithNearbyMate(entityID, AnimalBreedRange, rng)
+		if offspringID > 0 {
+			s.SetMobPersistenceRequired2612(offspringID, true)
+		}
 		return true, offspringID
 	}
 	return false, 0
@@ -2808,6 +2966,15 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 	if ps.HuntCooldownTicks > 0 {
 		ps.HuntCooldownTicks--
 	}
+	if ps.AdmiringDisabledTicks > 0 {
+		ps.AdmiringDisabledTicks--
+	}
+	if ps.BabyAvoidTicks > 0 {
+		ps.BabyAvoidTicks--
+		if ps.BabyAvoidTicks == 0 {
+			ps.BabyAvoidPlayer = nil
+		}
+	}
 	if ps.AngerTicks > 0 {
 		ps.AngerTicks--
 		if ps.AngerTicks == 0 {
@@ -2827,8 +2994,9 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 	dim := ent.EffectiveDimension()
 	ps.Dimension = dim
 
-	// 1. Zombification outside the Nether (Overworld / End) after 300 ticks (15s).
-	if dim != world.DimensionNether && !ps.ImmuneToZombification {
+	// 1. Zombification outside `piglinSafe` dimensions (Overworld / End) after 300 ticks (15s).
+	if !IsDimensionPiglinSafe2612(dim) && !ps.ImmuneToZombification {
+		ps.Shaking = true
 		ps.TimeInOverworld++
 		if ps.TimeInOverworld >= PiglinZombificationTicks {
 			nm.mu.Unlock()
@@ -2836,31 +3004,68 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 			return
 		}
 	} else {
+		ps.Shaking = false
 		ps.TimeInOverworld = 0
 	}
 
-	// 2. Admiring / Bartering timer.
+	// 2. Admiring / Bartering timer (`ADMIRING_ITEM = 120` ticks -> `PiglinAi.stopHoldingOffHandItem`).
 	if ps.AdmireTicks > 0 {
 		ps.AdmireTicks--
 		if ps.AdmireTicks == 0 {
-			wasBarter := ps.Bartering || canonicalResourceName(ps.OffHandItem.ResolvedID()) == "minecraft:gold_ingot"
+			isBaby := ps.Baby || s.IsMobBaby(entityID)
+			wasBarter := !isBaby && (ps.Bartering || canonicalResourceName(ps.OffHandItem.ResolvedID()) == "minecraft:gold_ingot")
 			if wasBarter {
 				nm.mu.Unlock()
 				_, _, _, _ = s.CompletePiglinBarter(entityID, rng)
 				return
 			}
-			// Non-ingot loved gold item: pocket into Piglin's 8-slot inventory.
-			if !ps.OffHandItem.IsEmpty() && len(ps.Inventory) < PiglinInventorySlots {
-				ps.Inventory = append(ps.Inventory, ps.OffHandItem)
-			}
-			mainH := ps.MainHandItem
+			offItem := ps.OffHandItem
 			ps.OffHandItem = world.ItemStack{}
 			ps.Bartering = false
 			ps.BarterPlayer = nil
+
+			if isBaby {
+				// Baby Piglin keeps the admired item (`stopHoldingOffHandItem` baby branch, `piglin_2612.txt:1914-1943`):
+				// if not armor, moves previous loved MainHandItem to pocket inventory and holds `offItem` in MainHand!
+				if !offItem.IsEmpty() {
+					if !ps.MainHandItem.IsEmpty() && IsPiglinLovedGoldItem(ps.MainHandItem.ResolvedID()) && len(ps.Inventory) < PiglinInventorySlots {
+						ps.Inventory = append(ps.Inventory, ps.MainHandItem)
+					}
+					ps.MainHandItem = offItem
+				}
+				mainH := ps.MainHandItem
+				nm.mu.Unlock()
+				cp := ent.ChunkPos()
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEquipment,
+					EncodePiglinEquipmentPacket(entityID, mainH, world.ItemStack{}))
+				return
+			}
+
+			// Adult non-ingot loved item: pocket into Piglin's 8-slot inventory (or toss if full).
+			overflowThrow := false
+			if !offItem.IsEmpty() {
+				if len(ps.Inventory) < PiglinInventorySlots {
+					ps.Inventory = append(ps.Inventory, offItem)
+				} else {
+					overflowThrow = true
+				}
+			}
+			mainH := ps.MainHandItem
 			nm.mu.Unlock()
 			cp := ent.ChunkPos()
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEquipment,
 				EncodePiglinEquipmentPacket(entityID, mainH, world.ItemStack{}))
+			if overflowThrow {
+				sx, sy, sz, vx, vy, vz := ComputePiglinThrowVelocity2612(ent.X, ent.Y, ent.Z, PiglinEyeHeightAdult2612, false, 0, 0, 0, rng)
+				if dropID, _ := s.SpawnItemEntityInDimension(dim, sx, sy, sz, offItem); dropID > 0 {
+					s.entities.Update(dropID, func(e *world.Entity) {
+						e.PickupDelay = PiglinDefaultPickupDelayTicks2612
+						e.VelocityX = clampVelocityShort(vx)
+						e.VelocityY = clampVelocityShort(vy)
+						e.VelocityZ = clampVelocityShort(vz)
+					})
+				}
+			}
 			return
 		}
 		nm.mu.Unlock()
@@ -2881,7 +3086,7 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 	cache := s.DimensionChunks(dim)
 	feetY := int(math.Floor(ent.Y + 0.01))
 
-	// 3. Standard piglins retreat from soul fire/torches/lanterns/campfires and zombified piglins/zoglins.
+	// 3. Standard piglins retreat from valid `#piglin_repellents` (incl. lit `soul_campfire`) and zombified piglins/zoglins.
 	if snap.TypeName == MobTypePiglin && s.EntityMountedVehicle(entityID) == 0 {
 		if rx, _, rz, repelled := s.HasPiglinRepellentNear(dim, ent.X, ent.Y, ent.Z, PiglinRepellentRadius); repelled {
 			nm.mu.Lock()
@@ -2908,12 +3113,17 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 		nm.mu.Unlock()
 	}
 
-	// 4. Standard piglins seek and pick up dropped gold items within 16 blocks.
-	if snap.TypeName == MobTypePiglin {
+	// 4. Standard piglins seek and pick up dropped `#piglin_loved` items and `gold_nugget` within 16 blocks.
+	if snap.TypeName == MobTypePiglin && !(snap.AdmiringDisabledTicks > 0 && (snap.AngerTarget != nil || snap.AngerMobID != 0)) {
 		allEnts := s.entities.AppendAll(nil)
 		for i := range allEnts {
 			it := &allEnts[i]
-			if !it.IsItem() || it.EffectiveDimension() != dim || it.PickupDelay > 0 || !IsPiglinLovedGoldItem(it.Item.ResolvedID()) {
+			if !it.IsItem() || it.EffectiveDimension() != dim || it.PickupDelay > 0 {
+				continue
+			}
+			resID := canonicalResourceName(it.Item.ResolvedID())
+			isNugget := resID == "minecraft:gold_nugget"
+			if !isNugget && !IsPiglinLovedGoldItem(resID) {
 				continue
 			}
 			dx := it.X - ent.X
@@ -2922,7 +3132,7 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 			distSq := dx*dx + dy*dy + dz*dz
 			if distSq <= 2.25 {
 				if s.TryPiglinPickUpGoldItem(entityID, it.Item, nil) {
-					if it.Item.Count <= 1 {
+					if isNugget || it.Item.Count <= 1 {
 						s.entities.Remove(it.ID)
 						cp := it.ChunkPos()
 						s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
@@ -2942,6 +3152,17 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 	}
 
 	if snap.Baby {
+		if snap.BabyAvoidTicks > 0 && snap.BabyAvoidPlayer != nil && !snap.BabyAvoidPlayer.IsDead() {
+			pSnap := snap.BabyAvoidPlayer.Snapshot()
+			awayX := ent.X - pSnap.X
+			awayZ := ent.Z - pSnap.Z
+			dist := math.Hypot(awayX, awayZ)
+			if dist < 1e-4 {
+				awayX, dist = 1.0, 1.0
+			}
+			s.stepEntityTowardPoint(ent, cache, feetY, ent.X+(awayX/dist)*4.0, ent.Y, ent.Z+(awayZ/dist)*4.0, PiglinChaseSpeed, 0.2)
+			return
+		}
 		_, _ = s.TryBabyPiglinMountBabyHoglin(entityID)
 		return
 	}
@@ -2959,7 +3180,6 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 		}
 	}
 	if targetMobID == 0 {
-		// Check for Wither Skeleton or Wither within 16 blocks.
 		allEnts := s.entities.AppendAll(nil)
 		bestDistSq := PiglinAggroRange*PiglinAggroRange + 1.0
 		for i := range allEnts {
@@ -3011,9 +3231,10 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	// 6. Player target acquisition:
-	//    - Piglin Brutes attack any survival/adventure player within 16 blocks regardless of gold armor.
-	//    - Standard Piglins attack players within 16 blocks who are NOT wearing gold armor, OR who provoked them (AngerTarget).
+	// 6. Player target acquisition (`PiglinAi.findNearestValidAttackTarget` / `PiglinBruteAi.findNearestValidAttackTarget`):
+	//    - `ANGRY_AT` (`snap.AngerTarget`) ignores line-of-sight and golden armor;
+	//    - Unprovoked `PiglinBrute` attacks visible players within 16 blocks regardless of golden armor (WITHOUT alerting Piglins unless hurt!);
+	//    - Unprovoked `Piglin` attacks visible players within 16 blocks who are NOT wearing `#piglin_safe_armor`.
 	targetPlayer := snap.AngerTarget
 	if targetPlayer == nil || targetPlayer.IsDead() {
 		bestDistSq := PiglinAggroRange*PiglinAggroRange + 1.0
@@ -3032,14 +3253,11 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 			dy := pSnap.Y - ent.Y
 			dz := pSnap.Z - ent.Z
 			dSq := dx*dx + dy*dy + dz*dz
-			if dSq <= PiglinAggroRange*PiglinAggroRange && dSq < bestDistSq {
+			if dSq <= PiglinAggroRange*PiglinAggroRange && dSq < bestDistSq &&
+				hasColliderLineOfSight2612(cache, ent.X, ent.Y+PiglinEyeHeightAdult2612, ent.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z) {
 				bestDistSq = dSq
 				targetPlayer = p
 			}
-		}
-		// When a Piglin Brute spots an intruder in its Bastion/Fortress, it rallies nearby Piglins!
-		if targetPlayer != nil && snap.TypeName == MobTypePiglinBrute {
-			s.OnPiglinOrBruteDamaged(entityID, targetPlayer, 0)
 		}
 	}
 
@@ -3052,10 +3270,16 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 		distSq := dx*dx + dy*dy + dz*dz
 
 		if hasCrossbow && snap.TypeName == MobTypePiglin {
-			if distSq > 64.0 {
+			if distSq < PiglinCrossbowBackupDistSq2612 {
+				dist := math.Hypot(dx, dz)
+				if dist > 1e-4 {
+					s.stepEntityTowardPoint(ent, cache, feetY, ent.X-(dx/dist)*2.0, ent.Y, ent.Z-(dz/dist)*2.0, PiglinChaseSpeed*0.75, 0.2)
+				}
+			} else if distSq > 64.0 {
 				s.stepEntityTowardPoint(ent, cache, feetY, pSnap.X, pSnap.Y, pSnap.Z, PiglinChaseSpeed, 6.0)
 			}
-			if !snap.ChargingCrossbow && snap.AttackCooldown <= 0 {
+
+			if !snap.ChargingCrossbow && snap.CrossbowHoldTicks <= 0 && snap.AttackCooldown <= 0 {
 				s.SetPiglinChargingCrossbow(entityID, true)
 			} else if snap.ChargingCrossbow {
 				nm.mu.Lock()
@@ -3067,12 +3291,26 @@ func (s *Server) tickSinglePiglinOrBrute(entityID int32, rng *rand.Rand) {
 				nm.mu.Unlock()
 				if chargeTicks >= PiglinCrossbowChargeTicks {
 					s.SetPiglinChargingCrossbow(entityID, false)
+					holdDelay := PiglinCrossbowHoldMinTicks2612
+					if rng != nil {
+						holdDelay += rng.Intn(PiglinCrossbowHoldRandTicks2612)
+					}
 					nm.mu.Lock()
 					if cur, ok := nm.piglins[entityID]; ok && cur != nil {
-						cur.AttackCooldown = 30
+						cur.CrossbowHoldTicks = holdDelay
 					}
 					nm.mu.Unlock()
-					s.AttackPlayerFromMob(entityID, MobTypePiglin, ent.X, ent.Z, targetPlayer, 4.0)
+				}
+			} else if snap.CrossbowHoldTicks > 0 {
+				nm.mu.Lock()
+				remHold := 0
+				if cur, ok := nm.piglins[entityID]; ok && cur != nil {
+					cur.CrossbowHoldTicks--
+					remHold = cur.CrossbowHoldTicks
+				}
+				nm.mu.Unlock()
+				if remHold <= 0 && hasColliderLineOfSight2612(cache, ent.X, ent.Y+PiglinEyeHeightAdult2612, ent.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z) {
+					s.AttackPlayerFromMob(entityID, MobTypePiglin, ent.X, ent.Z, targetPlayer, 5.0)
 				}
 			}
 			return
@@ -3153,7 +3391,7 @@ func (s *Server) tickSingleZombifiedPiglin(entityID int32) {
 	}
 }
 
-func (s *Server) tickSingleHoglinOrZoglin(entityID int32, _ *rand.Rand) {
+func (s *Server) tickSingleHoglinOrZoglin(entityID int32, rng *rand.Rand) {
 	ent := s.entities.Get(entityID)
 	nm := s.netherMobs()
 	nm.mu.Lock()
@@ -3166,12 +3404,15 @@ func (s *Server) tickSingleHoglinOrZoglin(entityID int32, _ *rand.Rand) {
 	if hs.AttackCooldown > 0 {
 		hs.AttackCooldown--
 	}
+	if hs.AttackAnimationTicks > 0 {
+		hs.AttackAnimationTicks--
+	}
 
 	dim := ent.EffectiveDimension()
 	hs.Dimension = dim
 
-	// 1. Hoglin zombification into Zoglin outside the Nether after 300 ticks (15s).
-	if hs.TypeName == MobTypeHoglin && dim != world.DimensionNether && !hs.ImmuneToZombification {
+	// 1. Hoglin zombification into Zoglin outside `piglinSafe` dimensions after 300 ticks (15s).
+	if hs.TypeName == MobTypeHoglin && !IsDimensionPiglinSafe2612(dim) && !hs.ImmuneToZombification {
 		hs.TimeInOverworld++
 		if hs.TimeInOverworld >= HoglinZombificationTicks {
 			nm.mu.Unlock()
@@ -3187,11 +3428,14 @@ func (s *Server) tickSingleHoglinOrZoglin(entityID int32, _ *rand.Rand) {
 	cache := s.DimensionChunks(dim)
 	feetY := int(math.Floor(ent.Y + 0.01))
 
-	// 2. Hoglin panic / retreat from warped_fungus, nether_portal, respawn_anchor, or armor_stand within 7 blocks.
+	// 2. Hoglin panic / retreat from `#hoglin_repellents` (`warped_fungus`, `potted_warped_fungus`,
+	//    `nether_portal`, `respawn_anchor`) within 8x4x8 (`HoglinSpecificSensor`).
 	if snap.TypeName == MobTypeHoglin {
 		if rx, _, rz, repelled := s.HasHoglinRepellentNear(dim, ent.X, ent.Y, ent.Z, HoglinRepellentRadius); repelled {
 			nm.mu.Lock()
 			hs.Panicking = true
+			hs.TargetPlayer = nil
+			hs.TargetMobID = 0
 			hs.RepellentX = rx
 			hs.RepellentZ = rz
 			nm.mu.Unlock()
@@ -3211,41 +3455,24 @@ func (s *Server) tickSingleHoglinOrZoglin(entityID int32, _ *rand.Rand) {
 		nm.mu.Lock()
 		hs.Panicking = false
 		nm.mu.Unlock()
-	}
 
-	// 3. Zoglins attack nearby non-zoglin/non-creeper mobs as well as players.
-	if snap.TypeName == MobTypeZoglin {
-		allEnts := s.entities.AppendAll(nil)
-		for i := range allEnts {
-			other := &allEnts[i]
-			if other.ID == entityID || other.IsItem() || other.IsExperienceOrb() || other.EffectiveDimension() != dim {
-				continue
-			}
-			oNorm := canonicalResourceName(other.TypeName)
-			if oNorm == MobTypeZoglin || oNorm == MobTypeCreeper || IsDecorationEntity(oNorm) {
-				continue
-			}
-			dx := other.X - ent.X
-			dy := other.Y - ent.Y
-			dz := other.Z - ent.Z
-			if dx*dx+dy*dy+dz*dz <= 256.0 {
-				s.stepEntityTowardPoint(ent, cache, feetY, other.X, other.Y, other.Z, ZoglinChaseSpeed, 1.3)
-				if dx*dx+dy*dy+dz*dz <= 4.5 && snap.AttackCooldown <= 0 {
-					nm.mu.Lock()
-					hs.AttackCooldown = 20
-					nm.mu.Unlock()
-					dmg := ZoglinAttackDamage
-					if snap.Baby {
-						dmg = HoglinBabyAttackDmg
-					}
-					s.applyDamageToMob(other, dmg, nil, 0.5, false, false)
-				}
-				return
-			}
+		// `HoglinAi.findNearestValidAttackTarget`: breeding Hoglins do not acquire attack targets.
+		if s.MobInLoveTicks(entityID) > 0 {
+			return
 		}
 	}
 
-	// 4. Hoglins & Zoglins chase and fling survival/adventure players within 16 blocks.
+	eyeH := 1.19
+	if snap.Baby {
+		eyeH = 0.60
+	}
+
+	// 3. Target selection (`Zoglin`: closest attackable non-creeper, non-zoglin living mob OR player;
+	//    `Hoglin`: closest survival/adventure player within 16 blocks with LOS).
+	bestDistSq := 256.0 + 1.0
+	var bestPlayer *PlayerSession
+	var bestMob *world.Entity
+
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
 			continue
@@ -3257,22 +3484,135 @@ func (s *Server) tickSingleHoglinOrZoglin(entityID int32, _ *rand.Rand) {
 		dx := pSnap.X - ent.X
 		dy := pSnap.Y - ent.Y
 		dz := pSnap.Z - ent.Z
-		if dx*dx+dy*dy+dz*dz <= 256.0 {
-			s.stepEntityTowardPoint(ent, cache, feetY, pSnap.X, pSnap.Y, pSnap.Z, HoglinChaseSpeed, 1.3)
-			if dx*dx+dy*dy+dz*dz <= 4.5 && snap.AttackCooldown <= 0 {
-				nm.mu.Lock()
-				hs.AttackCooldown = 20
-				nm.mu.Unlock()
-				dmg := HoglinAttackDamage
-				if snap.Baby {
-					dmg = HoglinBabyAttackDmg
+		dSq := dx*dx + dy*dy + dz*dz
+		if dSq <= 256.0 && dSq < bestDistSq &&
+			(snap.TargetPlayer == p || hasColliderLineOfSight2612(cache, ent.X, ent.Y+eyeH, ent.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z)) {
+			bestDistSq = dSq
+			bestPlayer = p
+			bestMob = nil
+		}
+	}
+
+	if snap.TypeName == MobTypeZoglin {
+		allEnts := s.entities.AppendAll(nil)
+		for i := range allEnts {
+			other := &allEnts[i]
+			if other.ID == entityID || other.EffectiveDimension() != dim || !IsValidZoglinAttackTargetEntity2612(other) {
+				continue
+			}
+			dx := other.X - ent.X
+			dy := other.Y - ent.Y
+			dz := other.Z - ent.Z
+			dSq := dx*dx + dy*dy + dz*dz
+			if dSq <= 256.0 && dSq < bestDistSq &&
+				(snap.TargetMobID == other.ID || hasColliderLineOfSight2612(cache, ent.X, ent.Y+eyeH, ent.Z, other.X, other.Y+0.9, other.Z)) {
+				bestDistSq = dSq
+				cpMob := *other
+				bestMob = &cpMob
+				bestPlayer = nil
+			}
+		}
+	}
+
+	chaseSpeed := HoglinChaseSpeed
+	atkSound := SoundHoglinAttack
+	if snap.TypeName == MobTypeZoglin {
+		chaseSpeed = ZoglinChaseSpeed
+		atkSound = SoundZoglinAttack
+	}
+	meleeCD := HoglinAdultMeleeCooldown2612
+	if snap.Baby {
+		meleeCD = HoglinBabyMeleeCooldown2612
+	}
+
+	if bestMob != nil {
+		s.stepEntityTowardPoint(ent, cache, feetY, bestMob.X, bestMob.Y, bestMob.Z, chaseSpeed, 1.3)
+		curEnt := s.entities.Get(entityID)
+		if curEnt == nil {
+			return
+		}
+		dx := bestMob.X - curEnt.X
+		dy := bestMob.Y - curEnt.Y
+		dz := bestMob.Z - curEnt.Z
+		if dx*dx+dy*dy+dz*dz <= 4.5 && snap.AttackCooldown <= 0 {
+			nm.mu.Lock()
+			hs.AttackCooldown = meleeCD
+			hs.AttackAnimationTicks = HoglinAttackAnimDuration2612
+			nm.mu.Unlock()
+
+			cp := curEnt.ChunkPos()
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(entityID, EntityEventHoglinZoglinAttack2612))
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(atkSound, SoundSourceHostile, curEnt.X, curEnt.Y, curEnt.Z, 1.0, 1.0, 0))
+
+			dmg := RollHoglinBaseAttackDamage2612(ZoglinAttackDamage, snap.Baby, rng)
+			kbRes := MobKnockbackResistance2612(bestMob.TypeName)
+			killed := s.applyDamageToMob(bestMob, dmg, nil, 0, false, false)
+			if !killed {
+				baseKB := BaseKnockbackStrength * (1.0 - kbRes)
+				var bvx, bvy, bvz float64
+				if baseKB > 0 {
+					bvx, bvy, bvz = ComputeKnockback(curEnt.X, curEnt.Z, 0, bestMob.X, bestMob.Z, baseKB)
 				}
-				dealt := s.AttackPlayerFromMob(entityID, snap.TypeName, ent.X, ent.Z, p, dmg)
-				if dealt > 0 && !snap.Baby && p.send != nil {
-					_ = p.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(p.EntityID, 0, HoglinFlingVelocityY, 0))
+				tvx, tvy, tvz, thrown := ComputeHoglinThrowImpulse2612(
+					curEnt.X, curEnt.Z, bestMob.X, bestMob.Z, HoglinBaseAttackKnockback2612, kbRes, snap.Baby, rng,
+				)
+				if baseKB > 0 || thrown {
+					fvx, fvy, fvz := bvx+tvx, bvy+tvy, bvz+tvz
+					s.entities.Update(bestMob.ID, func(e *world.Entity) {
+						e.VelocityX = clampVelocityShort(fvx)
+						e.VelocityY = clampVelocityShort(fvy)
+						e.VelocityZ = clampVelocityShort(fvz)
+						if fvy > 0 {
+							e.OnGround = false
+						}
+					})
+					mcp := bestMob.ChunkPos()
+					s.BroadcastDimensionChunk(dim, mcp.X, mcp.Z, protocol.PlaySetEntityMotion,
+						EncodeSetEntityMotionPacket(bestMob.ID, fvx, fvy, fvz))
 				}
 			}
+		}
+		return
+	}
+
+	if bestPlayer != nil {
+		pSnap := bestPlayer.Snapshot()
+		s.stepEntityTowardPoint(ent, cache, feetY, pSnap.X, pSnap.Y, pSnap.Z, chaseSpeed, 1.3)
+		curEnt := s.entities.Get(entityID)
+		if curEnt == nil {
 			return
+		}
+		dx := pSnap.X - curEnt.X
+		dy := pSnap.Y - curEnt.Y
+		dz := pSnap.Z - curEnt.Z
+		if dx*dx+dy*dy+dz*dz <= 4.5 && snap.AttackCooldown <= 0 {
+			nm.mu.Lock()
+			hs.AttackCooldown = meleeCD
+			hs.AttackAnimationTicks = HoglinAttackAnimDuration2612
+			nm.mu.Unlock()
+
+			cp := curEnt.ChunkPos()
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(entityID, EntityEventHoglinZoglinAttack2612))
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(atkSound, SoundSourceHostile, curEnt.X, curEnt.Y, curEnt.Z, 1.0, 1.0, 0))
+
+			dmg := RollHoglinBaseAttackDamage2612(HoglinAttackDamage, snap.Baby, rng)
+			dealt := s.AttackPlayerFromMob(entityID, snap.TypeName, curEnt.X, curEnt.Z, bestPlayer, dmg)
+			if dealt > 0 && !snap.Baby && bestPlayer.send != nil {
+				kbRes := s.PlayerKnockbackResistance(bestPlayer)
+				tvx, tvy, tvz, thrown := ComputeHoglinThrowImpulse2612(
+					curEnt.X, curEnt.Z, pSnap.X, pSnap.Z, HoglinBaseAttackKnockback2612, kbRes, false, rng,
+				)
+				if thrown {
+					baseKB := BaseKnockbackStrength * (1.0 - kbRes)
+					bvx, bvy, bvz := ComputeKnockback(curEnt.X, curEnt.Z, 0, pSnap.X, pSnap.Z, baseKB)
+					_ = bestPlayer.send(protocol.PlaySetEntityMotion,
+						EncodeSetEntityMotionPacket(bestPlayer.EntityID, bvx+tvx, bvy+tvy, bvz+tvz))
+				}
+			}
 		}
 	}
 }

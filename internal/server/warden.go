@@ -412,6 +412,17 @@ func (s *Server) EmitVibration(ev VibrationEvent) int {
 	// full event context are preserved before EmitGameEvent's secondary broadcast.
 	s.NotifyWardensOfVibration(ev)
 
+	// Vanilla 26.1.2 `PiglinAi.angerNearbyPiglins`: breaking any `#minecraft:guarded_by_piglins`
+	// block (`requireVisibility=false`) or opening a guarded container (`requireVisibility=true`)
+	// angers nearby adult Piglins and Piglin Brutes for 600 ticks even through gold armor.
+	if ev.Player != nil {
+		if ev.Type == GameEventBlockDestroy && IsPiglinGuardedBlock(ev.BlockOrItemID) {
+			s.NotifyPiglinsPlayerMinedGoldBlock(dim, int(math.Floor(ev.X)), int(math.Floor(ev.Y)), int(math.Floor(ev.Z)), ev.Player)
+		} else if ev.Type == GameEventContainerOpen && IsPiglinGuardedContainer2612(ev.BlockOrItemID) {
+			s.NotifyPiglinsPlayerOpenedGuardedBlock(dim, int(math.Floor(ev.X)), int(math.Floor(ev.Y)), int(math.Floor(ev.Z)), ev.Player)
+		}
+	}
+
 	// Forward to sculk sensors & shriekers.
 	notifiedSensors := s.EmitGameEvent(dim, ev.Type, ev.X, ev.Y, ev.Z, VibrationSource{
 		Player:        ev.Player,

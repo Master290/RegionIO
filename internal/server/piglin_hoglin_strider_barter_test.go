@@ -9,8 +9,8 @@ import (
 
 func TestPiglinBarterLootTableWeightsAndKeyOutcomes(t *testing.T) {
 	table := PiglinBarterLootTable()
-	if len(table) != 18 {
-		t.Fatalf("len(PiglinBarterLootTable()) = %d, want 18", len(table))
+	if len(table) != 19 {
+		t.Fatalf("len(PiglinBarterLootTable()) = %d, want 19", len(table))
 	}
 	totalWeight := 0
 	for _, entry := range table {
@@ -34,7 +34,7 @@ func TestPiglinBarterLootTableWeightsAndKeyOutcomes(t *testing.T) {
 	// 2. Iron Boots with Soul Speed (weight 8, roll 5..12).
 	bootStack, bootMeta, bootEntry := RollPiglinBarterLootByWeightRoll(5, rng)
 	if canonicalResourceName(bootStack.ResolvedID()) != "minecraft:iron_boots" || !bootEntry.SoulSpeedBoot {
-		t.Fatalf("roll 5 = (%v, %+v), want iron_boots with Soul Speed", bookStack, bootEntry)
+		t.Fatalf("roll 5 = (%v, %+v), want iron_boots with Soul Speed", bootStack, bootEntry)
 	}
 	if lvl := bootMeta.EnchantmentLevel(EnchantSoulSpeed); lvl < 1 || lvl > 3 {
 		t.Fatalf("iron_boots Soul Speed level = %d, want 1..3", lvl)
@@ -50,28 +50,32 @@ func TestPiglinBarterLootTableWeightsAndKeyOutcomes(t *testing.T) {
 		t.Fatalf("roll 21 expected SplashFireRes, got %+v", splashEntry)
 	}
 
-	// 4. Ender Pearl (weight 10, roll 49..58, count 2..4).
+	// 4. Ender Pearl (weight 10, roll 49..58, count 2..4) and Dried Ghast (weight 10, roll 59..68, count 1).
 	pearlStack, _, _ := RollPiglinBarterLootByWeightRoll(50, rng)
 	if canonicalResourceName(pearlStack.ResolvedID()) != "minecraft:ender_pearl" || pearlStack.Count < 2 || pearlStack.Count > 4 {
 		t.Fatalf("roll 50 = %v (count=%d), want ender_pearl count 2..4", pearlStack, pearlStack.Count)
 	}
+	driedGhastStack, _, _ := RollPiglinBarterLootByWeightRoll(60, rng)
+	if canonicalResourceName(driedGhastStack.ResolvedID()) != "minecraft:dried_ghast" || driedGhastStack.Count != 1 {
+		t.Fatalf("roll 60 = %v (count=%d), want 1 dried_ghast", driedGhastStack, driedGhastStack.Count)
+	}
 
-	// 5. Obsidian (roll 100), Crying Obsidian (roll 140), Spectral Arrow (roll 350), Blackstone (roll 450).
-	obsStack, _, _ := RollPiglinBarterLootByWeightRoll(100, rng)
+	// 5. Obsidian (roll 110), Crying Obsidian (roll 150), Spectral Arrow (roll 360), Blackstone (roll 460).
+	obsStack, _, _ := RollPiglinBarterLootByWeightRoll(110, rng)
 	if canonicalResourceName(obsStack.ResolvedID()) != "minecraft:obsidian" || obsStack.Count != 1 {
-		t.Fatalf("roll 100 = %v, want 1 obsidian", obsStack)
+		t.Fatalf("roll 110 = %v, want 1 obsidian", obsStack)
 	}
-	cryingStack, _, _ := RollPiglinBarterLootByWeightRoll(140, rng)
+	cryingStack, _, _ := RollPiglinBarterLootByWeightRoll(150, rng)
 	if canonicalResourceName(cryingStack.ResolvedID()) != "minecraft:crying_obsidian" || cryingStack.Count < 1 || cryingStack.Count > 3 {
-		t.Fatalf("roll 140 = %v, want 1..3 crying_obsidian", cryingStack)
+		t.Fatalf("roll 150 = %v, want 1..3 crying_obsidian", cryingStack)
 	}
-	arrowStack, _, _ := RollPiglinBarterLootByWeightRoll(350, rng)
+	arrowStack, _, _ := RollPiglinBarterLootByWeightRoll(360, rng)
 	if canonicalResourceName(arrowStack.ResolvedID()) != "minecraft:spectral_arrow" || arrowStack.Count < 6 || arrowStack.Count > 12 {
-		t.Fatalf("roll 350 = %v, want 6..12 spectral_arrow", arrowStack)
+		t.Fatalf("roll 360 = %v, want 6..12 spectral_arrow", arrowStack)
 	}
-	blackstoneStack, _, _ := RollPiglinBarterLootByWeightRoll(450, rng)
+	blackstoneStack, _, _ := RollPiglinBarterLootByWeightRoll(460, rng)
 	if canonicalResourceName(blackstoneStack.ResolvedID()) != "minecraft:blackstone" || blackstoneStack.Count < 8 || blackstoneStack.Count > 16 {
-		t.Fatalf("roll 450 = %v, want 8..16 blackstone", blackstoneStack)
+		t.Fatalf("roll 460 = %v, want 8..16 blackstone", blackstoneStack)
 	}
 }
 
@@ -197,6 +201,13 @@ func TestPiglinZombificationBarterGoldCuriosityGoldArmorAndBrutes(t *testing.T) 
 	player.SetInventorySlot(5, world.NewNamedItemStack("minecraft:golden_helmet", 1))
 	if !IsPlayerWearingGoldArmor(player) {
 		t.Fatal("expected player with golden_helmet in slot 5 to return IsPlayerWearingGoldArmor=true")
+	}
+	for bx := -1; bx <= 4; bx++ {
+		for by := 64; by <= 66; by++ {
+			for bz := -1; bz <= 1; bz++ {
+				netherCache.SetBlock(bx, by, bz, world.StateAir)
+			}
+		}
 	}
 	if alerted := srv.NotifyPiglinsPlayerOpenedGuardedBlock(world.DimensionNether, 3, 64, 0, player); alerted < 1 {
 		t.Fatalf("expected NotifyPiglinsPlayerOpenedGuardedBlock to anger nearby piglin, got %d", alerted)
