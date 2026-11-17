@@ -47,7 +47,7 @@ const (
 	EvokerWololoRange        float64 = 16.0
 
 	// Pillager & Vindicator constants.
-	PillagerCrossbowChargeTicks int     = 40   // 2s crossbow charge
+	PillagerCrossbowChargeTicks int     = 25   // 1.25s base crossbow charge (`CrossbowItem.getChargeDuration`, -5 per Quick Charge)
 	PillagerCrossbowRange       float64 = 16.0
 	PillagerArrowSpeed          float64 = 1.6
 	PillagerArrowDamage         float32 = 4.0
@@ -196,10 +196,28 @@ type IllagerBehaviorState struct {
 	Celebrating          bool
 	ChargingCrossbow     bool
 	CrossbowChargeTicks  int
+	CrossbowState        PillagerCrossbowState2612
+	CrossbowAttackDelay  int
+	CrossbowSeeTime      int
+	QuickChargeLevel     int
+	MultishotLevel       int
+	CrossbowDamage       int32
+	ChargedProjectiles   []ChargedProjectile
 	IsJohnny             bool
 	CustomName           string
+	MeleeAttackCooldown  int
+	DoorBreakActive      bool
+	DoorBreakX           int
+	DoorBreakY           int
+	DoorBreakZ           int
+	DoorBreakTicks       int
+	DoorLastProgress     int
 	ActiveSpell          byte
+	SpellWarmupDelay     int
 	SpellCastTicks       int
+	SpellTargetX         float64
+	SpellTargetY         float64
+	SpellTargetZ         float64
 	FangsCooldown        int
 	SummonVexCooldown    int
 	WololoCooldown       int
@@ -211,35 +229,50 @@ type IllagerBehaviorState struct {
 
 // EvokerFangsState tracks a summoned `minecraft:evoker_fangs` entity.
 type EvokerFangsState struct {
-	EntityID         int32
-	Dimension        string
-	OwnerID          int32
-	WarmupDelayTicks int
-	LifeTicks        int
-	HasDealtDamage   bool
+	EntityID           int32
+	Dimension          string
+	OwnerID            int32
+	WarmupDelayTicks   int
+	LifeTicks          int
+	LifeTicksRemaining int
+	SentSpikeEvent     bool
+	HasDealtDamage     bool
 }
 
 // VexBehaviorState tracks a `minecraft:vex` entity (including its summoner
-// `OwnerEvokerID`, charging flag, and limited life decay timer).
+// `OwnerEvokerID`, charging flag, bound origin, and limited life decay timer).
 type VexBehaviorState struct {
-	EntityID       int32
-	OwnerEvokerID  int32
-	Charging       bool
-	LifeTicks      int
-	MaxLifeTicks   int
-	HasLimitedLife bool
-	AttackCooldown int
+	EntityID         int32
+	OwnerEvokerID    int32
+	Charging         bool
+	LifeTicks        int
+	MaxLifeTicks     int
+	LimitedLifeTicks int
+	HasLimitedLife   bool
+	HasBoundOrigin   bool
+	BoundOriginX     int
+	BoundOriginY     int
+	BoundOriginZ     int
+	AttackCooldown   int
 }
 
 // WitchBehaviorState tracks a `minecraft:witch` entity's potion drinking and
 // splash-potion throwing state.
 type WitchBehaviorState struct {
-	EntityID          int32
-	Drinking          bool
-	DrinkingPotion    string
-	DrinkTicksLeft    int
-	ThrowCooldown     int
-	LastThrownPotion  string
+	EntityID               int32
+	Drinking               bool
+	DrinkingPotion         string
+	DrinkTicksLeft         int
+	SpeedModifierDrinking  float64
+	ThrowCooldown          int
+	SeeTime                int
+	HealRaidersCooldown    int
+	LastDamageWasFire      bool
+	PrevTargetID           int32
+	PrevTargetX            float64
+	PrevTargetZ            float64
+	LastThrownPotion       string
+	LastThrownProjectileID int32
 }
 
 // RavagerBehaviorState tracks a `minecraft:ravager` entity's shield-stun timer,
@@ -257,16 +290,18 @@ type RavagerBehaviorState struct {
 type RavagerBlockBreakHook func(dimension string, x, y, z int, blockState uint16) bool
 
 type serverIllagerManager struct {
-	mu               sync.RWMutex
-	nextPatrolID     int32
-	patrols          map[int32]*IllagerPatrolGroup
-	illagers         map[int32]*IllagerBehaviorState
-	fangs            map[int32]*EvokerFangsState
-	vexes            map[int32]*VexBehaviorState
-	witches          map[int32]*WitchBehaviorState
-	ravagers         map[int32]*RavagerBehaviorState
-	sheepWoolColors  map[int32]byte
-	ravagerBreakHook RavagerBlockBreakHook
+	mu                  sync.RWMutex
+	nextPatrolID        int32
+	patrols             map[int32]*IllagerPatrolGroup
+	illagers            map[int32]*IllagerBehaviorState
+	fangs               map[int32]*EvokerFangsState
+	vexes               map[int32]*VexBehaviorState
+	witches             map[int32]*WitchBehaviorState
+	splashPotions       map[int32]*WitchThrownSplashPotionState2612
+	activeSplashOwnerID int32
+	ravagers            map[int32]*RavagerBehaviorState
+	sheepWoolColors     map[int32]byte
+	ravagerBreakHook    RavagerBlockBreakHook
 }
 
 var illagerManagers sync.Map // map[*Server]*serverIllagerManager
@@ -279,6 +314,7 @@ func (s *Server) illagerManager() *serverIllagerManager {
 			fangs:           make(map[int32]*EvokerFangsState),
 			vexes:           make(map[int32]*VexBehaviorState),
 			witches:         make(map[int32]*WitchBehaviorState),
+			splashPotions:   make(map[int32]*WitchThrownSplashPotionState2612),
 			ravagers:        make(map[int32]*RavagerBehaviorState),
 			sheepWoolColors: make(map[int32]byte),
 		}
@@ -292,6 +328,7 @@ func (s *Server) illagerManager() *serverIllagerManager {
 		fangs:           make(map[int32]*EvokerFangsState),
 		vexes:           make(map[int32]*VexBehaviorState),
 		witches:         make(map[int32]*WitchBehaviorState),
+		splashPotions:   make(map[int32]*WitchThrownSplashPotionState2612),
 		ravagers:        make(map[int32]*RavagerBehaviorState),
 		sheepWoolColors: make(map[int32]byte),
 	}
@@ -631,15 +668,18 @@ func (s *Server) ensureIllagerOrRaiderState(entityID int32, typeName string, isC
 	}
 	norm := canonicalResourceName(typeName)
 	mgr := s.illagerManager()
+	createdIllager := false
 	mgr.mu.Lock()
 	switch norm {
 	case MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeIllusioner:
 		st := mgr.illagers[entityID]
 		if st == nil {
+			createdIllager = true
 			st = &IllagerBehaviorState{
-				EntityID:  entityID,
-				MobType:   norm,
-				IsCaptain: isCaptain,
+				EntityID:         entityID,
+				MobType:          norm,
+				IsCaptain:        isCaptain,
+				DoorLastProgress: -1,
 			}
 			mgr.illagers[entityID] = st
 		} else if isCaptain {
@@ -648,7 +688,8 @@ func (s *Server) ensureIllagerOrRaiderState(entityID int32, typeName string, isC
 	case MobTypeWitch:
 		if mgr.witches[entityID] == nil {
 			mgr.witches[entityID] = &WitchBehaviorState{
-				EntityID: entityID,
+				EntityID:      entityID,
+				ThrowCooldown: -1, // RangedAttackGoal.attackTime starts at -1 -> initializes to 60 on target acquisition
 			}
 		}
 	case MobTypeRavager:
@@ -661,10 +702,33 @@ func (s *Server) ensureIllagerOrRaiderState(entityID int32, typeName string, isC
 	mgr.mu.Unlock()
 
 	if IsIllagerMob(norm) {
+		defWeapon := DefaultIllagerMainHandWeapon(norm)
+		if createdIllager && !defWeapon.IsEmpty() && s.MobEquipment(entityID, EquipmentSlotMainHand).IsEmpty() {
+			ds := s.dispenserState()
+			ds.mu.Lock()
+			eq := ds.mobEquipment[entityID]
+			eq[EquipmentSlotMainHand] = defWeapon
+			if isCaptain {
+				eq[EquipmentSlotHead] = world.NewNamedItemStack(ItemWhiteBanner, 1)
+			}
+			ds.mobEquipment[entityID] = eq
+			ds.mu.Unlock()
+		} else if isCaptain && s.MobEquipment(entityID, EquipmentSlotHead).IsEmpty() {
+			ds := s.dispenserState()
+			ds.mu.Lock()
+			eq := ds.mobEquipment[entityID]
+			eq[EquipmentSlotHead] = world.NewNamedItemStack(ItemWhiteBanner, 1)
+			ds.mobEquipment[entityID] = eq
+			ds.mu.Unlock()
+		}
 		if ent := s.entities.Get(entityID); ent != nil {
 			cp := ent.ChunkPos()
+			mainNow := s.MobEquipment(entityID, EquipmentSlotMainHand)
+			if mainNow.IsEmpty() && createdIllager {
+				mainNow = defWeapon
+			}
 			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetEquipment,
-				EncodeIllagerEquipmentPacket(entityID, DefaultIllagerMainHandWeapon(norm), isCaptain))
+				EncodeIllagerEquipmentPacket(entityID, mainNow, isCaptain))
 		}
 	}
 }
@@ -681,7 +745,11 @@ func (s *Server) GetIllagerState(entityID int32) (IllagerBehaviorState, bool) {
 	if !ok || st == nil {
 		return IllagerBehaviorState{}, false
 	}
-	return *st, true
+	cp := *st
+	if len(st.ChargedProjectiles) > 0 {
+		cp.ChargedProjectiles = append([]ChargedProjectile(nil), st.ChargedProjectiles...)
+	}
+	return cp, true
 }
 
 // SpawnIllagerPatrol spawns a vanilla Illager Patrol at `(x, y, z)` in `dimension`
@@ -959,19 +1027,34 @@ func (s *Server) SpawnVex(dimension string, x, y, z float64, ownerEvokerID int32
 	mgr := s.illagerManager()
 	mgr.mu.Lock()
 	mgr.vexes[id] = &VexBehaviorState{
-		EntityID:       id,
-		OwnerEvokerID:  ownerEvokerID,
-		MaxLifeTicks:   VexLifeDecayStartTicks,
-		HasLimitedLife: ownerEvokerID > 0,
+		EntityID:         id,
+		OwnerEvokerID:    ownerEvokerID,
+		MaxLifeTicks:     VexLifeDecayStartTicks,
+		LimitedLifeTicks: VexLifeDecayStartTicks,
+		HasLimitedLife:   ownerEvokerID > 0,
+		HasBoundOrigin:   ownerEvokerID > 0,
+		BoundOriginX:     int(math.Floor(x)),
+		BoundOriginY:     int(math.Floor(y)),
+		BoundOriginZ:     int(math.Floor(z)),
 	}
 	mgr.mu.Unlock()
+
+	defSword := DefaultIllagerMainHandWeapon(MobTypeVex)
+	if !defSword.IsEmpty() {
+		ds := s.dispenserState()
+		ds.mu.Lock()
+		eq := ds.mobEquipment[id]
+		eq[EquipmentSlotMainHand] = defSword
+		ds.mobEquipment[id] = eq
+		ds.mu.Unlock()
+	}
 
 	if ent := s.entities.Get(id); ent != nil {
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySetEntityDataCB, EncodeVexDataPacket(id, false))
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlaySetEquipment,
-			EncodeIllagerEquipmentPacket(id, DefaultIllagerMainHandWeapon(MobTypeVex), false))
+			EncodeIllagerEquipmentPacket(id, defSword, false))
 	}
 	return id, nil
 }
@@ -1047,10 +1130,11 @@ func (s *Server) SpawnEvokerFangs(dimension string, x, y, z float64, warmupDelay
 	mgr := s.illagerManager()
 	mgr.mu.Lock()
 	mgr.fangs[id] = &EvokerFangsState{
-		EntityID:         id,
-		Dimension:        normDim,
-		OwnerID:          ownerID,
-		WarmupDelayTicks: warmupDelayTicks,
+		EntityID:           id,
+		Dimension:          normDim,
+		OwnerID:            ownerID,
+		WarmupDelayTicks:   warmupDelayTicks,
+		LifeTicksRemaining: EvokerFangsInitialLifeTicks2612,
 	}
 	mgr.mu.Unlock()
 
@@ -1062,10 +1146,10 @@ func (s *Server) SpawnEvokerFangs(dimension string, x, y, z float64, warmupDelay
 }
 
 // CastEvokerFangsSpell casts the Evoker's Fangs attack toward `(targetX, targetY, targetZ)`:
-//   - If target is within `3.0` blocks of the Evoker, spawns 2 concentric rings
-//     (5 inner fangs at radius 1.5 + 8 outer fangs at radius 2.5).
-//   - Otherwise spawns a straight line of `8` fangs stretching from the Evoker
-//     toward `(targetX, targetZ)` with staggered warmup delays.
+//   - If `distanceToSqr < 9.0` (`< 3.0` blocks), spawns 2 concentric rings
+//     (5 inner fangs at radius 1.5 with warmup 0 + 8 outer fangs at radius 2.5 with warmup 3).
+//   - Otherwise spawns a straight line of `16` fangs (`warmupDelayTicks = 0..15`) stretching
+//     from the Evoker toward `(targetX, targetZ)` snapped to ground support via `createSpellEntity`.
 func (s *Server) CastEvokerFangsSpell(evokerID int32, targetX, targetY, targetZ float64) (fangIDs []int32) {
 	if s == nil || s.entities == nil {
 		return nil
@@ -1082,7 +1166,8 @@ func (s *Server) CastEvokerFangsSpell(evokerID int32, targetX, targetY, targetZ 
 	mgr.mu.Lock()
 	if st := mgr.illagers[evokerID]; st != nil {
 		st.ActiveSpell = IllagerSpellFangs
-		st.FangsCooldown = EvokerFangsCooldownTicks
+		st.SpellCastTicks = EvokerFangsSpellCastTicks2612
+		st.FangsCooldown = EvokerFangsSpellIntervalTicks2612
 	}
 	mgr.mu.Unlock()
 
@@ -1091,43 +1176,7 @@ func (s *Server) CastEvokerFangsSpell(evokerID int32, targetX, targetY, targetZ 
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundEvokerPrepareAttack, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 
-	dx := targetX - ent.X
-	dz := targetZ - ent.Z
-	dist := math.Hypot(dx, dz)
-
-	if dist <= 3.0 {
-		// Defensive 2-ring circle pattern (5 inner + 8 outer fangs).
-		for i := 0; i < 5; i++ {
-			angle := float64(i) * (2.0 * math.Pi / 5.0)
-			fx := ent.X + math.Cos(angle)*1.5
-			fz := ent.Z + math.Sin(angle)*1.5
-			if fid, err := s.SpawnEvokerFangs(dim, fx, ent.Y, fz, 0, evokerID); err == nil {
-				fangIDs = append(fangIDs, fid)
-			}
-		}
-		for i := 0; i < 8; i++ {
-			angle := float64(i) * (2.0 * math.Pi / 8.0)
-			fx := ent.X + math.Cos(angle)*2.5
-			fz := ent.Z + math.Sin(angle)*2.5
-			if fid, err := s.SpawnEvokerFangs(dim, fx, ent.Y, fz, 3, evokerID); err == nil {
-				fangIDs = append(fangIDs, fid)
-			}
-		}
-		return fangIDs
-	}
-
-	// Offensive line of 8 fangs toward target.
-	dirX := dx / dist
-	dirZ := dz / dist
-	for i := 1; i <= 8; i++ {
-		stepDist := 1.25 * float64(i)
-		fx := ent.X + dirX*stepDist
-		fz := ent.Z + dirZ*stepDist
-		if fid, err := s.SpawnEvokerFangs(dim, fx, targetY, fz, i, evokerID); err == nil {
-			fangIDs = append(fangIDs, fid)
-		}
-	}
-	return fangIDs
+	return s.performEvokerFangsSpellEntities2612(evokerID, ent, targetX, targetY, targetZ)
 }
 
 // CastEvokerSummonVexSpell summons `3` (`EvokerSummonVexCount`) `minecraft:vex`
@@ -1148,7 +1197,8 @@ func (s *Server) CastEvokerSummonVexSpell(evokerID int32) (vexIDs []int32) {
 	mgr.mu.Lock()
 	if st := mgr.illagers[evokerID]; st != nil {
 		st.ActiveSpell = IllagerSpellSummonVex
-		st.SummonVexCooldown = EvokerVexCooldownTicks
+		st.SpellCastTicks = EvokerSummonVexSpellCastTicks2612
+		st.SummonVexCooldown = EvokerSummonVexSpellIntervalTicks2612
 	}
 	mgr.mu.Unlock()
 
@@ -1157,23 +1207,14 @@ func (s *Server) CastEvokerSummonVexSpell(evokerID int32) (vexIDs []int32) {
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundEvokerPrepareSummon, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 
-	for i := 0; i < EvokerSummonVexCount; i++ {
-		angle := float64(i) * (2.0 * math.Pi / float64(EvokerSummonVexCount))
-		vx := ent.X + math.Cos(angle)*1.2
-		vz := ent.Z + math.Sin(angle)*1.2
-		vid, err := s.SpawnVex(dim, vx, ent.Y+1.0, vz, evokerID)
-		if err == nil && vid != 0 {
-			vexIDs = append(vexIDs, vid)
-		}
-	}
-	return vexIDs
+	return s.performEvokerSummonVexEntities2612(evokerID, ent, nil)
 }
 
-// TryEvokerWololoSheep searches within `EvokerWololoRange` (`16.0` blocks) of
-// Evoker `evokerID` for an adult `minecraft:sheep` with Blue wool (`color == 11`)
-// and converts its wool color to Red (`color == 14`, `SoundEvokerPrepareWololo`)!
+// TryEvokerWololoSheep searches within `EvokerWololoRange` (`16.0` horiz, `4.0` vert) of
+// Evoker `evokerID` for an adult `minecraft:sheep` with Blue wool (`color == 11`) when
+// `GameRules.MOB_GRIEFING` is enabled, and converts its wool color to Red (`color == 14`)!
 func (s *Server) TryEvokerWololoSheep(evokerID int32) (convertedSheepID int32, converted bool) {
-	if s == nil || s.entities == nil {
+	if s == nil || s.entities == nil || !s.MobGriefing() {
 		return 0, false
 	}
 	ent := s.entities.Get(evokerID)
@@ -1182,45 +1223,27 @@ func (s *Server) TryEvokerWololoSheep(evokerID int32) (convertedSheepID int32, c
 	}
 	s.ensureIllagerOrRaiderState(evokerID, MobTypeEvoker, false)
 	dim := ent.EffectiveDimension()
-	maxDistSq := EvokerWololoRange * EvokerWololoRange
-
-	const (
-		woolBlue byte = 11
-		woolRed  byte = 14
-	)
-
-	allEnts := s.entities.AppendAll(nil)
-	for i := range allEnts {
-		other := &allEnts[i]
-		if other.EffectiveDimension() != dim || canonicalResourceName(other.TypeName) != MobTypeSheep {
-			continue
-		}
-		if s.IsMobBaby(other.ID) || s.IsSheepSheared(other.ID) || s.SheepWoolColor(other.ID) != woolBlue {
-			continue
-		}
-		dx := other.X - ent.X
-		dy := other.Y - ent.Y
-		dz := other.Z - ent.Z
-		if dx*dx+dy*dy+dz*dz <= maxDistSq {
-			s.SetSheepWoolColor(other.ID, woolRed)
-			mgr := s.illagerManager()
-			mgr.mu.Lock()
-			if st := mgr.illagers[evokerID]; st != nil {
-				st.ActiveSpell = IllagerSpellWololo
-				st.WololoCooldown = EvokerWololoCooldown
-				st.WololoSheepID = other.ID
-			}
-			mgr.mu.Unlock()
-
-			cp := ent.ChunkPos()
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
-				EncodeSpellcasterDataPacket(evokerID, false, IllagerSpellWololo))
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundEvokerPrepareWololo, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-			return other.ID, true
-		}
+	sheepID, found := s.findEvokerWololoBlueSheep2612(dim, ent.X, ent.Y, ent.Z, nil)
+	if !found {
+		return 0, false
 	}
-	return 0, false
+	s.SetSheepWoolColor(sheepID, 14)
+	mgr := s.illagerManager()
+	mgr.mu.Lock()
+	if st := mgr.illagers[evokerID]; st != nil {
+		st.ActiveSpell = IllagerSpellWololo
+		st.SpellCastTicks = EvokerWololoSpellCastTicks2612
+		st.WololoCooldown = EvokerWololoSpellIntervalTicks2612
+		st.WololoSheepID = sheepID
+	}
+	mgr.mu.Unlock()
+
+	cp := ent.ChunkPos()
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+		EncodeSpellcasterDataPacket(evokerID, false, IllagerSpellWololo))
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+		EncodeSoundPacket(SoundEvokerPrepareWololo, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+	return sheepID, true
 }
 
 // ============================================================================
@@ -1361,32 +1384,13 @@ func ReduceWitchMagicDamage(rawDamage float32) float32 {
 // potion type (`WitchPotionWaterBreathing`, `WitchPotionFireResistance`,
 // `WitchPotionHealing`, or `WitchPotionSwiftness`) it should drink, or `""` if none.
 func (s *Server) SelectWitchSelfPotion(witchID int32, targetDist float64) string {
-	if s == nil || s.entities == nil {
-		return WitchPotionNone
-	}
-	ent := s.entities.Get(witchID)
-	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeWitch {
-		return WitchPotionNone
-	}
-	dim := ent.EffectiveDimension()
-	if s.isEntityEyesUnderWater(dim, ent.X, ent.Y, ent.Z, 1.4) && !s.HasEntityEffect(witchID, EffectWaterBreathing) {
-		return WitchPotionWaterBreathing
-	}
-	if s.IsEntityOnFire(witchID) && !s.HasEntityEffect(witchID, EffectFireResistance) {
-		return WitchPotionFireResistance
-	}
-	if s.MobHealth(witchID) < DefaultWitchMaxHealth {
-		return WitchPotionHealing
-	}
-	if targetDist > 11.0 && !s.HasEntityEffect(witchID, EffectSpeed) {
-		return WitchPotionSwiftness
-	}
-	return WitchPotionNone
+	return s.TrySelectWitchSelfPotionAiStep2612(witchID, targetDist > 0, targetDist*targetDist, nil)
 }
 
 // StartWitchDrinkPotion begins a 32-tick potion drinking cycle on Witch
-// `witchID` for `potionType`, setting `Witch.DATA_USING_ITEM = true` and playing
-// `SoundWitchDrink`.
+// `witchID` for `potionType`, equipping `minecraft:potion` in `MAINHAND`, applying
+// `SPEED_MODIFIER_DRINKING` (`-0.25 ADD_VALUE`), setting `Witch.DATA_USING_ITEM = true`,
+// and playing `SoundWitchDrink`.
 func (s *Server) StartWitchDrinkPotion(witchID int32, potionType string) bool {
 	if s == nil || s.entities == nil || potionType == "" {
 		return false
@@ -1396,12 +1400,15 @@ func (s *Server) StartWitchDrinkPotion(witchID int32, potionType string) bool {
 		return false
 	}
 	s.ensureIllagerOrRaiderState(witchID, MobTypeWitch, false)
+	s.equipWitchMainHandPotion2612(witchID, potionType)
+
 	mgr := s.illagerManager()
 	mgr.mu.Lock()
 	st := mgr.witches[witchID]
 	st.Drinking = true
 	st.DrinkingPotion = potionType
 	st.DrinkTicksLeft = WitchDrinkDurationTicks
+	st.SpeedModifierDrinking = WitchDrinkingSpeedModifier2612
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
@@ -1415,7 +1422,8 @@ func (s *Server) StartWitchDrinkPotion(witchID int32, potionType string) bool {
 
 // FinishWitchDrinkPotion completes the Witch's potion drinking and applies the
 // resulting self-buff or heal (`Water Breathing`, `Fire Resistance`, `Healing`,
-// or `Swiftness`), clearing `Witch.DATA_USING_ITEM = false`.
+// or `Swiftness`), clearing `MAINHAND` to `ItemStack.EMPTY`, removing
+// `SPEED_MODIFIER_DRINKING`, emitting `GameEventDrink`, and setting `DATA_USING_ITEM = false`.
 func (s *Server) FinishWitchDrinkPotion(witchID int32) (appliedPotion string, ok bool) {
 	if s == nil || s.entities == nil {
 		return "", false
@@ -1435,25 +1443,36 @@ func (s *Server) FinishWitchDrinkPotion(witchID int32) (appliedPotion string, ok
 	st.Drinking = false
 	st.DrinkingPotion = ""
 	st.DrinkTicksLeft = 0
+	st.SpeedModifierDrinking = 0
+	if appliedPotion == WitchPotionFireResistance {
+		st.LastDamageWasFire = false
+	}
 	mgr.mu.Unlock()
 
-	switch appliedPotion {
-	case WitchPotionWaterBreathing:
-		s.ApplyEntityEffectScaled(witchID, NewStatusEffectInstance(EffectWaterBreathing, WitchSelfBuffDurationTicks, 0), 1.0)
-	case WitchPotionFireResistance:
-		s.ApplyEntityEffectScaled(witchID, NewStatusEffectInstance(EffectFireResistance, WitchSelfBuffDurationTicks, 0), 1.0)
-	case WitchPotionHealing:
-		cur := s.MobHealth(witchID)
-		next := cur + WitchHealAmount
-		if next > DefaultWitchMaxHealth {
-			next = DefaultWitchMaxHealth
+	held := s.MobEquipment(witchID, EquipmentSlotMainHand)
+	hadValidPotionInHand := canonicalResourceName(held.ResolvedID()) == "minecraft:potion"
+	s.equipWitchMainHandPotion2612(witchID, "")
+
+	if hadValidPotionInHand {
+		switch appliedPotion {
+		case WitchPotionWaterBreathing:
+			s.ApplyEntityEffectScaled(witchID, NewStatusEffectInstance(EffectWaterBreathing, WitchSelfBuffDurationTicks, 0), 1.0)
+		case WitchPotionFireResistance:
+			s.ApplyEntityEffectScaled(witchID, NewStatusEffectInstance(EffectFireResistance, WitchSelfBuffDurationTicks, 0), 1.0)
+		case WitchPotionHealing:
+			cur := s.MobHealth(witchID)
+			next := cur + WitchHealAmount
+			if next > DefaultWitchMaxHealth {
+				next = DefaultWitchMaxHealth
+			}
+			s.SetMobHealth(witchID, next)
+		case WitchPotionSwiftness:
+			s.ApplyEntityEffectScaled(witchID, NewStatusEffectInstance(EffectSpeed, WitchSelfBuffDurationTicks, 0), 1.0)
 		}
-		s.SetMobHealth(witchID, next)
-	case WitchPotionSwiftness:
-		s.ApplyEntityEffectScaled(witchID, NewStatusEffectInstance(EffectSpeed, WitchSelfBuffDurationTicks, 0), 1.0)
 	}
 
 	dim := ent.EffectiveDimension()
+	s.EmitGameEvent(dim, GameEventDrink, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: witchID})
 	cp := ent.ChunkPos()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 		EncodeWitchDataPacket(witchID, false, false))
@@ -1462,9 +1481,9 @@ func (s *Server) FinishWitchDrinkPotion(witchID int32) (appliedPotion string, ok
 
 // WitchThrowSplashPotionAtPlayer chooses and throws the vanilla offensive splash
 // potion from Witch `witchID` at `target`:
-//   - Distance >= 8.0 and target lacks Slowness -> Splash Potion of Slowness (90s)
+//   - Horizontal distance >= 8.0 and target lacks Slowness -> Splash Potion of Slowness (90s)
 //   - Target HP >= 8.0 and target lacks Poison -> Splash Potion of Poison (45s)
-//   - Distance <= 3.0 and target lacks Weakness -> Splash Potion of Weakness (90s)
+//   - Horizontal distance <= 3.0 and target lacks Weakness -> Splash Potion of Weakness (90s)
 //   - Otherwise -> Splash Potion of Harming (6.0 instant magic damage)
 func (s *Server) WitchThrowSplashPotionAtPlayer(witchID int32, target *PlayerSession) (potionType string, thrown bool) {
 	if s == nil || s.entities == nil || target == nil || target.IsDead() {
@@ -1477,20 +1496,25 @@ func (s *Server) WitchThrowSplashPotionAtPlayer(witchID int32, target *PlayerSes
 	s.ensureIllagerOrRaiderState(witchID, MobTypeWitch, false)
 	snap := target.Snapshot()
 	dx := snap.X - ent.X
-	dy := snap.Y - ent.Y
 	dz := snap.Z - ent.Z
-	dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+	horizDist := math.Hypot(dx, dz)
 
-	if dist >= 8.0 && !target.HasPlayerEffect(EffectSlowness) {
-		potionType = WitchPotionSlowness
+	potionType = SelectWitchCombatSplashPotion2612(
+		horizDist,
+		snap.Health,
+		target.HasPlayerEffect(EffectSlowness),
+		target.HasPlayerEffect(EffectPoison),
+		target.HasPlayerEffect(EffectWeakness),
+		nil,
+	)
+	switch potionType {
+	case WitchPotionSlowness:
 		s.ApplyPlayerEffect(target, NewStatusEffectInstance(EffectSlowness, WitchSlownessSplashTicks, 0))
-	} else if snap.Health >= 8.0 && !target.HasPlayerEffect(EffectPoison) {
-		potionType = WitchPotionPoison
+	case WitchPotionPoison:
 		s.ApplyPlayerEffect(target, NewStatusEffectInstance(EffectPoison, WitchPoisonSplashTicks, 0))
-	} else if dist <= 3.0 && !target.HasPlayerEffect(EffectWeakness) {
-		potionType = WitchPotionWeakness
+	case WitchPotionWeakness:
 		s.ApplyPlayerEffect(target, NewStatusEffectInstance(EffectWeakness, WitchWeaknessSplashTicks, 0))
-	} else {
+	default:
 		potionType = WitchPotionHarming
 		s.DamagePlayerWithArmor(target, WitchHarmingSplashDamage, "magic")
 	}
@@ -1511,9 +1535,9 @@ func (s *Server) WitchThrowSplashPotionAtPlayer(witchID int32, target *PlayerSes
 }
 
 // TryWitchHealRaidAlly checks if Witch `witchID` belongs to an active Raid and
-// has an injured fellow Raider within `WitchThrowRange` (`10` blocks); if so,
-// throws a Splash Potion of Regeneration / Healing to restore `4.0 HP` and grant
-// `EffectRegeneration` to that raider!
+// has an injured non-Witch Raider within `WitchThrowRange` (`10` blocks); if so,
+// throws `Potions.HEALING` when `allyHP <= 4.0` or `Potions.REGENERATION` when
+// `allyHP > 4.0`, matching `Witch.performRangedAttack` + `NearestHealableRaiderTargetGoal` in 26.1.2!
 func (s *Server) TryWitchHealRaidAlly(witchID int32) (healedRaiderID int32, healed bool) {
 	if s == nil || s.entities == nil {
 		return 0, false
@@ -1522,6 +1546,7 @@ func (s *Server) TryWitchHealRaidAlly(witchID int32) (healedRaiderID int32, heal
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeWitch {
 		return 0, false
 	}
+	s.ensureIllagerOrRaiderState(witchID, MobTypeWitch, false)
 	rm := s.raidManager()
 	rm.mu.Lock()
 	ws := rm.raiderIndex[witchID]
@@ -1531,7 +1556,7 @@ func (s *Server) TryWitchHealRaidAlly(witchID int32) (healedRaiderID int32, heal
 	}
 	var candidateIDs []int32
 	if raidID > 0 {
-		if r := rm.raids[raidID]; r != nil {
+		if r := rm.raids[raidID]; r != nil && r.Status == RaidStatusOngoing {
 			for eid := range r.Raiders {
 				if eid != witchID {
 					candidateIDs = append(candidateIDs, eid)
@@ -1551,6 +1576,10 @@ func (s *Server) TryWitchHealRaidAlly(witchID int32) (healedRaiderID int32, heal
 		if ally == nil || ally.EffectiveDimension() != dim {
 			continue
 		}
+		// `NearestHealableRaiderTargetGoal` selector excludes other Witches (`!target.is(EntityType.WITCH)`).
+		if canonicalResourceName(ally.TypeName) == MobTypeWitch {
+			continue
+		}
 		maxHP := RaiderMaxHealth(ally.TypeName)
 		curHP := s.MobHealth(cid)
 		if curHP <= 0 || curHP >= maxHP {
@@ -1560,17 +1589,22 @@ func (s *Server) TryWitchHealRaidAlly(witchID int32) (healedRaiderID int32, heal
 		dy := ally.Y - ent.Y
 		dz := ally.Z - ent.Z
 		if dx*dx+dy*dy+dz*dz <= maxDistSq {
-			nextHP := curHP + WitchHealAmount
-			if nextHP > maxHP {
-				nextHP = maxHP
+			chosenPot := SelectWitchRaiderSupportPotion2612(curHP)
+			if chosenPot == WitchPotionHealing {
+				nextHP := curHP + WitchHealAmount
+				if nextHP > maxHP {
+					nextHP = maxHP
+				}
+				s.SetMobHealth(cid, nextHP)
+			} else {
+				s.ApplyEntityEffectScaled(cid, NewStatusEffectInstance(EffectRegeneration, WitchRegenRaidAllySplashTicks, 0), 1.0)
 			}
-			s.SetMobHealth(cid, nextHP)
-			s.ApplyEntityEffectScaled(cid, NewStatusEffectInstance(EffectRegeneration, WitchRegenRaidAllySplashTicks, 0), 1.0)
 			mgr := s.illagerManager()
 			mgr.mu.Lock()
 			if st := mgr.witches[witchID]; st != nil {
-				st.LastThrownPotion = WitchPotionRegeneration
+				st.LastThrownPotion = chosenPot
 				st.ThrowCooldown = WitchThrowCooldownTicks
+				st.HealRaidersCooldown = WitchHealRaidersCooldownTicks2612
 			}
 			mgr.mu.Unlock()
 			cp := ent.ChunkPos()
@@ -1824,14 +1858,15 @@ func (s *Server) RavagerDestroyBlocksAround(ravagerID int32) (brokenBlocks [][3]
 // ============================================================================
 
 // TickIllagersWitchesRavagersAndVexes steps all active Illagers, Patrols,
-// Evoker Fangs, Vexes, Witches, and Ravagers by 1 server tick (20 TPS).
+// Evoker Fangs, Vexes, Witches, ThrownSplashPotions, and Ravagers by 1 server tick (20 TPS).
 func (s *Server) TickIllagersWitchesRavagersAndVexes(rng *rand.Rand) {
 	if s == nil || s.entities == nil {
 		return
 	}
+	s.tickWitchSplashPotions2612()
 	s.tickEvokerFangs()
 	s.tickVexes()
-	s.tickWitches()
+	s.tickWitches(rng)
 	s.tickRavagers()
 	s.tickIllagersAndPatrols(rng)
 }
@@ -1863,29 +1898,44 @@ func (s *Server) tickEvokerFangs() {
 			mgr.mu.Unlock()
 			continue
 		}
-		if st.WarmupDelayTicks > 0 {
-			st.WarmupDelayTicks--
+		if st.LifeTicksRemaining == 0 && st.LifeTicks == 0 {
+			st.LifeTicksRemaining = EvokerFangsInitialLifeTicks2612
+		}
+		// Exact `EvokerFangs.tick()` (`26.1.2.jar`):
+		//   `--this.warmupDelayTicks`:
+		//   if `warmupDelayTicks < 0`:
+		//     send event 4 once, `--this.lifeTicks`:
+		//     if `this.lifeTicks == 14` (`warmupDelayTicks == -8`) -> deal 6.0 magic damage!
+		//     if `this.lifeTicks < 0` -> discard!
+		st.WarmupDelayTicks--
+		if st.WarmupDelayTicks >= 0 {
 			mgr.mu.Unlock()
 			continue
 		}
+		sendSpikeEvent := !st.SentSpikeEvent
+		if sendSpikeEvent {
+			st.SentSpikeEvent = true
+		}
 		st.LifeTicks++
-		snapAttack := !st.HasDealtDamage
-		if snapAttack {
+		st.LifeTicksRemaining--
+		dealDamageNow := st.LifeTicksRemaining == EvokerFangsDamageLifeTick2612 && !st.HasDealtDamage
+		if dealDamageNow {
 			st.HasDealtDamage = true
 		}
-		expired := st.LifeTicks >= EvokerFangsLifetimeTicks
+		expired := st.LifeTicksRemaining < 0
 		ownerID := st.OwnerID
 		dim := st.Dimension
 		mgr.mu.Unlock()
 
 		cp := ent.ChunkPos()
-		if snapAttack {
+		if sendSpikeEvent {
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
 				EncodeEntityEventPacket(id, EntityEventEvokerFangsAttack))
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 				EncodeSoundPacket(SoundEvokerFangsAttack, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-
-			// Deal 6.0 HP magic damage to survival players and non-illager entities within 1.25 blocks.
+		}
+		if dealDamageNow {
+			// `getBoundingBox().inflate(0.2, 0.0, 0.2)` around 0.5x0.8 EvokerFangs -> horiz half-extent 0.45 + target halfW (~0.75..1.15).
 			for _, p := range s.onlinePlayersSnapshot() {
 				if p == nil || p.IsDead() {
 					continue
@@ -1894,27 +1944,29 @@ func (s *Server) tickEvokerFangs() {
 				if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeCreative || ps.GameMode == GameModeSpectator {
 					continue
 				}
-				dx := ps.X - ent.X
-				dy := ps.Y - ent.Y
-				dz := ps.Z - ent.Z
-				if dx*dx+dz*dz <= 1.56 && math.Abs(dy) <= 1.5 {
+				if math.Abs(ps.X-ent.X) <= 0.75 && math.Abs(ps.Z-ent.Z) <= 0.75 &&
+					ps.Y <= ent.Y+0.8 && ps.Y+1.8 >= ent.Y {
 					s.DamagePlayerWithArmor(p, EvokerFangsDamage, "magic")
 				}
 			}
 			allEnts := s.entities.AppendAll(nil)
 			for i := range allEnts {
 				other := &allEnts[i]
-				if other.ID == id || other.ID == ownerID || other.EffectiveDimension() != dim || other.IsItem() || other.IsExperienceOrb() {
+				if other.ID == id || other.ID == ownerID || other.EffectiveDimension() != dim || !IsAttackableLivingMobEntity2612(other) {
 					continue
 				}
-				if IsIllagerOrRaiderFamily(other.TypeName) {
+				if s.IsEvokerAlliedToEntity2612(ownerID, other) {
 					continue
 				}
-				dx := other.X - ent.X
-				dy := other.Y - ent.Y
-				dz := other.Z - ent.Z
-				if dx*dx+dz*dz <= 1.56 && math.Abs(dy) <= 1.5 {
-					s.applyDamageToMob(other, EvokerFangsDamage, nil, 0.1, false, false)
+				if math.Abs(other.X-ent.X) <= 0.95 && math.Abs(other.Z-ent.Z) <= 0.95 &&
+					other.Y <= ent.Y+0.8 && other.Y+1.8 >= ent.Y {
+					dmg := EvokerFangsDamage
+					if canonicalResourceName(other.TypeName) == MobTypeWitch {
+						dmg = ComputeWitchDamageAfterMagicAbsorb2612(other.ID, ownerID, "indirect_magic", dmg)
+					}
+					if dmg > 0 {
+						s.applyDamageToMob(other, dmg, nil, 0.1, false, false)
+					}
 				}
 			}
 		}
@@ -1973,14 +2025,25 @@ func (s *Server) tickVexes() {
 		if st.AttackCooldown > 0 {
 			st.AttackCooldown--
 		}
-		ownerDead := st.OwnerEvokerID > 0 && s.entities.Get(st.OwnerEvokerID) == nil
-		decaying := (st.HasLimitedLife && st.LifeTicks >= st.MaxLifeTicks) || ownerDead
-		lifeTicks := st.LifeTicks
+		takeStarve := false
+		if st.HasLimitedLife {
+			if st.LimitedLifeTicks > 0 {
+				st.LimitedLifeTicks--
+				if st.LimitedLifeTicks <= 0 {
+					st.LimitedLifeTicks = VexStarveDamageIntervalTicks2612
+					takeStarve = true
+				}
+			}
+			// Preserve legacy MaxLifeTicks test hook if LifeTicks was bumped directly.
+			if !takeStarve && st.MaxLifeTicks > 0 && st.LifeTicks >= st.MaxLifeTicks && st.LifeTicks%VexStarveDamageIntervalTicks2612 == 0 {
+				takeStarve = true
+			}
+		}
 		canAttack := st.AttackCooldown <= 0
 		mgr.mu.Unlock()
 
-		// Vex limited-life starvation decay: 1.0 damage every 20 ticks once MaxLifeTicks is exceeded or summoner dies.
-		if decaying && lifeTicks%20 == 0 {
+		// Vex limited-life starvation decay (`Vex.tick()`: `--limitedLifeTicks <= 0` -> `limitedLifeTicks = 20; hurt(starve, 1.0F)`).
+		if takeStarve {
 			if s.applyDamageToMob(ent, 1.0, nil, 0, false, false) {
 				mgr.mu.Lock()
 				delete(mgr.vexes, id)
@@ -2045,7 +2108,7 @@ func (s *Server) tickVexes() {
 	}
 }
 
-func (s *Server) tickWitches() {
+func (s *Server) tickWitches(rng *rand.Rand) {
 	mgr := s.illagerManager()
 	mgr.mu.RLock()
 	if len(mgr.witches) == 0 {
@@ -2066,55 +2129,214 @@ func (s *Server) tickWitches() {
 			mgr.mu.Unlock()
 			continue
 		}
+		dim := ent.EffectiveDimension()
+		cache := s.DimensionChunks(dim)
+
 		mgr.mu.Lock()
 		st := mgr.witches[id]
 		if st == nil {
 			mgr.mu.Unlock()
 			continue
 		}
-		if st.ThrowCooldown > 0 {
-			st.ThrowCooldown--
+		if st.HealRaidersCooldown > 0 {
+			st.HealRaidersCooldown--
 		}
-		if st.Drinking {
-			st.DrinkTicksLeft--
-			done := st.DrinkTicksLeft <= 0
-			mgr.mu.Unlock()
-			if done {
-				_, _ = s.FinishWitchDrinkPotion(id)
-			}
-			continue
-		}
-		canThrow := st.ThrowCooldown <= 0
+		healCD := st.HealRaidersCooldown
+		isDrinking := st.Drinking
 		mgr.mu.Unlock()
 
-		// Check if Witch needs to drink a self-buff/healing potion.
-		if selfPot := s.SelectWitchSelfPotion(id, 0); selfPot != "" {
-			s.StartWitchDrinkPotion(id, selfPot)
+		// Find active target: during active raid when `healCD <= 0`, check injured non-Witch raider (`50%` roll);
+		// otherwise nearest survival player within 16 blocks (`attackPlayersGoal` enabled when `healCD <= 0`).
+		var targetPlayer *PlayerSession
+		var targetRaider *world.Entity
+		var targetX, targetEyeY, targetZ, targetVX, targetVZ, targetDistSq float64
+		hasTarget := false
+
+		if s.Difficulty() != DifficultyPeaceful {
+			if healCD <= 0 && s.IsEntityInActiveRaid2612(id) && (rng == nil || rng.Intn(2) == 0) {
+				rm := s.raidManager()
+				rm.mu.Lock()
+				var candIDs []int32
+				if ws := rm.raiderIndex[id]; ws != nil && ws.RaidID > 0 {
+					if r := rm.raids[ws.RaidID]; r != nil && r.Status == RaidStatusOngoing {
+						for rid := range r.Raiders {
+							if rid != id {
+								candIDs = append(candIDs, rid)
+							}
+						}
+					}
+				}
+				rm.mu.Unlock()
+				bestRSq := 144.0 // followRange 12^2
+				for _, rid := range candIDs {
+					ally := s.entities.Get(rid)
+					if ally == nil || ally.EffectiveDimension() != dim || canonicalResourceName(ally.TypeName) == MobTypeWitch {
+						continue
+					}
+					hp := s.MobHealth(rid)
+					if hp <= 0 || hp >= RaiderMaxHealth(ally.TypeName) {
+						continue
+					}
+					dx, dy, dz := ally.X-ent.X, ally.Y-ent.Y, ally.Z-ent.Z
+					dSq := dx*dx + dy*dy + dz*dz
+					if dSq <= bestRSq {
+						bestRSq = dSq
+						allyCopy := *ally
+						targetRaider = &allyCopy
+						targetX, targetEyeY, targetZ = ally.X, ally.Y+1.62, ally.Z
+						targetDistSq = dSq
+						hasTarget = true
+					}
+				}
+				if targetRaider != nil {
+					mgr.mu.Lock()
+					if stNow := mgr.witches[id]; stNow != nil {
+						stNow.HealRaidersCooldown = WitchHealRaidersCooldownTicks2612
+					}
+					mgr.mu.Unlock()
+				}
+			}
+			if !hasTarget && healCD <= 0 {
+				bestPSq := 256.0 // 16^2
+				for _, p := range s.onlinePlayersSnapshot() {
+					if p == nil || p.IsDead() {
+						continue
+					}
+					ps := p.Snapshot()
+					if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeCreative || ps.GameMode == GameModeSpectator {
+						continue
+					}
+					dx, dy, dz := ps.X-ent.X, ps.Y-ent.Y, ps.Z-ent.Z
+					dSq := dx*dx + dy*dy + dz*dz
+					if dSq <= bestPSq {
+						bestPSq = dSq
+						targetPlayer = p
+						targetX, targetEyeY, targetZ = ps.X, ps.Y+1.62, ps.Z
+						targetDistSq = dSq
+						hasTarget = true
+					}
+				}
+			}
+		}
+
+		// 1. `Witch.aiStep()` self-drinking (`usingTime-- <= 0` post-decrement).
+		if isDrinking {
+			mgr.mu.Lock()
+			var finishNow bool
+			if stNow := mgr.witches[id]; stNow != nil && stNow.Drinking {
+				oldUsing := stNow.DrinkTicksLeft
+				stNow.DrinkTicksLeft--
+				if oldUsing <= 0 {
+					finishNow = true
+				}
+			}
+			mgr.mu.Unlock()
+			if finishNow {
+				_, _ = s.FinishWitchDrinkPotion(id)
+			}
+		} else {
+			if selfPot := s.TrySelectWitchSelfPotionAiStep2612(id, hasTarget, targetDistSq, rng); selfPot != "" {
+				s.StartWitchDrinkPotion(id, selfPot)
+			}
+		}
+
+		// 2. `RangedAttackGoal(this, 1.0D, 60, 10.0F)`:
+		if !hasTarget || s.Difficulty() == DifficultyPeaceful {
+			mgr.mu.Lock()
+			if stNow := mgr.witches[id]; stNow != nil {
+				stNow.SeeTime = 0
+				stNow.ThrowCooldown = -1
+				stNow.PrevTargetID = 0
+			}
+			mgr.mu.Unlock()
 			continue
 		}
 
-		if !canThrow || s.Difficulty() == DifficultyPeaceful {
+		var curTargetID int32
+		if targetRaider != nil {
+			curTargetID = targetRaider.ID
+			targetVX = float64(targetRaider.VelocityX) / 8000.0
+			targetVZ = float64(targetRaider.VelocityZ) / 8000.0
+		} else if targetPlayer != nil {
+			curTargetID = targetPlayer.EntityID
+		}
+
+		hasLOS := hasColliderLineOfSight2612(cache, ent.X, ent.Y+WitchEyeHeight2612, ent.Z, targetX, targetEyeY, targetZ)
+		mgr.mu.Lock()
+		stNow := mgr.witches[id]
+		if stNow == nil {
+			mgr.mu.Unlock()
 			continue
 		}
-		// During a raid, prioritize healing injured fellow raiders.
-		if _, healed := s.TryWitchHealRaidAlly(id); healed {
-			continue
+		if curTargetID > 0 && stNow.PrevTargetID == curTargetID && targetVX == 0 && targetVZ == 0 {
+			dxMove := targetX - stNow.PrevTargetX
+			dzMove := targetZ - stNow.PrevTargetZ
+			if dxMove*dxMove+dzMove*dzMove <= 4.0 {
+				targetVX = dxMove
+				targetVZ = dzMove
+			}
 		}
-		dim := ent.EffectiveDimension()
-		for _, p := range s.onlinePlayersSnapshot() {
-			if p == nil || p.IsDead() {
-				continue
+		stNow.PrevTargetID = curTargetID
+		stNow.PrevTargetX = targetX
+		stNow.PrevTargetZ = targetZ
+		if hasLOS {
+			stNow.SeeTime++
+		} else {
+			stNow.SeeTime = 0
+		}
+		seeTime := stNow.SeeTime
+		stNow.ThrowCooldown--
+		fireNow := false
+		if stNow.ThrowCooldown == 0 {
+			if hasLOS {
+				fireNow = true
+				stNow.ThrowCooldown = WitchThrowCooldownTicks
 			}
-			ps := p.Snapshot()
-			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeCreative || ps.GameMode == GameModeSpectator {
-				continue
+		} else if stNow.ThrowCooldown < 0 {
+			stNow.ThrowCooldown = WitchThrowCooldownTicks
+		}
+		currentlyDrinking := stNow.Drinking
+		mgr.mu.Unlock()
+
+		// Move toward target when `distSq > 100.0 || seeTime < 5` using `WitchEffectiveMovementSpeed2612` (`0.0` while drinking!).
+		if targetDistSq > WitchThrowRange*WitchThrowRange || seeTime < 5 {
+			effSpeed := s.WitchEffectiveMovementSpeed2612(id) * 0.45
+			if effSpeed > 0 {
+				s.moveIllagerHorizontallyToward2612(id, ent, targetX, targetZ, effSpeed)
+				ent = s.entities.Get(id)
+				if ent == nil {
+					continue
+				}
 			}
-			dx := ps.X - ent.X
-			dy := ps.Y - ent.Y
-			dz := ps.Z - ent.Z
-			if dx*dx+dy*dy+dz*dz <= WitchThrowRange*WitchThrowRange {
-				_, _ = s.WitchThrowSplashPotionAtPlayer(id, p)
-				break
+		}
+
+		// `Witch.performRangedAttack`: if `isDrinkingPotion()`, returns early without throwing!
+		if fireNow && !currentlyDrinking {
+			spawnX, spawnY, spawnZ, vx, vy, vz, horizDist := ComputeWitchSplashPotionAim2612(
+				ent.X, ent.Y, ent.Z,
+				targetX, targetEyeY, targetZ,
+				targetVX, targetVZ,
+				rng,
+			)
+			var potType string
+			if targetRaider != nil {
+				potType = SelectWitchRaiderSupportPotion2612(s.MobHealth(targetRaider.ID))
+			} else if targetPlayer != nil {
+				ps := targetPlayer.Snapshot()
+				potType = SelectWitchCombatSplashPotion2612(
+					horizDist,
+					ps.Health,
+					targetPlayer.HasPlayerEffect(EffectSlowness),
+					targetPlayer.HasPlayerEffect(EffectPoison),
+					targetPlayer.HasPlayerEffect(EffectWeakness),
+					rng,
+				)
+			}
+			if potType != "" {
+				s.SpawnWitchSplashPotionProjectile2612(dim, id, potType, spawnX, spawnY, spawnZ, vx, vy, vz)
+				cp := ent.ChunkPos()
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundWitchThrow, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 			}
 		}
 	}
@@ -2215,11 +2437,8 @@ func (s *Server) tickIllagersAndPatrols(rng *rand.Rand) {
 			st.WololoCooldown--
 		}
 		mobType := st.MobType
-		isJohnny := st.IsJohnny
 		patrolID := st.PatrolID
 		leaderID := st.PatrolLeaderID
-		fangsCD := st.FangsCooldown
-		wololoCD := st.WololoCooldown
 		mgr.mu.Unlock()
 
 		dim := ent.EffectiveDimension()
@@ -2239,35 +2458,21 @@ func (s *Server) tickIllagersAndPatrols(rng *rand.Rand) {
 						e.Yaw = yaw
 						e.HeadYaw = yaw
 					})
+					ent = s.entities.Get(id)
+					if ent == nil {
+						continue
+					}
 				}
 			}
 		}
 
-		// Vindicator "Johnny" attacks any nearby non-illager living mob!
-		if mobType == MobTypeVindicator && isJohnny {
-			allEnts := s.entities.AppendAll(nil)
-			for i := range allEnts {
-				other := &allEnts[i]
-				if other.ID == id || other.EffectiveDimension() != dim || other.IsItem() || other.IsExperienceOrb() {
-					continue
-				}
-				if IsIllagerOrRaiderFamily(other.TypeName) || IsDecorationEntity(other.TypeName) {
-					continue
-				}
-				dx := other.X - ent.X
-				dy := other.Y - ent.Y
-				dz := other.Z - ent.Z
-				if dx*dx+dy*dy+dz*dz <= 9.0 {
-					s.applyDamageToMob(other, VindicatorJohnnyAttackDmg, nil, 0.3, false, true)
-					break
-				}
-			}
-		}
-
-		// Evoker Wololo sheep conversion when out of cooldown.
-		if mobType == MobTypeEvoker && wololoCD == 0 && fangsCD == 0 {
-			_, _ = s.TryEvokerWololoSheep(id)
+		switch mobType {
+		case MobTypePillager:
+			s.tickPillagerCrossbowAI2612(id, ent, rng)
+		case MobTypeVindicator:
+			s.tickVindicatorAI2612(id, ent, rng)
+		case MobTypeEvoker:
+			s.tickEvokerAI2612(id, ent, rng)
 		}
 	}
-	_ = rng
 }

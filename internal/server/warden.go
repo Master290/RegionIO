@@ -1485,8 +1485,12 @@ func (s *Server) FireWardenSonicBoom(wardenID int32, targetEntityID int32) float
 			if math.Hypot(dx, dz) > WardenSonicBoomHorizRange || dy > WardenSonicBoomVertRange {
 				return 0
 			}
-			s.applyDamageToMob(targetEnt, WardenSonicBoomDamage, nil, WardenSonicBoomHorizKB, false, true)
-			return WardenSonicBoomDamage
+			mobDmg := WardenSonicBoomDamage
+			if canonicalResourceName(targetEnt.TypeName) == MobTypeWitch {
+				mobDmg = ComputeWitchDamageAfterMagicAbsorb2612(targetEnt.ID, wardenID, "sonic_boom", mobDmg)
+			}
+			s.applyDamageToMob(targetEnt, mobDmg, nil, WardenSonicBoomHorizKB, false, true)
+			return mobDmg
 		}
 	}
 	return 0

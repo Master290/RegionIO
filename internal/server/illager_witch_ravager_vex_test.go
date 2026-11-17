@@ -97,6 +97,7 @@ func TestPillagerCrossbowAndVindicatorJohnny(t *testing.T) {
 func TestEvokerFangsVexSummonDecayAndWololoSheep(t *testing.T) {
 	s := newSurvivalTestServer(t)
 	s.SetDifficulty(DifficultyNormal)
+	placeFlatStoneFloor2612(s, world.DimensionOverworld, -8, 32, 64, -8, 16)
 	rng := rand.New(rand.NewSource(19))
 
 	evokerID, err := s.SpawnMobInDimension(world.DimensionOverworld, 0.5, 65.0, 0.5, MobTypeEvoker)
@@ -104,10 +105,10 @@ func TestEvokerFangsVexSummonDecayAndWololoSheep(t *testing.T) {
 		t.Fatalf("SpawnMobInDimension(evoker) failed: %v", err)
 	}
 
-	// 1. Cast Evoker Fangs in a line (distance > 3) and in a 2-ring circle (distance <= 3).
+	// 1. Cast Evoker Fangs in a line (distance >= 3 -> 16 fangs) and in a 2-ring circle (distance < 3 -> 13 fangs).
 	lineFangs := s.CastEvokerFangsSpell(evokerID, 8.5, 65.0, 0.5)
-	if len(lineFangs) != 8 {
-		t.Fatalf("expected 8 fangs in line attack, got %d", len(lineFangs))
+	if len(lineFangs) != 16 {
+		t.Fatalf("expected 16 fangs in line attack, got %d", len(lineFangs))
 	}
 	circleFangs := s.CastEvokerFangsSpell(evokerID, 1.5, 65.0, 0.5)
 	if len(circleFangs) != 13 {
@@ -116,7 +117,7 @@ func TestEvokerFangsVexSummonDecayAndWololoSheep(t *testing.T) {
 
 	victim := newBeeTestPlayer(t, s, "FangVictim", 2.0, 65.0, 0.5)
 	hpBefore := victim.Snapshot().Health
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 12; i++ {
 		s.TickIllagersWitchesRavagersAndVexes(rng)
 	}
 	if victim.Snapshot().Health >= hpBefore {
@@ -239,9 +240,15 @@ func TestWitchPotionsMagicResistanceAndRaidAllyHeal(t *testing.T) {
 	s.SetMobHealth(allyID, 10.0)
 
 	healedID, healed := s.TryWitchHealRaidAlly(raidWitchID)
-	if !healed || healedID != allyID || s.MobHealth(allyID) <= 10.0 || !s.HasEntityEffect(allyID, EffectRegeneration) {
-		t.Fatalf("expected raid witch to heal and regenerate injured raider %d, healed=%v hp=%v",
+	if !healed || healedID != allyID || !s.HasEntityEffect(allyID, EffectRegeneration) {
+		t.Fatalf("expected raid witch to apply Regeneration to injured raider %d (HP=10 > 4), healed=%v hp=%v",
 			allyID, healed, s.MobHealth(allyID))
+	}
+	s.SetMobHealth(allyID, 3.0)
+	healedID2, healed2 := s.TryWitchHealRaidAlly(raidWitchID)
+	if !healed2 || healedID2 != allyID || s.MobHealth(allyID) <= 3.0 {
+		t.Fatalf("expected raid witch to apply instant Healing to critically injured raider %d (HP<=4), healed=%v hp=%v",
+			allyID, healed2, s.MobHealth(allyID))
 	}
 }
 

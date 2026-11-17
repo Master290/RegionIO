@@ -311,8 +311,12 @@ func (s *Server) OnGuardianThornsRetaliateMob(entityID, attackerMobID int32) (re
 	if attEnt == nil {
 		return false, 0
 	}
-	s.applyDamageToMob(attEnt, GuardianThornsDamage, nil, 0.2, false, false)
-	return true, GuardianThornsDamage
+	dmg := GuardianThornsDamage
+	if canonicalResourceName(attEnt.TypeName) == MobTypeWitch {
+		dmg = ComputeWitchDamageAfterMagicAbsorb2612(attEnt.ID, entityID, "thorns", dmg)
+	}
+	s.applyDamageToMob(attEnt, dmg, nil, 0.2, false, false)
+	return true, dmg
 }
 
 // OnGuardianOrElderKilled cleans up GuardianBehaviorState when a Guardian or

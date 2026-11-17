@@ -1208,7 +1208,16 @@ func (s *Server) ApplyEntityEffectScaled(entityID int32, inst StatusEffectInstan
 		} else {
 			base := float64(int(6) << minInt32(inst.Amplifier, 20))
 			dmg := float32(math.Floor(scale*base + 0.5))
-			s.damageOrKillMobFromEffect(ent, dmg)
+			if canonicalResourceName(ent.TypeName) == MobTypeWitch {
+				mgr := s.illagerManager()
+				mgr.mu.RLock()
+				splashOwner := mgr.activeSplashOwnerID
+				mgr.mu.RUnlock()
+				dmg = ComputeWitchDamageAfterMagicAbsorb2612(ent.ID, splashOwner, "indirect_magic", dmg)
+			}
+			if dmg > 0 {
+				s.damageOrKillMobFromEffect(ent, dmg)
+			}
 		}
 		return true
 

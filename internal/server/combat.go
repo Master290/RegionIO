@@ -753,7 +753,11 @@ func (s *Server) ApplyThornsRetaliation(target *PlayerSession, attackerMobID int
 		EncodeSoundPacket("minecraft:enchant.thorns.hit", SoundSourcePlayers, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
 	if attackerMobID > 0 && s.entities != nil {
 		if mob := s.entities.Get(attackerMobID); mob != nil {
-			s.applyDamageToMob(mob, totalThornsDamage, target, 0, false, false)
+			mobThornsDmg := totalThornsDamage
+			if canonicalResourceName(mob.TypeName) == MobTypeWitch {
+				mobThornsDmg = ComputeWitchDamageAfterMagicAbsorb2612(mob.ID, snap.EntityID, "thorns", mobThornsDmg)
+			}
+			s.applyDamageToMob(mob, mobThornsDmg, target, 0, false, false)
 		}
 	}
 	if attackerPlayer != nil && !attackerPlayer.IsDead() {
