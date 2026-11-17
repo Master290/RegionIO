@@ -502,18 +502,22 @@ func (s *Server) BrewingStandComparatorSignalAt(dim string, x, y, z int) int {
 // BrewingStandBlockEntity represents the persistent and runtime state of a
 // minecraft:brewing_stand block entity at (Dimension, X, Y, Z).
 type BrewingStandBlockEntity struct {
-	ID          string
-	Dimension   string
-	X           int
-	Y           int
-	Z           int
-	CustomName  string
-	Items       [BrewingStandSlotCount]world.ItemStack
-	PotionTypes [3]string // canonical potion IDs for bottle slots 0..2
-	BrewTime    int16     // remaining ticks in current brew (400..0)
-	Fuel        int16     // remaining fuel charges (0..20)
-	ingredient  string    // item ID of ingredient when brewing started
-	lastBrewer  *PlayerSession
+	ID             string
+	Dimension      string
+	X              int
+	Y              int
+	Z              int
+	CustomName     string
+	CustomNameTag  nbt.Tag
+	Lock           string
+	LockTag        nbt.Tag
+	Items          [BrewingStandSlotCount]world.ItemStack
+	SlotComponents [BrewingStandSlotCount]*nbt.Compound
+	PotionTypes    [3]string // canonical potion IDs for bottle slots 0..2
+	BrewTime       int16     // remaining ticks in current brew (400..0)
+	Fuel           int16     // remaining fuel charges (0..20)
+	ingredient     string    // item ID of ingredient when brewing started
+	lastBrewer     *PlayerSession
 }
 
 // Clone returns a deep copy of b.
@@ -526,6 +530,11 @@ func (b BrewingStandBlockEntity) Clone() BrewingStandBlockEntity {
 		cp.Dimension = world.DimensionOverworld
 	} else {
 		cp.Dimension = world.NormalizeDimension(cp.Dimension)
+	}
+	cp.CustomNameTag = world.CloneNBTTag(b.CustomNameTag)
+	cp.LockTag = world.CloneNBTTag(b.LockTag)
+	for i := range b.SlotComponents {
+		cp.SlotComponents[i] = world.CloneNBTCompound(b.SlotComponents[i])
 	}
 	for i := 0; i < 3; i++ {
 		if IsPotionItem(cp.Items[i]) {
@@ -543,14 +552,21 @@ func EncodeBrewingStandBlockEntityNBT(b BrewingStandBlockEntity) *nbt.Compound {
 	b = b.Clone()
 	c := nbt.NewCompound().
 		Set("id", nbt.String("minecraft:brewing_stand")).
-		Set("dimension", nbt.String(b.Dimension)).
 		Set("x", nbt.Int(b.X)).
 		Set("y", nbt.Int(b.Y)).
 		Set("z", nbt.Int(b.Z)).
+		Set("keepPacked", nbt.Byte(0)).
 		Set("BrewTime", nbt.Short(b.BrewTime)).
-		Set("Fuel", nbt.Byte(b.Fuel))
-	if b.CustomName != "" {
+		Set("Fuel", nbt.Byte(int8(b.Fuel)))
+	if b.CustomNameTag != nil && (b.CustomName == "" || world.ExtractCustomNameFromNBTTag(b.CustomNameTag) == b.CustomName) {
+		c.Set("CustomName", world.CloneNBTTag(b.CustomNameTag))
+	} else if b.CustomName != "" {
 		c.Set("CustomName", nbt.String(b.CustomName))
+	}
+	if b.LockTag != nil && (b.Lock == "" || world.ExtractLockStringFromNBTTag(b.LockTag) == b.Lock) {
+		c.Set("lock", world.CloneNBTTag(b.LockTag))
+	} else if b.Lock != "" {
+		c.Set("lock", nbt.String(b.Lock))
 	}
 
 	var items []nbt.Tag
@@ -566,12 +582,32 @@ func EncodeBrewingStandBlockEntityNBT(b BrewingStandBlockEntity) *nbt.Compound {
 			Set("Slot", nbt.Byte(slot)).
 			Set("id", nbt.String(itemID)).
 			Set("count", nbt.Int(st.Count))
+		var comps *nbt.Compound
+		if b.SlotComponents[slot] != nil && b.SlotComponents[slot].Len() > 0 {
+			comps = world.CloneNBTCompound(b.SlotComponents[slot])
+		}
 		if slot < 3 && IsPotionItem(st) {
 			pType := b.PotionTypes[slot]
 			if pType == "" {
 				pType = PotionWater
 			}
-			itemComp.Set("Potion", nbt.String(canonicalPotionID(pType)))
+			if comps == nil {
+				comps = nbt.NewCompound()
+			}
+			var pcComp *nbt.Compound
+			if existingPC, ok := comps.Get("minecraft:potion_contents"); ok {
+				if existingMap, ok := existingPC.(*nbt.Compound); ok {
+					pcComp = world.CloneNBTCompound(existingMap)
+				}
+			}
+			if pcComp == nil {
+				pcComp = nbt.NewCompound()
+			}
+			pcComp.Set("potion", nbt.String(canonicalPotionID(pType)))
+			comps.Set("minecraft:potion_contents", pcComp)
+		}
+		if comps != nil && comps.Len() > 0 {
+			itemComp.Set("components", comps)
 		}
 		items = append(items, itemComp)
 	}
@@ -607,9 +643,15 @@ func DecodeBrewingStandBlockEntityNBT(c *nbt.Compound) (BrewingStandBlockEntity,
 		}
 	}
 	if cnTag, ok := c.Get("CustomName"); ok {
-		if cs, ok := cnTag.(nbt.String); ok {
-			b.CustomName = string(cs)
-		}
+		b.CustomNameTag = world.CloneNBTTag(cnTag)
+		b.CustomName = world.ExtractCustomNameFromNBTTag(cnTag)
+	}
+	if lockTag, ok := c.Get("lock"); ok {
+		b.LockTag = world.CloneNBTTag(lockTag)
+		b.Lock = world.ExtractLockStringFromNBTTag(lockTag)
+	} else if lockTag, ok := c.Get("Lock"); ok {
+		b.LockTag = world.CloneNBTTag(lockTag)
+		b.Lock = world.ExtractLockStringFromNBTTag(lockTag)
 	}
 	if xTag, ok := c.Get("x"); ok {
 		if v, ok := xTag.(nbt.Int); ok {
@@ -637,7 +679,7 @@ func DecodeBrewingStandBlockEntityNBT(c *nbt.Compound) (BrewingStandBlockEntity,
 	if fuelTag, ok := c.Get("Fuel"); ok {
 		switch v := fuelTag.(type) {
 		case nbt.Byte:
-			b.Fuel = int16(uint8(v))
+			b.Fuel = int16(int8(v))
 		case nbt.Short:
 			b.Fuel = int16(v)
 		case nbt.Int:
@@ -695,18 +737,44 @@ func DecodeBrewingStandBlockEntityNBT(c *nbt.Compound) (BrewingStandBlockEntity,
 				continue
 			}
 			b.Items[slot] = st
+			if compTag, ok := ic.Get("components"); ok {
+				if comp, ok := compTag.(*nbt.Compound); ok && comp.Len() > 0 {
+					b.SlotComponents[slot] = world.CloneNBTCompound(comp)
+				}
+			}
 			if slot < 3 && IsPotionItem(st) {
-				pType := PotionWater
-				if pt, ok := ic.Get("Potion"); ok {
-					if ps, ok := pt.(nbt.String); ok && string(ps) != "" {
-						pType = canonicalPotionID(string(ps))
+				pType := ""
+				if b.SlotComponents[slot] != nil {
+					if pcTag, ok := b.SlotComponents[slot].Get("minecraft:potion_contents"); ok {
+						switch pc := pcTag.(type) {
+						case nbt.String:
+							if string(pc) != "" {
+								pType = canonicalPotionID(string(pc))
+							}
+						case *nbt.Compound:
+							if potTag, ok := pc.Get("potion"); ok {
+								if ps, ok := potTag.(nbt.String); ok && string(ps) != "" {
+									pType = canonicalPotionID(string(ps))
+								}
+							}
+						}
 					}
+				}
+				if pType == "" {
+					if pt, ok := ic.Get("Potion"); ok {
+						if ps, ok := pt.(nbt.String); ok && string(ps) != "" {
+							pType = canonicalPotionID(string(ps))
+						}
+					}
+				}
+				if pType == "" {
+					pType = PotionWater
 				}
 				b.PotionTypes[slot] = pType
 			}
 		}
 	}
-	if !b.Items[BrewingStandSlotIngredient].IsEmpty() {
+	if b.BrewTime > 0 && !b.Items[BrewingStandSlotIngredient].IsEmpty() {
 		b.ingredient = b.Items[BrewingStandSlotIngredient].ResolvedID()
 	}
 	return b, true
@@ -726,10 +794,16 @@ func makeBrewingKey(dim string, x, y, z int) brewingKey {
 	}
 }
 
+type brewingChunkKey struct {
+	dim    string
+	cx, cz int32
+}
+
 type serverBrewingState struct {
-	mu         sync.Mutex
-	loadedDisk bool
-	stands     map[brewingKey]*BrewingStandBlockEntity
+	mu          sync.Mutex
+	loadedDisk  bool
+	loadedChunk map[brewingChunkKey]bool
+	stands      map[brewingKey]*BrewingStandBlockEntity
 }
 
 var serverBrewingStands sync.Map // map[*Server]*serverBrewingState
@@ -739,9 +813,14 @@ func (s *Server) brewingState() *serverBrewingState {
 		return v.(*serverBrewingState)
 	}
 	actual, _ := serverBrewingStands.LoadOrStore(s, &serverBrewingState{
-		stands: make(map[brewingKey]*BrewingStandBlockEntity),
+		loadedChunk: make(map[brewingChunkKey]bool),
+		stands:      make(map[brewingKey]*BrewingStandBlockEntity),
 	})
 	return actual.(*serverBrewingState)
+}
+
+func isBrewingStandBlockEntityID(id string) bool {
+	return normalizeBrewingItem(id) == "minecraft:brewing_stand"
 }
 
 func (s *Server) brewingSidecarPath() string {
@@ -756,6 +835,20 @@ func (s *Server) ensureBrewingLoadedLocked(bs *serverBrewingState) {
 		return
 	}
 	bs.loadedDisk = true
+	if store := s.activeFurnaceStore(); store != nil {
+		if comps, err := store.LoadAllBlockEntities(isBrewingStandBlockEntityID); err == nil {
+			for _, comp := range comps {
+				if b, valid := DecodeBrewingStandBlockEntityNBT(comp); valid {
+					key := makeBrewingKey(b.Dimension, b.X, b.Y, b.Z)
+					if _, exists := bs.stands[key]; !exists {
+						cp := b.Clone()
+						bs.stands[key] = &cp
+					}
+					bs.loadedChunk[brewingChunkKey{dim: key.dim, cx: int32(b.X >> 4), cz: int32(b.Z >> 4)}] = true
+				}
+			}
+		}
+	}
 	path := s.brewingSidecarPath()
 	if path == "" {
 		return
@@ -802,6 +895,37 @@ func (s *Server) ensureBrewingLoadedLocked(bs *serverBrewingState) {
 	}
 }
 
+func (s *Server) ensureChunkBrewingLoadedLocked(bs *serverBrewingState, dim string, cx, cz int32) {
+	s.ensureBrewingLoadedLocked(bs)
+	normDim := world.NormalizeDimension(dim)
+	ck := brewingChunkKey{dim: normDim, cx: cx, cz: cz}
+	if bs.loadedChunk[ck] {
+		return
+	}
+	bs.loadedChunk[ck] = true
+	if s == nil {
+		return
+	}
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	comps, err := cache.LoadChunkBlockEntities(cx, cz, isBrewingStandBlockEntityID)
+	if err != nil {
+		return
+	}
+	for _, comp := range comps {
+		if b, valid := DecodeBrewingStandBlockEntityNBT(comp); valid {
+			b.Dimension = normDim
+			key := makeBrewingKey(normDim, b.X, b.Y, b.Z)
+			if _, exists := bs.stands[key]; !exists {
+				cp := b.Clone()
+				bs.stands[key] = &cp
+			}
+		}
+	}
+}
+
 // LoadBrewingStands loads all persisted brewing stand block entities from disk
 // and synchronizes their `has_bottle_0..2` block state properties and comparators.
 func (s *Server) LoadBrewingStands() error {
@@ -811,6 +935,7 @@ func (s *Server) LoadBrewingStands() error {
 	bs := s.brewingState()
 	bs.mu.Lock()
 	bs.loadedDisk = false
+	bs.loadedChunk = make(map[brewingChunkKey]bool)
 	s.ensureBrewingLoadedLocked(bs)
 	var loaded []BrewingStandBlockEntity
 	for _, stand := range bs.stands {
@@ -837,7 +962,7 @@ func (s *Server) ChunkBrewingStandBlockEntitiesNBT(dim string, cx, cz int32) []*
 	normDim := world.NormalizeDimension(dim)
 	bs := s.brewingState()
 	bs.mu.Lock()
-	s.ensureBrewingLoadedLocked(bs)
+	s.ensureChunkBrewingLoadedLocked(bs, normDim, cx, cz)
 	var out []*nbt.Compound
 	for k, stand := range bs.stands {
 		if k.dim != normDim || stand == nil {
@@ -851,8 +976,23 @@ func (s *Server) ChunkBrewingStandBlockEntitiesNBT(dim string, cx, cz int32) []*
 	return out
 }
 
-// UnloadChunkBrewingStands removes all brewing stands in chunk (cx, cz) of dim
-// from runtime memory and returns their serialized NBT compounds.
+// SaveChunkBrewingStands persists all brewing stands in chunk (cx, cz) of dim
+// into the chunk's `block_entities` NBT list.
+func (s *Server) SaveChunkBrewingStands(dim string, cx, cz int32) error {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return nil
+	}
+	comps := s.ChunkBrewingStandBlockEntitiesNBT(normDim, cx, cz)
+	return cache.SaveChunkBlockEntities(cx, cz, isBrewingStandBlockEntityID, comps)
+}
+
+// UnloadChunkBrewingStands persists and removes all brewing stands in chunk
+// (cx, cz) of dim from runtime memory and returns their serialized NBT compounds.
 func (s *Server) UnloadChunkBrewingStands(dim string, cx, cz int32) []*nbt.Compound {
 	if s == nil {
 		return nil
@@ -860,7 +1000,6 @@ func (s *Server) UnloadChunkBrewingStands(dim string, cx, cz int32) []*nbt.Compo
 	normDim := world.NormalizeDimension(dim)
 	bs := s.brewingState()
 	bs.mu.Lock()
-	defer bs.mu.Unlock()
 	var out []*nbt.Compound
 	for k, stand := range bs.stands {
 		if k.dim != normDim {
@@ -873,7 +1012,40 @@ func (s *Server) UnloadChunkBrewingStands(dim string, cx, cz int32) []*nbt.Compo
 			delete(bs.stands, k)
 		}
 	}
+	bs.loadedChunk[brewingChunkKey{dim: normDim, cx: cx, cz: cz}] = true
+	bs.mu.Unlock()
+
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		_ = cache.SaveChunkBlockEntities(cx, cz, isBrewingStandBlockEntityID, out)
+	}
 	return out
+}
+
+// ReloadChunkBrewingStands reloads brewing stand block entities for chunk (cx, cz)
+// of dim from disk and synchronizes their bottle block states and comparators.
+func (s *Server) ReloadChunkBrewingStands(dim string, cx, cz int32) error {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
+	bs := s.brewingState()
+	bs.mu.Lock()
+	delete(bs.loadedChunk, brewingChunkKey{dim: normDim, cx: cx, cz: cz})
+	s.ensureChunkBrewingLoadedLocked(bs, normDim, cx, cz)
+	var loaded []BrewingStandBlockEntity
+	for k, stand := range bs.stands {
+		if k.dim == normDim && int32(k.x>>4) == cx && int32(k.z>>4) == cz && stand != nil {
+			loaded = append(loaded, stand.Clone())
+		}
+	}
+	bs.mu.Unlock()
+
+	for _, stand := range loaded {
+		s.BindNoteBlockAndJukeboxRedstone(stand.Dimension)
+		s.updateBrewingStandBottleBlockStateInDim(stand.Dimension, stand.X, stand.Y, stand.Z, stand.Items)
+		s.updateHopperComparatorsAndBroadcast(stand.Dimension, stand.X, stand.Y, stand.Z)
+	}
+	return nil
 }
 
 // LoadChunkBrewingStandBlockEntitiesNBT loads brewing stand block entities from
@@ -917,21 +1089,37 @@ func (s *Server) SaveBrewingStands() error {
 	if s == nil {
 		return nil
 	}
-	path := s.brewingSidecarPath()
-	if path == "" {
-		return nil
-	}
 	bs := s.brewingState()
 	bs.mu.Lock()
 	s.ensureBrewingLoadedLocked(bs)
 	list := make([]BrewingStandBlockEntity, 0, len(bs.stands))
+	byChunk := make(map[brewingChunkKey][]*nbt.Compound)
+	for ck := range bs.loadedChunk {
+		byChunk[ck] = nil
+	}
 	for _, stand := range bs.stands {
 		if stand != nil {
-			list = append(list, stand.Clone())
+			cp := stand.Clone()
+			list = append(list, cp)
+			ck := brewingChunkKey{dim: cp.Dimension, cx: int32(cp.X >> 4), cz: int32(cp.Z >> 4)}
+			byChunk[ck] = append(byChunk[ck], EncodeBrewingStandBlockEntityNBT(cp))
 		}
 	}
 	bs.mu.Unlock()
 
+	var firstErr error
+	for ck, comps := range byChunk {
+		if cache := s.DimensionChunks(ck.dim); cache != nil {
+			if err := cache.SaveChunkBlockEntities(ck.cx, ck.cz, isBrewingStandBlockEntityID, comps); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	path := s.brewingSidecarPath()
+	if path == "" {
+		return firstErr
+	}
 	sort.Slice(list, func(i, j int) bool {
 		if list[i].Dimension != list[j].Dimension {
 			return list[i].Dimension < list[j].Dimension
@@ -956,11 +1144,14 @@ func (s *Server) SaveBrewingStands() error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
+	if err := os.WriteFile(path, nbt.MarshalNamed("", root), 0o644); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
 }
 
 func (s *Server) getOrCreateBrewingStandInDimLocked(bs *serverBrewingState, dim string, x, y, z int) *BrewingStandBlockEntity {
-	s.ensureBrewingLoadedLocked(bs)
+	s.ensureChunkBrewingLoadedLocked(bs, dim, int32(x>>4), int32(z>>4))
 	key := makeBrewingKey(dim, x, y, z)
 	b := bs.stands[key]
 	if b == nil {
@@ -989,7 +1180,7 @@ func (s *Server) BrewingStandAtInDim(dim string, x, y, z int) (BrewingStandBlock
 	normDim := world.NormalizeDimension(dim)
 	bs := s.brewingState()
 	bs.mu.Lock()
-	s.ensureBrewingLoadedLocked(bs)
+	s.ensureChunkBrewingLoadedLocked(bs, normDim, int32(x>>4), int32(z>>4))
 	b := bs.stands[makeBrewingKey(normDim, x, y, z)]
 	if b == nil {
 		bs.mu.Unlock()

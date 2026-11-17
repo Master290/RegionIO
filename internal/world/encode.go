@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 )
 
@@ -100,6 +101,7 @@ type Chunk struct {
 	dimHeight          int
 	noSkylight         bool
 	blockEntities      []StructureBlockEntity
+	rawBlockEntities   []*nbt.Compound
 	entities           []StructureEntity
 	structureStarts    []StructureStartRecord
 	intersectingStarts []StructureStartRecord
@@ -346,6 +348,14 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 	if len(c.blockEntities) > 0 {
 		clone.blockEntities = make([]StructureBlockEntity, len(c.blockEntities))
 		copy(clone.blockEntities, c.blockEntities)
+	}
+	if len(c.rawBlockEntities) > 0 {
+		clone.rawBlockEntities = make([]*nbt.Compound, 0, len(c.rawBlockEntities))
+		for _, rawBE := range c.rawBlockEntities {
+			if rawBE != nil {
+				clone.rawBlockEntities = append(clone.rawBlockEntities, CloneNBTCompound(rawBE))
+			}
+		}
 	}
 	if len(c.entities) > 0 {
 		clone.entities = make([]StructureEntity, len(c.entities))

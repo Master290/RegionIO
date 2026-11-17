@@ -331,6 +331,9 @@ func validateConfig(cfg Config) error {
 }
 
 func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entities *world.EntityManager) *Server {
+	if store == nil && chunks != nil {
+		store = chunks.Store()
+	}
 	s := &Server{
 		cfg:              cfg,
 		chunks:           chunks,
@@ -416,6 +419,9 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 	s.RegisterWardenSummonHook()
 	if store != nil {
 		_ = s.LoadFurnaces()
+		_ = s.LoadBrewingStands()
+		_ = s.LoadHoppers()
+		_ = s.LoadCampfires()
 	}
 	if cfg.WorldDir != "" {
 		_ = s.LoadWorldSettingsFile()

@@ -28,7 +28,11 @@ type FurnaceBlockEntity struct {
 	ID               string // "minecraft:furnace", "minecraft:blast_furnace", or "minecraft:smoker"
 	X, Y, Z          int
 	CustomName       string
+	CustomNameTag    nbt.Tag
+	Lock             string
+	LockTag          nbt.Tag
 	Items            [FurnaceSlotCount]ItemStack
+	SlotComponents   [FurnaceSlotCount]*nbt.Compound
 	LitTimeRemaining int16 // NBT "lit_time_remaining" (ContainerData index 0)
 	LitTotalTime     int16 // NBT "lit_total_time"     (ContainerData index 1)
 	CookingTimer     int16 // NBT "cooking_time_spent" (ContainerData index 2)
@@ -39,6 +43,11 @@ type FurnaceBlockEntity struct {
 // Clone returns a deep copy of f.
 func (f FurnaceBlockEntity) Clone() FurnaceBlockEntity {
 	out := f
+	out.CustomNameTag = CloneNBTTag(f.CustomNameTag)
+	out.LockTag = CloneNBTTag(f.LockTag)
+	for i := range f.SlotComponents {
+		out.SlotComponents[i] = CloneNBTCompound(f.SlotComponents[i])
+	}
 	if len(f.RecipesUsed) > 0 {
 		out.RecipesUsed = make(map[string]int32, len(f.RecipesUsed))
 		for k, v := range f.RecipesUsed {
@@ -46,6 +55,86 @@ func (f FurnaceBlockEntity) Clone() FurnaceBlockEntity {
 		}
 	}
 	return out
+}
+
+// CloneNBTTag returns a deep copy of tag.
+func CloneNBTTag(tag nbt.Tag) nbt.Tag {
+	if tag == nil {
+		return nil
+	}
+	switch v := tag.(type) {
+	case *nbt.Compound:
+		return CloneNBTCompound(v)
+	case nbt.List:
+		elems := make([]nbt.Tag, len(v.Elems))
+		for i, e := range v.Elems {
+			elems[i] = CloneNBTTag(e)
+		}
+		return nbt.List{ElemID: v.ElemID, Elems: elems}
+	case nbt.ByteArray:
+		return append(nbt.ByteArray(nil), v...)
+	case nbt.IntArray:
+		return append(nbt.IntArray(nil), v...)
+	case nbt.LongArray:
+		return append(nbt.LongArray(nil), v...)
+	default:
+		return tag
+	}
+}
+
+// CloneNBTCompound returns a deep copy of c.
+func CloneNBTCompound(c *nbt.Compound) *nbt.Compound {
+	if c == nil {
+		return nil
+	}
+	out := nbt.NewCompound()
+	for _, k := range c.Keys() {
+		if v, ok := c.Get(k); ok {
+			out.Set(k, CloneNBTTag(v))
+		}
+	}
+	return out
+}
+
+// ExtractCustomNameFromNBTTag extracts a human-readable string from a vanilla
+// ComponentSerialization.CODEC NBT tag (String or Compound).
+func ExtractCustomNameFromNBTTag(tag nbt.Tag) string {
+	switch v := tag.(type) {
+	case nbt.String:
+		return string(v)
+	case *nbt.Compound:
+		if t, ok := v.Get("text"); ok {
+			if str, ok := t.(nbt.String); ok {
+				return string(str)
+			}
+		}
+	}
+	return ""
+}
+
+// ExtractLockStringFromNBTTag extracts a human-readable lock string from a
+// vanilla 26.1.2 LockCode NBT tag (ItemPredicate Compound or legacy String).
+func ExtractLockStringFromNBTTag(tag nbt.Tag) string {
+	switch v := tag.(type) {
+	case nbt.String:
+		return string(v)
+	case *nbt.Compound:
+		if compsTag, ok := v.Get("components"); ok {
+			if comps, ok := compsTag.(*nbt.Compound); ok {
+				if cnTag, ok := comps.Get("minecraft:custom_name"); ok {
+					if s := ExtractCustomNameFromNBTTag(cnTag); s != "" {
+						return s
+					}
+				}
+			}
+		}
+		if itemsTag, ok := v.Get("items"); ok {
+			if s, ok := itemsTag.(nbt.String); ok {
+				return string(s)
+			}
+		}
+	}
+	return ""
 }
 
 // IsFurnaceBlockID reports whether id is one of the three furnace block/entity IDs.
@@ -127,8 +216,15 @@ func EncodeFurnaceBlockEntityNBT(f FurnaceBlockEntity) *nbt.Compound {
 		Set("cooking_total_time", nbt.Short(f.CookingTotalTime)).
 		Set("lit_time_remaining", nbt.Short(f.LitTimeRemaining)).
 		Set("lit_total_time", nbt.Short(f.LitTotalTime))
-	if f.CustomName != "" {
+	if f.CustomNameTag != nil && (f.CustomName == "" || ExtractCustomNameFromNBTTag(f.CustomNameTag) == f.CustomName) {
+		c.Set("CustomName", CloneNBTTag(f.CustomNameTag))
+	} else if f.CustomName != "" {
 		c.Set("CustomName", nbt.String(f.CustomName))
+	}
+	if f.LockTag != nil && (f.Lock == "" || ExtractLockStringFromNBTTag(f.LockTag) == f.Lock) {
+		c.Set("lock", CloneNBTTag(f.LockTag))
+	} else if f.Lock != "" {
+		c.Set("lock", nbt.String(f.Lock))
 	}
 
 	items := nbt.List{ElemID: nbt.TagCompound}
@@ -145,6 +241,9 @@ func EncodeFurnaceBlockEntityNBT(f FurnaceBlockEntity) *nbt.Compound {
 			Set("Slot", nbt.Byte(int8(slot))).
 			Set("id", nbt.String(itemName)).
 			Set("count", nbt.Int(st.Count))
+		if f.SlotComponents[slot] != nil && f.SlotComponents[slot].Len() > 0 {
+			entry.Set("components", CloneNBTCompound(f.SlotComponents[slot]))
+		}
 		items.Elems = append(items.Elems, entry)
 	}
 	c.Set("Items", items)
@@ -172,7 +271,15 @@ func DecodeFurnaceBlockEntityNBT(c *nbt.Compound) (FurnaceBlockEntity, bool) {
 	if c == nil {
 		return FurnaceBlockEntity{}, false
 	}
-	id := normalizeItemName(string(nbtAsString(c, "id")))
+	idTag, hasID := c.Get("id")
+	if !hasID {
+		return FurnaceBlockEntity{}, false
+	}
+	idStr, ok := idTag.(nbt.String)
+	if !ok {
+		return FurnaceBlockEntity{}, false
+	}
+	id := normalizeItemName(string(idStr))
 	if !IsFurnaceBlockID(id) {
 		return FurnaceBlockEntity{}, false
 	}
@@ -181,15 +288,25 @@ func DecodeFurnaceBlockEntityNBT(c *nbt.Compound) (FurnaceBlockEntity, bool) {
 		X:                int(nbtAsInt(c, "x")),
 		Y:                int(nbtAsInt(c, "y")),
 		Z:                int(nbtAsInt(c, "z")),
-		CustomName:       string(nbtAsString(c, "CustomName")),
 		CookingTimer:     nbtShortOrInt(c, "cooking_time_spent", "CookTime"),
 		CookingTotalTime: nbtShortOrInt(c, "cooking_total_time", "CookTimeTotal"),
 		LitTimeRemaining: nbtShortOrInt(c, "lit_time_remaining", "BurnTime"),
 		LitTotalTime:     nbtShortOrInt(c, "lit_total_time", "BurnTimeTotal"),
 	}
+	if cnTag, ok := c.Get("CustomName"); ok {
+		f.CustomNameTag = CloneNBTTag(cnTag)
+		f.CustomName = ExtractCustomNameFromNBTTag(cnTag)
+	}
+	if lockTag, ok := c.Get("lock"); ok {
+		f.LockTag = CloneNBTTag(lockTag)
+		f.Lock = ExtractLockStringFromNBTTag(lockTag)
+	} else if lockTag, ok := c.Get("Lock"); ok {
+		f.LockTag = CloneNBTTag(lockTag)
+		f.Lock = ExtractLockStringFromNBTTag(lockTag)
+	}
 
 	if itemsTag, ok := c.Get("Items"); ok {
-		if list, ok := itemsTag.(nbt.List); ok && list.ElemID == nbt.TagCompound {
+		if list, ok := itemsTag.(nbt.List); ok && (list.ElemID == nbt.TagCompound || len(list.Elems) == 0) {
 			for _, elem := range list.Elems {
 				ic, ok := elem.(*nbt.Compound)
 				if !ok {
@@ -205,6 +322,11 @@ func DecodeFurnaceBlockEntityNBT(c *nbt.Compound) (FurnaceBlockEntity, bool) {
 					continue
 				}
 				f.Items[slot] = NewNamedItemStack(itemIDStr, count)
+				if compTag, ok := ic.Get("components"); ok {
+					if comp, ok := compTag.(*nbt.Compound); ok && comp.Len() > 0 {
+						f.SlotComponents[slot] = CloneNBTCompound(comp)
+					}
+				}
 			}
 		}
 	}
@@ -278,12 +400,120 @@ func nbtSlotIndex(c *nbt.Compound, key string) (int, bool) {
 	}
 }
 
-// SaveChunkFurnaces persists all furnace block entities belonging to chunk
-// (cx, cz) directly into the chunk's Anvil "block_entities" NBT list on disk,
-// and also updates the world's furnace index so block edits saved via
-// Cache.SaveAll do not drop furnace state.
-func (c *Cache) SaveChunkFurnaces(cx, cz int32, furnaces []FurnaceBlockEntity) error {
+// RawBlockEntities returns a deep copy of all raw block_entities NBT compounds
+// attached to this chunk.
+func (c *Chunk) RawBlockEntities() []*nbt.Compound {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.rawBlockEntities) == 0 {
+		return nil
+	}
+	out := make([]*nbt.Compound, 0, len(c.rawBlockEntities))
+	for _, be := range c.rawBlockEntities {
+		if be != nil {
+			out = append(out, CloneNBTCompound(be))
+		}
+	}
+	return out
+}
+
+// ReplaceRawBlockEntities replaces all raw block_entities compounds on c whose
+// canonical "id" satisfies matchID with clones of replacements.
+func (c *Chunk) ReplaceRawBlockEntities(matchID func(string) bool, replacements []*nbt.Compound) {
+	if c == nil || matchID == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := make([]*nbt.Compound, 0, len(c.rawBlockEntities)+len(replacements))
+	for _, existing := range c.rawBlockEntities {
+		if existing == nil {
+			continue
+		}
+		id := normalizeItemName(string(nbtAsString(existing, "id")))
+		if !matchID(id) {
+			kept = append(kept, existing)
+		}
+	}
+	for _, rep := range replacements {
+		if rep != nil {
+			kept = append(kept, CloneNBTCompound(rep))
+		}
+	}
+	c.rawBlockEntities = kept
+	c.revision.Add(1)
+}
+
+// Store returns the underlying persistent Store attached to c, or nil.
+func (c *Cache) Store() *Store {
+	if c == nil {
+		return nil
+	}
+	return c.store
+}
+
+// UnloadChunk flushes any dirty state for chunk (cx, cz) to the backing Store
+// and evicts the chunk from in-memory cache so the next access reloads from disk.
+func (c *Cache) UnloadChunk(cx, cz int32) error {
+	if c == nil {
+		return nil
+	}
+	key := [2]int32{cx, cz}
+	c.mu.Lock()
+	ch := c.chunks[key]
+	_, isDirty := c.dirty[key]
+	isUnsaved := c.unsavedGen[key]
+	c.mu.Unlock()
+
+	if ch != nil && c.store != nil && (isDirty || isUnsaved) {
+		snapshot, _ := ch.snapshot()
+		if err := c.store.saveSnapshot(snapshot); err != nil {
+			return err
+		}
+	}
+
+	c.mu.Lock()
+	delete(c.chunks, key)
+	delete(c.frames, key)
+	delete(c.dirty, key)
+	delete(c.unsavedGen, key)
+	if c.order != nil && c.index != nil {
+		if elem, ok := c.index[key]; ok {
+			c.order.Remove(elem)
+			delete(c.index, key)
+		}
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+// LoadVanillaChunk loads chunk (cx, cz) from the backing Store without requiring
+// RegionIO's generator stamp, caching and returning the loaded Chunk.
+func (c *Cache) LoadVanillaChunk(cx, cz int32) (*Chunk, error) {
 	if c == nil || c.store == nil {
+		return nil, ErrChunkNotFound
+	}
+	ch, err := c.store.LoadVanillaChunk(cx, cz)
+	if err != nil {
+		return nil, err
+	}
+	key := [2]int32{cx, cz}
+	c.mu.Lock()
+	c.chunks[key] = ch
+	delete(c.frames, key)
+	c.touch(key)
+	c.mu.Unlock()
+	return ch, nil
+}
+
+// SaveChunkBlockEntities replaces all block_entities in chunk (cx, cz) whose
+// canonical "id" satisfies matchID with list, updating both the in-memory Chunk
+// and the on-disk Anvil chunk NBT.
+func (c *Cache) SaveChunkBlockEntities(cx, cz int32, matchID func(string) bool, list []*nbt.Compound) error {
+	if c == nil || matchID == nil {
 		return nil
 	}
 	key := [2]int32{cx, cz}
@@ -293,6 +523,297 @@ func (c *Cache) SaveChunkFurnaces(cx, cz int32, furnaces []FurnaceBlockEntity) e
 	ch, err := c.chunkAtErr(cx, cz)
 	if err != nil {
 		return err
+	}
+	ch.ReplaceRawBlockEntities(matchID, list)
+	if c.store == nil {
+		return nil
+	}
+	snapshot, savedRevision := ch.snapshot()
+	if err := c.store.SaveChunkBlockEntities(cx, cz, snapshot, matchID, list); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	if dirtyRevision, ok := c.dirty[key]; ok && dirtyRevision <= savedRevision {
+		delete(c.dirty, key)
+	}
+	c.evictIfNeeded()
+	c.mu.Unlock()
+	return nil
+}
+
+// LoadChunkBlockEntities returns all block_entities compounds in chunk (cx, cz)
+// whose canonical "id" satisfies matchID, reading from the backing Store (if any)
+// and falling back to the in-memory Chunk's rawBlockEntities.
+func (c *Cache) LoadChunkBlockEntities(cx, cz int32, matchID func(string) bool) ([]*nbt.Compound, error) {
+	if c == nil || matchID == nil {
+		return nil, nil
+	}
+	byPos := make(map[[3]int]*nbt.Compound)
+	c.mu.Lock()
+	memChunk := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if memChunk != nil {
+		for _, comp := range memChunk.RawBlockEntities() {
+			id := normalizeItemName(string(nbtAsString(comp, "id")))
+			if matchID(id) {
+				pos := [3]int{int(nbtAsInt(comp, "x")), int(nbtAsInt(comp, "y")), int(nbtAsInt(comp, "z"))}
+				byPos[pos] = comp
+			}
+		}
+	}
+	if c.store != nil {
+		persisted, err := c.store.LoadChunkBlockEntities(cx, cz, matchID)
+		if err != nil {
+			return nil, err
+		}
+		for _, comp := range persisted {
+			pos := [3]int{int(nbtAsInt(comp, "x")), int(nbtAsInt(comp, "y")), int(nbtAsInt(comp, "z"))}
+			byPos[pos] = comp
+		}
+	}
+	return sortedBlockEntityCompounds(byPos), nil
+}
+
+// SaveChunkBlockEntities persists all block_entities in chunk (cx, cz) matching
+// matchID into the chunk's Anvil "block_entities" NBT list on disk, preserving
+// all non-matching block entities already present in the chunk.
+func (s *Store) SaveChunkBlockEntities(cx, cz int32, snapshot *Chunk, matchID func(string) bool, replacements []*nbt.Compound) error {
+	if s == nil || matchID == nil {
+		return nil
+	}
+	rf, err := s.regionFor(cx, cz)
+	if err != nil {
+		return err
+	}
+	_, _, lx, lz := regionIndex(cx, cz)
+
+	byPos := make(map[[3]int]*nbt.Compound)
+	if snapshot != nil {
+		for _, comp := range snapshot.RawBlockEntities() {
+			id := normalizeItemName(string(nbtAsString(comp, "id")))
+			if !matchID(id) {
+				pos := [3]int{int(nbtAsInt(comp, "x")), int(nbtAsInt(comp, "y")), int(nbtAsInt(comp, "z"))}
+				byPos[pos] = comp
+			}
+		}
+	}
+	if existingRaw, err := rf.ReadChunk(lx, lz); err == nil {
+		if _, tag, err := nbt.UnmarshalNamed(existingRaw); err == nil {
+			if existingRoot, ok := tag.(*nbt.Compound); ok {
+				if beTag, ok := existingRoot.Get("block_entities"); ok {
+					if list, ok := beTag.(nbt.List); ok && list.ElemID == nbt.TagCompound {
+						for _, elem := range list.Elems {
+							ec, ok := elem.(*nbt.Compound)
+							if !ok {
+								continue
+							}
+							id := normalizeItemName(string(nbtAsString(ec, "id")))
+							if !matchID(id) {
+								pos := [3]int{int(nbtAsInt(ec, "x")), int(nbtAsInt(ec, "y")), int(nbtAsInt(ec, "z"))}
+								byPos[pos] = CloneNBTCompound(ec)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, rep := range replacements {
+		if rep == nil {
+			continue
+		}
+		x := int(nbtAsInt(rep, "x"))
+		y := int(nbtAsInt(rep, "y"))
+		z := int(nbtAsInt(rep, "z"))
+		if int32(x>>4) == cx && int32(z>>4) == cz {
+			byPos[[3]int{x, y, z}] = CloneNBTCompound(rep)
+		}
+	}
+
+	var root *nbt.Compound
+	if snapshot != nil {
+		root = chunkToNBT(snapshot)
+	} else if existingRaw, err := rf.ReadChunk(lx, lz); err == nil {
+		if _, tag, err := nbt.UnmarshalNamed(existingRaw); err == nil {
+			root, _ = tag.(*nbt.Compound)
+		}
+	}
+	if root == nil {
+		return nil
+	}
+
+	sorted := sortedBlockEntityCompounds(byPos)
+	beList := nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  make([]nbt.Tag, 0, len(sorted)),
+	}
+	for _, comp := range sorted {
+		beList.Elems = append(beList.Elems, comp)
+	}
+	root.Set("block_entities", beList)
+	raw := nbt.MarshalNamed("", root)
+	return rf.WriteChunk(lx, lz, raw)
+}
+
+// LoadChunkBlockEntities reads all block_entities compounds in chunk (cx, cz)
+// whose canonical "id" satisfies matchID.
+func (s *Store) LoadChunkBlockEntities(cx, cz int32, matchID func(string) bool) ([]*nbt.Compound, error) {
+	if s == nil || matchID == nil {
+		return nil, nil
+	}
+	rf, err := s.regionFor(cx, cz)
+	if err != nil {
+		return nil, nil
+	}
+	_, _, lx, lz := regionIndex(cx, cz)
+	raw, err := rf.ReadChunk(lx, lz)
+	if err != nil {
+		return nil, nil
+	}
+	_, tag, err := nbt.UnmarshalNamed(raw)
+	if err != nil {
+		return nil, fmt.Errorf("world: decode chunk (%d,%d) block_entities NBT: %w", cx, cz, err)
+	}
+	root, ok := tag.(*nbt.Compound)
+	if !ok {
+		return nil, nil
+	}
+	return ExtractBlockEntitiesFromChunkRoot(root, matchID), nil
+}
+
+// LoadAllBlockEntities scans all region files in the store and returns every
+// persisted block_entities compound whose canonical "id" satisfies matchID.
+func (s *Store) LoadAllBlockEntities(matchID func(string) bool) ([]*nbt.Compound, error) {
+	if s == nil || matchID == nil {
+		return nil, nil
+	}
+	byPos := make(map[[3]int]*nbt.Compound)
+	regionDir := filepath.Join(s.dir, "region")
+	entries, err := os.ReadDir(regionDir)
+	if err != nil {
+		return nil, nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		rx, rz, ok := parseRegionFileName(entry.Name())
+		if !ok {
+			continue
+		}
+		rf, err := s.regionFor(int32(rx*32), int32(rz*32))
+		if err != nil {
+			continue
+		}
+		for lz := 0; lz < 32; lz++ {
+			for lx := 0; lx < 32; lx++ {
+				raw, err := rf.ReadChunk(lx, lz)
+				if err != nil {
+					continue
+				}
+				_, tag, err := nbt.UnmarshalNamed(raw)
+				if err != nil {
+					continue
+				}
+				root, ok := tag.(*nbt.Compound)
+				if !ok {
+					continue
+				}
+				for _, comp := range ExtractBlockEntitiesFromChunkRoot(root, matchID) {
+					pos := [3]int{int(nbtAsInt(comp, "x")), int(nbtAsInt(comp, "y")), int(nbtAsInt(comp, "z"))}
+					byPos[pos] = comp
+				}
+			}
+		}
+	}
+	return sortedBlockEntityCompounds(byPos), nil
+}
+
+// ExtractBlockEntitiesFromChunkRoot returns deep copies of all compounds in
+// root's "block_entities" list whose canonical "id" satisfies matchID (or all
+// compounds if matchID is nil).
+func ExtractBlockEntitiesFromChunkRoot(root *nbt.Compound, matchID func(string) bool) []*nbt.Compound {
+	if root == nil {
+		return nil
+	}
+	beTag, ok := root.Get("block_entities")
+	if !ok {
+		return nil
+	}
+	list, ok := beTag.(nbt.List)
+	if !ok || list.ElemID != nbt.TagCompound {
+		return nil
+	}
+	var out []*nbt.Compound
+	for _, elem := range list.Elems {
+		ec, ok := elem.(*nbt.Compound)
+		if !ok {
+			continue
+		}
+		idTag, hasID := ec.Get("id")
+		if !hasID {
+			continue
+		}
+		idStr, ok := idTag.(nbt.String)
+		if !ok {
+			continue
+		}
+		if matchID == nil || matchID(normalizeItemName(string(idStr))) {
+			out = append(out, CloneNBTCompound(ec))
+		}
+	}
+	return out
+}
+
+func sortedBlockEntityCompounds(byPos map[[3]int]*nbt.Compound) []*nbt.Compound {
+	if len(byPos) == 0 {
+		return nil
+	}
+	positions := make([][3]int, 0, len(byPos))
+	for pos := range byPos {
+		positions = append(positions, pos)
+	}
+	sort.Slice(positions, func(i, j int) bool {
+		if positions[i][1] != positions[j][1] {
+			return positions[i][1] < positions[j][1]
+		}
+		if positions[i][2] != positions[j][2] {
+			return positions[i][2] < positions[j][2]
+		}
+		return positions[i][0] < positions[j][0]
+	})
+	out := make([]*nbt.Compound, 0, len(positions))
+	for _, pos := range positions {
+		out = append(out, CloneNBTCompound(byPos[pos]))
+	}
+	return out
+}
+
+// SaveChunkFurnaces persists all furnace block entities belonging to chunk
+// (cx, cz) directly into the chunk's Anvil "block_entities" NBT list on disk,
+// and also updates the world's furnace index so block edits saved via
+// Cache.SaveAll do not drop furnace state.
+func (c *Cache) SaveChunkFurnaces(cx, cz int32, furnaces []FurnaceBlockEntity) error {
+	if c == nil {
+		return nil
+	}
+	key := [2]int32{cx, cz}
+	c.startUse(key)
+	defer c.endUse(key)
+
+	ch, err := c.chunkAtErr(cx, cz)
+	if err != nil {
+		return err
+	}
+	compounds := make([]*nbt.Compound, 0, len(furnaces))
+	for _, f := range furnaces {
+		if int32(f.X>>4) == cx && int32(f.Z>>4) == cz {
+			compounds = append(compounds, EncodeFurnaceBlockEntityNBT(f))
+		}
+	}
+	ch.ReplaceRawBlockEntities(IsFurnaceBlockID, compounds)
+	if c.store == nil {
+		return nil
 	}
 	snapshot, savedRevision := ch.snapshot()
 	if err := c.store.saveChunkWithFurnaces(snapshot, furnaces); err != nil {
@@ -306,6 +827,35 @@ func (c *Cache) SaveChunkFurnaces(cx, cz int32, furnaces []FurnaceBlockEntity) e
 	c.evictIfNeeded()
 	c.mu.Unlock()
 	return nil
+}
+
+// LoadChunkFurnaces returns all furnace block entities for chunk (cx, cz),
+// combining in-memory Chunk rawBlockEntities and the backing Store.
+func (c *Cache) LoadChunkFurnaces(cx, cz int32) ([]FurnaceBlockEntity, error) {
+	if c == nil {
+		return nil, nil
+	}
+	byPos := make(map[[3]int]FurnaceBlockEntity)
+	c.mu.Lock()
+	memChunk := c.chunks[[2]int32{cx, cz}]
+	c.mu.Unlock()
+	if memChunk != nil {
+		for _, comp := range memChunk.RawBlockEntities() {
+			if f, ok := DecodeFurnaceBlockEntityNBT(comp); ok {
+				byPos[[3]int{f.X, f.Y, f.Z}] = f
+			}
+		}
+	}
+	if c.store != nil {
+		persisted, err := c.store.LoadChunkFurnaces(cx, cz)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range persisted {
+			byPos[[3]int{f.X, f.Y, f.Z}] = f
+		}
+	}
+	return mapValuesSorted(byPos), nil
 }
 
 func (s *Store) saveChunkWithFurnaces(snapshot *Chunk, furnaces []FurnaceBlockEntity) error {

@@ -873,10 +873,25 @@ func (p *snbtParser) parseScalar() nbt.Tag {
 
 func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 	list := nbt.List{ElemID: nbt.TagCompound}
-	if c == nil || len(c.blockEntities) == 0 {
+	if c == nil || (len(c.blockEntities) == 0 && len(c.rawBlockEntities) == 0) {
 		return list
 	}
+	rawByPos := make(map[[3]int]*nbt.Compound, len(c.rawBlockEntities))
+	for _, rawBE := range c.rawBlockEntities {
+		if rawBE == nil {
+			continue
+		}
+		pos := [3]int{int(nbtAsInt(rawBE, "x")), int(nbtAsInt(rawBE, "y")), int(nbtAsInt(rawBE, "z"))}
+		rawByPos[pos] = rawBE
+	}
+	emittedPos := make(map[[3]int]bool, len(c.blockEntities)+len(c.rawBlockEntities))
 	for _, be := range c.blockEntities {
+		pos := [3]int{be.X, be.Y, be.Z}
+		if rawBE, ok := rawByPos[pos]; ok {
+			list.Elems = append(list.Elems, CloneNBTCompound(rawBE))
+			emittedPos[pos] = true
+			continue
+		}
 		comp := nbt.NewCompound().
 			Set("id", nbt.String(be.ID)).
 			Set("x", nbt.Int(be.X)).
@@ -939,6 +954,18 @@ func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 			comp.Set("bees", bees)
 		}
 		list.Elems = append(list.Elems, comp)
+		emittedPos[pos] = true
+	}
+	for _, rawBE := range c.rawBlockEntities {
+		if rawBE == nil {
+			continue
+		}
+		pos := [3]int{int(nbtAsInt(rawBE, "x")), int(nbtAsInt(rawBE, "y")), int(nbtAsInt(rawBE, "z"))}
+		if emittedPos[pos] {
+			continue
+		}
+		list.Elems = append(list.Elems, CloneNBTCompound(rawBE))
+		emittedPos[pos] = true
 	}
 	return list
 }
@@ -960,6 +987,7 @@ func structureBlockEntitiesFromNBT(c *Chunk, root *nbt.Compound) {
 		if !ok {
 			continue
 		}
+		c.rawBlockEntities = append(c.rawBlockEntities, CloneNBTCompound(comp))
 		x := int(nbtAsInt(comp, "x"))
 		y := int(nbtAsInt(comp, "y"))
 		z := int(nbtAsInt(comp, "z"))

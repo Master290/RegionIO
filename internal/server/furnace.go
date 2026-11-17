@@ -342,8 +342,16 @@ func (b *SmeltingBook) Recipe(name string) (*SmeltingRecipe, bool) {
 	if b == nil {
 		return nil, false
 	}
-	rec, ok := b.byName[canonicalResourceName(name)]
-	return rec, ok
+	canonical := canonicalResourceName(name)
+	if rec, ok := b.byName[canonical]; ok {
+		return rec, true
+	}
+	for _, rec := range b.byType["minecraft:smelting"] {
+		if rec.Result.ResolvedID() == canonical {
+			return rec, true
+		}
+	}
+	return nil, false
 }
 
 // Match finds the cooking recipe of recipeType ("minecraft:smelting",
@@ -477,15 +485,29 @@ func (s *Server) furnaceState() *serverFurnaceState {
 	return actual.(*serverFurnaceState)
 }
 
+func (s *Server) activeFurnaceStore() *world.Store {
+	if s == nil {
+		return nil
+	}
+	if s.store != nil {
+		return s.store
+	}
+	if s.chunks != nil {
+		return s.chunks.Store()
+	}
+	return nil
+}
+
 func (s *Server) ensureFurnacesLoadedLocked(fs *serverFurnaceState) {
 	if fs.loadedStore {
 		return
 	}
 	fs.loadedStore = true
-	if s == nil || s.store == nil {
+	store := s.activeFurnaceStore()
+	if store == nil {
 		return
 	}
-	persisted, err := s.store.LoadAllFurnaces()
+	persisted, err := store.LoadAllFurnaces()
 	if err != nil {
 		return
 	}
@@ -506,10 +528,16 @@ func (s *Server) ensureChunkFurnacesLoadedLocked(fs *serverFurnaceState, cx, cz 
 		return
 	}
 	fs.loadedChunk[ck] = true
-	if s == nil || s.store == nil {
+	if s == nil {
 		return
 	}
-	persisted, err := s.store.LoadChunkFurnaces(cx, cz)
+	var persisted []world.FurnaceBlockEntity
+	var err error
+	if s.chunks != nil {
+		persisted, err = s.chunks.LoadChunkFurnaces(cx, cz)
+	} else if store := s.activeFurnaceStore(); store != nil {
+		persisted, err = store.LoadChunkFurnaces(cx, cz)
+	}
 	if err != nil {
 		return
 	}
@@ -565,21 +593,27 @@ func (s *Server) collectChunkFurnacesLocked(fs *serverFurnaceState, cx, cz int32
 }
 
 func (s *Server) persistChunkFurnaces(cx, cz int32) {
-	if s == nil || s.chunks == nil || s.store == nil {
-		return
+	_ = s.SaveChunkFurnaces(cx, cz)
+}
+
+// SaveChunkFurnaces persists all furnace block entities in chunk (cx, cz) into
+// the chunk's `block_entities` NBT list.
+func (s *Server) SaveChunkFurnaces(cx, cz int32) error {
+	if s == nil || s.chunks == nil {
+		return nil
 	}
 	fs := s.furnaceState()
 	fs.mu.Lock()
 	s.ensureChunkFurnacesLoadedLocked(fs, cx, cz)
 	list := s.collectChunkFurnacesLocked(fs, cx, cz)
 	fs.mu.Unlock()
-	_ = s.chunks.SaveChunkFurnaces(cx, cz, list)
+	return s.chunks.SaveChunkFurnaces(cx, cz, list)
 }
 
 // SaveFurnaces flushes all chunks containing furnace block entities to the
 // underlying world store.
 func (s *Server) SaveFurnaces() error {
-	if s == nil || s.chunks == nil || s.store == nil {
+	if s == nil || s.chunks == nil {
 		return nil
 	}
 	fs := s.furnaceState()
@@ -1205,10 +1239,6 @@ func stepFurnaceTickLocked(f *world.FurnaceBlockEntity) (changed, slotsChanged, 
 						f.RecipesUsed = make(map[string]int32)
 					}
 					f.RecipesUsed[rec.Name]++
-					// If input became empty, reset CookingTotalTime to 0.
-					if f.Items[world.FurnaceSlotInput].IsEmpty() {
-						f.CookingTotalTime = 0
-					}
 					slotsChanged = true
 				}
 			} else if f.CookingTimer != 0 {
@@ -1318,6 +1348,31 @@ func calculateFurnaceRecipesXP(used map[string]int32) int {
 	return totalXP
 }
 
+// CalculateFurnaceRecipeExperience computes the exact vanilla 26.1.2
+// AbstractFurnaceBlockEntity.createExperience XP award for recipeCount smelts
+// of a recipe with per-item xp and random sample randFloat in [0, 1):
+//
+//	int i = Mth.floor((float)recipeCount * xp);
+//	float f = Mth.frac((float)recipeCount * xp);
+//	if (f != 0.0F && randFloat < f) ++i;
+func CalculateFurnaceRecipeExperience(recipeCount int32, xp float32, randFloat float32) int {
+	if recipeCount <= 0 || xp <= 0 {
+		return 0
+	}
+	prod := float32(recipeCount) * xp
+	whole := int(math.Floor(float64(prod)))
+	frac := prod - float32(whole)
+	if frac > 0 && randFloat < frac {
+		whole++
+	}
+	return whole
+}
+
+// FurnaceRecipesUsedExperience returns the total smelting XP stored in used.
+func FurnaceRecipesUsedExperience(used map[string]int32) int {
+	return calculateFurnaceRecipesXP(used)
+}
+
 // AwardFurnaceExperience computes the total stored XP from a furnace's
 // RecipesUsed map, clears the map, and spawns experience orbs at the furnace
 // (matching AbstractFurnaceBlockEntity.getRecipesToAwardAndPopExperience).
@@ -1327,6 +1382,7 @@ func (s *Server) AwardFurnaceExperience(x, y, z int) int {
 	}
 	fs := s.furnaceState()
 	fs.mu.Lock()
+	s.ensureChunkFurnacesLoadedLocked(fs, int32(x>>4), int32(z>>4))
 	f := fs.furnaces[furnaceKey{x, y, z}]
 	if f == nil || len(f.RecipesUsed) == 0 {
 		fs.mu.Unlock()
@@ -1393,7 +1449,7 @@ func (s *Server) UnloadChunkFurnaces(cx, cz int32) error {
 	delete(fs.loadedChunk, [2]int32{cx, cz})
 	fs.mu.Unlock()
 
-	if s.chunks != nil && s.store != nil {
+	if s.chunks != nil {
 		return s.chunks.SaveChunkFurnaces(cx, cz, list)
 	}
 	return nil
