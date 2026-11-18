@@ -104,9 +104,10 @@ type Chunk struct {
 	rawBlockEntities   []*nbt.Compound
 	entities           []StructureEntity
 	structureStarts    []StructureStartRecord
-	intersectingStarts []StructureStartRecord
-	structureRefs      map[string][][2]int32
-	persistedTicks     []ScheduledBlockTickEntry
+	intersectingStarts     []StructureStartRecord
+	structureRefs          map[string][][2]int32
+	persistedTicks         []ScheduledBlockTickEntry
+	persistedFallingBlocks []FallingBlockEntitySnapshot
 }
 
 func (c *Chunk) minY() int {
@@ -371,6 +372,12 @@ func (c *Chunk) snapshot() (*Chunk, uint64) {
 	if len(c.persistedTicks) > 0 {
 		clone.persistedTicks = make([]ScheduledBlockTickEntry, len(c.persistedTicks))
 		copy(clone.persistedTicks, c.persistedTicks)
+	}
+	if len(c.persistedFallingBlocks) > 0 {
+		clone.persistedFallingBlocks = make([]FallingBlockEntitySnapshot, len(c.persistedFallingBlocks))
+		for i, fb := range c.persistedFallingBlocks {
+			clone.persistedFallingBlocks[i] = fb.clone()
+		}
 	}
 	if len(c.structureRefs) > 0 {
 		clone.structureRefs = make(map[string][][2]int32, len(c.structureRefs))

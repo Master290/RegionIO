@@ -33,19 +33,19 @@ func TestScheduledBlockTicksExportImportAndNBTRoundTrip(t *testing.T) {
 	c.SetBlock(10, 64, 10, fire)
 
 	c.ScheduleBlockUpdate(2, 64, 2, UpdateRedstone, 6)
-	c.ScheduleBlockUpdate(5, 71, 5, UpdateFalling, 1)
+	c.ScheduleBlockUpdate(5, 71, 5, UpdateFalling, FallingBlockTickDelay)
 	c.ScheduleBlockUpdate(8, 64, 8, UpdateFluid, 5)
 	c.ScheduleBlockUpdate(10, 64, 10, UpdateFire, 30)
 
-	// Advance 1 tick so sand falls from (5,71,5) to (5,70,5) with FallDistance=1 and delay=2,
+	// Advance 1 tick so sand at (5,71,5) has 1 tick remaining before FallingBlockEntity detachment,
 	// while remaining delays for repeater/water/fire become 5, 4, 29.
 	c.TickBlockUpdates()
 
 	if got, ok := c.RemainingBlockUpdateDelay(2, 64, 2, UpdateRedstone); !ok || got != 5 {
 		t.Fatalf("repeater remaining delay = (%d, %v), want (5, true)", got, ok)
 	}
-	if got, ok := c.RemainingBlockUpdateDelay(5, 70, 5, UpdateFalling); !ok || got != 2 {
-		t.Fatalf("falling sand remaining delay = (%d, %v), want (2, true)", got, ok)
+	if got, ok := c.RemainingBlockUpdateDelay(5, 71, 5, UpdateFalling); !ok || got != 1 {
+		t.Fatalf("falling sand remaining delay = (%d, %v), want (1, true)", got, ok)
 	}
 	if got, ok := c.RemainingBlockUpdateDelay(8, 64, 8, UpdateFluid); !ok || got != 4 {
 		t.Fatalf("water remaining delay = (%d, %v), want (4, true)", got, ok)
@@ -70,7 +70,7 @@ func TestScheduledBlockTicksExportImportAndNBTRoundTrip(t *testing.T) {
 	c2 := NewCache(-1, GenerateFlat)
 	c2.SetBlock(2, 63, 2, stone)
 	c2.SetBlock(2, 64, 2, repeater)
-	c2.SetBlock(5, 70, 5, sand)
+	c2.SetBlock(5, 71, 5, sand)
 	c2.SetBlock(8, 64, 8, water)
 	c2.SetBlock(10, 64, 10, fire)
 
@@ -81,8 +81,8 @@ func TestScheduledBlockTicksExportImportAndNBTRoundTrip(t *testing.T) {
 	if got, ok := c2.RemainingBlockUpdateDelay(2, 64, 2, UpdateRedstone); !ok || got != 5 {
 		t.Fatalf("restored repeater remaining delay = (%d, %v), want (5, true)", got, ok)
 	}
-	if got, ok := c2.RemainingBlockUpdateDelay(5, 70, 5, UpdateFalling); !ok || got != 2 {
-		t.Fatalf("restored falling sand remaining delay = (%d, %v), want (2, true)", got, ok)
+	if got, ok := c2.RemainingBlockUpdateDelay(5, 71, 5, UpdateFalling); !ok || got != 1 {
+		t.Fatalf("restored falling sand remaining delay = (%d, %v), want (1, true)", got, ok)
 	}
 	if got, ok := c2.RemainingBlockUpdateDelay(8, 64, 8, UpdateFluid); !ok || got != 4 {
 		t.Fatalf("restored water remaining delay = (%d, %v), want (4, true)", got, ok)
@@ -91,19 +91,21 @@ func TestScheduledBlockTicksExportImportAndNBTRoundTrip(t *testing.T) {
 		t.Fatalf("restored fire remaining delay = (%d, %v), want (29, true)", got, ok)
 	}
 
-	// Check that FallDistance=1 was preserved on the falling sand entry.
-	exported := c2.ExportChunkScheduledBlockTicks(0, 0)
-	foundFallDist := false
-	for _, e := range exported {
-		if e.Kind == UpdateFalling && e.X == 5 && e.Y == 70 && e.Z == 5 {
-			if e.FallDistance != 1 {
-				t.Fatalf("restored FallDistance = %d, want 1", e.FallDistance)
-			}
-			foundFallDist = true
-		}
+	// Advancing 1 more tick detaches the restored sand into an in-flight FallingBlockEntity,
+	// which round-trips through UnloadChunkRedstoneRuntime / LoadChunkRedstoneRuntime.
+	c2.TickBlockUpdates()
+	if got := c2.GetBlock(5, 71, 5); got != StateAir {
+		t.Fatalf("expected restored sand to detach on tick 2, got %s", stateLabel(got))
 	}
-	if !foundFallDist {
-		t.Fatalf("falling block entry not found in ExportChunkScheduledBlockTicks")
+	if c2.ActiveFallingBlockCount() != 1 {
+		t.Fatalf("expected 1 active FallingBlockEntity after detachment, got %d", c2.ActiveFallingBlockCount())
+	}
+	rt := c2.UnloadChunkRedstoneRuntime(0, 0)
+	if c2.ActiveFallingBlockCount() != 0 {
+		t.Fatalf("expected UnloadChunkRedstoneRuntime to unload falling_blocks, got %d", c2.ActiveFallingBlockCount())
+	}
+	if n := c2.LoadChunkRedstoneRuntime(0, 0, rt); n < 1 || c2.ActiveFallingBlockCount() != 1 {
+		t.Fatalf("expected LoadChunkRedstoneRuntime to restore 1 FallingBlockEntity, got n=%d count=%d", n, c2.ActiveFallingBlockCount())
 	}
 }
 

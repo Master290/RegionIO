@@ -3477,9 +3477,9 @@ func (c *Cache) RecoverChunkActiveBlockTicks(cx, cz int32) int {
 			}
 
 		default:
-			if IsFallingBlock(cb.state) && cb.y > MinY && isFreeToFallThrough(c.GetBlock(cb.x, cb.y-1, cb.z)) {
+			if IsFallingBlock(cb.state) && (cb.y == c.minY() || (cb.y > c.minY() && isFreeToFallThrough(c.GetBlock(cb.x, cb.y-1, cb.z)))) {
 				if !c.HasPendingBlockUpdate(cb.x, cb.y, cb.z, UpdateFalling) {
-					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFalling, FallingBlockTickDelay)
+					c.ScheduleBlockUpdate(cb.x, cb.y, cb.z, UpdateFalling, FallingBlockDelayFor(cb.state))
 					recovered++
 				}
 			} else if kind, lvl, isFluid := isStandaloneFluidBlock(cb.state); isFluid {
@@ -3580,14 +3580,15 @@ func (c *Cache) UnloadChunkRedstoneRuntime(cx, cz int32) *nbt.Compound {
 	root.Set("fluid_ticks", EncodeScheduledBlockTicksNBT(fluidEntries))
 	root.Set("piston_runtime", EncodePistonRuntimeNBT(c.UnloadChunkPistonRuntime(cx, cz)))
 	root.Set("moving_pistons", EncodeMovingPistonsNBT(c.UnloadChunkMovingPistons(cx, cz)))
+	root.Set("falling_blocks", EncodeFallingBlocksNBT(c.UnloadChunkFallingBlocks(cx, cz)))
 	root.Set("observer_runtime", EncodeObserverRuntimeNBT(c.UnloadChunkObservers(cx, cz)))
 	return root
 }
 
 // LoadChunkRedstoneRuntime restores scheduled block/fluid ticks, piston runtime
-// entries, and observer retrigger entries for chunk (cx, cz) from comp, and
-// runs RecoverChunkActiveBlockTicks(cx, cz) to recover any unqueued active
-// transient block states in the chunk.
+// entries, falling block entities, and observer retrigger entries for chunk (cx, cz)
+// from comp, and runs RecoverChunkActiveBlockTicks(cx, cz) to recover any unqueued
+// active transient block states in the chunk.
 func (c *Cache) LoadChunkRedstoneRuntime(cx, cz int32, comp *nbt.Compound) int {
 	if c == nil {
 		return 0
@@ -3603,6 +3604,11 @@ func (c *Cache) LoadChunkRedstoneRuntime(cx, cz int32, comp *nbt.Compound) int {
 		if mpTag, ok := comp.Get("moving_pistons"); ok {
 			if list, ok := mpTag.(nbt.List); ok {
 				restored += c.ImportMovingPistonsNBT(list)
+			}
+		}
+		if fbTag, ok := comp.Get("falling_blocks"); ok {
+			if list, ok := fbTag.(nbt.List); ok {
+				restored += c.ImportChunkFallingBlocks(cx, cz, DecodeFallingBlocksNBT(list))
 			}
 		}
 		if orTag, ok := comp.Get("observer_runtime"); ok {

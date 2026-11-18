@@ -192,6 +192,10 @@ func TestShowcaseBlockEntitiesMCANBTSchemaZeroExtraKeys2612(t *testing.T) {
 	oakHangingState, _ := world.BlockStateIDByProperties("minecraft:oak_hanging_sign", map[string]string{
 		"attached": "false", "rotation": "0", "waterlogged": "false",
 	})
+	for bx := 1; bx <= 9; bx++ {
+		cache.SetBlock(bx, y-1, 1, world.StateStone)
+	}
+	cache.SetBlock(2, y+1, 1, world.StateStone)
 	cache.SetBlock(1, y, 1, oakSignState)
 	cache.SetBlock(2, y, 1, oakHangingState)
 
@@ -559,6 +563,10 @@ func TestShowcaseBlockEntitiesVanillaFixtureLoadAndReloadGameplay2612(t *testing
 	redBannerState, _ := BannerPlacementState("minecraft:red_banner", 1, 0.0)
 	potState, _ := world.BlockStateIDByProperties("minecraft:decorated_pot", nil)
 
+	for bx := 1; bx <= 9; bx++ {
+		cache.SetBlock(bx, y-1, 1, world.StateStone)
+	}
+	cache.SetBlock(2, y+1, 1, world.StateStone)
 	cache.SetBlock(1, y, 1, oakSignState)
 	cache.SetBlock(2, y, 1, spruceHangingState)
 	cache.SetBlock(4, y, 4, lecternNoBookState)
@@ -1013,6 +1021,10 @@ func TestShowcaseBlockEntitiesLevelChunkWithLightAndBlockEntityData2612(t *testi
 	beaconState, _ := world.BlockStateIDByProperties("minecraft:beacon", nil)
 	conduitState, _ := world.BlockStateIDByProperties("minecraft:conduit", map[string]string{"waterlogged": "true"})
 
+	for bx := 1; bx <= 9; bx++ {
+		cache.SetBlock(bx, y-1, 1, world.StateStone)
+	}
+	cache.SetBlock(2, y+1, 1, world.StateStone)
 	cache.SetBlock(1, y, 1, oakSignState)
 	cache.SetBlock(2, y, 1, oakHangingState)
 	cache.SetBlock(3, y, 1, lecternState)

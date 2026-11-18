@@ -219,6 +219,26 @@ func DamageAnvilOnFallLanding(state uint16, fallDistance float64, rng *rand.Rand
 //     anvil -> chipped_anvil -> damaged_anvil -> air.
 //   - Emits LevelEventSoundAnvilBroken (1029) if destroyed or LevelEventSoundAnvilLand (1031) otherwise.
 func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16, fallDistance float64, rng *rand.Rand) (finalState uint16, degraded bool, broken bool, damagedEntities int) {
+	return s.handleFallingAnvilLandingInternal(
+		dim,
+		x, y, z,
+		float64(x)+0.5, float64(y), float64(z)+0.5,
+		state,
+		fallDistance,
+		true,
+		rng,
+	)
+}
+
+func (s *Server) handleFallingAnvilLandingInternal(
+	dim string,
+	x, y, z int,
+	entX, entY, entZ float64,
+	state uint16,
+	fallDistance float64,
+	placed bool,
+	rng *rand.Rand,
+) (finalState uint16, degraded bool, broken bool, damagedEntities int) {
 	if s == nil {
 		return state, false, false, 0
 	}
@@ -233,11 +253,11 @@ func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16
 
 	dmg := CalculateFallingAnvilDamage(fallDistance)
 	if dmg > 0 {
-		minX, maxX := float64(x), float64(x+1)
-		minY, maxY := float64(y), float64(y+2)
-		minZ, maxZ := float64(z), float64(z+1)
+		fbMinX, fbMaxX := entX-world.FallingBlockHalfWidth, entX+world.FallingBlockHalfWidth
+		fbMinY, fbMaxY := entY, entY+world.FallingBlockHeight
+		fbMinZ, fbMaxZ := entZ-world.FallingBlockHalfWidth, entZ+world.FallingBlockHalfWidth
 
-		// Damage mobs overlapping the landing cell.
+		// Damage mobs intersecting FallingBlockEntity.getBoundingBox().
 		if s.entities != nil {
 			nearby := s.entities.AppendInChunkRange(nil, int32(x>>4), int32(z>>4), 1)
 			for i := range nearby {
@@ -245,9 +265,12 @@ func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16
 				if ent.IsItem() || ent.IsExperienceOrb() || ent.EffectiveDimension() != normDim {
 					continue
 				}
-				if ent.X >= minX-0.3 && ent.X <= maxX+0.3 &&
-					ent.Y >= minY-0.5 && ent.Y <= maxY &&
-					ent.Z >= minZ-0.3 && ent.Z <= maxZ+0.3 {
+				eMinX, eMaxX := ent.X-0.3, ent.X+0.3
+				eMinY, eMaxY := ent.Y, ent.Y+1.8
+				eMinZ, eMaxZ := ent.Z-0.3, ent.Z+0.3
+				if fbMinX < eMaxX && fbMaxX > eMinX &&
+					fbMinY < eMaxY && fbMaxY > eMinY &&
+					fbMinZ < eMaxZ && fbMaxZ > eMinZ {
 					hp := s.MobHealth(ent.ID)
 					if hp <= 0 {
 						continue
@@ -267,7 +290,7 @@ func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16
 			}
 		}
 
-		// Damage survival/adventure players overlapping the landing cell.
+		// Damage survival/adventure players intersecting FallingBlockEntity.getBoundingBox().
 		s.playersMu.RLock()
 		sessions := make([]*PlayerSession, 0, len(s.players))
 		for _, ps := range s.players {
@@ -286,21 +309,30 @@ func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16
 			if snap.GameMode != GameModeSurvival && snap.GameMode != GameModeAdventure {
 				continue
 			}
-			if snap.X >= minX-0.3 && snap.X <= maxX+0.3 &&
-				snap.Y >= minY-0.5 && snap.Y <= maxY &&
-				snap.Z >= minZ-0.3 && snap.Z <= maxZ+0.3 {
+			pMinX, pMaxX := snap.X-0.3, snap.X+0.3
+			pMinY, pMaxY := snap.Y, snap.Y+1.8
+			pMinZ, pMaxZ := snap.Z-0.3, snap.Z+0.3
+			if fbMinX < pMaxX && fbMaxX > pMinX &&
+				fbMinY < pMaxY && fbMaxY > pMinY &&
+				fbMinZ < pMaxZ && fbMaxZ > pMinZ {
 				playerDmg := dmg
 				helmet := sess.InventorySlot(ArmorSlotHead)
-				if !helmet.IsEmpty() && IsArmorItem(helmet.ResolvedID()) {
+				if !helmet.IsEmpty() {
+					// Vanilla 26.1.2 LivingEntity.hurtServer: `#minecraft:damages_helmet`
+					// reduces damage by 25% whenever EquipmentSlot.HEAD is non-empty, and
+					// wears durability by max(1, floor(dmg / 4.0)) if damageable.
 					playerDmg *= AnvilHelmetDamageFactor
-					helmetMeta := GetSlotItemMeta(sess, ArmorSlotHead)
-					wear := int32(math.Max(1, math.Floor(float64(dmg)/4.0)))
-					newHelmet, newMeta, broke := DamageItem(helmet, helmetMeta, wear, rng)
-					sess.SetInventorySlot(ArmorSlotHead, newHelmet)
-					if broke {
-						SetSlotItemMeta(sess, ArmorSlotHead, ItemMeta{})
-					} else {
-						SetSlotItemMeta(sess, ArmorSlotHead, newMeta)
+					if MaxItemDurability(helmet.ResolvedID()) > 0 {
+						helmetMeta := GetSlotItemMeta(sess, ArmorSlotHead)
+						wear := int32(math.Max(1, math.Floor(float64(dmg)/4.0)))
+						newHelmet, newMeta, broke := DamageItem(helmet, helmetMeta, wear, rng)
+						sess.SetInventorySlot(ArmorSlotHead, newHelmet)
+						if broke {
+							SetSlotItemMeta(sess, ArmorSlotHead, ItemMeta{})
+						} else {
+							SetSlotItemMeta(sess, ArmorSlotHead, newMeta)
+						}
+						s.syncPlayerInventorySlot(sess, ArmorSlotHead)
 					}
 				}
 				beforeHP := sess.Snapshot().Health
@@ -313,11 +345,19 @@ func (s *Server) HandleFallingAnvilLanding(dim string, x, y, z int, state uint16
 	}
 
 	nextState, didDegrade, didBreak := DamageAnvilOnFallLanding(state, fallDistance, rng)
+	cx, cz := int32(x>>4), int32(z>>4)
+	if !placed {
+		// Landed inside a non-replaceable partial block (e.g. torch, slab):
+		// do NOT overwrite the block at (x, y, z); emit AnvilBlock.onBrokenAfterFall (1029).
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+			EncodeLevelEventPacket(LevelEventSoundAnvilBroken, x, y, z, 0, false))
+		return nextState, didDegrade, didBreak, damagedEntities
+	}
+
 	if cache != nil && didDegrade && nextState != state {
 		_, res := cache.ApplyBlockWithUpdates(x, y, z, nextState)
 		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 	}
-	cx, cz := int32(x>>4), int32(z>>4)
 	if didBreak {
 		s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
 			EncodeLevelEventPacket(LevelEventSoundAnvilBroken, x, y, z, 0, false))
@@ -406,16 +446,19 @@ func (s *Server) HandleFallingStalactiteLanding(dim string, x, y, z int, fallDis
 					snap.Z >= minZ-0.3 && snap.Z <= maxZ+0.3 {
 					playerDmg := dmg
 					helmet := sess.InventorySlot(ArmorSlotHead)
-					if !helmet.IsEmpty() && IsArmorItem(helmet.ResolvedID()) {
+					if !helmet.IsEmpty() {
 						playerDmg *= AnvilHelmetDamageFactor
-						helmetMeta := GetSlotItemMeta(sess, ArmorSlotHead)
-						wear := int32(math.Max(1, math.Floor(float64(dmg)/4.0)))
-						newHelmet, newMeta, broke := DamageItem(helmet, helmetMeta, wear, rng)
-						sess.SetInventorySlot(ArmorSlotHead, newHelmet)
-						if broke {
-							SetSlotItemMeta(sess, ArmorSlotHead, ItemMeta{})
-						} else {
-							SetSlotItemMeta(sess, ArmorSlotHead, newMeta)
+						if MaxItemDurability(helmet.ResolvedID()) > 0 {
+							helmetMeta := GetSlotItemMeta(sess, ArmorSlotHead)
+							wear := int32(math.Max(1, math.Floor(float64(dmg)/4.0)))
+							newHelmet, newMeta, broke := DamageItem(helmet, helmetMeta, wear, rng)
+							sess.SetInventorySlot(ArmorSlotHead, newHelmet)
+							if broke {
+								SetSlotItemMeta(sess, ArmorSlotHead, ItemMeta{})
+							} else {
+								SetSlotItemMeta(sess, ArmorSlotHead, newMeta)
+							}
+							s.syncPlayerInventorySlot(sess, ArmorSlotHead)
 						}
 					}
 					beforeHP := sess.Snapshot().Health
@@ -434,19 +477,92 @@ func (s *Server) HandleFallingStalactiteLanding(dim string, x, y, z int, fallDis
 	return damagedEntities
 }
 
-// ProcessFallingBlockLandings processes all anvil and pointed_dripstone landings
-// recorded in a world.BlockUpdateResult.Landings slice.
+// ProcessFallingBlockLandings processes all anvil, pointed_dripstone, and
+// brushable_block landings recorded in a world.BlockUpdateResult.Landings slice.
 func (s *Server) ProcessFallingBlockLandings(dim string, landings []world.FallingBlockLanding, rng *rand.Rand) {
+	s.ProcessFallingBlockLandingsWithDrops(dim, landings, nil, rng)
+}
+
+// ProcessFallingBlockLandingsWithDrops processes all falling block landings in dim
+// and returns the set of indices in drops that should be suppressed (e.g. when a
+// falling `damaged_anvil` shatters with `cancelDrop=true` upon landing on a partial
+// block, or when `doEntityDrops` is false for a `FallingBlockEntity` drop).
+func (s *Server) ProcessFallingBlockLandingsWithDrops(
+	dim string,
+	landings []world.FallingBlockLanding,
+	drops []world.BlockPosDrop,
+	rng *rand.Rand,
+) map[int]bool {
 	if s == nil || len(landings) == 0 {
-		return
+		return nil
 	}
+	normDim := world.NormalizeDimension(dim)
+	var suppressed map[int]bool
+	suppressDrop := func(idx int) {
+		if idx < 0 {
+			return
+		}
+		if suppressed == nil {
+			suppressed = make(map[int]bool)
+		}
+		suppressed[idx] = true
+	}
+
+	doEntDrops := s.DoEntityDrops()
 	for _, l := range landings {
+		if l.DroppedItemIndex >= 0 && !doEntDrops {
+			suppressDrop(l.DroppedItemIndex)
+		}
+		fallDist := float64(l.FallDistance)
+		if l.ExactFallDistance > 0 {
+			fallDist = l.ExactFallDistance
+		}
+		entX, entY, entZ := l.EntityX, l.EntityY, l.EntityZ
+		hasExactPos := entX != 0 || entY != 0 || entZ != 0
+		if !hasExactPos {
+			entX, entY, entZ = float64(l.Pos.X)+0.5, float64(l.Pos.Y), float64(l.Pos.Z)+0.5
+		}
+		placed := l.Placed || (!hasExactPos && !l.BrokenAfterFall)
+
 		if IsAnvilBlock(l.State) {
-			s.HandleFallingAnvilLanding(dim, l.Pos.X, l.Pos.Y, l.Pos.Z, l.State, float64(l.FallDistance), rng)
+			nextState, didDegrade, didBreak, _ := s.handleFallingAnvilLandingInternal(
+				normDim,
+				l.Pos.X, l.Pos.Y, l.Pos.Z,
+				entX, entY, entZ,
+				l.State,
+				fallDist,
+				placed,
+				rng,
+			)
+			if !placed {
+				if didBreak {
+					// Vanilla FallingBlockEntity.causeFallDamage sets `cancelDrop = true`
+					// when `AnvilBlock.damage` returns null (damaged_anvil destroyed).
+					suppressDrop(l.DroppedItemIndex)
+				} else if didDegrade && l.DroppedItemIndex >= 0 && l.DroppedItemIndex < len(drops) {
+					if newName := world.BlockName(nextState); newName != "" {
+						drops[l.DroppedItemIndex].Stack = world.NewNamedItemStack(newName, 1)
+					}
+				}
+			}
 		} else if world.IsPointedDripstoneBlock(l.State) {
-			s.HandleFallingStalactiteLanding(dim, l.Pos.X, l.Pos.Y, l.Pos.Z, float64(l.FallDistance), l.HurtEntities, l.DamagePerDistance, rng)
+			s.HandleFallingStalactiteLanding(normDim, l.Pos.X, l.Pos.Y, l.Pos.Z, fallDist, l.HurtEntities, l.DamagePerDistance, rng)
+		} else if world.IsBrushableBlock(l.State) && l.BrokenAfterFall {
+			// Vanilla 26.1.2 BrushableBlock.onBrokenAfterFall:
+			// levelEvent(2001, BlockPos.containing(center), Block.getId(blockState)) + GameEvent.BLOCK_DESTROY.
+			cx, cz := int32(l.Pos.X>>4), int32(l.Pos.Z>>4)
+			s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+				EncodeLevelEventPacket(LevelEventParticlesDestroyBlock, l.Pos.X, l.Pos.Y, l.Pos.Z, int32(l.State), false))
+			s.EmitVibration(VibrationEvent{
+				Dimension: normDim,
+				Type:      GameEventBlockDestroy,
+				X:         entX,
+				Y:         entY + world.FallingBlockHeight*0.5,
+				Z:         entZ,
+			})
 		}
 	}
+	return suppressed
 }
 
 // IsValidRepairMaterial reports whether materialItemName is the valid anvil

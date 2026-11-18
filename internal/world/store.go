@@ -128,9 +128,10 @@ func biomeIDByName(name string) uint16 {
 
 // Store reads and writes chunks under a world directory's region/ folder.
 type Store struct {
-	dir     string
-	mu      sync.Mutex
-	regions map[[2]int]*RegionFile
+	dir           string
+	mu            sync.Mutex
+	regions       map[[2]int]*RegionFile
+	entityRegions map[[2]int]*RegionFile
 
 	metaMu sync.Mutex
 	meta   worldMetadata
@@ -170,7 +171,11 @@ func newStore(dir string, seed *int64) (*Store, error) {
 	if err := mkdirAll(regionDir); err != nil {
 		return nil, err
 	}
-	store := &Store{dir: dir, regions: make(map[[2]int]*RegionFile)}
+	store := &Store{
+		dir:           dir,
+		regions:       make(map[[2]int]*RegionFile),
+		entityRegions: make(map[[2]int]*RegionFile),
+	}
 	if seed != nil {
 		meta, err := validateWorldMetadata(dir, *seed)
 		if err != nil {
@@ -290,6 +295,46 @@ func (s *Store) regionFor(cx, cz int32) (*RegionFile, error) {
 	return rf, nil
 }
 
+// entityRegionFor returns the cached Anvil entity RegionFile (`entities/r.<rx>.<rz>.mca`)
+// for chunk (cx, cz). When create is false and the entity region file does not exist on
+// disk, (nil, nil) is returned without creating an empty `entities/` directory.
+func (s *Store) entityRegionFor(cx, cz int32, create bool) (*RegionFile, error) {
+	rx, rz, _, _ := regionIndex(cx, cz)
+	key := [2]int{rx, rz}
+	s.mu.Lock()
+	if s.entityRegions == nil {
+		s.entityRegions = make(map[[2]int]*RegionFile)
+	}
+	rf, ok := s.entityRegions[key]
+	s.mu.Unlock()
+	if ok {
+		return rf, nil
+	}
+	entitiesDir := filepath.Join(s.dir, "entities")
+	if !create {
+		entPath := filepath.Join(entitiesDir, fmt.Sprintf("r.%d.%d.mca", rx, rz))
+		if _, err := os.Stat(entPath); err != nil {
+			if os.IsNotExist(err) {
+				return nil, nil
+			}
+			return nil, err
+		}
+	}
+	rf, err := OpenRegion(entitiesDir, rx, rz)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	if existing, dup := s.entityRegions[key]; dup {
+		rf.Close()
+		rf = existing
+	} else {
+		s.entityRegions[key] = rf
+	}
+	s.mu.Unlock()
+	return rf, nil
+}
+
 // LoadChunk reads and decodes the chunk at (cx, cz). It returns ErrChunkNotFound
 // when the chunk is not stored.
 func (s *Store) LoadChunk(cx, cz int32) (*Chunk, error) {
@@ -395,6 +440,19 @@ func (s *Store) loadChunk(cx, cz int32, requireGeneratorVersion bool) (*Chunk, e
 		}
 		ch.noSkylight = !s.dimType.HasSkylight
 	}
+	if entRF, entErr := s.entityRegionFor(cx, cz, false); entErr == nil && entRF != nil {
+		if entRaw, readErr := entRF.ReadChunk(lx, lz); readErr == nil {
+			if _, entTag, decErr := nbt.UnmarshalNamed(entRaw); decErr == nil {
+				if entRoot, ok := entTag.(*nbt.Compound); ok && entRoot != nil {
+					if listTag, hasList := entRoot.Get("Entities"); hasList {
+						if list, ok := listTag.(nbt.List); ok {
+							ch.persistedFallingBlocks = DecodeFallingBlocksNBT(list)
+						}
+					}
+				}
+			}
+		}
+	}
 	return ch, nil
 }
 
@@ -412,7 +470,59 @@ func (s *Store) saveSnapshot(c *Chunk) error {
 	}
 	raw := nbt.MarshalNamed("", chunkToNBT(c))
 	_, _, lx, lz := regionIndex(c.X, c.Z)
-	return rf.WriteChunk(lx, lz, raw)
+	if err := rf.WriteChunk(lx, lz, raw); err != nil {
+		return err
+	}
+	return s.saveChunkEntitiesSnapshot(c, lx, lz)
+}
+
+func (s *Store) saveChunkEntitiesSnapshot(c *Chunk, lx, lz int) error {
+	hasFalling := len(c.persistedFallingBlocks) > 0
+	entRF, err := s.entityRegionFor(c.X, c.Z, hasFalling)
+	if err != nil || entRF == nil {
+		return err
+	}
+
+	var preserved []nbt.Tag
+	hadStoredChunk := false
+	if existingRaw, readErr := entRF.ReadChunk(lx, lz); readErr == nil {
+		hadStoredChunk = true
+		if _, entTag, decErr := nbt.UnmarshalNamed(existingRaw); decErr == nil {
+			if entRoot, ok := entTag.(*nbt.Compound); ok && entRoot != nil {
+				if listTag, hasList := entRoot.Get("Entities"); hasList {
+					if list, ok := listTag.(nbt.List); ok {
+						for _, elem := range list.Elems {
+							comp, ok := elem.(*nbt.Compound)
+							if !ok || comp == nil {
+								continue
+							}
+							if _, isFB := DecodeFallingBlockEntityNBT(comp); !isFB {
+								preserved = append(preserved, comp)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if !hasFalling && !hadStoredChunk {
+		return nil
+	}
+
+	allElems := make([]nbt.Tag, 0, len(preserved)+len(c.persistedFallingBlocks))
+	allElems = append(allElems, preserved...)
+	for _, fb := range c.persistedFallingBlocks {
+		allElems = append(allElems, EncodeFallingBlockEntityNBT(fb))
+	}
+	elemID := byte(nbt.TagEnd)
+	if len(allElems) > 0 {
+		elemID = nbt.TagCompound
+	}
+	entRoot := nbt.NewCompound().
+		Set("DataVersion", nbt.Int(dataVersion26)).
+		Set("Position", nbt.IntArray{c.X, c.Z}).
+		Set("Entities", nbt.List{ElemID: elemID, Elems: allElems})
+	return entRF.WriteChunk(lx, lz, nbt.MarshalNamed("", entRoot))
 }
 
 // Close releases all open region files. Called on shutdown.
@@ -426,6 +536,12 @@ func (s *Store) Close() error {
 		}
 	}
 	s.regions = nil
+	for _, rf := range s.entityRegions {
+		if err := rf.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	s.entityRegions = nil
 	return firstErr
 }
 

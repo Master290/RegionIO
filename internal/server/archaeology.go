@@ -69,6 +69,38 @@ func (s *Server) brushableStore() *serverBrushableStore {
 	return actual.(*serverBrushableStore)
 }
 
+// BindBrushableCallbacks wires Vanilla 26.1.2 `BrushableBlockEntity.checkReset`
+// and falling detachment cleanup callbacks onto the world.Cache for `dim`.
+func (s *Server) BindBrushableCallbacks(dim string) {
+	if s == nil {
+		return
+	}
+	normDim := normalizeHopperDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	cache.SetBrushableResetCallback(func(x, y, z int, newBrushCount, newDusted int, removed bool) {
+		key := hopperBlockKey{dim: normDim, x: x, y: y, z: z}
+		st := s.brushableStore()
+		st.mu.Lock()
+		if removed {
+			delete(st.blocks, key)
+			st.mu.Unlock()
+			return
+		}
+		if be := st.blocks[key]; be != nil {
+			be.BrushCount = newBrushCount
+			be.Dusted = newDusted
+			if newBrushCount <= 0 {
+				be.HitDirection = ""
+				be.IdleTicks = 0
+			}
+		}
+		st.mu.Unlock()
+	})
+}
+
 var archaeologyAdvancementsOnce sync.Once
 
 func ensureArchaeologyAdvancementsRegistered() {
@@ -199,6 +231,7 @@ func (s *Server) PlaceBrushableBlockWithItemAt(
 		normBlock = "minecraft:suspicious_sand"
 	}
 	cache := s.DimensionChunks(normDim)
+	s.BindBrushableCallbacks(normDim)
 	state := world.BrushableBlockState(normBlock, 0)
 	if cache != nil && state != world.StateAir {
 		_, res = cache.ApplyBlockWithUpdates(x, y, z, state)
@@ -432,11 +465,19 @@ func (s *Server) stepBrushBlockInternal(
 		EncodeLevelEventPacket(LevelEventParticlesDestroyBlock, x, y, z, int32(curState), false))
 
 	if !completed {
+		s.BindBrushableCallbacks(normDim)
 		nextState := world.BrushableBlockState(blockName, dustedStage)
 		if nextState != world.StateAir && nextState != curState {
 			_, upd := cache.ApplyBlockWithUpdates(x, y, z, nextState)
 			s.broadcastDimensionBlockChanges(normDim, cache, upd.Changes, upd.LightChanged)
 		}
+		st.mu.Lock()
+		curCount := 0
+		if curBE := st.blocks[hopperBlockKey{dim: normDim, x: x, y: y, z: z}]; curBE != nil {
+			curCount = curBE.BrushCount
+		}
+		st.mu.Unlock()
+		cache.RecordBrushableStrokeAt(x, y, z, curCount)
 		brushSound := SoundBrushSand
 		if blockName == "minecraft:suspicious_gravel" {
 			brushSound = SoundBrushGravel
@@ -566,6 +607,9 @@ func (s *Server) TickBrushableBlocks() int {
 		if nextState != world.StateAir && nextState != cur {
 			_, upd := cache.ApplyBlockWithUpdates(u.x, u.y, u.z, nextState)
 			s.broadcastDimensionBlockChanges(u.dim, cache, upd.Changes, upd.LightChanged)
+		}
+		if u.nextDusted <= 0 {
+			cache.ClearBrushableRuntimeAt(u.x, u.y, u.z, false)
 		}
 	}
 	return len(updates)

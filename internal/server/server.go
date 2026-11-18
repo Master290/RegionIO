@@ -360,6 +360,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		})
 		s.BindPistonAndRedstoneHooks(world.DimensionOverworld)
 		s.BindBellRedstone(world.DimensionOverworld)
+		s.BindBrushableCallbacks(world.DimensionOverworld)
 	}
 	if entities != nil {
 		entities.SetStepCallback(func(dim string, x, y, z int) {
@@ -3737,14 +3738,28 @@ func (s *Server) TickDimensionBlockUpdates(dim string) world.BlockUpdateResult {
 	if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 	}
-	if len(res.Drops) > 0 && s.DoTileDrops() {
-		for _, d := range res.Drops {
-			if !d.Stack.IsEmpty() {
-				s.SpawnItemEntityInDimension(normDim, float64(d.Pos.X)+0.5, float64(d.Pos.Y)+0.5, float64(d.Pos.Z)+0.5, d.Stack)
+	suppressedDrops := s.ProcessFallingBlockLandingsWithDrops(normDim, res.Landings, res.Drops, nil)
+	if len(res.Drops) > 0 {
+		tileDrops := s.DoTileDrops()
+		for i, d := range res.Drops {
+			if suppressedDrops[i] || d.Stack.IsEmpty() {
+				continue
 			}
+			// Non-entity block-break drops (e.g. scaffolding cascade, fluid wash) obey doTileDrops;
+			// FallingBlockEntity drops are already gated by doEntityDrops in ProcessFallingBlockLandingsWithDrops.
+			isEntityDrop := false
+			for _, l := range res.Landings {
+				if l.DroppedItemIndex == i {
+					isEntityDrop = true
+					break
+				}
+			}
+			if !isEntityDrop && !tileDrops {
+				continue
+			}
+			s.SpawnItemEntityInDimension(normDim, float64(d.Pos.X)+0.5, float64(d.Pos.Y)+0.5, float64(d.Pos.Z)+0.5, d.Stack)
 		}
 	}
-	s.ProcessFallingBlockLandings(normDim, res.Landings, nil)
 	return res
 }
 

@@ -49,11 +49,18 @@ type BlockChange struct {
 }
 
 // FallingBlockLanding records a gravity-affected block landing on a supporting
-// surface after falling FallDistance blocks (>= 1).
+// surface (or shattering on a partial block / BrushableBlock) after falling.
 type FallingBlockLanding struct {
 	Pos               BlockPos
+	EntityX           float64
+	EntityY           float64
+	EntityZ           float64
 	State             uint16
 	FallDistance      int
+	ExactFallDistance float64
+	Placed            bool
+	BrokenAfterFall   bool
+	DroppedItemIndex  int
 	HurtEntities      bool
 	DamagePerDistance float32
 	DamageMax         int
@@ -173,6 +180,9 @@ type BlockUpdateScheduler struct {
 	nextSeq                   uint64
 	pending                   map[scheduledUpdateKey]scheduledUpdate
 	fallDist                  map[BlockPos]int
+	fallingEntities           []*FallingBlockEntitySnapshot
+	brushableResets           map[BlockPos]brushableResetState
+	brushableCallback         BrushableResetCallback
 	anvilLanding              FallingAnvilLandingHook
 	maxChainedNeighborUpdates int
 	chainedDepth              int
@@ -371,6 +381,8 @@ func (c *Cache) ApplyBlockWithUpdates(x, y, z int, state uint16) (bool, BlockUpd
 				c.RemoveStructureBlockDataAt(x, y, z)
 			} else if IsJigsawBlock(oldState) && !IsJigsawBlock(targetState) {
 				c.RemoveJigsawBlockEntityAt(x, y, z)
+			} else if IsBrushableBlock(oldState) && !IsBrushableBlock(targetState) {
+				c.ClearBrushableRuntimeAt(x, y, z, true)
 			}
 		}
 		if !IsNoteBlock(targetState) || !IsNoteBlock(oldState) {
@@ -490,6 +502,7 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 	s.inTick = false
 	s.mu.Unlock()
 
+	c.stepAllFallingBlocks(&res)
 	c.stepAllMovingPistons(now, &res)
 	return res
 }
@@ -505,11 +518,11 @@ func (c *Cache) StepBlockUpdates(ticks int) BlockUpdateResult {
 	return total
 }
 
-// FlushBlockUpdates advances ticks until no scheduled updates or moving pistons
-// remain or maxTicks is reached.
+// FlushBlockUpdates advances ticks until no scheduled updates, falling blocks,
+// or moving pistons remain or maxTicks is reached.
 func (c *Cache) FlushBlockUpdates(maxTicks int) BlockUpdateResult {
 	var total BlockUpdateResult
-	for i := 0; i < maxTicks && (c.PendingBlockUpdates() > 0 || c.ActiveMovingPistonCount() > 0); i++ {
+	for i := 0; i < maxTicks && (c.PendingBlockUpdates() > 0 || c.ActiveMovingPistonCount() > 0 || c.ActiveFallingBlockCount() > 0); i++ {
 		step := c.TickBlockUpdates()
 		total.merge(step)
 	}
@@ -561,6 +574,8 @@ func (c *Cache) setBlockRecorded(x, y, z int, newState uint16, res *BlockUpdateR
 			c.CancelScheduledBlockUpdate(x, y, z, UpdateRedstone)
 		} else if isBlockNamed(oldState, "minecraft:nether_portal") {
 			c.UnregisterPortalPOI(BlockPos{X: x, Y: y, Z: z})
+		} else if IsBrushableBlock(oldState) && !IsBrushableBlock(newState) {
+			c.ClearBrushableRuntimeAt(x, y, z, true)
 		}
 		if isBlockNamed(newState, "minecraft:nether_portal") {
 			c.RegisterPortalPOI(BlockPos{X: x, Y: y, Z: z}, BlockProperties(newState)["axis"])
@@ -735,23 +750,33 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	return state
 }
 
-// touchesWater mirrors vanilla ConcretePowderBlock.touchesLiquid: it checks the
-// cell itself and the 5 non-downward neighbors (west, east, up, north, south),
-// deliberately excluding Direction.DOWN so concrete powder above water falls
-// into the water cell before solidifying.
+// touchesWater mirrors vanilla 26.1.2 ConcretePowderBlock.touchesLiquid + shouldSolidify:
+// checks whether (x, y, z) itself contains `#minecraft:water` or any of the 5 non-downward
+// neighbors (west, east, up, north, south) contains `#minecraft:water` WITHOUT a sturdy
+// face blocking contact (`!neighbor.isFaceSturdy(level, pos, dir.getOpposite())`).
+// Deliberately excludes Direction.DOWN (unless (x, y, z) itself already has water) so
+// concrete powder placed above water falls into the water cell before solidifying.
 func (c *Cache) touchesWater(x, y, z int) bool {
 	if hasWaterFluid(c.GetBlock(x, y, z)) {
 		return true
 	}
-	for _, off := range sixNeighborOffsets {
-		if off[1] < 0 {
-			continue
-		}
-		ny := y + off[1]
+	nonDownNeighbors := [5]struct {
+		dx, dy, dz  int
+		oppositeDir string
+	}{
+		{-1, 0, 0, "east"},
+		{1, 0, 0, "west"},
+		{0, 1, 0, "down"},
+		{0, 0, -1, "south"},
+		{0, 0, 1, "north"},
+	}
+	for _, nb := range nonDownNeighbors {
+		ny := y + nb.dy
 		if ny < c.minY() || ny >= c.maxY() {
 			continue
 		}
-		if hasWaterFluid(c.GetBlock(x+off[0], ny, z+off[2])) {
+		nState := c.GetBlock(x+nb.dx, ny, z+nb.dz)
+		if hasWaterFluid(nState) && !IsBlockFaceSturdy(nState, nb.oppositeDir) {
 			return true
 		}
 	}
@@ -797,7 +822,7 @@ func (c *Cache) applyImmediatePostPlacement(x, y, z int, oldState, newState uint
 			}
 			nState := c.GetBlock(nx, ny, nz)
 			if off[1] <= 0 {
-				if concrete, ok := concretePowderToConcrete(nState); ok {
+				if concrete, ok := concretePowderToConcrete(nState); ok && c.touchesWater(nx, ny, nz) {
 					if c.setBlockRecorded(nx, ny, nz, concrete, res) {
 						c.scheduleAround(nx, ny, nz)
 					}
@@ -896,8 +921,8 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 		return
 	}
 	state := c.GetBlock(x, y, z)
-	if IsFallingBlock(state) && y > c.minY() && isFreeToFallThrough(c.GetBlock(x, y-1, z)) {
-		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, FallingBlockTickDelay)
+	if IsFallingBlock(state) && (y == c.minY() || (y > c.minY() && (isFreeToFallThrough(c.GetBlock(x, y-1, z)) || c.HasPendingBlockUpdate(x, y-1, z, UpdateFalling)))) {
+		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, FallingBlockDelayFor(state))
 	}
 	if c.needsScaffoldingTickAt(x, y, z, state) {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, ScaffoldingTickDelay)
@@ -1570,34 +1595,11 @@ func IsDragonEggBlock(state uint16) bool {
 	return isBlockNamed(state, "minecraft:dragon_egg")
 }
 
-// isFreeToFallThrough mirrors FallingBlock.isFree(BlockState): air, fire,
-// fluids (water/lava), or replaceable non-motion-blocking blocks (short_grass,
-// fern, snow layers=1, vines, etc.).
+// isFreeToFallThrough mirrors Vanilla 26.1.2 FallingBlock.isFree(BlockState):
+// air, #minecraft:fire, standalone liquid (water/lava/bubble_column), or
+// #minecraft:replaceable (913 states across 29 blocks).
 func isFreeToFallThrough(state uint16) bool {
-	if isAirState(state) {
-		return true
-	}
-	if _, _, ok := classifyFluidState(state); ok {
-		return true
-	}
-	info, ok := stateByID(state)
-	if !ok {
-		return false
-	}
-	switch info.Name {
-	case "minecraft:fire", "minecraft:soul_fire",
-		"minecraft:short_grass", "minecraft:fern", "minecraft:dead_bush",
-		"minecraft:tall_grass", "minecraft:large_fern",
-		"minecraft:seagrass", "minecraft:tall_seagrass",
-		"minecraft:vine", "minecraft:glow_lichen",
-		"minecraft:crimson_roots", "minecraft:warped_roots", "minecraft:nether_sprouts",
-		"minecraft:Leaf_litter", "minecraft:leaf_litter", "minecraft:bush",
-		"minecraft:short_dry_grass", "minecraft:tall_dry_grass":
-		return true
-	case "minecraft:snow":
-		return info.Properties["layers"] == "1"
-	}
-	return false
+	return IsFallingBlockFree(state)
 }
 
 // IsAnvilBlockState reports whether state is any anvil variant
@@ -1645,7 +1647,7 @@ func StepAnvilDamageBlockState(state uint16) (nextState uint16, broken bool) {
 }
 
 func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
-	if y < MinY || y >= MinY+WorldHeight {
+	if y < c.minY() || y >= c.maxY() {
 		return
 	}
 	state := c.GetBlock(x, y, z)
@@ -1657,94 +1659,32 @@ func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 		c.stepPointedDripstoneTick(x, y, z, state, res)
 		return
 	}
-	if y <= MinY || !IsFallingBlock(state) {
+	if !IsFallingBlock(state) {
 		return
 	}
-	below := c.GetBlock(x, y-1, z)
-	if !isFreeToFallThrough(below) {
-		if IsBrushableBlock(state) {
+
+	brushHandled := false
+	if IsBrushableBlock(state) {
+		brushHandled, _ = c.checkBrushableResetOnTick(x, y, z, res)
+		state = c.GetBlock(x, y, z)
+		if !IsBrushableBlock(state) {
+			return
+		}
+	}
+
+	// Vanilla 26.1.2 FallingBlock.tick / BrushableBlock.tick:
+	//   if (isFree(level.getBlockState(pos.below())) && pos.getY() >= level.getMinY())
+	//       FallingBlockEntity.fall(level, pos, state);
+	// Note: at y == c.minY(), pos.below() is out-of-bounds void_air (isFree == true).
+	belowFree := y == c.minY() || (y > c.minY() && IsFallingBlockFree(c.GetBlock(x, y-1, z)))
+	if !belowFree {
+		if IsBrushableBlock(state) && !brushHandled {
 			c.DecayBrushableBlockAt(x, y, z, res)
 		}
 		return
 	}
 
-	s := c.BlockUpdates()
-	srcPos := BlockPos{X: x, Y: y, Z: z}
-	dstPos := BlockPos{X: x, Y: y - 1, Z: z}
-	s.mu.Lock()
-	if s.fallDist == nil {
-		s.fallDist = make(map[BlockPos]int)
-	}
-	dist := s.fallDist[srcPos] + 1
-	delete(s.fallDist, srcPos)
-	hook := s.anvilLanding
-	s.mu.Unlock()
-
-	// Remove the falling block from (x, y, z).
-	if !c.setBlockRecorded(x, y, z, StateAir, res) {
-		return
-	}
-
-	// Determine what state lands at (x, y-1, z): concrete powder solidifies when
-	// falling into or next to water.
-	landedState := state
-	if concrete, ok := concretePowderToConcrete(state); ok {
-		if hasWaterFluid(below) || c.touchesWater(x, y-1, z) {
-			landedState = concrete
-		}
-	}
-
-	willContinue := (y-1 > MinY) && isFreeToFallThrough(c.GetBlock(x, y-2, z))
-	if willContinue {
-		s.mu.Lock()
-		s.fallDist[dstPos] = dist
-		s.mu.Unlock()
-		if IsBrushableBlock(state) {
-			if ch := c.chunkAt(int32(x>>4), int32(z>>4)); ch != nil {
-				ch.MoveStructureBlockEntity(x, y, z, x, y-1, z)
-			}
-		}
-	} else {
-		if IsBrushableBlock(state) {
-			// Vanilla BrushableBlock.onBrokenAfterFall (cancelDrop=true):
-			// falling suspicious_sand / suspicious_gravel shatters upon landing,
-			// leaving no block and dropping no item.
-			if ch := c.chunkAt(int32(x>>4), int32(z>>4)); ch != nil {
-				ch.RemoveStructureBlockEntity(x, y, z)
-				ch.RemoveStructureBlockEntity(x, y-1, z)
-			}
-			res.Landings = append(res.Landings, FallingBlockLanding{
-				Pos:          dstPos,
-				State:        state,
-				FallDistance: dist,
-			})
-			c.runNeighborSupportPass(x, y, z, res)
-			c.runNeighborSupportPass(x, y-1, z, res)
-			c.scheduleAround(x, y, z)
-			c.scheduleAround(x, y-1, z)
-			return
-		}
-		if IsAnvilBlockState(landedState) && hook != nil {
-			if nextState, handled := hook(c, dstPos, landedState, dist); handled {
-				landedState = nextState
-			}
-		}
-		res.Landings = append(res.Landings, FallingBlockLanding{
-			Pos:          dstPos,
-			State:        landedState,
-			FallDistance: dist,
-		})
-	}
-
-	if landedState != StateAir || below != StateAir {
-		c.setBlockRecorded(x, y-1, z, landedState, res)
-	}
-
-	// Notify neighbors around both the vacated cell and the destination cell.
-	c.runNeighborSupportPass(x, y, z, res)
-	c.runNeighborSupportPass(x, y-1, z, res)
-	c.scheduleAround(x, y, z)
-	c.scheduleAround(x, y-1, z)
+	c.detachBlockIntoFallingEntity(x, y, z, state, res)
 }
 
 // classifyFluidState returns the fluid kind and its block-state level (0 =
@@ -1941,7 +1881,7 @@ func (c *Cache) stepFluid(x, y, z int, res *BlockUpdateResult) {
 			continue
 		}
 		if kind == fluidWater {
-			if concrete, ok := concretePowderToConcrete(target); ok {
+			if concrete, ok := concretePowderToConcrete(target); ok && c.touchesWater(nx, y, nz) {
 				if c.setBlockRecorded(nx, y, nz, concrete, res) {
 					c.scheduleAround(nx, y, nz)
 				}
@@ -1989,7 +1929,7 @@ func (c *Cache) checkAdjacentWaterAbsorbersOrPowder(x, y, z int, res *BlockUpdat
 		}
 		nState := c.GetBlock(nx, ny, nz)
 		if off[1] <= 0 {
-			if concrete, ok := concretePowderToConcrete(nState); ok {
+			if concrete, ok := concretePowderToConcrete(nState); ok && c.touchesWater(nx, ny, nz) {
 				if c.setBlockRecorded(nx, ny, nz, concrete, res) {
 					c.scheduleAround(nx, ny, nz)
 				}

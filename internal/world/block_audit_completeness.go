@@ -444,6 +444,74 @@ func BlockCollisionBoxes(state uint16) []AABB {
 		}
 	}
 
+	// 10. Partial-height functional, aquatic, sculk, and decorative blocks whose
+	// Vanilla 26.1.2 collision shapes are shorter than a full cube.
+	switch name {
+	case "minecraft:lectern":
+		return []AABB{
+			{MinX: 0, MinY: 0, MinZ: 0, MaxX: 1, MaxY: 2.0 / 16.0, MaxZ: 1},
+			{MinX: 4.0 / 16.0, MinY: 2.0 / 16.0, MinZ: 4.0 / 16.0, MaxX: 12.0 / 16.0, MaxY: 14.0 / 16.0, MaxZ: 12.0 / 16.0},
+		}
+	case "minecraft:brewing_stand":
+		return []AABB{
+			{MinX: 1.0 / 16.0, MinY: 0, MinZ: 1.0 / 16.0, MaxX: 15.0 / 16.0, MaxY: 2.0 / 16.0, MaxZ: 15.0 / 16.0},
+			{MinX: 7.0 / 16.0, MinY: 0, MinZ: 7.0 / 16.0, MaxX: 9.0 / 16.0, MaxY: 14.0 / 16.0, MaxZ: 9.0 / 16.0},
+		}
+	case "minecraft:grindstone":
+		if props["face"] == "ceiling" {
+			return []AABB{{MinX: 2.0 / 16.0, MinY: 2.0 / 16.0, MinZ: 2.0 / 16.0, MaxX: 14.0 / 16.0, MaxY: 1, MaxZ: 14.0 / 16.0}}
+		}
+		return []AABB{{MinX: 2.0 / 16.0, MinY: 0, MinZ: 2.0 / 16.0, MaxX: 14.0 / 16.0, MaxY: 14.0 / 16.0, MaxZ: 14.0 / 16.0}}
+	case "minecraft:heavy_core":
+		return []AABB{{MinX: 4.0 / 16.0, MinY: 0, MinZ: 4.0 / 16.0, MaxX: 12.0 / 16.0, MaxY: 8.0 / 16.0, MaxZ: 12.0 / 16.0}}
+	case "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor", "minecraft:sculk_shrieker":
+		return []AABB{{MinX: 0, MinY: 0, MinZ: 0, MaxX: 1, MaxY: 8.0 / 16.0, MaxZ: 1}}
+	case "minecraft:turtle_egg":
+		return []AABB{{MinX: 3.0 / 16.0, MinY: 0, MinZ: 3.0 / 16.0, MaxX: 12.0 / 16.0, MaxY: 7.0 / 16.0, MaxZ: 12.0 / 16.0}}
+	case "minecraft:dried_ghast":
+		return []AABB{{MinX: 3.0 / 16.0, MinY: 0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 10.0 / 16.0, MaxZ: 13.0 / 16.0}}
+	case "minecraft:sea_pickle":
+		return []AABB{{MinX: 2.0 / 16.0, MinY: 0, MinZ: 2.0 / 16.0, MaxX: 14.0 / 16.0, MaxY: 6.0 / 16.0, MaxZ: 14.0 / 16.0}}
+	case "minecraft:conduit":
+		return []AABB{{MinX: 5.0 / 16.0, MinY: 5.0 / 16.0, MinZ: 5.0 / 16.0, MaxX: 11.0 / 16.0, MaxY: 11.0 / 16.0, MaxZ: 11.0 / 16.0}}
+	case "minecraft:chorus_plant":
+		return []AABB{{MinX: 3.0 / 16.0, MinY: 3.0 / 16.0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 13.0 / 16.0, MaxZ: 13.0 / 16.0}}
+	case "minecraft:cocoa":
+		return []AABB{{MinX: 4.0 / 16.0, MinY: 5.0 / 16.0, MinZ: 4.0 / 16.0, MaxX: 12.0 / 16.0, MaxY: 12.0 / 16.0, MaxZ: 12.0 / 16.0}}
+	case "minecraft:pitcher_crop":
+		if props["half"] == "upper" {
+			return nil
+		}
+		if props["age"] == "0" {
+			return []AABB{{MinX: 5.0 / 16.0, MinY: 0, MinZ: 5.0 / 16.0, MaxX: 11.0 / 16.0, MaxY: 3.0 / 16.0, MaxZ: 11.0 / 16.0}}
+		}
+		if props["age"] == "1" || props["age"] == "2" {
+			return []AABB{{MinX: 3.0 / 16.0, MinY: 0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 5.0 / 16.0, MaxZ: 13.0 / 16.0}}
+		}
+		return []AABB{fullCubeBox}
+	case "minecraft:pointed_dripstone":
+		dir := props["vertical_direction"]
+		if dir == "" {
+			dir = props["tip_direction"]
+		}
+		if dir == "up" && props["thickness"] == "tip" {
+			return []AABB{{MinX: 5.0 / 16.0, MinY: 0, MinZ: 5.0 / 16.0, MaxX: 11.0 / 16.0, MaxY: 11.0 / 16.0, MaxZ: 11.0 / 16.0}}
+		}
+		if dir == "down" && props["thickness"] == "tip" {
+			return []AABB{{MinX: 5.0 / 16.0, MinY: 5.0 / 16.0, MinZ: 5.0 / 16.0, MaxX: 11.0 / 16.0, MaxY: 1, MaxZ: 11.0 / 16.0}}
+		}
+		return []AABB{{MinX: 3.0 / 16.0, MinY: 0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 1, MaxZ: 13.0 / 16.0}}
+	}
+	if IsCopperGolemStatueBlock(state) {
+		return []AABB{{MinX: 3.0 / 16.0, MinY: 0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 14.0 / 16.0, MaxZ: 13.0 / 16.0}}
+	}
+	if IsAmethystBudOrClusterBlock(state) {
+		if props["facing"] == "down" {
+			return []AABB{{MinX: 3.0 / 16.0, MinY: 9.0 / 16.0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 1, MaxZ: 13.0 / 16.0}}
+		}
+		return []AABB{{MinX: 3.0 / 16.0, MinY: 0, MinZ: 3.0 / 16.0, MaxX: 13.0 / 16.0, MaxY: 7.0 / 16.0, MaxZ: 13.0 / 16.0}}
+	}
+
 	// For all remaining solid/partial blocks, collision shape equals outline shape.
 	return BlockOutlineBoxes(state)
 }
@@ -632,12 +700,12 @@ func hasEmptyCollisionShape(state uint16, name string, props map[string]string) 
 		"minecraft:dead_bush", "minecraft:bush", "minecraft:firefly_bush",
 		"minecraft:short_dry_grass", "minecraft:tall_dry_grass", "minecraft:cactus_flower",
 		"minecraft:leaf_litter", "minecraft:pink_petals", "minecraft:wildflowers",
-		"minecraft:dandelion", "minecraft:poppy", "minecraft:blue_orchid", "minecraft:allium",
+		"minecraft:dandelion", "minecraft:golden_dandelion", "minecraft:poppy", "minecraft:blue_orchid", "minecraft:allium",
 		"minecraft:azure_bluet", "minecraft:oxeye_daisy", "minecraft:cornflower",
 		"minecraft:lily_of_the_valley", "minecraft:wither_rose", "minecraft:torchflower",
 		"minecraft:open_eyeblossom", "minecraft:closed_eyeblossom",
 		"minecraft:sunflower", "minecraft:lilac", "minecraft:rose_bush", "minecraft:peony",
-		"minecraft:pitcher_plant", "minecraft:sugar_cane", "minecraft:bamboo_sapling",
+		"minecraft:pitcher_plant", "minecraft:sugar_cane", "minecraft:bamboo_sapling", "minecraft:mangrove_propagule",
 		"minecraft:brown_mushroom", "minecraft:red_mushroom",
 		"minecraft:crimson_fungus", "minecraft:warped_fungus",
 		"minecraft:crimson_roots", "minecraft:warped_roots", "minecraft:nether_sprouts",

@@ -134,22 +134,22 @@ func MakeScaffoldingBlockState(distance int, bottom, waterlogged bool) uint16 {
 	return id
 }
 
-// CalculateScaffoldingDistanceAt mirrors vanilla ScaffoldingBlock.getDistance(level, pos):
+// CalculateScaffoldingDistanceAt mirrors vanilla 26.1.2 ScaffoldingBlock.getDistance(level, pos):
 //   - If the block directly below (x, y-1, z) is scaffolding, start with its distance.
-//   - Else if the block directly below has a sturdy top face, return 0 immediately.
+//   - Else if `below.isFaceSturdy(level, pos.below(), Direction.UP)` is true, return 0 immediately.
 //   - Else start with distance = 7.
 //   - Then inspect the 4 horizontal neighbors: any adjacent scaffolding with
 //     distance d reduces this cell's distance to min(dist, d+1).
 func (c *Cache) CalculateScaffoldingDistanceAt(x, y, z int) int {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return ScaffoldingMaxDistance
 	}
 	dist := ScaffoldingMaxDistance
-	if y > MinY {
+	if y > c.minY() {
 		below := c.GetBlock(x, y-1, z)
 		if IsScaffoldingBlock(below) {
 			dist = ScaffoldingDistance(below)
-		} else if isSturdySupportBlock(below) {
+		} else if IsBlockFaceSturdy(below, "up") {
 			return 0
 		}
 	}
@@ -159,7 +159,7 @@ func (c *Cache) CalculateScaffoldingDistanceAt(x, y, z int) int {
 			cand := ScaffoldingDistance(neighbor) + 1
 			if cand < dist {
 				dist = cand
-				if dist == 0 {
+				if dist <= 1 && (y <= c.minY() || !IsScaffoldingBlock(c.GetBlock(x, y-1, z))) {
 					break
 				}
 			}
@@ -174,28 +174,31 @@ func (c *Cache) IsScaffoldingBottomAt(x, y, z int, distance int) bool {
 	if distance <= 0 {
 		return false
 	}
-	if c == nil || y <= MinY {
+	if c == nil || y <= c.minY() {
 		return true
 	}
 	return !IsScaffoldingBlock(c.GetBlock(x, y-1, z))
 }
 
 // ResolveScaffoldingStateAt computes the scaffolding state at (x, y, z),
-// preserving waterlogged (or enabling it if replacing water).
+// preserving waterlogged (or enabling it if replacing source water).
 func (c *Cache) ResolveScaffoldingStateAt(x, y, z int, baseState uint16) uint16 {
 	waterlogged := isWaterloggedState(baseState)
-	if !waterlogged && c != nil && y >= MinY && y < MinY+WorldHeight && c.GetBlock(x, y, z) == StateWater {
-		waterlogged = true
+	if !waterlogged && c != nil && y >= c.minY() && y < c.maxY() {
+		if kind, lvl, ok := classifyFluidState(c.GetBlock(x, y, z)); ok && kind == fluidWater && lvl == 0 && isLiquidBlock(c.GetBlock(x, y, z)) {
+			waterlogged = true
+		}
 	}
 	dist := c.CalculateScaffoldingDistanceAt(x, y, z)
 	bottom := c.IsScaffoldingBottomAt(x, y, z, dist)
 	return MakeScaffoldingBlockState(dist, bottom, waterlogged)
 }
 
-// CanPlaceScaffoldingAt reports whether scaffolding can be placed at (x, y, z)
-// (requires calculated distance < 7 and a replaceable target block).
+// CanPlaceScaffoldingAt reports whether scaffolding can be placed directly at
+// a non-scaffolding position (x, y, z) (requires calculated distance < 7 and a
+// replaceable target block).
 func (c *Cache) CanPlaceScaffoldingAt(x, y, z int) bool {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return false
 	}
 	cur := c.GetBlock(x, y, z)
@@ -206,70 +209,143 @@ func (c *Cache) CanPlaceScaffoldingAt(x, y, z int) bool {
 }
 
 func isScaffoldingReplaceable(state uint16) bool {
-	if isAirState(state) || state == StateWater || state == StateLava {
-		return true
+	if IsScaffoldingBlock(state) {
+		return false
 	}
-	if _, _, ok := isStandaloneFluidBlock(state); ok {
-		return true
-	}
-	return isFreeToFallThrough(state) && !IsScaffoldingBlock(state)
+	return CanFallingBlockReplaceOnLanding(state)
 }
 
-// PlaceScaffoldingAt implements vanilla ScaffoldingBlockItem placement:
-//   - If (x, y, z) is a replaceable block and CalculateScaffoldingDistanceAt(x, y, z) < 7,
-//     scaffolding is placed directly at (x, y, z).
-//   - If (x, y, z) is already `minecraft:scaffolding`, placement slides along
-//     existing scaffolding blocks in `extendDir` ("up" by default, or "north",
-//     "south", "west", "east" when extending horizontally from the top/side)
-//     until a replaceable cell with distance < 7 is found.
-func (c *Cache) PlaceScaffoldingAt(x, y, z int, extendDir string) (placedPos BlockPos, placedState uint16, ok bool, res BlockUpdateResult) {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
-		return BlockPos{}, StateAir, false, res
+// UpdateScaffoldingPlacementContext mirrors Vanilla 26.1.2
+// `BlockPlaceContext` + `ScaffoldingBlockItem.updatePlacementContext(ctx)`:
+//   - Given the clicked block `(hitX, hitY, hitZ)`, `clickedFace` ("down","up","north","south","west","east"),
+//     player `horizontalDirection` ("north","south","west","east"), `isInside`, and `isSecondaryUseActive` (sneaking):
+//   - First resolves `clickedPos`: `(hitX, hitY, hitZ)` if the clicked block is already
+//     `minecraft:scaffolding` or replaceable, otherwise `(hitX, hitY, hitZ)` offset by `clickedFace`.
+//   - If `clickedPos` is NOT `minecraft:scaffolding`: succeeds iff replaceable and `getDistance(clickedPos) < 7`.
+//   - If `clickedPos` IS `minecraft:scaffolding`: chooses extension direction (`isSecondaryUseActive` ->
+//     `clickedFace.getOpposite()` if `isInside` else `clickedFace`; otherwise `horizontalDirection` if
+//     `clickedFace == "up"` else `"up"`), then marches along existing scaffolding while `steps < 7`
+//     (counting `steps` only on horizontal axes!) and returns the first replaceable cell (allowing
+//     `distance == 7` because `ScaffoldingBlockItem.mustSurvive()` returns `false`).
+func (c *Cache) UpdateScaffoldingPlacementContext(
+	hitX, hitY, hitZ int,
+	clickedFace string,
+	horizontalDirection string,
+	isInside bool,
+	isSecondaryUseActive bool,
+) (targetPos BlockPos, placementDir string, ok bool) {
+	if c == nil {
+		return BlockPos{}, "", false
 	}
-	tx, ty, tz := x, y, z
-	if IsScaffoldingBlock(c.GetBlock(tx, ty, tz)) {
-		dx, dy, dz := 0, 1, 0
-		maxSteps := WorldHeight
-		switch strings.ToLower(strings.TrimSpace(extendDir)) {
-		case "north":
-			dx, dy, dz = 0, 0, -1
-			maxSteps = ScaffoldingMaxDistance
-		case "south":
-			dx, dy, dz = 0, 0, 1
-			maxSteps = ScaffoldingMaxDistance
-		case "west":
-			dx, dy, dz = -1, 0, 0
-			maxSteps = ScaffoldingMaxDistance
-		case "east":
-			dx, dy, dz = 1, 0, 0
-			maxSteps = ScaffoldingMaxDistance
+	face := strings.ToLower(strings.TrimSpace(clickedFace))
+	switch face {
+	case "down", "up", "north", "south", "west", "east":
+	default:
+		face = "up"
+	}
+	horiz := strings.ToLower(strings.TrimSpace(horizontalDirection))
+	switch horiz {
+	case "north", "south", "west", "east":
+	default:
+		horiz = "north"
+	}
+
+	cx, cy, cz := hitX, hitY, hitZ
+	if cy < c.minY() || cy >= c.maxY() {
+		return BlockPos{}, "", false
+	}
+	hitState := c.GetBlock(cx, cy, cz)
+	if !IsScaffoldingBlock(hitState) && !isScaffoldingReplaceable(hitState) {
+		dx, dy, dz, valid := directionOffset3D(face)
+		if !valid {
+			return BlockPos{}, "", false
 		}
-		found := false
-		for step := 0; step < maxSteps; step++ {
-			tx += dx
-			ty += dy
-			tz += dz
-			if ty < MinY || ty >= MinY+WorldHeight {
-				return BlockPos{}, StateAir, false, res
-			}
-			cur := c.GetBlock(tx, ty, tz)
-			if IsScaffoldingBlock(cur) {
-				continue
-			}
-			if isScaffoldingReplaceable(cur) {
-				found = true
-			}
-			break
-		}
-		if !found {
-			return BlockPos{}, StateAir, false, res
+		cx += dx
+		cy += dy
+		cz += dz
+		if cy < c.minY() || cy >= c.maxY() {
+			return BlockPos{}, "", false
 		}
 	}
 
-	if !c.CanPlaceScaffoldingAt(tx, ty, tz) {
+	stateAtClicked := c.GetBlock(cx, cy, cz)
+	if !IsScaffoldingBlock(stateAtClicked) {
+		if !isScaffoldingReplaceable(stateAtClicked) {
+			return BlockPos{}, "", false
+		}
+		if c.CalculateScaffoldingDistanceAt(cx, cy, cz) == ScaffoldingMaxDistance {
+			return BlockPos{}, "", false
+		}
+		return BlockPos{X: cx, Y: cy, Z: cz}, face, true
+	}
+
+	var dir string
+	if isSecondaryUseActive {
+		if isInside {
+			dir = oppositeDirection(face)
+		} else {
+			dir = face
+		}
+	} else {
+		if face == "up" {
+			dir = horiz
+		} else {
+			dir = "up"
+		}
+	}
+
+	dx, dy, dz, valid := directionOffset3D(dir)
+	if !valid {
+		return BlockPos{}, "", false
+	}
+	isHoriz := dy == 0
+	steps := 0
+	mx, my, mz := cx+dx, cy+dy, cz+dz
+	for steps < ScaffoldingMaxDistance {
+		if my < c.minY() || my >= c.maxY() {
+			return BlockPos{}, "", false
+		}
+		cur := c.GetBlock(mx, my, mz)
+		if !IsScaffoldingBlock(cur) {
+			if isScaffoldingReplaceable(cur) {
+				return BlockPos{X: mx, Y: my, Z: mz}, dir, true
+			}
+			return BlockPos{}, "", false
+		}
+		mx += dx
+		my += dy
+		mz += dz
+		if isHoriz {
+			steps++
+		}
+	}
+	return BlockPos{}, "", false
+}
+
+// PlaceScaffoldingWithContext places a `minecraft:scaffolding` block using
+// Vanilla 26.1.2 `ScaffoldingBlockItem.updatePlacementContext` + `mustSurvive() == false`.
+func (c *Cache) PlaceScaffoldingWithContext(
+	hitX, hitY, hitZ int,
+	clickedFace string,
+	horizontalDirection string,
+	isInside bool,
+	isSecondaryUseActive bool,
+) (placedPos BlockPos, placedState uint16, ok bool, res BlockUpdateResult) {
+	targetPos, _, valid := c.UpdateScaffoldingPlacementContext(hitX, hitY, hitZ, clickedFace, horizontalDirection, isInside, isSecondaryUseActive)
+	if !valid {
 		return BlockPos{}, StateAir, false, res
 	}
-	waterlogged := hasWaterFluid(c.GetBlock(tx, ty, tz))
+	return c.placeResolvedScaffoldingCell(targetPos.X, targetPos.Y, targetPos.Z)
+}
+
+func (c *Cache) placeResolvedScaffoldingCell(tx, ty, tz int) (placedPos BlockPos, placedState uint16, ok bool, res BlockUpdateResult) {
+	existing := c.GetBlock(tx, ty, tz)
+	waterlogged := false
+	if !c.IsWaterEvaporatingDimension() {
+		if kind, lvl, isFl := classifyFluidState(existing); isFl && kind == fluidWater && lvl == 0 && isLiquidBlock(existing) {
+			waterlogged = true
+		}
+	}
 	dist := c.CalculateScaffoldingDistanceAt(tx, ty, tz)
 	bottom := c.IsScaffoldingBottomAt(tx, ty, tz, dist)
 	state := MakeScaffoldingBlockState(dist, bottom, waterlogged)
@@ -277,7 +353,66 @@ func (c *Cache) PlaceScaffoldingAt(x, y, z int, extendDir string) (placedPos Blo
 	if !applied {
 		return BlockPos{}, StateAir, false, res
 	}
+	// Vanilla ScaffoldingBlock.onPlace always schedules a 1-tick block update.
+	c.ScheduleBlockUpdate(tx, ty, tz, UpdateFalling, ScaffoldingTickDelay)
+	if waterlogged {
+		c.ScheduleBlockUpdate(tx, ty, tz, UpdateFluid, WaterTickDelay)
+	}
 	return BlockPos{X: tx, Y: ty, Z: tz}, c.GetBlock(tx, ty, tz), true, upd
+}
+
+// PlaceScaffoldingAt implements vanilla ScaffoldingBlockItem placement:
+//   - If (x, y, z) is a replaceable block and CalculateScaffoldingDistanceAt(x, y, z) < 7,
+//     scaffolding is placed directly at (x, y, z).
+//   - If (x, y, z) is already `minecraft:scaffolding`, placement slides along
+//     existing scaffolding blocks in `extendDir` ("up" by default, or "north",
+//     "south", "west", "east", "down") while horizontal `steps < 7` (unlimited
+//     vertically within world bounds) and places scaffolding at the first
+//     replaceable cell (`mustSurvive() == false`, so `distance == 7` places and
+//     detaches into a `FallingBlockEntity` on tick 1).
+func (c *Cache) PlaceScaffoldingAt(x, y, z int, extendDir string) (placedPos BlockPos, placedState uint16, ok bool, res BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return BlockPos{}, StateAir, false, res
+	}
+	if !IsScaffoldingBlock(c.GetBlock(x, y, z)) {
+		if !c.CanPlaceScaffoldingAt(x, y, z) {
+			return BlockPos{}, StateAir, false, res
+		}
+		return c.placeResolvedScaffoldingCell(x, y, z)
+	}
+
+	dir := strings.ToLower(strings.TrimSpace(extendDir))
+	switch dir {
+	case "north", "south", "west", "east", "down", "up":
+	default:
+		dir = "up"
+	}
+	dx, dy, dz, valid := directionOffset3D(dir)
+	if !valid {
+		return BlockPos{}, StateAir, false, res
+	}
+	isHoriz := dy == 0
+	steps := 0
+	tx, ty, tz := x+dx, y+dy, z+dz
+	for steps < ScaffoldingMaxDistance {
+		if ty < c.minY() || ty >= c.maxY() {
+			return BlockPos{}, StateAir, false, res
+		}
+		cur := c.GetBlock(tx, ty, tz)
+		if !IsScaffoldingBlock(cur) {
+			if !isScaffoldingReplaceable(cur) {
+				return BlockPos{}, StateAir, false, res
+			}
+			return c.placeResolvedScaffoldingCell(tx, ty, tz)
+		}
+		tx += dx
+		ty += dy
+		tz += dz
+		if isHoriz {
+			steps++
+		}
+	}
+	return BlockPos{}, StateAir, false, res
 }
 
 func (c *Cache) needsScaffoldingTickAt(x, y, z int, state uint16) bool {
@@ -291,6 +426,13 @@ func (c *Cache) needsScaffoldingTickAt(x, y, z int, state uint16) bool {
 	return wantDist == ScaffoldingMaxDistance || curDist != wantDist || curBottom != wantBottom
 }
 
+// stepScaffoldingTick mirrors Vanilla 26.1.2 `ScaffoldingBlock.tick`:
+//   - Computes `newDist = getDistance(level, pos)` and `updated = state.setValue(DISTANCE, newDist).setValue(BOTTOM, isBottom(...))`.
+//   - When `newDist == 7`:
+//     - If `state.getValue(DISTANCE) == 7`: `FallingBlockEntity.fall(level, pos, updated)`!
+//     - Else (`state.getValue(DISTANCE) < 7`): `level.destroyBlock(pos, true)` (breaks into air/water,
+//       drops `1x minecraft:scaffolding`, and triggers neighbor 1-tick cascade)!
+//   - Otherwise, if `updated != state`, updates the block state at `(x, y, z)`.
 func (c *Cache) stepScaffoldingTick(x, y, z int, state uint16, res *BlockUpdateResult) {
 	if !IsScaffoldingBlock(state) {
 		return
@@ -298,22 +440,21 @@ func (c *Cache) stepScaffoldingTick(x, y, z int, state uint16, res *BlockUpdateR
 	newDist := c.CalculateScaffoldingDistanceAt(x, y, z)
 	newBottom := c.IsScaffoldingBottomAt(x, y, z, newDist)
 	waterlogged := isWaterloggedState(state)
+	updated := MakeScaffoldingBlockState(newDist, newBottom, waterlogged)
 
 	if newDist == ScaffoldingMaxDistance {
+		if ScaffoldingDistance(state) == ScaffoldingMaxDistance {
+			c.detachBlockIntoFallingEntity(x, y, z, updated, res)
+			return
+		}
 		replacement := StateAir
 		if waterlogged {
 			replacement = StateWater
 		}
-		landY := c.findFallingLandingY(x, y, z)
-		fallDist := y - landY
-		if fallDist < 1 {
-			fallDist = 1
-		}
 		if c.setBlockRecorded(x, y, z, replacement, res) {
-			res.Landings = append(res.Landings, FallingBlockLanding{
-				Pos:          BlockPos{X: x, Y: landY, Z: z},
-				State:        state,
-				FallDistance: fallDist,
+			res.Drops = append(res.Drops, BlockPosDrop{
+				Pos:   BlockPos{X: x, Y: y, Z: z},
+				Stack: NewNamedItemStack("minecraft:scaffolding", 1),
 			})
 			c.runNeighborSupportPass(x, y, z, res)
 			c.scheduleAround(x, y, z)
@@ -321,9 +462,8 @@ func (c *Cache) stepScaffoldingTick(x, y, z int, state uint16, res *BlockUpdateR
 		return
 	}
 
-	newState := MakeScaffoldingBlockState(newDist, newBottom, waterlogged)
-	if newState != state {
-		if c.setBlockRecorded(x, y, z, newState, res) {
+	if updated != state {
+		if c.setBlockRecorded(x, y, z, updated, res) {
 			c.runNeighborSupportPass(x, y, z, res)
 			c.scheduleAround(x, y, z)
 		}

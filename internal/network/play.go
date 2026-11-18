@@ -1931,7 +1931,8 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
-	if _, err := r.Bool(); err != nil {
+	inside, err := r.Bool()
+	if err != nil {
 		return err
 	}
 	if _, err := r.Bool(); err != nil {
@@ -2433,6 +2434,25 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				} else if world.BlockName(state) == "minecraft:wet_sponge" && h.srv != nil {
 					if finalSt, _ := h.srv.PlaceWetSpongeAt(dim, px, py, pz); finalSt != world.StateAir {
 						state = finalSt
+						placed = true
+					}
+				} else if world.IsScaffoldingBlock(state) {
+					horizDir := "north"
+					sneak := false
+					if h.session != nil {
+						horizDir = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
+						sneak = h.session.IsSneaking()
+					}
+					if scPos, scState, scOK, scRes := cache.PlaceScaffoldingWithContext(x, y, z, server.BlockFaceDirectionName(face), horizDir, inside, sneak); scOK {
+						px, py, pz = scPos.X, scPos.Y, scPos.Z
+						state = scState
+						h.broadcastBlockChanges(dim, cache, scRes)
+						placed = true
+					}
+				} else if world.IsFallingBlock(state) {
+					if valid, fallRes := cache.ApplyBlockWithUpdates(px, py, pz, state); valid {
+						state = cache.GetBlock(px, py, pz)
+						h.broadcastBlockChanges(dim, cache, fallRes)
 						placed = true
 					}
 				} else if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {

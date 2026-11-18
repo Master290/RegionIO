@@ -51,10 +51,21 @@ func TestScaffoldingPlacementDistanceBottomAndChainCollapse(t *testing.T) {
 		}
 	}
 
-	// 4. Attempting to extend a 7th block horizontally (distance 7) must be rejected.
-	if _, _, hOk, _ := c.PlaceScaffoldingAt(x, y+2, z, "east"); hOk {
-		t.Fatalf("expected 7th horizontal overhang block (distance=7) to be rejected")
+	// 4. Extending a 7th block horizontally places distance=7 (mustSurvive()=false),
+	// while an 8th block (steps == 7) is rejected by ScaffoldingBlockItem.updatePlacementContext.
+	pos7, st7, ok7, _ := c.PlaceScaffoldingAt(x, y+2, z, "east")
+	if !ok7 || pos7 != (BlockPos{X: x + 7, Y: y + 2, Z: z}) || ScaffoldingDistance(st7) != 7 {
+		t.Fatalf("7th horizontal overhang: got ok=%v pos=%+v dist=%d, want ok=true (x+7,y+2,z) dist=7", ok7, pos7, ScaffoldingDistance(st7))
 	}
+	if _, _, ok8, _ := c.PlaceScaffoldingAt(x, y+2, z, "east"); ok8 {
+		t.Fatalf("expected 8th horizontal overhang block (steps==7) to be rejected")
+	}
+	// Tick 1: the distance=7 block at (x+7, y+2, z) detaches via FallingBlockEntity.fall!
+	c.StepBlockUpdates(1)
+	if got := c.GetBlock(x+7, y+2, z); got != StateAir {
+		t.Fatalf("expected distance=7 overhang at x+7 to detach on tick 1, got %s", stateLabel(got))
+	}
+	c.FlushBlockUpdates(64)
 
 	// 5. Scheduled tick persistence round-trip for scaffolding before collapse.
 	c.ScheduleBlockUpdate(x+6, y+2, z, UpdateFalling, 1)
@@ -66,7 +77,9 @@ func TestScaffoldingPlacementDistanceBottomAndChainCollapse(t *testing.T) {
 	}
 
 	// 6. Break base scaffolding at (x, y, z) and flush scheduled 1-tick updates:
-	// the entire vertical column and 6-block horizontal bridge must collapse in a chain reaction.
+	// the entire vertical column (y+1, y+2) and 6-block horizontal bridge (x+1..x+6)
+	// have state.distance < 7 and newDist == 7, so each breaks via destroyBlock(pos, true)
+	// dropping 1x minecraft:scaffolding in a 1-tick-per-block cascade (8 drops total).
 	_, breakRes := c.BreakBlockWithUpdates(x, y, z)
 	flushRes := c.FlushBlockUpdates(32)
 	breakRes.merge(flushRes)
@@ -81,8 +94,14 @@ func TestScaffoldingPlacementDistanceBottomAndChainCollapse(t *testing.T) {
 			t.Fatalf("overhang at x+%d did not collapse: got %s", d, stateLabel(got))
 		}
 	}
-	if len(breakRes.Landings) < 8 {
-		t.Fatalf("expected at least 8 falling landings from collapsed scaffolding, got %d", len(breakRes.Landings))
+	scaffoldingDrops := 0
+	for _, drop := range breakRes.Drops {
+		if drop.Stack.ResolvedID() == "minecraft:scaffolding" {
+			scaffoldingDrops += int(drop.Stack.Count)
+		}
+	}
+	if scaffoldingDrops != 8 {
+		t.Fatalf("expected 8 dropped minecraft:scaffolding items from collapsed column+bridge, got %d", scaffoldingDrops)
 	}
 }
 
