@@ -621,8 +621,9 @@ func (h *handler) serverTickLoop() {
 			nowGameTime, _ := h.srv.WorldTime()
 			if nowGameTime == lastGameTime {
 				// StartSpawning is not advancing the world clock; tick player,
-				// entity status effects, raids, and boss fights here.
+				// entity status effects, block breaking, raids, and boss fights here.
 				h.srv.TickAllPlayerEffects()
+				h.srv.TickAllPlayersBlockBreaking()
 				h.srv.TickAllEntityEffects()
 				h.srv.TickVillagers()
 				h.srv.TickRaids()
@@ -1805,6 +1806,9 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
+	if seq < 0 {
+		return errors.New("player_action: negative sequence")
+	}
 	if status == server.PlayerActionReleaseUseItem ||
 		status == server.PlayerActionDropAllItems ||
 		status == server.PlayerActionDropItem ||
@@ -1813,21 +1817,7 @@ func (h *handler) handlePlayerAction(pkt protocol.Packet) error {
 	}
 
 	if h.srv != nil {
-		if h.session != nil && !h.srv.CanInteractWithBlock(h.session, x, y, z) {
-			return h.sendBlockChangedAck(seq)
-		}
-		canModifyWorld := h.session == nil || (h.session.Snapshot().GameMode != server.GameModeSpectator && h.session.Snapshot().GameMode != server.GameModeAdventure)
-		if canModifyWorld && status == server.PlayerActionStartDestroyBlock && int(faceByte) < len(faceOffsets) {
-			dim := world.DimensionOverworld
-			if h.session != nil {
-				dim = h.session.Dimension()
-			}
-			off := faceOffsets[faceByte]
-			if h.srv.ExtinguishFireAt(dim, x+off[0], y+off[1], z+off[2]) {
-				return h.sendBlockChangedAck(seq)
-			}
-		}
-		if broken, _ := h.srv.BreakBlock(h.session, x, y, z, status); broken {
+		if broken, _ := h.srv.HandlePlayerBlockBreakAction(h.session, x, y, z, status, faceByte); broken {
 			h.syncHotbarFromSession()
 			h.log.Debug("block broken", "x", x, "y", y, "z", z)
 		}
@@ -1942,6 +1932,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	if err != nil {
 		return err
 	}
+	if seq < 0 {
+		return errors.New("use_item_on: negative sequence")
+	}
 	if hand != server.HandMain && hand != server.HandOffHand {
 		return errors.New("use_item_on: invalid hand")
 	}
@@ -1957,6 +1950,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 		return h.sendBlockChangedAck(seq)
 	}
 	if h.srv != nil && h.session != nil && !h.srv.CanInteractWithBlock(h.session, x, y, z) {
+		h.sendUseItemOnRollback(h.srv.PlayerChunks(h.session), x, y, z, face)
 		return h.sendBlockChangedAck(seq)
 	}
 	isAdventure := h.session != nil && h.session.Snapshot().GameMode == server.GameModeAdventure
@@ -2068,6 +2062,12 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					return h.sendBlockChangedAck(seq)
 				}
 			}
+			if heldStack.ResolvedID() == "minecraft:bucket" {
+				if _, _, handled := h.srv.UseFluidBucketOnBlock(h.session, hand, x, y, z, face); handled {
+					h.syncHotbarFromSession()
+					return h.sendBlockChangedAck(seq)
+				}
+			}
 			if !isAdventure {
 				if world.IsLodestoneBlock(clickedState) && server.IsCompassItem(heldStack) {
 					if h.srv.UseCompassOnLodestone(h.session, hand, x, y, z) {
@@ -2077,12 +2077,6 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				}
 				if heldStack.ResolvedID() == server.BrushItemID && world.IsBrushableBlock(clickedState) {
 					if _, _, _, handled := h.srv.UsePlayerBrushOnBlock(h.session, hand, x, y, z, face); handled {
-						h.syncHotbarFromSession()
-						return h.sendBlockChangedAck(seq)
-					}
-				}
-				if heldStack.ResolvedID() == "minecraft:bucket" {
-					if _, _, handled := h.srv.UseFluidBucketOnBlock(h.session, hand, x, y, z, face); handled {
 						h.syncHotbarFromSession()
 						return h.sendBlockChangedAck(seq)
 					}
@@ -2169,7 +2163,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				h.srv.EmitPlayerBlockVibration(h.session, evType, dim, x, y, z, world.BlockName(newState))
 				return h.sendBlockChangedAck(seq)
 			}
-			if !isAdventure && h.session != nil && !h.session.IsDead() {
+			if h.session != nil && !h.session.IsDead() {
 				invSlot := h.session.HeldInventorySlot()
 				if hand == server.HandOffHand {
 					invSlot = server.OffHandContainerSlot
@@ -2185,6 +2179,16 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						return h.sendBlockChangedAck(seq)
 					}
 				}
+			}
+			if !isAdventure && h.session != nil && !h.session.IsDead() {
+				invSlot := h.session.HeldInventorySlot()
+				if hand == server.HandOffHand {
+					invSlot = server.OffHandContainerSlot
+				}
+				if invSlot >= 0 && h.session.InventorySlot(invSlot).IsEmpty() && hand == 0 && h.heldSlot >= 0 && int(h.heldSlot) < len(h.hotbar) && h.hotbar[h.heldSlot] > 0 {
+					h.session.SetInventorySlot(invSlot, world.NewItemStack(h.hotbar[h.heldSlot], 1))
+				}
+				heldItem := h.session.InventorySlot(invSlot)
 				if world.IsSnowLayerBlock(cache.GetBlock(x, y, z)) && heldItem.ResolvedID() == "minecraft:snow" {
 					creative := h.session.Snapshot().GameMode == server.GameModeCreative
 					if newStack, stacked := h.srv.StackSnowLayerWithItem(dim, x, y, z, heldItem, creative); stacked {
@@ -2244,7 +2248,22 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 	}
 
 	if isAdventure {
-		return h.sendBlockChangedAck(seq)
+		allowed := false
+		if h.srv != nil && h.session != nil {
+			advSlot := h.session.HeldInventorySlot()
+			if hand == server.HandOffHand {
+				advSlot = server.OffHandContainerSlot
+			}
+			if cache := h.srv.PlayerChunks(h.session); cache != nil && advSlot >= 0 && y >= world.MinY && y < world.MinY+world.WorldHeight {
+				allowed = server.CanPlaceOnBlockInAdventure(server.GetSlotItemMeta(h.session, advSlot), cache.GetBlock(x, y, z))
+			}
+		}
+		if !allowed {
+			if h.srv != nil && h.session != nil {
+				h.sendUseItemOnRollback(h.srv.PlayerChunks(h.session), x, y, z, face)
+			}
+			return h.sendBlockChangedAck(seq)
+		}
 	}
 
 	if face >= 0 && int(face) < len(faceOffsets) && (h.session == nil || !h.session.IsDead()) {
@@ -2346,17 +2365,57 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				return h.sendBlockChangedAck(seq)
 			}
 		}
-		if state, ok := h.heldBlock(); ok {
-			off := faceOffsets[face]
-			px, py, pz := x+off[0], y+off[1], z+off[2]
-			dim := world.DimensionOverworld
-			if h.session != nil {
-				dim = h.session.Dimension()
-			}
+		if baseState, placeInvSlot, ok := h.heldBlockForHand(hand); ok {
 			cache := h.srv.PlayerChunks(h.session)
 			if cache != nil {
-				if h.srv != nil {
-					state = h.srv.ResolvePlacedBlockState(h.session, state, face)
+				dim := world.DimensionOverworld
+				if h.session != nil {
+					dim = h.session.Dimension()
+				}
+				var px, py, pz int
+				state := baseState
+				scHorizDir, scSneak := "north", false
+				if world.IsScaffoldingBlock(baseState) {
+					if h.session != nil {
+						scHorizDir = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
+						scSneak = h.session.IsSneaking()
+					}
+					scTarget, _, scCtxOK := cache.UpdateScaffoldingPlacementContext(x, y, z, server.BlockFaceDirectionName(face), scHorizDir, inside, scSneak)
+					if !scCtxOK {
+						h.sendUseItemOnRollback(cache, x, y, z, face)
+						return h.sendBlockChangedAck(seq)
+					}
+					px, py, pz = scTarget.X, scTarget.Y, scTarget.Z
+					state = cache.ResolveScaffoldingStateAt(px, py, pz, baseState)
+				} else {
+					clickedState := uint16(world.StateAir)
+					if y >= world.MinY && y < world.MinY+world.WorldHeight {
+						clickedState = cache.GetBlock(x, y, z)
+					}
+					off := faceOffsets[face]
+					px, py, pz = x+off[0], y+off[1], z+off[2]
+					if y >= world.MinY && y < world.MinY+world.WorldHeight &&
+						server.CanReplaceBlockForPlacement(clickedState, baseState, face, cursorY, true) {
+						px, py, pz = x, y, z
+					} else if py < world.MinY || py >= world.MinY+world.WorldHeight ||
+						!server.CanReplaceBlockForPlacement(cache.GetBlock(px, py, pz), baseState, face, cursorY, false) {
+						h.sendUseItemOnRollback(cache, x, y, z, face)
+						return h.sendBlockChangedAck(seq)
+					}
+					if py < world.MinY || py >= world.MinY+world.WorldHeight {
+						h.sendUseItemOnRollback(cache, x, y, z, face)
+						return h.sendBlockChangedAck(seq)
+					}
+
+					if resolvedTorch, torchOK := server.ResolveTorchPlacementAt(cache, px, py, pz, state, face); !torchOK {
+						h.sendUseItemOnRollback(cache, x, y, z, face)
+						return h.sendBlockChangedAck(seq)
+					} else {
+						state = resolvedTorch
+					}
+					if h.srv != nil {
+						state = h.srv.ResolvePlacedBlockState(h.session, state, face)
+					}
 				}
 				if world.IsBellBlock(state) {
 					playerFacing := "north"
@@ -2365,6 +2424,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					bellSt, ok := cache.ResolveBellPlacementState(px, py, pz, server.BlockFaceDirectionName(face), playerFacing)
 					if !ok {
+						h.sendUseItemOnRollback(cache, x, y, z, face)
 						return h.sendBlockChangedAck(seq)
 					}
 					state = bellSt
@@ -2414,7 +2474,26 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 				}
 				placed := false
-				if server.IsBedBlock(state) && h.srv != nil {
+				if server.IsDoorBlockState(state) && h.srv != nil {
+					doorClickX := (float64(x) + float64(cursorX)) - float64(px)
+					doorClickZ := (float64(z) + float64(cursorZ)) - float64(pz)
+					if finalDoor, ok := h.srv.PlaceDoorBlock(h.session, dim, px, py, pz, state, doorClickX, doorClickZ); ok {
+						state = finalDoor
+						placed = true
+					} else {
+						h.sendUseItemOnRollback(cache, x, y, z, face)
+						if h.conn != nil && py+1 < world.MinY+world.WorldHeight {
+							wUp := protocol.NewWriter(12)
+							wUp.Position(px, py+1, pz)
+							wUp.VarInt(int32(cache.GetBlock(px, py+1, pz)))
+							_ = h.conn.SendWriter(protocol.PlayBlockUpdate, wUp)
+						}
+						return h.sendBlockChangedAck(seq)
+					}
+				} else if h.srv != nil && !h.srv.IsBlockPlacementUnobstructed(dim, px, py, pz, state) {
+					h.sendUseItemOnRollback(cache, x, y, z, face)
+					return h.sendBlockChangedAck(seq)
+				} else if server.IsBedBlock(state) && h.srv != nil {
 					placed = h.srv.PlaceBedBlock(h.session, px, py, pz, state)
 				} else if server.IsChestBlock(state) && h.srv != nil && h.session != nil {
 					if finalSt, ok := h.srv.PlaceChestAt(h.session, px, py, pz, state); ok {
@@ -2424,7 +2503,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				} else if server.IsDecoratedPotBlock(state) && h.srv != nil {
 					sherds := h.srv.LastCraftedDecoratedPotSherds()
 					if h.session != nil {
-						if sh, hasSlotSherds := server.GetSlotDecoratedPotSherds(h.srv, h.session, h.session.HeldInventorySlot()); hasSlotSherds {
+						if sh, hasSlotSherds := server.GetSlotDecoratedPotSherds(h.srv, h.session, placeInvSlot); hasSlotSherds {
 							sherds = sh
 						}
 					}
@@ -2437,13 +2516,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						placed = true
 					}
 				} else if world.IsScaffoldingBlock(state) {
-					horizDir := "north"
-					sneak := false
-					if h.session != nil {
-						horizDir = server.HorizontalFacingFromYaw(h.session.Snapshot().Yaw)
-						sneak = h.session.IsSneaking()
-					}
-					if scPos, scState, scOK, scRes := cache.PlaceScaffoldingWithContext(x, y, z, server.BlockFaceDirectionName(face), horizDir, inside, sneak); scOK {
+					if scPos, scState, scOK, scRes := cache.PlaceScaffoldingWithContext(x, y, z, server.BlockFaceDirectionName(face), scHorizDir, inside, scSneak); scOK {
 						px, py, pz = scPos.X, scPos.Y, scPos.Z
 						state = scState
 						h.broadcastBlockChanges(dim, cache, scRes)
@@ -2458,6 +2531,9 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 				} else if valid, lightChunks := cache.SetBlockWithLight(px, py, pz, state); valid {
 					h.broadcastBlockUpdate(px, py, pz, state, lightChunks)
 					placed = true
+				}
+				if !placed {
+					h.sendUseItemOnRollback(cache, x, y, z, face)
 				}
 				if placed {
 					blockName := world.BlockName(state)
@@ -2485,7 +2561,7 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						h.srv.OnSignPlaced(h.session, px, py, pz, true)
 					}
 					if server.IsBannerBlock(state) && h.srv != nil && h.session != nil {
-						h.srv.OnBannerPlaced(h.session, h.session.HeldInventorySlot(), px, py, pz)
+						h.srv.OnBannerPlaced(h.session, placeInvSlot, px, py, pz)
 						h.srv.SendBannerBlockEntityPacket(h.session, px, py, pz)
 					}
 					if server.IsBeaconBlock(state) && h.srv != nil {
@@ -2504,13 +2580,13 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 					}
 					if server.IsBrewingStandBlock(state) && h.srv != nil {
 						var customName string
-						if h.session != nil {
-							customName = server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName
+						if h.session != nil && placeInvSlot >= 0 {
+							customName = server.GetSlotItemMeta(h.session, placeInvSlot).CustomName
 						}
 						h.srv.OnBrewingStandPlacedInDim(dim, px, py, pz, customName)
 					}
-					if server.IsFurnaceBlock(state) && h.srv != nil && h.session != nil {
-						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
+					if server.IsFurnaceBlock(state) && h.srv != nil && h.session != nil && placeInvSlot >= 0 {
+						if customName := server.GetSlotItemMeta(h.session, placeInvSlot).CustomName; customName != "" {
 							h.srv.SetFurnaceState(world.FurnaceBlockEntity{
 								ID:         blockName,
 								X:          px,
@@ -2520,22 +2596,18 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 							})
 						}
 					}
-					if blockName == "minecraft:hopper" && h.srv != nil && h.session != nil {
-						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
+					if blockName == "minecraft:hopper" && h.srv != nil && h.session != nil && placeInvSlot >= 0 {
+						if customName := server.GetSlotItemMeta(h.session, placeInvSlot).CustomName; customName != "" {
 							h.srv.SetHopperCustomName(dim, px, py, pz, customName)
 						}
 					}
-					if server.IsBarrelBlock(state) && h.srv != nil && h.session != nil {
-						if customName := server.GetSlotItemMeta(h.session, h.session.HeldInventorySlot()).CustomName; customName != "" {
+					if server.IsBarrelBlock(state) && h.srv != nil && h.session != nil && placeInvSlot >= 0 {
+						if customName := server.GetSlotItemMeta(h.session, placeInvSlot).CustomName; customName != "" {
 							h.srv.SetStorageCustomName(dim, px, py, pz, customName)
 						}
 					}
 					if server.IsShulkerBoxItemOrBlock(blockName) && h.srv != nil {
-						invSlot := -1
-						if h.session != nil {
-							invSlot = h.session.HeldInventorySlot()
-						}
-						h.srv.OnShulkerBoxPlacedFromSlot(h.session, invSlot, dim, px, py, pz)
+						h.srv.OnShulkerBoxPlacedFromSlot(h.session, placeInvSlot, dim, px, py, pz)
 					}
 					if blockName == "minecraft:sniffer_egg" && h.srv != nil {
 						h.srv.PlaceSnifferEgg(dim, px, py, pz)
@@ -2544,13 +2616,16 @@ func (h *handler) handleUseItemOn(pkt protocol.Packet) error {
 						h.srv.RecordItemUsed(h.session, blockName, 1)
 						h.srv.TriggerPlantedSeed(h.session, blockName)
 					}
-					if h.session != nil && h.session.Snapshot().GameMode == server.GameModeSurvival {
-						if slot, updated, consumed := h.srv.ConsumeHeldItem(h.session, 1); consumed {
-							if hotbarIdx := slot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
-								if updated.IsEmpty() {
-									h.hotbar[hotbarIdx] = -1
-								} else {
-									h.hotbar[hotbarIdx] = updated.ResolvedItemID()
+					if h.session != nil && h.srv != nil {
+						gm := h.session.Snapshot().GameMode
+						if gm == server.GameModeSurvival || gm == server.GameModeAdventure {
+							if updated, consumed := h.srv.ConsumeInventorySlotItem(h.session, placeInvSlot, 1); consumed {
+								if hotbarIdx := placeInvSlot - hotbarInvStart; hotbarIdx >= 0 && hotbarIdx < len(h.hotbar) {
+									if updated.IsEmpty() {
+										h.hotbar[hotbarIdx] = -1
+									} else {
+										h.hotbar[hotbarIdx] = updated.ResolvedItemID()
+									}
 								}
 							}
 						}
@@ -2586,24 +2661,68 @@ func (h *handler) isHoldingFlintAndSteel() bool {
 	return false
 }
 
-// heldBlock returns the block state for the currently held item, if it is a
-// placeable block.
-func (h *handler) heldBlock() (uint16, bool) {
+// heldBlockForHand returns the block state, inventory slot, and whether the item
+// held in hand is a placeable block.
+func (h *handler) heldBlockForHand(hand int32) (uint16, int, bool) {
 	if h.session != nil {
+		if hand == server.HandOffHand {
+			held := h.session.InventorySlot(server.OffHandContainerSlot)
+			if !held.IsEmpty() {
+				if itemID := held.ResolvedItemID(); itemID >= 0 {
+					st, ok := world.ItemToBlock(itemID)
+					return st, server.OffHandContainerSlot, ok
+				}
+			}
+			return 0, server.OffHandContainerSlot, false
+		}
 		if held := h.session.HeldItem(); !held.IsEmpty() {
 			if itemID := held.ResolvedItemID(); itemID >= 0 {
-				return world.ItemToBlock(itemID)
+				st, ok := world.ItemToBlock(itemID)
+				return st, h.session.HeldInventorySlot(), ok
 			}
 		}
 	}
+	if hand == server.HandOffHand {
+		return 0, server.OffHandContainerSlot, false
+	}
 	if h.heldSlot < 0 || int(h.heldSlot) >= len(h.hotbar) {
-		return 0, false
+		return 0, -1, false
 	}
 	itemID := h.hotbar[h.heldSlot]
 	if itemID < 0 {
-		return 0, false
+		return 0, -1, false
 	}
-	return world.ItemToBlock(itemID)
+	st, ok := world.ItemToBlock(itemID)
+	return st, hotbarInvStart + int(h.heldSlot), ok
+}
+
+// sendUseItemOnRollback sends authoritative PlayBlockUpdate packets for the
+// clicked block and its face-adjacent target cell back to this client.
+func (h *handler) sendUseItemOnRollback(cache *world.Cache, x, y, z int, face int32) {
+	if cache == nil || h.conn == nil {
+		return
+	}
+	sendPos := func(bx, by, bz int) {
+		if by < world.MinY || by >= world.MinY+world.WorldHeight {
+			return
+		}
+		w := protocol.NewWriter(12)
+		w.Position(bx, by, bz)
+		w.VarInt(int32(cache.GetBlock(bx, by, bz)))
+		_ = h.conn.SendWriter(protocol.PlayBlockUpdate, w)
+	}
+	sendPos(x, y, z)
+	if face >= 0 && int(face) < len(faceOffsets) {
+		off := faceOffsets[face]
+		sendPos(x+off[0], y+off[1], z+off[2])
+	}
+}
+
+// heldBlock returns the block state for the currently held item, if it is a
+// placeable block.
+func (h *handler) heldBlock() (uint16, bool) {
+	st, _, ok := h.heldBlockForHand(server.HandMain)
+	return st, ok
 }
 
 func (h *handler) broadcastBlockUpdate(x, y, z int, state uint16, lightChunks []world.ChunkPos) {

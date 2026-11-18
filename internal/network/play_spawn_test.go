@@ -308,7 +308,18 @@ func TestPlaySurvivalDigPickupFallDeathAndRespawn(t *testing.T) {
 	h.conn.Profile = profile
 	_ = rec.take(t)
 
-	// 1. Dig block at (8, FlatSurfaceY, 8) with STOP_DESTROY_BLOCK (status 2).
+	// 1. Dig block at (8, FlatSurfaceY, 8) using START_DESTROY_BLOCK -> ticks -> STOP_DESTROY_BLOCK.
+	startW := protocol.NewWriter(16)
+	startW.VarInt(server.PlayerActionStartDestroyBlock)
+	startW.Position(8, world.FlatSurfaceY, 8)
+	startW.Byte(1) // UP face
+	startW.VarInt(6)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayPlayerAction, Data: startW.Bytes()}); err != nil {
+		t.Fatalf("PlayPlayerAction START: %v", err)
+	}
+	for range 15 {
+		srv.TickPlayerBlockBreaking(h.session)
+	}
 	digW := protocol.NewWriter(16)
 	digW.VarInt(server.PlayerActionStopDestroyBlock)
 	digW.Position(8, world.FlatSurfaceY, 8)
@@ -333,6 +344,14 @@ func TestPlaySurvivalDigPickupFallDeathAndRespawn(t *testing.T) {
 	}
 	if got := h.session.InventorySlot(world.HotbarContainerOffset); got.Count != 1 || got.ResolvedID() != "minecraft:dirt" {
 		t.Fatalf("hotbar slot 0 after pickup = %+v, want 1x minecraft:dirt", got)
+	}
+
+	// Step out of (8, FlatSurfaceY, 8) before placing dirt back into that cell.
+	stepAsideW := protocol.NewWriter(32)
+	stepAsideW.Float64(9.5).Float64(float64(world.FlatSurfaceY) + 1.0).Float64(8.5)
+	stepAsideW.Byte(1)
+	if err := h.handlePlay(protocol.Packet{ID: protocol.PlayMovePos, Data: stepAsideW.Bytes()}); err != nil {
+		t.Fatalf("PlayMovePos step aside: %v", err)
 	}
 
 	// 3. Place the picked-up dirt block back via PlayUseItemOn and verify the stack is consumed.

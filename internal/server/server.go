@@ -1144,6 +1144,7 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 		return
 	}
 	session.joined.Store(false)
+	s.ClearPlayerDiggingState(session)
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)
 	s.DismountPlayerVehicle(session)
@@ -1487,6 +1488,26 @@ func (session *PlayerSession) ApplyPlayerData(d world.PlayerData) {
 					}
 				}
 			}
+			if cpoTag, ok := comp.Get("CanPlaceOn"); ok {
+				if cpoList, ok := cpoTag.(nbt.List); ok && len(cpoList.Elems) > 0 {
+					for _, el := range cpoList.Elems {
+						if s, ok := el.(nbt.String); ok {
+							meta.CanPlaceOn = append(meta.CanPlaceOn, string(s))
+						}
+					}
+					meta.CanPlaceOn = NormalizeAdventureBlockEntries(meta.CanPlaceOn)
+				}
+			}
+			if cbTag, ok := comp.Get("CanBreak"); ok {
+				if cbList, ok := cbTag.(nbt.List); ok && len(cbList.Elems) > 0 {
+					for _, el := range cbList.Elems {
+						if s, ok := el.(nbt.String); ok {
+							meta.CanBreak = append(meta.CanBreak, string(s))
+						}
+					}
+					meta.CanBreak = NormalizeAdventureBlockEntries(meta.CanBreak)
+				}
+			}
 			if !meta.IsEmpty() {
 				SetSlotItemMeta(session, slot, meta)
 			}
@@ -1794,6 +1815,24 @@ func (session *PlayerSession) PlayerData() world.PlayerData {
 					}
 				}
 				entry.Set("StoredEnchantments", stEnchComp)
+			}
+			if len(meta.CanPlaceOn) > 0 {
+				cpoElems := make([]nbt.Tag, 0, len(meta.CanPlaceOn))
+				for _, b := range NormalizeAdventureBlockEntries(meta.CanPlaceOn) {
+					cpoElems = append(cpoElems, nbt.String(b))
+				}
+				if len(cpoElems) > 0 {
+					entry.Set("CanPlaceOn", nbt.List{ElemID: nbt.TagString, Elems: cpoElems})
+				}
+			}
+			if len(meta.CanBreak) > 0 {
+				cbElems := make([]nbt.Tag, 0, len(meta.CanBreak))
+				for _, b := range NormalizeAdventureBlockEntries(meta.CanBreak) {
+					cbElems = append(cbElems, nbt.String(b))
+				}
+				if len(cbElems) > 0 {
+					entry.Set("CanBreak", nbt.List{ElemID: nbt.TagString, Elems: cbElems})
+				}
 			}
 			if hasWB {
 				entry.Set("WritableBook", wb.ToNBT())

@@ -265,6 +265,18 @@ func readWireItemStack(r *protocol.Reader) (e2eWireItemStack, error) {
 			if _, err := r.VarInt(); err != nil {
 				return out, err
 			}
+		case server.DataComponentCanPlaceOnID:
+			entries, err := server.DecodeAdventurePredicatePayload(r)
+			if err != nil {
+				return out, err
+			}
+			out.Meta.CanPlaceOn = entries
+		case server.DataComponentCanBreakID:
+			entries, err := server.DecodeAdventurePredicatePayload(r)
+			if err != nil {
+				return out, err
+			}
+			out.Meta.CanBreak = entries
 		default:
 			return out, fmt.Errorf("readWireItemStack: unsupported component ID %d", compID)
 		}
@@ -1350,10 +1362,12 @@ func TestIssue56E2EInventoryAndContainersParity(t *testing.T) {
 
 	// Bob breaks breakChestPos:
 	alice.drain(20 * time.Millisecond)
+	_ = srv1.SetPlayerGameMode(bobSess, server.GameModeCreative)
 	sendBreakBlockWire(t, bobConn, breakChestPos[0], breakChestPos[1], breakChestPos[2], 510, 511)
 	closePkts := alice.waitUntil(2*time.Second, func(ps []protocol.Packet) bool {
 		return len(findPackets(ps, protocol.PlayContainerClose)) > 0
 	})
+	_ = srv1.SetPlayerGameMode(bobSess, server.GameModeSurvival)
 	ccList := findPackets(closePkts, protocol.PlayContainerClose)
 	if len(ccList) == 0 {
 		t.Fatal("Alice did NOT receive clientbound PlayContainerClose when Bob broke open chest")
@@ -1512,7 +1526,10 @@ func TestIssue56E2EInventoryAndContainersParity(t *testing.T) {
 		map[int]e2eWireHashedStack{38: {}}, sticks(2).toHashedStack())
 	sendContainerClickWire(t, aliceConn, cidCraft3, alice.stateID, 5, 1, server.ContainerInputPickup,
 		map[int]e2eWireHashedStack{5: sticks(1).toHashedStack()}, sticks(1).toHashedStack())
-	alice.drain(80 * time.Millisecond)
+	alice.waitUntil(3*time.Second, func(_ []protocol.Packet) bool {
+		return len(alice.slots) > 5 && alice.slots[5].Stack.ResolvedID() == "minecraft:stick"
+	})
+	alice.drain(40 * time.Millisecond)
 
 	// Final ingredient click into grid slot 8 -> server MUST send PlayContainerSetSlot for slot 0 = wooden_pickaxe!
 	pickaxeID := mustItemID(t, "minecraft:wooden_pickaxe")

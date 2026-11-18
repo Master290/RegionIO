@@ -164,9 +164,97 @@ func parseItemComponentsBracket(spec *ParsedItemSpec, compPart string) error {
 			}
 			spec.Trim = trim
 			spec.HasTrimSpec = true
+
+		case "can_place_on":
+			entries, err := parseAdventurePredicateComponentValue(val)
+			if err != nil {
+				return err
+			}
+			spec.Meta.CanPlaceOn = entries
+
+		case "can_break":
+			entries, err := parseAdventurePredicateComponentValue(val)
+			if err != nil {
+				return err
+			}
+			spec.Meta.CanBreak = entries
 		}
 	}
 	return nil
+}
+
+func parseAdventurePredicateComponentValue(raw string) ([]string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return nil, fmt.Errorf("empty adventure predicate")
+	}
+	var rawEntries []string
+	var extractPredicateNode func(node string)
+	extractPredicateNode = func(node string) {
+		node = strings.TrimSpace(node)
+		if node == "" {
+			return
+		}
+		if strings.HasPrefix(node, "[") && strings.HasSuffix(node, "]") {
+			inner := strings.TrimSpace(node[1 : len(node)-1])
+			for _, tok := range splitTopLevelCSV(inner) {
+				extractPredicateNode(tok)
+			}
+			return
+		}
+		if strings.HasPrefix(node, "{") && strings.HasSuffix(node, "}") {
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(node), &obj); err == nil {
+				if preds, ok := obj["predicates"].([]any); ok {
+					for _, p := range preds {
+						if pm, ok := p.(map[string]any); ok {
+							rawEntries = appendAdventureBlocksValue(rawEntries, pm["blocks"])
+						}
+					}
+				} else {
+					rawEntries = appendAdventureBlocksValue(rawEntries, obj["blocks"])
+				}
+				return
+			}
+			// Fallback SNBT key:value compound parser (unquoted keys such as `{predicates:[{blocks:"stone"}]}`).
+			inner := strings.TrimSpace(node[1 : len(node)-1])
+			for _, pair := range splitTopLevelCSV(inner) {
+				pair = strings.TrimSpace(pair)
+				sep := strings.IndexAny(pair, ":=")
+				if sep <= 0 {
+					continue
+				}
+				k := strings.ToLower(trimMatchingQuotes(strings.TrimSpace(pair[:sep])))
+				v := strings.TrimSpace(pair[sep+1:])
+				switch k {
+				case "predicates", "blocks":
+					extractPredicateNode(v)
+				}
+			}
+			return
+		}
+		rawEntries = append(rawEntries, trimMatchingQuotes(node))
+	}
+	extractPredicateNode(s)
+	norm := NormalizeAdventureBlockEntries(rawEntries)
+	if len(norm) == 0 {
+		return nil, fmt.Errorf("invalid adventure predicate %q", raw)
+	}
+	return norm, nil
+}
+
+func appendAdventureBlocksValue(dst []string, val any) []string {
+	switch v := val.(type) {
+	case string:
+		return append(dst, v)
+	case []any:
+		for _, elem := range v {
+			if s, ok := elem.(string); ok {
+				dst = append(dst, s)
+			}
+		}
+	}
+	return dst
 }
 
 func parseArmorTrimComponentValue(raw string) (ArmorTrim, error) {
@@ -316,7 +404,8 @@ func trimMatchingQuotes(s string) string {
 
 // MaxStackSizeForSpec returns the maximum stack size (1, 16, or 64) for an item spec.
 func MaxStackSizeForSpec(spec ParsedItemSpec) int32 {
-	if MaxItemDurability(spec.ItemID) > 0 || !spec.Meta.IsEmpty() {
+	if MaxItemDurability(spec.ItemID) > 0 || spec.Meta.Damage > 0 || spec.Meta.CustomName != "" ||
+		len(spec.Meta.Enchantments) > 0 || len(spec.Meta.StoredEnchantments) > 0 || spec.Meta.RepairCost > 0 {
 		return 1
 	}
 	name := strings.TrimPrefix(spec.ItemID, "minecraft:")
@@ -1983,6 +2072,18 @@ func DecodeCreativeSlotItemStack(r *protocol.Reader) (CreativeSlotItem, error) {
 				return out, nil
 			}
 			out.Meta.RepairCost = rc
+		case DataComponentCanPlaceOnID:
+			entries, err := DecodeAdventurePredicatePayload(r)
+			if err != nil {
+				return out, nil
+			}
+			out.Meta.CanPlaceOn = entries
+		case DataComponentCanBreakID:
+			entries, err := DecodeAdventurePredicatePayload(r)
+			if err != nil {
+				return out, nil
+			}
+			out.Meta.CanBreak = entries
 		case DataComponentTrim:
 			t, err := DecodeArmorTrimComponent(r)
 			if err != nil {

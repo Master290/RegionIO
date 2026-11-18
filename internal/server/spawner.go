@@ -92,6 +92,7 @@ func (s *Server) entityTickLoop(ctx context.Context, log *slog.Logger) {
 			s.TickWeather(rng)
 			s.TrySkipNightBySleep()
 			s.TickAllPlayersHunger()
+			s.TickAllPlayersBlockBreaking()
 			s.TickBrewingStands()
 			s.TickLingeringClouds()
 			s.TickVillagers()

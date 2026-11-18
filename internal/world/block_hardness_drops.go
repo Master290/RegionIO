@@ -162,7 +162,7 @@ func BlockHardness(state uint16) float64 {
 		"minecraft:small_dripleaf":
 		return 0.0
 	}
-	if strings.HasPrefix(name, "minecraft:potted_") || strings.HasSuffix(name, "_torch") {
+	if strings.HasPrefix(name, "minecraft:potted_") || name == "minecraft:torch" || strings.HasSuffix(name, "_torch") {
 		return 0.0
 	}
 

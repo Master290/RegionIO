@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
@@ -358,14 +359,27 @@ func itemCategories(itemName string) []ItemCategory {
 }
 
 // ItemMeta holds per-stack durability damage, enchantments, stored enchantments
-// (for enchanted_book), custom anvil name, and prior-work penalty cost.
+// (for enchanted_book), Adventure mode block predicates, custom anvil name, and
+// prior-work penalty cost.
 type ItemMeta struct {
 	Damage             int32
 	Enchantments       map[string]int
 	StoredEnchantments map[string]int
 	CustomName         string
 	RepairCost         int32
+	CanPlaceOn         []string
+	CanBreak           []string
 }
+
+// Equipment break ClientboundEntityEventPacket (0x22) status codes (LivingEntity.entityEventForEquipmentBreak in 26.1.2).
+const (
+	EntityEventMainHandBreak byte = 47
+	EntityEventOffHandBreak  byte = 48
+	EntityEventHeadBreak     byte = 49
+	EntityEventChestBreak    byte = 50
+	EntityEventLegsBreak     byte = 51
+	EntityEventFeetBreak     byte = 52
+)
 
 // Clone returns a deep copy of m.
 func (m ItemMeta) Clone() ItemMeta {
@@ -390,12 +404,233 @@ func (m ItemMeta) Clone() ItemMeta {
 			}
 		}
 	}
+	if len(m.CanPlaceOn) > 0 {
+		cp.CanPlaceOn = NormalizeAdventureBlockEntries(m.CanPlaceOn)
+	}
+	if len(m.CanBreak) > 0 {
+		cp.CanBreak = NormalizeAdventureBlockEntries(m.CanBreak)
+	}
 	return cp
 }
 
-// IsEmpty reports whether m carries no damage, enchantments, stored enchantments, custom name, or repair cost.
+// IsEmpty reports whether m carries no damage, enchantments, stored enchantments, Adventure predicates, custom name, or repair cost.
 func (m ItemMeta) IsEmpty() bool {
-	return m.Damage == 0 && len(m.Enchantments) == 0 && len(m.StoredEnchantments) == 0 && m.CustomName == "" && m.RepairCost == 0
+	return m.Damage == 0 && len(m.Enchantments) == 0 && len(m.StoredEnchantments) == 0 &&
+		m.CustomName == "" && m.RepairCost == 0 && len(m.CanPlaceOn) == 0 && len(m.CanBreak) == 0
+}
+
+// NormalizeAdventureBlockEntries normalizes block names and `#tag` entries for
+// `minecraft:can_place_on` / `minecraft:can_break` predicates.
+func NormalizeAdventureBlockEntries(entries []string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		s := strings.ToLower(strings.TrimSpace(e))
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, "#") {
+			tag := strings.TrimSpace(strings.TrimPrefix(s, "#"))
+			if tag == "" {
+				continue
+			}
+			if !strings.Contains(tag, ":") {
+				tag = "minecraft:" + tag
+			}
+			out = append(out, "#"+tag)
+			continue
+		}
+		if !strings.Contains(s, ":") {
+			s = "minecraft:" + s
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// CanBreakBlockInAdventure reports whether meta allows breaking state in Adventure mode.
+func CanBreakBlockInAdventure(meta ItemMeta, state uint16) bool {
+	return matchesAdventureBlockEntries(meta.CanBreak, state)
+}
+
+// CanPlaceOnBlockInAdventure reports whether meta allows placing/using against clickedState in Adventure mode.
+func CanPlaceOnBlockInAdventure(meta ItemMeta, clickedState uint16) bool {
+	return matchesAdventureBlockEntries(meta.CanPlaceOn, clickedState)
+}
+
+func matchesAdventureBlockEntries(entries []string, state uint16) bool {
+	if len(entries) == 0 || state == world.StateAir {
+		return false
+	}
+	blockName := world.BlockName(state)
+	for _, raw := range entries {
+		e := strings.ToLower(strings.TrimSpace(raw))
+		if e == "" {
+			continue
+		}
+		if strings.HasPrefix(e, "#") {
+			tag := strings.TrimPrefix(e, "#")
+			if !strings.Contains(tag, ":") {
+				tag = "minecraft:" + tag
+			}
+			if world.HasBlockTag(state, tag) || world.HasBlockNameTag(blockName, tag) {
+				return true
+			}
+			continue
+		}
+		if !strings.Contains(e, ":") {
+			e = "minecraft:" + e
+		}
+		if blockName == e {
+			return true
+		}
+	}
+	return false
+}
+
+// EncodeAdventurePredicatePayload encodes a protocol 775 `AdventureModePredicate`
+// payload (`can_place_on` = 14 / `can_break` = 15).
+func EncodeAdventurePredicatePayload(entries []string) []byte {
+	norm := NormalizeAdventureBlockEntries(entries)
+	w := protocol.NewWriter(16 + len(norm)*8)
+	w.VarInt(int32(len(norm)))
+	for _, entry := range norm {
+		w.Bool(true) // Optional<HolderSet<Block>> present
+		if strings.HasPrefix(entry, "#") {
+			w.VarInt(0) // named HolderSet (tag)
+			w.String(strings.TrimPrefix(entry, "#"))
+		} else {
+			regID, _ := world.BlockRegistryID(entry)
+			w.VarInt(2) // direct HolderSet of length 1 (1 + 1)
+			w.VarInt(regID)
+		}
+		w.Bool(false) // Optional<StatePropertiesPredicate> absent
+		w.Bool(false) // Optional<NbtPredicate> absent
+		w.VarInt(0)   // DataComponentExactPredicate empty
+		w.VarInt(0)   // DataComponentPredicate partial map empty
+	}
+	return w.Bytes()
+}
+
+// DecodeAdventurePredicatePayload decodes a protocol 775 `AdventureModePredicate`
+// payload (`can_place_on` = 14 / `can_break` = 15) into block/tag identifiers.
+func DecodeAdventurePredicatePayload(r *protocol.Reader) ([]string, error) {
+	predCount, err := r.VarInt()
+	if err != nil {
+		return nil, err
+	}
+	if predCount < 0 || predCount > 1024 {
+		return nil, errors.New("enchanting: invalid adventure predicate count")
+	}
+	var out []string
+	for i := int32(0); i < predCount; i++ {
+		hasBlocks, err := r.Bool()
+		if err != nil {
+			return nil, err
+		}
+		if hasBlocks {
+			rawSetLen, err := r.VarInt()
+			if err != nil {
+				return nil, err
+			}
+			if rawSetLen == 0 {
+				tagID, err := r.String()
+				if err != nil {
+					return nil, err
+				}
+				tagID = strings.ToLower(strings.TrimSpace(tagID))
+				if tagID != "" {
+					if !strings.Contains(tagID, ":") {
+						tagID = "minecraft:" + tagID
+					}
+					out = append(out, "#"+tagID)
+				}
+			} else if rawSetLen > 1 {
+				cnt := rawSetLen - 1
+				if cnt > 4096 {
+					return nil, errors.New("enchanting: adventure predicate holder set too large")
+				}
+				for j := int32(0); j < cnt; j++ {
+					regID, err := r.VarInt()
+					if err != nil {
+						return nil, err
+					}
+					if name, ok := world.BlockRegistryName(regID); ok {
+						out = append(out, name)
+					}
+				}
+			}
+		}
+		hasProps, err := r.Bool()
+		if err != nil {
+			return nil, err
+		}
+		if hasProps {
+			propCount, err := r.VarInt()
+			if err != nil {
+				return nil, err
+			}
+			for j := int32(0); j < propCount; j++ {
+				if _, err := r.String(); err != nil {
+					return nil, err
+				}
+				exact, err := r.Bool()
+				if err != nil {
+					return nil, err
+				}
+				if exact {
+					if _, err := r.String(); err != nil {
+						return nil, err
+					}
+				} else {
+					hasMin, err := r.Bool()
+					if err != nil {
+						return nil, err
+					}
+					if hasMin {
+						if _, err := r.String(); err != nil {
+							return nil, err
+						}
+					}
+					hasMax, err := r.Bool()
+					if err != nil {
+						return nil, err
+					}
+					if hasMax {
+						if _, err := r.String(); err != nil {
+							return nil, err
+						}
+					}
+				}
+			}
+		}
+		hasNBT, err := r.Bool()
+		if err != nil {
+			return nil, err
+		}
+		if hasNBT {
+			if _, err := readAnonymousNBTTag(r); err != nil {
+				return nil, err
+			}
+		}
+		exactCount, err := r.VarInt()
+		if err != nil {
+			return nil, err
+		}
+		if exactCount != 0 {
+			return nil, errors.New("enchanting: unsupported exact data component matchers in adventure predicate")
+		}
+		partialCount, err := r.VarInt()
+		if err != nil {
+			return nil, err
+		}
+		if partialCount != 0 {
+			return nil, errors.New("enchanting: unsupported partial data component matchers in adventure predicate")
+		}
+	}
+	return out, nil
 }
 
 // HasEnchantments reports whether m has at least one enchantment with level > 0.
@@ -709,10 +944,42 @@ func shouldIgnoreDurabilityDamage(unbreakingLevel int, isArmor bool, rng *rand.R
 	return rng.Intn(unbreakingLevel+1) > 0
 }
 
+var (
+	durabilityRngMu sync.Mutex
+	durabilityRng   = rand.New(rand.NewSource(time.Now().UnixNano()))
+)
+
+func nextServerDurabilityRand() *rand.Rand {
+	durabilityRngMu.Lock()
+	seed := durabilityRng.Int63()
+	durabilityRngMu.Unlock()
+	return rand.New(rand.NewSource(seed))
+}
+
 // DamagePlayerItem applies durability damage to the item in session's inventory
 // slot, breaking and removing the item when its durability reaches MaxItemDurability.
 func (s *Server) DamagePlayerItem(session *PlayerSession, slot int, amount int32) bool {
-	return s.DamagePlayerItemWithRand(session, slot, amount, nil)
+	return s.DamagePlayerItemWithRand(session, slot, amount, nextServerDurabilityRand())
+}
+
+func equipmentBreakEventForSlot(session *PlayerSession, slot int) byte {
+	switch slot {
+	case OffHandContainerSlot:
+		return EntityEventOffHandBreak
+	case ArmorSlotHead:
+		return EntityEventHeadBreak
+	case ArmorSlotChest:
+		return EntityEventChestBreak
+	case ArmorSlotLegs:
+		return EntityEventLegsBreak
+	case ArmorSlotFeet:
+		return EntityEventFeetBreak
+	default:
+		if session != nil && slot == session.HeldInventorySlot() {
+			return EntityEventMainHandBreak
+		}
+		return EntityEventMainHandBreak
+	}
 }
 
 // DamagePlayerItemWithRand applies durability damage using rng for Unbreaking rolls.
@@ -720,7 +987,8 @@ func (s *Server) DamagePlayerItemWithRand(session *PlayerSession, slot int, amou
 	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots || amount <= 0 {
 		return false
 	}
-	if session.Snapshot().GameMode == GameModeCreative {
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeCreative {
 		return false
 	}
 	stack := session.InventorySlot(slot)
@@ -729,11 +997,31 @@ func (s *Server) DamagePlayerItemWithRand(session *PlayerSession, slot int, amou
 	}
 	meta := GetSlotItemMeta(session, slot)
 	newStack, newMeta, broke := DamageItem(stack, meta, amount, rng)
+	if !broke && newMeta.Damage == meta.Damage {
+		return false
+	}
 	session.SetInventorySlot(slot, newStack)
 	SetSlotItemMeta(session, slot, newMeta)
-	if s != nil && session.send != nil {
-		stateID := session.NextContainerStateID()
-		_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, slot, newStack))
+	if broke {
+		clearAllSlotMetadata(session, slot)
+	}
+	if s != nil {
+		syncRemotePlayerInventorySlot(s, session, slot)
+	}
+	if session.send != nil {
+		sendPlayerSlotUpdate(session, slot)
+	}
+	if broke && s != nil {
+		evByte := equipmentBreakEventForSlot(session, slot)
+		evPkt := EncodeEntityEventPacket(snap.EntityID, evByte)
+		if session.send != nil {
+			_ = session.send(protocol.PlayEntityEvent, evPkt)
+		}
+		dim := world.NormalizeDimension(snap.Dimension)
+		cx := int32(int64(math.Floor(snap.X)) >> 4)
+		cz := int32(int64(math.Floor(snap.Z)) >> 4)
+		s.BroadcastDimensionChunkExcept(dim, cx, cz, session.Profile.UUID, protocol.PlayEntityEvent, evPkt)
+		s.SendPlayerEquipmentPacket(session)
 	}
 	return broke
 }

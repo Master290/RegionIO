@@ -838,7 +838,9 @@ func (d containerSlotData) SameItemSameComponents(other containerSlotData) bool 
 		d.Meta.CustomName != other.Meta.CustomName ||
 		d.Meta.RepairCost != other.Meta.RepairCost ||
 		!intMapEqual(d.Meta.Enchantments, other.Meta.Enchantments) ||
-		!intMapEqual(d.Meta.StoredEnchantments, other.Meta.StoredEnchantments) {
+		!intMapEqual(d.Meta.StoredEnchantments, other.Meta.StoredEnchantments) ||
+		!stringSliceEqual(d.Meta.CanPlaceOn, other.Meta.CanPlaceOn) ||
+		!stringSliceEqual(d.Meta.CanBreak, other.Meta.CanBreak) {
 		return false
 	}
 	if d.Trim != other.Trim || d.Potion != other.Potion || d.HasMap != other.HasMap || (d.HasMap && d.MapID != other.MapID) {
@@ -882,6 +884,30 @@ func intMapEqual(a, b map[string]int) bool {
 	return true
 }
 
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func hashOpsList(hashes []uint32) uint32 {
+	buf := make([]byte, 2+len(hashes)*4)
+	buf[0] = 4
+	off := 1
+	for _, h := range hashes {
+		binary.LittleEndian.PutUint32(buf[off:], h)
+		off += 4
+	}
+	buf[off] = 5
+	return crc32.Checksum(buf, containerCRC32CTable)
+}
+
 func (d containerSlotData) effectiveEnchantments() ([]EnchantmentInstance, int32) {
 	if d.Stack.ResolvedID() == "minecraft:enchanted_book" && len(d.Meta.StoredEnchantments) > 0 {
 		out := make([]EnchantmentInstance, 0, len(d.Meta.StoredEnchantments))
@@ -923,6 +949,20 @@ func (d containerSlotData) ToHashedStack() HashedStack {
 	}
 	if d.Meta.RepairCost > 0 {
 		added[DataComponentRepairCostID] = int32(hashOpsInt(d.Meta.RepairCost))
+	}
+	if len(d.Meta.CanPlaceOn) > 0 {
+		hashes := make([]uint32, 0, len(d.Meta.CanPlaceOn))
+		for _, e := range d.Meta.CanPlaceOn {
+			hashes = append(hashes, hashOpsMap([][2]uint32{{hashOpsString("blocks"), hashOpsString(e)}}))
+		}
+		added[DataComponentCanPlaceOnID] = int32(hashOpsList(hashes))
+	}
+	if len(d.Meta.CanBreak) > 0 {
+		hashes := make([]uint32, 0, len(d.Meta.CanBreak))
+		for _, e := range d.Meta.CanBreak {
+			hashes = append(hashes, hashOpsMap([][2]uint32{{hashOpsString("blocks"), hashOpsString(e)}}))
+		}
+		added[DataComponentCanBreakID] = int32(hashOpsList(hashes))
 	}
 	if d.Trim.IsValid() {
 		added[DataComponentTrim] = int32(hashOpsMap([][2]uint32{
@@ -1008,6 +1048,12 @@ func (d containerSlotData) WriteProtocolSlot(w *protocol.Writer) {
 			cw.VarInt(int32(inst.Level))
 		}
 		comps = append(comps, rawComp{id: enchCompID, data: cw.Bytes()})
+	}
+	if len(d.Meta.CanPlaceOn) > 0 {
+		comps = append(comps, rawComp{id: DataComponentCanPlaceOnID, data: EncodeAdventurePredicatePayload(d.Meta.CanPlaceOn)})
+	}
+	if len(d.Meta.CanBreak) > 0 {
+		comps = append(comps, rawComp{id: DataComponentCanBreakID, data: EncodeAdventurePredicatePayload(d.Meta.CanBreak)})
 	}
 	if d.Meta.RepairCost > 0 {
 		cw := protocol.NewWriter(4)
@@ -1552,6 +1598,20 @@ func (s *Server) InitPlayerInventoryRemoteState(session *PlayerSession) {
 		slots := s.buildPlayerMenuSlotData(session, tr)
 		carried := getCarriedSlotDataLocked(session, tr)
 		setTrackerRemoteSnapshot(tr, 0, slots, carried)
+	}
+	tr.mu.Unlock()
+}
+
+func syncRemotePlayerInventorySlot(_ *Server, session *PlayerSession, slot int) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+	tr.mu.Lock()
+	if tr.open == nil && tr.remoteContainerID == 0 && slot < len(tr.remoteSlots) {
+		tr.remoteSlots[slot] = getPlayerSlotData(session, slot).ToHashedStack()
 	}
 	tr.mu.Unlock()
 }

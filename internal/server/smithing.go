@@ -40,6 +40,12 @@ const (
 	// DataComponentEnchantmentsID is BuiltInRegistries.DATA_COMPONENT_TYPE index 13 ("minecraft:enchantments").
 	DataComponentEnchantmentsID int32 = 13
 
+	// DataComponentCanPlaceOnID is BuiltInRegistries.DATA_COMPONENT_TYPE index 14 ("minecraft:can_place_on").
+	DataComponentCanPlaceOnID int32 = 14
+
+	// DataComponentCanBreakID is BuiltInRegistries.DATA_COMPONENT_TYPE index 15 ("minecraft:can_break").
+	DataComponentCanBreakID int32 = 15
+
 	// DataComponentRepairCostID is BuiltInRegistries.DATA_COMPONENT_TYPE index 19 ("minecraft:repair_cost").
 	DataComponentRepairCostID int32 = 19
 
@@ -318,6 +324,12 @@ func WriteSlotWithArmorTrim(w *protocol.Writer, stack world.ItemStack, meta Item
 		}
 		comps = append(comps, rawComp{id: enchCompID, data: cw.Bytes()})
 	}
+	if len(meta.CanPlaceOn) > 0 {
+		comps = append(comps, rawComp{id: DataComponentCanPlaceOnID, data: EncodeAdventurePredicatePayload(meta.CanPlaceOn)})
+	}
+	if len(meta.CanBreak) > 0 {
+		comps = append(comps, rawComp{id: DataComponentCanBreakID, data: EncodeAdventurePredicatePayload(meta.CanBreak)})
+	}
 	if meta.RepairCost > 0 {
 		cw := protocol.NewWriter(4)
 		cw.VarInt(meta.RepairCost)
@@ -418,6 +430,18 @@ func ReadSlotWithArmorTrim(r *protocol.Reader) (world.ItemStack, ItemMeta, Armor
 				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
 			}
 			meta.RepairCost = rc
+		case DataComponentCanPlaceOnID:
+			entries, err := DecodeAdventurePredicatePayload(r)
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			meta.CanPlaceOn = entries
+		case DataComponentCanBreakID:
+			entries, err := DecodeAdventurePredicatePayload(r)
+			if err != nil {
+				return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, err
+			}
+			meta.CanBreak = entries
 		case DataComponentTrim:
 			t, err := DecodeArmorTrimComponent(r)
 			if err != nil {

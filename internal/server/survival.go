@@ -636,7 +636,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		mode = snap.GameMode
 		dim = world.NormalizeDimension(snap.Dimension)
 	}
-	if mode == GameModeAdventure || mode == GameModeSpectator {
+	if mode == GameModeSpectator {
 		return false, 0
 	}
 	cache := s.DimensionChunks(dim)
@@ -649,8 +649,25 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 
+	var heldStack world.ItemStack
+	var toolMeta ItemMeta
+	heldSlot := -1
+	if session != nil {
+		heldSlot = session.HeldInventorySlot()
+		if heldSlot >= 0 {
+			heldStack = session.InventorySlot(heldSlot)
+			toolMeta = GetSlotItemMeta(session, heldSlot)
+		}
+	}
+
+	adventureAllowed := mode == GameModeAdventure && session != nil && CanBreakBlockInAdventure(toolMeta, prevState)
+	if mode == GameModeAdventure && !adventureAllowed {
+		return false, 0
+	}
+	survivalLike := mode == GameModeSurvival || adventureAllowed
+
 	switch mode {
-	case GameModeSurvival:
+	case GameModeSurvival, GameModeAdventure:
 		if prevState == world.StateBedrock || world.BlockName(prevState) == "minecraft:end_portal_frame" || world.BlockName(prevState) == "minecraft:end_portal" || world.BlockName(prevState) == "minecraft:end_gateway" {
 			return false, 0
 		}
@@ -676,19 +693,8 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		return false, 0
 	}
 
-	var heldStack world.ItemStack
-	var toolMeta ItemMeta
-	heldSlot := -1
-	if session != nil {
-		heldSlot = session.HeldInventorySlot()
-		if heldSlot >= 0 {
-			heldStack = session.InventorySlot(heldSlot)
-			toolMeta = GetSlotItemMeta(session, heldSlot)
-		}
-	}
-
 	if world.BlockName(prevState) == "minecraft:tripwire" {
-		if mode == GameModeSurvival && s.DoTileDrops() {
+		if survivalLike && s.DoTileDrops() {
 			s.BreakTripwireBlock(dim, x, y, z, heldStack.ResolvedID())
 		} else {
 			withShears := canonicalResourceName(heldStack.ResolvedID()) == "minecraft:shears"
@@ -698,7 +704,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
 		s.OnSculkBlockBroken(dim, x, y, z, prevState)
 		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:tripwire")
-		if mode == GameModeSurvival {
+		if survivalLike {
 			s.RecordBlockBreakExhaustion(session)
 			s.RecordBlockMined(session, "minecraft:tripwire")
 			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
@@ -709,19 +715,16 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 
 	if IsDecoratedPotBlock(prevState) {
-		shatter := mode == GameModeSurvival && ShouldToolShatterDecoratedPot(heldStack, toolMeta)
-		s.BreakDecoratedPotAt(dim, x, y, z, shatter, mode == GameModeSurvival)
+		shatter := survivalLike && ShouldToolShatterDecoratedPot(heldStack, toolMeta)
+		s.BreakDecoratedPotAt(dim, x, y, z, shatter, survivalLike)
 		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
 		s.OnSculkBlockBroken(dim, x, y, z, prevState)
 		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:decorated_pot")
-		if mode == GameModeSurvival {
+		if survivalLike {
 			s.RecordBlockBreakExhaustion(session)
 			s.RecordBlockMined(session, "minecraft:decorated_pot")
 			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
 				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
-				if s.DamagePlayerItem(session, heldSlot, 1) {
-					s.RecordItemBroken(session, heldStack.ResolvedID())
-				}
 			}
 		}
 		return true, 0
@@ -740,13 +743,15 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
 		s.OnSculkBlockBroken(dim, x, y, z, prevState)
 		s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
-		if mode == GameModeSurvival {
+		if survivalLike {
 			s.RecordBlockBreakExhaustion(session)
 			s.RecordBlockMined(session, world.BlockName(prevState))
 			if session != nil && heldSlot >= 0 && !heldStack.IsEmpty() {
 				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
-				if s.DamagePlayerItem(session, heldSlot, 1) {
-					s.RecordItemBroken(session, heldStack.ResolvedID())
+				if wear := toolWearForBlockBreak(heldStack, prevState); wear > 0 {
+					if s.DamagePlayerItem(session, heldSlot, wear) {
+						s.RecordItemBroken(session, heldStack.ResolvedID())
+					}
 				}
 			}
 		}
@@ -754,7 +759,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 
 	if IsCampfireBlock(prevState) {
-		if mode == GameModeSurvival && s.DoTileDrops() {
+		if survivalLike && s.DoTileDrops() {
 			s.BreakCampfireAt(dim, x, y, z, HasSilkTouch(toolMeta))
 		} else {
 			s.dropAndRemoveCampfireEntity(dim, x, y, z)
@@ -776,7 +781,7 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			s.CheckHangingEntitiesAroundBlock(dim, x, y, z)
 			s.OnSculkBlockBroken(dim, x, y, z, prevState)
 			s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, "minecraft:tnt")
-			if mode == GameModeSurvival {
+			if survivalLike {
 				s.RecordBlockBreakExhaustion(session)
 				s.RecordBlockMined(session, "minecraft:tnt")
 			}
@@ -878,15 +883,15 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		}
 	}
 
-	if mode == GameModeSurvival {
+	if survivalLike {
 		s.RecordBlockBreakExhaustion(session)
 		s.RecordBlockMined(session, world.BlockName(prevState))
 		if session != nil && heldSlot >= 0 {
 			if !heldStack.IsEmpty() {
 				s.RecordItemUsed(session, heldStack.ResolvedID(), 1)
 			}
-			if !world.IsInstantBreakBlock(prevState) {
-				if s.DamagePlayerItem(session, heldSlot, 1) && !heldStack.IsEmpty() {
+			if wear := toolWearForBlockBreak(heldStack, prevState); wear > 0 {
+				if s.DamagePlayerItem(session, heldSlot, wear) && !heldStack.IsEmpty() {
 					s.RecordItemBroken(session, heldStack.ResolvedID())
 				}
 			}
@@ -964,10 +969,26 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 			}
 			return true, firstDropID
 		}
-		if drop, ok := ApplyBlockDropEnchantments(prevState, toolMeta, nil); ok {
-			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, drop)
-			return true, dropID
+		dropState := prevState
+		if strings.HasSuffix(blockName, "_door") && !strings.HasSuffix(blockName, "_trapdoor") && world.BlockProperties(prevState)["half"] == "upper" {
+			if lower, ok := world.WithBlockProperty(prevState, "half", "lower"); ok {
+				dropState = lower
+			}
+		} else if IsBedBlock(prevState) && world.BlockProperties(prevState)["part"] == "head" {
+			if foot, ok := world.WithBlockProperty(prevState, "part", "foot"); ok {
+				dropState = foot
+			}
+		} else if standingTorch, ok := standingTorchForWallTorch(blockName); ok {
+			if torchSt, ok := world.DefaultBlockStateID(standingTorch); ok {
+				dropState = torchSt
+			}
 		}
+		dropIDs, _, _ := s.SpawnBlockBreakDropsAndXPAt(dim, x, y, z, dropState, heldStack, toolMeta, nextServerDurabilityRand())
+		var firstDropID int32
+		if len(dropIDs) > 0 {
+			firstDropID = dropIDs[0]
+		}
+		return true, firstDropID
 	} else if mode == GameModeCreative && isShulkerBox && shulkerDropData != nil && (shulkerDropData.HasAnyItems() || shulkerDropData.LootTable != "") {
 		// Vanilla ShulkerBoxBlock.playerWillDestroy: breaking a non-empty (or loot-seeded)
 		// shulker box in Creative mode still drops the filled shulker box item entity.
@@ -1455,6 +1476,74 @@ func (s *Server) ConsumeHeldItem(session *PlayerSession, count int32) (slot int,
 		_ = send(protocol.PlayContainerSetSlot, encodeContainerSetSlotPacket(stateID, slot, updated))
 	}
 	return slot, updated, true
+}
+
+// toolWearForBlockBreak returns the item durability consumed when breaking
+// blockState with heldStack in Survival/Adventure mode (Vanilla 26.1.2
+// ItemStack.mineBlock + Tool.damagePerBlock): 0 for 0-hardness blocks or
+// non-damageable items, 2 for swords/tridents/maces, and 1 for mining tools.
+func toolWearForBlockBreak(heldStack world.ItemStack, blockState uint16) int32 {
+	if heldStack.IsEmpty() || world.BlockHardness(blockState) <= 0 {
+		return 0
+	}
+	id := canonicalItemName(heldStack.ResolvedID())
+	if MaxItemDurability(id) <= 0 {
+		return 0
+	}
+	if strings.HasSuffix(id, "_sword") || id == "minecraft:trident" || id == "minecraft:mace" {
+		return 2
+	}
+	return 1
+}
+
+// ConsumeInventorySlotItem decrements the item stack in a specific player
+// inventory slot (including hotbar and OffHandContainerSlot) by count when in
+// Survival or Adventure mode, clears slot metadata when depleted, syncs remote
+// tracking state, and sends PlayContainerSetSlot with full item components.
+func (s *Server) ConsumeInventorySlotItem(session *PlayerSession, slot int, count int32) (updated world.ItemStack, ok bool) {
+	if s == nil || session == nil || count <= 0 || slot < 0 || slot >= world.PlayerInventorySlots {
+		return world.ItemStack{}, false
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeCreative {
+		return session.InventorySlot(slot), true
+	}
+	if snap.GameMode != GameModeSurvival && snap.GameMode != GameModeAdventure {
+		return world.ItemStack{}, false
+	}
+
+	session.mu.Lock()
+	cur := session.inventory[slot]
+	if cur.IsEmpty() || cur.Count < count {
+		session.mu.Unlock()
+		return world.ItemStack{}, false
+	}
+	remaining := cur.Count - count
+	if remaining <= 0 {
+		updated = world.ItemStack{}
+	} else {
+		updated = cur
+		updated.Count = remaining
+	}
+	session.inventory[slot] = updated
+	session.containerStateID++
+	if session.containerStateID <= 0 {
+		session.containerStateID = 1
+	}
+	send := session.send
+	session.mu.Unlock()
+
+	if updated.IsEmpty() {
+		ClearSlotBannerMeta(session, slot)
+		ClearSlotLodestoneTracker(session, slot)
+		ClearSlotShulkerBoxData(session, slot)
+		SetSlotItemMeta(session, slot, ItemMeta{})
+	}
+	syncRemotePlayerInventorySlot(s, session, slot)
+	if send != nil {
+		_ = send(protocol.PlayContainerSetSlot, EncodePlayerSlotSetPacket(session, slot))
+	}
+	return updated, true
 }
 
 // TryPickupItems checks for nearby dropped item entities around session, adds
@@ -5746,7 +5835,7 @@ func (s *Server) UseFluidBucketOnBlock(session *PlayerSession, hand int32, x, y,
 		return res, false, false
 	}
 	snap := session.Snapshot()
-	if snap.GameMode == GameModeSpectator || snap.GameMode == GameModeAdventure {
+	if snap.GameMode == GameModeSpectator {
 		return res, false, false
 	}
 	invSlot, heldStack := session.handSlotAndStack(hand)
@@ -5761,6 +5850,11 @@ func (s *Server) UseFluidBucketOnBlock(session *PlayerSession, hand int32, x, y,
 	cache := s.DimensionChunks(dim)
 	if cache == nil {
 		return res, false, false
+	}
+	if snap.GameMode == GameModeAdventure {
+		if invSlot < 0 || !CanPlaceOnBlockInAdventure(GetSlotItemMeta(session, invSlot), cache.GetBlock(x, y, z)) {
+			return res, false, false
+		}
 	}
 
 	if itemID == "minecraft:bucket" {
@@ -5819,8 +5913,10 @@ func (s *Server) UseFluidBucketOnBlock(session *PlayerSession, hand int32, x, y,
 	if snap.GameMode != GameModeCreative && invSlot >= 0 && invSlot < world.PlayerInventorySlots {
 		emptyBucket := world.NewNamedItemStack("minecraft:bucket", 1)
 		session.SetInventorySlot(invSlot, emptyBucket)
+		SetSlotItemMeta(session, invSlot, ItemMeta{})
+		syncRemotePlayerInventorySlot(s, session, invSlot)
 		if session.send != nil {
-			_ = session.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, session.NextContainerStateID(), invSlot, emptyBucket))
+			_ = session.send(protocol.PlayContainerSetSlot, EncodePlayerSlotSetPacket(session, invSlot))
 		}
 	}
 	s.RecordItemUsed(session, itemID, 1)
