@@ -81,19 +81,31 @@ const (
 // PhantomState tracks the flight phase, circling anchor, target player, size,
 // cat-scare state, and swoop timer for an active Phantom entity.
 type PhantomState struct {
-	EntityID      int32
-	Dimension     string
-	Phase         PhantomPhase
-	AnchorX       float64
-	AnchorY       float64
-	AnchorZ       float64
-	OrbitAngle    float64
-	PhaseTicks    int
-	SwoopCooldown int
-	TargetPlayer  *PlayerSession
-	Size          int32
-	ScaredByCat   bool
-	TickCounter   int
+	EntityID          int32
+	Dimension         string
+	Phase             PhantomPhase
+	AnchorX           float64
+	AnchorY           float64
+	AnchorZ           float64
+	OrbitAngle        float64
+	CircleDistance    float64
+	CircleHeight      float64
+	Clockwise         float64
+	MoveTargetX       float64
+	MoveTargetY       float64
+	MoveTargetZ       float64
+	MoveSpeed         float64
+	VX, VY, VZ        float64
+	PhaseTicks        int
+	SwoopCooldown     int
+	NextScanTick      int
+	CatSearchTick     int
+	StrategyStarted   bool
+	CircleInitialized bool
+	TargetPlayer      *PlayerSession
+	Size              int32
+	ScaredByCat       bool
+	TickCounter       int
 }
 
 type phantomManager struct {
@@ -321,26 +333,34 @@ func (s *Server) SpawnPhantom(dimension string, x, y, z float64, targetPlayer *P
 	mem.lastHealth = DefaultPhantomMaxHealth
 	tr.mu.Unlock()
 
-	anchorX, anchorY, anchorZ := x, y, z
+	anchorX, anchorY, anchorZ := math.Floor(x), math.Floor(y)+5.0, math.Floor(z)
+	strategyStarted := false
+	nextScanTick := 10
 	if targetPlayer != nil {
 		snap := targetPlayer.Snapshot()
-		anchorX = snap.X
-		anchorY = snap.Y + PhantomCircleAltitudeOffset
-		anchorZ = snap.Z
+		anchorX, anchorY, anchorZ = computePhantomAnchorAboveTarget2612(snap.X, snap.Y, snap.Z, OverworldSeaLevel2612, nil)
+		strategyStarted = true
+		nextScanTick = PhantomTargetScanCooldownTicks2612
 	}
+
+	st := &PhantomState{
+		EntityID:        id,
+		Dimension:       normDim,
+		Phase:           PhantomPhaseCircling,
+		AnchorX:         anchorX,
+		AnchorY:         anchorY,
+		AnchorZ:         anchorZ,
+		MoveSpeed:       0.1,
+		SwoopCooldown:   PhantomInitialSweepDelayTicks2612,
+		NextScanTick:    nextScanTick,
+		StrategyStarted: strategyStarted,
+		TargetPlayer:    targetPlayer,
+	}
+	initPhantomCircleGoal2612(st, nil)
 
 	mgr := s.phantomManager()
 	mgr.mu.Lock()
-	mgr.phantoms[id] = &PhantomState{
-		EntityID:      id,
-		Dimension:     normDim,
-		Phase:         PhantomPhaseCircling,
-		AnchorX:       anchorX,
-		AnchorY:       anchorY,
-		AnchorZ:       anchorZ,
-		SwoopCooldown: PhantomSwoopIntervalTicks,
-		TargetPlayer:  targetPlayer,
-	}
+	mgr.phantoms[id] = st
 	mgr.mu.Unlock()
 
 	if ent := s.entities.Get(id); ent != nil {
@@ -383,12 +403,15 @@ func (s *Server) SetPhantomPhase(entityID int32, phase PhantomPhase) bool {
 	st.PhaseTicks = 0
 	if phase == PhantomPhaseSwooping {
 		st.ScaredByCat = false
+		st.StrategyStarted = true
+		st.NextScanTick = 0
+		st.CatSearchTick = 0
 	}
 	return true
 }
 
 // OnPhantomDamaged handles a Phantom taking damage: in vanilla
-// `PhantomSweepAttackGoal.canContinueToUse()`, taking damage (`hurtTime > 0`)
+// `PhantomSweepAttackGoal.tick()`, taking damage (`hurtTime > 0`)
 // immediately aborts an active swoop dive and returns the Phantom to circling.
 func (s *Server) OnPhantomDamaged(entityID int32) bool {
 	if s == nil {
@@ -404,8 +427,8 @@ func (s *Server) OnPhantomDamaged(entityID int32) bool {
 	aborted := st.Phase == PhantomPhaseSwooping
 	st.Phase = PhantomPhaseCircling
 	st.PhaseTicks = 0
-	if st.SwoopCooldown < PhantomSwoopIntervalTicks {
-		st.SwoopCooldown = PhantomSwoopIntervalTicks
+	if st.SwoopCooldown < PhantomResweepMinSeconds2612*20 {
+		st.SwoopCooldown = PhantomResweepMinSeconds2612 * 20
 	}
 	return aborted
 }
@@ -660,15 +683,13 @@ func (s *Server) tickSinglePhantom(entityID int32, rng *rand.Rand) {
 	}
 	st.TickCounter++
 	st.PhaseTicks++
-	if st.SwoopCooldown > 0 {
-		st.SwoopCooldown--
-	}
 	snap := *st
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
+	cache := s.DimensionChunks(dim)
 
-	// 1. Daylight burning: Phantoms are undead and catch fire under daytime open sky.
+	// 1. Daylight burning (`Mob.burnUndead`): Phantoms are in `#minecraft:burn_in_daylight` and `#minecraft:undead`.
 	if s.IsPhantomInDaylight(dim, ent.X, ent.Y, ent.Z) {
 		s.SetEntityFireTicks(entityID, PhantomSunFireTicks)
 		if snap.TickCounter%PhantomSunBurnIntervalTicks == 0 {
@@ -682,165 +703,177 @@ func (s *Server) tickSinglePhantom(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	// 2. Validate or acquire nearest survival/adventure target player within 64 blocks.
-	target := snap.TargetPlayer
-	if target == nil || target.IsDead() || world.NormalizeDimension(target.Dimension()) != dim || target.Snapshot().GameMode == GameModeSpectator || target.Snapshot().GameMode == GameModeCreative {
-		target = s.findNearestWitherTarget(dim, ent.X, ent.Y, ent.Z, PhantomAggroRange)
-		mgr.mu.Lock()
-		if cur, ok := mgr.phantoms[entityID]; ok && cur != nil {
-			cur.TargetPlayer = target
-		}
-		mgr.mu.Unlock()
+	// Wing flap sound (`TICKS_PER_FLAP = ceil(24.166098F) = 25`):
+	if snap.TickCounter%25 == 0 {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundPhantomFlap, SoundSourceHostile, ent.X, ent.Y, ent.Z, 10.0, 0.95, 0))
 	}
 
-	var goalX, goalY, goalZ float64
-	speed := PhantomFlySpeed
-	activePhase := snap.Phase
-
-	if target != nil && !target.IsDead() {
+	// 2. `targetSelector`: `PhantomAttackPlayerTargetGoal` (runs BEFORE `goalSelector`!):
+	target := snap.TargetPlayer
+	if target != nil {
 		tSnap := target.Snapshot()
-		anchorX := tSnap.X
-		anchorY := tSnap.Y + PhantomCircleAltitudeOffset
-		anchorZ := tSnap.Z
-
-		// Check if a cat or ocelot is near the target player or near the phantom itself.
-		_, catX, catY, catZ, scaredByCat := s.FindCatOrOcelotNearPosition(dim, tSnap.X, tSnap.Y, tSnap.Z, PhantomCatScareRange)
-		if !scaredByCat {
-			_, catX, catY, catZ, scaredByCat = s.FindCatOrOcelotNearPosition(dim, ent.X, ent.Y, ent.Z, PhantomCatScareRange)
+		if target.IsDead() || tSnap.Health <= 0 ||
+			world.NormalizeDimension(tSnap.Dimension) != dim ||
+			tSnap.GameMode == GameModeSpectator || tSnap.GameMode == GameModeCreative {
+			target = nil
 		}
-
-		if activePhase == PhantomPhaseCircling {
-			angle := snap.OrbitAngle + PhantomCircleAngularSpeed
-			goalX = anchorX + math.Cos(angle)*PhantomCircleRadius
-			goalY = anchorY
-			goalZ = anchorZ + math.Sin(angle)*PhantomCircleRadius
-
-			nextPhase := PhantomPhaseCircling
-			if snap.SwoopCooldown <= 0 && !scaredByCat {
-				nextPhase = PhantomPhaseSwooping
-				cp := ent.ChunkPos()
-				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-					EncodeSoundPacket(SoundPhantomSwoop, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-			} else if scaredByCat && snap.SwoopCooldown <= 0 {
-				cx := int32(int64(math.Floor(catX)) >> 4)
-				cz := int32(int64(math.Floor(catZ)) >> 4)
-				s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
-					EncodeSoundPacket(SoundCatHiss, SoundSourceNeutral, catX, catY, catZ, 1.0, 1.0, 0))
-			}
-			mgr.mu.Lock()
-			if cur, ok := mgr.phantoms[entityID]; ok && cur != nil {
-				cur.AnchorX, cur.AnchorY, cur.AnchorZ = anchorX, anchorY, anchorZ
-				cur.OrbitAngle = angle
-				cur.ScaredByCat = scaredByCat
-				if nextPhase == PhantomPhaseSwooping {
-					cur.Phase = PhantomPhaseSwooping
-					cur.PhaseTicks = 0
-					activePhase = PhantomPhaseSwooping
-				} else if scaredByCat && cur.SwoopCooldown <= 0 {
-					cur.SwoopCooldown = nextPhantomSwoopCooldown(rng)
-				}
-			}
-			mgr.mu.Unlock()
+	}
+	nextScan := snap.NextScanTick
+	if target == nil {
+		if nextScan > 0 {
+			nextScan--
 		} else {
-			// Swooping down toward the target player: cats/ocelots immediately scare
-			// swooping phantoms away and emit a hiss sound!
-			if scaredByCat || snap.PhaseTicks >= PhantomMaxSwoopTicks {
-				if scaredByCat {
-					cx := int32(int64(math.Floor(catX)) >> 4)
-					cz := int32(int64(math.Floor(catZ)) >> 4)
-					s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
-						EncodeSoundPacket(SoundCatHiss, SoundSourceNeutral, catX, catY, catZ, 1.0, 1.0, 0))
+			nextScan = PhantomTargetScanCooldownTicks2612
+			target = s.findPhantomNearestAttackablePlayer2612(dim, ent.X, ent.Y, ent.Z, snap.Size)
+		}
+	}
+
+	// 3. `goalSelector`: `PhantomAttackStrategyGoal` + (`PhantomSweepAttackGoal` | `PhantomCircleAroundAnchorGoal`):
+	local := snap
+	local.TargetPlayer = target
+	local.NextScanTick = nextScan
+
+	var playSwoopSound bool
+	var playCatHiss bool
+	var catHissX, catHissY, catHissZ float64
+	var bitTargetNow bool
+
+	if target != nil {
+		tSnap := target.Snapshot()
+		if !local.StrategyStarted {
+			// `PhantomAttackStrategyGoal.start()`:
+			local.StrategyStarted = true
+			local.Phase = PhantomPhaseCircling
+			local.PhaseTicks = 0
+			local.SwoopCooldown = PhantomInitialSweepDelayTicks2612
+			local.AnchorX, local.AnchorY, local.AnchorZ = computePhantomAnchorAboveTarget2612(tSnap.X, tSnap.Y, tSnap.Z, OverworldSeaLevel2612, rng)
+			initPhantomCircleGoal2612(&local, rng)
+		} else if local.Phase == PhantomPhaseCircling {
+			// Ensure legacy/unclamped anchor respects `seaLevel + 1` (`64`):
+			if local.AnchorY < float64(OverworldSeaLevel2612+1) {
+				local.AnchorX, local.AnchorY, local.AnchorZ = computePhantomAnchorAboveTarget2612(tSnap.X, tSnap.Y, tSnap.Z, OverworldSeaLevel2612, rng)
+			}
+			local.SwoopCooldown--
+			if local.SwoopCooldown <= 0 {
+				local.Phase = PhantomPhaseSwooping
+				local.PhaseTicks = 0
+				local.ScaredByCat = false
+				local.CatSearchTick = 0
+				local.AnchorX, local.AnchorY, local.AnchorZ = computePhantomAnchorAboveTarget2612(tSnap.X, tSnap.Y, tSnap.Z, OverworldSeaLevel2612, rng)
+				local.SwoopCooldown = nextPhantomResweepDelay2612(rng)
+				playSwoopSound = true
+			}
+		}
+	} else if local.StrategyStarted {
+		// `PhantomAttackStrategyGoal.stop()`:
+		local.StrategyStarted = false
+		local.Phase = PhantomPhaseCircling
+		local.PhaseTicks = 0
+		if cache != nil {
+			ax, az := int(math.Floor(local.AnchorX)), int(math.Floor(local.AnchorZ))
+			if topY, ok := cache.SafeSpawnY(ax, az); ok {
+				addY := 10
+				if rng != nil {
+					addY += rng.Intn(20)
 				}
-				angle := snap.OrbitAngle + PhantomCircleAngularSpeed
-				goalX = anchorX + math.Cos(angle)*PhantomCircleRadius
-				goalY = anchorY
-				goalZ = anchorZ + math.Sin(angle)*PhantomCircleRadius
-				activePhase = PhantomPhaseCircling
-				mgr.mu.Lock()
-				if cur, ok := mgr.phantoms[entityID]; ok && cur != nil {
-					cur.Phase = PhantomPhaseCircling
-					cur.PhaseTicks = 0
-					cur.OrbitAngle = angle
-					cur.AnchorX, cur.AnchorY, cur.AnchorZ = anchorX, anchorY, anchorZ
-					cur.SwoopCooldown = nextPhantomSwoopCooldown(rng)
-					cur.ScaredByCat = scaredByCat
-				}
-				mgr.mu.Unlock()
-			} else {
-				speed = PhantomSwoopSpeed
-				goalX = tSnap.X
-				goalY = tSnap.Y + 0.8
-				goalZ = tSnap.Z
+				local.AnchorY = float64(topY + addY)
+			}
+		}
+	}
+
+	if local.Phase == PhantomPhaseSwooping && target != nil {
+		// `PhantomSweepAttackGoal.canContinueToUse()`: check Cats/Ocelots in `boundingBox.inflate(16.0D)`:
+		if local.TickCounter > local.CatSearchTick {
+			local.CatSearchTick = local.TickCounter + 20
+			w, _, _, _ := PhantomDimensionsAndDamage2612(local.Size)
+			scareRange := float64(w)*0.5 + PhantomCatScareRange
+			_, cx, cy, cz, foundCat := s.FindCatOrOcelotNearPosition(dim, ent.X, ent.Y, ent.Z, scareRange)
+			local.ScaredByCat = foundCat
+			if foundCat {
+				playCatHiss = true
+				catHissX, catHissY, catHissZ = cx, cy, cz
+			}
+		}
+		if local.ScaredByCat {
+			// `PhantomSweepAttackGoal.stop()` (`Phantom.java:2439-2449`):
+			// `this.setTarget(null); this.attackPhase = AttackPhase.CIRCLE;`!
+			local.TargetPlayer = nil
+			target = nil
+			local.Phase = PhantomPhaseCircling
+			local.PhaseTicks = 0
+			local.StrategyStarted = false
+			local.NextScanTick = PhantomTargetScanCooldownTicks2612
+			stepPhantomCircleGoal2612(cache, ent, &local, rng)
+		} else {
+			tSnap := target.Snapshot()
+			local.MoveTargetX = tSnap.X
+			local.MoveTargetY = tSnap.Y + 0.9 // `target.getY(0.5D)`
+			local.MoveTargetZ = tSnap.Z
+			if phantomSwoopIntersectsPlayer2612(ent.X, ent.Y, ent.Z, local.Size, tSnap) {
+				bitTargetNow = true
+				local.Phase = PhantomPhaseCircling
+				local.PhaseTicks = 0
+				local.CircleInitialized = false
 			}
 		}
 	} else {
-		// No player target: circle around current anchor.
-		angle := snap.OrbitAngle + PhantomCircleAngularSpeed
-		goalX = snap.AnchorX + math.Cos(angle)*PhantomCircleRadius
-		goalY = snap.AnchorY
-		goalZ = snap.AnchorZ + math.Sin(angle)*PhantomCircleRadius
-		mgr.mu.Lock()
-		if cur, ok := mgr.phantoms[entityID]; ok && cur != nil {
-			cur.OrbitAngle = angle
-		}
-		mgr.mu.Unlock()
+		stepPhantomCircleGoal2612(cache, ent, &local, rng)
 	}
 
-	// Move 3D toward (goalX, goalY, goalZ).
-	dx := goalX - ent.X
-	dy := goalY - ent.Y
-	dz := goalZ - ent.Z
-	dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-	nextX, nextY, nextZ := ent.X, ent.Y, ent.Z
-	yaw := ent.Yaw
-	pitch := ent.Pitch
-	if dist > 1e-4 {
-		step := speed
-		if step > dist {
-			step = dist
-		}
-		vx := (dx / dist) * step
-		vy := (dy / dist) * step
-		vz := (dz / dist) * step
-		nextX += vx
-		nextY += vy
-		nextZ += vz
-		yaw = yawToward(dx, dz)
-		pitch = float32(-math.Atan2(dy, math.Hypot(dx, dz)) * (180.0 / math.Pi))
-		s.entities.Update(entityID, func(e *world.Entity) {
-			e.X = nextX
-			e.Y = nextY
-			e.Z = nextZ
-			e.Yaw = yaw
-			e.Pitch = pitch
-			e.HeadYaw = yaw
-			e.VelocityX = clampVelocityShort(vx)
-			e.VelocityY = clampVelocityShort(vy)
-			e.VelocityZ = clampVelocityShort(vz)
-			e.OnGround = false
-		})
+	if playSwoopSound && !playCatHiss {
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundPhantomSwoop, SoundSourceHostile, ent.X, ent.Y, ent.Z, 10.0, 1.0, 0))
+	}
+	if playCatHiss {
+		cx := int32(int64(math.Floor(catHissX)) >> 4)
+		cz := int32(int64(math.Floor(catHissZ)) >> 4)
+		s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+			EncodeSoundPacket(SoundCatHiss, SoundSourceNeutral, catHissX, catHissY, catHissZ, 1.0, 1.0, 0))
 	}
 
-	// Check swoop melee bite against target player (only if still swooping and not scared by cat).
-	if activePhase == PhantomPhaseSwooping && target != nil && !target.IsDead() {
+	// 4. `PhantomMoveControl` + `travelFlying`:
+	nextX, nextY, nextZ, yaw, pitch, horizCollided := stepPhantomMoveControl2612(cache, ent, &local)
+	s.entities.Update(entityID, func(e *world.Entity) {
+		e.X = nextX
+		e.Y = nextY
+		e.Z = nextZ
+		e.Yaw = yaw
+		e.Pitch = pitch
+		e.HeadYaw = yaw
+		e.VelocityX = clampVelocityShort(local.VX)
+		e.VelocityY = clampVelocityShort(local.VY)
+		e.VelocityZ = clampVelocityShort(local.VZ)
+		e.OnGround = false
+	})
+
+	if !bitTargetNow && local.Phase == PhantomPhaseSwooping && target != nil && !target.IsDead() {
 		tSnap := target.Snapshot()
-		adx := tSnap.X - nextX
-		ady := (tSnap.Y + 0.8) - nextY
-		adz := tSnap.Z - nextZ
-		if adx*adx+ady*ady+adz*adz <= PhantomAttackReach*PhantomAttackReach {
-			dmg := PhantomAttackDamageForSize(snap.Size)
-			s.AttackPlayerFromMob(entityID, MobTypePhantom, nextX, nextZ, target, dmg)
-			cp := ent.ChunkPos()
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundPhantomBite, SoundSourceHostile, nextX, nextY, nextZ, 1.0, 1.0, 0))
-			mgr.mu.Lock()
-			if cur, ok := mgr.phantoms[entityID]; ok && cur != nil {
-				cur.Phase = PhantomPhaseCircling
-				cur.PhaseTicks = 0
-				cur.SwoopCooldown = nextPhantomSwoopCooldown(rng)
-			}
-			mgr.mu.Unlock()
+		if phantomSwoopIntersectsPlayer2612(nextX, nextY, nextZ, local.Size, tSnap) {
+			bitTargetNow = true
+			local.Phase = PhantomPhaseCircling
+			local.PhaseTicks = 0
+			local.CircleInitialized = false
+		} else if horizCollided {
+			local.Phase = PhantomPhaseCircling
+			local.PhaseTicks = 0
 		}
+	}
+
+	mgr.mu.Lock()
+	if cur, ok := mgr.phantoms[entityID]; ok && cur != nil {
+		*cur = local
+	}
+	mgr.mu.Unlock()
+
+	if bitTargetNow && target != nil && !target.IsDead() {
+		dmg := PhantomAttackDamageForSize(local.Size)
+		s.AttackPlayerFromMob(entityID, MobTypePhantom, nextX, nextZ, target, dmg)
+		cp := ent.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundPhantomBite, SoundSourceHostile, nextX, nextY, nextZ, 1.0, 1.0, 0))
 	}
 }
 

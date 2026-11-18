@@ -480,14 +480,11 @@ func ScaleSlimeOrMagmaCubeDimensions2612(typeName string, size int) (width, heig
 }
 
 // ScalePhantomDimensions2612 returns the scaled `(width, height, attackDamage)`
-// for a `minecraft:phantom` with `size` (`0..64`, matching `Phantom.updatePhantomSizeInfo`:
-// `width = 0.9 + 0.2*size`, `height = 0.5 + 0.1*size`, `attackDamage = 6 + size`).
+// for a `minecraft:phantom` with `size` (`0..64`, matching `Phantom.getDefaultDimensions`:
+// `scale = 1.0 + 0.15*size`, `width = 0.9*scale`, `height = 0.5*scale`, `attackDamage = 6 + size`).
 func ScalePhantomDimensions2612(size int) (width, height, attackDamage float32) {
-	if size < 0 {
-		size = 0
-	}
-	s := float32(size)
-	return 0.9 + 0.2*s, 0.5 + 0.1*s, 6.0 + s
+	w, h, _, dmg := PhantomDimensionsAndDamage2612(int32(size))
+	return w, h, dmg
 }
 
 // --- 2. Sound Event Registry for Hostile, Nether, Golem & Undead Horse Mobs ---

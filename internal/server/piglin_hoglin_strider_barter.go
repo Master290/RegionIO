@@ -74,13 +74,13 @@ const (
 	ZoglinChaseSpeed   = 0.17
 	ZoglinAttackDamage = float32(6.0)
 
-	StriderLandSpeed                = 0.09
+	StriderLandSpeed                = 0.1155 // 0.175 * (1.0 - 0.34) SUFFOCATING_MODIFIER (vanilla 26.1.2)
 	StriderLavaSpeed                = 0.175
-	StriderBoostSpeedMult           = 1.55
+	StriderBoostSpeedMult           = 2.15
 	StriderMinBoostTicks            = 140
 	StriderMaxBoostTicks            = 980 // 140 + random.nextInt(841) in ItemBasedSteering.boost (vanilla 26.1.2)
 	StriderWaterDamage              = float32(1.0)
-	StriderWaterDamageIntervalTicks = 20
+	StriderWaterDamageIntervalTicks = 10 // LivingEntity.aiStep -> hurtServer(drown, 1.0F) lands every 10 ticks (`invulnerableTime <= 10`)
 	WarpedFungusOnAStickMaxDamage   = 100
 
 	// XP rewards on death (vanilla 26.1.2).
@@ -334,8 +334,11 @@ type StriderState struct {
 	Dimension        string
 	Saddled          bool
 	Shivering        bool
+	Boosting         bool
+	BoostElapsed     int32
 	BoostTicks       int32
 	TotalBoostTime   int32
+	FloatVY          float64
 	RiderEntityID    int32
 	WaterDamageTimer int
 }
@@ -2367,7 +2370,8 @@ func DecodeStriderEntityDataPacket(data []byte) (entityID, boostTime int32, shiv
 }
 
 // IsStriderOnLava reports whether the strider at (x, y, z) in cache is standing
-// on or inside `minecraft:lava` (or `minecraft:lava_cauldron`).
+// on or inside `#minecraft:strider_warm_blocks` (`minecraft:lava`, source or flowing,
+// or `minecraft:lava_cauldron`).
 func IsStriderOnLava(cache *world.Cache, x, y, z float64) bool {
 	if cache == nil {
 		return false
@@ -2379,8 +2383,7 @@ func IsStriderOnLava(cache *world.Cache, x, y, z float64) bool {
 		if checkY < world.MinY || checkY >= world.MinY+world.WorldHeight {
 			continue
 		}
-		name := world.BlockName(cache.GetBlock(bx, checkY, bz))
-		if name == "minecraft:lava" || name == "minecraft:lava_cauldron" {
+		if IsStriderWarmBlock2612(cache.GetBlock(bx, checkY, bz)) {
 			return true
 		}
 	}
@@ -2615,9 +2618,15 @@ func (s *Server) UpdateStriderEnvironment(entityID int32) (onLava bool, shiverin
 	}
 	dim := ent.EffectiveDimension()
 	cache := s.DimensionChunks(dim)
+	st := s.ensureStriderState(entityID)
 	onLava = IsStriderOnLava(cache, ent.X, ent.Y, ent.Z)
+	if onLava {
+		s.stepFloatStrider2612(cache, ent, st)
+	} else {
+		st.FloatVY = 0
+	}
 
-	// A baby strider riding on top of a warm adult strider does not shiver!
+	// A baby/rider strider riding on top of a warm adult strider does not shiver (`Strider.tick()` line 3271-3285)!
 	ridingWarmStrider := false
 	if vehID := s.EntityMountedVehicle(entityID); vehID > 0 {
 		if vEnt := s.entities.Get(vehID); vEnt != nil && canonicalResourceName(vEnt.TypeName) == MobTypeStrider {
@@ -2628,24 +2637,14 @@ func (s *Server) UpdateStriderEnvironment(entityID int32) (onLava bool, shiverin
 	}
 	shivering = !onLava && !ridingWarmStrider
 
-	if onLava {
-		// Float/stand on top of the lava surface.
-		by := int(math.Floor(ent.Y))
-		if cache != nil && world.BlockName(cache.GetBlock(int(math.Floor(ent.X)), by, int(math.Floor(ent.Z)))) == "minecraft:lava" {
-			s.entities.Update(entityID, func(e *world.Entity) {
-				e.Y = float64(by + 1)
-				e.VelocityY = 0
-				e.OnGround = true
-			})
-		}
-	}
-
-	st := s.ensureStriderState(entityID)
 	nm := s.netherMobs()
 	nm.mu.Lock()
 	changed := st.Shivering != shivering
 	st.Shivering = shivering
-	boost := st.BoostTicks
+	boost := st.TotalBoostTime
+	if !st.Boosting {
+		boost = st.BoostTicks
+	}
 	saddled := st.Saddled
 	nm.mu.Unlock()
 
@@ -2698,15 +2697,13 @@ func (s *Server) SteerStriderWithWarpedFungusOnAStick(rider *PlayerSession, stri
 		return false, ent.X, ent.Y, ent.Z
 	}
 
-	onLava, _ := s.UpdateStriderEnvironment(striderID)
+	onLava, shivering := s.UpdateStriderEnvironment(striderID)
+	curEnt := s.entities.Get(striderID)
+	if curEnt != nil {
+		ent = curEnt
+	}
 	st, _ := s.GetStriderState(striderID)
-	speed := StriderLandSpeed
-	if onLava {
-		speed = StriderLavaSpeed
-	}
-	if st.BoostTicks > 0 {
-		speed *= StriderBoostSpeedMult
-	}
+	speed := StriderRiddenSpeed2612(shivering, st.Boosting, st.BoostElapsed, st.TotalBoostTime)
 
 	rSnap := rider.Snapshot()
 	yawRad := float64(rSnap.Yaw) * (math.Pi / 180.0)
@@ -2721,6 +2718,7 @@ func (s *Server) SteerStriderWithWarpedFungusOnAStick(rider *PlayerSession, stri
 		e.Y = nextY
 		e.Z = nextZ
 		e.Yaw = rSnap.Yaw
+		e.Pitch = rSnap.Pitch * 0.5
 		e.HeadYaw = rSnap.Yaw
 		e.OnGround = true
 	})
@@ -2737,9 +2735,13 @@ func (s *Server) SteerStriderWithWarpedFungusOnAStick(rider *PlayerSession, stri
 }
 
 // BoostStrider triggers a speed boost on a saddled strider when its rider uses
-// `minecraft:warped_fungus_on_a_stick`, setting `DATA_BOOST_TIME` (`140..420` ticks),
-// damaging the stick by 1 durability in Survival (reverting to `minecraft:fishing_rod`
-// if broken), and granting `minecraft:nether/ride_strider`.
+// `minecraft:warped_fungus_on_a_stick`, matching `ItemBasedSteering.boost` +
+// `FoodOnAStickItem.use` in `26.1.2.jar`:
+//   - Returns `(0, false)` immediately if already `Boosting == true`!
+//   - Sets `DATA_BOOST_TIME` = `140 + random.nextInt(841)` (`140..980` ticks);
+//   - Damages the stick by 1 durability in Survival (`MaxDamage = 100`), converting
+//     it to `minecraft:fishing_rod` on break (`hurtAndConvertOnBreak`);
+//   - Grants `minecraft:nether/ride_strider`.
 func (s *Server) BoostStrider(rider *PlayerSession, striderID int32, rng *rand.Rand) (boostTicks int32, ok bool) {
 	if s == nil || s.entities == nil || striderID <= 0 {
 		return 0, false
@@ -2748,13 +2750,19 @@ func (s *Server) BoostStrider(rider *PlayerSession, striderID int32, rng *rand.R
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeStrider || !s.IsStriderSaddled(striderID) {
 		return 0, false
 	}
+	st := s.ensureStriderState(striderID)
+	nm := s.netherMobs()
+	nm.mu.Lock()
+	if st.Boosting {
+		nm.mu.Unlock()
+		return 0, false
+	}
 	boostTicks = StriderMinBoostTicks
 	if rng != nil {
 		boostTicks += int32(rng.Intn(int(StriderMaxBoostTicks - StriderMinBoostTicks + 1)))
 	}
-	st := s.ensureStriderState(striderID)
-	nm := s.netherMobs()
-	nm.mu.Lock()
+	st.Boosting = true
+	st.BoostElapsed = 0
 	st.BoostTicks = boostTicks
 	st.TotalBoostTime = boostTicks
 	shiver := st.Shivering
@@ -2768,15 +2776,31 @@ func (s *Server) BoostStrider(rider *PlayerSession, striderID int32, rng *rand.R
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundStriderHappy, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	if rider != nil {
-		slot := rider.HeldInventorySlot()
-		if slot >= 0 {
-			held := rider.InventorySlot(slot)
-			if !held.IsEmpty() && canonicalResourceName(held.ResolvedID()) == "minecraft:warped_fungus_on_a_stick" {
-				if s.DamageHeldItem(rider, 1) {
-					rider.SetInventorySlot(slot, world.NewNamedItemStack("minecraft:fishing_rod", 1))
+		stickSlot := -1
+		if hs := rider.HeldInventorySlot(); hs >= 0 {
+			if held := rider.InventorySlot(hs); !held.IsEmpty() && canonicalResourceName(held.ResolvedID()) == "minecraft:warped_fungus_on_a_stick" {
+				stickSlot = hs
+			}
+		}
+		if stickSlot < 0 {
+			if off := rider.InventorySlot(45); !off.IsEmpty() && canonicalResourceName(off.ResolvedID()) == "minecraft:warped_fungus_on_a_stick" {
+				stickSlot = 45
+			}
+		}
+		if stickSlot >= 0 {
+			prevMeta := GetSlotItemMeta(rider, stickSlot).Clone()
+			if s.DamagePlayerItemWithRand(rider, stickSlot, 1, rng) {
+				rod := world.NewNamedItemStack(ItemFishingRod, 1)
+				prevMeta.Damage = 0
+				rider.SetInventorySlot(stickSlot, rod)
+				SetSlotItemMeta(rider, stickSlot, prevMeta)
+				if rider.send != nil {
+					stateID := rider.NextContainerStateID()
+					_ = rider.send(protocol.PlayContainerSetSlot, EncodeContainerSlot(0, stateID, stickSlot, rod))
 				}
 			}
 		}
+		s.RecordItemUsed(rider, "minecraft:warped_fungus_on_a_stick", 1)
 		s.GrantCriterion(rider, "minecraft:nether/ride_strider", "used_warped_fungus_on_a_stick")
 	}
 	return boostTicks, true
@@ -3627,7 +3651,24 @@ func (s *Server) tickSingleStrider(entityID int32, _ *rand.Rand) {
 		nm.mu.Unlock()
 		return
 	}
-	if st.BoostTicks > 0 {
+	// `ItemBasedSteering.tickBoost()`: stops when `this.boostTime++ > this.boostTimeTotal()`!
+	if st.Boosting {
+		if st.BoostElapsed > st.TotalBoostTime {
+			st.Boosting = false
+			st.BoostElapsed = 0
+			st.BoostTicks = 0
+		} else {
+			st.BoostElapsed++
+			if st.BoostTicks > 0 {
+				st.BoostTicks--
+			}
+			if st.BoostElapsed > st.TotalBoostTime {
+				st.Boosting = false
+				st.BoostElapsed = 0
+				st.BoostTicks = 0
+			}
+		}
+	} else if st.BoostTicks > 0 {
 		st.BoostTicks--
 	}
 	if st.WaterDamageTimer > 0 {
@@ -3637,8 +3678,12 @@ func (s *Server) tickSingleStrider(entityID int32, _ *rand.Rand) {
 	riderID := st.RiderEntityID
 	nm.mu.Unlock()
 
+	// `EntityType.STRIDER.fireImmune()` & `Strider.isOnFire() == false`:
+	s.SetEntityFireTicks(entityID, 0)
+
 	dim := ent.EffectiveDimension()
-	// Striders are sensitive to water and rain (1.0 HP damage every 20 ticks).
+	// `Strider.isSensitiveToWater()` in `LivingEntity.aiStep()` -> `hurtServer(drown, 1.0F)` every tick,
+	// landing on ticks 1, 11, 21, ... (`invulnerableTime <= 10` -> 10-tick cadence!).
 	if s.IsEndermanInWaterOrRain(dim, ent.X, ent.Y, ent.Z) && waterTimer <= 0 {
 		nm.mu.Lock()
 		if cur, ok := nm.striders[entityID]; ok && cur != nil {
@@ -3654,6 +3699,16 @@ func (s *Server) tickSingleStrider(entityID int32, _ *rand.Rand) {
 	if riderID > 0 {
 		if rider := s.playerByEntityID(riderID); rider != nil && !rider.IsDead() {
 			s.SteerStriderWithWarpedFungusOnAStick(rider, entityID)
+			return
+		}
+	}
+	if s.EntityMountedVehicle(entityID) == 0 {
+		if curEnt := s.entities.Get(entityID); curEnt != nil {
+			cache := s.DimensionChunks(dim)
+			stSnap, hasSt := s.GetStriderState(entityID)
+			if hasSt {
+				s.stepStriderUnmountedGoals2612(curEnt, cache, &stSnap)
+			}
 		}
 	}
 }

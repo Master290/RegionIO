@@ -75,8 +75,8 @@ func TestHostileNetherMobsHitboxesAttributesAndSounds2612(t *testing.T) {
 		t.Fatalf("MagmaCube size 4 scaling = (%v, %v, %v, hp=%v, dmg=%v, armor=%v)", mw, mh, meye, mhp, mdmg, marmor)
 	}
 	pw, ph, pdmg := ScalePhantomDimensions2612(2)
-	if math.Abs(float64(pw-1.3)) > 1e-4 || math.Abs(float64(ph-0.7)) > 1e-4 || pdmg != 8.0 {
-		t.Fatalf("Phantom size 2 scaling = (%v, %v, dmg=%v), want (1.3, 0.7, 8.0)", pw, ph, pdmg)
+	if math.Abs(float64(pw-1.17)) > 1e-4 || math.Abs(float64(ph-0.65)) > 1e-4 || pdmg != 8.0 {
+		t.Fatalf("Phantom size 2 scaling = (%v, %v, dmg=%v), want (1.17, 0.65, 8.0)", pw, ph, pdmg)
 	}
 }
 

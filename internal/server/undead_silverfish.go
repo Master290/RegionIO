@@ -119,24 +119,36 @@ const (
 // reinforcement chance for a Zombie, Husk, Drowned, Zombie Villager, Skeleton,
 // Stray, or Wither Skeleton.
 type UndeadGearState struct {
-	EntityID            int32
-	TypeName            string
-	MainHand            world.ItemStack
-	OffHand             world.ItemStack
-	Head                world.ItemStack
-	Chest               world.ItemStack
-	Legs                world.ItemStack
-	Feet                world.ItemStack
-	HelmetDamage        int
-	HelmetMaxDamage     int
-	InWaterTicks        int
-	InPowderSnowTicks   int
-	Converting          bool
-	ConversionTicks     int
-	ReinforcementChance float32
-	CanBreakDoors       bool
-	AttackCooldown      int
-	SunBurnTickCounter  int
+	EntityID              int32
+	TypeName              string
+	MainHand              world.ItemStack
+	OffHand               world.ItemStack
+	Head                  world.ItemStack
+	Chest                 world.ItemStack
+	Legs                  world.ItemStack
+	Feet                  world.ItemStack
+	HelmetDamage          int
+	HelmetMaxDamage       int
+	InWaterTicks          int
+	InPowderSnowTicks     int
+	Converting            bool
+	ConversionTicks       int
+	ReinforcementChance   float32
+	CanBreakDoors         bool
+	AttackCooldown        int
+	SunBurnTickCounter    int
+	RangedAttackTime      int
+	RangedSeeTime         int
+	UsingTrident          bool
+	Aggressive            bool
+	SearchingForLand      bool
+	Swimming              bool
+	HasTrampleEgg         bool
+	TrampleEggX           int
+	TrampleEggY           int
+	TrampleEggZ           int
+	TrampleEggTicks       int
+	GuaranteedOffHandDrop bool
 }
 
 // SilverfishState tracks the AI and infested-block wake-up timer for a
@@ -150,9 +162,10 @@ type SilverfishState struct {
 }
 
 type serverUndeadManager struct {
-	mu         sync.RWMutex
-	undead     map[int32]*UndeadGearState
-	silverfish map[int32]*SilverfishState
+	mu              sync.RWMutex
+	undead          map[int32]*UndeadGearState
+	silverfish      map[int32]*SilverfishState
+	drownedTridents map[int32]*DrownedThrownTridentState2612
 }
 
 var undeadManagers sync.Map // map[*Server]*serverUndeadManager
@@ -160,16 +173,18 @@ var undeadManagers sync.Map // map[*Server]*serverUndeadManager
 func (s *Server) undeadManager() *serverUndeadManager {
 	if s == nil {
 		return &serverUndeadManager{
-			undead:     make(map[int32]*UndeadGearState),
-			silverfish: make(map[int32]*SilverfishState),
+			undead:          make(map[int32]*UndeadGearState),
+			silverfish:      make(map[int32]*SilverfishState),
+			drownedTridents: make(map[int32]*DrownedThrownTridentState2612),
 		}
 	}
 	if v, ok := undeadManagers.Load(s); ok {
 		return v.(*serverUndeadManager)
 	}
 	mgr := &serverUndeadManager{
-		undead:     make(map[int32]*UndeadGearState),
-		silverfish: make(map[int32]*SilverfishState),
+		undead:          make(map[int32]*UndeadGearState),
+		silverfish:      make(map[int32]*SilverfishState),
+		drownedTridents: make(map[int32]*DrownedThrownTridentState2612),
 	}
 	actual, _ := undeadManagers.LoadOrStore(s, mgr)
 	return actual.(*serverUndeadManager)
@@ -239,6 +254,7 @@ func (s *Server) ensureUndeadState(entityID int32, typeName string, rng *rand.Ra
 		EntityID:            entityID,
 		TypeName:            norm,
 		ReinforcementChance: DefaultZombieReinforcementChance,
+		RangedAttackTime:    -1,
 	}
 	switch norm {
 	case MobTypeSkeleton, MobTypeStray, MobTypeBogged, MobTypeParched:
@@ -247,12 +263,7 @@ func (s *Server) ensureUndeadState(entityID int32, typeName string, rng *rand.Ra
 		st.MainHand = world.NewNamedItemStack(ItemStoneSword, 1)
 	case MobTypeDrowned:
 		if rng != nil {
-			if rng.Float32() < 0.15 {
-				st.MainHand = world.NewNamedItemStack(ItemTrident, 1)
-			}
-			if rng.Float32() < 0.03 {
-				st.OffHand = world.NewNamedItemStack(ItemNautilusShell, 1)
-			}
+			st.MainHand, st.OffHand, st.GuaranteedOffHandDrop = RollDrownedDefaultEquipment2612(rng)
 		}
 	}
 	mgr.undead[entityID] = st
@@ -423,6 +434,7 @@ func (s *Server) SetUndeadEquipment(entityID int32, mainHand, offHand, head worl
 	st.Head = head
 	st.HelmetDamage = 0
 	st.HelmetMaxDamage = defaultHelmetMaxDurability(head.ResolvedID())
+	st.RangedAttackTime = -1
 	snap := *st
 	mgr.mu.Unlock()
 
@@ -851,9 +863,10 @@ func (s *Server) ApplyHuskMeleeHunger(huskID int32, target *PlayerSession) bool 
 	return true
 }
 
-// ShootDrownedTridentAtPlayer fires a ranged `minecraft:trident` from Drowned
-// `drownedID` at `target`, dealing `DrownedTridentBaseDamage` (`8.0` base,
-// scaled by difficulty) and broadcasting `SoundDrownedShoot`.
+// ShootDrownedTridentAtPlayer fires a ranged `minecraft:trident` projectile
+// (`EntityTypeTrident`) from Drowned `drownedID` at `target`, dealing
+// `DrownedTridentBaseDamage` (`8.0` base, scaled by difficulty) and broadcasting
+// `AnimateSwingMainHand` + `SoundDrownedShoot`.
 func (s *Server) ShootDrownedTridentAtPlayer(drownedID int32, target *PlayerSession) (dealt float32, ok bool) {
 	if s == nil || s.entities == nil || target == nil || target.IsDead() {
 		return 0, false
@@ -866,10 +879,17 @@ func (s *Server) ShootDrownedTridentAtPlayer(drownedID int32, target *PlayerSess
 	if !hasSt || canonicalResourceName(st.MainHand.ResolvedID()) != ItemTrident {
 		return 0, false
 	}
-	dim := ent.EffectiveDimension()
-	cp := ent.ChunkPos()
-	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-		EncodeSoundPacket(SoundDrownedShoot, SoundSourceHostile, ent.X, ent.Y+1.5, ent.Z, 1.0, 1.0, 0))
+	tSnap := target.Snapshot()
+	projID, spawned := s.SpawnDrownedThrownTrident2612(drownedID, tSnap.X, tSnap.Y, 1.8, tSnap.Z, nil)
+	if !spawned {
+		return 0, false
+	}
+	mgr := s.undeadManager()
+	mgr.mu.Lock()
+	if tr := mgr.drownedTridents[projID]; tr != nil {
+		tr.DealtDamage = true
+	}
+	mgr.mu.Unlock()
 	dealt = s.AttackPlayerFromMob(drownedID, MobTypeDrowned, ent.X, ent.Z, target, DrownedTridentBaseDamage)
 	return dealt, true
 }
@@ -1538,6 +1558,8 @@ func (s *Server) TickUndeadAndSilverfish(rng *rand.Rand) {
 		rng = rand.New(rand.NewSource(int64(s.entityTracker().aiTickID) + 409))
 	}
 
+	s.tickDrownedThrownTridents2612(rng)
+
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		ent := &allEnts[i]
@@ -1555,7 +1577,7 @@ func (s *Server) TickUndeadAndSilverfish(rng *rand.Rand) {
 			}
 		case MobTypeDrowned:
 			s.tickUndeadSunburn(ent, rng)
-			s.tickHostileUndeadCombat(ent, norm, rng)
+			s.tickSingleDrowned2612(ent, rng)
 		case MobTypeSkeleton:
 			if _, conv := s.StepSkeletonPowderSnowConversion(ent.ID, 1); conv {
 				continue
