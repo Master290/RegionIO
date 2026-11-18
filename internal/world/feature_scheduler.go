@@ -297,6 +297,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 	// steps. Their origins reach two chunks out because a portal template can
 	// span that far.
 	r.deferOceanRuinPhysics = true
+	r.deferAncientCities = true
 	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
 		return fmt.Errorf("world: structure starts (%d,%d): %w", targetX, targetZ, err)
 	}
@@ -378,6 +379,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 				return err
 			}
 		}
+		r.placePendingAncientCitiesForChunk(seed, source.X, source.Z)
 		if err := r.placeScheduledUndergroundDecoration(seed); err != nil {
 			return fmt.Errorf("world: replay source underground decoration (%d,%d): %w", source.X, source.Z, err)
 		}
@@ -424,12 +426,50 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		}
 	}
 	r.flushRemainingPendingOceanRuins()
+	r.flushRemainingPendingAncientCities(seed)
 	r.runPostProcessing(nil)
 	if len(r.deferredOceanRuinWritten) > 0 {
 		applyOceanRuinPhysics(r, r.deferredOceanRuinWritten)
 		r.deferredOceanRuinWritten = nil
 	}
 	return nil
+}
+
+func (r *decorationRegion) placePendingAncientCitiesForChunk(seed int64, cx, cz int32) {
+	if r == nil || len(r.pendingAncientCities) == 0 {
+		return
+	}
+	if r.placedAncientCityChunks == nil {
+		r.placedAncientCityChunks = make(map[[2]int32]bool, len(r.chunks))
+	}
+	key := [2]int32{cx, cz}
+	if r.placedAncientCityChunks[key] {
+		return
+	}
+	r.placedAncientCityChunks[key] = true
+	PlaceJigsawStartsForChunk(r, r.pendingAncientCities, "minecraft:ancient_city", 7, seed, cx, cz)
+}
+
+func (r *decorationRegion) flushRemainingPendingAncientCities(seed int64) {
+	if r == nil || len(r.pendingAncientCities) == 0 {
+		return
+	}
+	keys := make([][2]int32, 0, len(r.chunks))
+	for k := range r.chunks {
+		if r.placedAncientCityChunks == nil || !r.placedAncientCityChunks[k] {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i][0] != keys[j][0] {
+			return keys[i][0] < keys[j][0]
+		}
+		return keys[i][1] < keys[j][1]
+	})
+	for _, k := range keys {
+		r.placePendingAncientCitiesForChunk(seed, k[0], k[1])
+	}
+	r.pendingAncientCities = nil
 }
 
 // placeScheduledStructures replays every structure start whose pieces may
@@ -474,8 +514,12 @@ func (r *decorationRegion) placeScheduledStructures(od *worldgen.OverworldDensit
 		}
 	}
 	if len(ancientCities) > 0 {
-		for _, key := range regionChunks {
-			PlaceJigsawStartsForChunk(r, ancientCities, "minecraft:ancient_city", 7, seed, key[0], key[1])
+		if r.deferAncientCities {
+			r.pendingAncientCities = append(r.pendingAncientCities, ancientCities...)
+		} else {
+			for _, key := range regionChunks {
+				PlaceJigsawStartsForChunk(r, ancientCities, "minecraft:ancient_city", 7, seed, key[0], key[1])
+			}
 		}
 	}
 	for _, key := range regionChunks {

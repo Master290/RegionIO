@@ -266,6 +266,52 @@ func (r *decorationRegion) placeConfiguredVegetation(set *worldgen.FeatureSet, r
 	case "minecraft:coral_tree", "minecraft:coral_claw", "minecraft:coral_mushroom":
 		r.placeCoralFeature(random, position, configured.Type, set)
 		return nil
+	case "minecraft:sculk_patch":
+		config, err := set.SculkPatch(name)
+		if err != nil {
+			return err
+		}
+		r.placeSculkPatch(set, random, position, config)
+		return nil
+	case "minecraft:dripstone_cluster":
+		config, err := set.DripstoneCluster(name)
+		if err != nil {
+			return err
+		}
+		r.placeDripstoneCluster(set, random, position, config)
+		return nil
+	case "minecraft:pointed_dripstone":
+		config, err := set.PointedDripstone(name)
+		if err != nil {
+			return err
+		}
+		r.placePointedDripstone(set, random, position, config)
+		return nil
+	case "minecraft:vegetation_patch", "minecraft:waterlogged_vegetation_patch":
+		config, err := set.VegetationPatch(name)
+		if err != nil {
+			return err
+		}
+		r.placeVegetationPatch(random, position, config, set, configured.Type == "minecraft:waterlogged_vegetation_patch")
+		return nil
+	case "minecraft:simple_random_selector":
+		config, err := set.SimpleRandomSelector(name)
+		if err != nil {
+			return err
+		}
+		r.placeSimpleRandomSelector(random, position, config, set)
+		return nil
+	case "minecraft:random_boolean_selector":
+		config, err := set.RandomBooleanSelector(name)
+		if err != nil {
+			return err
+		}
+		chosen := config.FeatureFalse
+		if random.NextBoolean() {
+			chosen = config.FeatureTrue
+		}
+		r.placeFeatureRef(random, position, chosen, set)
+		return nil
 	case "minecraft:huge_fungus",
 		"minecraft:weeping_vines", "minecraft:twisting_vines",
 		"minecraft:iceberg", "minecraft:block_pile", "minecraft:delta_feature",

@@ -1964,6 +1964,14 @@ func PlaceJigsawStartsForChunk(region *decorationRegion, starts []*JigsawStart, 
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
 	random.SetFeatureSeed(decorationSeed, worldgen.StructureIndexInStep(wantName), step)
 
+	if region != nil {
+		prevSX, prevSZ := region.sourceX, region.sourceZ
+		region.sourceX, region.sourceZ = chunkX, chunkZ
+		defer func() {
+			region.sourceX, region.sourceZ = prevSX, prevSZ
+		}()
+	}
+
 	for _, key := range set.elements() {
 		for _, cand := range candidates {
 			if cand.key == key {

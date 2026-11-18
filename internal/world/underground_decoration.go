@@ -3,6 +3,7 @@ package world
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"regionio/internal/worldgen"
 )
@@ -207,7 +208,7 @@ func (r *decorationRegion) placeSculkPatch(set *worldgen.FeatureSet, random worl
 		}
 	}
 	belowState := r.getBlock(origin.X, origin.Y-1, origin.Z)
-	if random.NextFloat() <= config.CatalystChance && canMultifaceAttachTo(belowState) {
+	if random.NextFloat() <= config.CatalystChance && isSculkCollisionFullBlock(belowState) {
 		if catalyst, ok := nameToStateID("minecraft:sculk_catalyst", map[string]string{"bloom": "false"}); ok {
 			if r.setBlock(origin.X, origin.Y, origin.Z, catalyst) {
 				r.addStructureBlockEntity(StructureBlockEntity{
@@ -253,11 +254,31 @@ func (r *decorationRegion) sculkCanSpreadFrom(x, y, z int) bool {
 		return false
 	}
 	for _, dir := range allMultifaceDirs {
-		if canMultifaceAttachTo(r.getBlock(x+dir.dx, y+dir.dy, z+dir.dz)) {
+		if isSculkCollisionFullBlock(r.getBlock(x+dir.dx, y+dir.dy, z+dir.dz)) {
 			return true
 		}
 	}
 	return false
+}
+
+var (
+	sculkCollisionFullOnce  sync.Once
+	sculkCollisionFullTable [totalBlockStates]bool
+)
+
+func isSculkCollisionFullBlock(state uint16) bool {
+	sculkCollisionFullOnce.Do(func() {
+		stateByIDOnce.Do(buildStateTable)
+		for id := range stateByIDTable {
+			boxes := BlockCollisionBoxes(uint16(id))
+			if len(boxes) == 1 &&
+				boxes[0].MinX == 0 && boxes[0].MinY == 0 && boxes[0].MinZ == 0 &&
+				boxes[0].MaxX == 1 && boxes[0].MaxY == 1 && boxes[0].MaxZ == 1 {
+				sculkCollisionFullTable[id] = true
+			}
+		}
+	})
+	return int(state) < totalBlockStates && sculkCollisionFullTable[state]
 }
 
 func isSculkBehaviourBlock(state uint16) bool {

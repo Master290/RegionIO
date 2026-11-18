@@ -13,9 +13,9 @@ func (r *decorationRegion) placeUnderwaterMagma(random worldgen.RandomSource, or
 	}
 	placed := false
 	radius := config.PlacementRadiusAroundFloor
-	for x := origin.X - radius; x <= origin.X+radius; x++ {
+	for z := origin.Z - radius; z <= origin.Z+radius; z++ {
 		for y := floorY - radius; y <= floorY+radius; y++ {
-			for z := origin.Z - radius; z <= origin.Z+radius; z++ {
+			for x := origin.X - radius; x <= origin.X+radius; x++ {
 				if random.NextFloat() >= config.PlacementProbability || !r.validUnderwaterMagmaPosition(x, y, z) {
 					continue
 				}

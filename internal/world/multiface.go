@@ -164,7 +164,7 @@ func (r *decorationRegion) multifaceStateForPlacement(blockName string, currentS
 				props[k] = v
 			}
 		}
-	} else if currentState == StateWater {
+	} else if hasWaterSourceFluid(currentState) {
 		props["waterlogged"] = "true"
 	}
 	props[dir.name] = "true"
@@ -347,7 +347,7 @@ func (r *decorationRegion) multifaceStateCanBeReplaced(set *worldgen.FeatureSet,
 				return false
 			}
 		}
-		if isLavaState(targetState) {
+		if stateFlags(targetState)&flagFluid != 0 && !hasWaterSourceFluid(targetState) {
 			return false
 		}
 		if name, ok := stateByID(targetState); ok {
@@ -413,4 +413,25 @@ func isBlockNamed(state uint16, want string) bool {
 func multifaceHasFace(state uint16, face string) bool {
 	name, ok := stateByID(state)
 	return ok && name.Properties[face] == "true"
+}
+
+func hasWaterSourceFluid(state uint16) bool {
+	if state == StateWater {
+		return true
+	}
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	if info.Properties["waterlogged"] == "true" {
+		return true
+	}
+	switch info.Name {
+	case "minecraft:water":
+		return info.Properties["level"] == "" || info.Properties["level"] == "0"
+	case "minecraft:bubble_column", "minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:seagrass", "minecraft:tall_seagrass":
+		return true
+	}
+	return false
 }

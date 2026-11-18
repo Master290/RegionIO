@@ -105,6 +105,7 @@ type Aquifer struct {
 	od     *OverworldDensity
 	global FluidPicker
 
+	firstNoiseX, firstNoiseZ        int
 	minGridX, minGridY, minGridZ    int
 	gridSizeX, gridSizeY, gridSizeZ int
 
@@ -148,6 +149,8 @@ func NewAquifer(od *OverworldDensity, chunkX, chunkZ int, picker FluidPicker) *A
 	a := aquiferPool.Get().(*Aquifer)
 	a.od = od
 	a.global = picker
+	a.firstNoiseX = chunkX * 4
+	a.firstNoiseZ = chunkZ * 4
 	a.minGridX = aquiferGridX(minBlockX - 5)
 	maxGridX := aquiferGridX(maxBlockX-5) + 1
 	a.gridSizeX = maxGridX - a.minGridX + 1
@@ -400,12 +403,12 @@ func adjustSurfaceLevel(preliminarySurfaceLevel int) int { return preliminarySur
 // floodedness noise says "fully flooded", a randomised low one when it says
 // "partially", and nothing at all otherwise — which is what leaves caves dry.
 func (a *Aquifer) computeSurfaceLevel(x, y, z int, global FluidStatus, lowestPreliminarySurface int, surfaceAtCentreIsUnderFluid bool) int {
-	ctx := FunctionContext{X: float64(x), Y: float64(y), Z: float64(z)}
 	var partiallyFloodedness, fullyFloodedness float64
-	if a.isDeepDarkRegion(ctx) {
+	if a.isDeepDarkRegion(x, y, z) {
 		// The deep dark is never flooded.
 		partiallyFloodedness, fullyFloodedness = -1.0, -1.0
 	} else {
+		ctx := FunctionContext{X: float64(x), Y: float64(y), Z: float64(z)}
 		distanceBelowSurface := lowestPreliminarySurface + 8 - y
 		floodednessFactor := 0.0
 		if surfaceAtCentreIsUnderFluid {
@@ -457,11 +460,22 @@ func (a *Aquifer) computeFluidType(x, y, z int, global FluidStatus, fluidSurface
 	return global.Type
 }
 
-// isDeepDarkRegion is OverworldBiomeBuilder.isDeepDarkRegion.
-func (a *Aquifer) isDeepDarkRegion(ctx FunctionContext) bool {
+// isDeepDarkRegion is OverworldBiomeBuilder.isDeepDarkRegion evaluated through
+// NoiseChunk's wrapped NoiseRouter: inside the chunk's 5x5 quart FlatCache
+// window [firstNoiseX..firstNoiseX+4] x [firstNoiseZ..firstNoiseZ+4], flat_cache
+// nodes (erosion and the offset term of depth) read quart-aligned X/Z while
+// depth's y_clamped_gradient still uses exact Y.
+func (a *Aquifer) isDeepDarkRegion(x, y, z int) bool {
 	if a.od.Erosion == nil || a.od.Depth == nil {
 		return false
 	}
+	qx, qz := x>>2, z>>2
+	fx, fz := float64(x), float64(z)
+	if qx >= a.firstNoiseX && qx <= a.firstNoiseX+4 &&
+		qz >= a.firstNoiseZ && qz <= a.firstNoiseZ+4 {
+		fx, fz = float64(qx<<2), float64(qz<<2)
+	}
+	ctx := FunctionContext{X: fx, Y: float64(y), Z: fz}
 	return a.od.Erosion.Compute(ctx) < deepDarkErosionMax && a.od.Depth.Compute(ctx) > deepDarkDepthMin
 }
 

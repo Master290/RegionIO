@@ -60,6 +60,9 @@ type decorationRegion struct {
 	deferredOceanRuinWritten [][3]int
 	pendingOceanRuins        []*pendingOceanRuinBatch
 	placedOceanRuinChunks    map[[2]int32]bool
+	deferAncientCities       bool
+	pendingAncientCities     []*JigsawStart
+	placedAncientCityChunks  map[[2]int32]bool
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
@@ -187,6 +190,9 @@ func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
 	}
 	clearOverwrittenBlockEntity(chunk, x, y, z, state)
 	chunk.SetBlock(x&15, y, z&15, state)
+	if isPostProcessAboveBlock(state) {
+		r.markForPostProcessing(x, y+1, z)
+	}
 	return true
 }
 
@@ -204,7 +210,15 @@ func (r *decorationRegion) setBlockGlobal(x, y, z int, state uint16) bool {
 	}
 	clearOverwrittenBlockEntity(chunk, x, y, z, state)
 	chunk.SetBlock(x&15, y, z&15, state)
+	if isPostProcessAboveBlock(state) {
+		r.markForPostProcessing(x, y+1, z)
+	}
 	return true
+}
+
+func isPostProcessAboveBlock(state uint16) bool {
+	info, ok := stateByID(state)
+	return ok && (info.Name == "minecraft:magma_block" || info.Name == "minecraft:soul_sand")
 }
 
 func clearOverwrittenBlockEntity(chunk *Chunk, x, y, z int, newState uint16) {
@@ -521,6 +535,16 @@ func (r *decorationRegion) runPostProcessing(set *worldgen.FeatureSet) {
 			}
 			if set != nil && !snowLayerCanSurviveOn(r.getBlock(x, y-1, z), set) {
 				r.setBlockGlobal(x, y, z, StateAir)
+			}
+		case canHoldBubbleColumn(cur) && y > MinY:
+			want := desiredBubbleColumnStateForBelow(r.getBlock(x, y-1, z))
+			if cur != want {
+				for ay := y; ay < MinY+WorldHeight; ay++ {
+					if !canHoldBubbleColumn(r.getBlock(x, ay, z)) {
+						break
+					}
+					r.setBlockGlobal(x, ay, z, want)
+				}
 			}
 		}
 	}

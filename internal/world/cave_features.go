@@ -53,7 +53,7 @@ func (r *decorationRegion) placeBlockColumn(random worldgen.RandomSource, positi
 	placed := false
 	for li, layer := range config.Layers {
 		for j := 0; j < heights[li]; j++ {
-			chosen, ok := layer.Provider.SampleState(random)
+			chosen, ok := layer.Provider.SampleStateAt(random, worldgen.FeaturePosition{X: x, Y: y, Z: z})
 			if !ok {
 				y += dy
 				continue
@@ -212,6 +212,26 @@ func (r *decorationRegion) placeFeatureRef(random worldgen.RandomSource, positio
 		return r.placeSeaPickle(random, position, config, set)
 	case "minecraft:bonus_chest":
 		return r.placeBonusChest(random, position)
+	case "minecraft:sculk_patch":
+		config, err := set.SculkPatch(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeSculkPatch(set, random, position, config)
+	case "minecraft:dripstone_cluster":
+		config, err := set.DripstoneCluster(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeDripstoneCluster(set, random, position, config)
+	case "minecraft:multiface_growth":
+		config, err := set.MultifaceGrowth(ref.Name)
+		if err != nil {
+			return false
+		}
+		return r.placeMultifaceGrowth(set, random, position, config)
+	case "minecraft:vines":
+		return r.placeVines(position)
 	}
 	noteNotReplayed("nested:" + configured.Type)
 	return false
@@ -274,14 +294,18 @@ func patchVegetationPosition(ground [3]int, direction int, waterlogged bool) wor
 // a water source in the cell itself) on top of the shared supports tag.
 func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePosition, name string, set *worldgen.FeatureSet) bool {
 	if name == "minecraft:small_dripleaf" {
-		if isWaterState(r.getBlock(position.X, position.Y, position.Z)) {
-			return true
+		if position.Y <= MinY {
+			return false
 		}
 		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
 		if !ok {
 			return false
 		}
-		return below.Name == "minecraft:clay" || below.Name == "minecraft:moss_block"
+		if flattenBlockTagContains(set, "minecraft:supports_small_dripleaf", below.Name) {
+			return true
+		}
+		return hasWaterSourceFluid(r.getBlock(position.X, position.Y, position.Z)) &&
+			flattenBlockTagContains(set, "minecraft:supports_vegetation", below.Name)
 	}
 	if name == "minecraft:spore_blossom" {
 		if position.Y >= MinY+WorldHeight-1 {

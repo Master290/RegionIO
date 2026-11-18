@@ -71,7 +71,16 @@ const dataVersion26 = 4790
 // SHAPE_CHECK_BLOCKS fence post-processing, and OceanRuinPieces per-chunk
 // StructureTemplate rotation/waterlogging, chest step-4 LootTableSeed, and
 // ProtoChunkTicks delay-0 block/fluid/falling-block physics (vanilla 26.1.2).
-const generatorVersion = 62
+// Version 63: Cave biome (lush_caves, dripstone_caves, deep_dark) and ancient_city
+// generation parity: jigsaw feature_pool_element source-chunk write-guard binding
+// and sculk_patch/dripstone/vegetation dispatch, step-7 ancient_city deferral
+// before underground_decoration, SculkPatchFeature collision-full-block substrate
+// check, MultifaceBlock water-source fluid replacement/waterlogging, 26.1.2
+// SmallDripleafBlock survival tags, BlockColumn position-aware state providers,
+// UnderwaterMagmaFeature betweenClosedStream Z-Y-X order, Blocks::postProcessAbove
+// bubble-column propagation for magma_block/soul_sand, and NoiseChunk$FlatCache
+// quart-alignment in Aquifer.isDeepDarkRegion (vanilla 26.1.2).
+const generatorVersion = 63
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

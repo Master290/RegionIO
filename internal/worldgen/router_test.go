@@ -97,3 +97,52 @@ func TestPositionalRandomAt(t *testing.T) {
 		t.Error("ore and aquifer factories share a stream")
 	}
 }
+
+type fnDensity func(FunctionContext) float64
+
+func (f fnDensity) Compute(c FunctionContext) float64 { return f(c) }
+
+// TestAquiferDeepDarkFlatCacheQuartAlignment verifies NoiseChunk$FlatCache
+// quart-alignment for block X/Z inside the chunk's 5x5 quart cache window,
+// exact Y preservation for Depth, and exact X/Z fallback outside the window.
+func TestAquiferDeepDarkFlatCacheQuartAlignment(t *testing.T) {
+	od, err := LoadOverworldFinalDensity(12345)
+	if err != nil {
+		t.Fatalf("LoadOverworldFinalDensity: %v", err)
+	}
+	aq := NewAquifer(od, -134, 158, OverworldFluidPicker(63))
+	defer ReleaseAquifer(aq)
+	if aq.firstNoiseX != -536 || aq.firstNoiseZ != 632 {
+		t.Fatalf("firstNoise = (%d,%d), want (-536,632)", aq.firstNoiseX, aq.firstNoiseZ)
+	}
+
+	synth := &Aquifer{
+		firstNoiseX: 8,
+		firstNoiseZ: 12,
+		od: &OverworldDensity{
+			Erosion: fnDensity(func(c FunctionContext) float64 {
+				if int(c.X)&3 == 0 && int(c.Z)&3 == 0 {
+					return -0.5 // < deepDarkErosionMax
+				}
+				return 0.0
+			}),
+			Depth: fnDensity(func(c FunctionContext) float64 {
+				if int(c.Y) == -40 {
+					return 1.2 // > deepDarkDepthMin
+				}
+				return 0.0
+			}),
+		},
+	}
+
+	if !synth.isDeepDarkRegion(35, -40, 51) {
+		t.Errorf("isDeepDarkRegion(35,-40,51) = false, want true inside 5x5 quart FlatCache window")
+	}
+	if synth.isDeepDarkRegion(35, 10, 51) {
+		t.Errorf("isDeepDarkRegion(35,10,51) = true, want false when exact Y fails depth threshold")
+	}
+	if synth.isDeepDarkRegion(53, -40, 51) {
+		t.Errorf("isDeepDarkRegion(53,-40,51) = true, want false outside 5x5 quart FlatCache window")
+	}
+}
+
