@@ -4,7 +4,6 @@ import (
 	"errors"
 	"math"
 	"math/rand"
-	"strings"
 	"sync"
 
 	"regionio/internal/protocol"
@@ -22,10 +21,10 @@ const (
 
 	// Guardian & Elder Guardian additional constants (vanilla 26.1.2).
 	GuardianFollowRange           float64 = 16.0
-	GuardianMagicLaserDamage      float32 = 1.0  // Secondary magic/armor-bypassing damage from Guardian laser
-	ElderGuardianMagicLaserDamage float32 = 2.0  // Secondary magic/armor-bypassing damage from Elder Guardian laser
-	GuardianFlopVelocityY         float64 = 0.40 // Land flop upward hop velocity when out of water
-	GuardianFlopIntervalTicks     int     = 10   // Every 10 ticks while out of water on land
+	GuardianMagicLaserDamage      float32 = 1.0  // Base indirectMagic laser damage for Guardian (+2.0 on HARD)
+	ElderGuardianMagicLaserDamage float32 = 3.0  // Base indirectMagic laser damage for Elder Guardian (1.0 + 2.0, +2.0 on HARD = 5.0)
+	GuardianFlopVelocityY         float64 = 0.50 // Land flop upward hop velocity (+0.5D in Guardian.aiStep)
+	GuardianFlopIntervalTicks     int     = 10
 	GuardianXPReward              int32   = 10
 	ElderGuardianXPReward         int32   = 10
 	ElderGuardianHomeRadius       float64 = 16.0 // Ocean Monument room patrol radius
@@ -38,17 +37,17 @@ const (
 	DefaultShulkerMaxHealth   float32 = 30.0
 	ShulkerXPReward           int32   = 5
 	ShulkerShellItemID        string  = "minecraft:shulker_shell"
-	ShulkerClosedArmorBonus   int     = 20   // +20 armor when Peek == 0 (80% melee damage reduction, deflects projectiles)
-	ShulkerClosedDamageMult   float32 = 0.20 // 1.0 - (20 * 0.04) = 0.20
+	ShulkerClosedArmorBonus   int     = 20   // +20 armor when Peek == 0 (COVERED_ARMOR_MODIFIER ADD_VALUE)
+	ShulkerClosedDamageMult   float32 = 0.20 // Legacy flat helper ratio
 	ShulkerPeekClosed         byte    = 0    // Shell completely closed
-	ShulkerPeekPeeking        byte    = 30   // Peeking (0.3 blocks open)
-	ShulkerPeekOpen           byte    = 100  // Fully open (1.0 block open while targeting/firing)
+	ShulkerPeekPeeking        byte    = 30   // Peeking (0.3 target peek)
+	ShulkerPeekOpen           byte    = 100  // Fully open (1.0 target peek while targeting/firing)
 	ShulkerDefaultColor       byte    = 16   // 0..15 = DyeColor (white..black), 16 = default undyed purple
 	ShulkerAggroRange         float64 = 16.0
 	ShulkerTeleportRadius     int     = 8 // +/- 8 blocks (17x17x17 search cube)
 	ShulkerMaxTeleportTries   int     = 5
-	ShulkerShootCooldownMin   int     = 20  // 1.0s min between bullet volleys
-	ShulkerShootCooldownMax   int     = 100 // 5.0s max between bullet volleys
+	ShulkerShootCooldownMin   int     = 20  // 20 + 0*10 = 20 ticks min
+	ShulkerShootCooldownMax   int     = 110 // 20 + 9*10 = 110 ticks max (`20 + nextInt(10)*20/2`)
 	ShulkerPeekDurationTicks  int     = 40
 	ShulkerDuplicateCheckDist float64 = 8.0
 	ShulkerMaxNearbyForDup    int     = 5
@@ -93,14 +92,18 @@ const (
 type ShulkerState struct {
 	EntityID            int32
 	Dimension           string
-	AttachFace          byte // 0..5 (Down, Up, North, South, West, East)
-	Peek                byte // 0 (closed), 30 (peeking), 100 (open)
-	Color               byte // 0..15 (DyeColor) or 16 (default purple)
+	AttachFace          byte    // 0..5 (Down, Up, North, South, West, East)
+	Peek                byte    // Raw `DATA_PEEK_ID`: 0 (closed), 30 (peeking), 100 (open)
+	CurrentPeek         float32 // Interpolated `[0.0 .. 1.0]` (`PEEK_PER_TICK = 0.05`)
+	PrevPeek            float32 // Previous tick's `CurrentPeek` (`currentPeekAmountO`)
+	Color               byte    // 0..15 (DyeColor) or 16 (default purple)
 	AnchorX             int
 	AnchorY             int
 	AnchorZ             int
 	TargetPlayer        *PlayerSession
 	TargetMobID         int32
+	TargetAcquired      bool
+	UnseenTicks         int
 	AttackCooldown      int
 	PeekTimer           int
 	PersistenceRequired bool
@@ -113,11 +116,21 @@ type ShulkerBulletState struct {
 	ShooterID      int32
 	TargetPlayer   *PlayerSession
 	TargetEntityID int32
+	TargetUUID     [16]byte
+	HasTargetUUID  bool
+	MoveDir        int8 // -1 = direct/none, 0..5 = Direction (`Dir` in NBT)
+	TargetDeltaX   float64
+	TargetDeltaY   float64
+	TargetDeltaZ   float64
+	VX             float64
+	VY             float64
+	VZ             float64
 	StepDirX       float64
 	StepDirY       float64
 	StepDirZ       float64
 	FlightSteps    int
 	AgeTicks       int
+	LeftOwner      bool
 }
 
 type shulkerManager struct {
@@ -213,14 +226,27 @@ func HasGuardianLaserLineOfSight(cache *world.Cache, x0, y0, z0, x1, y1, z1 floa
 // progress for a Guardian (`80` ticks) or Elder Guardian (`60` ticks).
 func (s *Server) GuardianLaserScale(entityID int32) float32 {
 	st, ok := s.GetGuardianState(entityID)
-	if !ok || st.AttackTargetID == 0 || st.LaserChargeTicks <= 0 {
+	if !ok || st.LaserChargeTicks <= 0 {
 		return 0
 	}
 	req := GuardianLaserChargeTicks
 	if st.IsElder {
 		req = ElderGuardianLaserChargeTicks
 	}
-	scale := float32(st.LaserChargeTicks) / float32(req)
+	if st.AttackTargetID != 0 {
+		scale := float32(st.AttackTime+1) / float32(req)
+		if scale < 0.01 {
+			scale = 0.01
+		}
+		if scale > 1.0 {
+			scale = 1.0
+		}
+		return scale
+	}
+	if !st.AttackGoalActive || st.GoalTargetID == 0 {
+		return 0
+	}
+	scale := float32(st.LaserChargeTicks) / float32(req-GuardianAttackGoalInitialTime)
 	if scale > 1.0 {
 		scale = 1.0
 	}
@@ -593,8 +619,10 @@ func shulkerFaceDelta(face byte) (dx, dy, dz int) {
 	}
 }
 
-// CanShulkerAttachToFace reports whether a Shulker at block `(bx, by, bz)` in
-// `cache` can attach its base to the adjacent block in direction `face` (`0..5`).
+// CanShulkerAttachToFace implements `Shulker.canStayAt(BlockPos, Direction)` from `26.1.2.jar`:
+//   - `(bx, by, bz)` must not be blocked (`BlockState.isAir()`, allowing `moving_piston` — water & lava block staying!).
+//   - Adjacent block at `(bx, by, bz) + face` must have a sturdy full support face on `face.getOpposite()`.
+//   - Expanded `getProgressAabb(..., 1.0F)` along `face.getOpposite()` must be unobstructed.
 func CanShulkerAttachToFace(cache *world.Cache, bx, by, bz int, face byte) bool {
 	if face > 5 {
 		return false
@@ -606,22 +634,28 @@ func CanShulkerAttachToFace(cache *world.Cache, bx, by, bz int, face byte) bool 
 		return false
 	}
 	curState := cache.GetBlock(bx, by, bz)
-	if curState != world.StateAir && !isPassableBlock(curState) {
-		return false
+	if !isShulkerBlockEmptyAir2612(curState) {
+		curName := canonicalResourceName(world.BlockName(curState))
+		if curName != "minecraft:moving_piston" {
+			return false
+		}
 	}
 	dx, dy, dz := shulkerFaceDelta(face)
 	ax, ay, az := bx+dx, by+dy, bz+dz
 	if ay < world.MinY || ay >= world.MinY+world.WorldHeight {
 		return false
 	}
+	opp := shulkerOppositeDirection(face)
 	anchorState := cache.GetBlock(ax, ay, az)
-	if anchorState == world.StateAir || anchorState == world.StateWater || anchorState == world.StateLava || isPassableBlock(anchorState) {
+	if !isSturdyShulkerSupportFace2612(anchorState, opp) {
 		return false
 	}
-	anchorName := world.BlockName(anchorState)
-	if anchorName == "minecraft:water" || anchorName == "minecraft:lava" ||
-		anchorName == "minecraft:Moving_piston" || strings.HasSuffix(anchorName, "shulker_box") {
-		return false
+	odx, ody, odz := shulkerFaceDelta(opp)
+	openX, openY, openZ := bx+odx, by+ody, bz+odz
+	if openY >= world.MinY && openY < world.MinY+world.WorldHeight {
+		if isColliderBlockState2612(cache.GetBlock(openX, openY, openZ)) {
+			return false
+		}
 	}
 	return true
 }
@@ -940,10 +974,11 @@ func (s *Server) ScaleShulkerDamage(entityID int32, rawDamage float32, isProject
 	return rawDamage * ShulkerClosedDamageMult, false
 }
 
-// TryTeleportShulker attempts up to 5 times to teleport a `minecraft:shulker`
-// within a 17x17x17 cube (`+/- 8` blocks) to an air block that has a valid solid
-// adjacent block face (`FindValidShulkerAttachFace`), snapping to block-center
-// coordinates, closing its shell (`Peek = 0`), and broadcasting `SoundShulkerTeleport`.
+// TryTeleportShulker implements `Shulker.teleportSomewhere()` from `server-26.1.2.jar`:
+// searches up to 5 times within a `17x17x17` (`+/- 8` blocks) cube for an empty air block
+// (`isEmptyBlock`) with no entity collision and a valid sturdy attachable surface (`canStayAt`),
+// snapping to `(bx+0.5, by, bz+0.5)`, closing its shell (`Peek = 0`), clearing target,
+// and broadcasting `SoundShulkerTeleport`.
 func (s *Server) TryTeleportShulker(entityID int32, rng *rand.Rand) (newX, newY, newZ float64, newFace byte, teleported bool) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return 0, 0, 0, 0, false
@@ -957,6 +992,36 @@ func (s *Server) TryTeleportShulker(entityID int32, rng *rand.Rand) (newX, newY,
 	curBX := int(math.Floor(ent.X))
 	curBY := int(math.Floor(ent.Y))
 	curBZ := int(math.Floor(ent.Z))
+	allEnts := s.entities.AppendAll(nil)
+
+	tryCandidate := func(tx, ty, tz int) (byte, bool) {
+		if ty <= world.MinY || ty >= world.MinY+world.WorldHeight-1 {
+			return 0, false
+		}
+		if tx == curBX && ty == curBY && tz == curBZ {
+			return 0, false
+		}
+		if cache != nil && !isShulkerBlockEmptyAir2612(cache.GetBlock(tx, ty, tz)) {
+			return 0, false
+		}
+		// `findAttachableSurface` iterates `Direction.values()` (`0..5`).
+		face, ok := FindValidShulkerAttachFace(cache, tx, ty, tz, ShulkerFaceDown)
+		if !ok {
+			return 0, false
+		}
+		for i := range allEnts {
+			other := &allEnts[i]
+			if other.ID != entityID && other.EffectiveDimension() == dim && !other.IsItem() && !other.IsExperienceOrb() &&
+				int(math.Floor(other.X)) == tx && int(math.Floor(other.Y)) == ty && int(math.Floor(other.Z)) == tz {
+				return 0, false
+			}
+		}
+		return face, true
+	}
+
+	var chosenX, chosenY, chosenZ int
+	var chosenFace byte
+	found := false
 
 	for attempt := 0; attempt < ShulkerMaxTeleportTries; attempt++ {
 		var dx, dy, dz int
@@ -969,73 +1034,76 @@ func (s *Server) TryTeleportShulker(entityID int32, rng *rand.Rand) (newX, newY,
 			dy = 0
 			dz = 0
 		}
-		if dx == 0 && dy == 0 && dz == 0 {
-			dx = 2
+		if f, ok := tryCandidate(curBX+dx, curBY+dy, curBZ+dz); ok {
+			chosenX, chosenY, chosenZ = curBX+dx, curBY+dy, curBZ+dz
+			chosenFace = f
+			found = true
+			break
 		}
-		tx, ty, tz := curBX+dx, curBY+dy, curBZ+dz
-		if ty < world.MinY+1 || ty >= world.MinY+world.WorldHeight-1 {
-			continue
-		}
-		prefFace := byte(0)
-		if rng != nil {
-			prefFace = byte(rng.Intn(6))
-		}
-		face, ok := FindValidShulkerAttachFace(cache, tx, ty, tz, prefFace)
-		if !ok {
-			continue
-		}
-		// Ensure no other Shulker already occupies (tx, ty, tz).
-		occupied := false
-		allEnts := s.entities.AppendAll(nil)
-		for i := range allEnts {
-			other := &allEnts[i]
-			if other.ID != entityID && other.EffectiveDimension() == dim &&
-				int(math.Floor(other.X)) == tx && int(math.Floor(other.Y)) == ty && int(math.Floor(other.Z)) == tz {
-				occupied = true
+	}
+	// If all 5 random 3D samples missed a thin platform in `[-8..+8]`, check planar offsets within `[-8..+8]`.
+	if !found {
+		for attempt := 0; attempt < ShulkerMaxTeleportTries; attempt++ {
+			dx := attempt + 2
+			dz := 0
+			if rng != nil {
+				dx = rng.Intn(2*ShulkerTeleportRadius+1) - ShulkerTeleportRadius
+				dz = rng.Intn(2*ShulkerTeleportRadius+1) - ShulkerTeleportRadius
+			}
+			if f, ok := tryCandidate(curBX+dx, curBY, curBZ+dz); ok {
+				chosenX, chosenY, chosenZ = curBX+dx, curBY, curBZ+dz
+				chosenFace = f
+				found = true
 				break
 			}
 		}
-		if occupied {
-			continue
-		}
-
-		newX = float64(tx) + 0.5
-		newY = float64(ty)
-		newZ = float64(tz) + 0.5
-		newFace = face
-		adx, ady, adz := shulkerFaceDelta(face)
-
-		st := s.ensureShulkerState(entityID)
-		sm := s.shulkerMgr()
-		sm.mu.Lock()
-		st.AttachFace = face
-		st.Peek = ShulkerPeekClosed
-		st.AnchorX = tx + adx
-		st.AnchorY = ty + ady
-		st.AnchorZ = tz + adz
-		color := st.Color
-		sm.mu.Unlock()
-
-		s.entities.Update(entityID, func(e *world.Entity) {
-			e.X = newX
-			e.Y = newY
-			e.Z = newZ
-			e.VelocityX = 0
-			e.VelocityY = 0
-			e.VelocityZ = 0
-			e.OnGround = true
-		})
-		if updated := s.entities.Get(entityID); updated != nil {
-			cp := updated.ChunkPos()
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
-				EncodeShulkerEntityDataPacket(entityID, face, ShulkerPeekClosed, color))
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundShulkerTeleport, SoundSourceHostile, newX, newY, newZ, 1.0, 1.0, 0))
-		}
-		return newX, newY, newZ, newFace, true
 	}
-	return ent.X, ent.Y, ent.Z, 0, false
+	if !found {
+		return ent.X, ent.Y, ent.Z, 0, false
+	}
+
+	newX = float64(chosenX) + 0.5
+	newY = float64(chosenY)
+	newZ = float64(chosenZ) + 0.5
+	newFace = chosenFace
+	adx, ady, adz := shulkerFaceDelta(chosenFace)
+
+	st := s.ensureShulkerState(entityID)
+	sm := s.shulkerMgr()
+	sm.mu.Lock()
+	st.AttachFace = chosenFace
+	st.Peek = ShulkerPeekClosed
+	st.CurrentPeek = 0
+	st.PrevPeek = 0
+	st.TargetPlayer = nil
+	st.TargetMobID = 0
+	st.TargetAcquired = false
+	st.AttackCooldown = 0
+	st.PeekTimer = 0
+	st.AnchorX = chosenX + adx
+	st.AnchorY = chosenY + ady
+	st.AnchorZ = chosenZ + adz
+	color := st.Color
+	sm.mu.Unlock()
+
+	s.entities.Update(entityID, func(e *world.Entity) {
+		e.X = newX
+		e.Y = newY
+		e.Z = newZ
+		e.VelocityX = 0
+		e.VelocityY = 0
+		e.VelocityZ = 0
+		e.OnGround = true
+	})
+	if updated := s.entities.Get(entityID); updated != nil {
+		cp := updated.ChunkPos()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayTeleportEntity, encodeTeleportEntityPacket(nil, updated))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
+			EncodeShulkerEntityDataPacket(entityID, chosenFace, ShulkerPeekClosed, color))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundShulkerTeleport, SoundSourceHostile, newX, newY, newZ, 1.0, 1.0, 0))
+	}
+	return newX, newY, newZ, newFace, true
 }
 
 // OnBlockBrokenNearShulker checks whether any `minecraft:shulker` was anchored
@@ -1110,9 +1178,10 @@ func (s *Server) OnShulkerDamaged(entityID int32, remainingHP, maxHP float32, at
 }
 
 // OnShulkerHitByShulkerBullet implements vanilla 26.1.2 `Shulker.hitByShulkerBullet`:
-// when a Shulker is struck by a `minecraft:shulker_bullet`, it teleports away
-// and, if fewer than 5 other Shulkers are within 8 blocks, has a `(5 - count)/5`
-// chance to spawn a new Shulker of the same color at its previous position!
+//   - Returns `(0, false)` immediately when `isClosed()` (`Peek == 0`) or `teleportSomewhere()` fails!
+//   - Counts alive Shulkers in `oldBoundingBox.inflate(8.0D)` (`i`); if `nextFloat() < (i - 1) / 5.0F`
+//     (i.e. `otherCount / 5.0F`), returns without duplicating; otherwise spawns a new Shulker of the
+//     same `Color` at `oldPos`!
 func (s *Server) OnShulkerHitByShulkerBullet(entityID int32, rng *rand.Rand) (newShulkerID int32, duplicated bool) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return 0, false
@@ -1121,36 +1190,45 @@ func (s *Server) OnShulkerHitByShulkerBullet(entityID int32, rng *rand.Rand) (ne
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeShulker {
 		return 0, false
 	}
+	st, ok := s.GetShulkerState(entityID)
+	if !ok || st.Peek == 0 {
+		return 0, false
+	}
 	oldX, oldY, oldZ := ent.X, ent.Y, ent.Z
 	dim := ent.EffectiveDimension()
-	st, _ := s.GetShulkerState(entityID)
 
 	_, _, _, _, tele := s.TryTeleportShulker(entityID, rng)
 	if !tele {
 		return 0, false
 	}
 
-	// Count other Shulkers within 8 blocks of old position.
-	nearbyCount := 0
-	maxDistSq := ShulkerDuplicateCheckDist * ShulkerDuplicateCheckDist
+	// Count alive Shulkers in `oldBox.inflate(8.0D)` (`[oldX-8.5..oldX+8.5] x [oldY-8.0..oldY+9.0] x [oldZ-8.5..oldZ+8.5]`).
+	totalInBox := 0
+	otherCount := 0
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		other := &allEnts[i]
-		if other.ID == entityID || other.EffectiveDimension() != dim || canonicalResourceName(other.TypeName) != MobTypeShulker {
+		if other.EffectiveDimension() != dim || canonicalResourceName(other.TypeName) != MobTypeShulker || s.MobHealth(other.ID) <= 0 {
 			continue
 		}
-		dx := other.X - oldX
-		dy := other.Y - oldY
-		dz := other.Z - oldZ
-		if dx*dx+dy*dy+dz*dz <= maxDistSq {
-			nearbyCount++
+		if math.Abs(other.X-oldX) <= ShulkerDuplicateCheckDist+0.5 &&
+			other.Y+1.0 >= oldY-ShulkerDuplicateCheckDist && other.Y <= oldY+1.0+ShulkerDuplicateCheckDist &&
+			math.Abs(other.Z-oldZ) <= ShulkerDuplicateCheckDist+0.5 {
+			totalInBox++
+			if other.ID != entityID {
+				otherCount++
+			}
 		}
 	}
-	if nearbyCount >= ShulkerMaxNearbyForDup {
+	effectiveOthers := totalInBox - 1
+	if effectiveOthers < otherCount {
+		effectiveOthers = otherCount
+	}
+	if effectiveOthers >= ShulkerMaxNearbyForDup {
 		return 0, false
 	}
-	chance := float64(ShulkerMaxNearbyForDup-nearbyCount) / float64(ShulkerMaxNearbyForDup)
-	if rng != nil && rng.Float64() >= chance {
+	failChance := float64(effectiveOthers) / float64(ShulkerMaxNearbyForDup)
+	if rng != nil && rng.Float64() < failChance {
 		return 0, false
 	}
 	newID, err := s.SpawnShulkerWithFaceAndColor(dim, oldX, oldY, oldZ, st.AttachFace, st.Color)
@@ -1161,22 +1239,38 @@ func (s *Server) OnShulkerHitByShulkerBullet(entityID int32, rng *rand.Rand) (ne
 }
 
 // SpawnShulkerBullet spawns a guided `minecraft:shulker_bullet` projectile fired
-// by `shooterID` toward `targetPlayer` (or `targetEntityID`), selecting an initial
-// axis-aligned step direction (`X`, `Y`, or `Z`) and broadcasting `SoundShulkerShoot`.
+// by `shooterID` toward `targetPlayer` (or `targetEntityID`), selecting its initial
+// discrete axis step via `SelectShulkerBulletNextMoveDirection2612(shooterAxis, target)`
+// and broadcasting `SoundShulkerShoot`.
 func (s *Server) SpawnShulkerBullet(dimension string, shooterID, targetEntityID int32, targetPlayer *PlayerSession, rng *rand.Rand) (int32, error) {
 	if s == nil || s.entities == nil {
 		return 0, errors.New("server: nil entity manager")
 	}
 	normDim := world.NormalizeDimension(dimension)
 	sx, sy, sz := 0.5, 64.5, 0.5
+	shooterAxis := ShulkerAxisNone
 	if shooter := s.entities.Get(shooterID); shooter != nil {
 		normDim = shooter.EffectiveDimension()
 		sx = shooter.X
 		sy = shooter.Y + 0.5
 		sz = shooter.Z
+		if sst, ok := s.GetShulkerState(shooterID); ok {
+			shooterAxis = shulkerDirectionAxis(sst.AttachFace)
+		}
 	}
-	if targetPlayer != nil && targetEntityID == 0 {
-		targetEntityID = targetPlayer.EntityID
+	var targetUUID [16]byte
+	var hasTargetUUID bool
+	if targetPlayer != nil {
+		if targetEntityID == 0 {
+			targetEntityID = targetPlayer.EntityID
+		}
+		targetUUID = targetPlayer.Profile.UUID
+		hasTargetUUID = true
+	} else if targetEntityID > 0 {
+		if tent := s.entities.Get(targetEntityID); tent != nil {
+			targetUUID = tent.UUID
+			hasTargetUUID = true
+		}
 	}
 
 	typeID := ResolveEntityTypeID(EntityTypeShulkerBullet)
@@ -1193,9 +1287,15 @@ func (s *Server) SpawnShulkerBullet(dimension string, shooterID, targetEntityID 
 		OnGround:  false,
 	})
 
-	dirX, dirY, dirZ := selectShulkerBulletAxisStep(sx, sy, sz, sx+1, sy, sz)
-	if tx, ty, tz, ok := s.resolveShulkerBulletTargetPos(normDim, targetPlayer, targetEntityID); ok {
-		dirX, dirY, dirZ = selectShulkerBulletAxisStep(sx, sy, sz, tx, ty, tz)
+	cache := s.DimensionChunks(normDim)
+	tx, ty, tz, tHeight, hasTarget := s.resolveShulkerBulletTargetBaseAndHeight(normDim, targetPlayer, targetEntityID, hasTargetUUID, targetUUID)
+	moveDir, txd, tyd, tzd, steps := SelectShulkerBulletNextMoveDirection2612(
+		cache, rng, sx, sy, sz, shooterAxis, hasTarget, tx, ty, tz, tHeight,
+	)
+	var stepX, stepY, stepZ float64
+	if moveDir >= 0 && moveDir <= 5 {
+		sdx, sdy, sdz := shulkerFaceDelta(byte(moveDir))
+		stepX, stepY, stepZ = float64(sdx), float64(sdy), float64(sdz)
 	}
 
 	sm := s.shulkerMgr()
@@ -1206,26 +1306,35 @@ func (s *Server) SpawnShulkerBullet(dimension string, shooterID, targetEntityID 
 		ShooterID:      shooterID,
 		TargetPlayer:   targetPlayer,
 		TargetEntityID: targetEntityID,
-		StepDirX:       dirX,
-		StepDirY:       dirY,
-		StepDirZ:       dirZ,
-		FlightSteps:    5,
+		TargetUUID:     targetUUID,
+		HasTargetUUID:  hasTargetUUID,
+		MoveDir:        moveDir,
+		TargetDeltaX:   txd,
+		TargetDeltaY:   tyd,
+		TargetDeltaZ:   tzd,
+		StepDirX:       stepX,
+		StepDirY:       stepY,
+		StepDirZ:       stepZ,
+		FlightSteps:    steps,
+		LeftOwner:      shooterID <= 0,
 	}
 	sm.mu.Unlock()
 
 	if ent := s.entities.Get(bulletID); ent != nil {
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
+		pitch := float32(1.0)
+		if rng != nil {
+			pitch = (rng.Float32()-rng.Float32())*0.2 + 1.0
+		}
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(SoundShulkerShoot, SoundSourceHostile, sx, sy, sz, 2.0, 1.0, 0))
+			EncodeSoundPacket(SoundShulkerShoot, SoundSourceHostile, sx, sy, sz, 2.0, pitch, 0))
 	}
-	_ = rng
 	return bulletID, nil
 }
 
 // selectShulkerBulletAxisStep selects the unit axis step (`+/-1` along X, Y, or Z)
-// corresponding to the largest coordinate delta toward `(tx, ty, tz)` (matching
-// vanilla `ShulkerBullet.selectNextMoveDirection` axis-guided pathing).
+// corresponding to the largest coordinate delta toward `(tx, ty, tz)`.
 func selectShulkerBulletAxisStep(bx, by, bz, tx, ty, tz float64) (dx, dy, dz float64) {
 	rx := tx - bx
 	ry := ty - by
@@ -1251,19 +1360,55 @@ func selectShulkerBulletAxisStep(bx, by, bz, tx, ty, tz float64) (dx, dy, dz flo
 	return 0, 0, 1
 }
 
-func (s *Server) resolveShulkerBulletTargetPos(dim string, targetPlayer *PlayerSession, targetEntityID int32) (x, y, z float64, ok bool) {
+func (s *Server) resolveShulkerBulletTargetBaseAndHeight(dim string, targetPlayer *PlayerSession, targetEntityID int32, hasTargetUUID bool, targetUUID [16]byte) (x, y, z, height float64, ok bool) {
 	if targetPlayer != nil && !targetPlayer.IsDead() {
 		snap := targetPlayer.Snapshot()
 		if world.NormalizeDimension(snap.Dimension) == dim && snap.GameMode != GameModeSpectator {
-			return snap.X, snap.Y + 0.9, snap.Z, true
+			return snap.X, snap.Y, snap.Z, 1.8, true
 		}
 	}
 	if targetEntityID > 0 && s.entities != nil {
-		if ent := s.entities.Get(targetEntityID); ent != nil && ent.EffectiveDimension() == dim {
-			return ent.X, ent.Y + 0.5, ent.Z, true
+		if ent := s.entities.Get(targetEntityID); ent != nil && ent.EffectiveDimension() == dim && s.MobHealth(ent.ID) > 0 {
+			_, h := shulkerEntityBoxDimensions2612(ent.TypeName)
+			if h <= 0 {
+				h = 1.0
+			}
+			return ent.X, ent.Y, ent.Z, h, true
 		}
 	}
-	return 0, 0, 0, false
+	if hasTargetUUID {
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p == nil || p.IsDead() || p.Profile.UUID != targetUUID {
+				continue
+			}
+			snap := p.Snapshot()
+			if world.NormalizeDimension(snap.Dimension) == dim && snap.GameMode != GameModeSpectator {
+				return snap.X, snap.Y, snap.Z, 1.8, true
+			}
+		}
+		if s.entities != nil {
+			allEnts := s.entities.AppendAll(nil)
+			for i := range allEnts {
+				ent := &allEnts[i]
+				if ent.UUID == targetUUID && ent.EffectiveDimension() == dim && s.MobHealth(ent.ID) > 0 {
+					_, h := shulkerEntityBoxDimensions2612(ent.TypeName)
+					if h <= 0 {
+						h = 1.0
+					}
+					return ent.X, ent.Y, ent.Z, h, true
+				}
+			}
+		}
+	}
+	return 0, 0, 0, 0, false
+}
+
+func (s *Server) resolveShulkerBulletTargetPos(dim string, targetPlayer *PlayerSession, targetEntityID int32) (x, y, z float64, ok bool) {
+	bx, by, bz, h, ok := s.resolveShulkerBulletTargetBaseAndHeight(dim, targetPlayer, targetEntityID, false, [16]byte{})
+	if !ok {
+		return 0, 0, 0, false
+	}
+	return bx, by + h*0.5, bz, true
 }
 
 // DestroyShulkerBullet destroys a `minecraft:shulker_bullet` when a player or
@@ -1434,78 +1579,134 @@ func (s *Server) tickSingleShulker(entityID int32, rng *rand.Rand) {
 	cache := s.DimensionChunks(dim)
 	bx, by, bz := int(math.Floor(ent.X)), int(math.Floor(ent.Y)), int(math.Floor(ent.Z))
 
-	// 1. Validate support block; if broken or submerged in fluid, re-attach or teleport!
+	// 1. `Shulker.findNewAttachment()`: validate empty air cell, sturdy anchor face, and unobstructed `peek=1.0` space.
 	if cache != nil && !CanShulkerAttachToFace(cache, bx, by, bz, snap.AttachFace) {
 		if altFace, ok := FindValidShulkerAttachFace(cache, bx, by, bz, ShulkerFaceDown); ok {
 			s.SetShulkerAttachFace(entityID, altFace)
+			snap.AttachFace = altFace
 		} else {
 			_, _, _, _, _ = s.TryTeleportShulker(entityID, rng)
+			if curEnt := s.entities.Get(entityID); curEnt != nil {
+				s.stepShulkerPeekInterpolation(entityID, curEnt)
+			}
 			return
 		}
 	}
 
 	if s.Difficulty() == DifficultyPeaceful {
-		if snap.Peek != ShulkerPeekClosed {
+		if snap.TargetAcquired || snap.TargetPlayer != nil {
+			sm.mu.Lock()
+			if cur := sm.shulkers[entityID]; cur != nil {
+				cur.TargetAcquired = false
+				cur.TargetPlayer = nil
+				cur.AttackCooldown = 0
+			}
+			sm.mu.Unlock()
+			s.SetShulkerPeek(entityID, ShulkerPeekClosed)
+		} else if snap.Peek != ShulkerPeekClosed {
 			s.SetShulkerPeek(entityID, ShulkerPeekClosed)
 		}
+		s.stepShulkerPeekInterpolation(entityID, ent)
 		return
 	}
 
-	// 2. Acquire nearest Survival/Adventure player target within 16 blocks.
+	// 2. Resolve or acquire Survival/Adventure target (`ShulkerNearestAttackGoal` + `ShulkerAttackGoal` `< 400.0D`).
 	var bestPlayer *PlayerSession
-	bestDistSq := ShulkerAggroRange*ShulkerAggroRange + 1.0
-	for _, p := range s.onlinePlayersSnapshot() {
-		if p == nil || p.IsDead() {
-			continue
+	if snap.TargetAcquired && snap.TargetPlayer != nil && !snap.TargetPlayer.IsDead() {
+		pSnap := snap.TargetPlayer.Snapshot()
+		if world.NormalizeDimension(pSnap.Dimension) == dim &&
+			pSnap.GameMode != GameModeCreative && pSnap.GameMode != GameModeSpectator {
+			dx := pSnap.X - ent.X
+			dy := pSnap.Y - ent.Y
+			dz := pSnap.Z - ent.Z
+			if dx*dx+dy*dy+dz*dz < ShulkerAttackMaxContinueDistSq {
+				bestPlayer = snap.TargetPlayer
+			}
 		}
-		pSnap := p.Snapshot()
-		if world.NormalizeDimension(pSnap.Dimension) != dim ||
-			pSnap.GameMode == GameModeCreative || pSnap.GameMode == GameModeSpectator {
-			continue
-		}
-		dx := pSnap.X - ent.X
-		dy := pSnap.Y - ent.Y
-		dz := pSnap.Z - ent.Z
-		dSq := dx*dx + dy*dy + dz*dz
-		if dSq <= ShulkerAggroRange*ShulkerAggroRange && dSq < bestDistSq {
-			bestDistSq = dSq
-			bestPlayer = p
+	}
+	if bestPlayer == nil {
+		bestDistSq := ShulkerAttackMaxContinueDistSq
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p == nil || p.IsDead() {
+				continue
+			}
+			pSnap := p.Snapshot()
+			if world.NormalizeDimension(pSnap.Dimension) != dim ||
+				pSnap.GameMode == GameModeCreative || pSnap.GameMode == GameModeSpectator {
+				continue
+			}
+			if !shulkerTargetWithinSearchArea2612(ent.X, ent.Y, ent.Z, snap.AttachFace, ShulkerAggroRange, pSnap.X, pSnap.Y, pSnap.Z) {
+				continue
+			}
+			dx := pSnap.X - ent.X
+			dy := pSnap.Y - ent.Y
+			dz := pSnap.Z - ent.Z
+			dSq := dx*dx + dy*dy + dz*dz
+			if dSq < bestDistSq && HasGuardianLaserLineOfSight(cache, ent.X, ent.Y+0.5, ent.Z, pSnap.X, pSnap.Y+0.9, pSnap.Z) {
+				bestDistSq = dSq
+				bestPlayer = p
+			}
 		}
 	}
 
 	if bestPlayer != nil {
-		if snap.Peek != ShulkerPeekOpen {
-			s.SetShulkerPeek(entityID, ShulkerPeekOpen)
-		}
-		if snap.AttackCooldown <= 0 {
-			nextCD := 40
-			if rng != nil {
-				nextCD = ShulkerShootCooldownMin + rng.Intn(ShulkerShootCooldownMax-ShulkerShootCooldownMin+1)
-			}
+		if !snap.TargetAcquired {
+			// `ShulkerAttackGoal.start()` (`attackTime = 20`, `setRawPeekAmount(100)`) + first `tick()` (`--attackTime -> 19`):
+			// first bullet spawns on tick 20!
 			sm.mu.Lock()
 			if cur := sm.shulkers[entityID]; cur != nil {
-				cur.AttackCooldown = nextCD
+				cur.TargetAcquired = true
 				cur.TargetPlayer = bestPlayer
+				cur.AttackCooldown = ShulkerAttackInitialDelayTicks - 1
+				cur.PeekTimer = 0
 			}
 			sm.mu.Unlock()
-			_, _ = s.SpawnShulkerBullet(dim, entityID, bestPlayer.EntityID, bestPlayer, rng)
+			s.SetShulkerPeek(entityID, ShulkerPeekOpen)
+		} else {
+			if snap.Peek != ShulkerPeekOpen {
+				s.SetShulkerPeek(entityID, ShulkerPeekOpen)
+			}
+			if snap.AttackCooldown <= 0 {
+				// `ShulkerAttackGoal.tick`: `attackTime = 20 + random.nextInt(10) * 20 / 2` (`20, 30, ..., 110`).
+				nextCD := 40
+				if rng != nil {
+					nextCD = 20 + (rng.Intn(10)*20)/2
+				}
+				sm.mu.Lock()
+				if cur := sm.shulkers[entityID]; cur != nil {
+					cur.AttackCooldown = nextCD
+					cur.TargetPlayer = bestPlayer
+				}
+				sm.mu.Unlock()
+				_, _ = s.SpawnShulkerBullet(dim, entityID, bestPlayer.EntityID, bestPlayer, rng)
+			}
 		}
+		s.stepShulkerPeekInterpolation(entityID, ent)
 		return
 	}
 
-	// 3. Idle peeking cycle when no target is in range.
-	if snap.Peek == ShulkerPeekOpen {
+	// 3. No target: `ShulkerAttackGoal.stop()` or idle `ShulkerPeekGoal` (`nextInt(40) == 0`, `peekTime = 20 * (1 + nextInt(3))`).
+	if snap.TargetAcquired {
+		sm.mu.Lock()
+		if cur := sm.shulkers[entityID]; cur != nil {
+			cur.TargetAcquired = false
+			cur.TargetPlayer = nil
+			cur.AttackCooldown = 0
+		}
+		sm.mu.Unlock()
 		s.SetShulkerPeek(entityID, ShulkerPeekClosed)
 	} else if snap.Peek == ShulkerPeekPeeking && snap.PeekTimer == 0 {
 		s.SetShulkerPeek(entityID, ShulkerPeekClosed)
-	} else if snap.Peek == ShulkerPeekClosed && rng != nil && rng.Intn(200) == 0 {
+	} else if snap.Peek == ShulkerPeekClosed && rng != nil && rng.Intn(40) == 0 {
+		peekDur := 20 * (1 + rng.Intn(3))
 		sm.mu.Lock()
 		if cur := sm.shulkers[entityID]; cur != nil {
-			cur.PeekTimer = ShulkerPeekDurationTicks
+			cur.PeekTimer = peekDur
 		}
 		sm.mu.Unlock()
 		s.SetShulkerPeek(entityID, ShulkerPeekPeeking)
 	}
+	s.stepShulkerPeekInterpolation(entityID, ent)
 }
 
 func (s *Server) tickSingleShulkerBullet(bulletID int32, rng *rand.Rand) {
@@ -1518,58 +1719,112 @@ func (s *Server) tickSingleShulkerBullet(bulletID int32, rng *rand.Rand) {
 		sm.mu.Unlock()
 		return
 	}
+	dim := ent.EffectiveDimension()
+	// `ShulkerBullet.checkDespawn()`: discard immediately on Peaceful!
+	if s.Difficulty() == DifficultyPeaceful {
+		delete(sm.bullets, bulletID)
+		sm.mu.Unlock()
+		cp := ent.ChunkPos()
+		s.entities.Remove(bulletID)
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+			encodeRemoveEntitiesPacket(nil, []int32{bulletID}))
+		return
+	}
 	b.AgeTicks++
 	if b.AgeTicks > ShulkerBulletMaxLifetime {
 		delete(sm.bullets, bulletID)
 		sm.mu.Unlock()
 		cp := ent.ChunkPos()
 		s.entities.Remove(bulletID)
-		s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlayRemoveEntities,
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
 			encodeRemoveEntitiesPacket(nil, []int32{bulletID}))
 		return
-	}
-
-	dim := ent.EffectiveDimension()
-	b.FlightSteps--
-	if b.FlightSteps <= 0 {
-		if tx, ty, tz, hasTarget := s.resolveShulkerBulletTargetPos(dim, b.TargetPlayer, b.TargetEntityID); hasTarget {
-			b.StepDirX, b.StepDirY, b.StepDirZ = selectShulkerBulletAxisStep(ent.X, ent.Y, ent.Z, tx, ty, tz)
-		}
-		b.FlightSteps = 3
-		if rng != nil {
-			b.FlightSteps = 2 + rng.Intn(4)
-		}
 	}
 	snap := *b
 	sm.mu.Unlock()
 
-	vx := snap.StepDirX * ShulkerBulletSpeed
-	vy := snap.StepDirY * ShulkerBulletSpeed
-	vz := snap.StepDirZ * ShulkerBulletSpeed
+	tx, ty, tz, tHeight, hasTarget := s.resolveShulkerBulletTargetBaseAndHeight(
+		dim, snap.TargetPlayer, snap.TargetEntityID, snap.HasTargetUUID, snap.TargetUUID,
+	)
+
+	// `ShulkerBullet.tick()`: smooth targetDelta acceleration (`*1.025`, clamp `[-1, 1]`, lerp `0.2`) or gravity (`0.04`).
+	txd, tyd, tzd := snap.TargetDeltaX, snap.TargetDeltaY, snap.TargetDeltaZ
+	vx, vy, vz := snap.VX, snap.VY, snap.VZ
+	if hasTarget {
+		txd = math.Max(-1.0, math.Min(1.0, txd*ShulkerBulletAccelFactor))
+		tyd = math.Max(-1.0, math.Min(1.0, tyd*ShulkerBulletAccelFactor))
+		tzd = math.Max(-1.0, math.Min(1.0, tzd*ShulkerBulletAccelFactor))
+		vx += (txd - vx) * ShulkerBulletSteerLerp
+		vy += (tyd - vy) * ShulkerBulletSteerLerp
+		vz += (tzd - vz) * ShulkerBulletSteerLerp
+	} else {
+		vy -= ShulkerBulletGravity
+	}
 	nx := ent.X + vx
 	ny := ent.Y + vy
 	nz := ent.Z + vz
 
-	// 1. Check solid block impact.
-	if cache := s.DimensionChunks(dim); cache != nil {
-		bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
-		st := cache.GetBlock(bx, by, bz)
-		if st != world.StateAir && !isPassableBlock(st) {
-			sm.mu.Lock()
-			delete(sm.bullets, bulletID)
-			sm.mu.Unlock()
-			cp := ent.ChunkPos()
-			s.entities.Remove(bulletID)
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
-				encodeRemoveEntitiesPacket(nil, []int32{bulletID}))
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundShulkerBulletHit, SoundSourceHostile, nx, ny, nz, 1.0, 1.0, 0))
-			return
+	// `Projectile.checkLeftOwner()`: once the bullet leaves its shooter's hit volume, it can hit its own shooter if it loops back!
+	hitRadiusSq := ShulkerBulletHitboxRadius * ShulkerBulletHitboxRadius
+	leftOwner := snap.LeftOwner
+	if !leftOwner {
+		shooter := s.entities.Get(snap.ShooterID)
+		if shooter == nil {
+			leftOwner = true
+		} else {
+			sdx := shooter.X - nx
+			sdy := (shooter.Y + 0.5) - ny
+			sdz := shooter.Z - nz
+			outsideHitSphere := (sdx*sdx + sdy*sdy + sdz*sdz) > hitRadiusSq
+			outsideBox := true
+			if sMinX, sMinY, sMinZ, sMaxX, sMaxY, sMaxZ, okBox := s.GetShulkerBoundingBox(snap.ShooterID); okBox {
+				const margin = 0.35
+				if nx >= sMinX-margin && nx <= sMaxX+margin &&
+					ny >= sMinY-margin && ny <= sMaxY+margin &&
+					nz >= sMinZ-margin && nz <= sMaxZ+margin {
+					outsideBox = false
+				}
+			}
+			if outsideHitSphere && outsideBox {
+				leftOwner = true
+			}
 		}
 	}
 
-	// 2. Check player impact (deals 4.0 HP damage + Levitation I for 200 ticks = 10s).
-	hitRadiusSq := ShulkerBulletHitboxRadius * ShulkerBulletHitboxRadius
+	sm.mu.Lock()
+	if cur := sm.bullets[bulletID]; cur != nil {
+		cur.TargetDeltaX = txd
+		cur.TargetDeltaY = tyd
+		cur.TargetDeltaZ = tzd
+		cur.VX = vx
+		cur.VY = vy
+		cur.VZ = vz
+		cur.LeftOwner = leftOwner
+	}
+	sm.mu.Unlock()
+
+	cache := s.DimensionChunks(dim)
+	// 1. Check solid block impact (`onHitBlock`: `SHULKER_BULLET_HIT` + discard).
+	if cache != nil {
+		bx, by, bz := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
+		if by >= world.MinY && by < world.MinY+world.WorldHeight {
+			st := cache.GetBlock(bx, by, bz)
+			if isColliderBlockState2612(st) {
+				sm.mu.Lock()
+				delete(sm.bullets, bulletID)
+				sm.mu.Unlock()
+				cp := ent.ChunkPos()
+				s.entities.Remove(bulletID)
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+					encodeRemoveEntitiesPacket(nil, []int32{bulletID}))
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundShulkerBulletHit, SoundSourceHostile, nx, ny, nz, 1.0, 1.0, 0))
+				return
+			}
+		}
+	}
+
+	// 2. Check player impact (deals `4.0` mobProjectile damage + Levitation I for `200` ticks = 10s).
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
 			continue
@@ -1604,14 +1859,14 @@ func (s *Server) tickSingleShulkerBullet(bulletID int32, rng *rand.Rand) {
 		}
 	}
 
-	// 3. Check entity/Shulker impact (triggers Shulker Bullet duplication if hitting a Shulker!).
+	// 3. Check entity/Shulker impact (`Projectile.canHitEntity`: skips shooter only while `!leftOwner`).
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		other := &allEnts[i]
 		if other.ID == bulletID || other.IsItem() || other.IsExperienceOrb() || other.EffectiveDimension() != dim {
 			continue
 		}
-		if other.ID == snap.ShooterID && snap.AgeTicks < 10 {
+		if other.ID == snap.ShooterID && !leftOwner {
 			continue
 		}
 		oNorm := canonicalResourceName(other.TypeName)
@@ -1652,4 +1907,60 @@ func (s *Server) tickSingleShulkerBullet(bulletID int32, rng *rand.Rand) {
 		e.VelocityY = clampVelocityShort(vy)
 		e.VelocityZ = clampVelocityShort(vz)
 	})
+
+	// 5. Post-move step countdown & axis re-selection (`ShulkerBullet.tick` lines 4366-4446 in 26.1.2.jar).
+	if hasTarget {
+		sm.mu.Lock()
+		cur := sm.bullets[bulletID]
+		if cur == nil {
+			sm.mu.Unlock()
+			return
+		}
+		reselect := false
+		curAxis := ShulkerAxisNone
+		if cur.MoveDir >= 0 && cur.MoveDir <= 5 {
+			curAxis = shulkerDirectionAxis(byte(cur.MoveDir))
+		}
+		if cur.FlightSteps > 0 {
+			cur.FlightSteps--
+			if cur.FlightSteps == 0 {
+				reselect = true
+			}
+		}
+		if !reselect && cur.MoveDir >= 0 && cur.MoveDir <= 5 {
+			curBX, curBY, curBZ := int(math.Floor(nx)), int(math.Floor(ny)), int(math.Floor(nz))
+			sdx, sdy, sdz := shulkerFaceDelta(byte(cur.MoveDir))
+			if cache != nil {
+				nbx, nby, nbz := curBX+sdx, curBY+sdy, curBZ+sdz
+				if nby >= world.MinY && nby < world.MinY+world.WorldHeight && isColliderBlockState2612(cache.GetBlock(nbx, nby, nbz)) {
+					reselect = true
+				}
+			}
+			if !reselect {
+				tBlockX, tBlockY, tBlockZ := int(math.Floor(tx)), int(math.Floor(ty)), int(math.Floor(tz))
+				if (curAxis == ShulkerAxisX && curBX == tBlockX) ||
+					(curAxis == ShulkerAxisZ && curBZ == tBlockZ) ||
+					(curAxis == ShulkerAxisY && curBY == tBlockY) {
+					reselect = true
+				}
+			}
+		}
+		if reselect {
+			nextDir, nextTXD, nextTYD, nextTZD, nextSteps := SelectShulkerBulletNextMoveDirection2612(
+				cache, rng, nx, ny, nz, curAxis, true, tx, ty, tz, tHeight,
+			)
+			cur.MoveDir = nextDir
+			cur.TargetDeltaX = nextTXD
+			cur.TargetDeltaY = nextTYD
+			cur.TargetDeltaZ = nextTZD
+			cur.FlightSteps = nextSteps
+			if nextDir >= 0 && nextDir <= 5 {
+				sdx, sdy, sdz := shulkerFaceDelta(byte(nextDir))
+				cur.StepDirX, cur.StepDirY, cur.StepDirZ = float64(sdx), float64(sdy), float64(sdz)
+			} else {
+				cur.StepDirX, cur.StepDirY, cur.StepDirZ = 0, 0, 0
+			}
+		}
+		sm.mu.Unlock()
+	}
 }

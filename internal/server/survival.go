@@ -2288,7 +2288,12 @@ func (s *Server) traceAndResolveProjectileShot(
 				if ent.EffectiveDimension() != dim {
 					continue
 				}
-				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.2 && ry <= ent.Y+2.0 && math.Abs(ent.Z-rz) <= 0.8 {
+				if math.Abs(ent.X-rx) <= 0.8 && ry >= ent.Y-0.5 && ry <= ent.Y+2.0 && math.Abs(ent.Z-rz) <= 0.8 {
+					if canonicalResourceName(ent.TypeName) == EntityTypeShulkerBullet {
+						s.DestroyShulkerBullet(ent.ID)
+						hitEntity = true
+						break
+					}
 					if ent.TypeName == EntityTypeArmorStand {
 						dmg := damage
 						if dmg <= 0 {

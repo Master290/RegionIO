@@ -60,8 +60,9 @@ func TestGuardianSwimmingLandFlopThornsAndLaserLineOfSight(t *testing.T) {
 		t.Fatalf("expected Guardian spikes to retaliate on attacking mob, retaliated=%v dealt=%v", mobRet, mobDealt)
 	}
 
-	// 4. Guardian targets Axolotl with laser beam and charges up (GuardianLaserScale 0 -> 1);
+	// 4. Guardian targets Axolotl (`distanceToSqr > 9.0D`) with laser beam and charges up (GuardianLaserScale 0 -> 1);
 	// placing a solid wall in between breaks line-of-sight and cancels the laser charge!
+	s.entities.Update(axolotlID, func(e *world.Entity) { e.X, e.Y, e.Z = 6.5, 62.0, 0.5 })
 	s.TickAquaticMobs(rng)
 	s.TickAquaticMobs(rng)
 	if scale := s.GuardianLaserScale(gID); scale <= 0 {

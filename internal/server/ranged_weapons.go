@@ -618,7 +618,7 @@ func (s *Server) resolveArrowTrajectory(
 				if ent.ID == snap.EntityID || ent.ID == projID || hitEntities[ent.ID] ||
 					ent.IsItem() || ent.IsExperienceOrb() ||
 					ent.TypeName == EntityTypeFireworkRocket || IsHangingEntity(ent.TypeName) ||
-					(IsStandardProjectileEntityType(ent.TypeName) && canonEntType != EntityTypeFireball) {
+					(IsStandardProjectileEntityType(ent.TypeName) && canonEntType != EntityTypeFireball && canonEntType != EntityTypeShulkerBullet) {
 					continue
 				}
 				if ent.EffectiveDimension() != dim {
@@ -633,9 +633,24 @@ func (s *Server) resolveArrowTrajectory(
 					minHitY = ent.Y - 1.0
 					maxHitY = ent.Y + 2.0
 					hitHalfW = 1.0
+				} else if canonEntType == EntityTypeShulkerBullet {
+					minHitY = ent.Y - 0.6
+					maxHitY = ent.Y + 0.8
+					hitHalfW = 0.8
 				}
 				if math.Abs(ent.X-rx) <= hitHalfW && ry >= minHitY && ry <= maxHitY && math.Abs(ent.Z-rz) <= hitHalfW {
 					hitEntities[ent.ID] = true
+					if canonEntType == EntityTypeShulkerBullet {
+						if s.DestroyShulkerBullet(ent.ID) {
+							consumedArrowOnHit = piercingLevel <= 0
+							entityHits++
+							if entityHits >= maxEntityHits {
+								landX, landY, landZ = rx, ry, rz
+								break
+							}
+							continue
+						}
+					}
 					if canonEntType == EntityTypeFireball {
 						if s.DeflectGhastFireballByProjectile2612(ent.ID, session, lx, ly, lz) {
 							consumedArrowOnHit = piercingLevel <= 0
@@ -679,6 +694,15 @@ func (s *Server) resolveArrowTrajectory(
 							entityHits = maxEntityHits
 							break
 						}
+					}
+					if normType == MobTypeShulker && s.IsShulkerClosed(ent.ID) {
+						// Vanilla 26.1.2 Shulker.hurtServer: `if (isClosed() && source.getDirectEntity() instanceof AbstractArrow) return false;`
+						cp := ent.ChunkPos()
+						s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+							EncodeSoundPacket(SoundShulkerHurtClosed, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+						entityHits = maxEntityHits
+						landX, landY, landZ = rx, ry, rz
+						break
 					}
 
 					kb := 0.3 + float64(punchLevel)*PunchKnockbackPerLvl
@@ -729,7 +753,10 @@ func (s *Server) resolveArrowTrajectory(
 			if IsCampfireBlock(hitState) && onFire {
 				s.TryIgniteCampfireWithProjectile(dim, bx, by, bz, true)
 			}
-			if !isPassableBlock(hitState) {
+			if hitState == world.StateWater || canonicalResourceName(world.BlockName(hitState)) == "minecraft:water" || canonicalResourceName(world.BlockName(hitState)) == "minecraft:bubble_column" {
+				onFire = false
+			}
+			if !isPassableBlock(hitState) && !isFluidProjectilePassable2612(hitState) {
 				shattered, targetPower := s.OnProjectileBlockImpact(dim, bx, by, bz, prevX, prevY, prevZ, rx, ry, rz, projID, arrowItemID)
 				if targetPower > 0 {
 					s.TriggerTargetHit(session, targetPower, math.Hypot(rx-startX, rz-startZ))
@@ -1579,7 +1606,7 @@ func (s *Server) resolveTridentTrajectory(
 				canonEntType := canonicalResourceName(ent.TypeName)
 				if ent.ID == snap.EntityID || ent.ID == projID || ent.IsItem() || ent.IsExperienceOrb() ||
 					ent.TypeName == EntityTypeFireworkRocket || IsHangingEntity(ent.TypeName) ||
-					(IsStandardProjectileEntityType(ent.TypeName) && canonEntType != EntityTypeFireball) {
+					(IsStandardProjectileEntityType(ent.TypeName) && canonEntType != EntityTypeFireball && canonEntType != EntityTypeShulkerBullet) {
 					continue
 				}
 				if ent.EffectiveDimension() != dim {
@@ -1594,10 +1621,18 @@ func (s *Server) resolveTridentTrajectory(
 					minHitY = ent.Y - 1.0
 					maxHitY = ent.Y + 2.0
 					hitHalfW = 1.0
+				} else if canonEntType == EntityTypeShulkerBullet {
+					minHitY = ent.Y - 0.6
+					maxHitY = ent.Y + 0.8
+					hitHalfW = 0.8
 				}
 				if math.Abs(ent.X-rx) <= hitHalfW && ry >= minHitY && ry <= maxHitY && math.Abs(ent.Z-rz) <= hitHalfW {
 					hitAnyEntity = true
 					landX, landY, landZ = rx, ry, rz
+					if canonEntType == EntityTypeShulkerBullet {
+						s.DestroyShulkerBullet(ent.ID)
+						break
+					}
 					if canonEntType == EntityTypeFireball {
 						s.DeflectGhastFireballByProjectile2612(ent.ID, session, lx, ly, lz)
 						break
@@ -1613,6 +1648,13 @@ func (s *Server) resolveTridentTrajectory(
 					normType := canonicalResourceName(ent.TypeName)
 					if normType == MobTypeEnderman {
 						s.TryEndermanDodgeProjectile(ent.ID, "minecraft:trident", nil)
+						break
+					}
+					if normType == MobTypeShulker && s.IsShulkerClosed(ent.ID) {
+						// ThrownTrident extends AbstractArrow -> 0 damage when Shulker isClosed()!
+						cp := ent.ChunkPos()
+						s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+							EncodeSoundPacket(SoundShulkerHurtClosed, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 						break
 					}
 					inWaterOrRain := s.IsEntityInWaterOrRainAt(dim, ent.X, ent.Y, ent.Z)
@@ -1655,7 +1697,7 @@ func (s *Server) resolveTridentTrajectory(
 					s.OnVillageBellRung(dim, bx, by, bz)
 				}
 			}
-			if !isPassableBlock(hitState) {
+			if !isPassableBlock(hitState) && !isFluidProjectilePassable2612(hitState) {
 				_, targetPower := s.OnProjectileBlockImpact(dim, bx, by, bz, prevX, prevY, prevZ, rx, ry, rz, projID, TridentItemID)
 				if targetPower > 0 {
 					s.TriggerTargetHit(session, targetPower, math.Hypot(rx-startX, rz-startZ))

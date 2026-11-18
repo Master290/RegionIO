@@ -194,7 +194,9 @@ func TestTurtleHomeBeachEggLayingIncubationSilkTouchAndBabyScute(t *testing.T) {
 func TestSquidAndGlowSquidInkCloudAndDarkTicks(t *testing.T) {
 	s := newSurvivalTestServer(t)
 	s.SetDifficulty(DifficultyNormal)
-	placeWaterColumnForAquaticTest(s, 0, 60, 64, 0)
+	for x := 0; x <= 8; x++ {
+		placeWaterColumnForAquaticTest(s, x, 60, 64, 0)
+	}
 
 	squidID, err := s.SpawnSquid(world.DimensionOverworld, 0.5, 62.0, 0.5)
 	if err != nil {
@@ -319,7 +321,9 @@ func TestFishSchoolingLandFlopPufferfishPoisonAndBuckets(t *testing.T) {
 func TestGuardianLaserThornsAndElderGuardianMiningFatigue(t *testing.T) {
 	s := newSurvivalTestServer(t)
 	s.SetDifficulty(DifficultyNormal)
-	placeWaterColumnForAquaticTest(s, 0, 60, 64, 0)
+	for x := 0; x <= 8; x++ {
+		placeWaterColumnForAquaticTest(s, x, 60, 64, 0)
+	}
 
 	gID, err := s.SpawnGuardian(world.DimensionOverworld, 0.5, 62.0, 0.5)
 	if err != nil {
@@ -337,7 +341,7 @@ func TestGuardianLaserThornsAndElderGuardianMiningFatigue(t *testing.T) {
 		t.Fatalf("DecodeGuardianDataPacket mismatch: id=%d moving=%v target=%d err=%v", decID, decMoving, decTarget, err)
 	}
 
-	raider := newBeeTestPlayer(t, s, "Raider", 4.5, 62.0, 0.5)
+	raider := newBeeTestPlayer(t, s, "Raider", 6.5, 62.0, 0.5)
 
 	// Stationary guardian has spikes extended -> melee attack triggers 2.0 HP Thorns retaliation.
 	hpBeforeThorns := raider.Snapshot().Health
@@ -356,10 +360,10 @@ func TestGuardianLaserThornsAndElderGuardianMiningFatigue(t *testing.T) {
 		t.Fatalf("unexpected Mining Fatigue effect from Elder Guardian: %+v has=%v", eff, hasEff)
 	}
 
-	// Laser beam charge (60 ticks for Elder Guardian, 80 ticks for Guardian) deals laser damage.
+	// Laser beam charge (10-tick windup from attackTime=-10 + 60 ticks for Elder Guardian, 80 ticks for Guardian) deals laser damage.
 	rng := rand.New(rand.NewSource(123))
 	hpBeforeLaser := raider.Snapshot().Health
-	for i := 0; i < ElderGuardianLaserChargeTicks+2; i++ {
+	for i := 0; i < 10+ElderGuardianLaserChargeTicks+2; i++ {
 		s.TickAquaticMobs(rng)
 	}
 	if raider.Snapshot().Health >= hpBeforeLaser {

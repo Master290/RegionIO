@@ -1630,11 +1630,6 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeShulker {
-		scaledDmg, deflected := s.ScaleShulkerDamage(target.ID, damage, false)
-		if deflected || scaledDmg <= 0 {
-			return 0, false
-		}
-		damage = scaledDmg
 		kbStrength = 0
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeCreaking {
@@ -1674,6 +1669,13 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 	}
 
 	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
+	if !killed {
+		normHit := canonicalResourceName(target.TypeName)
+		if normHit == MobTypeGuardian || normHit == MobTypeElderGuardian {
+			// Vanilla 26.1.2 Guardian.hurtServer: Thorns triggers ONLY on direct LivingEntity melee hits!
+			s.OnGuardianThornsRetaliateWithCause(target.ID, session, "player", true)
+		}
+	}
 
 	if isSweep {
 		var sweepLevel int32
@@ -1747,6 +1749,16 @@ func (s *Server) applyDamageToMob(
 				return false
 			}
 		}
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeShulker {
+		// Vanilla 26.1.2 Shulker: COVERED_ARMOR_MODIFIER (+20.0 ADD_VALUE on Attributes.ARMOR) when Peek == 0!
+		if armor := s.ShulkerArmorValue(target.ID); armor > 0 {
+			damage = DamageAfterArmor(damage, armor, 0)
+			if damage <= 0 {
+				return false
+			}
+		}
+		kbStrength = 0
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeWolf && s.HasWolfArmor(target.ID) {
 		if absorbed, _, _ := s.AbsorbWolfDamageWithArmor(target.ID, damage, false); absorbed {
@@ -1863,7 +1875,8 @@ func (s *Server) applyDamageToMob(
 		} else if normTarget == MobTypeSquid || normTarget == MobTypeGlowSquid {
 			s.OnSquidDamaged(target.ID, attacker)
 		} else if normTarget == MobTypeGuardian || normTarget == MobTypeElderGuardian {
-			s.OnGuardianThornsRetaliate(target.ID, attacker)
+			// Non-melee/indirect hits still trigger randomStrollGoal (`SwimTimer = 0`), while direct melee Thorns runs in AttackEntity!
+			s.OnGuardianThornsRetaliateWithCause(target.ID, attacker, "indirect", false)
 		} else if normTarget == MobTypeShulker {
 			s.OnShulkerDamaged(target.ID, newHP, DefaultShulkerMaxHealth, attacker, nil)
 		} else if normTarget == MobTypeRabbit {
@@ -1906,27 +1919,36 @@ func (s *Server) applyDamageToMob(
 			s.NotifyOwnerAttackedTarget(attacker, target.ID)
 		}
 		// Apply horizontal knockback step if walkable, and set velocity on entity.
-		curFeetY := int(math.Floor(target.Y + 0.01))
-		nextX := target.X + vx
+		// Shulker.setDeltaMovement is a no-op in vanilla 26.1.2 (and OnShulkerDamaged may have teleported it!).
+		nextX := target.X
 		nextY := target.Y
-		nextZ := target.Z + vz
-		if s.chunks != nil {
-			if nx, ny, nz, ok := tryApplyHorizontalStep(s.chunks, target.X, curFeetY, target.Z, nextX, nextZ); ok {
-				nextX, nextY, nextZ = nx, float64(ny), nz
-			} else {
-				nextX, nextZ = target.X, target.Z
+		nextZ := target.Z
+		if normTarget == MobTypeShulker {
+			if curEnt := s.entities.Get(target.ID); curEnt != nil {
+				nextX, nextY, nextZ = curEnt.X, curEnt.Y, curEnt.Z
 			}
+		} else {
+			curFeetY := int(math.Floor(target.Y + 0.01))
+			nextX = target.X + vx
+			nextZ = target.Z + vz
+			if s.chunks != nil {
+				if nx, ny, nz, ok := tryApplyHorizontalStep(s.chunks, target.X, curFeetY, target.Z, nextX, nextZ); ok {
+					nextX, nextY, nextZ = nx, float64(ny), nz
+				} else {
+					nextX, nextZ = target.X, target.Z
+				}
+			}
+			s.entities.Update(target.ID, func(e *world.Entity) {
+				e.X = nextX
+				e.Y = nextY
+				e.Z = nextZ
+				e.VelocityX = velX
+				e.VelocityY = velY
+				e.VelocityZ = velZ
+			})
+			s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlaySetEntityMotion,
+				EncodeSetEntityMotionPacket(target.ID, vx, vy, vz))
 		}
-		s.entities.Update(target.ID, func(e *world.Entity) {
-			e.X = nextX
-			e.Y = nextY
-			e.Z = nextZ
-			e.VelocityX = velX
-			e.VelocityY = velY
-			e.VelocityZ = velZ
-		})
-		s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlaySetEntityMotion,
-			EncodeSetEntityMotionPacket(target.ID, vx, vy, vz))
 		hurtSnd, hurtSrc := mobHurtSound(target.TypeName)
 		s.BroadcastChunk(chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 			EncodeSoundPacket(hurtSnd, hurtSrc, nextX, nextY, nextZ, 1.0, 1.0, 0))

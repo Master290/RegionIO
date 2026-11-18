@@ -115,7 +115,7 @@ const (
 	SalmonVariantLarge  = "large"
 
 	// Guardian & Elder Guardian constants (Guardian.java & ElderGuardian.java).
-	GuardianLaserRange                  float64 = 15.0
+	GuardianLaserRange                  float64 = 16.0 // Attributes.FOLLOW_RANGE = 16.0D
 	GuardianLaserChargeTicks            int     = 80   // 4 seconds (80 ticks) laser charge for Guardian
 	ElderGuardianLaserChargeTicks       int     = 60   // 3 seconds (60 ticks) laser charge for Elder Guardian
 	GuardianLaserDamage                 float32 = 6.0  // Base laser damage for Guardian
@@ -267,9 +267,14 @@ type GuardianBehaviorState struct {
 	EntityID            int32
 	IsElder             bool
 	Moving              bool
-	AttackTargetID      int32
+	AttackTargetID      int32 // Synced `DATA_ID_ATTACK_TARGET` (0 during -10..-1 windup, targetID at >= 0)
+	GoalTargetID        int32 // Internal `Mob.target` (`GuardianAttackGoal`)
+	AttackGoalActive    bool
+	AttackTime          int // `GuardianAttackGoal.attackTime` (`-10 .. getAttackDuration()`)
+	UnseenTargetTicks   int
 	LaserChargeTicks    int
 	FatigueCooldown     int
+	TickCount           int
 	OutOfWaterTicks     int
 	SwimTimer           int
 	SwimDirX            float64
@@ -281,6 +286,7 @@ type GuardianBehaviorState struct {
 	HomeZ               float64
 	HomeRadius          float64
 	PersistenceRequired bool
+	Silent              bool
 }
 
 // TurtleEggPlaceHook is an optional callback invoked when a pregnant turtle
@@ -1736,9 +1742,10 @@ func (s *Server) spawnGuardianInternal(dimension string, x, y, z float64, elder 
 	mgr := s.aquaticManager()
 	mgr.mu.Lock()
 	mgr.guardians[id] = &GuardianBehaviorState{
-		EntityID: id,
-		IsElder:  elder,
-		Moving:   false, // Stationary by default -> spikes extended!
+		EntityID:            id,
+		IsElder:             elder,
+		Moving:              false, // Stationary by default -> spikes extended!
+		PersistenceRequired: elder, // `ElderGuardian.<init>` calls `setPersistenceRequired()`
 	}
 	mgr.mu.Unlock()
 
@@ -1798,30 +1805,50 @@ func (s *Server) SetGuardianMoving(entityID int32, moving bool) bool {
 	return true
 }
 
-// OnGuardianThornsRetaliate applies `2.0 HP` spike retaliation damage to a melee
-// attacker when a `minecraft:guardian` or `minecraft:elder_guardian` is hit
-// while its spikes are extended (`!Moving`).
+// OnGuardianThornsRetaliate applies `2.0 HP` spike retaliation damage to a direct
+// LivingEntity melee attacker when a `minecraft:guardian` or `minecraft:elder_guardian`
+// is hit while its spikes are extended (`!Moving`).
 func (s *Server) OnGuardianThornsRetaliate(entityID int32, attacker *PlayerSession) (retaliated bool, dealt float32) {
-	if s == nil || attacker == nil || attacker.IsDead() {
+	return s.OnGuardianThornsRetaliateWithCause(entityID, attacker, "player", true)
+}
+
+// OnGuardianThornsRetaliateWithCause implements `Guardian.hurtServer` from `26.1.2.jar`:
+// retaliates for `2.0F` Thorns damage ONLY when `!isMoving()`, `!source.is(AVOIDS_GUARDIAN_THORNS)`,
+// `!source.is(THORNS)`, and `source.getDirectEntity() instanceof LivingEntity`, then triggers `randomStrollGoal`.
+func (s *Server) OnGuardianThornsRetaliateWithCause(
+	entityID int32,
+	attacker *PlayerSession,
+	damageCause string,
+	directEntityIsLiving bool,
+) (retaliated bool, dealt float32) {
+	if s == nil {
 		return false, 0
 	}
 	mgr := s.aquaticManager()
-	mgr.mu.RLock()
+	mgr.mu.Lock()
 	st := mgr.guardians[entityID]
 	spikesExtended := st != nil && !st.Moving
-	mgr.mu.RUnlock()
-	if !spikesExtended {
+	if st != nil {
+		// `Guardian.hurtServer`: `if (this.randomStrollGoal != null) this.randomStrollGoal.trigger();`
+		st.SwimTimer = 0
+	}
+	mgr.mu.Unlock()
+	if !spikesExtended || attacker == nil || attacker.IsDead() {
+		return false, 0
+	}
+	if AvoidsGuardianThorns2612(damageCause, directEntityIsLiving) {
 		return false, 0
 	}
 	dealt = s.DamagePlayerWithArmor(attacker, GuardianThornsDamage, "thorns")
 	return dealt > 0, dealt
 }
 
-// ApplyElderGuardianMiningFatigueAura checks all survival/adventure players
-// within `ElderGuardianFatigueRadius` (`50` blocks) of Elder Guardian `entityID`
-// and applies `EffectMiningFatigue` III (`Amplifier = 2`, `Duration = 6000` ticks
-// = 5 minutes) + `SoundElderGuardianCurse` to any player who does not already
-// have Mining Fatigue III with `> 1200` ticks remaining.
+// ApplyElderGuardianMiningFatigueAura implements `ElderGuardian.customServerAiStep` +
+// `MobEffectUtil.addEffectToPlayersAround` from `server-26.1.2.jar`:
+// checks all Survival/Adventure players within `50.0` blocks of Elder Guardian `entityID`
+// and applies `Mining Fatigue III` (`Amplifier = 2`, `Duration = 6000` ticks = 5 minutes) +
+// `ClientboundGameEventPacket(GUARDIAN_ELDER_EFFECT = 10, isSilent ? 0.0F : 1.0F)` to any player
+// who does not have `MINING_FATIGUE`, has `amplifier < 2`, or `endsWithin(1199)` (`duration < 1200`).
 func (s *Server) ApplyElderGuardianMiningFatigueAura(entityID int32) (affectedPlayers int) {
 	if s == nil || s.entities == nil || s.Difficulty() == DifficultyPeaceful {
 		return 0
@@ -1830,8 +1857,15 @@ func (s *Server) ApplyElderGuardianMiningFatigueAura(entityID int32) (affectedPl
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeElderGuardian {
 		return 0
 	}
+	mgr := s.aquaticManager()
+	mgr.mu.RLock()
+	st := mgr.guardians[entityID]
+	silent := st != nil && st.Silent
+	mgr.mu.RUnlock()
+
 	dim := ent.EffectiveDimension()
 	maxDistSq := ElderGuardianFatigueRadius * ElderGuardianFatigueRadius
+	gameEvPkt := EncodeGuardianElderEffectGameEvent(silent)
 
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
@@ -1841,23 +1875,29 @@ func (s *Server) ApplyElderGuardianMiningFatigueAura(entityID int32) (affectedPl
 		if world.NormalizeDimension(snap.Dimension) != dim {
 			continue
 		}
-		if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
+		if snap.GameMode != GameModeSurvival && snap.GameMode != GameModeAdventure {
 			continue
 		}
 		dx := snap.X - ent.X
 		dy := snap.Y - ent.Y
 		dz := snap.Z - ent.Z
-		if dx*dx+dy*dy+dz*dz > maxDistSq {
+		if dx*dx+dy*dy+dz*dz >= maxDistSq {
 			continue
 		}
-		if inst, has := p.PlayerEffect(EffectMiningFatigue); has && inst.Amplifier >= ElderGuardianFatigueAmplifier && inst.Duration > 1200 {
+		// `MobEffectUtil.addEffectToPlayersAround`: skip only when `amplifier >= 2 && !endsWithin(1200 - 1)` (`duration >= 1200`).
+		if inst, has := p.PlayerEffect(EffectMiningFatigue); has && inst.Amplifier >= ElderGuardianFatigueAmplifier && inst.Duration >= 1200 {
 			continue
 		}
 		s.ApplyPlayerEffect(p, NewStatusEffectInstance(EffectMiningFatigue, ElderGuardianFatigueDurationTicks, ElderGuardianFatigueAmplifier))
-		cx := int32(int(math.Floor(snap.X)) >> 4)
-		cz := int32(int(math.Floor(snap.Z)) >> 4)
-		s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
-			EncodeSoundPacket(SoundElderGuardianCurse, SoundSourceHostile, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+		if p.send != nil {
+			_ = p.send(protocol.PlayGameEvent, gameEvPkt)
+		}
+		if !silent {
+			cx := int32(int(math.Floor(snap.X)) >> 4)
+			cz := int32(int(math.Floor(snap.Z)) >> 4)
+			s.BroadcastDimensionChunk(dim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundElderGuardianCurse, SoundSourceHostile, snap.X, snap.Y, snap.Z, 1.0, 1.0, 0))
+		}
 		affectedPlayers++
 	}
 	return affectedPlayers
@@ -2402,16 +2442,27 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 			continue
 		}
 		dim := ent.EffectiveDimension()
+		cache := s.DimensionChunks(dim)
+
 		mgr.mu.Lock()
 		st := mgr.guardians[id]
 		if st == nil {
 			mgr.mu.Unlock()
 			continue
 		}
+		st.TickCount++
 		isElder := st.IsElder
 		if isElder {
+			// `ElderGuardian.customServerAiStep`: `if (!this.hasHome()) this.setHomeTo(this.blockPosition(), 16);`
+			if !st.HasHome {
+				st.HasHome = true
+				st.HomeX = math.Floor(ent.X) + 0.5
+				st.HomeY = math.Floor(ent.Y)
+				st.HomeZ = math.Floor(ent.Z) + 0.5
+				st.HomeRadius = ElderGuardianHomeRadius
+			}
 			if st.FatigueCooldown <= 0 {
-				st.FatigueCooldown = ElderGuardianFatigueIntervalTicks
+				st.FatigueCooldown = ElderGuardianFatigueIntervalTicks - 1
 				mgr.mu.Unlock()
 				s.ApplyElderGuardianMiningFatigueAura(id)
 				mgr.mu.Lock()
@@ -2424,79 +2475,127 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 				st.FatigueCooldown--
 			}
 		}
+		curGoalTargetID := st.GoalTargetID
+		goalWasActive := st.AttackGoalActive
 		mgr.mu.Unlock()
 
 		if peaceful {
 			continue
 		}
 
-		// Find nearest valid target (survival/adventure player, squid/glow_squid, or axolotl)
-		// within 15 blocks with unobstructed line-of-sight.
-		cache := s.DimensionChunks(dim)
-		maxDistSq := GuardianLaserRange * GuardianLaserRange
-		var bestPlayer *PlayerSession
-		var bestSquid *world.Entity
-		bestDistSq := maxDistSq
-
-		for _, p := range s.onlinePlayersSnapshot() {
-			if p == nil || p.IsDead() {
-				continue
-			}
-			snap := p.Snapshot()
-			if world.NormalizeDimension(snap.Dimension) != dim {
-				continue
-			}
-			if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
-				continue
-			}
-			dx := snap.X - ent.X
-			dy := snap.Y - ent.Y
-			dz := snap.Z - ent.Z
-			dSq := dx*dx + dy*dy + dz*dz
-			if dSq <= bestDistSq && HasGuardianLaserLineOfSight(cache, ent.X, ent.Y+0.425, ent.Z, snap.X, snap.Y+0.9, snap.Z) {
-				bestDistSq = dSq
-				bestPlayer = p
-			}
+		eyeOffset := GuardianEyeHeight2612
+		reqTicks := GuardianLaserChargeTicks
+		swimSpeed := GuardianSwimSpeed
+		strollInterval := 80
+		if isElder {
+			eyeOffset = ElderGuardianEyeHeight2612
+			reqTicks = ElderGuardianLaserChargeTicks
+			swimSpeed = ElderGuardianSwimSpeed
+			strollInterval = 400
 		}
+		eyeY := ent.Y + eyeOffset
+		maxDistSq := GuardianLaserRange * GuardianLaserRange // 16.0^2 = 256.0
 
-		if bestPlayer == nil {
-			allEnts := s.entities.AppendAll(nil)
-			for i := range allEnts {
-				other := &allEnts[i]
-				if other.EffectiveDimension() != dim {
+		var (
+			bestPlayer *PlayerSession
+			bestSquid  *world.Entity
+			targetDistSq float64
+			targetHasLOS bool
+		)
+
+		// 1. Check if existing locked `GoalTargetID` is still valid (`GuardianAttackGoal.canContinueToUse`).
+		if goalWasActive && curGoalTargetID != 0 {
+			for _, p := range s.onlinePlayersSnapshot() {
+				if p == nil || p.IsDead() || p.EntityID != curGoalTargetID {
 					continue
 				}
-				onorm := canonicalResourceName(other.TypeName)
-				if onorm != MobTypeSquid && onorm != MobTypeGlowSquid && onorm != MobTypeAxolotl {
-					continue
+				snap := p.Snapshot()
+				if world.NormalizeDimension(snap.Dimension) != dim ||
+					snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
+					break
 				}
-				dx := other.X - ent.X
-				dy := other.Y - ent.Y
-				dz := other.Z - ent.Z
+				dx, dy, dz := snap.X-ent.X, snap.Y-ent.Y, snap.Z-ent.Z
 				dSq := dx*dx + dy*dy + dz*dz
-				if dSq <= bestDistSq && HasGuardianLaserLineOfSight(cache, ent.X, ent.Y+0.425, ent.Z, other.X, other.Y+0.4, other.Z) {
-					bestDistSq = dSq
-					bestSquid = other
+				if dSq <= maxDistSq && (isElder || dSq > GuardianMinAttackDistSq) {
+					bestPlayer = p
+					targetDistSq = dSq
+					targetHasLOS = HasGuardianLaserLineOfSight(cache, ent.X, eyeY, ent.Z, snap.X, snap.Y+0.9, snap.Z)
+				}
+				break
+			}
+			if bestPlayer == nil {
+				if other := s.entities.Get(curGoalTargetID); other != nil && other.EffectiveDimension() == dim && s.MobHealth(other.ID) > 0 {
+					onorm := canonicalResourceName(other.TypeName)
+					if onorm == MobTypeSquid || onorm == MobTypeGlowSquid || onorm == MobTypeAxolotl {
+						dx, dy, dz := other.X-ent.X, other.Y-ent.Y, other.Z-ent.Z
+						dSq := dx*dx + dy*dy + dz*dz
+						if dSq <= maxDistSq && (isElder || dSq > GuardianMinAttackDistSq) {
+							cpCopy := *other
+							bestSquid = &cpCopy
+							targetDistSq = dSq
+							targetHasLOS = HasGuardianLaserLineOfSight(cache, ent.X, eyeY, ent.Z, other.X, other.Y+0.4, other.Z)
+						}
+					}
 				}
 			}
 		}
+
+		// 2. Otherwise run `NearestAttackableTargetGoal` + `GuardianAttackSelector` (`mustSee=true`, `distSqr > 9.0D`, `<= 256.0D`).
+		if bestPlayer == nil && bestSquid == nil {
+			bestDistSq := maxDistSq
+			for _, p := range s.onlinePlayersSnapshot() {
+				if p == nil || p.IsDead() {
+					continue
+				}
+				snap := p.Snapshot()
+				if world.NormalizeDimension(snap.Dimension) != dim ||
+					snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
+					continue
+				}
+				dx, dy, dz := snap.X-ent.X, snap.Y-ent.Y, snap.Z-ent.Z
+				dSq := dx*dx + dy*dy + dz*dz
+				if dSq > GuardianMinAttackDistSq && dSq <= bestDistSq &&
+					HasGuardianLaserLineOfSight(cache, ent.X, eyeY, ent.Z, snap.X, snap.Y+0.9, snap.Z) {
+					bestDistSq = dSq
+					bestPlayer = p
+					targetDistSq = dSq
+					targetHasLOS = true
+				}
+			}
+			if bestPlayer == nil {
+				allEnts := s.entities.AppendAll(nil)
+				for i := range allEnts {
+					other := &allEnts[i]
+					if other.EffectiveDimension() != dim || s.MobHealth(other.ID) <= 0 {
+						continue
+					}
+					onorm := canonicalResourceName(other.TypeName)
+					if onorm != MobTypeSquid && onorm != MobTypeGlowSquid && onorm != MobTypeAxolotl {
+						continue
+					}
+					dx, dy, dz := other.X-ent.X, other.Y-ent.Y, other.Z-ent.Z
+					dSq := dx*dx + dy*dy + dz*dz
+					if dSq > GuardianMinAttackDistSq && dSq <= bestDistSq &&
+						HasGuardianLaserLineOfSight(cache, ent.X, eyeY, ent.Z, other.X, other.Y+0.4, other.Z) {
+						bestDistSq = dSq
+						bestSquid = other
+						targetDistSq = dSq
+						targetHasLOS = true
+					}
+				}
+			}
+		}
+		_ = targetDistSq
 
 		var targetID int32
+		var targetX, targetZ float64
 		if bestPlayer != nil {
 			targetID = bestPlayer.EntityID
+			ps := bestPlayer.Snapshot()
+			targetX, targetZ = ps.X, ps.Z
 		} else if bestSquid != nil {
 			targetID = bestSquid.ID
-		}
-
-		reqTicks := GuardianLaserChargeTicks
-		laserDmg := GuardianLaserDamage
-		magicDmg := GuardianMagicLaserDamage
-		swimSpeed := GuardianSwimSpeed
-		if isElder {
-			reqTicks = ElderGuardianLaserChargeTicks
-			laserDmg = ElderGuardianLaserDamage
-			magicDmg = ElderGuardianMagicLaserDamage
-			swimSpeed = ElderGuardianSwimSpeed
+			targetX, targetZ = bestSquid.X, bestSquid.Z
 		}
 
 		inWater := s.isEntityInWater(dim, ent.X, ent.Y, ent.Z)
@@ -2509,39 +2608,90 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 		}
 		prevTarget := st.AttackTargetID
 		prevMoving := st.Moving
-		var fireLaser bool
-		var doFlop bool
-		var swimDX, swimDY, swimDZ float64
-		if targetID != 0 {
+		silent := st.Silent
+		var (
+			fireLaser       bool
+			broadcastLock21 bool
+			doFlop          bool
+			swimDX, swimDY, swimDZ float64
+		)
+
+		if targetID != 0 && targetHasLOS {
 			if inWater {
 				st.OutOfWaterTicks = 0
 			} else {
 				st.OutOfWaterTicks++
 			}
-			st.Moving = false // Extend spikes and lock laser beam onto target!
-			if st.AttackTargetID != targetID {
+			st.Moving = false // `getNavigation().stop()` -> `GuardianMoveControl` sets `Moving = false` (spikes extended!)
+			if !st.AttackGoalActive || st.GoalTargetID != targetID {
+				// `GuardianAttackGoal.start()`: `attackTime = -10`, `DATA_ID_ATTACK_TARGET` remains 0 until `attackTime == 0`!
+				st.AttackGoalActive = true
+				st.GoalTargetID = targetID
+				st.AttackTime = GuardianAttackGoalInitialTime
+				st.AttackTargetID = 0
+			}
+			// `GuardianAttackGoal.tick()`: `++this.attackTime`.
+			st.AttackTime++
+			st.LaserChargeTicks = st.AttackTime - GuardianAttackGoalInitialTime
+			if st.AttackTime == 0 {
 				st.AttackTargetID = targetID
-				st.LaserChargeTicks = 1
-			} else {
-				st.LaserChargeTicks++
-				if st.LaserChargeTicks >= reqTicks {
-					fireLaser = true
-					st.LaserChargeTicks = 0
-					st.AttackTargetID = 0
-				}
+				broadcastLock21 = !silent
+			} else if st.AttackTime >= reqTicks {
+				fireLaser = true
+				st.AttackGoalActive = false
+				st.GoalTargetID = 0
+				st.AttackTargetID = 0
+				st.AttackTime = 0
+				st.LaserChargeTicks = 0
+				st.SwimTimer = 0 // `stop()` triggers `randomStrollGoal.trigger()`
 			}
 		} else {
+			// Lost target, lost line-of-sight (`!hasLineOfSight`), or `Guardian` retreated at `distSqr <= 9.0D`!
+			wasGoal := st.AttackGoalActive
+			st.AttackGoalActive = false
+			st.GoalTargetID = 0
 			st.AttackTargetID = 0
+			st.AttackTime = 0
 			st.LaserChargeTicks = 0
+			if wasGoal {
+				st.SwimTimer = 0 // `GuardianAttackGoal.stop()` -> `randomStrollGoal.trigger()`
+			}
+
 			if inWater {
 				st.OutOfWaterTicks = 0
 				st.Moving = true // Retract spikes while cruising underwater
 				if st.SwimTimer <= 0 {
-					st.SwimTimer = 40
+					st.SwimTimer = strollInterval / 2
 					if rng != nil {
 						st.SwimTimer = 30 + rng.Intn(40)
 					}
-					if st.HasHome {
+					// If retreating from a close target (`distSqr <= 9.0`), steer away from nearest player!
+					steeredAway := false
+					if !isElder {
+						for _, p := range s.onlinePlayersSnapshot() {
+							if p == nil || p.IsDead() {
+								continue
+							}
+							ps := p.Snapshot()
+							if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeCreative || ps.GameMode == GameModeSpectator {
+								continue
+							}
+							adx, adz := ent.X-ps.X, ent.Z-ps.Z
+							d2 := adx*adx + (ent.Y-ps.Y)*(ent.Y-ps.Y) + adz*adz
+							if d2 <= GuardianMinAttackDistSq {
+								hlen := math.Hypot(adx, adz)
+								if hlen < 1e-4 {
+									adx, adz, hlen = 1, 0, 1
+								}
+								st.SwimDirX = adx / hlen
+								st.SwimDirY = 0
+								st.SwimDirZ = adz / hlen
+								steeredAway = true
+								break
+							}
+						}
+					}
+					if !steeredAway && st.HasHome {
 						hdx := st.HomeX - ent.X
 						hdy := st.HomeY - ent.Y
 						hdz := st.HomeZ - ent.Z
@@ -2554,9 +2704,10 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 							st.SwimDirX = hdx / hDist
 							st.SwimDirY = hdy / hDist
 							st.SwimDirZ = hdz / hDist
+							steeredAway = true
 						}
 					}
-					if st.SwimDirX == 0 && st.SwimDirY == 0 && st.SwimDirZ == 0 {
+					if !steeredAway && (st.SwimDirX == 0 && st.SwimDirY == 0 && st.SwimDirZ == 0) {
 						angle := 0.0
 						if rng != nil {
 							angle = rng.Float64() * 2.0 * math.Pi
@@ -2571,8 +2722,8 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 				swimDX, swimDY, swimDZ = st.SwimDirX*swimSpeed, st.SwimDirY*swimSpeed, st.SwimDirZ*swimSpeed
 			} else {
 				st.OutOfWaterTicks++
-				st.Moving = false // Spikes extended while flopping out of water on land
-				if st.OutOfWaterTicks == 1 || st.OutOfWaterTicks%GuardianFlopIntervalTicks == 0 {
+				st.Moving = false // Spikes extended while out of water on land
+				if ent.OnGround || (st.OutOfWaterTicks == 1 && ent.VelocityY == 0) {
 					doFlop = true
 				}
 			}
@@ -2586,24 +2737,43 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 				EncodeGuardianDataPacket(id, curMoving, curTarget))
 		}
+		if broadcastLock21 {
+			evW := protocol.NewWriter(5)
+			evW.Int32(id)
+			evW.Byte(EntityEventGuardianAttackSound)
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent, evW.Bytes())
+		}
+		if targetID != 0 && targetHasLOS {
+			yaw := yawToward(targetX-ent.X, targetZ-ent.Z)
+			s.entities.Update(id, func(e *world.Entity) {
+				e.Yaw, e.HeadYaw = yaw, yaw
+			})
+		}
 		if fireLaser {
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundGuardianAttack, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			if !silent {
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundGuardianAttack, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			}
 			if bestPlayer != nil {
-				s.AttackPlayerFromMob(id, ent.TypeName, ent.X, ent.Z, bestPlayer, laserDmg)
-				if !bestPlayer.IsDead() {
-					s.DamagePlayerWithEffects(bestPlayer, magicDmg, "indirect_magic")
-				}
+				s.ApplyGuardianLaserToPlayer2612(id, ent.TypeName, ent.X, ent.Z, isElder, bestPlayer)
 			} else if bestSquid != nil {
-				s.applyDamageToMob(bestSquid, laserDmg+magicDmg, nil, 0, false, false)
+				magicRaw, mobRaw := GuardianLaserRawDamages2612(isElder, s.Difficulty())
+				total := mobRaw
+				if magicRaw > total {
+					total = magicRaw
+				}
+				s.applyDamageToMob(bestSquid, total, nil, 0.3, false, false)
 			}
 		} else if curMoving && (swimDX != 0 || swimDY != 0 || swimDZ != 0) {
 			nx, ny, nz := ent.X+swimDX, ent.Y+swimDY, ent.Z+swimDZ
 			if cache == nil || s.isEntityInWater(dim, nx, ny, nz) {
+				yaw := yawToward(swimDX, swimDZ)
 				s.entities.Update(id, func(e *world.Entity) {
 					e.X = nx
 					e.Y = ny
 					e.Z = nz
+					e.Yaw = yaw
+					e.HeadYaw = yaw
 					e.VelocityX = clampVelocityShort(swimDX)
 					e.VelocityY = clampVelocityShort(swimDY)
 					e.VelocityZ = clampVelocityShort(swimDZ)
@@ -2616,21 +2786,68 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 				}
 				mgr.mu.Unlock()
 			}
-		} else if doFlop {
-			flopSX, flopSZ := 0.0, 0.0
-			if rng != nil {
-				ang := rng.Float64() * 2.0 * math.Pi
-				flopSX = math.Cos(ang) * 0.15
-				flopSZ = math.Sin(ang) * 0.15
+		} else if !inWater {
+			if doFlop {
+				// `Guardian.aiStep()`: `deltaMovement.add((nextFloat()*2 - 1)*0.4F, 0.5D, (nextFloat()*2 - 1)*0.4F)`, `setYRot(nextFloat()*360)`.
+				curVX := float64(ent.VelocityX) / 8000.0
+				curVY := float64(ent.VelocityY) / 8000.0
+				curVZ := float64(ent.VelocityZ) / 8000.0
+				rx, rz := 0.0, 0.0
+				flopYaw := ent.Yaw
+				if rng != nil {
+					rx = float64(rng.Float32()*2.0-1.0) * GuardianLandFlopHorizSpread
+					rz = float64(rng.Float32()*2.0-1.0) * GuardianLandFlopHorizSpread
+					flopYaw = rng.Float32() * 360.0
+				}
+				newVX := curVX + rx
+				newVY := curVY + GuardianLandFlopDeltaY
+				newVZ := curVZ + rz
+				s.entities.Update(id, func(e *world.Entity) {
+					e.VelocityX = clampVelocityShort(newVX)
+					e.VelocityY = clampVelocityShort(newVY)
+					e.VelocityZ = clampVelocityShort(newVZ)
+					e.Yaw = flopYaw
+					e.HeadYaw = flopYaw
+					e.OnGround = false
+				})
+				if !silent {
+					flopSnd := SoundGuardianFlop
+					if isElder {
+						flopSnd = SoundElderGuardianFlop
+					}
+					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+						EncodeSoundPacket(flopSnd, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+				}
+			} else if cache != nil {
+				// Airborne on land between flops: step gravity (`0.08`) until landing back `onGround`!
+				vy := float64(ent.VelocityY)/8000.0 - 0.08
+				vx := float64(ent.VelocityX) / 8000.0 * 0.91
+				vz := float64(ent.VelocityZ) / 8000.0 * 0.91
+				nextX := ent.X + vx
+				nextY := ent.Y + vy
+				nextZ := ent.Z + vz
+				bx, bz := int(math.Floor(nextX)), int(math.Floor(nextZ))
+				belowY := int(math.Floor(nextY - 0.01))
+				landed := false
+				if vy <= 0 && belowY >= world.MinY && belowY < world.MinY+world.WorldHeight && isColliderBlockState2612(cache.GetBlock(bx, belowY, bz)) {
+					nextY = float64(belowY + 1)
+					vy = 0
+					vx, vz = 0, 0
+					landed = true
+				}
+				s.entities.Update(id, func(e *world.Entity) {
+					e.X, e.Y, e.Z = nextX, nextY, nextZ
+					e.VelocityX = clampVelocityShort(vx)
+					e.VelocityY = clampVelocityShort(vy)
+					e.VelocityZ = clampVelocityShort(vz)
+					e.OnGround = landed
+				})
 			}
+		} else if inWater && !curMoving && targetID == 0 {
+			// `Guardian.travelInWater`: stationary idle Guardian sinks by `-0.005D` per tick.
 			s.entities.Update(id, func(e *world.Entity) {
-				e.VelocityX = clampVelocityShort(flopSX)
-				e.VelocityY = clampVelocityShort(GuardianFlopVelocityY)
-				e.VelocityZ = clampVelocityShort(flopSZ)
-				e.OnGround = false
+				e.VelocityY = clampVelocityShort(GuardianIdleWaterSinkDeltaY)
 			})
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-				EncodeSoundPacket(SoundGuardianFlop, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		}
 	}
 	_ = rng

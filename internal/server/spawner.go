@@ -206,6 +206,11 @@ func (t *EntityTracker) TickAndBroadcast(s *Server, rng *rand.Rand) {
 							EncodeSetEntityMotionPacket(h.projectileID, ox, oy, oz))
 					}
 				}
+			case 4:
+				s.DestroyShulkerBullet(h.targetID)
+				if h.consumeProjectile {
+					s.despawnHostileEntityByID(h.projectileID)
+				}
 			}
 		}
 		s.TickWithers(rng)
@@ -327,7 +332,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferred
 			})
 			continue
 		}
-		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning || snapshot.TypeName == EntityTypeEvokerFangs || IsFireballEntityType(snapshot.TypeName) {
+		if snapshot.TypeName == EntityTypeFishingBobber || snapshot.IsExperienceOrb() || IsDecorationEntity(snapshot.TypeName) || IsWindChargeEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeLlamaSpit || snapshot.TypeName == EntityTypeLightning || snapshot.TypeName == EntityTypeEvokerFangs || IsFireballEntityType(snapshot.TypeName) || snapshot.TypeName == EntityTypeShulkerBullet {
 			continue
 		}
 		if IsStandardProjectileEntityType(snapshot.TypeName) {
@@ -386,6 +391,17 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferred
 							hitProjectileTarget = true
 							break
 						}
+					} else if candCanon == EntityTypeShulkerBullet {
+						if math.Abs(cand.X-nx) <= 0.8 && ny >= cand.Y-0.5 && ny <= cand.Y+0.8 && math.Abs(cand.Z-nz) <= 0.8 {
+							projHits = append(projHits, deferredProjectileHit2612{
+								kind:              4,
+								projectileID:      snapshot.ID,
+								targetID:          cand.ID,
+								consumeProjectile: projCanon != "minecraft:trident",
+							})
+							hitProjectileTarget = true
+							break
+						}
 					}
 				}
 				if hitProjectileTarget {
@@ -424,7 +440,7 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferred
 			}
 			continue
 		}
-		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite || snapshot.TypeName == MobTypeBlaze || snapshot.TypeName == MobTypeGhast || snapshot.TypeName == MobTypeMagmaCube || snapshot.TypeName == MobTypeSlime || snapshot.TypeName == MobTypeBat || snapshot.TypeName == MobTypeNautilus || snapshot.TypeName == MobTypeZombieNautilus || snapshot.TypeName == MobTypeHappyGhast || snapshot.TypeName == MobTypeParched || snapshot.TypeName == MobTypeCamelHusk {
+		if snapshot.TypeName == MobTypeWarden || snapshot.TypeName == MobTypePhantom || snapshot.TypeName == MobTypeBreeze || snapshot.TypeName == MobTypeAllay || snapshot.TypeName == MobTypeBee || snapshot.TypeName == MobTypeVex || snapshot.TypeName == MobTypeEnderman || snapshot.TypeName == MobTypeEndermite || snapshot.TypeName == MobTypeBlaze || snapshot.TypeName == MobTypeGhast || snapshot.TypeName == MobTypeMagmaCube || snapshot.TypeName == MobTypeSlime || snapshot.TypeName == MobTypeBat || snapshot.TypeName == MobTypeNautilus || snapshot.TypeName == MobTypeZombieNautilus || snapshot.TypeName == MobTypeHappyGhast || snapshot.TypeName == MobTypeParched || snapshot.TypeName == MobTypeCamelHusk || snapshot.TypeName == MobTypeGuardian || snapshot.TypeName == MobTypeElderGuardian || snapshot.TypeName == MobTypeShulker {
 			mem := t.mobStateFor(snapshot.ID, aiTick)
 			if !mem.healthInit {
 				mem.healthInit = true
