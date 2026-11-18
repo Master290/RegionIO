@@ -624,8 +624,8 @@ func (t *EntityTracker) stepEntitiesLocked(s *Server, rng *rand.Rand) []deferred
 				swellDir = mem.creeperSwellDir
 			}
 		case MobTypeSpider, MobTypeCaveSpider:
-			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderFamilyAI(
-				snapshot.TypeName, s.chunks, rng, mem, t.playerTargets,
+			nextX, nextY, nextZ, nextYaw, attackTarget, leaped = s.stepHostileSpiderFamilyAIInDimension(
+				snapshot.EffectiveDimension(), snapshot.TypeName, s.DimensionChunks(snapshot.EffectiveDimension()), rng, mem, t.playerTargets,
 				snapshot.X, feetY, snapshot.Z, snapshot.Yaw,
 			)
 			attackDmg = SpiderAttackDamage

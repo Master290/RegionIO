@@ -34,36 +34,39 @@ const (
 
 	// Bee SynchedEntityData metadata indices (protocol 775 / MC 26.1.2):
 	//  - Index 16 (AgeableMob DATA_BABY_ID, boolean): is baby
-	//  - Index 17 (Bee DATA_FLAGS_ID, byte): 0x02 = isRolling, 0x04 = hasStung, 0x08 = hasNectar
-	//  - Index 18 (Bee DATA_REMAINING_ANGER_TIME_ID, varint): anger time in ticks
-	BeeMetaIndexBaby      byte = 16
-	BeeMetaIndexFlags     byte = 17
-	BeeMetaIndexAngerTime byte = 18
+	//  - Index 17 (AgeableMob AGE_LOCKED, boolean): age locked
+	//  - Index 18 (Bee DATA_FLAGS_ID, byte): 0x02 = isRolling, 0x04 = hasStung, 0x08 = hasNectar
+	//  - Index 19 (Bee DATA_ANGER_END_TIME, long / VarLong): anger end gameTime (-1L when calm)
+	BeeMetaIndexBaby         byte = 16
+	BeeMetaIndexAgeLocked    byte = 17
+	BeeMetaIndexFlags        byte = 18
+	BeeMetaIndexAngerEndTime byte = 19
+	BeeMetaIndexAngerTime    byte = BeeMetaIndexAngerEndTime
 
 	BeeFlagIsRolling byte = 0x02
 	BeeFlagHasStung  byte = 0x04
 	BeeFlagHasNectar byte = 0x08
 
 	// Pollination & hive constants (vanilla 26.1.2).
-	BeePollinateTargetTicks        = 400  // 20 seconds of flower pollination
+	BeePollinateTargetTicks        = 400  // 20 seconds minimum flower pollination (`successfulPollinatingTicks > 400`)
 	BeePollinateMaxDurationTicks   = 600  // max 30 seconds per pollination attempt
-	BeePollinateCooldownTicks      = 200  // cooldown between flower checks
+	BeePollinateCooldownTicks      = 200  // cooldown after pollination attempt (`COOLDOWN_BEFORE_LOCATING_NEW_FLOWER`)
 	BeeMaxCropsGrownPerPollination = 10   // max crops fertilized while returning with nectar
-	BeeCropGrowChance              = 0.05 // 5% chance per tick when flying over a crop with nectar
+	BeeCropGrowChance              = 0.05 // crop fertilization check while flying over a crop with nectar
 	BeeMaxHiveOccupants            = 3    // max 3 bees inside a beehive or bee_nest
 	BeeMinOccupationTicksNectar    = 2400 // 2 minutes inside hive when entering with nectar
 	BeeMinOccupationTicksNoNectar  = 600  // 30 seconds inside hive when entering without nectar
 	BeeMaxHoneyLevel               = 5    // honey_level 0..5
-	BeeHiveSearchRadius            = 22   // search radius for flowers and hives
+	BeeHiveSearchRadius            = 22   // search radius for hives
 	BeeCampfireSmokeMaxDistance    = 5    // campfire up to 5 blocks below calms hive
 
 	// Combat, sting, poison, and post-sting death constants (vanilla 26.1.2).
 	BeeBaseAttackDamage          float32 = 2.0
 	BeeSwarmAlertRadius          float64 = 22.0
-	BeeAngerMinTicks                     = 400  // 20 seconds
-	BeeAngerMaxTicks                     = 800  // 40 seconds
-	BeePostStingDeathMinTicks            = 1000 // 50 seconds after losing stinger
-	BeePostStingDeathMaxTicks            = 1200 // 60 seconds after losing stinger
+	BeeAngerMinTicks                     = 400  // 20 seconds (`TimeUtil.rangeOfSeconds(20, 39)`)
+	BeeAngerMaxTicks                     = 780  // 39 seconds (`TimeUtil.rangeOfSeconds(20, 39)`)
+	BeePostStingDeathMinTicks            = 1000 // legacy bound; exact curve uses `1200 - timeSinceSting` every 5 ticks
+	BeePostStingDeathMaxTicks            = 1200 // guaranteed post-sting death ceiling (`STING_DEATH_COUNTDOWN = 1200`)
 	BeePoisonDurationNormalTicks         = 200  // 10s Poison I on Normal
 	BeePoisonDurationHardTicks           = 360  // 18s Poison I on Hard
 	BeeFlySpeed                  float64 = 0.24
@@ -133,10 +136,14 @@ type beeHivePosKey struct {
 // BeeState holds per-entity state for a `minecraft:bee` (ID 11).
 type BeeState struct {
 	EntityID                   int32
+	AgeLocked                  bool
 	HasNectar                  bool
 	HasStung                   bool
 	IsRolling                  bool
 	AngerTicks                 int
+	AngerEndTime               int64
+	AngryAtUUID                [16]byte
+	HasAngryAtUUID             bool
 	TargetSession              *PlayerSession
 	TargetMobID                int32
 	AttackCooldown             int
@@ -150,6 +157,7 @@ type BeeState struct {
 	PollinatingTicks           int
 	PollinateAttemptTicks      int
 	PollinateCooldown          int
+	TicksSincePollination      int
 	CropsGrownSincePollination int
 	StayOutOfHiveCountdown     int
 	CannotEnterHiveTicks       int
@@ -280,6 +288,7 @@ func (s *Server) SetBeeHasNectar(entityID int32, hasNectar bool) {
 	st.HasNectar = hasNectar
 	if hasNectar {
 		st.CropsGrownSincePollination = 0
+		st.TicksSincePollination = 0
 	}
 	mgr.mu.Unlock()
 	if s.entities != nil {
@@ -330,21 +339,26 @@ func EncodeBeeDataPacket(entityID int32, isBaby bool, st BeeState) []byte {
 	if st.HasNectar {
 		flags |= BeeFlagHasNectar
 	}
-	anger := st.AngerTicks
-	if anger < 0 {
-		anger = 0
+	angerEnd := int64(-1)
+	if st.AngerEndTime > 0 {
+		angerEnd = st.AngerEndTime
+	} else if st.AngerTicks > 0 {
+		angerEnd = int64(st.AngerTicks)
 	}
-	w := protocol.NewWriter(24)
+	w := protocol.NewWriter(32)
 	w.VarInt(entityID)
 	w.Byte(BeeMetaIndexBaby)
 	w.VarInt(EntityDataSerializerBool)
 	w.Bool(isBaby)
+	w.Byte(BeeMetaIndexAgeLocked)
+	w.VarInt(EntityDataSerializerBool)
+	w.Bool(st.AgeLocked)
 	w.Byte(BeeMetaIndexFlags)
 	w.VarInt(EntityDataSerializerByte)
 	w.Byte(flags)
-	w.Byte(BeeMetaIndexAngerTime)
-	w.VarInt(EntityDataSerializerInt)
-	w.VarInt(int32(anger))
+	w.Byte(BeeMetaIndexAngerEndTime)
+	w.VarInt(EntityDataSerializerLong)
+	w.VarLong(angerEnd)
 	w.Byte(0xFF)
 	return w.Bytes()
 }
@@ -359,6 +373,7 @@ func DecodeBeeDataPacket(r *protocol.Reader) (entityID int32, isBaby bool, st Be
 		return 0, false, BeeState{}, err
 	}
 	st.EntityID = entityID
+	st.AngerEndTime = -1
 	for {
 		idx, err := r.ReadByte()
 		if err != nil {
@@ -380,6 +395,14 @@ func DecodeBeeDataPacket(r *protocol.Reader) (entityID int32, isBaby bool, st Be
 			if err != nil {
 				return 0, false, BeeState{}, err
 			}
+		case BeeMetaIndexAgeLocked:
+			if ser != EntityDataSerializerBool {
+				return 0, false, BeeState{}, errors.New("bee: unexpected age_locked serializer")
+			}
+			st.AgeLocked, err = r.Bool()
+			if err != nil {
+				return 0, false, BeeState{}, err
+			}
 		case BeeMetaIndexFlags:
 			if ser != EntityDataSerializerByte {
 				return 0, false, BeeState{}, errors.New("bee: unexpected flags serializer")
@@ -391,15 +414,20 @@ func DecodeBeeDataPacket(r *protocol.Reader) (entityID int32, isBaby bool, st Be
 			st.IsRolling = (flags & BeeFlagIsRolling) != 0
 			st.HasStung = (flags & BeeFlagHasStung) != 0
 			st.HasNectar = (flags & BeeFlagHasNectar) != 0
-		case BeeMetaIndexAngerTime:
-			if ser != EntityDataSerializerInt {
-				return 0, false, BeeState{}, errors.New("bee: unexpected anger time serializer")
+		case BeeMetaIndexAngerEndTime:
+			if ser != EntityDataSerializerLong {
+				return 0, false, BeeState{}, errors.New("bee: unexpected anger_end_time serializer")
 			}
-			anger, err := r.VarInt()
+			angerEnd, err := r.VarLong()
 			if err != nil {
 				return 0, false, BeeState{}, err
 			}
-			st.AngerTicks = int(anger)
+			st.AngerEndTime = angerEnd
+			if angerEnd > 0 {
+				st.AngerTicks = int(angerEnd)
+			} else {
+				st.AngerTicks = 0
+			}
 		default:
 			return 0, false, BeeState{}, fmt.Errorf("bee: unexpected metadata index %d", idx)
 		}
@@ -417,6 +445,10 @@ func (s *Server) BeeEntityDataPacket(entityID int32) []byte {
 		return nil
 	}
 	st, _ := s.BeeStateFor(entityID)
+	if st.AngerTicks > 0 && st.AngerEndTime <= 0 {
+		gt, _ := s.WorldTime()
+		st.AngerEndTime = gt + int64(st.AngerTicks)
+	}
 	return EncodeBeeDataPacket(entityID, s.IsMobBaby(entityID), st)
 }
 
@@ -425,6 +457,10 @@ func (s *Server) broadcastBeeMetadata(ent *world.Entity) {
 		return
 	}
 	st, _ := s.BeeStateFor(ent.ID)
+	if st.AngerTicks > 0 && st.AngerEndTime <= 0 {
+		gt, _ := s.WorldTime()
+		st.AngerEndTime = gt + int64(st.AngerTicks)
+	}
 	isBaby := s.IsMobBaby(ent.ID)
 	cp := ent.ChunkPos()
 	s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySetEntityDataCB,
@@ -485,12 +521,24 @@ func IsBeehiveOrNestBlock(stateName string) bool {
 	return base == "minecraft:beehive" || base == "minecraft:bee_nest"
 }
 
-// IsBeeFlowerBlockState reports whether state is a flower or flowering block that bees can pollinate in 26.1.2.
+// IsBeeFlowerBlockState reports whether state is a flower or flowering block that bees can pollinate in 26.1.2
+// (`Bee.attractsBees(BlockState)`: in `#minecraft:bee_attractive`, `waterlogged != "true"`, and for `minecraft:sunflower` `half == "upper"`).
 func IsBeeFlowerBlockState(state uint16) bool {
 	if state == world.StateAir {
 		return false
 	}
-	return IsBeeFlowerBlock(world.BlockName(state))
+	name := world.BlockName(state)
+	if !IsBeeFlowerBlock(name) {
+		return false
+	}
+	props := world.BlockProperties(state)
+	if props["waterlogged"] == "true" {
+		return false
+	}
+	if canonicalResourceName(name) == "minecraft:sunflower" && props["half"] != "upper" {
+		return false
+	}
+	return true
 }
 
 // IsTallBeeFlowerBlock reports whether stateName is a 2-block-tall flower whose upper half bees pollinate.
@@ -665,8 +713,9 @@ func (s *Server) ComparatorOutputForBeehive(dimension string, x, y, z int) (int,
 	return BeehiveHoneyLevelState(st), true
 }
 
-// IsBeehiveSmokedByCampfire returns true if there is a lit `minecraft:campfire` or `minecraft:soul_campfire`
-// within 5 blocks directly below (x, y, z) without an obstructing solid block blocking smoke.
+// IsBeehiveSmokedByCampfire implements vanilla `CampfireBlock.isSmokeyPos(Level, BlockPos)` in 26.1.2:
+// scans `dy = 1..5` below `(x, y, z)`; returns true if `isLitCampfire(pos.below(dy))`;
+// if `pos.below(dy)` has a center collision shape (`!isPassableBlock`), checks ONLY `isLitCampfire(pos.below(dy+1))` and stops.
 func (s *Server) IsBeehiveSmokedByCampfire(dimension string, x, y, z int) bool {
 	if s == nil {
 		return false
@@ -684,16 +733,14 @@ func (s *Server) IsBeehiveSmokedByCampfire(dimension string, x, y, z int) bool {
 		if st == world.StateAir {
 			continue
 		}
-		base := canonicalResourceName(world.BlockName(st))
-		if base == "minecraft:campfire" || base == "minecraft:soul_campfire" {
-			props := world.BlockProperties(st)
-			return props["lit"] != "false"
-		}
-		if base == "minecraft:hay_block" {
-			continue
+		if isLitCampfireState2612(st) {
+			return true
 		}
 		if !isPassableBlock(st) {
-			return false
+			if by-1 < world.MinY {
+				return false
+			}
+			return isLitCampfireState2612(cache.GetBlock(x, by-1, z))
 		}
 	}
 	return false
@@ -957,7 +1004,7 @@ func (s *Server) TryEnterBeehive(beeEntityID int32, dimension string, hx, hy, hz
 		return false
 	}
 	st, _ := s.BeeStateFor(beeEntityID)
-	if st.HasStung || st.AngerTicks > 0 || st.CannotEnterHiveTicks > 0 || st.StayOutOfHiveCountdown > 0 {
+	if st.HasStung || st.AngerTicks > 0 || st.CannotEnterHiveTicks > 0 || st.StayOutOfHiveCountdown > 0 || s.IsBeehiveFireNearby(normDim, hx, hy, hz) {
 		return false
 	}
 	mgr := s.BeeStates()
@@ -1107,6 +1154,9 @@ func (s *Server) spawnBeeFromOccupant(dimension string, hx, hy, hz int, hiveStat
 			st.HasHivePos = true
 			st.HiveX, st.HiveY, st.HiveZ = hx, hy, hz
 			st.StayOutOfHiveCountdown = 400
+			st.CannotEnterHiveTicks = 400
+			st.TicksSincePollination = 0
+			st.CropsGrownSincePollination = 0
 			st.CustomName = occ.CustomName
 			if sharedFlower != nil {
 				st.HasFlowerPos = true
@@ -1650,6 +1700,7 @@ func (s *Server) AngerBeeAtPlayer(beeEntityID int32, targetSession *PlayerSessio
 		return false
 	}
 	st := s.ensureBeeState(beeEntityID)
+	gt, _ := s.WorldTime()
 	mgr := s.BeeStates()
 	mgr.mu.Lock()
 	if st.HasStung {
@@ -1657,6 +1708,9 @@ func (s *Server) AngerBeeAtPlayer(beeEntityID int32, targetSession *PlayerSessio
 		return false
 	}
 	st.AngerTicks = randomBeeAngerTicks(rng)
+	st.AngerEndTime = gt + int64(st.AngerTicks)
+	st.AngryAtUUID = targetSession.Profile.UUID
+	st.HasAngryAtUUID = true
 	st.TargetSession = targetSession
 	st.TargetMobID = 0
 	st.IsRolling = false
@@ -1677,6 +1731,7 @@ func (s *Server) AngerBeeAtMob(beeEntityID, targetMobID int32, rng *rand.Rand) b
 		return false
 	}
 	st := s.ensureBeeState(beeEntityID)
+	gt, _ := s.WorldTime()
 	mgr := s.BeeStates()
 	mgr.mu.Lock()
 	if st.HasStung {
@@ -1684,6 +1739,7 @@ func (s *Server) AngerBeeAtMob(beeEntityID, targetMobID int32, rng *rand.Rand) b
 		return false
 	}
 	st.AngerTicks = randomBeeAngerTicks(rng)
+	st.AngerEndTime = gt + int64(st.AngerTicks)
 	st.TargetMobID = targetMobID
 	st.TargetSession = nil
 	st.IsRolling = false
@@ -1799,13 +1855,14 @@ func (s *Server) PerformBeeSting(bee *world.Entity, targetSession *PlayerSession
 		}
 		mgr.mu.Lock()
 		st.HasStung = true
-		st.HasNectar = false
 		st.IsRolling = false
 		st.AngerTicks = 0
+		st.AngerEndTime = -1
+		st.HasAngryAtUUID = false
 		st.TargetSession = nil
 		st.TargetMobID = 0
 		st.TimeSinceSting = 0
-		st.DeathAfterStingTicks = randomBeePostStingDeathTicks(rng)
+		st.DeathAfterStingTicks = BeeStingDeathCountdownTicks
 		mgr.mu.Unlock()
 		s.broadcastBeeMetadata(bee)
 	}
@@ -1858,13 +1915,14 @@ func (s *Server) PerformBeeStingOnMob(bee, targetMob *world.Entity, rng *rand.Ra
 
 	mgr.mu.Lock()
 	st.HasStung = true
-	st.HasNectar = false
 	st.IsRolling = false
 	st.AngerTicks = 0
+	st.AngerEndTime = -1
+	st.HasAngryAtUUID = false
 	st.TargetSession = nil
 	st.TargetMobID = 0
 	st.TimeSinceSting = 0
-	st.DeathAfterStingTicks = randomBeePostStingDeathTicks(rng)
+	st.DeathAfterStingTicks = BeeStingDeathCountdownTicks
 	mgr.mu.Unlock()
 	s.broadcastBeeMetadata(bee)
 	return true
@@ -1976,7 +2034,7 @@ func (s *Server) findNearbyBeeFlower(cache *world.Cache, cx, cy, cz, radius int)
 	bestDistSq := math.MaxInt32
 	var fx, fy, fz int
 	found := false
-	for dy := -3; dy <= 3; dy++ {
+	for dy := -5; dy <= 5; dy++ {
 		y := cy + dy
 		if y < world.MinY || y >= world.MinY+world.WorldHeight {
 			continue
@@ -2161,13 +2219,13 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 		cache = s.DimensionChunks(dim)
 	}
 
-	// 0. Water submersion check (vanilla Bee.customServerAiStep: 1.0 damage every 20 ticks in water) + leash constraint.
-	_, _, fluidKind, submerged := s.EntitySubmergedFluidDepth(dim, ent.X, ent.Y, ent.Z)
+	// 0. Water submersion check (vanilla Bee.customServerAiStep: `if (this.underWaterTicks > 20)` -> 1.0 drown damage every tick).
+	inWater := isEntityTouchingWaterAt2612(s, dim, ent.X, ent.Y, ent.Z)
 	dealWaterDmg := false
 	mgr.mu.Lock()
-	if submerged && fluidKind == world.FluidWater {
+	if inWater {
 		st.UnderWaterTicks++
-		if st.UnderWaterTicks >= 20 && st.UnderWaterTicks%20 == 0 {
+		if st.UnderWaterTicks > BeeUnderWaterDrownThresholdTicks {
 			dealWaterDmg = true
 		}
 	} else {
@@ -2181,7 +2239,8 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 		}
 	}
 
-	// 1. Post-sting death timer (50..60 seconds after losing stinger).
+	// 1. Cooldowns, `ticksWithoutNectarSinceExitingHive`, and exact `Bee.customServerAiStep` post-sting death curve:
+	//    `if (timeSinceSting % 5 == 0 && random.nextInt(Mth.clamp(1200 - timeSinceSting, 1, 1200)) == 0) hurtServer(generic, getHealth())`.
 	mgr.mu.Lock()
 	if st.StayOutOfHiveCountdown > 0 {
 		st.StayOutOfHiveCountdown--
@@ -2195,13 +2254,30 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 	if st.AttackCooldown > 0 {
 		st.AttackCooldown--
 	}
+	if !st.HasNectar {
+		st.TicksSincePollination++
+	}
 	if st.HasStung {
 		st.TimeSinceSting++
-		limit := st.DeathAfterStingTicks
-		if limit <= 0 {
-			limit = 1100
+		shouldDie := false
+		if st.TimeSinceSting%5 == 0 {
+			bound := BeeStingDeathCountdownTicks - st.TimeSinceSting
+			if bound < 1 {
+				bound = 1
+			} else if bound > BeeStingDeathCountdownTicks {
+				bound = BeeStingDeathCountdownTicks
+			}
+			var roll int
+			if rng != nil {
+				roll = rng.Intn(bound)
+			} else {
+				roll = rand.Intn(bound)
+			}
+			if roll == 0 {
+				shouldDie = true
+			}
 		}
-		if st.TimeSinceSting >= limit {
+		if shouldDie {
 			mgr.mu.Unlock()
 			s.applyDamageToMob(ent, s.MobHealth(ent.ID)+100.0, nil, 0, false, false)
 			return
@@ -2214,6 +2290,8 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 	// 2. Angry bee pursuit & sting.
 	if s.Difficulty() == DifficultyPeaceful && st.AngerTicks > 0 {
 		st.AngerTicks = 0
+		st.AngerEndTime = -1
+		st.HasAngryAtUUID = false
 		st.TargetSession = nil
 		st.TargetMobID = 0
 		mgr.mu.Unlock()
@@ -2227,6 +2305,8 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 		cooldown := st.AttackCooldown
 		stillAngry := st.AngerTicks > 0
 		if !stillAngry {
+			st.AngerEndTime = -1
+			st.HasAngryAtUUID = false
 			st.TargetSession = nil
 			st.TargetMobID = 0
 		}
@@ -2240,6 +2320,8 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 			if targetSess.IsDead() || snap.Health <= 0 || snap.Dimension != dim || snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
 				mgr.mu.Lock()
 				st.AngerTicks = 0
+				st.AngerEndTime = -1
+				st.HasAngryAtUUID = false
 				st.TargetSession = nil
 				mgr.mu.Unlock()
 				s.broadcastBeeMetadata(ent)
@@ -2266,6 +2348,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 			if targetMob == nil || targetMob.EffectiveDimension() != dim || s.MobHealth(targetMobID) <= 0 {
 				mgr.mu.Lock()
 				st.AngerTicks = 0
+				st.AngerEndTime = -1
 				st.TargetMobID = 0
 				mgr.mu.Unlock()
 				s.broadcastBeeMetadata(ent)
@@ -2327,14 +2410,17 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 	hasNectar := st.HasNectar
 	stayOut := st.StayOutOfHiveCountdown
 	cannotEnter := st.CannotEnterHiveTicks
+	ticksWithoutNectar := st.TicksSincePollination
+	isPollinating := st.IsRolling
 	mgr.mu.RUnlock()
 
 	if hasNectar && (rng == nil || rng.Float64() < BeeCropGrowChance) {
 		s.TryFertilizeCropUnderBee(ent.ID)
 	}
 
-	// 5. Return to hive if: (HasNectar || Night || Rain) && allowed to enter.
-	wantsHive := (hasNectar || s.IsBeeNightOrRain(dim)) && stayOut <= 0 && cannotEnter <= 0
+	// 5. Return to hive (`Bee.wantsToEnterHive`):
+	//    `!isPollinating && !hasStung && stayOutOfHiveCountdown <= 0 && !isHiveNearFire && (hasNectar || ticksWithoutNectarSinceExitingHive > 3600 || IsBeeNightOrRain)`.
+	wantsHive := !isPollinating && (hasNectar || ticksWithoutNectar > BeeTicksWithoutNectarBeforeGoingHome || s.IsBeeNightOrRain(dim)) && stayOut <= 0 && cannotEnter <= 0
 	if wantsHive && cache != nil {
 		mgr.mu.RLock()
 		hasHive := st.HasHivePos && st.HiveDimension == dim
@@ -2360,7 +2446,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				mgr.mu.Unlock()
 			}
 		}
-		if hasHive {
+		if hasHive && !s.IsBeehiveFireNearby(dim, hx, hy, hz) {
 			tx, ty, tz := float64(hx)+0.5, float64(hy)+0.5, float64(hz)+0.5
 			dist := math.Sqrt((tx-ent.X)*(tx-ent.X) + (ty-ent.Y)*(ty-ent.Y) + (tz-ent.Z)*(tz-ent.Z))
 			if dist <= 1.75 {
@@ -2377,7 +2463,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 		}
 	}
 
-	// 6. Flower pollination (during daytime and clear weather when not holding nectar).
+	// 6. Flower pollination (`BeePollinateGoal`: `MIN_FIND_FLOWER_RETRY_COOLDOWN=20..60`, `hasPollinatedLongEnough`: `successfulPollinatingTicks > 400` + `20%` continue chance up to `600`).
 	if !hasNectar && !s.IsBeeNightOrRain(dim) && cache != nil {
 		mgr.mu.RLock()
 		hasFlower := st.HasFlowerPos
@@ -2411,8 +2497,15 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				st.PollinateAttemptTicks = 0
 				mgr.mu.Unlock()
 			} else {
+				retryCooldown := BeeMinFindFlowerRetryCooldown
+				span := BeeMaxFindFlowerRetryCooldown - BeeMinFindFlowerRetryCooldown + 1
+				if rng != nil {
+					retryCooldown += rng.Intn(span)
+				} else {
+					retryCooldown += rand.Intn(span)
+				}
 				mgr.mu.Lock()
-				st.PollinateCooldown = BeePollinateCooldownTicks
+				st.PollinateCooldown = retryCooldown
 				mgr.mu.Unlock()
 			}
 		}
@@ -2423,7 +2516,7 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				flowerBlockName := canonicalResourceName(world.BlockName(cache.GetBlock(fx, fy, fz)))
 				if flowerBlockName == "minecraft:wither_rose" {
 					s.ApplyWitherRoseContact(nil, ent.ID)
-				} else if flowerBlockName == "minecraft:open_eyeblossom" {
+				} else if flowerBlockName == "minecraft:open_eyeblossom" && s.Difficulty() != DifficultyPeaceful && !s.HasEntityEffect(ent.ID, EffectPoison) {
 					s.ApplyEntityEffectScaled(ent.ID, StatusEffectInstance{
 						ID:            EffectPoison,
 						Amplifier:     0,
@@ -2434,16 +2527,26 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 				}
 				mgr.mu.Lock()
 				wasRolling := st.IsRolling
+				if !wasRolling {
+					st.TicksSincePollination = 0
+				}
 				st.IsRolling = true
 				st.PollinatingTicks++
 				st.PollinateAttemptTicks++
-				done := st.PollinatingTicks >= BeePollinateTargetTicks
+				longEnough := st.PollinatingTicks > BeePollinateTargetTicks
+				done := false
+				if longEnough {
+					if st.PollinateAttemptTicks >= BeePollinateMaxDurationTicks || rng == nil || rng.Float32() >= 0.2 {
+						done = true
+					}
+				}
 				timedOut := !done && st.PollinateAttemptTicks >= BeePollinateMaxDurationTicks
 				if done {
 					st.HasNectar = true
 					st.IsRolling = false
 					st.PollinatingTicks = 0
 					st.PollinateAttemptTicks = 0
+					st.TicksSincePollination = 0
 					st.CropsGrownSincePollination = 0
 					st.PollinateCooldown = BeePollinateCooldownTicks
 				} else if timedOut {
@@ -2482,7 +2585,8 @@ func (s *Server) TickBeeAI(ent *world.Entity, cache *world.Cache, targets []play
 // InteractWithBee handles a player right-clicking a `minecraft:bee`:
 //   - With a named `minecraft:name_tag`: sets the bee's CustomName (preserved across hive entry/exit)
 //   - With a flower item (`IsBeeBreedItem`): accelerates baby growth by 10% (`FeedBabyMob`)
-//     or enters love mode on adults to breed a baby bee (`InteractWithAnimal`).
+//     or enters love mode on adults to breed a baby bee (`InteractWithAnimal`),
+//     and applies `FlowerBlock.getBeeInteractionEffect()` (`wither_rose` -> Wither, `open_eyeblossom` -> Poison 25t).
 func (s *Server) InteractWithBee(session *PlayerSession, entityID int32) (handled bool, offspringID int32) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return false, 0
@@ -2511,11 +2615,24 @@ func (s *Server) InteractWithBee(session *PlayerSession, entityID int32) (handle
 		return false, 0
 	}
 	handled, offspringID = s.InteractWithAnimal(session, entityID)
-	if handled && offspringID > 0 {
-		s.ensureBeeState(offspringID)
-		if babyEnt := s.entities.Get(offspringID); babyEnt != nil {
-			s.broadcastBeeMetadata(babyEnt)
-			s.SpawnExperienceOrbsInDimension(babyEnt.EffectiveDimension(), babyEnt.X, babyEnt.Y+0.25, babyEnt.Z, 4)
+	if handled {
+		if heldID == "minecraft:wither_rose" {
+			s.ApplyWitherRoseContact(nil, entityID)
+		} else if heldID == "minecraft:open_eyeblossom" && s.Difficulty() != DifficultyPeaceful {
+			s.ApplyEntityEffectScaled(entityID, StatusEffectInstance{
+				ID:            EffectPoison,
+				Amplifier:     0,
+				Duration:      25,
+				ShowParticles: true,
+				ShowIcon:      true,
+			}, 1.0)
+		}
+		if offspringID > 0 {
+			s.ensureBeeState(offspringID)
+			if babyEnt := s.entities.Get(offspringID); babyEnt != nil {
+				s.broadcastBeeMetadata(babyEnt)
+				s.SpawnExperienceOrbsInDimension(babyEnt.EffectiveDimension(), babyEnt.X, babyEnt.Y+0.25, babyEnt.Z, 4)
+			}
 		}
 	}
 	return handled, offspringID

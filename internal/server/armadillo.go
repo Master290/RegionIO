@@ -56,8 +56,9 @@ const (
 	EntityEventArmadilloPeek byte = 64
 
 	// SynchedEntityData index and serializer for Armadillo in 26.1.2 (protocol 775).
-	EntityDataArmadilloStateID         byte  = 17 // Armadillo.ARMADILLO_STATE (ARMADILLO_STATE serializer = 27)
-	EntityDataSerializerArmadilloState int32 = 27
+	// Entity (0..7) -> LivingEntity (8..14) -> Mob (15) -> AgeableMob (16=DATA_BABY_ID, 17=AGE_LOCKED) -> Armadillo (18=ARMADILLO_STATE).
+	EntityDataArmadilloStateID         byte  = 18 // Armadillo.ARMADILLO_STATE
+	EntityDataSerializerArmadilloState int32 = 36 // EntityDataSerializers.ARMADILLO_STATE in 26.1.2
 
 	// Canonical Armadillo sounds.
 	SoundArmadilloAmbient    = "minecraft:entity.armadillo.ambient"
@@ -91,10 +92,14 @@ type ArmadilloBehaviorState struct {
 	State              ArmadilloState
 	StateTicks         int
 	InStateTicks       int64
+	DangerMemoryTicks  int
+	DangerWasAround    bool
+	BallUpStayTicks    int
 	NextPeekTimer      int
 	ScuteShedTimer     int
 	PanicTicks         int
 	LastHurtByEntityID int32
+	LastHurtByTicks    int
 }
 
 // ArmadilloStateName returns the vanilla serialized name (`"idle"`, `"rolling"`,
@@ -246,7 +251,8 @@ func IsArmadilloThreatMob(typeName string) bool {
 		"minecraft:skeleton_horse",
 		"minecraft:zombie_horse",
 		"minecraft:camel_husk",
-		"minecraft:parched":
+		"minecraft:parched",
+		"minecraft:zombie_nautilus":
 		return true
 	default:
 		return false
@@ -320,7 +326,7 @@ func (s *Server) ensureArmadilloState(entityID int32) *ArmadilloBehaviorState {
 		st = &ArmadilloBehaviorState{
 			EntityID:       entityID,
 			State:          ArmadilloStateIdle,
-			ScuteShedTimer: ArmadilloScuteShedMinTicks,
+			ScuteShedTimer: ArmadilloScuteShedMinTicks + rand.Intn(ArmadilloScuteShedMaxTicks-ArmadilloScuteShedMinTicks),
 		}
 		mgr.armadillos[entityID] = st
 	}
@@ -423,8 +429,7 @@ func (s *Server) SpawnArmadillo(dimension string, x, y, z float64, baby bool) (i
 }
 
 // CanArmadilloEntityStayRolledUp checks whether the armadillo with entityID
-// satisfies vanilla `Armadillo.canStayRolledUp()` (not in liquid, not leashed,
-// not a passenger or vehicle).
+// satisfies vanilla `Armadillo.canStayRolledUp()` (`!isPanicking() && !isInLiquid() && !isLeashed() && !isPassenger() && !isVehicle()`).
 func (s *Server) CanArmadilloEntityStayRolledUp(entityID int32) bool {
 	if s == nil || s.entities == nil {
 		return false
@@ -433,23 +438,19 @@ func (s *Server) CanArmadilloEntityStayRolledUp(entityID int32) bool {
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeArmadillo {
 		return false
 	}
-	inLiquid := false
-	if cache := s.DimensionChunks(ent.EffectiveDimension()); cache != nil {
-		bx := int(math.Floor(ent.X))
-		by := int(math.Floor(ent.Y))
-		bz := int(math.Floor(ent.Z))
-		blk := cache.GetBlock(bx, by, bz)
-		if blk == world.StateWater || world.BlockName(blk) == "minecraft:lava" {
-			inLiquid = true
-		}
+	isPanicking := false
+	if st, ok := s.GetArmadilloState(entityID); ok && st.PanicTicks > 0 {
+		isPanicking = true
 	}
+	inLiquid := isEntityTouchingLiquidAt2612(s, ent.EffectiveDimension(), ent.X, ent.Y, ent.Z)
 	isLeashed := s.IsEntityLeashed(entityID)
-	return CanArmadilloStayRolledUp(false, inLiquid, isLeashed, false, false)
+	isPassenger := s.MountedVehicleOfEntity(nil, entityID) != 0
+	return CanArmadilloStayRolledUp(isPanicking, inLiquid, isLeashed, isPassenger, false)
 }
 
 // BeginRollUpArmadillo starts the 10-tick `ArmadilloStateRolling` curling
 // transition (`IDLE -> ROLLING -> SCARED`), resetting love, broadcasting
-// `ARMADILLO_STATE = ROLLING`, and playing `SoundArmadilloRoll`.
+// `ARMADILLO_STATE = ROLLING`, and playing `SoundArmadilloRoll` (`Armadillo.rollUp`).
 func (s *Server) BeginRollUpArmadillo(entityID int32) bool {
 	if s == nil || s.entities == nil || !s.CanArmadilloEntityStayRolledUp(entityID) {
 		return false
@@ -462,14 +463,26 @@ func (s *Server) BeginRollUpArmadillo(entityID int32) bool {
 	if st == nil {
 		return false
 	}
-	s.SetMobInLove(entityID, 0, nil)
 	mgr := s.armadilloManager()
 	mgr.mu.Lock()
+	if st.State != ArmadilloStateIdle {
+		if st.DangerMemoryTicks < ArmadilloDangerMemoryTicks {
+			st.DangerMemoryTicks = ArmadilloDangerMemoryTicks
+		}
+		mgr.mu.Unlock()
+		return true
+	}
 	st.State = ArmadilloStateRolling
 	st.StateTicks = ArmadilloRollingDurationTicks
 	st.InStateTicks = 0
+	st.BallUpStayTicks = 0
+	st.DangerWasAround = false
+	if st.DangerMemoryTicks < ArmadilloDangerMemoryTicks {
+		st.DangerMemoryTicks = ArmadilloDangerMemoryTicks
+	}
 	mgr.mu.Unlock()
 
+	s.SetMobInLove(entityID, 0, nil)
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
@@ -479,8 +492,8 @@ func (s *Server) BeginRollUpArmadillo(entityID int32) bool {
 	return true
 }
 
-// RollUpArmadillo causes the armadillo with entityID to curl into its shell
-// (transitioning to SCARED, resetting love, and broadcasting ARMADILLO_STATE metadata + sound).
+// RollUpArmadillo causes the armadillo with entityID to curl immediately into SCARED
+// (resetting love and broadcasting ARMADILLO_STATE metadata + sound).
 func (s *Server) RollUpArmadillo(entityID int32) bool {
 	if s == nil || s.entities == nil {
 		return false
@@ -502,6 +515,9 @@ func (s *Server) RollUpArmadillo(entityID int32) bool {
 	st.State = ArmadilloStateScared
 	st.StateTicks = ArmadilloScaredMinDurationTicks
 	st.InStateTicks = 0
+	st.BallUpStayTicks = 0
+	st.DangerMemoryTicks = ArmadilloDangerMemoryTicks
+	st.DangerWasAround = true
 	st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + ArmadilloPeekMinDelayTicks
 	mgr.mu.Unlock()
 
@@ -514,7 +530,7 @@ func (s *Server) RollUpArmadillo(entityID int32) bool {
 	return true
 }
 
-// UnrollArmadillo uncurls the armadillo with entityID back to ArmadilloStateIdle.
+// UnrollArmadillo uncurls the armadillo with entityID back to ArmadilloStateIdle (`Armadillo.rollOut`).
 func (s *Server) UnrollArmadillo(entityID int32) bool {
 	if s == nil || s.entities == nil {
 		return false
@@ -529,10 +545,17 @@ func (s *Server) UnrollArmadillo(entityID int32) bool {
 	}
 	mgr := s.armadilloManager()
 	mgr.mu.Lock()
+	wasScared := st.State != ArmadilloStateIdle
 	st.State = ArmadilloStateIdle
 	st.StateTicks = 0
 	st.InStateTicks = 0
+	st.DangerMemoryTicks = 0
+	st.DangerWasAround = false
+	st.BallUpStayTicks = 0
 	mgr.mu.Unlock()
+	if !wasScared {
+		return true
+	}
 
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
@@ -543,9 +566,16 @@ func (s *Server) UnrollArmadillo(entityID int32) bool {
 	return true
 }
 
-// OnArmadilloDamaged is invoked when an armadillo takes damage: sets panic
-// state and curls the armadillo into its shell.
+// OnArmadilloDamaged is invoked when an armadillo takes non-environmental damage:
+// sets `DANGER_DETECTED_RECENTLY` (80 ticks) and curls into `ROLLING` (`Armadillo.actuallyHurt`).
 func (s *Server) OnArmadilloDamaged(entityID int32) {
+	s.OnArmadilloDamagedWithAttacker(entityID, 0)
+}
+
+// OnArmadilloDamagedWithAttacker implements `Armadillo.actuallyHurt` when hurt by a LivingEntity:
+// records `lastHurtByMob` (100 ticks), sets `DANGER_DETECTED_RECENTLY = 80` without environmental panic,
+// and calls `rollUp()` (`IDLE -> ROLLING`) if `canStayRolledUp()`.
+func (s *Server) OnArmadilloDamagedWithAttacker(entityID, attackerEntityID int32) {
 	if s == nil {
 		return
 	}
@@ -553,16 +583,14 @@ func (s *Server) OnArmadilloDamaged(entityID int32) {
 	if st != nil {
 		mgr := s.armadilloManager()
 		mgr.mu.Lock()
-		st.PanicTicks = ArmadilloPanicDurationTicks
+		st.DangerMemoryTicks = ArmadilloDangerMemoryTicks
+		if attackerEntityID != 0 {
+			st.LastHurtByEntityID = attackerEntityID
+			st.LastHurtByTicks = ArmadilloLastHurtByTimeoutTicks
+		}
 		mgr.mu.Unlock()
 	}
-	tr := s.entityTracker()
-	tr.mu.Lock()
-	if mem := tr.mobStates[entityID]; mem != nil {
-		mem.panicTicks = ArmadilloPanicDurationTicks
-	}
-	tr.mu.Unlock()
-	s.RollUpArmadillo(entityID)
+	s.BeginRollUpArmadillo(entityID)
 }
 
 // OnArmadilloEnvironmentalPanicDamage handles vanilla `Armadillo.actuallyHurt` /
@@ -627,7 +655,8 @@ func (s *Server) HasArmadilloThreatNearby(dim string, armadilloID int32, x, y, z
 		}
 		isMounted := s.MountedVehicleOfEntity(sess, 0) != 0 || s.PlayerMountedVehicle(sess) != 0
 		isLastHurt := lastHurtBy != 0 && snap.EntityID == lastHurtBy
-		if !sess.IsSprinting() && !isMounted && !isLastHurt {
+		isSprintingNotSneaking := sess.IsSprinting() && !sess.IsSneaking()
+		if !isSprintingNotSneaking && !isMounted && !isLastHurt {
 			continue
 		}
 		dx := snap.X - x
@@ -682,7 +711,12 @@ func (s *Server) BrushArmadillo(session *PlayerSession, entityID int32, rng *ran
 	slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
 	held := session.InventorySlot(slotIdx)
 	if held.IsEmpty() || canonicalResourceName(held.ResolvedID()) != BrushItemID {
-		return 0, false
+		offHeld := session.InventorySlot(45)
+		if offHeld.IsEmpty() || canonicalResourceName(offHeld.ResolvedID()) != BrushItemID {
+			return 0, false
+		}
+		slotIdx = 45
+		held = offHeld
 	}
 
 	dim := ent.EffectiveDimension()
@@ -750,8 +784,18 @@ func (s *Server) InteractWithArmadillo(session *PlayerSession, entityID int32) (
 		return false, 0
 	}
 	held := session.HeldItem()
+	offHeld := session.InventorySlot(45)
+	if (!held.IsEmpty() && canonicalResourceName(held.ResolvedID()) == BrushItemID) ||
+		(held.IsEmpty() && !offHeld.IsEmpty() && canonicalResourceName(offHeld.ResolvedID()) == BrushItemID) ||
+		(!offHeld.IsEmpty() && canonicalResourceName(offHeld.ResolvedID()) == BrushItemID && canonicalResourceName(held.ResolvedID()) != SpiderEyeItemID) {
+		scuteID, ok := s.BrushArmadillo(session, entityID, nil)
+		return ok, scuteID
+	}
 	if held.IsEmpty() {
-		return false, 0
+		held = offHeld
+		if held.IsEmpty() {
+			return false, 0
+		}
 	}
 	itemID := canonicalResourceName(held.ResolvedID())
 
@@ -786,8 +830,10 @@ func (s *Server) InteractWithArmadillo(session *PlayerSession, entityID int32) (
 	return false, 0
 }
 
-// TickArmadillos advances all armadillo entities by one tick: checks for nearby
-// threats to curl/uncurl and ticks periodic armadillo_scute shedding.
+// TickArmadillos advances all armadillo entities by one tick (`Armadillo.customServerAiStep`
+// + `MobSensor` + `ArmadilloAi$ArmadilloBallUp` + `ARMADILLO_ROLLING_OUT`):
+//   - `IDLE -> ROLLING (10t) -> SCARED (PEEK EntityEvent=64 while dangerIsAround, -> UNROLLING when ttl < 30) -> UNROLLING (30t -> IDLE, or -> SCARED if threat returns)`
+//   - Periodic `armadillo_scute` shedding every `6000..11999` ticks (`5..10` min) on adults.
 func (s *Server) TickArmadillos(rng *rand.Rand) {
 	if s == nil || s.entities == nil {
 		return
@@ -804,34 +850,52 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 		}
 		dim := ent.EffectiveDimension()
 		cp := ent.ChunkPos()
-		if st.State != ArmadilloStateIdle && !s.CanArmadilloEntityStayRolledUp(ent.ID) {
-			s.UnrollArmadillo(ent.ID)
+
+		mgr := s.armadilloManager()
+		mgr.mu.Lock()
+		if st.PanicTicks > 0 {
+			st.PanicTicks--
+		}
+		if st.LastHurtByTicks > 0 {
+			st.LastHurtByTicks--
+			if st.LastHurtByTicks == 0 {
+				st.LastHurtByEntityID = 0
+			}
+		}
+		mgr.mu.Unlock()
+
+		canStay := s.CanArmadilloEntityStayRolledUp(ent.ID)
+		if !canStay {
+			if st.State != ArmadilloStateIdle {
+				s.UnrollArmadillo(ent.ID)
+			}
 			continue
 		}
 		threatNearby := s.HasArmadilloThreatNearby(dim, ent.ID, ent.X, ent.Y, ent.Z)
 
-		mgr := s.armadilloManager()
 		mgr.mu.Lock()
 		st.InStateTicks++
-		if st.PanicTicks > 0 {
-			st.PanicTicks--
+		if threatNearby {
+			st.DangerMemoryTicks = ArmadilloDangerMemoryTicks
+		} else if st.DangerMemoryTicks > 0 {
+			st.DangerMemoryTicks--
 		}
 		if st.ScuteShedTimer <= 0 {
 			st.ScuteShedTimer = ArmadilloScuteShedMinTicks
 			if rng != nil {
-				st.ScuteShedTimer += rng.Intn(ArmadilloScuteShedMaxTicks - ArmadilloScuteShedMinTicks + 1)
+				st.ScuteShedTimer += rng.Intn(ArmadilloScuteShedMaxTicks - ArmadilloScuteShedMinTicks)
 			}
 		}
 
-		// Periodic scute shedding (adults only).
+		// Periodic scute shedding (adults only, respects doMobLoot).
 		shedScute := false
 		if !s.IsMobBaby(ent.ID) {
 			st.ScuteShedTimer--
 			if st.ScuteShedTimer <= 0 {
-				shedScute = true
+				shedScute = s.DoMobLoot()
 				st.ScuteShedTimer = ArmadilloScuteShedMinTicks
 				if rng != nil {
-					st.ScuteShedTimer += rng.Intn(ArmadilloScuteShedMaxTicks - ArmadilloScuteShedMinTicks + 1)
+					st.ScuteShedTimer += rng.Intn(ArmadilloScuteShedMaxTicks - ArmadilloScuteShedMinTicks)
 				}
 			}
 		}
@@ -841,65 +905,82 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 		shouldBroadcast := false
 		fromRolling := false
 		shouldPeek := false
+		resetLove := false
 
 		switch curState {
 		case ArmadilloStateIdle:
-			if threatNearby {
-				st.State = ArmadilloStateScared
-				st.StateTicks = ArmadilloScaredMinDurationTicks
+			if st.DangerMemoryTicks > 0 && ent.OnGround {
+				st.State = ArmadilloStateRolling
+				st.StateTicks = ArmadilloRollingDurationTicks
 				st.InStateTicks = 0
-				st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + ArmadilloPeekMinDelayTicks
-				broadcastState = ArmadilloStateScared
+				st.BallUpStayTicks = 0
+				st.DangerWasAround = false
+				broadcastState = ArmadilloStateRolling
 				shouldBroadcast = true
+				resetLove = true
 			}
 		case ArmadilloStateRolling:
-			st.StateTicks--
-			if st.StateTicks <= 0 {
+			st.BallUpStayTicks++
+			if st.NextPeekTimer > 0 {
+				st.NextPeekTimer--
+			}
+			if st.StateTicks > 0 {
+				st.StateTicks--
+			}
+			if st.InStateTicks >= ArmadilloRollingDurationTicks || st.StateTicks <= 0 {
 				st.State = ArmadilloStateScared
 				st.StateTicks = ArmadilloScaredMinDurationTicks
 				st.InStateTicks = 0
-				st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + ArmadilloPeekMinDelayTicks
+				dangerAround := st.DangerMemoryTicks > ArmadilloDangerThresholdTicks
+				st.DangerWasAround = dangerAround
+				st.NextPeekTimer = pickNextArmadilloPeekTimer2612(rng)
 				broadcastState = ArmadilloStateScared
 				shouldBroadcast = true
 				fromRolling = true
 			}
 		case ArmadilloStateScared:
+			st.BallUpStayTicks++
 			if st.NextPeekTimer > 0 {
 				st.NextPeekTimer--
-				if st.NextPeekTimer == 0 && ent.OnGround {
-					shouldPeek = true
-					delay := ArmadilloPeekMinDelayTicks
-					if rng != nil {
-						delay += rng.Intn(ArmadilloPeekMaxDelayTicks - ArmadilloPeekMinDelayTicks + 1)
-					}
-					st.NextPeekTimer = ArmadilloScaredAnimationDurationTicks + delay
-				}
 			}
-			if threatNearby {
-				st.StateTicks = ArmadilloScaredMinDurationTicks
-			} else {
-				st.StateTicks--
-				if st.StateTicks <= 0 {
-					st.State = ArmadilloStateUnrolling
-					st.StateTicks = ArmadilloUnrollingDurationTicks
-					st.InStateTicks = 0
-					broadcastState = ArmadilloStateUnrolling
-					shouldBroadcast = true
-				}
+			dangerIsAround := st.DangerMemoryTicks > ArmadilloDangerThresholdTicks
+			if dangerIsAround != st.DangerWasAround {
+				st.NextPeekTimer = pickNextArmadilloPeekTimer2612(rng)
+				st.DangerWasAround = dangerIsAround
+			}
+			if st.NextPeekTimer == 0 && ent.OnGround && dangerIsAround {
+				shouldPeek = true
+				st.NextPeekTimer = pickNextArmadilloPeekTimer2612(rng)
+			}
+			if st.DangerMemoryTicks < ArmadilloUnrollingDurationTicks || st.BallUpStayTicks >= ArmadilloBallUpStayInStateTicks {
+				st.State = ArmadilloStateUnrolling
+				st.StateTicks = ArmadilloUnrollingDurationTicks
+				st.InStateTicks = 0
+				broadcastState = ArmadilloStateUnrolling
+				shouldBroadcast = true
 			}
 		case ArmadilloStateUnrolling:
-			if threatNearby {
+			st.BallUpStayTicks++
+			if st.NextPeekTimer > 0 {
+				st.NextPeekTimer--
+			}
+			if st.DangerMemoryTicks > ArmadilloUnrollingDurationTicks && st.BallUpStayTicks < ArmadilloBallUpStayInStateTicks {
 				st.State = ArmadilloStateScared
 				st.StateTicks = ArmadilloScaredMinDurationTicks
 				st.InStateTicks = 0
 				broadcastState = ArmadilloStateScared
 				shouldBroadcast = true
 			} else {
-				st.StateTicks--
-				if st.StateTicks <= 0 {
+				if st.StateTicks > 0 {
+					st.StateTicks--
+				}
+				if st.DangerMemoryTicks <= 0 || st.StateTicks <= 0 {
 					st.State = ArmadilloStateIdle
 					st.StateTicks = 0
 					st.InStateTicks = 0
+					st.DangerMemoryTicks = 0
+					st.DangerWasAround = false
+					st.BallUpStayTicks = 0
 					broadcastState = ArmadilloStateIdle
 					shouldBroadcast = true
 				}
@@ -907,6 +988,9 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 		}
 		mgr.mu.Unlock()
 
+		if resetLove {
+			s.SetMobInLove(ent.ID, 0, nil)
+		}
 		if shouldPeek {
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
 				EncodeEntityEventPacket(ent.ID, EntityEventArmadilloPeek))
@@ -925,13 +1009,19 @@ func (s *Server) TickArmadillos(rng *rand.Rand) {
 			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 				EncodeArmadilloEntityDataPacket(ent.ID, broadcastState))
 			switch broadcastState {
-			case ArmadilloStateScared:
-				snd := SoundArmadilloRoll
-				if fromRolling && ent.OnGround {
-					snd = SoundArmadilloLand
-				}
+			case ArmadilloStateRolling:
 				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-					EncodeSoundPacket(snd, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+					EncodeSoundPacket(SoundArmadilloRoll, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+			case ArmadilloStateScared:
+				if fromRolling {
+					if ent.OnGround {
+						s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+							EncodeSoundPacket(SoundArmadilloLand, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+					}
+				} else {
+					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+						EncodeSoundPacket(SoundArmadilloRoll, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+				}
 			case ArmadilloStateUnrolling:
 				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 					EncodeSoundPacket(SoundArmadilloUnrollStart, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))

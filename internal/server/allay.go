@@ -24,13 +24,13 @@ const (
 
 	AllayPickupRange               float64 = 32.0
 	AllayFollowPlayerRange         float64 = 64.0
-	AllayDeliveryStopDist          float64 = 2.0
+	AllayDeliveryStopDist          float64 = 3.0  // GoAndGiveItemsToTarget.CLOSE_ENOUGH_DISTANCE_TO_TARGET = 3
 	AllayNoteBlockRange            float64 = 16.0
 	AllayNoteBlockListenTicks      int     = 600  // 30 seconds (600 ticks) bound to a played note_block
 	AllayJukeboxDanceRange         float64 = 10.0 // 10 blocks around an active jukebox
 	AllayDuplicationCooldownTicks  int     = 6000 // 5 minutes (6000 ticks) between amethyst_shard duplications
 	AllayInventoryMaxStack         int32   = 64
-	AllayThrowCollectDelayTicks    int     = 40   // Wait up to 2s after picking up an item before throwing delivery
+	AllayThrowCollectDelayTicks    int     = 60   // GoAndGiveItemsToTarget: ITEM_PICKUP_COOLDOWN_TICKS = 60 (3s)
 
 	AmethystShardItemID = "minecraft:amethyst_shard"
 	NoteBlockName       = "minecraft:note_block"
@@ -57,7 +57,10 @@ const (
 type AllayBehaviorState struct {
 	EntityID                 int32
 	HeldItem                 world.ItemStack
+	HeldItemMeta             ItemMeta
+	HeldPotionID             string
 	CollectedCount           int32
+	CollectedStacks          []allayInventoryEntry
 	LikedPlayerUUID          [16]byte
 	HasLikedPlayer           bool
 	NoteBlockDimension       string
@@ -70,6 +73,7 @@ type AllayBehaviorState struct {
 	CanDuplicate             bool
 	DuplicationCooldownTicks int
 	DeliveryDelayTicks       int
+	PanicTicks               int
 	RegenTickCounter         int
 	LastDeliveredEntityID    int32
 }
@@ -125,7 +129,19 @@ func (s *Server) GetAllayState(entityID int32) (AllayBehaviorState, bool) {
 	if !ok || st == nil {
 		return AllayBehaviorState{}, false
 	}
-	return *st, true
+	cp := *st
+	cp.HeldItemMeta = st.HeldItemMeta.Clone()
+	if len(st.CollectedStacks) > 0 {
+		cp.CollectedStacks = make([]allayInventoryEntry, len(st.CollectedStacks))
+		for i := range st.CollectedStacks {
+			cp.CollectedStacks[i] = allayInventoryEntry{
+				Stack:    st.CollectedStacks[i].Stack,
+				Meta:     st.CollectedStacks[i].Meta.Clone(),
+				PotionID: st.CollectedStacks[i].PotionID,
+			}
+		}
+	}
+	return cp, true
 }
 
 // EncodeAllayEntityDataPacket encodes a ClientboundSetEntityDataPacket (0x63)
@@ -409,6 +425,22 @@ func cloneAllayItemStackWithCount(src world.ItemStack, count int32) world.ItemSt
 	return world.NewItemStack(src.ResolvedItemID(), count)
 }
 
+func (s *Server) spawnAllayItemWithMeta(dim string, x, y, z float64, stack world.ItemStack, meta ItemMeta, potionID string) int32 {
+	id, _ := s.SpawnItemEntityInDimension(dim, x, y, z, stack)
+	if id > 0 {
+		if !meta.IsEmpty() {
+			ft := s.fishingTracker()
+			ft.mu.Lock()
+			ft.droppedMeta[id] = meta.Clone()
+			ft.mu.Unlock()
+		}
+		if normPot := normalizeOptionalPotionID2612(potionID); normPot != "" && IsPotionOrTippedArrowItem(stack) {
+			s.AssociateDroppedPotionEntity(id, normPot)
+		}
+	}
+	return id
+}
+
 // DropAllayInventoryOnDeath drops the Allay's main-hand HeldItem and any
 // collected items in its internal inventory when the Allay dies.
 func (s *Server) DropAllayInventoryOnDeath(entityID int32) []int32 {
@@ -425,7 +457,10 @@ func (s *Server) DropAllayInventoryOnDeath(entityID int32) []int32 {
 		return nil
 	}
 	held := st.HeldItem
+	heldMeta := st.HeldItemMeta.Clone()
+	heldPot := st.HeldPotionID
 	collected := st.CollectedCount
+	stacks := append([]allayInventoryEntry(nil), st.CollectedStacks...)
 	mgr.mu.Unlock()
 
 	if ent == nil {
@@ -433,11 +468,17 @@ func (s *Server) DropAllayInventoryOnDeath(entityID int32) []int32 {
 	}
 	dim := ent.EffectiveDimension()
 	var dropped []int32
-	if id, _ := s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, cloneAllayItemStackWithCount(held, held.Count)); id > 0 {
+	if id := s.spawnAllayItemWithMeta(dim, ent.X, ent.Y+0.25, ent.Z, cloneAllayItemStackWithCount(held, held.Count), heldMeta, heldPot); id > 0 {
 		dropped = append(dropped, id)
 	}
-	if collected > 0 {
-		if id, _ := s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, cloneAllayItemStackWithCount(held, collected)); id > 0 {
+	if len(stacks) > 0 {
+		for _, entry := range stacks {
+			if id := s.spawnAllayItemWithMeta(dim, ent.X, ent.Y+0.25, ent.Z, entry.Stack, entry.Meta, entry.PotionID); id > 0 {
+				dropped = append(dropped, id)
+			}
+		}
+	} else if collected > 0 {
+		if id := s.spawnAllayItemWithMeta(dim, ent.X, ent.Y+0.25, ent.Z, cloneAllayItemStackWithCount(held, collected), ItemMeta{}, heldPot); id > 0 {
 			dropped = append(dropped, id)
 		}
 	}
@@ -445,8 +486,8 @@ func (s *Server) DropAllayInventoryOnDeath(entityID int32) []int32 {
 }
 
 // DuplicateAllay duplicates a dancing Allay when given a `minecraft:amethyst_shard`,
-// spawning a new Allay at the same location and placing both on a 6000-tick (5m)
-// duplication cooldown.
+// spawning a new Allay at the same location (`setPersistenceRequired()`) and placing
+// both on a 6000-tick (5m) duplication cooldown.
 func (s *Server) DuplicateAllay(entityID int32) (newAllayID int32, ok bool) {
 	if s == nil || s.entities == nil {
 		return 0, false
@@ -475,6 +516,7 @@ func (s *Server) DuplicateAllay(entityID int32) (newAllayID int32, ok bool) {
 	if err != nil || childID <= 0 {
 		return 0, false
 	}
+	s.SetMobPersistenceRequired2612(childID, true)
 	childSt := s.ensureAllayState(childID)
 	if childSt != nil {
 		mgr.mu.Lock()
@@ -504,9 +546,10 @@ func (s *Server) DuplicateAllay(entityID int32) (newAllayID int32, ok bool) {
 //   - If the Allay is dancing, can duplicate, and the player holds `minecraft:amethyst_shard`,
 //     duplicates the Allay and consumes 1 shard in survival.
 //   - If the player holds an item and the Allay's hand is empty, gives 1 item to
-//     the Allay and binds the Allay to the player.
+//     the Allay (preserving ItemMeta & potion components) and binds the Allay to the player.
 //   - If the player's hand is empty and the Allay holds an item, retrieves the
-//     held item (and any collected items) back to the player and unbinds the Allay.
+//     held item (preserving ItemMeta & potion components) and throws any collected
+//     internal inventory items, unbinding `LIKED_PLAYER`.
 func (s *Server) InteractWithAllay(session *PlayerSession, entityID int32) (handled bool, duplicatedAllayID int32) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return false, 0
@@ -530,6 +573,7 @@ func (s *Server) InteractWithAllay(session *PlayerSession, entityID int32) (hand
 	if st == nil {
 		return false, 0
 	}
+	slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
 	held := session.HeldItem()
 	heldID := ""
 	if !held.IsEmpty() {
@@ -550,6 +594,8 @@ func (s *Server) InteractWithAllay(session *PlayerSession, entityID int32) (hand
 
 	// 2. Give 1 item to an empty-handed Allay.
 	if !held.IsEmpty() {
+		givenMeta := GetSlotItemMeta(session, slotIdx).Clone()
+		givenPotion := normalizeOptionalPotionID2612(GetSlotPotionType(session, slotIdx))
 		mgr.mu.Lock()
 		if !st.HeldItem.IsEmpty() {
 			mgr.mu.Unlock()
@@ -557,36 +603,97 @@ func (s *Server) InteractWithAllay(session *PlayerSession, entityID int32) (hand
 		}
 		given := cloneAllayItemStackWithCount(held, 1)
 		st.HeldItem = given
+		st.HeldItemMeta = givenMeta
+		st.HeldPotionID = givenPotion
 		st.LikedPlayerUUID = session.Profile.UUID
 		st.HasLikedPlayer = true
 		mgr.mu.Unlock()
 
+		wasSingle := held.Count <= 1 && snap.GameMode != GameModeCreative
 		consumeOneHeldItemInSurvival(session)
+		if wasSingle {
+			SetSlotItemMeta(session, slotIdx, ItemMeta{})
+			SetSlotPotionType(session, slotIdx, "")
+		}
 		s.broadcastAllayEquipment(ent, given)
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 			EncodeSoundPacket(SoundAllayItemGiven, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		return true, 0
 	}
 
-	// 3. Empty hand: take item(s) back from the Allay.
+	// 3. Empty hand: take main-hand item back (preserving components) and throw collected inventory stacks.
 	mgr.mu.Lock()
 	if st.HeldItem.IsEmpty() {
 		mgr.mu.Unlock()
 		return false, 0
 	}
-	returnedItem := st.HeldItem
+	returnedItem := cloneAllayItemStackWithCount(st.HeldItem, 1)
+	returnedMeta := st.HeldItemMeta.Clone()
+	returnedPotion := st.HeldPotionID
 	extraCount := st.CollectedCount
+	extraStacks := append([]allayInventoryEntry(nil), st.CollectedStacks...)
 	st.HeldItem = world.ItemStack{}
+	st.HeldItemMeta = ItemMeta{}
+	st.HeldPotionID = ""
 	st.CollectedCount = 0
+	st.CollectedStacks = nil
 	st.HasLikedPlayer = false
 	st.LikedPlayerUUID = [16]byte{}
 	mgr.mu.Unlock()
 
-	totalReturn := returnedItem.Count + extraCount
-	returnStack := cloneAllayItemStackWithCount(returnedItem, totalReturn)
-	added, _ := session.AddItemToInventory(returnStack)
-	if rem := totalReturn - added; rem > 0 {
-		s.SpawnItemEntityInDimension(dim, snap.X, snap.Y+0.5, snap.Z, cloneAllayItemStackWithCount(returnedItem, rem))
+	placedMainHand := false
+	if curSlot := session.InventorySlot(slotIdx); curSlot.IsEmpty() {
+		session.SetInventorySlot(slotIdx, returnedItem)
+		SetSlotItemMeta(session, slotIdx, returnedMeta)
+		SetSlotPotionType(session, slotIdx, returnedPotion)
+		placedMainHand = true
+	} else if returnedMeta.IsEmpty() && returnedPotion == "" {
+		if added, _ := session.AddItemToInventory(returnedItem); added >= returnedItem.Count {
+			placedMainHand = true
+		}
+	} else {
+		for sIdx := int(world.HotbarContainerOffset); sIdx < int(world.HotbarContainerOffset)+9; sIdx++ {
+			if session.InventorySlot(sIdx).IsEmpty() {
+				session.SetInventorySlot(sIdx, returnedItem)
+				SetSlotItemMeta(session, sIdx, returnedMeta)
+				SetSlotPotionType(session, sIdx, returnedPotion)
+				placedMainHand = true
+				break
+			}
+		}
+		if !placedMainHand {
+			for sIdx := 9; sIdx < int(world.HotbarContainerOffset); sIdx++ {
+				if session.InventorySlot(sIdx).IsEmpty() {
+					session.SetInventorySlot(sIdx, returnedItem)
+					SetSlotItemMeta(session, sIdx, returnedMeta)
+					SetSlotPotionType(session, sIdx, returnedPotion)
+					placedMainHand = true
+					break
+				}
+			}
+		}
+	}
+	if !placedMainHand {
+		s.spawnAllayItemWithMeta(dim, snap.X, snap.Y+0.5, snap.Z, returnedItem, returnedMeta, returnedPotion)
+	}
+
+	if len(extraStacks) > 0 {
+		for _, entry := range extraStacks {
+			if entry.Meta.IsEmpty() && entry.PotionID == "" {
+				added, _ := session.AddItemToInventory(entry.Stack)
+				if rem := entry.Stack.Count - added; rem > 0 {
+					s.spawnAllayItemWithMeta(dim, ent.X, ent.Y+0.5, ent.Z, cloneAllayItemStackWithCount(entry.Stack, rem), ItemMeta{}, "")
+				}
+			} else {
+				s.spawnAllayItemWithMeta(dim, ent.X, ent.Y+0.5, ent.Z, entry.Stack, entry.Meta, entry.PotionID)
+			}
+		}
+	} else if extraCount > 0 {
+		extraStack := cloneAllayItemStackWithCount(returnedItem, extraCount)
+		added, _ := session.AddItemToInventory(extraStack)
+		if rem := extraCount - added; rem > 0 {
+			s.spawnAllayItemWithMeta(dim, ent.X, ent.Y+0.5, ent.Z, cloneAllayItemStackWithCount(returnedItem, rem), ItemMeta{}, returnedPotion)
+		}
 	}
 
 	s.broadcastAllayEquipment(ent, world.ItemStack{})
@@ -666,9 +773,17 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 			}
 		}
 
-		// 2. Duplication cooldown & Note Block listener timer & Jukebox range check.
+		// 2. Duplication cooldown, panic state (`shouldStopDancing`), Note Block listener timer & Jukebox range check.
 		mgr.mu.Lock()
 		stateBroadcastNeeded := false
+		if st.PanicTicks > 0 {
+			st.PanicTicks--
+			if st.Dancing {
+				st.Dancing = false
+				st.HasJukeboxPos = false
+				stateBroadcastNeeded = true
+			}
+		}
 		if st.DuplicationCooldownTicks > 0 {
 			st.DuplicationCooldownTicks--
 			if st.DuplicationCooldownTicks == 0 && !st.CanDuplicate {
@@ -709,15 +824,15 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 			s.broadcastAllayState(ent, snap)
 		}
 
-		// 3. Item pickup & delivery when holding a filter item.
+		// 3. Item pickup & delivery when holding a filter item (`Allay.wantsToPickUp`: checks `mobGriefing` and `allayConsidersItemEqual`).
 		if snap.HeldItem.IsEmpty() {
 			continue
 		}
 		wantID := canonicalResourceName(snap.HeldItem.ResolvedID())
 		maxInv := AllayMaxInventoryCountForItem(wantID)
 
-		// Look for matching dropped item entities within 32 blocks if inventory has room and not on throw cooldown.
-		if snap.CollectedCount < maxInv && snap.DeliveryDelayTicks <= 0 {
+		// Look for matching dropped item entities within 32 blocks if mobGriefing is enabled, inventory has room, and not on throw cooldown.
+		if s.MobGriefing() && snap.CollectedCount < maxInv && snap.DeliveryDelayTicks <= 0 {
 			var bestItem *world.Entity
 			bestDistSq := AllayPickupRange * AllayPickupRange
 			for j := range allEnts {
@@ -728,7 +843,8 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 				if cand.PickupDelay > 0 && cand.ID == snap.LastDeliveredEntityID {
 					continue
 				}
-				if canonicalResourceName(cand.Item.ResolvedID()) != wantID {
+				candPotion, _ := s.DroppedPotionEntityType(cand.ID)
+				if !AllayConsidersItemEqual2612(snap.HeldItem, snap.HeldPotionID, cand.Item, candPotion) {
 					continue
 				}
 				dx := cand.X - ent.X
@@ -750,8 +866,28 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 						take = space
 					}
 					if take > 0 {
+						var pickedMeta ItemMeta
+						ft := s.fishingTracker()
+						ft.mu.Lock()
+						if dm, hasDM := ft.droppedMeta[bestItem.ID]; hasDM {
+							pickedMeta = dm.Clone()
+							if take >= bestItem.Item.Count {
+								delete(ft.droppedMeta, bestItem.ID)
+							}
+						}
+						ft.mu.Unlock()
+						pickedPotion, _ := s.DroppedPotionEntityType(bestItem.ID)
+						if take >= bestItem.Item.Count {
+							s.TakeDroppedPotionEntityType(bestItem.ID)
+						}
+
 						mgr.mu.Lock()
 						st.CollectedCount += take
+						st.CollectedStacks = append(st.CollectedStacks, allayInventoryEntry{
+							Stack:    cloneAllayItemStackWithCount(bestItem.Item, take),
+							Meta:     pickedMeta,
+							PotionID: pickedPotion,
+						})
 						st.DeliveryDelayTicks = 0
 						snap = *st
 						mgr.mu.Unlock()
@@ -778,7 +914,7 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 			}
 		}
 
-		// 4. Deliver collected items to bound Note Block (priority) or LikedPlayer,
+		// 4. Deliver collected items to bound Note Block (priority) or non-spectator LikedPlayer within 64 blocks,
 		// or follow LikedPlayer / bound Note Block when idle.
 		var targetX, targetY, targetZ float64
 		hasTarget := false
@@ -792,9 +928,14 @@ func (s *Server) TickAllays(rng *rand.Rand) {
 		} else if snap.HasLikedPlayer {
 			if owner := s.findPlayerByUUID(snap.LikedPlayerUUID); owner != nil && !owner.IsDead() {
 				osnap := owner.Snapshot()
-				if world.NormalizeDimension(osnap.Dimension) == dim {
-					targetX, targetY, targetZ = osnap.X, osnap.Y+1.0, osnap.Z
-					hasTarget = true
+				if osnap.GameMode != GameModeSpectator && osnap.Health > 0 && world.NormalizeDimension(osnap.Dimension) == dim {
+					pdx := osnap.X - ent.X
+					pdy := (osnap.Y + 1.0) - ent.Y
+					pdz := osnap.Z - ent.Z
+					if pdx*pdx+pdy*pdy+pdz*pdz <= AllayFollowPlayerRange*AllayFollowPlayerRange {
+						targetX, targetY, targetZ = osnap.X, osnap.Y+1.0, osnap.Z
+						hasTarget = true
+					}
 				}
 			}
 		}
@@ -854,15 +995,28 @@ func (s *Server) throwAllayCollectedItems(ent *world.Entity, st *AllayBehaviorSt
 		mgr.mu.Unlock()
 		return
 	}
-	dropStack := cloneAllayItemStackWithCount(st.HeldItem, st.CollectedCount)
+	held := st.HeldItem
+	heldPot := st.HeldPotionID
+	count := st.CollectedCount
+	stacks := append([]allayInventoryEntry(nil), st.CollectedStacks...)
 	st.CollectedCount = 0
+	st.CollectedStacks = nil
 	st.DeliveryDelayTicks = AllayThrowCollectDelayTicks
 	hasLiked := st.HasLikedPlayer
 	likedUUID := st.LikedPlayerUUID
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
-	dropID, _ := s.SpawnItemEntityInDimension(dim, tx, ty, tz, dropStack)
+	var dropID int32
+	if len(stacks) > 0 {
+		for _, entry := range stacks {
+			if id := s.spawnAllayItemWithMeta(dim, tx, ty, tz, entry.Stack, entry.Meta, entry.PotionID); id > 0 {
+				dropID = id
+			}
+		}
+	} else {
+		dropID = s.spawnAllayItemWithMeta(dim, tx, ty, tz, cloneAllayItemStackWithCount(held, count), ItemMeta{}, heldPot)
+	}
 	mgr.mu.Lock()
 	st.LastDeliveredEntityID = dropID
 	mgr.mu.Unlock()

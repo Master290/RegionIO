@@ -66,8 +66,8 @@ func TestBeeFlowerPollinationAndCropGrowth(t *testing.T) {
 	}
 	rng := rand.New(rand.NewSource(42))
 
-	// Tick 400 times over the flower to complete pollination.
-	for i := 0; i < BeePollinateTargetTicks+2; i++ {
+	// Tick over the flower until pollination completes (`successfulPollinatingTicks > 400`, max 600).
+	for i := 0; i < BeePollinateMaxDurationTicks; i++ {
 		ent := srv.entities.Get(beeID)
 		srv.TickBeeAI(ent, cache, nil, rng)
 		st, _ := srv.BeeStateFor(beeID)
@@ -565,19 +565,19 @@ func TestBeeWitherRoseEyeblossomTallFlowersPitcherCropWaterAndPersistence(t *tes
 		t.Fatalf("expected pitcher_crop[age=1] to become double-height age=2, got lower=%v upper=%v", lowerProps, upperProps)
 	}
 
-	// 6. Water submersion damage: 20 ticks submerged in water deals 1.0 damage.
+	// 6. Water submersion damage: `underWaterTicks > 20` (21st tick submerged in water deals 1.0 drown damage).
 	cache.SetBlock(90, 65, 90, world.StateWater)
 	beeWater, _ := srv.SpawnBee(dim, 90.5, 65.2, 90.5, false)
 	hpBefore := srv.MobHealth(beeWater)
-	for i := 0; i < 20; i++ {
-		// Keep bee submerged at (90.5, 65.2, 90.5) for 20 ticks.
+	for i := 0; i < 21; i++ {
+		// Keep bee submerged at (90.5, 65.2, 90.5) for 21 ticks.
 		srv.entities.Update(beeWater, func(e *world.Entity) {
 			e.X, e.Y, e.Z = 90.5, 65.2, 90.5
 		})
 		srv.TickBeeAI(srv.entities.Get(beeWater), cache, nil, rng)
 	}
 	if hpAfter := srv.MobHealth(beeWater); hpAfter >= hpBefore {
-		t.Fatalf("expected bee submerged in water for 20 ticks to take damage: before=%v after=%v", hpBefore, hpAfter)
+		t.Fatalf("expected bee submerged in water for >20 ticks to take damage: before=%v after=%v", hpBefore, hpAfter)
 	}
 
 	// 7. Worldgen tree-decorator StructureBlockEntity{ID: "minecraft:beehive"} hydration + NBT & file persistence.

@@ -1444,6 +1444,21 @@ func (s *Server) stepHostileSpiderFamilyAI(
 	z float64,
 	yaw float32,
 ) (nextX, nextY, nextZ float64, nextYaw float32, attackTarget *PlayerSession, leaped bool) {
+	return s.stepHostileSpiderFamilyAIInDimension(world.DimensionOverworld, spiderType, chunks, rng, mem, targets, x, feetY, z, yaw)
+}
+
+func (s *Server) stepHostileSpiderFamilyAIInDimension(
+	dimension string,
+	spiderType string,
+	chunks *world.Cache,
+	rng *rand.Rand,
+	mem *mobMemory,
+	targets []playerTarget,
+	x float64,
+	feetY int,
+	z float64,
+	yaw float32,
+) (nextX, nextY, nextZ float64, nextYaw float32, attackTarget *PlayerSession, leaped bool) {
 	width, height, _ := SpiderDimensionsForType2612(spiderType)
 	if mem.attackCooldown > 0 {
 		mem.attackCooldown--
@@ -1456,7 +1471,7 @@ func (s *Server) stepHostileSpiderFamilyAI(
 	}
 
 	if s != nil {
-		if _, ax, _, az, armOK := s.HasUnrolledArmadilloNearSpider(world.DimensionOverworld, x, float64(feetY), z, SpiderArmadilloAvoidRange); armOK {
+		if _, ax, _, az, armOK := s.HasUnrolledArmadilloNearSpider(dimension, x, float64(feetY), z, SpiderArmadilloAvoidRange); armOK {
 			awayX := x - ax
 			awayZ := z - az
 			dist := math.Hypot(awayX, awayZ)
@@ -2050,9 +2065,9 @@ func (s *Server) TickMobsInCauldrons() {
 		}
 		if !IsFireImmuneMob(mob.TypeName) && !s.HasEntityEffect(mob.ID, EffectFireResistance) {
 			if dmg, ok := s.CampfireContactDamageAt(dim, bx, by, bz); ok && dmg > 0 {
-				s.applyDamageToMob(mob, dmg, nil, 0, false, false)
+				s.applyEnvironmentalPanicDamageToMob(mob, dmg)
 			} else if fDmg, fOK := s.FireDamageAtPosition(dim, mob.X, mob.Y, mob.Z, 0.6, 1.8); fOK && fDmg > 0 {
-				s.applyDamageToMob(mob, fDmg, nil, 0, false, false)
+				s.applyEnvironmentalPanicDamageToMob(mob, fDmg)
 			}
 		}
 	}

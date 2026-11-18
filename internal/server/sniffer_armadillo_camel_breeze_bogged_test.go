@@ -203,6 +203,13 @@ func TestArmadilloThreatRollUpDamageReductionScuteAndBreeding(t *testing.T) {
 		t.Fatal("expected armadillo to curl up when undead zombie is within 7 blocks")
 	}
 	st, _ := srv.GetArmadilloState(armID)
+	if st.State != ArmadilloStateRolling {
+		t.Fatalf("armadillo state after 1st threat tick = %d, want %d (ROLLING)", st.State, ArmadilloStateRolling)
+	}
+	for i := 0; i < ArmadilloRollingDurationTicks; i++ {
+		srv.TickArmadillos(rng)
+	}
+	st, _ = srv.GetArmadilloState(armID)
 	if st.State != ArmadilloStateScared {
 		t.Fatalf("armadillo state = %d, want %d (SCARED)", st.State, ArmadilloStateScared)
 	}
@@ -228,9 +235,9 @@ func TestArmadilloThreatRollUpDamageReductionScuteAndBreeding(t *testing.T) {
 		t.Fatalf("armadillo HP after rolled hit = %v, want %v", gotHP, DefaultArmadilloMaxHealth-2.5)
 	}
 
-	// Remove the zombie threat and tick until the armadillo unrolls back to IDLE.
+	// Remove the zombie threat and tick until `lastHurtByMob` (100t) + `DANGER_DETECTED_RECENTLY` (80t) expire so the armadillo unrolls back to IDLE.
 	srv.entities.Remove(zombieID)
-	for i := 0; i < ArmadilloScaredMinDurationTicks+ArmadilloUnrollingDurationTicks+5; i++ {
+	for i := 0; i < ArmadilloLastHurtByTimeoutTicks+ArmadilloDangerMemoryTicks+5; i++ {
 		srv.TickArmadillos(rng)
 	}
 	if srv.IsArmadilloRolledUp(armID) {

@@ -1671,7 +1671,7 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 	}
 
-	killed = s.applyDamageToMob(target, damage, session, kbStrength, isCrit, isStrong)
+	killed = s.applyDamageToMobInternal(target, damage, session, kbStrength, isCrit, isStrong, true, false)
 	if !killed {
 		normHit := canonicalResourceName(target.TypeName)
 		if normHit == MobTypeGuardian || normHit == MobTypeElderGuardian {
@@ -1725,12 +1725,43 @@ func (s *Server) applyDamageToMob(
 	isCrit bool,
 	isStrong bool,
 ) (killed bool) {
+	return s.applyDamageToMobInternal(target, damage, attacker, kbStrength, isCrit, isStrong, false, false)
+}
+
+func (s *Server) applyEnvironmentalPanicDamageToMob(target *world.Entity, damage float32) (killed bool) {
+	return s.applyDamageToMobInternal(target, damage, nil, 0, false, false, false, true)
+}
+
+func (s *Server) applyDamageToMobInternal(
+	target *world.Entity,
+	damage float32,
+	attacker *PlayerSession,
+	kbStrength float64,
+	isCrit bool,
+	isStrong bool,
+	alreadyReducedArmadillo bool,
+	isEnvironmentalPanic bool,
+) (killed bool) {
 	if target == nil || damage <= 0 {
 		return false
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeWarden {
 		_, killed = s.DamageWarden(target.ID, damage, attacker)
 		return killed
+	}
+	if canonicalResourceName(target.TypeName) == MobTypeAllay && s.IsAllayImmuneToAttacker(target.ID, attacker) {
+		return false
+	}
+	wasArmadilloScared := canonicalResourceName(target.TypeName) == MobTypeArmadillo && s.IsArmadilloRolledUp(target.ID)
+	if !alreadyReducedArmadillo && wasArmadilloScared {
+		damage = ReduceArmadilloRolledDamage(damage)
+		kbStrength = 0
+		if damage <= 0 {
+			if isEnvironmentalPanic {
+				s.OnArmadilloEnvironmentalPanicDamage(target.ID)
+			}
+			return false
+		}
 	}
 	if canonicalResourceName(target.TypeName) == MobTypeBat {
 		s.WakeBatOnHurt(target.ID)
@@ -1860,7 +1891,15 @@ func (s *Server) applyDamageToMob(
 		s.OnEntityDamagedWithEffects(target.ID, false)
 		normTarget := canonicalResourceName(target.TypeName)
 		if normTarget == MobTypeArmadillo {
-			s.OnArmadilloDamaged(target.ID)
+			if isEnvironmentalPanic {
+				s.OnArmadilloEnvironmentalPanicDamage(target.ID)
+			} else {
+				s.OnArmadilloDamagedWithAttacker(target.ID, attackerID)
+			}
+		} else if normTarget == MobTypeAllay {
+			s.OnAllayDamaged(target.ID)
+		} else if normTarget == MobTypeBee {
+			s.OnBeeDamaged(target.ID)
 		} else if normTarget == MobTypeBreeze {
 			s.OnBreezeDamaged(target.ID)
 		} else if normTarget == MobTypeSniffer {
@@ -1959,6 +1998,9 @@ func (s *Server) applyDamageToMob(
 				EncodeSetEntityMotionPacket(target.ID, vx, vy, vz))
 		}
 		hurtSnd, hurtSrc := mobHurtSound(target.TypeName)
+		if wasArmadilloScared {
+			hurtSnd = SoundArmadilloHurtReduced
+		}
 		s.BroadcastChunk(chunkPos.X, chunkPos.Z, PlaySoundPacketID,
 			EncodeSoundPacket(hurtSnd, hurtSrc, nextX, nextY, nextZ, 1.0, 1.0, 0))
 		return false
@@ -1975,6 +2017,9 @@ func (s *Server) applyDamageToMob(
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(target.ID, EntityEventDeath))
 	s.OnEntityDiedWithEffects(target.ID)
+	if canonicalResourceName(target.TypeName) == MobTypeAllay {
+		s.DropAllayInventoryOnDeath(target.ID)
+	}
 	s.OnRaiderKilled(target.ID, attacker)
 	_ = s.DismountEntityFromVehicle(target.ID)
 	if canonicalResourceName(target.TypeName) == MobTypeBee {
