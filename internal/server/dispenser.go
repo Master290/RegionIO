@@ -15,6 +15,7 @@ import (
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/world"
+	"regionio/internal/worldgen"
 )
 
 // Dispenser and Dropper menu, slot, timing, and LevelEvent constants for Minecraft 26.1.2 (protocol 775).
@@ -83,18 +84,43 @@ type dispenserBlockKey struct {
 	x, y, z int
 }
 
-// DispenserBlockEntity stores the 9-slot inventory and per-slot component metadata
-// for a `minecraft:dispenser` or `minecraft:dropper` block entity.
+// DispenserBlockEntity stores the 9-slot inventory, LootTable/lock/CustomName,
+// and per-slot 26.1.2 component metadata for a `minecraft:dispenser` or
+// `minecraft:dropper` block entity.
 type DispenserBlockEntity struct {
 	Dimension        string
 	X, Y, Z          int
 	IsDropper        bool
 	CustomName       string
+	CustomNameTag    nbt.Tag
+	Lock             string
+	LockTag          nbt.Tag
+	LootTable        string
+	LootTableSeed    int64
 	Slots            [DispenserSlotCount]world.ItemStack
 	SlotMeta         [DispenserSlotCount]ItemMeta
 	SlotPotions      [DispenserSlotCount]string
 	SlotFireworks    [DispenserSlotCount]FireworksComponent
 	SlotShulkerItems [DispenserSlotCount][ChestSlotCount]world.ItemStack
+	SlotShulkerData  [DispenserSlotCount]*ShulkerBoxItemData
+	SlotComponents   [DispenserSlotCount]*nbt.Compound
+}
+
+// Clone returns a deep copy of the DispenserBlockEntity.
+func (be *DispenserBlockEntity) Clone() *DispenserBlockEntity {
+	if be == nil {
+		return nil
+	}
+	cp := *be
+	cp.CustomNameTag = world.CloneNBTTag(be.CustomNameTag)
+	cp.LockTag = world.CloneNBTTag(be.LockTag)
+	for i := 0; i < DispenserSlotCount; i++ {
+		cp.SlotMeta[i] = be.SlotMeta[i].Clone()
+		cp.SlotFireworks[i] = be.SlotFireworks[i].Clone()
+		cp.SlotShulkerData[i] = be.SlotShulkerData[i].Clone()
+		cp.SlotComponents[i] = world.CloneNBTCompound(be.SlotComponents[i])
+	}
+	return &cp
 }
 
 // DispenserProjectile tracks a projectile launched by a dispenser (arrow,
@@ -130,18 +156,20 @@ type PrimedTNTState struct {
 type DropperContainerTransferFunc func(dim string, x, y, z int, facing string, stack world.ItemStack, meta ItemMeta, potionType string) (transferred bool)
 
 type serverDispenserState struct {
-	mu                sync.Mutex
-	blocks            map[dispenserBlockKey]*DispenserBlockEntity
-	shulkerBoxes      map[dispenserBlockKey]*[ChestSlotCount]world.ItemStack
-	mobEquipment      map[int32][EquipmentSlotCount]world.ItemStack
-	horseArmor        map[int32]string
-	wolfArmor         map[int32]world.ItemStack
-	llamaCarpet       map[int32]string
-	chestedAnimal     map[int32]bool
-	projectiles       map[int32]*DispenserProjectile
-	primedTNTs        map[int32]*PrimedTNTState
-	customTransferFn  DropperContainerTransferFunc
-	rng               *rand.Rand
+	mu               sync.Mutex
+	loadedStore      bool
+	loadedChunk      map[storageChunkKey]bool
+	blocks           map[dispenserBlockKey]*DispenserBlockEntity
+	shulkerBoxes     map[dispenserBlockKey]*[ChestSlotCount]world.ItemStack
+	mobEquipment     map[int32][EquipmentSlotCount]world.ItemStack
+	horseArmor       map[int32]string
+	wolfArmor        map[int32]world.ItemStack
+	llamaCarpet      map[int32]string
+	chestedAnimal    map[int32]bool
+	projectiles      map[int32]*DispenserProjectile
+	primedTNTs       map[int32]*PrimedTNTState
+	customTransferFn DropperContainerTransferFunc
+	rng              *rand.Rand
 }
 
 var serverDispensers sync.Map // map[*Server]*serverDispenserState
@@ -151,6 +179,7 @@ func (s *Server) dispenserState() *serverDispenserState {
 		return v.(*serverDispenserState)
 	}
 	actual, _ := serverDispensers.LoadOrStore(s, &serverDispenserState{
+		loadedChunk:   make(map[storageChunkKey]bool),
 		blocks:        make(map[dispenserBlockKey]*DispenserBlockEntity),
 		shulkerBoxes:  make(map[dispenserBlockKey]*[ChestSlotCount]world.ItemStack),
 		mobEquipment:  make(map[int32][EquipmentSlotCount]world.ItemStack),
@@ -163,6 +192,171 @@ func (s *Server) dispenserState() *serverDispenserState {
 		rng:           rand.New(rand.NewSource(time.Now().UnixNano())),
 	})
 	return actual.(*serverDispenserState)
+}
+
+// IsDispenserOrDropperBlockEntityID reports whether id is `minecraft:dispenser`
+// or `minecraft:dropper`.
+func IsDispenserOrDropperBlockEntityID(id string) bool {
+	switch canonicalResourceName(id) {
+	case "minecraft:dispenser", "minecraft:dropper":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) ensureDispensersLoadedLocked(ds *serverDispenserState) {
+	if ds.loadedStore {
+		return
+	}
+	ds.loadedStore = true
+	if s == nil {
+		return
+	}
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		var store *world.Store
+		if dim == world.DimensionOverworld {
+			store = s.activeFurnaceStore()
+		}
+		if store == nil {
+			if cache := s.loadedDimensionCache(dim); cache != nil {
+				store = cache.Store()
+			}
+		}
+		if store == nil {
+			continue
+		}
+		comps, err := store.LoadAllBlockEntities(IsDispenserOrDropperBlockEntityID)
+		if err != nil {
+			continue
+		}
+		for _, comp := range comps {
+			be, ok := DecodeDispenserBlockEntityNBT(comp, dim)
+			if !ok || be == nil {
+				continue
+			}
+			key := dispenserBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}
+			if _, exists := ds.blocks[key]; !exists {
+				ds.blocks[key] = be
+			}
+			ds.loadedChunk[storageChunkKey{dim: be.Dimension, cx: int32(be.X >> 4), cz: int32(be.Z >> 4)}] = true
+		}
+	}
+}
+
+func (s *Server) ensureChunkDispensersLoadedLocked(ds *serverDispenserState, dim string, cx, cz int32) {
+	s.ensureDispensersLoadedLocked(ds)
+	normDim := normalizeDispenserDim(dim)
+	ck := storageChunkKey{dim: normDim, cx: cx, cz: cz}
+	if ds.loadedChunk[ck] {
+		return
+	}
+	ds.loadedChunk[ck] = true
+	if s == nil {
+		return
+	}
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	if comps, err := cache.LoadChunkBlockEntities(cx, cz, IsDispenserOrDropperBlockEntityID); err == nil {
+		for _, comp := range comps {
+			be, ok := DecodeDispenserBlockEntityNBT(comp, normDim)
+			if !ok || be == nil {
+				continue
+			}
+			key := dispenserBlockKey{dim: normDim, x: be.X, y: be.Y, z: be.Z}
+			if _, exists := ds.blocks[key]; !exists {
+				ds.blocks[key] = be
+			}
+		}
+	}
+	// Hydrate any worldgen StructureBlockEntity (`minecraft:dispenser` / `minecraft:dropper`)
+	// without unpacking its LootTable yet so LootTable/LootTableSeed survive until first access.
+	for _, sbe := range cache.LoadedChunkStructureBlockEntities(cx, cz) {
+		if !IsDispenserOrDropperBlockEntityID(sbe.ID) {
+			continue
+		}
+		key := dispenserBlockKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := ds.blocks[key]; exists {
+			continue
+		}
+		be := &DispenserBlockEntity{
+			Dimension:     normDim,
+			X:             sbe.X,
+			Y:             sbe.Y,
+			Z:             sbe.Z,
+			IsDropper:     canonicalResourceName(sbe.ID) == "minecraft:dropper",
+			LootTable:     canonicalResourceName(sbe.LootTable),
+			LootTableSeed: sbe.LootTableSeed,
+		}
+		if sbe.LootTable == "" {
+			_ = DefaultRecipeBook()
+			for _, it := range sbe.Items {
+				if it.Slot < 0 || int(it.Slot) >= DispenserSlotCount || it.ItemID == "" || it.Count <= 0 {
+					continue
+				}
+				be.Slots[it.Slot] = world.NewNamedItemStack(it.ItemID, int32(it.Count))
+				if it.PotionID != "" {
+					be.SlotPotions[it.Slot] = strings.TrimPrefix(canonicalResourceName(it.PotionID), "minecraft:")
+				}
+			}
+		}
+		ds.blocks[key] = be
+	}
+}
+
+func (s *Server) unpackDispenserLootTableLocked(be *DispenserBlockEntity) bool {
+	if be == nil || be.LootTable == "" {
+		return false
+	}
+	lootTable := be.LootTable
+	seed := be.LootTableSeed
+	be.LootTable = ""
+	be.LootTableSeed = 0
+	if seed == 0 {
+		seed = (int64(be.X)&0x3FFFFFF)<<38 | (int64(be.Y) & 0xFFF) | ((int64(be.Z) & 0x3FFFFFF) << 12)
+		if s != nil && s.cfg.WorldSeed != 0 {
+			seed ^= s.cfg.WorldSeed
+		}
+	}
+	_ = DefaultRecipeBook()
+	if reg, err := worldgen.LoadLootAndSpawnerRegistry(); err == nil && reg != nil {
+		items := reg.FillContainer(lootTable, seed, DispenserSlotCount)
+		for _, it := range items {
+			if it.Slot < 0 || int(it.Slot) >= DispenserSlotCount || it.ItemID == "" || it.Count <= 0 {
+				continue
+			}
+			be.Slots[it.Slot] = world.NewNamedItemStack(it.ItemID, int32(it.Count))
+			if it.PotionID != "" {
+				be.SlotPotions[it.Slot] = strings.TrimPrefix(canonicalResourceName(it.PotionID), "minecraft:")
+			}
+		}
+	}
+	return true
+}
+
+func (s *Server) dispenserSlotShulkerDataLocked(be *DispenserBlockEntity, slot int) *ShulkerBoxItemData {
+	if be == nil || slot < 0 || slot >= DispenserSlotCount {
+		return nil
+	}
+	if be.SlotShulkerData[slot] != nil && !be.SlotShulkerData[slot].IsEmpty() {
+		return be.SlotShulkerData[slot].Clone()
+	}
+	hasLegacy := false
+	for i := 0; i < ChestSlotCount; i++ {
+		if !be.SlotShulkerItems[slot][i].IsEmpty() && be.SlotShulkerItems[slot][i].Count > 0 {
+			hasLegacy = true
+			break
+		}
+	}
+	if !hasLegacy && be.SlotMeta[slot].CustomName == "" {
+		return nil
+	}
+	return &ShulkerBoxItemData{
+		Slots:      be.SlotShulkerItems[slot],
+		CustomName: be.SlotMeta[slot].CustomName,
+	}
 }
 
 func normalizeDispenserDim(dim string) string {
@@ -200,12 +394,14 @@ func IsShulkerBoxItemOrBlock(name string) bool {
 
 func (s *Server) getOrCreateDispenserLocked(ds *serverDispenserState, dim string, x, y, z int) *DispenserBlockEntity {
 	normDim := normalizeDispenserDim(dim)
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	key := dispenserBlockKey{dim: normDim, x: x, y: y, z: z}
 	if be, ok := ds.blocks[key]; ok && be != nil {
 		if cache := s.DimensionChunks(normDim); cache != nil {
-			if world.BlockName(cache.GetBlock(x, y, z)) == "minecraft:dropper" {
+			bn := world.BlockName(cache.GetBlock(x, y, z))
+			if bn == "minecraft:dropper" {
 				be.IsDropper = true
-			} else if world.BlockName(cache.GetBlock(x, y, z)) == "minecraft:dispenser" {
+			} else if bn == "minecraft:dispenser" {
 				be.IsDropper = false
 			}
 		}
@@ -228,7 +424,8 @@ func (s *Server) getOrCreateDispenserLocked(ds *serverDispenserState, dim string
 	return be
 }
 
-// DispenserAt returns a snapshot of the DispenserBlockEntity at (dim, x, y, z).
+// DispenserAt returns a snapshot of the DispenserBlockEntity at (dim, x, y, z)
+// WITHOUT unpacking its LootTable.
 func (s *Server) DispenserAt(dim string, x, y, z int) (DispenserBlockEntity, bool) {
 	if s == nil {
 		return DispenserBlockEntity{}, false
@@ -237,19 +434,17 @@ func (s *Server) DispenserAt(dim string, x, y, z int) (DispenserBlockEntity, boo
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	be, ok := ds.blocks[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if !ok || be == nil {
 		return DispenserBlockEntity{}, false
 	}
-	cp := *be
-	for i := 0; i < DispenserSlotCount; i++ {
-		cp.SlotMeta[i] = be.SlotMeta[i].Clone()
-	}
-	return cp, true
+	cp := be.Clone()
+	return *cp, true
 }
 
 // DispenserSlotsInDimension returns the 9 inventory slots of the dispenser or
-// dropper at (dim, x, y, z).
+// dropper at (dim, x, y, z), unpacking any pending LootTable on first access.
 func (s *Server) DispenserSlotsInDimension(dim string, x, y, z int) [DispenserSlotCount]world.ItemStack {
 	if s == nil {
 		return [DispenserSlotCount]world.ItemStack{}
@@ -257,12 +452,19 @@ func (s *Server) DispenserSlotsInDimension(dim string, x, y, z int) [DispenserSl
 	normDim := normalizeDispenserDim(dim)
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	be := ds.blocks[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if be == nil {
+		ds.mu.Unlock()
 		return [DispenserSlotCount]world.ItemStack{}
 	}
-	return be.Slots
+	unpacked := s.unpackDispenserLootTableLocked(be)
+	slots := be.Slots
+	ds.mu.Unlock()
+	if unpacked {
+		_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+	}
+	return slots
 }
 
 // DispenserSlots returns the 9 inventory slots of the dispenser or dropper at
@@ -280,12 +482,16 @@ func (s *Server) DispenserSlotPotion(dim string, x, y, z, slot int) string {
 	normDim := normalizeDispenserDim(dim)
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	be := ds.blocks[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if be == nil {
+		ds.mu.Unlock()
 		return ""
 	}
-	return be.SlotPotions[slot]
+	_ = s.unpackDispenserLootTableLocked(be)
+	pot := be.SlotPotions[slot]
+	ds.mu.Unlock()
+	return pot
 }
 
 // DispenserSlotMeta returns the ItemMeta stored on slot (0..8) of the
@@ -297,12 +503,16 @@ func (s *Server) DispenserSlotMeta(dim string, x, y, z, slot int) ItemMeta {
 	normDim := normalizeDispenserDim(dim)
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	be := ds.blocks[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if be == nil {
+		ds.mu.Unlock()
 		return ItemMeta{}
 	}
-	return be.SlotMeta[slot].Clone()
+	_ = s.unpackDispenserLootTableLocked(be)
+	meta := be.SlotMeta[slot].Clone()
+	ds.mu.Unlock()
+	return meta
 }
 
 // SetDispenserSlotInDimension sets slot (0..8) of the dispenser/dropper at
@@ -346,8 +556,14 @@ func (s *Server) SetDispenserSlotShulkerItems(dim string, x, y, z, slot int, ite
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	be := s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
+	_ = s.unpackDispenserLootTableLocked(be)
 	be.SlotShulkerItems[slot] = items
+	if be.SlotShulkerData[slot] == nil {
+		be.SlotShulkerData[slot] = &ShulkerBoxItemData{}
+	}
+	be.SlotShulkerData[slot].Slots = items
 	ds.mu.Unlock()
+	_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
 	return true
 }
 
@@ -368,12 +584,15 @@ func (s *Server) SetDispenserSlotFull(
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	be := s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
+	_ = s.unpackDispenserLootTableLocked(be)
 	if stack.IsEmpty() {
 		be.Slots[slot] = world.ItemStack{}
 		be.SlotMeta[slot] = ItemMeta{}
 		be.SlotPotions[slot] = ""
 		be.SlotFireworks[slot] = FireworksComponent{}
 		be.SlotShulkerItems[slot] = [ChestSlotCount]world.ItemStack{}
+		be.SlotShulkerData[slot] = nil
+		be.SlotComponents[slot] = nil
 	} else {
 		normStack := world.NewItemStack(stack.ResolvedItemID(), stack.Count)
 		if normStack.IsEmpty() {
@@ -386,6 +605,7 @@ func (s *Server) SetDispenserSlotFull(
 	}
 	ds.mu.Unlock()
 
+	_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
 	s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
 	return true
 }
@@ -414,16 +634,39 @@ func (s *Server) DropDispenserContentsInDimension(dim string, x, y, z int) {
 	normDim := normalizeDispenserDim(dim)
 	ds := s.dispenserState()
 	ds.mu.Lock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	key := dispenserBlockKey{dim: normDim, x: x, y: y, z: z}
 	be := ds.blocks[key]
+	if be != nil {
+		_ = s.unpackDispenserLootTableLocked(be)
+	}
 	delete(ds.blocks, key)
 	ds.mu.Unlock()
+
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		cache.RemoveStructureBlockEntity(x, y, z)
+	}
+	_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
 	if be == nil {
 		return
 	}
 	for i := 0; i < DispenserSlotCount; i++ {
-		if !be.Slots[i].IsEmpty() {
-			s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, be.Slots[i])
+		if !be.Slots[i].IsEmpty() && be.Slots[i].Count > 0 {
+			entID, _ := s.SpawnItemEntityInDimension(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, be.Slots[i])
+			if entID > 0 {
+				if !be.SlotMeta[i].IsEmpty() {
+					ft := s.fishingTracker()
+					ft.mu.Lock()
+					ft.droppedMeta[entID] = be.SlotMeta[i].Clone()
+					ft.mu.Unlock()
+				}
+				if be.SlotPotions[i] != "" && IsPotionOrTippedArrowItem(be.Slots[i]) {
+					s.AssociateDroppedPotionEntity(entID, be.SlotPotions[i])
+				}
+				if shData := s.dispenserSlotShulkerDataLocked(be, i); shData != nil && IsShulkerBoxItemOrBlock(be.Slots[i].ResolvedID()) {
+					s.AssociateDroppedShulkerBoxEntity(entID, shData)
+				}
+			}
 		}
 	}
 	s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
@@ -499,13 +742,18 @@ func (s *Server) DispenserComparatorSignalAt(dim string, x, y, z int) int {
 	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	be := ds.blocks[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if be == nil {
 		ds.mu.Unlock()
 		return 0
 	}
+	unpacked := s.unpackDispenserLootTableLocked(be)
 	slots := be.Slots
 	ds.mu.Unlock()
+	if unpacked {
+		_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+	}
 	return CalculateContainerComparatorSignal(slots[:])
 }
 
@@ -637,8 +885,8 @@ func DispenserItemMaxStackSize(stack world.ItemStack) int32 {
 	}
 	id := canonicalResourceName(stack.ResolvedID())
 	switch id {
-	case "minecraft:snowball", "minecraft:egg", "minecraft:ender_pearl",
-		"minecraft:Bucket", "minecraft:bucket", "minecraft:honey_bottle",
+	case "minecraft:snowball", "minecraft:egg", "minecraft:blue_egg", "minecraft:brown_egg",
+		"minecraft:ender_pearl", "minecraft:Bucket", "minecraft:bucket", "minecraft:honey_bottle",
 		"minecraft:wind_charge", "minecraft:armor_stand":
 		return 16
 	case "minecraft:water_bucket", "minecraft:lava_bucket", "minecraft:powder_snow_bucket",
@@ -650,9 +898,11 @@ func DispenserItemMaxStackSize(stack world.ItemStack) int32 {
 		"minecraft:elytra", "minecraft:shield", "minecraft:carved_pumpkin",
 		"minecraft:leather_horse_armor", "minecraft:iron_horse_armor",
 		"minecraft:golden_horse_armor", "minecraft:diamond_horse_armor",
-		"minecraft:wolf_armor",
+		"minecraft:copper_horse_armor",
+		"minecraft:wolf_armor", "minecraft:trident", "minecraft:mace", "minecraft:bow", "minecraft:crossbow",
+		"minecraft:fishing_rod", "minecraft:carrot_on_a_stick", "minecraft:warped_fungus_on_a_stick",
 		"minecraft:minecart", "minecraft:chest_minecart", "minecraft:furnace_minecart",
-		"minecraft:tnt_minecart", "minecraft:hopper_minecart":
+		"minecraft:tnt_minecart", "minecraft:hopper_minecart", "minecraft:command_block_minecart":
 		if id == "minecraft:carved_pumpkin" {
 			return 64
 		}
@@ -663,7 +913,9 @@ func DispenserItemMaxStackSize(stack world.ItemStack) int32 {
 		strings.HasSuffix(id, "_leggings") || strings.HasSuffix(id, "_boots") ||
 		strings.HasSuffix(id, "_sword") || strings.HasSuffix(id, "_pickaxe") ||
 		strings.HasSuffix(id, "_axe") || strings.HasSuffix(id, "_shovel") ||
-		strings.HasSuffix(id, "_hoe") || IsShulkerBoxItemOrBlock(id) || IsMusicDiscItem(stack) {
+		strings.HasSuffix(id, "_hoe") || strings.HasSuffix(id, "_spear") ||
+		strings.HasSuffix(id, "_nautilus_armor") || strings.HasSuffix(id, "_harness") ||
+		IsShulkerBoxItemOrBlock(id) || IsMusicDiscItem(stack) {
 		return 1
 	}
 	if strings.HasSuffix(id, "_banner") || strings.HasSuffix(id, "_sign") {
@@ -868,9 +1120,13 @@ func (s *Server) TryInsertIntoDispenser(
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	be := s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
-	rem := mergeIntoDispenserLocked(be, stack, meta, potionType)
+	unpacked := s.unpackDispenserLootTableLocked(be)
+	rem := mergeIntoDispenserFullLocked(be, stack, meta, potionType, nil, nil)
 	changed := rem.Count != stack.Count
 	ds.mu.Unlock()
+	if changed || unpacked {
+		_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+	}
 	if changed {
 		s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
 		_ = s.SyncDispenserViewers(nil, x, y, z)
@@ -878,11 +1134,56 @@ func (s *Server) TryInsertIntoDispenser(
 	return rem
 }
 
+func (s *Server) hopperInsertIntoDispenserFull(
+	dim string,
+	x, y, z int,
+	stack world.ItemStack,
+	meta ItemMeta,
+	potionType string,
+	shulkerData *ShulkerBoxItemData,
+	rawComp *nbt.Compound,
+) bool {
+	if s == nil || stack.IsEmpty() || stack.Count <= 0 {
+		return false
+	}
+	single := world.NewItemStack(stack.ResolvedItemID(), 1)
+	if single.IsEmpty() {
+		single = world.NewNamedItemStack(stack.ResolvedID(), 1)
+	}
+	normDim := normalizeDispenserDim(dim)
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	be := s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
+	unpacked := s.unpackDispenserLootTableLocked(be)
+	rem := mergeIntoDispenserFullLocked(be, single, meta, potionType, shulkerData, rawComp)
+	inserted := rem.IsEmpty()
+	ds.mu.Unlock()
+	if inserted || unpacked {
+		_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+	}
+	if inserted {
+		s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
+		_ = s.SyncDispenserViewers(nil, x, y, z)
+	}
+	return inserted
+}
+
 func mergeIntoDispenserLocked(
 	be *DispenserBlockEntity,
 	stack world.ItemStack,
 	meta ItemMeta,
 	potionType string,
+) world.ItemStack {
+	return mergeIntoDispenserFullLocked(be, stack, meta, potionType, nil, nil)
+}
+
+func mergeIntoDispenserFullLocked(
+	be *DispenserBlockEntity,
+	stack world.ItemStack,
+	meta ItemMeta,
+	potionType string,
+	shulkerData *ShulkerBoxItemData,
+	rawComp *nbt.Compound,
 ) world.ItemStack {
 	if be == nil || stack.IsEmpty() || stack.Count <= 0 {
 		return world.ItemStack{}
@@ -892,13 +1193,13 @@ func mergeIntoDispenserLocked(
 	itemID := stack.ResolvedItemID()
 
 	// 1. Merge into existing matching non-full stacks if stackable and metadata-compatible.
-	if maxStack > 1 {
+	if maxStack > 1 && shulkerData == nil && rawComp == nil {
 		for i := 0; i < DispenserSlotCount && remaining > 0; i++ {
 			cur := be.Slots[i]
 			if cur.IsEmpty() || cur.ResolvedItemID() != itemID || cur.Count >= maxStack {
 				continue
 			}
-			if be.SlotPotions[i] != potionType || !dispenserItemMetaEqual(be.SlotMeta[i], meta) {
+			if be.SlotPotions[i] != potionType || !dispenserItemMetaEqual(be.SlotMeta[i], meta) || be.SlotComponents[i] != nil {
 				continue
 			}
 			space := maxStack - cur.Count
@@ -927,6 +1228,15 @@ func mergeIntoDispenserLocked(
 		be.Slots[i] = placed
 		be.SlotMeta[i] = meta.Clone()
 		be.SlotPotions[i] = potionType
+		be.SlotFireworks[i] = FireworksComponent{}
+		if shulkerData != nil && !shulkerData.IsEmpty() {
+			be.SlotShulkerData[i] = shulkerData.Clone()
+			be.SlotShulkerItems[i] = shulkerData.Slots
+		} else {
+			be.SlotShulkerData[i] = nil
+			be.SlotShulkerItems[i] = [ChestSlotCount]world.ItemStack{}
+		}
+		be.SlotComponents[i] = world.CloneNBTCompound(rawComp)
 		remaining -= take
 	}
 
@@ -984,6 +1294,8 @@ func consumeWithRemainderLocked(
 		be.SlotPotions[slot] = remPotion
 		be.SlotFireworks[slot] = FireworksComponent{}
 		be.SlotShulkerItems[slot] = [ChestSlotCount]world.ItemStack{}
+		be.SlotShulkerData[slot] = nil
+		be.SlotComponents[slot] = nil
 		return world.ItemStack{}
 	}
 	be.Slots[slot].Count--
@@ -1003,6 +1315,8 @@ func decrementDispenserSlotLocked(be *DispenserBlockEntity, slot int) {
 		be.SlotPotions[slot] = ""
 		be.SlotFireworks[slot] = FireworksComponent{}
 		be.SlotShulkerItems[slot] = [ChestSlotCount]world.ItemStack{}
+		be.SlotShulkerData[slot] = nil
+		be.SlotComponents[slot] = nil
 	} else {
 		be.Slots[slot].Count--
 	}
@@ -1046,6 +1360,19 @@ func damageDispenserToolSlotByAmountLocked(be *DispenserBlockEntity, slot int, w
 // spawnDispensedItemEntity spawns a dropped item entity in front of the
 // dispenser/dropper at (x, y, z) with vanilla velocity and Gaussian spread.
 func (s *Server) spawnDispensedItemEntity(dim string, x, y, z int, facing string, stack world.ItemStack, rng *rand.Rand) int32 {
+	return s.spawnDispensedItemEntityFull(dim, x, y, z, facing, stack, ItemMeta{}, "", nil, rng)
+}
+
+func (s *Server) spawnDispensedItemEntityFull(
+	dim string,
+	x, y, z int,
+	facing string,
+	stack world.ItemStack,
+	meta ItemMeta,
+	potionType string,
+	shulkerData *ShulkerBoxItemData,
+	rng *rand.Rand,
+) int32 {
 	if s == nil || stack.IsEmpty() {
 		return 0
 	}
@@ -1057,6 +1384,20 @@ func (s *Server) spawnDispensedItemEntity(dim string, x, y, z int, facing string
 		ent.VelocityX = int16(clampDispenserFloat(vx*8000, -32767, 32767))
 		ent.VelocityY = int16(clampDispenserFloat(vy*8000, -32767, 32767))
 		ent.VelocityZ = int16(clampDispenserFloat(vz*8000, -32767, 32767))
+	}
+	if entID > 0 {
+		if !meta.IsEmpty() {
+			ft := s.fishingTracker()
+			ft.mu.Lock()
+			ft.droppedMeta[entID] = meta.Clone()
+			ft.mu.Unlock()
+		}
+		if potionType != "" && IsPotionOrTippedArrowItem(stack) {
+			s.AssociateDroppedPotionEntity(entID, potionType)
+		}
+		if shulkerData != nil && !shulkerData.IsEmpty() && IsShulkerBoxItemOrBlock(stack.ResolvedID()) {
+			s.AssociateDroppedShulkerBoxEntity(entID, shulkerData)
+		}
 	}
 	return entID
 }
@@ -1107,9 +1448,13 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	be := s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
+	unpacked := s.unpackDispenserLootTableLocked(be)
 	slot := ChooseRandomDispenserSlot(be.Slots, ds.rng)
 	if slot < 0 {
 		ds.mu.Unlock()
+		if unpacked {
+			_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+		}
 		s.broadcastDispenserEffects(normDim, x, y, z, facing, LevelEventSoundFailDispense, false)
 		s.EmitGameEvent(normDim, GameEventBlockActivate, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
 		return false
@@ -1118,7 +1463,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 	meta := be.SlotMeta[slot].Clone()
 	potionType := be.SlotPotions[slot]
 	fireworkData := be.SlotFireworks[slot].Clone()
-	shulkerItems := be.SlotShulkerItems[slot]
+	shulkerData := s.dispenserSlotShulkerDataLocked(be, slot)
 	rng := ds.rng
 	ds.mu.Unlock()
 
@@ -1138,19 +1483,19 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 	)
 
 	switch {
-	// 1. Projectiles: Arrows, Tipped Arrows, Spectral Arrows, Snowballs, Eggs,
-	//    Splash/Lingering Potions, Experience Bottles, Firework Rockets, Fire Charges, Wind Charges.
+	// 1. Projectiles: Arrows, Tipped Arrows, Spectral Arrows, Snowballs, Eggs
+	//    (including blue_egg & brown_egg), Splash/Lingering Potions, Experience
+	//    Bottles, Firework Rockets, Fire Charges, Wind Charges.
+	//    Note: `minecraft:trident` is NOT in DispenserBlock.DISPENSER_REGISTRY in
+	//    vanilla 26.1.2.jar, so it falls through to DefaultDispenseItemBehavior.
 	case itemID == "minecraft:arrow" || itemID == "minecraft:tipped_arrow" || itemID == "minecraft:spectral_arrow":
 		s.dispenseArrowProjectile(normDim, x, y, z, facing, itemID, potionType, rng)
 		soundEvent = LevelEventSoundLaunchProjectile
 		consumeOne = true
 
-	case itemID == "minecraft:trident":
-		s.dispenseTridentProjectile(normDim, x, y, z, facing, rng)
-		soundEvent = LevelEventSoundLaunchProjectile
-		consumeOne = true
-
-	case itemID == "minecraft:snowball" || itemID == "minecraft:egg" || itemID == "minecraft:wind_charge":
+	case itemID == "minecraft:snowball" || itemID == "minecraft:egg" ||
+		itemID == "minecraft:blue_egg" || itemID == "minecraft:brown_egg" ||
+		itemID == "minecraft:wind_charge":
 		s.dispenseThrownProjectile(normDim, x, y, z, facing, itemID, rng)
 		soundEvent = LevelEventSoundLaunchProjectile
 		consumeOne = true
@@ -1183,7 +1528,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 		} else {
 			// Vanilla fallback: eject the filled bucket item.
 			single := world.NewNamedItemStack(itemID, 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
@@ -1192,7 +1537,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			replaceWith = &filledBucket
 		} else {
 			single := world.NewNamedItemStack("minecraft:bucket", 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
@@ -1214,7 +1559,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 
 	// 4. Shulker Box placement.
 	case IsShulkerBoxItemOrBlock(itemID):
-		if s.dispensePlaceShulkerBox(normDim, cache, fx, fy, fz, facing, itemID, shulkerItems) {
+		if s.dispensePlaceShulkerBox(normDim, cache, fx, fy, fz, facing, itemID, shulkerData, meta.CustomName) {
 			consumeOne = true
 		} else {
 			succeeded = false
@@ -1232,29 +1577,31 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			soundEvent = LevelEventSoundFailDispense
 			emitSmoke = false
 		} else {
-			// Normal armor / elytra / shield falls back to dropping the item if no entity in front can equip it.
+			// Normal armor / elytra / shield / non-wither skulls fall back to DefaultDispenseItemBehavior.
 			single := world.NewNamedItemStack(itemID, 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
-	// 6. Saddles, Horse Armor, Wolf Armor, Llama Carpets, and Equine Chests.
-	case isDispenserAnimalEquipment(itemID, normDim, fx, fy, fz, s):
+	// 6. Saddles, Horse Armor, Wolf Armor, Nautilus Armor, Harnesses, Llama Carpets, and Equine Chests.
+	case isDispenserAnimalEquipment(itemID):
 		if s.dispenseAnimalEquipment(normDim, fx, fy, fz, itemID, meta) {
 			consumeOne = true
 		} else {
-			succeeded = false
-			soundEvent = LevelEventSoundFailDispense
-			emitSmoke = false
+			// Vanilla EquipmentDispenseItemBehavior & DispenseItemBehavior$2 (chest):
+			// when no valid entity in front can equip the item, fall back to DefaultDispenseItemBehavior!
+			single := world.NewNamedItemStack(itemID, 1)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
+			consumeOne = true
 		}
 
 	// 7. Minecarts & Boats / Rafts.
 	case isMinecartItem(itemID):
-		if s.dispenseMinecart(normDim, cache, fx, fy, fz, facing, itemID) {
+		if s.dispenseMinecart(normDim, cache, x, y, z, fx, fy, fz, facing, itemID) {
 			consumeOne = true
 		} else {
 			single := world.NewNamedItemStack(itemID, 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
@@ -1263,7 +1610,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			consumeOne = true
 		} else {
 			single := world.NewNamedItemStack(itemID, 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
@@ -1288,7 +1635,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			emitSmoke = false
 		}
 
-	// 10. Shears (Sheep, Mooshroom, Snow Golem, Bogged, Beehive/Bee Nest, Pumpkin).
+	// 10. Shears (Beehive/Bee Nest, Sheep, Mooshroom, Snow Golem, Bogged, Copper Golem, Wolf/Nautilus/HappyGhast equipment).
 	case itemID == "minecraft:shears":
 		if s.dispenseShears(normDim, cache, fx, fy, fz, facing, rng) {
 			damageTool = ShearsMaxDurability
@@ -1309,14 +1656,15 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			emitSmoke = false
 		}
 
-	// 11. Glass Bottle (Water source / waterlogged / water cauldron -> water potion; Beehive honey_level=5 -> honey_bottle).
+	// 11. Glass Bottle (Water fluid / Beehive honey_level>=5 -> filled bottle; else eject glass_bottle with fail sound).
 	case itemID == "minecraft:glass_bottle":
 		if filledBottle, filledPot, ok := s.dispenseGlassBottle(normDim, cache, fx, fy, fz); ok {
 			replaceWith = &filledBottle
 			replacePot = filledPot
 		} else {
 			single := world.NewNamedItemStack("minecraft:glass_bottle", 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
+			soundEvent = LevelEventSoundFailDispense
 			consumeOne = true
 		}
 
@@ -1327,21 +1675,21 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			replaceWith = &emptyBottle
 		} else {
 			single := world.NewNamedItemStack("minecraft:potion", 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
-	// 12. Honeycomb (Waxing Copper Blocks & Signs).
+	// 12. Honeycomb (Waxing Copper / Lightning Rod / WAXABLES Blocks; else eject honeycomb).
 	case itemID == "minecraft:honeycomb":
 		if s.dispenseHoneycombWax(normDim, cache, fx, fy, fz) {
 			consumeOne = true
 		} else {
 			single := world.NewNamedItemStack("minecraft:honeycomb", 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
-	// 12b. Glowstone (Charging Respawn Anchor).
+	// 12b. Glowstone (Charging Respawn Anchor; if non-anchor block in front, eject glowstone).
 	case itemID == "minecraft:glowstone":
 		frontState := cache.GetBlock(fx, fy, fz)
 		if IsRespawnAnchorBlock(frontState) {
@@ -1360,7 +1708,7 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			}
 		} else {
 			single := world.NewNamedItemStack("minecraft:glowstone", 1)
-			s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+			s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, nil, rng)
 			consumeOne = true
 		}
 
@@ -1390,13 +1738,13 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 		if single.IsEmpty() {
 			single = world.NewNamedItemStack(itemID, 1)
 		}
-		s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+		s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, shulkerData, rng)
 		consumeOne = true
 	}
 
 	// Apply slot mutations under lock.
 	var overflow world.ItemStack
-	if consumeOne || replaceWith != nil || damageTool > 0 {
+	if consumeOne || replaceWith != nil || damageTool > 0 || unpacked {
 		ds.mu.Lock()
 		be = s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
 		if replaceWith != nil {
@@ -1407,9 +1755,10 @@ func (s *Server) DispenseFromDispenser(dim string, x, y, z int) bool {
 			decrementDispenserSlotLocked(be, slot)
 		}
 		ds.mu.Unlock()
+		_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
 	}
 	if !overflow.IsEmpty() {
-		s.spawnDispensedItemEntity(normDim, x, y, z, facing, overflow, rng)
+		s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, overflow, ItemMeta{}, replacePot, nil, rng)
 	}
 
 	s.broadcastDispenserEffects(normDim, x, y, z, facing, soundEvent, emitSmoke)
@@ -1526,6 +1875,11 @@ func (s *Server) dispenseThrownProjectile(dim string, x, y, z int, facing, itemI
 	px, py, pz := DispenserDispensePosition(x, y, z, facing, true)
 	vx, vy, vz := DispenserProjectileVelocity(facing, DispenserDefaultProjectilePower, DispenserDefaultProjectileUncertainty, rng)
 	var entID int32
+	projTypeName := itemID
+	isEggItem := itemID == "minecraft:egg" || itemID == "minecraft:blue_egg" || itemID == "minecraft:brown_egg"
+	if isEggItem {
+		projTypeName = "minecraft:egg"
+	}
 	if itemID == WindChargeItemID {
 		dx, dy, dz := DispenserFacingVector(facing)
 		dirX, dirY, dirZ := float64(dx)*WindChargeFlightSpeed, float64(dy)*WindChargeFlightSpeed, float64(dz)*WindChargeFlightSpeed
@@ -1540,11 +1894,11 @@ func (s *Server) dispenseThrownProjectile(dim string, x, y, z int, facing, itemI
 		s.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), PlaySoundPacketID,
 			EncodeSoundPacket(SoundWindChargeThrow, SoundSourceBlocks, px, py, pz, 0.5, 0.5, 0))
 	} else {
-		entID = s.spawnDispenserProjectileEntity(dim, itemID, px, py, pz, vx, vy, vz)
+		entID = s.spawnDispenserProjectileEntity(dim, projTypeName, px, py, pz, vx, vy, vz)
 	}
 	proj := &DispenserProjectile{
 		EntityID:  entID,
-		TypeName:  itemID,
+		TypeName:  projTypeName,
 		Dimension: dim,
 		X:         px,
 		Y:         py,
@@ -1564,8 +1918,8 @@ func (s *Server) dispenseThrownProjectile(dim string, x, y, z int, facing, itemI
 	if shattered, _ := s.HitDecoratedPotWithProjectile(dim, fx, fy, fz, entID); shattered {
 		proj.Impacted = true
 	}
-	switch itemID {
-	case "minecraft:snowball":
+	switch {
+	case itemID == "minecraft:snowball":
 		for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
 			if canonicalResourceName(ent.TypeName) == "minecraft:blaze" {
 				curHP := s.MobHealth(ent.ID)
@@ -1574,7 +1928,7 @@ func (s *Server) dispenseThrownProjectile(dim string, x, y, z int, facing, itemI
 				}
 			}
 		}
-	case "minecraft:egg":
+	case isEggItem:
 		// Vanilla ThrownEgg.onHit: 1/8 chance to hatch a baby chicken (1/256 for 4).
 		if rng != nil && rng.Intn(8) == 0 {
 			chicks := 1
@@ -1670,21 +2024,20 @@ func (s *Server) dispenseFireCharge(dim string, x, y, z int, facing string, fx, 
 	ds.projectiles[entID] = proj
 	ds.mu.Unlock()
 
-	// If an entity is directly in front, apply 5.0 fire damage; otherwise if the
-	// front cell is air with solid support below (or an unlit campfire / TNT), ignite it.
+	// Vanilla 26.1.2 FireChargeItem implements ProjectileItem: ProjectileDispenseBehavior
+	// shoots a SmallFireball (dealing 5.0 fire damage on direct entity impact or shattering
+	// a decorated pot, without running flint_and_steel on the front block).
 	if players := s.playersInBlockBox(dim, fx, fy, fz); len(players) > 0 {
+		proj.Impacted = true
 		s.DamagePlayerWithArmor(players[0], 5.0, "fireball")
 	} else if mobs := s.mobsInBlockBox(dim, fx, fy, fz); len(mobs) > 0 {
+		proj.Impacted = true
 		curHP := s.MobHealth(mobs[0].ID)
 		if curHP > 0 {
 			s.SetMobHealth(mobs[0].ID, maxFloat32(0, curHP-5.0))
 		}
-	} else if cache := s.DimensionChunks(dim); cache != nil {
-		if shattered, _ := s.HitDecoratedPotWithProjectile(dim, fx, fy, fz, entID); shattered {
-			proj.Impacted = true
-		} else {
-			_ = s.dispenseFlintAndSteel(dim, cache, fx, fy, fz)
-		}
+	} else if shattered, _ := s.HitDecoratedPotWithProjectile(dim, fx, fy, fz, entID); shattered {
+		proj.Impacted = true
 	}
 	s.EmitGameEvent(dim, GameEventProjectileShoot, px, py, pz, VibrationSource{EntityID: entID})
 	return entID
@@ -1770,16 +2123,9 @@ func (s *Server) dispenseFilledBucket(dim string, cache *world.Cache, fx, fy, fz
 		return false
 	}
 	targetState := cache.GetBlock(fx, fy, fz)
-	targetName := world.BlockName(targetState)
 
 	switch itemID {
 	case "minecraft:lava_bucket":
-		if targetName == "minecraft:cauldron" {
-			if st, ok := world.BlockStateByName("minecraft:lava_cauldron", nil); ok {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
-				return true
-			}
-		}
 		if !isDispenserFluidReplaceable(targetState) {
 			return false
 		}
@@ -1787,12 +2133,6 @@ func (s *Server) dispenseFilledBucket(dim string, cache *world.Cache, fx, fy, fz
 		return true
 
 	case "minecraft:powder_snow_bucket":
-		if targetName == "minecraft:cauldron" {
-			if st, ok := world.BlockStateByName("minecraft:powder_snow_cauldron", map[string]string{"level": "3"}); ok {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
-				return true
-			}
-		}
 		if !isDispenserFluidReplaceable(targetState) {
 			return false
 		}
@@ -1804,12 +2144,7 @@ func (s *Server) dispenseFilledBucket(dim string, cache *world.Cache, fx, fy, fz
 
 	default: // water_bucket and fish/axolotl/tadpole buckets
 		placedWater := false
-		if targetName == "minecraft:cauldron" && itemID == "minecraft:water_bucket" {
-			if st, ok := world.BlockStateByName("minecraft:water_cauldron", map[string]string{"level": "3"}); ok {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
-				placedWater = true
-			}
-		} else if world.CanBlockBeWaterlogged(targetState) && !world.IsWaterlogged(targetState) {
+		if world.CanBlockBeWaterlogged(targetState) && !world.IsWaterlogged(targetState) {
 			if dim == world.DimensionNether || cache.IsWaterEvaporatingDimension() {
 				placedWater = true
 			} else if nextSt, ok := world.SetWaterlogged(targetState, true); ok {
@@ -1887,6 +2222,9 @@ func (s *Server) dispenseEmptyBucketScoop(dim string, cache *world.Cache, fx, fy
 	targetName := world.BlockName(targetState)
 	props := world.BlockProperties(targetState)
 
+	// Vanilla 26.1.2 DispenseItemBehavior$4: checks `block instanceof BucketPickup`
+	// (`LiquidBlock`, `BubbleColumnBlock`, `PowderSnowBlock`, `SimpleWaterloggedBlock`).
+	// `AbstractCauldronBlock` does NOT implement `BucketPickup`!
 	switch targetName {
 	case "minecraft:water":
 		if props["level"] == "" || props["level"] == "0" {
@@ -1904,25 +2242,6 @@ func (s *Server) dispenseEmptyBucketScoop(dim string, cache *world.Cache, fx, fy
 	case "minecraft:powder_snow":
 		s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateAir)
 		return world.NewNamedItemStack("minecraft:powder_snow_bucket", 1), true
-	case "minecraft:water_cauldron":
-		if props["level"] == "3" {
-			if emptyCauldron, ok := world.BlockStateByName("minecraft:cauldron", nil); ok {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, emptyCauldron)
-				return world.NewNamedItemStack("minecraft:water_bucket", 1), true
-			}
-		}
-	case "minecraft:lava_cauldron":
-		if emptyCauldron, ok := world.BlockStateByName("minecraft:cauldron", nil); ok {
-			s.setDispenserWorldBlock(dim, cache, fx, fy, fz, emptyCauldron)
-			return world.NewNamedItemStack("minecraft:lava_bucket", 1), true
-		}
-	case "minecraft:powder_snow_cauldron":
-		if props["level"] == "3" {
-			if emptyCauldron, ok := world.BlockStateByName("minecraft:cauldron", nil); ok {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, emptyCauldron)
-				return world.NewNamedItemStack("minecraft:powder_snow_bucket", 1), true
-			}
-		}
 	default:
 		if props["waterlogged"] == "true" {
 			if nextSt, ok := world.WithBlockProperty(targetState, "waterlogged", "false"); ok {
@@ -1951,6 +2270,18 @@ func isDispenserFluidReplaceable(state uint16) bool {
 	}
 }
 
+func isDispenserAirBlock(state uint16) bool {
+	if state == world.StateAir {
+		return true
+	}
+	switch world.BlockName(state) {
+	case "minecraft:air", "minecraft:cave_air", "minecraft:void_air":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) setDispenserWorldBlock(dim string, cache *world.Cache, x, y, z int, nextState uint16) {
 	if cache == nil {
 		return
@@ -1970,7 +2301,8 @@ func (s *Server) dispensePlaceShulkerBox(
 	fx, fy, fz int,
 	dispenserFacing string,
 	itemID string,
-	shulkerItems [ChestSlotCount]world.ItemStack,
+	shulkerData *ShulkerBoxItemData,
+	fallbackCustomName string,
 ) bool {
 	if cache == nil || fy < world.MinY || fy >= world.MinY+world.WorldHeight {
 		return false
@@ -1979,9 +2311,14 @@ func (s *Server) dispensePlaceShulkerBox(
 	if !isDispenserPlaceReplaceable(cur) {
 		return false
 	}
-	placeFacing := dispenserFacing
-	if placeFacing == "" {
-		placeFacing = "up"
+	// Vanilla 26.1.2 ShulkerBoxDispenseBehavior:
+	//   Direction dir2 = level.isEmptyBlock(frontPos.below()) ? facing : Direction.UP;
+	//   new DirectionalPlaceContext(level, frontPos, facing, stack, dir2)
+	// ShulkerBoxBlock.getStateForPlacement uses ctx.getClickedFace() == dir2!
+	belowEmpty := fy-1 < world.MinY || isDispenserAirBlock(cache.GetBlock(fx, fy-1, fz))
+	placeFacing := "up"
+	if belowEmpty && dispenserFacing != "" {
+		placeFacing = dispenserFacing
 	}
 	st, ok := world.BlockStateByName(itemID, map[string]string{"facing": placeFacing})
 	if !ok {
@@ -1991,15 +2328,7 @@ func (s *Server) dispensePlaceShulkerBox(
 		}
 	}
 	s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
-	s.SetShulkerBoxSlots(dim, fx, fy, fz, shulkerItems)
-	// Also mirror into ChestSlots for Overworld so standard chest UI can view it if opened.
-	if dim == world.DimensionOverworld {
-		for i := 0; i < ChestSlotCount; i++ {
-			if !shulkerItems[i].IsEmpty() {
-				s.SetChestSlot(fx, fy, fz, i, shulkerItems[i])
-			}
-		}
-	}
+	s.ApplyShulkerBoxItemDataAt(dim, fx, fy, fz, shulkerData, fallbackCustomName)
 	return true
 }
 
@@ -2065,18 +2394,10 @@ func DispenserEquipmentSlotForItem(itemID string) (equipSlot int, playerInvSlot 
 	}
 }
 
-func (s *Server) dispenseEquipOrPlaceHeadPumpkin(
-	dim string,
-	cache *world.Cache,
-	x, y, z, fx, fy, fz int,
-	facing string,
-	itemID string,
-	meta ItemMeta,
-	rng *rand.Rand,
-) (handled bool, isOptionalFail bool) {
+func (s *Server) dispenseEquipOntoEntity(dim string, fx, fy, fz int, itemID string, meta ItemMeta) bool {
 	equipSlot, playerInvSlot, ok := DispenserEquipmentSlotForItem(itemID)
 	if !ok {
-		return false, false
+		return false
 	}
 	single := world.NewNamedItemStack(itemID, 1)
 
@@ -2086,7 +2407,7 @@ func (s *Server) dispenseEquipOrPlaceHeadPumpkin(
 			sess.SetInventorySlot(playerInvSlot, single)
 			SetSlotItemMeta(sess, playerInvSlot, meta.Clone())
 			s.syncPlayerInventorySlot(sess, playerInvSlot)
-			return true, false
+			return true
 		}
 	}
 
@@ -2098,7 +2419,7 @@ func (s *Server) dispenseEquipOrPlaceHeadPumpkin(
 		}
 		if st.Equipment[equipSlot].IsEmpty() {
 			if s.SetArmorStandEquipment(ent.ID, equipSlot, single) {
-				return true, false
+				return true
 			}
 		}
 	}
@@ -2111,49 +2432,152 @@ func (s *Server) dispenseEquipOrPlaceHeadPumpkin(
 		cur := s.MobEquipment(ent.ID, equipSlot)
 		if cur.IsEmpty() {
 			s.SetMobEquipment(ent.ID, equipSlot, single)
+			return true
+		}
+	}
+	return false
+}
+
+func copperGolemBaseChestAndStage(state uint16) (chestName string, stage world.CopperOxidationStage, ok bool) {
+	switch world.BlockName(state) {
+	case "minecraft:copper_block":
+		return "minecraft:copper_chest", world.CopperStageUnaffected, true
+	case "minecraft:exposed_copper":
+		return "minecraft:exposed_copper_chest", world.CopperStageExposed, true
+	case "minecraft:weathered_copper":
+		return "minecraft:weathered_copper_chest", world.CopperStageWeathered, true
+	case "minecraft:oxidized_copper":
+		return "minecraft:oxidized_copper_chest", world.CopperStageOxidized, true
+	case "minecraft:waxed_copper_block":
+		return "minecraft:waxed_copper_chest", world.CopperStageUnaffected, true
+	case "minecraft:waxed_exposed_copper":
+		return "minecraft:waxed_exposed_copper_chest", world.CopperStageExposed, true
+	case "minecraft:waxed_weathered_copper":
+		return "minecraft:waxed_weathered_copper_chest", world.CopperStageWeathered, true
+	case "minecraft:waxed_oxidized_copper":
+		return "minecraft:waxed_oxidized_copper_chest", world.CopperStageOxidized, true
+	default:
+		return "", world.CopperStageUnaffected, false
+	}
+}
+
+func (s *Server) tryDispenseCarvedPumpkinGolem(dim string, cache *world.Cache, fx, fy, fz int) bool {
+	if cache == nil || fy < world.MinY || fy >= world.MinY+world.WorldHeight || !isDispenserAirBlock(cache.GetBlock(fx, fy, fz)) {
+		return false
+	}
+	pumpkinSt, ok := world.BlockStateByName("minecraft:carved_pumpkin", map[string]string{"facing": "north"})
+	if !ok || pumpkinSt == world.StateAir {
+		pumpkinSt, _ = world.BlockStateByName("minecraft:carved_pumpkin", nil)
+	}
+	if pumpkinSt == world.StateAir {
+		return false
+	}
+	prev := cache.GetBlock(fx, fy, fz)
+	cache.SetBlock(fx, fy, fz, pumpkinSt)
+
+	if _, ok := FindSnowGolemPatternAt(cache, fx, fy, fz); ok {
+		if _, summoned := s.TrySummonSnowGolemAt(dim, fx, fy, fz, nil); summoned {
+			return true
+		}
+	}
+	if _, ok := FindIronGolemPatternAt(cache, fx, fy, fz); ok {
+		if _, summoned := s.TrySummonIronGolemAt(dim, fx, fy, fz, nil); summoned {
+			return true
+		}
+	}
+	copperDirs := [6][3]int{{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}}
+	for _, off := range copperDirs {
+		cx, cy, cz := fx+off[0], fy+off[1], fz+off[2]
+		if cy < world.MinY || cy >= world.MinY+world.WorldHeight {
+			continue
+		}
+		chestName, stage, isCopper := copperGolemBaseChestAndStage(cache.GetBlock(cx, cy, cz))
+		if !isCopper {
+			continue
+		}
+		chestSt, hasChest := world.BlockStateByName(chestName, map[string]string{
+			"facing":      "north",
+			"type":        "single",
+			"waterlogged": "false",
+		})
+		if !hasChest {
+			chestSt, _ = world.BlockStateByName(chestName, nil)
+		}
+		s.setDispenserWorldBlock(dim, cache, fx, fy, fz, world.StateAir)
+		if chestSt != world.StateAir {
+			s.setDispenserWorldBlock(dim, cache, cx, cy, cz, chestSt)
+		}
+		if golemID, err := s.SpawnCopperGolem(dim, float64(fx)+0.5, float64(fy)+0.05, float64(fz)+0.5, "north"); err == nil && golemID > 0 {
+			s.SetCopperGolemState(golemID, stage, false, "standing")
+			return true
+		}
+		return true
+	}
+
+	cache.SetBlock(fx, fy, fz, prev)
+	return false
+}
+
+func (s *Server) tryDispenseWitherSkullSummon(dim string, cache *world.Cache, fx, fy, fz int, facing string) bool {
+	if cache == nil || fy < world.MinY || fy >= world.MinY+world.WorldHeight || !isDispenserAirBlock(cache.GetBlock(fx, fy, fz)) {
+		return false
+	}
+	if s.Difficulty() == DifficultyPeaceful {
+		return false
+	}
+	var skullSt uint16
+	if facing == "up" {
+		skullSt, _ = world.BlockStateByName("minecraft:wither_skeleton_skull", map[string]string{"rotation": "0"})
+	} else if facing != "down" {
+		skullSt, _ = world.BlockStateByName("minecraft:wither_skeleton_wall_skull", map[string]string{"facing": facing})
+	}
+	if skullSt == world.StateAir {
+		skullSt, _ = world.BlockStateByName("minecraft:wither_skeleton_skull", map[string]string{"rotation": "0"})
+	}
+	if skullSt == world.StateAir {
+		return false
+	}
+	prev := cache.GetBlock(fx, fy, fz)
+	cache.SetBlock(fx, fy, fz, skullSt)
+	if _, ok := FindWitherPatternAt(cache, fx, fy, fz); ok {
+		if _, summoned := s.TrySummonWitherAt(dim, fx, fy, fz, nil); summoned {
+			return true
+		}
+	}
+	cache.SetBlock(fx, fy, fz, prev)
+	return false
+}
+
+func (s *Server) dispenseEquipOrPlaceHeadPumpkin(
+	dim string,
+	cache *world.Cache,
+	x, y, z, fx, fy, fz int,
+	facing string,
+	itemID string,
+	meta ItemMeta,
+	rng *rand.Rand,
+) (handled bool, isOptionalFail bool) {
+	if itemID == "minecraft:carved_pumpkin" {
+		if s.tryDispenseCarvedPumpkinGolem(dim, cache, fx, fy, fz) {
 			return true, false
 		}
-	}
-
-	// 4. For carved_pumpkin or skulls/heads: if no entity was equipped, try placing
-	// the block at (fx, fy, fz) and checking Iron Golem / Snow Golem / Wither patterns!
-	if itemID == "minecraft:carved_pumpkin" {
-		if cache != nil && fy >= world.MinY && fy < world.MinY+world.WorldHeight && isDispenserPlaceReplaceable(cache.GetBlock(fx, fy, fz)) {
-			horizFacing := facing
-			if horizFacing == "up" || horizFacing == "down" {
-				horizFacing = "north"
-			}
-			st, ok := world.BlockStateByName("minecraft:carved_pumpkin", map[string]string{"facing": horizFacing})
-			if !ok {
-				st, _ = world.BlockStateByName("minecraft:carved_pumpkin", nil)
-			}
-			if st != world.StateAir {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
-				if _, ok := s.TrySummonIronGolemAt(dim, fx, fy, fz, nil); !ok {
-					_, _ = s.TrySummonSnowGolemAt(dim, fx, fy, fz, nil)
-				}
-				return true, false
-			}
+		if s.dispenseEquipOntoEntity(dim, fx, fy, fz, itemID, meta) {
+			return true, false
 		}
 		return false, true
 	}
-	if isSkullOrHeadItem(itemID) {
-		if cache != nil && fy >= world.MinY && fy < world.MinY+world.WorldHeight && isDispenserPlaceReplaceable(cache.GetBlock(fx, fy, fz)) {
-			st, ok := world.BlockStateByName(itemID, map[string]string{"rotation": "0"})
-			if !ok {
-				st, _ = world.BlockStateByName(itemID, nil)
-			}
-			if st != world.StateAir {
-				s.setDispenserWorldBlock(dim, cache, fx, fy, fz, st)
-				if itemID == "minecraft:wither_skeleton_skull" {
-					_, _ = s.TrySummonWitherAt(dim, fx, fy, fz, nil)
-				}
-				return true, false
-			}
+	if itemID == "minecraft:wither_skeleton_skull" {
+		if s.tryDispenseWitherSkullSummon(dim, cache, fx, fy, fz, facing) {
+			return true, false
+		}
+		if s.dispenseEquipOntoEntity(dim, fx, fy, fz, itemID, meta) {
+			return true, false
 		}
 		return false, true
 	}
-
+	if s.dispenseEquipOntoEntity(dim, fx, fy, fz, itemID, meta) {
+		return true, false
+	}
 	return false, false
 }
 
@@ -2161,8 +2585,8 @@ func canMobEquipArmorFromDispenser(typeName string) bool {
 	switch canonicalResourceName(typeName) {
 	case "minecraft:zombie", "minecraft:husk", "minecraft:drowned", "minecraft:zombified_piglin",
 		"minecraft:skeleton", "minecraft:stray", "minecraft:bogged", "minecraft:wither_skeleton",
-		"minecraft:piglin", "minecraft:piglin_brute", "minecraft:pillager", "minecraft:vindicator",
-		"minecraft:evoker", "minecraft:villager":
+		"minecraft:parched", "minecraft:piglin", "minecraft:piglin_brute", "minecraft:pillager",
+		"minecraft:vindicator", "minecraft:evoker", "minecraft:villager":
 		return true
 	default:
 		return false
@@ -2204,36 +2628,21 @@ func (s *Server) SetMobEquipment(entityID int32, equipSlot int, stack world.Item
 	return true
 }
 
-// --- Saddles, Horse Armor, Wolf Armor, Llama Carpets, and Equine Chests ---
+// --- Saddles, Horse Armor, Wolf Armor, Nautilus Armor, Harnesses, Llama Carpets, and Equine Chests ---
 
 // AttachEquineChest attaches a chest onto a tamed adult donkey, mule, llama, or trader_llama.
 func (s *Server) AttachEquineChest(entityID int32) bool {
 	return s.EquipEquineChest(entityID)
 }
 
-func isDispenserAnimalEquipment(itemID, dim string, fx, fy, fz int, s *Server) bool {
+func isDispenserAnimalEquipment(itemID string) bool {
 	norm := canonicalResourceName(itemID)
-	if norm == "minecraft:saddle" || norm == "minecraft:wolf_armor" || IsHorseArmorItem(norm) {
+	if norm == "minecraft:saddle" || norm == "minecraft:wolf_armor" || norm == "minecraft:chest" ||
+		IsHorseArmorItem(norm) || strings.HasSuffix(norm, "_nautilus_armor") || IsHarnessItem2612(norm) {
 		return true
 	}
-	if norm == "minecraft:chest" {
-		// Only acts as animal equipment if a tamed adult donkey/mule/llama/trader_llama is in front.
-		for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
-			if IsChestedEquineMob(ent.TypeName) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) {
-				return true
-			}
-		}
-		return false
-	}
-	if _, isCarpet := CarpetColorByItemName(norm); isCarpet || strings.HasSuffix(norm, "_carpet") {
-		for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
-			t := canonicalResourceName(ent.TypeName)
-			if (t == MobTypeLlama || t == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) {
-				return true
-			}
-		}
-	}
-	return false
+	_, isWoolCarpet := CarpetColorByItemName(norm)
+	return isWoolCarpet
 }
 
 func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID string, meta ItemMeta) bool {
@@ -2243,7 +2652,6 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 		mobType := canonicalResourceName(ent.TypeName)
 		switch {
 		case norm == "minecraft:saddle":
-			// Tamed adult horse/donkey/mule/skeleton_horse/zombie_horse, camel, or adult pig/strider.
 			if mobType == MobTypeHorse || mobType == MobTypeDonkey || mobType == MobTypeMule || mobType == MobTypeSkeletonHorse || mobType == MobTypeZombieHorse {
 				if s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && !s.IsEquineSaddled(ent.ID) {
 					if s.EquipEquineSaddle(ent.ID, true) {
@@ -2264,6 +2672,18 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 					s.broadcastTamedMobMetadata(ent, snap)
 					return true
 				}
+			} else if IsNautilusMobType(mobType) {
+				bt := s.batNautilusTracker()
+				bt.mu.Lock()
+				nst := bt.nautiluses[ent.ID]
+				canSaddle := nst != nil && nst.Tamed && !nst.Baby && !s.IsMobBaby(ent.ID) && !nst.Saddled
+				if canSaddle {
+					nst.Saddled = true
+				}
+				bt.mu.Unlock()
+				if canSaddle {
+					return true
+				}
 			} else if (mobType == MobTypePig || mobType == "minecraft:strider") && !s.IsMobBaby(ent.ID) {
 				st := s.ensureTamedMobState(ent.ID, mobType)
 				mgr := s.tamedManager()
@@ -2279,7 +2699,7 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 			}
 
 		case IsHorseArmorItem(norm):
-			if mobType == MobTypeHorse && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && s.HorseArmor(ent.ID) == "" {
+			if (mobType == MobTypeHorse || mobType == MobTypeZombieHorse) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && s.HorseArmor(ent.ID) == "" {
 				stack := world.NewNamedItemStack(norm, 1)
 				if s.EquipHorseArmor(ent.ID, stack) {
 					s.SetHorseArmor(ent.ID, norm)
@@ -2297,6 +2717,40 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 				return true
 			}
 
+		case strings.HasSuffix(norm, "_nautilus_armor"):
+			if _, _, valid := IsNautilusArmorItem2612(norm); valid && IsNautilusMobType(mobType) {
+				bt := s.batNautilusTracker()
+				bt.mu.Lock()
+				nst := bt.nautiluses[ent.ID]
+				canEquip := nst != nil && nst.Tamed && !nst.Baby && !s.IsMobBaby(ent.ID) && nst.BodyArmor.IsEmpty()
+				if canEquip {
+					nst.BodyArmor = world.NewNamedItemStack(norm, 1)
+				}
+				bt.mu.Unlock()
+				if canEquip {
+					return true
+				}
+			}
+
+		case IsHarnessItem2612(norm):
+			if mobType == MobTypeHappyGhast && !s.IsMobBaby(ent.ID) {
+				mgr := s.happyGhastParchedMgr()
+				mgr.mu.Lock()
+				hst := mgr.happyGhasts[ent.ID]
+				if hst == nil {
+					hst = &HappyGhastBehaviorState{EntityID: ent.ID, Baby: false}
+					mgr.happyGhasts[ent.ID] = hst
+				}
+				canEquip := !hst.Baby && hst.HarnessItem == ""
+				if canEquip {
+					hst.HarnessItem = norm
+				}
+				mgr.mu.Unlock()
+				if canEquip {
+					return true
+				}
+			}
+
 		case strings.HasSuffix(norm, "_carpet"):
 			if (mobType == MobTypeLlama || mobType == MobTypeTraderLlama) && s.IsMobTamed(ent.ID) && !s.IsMobBaby(ent.ID) && s.LlamaCarpet(ent.ID) == "" {
 				if color, ok := CarpetColorByItemName(norm); ok {
@@ -2304,9 +2758,6 @@ func (s *Server) dispenseAnimalEquipment(dim string, fx, fy, fz int, itemID stri
 						s.SetLlamaCarpet(ent.ID, norm)
 						return true
 					}
-				} else {
-					s.SetLlamaCarpet(ent.ID, norm)
-					return true
 				}
 			}
 
@@ -2483,22 +2934,55 @@ func isRailBlock(state uint16) bool {
 	}
 }
 
-func (s *Server) dispenseMinecart(dim string, cache *world.Cache, fx, fy, fz int, facing, itemID string) bool {
+func isAscendingRail(state uint16) bool {
+	if !isRailBlock(state) {
+		return false
+	}
+	return strings.HasPrefix(world.BlockProperties(state)["shape"], "ascending_")
+}
+
+func hasDispenserWaterFluid(state uint16) bool {
+	if state == world.StateAir {
+		return false
+	}
+	switch world.BlockName(state) {
+	case "minecraft:water", "minecraft:bubble_column",
+		"minecraft:kelp", "minecraft:kelp_plant",
+		"minecraft:seagrass", "minecraft:tall_seagrass":
+		return true
+	}
+	return world.BlockProperties(state)["waterlogged"] == "true"
+}
+
+func (s *Server) dispenseMinecart(dim string, cache *world.Cache, x, y, z, fx, fy, fz int, facing, itemID string) bool {
 	if cache == nil || fy < world.MinY || fy >= world.MinY+world.WorldHeight {
 		return false
 	}
 	frontState := cache.GetBlock(fx, fy, fz)
-	var spawnY float64
+	var yOffset float64
 	if isRailBlock(frontState) {
-		spawnY = float64(fy) + 0.0625
-	} else if isDispenserPlaceReplaceable(frontState) && fy-1 >= world.MinY && isRailBlock(cache.GetBlock(fx, fy-1, fz)) {
-		spawnY = float64(fy-1) + 0.0625
+		if isAscendingRail(frontState) {
+			yOffset = 0.6
+		} else {
+			yOffset = 0.1
+		}
+	} else if isDispenserAirBlock(frontState) && fy-1 >= world.MinY && isRailBlock(cache.GetBlock(fx, fy-1, fz)) {
+		belowState := cache.GetBlock(fx, fy-1, fz)
+		if !strings.EqualFold(facing, "down") && isAscendingRail(belowState) {
+			yOffset = -0.4
+		} else {
+			yOffset = -0.9
+		}
 	} else {
 		return false
 	}
-	entID, _ := s.SpawnVehicle(dim, itemID, float64(fx)+0.5, spawnY, float64(fz)+0.5, 0)
+	dx, _, dz := DispenserFacingVector(facing)
+	spawnX := float64(x) + 0.5 + float64(dx)*1.125
+	spawnY := float64(fy) + yOffset
+	spawnZ := float64(z) + 0.5 + float64(dz)*1.125
+	entID, _ := s.SpawnVehicle(dim, itemID, spawnX, spawnY, spawnZ, 0)
 	if entID == 0 {
-		entID = s.spawnDispenserProjectileEntity(dim, itemID, float64(fx)+0.5, spawnY, float64(fz)+0.5, 0, 0, 0)
+		entID = s.spawnDispenserProjectileEntity(dim, itemID, spawnX, spawnY, spawnZ, 0, 0, 0)
 	}
 	return entID != 0
 }
@@ -2513,21 +2997,20 @@ func (s *Server) dispenseBoat(dim string, cache *world.Cache, x, y, z, fx, fy, f
 		return false
 	}
 	frontState := cache.GetBlock(fx, fy, fz)
-	frontName := world.BlockName(frontState)
-	var spawnY float64
+	var yOffset float64
 	switch {
-	case frontName == "minecraft:water":
-		spawnY = float64(fy) + 1.0
-	case isDispenserPlaceReplaceable(frontState) && fy-1 >= world.MinY && world.BlockName(cache.GetBlock(fx, fy-1, fz)) == "minecraft:water":
-		spawnY = float64(fy)
-	case isDispenserPlaceReplaceable(frontState):
-		spawnY = float64(fy)
+	case hasDispenserWaterFluid(frontState):
+		yOffset = 1.0
+	case isDispenserAirBlock(frontState) && fy-1 >= world.MinY && hasDispenserWaterFluid(cache.GetBlock(fx, fy-1, fz)):
+		yOffset = 0.0
 	default:
+		// Vanilla 26.1.2 BoatDispenseItemBehavior: on dry land, falls back to DefaultDispenseItemBehavior!
 		return false
 	}
-	dx, _, dz := DispenserFacingVector(facing)
-	spawnX := float64(x) + 0.5 + float64(dx)*1.125
-	spawnZ := float64(z) + 0.5 + float64(dz)*1.125
+	dx, dy, dz := DispenserFacingVector(facing)
+	spawnX := float64(x) + 0.5 + float64(dx)*1.25
+	spawnY := float64(y) + 0.5 + float64(dy)*1.125 + yOffset
+	spawnZ := float64(z) + 0.5 + float64(dz)*1.25
 	entID, _ := s.SpawnVehicle(dim, itemID, spawnX, spawnY, spawnZ, 0)
 	if entID == 0 {
 		entID = s.spawnDispenserProjectileEntity(dim, itemID, spawnX, spawnY, spawnZ, 0, 0, 0)
@@ -2565,19 +3048,12 @@ func (s *Server) dispenseFlintAndSteel(dim string, cache *world.Cache, fx, fy, f
 		return true
 	}
 
-	// 3. Place fire (or light a Nether portal) if the front cell is air.
-	if targetState == world.StateAir || targetName == "minecraft:air" || targetName == "minecraft:cave_air" {
+	// 3. Place fire (or light a Nether portal) ONLY if BaseFireBlock.canBePlacedAt succeeds!
+	if isDispenserAirBlock(targetState) {
 		if _, lit := s.LightPortalAt(dim, fx, fy, fz); lit {
 			return true
 		}
-		fireName := "minecraft:fire"
-		if fy-1 >= world.MinY {
-			belowName := world.BlockName(cache.GetBlock(fx, fy-1, fz))
-			if belowName == "minecraft:soul_sand" || belowName == "minecraft:soul_soil" {
-				fireName = "minecraft:soul_fire"
-			}
-		}
-		if fireSt, ok := world.BlockStateByName(fireName, nil); ok && fireSt != world.StateAir {
+		if fireSt, ok := cache.ResolveFireStateForPlacement(fx, fy, fz, 0); ok && fireSt != world.StateAir {
 			s.setDispenserWorldBlock(dim, cache, fx, fy, fz, fireSt)
 			return true
 		}
@@ -2660,40 +3136,16 @@ func (s *Server) dispenseShears(dim string, cache *world.Cache, fx, fy, fz int, 
 		}
 	}
 
-	// 2. Shearable entities in [fx, fx+1) x [fy, fy+1) x [fz, fz+1) (Sheep, Snow Golem, Mooshroom, Bogged).
+	// 2. Shearable entities in [fx, fx+1) x [fy, fy+1) x [fz, fz+1) (Sheep, Snow Golem, Mooshroom, Bogged, Copper Golem, Wolf/Nautilus/HappyGhast equipment).
+	// Note: Vanilla 26.1.2 ShearsDispenseItemBehavior does NOT carve `minecraft:pumpkin` blocks!
 	for _, ent := range s.mobsInBlockBox(dim, fx, fy, fz) {
 		mobType := canonicalResourceName(ent.TypeName)
-		switch mobType {
-		case MobTypeSheep:
-			if s.IsMobBaby(ent.ID) {
-				continue
-			}
-			tr := s.entityTracker()
-			tr.mu.Lock()
-			mem := tr.mobStateFor(ent.ID, tr.aiTickID)
-			alreadySheared := mem.sheared
-			if !alreadySheared {
-				mem.sheared = true
-				mem.woolRegrowTimer = 0
-			}
-			tr.mu.Unlock()
-			if !alreadySheared {
-				woolCount := int32(1)
-				if rng != nil {
-					woolCount += int32(rng.Intn(3))
-				} else {
-					woolCount = 2
-				}
-				wool := world.NewNamedItemStack("minecraft:white_wool", woolCount)
-				s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.5, ent.Z, wool)
-				cp := ent.ChunkPos()
-				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB, EncodeSheepWoolDataPacket(ent.ID, 0, true))
-				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-					EncodeSoundPacket("minecraft:entity.sheep.shear", SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
+		switch {
+		case mobType == MobTypeSheep:
+			if _, sheared := s.ShearSheepColored(nil, ent.ID, rng); sheared {
 				return true
 			}
-		case MobTypeSnowGolem:
+		case mobType == MobTypeSnowGolem:
 			tr := s.entityTracker()
 			tr.mu.Lock()
 			mem := tr.mobStateFor(ent.ID, tr.aiTickID)
@@ -2707,36 +3159,58 @@ func (s *Server) dispenseShears(dim string, cache *world.Cache, fx, fy, fz int, 
 				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
 				return true
 			}
-		case MobTypeBogged:
+		case mobType == MobTypeBogged:
 			if _, sheared := s.ShearBogged(nil, ent.ID, rng); sheared {
 				return true
 			}
-		case MobTypeMooshroom:
+		case mobType == MobTypeMooshroom:
 			if s.dispenseShearMooshroom(dim, ent) {
 				return true
 			}
-		case MobTypeCopperGolem:
+		case mobType == MobTypeCopperGolem:
 			if s.dispenseShearCopperGolem(dim, ent) {
 				return true
 			}
-		case MobTypeWolf:
+		case mobType == MobTypeWolf:
 			if _, _, sheared := s.RemoveWolfArmorWithShears(nil, ent.ID); sheared {
 				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
 				return true
 			}
-		}
-	}
-
-	// 3. Carve a `minecraft:pumpkin` block into `minecraft:carved_pumpkin` and drop 4 pumpkin_seeds.
-	if targetName == "minecraft:pumpkin" {
-		horizFacing := facing
-		if horizFacing == "up" || horizFacing == "down" {
-			horizFacing = "north"
-		}
-		if carvedSt, ok := world.BlockStateByName("minecraft:carved_pumpkin", map[string]string{"facing": horizFacing}); ok {
-			s.setDispenserWorldBlock(dim, cache, fx, fy, fz, carvedSt)
-			s.SpawnItemEntityInDimension(dim, float64(fx)+0.5, float64(fy)+0.5, float64(fz)+0.5, world.NewNamedItemStack("minecraft:pumpkin_seeds", 4))
-			return true
+		case IsNautilusMobType(mobType):
+			bt := s.batNautilusTracker()
+			bt.mu.Lock()
+			nst := bt.nautiluses[ent.ID]
+			var dropped world.ItemStack
+			if nst != nil && !nst.HasRider {
+				if !nst.BodyArmor.IsEmpty() {
+					dropped = nst.BodyArmor
+					nst.BodyArmor = world.ItemStack{}
+				} else if nst.Saddled {
+					dropped = world.NewNamedItemStack("minecraft:saddle", 1)
+					nst.Saddled = false
+				}
+			}
+			bt.mu.Unlock()
+			if !dropped.IsEmpty() {
+				s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.5, ent.Z, dropped)
+				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
+				return true
+			}
+		case mobType == MobTypeHappyGhast:
+			mgr := s.happyGhastParchedMgr()
+			mgr.mu.Lock()
+			hst := mgr.happyGhasts[ent.ID]
+			var removedHarness string
+			if hst != nil && hst.HarnessItem != "" && len(hst.Passengers) == 0 {
+				removedHarness = hst.HarnessItem
+				hst.HarnessItem = ""
+			}
+			mgr.mu.Unlock()
+			if removedHarness != "" {
+				s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+1.0, ent.Z, world.NewNamedItemStack(removedHarness, 1))
+				s.EmitGameEvent(dim, GameEventShear, ent.X, ent.Y, ent.Z, VibrationSource{EntityID: ent.ID})
+				return true
+			}
 		}
 	}
 
@@ -2791,16 +3265,9 @@ func (s *Server) dispenseGlassBottle(dim string, cache *world.Cache, fx, fy, fz 
 		}
 	}
 
-	// 2. Water block or waterlogged block -> water potion.
-	if targetName == "minecraft:water" || props["waterlogged"] == "true" {
-		return world.NewNamedItemStack("minecraft:potion", 1), PotionWater, true
-	}
-
-	// 3. Water cauldron -> decrement cauldron level and produce water potion.
-	if targetName == "minecraft:water_cauldron" {
-		_, lvl, _ := ParseCauldronState(targetState)
-		nextSt := CauldronWaterBlockState(lvl - 1)
-		s.setDispenserWorldBlock(dim, cache, fx, fy, fz, nextSt)
+	// 2. FluidState.is(FluidTags.WATER) (water, bubble_column, underwater plants, waterlogged blocks) -> water potion.
+	// Note: `minecraft:water_cauldron` does NOT have a water FluidState in vanilla 26.1.2!
+	if hasDispenserWaterFluid(targetState) {
 		return world.NewNamedItemStack("minecraft:potion", 1), PotionWater, true
 	}
 
@@ -2818,26 +3285,12 @@ func (s *Server) dispenseHoneycombWax(dim string, cache *world.Cache, fx, fy, fz
 			EncodeLevelEventPacket(LevelEventParticlesWaxOn, fx, fy, fz, 0, false))
 		return true
 	}
-	if IsSignBlock(targetState) {
-		sign, exists := s.GetSignAt(dim, fx, fy, fz)
-		if !exists || sign == nil {
-			signID, _, _ := SignBlockEntityTypeForState(targetState)
-			sign = NewSignBlockEntity(signID, dim, fx, fy, fz)
-		}
-		if !sign.IsWaxed {
-			sign.IsWaxed = true
-			s.SetSignAt(sign)
-			s.BroadcastDimensionChunk(dim, int32(fx>>4), int32(fz>>4), PlayLevelEventCB,
-				EncodeLevelEventPacket(LevelEventParticlesWaxOn, fx, fy, fz, 0, false))
-			return true
-		}
-	}
 	return false
 }
 
 // WaxedCopperBlockState returns the waxed counterpart block state for an
-// unwaxed copper block state (e.g. `minecraft:copper_block` -> `minecraft:waxed_copper_block`,
-// `minecraft:cut_copper_stairs` -> `minecraft:waxed_cut_copper_stairs`), preserving all properties.
+// unwaxed block in `HoneycombItem.WAXABLES` (all copper variants plus
+// `lightning_rod` variants), preserving all block properties.
 func WaxedCopperBlockState(state uint16) (uint16, bool) {
 	if state == world.StateAir {
 		return 0, false
@@ -2847,7 +3300,7 @@ func WaxedCopperBlockState(state uint16) (uint16, bool) {
 		return 0, false
 	}
 	short := strings.TrimPrefix(name, "minecraft:")
-	if strings.HasPrefix(short, "waxed_") || !strings.Contains(short, "copper") {
+	if strings.HasPrefix(short, "waxed_") {
 		return 0, false
 	}
 	waxedName := "minecraft:waxed_" + short
@@ -2995,11 +3448,13 @@ func (s *Server) HopperExtractFromDispenser(dim string, x, y, z int) (stack worl
 	normDim := normalizeDispenserDim(dim)
 	ds := s.dispenserState()
 	ds.mu.Lock()
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(x>>4), int32(z>>4))
 	be := ds.blocks[dispenserBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if be == nil {
 		ds.mu.Unlock()
 		return world.ItemStack{}, ItemMeta{}, "", false
 	}
+	unpacked := s.unpackDispenserLootTableLocked(be)
 	foundSlot := -1
 	for i := 0; i < DispenserSlotCount; i++ {
 		if !be.Slots[i].IsEmpty() && be.Slots[i].Count > 0 {
@@ -3009,6 +3464,9 @@ func (s *Server) HopperExtractFromDispenser(dim string, x, y, z int) (stack worl
 	}
 	if foundSlot < 0 {
 		ds.mu.Unlock()
+		if unpacked {
+			_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+		}
 		return world.ItemStack{}, ItemMeta{}, "", false
 	}
 	cur := be.Slots[foundSlot]
@@ -3021,6 +3479,7 @@ func (s *Server) HopperExtractFromDispenser(dim string, x, y, z int) (stack worl
 	decrementDispenserSlotLocked(be, foundSlot)
 	ds.mu.Unlock()
 
+	_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
 	s.updateDispenserComparatorsAndBroadcast(normDim, x, y, z)
 	_ = s.SyncDispenserViewers(nil, x, y, z)
 	return stack, meta, potionType, true
@@ -3159,7 +3618,7 @@ func (s *Server) SyncDispenserViewers(actor *PlayerSession, bx, by, bz int) erro
 	return firstErr
 }
 
-// --- Persistence: SaveDispensers & LoadDispensers ---
+// --- Persistence: Anvil (.mca) block_entities + SaveDispensers & LoadDispensers ---
 
 func (s *Server) dispensersFilePath() string {
 	if s == nil || s.cfg.WorldDir == "" {
@@ -3168,29 +3627,130 @@ func (s *Server) dispensersFilePath() string {
 	return filepath.Join(s.cfg.WorldDir, "dispensers.nbt")
 }
 
-// SaveDispensers persists all non-empty dispensers and droppers to
-// `<WorldDir>/dispensers.nbt`.
+func (s *Server) scanLoadedChunkDispenserBlocksLocked(ds *serverDispenserState, dim string, cx, cz int32) {
+	cache := s.DimensionChunks(dim)
+	if cache == nil || !cache.IsChunkLoaded(cx, cz) {
+		return
+	}
+	for _, entry := range cache.LoadedChunkMatchingBlocks(cx, cz, IsDispenserOrDropperBlock) {
+		wx, y, wz, st := entry[0], entry[1], entry[2], uint16(entry[3])
+		key := dispenserBlockKey{dim: dim, x: wx, y: y, z: wz}
+		isDrop := world.BlockName(st) == "minecraft:dropper"
+		if existing, exists := ds.blocks[key]; !exists || existing == nil {
+			ds.blocks[key] = &DispenserBlockEntity{
+				Dimension: dim,
+				X:         wx,
+				Y:         y,
+				Z:         wz,
+				IsDropper: isDrop,
+			}
+		} else {
+			existing.IsDropper = isDrop
+		}
+	}
+}
+
+// SaveChunkDispensers persists all `minecraft:dispenser` and `minecraft:dropper`
+// block entities in chunk (cx, cz) of dim to the chunk's Anvil `block_entities` list.
+func (s *Server) SaveChunkDispensers(dim string, cx, cz int32) error {
+	if s == nil {
+		return nil
+	}
+	normDim := normalizeDispenserDim(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return nil
+	}
+	comps := s.ChunkDispenserBlockEntitiesNBT(normDim, cx, cz)
+	return cache.SaveChunkBlockEntities(cx, cz, IsDispenserOrDropperBlockEntityID, comps)
+}
+
+// SaveDispensersToStore flushes all tracked dispensers and droppers across all
+// dimensions into their chunks' Anvil (.mca) `block_entities` lists.
+func (s *Server) SaveDispensersToStore() error {
+	if s == nil {
+		return nil
+	}
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	s.ensureDispensersLoadedLocked(ds)
+	chunks := make(map[storageChunkKey]struct{})
+	for ck := range ds.loadedChunk {
+		chunks[ck] = struct{}{}
+	}
+	for k := range ds.blocks {
+		chunks[storageChunkKey{dim: k.dim, cx: int32(k.x >> 4), cz: int32(k.z >> 4)}] = struct{}{}
+	}
+	ds.mu.Unlock()
+
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		if cache := s.loadedDimensionCache(dim); cache != nil {
+			for _, coord := range cache.LoadedChunkCoords() {
+				ck := storageChunkKey{dim: dim, cx: coord[0], cz: coord[1]}
+				if _, ok := chunks[ck]; ok {
+					continue
+				}
+				if len(cache.LoadedChunkMatchingBlocks(coord[0], coord[1], IsDispenserOrDropperBlock)) > 0 {
+					chunks[ck] = struct{}{}
+				}
+			}
+		}
+	}
+
+	var firstErr error
+	for ck := range chunks {
+		if err := s.SaveChunkDispensers(ck.dim, ck.cx, ck.cz); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// SaveDispensers persists all dispensers and droppers into Anvil (.mca) chunk
+// `block_entities` AND (if WorldDir is configured) `<WorldDir>/dispensers.nbt`.
 func (s *Server) SaveDispensers() error {
 	if s == nil {
 		return nil
 	}
+	storeErr := s.SaveDispensersToStore()
 	path := s.dispensersFilePath()
 	if path == "" {
-		return nil
+		return storeErr
 	}
 	root := s.SaveDispensersToNBT()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, nbt.MarshalNamed("", root), 0o644)
+	if err := os.WriteFile(path, nbt.MarshalNamed("", root), 0o644); err != nil {
+		return err
+	}
+	return storeErr
 }
 
-// LoadDispensers loads all persisted dispensers and droppers from
-// `<WorldDir>/dispensers.nbt` (no-op if the file does not exist).
+// LoadDispensers loads all persisted dispensers and droppers from the Anvil
+// (.mca) store and (if present) `<WorldDir>/dispensers.nbt`.
 func (s *Server) LoadDispensers() error {
 	if s == nil {
 		return nil
 	}
+	ds := s.dispenserState()
+	ds.mu.Lock()
+	ds.loadedStore = false
+	s.ensureDispensersLoadedLocked(ds)
+	var storeLoaded []*DispenserBlockEntity
+	for _, be := range ds.blocks {
+		if be != nil {
+			storeLoaded = append(storeLoaded, be.Clone())
+		}
+	}
+	ds.mu.Unlock()
+	for _, be := range storeLoaded {
+		s.BindNoteBlockAndJukeboxRedstone(be.Dimension)
+		if be.LootTable == "" {
+			s.updateDispenserComparatorsAndBroadcast(be.Dimension, be.X, be.Y, be.Z)
+		}
+	}
+
 	path := s.dispensersFilePath()
 	if path == "" {
 		return nil
@@ -3222,6 +3782,7 @@ func (s *Server) SaveDispensersToNBT() *nbt.Compound {
 	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
+	s.ensureDispensersLoadedLocked(ds)
 	keys := make([]dispenserBlockKey, 0, len(ds.blocks))
 	for k := range ds.blocks {
 		keys = append(keys, k)
@@ -3245,7 +3806,9 @@ func (s *Server) SaveDispensersToNBT() *nbt.Compound {
 		if be == nil {
 			continue
 		}
-		entries = append(entries, EncodeDispenserBlockEntityNBT(be))
+		c := EncodeDispenserBlockEntityNBT(be)
+		c.Set("Dimension", nbt.String(normalizeDispenserDim(be.Dimension)))
+		entries = append(entries, c)
 	}
 	ds.mu.Unlock()
 
@@ -3253,7 +3816,57 @@ func (s *Server) SaveDispensersToNBT() *nbt.Compound {
 	return root
 }
 
-// EncodeDispenserBlockEntityNBT serializes a DispenserBlockEntity (dispenser or dropper) into an NBT compound.
+func encodeDispenserSlotComponents(be *DispenserBlockEntity, slotIdx int) *nbt.Compound {
+	if be == nil || slotIdx < 0 || slotIdx >= DispenserSlotCount {
+		return nil
+	}
+	st := be.Slots[slotIdx]
+	var shulkerArr *[ChestSlotCount]world.ItemStack
+	var shData *ShulkerBoxItemData
+	if IsShulkerBoxItemOrBlock(st.ResolvedID()) {
+		if be.SlotShulkerData[slotIdx] != nil && !be.SlotShulkerData[slotIdx].IsEmpty() {
+			shData = be.SlotShulkerData[slotIdx]
+		} else {
+			for i := 0; i < ChestSlotCount; i++ {
+				if !be.SlotShulkerItems[slotIdx][i].IsEmpty() {
+					cp := be.SlotShulkerItems[slotIdx]
+					shulkerArr = &cp
+					break
+				}
+			}
+		}
+	}
+	comp := encodeHopperItemComponents(be.SlotComponents[slotIdx], be.SlotMeta[slotIdx], be.SlotPotions[slotIdx], shulkerArr)
+	if shData != nil {
+		if shComp := EncodeShulkerBoxItemComponentsNBT(shData); shComp != nil {
+			if comp == nil {
+				comp = shComp
+			} else {
+				for _, k := range shComp.Keys() {
+					if v, ok := shComp.Get(k); ok {
+						comp.Set(k, world.CloneNBTTag(v))
+					}
+				}
+			}
+		}
+	}
+	fw := be.SlotFireworks[slotIdx]
+	if fw.FlightDuration > 0 || len(fw.Explosions) > 0 {
+		if comp == nil {
+			comp = nbt.NewCompound()
+		}
+		comp.Set("minecraft:fireworks", WriteFireworksNBT(fw))
+	}
+	if comp != nil && comp.Len() == 0 {
+		return nil
+	}
+	return comp
+}
+
+// EncodeDispenserBlockEntityNBT serializes a DispenserBlockEntity (dispenser or
+// dropper) into a vanilla 26.1.2 `block_entities` NBT compound (`id`, `x`, `y`,
+// `z`, `keepPacked`, optional `CustomName` / `lock`, and either
+// `LootTable`/`LootTableSeed` or `Items` with 26.1.2 `components`).
 func EncodeDispenserBlockEntityNBT(be *DispenserBlockEntity) *nbt.Compound {
 	c := nbt.NewCompound()
 	if be == nil {
@@ -3264,40 +3877,53 @@ func EncodeDispenserBlockEntityNBT(be *DispenserBlockEntity) *nbt.Compound {
 		id = "minecraft:dropper"
 	}
 	c.Set("id", nbt.String(id))
-	c.Set("Dimension", nbt.String(normalizeDispenserDim(be.Dimension)))
 	c.Set("x", nbt.Int(int32(be.X)))
 	c.Set("y", nbt.Int(int32(be.Y)))
 	c.Set("z", nbt.Int(int32(be.Z)))
-	if be.CustomName != "" {
+	c.Set("keepPacked", nbt.Byte(0))
+	if be.CustomNameTag != nil {
+		c.Set("CustomName", world.CloneNBTTag(be.CustomNameTag))
+	} else if be.CustomName != "" {
 		c.Set("CustomName", nbt.String(be.CustomName))
 	}
-	var itemTags []nbt.Tag
-	for slotIdx := 0; slotIdx < DispenserSlotCount; slotIdx++ {
-		st := be.Slots[slotIdx]
-		if st.IsEmpty() || st.Count <= 0 {
-			continue
-		}
-		it := nbt.NewCompound()
-		it.Set("Slot", nbt.Byte(int8(slotIdx)))
-		it.Set("id", nbt.String(st.ResolvedID()))
-		it.Set("count", nbt.Int(st.Count))
-		if be.SlotPotions[slotIdx] != "" {
-			it.Set("Potion", nbt.String(be.SlotPotions[slotIdx]))
-		}
-		if be.SlotMeta[slotIdx].Damage > 0 {
-			it.Set("Damage", nbt.Int(be.SlotMeta[slotIdx].Damage))
-		}
-		if be.SlotMeta[slotIdx].CustomName != "" {
-			it.Set("CustomName", nbt.String(be.SlotMeta[slotIdx].CustomName))
-		}
-		encodeItemMetaToNBT(it, be.SlotMeta[slotIdx])
-		itemTags = append(itemTags, it)
+	if be.LockTag != nil {
+		c.Set("lock", world.CloneNBTTag(be.LockTag))
+	} else if be.Lock != "" {
+		c.Set("lock", nbt.String(be.Lock))
 	}
-	c.Set("Items", nbt.List{ElemID: nbt.TagCompound, Elems: itemTags})
+
+	if be.LootTable != "" {
+		c.Set("LootTable", nbt.String(canonicalResourceName(be.LootTable)))
+		if be.LootTableSeed != 0 {
+			c.Set("LootTableSeed", nbt.Long(be.LootTableSeed))
+		}
+	} else {
+		var itemTags []nbt.Tag
+		for slotIdx := 0; slotIdx < DispenserSlotCount; slotIdx++ {
+			st := be.Slots[slotIdx]
+			if st.IsEmpty() || st.Count <= 0 {
+				continue
+			}
+			it := nbt.NewCompound()
+			it.Set("Slot", nbt.Byte(int8(slotIdx)))
+			it.Set("id", nbt.String(st.ResolvedID()))
+			it.Set("count", nbt.Int(st.Count))
+			if comp := encodeDispenserSlotComponents(be, slotIdx); comp != nil {
+				it.Set("components", comp)
+			}
+			itemTags = append(itemTags, it)
+		}
+		elemID := byte(nbt.TagEnd)
+		if len(itemTags) > 0 {
+			elemID = nbt.TagCompound
+		}
+		c.Set("Items", nbt.List{ElemID: elemID, Elems: itemTags})
+	}
 	return c
 }
 
-// DecodeDispenserBlockEntityNBT deserializes a DispenserBlockEntity (dispenser or dropper) from an NBT compound.
+// DecodeDispenserBlockEntityNBT deserializes a DispenserBlockEntity (dispenser
+// or dropper) from a vanilla 26.1.2 `block_entities` NBT compound (or legacy sidecar).
 func DecodeDispenserBlockEntityNBT(c *nbt.Compound, fallbackDim string) (*DispenserBlockEntity, bool) {
 	if c == nil {
 		return nil, false
@@ -3312,56 +3938,124 @@ func DecodeDispenserBlockEntityNBT(c *nbt.Compound, fallbackDim string) (*Dispen
 		dim = fallbackDim
 	}
 	normDim := normalizeDispenserDim(dim)
-	x, _ := nbtGetInt(c, "x")
-	y, _ := nbtGetInt(c, "y")
-	z, _ := nbtGetInt(c, "z")
-	customName, _ := nbtGetString(c, "CustomName")
+	x, okX := nbtGetInt(c, "x")
+	y, okY := nbtGetInt(c, "y")
+	z, okZ := nbtGetInt(c, "z")
+	if !okX || !okY || !okZ {
+		return nil, false
+	}
+
+	var customName string
+	var customNameTag nbt.Tag
+	if rawName, ok := c.Get("CustomName"); ok && rawName != nil {
+		customNameTag = world.CloneNBTTag(rawName)
+		customName = world.ExtractCustomNameFromNBTTag(rawName)
+	}
+	var lockStr string
+	var lockTag nbt.Tag
+	if rawLock, ok := c.Get("lock"); ok && rawLock != nil {
+		lockTag = world.CloneNBTTag(rawLock)
+		lockStr = world.ExtractLockStringFromNBTTag(rawLock)
+	} else if rawLockUpper, ok := c.Get("Lock"); ok && rawLockUpper != nil {
+		lockTag = world.CloneNBTTag(rawLockUpper)
+		lockStr = world.ExtractLockStringFromNBTTag(rawLockUpper)
+	}
+	lootTable, _ := nbtGetString(c, "LootTable")
+	if lootTable != "" {
+		lootTable = canonicalResourceName(lootTable)
+	}
+	var lootTableSeed int64
+	if rawSeed, ok := c.Get("LootTableSeed"); ok {
+		switch sv := rawSeed.(type) {
+		case nbt.Long:
+			lootTableSeed = int64(sv)
+		case nbt.Int:
+			lootTableSeed = int64(sv)
+		}
+	}
 
 	be := &DispenserBlockEntity{
-		Dimension:  normDim,
-		X:          int(x),
-		Y:          int(y),
-		Z:          int(z),
-		IsDropper:  normID == "minecraft:dropper",
-		CustomName: customName,
+		Dimension:     normDim,
+		X:             int(x),
+		Y:             int(y),
+		Z:             int(z),
+		IsDropper:     normID == "minecraft:dropper",
+		CustomName:    customName,
+		CustomNameTag: customNameTag,
+		Lock:          lockStr,
+		LockTag:       lockTag,
+		LootTable:     lootTable,
+		LootTableSeed: lootTableSeed,
 	}
-	if itemElems, ok := nbtGetListElems(c, "Items"); ok {
-		for _, itElem := range itemElems {
-			itComp, ok := itElem.(*nbt.Compound)
-			if !ok || itComp == nil {
-				continue
-			}
-			slotByte, _ := nbtGetByte(itComp, "Slot")
-			slotIdx := int(slotByte)
-			if slotIdx < 0 || slotIdx >= DispenserSlotCount {
-				continue
-			}
-			itemID, _ := nbtGetString(itComp, "id")
-			count, _ := nbtGetInt(itComp, "count")
-			if count <= 0 {
-				if bCount, ok := nbtGetByte(itComp, "Count"); ok {
-					count = int32(bCount)
+	if lootTable == "" {
+		if itemElems, ok := nbtGetListElems(c, "Items"); ok {
+			for _, itElem := range itemElems {
+				itComp, ok := itElem.(*nbt.Compound)
+				if !ok || itComp == nil {
+					continue
 				}
-			}
-			if itemID == "" || count <= 0 {
-				continue
-			}
-			be.Slots[slotIdx] = world.NewNamedItemStack(itemID, count)
-			if pot, ok := nbtGetString(itComp, "Potion"); ok {
+				slotByte, okSlot := nbtGetByte(itComp, "Slot")
+				slotIdx := int(slotByte)
+				if !okSlot || slotIdx < 0 || slotIdx >= DispenserSlotCount {
+					continue
+				}
+				itemID, _ := nbtGetString(itComp, "id")
+				count, _ := nbtGetInt(itComp, "count")
+				if count <= 0 {
+					if bCount, ok := nbtGetByte(itComp, "Count"); ok {
+						count = int32(bCount)
+					}
+				}
+				if itemID == "" || count <= 0 {
+					continue
+				}
+				be.Slots[slotIdx] = world.NewNamedItemStack(itemID, count)
+
+				rawComp, meta, pot, shArr := decodeHopperItemComponents(itComp)
+				if pot == "" {
+					if legacyPot, ok := nbtGetString(itComp, "Potion"); ok && legacyPot != "" {
+						pot = legacyPot
+					}
+				}
+				if pot != "" {
+					pot = canonicalResourceName(pot)
+				}
+				if meta.IsEmpty() {
+					meta = decodeItemMetaFromNBT(itComp)
+					if meta.Damage == 0 {
+						if dmg, ok := nbtGetInt(itComp, "Damage"); ok && dmg > 0 {
+							meta.Damage = dmg
+						}
+					}
+					if meta.CustomName == "" {
+						if cname, ok := nbtGetString(itComp, "CustomName"); ok && cname != "" {
+							meta.CustomName = cname
+						}
+					}
+				}
+				be.SlotComponents[slotIdx] = rawComp
+				be.SlotMeta[slotIdx] = meta
 				be.SlotPotions[slotIdx] = pot
-			}
-			meta := decodeItemMetaFromNBT(itComp)
-			if meta.Damage == 0 {
-				if dmg, ok := nbtGetInt(itComp, "Damage"); ok && dmg > 0 {
-					meta.Damage = dmg
+				if rawComp != nil {
+					if IsShulkerBoxItemOrBlock(itemID) {
+						if shData, hasSh := DecodeShulkerBoxItemComponentsNBT(rawComp); hasSh && shData != nil {
+							be.SlotShulkerData[slotIdx] = shData
+							be.SlotShulkerItems[slotIdx] = shData.Slots
+						} else if shArr != nil {
+							be.SlotShulkerItems[slotIdx] = *shArr
+						}
+					}
+					if rawFW, hasFW := rawComp.Get("minecraft:fireworks"); hasFW {
+						if fwComp, isComp := rawFW.(*nbt.Compound); isComp {
+							if fw, valid := ReadFireworksNBT(fwComp); valid {
+								be.SlotFireworks[slotIdx] = fw
+							}
+						}
+					}
+				} else if shArr != nil {
+					be.SlotShulkerItems[slotIdx] = *shArr
 				}
 			}
-			if meta.CustomName == "" {
-				if cname, ok := nbtGetString(itComp, "CustomName"); ok && cname != "" {
-					meta.CustomName = cname
-				}
-			}
-			be.SlotMeta[slotIdx] = meta
 		}
 	}
 	return be, true
@@ -3450,6 +4144,7 @@ func (s *Server) LoadDispensersFromNBT(root *nbt.Compound) int {
 			continue
 		}
 		ds.blocks[dispenserBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}] = be
+		ds.loadedChunk[storageChunkKey{dim: be.Dimension, cx: int32(be.X >> 4), cz: int32(be.Z >> 4)}] = true
 		dimsToBind = append(dimsToBind, be.Dimension)
 		loaded++
 	}
@@ -3468,18 +4163,42 @@ func (s *Server) ChunkDispenserBlockEntitiesNBT(dim string, cx, cz int32) []*nbt
 		return nil
 	}
 	normDim := normalizeDispenserDim(dim)
+	cache := s.DimensionChunks(normDim)
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	var out []*nbt.Compound
+	s.ensureChunkDispensersLoadedLocked(ds, normDim, cx, cz)
+	s.scanLoadedChunkDispenserBlocksLocked(ds, normDim, cx, cz)
+
+	var keys []dispenserBlockKey
 	for k, be := range ds.blocks {
 		if k.dim != normDim || be == nil {
 			continue
 		}
 		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
+			if cache != nil && cache.IsChunkLoaded(cx, cz) {
+				if !IsDispenserOrDropperBlock(cache.GetBlock(k.x, k.y, k.z)) {
+					continue
+				}
+			}
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].y != keys[j].y {
+			return keys[i].y < keys[j].y
+		}
+		if keys[i].z != keys[j].z {
+			return keys[i].z < keys[j].z
+		}
+		return keys[i].x < keys[j].x
+	})
+	var out []*nbt.Compound
+	for _, k := range keys {
+		if be := ds.blocks[k]; be != nil {
 			out = append(out, EncodeDispenserBlockEntityNBT(be))
 		}
 	}
+	ds.mu.Unlock()
 	return out
 }
 
@@ -3490,22 +4209,20 @@ func (s *Server) UnloadChunkDispensers(dim string, cx, cz int32) []*nbt.Compound
 		return nil
 	}
 	normDim := normalizeDispenserDim(dim)
+	comps := s.ChunkDispenserBlockEntitiesNBT(normDim, cx, cz)
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		_ = cache.SaveChunkBlockEntities(cx, cz, IsDispenserOrDropperBlockEntityID, comps)
+	}
 	ds := s.dispenserState()
 	ds.mu.Lock()
-	defer ds.mu.Unlock()
-	var out []*nbt.Compound
-	for k, be := range ds.blocks {
-		if k.dim != normDim {
-			continue
-		}
-		if int32(k.x>>4) == cx && int32(k.z>>4) == cz {
-			if be != nil {
-				out = append(out, EncodeDispenserBlockEntityNBT(be))
-			}
+	for k := range ds.blocks {
+		if k.dim == normDim && int32(k.x>>4) == cx && int32(k.z>>4) == cz {
 			delete(ds.blocks, k)
 		}
 	}
-	return out
+	ds.loadedChunk[storageChunkKey{dim: normDim, cx: cx, cz: cz}] = true
+	ds.mu.Unlock()
+	return comps
 }
 
 // LoadChunkDispenserBlockEntitiesNBT loads dispenser and dropper block entities
@@ -3518,15 +4235,22 @@ func (s *Server) LoadChunkDispenserBlockEntitiesNBT(dim string, list []*nbt.Comp
 	ds := s.dispenserState()
 	ds.mu.Lock()
 	loaded := 0
+	chunks := make(map[storageChunkKey]struct{})
 	for _, c := range list {
 		be, ok := DecodeDispenserBlockEntityNBT(c, normDim)
 		if !ok || be == nil {
 			continue
 		}
+		ck := storageChunkKey{dim: be.Dimension, cx: int32(be.X >> 4), cz: int32(be.Z >> 4)}
+		ds.loadedChunk[ck] = true
+		chunks[ck] = struct{}{}
 		ds.blocks[dispenserBlockKey{dim: be.Dimension, x: be.X, y: be.Y, z: be.Z}] = be
 		loaded++
 	}
 	ds.mu.Unlock()
+	for ck := range chunks {
+		_ = s.SaveChunkDispensers(ck.dim, ck.cx, ck.cz)
+	}
 	if loaded > 0 {
 		s.BindNoteBlockAndJukeboxRedstone(normDim)
 	}

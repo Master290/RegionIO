@@ -126,8 +126,18 @@ type CrafterBlockEntity struct {
 	X, Y, Z                int
 	Slots                  [CrafterSlotCount]world.ItemStack
 	SlotMeta               [CrafterSlotCount]ItemMeta
+	SlotPotions            [CrafterSlotCount]string
+	SlotShulker            [CrafterSlotCount]*[ChestSlotCount]world.ItemStack
+	SlotComponents         [CrafterSlotCount]*nbt.Compound
 	Disabled               [CrafterSlotCount]bool
+	Triggered              bool
 	CraftingTicksRemaining int
+	CustomName             string
+	CustomNameTag          nbt.Tag
+	Lock                   string
+	LockTag                nbt.Tag
+	LootTable              string
+	LootTableSeed          int64
 }
 
 // Clone returns a deep copy of the CrafterBlockEntity.
@@ -136,8 +146,15 @@ func (cr *CrafterBlockEntity) Clone() *CrafterBlockEntity {
 		return nil
 	}
 	cp := *cr
+	cp.CustomNameTag = world.CloneNBTTag(cr.CustomNameTag)
+	cp.LockTag = world.CloneNBTTag(cr.LockTag)
 	for i := 0; i < CrafterSlotCount; i++ {
 		cp.SlotMeta[i] = cr.SlotMeta[i].Clone()
+		cp.SlotComponents[i] = world.CloneNBTCompound(cr.SlotComponents[i])
+		if cr.SlotShulker[i] != nil {
+			arr := *cr.SlotShulker[i]
+			cp.SlotShulker[i] = &arr
+		}
 	}
 	return &cp
 }
@@ -153,11 +170,13 @@ type hopperChunkKey struct {
 }
 
 type serverHopperState struct {
-	mu               sync.Mutex
-	loadedStore      bool
-	loadedChunk      map[hopperChunkKey]bool
-	hoppers          map[hopperBlockKey]*HopperBlockEntity
-	bookshelves      map[hopperBlockKey]*ChiseledBookshelfBlockEntity
+	mu                 sync.Mutex
+	loadedStore        bool
+	loadedChunk        map[hopperChunkKey]bool
+	loadedCrafterStore bool
+	loadedCrafterChunk map[hopperChunkKey]bool
+	hoppers            map[hopperBlockKey]*HopperBlockEntity
+	bookshelves        map[hopperBlockKey]*ChiseledBookshelfBlockEntity
 	crafters         map[hopperBlockKey]*CrafterBlockEntity
 	composterPending map[hopperBlockKey]int // countdown ticks for level 7 -> 8 maturation
 	minecartFallback map[int32]*[HopperBlockSlotCount]world.ItemStack
@@ -174,13 +193,14 @@ func (s *Server) hopperState() *serverHopperState {
 		return hs
 	}
 	hs := &serverHopperState{
-		loadedChunk:      make(map[hopperChunkKey]bool),
-		hoppers:          make(map[hopperBlockKey]*HopperBlockEntity),
-		bookshelves:      make(map[hopperBlockKey]*ChiseledBookshelfBlockEntity),
-		crafters:         make(map[hopperBlockKey]*CrafterBlockEntity),
-		composterPending: make(map[hopperBlockKey]int),
-		minecartFallback: make(map[int32]*[HopperBlockSlotCount]world.ItemStack),
-		minecartEnabled:  make(map[int32]bool),
+		loadedChunk:        make(map[hopperChunkKey]bool),
+		loadedCrafterChunk: make(map[hopperChunkKey]bool),
+		hoppers:            make(map[hopperBlockKey]*HopperBlockEntity),
+		bookshelves:        make(map[hopperBlockKey]*ChiseledBookshelfBlockEntity),
+		crafters:           make(map[hopperBlockKey]*CrafterBlockEntity),
+		composterPending:   make(map[hopperBlockKey]int),
+		minecartFallback:   make(map[int32]*[HopperBlockSlotCount]world.ItemStack),
+		minecartEnabled:    make(map[int32]bool),
 	}
 	actual, _ := serverHoppers.LoadOrStore(s, hs)
 	res := actual.(*serverHopperState)
@@ -895,16 +915,134 @@ func IsCrafterBlock(state uint16) bool {
 	return world.BlockName(state) == "minecraft:crafter"
 }
 
+func isCrafterBlockEntityID(id string) bool {
+	return canonicalResourceName(id) == "minecraft:crafter"
+}
+
+func (s *Server) ensureCraftersLoadedLocked(hs *serverHopperState) {
+	if hs.loadedCrafterStore {
+		return
+	}
+	hs.loadedCrafterStore = true
+	if s == nil {
+		return
+	}
+	tm := s.crafterTimers()
+	for _, dim := range []string{world.DimensionOverworld, world.DimensionNether, world.DimensionEnd} {
+		var store *world.Store
+		if dim == world.DimensionOverworld {
+			store = s.activeFurnaceStore()
+		}
+		if store == nil {
+			if cache := s.loadedDimensionCache(dim); cache != nil {
+				store = cache.Store()
+			}
+		}
+		if store == nil {
+			continue
+		}
+		comps, err := store.LoadAllBlockEntities(isCrafterBlockEntityID)
+		if err != nil {
+			continue
+		}
+		for _, comp := range comps {
+			cr, ok := DecodeCrafterBlockEntityNBT(comp, dim)
+			if !ok || cr == nil {
+				continue
+			}
+			key := hopperBlockKey{dim: cr.Dimension, x: cr.X, y: cr.Y, z: cr.Z}
+			if _, exists := hs.crafters[key]; !exists {
+				hs.crafters[key] = cr
+				if cr.CraftingTicksRemaining > 0 {
+					tm.mu.Lock()
+					tm.timers[key] = cr.CraftingTicksRemaining
+					tm.mu.Unlock()
+				}
+			}
+			hs.loadedCrafterChunk[hopperChunkKey{dim: cr.Dimension, cx: int32(cr.X >> 4), cz: int32(cr.Z >> 4)}] = true
+		}
+	}
+}
+
+func (s *Server) ensureChunkCraftersLoadedLocked(hs *serverHopperState, dim string, cx, cz int32) {
+	s.ensureCraftersLoadedLocked(hs)
+	normDim := normalizeHopperDim(dim)
+	ck := hopperChunkKey{dim: normDim, cx: cx, cz: cz}
+	if hs.loadedCrafterChunk[ck] {
+		return
+	}
+	hs.loadedCrafterChunk[ck] = true
+	if s == nil {
+		return
+	}
+	cache := s.DimensionChunks(normDim)
+	if cache == nil {
+		return
+	}
+	tm := s.crafterTimers()
+	if comps, err := cache.LoadChunkBlockEntities(cx, cz, isCrafterBlockEntityID); err == nil {
+		for _, comp := range comps {
+			cr, ok := DecodeCrafterBlockEntityNBT(comp, normDim)
+			if !ok || cr == nil {
+				continue
+			}
+			key := hopperBlockKey{dim: normDim, x: cr.X, y: cr.Y, z: cr.Z}
+			if _, exists := hs.crafters[key]; !exists {
+				hs.crafters[key] = cr
+				if cr.CraftingTicksRemaining > 0 {
+					tm.mu.Lock()
+					tm.timers[key] = cr.CraftingTicksRemaining
+					tm.mu.Unlock()
+				}
+			}
+		}
+	}
+	for _, sbe := range cache.LoadedChunkStructureBlockEntities(cx, cz) {
+		if !isCrafterBlockEntityID(sbe.ID) {
+			continue
+		}
+		key := hopperBlockKey{dim: normDim, x: sbe.X, y: sbe.Y, z: sbe.Z}
+		if _, exists := hs.crafters[key]; exists {
+			continue
+		}
+		cr := &CrafterBlockEntity{
+			Dimension:     normDim,
+			X:             sbe.X,
+			Y:             sbe.Y,
+			Z:             sbe.Z,
+			LootTable:     canonicalResourceName(sbe.LootTable),
+			LootTableSeed: sbe.LootTableSeed,
+		}
+		if sbe.LootTable == "" {
+			for _, item := range sbe.Items {
+				if item.Slot >= 0 && int(item.Slot) < CrafterSlotCount && item.ItemID != "" && item.Count > 0 {
+					cr.Slots[item.Slot] = world.NewNamedItemStack(item.ItemID, int32(item.Count))
+					if item.PotionID != "" {
+						cr.SlotPotions[item.Slot] = strings.TrimPrefix(canonicalResourceName(item.PotionID), "minecraft:")
+					}
+				}
+			}
+		}
+		hs.crafters[key] = cr
+	}
+}
+
 func (s *Server) getOrCreateCrafterLocked(hs *serverHopperState, dim string, x, y, z int) *CrafterBlockEntity {
 	normDim := normalizeHopperDim(dim)
+	s.ensureChunkCraftersLoadedLocked(hs, normDim, int32(x>>4), int32(z>>4))
 	key := hopperBlockKey{dim: normDim, x: x, y: y, z: z}
 	cr := hs.crafters[key]
 	if cr == nil {
+		triggered := false
+		if cache := s.DimensionChunks(normDim); cache != nil {
+			triggered = CrafterTriggered(cache.GetBlock(x, y, z))
+		}
 		cr = &CrafterBlockEntity{
 			Dimension: normDim,
 			X:         x,
 			Y:         y,
 			Z:         z,
+			Triggered: triggered,
 		}
 		hs.crafters[key] = cr
 	}
@@ -919,12 +1057,22 @@ func (s *Server) GetCrafterAt(dim string, x, y, z int) (*CrafterBlockEntity, boo
 	normDim := normalizeHopperDim(dim)
 	hs := s.hopperState()
 	hs.mu.Lock()
-	cr, ok := hs.crafters[hopperBlockKey{dim: normDim, x: x, y: y, z: z}]
+	s.ensureChunkCraftersLoadedLocked(hs, normDim, int32(x>>4), int32(z>>4))
+	key := hopperBlockKey{dim: normDim, x: x, y: y, z: z}
+	cr, ok := hs.crafters[key]
 	var cp *CrafterBlockEntity
 	if ok && cr != nil {
 		cp = cr.Clone()
 	}
 	hs.mu.Unlock()
+	if cp != nil {
+		tm := s.crafterTimers()
+		tm.mu.Lock()
+		if rem, active := tm.timers[key]; active && rem > 0 {
+			cp.CraftingTicksRemaining = rem
+		}
+		tm.mu.Unlock()
+	}
 	return cp, cp != nil
 }
 
@@ -938,10 +1086,17 @@ func (s *Server) SetCrafterSlot(dim string, x, y, z, slot int, stack world.ItemS
 	hs := s.hopperState()
 	hs.mu.Lock()
 	cr := s.getOrCreateCrafterLocked(hs, normDim, x, y, z)
+	_ = s.unpackCrafterLootTableLocked(cr)
 	if stack.IsEmpty() || stack.Count <= 0 {
 		cr.Slots[slot] = world.ItemStack{}
 		cr.SlotMeta[slot] = ItemMeta{}
+		cr.SlotPotions[slot] = ""
+		cr.SlotShulker[slot] = nil
+		cr.SlotComponents[slot] = nil
 	} else {
+		if cr.Disabled[slot] {
+			cr.Disabled[slot] = false
+		}
 		if stack.ItemID <= 0 && stack.ID != "" {
 			stack = world.NewNamedItemStack(stack.ID, stack.Count)
 		} else {
@@ -951,6 +1106,7 @@ func (s *Server) SetCrafterSlot(dim string, x, y, z, slot int, stack world.ItemS
 		cr.SlotMeta[slot] = meta.Clone()
 	}
 	hs.mu.Unlock()
+	_ = s.SaveChunkCrafters(normDim, int32(x>>4), int32(z>>4))
 	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
@@ -970,6 +1126,7 @@ func (s *Server) SetCrafterSlotDisabled(dim string, x, y, z, slot int, disabled 
 	cr := s.getOrCreateCrafterLocked(hs, normDim, x, y, z)
 	cr.Disabled[slot] = disabled
 	hs.mu.Unlock()
+	_ = s.SaveChunkCrafters(normDim, int32(x>>4), int32(z>>4))
 	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
@@ -977,7 +1134,7 @@ func (s *Server) SetCrafterSlotDisabled(dim string, x, y, z, slot int, disabled 
 
 // CrafterComparatorSignalAt returns the redstone comparator signal (0..9) for
 // a `minecraft:crafter` at (dim, x, y, z), equal to the number of slots (0..8)
-// that are either non-empty or disabled (matching vanilla CrafterBlockEntity.getRedstoneStrength).
+// that are either non-empty or disabled (matching vanilla CrafterBlockEntity.getRedstoneSignal).
 func (s *Server) CrafterComparatorSignalAt(dim string, x, y, z int) int {
 	if s == nil {
 		return 0
@@ -991,11 +1148,13 @@ func (s *Server) CrafterComparatorSignalAt(dim string, x, y, z int) int {
 	}
 	hs := s.hopperState()
 	hs.mu.Lock()
+	s.ensureChunkCraftersLoadedLocked(hs, normDim, int32(x>>4), int32(z>>4))
 	cr := hs.crafters[hopperBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if cr == nil {
 		hs.mu.Unlock()
 		return 0
 	}
+	unpacked := s.unpackCrafterLootTableLocked(cr)
 	sig := 0
 	for i := 0; i < CrafterSlotCount; i++ {
 		if (!cr.Slots[i].IsEmpty() && cr.Slots[i].Count > 0) || cr.Disabled[i] {
@@ -1003,6 +1162,9 @@ func (s *Server) CrafterComparatorSignalAt(dim string, x, y, z int) int {
 		}
 	}
 	hs.mu.Unlock()
+	if unpacked {
+		_ = s.SaveChunkCrafters(normDim, int32(x>>4), int32(z>>4))
+	}
 	return sig
 }
 
@@ -1028,6 +1190,7 @@ func (s *Server) HopperInsertIntoCrafter(dim string, x, y, z int, stack world.It
 	hs := s.hopperState()
 	hs.mu.Lock()
 	cr := s.getOrCreateCrafterLocked(hs, normDim, x, y, z)
+	_ = s.unpackCrafterLootTableLocked(cr)
 
 	// 1. Prefer the first empty enabled slot.
 	for i := 0; i < CrafterSlotCount; i++ {
@@ -1038,6 +1201,7 @@ func (s *Server) HopperInsertIntoCrafter(dim string, x, y, z int, stack world.It
 			cr.Slots[i] = single
 			cr.SlotMeta[i] = meta.Clone()
 			hs.mu.Unlock()
+			_ = s.SaveChunkCrafters(normDim, int32(x>>4), int32(z>>4))
 			s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 			return true
 		}
@@ -1046,21 +1210,26 @@ func (s *Server) HopperInsertIntoCrafter(dim string, x, y, z int, stack world.It
 	// 2. Otherwise, merge into the matching enabled slot with the smallest stack count.
 	bestSlot := -1
 	bestCount := int32(maxStack)
-	if maxStack > 1 && meta.IsEmpty() {
+	if maxStack > 1 {
 		for i := 0; i < CrafterSlotCount; i++ {
 			if cr.Disabled[i] {
 				continue
 			}
 			cur := cr.Slots[i]
-			if cur.ResolvedItemID() == itemID && cr.SlotMeta[i].IsEmpty() && cur.Count < bestCount {
+			if cur.ResolvedItemID() == itemID && dispenserItemMetaEqual(cr.SlotMeta[i], meta) && cur.Count < bestCount {
 				bestCount = cur.Count
 				bestSlot = i
 			}
 		}
 	}
 	if bestSlot >= 0 {
-		cr.Slots[bestSlot] = world.NewItemStack(itemID, cr.Slots[bestSlot].Count+1)
+		next := world.NewItemStack(itemID, cr.Slots[bestSlot].Count+1)
+		if next.IsEmpty() {
+			next = world.NewNamedItemStack(stack.ResolvedID(), cr.Slots[bestSlot].Count+1)
+		}
+		cr.Slots[bestSlot] = next
 		hs.mu.Unlock()
+		_ = s.SaveChunkCrafters(normDim, int32(x>>4), int32(z>>4))
 		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 		return true
 	}
@@ -1078,11 +1247,13 @@ func (s *Server) HopperExtractFromCrafter(dim string, x, y, z int) (world.ItemSt
 	s.BindNoteBlockAndJukeboxRedstone(normDim)
 	hs := s.hopperState()
 	hs.mu.Lock()
+	s.ensureChunkCraftersLoadedLocked(hs, normDim, int32(x>>4), int32(z>>4))
 	cr := hs.crafters[hopperBlockKey{dim: normDim, x: x, y: y, z: z}]
 	if cr == nil {
 		hs.mu.Unlock()
 		return world.ItemStack{}, ItemMeta{}, false
 	}
+	_ = s.unpackCrafterLootTableLocked(cr)
 	for i := 0; i < CrafterSlotCount; i++ {
 		cur := cr.Slots[i]
 		if cur.IsEmpty() || cur.Count <= 0 {
@@ -1096,10 +1267,18 @@ func (s *Server) HopperExtractFromCrafter(dim string, x, y, z int) (world.ItemSt
 		if cur.Count <= 1 {
 			cr.Slots[i] = world.ItemStack{}
 			cr.SlotMeta[i] = ItemMeta{}
+			cr.SlotPotions[i] = ""
+			cr.SlotShulker[i] = nil
+			cr.SlotComponents[i] = nil
 		} else {
-			cr.Slots[i] = world.NewItemStack(cur.ResolvedItemID(), cur.Count-1)
+			next := world.NewItemStack(cur.ResolvedItemID(), cur.Count-1)
+			if next.IsEmpty() {
+				next = world.NewNamedItemStack(cur.ResolvedID(), cur.Count-1)
+			}
+			cr.Slots[i] = next
 		}
 		hs.mu.Unlock()
+		_ = s.SaveChunkCrafters(normDim, int32(x>>4), int32(z>>4))
 		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 		return out, meta, true
 	}
@@ -1410,46 +1589,70 @@ func doubleChestPartnerPos(cache *world.Cache, x, y, z int, state uint16) (px, p
 }
 
 func (s *Server) hopperInsertIntoChestOrBarrel(dim string, cache *world.Cache, x, y, z int, state uint16, single world.ItemStack) bool {
+	return s.hopperInsertIntoChestOrBarrelWithMeta(dim, cache, x, y, z, state, single, ItemMeta{}, "", nil, nil)
+}
+
+func (s *Server) hopperInsertIntoChestOrBarrelWithMeta(
+	dim string,
+	cache *world.Cache,
+	x, y, z int,
+	state uint16,
+	single world.ItemStack,
+	meta ItemMeta,
+	potionType string,
+	shulker *[ChestSlotCount]world.ItemStack,
+	rawComp *nbt.Compound,
+) bool {
 	normDim := normalizeHopperDim(dim)
+	type chestCoord struct{ x, y, z int }
+	var targets []chestCoord
 	if pX, pY, pZ, thisFirst, isDouble := doubleChestPartnerPos(cache, x, y, z, state); isDouble {
-		type chestCoord struct{ x, y, z int }
-		halves := [2]chestCoord{{x, y, z}, {pX, pY, pZ}}
-		if !thisFirst {
-			halves = [2]chestCoord{{pX, pY, pZ}, {x, y, z}}
+		if thisFirst {
+			targets = []chestCoord{{x, y, z}, {pX, pY, pZ}}
+		} else {
+			targets = []chestCoord{{pX, pY, pZ}, {x, y, z}}
 		}
-		maxStack := DispenserItemMaxStackSize(single)
-		itemID := single.ResolvedItemID()
-		if maxStack > 1 {
-			for _, h := range halves {
-				slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
-				for i := 0; i < ChestSlotCount; i++ {
-					cur := slots[i]
-					if !cur.IsEmpty() && cur.ResolvedItemID() == itemID && cur.Count < maxStack {
-						s.SetChestSlotInDim(normDim, h.x, h.y, h.z, i, world.NewItemStack(itemID, cur.Count+1))
-						s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
-						_ = s.syncChestViewers(nil, h.x, h.y, h.z)
-						return true
-					}
-				}
-			}
-		}
-		for _, h := range halves {
-			slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
-			for i := 0; i < ChestSlotCount; i++ {
-				if slots[i].IsEmpty() {
-					s.SetChestSlotInDim(normDim, h.x, h.y, h.z, i, single)
-					s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
-					_ = s.syncChestViewers(nil, h.x, h.y, h.z)
-					return true
-				}
-			}
-		}
-		return false
+	} else {
+		targets = []chestCoord{{x, y, z}}
 	}
 
-	if s.transferIntoChestAtInDim(normDim, x, y, z, single) {
-		s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
-		return true
+	maxStack := DispenserItemMaxStackSize(single)
+	itemID := single.ResolvedItemID()
+	if maxStack > 1 {
+		for _, h := range targets {
+			slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
+			for i := 0; i < ChestSlotCount; i++ {
+				cur := slots[i]
+				if cur.IsEmpty() || cur.ResolvedItemID() != itemID || cur.Count >= maxStack {
+					continue
+				}
+				curMeta, curPot, curComp := s.GetChestSlotMeta(normDim, h.x, h.y, h.z, i)
+				if !dispenserItemMetaEqual(curMeta, meta) || curPot != potionType || (curComp != nil) != (rawComp != nil) {
+					continue
+				}
+				next := world.NewItemStack(itemID, cur.Count+1)
+				if next.IsEmpty() {
+					next = world.NewNamedItemStack(single.ResolvedID(), cur.Count+1)
+				}
+				s.SetChestSlotWithMeta(normDim, h.x, h.y, h.z, i, next, meta, potionType, rawComp)
+				_ = s.SaveChunkStorageContainers(normDim, int32(h.x>>4), int32(h.z>>4))
+				s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
+				_ = s.syncChestViewers(nil, h.x, h.y, h.z)
+				return true
+			}
+		}
+	}
+	for _, h := range targets {
+		slots := s.ChestSlotsInDim(normDim, h.x, h.y, h.z)
+		for i := 0; i < ChestSlotCount; i++ {
+			if slots[i].IsEmpty() {
+				s.setStorageSlotMetaAndComponents(normDim, h.x, h.y, h.z, i, single, meta, ArmorTrim{}, potionType, shulker, rawComp)
+				_ = s.SaveChunkStorageContainers(normDim, int32(h.x>>4), int32(h.z>>4))
+				s.updateHopperComparatorsAndBroadcast(normDim, h.x, h.y, h.z)
+				_ = s.syncChestViewers(nil, h.x, h.y, h.z)
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -1660,7 +1863,7 @@ func (s *Server) TryHopperInsertIntoBlock(
 		return s.HopperInsertIntoHopper(normDim, tx, ty, tz, single, meta, potionType)
 
 	case IsChestBlock(targetState) || world.IsCopperChestBlock(targetState) || targetName == "minecraft:trapped_chest" || targetName == "minecraft:barrel":
-		return s.hopperInsertIntoChestOrBarrel(normDim, cache, tx, ty, tz, targetState, single)
+		return s.hopperInsertIntoChestOrBarrelWithMeta(normDim, cache, tx, ty, tz, targetState, single, meta, potionType, nil, nil)
 
 	case IsFurnaceBlock(targetState):
 		return s.hopperInsertIntoFurnace(normDim, tx, ty, tz, hopperFacing, single)
@@ -1674,11 +1877,7 @@ func (s *Server) TryHopperInsertIntoBlock(
 		if IsShulkerBoxItemOrBlock(single.ResolvedID()) {
 			return false
 		}
-		if s.transferIntoShulkerBoxAt(normDim, tx, ty, tz, single) {
-			s.updateHopperComparatorsAndBroadcast(normDim, tx, ty, tz)
-			return true
-		}
-		return false
+		return s.hopperInsertIntoChestOrBarrelWithMeta(normDim, cache, tx, ty, tz, targetState, single, meta, potionType, nil, nil)
 
 	case targetName == "minecraft:jukebox":
 		if !IsMusicDiscItem(single) {
@@ -1892,11 +2091,13 @@ func (s *Server) TryHopperExtractFromBlockAbove(
 		case srcName == "minecraft:dispenser" || srcName == "minecraft:dropper":
 			ds := s.dispenserState()
 			ds.mu.Lock()
+			s.ensureChunkDispensersLoadedLocked(ds, normDim, int32(sx>>4), int32(sz>>4))
 			be := ds.blocks[dispenserBlockKey{dim: normDim, x: sx, y: sy, z: sz}]
 			if be == nil {
 				ds.mu.Unlock()
 				return world.ItemStack{}, ItemMeta{}, "", true, false
 			}
+			_ = s.unpackDispenserLootTableLocked(be)
 			for i := 0; i < DispenserSlotCount; i++ {
 				cur := be.Slots[i]
 				if cur.IsEmpty() || cur.Count <= 0 {
@@ -1913,6 +2114,7 @@ func (s *Server) TryHopperExtractFromBlockAbove(
 				}
 				decrementDispenserSlotLocked(be, i)
 				ds.mu.Unlock()
+				_ = s.SaveChunkDispensers(normDim, int32(sx>>4), int32(sz>>4))
 				s.updateDispenserComparatorsAndBroadcast(normDim, sx, sy, sz)
 				_ = s.SyncDispenserViewers(nil, sx, sy, sz)
 				return single, m, p, true, true

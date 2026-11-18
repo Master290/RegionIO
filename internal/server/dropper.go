@@ -4,12 +4,12 @@ import (
 	"strconv"
 	"strings"
 
+	"regionio/internal/nbt"
 	"regionio/internal/world"
 )
 
 // SetDropperContainerTransferHook registers an optional callback that Agent B
-// can use to handle dropper-to-container transfers for custom container types
-// (such as hoppers, barrels, chiseled bookshelves, or crafters).
+// can use to handle dropper-to-container transfers for custom container types.
 func (s *Server) SetDropperContainerTransferHook(fn DropperContainerTransferFunc) {
 	if s == nil {
 		return
@@ -21,11 +21,15 @@ func (s *Server) SetDropperContainerTransferHook(fn DropperContainerTransferFunc
 }
 
 // IsDropperTargetContainer reports whether the block state at the front of a
-// dropper is a container (or hopper-like receiver such as a composter or empty
-// jukebox) that intercepts dropper item ejection instead of dropping into air.
+// dropper provides a vanilla Container / WorldlyContainer (matching
+// HopperBlockEntity.getBlockContainer in 26.1.2) that intercepts dropper item
+// ejection instead of dropping into air.
 func IsDropperTargetContainer(state uint16) bool {
 	if state == world.StateAir {
 		return false
+	}
+	if world.IsCopperChestBlock(state) {
+		return true
 	}
 	name := world.BlockName(state)
 	switch name {
@@ -34,24 +38,23 @@ func IsDropperTargetContainer(state uint16) bool {
 		"minecraft:furnace", "minecraft:blast_furnace", "minecraft:smoker",
 		"minecraft:brewing_stand", "minecraft:hopper",
 		"minecraft:chiseled_bookshelf", "minecraft:crafter", "minecraft:decorated_pot",
-		"minecraft:composter":
+		"minecraft:composter", "minecraft:jukebox":
 		return true
-	case "minecraft:jukebox":
-		props := world.BlockProperties(state)
-		return props["has_record"] != "true"
 	}
 	return IsShulkerBoxItemOrBlock(name)
 }
 
 // DispenseFromDropper executes a single activation of the `minecraft:dropper`
 // at (dim, x, y, z) following vanilla 26.1.2 DropperBlock.dispenseFrom:
-//   - Picks a uniformly random non-empty slot (0..8). If empty, emits
-//     LevelEvent 1001 (dispenser fail) and returns false.
-//   - If the block in front (x+dx, y+dy, z+dz) is a container, attempts to
-//     transfer 1 item into that container without playing dispense sound/smoke
-//     (and without dropping the item if the target container is full).
+//   - Unpacks any pending LootTable and picks a uniformly random non-empty slot
+//     (0..8). If empty, emits LevelEvent 1001 (dispenser fail) and returns false.
+//   - If a block Container / WorldlyContainer or vehicle Container entity is at
+//     (x+dx, y+dy, z+dz), attempts to transfer 1 item into that container
+//     respecting WorldlyContainer face rules without playing dispense sound/smoke
+//     (and keeping the item in the dropper if the target container rejects it).
 //   - Otherwise, ejects 1 item as a dropped item entity with vanilla velocity
-//     and Gaussian spread, and emits LevelEvent 1000 + smoke LevelEvent 2000.
+//     and spread, preserving ItemMeta / Potion / ShulkerBoxItemData, and emits
+//     LevelEvent 1000 + smoke LevelEvent 2000.
 func (s *Server) DispenseFromDropper(dim string, x, y, z int) bool {
 	if s == nil {
 		return false
@@ -71,19 +74,28 @@ func (s *Server) DispenseFromDropper(dim string, x, y, z int) bool {
 	ds.mu.Lock()
 	be := s.getOrCreateDispenserLocked(ds, normDim, x, y, z)
 	be.IsDropper = true
+	unpacked := s.unpackDispenserLootTableLocked(be)
 	slot := ChooseRandomDispenserSlot(be.Slots, ds.rng)
 	if slot < 0 {
 		ds.mu.Unlock()
+		if unpacked {
+			_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+		}
+		// Vanilla DropperBlock.dispenseFrom: levelEvent(1001, pos, 0) on empty dropper.
 		s.broadcastDispenserEffects(normDim, x, y, z, facing, LevelEventSoundFailDispense, false)
-		s.EmitGameEvent(normDim, GameEventBlockActivate, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
 		return false
 	}
 	item := be.Slots[slot]
 	meta := be.SlotMeta[slot].Clone()
 	potionType := be.SlotPotions[slot]
+	shulkerData := s.dispenserSlotShulkerDataLocked(be, slot)
+	rawComp := world.CloneNBTCompound(be.SlotComponents[slot])
 	rng := ds.rng
 	customFn := ds.customTransferFn
 	ds.mu.Unlock()
+	if unpacked {
+		_ = s.SaveChunkDispensers(normDim, int32(x>>4), int32(z>>4))
+	}
 
 	single := world.NewItemStack(item.ResolvedItemID(), 1)
 	if single.IsEmpty() {
@@ -94,7 +106,7 @@ func (s *Server) DispenseFromDropper(dim string, x, y, z int) bool {
 	fx, fy, fz := x+dx, y+dy, z+dz
 	frontState := cache.GetBlock(fx, fy, fz)
 
-	// 1. Check if the block in front is a container (or custom hook handles it).
+	// 1. Check custom hook first if registered.
 	if customFn != nil {
 		if customFn(normDim, fx, fy, fz, facing, single, meta, potionType) {
 			s.consumeDropperSlotOne(normDim, x, y, z, slot)
@@ -103,8 +115,16 @@ func (s *Server) DispenseFromDropper(dim string, x, y, z int) bool {
 		}
 	}
 
-	if IsDropperTargetContainer(frontState) {
-		transferred := s.tryDropperTransferIntoContainer(normDim, cache, fx, fy, fz, facing, frontState, single, meta, potionType)
+	// 2. Check block Container / WorldlyContainer OR entity Container at (fx, fy, fz).
+	hasBlockContainer := fy >= world.MinY && fy < world.MinY+world.WorldHeight && IsDropperTargetContainer(frontState)
+	vehicleContainers := s.findVehicleContainersInBlock(normDim, fx, fy, fz)
+	if hasBlockContainer || len(vehicleContainers) > 0 {
+		var transferred bool
+		if hasBlockContainer {
+			transferred = s.tryDropperTransferIntoContainer(normDim, cache, fx, fy, fz, facing, frontState, single, meta, potionType, shulkerData, rawComp)
+		} else {
+			transferred = s.tryInsertIntoVehicleContainerAt(normDim, fx, fy, fz, single)
+		}
 		if transferred {
 			s.consumeDropperSlotOne(normDim, x, y, z, slot)
 			s.updateDispenserComparatorsAndBroadcast(normDim, fx, fy, fz)
@@ -114,8 +134,8 @@ func (s *Server) DispenseFromDropper(dim string, x, y, z int) bool {
 		return transferred
 	}
 
-	// 2. No container in front -> eject 1 item into the world as a dropped item entity.
-	s.spawnDispensedItemEntity(normDim, x, y, z, facing, single, rng)
+	// 3. No container in front -> eject 1 item into the world as a dropped item entity.
+	s.spawnDispensedItemEntityFull(normDim, x, y, z, facing, single, meta, potionType, shulkerData, rng)
 	s.consumeDropperSlotOne(normDim, x, y, z, slot)
 	s.broadcastDispenserEffects(normDim, x, y, z, facing, LevelEventSoundDispense, true)
 	s.EmitGameEvent(normDim, GameEventBlockActivate, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{})
@@ -128,6 +148,7 @@ func (s *Server) consumeDropperSlotOne(dim string, x, y, z, slot int) {
 	be := s.getOrCreateDispenserLocked(ds, dim, x, y, z)
 	decrementDispenserSlotLocked(be, slot)
 	ds.mu.Unlock()
+	_ = s.SaveChunkDispensers(dim, int32(x>>4), int32(z>>4))
 	s.updateDispenserComparatorsAndBroadcast(dim, x, y, z)
 	_ = s.SyncDispenserViewers(nil, x, y, z)
 }
@@ -141,24 +162,32 @@ func (s *Server) tryDropperTransferIntoContainer(
 	single world.ItemStack,
 	meta ItemMeta,
 	potionType string,
+	shulkerData *ShulkerBoxItemData,
+	rawComp *nbt.Compound,
 ) bool {
 	frontName := world.BlockName(frontState)
+	var shulkerArr *[ChestSlotCount]world.ItemStack
+	if shulkerData != nil && shulkerData.HasAnyItems() {
+		cp := shulkerData.Slots
+		shulkerArr = &cp
+	}
+
 	switch {
 	case frontName == "minecraft:dispenser" || frontName == "minecraft:dropper":
-		return s.HopperInsertIntoDispenser(dim, fx, fy, fz, single, meta, potionType)
+		return s.hopperInsertIntoDispenserFull(dim, fx, fy, fz, single, meta, potionType, shulkerData, rawComp)
 
-	case IsChestBlock(frontState) || frontName == "minecraft:trapped_chest" || frontName == "minecraft:barrel":
-		return s.transferIntoChestAtInDim(dim, fx, fy, fz, single)
+	case IsChestBlock(frontState) || world.IsCopperChestBlock(frontState) || frontName == "minecraft:trapped_chest" || frontName == "minecraft:barrel":
+		return s.hopperInsertIntoChestOrBarrelWithMeta(dim, cache, fx, fy, fz, frontState, single, meta, potionType, shulkerArr, rawComp)
 
 	case IsShulkerBoxItemOrBlock(frontName):
 		// Vanilla ShulkerBoxBlockEntity.canPlaceItemThroughFace: shulker boxes cannot be nested inside shulker boxes!
 		if IsShulkerBoxItemOrBlock(single.ResolvedID()) {
 			return false
 		}
-		return s.transferIntoShulkerBoxAt(dim, fx, fy, fz, single)
+		return s.hopperInsertIntoChestOrBarrelWithMeta(dim, cache, fx, fy, fz, frontState, single, meta, potionType, nil, rawComp)
 
 	case IsFurnaceBlock(frontState):
-		return s.transferIntoFurnaceAt(fx, fy, fz, dropperFacing, single)
+		return s.hopperInsertIntoFurnace(dim, fx, fy, fz, dropperFacing, single)
 
 	case frontName == "minecraft:brewing_stand":
 		entryFace := oppositeDropperDirection(dropperFacing)
@@ -166,13 +195,14 @@ func (s *Server) tryDropperTransferIntoContainer(
 		return inserted
 
 	case frontName == "minecraft:composter":
-		return s.transferIntoComposterAt(dim, cache, fx, fy, fz, frontState, single)
+		entryFace := oppositeDropperDirection(dropperFacing)
+		return s.HopperInsertIntoComposter(dim, fx, fy, fz, entryFace, single)
 
 	case frontName == "minecraft:jukebox":
 		if !IsMusicDiscItem(single) {
 			return false
 		}
-		inserted, _ := s.InsertJukeboxDisc(dim, fx, fy, fz, single)
+		inserted, _, _ := s.HopperTryInsertIntoJukebox(dim, fx, fy, fz, single)
 		return inserted
 
 	case frontName == "minecraft:hopper":
@@ -183,6 +213,9 @@ func (s *Server) tryDropperTransferIntoContainer(
 
 	case frontName == "minecraft:crafter":
 		return s.HopperInsertIntoCrafter(dim, fx, fy, fz, single, meta)
+
+	case frontName == "minecraft:decorated_pot":
+		return s.HopperInsertIntoDecoratedPot(dim, fx, fy, fz, single, meta)
 
 	default:
 		return false
@@ -197,130 +230,34 @@ func (s *Server) transferIntoChestAtInDim(dim string, x, y, z int, single world.
 	if s == nil || single.IsEmpty() {
 		return false
 	}
-	slots := s.ChestSlotsInDim(dim, x, y, z)
-	maxStack := DispenserItemMaxStackSize(single)
-	itemID := single.ResolvedItemID()
-
-	if maxStack > 1 {
-		for i := 0; i < ChestSlotCount; i++ {
-			cur := slots[i]
-			if !cur.IsEmpty() && cur.ResolvedItemID() == itemID && cur.Count < maxStack {
-				s.SetChestSlotInDim(dim, x, y, z, i, world.NewItemStack(itemID, cur.Count+1))
-				_ = s.syncChestViewers(nil, x, y, z)
-				return true
-			}
-		}
+	cache := s.DimensionChunks(dim)
+	var state uint16
+	if cache != nil {
+		state = cache.GetBlock(x, y, z)
 	}
-	for i := 0; i < ChestSlotCount; i++ {
-		if slots[i].IsEmpty() {
-			s.SetChestSlotInDim(dim, x, y, z, i, single)
-			_ = s.syncChestViewers(nil, x, y, z)
-			return true
-		}
-	}
-	return false
+	return s.hopperInsertIntoChestOrBarrelWithMeta(dim, cache, x, y, z, state, single, ItemMeta{}, "", nil, nil)
 }
 
 func (s *Server) transferIntoShulkerBoxAt(dim string, x, y, z int, single world.ItemStack) bool {
-	if s == nil || single.IsEmpty() {
+	if s == nil || single.IsEmpty() || IsShulkerBoxItemOrBlock(single.ResolvedID()) {
 		return false
 	}
-	slots := s.ShulkerBoxSlots(dim, x, y, z)
-	maxStack := DispenserItemMaxStackSize(single)
-	itemID := single.ResolvedItemID()
-
-	if maxStack > 1 {
-		for i := 0; i < ChestSlotCount; i++ {
-			cur := slots[i]
-			if !cur.IsEmpty() && cur.ResolvedItemID() == itemID && cur.Count < maxStack {
-				slots[i] = world.NewItemStack(itemID, cur.Count+1)
-				s.SetShulkerBoxSlots(dim, x, y, z, slots)
-				if dim == world.DimensionOverworld {
-					s.SetChestSlot(x, y, z, i, slots[i])
-				}
-				return true
-			}
-		}
+	cache := s.DimensionChunks(dim)
+	var state uint16
+	if cache != nil {
+		state = cache.GetBlock(x, y, z)
 	}
-	for i := 0; i < ChestSlotCount; i++ {
-		if slots[i].IsEmpty() {
-			slots[i] = single
-			s.SetShulkerBoxSlots(dim, x, y, z, slots)
-			if dim == world.DimensionOverworld {
-				s.SetChestSlot(x, y, z, i, single)
-			}
-			return true
-		}
-	}
-	return false
+	return s.hopperInsertIntoChestOrBarrelWithMeta(dim, cache, x, y, z, state, single, ItemMeta{}, "", nil, nil)
 }
 
 // transferIntoFurnaceAt inserts 1 item into a furnace, blast_furnace, or smoker
-// following vanilla WorldlyContainer side rules:
-//   - Dropper facing "down" (entering top face of furnace) -> Slot 0 (input)
-//   - Dropper facing horizontal or "up" (entering side or bottom of furnace) ->
-//     Slot 1 (fuel), only if the item is valid furnace fuel or an empty bucket.
+// following vanilla WorldlyContainer side rules.
 func (s *Server) transferIntoFurnaceAt(x, y, z int, dropperFacing string, single world.ItemStack) bool {
-	if s == nil || single.IsEmpty() {
-		return false
-	}
-	slots := s.FurnaceSlots(x, y, z)
-	targetSlot := world.FurnaceSlotFuel
-	if strings.EqualFold(dropperFacing, "down") {
-		targetSlot = world.FurnaceSlotInput
-	} else {
-		if !CanPlaceInFurnaceFuelSlot(single) {
-			return false
-		}
-	}
-	cur := slots[targetSlot]
-	maxStack := DispenserItemMaxStackSize(single)
-	if cur.IsEmpty() {
-		return s.SetFurnaceSlot(x, y, z, targetSlot, single)
-	}
-	if cur.ResolvedItemID() == single.ResolvedItemID() && cur.Count < maxStack {
-		return s.SetFurnaceSlot(x, y, z, targetSlot, world.NewItemStack(cur.ResolvedItemID(), cur.Count+1))
-	}
-	return false
+	return s.hopperInsertIntoFurnace(world.DimensionOverworld, x, y, z, dropperFacing, single)
 }
 
-func (s *Server) transferIntoComposterAt(dim string, cache *world.Cache, x, y, z int, state uint16, single world.ItemStack) bool {
-	if cache == nil || single.IsEmpty() {
-		return false
-	}
-	chance := compostChanceForItem(single.ResolvedID())
-	if chance <= 0 {
-		return false
-	}
-	props := world.BlockProperties(state)
-	lvl, _ := strconv.Atoi(props["level"])
-	if lvl >= 7 {
-		return false
-	}
-	ds := s.dispenserState()
-	ds.mu.Lock()
-	roll := ds.rng.Float64()
-	ds.mu.Unlock()
-
-	nextLvl := lvl
-	if lvl == 0 || roll < float64(chance) {
-		nextLvl = lvl + 1
-	}
-	if nextLvl > lvl {
-		nextStr := strconv.Itoa(nextLvl)
-		if nextSt, ok := world.WithBlockProperty(state, "level", nextStr); ok {
-			s.setDispenserWorldBlock(dim, cache, x, y, z, nextSt)
-		}
-	}
-	return true
-}
-
-func compostChanceForItem(itemID string) float32 {
-	return world.CompostChanceForItem(itemID)
-}
-
-func oppositeDropperDirection(facing string) string {
-	switch strings.ToLower(facing) {
+func oppositeDropperDirection(dir string) string {
+	switch strings.ToLower(dir) {
 	case "down":
 		return "up"
 	case "up":
@@ -334,6 +271,12 @@ func oppositeDropperDirection(facing string) string {
 	case "east":
 		return "west"
 	default:
-		return "south"
+		return "up"
 	}
 }
+
+func compostChanceForItem(itemID string) float32 {
+	return world.CompostChanceForItem(itemID)
+}
+
+var _ = strconv.Itoa

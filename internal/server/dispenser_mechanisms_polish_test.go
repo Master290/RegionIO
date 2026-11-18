@@ -44,27 +44,44 @@ func TestDispenserSpawnEggArmorStandTridentAndShearsMooshroomCopperGolem(t *test
 		t.Fatalf("armor_stand yaw when dispensed south = %v, want 180 (facing north)", standsInFront[0].Yaw)
 	}
 
-	// 3. Trident (`minecraft:trident`) projectile dispense.
+	// 3. Trident (`minecraft:trident`) is NOT in DispenserBlock.DISPENSER_REGISTRY in
+	//    vanilla 26.1.2.jar, so it falls back to DefaultDispenseItemBehavior (ejecting
+	//    1 trident ItemEntity), whereas `minecraft:blue_egg` / `minecraft:brown_egg`
+	//    ARE registered via registerProjectileBehavior!
 	placeDispenserOrDropperForTest(t, srv, dim, 30, 70, 10, "minecraft:dispenser", "east")
 	srv.SetDispenserSlot(30, 70, 10, 0, world.NewNamedItemStack("minecraft:trident", 1))
 	if !srv.DispenseFromDispenser(dim, 30, 70, 10) {
-		t.Fatal("expected dispenser with trident to succeed")
+		t.Fatal("expected dispenser with trident to succeed via DefaultDispenseItemBehavior")
 	}
 	if !srv.DispenserSlots(30, 70, 10)[0].IsEmpty() {
 		t.Fatal("expected trident slot to be empty after dispense")
 	}
+	foundTridentDrop := false
+	for _, ent := range srv.entities.AppendInChunkRange(nil, int32(31>>4), int32(10>>4), 1) {
+		if ent.IsItem() && ent.Item.ResolvedID() == "minecraft:trident" {
+			foundTridentDrop = true
+			break
+		}
+	}
+	if !foundTridentDrop {
+		t.Fatal("expected dispensed minecraft:trident to be ejected as an ItemEntity (vanilla 26.1.2)")
+	}
+	srv.SetDispenserSlot(30, 70, 10, 0, world.NewNamedItemStack("minecraft:blue_egg", 1))
+	if !srv.DispenseFromDispenser(dim, 30, 70, 10) {
+		t.Fatal("expected dispenser with blue_egg projectile to succeed")
+	}
 	ds := srv.dispenserState()
 	ds.mu.Lock()
-	foundTrident := false
+	foundEggProj := false
 	for _, p := range ds.projectiles {
-		if p != nil && p.TypeName == EntityTypeTrident && p.BaseDamage == 8.0 {
-			foundTrident = true
+		if p != nil && p.TypeName == "minecraft:egg" {
+			foundEggProj = true
 			break
 		}
 	}
 	ds.mu.Unlock()
-	if !foundTrident {
-		t.Fatal("expected active minecraft:trident projectile with BaseDamage=8.0")
+	if !foundEggProj {
+		t.Fatal("expected active minecraft:egg projectile launched from blue_egg")
 	}
 
 	// 4. Shears (`minecraft:shears`) on `minecraft:mooshroom` -> converts to `minecraft:cow` and drops 5 `red_mushroom`.

@@ -470,6 +470,12 @@ func (c *Cache) UnloadChunk(cx, cz int32) error {
 
 	if ch != nil && c.store != nil && (isDirty || isUnsaved) {
 		snapshot, _ := ch.snapshot()
+		if _, hasSched := cacheSchedulers.Load(c); hasSched {
+			snapshot.persistedTicks = c.ExportChunkScheduledBlockTicks(cx, cz)
+			snapshot.persistedFallingBlocks = c.ExportChunkFallingBlocks(cx, cz)
+		}
+		c.syncChunkPistonBlockEntitiesToSnapshot(cx, cz, snapshot)
+		c.syncChunkSculkToSnapshot(cx, cz, snapshot)
 		if err := c.store.saveSnapshot(snapshot); err != nil {
 			return err
 		}
@@ -532,6 +538,12 @@ func (c *Cache) SaveChunkBlockEntities(cx, cz int32, matchID func(string) bool, 
 		return nil
 	}
 	snapshot, savedRevision := ch.snapshot()
+	if _, hasSched := cacheSchedulers.Load(c); hasSched {
+		snapshot.persistedTicks = c.ExportChunkScheduledBlockTicks(cx, cz)
+		snapshot.persistedFallingBlocks = c.ExportChunkFallingBlocks(cx, cz)
+	}
+	c.syncChunkPistonBlockEntitiesToSnapshot(cx, cz, snapshot)
+	c.syncChunkSculkToSnapshot(cx, cz, snapshot)
 	if err := c.store.SaveChunkBlockEntities(cx, cz, snapshot, matchID, list); err != nil {
 		return err
 	}

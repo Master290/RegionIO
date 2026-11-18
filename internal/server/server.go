@@ -430,6 +430,8 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadFurnaces()
 		_ = s.LoadBrewingStands()
 		_ = s.LoadHoppers()
+		_ = s.LoadDispensers()
+		_ = s.LoadCrafters()
 		_ = s.LoadCampfires()
 		_ = s.LoadShowcaseBlockEntitiesFromStore()
 	}
