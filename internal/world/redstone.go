@@ -758,8 +758,8 @@ func (c *Cache) emittedSignalFromSource(sx, sy, sz, tx, ty, tz int, directOnly, 
 		if p <= 0 {
 			return 0
 		}
-		// Calibrated sculk sensor does not emit redstone power out of its calibration input side (facing).
-		inDX, inDZ := RepeaterInputOffset(props["facing"])
+		// Calibrated sculk sensor does not emit redstone power out of its amethyst calibration input side (facing.getOpposite()).
+		inDX, inDZ := RepeaterOutputOffset(props["facing"])
 		if tx == sx+inDX && ty == sy && tz == sz+inDZ {
 			return 0
 		}
@@ -1300,6 +1300,8 @@ func (c *Cache) analogSignalAt(x, y, z int) int {
 		case 4:
 			blockSig = MaxRedstonePower
 		}
+	case "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
+		blockSig = c.SculkSensorComparatorSignalAt(x, y, z)
 	default:
 		if IsCommandBlockName(info.Name) {
 			blockSig = c.CommandBlockComparatorSignalAt(x, y, z)
@@ -3116,9 +3118,12 @@ func BlockStateIDByProperties(name string, props map[string]string) (uint16, boo
 }
 
 // CalibratedSculkSensorInputPower returns the calibration redstone signal (0..15)
-// entering the amethyst input side (`facing`) of a `minecraft:calibrated_sculk_sensor`
-// at (x, y, z). When the returned value is 0, the calibrated sculk sensor accepts
-// all vibration frequencies (1..15); when it is 1..15, only vibrations of that
+// entering the amethyst input side (`facing.getOpposite()`) of a
+// `minecraft:calibrated_sculk_sensor` at (x, y, z), matching
+// `CalibratedSculkSensorBlockEntity$VibrationUser.getBackSignal` in 26.1.2.jar
+// (`level.getSignal(pos.relative(facing.getOpposite()), facing.getOpposite())`).
+// When the returned value is 0, the calibrated sculk sensor accepts all
+// vibration frequencies (1..15); when it is 1..15, only vibrations of that
 // exact frequency are accepted.
 func (c *Cache) CalibratedSculkSensorInputPower(x, y, z int) int {
 	if c == nil || y < MinY || y >= MinY+WorldHeight {
@@ -3133,12 +3138,12 @@ func (c *Cache) CalibratedSculkSensorInputPower(x, y, z int) int {
 	if facing == "" {
 		facing = "north"
 	}
-	sig := c.repeaterInputSignal(x, y, z, facing)
-	inDX, inDZ := RepeaterInputOffset(facing)
+	inDX, inDZ := RepeaterOutputOffset(facing)
 	ix, iy, iz := x+inDX, y, z+inDZ
-	if analog := c.analogSignalAt(ix, iy, iz); analog > sig {
-		sig = analog
+	if iy < MinY || iy >= MinY+WorldHeight {
+		return 0
 	}
+	sig := c.signalFromNeighborExcluding(ix, iy, iz, x, y, z, BlockPos{X: x, Y: y, Z: z}, true)
 	return clampPower(sig)
 }
 

@@ -20,9 +20,10 @@ func TestVibrationFrequenciesAndDistanceFormulas(t *testing.T) {
 		{GameEventProjectileShoot, 3},
 		{GameEventInstrumentPlay, 3},
 		{GameEventElytraGlide, 4},
-		{GameEventShear, 4},
+		{GameEventUnequip, 4},
 		{GameEventEntityDismount, 5},
 		{GameEventEquip, 5},
+		{GameEventShear, 6},
 		{GameEventEntityMount, 6},
 		{GameEventEntityInteract, 6},
 		{GameEventEntityDamage, 7},
@@ -36,15 +37,16 @@ func TestVibrationFrequenciesAndDistanceFormulas(t *testing.T) {
 		{GameEventBlockActivate, 10},
 		{GameEventNoteBlockPlay, 10},
 		{GameEventBlockChange, 11},
-		{GameEventFluidPickup, 11},
 		{GameEventBlockDestroy, 12},
-		{GameEventFluidPlace, 12},
+		{GameEventFluidPickup, 12},
 		{GameEventBlockPlace, 13},
+		{GameEventFluidPlace, 13},
 		{GameEventEntityPlace, 14},
 		{GameEventLightningStrike, 14},
+		{GameEventTeleport, 14},
 		{GameEventEntityDie, 15},
 		{GameEventExplode, 15},
-		{GameEventShriek, 15},
+		{GameEventShriek, 0},
 	}
 	for _, tc := range cases {
 		if got := VibrationFrequency(tc.event); got != tc.want {
@@ -159,7 +161,8 @@ func TestSculkSensorLifecycleRedstoneComparatorAndWaterlogged(t *testing.T) {
 		t.Fatalf("after 30 active ticks: phase=%s power=%d, want cooldown/0", phase, power)
 	}
 
-	// Advance 10 cooldown ticks -> transitions to "inactive" (power=0), while comparator frequency stays 13!
+	// Advance 10 cooldown ticks -> transitions to "inactive" (power=0):
+	// comparator output drops to 0 outside ACTIVE, while last_vibration_frequency stays 13!
 	for i := 0; i < SculkSensorCooldownTicks; i++ {
 		srv.TickAllSculk()
 	}
@@ -167,7 +170,10 @@ func TestSculkSensorLifecycleRedstoneComparatorAndWaterlogged(t *testing.T) {
 	if phase != SculkSensorPhaseInactive || power != 0 {
 		t.Fatalf("after 10 cooldown ticks: phase=%s power=%d, want inactive/0", phase, power)
 	}
-	if freq := srv.SculkSensorComparatorSignalAt(dim, sx, sy, sz); freq != 13 {
+	if compSig := srv.SculkSensorComparatorSignalAt(dim, sx, sy, sz); compSig != 0 {
+		t.Fatalf("expected comparator signal=0 in inactive phase, got %d", compSig)
+	}
+	if freq := srv.SculkSensorLastFrequency(dim, sx, sy, sz); freq != 13 {
 		t.Fatalf("expected last_vibration_frequency=13 to persist in inactive phase, got %d", freq)
 	}
 
@@ -191,8 +197,8 @@ func TestCalibratedSculkSensorRadiusCycleAndInputFilter(t *testing.T) {
 	cache := srv.BindNoteBlockAndJukeboxRedstone(dim)
 
 	cx, cy, cz := 30, 65, 30
-	// Place a calibrated_sculk_sensor facing north (calibration input is at (cx, cy, cz-1)).
-	cache.SetBlock(cx, cy, cz, CalibratedSculkSensorBlockState("north", SculkSensorPhaseInactive, 0, false))
+	// Place a calibrated_sculk_sensor facing south (calibration input side is facing.getOpposite() = north at (cx, cy, cz-1)).
+	cache.SetBlock(cx, cy, cz, CalibratedSculkSensorBlockState("south", SculkSensorPhaseInactive, 0, false))
 
 	// 1. Verify 16-block listening radius: event at distance 12 blocks (30.5, 65.5, 42.5) is detected!
 	if n := srv.EmitGameEvent(dim, GameEventDrink, 30.5, 65.5, 42.5, VibrationSource{}); n != 1 {
@@ -367,9 +373,11 @@ func TestSculkShriekerWarningLevelsDarknessDecayAndWardenHook(t *testing.T) {
 		return true
 	})
 
-	// 1. Emit a player vibration near the sculk_sensor -> activates sensor -> relays to sculk_shrieker!
+	// 1. Emit a player vibration near the sculk_sensor -> activates sensor (1 tick) -> tendrils_clicking travels 3 blocks (3 ticks) -> sculk_shrieker!
 	srv.EmitGameEvent(dim, GameEventStep, 90.5, 65.0, 91.5, VibrationSource{Player: sess})
-	srv.TickAllSculk()
+	for i := 0; i < 4; i++ {
+		srv.TickAllSculk()
+	}
 
 	_, shrieking, _, ok := ParseSculkShriekerState(cache.GetBlock(93, 65, 90))
 	if !ok || !shrieking {
@@ -378,13 +386,16 @@ func TestSculkShriekerWarningLevelsDarknessDecayAndWardenHook(t *testing.T) {
 	if lvl := sess.PlayerWarningLevel(); lvl != 1 {
 		t.Fatalf("PlayerWarningLevel after 1st shriek = %d, want 1", lvl)
 	}
+	for i := 0; i < SculkShriekerDurationTicks; i++ {
+		srv.TickAllSculk()
+	}
 	if !sess.HasPlayerEffect(EffectDarkness) {
-		t.Fatal("expected survival player within 40 blocks to receive minecraft:darkness")
+		t.Fatal("expected survival player within 40 blocks to receive minecraft:darkness after 90-tick shriek")
 	}
 
-	// 2. Step through cooldown (200 ticks) and trigger 3 more times to reach warning level 4 -> summons Warden!
+	// 2. Step through remaining cooldown and trigger 3 more times to reach warning level 4 -> summons Warden on 90th shriek tick!
 	for step := 2; step <= 4; step++ {
-		for i := 0; i < WardenWarningCooldownTicks+10; i++ {
+		for i := 0; i < WardenWarningCooldownTicks; i++ {
 			srv.TickAllSculk()
 		}
 		if !srv.StepOnSculkShrieker(sess, 93, 65, 90) {
@@ -393,6 +404,9 @@ func TestSculkShriekerWarningLevelsDarknessDecayAndWardenHook(t *testing.T) {
 		if lvl := sess.PlayerWarningLevel(); lvl != step {
 			t.Fatalf("PlayerWarningLevel on step %d = %d, want %d", step, lvl, step)
 		}
+	}
+	for i := 0; i < SculkShriekerDurationTicks; i++ {
+		srv.TickAllSculk()
 	}
 	if !wardenSummoned || summonedBy != sess {
 		t.Fatalf("expected WardenSummonHook to fire at warning level 4 (wardenSummoned=%v, summonedBy=%v)", wardenSummoned, summonedBy)
@@ -427,35 +441,56 @@ func TestSculkCatalystBloomSpreadVeinsActivatorsAndAdvancement(t *testing.T) {
 		t.Fatalf("RegisterPlayer: %v", err)
 	}
 
-	// Build a 7x7 stone platform at y=64 with a sculk_catalyst at (110, 64, 110).
-	cx, cy, cz := 110, 64, 110
+	// Build an isolated 11x11 stone platform at y=80 (so dx=4..5 is outside SculkSpreaderNoGrowthRadius=4
+	// while still within SculkCatalystListenRadius=8 of catalyst at (110, 80, 110)).
+	cx, cy, cz := 110, 80, 110
 	stone := mustBlockState(t, "minecraft:stone")
-	for dx := -3; dx <= 3; dx++ {
-		for dz := -3; dz <= 3; dz++ {
+	for dx := -5; dx <= 5; dx++ {
+		for dz := -5; dz <= 5; dz++ {
 			cache.SetBlock(cx+dx, cy, cz+dz, stone)
 			cache.SetBlock(cx+dx, cy+1, cz+dz, world.StateAir)
 		}
 	}
 	cache.SetBlock(cx, cy, cz, SculkCatalystBlockState(false))
 
-	// Kill a mob with 15 XP at (111.5, 65.0, 110.5) within 8 blocks of the catalyst.
-	absorbed := srv.TriggerSculkCatalystOnMobDeath(dim, 111.5, 65.0, 110.5, 15, sess)
+	// Kill a mob with 75 XP at (cx+4.5, 81.0, cz+0.5) (distance ~4.5, within 8 blocks of the catalyst).
+	absorbed := srv.TriggerSculkCatalystOnMobDeath(dim, float64(cx+4)+0.5, float64(cy+1), float64(cz)+0.5, 75, sess)
 	if !absorbed {
 		t.Fatal("expected sculk_catalyst to absorb mob death XP")
 	}
 
-	// Verify catalyst entered bloom=true.
+	// Verify catalyst entered bloom=true and granted "It Spreads" advancement!
 	bloom, ok := ParseSculkCatalystState(cache.GetBlock(cx, cy, cz))
 	if !ok || !bloom {
 		t.Fatal("expected sculk_catalyst to have bloom=true immediately after absorbing XP")
 	}
+	if !sess.HasCompletedAdvancement("minecraft:adventure/kill_mob_near_sculk_catalyst") {
+		t.Fatal("expected killer to receive minecraft:adventure/kill_mob_near_sculk_catalyst (It Spreads)")
+	}
 
-	// Verify stone blocks around the death site converted to minecraft:sculk and sculk_vein appeared.
+	// Tick 8 times -> catalyst returns to bloom=false while cursor spreads sculk & sculk_vein.
+	for i := 0; i < SculkCatalystBloomTicks; i++ {
+		srv.TickAllSculk()
+	}
+	bloom, _ = ParseSculkCatalystState(cache.GetBlock(cx, cy, cz))
+	if bloom {
+		t.Fatal("expected sculk_catalyst bloom to reset to false after 8 ticks")
+	}
+	for i := 0; i < 145; i++ {
+		srv.TickAllSculk()
+	}
+	// Additional high-XP death on the converted +x sculk patch at distance >= 4 spawns sensors/shriekers via SculkBlock.attemptUseCharge!
+	srv.TriggerSculkCatalystOnMobDeath(dim, float64(cx+4)+0.5, float64(cy+1), float64(cz)+0.5, 60, sess)
+	for i := 0; i < 90; i++ {
+		srv.TickAllSculk()
+	}
+
+	// Verify stone blocks around the death site converted to minecraft:sculk, sculk_vein appeared, and an activator grew.
 	sculkCount := 0
 	veinCount := 0
 	activatorCount := 0
-	for dx := -3; dx <= 3; dx++ {
-		for dz := -3; dz <= 3; dz++ {
+	for dx := -5; dx <= 5; dx++ {
+		for dz := -5; dz <= 5; dz++ {
 			stFloor := cache.GetBlock(cx+dx, cy, cz+dz)
 			if stFloor == SculkBlockState() {
 				sculkCount++
@@ -476,21 +511,7 @@ func TestSculkCatalystBloomSpreadVeinsActivatorsAndAdvancement(t *testing.T) {
 		t.Fatalf("expected >= 1 minecraft:sculk_vein placed on border, got %d", veinCount)
 	}
 	if activatorCount < 1 {
-		t.Fatalf("expected >= 1 sculk_sensor/shrieker grown for XP charge 15, got %d", activatorCount)
-	}
-
-	// Verify "It Spreads" advancement (minecraft:adventure/kill_mob_near_sculk_catalyst) was granted!
-	if !sess.HasCompletedAdvancement("minecraft:adventure/kill_mob_near_sculk_catalyst") {
-		t.Fatal("expected killer to receive minecraft:adventure/kill_mob_near_sculk_catalyst (It Spreads)")
-	}
-
-	// Tick 8 times -> catalyst returns to bloom=false.
-	for i := 0; i < SculkCatalystBloomTicks; i++ {
-		srv.TickAllSculk()
-	}
-	bloom, _ = ParseSculkCatalystState(cache.GetBlock(cx, cy, cz))
-	if bloom {
-		t.Fatal("expected sculk_catalyst bloom to reset to false after 8 ticks")
+		t.Fatalf("expected >= 1 sculk_sensor/shrieker grown for XP charge, got %d", activatorCount)
 	}
 }
 
@@ -520,8 +541,11 @@ func TestSculkDiskPersistence(t *testing.T) {
 	if err := srv2.LoadSculk(); err != nil {
 		t.Fatalf("LoadSculk: %v", err)
 	}
-	if got := srv2.SculkSensorComparatorSignalAt(dim, sx, sy, sz); got != 11 {
-		t.Fatalf("reloaded SculkSensorComparatorSignalAt = %d, want 11", got)
+	if got := srv2.SculkSensorLastFrequency(dim, sx, sy, sz); got != 11 {
+		t.Fatalf("reloaded SculkSensorLastFrequency = %d, want 11", got)
+	}
+	if compSig := srv2.SculkSensorComparatorSignalAt(dim, sx, sy, sz); compSig != 0 {
+		t.Fatalf("reloaded inactive SculkSensorComparatorSignalAt = %d, want 0", compSig)
 	}
 }
 
@@ -564,28 +588,38 @@ func TestStepOnSculkSensorShriekerSneakAndUnderwaterCatalystSpread(t *testing.T)
 	if freq := srv.SculkSensorComparatorSignalAt(dim, sx, sy, sz); freq != 1 {
 		t.Fatalf("after StepOnSculkSensor: comparator freq=%d, want 1", freq)
 	}
+	for i := 0; i < 3; i++ {
+		srv.TickAllSculk()
+	}
 	_, shrieking, _, _ := ParseSculkShriekerState(cache.GetBlock(sx+3, sy, sz))
 	if !shrieking {
-		t.Fatal("expected StepOnSculkSensor to relay to nearby sculk_shrieker")
+		t.Fatal("expected StepOnSculkSensor to relay to nearby sculk_shrieker after 3 travel ticks")
 	}
 
 	// 3. Underwater sculk_catalyst mob death produces waterlogged sculk_vein and waterlogged activator.
-	cx, cy, cz := 160, 64, 160
+	cx, cy, cz := 160, 80, 160
 	stone := mustBlockState(t, "minecraft:stone")
-	for dx := -3; dx <= 3; dx++ {
-		for dz := -3; dz <= 3; dz++ {
+	for dx := -5; dx <= 5; dx++ {
+		for dz := -5; dz <= 5; dz++ {
 			cache.SetBlock(cx+dx, cy, cz+dz, stone)
 			cache.SetBlock(cx+dx, cy+1, cz+dz, world.StateWater)
 		}
 	}
 	cache.SetBlock(cx, cy, cz, SculkCatalystBlockState(false))
-	if !srv.TriggerSculkCatalystOnMobDeath(dim, float64(cx+1)+0.5, float64(cy+1), float64(cz)+0.5, 15, sess) {
+	if !srv.TriggerSculkCatalystOnMobDeath(dim, float64(cx+4)+0.5, float64(cy+1), float64(cz)+0.5, 35, sess) {
 		t.Fatal("expected underwater sculk_catalyst to absorb mob death XP")
+	}
+	for i := 0; i < 75; i++ {
+		srv.TickAllSculk()
+	}
+	srv.TriggerSculkCatalystOnMobDeath(dim, float64(cx+4)+0.5, float64(cy+1), float64(cz)+0.5, 50, sess)
+	for i := 0; i < 60; i++ {
+		srv.TickAllSculk()
 	}
 	wlVein := 0
 	wlAct := 0
-	for dx := -3; dx <= 3; dx++ {
-		for dz := -3; dz <= 3; dz++ {
+	for dx := -5; dx <= 5; dx++ {
+		for dz := -5; dz <= 5; dz++ {
 			st := cache.GetBlock(cx+dx, cy+1, cz+dz)
 			if world.IsSculkVeinBlock(st) && world.IsWaterlogged(st) {
 				wlVein++

@@ -421,8 +421,9 @@ func (c *Cache) chunkAtErr(cx, cz int32) (*Chunk, error) {
 	close(pending.done)
 	c.mu.Unlock()
 	if fromStore && loadErr == nil && ch != nil {
-		if len(ch.persistedTicks) > 0 {
-			c.ImportChunkScheduledBlockTicks(cx, cz, ch.persistedTicks)
+		remTicks := c.importChunkSculkFromChunk(ch)
+		if len(remTicks) > 0 {
+			c.ImportChunkScheduledBlockTicks(cx, cz, remTicks)
 		}
 		c.importChunkPistonBlockEntitiesFromChunk(ch)
 	}
@@ -475,8 +476,9 @@ func (c *Cache) chunkAtCanonicalErr(cx, cz int32) (*Chunk, error) {
 			c.evictIfNeeded()
 			c.mu.Unlock()
 			if inserted && loaded != nil {
-				if len(loaded.persistedTicks) > 0 {
-					c.ImportChunkScheduledBlockTicks(cx, cz, loaded.persistedTicks)
+				remTicks := c.importChunkSculkFromChunk(loaded)
+				if len(remTicks) > 0 {
+					c.ImportChunkScheduledBlockTicks(cx, cz, remTicks)
 				}
 				c.importChunkPistonBlockEntitiesFromChunk(loaded)
 			}
@@ -1236,6 +1238,12 @@ func (c *Cache) flushDirty() error {
 			pendingTickChunks = append(pendingTickChunks, ck)
 		}
 	}
+	for _, ck := range c.activeSculkChunks() {
+		if !seenTickChunk[ck] {
+			seenTickChunk[ck] = true
+			pendingTickChunks = append(pendingTickChunks, ck)
+		}
+	}
 
 	c.mu.Lock()
 	keys := make([][2]int32, 0, len(c.dirty)+len(c.unsavedGen)+len(pendingTickChunks))
@@ -1277,6 +1285,7 @@ func (c *Cache) flushDirty() error {
 			snapshot.persistedTicks = c.ExportChunkScheduledBlockTicks(k[0], k[1])
 		}
 		c.syncChunkPistonBlockEntitiesToSnapshot(k[0], k[1], snapshot)
+		c.syncChunkSculkToSnapshot(k[0], k[1], snapshot)
 		if err := c.store.saveSnapshot(snapshot); err != nil {
 			if firstErr == nil {
 				firstErr = err

@@ -25,15 +25,15 @@ func TestSculkBlockStatesPlacementWaterloggingAndLight(t *testing.T) {
 		t.Fatalf("sculk_shrieker light emission = %d, want 0", LightEmission(shriek))
 	}
 
-	// 2. Placement in water source sets waterlogged=true, calibrated facing opposite to player,
-	//    and player-placed shrieker has can_summon=false.
+	// 2. Placement in water source sets waterlogged=true, calibrated facing equal to playerHorizontalFacing
+	//    (CalibratedSculkSensorBlock.getStateForPlacement), and player-placed shrieker has can_summon=false.
 	c.SetBlock(x, y, z, StateWater)
 	stCal, ok := c.ResolveSculkPlacementStateAt(x, y, z, "minecraft:calibrated_sculk_sensor", "south")
 	if !ok {
 		t.Fatal("ResolveSculkPlacementStateAt(calibrated_sculk_sensor) failed")
 	}
 	phase, power, wl, cal, facing, ok := ParseSculkSensorState(stCal)
-	if !ok || !cal || !wl || facing != "north" || phase != SculkSensorPhaseInactive || power != 0 {
+	if !ok || !cal || !wl || facing != "south" || phase != SculkSensorPhaseInactive || power != 0 {
 		t.Fatalf("unexpected calibrated_sculk_sensor placement state: phase=%s power=%d wl=%v cal=%v facing=%s", phase, power, wl, cal, facing)
 	}
 
@@ -81,8 +81,9 @@ func TestWorldSculkSensorRedstonePhasesAndAmethystAdjacency(t *testing.T) {
 		}
 	}
 
-	// Place a calibrated_sculk_sensor facing west (input at sx-1) and redstone_wire at east (sx+1) and west (sx-1).
-	c.SetBlock(sx, sy, sz, CalibratedSculkSensorBlockState("west", SculkSensorPhaseInactive, 0, true))
+	// Place a calibrated_sculk_sensor facing east (amethyst input side is facing.getOpposite() = west at sx-1)
+	// and redstone_wire at east (sx+1).
+	c.SetBlock(sx, sy, sz, CalibratedSculkSensorBlockState("east", SculkSensorPhaseInactive, 0, true))
 	wire, _ := nameToStateID("minecraft:redstone_wire", nil)
 	c.SetBlock(sx+1, sy, sz, wire)
 	amethyst, _ := nameToStateID("minecraft:amethyst_block", nil)

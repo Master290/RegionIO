@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +35,7 @@ const (
 	SculkSensorPhaseCooldown = "cooldown"
 
 	// SculkShriekerRelayRadius is the maximum distance (8 blocks) at which an
-	// activating sculk sensor triggers a nearby sculk_shrieker.
+	// activating sculk sensor's tendrils_clicking reaches a sculk_shrieker.
 	SculkShriekerRelayRadius = 8.0
 	// SculkShriekerDurationTicks is the duration (90 ticks = 4.5s) a sculk_shrieker stays shrieking=true.
 	SculkShriekerDurationTicks = 90
@@ -51,14 +50,17 @@ const (
 	WardenWarningCooldownTicks = 200
 	// WardenWarningDecayTicks is the 12000-tick (10min) interval after which a player's warning level decays by 1.
 	WardenWarningDecayTicks = 12000
-	// WardenWarningCopyRadius is the 48-block radius within which nearby players share the highest warning level.
+	// WardenWarningCopyRadius is the 48-block check diameter (`WARNING_CHECK_DIAMETER = 48`) for nearby Wardens.
 	WardenWarningCopyRadius = 48.0
+	// WardenPlayerSearchRadius is `WardenSpawnTracker.PLAYER_SEARCH_RADIUS` (`16.0` blocks)
+	// within which nearby players share warning levels.
+	WardenPlayerSearchRadius = 16.0
 
 	// SculkCatalystListenRadius is the radius (8 blocks) within which a sculk_catalyst absorbs mob death XP.
 	SculkCatalystListenRadius = 8.0
 	// SculkCatalystBloomTicks is the duration (8 ticks) a sculk_catalyst stays bloom=true after absorbing XP.
 	SculkCatalystBloomTicks = 8
-	// SculkActivatorChargeThreshold is the minimum XP charge (10) required for a catalyst spread to grow a sensor/shrieker.
+	// SculkActivatorChargeThreshold is `SculkSpreader.GROWTH_SPAWN_COST` (`10`).
 	SculkActivatorChargeThreshold = 10
 
 	// Sound events for sculk blocks.
@@ -70,7 +72,7 @@ const (
 	SoundSculkBlockSpread        = "minecraft:block.sculk.spread"
 )
 
-// Canonical vanilla 26.1.2 GameEvent identifiers grouped by vibration frequency (1..15).
+// Canonical vanilla 26.1.2 GameEvent identifiers.
 const (
 	// Frequency 1: Movement in any medium
 	GameEventStep       = "minecraft:step"
@@ -86,29 +88,29 @@ const (
 	GameEventResonate2      = "minecraft:resonate_2"
 
 	// Frequency 3: Item interactions / shooting projectiles / playing instruments
+	GameEventItemInteractStart  = "minecraft:item_interact_start"
 	GameEventItemInteractFinish = "minecraft:item_interact_finish"
 	GameEventProjectileShoot    = "minecraft:projectile_shoot"
 	GameEventInstrumentPlay     = "minecraft:instrument_play"
 	GameEventResonate3          = "minecraft:resonate_3"
 
-	// Frequency 4: Gliding with elytra or unique mob actions
+	// Frequency 4: Gliding with elytra, unequip, or unique mob actions
 	GameEventElytraGlide  = "minecraft:elytra_glide"
-	GameEventShear        = "minecraft:shear"
+	GameEventUnequip      = "minecraft:unequip"
+	GameEventEntityAction = "minecraft:entity_action"
 	GameEventEntityRoar   = "minecraft:entity_roar"
 	GameEventEntityShake  = "minecraft:entity_shake"
-	GameEventEntityAction = "minecraft:entity_action"
 	GameEventResonate4    = "minecraft:resonate_4"
 
 	// Frequency 5: Dismounting a mob or equipping gear
 	GameEventEntityDismount = "minecraft:entity_dismount"
 	GameEventEquip          = "minecraft:equip"
-	GameEventUnequip        = "minecraft:unequip"
 	GameEventResonate5      = "minecraft:resonate_5"
 
-	// Frequency 6: Mounting a mob or interacting with a mob
+	// Frequency 6: Mounting a mob, shearing, or interacting with a mob
 	GameEventEntityMount    = "minecraft:entity_mount"
 	GameEventEntityInteract = "minecraft:entity_interact"
-	GameEventTeleport       = "minecraft:teleport"
+	GameEventShear          = "minecraft:shear"
 	GameEventResonate6      = "minecraft:resonate_6"
 
 	// Frequency 7: A mob or player taking damage
@@ -137,130 +139,36 @@ const (
 	GameEventJukeboxPlay   = "minecraft:jukebox_play"
 	GameEventResonate10    = "minecraft:resonate_10"
 
-	// Frequency 11: Blocks changing or picking up fluids
+	// Frequency 11: Blocks changing
 	GameEventBlockChange = "minecraft:block_change"
-	GameEventFluidPickup = "minecraft:fluid_pickup"
 	GameEventJukeboxStop = "minecraft:jukebox_stop_play"
 	GameEventResonate11  = "minecraft:resonate_11"
 
-	// Frequency 12: Blocks being destroyed or placing fluids
+	// Frequency 12: Blocks being destroyed or picking up fluids
 	GameEventBlockDestroy = "minecraft:block_destroy"
-	GameEventFluidPlace   = "minecraft:fluid_place"
+	GameEventFluidPickup  = "minecraft:fluid_pickup"
 	GameEventResonate12   = "minecraft:resonate_12"
 
-	// Frequency 13: Blocks being placed
+	// Frequency 13: Blocks or fluids being placed
 	GameEventBlockPlace = "minecraft:block_place"
+	GameEventFluidPlace = "minecraft:fluid_place"
 	GameEventResonate13 = "minecraft:resonate_13"
 
-	// Frequency 14: Entities being created or lightning strike
+	// Frequency 14: Entities being created, teleporting, or lightning strike
 	GameEventEntityPlace     = "minecraft:entity_place"
 	GameEventLightningStrike = "minecraft:lightning_strike"
+	GameEventTeleport        = "minecraft:teleport"
 	GameEventResonate14      = "minecraft:resonate_14"
 
-	// Frequency 15: Entities dying, explosions, or sculk shrieking
+	// Frequency 15: Entities dying or explosions
 	GameEventEntityDie  = "minecraft:entity_die"
 	GameEventExplode    = "minecraft:explode"
-	GameEventShriek     = "minecraft:shriek"
 	GameEventResonate15 = "minecraft:resonate_15"
+
+	// Non-sensor sculk / Warden game events (frequency 0 in VIBRATION_FREQUENCY_FOR_EVENT):
+	GameEventShriek                     = "minecraft:shriek"
+	GameEventSculkSensorTendrilsClicking = "minecraft:sculk_sensor_tendrils_clicking"
 )
-
-var vibrationFrequencyByEvent = map[string]int{
-	// Frequency 1
-	GameEventStep:       1,
-	GameEventSwim:       1,
-	GameEventFlap:       1,
-	GameEventEntityMove: 1,
-	GameEventResonate1:  1,
-
-	// Frequency 2
-	GameEventHitGround:      2,
-	GameEventSplash:         2,
-	GameEventProjectileLand: 2,
-	GameEventResonate2:      2,
-
-	// Frequency 3
-	GameEventItemInteractFinish: 3,
-	GameEventProjectileShoot:    3,
-	GameEventInstrumentPlay:     3,
-	GameEventResonate3:          3,
-
-	// Frequency 4
-	GameEventElytraGlide:  4,
-	GameEventShear:        4,
-	"minecraft:shearing":  4,
-	GameEventEntityRoar:   4,
-	GameEventEntityShake:  4,
-	GameEventEntityAction: 4,
-	GameEventResonate4:    4,
-
-	// Frequency 5
-	GameEventEntityDismount: 5,
-	GameEventEquip:          5,
-	GameEventUnequip:        5,
-	GameEventResonate5:      5,
-
-	// Frequency 6
-	GameEventEntityMount:    6,
-	GameEventEntityInteract: 6,
-	GameEventTeleport:       6,
-	GameEventResonate6:      6,
-
-	// Frequency 7
-	GameEventEntityDamage: 7,
-	GameEventResonate7:    7,
-
-	// Frequency 8
-	GameEventDrink:     8,
-	GameEventEat:       8,
-	GameEventResonate8: 8,
-
-	// Frequency 9
-	GameEventContainerClose:    9,
-	GameEventBlockClose:        9,
-	GameEventBlockDeactivate:   9,
-	"minecraft:block_unswitch": 9,
-	"minecraft:block_unpress":  9,
-	GameEventBlockDetach:       9,
-	GameEventResonate9:         9,
-
-	// Frequency 10
-	GameEventContainerOpen:   10,
-	GameEventBlockOpen:       10,
-	GameEventBlockActivate:   10,
-	"minecraft:block_switch": 10,
-	"minecraft:block_press":  10,
-	GameEventBlockAttach:     10,
-	GameEventNoteBlockPlay:   10,
-	GameEventPrimeFuse:       10,
-	GameEventJukeboxPlay:     10,
-	GameEventResonate10:      10,
-
-	// Frequency 11
-	GameEventBlockChange: 11,
-	GameEventFluidPickup: 11,
-	GameEventJukeboxStop: 11,
-	GameEventResonate11:  11,
-
-	// Frequency 12
-	GameEventBlockDestroy: 12,
-	GameEventFluidPlace:   12,
-	GameEventResonate12:   12,
-
-	// Frequency 13
-	GameEventBlockPlace: 13,
-	GameEventResonate13: 13,
-
-	// Frequency 14
-	GameEventEntityPlace:     14,
-	GameEventLightningStrike: 14,
-	GameEventResonate14:      14,
-
-	// Frequency 15
-	GameEventEntityDie:  15,
-	GameEventExplode:    15,
-	GameEventShriek:     15,
-	GameEventResonate15: 15,
-}
 
 func canonicalGameEvent(event string) string {
 	s := strings.ToLower(strings.TrimSpace(event))
@@ -273,212 +181,37 @@ func canonicalGameEvent(event string) string {
 	return s
 }
 
-// VibrationFrequency returns the vanilla 26.1.2 vibration frequency (1..15) for
-// gameEvent, or 0 if gameEvent does not produce a vibration.
+// VibrationFrequency returns the exact vanilla 26.1.2 `VIBRATION_FREQUENCY_FOR_EVENT`
+// (`1..15`) for gameEvent, or `0` if gameEvent is not in `#minecraft:vibrations`.
 func VibrationFrequency(gameEvent string) int {
-	return vibrationFrequencyByEvent[canonicalGameEvent(gameEvent)]
+	return world.VibrationFrequency(gameEvent)
 }
 
 // ResonateGameEvent returns the canonical "minecraft:resonate_<1..15>" game
 // event identifier for a vibration frequency in 1..15.
 func ResonateGameEvent(freq int) string {
-	if freq < 1 || freq > 15 {
-		return ""
-	}
-	return "minecraft:resonate_" + strconv.Itoa(freq)
+	return world.ResonateGameEvent(freq)
 }
 
 // SculkSensorSignalForDistance calculates the redstone power output (1..15) of a
 // sculk sensor or calibrated sculk sensor for a vibration at distance dist
-// within maxDist, matching vanilla VibrationSystem.getRedstoneStrengthForDistance:
+// within maxDist, matching vanilla `VibrationSystem.getRedstoneStrengthForDistance`:
 //
-//	max(1, ceil((1.0 - dist/maxDist) * 15.0))
+//	max(1, 15 - floor((15.0 / maxDist) * float32(dist)))
 func SculkSensorSignalForDistance(dist, maxDist float64) int {
-	if maxDist <= 0 || dist > maxDist {
-		return 0
-	}
-	if dist <= 0 {
-		return world.MaxRedstonePower
-	}
-	ratio := 1.0 - (dist / maxDist)
-	sig := int(math.Ceil(ratio * float64(world.MaxRedstonePower)))
-	if sig < 1 {
-		sig = 1
-	}
-	if sig > world.MaxRedstonePower {
-		sig = world.MaxRedstonePower
-	}
-	return sig
+	return world.SculkSensorSignalForDistance(dist, maxDist)
 }
 
-// VibrationTravelTicks returns the travel delay in game ticks for a vibration
-// traveling distance blocks (1 block per game tick, minimum 1 tick).
+// VibrationTravelTicks returns the total travel delay in game ticks from emission
+// for a vibration traveling distance blocks (`max(1, floor(float32(distance)))`).
 func VibrationTravelTicks(distance float64) int {
 	if distance <= 1.0 {
 		return 1
 	}
-	return int(math.Floor(distance))
+	return int(math.Floor(float64(float32(distance))))
 }
 
-// --- Sculk Block State Tables & Helpers ---
-
-type sculkSensorMeta struct {
-	calibrated  bool
-	facing      string
-	phase       string
-	power       int
-	waterlogged bool
-}
-
-type sculkShriekerMeta struct {
-	canSummon   bool
-	shrieking   bool
-	waterlogged bool
-}
-
-var (
-	sculkStatesOnce       sync.Once
-	stateSculk            uint16
-	stateAmethystBlock    uint16
-	stateCatalyst         [2]uint16 // false, true
-	sensorMetaByState     map[uint16]sculkSensorMeta
-	shriekerMetaByState   map[uint16]sculkShriekerMeta
-	woolOrCarpetByState   map[uint16]bool
-	woolOnlyByState       map[uint16]bool
-	sculkReplaceableState map[uint16]bool
-)
-
-func initSculkStates() {
-	sculkStatesOnce.Do(func() {
-		sensorMetaByState = make(map[uint16]sculkSensorMeta, 512)
-		shriekerMetaByState = make(map[uint16]sculkShriekerMeta, 16)
-		woolOrCarpetByState = make(map[uint16]bool, 64)
-		woolOnlyByState = make(map[uint16]bool, 32)
-		sculkReplaceableState = make(map[uint16]bool, 128)
-
-		if st, ok := world.BlockStateIDByProperties("minecraft:sculk", nil); ok {
-			stateSculk = st
-		}
-		if st, ok := world.BlockStateIDByProperties("minecraft:amethyst_block", nil); ok {
-			stateAmethystBlock = st
-		}
-		if st, ok := world.BlockStateIDByProperties("minecraft:sculk_catalyst", map[string]string{"bloom": "false"}); ok {
-			stateCatalyst[0] = st
-		}
-		if st, ok := world.BlockStateIDByProperties("minecraft:sculk_catalyst", map[string]string{"bloom": "true"}); ok {
-			stateCatalyst[1] = st
-		}
-
-		phases := []string{SculkSensorPhaseInactive, SculkSensorPhaseActive, SculkSensorPhaseCooldown}
-		boolStrs := []string{"false", "true"}
-		facings := []string{"north", "south", "west", "east"}
-
-		for _, phase := range phases {
-			for p := 0; p <= 15; p++ {
-				pStr := strconv.Itoa(p)
-				for _, wlStr := range boolStrs {
-					wl := wlStr == "true"
-					if st, ok := world.BlockStateIDByProperties("minecraft:sculk_sensor", map[string]string{
-						"power":              pStr,
-						"sculk_sensor_phase": phase,
-						"waterlogged":        wlStr,
-					}); ok && st != world.StateAir {
-						sensorMetaByState[st] = sculkSensorMeta{
-							calibrated:  false,
-							phase:       phase,
-							power:       p,
-							waterlogged: wl,
-						}
-					}
-					for _, facing := range facings {
-						if st, ok := world.BlockStateIDByProperties("minecraft:calibrated_sculk_sensor", map[string]string{
-							"facing":             facing,
-							"power":              pStr,
-							"sculk_sensor_phase": phase,
-							"waterlogged":        wlStr,
-						}); ok && st != world.StateAir {
-							sensorMetaByState[st] = sculkSensorMeta{
-								calibrated:  true,
-								facing:      facing,
-								phase:       phase,
-								power:       p,
-								waterlogged: wl,
-							}
-						}
-					}
-				}
-			}
-		}
-
-		for _, csStr := range boolStrs {
-			for _, shStr := range boolStrs {
-				for _, wlStr := range boolStrs {
-					if st, ok := world.BlockStateIDByProperties("minecraft:sculk_shrieker", map[string]string{
-						"can_summon":  csStr,
-						"shrieking":   shStr,
-						"waterlogged": wlStr,
-					}); ok && st != world.StateAir {
-						shriekerMetaByState[st] = sculkShriekerMeta{
-							canSummon:   csStr == "true",
-							shrieking:   shStr == "true",
-							waterlogged: wlStr == "true",
-						}
-					}
-				}
-			}
-		}
-
-		colors := []string{
-			"white", "orange", "magenta", "light_blue",
-			"yellow", "lime", "pink", "gray",
-			"light_gray", "cyan", "purple", "blue",
-			"brown", "green", "red", "black",
-		}
-		for _, c := range colors {
-			if st, ok := world.BlockStateIDByProperties("minecraft:"+c+"_wool", nil); ok && st != world.StateAir {
-				woolOnlyByState[st] = true
-				woolOrCarpetByState[st] = true
-			}
-			if st, ok := world.BlockStateIDByProperties("minecraft:"+c+"_carpet", nil); ok && st != world.StateAir {
-				woolOrCarpetByState[st] = true
-			}
-			if st, ok := world.BlockStateIDByProperties("minecraft:"+c+"_terracotta", nil); ok && st != world.StateAir {
-				sculkReplaceableState[st] = true
-			}
-		}
-
-		replaceableBlocks := []string{
-			"minecraft:stone", "minecraft:granite", "minecraft:diorite", "minecraft:andesite",
-			"minecraft:tuff", "minecraft:calcite", "minecraft:dripstone_block",
-			"minecraft:deepslate", "minecraft:cobbled_deepslate",
-			"minecraft:dirt", "minecraft:coarse_dirt", "minecraft:rooted_dirt",
-			"minecraft:grass_block", "minecraft:podzol", "minecraft:mycelium",
-			"minecraft:mud", "minecraft:muddy_mangrove_roots", "minecraft:clay", "minecraft:moss_block",
-			"minecraft:sand", "minecraft:red_sand", "minecraft:gravel",
-			"minecraft:sandstone", "minecraft:red_sandstone", "minecraft:terracotta",
-			"minecraft:netherrack", "minecraft:basalt", "minecraft:smooth_basalt",
-			"minecraft:blackstone", "minecraft:soul_sand", "minecraft:soul_soil",
-			"minecraft:end_stone",
-		}
-		for _, name := range replaceableBlocks {
-			if st, ok := world.BlockStateIDByProperties(name, nil); ok && st != world.StateAir {
-				sculkReplaceableState[st] = true
-			}
-			// For snowy blocks like grass_block/podzol/mycelium or axis blocks like deepslate/basalt:
-			if st, ok := world.BlockStateIDByProperties(name, map[string]string{"snowy": "false"}); ok && st != world.StateAir {
-				sculkReplaceableState[st] = true
-			}
-			if st, ok := world.BlockStateIDByProperties(name, map[string]string{"snowy": "true"}); ok && st != world.StateAir {
-				sculkReplaceableState[st] = true
-			}
-			for _, axis := range []string{"x", "y", "z"} {
-				if st, ok := world.BlockStateIDByProperties(name, map[string]string{"axis": axis}); ok && st != world.StateAir {
-					sculkReplaceableState[st] = true
-				}
-			}
-		}
-	})
-}
+// --- Sculk Block State Wrappers ---
 
 // SculkBlockState returns the block state ID for `minecraft:sculk`.
 func SculkBlockState() uint16 {
@@ -555,7 +288,7 @@ func SculkVeinBlockState(faces map[string]bool, waterlogged bool) uint16 {
 	south := faces != nil && faces["south"]
 	east := faces != nil && faces["east"]
 	west := faces != nil && faces["west"]
-	if !down && !up && !north && !south && !east && !west {
+	if !down && !up && !north && !south && !west && !east {
 		down = true
 	}
 	return world.SculkVeinBlockState(down, up, north, south, east, west, waterlogged)
@@ -567,14 +300,14 @@ func IsSculkReplaceableBlock(state uint16) bool {
 	return world.IsSculkReplaceableBlock(state)
 }
 
-// IsWoolBlock reports whether state is one of the 16 wool blocks (`*_wool`).
+// IsWoolBlock reports whether state is one of the 16 wool blocks (`*_wool`,
+// `#minecraft:occludes_vibration_signals`).
 func IsWoolBlock(state uint16) bool {
 	return world.IsWoolBlock(state)
 }
 
 // IsWoolOrCarpetBlock reports whether state is a wool block (`*_wool`) or wool
-// carpet (`*_carpet`) in vanilla `#minecraft:dampens_vibrations` /
-// `#minecraft:occludes_vibration_signals`.
+// carpet (`*_carpet`) in vanilla `#minecraft:dampens_vibrations`.
 func IsWoolOrCarpetBlock(state uint16) bool {
 	return world.IsWoolOrCarpetBlock(state)
 }
@@ -584,9 +317,9 @@ func IsWoolOrCarpetName(blockOrItemName string) bool {
 	return world.IsWoolOrCarpetName(blockOrItemName)
 }
 
-// IsVibrationOccluded checks whether the straight line between (srcX, srcY, srcZ)
-// and (dstX, dstY, dstZ) passes through any wool or carpet block, matching
-// vanilla VibrationSystem.Listener.isOccluded.
+// IsVibrationOccluded checks whether all 6 nudged rays between the block centers
+// of (srcX, srcY, srcZ) and (dstX, dstY, dstZ) are occluded by `#minecraft:occludes_vibration_signals`
+// (`*_wool`), matching `VibrationSystem.Listener.isOccluded` in `26.1.2.jar`.
 func IsVibrationOccluded(getBlock func(x, y, z int) uint16, srcX, srcY, srcZ, dstX, dstY, dstZ float64) bool {
 	return world.IsVibrationOccluded(getBlock, srcX, srcY, srcZ, dstX, dstY, dstZ)
 }
@@ -601,7 +334,7 @@ type VibrationSource struct {
 	BlockOrItemID string // optional block/item identifier involved in the event (e.g. placed/broken block)
 }
 
-// PendingVibration represents an in-flight vibration traveling toward a sculk sensor.
+// PendingVibration represents an in-flight or candidate vibration traveling toward a sculk sensor.
 type PendingVibration struct {
 	Event          string
 	Frequency      int
@@ -627,24 +360,30 @@ type SculkSensorBlockEntity struct {
 	Power                  int
 	LastVibrationFrequency int
 	Pending                *PendingVibration
+	Listener               world.VibrationSystemData
 }
 
-// SculkShriekerBlockEntity tracks the active shrieking timer and cooldown of a
-// `minecraft:sculk_shrieker`.
+// SculkShriekerBlockEntity tracks the `warning_level`, `listener`, and shrieking
+// timer of a `minecraft:sculk_shrieker`.
 type SculkShriekerBlockEntity struct {
 	Dimension      string
 	X, Y, Z        int
 	CanSummon      bool
+	WarningLevel   int
 	ShriekingTicks int
 	CooldownTicks  int
 	TargetPlayer   *PlayerSession
+	Listener       world.VibrationSystemData
 }
 
-// SculkCatalystBlockEntity tracks the bloom timer of a `minecraft:sculk_catalyst`.
+// SculkCatalystBlockEntity tracks the `bloom` timer and `SculkSpreader` cursors
+// of a `minecraft:sculk_catalyst`.
 type SculkCatalystBlockEntity struct {
 	Dimension  string
 	X, Y, Z    int
 	BloomTicks int
+	Cursors    []world.SculkChargeCursor
+	rng        *rand.Rand
 }
 
 // PlayerWardenTracker tracks a player's vanilla `warden_spawn_tracker` state
@@ -668,6 +407,7 @@ type WardenPresentPredicateFunc func(dim string, x, y, z float64, radius float64
 type serverSculkState struct {
 	mu                sync.Mutex
 	loadedDisk        bool
+	tickCounter       int64
 	sensors           map[brewingKey]*SculkSensorBlockEntity
 	shriekers         map[brewingKey]*SculkShriekerBlockEntity
 	catalysts         map[brewingKey]*SculkCatalystBlockEntity
@@ -701,6 +441,281 @@ func getPlayerWardenTracker(session *PlayerSession) *PlayerWardenTracker {
 	}
 	actual, _ := playerWardenTrackers.LoadOrStore(session, &PlayerWardenTracker{})
 	return actual.(*PlayerWardenTracker)
+}
+
+func (s *Server) playerByUUID(uuid [16]byte) *PlayerSession {
+	if s == nil {
+		return nil
+	}
+	s.playersMu.RLock()
+	sess := s.players[uuid]
+	s.playersMu.RUnlock()
+	return sess
+}
+
+func (s *Server) resolveVibrationPlayer(info *world.VibrationInfoData, fallback *PlayerSession) *PlayerSession {
+	if fallback != nil {
+		return fallback
+	}
+	if s == nil || info == nil {
+		return nil
+	}
+	if info.HasProjectileOwnerUUID {
+		if p := s.playerByUUID(info.ProjectileOwnerUUID); p != nil {
+			return p
+		}
+	}
+	if info.HasSourceUUID {
+		if p := s.playerByUUID(info.SourceUUID); p != nil {
+			return p
+		}
+	}
+	if info.SourceEntityID != 0 {
+		if p := s.playerByEntityID(info.SourceEntityID); p != nil {
+			return p
+		}
+	}
+	return nil
+}
+
+func (s *Server) syncSensorPendingFromListener(be *SculkSensorBlockEntity, playerHint *PlayerSession) {
+	if be == nil {
+		return
+	}
+	maxR := SculkSensorRadius
+	if be.Calibrated {
+		maxR = CalibratedSculkSensorRadius
+	}
+	var src *world.VibrationInfoData
+	var ticks int
+	if be.Listener.Current != nil {
+		src = be.Listener.Current
+		ticks = be.Listener.TravelTimeInTicks
+	} else if be.Listener.Selector.Candidate != nil {
+		src = be.Listener.Selector.Candidate
+		ticks = VibrationTravelTicks(float64(src.Distance))
+	}
+	if src == nil {
+		be.Pending = nil
+		return
+	}
+	var prevEntityID int32
+	var prevResonance bool
+	var prevPlayer *PlayerSession
+	if be.Pending != nil {
+		prevEntityID = be.Pending.EntityID
+		prevResonance = be.Pending.IsResonance
+		prevPlayer = be.Pending.Player
+	}
+	p := s.resolveVibrationPlayer(src, playerHint)
+	if p == nil {
+		p = prevPlayer
+	}
+	entID := src.SourceEntityID
+	if entID == 0 {
+		entID = prevEntityID
+	}
+	if entID == 0 && p != nil {
+		entID = p.EntityID
+	}
+	be.Pending = &PendingVibration{
+		Event:          src.GameEvent,
+		Frequency:      VibrationFrequency(src.GameEvent),
+		SourceX:        src.Pos[0],
+		SourceY:        src.Pos[1],
+		SourceZ:        src.Pos[2],
+		Distance:       float64(src.Distance),
+		MaxDistance:    maxR,
+		TicksRemaining: ticks,
+		Player:         p,
+		EntityID:       entID,
+		IsResonance:    prevResonance || strings.HasPrefix(src.GameEvent, "minecraft:resonate_"),
+	}
+}
+
+func ensureSensorListenerSynced(be *SculkSensorBlockEntity) {
+	if be == nil {
+		return
+	}
+	if be.Listener.Current == nil && be.Listener.Selector.Candidate == nil && be.Pending != nil {
+		p := be.Pending
+		var srcUUID [16]byte
+		var hasUUID bool
+		if p.Player != nil {
+			srcUUID = p.Player.Profile.UUID
+			hasUUID = true
+		}
+		be.Listener.Current = &world.VibrationInfoData{
+			GameEvent:      canonicalGameEvent(p.Event),
+			Distance:       float32(p.Distance),
+			Pos:            [3]float64{p.SourceX, p.SourceY, p.SourceZ},
+			HasSourceUUID:  hasUUID,
+			SourceUUID:     srcUUID,
+			SourceEntityID: p.EntityID,
+		}
+		be.Listener.TravelTimeInTicks = p.TicksRemaining
+		be.Listener.Selector = world.NewVibrationSelectorData()
+	}
+}
+
+func pushSensorToWorldCache(cache *world.Cache, be *SculkSensorBlockEntity) {
+	if cache == nil || be == nil {
+		return
+	}
+	ensureSensorListenerSynced(be)
+	cache.SetWorldSculkSensorState(world.WorldSculkSensorState{
+		X:                      be.X,
+		Y:                      be.Y,
+		Z:                      be.Z,
+		Calibrated:             be.Calibrated,
+		LastVibrationFrequency: be.LastVibrationFrequency,
+		PhaseTicks:             be.PhaseTicks,
+		Listener:               be.Listener.Clone(),
+	})
+}
+
+func pushShriekerToWorldCache(cache *world.Cache, be *SculkShriekerBlockEntity) {
+	if cache == nil || be == nil {
+		return
+	}
+	cache.SetWorldSculkShriekerState(world.WorldSculkShriekerState{
+		X:              be.X,
+		Y:              be.Y,
+		Z:              be.Z,
+		WarningLevel:   be.WarningLevel,
+		ShriekingTicks: be.ShriekingTicks,
+		Listener:       be.Listener.Clone(),
+	})
+}
+
+func pushCatalystToWorldCache(cache *world.Cache, be *SculkCatalystBlockEntity) {
+	if cache == nil || be == nil {
+		return
+	}
+	cache.SetWorldSculkCatalystState(world.WorldSculkCatalystState{
+		X:          be.X,
+		Y:          be.Y,
+		Z:          be.Z,
+		BloomTicks: be.BloomTicks,
+		Cursors:    be.Cursors,
+	})
+}
+
+func (s *Server) syncSculkFromWorldCaches() {
+	if s == nil {
+		return
+	}
+	dimCaches := make(map[string]*world.Cache, 3)
+	if s.chunks != nil {
+		dimCaches[world.DimensionOverworld] = s.chunks
+	}
+	ds := s.dimState()
+	ds.mu.Lock()
+	for d, c := range ds.caches {
+		if c != nil {
+			dimCaches[world.NormalizeDimension(d)] = c
+		}
+	}
+	ds.mu.Unlock()
+
+	for dim, cache := range dimCaches {
+		if cache == nil {
+			continue
+		}
+		sensors, shriekers, catalysts := cache.DrainImportedSculkSnapshots()
+		if len(sensors) == 0 && len(shriekers) == 0 && len(catalysts) == 0 {
+			continue
+		}
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		for _, ws := range sensors {
+			bState := cache.GetBlock(ws.X, ws.Y, ws.Z)
+			phase, power, _, cal, _, ok := ParseSculkSensorState(bState)
+			if !ok {
+				continue
+			}
+			listener := ws.Listener.Clone()
+			if listener.Selector.Candidate != nil && listener.Selector.Tick > st.tickCounter {
+				st.tickCounter = listener.Selector.Tick
+			}
+			be := &SculkSensorBlockEntity{
+				Dimension:              dim,
+				X:                      ws.X,
+				Y:                      ws.Y,
+				Z:                      ws.Z,
+				Calibrated:             cal,
+				Phase:                  phase,
+				PhaseTicks:             ws.PhaseTicks,
+				Power:                  power,
+				LastVibrationFrequency: ws.LastVibrationFrequency,
+				Listener:               listener,
+			}
+			if (phase == SculkSensorPhaseActive || phase == SculkSensorPhaseCooldown) && be.PhaseTicks <= 0 {
+				if phase == SculkSensorPhaseCooldown {
+					be.PhaseTicks = SculkSensorCooldownTicks
+				} else if cal {
+					be.PhaseTicks = CalibratedSculkSensorActiveTicks
+				} else {
+					be.PhaseTicks = SculkSensorActiveTicks
+				}
+			}
+			s.syncSensorPendingFromListener(be, nil)
+			st.sensors[makeBrewingKey(dim, ws.X, ws.Y, ws.Z)] = be
+		}
+		for _, ws := range shriekers {
+			bState := cache.GetBlock(ws.X, ws.Y, ws.Z)
+			canSummon, shrieking, _, ok := ParseSculkShriekerState(bState)
+			if !ok {
+				continue
+			}
+			listener := ws.Listener.Clone()
+			if listener.Selector.Candidate != nil && listener.Selector.Tick > st.tickCounter {
+				st.tickCounter = listener.Selector.Tick
+			}
+			be := &SculkShriekerBlockEntity{
+				Dimension:      dim,
+				X:              ws.X,
+				Y:              ws.Y,
+				Z:              ws.Z,
+				CanSummon:      canSummon,
+				WarningLevel:   ws.WarningLevel,
+				ShriekingTicks: ws.ShriekingTicks,
+				Listener:       listener,
+			}
+			if shrieking && be.ShriekingTicks <= 0 {
+				be.ShriekingTicks = SculkShriekerDurationTicks
+			}
+			if listener.Current != nil {
+				be.TargetPlayer = s.resolveVibrationPlayer(listener.Current, nil)
+			}
+			st.shriekers[makeBrewingKey(dim, ws.X, ws.Y, ws.Z)] = be
+		}
+		for _, ws := range catalysts {
+			bState := cache.GetBlock(ws.X, ws.Y, ws.Z)
+			bloom, ok := ParseSculkCatalystState(bState)
+			if !ok {
+				continue
+			}
+			cursors := make([]world.SculkChargeCursor, len(ws.Cursors))
+			for i := range ws.Cursors {
+				cursors[i] = ws.Cursors[i].Clone()
+			}
+			be := &SculkCatalystBlockEntity{
+				Dimension:  dim,
+				X:          ws.X,
+				Y:          ws.Y,
+				Z:          ws.Z,
+				BloomTicks: ws.BloomTicks,
+				Cursors:    cursors,
+			}
+			if bloom && be.BloomTicks <= 0 {
+				be.BloomTicks = SculkCatalystBloomTicks
+			}
+			st.catalysts[makeBrewingKey(dim, ws.X, ws.Y, ws.Z)] = be
+		}
+		st.mu.Unlock()
+	}
 }
 
 // SetWardenSummonHook registers Agent A's callback to spawn a `minecraft:warden`
@@ -841,13 +856,55 @@ func LoadSculkTrackerFromPlayerCompound(session *PlayerSession, root *nbt.Compou
 	session.SetPlayerWardenTrackerState(warn, cd, since)
 }
 
-// SculkSensorComparatorSignalAt returns the redstone comparator signal (0..15)
-// for a `sculk_sensor` or `calibrated_sculk_sensor` at (x, y, z) in dim, which
-// equals its `last_vibration_frequency` (0..15).
+// SculkSensorComparatorSignalAt returns the vanilla 26.1.2 comparator output
+// (`SculkSensorBlock.getAnalogOutputSignal`) at (x, y, z) in dim:
+// `last_vibration_frequency` (`1..15`) ONLY when `sculk_sensor_phase == "active"`,
+// and `0` during `"cooldown"` or `"inactive"`.
 func (s *Server) SculkSensorComparatorSignalAt(dim string, x, y, z int) int {
 	if s == nil {
 		return 0
 	}
+	s.syncSculkFromWorldCaches()
+	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+	if cache != nil {
+		phase, _, _, _, _, ok := ParseSculkSensorState(cache.GetBlock(x, y, z))
+		if !ok || phase != SculkSensorPhaseActive {
+			return 0
+		}
+	}
+	st := s.sculkState()
+	st.mu.Lock()
+	s.ensureSculkLoadedLocked(st)
+	be := st.sensors[makeBrewingKey(normDim, x, y, z)]
+	freq := 0
+	if be != nil {
+		if cache == nil && be.Phase != SculkSensorPhaseActive {
+			st.mu.Unlock()
+			return 0
+		}
+		freq = be.LastVibrationFrequency
+	}
+	st.mu.Unlock()
+	if freq == 0 && cache != nil {
+		return cache.SculkSensorComparatorSignalAt(x, y, z)
+	}
+	if freq < 0 {
+		return 0
+	}
+	if freq > world.MaxRedstonePower {
+		return world.MaxRedstonePower
+	}
+	return freq
+}
+
+// SculkSensorLastFrequency returns the persisted `last_vibration_frequency` (0..15)
+// stored in the sculk sensor block entity at (x, y, z) in dim across all phases.
+func (s *Server) SculkSensorLastFrequency(dim string, x, y, z int) int {
+	if s == nil {
+		return 0
+	}
+	s.syncSculkFromWorldCaches()
 	normDim := world.NormalizeDimension(dim)
 	cache := s.DimensionChunks(normDim)
 	if cache != nil && !IsSculkSensorBlock(cache.GetBlock(x, y, z)) {
@@ -862,6 +919,11 @@ func (s *Server) SculkSensorComparatorSignalAt(dim string, x, y, z int) int {
 		freq = be.LastVibrationFrequency
 	}
 	st.mu.Unlock()
+	if freq == 0 && cache != nil {
+		if ws, ok := cache.GetWorldSculkSensorState(x, y, z); ok {
+			freq = ws.LastVibrationFrequency
+		}
+	}
 	if freq < 0 {
 		return 0
 	}
@@ -871,24 +933,32 @@ func (s *Server) SculkSensorComparatorSignalAt(dim string, x, y, z int) int {
 	return freq
 }
 
-// SculkSensorLastFrequency returns the last vibration frequency (0..15) stored
-// by the sculk sensor at (x, y, z) in dim.
-func (s *Server) SculkSensorLastFrequency(dim string, x, y, z int) int {
-	return s.SculkSensorComparatorSignalAt(dim, x, y, z)
-}
-
-// SetSculkSensorLastFrequency sets the last vibration frequency (0..15) of the
+// SetSculkSensorLastFrequency sets the `last_vibration_frequency` (0..15) of the
 // sculk sensor at (x, y, z) in dim and updates adjacent comparators.
 func (s *Server) SetSculkSensorLastFrequency(dim string, x, y, z, freq int) {
 	if s == nil {
 		return
 	}
+	s.syncSculkFromWorldCaches()
 	if freq < 0 {
 		freq = 0
 	} else if freq > 15 {
 		freq = 15
 	}
 	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
+
+	phase := SculkSensorPhaseInactive
+	power := 0
+	calibrated := false
+	if cache != nil {
+		if ph, pw, _, cal, _, ok := ParseSculkSensorState(cache.GetBlock(x, y, z)); ok {
+			phase = ph
+			power = pw
+			calibrated = cal
+		}
+	}
+
 	st := s.sculkState()
 	st.mu.Lock()
 	s.ensureSculkLoadedLocked(st)
@@ -896,18 +966,24 @@ func (s *Server) SetSculkSensorLastFrequency(dim string, x, y, z, freq int) {
 	be := st.sensors[key]
 	if be == nil {
 		be = &SculkSensorBlockEntity{
-			Dimension: normDim,
-			X:         x,
-			Y:         y,
-			Z:         z,
-			Phase:     SculkSensorPhaseInactive,
+			Dimension:  normDim,
+			X:          x,
+			Y:          y,
+			Z:          z,
+			Calibrated: calibrated,
+			Phase:      phase,
+			Power:      power,
+			Listener:   world.NewVibrationSystemData(),
 		}
 		st.sensors[key] = be
 	}
 	be.LastVibrationFrequency = freq
+	beSnapshot := *be
+	beSnapshot.Listener = be.Listener.Clone()
 	st.mu.Unlock()
 
-	if cache := s.DimensionChunks(normDim); cache != nil {
+	if cache != nil {
+		pushSensorToWorldCache(cache, &beSnapshot)
 		res := cache.UpdateComparatorsAround(x, y, z)
 		if len(res.Changes) > 0 {
 			s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
@@ -918,11 +994,12 @@ func (s *Server) SetSculkSensorLastFrequency(dim string, x, y, z, freq int) {
 
 // --- Game Event Emission & Vibration System ---
 
-// isMovementOrSneakDampenedEvent reports whether canonicalEvent is suppressed
-// when the actor is sneaking or stepping on wool.
-func isMovementOrSneakDampenedEvent(canonicalEvent string) bool {
+// isSneakIgnoredVibrationEvent matches `#minecraft:ignore_vibrations_sneaking` in 26.1.2.jar:
+// hit_ground, projectile_shoot, step, swim, item_interact_start, item_interact_finish.
+func isSneakIgnoredVibrationEvent(canonicalEvent string) bool {
 	switch canonicalEvent {
-	case GameEventStep, GameEventHitGround, GameEventSwim, GameEventFlap, GameEventEntityMove, GameEventProjectileShoot:
+	case GameEventStep, GameEventSwim, GameEventHitGround,
+		GameEventProjectileShoot, GameEventItemInteractStart, GameEventItemInteractFinish:
 		return true
 	default:
 		return false
@@ -930,11 +1007,12 @@ func isMovementOrSneakDampenedEvent(canonicalEvent string) bool {
 }
 
 // EmitGameEvent dispatches a vanilla 26.1.2 game event at (x, y, z) in dim.
-// It evaluates vibration frequency (1..15), sneaking / wool dampening (granting
-// `minecraft:adventure/avoid_vibration` when sneaking near an unoccluded sensor),
-// wool occlusion along the ray to each sensor, calibrated sculk sensor input
-// filtering, and travel delay `max(1, floor(distance))` ticks.
-// Returns the number of sculk sensors that scheduled a vibration from this event.
+// It evaluates `#minecraft:vibrations` / `#minecraft:shrieker_can_listen` /
+// `#minecraft:warden_can_listen`, `#minecraft:dampens_vibrations`,
+// `#minecraft:ignore_vibrations_sneaking` (granting `minecraft:adventure/avoid_vibration`),
+// integer `BlockPos.distSqr <= radius^2` listener range, `#minecraft:occludes_vibration_signals`
+// 6-ray wool occlusion, calibrated sculk sensor `getBackSignal` filtering, and
+// `VibrationSelector` same-tick candidate selection.
 func (s *Server) EmitGameEvent(dim string, event string, x, y, z float64, source VibrationSource) int {
 	return s.emitGameEventInternal(dim, event, x, y, z, source, nil)
 }
@@ -949,7 +1027,9 @@ func (s *Server) emitGameEventInternal(
 	if s == nil {
 		return 0
 	}
+	s.syncSculkFromWorldCaches()
 	s.EnsureWardenSummonHook()
+
 	srcID := source.EntityID
 	if srcID == 0 && source.Player != nil {
 		srcID = source.Player.EntityID
@@ -959,141 +1039,255 @@ func (s *Server) emitGameEventInternal(
 	if srcID != 0 && s.IsWardenEntity(srcID) {
 		return 0
 	}
+
+	var srcUUID [16]byte
+	var hasSrcUUID bool
+	if source.Player != nil {
+		srcUUID = source.Player.Profile.UUID
+		hasSrcUUID = true
+	} else if srcID != 0 && s.entities != nil {
+		if ent := s.entities.Get(srcID); ent != nil && ent.UUID != ([16]byte{}) {
+			srcUUID = ent.UUID
+			hasSrcUUID = true
+		}
+	}
+
 	canonicalEv := canonicalGameEvent(event)
 	freq := VibrationFrequency(canonicalEv)
-	if freq <= 0 {
+	isTendrilsClicking := canonicalEv == GameEventSculkSensorTendrilsClicking
+	isShriek := canonicalEv == GameEventShriek
+	normDim := world.NormalizeDimension(dim)
+
+	if freq <= 0 && !isTendrilsClicking {
+		if excludeSensor == nil && isShriek {
+			s.NotifyWardensOfVibration(VibrationEvent{
+				Dimension:      normDim,
+				Type:           canonicalEv,
+				X:              x,
+				Y:              y,
+				Z:              z,
+				SourceEntityID: srcID,
+				Player:         source.Player,
+				Sneaking:       source.Sneaking,
+				BlockOrItemID:  source.BlockOrItemID,
+			})
+		}
 		return 0
 	}
-	normDim := world.NormalizeDimension(dim)
+
 	cache := s.DimensionChunks(normDim)
 	if cache == nil {
 		return 0
 	}
 
-	// 1. Check wool dampening for block placement/destruction/change or stepping on wool/carpet.
+	// 1. Check `#minecraft:dampens_vibrations` (wool blocks & wool carpets):
+	//    - Affected block state in `block_place`, `block_destroy`, `block_change`, or `ItemEntity` wool/carpet.
+	//    - Stepping / landing on wool or wool carpet.
 	if source.BlockOrItemID != "" && IsWoolOrCarpetName(source.BlockOrItemID) {
-		switch canonicalEv {
-		case GameEventBlockPlace, GameEventBlockDestroy, GameEventBlockChange, GameEventStep, GameEventHitGround:
-			return 0
-		}
+		return 0
 	}
 	bx := int(math.Floor(x))
 	by := int(math.Floor(y))
 	bz := int(math.Floor(z))
+	if canonicalEv == GameEventBlockPlace && IsWoolOrCarpetBlock(cache.GetBlock(bx, by, bz)) {
+		return 0
+	}
 	if canonicalEv == GameEventStep || canonicalEv == GameEventHitGround {
-		if IsWoolOrCarpetBlock(cache.GetBlock(bx, by, bz)) || IsWoolOrCarpetBlock(cache.GetBlock(bx, by-1, bz)) {
+		feetBelowY := int(math.Floor(y - 0.2))
+		if IsWoolOrCarpetBlock(cache.GetBlock(bx, by, bz)) ||
+			IsWoolOrCarpetBlock(cache.GetBlock(bx, feetBelowY, bz)) ||
+			IsWoolOrCarpetBlock(cache.GetBlock(bx, by-1, bz)) {
 			return 0
 		}
 	}
 
-	// 2. Check sneaking dampening: sneaking suppresses movement/landing vibrations
-	//    and grants "Sneak 100" (minecraft:adventure/avoid_vibration) if a sensor
-	//    would otherwise have detected the player!
-	if source.Sneaking && isMovementOrSneakDampenedEvent(canonicalEv) {
-		if source.Player != nil && s.hasUnoccludedSensorInRange(normDim, cache, x, y, z, freq) {
+	// 2. Check `#minecraft:ignore_vibrations_sneaking`:
+	if source.Sneaking && isSneakIgnoredVibrationEvent(canonicalEv) {
+		if freq > 0 && source.Player != nil && s.hasUnoccludedSensorInRange(normDim, cache, x, y, z, freq) {
 			s.TriggerAvoidVibration(source.Player)
 		}
 		return 0
 	}
 
-	// 3. Scan for inactive sculk_sensor (radius 8) and calibrated_sculk_sensor (radius 16) blocks.
-	maxR := int(math.Ceil(CalibratedSculkSensorRadius))
-	minY := by - maxR
-	if minY < world.MinY {
-		minY = world.MinY
-	}
-	maxY := by + maxR
-	if maxY >= world.MinY+world.WorldHeight {
-		maxY = world.MinY + world.WorldHeight - 1
-	}
-
 	st := s.sculkState()
 	st.mu.Lock()
 	s.ensureSculkLoadedLocked(st)
+	currentTick := st.tickCounter
 
 	scheduledCount := 0
-	isResonance := strings.HasPrefix(canonicalEv, "minecraft:resonate_")
+	var updatedSensors []*SculkSensorBlockEntity
+	var updatedShriekers []*SculkShriekerBlockEntity
 
-	for sy := minY; sy <= maxY; sy++ {
-		for sz := bz - maxR; sz <= bz+maxR; sz++ {
-			for sx := bx - maxR; sx <= bx+maxR; sx++ {
-				if excludeSensor != nil && excludeSensor.x == sx && excludeSensor.y == sy && excludeSensor.z == sz {
-					continue
-				}
-				bState := cache.GetBlock(sx, sy, sz)
-				phase, power, _, calibrated, _, ok := ParseSculkSensorState(bState)
-				if !ok {
-					continue
-				}
-				radius := SculkSensorRadius
-				if calibrated {
-					radius = CalibratedSculkSensorRadius
-				}
-				cx := float64(sx) + 0.5
-				cy := float64(sy) + 0.5
-				cz := float64(sz) + 0.5
-				dx := cx - x
-				dy := cy - y
-				dz := cz - z
-				dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
-				if dist > radius {
-					continue
-				}
+	if isTendrilsClicking {
+		// `#minecraft:shrieker_can_listen`: `SculkShriekerBlockEntity` listens within integer
+		// `BlockPos.distSqr <= 64` (radius 8) when triggered by a non-spectator player!
+		if source.Player != nil && source.Player.Snapshot().GameMode != GameModeSpectator {
+			maxR := int(SculkShriekerRelayRadius)
+			minY := by - maxR
+			if minY < world.MinY {
+				minY = world.MinY
+			}
+			maxY := by + maxR
+			if maxY >= world.MinY+world.WorldHeight {
+				maxY = world.MinY + world.WorldHeight - 1
+			}
+			rSqInt := maxR * maxR
 
-				// Sensor only listens while in the "inactive" phase and without an already-queued vibration.
-				if phase != SculkSensorPhaseInactive {
-					continue
+			for sy := minY; sy <= maxY; sy++ {
+				for sz := bz - maxR; sz <= bz+maxR; sz++ {
+					for sx := bx - maxR; sx <= bx+maxR; sx++ {
+						ibx, iby, ibz := sx-bx, sy-by, sz-bz
+						if ibx*ibx+iby*iby+ibz*ibz > rSqInt {
+							continue
+						}
+						canSummon, shrieking, _, ok := ParseSculkShriekerState(cache.GetBlock(sx, sy, sz))
+						if !ok || shrieking {
+							continue
+						}
+						key := makeBrewingKey(normDim, sx, sy, sz)
+						be := st.shriekers[key]
+						if be != nil && (be.ShriekingTicks > 0 || be.Listener.Current != nil) {
+							continue
+						}
+						cx, cy, cz := float64(sx)+0.5, float64(sy)+0.5, float64(sz)+0.5
+						if cache.IsVibrationOccluded(x, y, z, cx, cy, cz) {
+							continue
+						}
+						dx, dy, dz := cx-x, cy-y, cz-z
+						dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+						info := world.VibrationInfoData{
+							GameEvent:      canonicalEv,
+							Distance:       float32(dist),
+							Pos:            [3]float64{x, y, z},
+							HasSourceUUID:  hasSrcUUID,
+							SourceUUID:     srcUUID,
+							SourceEntityID: srcID,
+						}
+						if be == nil {
+							be = &SculkShriekerBlockEntity{
+								Dimension: normDim,
+								X:         sx,
+								Y:         sy,
+								Z:         sz,
+								CanSummon: canSummon,
+								Listener:  world.NewVibrationSystemData(),
+							}
+							st.shriekers[key] = be
+						}
+						be.CanSummon = canSummon
+						if be.Listener.Selector.AddCandidate(info, currentTick) {
+							be.TargetPlayer = source.Player
+							cp := *be
+							cp.Listener = be.Listener.Clone()
+							updatedShriekers = append(updatedShriekers, &cp)
+							scheduledCount++
+						}
+					}
 				}
-				key := makeBrewingKey(normDim, sx, sy, sz)
-				be := st.sensors[key]
-				if be != nil && (be.Phase != SculkSensorPhaseInactive || be.Pending != nil) {
-					continue
-				}
+			}
+		}
+	} else {
+		// Standard `#minecraft:vibrations` (`freq` in `1..15`): scan sensors within radius 16.
+		maxR := int(CalibratedSculkSensorRadius)
+		minY := by - maxR
+		if minY < world.MinY {
+			minY = world.MinY
+		}
+		maxY := by + maxR
+		if maxY >= world.MinY+world.WorldHeight {
+			maxY = world.MinY + world.WorldHeight - 1
+		}
 
-				// Calibrated sculk sensor frequency filtering:
-				if calibrated {
-					calFilter := cache.CalibratedSculkSensorInputPower(sx, sy, sz)
-					if calFilter > 0 && calFilter != freq {
+		for sy := minY; sy <= maxY; sy++ {
+			for sz := bz - maxR; sz <= bz+maxR; sz++ {
+				for sx := bx - maxR; sx <= bx+maxR; sx++ {
+					if excludeSensor != nil && excludeSensor.x == sx && excludeSensor.y == sy && excludeSensor.z == sz {
 						continue
 					}
-				}
-
-				// Wool occlusion check along the ray from vibration source to sensor center:
-				if IsVibrationOccluded(cache.GetBlock, x, y, z, cx, cy, cz) {
-					continue
-				}
-
-				if be == nil {
-					be = &SculkSensorBlockEntity{
-						Dimension:  normDim,
-						X:          sx,
-						Y:          sy,
-						Z:          sz,
-						Calibrated: calibrated,
-						Phase:      phase,
-						Power:      power,
+					// `SculkSensorBlockEntity$VibrationUser.canReceiveVibration`: ignore self place/destroy!
+					if (canonicalEv == GameEventBlockPlace || canonicalEv == GameEventBlockDestroy) &&
+						bx == sx && by == sy && bz == sz {
+						continue
 					}
-					st.sensors[key] = be
+					bState := cache.GetBlock(sx, sy, sz)
+					phase, power, _, calibrated, _, ok := ParseSculkSensorState(bState)
+					if !ok || phase != SculkSensorPhaseInactive {
+						continue
+					}
+					rInt := int(SculkSensorRadius)
+					if calibrated {
+						rInt = int(CalibratedSculkSensorRadius)
+					}
+					// `EuclideanGameEventListenerRegistry`: integer `BlockPos.distSqr <= radius * radius`!
+					ibx, iby, ibz := sx-bx, sy-by, sz-bz
+					if ibx*ibx+iby*iby+ibz*ibz > rInt*rInt {
+						continue
+					}
+
+					key := makeBrewingKey(normDim, sx, sy, sz)
+					be := st.sensors[key]
+					if be != nil {
+						ensureSensorListenerSynced(be)
+						if be.Phase != SculkSensorPhaseInactive || be.Listener.Current != nil {
+							continue
+						}
+					}
+
+					if calibrated {
+						if calFilter := cache.CalibratedSculkSensorInputPower(sx, sy, sz); calFilter > 0 && calFilter != freq {
+							continue
+						}
+					}
+
+					cx, cy, cz := float64(sx)+0.5, float64(sy)+0.5, float64(sz)+0.5
+					if cache.IsVibrationOccluded(x, y, z, cx, cy, cz) {
+						continue
+					}
+
+					dx, dy, dz := cx-x, cy-y, cz-z
+					dist := math.Sqrt(dx*dx + dy*dy + dz*dz)
+					info := world.VibrationInfoData{
+						GameEvent:      canonicalEv,
+						Distance:       float32(dist),
+						Pos:            [3]float64{x, y, z},
+						HasSourceUUID:  hasSrcUUID,
+						SourceUUID:     srcUUID,
+						SourceEntityID: srcID,
+					}
+
+					if be == nil {
+						be = &SculkSensorBlockEntity{
+							Dimension:  normDim,
+							X:          sx,
+							Y:          sy,
+							Z:          sz,
+							Calibrated: calibrated,
+							Phase:      phase,
+							Power:      power,
+							Listener:   world.NewVibrationSystemData(),
+						}
+						st.sensors[key] = be
+					}
+					be.Calibrated = calibrated
+					if be.Listener.Selector.AddCandidate(info, currentTick) {
+						s.syncSensorPendingFromListener(be, source.Player)
+						cp := *be
+						cp.Listener = be.Listener.Clone()
+						updatedSensors = append(updatedSensors, &cp)
+						scheduledCount++
+					}
 				}
-				be.Calibrated = calibrated
-				be.Pending = &PendingVibration{
-					Event:          canonicalEv,
-					Frequency:      freq,
-					SourceX:        x,
-					SourceY:        y,
-					SourceZ:        z,
-					Distance:       dist,
-					MaxDistance:    radius,
-					TicksRemaining: VibrationTravelTicks(dist),
-					Player:         source.Player,
-					EntityID:       srcID,
-					IsResonance:    isResonance,
-				}
-				scheduledCount++
 			}
 		}
 	}
 	st.mu.Unlock()
+
+	for _, snap := range updatedSensors {
+		pushSensorToWorldCache(cache, snap)
+	}
+	for _, snap := range updatedShriekers {
+		pushShriekerToWorldCache(cache, snap)
+	}
 
 	if scheduledCount > 0 {
 		_ = s.SaveSculk()
@@ -1118,7 +1312,7 @@ func (s *Server) hasUnoccludedSensorInRange(dim string, cache *world.Cache, x, y
 	bx := int(math.Floor(x))
 	by := int(math.Floor(y))
 	bz := int(math.Floor(z))
-	maxR := int(math.Ceil(CalibratedSculkSensorRadius))
+	maxR := int(CalibratedSculkSensorRadius)
 	minY := by - maxR
 	if minY < world.MinY {
 		minY = world.MinY
@@ -1136,17 +1330,12 @@ func (s *Server) hasUnoccludedSensorInRange(dim string, cache *world.Cache, x, y
 				if !ok || phase != SculkSensorPhaseInactive {
 					continue
 				}
-				radius := SculkSensorRadius
+				rInt := int(SculkSensorRadius)
 				if calibrated {
-					radius = CalibratedSculkSensorRadius
+					rInt = int(CalibratedSculkSensorRadius)
 				}
-				cx := float64(sx) + 0.5
-				cy := float64(sy) + 0.5
-				cz := float64(sz) + 0.5
-				dx := cx - x
-				dy := cy - y
-				dz := cz - z
-				if dx*dx+dy*dy+dz*dz > radius*radius {
+				ibx, iby, ibz := sx-bx, sy-by, sz-bz
+				if ibx*ibx+iby*iby+ibz*ibz > rInt*rInt {
 					continue
 				}
 				if calibrated {
@@ -1154,7 +1343,8 @@ func (s *Server) hasUnoccludedSensorInRange(dim string, cache *world.Cache, x, y
 						continue
 					}
 				}
-				if !IsVibrationOccluded(cache.GetBlock, x, y, z, cx, cy, cz) {
+				cx, cy, cz := float64(sx)+0.5, float64(sy)+0.5, float64(sz)+0.5
+				if !cache.IsVibrationOccluded(x, y, z, cx, cy, cz) {
 					return true
 				}
 			}
@@ -1170,13 +1360,15 @@ type resonanceEmission struct {
 	x, y, z    float64
 	freq       int
 	player     *PlayerSession
+	entityID   int32
 	fromSensor brewingKey
 }
 
-type shriekerRelay struct {
-	dim        string
+type tendrilsClickEmission struct {
+	dim      string
 	sx, sy, sz int
-	player     *PlayerSession
+	player   *PlayerSession
+	entityID int32
 }
 
 // TickAllSculk advances all tracked sculk sensors, calibrated sculk sensors,
@@ -1185,6 +1377,7 @@ func (s *Server) TickAllSculk() {
 	if s == nil {
 		return
 	}
+	s.syncSculkFromWorldCaches()
 	s.tickPlayerWardenTrackers()
 	s.tickSculkBlocks()
 }
@@ -1245,6 +1438,8 @@ func (s *Server) tickSculkBlocks() {
 	st := s.sculkState()
 	st.mu.Lock()
 	s.ensureSculkLoadedLocked(st)
+	st.tickCounter++
+	currentTick := st.tickCounter
 
 	sensorKeys := make([]brewingKey, 0, len(st.sensors))
 	for k := range st.sensors {
@@ -1265,35 +1460,41 @@ func (s *Server) tickSculkBlocks() {
 	sortBrewingKeys(catalystKeys)
 
 	var resonances []resonanceEmission
-	var relays []shriekerRelay
+	var clicks []tendrilsClickEmission
 	dirty := false
 
 	for _, k := range sensorKeys {
-		changed, resList, relay := s.tickSingleSculkSensor(k)
+		changed, resList, click := s.tickSingleSculkSensor(k, currentTick)
 		if changed {
 			dirty = true
 		}
 		if len(resList) > 0 {
 			resonances = append(resonances, resList...)
 		}
-		if relay != nil {
-			relays = append(relays, *relay)
+		if click != nil {
+			clicks = append(clicks, *click)
 		}
 	}
 
 	for _, r := range resonances {
 		from := r.fromSensor
 		s.emitGameEventInternal(r.dim, ResonateGameEvent(r.freq), r.x, r.y, r.z, VibrationSource{
-			Player: r.player,
+			Player:   r.player,
+			EntityID: r.entityID,
 		}, &from)
 	}
 
-	for _, rel := range relays {
-		s.relaySensorToNearbyShriekers(rel.dim, rel.sx, rel.sy, rel.sz, rel.player)
+	for _, cl := range clicks {
+		s.emitGameEventInternal(cl.dim, GameEventSculkSensorTendrilsClicking,
+			float64(cl.sx)+0.5, float64(cl.sy)+0.5, float64(cl.sz)+0.5,
+			VibrationSource{
+				Player:   cl.player,
+				EntityID: cl.entityID,
+			}, nil)
 	}
 
 	for _, k := range shriekerKeys {
-		if s.tickSingleSculkShrieker(k) {
+		if s.tickSingleSculkShrieker(k, currentTick) {
 			dirty = true
 		}
 	}
@@ -1324,7 +1525,7 @@ func sortBrewingKeys(keys []brewingKey) {
 	})
 }
 
-func (s *Server) tickSingleSculkSensor(k brewingKey) (changed bool, resonances []resonanceEmission, relay *shriekerRelay) {
+func (s *Server) tickSingleSculkSensor(k brewingKey, currentTick int64) (changed bool, resonances []resonanceEmission, click *tendrilsClickEmission) {
 	cache := s.DimensionChunks(k.dim)
 	if cache == nil {
 		return false, nil, nil
@@ -1336,6 +1537,7 @@ func (s *Server) tickSingleSculkSensor(k brewingKey) (changed bool, resonances [
 		st.mu.Lock()
 		delete(st.sensors, k)
 		st.mu.Unlock()
+		cache.DeleteWorldSculkSensorState(k.x, k.y, k.z)
 		res := cache.UpdateComparatorsAround(k.x, k.y, k.z)
 		if len(res.Changes) > 0 {
 			s.broadcastDimensionBlockChanges(k.dim, cache, res.Changes, res.LightChanged)
@@ -1351,6 +1553,10 @@ func (s *Server) tickSingleSculkSensor(k brewingKey) (changed bool, resonances [
 		return false, nil, nil
 	}
 	be.Calibrated = calibrated
+	if be.Phase == "" || be.Phase != curPhase {
+		be.Phase = curPhase
+	}
+	ensureSensorListenerSynced(be)
 
 	var (
 		nextPhase      = be.Phase
@@ -1360,64 +1566,120 @@ func (s *Server) tickSingleSculkSensor(k brewingKey) (changed bool, resonances [
 		playClickStop  bool
 		activatedFreq  int
 		activatedBy    *PlayerSession
+		activatedEntID int32
+		beSnapshot     SculkSensorBlockEntity
 	)
 
-	switch be.Phase {
-	case "", SculkSensorPhaseInactive:
-		if be.Pending != nil {
-			be.Pending.TicksRemaining--
-			if be.Pending.TicksRemaining <= 0 {
-				vib := be.Pending
-				be.Pending = nil
-				if curPhase == SculkSensorPhaseInactive {
-					nextPhase = SculkSensorPhaseActive
-					if calibrated {
-						be.PhaseTicks = CalibratedSculkSensorActiveTicks
-					} else {
-						be.PhaseTicks = SculkSensorActiveTicks
-					}
-					nextPower = SculkSensorSignalForDistance(vib.Distance, vib.MaxDistance)
-					be.Phase = nextPhase
-					be.Power = nextPower
-					be.LastVibrationFrequency = vib.Frequency
-					updateBlock = true
-					playClickStart = !waterlogged
-					activatedFreq = vib.Frequency
-					activatedBy = vib.Player
-					if activatedBy == nil && vib.EntityID != 0 {
-						activatedBy = s.playerByEntityID(vib.EntityID)
-					}
-					changed = true
-				}
-			}
-		}
-
-	case SculkSensorPhaseActive:
-		be.PhaseTicks--
-		if be.PhaseTicks <= 0 {
-			nextPhase = SculkSensorPhaseCooldown
-			nextPower = 0
-			be.Phase = nextPhase
-			be.PhaseTicks = SculkSensorCooldownTicks
-			be.Power = 0
-			updateBlock = true
-			playClickStop = !waterlogged
-			changed = true
-		}
-
-	case SculkSensorPhaseCooldown:
-		be.PhaseTicks--
-		if be.PhaseTicks <= 0 {
-			nextPhase = SculkSensorPhaseInactive
-			nextPower = 0
-			be.Phase = nextPhase
-			be.PhaseTicks = 0
-			be.Power = 0
-			updateBlock = true
+	// 1. `VibrationSystem$Ticker.tick`: promote `VibrationSelector` candidate when `Current == nil`,
+	//    and advance in-flight `TravelTimeInTicks`!
+	if be.Listener.Current == nil {
+		if cand, ok := be.Listener.Selector.ChosenCandidate(currentTick); ok {
+			be.Listener.Current = cand
+			be.Listener.TravelTimeInTicks = int(math.Floor(float64(cand.Distance)))
+			be.Listener.Selector.StartOver()
 			changed = true
 		}
 	}
+	if be.Listener.Current != nil {
+		if be.Listener.TravelTimeInTicks > 0 {
+			be.Listener.TravelTimeInTicks--
+			changed = true
+		}
+		if be.Listener.TravelTimeInTicks <= 0 {
+			vib := be.Listener.Current
+			var prevPlayer *PlayerSession
+			var prevEntID int32
+			if be.Pending != nil {
+				prevPlayer = be.Pending.Player
+				prevEntID = be.Pending.EntityID
+			}
+			be.Listener.Current = nil
+			be.Listener.TravelTimeInTicks = 0
+			be.Pending = nil
+			changed = true
+
+			// Re-validate `canReceiveVibration` on arrival (`phase == inactive` & calibrated filter):
+			canActivate := curPhase == SculkSensorPhaseInactive
+			freq := VibrationFrequency(vib.GameEvent)
+			if canActivate && calibrated {
+				if calFilter := cache.CalibratedSculkSensorInputPower(k.x, k.y, k.z); calFilter > 0 && calFilter != freq {
+					canActivate = false
+				}
+			}
+			if canActivate && freq > 0 {
+				// `VibrationSystem$User.receiveVibration`: power uses integer BlockPos distance!
+				vbx := int(math.Floor(vib.Pos[0]))
+				vby := int(math.Floor(vib.Pos[1]))
+				vbz := int(math.Floor(vib.Pos[2]))
+				dbx, dby, dbz := vbx-k.x, vby-k.y, vbz-k.z
+				blockDist := float64(float32(math.Sqrt(float64(dbx*dbx + dby*dby + dbz*dbz))))
+				maxR := SculkSensorRadius
+				if calibrated {
+					maxR = CalibratedSculkSensorRadius
+				}
+				nextPower = SculkSensorSignalForDistance(blockDist, maxR)
+				nextPhase = SculkSensorPhaseActive
+				if calibrated {
+					be.PhaseTicks = CalibratedSculkSensorActiveTicks
+				} else {
+					be.PhaseTicks = SculkSensorActiveTicks
+				}
+				be.Phase = nextPhase
+				be.Power = nextPower
+				be.LastVibrationFrequency = freq
+				updateBlock = true
+				playClickStart = !waterlogged
+				activatedFreq = freq
+				activatedBy = s.resolveVibrationPlayer(vib, prevPlayer)
+				activatedEntID = vib.SourceEntityID
+				if activatedEntID == 0 {
+					activatedEntID = prevEntID
+				}
+				if activatedEntID == 0 && activatedBy != nil {
+					activatedEntID = activatedBy.EntityID
+				}
+			}
+		} else {
+			s.syncSensorPendingFromListener(be, nil)
+		}
+	} else {
+		// 2. Scheduled block tick for `ACTIVE -> COOLDOWN` (`30` / `10` ticks) and `COOLDOWN -> INACTIVE` (`10` ticks):
+		switch curPhase {
+		case SculkSensorPhaseActive:
+			be.PhaseTicks--
+			changed = true
+			if be.PhaseTicks <= 0 {
+				nextPhase = SculkSensorPhaseCooldown
+				nextPower = 0
+				be.Phase = nextPhase
+				be.PhaseTicks = SculkSensorCooldownTicks
+				be.Power = 0
+				updateBlock = true
+			}
+		case SculkSensorPhaseCooldown:
+			be.PhaseTicks--
+			changed = true
+			if be.PhaseTicks <= 0 {
+				nextPhase = SculkSensorPhaseInactive
+				nextPower = 0
+				be.Phase = nextPhase
+				be.PhaseTicks = 0
+				be.Power = 0
+				updateBlock = true
+				// Vanilla `SculkSensorBlock.tick` (`sculk_javap.txt:2461-2481`):
+				// `SCULK_CLICKING_STOP` plays on `COOLDOWN -> INACTIVE` when `!waterlogged`!
+				playClickStop = !waterlogged
+			}
+		}
+	}
+
+	beSnapshot = *be
+	beSnapshot.Listener = be.Listener.Clone()
 	st.mu.Unlock()
+
+	if changed {
+		pushSensorToWorldCache(cache, &beSnapshot)
+	}
 
 	if updateBlock {
 		s.BindNoteBlockAndJukeboxRedstone(k.dim)
@@ -1446,93 +1708,38 @@ func (s *Server) tickSingleSculkSensor(k brewingKey) (changed bool, resonances [
 	}
 
 	if activatedFreq > 0 {
-		initSculkStates()
-		// Check adjacent blocks for minecraft:amethyst_block resonance!
-		adjOffsets := [6][3]int{
-			{1, 0, 0}, {-1, 0, 0},
-			{0, 1, 0}, {0, -1, 0},
-			{0, 0, 1}, {0, 0, -1},
+		for _, am := range cache.FindAdjacentAmethystBlocks(k.x, k.y, k.z) {
+			ax, ay, az := am[0], am[1], am[2]
+			s.BroadcastDimensionChunk(k.dim, int32(ax>>4), int32(az>>4), PlaySoundPacketID,
+				EncodeSoundPacket(SoundAmethystBlockResonate, SoundSourceBlocks, float64(ax)+0.5, float64(ay)+0.5, float64(az)+0.5, 1.0, 1.0, 0))
+			resonances = append(resonances, resonanceEmission{
+				dim:        k.dim,
+				x:          float64(ax) + 0.5,
+				y:          float64(ay) + 0.5,
+				z:          float64(az) + 0.5,
+				freq:       activatedFreq,
+				player:     activatedBy,
+				entityID:   activatedEntID,
+				fromSensor: k,
+			})
 		}
-		for _, off := range adjOffsets {
-			ax, ay, az := k.x+off[0], k.y+off[1], k.z+off[2]
-			if ay < world.MinY || ay >= world.MinY+world.WorldHeight {
-				continue
-			}
-			if cache.GetBlock(ax, ay, az) == stateAmethystBlock && stateAmethystBlock != world.StateAir {
-				s.BroadcastDimensionChunk(k.dim, int32(ax>>4), int32(az>>4), PlaySoundPacketID,
-					EncodeSoundPacket(SoundAmethystBlockResonate, SoundSourceBlocks, float64(ax)+0.5, float64(ay)+0.5, float64(az)+0.5, 1.0, 1.0, 0))
-				resonances = append(resonances, resonanceEmission{
-					dim:        k.dim,
-					x:          float64(ax) + 0.5,
-					y:          float64(ay) + 0.5,
-					z:          float64(az) + 0.5,
-					freq:       activatedFreq,
-					player:     activatedBy,
-					fromSensor: k,
-				})
-			}
-		}
-
-		if activatedBy != nil {
-			relay = &shriekerRelay{
-				dim:    k.dim,
-				sx:     k.x,
-				sy:     k.y,
-				sz:     k.z,
-				player: activatedBy,
-			}
+		click = &tendrilsClickEmission{
+			dim:      k.dim,
+			sx:       k.x,
+			sy:       k.y,
+			sz:       k.z,
+			player:   activatedBy,
+			entityID: activatedEntID,
 		}
 	}
 
-	return changed, resonances, relay
-}
-
-func (s *Server) relaySensorToNearbyShriekers(dim string, sx, sy, sz int, player *PlayerSession) {
-	if s == nil || player == nil {
-		return
-	}
-	normDim := world.NormalizeDimension(dim)
-	cache := s.DimensionChunks(normDim)
-	if cache == nil {
-		return
-	}
-	maxR := int(math.Ceil(SculkShriekerRelayRadius))
-	minY := sy - maxR
-	if minY < world.MinY {
-		minY = world.MinY
-	}
-	maxY := sy + maxR
-	if maxY >= world.MinY+world.WorldHeight {
-		maxY = world.MinY + world.WorldHeight - 1
-	}
-
-	srcX, srcY, srcZ := float64(sx)+0.5, float64(sy)+0.5, float64(sz)+0.5
-	for y := minY; y <= maxY; y++ {
-		for z := sz - maxR; z <= sz+maxR; z++ {
-			for x := sx - maxR; x <= sx+maxR; x++ {
-				if !IsSculkShriekerBlock(cache.GetBlock(x, y, z)) {
-					continue
-				}
-				dx := (float64(x) + 0.5) - srcX
-				dy := (float64(y) + 0.5) - srcY
-				dz := (float64(z) + 0.5) - srcZ
-				if dx*dx+dy*dy+dz*dz > SculkShriekerRelayRadius*SculkShriekerRelayRadius {
-					continue
-				}
-				if IsVibrationOccluded(cache.GetBlock, srcX, srcY, srcZ, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5) {
-					continue
-				}
-				if s.TriggerSculkShriekerAt(normDim, x, y, z, player) {
-					return
-				}
-			}
-		}
-	}
+	return changed, resonances, click
 }
 
 // StepOnSculkShrieker triggers a `minecraft:sculk_shrieker` at (x, y, z) when
-// session steps directly on top of it (unless sneaking, in which case the step
-// is suppressed and "Sneak 100" `minecraft:adventure/avoid_vibration` is granted).
+// session steps directly on top of it (`SculkShriekerBlock.stepOn`):
+//   - If sneaking, suppresses activation and grants `minecraft:adventure/avoid_vibration` ("Sneak 100").
+//   - Otherwise calls `TriggerSculkShriekerAt` immediately (0 travel delay).
 func (s *Server) StepOnSculkShrieker(session *PlayerSession, x, y, z int) bool {
 	if s == nil || session == nil {
 		return false
@@ -1554,12 +1761,13 @@ func (s *Server) StepOnSculkShrieker(session *PlayerSession, x, y, z int) bool {
 //   - If `sneaking` (or `session.IsSneaking()`) is true, suppresses activation
 //     and grants `minecraft:adventure/avoid_vibration` ("Sneak 100") to `session`.
 //   - Otherwise immediately activates an `inactive` sensor with `power=15` and
-//     `last_vibration_frequency=1` (`minecraft:step`), respecting calibrated
-//     frequency filtering, amethyst resonance, and shrieker relay.
+//     `last_vibration_frequency=1` (`minecraft:step`), emitting amethyst resonance
+//     and `minecraft:sculk_sensor_tendrils_clicking`.
 func (s *Server) StepOnSculkSensor(session *PlayerSession, entityID int32, x, y, z int, sneaking bool) bool {
 	if s == nil {
 		return false
 	}
+	s.syncSculkFromWorldCaches()
 	if session != nil && session.IsSneaking() {
 		sneaking = true
 	}
@@ -1611,6 +1819,7 @@ func (s *Server) StepOnSculkSensor(session *PlayerSession, entityID int32, x, y,
 			X:         x,
 			Y:         y,
 			Z:         z,
+			Listener:  world.NewVibrationSystemData(),
 		}
 		st.sensors[key] = be
 	}
@@ -1624,7 +1833,11 @@ func (s *Server) StepOnSculkSensor(session *PlayerSession, entityID int32, x, y,
 	be.Power = world.MaxRedstonePower
 	be.LastVibrationFrequency = 1
 	be.Pending = nil
+	beSnapshot := *be
+	beSnapshot.Listener = be.Listener.Clone()
 	st.mu.Unlock()
+
+	pushSensorToWorldCache(cache, &beSnapshot)
 
 	s.BindNoteBlockAndJukeboxRedstone(normDim)
 	var targetState uint16
@@ -1653,25 +1866,33 @@ func (s *Server) StepOnSculkSensor(session *PlayerSession, entityID int32, x, y,
 			EntityID: entityID,
 		}, &from)
 	}
-	if session != nil {
-		s.relaySensorToNearbyShriekers(normDim, x, y, z, session)
-	}
+	s.emitGameEventInternal(normDim, GameEventSculkSensorTendrilsClicking,
+		float64(x)+0.5, float64(y)+0.5, float64(z)+0.5,
+		VibrationSource{
+			Player:   session,
+			EntityID: entityID,
+		}, nil)
 	_ = s.SaveSculk()
 	return true
 }
 
-// TriggerSculkShriekerAt activates a `minecraft:sculk_shrieker` at (x, y, z) in dim:
-//   - Sets `shrieking=true` for 90 ticks, broadcasts the shriek sound, and emits
-//     `minecraft:shriek` (frequency 15).
-//   - When `can_summon=true` and player != nil (and not on warning cooldown),
-//     increments the player's warning level (1..4), applies `minecraft:darkness`
-//     (260 ticks) to survival/adventure players within 40 blocks, and invokes
-//     the Warden summon hook when warning level reaches 4.
+// TriggerSculkShriekerAt activates a `minecraft:sculk_shrieker` at (x, y, z) in dim
+// (`SculkShriekerBlockEntity.tryShriek` in vanilla 26.1.2):
+//   - Requires a non-spectator `player` and `shrieking == false`.
+//   - When `can_summon == true`, evaluates `WardenSpawnTracker.tryWarn` (checking
+//     the 48-block Warden-present hook and 200-tick warning cooldown; if on cooldown,
+//     returns `false` without shrieking) and stores `warning_level` (`1..4`) on the
+//     block entity.
+//   - Sets `shrieking = true` for `90` ticks, plays `block.sculk_shrieker.shriek`,
+//     and emits `minecraft:shriek`. At tick `90` (`tryRespond`, or on break if broken
+//     mid-shriek), applies `Darkness` (`260` ticks, radius `40`) and summons a Warden
+//     if `warning_level >= 4`.
 func (s *Server) TriggerSculkShriekerAt(dim string, x, y, z int, player *PlayerSession) bool {
-	if s == nil {
+	if s == nil || player == nil {
 		return false
 	}
-	if player != nil && player.Snapshot().GameMode == GameModeSpectator {
+	s.syncSculkFromWorldCaches()
+	if player.Snapshot().GameMode == GameModeSpectator {
 		return false
 	}
 	s.EnsureWardenSummonHook()
@@ -1690,25 +1911,53 @@ func (s *Server) TriggerSculkShriekerAt(dim string, x, y, z int, player *PlayerS
 	s.ensureSculkLoadedLocked(st)
 	key := makeBrewingKey(normDim, x, y, z)
 	be := st.shriekers[key]
-	if be != nil && (be.ShriekingTicks > 0 || be.CooldownTicks > 0) {
+	if be != nil && be.ShriekingTicks > 0 {
 		st.mu.Unlock()
 		return false
 	}
+	presentHook := st.wardenPresentHook
+	st.mu.Unlock()
+
+	sx, sy, sz := float64(x)+0.5, float64(y)+0.5, float64(z)+0.5
+	newWarningLevel := 0
+	wardenAlreadyPresent := false
+	if canSummon {
+		if presentHook != nil && presentHook(normDim, sx, sy, sz, WardenWarningCopyRadius) {
+			wardenAlreadyPresent = true
+			newWarningLevel = 0
+		} else {
+			lvl, incremented := s.tryIncrementPlayerWarningLevel(normDim, x, y, z, player)
+			if !incremented {
+				return false
+			}
+			newWarningLevel = lvl
+		}
+	}
+
+	st.mu.Lock()
+	be = st.shriekers[key]
 	if be == nil {
 		be = &SculkShriekerBlockEntity{
 			Dimension: normDim,
 			X:         x,
 			Y:         y,
 			Z:         z,
+			Listener:  world.NewVibrationSystemData(),
 		}
 		st.shriekers[key] = be
 	}
 	be.CanSummon = canSummon
+	if canSummon {
+		be.WarningLevel = newWarningLevel
+	}
 	be.ShriekingTicks = SculkShriekerDurationTicks
+	be.CooldownTicks = 0
 	be.TargetPlayer = player
-	summonHook := st.wardenSummonHook
-	presentHook := st.wardenPresentHook
+	beSnapshot := *be
+	beSnapshot.Listener = be.Listener.Clone()
 	st.mu.Unlock()
+
+	pushShriekerToWorldCache(cache, &beSnapshot)
 
 	nextState := SculkShriekerBlockState(canSummon, true, waterlogged)
 	if valid, lightChunks := cache.SetBlockWithLight(x, y, z, nextState); valid {
@@ -1721,47 +1970,60 @@ func (s *Server) TriggerSculkShriekerAt(dim string, x, y, z int, player *PlayerS
 	cz := int32(z >> 4)
 	if !waterlogged {
 		s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-			EncodeSoundPacket(SoundSculkShriekerShriek, SoundSourceBlocks, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, 2.0, 1.0, 0))
+			EncodeSoundPacket(SoundSculkShriekerShriek, SoundSourceBlocks, sx, sy, sz, 2.0, 1.0, 0))
+	}
+	if wardenAlreadyPresent {
+		s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+			EncodeSoundPacket(SoundWardenListeningAngry, SoundSourceHostile, sx, sy, sz, 10.0, 1.0, 0))
 	}
 
-	// Emit GameEventShriek (frequency 15).
-	s.EmitGameEvent(normDim, GameEventShriek, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5, VibrationSource{
+	// Emit `minecraft:shriek` (`warden_can_listen`).
+	s.EmitGameEvent(normDim, GameEventShriek, sx, sy, sz, VibrationSource{
 		Player: player,
 	})
 
-	if canSummon && player != nil {
-		sx, sy, sz := float64(x)+0.5, float64(y)+0.5, float64(z)+0.5
-		if presentHook != nil && presentHook(normDim, sx, sy, sz, WardenWarningCopyRadius) {
-			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-				EncodeSoundPacket(SoundWardenListeningAngry, SoundSourceHostile, sx, sy, sz, 10.0, 1.0, 0))
-		} else {
-			newLevel, incremented := s.tryIncrementPlayerWarningLevel(normDim, x, y, z, player)
-			if incremented {
-				s.applySculkShriekerDarkness(normDim, sx, sy, sz)
-				switch newLevel {
-				case 1:
-					s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-						EncodeSoundPacket(SoundWardenNearbyClose, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
-				case 2:
-					s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-						EncodeSoundPacket(SoundWardenNearbyCloser, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
-				case 3:
-					s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
-						EncodeSoundPacket(SoundWardenNearbyClosest, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
-				}
-				if newLevel >= WardenWarningMaxLevel && summonHook != nil {
-					spawnX, spawnY, spawnZ, found := s.FindWardenSpawnPosition(normDim, x, y, z)
-					if !found {
-						spawnX, spawnY, spawnZ = sx, float64(y)+1.0, sz
-					}
-					summonHook(normDim, spawnX, spawnY, spawnZ, x, y, z, player)
-				}
-			}
-		}
-	}
-
 	_ = s.SaveSculk()
 	return true
+}
+
+func (s *Server) tryRespondSculkShrieker(dim string, x, y, z, warningLevel int, targetPlayer *PlayerSession) {
+	if s == nil || warningLevel <= 0 {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	st := s.sculkState()
+	st.mu.Lock()
+	summonHook := st.wardenSummonHook
+	st.mu.Unlock()
+
+	sx, sy, sz := float64(x)+0.5, float64(y)+0.5, float64(z)+0.5
+	cx, cz := int32(x>>4), int32(z>>4)
+
+	summoned := false
+	if warningLevel >= WardenWarningMaxLevel && summonHook != nil {
+		spawnX, spawnY, spawnZ, found := s.FindWardenSpawnPosition(normDim, x, y, z)
+		if !found {
+			spawnX, spawnY, spawnZ = sx, float64(y)+1.0, sz
+		}
+		summoned = summonHook(normDim, spawnX, spawnY, spawnZ, x, y, z, targetPlayer)
+	}
+	if !summoned {
+		switch warningLevel {
+		case 1:
+			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundWardenNearbyClose, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
+		case 2:
+			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundWardenNearbyCloser, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
+		case 3:
+			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundWardenNearbyClosest, SoundSourceHostile, sx, sy, sz, 5.0, 1.0, 0))
+		default:
+			s.BroadcastDimensionChunk(normDim, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundWardenListeningAngry, SoundSourceHostile, sx, sy, sz, 10.0, 1.0, 0))
+		}
+	}
+	s.applySculkShriekerDarkness(normDim, sx, sy, sz)
 }
 
 // ResolvePlayerPlacedSculkShriekerState returns the block state for a player-placed
@@ -1773,12 +2035,12 @@ func ResolvePlayerPlacedSculkShriekerState(waterlogged bool) uint16 {
 
 // OnBreakSculkShriekerAt cleans up runtime state when a `minecraft:sculk_shrieker`
 // at (x, y, z) in dim is broken, and if it was broken mid-shriek (`shrieking=true`)
-// with `can_summon=true` and an active target player, ensures the darkness/warning
-// response still completes (vanilla SculkShriekerBlock.onRemove -> tryRespond).
+// with `can_summon=true` and `warning_level > 0`, runs `tryRespond` (`SculkShriekerBlock.affectNeighborsAfterRemoval`).
 func (s *Server) OnBreakSculkShriekerAt(dim string, x, y, z int, brokenState uint16) {
 	if s == nil {
 		return
 	}
+	s.syncSculkFromWorldCaches()
 	normDim := world.NormalizeDimension(dim)
 	key := makeBrewingKey(normDim, x, y, z)
 	st := s.sculkState()
@@ -1787,8 +2049,14 @@ func (s *Server) OnBreakSculkShriekerAt(dim string, x, y, z int, brokenState uin
 	be := st.shriekers[key]
 	delete(st.shriekers, key)
 	st.mu.Unlock()
-	if be != nil && be.ShriekingTicks > 0 && be.CanSummon {
-		s.applySculkShriekerDarkness(normDim, float64(x)+0.5, float64(y)+0.5, float64(z)+0.5)
+	if cache := s.DimensionChunks(normDim); cache != nil {
+		cache.DeleteWorldSculkShriekerState(x, y, z)
+	}
+	canSummon, shrieking, _, ok := ParseSculkShriekerState(brokenState)
+	if be != nil && (shrieking || be.ShriekingTicks > 0) && (canSummon || be.CanSummon) && be.WarningLevel > 0 {
+		s.tryRespondSculkShrieker(normDim, x, y, z, be.WarningLevel, be.TargetPlayer)
+	} else if ok && shrieking && canSummon && be != nil && be.WarningLevel > 0 {
+		s.tryRespondSculkShrieker(normDim, x, y, z, be.WarningLevel, be.TargetPlayer)
 	}
 	_ = s.SaveSculk()
 }
@@ -1807,7 +2075,8 @@ func (s *Server) tryIncrementPlayerWarningLevel(dim string, sx, sy, sz int, play
 	baseLevel := tr.WarningLevel
 	tr.mu.Unlock()
 
-	// Copy highest warning level from any player within 48 blocks in the same dimension.
+	// `WardenSpawnTracker.tryWarn`: search alive non-spectator players within 16 blocks (`PLAYER_SEARCH_RADIUS`),
+	// copy highest warning level, increment by 1, and copy updated tracker to all nearby players within 16 blocks!
 	s.playersMu.RLock()
 	sessions := make([]*PlayerSession, 0, len(s.players))
 	for _, sess := range s.players {
@@ -1816,17 +2085,33 @@ func (s *Server) tryIncrementPlayerWarningLevel(dim string, sx, sy, sz int, play
 	s.playersMu.RUnlock()
 
 	cx, cy, cz := float64(sx)+0.5, float64(sy)+0.5, float64(sz)+0.5
+	var nearbyPlayers []*PlayerSession
 	for _, other := range sessions {
-		if other == nil || other == player || world.NormalizeDimension(other.Dimension()) != dim {
+		if other == nil || world.NormalizeDimension(other.Dimension()) != dim {
 			continue
 		}
 		snap := other.Snapshot()
+		if snap.GameMode == GameModeSpectator {
+			continue
+		}
 		dx := snap.X - cx
 		dy := snap.Y - cy
 		dz := snap.Z - cz
-		if dx*dx+dy*dy+dz*dz <= WardenWarningCopyRadius*WardenWarningCopyRadius {
-			if otherLvl := other.PlayerWarningLevel(); otherLvl > baseLevel {
-				baseLevel = otherLvl
+		if dx*dx+dy*dy+dz*dz < WardenPlayerSearchRadius*WardenPlayerSearchRadius {
+			nearbyPlayers = append(nearbyPlayers, other)
+			if other != player {
+				if otherTr := getPlayerWardenTracker(other); otherTr != nil {
+					otherTr.mu.Lock()
+					if otherTr.CooldownTicks > 0 {
+						lvl := otherTr.WarningLevel
+						otherTr.mu.Unlock()
+						return lvl, false
+					}
+					if otherTr.WarningLevel > baseLevel {
+						baseLevel = otherTr.WarningLevel
+					}
+					otherTr.mu.Unlock()
+				}
 			}
 		}
 	}
@@ -1841,6 +2126,13 @@ func (s *Server) tryIncrementPlayerWarningLevel(dim string, sx, sy, sz int, play
 	tr.CooldownTicks = WardenWarningCooldownTicks
 	tr.TicksSinceLastWarning = 0
 	tr.mu.Unlock()
+
+	for _, near := range nearbyPlayers {
+		if near == player {
+			continue
+		}
+		near.SetPlayerWardenTrackerState(nextLevel, WardenWarningCooldownTicks, 0)
+	}
 
 	return nextLevel, true
 }
@@ -1950,7 +2242,7 @@ func (s *Server) FindWardenSpawnPosition(dim string, sx, sy, sz int) (spawnX, sp
 	return float64(sx) + 0.5, float64(sy) + 1.0, float64(sz) + 0.5, false
 }
 
-func (s *Server) tickSingleSculkShrieker(k brewingKey) bool {
+func (s *Server) tickSingleSculkShrieker(k brewingKey, currentTick int64) bool {
 	cache := s.DimensionChunks(k.dim)
 	if cache == nil {
 		return false
@@ -1961,6 +2253,7 @@ func (s *Server) tickSingleSculkShrieker(k brewingKey) bool {
 		st.mu.Lock()
 		delete(st.shriekers, k)
 		st.mu.Unlock()
+		cache.DeleteWorldSculkShriekerState(k.x, k.y, k.z)
 		return true
 	}
 
@@ -1971,43 +2264,97 @@ func (s *Server) tickSingleSculkShrieker(k brewingKey) bool {
 		st.mu.Unlock()
 		return false
 	}
-	changed := false
-	finishShriek := false
-	if be.ShriekingTicks > 0 {
-		be.ShriekingTicks--
-		if be.ShriekingTicks <= 0 {
-			be.CooldownTicks = 20
-			finishShriek = true
-			changed = true
-		}
-	} else if be.CooldownTicks > 0 {
-		be.CooldownTicks--
-		if be.CooldownTicks <= 0 {
-			delete(st.shriekers, k)
+	be.CanSummon = canSummon
+
+	var (
+		changed         bool
+		arrivedPlayer   *PlayerSession
+		triggerFromVib  bool
+		finishShriek    bool
+		respWarnLevel   int
+		respTarget      *PlayerSession
+		beSnapshot      SculkShriekerBlockEntity
+	)
+
+	// 1. `VibrationSystem$Ticker.tick` on `SculkShriekerBlockEntity`:
+	if be.Listener.Current == nil {
+		if cand, ok := be.Listener.Selector.ChosenCandidate(currentTick); ok {
+			be.Listener.Current = cand
+			be.Listener.TravelTimeInTicks = int(math.Floor(float64(cand.Distance)))
+			be.Listener.Selector.StartOver()
 			changed = true
 		}
 	}
+	if be.Listener.Current != nil {
+		if be.Listener.TravelTimeInTicks > 0 {
+			be.Listener.TravelTimeInTicks--
+			changed = true
+		}
+		if be.Listener.TravelTimeInTicks <= 0 {
+			vib := be.Listener.Current
+			prevTarget := be.TargetPlayer
+			be.Listener.Current = nil
+			be.Listener.TravelTimeInTicks = 0
+			changed = true
+			if !shrieking && be.ShriekingTicks <= 0 {
+				arrivedPlayer = s.resolveVibrationPlayer(vib, prevTarget)
+				if arrivedPlayer != nil {
+					triggerFromVib = true
+				}
+			}
+		}
+	}
+
+	// 2. Scheduled 90-tick shriek completion (`SculkShriekerBlock.tick` -> `shrieking=false` + `tryRespond`):
+	if !triggerFromVib && be.ShriekingTicks > 0 {
+		be.ShriekingTicks--
+		changed = true
+		if be.ShriekingTicks <= 0 {
+			be.ShriekingTicks = 0
+			finishShriek = true
+			respWarnLevel = be.WarningLevel
+			respTarget = be.TargetPlayer
+		}
+	}
+
+	beSnapshot = *be
+	beSnapshot.Listener = be.Listener.Clone()
 	st.mu.Unlock()
 
-	if finishShriek && shrieking {
-		nextState := SculkShriekerBlockState(canSummon, false, waterlogged)
-		if valid, lightChunks := cache.SetBlockWithLight(k.x, k.y, k.z, nextState); valid {
-			s.broadcastBlockAndLightUpdate(k.x, k.y, k.z, nextState, lightChunks)
-		} else {
-			cache.SetBlock(k.x, k.y, k.z, nextState)
+	if changed {
+		pushShriekerToWorldCache(cache, &beSnapshot)
+	}
+
+	if triggerFromVib && arrivedPlayer != nil {
+		s.TriggerSculkShriekerAt(k.dim, k.x, k.y, k.z, arrivedPlayer)
+		return true
+	}
+
+	if finishShriek {
+		if shrieking {
+			nextState := SculkShriekerBlockState(canSummon, false, waterlogged)
+			if valid, lightChunks := cache.SetBlockWithLight(k.x, k.y, k.z, nextState); valid {
+				s.broadcastBlockAndLightUpdate(k.x, k.y, k.z, nextState, lightChunks)
+			} else {
+				cache.SetBlock(k.x, k.y, k.z, nextState)
+			}
+		}
+		if canSummon && respWarnLevel > 0 {
+			s.tryRespondSculkShrieker(k.dim, k.x, k.y, k.z, respWarnLevel, respTarget)
 		}
 	}
 	return changed
 }
 
-// --- Sculk Catalyst & Sculk Spread Mechanics ---
+// --- Sculk Catalyst & SculkSpreader Cursor Mechanics ---
 
 // TriggerSculkCatalystOnMobDeath checks whether a mob dying at (mobX, mobY, mobZ)
-// in dim with xpReward (> 0) is within 8 blocks of an unoccluded
-// `minecraft:sculk_catalyst`. If so, the nearest catalyst blooms, spreads sculk
-// (`minecraft:sculk`, `minecraft:sculk_vein`, and rare sensors/shriekers for high
-// charge), grants `minecraft:adventure/kill_mob_near_sculk_catalyst` ("It Spreads")
-// to killer, and returns true (indicating the XP was consumed by the catalyst).
+// in dim with xpReward (> 0) is within integer `BlockPos.distSqr <= 64` (radius 8)
+// of a `minecraft:sculk_catalyst` (`SculkCatalystBlockEntity$CatalystListener`,
+// NOT occluded by wool!). If so, the closest catalyst blooms (`8` ticks), spawns
+// `SculkSpreader` `ChargeCursor`s at `BlockPos.containing(mobX, mobY + 0.5, mobZ)`,
+// grants `minecraft:adventure/kill_mob_near_sculk_catalyst` ("It Spreads") to killer,
+// and returns true (indicating the XP was consumed by the catalyst).
 func (s *Server) TriggerSculkCatalystOnMobDeath(
 	dim string,
 	mobX, mobY, mobZ float64,
@@ -2017,6 +2364,7 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 	if s == nil || xpReward <= 0 {
 		return false
 	}
+	s.syncSculkFromWorldCaches()
 	normDim := world.NormalizeDimension(dim)
 	cache := s.DimensionChunks(normDim)
 	if cache == nil {
@@ -2026,7 +2374,8 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 	bx := int(math.Floor(mobX))
 	by := int(math.Floor(mobY))
 	bz := int(math.Floor(mobZ))
-	maxR := int(math.Ceil(SculkCatalystListenRadius))
+	maxR := int(SculkCatalystListenRadius)
+	rSqInt := maxR * maxR
 	minY := by - maxR
 	if minY < world.MinY {
 		minY = world.MinY
@@ -2036,13 +2385,17 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 		maxY = world.MinY + world.WorldHeight - 1
 	}
 
-	bestDist2 := SculkCatalystListenRadius*SculkCatalystListenRadius + 1.0
+	bestDist2 := math.MaxFloat64
 	var found bool
 	var catX, catY, catZ int
 
 	for y := minY; y <= maxY; y++ {
 		for z := bz - maxR; z <= bz+maxR; z++ {
 			for x := bx - maxR; x <= bx+maxR; x++ {
+				ibx, iby, ibz := x-bx, y-by, z-bz
+				if ibx*ibx+iby*iby+ibz*ibz > rSqInt {
+					continue
+				}
 				if !IsSculkCatalystBlock(cache.GetBlock(x, y, z)) {
 					continue
 				}
@@ -2053,15 +2406,11 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 				dy := cy - mobY
 				dz := cz - mobZ
 				d2 := dx*dx + dy*dy + dz*dz
-				if d2 > SculkCatalystListenRadius*SculkCatalystListenRadius || d2 >= bestDist2 {
-					continue
+				if d2 < bestDist2 {
+					bestDist2 = d2
+					catX, catY, catZ = x, y, z
+					found = true
 				}
-				if IsVibrationOccluded(cache.GetBlock, mobX, mobY, mobZ, cx, cy, cz) {
-					continue
-				}
-				bestDist2 = d2
-				catX, catY, catZ = x, y, z
-				found = true
 			}
 		}
 	}
@@ -2070,7 +2419,7 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 		return false
 	}
 
-	// Activate catalyst bloom=true for 8 ticks.
+	// Activate catalyst `bloom = true` for `8` ticks (`SculkCatalystBlockEntity.bloom`).
 	bloomState := SculkCatalystBlockState(true)
 	if valid, lightChunks := cache.SetBlockWithLight(catX, catY, catZ, bloomState); valid {
 		s.broadcastBlockAndLightUpdate(catX, catY, catZ, bloomState, lightChunks)
@@ -2078,28 +2427,41 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 		cache.SetBlock(catX, catY, catZ, bloomState)
 	}
 
+	// `BlockPos.containing(pos.relative(Direction.UP, 0.5))`:
+	curX := int(math.Floor(mobX))
+	curY := int(math.Floor(mobY + 0.5))
+	curZ := int(math.Floor(mobZ))
+
 	st := s.sculkState()
 	st.mu.Lock()
 	s.ensureSculkLoadedLocked(st)
 	key := makeBrewingKey(normDim, catX, catY, catZ)
-	st.catalysts[key] = &SculkCatalystBlockEntity{
+	be := st.catalysts[key]
+	if be == nil {
+		be = &SculkCatalystBlockEntity{
+			Dimension: normDim,
+			X:         catX,
+			Y:         catY,
+			Z:         catZ,
+		}
+		st.catalysts[key] = be
+	}
+	be.BloomTicks = SculkCatalystBloomTicks
+	be.Cursors = world.BuildSculkSpreaderCursors(be.Cursors, curX, curY, curZ, xpReward)
+	beSnapshot := SculkCatalystBlockEntity{
 		Dimension:  normDim,
 		X:          catX,
 		Y:          catY,
 		Z:          catZ,
-		BloomTicks: SculkCatalystBloomTicks,
+		BloomTicks: be.BloomTicks,
+		Cursors:    append([]world.SculkChargeCursor(nil), be.Cursors...),
 	}
 	st.mu.Unlock()
 
+	pushCatalystToWorldCache(cache, &beSnapshot)
+
 	s.BroadcastDimensionChunk(normDim, int32(catX>>4), int32(catZ>>4), PlaySoundPacketID,
 		EncodeSoundPacket(SoundSculkCatalystBloom, SoundSourceBlocks, float64(catX)+0.5, float64(catY)+0.5, float64(catZ)+0.5, 2.0, 1.0, 0))
-
-	// Spread sculk around the mob death position (falling back to catalyst position if needed).
-	spreadOriginX, spreadOriginY, spreadOriginZ := bx, by, bz
-	if !s.hasSculkReplaceableAround(cache, spreadOriginX, spreadOriginY, spreadOriginZ) {
-		spreadOriginX, spreadOriginY, spreadOriginZ = catX, catY, catZ
-	}
-	s.SpreadSculkCharge(normDim, spreadOriginX, spreadOriginY, spreadOriginZ, xpReward, nil)
 
 	if killer != nil {
 		s.TriggerKillMobNearSculkCatalyst(killer)
@@ -2109,28 +2471,9 @@ func (s *Server) TriggerSculkCatalystOnMobDeath(
 	return true
 }
 
-func (s *Server) hasSculkReplaceableAround(cache *world.Cache, ox, oy, oz int) bool {
-	for dy := -2; dy <= 1; dy++ {
-		for dz := -2; dz <= 2; dz++ {
-			for dx := -2; dx <= 2; dx++ {
-				y := oy + dy
-				if y < world.MinY || y >= world.MinY+world.WorldHeight {
-					continue
-				}
-				if IsSculkReplaceableBlock(cache.GetBlock(ox+dx, y, oz+dz)) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// SpreadSculkCharge spreads `minecraft:sculk`, `minecraft:sculk_vein` (preserving
-// waterlogging underwater and discharging consumed vein faces), and (when
-// charge >= 10) rare `minecraft:sculk_sensor` / `minecraft:sculk_shrieker`
-// blocks around (originX, originY, originZ) in dim.
-// Returns the number of blocks converted to `minecraft:sculk`.
+// SpreadSculkCharge synchronously spreads `minecraft:sculk`, `minecraft:sculk_vein`,
+// and (when charge >= 10) rare `minecraft:sculk_sensor` / `minecraft:sculk_shrieker`
+// blocks around (originX, originY, originZ) in dim (standalone helper).
 func (s *Server) SpreadSculkCharge(dim string, originX, originY, originZ, charge int, rng *rand.Rand) int {
 	if s == nil || charge <= 0 {
 		return 0
@@ -2158,6 +2501,7 @@ func (s *Server) tickSingleSculkCatalyst(k brewingKey) bool {
 		st.mu.Lock()
 		delete(st.catalysts, k)
 		st.mu.Unlock()
+		cache.DeleteWorldSculkCatalystState(k.x, k.y, k.z)
 		return true
 	}
 
@@ -2168,14 +2512,94 @@ func (s *Server) tickSingleSculkCatalyst(k brewingKey) bool {
 		st.mu.Unlock()
 		return false
 	}
-	be.BloomTicks--
-	done := be.BloomTicks <= 0
-	if done {
-		delete(st.catalysts, k)
+	if be.rng == nil {
+		be.rng = rand.New(rand.NewSource(int64(k.x)*341873128712 + int64(k.z)*132897987541 + int64(k.y) + 0x5DEECE66D))
+	}
+	rng := be.rng
+	cursorsIn := make([]world.SculkChargeCursor, len(be.Cursors))
+	for i := range be.Cursors {
+		cursorsIn[i] = be.Cursors[i].Clone()
+	}
+
+	changed := false
+	finishBloom := false
+	if be.BloomTicks > 0 {
+		be.BloomTicks--
+		changed = true
+		if be.BloomTicks <= 0 {
+			be.BloomTicks = 0
+			finishBloom = true
+		}
 	}
 	st.mu.Unlock()
 
-	if done && bloom {
+	// `SculkCatalystBlockEntity.serverTick` -> `spreader.updateCursors(level, pos, random, true)`:
+	var spreadRes world.BlockUpdateResult
+	var nextCursors []world.SculkChargeCursor
+	if len(cursorsIn) > 0 {
+		nextCursors, spreadRes = cache.UpdateSculkCatalystCursorsAt(k.x, k.y, k.z, cursorsIn, rng)
+		changed = true
+	}
+
+	st.mu.Lock()
+	be = st.catalysts[k]
+	var beSnapshot SculkCatalystBlockEntity
+	stillTracked := false
+	if be != nil {
+		if len(cursorsIn) > 0 {
+			be.Cursors = nextCursors
+		}
+		// Register any newly grown sculk_sensor / sculk_shrieker block entities in serverSculkState!
+		for _, chg := range spreadRes.Changes {
+			if _, pw, _, cal, _, isSens := ParseSculkSensorState(chg.NewState); isSens {
+				sk := makeBrewingKey(k.dim, chg.Pos.X, chg.Pos.Y, chg.Pos.Z)
+				if _, exists := st.sensors[sk]; !exists {
+					st.sensors[sk] = &SculkSensorBlockEntity{
+						Dimension:  k.dim,
+						X:          chg.Pos.X,
+						Y:          chg.Pos.Y,
+						Z:          chg.Pos.Z,
+						Calibrated: cal,
+						Phase:      SculkSensorPhaseInactive,
+						Power:      pw,
+						Listener:   world.NewVibrationSystemData(),
+					}
+				}
+			} else if cs, _, _, isSh := ParseSculkShriekerState(chg.NewState); isSh {
+				sk := makeBrewingKey(k.dim, chg.Pos.X, chg.Pos.Y, chg.Pos.Z)
+				if _, exists := st.shriekers[sk]; !exists {
+					st.shriekers[sk] = &SculkShriekerBlockEntity{
+						Dimension: k.dim,
+						X:         chg.Pos.X,
+						Y:         chg.Pos.Y,
+						Z:         chg.Pos.Z,
+						CanSummon: cs,
+						Listener:  world.NewVibrationSystemData(),
+					}
+				}
+			}
+		}
+		beSnapshot = SculkCatalystBlockEntity{
+			Dimension:  k.dim,
+			X:          k.x,
+			Y:          k.y,
+			Z:          k.z,
+			BloomTicks: be.BloomTicks,
+			Cursors:    append([]world.SculkChargeCursor(nil), be.Cursors...),
+		}
+		stillTracked = true
+	}
+	st.mu.Unlock()
+
+	if stillTracked && changed {
+		pushCatalystToWorldCache(cache, &beSnapshot)
+	}
+
+	if len(spreadRes.Changes) > 0 {
+		s.broadcastDimensionBlockChanges(k.dim, cache, spreadRes.Changes, spreadRes.LightChanged)
+	}
+
+	if finishBloom && bloom {
 		idleState := SculkCatalystBlockState(false)
 		if valid, lightChunks := cache.SetBlockWithLight(k.x, k.y, k.z, idleState); valid {
 			s.broadcastBlockAndLightUpdate(k.x, k.y, k.z, idleState, lightChunks)
@@ -2183,10 +2607,10 @@ func (s *Server) tickSingleSculkCatalyst(k brewingKey) bool {
 			cache.SetBlock(k.x, k.y, k.z, idleState)
 		}
 	}
-	return done
+	return changed
 }
 
-// --- Disk Persistence (<WorldDir>/region/sculk.nbt) ---
+// --- Disk Sidecar & Chunk BlockEntity NBT Serialization ---
 
 func (s *Server) sculkSidecarPath() string {
 	if s == nil || s.cfg.WorldDir == "" {
@@ -2224,6 +2648,9 @@ func (s *Server) ensureSculkLoadedLocked(st *serverSculkState) {
 				continue
 			}
 			be := decodeSculkSensorNBT(comp)
+			if be.Listener.Selector.Candidate != nil && be.Listener.Selector.Tick > st.tickCounter {
+				st.tickCounter = be.Listener.Selector.Tick
+			}
 			key := makeBrewingKey(be.Dimension, be.X, be.Y, be.Z)
 			if _, exists := st.sensors[key]; !exists {
 				st.sensors[key] = be
@@ -2237,6 +2664,9 @@ func (s *Server) ensureSculkLoadedLocked(st *serverSculkState) {
 				continue
 			}
 			be := decodeSculkShriekerNBT(comp)
+			if be.Listener.Selector.Candidate != nil && be.Listener.Selector.Tick > st.tickCounter {
+				st.tickCounter = be.Listener.Selector.Tick
+			}
 			key := makeBrewingKey(be.Dimension, be.X, be.Y, be.Z)
 			if _, exists := st.shriekers[key]; !exists {
 				st.shriekers[key] = be
@@ -2279,7 +2709,21 @@ func (s *Server) LoadSculk() error {
 	st.mu.Lock()
 	st.loadedDisk = false
 	s.ensureSculkLoadedLocked(st)
+	var sensorsCopy []*SculkSensorBlockEntity
+	for _, be := range st.sensors {
+		if be != nil {
+			s.syncSensorPendingFromListener(be, nil)
+			cp := *be
+			cp.Listener = be.Listener.Clone()
+			sensorsCopy = append(sensorsCopy, &cp)
+		}
+	}
 	st.mu.Unlock()
+	for _, cp := range sensorsCopy {
+		if cache := s.DimensionChunks(cp.Dimension); cache != nil {
+			pushSensorToWorldCache(cache, cp)
+		}
+	}
 	return nil
 }
 
@@ -2302,7 +2746,8 @@ func (s *Server) SaveSculk() error {
 		if be == nil {
 			continue
 		}
-		if be.LastVibrationFrequency == 0 && be.Phase == SculkSensorPhaseInactive && be.Pending == nil {
+		ensureSensorListenerSynced(be)
+		if be.LastVibrationFrequency == 0 && be.Phase == SculkSensorPhaseInactive && be.Listener.IsIdle() {
 			continue
 		}
 		sensorElems = append(sensorElems, encodeSculkSensorNBT(be))
@@ -2310,7 +2755,7 @@ func (s *Server) SaveSculk() error {
 
 	var shriekerElems []nbt.Tag
 	for _, be := range st.shriekers {
-		if be == nil || (be.ShriekingTicks <= 0 && be.CooldownTicks <= 0) {
+		if be == nil || (be.ShriekingTicks <= 0 && be.CooldownTicks <= 0 && be.WarningLevel == 0 && be.Listener.IsIdle()) {
 			continue
 		}
 		shriekerElems = append(shriekerElems, encodeSculkShriekerNBT(be))
@@ -2318,7 +2763,7 @@ func (s *Server) SaveSculk() error {
 
 	var catalystElems []nbt.Tag
 	for _, be := range st.catalysts {
-		if be == nil || be.BloomTicks <= 0 {
+		if be == nil || (be.BloomTicks <= 0 && len(be.Cursors) == 0) {
 			continue
 		}
 		catalystElems = append(catalystElems, encodeSculkCatalystNBT(be))
@@ -2342,23 +2787,17 @@ func (s *Server) SaveSculk() error {
 }
 
 func encodeSculkSensorNBT(be *SculkSensorBlockEntity) *nbt.Compound {
+	ensureSensorListenerSynced(be)
+	c := world.EncodeSculkSensorBlockEntityNBT(be.Calibrated, be.X, be.Y, be.Z, be.LastVibrationFrequency, be.Listener)
 	var calByte byte
-	idStr := "minecraft:sculk_sensor"
 	if be.Calibrated {
 		calByte = 1
-		idStr = "minecraft:calibrated_sculk_sensor"
 	}
-	c := nbt.NewCompound().
-		Set("id", nbt.String(idStr)).
-		Set("dimension", nbt.String(be.Dimension)).
-		Set("x", nbt.Int(be.X)).
-		Set("y", nbt.Int(be.Y)).
-		Set("z", nbt.Int(be.Z)).
+	c.Set("dimension", nbt.String(be.Dimension)).
 		Set("calibrated", nbt.Byte(calByte)).
 		Set("phase", nbt.String(be.Phase)).
 		Set("phase_ticks", nbt.Int(be.PhaseTicks)).
-		Set("power", nbt.Int(be.Power)).
-		Set("last_vibration_frequency", nbt.Int(be.LastVibrationFrequency))
+		Set("power", nbt.Int(be.Power))
 	if be.Pending != nil {
 		p := be.Pending
 		var resByte byte
@@ -2383,6 +2822,7 @@ func decodeSculkSensorNBT(c *nbt.Compound) *SculkSensorBlockEntity {
 	be := &SculkSensorBlockEntity{
 		Dimension: world.DimensionOverworld,
 		Phase:     SculkSensorPhaseInactive,
+		Listener:  world.NewVibrationSystemData(),
 	}
 	if t, ok := c.Get("id"); ok {
 		if v, ok := t.(nbt.String); ok && canonicalResourceName(string(v)) == "minecraft:calibrated_sculk_sensor" {
@@ -2432,6 +2872,11 @@ func decodeSculkSensorNBT(c *nbt.Compound) *SculkSensorBlockEntity {
 	if t, ok := c.Get("last_vibration_frequency"); ok {
 		if v, ok := t.(nbt.Int); ok {
 			be.LastVibrationFrequency = int(v)
+		}
+	}
+	if lTag, ok := c.Get("listener"); ok {
+		if lComp, ok := lTag.(*nbt.Compound); ok {
+			be.Listener = world.VibrationSystemDataFromNBT(lComp)
 		}
 	}
 	if evTag, ok := c.Get("pending_event"); ok {
@@ -2486,6 +2931,38 @@ func decodeSculkSensorNBT(c *nbt.Compound) *SculkSensorBlockEntity {
 			}
 			if p.TicksRemaining > 0 && p.Frequency > 0 {
 				be.Pending = p
+				ensureSensorListenerSynced(be)
+				if be.Listener.Current != nil && p.EntityID != 0 {
+					be.Listener.Current.SourceEntityID = p.EntityID
+				}
+			}
+		}
+	} else if !be.Listener.IsIdle() {
+		maxR := SculkSensorRadius
+		if be.Calibrated {
+			maxR = CalibratedSculkSensorRadius
+		}
+		var src *world.VibrationInfoData
+		var ticks int
+		if be.Listener.Current != nil {
+			src = be.Listener.Current
+			ticks = be.Listener.TravelTimeInTicks
+		} else if be.Listener.Selector.Candidate != nil {
+			src = be.Listener.Selector.Candidate
+			ticks = VibrationTravelTicks(float64(src.Distance))
+		}
+		if src != nil {
+			be.Pending = &PendingVibration{
+				Event:          src.GameEvent,
+				Frequency:      VibrationFrequency(src.GameEvent),
+				SourceX:        src.Pos[0],
+				SourceY:        src.Pos[1],
+				SourceZ:        src.Pos[2],
+				Distance:       float64(src.Distance),
+				MaxDistance:    maxR,
+				TicksRemaining: ticks,
+				EntityID:       src.SourceEntityID,
+				IsResonance:    strings.HasPrefix(src.GameEvent, "minecraft:resonate_"),
 			}
 		}
 	}
@@ -2493,24 +2970,22 @@ func decodeSculkSensorNBT(c *nbt.Compound) *SculkSensorBlockEntity {
 }
 
 func encodeSculkShriekerNBT(be *SculkShriekerBlockEntity) *nbt.Compound {
+	c := world.EncodeSculkShriekerBlockEntityNBT(be.X, be.Y, be.Z, be.WarningLevel, be.Listener)
 	var csByte byte
 	if be.CanSummon {
 		csByte = 1
 	}
-	return nbt.NewCompound().
-		Set("id", nbt.String("minecraft:sculk_shrieker")).
-		Set("dimension", nbt.String(be.Dimension)).
-		Set("x", nbt.Int(be.X)).
-		Set("y", nbt.Int(be.Y)).
-		Set("z", nbt.Int(be.Z)).
+	c.Set("dimension", nbt.String(be.Dimension)).
 		Set("can_summon", nbt.Byte(csByte)).
 		Set("shrieking_ticks", nbt.Int(be.ShriekingTicks)).
 		Set("cooldown_ticks", nbt.Int(be.CooldownTicks))
+	return c
 }
 
 func decodeSculkShriekerNBT(c *nbt.Compound) *SculkShriekerBlockEntity {
 	be := &SculkShriekerBlockEntity{
 		Dimension: world.DimensionOverworld,
+		Listener:  world.NewVibrationSystemData(),
 	}
 	if t, ok := c.Get("dimension"); ok {
 		if v, ok := t.(nbt.String); ok && string(v) != "" {
@@ -2532,6 +3007,11 @@ func decodeSculkShriekerNBT(c *nbt.Compound) *SculkShriekerBlockEntity {
 			be.Z = int(v)
 		}
 	}
+	if t, ok := c.Get("warning_level"); ok {
+		if v, ok := t.(nbt.Int); ok {
+			be.WarningLevel = int(v)
+		}
+	}
 	if t, ok := c.Get("can_summon"); ok {
 		if v, ok := t.(nbt.Byte); ok {
 			be.CanSummon = v != 0
@@ -2547,17 +3027,19 @@ func decodeSculkShriekerNBT(c *nbt.Compound) *SculkShriekerBlockEntity {
 			be.CooldownTicks = int(v)
 		}
 	}
+	if lTag, ok := c.Get("listener"); ok {
+		if lComp, ok := lTag.(*nbt.Compound); ok {
+			be.Listener = world.VibrationSystemDataFromNBT(lComp)
+		}
+	}
 	return be
 }
 
 func encodeSculkCatalystNBT(be *SculkCatalystBlockEntity) *nbt.Compound {
-	return nbt.NewCompound().
-		Set("id", nbt.String("minecraft:sculk_catalyst")).
-		Set("dimension", nbt.String(be.Dimension)).
-		Set("x", nbt.Int(be.X)).
-		Set("y", nbt.Int(be.Y)).
-		Set("z", nbt.Int(be.Z)).
+	c := world.EncodeSculkCatalystBlockEntityNBT(be.X, be.Y, be.Z, be.Cursors)
+	c.Set("dimension", nbt.String(be.Dimension)).
 		Set("bloom_ticks", nbt.Int(be.BloomTicks))
+	return c
 }
 
 func decodeSculkCatalystNBT(c *nbt.Compound) *SculkCatalystBlockEntity {
@@ -2589,6 +3071,15 @@ func decodeSculkCatalystNBT(c *nbt.Compound) *SculkCatalystBlockEntity {
 			be.BloomTicks = int(v)
 		}
 	}
+	if curTag, ok := c.Get("cursors"); ok {
+		for _, el := range nbtListElems(curTag) {
+			if comp, ok := el.(*nbt.Compound); ok {
+				if cur, valid := world.SculkChargeCursorFromNBT(comp); valid {
+					be.Cursors = append(be.Cursors, cur)
+				}
+			}
+		}
+	}
 	return be
 }
 
@@ -2598,6 +3089,7 @@ func (s *Server) ChunkSculkBlockEntitiesNBT(dim string, cx, cz int32) []*nbt.Com
 	if s == nil {
 		return nil
 	}
+	s.syncSculkFromWorldCaches()
 	normDim := world.NormalizeDimension(dim)
 	st := s.sculkState()
 	st.mu.Lock()
@@ -2637,6 +3129,7 @@ func (s *Server) UnloadChunkSculk(dim string, cx, cz int32) []*nbt.Compound {
 	if s == nil {
 		return nil
 	}
+	s.syncSculkFromWorldCaches()
 	normDim := world.NormalizeDimension(dim)
 	st := s.sculkState()
 	st.mu.Lock()
@@ -2686,10 +3179,14 @@ func (s *Server) LoadChunkSculkBlockEntitiesNBT(dim string, list []*nbt.Compound
 		return 0
 	}
 	normDim := world.NormalizeDimension(dim)
+	cache := s.DimensionChunks(normDim)
 	st := s.sculkState()
 	st.mu.Lock()
 	s.ensureSculkLoadedLocked(st)
 	count := 0
+	var sensorsToPush []*SculkSensorBlockEntity
+	var shriekersToPush []*SculkShriekerBlockEntity
+	var catalystsToPush []*SculkCatalystBlockEntity
 	for _, comp := range list {
 		if comp == nil {
 			continue
@@ -2706,24 +3203,53 @@ func (s *Server) LoadChunkSculkBlockEntitiesNBT(dim string, list []*nbt.Compound
 		case "minecraft:sculk_sensor", "minecraft:calibrated_sculk_sensor":
 			be := decodeSculkSensorNBT(comp)
 			be.Dimension = normDim
+			if be.Listener.Selector.Candidate != nil && be.Listener.Selector.Tick > st.tickCounter {
+				st.tickCounter = be.Listener.Selector.Tick
+			}
+			s.syncSensorPendingFromListener(be, nil)
 			key := makeBrewingKey(normDim, be.X, be.Y, be.Z)
 			st.sensors[key] = be
+			cp := *be
+			cp.Listener = be.Listener.Clone()
+			sensorsToPush = append(sensorsToPush, &cp)
 			count++
 		case "minecraft:sculk_shrieker":
 			be := decodeSculkShriekerNBT(comp)
 			be.Dimension = normDim
+			if be.Listener.Selector.Candidate != nil && be.Listener.Selector.Tick > st.tickCounter {
+				st.tickCounter = be.Listener.Selector.Tick
+			}
+			if be.Listener.Current != nil {
+				be.TargetPlayer = s.resolveVibrationPlayer(be.Listener.Current, nil)
+			}
 			key := makeBrewingKey(normDim, be.X, be.Y, be.Z)
 			st.shriekers[key] = be
+			cp := *be
+			cp.Listener = be.Listener.Clone()
+			shriekersToPush = append(shriekersToPush, &cp)
 			count++
 		case "minecraft:sculk_catalyst":
 			be := decodeSculkCatalystNBT(comp)
 			be.Dimension = normDim
 			key := makeBrewingKey(normDim, be.X, be.Y, be.Z)
 			st.catalysts[key] = be
+			cp := *be
+			cp.Cursors = append([]world.SculkChargeCursor(nil), be.Cursors...)
+			catalystsToPush = append(catalystsToPush, &cp)
 			count++
 		}
 	}
 	st.mu.Unlock()
+	if cache != nil {
+		for _, cp := range sensorsToPush {
+			pushSensorToWorldCache(cache, cp)
+		}
+		for _, cp := range shriekersToPush {
+			pushShriekerToWorldCache(cache, cp)
+		}
+		for _, cp := range catalystsToPush {
+			pushCatalystToWorldCache(cache, cp)
+		}
+	}
 	return count
 }
-

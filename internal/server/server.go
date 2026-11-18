@@ -3391,13 +3391,11 @@ func (s *Server) OnSculkBlockPlaced(dim string, x, y, z int, state uint16) {
 		return
 	}
 	normDim := world.NormalizeDimension(dim)
-	if IsSculkSensorBlock(state) {
+	cache := s.DimensionChunks(normDim)
+	switch {
+	case IsSculkSensorBlock(state):
 		phase, power, _, calibrated, _, _ := ParseSculkSensorState(state)
-		st := s.sculkState()
-		st.mu.Lock()
-		s.ensureSculkLoadedLocked(st)
-		key := makeBrewingKey(normDim, x, y, z)
-		st.sensors[key] = &SculkSensorBlockEntity{
+		be := &SculkSensorBlockEntity{
 			Dimension:  normDim,
 			X:          x,
 			Y:          y,
@@ -3405,13 +3403,54 @@ func (s *Server) OnSculkBlockPlaced(dim string, x, y, z int, state uint16) {
 			Calibrated: calibrated,
 			Phase:      phase,
 			Power:      power,
+			Listener:   world.NewVibrationSystemData(),
 		}
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		st.sensors[makeBrewingKey(normDim, x, y, z)] = be
 		st.mu.Unlock()
-		if cache := s.DimensionChunks(normDim); cache != nil {
+		if cache != nil {
+			pushSensorToWorldCache(cache, be)
 			res := cache.UpdateComparatorsAround(x, y, z)
 			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 			}
+		}
+		_ = s.SaveSculk()
+	case IsSculkShriekerBlock(state):
+		canSummon, _, _, _ := ParseSculkShriekerState(state)
+		be := &SculkShriekerBlockEntity{
+			Dimension: normDim,
+			X:         x,
+			Y:         y,
+			Z:         z,
+			CanSummon: canSummon,
+			Listener:  world.NewVibrationSystemData(),
+		}
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		st.shriekers[makeBrewingKey(normDim, x, y, z)] = be
+		st.mu.Unlock()
+		if cache != nil {
+			pushShriekerToWorldCache(cache, be)
+		}
+		_ = s.SaveSculk()
+	case IsSculkCatalystBlock(state):
+		be := &SculkCatalystBlockEntity{
+			Dimension: normDim,
+			X:         x,
+			Y:         y,
+			Z:         z,
+		}
+		st := s.sculkState()
+		st.mu.Lock()
+		s.ensureSculkLoadedLocked(st)
+		st.catalysts[makeBrewingKey(normDim, x, y, z)] = be
+		st.mu.Unlock()
+		if cache != nil {
+			pushCatalystToWorldCache(cache, be)
 		}
 		_ = s.SaveSculk()
 	}
@@ -3433,6 +3472,7 @@ func (s *Server) OnSculkBlockBroken(dim string, x, y, z int, oldState uint16) {
 		delete(st.sensors, key)
 		st.mu.Unlock()
 		if cache := s.DimensionChunks(normDim); cache != nil {
+			cache.DeleteWorldSculkSensorState(x, y, z)
 			res := cache.UpdateComparatorsAround(x, y, z)
 			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
@@ -3440,18 +3480,16 @@ func (s *Server) OnSculkBlockBroken(dim string, x, y, z int, oldState uint16) {
 		}
 		_ = s.SaveSculk()
 	case IsSculkShriekerBlock(oldState):
-		st := s.sculkState()
-		st.mu.Lock()
-		s.ensureSculkLoadedLocked(st)
-		delete(st.shriekers, key)
-		st.mu.Unlock()
-		_ = s.SaveSculk()
+		s.OnBreakSculkShriekerAt(normDim, x, y, z, oldState)
 	case IsSculkCatalystBlock(oldState):
 		st := s.sculkState()
 		st.mu.Lock()
 		s.ensureSculkLoadedLocked(st)
 		delete(st.catalysts, key)
 		st.mu.Unlock()
+		if cache := s.DimensionChunks(normDim); cache != nil {
+			cache.DeleteWorldSculkCatalystState(x, y, z)
+		}
 		_ = s.SaveSculk()
 	}
 }
