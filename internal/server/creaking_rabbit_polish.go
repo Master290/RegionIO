@@ -1935,7 +1935,7 @@ func (s *Server) EatFoxHeldItem(entityID int32, rng *rand.Rand) (ate bool, telep
 		return false, false
 	}
 	eatenID := canonicalResourceName(fs.HeldItem.ResolvedID())
-	fs.HeldItem = world.ItemStack{}
+	fs.HeldItem = FoxLeftoverContainerAfterEat2612(eatenID)
 	fs.EatTicks = 0
 	mgr.mu.Unlock()
 

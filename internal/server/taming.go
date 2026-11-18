@@ -63,12 +63,13 @@ const (
 	EntityEventTamingSucceeded byte = 7
 	EntityEventWolfShakeWater  byte = 8
 
-	// SynchedEntityData indices for TamableAnimal, Wolf, Cat, and AbstractHorse in 26.1.2.
-	EntityDataTamableFlagsID      byte = 17 // TamableAnimal.DATA_FLAGS_ID (BYTE serializer 0: 0x01 sitting, 0x04 tamed)
-	EntityDataWolfBeggingID       byte = 19 // Wolf.DATA_INTERESTED_ID (BOOLEAN serializer 8)
-	EntityDataWolfCollarColorID   byte = 20 // Wolf.DATA_COLLAR_COLOR (INT serializer 1)
-	EntityDataWolfAngerTimeID     byte = 21 // Wolf.DATA_REMAINING_ANGER_TIME (INT serializer 1)
-	EntityDataCatCollarColorID    byte = 20 // Cat.DATA_COLLAR_COLOR (INT serializer 1)
+	// SynchedEntityData indices for TamableAnimal, Wolf, Cat, and AbstractHorse in 26.1.2 (protocol 775).
+	// AgeableMob defines 16 (DATA_BABY_ID) and 17 (AGE_LOCKED); TamableAnimal defines 18 (DATA_FLAGS_ID) and 19 (DATA_OWNERUUID_ID).
+	EntityDataTamableFlagsID      byte = 18 // TamableAnimal.DATA_FLAGS_ID (BYTE serializer 0: 0x01 sitting, 0x04 tamed)
+	EntityDataWolfBeggingID       byte = 20 // Wolf.DATA_INTERESTED_ID (BOOLEAN serializer 8)
+	EntityDataWolfCollarColorID   byte = 21 // Wolf.DATA_COLLAR_COLOR (INT serializer 1)
+	EntityDataWolfAngerTimeID     byte = 22 // Wolf.DATA_ANGER_END_TIME (LONG serializer 2)
+	EntityDataCatCollarColorID    byte = 23 // Cat.DATA_COLLAR_COLOR (INT serializer 1)
 	EntityDataAbstractHorseFlags  byte = 17 // AbstractHorse.DATA_ID_FLAGS (BYTE serializer 0: 0x02 tamed, 0x04 saddled)
 	TamableFlagSitting            byte = 0x01
 	TamableFlagTamed              byte = 0x04
@@ -206,8 +207,8 @@ func DecodeTamableMobDataPacket(r *protocol.Reader) (entityID int32, tamed, sitt
 }
 
 // EncodeWolfEntityDataPacket encodes a ClientboundSetEntityDataPacket (0x63)
-// updating a wolf's health (9), tamable flags (17), collar color (20), and
-// remaining anger time (21) for protocol 775.
+// updating a wolf's health (9), tamable flags (18), collar color (21), and
+// anger end time (22, LONG serializer 2) for protocol 775.
 func EncodeWolfEntityDataPacket(entityID int32, health float32, tamed, sitting bool, collarColor, angerTime int32) []byte {
 	var flags byte
 	if sitting {
@@ -216,7 +217,11 @@ func EncodeWolfEntityDataPacket(entityID int32, health float32, tamed, sitting b
 	if tamed {
 		flags |= TamableFlagTamed
 	}
-	w := protocol.NewWriter(32)
+	angerEnd := int64(-1)
+	if angerTime > 0 {
+		angerEnd = int64(angerTime)
+	}
+	w := protocol.NewWriter(36)
 	w.VarInt(entityID)
 
 	w.Byte(EntityDataLivingHealthID)
@@ -232,8 +237,8 @@ func EncodeWolfEntityDataPacket(entityID int32, health float32, tamed, sitting b
 	w.VarInt(collarColor)
 
 	w.Byte(EntityDataWolfAngerTimeID)
-	w.VarInt(EntityDataSerializerInt)
-	w.VarInt(angerTime)
+	w.VarInt(EntityDataSerializerLong)
+	w.VarLong(angerEnd)
 
 	w.Byte(0xFF)
 	return w.Bytes()
@@ -470,7 +475,9 @@ func (s *Server) TamedMobEntityDataPacket(entityID int32, typeName string) []byt
 // itemName in vanilla 26.1.2 (2x the food nutrition value).
 func WolfMeatHealAmount(itemName string) float32 {
 	switch canonicalResourceName(itemName) {
-	case "minecraft:rotten_flesh", "minecraft:cod", "minecraft:salmon", "minecraft:tropical_fish", "minecraft:chicken":
+	case "minecraft:tropical_fish", "minecraft:pufferfish":
+		return 2.0
+	case "minecraft:rotten_flesh", "minecraft:cod", "minecraft:salmon", "minecraft:chicken":
 		return 4.0
 	case "minecraft:beef", "minecraft:porkchop", "minecraft:mutton", "minecraft:rabbit":
 		return 6.0
@@ -480,9 +487,34 @@ func WolfMeatHealAmount(itemName string) float32 {
 		return 12.0
 	case "minecraft:cooked_beef", "minecraft:cooked_porkchop":
 		return 16.0
+	case "minecraft:rabbit_stew":
+		return 20.0
 	default:
 		return 4.0
 	}
+}
+
+func consumeOneWolfFoodInSurvival(session *PlayerSession, heldID string) {
+	if session == nil {
+		return
+	}
+	snap := session.Snapshot()
+	if snap.GameMode == GameModeCreative {
+		return
+	}
+	if canonicalResourceName(heldID) == "minecraft:rabbit_stew" {
+		slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
+		held := session.InventorySlot(slotIdx)
+		bowl := world.NewNamedItemStack("minecraft:bowl", 1)
+		if held.Count <= 1 {
+			session.SetInventorySlot(slotIdx, bowl)
+		} else {
+			session.SetInventorySlot(slotIdx, world.NewItemStack(held.ResolvedItemID(), held.Count-1))
+			_, _ = session.AddItemToInventory(bowl)
+		}
+		return
+	}
+	consumeOneHeldItemInSurvival(session)
 }
 
 // DyeColorIndexByItemName maps a `minecraft:<color>_dye` item name to its
@@ -653,7 +685,22 @@ func (s *Server) interactWithWolf(session *PlayerSession, ent *world.Entity, hel
 
 	isOwner := ownerUUID == session.Profile.UUID
 
-	// 2a. Tamed adult wolf + wolf_armor -> equip wolf armor (owner only).
+	// 2a. Wolf.mobInteract checks injured wolf + #wolf_food FIRST (any player, before armor/dye/sit)!
+	if IsWolfMeatItem(heldID) && s.MobHealth(ent.ID) < DefaultWolfTamedMaxHealth {
+		curHP := s.MobHealth(ent.ID)
+		consumeOneWolfFoodInSurvival(session, heldID)
+		newHP := curHP + WolfMeatHealAmount(heldID)
+		if newHP > DefaultWolfTamedMaxHealth {
+			newHP = DefaultWolfTamedMaxHealth
+		}
+		s.SetMobHealth(ent.ID, newHP)
+		if curSt, ok := s.GetTamedMobState(ent.ID); ok {
+			s.broadcastTamedMobMetadata(ent, curSt)
+		}
+		return true, 0
+	}
+
+	// 2b. Tamed adult wolf + wolf_armor -> equip wolf armor (owner only).
 	if isOwner && heldID == WolfArmorItemID && !s.IsMobBaby(ent.ID) && !s.HasWolfArmor(ent.ID) {
 		pSnap := session.Snapshot()
 		slotIdx := world.HotbarContainerOffset + int(pSnap.SelectedSlot)
@@ -665,21 +712,21 @@ func (s *Server) interactWithWolf(session *PlayerSession, ent *world.Entity, hel
 		}
 	}
 
-	// 2b. Tamed armored wolf + armadillo_scute -> repair wolf armor by 8 durability (owner only).
-	if isOwner && heldID == ArmadilloScuteItemID && s.HasWolfArmor(ent.ID) {
+	// 2c. Tamed SITTING armored wolf + armadillo_scute -> repair wolf armor by 8 durability (Wolf.isInSittingPose(), owner only).
+	if isOwner && sitting && heldID == ArmadilloScuteItemID && s.HasWolfArmor(ent.ID) {
 		if _, repaired := s.RepairWolfArmorWithScute(session, ent.ID); repaired {
 			return true, 0
 		}
 	}
 
-	// 2c. Tamed armored wolf + shears -> remove and drop wolf armor (owner only).
-	if isOwner && heldID == "minecraft:shears" && s.HasWolfArmor(ent.ID) {
+	// 2d. Tamed adult armored wolf + shears -> remove and drop wolf armor (owner only).
+	if isOwner && !s.IsMobBaby(ent.ID) && heldID == "minecraft:shears" && s.HasWolfArmor(ent.ID) {
 		if _, _, removed := s.RemoveWolfArmorWithShears(session, ent.ID); removed {
 			return true, 0
 		}
 	}
 
-	// 2d. Tamed wolf + dye -> recolor collar or dye equipped wolf_armor (owner only).
+	// 2e. Tamed wolf + dye -> recolor collar or dye equipped wolf_armor (owner only).
 	if dyeIdx, ok := DyeColorIndexByItemName(heldID); ok && isOwner {
 		if session.IsSneaking() && s.HasWolfArmor(ent.ID) {
 			if _, dyed := s.DyeEquippedWolfArmor(ent.ID, dyeIdx); dyed {
@@ -701,27 +748,27 @@ func (s *Server) interactWithWolf(session *PlayerSession, ent *world.Entity, hel
 		return false, 0
 	}
 
-	// 3. Tamed wolf + meat -> feed baby, heal if injured, or enter love mode if full health.
+	// 3. Tamed wolf + #wolf_food at full health -> feed baby or enter love mode.
 	if IsWolfMeatItem(heldID) {
 		if s.IsMobBaby(ent.ID) {
+			if canonicalResourceName(heldID) == "minecraft:rabbit_stew" {
+				consumeOneWolfFoodInSurvival(session, heldID)
+				delta := (-s.MobAge(ent.ID)) / 10
+				if delta < 20 {
+					delta = 20
+				}
+				nextAge := s.MobAge(ent.ID) + delta
+				if nextAge > 0 {
+					nextAge = 0
+				}
+				s.SetMobAge(ent.ID, nextAge)
+				return true, 0
+			}
 			fed, _ := s.FeedBabyMob(session, ent.ID, heldID)
 			return fed, 0
 		}
-		curHP := s.MobHealth(ent.ID)
-		if curHP < DefaultWolfTamedMaxHealth {
-			consumeOneHeldItemInSurvival(session)
-			newHP := curHP + WolfMeatHealAmount(heldID)
-			if newHP > DefaultWolfTamedMaxHealth {
-				newHP = DefaultWolfTamedMaxHealth
-			}
-			s.SetMobHealth(ent.ID, newHP)
-			if curSt, ok := s.GetTamedMobState(ent.ID); ok {
-				s.broadcastTamedMobMetadata(ent, curSt)
-			}
-			return true, 0
-		}
 		if s.MobBreedCooldown(ent.ID) <= 0 && s.MobInLoveTicks(ent.ID) <= 0 {
-			consumeOneHeldItemInSurvival(session)
+			consumeOneWolfFoodInSurvival(session, heldID)
 			s.SetMobInLove(ent.ID, AnimalLoveDurationTicks, session)
 			offspringID, _ = s.TryBreedMobWithNearbyMate(ent.ID, AnimalBreedRange, rng)
 			return true, offspringID
@@ -749,9 +796,12 @@ func (s *Server) interactWithCat(session *PlayerSession, ent *world.Entity, held
 	cp := ent.ChunkPos()
 	dim := ent.EffectiveDimension()
 
-	// 1. Wild cat + cod/salmon -> 1/3 chance to tame.
+	// 1. Wild cat + cod/salmon -> requires stealth (CatTemptGoal / CatAvoidEntityGoal), then 1/3 chance to tame.
 	if !tamed {
 		if IsCatFoodItem(heldID) {
+			if !s.EvaluateWildCatTemptAndScare2612(session, ent) {
+				return false, 0
+			}
 			consumeOneHeldItemInSurvival(session)
 			if rng == nil || rng.Intn(3) == 0 {
 				s.TameMob(ent.ID, session)
@@ -1214,7 +1264,7 @@ func (s *Server) NotifyOwnerDamagedByMob(owner *PlayerSession, attackerMobID int
 }
 
 // ProvokeWildWolf makes a wild (untamed) wolf angry at attacker for
-// DefaultWolfAngerTicks (400 ticks).
+// DefaultWolfAngerTicks (400 ticks) and alerts nearby untamed pack wolves within 16 blocks.
 func (s *Server) ProvokeWildWolf(wolfID int32, attacker *PlayerSession) {
 	if s == nil || s.entities == nil || wolfID <= 0 {
 		return
@@ -1230,12 +1280,15 @@ func (s *Server) ProvokeWildWolf(wolfID int32, attacker *PlayerSession) {
 		mgr.mu.Unlock()
 		return
 	}
-	st.AngerTicks = DefaultWolfAngerTicks
+	st.AngerTicks = RollWolfAngerTicks2612(nil)
 	st.TargetPlayer = attacker
 	snap := *st
 	mgr.mu.Unlock()
 
 	s.broadcastTamedMobMetadata(ent, snap)
+	if attacker != nil {
+		s.AlertWildWolfPack2612(wolfID, attacker, nil)
+	}
 }
 
 func (s *Server) inheritTamedParentTraits(parentA, parentB, offspringID int32, offspringType string, rng *rand.Rand) {
@@ -1252,6 +1305,9 @@ func (s *Server) inheritTamedParentTraits(parentA, parentB, offspringID int32, o
 	if !stA.Tamed || (stB.Tamed && rng != nil && rng.Intn(2) == 1) {
 		ownerUUID = stB.OwnerUUID
 		collar = stB.CollarColor
+	}
+	if okA && stA.Tamed && okB && stB.Tamed {
+		collar = MixCollarDyeColors2612(stA.CollarColor, stB.CollarColor, rng)
 	}
 	childSt := s.ensureTamedMobState(offspringID, offspringType)
 	mgr := s.tamedManager()
@@ -1270,6 +1326,7 @@ func (s *Server) inheritTamedParentTraits(parentA, parentB, offspringID int32, o
 			varVar = s.WolfVariant(parentB)
 		}
 		s.SetWolfVariant(offspringID, varVar)
+		s.SetWolfSoundVariant(offspringID, RollWolfSoundVariant2612(rng))
 	}
 	if canonicalResourceName(offspringType) == MobTypeCat {
 		catVar := s.CatVariant(parentA)
@@ -1277,6 +1334,7 @@ func (s *Server) inheritTamedParentTraits(parentA, parentB, offspringID int32, o
 			catVar = s.CatVariant(parentB)
 		}
 		s.SetCatVariant(offspringID, catVar)
+		s.SetCatSoundVariant(offspringID, RollCatSoundVariant2612(rng))
 	}
 	if IsEquineOrLlamaMob(offspringType) {
 		s.inheritEquineOrLlamaTraits(parentA, parentB, offspringID, offspringType, rng)
@@ -1366,7 +1424,57 @@ func (s *Server) tickSingleTamedMob(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	if !snap.Tamed || snap.Sitting {
+	if !snap.Tamed {
+		// Untamed wolf natural prey & AbstractSkeleton hunting (`Wolf.registerGoals`).
+		if snap.TypeName == MobTypeWolf && !snap.Sitting {
+			var preyEnt *world.Entity
+			if snap.TargetEntityID > 0 {
+				if cand := s.entities.Get(snap.TargetEntityID); cand != nil && cand.EffectiveDimension() == dim && s.IsWildWolfPreyOrSkeletonTarget2612(cand) {
+					preyEnt = cand
+				}
+			}
+			if preyEnt == nil {
+				bestDistSq := 256.0
+				allEnts := s.entities.AppendAll(nil)
+				for i := range allEnts {
+					cand := &allEnts[i]
+					if cand.ID == entityID || cand.EffectiveDimension() != dim || !s.IsWildWolfPreyOrSkeletonTarget2612(cand) {
+						continue
+					}
+					dx, dy, dz := cand.X-ent.X, cand.Y-ent.Y, cand.Z-ent.Z
+					dSq := dx*dx + dy*dy + dz*dz
+					if dSq <= bestDistSq {
+						bestDistSq = dSq
+						cpCand := *cand
+						preyEnt = &cpCand
+					}
+				}
+				if preyEnt != nil {
+					mgr.mu.Lock()
+					st.TargetEntityID = preyEnt.ID
+					mgr.mu.Unlock()
+				}
+			}
+			if preyEnt != nil {
+				s.stepEntityTowardPoint(ent, cache, feetY, preyEnt.X, preyEnt.Y, preyEnt.Z, WolfChaseSpeed, 1.2)
+				if updated := s.entities.Get(entityID); updated != nil {
+					dx, dy, dz := preyEnt.X-updated.X, preyEnt.Y-updated.Y, preyEnt.Z-updated.Z
+					if dx*dx+dy*dy+dz*dz <= WolfAttackReach*WolfAttackReach && snap.AttackCooldown <= 0 {
+						mgr.mu.Lock()
+						st.AttackCooldown = WolfAttackCooldownTicks
+						mgr.mu.Unlock()
+						if s.applyDamageToMob(preyEnt, WolfAttackDamage, nil, 0.3, false, false) {
+							mgr.mu.Lock()
+							st.TargetEntityID = 0
+							mgr.mu.Unlock()
+						}
+					}
+				}
+			}
+		}
+		return
+	}
+	if snap.Sitting {
 		return
 	}
 
@@ -1400,7 +1508,10 @@ func (s *Server) tickSingleTamedMob(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	// 4. Non-sitting tamed pet following its owner (and teleporting if >= 12 blocks away).
+	// 4. Non-sitting, unleashed tamed pet following its owner (and teleporting if >= 12 blocks away).
+	if s.IsEntityLeashed(entityID) {
+		return
+	}
 	owner := s.findOnlinePlayerByUUID(snap.OwnerUUID)
 	if owner == nil || owner.IsDead() {
 		return
@@ -1435,9 +1546,10 @@ func (s *Server) findOnlinePlayerByUUID(uuid [16]byte) *PlayerSession {
 }
 
 func (s *Server) teleportTamedMobNearOwner(ent *world.Entity, cache *world.Cache, ownerX, ownerY, ownerZ float64) {
-	if s == nil || s.entities == nil || ent == nil {
+	if s == nil || s.entities == nil || ent == nil || s.IsEntityLeashed(ent.ID) {
 		return
 	}
+	canFlyToLeaves := canonicalResourceName(ent.TypeName) == MobTypeParrot
 	baseBX := int(math.Floor(ownerX))
 	baseBY := int(math.Floor(ownerY))
 	baseBZ := int(math.Floor(ownerZ))
@@ -1458,6 +1570,9 @@ func (s *Server) teleportTamedMobNearOwner(ent *world.Entity, cache *world.Cache
 					continue
 				}
 				floor := cache.GetBlock(cx, cy-1, cz)
+				if !canFlyToLeaves && strings.HasSuffix(world.BlockName(floor), "_leaves") {
+					continue
+				}
 				if isSolidGroundBlock(floor) && isColumnPassableAt(cache, cx, cy, cz) {
 					destX = float64(cx) + 0.5
 					destY = float64(cy)

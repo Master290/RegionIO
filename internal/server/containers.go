@@ -1732,10 +1732,11 @@ func (s *Server) InteractBlock(session *PlayerSession, x, y, z int) (opened bool
 		if session.IsSneaking() && !session.HeldItem().IsEmpty() {
 			return false, 0, nil
 		}
-		if cache.IsChestBlockedAbove(x, y, z) {
+		chestDim := world.NormalizeDimension(session.Dimension())
+		if cache.IsChestBlockedAbove(x, y, z) || s.IsCatSittingOnChestAt(chestDim, x, y, z) {
 			return true, 0, nil
 		}
-		if px, py, pz, _, ok := cache.DoubleChestPartnerAt(x, y, z); ok && cache.IsChestBlockedAbove(px, py, pz) {
+		if px, py, pz, _, ok := cache.DoubleChestPartnerAt(x, y, z); ok && (cache.IsChestBlockedAbove(px, py, pz) || s.IsCatSittingOnChestAt(chestDim, px, py, pz)) {
 			return true, 0, nil
 		}
 		s.RecordContainerOpenStat(session, blockName)
@@ -2027,7 +2028,7 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	}
 	dim := world.NormalizeDimension(session.Dimension())
 	cache := s.DimensionChunks(dim)
-	if cache != nil && cache.IsChestBlockedAbove(x, y, z) {
+	if (cache != nil && cache.IsChestBlockedAbove(x, y, z)) || s.IsCatSittingOnChestAt(dim, x, y, z) {
 		return 0, errors.New("server: chest is blocked above")
 	}
 	firstX, firstY, firstZ := x, y, z
@@ -2035,7 +2036,7 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	hasPartner := false
 	if cache != nil {
 		if px, py, pz, thisFirst, ok := cache.DoubleChestPartnerAt(x, y, z); ok {
-			if cache.IsChestBlockedAbove(px, py, pz) {
+			if cache.IsChestBlockedAbove(px, py, pz) || s.IsCatSittingOnChestAt(dim, px, py, pz) {
 				return 0, errors.New("server: double chest partner is blocked above")
 			}
 			hasPartner = true

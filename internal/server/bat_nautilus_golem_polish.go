@@ -71,10 +71,10 @@ const (
 	BreathOfTheNautilusRefreshTicks        = 40
 
 	// SynchedEntityData indices and serializers for AbstractNautilus & ZombieNautilus (protocol 775).
-	EntityDataTamableOwnerID               byte  = 18 // TamableAnimal.DATA_OWNERUUID_ID (OPTIONAL_LIVING_ENTITY_REFERENCE serializer = 14)
-	EntityDataSerializerOptionalUUID       int32 = 14
-	EntityDataNautilusDashID               byte  = 19 // AbstractNautilus.DASH (BOOLEAN serializer = 8)
-	EntityDataZombieNautilusVariantID      byte  = 20 // ZombieNautilus.DATA_VARIANT_ID (ZOMBIE_NAUTILUS_VARIANT serializer = 32)
+	EntityDataTamableOwnerID               byte  = 19 // TamableAnimal.DATA_OWNERUUID_ID (OPTIONAL_LIVING_ENTITY_REFERENCE serializer = 13)
+	EntityDataSerializerOptionalUUID       int32 = 13
+	EntityDataNautilusDashID               byte  = 20 // AbstractNautilus.DASH (BOOLEAN serializer = 8)
+	EntityDataZombieNautilusVariantID      byte  = 21 // ZombieNautilus.DATA_VARIANT_ID (ZOMBIE_NAUTILUS_VARIANT serializer = 32)
 	EntityDataSerializerZombieNautilusVar  int32 = 32
 	ZombieNautilusVariantTemperate         int32 = 0 // ZombieNautilusVariants.TEMPERATE
 	ZombieNautilusVariantWarm              int32 = 1 // ZombieNautilusVariants.WARM

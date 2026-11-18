@@ -88,7 +88,8 @@ func IsWolfMeatItem(itemName string) bool {
 		"minecraft:rotten_flesh",
 		"minecraft:cod", "minecraft:cooked_cod",
 		"minecraft:salmon", "minecraft:cooked_salmon",
-		"minecraft:tropical_fish":
+		"minecraft:tropical_fish", "minecraft:pufferfish",
+		"minecraft:rabbit_stew":
 		return true
 	default:
 		return false
@@ -462,7 +463,8 @@ func (s *Server) TryBreedMobWithNearbyMate(entityID int32, maxDist float64, rng 
 
 	var mateEnt *world.Entity
 	var offspringType string
-	var causePlayer *PlayerSession
+	var causePlayerA *PlayerSession
+	var causePlayerB *PlayerSession
 	allEnts := s.entities.AppendAll(nil)
 	for i := range allEnts {
 		other := &allEnts[i]
@@ -471,6 +473,9 @@ func (s *Server) TryBreedMobWithNearbyMate(entityID int32, maxDist float64, rng 
 		}
 		babyType, ok := CanMobsMateWithEachOther(ent.TypeName, other.TypeName)
 		if !ok {
+			continue
+		}
+		if (babyType == MobTypeWolf || babyType == MobTypeCat) && (s.IsMobSitting(entityID) || s.IsMobSitting(other.ID)) {
 			continue
 		}
 		dx := other.X - ent.X
@@ -485,10 +490,8 @@ func (s *Server) TryBreedMobWithNearbyMate(entityID int32, maxDist float64, rng 
 		}
 		mateEnt = other
 		offspringType = babyType
-		causePlayer = mem.loveCause
-		if causePlayer == nil {
-			causePlayer = otherMem.loveCause
-		}
+		causePlayerA = mem.loveCause
+		causePlayerB = otherMem.loveCause
 		mem.inLoveTicks = 0
 		mem.breedCooldown = AnimalBreedCooldownTicks
 		mem.loveCause = nil
@@ -511,9 +514,14 @@ func (s *Server) TryBreedMobWithNearbyMate(entityID int32, maxDist float64, rng 
 		return 0, false
 	}
 
+	causePlayer := causePlayerA
+	if causePlayer == nil {
+		causePlayer = causePlayerB
+	}
+
 	// Inherit ownership and attributes if parents are tamed.
 	s.inheritTamedParentTraits(ent.ID, mateEnt.ID, offspringID, offspringType, rng)
-	s.inheritFoxPandaOcelotTraits(ent.ID, mateEnt.ID, offspringID, offspringType, causePlayer, rng)
+	s.inheritFoxPandaOcelotTraits(ent.ID, mateEnt.ID, offspringID, offspringType, causePlayerA, causePlayerB, rng)
 
 	// Spawn 1..7 XP orbs at the breeding position.
 	xp := int32(BreedingMinXP)

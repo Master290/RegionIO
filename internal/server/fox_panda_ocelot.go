@@ -51,9 +51,9 @@ const (
 	FoxVariantRed  int32 = 0
 	FoxVariantSnow int32 = 1
 
-	// SynchedEntityData indices for Fox in 26.1.2 (protocol 775).
-	EntityDataFoxVariantID byte = 17 // Fox.DATA_TYPE_ID (INT serializer 1: 0=red, 1=snow)
-	EntityDataFoxFlagsID   byte = 18 // Fox.DATA_FLAGS_ID (BYTE serializer 0)
+	// SynchedEntityData indices for Fox in 26.1.2 (protocol 775; AgeableMob defines 16 & 17).
+	EntityDataFoxVariantID byte = 18 // Fox.DATA_TYPE_ID (INT serializer 1: 0=red, 1=snow)
+	EntityDataFoxFlagsID   byte = 19 // Fox.DATA_FLAGS_ID (BYTE serializer 0)
 
 	FoxFlagSitting     byte = 0x01
 	FoxFlagCrouching   byte = 0x04
@@ -64,12 +64,12 @@ const (
 	FoxFlagDefending   byte = 0x80
 
 	// SynchedEntityData indices for Panda in 26.1.2 (protocol 775).
-	EntityDataPandaUnhappyCounterID byte = 17 // INT
-	EntityDataPandaSneezeCounterID  byte = 18 // INT
-	EntityDataPandaEatCounterID     byte = 19 // INT
-	EntityDataPandaMainGeneID       byte = 20 // BYTE (0..6)
-	EntityDataPandaHiddenGeneID     byte = 21 // BYTE (0..6)
-	EntityDataPandaFlagsID          byte = 22 // BYTE (0x02 sneezing, 0x04 rolling, 0x08 sitting, 0x10 on_back)
+	EntityDataPandaUnhappyCounterID byte = 18 // INT
+	EntityDataPandaSneezeCounterID  byte = 19 // INT
+	EntityDataPandaEatCounterID     byte = 20 // INT
+	EntityDataPandaMainGeneID       byte = 21 // BYTE (0..6)
+	EntityDataPandaHiddenGeneID     byte = 22 // BYTE (0..6)
+	EntityDataPandaFlagsID          byte = 23 // BYTE (0x02 sneezing, 0x04 rolling, 0x08 sitting, 0x10 on_back)
 
 	PandaFlagSneezing byte = 0x02
 	PandaFlagRolling  byte = 0x04
@@ -77,7 +77,7 @@ const (
 	PandaFlagOnBack   byte = 0x10
 
 	// SynchedEntityData index for Ocelot in 26.1.2 (protocol 775).
-	EntityDataOcelotTrustingID byte = 17 // Ocelot.DATA_TRUSTING (BOOLEAN serializer 8)
+	EntityDataOcelotTrustingID byte = 18 // Ocelot.DATA_TRUSTING (BOOLEAN serializer 8)
 
 	// Canonical sounds for Fox, Panda, and Ocelot.
 	SoundFoxAggro    = "minecraft:entity.fox.aggro"
@@ -210,6 +210,8 @@ type FoxState struct {
 	TrustedUUIDs   [][16]byte
 	HeldItem       world.ItemStack
 	EatTicks       int
+	BerryWaitTicks int
+	FaceplantTicks int
 	DefendTargetID int32
 	HuntTargetID   int32
 	AttackCooldown int
@@ -289,7 +291,13 @@ func IsFoxEdibleMouthItem(itemName string) bool {
 		"minecraft:beef", "minecraft:cooked_beef",
 		"minecraft:porkchop", "minecraft:cooked_porkchop",
 		"minecraft:mutton", "minecraft:cooked_mutton",
-		"minecraft:apple", "minecraft:chorus_fruit":
+		"minecraft:apple", "minecraft:chorus_fruit",
+		"minecraft:mushroom_stew", "minecraft:rabbit_stew",
+		"minecraft:beetroot_soup", "minecraft:suspicious_stew",
+		"minecraft:honey_bottle", "minecraft:rotten_flesh",
+		"minecraft:bread", "minecraft:cooked_potato", "minecraft:baked_potato",
+		"minecraft:carrot", "minecraft:golden_carrot", "minecraft:melon_slice",
+		"minecraft:pumpkin_pie", "minecraft:cookie", "minecraft:tropical_fish":
 		return true
 	default:
 		return false
@@ -299,18 +307,21 @@ func IsFoxEdibleMouthItem(itemName string) bool {
 // IsFoxPreyMob reports whether a fox naturally hunts and pounces on mobType.
 func IsFoxPreyMob(mobType string) bool {
 	switch canonicalResourceName(mobType) {
-	case MobTypeChicken, "minecraft:rabbit", "minecraft:cod", "minecraft:salmon", MobTypeTadpole:
+	case MobTypeChicken, "minecraft:rabbit", "minecraft:cod", "minecraft:salmon", "minecraft:tropical_fish", MobTypeTadpole:
 		return true
 	default:
 		return false
 	}
 }
 
-// ResolveFoxVariantForBiome returns `FoxVariantSnow` (1) for snowy taiga / grove
-// biomes and `FoxVariantRed` (0) for standard taiga / forest biomes.
+// ResolveFoxVariantForBiome returns `FoxVariantSnow` (1) for `#minecraft:spawns_snow_foxes`
+// biomes and `FoxVariantRed` (0) otherwise.
 func ResolveFoxVariantForBiome(biomeName string) int32 {
 	switch canonicalResourceName(biomeName) {
-	case "minecraft:snowy_taiga", "minecraft:grove", "minecraft:snowy_plains", "minecraft:snowy_slopes", "minecraft:frozen_peaks":
+	case "minecraft:snowy_plains", "minecraft:ice_spikes", "minecraft:frozen_ocean",
+		"minecraft:snowy_taiga", "minecraft:frozen_river", "minecraft:snowy_beach",
+		"minecraft:frozen_peaks", "minecraft:jagged_peaks", "minecraft:snowy_slopes",
+		"minecraft:grove":
 		return FoxVariantSnow
 	default:
 		return FoxVariantRed
@@ -581,7 +592,12 @@ func (s *Server) TryFoxPickUpItem(entityID int32, candidate world.ItemStack) (pi
 	dim := ent.EffectiveDimension()
 	cp := ent.ChunkPos()
 	if !spatOut.IsEmpty() {
-		s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, spatOut)
+		spatID, _ := s.SpawnItemEntityInDimension(dim, ent.X, ent.Y+0.25, ent.Z, spatOut)
+		if spatID > 0 {
+			s.entities.Update(spatID, func(e *world.Entity) {
+				e.PickupDelay = FoxSpitPickupDelay
+			})
+		}
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 			EncodeSoundPacket(SoundFoxSpit, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	}
@@ -1202,7 +1218,7 @@ func (s *Server) InteractWithFoxPandaOrOcelot(session *PlayerSession, entityID i
 	return false, 0
 }
 
-func (s *Server) inheritFoxPandaOcelotTraits(parentA, parentB, offspringID int32, offspringType string, causePlayer *PlayerSession, rng *rand.Rand) {
+func (s *Server) inheritFoxPandaOcelotTraits(parentA, parentB, offspringID int32, offspringType string, causePlayerA, causePlayerB *PlayerSession, rng *rand.Rand) {
 	norm := canonicalResourceName(offspringType)
 	switch norm {
 	case MobTypeFox:
@@ -1213,14 +1229,19 @@ func (s *Server) inheritFoxPandaOcelotTraits(parentA, parentB, offspringID int32
 			variant = fb.Variant
 		}
 		s.SetFoxVariant(offspringID, variant)
-		if causePlayer != nil {
-			s.AddFoxTrustedPlayer(offspringID, causePlayer.Profile.UUID)
+		if causePlayerA != nil {
+			s.AddFoxTrustedPlayer(offspringID, causePlayerA.Profile.UUID)
 		}
-		for _, u := range fa.TrustedUUIDs {
-			s.AddFoxTrustedPlayer(offspringID, u)
+		if causePlayerB != nil {
+			s.AddFoxTrustedPlayer(offspringID, causePlayerB.Profile.UUID)
 		}
-		for _, u := range fb.TrustedUUIDs {
-			s.AddFoxTrustedPlayer(offspringID, u)
+		if causePlayerA == nil && causePlayerB == nil {
+			for _, u := range fa.TrustedUUIDs {
+				s.AddFoxTrustedPlayer(offspringID, u)
+			}
+			for _, u := range fb.TrustedUUIDs {
+				s.AddFoxTrustedPlayer(offspringID, u)
+			}
 		}
 
 	case MobTypePanda:
@@ -1231,7 +1252,11 @@ func (s *Server) inheritFoxPandaOcelotTraits(parentA, parentB, offspringID int32
 		s.SetMobHealth(offspringID, PandaMaxHealthForGenes(mg, hg))
 
 	case MobTypeOcelot:
-		s.SetOcelotTrusting(offspringID, true, causePlayer)
+		ocCause := causePlayerA
+		if ocCause == nil {
+			ocCause = causePlayerB
+		}
+		s.SetOcelotTrusting(offspringID, true, ocCause)
 
 	case MobTypeRabbit:
 		ra, _ := s.GetRabbitState(parentA)
@@ -1320,17 +1345,48 @@ func (s *Server) tickSingleFox(entityID int32, rng *rand.Rand) {
 	if fs.AttackCooldown > 0 {
 		fs.AttackCooldown--
 	}
-	// Eat held food item after FoxEatHeldTicks (600 ticks).
+	if fs.FaceplantTicks > 0 {
+		fs.FaceplantTicks--
+		wokeFromFaceplant := fs.FaceplantTicks == 0
+		if wokeFromFaceplant {
+			fs.Flags &^= FoxFlagFaceplanted
+		}
+		variant := fs.Variant
+		flags := fs.Flags
+		mgr.mu.Unlock()
+		if wokeFromFaceplant {
+			s.entities.Update(entityID, func(e *world.Entity) {
+				e.Pitch = 0
+			})
+			cp := ent.ChunkPos()
+			s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySetEntityDataCB,
+				EncodeFoxEntityDataPacket(entityID, variant, flags))
+		}
+		return
+	}
+	// Eat held food item after FoxEatHeldTicks (600 ticks) ONLY when `canEat` (`!isSleeping && onGround && no target`).
 	shouldEatHeld := false
-	if !fs.HeldItem.IsEmpty() && IsFoxEdibleMouthItem(fs.HeldItem.ResolvedID()) {
+	playChewSound := false
+	canEat := (fs.Flags&FoxFlagSleeping) == 0 && ent.OnGround && fs.DefendTargetID == 0 && fs.HuntTargetID == 0
+	if canEat && !fs.HeldItem.IsEmpty() && IsFoxEdibleMouthItem(fs.HeldItem.ResolvedID()) {
 		fs.EatTicks++
 		if fs.EatTicks >= FoxEatHeldTicks {
 			shouldEatHeld = true
+		} else if fs.EatTicks > 560 && rng != nil && rng.Float64() < 0.1 {
+			playChewSound = true
 		}
 	}
 	snap := *fs
 	mgr.mu.Unlock()
 
+	if playChewSound {
+		cp := ent.ChunkPos()
+		dim := ent.EffectiveDimension()
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+			EncodeSoundPacket(SoundFoxEat, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+			EncodeEntityEventPacket(entityID, 45))
+	}
 	if shouldEatHeld {
 		s.EatFoxHeldItem(entityID, rng)
 		ent = s.entities.Get(entityID)
@@ -1343,35 +1399,40 @@ func (s *Server) tickSingleFox(entityID int32, rng *rand.Rand) {
 	cache := s.DimensionChunks(dim)
 	feetY := int(math.Floor(ent.Y + 0.01))
 
-	// 1. Check nearby dropped item entities to pick up into mouth.
+	// 1. Check nearby dropped item entities to pick up into mouth (only when awake).
 	allEnts := s.entities.AppendAll(nil)
-	for i := range allEnts {
-		it := &allEnts[i]
-		if !it.IsItem() || it.EffectiveDimension() != dim || it.PickupDelay > 0 {
-			continue
-		}
-		dx := it.X - ent.X
-		dy := it.Y - ent.Y
-		dz := it.Z - ent.Z
-		if dx*dx+dy*dy+dz*dz <= 2.25 {
-			if picked, _ := s.TryFoxPickUpItem(entityID, it.Item); picked {
-				if it.Item.Count <= 1 {
-					s.entities.Remove(it.ID)
-					cp := it.ChunkPos()
-					s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
-						encodeRemoveEntitiesPacket(nil, []int32{it.ID}))
-				} else {
-					s.entities.Update(it.ID, func(e *world.Entity) {
-						e.Item.Count--
-					})
+	if (snap.Flags & FoxFlagSleeping) == 0 {
+		for i := range allEnts {
+			it := &allEnts[i]
+			if !it.IsItem() || it.EffectiveDimension() != dim || it.PickupDelay > 0 {
+				continue
+			}
+			dx := it.X - ent.X
+			dy := it.Y - ent.Y
+			dz := it.Z - ent.Z
+			if dx*dx+dy*dy+dz*dz <= 2.25 {
+				if picked, _ := s.TryFoxPickUpItem(entityID, it.Item); picked {
+					if it.Item.Count <= 1 {
+						s.entities.Remove(it.ID)
+						cp := it.ChunkPos()
+						s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
+							encodeRemoveEntitiesPacket(nil, []int32{it.ID}))
+					} else {
+						s.entities.Update(it.ID, func(e *world.Entity) {
+							e.Item.Count--
+						})
+					}
+					break
 				}
-				break
 			}
 		}
 	}
 
 	// 2. Defend trusted player if DefendTargetID > 0.
 	if snap.DefendTargetID > 0 {
+		if (snap.Flags & FoxFlagSleeping) != 0 {
+			s.SetFoxSleeping(entityID, false)
+		}
 		target := s.entities.Get(snap.DefendTargetID)
 		if target == nil || target.EffectiveDimension() != dim {
 			mgr.mu.Lock()
@@ -1424,15 +1485,27 @@ func (s *Server) tickSingleFox(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	// 4. Daytime sleeping behavior: during daytime (not thundering), foxes curl up and sleep.
-	isDay := !s.IsNight() && !s.IsThundering()
-	if isDay {
+	// 4. FoxEatBerriesGoal: harvest ripe sweet_berry_bush / cave_vines when awake!
+	if (snap.Flags & FoxFlagSleeping) == 0 {
+		if s.TryFoxHarvestNearbyBerries2612(entityID, rng) {
+			return
+		}
+	}
+
+	// 5. Daytime sleeping behavior (`Fox$SleepGoal` & `hasShelter`):
+	//    During daytime (not thundering, not in water) UNDER SHADE (`!canSeeSky`), foxes curl up and sleep.
+	inWater := IsMobEntityInWater2612(s, ent)
+	bx := int(math.Floor(ent.X))
+	bz := int(math.Floor(ent.Z))
+	hasShelter := HasFoxDaytimeShelter2612(cache, bx, feetY, bz)
+	isDay := !s.IsNight() && !s.IsThundering() && !inWater
+	if isDay && hasShelter {
 		if (snap.Flags & FoxFlagSleeping) == 0 {
 			s.SetFoxSleeping(entityID, true)
 		}
 		return
 	}
-	if (snap.Flags & FoxFlagSleeping) != 0 {
+	if (snap.Flags&FoxFlagSleeping) != 0 && (!isDay || !hasShelter) {
 		s.SetFoxSleeping(entityID, false)
 	}
 

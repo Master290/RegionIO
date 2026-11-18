@@ -369,6 +369,7 @@ type ItemMeta struct {
 	RepairCost         int32
 	CanPlaceOn         []string
 	CanBreak           []string
+	BucketAxolotl      *AxolotlBucketData2612
 }
 
 // Equipment break ClientboundEntityEventPacket (0x22) status codes (LivingEntity.entityEventForEquipmentBreak in 26.1.2).
@@ -384,9 +385,10 @@ const (
 // Clone returns a deep copy of m.
 func (m ItemMeta) Clone() ItemMeta {
 	cp := ItemMeta{
-		Damage:     m.Damage,
-		CustomName: m.CustomName,
-		RepairCost: m.RepairCost,
+		Damage:        m.Damage,
+		CustomName:    m.CustomName,
+		RepairCost:    m.RepairCost,
+		BucketAxolotl: m.BucketAxolotl.Clone(),
 	}
 	if len(m.Enchantments) > 0 {
 		cp.Enchantments = make(map[string]int, len(m.Enchantments))
@@ -413,10 +415,10 @@ func (m ItemMeta) Clone() ItemMeta {
 	return cp
 }
 
-// IsEmpty reports whether m carries no damage, enchantments, stored enchantments, Adventure predicates, custom name, or repair cost.
+// IsEmpty reports whether m carries no damage, enchantments, stored enchantments, Adventure predicates, custom name, repair cost, or bucket data.
 func (m ItemMeta) IsEmpty() bool {
 	return m.Damage == 0 && len(m.Enchantments) == 0 && len(m.StoredEnchantments) == 0 &&
-		m.CustomName == "" && m.RepairCost == 0 && len(m.CanPlaceOn) == 0 && len(m.CanBreak) == 0
+		m.CustomName == "" && m.RepairCost == 0 && len(m.CanPlaceOn) == 0 && len(m.CanBreak) == 0 && m.BucketAxolotl == nil
 }
 
 // NormalizeAdventureBlockEntries normalizes block names and `#tag` entries for

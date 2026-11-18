@@ -41,10 +41,10 @@ const (
 	TropicalFishBucketItemID = "minecraft:tropical_fish_bucket"
 
 	// SynchedEntityData indices for Axolotl in Minecraft 26.1.2 (protocol 775).
-	// Axolotl extends Animal -> AgeableMob (16) -> PathfinderMob -> Mob -> LivingEntity -> Entity.
-	EntityDataAxolotlVariantID     byte = 17 // Axolotl.DATA_VARIANT (INT serializer = 1)
-	EntityDataAxolotlPlayingDeadID byte = 18 // Axolotl.DATA_PLAYING_DEAD (BOOLEAN serializer = 8)
-	EntityDataAxolotlFromBucketID  byte = 19 // Axolotl.FROM_BUCKET (BOOLEAN serializer = 8)
+	// Axolotl extends Animal -> AgeableMob (16=DATA_BABY_ID, 17=AGE_LOCKED) -> PathfinderMob -> Mob -> LivingEntity -> Entity.
+	EntityDataAxolotlVariantID     byte = 18 // Axolotl.DATA_VARIANT (INT serializer = 1)
+	EntityDataAxolotlPlayingDeadID byte = 19 // Axolotl.DATA_PLAYING_DEAD (BOOLEAN serializer = 8)
+	EntityDataAxolotlFromBucketID  byte = 20 // Axolotl.FROM_BUCKET (BOOLEAN serializer = 8)
 
 	// Canonical Axolotl sounds.
 	SoundAxolotlAttack      = "minecraft:entity.axolotl.attack"
@@ -336,6 +336,7 @@ func (s *Server) TriggerAxolotlPlayDead(entityID int32) bool {
 	mgr.mu.Unlock()
 
 	s.ApplyEntityEffectScaled(entityID, NewStatusEffectInstance(EffectRegeneration, int32(AxolotlPlayDeadDurationTicks), 0), 1.0)
+	s.ClearEnemyTargetsOnPlayingDeadAxolotl2612(entityID)
 	s.broadcastAxolotlState(ent, snap)
 	return true
 }
@@ -361,53 +362,52 @@ func (s *Server) IsAxolotlInWater(entityID int32) bool {
 		cache.FluidHeightAt(bx, by, bz) > 0
 }
 
-// OnAxolotlDamaged is invoked when an Axolotl takes damage; in vanilla 26.1.2,
-// if the Axolotl is damaged in water and drops below 50% HP, takes > 2.0 damage,
-// or passes a 1-in-3 random roll, it plays dead for 200 ticks and regenerates health.
-func (s *Server) OnAxolotlDamaged(entityID int32, damage float32, rng *rand.Rand) bool {
-	if s == nil || s.entities == nil || damage <= 0 {
+// OnAxolotlDamagedPreHP evaluates `Axolotl.hurtServer` using the exact 26.1.2 pre-damage health:
+// `!isNoAi && random.nextInt(3) == 0 && (random.nextInt(3) < damage || preDamageHP/maxHP < 0.5) && damage < preDamageHP && isInWater && hasAttacker && !isPlayingDead`.
+func (s *Server) OnAxolotlDamagedPreHP(entityID int32, preDamageHP, damage float32, hasAttacker bool, rng *rand.Rand) bool {
+	if s == nil || s.entities == nil || damage <= 0 || preDamageHP <= 0 {
 		return false
 	}
 	ent := s.entities.Get(entityID)
 	if ent == nil || canonicalResourceName(ent.TypeName) != MobTypeAxolotl {
 		return false
 	}
-	curHP := s.MobHealth(entityID)
-	if curHP <= 0 {
-		return false
-	}
-	if !s.IsAxolotlInWater(entityID) {
-		return false
-	}
-	shouldPlayDead := curHP <= DefaultAxolotlMaxHealth*0.5 || damage > 2.0 || damage >= curHP
-	if !shouldPlayDead {
-		if rng == nil || rng.Intn(3) == 0 {
-			shouldPlayDead = true
-		}
-	}
-	if !shouldPlayDead {
+	st, _ := s.GetAxolotlState(entityID)
+	if !ShouldAxolotlPlayDead2612(false, st.PlayingDead, s.IsAxolotlInWater(entityID), hasAttacker, damage, preDamageHP, DefaultAxolotlMaxHealth, rng) {
 		return false
 	}
 	return s.TriggerAxolotlPlayDead(entityID)
 }
 
-// GrantAxolotlPlayerSupport applies the vanilla Axolotl combat-assistance reward
-// to player:
-//   - Grants Regeneration I (`EffectRegeneration`) for 100 ticks (+100 ticks if
-//     already active, capped at 2400 ticks / 2 minutes)
-//   - Removes Mining Fatigue (`EffectMiningFatigue`) from the player!
+// OnAxolotlDamaged implements `Axolotl.hurtServer` in vanilla 26.1.2:
+// `!isNoAi && random.nextInt(3) == 0 && (random.nextInt(3) < damage || curHP/maxHP < 0.5) && damage < curHP && isInWater && !isPlayingDead`.
+func (s *Server) OnAxolotlDamaged(entityID int32, damage float32, rng *rand.Rand) bool {
+	if s == nil || s.entities == nil || damage <= 0 {
+		return false
+	}
+	return s.OnAxolotlDamagedPreHP(entityID, s.MobHealth(entityID), damage, true, rng)
+}
+
+// GrantAxolotlPlayerSupport applies `Axolotl.applySupportingEffects` in vanilla 26.1.2:
+//   - If player has no Regeneration or `existing.Duration <= 2399` (`endsWithin(2399)`),
+//     grants Regeneration I (`min(2400, 100 + existing.Duration)` ticks), never clamping
+//     a longer `>= 2400`-tick Regeneration down to 2400!
+//   - Removes Mining Fatigue (`EffectMiningFatigue`) from the player.
 func (s *Server) GrantAxolotlPlayerSupport(axolotlID int32, player *PlayerSession) bool {
 	if s == nil || player == nil || player.IsDead() {
 		return false
 	}
-	dur := AxolotlPlayerRegenBaseTicks
-	if existing, ok := player.PlayerEffect(EffectRegeneration); ok && existing.Duration > 0 {
-		dur += existing.Duration
-		if dur > AxolotlPlayerRegenMaxTicks {
-			dur = AxolotlPlayerRegenMaxTicks
+	existing, hasExisting := player.PlayerEffect(EffectRegeneration)
+	if !hasExisting || existing.Duration <= 2399 {
+		dur := AxolotlPlayerRegenBaseTicks
+		if hasExisting && existing.Duration > 0 {
+			dur += existing.Duration
+			if dur > AxolotlPlayerRegenMaxTicks {
+				dur = AxolotlPlayerRegenMaxTicks
+			}
 		}
+		s.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectRegeneration, dur, 0))
 	}
-	s.ApplyPlayerEffect(player, NewStatusEffectInstance(EffectRegeneration, dur, 0))
 	s.RemovePlayerEffect(player, EffectMiningFatigue)
 	s.GrantAdvancement(player, "minecraft:husbandry/kill_axolotl_target")
 	return true
@@ -545,15 +545,29 @@ func (s *Server) CatchAxolotlInBucket(session *PlayerSession, entityID int32) bo
 	st := s.ensureAxolotlState(entityID, AxolotlVariantLucy)
 	age := s.MobAge(entityID)
 	hp := s.MobHealth(entityID)
+	customName := s.GetMobCustomName2612(entityID)
 	mgr := s.axolotlManager()
 	mgr.mu.Lock()
+	variant := st.Variant
+	huntCD := int64(st.PassiveHuntCooldown)
 	mgr.bucketedMap[session] = bucketedAxolotlInfo{
-		Variant:  st.Variant,
+		Variant:  variant,
 		AgeTicks: age,
 		Health:   hp,
 	}
 	delete(mgr.axolotls, entityID)
 	mgr.mu.Unlock()
+
+	bucketMeta := ItemMeta{
+		CustomName: customName,
+		BucketAxolotl: &AxolotlBucketData2612{
+			Variant:         variant,
+			AgeTicks:        age,
+			Health:          hp,
+			HuntingCooldown: huntCD,
+			CustomName:      customName,
+		},
+	}
 
 	dim := ent.EffectiveDimension()
 	cp := ent.ChunkPos()
@@ -562,16 +576,30 @@ func (s *Server) CatchAxolotlInBucket(session *PlayerSession, entityID int32) bo
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{entityID}))
 
+	placeBucketWithMeta := func() {
+		for idx := 0; idx < int(world.PlayerInventorySlots); idx++ {
+			if idx >= 36 || idx >= 9 && idx < 36 {
+				if session.InventorySlot(idx).IsEmpty() {
+					session.SetInventorySlot(idx, axBucket)
+					SetSlotItemMeta(session, idx, bucketMeta)
+					return
+				}
+			}
+		}
+		_, _ = session.AddItemToInventory(axBucket)
+	}
+
 	slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
 	if snap.GameMode != GameModeCreative {
 		if held.Count <= 1 {
 			session.SetInventorySlot(slotIdx, axBucket)
+			SetSlotItemMeta(session, slotIdx, bucketMeta)
 		} else {
 			session.SetInventorySlot(slotIdx, world.NewItemStack(held.ResolvedItemID(), held.Count-1))
-			_, _ = session.AddItemToInventory(axBucket)
+			placeBucketWithMeta()
 		}
 	} else {
-		_, _ = session.AddItemToInventory(axBucket)
+		placeBucketWithMeta()
 	}
 	s.TriggerItemAcquired(session, axBucket)
 
@@ -582,9 +610,8 @@ func (s *Server) CatchAxolotlInBucket(session *PlayerSession, entityID int32) bo
 
 // ReleaseAxolotlFromBucket empties a `minecraft:axolotl_bucket` held by session
 // at block (x, y, z) in dimension: places water, spawns the `minecraft:axolotl`
-// with its preserved variant/age/health and FromBucket=true, and replaces the
-// bucket with `minecraft:bucket` in survival mode.
-// (Can be called directly by Agent B's bucket block-placement handler.)
+// with its preserved per-stack bucket data (`Variant`, `Age`, `Health`, `HuntingCooldown`,
+// `CustomName`) and `FromBucket=true`, and replaces the bucket with `minecraft:bucket` in survival mode.
 func (s *Server) ReleaseAxolotlFromBucket(session *PlayerSession, dimension string, x, y, z int) (axolotlID int32, ok bool) {
 	if s == nil || s.entities == nil || session == nil || session.IsDead() {
 		return 0, false
@@ -600,33 +627,61 @@ func (s *Server) ReleaseAxolotlFromBucket(session *PlayerSession, dimension stri
 		s.broadcastMobBlockUpdate(normDim, x, y, z, world.StateWater)
 	}
 
+	slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
+	slotMeta := GetSlotItemMeta(session, slotIdx)
+	bucketData := slotMeta.BucketAxolotl.Clone()
+
 	mgr := s.axolotlManager()
-	mgr.mu.Lock()
-	saved, hasSaved := mgr.bucketedMap[session]
-	delete(mgr.bucketedMap, session)
-	mgr.mu.Unlock()
+	var saved bucketedAxolotlInfo
+	var hasSaved bool
+	if bucketData == nil {
+		mgr.mu.Lock()
+		saved, hasSaved = mgr.bucketedMap[session]
+		delete(mgr.bucketedMap, session)
+		mgr.mu.Unlock()
+	}
 
 	variant := AxolotlVariantLucy
 	isBaby := false
-	if hasSaved {
+	ageTicks := 0
+	var savedHP float32
+	var huntCooldown int
+	var customName string
+	if bucketData != nil {
+		variant = bucketData.Variant
+		ageTicks = bucketData.AgeTicks
+		isBaby = ageTicks < 0
+		savedHP = bucketData.Health
+		huntCooldown = int(bucketData.HuntingCooldown)
+		customName = bucketData.CustomName
+		if customName == "" {
+			customName = slotMeta.CustomName
+		}
+	} else if hasSaved {
 		variant = saved.Variant
-		isBaby = saved.AgeTicks < 0
+		ageTicks = saved.AgeTicks
+		isBaby = ageTicks < 0
+		savedHP = saved.Health
 	}
 	aid, err := s.SpawnAxolotl(normDim, float64(x)+0.5, float64(y), float64(z)+0.5, variant, isBaby)
 	if err != nil || aid <= 0 {
 		return 0, false
 	}
-	if hasSaved {
-		if saved.AgeTicks < 0 {
-			s.SetMobAge(aid, saved.AgeTicks)
-		}
-		if saved.Health > 0 {
-			s.SetMobHealth(aid, saved.Health)
-		}
+	if ageTicks != 0 {
+		s.SetMobAge(aid, ageTicks)
+	}
+	if savedHP > 0 {
+		s.SetMobHealth(aid, savedHP)
+	}
+	if customName != "" {
+		s.SetMobCustomName2612(aid, customName)
 	}
 	st := s.ensureAxolotlState(aid, variant)
 	mgr.mu.Lock()
 	st.FromBucket = true
+	if huntCooldown > 0 {
+		st.PassiveHuntCooldown = huntCooldown
+	}
 	snapSt := *st
 	mgr.mu.Unlock()
 	if ent := s.entities.Get(aid); ent != nil {
@@ -634,8 +689,8 @@ func (s *Server) ReleaseAxolotlFromBucket(session *PlayerSession, dimension stri
 	}
 
 	if snap.GameMode != GameModeCreative {
-		slotIdx := world.HotbarContainerOffset + int(snap.SelectedSlot)
 		session.SetInventorySlot(slotIdx, world.NewNamedItemStack(EmptyBucketItemID, 1))
+		SetSlotItemMeta(session, slotIdx, ItemMeta{})
 	}
 
 	cx := int32(x >> 4)
@@ -774,6 +829,7 @@ func (s *Server) TickAxolotls(rng *rand.Rand) {
 		if st == nil {
 			continue
 		}
+		inWaterNow := s.IsAxolotlInWater(ent.ID)
 		mgr.mu.Lock()
 		if st.PassiveHuntCooldown > 0 {
 			st.PassiveHuntCooldown--
@@ -782,35 +838,45 @@ func (s *Server) TickAxolotls(rng *rand.Rand) {
 			st.AttackCooldown--
 		}
 		if st.PlayingDead {
-			st.PlayingDeadTicks--
-			// Heal +0.5 HP every 25 ticks while playing dead.
-			healNow := st.PlayingDeadTicks%25 == 0
-			wokeUp := st.PlayingDeadTicks <= 0
-			if wokeUp {
+			// `PlayDead.canStillUse` + `ValidatePlayDead`: leaving water immediately cancels PlayDead!
+			if !inWaterNow {
 				st.PlayingDead = false
 				st.PlayingDeadTicks = 0
-			}
-			snap := *st
-			mgr.mu.Unlock()
-			if healNow {
-				curHP := s.MobHealth(ent.ID)
-				if curHP > 0 && curHP < DefaultAxolotlMaxHealth {
-					nextHP := curHP + 1.0
-					if nextHP > DefaultAxolotlMaxHealth {
-						nextHP = DefaultAxolotlMaxHealth
-					}
-					s.SetMobHealth(ent.ID, nextHP)
-				}
-			}
-			if wokeUp {
+				snap := *st
+				mgr.mu.Unlock()
 				s.broadcastAxolotlState(ent, snap)
+			} else {
+				st.PlayingDeadTicks--
+				// Regeneration I (`amplifier = 0`) heals +1.0 HP every 50 ticks (`50 >> 0 = 50`).
+				healNow := st.PlayingDeadTicks%50 == 0
+				wokeUp := st.PlayingDeadTicks <= 0
+				if wokeUp {
+					st.PlayingDead = false
+					st.PlayingDeadTicks = 0
+				}
+				snap := *st
+				mgr.mu.Unlock()
+				if healNow {
+					curHP := s.MobHealth(ent.ID)
+					if curHP > 0 && curHP < DefaultAxolotlMaxHealth {
+						nextHP := curHP + 1.0
+						if nextHP > DefaultAxolotlMaxHealth {
+							nextHP = DefaultAxolotlMaxHealth
+						}
+						s.SetMobHealth(ent.ID, nextHP)
+					}
+				}
+				if wokeUp {
+					s.broadcastAxolotlState(ent, snap)
+				}
+				continue
 			}
-			continue
+			mgr.mu.Lock()
 		}
 		canAttack := st.AttackCooldown <= 0
 		canHuntPassive := st.PassiveHuntCooldown <= 0
-		inWater := s.IsAxolotlInWater(ent.ID)
-		if inWater {
+		inWaterOrRain := IsAxolotlHydratedAt2612(s, ent)
+		if inWaterOrRain {
 			st.OutOfWaterTicks = 0
 		} else {
 			st.OutOfWaterTicks++
@@ -818,8 +884,11 @@ func (s *Server) TickAxolotls(rng *rand.Rand) {
 		outTicks := st.OutOfWaterTicks
 		mgr.mu.Unlock()
 
-		if !inWater && outTicks > AxolotlMaxOutOfWaterTicks && outTicks%20 == 0 && s.MobHealth(ent.ID) > 1.0 {
-			_ = s.applyDamageToMob(ent, 1.0, nil, 0, false, true)
+		// Axolotl.handleAirSupply: 6000 max air supply, then 2.0 dry_out damage every 20 ticks until death!
+		if !inWaterOrRain && outTicks > AxolotlMaxOutOfWaterTicks && outTicks%20 == 0 {
+			if s.applyEnvironmentalPanicDamageToMob(ent, AxolotlDryOutDamage) {
+				continue
+			}
 		}
 
 		if !canAttack {

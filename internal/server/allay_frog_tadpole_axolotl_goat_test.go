@@ -618,8 +618,14 @@ func TestAllayFrogTadpoleAxolotlPolish2612(t *testing.T) {
 		t.Fatal("expected Axolotl on dry land not to play dead when damaged")
 	}
 	cache.SetBlock(140, int(surfaceY), 100, world.StateWater)
-	if !srv.OnAxolotlDamaged(dryAxID, 8.0, rng) || !srv.IsAxolotlPlayingDead(dryAxID) {
-		t.Fatal("expected Axolotl in water to play dead when taking heavy damage")
+	playedDeadInWater := false
+	for attempt := 0; attempt < 30 && !playedDeadInWater; attempt++ {
+		if srv.OnAxolotlDamaged(dryAxID, 8.0, rng) {
+			playedDeadInWater = true
+		}
+	}
+	if !playedDeadInWater || !srv.IsAxolotlPlayingDead(dryAxID) {
+		t.Fatal("expected Axolotl in water to play dead when taking heavy damage (1/3 roll)")
 	}
 
 	// Combat priority: spawn a combat-ready Axolotl with a passive cod 1.2 blocks away and a hostile drowned 1.6 blocks away.

@@ -2526,7 +2526,8 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 			if bestPlayer == nil {
 				if other := s.entities.Get(curGoalTargetID); other != nil && other.EffectiveDimension() == dim && s.MobHealth(other.ID) > 0 {
 					onorm := canonicalResourceName(other.TypeName)
-					if onorm == MobTypeSquid || onorm == MobTypeGlowSquid || onorm == MobTypeAxolotl {
+					if (onorm == MobTypeSquid || onorm == MobTypeGlowSquid || onorm == MobTypeAxolotl) &&
+						!(onorm == MobTypeAxolotl && s.IsAxolotlPlayingDead(other.ID)) {
 						dx, dy, dz := other.X-ent.X, other.Y-ent.Y, other.Z-ent.Z
 						dSq := dx*dx + dy*dy + dz*dz
 						if dSq <= maxDistSq && (isElder || dSq > GuardianMinAttackDistSq) {
@@ -2571,6 +2572,9 @@ func (s *Server) tickGuardians(rng *rand.Rand) {
 					}
 					onorm := canonicalResourceName(other.TypeName)
 					if onorm != MobTypeSquid && onorm != MobTypeGlowSquid && onorm != MobTypeAxolotl {
+						continue
+					}
+					if onorm == MobTypeAxolotl && s.IsAxolotlPlayingDead(other.ID) {
 						continue
 					}
 					dx, dy, dz := other.X-ent.X, other.Y-ent.Y, other.Z-ent.Z

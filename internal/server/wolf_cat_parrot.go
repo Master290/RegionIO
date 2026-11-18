@@ -20,17 +20,17 @@ const (
 	WolfArmorScuteRepairAmount int32 = 8 // 12.5% of 64 = 8 durability restored per armadillo_scute
 	DefaultWolfArmorRGB        int32 = -1
 
-	// SynchedEntityData indices for Wolf, Cat, and Parrot in 26.1.2 (protocol 775).
-	EntityDataWolfVariantID         byte  = 22 // Wolf.DATA_VARIANT_ID (WOLF_VARIANT serializer = 22)
-	EntityDataSerializerWolfVariant int32 = 22
+	// SynchedEntityData indices & serializers for Wolf, Cat, and Parrot in 26.1.2 (protocol 775).
+	EntityDataWolfVariantID         byte  = 23 // Wolf.DATA_VARIANT_ID (WOLF_VARIANT serializer = 25)
+	EntityDataSerializerWolfVariant int32 = 25
 
-	EntityDataCatVariantID         byte  = 18 // Cat.DATA_VARIANT_ID (CAT_VARIANT serializer = 23)
-	EntityDataCatIsLyingID         byte  = 19 // Cat.IS_LYING (BOOLEAN serializer = 8)
-	EntityDataCatRelaxStateOneID   byte  = 20 // Cat.RELAX_STATE_ONE (BOOLEAN serializer = 8)
-	EntityDataCatCollarColor26ID   byte  = 21 // Cat.DATA_COLLAR_COLOR (INT serializer = 1)
-	EntityDataSerializerCatVariant int32 = 23
+	EntityDataCatVariantID         byte  = 20 // Cat.DATA_VARIANT_ID (CAT_VARIANT serializer = 21)
+	EntityDataCatIsLyingID         byte  = 21 // Cat.IS_LYING (BOOLEAN serializer = 8)
+	EntityDataCatRelaxStateOneID   byte  = 22 // Cat.RELAX_STATE_ONE (BOOLEAN serializer = 8)
+	EntityDataCatCollarColor26ID   byte  = 23 // Cat.DATA_COLLAR_COLOR (INT serializer = 1)
+	EntityDataSerializerCatVariant int32 = 21
 
-	EntityDataParrotVariantID byte = 19 // Parrot.DATA_VARIANT_ID (INT serializer = 1: 0..4)
+	EntityDataParrotVariantID byte = 20 // Parrot.DATA_VARIANT_ID (INT serializer = 1: 0..4)
 
 	// Cat & Ocelot repulsion radii.
 	CatCreeperRepelRange      = 6.0
@@ -150,23 +150,25 @@ func WolfArmorCrackLevelForDamage(damage int32) WolfArmorCrackLevel {
 	}
 }
 
-// WolfDetailState holds biome variant and wolf_armor state for a wolf entity.
+// WolfDetailState holds biome variant, sound variant, and wolf_armor state for a wolf entity.
 type WolfDetailState struct {
-	EntityID   int32
-	Variant    string
-	HasArmor   bool
-	ArmorStack world.ItemStack
-	ArmorMeta  ItemMeta
-	DyedRGB    int32 // -1 if undyed, 0xRRGGBB if dyed
+	EntityID     int32
+	Variant      string
+	SoundVariant string
+	HasArmor     bool
+	ArmorStack   world.ItemStack
+	ArmorMeta    ItemMeta
+	DyedRGB      int32 // -1 if undyed, 0xRRGGBB if dyed
 }
 
-// CatDetailState holds variant, lying/relaxed state, and gift cooldown for a cat entity.
+// CatDetailState holds variant, sound variant, lying/relaxed state, and gift cooldown for a cat entity.
 type CatDetailState struct {
-	EntityID       int32
-	Variant        string
-	Lying          bool
-	Relaxed        bool
-	LastGiftDay    int64
+	EntityID     int32
+	Variant      string
+	SoundVariant string
+	Lying        bool
+	Relaxed      bool
+	LastGiftDay  int64
 }
 
 // ParrotDetailState holds color variant, dancing state, and imitation cooldown for a parrot entity.
@@ -224,13 +226,13 @@ func ResolveWolfVariantForBiome(biomeName string) string {
 		return WolfVariantChestnut
 	case "minecraft:sparse_jungle", "minecraft:jungle", "minecraft:bamboo_jungle":
 		return WolfVariantRusty
-	case "minecraft:grove", "minecraft:snowy_plains", "minecraft:snowy_slopes", "minecraft:frozen_peaks", "minecraft:jagged_peaks":
+	case "minecraft:grove":
 		return WolfVariantSnowy
 	case "minecraft:savanna", "minecraft:savanna_plateau", "minecraft:windswept_savanna":
 		return WolfVariantSpotted
 	case "minecraft:wooded_badlands", "minecraft:badlands", "minecraft:eroded_badlands":
 		return WolfVariantStriped
-	case "minecraft:forest", "minecraft:flower_forest", "minecraft:birch_forest", "minecraft:dark_forest":
+	case "minecraft:forest":
 		return WolfVariantWoods
 	case "minecraft:taiga":
 		return WolfVariantPale
@@ -255,15 +257,10 @@ func WolfVariantRegistryIndex(variant string) int32 {
 }
 
 // EncodeWolfVariantDataPacket encodes a ClientboundSetEntityDataPacket (0x63)
-// updating Wolf.DATA_VARIANT_ID (index 22, WOLF_VARIANT serializer 22).
+// updating Wolf.DATA_VARIANT_ID (index 23, WOLF_VARIANT serializer 25) and
+// Wolf.DATA_SOUND_VARIANT_ID (index 24, WOLF_SOUND_VARIANT serializer 26).
 func EncodeWolfVariantDataPacket(entityID int32, variant string) []byte {
-	w := protocol.NewWriter(12)
-	w.VarInt(entityID)
-	w.Byte(EntityDataWolfVariantID)
-	w.VarInt(EntityDataSerializerWolfVariant)
-	w.VarInt(WolfVariantRegistryIndex(variant))
-	w.Byte(0xFF)
-	return w.Bytes()
+	return EncodeWolfVariantAndSoundDataPacket2612(entityID, variant, WolfSoundVariantClassic)
 }
 
 func inferBiomeAtPosition(cache *world.Cache, bx, by, bz int) string {
@@ -345,9 +342,10 @@ func (s *Server) ensureWolfDetailState(entityID int32) *WolfDetailState {
 			}
 		}
 		ws = &WolfDetailState{
-			EntityID: entityID,
-			Variant:  variant,
-			DyedRGB:  DefaultWolfArmorRGB,
+			EntityID:     entityID,
+			Variant:      variant,
+			SoundVariant: WolfSoundVariantClassic,
+			DyedRGB:      DefaultWolfArmorRGB,
 		}
 		pm.wolves[entityID] = ws
 	}
@@ -846,41 +844,10 @@ func RollCatSpawnVariant(inSwampHut, isFullMoon bool, rng *rand.Rand) string {
 }
 
 // EncodeCatEntityDataPacket encodes a ClientboundSetEntityDataPacket (0x63)
-// updating a cat's Tamable flags (17), CatVariant (18), Lying (19), Relaxed (20),
-// and CollarColor (21) for protocol 775.
+// updating a cat's Tamable flags (18), CatVariant (20), Lying (21), Relaxed (22),
+// CollarColor (23), and CatSoundVariant (24) for protocol 775.
 func EncodeCatEntityDataPacket(entityID int32, tamed, sitting bool, variant string, lying, relaxed bool, collarColor int32) []byte {
-	var flags byte
-	if sitting {
-		flags |= TamableFlagSitting
-	}
-	if tamed {
-		flags |= TamableFlagTamed
-	}
-	w := protocol.NewWriter(36)
-	w.VarInt(entityID)
-
-	w.Byte(EntityDataTamableFlagsID)
-	w.VarInt(EntityDataSerializerByte)
-	w.Byte(flags)
-
-	w.Byte(EntityDataCatVariantID)
-	w.VarInt(EntityDataSerializerCatVariant)
-	w.VarInt(CatVariantRegistryIndex(variant))
-
-	w.Byte(EntityDataCatIsLyingID)
-	w.VarInt(EntityDataSerializerBool)
-	w.Bool(lying)
-
-	w.Byte(EntityDataCatRelaxStateOneID)
-	w.VarInt(EntityDataSerializerBool)
-	w.Bool(relaxed)
-
-	w.Byte(EntityDataCatCollarColor26ID)
-	w.VarInt(EntityDataSerializerInt)
-	w.VarInt(collarColor)
-
-	w.Byte(0xFF)
-	return w.Bytes()
+	return EncodeCatFullEntityDataPacket2612(entityID, tamed, sitting, [16]byte{}, variant, lying, relaxed, collarColor, CatSoundVariantClassic)
 }
 
 func (s *Server) ensureCatDetailState(entityID int32, rng *rand.Rand) *CatDetailState {
@@ -893,9 +860,10 @@ func (s *Server) ensureCatDetailState(entityID int32, rng *rand.Rand) *CatDetail
 	cs, ok := pm.cats[entityID]
 	if !ok || cs == nil {
 		cs = &CatDetailState{
-			EntityID:    entityID,
-			Variant:     RollCatSpawnVariant(false, false, rng),
-			LastGiftDay: -1,
+			EntityID:     entityID,
+			Variant:      RollCatSpawnVariant(false, false, rng),
+			SoundVariant: RollCatSoundVariant2612(rng),
+			LastGiftDay:  -1,
 		}
 		pm.cats[entityID] = cs
 	}

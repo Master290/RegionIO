@@ -784,17 +784,12 @@ func (s *Server) tickSinglePhantom(entityID int32, rng *rand.Rand) {
 	}
 
 	if local.Phase == PhantomPhaseSwooping && target != nil {
-		// `PhantomSweepAttackGoal.canContinueToUse()`: check Cats/Ocelots in `boundingBox.inflate(16.0D)`:
+		// `PhantomSweepAttackGoal.canContinueToUse()` (`Phantom.java:2456-2472`):
+		// checks ONLY `Cat.class` (`minecraft:cat`, NOT `ocelot`) in `boundingBox.inflate(16.0D)` and calls `cat.hiss()`:
 		if local.TickCounter > local.CatSearchTick {
 			local.CatSearchTick = local.TickCounter + 20
-			w, _, _, _ := PhantomDimensionsAndDamage2612(local.Size)
-			scareRange := float64(w)*0.5 + PhantomCatScareRange
-			_, cx, cy, cz, foundCat := s.FindCatOrOcelotNearPosition(dim, ent.X, ent.Y, ent.Z, scareRange)
+			_, _, _, _, foundCat := s.HissAllCatsNearPhantom2612(dim, ent.X, ent.Y, ent.Z, local.Size)
 			local.ScaredByCat = foundCat
-			if foundCat {
-				playCatHiss = true
-				catHissX, catHissY, catHissZ = cx, cy, cz
-			}
 		}
 		if local.ScaredByCat {
 			// `PhantomSweepAttackGoal.stop()` (`Phantom.java:2439-2449`):

@@ -757,7 +757,7 @@ func (s *Server) ApplyThornsRetaliation(target *PlayerSession, attackerMobID int
 			if canonicalResourceName(mob.TypeName) == MobTypeWitch {
 				mobThornsDmg = ComputeWitchDamageAfterMagicAbsorb2612(mob.ID, snap.EntityID, "thorns", mobThornsDmg)
 			}
-			s.applyDamageToMob(mob, mobThornsDmg, target, 0, false, false)
+			s.applyDamageToMobBypassWolfArmor(mob, mobThornsDmg, target)
 		}
 	}
 	if attackerPlayer != nil && !attackerPlayer.IsDead() {
@@ -894,9 +894,7 @@ func MobLootDrops(typeName string, rng *rand.Rand) []world.ItemStack {
 			return []world.ItemStack{stack}
 		}
 	case MobTypeCat:
-		if stack := world.NewNamedItemStack("minecraft:string", 1); !stack.IsEmpty() {
-			return []world.ItemStack{stack}
-		}
+		return RollCatDeathLoot(rng, 0)
 	case MobTypeWither:
 		if stack := world.NewNamedItemStack(NetherStarItemID, 1); !stack.IsEmpty() {
 			return []world.ItemStack{stack}
@@ -1674,7 +1672,7 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		}
 	}
 
-	killed = s.applyDamageToMobInternal(target, damage, session, kbStrength, isCrit, isStrong, true, false)
+	killed = s.applyDamageToMobInternal(target, damage, session, kbStrength, isCrit, isStrong, true, false, false)
 	if !killed {
 		normHit := canonicalResourceName(target.TypeName)
 		if normHit == MobTypeGuardian || normHit == MobTypeElderGuardian {
@@ -1728,11 +1726,15 @@ func (s *Server) applyDamageToMob(
 	isCrit bool,
 	isStrong bool,
 ) (killed bool) {
-	return s.applyDamageToMobInternal(target, damage, attacker, kbStrength, isCrit, isStrong, false, false)
+	return s.applyDamageToMobInternal(target, damage, attacker, kbStrength, isCrit, isStrong, false, false, false)
+}
+
+func (s *Server) applyDamageToMobBypassWolfArmor(target *world.Entity, damage float32, attacker *PlayerSession) (killed bool) {
+	return s.applyDamageToMobInternal(target, damage, attacker, 0, false, false, false, false, true)
 }
 
 func (s *Server) applyEnvironmentalPanicDamageToMob(target *world.Entity, damage float32) (killed bool) {
-	return s.applyDamageToMobInternal(target, damage, nil, 0, false, false, false, true)
+	return s.applyDamageToMobInternal(target, damage, nil, 0, false, false, false, true, true)
 }
 
 func (s *Server) applyDamageToMobInternal(
@@ -1744,6 +1746,7 @@ func (s *Server) applyDamageToMobInternal(
 	isStrong bool,
 	alreadyReducedArmadillo bool,
 	isEnvironmentalPanic bool,
+	bypassWolfArmor bool,
 ) (killed bool) {
 	if target == nil || damage <= 0 {
 		return false
@@ -1797,13 +1800,20 @@ func (s *Server) applyDamageToMobInternal(
 		}
 		kbStrength = 0
 	}
-	if canonicalResourceName(target.TypeName) == MobTypeWolf && s.HasWolfArmor(target.ID) {
-		if absorbed, _, _ := s.AbsorbWolfDamageWithArmor(target.ID, damage, false); absorbed {
-			if attacker != nil {
-				s.ProvokeWildWolf(target.ID, attacker)
-				s.NotifyOwnerAttackedTarget(attacker, target.ID)
+	if canonicalResourceName(target.TypeName) == MobTypeWolf {
+		// Vanilla 26.1.2 `Wolf.hurtServer`: cancels water shake and clears `orderedToSit` BEFORE `actuallyHurt` / `wolf_armor` absorption!
+		s.CancelWolfShake(target.ID)
+		if s.IsMobSitting(target.ID) {
+			s.SetMobSitting(target.ID, false)
+		}
+		if s.HasWolfArmor(target.ID) {
+			if absorbed, _, _ := s.AbsorbWolfDamageWithArmor(target.ID, damage, bypassWolfArmor); absorbed {
+				if attacker != nil {
+					s.ProvokeWildWolf(target.ID, attacker)
+					s.NotifyOwnerAttackedTarget(attacker, target.ID)
+				}
+				return false
 			}
-			return false
 		}
 	}
 
@@ -1910,7 +1920,7 @@ func (s *Server) applyDamageToMobInternal(
 		} else if normTarget == MobTypeCamel {
 			s.OnCamelDamaged(target.ID)
 		} else if normTarget == MobTypeAxolotl {
-			s.OnAxolotlDamaged(target.ID, damage, nil)
+			s.OnAxolotlDamagedPreHP(target.ID, oldHP, damage, attacker != nil || attackerID > 0, nil)
 		} else if normTarget == MobTypeLlama || normTarget == MobTypeTraderLlama {
 			s.OnLlamaDamaged(target.ID, attacker, 0)
 		} else if normTarget == MobTypeWanderingTrader {
@@ -2020,6 +2030,9 @@ func (s *Server) applyDamageToMobInternal(
 	s.BroadcastChunk(chunkPos.X, chunkPos.Z, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(target.ID, EntityEventDeath))
 	s.OnEntityDiedWithEffects(target.ID)
+	if attacker != nil {
+		s.OnMobKilledNearAxolotls(target.ID, attacker)
+	}
 	if canonicalResourceName(target.TypeName) == MobTypeAllay {
 		s.DropAllayInventoryOnDeath(target.ID)
 	}

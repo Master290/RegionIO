@@ -598,6 +598,9 @@ func DrownedOkTargetMob2612(s *Server, dim string, target *world.Entity) bool {
 	if s == nil || target == nil {
 		return false
 	}
+	if canonicalResourceName(target.TypeName) == MobTypeAxolotl && s.IsAxolotlPlayingDead(target.ID) {
+		return false
+	}
 	if IsLevelBrightOutside2612(s, dim) && !IsMobEntityInWater2612(s, target) {
 		return false
 	}
