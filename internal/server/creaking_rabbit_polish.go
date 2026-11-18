@@ -38,14 +38,14 @@ const (
 	DefaultCreakingMaxHealth     float32 = 1.0  // 0.5 hearts (standalone); heart-bound Creakings are invulnerable
 	CreakingAttackDamage         float32 = 3.0  // 3.0 HP melee damage on Normal
 	CreakingAttackReach          float64 = 2.0  // Melee attack reach
-	CreakingAttackCooldownTicks  int     = 20   // 1.0s between melee swings
-	CreakingChaseSpeed           float64 = 0.24 // Stalking speed when not observed
-	CreakingFollowRange          float64 = 32.0 // Player detection & gaze check radius
+	CreakingAttackCooldownTicks  int     = 40   // 2.0s between melee swings (CreakingAi MeleeAttack.create(..., 40))
+	CreakingChaseSpeed           float64 = 0.40 // Stalking sprint speed when unobserved (Attributes.MOVEMENT_SPEED = 0.4)
+	CreakingFollowRange          float64 = 32.0 // Player detection & active gaze check radius (FOLLOW_RANGE = 32.0)
 	CreakingMaxHeartDist         float64 = 34.0 // Max distance from linked creaking_heart before despawn
 	CreakingHeartSpawnHorizRange int     = 16   // +/- 16 horizontal blocks around creaking_heart
 	CreakingHeartSpawnVertRange  int     = 8    // +/- 8 vertical blocks around creaking_heart
 	CreakingResinCooldownTicks   int     = 100  // 5 seconds (100 ticks) cooldown between resin clump bursts
-	CreakingDeathTearingTicks    int     = 20   // 1 second tearing-down death animation when heart is broken
+	CreakingDeathTearingTicks    int     = 45   // 45 ticks tearing-down death animation (Creaking.tickDeath: deathTime > 45)
 	CreakingGazeCosThreshold     float64 = 0.50 // ~60-degree view cone threshold for freezing Creaking
 
 	// Creaking Heart block state values (`creaking_heart_state` property in 26.1.2).
@@ -116,18 +116,21 @@ const (
 
 // CreakingState holds server-side state for a `minecraft:creaking` entity.
 type CreakingState struct {
-	EntityID       int32
-	Dimension      string
-	CanMove        bool
-	IsActive       bool
-	IsTearingDown  bool
-	IsHeartBound   bool
-	HeartX         int
-	HeartY         int
-	HeartZ         int
-	TargetPlayer   *PlayerSession
-	AttackCooldown int
-	TearingTicks   int
+	EntityID            int32
+	EntityUUID          [16]byte
+	Dimension           string
+	CanMove             bool
+	IsActive            bool
+	IsTearingDown       bool
+	IsHeartBound        bool
+	PersistenceRequired bool
+	HeartX              int
+	HeartY              int
+	HeartZ              int
+	TargetPlayer        *PlayerSession
+	AttackCooldown      int
+	TearingTicks        int
+	PlayerStuckTicks    int
 }
 
 // CreakingHeartState holds server-side state for a `minecraft:creaking_heart` block.
@@ -138,6 +141,9 @@ type CreakingHeartState struct {
 	Z                  int
 	Natural            bool
 	LinkedCreakingID   int32
+	LinkedCreakingUUID [16]byte
+	HasLinkedUUID      bool
+	ReloadGraceTicks   int
 	ResinCooldownTicks int
 }
 
@@ -434,15 +440,24 @@ func (s *Server) spawnCreakingInternal(dimension string, x, y, z float64, heartB
 		Z:         z,
 		OnGround:  true,
 	})
+	entUUID := syntheticEntityUUID2612(id)
+	s.entities.Update(id, func(e *world.Entity) {
+		if e.UUID == ([16]byte{}) {
+			e.UUID = entUUID
+		} else {
+			entUUID = e.UUID
+		}
+	})
 	s.SetMobHealth(id, DefaultCreakingMaxHealth)
 
 	cm := s.creakingRabbitMgr()
 	cm.mu.Lock()
 	cm.creaking[id] = &CreakingState{
 		EntityID:     id,
+		EntityUUID:   entUUID,
 		Dimension:    normDim,
 		CanMove:      true,
-		IsActive:     heartBound,
+		IsActive:     false,
 		IsHeartBound: heartBound,
 		HeartX:       hx,
 		HeartY:       hy,
@@ -462,6 +477,9 @@ func (s *Server) spawnCreakingInternal(dimension string, x, y, z float64, heartB
 			cm.hearts[key] = hs
 		}
 		hs.LinkedCreakingID = id
+		hs.LinkedCreakingUUID = entUUID
+		hs.HasLinkedUUID = true
+		hs.ReloadGraceTicks = 0
 	}
 	cm.mu.Unlock()
 
@@ -469,7 +487,11 @@ func (s *Server) spawnCreakingInternal(dimension string, x, y, z float64, heartB
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, ent))
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySetEntityDataCB,
-			EncodeCreakingEntityDataPacket(id, true, heartBound, false, heartBound, hx, hy, hz))
+			EncodeCreakingEntityDataPacket(id, true, false, false, heartBound, hx, hy, hz))
+		if heartBound {
+			s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(id, EntityEventCreakingSpawn2612))
+		}
 		s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, PlaySoundPacketID,
 			EncodeSoundPacket(SoundCreakingSpawn, SoundSourceHostile, x, y, z, 1.0, 1.0, 0))
 	}
@@ -661,13 +683,25 @@ func (s *Server) UpdateCreakingHeartAt(dimension string, hx, hy, hz int, rng *ra
 		}
 	case CreakingHeartStateDormant:
 		if linkedID > 0 {
-			// During daytime, despawn the linked Creaking if no player is currently looking at it.
-			if lookedAt, _ := s.IsAnyPlayerLookingAtCreaking(linkedID); !lookedAt {
-				s.DespawnHeartBoundCreaking(linkedID, false)
+			// Vanilla 26.1.2 `CreakingHeartBlockEntity.serverTick`: when `!CREAKING_ACTIVE`
+			// and `!creaking.isPersistenceRequired()`, `removeProtector(null)` immediately
+			// calls `creaking.tearDown()` regardless of player gaze!
+			cst, hasCst := s.GetCreakingState(linkedID)
+			if (!hasCst || !cst.PersistenceRequired) && s.GetMobCustomName2612(linkedID) == "" {
+				s.DespawnHeartBoundCreaking(linkedID, true)
 			}
 		}
 	case CreakingHeartStateAwake:
 		if linkedID == 0 {
+			cm.mu.RLock()
+			waitingReload := false
+			if curHS := cm.hearts[key]; curHS != nil && curHS.HasLinkedUUID && curHS.ReloadGraceTicks < CreakingReloadGraceTicks2612 {
+				waitingReload = true
+			}
+			cm.mu.RUnlock()
+			if waitingReload {
+				return newHeartState, 0
+			}
 			// Spawn a linked Creaking when a survival/adventure player is within 32 blocks.
 			playerNear := false
 			maxDistSq := CreakingFollowRange * CreakingFollowRange
@@ -697,65 +731,17 @@ func (s *Server) UpdateCreakingHeartAt(dimension string, hx, hy, hz int, rng *ra
 }
 
 // IsPlayerLookingAtCreaking checks whether `player` is looking at the Creaking
-// at `(creakingX, creakingY, creakingZ)` in `dimension`:
-//   - Player must be alive, in the same dimension, in Survival or Adventure mode,
-//     and within `CreakingFollowRange` (`32` blocks).
-//   - Wearing `minecraft:carved_pumpkin` on the head slot (`ArmorSlotHead`) or
-//     having `EffectBlindness` exempts the player from freezing the Creaking.
-//   - Checks that the normalized vector from player's eyes (`Y + 1.62`) to the
-//     Creaking (`Y + 1.35`) is within the player's view cone (`dot > 0.50`) and
-//     has unobstructed line-of-sight (`HasGuardianLaserLineOfSight`).
+// at `(creakingX, creakingY, creakingZ)` in `dimension` using vanilla 26.1.2's
+// 3-point `isLookingAtMe(player, 0.5, false, true, eyeY, y+0.5, (eyeY+y)/2)` cone,
+// visual LOS (`ClipContext.Block.VISUAL`), `#gaze_disguise_equipment` (`carved_pumpkin`),
+// and `EffectBlindness` checks.
 func (s *Server) IsPlayerLookingAtCreaking(player *PlayerSession, dimension string, creakingX, creakingY, creakingZ float64) bool {
-	if s == nil || player == nil || player.IsDead() {
+	if s == nil {
 		return false
 	}
-	snap := player.Snapshot()
 	normDim := world.NormalizeDimension(dimension)
-	if world.NormalizeDimension(snap.Dimension) != normDim {
-		return false
-	}
-	if snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
-		return false
-	}
-	if player.HasPlayerEffect(EffectBlindness) {
-		return false
-	}
-	headStack := player.InventorySlot(ArmorSlotHead)
-	if !headStack.IsEmpty() && canonicalResourceName(headStack.ResolvedID()) == "minecraft:carved_pumpkin" {
-		return false
-	}
-
-	eyeX := snap.X
-	eyeY := snap.Y + 1.62
-	eyeZ := snap.Z
-	targetX := creakingX
-	targetY := creakingY + 1.35
-	targetZ := creakingZ
-
-	dx := targetX - eyeX
-	dy := targetY - eyeY
-	dz := targetZ - eyeZ
-	distSq := dx*dx + dy*dy + dz*dz
-	if distSq > CreakingFollowRange*CreakingFollowRange || distSq < 1e-6 {
-		return false
-	}
-	dist := math.Sqrt(distSq)
-	toX, toY, toZ := dx/dist, dy/dist, dz/dist
-
-	yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
-	pitchRad := float64(snap.Pitch) * (math.Pi / 180.0)
-	cosPitch := math.Cos(pitchRad)
-	lookX := -math.Sin(yawRad) * cosPitch
-	lookY := -math.Sin(pitchRad)
-	lookZ := math.Cos(yawRad) * cosPitch
-
-	dot := lookX*toX + lookY*toY + lookZ*toZ
-	if dot <= CreakingGazeCosThreshold {
-		return false
-	}
-
 	cache := s.DimensionChunks(normDim)
-	return HasGuardianLaserLineOfSight(cache, eyeX, eyeY, eyeZ, targetX, targetY, targetZ)
+	return IsPlayerLookingAtCreakingSamplePoints2612(cache, player, normDim, creakingX, creakingY, creakingZ, CreakingFollowRange, false)
 }
 
 // IsAnyPlayerLookingAtCreaking checks whether any online Survival/Adventure player
@@ -777,92 +763,19 @@ func (s *Server) IsAnyPlayerLookingAtCreaking(entityID int32) (lookedAt bool, ob
 	return false, nil
 }
 
-// SpawnResinClumpsAroundHeart attaches up to `count` (`2..3`) `minecraft:resin_clump`
-// multiface blocks onto faces adjacent to `minecraft:pale_oak_log` / `minecraft:stripped_pale_oak_log`
-// blocks within 2 blocks of `(hx, hy, hz)` in `dimension`.
+// SpawnResinClumpsAroundHeart attaches `count` (`2..3`) `minecraft:resin_clump`
+// multiface blocks onto faces adjacent to `#minecraft:pale_oak_logs` connected
+// within BFS depth `2` of `(hx, hy, hz)` in `dimension` (`CreakingHeartBlockEntity.spreadResin`).
 func (s *Server) SpawnResinClumpsAroundHeart(dimension string, hx, hy, hz int, count int, rng *rand.Rand) int {
-	if s == nil {
-		return 0
-	}
-	normDim := world.NormalizeDimension(dimension)
-	cache := s.DimensionChunks(normDim)
-	if cache == nil {
-		return 0
-	}
-	if count <= 0 {
-		count = 2
-		if rng != nil {
-			count = 2 + rng.Intn(2) // 2..3 resin clumps
-		}
-	}
-
-	type candidateFace struct {
-		x, y, z int
-		face    string
-	}
-	var candidates []candidateFace
-	faceOffsets := [6]struct {
-		dx, dy, dz int
-		attachFace string
-	}{
-		{0, 1, 0, "down"},   // air above log -> attaches to "down" face (onto top of log)
-		{0, -1, 0, "up"},    // air below log -> attaches to "up" face (onto bottom of log)
-		{0, 0, -1, "south"}, // air north of log -> attaches to "south" face (onto north side of log)
-		{0, 0, 1, "north"},  // air south of log -> attaches to "north" face (onto south side of log)
-		{-1, 0, 0, "east"},  // air west of log -> attaches to "east" face (onto west side of log)
-		{1, 0, 0, "west"},   // air east of log -> attaches to "west" face (onto east side of log)
-	}
-
-	for dy := -2; dy <= 2; dy++ {
-		ly := hy + dy
-		if ly < world.MinY+1 || ly >= world.MinY+world.WorldHeight-1 {
-			continue
-		}
-		for dx := -1; dx <= 1; dx++ {
-			lx := hx + dx
-			for dz := -1; dz <= 1; dz++ {
-				lz := hz + dz
-				if !IsPaleOakLogBlock(cache.GetBlock(lx, ly, lz)) {
-					continue
-				}
-				for _, fo := range faceOffsets {
-					ax, ay, az := lx+fo.dx, ly+fo.dy, lz+fo.dz
-					cur := cache.GetBlock(ax, ay, az)
-					if cur == world.StateAir || world.BlockName(cur) == ResinClumpItemID {
-						candidates = append(candidates, candidateFace{x: ax, y: ay, z: az, face: fo.attachFace})
-					}
-				}
-			}
-		}
-	}
-	if len(candidates) == 0 {
-		return 0
-	}
-	if rng != nil {
-		rng.Shuffle(len(candidates), func(i, j int) {
-			candidates[i], candidates[j] = candidates[j], candidates[i]
-		})
-	}
-
-	placed := 0
-	for _, cand := range candidates {
-		if placed >= count {
-			break
-		}
-		if newState, _, ok := cache.PlaceMultifaceFaceAt(cand.x, cand.y, cand.z, ResinClumpItemID, cand.face); ok && newState != world.StateAir {
-			cache.SetBlock(cand.x, cand.y, cand.z, newState)
-			s.broadcastMobBlockUpdate(normDim, cand.x, cand.y, cand.z, newState)
-			placed++
-		}
-	}
-	return placed
+	return SpreadResinAroundHeart2612(s, dimension, hx, hy, hz, count, rng)
 }
 
 // OnCreakingHit handles a player or projectile striking a `minecraft:creaking`:
 //   - If the Creaking is heart-bound (`IsHeartBound == true`), it is completely
-//     invulnerable to direct damage (`invulnerable = true`), plays `SoundCreakingSway`,
-//     and if its linked `minecraft:creaking_heart`'s resin cooldown is 0, spawns
-//     `2..3` `minecraft:resin_clump` blocks on adjacent Pale Oak logs (`ResinCooldownTicks = 100`).
+//     invulnerable to direct damage (`invulnerable = true`), broadcasts EntityEvent `66`,
+//     plays `SoundCreakingSway`, and if its linked `minecraft:creaking_heart`'s
+//     `emitter` cooldown is `0`, sets `ResinCooldownTicks = 100` and (when the heart's
+//     state is `awake`) exudes `2..3` `minecraft:resin_clump` blocks onto connected Pale Oak logs.
 //   - If the Creaking is standalone (`IsHeartBound == false`), returns `invulnerable = false`
 //     so normal damage (`1.0 HP`) applies.
 func (s *Server) OnCreakingHit(entityID int32, attacker *PlayerSession, rng *rand.Rand) (invulnerable bool, resinPlaced int) {
@@ -882,6 +795,7 @@ func (s *Server) OnCreakingHit(entityID int32, attacker *PlayerSession, rng *ran
 	}
 	if attacker != nil {
 		st.TargetPlayer = attacker
+		st.IsActive = true
 	}
 	dim := ent.EffectiveDimension()
 	hx, hy, hz := st.HeartX, st.HeartY, st.HeartZ
@@ -895,19 +809,32 @@ func (s *Server) OnCreakingHit(entityID int32, attacker *PlayerSession, rng *ran
 	cm.mu.Unlock()
 
 	cp := ent.ChunkPos()
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+		EncodeEntityEventPacket(entityID, EntityEventCreakingHurt2612))
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 		EncodeSoundPacket(SoundCreakingSway, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	s.BroadcastDimensionChunk(dim, int32(hx>>4), int32(hz>>4), PlaySoundPacketID,
 		EncodeSoundPacket(SoundCreakingHeartHurt, SoundSourceBlocks, float64(hx)+0.5, float64(hy)+0.5, float64(hz)+0.5, 1.0, 1.0, 0))
 
 	if canExudeResin && attacker != nil {
-		resinPlaced = s.SpawnResinClumpsAroundHeart(dim, hx, hy, hz, 0, rng)
+		heartAwake := true
+		if cache := s.DimensionChunks(dim); cache != nil {
+			curHeart := cache.GetBlock(hx, hy, hz)
+			if world.BlockName(curHeart) != CreakingHeartBlockID {
+				heartAwake = false
+			} else if _, props, hasProps := world.BlockStateProperties(curHeart); hasProps && props["creaking_heart_state"] != "" {
+				heartAwake = props["creaking_heart_state"] == CreakingHeartStateAwake
+			}
+		}
+		if heartAwake {
+			resinPlaced = s.SpawnResinClumpsAroundHeart(dim, hx, hy, hz, 0, rng)
+		}
 	}
 	return true, resinPlaced
 }
 
-// DespawnHeartBoundCreaking removes a heart-bound `minecraft:creaking` when its
-// `minecraft:creaking_heart` is destroyed (`tearingDown = true`) or when daytime arrives.
+// DespawnHeartBoundCreaking executes `Creaking.tearDown()`, emitting crumble
+// particles + `SoundCreakingDeath` and discarding the heart-bound `minecraft:creaking`.
 func (s *Server) DespawnHeartBoundCreaking(entityID int32, tearingDown bool) bool {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return false
@@ -920,6 +847,7 @@ func (s *Server) DespawnHeartBoundCreaking(entityID int32, tearingDown bool) boo
 		key := creakingBlockKey{dim: st.Dimension, x: st.HeartX, y: st.HeartY, z: st.HeartZ}
 		if hs := cm.hearts[key]; hs != nil && hs.LinkedCreakingID == entityID {
 			hs.LinkedCreakingID = 0
+			hs.HasLinkedUUID = false
 		}
 	}
 	delete(cm.creaking, entityID)
@@ -933,12 +861,10 @@ func (s *Server) DespawnHeartBoundCreaking(entityID int32, tearingDown bool) boo
 	if tearingDown && st != nil {
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 			EncodeCreakingEntityDataPacket(entityID, false, true, true, st.IsHeartBound, st.HeartX, st.HeartY, st.HeartZ))
-		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(SoundCreakingDeath, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-	} else {
-		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(SoundCreakingDeactivate, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	}
+	broadcastCreakingCrumbleParticles2612(s, dim, ent.X, ent.Y+1.35, ent.Z)
+	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+		EncodeSoundPacket(SoundCreakingDeath, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	s.entities.Remove(entityID)
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
 		encodeRemoveEntitiesPacket(nil, []int32{entityID}))
@@ -947,10 +873,12 @@ func (s *Server) DespawnHeartBoundCreaking(entityID int32, tearingDown bool) boo
 
 // OnCreakingHeartBroken handles a `minecraft:creaking_heart` block being broken
 // at `(hx, hy, hz)` in `dimension`:
-//   - Immediately tears down & despawns its linked `minecraft:creaking`
-//   - If broken with Silk Touch, drops `1x minecraft:creaking_heart` and `0` XP
-//   - Otherwise drops `1..3` `minecraft:resin_clump` (up to `4` with Fortune) and
-//     `20..24` XP when `natural == true`.
+//   - When broken by a player (`destroyer != nil`), starts the 45-tick tearing-down
+//     death animation (`Creaking.tickDeath`: `deathTime` `1..45`, discarded on tick `46`);
+//     when broken without a player damage source, calls `tearDown()` immediately.
+//   - If broken with Silk Touch, drops `1x minecraft:creaking_heart` and `0` XP.
+//   - Otherwise drops `1..3` `minecraft:resin_clump` (up to `9` with Fortune per
+//     `loot_table/blocks/creaking_heart.json`) and `20..24` XP when `natural == true`.
 func (s *Server) OnCreakingHeartBroken(dimension string, hx, hy, hz int, destroyer *PlayerSession, silkTouch bool, fortuneLevel int, rng *rand.Rand) (destroyedCreakingID int32, drops []world.ItemStack, xpReward int32) {
 	if s == nil {
 		return 0, nil, 0
@@ -968,21 +896,33 @@ func (s *Server) OnCreakingHeartBroken(dimension string, hx, hy, hz int, destroy
 	delete(cm.hearts, key)
 	cm.mu.Unlock()
 
+	triggerBreakOnCreaking := func(cid int32) {
+		if cid <= 0 {
+			return
+		}
+		if destroyer != nil {
+			s.StartCreakingTearDownDeath(cid, destroyer)
+		} else {
+			s.DespawnHeartBoundCreaking(cid, true)
+		}
+	}
+
 	if destroyedCreakingID > 0 {
-		s.DespawnHeartBoundCreaking(destroyedCreakingID, true)
+		triggerBreakOnCreaking(destroyedCreakingID)
 	}
 	if s.entities != nil {
 		// Also check any Creaking referencing (hx, hy, hz).
 		cm.mu.RLock()
 		var extraIDs []int32
 		for id, st := range cm.creaking {
-			if st != nil && st.IsHeartBound && st.Dimension == normDim && st.HeartX == hx && st.HeartY == hy && st.HeartZ == hz {
+			if id != destroyedCreakingID && st != nil && st.IsHeartBound && !st.IsTearingDown &&
+				st.Dimension == normDim && st.HeartX == hx && st.HeartY == hy && st.HeartZ == hz {
 				extraIDs = append(extraIDs, id)
 			}
 		}
 		cm.mu.RUnlock()
 		for _, id := range extraIDs {
-			s.DespawnHeartBoundCreaking(id, true)
+			triggerBreakOnCreaking(id)
 			if destroyedCreakingID == 0 {
 				destroyedCreakingID = id
 			}
@@ -1008,8 +948,8 @@ func (s *Server) OnCreakingHeartBroken(dimension string, hx, hy, hz int, destroy
 			clumpCount += int32(rng.Intn(fortuneLevel + 1))
 		}
 	}
-	if clumpCount > 4 {
-		clumpCount = 4
+	if clumpCount > CreakingHeartMaxClumpDrop2612 {
+		clumpCount = CreakingHeartMaxClumpDrop2612
 	}
 	if clumpStack := world.NewNamedItemStack(ResinClumpItemID, clumpCount); !clumpStack.IsEmpty() {
 		drops = []world.ItemStack{clumpStack}
@@ -1037,6 +977,7 @@ func (s *Server) OnCreakingKilled(entityID int32) {
 		key := creakingBlockKey{dim: st.Dimension, x: st.HeartX, y: st.HeartY, z: st.HeartZ}
 		if hs := cm.hearts[key]; hs != nil && hs.LinkedCreakingID == entityID {
 			hs.LinkedCreakingID = 0
+			hs.HasLinkedUUID = false
 		}
 	}
 	delete(cm.creaking, entityID)
@@ -1056,6 +997,23 @@ func (s *Server) TickCreakingsAndHearts(rng *rand.Rand) {
 		if hs != nil {
 			if hs.ResinCooldownTicks > 0 {
 				hs.ResinCooldownTicks--
+			}
+			if hs.HasLinkedUUID && hs.LinkedCreakingID == 0 {
+				for cid, cst := range cm.creaking {
+					if cst != nil && cst.Dimension == hs.Dimension && cst.EntityUUID == hs.LinkedCreakingUUID {
+						hs.LinkedCreakingID = cid
+						cst.IsHeartBound = true
+						cst.HeartX, cst.HeartY, cst.HeartZ = hs.X, hs.Y, hs.Z
+						break
+					}
+				}
+				if hs.LinkedCreakingID == 0 {
+					hs.ReloadGraceTicks++
+					if hs.ReloadGraceTicks >= CreakingReloadGraceTicks2612 {
+						hs.HasLinkedUUID = false
+						hs.LinkedCreakingUUID = [16]byte{}
+					}
+				}
 			}
 			heartKeys = append(heartKeys, k)
 		}
@@ -1084,6 +1042,17 @@ func (s *Server) tickSingleCreaking(entityID int32, _ *rand.Rand) {
 		cm.mu.Unlock()
 		return
 	}
+	// Vanilla 26.1.2 `Creaking.tickDeath`: while `isTearingDown()`, increments `deathTime`
+	// each tick (`1..45`) and calls `tearDown()` on tick `46` (`if (deathTime > 45)`).
+	if st.IsTearingDown {
+		st.TearingTicks++
+		done := st.TearingTicks > CreakingDeathTearingTicks
+		cm.mu.Unlock()
+		if done {
+			s.DespawnHeartBoundCreaking(entityID, true)
+		}
+		return
+	}
 	if st.AttackCooldown > 0 {
 		st.AttackCooldown--
 	}
@@ -1093,39 +1062,92 @@ func (s *Server) tickSingleCreaking(entityID int32, _ *rand.Rand) {
 	dim := ent.EffectiveDimension()
 	cache := s.DimensionChunks(dim)
 
-	// 1. Validate heart link and max distance (34 blocks) for heart-bound Creakings.
+	if s.Difficulty() == DifficultyPeaceful {
+		s.DespawnHeartBoundCreaking(entityID, false)
+		return
+	}
+
+	// 1. Validate heart link, protector ownership, max distance (34.0 blocks from bottom center),
+	//    stuck-player check (> 4 ticks), and daytime disintegration (`Creaking.tick` + `CreakingHeartBlockEntity.serverTick`).
 	if snap.IsHeartBound {
 		if cache != nil && world.BlockName(cache.GetBlock(snap.HeartX, snap.HeartY, snap.HeartZ)) != CreakingHeartBlockID {
 			s.DespawnHeartBoundCreaking(entityID, true)
 			return
 		}
+		key := creakingBlockKey{dim: dim, x: snap.HeartX, y: snap.HeartY, z: snap.HeartZ}
+		cm.mu.RLock()
+		hs := cm.hearts[key]
+		conflictOtherProtector := hs != nil && hs.LinkedCreakingID > 0 && hs.LinkedCreakingID != entityID && s.entities.Get(hs.LinkedCreakingID) != nil
+		cm.mu.RUnlock()
+		if conflictOtherProtector {
+			s.DespawnHeartBoundCreaking(entityID, true)
+			return
+		}
+
 		hdx := ent.X - (float64(snap.HeartX) + 0.5)
-		hdy := ent.Y - (float64(snap.HeartY) + 0.5)
+		hdy := ent.Y - float64(snap.HeartY)
 		hdz := ent.Z - (float64(snap.HeartZ) + 0.5)
 		if hdx*hdx+hdy*hdy+hdz*hdz > CreakingMaxHeartDist*CreakingMaxHeartDist {
 			s.DespawnHeartBoundCreaking(entityID, true)
 			return
 		}
-		// Despawn during daytime when no player is observing it.
-		if !s.IsNight() && !s.IsThundering() {
-			if looked, _ := s.IsAnyPlayerLookingAtCreaking(entityID); !looked {
-				s.DespawnHeartBoundCreaking(entityID, false)
-				return
+
+		// `Creaking.playerIsStuckInYou`: > 4 consecutive ticks with a player's eye inside Creaking AABB (0.9 x 2.7 x 0.9).
+		stuckNow := false
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p == nil || p.IsDead() {
+				continue
 			}
+			ps := p.Snapshot()
+			if world.NormalizeDimension(ps.Dimension) != dim || ps.GameMode == GameModeSpectator {
+				continue
+			}
+			eyeY := ps.Y + 1.62
+			if math.Abs(ps.X-ent.X) <= 0.45 && math.Abs(ps.Z-ent.Z) <= 0.45 && eyeY >= ent.Y && eyeY <= ent.Y+2.7 {
+				stuckNow = true
+				break
+			}
+		}
+		cm.mu.Lock()
+		stuckExceeded := false
+		if cur := cm.creaking[entityID]; cur != nil {
+			if stuckNow {
+				cur.PlayerStuckTicks++
+				stuckExceeded = cur.PlayerStuckTicks > 4
+			} else {
+				cur.PlayerStuckTicks = 0
+			}
+		}
+		cm.mu.Unlock()
+		if stuckExceeded {
+			s.DespawnHeartBoundCreaking(entityID, true)
+			return
+		}
+
+		// Daytime arrival (`!CREAKING_ACTIVE` and `!isPersistenceRequired()`): immediate `tearDown()` even if observed!
+		isPersistent := snap.PersistenceRequired || s.GetMobCustomName2612(entityID) != ""
+		if !s.IsNight() && !s.IsThundering() && !isPersistent {
+			s.DespawnHeartBoundCreaking(entityID, true)
+			return
 		}
 	}
 
-	if s.Difficulty() == DifficultyPeaceful {
-		return
-	}
-
-	// 2. Freeze-when-looked-at check ("Weeping Angel" mechanic).
-	lookedAt, _ := s.IsAnyPlayerLookingAtCreaking(entityID)
-	canMove := !lookedAt
-
-	// 3. Find nearest Survival/Adventure player within 32 blocks.
-	var bestPlayer *PlayerSession
-	bestDistSq := CreakingFollowRange*CreakingFollowRange + 1.0
+	// 2. Exact `Creaking.checkCanMove` (`26.1.2.jar` lines 2244-2355):
+	//    - Collect alive Survival/Adventure players within `FOLLOW_RANGE` (`32.0` blocks).
+	//    - If `!isActive`: requires a player within `< 12.0` blocks (`distanceToSqr < 144.0`)
+	//      looking at any of the 3 Y sample points (`dot > 0.5`, visual LOS) to `activate(player)` and freeze!
+	//    - If `isActive`: deactivates if no attackable player remains within `32.0` blocks;
+	//      otherwise freezes (`canMove = false`) whenever any non-disguised, non-blinded player
+	//      within `32.0` blocks looks at it!
+	var (
+		bestPlayer          *PlayerSession
+		bestDistSq          = CreakingFollowRange*CreakingFollowRange + 1.0
+		hasAttackablePlayer bool
+		isActive            = snap.IsActive
+		canMove             = true
+		justActivated       bool
+		justDeactivated     bool
+	)
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
 			continue
@@ -1139,12 +1161,32 @@ func (s *Server) tickSingleCreaking(entityID int32, _ *rand.Rand) {
 		dy := pSnap.Y - ent.Y
 		dz := pSnap.Z - ent.Z
 		dSq := dx*dx + dy*dy + dz*dz
-		if dSq <= CreakingFollowRange*CreakingFollowRange && dSq < bestDistSq {
+		if dSq > CreakingFollowRange*CreakingFollowRange {
+			continue
+		}
+		hasAttackablePlayer = true
+		if dSq < bestDistSq {
 			bestDistSq = dSq
 			bestPlayer = p
 		}
+		if isActive {
+			if IsPlayerLookingAtCreakingSamplePoints2612(cache, p, dim, ent.X, ent.Y, ent.Z, CreakingFollowRange, false) {
+				canMove = false
+			}
+		} else {
+			if IsPlayerLookingAtCreakingSamplePoints2612(cache, p, dim, ent.X, ent.Y, ent.Z, CreakingActivationRange, true) {
+				isActive = true
+				canMove = false
+				bestPlayer = p
+				justActivated = true
+			}
+		}
 	}
-	isActive := bestPlayer != nil || snap.IsHeartBound
+	if !hasAttackablePlayer && isActive {
+		isActive = false
+		bestPlayer = nil
+		justDeactivated = true
+	}
 
 	if canMove != snap.CanMove || isActive != snap.IsActive {
 		cm.mu.Lock()
@@ -1157,20 +1199,39 @@ func (s *Server) tickSingleCreaking(entityID int32, _ *rand.Rand) {
 		cp := ent.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySetEntityDataCB,
 			EncodeCreakingEntityDataPacket(entityID, canMove, isActive, false, snap.IsHeartBound, snap.HeartX, snap.HeartY, snap.HeartZ))
-		sound := SoundCreakingUnfreeze
-		if !canMove {
-			sound = SoundCreakingFreeze
+		if justActivated {
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(SoundCreakingActivate, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		} else if justDeactivated {
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(SoundCreakingDeactivate, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		}
-		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-			EncodeSoundPacket(sound, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		if canMove != snap.CanMove {
+			sound := SoundCreakingUnfreeze
+			if !canMove {
+				sound = SoundCreakingFreeze
+			}
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(sound, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		}
 	}
 
-	// If frozen by a player's gaze, do NOT move or attack!
-	if !canMove || bestPlayer == nil {
+	// If frozen by a player's gaze (`stopInPlace()`), zero out velocity and do NOT move, rotate, or attack!
+	if !canMove {
+		if ent.VelocityX != 0 || ent.VelocityY != 0 || ent.VelocityZ != 0 {
+			s.entities.Update(entityID, func(e *world.Entity) {
+				e.VelocityX, e.VelocityY, e.VelocityZ = 0, 0, 0
+			})
+		}
 		return
 	}
 
-	// 4. Stalk & melee attack target player when unobserved.
+	// Inactive Creaking (`!isActive`) does NOT stalk or attack players (`CreakingAi.initIdleActivity`).
+	if !isActive || bestPlayer == nil {
+		return
+	}
+
+	// 3. Stalk & melee attack target player when active and unobserved (`0.4` speed, `40`-tick cooldown).
 	pSnap := bestPlayer.Snapshot()
 	feetY := int(math.Floor(ent.Y + 0.01))
 	s.stepEntityTowardPoint(ent, cache, feetY, pSnap.X, pSnap.Y, pSnap.Z, CreakingChaseSpeed, 1.2)

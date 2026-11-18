@@ -72,9 +72,9 @@ const (
 	WardenSonicBoomHorizRange    float64 = 15.0
 	WardenSonicBoomVertRange     float64 = 20.0
 	WardenSonicBoomMinDist       float64 = 4.0
-	WardenSonicBoomChargeTicks   int     = 34  // 1.7s wind-up before firing beam
-	WardenSonicBoomTotalTicks    int     = 60  // 3.0s total sonic boom state duration
-	WardenSonicBoomCooldownTicks int     = 200 // 10.0s cooldown between sonic booms
+	WardenSonicBoomChargeTicks   int     = 34 // 1.7s wind-up before firing beam
+	WardenSonicBoomTotalTicks    int     = 60 // 3.0s total sonic boom state duration
+	WardenSonicBoomCooldownTicks int     = 40 // 2.0s cooldown after SonicBoom.stop() / melee hit (vanilla SonicBoom.COOLDOWN=40)
 	WardenSonicBoomDamage        float32 = 10.0
 	WardenSonicBoomHorizKB       float64 = 2.5
 	WardenSonicBoomVertKB        float64 = 0.5
@@ -208,19 +208,12 @@ func (s WardenAngerStage) String() string {
 }
 
 // WardenHeartbeatIntervalTicks returns the client/server heartbeat interval in
-// ticks corresponding to the Warden's synced client anger level (0..150):
-//   - Calm (0..39):      40 ticks (2.0s)
-//   - Agitated (40..79): 20 ticks (1.0s)
-//   - Angry (80..150):   10 ticks (0.5s)
+// ticks corresponding to the Warden's synced client anger level (0..150),
+// matching vanilla 26.1.2 `Warden.getHeartBeatDelay()`:
+//
+//	40 - floor(clamp(anger / 80.0, 0.0, 1.0) * 30.0)
 func WardenHeartbeatIntervalTicks(anger int) int {
-	switch ClassifyWardenAnger(anger) {
-	case WardenAngerStageAngry:
-		return 10
-	case WardenAngerStageAgitated:
-		return 20
-	default:
-		return 40
-	}
+	return WardenHeartbeatInterval2612(anger)
 }
 
 // VibrationEvent describes a world game event / vibration emitted by an entity,
@@ -260,19 +253,23 @@ type WardenState struct {
 	Health    float32
 	MaxHealth float32
 
-	Phase               WardenPhase
-	Pose                byte
-	PhaseTicks          int
-	TickCounter         int
-	TicksWithoutAnger   int
-	MeleeCooldown       int
-	SniffCooldown       int
-	VibrationCooldown   int
-	SonicBoomCooldown   int
-	SonicBoomTicks      int
-	SonicBoomTargetID   int32
-	DarknessPulseTicker int
-	HeartbeatTicker     int
+	Phase                 WardenPhase
+	Pose                  byte
+	PhaseTicks            int
+	TickCounter           int
+	TicksWithoutAnger     int
+	MeleeCooldown         int
+	SniffCooldown         int
+	VibrationCooldown     int
+	TouchCooldown         int
+	RecentProjectileTicks int
+	ChasingNoMeleeTicks   int
+	SonicBoomCooldown     int
+	SonicBoomTicks        int
+	SonicBoomTargetID     int32
+	DarknessPulseTicker   int
+	HeartbeatTicker       int
+	PersistenceRequired   bool
 
 	HasDisturbancePos bool
 	DisturbanceX      float64
@@ -284,9 +281,10 @@ type WardenState struct {
 	ActiveTargetIsPlayer bool
 	ClientAngerLevel     int
 	Suspects             map[int32]*WardenSuspectEntry
+	AngerByUUID          map[[16]byte]int
 }
 
-// Clone returns a deep copy of w (including a cloned Suspects map).
+// Clone returns a deep copy of w (including cloned Suspects and AngerByUUID maps).
 func (w WardenState) Clone() WardenState {
 	out := w
 	if len(w.Suspects) > 0 {
@@ -299,6 +297,14 @@ func (w WardenState) Clone() WardenState {
 		}
 	} else {
 		out.Suspects = make(map[int32]*WardenSuspectEntry)
+	}
+	if len(w.AngerByUUID) > 0 {
+		out.AngerByUUID = make(map[[16]byte]int, len(w.AngerByUUID))
+		for k, v := range w.AngerByUUID {
+			out.AngerByUUID[k] = v
+		}
+	} else {
+		out.AngerByUUID = make(map[[16]byte]int)
 	}
 	return out
 }
@@ -823,6 +829,18 @@ func (s *Server) AddWardenAnger(
 	delta int,
 	allowRoar bool,
 ) (newAnger int, roared bool) {
+	return s.addWardenAngerInternal(wardenID, suspectEntityID, player, knownX, knownY, knownZ, delta, allowRoar, true)
+}
+
+func (s *Server) addWardenAngerInternal(
+	wardenID int32,
+	suspectEntityID int32,
+	player *PlayerSession,
+	knownX, knownY, knownZ float64,
+	delta int,
+	allowRoar bool,
+	updateDisturbance bool,
+) (newAnger int, roared bool) {
 	if s == nil || wardenID == 0 || suspectEntityID == 0 || suspectEntityID == wardenID {
 		return 0, false
 	}
@@ -859,7 +877,9 @@ func (s *Server) AddWardenAnger(
 		st.Suspects = make(map[int32]*WardenSuspectEntry)
 	}
 	entry := st.Suspects[suspectEntityID]
+	isNewSuspect := false
 	if entry == nil {
+		isNewSuspect = true
 		entry = &WardenSuspectEntry{
 			EntityID: suspectEntityID,
 			IsPlayer: player != nil,
@@ -877,14 +897,24 @@ func (s *Server) AddWardenAnger(
 	entry.LastKnownY = knownY
 	entry.LastKnownZ = knownZ
 
+	if isNewSuspect && len(st.AngerByUUID) > 0 {
+		u := resolveSuspectUUID2612(s, entry)
+		if savedAnger, hasSaved := st.AngerByUUID[u]; hasSaved && savedAnger > 0 {
+			entry.Anger = clampWardenAnger(savedAnger)
+			delete(st.AngerByUUID, u)
+		}
+	}
+
 	prevAnger := entry.Anger
 	entry.Anger = clampWardenAnger(prevAnger + delta)
 	st.TicksWithoutAnger = 0
-	st.HasDisturbancePos = true
-	st.DisturbanceX = knownX
-	st.DisturbanceY = knownY
-	st.DisturbanceZ = knownZ
-	st.DisturbanceTicks = 0
+	if updateDisturbance {
+		st.HasDisturbancePos = true
+		st.DisturbanceX = knownX
+		st.DisturbanceY = knownY
+		st.DisturbanceZ = knownZ
+		st.DisturbanceTicks = 0
+	}
 
 	// When crossing into Angry (>= 80) for the first time on this suspect, the
 	// Warden roars for 84 ticks and gains an additional +20 anger!
@@ -1106,14 +1136,68 @@ func (s *Server) notifySingleWardenVibration(
 		return false
 	}
 
+	// Resolve shooter/source entity coordinates for projectile distance & disturbance checks.
+	shooterPlayer := ev.Player
+	if shooterPlayer == nil && srcID != 0 {
+		shooterPlayer = s.playerByEntityID(srcID)
+	}
+	shooterX, shooterY, shooterZ := ev.X, ev.Y, ev.Z
+	hasShooterPos := false
+	if shooterPlayer != nil {
+		ps := shooterPlayer.Snapshot()
+		shooterX, shooterY, shooterZ = ps.X, ps.Y, ps.Z
+		hasShooterPos = true
+	} else if srcID != 0 && s.entities != nil {
+		if se := s.entities.Get(srcID); se != nil {
+			shooterX, shooterY, shooterZ = se.X, se.Y, se.Z
+			hasShooterPos = true
+		}
+	}
+
+	evType := canonicalResourceName(ev.Type)
+	isProjectileEvent := evType == GameEventProjectileLand || evType == GameEventProjectileShoot || ev.ProjectileEntityID != 0
+
+	disturbX, disturbY, disturbZ := ev.X, ev.Y, ev.Z
+	angerDelta := WardenVibrationAngerBoost
+	updateDisturbanceInAnger := true
+	if isProjectileEvent {
+		updateDisturbanceInAnger = false
+		angerDelta = 0
+		if srcID != 0 {
+			shooterCloserThan30 := true
+			if hasShooterPos {
+				sdx := shooterX - st.X
+				sdy := shooterY - st.Y
+				sdz := shooterZ - st.Z
+				shooterCloserThan30 = (sdx*sdx + sdy*sdy + sdz*sdz) < WardenProjectileAngerDistance*WardenProjectileAngerDistance
+			}
+			if shooterCloserThan30 {
+				if st.RecentProjectileTicks > 0 {
+					angerDelta = WardenProjectileRepeatAnger
+					if hasShooterPos {
+						disturbX = math.Floor(shooterX) + 0.5
+						disturbY = math.Floor(shooterY)
+						disturbZ = math.Floor(shooterZ) + 0.5
+					}
+				} else {
+					angerDelta = WardenProjectileDistractAnger
+				}
+			}
+			st.RecentProjectileTicks = WardenProjectileRepeatWindowTicks
+		}
+	}
+
 	st.VibrationCooldown = WardenVibrationCooldown
 	st.TicksWithoutAnger = 0
-	st.HasDisturbancePos = true
-	st.DisturbanceX = ev.X
-	st.DisturbanceY = ev.Y
-	st.DisturbanceZ = ev.Z
-	st.DisturbanceTicks = 0
-	st.Yaw = yawToward(ev.X-st.X, ev.Z-st.Z)
+	if st.ActiveTargetID == 0 {
+		st.HasDisturbancePos = true
+		st.DisturbanceX = disturbX
+		st.DisturbanceY = disturbY
+		st.DisturbanceZ = disturbZ
+		st.DisturbanceTicks = 0
+		st.SniffCooldown = WardenSniffIntervalTicks
+	}
+	st.Yaw = yawToward(disturbX-st.X, disturbZ-st.Z)
 
 	// Interrupt sniffing when a fresh vibration is heard.
 	var poseChanged bool
@@ -1124,36 +1208,6 @@ func (s *Server) notifySingleWardenVibration(
 		}
 		st.Phase = WardenPhaseInvestigating
 		st.PhaseTicks = 0
-	}
-
-	// Determine anger delta for projectile vs regular vibration.
-	evType := canonicalResourceName(ev.Type)
-	isProjectileEvent := evType == GameEventProjectileLand || evType == GameEventProjectileShoot || ev.ProjectileEntityID != 0
-	angerDelta := WardenVibrationAngerBoost
-	if isProjectileEvent && srcID != 0 {
-		if st.Suspects == nil {
-			st.Suspects = make(map[int32]*WardenSuspectEntry)
-		}
-		entry := st.Suspects[srcID]
-		if entry != nil && entry.LastProjectile > 0 && (st.TickCounter-entry.LastProjectile) <= WardenProjectileRepeatWindowTicks {
-			angerDelta = WardenProjectileRepeatAnger
-		} else {
-			angerDelta = WardenProjectileDistractAnger
-		}
-		if entry == nil {
-			entry = &WardenSuspectEntry{
-				EntityID: srcID,
-				IsPlayer: ev.Player != nil,
-			}
-			if ev.Player != nil {
-				entry.PlayerUUID = ev.Player.Profile.UUID
-			}
-			st.Suspects[srcID] = entry
-		}
-		if st.TickCounter <= 0 {
-			st.TickCounter = 1
-		}
-		entry.LastProjectile = st.TickCounter
 	}
 
 	wX, wY, wZ := st.X, st.Y, st.Z
@@ -1181,16 +1235,20 @@ func (s *Server) notifySingleWardenVibration(
 			EncodeWardenEntityDataPacket(wardenID, wPose, wAnger))
 	}
 
-	if srcID != 0 {
-		s.AddWardenAnger(wardenID, srcID, ev.Player, ev.X, ev.Y, ev.Z, angerDelta, true)
+	if srcID != 0 && angerDelta > 0 {
+		knownX, knownY, knownZ := ev.X, ev.Y, ev.Z
+		if hasShooterPos && isProjectileEvent {
+			knownX, knownY, knownZ = shooterX, shooterY, shooterZ
+		}
+		s.addWardenAngerInternal(wardenID, srcID, shooterPlayer, knownX, knownY, knownZ, angerDelta, true, updateDisturbanceInAnger)
 	}
 	return true
 }
 
-// PerformWardenSniff locates the nearest valid player or mob within the
-// Warden's smell range (6 horizontal / 20 vertical blocks, or up to 24 blocks)
-// and adds +35 anger toward that suspect, setting its position as the Warden's
-// disturbance goal.
+// PerformWardenSniff locates the nearest valid attackable target within 24x20x24
+// (prioritizing players over mobs per `WardenEntitySensor`), adds +35 anger ONLY if
+// `closerThan(target, 6.0, 20.0)` (`Sniffing.stop` in `26.1.2.jar`), and sets
+// `DISTURBANCE_LOCATION` when absent.
 func (s *Server) PerformWardenSniff(wardenID int32) (smelledEntityID int32, newAnger int) {
 	if s == nil || wardenID == 0 {
 		return 0, 0
@@ -1204,8 +1262,32 @@ func (s *Server) PerformWardenSniff(wardenID int32) (smelledEntityID int32, newA
 	if bestID == 0 {
 		return 0, 0
 	}
-	newAnger, _ = s.AddWardenAnger(wardenID, bestID, bestPlayer, bestX, bestY, bestZ, WardenSniffAngerBoost, true)
-	return bestID, newAnger
+	dx := bestX - st.X
+	dy := bestY - st.Y
+	dz := bestZ - st.Z
+	withinAngerCylinder := (dx*dx+dz*dz) < WardenSniffHorizontalRadius*WardenSniffHorizontalRadius &&
+		(dy*dy) < WardenSniffVerticalRadius*WardenSniffVerticalRadius
+
+	if withinAngerCylinder {
+		newAnger, _ = s.AddWardenAnger(wardenID, bestID, bestPlayer, bestX, bestY, bestZ, WardenSniffAngerBoost, true)
+		return bestID, newAnger
+	}
+
+	// Target is between 6.0 and 24.0 blocks horizontally: Sniffing.stop() sets disturbance
+	// location (if absent) without increasing anger!
+	mgr := s.wardenManager()
+	mgr.mu.Lock()
+	if cur := mgr.wardens[wardenID]; cur != nil && cur.ActiveTargetID == 0 && !cur.HasDisturbancePos {
+		cur.HasDisturbancePos = true
+		cur.DisturbanceX = math.Floor(bestX) + 0.5
+		cur.DisturbanceY = math.Floor(bestY)
+		cur.DisturbanceZ = math.Floor(bestZ) + 0.5
+		cur.DisturbanceTicks = 0
+		cur.TicksWithoutAnger = 0
+		cur.SniffCooldown = WardenSniffIntervalTicks
+	}
+	mgr.mu.Unlock()
+	return bestID, 0
 }
 
 func (s *Server) findNearestSmellableSuspect(
@@ -1214,9 +1296,9 @@ func (s *Server) findNearestSmellableSuspect(
 	wx, wy, wz float64,
 ) (entityID int32, player *PlayerSession, tx, ty, tz float64) {
 	normDim := world.NormalizeDimension(dim)
-	bestDistSq := WardenSmellDetectRadius * WardenSmellDetectRadius
+	bestDistSq := WardenSmellDetectRadius*WardenSmellDetectRadius + WardenSniffVerticalRadius*WardenSniffVerticalRadius + 1.0
 
-	// Check survival/adventure players in the same dimension.
+	// Vanilla 26.1.2 `WardenEntitySensor`: always searches Survival/Adventure Players first!
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
 			continue
@@ -1232,7 +1314,7 @@ func (s *Server) findNearestSmellableSuspect(
 		dy := math.Abs(snap.Y - wy)
 		dz := snap.Z - wz
 		horiz := math.Hypot(dx, dz)
-		if dy > WardenSniffVerticalRadius || horiz > WardenSmellDetectRadius {
+		if dy >= WardenSmellDetectRadius || horiz >= WardenSmellDetectRadius {
 			continue
 		}
 		distSq := dx*dx + dy*dy + dz*dz
@@ -1243,23 +1325,27 @@ func (s *Server) findNearestSmellableSuspect(
 			tx, ty, tz = snap.X, snap.Y, snap.Z
 		}
 	}
+	if entityID != 0 {
+		return entityID, player, tx, ty, tz
+	}
 
-	// If no player within primary 6x20 sniff cylinder, also check non-warden mobs.
+	// Only if no valid player is within 24 blocks, check non-Warden mobs.
 	if s.entities != nil {
 		for _, ent := range s.entities.AppendAll(nil) {
 			if ent.ID == wardenID || ent.IsItem() || ent.IsExperienceOrb() ||
 				IsDecorationEntity(ent.TypeName) || ent.TypeName == EntityTypeFishingBobber ||
+				ent.TypeName == EntityTypeArmorStand ||
 				canonicalResourceName(ent.TypeName) == MobTypeWarden {
 				continue
 			}
-			if ent.EffectiveDimension() != normDim {
+			if ent.EffectiveDimension() != normDim || s.MobHealth(ent.ID) <= 0 {
 				continue
 			}
 			dx := ent.X - wx
 			dy := math.Abs(ent.Y - wy)
 			dz := ent.Z - wz
 			horiz := math.Hypot(dx, dz)
-			if dy > WardenSniffVerticalRadius || horiz > WardenSmellDetectRadius {
+			if dy >= WardenSmellDetectRadius || horiz >= WardenSmellDetectRadius {
 				continue
 			}
 			distSq := dx*dx + dy*dy + dz*dz
@@ -1331,17 +1417,27 @@ func (s *Server) AttackFromWarden(wardenID int32, targetEntityID int32) float32 
 	if s == nil || wardenID == 0 || targetEntityID == 0 {
 		return 0
 	}
-	st, ok := s.GetWardenState(wardenID)
-	if !ok || st.Health <= 0 {
+	mgr := s.wardenManager()
+	mgr.mu.Lock()
+	st, ok := mgr.wardens[wardenID]
+	if !ok || st == nil || st.Health <= 0 {
+		mgr.mu.Unlock()
 		return 0
 	}
-	cx := int32(int64(math.Floor(st.X)) >> 4)
-	cz := int32(int64(math.Floor(st.Z)) >> 4)
+	if st.SonicBoomCooldown < WardenSonicBoomCooldownTicks {
+		st.SonicBoomCooldown = WardenSonicBoomCooldownTicks
+	}
+	st.ChasingNoMeleeTicks = 0
+	snap := st.Clone()
+	mgr.mu.Unlock()
 
-	s.BroadcastDimensionChunk(st.Dimension, cx, cz, PlayAnimateCB,
+	cx := int32(int64(math.Floor(snap.X)) >> 4)
+	cz := int32(int64(math.Floor(snap.Z)) >> 4)
+
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlayAnimateCB,
 		EncodeAnimatePacket(wardenID, AnimateSwingMainHand))
-	s.BroadcastDimensionChunk(st.Dimension, cx, cz, PlaySoundPacketID,
-		EncodeSoundPacket(SoundWardenAttackImpact, SoundSourceHostile, st.X, st.Y, st.Z, 2.0, 1.0, 0))
+	s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+		EncodeSoundPacket(SoundWardenAttackImpact, SoundSourceHostile, snap.X, snap.Y, snap.Z, 2.0, 1.0, 0))
 
 	if player := s.playerByEntityID(targetEntityID); player != nil {
 		if player.IsBlockingWithShield() {
@@ -1358,7 +1454,8 @@ func (s *Server) AttackFromWarden(wardenID int32, targetEntityID int32) float32 
 				s.TriggerKilledByEntity(player, MobTypeWarden)
 				s.BroadcastDeathMessage(player, "warden", MobTypeWarden)
 			} else {
-				vx, vy, vz := ComputeKnockback(st.X, st.Z, st.Yaw, pSnap.X, pSnap.Z, WardenAttackKnockback)
+				kbScale := 1.0 - ResolvePlayerKnockbackResistance2612(player)
+				vx, vy, vz := ComputeKnockback(snap.X, snap.Z, snap.Yaw, pSnap.X, pSnap.Z, WardenAttackKnockback*kbScale)
 				if player.send != nil {
 					_ = player.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(player.EntityID, vx, vy, vz))
 				}
@@ -1438,14 +1535,14 @@ func (s *Server) FireWardenSonicBoom(wardenID int32, targetEntityID int32) float
 			return 0
 		}
 
-		// Sonic boom bypasses armor and shield, reduced only by Resistance status effect.
+		// Sonic boom bypasses armor, enchantments, and shield, reduced only by Resistance,
+		// and deals 0.0 exhaustion (`data/minecraft/damage_type/sonic_boom.json`).
 		dmg := ScaleDamageByDifficulty(WardenSonicBoomDamage, s.Difficulty())
 		if dmg <= 0 {
 			return 0
 		}
 		effective := dmg * player.ResistanceDamageMultiplier("sonic_boom")
 		s.DamagePlayerWithEffects(player, dmg, "sonic_boom")
-		s.RecordDamageExhaustion(player)
 		s.SyncHealthObjectives(player)
 
 		s.EmitVibration(VibrationEvent{
@@ -1463,14 +1560,9 @@ func (s *Server) FireWardenSonicBoom(wardenID int32, targetEntityID int32) float
 			s.TriggerKilledByEntity(player, MobTypeWarden)
 			s.BroadcastDeathMessage(player, "sonic_boom", MobTypeWarden)
 		} else {
-			horizDist := math.Hypot(dx, dz)
-			var vx, vz float64
-			if horizDist > 1e-4 {
-				vx = (dx / horizDist) * WardenSonicBoomHorizKB
-				vz = (dz / horizDist) * WardenSonicBoomHorizKB
-			}
-			vy := WardenSonicBoomVertKB
-			if player.send != nil {
+			kbRes := ResolvePlayerKnockbackResistance2612(player)
+			vx, vy, vz := ComputeWardenSonicBoomPush2612(st.X, st.Y, st.Z, pSnap.X, pSnap.Y+1.62, pSnap.Z, kbRes)
+			if player.send != nil && (vx != 0 || vy != 0 || vz != 0) {
 				_ = player.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(player.EntityID, vx, vy, vz))
 			}
 		}
@@ -1489,7 +1581,22 @@ func (s *Server) FireWardenSonicBoom(wardenID int32, targetEntityID int32) float
 			if canonicalResourceName(targetEnt.TypeName) == MobTypeWitch {
 				mobDmg = ComputeWitchDamageAfterMagicAbsorb2612(targetEnt.ID, wardenID, "sonic_boom", mobDmg)
 			}
-			s.applyDamageToMob(targetEnt, mobDmg, nil, WardenSonicBoomHorizKB, false, true)
+			kbRes := ResolveMobKnockbackResistance2612(s, targetEnt)
+			killed := s.applyDamageToMob(targetEnt, mobDmg, nil, 0, false, true)
+			if !killed && kbRes < 1.0 {
+				vx, vy, vz := ComputeWardenSonicBoomPush2612(st.X, st.Y, st.Z, targetEnt.X, targetEnt.Y+1.0, targetEnt.Z, kbRes)
+				velX := clampVelocityShort(vx)
+				velY := clampVelocityShort(vy)
+				velZ := clampVelocityShort(vz)
+				s.entities.Update(targetEnt.ID, func(e *world.Entity) {
+					e.VelocityX = velX
+					e.VelocityY = velY
+					e.VelocityZ = velZ
+				})
+				cp := targetEnt.ChunkPos()
+				s.BroadcastDimensionChunk(st.Dimension, cp.X, cp.Z, protocol.PlaySetEntityMotion,
+					EncodeSetEntityMotionPacket(targetEnt.ID, vx, vy, vz))
+			}
 			return mobDmg
 		}
 	}
@@ -1551,16 +1658,17 @@ func (s *Server) DamageWarden(entityID int32, damage float32, attacker *PlayerSe
 		mgr.mu.Unlock()
 		return 0, false
 	}
+	// Vanilla 26.1.2 `Warden.isInvulnerableTo`: completely invulnerable to non-bypass
+	// damage while `isDiggingOrEmerging()` (`Pose.EMERGING` or `Pose.DIGGING`).
+	if st.Phase == WardenPhaseEmerging || st.Phase == WardenPhaseDigging ||
+		st.Pose == PoseEmerging || st.Pose == PoseDigging {
+		mgr.mu.Unlock()
+		return 0, false
+	}
 
 	st.Health -= damage
 	st.TicksWithoutAnger = 0
 	var poseChanged bool
-	if st.Phase == WardenPhaseDigging {
-		st.Phase = WardenPhaseCalm
-		st.Pose = PoseStanding
-		st.PhaseTicks = 0
-		poseChanged = true
-	}
 	if st.Health <= 0 {
 		st.Health = 0
 		killed = true
@@ -1746,13 +1854,28 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 	if st.VibrationCooldown > 0 {
 		st.VibrationCooldown--
 	}
+	if st.TouchCooldown > 0 {
+		st.TouchCooldown--
+	}
+	if st.RecentProjectileTicks > 0 {
+		st.RecentProjectileTicks--
+	}
 	if st.SonicBoomCooldown > 0 {
 		st.SonicBoomCooldown--
 	}
 
-	// 1. Decay anger by 1 per second (every 20 ticks) for all suspects and prune dead/invalid suspects.
+	// 1. Decay anger by 1 per second (every 20 ticks) for all suspects (including UUID-queued suspects)
+	//    and prune dead/invalid suspects (`AngerManagement.tick`).
 	prevClientAnger := st.ClientAngerLevel
-	if st.TickCounter%WardenAngerDecayIntervalTicks == 0 && len(st.Suspects) > 0 {
+	if st.TickCounter%WardenAngerDecayIntervalTicks == 0 {
+		s.convertWardenUUIDSuspectsLocked(st)
+		for u, a := range st.AngerByUUID {
+			if a <= 1 {
+				delete(st.AngerByUUID, u)
+			} else {
+				st.AngerByUUID[u] = a - 1
+			}
+		}
 		for id, entry := range st.Suspects {
 			if entry == nil {
 				delete(st.Suspects, id)
@@ -1768,18 +1891,22 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 	recomputeWardenTargetLocked(st)
 	angerSynced := st.ClientAngerLevel != prevClientAnger
 
-	// 2. Track calm timeout (1200 ticks = 60s without any suspects or disturbances -> Digging).
-	if len(st.Suspects) == 0 && st.ActiveTargetID == 0 {
-		st.TicksWithoutAnger++
-	} else {
+	// 2. Track `DIG_COOLDOWN` (`1200` ticks = 60s without vibrations, anger increases, or active fight target).
+	//    Vanilla `WardenAi`: `DIG_COOLDOWN` is kept reset during `FIGHT`/`ROAR` or when `PersistenceRequired`
+	//    / custom-named, and ticks down even when suspects have `< 80` anger!
+	hasCustomName := s.GetMobCustomName2612(entityID) != ""
+	if st.ActiveTargetID != 0 || st.Phase == WardenPhaseRoaring || st.Phase == WardenPhaseSonicBoom ||
+		st.PersistenceRequired || hasCustomName {
 		st.TicksWithoutAnger = 0
+	} else if st.Phase != WardenPhaseEmerging && st.Phase != WardenPhaseDigging {
+		st.TicksWithoutAnger++
 	}
 
-	// 3. Darkness pulse every 120 ticks (6.0s) and periodic heartbeat sound.
+	// 3. Darkness pulse every 120 ticks (`Warden.customServerAiStep`: runs in all phases except Digging!)
+	//    and periodic heartbeat sound.
 	st.DarknessPulseTicker++
 	pulseDarknessNow := false
-	if st.DarknessPulseTicker >= WardenDarknessPulseIntervalTicks &&
-		st.Phase != WardenPhaseEmerging && st.Phase != WardenPhaseDigging {
+	if st.DarknessPulseTicker >= WardenDarknessPulseIntervalTicks && st.Phase != WardenPhaseDigging {
 		st.DarknessPulseTicker = 0
 		pulseDarknessNow = true
 	}
@@ -1794,6 +1921,42 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 
 	cx := int32(int64(math.Floor(st.X)) >> 4)
 	cz := int32(int64(math.Floor(st.Z)) >> 4)
+	dimSnap := st.Dimension
+	xSnap, ySnap, zSnap := st.X, st.Y, st.Z
+
+	// Helper to flush Darkness pulse and client anger sync even when a pose phase returns early.
+	flushSideEffects := func(pose byte, clientAnger int, alreadySentData bool) {
+		if pulseDarknessNow {
+			s.PulseWardenDarkness(dimSnap, xSnap, ySnap, zSnap)
+		}
+		if playHeartbeatNow {
+			s.BroadcastDimensionChunk(dimSnap, cx, cz, PlaySoundPacketID,
+				EncodeSoundPacket(SoundWardenHeartbeat, SoundSourceHostile, xSnap, ySnap, zSnap, 2.0, 1.0, 0))
+		}
+		if angerSynced && !alreadySentData {
+			s.BroadcastDimensionChunk(dimSnap, cx, cz, PlaySetEntityDataCB,
+				EncodeWardenEntityDataPacket(entityID, pose, clientAnger))
+		}
+	}
+
+	// Vanilla `WardenAi.updateActivity`: `Activity.DIG` has higher priority than `SNIFF` and `IDLE`
+	// whenever `DIG_COOLDOWN` (`1200` ticks) expires with no active target or disturbance walk target.
+	if st.TicksWithoutAnger >= WardenCalmDigTimeoutTicks &&
+		st.ActiveTargetID == 0 && !st.HasDisturbancePos &&
+		st.Phase != WardenPhaseEmerging && st.Phase != WardenPhaseDigging &&
+		st.Phase != WardenPhaseRoaring && st.Phase != WardenPhaseSonicBoom {
+		st.Phase = WardenPhaseDigging
+		st.Pose = PoseDigging
+		st.PhaseTicks = WardenDiggingDurationTicks
+		snap := st.Clone()
+		mgr.mu.Unlock()
+
+		s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
+			EncodeWardenEntityDataPacket(entityID, snap.Pose, snap.ClientAngerLevel))
+		s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
+			EncodeSoundPacket(SoundWardenDig, SoundSourceHostile, snap.X, snap.Y, snap.Z, 5.0, 1.0, 0))
+		return
+	}
 
 	// 4. Phase state machine.
 	switch st.Phase {
@@ -1807,9 +1970,12 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 			mgr.mu.Unlock()
 			s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
 				EncodeWardenEntityDataPacket(entityID, snap.Pose, snap.ClientAngerLevel))
+			flushSideEffects(snap.Pose, snap.ClientAngerLevel, true)
 			return
 		}
+		poseSnap, angerSnap := st.Pose, st.ClientAngerLevel
 		mgr.mu.Unlock()
+		flushSideEffects(poseSnap, angerSnap, false)
 		return
 
 	case WardenPhaseDigging:
@@ -1827,6 +1993,7 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 		if st.PhaseTicks <= 0 {
 			if st.ActiveTargetID != 0 {
 				st.Phase = WardenPhaseChasing
+				st.ChasingNoMeleeTicks = 0
 			} else {
 				st.Phase = WardenPhaseCalm
 			}
@@ -1836,9 +2003,12 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 			mgr.mu.Unlock()
 			s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
 				EncodeWardenEntityDataPacket(entityID, snap.Pose, snap.ClientAngerLevel))
+			flushSideEffects(snap.Pose, snap.ClientAngerLevel, true)
 			return
 		}
+		poseSnap, angerSnap := st.Pose, st.ClientAngerLevel
 		mgr.mu.Unlock()
+		flushSideEffects(poseSnap, angerSnap, false)
 		return
 
 	case WardenPhaseSniffing:
@@ -1853,6 +2023,7 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 
 			s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
 				EncodeWardenEntityDataPacket(entityID, snap.Pose, snap.ClientAngerLevel))
+			flushSideEffects(snap.Pose, snap.ClientAngerLevel, true)
 			smelledID, _ := s.PerformWardenSniff(entityID)
 			if smelledID != 0 {
 				mgr.mu.Lock()
@@ -1867,7 +2038,9 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 			}
 			return
 		}
+		poseSnap, angerSnap := st.Pose, st.ClientAngerLevel
 		mgr.mu.Unlock()
+		flushSideEffects(poseSnap, angerSnap, false)
 		return
 
 	case WardenPhaseSonicBoom:
@@ -1896,6 +2069,7 @@ func (s *Server) tickSingleWarden(entityID int32, rng *rand.Rand) {
 			s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySetEntityDataCB,
 				EncodeWardenEntityDataPacket(entityID, snap.Pose, snap.ClientAngerLevel))
 		}
+		flushSideEffects(snap.Pose, snap.ClientAngerLevel, doneNow)
 		return
 	}
 
@@ -2000,8 +2174,8 @@ func (s *Server) pruneInvalidWardenSuspectsLocked(st *WardenState) {
 }
 
 // OnEntityCollideWithWarden handles physical contact between wardenID and
-// otherEntityID (player or mob), adding +35 anger (WardenTouchAngerBoost) when
-// the Warden's anger toward otherEntityID is below the Angry threshold (80).
+// otherEntityID (player or mob), enforcing vanilla 26.1.2's 20-tick
+// `TOUCH_COOLDOWN` (`Warden.doPush`) and adding +35 anger (`WardenTouchAngerBoost`).
 func (s *Server) OnEntityCollideWithWarden(wardenID, otherEntityID int32) (newAnger int, roared bool) {
 	if s == nil || wardenID == 0 || otherEntityID == 0 || wardenID == otherEntityID {
 		return 0, false
@@ -2009,10 +2183,24 @@ func (s *Server) OnEntityCollideWithWarden(wardenID, otherEntityID int32) (newAn
 	if s.IsWardenEntity(otherEntityID) {
 		return 0, false
 	}
-	curAnger := s.WardenSuspectAnger(wardenID, otherEntityID)
-	if curAnger >= WardenAngryThreshold {
-		return curAnger, false
+	mgr := s.wardenManager()
+	mgr.mu.Lock()
+	st := mgr.wardens[wardenID]
+	if st == nil || st.Health <= 0 || st.Phase == WardenPhaseEmerging || st.Phase == WardenPhaseDigging {
+		mgr.mu.Unlock()
+		return 0, false
 	}
+	if st.TouchCooldown > 0 {
+		var cur int
+		if e := st.Suspects[otherEntityID]; e != nil {
+			cur = e.Anger
+		}
+		mgr.mu.Unlock()
+		return cur, false
+	}
+	st.TouchCooldown = WardenTouchCooldownTicks
+	mgr.mu.Unlock()
+
 	if p := s.playerByEntityID(otherEntityID); p != nil {
 		pSnap := p.Snapshot()
 		return s.AddWardenAnger(wardenID, otherEntityID, p, pSnap.X, pSnap.Y, pSnap.Z, WardenTouchAngerBoost, true)
@@ -2026,6 +2214,9 @@ func (s *Server) OnEntityCollideWithWarden(wardenID, otherEntityID int32) (newAn
 }
 
 func (s *Server) checkWardenTouchCollisions(st WardenState) {
+	if st.TouchCooldown > 0 || st.Phase == WardenPhaseEmerging || st.Phase == WardenPhaseDigging {
+		return
+	}
 	rSq := WardenTouchCollisionRadius * WardenTouchCollisionRadius
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
@@ -2040,9 +2231,8 @@ func (s *Server) checkWardenTouchCollisions(st WardenState) {
 		dy := math.Abs(pSnap.Y - st.Y)
 		dz := pSnap.Z - st.Z
 		if dx*dx+dz*dz <= rSq && dy <= 2.5 {
-			if s.WardenSuspectAnger(st.EntityID, pSnap.EntityID) < WardenAngryThreshold {
-				s.AddWardenAnger(st.EntityID, pSnap.EntityID, p, pSnap.X, pSnap.Y, pSnap.Z, WardenTouchAngerBoost, true)
-			}
+			s.OnEntityCollideWithWarden(st.EntityID, pSnap.EntityID)
+			return
 		}
 	}
 	if s.entities != nil {
@@ -2060,9 +2250,8 @@ func (s *Server) checkWardenTouchCollisions(st WardenState) {
 			dy := math.Abs(ent.Y - st.Y)
 			dz := ent.Z - st.Z
 			if dx*dx+dz*dz <= rSq && dy <= 2.5 {
-				if s.WardenSuspectAnger(st.EntityID, ent.ID) < WardenAngryThreshold {
-					s.AddWardenAnger(st.EntityID, ent.ID, nil, ent.X, ent.Y, ent.Z, WardenTouchAngerBoost, true)
-				}
+				s.OnEntityCollideWithWarden(st.EntityID, ent.ID)
+				return
 			}
 		}
 	}
@@ -2118,11 +2307,13 @@ func (s *Server) stepWardenMovementAndCombat(entityID int32, st WardenState, rng
 		vertDist := math.Abs(goalY - nextY)
 
 		if st.ActiveTargetID != 0 {
-			if horizDist <= WardenMeleeReach && vertDist <= WardenMeleeVerticalReach && st.MeleeCooldown <= 0 {
+			pathBlocked := !moved || vertDist > WardenMeleeVerticalReach ||
+				IsWardenGroundLineBlocked2612(cache, st.X, feetY, st.Z, goalX, goalFeetY, goalZ)
+			if horizDist <= WardenMeleeReach && vertDist <= WardenMeleeVerticalReach && !pathBlocked && st.MeleeCooldown <= 0 {
 				attackTargetID = st.ActiveTargetID
 			} else if st.SonicBoomCooldown <= 0 &&
-				horizDist <= WardenSonicBoomHorizRange && vertDist <= WardenSonicBoomVertRange &&
-				(horizDist > WardenSonicBoomMinDist || vertDist > WardenMeleeVerticalReach || !moved) {
+				horizDist < WardenSonicBoomHorizRange && vertDist < WardenSonicBoomVertRange &&
+				(pathBlocked || st.ChasingNoMeleeTicks >= WardenSonicBoomInitialCooldownTicks) {
 				triggerSonicBoom = true
 				sonicTargetID = st.ActiveTargetID
 			}
@@ -2142,6 +2333,11 @@ func (s *Server) stepWardenMovementAndCombat(entityID int32, st WardenState, rng
 		return
 	}
 	cur.X, cur.Y, cur.Z, cur.Yaw = nextX, nextY, nextZ, nextYaw
+	if cur.ActiveTargetID != 0 {
+		cur.ChasingNoMeleeTicks++
+	} else {
+		cur.ChasingNoMeleeTicks = 0
+	}
 	if cur.ActiveTargetID == 0 && cur.HasDisturbancePos {
 		cur.DisturbanceTicks++
 		if cur.DisturbanceTicks >= WardenDisturbanceTimeoutTicks {

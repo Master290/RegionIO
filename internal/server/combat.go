@@ -1636,6 +1636,9 @@ func (s *Server) AttackEntity(session *PlayerSession, targetEntityID int32) (dea
 		if invuln, _ := s.OnCreakingHit(target.ID, session, nil); invuln {
 			return 0, false
 		}
+		if !s.CanCreakingMove(target.ID) {
+			kbStrength = 0
+		}
 	}
 
 	isSweep := isStrong && !isCrit && !isSprinting && snap.OnGround && IsSwordItem(heldStack.ResolvedID())
@@ -1786,6 +1789,12 @@ func (s *Server) applyDamageToMob(
 		attackerYaw = snap.Yaw
 	}
 
+	if kbRes := ResolveMobKnockbackResistance2612(s, target); kbRes > 0 {
+		kbStrength *= 1.0 - kbRes
+		if kbStrength < 0 {
+			kbStrength = 0
+		}
+	}
 	vx, vy, vz := ComputeKnockback(attackerX, attackerZ, attackerYaw, target.X, target.Z, kbStrength)
 	velX := clampVelocityShort(vx)
 	velY := clampVelocityShort(vy)

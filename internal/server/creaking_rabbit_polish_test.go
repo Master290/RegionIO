@@ -118,10 +118,17 @@ func TestCreakingHeartLinkFreezeGazeResinAndHeartDestruction(t *testing.T) {
 		t.Fatalf("expected heart-bound Creaking health to remain %v", DefaultCreakingMaxHealth)
 	}
 
-	// 6. Breaking the creaking_heart destroys the linked Creaking and drops resin_clump + XP.
+	// 6. Breaking the creaking_heart enters 45-tick tearing-down death (`tickDeath`: `deathTime` 1..45, removed on tick 46) and drops resin_clump + XP.
+	cache.SetBlock(4, 65, 4, world.StateAir)
 	destroyedID, heartDrops, xp := s.OnCreakingHeartBroken(world.DimensionOverworld, 4, 65, 4, player, false, 0, rng)
-	if destroyedID != creakingID || s.entities.Get(creakingID) != nil {
-		t.Fatalf("expected breaking creaking_heart to despawn linked Creaking %d, got destroyedID=%d", creakingID, destroyedID)
+	if destroyedID != creakingID {
+		t.Fatalf("expected breaking creaking_heart to target linked Creaking %d, got destroyedID=%d", creakingID, destroyedID)
+	}
+	for i := 0; i <= CreakingDeathTearingTicks; i++ {
+		s.TickCreakingsAndHearts(rng)
+	}
+	if s.entities.Get(creakingID) != nil {
+		t.Fatalf("expected tearing-down Creaking %d to be removed after %d ticks", creakingID, CreakingDeathTearingTicks+1)
 	}
 	if len(heartDrops) == 0 || heartDrops[0].ResolvedID() != ResinClumpItemID || xp < 20 {
 		t.Fatalf("expected broken natural creaking_heart to drop resin_clump and 20..24 XP, drops=%+v xp=%d", heartDrops, xp)

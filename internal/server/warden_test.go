@@ -185,15 +185,18 @@ func TestWardenAngerManagementDecayPlayerPriorityAndRoar(t *testing.T) {
 		t.Fatalf("ClientAngerLevel = %d, want %d", st.ClientAngerLevel, pAnger)
 	}
 
-	// 3. Verify heartbeat intervals across anger stages.
-	if got := WardenHeartbeatIntervalTicks(20); got != 40 {
-		t.Fatalf("calm heartbeat interval = %d, want 40", got)
+	// 3. Verify heartbeat intervals across anger levels (`Warden.getHeartBeatDelay()`).
+	if got := WardenHeartbeatIntervalTicks(0); got != 40 {
+		t.Fatalf("calm (0) heartbeat interval = %d, want 40", got)
+	}
+	if got := WardenHeartbeatIntervalTicks(20); got != 33 {
+		t.Fatalf("calm (20) heartbeat interval = %d, want 33", got)
 	}
 	if got := WardenHeartbeatIntervalTicks(55); got != 20 {
-		t.Fatalf("agitated heartbeat interval = %d, want 20", got)
+		t.Fatalf("agitated (55) heartbeat interval = %d, want 20", got)
 	}
 	if got := WardenHeartbeatIntervalTicks(100); got != 10 {
-		t.Fatalf("angry heartbeat interval = %d, want 10", got)
+		t.Fatalf("angry (100) heartbeat interval = %d, want 10", got)
 	}
 
 	// 4. Advance 20 ticks (1 second) and verify anger decays by 1 for all suspects.
@@ -282,7 +285,8 @@ func TestWardenBlindnessVibrationProjectileSniffingAndSelfSilence(t *testing.T) 
 		t.Fatalf("anger after 2nd projectile within 100 ticks = %d, want %d", got, wantAfterSecond)
 	}
 
-	// 3. Sniffing adds +35 anger to the nearest smelled player (45 + 35 = 80 -> +20 roar = 100!).
+	// 3. Sniffing adds +35 anger to the nearest smelled player within < 6.0 horizontal blocks (45 + 35 = 80 -> +20 roar = 100!).
+	srv.SetPlayerTransform(player, 15.5, feetY, 10.5, 0, 0, true)
 	smelledID, newAnger := srv.PerformWardenSniff(wardenID)
 	if smelledID != player.EntityID || newAnger != 100 {
 		t.Fatalf("PerformWardenSniff = (id=%d, anger=%d), want (id=%d, anger=100)", smelledID, newAnger, player.EntityID)
