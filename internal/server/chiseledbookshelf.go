@@ -14,6 +14,10 @@ import (
 	"regionio/internal/world"
 )
 
+// BlockEntityTypeChiseledBookshelf is BuiltInRegistries.BLOCK_ENTITY_TYPE index 39
+// ("minecraft:chiseled_bookshelf" in protocol 775 / 26.1.2).
+const BlockEntityTypeChiseledBookshelf int32 = 39
+
 type chiseledBookshelfBookSlotKey struct {
 	dim  string
 	x    int
@@ -396,6 +400,7 @@ func (s *Server) InteractChiseledBookshelfWithHand(
 		return false, res
 	}
 	SetChiseledBookshelfSlotBookContent(normDim, x, y, z, slot, wrtPtr, sgnPtr)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 
 	snap := session.Snapshot()
 	if snap.GameMode != GameModeCreative {
@@ -564,7 +569,14 @@ func (s *Server) HydrateChunkChiseledBookshelves(dim string, cx, cz int32) int {
 	return count
 }
 
-// ToNBT serializes the ChiseledBookshelfBlockEntity into a vanilla-compatible NBT compound.
+// ToUpdateTagNBT returns the vanilla 26.1.2 BlockEntity.getUpdateTag payload for
+// ChiseledBookShelfBlockEntity (an empty CompoundTag).
+func (cb *ChiseledBookshelfBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	return nbt.NewCompound()
+}
+
+// ToNBT serializes the ChiseledBookshelfBlockEntity into an exact vanilla 26.1.2
+// block_entities NBT compound (id, x, y, z, keepPacked, Items, last_interacted_slot).
 func (cb *ChiseledBookshelfBlockEntity) ToNBT() *nbt.Compound {
 	if cb == nil {
 		return nbt.NewCompound()
@@ -572,11 +584,10 @@ func (cb *ChiseledBookshelfBlockEntity) ToNBT() *nbt.Compound {
 	normDim := normalizeHopperDim(cb.Dimension)
 	comp := nbt.NewCompound()
 	comp.Set("id", nbt.String("minecraft:chiseled_bookshelf"))
-	comp.Set("Dimension", nbt.String(normDim))
 	comp.Set("x", nbt.Int(int32(cb.X)))
 	comp.Set("y", nbt.Int(int32(cb.Y)))
 	comp.Set("z", nbt.Int(int32(cb.Z)))
-	comp.Set("last_interacted_slot", nbt.Int(int32(cb.LastInteractedSlot)))
+	comp.Set("keepPacked", nbt.Byte(0))
 
 	var itemEntries []nbt.Tag
 	for i := 0; i < ChiseledBookshelfSlotCount; i++ {
@@ -588,34 +599,62 @@ func (cb *ChiseledBookshelfBlockEntity) ToNBT() *nbt.Compound {
 		entry.Set("Slot", nbt.Byte(int8(i)))
 		entry.Set("id", nbt.String(st.ResolvedID()))
 		entry.Set("count", nbt.Int(st.Count))
-		if !cb.SlotMeta[i].IsEmpty() {
-			metaComp := nbt.NewCompound()
-			encodeItemMetaToNBT(metaComp, cb.SlotMeta[i])
-			entry.Set("Meta", metaComp)
-		}
+
+		comps := encodeHopperItemComponents(nil, cb.SlotMeta[i], "", nil)
 		if wrt, sgn, hasBookMeta := GetChiseledBookshelfSlotBookContent(normDim, cb.X, cb.Y, cb.Z, i); hasBookMeta {
 			if wrt != nil {
-				entry.Set("writable_book_content", wrt.ToNBT())
+				if comps == nil {
+					comps = nbt.NewCompound()
+				}
+				comps.Set("minecraft:writable_book_content", wrt.ToNBT())
 			}
 			if sgn != nil {
-				entry.Set("written_book_content", sgn.ToNBT())
+				if comps == nil {
+					comps = nbt.NewCompound()
+				}
+				comps.Set("minecraft:written_book_content", sgn.ToNBT())
 			}
+		}
+		if comps != nil && comps.Len() > 0 {
+			entry.Set("components", comps)
 		}
 		itemEntries = append(itemEntries, entry)
 	}
-	comp.Set("Items", nbt.List{ElemID: nbt.TagCompound, Elems: itemEntries})
+	elemID := byte(nbt.TagCompound)
+	if len(itemEntries) == 0 {
+		elemID = nbt.TagEnd
+	}
+	comp.Set("Items", nbt.List{ElemID: elemID, Elems: itemEntries})
+	lastSlot := cb.LastInteractedSlot
+	if lastSlot < -1 || lastSlot >= ChiseledBookshelfSlotCount {
+		lastSlot = -1
+	}
+	comp.Set("last_interacted_slot", nbt.Int(int32(lastSlot)))
 	return comp
 }
 
 // ChiseledBookshelfBlockEntityFromNBT deserializes a ChiseledBookshelfBlockEntity from an NBT compound.
 func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelfBlockEntity, bool) {
+	return ChiseledBookshelfBlockEntityFromNBTWithDim(comp, "")
+}
+
+// ChiseledBookshelfBlockEntityFromNBTWithDim deserializes a ChiseledBookshelfBlockEntity
+// from a vanilla 26.1.2 block_entities compound, defaulting to fallbackDim when no
+// legacy Dimension tag is present.
+func ChiseledBookshelfBlockEntityFromNBTWithDim(comp *nbt.Compound, fallbackDim string) (*ChiseledBookshelfBlockEntity, bool) {
 	if comp == nil {
 		return nil, false
 	}
 	if idStr, hasID := nbtGetString(comp, "id"); hasID && idStr != "" && canonicalResourceName(idStr) != "minecraft:chiseled_bookshelf" {
 		return nil, false
 	}
-	dim, _ := nbtGetString(comp, "Dimension")
+	dim, hasDim := nbtGetString(comp, "Dimension")
+	if !hasDim || dim == "" {
+		dim, _ = nbtGetString(comp, "dimension")
+	}
+	if dim == "" {
+		dim = fallbackDim
+	}
 	x, okX := nbtGetInt(comp, "x")
 	y, okY := nbtGetInt(comp, "y")
 	z, okZ := nbtGetInt(comp, "z")
@@ -623,7 +662,7 @@ func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelf
 		return nil, false
 	}
 	lastSlot, okLast := nbtGetInt(comp, "last_interacted_slot")
-	if !okLast {
+	if !okLast || lastSlot < -1 || int(lastSlot) >= ChiseledBookshelfSlotCount {
 		lastSlot = -1
 	}
 	normDim := normalizeHopperDim(dim)
@@ -649,34 +688,38 @@ func ChiseledBookshelfBlockEntityFromNBT(comp *nbt.Compound) (*ChiseledBookshelf
 		if itemID == "" {
 			continue
 		}
+		_ = DefaultRecipeBook()
 		cb.Slots[slot] = world.NewNamedItemStack(itemID, 1)
-		if rawMeta, ok := entry.Get("Meta"); ok {
+		_, parsedMeta, _, _ := decodeHopperItemComponents(entry)
+		if !parsedMeta.IsEmpty() {
+			cb.SlotMeta[slot] = parsedMeta
+		} else if rawMeta, ok := entry.Get("Meta"); ok {
 			if metaComp, ok := rawMeta.(*nbt.Compound); ok && metaComp != nil {
 				cb.SlotMeta[slot] = decodeItemMetaFromNBT(metaComp)
 			}
 		}
 		var wrtPtr *WritableBookContent
 		var sgnPtr *WrittenBookContent
-		if wc, ok := nbtCompoundTag(entry, "writable_book_content"); ok && wc != nil {
-			parsed := WritableBookContentFromNBT(wc)
-			wrtPtr = &parsed
-		}
-		if sc, ok := nbtCompoundTag(entry, "written_book_content"); ok && sc != nil {
-			parsed := WrittenBookContentFromNBT(sc)
-			sgnPtr = &parsed
-		}
 		if comps, ok := nbtCompoundTag(entry, "components"); ok && comps != nil {
-			if wrtPtr == nil {
-				if wc, ok := nbtCompoundTag(comps, "minecraft:writable_book_content"); ok && wc != nil {
-					parsed := WritableBookContentFromNBT(wc)
-					wrtPtr = &parsed
-				}
+			if wc, ok := nbtCompoundTag(comps, "minecraft:writable_book_content"); ok && wc != nil {
+				parsed := WritableBookContentFromNBT(wc)
+				wrtPtr = &parsed
 			}
-			if sgnPtr == nil {
-				if sc, ok := nbtCompoundTag(comps, "minecraft:written_book_content"); ok && sc != nil {
-					parsed := WrittenBookContentFromNBT(sc)
-					sgnPtr = &parsed
-				}
+			if sc, ok := nbtCompoundTag(comps, "minecraft:written_book_content"); ok && sc != nil {
+				parsed := WrittenBookContentFromNBT(sc)
+				sgnPtr = &parsed
+			}
+		}
+		if wrtPtr == nil {
+			if wc, ok := nbtCompoundTag(entry, "writable_book_content"); ok && wc != nil {
+				parsed := WritableBookContentFromNBT(wc)
+				wrtPtr = &parsed
+			}
+		}
+		if sgnPtr == nil {
+			if sc, ok := nbtCompoundTag(entry, "written_book_content"); ok && sc != nil {
+				parsed := WrittenBookContentFromNBT(sc)
+				sgnPtr = &parsed
 			}
 		}
 		SetChiseledBookshelfSlotBookContent(normDim, cb.X, cb.Y, cb.Z, slot, wrtPtr, sgnPtr)
@@ -745,7 +788,11 @@ func (s *Server) SaveChiseledBookshelves() error {
 	list := make([]nbt.Tag, 0, len(keys))
 	for _, k := range keys {
 		if cb := hs.bookshelves[k]; cb != nil {
-			list = append(list, cb.ToNBT())
+			comp := cb.ToNBT()
+			if k.dim != "" && k.dim != world.DimensionOverworld {
+				comp.Set("Dimension", nbt.String(k.dim))
+			}
+			list = append(list, comp)
 		}
 	}
 	hs.mu.Unlock()
@@ -864,12 +911,9 @@ func (s *Server) LoadChunkChiseledBookshelfBlockEntitiesNBT(dim string, list []*
 	hs := s.hopperState()
 	hs.mu.Lock()
 	for _, comp := range list {
-		cb, ok := ChiseledBookshelfBlockEntityFromNBT(comp)
+		cb, ok := ChiseledBookshelfBlockEntityFromNBTWithDim(comp, normDim)
 		if !ok || cb == nil {
 			continue
-		}
-		if cb.Dimension == "" {
-			cb.Dimension = normDim
 		}
 		hs.bookshelves[hopperBlockKey{dim: cb.Dimension, x: cb.X, y: cb.Y, z: cb.Z}] = cb
 		loaded = append(loaded, cb.Clone())

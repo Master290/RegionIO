@@ -525,6 +525,9 @@ func (c *Cache) SaveChunkBlockEntities(cx, cz int32, matchID func(string) bool, 
 		return err
 	}
 	ch.ReplaceRawBlockEntities(matchID, list)
+	c.mu.Lock()
+	delete(c.frames, key)
+	c.mu.Unlock()
 	if c.store == nil {
 		return nil
 	}
@@ -628,6 +631,9 @@ func (s *Store) SaveChunkBlockEntities(cx, cz int32, snapshot *Chunk, matchID fu
 		if int32(x>>4) == cx && int32(z>>4) == cz {
 			byPos[[3]int{x, y, z}] = CloneNBTCompound(rep)
 		}
+	}
+	if snapshot != nil {
+		snapshot.fillMissingDefaultShowcaseBlockEntities(byPos)
 	}
 
 	var root *nbt.Compound

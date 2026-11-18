@@ -164,25 +164,18 @@ func (st SignText) HasAnyMessageText() bool {
 	return false
 }
 
-// ToNBT serializes SignText into the vanilla front_text / back_text NBT compound:
-//   - messages: List of 4 String tags (JSON chat components)
-//   - filtered_messages: optional List of 4 String tags
+// ToNBT serializes SignText into the vanilla 26.1.2 front_text / back_text NBT compound
+// (SignText.DIRECT_CODEC):
+//   - messages: List of 4 ComponentSerialization.CODEC tags (String or Compound)
+//   - filtered_messages: optional List of 4 ComponentSerialization.CODEC tags
 //   - color: String ("black", "red", ...)
 //   - has_glowing_text: Byte (0 or 1)
 func (st SignText) ToNBT() *nbt.Compound {
 	comp := nbt.NewCompound()
-	msgElems := make([]nbt.Tag, SignTextLineCount)
-	for i := 0; i < SignTextLineCount; i++ {
-		msgElems[i] = nbt.String(st.Messages[i].ToJSON())
-	}
-	comp.Set("messages", nbt.List{ElemID: nbt.TagString, Elems: msgElems})
+	comp.Set("messages", encodeChatComponentsNBTList(st.Messages[:]))
 
 	if st.HasFiltered {
-		filtElems := make([]nbt.Tag, SignTextLineCount)
-		for i := 0; i < SignTextLineCount; i++ {
-			filtElems[i] = nbt.String(st.FilteredMessages[i].ToJSON())
-		}
-		comp.Set("filtered_messages", nbt.List{ElemID: nbt.TagString, Elems: filtElems})
+		comp.Set("filtered_messages", encodeChatComponentsNBTList(st.FilteredMessages[:]))
 	}
 
 	col := st.Color
@@ -208,23 +201,13 @@ func SignTextFromNBT(comp *nbt.Compound) SignText {
 	}
 	if msgList, ok := nbtListTag(comp, "messages"); ok {
 		for i := 0; i < len(msgList.Elems) && i < SignTextLineCount; i++ {
-			switch v := msgList.Elems[i].(type) {
-			case nbt.String:
-				out.Messages[i] = ParseChatComponentOrText(string(v))
-			case *nbt.Compound:
-				out.Messages[i] = ChatComponentFromNBT(v)
-			}
+			out.Messages[i] = decodeChatComponentTagCompat(msgList.Elems[i])
 		}
 	}
 	if filtList, ok := nbtListTag(comp, "filtered_messages"); ok && len(filtList.Elems) > 0 {
 		out.HasFiltered = true
 		for i := 0; i < len(filtList.Elems) && i < SignTextLineCount; i++ {
-			switch v := filtList.Elems[i].(type) {
-			case nbt.String:
-				out.FilteredMessages[i] = ParseChatComponentOrText(string(v))
-			case *nbt.Compound:
-				out.FilteredMessages[i] = ChatComponentFromNBT(v)
-			}
+			out.FilteredMessages[i] = decodeChatComponentTagCompat(filtList.Elems[i])
 		}
 	}
 	return out
@@ -323,9 +306,10 @@ func (s *SignBlockEntity) ToUpdateTagNBT() *nbt.Compound {
 	return comp
 }
 
-// ToNBT returns the full chunk block_entities NBT compound (id, x, y, z, dimension, is_waxed, front_text, back_text).
+// ToNBT returns the exact vanilla 26.1.2 chunk block_entities NBT compound
+// (id, x, y, z, keepPacked, front_text, back_text, is_waxed).
 func (s *SignBlockEntity) ToNBT() *nbt.Compound {
-	comp := s.ToUpdateTagNBT()
+	comp := nbt.NewCompound()
 	if s == nil {
 		return comp
 	}
@@ -337,9 +321,10 @@ func (s *SignBlockEntity) ToNBT() *nbt.Compound {
 	comp.Set("x", nbt.Int(int32(s.X)))
 	comp.Set("y", nbt.Int(int32(s.Y)))
 	comp.Set("z", nbt.Int(int32(s.Z)))
-	if s.Dimension != "" {
-		comp.Set("dimension", nbt.String(world.NormalizeDimension(s.Dimension)))
-	}
+	comp.Set("keepPacked", nbt.Byte(0))
+	comp.Set("front_text", s.FrontText.ToNBT())
+	comp.Set("back_text", s.BackText.ToNBT())
+	comp.Set("is_waxed", boolToNBTByte(s.IsWaxed))
 	return comp
 }
 
@@ -534,12 +519,16 @@ func (s *Server) RemoveSignAt(dimension string, x, y, z int) bool {
 	if s == nil {
 		return false
 	}
-	key := blockPosDimKey{dim: world.NormalizeDimension(dimension), x: x, y: y, z: z}
+	normDim := world.NormalizeDimension(dimension)
+	key := blockPosDimKey{dim: normDim, x: x, y: y, z: z}
 	st := s.signStore()
 	st.mu.Lock()
 	_, existed := st.signs[key]
 	delete(st.signs, key)
 	st.mu.Unlock()
+	if existed {
+		s.syncShowcaseChunkInMemory(normDim, x, z)
+	}
 	return existed
 }
 
@@ -547,10 +536,11 @@ func (s *Server) broadcastSignBlockEntity(sign *SignBlockEntity) {
 	if s == nil || sign == nil {
 		return
 	}
+	s.syncShowcaseChunkInMemory(sign.Dimension, sign.X, sign.Z)
 	pkt := EncodeBlockEntityDataPacket(sign.X, sign.Y, sign.Z, sign.BlockEntityTypeIndex(), sign.ToUpdateTagNBT())
 	cx := int32(sign.X >> 4)
 	cz := int32(sign.Z >> 4)
-	s.BroadcastChunk(cx, cz, PlayBlockEntityDataCB, pkt)
+	s.BroadcastDimensionChunk(world.NormalizeDimension(sign.Dimension), cx, cz, PlayBlockEntityDataCB, pkt)
 }
 
 // SendChunkSignBlockEntitiesToSession sends ClientboundBlockEntityDataPacket (0x06)
@@ -926,6 +916,7 @@ func (s *Server) LoadChunkSignAndLecternBlockEntitiesNBT(dimension string, list 
 					lec.Dimension = normDim
 				}
 				s.SetLecternAt(lec)
+				s.applyLecternBlockStateAndNotify(lec.Dimension, lec.X, lec.Y, lec.Z, lec.HasBook(), false)
 			}
 		}
 	}
@@ -960,7 +951,11 @@ func (s *Server) SaveSignsAndLecternsToNBT() *nbt.Compound {
 	var elems []nbt.Tag
 	for _, k := range signKeys {
 		if sign := signSt.signs[k]; sign != nil {
-			elems = append(elems, sign.ToNBT())
+			comp := sign.ToNBT()
+			if k.dim != "" && k.dim != world.DimensionOverworld {
+				comp.Set("dimension", nbt.String(k.dim))
+			}
+			elems = append(elems, comp)
 		}
 	}
 	signSt.mu.RUnlock()
@@ -985,7 +980,11 @@ func (s *Server) SaveSignsAndLecternsToNBT() *nbt.Compound {
 	})
 	for _, k := range lecKeys {
 		if lec := lecSt.lecterns[k]; lec != nil {
-			elems = append(elems, lec.ToNBT())
+			comp := lec.ToNBT()
+			if k.dim != "" && k.dim != world.DimensionOverworld {
+				comp.Set("dimension", nbt.String(k.dim))
+			}
+			elems = append(elems, comp)
 		}
 	}
 	lecSt.mu.RUnlock()

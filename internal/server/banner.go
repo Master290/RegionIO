@@ -690,7 +690,24 @@ func (b *BannerBlockEntity) Clone() *BannerBlockEntity {
 	return cp
 }
 
-// ToNBT serializes BannerBlockEntity into a vanilla 26.1.2 `minecraft:banner` block entity compound.
+// ToUpdateTagNBT returns the vanilla 26.1.2 BannerBlockEntity.getUpdateTag payload
+// (saveWithoutMetadata: patterns when non-empty, CustomName when non-nil).
+func (b *BannerBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	comp := nbt.NewCompound()
+	if b == nil {
+		return comp
+	}
+	if !b.Patterns.IsEmpty() {
+		comp.Set("patterns", b.Patterns.ToNBT())
+	}
+	if b.CustomName != nil && !b.CustomName.IsEmpty() {
+		comp.Set("CustomName", b.CustomName.ToNBT())
+	}
+	return comp
+}
+
+// ToNBT serializes BannerBlockEntity into an exact vanilla 26.1.2 `minecraft:banner`
+// block_entities compound (id, x, y, z, keepPacked, plus optional patterns & CustomName).
 func (b *BannerBlockEntity) ToNBT() *nbt.Compound {
 	comp := nbt.NewCompound()
 	if b == nil {
@@ -700,17 +717,12 @@ func (b *BannerBlockEntity) ToNBT() *nbt.Compound {
 	comp.Set("x", nbt.Int(int32(b.X)))
 	comp.Set("y", nbt.Int(int32(b.Y)))
 	comp.Set("z", nbt.Int(int32(b.Z)))
-	if b.Dimension != "" {
-		comp.Set("dimension", nbt.String(world.NormalizeDimension(b.Dimension)))
-	}
-	if b.BaseColor != "" {
-		comp.Set("base_color", nbt.String(b.BaseColor))
-	}
+	comp.Set("keepPacked", nbt.Byte(0))
 	if !b.Patterns.IsEmpty() {
 		comp.Set("patterns", b.Patterns.ToNBT())
 	}
 	if b.CustomName != nil && !b.CustomName.IsEmpty() {
-		comp.Set("CustomName", nbt.String(b.CustomName.ToJSON()))
+		comp.Set("CustomName", b.CustomName.ToNBT())
 	}
 	return comp
 }
@@ -745,39 +757,110 @@ func BannerBlockEntityFromNBT(comp *nbt.Compound) (*BannerBlockEntity, error) {
 	if patList, ok := nbtListTag(comp, "patterns"); ok {
 		out.Patterns = BannerPatternsFromNBT(patList)
 	}
-	if cnRaw, ok := nbtStringTag(comp, "CustomName"); ok && cnRaw != "" {
-		cn := ParseChatComponentOrText(cnRaw)
-		out.CustomName = &cn
+	if cnTag, ok := comp.Get("CustomName"); ok && cnTag != nil {
+		cn := decodeChatComponentTagCompat(cnTag)
+		if !cn.IsEmpty() {
+			out.CustomName = &cn
+		}
 	}
 	return out, nil
 }
 
 // EncodeBannerBlockEntityPacket encodes ClientboundBlockEntityDataPacket (0x06)
-// for a BannerBlockEntity (BlockEntityTypeBanner = 20).
+// for a BannerBlockEntity (BlockEntityTypeBanner = 20) using getUpdateTag.
 func EncodeBannerBlockEntityPacket(b *BannerBlockEntity) []byte {
 	if b == nil {
 		return nil
 	}
-	return EncodeBlockEntityDataPacket(b.X, b.Y, b.Z, BlockEntityTypeBanner, b.ToNBT())
+	return EncodeBlockEntityDataPacket(b.X, b.Y, b.Z, BlockEntityTypeBanner, b.ToUpdateTagNBT())
+}
+
+type droppedBannerItemData struct {
+	patterns   BannerPatternsComponent
+	customName *ChatComponent
 }
 
 type serverBannerStore struct {
 	mu      sync.RWMutex
 	banners map[blockPosDimKey]*BannerBlockEntity
+	dropped map[int32]droppedBannerItemData
 }
 
 var bannerStores sync.Map // map[*Server]*serverBannerStore
 
 func (s *Server) bannerStore() *serverBannerStore {
 	if s == nil {
-		return &serverBannerStore{banners: make(map[blockPosDimKey]*BannerBlockEntity)}
+		return &serverBannerStore{
+			banners: make(map[blockPosDimKey]*BannerBlockEntity),
+			dropped: make(map[int32]droppedBannerItemData),
+		}
 	}
 	if v, ok := bannerStores.Load(s); ok {
 		return v.(*serverBannerStore)
 	}
-	st := &serverBannerStore{banners: make(map[blockPosDimKey]*BannerBlockEntity)}
+	st := &serverBannerStore{
+		banners: make(map[blockPosDimKey]*BannerBlockEntity),
+		dropped: make(map[int32]droppedBannerItemData),
+	}
 	actual, _ := bannerStores.LoadOrStore(s, st)
 	return actual.(*serverBannerStore)
+}
+
+// AssociateDroppedBannerEntity attaches banner_patterns and custom_name components
+// to a spawned banner item entity so picking it up restores them.
+func (s *Server) AssociateDroppedBannerEntity(entityID int32, patterns BannerPatternsComponent, customName *ChatComponent) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	if patterns.IsEmpty() && (customName == nil || customName.IsEmpty()) {
+		return
+	}
+	var cnCopy *ChatComponent
+	if customName != nil && !customName.IsEmpty() {
+		cp := *customName
+		cnCopy = &cp
+	}
+	st := s.bannerStore()
+	st.mu.Lock()
+	if st.dropped == nil {
+		st.dropped = make(map[int32]droppedBannerItemData)
+	}
+	st.dropped[entityID] = droppedBannerItemData{
+		patterns:   patterns.Clone(),
+		customName: cnCopy,
+	}
+	st.mu.Unlock()
+}
+
+// DroppedBannerData returns any banner_patterns and custom_name components associated with entityID.
+func (s *Server) DroppedBannerData(entityID int32) (BannerPatternsComponent, *ChatComponent, bool) {
+	if s == nil || entityID <= 0 {
+		return BannerPatternsComponent{}, nil, false
+	}
+	st := s.bannerStore()
+	st.mu.RLock()
+	d, ok := st.dropped[entityID]
+	st.mu.RUnlock()
+	if !ok {
+		return BannerPatternsComponent{}, nil, false
+	}
+	var cnCopy *ChatComponent
+	if d.customName != nil {
+		cp := *d.customName
+		cnCopy = &cp
+	}
+	return d.patterns.Clone(), cnCopy, true
+}
+
+// TakeDroppedBannerData removes any dropped banner component tracking for entityID.
+func (s *Server) TakeDroppedBannerData(entityID int32) {
+	if s == nil || entityID <= 0 {
+		return
+	}
+	st := s.bannerStore()
+	st.mu.Lock()
+	delete(st.dropped, entityID)
+	st.mu.Unlock()
 }
 
 // GetBannerAt returns a copy of the BannerBlockEntity at (dimension, x, y, z), if present.
@@ -813,6 +896,7 @@ func (s *Server) SetBannerAt(b *BannerBlockEntity) {
 	st.banners[key] = cp
 	st.mu.Unlock()
 
+	s.syncShowcaseChunkInMemory(cp.Dimension, cp.X, cp.Z)
 	pkt := EncodeBannerBlockEntityPacket(cp)
 	cx := int32(cp.X >> 4)
 	cz := int32(cp.Z >> 4)
@@ -822,8 +906,15 @@ func (s *Server) SetBannerAt(b *BannerBlockEntity) {
 // RemoveBannerAt removes any BannerBlockEntity at (dimension, x, y, z) and returns
 // the dropped banner ItemStack and its BannerPatternsComponent.
 func (s *Server) RemoveBannerAt(dimension string, x, y, z int) (world.ItemStack, BannerPatternsComponent, bool) {
+	drop, patterns, _, ok := s.RemoveBannerWithMetaAt(dimension, x, y, z)
+	return drop, patterns, ok
+}
+
+// RemoveBannerWithMetaAt removes any BannerBlockEntity at (dimension, x, y, z) and returns
+// the dropped banner ItemStack, its BannerPatternsComponent, and its CustomName component.
+func (s *Server) RemoveBannerWithMetaAt(dimension string, x, y, z int) (world.ItemStack, BannerPatternsComponent, *ChatComponent, bool) {
 	if s == nil {
-		return world.ItemStack{}, BannerPatternsComponent{}, false
+		return world.ItemStack{}, BannerPatternsComponent{}, nil, false
 	}
 	dim := world.NormalizeDimension(dimension)
 	key := blockPosDimKey{dim: dim, x: x, y: y, z: z}
@@ -834,24 +925,31 @@ func (s *Server) RemoveBannerAt(dimension string, x, y, z int) (world.ItemStack,
 		delete(st.banners, key)
 	}
 	st.mu.Unlock()
+	if exists {
+		s.syncShowcaseChunkInMemory(dim, x, z)
+	}
 
 	baseColor := ""
 	var patterns BannerPatternsComponent
+	var customName *ChatComponent
 	if b != nil {
 		baseColor = b.BaseColor
 		patterns = b.Patterns.Clone()
+		if b.CustomName != nil && !b.CustomName.IsEmpty() {
+			cn := *b.CustomName
+			customName = &cn
+		}
 	}
-	if baseColor == "" {
-		if cache := s.chunksForDimension(dim); cache != nil {
-			if col, ok := BannerColorFromBlockState(cache.GetBlock(x, y, z)); ok {
-				baseColor = col
-			}
+	if cache := s.chunksForDimension(dim); cache != nil {
+		if col, ok := BannerColorFromBlockState(cache.GetBlock(x, y, z)); ok {
+			baseColor = col
 		}
 	}
 	if baseColor == "" && !exists {
-		return world.ItemStack{}, BannerPatternsComponent{}, false
+		return world.ItemStack{}, BannerPatternsComponent{}, nil, false
 	}
-	return world.NewNamedItemStack(BannerItemFromColor(baseColor), 1), patterns, true
+	_ = DefaultRecipeBook()
+	return world.NewNamedItemStack(BannerItemFromColor(baseColor), 1), patterns, customName, true
 }
 
 // SendBannerBlockEntityPacket sends the BlockEntityData (0x06) packet for the banner
@@ -1194,6 +1292,13 @@ func (s *Server) LoadChunkBannerBlockEntitiesNBT(dimension string, list nbt.List
 			if _, hasDim := nbtStringTag(comp, "dimension"); !hasDim {
 				b.Dimension = normDim
 			}
+			if _, hasCol := nbtStringTag(comp, "base_color"); !hasCol {
+				if cache := s.chunksForDimension(b.Dimension); cache != nil {
+					if col, ok := BannerColorFromBlockState(cache.GetBlock(b.X, b.Y, b.Z)); ok {
+						b.BaseColor = col
+					}
+				}
+			}
 			key := blockPosDimKey{dim: b.Dimension, x: b.X, y: b.Y, z: b.Z}
 			st := s.bannerStore()
 			st.mu.Lock()
@@ -1231,7 +1336,14 @@ func (s *Server) SaveBannersToNBT() *nbt.Compound {
 	var elems []nbt.Tag
 	for _, k := range keys {
 		if b := st.banners[k]; b != nil {
-			elems = append(elems, b.ToNBT())
+			comp := b.ToNBT()
+			if k.dim != "" && k.dim != world.DimensionOverworld {
+				comp.Set("dimension", nbt.String(k.dim))
+			}
+			if b.BaseColor != "" {
+				comp.Set("base_color", nbt.String(b.BaseColor))
+			}
+			elems = append(elems, comp)
 		}
 	}
 	st.mu.RUnlock()

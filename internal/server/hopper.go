@@ -466,6 +466,7 @@ func (s *Server) SetHopperSlotWithMeta(dim string, x, y, z, slot int, stack worl
 		be.SlotPotions[slot] = potionType
 	}
 	hs.mu.Unlock()
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
 }
@@ -798,6 +799,7 @@ func (s *Server) SetChiseledBookshelfSlot(dim string, x, y, z, slot int, stack w
 			}
 		}
 	}
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
 }
@@ -949,6 +951,7 @@ func (s *Server) SetCrafterSlot(dim string, x, y, z, slot int, stack world.ItemS
 		cr.SlotMeta[slot] = meta.Clone()
 	}
 	hs.mu.Unlock()
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
 }
@@ -967,6 +970,7 @@ func (s *Server) SetCrafterSlotDisabled(dim string, x, y, z, slot int, disabled 
 	cr := s.getOrCreateCrafterLocked(hs, normDim, x, y, z)
 	cr.Disabled[slot] = disabled
 	hs.mu.Unlock()
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return true
 }
@@ -3161,6 +3165,30 @@ func encodeHopperItemComponents(base *nbt.Compound, meta ItemMeta, potion string
 			}
 		}
 	}
+	if len(meta.StoredEnchantments) > 0 {
+		keys := make([]string, 0, len(meta.StoredEnchantments))
+		for id, lvl := range meta.StoredEnchantments {
+			if lvl > 0 {
+				keys = append(keys, canonicalResourceName(id))
+			}
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			storedComp := nbt.NewCompound()
+			for _, id := range keys {
+				lvl := meta.StoredEnchantments[id]
+				if lvl <= 0 {
+					lvl = meta.StoredEnchantments[strings.TrimPrefix(id, "minecraft:")]
+				}
+				if lvl > 0 {
+					storedComp.Set(id, nbt.Int(int32(lvl)))
+				}
+			}
+			if storedComp.Len() > 0 {
+				ensureComp().Set("minecraft:stored_enchantments", storedComp)
+			}
+		}
+	}
 	if shulker != nil {
 		var containerSlots []nbt.Tag
 		for sIdx := 0; sIdx < ChestSlotCount; sIdx++ {
@@ -3234,6 +3262,24 @@ func decodeHopperItemComponents(itComp *nbt.Compound) (comp *nbt.Compound, meta 
 								meta.Enchantments = make(map[string]int)
 							}
 							meta.Enchantments[canonicalResourceName(k)] = int(lvl)
+						}
+					}
+				}
+			}
+			if storedTag, ok := rawComp.Get("minecraft:stored_enchantments"); ok {
+				if storedComp, ok := storedTag.(*nbt.Compound); ok && storedComp != nil {
+					levelsComp := storedComp
+					if subTag, ok := storedComp.Get("levels"); ok {
+						if sub, ok := subTag.(*nbt.Compound); ok && sub != nil {
+							levelsComp = sub
+						}
+					}
+					for _, k := range levelsComp.Keys() {
+						if lvl, ok := nbtGetInt(levelsComp, k); ok && lvl > 0 {
+							if meta.StoredEnchantments == nil {
+								meta.StoredEnchantments = make(map[string]int)
+							}
+							meta.StoredEnchantments[canonicalResourceName(k)] = int(lvl)
 						}
 					}
 				}

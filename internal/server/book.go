@@ -427,9 +427,9 @@ func (c WrittenBookContent) ToNBT() *nbt.Compound {
 	elems := make([]nbt.Tag, 0, len(c.Pages))
 	for _, p := range c.Pages {
 		pc := nbt.NewCompound()
-		pc.Set("raw", nbt.String(p.Raw.ToJSON()))
+		pc.Set("raw", p.Raw.ToNBT())
 		if p.HasFiltered {
-			pc.Set("filtered", nbt.String(p.Filtered.ToJSON()))
+			pc.Set("filtered", p.Filtered.ToNBT())
 		}
 		elems = append(elems, pc)
 	}
@@ -463,18 +463,29 @@ func WrittenBookContentFromNBT(comp *nbt.Compound) WrittenBookContent {
 		for _, elem := range list.Elems {
 			switch v := elem.(type) {
 			case nbt.String:
-				out.Pages = append(out.Pages, FilterableComponent{Raw: ParseChatComponentOrText(string(v))})
+				out.Pages = append(out.Pages, FilterableComponent{Raw: decodeChatComponentTagCompat(v)})
 			case *nbt.Compound:
-				rawStr, _ := nbtStringTag(v, "raw")
-				filtStr, hasFilt := nbtStringTag(v, "filtered")
-				fc := FilterableComponent{
-					Raw:         ParseChatComponentOrText(rawStr),
-					HasFiltered: hasFilt,
+				if v == nil {
+					continue
 				}
-				if hasFilt {
-					fc.Filtered = ParseChatComponentOrText(filtStr)
+				if v.Len() == 1 {
+					if inner, isWrap := v.Get(""); isWrap {
+						out.Pages = append(out.Pages, FilterableComponent{Raw: decodeChatComponentTagCompat(inner)})
+						continue
+					}
 				}
-				out.Pages = append(out.Pages, fc)
+				if rawTag, hasRaw := v.Get("raw"); hasRaw {
+					fc := FilterableComponent{
+						Raw: decodeChatComponentTagCompat(rawTag),
+					}
+					if filtTag, hasFilt := v.Get("filtered"); hasFilt {
+						fc.HasFiltered = true
+						fc.Filtered = decodeChatComponentTagCompat(filtTag)
+					}
+					out.Pages = append(out.Pages, fc)
+				} else {
+					out.Pages = append(out.Pages, FilterableComponent{Raw: ChatComponentFromNBT(v)})
+				}
 			}
 		}
 	}

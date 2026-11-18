@@ -19,8 +19,8 @@ import (
 const (
 	JukeboxEndPaddingTicks int64 = 20
 
-	// BlockEntityTypeJukebox is BuiltInRegistries.BLOCK_ENTITY_TYPE index 5 ("minecraft:jukebox").
-	BlockEntityTypeJukebox int32 = 5
+	// BlockEntityTypeJukebox is BuiltInRegistries.BLOCK_ENTITY_TYPE index 4 ("minecraft:jukebox").
+	BlockEntityTypeJukebox int32 = 4
 
 	// GameEventJukeboxStopPlay is the vanilla GameEvent ID emitted when a jukebox stops playing.
 	GameEventJukeboxStopPlay = "minecraft:jukebox_stop_play"
@@ -187,6 +187,7 @@ type JukeboxBlockEntity struct {
 	Y                     int
 	Z                     int
 	RecordItem            world.ItemStack
+	RecordComponents      *nbt.Compound
 	TicksSinceSongStarted int64
 	Playing               bool
 }
@@ -197,6 +198,9 @@ func (jb *JukeboxBlockEntity) Clone() *JukeboxBlockEntity {
 		return nil
 	}
 	cp := *jb
+	if jb.RecordComponents != nil {
+		cp.RecordComponents = world.CloneNBTCompound(jb.RecordComponents)
+	}
 	return &cp
 }
 
@@ -245,8 +249,15 @@ func (jb *JukeboxBlockEntity) RedstoneSignal() int {
 	return 0
 }
 
-// ToNBT serializes the jukebox block entity into a vanilla NBT compound
-// ("id": "minecraft:jukebox", "RecordItem", "ticks_since_song_started").
+// ToUpdateTagNBT returns the vanilla 26.1.2 BlockEntity.getUpdateTag payload for
+// JukeboxBlockEntity (an empty CompoundTag).
+func (jb *JukeboxBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	return nbt.NewCompound()
+}
+
+// ToNBT serializes the jukebox block entity into an exact vanilla 26.1.2
+// block_entities NBT compound ("id": "minecraft:jukebox", "x", "y", "z",
+// "keepPacked", plus optional "RecordItem" and "ticks_since_song_started").
 func (jb *JukeboxBlockEntity) ToNBT() *nbt.Compound {
 	comp := nbt.NewCompound()
 	if jb == nil {
@@ -256,9 +267,7 @@ func (jb *JukeboxBlockEntity) ToNBT() *nbt.Compound {
 	comp.Set("x", nbt.Int(int32(jb.X)))
 	comp.Set("y", nbt.Int(int32(jb.Y)))
 	comp.Set("z", nbt.Int(int32(jb.Z)))
-	if jb.Dimension != "" {
-		comp.Set("dimension", nbt.String(world.NormalizeDimension(jb.Dimension)))
-	}
+	comp.Set("keepPacked", nbt.Byte(0))
 	if jb.HasRecord() {
 		rec := nbt.NewCompound()
 		rec.Set("id", nbt.String(jb.RecordItem.ResolvedID()))
@@ -267,8 +276,11 @@ func (jb *JukeboxBlockEntity) ToNBT() *nbt.Compound {
 			cnt = 1
 		}
 		rec.Set("count", nbt.Int(cnt))
+		if jb.RecordComponents != nil && jb.RecordComponents.Len() > 0 {
+			rec.Set("components", world.CloneNBTCompound(jb.RecordComponents))
+		}
 		comp.Set("RecordItem", rec)
-		if jb.Playing {
+		if jb.IsPlaying() {
 			comp.Set("ticks_since_song_started", nbt.Long(jb.TicksSinceSongStarted))
 		}
 	}
@@ -312,6 +324,9 @@ func JukeboxBlockEntityFromNBT(comp *nbt.Compound) (*JukeboxBlockEntity, error) 
 			// Ensure item IDs are registered before resolving named stack.
 			_ = DefaultRecipeBook()
 			jb.RecordItem = world.NewNamedItemStack(itemID, cnt)
+		}
+		if comps, ok := nbtCompoundTag(recComp, "components"); ok && comps != nil && comps.Len() > 0 {
+			jb.RecordComponents = world.CloneNBTCompound(comps)
 		}
 	}
 	if rawTicks, ok := comp.Get("ticks_since_song_started"); ok && jb.HasRecord() {
@@ -415,7 +430,9 @@ func (s *Server) ensureJukeboxesLoadedLocked(st *serverJukeboxStore) {
 			continue
 		}
 		key := blockPosDimKey{dim: jb.Dimension, x: jb.X, y: jb.Y, z: jb.Z}
-		st.jukeboxes[key] = jb
+		if _, exists := st.jukeboxes[key]; !exists {
+			st.jukeboxes[key] = jb
+		}
 	}
 }
 
@@ -451,7 +468,11 @@ func (s *Server) SaveJukeboxes() error {
 	})
 	elems := make([]nbt.Tag, 0, len(keys))
 	for _, k := range keys {
-		elems = append(elems, st.jukeboxes[k].ToNBT())
+		comp := st.jukeboxes[k].ToNBT()
+		if k.dim != "" && k.dim != world.DimensionOverworld {
+			comp.Set("dimension", nbt.String(k.dim))
+		}
+		elems = append(elems, comp)
 	}
 	st.mu.RUnlock()
 
@@ -482,16 +503,20 @@ func (s *Server) syncLoadedJukeboxBlockState(jb *JukeboxBlockEntity) {
 	_ = cache.UpdateComparatorsAround(jb.X, jb.Y, jb.Z)
 }
 
-// LoadJukeboxes reloads jukebox block entities from <WorldDir>/region/jukeboxes.nbt.
+// LoadJukeboxes reloads jukebox block entities from .mca and <WorldDir>/region/jukeboxes.nbt.
 func (s *Server) LoadJukeboxes() error {
 	if s == nil {
 		return nil
 	}
+	_ = s.LoadShowcaseBlockEntitiesFromStore()
 	st := s.jukeboxStore()
 	st.mu.Lock()
-	st.loadedDisk = false
-	st.jukeboxes = make(map[blockPosDimKey]*JukeboxBlockEntity)
-	s.ensureJukeboxesLoadedLocked(st)
+	if path := s.jukeboxSidecarPath(); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			st.loadedDisk = false
+			s.ensureJukeboxesLoadedLocked(st)
+		}
+	}
 	loaded := make([]*JukeboxBlockEntity, 0, len(st.jukeboxes))
 	for _, jb := range st.jukeboxes {
 		if jb != nil {
@@ -612,6 +637,7 @@ func (s *Server) SetJukeboxAt(jb *JukeboxBlockEntity) {
 		st.jukeboxes[key] = cp
 	}
 	st.mu.Unlock()
+	s.syncShowcaseChunkInMemory(cp.Dimension, cp.X, cp.Z)
 }
 
 // JukeboxComparatorSignalAt returns the redstone comparator signal (1..15) for
@@ -903,6 +929,7 @@ func (s *Server) TickJukeboxes() {
 		}
 		if song.HasFinished(jb.TicksSinceSongStarted) {
 			jb.Playing = false
+			jb.TicksSinceSongStarted = 0
 			finished = append(finished, finishedEntry{key: key})
 			continue
 		}
@@ -937,6 +964,7 @@ func (s *Server) TickJukeboxes() {
 			s.EmitGameEvent(f.key.dim, GameEventJukeboxStopPlay, float64(f.key.x)+0.5, float64(f.key.y)+0.5, float64(f.key.z)+0.5, VibrationSource{})
 			s.NotifyJukeboxPlayingForAllays(f.key.dim, f.key.x, f.key.y, f.key.z, false)
 			s.notifyJukeboxParrots(f.key.dim, f.key.x, f.key.y, f.key.z)
+			s.syncShowcaseChunkInMemory(f.key.dim, f.key.x, f.key.z)
 
 			if cache := s.BindNoteBlockAndJukeboxRedstone(f.key.dim); cache != nil {
 				// Re-trigger redstone propagation around the jukebox now that its
@@ -1034,22 +1062,15 @@ func (s *Server) HopperTryExtractFromJukebox(dimension string, x, y, z int) (wor
 }
 
 // BroadcastJukeboxBlockEntityData broadcasts ClientboundBlockEntityDataPacket
-// (`0x06`, `BlockEntityTypeJukebox = 5`) for the jukebox at (dimension, x, y, z).
+// (`0x06`, `BlockEntityTypeJukebox = 4`) for the jukebox at (dimension, x, y, z).
 func (s *Server) BroadcastJukeboxBlockEntityData(dimension string, x, y, z int) {
 	if s == nil {
 		return
 	}
 	dim := world.NormalizeDimension(dimension)
-	jb, ok := s.GetJukeboxAt(dim, x, y, z)
-	if !ok || jb == nil {
-		jb = &JukeboxBlockEntity{
-			Dimension: dim,
-			X:         x,
-			Y:         y,
-			Z:         z,
-		}
-	}
-	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeJukebox, jb.ToNBT())
+	s.syncShowcaseChunkInMemory(dim, x, z)
+	jb, _ := s.GetJukeboxAt(dim, x, y, z)
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeJukebox, jb.ToUpdateTagNBT())
 	s.BroadcastDimensionChunk(dim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
 }
 

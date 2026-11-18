@@ -332,43 +332,28 @@ func IsHostileConduitTargetType(typeName string) bool {
 
 // --- Conduit Block Entity NBT Serialization ---
 
-// EncodeConduitBlockEntityNBT serializes c into a vanilla 26.1.2 block entity
-// NBT compound (`id: "minecraft:conduit"`, `x`, `y`, `z`, `Active`, `Hunting`,
-// `FrameCount`, `Target`).
+// ToUpdateTagNBT returns the vanilla 26.1.2 ConduitBlockEntity.getUpdateTag payload
+// (saveCustomOnly: Target IntArray[4] when present, empty otherwise).
+func (c ConduitBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	comp := nbt.NewCompound()
+	if c.HasTarget {
+		comp.Set("Target", uuidToNBTIntArray(c.TargetUUID))
+	}
+	return comp
+}
+
+// EncodeConduitBlockEntityNBT serializes c into an exact vanilla 26.1.2
+// block_entities NBT compound (`id: "minecraft:conduit"`, `x`, `y`, `z`,
+// `keepPacked`, plus optional `Target`).
 func EncodeConduitBlockEntityNBT(c ConduitBlockEntity) *nbt.Compound {
-	id := c.ID
-	if id == "" {
-		id = "minecraft:conduit"
-	}
-	dim := c.Dimension
-	if dim == "" {
-		dim = world.DimensionOverworld
-	}
-	var activeByte, huntingByte nbt.Byte
-	if c.Active {
-		activeByte = 1
-	}
-	if c.Hunting {
-		huntingByte = 1
-	}
 	comp := nbt.NewCompound().
-		Set("id", nbt.String(id)).
-		Set("Dimension", nbt.String(world.NormalizeDimension(dim))).
+		Set("id", nbt.String("minecraft:conduit")).
 		Set("x", nbt.Int(int32(c.X))).
 		Set("y", nbt.Int(int32(c.Y))).
 		Set("z", nbt.Int(int32(c.Z))).
-		Set("Active", activeByte).
-		Set("Hunting", huntingByte).
-		Set("FrameCount", nbt.Int(int32(c.FrameCount)))
-
+		Set("keepPacked", nbt.Byte(0))
 	if c.HasTarget {
 		comp.Set("Target", uuidToNBTIntArray(c.TargetUUID))
-		if c.TargetEntityID > 0 {
-			comp.Set("TargetEntityID", nbt.Int(c.TargetEntityID))
-		}
-	}
-	if c.TickCounter > 0 {
-		comp.Set("TickCounter", nbt.Int(int32(c.TickCounter)))
 	}
 	return comp
 }
@@ -534,8 +519,11 @@ func (s *Server) ensureConduitsLoadedLocked(cs *serverConduitState) {
 			continue
 		}
 		if c, ok := DecodeConduitBlockEntityNBT(comp); ok {
-			cp := c.Clone()
-			cs.conduits[conduitKey{dim: cp.Dimension, x: cp.X, y: cp.Y, z: cp.Z}] = &cp
+			key := conduitKey{dim: c.Dimension, x: c.X, y: c.Y, z: c.Z}
+			if _, exists := cs.conduits[key]; !exists {
+				cp := c.Clone()
+				cs.conduits[key] = &cp
+			}
 		}
 	}
 }
@@ -587,7 +575,11 @@ func (s *Server) SaveConduits() error {
 		if c == nil {
 			continue
 		}
-		elems = append(elems, EncodeConduitBlockEntityNBT(*c))
+		comp := EncodeConduitBlockEntityNBT(*c)
+		if k.dim != "" && k.dim != world.DimensionOverworld {
+			comp.Set("Dimension", nbt.String(k.dim))
+		}
+		elems = append(elems, comp)
 	}
 	cs.mu.Unlock()
 
@@ -742,6 +734,7 @@ func (s *Server) SetConduitState(c ConduitBlockEntity) {
 	s.ensureConduitsLoadedLocked(cs)
 	cs.conduits[conduitKey{dim: cp.Dimension, x: cp.X, y: cp.Y, z: cp.Z}] = &cp
 	cs.mu.Unlock()
+	s.syncShowcaseChunkInMemory(cp.Dimension, cp.X, cp.Z)
 	_ = s.SaveConduits()
 }
 
@@ -1108,11 +1101,12 @@ func (s *Server) BroadcastConduitBlockEntityData(dim string, x, y, z int) {
 		return
 	}
 	normDim := world.NormalizeDimension(dim)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	be, ok := s.ConduitAtInDim(normDim, x, y, z)
 	if !ok {
 		return
 	}
-	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeConduit, EncodeConduitBlockEntityNBT(be))
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeConduit, be.ToUpdateTagNBT())
 	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
 }
 

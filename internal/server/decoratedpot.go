@@ -10,6 +10,7 @@ import (
 
 	"regionio/internal/nbt"
 	"regionio/internal/world"
+	"regionio/internal/worldgen"
 )
 
 // DecoratedPotWobbleStyle identifies the wobble animation style sent via
@@ -210,6 +211,9 @@ type DecoratedPotBlockEntity struct {
 	Sherds          [4]string // [0]=Back, [1]=Left, [2]=Right, [3]=Front
 	Item            world.ItemStack
 	Meta            ItemMeta
+	ItemComponents  *nbt.Compound
+	LootTable       string
+	LootTableSeed   int64
 	LastWobbleStyle DecoratedPotWobbleStyle
 }
 
@@ -220,6 +224,9 @@ func (dp *DecoratedPotBlockEntity) Clone() *DecoratedPotBlockEntity {
 	}
 	cp := *dp
 	cp.Meta = dp.Meta.Clone()
+	if dp.ItemComponents != nil {
+		cp.ItemComponents = world.CloneNBTCompound(dp.ItemComponents)
+	}
 	return &cp
 }
 
@@ -265,10 +272,15 @@ func (s *Server) getOrCreateDecoratedPotLocked(st *serverDecoratedPotStore, dim 
 						shArr[i] = sbe.Sherds[i]
 					}
 					dp.Sherds = normalizePotSherds(shArr)
-					for _, slot := range sbe.Items {
-						if slot.ItemID != "" && slot.Count > 0 {
-							dp.Item = world.NewNamedItemStack(slot.ItemID, int32(slot.Count))
-							break
+					if sbe.LootTable != "" {
+						dp.LootTable = sbe.LootTable
+						dp.LootTableSeed = sbe.LootTableSeed
+					} else {
+						for _, slot := range sbe.Items {
+							if slot.ItemID != "" && slot.Count > 0 {
+								dp.Item = world.NewNamedItemStack(slot.ItemID, int32(slot.Count))
+								break
+							}
 						}
 					}
 				}
@@ -423,6 +435,54 @@ func (s *Server) GetDecoratedPotAt(dim string, x, y, z int) (*DecoratedPotBlockE
 	return cp, cp != nil
 }
 
+func (s *Server) unpackDecoratedPotLootLocked(dp *DecoratedPotBlockEntity) bool {
+	if dp == nil || dp.LootTable == "" {
+		return false
+	}
+	lootTable := dp.LootTable
+	seed := dp.LootTableSeed
+	dp.LootTable = ""
+	dp.LootTableSeed = 0
+	if seed == 0 {
+		seed = (int64(dp.X)&0x3FFFFFF)<<38 | (int64(dp.Y) & 0xFFF) | ((int64(dp.Z) & 0x3FFFFFF) << 12)
+		if s != nil && s.cfg.WorldSeed != 0 {
+			seed ^= s.cfg.WorldSeed
+		}
+	}
+	_ = DefaultRecipeBook()
+	if reg, err := worldgen.LoadLootAndSpawnerRegistry(); err == nil && reg != nil {
+		items := reg.FillContainer(lootTable, seed, 1)
+		for _, it := range items {
+			if it.ItemID != "" && it.Count > 0 {
+				dp.Item = world.NewNamedItemStack(it.ItemID, int32(it.Count))
+				break
+			}
+		}
+	}
+	return true
+}
+
+// SetDecoratedPotLootTable assigns a LootTable and LootTableSeed to the decorated pot at (dim, x, y, z).
+func (s *Server) SetDecoratedPotLootTable(dim string, x, y, z int, lootTable string, seed int64) bool {
+	if s == nil {
+		return false
+	}
+	normDim := normalizeHopperDim(dim)
+	st := s.decoratedPotStore()
+	st.mu.Lock()
+	dp := s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+	dp.LootTable = strings.TrimSpace(lootTable)
+	dp.LootTableSeed = seed
+	if dp.LootTable != "" {
+		dp.Item = world.ItemStack{}
+		dp.Meta = ItemMeta{}
+		dp.ItemComponents = nil
+	}
+	st.mu.Unlock()
+	s.syncShowcaseChunkInMemory(normDim, x, z)
+	return true
+}
+
 // SetDecoratedPotSherds sets the 4 side sherds (`[back, left, right, front]`)
 // of the `minecraft:decorated_pot` at (dim, x, y, z).
 func (s *Server) SetDecoratedPotSherds(dim string, x, y, z int, sherds [4]string) bool {
@@ -450,6 +510,9 @@ func (s *Server) SetDecoratedPotItem(dim string, x, y, z int, stack world.ItemSt
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	dp := s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+	dp.LootTable = ""
+	dp.LootTableSeed = 0
+	dp.ItemComponents = nil
 	if stack.IsEmpty() || stack.Count <= 0 {
 		dp.Item = world.ItemStack{}
 		dp.Meta = ItemMeta{}
@@ -539,6 +602,7 @@ func (s *Server) InteractDecoratedPot(session *PlayerSession, dim string, x, y, 
 		st := s.decoratedPotStore()
 		st.mu.Lock()
 		dp := s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+		_ = s.unpackDecoratedPotLootLocked(dp)
 		canInsert := false
 		var newCount int32
 		if dp.Item.IsEmpty() || dp.Item.Count <= 0 {
@@ -619,6 +683,9 @@ func (s *Server) DecoratedPotComparatorSignalAt(dim string, x, y, z int) int {
 	if dp == nil && isPotBlock {
 		dp = s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
 	}
+	if dp != nil {
+		_ = s.unpackDecoratedPotLootLocked(dp)
+	}
 	if dp == nil || dp.Item.IsEmpty() || dp.Item.Count <= 0 {
 		st.mu.Unlock()
 		return 0
@@ -650,6 +717,7 @@ func (s *Server) HopperInsertIntoDecoratedPot(dim string, x, y, z int, stack wor
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	dp := s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
+	_ = s.unpackDecoratedPotLootLocked(dp)
 	if dp.Item.IsEmpty() || dp.Item.Count <= 0 {
 		dp.Item = single
 		dp.Meta = meta.Clone()
@@ -684,6 +752,9 @@ func (s *Server) HopperExtractFromDecoratedPot(dim string, x, y, z int) (world.I
 	if dp == nil && isPotBlock {
 		dp = s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
 	}
+	if dp != nil {
+		_ = s.unpackDecoratedPotLootLocked(dp)
+	}
 	if dp == nil || dp.Item.IsEmpty() || dp.Item.Count <= 0 {
 		st.mu.Unlock()
 		return world.ItemStack{}, ItemMeta{}, false
@@ -693,10 +764,12 @@ func (s *Server) HopperExtractFromDecoratedPot(dim string, x, y, z int) (world.I
 	if dp.Item.Count <= 1 {
 		dp.Item = world.ItemStack{}
 		dp.Meta = ItemMeta{}
+		dp.ItemComponents = nil
 	} else {
 		dp.Item = world.NewNamedItemStack(dp.Item.ResolvedID(), dp.Item.Count-1)
 	}
 	st.mu.Unlock()
+	s.BroadcastDecoratedPotBlockEntityData(normDim, x, y, z)
 	s.updateHopperComparatorsAndBroadcast(normDim, x, y, z)
 	return out, meta, true
 }
@@ -754,10 +827,14 @@ func (s *Server) BreakDecoratedPotAt(
 		dp = s.getOrCreateDecoratedPotLocked(st, normDim, x, y, z)
 		ok = dp != nil
 	}
+	if dp != nil {
+		_ = s.unpackDecoratedPotLootLocked(dp)
+	}
 	if ok {
 		delete(st.pots, key)
 	}
 	st.mu.Unlock()
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 
 	if cache != nil {
 		cache.RemoveStructureBlockEntity(x, y, z)
@@ -848,50 +925,83 @@ func (s *Server) HitDecoratedPotWithProjectile(dim string, x, y, z int, projecti
 
 // --- NBT Serialization & Persistence (`decorated_pots.dat`) ---
 
-// ToNBT serializes the DecoratedPotBlockEntity into a vanilla-compatible NBT compound.
-func (dp *DecoratedPotBlockEntity) ToNBT() *nbt.Compound {
-	if dp == nil {
-		return nbt.NewCompound()
-	}
+// ToUpdateTagNBT returns the vanilla 26.1.2 DecoratedPotBlockEntity.getUpdateTag
+// payload (saveCustomOnly: sherds omitted when all 4 are minecraft:brick; LootTable /
+// LootTableSeed or item with 26.1.2 components).
+func (dp *DecoratedPotBlockEntity) ToUpdateTagNBT() *nbt.Compound {
 	comp := nbt.NewCompound()
-	comp.Set("id", nbt.String("minecraft:decorated_pot"))
-	comp.Set("Dimension", nbt.String(normalizeHopperDim(dp.Dimension)))
-	comp.Set("x", nbt.Int(int32(dp.X)))
-	comp.Set("y", nbt.Int(int32(dp.Y)))
-	comp.Set("z", nbt.Int(int32(dp.Z)))
-
-	sh := normalizePotSherds(dp.Sherds)
-	sherdTags := []nbt.Tag{
-		nbt.String(sh[0]),
-		nbt.String(sh[1]),
-		nbt.String(sh[2]),
-		nbt.String(sh[3]),
+	if dp == nil {
+		return comp
 	}
-	comp.Set("sherds", nbt.List{ElemID: nbt.TagString, Elems: sherdTags})
-
-	if !dp.Item.IsEmpty() && dp.Item.Count > 0 {
+	sh := normalizePotSherds(dp.Sherds)
+	if sh != DefaultDecoratedPotSherds() {
+		sherdTags := []nbt.Tag{
+			nbt.String(sh[0]),
+			nbt.String(sh[1]),
+			nbt.String(sh[2]),
+			nbt.String(sh[3]),
+		}
+		comp.Set("sherds", nbt.List{ElemID: nbt.TagString, Elems: sherdTags})
+	}
+	if dp.LootTable != "" {
+		comp.Set("LootTable", nbt.String(canonicalResourceName(dp.LootTable)))
+		if dp.LootTableSeed != 0 {
+			comp.Set("LootTableSeed", nbt.Long(dp.LootTableSeed))
+		}
+	} else if !dp.Item.IsEmpty() && dp.Item.Count > 0 {
 		itemComp := nbt.NewCompound()
 		itemComp.Set("id", nbt.String(dp.Item.ResolvedID()))
 		itemComp.Set("count", nbt.Int(dp.Item.Count))
-		if !dp.Meta.IsEmpty() {
-			metaComp := nbt.NewCompound()
-			encodeItemMetaToNBT(metaComp, dp.Meta)
-			itemComp.Set("Meta", metaComp)
+		if comps := encodeHopperItemComponents(dp.ItemComponents, dp.Meta, "", nil); comps != nil && comps.Len() > 0 {
+			itemComp.Set("components", comps)
 		}
 		comp.Set("item", itemComp)
 	}
 	return comp
 }
 
+// ToNBT serializes the DecoratedPotBlockEntity into an exact vanilla 26.1.2
+// block_entities NBT compound (id, x, y, z, keepPacked, plus saveAdditional fields).
+func (dp *DecoratedPotBlockEntity) ToNBT() *nbt.Compound {
+	if dp == nil {
+		return nbt.NewCompound()
+	}
+	comp := nbt.NewCompound()
+	comp.Set("id", nbt.String("minecraft:decorated_pot"))
+	comp.Set("x", nbt.Int(int32(dp.X)))
+	comp.Set("y", nbt.Int(int32(dp.Y)))
+	comp.Set("z", nbt.Int(int32(dp.Z)))
+	comp.Set("keepPacked", nbt.Byte(0))
+	upd := dp.ToUpdateTagNBT()
+	for _, k := range upd.Keys() {
+		if v, ok := upd.Get(k); ok {
+			comp.Set(k, v)
+		}
+	}
+	return comp
+}
+
 // DecoratedPotBlockEntityFromNBT deserializes a DecoratedPotBlockEntity from an NBT compound.
 func DecoratedPotBlockEntityFromNBT(comp *nbt.Compound) (*DecoratedPotBlockEntity, bool) {
+	return DecoratedPotBlockEntityFromNBTWithDim(comp, "")
+}
+
+// DecoratedPotBlockEntityFromNBTWithDim deserializes a DecoratedPotBlockEntity from a
+// vanilla 26.1.2 block_entities compound, using fallbackDim when no legacy Dimension tag is present.
+func DecoratedPotBlockEntityFromNBTWithDim(comp *nbt.Compound, fallbackDim string) (*DecoratedPotBlockEntity, bool) {
 	if comp == nil {
 		return nil, false
 	}
 	if idStr, hasID := nbtGetString(comp, "id"); hasID && idStr != "" && canonicalResourceName(idStr) != "minecraft:decorated_pot" {
 		return nil, false
 	}
-	dim, _ := nbtGetString(comp, "Dimension")
+	dim, hasDim := nbtGetString(comp, "Dimension")
+	if !hasDim || dim == "" {
+		dim, _ = nbtGetString(comp, "dimension")
+	}
+	if dim == "" {
+		dim = fallbackDim
+	}
 	x, okX := nbtGetInt(comp, "x")
 	y, okY := nbtGetInt(comp, "y")
 	z, okZ := nbtGetInt(comp, "z")
@@ -911,6 +1021,15 @@ func DecoratedPotBlockEntityFromNBT(comp *nbt.Compound) (*DecoratedPotBlockEntit
 			dp.Sherds[i] = canonicalResourceName(string(st))
 		}
 	}
+	if lt, hasLT := nbtGetString(comp, "LootTable"); hasLT && strings.TrimSpace(lt) != "" {
+		dp.LootTable = canonicalResourceName(lt)
+		if rawSeed, ok := comp.Get("LootTableSeed"); ok {
+			if l, okL := rawSeed.(nbt.Long); okL {
+				dp.LootTableSeed = int64(l)
+			}
+		}
+		return dp, true
+	}
 	if rawItem, ok := comp.Get("item"); ok {
 		if itemComp, ok := rawItem.(*nbt.Compound); ok && itemComp != nil {
 			itemID, _ := nbtGetString(itemComp, "id")
@@ -919,8 +1038,15 @@ func DecoratedPotBlockEntityFromNBT(comp *nbt.Compound) (*DecoratedPotBlockEntit
 				cnt = 1
 			}
 			if itemID != "" {
+				_ = DefaultRecipeBook()
 				dp.Item = world.NewNamedItemStack(itemID, cnt)
-				if rawMeta, ok := itemComp.Get("Meta"); ok {
+				rawComps, parsedMeta, _, _ := decodeHopperItemComponents(itemComp)
+				if rawComps != nil && rawComps.Len() > 0 {
+					dp.ItemComponents = rawComps
+				}
+				if !parsedMeta.IsEmpty() {
+					dp.Meta = parsedMeta
+				} else if rawMeta, ok := itemComp.Get("Meta"); ok {
 					if metaComp, ok := rawMeta.(*nbt.Compound); ok && metaComp != nil {
 						dp.Meta = decodeItemMetaFromNBT(metaComp)
 					}
@@ -969,7 +1095,11 @@ func (s *Server) SaveDecoratedPots() error {
 	list := make([]nbt.Tag, 0, len(keys))
 	for _, k := range keys {
 		if dp := st.pots[k]; dp != nil {
-			list = append(list, dp.ToNBT())
+			comp := dp.ToNBT()
+			if k.dim != "" && k.dim != world.DimensionOverworld {
+				comp.Set("Dimension", nbt.String(k.dim))
+			}
+			list = append(list, comp)
 		}
 	}
 	st.mu.Unlock()
@@ -1089,12 +1219,9 @@ func (s *Server) LoadChunkDecoratedPotBlockEntitiesNBT(dim string, list []*nbt.C
 	st := s.decoratedPotStore()
 	st.mu.Lock()
 	for _, comp := range list {
-		dp, ok := DecoratedPotBlockEntityFromNBT(comp)
+		dp, ok := DecoratedPotBlockEntityFromNBTWithDim(comp, normDim)
 		if !ok || dp == nil {
 			continue
-		}
-		if dp.Dimension == "" {
-			dp.Dimension = normDim
 		}
 		st.pots[hopperBlockKey{dim: dp.Dimension, x: dp.X, y: dp.Y, z: dp.Z}] = dp
 		loaded = append(loaded, dp.Clone())
@@ -1115,11 +1242,12 @@ func (s *Server) BroadcastDecoratedPotBlockEntityData(dim string, x, y, z int) {
 		return
 	}
 	normDim := normalizeHopperDim(dim)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	dp, ok := s.GetDecoratedPotAt(normDim, x, y, z)
 	if !ok || dp == nil {
 		return
 	}
-	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeDecoratedPot, dp.ToNBT())
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeDecoratedPot, dp.ToUpdateTagNBT())
 	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
 }
 

@@ -403,7 +403,7 @@ func (c *Chunk) encode() []byte {
 	w.VarInt(int32(sec.Len()))
 	w.Raw(sec.Bytes())
 
-	w.VarInt(0) // block entity count
+	c.writeBlockEntities(w)
 	c.writeLight(w)
 	return w.Bytes()
 }

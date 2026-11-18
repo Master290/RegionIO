@@ -430,6 +430,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadBrewingStands()
 		_ = s.LoadHoppers()
 		_ = s.LoadCampfires()
+		_ = s.LoadShowcaseBlockEntitiesFromStore()
 	}
 	if cfg.WorldDir != "" {
 		_ = s.LoadWorldSettingsFile()
@@ -614,6 +615,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveStorageContainers(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveShowcaseBlockEntitiesToStore(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveBeehives(); err != nil && firstErr == nil {
@@ -1025,6 +1029,7 @@ func (s *Server) OnChunkLoaded(dimension string, cx, cz int32) {
 	}
 	_ = s.ReloadChunkStorageContainers(dim, cx, cz)
 	_ = s.ReloadChunkBeehives(dim, cx, cz)
+	_ = s.ReloadChunkShowcaseBlockEntities(dim, cx, cz)
 }
 
 // Config returns the active configuration.

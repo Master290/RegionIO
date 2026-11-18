@@ -14,8 +14,8 @@ import (
 // MenuTypeLectern is BuiltInRegistries.MENU index 17 ("minecraft:lectern" in protocol 775 / 26.1.2).
 const MenuTypeLectern int32 = 17
 
-// BlockEntityTypeLectern is BuiltInRegistries.BLOCK_ENTITY_TYPE index 31 ("minecraft:lectern" in protocol 775).
-const BlockEntityTypeLectern int32 = 31
+// BlockEntityTypeLectern is BuiltInRegistries.BLOCK_ENTITY_TYPE index 30 ("minecraft:lectern" in protocol 775 / 26.1.2).
+const BlockEntityTypeLectern int32 = 30
 
 // LecternMenu button IDs in ServerboundContainerButtonClickPacket (0x11),
 // matching vanilla net.minecraft.world.inventory.LecternMenu.
@@ -202,7 +202,14 @@ func LecternStateWithPowered(state uint16, powered bool) uint16 {
 	return MakeLecternBlockState(facing, hasBook, powered)
 }
 
-// ToNBT serializes LecternBlockEntity into a vanilla block_entities NBT compound.
+// ToUpdateTagNBT returns the vanilla 26.1.2 BlockEntity.getUpdateTag payload for
+// LecternBlockEntity (an empty CompoundTag).
+func (l *LecternBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	return nbt.NewCompound()
+}
+
+// ToNBT serializes LecternBlockEntity into an exact vanilla 26.1.2 block_entities
+// NBT compound (id, x, y, z, keepPacked, and Book + Page only when Book is non-empty).
 func (l *LecternBlockEntity) ToNBT() *nbt.Compound {
 	comp := nbt.NewCompound()
 	if l == nil {
@@ -212,18 +219,28 @@ func (l *LecternBlockEntity) ToNBT() *nbt.Compound {
 	comp.Set("x", nbt.Int(int32(l.X)))
 	comp.Set("y", nbt.Int(int32(l.Y)))
 	comp.Set("z", nbt.Int(int32(l.Z)))
-	if l.Dimension != "" {
-		comp.Set("dimension", nbt.String(world.NormalizeDimension(l.Dimension)))
-	}
+	comp.Set("keepPacked", nbt.Byte(0))
 	if !l.Book.IsEmpty() {
+		cnt := l.Book.Count
+		if cnt <= 0 {
+			cnt = 1
+		}
 		bookTag := nbt.NewCompound()
 		bookTag.Set("id", nbt.String(l.Book.ResolvedID()))
-		bookTag.Set("count", nbt.Int(l.Book.Count))
+		bookTag.Set("count", nbt.Int(cnt))
+		var comps *nbt.Compound
 		if l.Writable != nil {
-			bookTag.Set("writable_book_content", l.Writable.ToNBT())
+			comps = nbt.NewCompound()
+			comps.Set("minecraft:writable_book_content", l.Writable.ToNBT())
 		}
 		if l.Written != nil {
-			bookTag.Set("written_book_content", l.Written.ToNBT())
+			if comps == nil {
+				comps = nbt.NewCompound()
+			}
+			comps.Set("minecraft:written_book_content", l.Written.ToNBT())
+		}
+		if comps != nil && comps.Len() > 0 {
+			bookTag.Set("components", comps)
 		}
 		comp.Set("Book", bookTag)
 		comp.Set("Page", nbt.Int(l.Page))
@@ -231,15 +248,21 @@ func (l *LecternBlockEntity) ToNBT() *nbt.Compound {
 	return comp
 }
 
-// LecternBlockEntityFromNBT decodes a LecternBlockEntity from a block_entities NBT compound.
+// LecternBlockEntityFromNBT decodes a LecternBlockEntity from a vanilla 26.1.2 block_entities NBT compound.
 func LecternBlockEntityFromNBT(comp *nbt.Compound) (*LecternBlockEntity, error) {
 	if comp == nil {
 		return nil, errors.New("server: nil lectern NBT")
+	}
+	if idStr, ok := nbtStringTag(comp, "id"); ok && idStr != "" && canonicalResourceName(idStr) != "minecraft:lectern" {
+		return nil, errors.New("server: not a lectern block entity")
 	}
 	x, _ := nbtIntTag(comp, "x")
 	y, _ := nbtIntTag(comp, "y")
 	z, _ := nbtIntTag(comp, "z")
 	dim, _ := nbtStringTag(comp, "dimension")
+	if dim == "" {
+		dim, _ = nbtStringTag(comp, "Dimension")
+	}
 	if dim == "" {
 		dim = world.DimensionOverworld
 	}
@@ -255,16 +278,35 @@ func LecternBlockEntityFromNBT(comp *nbt.Compound) (*LecternBlockEntity, error) 
 		if !ok || cnt <= 0 {
 			cnt = 1
 		}
-		out.Book = world.NewNamedItemStack(itemID, cnt)
-		if wc, ok := nbtCompoundTag(bookComp, "writable_book_content"); ok && wc != nil {
-			parsed := WritableBookContentFromNBT(wc)
-			out.Writable = &parsed
-			out.PageCount = int32(len(parsed.Pages))
+		if itemID != "" {
+			_ = DefaultRecipeBook()
+			out.Book = world.NewNamedItemStack(itemID, cnt)
 		}
-		if sc, ok := nbtCompoundTag(bookComp, "written_book_content"); ok && sc != nil {
-			parsed := WrittenBookContentFromNBT(sc)
-			out.Written = &parsed
-			out.PageCount = int32(len(parsed.Pages))
+		if comps, ok := nbtCompoundTag(bookComp, "components"); ok && comps != nil {
+			if wc, ok := nbtCompoundTag(comps, "minecraft:writable_book_content"); ok && wc != nil {
+				parsed := WritableBookContentFromNBT(wc)
+				out.Writable = &parsed
+				out.PageCount = int32(len(parsed.Pages))
+			}
+			if sc, ok := nbtCompoundTag(comps, "minecraft:written_book_content"); ok && sc != nil {
+				parsed := WrittenBookContentFromNBT(sc)
+				out.Written = &parsed
+				out.PageCount = int32(len(parsed.Pages))
+			}
+		}
+		if out.Writable == nil {
+			if wc, ok := nbtCompoundTag(bookComp, "writable_book_content"); ok && wc != nil {
+				parsed := WritableBookContentFromNBT(wc)
+				out.Writable = &parsed
+				out.PageCount = int32(len(parsed.Pages))
+			}
+		}
+		if out.Written == nil {
+			if sc, ok := nbtCompoundTag(bookComp, "written_book_content"); ok && sc != nil {
+				parsed := WrittenBookContentFromNBT(sc)
+				out.Written = &parsed
+				out.PageCount = int32(len(parsed.Pages))
+			}
 		}
 		if out.PageCount < 1 && !out.Book.IsEmpty() {
 			out.PageCount = 1
@@ -443,6 +485,7 @@ func (s *Server) SetLecternAt(lec *LecternBlockEntity) {
 	st.mu.Lock()
 	st.lecterns[key] = cp
 	st.mu.Unlock()
+	s.syncShowcaseChunkInMemory(cp.Dimension, cp.X, cp.Z)
 }
 
 // GetLecternComparatorOutput returns the redstone comparator signal (0..15)
@@ -485,19 +528,15 @@ func (s *Server) applyLecternBlockStateAndNotify(dim string, x, y, z int, hasBoo
 }
 
 // BroadcastLecternBlockEntityData broadcasts ClientboundBlockEntityDataPacket
-// (0x06, BlockEntityTypeLectern = 31) for the lectern at (dim, x, y, z).
+// (0x06, BlockEntityTypeLectern = 30) for the lectern at (dim, x, y, z).
 func (s *Server) BroadcastLecternBlockEntityData(dim string, x, y, z int, lec *LecternBlockEntity) {
 	if s == nil {
 		return
 	}
-	var comp *nbt.Compound
-	if lec != nil {
-		comp = lec.ToNBT()
-	} else {
-		comp = (&LecternBlockEntity{Dimension: dim, X: x, Y: y, Z: z}).ToNBT()
-	}
-	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeLectern, comp)
-	s.BroadcastDimensionChunk(world.NormalizeDimension(dim), int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
+	normDim := world.NormalizeDimension(dim)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeLectern, lec.ToUpdateTagNBT())
+	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
 }
 
 // TickLecterns advances any active 2-tick lectern page-turn redstone pulses by 1 game tick.
@@ -888,6 +927,7 @@ func (s *Server) TakeBookFromLectern(session *PlayerSession, dim string, x, y, z
 	}
 
 	s.applyLecternBlockStateAndNotify(normDim, x, y, z, false, false)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	s.BroadcastLecternBlockEntityData(normDim, x, y, z, nil)
 	s.EmitVibration(VibrationEvent{
 		Dimension: normDim,
@@ -1008,6 +1048,7 @@ func (s *Server) RemoveLecternAt(dimension string, x, y, z int) (world.ItemStack
 	st.mu.Unlock()
 
 	s.applyLecternBlockStateAndNotify(normDim, x, y, z, false, false)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 
 	for _, v := range viewers {
 		if v.session != nil && v.session.send != nil {

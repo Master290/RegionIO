@@ -24,15 +24,26 @@ type decoder struct {
 
 // Unmarshal decodes a network-format payload (unnamed root) into a Tag.
 func Unmarshal(b []byte) (Tag, error) {
+	t, _, err := UnmarshalPrefix(b)
+	return t, err
+}
+
+// UnmarshalPrefix decodes a single network-format payload (unnamed root) from
+// the start of b, returning the decoded Tag and the number of bytes consumed.
+func UnmarshalPrefix(b []byte) (Tag, int, error) {
 	d := &decoder{b: b}
 	id, err := d.u8()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if id == TagEnd {
-		return nil, nil
+		return nil, d.pos, nil
 	}
-	return d.payload(id)
+	t, err := d.payload(id)
+	if err != nil {
+		return nil, d.pos, err
+	}
+	return t, d.pos, nil
 }
 
 // UnmarshalNamed decodes a classic named-format payload, returning the root

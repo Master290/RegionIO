@@ -432,7 +432,7 @@ func TestBeaconConduitSculkAndCopperGolemStatueChunkPersistence(t *testing.T) {
 	srv := newBrewingTestServer(t)
 	dim := world.DimensionOverworld
 
-	// 1. Beacon TickCounter persistence + UnloadChunkBeacons
+	// 1. Beacon vanilla 26.1.2 persistence + UnloadChunkBeacons (no non-vanilla TickCounter)
 	srv.SetBeaconState(BeaconBlockEntity{
 		Dimension:       dim,
 		X:               5,
@@ -442,45 +442,51 @@ func TestBeaconConduitSculkAndCopperGolemStatueChunkPersistence(t *testing.T) {
 		PrimaryEffect:   "minecraft:speed",
 		SecondaryEffect: "minecraft:regeneration",
 		CustomName:      "Home Beacon",
-		TickCounter:     55,
+		Lock:            "BeaconKey",
 	})
 	unloadedBeacons := srv.UnloadChunkBeacons(dim, 0, 0)
 	if len(unloadedBeacons) != 1 {
 		t.Fatalf("expected 1 beacon unloaded, got %d", len(unloadedBeacons))
 	}
+	assertOnlyAllowedNBTKeys(t, "unloaded beacon", unloadedBeacons[0],
+		"id", "x", "y", "z", "keepPacked", "Levels", "primary_effect", "secondary_effect", "CustomName", "lock",
+	)
 	var beaconElems []nbt.Tag
 	for _, c := range unloadedBeacons {
 		beaconElems = append(beaconElems, c)
 	}
 	srv.LoadChunkBeaconBlockEntitiesNBT(dim, nbt.List{ElemID: nbt.TagCompound, Elems: beaconElems})
 	gotBeacon, ok := srv.BeaconAtInDim(dim, 5, 64, 5)
-	if !ok || gotBeacon.TickCounter != 55 || gotBeacon.CustomName != "Home Beacon" {
-		t.Fatalf("expected beacon TickCounter=55 and CustomName preserved, got %+v", gotBeacon)
+	if !ok || gotBeacon.Levels != 4 || gotBeacon.PrimaryEffect != "minecraft:speed" ||
+		gotBeacon.SecondaryEffect != "minecraft:regeneration" || gotBeacon.CustomName != "Home Beacon" || gotBeacon.Lock != "BeaconKey" {
+		t.Fatalf("expected beacon vanilla fields preserved, got %+v", gotBeacon)
 	}
 
-	// 2. Conduit TickCounter persistence + UnloadChunkConduits
+	// 2. Conduit vanilla 26.1.2 persistence + UnloadChunkConduits (id, x, y, z, keepPacked, Target)
+	targetUUID := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 	srv.SetConduitState(ConduitBlockEntity{
-		Dimension:   dim,
-		X:           6,
-		Y:           64,
-		Z:           6,
-		Active:      true,
-		Hunting:     true,
-		FrameCount:  42,
-		TickCounter: 27,
+		Dimension:  dim,
+		X:          6,
+		Y:          64,
+		Z:          6,
+		TargetUUID: targetUUID,
+		HasTarget:  true,
 	})
 	unloadedConduits := srv.UnloadChunkConduits(dim, 0, 0)
 	if len(unloadedConduits) != 1 {
 		t.Fatalf("expected 1 conduit unloaded, got %d", len(unloadedConduits))
 	}
+	assertOnlyAllowedNBTKeys(t, "unloaded conduit", unloadedConduits[0],
+		"id", "x", "y", "z", "keepPacked", "Target",
+	)
 	var conduitElems []nbt.Tag
 	for _, c := range unloadedConduits {
 		conduitElems = append(conduitElems, c)
 	}
 	srv.LoadChunkConduitBlockEntitiesNBT(dim, nbt.List{ElemID: nbt.TagCompound, Elems: conduitElems})
 	gotConduit, ok := srv.ConduitAtInDim(dim, 6, 64, 6)
-	if !ok || gotConduit.TickCounter != 27 || gotConduit.FrameCount != 42 {
-		t.Fatalf("expected conduit TickCounter=27 and FrameCount=42 preserved, got %+v", gotConduit)
+	if !ok || !gotConduit.HasTarget || gotConduit.TargetUUID != targetUUID {
+		t.Fatalf("expected conduit Target UUID preserved, got %+v", gotConduit)
 	}
 
 	// 3. Sculk sensor PendingVibration full fields + shrieker + catalyst chunk unload/reload

@@ -461,6 +461,11 @@ func ChatComponentFromNBT(tag nbt.Tag) ChatComponent {
 		if v == nil {
 			return TextComponent("")
 		}
+		if v.Len() == 1 {
+			if inner, ok := v.Get(""); ok {
+				return ChatComponentFromNBT(inner)
+			}
+		}
 		var out ChatComponent
 		if s, ok := getNBTString(v, "text"); ok {
 			out.Text = s
@@ -514,6 +519,64 @@ func ChatComponentFromNBT(tag nbt.Tag) ChatComponent {
 			out.Insertion = ins
 		}
 		return out
+	default:
+		return TextComponent("")
+	}
+}
+
+// encodeChatComponentsNBTList encodes a slice of ChatComponents into a 26.1.2
+// ComponentSerialization.CODEC.listOf() NBT List, matching ListTag.wrapIfNeeded
+// (homogeneous TagString when all entries are plain strings, or TagCompound with
+// {"": tag} wrappers for non-compound elements when styled compounds are present).
+func encodeChatComponentsNBTList(comps []ChatComponent) nbt.List {
+	if len(comps) == 0 {
+		return nbt.List{ElemID: nbt.TagEnd}
+	}
+	rawTags := make([]nbt.Tag, len(comps))
+	hasCompound := false
+	for i, c := range comps {
+		t := c.ToNBT()
+		if _, ok := t.(*nbt.Compound); ok {
+			hasCompound = true
+		}
+		rawTags[i] = t
+	}
+	if !hasCompound {
+		return nbt.List{ElemID: nbt.TagString, Elems: rawTags}
+	}
+	wrapped := make([]nbt.Tag, len(rawTags))
+	for i, t := range rawTags {
+		if comp, ok := t.(*nbt.Compound); ok && comp != nil {
+			if comp.Len() == 1 {
+				if _, isWrap := comp.Get(""); isWrap {
+					wrapped[i] = nbt.NewCompound().Set("", comp)
+					continue
+				}
+			}
+			wrapped[i] = comp
+			continue
+		}
+		wrapped[i] = nbt.NewCompound().Set("", t)
+	}
+	return nbt.List{ElemID: nbt.TagCompound, Elems: wrapped}
+}
+
+// decodeChatComponentTagCompat decodes a 26.1.2 ComponentSerialization.CODEC NBT tag
+// (String or Compound, including {"": inner} ListTag wrappers), while remaining
+// backward-compatible with legacy JSON-serialized component strings.
+func decodeChatComponentTagCompat(tag nbt.Tag) ChatComponent {
+	switch v := tag.(type) {
+	case *nbt.Compound:
+		return ChatComponentFromNBT(v)
+	case nbt.String:
+		s := string(v)
+		trimmed := strings.TrimSpace(s)
+		if (strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) ||
+			(strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]")) ||
+			(len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"') {
+			return ParseChatComponentOrText(trimmed)
+		}
+		return TextComponent(s)
 	default:
 		return TextComponent("")
 	}

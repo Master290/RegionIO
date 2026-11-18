@@ -863,9 +863,16 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	}
 	s.EmitPlayerBlockVibration(session, GameEventBlockDestroy, dim, x, y, z, world.BlockName(prevState))
 	var bannerDrop world.ItemStack
+	var bannerDropPatterns BannerPatternsComponent
+	var bannerDropCustomName *ChatComponent
 	var hasBannerDrop bool
 	if IsBannerBlock(prevState) {
-		bannerDrop, _, hasBannerDrop = s.RemoveBannerAt(dim, x, y, z)
+		bannerDrop, bannerDropPatterns, bannerDropCustomName, hasBannerDrop = s.RemoveBannerWithMetaAt(dim, x, y, z)
+		if col, ok := BannerColorFromBlockState(prevState); ok {
+			_ = DefaultRecipeBook()
+			bannerDrop = world.NewNamedItemStack(BannerItemFromColor(col), 1)
+			hasBannerDrop = !bannerDrop.IsEmpty()
+		}
 	}
 
 	if mode == GameModeSurvival {
@@ -916,6 +923,15 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 		}
 		if hasBannerDrop && !bannerDrop.IsEmpty() {
 			dropID, _ := s.SpawnItemEntityInDimension(dim, float64(x)+0.5, float64(y)+0.25, float64(z)+0.5, bannerDrop)
+			if dropID > 0 {
+				s.AssociateDroppedBannerEntity(dropID, bannerDropPatterns, bannerDropCustomName)
+				if bannerDropCustomName != nil && bannerDropCustomName.PlainText() != "" {
+					ft := s.fishingTracker()
+					ft.mu.Lock()
+					ft.droppedMeta[dropID] = ItemMeta{CustomName: bannerDropCustomName.PlainText()}
+					ft.mu.Unlock()
+				}
+			}
 			return true, dropID
 		}
 		if IsCauldronBlock(prevState) {
@@ -1528,6 +1544,21 @@ func (s *Server) TryPickupItems(session *PlayerSession) int32 {
 			}
 			if added >= live.Item.Count {
 				s.TakeDroppedShulkerBoxItemData(live.ID)
+			}
+		}
+		if bPatterns, bName, ok := s.DroppedBannerData(live.ID); ok && IsBannerItem(live.Item.ResolvedID()) {
+			for _, slot := range changedSlots {
+				if !bPatterns.IsEmpty() {
+					SetSlotBannerPatterns(session, slot, bPatterns)
+				}
+				if bName != nil && bName.PlainText() != "" {
+					meta := GetSlotItemMeta(session, slot)
+					meta.CustomName = bName.PlainText()
+					SetSlotItemMeta(session, slot, meta)
+				}
+			}
+			if added >= live.Item.Count {
+				s.TakeDroppedBannerData(live.ID)
 			}
 		}
 		totalPickedUp += added

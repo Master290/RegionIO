@@ -916,7 +916,7 @@ func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 		if be.KeyItem != "" {
 			comp.Set("key_item", nbt.String(be.KeyItem))
 		}
-		if len(be.Sherds) > 0 {
+		if len(be.Sherds) > 0 && !areAllBrickSherds(be.Sherds) {
 			sherds := nbt.List{ElemID: nbt.TagString}
 			for _, sh := range be.Sherds {
 				sherds.Elems = append(sherds.Elems, nbt.String(sh))
@@ -977,6 +977,7 @@ func structureBlockEntitiesToNBT(c *Chunk) nbt.List {
 		list.Elems = append(list.Elems, CloneNBTCompound(rawBE))
 		emittedPos[pos] = true
 	}
+	c.appendDefaultShowcaseBlockEntitiesToList(emittedPos, &list)
 	return list
 }
 

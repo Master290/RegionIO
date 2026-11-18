@@ -25,8 +25,8 @@ const (
 	// PlaySetBeaconSB is ServerboundSetBeaconPacket (0x34 in protocol 775).
 	PlaySetBeaconSB int32 = 0x34
 
-	// BlockEntityTypeBeacon is BuiltInRegistries.BLOCK_ENTITY_TYPE index 14 ("minecraft:beacon").
-	BlockEntityTypeBeacon int32 = 14
+	// BlockEntityTypeBeacon is BuiltInRegistries.BLOCK_ENTITY_TYPE index 15 ("minecraft:beacon").
+	BlockEntityTypeBeacon int32 = 15
 
 	// BeaconSlotPayment is slot 0 in BeaconMenu (max stack size 1).
 	BeaconSlotPayment     = 0
@@ -63,6 +63,9 @@ type BeaconBlockEntity struct {
 	PrimaryEffect   string              // Canonical mob_effect ID (e.g. "minecraft:speed") or ""
 	SecondaryEffect string              // Canonical mob_effect ID (e.g. "minecraft:regeneration" or same as PrimaryEffect for Level II) or ""
 	CustomName      string              // Optional custom container title
+	CustomNameTag   nbt.Tag             // Preserved 26.1.2 ComponentSerialization.CODEC CustomName tag
+	Lock            string              // Optional lock custom-name string
+	LockTag         nbt.Tag             // Preserved 26.1.2 LockCode.CODEC "lock" tag
 	BeamSections    []BeaconBeamSection // Active vertical beam sections when sky is clear and Levels > 0
 	TickCounter     int                 // Ticks accumulated toward BeaconTickInterval (80)
 	LastBuilder     *PlayerSession      // Optional player who placed/updated the beacon
@@ -76,6 +79,12 @@ func (b BeaconBlockEntity) Clone() BeaconBlockEntity {
 	}
 	if b.ID == "" {
 		cp.ID = "minecraft:beacon"
+	}
+	if b.CustomNameTag != nil {
+		cp.CustomNameTag = world.CloneNBTTag(b.CustomNameTag)
+	}
+	if b.LockTag != nil {
+		cp.LockTag = world.CloneNBTTag(b.LockTag)
 	}
 	if len(b.BeamSections) > 0 {
 		cp.BeamSections = make([]BeaconBeamSection, len(b.BeamSections))
@@ -528,37 +537,62 @@ func DecodeSetBeaconPacket(r *protocol.Reader) (primaryEffectID, secondaryEffect
 
 // --- Beacon Block Entity NBT Serialization ---
 
-// EncodeBeaconBlockEntityNBT serializes b into a vanilla 26.1.2 block entity
-// NBT compound (`id: "minecraft:beacon"`, `x`, `y`, `z`, `Levels`,
-// `primary_effect`, `secondary_effect`, `CustomName`, `Dimension`).
+func isValidBeaconEffect2612(effectID string) bool {
+	switch canonicalEffectID(effectID) {
+	case "minecraft:speed",
+		"minecraft:haste",
+		"minecraft:resistance",
+		"minecraft:jump_boost",
+		"minecraft:strength",
+		"minecraft:regeneration":
+		return true
+	default:
+		return false
+	}
+}
+
+// ToUpdateTagNBT returns the vanilla 26.1.2 BeaconBlockEntity.getUpdateTag payload
+// (saveCustomOnly: primary_effect, secondary_effect, Levels, CustomName, lock).
+func (b BeaconBlockEntity) ToUpdateTagNBT() *nbt.Compound {
+	comp := nbt.NewCompound()
+	if b.PrimaryEffect != "" && isValidBeaconEffect2612(b.PrimaryEffect) {
+		comp.Set("primary_effect", nbt.String(canonicalEffectID(b.PrimaryEffect)))
+	}
+	if b.SecondaryEffect != "" && isValidBeaconEffect2612(b.SecondaryEffect) {
+		comp.Set("secondary_effect", nbt.String(canonicalEffectID(b.SecondaryEffect)))
+	}
+	comp.Set("Levels", nbt.Int(int32(b.Levels)))
+	if b.CustomNameTag != nil {
+		comp.Set("CustomName", world.CloneNBTTag(b.CustomNameTag))
+	} else if b.CustomName != "" {
+		comp.Set("CustomName", nbt.String(b.CustomName))
+	}
+	if b.LockTag != nil {
+		comp.Set("lock", world.CloneNBTTag(b.LockTag))
+	} else if b.Lock != "" {
+		comp.Set("lock", nbt.NewCompound().Set(
+			"components",
+			nbt.NewCompound().Set("minecraft:custom_name", nbt.String(b.Lock)),
+		))
+	}
+	return comp
+}
+
+// EncodeBeaconBlockEntityNBT serializes b into an exact vanilla 26.1.2
+// block_entities NBT compound (`id: "minecraft:beacon"`, `x`, `y`, `z`, `keepPacked`,
+// `Levels`, plus optional `primary_effect`, `secondary_effect`, `CustomName`, `lock`).
 func EncodeBeaconBlockEntityNBT(b BeaconBlockEntity) *nbt.Compound {
-	id := b.ID
-	if id == "" {
-		id = "minecraft:beacon"
-	}
-	dim := b.Dimension
-	if dim == "" {
-		dim = world.DimensionOverworld
-	}
 	comp := nbt.NewCompound().
-		Set("id", nbt.String(id)).
-		Set("Dimension", nbt.String(world.NormalizeDimension(dim))).
+		Set("id", nbt.String("minecraft:beacon")).
 		Set("x", nbt.Int(int32(b.X))).
 		Set("y", nbt.Int(int32(b.Y))).
 		Set("z", nbt.Int(int32(b.Z))).
-		Set("Levels", nbt.Int(int32(b.Levels)))
-
-	if b.PrimaryEffect != "" {
-		comp.Set("primary_effect", nbt.String(canonicalEffectID(b.PrimaryEffect)))
-	}
-	if b.SecondaryEffect != "" {
-		comp.Set("secondary_effect", nbt.String(canonicalEffectID(b.SecondaryEffect)))
-	}
-	if b.CustomName != "" {
-		comp.Set("CustomName", nbt.String(b.CustomName))
-	}
-	if b.TickCounter > 0 {
-		comp.Set("TickCounter", nbt.Int(int32(b.TickCounter)))
+		Set("keepPacked", nbt.Byte(0))
+	upd := b.ToUpdateTagNBT()
+	for _, k := range upd.Keys() {
+		if v, ok := upd.Get(k); ok {
+			comp.Set(k, v)
+		}
 	}
 	return comp
 }
@@ -568,7 +602,7 @@ func (b BeaconBlockEntity) ToNBT() *nbt.Compound {
 	return EncodeBeaconBlockEntityNBT(b)
 }
 
-// DecodeBeaconBlockEntityNBT parses a BeaconBlockEntity from an NBT compound.
+// DecodeBeaconBlockEntityNBT parses a BeaconBlockEntity from a vanilla 26.1.2 NBT compound.
 func DecodeBeaconBlockEntityNBT(comp *nbt.Compound) (BeaconBlockEntity, bool) {
 	if comp == nil {
 		return BeaconBlockEntity{}, false
@@ -616,35 +650,36 @@ func DecodeBeaconBlockEntityNBT(comp *nbt.Compound) (BeaconBlockEntity, bool) {
 			b.Levels = lvl
 		}
 	}
+	// Vanilla 26.1.2 BeaconBlockEntity.loadEffect reads ONLY string ResourceLocation
+	// keys "primary_effect" and "secondary_effect" validated against VALID_EFFECTS
+	// (never legacy numeric IDs).
 	if v, ok := comp.Get("primary_effect"); ok {
-		if s, ok := v.(nbt.String); ok && string(s) != "" {
-			if _, valid := DefaultMobEffectRegistry().ByID(string(s)); valid {
-				b.PrimaryEffect = canonicalEffectID(string(s))
-			}
-		}
-	} else if v, ok := comp.Get("Primary"); ok {
-		if s, ok := v.(nbt.String); ok && string(s) != "" {
-			if _, valid := DefaultMobEffectRegistry().ByID(string(s)); valid {
-				b.PrimaryEffect = canonicalEffectID(string(s))
-			}
+		if s, ok := v.(nbt.String); ok && string(s) != "" && isValidBeaconEffect2612(string(s)) {
+			b.PrimaryEffect = canonicalEffectID(string(s))
 		}
 	}
 	if v, ok := comp.Get("secondary_effect"); ok {
-		if s, ok := v.(nbt.String); ok && string(s) != "" {
-			if _, valid := DefaultMobEffectRegistry().ByID(string(s)); valid {
-				b.SecondaryEffect = canonicalEffectID(string(s))
-			}
-		}
-	} else if v, ok := comp.Get("Secondary"); ok {
-		if s, ok := v.(nbt.String); ok && string(s) != "" {
-			if _, valid := DefaultMobEffectRegistry().ByID(string(s)); valid {
-				b.SecondaryEffect = canonicalEffectID(string(s))
-			}
+		if s, ok := v.(nbt.String); ok && string(s) != "" && isValidBeaconEffect2612(string(s)) {
+			b.SecondaryEffect = canonicalEffectID(string(s))
 		}
 	}
-	if v, ok := comp.Get("CustomName"); ok {
-		if s, ok := v.(nbt.String); ok {
-			b.CustomName = string(s)
+	if v, ok := comp.Get("CustomName"); ok && v != nil {
+		b.CustomNameTag = world.CloneNBTTag(v)
+		b.CustomName = decodeChatComponentTagCompat(v).PlainText()
+	}
+	if v, ok := comp.Get("lock"); ok && v != nil {
+		b.LockTag = world.CloneNBTTag(v)
+		switch lv := v.(type) {
+		case nbt.String:
+			b.Lock = string(lv)
+		case *nbt.Compound:
+			if lv != nil {
+				if comps, okC := nbtCompoundTag(lv, "components"); okC && comps != nil {
+					if cn, hasCN := comps.Get("minecraft:custom_name"); hasCN {
+						b.Lock = decodeChatComponentTagCompat(cn).PlainText()
+					}
+				}
+			}
 		}
 	}
 	if v, ok := comp.Get("TickCounter"); ok {
@@ -731,8 +766,11 @@ func (s *Server) ensureBeaconsLoadedLocked(bs *serverBeaconState) {
 			continue
 		}
 		if b, ok := DecodeBeaconBlockEntityNBT(comp); ok {
-			cp := b.Clone()
-			bs.beacons[beaconKey{dim: cp.Dimension, x: cp.X, y: cp.Y, z: cp.Z}] = &cp
+			key := beaconKey{dim: b.Dimension, x: b.X, y: b.Y, z: b.Z}
+			if _, exists := bs.beacons[key]; !exists {
+				cp := b.Clone()
+				bs.beacons[key] = &cp
+			}
 		}
 	}
 }
@@ -784,7 +822,11 @@ func (s *Server) SaveBeacons() error {
 		if b == nil {
 			continue
 		}
-		elems = append(elems, EncodeBeaconBlockEntityNBT(*b))
+		comp := EncodeBeaconBlockEntityNBT(*b)
+		if k.dim != "" && k.dim != world.DimensionOverworld {
+			comp.Set("Dimension", nbt.String(k.dim))
+		}
+		elems = append(elems, comp)
 	}
 	bs.mu.Unlock()
 
@@ -939,6 +981,7 @@ func (s *Server) SetBeaconState(b BeaconBlockEntity) {
 	s.ensureBeaconsLoadedLocked(bs)
 	bs.beacons[beaconKey{dim: cp.Dimension, x: cp.X, y: cp.Y, z: cp.Z}] = &cp
 	bs.mu.Unlock()
+	s.syncShowcaseChunkInMemory(cp.Dimension, cp.X, cp.Z)
 	_ = s.SaveBeacons()
 }
 
@@ -973,6 +1016,7 @@ func (s *Server) RemoveBeaconInDim(dim string, x, y, z int) {
 	}
 
 	if prev != nil {
+		s.syncShowcaseChunkInMemory(normDim, x, z)
 		if prev.Levels > 0 {
 			s.playBeaconSound(normDim, x, y, z, SoundBeaconDeactivate)
 		}
@@ -1298,6 +1342,10 @@ func (s *Server) OpenBeacon(session *PlayerSession, x, y, z int) (int32, error) 
 		dim = world.DimensionOverworld
 	}
 	b, _ := s.UpdateBeaconAtInDim(dim, x, y, z, session)
+	if !canSessionUnlockBeacon(session, b) {
+		s.playBeaconSound(dim, x, y, z, "minecraft:block.chest.locked")
+		return 0, nil
+	}
 	title := "Beacon"
 	if b.CustomName != "" {
 		title = b.CustomName
@@ -1604,17 +1652,18 @@ func (s *Server) HandleSetBeaconRawPacket(session *PlayerSession, r *protocol.Re
 }
 
 // BroadcastBeaconBlockEntityData broadcasts ClientboundBlockEntityDataPacket
-// (`0x06`, `BlockEntityTypeBeacon = 14`) for the beacon at (dim, x, y, z).
+// (`0x06`, `BlockEntityTypeBeacon = 15`) for the beacon at (dim, x, y, z).
 func (s *Server) BroadcastBeaconBlockEntityData(dim string, x, y, z int) {
 	if s == nil {
 		return
 	}
 	normDim := world.NormalizeDimension(dim)
+	s.syncShowcaseChunkInMemory(normDim, x, z)
 	be, ok := s.BeaconAtInDim(normDim, x, y, z)
 	if !ok {
 		return
 	}
-	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeBeacon, EncodeBeaconBlockEntityNBT(be))
+	pkt := EncodeBlockEntityDataPacket(x, y, z, BlockEntityTypeBeacon, be.ToUpdateTagNBT())
 	s.BroadcastDimensionChunk(normDim, int32(x>>4), int32(z>>4), PlayBlockEntityDataCB, pkt)
 }
 
@@ -1764,6 +1813,39 @@ func (s *Server) playBeaconSound(dim string, x, y, z int, soundName string) {
 			_ = sess.send(PlaySoundPacketID, pkt)
 		}
 	}
+}
+
+func canSessionUnlockBeacon(session *PlayerSession, b BeaconBlockEntity) bool {
+	if b.Lock == "" && b.LockTag == nil {
+		return true
+	}
+	if session == nil {
+		return false
+	}
+	if session.Snapshot().GameMode == GameModeSpectator {
+		return true
+	}
+	held := session.HeldItem()
+	if held.IsEmpty() {
+		return false
+	}
+	heldMeta := session.HeldItemMeta()
+	if lc, ok := b.LockTag.(*nbt.Compound); ok && lc != nil {
+		if reqItems, hasItems := nbtStringTag(lc, "items"); hasItems && reqItems != "" {
+			if canonicalBeaconResource(held.ResolvedID()) != canonicalBeaconResource(reqItems) {
+				return false
+			}
+		}
+		if comps, hasComps := nbtCompoundTag(lc, "components"); hasComps && comps != nil {
+			if cn, hasCN := comps.Get("minecraft:custom_name"); hasCN {
+				if heldMeta.CustomName != decodeChatComponentTagCompat(cn).PlainText() {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	return b.Lock != "" && heldMeta.CustomName == b.Lock
 }
 
 func canonicalBeaconResource(id string) string {

@@ -357,14 +357,26 @@ func TestConduitFrameActivationEffectRadiusAndMobAttack(t *testing.T) {
 		t.Fatal("expected mob to be despawned after lethal conduit attack")
 	}
 
-	// Test Conduit NBT round-trip and chunk NBT persistence.
+	// Test Conduit NBT round-trip and chunk NBT persistence (vanilla 26.1.2 saveAdditional:
+	// id, x, y, z, keepPacked, and optional Target; frame activation resumes on reload).
 	stateAfter, ok := srv.ConduitAt(cx, cy, cz)
 	if !ok {
 		t.Fatal("expected ConduitAt to return true")
 	}
-	decoded, ok := ConduitFromNBT(stateAfter.ToNBT())
-	if !ok || decoded == nil || !decoded.IsActive() || !decoded.IsHunting() || decoded.FrameCount != 42 {
+	conduitComp := stateAfter.ToNBT()
+	assertOnlyAllowedNBTKeys(t, "conduit ToNBT", conduitComp, "id", "x", "y", "z", "keepPacked", "Target")
+	decoded, ok := ConduitFromNBT(conduitComp)
+	if !ok || decoded == nil || decoded.X != cx || decoded.Y != cy || decoded.Z != cz {
 		t.Fatalf("ConduitFromNBT = %+v, ok=%v", decoded, ok)
+	}
+	srv.RemoveConduitInDim(world.DimensionOverworld, cx, cy, cz)
+	srv.LoadChunkConduitBlockEntitiesNBT(world.DimensionOverworld, nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  []nbt.Tag{conduitComp},
+	})
+	reloadedConduit, _ := srv.UpdateConduitAtInDim(world.DimensionOverworld, cx, cy, cz)
+	if !reloadedConduit.IsActive() || !reloadedConduit.IsHunting() || reloadedConduit.FrameCount != 42 {
+		t.Fatalf("reloaded conduit after frame tick = %+v, want active+hunting FrameCount=42", reloadedConduit)
 	}
 }
 
