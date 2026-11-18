@@ -36,7 +36,73 @@ func (s *Server) TickRandomBlocks() world.BlockUpdateResult {
 	if s == nil || s.chunks == nil {
 		return world.BlockUpdateResult{}
 	}
-	return s.chunks.RandomTickLoadedChunks()
+	res := s.chunks.RandomTickLoadedChunks()
+	if len(res.EntityPushUps) > 0 {
+		s.ApplyEntityPushUps(world.DimensionOverworld, res.EntityPushUps)
+	}
+	return res
+}
+
+// ApplyEntityPushUps mirrors vanilla `Block.pushEntitiesUp(oldState, newState, level, pos)`
+// when a partial-height block (`farmland` 15/16 or `mud` 14/16) turns into a
+// full-cube block (`dirt` or `clay` 16/16), lifting any entity or player whose
+// bounding box intersects the newly added top slab up to `pos.Y + NewTopY`.
+func (s *Server) ApplyEntityPushUps(dim string, pushUps []world.EntityPushUp) {
+	if s == nil || len(pushUps) == 0 {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	for _, p := range pushUps {
+		minX, maxX := float64(p.Pos.X), float64(p.Pos.X+1)
+		minZ, maxZ := float64(p.Pos.Z), float64(p.Pos.Z+1)
+		oldTop := float64(p.Pos.Y) + p.OldTopY
+		newTop := float64(p.Pos.Y) + p.NewTopY
+
+		if s.entities != nil {
+			nearby := s.entities.AppendInChunkRange(nil, int32(p.Pos.X>>4), int32(p.Pos.Z>>4), 1)
+			for i := range nearby {
+				ent := &nearby[i]
+				if ent.EffectiveDimension() != normDim {
+					continue
+				}
+				halfW := 0.3
+				if ent.IsItem() || ent.IsExperienceOrb() {
+					halfW = 0.125
+				}
+				if ent.X+halfW > minX && ent.X-halfW < maxX &&
+					ent.Z+halfW > minZ && ent.Z-halfW < maxZ &&
+					ent.Y >= oldTop-0.125 && ent.Y < newTop {
+					s.entities.Update(ent.ID, func(e *world.Entity) {
+						if e.Y < newTop {
+							e.Y = newTop
+						}
+					})
+				}
+			}
+		}
+
+		s.playersMu.RLock()
+		sessions := make([]*PlayerSession, 0, len(s.players))
+		for _, ps := range s.players {
+			sessions = append(sessions, ps)
+		}
+		s.playersMu.RUnlock()
+
+		for _, sess := range sessions {
+			if sess == nil || sess.IsDead() {
+				continue
+			}
+			snap := sess.Snapshot()
+			if world.NormalizeDimension(snap.Dimension) != normDim || snap.GameMode == GameModeSpectator {
+				continue
+			}
+			if snap.X+0.3 > minX && snap.X-0.3 < maxX &&
+				snap.Z+0.3 > minZ && snap.Z-0.3 < maxZ &&
+				snap.Y >= oldTop-0.125 && snap.Y < newTop {
+				s.SetPlayerTransform(sess, snap.X, newTop, snap.Z, snap.Yaw, snap.Pitch, snap.OnGround)
+			}
+		}
+	}
 }
 
 func (s *Server) worldCacheForSession(session *PlayerSession) *world.Cache {
@@ -218,6 +284,9 @@ func (s *Server) CheckPlayerFarmlandTrample(session *PlayerSession, fallDistance
 	by := int(math.Floor(snap.Y - 0.2))
 	bz := int(math.Floor(snap.Z))
 	trampled, res = cache.TrampleFarmland(bx, by, bz)
+	if trampled && len(res.EntityPushUps) > 0 {
+		s.ApplyEntityPushUps(snap.Dimension, res.EntityPushUps)
+	}
 	return trampled, res
 }
 
@@ -249,6 +318,7 @@ func (s *Server) CheckEntityFarmlandTrample(entityID int32, width, height, fallD
 	bz := int(math.Floor(ent.Z))
 	trampled, res = cache.TrampleFarmland(bx, by, bz)
 	if trampled {
+		s.ApplyEntityPushUps(dim, res.EntityPushUps)
 		s.broadcastDimensionBlockChanges(dim, cache, res.Changes, res.LightChanged)
 	}
 	return trampled, res

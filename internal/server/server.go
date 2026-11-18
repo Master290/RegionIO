@@ -3728,6 +3728,9 @@ func (s *Server) TickDimensionBlockUpdates(dim string) world.BlockUpdateResult {
 		return world.BlockUpdateResult{}
 	}
 	res := cache.TickBlockUpdates()
+	if len(res.EntityPushUps) > 0 {
+		s.ApplyEntityPushUps(normDim, res.EntityPushUps)
+	}
 	if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 		s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 	}
@@ -3784,6 +3787,16 @@ func (s *Server) RandomTickBlockAtInDimension(dimension string, x, y, z int, rng
 	}
 	if world.IsSnowLayerBlock(state) || world.IsIceBlock(state) || world.IsFrostedIceBlock(state) {
 		return s.RandomTickSnowOrIceInDimension(normDim, x, y, z, rng)
+	}
+	if world.IsRandomTickableBlock(state) {
+		upd := cache.RandomTickBlockWithRNG(x, y, z, rng)
+		if len(upd.EntityPushUps) > 0 {
+			s.ApplyEntityPushUps(normDim, upd.EntityPushUps)
+		}
+		if len(upd.Changes) > 0 || len(upd.LightChanged) > 0 {
+			s.broadcastDimensionBlockChanges(normDim, cache, upd.Changes, upd.LightChanged)
+		}
+		return len(upd.Changes) > 0
 	}
 	return false
 }

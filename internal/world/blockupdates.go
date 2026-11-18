@@ -51,9 +51,21 @@ type BlockChange struct {
 // FallingBlockLanding records a gravity-affected block landing on a supporting
 // surface after falling FallDistance blocks (>= 1).
 type FallingBlockLanding struct {
-	Pos          BlockPos
-	State        uint16
-	FallDistance int
+	Pos               BlockPos
+	State             uint16
+	FallDistance      int
+	HurtEntities      bool
+	DamagePerDistance float32
+	DamageMax         int
+}
+
+// EntityPushUp records an upward collision push (`Block.pushEntitiesUp`) when a
+// partial-height block (`farmland` 15/16 or `mud` 14/16) transforms in place
+// into a full-cube block (`dirt` or `clay` 16/16).
+type EntityPushUp struct {
+	Pos     BlockPos
+	OldTopY float64
+	NewTopY float64
 }
 
 // FallingAnvilLandingHook is an optional callback invoked when a falling anvil
@@ -70,12 +82,14 @@ type BlockPosDrop struct {
 }
 
 // BlockUpdateResult aggregates all block transitions, deduplicated
-// light-dirty chunks, falling-block landings, and item drops produced by a block edit or tick pass.
+// light-dirty chunks, falling-block landings, item drops, and entity push-ups
+// produced by a block edit or tick pass.
 type BlockUpdateResult struct {
-	Changes      []BlockChange
-	LightChanged []ChunkPos
-	Landings     []FallingBlockLanding
-	Drops        []BlockPosDrop
+	Changes       []BlockChange
+	LightChanged  []ChunkPos
+	Landings      []FallingBlockLanding
+	Drops         []BlockPosDrop
+	EntityPushUps []EntityPushUp
 }
 
 func (r *BlockUpdateResult) appendChange(pos BlockPos, oldState, newState uint16, light []ChunkPos) {
@@ -111,6 +125,9 @@ func (r *BlockUpdateResult) merge(other BlockUpdateResult) {
 	}
 	if len(other.Drops) > 0 {
 		r.Drops = append(r.Drops, other.Drops...)
+	}
+	if len(other.EntityPushUps) > 0 {
+		r.EntityPushUps = append(r.EntityPushUps, other.EntityPushUps...)
 	}
 }
 
@@ -459,6 +476,8 @@ func (c *Cache) TickBlockUpdates() BlockUpdateResult {
 				c.stepRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 				c.stepCopperRedstoneUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 				c.stepComposterUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+				c.stepCauldronDripUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
+				c.stepFarmlandUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 				c.stepFrostedIceUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 				c.stepEyeblossomUpdate(u.pos.X, u.pos.Y, u.pos.Z, &res)
 			case UpdateFire:
@@ -599,6 +618,9 @@ func (c *Cache) resolvePlacementReaction(x, y, z int, state uint16) uint16 {
 	}
 	if IsPointedDripstoneBlock(state) {
 		return c.ResolvePointedDripstoneStateAt(x, y, z, state)
+	}
+	if isBlockNamed(state, "minecraft:farmland") && !c.CanFarmlandSurviveAt(x, y, z) {
+		return StateDirt
 	}
 	if IsLanternBlock(state) {
 		return c.ResolveLanternPlacementAt(x, y, z, state)
@@ -880,6 +902,17 @@ func (c *Cache) scheduleCellIfNeeded(x, y, z int) {
 	if c.needsScaffoldingTickAt(x, y, z, state) {
 		c.ScheduleBlockUpdate(x, y, z, UpdateFalling, ScaffoldingTickDelay)
 	}
+	if IsPointedDripstoneBlock(state) {
+		dir := PointedDripstoneDirection(state)
+		if dir == "down" && !c.CanPointedDripstoneSurviveAt(x, y, z, "down") {
+			c.ScheduleBlockUpdate(x, y, z, UpdateFalling, DripstoneFallingDelayTicks)
+		} else if dir == "up" && !c.CanPointedDripstoneSurviveAt(x, y, z, "up") {
+			c.ScheduleBlockUpdate(x, y, z, UpdateFalling, DripstoneStalagmiteBreakDelayTicks)
+		}
+	}
+	if isBlockNamed(state, "minecraft:farmland") && !c.CanFarmlandSurviveAt(x, y, z) {
+		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, 1)
+	}
 	if lvl, ok := ComposterLevel(state); ok && lvl == ComposterMaxFillLevel {
 		c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, ComposterReadyTickDelay)
 	}
@@ -947,6 +980,7 @@ func (c *Cache) propagateMultiBlockPartnerBreak(x, y, z int, brokenState uint16,
 	}
 	if IsPairableChestBlock(brokenState) {
 		trappedChestOpenCounts.Delete(trappedChestOpenKey{c: c, x: x, y: y, z: z})
+		copperChestOpenCounts.Delete(copperChestOpenKey{c: c, x: x, y: y, z: z})
 		if info.Name == "minecraft:trapped_chest" && y-1 >= MinY {
 			belowSt := c.GetBlock(x, y-1, z)
 			c.propagateRedstoneAround(x, y-1, z, belowSt, belowSt, res)
@@ -1261,6 +1295,21 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		return c.EvaluateChorusBlockAt(x, y, z, state)
 	}
 
+	// Pointed dripstone uses vanilla scheduled ticks on lost support
+	// (2 ticks for downward stalactites, 1 tick for upward stalagmites).
+	if name == "minecraft:pointed_dripstone" {
+		dir := PointedDripstoneDirection(state)
+		if dir == "down" && !c.CanPointedDripstoneSurviveAt(x, y, z, "down") {
+			c.ScheduleBlockUpdate(x, y, z, UpdateFalling, DripstoneFallingDelayTicks)
+			return state, true
+		}
+		if dir == "up" && !c.CanPointedDripstoneSurviveAt(x, y, z, "up") {
+			c.ScheduleBlockUpdate(x, y, z, UpdateFalling, DripstoneStalagmiteBreakDelayTicks)
+			return state, true
+		}
+		return state, true
+	}
+
 	// 1. Wall-mounted blocks (wall_torch, ladder, wall_sign, wall_banner, button/lever on wall, etc.)
 	if supportPos, isWallMounted := wallSupportPos(x, y, z, name, props); isWallMounted {
 		if supportPos.Y < MinY || supportPos.Y >= MinY+WorldHeight {
@@ -1400,12 +1449,12 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		}
 	}
 
-	// 6b. Pitcher crop (single-block at age 0..1 with half=lower on farmland; double-height at age 2..4 with lower+upper).
+	// 6b. Pitcher crop (single-block at age 0..2 with half=lower on farmland; double-height at age 3..4 with lower+upper).
 	if name == "minecraft:pitcher_crop" {
 		half := props["half"]
 		age, _ := strconv.Atoi(props["age"])
 		if half == "upper" {
-			if age < 2 || y <= MinY {
+			if age < 3 || y <= MinY {
 				return replacement, false
 			}
 			bInfo, ok := stateByID(c.GetBlock(x, y-1, z))
@@ -1417,7 +1466,7 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		if y <= MinY || !isBlockNamed(c.GetBlock(x, y-1, z), "minecraft:farmland") {
 			return replacement, false
 		}
-		if age >= 2 {
+		if age >= 3 {
 			if y+1 >= MinY+WorldHeight {
 				return replacement, false
 			}
@@ -1438,7 +1487,7 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		if !canPlantSurviveOn(name, below) {
 			return replacement, false
 		}
-		// Attached melon/pumpkin stem reverts to mature stem[age=7] when its fruit is broken.
+		// Attached melon/pumpkin stem reverts to mature stem[age=7] when its fruit is broken or carved.
 		if name == "minecraft:attached_melon_stem" || name == "minecraft:attached_pumpkin_stem" {
 			dx, dz := facingOffset(props["facing"])
 			fruit := c.GetBlock(x+dx, y, z+dz)
@@ -1447,7 +1496,7 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 					return stem, true
 				}
 			}
-			if name == "minecraft:attached_pumpkin_stem" && !isBlockNamed(fruit, "minecraft:pumpkin") && !isBlockNamed(fruit, "minecraft:carved_pumpkin") {
+			if name == "minecraft:attached_pumpkin_stem" && !isBlockNamed(fruit, "minecraft:pumpkin") {
 				if stem, ok := nameToStateID("minecraft:pumpkin_stem", map[string]string{"age": "7"}); ok {
 					return stem, true
 				}
@@ -1464,11 +1513,10 @@ func (c *Cache) evaluateBlockSurvival(x, y, z int, state uint16) (replacement ui
 		return state, true
 	}
 
-	// 7c. Farmland turns back to dirt when a solid / motion-blocking block is placed directly on top of it.
-	if name == "minecraft:farmland" && y+1 < MinY+WorldHeight {
-		above := c.GetBlock(x, y+1, z)
-		if isFullOpaqueTurfCover(above) {
-			return StateDirt, true
+	// 7c. Farmland schedules a 1-tick turnToDirt update when covered by a solid block not in #minecraft:maintains_farmland.
+	if name == "minecraft:farmland" {
+		if !c.CanFarmlandSurviveAt(x, y, z) {
+			c.ScheduleBlockUpdate(x, y, z, UpdateRedstone, 1)
 		}
 		return state, true
 	}
@@ -1603,6 +1651,10 @@ func (c *Cache) stepFallingBlock(x, y, z int, res *BlockUpdateResult) {
 	state := c.GetBlock(x, y, z)
 	if IsScaffoldingBlock(state) {
 		c.stepScaffoldingTick(x, y, z, state, res)
+		return
+	}
+	if IsPointedDripstoneBlock(state) {
+		c.stepPointedDripstoneTick(x, y, z, state, res)
 		return
 	}
 	if y <= MinY || !IsFallingBlock(state) {

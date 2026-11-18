@@ -457,8 +457,8 @@ func TestCopperRandomTickIntegrationAndDoubleChestWorldSync(t *testing.T) {
 	// 3. World-level paired double copper_chest synchronization on oxidize, wax, unwax, scrape, and lightning.
 	c.SetBlock(20, y, 20, chestLeft)
 	c.SetBlock(21, y, 20, chestRight)
-	if got := ComputeCopperOxidationChance(c, 20, y, 20); math.Abs(got-0.75) > 1e-6 {
-		t.Fatalf("double copper_chest oxidation chance = %v, want 0.75 (partner half skipped)", got)
+	if got := ComputeCopperOxidationChance(c, 20, y, 20); math.Abs(got-0.1875) > 1e-6 {
+		t.Fatalf("double copper_chest oxidation chance = %v, want 0.1875 (((0+1)/(0+1+1))^2 * 0.75)", got)
 	}
 	if _, _, ok := c.OxidizeCopperAt(20, y, 20); !ok {
 		t.Fatal("expected OxidizeCopperAt on left copper_chest to succeed")

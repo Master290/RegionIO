@@ -1585,7 +1585,7 @@ func (s *Server) DamagePlayer(session *PlayerSession, amount float32, cause stri
 	}
 
 	switch cause {
-	case "fall":
+	case "fall", "stalagmite", "ender_pearl":
 		if !s.FallDamage() {
 			return false
 		}
@@ -1830,6 +1830,22 @@ func (s *Server) HandlePlayerFall(session *PlayerSession, oldY, newY float64, wa
 
 	if !s.FallDamage() || session.HasSlowFalling() {
 		return 0
+	}
+	if cache := s.DimensionChunks(world.NormalizeDimension(snap.Dimension)); cache != nil {
+		bx := int(math.Floor(snap.X))
+		bz := int(math.Floor(snap.Z))
+		safeFall := FallDamageThreshold + float64(session.JumpBoostLevel())
+		for _, candY := range []int{int(math.Floor(newY - 0.2)), int(math.Floor(newY))} {
+			if stalagDmg, onStalagmite := cache.StalagmiteFallDamageWithSafeFall(bx, candY, bz, totalFall, safeFall); onStalagmite {
+				if stalagDmg <= 0 {
+					return 0
+				}
+				prot := session.ArmorEnchantmentProtection("stalagmite")
+				resMult := session.ResistanceDamageMultiplier("stalagmite")
+				s.DamagePlayerWithEffects(session, stalagDmg, "stalagmite")
+				return stalagDmg * resMult * (1.0 - prot)
+			}
+		}
 	}
 	if totalFall <= FallDamageThreshold {
 		return 0

@@ -35,10 +35,11 @@ const (
 	AnvilFallDegradeChancePerStep = 0.05
 	AnvilHelmetDamageFactor       = 0.75
 
-	// Vanilla LevelEvent IDs for Anvil sounds and particles (ClientboundLevelEventPacket 0x2e).
-	LevelEventSoundAnvilBroken int32 = 1029
-	LevelEventSoundAnvilUsed   int32 = 1030
-	LevelEventSoundAnvilLand   int32 = 1031
+	// Vanilla LevelEvent IDs for Anvil and Pointed Dripstone sounds (ClientboundLevelEventPacket 0x2e).
+	LevelEventSoundAnvilBroken          int32 = 1029
+	LevelEventSoundAnvilUsed            int32 = 1030
+	LevelEventSoundAnvilLand            int32 = 1031
+	LevelEventSoundPointedDripstoneLand int32 = 1045
 )
 
 // AnvilResult holds the computed output and cost of an anvil operation.
@@ -331,8 +332,110 @@ func slotIdxSession(sess *PlayerSession) *PlayerSession {
 	return sess
 }
 
-// ProcessFallingBlockLandings processes all anvil landings recorded in a
-// world.BlockUpdateResult.Landings slice.
+// HandleFallingStalactiteLanding processes a falling pointed_dripstone segment
+// landing at (x, y, z) in dim:
+//   - If `hurtEntities` is true (the tip segment), deals `falling_stalactite` damage
+//     (`min(40, floor(ceil(fallDistance - 1.0) * max(colLen, 6)))`) to mobs and
+//     survival/adventure players in the landing cell, with 25% helmet reduction & wear
+//     (`#minecraft:damages_helmet` includes `minecraft:falling_stalactite`).
+//   - Emits `LevelEventSoundPointedDripstoneLand` (1045, `PointedDripstoneBlock.onBrokenAfterFall`).
+func (s *Server) HandleFallingStalactiteLanding(dim string, x, y, z int, fallDistance float64, hurtEntities bool, damagePerDist float32, rng *rand.Rand) int {
+	if s == nil {
+		return 0
+	}
+	normDim := world.NormalizeDimension(dim)
+	damagedEntities := 0
+
+	if hurtEntities {
+		colLen := int(damagePerDist)
+		if colLen < world.DripstoneMaxHeightForDamageCalc {
+			colLen = world.DripstoneMaxHeightForDamageCalc
+		}
+		dmg := world.CalculateFallingStalactiteDamage(fallDistance, colLen)
+		if dmg > 0 {
+			minX, maxX := float64(x), float64(x+1)
+			minY, maxY := float64(y), float64(y+2)
+			minZ, maxZ := float64(z), float64(z+1)
+
+			if s.entities != nil {
+				nearby := s.entities.AppendInChunkRange(nil, int32(x>>4), int32(z>>4), 1)
+				for i := range nearby {
+					ent := &nearby[i]
+					if ent.IsItem() || ent.IsExperienceOrb() || ent.EffectiveDimension() != normDim {
+						continue
+					}
+					if ent.X >= minX-0.3 && ent.X <= maxX+0.3 &&
+						ent.Y >= minY-0.5 && ent.Y <= maxY &&
+						ent.Z >= minZ-0.3 && ent.Z <= maxZ+0.3 {
+						hp := s.MobHealth(ent.ID)
+						if hp <= 0 {
+							continue
+						}
+						damagedEntities++
+						rem := hp - dmg
+						if rem > 0 {
+							s.SetMobHealth(ent.ID, rem)
+						} else {
+							s.SetMobHealth(ent.ID, 0)
+							s.entities.Remove(ent.ID)
+						}
+					}
+				}
+			}
+
+			s.playersMu.RLock()
+			sessions := make([]*PlayerSession, 0, len(s.players))
+			for _, ps := range s.players {
+				sessions = append(sessions, ps)
+			}
+			s.playersMu.RUnlock()
+
+			for _, sess := range sessions {
+				if sess == nil || sess.IsDead() {
+					continue
+				}
+				snap := sess.Snapshot()
+				if world.NormalizeDimension(snap.Dimension) != normDim {
+					continue
+				}
+				if snap.GameMode != GameModeSurvival && snap.GameMode != GameModeAdventure {
+					continue
+				}
+				if snap.X >= minX-0.3 && snap.X <= maxX+0.3 &&
+					snap.Y >= minY-0.5 && snap.Y <= maxY &&
+					snap.Z >= minZ-0.3 && snap.Z <= maxZ+0.3 {
+					playerDmg := dmg
+					helmet := sess.InventorySlot(ArmorSlotHead)
+					if !helmet.IsEmpty() && IsArmorItem(helmet.ResolvedID()) {
+						playerDmg *= AnvilHelmetDamageFactor
+						helmetMeta := GetSlotItemMeta(sess, ArmorSlotHead)
+						wear := int32(math.Max(1, math.Floor(float64(dmg)/4.0)))
+						newHelmet, newMeta, broke := DamageItem(helmet, helmetMeta, wear, rng)
+						sess.SetInventorySlot(ArmorSlotHead, newHelmet)
+						if broke {
+							SetSlotItemMeta(sess, ArmorSlotHead, ItemMeta{})
+						} else {
+							SetSlotItemMeta(sess, ArmorSlotHead, newMeta)
+						}
+					}
+					beforeHP := sess.Snapshot().Health
+					s.DamagePlayer(sess, playerDmg, "falling_stalactite")
+					if sess.Snapshot().Health < beforeHP {
+						damagedEntities++
+					}
+				}
+			}
+		}
+	}
+
+	cx, cz := int32(x>>4), int32(z>>4)
+	s.BroadcastDimensionChunk(normDim, cx, cz, PlayLevelEventCB,
+		EncodeLevelEventPacket(LevelEventSoundPointedDripstoneLand, x, y, z, 0, false))
+	return damagedEntities
+}
+
+// ProcessFallingBlockLandings processes all anvil and pointed_dripstone landings
+// recorded in a world.BlockUpdateResult.Landings slice.
 func (s *Server) ProcessFallingBlockLandings(dim string, landings []world.FallingBlockLanding, rng *rand.Rand) {
 	if s == nil || len(landings) == 0 {
 		return
@@ -340,6 +443,8 @@ func (s *Server) ProcessFallingBlockLandings(dim string, landings []world.Fallin
 	for _, l := range landings {
 		if IsAnvilBlock(l.State) {
 			s.HandleFallingAnvilLanding(dim, l.Pos.X, l.Pos.Y, l.Pos.Z, l.State, float64(l.FallDistance), rng)
+		} else if world.IsPointedDripstoneBlock(l.State) {
+			s.HandleFallingStalactiteLanding(dim, l.Pos.X, l.Pos.Y, l.Pos.Z, float64(l.FallDistance), l.HurtEntities, l.DamagePerDistance, rng)
 		}
 	}
 }

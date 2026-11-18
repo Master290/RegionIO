@@ -805,10 +805,11 @@ func (s *Server) TryFillCauldronFromPrecipitation(
 	}
 }
 
-// FindDripstoneFluidAboveCauldron searches up to 10 blocks of air above a
-// cauldron at (x, y, z) for a downward-pointing `minecraft:pointed_dripstone`
-// stalactite tip, traces the stalactite column up to its ceiling support block,
-// and returns the fluid above the ceiling (`"water"`, `"lava"`, or `""`).
+// FindDripstoneFluidAboveCauldron searches up to 10 drip-through blocks above a
+// cauldron at (x, y, z) for a non-waterlogged downward `minecraft:pointed_dripstone`
+// stalactite tip (`CanPointedDripstoneDrip`), traces the stalactite column up to
+// its ceiling support block (requiring column length <= 10, `findRootBlock(..., 11)`),
+// and returns the source fluid above the ceiling (`"water"`, `"lava"`, or `""`).
 func FindDripstoneFluidAboveCauldron(getBlock func(x, y, z int) uint16, x, y, z int) string {
 	if getBlock == nil {
 		return ""
@@ -819,11 +820,12 @@ func FindDripstoneFluidAboveCauldron(getBlock func(x, y, z int) uint16, x, y, z 
 	for dy := 1; dy <= MaxDripstoneSearchDistance; dy++ {
 		cy := y + dy
 		st := getBlock(x, cy, z)
-		if st == world.StateAir {
-			continue
-		}
-		if pointedDripstoneTipIDs[st] {
+		if world.CanPointedDripstoneDrip(st) {
 			tipY = cy
+			break
+		}
+		if world.CanDripThroughBlock(st) {
+			continue
 		}
 		break
 	}
@@ -831,28 +833,43 @@ func FindDripstoneFluidAboveCauldron(getBlock func(x, y, z int) uint16, x, y, z 
 		return ""
 	}
 
-	topStalactiteY := tipY
-	for cy := tipY + 1; cy <= tipY+64; cy++ {
+	// Vanilla findRootBlock(level, tipPos, tipState, 11): i = 1..10 => stalactite length <= 10.
+	ceilingY := -1000
+	for i := 1; i < world.DripstoneMaxStalactiteCheckDepth; i++ {
+		cy := tipY + i
 		st := getBlock(x, cy, z)
 		if pointedDripstoneDown[st] {
-			topStalactiteY = cy
 			continue
+		}
+		if st != world.StateAir && world.BlockName(st) != "minecraft:pointed_dripstone" &&
+			world.BlockName(st) != "minecraft:water" && world.BlockName(st) != "minecraft:lava" {
+			ceilingY = cy
 		}
 		break
 	}
-
-	ceilingY := topStalactiteY + 1
-	ceilingState := getBlock(x, ceilingY, z)
-	if ceilingState == world.StateAir || world.BlockName(ceilingState) == "minecraft:pointed_dripstone" {
+	if ceilingY == -1000 {
 		return ""
 	}
 
 	fluidState := getBlock(x, ceilingY+1, z)
-	if fluidState == world.StateWater || world.BlockName(fluidState) == "minecraft:water" || world.IsWaterlogged(fluidState) {
+	if fluidState == world.StateWater || world.IsWaterlogged(fluidState) {
 		return "water"
 	}
-	if fluidState == world.StateLava || world.BlockName(fluidState) == "minecraft:lava" {
+	if world.BlockName(fluidState) == "minecraft:water" {
+		lvl := world.BlockProperties(fluidState)["level"]
+		if lvl == "" || lvl == "0" {
+			return "water"
+		}
+		return ""
+	}
+	if fluidState == world.StateLava {
 		return "lava"
+	}
+	if world.BlockName(fluidState) == "minecraft:lava" {
+		lvl := world.BlockProperties(fluidState)["level"]
+		if lvl == "" || lvl == "0" {
+			return "lava"
+		}
 	}
 	return ""
 }

@@ -474,50 +474,77 @@ func DeoxidizeCopperBlockStateFully(state uint16) (uint16, bool) {
 
 // --- Random-Tick Oxidation & Neighborhood Formula ---
 
+type copperChestOpenKey struct {
+	c       *Cache
+	x, y, z int
+}
+
+var copperChestOpenCounts sync.Map // map[copperChestOpenKey]int
+
+// SetCopperChestOpenCount sets the active viewer count on a copper_chest at
+// (x, y, z) (and its paired double-chest partner, if any), matching vanilla
+// WeatheringCopperChestBlock.randomTick's `getEntitiesWithContainerOpen().isEmpty()` check.
+func (c *Cache) SetCopperChestOpenCount(x, y, z, count int) {
+	if c == nil || y < MinY || y >= MinY+WorldHeight {
+		return
+	}
+	if count < 0 {
+		count = 0
+	}
+	setOne := func(tx, ty, tz int) {
+		key := copperChestOpenKey{c: c, x: tx, y: ty, z: tz}
+		if count == 0 {
+			copperChestOpenCounts.Delete(key)
+		} else {
+			copperChestOpenCounts.Store(key, count)
+		}
+	}
+	setOne(x, y, z)
+	if px, py, pz, _, hasPartner := c.DoubleChestPartnerAt(x, y, z); hasPartner {
+		setOne(px, py, pz)
+	}
+}
+
+// IsCopperChestOpenAt reports whether a copper_chest at (x, y, z) currently has
+// one or more open container viewers.
+func (c *Cache) IsCopperChestOpenAt(x, y, z int) bool {
+	if c == nil {
+		return false
+	}
+	if v, ok := copperChestOpenCounts.Load(copperChestOpenKey{c: c, x: x, y: y, z: z}); ok && v.(int) > 0 {
+		return true
+	}
+	if px, py, pz, _, hasPartner := c.DoubleChestPartnerAt(x, y, z); hasPartner {
+		if v, ok := copperChestOpenCounts.Load(copperChestOpenKey{c: c, x: px, y: py, z: pz}); ok && v.(int) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // ComputeCopperOxidationChance calculates the vanilla conditional probability
-// P = m * ((b + 1) / (a + 1))^2 that an unwaxed copper block at (x, y, z)
-// advances to its next oxidation stage after passing the 64/1125 random-tick
-// pre-roll:
-//   - Scans all positions within Manhattan distance <= 4 of (x, y, z).
-//   - Waxed copper blocks are ignored.
+// P = m * ((older + 1) / (older + same + 1))^2 that an unwaxed copper block at
+// (x, y, z) advances to its next oxidation stage after passing the 0.05688889f
+// random-tick pre-roll (`ChangeOverTimeBlock.getNextState` in 26.1.2.jar):
+//   - Scans all positions `(nx, ny, nz) != (x, y, z)` within Manhattan distance <= 4.
+//   - Waxed copper blocks are ignored (`!(block instanceof ChangeOverTimeBlock)`).
 //   - If any unwaxed copper block in the neighborhood has stage < myStage,
-//     returns 0 (oxidation is blocked).
-//   - Otherwise, let `a` be the number of unwaxed copper neighbors with
-//     stage >= myStage, and `b` be the number with stage > myStage.
-//   - Let c = (b + 1) / (a + 1), and m = 0.75 for unaffected (stage 0) or 1.0
-//     for exposed/weathered (stages 1..2). Returns m * c * c.
+//     returns 0 immediately (oxidation is aborted).
+//   - Otherwise counts `older` (stage > myStage) and `same` (stage == myStage),
+//     computes `f = float32(older+1) / float32(older+same+1)` and returns `f * f * m`
+//     where `m = 0.75f` for UNAFFECTED (stage 0) and `1.0f` for EXPOSED/WEATHERED.
 func ComputeCopperOxidationChance(c *Cache, x, y, z int) float64 {
 	if c == nil || y < MinY || y >= MinY+WorldHeight {
 		return 0
 	}
 	state := c.GetBlock(x, y, z)
-	fam, myStage, waxed, ok := ClassifyCopperBlock(state)
+	_, myStage, waxed, ok := ClassifyCopperBlock(state)
 	if !ok || waxed || myStage >= CopperStageOxidized {
 		return 0
 	}
-	info, _ := stateByID(state)
 
-	// If this is a copper door or double copper chest, determine its partner half
-	// so we don't count the other half of the same multi-block as a separate neighbor.
-	var skipPartner BlockPos
-	hasSkipPartner := false
-	if fam.Kind == "copper_door" {
-		if info.Properties["half"] == "lower" {
-			skipPartner = BlockPos{X: x, Y: y + 1, Z: z}
-			hasSkipPartner = true
-		} else if info.Properties["half"] == "upper" {
-			skipPartner = BlockPos{X: x, Y: y - 1, Z: z}
-			hasSkipPartner = true
-		}
-	} else if fam.Kind == "copper_chest" {
-		if pPos, ok := PartnerCopperChestPos(x, y, z, state); ok {
-			skipPartner = pPos
-			hasSkipPartner = true
-		}
-	}
-
-	a := 0 // unwaxed neighbors with stage >= myStage
-	b := 0 // unwaxed neighbors with stage > myStage
+	same := 0  // unwaxed ChangeOverTimeBlock neighbors with stage == myStage
+	older := 0 // unwaxed ChangeOverTimeBlock neighbors with stage > myStage
 
 	for dy := -CopperOxidationScanDistance; dy <= CopperOxidationScanDistance; dy++ {
 		ny := y + dy
@@ -533,51 +560,32 @@ func ComputeCopperOxidationChance(c *Cache, x, y, z int) float64 {
 					continue
 				}
 				nx := x + dx
-				if hasSkipPartner && nx == skipPartner.X && ny == skipPartner.Y && nz == skipPartner.Z {
-					continue
-				}
 				nState := c.GetBlock(nx, ny, nz)
 				if nState == StateAir {
 					continue
 				}
-				nFam, nStage, nWaxed, nOK := ClassifyCopperBlock(nState)
+				_, nStage, nWaxed, nOK := ClassifyCopperBlock(nState)
 				if !nOK || nWaxed {
 					continue
-				}
-				// Avoid double-counting the upper half of another copper door or right half of a double copper chest
-				// when its primary half is also within Manhattan distance <= 4.
-				if nFam.Kind == "copper_door" {
-					if nInfo, ok := stateByID(nState); ok && nInfo.Properties["half"] == "upper" {
-						if absInt(dx)+absInt(dy-1)+absInt(dz) <= CopperOxidationScanDistance {
-							continue
-						}
-					}
-				} else if nFam.Kind == "copper_chest" {
-					if nInfo, ok := stateByID(nState); ok && nInfo.Properties["type"] == "right" {
-						if pPos, ok := PartnerCopperChestPos(nx, ny, nz, nState); ok {
-							if absInt(pPos.X-x)+absInt(pPos.Y-y)+absInt(pPos.Z-z) <= CopperOxidationScanDistance {
-								continue
-							}
-						}
-					}
 				}
 				if nStage < myStage {
 					return 0
 				}
 				if nStage > myStage {
-					b++
+					older++
+				} else {
+					same++
 				}
-				a++
 			}
 		}
 	}
 
-	ratio := float64(b+1) / float64(a+1)
-	modifier := CopperExposedOrWeatheredOxidationModifier
+	ratio := float32(older+1) / float32(older+same+1)
+	modifier := float32(CopperExposedOrWeatheredOxidationModifier)
 	if myStage == CopperStageUnaffected {
-		modifier = CopperUnaffectedOxidationModifier
+		modifier = float32(CopperUnaffectedOxidationModifier)
 	}
-	return modifier * ratio * ratio
+	return float64(ratio * ratio * modifier)
 }
 
 // OxidizeCopperAt advances the unwaxed copper block at (x, y, z) by one
@@ -600,18 +608,18 @@ func (c *Cache) OxidizeCopperAt(x, y, z int) (uint16, BlockUpdateResult, bool) {
 }
 
 // StepCopperOxidationNeighborhood evaluates the neighborhood oxidation chance
-// ComputeCopperOxidationChance(c, x, y, z) (assuming the 64/1125 pre-roll has
-// already succeeded) and oxidizes the block if rng.Float64() < chance.
+// ComputeCopperOxidationChance(c, x, y, z) (assuming the 0.05688889f pre-roll has
+// already succeeded) and oxidizes the block if rng.Float32() < chance.
 func (c *Cache) StepCopperOxidationNeighborhood(x, y, z int, rng *rand.Rand) (uint16, BlockUpdateResult, bool) {
-	chance := ComputeCopperOxidationChance(c, x, y, z)
+	chance := float32(ComputeCopperOxidationChance(c, x, y, z))
 	if chance <= 0 {
 		return 0, BlockUpdateResult{}, false
 	}
-	var roll float64
+	var roll float32
 	if rng != nil {
-		roll = rng.Float64()
+		roll = rng.Float32()
 	} else {
-		roll = rand.Float64()
+		roll = rand.Float32()
 	}
 	if roll >= chance {
 		return c.GetBlock(x, y, z), BlockUpdateResult{}, false
@@ -622,8 +630,9 @@ func (c *Cache) StepCopperOxidationNeighborhood(x, y, z int, rng *rand.Rand) (ui
 // TryOxidizeCopperOnRandomTick executes a full vanilla random-tick oxidation
 // attempt at (x, y, z):
 //  1. Checks that the block is an unwaxed copper block with stage < oxidized
-//     (and for a copper_door, only the lower half ticks randomly).
-//  2. Rolls the 64/1125 (0.05688889) pre-roll.
+//     (for copper_door only DoubleBlockHalf.LOWER ticks; for copper_chest only
+//     single/left half ticks and only when no entity currently has the chest open).
+//  2. Rolls the 0.05688889f (64/1125) pre-roll.
 //  3. Evaluates the 4-block Manhattan neighborhood formula and advances the stage on success.
 func (c *Cache) TryOxidizeCopperOnRandomTick(x, y, z int, rng *rand.Rand) (uint16, BlockUpdateResult, bool) {
 	if c == nil || y < MinY || y >= MinY+WorldHeight {
@@ -634,8 +643,6 @@ func (c *Cache) TryOxidizeCopperOnRandomTick(x, y, z int, rng *rand.Rand) (uint1
 	if !ok || waxed || stage >= CopperStageOxidized {
 		return state, BlockUpdateResult{}, false
 	}
-	// Vanilla WeatheringCopperDoorBlock only runs randomTick on DoubleBlockHalf.LOWER,
-	// and paired copper chests only tick on single or left half.
 	if fam.Kind == "copper_door" {
 		if info, ok := stateByID(state); ok && info.Properties["half"] == "upper" {
 			return state, BlockUpdateResult{}, false
@@ -644,14 +651,17 @@ func (c *Cache) TryOxidizeCopperOnRandomTick(x, y, z int, rng *rand.Rand) (uint1
 		if info, ok := stateByID(state); ok && info.Properties["type"] == "right" {
 			return state, BlockUpdateResult{}, false
 		}
+		if c.IsCopperChestOpenAt(x, y, z) {
+			return state, BlockUpdateResult{}, false
+		}
 	}
-	var preRoll float64
+	var preRoll float32
 	if rng != nil {
-		preRoll = rng.Float64()
+		preRoll = rng.Float32()
 	} else {
-		preRoll = rand.Float64()
+		preRoll = rand.Float32()
 	}
-	if preRoll >= CopperOxidationPreRollChance {
+	if preRoll >= float32(CopperOxidationPreRollChance) {
 		return state, BlockUpdateResult{}, false
 	}
 	return c.StepCopperOxidationNeighborhood(x, y, z, rng)

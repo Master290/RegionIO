@@ -150,7 +150,7 @@ func IsRandomTickableBlock(state uint16) bool {
 		age, ok := ChorusFlowerAge(state)
 		return ok && age < ChorusFlowerMaxAge
 	case "minecraft:pointed_dripstone":
-		return info.Properties["vertical_direction"] == "down" && info.Properties["thickness"] == "tip"
+		return true
 	}
 	if strings.HasSuffix(name, "_sapling") {
 		return true
@@ -438,20 +438,21 @@ func (c *Cache) randomTickBlock(x, y, z int, state uint16, rng *rand.Rand, res *
 //    nether wart, cocoa, sweet berries)
 // ---------------------------------------------------------------------------
 
-// CropGrowthSpeed computes vanilla CropBlock.getGrowthSpeed(block, level, pos):
-//   - Base speed is 1.0.
-//   - Each farmland cell in the 3x3 area at y-1 adds:
-//     - Underneath (dx=0, dz=0): +1.0 if dry (moisture == 0), +3.0 if hydrated (moisture > 0)
-//     - Surrounding 8 cells: +0.25 if dry, +0.75 if hydrated
+// CropGrowthSpeed computes vanilla CropBlock.getGrowthSpeed(block, level, pos)
+// using exact float32 arithmetic from 26.1.2.jar:
+//   - Base speed is 1.0f.
+//   - Each `#minecraft:grows_crops` (`minecraft:farmland`) cell in the 3x3 area at y-1 adds:
+//     - Underneath (dx=0, dz=0): +1.0f if dry (moisture == 0), +3.0f if hydrated (moisture > 0)
+//     - Surrounding 8 cells: +0.25f if dry, +0.75f if hydrated (`pts / 4.0f`)
 //   - If the same crop block is present on both a west/east neighbor and a
 //     north/south neighbor, OR on any of the 4 diagonal neighbors at y, the
-//     total speed is halved.
+//     total speed is halved (`speed / 2.0f`).
 func (c *Cache) CropGrowthSpeed(x, y, z int, cropName string) float64 {
-	speed := 1.0
+	speed := float32(1.0)
 	for dx := -1; dx <= 1; dx++ {
 		for dz := -1; dz <= 1; dz++ {
 			soil := c.GetBlock(x+dx, y-1, z+dz)
-			pts := 0.0
+			pts := float32(0.0)
 			if sInfo, ok := stateByID(soil); ok && sInfo.Name == "minecraft:farmland" {
 				pts = 1.0
 				moisture, _ := strconv.Atoi(sInfo.Properties["moisture"])
@@ -480,23 +481,27 @@ func (c *Cache) CropGrowthSpeed(x, y, z int, cropName string) float64 {
 	if horizBoth || diagonal {
 		speed /= 2.0
 	}
-	return speed
+	return float64(speed)
+}
+
+func cropGrowthRandomBound(speed float32) int {
+	bound := int(float32(25.0)/speed) + 1
+	if bound < 1 {
+		return 1
+	}
+	return bound
 }
 
 func (c *Cache) randomTickStandardCrop(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
-	if c.RawBrightnessAt(x, y+1, z) < 9 {
+	if c.RawBrightnessAt(x, y, z) < 9 {
 		return
 	}
 	age, err := strconv.Atoi(info.Properties["age"])
 	if err != nil || age >= 7 {
 		return
 	}
-	speed := c.CropGrowthSpeed(x, y, z, info.Name)
-	bound := int(25.0/speed) + 1
-	if bound < 1 {
-		bound = 1
-	}
-	if rng.Intn(bound) == 0 {
+	speed := float32(c.CropGrowthSpeed(x, y, z, info.Name))
+	if rng.Intn(cropGrowthRandomBound(speed)) == 0 {
 		if nextState, ok := withStateProperty(state, "age", strconv.Itoa(age+1)); ok {
 			c.setBlockRecorded(x, y, z, nextState, res)
 		}
@@ -504,23 +509,20 @@ func (c *Cache) randomTickStandardCrop(x, y, z int, state uint16, info stateName
 }
 
 func (c *Cache) randomTickBeetroot(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
-	if c.RawBrightnessAt(x, y+1, z) < 9 {
+	// Vanilla 26.1.2 BeetrootBlock.randomTick:
+	// `if (random.nextInt(3) != 0) super.randomTick(state, level, pos, random);`
+	if rng.Intn(3) == 0 {
+		return
+	}
+	if c.RawBrightnessAt(x, y, z) < 9 {
 		return
 	}
 	age, err := strconv.Atoi(info.Properties["age"])
 	if err != nil || age >= 3 {
 		return
 	}
-	// Vanilla BeetrootBlock.randomTick has a 1/3 gate before CropBlock.randomTick.
-	if rng.Intn(3) != 0 {
-		return
-	}
-	speed := c.CropGrowthSpeed(x, y, z, info.Name)
-	bound := int(25.0/speed) + 1
-	if bound < 1 {
-		bound = 1
-	}
-	if rng.Intn(bound) == 0 {
+	speed := float32(c.CropGrowthSpeed(x, y, z, info.Name))
+	if rng.Intn(cropGrowthRandomBound(speed)) == 0 {
 		if nextState, ok := withStateProperty(state, "age", strconv.Itoa(age+1)); ok {
 			c.setBlockRecorded(x, y, z, nextState, res)
 		}
@@ -528,18 +530,20 @@ func (c *Cache) randomTickBeetroot(x, y, z int, state uint16, info stateName, rn
 }
 
 func (c *Cache) randomTickTorchflowerCrop(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
-	if c.RawBrightnessAt(x, y+1, z) < 9 {
+	// Vanilla 26.1.2 TorchflowerCropBlock.randomTick:
+	// `if (random.nextInt(3) != 0) super.randomTick(state, level, pos, random);`
+	if rng.Intn(3) == 0 {
 		return
 	}
-	if rng.Intn(3) != 0 {
+	if c.RawBrightnessAt(x, y, z) < 9 {
 		return
 	}
-	speed := c.CropGrowthSpeed(x, y, z, info.Name)
-	bound := int(25.0/speed) + 1
-	if bound < 1 {
-		bound = 1
+	age, err := strconv.Atoi(info.Properties["age"])
+	if err != nil || age >= 2 {
+		return
 	}
-	if rng.Intn(bound) != 0 {
+	speed := float32(c.CropGrowthSpeed(x, y, z, info.Name))
+	if rng.Intn(cropGrowthRandomBound(speed)) != 0 {
 		return
 	}
 	c.advanceTorchflowerCropAt(x, y, z, state, info, res)
@@ -566,26 +570,23 @@ func (c *Cache) randomTickPitcherCrop(x, y, z int, state uint16, info stateName,
 	if info.Properties["half"] != "lower" {
 		return
 	}
-	if c.RawBrightnessAt(x, y+1, z) < 9 {
+	// Vanilla 26.1.2 PitcherCropBlock.randomTick rolls growth chance first, then calls grow -> canGrow.
+	speed := float32(c.CropGrowthSpeed(x, y, z, info.Name))
+	if rng.Intn(cropGrowthRandomBound(speed)) != 0 {
 		return
 	}
 	age, err := strconv.Atoi(info.Properties["age"])
 	if err != nil || age >= 4 {
 		return
 	}
-	speed := c.CropGrowthSpeed(x, y, z, info.Name)
-	bound := int(25.0/speed) + 1
-	if bound < 1 {
-		bound = 1
-	}
-	if rng.Intn(bound) != 0 {
+	if c.RawBrightnessAt(x, y, z) < 8 {
 		return
 	}
 	c.advancePitcherCropAt(x, y, z, age+1, res)
 }
 
 func (c *Cache) advancePitcherCropAt(x, lowerY, z int, targetAge int, res *BlockUpdateResult) bool {
-	if lowerY <= c.minY() || lowerY >= c.maxY() {
+	if lowerY <= c.minY() || lowerY >= c.maxY() || lowerY+1 >= c.maxY() {
 		return false
 	}
 	if !isBlockNamed(c.GetBlock(x, lowerY-1, z), "minecraft:farmland") {
@@ -602,18 +603,13 @@ func (c *Cache) advancePitcherCropAt(x, lowerY, z int, targetAge int, res *Block
 	if !okLower {
 		return false
 	}
-	if targetAge < 2 {
+	// Vanilla 26.1.2 PitcherCropBlock.DOUBLE_PLANT_AGE_INTERSECTION = 3 (isDouble(age) => age >= 3).
+	if targetAge < 3 {
 		return c.setBlockRecorded(x, lowerY, z, lowerState, res)
 	}
-	if lowerY+1 >= c.maxY() {
-		return false
-	}
 	above := c.GetBlock(x, lowerY+1, z)
-	if !isAirState(above) {
-		aInfo, ok := stateByID(above)
-		if !ok || aInfo.Name != "minecraft:pitcher_crop" || aInfo.Properties["half"] != "upper" {
-			return false
-		}
+	if !isAirState(above) && !isBlockNamed(above, "minecraft:pitcher_crop") {
+		return false
 	}
 	upperState, okUpper := nameToStateID("minecraft:pitcher_crop", map[string]string{
 		"age":  ageStr,
@@ -657,19 +653,15 @@ func isValidStemFruitFloor(state uint16) bool {
 }
 
 func (c *Cache) randomTickStem(x, y, z int, state uint16, info stateName, rng *rand.Rand, res *BlockUpdateResult) {
-	if c.RawBrightnessAt(x, y+1, z) < 9 {
+	if c.RawBrightnessAt(x, y, z) < 9 {
 		return
 	}
 	age, err := strconv.Atoi(info.Properties["age"])
 	if err != nil {
 		return
 	}
-	speed := c.CropGrowthSpeed(x, y, z, info.Name)
-	bound := int(25.0/speed) + 1
-	if bound < 1 {
-		bound = 1
-	}
-	if rng.Intn(bound) != 0 {
+	speed := float32(c.CropGrowthSpeed(x, y, z, info.Name))
+	if rng.Intn(cropGrowthRandomBound(speed)) != 0 {
 		return
 	}
 	if age < 7 {
@@ -680,7 +672,7 @@ func (c *Cache) randomTickStem(x, y, z int, state uint16, info stateName, rng *r
 	}
 
 	// Mature stem (age == 7): attempt to spawn melon / pumpkin on a random
-	// horizontal neighbor cell with air and valid soil underneath.
+	// horizontal neighbor cell with air and valid `#minecraft:supports_stem_fruit` soil underneath.
 	dir := stemDirections[rng.Intn(len(stemDirections))]
 	nx, nz := x+dir.dx, z+dir.dz
 	if !isAirState(c.GetBlock(nx, y, nz)) || !isValidStemFruitFloor(c.GetBlock(nx, y-1, nz)) {
@@ -701,6 +693,7 @@ func (c *Cache) randomTickStem(x, y, z int, state uint16, info stateName, rng *r
 	if c.setBlockRecorded(nx, y, nz, fruitState, res) {
 		c.setBlockRecorded(x, y, z, attachedState, res)
 		c.runNeighborSupportPass(nx, y, nz, res)
+		c.scheduleAround(nx, y, nz)
 	}
 }
 
@@ -841,29 +834,54 @@ func (c *Cache) IsFarmlandHydrated(x, y, z int) bool {
 	return false
 }
 
-// isUnderCrops reports whether the block at (x, y+1, z) is a crop or stem that
-// prevents dry farmland (moisture == 0) from decaying back to dirt.
-func (c *Cache) isUnderCrops(x, y, z int) bool {
-	if y+1 >= c.maxY() {
-		return false
+// IsMaintainsFarmlandBlock reports whether state belongs to the vanilla 26.1.2
+// `#minecraft:maintains_farmland` block tag (`pumpkin_stem`, `attached_pumpkin_stem`,
+// `melon_stem`, `attached_melon_stem`, `beetroots`, `carrots`, `potatoes`,
+// `torchflower_crop`, `torchflower`, `pitcher_crop`, `wheat`, `moving_piston`,
+// and `#minecraft:fence_gates`).
+func IsMaintainsFarmlandBlock(state uint16) bool {
+	if IsFenceGateBlock(state) {
+		return true
 	}
-	info, ok := stateByID(c.GetBlock(x, y+1, z))
+	info, ok := stateByID(state)
 	if !ok {
 		return false
 	}
 	switch info.Name {
-	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
-		"minecraft:melon_stem", "minecraft:pumpkin_stem",
-		"minecraft:attached_melon_stem", "minecraft:attached_pumpkin_stem",
-		"minecraft:torchflower_crop", "minecraft:torchflower", "minecraft:pitcher_crop", "minecraft:pitcher_plant":
+	case "minecraft:pumpkin_stem", "minecraft:attached_pumpkin_stem",
+		"minecraft:melon_stem", "minecraft:attached_melon_stem",
+		"minecraft:beetroots", "minecraft:carrots", "minecraft:potatoes",
+		"minecraft:torchflower_crop", "minecraft:torchflower",
+		"minecraft:pitcher_crop", "minecraft:wheat",
+		"minecraft:moving_piston":
 		return true
 	}
 	return false
 }
 
+// CanFarmlandSurviveAt mirrors vanilla 26.1.2 `FarmlandBlock.canSurvive`:
+// returns `!aboveState.isSolid() || aboveState.is(BlockTags.MAINTAINS_FARMLAND)`.
+func (c *Cache) CanFarmlandSurviveAt(x, y, z int) bool {
+	if c == nil || y+1 >= c.maxY() {
+		return true
+	}
+	above := c.GetBlock(x, y+1, z)
+	return !isSolidState(above) || IsMaintainsFarmlandBlock(above)
+}
+
+// isUnderCrops reports whether the block at (x, y+1, z) belongs to
+// `#minecraft:maintains_farmland`, preventing dry farmland (moisture == 0)
+// from decaying back to dirt on randomTick.
+func (c *Cache) isUnderCrops(x, y, z int) bool {
+	if y+1 >= c.maxY() {
+		return false
+	}
+	return IsMaintainsFarmlandBlock(c.GetBlock(x, y+1, z))
+}
+
 func (c *Cache) randomTickFarmland(x, y, z int, state uint16, info stateName, res *BlockUpdateResult) {
 	moisture, _ := strconv.Atoi(info.Properties["moisture"])
-	if c.IsFarmlandHydrated(x, y, z) {
+	if c.IsFarmlandHydrated(x, y, z) || c.IsRainingAt(x, y+1, z) {
 		if moisture < 7 {
 			if nextState, ok := withStateProperty(state, "moisture", "7"); ok {
 				c.setBlockRecorded(x, y, z, nextState, res)
@@ -882,17 +900,35 @@ func (c *Cache) randomTickFarmland(x, y, z int, state uint16, info stateName, re
 	}
 }
 
+func (c *Cache) stepFarmlandUpdate(x, y, z int, res *BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return
+	}
+	if !isBlockNamed(c.GetBlock(x, y, z), "minecraft:farmland") {
+		return
+	}
+	if !c.CanFarmlandSurviveAt(x, y, z) {
+		c.turnFarmlandToDirt(x, y, z, res)
+	}
+}
+
 func (c *Cache) turnFarmlandToDirt(x, y, z int, res *BlockUpdateResult) bool {
 	if !c.setBlockRecorded(x, y, z, StateDirt, res) {
 		return false
 	}
+	res.EntityPushUps = append(res.EntityPushUps, EntityPushUp{
+		Pos:     BlockPos{X: x, Y: y, Z: z},
+		OldTopY: 15.0 / 16.0,
+		NewTopY: 1.0,
+	})
 	c.runNeighborSupportPass(x, y, z, res)
 	c.scheduleAround(x, y, z)
 	return true
 }
 
-// TrampleFarmland turns minecraft:farmland at (x, y, z) into minecraft:dirt and
-// breaks any crop planted on top of it (vanilla FarmBlock.fallOn / turnToDirt).
+// TrampleFarmland turns minecraft:farmland at (x, y, z) into minecraft:dirt,
+// records an entity push-up from 15/16 to 16/16, and breaks any crop planted
+// on top of it (vanilla FarmlandBlock.fallOn / turnToDirt).
 func (c *Cache) TrampleFarmland(x, y, z int) (bool, BlockUpdateResult) {
 	var res BlockUpdateResult
 	if !isBlockNamed(c.GetBlock(x, y, z), "minecraft:farmland") {
@@ -903,29 +939,31 @@ func (c *Cache) TrampleFarmland(x, y, z int) (bool, BlockUpdateResult) {
 }
 
 // FarmlandMinTrampleVolume is the minimum entity bounding-box volume
-// (`width * width * height > 0.512`) required to trample farmland in vanilla
-// `FarmBlock.fallOn`.
+// (`width * width * height > 0.512f`) required to trample farmland in vanilla
+// `FarmlandBlock.fallOn`.
 const FarmlandMinTrampleVolume = 0.512
 
-// CanEntityTrampleFarmland reports whether a landing entity (player or mob)
-// tramples farmland on impact, matching vanilla `FarmBlock.fallOn`:
-//   - Requires `fallDistance > 0.5` and `rng.Float64() < fallDistance - 0.5`.
+// CanEntityTrampleFarmland reports whether a landing living entity (player or mob)
+// tramples farmland on impact, matching vanilla 26.1.2 `FarmlandBlock.fallOn`:
+//   - Requires `double(rng.Float32()) < fallDistance - 0.5`.
 //   - Non-player entities require `mobGriefing == true`.
-//   - Entity bounding-box volume (`width * width * height`) must exceed `0.512`.
+//   - Entity bounding-box volume (`float32(width) * float32(width) * float32(height)`) must exceed `0.512f`.
 func CanEntityTrampleFarmland(isPlayer, mobGriefing bool, width, height, fallDistance float64, rng *rand.Rand) bool {
 	if fallDistance <= 0.5 {
-		return false
-	}
-	if !isPlayer && !mobGriefing {
-		return false
-	}
-	if width*width*height <= FarmlandMinTrampleVolume {
 		return false
 	}
 	if rng == nil {
 		rng = rand.New(rand.NewSource(1))
 	}
-	return rng.Float64() < fallDistance-0.5
+	if float64(rng.Float32()) >= fallDistance-0.5 {
+		return false
+	}
+	if !isPlayer && !mobGriefing {
+		return false
+	}
+	w := float32(width)
+	h := float32(height)
+	return w*w*h > float32(FarmlandMinTrampleVolume)
 }
 
 // TillSoilAt converts grass_block, dirt, or dirt_path (when air is above) into

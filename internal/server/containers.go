@@ -1210,6 +1210,8 @@ func (s *Server) updateContainerViewerState(dim string, x, y, z int) {
 			if len(res.Changes) > 0 || len(res.LightChanged) > 0 {
 				s.broadcastDimensionBlockChanges(normDim, cache, res.Changes, res.LightChanged)
 			}
+		} else if world.IsCopperChestBlock(state) {
+			cache.SetCopperChestOpenCount(x, y, z, openCount)
 		}
 	}
 }

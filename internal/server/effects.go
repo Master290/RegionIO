@@ -983,6 +983,10 @@ func (s *Server) DamagePlayerWithEffects(session *PlayerSession, amount float32,
 				return false
 			}
 		}
+	case "stalagmite":
+		if session.HasSlowFalling() {
+			return false
+		}
 	}
 
 	if mult := session.ResistanceDamageMultiplier(cause); mult < 1.0 {

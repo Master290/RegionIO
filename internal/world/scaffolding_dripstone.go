@@ -20,28 +20,58 @@ const (
 	// DripstoneMaxGrowthLength is vanilla PointedDripstoneBlock.MAX_GROWTH_LENGTH (7).
 	DripstoneMaxGrowthLength = 7
 
-	// DripstoneMaxCauldronSearchDepth is vanilla
-	// PointedDripstoneBlock.MAX_SEARCH_LENGTH_BETWEEN_STALACTITE_TIP_AND_CAULDRON (10).
+	// DripstoneMaxStalagmiteSearchRangeWhenGrowing is vanilla
+	// PointedDripstoneBlock.MAX_STALAGMITE_SEARCH_RANGE_WHEN_GROWING (10).
+	DripstoneMaxStalagmiteSearchRangeWhenGrowing = 10
+
+	// DripstoneMaxCauldronSearchDepth is vanilla's maximum block distance (10, i.e.
+	// findBlockVertical(..., MAX_SEARCH_LENGTH_BETWEEN_STALACTITE_TIP_AND_CAULDRON=11))
+	// between a stalactite tip and a cauldron below it.
 	DripstoneMaxCauldronSearchDepth = 10
 
-	// DripstoneMaxStalactiteCheckDepth is vanilla's maximum stalactite column
-	// scan length (11) when looking for the supporting ceiling block.
+	// DripstoneMaxStalactiteCheckDepth is vanilla's MAX_SEARCH_LENGTH_WHEN_CHECKING_DRIP_TYPE (11),
+	// allowing stalactite columns of length <= 10 blocks below the ceiling support block.
 	DripstoneMaxStalactiteCheckDepth = 11
 
-	// DripstoneGrowthProbability is vanilla PointedDripstoneBlock.GROWTH_PROBABILITY (0.011377778).
+	// DripstoneFallingDelayTicks is vanilla PointedDripstoneBlock.DELAY_BEFORE_FALLING (2).
+	DripstoneFallingDelayTicks = 2
+
+	// DripstoneStalagmiteBreakDelayTicks is the 1-tick scheduled break delay for unsupported stalagmites.
+	DripstoneStalagmiteBreakDelayTicks = 1
+
+	// DripstoneCauldronBaseTickDelay is the 50-tick base delay in vanilla
+	// PointedDripstoneBlock.maybeTransferFluid (`50 + (tipPos.getY() - cauldronPos.getY())`).
+	DripstoneCauldronBaseTickDelay = 50
+
+	// StalactiteDripStartPixel is vanilla PointedDripstoneBlock.STALACTITE_DRIP_START_PIXEL (5.0 / 16.0 = 0.3125).
+	StalactiteDripStartPixel = 5.0 / 16.0
+
+	// DripstoneGrowthProbability is vanilla PointedDripstoneBlock.GROWTH_PROBABILITY_PER_RANDOM_TICK (0.011377778).
 	DripstoneGrowthProbability = 0.011377778
 
-	// DripstoneWaterTransferProbability is vanilla's water drip transfer chance (45/256 = 0.17578125).
+	// DripstoneWaterTransferProbability is vanilla's WATER_TRANSFER_PROBABILITY_PER_RANDOM_TICK (45/256 = 0.17578125).
 	DripstoneWaterTransferProbability = 0.17578125
 
-	// DripstoneLavaTransferProbability is vanilla's lava drip transfer chance (15/256 = 0.05859375).
+	// DripstoneLavaTransferProbability is vanilla's LAVA_TRANSFER_PROBABILITY_PER_RANDOM_TICK (15/256 = 0.05859375).
 	DripstoneLavaTransferProbability = 0.05859375
 
-	// FallingStalactiteDamagePerBlock is vanilla PointedDripstoneBlock.STALACTITE_DAMAGE_PER_FALL_DISTANCE (6.0).
+	// DripstoneStalactiteDamagePerDistanceAndSize is vanilla STALACTITE_DAMAGE_PER_FALL_DISTANCE_AND_SIZE (1.0).
+	DripstoneStalactiteDamagePerDistanceAndSize = 1.0
+
+	// DripstoneMaxHeightForDamageCalc is vanilla MAX_STALACTITE_HEIGHT_FOR_DAMAGE_CALCULATION (6).
+	DripstoneMaxHeightForDamageCalc = 6
+
+	// FallingStalactiteDamagePerBlock is the minimum per-block damage factor (6.0 = max(len, 6) * 1.0).
 	FallingStalactiteDamagePerBlock = 6.0
 
-	// FallingStalactiteMaxDamage is vanilla PointedDripstoneBlock.STALACTITE_FALL_DAMAGE_MAX (40).
+	// FallingStalactiteMaxDamage is vanilla PointedDripstoneBlock.STALACTITE_MAX_DAMAGE (40).
 	FallingStalactiteMaxDamage = 40.0
+
+	// DripstoneStalagmiteFallDistanceOffset is vanilla STALAGMITE_FALL_DISTANCE_OFFSET (2.5).
+	DripstoneStalagmiteFallDistanceOffset = 2.5
+
+	// DripstoneStalagmiteFallDamageModifier is vanilla STALAGMITE_FALL_DAMAGE_MODIFIER (2.0).
+	DripstoneStalagmiteFallDamageModifier = 2.0
 )
 
 // ---------------------------------------------------------------------------
@@ -367,46 +397,161 @@ func MakePointedDripstoneState(verticalDirection, thickness string, waterlogged 
 	return id
 }
 
-// CalculatePointedDripstoneThicknessAt computes the vanilla DripstoneThickness
-// (`"tip"`, `"tip_merge"`, `"frustum"`, `"middle"`, `"base"`) for a pointed
-// dripstone block at (x, y, z) pointing in `verticalDirection` (`"up"` or `"down"`).
-func (c *Cache) CalculatePointedDripstoneThicknessAt(x, y, z int, verticalDirection string) string {
+// CanPointedDripstoneDrip mirrors vanilla PointedDripstoneBlock.canDrip(state):
+// `vertical_direction == "down"`, `thickness == "tip"`, and `waterlogged == "false"`.
+func CanPointedDripstoneDrip(state uint16) bool {
+	return IsPointedDripstoneBlock(state) &&
+		PointedDripstoneDirection(state) == "down" &&
+		PointedDripstoneThickness(state) == "tip" &&
+		!isWaterloggedState(state)
+}
+
+// CanPointedDripstoneSurviveAt mirrors vanilla PointedDripstoneBlock.isValidPointedDripstonePlacement:
+//   - `"down"` (stalactite): block at `y+1` has a sturdy bottom face or is `pointed_dripstone[down]`.
+//   - `"up"` (stalagmite): block at `y-1` has a sturdy top face or is `pointed_dripstone[up]`.
+func (c *Cache) CanPointedDripstoneSurviveAt(x, y, z int, verticalDirection string) bool {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false
+	}
+	if verticalDirection == "up" {
+		if y <= c.minY() {
+			return false
+		}
+		below := c.GetBlock(x, y-1, z)
+		if IsPointedDripstoneBlock(below) && PointedDripstoneDirection(below) == "up" {
+			return true
+		}
+		return !isAirState(below) && !isStandaloneFluidState(below) && isSturdySupportBlock(below)
+	}
+	if y+1 >= c.maxY() {
+		return false
+	}
+	above := c.GetBlock(x, y+1, z)
+	if IsPointedDripstoneBlock(above) && PointedDripstoneDirection(above) == "down" {
+		return true
+	}
+	return !isAirState(above) && !isStandaloneFluidState(above) && isSturdySupportBlock(above)
+}
+
+func isStandaloneFluidState(state uint16) bool {
+	_, _, ok := isStandaloneFluidBlock(state)
+	return ok
+}
+
+// IsStalactiteStartPos mirrors vanilla PointedDripstoneBlock.isStalactiteStartPos:
+// returns true iff `(x, y, z)` is a downward `pointed_dripstone` and `(x, y+1, z)`
+// is NOT `minecraft:pointed_dripstone` (i.e. the topmost segment of the stalactite).
+func (c *Cache) IsStalactiteStartPos(x, y, z int) bool {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false
+	}
+	st := c.GetBlock(x, y, z)
+	if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" {
+		return false
+	}
+	if y+1 >= c.maxY() {
+		return true
+	}
+	return !IsPointedDripstoneBlock(c.GetBlock(x, y+1, z))
+}
+
+// CalculatePointedDripstoneThicknessWithMergeAt mirrors vanilla
+// PointedDripstoneBlock.calculateDripstoneThickness(level, pos, tipDir, mergeOpposingTips).
+func (c *Cache) CalculatePointedDripstoneThicknessWithMergeAt(x, y, z int, verticalDirection string, mergeOpposingTips bool) string {
 	if c == nil {
 		return "tip"
 	}
 	dy := -1
+	oppDir := "up"
 	if verticalDirection == "up" {
 		dy = 1
+		oppDir = "down"
 	}
 	aheadY := y + dy
 	behindY := y - dy
 
 	var ahead uint16 = StateAir
-	if aheadY >= MinY && aheadY < MinY+WorldHeight {
+	if aheadY >= c.minY() && aheadY < c.maxY() {
 		ahead = c.GetBlock(x, aheadY, z)
 	}
-	if !IsPointedDripstoneBlock(ahead) {
-		return "tip"
-	}
-	aheadDir := PointedDripstoneDirection(ahead)
-	aheadThick := PointedDripstoneThickness(ahead)
-	if aheadDir != verticalDirection {
-		if aheadThick == "tip" || aheadThick == "tip_merge" {
+	if IsPointedDripstoneBlock(ahead) && PointedDripstoneDirection(ahead) == oppDir {
+		if mergeOpposingTips || PointedDripstoneThickness(ahead) == "tip_merge" {
 			return "tip_merge"
 		}
 		return "tip"
 	}
+	if !IsPointedDripstoneBlock(ahead) || PointedDripstoneDirection(ahead) != verticalDirection {
+		return "tip"
+	}
+	aheadThick := PointedDripstoneThickness(ahead)
 	if aheadThick == "tip" || aheadThick == "tip_merge" {
 		return "frustum"
 	}
 	var behind uint16 = StateAir
-	if behindY >= MinY && behindY < MinY+WorldHeight {
+	if behindY >= c.minY() && behindY < c.maxY() {
 		behind = c.GetBlock(x, behindY, z)
 	}
 	if !IsPointedDripstoneBlock(behind) || PointedDripstoneDirection(behind) != verticalDirection {
 		return "base"
 	}
 	return "middle"
+}
+
+// CalculatePointedDripstoneThicknessAt computes the vanilla DripstoneThickness
+// (`"tip"`, `"tip_merge"`, `"frustum"`, `"middle"`, `"base"`) for a pointed
+// dripstone block at (x, y, z) pointing in `verticalDirection` (`"up"` or `"down"`),
+// merging opposing tips (`mergeOpposingTips = true`).
+func (c *Cache) CalculatePointedDripstoneThicknessAt(x, y, z int, verticalDirection string) string {
+	return c.CalculatePointedDripstoneThicknessWithMergeAt(x, y, z, verticalDirection, true)
+}
+
+func (c *Cache) calculatePointedDripstoneTipDirection(x, y, z int, preferredDir string) string {
+	dir := preferredDir
+	if dir != "up" && dir != "down" {
+		dir = "down"
+	}
+	opp := "up"
+	if dir == "up" {
+		opp = "down"
+	}
+	if c.CanPointedDripstoneSurviveAt(x, y, z, dir) {
+		return dir
+	}
+	if c.CanPointedDripstoneSurviveAt(x, y, z, opp) {
+		return opp
+	}
+	return ""
+}
+
+// PlacePointedDripstoneAt implements vanilla PointedDripstoneBlock.getStateForPlacement:
+// resolves `vertical_direction` (`preferredDir` or its opposite if only one support is valid),
+// sets `mergeOpposingTips = !sneaking` (so sneaking keeps opposing tips unmerged as `"tip"`),
+// sets `waterlogged` when placed in water, and updates the column.
+func (c *Cache) PlacePointedDripstoneAt(x, y, z int, preferredDir string, sneaking bool) (uint16, BlockUpdateResult, bool) {
+	var res BlockUpdateResult
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return StateAir, res, false
+	}
+	dir := c.calculatePointedDripstoneTipDirection(x, y, z, preferredDir)
+	if dir == "" {
+		return StateAir, res, false
+	}
+	existing := c.GetBlock(x, y, z)
+	waterlogged := hasWaterFluid(existing)
+	thick := c.CalculatePointedDripstoneThicknessWithMergeAt(x, y, z, dir, !sneaking)
+	targetState := MakePointedDripstoneState(dir, thick, waterlogged)
+
+	c.ensureLightNeighborhoodLoadedAt(x, z, existing, targetState)
+	ok, lightChanged := c.SetBlockWithLight(x, y, z, targetState)
+	if !ok {
+		return StateAir, res, false
+	}
+	if existing != targetState {
+		res.appendChange(BlockPos{X: x, Y: y, Z: z}, existing, targetState, lightChanged)
+		c.notifyObserversOfChangeAt(x, y, z, existing, targetState)
+	}
+	c.applyImmediatePostPlacement(x, y, z, existing, targetState, &res)
+	return c.GetBlock(x, y, z), res, true
 }
 
 // ResolvePointedDripstoneStateAt resolves a newly placed pointed_dripstone state
@@ -416,94 +561,213 @@ func (c *Cache) ResolvePointedDripstoneStateAt(x, y, z int, baseState uint16) ui
 	if dir == "" {
 		dir = "down"
 	}
+	if c != nil {
+		if resolvedDir := c.calculatePointedDripstoneTipDirection(x, y, z, dir); resolvedDir != "" {
+			dir = resolvedDir
+		}
+	}
 	waterlogged := isWaterloggedState(baseState)
-	if !waterlogged && c != nil && y >= MinY && y < MinY+WorldHeight && c.GetBlock(x, y, z) == StateWater {
+	if !waterlogged && c != nil && y >= c.minY() && y < c.maxY() && hasWaterFluid(c.GetBlock(x, y, z)) {
 		waterlogged = true
 	}
-	thick := c.CalculatePointedDripstoneThicknessAt(x, y, z, dir)
+	thick := c.CalculatePointedDripstoneThicknessWithMergeAt(x, y, z, dir, true)
 	return MakePointedDripstoneState(dir, thick, waterlogged)
 }
 
 // RecalculatePointedDripstoneColumnAround updates the `thickness` property of
 // any connected pointed_dripstone segments at, above, and below (x, y, z) from
-// tip toward base so multi-segment stalactites and stalagmites always maintain
-// valid `tip`/`tip_merge`/`frustum`/`middle`/`base` gradients.
+// tip toward base, matching vanilla `PointedDripstoneBlock.updateShape`:
+//   - Downward stalactites that have lost ceiling support or already have a pending
+//     falling tick keep their current state until the 2-tick scheduled fall runs.
+//   - `mergeOpposingTips` is `true` iff the segment already has `thickness == "tip_merge"`
+//     (or its opposing neighbor is `"tip_merge"`), preserving unmerged sneak-placed tips.
 func (c *Cache) RecalculatePointedDripstoneColumnAround(x, y, z int, res *BlockUpdateResult) {
 	if c == nil {
 		return
 	}
 	minScan := y - 1
-	for minScan > MinY && IsPointedDripstoneBlock(c.GetBlock(x, minScan, z)) {
+	for minScan > c.minY() && IsPointedDripstoneBlock(c.GetBlock(x, minScan, z)) {
 		minScan--
 	}
 	maxScan := y + 1
-	for maxScan < MinY+WorldHeight-1 && IsPointedDripstoneBlock(c.GetBlock(x, maxScan, z)) {
+	for maxScan < c.maxY()-1 && IsPointedDripstoneBlock(c.GetBlock(x, maxScan, z)) {
 		maxScan++
 	}
-	// Two passes (bottom-to-top for stalactites, top-to-bottom for stalagmites,
-	// repeated once for tip_merge propagation) settle the entire column.
 	for pass := 0; pass < 2; pass++ {
 		for cy := minScan; cy <= maxScan; cy++ {
-			if cy < MinY || cy >= MinY+WorldHeight {
+			if cy < c.minY() || cy >= c.maxY() {
 				continue
 			}
 			st := c.GetBlock(x, cy, z)
-			if !IsPointedDripstoneBlock(st) {
+			if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" {
 				continue
 			}
-			dir := PointedDripstoneDirection(st)
-			if dir != "down" {
+			if _, pending := c.ScheduledBlockUpdatePriority(x, cy, z, UpdateFalling); pending || !c.CanPointedDripstoneSurviveAt(x, cy, z, "down") {
 				continue
 			}
-			wantThick := c.CalculatePointedDripstoneThicknessAt(x, cy, z, dir)
-			if wantThick != PointedDripstoneThickness(st) {
-				next := MakePointedDripstoneState(dir, wantThick, isWaterloggedState(st))
+			curThick := PointedDripstoneThickness(st)
+			wantThick := c.CalculatePointedDripstoneThicknessWithMergeAt(x, cy, z, "down", curThick == "tip_merge")
+			if wantThick != curThick {
+				next := MakePointedDripstoneState("down", wantThick, isWaterloggedState(st))
 				c.setBlockRecorded(x, cy, z, next, res)
 			}
 		}
 		for cy := maxScan; cy >= minScan; cy-- {
-			if cy < MinY || cy >= MinY+WorldHeight {
+			if cy < c.minY() || cy >= c.maxY() {
 				continue
 			}
 			st := c.GetBlock(x, cy, z)
-			if !IsPointedDripstoneBlock(st) {
+			if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "up" {
 				continue
 			}
-			dir := PointedDripstoneDirection(st)
-			if dir != "up" {
+			if !c.CanPointedDripstoneSurviveAt(x, cy, z, "up") {
 				continue
 			}
-			wantThick := c.CalculatePointedDripstoneThicknessAt(x, cy, z, dir)
-			if wantThick != PointedDripstoneThickness(st) {
-				next := MakePointedDripstoneState(dir, wantThick, isWaterloggedState(st))
+			curThick := PointedDripstoneThickness(st)
+			wantThick := c.CalculatePointedDripstoneThicknessWithMergeAt(x, cy, z, "up", curThick == "tip_merge")
+			if wantThick != curThick {
+				next := MakePointedDripstoneState("up", wantThick, isWaterloggedState(st))
 				c.setBlockRecorded(x, cy, z, next, res)
 			}
 		}
 	}
 }
 
-// FallingStalactiteDamage returns the vanilla damage dealt by a falling
-// pointed_dripstone stalactite after falling `fallDistance` blocks:
-// `min(40, max(0, ceil((fallDistance - 1) * 6.0)))` (or `6.0 * fallDistance` when >= 1).
-func FallingStalactiteDamage(fallDistance int) float32 {
-	if fallDistance <= 0 {
+func (c *Cache) stepPointedDripstoneTick(x, y, z int, state uint16, res *BlockUpdateResult) {
+	if !IsPointedDripstoneBlock(state) {
+		return
+	}
+	dir := PointedDripstoneDirection(state)
+	if dir == "up" {
+		if !c.CanPointedDripstoneSurviveAt(x, y, z, "up") {
+			replacement := StateAir
+			if isWaterloggedState(state) {
+				replacement = StateWater
+			}
+			if c.setBlockRecorded(x, y, z, replacement, res) {
+				res.Drops = append(res.Drops, BlockPosDrop{
+					Pos:   BlockPos{X: x, Y: y, Z: z},
+					Stack: NewNamedItemStack("minecraft:pointed_dripstone", 1),
+				})
+				c.RecalculatePointedDripstoneColumnAround(x, y, z, res)
+				c.runNeighborSupportPass(x, y, z, res)
+				c.scheduleAround(x, y, z)
+			}
+		}
+		return
+	}
+
+	// Stalactite (`vertical_direction == "down"`): PointedDripstoneBlock.spawnFallingStalactite.
+	if c.CanPointedDripstoneSurviveAt(x, y, z, "down") {
+		return
+	}
+	type seg struct {
+		y     int
+		state uint16
+	}
+	var segs []seg
+	for curY := y; curY >= c.minY(); curY-- {
+		cur := c.GetBlock(x, curY, z)
+		if !IsPointedDripstoneBlock(cur) || PointedDripstoneDirection(cur) != "down" {
+			break
+		}
+		segs = append(segs, seg{y: curY, state: cur})
+		if PointedDripstoneThickness(cur) == "tip" || PointedDripstoneThickness(cur) == "tip_merge" {
+			break
+		}
+	}
+	if len(segs) == 0 {
+		return
+	}
+	// Remove all falling segments first so findFallingLandingY sees the cleared column.
+	for _, sg := range segs {
+		replacement := StateAir
+		if isWaterloggedState(sg.state) {
+			replacement = StateWater
+		}
+		c.CancelScheduledBlockUpdate(x, sg.y, z, UpdateFalling)
+		c.setBlockRecorded(x, sg.y, z, replacement, res)
+	}
+	bottomY := segs[len(segs)-1].y
+	c.RecalculatePointedDripstoneColumnAround(x, bottomY, z, res)
+	for _, sg := range segs {
+		landY := c.findFallingLandingY(x, sg.y, z)
+		fallDist := sg.y - landY
+		if fallDist < 0 {
+			fallDist = 0
+		}
+		thick := PointedDripstoneThickness(sg.state)
+		isTip := thick == "tip" || thick == "tip_merge"
+		var dmgPerDist float32
+		var dmgMax int
+		if isTip {
+			colHeight := 1 + y - sg.y
+			if colHeight < DripstoneMaxHeightForDamageCalc {
+				colHeight = DripstoneMaxHeightForDamageCalc
+			}
+			dmgPerDist = float32(colHeight) * DripstoneStalactiteDamagePerDistanceAndSize
+			dmgMax = int(FallingStalactiteMaxDamage)
+		}
+		res.Landings = append(res.Landings, FallingBlockLanding{
+			Pos:               BlockPos{X: x, Y: landY, Z: z},
+			State:             sg.state,
+			FallDistance:      fallDist,
+			HurtEntities:      isTip,
+			DamagePerDistance: dmgPerDist,
+			DamageMax:         dmgMax,
+		})
+		res.Drops = append(res.Drops, BlockPosDrop{
+			Pos:   BlockPos{X: x, Y: landY, Z: z},
+			Stack: NewNamedItemStack("minecraft:pointed_dripstone", 1),
+		})
+		c.runNeighborSupportPass(x, sg.y, z, res)
+		c.scheduleAround(x, sg.y, z)
+	}
+}
+
+// CalculateFallingStalactiteDamage computes vanilla `FallingBlockEntity.causeFallDamage`
+// for a falling stalactite tip of `columnLength` (`>= 1`) after falling `fallDistance` blocks:
+// `min(40, floor(float32(ceil(fallDistance - 1.0)) * float32(max(columnLength, 6))))`.
+func CalculateFallingStalactiteDamage(fallDistance float64, columnLength int) float32 {
+	blocksAfterFirst := int(math.Ceil(fallDistance - 1.0))
+	if blocksAfterFirst <= 0 {
 		return 0
 	}
-	eff := fallDistance
-	dmg := float64(eff) * FallingStalactiteDamagePerBlock
+	h := columnLength
+	if h < DripstoneMaxHeightForDamageCalc {
+		h = DripstoneMaxHeightForDamageCalc
+	}
+	perDist := float32(h) * float32(DripstoneStalactiteDamagePerDistanceAndSize)
+	dmg := int(math.Floor(float64(float32(blocksAfterFirst) * perDist)))
+	if dmg > int(FallingStalactiteMaxDamage) {
+		dmg = int(FallingStalactiteMaxDamage)
+	}
+	if dmg < 0 {
+		return 0
+	}
+	return float32(dmg)
+}
+
+// FallingStalactiteDamage returns the vanilla damage dealt by a falling
+// pointed_dripstone stalactite (with base multiplier 6.0, capped at 40) for
+// `blocksAfterFirst` (`ceil(fallDistance - 1.0)`).
+func FallingStalactiteDamage(blocksAfterFirst int) float32 {
+	if blocksAfterFirst <= 0 {
+		return 0
+	}
+	dmg := float64(blocksAfterFirst) * FallingStalactiteDamagePerBlock
 	if dmg > FallingStalactiteMaxDamage {
 		dmg = FallingStalactiteMaxDamage
 	}
 	return float32(dmg)
 }
 
-// StalagmiteFallDamage calculates the amplified fall damage when an entity lands
-// on an upward-pointing pointed_dripstone tip (`vertical_direction=up`,
-// `thickness=tip`) at (x, y, z). In vanilla PointedDripstoneBlock.fallOn, fall
-// distance is transformed to `fallDistance * 2.0 + 2.0` before standard fall
-// damage (`ceil(effectiveDistance - 3.0)`).
-func (c *Cache) StalagmiteFallDamage(x, y, z int, fallDistance float64) (damage float32, onStalagmite bool) {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+// StalagmiteFallDamageWithSafeFall calculates vanilla 26.1.2 `PointedDripstoneBlock.fallOn`
+// (`entity.causeFallDamage(fallDistance + 2.5, 2.0f, stalagmite)`) combined with
+// `LivingEntity.calculateFallDamage`:
+// `floor((fallDistance + 2.5 + 1e-6 - safeFallDistance) * 2.0)`.
+func (c *Cache) StalagmiteFallDamageWithSafeFall(x, y, z int, fallDistance, safeFallDistance float64) (damage float32, onStalagmite bool) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return 0, false
 	}
 	st := c.GetBlock(x, y, z)
@@ -513,29 +777,120 @@ func (c *Cache) StalagmiteFallDamage(x, y, z int, fallDistance float64) (damage 
 	if fallDistance <= 0 {
 		return 0, true
 	}
-	effective := fallDistance*2.0 + 2.0
-	raw := math.Ceil(effective - 3.0)
-	if raw < 0 {
-		raw = 0
+	fallPower := fallDistance + DripstoneStalagmiteFallDistanceOffset + 1e-6 - safeFallDistance
+	raw := math.Floor(fallPower * DripstoneStalagmiteFallDamageModifier)
+	if raw <= 0 {
+		return 0, true
 	}
 	return float32(raw), true
 }
 
+// StalagmiteFallDamage calculates the amplified fall damage when an entity with
+// default `SAFE_FALL_DISTANCE = 3.0` lands on an upward-pointing pointed_dripstone
+// tip (`vertical_direction=up`, `thickness=tip`) at (x, y, z).
+func (c *Cache) StalagmiteFallDamage(x, y, z int, fallDistance float64) (damage float32, onStalagmite bool) {
+	return c.StalagmiteFallDamageWithSafeFall(x, y, z, fallDistance, 3.0)
+}
+
+// ScheduleStalactiteDripTicks returns the exact block-tick delay scheduled on a
+// cauldron at `cauldronY` when a stalactite tip at `tipY` drips into it in vanilla
+// 26.1.2 `PointedDripstoneBlock.maybeTransferFluid`: `50 + (tipY - cauldronY)`.
+func ScheduleStalactiteDripTicks(tipY, cauldronY int) int {
+	delay := DripstoneCauldronBaseTickDelay + (tipY - cauldronY)
+	if delay < 1 {
+		delay = 1
+	}
+	return delay
+}
+
+// CanDripThroughBlock mirrors vanilla `PointedDripstoneBlock.canDripThrough`:
+// air, or a non-solid-render block with empty fluid state whose collision shape
+// does not intersect the central 4x16x4 drip column `[6..10, 0..16, 6..10]`.
+func CanDripThroughBlock(state uint16) bool {
+	if isAirState(state) {
+		return true
+	}
+	if isSolidState(state) || lightOpacity(state) >= 15 {
+		return false
+	}
+	if hasWaterFluid(state) || isLavaBlock(state) {
+		return false
+	}
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:cauldron", "minecraft:water_cauldron", "minecraft:lava_cauldron", "minecraft:powder_snow_cauldron",
+		"minecraft:pointed_dripstone", "minecraft:hopper", "minecraft:composter", "minecraft:lectern",
+		"minecraft:brewing_stand", "minecraft:grindstone", "minecraft:stonecutter", "minecraft:bell",
+		"minecraft:lantern", "minecraft:soul_lantern", "minecraft:iron_chain",
+		"minecraft:end_rod", "minecraft:lightning_rod", "minecraft:cactus", "minecraft:bamboo",
+		"minecraft:chorus_plant", "minecraft:chorus_flower", "minecraft:dragon_egg",
+		"minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil",
+		"minecraft:chest", "minecraft:trapped_chest", "minecraft:ender_chest",
+		"minecraft:enchanting_table", "minecraft:end_portal_frame", "minecraft:daylight_detector",
+		"minecraft:farmland", "minecraft:dirt_path", "minecraft:mud", "minecraft:soul_sand":
+		return false
+	}
+	if IsCopperLanternBlock(state) || IsChainBlock(state) || IsLightningRodBlock(state) ||
+		IsCopperChestBlock(state) || IsCopperGolemStatueBlock(state) ||
+		IsFenceBlock(state) || IsWallBlock(state) || IsPaneOrBarsBlock(state) ||
+		IsFenceGateBlock(state) || IsStairsBlock(state) || strings.HasSuffix(info.Name, "_slab") ||
+		strings.HasSuffix(info.Name, "_bed") || strings.HasSuffix(info.Name, "_carpet") ||
+		strings.HasSuffix(info.Name, "shulker_box") || IsAmethystBudOrClusterBlock(state) {
+		return false
+	}
+	if strings.HasSuffix(info.Name, "_trapdoor") && info.Properties["open"] != "true" {
+		return false
+	}
+	if info.Name == "minecraft:snow" && info.Properties["layers"] != "1" {
+		return false
+	}
+	return !blocksMotionOrFluid(state)
+}
+
+func isWaterSourceOrWaterlogged(state uint16) bool {
+	if isStandaloneWaterSourceOrBubble(state) || isWaterloggedState(state) {
+		return true
+	}
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	if info.Name == "minecraft:water" {
+		lvl := info.Properties["level"]
+		return lvl == "" || lvl == "0"
+	}
+	return false
+}
+
+func isLavaSourceBlock(state uint16) bool {
+	if state == StateLava {
+		return true
+	}
+	info, ok := stateByID(state)
+	if !ok || info.Name != "minecraft:lava" {
+		return false
+	}
+	lvl := info.Properties["level"]
+	return lvl == "" || lvl == "0"
+}
+
 // TraceStalactiteRoot scans upward from a downward pointed_dripstone block at
-// (x, y, z) (up to DripstoneMaxStalactiteCheckDepth blocks) and returns the Y
-// coordinate of the ceiling support block (`rootY`), the stalactite column
-// length, and true if a valid non-air ceiling block supports the column.
+// (x, y, z) (matching `findRootBlock(..., 11)`: stalactite column length <= 10)
+// and returns the Y coordinate of the ceiling support block (`rootY`), the
+// stalactite column length, and true if a valid ceiling block supports it.
 func (c *Cache) TraceStalactiteRoot(x, y, z int) (rootY int, length int, ok bool) {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return 0, 0, false
 	}
 	st := c.GetBlock(x, y, z)
 	if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" {
 		return 0, 0, false
 	}
-	// Walk down to the tip first if (x, y, z) is mid-column.
 	tipY := y
-	for tipY > MinY {
+	for step := 1; step < DripstoneMaxStalactiteCheckDepth && tipY > c.minY(); step++ {
 		below := c.GetBlock(x, tipY-1, z)
 		if IsPointedDripstoneBlock(below) && PointedDripstoneDirection(below) == "down" {
 			tipY--
@@ -544,187 +899,313 @@ func (c *Cache) TraceStalactiteRoot(x, y, z int) (rootY int, length int, ok bool
 		}
 	}
 	curY := tipY
-	for step := 0; step < DripstoneMaxStalactiteCheckDepth && curY < MinY+WorldHeight; step++ {
-		cur := c.GetBlock(x, curY, z)
-		if IsPointedDripstoneBlock(cur) && PointedDripstoneDirection(cur) == "down" {
-			length++
+	for step := 1; step < DripstoneMaxStalactiteCheckDepth && curY+1 < c.maxY(); step++ {
+		length++
+		above := c.GetBlock(x, curY+1, z)
+		if IsPointedDripstoneBlock(above) {
+			if PointedDripstoneDirection(above) != "down" {
+				return 0, 0, false
+			}
 			curY++
 			continue
 		}
-		if !isAirState(cur) && isSturdySupportBlock(cur) {
-			return curY, length, true
+		if !isAirState(above) && !isStandaloneFluidState(above) && isSturdySupportBlock(above) {
+			return curY + 1, length, true
 		}
 		return 0, 0, false
 	}
 	return 0, 0, false
 }
 
-// TryDripFromPointedDripstoneAt executes vanilla PointedDripstoneBlock.maybeTransferFluid
-// from a stalactite tip at (x, y, z):
-//   - If the supporting block at `rootY` is `minecraft:clay` and the block at
-//     `rootY+1` holds water (or is `minecraft:mud` with water above), converts
-//     `(x, rootY, z)` from `minecraft:clay` to `minecraft:mud`.
-//   - Otherwise, if `rootY+1` holds water or lava (or `rootY` is `minecraft:mud`
-//     with water above), searches up to 10 blocks below the stalactite tip for a
-//     cauldron (`minecraft:cauldron`, `minecraft:water_cauldron`,
-//     `minecraft:lava_cauldron`) and fills it by one level.
+func (c *Cache) findStalactiteTipFromStart(x, startY, z int, maxSteps int, allowMerged bool) (int, uint16, bool) {
+	st := c.GetBlock(x, startY, z)
+	if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" {
+		return 0, StateAir, false
+	}
+	th := PointedDripstoneThickness(st)
+	if th == "tip" || (allowMerged && th == "tip_merge") {
+		return startY, st, true
+	}
+	for i := 1; i < maxSteps; i++ {
+		cy := startY - i
+		if cy < c.minY() {
+			return 0, StateAir, false
+		}
+		cur := c.GetBlock(x, cy, z)
+		if !IsPointedDripstoneBlock(cur) || PointedDripstoneDirection(cur) != "down" {
+			return 0, StateAir, false
+		}
+		cth := PointedDripstoneThickness(cur)
+		if cth == "tip" || (allowMerged && cth == "tip_merge") {
+			return cy, cur, true
+		}
+	}
+	return 0, StateAir, false
+}
+
+func canCauldronReceiveStalactiteDrip(state uint16, fluid string) bool {
+	info, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	switch info.Name {
+	case "minecraft:cauldron":
+		return fluid == "water" || fluid == "lava"
+	case "minecraft:water_cauldron":
+		return fluid == "water"
+	default:
+		return false
+	}
+}
+
+// MaybeTransferFluidFromStalactiteAt implements vanilla 26.1.2
+// `PointedDripstoneBlock.maybeTransferFluid(state, level, pos, roll)` at `startPos`:
+//   - Requires `IsStalactiteStartPos(x, y, z)` and stalactite length <= 10 (`findRootBlock` / `findTip` with 11).
+//   - Water (`roll < 0.17578125 = 45/256`) or non-ultrawarm `minecraft:mud` directly above the ceiling block:
+//     - If `mud`: immediately converts `(x, rootY+1, z)` to `minecraft:clay` and pushes entities up (`14/16 -> 16/16`).
+//     - Otherwise: finds a fillable `cauldron` / `water_cauldron` within `<= 10` drip-through blocks below `tip`
+//       and schedules a cauldron block tick with delay `50 + (tipY - cauldronY)`.
+//   - Lava (`roll < 0.05859375 = 15/256`): finds an empty `cauldron` within `<= 10` drip-through blocks below `tip`
+//     and schedules a cauldron block tick with delay `50 + (tipY - cauldronY)`.
+func (c *Cache) MaybeTransferFluidFromStalactiteAt(x, y, z int, roll float32, res *BlockUpdateResult) bool {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return false
+	}
+	if roll > float32(DripstoneWaterTransferProbability) && roll > float32(DripstoneLavaTransferProbability) {
+		return false
+	}
+	if !c.IsStalactiteStartPos(x, y, z) {
+		return false
+	}
+	rootY := y + 1
+	if rootY+1 >= c.maxY() {
+		return false
+	}
+	rootState := c.GetBlock(x, rootY, z)
+	if isAirState(rootState) || isStandaloneFluidState(rootState) || !isSturdySupportBlock(rootState) {
+		return false
+	}
+	aboveState := c.GetBlock(x, rootY+1, z)
+
+	var fluid string
+	var threshold float32
+	sourceIsMud := false
+	if isBlockNamed(aboveState, "minecraft:mud") && !c.IsWaterEvaporatingDimension() {
+		fluid = "water"
+		threshold = float32(DripstoneWaterTransferProbability)
+		sourceIsMud = true
+	} else if isWaterSourceOrWaterlogged(aboveState) {
+		fluid = "water"
+		threshold = float32(DripstoneWaterTransferProbability)
+	} else if isLavaSourceBlock(aboveState) {
+		fluid = "lava"
+		threshold = float32(DripstoneLavaTransferProbability)
+	} else {
+		return false
+	}
+	if roll >= threshold {
+		return false
+	}
+
+	tipY, tipState, ok := c.findStalactiteTipFromStart(x, y, z, DripstoneMaxStalactiteCheckDepth, false)
+	if !ok || !CanPointedDripstoneDrip(tipState) || rootY-tipY >= DripstoneMaxStalactiteCheckDepth {
+		return false
+	}
+
+	if sourceIsMud {
+		clayState, ok := nameToStateID("minecraft:clay", nil)
+		if !ok {
+			return false
+		}
+		push := EntityPushUp{
+			Pos:     BlockPos{X: x, Y: rootY + 1, Z: z},
+			OldTopY: 14.0 / 16.0,
+			NewTopY: 1.0,
+		}
+		if res != nil {
+			if c.setBlockRecorded(x, rootY+1, z, clayState, res) {
+				res.EntityPushUps = append(res.EntityPushUps, push)
+				c.runNeighborSupportPass(x, rootY+1, z, res)
+				c.scheduleAround(x, rootY+1, z)
+				return true
+			}
+			return false
+		}
+		_, upd := c.ApplyBlockWithUpdates(x, rootY+1, z, clayState)
+		return len(upd.Changes) > 0
+	}
+
+	for dy := 1; dy <= DripstoneMaxCauldronSearchDepth; dy++ {
+		cy := tipY - dy
+		if cy < c.minY() {
+			return false
+		}
+		target := c.GetBlock(x, cy, z)
+		if canCauldronReceiveStalactiteDrip(target, fluid) {
+			c.ScheduleBlockUpdate(x, cy, z, UpdateRedstone, ScheduleStalactiteDripTicks(tipY, cy))
+			return true
+		}
+		if !CanDripThroughBlock(target) {
+			return false
+		}
+	}
+	return false
+}
+
+// TryDripFromPointedDripstoneAt triggers a guaranteed fluid-transfer check (`roll = 0`)
+// on the stalactite containing `(x, y, z)` (either `startPos` or `tipPos` of a column
+// of length <= 10): dries `mud -> clay` immediately or schedules the `50 + (tipY - cauldronY)`
+// cauldron drip tick.
 func (c *Cache) TryDripFromPointedDripstoneAt(x, y, z int, res *BlockUpdateResult) bool {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return false
 	}
 	st := c.GetBlock(x, y, z)
 	if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" {
 		return false
 	}
-	thick := PointedDripstoneThickness(st)
-	if thick != "tip" || isWaterloggedState(st) {
-		return false
-	}
-	rootY, _, ok := c.TraceStalactiteRoot(x, y, z)
-	if !ok || rootY+1 >= MinY+WorldHeight {
-		return false
-	}
-	rootState := c.GetBlock(x, rootY, z)
-	aboveState := c.GetBlock(x, rootY+1, z)
-
-	hasWaterAbove := hasWaterFluid(aboveState) || isBlockNamed(aboveState, "minecraft:mud")
-	hasLavaAbove := isLavaBlock(aboveState)
-
-	// 1. Clay -> Mud conversion when water (or mud) sits above a clay ceiling block,
-	// and Mud -> Clay drying when mud sits above a non-clay ceiling block (or is the ceiling block).
-	if isBlockNamed(rootState, "minecraft:clay") && hasWaterAbove {
-		if mudState, ok := nameToStateID("minecraft:mud", nil); ok {
-			if res != nil {
-				if c.setBlockRecorded(x, rootY, z, mudState, res) {
-					c.runNeighborSupportPass(x, rootY, z, res)
-					c.scheduleAround(x, rootY, z)
-					return true
-				}
-			} else {
-				_, upd := c.ApplyBlockWithUpdates(x, rootY, z, mudState)
-				return len(upd.Changes) > 0
-			}
-		}
-	}
-	if isBlockNamed(aboveState, "minecraft:mud") {
-		if clayState, ok := nameToStateID("minecraft:clay", nil); ok {
-			if res != nil {
-				if c.setBlockRecorded(x, rootY+1, z, clayState, res) {
-					c.runNeighborSupportPass(x, rootY+1, z, res)
-					c.scheduleAround(x, rootY+1, z)
-					return true
-				}
-			} else {
-				_, upd := c.ApplyBlockWithUpdates(x, rootY+1, z, clayState)
-				return len(upd.Changes) > 0
-			}
-		}
-	} else if isBlockNamed(rootState, "minecraft:mud") && !hasWaterAbove {
-		if clayState, ok := nameToStateID("minecraft:clay", nil); ok {
-			if res != nil {
-				if c.setBlockRecorded(x, rootY, z, clayState, res) {
-					c.runNeighborSupportPass(x, rootY, z, res)
-					c.scheduleAround(x, rootY, z)
-					return true
-				}
-			} else {
-				_, upd := c.ApplyBlockWithUpdates(x, rootY, z, clayState)
-				return len(upd.Changes) > 0
-			}
-		}
-	}
-
-	if !hasWaterAbove && !hasLavaAbove {
-		return false
-	}
-
-	// 2. Search downward up to 10 blocks for a cauldron to fill.
-	for dy := 1; dy <= DripstoneMaxCauldronSearchDepth; dy++ {
-		cy := y - dy
-		if cy < MinY {
+	startY := y
+	for step := 1; step < DripstoneMaxStalactiteCheckDepth && startY+1 < c.maxY(); step++ {
+		above := c.GetBlock(x, startY+1, z)
+		if IsPointedDripstoneBlock(above) && PointedDripstoneDirection(above) == "down" {
+			startY++
+		} else {
 			break
 		}
-		target := c.GetBlock(x, cy, z)
-		if isAirState(target) {
-			continue
-		}
-		info, ok := stateByID(target)
-		if !ok {
-			break
-		}
-		switch info.Name {
-		case "minecraft:cauldron":
-			var next uint16
-			var found bool
-			if hasWaterAbove {
-				next, found = nameToStateID("minecraft:water_cauldron", map[string]string{"level": "1"})
-			} else if hasLavaAbove {
-				next, found = nameToStateID("minecraft:lava_cauldron", nil)
-			}
-			if found {
-				if res != nil {
-					if c.setBlockRecorded(x, cy, z, next, res) {
-						c.propagateRedstoneAround(x, cy, z, target, next, res)
-						c.scheduleAround(x, cy, z)
-						return true
-					}
-				} else {
-					_, upd := c.ApplyBlockWithUpdates(x, cy, z, next)
-					return len(upd.Changes) > 0
-				}
-			}
-			return false
-		case "minecraft:water_cauldron":
-			if !hasWaterAbove {
-				return false
-			}
-			lvl, _ := strconv.Atoi(info.Properties["level"])
-			if lvl < 1 || lvl >= 3 {
-				return false
-			}
-			next, found := nameToStateID("minecraft:water_cauldron", map[string]string{"level": strconv.Itoa(lvl + 1)})
-			if found {
-				if res != nil {
-					if c.setBlockRecorded(x, cy, z, next, res) {
-						c.propagateRedstoneAround(x, cy, z, target, next, res)
-						c.scheduleAround(x, cy, z)
-						return true
-					}
-				} else {
-					_, upd := c.ApplyBlockWithUpdates(x, cy, z, next)
-					return len(upd.Changes) > 0
-				}
-			}
-			return false
-		default:
-			if blocksMotionOrFluid(target) {
-				return false
-			}
-		}
 	}
-	return false
+	return c.MaybeTransferFluidFromStalactiteAt(x, startY, z, 0, res)
 }
 
-// CanGrowPointedDripstoneAt reports whether the stalactite tip at (x, y, z) has
-// a `minecraft:dripstone_block` ceiling within 7 blocks and a water source
-// directly above that `dripstone_block` (vanilla PointedDripstoneBlock.canGrow).
+func (c *Cache) stepCauldronDripUpdate(x, y, z int, res *BlockUpdateResult) {
+	if c == nil || y < c.minY() || y >= c.maxY() {
+		return
+	}
+	state := c.GetBlock(x, y, z)
+	info, ok := stateByID(state)
+	if !ok || (info.Name != "minecraft:cauldron" && info.Name != "minecraft:water_cauldron") {
+		return
+	}
+
+	// AbstractCauldronBlock.tick -> findStalactiteTipAboveCauldron (1..10 blocks above).
+	tipY := 0
+	foundTip := false
+	for dy := 1; dy <= DripstoneMaxCauldronSearchDepth; dy++ {
+		cy := y + dy
+		if cy >= c.maxY() {
+			break
+		}
+		cur := c.GetBlock(x, cy, z)
+		if CanPointedDripstoneDrip(cur) {
+			tipY = cy
+			foundTip = true
+			break
+		}
+		if !CanDripThroughBlock(cur) {
+			break
+		}
+	}
+	if !foundTip {
+		return
+	}
+
+	// getCauldronFillFluidType -> getFluidAboveStalactite (findRootBlock(..., 11) => length <= 10).
+	rootY, length, ok := c.TraceStalactiteRoot(x, tipY, z)
+	if !ok || length >= DripstoneMaxStalactiteCheckDepth || rootY+1 >= c.maxY() {
+		return
+	}
+	aboveState := c.GetBlock(x, rootY+1, z)
+	var fluid string
+	if (isBlockNamed(aboveState, "minecraft:mud") && !c.IsWaterEvaporatingDimension()) || isWaterSourceOrWaterlogged(aboveState) {
+		fluid = "water"
+	} else if isLavaSourceBlock(aboveState) {
+		fluid = "lava"
+	} else {
+		return
+	}
+
+	if !canCauldronReceiveStalactiteDrip(state, fluid) {
+		return
+	}
+
+	var nextState uint16
+	var found bool
+	switch info.Name {
+	case "minecraft:cauldron":
+		if fluid == "water" {
+			nextState, found = nameToStateID("minecraft:water_cauldron", map[string]string{"level": "1"})
+		} else if fluid == "lava" {
+			nextState, found = nameToStateID("minecraft:lava_cauldron", nil)
+		}
+	case "minecraft:water_cauldron":
+		lvl, _ := strconv.Atoi(info.Properties["level"])
+		if lvl < 1 || lvl >= 3 {
+			return
+		}
+		nextState, found = nameToStateID("minecraft:water_cauldron", map[string]string{"level": strconv.Itoa(lvl + 1)})
+	}
+	if found && c.setBlockRecorded(x, y, z, nextState, res) {
+		c.propagateRedstoneAround(x, y, z, state, nextState, res)
+		c.scheduleAround(x, y, z)
+	}
+}
+
+func canPointedDripstoneTipGrow(c *Cache, x, tipY, z int, dir string) bool {
+	nextY := tipY - 1
+	oppDir := "up"
+	if dir == "up" {
+		nextY = tipY + 1
+		oppDir = "down"
+	}
+	if nextY < c.minY() || nextY >= c.maxY() {
+		return false
+	}
+	nextState := c.GetBlock(x, nextY, z)
+	if hasWaterFluid(nextState) || isLavaBlock(nextState) {
+		return false
+	}
+	if isAirState(nextState) {
+		return true
+	}
+	return IsPointedDripstoneBlock(nextState) &&
+		PointedDripstoneDirection(nextState) == oppDir &&
+		PointedDripstoneThickness(nextState) == "tip"
+}
+
+// CanGrowPointedDripstoneAt reports whether the stalactite containing (x, y, z)
+// has a `minecraft:dripstone_block` ceiling, a water source directly above that
+// `dripstone_block`, an unmerged non-waterlogged `tip` within `MAX_GROWTH_LENGTH` (7),
+// and a valid empty-fluid growth cell below the tip (`PointedDripstoneBlock.canGrow` + `canTipGrow`).
 func (c *Cache) CanGrowPointedDripstoneAt(x, y, z int) bool {
-	if c == nil || y < MinY || y >= MinY+WorldHeight {
+	if c == nil || y < c.minY() || y >= c.maxY() {
 		return false
 	}
 	st := c.GetBlock(x, y, z)
-	if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" || PointedDripstoneThickness(st) != "tip" {
+	if !IsPointedDripstoneBlock(st) || PointedDripstoneDirection(st) != "down" {
 		return false
 	}
-	rootY, length, ok := c.TraceStalactiteRoot(x, y, z)
-	if !ok || length > DripstoneMaxGrowthLength || rootY+1 >= MinY+WorldHeight {
+	startY := y
+	for step := 1; step < DripstoneMaxStalactiteCheckDepth && startY+1 < c.maxY(); step++ {
+		above := c.GetBlock(x, startY+1, z)
+		if IsPointedDripstoneBlock(above) && PointedDripstoneDirection(above) == "down" {
+			startY++
+		} else {
+			break
+		}
+	}
+	if startY+2 >= c.maxY() || !c.IsStalactiteStartPos(x, startY, z) {
 		return false
 	}
-	if !isBlockNamed(c.GetBlock(x, rootY, z), "minecraft:dripstone_block") {
+	if !isBlockNamed(c.GetBlock(x, startY+1, z), "minecraft:dripstone_block") {
 		return false
 	}
-	above := c.GetBlock(x, rootY+1, z)
-	return isStandaloneWaterSourceOrBubble(above) || isWaterloggedState(above)
+	if !isWaterSourceOrWaterlogged(c.GetBlock(x, startY+2, z)) {
+		return false
+	}
+	tipY, tipState, ok := c.findStalactiteTipFromStart(x, startY, z, DripstoneMaxGrowthLength, false)
+	if !ok || !CanPointedDripstoneDrip(tipState) {
+		return false
+	}
+	return canPointedDripstoneTipGrow(c, x, tipY, z, "down")
 }
 
 func stateProperty(state uint16, key string) string {
@@ -735,170 +1216,125 @@ func stateProperty(state uint16, key string) string {
 	return info.Properties[key]
 }
 
-// GrowPointedDripstoneAt grows either the downward stalactite at (x, y, z) or
-// the upward stalagmite below it (up to DripstoneMaxGrowthLength = 7 blocks each),
-// merging tips to `tip_merge` when stalactite and stalagmite meet.
+// GrowPointedDripstoneAt grows either the downward stalactite (`preferStalagmite == false`)
+// or the upward stalagmite below it (`preferStalagmite == true`), matching vanilla
+// `PointedDripstoneBlock.growStalactiteOrStalagmiteIfPossible`.
 func (c *Cache) GrowPointedDripstoneAt(x, y, z int, preferStalagmite bool, res *BlockUpdateResult) bool {
 	if !c.CanGrowPointedDripstoneAt(x, y, z) {
 		return false
 	}
-	_, stalactiteLen, _ := c.TraceStalactiteRoot(x, y, z)
-	if preferStalagmite {
-		if c.tryGrowStalagmiteBelow(x, y, z, res) {
-			return true
+	startY := y
+	for step := 1; step < DripstoneMaxStalactiteCheckDepth && startY+1 < c.maxY(); step++ {
+		above := c.GetBlock(x, startY+1, z)
+		if IsPointedDripstoneBlock(above) && PointedDripstoneDirection(above) == "down" {
+			startY++
+		} else {
+			break
 		}
-		if stalactiteLen < DripstoneMaxGrowthLength {
-			return c.tryGrowStalactiteDown(x, y, z, res)
-		}
+	}
+	tipY, _, ok := c.findStalactiteTipFromStart(x, startY, z, DripstoneMaxGrowthLength, false)
+	if !ok {
 		return false
 	}
-	if stalactiteLen < DripstoneMaxGrowthLength && c.tryGrowStalactiteDown(x, y, z, res) {
-		return true
+	// Enforce MAX_GROWTH_LENGTH (7) cap on stalactite downward growth when growing downward.
+	stalactiteLen := startY - tipY + 1
+	if preferStalagmite {
+		return c.tryGrowStalagmiteBelow(x, tipY, z, res)
 	}
-	return c.tryGrowStalagmiteBelow(x, y, z, res)
+	if stalactiteLen >= DripstoneMaxGrowthLength {
+		return false
+	}
+	return c.growPointedDripstoneFromTip(x, tipY, z, "down", res)
 }
 
-func canDripstoneGrowInto(state uint16) bool {
-	return isAirState(state) || state == StateWater || (isBlockNamed(state, "minecraft:water") && stateProperty(state, "level") == "0")
-}
-
-func (c *Cache) tryGrowStalactiteDown(x, tipY, z int, res *BlockUpdateResult) bool {
+func (c *Cache) growPointedDripstoneFromTip(x, tipY, z int, dir string, res *BlockUpdateResult) bool {
 	targetY := tipY - 1
-	if targetY < MinY {
+	oppDir := "up"
+	if dir == "up" {
+		targetY = tipY + 1
+		oppDir = "down"
+	}
+	if targetY < c.minY() || targetY >= c.maxY() {
 		return false
 	}
 	target := c.GetBlock(x, targetY, z)
-	if IsPointedDripstoneBlock(target) && PointedDripstoneDirection(target) == "up" && PointedDripstoneThickness(target) == "tip" {
+	apply := func(fn func(r *BlockUpdateResult) bool) bool {
 		if res != nil {
-			c.RecalculatePointedDripstoneColumnAround(x, tipY, z, res)
-		} else {
-			var local BlockUpdateResult
-			c.RecalculatePointedDripstoneColumnAround(x, tipY, z, &local)
+			return fn(res)
 		}
-		c.scheduleAround(x, tipY, z)
-		return true
+		var local BlockUpdateResult
+		return fn(&local)
 	}
-	if !canDripstoneGrowInto(target) {
+	if IsPointedDripstoneBlock(target) && PointedDripstoneDirection(target) == oppDir && PointedDripstoneThickness(target) == "tip" {
+		return apply(func(r *BlockUpdateResult) bool {
+			upperY, lowerY := tipY, targetY
+			if dir == "up" {
+				upperY, lowerY = targetY, tipY
+			}
+			uState := MakePointedDripstoneState("down", "tip_merge", isWaterloggedState(c.GetBlock(x, upperY, z)))
+			lState := MakePointedDripstoneState("up", "tip_merge", isWaterloggedState(c.GetBlock(x, lowerY, z)))
+			c1 := c.setBlockRecorded(x, upperY, z, uState, r)
+			c2 := c.setBlockRecorded(x, lowerY, z, lState, r)
+			c.RecalculatePointedDripstoneColumnAround(x, upperY, z, r)
+			c.scheduleAround(x, upperY, z)
+			c.scheduleAround(x, lowerY, z)
+			return c1 || c2
+		})
+	}
+	if !isAirState(target) && !(isBlockNamed(target, "minecraft:water") && isWaterSourceOrWaterlogged(target)) {
 		return false
 	}
 	waterlogged := hasWaterFluid(target)
-	newState := MakePointedDripstoneState("down", "tip", waterlogged)
-	if res != nil {
-		if !c.setBlockRecorded(x, targetY, z, newState, res) {
+	thick := c.CalculatePointedDripstoneThicknessWithMergeAt(x, targetY, z, dir, true)
+	newState := MakePointedDripstoneState(dir, thick, waterlogged)
+	return apply(func(r *BlockUpdateResult) bool {
+		if !c.setBlockRecorded(x, targetY, z, newState, r) {
 			return false
 		}
-		c.RecalculatePointedDripstoneColumnAround(x, targetY, z, res)
+		c.RecalculatePointedDripstoneColumnAround(x, targetY, z, r)
 		c.scheduleAround(x, targetY, z)
 		return true
-	}
-	var local BlockUpdateResult
-	if !c.setBlockRecorded(x, targetY, z, newState, &local) {
-		return false
-	}
-	c.RecalculatePointedDripstoneColumnAround(x, targetY, z, &local)
-	c.scheduleAround(x, targetY, z)
-	return true
+	})
 }
 
 func (c *Cache) tryGrowStalagmiteBelow(x, stalactiteTipY, z int, res *BlockUpdateResult) bool {
-	for dy := 1; dy <= DripstoneMaxCauldronSearchDepth; dy++ {
-		cy := stalactiteTipY - dy
-		if cy < MinY {
+	for i := 0; i < DripstoneMaxStalagmiteSearchRangeWhenGrowing; i++ {
+		cy := stalactiteTipY - 1 - i
+		if cy < c.minY() {
 			return false
 		}
 		cur := c.GetBlock(x, cy, z)
-		if canDripstoneGrowInto(cur) {
-			continue
+		// Vanilla growStalagmiteBelow: abort immediately if any fluid is encountered.
+		if hasWaterFluid(cur) || isLavaBlock(cur) {
+			return false
 		}
-		// Case 1: Hit an existing upward stalagmite tip.
-		if IsPointedDripstoneBlock(cur) && PointedDripstoneDirection(cur) == "up" {
-			if PointedDripstoneThickness(cur) != "tip" {
-				return false
+		if IsPointedDripstoneBlock(cur) && PointedDripstoneDirection(cur) == "up" && PointedDripstoneThickness(cur) == "tip" {
+			if canPointedDripstoneTipGrow(c, x, cy, z, "up") {
+				return c.growPointedDripstoneFromTip(x, cy, z, "up", res)
 			}
-			// Check stalagmite column length (< 7).
-			stalagLen := 0
-			for sy := cy; sy >= MinY; sy-- {
-				s := c.GetBlock(x, sy, z)
-				if IsPointedDripstoneBlock(s) && PointedDripstoneDirection(s) == "up" {
-					stalagLen++
-				} else {
-					break
-				}
-			}
-			if stalagLen >= DripstoneMaxGrowthLength {
-				return false
-			}
-			growY := cy + 1
-			if growY == stalactiteTipY {
-				if res != nil {
-					c.RecalculatePointedDripstoneColumnAround(x, cy, z, res)
-				} else {
-					var local BlockUpdateResult
-					c.RecalculatePointedDripstoneColumnAround(x, cy, z, &local)
-				}
-				c.scheduleAround(x, cy, z)
-				return true
-			}
-			if growY >= MinY+WorldHeight || !canDripstoneGrowInto(c.GetBlock(x, growY, z)) {
-				return false
-			}
-			waterlogged := hasWaterFluid(c.GetBlock(x, growY, z))
-			newState := MakePointedDripstoneState("up", "tip", waterlogged)
-			if res != nil {
-				if !c.setBlockRecorded(x, growY, z, newState, res) {
-					return false
-				}
-				c.RecalculatePointedDripstoneColumnAround(x, growY, z, res)
-				c.scheduleAround(x, growY, z)
-				return true
-			}
-			var local BlockUpdateResult
-			if !c.setBlockRecorded(x, growY, z, newState, &local) {
-				return false
-			}
-			c.RecalculatePointedDripstoneColumnAround(x, growY, z, &local)
-			c.scheduleAround(x, growY, z)
-			return true
 		}
-		// Case 2: Hit a sturdy floor block with a growable cell directly above it.
-		if isSturdySupportBlock(cur) && cy+1 <= stalactiteTipY-1 {
-			growY := cy + 1
-			if !canDripstoneGrowInto(c.GetBlock(x, growY, z)) {
-				return false
-			}
-			waterlogged := hasWaterFluid(c.GetBlock(x, growY, z))
-			newState := MakePointedDripstoneState("up", "tip", waterlogged)
-			if res != nil {
-				if !c.setBlockRecorded(x, growY, z, newState, res) {
-					return false
-				}
-				c.RecalculatePointedDripstoneColumnAround(x, growY, z, res)
-				c.scheduleAround(x, growY, z)
-				return true
-			}
-			var local BlockUpdateResult
-			if !c.setBlockRecorded(x, growY, z, newState, &local) {
-				return false
-			}
-			c.RecalculatePointedDripstoneColumnAround(x, growY, z, &local)
-			c.scheduleAround(x, growY, z)
-			return true
+		if cy > c.minY() && c.CanPointedDripstoneSurviveAt(x, cy, z, "up") && !hasWaterFluid(c.GetBlock(x, cy-1, z)) {
+			return c.growPointedDripstoneFromTip(x, cy-1, z, "up", res)
 		}
-		return false
+		if !CanDripThroughBlock(cur) {
+			return false
+		}
 	}
 	return false
 }
 
 func (c *Cache) randomTickPointedDripstone(x, y, z int, state uint16, rng *rand.Rand, res *BlockUpdateResult) {
-	if !IsPointedDripstoneBlock(state) || PointedDripstoneDirection(state) != "down" || PointedDripstoneThickness(state) != "tip" {
+	if !IsPointedDripstoneBlock(state) {
 		return
 	}
-	if rng.Float64() < DripstoneWaterTransferProbability {
-		c.TryDripFromPointedDripstoneAt(x, y, z, res)
-	}
-	if rng.Float64() < DripstoneGrowthProbability {
-		preferStalagmite := rng.Intn(2) == 1
-		c.GrowPointedDripstoneAt(x, y, z, preferStalagmite, res)
+	f := rng.Float32()
+	c.MaybeTransferFluidFromStalactiteAt(x, y, z, f, res)
+	if rng.Float32() < float32(DripstoneGrowthProbability) && c.IsStalactiteStartPos(x, y, z) {
+		if !c.CanGrowPointedDripstoneAt(x, y, z) {
+			return
+		}
+		growDown := rng.Intn(2) == 0
+		c.GrowPointedDripstoneAt(x, y, z, !growDown, res)
 	}
 }
 

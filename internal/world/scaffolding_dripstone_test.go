@@ -141,11 +141,16 @@ func TestPointedDripstoneThicknessMergeFallingAndDamage(t *testing.T) {
 		t.Fatalf("after breaking y=70, y=71 thickness = %q, want \"tip\"", got)
 	}
 
-	// 4. Break ceiling stone at y=75 -> entire 4-block stalactite detaches, falls, and records landings.
-	_, res := c.BreakBlockWithUpdates(x, 75, z)
+	// 4. Break ceiling stone at y=75 -> schedules 2-tick collapse (DELAY_BEFORE_FALLING=2);
+	// on tick 2 the entire 4-block stalactite detaches, falls, and records landings.
+	_, breakRes := c.BreakBlockWithUpdates(x, 75, z)
+	if len(breakRes.Landings) != 0 {
+		t.Fatalf("expected 0 landings at tick 0 before 2-tick fall delay, got %d", len(breakRes.Landings))
+	}
+	res := c.StepBlockUpdates(2)
 	for py := 71; py <= 74; py++ {
 		if got := c.GetBlock(x, py, z); got != StateAir {
-			t.Fatalf("stalactite at y=%d remained %s after ceiling broken", py, stateLabel(got))
+			t.Fatalf("stalactite at y=%d remained %s after ceiling broken + 2 ticks", py, stateLabel(got))
 		}
 	}
 	if len(res.Landings) != 4 {
@@ -163,31 +168,34 @@ func TestPointedDripstoneClayToMudCauldronAndGrowth(t *testing.T) {
 	c := NewCache(-1, GenerateFlat)
 	x, z := 48, 48
 
-	// 1. Clay -> Mud conversion when water sits above clay with a stalactite tip below.
-	clayID, _ := nameToStateID("minecraft:clay", nil)
-	c.SetBlock(x, 72, z, StateWater)
-	c.SetBlock(x, 71, z, clayID)
+	// 1. Mud -> Clay drying when mud (with water above) sits on top of a ceiling block with a stalactite below.
+	mudID, _ := nameToStateID("minecraft:mud", nil)
+	dripBlockID, _ := nameToStateID("minecraft:dripstone_block", nil)
+	c.SetBlock(x, 73, z, StateWater)
+	c.SetBlock(x, 72, z, mudID)
+	c.SetBlock(x, 71, z, dripBlockID)
 	c.SetBlock(x, 70, z, MakePointedDripstoneState("down", "tip", false))
 
 	var dripRes BlockUpdateResult
 	if !c.TryDripFromPointedDripstoneAt(x, 70, z, &dripRes) {
-		t.Fatalf("expected TryDripFromPointedDripstoneAt to convert clay to mud")
+		t.Fatalf("expected TryDripFromPointedDripstoneAt to dry mud into clay")
 	}
-	if got := stateLabel(c.GetBlock(x, 71, z)); got != "minecraft:mud" {
-		t.Fatalf("ceiling block after drip = %s, want minecraft:mud", got)
+	if got := stateLabel(c.GetBlock(x, 72, z)); got != "minecraft:clay" {
+		t.Fatalf("block above ceiling after drip = %s, want minecraft:clay", got)
 	}
 
-	// 2. Cauldron filling below stalactite tip.
-	dripBlockID, _ := nameToStateID("minecraft:dripstone_block", nil)
+	// 2. Cauldron filling below stalactite tip (scheduled delay = 50 + (70 - 65) = 55 ticks).
 	cauldronID, _ := nameToStateID("minecraft:cauldron", nil)
+	c.SetBlock(x, 72, z, StateWater)
 	c.SetBlock(x, 71, z, dripBlockID)
 	c.SetBlock(x, 65, z, cauldronID)
 
 	if !c.TryDripFromPointedDripstoneAt(x, 70, z, &dripRes) {
-		t.Fatalf("expected TryDripFromPointedDripstoneAt to fill cauldron below")
+		t.Fatalf("expected TryDripFromPointedDripstoneAt to schedule cauldron drip")
 	}
+	c.StepBlockUpdates(55)
 	if got := stateLabel(c.GetBlock(x, 65, z)); got != "minecraft:water_cauldron" {
-		t.Fatalf("cauldron after water drip = %s, want minecraft:water_cauldron", got)
+		t.Fatalf("cauldron after 55-tick water drip = %s, want minecraft:water_cauldron", got)
 	}
 
 	// 3. Stalactite and stalagmite growth under dripstone_block + water source.

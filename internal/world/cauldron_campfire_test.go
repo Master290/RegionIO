@@ -94,10 +94,14 @@ func TestWorldCauldronBlockStatesComparatorPrecipitationAndDrops(t *testing.T) {
 	c.SetBlock(20, y+4, 20, StateLava)
 	var dripRes BlockUpdateResult
 	if !c.TryDripFromPointedDripstoneAt(20, y+2, 20, &dripRes) {
-		t.Fatal("expected pointed_dripstone with lava above to fill cauldron")
+		t.Fatal("expected pointed_dripstone with lava above to schedule cauldron drip")
 	}
+	if gotSig := c.ComparatorOutputSignalAt(21, y, 20); gotSig != 0 {
+		t.Fatalf("before 52-tick scheduled drip: ComparatorOutputSignalAt = %d, want 0", gotSig)
+	}
+	c.StepBlockUpdates(ScheduleStalactiteDripTicks(y+2, y))
 	if gotSig := c.ComparatorOutputSignalAt(21, y, 20); gotSig != 3 {
-		t.Fatalf("after lava dripstone fill: ComparatorOutputSignalAt = %d, want 3", gotSig)
+		t.Fatalf("after 52-tick lava dripstone fill: ComparatorOutputSignalAt = %d, want 3", gotSig)
 	}
 
 	// 4. Block break drops: all 4 cauldron variants drop 1x minecraft:cauldron with pickaxe, nil with bare hand.

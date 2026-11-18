@@ -259,11 +259,12 @@ func TestFarmlandHydrationDryingTramplingAndTilling(t *testing.T) {
 		t.Fatalf("expected crop above trampled farmland to break")
 	}
 
-	// 5. Placing a solid block on top of farmland turns the farmland into dirt.
+	// 5. Placing a solid block on top of farmland schedules 1-tick FarmlandBlock.tick -> dirt.
 	c.TillSoilAt(7, FlatSurfaceY, 7)
 	c.ApplyBlockWithUpdates(7, FlatSurfaceY+1, 7, StateStone)
+	c.StepBlockUpdates(1)
 	if c.GetBlock(7, FlatSurfaceY, 7) != StateDirt {
-		t.Fatalf("expected farmland under placed stone to become dirt")
+		t.Fatalf("expected farmland under placed stone to become dirt after 1 tick")
 	}
 }
 
@@ -542,28 +543,33 @@ func TestTorchflowerAndPitcherCropGrowthBonemealSurvivalAndDrops(t *testing.T) {
 		t.Fatalf("pitcher_crop at age=1 unexpected state: %+v, upper=%d", pInfo1, c.GetBlock(6, FlatSurfaceY+2, 6))
 	}
 
-	// Advance pitcher_crop to age=2 -> becomes double-height (lower + upper)!
+	// Advance pitcher_crop to age=2 -> still single-block lower half (DOUBLE_PLANT_AGE_INTERSECTION = 3)!
 	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+1, 6, rng); !ok {
 		t.Fatalf("expected ApplyBoneMeal on pitcher_crop[age=1] to succeed")
 	}
 	pLower2, _ := stateByID(c.GetBlock(6, FlatSurfaceY+1, 6))
-	pUpper2, _ := stateByID(c.GetBlock(6, FlatSurfaceY+2, 6))
-	if pLower2.Properties["age"] != "2" || pLower2.Properties["half"] != "lower" ||
-		pUpper2.Name != "minecraft:pitcher_crop" || pUpper2.Properties["age"] != "2" || pUpper2.Properties["half"] != "upper" {
-		t.Fatalf("pitcher_crop at age=2 expected lower+upper age=2, got lower=%+v upper=%+v", pLower2, pUpper2)
+	if pLower2.Properties["age"] != "2" || pLower2.Properties["half"] != "lower" || !isAirState(c.GetBlock(6, FlatSurfaceY+2, 6)) {
+		t.Fatalf("pitcher_crop at age=2 expected single-block lower age=2, got lower=%+v upper=%d", pLower2, c.GetBlock(6, FlatSurfaceY+2, 6))
 	}
-	// Unripe pitcher_crop drops pitcher_pod from lower half and nil from upper half.
 	if drops := CropDropsForBlock(c.GetBlock(6, FlatSurfaceY+1, 6), 0, rng); len(drops) != 1 || drops[0].ResolvedID() != "minecraft:pitcher_pod" {
 		t.Fatalf("pitcher_crop[age=2,half=lower] drops = %+v, want 1x pitcher_pod", drops)
 	}
+
+	// Advance pitcher_crop to age=3 -> becomes double-height (lower + upper)!
+	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+1, 6, rng); !ok {
+		t.Fatalf("expected ApplyBoneMeal on pitcher_crop[age=2] to succeed")
+	}
+	pLower3, _ := stateByID(c.GetBlock(6, FlatSurfaceY+1, 6))
+	pUpper3, _ := stateByID(c.GetBlock(6, FlatSurfaceY+2, 6))
+	if pLower3.Properties["age"] != "3" || pLower3.Properties["half"] != "lower" ||
+		pUpper3.Name != "minecraft:pitcher_crop" || pUpper3.Properties["age"] != "3" || pUpper3.Properties["half"] != "upper" {
+		t.Fatalf("pitcher_crop at age=3 expected lower+upper age=3, got lower=%+v upper=%+v", pLower3, pUpper3)
+	}
 	if drops := CropDropsForBlock(c.GetBlock(6, FlatSurfaceY+2, 6), 0, rng); len(drops) != 0 {
-		t.Fatalf("pitcher_crop[age=2,half=upper] drops = %+v, want nil", drops)
+		t.Fatalf("pitcher_crop[age=3,half=upper] drops = %+v, want nil", drops)
 	}
 
-	// Bone meal clicking the UPPER half at (6, FlatSurfaceY+2, 6) advances both halves to age=3 and then age=4!
-	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+2, 6, rng); !ok {
-		t.Fatalf("expected ApplyBoneMeal on upper half of pitcher_crop[age=2] to succeed")
-	}
+	// Bone meal clicking the UPPER half at (6, FlatSurfaceY+2, 6) advances both halves to age=4!
 	if ok, _ := c.ApplyBoneMeal(6, FlatSurfaceY+2, 6, rng); !ok {
 		t.Fatalf("expected ApplyBoneMeal on upper half of pitcher_crop[age=3] to succeed")
 	}
