@@ -277,10 +277,13 @@ func TestIronGolemPatternVillagerSpawnAndCombat(t *testing.T) {
 		t.Fatalf("expected iron_ingot to heal Iron Golem from 60 to 85 HP, got %.1f", s.MobHealth(golemID))
 	}
 
-	// 4. Villager panic spawns a village Iron Golem when 3 villagers are near a zombie.
-	_, _ = s.SpawnVillager(40.5, 65, 40.5, VillagerProfessionFarmer, 1)
-	_, _ = s.SpawnVillager(41.5, 65, 40.5, VillagerProfessionLibrarian, 1)
-	_, _ = s.SpawnVillager(42.5, 65, 40.5, VillagerProfessionCleric, 1)
+	// 4. Villager panic spawns a village Iron Golem when 3 villagers (who have slept within 24000 ticks) are near a zombie.
+	pv1, _ := s.SpawnVillager(40.5, 65, 40.5, VillagerProfessionFarmer, 1)
+	pv2, _ := s.SpawnVillager(41.5, 65, 40.5, VillagerProfessionLibrarian, 1)
+	pv3, _ := s.SpawnVillager(42.5, 65, 40.5, VillagerProfessionCleric, 1)
+	s.RecordVillagerSlept(pv1, 0)
+	s.RecordVillagerSlept(pv2, 0)
+	s.RecordVillagerSlept(pv3, 0)
 	_, _ = s.SpawnMob(43.5, 65, 40.5, MobTypeZombie)
 
 	villageGolemID, vSpawned := s.TickVillagerGolemSpawning(rng)

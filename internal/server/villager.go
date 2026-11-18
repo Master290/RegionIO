@@ -277,15 +277,17 @@ func DecodeVillagerEntityDataPacket(r *protocol.Reader) (entityID, villagerTypeI
 // VillagerState holds the authoritative server-side profession, badge level,
 // experience, trade offers, and daily restock state for a villager entity.
 type VillagerState struct {
-	EntityID            int32
-	VillagerType        string
-	Profession          string
-	Level               int
-	XP                  int32
-	Offers              []MerchantOffer
-	LastRestockGameTime int64
-	LastRestockDay      int64
-	RestocksToday       int
+	EntityID                        int32
+	VillagerType                    string
+	Profession                      string
+	Level                           int
+	XP                              int32
+	Offers                          []MerchantOffer
+	LastRestockGameTime             int64
+	LastRestockDay                  int64
+	RestocksToday                   int
+	UpdateMerchantTimer             int
+	IncreaseProfessionLevelOnUpdate bool
 }
 
 // Clone returns a deep copy of VillagerState (including its Offers slice).
@@ -571,6 +573,7 @@ func (s *Server) AddVillagerXP(entityID int32, xp int32) (newLevel int, leveledU
 	vtr.mu.Unlock()
 
 	if leveledUp {
+		s.ApplyEntityEffectScaled(entityID, NewStatusEffectInstance(EffectRegeneration, VillagerLevelUpRegenTicks, 0), 1.0)
 		if ent := s.entities.Get(entityID); ent != nil {
 			cp := ent.ChunkPos()
 			s.BroadcastChunk(cp.X, cp.Z, PlaySetEntityDataCB,
@@ -659,10 +662,57 @@ func (s *Server) syncMerchantOffersToViewers(entityID int32, offers []MerchantOf
 	}
 }
 
-// TickVillagers checks villager workstation POI validation/acquisition, daily
-// gossip decay, work-hour restocking (2000..9000 time of day, up to 2 restocks
-// per day when offers have been used), zombie villager conversions, and cleans
-// up state for removed villager entities.
+func (s *Server) stepVillagerPendingLevelUp(entityID int32) {
+	if s == nil || entityID <= 0 || s.IsVillagerTrading(entityID) {
+		return
+	}
+	vtr := s.villagerTracker()
+	vtr.mu.Lock()
+	vs := vtr.villagers[entityID]
+	if vs == nil || vs.UpdateMerchantTimer <= 0 {
+		vtr.mu.Unlock()
+		return
+	}
+	vs.UpdateMerchantTimer--
+	if vs.UpdateMerchantTimer > 0 {
+		vtr.mu.Unlock()
+		return
+	}
+	leveledUp := false
+	if vs.IncreaseProfessionLevelOnUpdate {
+		vs.IncreaseProfessionLevelOnUpdate = false
+		for CanVillagerLevelUp(vs.Level, vs.XP) {
+			vs.Level++
+			leveledUp = true
+			vs.Offers = append(vs.Offers, DefaultTradeBook().RollOffers(vs.Profession, vs.Level, vtr.rng)...)
+		}
+	}
+	newLevel := vs.Level
+	vType := vs.VillagerType
+	vProf := vs.Profession
+	vXP := vs.XP
+	offers := make([]MerchantOffer, len(vs.Offers))
+	copy(offers, vs.Offers)
+	vtr.mu.Unlock()
+
+	if leveledUp {
+		s.ApplyEntityEffectScaled(entityID, NewStatusEffectInstance(EffectRegeneration, VillagerLevelUpRegenTicks, 0), 1.0)
+		if ent := s.entities.Get(entityID); ent != nil {
+			cp := ent.ChunkPos()
+			s.BroadcastChunk(cp.X, cp.Z, PlaySetEntityDataCB,
+				EncodeVillagerEntityDataPacket(entityID, VillagerTypeID(vType), VillagerProfessionID(vProf), int32(newLevel)))
+			s.BroadcastChunk(cp.X, cp.Z, protocol.PlayEntityEvent,
+				EncodeEntityEventPacket(entityID, EntityEventVillagerHappy))
+		}
+		s.syncMerchantOffersToViewers(entityID, offers, int32(newLevel), vXP)
+	}
+}
+
+// TickVillagers checks villager workstation POI validation/acquisition, per-villager
+// 24000-tick gossip decay, delayed level-up timer, autonomous farmer tasks,
+// work-hour restocking (2000..8999 time of day, up to 2 restocks per day with
+// catchUpDemand on new day), zombie villager conversions, and cleans up state
+// for removed villager entities.
 func (s *Server) TickVillagers() {
 	if s == nil || s.entities == nil {
 		return
@@ -672,7 +722,7 @@ func (s *Server) TickVillagers() {
 	gameTime, dayTime := s.WorldTime()
 	tod := s.TimeOfDay()
 	curDay := dayTime / TicksPerDay
-	inWorkHours := tod >= VillagerWorkStartTicks && tod <= VillagerWorkEndTicks
+	inWorkHours := tod >= VillagerWorkStartTicks && tod < VillagerWorkEndTicks
 
 	vtr := s.villagerTracker()
 	vtr.mu.Lock()
@@ -692,7 +742,6 @@ func (s *Server) TickVillagers() {
 	}
 
 	var toRestock []int32
-	var toDecay []int32
 	var removed []int32
 
 	for _, entityID := range ids {
@@ -704,10 +753,17 @@ func (s *Server) TickVillagers() {
 		if canonicalResourceName(ent.TypeName) == MobTypeWanderingTrader {
 			continue
 		}
-		s.stepVillagerPolishTick(entityID, dayTime, gameTime)
+		s.stepVillagerPendingLevelUp(entityID)
+		s.maybeDecayVillagerGossip2612(entityID, gameTime)
+		s.stepVillagerPolishTick(entityID, tod, gameTime)
+		s.stepVillagerItemPickupAndFarming(entityID, tod)
 		if _, hadSite := s.VillagerJobSite(entityID); hadSite {
 			s.ValidateVillagerWorkstation(entityID)
 		}
+		var syncOffers []MerchantOffer
+		var syncLevel, syncXP int32
+		didCatchUp := false
+
 		vtr.mu.Lock()
 		vs := vtr.villagers[entityID]
 		if vs == nil {
@@ -715,26 +771,44 @@ func (s *Server) TickVillagers() {
 			continue
 		}
 		prof := canonicalResourceName(vs.Profession)
-		if vs.LastRestockDay != curDay {
-			if vs.LastRestockDay >= 0 {
-				toDecay = append(toDecay, entityID)
-			}
-			vs.LastRestockDay = curDay
-			vs.RestocksToday = 0
-		}
 		vtr.mu.Unlock()
 
 		if prof == VillagerProfessionNone || s.IsVillagerJobSiteLost(entityID) {
 			s.TryAcquireVillagerWorkstation(entityID)
 		}
-		if s.IsVillagerJobSiteLost(entityID) {
+		if s.IsVillagerJobSiteLost(entityID) || !inWorkHours || !CanProfessionTrade(prof) {
 			continue
 		}
 
+		// `WorkAtPoi -> Villager.shouldRestock`: only runs during work hours when `JOB_SITE` is valid.
 		vtr.mu.Lock()
 		vs = vtr.villagers[entityID]
-		if vs != nil && inWorkHours && vs.RestocksToday < MaxVillagerRestocksPerDay &&
-			(vs.LastRestockGameTime <= 0 || gameTime-vs.LastRestockGameTime >= MinRestockIntervalTicks) {
+		if vs != nil && vs.LastRestockDay != curDay {
+			if vs.LastRestockDay >= 0 && curDay > vs.LastRestockDay {
+				missing := MaxVillagerRestocksPerDay - vs.RestocksToday
+				if missing > 0 {
+					for i := range vs.Offers {
+						vs.Offers[i].ResetUses()
+					}
+					for m := 0; m < missing; m++ {
+						for i := range vs.Offers {
+							vs.Offers[i].UpdateDemand()
+						}
+					}
+					syncOffers = make([]MerchantOffer, len(vs.Offers))
+					copy(syncOffers, vs.Offers)
+					syncLevel = int32(vs.Level)
+					syncXP = vs.XP
+					didCatchUp = true
+				}
+			}
+			vs.LastRestockDay = curDay
+			vs.RestocksToday = 0
+		}
+		allowedToRestock := vs != nil &&
+			(vs.RestocksToday == 0 ||
+				(vs.RestocksToday < MaxVillagerRestocksPerDay && gameTime > vs.LastRestockGameTime+MinRestockIntervalTicks))
+		if allowedToRestock {
 			for i := range vs.Offers {
 				if vs.Offers[i].Uses > 0 {
 					toRestock = append(toRestock, entityID)
@@ -743,25 +817,17 @@ func (s *Server) TickVillagers() {
 			}
 		}
 		vtr.mu.Unlock()
-	}
 
-	if len(removed) > 0 {
-		vtr.mu.Lock()
-		for _, id := range removed {
-			delete(vtr.villagers, id)
+		if didCatchUp {
+			s.syncMerchantOffersToViewers(entityID, syncOffers, syncLevel, syncXP)
 		}
-		vtr.mu.Unlock()
 	}
 
-	for _, id := range toDecay {
-		s.DecayVillagerGossips(id)
-	}
 	for _, id := range toRestock {
 		s.RestockVillager(id)
 	}
 	for _, id := range removed {
-		s.ReleaseVillagerWorkstation(id)
-		s.closeMerchantScreensForVillager(id)
+		s.ReleaseAllVillagerPOIs(id)
 	}
 }
 
@@ -806,9 +872,12 @@ func (s *Server) InteractWithVillager(session *PlayerSession, entityID int32) (o
 		return false, 0, nil
 	}
 
+	if s.IsVillagerSleeping(entityID) || s.IsVillagerTrading(entityID) {
+		return false, 0, nil
+	}
 	vs := s.ensureVillagerState(entityID)
 	cp := ent.ChunkPos()
-	if vs == nil || !CanProfessionTrade(vs.Profession) || len(vs.Offers) == 0 {
+	if s.IsMobBaby(entityID) || vs == nil || !CanProfessionTrade(vs.Profession) || len(vs.Offers) == 0 {
 		s.BroadcastChunk(cp.X, cp.Z, PlaySoundPacketID,
 			EncodeSoundPacket("minecraft:entity.villager.no", SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 		return false, 0, nil

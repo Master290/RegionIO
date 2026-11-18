@@ -975,6 +975,17 @@ func IsMobFireImmune2612(mobType string, hasFireResistance bool) bool {
 //     resets to `0` and deals `2.0` drowning damage.
 func StepMobAirSupplyAndDrowning2612(mobType string, currentAir int, inWater, hasWaterBreathing bool) (nextAir int, drownDamage float32) {
 	norm := canonicalResourceName(mobType)
+	// `IronGolem.decreaseAirSupply(int air)` in `26.1.2.jar` returns `air` unchanged underwater.
+	if norm == MobTypeIronGolem {
+		if inWater {
+			return currentAir, 0
+		}
+		nextAir = currentAir + 4
+		if nextAir > DefaultMobMaxAirTicks {
+			nextAir = DefaultMobMaxAirTicks
+		}
+		return nextAir, 0
+	}
 	maxAir := DefaultMobMaxAirTicks
 	if norm == MobTypeDolphin {
 		maxAir = DolphinMaxAirTicks

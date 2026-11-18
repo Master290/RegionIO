@@ -21,18 +21,18 @@ func TestVillagerScheduleBedAndBellResonance(t *testing.T) {
 	if got := VillagerScheduleActivity(VillagerProfessionLibrarian, false, 13000); got != VillagerActivityRest {
 		t.Fatalf("expected librarian at 13000 to be in rest activity, got %q", got)
 	}
-	// Nitwit stays awake until 14000 and sleeps until 2000, never works.
+	// In 26.1.2 (`villager_schedule.json`), Nitwit uses `VILLAGER_ACTIVITY` (`idle` 10..11999, `rest` 12000..23999 & 0..9).
 	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 3000); got != VillagerActivityIdle {
 		t.Fatalf("expected nitwit at 3000 to be idle, got %q", got)
 	}
-	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 13000); got != VillagerActivityIdle {
-		t.Fatalf("expected nitwit at 13000 to still be idle, got %q", got)
+	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 1000); got != VillagerActivityIdle {
+		t.Fatalf("expected nitwit at 1000 to be idle, got %q", got)
 	}
-	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 15000); got != VillagerActivityRest {
-		t.Fatalf("expected nitwit at 15000 to be resting, got %q", got)
+	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 13000); got != VillagerActivityRest {
+		t.Fatalf("expected nitwit at 13000 to be resting, got %q", got)
 	}
-	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 1000); got != VillagerActivityRest {
-		t.Fatalf("expected nitwit at 1000 to still be resting, got %q", got)
+	if got := VillagerScheduleActivity(VillagerProfessionNitwit, false, 5); got != VillagerActivityRest {
+		t.Fatalf("expected nitwit at 5 (before keyframe 10) to still be resting, got %q", got)
 	}
 
 	// 2. Bed claiming & sleeping at night, plus dawn wake-up heal (+2 HP).
@@ -130,7 +130,13 @@ func TestVillagerBreedingGiftsAndLightningWitch(t *testing.T) {
 		t.Fatalf("expected 12/12 food points after sharing, got %d/%d", s.VillagerFoodPoints(vA), s.VillagerFoodPoints(vB))
 	}
 
-	// Breed vA and vB -> spawns baby villager with 0 food remaining on parents.
+	// Place a vacant reachable bed (`VillagerMakeLove` requires an unclaimed bed for the newborn) and breed vA + vB.
+	breedBed, _ := world.BlockStateByName("minecraft:red_bed", map[string]string{
+		"facing":   "north",
+		"occupied": "false",
+		"part":     "foot",
+	})
+	s.chunks.SetBlock(6, 65, 6, breedBed)
 	childID, bred := s.TryBreedVillagers(vA, vB, rng)
 	if !bred || childID <= 0 {
 		t.Fatalf("expected TryBreedVillagers to spawn baby villager: bred=%v childID=%d", bred, childID)
@@ -267,14 +273,18 @@ func TestIronGolemCrackStagesReputationAndPlayerCreatedRules(t *testing.T) {
 		t.Fatalf("expected OnIronGolemDamaged(80 -> 65) to report crack stage increase")
 	}
 
-	// Give player reputation <= -15 (-20 via minor_negative 20) on nearby villager.
+	// Give player reputation <= -100 (`DefendVillageTargetGoal` in 26.1.2: -20 does NOT aggro, -120 DOES aggro).
 	s.SetPlayerTransform(player, 11.5, 65.0, 11.5, 0, 0, true)
 	s.AddVillagerGossip(villagerID, player.Profile.UUID, GossipMinorNegative, 20)
+	if s.ShouldIronGolemAttackPlayer(villageGolemID, player) {
+		t.Fatalf("expected village-spawned Iron Golem NOT to attack player with reputation -20 (threshold <= -100)")
+	}
+	s.AddVillagerGossip(villagerID, player.Profile.UUID, GossipMajorNegative, 20)
 	if !s.ShouldIronGolemAttackPlayer(villageGolemID, player) {
-		t.Fatalf("expected village-spawned Iron Golem to attack player with reputation <= -15")
+		t.Fatalf("expected village-spawned Iron Golem to attack player with reputation <= -100")
 	}
 	if s.ShouldIronGolemAttackPlayer(playerGolemID, player) {
-		t.Fatalf("expected player-created Iron Golem to NEVER attack player even with reputation <= -15")
+		t.Fatalf("expected player-created Iron Golem to NEVER attack player even with reputation <= -100")
 	}
 
 	// Poppy offering lifecycle.

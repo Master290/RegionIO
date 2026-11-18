@@ -808,10 +808,10 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 		return 0, errors.New("server: villager has no trades")
 	}
 
+	_ = s.CloseMerchantContainer(session, 0, false)
 	if !isWanderingTrader {
 		s.UpdateVillagerSpecialPricesForPlayer(session, entityID)
 	}
-	_ = s.CloseMerchantContainer(session, 0, false)
 
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
@@ -844,7 +844,7 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 			offers = make([]MerchantOffer, len(vs.Offers))
 			copy(offers, vs.Offers)
 		} else {
-			offers = s.EffectiveOffersForPlayer(session, entityID, ApplyHeroOfTheVillageToOffers(session, vs.Offers))
+			offers = s.EffectiveOffersForPlayer(session, entityID, vs.Offers)
 		}
 		offersPkt := EncodeMerchantOffersPacket(cid, offers, int32(vs.Level), vs.XP, !isWanderingTrader, !isWanderingTrader)
 		if err := session.send(PlayMerchantOffersCB, offersPkt); err != nil {
@@ -860,6 +860,12 @@ func (s *Server) CloseMerchantContainer(session *PlayerSession, containerID int3
 	if s == nil || session == nil {
 		return nil
 	}
+	var prevVillagerID int32
+	if open := session.OpenContainer(); open != nil && open.MenuType == MenuTypeMerchant {
+		if containerID == 0 || open.ContainerID == containerID {
+			prevVillagerID = int32(open.BlockX)
+		}
+	}
 	if carried := session.CarriedItem(); !carried.IsEmpty() {
 		session.SetCarriedItem(world.ItemStack{})
 		added, _ := session.AddItemToInventory(carried)
@@ -868,7 +874,11 @@ func (s *Server) CloseMerchantContainer(session *PlayerSession, containerID int3
 			s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(carried.ResolvedItemID(), rem))
 		}
 	}
-	return s.CloseContainer(session, containerID, notifyClient)
+	err := s.CloseContainer(session, containerID, notifyClient)
+	if prevVillagerID > 0 && !s.IsVillagerTrading(prevVillagerID) {
+		s.ResetVillagerSpecialPrices(prevVillagerID)
+	}
+	return err
 }
 
 func (s *Server) buildMerchantMenuSlots(session *PlayerSession, pay1, pay2, result world.ItemStack) []world.ItemStack {
@@ -1271,7 +1281,6 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 		isWanderingTrader = true
 	}
 
-	leveledUp := false
 	var playerXPReward int32
 	if traded {
 		for i := int32(0); i < tradesCompleted; i++ {
@@ -1283,13 +1292,9 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 		}
 		if !isWanderingTrader {
 			vs.XP += xpGained
-			for CanVillagerLevelUp(vs.Level, vs.XP) {
-				vs.Level++
-				leveledUp = true
-				newOffers := DefaultTradeBook().RollOffers(vs.Profession, vs.Level, vtr.rng)
-				vs.Offers = append(vs.Offers, newOffers...)
-			}
-			if leveledUp {
+			if CanVillagerLevelUp(vs.Level, vs.XP) {
+				vs.UpdateMerchantTimer = VillagerLevelUpDelayTicks
+				vs.IncreaseProfessionLevelOnUpdate = true
 				playerXPReward += 5
 			}
 		}
@@ -1302,8 +1307,6 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	copy(offersSnapshot, vs.Offers)
 	vLevel := vs.Level
 	vXP := vs.XP
-	vType := vs.VillagerType
-	vProf := vs.Profession
 	cid := tr.open.ContainerID
 	carried := tr.carried
 	vtr.mu.Unlock()
@@ -1330,21 +1333,6 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 			}
 			s.BroadcastChunk(cp.X, cp.Z, PlaySoundPacketID,
 				EncodeSoundPacket(yesSnd, SoundSourceNeutral, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
-			if leveledUp {
-				s.BroadcastChunk(cp.X, cp.Z, PlaySetEntityDataCB,
-					EncodeVillagerEntityDataPacket(entityID, VillagerTypeID(vType), VillagerProfessionID(vProf), int32(vLevel)))
-				s.BroadcastChunk(cp.X, cp.Z, protocol.PlayEntityEvent,
-					EncodeEntityEventPacket(entityID, EntityEventVillagerHappy))
-				// Vanilla grants villagers a brief regeneration boost on level-up (+4 HP capped at max).
-				hp := s.MobHealth(entityID)
-				if hp > 0 && hp < DefaultVillagerMaxHealth {
-					nextHP := hp + 4.0
-					if nextHP > DefaultVillagerMaxHealth {
-						nextHP = DefaultVillagerMaxHealth
-					}
-					s.SetMobHealth(entityID, nextHP)
-				}
-			}
 		}
 		if playerXPReward > 0 {
 			s.SpawnExperienceOrbsInDimension(orbDim, orbX, orbY, orbZ, playerXPReward)

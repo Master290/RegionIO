@@ -267,13 +267,10 @@ func ComputeVillagerMerchantOfferPrice2612(baseCost, demand, reputation int, pri
 }
 
 // UpdateMerchantOfferDemandOnRestock2612 implements `MerchantOffer.updateDemand()`
-// in `26.1.2.jar`: `demand = max(0, demand + uses - (maxUses - uses))` (`demand + 2*uses - maxUses`).
+// in `26.1.2.jar`: `this.demand = this.demand + this.uses - (this.maxUses - this.uses)`
+// (allows negative `demand`; `getModifiedCostCount` clamps `max(0, floor(base * demand * mult))` at price eval).
 func UpdateMerchantOfferDemandOnRestock2612(currentDemand, uses, maxUses int) int {
-	next := currentDemand + uses - (maxUses - uses)
-	if next < 0 {
-		return 0
-	}
-	return next
+	return currentDemand + uses - (maxUses - uses)
 }
 
 // --- 6. Advancements & Boss/Complex Mob NBT Round-Trip (26.1.2.jar) ---

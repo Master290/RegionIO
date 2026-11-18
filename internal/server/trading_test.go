@@ -232,17 +232,25 @@ func TestMerchantTradingUISelectTakeResultUsesAndOutOfStock(t *testing.T) {
 	if !vs.Offers[0].IsOutOfStock() {
 		t.Fatalf("expected offer[0] to be out of stock (uses=%d maxUses=%d)", vs.Offers[0].Uses, vs.Offers[0].MaxUses)
 	}
-	if vs.Level != 2 || len(vs.Offers) <= 2 {
-		t.Fatalf("expected villager to level up to 2 and unlock Apprentice trades; level=%d offers=%d", vs.Level, len(vs.Offers))
+	if vs.Level != 1 {
+		t.Fatalf("expected villager to remain Level 1 while trading screen is still open, got %d", vs.Level)
 	}
 	open = session.OpenContainer()
 	if !open.Result.IsEmpty() {
 		t.Fatalf("expected result slot 2 to clear when offer[0] is out of stock, got %+v", open.Result)
 	}
 
-	// Close the merchant container: the remaining 20x wheat in payment slot 0 and 2x emerald on cursor must return to player inventory.
+	// Close the merchant container: the remaining 20x wheat in payment slot 0 and 2x emerald on cursor must return to player inventory,
+	// and after 40 ticks (`updateMerchantTimer`) while `!isTrading()`, the villager levels up to Level 2 (Apprentice)!
 	if err := srv.CloseMerchantContainer(session, cid, true); err != nil {
 		t.Fatalf("CloseMerchantContainer: %v", err)
+	}
+	for i := 0; i < VillagerLevelUpDelayTicks; i++ {
+		srv.TickVillagers()
+	}
+	vs, _ = srv.VillagerState(vid)
+	if vs.Level != 2 || len(vs.Offers) <= 2 {
+		t.Fatalf("expected villager to level up to 2 and unlock Apprentice trades after 40 ticks; level=%d offers=%d", vs.Level, len(vs.Offers))
 	}
 	if got := countPlayerItem(session, "minecraft:wheat"); got != 20 {
 		t.Fatalf("player wheat count after close = %d, want 20", got)

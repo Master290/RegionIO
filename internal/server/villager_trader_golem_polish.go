@@ -39,8 +39,8 @@ const (
 	VillagerBellRaiderGlowRadius  = 48.0
 	VillagerBellPanicTicks        = 60
 
-	// Iron Golem crack stages & village reputation hostility threshold (vanilla 26.1.2).
-	IronGolemHostileReputationThreshold = -15
+	// Iron Golem crack stages & village reputation hostility threshold (vanilla 26.1.2 `DefendVillageTargetGoal` <= -100).
+	IronGolemHostileReputationThreshold = -100
 	IronGolemPlayerAngerTicks           = 600
 	IronGolemOfferPoppyDurationTicks    = 400
 
@@ -77,14 +77,25 @@ func (c IronGolemCrackLevel) String() string {
 }
 
 type villagerPolishEntry struct {
-	FoodPoints       int
-	BreedCooldown    int
-	GiftCooldown     int
-	PanicTicks       int
-	Sleeping         bool
-	LastSleptTick    int64
-	LastGossipedTick int64
-	LastPanickedTick int64
+	FoodPoints          int
+	BreedCooldown       int
+	GiftCooldown        int
+	PanicTicks          int
+	Sleeping            bool
+	HasLastSlept        bool
+	LastSleptTick       int64
+	HasLastWoken        bool
+	LastWokenTick       int64
+	HasLastGossipDecay  bool
+	LastGossipDecayTick int64
+	HasLastGossiped     bool
+	LastGossipedTick    int64
+	LastPanickedTick    int64
+	HasGolemDetected    bool
+	GolemDetectedUntil  int64
+	LastBellScanTick    int64
+	HasBellScanTick     bool
+	Inventory           [VillagerInventorySlots]world.ItemStack
 }
 
 type golemPolishEntry struct {
@@ -141,33 +152,34 @@ func (tr *villagerPolishTracker) ensureGolemLocked(id int32) *golemPolishEntry {
 // --- 1. Villager Daily Schedule, Bed POI Claiming & Bell Ringing ---
 
 // VillagerScheduleActivity returns the vanilla 26.1.2 daily schedule activity
-// for a villager given its profession, baby status, and time of day (0..23999).
-//   - Babies: Idle/Play during 0..11999, Rest during 12000..23999.
-//   - Nitwits: Rest during 14000..23999 and 0..1999 (sleep 2000 ticks later and
-//     wake 2000 ticks later than normal villagers), Idle during 2000..13999.
-//   - Unemployed adults ("minecraft:none"): Idle during 0..8999 and 11000..11999,
-//     Meet during 9000..10999, Rest during 12000..23999.
-//   - Employed adults: Idle 0..1999, Work 2000..8999, Meet 9000..10999,
-//     Idle 11000..11999, Rest 12000..23999.
+// from `data/minecraft/timeline/villager_schedule.json` (`period_ticks: 24000`)
+// and `Villager.registerBrainGoals`:
+//   - Keyframe `12000: rest` wraps into `0..9` (`tod < 10 || tod >= 12000` -> `rest`)
+//     for both `BABY_VILLAGER_ACTIVITY` and `VILLAGER_ACTIVITY`.
+//   - Babies (`BABY_VILLAGER_ACTIVITY`): `0..9: rest`, `10..2999: idle`, `3000..5999: play`,
+//     `6000..9999: idle`, `10000..11999: play`, `12000..23999: rest`.
+//   - Non-babies (`VILLAGER_ACTIVITY`, used for ALL adult villagers in 26.1.2 including
+//     `nitwit` and `none`): `0..9: rest`, `10..1999: idle`, `2000..8999: work`
+//     (which `Brain.setActiveActivityIfPossible` falls back to `idle` when `JOB_SITE`
+//     is absent, i.e. `none` or `nitwit`), `9000..10999: meet` (for trading professions;
+//     `nitwit` stays `idle` without `MEETING_POINT`), `11000..11999: idle`, `12000..23999: rest`.
 func VillagerScheduleActivity(profession string, isBaby bool, timeOfDay int64) VillagerActivity {
 	tod := ((timeOfDay % 24000) + 24000) % 24000
+	if tod < 10 || tod >= VillagerRestStartTick {
+		return VillagerActivityRest
+	}
 	if isBaby {
-		if tod >= VillagerRestStartTick {
-			return VillagerActivityRest
+		if (tod >= 3000 && tod < 6000) || (tod >= 10000 && tod < VillagerRestStartTick) {
+			return VillagerActivityPlay
 		}
 		return VillagerActivityIdle
 	}
 	prof := canonicalResourceName(profession)
-	if prof == VillagerProfessionNitwit {
-		if tod >= NitwitRestStartTick || tod < NitwitWakeTick {
-			return VillagerActivityRest
-		}
-		return VillagerActivityIdle
-	}
 	switch {
-	case tod >= VillagerRestStartTick:
-		return VillagerActivityRest
 	case tod >= VillagerMeetStartTick && tod < VillagerMeetEndTick:
+		if prof == VillagerProfessionNitwit {
+			return VillagerActivityIdle
+		}
 		return VillagerActivityMeet
 	case tod >= VillagerWorkStartTick && tod < VillagerWorkEndTick:
 		if CanProfessionTrade(prof) {
@@ -180,7 +192,8 @@ func VillagerScheduleActivity(profession string, isBaby bool, timeOfDay int64) V
 }
 
 // VillagerCurrentActivity returns the active schedule state of villager entityID,
-// overriding with VillagerActivityPanic if the villager is currently panicked.
+// overriding with VillagerActivityPanic if panicked, and applying `Brain.setActiveActivityIfPossible`
+// memory preconditions (`JOB_SITE` required for `work`, `MEETING_POINT` required for `meet`).
 func (s *Server) VillagerCurrentActivity(entityID int32) VillagerActivity {
 	if s == nil || entityID <= 0 {
 		return VillagerActivityIdle
@@ -198,7 +211,18 @@ func (s *Server) VillagerCurrentActivity(entityID int32) VillagerActivity {
 	if ok {
 		prof = vs.Profession
 	}
-	return VillagerScheduleActivity(prof, s.IsMobBaby(entityID), s.TimeOfDay())
+	act := VillagerScheduleActivity(prof, s.IsMobBaby(entityID), s.TimeOfDay())
+	switch act {
+	case VillagerActivityWork:
+		if s.IsVillagerJobSiteLost(entityID) {
+			return VillagerActivityIdle
+		}
+	case VillagerActivityMeet:
+		if _, hasBell := s.VillagerMeetingPoint(entityID); !hasBell || !s.ValidateVillagerMeetingPoint(entityID) {
+			return VillagerActivityIdle
+		}
+	}
+	return act
 }
 
 // BedOwnerAt returns the villager entityID that has claimed the bed at (dim, x, y, z), if any.
@@ -338,11 +362,13 @@ func (s *Server) IsVillagerSleeping(entityID int32) bool {
 	return e != nil && e.Sleeping
 }
 
-// WakeSleepingVillager wakes a sleeping villager and heals 2.0 HP if waking at dawn.
+// WakeSleepingVillager wakes a sleeping villager, clears bed `occupied=false`,
+// records `LAST_WOKEN` (`100`-tick re-sleep cooldown), and heals 2.0 HP.
 func (s *Server) WakeSleepingVillager(entityID int32) bool {
 	if s == nil || entityID <= 0 {
 		return false
 	}
+	gameTime, _ := s.WorldTime()
 	vp := s.villagerPolish()
 	vp.mu.Lock()
 	e := vp.villagers[entityID]
@@ -351,7 +377,13 @@ func (s *Server) WakeSleepingVillager(entityID int32) bool {
 		return false
 	}
 	e.Sleeping = false
+	e.HasLastWoken = true
+	e.LastWokenTick = gameTime
 	vp.mu.Unlock()
+
+	if bedSite, hasBed := s.VillagerBedSite(entityID); hasBed {
+		s.setVillagerBedOccupied(bedSite.Dimension, bedSite.Pos.X, bedSite.Pos.Y, bedSite.Pos.Z, false)
+	}
 
 	hp := s.MobHealth(entityID)
 	if hp > 0 && hp < DefaultVillagerMaxHealth {
@@ -371,7 +403,9 @@ func (s *Server) RecordVillagerSlept(entityID int32, tick int64) {
 	}
 	vp := s.villagerPolish()
 	vp.mu.Lock()
-	vp.ensureVillagerLocked(entityID).LastSleptTick = tick
+	e := vp.ensureVillagerLocked(entityID)
+	e.HasLastSlept = true
+	e.LastSleptTick = tick
 	vp.mu.Unlock()
 }
 
@@ -382,7 +416,9 @@ func (s *Server) RecordVillagerGossiped(entityID int32, tick int64) {
 	}
 	vp := s.villagerPolish()
 	vp.mu.Lock()
-	vp.ensureVillagerLocked(entityID).LastGossipedTick = tick
+	e := vp.ensureVillagerLocked(entityID)
+	e.HasLastGossiped = true
+	e.LastGossipedTick = tick
 	vp.mu.Unlock()
 }
 
@@ -439,8 +475,9 @@ func (s *Server) OnVillageBellRung(dim string, x, y, z int) (alertedVillagers in
 	return alertedVillagers, glowingRaiders
 }
 
-// stepVillagerPolishTick runs per-villager schedule, POI workstation acquisition,
-// bed sleeping, and gossip sharing during TickVillagers.
+// stepVillagerPolishTick runs per-villager `GolemSensor`, `MEETING_POINT` (`minecraft:bell`)
+// validation/acquisition, daily schedule, POI workstation acquisition, `SleepInBed`,
+// excess food sharing (`TradeWithVillager`), and gossip sharing during `TickVillagers`.
 func (s *Server) stepVillagerPolishTick(entityID int32, tod int64, tick int64) {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return
@@ -449,9 +486,29 @@ func (s *Server) stepVillagerPolishTick(entityID int32, tod int64, tick int64) {
 	if ent == nil || ent.TypeName != MobTypeVillager {
 		return
 	}
+	dim := ent.EffectiveDimension()
+	allEnts := s.entities.AppendAll(nil)
+
+	// `GolemSensor`: scan `AABB.inflate(16, 16, 16)` for any Iron Golem (`599`-tick memory TTL).
+	sawGolem := false
+	for i := range allEnts {
+		ge := &allEnts[i]
+		if ge.EffectiveDimension() == dim && canonicalResourceName(ge.TypeName) == MobTypeIronGolem {
+			if math.Abs(ge.X-ent.X) <= VillagerGolemSensorBoxHalfSize+1.0 &&
+				math.Abs(ge.Y-ent.Y) <= VillagerGolemSensorBoxHalfSize+2.7 &&
+				math.Abs(ge.Z-ent.Z) <= VillagerGolemSensorBoxHalfSize+1.0 {
+				sawGolem = true
+				break
+			}
+		}
+	}
+
 	vp := s.villagerPolish()
 	vp.mu.Lock()
 	ve := vp.ensureVillagerLocked(entityID)
+	if sawGolem {
+		s.markVillagerDetectedGolemLocked(vp, entityID, tick)
+	}
 	if ve.BreedCooldown > 0 {
 		ve.BreedCooldown--
 	}
@@ -462,6 +519,7 @@ func (s *Server) stepVillagerPolishTick(entityID int32, tod int64, tick int64) {
 		ve.PanicTicks--
 	}
 	wasSleeping := ve.Sleeping
+	inWakeCooldown := ve.HasLastWoken && tick >= ve.LastWokenTick && tick-ve.LastWokenTick < VillagerWakeReSleepCooldownTicks
 	vp.mu.Unlock()
 
 	vs, ok := s.VillagerState(entityID)
@@ -469,49 +527,101 @@ func (s *Server) stepVillagerPolishTick(entityID int32, tod int64, tick int64) {
 		return
 	}
 	isBaby := s.IsMobBaby(entityID)
+	if !isBaby && tod >= 10 && tod < VillagerRestStartTick {
+		if _, hadBell := s.VillagerMeetingPoint(entityID); hadBell {
+			s.ValidateVillagerMeetingPoint(entityID)
+		} else {
+			vp.mu.Lock()
+			e := vp.ensureVillagerLocked(entityID)
+			shouldScanBell := !e.HasBellScanTick || tick < e.LastBellScanTick || tick-e.LastBellScanTick >= 20 || (tod >= VillagerMeetStartTick && tod < VillagerMeetEndTick)
+			if shouldScanBell {
+				e.HasBellScanTick = true
+				e.LastBellScanTick = tick
+			}
+			vp.mu.Unlock()
+			if shouldScanBell {
+				_, _ = s.TryAcquireVillagerMeetingPoint(entityID)
+			}
+		}
+	}
+
 	act := VillagerScheduleActivity(vs.Profession, isBaby, tod)
+	if act == VillagerActivityMeet {
+		if _, hasBell := s.VillagerMeetingPoint(entityID); !hasBell {
+			act = VillagerActivityIdle
+		}
+	}
 
 	switch act {
 	case VillagerActivityWork:
 		if wasSleeping {
 			s.WakeSleepingVillager(entityID)
 		}
-		if !isBaby && vs.Profession != VillagerProfessionNitwit {
+		if !isBaby && canonicalResourceName(vs.Profession) != VillagerProfessionNitwit {
 			_, _ = s.TryAcquireVillagerWorkstation(entityID)
 		}
-	case VillagerActivityIdle:
+	case VillagerActivityIdle, VillagerActivityPlay, VillagerActivityMeet:
 		if wasSleeping {
 			s.WakeSleepingVillager(entityID)
 		}
-		// Unemployed adult villagers also look for unclaimed workstations during daytime.
 		if !isBaby && canonicalResourceName(vs.Profession) == VillagerProfessionNone && tod >= VillagerWorkStartTick && tod < VillagerRestStartTick {
 			_, _ = s.TryAcquireVillagerWorkstation(entityID)
 		}
-	case VillagerActivityMeet:
-		if wasSleeping {
-			s.WakeSleepingVillager(entityID)
-		}
-		// Share gossips with nearby villagers within 4 blocks during meeting hours.
-		dim := ent.EffectiveDimension()
-		for _, other := range s.entities.AppendAll(nil) {
-			if other.ID <= entityID || other.TypeName != MobTypeVillager || other.EffectiveDimension() != dim {
-				continue
-			}
-			dx := other.X - ent.X
-			dy := other.Y - ent.Y
-			dz := other.Z - ent.Z
-			if dx*dx+dy*dy+dz*dz <= 16.0 {
-				s.ShareVillagerGossip(entityID, other.ID)
-				s.ShareVillagerGossip(other.ID, entityID)
-				s.RecordVillagerGossiped(entityID, tick)
-				s.RecordVillagerGossiped(other.ID, tick)
+		// `VillagerGoalPackages.getIdlePackage` & `getMeetPackage` both run `TradeWithVillager`
+		// and `gossip` between nearby villagers (`<= 4` blocks).
+		if !isBaby {
+			inMeetWindow := act == VillagerActivityMeet || (tod >= VillagerMeetStartTick && tod < VillagerMeetEndTick)
+			for i := range allEnts {
+				other := &allEnts[i]
+				if other.ID <= entityID || other.TypeName != MobTypeVillager || other.EffectiveDimension() != dim || s.IsMobBaby(other.ID) {
+					continue
+				}
+				dx := other.X - ent.X
+				dy := other.Y - ent.Y
+				dz := other.Z - ent.Z
+				if dx*dx+dy*dy+dz*dz > 16.0 {
+					continue
+				}
+				s.stepVillagerTradeExcessFood(entityID, other.ID)
+				s.stepVillagerTradeExcessFood(other.ID, entityID)
+
+				vp.mu.Lock()
+				e1 := vp.ensureVillagerLocked(entityID)
+				e2 := vp.ensureVillagerLocked(other.ID)
+				ready1 := !e1.HasLastGossiped || tick < e1.LastGossipedTick || tick-e1.LastGossipedTick >= VillagerGossipTransferCooldownTicks
+				ready2 := !e2.HasLastGossiped || tick < e2.LastGossipedTick || tick-e2.LastGossipedTick >= VillagerGossipTransferCooldownTicks
+				vp.mu.Unlock()
+
+				if inMeetWindow && (ready1 || ready2) {
+					if ready1 {
+						s.ShareVillagerGossip(entityID, other.ID)
+						s.RecordVillagerGossiped(entityID, tick)
+					}
+					if ready2 {
+						s.ShareVillagerGossip(other.ID, entityID)
+						s.RecordVillagerGossiped(other.ID, tick)
+					}
+				}
 			}
 		}
 	case VillagerActivityRest:
-		if _, hasBed := s.TryAcquireVillagerBed(entityID); hasBed {
+		if inWakeCooldown && !wasSleeping {
+			return
+		}
+		if site, hasBed := s.TryAcquireVillagerBed(entityID); hasBed {
+			cache := s.DimensionChunks(site.Dimension)
+			if cache != nil && !wasSleeping {
+				_, props, propOK := world.BlockStateProperties(cache.GetBlock(site.Pos.X, site.Pos.Y, site.Pos.Z))
+				if propOK && props != nil && props["occupied"] == "true" {
+					if owner, ok := s.BedOwnerAt(site.Dimension, site.Pos.X, site.Pos.Y, site.Pos.Z); !ok || owner != entityID {
+						return
+					}
+				}
+			}
 			vp.mu.Lock()
 			vp.ensureVillagerLocked(entityID).Sleeping = true
 			vp.mu.Unlock()
+			s.setVillagerBedOccupied(site.Dimension, site.Pos.X, site.Pos.Y, site.Pos.Z, true)
 			s.RecordVillagerSlept(entityID, tick)
 		}
 	}
@@ -586,7 +696,7 @@ func (s *Server) AddVillagerFood(entityID int32, itemName string, count int) (ne
 }
 
 // CanVillagerBreed reports whether villager entityID is an adult villager with
-// at least 12 food points and not on breeding cooldown.
+// at least 12 food points (in `FoodPoints` + 8-slot `Inventory`) and not on breeding cooldown.
 func (s *Server) CanVillagerBreed(entityID int32) bool {
 	if s == nil || s.entities == nil || entityID <= 0 {
 		return false
@@ -599,7 +709,7 @@ func (s *Server) CanVillagerBreed(entityID int32) bool {
 	vp.mu.Lock()
 	defer vp.mu.Unlock()
 	e := vp.villagers[entityID]
-	return e != nil && e.FoodPoints >= VillagerBreedingFoodThreshold && e.BreedCooldown <= 0
+	return e != nil && e.FoodPoints+countInventoryFoodLocked(e) >= VillagerBreedingFoodThreshold && e.BreedCooldown <= 0
 }
 
 // ShareVillagerFood transfers 12 food points from giverID to receiverID when
@@ -701,9 +811,16 @@ func RollChildVillagerType(biomeName, parentAType, parentBType string, rng *rand
 	}
 }
 
-// TryBreedVillagers breeds two willing adult villagers (each with >= 12 food
-// points and off cooldown), consuming 12 food points from each parent and
-// spawning a baby `minecraft:villager` with `minecraft:none` profession.
+// TryBreedVillagers implements `VillagerMakeLove.breed` in `26.1.2.jar`:
+//   - Requires two willing adult villagers (`>= 12` food points each and off cooldown).
+//   - Digests and consumes `12` food points from each parent (`eatAndDigestFood`).
+//   - Searches within `48` blocks (`VillagerMakeLoveBedScanRadius`) for a reachable,
+//     unclaimed, unoccupied `#minecraft:beds` block (`takeVacantBed`).
+//   - If NO vacant reachable bed exists, broadcasts `EntityEventVillagerAngry` (`13`)
+//     and returns `(0, false)` without spawning a baby.
+//   - Otherwise spawns a baby `minecraft:villager` (`age = -24000`, `minecraft:none`),
+//     binds the bed POI (`HOME`) to the newborn baby, sets `6000`-tick breed cooldown
+//     on both parents, and broadcasts `EntityEventLoveHearts` (`12`).
 func (s *Server) TryBreedVillagers(parentA, parentB int32, rng *rand.Rand) (int32, bool) {
 	if s == nil || s.entities == nil || parentA <= 0 || parentB <= 0 || parentA == parentB {
 		return 0, false
@@ -721,25 +838,40 @@ func (s *Server) TryBreedVillagers(parentA, parentB int32, rng *rand.Rand) (int3
 		return 0, false
 	}
 
+	cx := (entA.X + entB.X) * 0.5
+	cy := (entA.Y + entB.Y) * 0.5
+	cz := (entA.Z + entB.Z) * 0.5
+	bedPos, hasVacantBed := s.findVacantReachableBedForVillagerChild(dim, cx, cy, cz)
+
 	vp := s.villagerPolish()
 	vp.mu.Lock()
 	ea := vp.ensureVillagerLocked(parentA)
 	eb := vp.ensureVillagerLocked(parentB)
-	if ea.FoodPoints < VillagerBreedingFoodThreshold || eb.FoodPoints < VillagerBreedingFoodThreshold || ea.BreedCooldown > 0 || eb.BreedCooldown > 0 {
+	if ea.BreedCooldown > 0 || eb.BreedCooldown > 0 ||
+		ea.FoodPoints+countInventoryFoodLocked(ea) < VillagerBreedingFoodThreshold ||
+		eb.FoodPoints+countInventoryFoodLocked(eb) < VillagerBreedingFoodThreshold {
 		vp.mu.Unlock()
 		return 0, false
 	}
-	ea.FoodPoints -= VillagerBreedingFoodThreshold
-	eb.FoodPoints -= VillagerBreedingFoodThreshold
-	ea.BreedCooldown = VillagerBreedingCooldownTicks
-	eb.BreedCooldown = VillagerBreedingCooldownTicks
+	digestVillagerFoodLocked(ea, VillagerBreedingFoodThreshold)
+	digestVillagerFoodLocked(eb, VillagerBreedingFoodThreshold)
+	if hasVacantBed {
+		ea.BreedCooldown = VillagerBreedingCooldownTicks
+		eb.BreedCooldown = VillagerBreedingCooldownTicks
+	}
 	vp.mu.Unlock()
+
+	cp := entA.ChunkPos()
+	if !hasVacantBed {
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+			EncodeEntityEventPacket(parentA, EntityEventVillagerAngry))
+		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
+			EncodeEntityEventPacket(parentB, EntityEventVillagerAngry))
+		return 0, false
+	}
 
 	vsA, _ := s.VillagerState(parentA)
 	vsB, _ := s.VillagerState(parentB)
-	cx := (entA.X + entB.X) * 0.5
-	cy := (entA.Y + entB.Y) * 0.5
-	cz := (entA.Z + entB.Z) * 0.5
 
 	childType := RollChildVillagerType("minecraft:plains", vsA.VillagerType, vsB.VillagerType, rng)
 	childID, err := s.SpawnVillagerInDimension(dim, cx, cy, cz, childType, VillagerProfessionNone, MinVillagerLevel)
@@ -747,8 +879,8 @@ func (s *Server) TryBreedVillagers(parentA, parentB int32, rng *rand.Rand) (int3
 		return 0, false
 	}
 	s.SetMobBaby(childID, true)
+	s.ClaimVillagerBed(childID, dim, bedPos.X, bedPos.Y, bedPos.Z)
 
-	cp := entA.ChunkPos()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(parentA, EntityEventLoveHearts))
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
@@ -832,9 +964,7 @@ func (s *Server) OnVillagerStruckByLightning(villagerID int32) (witchID int32, c
 	x, y, z := ent.X, ent.Y, ent.Z
 	cp := ent.ChunkPos()
 
-	s.ReleaseVillagerWorkstation(villagerID)
-	s.ReleaseVillagerBed(villagerID)
-	s.closeMerchantScreensForVillager(villagerID)
+	s.ReleaseAllVillagerPOIs(villagerID)
 
 	s.entities.Remove(villagerID)
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayRemoveEntities,
@@ -996,14 +1126,19 @@ func (s *Server) PlayerVillageReputationNear(dim string, x, y, z float64, player
 }
 
 // ShouldIronGolemAttackPlayer reports whether Iron Golem golemID is hostile
-// toward player according to vanilla 26.1.2 rules:
+// toward player according to vanilla 26.1.2 rules (`DefendVillageTargetGoal` + `NeutralMob`):
 //   - Player-created Iron Golems (`PlayerCreated == true`) NEVER attack players,
 //     even if attacked or if the player has low village reputation.
+//   - Peaceful difficulty, Creative, and Spectator players are never attacked.
 //   - Village-spawned Iron Golems (`PlayerCreated == false`) attack survival/adventure
-//     players who attacked a villager or golem, OR whose village reputation near
-//     the golem is <= -15 (`IronGolemHostileReputationThreshold`).
+//     players who provoked a villager/golem, OR whose village reputation on any
+//     villager in `golem.getBoundingBox().inflate(10.0, 8.0, 10.0)` is `<= -100`
+//     (`IronGolemHostileReputationThreshold`).
 func (s *Server) ShouldIronGolemAttackPlayer(golemID int32, player *PlayerSession) bool {
 	if s == nil || s.entities == nil || golemID <= 0 || player == nil || player.IsDead() {
+		return false
+	}
+	if s.Difficulty() == DifficultyPeaceful {
 		return false
 	}
 	snap := player.Snapshot()
@@ -1027,14 +1162,33 @@ func (s *Server) ShouldIronGolemAttackPlayer(golemID int32, player *PlayerSessio
 		return true
 	}
 
-	minRep, hasVil := s.PlayerVillageReputationNear(ent.EffectiveDimension(), ent.X, ent.Y, ent.Z, player.Profile.UUID, 16.0)
-	return hasVil && minRep <= IronGolemHostileReputationThreshold
+	dim := ent.EffectiveDimension()
+	if world.NormalizeDimension(player.Dimension()) != dim {
+		return false
+	}
+	// `DefendVillageTargetGoal.canUse`: `AABB villageBounds = this.golem.getBoundingBox().inflate(10.0, 8.0, 10.0)`
+	// (Iron Golem width = 1.4 -> halfW = 0.7; height = 2.7).
+	if math.Abs(snap.X-ent.X) > 11.0 || math.Abs(snap.Z-ent.Z) > 11.0 || snap.Y < ent.Y-9.8 || snap.Y > ent.Y+10.7 {
+		return false
+	}
+	for _, vEnt := range s.entities.AppendAll(nil) {
+		if vEnt.TypeName != MobTypeVillager || vEnt.EffectiveDimension() != dim {
+			continue
+		}
+		if math.Abs(vEnt.X-ent.X) > 11.0 || math.Abs(vEnt.Z-ent.Z) > 11.0 || vEnt.Y < ent.Y-9.95 || vEnt.Y > ent.Y+10.7 {
+			continue
+		}
+		if s.VillagerPlayerReputation(vEnt.ID, player.Profile.UUID) <= IronGolemHostileReputationThreshold {
+			return true
+		}
+	}
+	return false
 }
 
 // ProvokeVillageIronGolemsNear angers all non-player-created Iron Golems within
-// 16 blocks of (dim, x, y, z) against attacker for 600 ticks.
+// 16 blocks of (dim, x, y, z) against attacker for 400..780 ticks (`PERSISTENT_ANGER_TIME`).
 func (s *Server) ProvokeVillageIronGolemsNear(dim string, x, y, z float64, attacker *PlayerSession) int {
-	if s == nil || s.entities == nil || attacker == nil {
+	if s == nil || s.entities == nil || attacker == nil || s.Difficulty() == DifficultyPeaceful {
 		return 0
 	}
 	snap := attacker.Snapshot()
@@ -1043,6 +1197,11 @@ func (s *Server) ProvokeVillageIronGolemsNear(dim string, x, y, z float64, attac
 	}
 	normDim := world.NormalizeDimension(dim)
 	radSq := 16.0 * 16.0
+	sm := s.villagerSocial()
+	sm.mu.Lock()
+	angerDur := RollIronGolemPersistentAngerTicks2612(sm.rng)
+	sm.mu.Unlock()
+
 	vp := s.villagerPolish()
 	count := 0
 	for _, ent := range s.entities.AppendAll(nil) {
@@ -1060,7 +1219,7 @@ func (s *Server) ProvokeVillageIronGolemsNear(dim string, x, y, z float64, attac
 			ge := vp.ensureGolemLocked(ent.ID)
 			ge.AngryAtPlayer = attacker.Profile.UUID
 			ge.HasAngryPlayer = true
-			ge.AngerTicks = IronGolemPlayerAngerTicks
+			ge.AngerTicks = angerDur
 			vp.mu.Unlock()
 			count++
 		}
@@ -1161,9 +1320,13 @@ func (s *Server) stepIronGolemPolishAndPlayerTarget(golem *world.Entity, curCool
 	}
 	vp := s.villagerPolish()
 	var expiredPoppy bool
+	peaceful := s.Difficulty() == DifficultyPeaceful
 	vp.mu.Lock()
 	if ge := vp.golems[golem.ID]; ge != nil {
-		if ge.AngerTicks > 0 {
+		if peaceful {
+			ge.AngerTicks = 0
+			ge.HasAngryPlayer = false
+		} else if ge.AngerTicks > 0 {
 			ge.AngerTicks--
 			if ge.AngerTicks == 0 {
 				ge.HasAngryPlayer = false
@@ -1187,6 +1350,7 @@ func (s *Server) stepIronGolemPolishAndPlayerTarget(golem *world.Entity, curCool
 	}
 
 	if s.IsIronGolemPlayerCreated(golem.ID) {
+		s.stepIronGolemOfferFlowerGoal(golem, rng)
 		return false
 	}
 
@@ -1214,6 +1378,7 @@ func (s *Server) stepIronGolemPolishAndPlayerTarget(golem *world.Entity, curCool
 		}
 	}
 	if targetPlayer == nil {
+		s.stepIronGolemOfferFlowerGoal(golem, rng)
 		return false
 	}
 
@@ -1239,21 +1404,27 @@ func (s *Server) stepIronGolemPolishAndPlayerTarget(golem *world.Entity, curCool
 		mgr.mu.Lock()
 		if st := mgr.golems[golem.ID]; st != nil {
 			st.AttackCooldown = IronGolemAttackCooldownTicks
+			st.AttackAnimationTick = IronGolemAttackAnimationDurationTicks
 		}
 		mgr.mu.Unlock()
 
-		dmg := IronGolemMinAttackDamage
-		if rng != nil {
-			dmg += rng.Float32() * (IronGolemMaxAttackDamage - IronGolemMinAttackDamage)
-		} else {
-			dmg = 14.5
-		}
+		dmg := RollIronGolemAttackDamage2612(rng)
 		cp := updatedGolem.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
 			EncodeEntityEventPacket(updatedGolem.ID, EntityEventIronGolemAttack))
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
 			EncodeSoundPacket("minecraft:entity.iron_golem.attack", SoundSourceNeutral, updatedGolem.X, updatedGolem.Y, updatedGolem.Z, 1.0, 1.0, 0))
-		s.DamagePlayerWithArmor(targetPlayer, ScaleDamageByDifficulty(dmg, s.Difficulty()), "mob")
+		dealt := s.DamagePlayerWithArmor(targetPlayer, ScaleDamageByDifficulty(dmg, s.Difficulty()), "mob")
+		if dealt > 0 && !targetPlayer.IsDead() {
+			flingY := ComputeIronGolemVerticalFling2612(s.PlayerKnockbackResistance(targetPlayer))
+			if flingY > 0 {
+				motionPkt := EncodeSetEntityMotionPacket(targetPlayer.EntityID, 0, flingY, 0)
+				if targetPlayer.send != nil {
+					_ = targetPlayer.send(protocol.PlaySetEntityMotion, motionPkt)
+				}
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityMotion, motionPkt)
+			}
+		}
 	}
 	return true
 }

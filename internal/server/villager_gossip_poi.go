@@ -71,13 +71,13 @@ type GossipTypeSpec struct {
 //   - MAJOR_NEGATIVE("major_negative", -5, 100, 10, 10)
 //   - MINOR_NEGATIVE("minor_negative", -1, 200, 20, 20)
 //   - MINOR_POSITIVE("minor_positive", 1, 25, 1, 5)
-//   - MAJOR_POSITIVE("major_positive", 5, 20, 0, 100)
+//   - MAJOR_POSITIVE("major_positive", 5, 20, 0, 20)
 //   - TRADING("trading", 1, 25, 2, 20)
 var vanillaGossipTypeSpecs = map[GossipType]GossipTypeSpec{
 	GossipMajorNegative: {Type: GossipMajorNegative, Weight: -5, Max: 100, DecayPerDay: 10, DecayPerTransfer: 10},
 	GossipMinorNegative: {Type: GossipMinorNegative, Weight: -1, Max: 200, DecayPerDay: 20, DecayPerTransfer: 20},
 	GossipMinorPositive: {Type: GossipMinorPositive, Weight: 1, Max: 25, DecayPerDay: 1, DecayPerTransfer: 5},
-	GossipMajorPositive: {Type: GossipMajorPositive, Weight: 5, Max: 20, DecayPerDay: 0, DecayPerTransfer: 100},
+	GossipMajorPositive: {Type: GossipMajorPositive, Weight: 5, Max: 20, DecayPerDay: 0, DecayPerTransfer: 20},
 	GossipTrading:       {Type: GossipTrading, Weight: 1, Max: 25, DecayPerDay: 2, DecayPerTransfer: 20},
 }
 
@@ -244,16 +244,18 @@ type ZombieVillagerState struct {
 }
 
 type serverVillagerSocialManager struct {
-	mu              sync.Mutex
-	jobSiteByEntity map[int32]VillagerPOISite
-	entityByJobSite map[dimBlockKey]int32
-	jobSiteLost     map[int32]bool
-	bedByEntity     map[int32]VillagerPOISite
-	entityByBed     map[dimBlockKey]int32
-	gossips         map[int32]map[[16]byte]map[GossipType]int // entityID -> playerUUID -> GossipType -> value
-	lastDecayDay    map[int32]int64
-	zombieVillagers map[int32]*ZombieVillagerState
-	rng             *rand.Rand
+	mu                sync.Mutex
+	jobSiteByEntity   map[int32]VillagerPOISite
+	entityByJobSite   map[dimBlockKey]int32
+	jobSiteLost       map[int32]bool
+	bedByEntity       map[int32]VillagerPOISite
+	entityByBed       map[dimBlockKey]int32
+	meetingByEntity   map[int32]VillagerPOISite
+	entitiesByMeeting map[dimBlockKey]map[int32]struct{}
+	gossips           map[int32]map[[16]byte]map[GossipType]int // entityID -> playerUUID -> GossipType -> value
+	lastDecayDay      map[int32]int64
+	zombieVillagers   map[int32]*ZombieVillagerState
+	rng               *rand.Rand
 }
 
 var serverVillagerSocial sync.Map // map[*Server]*serverVillagerSocialManager
@@ -263,15 +265,17 @@ func (s *Server) villagerSocial() *serverVillagerSocialManager {
 		return v.(*serverVillagerSocialManager)
 	}
 	actual, _ := serverVillagerSocial.LoadOrStore(s, &serverVillagerSocialManager{
-		jobSiteByEntity: make(map[int32]VillagerPOISite),
-		entityByJobSite: make(map[dimBlockKey]int32),
-		jobSiteLost:     make(map[int32]bool),
-		bedByEntity:     make(map[int32]VillagerPOISite),
-		entityByBed:     make(map[dimBlockKey]int32),
-		gossips:         make(map[int32]map[[16]byte]map[GossipType]int),
-		lastDecayDay:    make(map[int32]int64),
-		zombieVillagers: make(map[int32]*ZombieVillagerState),
-		rng:             rand.New(rand.NewSource(time.Now().UnixNano())),
+		jobSiteByEntity:   make(map[int32]VillagerPOISite),
+		entityByJobSite:   make(map[dimBlockKey]int32),
+		jobSiteLost:       make(map[int32]bool),
+		bedByEntity:       make(map[int32]VillagerPOISite),
+		entityByBed:       make(map[dimBlockKey]int32),
+		meetingByEntity:   make(map[int32]VillagerPOISite),
+		entitiesByMeeting: make(map[dimBlockKey]map[int32]struct{}),
+		gossips:           make(map[int32]map[[16]byte]map[GossipType]int),
+		lastDecayDay:      make(map[int32]int64),
+		zombieVillagers:   make(map[int32]*ZombieVillagerState),
+		rng:               rand.New(rand.NewSource(time.Now().UnixNano())),
 	})
 	return actual.(*serverVillagerSocialManager)
 }
@@ -398,6 +402,9 @@ func (s *Server) ClaimVillagerWorkstation(entityID int32, dim string, x, y, z in
 	if curProf == VillagerProfessionNone {
 		s.SetVillagerProfession(entityID, wsProf, MinVillagerLevel)
 	}
+	cp := ent.ChunkPos()
+	s.BroadcastDimensionChunk(normDim, cp.X, cp.Z, protocol.PlayEntityEvent,
+		EncodeEntityEventPacket(entityID, EntityEventVillagerHappy))
 	return wsProf, true
 }
 
@@ -649,7 +656,7 @@ func (s *Server) AddVillagerGossip(entityID int32, targetUUID [16]byte, gossipTy
 	if next > spec.Max {
 		next = spec.Max
 	}
-	if next <= 0 {
+	if next < VillagerGossipDiscardThreshold {
 		delete(byType, gossipType)
 		next = 0
 	} else {
@@ -765,7 +772,7 @@ func decayGossipMapLocked(byPlayer map[[16]byte]map[GossipType]int) {
 				continue
 			}
 			next := val - spec.DecayPerDay
-			if next <= 0 {
+			if next < VillagerGossipDiscardThreshold {
 				delete(byType, gt)
 			} else {
 				byType[gt] = next
@@ -793,33 +800,35 @@ func (s *Server) ShareVillagerGossip(sourceEntityID, targetEntityID int32) {
 	if len(srcByPlayer) == 0 {
 		return
 	}
+	selected := selectWeightedGossipTopics(srcByPlayer, VillagerMaxGossipTopicsPerTransfer, sm.rng)
+	if len(selected) == 0 {
+		return
+	}
 	dstByPlayer := sm.gossips[targetEntityID]
 	if dstByPlayer == nil {
 		dstByPlayer = make(map[[16]byte]map[GossipType]int)
 		sm.gossips[targetEntityID] = dstByPlayer
 	}
 
-	for uuid, srcTypes := range srcByPlayer {
-		for gt, val := range srcTypes {
-			spec, ok := vanillaGossipTypeSpecs[gt]
-			if !ok {
-				continue
-			}
-			transferred := val - spec.DecayPerTransfer
-			if transferred <= 0 {
-				continue
-			}
-			if transferred > spec.Max {
-				transferred = spec.Max
-			}
-			dstTypes := dstByPlayer[uuid]
-			if dstTypes == nil {
-				dstTypes = make(map[GossipType]int)
-				dstByPlayer[uuid] = dstTypes
-			}
-			if transferred > dstTypes[gt] {
-				dstTypes[gt] = transferred
-			}
+	for _, topic := range selected {
+		spec, ok := vanillaGossipTypeSpecs[topic.gtype]
+		if !ok {
+			continue
+		}
+		transferred := topic.value - spec.DecayPerTransfer
+		if transferred < VillagerGossipDiscardThreshold {
+			continue
+		}
+		if transferred > spec.Max {
+			transferred = spec.Max
+		}
+		dstTypes := dstByPlayer[topic.uuid]
+		if dstTypes == nil {
+			dstTypes = make(map[GossipType]int)
+			dstByPlayer[topic.uuid] = dstTypes
+		}
+		if transferred > dstTypes[topic.gtype] {
+			dstTypes[topic.gtype] = transferred
 		}
 	}
 }
@@ -852,9 +861,6 @@ func (s *Server) EffectiveOffersForPlayer(session *PlayerSession, villagerEntity
 
 	rep := s.VillagerPlayerReputation(villagerEntityID, session.Profile.UUID)
 	heroInst, hasHero := session.PlayerEffect(EffectHeroOfTheVillage)
-	if rep == 0 && !hasHero {
-		return out
-	}
 
 	for i := range out {
 		var diff int32
@@ -878,9 +884,6 @@ func (s *Server) UpdateVillagerSpecialPricesForPlayer(session *PlayerSession, vi
 	}
 	rep := s.VillagerPlayerReputation(villagerEntityID, session.Profile.UUID)
 	heroInst, hasHero := session.PlayerEffect(EffectHeroOfTheVillage)
-	if rep == 0 && !hasHero {
-		return
-	}
 	vtr := s.villagerTracker()
 	vtr.mu.Lock()
 	vs, ok := vtr.villagers[villagerEntityID]
@@ -1095,9 +1098,7 @@ func (s *Server) ZombifyVillager(villagerEntityID int32) (int32, bool) {
 	delete(sm.gossips, villagerEntityID)
 	sm.mu.Unlock()
 
-	s.ReleaseVillagerWorkstation(villagerEntityID)
-	s.ReleaseVillagerBed(villagerEntityID)
-	s.closeMerchantScreensForVillager(villagerEntityID)
+	s.ReleaseAllVillagerPOIs(villagerEntityID)
 
 	cp := ent.ChunkPos()
 	s.entities.Remove(villagerEntityID)

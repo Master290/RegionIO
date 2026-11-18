@@ -1986,9 +1986,12 @@ func (s *Server) applyDamageToMob(
 	if canonicalResourceName(target.TypeName) == MobTypeWanderingTrader && attacker != nil {
 		s.OnWanderingTraderDamaged(target.ID, attacker, 0)
 	}
-	if attacker != nil && canonicalResourceName(target.TypeName) == MobTypeVillager {
-		s.OnVillagerKilledByPlayer(target.ID, dim, deathX, deathY, deathZ, attacker)
-		s.ProvokeVillageIronGolemsNear(dim, deathX, deathY, deathZ, attacker)
+	if canonicalResourceName(target.TypeName) == MobTypeVillager {
+		if attacker != nil {
+			s.OnVillagerKilledByPlayer(target.ID, dim, deathX, deathY, deathZ, attacker)
+			s.ProvokeVillageIronGolemsNear(dim, deathX, deathY, deathZ, attacker)
+		}
+		s.ReleaseAllVillagerPOIs(target.ID)
 	}
 	eqDrops := s.OnEquineOrLlamaKilled(target.ID)
 	for _, eqDrop := range eqDrops {

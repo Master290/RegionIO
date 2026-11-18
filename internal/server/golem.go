@@ -32,7 +32,7 @@ const (
 	IronGolemAttackCooldownTicks = 20
 	IronGolemMinAttackDamage     = float32(7.5)
 	IronGolemMaxAttackDamage     = float32(21.5)
-	IronGolemFlingVelocityY      = 0.45
+	IronGolemFlingVelocityY      = float64(float32(0.4))
 	IronGolemRepairHealAmount    = float32(25.0)
 
 	// Villager panic/gossip Iron Golem spawning parameters.
@@ -54,12 +54,13 @@ const (
 // IronGolemState tracks per-golem attributes (PlayerCreated flag, active target,
 // and attack cooldown).
 type IronGolemState struct {
-	EntityID       int32
-	Dimension      string
-	PlayerCreated  bool
-	TargetMobID    int32
-	TargetPlayer   *PlayerSession
-	AttackCooldown int
+	EntityID            int32
+	Dimension           string
+	PlayerCreated       bool
+	TargetMobID         int32
+	TargetPlayer        *PlayerSession
+	AttackCooldown      int
+	AttackAnimationTick int
 }
 
 // IronGolemPatternMatch describes a matched 4-iron-block T-shape + pumpkin on
@@ -463,16 +464,18 @@ func (s *Server) InteractWithIronGolem(session *PlayerSession, entityID int32) b
 	return true
 }
 
-// IsIronGolemTargetableHostile reports whether a mob of typeName is targeted by
-// Iron Golems defending a village (all hostile monsters except creepers).
+// IsIronGolemTargetableHostile reports whether a mob of typeName implements
+// `Enemy` and is targeted by Iron Golems in vanilla 26.1.2 (all `Enemy` mobs except `minecraft:creeper`).
 func IsIronGolemTargetableHostile(typeName string) bool {
 	switch canonicalResourceName(typeName) {
-	case MobTypeZombie, MobTypeZombieVillager, MobTypeHusk, MobTypeDrowned,
+	case MobTypeZombie, MobTypeZombieVillager, MobTypeHusk, MobTypeDrowned, "minecraft:zombified_piglin",
 		MobTypeSkeleton, MobTypeStray, MobTypeBogged, "minecraft:parched", MobTypeWitherSkeleton,
 		MobTypeSpider, "minecraft:cave_spider", MobTypeSilverfish, "minecraft:endermite",
 		MobTypeSlime, MobTypeMagmaCube,
 		MobTypePillager, MobTypeVindicator, MobTypeEvoker, MobTypeRavager, MobTypeVex, MobTypeIllusioner, MobTypeWitch,
 		MobTypePhantom, MobTypeWither, "minecraft:blaze", "minecraft:breeze",
+		MobTypeEnderman, MobTypeShulker, "minecraft:guardian", "minecraft:elder_guardian", "minecraft:ghast",
+		MobTypeWarden, MobTypeCreaking,
 		MobTypePiglin, MobTypePiglinBrute, MobTypeHoglin, MobTypeZoglin:
 		return true
 	default:
@@ -480,21 +483,19 @@ func IsIronGolemTargetableHostile(typeName string) bool {
 	}
 }
 
-// TickVillagerGolemSpawning checks villager clusters for panic (3+ villagers
-// near a hostile monster) or gossip gathering (5+ villagers) with no Iron Golem
-// within 16 blocks, and spawns a village Iron Golem when needed.
+// TickVillagerGolemSpawning implements `Villager.spawnGolemIfNeeded` + `GolemSensor`
+// + `VillagerHostilesSensor` in `26.1.2.jar`:
+//   - Updates `GolemSensor` (`16x16x16` AABB, `599`-tick memory TTL) on villagers near existing Iron Golems.
+//   - Only counts adult villagers satisfying `WantsVillagerToSpawnGolem2612` (`LAST_SLEPT < 24000` ticks
+//     and `GOLEM_DETECTED_RECENTLY` inactive) within `AABB.inflate(10, 10, 10)`.
+//   - Requires `>= 3` eligible villagers when panicked (`VillagerHostilesSensor` distances or `PanicTicks > 0`)
+//     or `>= 5` eligible villagers when gossiping, then spawns via `TrySpawnVillageIronGolemNear` (`LEGACY_IRON_GOLEM`)
+//     and sets `GOLEM_DETECTED_RECENTLY` (`599` ticks) on all villagers in the `10x10x10` box.
 func (s *Server) TickVillagerGolemSpawning(rng *rand.Rand) (spawnedGolemID int32, spawned bool) {
 	if s == nil || s.entities == nil {
 		return 0, false
 	}
 	gameTime, _ := s.WorldTime()
-	mgr := s.golemManager()
-	mgr.mu.RLock()
-	lastTick := mgr.lastVillageSpawnTick
-	mgr.mu.RUnlock()
-	if lastTick > 0 && gameTime >= lastTick && gameTime-lastTick < VillagerGolemSpawnCooldownTick {
-		return 0, false
-	}
 
 	allEnts := s.entities.AppendAll(nil)
 	var villagers []world.Entity
@@ -507,7 +508,7 @@ func (s *Server) TickVillagerGolemSpawning(rng *rand.Rand) (spawnedGolemID int32
 			villagers = append(villagers, e)
 		} else if norm == MobTypeIronGolem {
 			golems = append(golems, e)
-		} else if IsIronGolemTargetableHostile(norm) {
+		} else if _, ok := VillagerHostileAcceptableDistance2612(norm); ok {
 			hostiles = append(hostiles, e)
 		}
 	}
@@ -515,59 +516,82 @@ func (s *Server) TickVillagerGolemSpawning(rng *rand.Rand) (spawnedGolemID int32
 		return 0, false
 	}
 
-	groupRadSq := VillagerGolemGroupRadius * VillagerGolemGroupRadius
-	golemCheckSq := VillagerGolemCheckRadius * VillagerGolemCheckRadius
-
+	// `GolemSensor.checkForGolem`: scan `AABB.inflate(16, 16, 16)` around every villager.
+	vp := s.villagerPolish()
 	for i := range villagers {
 		v := &villagers[i]
 		dim := v.EffectiveDimension()
-
-		// Skip if an Iron Golem is already within 16 blocks.
-		hasGolem := false
 		for j := range golems {
 			g := &golems[j]
 			if g.EffectiveDimension() != dim {
 				continue
 			}
-			dx, dy, dz := g.X-v.X, g.Y-v.Y, g.Z-v.Z
-			if dx*dx+dy*dy+dz*dz <= golemCheckSq {
-				hasGolem = true
+			if math.Abs(g.X-v.X) <= VillagerGolemSensorBoxHalfSize+1.0 &&
+				math.Abs(g.Y-v.Y) <= VillagerGolemSensorBoxHalfSize+2.7 &&
+				math.Abs(g.Z-v.Z) <= VillagerGolemSensorBoxHalfSize+1.0 {
+				s.RecordVillagerDetectedGolem(v.ID, gameTime)
 				break
 			}
 		}
-		if hasGolem {
+	}
+
+	for i := range villagers {
+		v := &villagers[i]
+		if !s.WantsVillagerToSpawnGolem2612(v.ID, gameTime) {
 			continue
 		}
+		dim := v.EffectiveDimension()
 
-		// Count nearby adult villagers in the same dimension.
-		nearbyVillagers := 0
+		// Collect all villagers in `v.getBoundingBox().inflate(10.0, 10.0, 10.0)` and count eligible ones.
+		var inBoxIDs []int32
+		eligibleCount := 0
+		panicking := false
 		for j := range villagers {
 			other := &villagers[j]
 			if other.EffectiveDimension() != dim {
 				continue
 			}
-			dx, dy, dz := other.X-v.X, other.Y-v.Y, other.Z-v.Z
-			if dx*dx+dy*dy+dz*dz <= groupRadSq {
-				nearbyVillagers++
-			}
-		}
-
-		// Check if a hostile monster is within 16 blocks of this villager group.
-		panicking := false
-		for j := range hostiles {
-			h := &hostiles[j]
-			if h.EffectiveDimension() != dim {
+			if math.Abs(other.X-v.X) > VillagerGolemSummonBoxHalfSize+0.6 ||
+				math.Abs(other.Y-v.Y) > VillagerGolemSummonBoxHalfSize+1.95 ||
+				math.Abs(other.Z-v.Z) > VillagerGolemSummonBoxHalfSize+0.6 {
 				continue
 			}
-			dx, dy, dz := h.X-v.X, h.Y-v.Y, h.Z-v.Z
-			if dx*dx+dy*dy+dz*dz <= groupRadSq {
-				panicking = true
-				break
+			inBoxIDs = append(inBoxIDs, other.ID)
+			if s.WantsVillagerToSpawnGolem2612(other.ID, gameTime) {
+				eligibleCount++
+			}
+			if !panicking {
+				vp.mu.Lock()
+				if ve := vp.villagers[other.ID]; ve != nil && ve.PanicTicks > 0 {
+					panicking = true
+				}
+				vp.mu.Unlock()
+			}
+			if !panicking {
+				for k := range hostiles {
+					h := &hostiles[k]
+					if h.EffectiveDimension() != dim {
+						continue
+					}
+					maxDist, ok := VillagerHostileAcceptableDistance2612(h.TypeName)
+					if !ok {
+						continue
+					}
+					dx, dy, dz := h.X-other.X, h.Y-other.Y, h.Z-other.Z
+					if dx*dx+dy*dy+dz*dz <= maxDist*maxDist {
+						panicking = true
+						break
+					}
+				}
 			}
 		}
 
-		if (panicking && nearbyVillagers >= VillagerGolemPanicCount) || nearbyVillagers >= VillagerGolemGossipCount {
+		if (panicking && eligibleCount >= VillagerGolemPanicCount) || eligibleCount >= VillagerGolemGossipCount {
 			if id, ok := s.TrySpawnVillageIronGolemNear(dim, v.X, v.Y, v.Z, rng); ok {
+				for _, vid := range inBoxIDs {
+					s.RecordVillagerDetectedGolem(vid, gameTime)
+				}
+				mgr := s.golemManager()
 				mgr.mu.Lock()
 				mgr.lastVillageSpawnTick = gameTime
 				mgr.mu.Unlock()
@@ -578,8 +602,9 @@ func (s *Server) TickVillagerGolemSpawning(rng *rand.Rand) (spawnedGolemID int32
 	return 0, false
 }
 
-// TrySpawnVillageIronGolemNear finds a safe walkable position near (vx, vy, vz)
-// in dimension and spawns a village-created Iron Golem (PlayerCreated = false).
+// TrySpawnVillageIronGolemNear implements `SpawnUtil.trySpawnMob(..., 10, 8, 6, LEGACY_IRON_GOLEM)`
+// (`10` attempts, `dx, dz in [-8, 8]`, `dy` from `+6` down to `-6`), spawning a
+// village-created Iron Golem (`PlayerCreated = false`) only if a valid spot is found.
 func (s *Server) TrySpawnVillageIronGolemNear(dimension string, vx, vy, vz float64, rng *rand.Rand) (int32, bool) {
 	if s == nil || s.entities == nil {
 		return 0, false
@@ -599,20 +624,15 @@ func (s *Server) TrySpawnVillageIronGolemNear(dimension string, vx, vy, vz float
 				dx = rng.Intn(17) - 8
 				dz = rng.Intn(17) - 8
 			} else {
-				dx = (attempt % 5) - 2
-				dz = (attempt / 5) - 1
+				offsets := [10][2]int{{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}, {2, 0}, {-2, 0}, {0, 2}, {0, -2}, {2, 2}}
+				dx = offsets[attempt][0]
+				dz = offsets[attempt][1]
 			}
 			cx := baseX + dx
 			cz := baseZ + dz
-			for dy := 3; dy >= -3; dy-- {
+			for dy := 6; dy >= -6; dy-- {
 				cy := baseY + dy
-				if cy <= world.MinY+1 || cy >= world.MinY+world.WorldHeight-3 {
-					continue
-				}
-				floor := cache.GetBlock(cx, cy-1, cz)
-				if isSolidGroundBlock(floor) &&
-					isColumnPassableAt(cache, cx, cy, cz) &&
-					isPassableBlock(cache.GetBlock(cx, cy+2, cz)) {
+				if IsLegacyIronGolemSpawnSpot2612(cache, cx, cy, cz) {
 					spawnX = float64(cx) + 0.5
 					spawnY = float64(cy)
 					spawnZ = float64(cz) + 0.5
@@ -620,6 +640,9 @@ func (s *Server) TrySpawnVillageIronGolemNear(dimension string, vx, vy, vz float
 					break
 				}
 			}
+		}
+		if !found {
+			return 0, false
 		}
 	}
 	id, err := s.SpawnIronGolem(normDim, spawnX, spawnY, spawnZ, false)
@@ -671,6 +694,9 @@ func (s *Server) tickSingleIronGolem(golem *world.Entity, hostiles []world.Entit
 	if st.AttackCooldown > 0 {
 		st.AttackCooldown--
 	}
+	if st.AttackAnimationTick > 0 {
+		st.AttackAnimationTick--
+	}
 	curTargetID := st.TargetMobID
 	curCooldown := st.AttackCooldown
 	mgr.mu.Unlock()
@@ -714,6 +740,9 @@ func (s *Server) tickSingleIronGolem(golem *world.Entity, hostiles []world.Entit
 	mgr.mu.Lock()
 	st.TargetMobID = targetEnt.ID
 	mgr.mu.Unlock()
+	if s.IsIronGolemOfferingPoppy(golem.ID) {
+		s.StopIronGolemOfferPoppy(golem.ID)
+	}
 
 	s.stepEntityTowardPoint(golem, cache, feetY, targetEnt.X, targetEnt.Y, targetEnt.Z, IronGolemChaseSpeed, 1.5)
 	updatedGolem := s.entities.Get(golem.ID)
@@ -726,14 +755,10 @@ func (s *Server) tickSingleIronGolem(golem *world.Entity, hostiles []world.Entit
 	if dx*dx+dy*dy+dz*dz <= IronGolemAttackReach*IronGolemAttackReach && curCooldown <= 0 {
 		mgr.mu.Lock()
 		st.AttackCooldown = IronGolemAttackCooldownTicks
+		st.AttackAnimationTick = IronGolemAttackAnimationDurationTicks
 		mgr.mu.Unlock()
 
-		dmg := IronGolemMinAttackDamage
-		if rng != nil {
-			dmg += rng.Float32() * (IronGolemMaxAttackDamage - IronGolemMinAttackDamage)
-		} else {
-			dmg = 14.5
-		}
+		dmg := RollIronGolemAttackDamage2612(rng)
 
 		cp := updatedGolem.ChunkPos()
 		s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
@@ -745,17 +770,25 @@ func (s *Server) tickSingleIronGolem(golem *world.Entity, hostiles []world.Entit
 			s.DamageWither(targetEnt.ID, dmg, nil, false)
 			return
 		}
-		killed := s.applyDamageToMob(targetEnt, dmg, nil, 0.5, false, true)
+		kbRes := ResolveMobKnockbackResistance2612(s, targetEnt)
+		horizKB := 0.5
+		if kbRes >= 1.0 {
+			horizKB = 0
+		}
+		killed := s.applyDamageToMob(targetEnt, dmg, nil, horizKB, false, horizKB > 0)
 		if !killed {
-			// Apply Iron Golem's signature upward fling (vy = 0.45).
-			velY := clampVelocityShort(IronGolemFlingVelocityY)
-			s.entities.Update(targetEnt.ID, func(e *world.Entity) {
-				e.OnGround = false
-				e.VelocityY = velY
-				e.Y += IronGolemFlingVelocityY
-			})
-			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityMotion,
-				EncodeSetEntityMotionPacket(targetEnt.ID, 0, IronGolemFlingVelocityY, 0))
+			// Apply Iron Golem's signature upward fling (`0.4f * max(0, 1 - KNOCKBACK_RESISTANCE)`).
+			flingY := ComputeIronGolemVerticalFling2612(kbRes)
+			if flingY > 0 {
+				velY := clampVelocityShort(flingY)
+				s.entities.Update(targetEnt.ID, func(e *world.Entity) {
+					e.OnGround = false
+					e.VelocityY = velY
+					e.Y += flingY
+				})
+				s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlaySetEntityMotion,
+					EncodeSetEntityMotionPacket(targetEnt.ID, 0, flingY, 0))
+			}
 		} else {
 			mgr.mu.Lock()
 			st.TargetMobID = 0
