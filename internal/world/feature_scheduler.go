@@ -296,6 +296,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 	// places all referenced starts first and only then walks the feature
 	// steps. Their origins reach two chunks out because a portal template can
 	// span that far.
+	r.deferOceanRuinPhysics = true
 	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
 		return fmt.Errorf("world: structure starts (%d,%d): %w", targetX, targetZ, err)
 	}
@@ -322,6 +323,7 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 		if err := r.setSource(source.X, source.Z); err != nil {
 			return err
 		}
+		r.placePendingOceanRuinsForChunk(source.X, source.Z)
 		// Stage order within one source: lakes (1) carve the first air, so
 		// the geodes (2) and the monster rooms (3) validate against a world
 		// that already has it.
@@ -421,7 +423,12 @@ func (r *decorationRegion) replayScheduledOresWithSources(od *worldgen.Overworld
 			r.tickGrowingPlantHead(30, 55, 4)
 		}
 	}
+	r.flushRemainingPendingOceanRuins()
 	r.runPostProcessing(nil)
+	if len(r.deferredOceanRuinWritten) > 0 {
+		applyOceanRuinPhysics(r, r.deferredOceanRuinWritten)
+		r.deferredOceanRuinWritten = nil
+	}
 	return nil
 }
 

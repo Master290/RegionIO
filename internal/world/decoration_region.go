@@ -50,12 +50,16 @@ type decorationRegion struct {
 	// biomeZoomSeed is BiomeManager.obfuscateSeed(worldSeed), which getBiome needs
 	// and the chunks alone cannot supply. Every stage entry point that receives the
 	// world seed binds it; see bindSeed.
-	biomeZoomSeed        int64
-	biomeWorldSeed       int64
-	biomeZoomBound       bool
-	regionRandoms        map[[2]int32]worldgen.RandomSource
-	postProcessPositions [][3]int
-	postProcessSeen      map[[3]int]struct{}
+	biomeZoomSeed           int64
+	biomeWorldSeed          int64
+	biomeZoomBound          bool
+	regionRandoms           map[[2]int32]worldgen.RandomSource
+	postProcessPositions     [][3]int
+	postProcessSeen          map[[3]int]struct{}
+	deferOceanRuinPhysics    bool
+	deferredOceanRuinWritten [][3]int
+	pendingOceanRuins        []*pendingOceanRuinBatch
+	placedOceanRuinChunks    map[[2]int32]bool
 }
 
 func newDecorationRegion(chunks []*Chunk) (*decorationRegion, error) {
@@ -501,7 +505,7 @@ func (r *decorationRegion) runPostProcessing(set *worldgen.FeatureSet) {
 			continue
 		}
 		switch {
-		case info.Name == "minecraft:oak_fence" || info.Name == "minecraft:dark_oak_fence":
+		case IsFenceBlock(cur):
 			if next := r.resolvedFenceState(x, y, z, cur); next != cur {
 				r.setBlockGlobal(x, y, z, next)
 			}

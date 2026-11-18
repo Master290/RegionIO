@@ -2,6 +2,9 @@ package world
 
 import (
 	"fmt"
+	"math"
+	"sort"
+	"strconv"
 	"sync"
 
 	"regionio/internal/worldgen"
@@ -253,6 +256,8 @@ var (
 	ruinMossyBricksID   uint16
 	ruinAirID           uint16
 	ruinWaterID         uint16
+	ruinWaterLevelID    [16]uint16
+	ruinWaterLevelMap   map[uint16]int
 	ruinChestID         uint16
 	ruinChestWaterID    uint16
 	ruinSuspiciousSand  uint16
@@ -281,7 +286,13 @@ func initRuinPieceStates() {
 		ruinCrackedBricksID = must("minecraft:cracked_stone_bricks", nil)
 		ruinMossyBricksID = must("minecraft:mossy_stone_bricks", nil)
 		ruinAirID = must("minecraft:air", nil)
-		ruinWaterID = must("minecraft:water", nil)
+		ruinWaterLevelMap = make(map[uint16]int, 16)
+		for lvl := 0; lvl < 16; lvl++ {
+			id := must("minecraft:water", map[string]string{"level": strconv.Itoa(lvl)})
+			ruinWaterLevelID[lvl] = id
+			ruinWaterLevelMap[id] = lvl
+		}
+		ruinWaterID = ruinWaterLevelID[0]
 		ruinChestID = must("minecraft:chest", map[string]string{"facing": "north", "type": "single", "waterlogged": "false"})
 		ruinChestWaterID = must("minecraft:chest", map[string]string{"facing": "north", "type": "single", "waterlogged": "true"})
 		ruinSuspiciousSand = must("minecraft:suspicious_sand", nil)
@@ -293,22 +304,113 @@ func initRuinPieceStates() {
 	})
 }
 
+type oceanRuinMarkerSpec struct {
+	meta string
+	x    int
+	y    int
+	z    int
+}
+
+type oceanRuinSurvivorSpec struct {
+	x         int
+	y         int
+	z         int
+	state     uint16
+	lootTable string
+	lootSeed  int64
+}
+
+type preparedOceanRuinPiece struct {
+	isLarge       bool
+	liquidSources map[[3]int]bool
+	survivors     []oceanRuinSurvivorSpec
+	markers       []oceanRuinMarkerSpec
+}
+
+type pendingOceanRuinBatch struct {
+	pieces    []*preparedOceanRuinPiece
+	decorRngs map[[2]int32]*worldgen.WorldgenRandom
+	stepIdx   int
+	seed      int64
+}
+
+func (b *pendingOceanRuinBatch) chunkDecorRng(cx, cz int32) *worldgen.WorldgenRandom {
+	key := [2]int32{cx, cz}
+	if r := b.decorRngs[key]; r != nil {
+		return r
+	}
+	r, decSeed := worldgen.DecorationRandom(b.seed, int(cx), int(cz))
+	r.SetFeatureSeed(decSeed, b.stepIdx, 4)
+	b.decorRngs[key] = r
+	return r
+}
+
+func (r *decorationRegion) placePendingOceanRuinsForChunk(cx, cz int32) {
+	if r == nil || len(r.pendingOceanRuins) == 0 {
+		return
+	}
+	if r.placedOceanRuinChunks == nil {
+		r.placedOceanRuinChunks = make(map[[2]int32]bool, len(r.chunks))
+	}
+	key := [2]int32{cx, cz}
+	if r.placedOceanRuinChunks[key] {
+		return
+	}
+	r.placedOceanRuinChunks[key] = true
+	for _, batch := range r.pendingOceanRuins {
+		for _, prep := range batch.pieces {
+			w := placePreparedOceanRuinPieceInChunk(r, batch, prep, cx, cz, true)
+			if len(w) > 0 {
+				r.deferredOceanRuinWritten = append(r.deferredOceanRuinWritten, w...)
+			}
+		}
+	}
+}
+
+func (r *decorationRegion) flushRemainingPendingOceanRuins() {
+	if r == nil || len(r.pendingOceanRuins) == 0 {
+		return
+	}
+	keys := make([][2]int32, 0, len(r.chunks))
+	for k := range r.chunks {
+		if r.placedOceanRuinChunks == nil || !r.placedOceanRuinChunks[k] {
+			keys = append(keys, k)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i][0] != keys[j][0] {
+			return keys[i][0] < keys[j][0]
+		}
+		return keys[i][1] < keys[j][1]
+	})
+	for _, k := range keys {
+		r.placePendingOceanRuinsForChunk(k[0], k[1])
+	}
+	r.pendingOceanRuins = nil
+}
+
 // PlaceOceanRuinPieces writes every piece of one start into the region,
 // mirroring OceanRuinPiece.postProcess per piece: tree-point descend of the
 // template position onto the ocean floor, then the block pass with the
 // processor stack, then the chest/drowned data markers. random is the shared
 // structure stream; the chest loot seeds draw one nextLong each.
 //
-// After every piece places, applyOceanRuinPhysics replays the two block-tick
-// effects the saved vanilla chunks carry (proven by the -no-features capture
-// of chunk (7,4)/(7,5) and the empty saved tick lists of the kept world): the
-// falling-block pass of FallingBlock.updateShape/tick (gravel and sand the
-// integrity pass leaves over water fall one cell onto the first non-free
-// block; the vacated cells refill with source water via the two-horizontal-
-// neighbours rule) and the bubble columns BubbleColumnBlock.updateColumn
-// grows above magma that survives the final placement.
+// When deferOceanRuinPhysics is enabled on the region, prepared pieces wait
+// until each source chunk begins its FEATURES pass (mirroring applyBiomeDecoration)
+// and falling-block + fluid physics replay after Stage 9 so neighboring chunks
+// do not grow seagrass onto ruin roofs prematurely or overwrite ruin water pockets.
 func PlaceOceanRuinPieces(region *decorationRegion, random *worldgen.Legacy, stub *OceanRuinStub, seed int64) error {
 	initRuinPieceStates()
+
+	structureID := "minecraft:ocean_ruin_cold"
+	if stub.BiomeType == "warm" {
+		structureID = "minecraft:ocean_ruin_warm"
+	}
+	batch := &pendingOceanRuinBatch{
+		decorRngs: make(map[[2]int32]*worldgen.WorldgenRandom),
+		stepIdx:   worldgen.StructureIndexInStep(structureID),
+		seed:      seed,
+	}
 
 	baseX, baseZ := stub.X, stub.Z
 	rot := stub.Rotation
@@ -318,18 +420,29 @@ func PlaceOceanRuinPieces(region *decorationRegion, random *worldgen.Legacy, stu
 		if piece.HasCustomPos {
 			px, pz, prot = piece.X, piece.Z, piece.Rotation
 		}
-		w, err := placeOceanRuinPiece(region, random, stub, piece, px, pz, prot, seed)
+		prep, err := prepareOceanRuinPiece(region, stub, piece, px, pz, prot, seed)
 		if err != nil {
 			return err
 		}
-		written = append(written, w...)
+		if region.deferOceanRuinPhysics {
+			batch.pieces = append(batch.pieces, prep)
+		} else {
+			w := placePreparedOceanRuinPieceInChunk(region, batch, prep, 0, 0, false)
+			written = append(written, w...)
+		}
 	}
-	applyOceanRuinPhysics(region, written)
+	if region.deferOceanRuinPhysics {
+		if len(batch.pieces) > 0 {
+			region.pendingOceanRuins = append(region.pendingOceanRuins, batch)
+		}
+	} else {
+		applyOceanRuinPhysics(region, written)
+	}
 	recordStructureStartInRegion(region, oceanRuinStartRecord(stub))
 	return nil
 }
 
-func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub *OceanRuinStub, piece oceanRuinPieceSpec, baseX, baseZ int, rot int32, seed int64) ([][3]int, error) {
+func prepareOceanRuinPiece(region *decorationRegion, stub *OceanRuinStub, piece oceanRuinPieceSpec, baseX, baseZ int, rot int32, seed int64) (*preparedOceanRuinPiece, error) {
 	blocks, size, err := loadTemplateCached(piece.Template)
 	if err != nil {
 		return nil, err
@@ -375,59 +488,30 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 	}
 
 	// Processor pass mirrors StructureTemplate.processBlockInfos +
-	// CappedProcessor.finalizeProcessing:
-	//   - BlockRotProcessor drops cells whose positional roll (in 26.1.2
-	//     RandomSource.create is a Legacy LCG, not Xoroshiro) exceeds
-	//     integrity; its rottable_blocks set is empty for the 1-arg
-	//     constructor, so every cell rolls;
-	//   - BlockIgnoreProcessor.STRUCTURE_AND_AIR removes air and
-	//     structure_block cells from the placement list;
-	//   - the archaeology CappedProcessor then shuffles the survivor indices
-	//     with a Legacy source seeded from the piece position and converts
-	//     the first five gravel (cold) / sand (warm) cells it touches.
-	//     Cells the shuffle never converts are still placed unchanged — the
-	//     cap counts changed cells only, it does not drop the rest.
-	// Data markers are NOT part of the placement list: handleDataMarker reads
-	// them back raw from the template (filterBlocks skips the processors), so
-	// marker cells are never placed as structure_block and their effects land
-	// on whatever the pass left at their position.
-	type marker struct {
-		meta    string
-		x, y, z int
-	}
-	type kept struct {
-		x, y, z, state int
-		lootTable      string
-		lootSeed       int64
-	}
-	var markers []marker
-	var survivors []kept
+	// CappedProcessor.finalizeProcessing.
+	var markers []oceanRuinMarkerSpec
+	var survivors []oceanRuinSurvivorSpec
 	for _, b := range blocks {
 		p := worldgen.TransformBlockPos(b.Pos, "none", int(rot), [3]int{0, 0, 0})
 		x, y, z := tpX+p[0], tpY+p[1], tpZ+p[2]
 
 		if b.HasNBT {
-			markers = append(markers, marker{meta: b.Marker, x: x, y: y, z: z})
+			markers = append(markers, oceanRuinMarkerSpec{meta: b.Marker, x: x, y: y, z: z})
 		}
 		rng := worldgen.NewLegacy(worldgen.MthGetSeed(x, y, z))
 		if rng.NextFloat() > piece.Integrity {
 			continue
 		}
 		state := b.State
-		// BlockIgnoreProcessor.STRUCTURE_AND_AIR ignores by block identity:
-		// air plus every structure_block variant (the templates carry
-		// mode=data markers the default mode=load state does not equal).
+		// BlockIgnoreProcessor.STRUCTURE_AND_AIR ignores by block identity.
 		if state == ruinAirID || state == ruinStructureVoid || isStructureBlockState(state) {
 			continue
 		}
-		survivors = append(survivors, kept{x: x, y: y, z: z, state: int(state)})
+		survivors = append(survivors, oceanRuinSurvivorSpec{x: x, y: y, z: z, state: uint16(state)})
 	}
 
-	// CappedProcessor.finalizeProcessing: the per-piece source is
-	// Legacy(getSeed(pieceTP) XOR factory), where factory is the first
-	// NextLong of a Legacy source seeded with the world seed. Indices over
-	// the survivor list are shuffled with backward Fisher-Yates (the
-	// shufledListIntStream order), and ConstantInt(5) caps CHANGED cells.
+	// CappedProcessor.finalizeProcessing: convert up to 5 sand (warm) or
+	// gravel (cold) blocks to their suspicious archaeology equivalents.
 	shuffle := worldgen.NewLegacy(worldgen.MthGetSeed(tpX, tpY, tpZ) ^ worldgen.NewLegacy(seed).NextLong())
 	order := make([]int, len(survivors))
 	for i := range order {
@@ -447,22 +531,63 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 			break
 		}
 		c := &survivors[idx]
-		if stub.BiomeType == "cold" && c.state == int(ruinGravelID) {
-			c.state = int(ruinSuspiciousGrav)
+		if stub.BiomeType == "cold" && c.state == ruinGravelID {
+			c.state = ruinSuspiciousGrav
 			converted++
 			c.lootTable = "minecraft:archaeology/ocean_ruin_cold"
 			c.lootSeed = worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
-		} else if stub.BiomeType == "warm" && c.state == int(ruinSandID) {
-			c.state = int(ruinSuspiciousSand)
+		} else if stub.BiomeType == "warm" && c.state == ruinSandID {
+			c.state = ruinSuspiciousSand
 			converted++
 			c.lootTable = "minecraft:archaeology/ocean_ruin_warm"
 			c.lootSeed = worldgen.NewLegacy(worldgen.MthGetSeed(c.x, c.y, c.z)).NextLong()
 		}
 	}
+	liquidSources := make(map[[3]int]bool)
+	for i := range survivors {
+		survivors[i].state = rotateTemplateState(survivors[i].state, int(rot))
+		if isWaterSourceForRuinTemplate(survivors[i].state) {
+			liquidSources[[3]int{survivors[i].x, survivors[i].y, survivors[i].z}] = true
+		}
+	}
+	return &preparedOceanRuinPiece{
+		isLarge:       piece.IsLarge,
+		liquidSources: liquidSources,
+		survivors:     survivors,
+		markers:       markers,
+	}, nil
+}
+
+func placePreparedOceanRuinPieceInChunk(region *decorationRegion, batch *pendingOceanRuinBatch, prep *preparedOceanRuinPiece, cx, cz int32, chunkOnly bool) [][3]int {
+	inTarget := func(x, z int) bool {
+		return !chunkOnly || (int32(x>>4) == cx && int32(z>>4) == cz)
+	}
 	var written [][3]int
-	for _, c := range survivors {
-		if region.setBlock(c.x, c.y, c.z, uint16(c.state)) {
-			written = append(written, [3]int{c.x, c.y, c.z})
+	var needsWaterlogging [][3]int
+	for _, c := range prep.survivors {
+		if !inTarget(c.x, c.z) {
+			continue
+		}
+		state := c.state
+		pos := [3]int{c.x, c.y, c.z}
+		hadWaterSource := isWaterSourceForRuinTemplate(region.getBlock(c.x, c.y, c.z))
+		trackNeedWL := false
+		if !isWaterSourceForRuinTemplate(state) {
+			if st, ok := stateByID(state); ok && st.Properties["waterlogged"] == "false" {
+				if hadWaterSource {
+					if wlState, ok := withStateProperty(state, "waterlogged", "true"); ok {
+						state = wlState
+					}
+				} else {
+					trackNeedWL = true
+				}
+			}
+		}
+		if region.setBlockGlobal(c.x, c.y, c.z, state) {
+			written = append(written, pos)
+			if trackNeedWL {
+				needsWaterlogging = append(needsWaterlogging, pos)
+			}
 			if c.lootTable != "" {
 				region.addStructureBlockEntity(StructureBlockEntity{
 					ID:            "minecraft:brushable_block",
@@ -478,29 +603,78 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 		}
 	}
 
+	// StructureTemplate.placeInWorld waterlogging propagation (UP, N, E, S, W)
+	// against pre-existing source water (excluding fluid placed by the template).
+	wlDirs := [5][3]int{{0, 1, 0}, {0, 0, -1}, {1, 0, 0}, {0, 0, 1}, {-1, 0, 0}}
+	for changed := true; changed && len(needsWaterlogging) > 0; {
+		changed = false
+		keptWL := needsWaterlogging[:0]
+		for _, pos := range needsWaterlogging {
+			waterloggedNow := false
+			for _, d := range wlDirs {
+				adj := [3]int{pos[0] + d[0], pos[1] + d[1], pos[2] + d[2]}
+				if !prep.liquidSources[adj] && isWaterSourceForRuinTemplate(region.getBlock(adj[0], adj[1], adj[2])) {
+					cur := region.getBlock(pos[0], pos[1], pos[2])
+					if wlState, ok := withStateProperty(cur, "waterlogged", "true"); ok && wlState != cur {
+						region.setBlockGlobal(pos[0], pos[1], pos[2], wlState)
+					}
+					waterloggedNow = true
+					changed = true
+					break
+				}
+			}
+			if !waterloggedNow {
+				keptWL = append(keptWL, pos)
+			}
+		}
+		needsWaterlogging = keptWL
+	}
+
+	// StructureTemplate.placeInWorld runs updateShapeAtEdge +
+	// updateFromNeighbourShapes when knownShape is false; update stair shapes
+	// after BlockRotProcessor dropouts and waterlogging.
+	if len(written) > 0 {
+		stairChecked := make(map[[3]int]bool, len(written))
+		var stairUpdates [][4]int
+		horizDirs := [5][2]int{{0, 0}, {0, -1}, {1, 0}, {0, 1}, {-1, 0}}
+		for _, pos := range written {
+			for _, d := range horizDirs {
+				sp := [3]int{pos[0] + d[0], pos[1], pos[2] + d[1]}
+				if stairChecked[sp] {
+					continue
+				}
+				stairChecked[sp] = true
+				cur := region.getBlock(sp[0], sp[1], sp[2])
+				if !IsStairsBlock(cur) {
+					continue
+				}
+				if updated := regionResolveStairsStateAt(region, sp[0], sp[1], sp[2], cur); updated != cur {
+					stairUpdates = append(stairUpdates, [4]int{sp[0], sp[1], sp[2], int(updated)})
+				}
+			}
+		}
+		for _, upd := range stairUpdates {
+			region.setBlockGlobal(upd[0], upd[1], upd[2], uint16(upd[3]))
+		}
+	}
+
 	// Data markers (handleDataMarker), after the placement pass, on the raw
-	// template positions. The chest's waterlogged flag comes from the fluid
-	// at its marker cell and it draws one nextLong (its loot-table seed) from
-	// the shared stream. The drowned marker create the entity and, when that
-	// succeeds, set the cell to air above sea level or water below it. The
-	// fixture capture proves the create returns null during worldgen (both
-	// drowned marker cells keep their underneath states), so no cell write is
-	// replayed and no nextLong is drawn.
-	for _, m := range markers {
+	// template positions.
+	for _, m := range prep.markers {
+		if !inTarget(m.x, m.z) {
+			continue
+		}
 		switch m.meta {
 		case "chest":
 			chest := ruinChestID
-			if isWaterState(region.getBlock(m.x, m.y, m.z)) {
+			if isWaterSourceForRuinTemplate(region.getBlock(m.x, m.y, m.z)) {
 				chest = ruinChestWaterID
 			}
-			placedChest := region.setBlock(m.x, m.y, m.z, chest)
-			if placedChest {
+			if region.setBlockGlobal(m.x, m.y, m.z, chest) {
 				written = append(written, [3]int{m.x, m.y, m.z})
-			}
-			lootSeed := random.NextLong()
-			if placedChest {
+				lootSeed := batch.chunkDecorRng(int32(m.x>>4), int32(m.z>>4)).NextLong()
 				lootTable := "minecraft:chests/underwater_ruin_small"
-				if piece.IsLarge {
+				if prep.isLarge {
 					lootTable = "minecraft:chests/underwater_ruin_big"
 				}
 				region.addStructureBlockEntity(StructureBlockEntity{
@@ -513,7 +687,13 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 				})
 			}
 		case "drowned":
-			// Entity create is null during generation: no air/water write.
+			fill := ruinWaterID
+			if m.y > SeaLevel {
+				fill = StateAir
+			}
+			if region.setBlockGlobal(m.x, m.y, m.z, fill) {
+				written = append(written, [3]int{m.x, m.y, m.z})
+			}
 			region.addStructureEntity(StructureEntity{
 				ID:                  "minecraft:drowned",
 				X:                   float64(m.x) + 0.5,
@@ -526,7 +706,7 @@ func placeOceanRuinPiece(region *decorationRegion, random *worldgen.Legacy, stub
 			})
 		}
 	}
-	return written, nil
+	return written
 }
 
 var (
@@ -558,8 +738,170 @@ var (
 //     water cells becomes source water itself (the infinite-water rule both
 //     vacated cells of the fixture exercise; underwater ruin holes sit in
 //     open ocean where this always holds).
+type ruinFallingEntity struct {
+	x       int
+	y, vy   float64
+	z       int
+	state   uint16
+	shatter bool
+}
+
 func applyOceanRuinPhysics(region *decorationRegion, written [][3]int) {
-	// 1. Bubble columns above surviving magma.
+	if len(written) == 0 {
+		return
+	}
+	blockTicks := make(map[int][][3]int)
+	seenBlock := make(map[[4]int]bool)
+	fluidTicks := make(map[int][][3]int)
+	seenFluid := make(map[[4]int]bool)
+	maxTick := 0
+
+	scheduleBlock := func(tick, x, y, z int) {
+		if y < MinY || y >= MinY+WorldHeight {
+			return
+		}
+		k := [4]int{tick, x, y, z}
+		if seenBlock[k] {
+			return
+		}
+		seenBlock[k] = true
+		blockTicks[tick] = append(blockTicks[tick], [3]int{x, y, z})
+		if tick > maxTick {
+			maxTick = tick
+		}
+	}
+	dirs6 := [6][3]int{{-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}, {0, -1, 0}, {0, 1, 0}}
+	scheduleFluid := func(tick, x, y, z int) {
+		if y < MinY || y >= MinY+WorldHeight {
+			return
+		}
+		if hw, _, _, _ := ruinWaterFluid(region.getBlock(x, y, z)); !hw {
+			return
+		}
+		k := [4]int{tick, x, y, z}
+		if seenFluid[k] {
+			return
+		}
+		seenFluid[k] = true
+		fluidTicks[tick] = append(fluidTicks[tick], [3]int{x, y, z})
+		if tick > maxTick {
+			maxTick = tick
+		}
+	}
+	scheduleFluidWithNeighbors := func(tick, x, y, z int) {
+		scheduleFluid(tick, x, y, z)
+		for _, d := range dirs6 {
+			scheduleFluid(tick, x+d[0], y+d[1], z+d[2])
+		}
+	}
+
+	// ProtoChunkTicks stores delay=0 for both blockTicks (FallingBlock /
+	// BrushableBlock updateShape) and fluidTicks (LiquidBlock.updateShape via
+	// StructureTemplate.updateShapeAtEdge), so both fire on unpacked tick 1.
+	for _, p := range written {
+		if isRuinFallingState(region.getBlock(p[0], p[1], p[2])) {
+			scheduleBlock(1, p[0], p[1], p[2])
+		}
+		scheduleFluidWithNeighbors(1, p[0], p[1], p[2])
+	}
+
+	var entities []ruinFallingEntity
+	for t := 1; t <= 400; t++ {
+		if len(entities) == 0 && t > maxTick {
+			break
+		}
+
+		// 1. Scheduled blockTicks: FallingBlock.tick / BrushableBlock.tick.
+		if bq := blockTicks[t]; len(bq) > 0 {
+			delete(blockTicks, t)
+			sort.SliceStable(bq, func(i, j int) bool {
+				return bq[i][1] < bq[j][1]
+			})
+			for _, p := range bq {
+				x, y, z := p[0], p[1], p[2]
+				state := region.getBlock(x, y, z)
+				if !isRuinFallingState(state) {
+					continue
+				}
+				if y-1 < MinY || !isRuinFallFree(region.getBlock(x, y-1, z)) {
+					continue
+				}
+				region.setBlockGlobal(x, y, z, StateAir)
+				scheduleFluidWithNeighbors(t+5, x, y, z)
+				scheduleBlock(t+2, x, y+1, z)
+				for ay := y + 1; ay < MinY+WorldHeight; ay++ {
+					plant := region.getBlock(x, ay, z)
+					if !isRuinUnsupportedPlantAbove(plant) {
+						break
+					}
+					// Level.destroyBlock replaces destroyed underwater vegetation with
+					// getFluidState().createLegacyBlock() (water[level=0]), not air.
+					replacement := StateAir
+					if isWaterSourceForRuinTemplate(plant) {
+						replacement = ruinWaterID
+					}
+					region.setBlockGlobal(x, ay, z, replacement)
+					scheduleFluidWithNeighbors(t+5, x, ay, z)
+				}
+				entities = append(entities, ruinFallingEntity{
+					x:       x,
+					y:       float64(y),
+					z:       z,
+					state:   state,
+					shatter: state == ruinSuspiciousSand || state == ruinSuspiciousGrav,
+				})
+			}
+		}
+
+		// 2. Scheduled fluidTicks: WaterFluid / FlowingFluid.tick.
+		if fq := fluidTicks[t]; len(fq) > 0 {
+			delete(fluidTicks, t)
+			for _, p := range fq {
+				ruinTickFluidAt(region, p[0], p[1], p[2], func(cx, cy, cz int) {
+					scheduleFluidWithNeighbors(t+5, cx, cy, cz)
+				})
+			}
+		}
+
+		// 3. FallingBlockEntity physics step (gravity -0.04, 0.98 drag).
+		if len(entities) > 0 {
+			sort.SliceStable(entities, func(i, j int) bool {
+				return entities[i].y < entities[j].y
+			})
+			kept := entities[:0]
+			for _, e := range entities {
+				e.vy -= 0.04
+				nextY := e.y + e.vy
+				landed := false
+				for checkY := int(math.Floor(e.y)) - 1; checkY >= int(math.Floor(nextY)); checkY-- {
+					if checkY < MinY || !isRuinFallFree(region.getBlock(e.x, checkY, e.z)) {
+						landY := checkY + 1
+						landed = true
+						if !e.shatter && landY >= MinY && landY < MinY+WorldHeight && isRuinFallFree(region.getBlock(e.x, landY, e.z)) {
+							prevLand := region.getBlock(e.x, landY, e.z)
+							if blockNameEquals(prevLand, "minecraft:tall_seagrass") && landY+1 < MinY+WorldHeight &&
+								blockNameEquals(region.getBlock(e.x, landY+1, e.z), "minecraft:tall_seagrass") {
+								region.setBlockGlobal(e.x, landY+1, e.z, ruinWaterID)
+								scheduleFluidWithNeighbors(t+5, e.x, landY+1, e.z)
+							}
+							region.setBlockGlobal(e.x, landY, e.z, e.state)
+							scheduleBlock(t+2, e.x, landY, e.z)
+							scheduleFluidWithNeighbors(t+5, e.x, landY, e.z)
+						}
+						break
+					}
+				}
+				if !landed {
+					e.y = nextY
+					e.vy *= 0.98
+					kept = append(kept, e)
+				}
+			}
+			entities = kept
+		}
+	}
+
+	// 4. Bubble columns above surviving magma.
 	for _, p := range written {
 		if region.getBlock(p[0], p[1], p[2]) != ruinMagmaID {
 			continue
@@ -568,51 +910,390 @@ func applyOceanRuinPhysics(region *decorationRegion, written [][3]int) {
 			if region.getBlock(p[0], y, p[2]) != ruinWaterID {
 				break
 			}
-			region.setBlock(p[0], y, p[2], ruinBubbleDown)
+			region.setBlockGlobal(p[0], y, p[2], ruinBubbleDown)
 		}
 	}
+}
 
-	// 2. Falling pass, repeated to a fixpoint so stacked falls cascade.
-	var vacated [][3]int
-	tracked := written
-	for moved := true; moved; {
-		moved = false
-		for _, p := range tracked {
-			state := region.getBlock(p[0], p[1], p[2])
-			if !isRuinFallingState(state) {
-				continue
-			}
-			if p[1]-1 < MinY || !isRuinFallFree(region.getBlock(p[0], p[1]-1, p[2])) {
-				continue
-			}
-			land := p[1] - 1
-			for land-1 >= MinY && isRuinFallFree(region.getBlock(p[0], land-1, p[2])) {
-				land--
-			}
-			region.setBlock(p[0], land, p[2], state)
-			region.setBlock(p[0], p[1], p[2], StateAir)
-			region.moveStructureBlockEntity(p[0], p[1], p[2], p[0], land, p[2])
-			vacated = append(vacated, [3]int{p[0], p[1], p[2]})
-			tracked = append(tracked, [3]int{p[0], land, p[2]})
-			moved = true
-		}
-	}
+var ruinUnsupportedPlants = map[string]bool{
+	"minecraft:seagrass":         true,
+	"minecraft:tall_seagrass":    true,
+	"minecraft:kelp":             true,
+	"minecraft:kelp_plant":       true,
+	"minecraft:sea_pickle":       true,
+	"minecraft:tube_coral":       true,
+	"minecraft:brain_coral":      true,
+	"minecraft:bubble_coral":     true,
+	"minecraft:fire_coral":       true,
+	"minecraft:horn_coral":       true,
+	"minecraft:tube_coral_fan":   true,
+	"minecraft:brain_coral_fan":  true,
+	"minecraft:bubble_coral_fan": true,
+	"minecraft:fire_coral_fan":   true,
+	"minecraft:horn_coral_fan":   true,
+}
 
-	// 3. Refill vacated cells with source water.
-	for _, v := range vacated {
-		if region.getBlock(v[0], v[1], v[2]) != StateAir {
-			continue // a later fall re-filled the cell with a block.
-		}
-		sources := 0
-		for _, d := range [4][2]int{{1, 0}, {-1, 0}, {0, 1}, {0, -1}} {
-			if region.getBlock(v[0]+d[0], v[1], v[2]+d[1]) == ruinWaterID {
-				sources++
-			}
-		}
-		if sources >= 2 {
-			region.setBlock(v[0], v[1], v[2], ruinWaterID)
+func isRuinUnsupportedPlantAbove(state uint16) bool {
+	if state == 0 {
+		return false
+	}
+	st, ok := stateByID(state)
+	return ok && ruinUnsupportedPlants[st.Name]
+}
+
+type ruinHorizDir struct {
+	dx, dz, face int
+}
+
+// Direction order follows Direction.3DDataValue(): 0=DOWN, 1=UP, 2=NORTH, 3=SOUTH, 4=WEST, 5=EAST.
+var ruinHorizDirs4 = [4]ruinHorizDir{
+	{0, -1, 2}, // NORTH
+	{1, 0, 5},  // EAST
+	{0, 1, 3},  // SOUTH
+	{-1, 0, 4}, // WEST
+}
+
+func ruinOcclusionFaceMask(state uint16, dir int) (fullBlock bool, mask [32]byte, nonEmpty bool) {
+	if int(state) >= len(blockStateFlags) {
+		return false, mask, false
+	}
+	f := blockStateFlags[state]
+	if f&flagCanOcclude == 0 {
+		return false, mask, false
+	}
+	if f&flagShapeForOcclusion == 0 {
+		return true, mask, true
+	}
+	shape := lightFaceShapes[blockLightShape[state]]
+	copy(mask[:], shape[dir*32:(dir+1)*32])
+	return false, mask, true
+}
+
+func ruinCanPassThroughWall(from, into uint16, direction int) bool {
+	opposite := [6]int{1, 0, 3, 2, 5, 4}
+	fromFull, fromMask, fromNonEmpty := ruinOcclusionFaceMask(from, direction)
+	if fromFull {
+		return false
+	}
+	intoFull, intoMask, intoNonEmpty := ruinOcclusionFaceMask(into, opposite[direction])
+	if intoFull {
+		return false
+	}
+	if !fromNonEmpty && !intoNonEmpty {
+		return true
+	}
+	for i := 0; i < 32; i++ {
+		if fromMask[i]|intoMask[i] != 0xff {
+			return true
 		}
 	}
+	return false
+}
+
+func ruinWaterFluid(state uint16) (hasWater, isSource, falling bool, amount int) {
+	if lvl, ok := ruinWaterLevelMap[state]; ok {
+		if lvl == 0 {
+			return true, true, false, 8
+		}
+		if lvl >= 8 {
+			return true, false, true, 8
+		}
+		return true, false, false, 8 - lvl
+	}
+	if isWaterSourceForRuinTemplate(state) {
+		return true, true, false, 8
+	}
+	return false, false, false, 0
+}
+
+func ruinFluidToBlockState(hasWater, isSource, falling bool, amount int) uint16 {
+	if !hasWater || amount <= 0 {
+		return StateAir
+	}
+	if isSource {
+		return ruinWaterLevelID[0]
+	}
+	if falling {
+		return ruinWaterLevelID[8]
+	}
+	lvl := 8 - amount
+	if lvl < 1 {
+		lvl = 1
+	} else if lvl > 7 {
+		lvl = 7
+	}
+	return ruinWaterLevelID[lvl]
+}
+
+func ruinCanHoldWater(state uint16) bool {
+	if state == StateAir {
+		return true
+	}
+	lvl, ok := ruinWaterLevelMap[state]
+	return ok && lvl >= 1
+}
+
+func ruinIsWaterHole(region *decorationRegion, x, y, z int) bool {
+	if y-1 < MinY {
+		return false
+	}
+	cur := region.getBlock(x, y, z)
+	below := region.getBlock(x, y-1, z)
+	if !ruinCanPassThroughWall(cur, below, 0) {
+		return false
+	}
+	hw, _, _, _ := ruinWaterFluid(below)
+	return hw || ruinCanHoldWater(below)
+}
+
+func ruinGetNewWater(region *decorationRegion, x, y, z int) (hasWater, isSource, falling bool, amount int) {
+	cur := region.getBlock(x, y, z)
+	sourceCount := 0
+	maxAmt := 0
+	for _, d := range ruinHorizDirs4 {
+		nb := region.getBlock(x+d.dx, y, z+d.dz)
+		hw, src, _, amt := ruinWaterFluid(nb)
+		if !hw || !ruinCanPassThroughWall(cur, nb, d.face) {
+			continue
+		}
+		if src {
+			sourceCount++
+		}
+		if amt > maxAmt {
+			maxAmt = amt
+		}
+	}
+	if sourceCount >= 2 && y-1 >= MinY {
+		below := region.getBlock(x, y-1, z)
+		_, belowSrc, _, _ := ruinWaterFluid(below)
+		if isSolidState(below) || belowSrc {
+			return true, true, false, 8
+		}
+	}
+	if y+1 < MinY+WorldHeight {
+		above := region.getBlock(x, y+1, z)
+		if hwAbove, _, _, _ := ruinWaterFluid(above); hwAbove && ruinCanPassThroughWall(cur, above, 1) {
+			return true, false, true, 8
+		}
+	}
+	if maxAmt-1 <= 0 {
+		return false, false, false, 0
+	}
+	return true, false, false, maxAmt - 1
+}
+
+func ruinSlopeDistance(region *decorationRegion, x, y, z, dist, excludeFace int) int {
+	cur := region.getBlock(x, y, z)
+	opposite := [6]int{1, 0, 3, 2, 5, 4}
+	best := 1000
+	for _, d := range ruinHorizDirs4 {
+		if d.face == excludeFace {
+			continue
+		}
+		nx, nz := x+d.dx, z+d.dz
+		nb := region.getBlock(nx, y, nz)
+		_, nbSrc, _, _ := ruinWaterFluid(nb)
+		if nbSrc || !ruinCanHoldWater(nb) || !ruinCanPassThroughWall(cur, nb, d.face) {
+			continue
+		}
+		if ruinIsWaterHole(region, nx, y, nz) {
+			return dist
+		}
+		if dist < 4 {
+			if sub := ruinSlopeDistance(region, nx, y, nz, dist+1, opposite[d.face]); sub < best {
+				best = sub
+			}
+		}
+	}
+	return best
+}
+
+func ruinSpreadToSides(region *decorationRegion, x, y, z int, cur uint16, falling bool, amt int, scheduleFn func(nx, ny, nz int)) {
+	sideAmt := amt - 1
+	if falling {
+		sideAmt = 7
+	}
+	if sideAmt <= 0 {
+		return
+	}
+	opposite := [6]int{1, 0, 3, 2, 5, 4}
+	minDist := 1000
+	var winDirs []ruinHorizDir
+	for _, d := range ruinHorizDirs4 {
+		nx, nz := x+d.dx, z+d.dz
+		nb := region.getBlock(nx, y, nz)
+		_, nbSrc, _, _ := ruinWaterFluid(nb)
+		if nbSrc || !ruinCanHoldWater(nb) || !ruinCanPassThroughWall(cur, nb, d.face) {
+			continue
+		}
+		dist := 0
+		if !ruinIsWaterHole(region, nx, y, nz) {
+			dist = ruinSlopeDistance(region, nx, y, nz, 1, opposite[d.face])
+		}
+		if dist < minDist {
+			winDirs = winDirs[:0]
+			minDist = dist
+		}
+		if dist <= minDist {
+			if nb == StateAir {
+				winDirs = append(winDirs, d)
+			}
+			minDist = dist
+		}
+	}
+	for _, d := range winDirs {
+		nx, nz := x+d.dx, z+d.dz
+		shw, ssrc, sfall, samt := ruinGetNewWater(region, nx, y, nz)
+		sb := ruinFluidToBlockState(shw, ssrc, sfall, samt)
+		if shw && sb != StateAir {
+			region.setBlockGlobal(nx, y, nz, sb)
+			scheduleFn(nx, y, nz)
+		}
+	}
+}
+
+func ruinTickFluidAt(region *decorationRegion, x, y, z int, scheduleFn func(nx, ny, nz int)) {
+	cur := region.getBlock(x, y, z)
+	hw, src, falling, amt := ruinWaterFluid(cur)
+	if !hw {
+		return
+	}
+	if !src && ruinCanHoldWater(cur) {
+		nhw, nsrc, nfall, namt := ruinGetNewWater(region, x, y, z)
+		nb := ruinFluidToBlockState(nhw, nsrc, nfall, namt)
+		if nb != cur {
+			region.setBlockGlobal(x, y, z, nb)
+			scheduleFn(x, y, z)
+			cur = nb
+		}
+		hw, src, falling, amt = nhw, nsrc, nfall, namt
+		if !hw {
+			return
+		}
+	}
+	if y-1 >= MinY {
+		below := region.getBlock(x, y-1, z)
+		_, belowSrc, _, _ := ruinWaterFluid(below)
+		if !belowSrc && ruinCanHoldWater(below) && ruinCanPassThroughWall(cur, below, 0) {
+			if below == StateAir {
+				bhw, bsrc, bfall, bamt := ruinGetNewWater(region, x, y-1, z)
+				bb := ruinFluidToBlockState(bhw, bsrc, bfall, bamt)
+				if bb != below {
+					region.setBlockGlobal(x, y-1, z, bb)
+					scheduleFn(x, y-1, z)
+				}
+			}
+			srcCount := 0
+			for _, d := range ruinHorizDirs4 {
+				if _, dSrc, _, _ := ruinWaterFluid(region.getBlock(x+d.dx, y, z+d.dz)); dSrc {
+					srcCount++
+				}
+			}
+			if srcCount >= 3 {
+				ruinSpreadToSides(region, x, y, z, cur, falling, amt, scheduleFn)
+			}
+			return
+		}
+	}
+	if src || !ruinIsWaterHole(region, x, y, z) {
+		ruinSpreadToSides(region, x, y, z, cur, falling, amt, scheduleFn)
+	}
+}
+
+func isWaterSourceForRuinTemplate(state uint16) bool {
+	if state == ruinWaterID {
+		return true
+	}
+	st, ok := stateByID(state)
+	if !ok {
+		return false
+	}
+	if st.Properties["waterlogged"] == "true" {
+		return true
+	}
+	switch st.Name {
+	case "minecraft:kelp", "minecraft:kelp_plant", "minecraft:seagrass", "minecraft:tall_seagrass", "minecraft:bubble_column":
+		return true
+	}
+	return false
+}
+
+func regionCanTakeStairShape(region *decorationRegion, x, y, z int, facing, half, neighborDir string) bool {
+	dx, dz := facingOffset(neighborDir)
+	nb := region.getBlock(x+dx, y, z+dz)
+	if !IsStairsBlock(nb) {
+		return true
+	}
+	nbInfo, ok := stateByID(nb)
+	if !ok {
+		return true
+	}
+	return nbInfo.Properties["facing"] != facing || nbInfo.Properties["half"] != half
+}
+
+func regionComputeStairsShapeAt(region *decorationRegion, x, y, z int, facing, half string) string {
+	if region == nil || y < MinY || y >= MinY+WorldHeight {
+		return "straight"
+	}
+	axis := horizontalAxis(facing)
+	if axis == "" {
+		return "straight"
+	}
+	fdx, fdz := facingOffset(facing)
+	frontSt := region.getBlock(x+fdx, y, z+fdz)
+	if IsStairsBlock(frontSt) {
+		if fInfo, ok := stateByID(frontSt); ok && fInfo.Properties["half"] == half {
+			fFacing := fInfo.Properties["facing"]
+			if horizontalAxis(fFacing) != "" && horizontalAxis(fFacing) != axis &&
+				regionCanTakeStairShape(region, x, y, z, facing, half, oppositeDirection(fFacing)) {
+				if fFacing == horizontalCounterClockWise(facing) {
+					return "outer_left"
+				}
+				return "outer_right"
+			}
+		}
+	}
+	bdx, bdz := facingOffset(oppositeDirection(facing))
+	backSt := region.getBlock(x+bdx, y, z+bdz)
+	if IsStairsBlock(backSt) {
+		if bInfo, ok := stateByID(backSt); ok && bInfo.Properties["half"] == half {
+			bFacing := bInfo.Properties["facing"]
+			if horizontalAxis(bFacing) != "" && horizontalAxis(bFacing) != axis &&
+				regionCanTakeStairShape(region, x, y, z, facing, half, bFacing) {
+				if bFacing == horizontalCounterClockWise(facing) {
+					return "inner_left"
+				}
+				return "inner_right"
+			}
+		}
+	}
+	return "straight"
+}
+
+func regionResolveStairsStateAt(region *decorationRegion, x, y, z int, state uint16) uint16 {
+	if region == nil || !IsStairsBlock(state) {
+		return state
+	}
+	info, ok := stateByID(state)
+	if !ok {
+		return state
+	}
+	facing := info.Properties["facing"]
+	if facing == "" {
+		facing = "north"
+	}
+	half := info.Properties["half"]
+	if half == "" {
+		half = "bottom"
+	}
+	wantShape := regionComputeStairsShapeAt(region, x, y, z, facing, half)
+	if info.Properties["shape"] == wantShape {
+		return state
+	}
+	if updated, ok := withStateProperty(state, "shape", wantShape); ok {
+		return updated
+	}
+	return state
 }
 
 // isRuinFallingState matches the gravity blocks the underwater-ruin templates
@@ -635,7 +1316,8 @@ func isRuinFallFree(state uint16) bool {
 		return true
 	}
 	n, ok := stateByID(state)
-	return ok && (n.Name == "minecraft:water" || n.Name == "minecraft:lava")
+	return ok && (n.Name == "minecraft:water" || n.Name == "minecraft:lava" ||
+		n.Name == "minecraft:seagrass" || n.Name == "minecraft:tall_seagrass")
 }
 
 func isIceState(state uint16) bool {

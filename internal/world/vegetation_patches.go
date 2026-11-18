@@ -1145,18 +1145,13 @@ func (r *decorationRegion) placeCoralClaw(random worldgen.RandomSource, origin w
 			}
 			upLen = int(random.NextIntN(3)) + 3
 		}
-		placed := true
 		for i := 0; i < sidewayLen; i++ {
 			if !r.placeCoralBlock(random, bx, by, bz, coralBlockState, set) {
-				placed = false
 				break
 			}
 			bx += inwayX
 			by += inwayY
 			bz += inwayZ
-		}
-		if !placed {
-			continue
 		}
 		bx -= inwayX
 		by -= inwayY

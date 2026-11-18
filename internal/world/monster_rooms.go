@@ -438,20 +438,16 @@ func (r *decorationRegion) placeFossilTemplate(
 	procListName string,
 	random worldgen.RandomSource,
 ) {
-	pal := selectJigsawPalette(tmpl, targetPos)
-	if pal == nil {
+	if tmpl == nil || len(tmpl.palettes) == 0 {
 		return
 	}
+	palIdx := int(random.NextIntN(int32(len(tmpl.palettes))))
+	pal := &tmpl.palettes[palIdx]
 	procs := reg.ProcessorLists[normalizeResourceID(procListName)]
 
 	for _, orig := range pal.blocks {
 		rel := worldgen.TransformBlockPos(orig.Pos, "none", rotation, [3]int{0, 0, 0})
 		worldPos := [3]int{targetPos[0] + rel[0], targetPos[1] + rel[1], targetPos[2] + rel[2]}
-		if worldPos[0] < boundingBox.minX || worldPos[0] > boundingBox.maxX ||
-			worldPos[1] < boundingBox.minY || worldPos[1] > boundingBox.maxY ||
-			worldPos[2] < boundingBox.minZ || worldPos[2] > boundingBox.maxZ {
-			continue
-		}
 		curState := orig.State
 		curName := orig.BlockName
 
@@ -459,9 +455,8 @@ func (r *decorationRegion) placeFossilTemplate(
 		for _, proc := range procs {
 			switch proc.ProcessorType {
 			case "minecraft:block_rot":
-				if matchesRottableBlocks(curName, proc.RottableBlocks, set) && proc.Integrity < 1.0 {
-					rotRng := worldgen.NewLegacy(worldgen.MthGetSeed(worldPos[0], worldPos[1], worldPos[2]))
-					if proc.Integrity <= 0.0 || rotRng.NextFloat() > proc.Integrity {
+				if matchesRottableBlocks(orig.BlockName, proc.RottableBlocks, set) {
+					if !(random.NextFloat() <= proc.Integrity) {
 						discarded = true
 					}
 				}
@@ -508,6 +503,11 @@ func (r *decorationRegion) placeFossilTemplate(
 			}
 		}
 		if discarded || curName == "minecraft:structure_void" {
+			continue
+		}
+		if worldPos[0] < boundingBox.minX || worldPos[0] > boundingBox.maxX ||
+			worldPos[1] < boundingBox.minY || worldPos[1] > boundingBox.maxY ||
+			worldPos[2] < boundingBox.minZ || worldPos[2] > boundingBox.maxZ {
 			continue
 		}
 		stateToPlace := rotateTemplateState(curState, rotation)

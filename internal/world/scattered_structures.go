@@ -264,6 +264,14 @@ func (p *scatteredPiece) placeBlock(region *decorationRegion, chunkBox msBox, st
 		}
 	}
 	region.setBlockGlobal(wx, wy, wz, stateToPlace)
+	if IsFenceBlock(stateToPlace) {
+		region.markForPostProcessing(wx, wy, wz)
+	} else if st, ok := stateByID(stateToPlace); ok {
+		switch st.Name {
+		case "minecraft:torch", "minecraft:wall_torch", "minecraft:ladder", "minecraft:iron_bars":
+			region.markForPostProcessing(wx, wy, wz)
+		}
+	}
 }
 
 func (p *scatteredPiece) generateBox(region *decorationRegion, chunkBox msBox, x0, y0, z0, x1, y1, z1 int, edgeState, fillState uint16, onlyReplaceNonAir bool) {

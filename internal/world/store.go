@@ -65,7 +65,13 @@ const dataVersion26 = 4790
 // underWaterHeight swap and RNG stream fix, DiskFeature markAboveForPostProcessing snow
 // cleanup over ice_patch, and ±1-chunk write guards for icebergs/spikes/blue_ice
 // (vanilla 26.1.2).
-const generatorVersion = 61
+// Version 62: Warm/lukewarm ocean, swamp, and mushroom fields generation parity:
+// CoralClawFeature upward segment after blocked sideways step, FossilFeature
+// StructureTemplate RNG order for palette/BlockRotProcessor, SwampHutPiece
+// SHAPE_CHECK_BLOCKS fence post-processing, and OceanRuinPieces per-chunk
+// StructureTemplate rotation/waterlogging, chest step-4 LootTableSeed, and
+// ProtoChunkTicks delay-0 block/fluid/falling-block physics (vanilla 26.1.2).
+const generatorVersion = 62
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.
