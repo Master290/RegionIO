@@ -300,8 +300,12 @@ func (s *Server) OpenStonecutter(session *PlayerSession, bx, by, bz int) (int32,
 			return cid, err
 		}
 		slots := s.buildStonecutterMenuSlots(session, world.ItemStack{}, world.ItemStack{})
+		metas, trims := buildStonecutterMenuMetasAndTrims(session, ItemMeta{}, ArmorTrim{})
+		carriedTrim, _ := GetCarriedArmorTrim(session)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContentWithMetaAndTrim(
+			cid, stateID, slots, metas, trims, carried, GetCarriedItemMeta(session), carriedTrim,
+		)); err != nil {
 			return cid, err
 		}
 		if err := session.send(protocol.PlayContainerSetData, EncodeContainerSetData(cid, StonecutterDataSelectedRecipe, -1)); err != nil {
@@ -326,15 +330,23 @@ func (s *Server) CloseStonecutterContainer(session *PlayerSession, containerID i
 		return s.CloseContainer(session, containerID, notifyClient)
 	}
 	inputStack := tr.open.Crafting[StonecutterSlotInput]
+	var inputMeta ItemMeta
+	var inputTrim ArmorTrim
+	if !tr.open.CraftingSlots[StonecutterSlotInput].IsEmpty() &&
+		tr.open.CraftingSlots[StonecutterSlotInput].Stack.ResolvedItemID() == inputStack.ResolvedItemID() {
+		inputMeta = tr.open.CraftingSlots[StonecutterSlotInput].Meta.Clone()
+		inputTrim = tr.open.CraftingSlots[StonecutterSlotInput].Trim
+	}
 	tr.open.Crafting[StonecutterSlotInput] = world.ItemStack{}
+	tr.open.CraftingSlots[StonecutterSlotInput] = containerSlotData{}
 	tr.open.Result = world.ItemStack{}
 	tr.open.AnvilCost = -1
 	tr.mu.Unlock()
 
 	if !inputStack.IsEmpty() {
 		snap := session.Snapshot()
-		added, _ := session.AddItemToInventory(inputStack)
-		if rem := inputStack.Count - added; rem > 0 {
+		placed := returnStackWithMetaAndTrimToInventory(session, inputStack, inputMeta, inputTrim)
+		if rem := inputStack.Count - placed; rem > 0 {
 			_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(inputStack.ResolvedItemID(), rem))
 		}
 	}
@@ -406,13 +418,10 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
 				SetCarriedItemMeta(session, ItemMeta{})
+				SetCarriedArmorTrim(session, ArmorTrim{})
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
-			bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
-			 _ = bx
-			_ = by
-			_ = bz
 			tr.mu.Unlock()
 			snap := session.Snapshot()
 			_, _ = s.SpawnItemEntityInDimension(snap.Dimension, snap.X, snap.Y+0.25, snap.Z, dropStack)
@@ -428,6 +437,13 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 	}
 
 	prevInput := tr.open.Crafting[StonecutterSlotInput]
+	var inputMeta ItemMeta
+	var inputTrim ArmorTrim
+	if !tr.open.CraftingSlots[StonecutterSlotInput].IsEmpty() &&
+		tr.open.CraftingSlots[StonecutterSlotInput].Stack.ResolvedItemID() == prevInput.ResolvedItemID() {
+		inputMeta = tr.open.CraftingSlots[StonecutterSlotInput].Meta.Clone()
+		inputTrim = tr.open.CraftingSlots[StonecutterSlotInput].Trim
+	}
 	selectedIdx := int(tr.open.AnvilCost)
 	resStack, _, validIdx, hasResult := EvaluateStonecutterResult(prevInput, selectedIdx)
 	if hasResult {
@@ -438,6 +454,7 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 	}
 
 	slots := s.buildStonecutterMenuSlots(session, prevInput, tr.open.Result)
+	metas, trims := buildStonecutterMenuMetasAndTrims(session, inputMeta, inputTrim)
 	tookResult := false
 	var craftedStack world.ItemStack
 	bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
@@ -451,12 +468,15 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 		switch mode {
 		case ContainerInputPickup:
 			canTake := false
+			carriedTrim, _ := GetCarriedArmorTrim(session)
 			if tr.carried.IsEmpty() {
 				tr.carried = resStack
 				SetCarriedItemMeta(session, ItemMeta{})
+				SetCarriedArmorTrim(session, ArmorTrim{})
 				canTake = true
 			} else if tr.carried.ResolvedItemID() == resStack.ResolvedItemID() &&
 				GetCarriedItemMeta(session).IsEmpty() &&
+				!carriedTrim.IsValid() &&
 				tr.carried.Count+resStack.Count <= MaxItemStackSize {
 				tr.carried = world.NewItemStack(resStack.ResolvedItemID(), tr.carried.Count+resStack.Count)
 				canTake = true
@@ -465,6 +485,8 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 				remIn := slots[StonecutterSlotInput].Count - 1
 				if remIn <= 0 {
 					slots[StonecutterSlotInput] = world.ItemStack{}
+					metas[StonecutterSlotInput] = ItemMeta{}
+					trims[StonecutterSlotInput] = ArmorTrim{}
 				} else {
 					slots[StonecutterSlotInput] = world.NewItemStack(slots[StonecutterSlotInput].ResolvedItemID(), remIn)
 				}
@@ -475,17 +497,25 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 		case ContainerInputQuickMove:
 			// Shift-clicking result crafts as many times as input count and player inventory space allow.
 			for !slots[StonecutterSlotInput].IsEmpty() {
-				if !canFitInSlice(slots, resStack, 2, StonecutterMenuSlotCount) {
-					break
+				testSlots := append([]world.ItemStack(nil), slots...)
+				testMetas := make([]ItemMeta, len(metas))
+				for i := range metas {
+					testMetas[i] = metas[i].Clone()
 				}
-				rem := mergeIntoSlotSlice(slots, resStack, 29, 38)
-				rem = mergeIntoSlotSlice(slots, rem, 2, 29)
+				testTrims := append([]ArmorTrim(nil), trims...)
+				rem, remMeta, remTrim := mergeIntoSlotSliceWithMetaAndTrim(testSlots, testMetas, testTrims, resStack, ItemMeta{}, ArmorTrim{}, 29, 38)
+				rem, _, _ = mergeIntoSlotSliceWithMetaAndTrim(testSlots, testMetas, testTrims, rem, remMeta, remTrim, 2, 29)
 				if !rem.IsEmpty() {
 					break
 				}
+				slots = testSlots
+				metas = testMetas
+				trims = testTrims
 				remIn := slots[StonecutterSlotInput].Count - 1
 				if remIn <= 0 {
 					slots[StonecutterSlotInput] = world.ItemStack{}
+					metas[StonecutterSlotInput] = ItemMeta{}
+					trims[StonecutterSlotInput] = ArmorTrim{}
 				} else {
 					slots[StonecutterSlotInput] = world.NewItemStack(slots[StonecutterSlotInput].ResolvedItemID(), remIn)
 				}
@@ -500,28 +530,34 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 	} else {
 		switch mode {
 		case ContainerInputPickup:
-			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+			carriedMeta := GetCarriedItemMeta(session)
+			carriedTrim, _ := GetCarriedArmorTrim(session)
+			slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim = applyPickupSlotWithMetaAndTrim(
+				slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim, button,
+			)
+			SetCarriedItemMeta(session, carriedMeta)
+			SetCarriedArmorTrim(session, carriedTrim)
 
 		case ContainerInputQuickMove:
 			if slot == StonecutterSlotInput {
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 29, 38)
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 2, 29)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 29, 38)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 2, 29)
 			} else if slot >= 2 {
 				clicked := slots[slot]
 				if DefaultStonecutterBook().CanStonecut(clicked) {
 					prev := clicked.Count
-					slots[slot] = mergeIntoSlotSlice(slots, clicked, StonecutterSlotInput, StonecutterSlotInput+1)
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, clicked, metas[slot], trims[slot], StonecutterSlotInput, StonecutterSlotInput+1)
 					if slots[slot].Count == prev {
 						if slot < 29 {
-							slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 29, 38)
+							slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 29, 38)
 						} else if slot < 38 {
-							slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 2, 29)
+							slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 2, 29)
 						}
 					}
 				} else if slot >= 2 && slot < 29 {
-					slots[slot] = mergeIntoSlotSlice(slots, clicked, 29, 38)
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, clicked, metas[slot], trims[slot], 29, 38)
 				} else if slot >= 29 && slot < 38 {
-					slots[slot] = mergeIntoSlotSlice(slots, clicked, 2, 29)
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, clicked, metas[slot], trims[slot], 2, 29)
 				}
 			}
 
@@ -529,15 +565,34 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 			if button >= 0 && button < 9 {
 				hotbarIdx := 29 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+				metas[slot], metas[hotbarIdx] = metas[hotbarIdx], metas[slot]
+				trims[slot], trims[hotbarIdx] = trims[hotbarIdx], trims[slot]
 			} else if button == 40 {
 				offStack := session.InventorySlot(OffHandContainerSlot)
+				offMeta := GetSlotItemMeta(session, OffHandContainerSlot)
+				offTrim, _ := GetSlotArmorTrim(session, OffHandContainerSlot)
 				slots[slot], offStack = offStack, slots[slot]
+				metas[slot], offMeta = offMeta, metas[slot]
+				trims[slot], offTrim = offTrim, trims[slot]
 				session.SetInventorySlot(OffHandContainerSlot, offStack)
+				if offStack.IsEmpty() {
+					SetSlotItemMeta(session, OffHandContainerSlot, ItemMeta{})
+					ClearSlotArmorTrim(session, OffHandContainerSlot)
+				} else {
+					SetSlotItemMeta(session, OffHandContainerSlot, offMeta)
+					SetSlotArmorTrim(session, OffHandContainerSlot, offTrim)
+				}
 			}
 
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+				maxSt := MaxItemStackSize
+				if MaxItemDurability(slots[slot].ResolvedID()) > 0 || slots[slot].ResolvedID() == "minecraft:enchanted_book" {
+					maxSt = 1
+				}
+				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxSt)
+				SetCarriedItemMeta(session, metas[slot].Clone())
+				SetCarriedArmorTrim(session, trims[slot])
 			}
 
 		case ContainerInputThrow:
@@ -550,6 +605,8 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 				rem := slots[slot].Count - dropCount
 				if rem <= 0 {
 					slots[slot] = world.ItemStack{}
+					metas[slot] = ItemMeta{}
+					trims[slot] = ArmorTrim{}
 				} else {
 					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 				}
@@ -558,20 +615,52 @@ func (s *Server) HandleStonecutterClick(session *PlayerSession, click ContainerC
 			}
 
 		case ContainerInputPickupAll:
-			applyPickupAllSlice(slots, &tr.carried, 0)
+			carriedTrim, _ := GetCarriedArmorTrim(session)
+			if GetCarriedItemMeta(session).IsEmpty() && !carriedTrim.IsValid() {
+				applyPickupAllPlainSlice(slots, metas, trims, &tr.carried, func(i int) bool {
+					return i == StonecutterSlotResult
+				})
+			}
 		}
 	}
 
-	// Write back player inventory slots (2..28 -> 9..35, 29..37 -> 36..44).
+	// Write back player inventory slots (2..28 -> 9..35, 29..37 -> 36..44) along with ItemMeta & ArmorTrim.
 	for i := 0; i < 27; i++ {
-		session.SetInventorySlot(9+i, slots[2+i])
+		invIdx := 9 + i
+		menuIdx := 2 + i
+		session.SetInventorySlot(invIdx, slots[menuIdx])
+		if slots[menuIdx].IsEmpty() {
+			SetSlotItemMeta(session, invIdx, ItemMeta{})
+			ClearSlotArmorTrim(session, invIdx)
+		} else {
+			SetSlotItemMeta(session, invIdx, metas[menuIdx])
+			SetSlotArmorTrim(session, invIdx, trims[menuIdx])
+		}
 	}
 	for i := 0; i < 9; i++ {
-		session.SetInventorySlot(36+i, slots[29+i])
+		invIdx := 36 + i
+		menuIdx := 29 + i
+		session.SetInventorySlot(invIdx, slots[menuIdx])
+		if slots[menuIdx].IsEmpty() {
+			SetSlotItemMeta(session, invIdx, ItemMeta{})
+			ClearSlotArmorTrim(session, invIdx)
+		} else {
+			SetSlotItemMeta(session, invIdx, metas[menuIdx])
+			SetSlotArmorTrim(session, invIdx, trims[menuIdx])
+		}
 	}
 
 	newInput := slots[StonecutterSlotInput]
 	tr.open.Crafting[StonecutterSlotInput] = newInput
+	if newInput.IsEmpty() {
+		tr.open.CraftingSlots[StonecutterSlotInput] = containerSlotData{}
+	} else {
+		tr.open.CraftingSlots[StonecutterSlotInput] = containerSlotData{
+			Stack: newInput,
+			Meta:  metas[StonecutterSlotInput].Clone(),
+			Trim:  trims[StonecutterSlotInput],
+		}
+	}
 
 	// If the input item type changed or became empty, reset selected recipe to -1.
 	if newInput.IsEmpty() || newInput.ResolvedItemID() != prevInput.ResolvedItemID() {
@@ -618,6 +707,74 @@ func (s *Server) buildStonecutterMenuSlots(session *PlayerSession, input, result
 	return slots
 }
 
+func buildStonecutterMenuMetasAndTrims(session *PlayerSession, inputMeta ItemMeta, inputTrim ArmorTrim) ([]ItemMeta, []ArmorTrim) {
+	metas := make([]ItemMeta, StonecutterMenuSlotCount)
+	trims := make([]ArmorTrim, StonecutterMenuSlotCount)
+	metas[StonecutterSlotInput] = inputMeta.Clone()
+	trims[StonecutterSlotInput] = inputTrim
+	for i := 0; i < 27; i++ {
+		metas[2+i] = GetSlotItemMeta(session, 9+i)
+		if t, ok := GetSlotArmorTrim(session, 9+i); ok {
+			trims[2+i] = t
+		}
+	}
+	for i := 0; i < 9; i++ {
+		metas[29+i] = GetSlotItemMeta(session, 36+i)
+		if t, ok := GetSlotArmorTrim(session, 36+i); ok {
+			trims[29+i] = t
+		}
+	}
+	return metas, trims
+}
+
+func applyPickupAllPlainSlice(slots []world.ItemStack, metas []ItemMeta, trims []ArmorTrim, carried *world.ItemStack, skipSlot func(int) bool) {
+	if carried == nil || carried.IsEmpty() {
+		return
+	}
+	itemID := carried.ResolvedItemID()
+	maxStack := MaxStackSizeForBundleWeight(carried.ResolvedID())
+	if carried.Count >= maxStack {
+		return
+	}
+	for pass := 0; pass < 2 && carried.Count < maxStack; pass++ {
+		for i := range slots {
+			if skipSlot != nil && skipSlot(i) {
+				continue
+			}
+			st := slots[i]
+			if st.IsEmpty() || st.ResolvedItemID() != itemID {
+				continue
+			}
+			if (i < len(metas) && !metas[i].IsEmpty()) || (i < len(trims) && trims[i].IsValid()) {
+				continue
+			}
+			if pass == 0 && st.Count >= maxStack {
+				continue
+			}
+			space := maxStack - carried.Count
+			take := st.Count
+			if take > space {
+				take = space
+			}
+			*carried = world.NewItemStack(itemID, carried.Count+take)
+			if st.Count-take <= 0 {
+				slots[i] = world.ItemStack{}
+				if i < len(metas) {
+					metas[i] = ItemMeta{}
+				}
+				if i < len(trims) {
+					trims[i] = ArmorTrim{}
+				}
+			} else {
+				slots[i] = world.NewItemStack(itemID, st.Count-take)
+			}
+			if carried.Count >= maxStack {
+				return
+			}
+		}
+	}
+}
+
 func (s *Server) syncStonecutterContainer(session *PlayerSession) error {
 	if s == nil || session == nil || session.send == nil {
 		return nil
@@ -630,14 +787,25 @@ func (s *Server) syncStonecutterContainer(session *PlayerSession) error {
 	}
 	cid := tr.open.ContainerID
 	input := tr.open.Crafting[StonecutterSlotInput]
+	var inputMeta ItemMeta
+	var inputTrim ArmorTrim
+	if !tr.open.CraftingSlots[StonecutterSlotInput].IsEmpty() &&
+		tr.open.CraftingSlots[StonecutterSlotInput].Stack.ResolvedItemID() == input.ResolvedItemID() {
+		inputMeta = tr.open.CraftingSlots[StonecutterSlotInput].Meta.Clone()
+		inputTrim = tr.open.CraftingSlots[StonecutterSlotInput].Trim
+	}
 	result := tr.open.Result
 	selectedIdx := tr.open.AnvilCost
 	carried := tr.carried
 	tr.mu.Unlock()
 
 	slots := s.buildStonecutterMenuSlots(session, input, result)
+	metas, trims := buildStonecutterMenuMetasAndTrims(session, inputMeta, inputTrim)
+	carriedTrim, _ := GetCarriedArmorTrim(session)
 	stateID := session.NextContainerStateID()
-	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+	if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContentWithMetaAndTrim(
+		cid, stateID, slots, metas, trims, carried, GetCarriedItemMeta(session), carriedTrim,
+	)); err != nil {
 		return err
 	}
 	return session.send(protocol.PlayContainerSetData, EncodeContainerSetData(cid, StonecutterDataSelectedRecipe, selectedIdx))

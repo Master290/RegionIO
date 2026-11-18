@@ -65,6 +65,7 @@ func CanVillagerLevelUp(level int, totalXP int32) bool {
 type NumberRange struct {
 	Min float64
 	Max float64
+	Set bool
 }
 
 // UnmarshalJSON parses a vanilla NumberProvider JSON value (number or object).
@@ -81,6 +82,7 @@ func (nr *NumberRange) UnmarshalJSON(data []byte) error {
 		}
 		nr.Min = v
 		nr.Max = v
+		nr.Set = true
 		return nil
 	}
 	var obj struct {
@@ -105,6 +107,7 @@ func (nr *NumberRange) UnmarshalJSON(data []byte) error {
 			nr.Max = nr.Min
 		}
 	}
+	nr.Set = true
 	return nil
 }
 
@@ -143,14 +146,20 @@ func (e *VillagerTradeEntry) Instantiate(rng *rand.Rand) (MerchantOffer, bool) {
 	if e == nil || e.Wants.ID == "" || e.Gives.ID == "" {
 		return MerchantOffer{}, false
 	}
-	wantCount := e.Wants.Count.EvalInt(rng)
-	if wantCount <= 0 {
-		// Enchanted book and dynamic-cost trades specify count 0.0 in JSON and
-		// compute emerald price from enchantment level (vanilla range 5..19).
-		if rng != nil {
-			wantCount = 5 + rng.Int31n(15)
-		} else {
-			wantCount = 8
+	var wantCount int32
+	if !e.Wants.Count.Set {
+		// TradeCost.CODEC: optionalFieldOf("count", ConstantValue.exactly(1.0f))
+		wantCount = 1
+	} else {
+		wantCount = e.Wants.Count.EvalInt(rng)
+		if wantCount <= 0 {
+			// Enchanted book and dynamic-cost trades specify count 0.0 in JSON and
+			// compute emerald price from enchantment level (vanilla range 5..19).
+			if rng != nil {
+				wantCount = 5 + rng.Int31n(15)
+			} else {
+				wantCount = 8
+			}
 		}
 	}
 	if wantCount > MaxItemStackSize {
@@ -163,9 +172,14 @@ func (e *VillagerTradeEntry) Instantiate(rng *rand.Rand) (MerchantOffer, bool) {
 
 	var costB world.ItemStack
 	if e.AdditionalWants != nil && e.AdditionalWants.ID != "" {
-		bCount := e.AdditionalWants.Count.EvalInt(rng)
-		if bCount <= 0 {
+		var bCount int32
+		if !e.AdditionalWants.Count.Set {
 			bCount = 1
+		} else {
+			bCount = e.AdditionalWants.Count.EvalInt(rng)
+			if bCount <= 0 {
+				bCount = 1
+			}
 		}
 		if bCount > MaxItemStackSize {
 			bCount = MaxItemStackSize
@@ -176,9 +190,14 @@ func (e *VillagerTradeEntry) Instantiate(rng *rand.Rand) (MerchantOffer, bool) {
 		}
 	}
 
-	giveCount := e.Gives.Count.EvalInt(rng)
-	if giveCount <= 0 {
+	var giveCount int32
+	if !e.Gives.Count.Set {
 		giveCount = 1
+	} else {
+		giveCount = e.Gives.Count.EvalInt(rng)
+		if giveCount <= 0 {
+			giveCount = 1
+		}
 	}
 	if giveCount > MaxItemStackSize {
 		giveCount = MaxItemStackSize
@@ -188,13 +207,25 @@ func (e *VillagerTradeEntry) Instantiate(rng *rand.Rand) (MerchantOffer, bool) {
 		return MerchantOffer{}, false
 	}
 
-	maxUses := e.MaxUses.EvalInt(rng)
-	if maxUses <= 0 {
-		maxUses = 12
+	var maxUses int32
+	if !e.MaxUses.Set {
+		// VillagerTrade.CODEC: lenientOptionalFieldOf("max_uses", ConstantValue.exactly(4.0f))
+		maxUses = 4
+	} else {
+		maxUses = e.MaxUses.EvalInt(rng)
+		if maxUses < 1 {
+			maxUses = 1
+		}
 	}
-	xp := e.XP.EvalInt(rng)
-	if xp < 0 {
-		xp = 0
+	var xp int32
+	if !e.XP.Set {
+		// VillagerTrade.CODEC: lenientOptionalFieldOf("xp", ConstantValue.exactly(1.0f))
+		xp = 1
+	} else {
+		xp = e.XP.EvalInt(rng)
+		if xp < 0 {
+			xp = 0
+		}
 	}
 	mult := e.ReputationDiscount
 	if mult <= 0 {
@@ -817,12 +848,13 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
 	cid := tr.nextWindow
-	tr.open = &OpenContainerState{
+	openState := &OpenContainerState{
 		ContainerID: cid,
 		MenuType:    MenuTypeMerchant,
 		BlockX:      int(entityID),
 		BlockY:      0, // default to first trade index
 	}
+	tr.open = openState
 	carried := tr.carried
 	tr.mu.Unlock()
 
@@ -835,8 +867,12 @@ func (s *Server) OpenMerchant(session *PlayerSession, entityID int32) (int32, er
 			return cid, err
 		}
 		slots := s.buildMerchantMenuSlots(session, world.ItemStack{}, world.ItemStack{}, world.ItemStack{})
+		metas, trims := buildMerchantMenuMetasAndTrims(session, nil)
+		carriedTrim, _ := GetCarriedArmorTrim(session)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContentWithMetaAndTrim(
+			cid, stateID, slots, metas, trims, carried, GetCarriedItemMeta(session), carriedTrim,
+		)); err != nil {
 			return cid, err
 		}
 		var offers []MerchantOffer
@@ -866,14 +902,6 @@ func (s *Server) CloseMerchantContainer(session *PlayerSession, containerID int3
 			prevVillagerID = int32(open.BlockX)
 		}
 	}
-	if carried := session.CarriedItem(); !carried.IsEmpty() {
-		session.SetCarriedItem(world.ItemStack{})
-		added, _ := session.AddItemToInventory(carried)
-		if rem := carried.Count - added; rem > 0 {
-			snap := session.Snapshot()
-			s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(carried.ResolvedItemID(), rem))
-		}
-	}
 	err := s.CloseContainer(session, containerID, notifyClient)
 	if prevVillagerID > 0 && !s.IsVillagerTrading(prevVillagerID) {
 		s.ResetVillagerSpecialPrices(prevVillagerID)
@@ -892,12 +920,57 @@ func (s *Server) buildMerchantMenuSlots(session *PlayerSession, pay1, pay2, resu
 	return slots
 }
 
-func writeBackMerchantPlayerSlots(session *PlayerSession, slots []world.ItemStack) {
+func buildMerchantMenuMetasAndTrims(session *PlayerSession, open *OpenContainerState) ([]ItemMeta, []ArmorTrim) {
+	metas := make([]ItemMeta, MerchantMenuSlotCount)
+	trims := make([]ArmorTrim, MerchantMenuSlotCount)
+	if open != nil {
+		for i := 0; i < 2; i++ {
+			if !open.Crafting[i].IsEmpty() && !open.CraftingSlots[i].IsEmpty() &&
+				open.CraftingSlots[i].Stack.ResolvedItemID() == open.Crafting[i].ResolvedItemID() {
+				metas[i] = open.CraftingSlots[i].Meta.Clone()
+				trims[i] = open.CraftingSlots[i].Trim
+			}
+		}
+	}
 	for i := 0; i < 27; i++ {
-		session.SetInventorySlot(9+i, slots[3+i])
+		metas[3+i] = GetSlotItemMeta(session, 9+i)
+		if t, ok := GetSlotArmorTrim(session, 9+i); ok {
+			trims[3+i] = t
+		}
 	}
 	for i := 0; i < 9; i++ {
-		session.SetInventorySlot(36+i, slots[30+i])
+		metas[30+i] = GetSlotItemMeta(session, 36+i)
+		if t, ok := GetSlotArmorTrim(session, 36+i); ok {
+			trims[30+i] = t
+		}
+	}
+	return metas, trims
+}
+
+func writeBackMerchantPlayerSlotsWithMetaAndTrim(session *PlayerSession, slots []world.ItemStack, metas []ItemMeta, trims []ArmorTrim) {
+	for i := 0; i < 27; i++ {
+		invIdx := 9 + i
+		menuIdx := 3 + i
+		session.SetInventorySlot(invIdx, slots[menuIdx])
+		if slots[menuIdx].IsEmpty() {
+			SetSlotItemMeta(session, invIdx, ItemMeta{})
+			ClearSlotArmorTrim(session, invIdx)
+		} else {
+			SetSlotItemMeta(session, invIdx, metas[menuIdx])
+			SetSlotArmorTrim(session, invIdx, trims[menuIdx])
+		}
+	}
+	for i := 0; i < 9; i++ {
+		invIdx := 36 + i
+		menuIdx := 30 + i
+		session.SetInventorySlot(invIdx, slots[menuIdx])
+		if slots[menuIdx].IsEmpty() {
+			SetSlotItemMeta(session, invIdx, ItemMeta{})
+			ClearSlotArmorTrim(session, invIdx)
+		} else {
+			SetSlotItemMeta(session, invIdx, metas[menuIdx])
+			SetSlotArmorTrim(session, invIdx, trims[menuIdx])
+		}
 	}
 }
 
@@ -937,51 +1010,79 @@ func (s *Server) SelectMerchantTrade(session *PlayerSession, tradeIndex int) err
 	tr.open.BlockY = tradeIndex
 
 	slots := s.buildMerchantMenuSlots(session, tr.open.Crafting[0], tr.open.Crafting[1], tr.open.Result)
+	metas, trims := buildMerchantMenuMetasAndTrims(session, tr.open)
 
 	// 1. Return any existing payment slot items into player inventory slots 3..38.
 	if !slots[MerchantSlotPayment1].IsEmpty() {
-		slots[MerchantSlotPayment1] = mergeIntoSlotSlice(slots, slots[MerchantSlotPayment1], 3, MerchantMenuSlotCount)
+		slots[MerchantSlotPayment1], metas[MerchantSlotPayment1], trims[MerchantSlotPayment1] = mergeIntoSlotSliceWithMetaAndTrim(
+			slots, metas, trims, slots[MerchantSlotPayment1], metas[MerchantSlotPayment1], trims[MerchantSlotPayment1], 3, MerchantMenuSlotCount,
+		)
 	}
 	if !slots[MerchantSlotPayment2].IsEmpty() {
-		slots[MerchantSlotPayment2] = mergeIntoSlotSlice(slots, slots[MerchantSlotPayment2], 3, MerchantMenuSlotCount)
+		slots[MerchantSlotPayment2], metas[MerchantSlotPayment2], trims[MerchantSlotPayment2] = mergeIntoSlotSliceWithMetaAndTrim(
+			slots, metas, trims, slots[MerchantSlotPayment2], metas[MerchantSlotPayment2], trims[MerchantSlotPayment2], 3, MerchantMenuSlotCount,
+		)
 	}
 
 	// 2. If both payment slots are clear and the selected offer is in stock,
-	// pull matching items from the player's inventory (3..38) into slots 0 and 1.
+	// pull matching plain items from the player's inventory (3..38) into slots 0 and 1.
 	offer := vs.Offers[tradeIndex]
 	if !offer.IsOutOfStock() && slots[MerchantSlotPayment1].IsEmpty() && slots[MerchantSlotPayment2].IsEmpty() {
 		costA := offer.AdjustedCostA()
 		if !costA.IsEmpty() {
-			slots[MerchantSlotPayment1] = pullMatchingItemsFromSlice(slots, 3, MerchantMenuSlotCount, costA.ResolvedItemID(), MaxItemStackSize)
+			slots[MerchantSlotPayment1] = pullMatchingPlainItemsFromSlice(slots, metas, trims, 3, MerchantMenuSlotCount, costA.ResolvedItemID(), MaxItemStackSize)
+			metas[MerchantSlotPayment1] = ItemMeta{}
+			trims[MerchantSlotPayment1] = ArmorTrim{}
 		}
 		if !offer.CostB.IsEmpty() {
-			slots[MerchantSlotPayment2] = pullMatchingItemsFromSlice(slots, 3, MerchantMenuSlotCount, offer.CostB.ResolvedItemID(), MaxItemStackSize)
+			slots[MerchantSlotPayment2] = pullMatchingPlainItemsFromSlice(slots, metas, trims, 3, MerchantMenuSlotCount, offer.CostB.ResolvedItemID(), MaxItemStackSize)
+			metas[MerchantSlotPayment2] = ItemMeta{}
+			trims[MerchantSlotPayment2] = ArmorTrim{}
 		}
 	}
 
 	tr.open.Crafting[0] = slots[MerchantSlotPayment1]
 	tr.open.Crafting[1] = slots[MerchantSlotPayment2]
-	writeBackMerchantPlayerSlots(session, slots)
+	for i := 0; i < 2; i++ {
+		if slots[i].IsEmpty() {
+			tr.open.CraftingSlots[i] = containerSlotData{}
+		} else {
+			tr.open.CraftingSlots[i] = containerSlotData{
+				Stack: slots[i],
+				Meta:  metas[i].Clone(),
+				Trim:  trims[i],
+			}
+		}
+	}
+	writeBackMerchantPlayerSlotsWithMetaAndTrim(session, slots, metas, trims)
 	s.recomputeMerchantResultLocked(tr, vs.Offers)
 	slots[MerchantSlotResult] = tr.open.Result
+	metas[MerchantSlotResult] = ItemMeta{}
+	trims[MerchantSlotResult] = ArmorTrim{}
 	cid := tr.open.ContainerID
 	carried := tr.carried
 	tr.mu.Unlock()
 
 	if session.send != nil {
+		carriedTrim, _ := GetCarriedArmorTrim(session)
 		stateID := session.NextContainerStateID()
-		return session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried))
+		return session.send(protocol.PlayContainerSetContent, EncodeContainerContentWithMetaAndTrim(
+			cid, stateID, slots, metas, trims, carried, GetCarriedItemMeta(session), carriedTrim,
+		))
 	}
 	return nil
 }
 
-func pullMatchingItemsFromSlice(slots []world.ItemStack, start, end int, itemID int32, maxCount int32) world.ItemStack {
+func pullMatchingPlainItemsFromSlice(slots []world.ItemStack, metas []ItemMeta, trims []ArmorTrim, start, end int, itemID int32, maxCount int32) world.ItemStack {
 	if itemID <= 0 || maxCount <= 0 {
 		return world.ItemStack{}
 	}
 	var total int32
 	for i := start; i < end && total < maxCount; i++ {
 		if slots[i].IsEmpty() || slots[i].ResolvedItemID() != itemID {
+			continue
+		}
+		if (i < len(metas) && !metas[i].IsEmpty()) || (i < len(trims) && trims[i].IsValid()) {
 			continue
 		}
 		take := slots[i].Count
@@ -1076,6 +1177,8 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
+				SetCarriedItemMeta(session, ItemMeta{})
+				SetCarriedArmorTrim(session, ArmorTrim{})
 			} else {
 				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
 			}
@@ -1112,6 +1215,7 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	vtr.mu.Lock()
 	s.recomputeMerchantResultLocked(tr, vs.Offers)
 	slots := s.buildMerchantMenuSlots(session, tr.open.Crafting[0], tr.open.Crafting[1], tr.open.Result)
+	metas, trims := buildMerchantMenuMetasAndTrims(session, tr.open)
 
 	traded := false
 	var tradesCompleted int32
@@ -1143,21 +1247,29 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 				if isExplorerMapOffer {
 					if tr.carried.IsEmpty() {
 						tr.carried = world.NewItemStack(res.ResolvedItemID(), 1)
+						SetCarriedItemMeta(session, ItemMeta{})
+						SetCarriedArmorTrim(session, ArmorTrim{})
 						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 						traded = true
 						tradesCompleted++
 						tradedExplorerMap, _, tradedExplorerName = s.CreateExplorerMapForTradeOffer(offerName, originX, originZ)
 						tradedExplorerOnCursor = true
 					}
-				} else if canAddMerchantResultToCursor(tr.carried, res) {
-					if tr.carried.IsEmpty() {
-						tr.carried = world.NewItemStack(res.ResolvedItemID(), res.Count)
-					} else {
-						tr.carried = world.NewItemStack(res.ResolvedItemID(), tr.carried.Count+res.Count)
+				} else {
+					carriedTrim, _ := GetCarriedArmorTrim(session)
+					if canAddMerchantResultToCursor(tr.carried, res) &&
+						(tr.carried.IsEmpty() || (GetCarriedItemMeta(session).IsEmpty() && !carriedTrim.IsValid())) {
+						if tr.carried.IsEmpty() {
+							tr.carried = world.NewItemStack(res.ResolvedItemID(), res.Count)
+							SetCarriedItemMeta(session, ItemMeta{})
+							SetCarriedArmorTrim(session, ArmorTrim{})
+						} else {
+							tr.carried = world.NewItemStack(res.ResolvedItemID(), tr.carried.Count+res.Count)
+						}
+						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
+						traded = true
+						tradesCompleted++
 					}
-					xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
-					traded = true
-					tradesCompleted++
 				}
 			case ContainerInputQuickMove:
 				if isExplorerMapOffer {
@@ -1175,6 +1287,8 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 					}
 					if targetMenuSlot >= 0 {
 						slots[targetMenuSlot] = world.NewItemStack(res.ResolvedItemID(), 1)
+						metas[targetMenuSlot] = ItemMeta{}
+						trims[targetMenuSlot] = ArmorTrim{}
 						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 						traded = true
 						tradesCompleted++
@@ -1188,57 +1302,101 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 						// Try merging into hotbar (30..38) then main inventory (3..29).
 						testSlots := make([]world.ItemStack, len(slots))
 						copy(testSlots, slots)
-						rem := mergeIntoSlotSlice(testSlots, res, 30, 39)
-						rem = mergeIntoSlotSlice(testSlots, rem, 3, 30)
+						testMetas := make([]ItemMeta, len(metas))
+						for i := range metas {
+							testMetas[i] = metas[i].Clone()
+						}
+						testTrims := make([]ArmorTrim, len(trims))
+						copy(testTrims, trims)
+						rem, remMeta, remTrim := mergeIntoSlotSliceWithMetaAndTrim(testSlots, testMetas, testTrims, res, ItemMeta{}, ArmorTrim{}, 30, 39)
+						rem, _, _ = mergeIntoSlotSliceWithMetaAndTrim(testSlots, testMetas, testTrims, rem, remMeta, remTrim, 3, 30)
 						if !rem.IsEmpty() {
 							break
 						}
 						slots = testSlots
+						metas = testMetas
+						trims = testTrims
 						xpGained += consumeMerchantOfferPayment(&vs.Offers[offerIdx], &slots[MerchantSlotPayment1], &slots[MerchantSlotPayment2])
 						traded = true
 						tradesCompleted++
 					}
 				}
 			}
+			for i := 0; i < 2; i++ {
+				if slots[i].IsEmpty() {
+					metas[i] = ItemMeta{}
+					trims[i] = ArmorTrim{}
+				}
+			}
 		}
 	} else {
 		switch mode {
 		case ContainerInputPickup:
-			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+			carriedMeta := GetCarriedItemMeta(session)
+			carriedTrim, _ := GetCarriedArmorTrim(session)
+			slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim = applyPickupSlotWithMetaAndTrim(
+				slots[slot], metas[slot], trims[slot], tr.carried, carriedMeta, carriedTrim, button,
+			)
+			SetCarriedItemMeta(session, carriedMeta)
+			SetCarriedArmorTrim(session, carriedTrim)
 		case ContainerInputQuickMove:
 			if slot == MerchantSlotPayment1 || slot == MerchantSlotPayment2 {
 				// Payment slot -> Player inventory (hotbar 30..38, then main 3..29).
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 30, 39)
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 3, 30)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 30, 39)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 3, 30)
 			} else if slot >= 3 && slot < 30 {
 				// Main inventory -> try payment slots 0..2 first, else hotbar 30..38.
 				prev := slots[slot].Count
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, 2)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 0, 2)
 				if slots[slot].Count == prev {
-					slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 30, 39)
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 30, 39)
 				}
 			} else if slot >= 30 && slot < 39 {
 				// Hotbar -> try payment slots 0..2 first, else main inventory 3..29.
 				prev := slots[slot].Count
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, 2)
+				slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 0, 2)
 				if slots[slot].Count == prev {
-					slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 3, 30)
+					slots[slot], metas[slot], trims[slot] = mergeIntoSlotSliceWithMetaAndTrim(slots, metas, trims, slots[slot], metas[slot], trims[slot], 3, 30)
 				}
 			}
 		case ContainerInputSwap:
 			if button >= 0 && button < 9 {
 				hotbarIdx := 30 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+				metas[slot], metas[hotbarIdx] = metas[hotbarIdx], metas[slot]
+				trims[slot], trims[hotbarIdx] = trims[hotbarIdx], trims[slot]
 			} else if button == 40 {
 				offStack := session.InventorySlot(OffHandContainerSlot)
+				offMeta := GetSlotItemMeta(session, OffHandContainerSlot)
+				offTrim, _ := GetSlotArmorTrim(session, OffHandContainerSlot)
 				slots[slot], offStack = offStack, slots[slot]
+				metas[slot], offMeta = offMeta, metas[slot]
+				trims[slot], offTrim = offTrim, trims[slot]
 				session.SetInventorySlot(OffHandContainerSlot, offStack)
+				if offStack.IsEmpty() {
+					SetSlotItemMeta(session, OffHandContainerSlot, ItemMeta{})
+					ClearSlotArmorTrim(session, OffHandContainerSlot)
+				} else {
+					SetSlotItemMeta(session, OffHandContainerSlot, offMeta)
+					SetSlotArmorTrim(session, OffHandContainerSlot, offTrim)
+				}
 			}
 		case ContainerInputPickupAll:
-			applyPickupAllSlice(slots, &tr.carried, 0)
+			carriedTrim, _ := GetCarriedArmorTrim(session)
+			if GetCarriedItemMeta(session).IsEmpty() && !carriedTrim.IsValid() {
+				applyPickupAllPlainSlice(slots, metas, trims, &tr.carried, func(i int) bool {
+					return i == MerchantSlotResult
+				})
+			}
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+				maxSt := MaxItemStackSize
+				if MaxItemDurability(slots[slot].ResolvedID()) > 0 || slots[slot].ResolvedID() == "minecraft:enchanted_book" {
+					maxSt = 1
+				}
+				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxSt)
+				SetCarriedItemMeta(session, metas[slot].Clone())
+				SetCarriedArmorTrim(session, trims[slot])
 			}
 		case ContainerInputThrow:
 			if !slots[slot].IsEmpty() {
@@ -1250,6 +1408,8 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 				rem := slots[slot].Count - dropCount
 				if rem <= 0 {
 					slots[slot] = world.ItemStack{}
+					metas[slot] = ItemMeta{}
+					trims[slot] = ArmorTrim{}
 				} else {
 					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 				}
@@ -1261,7 +1421,18 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 
 	tr.open.Crafting[0] = slots[MerchantSlotPayment1]
 	tr.open.Crafting[1] = slots[MerchantSlotPayment2]
-	writeBackMerchantPlayerSlots(session, slots)
+	for i := 0; i < 2; i++ {
+		if slots[i].IsEmpty() {
+			tr.open.CraftingSlots[i] = containerSlotData{}
+		} else {
+			tr.open.CraftingSlots[i] = containerSlotData{
+				Stack: slots[i],
+				Meta:  metas[i].Clone(),
+				Trim:  trims[i],
+			}
+		}
+	}
+	writeBackMerchantPlayerSlotsWithMetaAndTrim(session, slots, metas, trims)
 	if tradedExplorerMap != nil {
 		if tradedExplorerOnCursor {
 			SetCarriedMapID(session, tradedExplorerMap.MapID, true)
@@ -1302,6 +1473,8 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 
 	s.recomputeMerchantResultLocked(tr, vs.Offers)
 	slots[MerchantSlotResult] = tr.open.Result
+	metas[MerchantSlotResult] = ItemMeta{}
+	trims[MerchantSlotResult] = ArmorTrim{}
 
 	offersSnapshot := make([]MerchantOffer, len(vs.Offers))
 	copy(offersSnapshot, vs.Offers)
@@ -1340,8 +1513,11 @@ func (s *Server) handleMerchantClick(session *PlayerSession, containerID int32, 
 	}
 
 	if session.send != nil {
+		carriedTrim, _ := GetCarriedArmorTrim(session)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContentWithMetaAndTrim(
+			cid, stateID, slots, metas, trims, carried, GetCarriedItemMeta(session), carriedTrim,
+		)); err != nil {
 			return err
 		}
 		if tradedExplorerMap != nil {

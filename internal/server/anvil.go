@@ -5,7 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
-	"unicode/utf8"
+	"unicode/utf16"
 
 	"regionio/internal/protocol"
 	"regionio/internal/world"
@@ -798,11 +798,43 @@ func ComputeAnvilResult(
 	}
 }
 
+// FilterAnvilText matches vanilla StringUtil.filterText by removing
+// control characters (< 32, 127) and section sign '§' (167).
+func FilterAnvilText(raw string) string {
+	var b strings.Builder
+	b.Grow(len(raw))
+	for _, r := range raw {
+		if r < 32 || r == 127 || r == 167 {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// ValidateAnvilItemName matches vanilla AnvilMenu.validateName: filters
+// disallowed characters and rejects names exceeding 50 UTF-16 code units.
+func ValidateAnvilItemName(raw string) (string, bool) {
+	filtered := FilterAnvilText(raw)
+	if len(utf16.Encode([]rune(filtered))) > MaxAnvilNameRunes {
+		return "", false
+	}
+	return filtered, true
+}
+
 func sanitizeAnvilName(raw string) string {
-	s := strings.TrimSpace(raw)
-	if utf8.RuneCountInString(s) > MaxAnvilNameRunes {
-		runes := []rune(s)
-		s = string(runes[:MaxAnvilNameRunes])
+	s := FilterAnvilText(raw)
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	units := utf16.Encode([]rune(s))
+	if len(units) > MaxAnvilNameRunes {
+		// Truncate at UTF-16 boundary <= MaxAnvilNameRunes without splitting surrogate pairs.
+		limit := MaxAnvilNameRunes
+		if limit > 0 && units[limit-1] >= 0xD800 && units[limit-1] <= 0xDBFF {
+			limit--
+		}
+		return string(utf16.Decode(units[:limit]))
 	}
 	return s
 }
@@ -858,13 +890,24 @@ func (s *Server) HandleRenameItem(session *PlayerSession, name string) error {
 	if s == nil || session == nil || session.IsDead() {
 		return nil
 	}
+	filtered, ok := ValidateAnvilItemName(name)
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(filtered) == "" {
+		filtered = ""
+	}
 	tr := getContainerTracker(session)
 	tr.mu.Lock()
 	if tr.open == nil || tr.open.MenuType != MenuTypeAnvil {
 		tr.mu.Unlock()
 		return nil
 	}
-	tr.open.AnvilRename = sanitizeAnvilName(name)
+	if tr.open.AnvilRename == filtered {
+		tr.mu.Unlock()
+		return nil
+	}
+	tr.open.AnvilRename = filtered
 	s.recomputeAnvilStateLocked(session, tr)
 	tr.mu.Unlock()
 	return s.syncOpenContainer(session)

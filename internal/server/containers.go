@@ -827,6 +827,28 @@ func (d containerSlotData) Clone() containerSlotData {
 	return cp
 }
 
+// HasCustomComponents reports whether d carries any non-default item metadata or data components.
+func (d containerSlotData) HasCustomComponents() bool {
+	if d.IsEmpty() {
+		return false
+	}
+	return !d.Meta.IsEmpty() ||
+		d.Trim.IsValid() ||
+		d.Potion != "" ||
+		d.HasMap ||
+		d.Shulker != nil ||
+		len(d.Bundle) > 0 ||
+		d.Horn != "" ||
+		d.Writable != nil ||
+		d.Written != nil ||
+		d.Fireworks != nil ||
+		d.Star != nil ||
+		d.Lodestone != nil ||
+		!d.Banner.IsEmpty() ||
+		d.ShieldColor != "" ||
+		d.RawComp != nil
+}
+
 func (d containerSlotData) SameItemSameComponents(other containerSlotData) bool {
 	if d.IsEmpty() || other.IsEmpty() {
 		return false
@@ -2498,7 +2520,8 @@ func (s *Server) closeContainerInternal(session *PlayerSession, containerID int3
 		for i := range tr.open.Crafting {
 			if !tr.open.Crafting[i].IsEmpty() {
 				var entry containerSlotData
-				if tr.open.MenuType == MenuTypeCrafting && !tr.open.CraftingSlots[i].IsEmpty() &&
+				if (tr.open.MenuType == MenuTypeCrafting || tr.open.MenuType == MenuTypeMerchant || tr.open.MenuType == MenuTypeStonecutter) &&
+					!tr.open.CraftingSlots[i].IsEmpty() &&
 					tr.open.CraftingSlots[i].Stack.ResolvedItemID() == tr.open.Crafting[i].ResolvedItemID() {
 					entry = tr.open.CraftingSlots[i].WithCount(tr.open.Crafting[i].Count)
 				} else {
@@ -2575,8 +2598,8 @@ func (s *Server) closeContainerInternal(session *PlayerSession, containerID int3
 			continue
 		}
 		if entry.Shulker == nil && entry.Potion == "" && !entry.HasMap && len(entry.Bundle) == 0 && entry.Horn == "" && entry.Writable == nil && entry.Written == nil && entry.Fireworks == nil && entry.Star == nil && entry.Lodestone == nil && entry.Banner.IsEmpty() && (!entry.Meta.IsEmpty() || entry.Trim.IsValid()) {
-			rem := returnStackWithMetaAndTrimToInventory(session, entry.Stack, entry.Meta, entry.Trim)
-			if rem > 0 {
+			placed := returnStackWithMetaAndTrimToInventory(session, entry.Stack, entry.Meta, entry.Trim)
+			if rem := entry.Stack.Count - placed; rem > 0 {
 				_, _ = s.SpawnPlayerDroppedItem(session, entry.WithCount(rem))
 			}
 			continue
@@ -4032,6 +4055,21 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 	}
 }
 
+// CraftingRemainderItem returns the vanilla 26.1.2 Items.craftRemainder item (count 1)
+// left behind when one unit of itemID is consumed in a crafting grid.
+func CraftingRemainderItem(itemID string) (world.ItemStack, bool) {
+	switch canonicalResourceName(itemID) {
+	case "minecraft:water_bucket", "minecraft:lava_bucket", "minecraft:milk_bucket":
+		st := world.NewNamedItemStack("minecraft:bucket", 1)
+		return st, !st.IsEmpty()
+	case "minecraft:dragon_breath", "minecraft:honey_bottle":
+		st := world.NewNamedItemStack("minecraft:glass_bottle", 1)
+		return st, !st.IsEmpty()
+	default:
+		return world.ItemStack{}, false
+	}
+}
+
 func (s *Server) clickCraftingOutputData(
 	session *PlayerSession,
 	slots []containerSlotData,
@@ -4084,7 +4122,24 @@ func (s *Server) clickCraftingOutputData(
 			if cur.IsEmpty() {
 				continue
 			}
-			slots[gridStart+i] = cur.WithCount(cur.Stack.Count - 1)
+			remStack, hasRem := CraftingRemainderItem(cur.Stack.ResolvedID())
+			next := cur.WithCount(cur.Stack.Count - 1)
+			slots[gridStart+i] = next
+			if hasRem && !remStack.IsEmpty() {
+				remData := containerSlotData{Stack: remStack}
+				switch {
+				case next.IsEmpty():
+					slots[gridStart+i] = remData
+				case next.SameItemSameComponents(remData) && next.Stack.Count+remStack.Count <= next.MaxStackSize():
+					slots[gridStart+i] = next.WithCount(next.Stack.Count + remStack.Count)
+				default:
+					leftover, _ := moveSlotDataSlice(slots, remData, invStart, invEnd, false, nil)
+					if !leftover.IsEmpty() && s != nil && session != nil {
+						snap := session.Snapshot()
+						_, _ = s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.25, snap.Z, leftover.Stack)
+					}
+				}
+			}
 		}
 	}
 
@@ -4191,10 +4246,27 @@ func (s *Server) clickCraftingOutput(
 			if cur.IsEmpty() {
 				continue
 			}
+			remStack, hasRem := CraftingRemainderItem(cur.ResolvedID())
 			if cur.Count <= 1 {
 				slots[gridStart+i] = world.ItemStack{}
 			} else {
 				slots[gridStart+i] = world.NewItemStack(cur.ResolvedItemID(), cur.Count-1)
+			}
+			if hasRem && !remStack.IsEmpty() {
+				remMax := MaxStackSizeForBundleWeight(remStack.ResolvedID())
+				after := slots[gridStart+i]
+				switch {
+				case after.IsEmpty():
+					slots[gridStart+i] = remStack
+				case after.ResolvedItemID() == remStack.ResolvedItemID() && after.Count+remStack.Count <= remMax:
+					slots[gridStart+i] = world.NewItemStack(remStack.ResolvedItemID(), after.Count+remStack.Count)
+				default:
+					leftover := mergeIntoSlotSlice(slots, remStack, invStart, invEnd)
+					if !leftover.IsEmpty() && s != nil && session != nil {
+						snap := session.Snapshot()
+						_, _ = s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.25, snap.Z, leftover)
+					}
+				}
 			}
 		}
 	}
@@ -4861,6 +4933,8 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 			openCopy.Crafting[MerchantSlotPayment2],
 			openCopy.Result,
 		)
+		slotMetas, slotTrims = buildMerchantMenuMetasAndTrims(session, openCopy)
+		hasMetaAndTrim = true
 	default:
 		return nil
 	}
@@ -4941,6 +5015,12 @@ func (s *Server) syncPlayerInventoryContainerLocked(session *PlayerSession, tr *
 	}
 	stateID := session.NextContainerStateID()
 	return session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(0, stateID, slots, carried))
+}
+
+// SyncPlayerInventory pushes session's current player inventory contents and
+// cursor item over TCP and updates its remote container snapshot.
+func (s *Server) SyncPlayerInventory(session *PlayerSession) error {
+	return s.syncPlayerInventoryContainer(session)
 }
 
 func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
@@ -7442,7 +7522,11 @@ func (s *Server) SendSetCursorItem(session *PlayerSession) error {
 	if session == nil || session.send == nil {
 		return nil
 	}
-	return session.send(protocol.PlaySetCursorItem, EncodeSetCursorItemPacket(session.CarriedItem()))
+	tr := getContainerTracker(session)
+	tr.mu.Lock()
+	carriedData := getCarriedSlotDataLocked(session, tr)
+	tr.mu.Unlock()
+	return session.send(protocol.PlaySetCursorItem, encodeSetCursorItemFromSlotData(carriedData))
 }
 
 // SendSetPlayerInventorySlot sends ClientboundSetPlayerInventoryPacket (0x6c) for a player inventory slot.

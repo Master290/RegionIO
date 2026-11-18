@@ -468,6 +468,7 @@ func newServerState(cfg Config, chunks *world.Cache, store *world.Store, entitie
 		_ = s.LoadRedstoneRuntimeFile()
 		_ = s.LoadPortalsFile()
 		_ = s.LoadEquinesAndLlamasFile()
+		_ = s.LoadVillagersFile()
 	}
 	return s
 }
@@ -663,6 +664,9 @@ func (s *Server) SaveAll() error {
 		firstErr = err
 	}
 	if err := s.SaveEquinesAndLlamasFile(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := s.SaveVillagersFile(); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	if err := s.SaveDecorationsFile(); err != nil && firstErr == nil {

@@ -1305,38 +1305,69 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 	}
 
 	// Return any existing items in the crafting grid back to the player's inventory first.
+	var returnEntries []containerSlotData
 	if isTable {
-		returnStacksToInventory(session, tr.open.Crafting[:9])
-		for i := range tr.open.Crafting {
+		for i := 0; i < 9; i++ {
+			if !tr.open.Crafting[i].IsEmpty() {
+				var entry containerSlotData
+				if !tr.open.CraftingSlots[i].IsEmpty() &&
+					tr.open.CraftingSlots[i].Stack.ResolvedItemID() == tr.open.Crafting[i].ResolvedItemID() {
+					entry = tr.open.CraftingSlots[i].WithCount(tr.open.Crafting[i].Count)
+				} else {
+					entry = containerSlotData{
+						Stack:  tr.open.Crafting[i],
+						Potion: tr.open.CraftingPotions[i],
+					}
+					if len(tr.open.CraftingStars[i].Colors) > 0 || len(tr.open.CraftingStars[i].FadeColors) > 0 {
+						cp := tr.open.CraftingStars[i].Clone()
+						entry.Star = &cp
+					}
+				}
+				returnEntries = append(returnEntries, entry)
+			}
 			tr.open.Crafting[i] = world.ItemStack{}
+			tr.open.CraftingSlots[i] = containerSlotData{}
 			tr.open.CraftingPotions[i] = ""
 			tr.open.CraftingStars[i] = FireworkExplosion{}
 		}
 		tr.open.Result = world.ItemStack{}
 	} else {
-		var existing [4]world.ItemStack
 		for i := 0; i < 4; i++ {
-			st := tr.invCraft[i]
-			if st.IsEmpty() {
-				st = session.InventorySlot(1 + i)
+			entry := getPlayerSlotData(session, 1+i)
+			if entry.IsEmpty() && !tr.invCraft[i].IsEmpty() {
+				entry = containerSlotData{Stack: tr.invCraft[i]}
+				if len(tr.invCraftStars[i].Colors) > 0 || len(tr.invCraftStars[i].FadeColors) > 0 {
+					cp := tr.invCraftStars[i].Clone()
+					entry.Star = &cp
+				}
 			}
-			existing[i] = st
+			if !entry.IsEmpty() {
+				returnEntries = append(returnEntries, entry)
+			}
 			tr.invCraft[i] = world.ItemStack{}
 			tr.invCraftStars[i] = FireworkExplosion{}
-			session.SetInventorySlot(1+i, world.ItemStack{})
-			clearAllSlotMetadata(session, 1+i)
+			setPlayerSlotData(session, 1+i, containerSlotData{})
 		}
 		tr.invResult = world.ItemStack{}
-		session.SetInventorySlot(0, world.ItemStack{})
-		clearAllSlotMetadata(session, 0)
-		returnStacksToInventory(session, existing[:])
+		setPlayerSlotData(session, 0, containerSlotData{})
+	}
+	var overflowDrops []containerSlotData
+	for _, entry := range returnEntries {
+		if rem := returnSlotDataToInventoryForRecipe(session, entry); !rem.IsEmpty() {
+			overflowDrops = append(overflowDrops, rem)
+		}
 	}
 
-	// Work on a mutable copy of player storage slots (9..44: main inventory + hotbar).
-	inv := session.Inventory()
+	// Work on a mutable copy of plain (no custom components) player storage slots (9..44),
+	// matching vanilla StackedItemContents.accountSimpleStack.
+	eligible := make([]bool, 36)
 	storage := make([]world.ItemStack, 36)
 	for i := 0; i < 36; i++ {
-		storage[i] = inv[9+i]
+		d := getPlayerSlotData(session, 9+i)
+		if !d.IsEmpty() && !d.HasCustomComponents() {
+			eligible[i] = true
+			storage[i] = d.Stack
+		}
 	}
 
 	// Determine whether we can satisfy at least one craft of targetPattern from storage.
@@ -1345,6 +1376,9 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 	if !canCraftOnce {
 		// Ingredients missing: leave returned items in player inventory and send ghost recipe.
 		tr.mu.Unlock()
+		for _, drop := range overflowDrops {
+			_, _ = s.SpawnPlayerDroppedItem(session, drop)
+		}
 		if isTable {
 			_ = s.syncOpenContainer(session)
 		} else {
@@ -1365,8 +1399,11 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 		}
 	}
 
-	// Commit updated player storage (9..44) and crafting grid slots.
+	// Commit updated plain player storage (9..44) and crafting grid slots.
 	for i := 0; i < 36; i++ {
+		if !eligible[i] {
+			continue
+		}
 		session.SetInventorySlot(9+i, storage[i])
 		if storage[i].IsEmpty() {
 			clearAllSlotMetadata(session, 9+i)
@@ -1376,9 +1413,13 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 	if isTable {
 		for i := 0; i < 9; i++ {
 			tr.open.Crafting[i] = newGrid[i]
+			tr.open.CraftingSlots[i] = containerSlotData{Stack: newGrid[i]}
 		}
 		tr.open.Result = result
 		tr.mu.Unlock()
+		for _, drop := range overflowDrops {
+			_, _ = s.SpawnPlayerDroppedItem(session, drop)
+		}
 		return s.syncOpenContainer(session)
 	}
 
@@ -1389,18 +1430,30 @@ func (s *Server) HandlePlaceRecipe(session *PlayerSession, containerID int32, re
 	tr.invResult = result
 	session.SetInventorySlot(0, result)
 	tr.mu.Unlock()
+	for _, drop := range overflowDrops {
+		_, _ = s.SpawnPlayerDroppedItem(session, drop)
+	}
 	return s.syncPlayerInventoryContainer(session)
 }
 
-func returnStacksToInventory(session *PlayerSession, stacks []world.ItemStack) {
-	if session == nil {
-		return
+func returnSlotDataToInventoryForRecipe(session *PlayerSession, entry containerSlotData) containerSlotData {
+	if session == nil || entry.IsEmpty() {
+		return containerSlotData{}
 	}
-	for _, st := range stacks {
-		if !st.IsEmpty() {
-			_, _ = session.AddItemToInventory(st)
+	if !entry.HasCustomComponents() {
+		added, _ := session.AddItemToInventory(entry.Stack)
+		return entry.WithCount(entry.Stack.Count - added)
+	}
+	inv := session.Inventory()
+	for _, rg := range [][2]int{{9, 36}, {36, 45}} {
+		for idx := rg[0]; idx < rg[1]; idx++ {
+			if inv[idx].IsEmpty() {
+				setPlayerSlotData(session, idx, entry)
+				return containerSlotData{}
+			}
 		}
 	}
+	return entry
 }
 
 func placeOneCraftFromStorage(storage []world.ItemStack, pattern []Ingredient, gridOut []world.ItemStack) bool {

@@ -4,10 +4,13 @@ import (
 	"errors"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"regionio/internal/nbt"
 	"regionio/internal/protocol"
 	"regionio/internal/registry"
 	"regionio/internal/world"
@@ -1035,4 +1038,240 @@ func (s *Server) FaceVillagerTowardPlayer(entityID int32, playerX, playerZ float
 		e.Yaw = yaw
 		e.HeadYaw = yaw
 	})
+}
+
+// SaveVillagersFile persists all living minecraft:villager entities and their
+// profession/level/XP/trade offers/restock state to <WorldDir>/data/villagers.dat.
+func (s *Server) SaveVillagersFile() error {
+	if s == nil || s.cfg.WorldDir == "" || s.entities == nil {
+		return nil
+	}
+	dir := filepath.Join(s.cfg.WorldDir, "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	allEnts := s.entities.AppendAll(nil)
+	elems := make([]nbt.Tag, 0, len(allEnts))
+	for i := range allEnts {
+		e := allEnts[i]
+		if canonicalResourceName(e.TypeName) != MobTypeVillager {
+			continue
+		}
+		hp := s.MobHealth(e.ID)
+		if hp <= 0 {
+			continue
+		}
+		vs := s.ensureVillagerState(e.ID)
+		if vs == nil {
+			continue
+		}
+		vtr := s.villagerTracker()
+		vtr.mu.Lock()
+		snapVS := vs.Clone()
+		vtr.mu.Unlock()
+
+		var babyByte int8
+		if s.IsMobBaby(e.ID) {
+			babyByte = 1
+		}
+		var lvlUpByte int8
+		if snapVS.IncreaseProfessionLevelOnUpdate {
+			lvlUpByte = 1
+		}
+		uuidCopy := make([]byte, 16)
+		copy(uuidCopy, e.UUID[:])
+
+		offerTags := make([]nbt.Tag, 0, len(snapVS.Offers))
+		for _, off := range snapVS.Offers {
+			oc := nbt.NewCompound().
+				Set("Name", nbt.String(off.Name)).
+				Set("BaseCostAId", nbt.String(off.BaseCostA.ResolvedID())).
+				Set("BaseCostACount", nbt.Int(off.BaseCostA.Count)).
+				Set("CostBId", nbt.String(off.CostB.ResolvedID())).
+				Set("CostBCount", nbt.Int(off.CostB.Count)).
+				Set("ResultId", nbt.String(off.Result.ResolvedID())).
+				Set("ResultCount", nbt.Int(off.Result.Count)).
+				Set("Uses", nbt.Int(off.Uses)).
+				Set("MaxUses", nbt.Int(off.MaxUses)).
+				Set("XP", nbt.Int(off.XP)).
+				Set("SpecialPriceDiff", nbt.Int(off.SpecialPriceDiff)).
+				Set("PriceMultiplier", nbt.Float(off.PriceMultiplier)).
+				Set("Demand", nbt.Int(off.Demand))
+			offerTags = append(offerTags, oc)
+		}
+
+		c := nbt.NewCompound().
+			Set("Dimension", nbt.String(e.EffectiveDimension())).
+			Set("UUID", nbt.ByteArray(uuidCopy)).
+			Set("X", nbt.Double(e.X)).
+			Set("Y", nbt.Double(e.Y)).
+			Set("Z", nbt.Double(e.Z)).
+			Set("Yaw", nbt.Float(e.Yaw)).
+			Set("Pitch", nbt.Float(e.Pitch)).
+			Set("Health", nbt.Float(hp)).
+			Set("Baby", nbt.Byte(babyByte)).
+			Set("VillagerType", nbt.String(canonicalResourceName(snapVS.VillagerType))).
+			Set("Profession", nbt.String(canonicalResourceName(snapVS.Profession))).
+			Set("Level", nbt.Int(int32(snapVS.Level))).
+			Set("XP", nbt.Int(snapVS.XP)).
+			Set("LastRestockGameTime", nbt.Long(snapVS.LastRestockGameTime)).
+			Set("LastRestockDay", nbt.Long(snapVS.LastRestockDay)).
+			Set("RestocksToday", nbt.Int(int32(snapVS.RestocksToday))).
+			Set("UpdateMerchantTimer", nbt.Int(int32(snapVS.UpdateMerchantTimer))).
+			Set("IncreaseProfessionLevelOnUpdate", nbt.Byte(lvlUpByte)).
+			Set("Offers", nbt.List{ElemID: nbt.TagCompound, Elems: offerTags})
+		elems = append(elems, c)
+	}
+	root := nbt.NewCompound().Set("Villagers", nbt.List{
+		ElemID: nbt.TagCompound,
+		Elems:  elems,
+	})
+	return os.WriteFile(filepath.Join(dir, "villagers.dat"), nbt.Marshal(root), 0o644)
+}
+
+// LoadVillagersFile restores saved villagers and their offers/XP state from
+// <WorldDir>/data/villagers.dat.
+func (s *Server) LoadVillagersFile() error {
+	if s == nil || s.cfg.WorldDir == "" || s.entities == nil {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(s.cfg.WorldDir, "data", "villagers.dat"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	rootTag, err := nbt.Unmarshal(raw)
+	if err != nil || rootTag == nil {
+		return err
+	}
+	root, ok := rootTag.(*nbt.Compound)
+	if !ok || root == nil {
+		return nil
+	}
+	list, ok := nbtListTag(root, "Villagers")
+	if !ok {
+		return nil
+	}
+	typeID := int(ResolveVillagerEntityTypeID())
+	vtr := s.villagerTracker()
+
+	for _, elem := range list.Elems {
+		comp, ok := elem.(*nbt.Compound)
+		if !ok || comp == nil {
+			continue
+		}
+		dim := world.NormalizeDimension(nbtStringField(comp, "Dimension"))
+		var uuid [16]byte
+		if ut, ok := comp.Get("UUID"); ok {
+			if ba, ok := ut.(nbt.ByteArray); ok && len(ba) == 16 {
+				copy(uuid[:], ba)
+			}
+		}
+		x := nbtDoubleField(comp, "X")
+		y := nbtDoubleField(comp, "Y")
+		z := nbtDoubleField(comp, "Z")
+		yaw := nbtFloatField(comp, "Yaw")
+		pitch := nbtFloatField(comp, "Pitch")
+		health := nbtFloatField(comp, "Health")
+		isBaby := nbtByteField(comp, "Baby") != 0
+
+		entityID := s.entities.Add(&world.Entity{
+			UUID:      uuid,
+			TypeID:    typeID,
+			TypeName:  MobTypeVillager,
+			Dimension: dim,
+			X:         x,
+			Y:         y,
+			Z:         z,
+			Yaw:       yaw,
+			HeadYaw:   yaw,
+			Pitch:     pitch,
+			OnGround:  true,
+		})
+		if health > 0 {
+			s.SetMobHealth(entityID, health)
+		}
+		if isBaby {
+			s.SetMobBaby(entityID, true)
+		}
+
+		vType := canonicalResourceName(nbtStringField(comp, "VillagerType"))
+		if vType == "" {
+			vType = VillagerTypePlains
+		}
+		prof := canonicalResourceName(nbtStringField(comp, "Profession"))
+		if prof == "" {
+			prof = VillagerProfessionNone
+		}
+		lvl := int(nbtIntField(comp, "Level"))
+		if lvl < MinVillagerLevel {
+			lvl = MinVillagerLevel
+		} else if lvl > MaxVillagerLevel {
+			lvl = MaxVillagerLevel
+		}
+		lastRestockGT, _ := nbtInt64(comp, "LastRestockGameTime")
+		lastRestockDay := int64(-1)
+		if d, ok := nbtInt64(comp, "LastRestockDay"); ok {
+			lastRestockDay = d
+		}
+
+		var offers []MerchantOffer
+		if offList, ok := nbtListTag(comp, "Offers"); ok {
+			offers = make([]MerchantOffer, 0, len(offList.Elems))
+			for _, oElem := range offList.Elems {
+				oc, ok := oElem.(*nbt.Compound)
+				if !ok || oc == nil {
+					continue
+				}
+				var costA, costB, result world.ItemStack
+				if id := nbtStringField(oc, "BaseCostAId"); id != "" {
+					if cnt := nbtIntField(oc, "BaseCostACount"); cnt > 0 {
+						costA = world.NewNamedItemStack(id, cnt)
+					}
+				}
+				if id := nbtStringField(oc, "CostBId"); id != "" {
+					if cnt := nbtIntField(oc, "CostBCount"); cnt > 0 {
+						costB = world.NewNamedItemStack(id, cnt)
+					}
+				}
+				if id := nbtStringField(oc, "ResultId"); id != "" {
+					if cnt := nbtIntField(oc, "ResultCount"); cnt > 0 {
+						result = world.NewNamedItemStack(id, cnt)
+					}
+				}
+				offers = append(offers, MerchantOffer{
+					Name:             nbtStringField(oc, "Name"),
+					BaseCostA:        costA,
+					CostB:            costB,
+					Result:           result,
+					Uses:             nbtIntField(oc, "Uses"),
+					MaxUses:          nbtIntField(oc, "MaxUses"),
+					XP:               nbtIntField(oc, "XP"),
+					SpecialPriceDiff: nbtIntField(oc, "SpecialPriceDiff"),
+					PriceMultiplier:  nbtFloatField(oc, "PriceMultiplier"),
+					Demand:           nbtIntField(oc, "Demand"),
+				})
+			}
+		}
+
+		vs := &VillagerState{
+			EntityID:                        entityID,
+			VillagerType:                    vType,
+			Profession:                      prof,
+			Level:                           lvl,
+			XP:                              nbtIntField(comp, "XP"),
+			Offers:                          offers,
+			LastRestockGameTime:             lastRestockGT,
+			LastRestockDay:                  lastRestockDay,
+			RestocksToday:                   int(nbtIntField(comp, "RestocksToday")),
+			UpdateMerchantTimer:             int(nbtIntField(comp, "UpdateMerchantTimer")),
+			IncreaseProfessionLevelOnUpdate: nbtByteField(comp, "IncreaseProfessionLevelOnUpdate") != 0,
+		}
+		vtr.mu.Lock()
+		vtr.villagers[entityID] = vs
+		vtr.mu.Unlock()
+	}
+	return nil
 }

@@ -77,6 +77,29 @@ func TestTradeBookLoadsAllVanilla26_1_2ProfessionsAndLevels(t *testing.T) {
 	if !ok || enchOffer.BaseCostA.ResolvedID() != "minecraft:emerald" || enchOffer.CostB.ResolvedID() != "minecraft:book" || enchOffer.Result.ResolvedID() != "minecraft:enchanted_book" {
 		t.Fatalf("instantiated librarian/1/emerald_and_book_enchanted_book = %+v", enchOffer)
 	}
+
+	// Verify vanilla 26.1.2 omitted-field defaults (TradeCost.count=1, VillagerTrade.max_uses=4, xp=1).
+	breadTrade, ok := book.Trade("minecraft:farmer/1/emerald_bread")
+	if !ok || breadTrade == nil {
+		t.Fatal("missing trade minecraft:farmer/1/emerald_bread")
+	}
+	breadOffer, ok := breadTrade.Instantiate(rng)
+	if !ok || breadOffer.BaseCostA.ResolvedID() != "minecraft:emerald" || breadOffer.BaseCostA.Count != 1 ||
+		breadOffer.Result.ResolvedID() != "minecraft:bread" || breadOffer.Result.Count != 6 ||
+		breadOffer.MaxUses != 16 || breadOffer.XP != 1 {
+		t.Fatalf("instantiated farmer/1/emerald_bread = %+v, want 1 emerald -> 6 bread (maxUses=16, xp=1)", breadOffer)
+	}
+
+	acaciaTrade, ok := book.Trade("minecraft:wandering_trader/emerald_acacia_log")
+	if !ok || acaciaTrade == nil {
+		t.Fatal("missing trade minecraft:wandering_trader/emerald_acacia_log")
+	}
+	acaciaOffer, ok := acaciaTrade.Instantiate(rng)
+	if !ok || acaciaOffer.BaseCostA.ResolvedID() != "minecraft:emerald" || acaciaOffer.BaseCostA.Count != 1 ||
+		acaciaOffer.Result.ResolvedID() != "minecraft:acacia_log" || acaciaOffer.Result.Count != 8 ||
+		acaciaOffer.MaxUses != 4 || acaciaOffer.XP != 1 {
+		t.Fatalf("instantiated wandering_trader/emerald_acacia_log = %+v, want 1 emerald -> 8 acacia_log (maxUses=4, xp=1)", acaciaOffer)
+	}
 }
 
 func TestMerchantOffersPacketRoundTrip(t *testing.T) {
