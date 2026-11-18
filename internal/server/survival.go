@@ -793,6 +793,9 @@ func (s *Server) BreakBlock(session *PlayerSession, x, y, z int, status int32) (
 	if IsChestBlock(prevState) || world.IsCopperChestBlock(prevState) || IsBarrelBlock(prevState) {
 		s.DropChestContentsInDim(dim, x, y, z)
 	}
+	if IsCraftingTableBlock(prevState) {
+		s.CloseCraftingTableViewersAt(dim, x, y, z)
+	}
 	if IsDispenserOrDropperBlock(prevState) {
 		s.BreakDispenserOrDropper(dim, x, y, z)
 	}
@@ -4939,74 +4942,34 @@ func (s *Server) DropSelectedItem(session *PlayerSession, dropAll bool) (int32, 
 		dropCount = cur.Count
 	}
 	dropped := world.NewItemStack(cur.ResolvedItemID(), dropCount)
-	slotHornInst := GetSlotGoatHornInstrument(session, invSlot)
-	slotMapID, hasSlotMapID := GetSlotMapID(session, invSlot)
-	slotBundle := GetSlotBundleContents(session, invSlot)
-	slotMeta := GetSlotItemMeta(session, invSlot)
-	slotPotion := GetSlotPotionType(session, invSlot)
-	slotShulker, hasSlotShulker := GetSlotShulkerBoxData(session, invSlot)
+	fullData := getPlayerSlotData(session, invSlot)
 	isOminousBottle := IsOminousBottleItem(cur)
 	slotOminousAmp := GetSlotOminousBottleAmplifier(session, invSlot)
 	s.StopUsingSpyglass(session)
 
 	rem := cur.Count - dropCount
 	if rem <= 0 {
-		session.SetInventorySlot(invSlot, world.ItemStack{})
-		SetSlotItemMeta(session, invSlot, ItemMeta{})
-		SetSlotPotionType(session, invSlot, "")
-		SetSlotArmorTrim(session, invSlot, ArmorTrim{})
-		ClearSlotBannerMeta(session, invSlot)
-		ClearSlotGoatHornInstrument(session, invSlot)
-		ClearSlotMapID(session, invSlot)
-		ClearSlotBundleContents(session, invSlot)
-		ClearSlotWritableBook(session, invSlot)
-		ClearSlotWrittenBook(session, invSlot)
-		ClearSlotShulkerBoxData(session, invSlot)
+		setPlayerSlotData(session, invSlot, containerSlotData{})
 		clearSlotOminousBottleAmplifier(session, invSlot)
 	} else {
 		session.SetInventorySlot(invSlot, world.NewItemStack(cur.ResolvedItemID(), rem))
 	}
 
-	if session.send != nil {
-		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSetSlotWithPotion(0, session.NextContainerStateID(), invSlot, session.InventorySlot(invSlot), GetSlotPotionType(session, invSlot)))
+	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	updatedSlot := getPlayerSlotData(session, invSlot)
+	if tr.remoteContainerID == 0 && invSlot >= 0 && invSlot < len(tr.remoteSlots) {
+		tr.remoteSlots[invSlot] = updatedSlot.ToHashedStack()
 	}
+	if session.send != nil {
+		_ = session.send(protocol.PlayContainerSetSlot, encodeContainerSlotFromSlotData(0, session.NextContainerStateID(), invSlot, updatedSlot))
+	}
+	tr.syncMu.Unlock()
 	s.TriggerInventoryChanged(session)
 
-	yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
-	pitchRad := float64(snap.Pitch) * (math.Pi / 180.0)
-	dirX := -math.Sin(yawRad) * math.Cos(pitchRad)
-	dirZ := math.Cos(yawRad) * math.Cos(pitchRad)
-	spawnX := snap.X + dirX*0.3
-	spawnY := snap.Y + 1.3
-	spawnZ := snap.Z + dirZ*0.3
-
-	dim := world.NormalizeDimension(snap.Dimension)
-	entID, _ := s.SpawnItemEntityInDimension(dim, spawnX, spawnY, spawnZ, dropped)
-	if entID > 0 {
-		if !slotMeta.IsEmpty() {
-			ft := s.fishingTracker()
-			ft.mu.Lock()
-			ft.droppedMeta[entID] = slotMeta.Clone()
-			ft.mu.Unlock()
-		}
-		if slotHornInst != "" && canonicalItemName(dropped.ResolvedID()) == GoatHornItemID {
-			s.AssociateDroppedGoatHornEntity(entID, slotHornInst)
-		}
-		if hasSlotMapID && canonicalItemName(dropped.ResolvedID()) == FilledMapItemID {
-			s.AssociateDroppedMapEntity(entID, slotMapID)
-		}
-		if len(slotBundle) > 0 && IsBundleItem(dropped.ResolvedID()) {
-			s.AssociateDroppedBundleEntity(entID, slotBundle)
-		}
-		if isOminousBottle {
-			s.AssociateDroppedOminousBottleAmplifier(entID, slotOminousAmp)
-		}
-		if slotPotion != "" && IsPotionOrTippedArrowItem(dropped) {
-			s.AssociateDroppedPotionEntity(entID, slotPotion)
-		}
-		if hasSlotShulker && IsShulkerBoxItemOrBlock(dropped.ResolvedID()) {
-			s.AssociateDroppedShulkerBoxEntity(entID, slotShulker)
-		}
+	entID, _ := s.SpawnPlayerDroppedItem(session, fullData.WithCount(dropCount))
+	if entID > 0 && isOminousBottle {
+		s.AssociateDroppedOminousBottleAmplifier(entID, slotOminousAmp)
 	}
 	s.RecordItemDropped(session, dropped.ResolvedID(), dropped.Count)
 	return entID, dropped

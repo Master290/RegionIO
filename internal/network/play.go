@@ -275,59 +275,20 @@ func (h *handler) sendContainerSetContent() error {
 	w.VarInt(stateID)
 	w.VarInt(world.PlayerInventorySlots)
 	for i := 0; i < world.PlayerInventorySlots; i++ {
-		if h.session != nil {
-			switch inv[i].ResolvedID() {
-			case server.FilledMapItemID:
-				if mapID, ok := server.GetSlotMapID(h.session, i); ok {
-					server.EncodeSlotWithMapID(w, inv[i], mapID, true)
-					continue
-				}
-			case server.WritableBookItemID:
-				if wb, ok := server.GetSlotWritableBook(h.session, i); ok {
-					server.EncodeSlotWithBookContent(w, inv[i], &wb, nil)
-					continue
-				}
-			case server.WrittenBookItemID:
-				if sb, ok := server.GetSlotWrittenBook(h.session, i); ok {
-					server.EncodeSlotWithBookContent(w, inv[i], nil, &sb)
-					continue
-				}
-			case server.FireworkRocketItemID:
-				if fw, ok := server.GetSlotFireworks(h.session, i); ok {
-					server.EncodeSlotWithFireworks(w, inv[i], fw)
-					continue
-				}
-			case server.FireworkStarItemID:
-				if exp, ok := server.GetSlotFireworkStar(h.session, i); ok {
-					server.EncodeSlotWithFireworkStar(w, inv[i], exp)
-					continue
-				}
-			}
-			if server.IsBundleItem(inv[i].ResolvedID()) {
-				if bundleItems := server.GetSlotBundleContents(h.session, i); len(bundleItems) > 0 {
-					server.EncodeSlotWithBundleContents(w, inv[i], bundleItems)
-					continue
-				}
-			}
-			if id := inv[i].ResolvedID(); server.IsBannerItem(id) || id == "minecraft:shield" {
-				pats := server.GetSlotBannerPatterns(h.session, i)
-				baseCol := server.GetSlotShieldBaseColor(h.session, i)
-				if !pats.IsEmpty() || baseCol != "" {
-					server.EncodeSlotWithBannerPatterns(w, inv[i], pats, baseCol)
-					continue
-				}
-			}
-			meta := server.GetSlotItemMeta(h.session, i)
-			trim, hasTrim := server.GetSlotArmorTrim(h.session, i)
-			if !meta.IsEmpty() || hasTrim {
-				server.WriteSlotWithArmorTrim(w, inv[i], meta, trim)
-				continue
-			}
+		if h.srv != nil && h.session != nil {
+			h.srv.WritePlayerInventorySlot(w, h.session, i)
+		} else {
+			writeItemStack(w, inv[i])
 		}
-		writeItemStack(w, inv[i])
 	}
 	writeItemStack(w, world.ItemStack{}) // carried item
-	return h.conn.SendWriter(protocol.PlayContainerSetContent, w)
+	if err := h.conn.SendWriter(protocol.PlayContainerSetContent, w); err != nil {
+		return err
+	}
+	if h.srv != nil && h.session != nil {
+		h.srv.InitPlayerInventoryRemoteState(h.session)
+	}
+	return nil
 }
 
 func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
@@ -339,56 +300,11 @@ func (h *handler) sendContainerSetSlot(slot int, stack world.ItemStack) error {
 	w.VarInt(0) // containerId 0 = player inventory
 	w.VarInt(stateID)
 	w.Uint16(uint16(int16(slot)))
-	if h.session != nil {
-		switch stack.ResolvedID() {
-		case server.FilledMapItemID:
-			if mapID, ok := server.GetSlotMapID(h.session, slot); ok {
-				server.EncodeSlotWithMapID(w, stack, mapID, true)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		case server.WritableBookItemID:
-			if wb, ok := server.GetSlotWritableBook(h.session, slot); ok {
-				server.EncodeSlotWithBookContent(w, stack, &wb, nil)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		case server.WrittenBookItemID:
-			if sb, ok := server.GetSlotWrittenBook(h.session, slot); ok {
-				server.EncodeSlotWithBookContent(w, stack, nil, &sb)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		case server.FireworkRocketItemID:
-			if fw, ok := server.GetSlotFireworks(h.session, slot); ok {
-				server.EncodeSlotWithFireworks(w, stack, fw)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		case server.FireworkStarItemID:
-			if exp, ok := server.GetSlotFireworkStar(h.session, slot); ok {
-				server.EncodeSlotWithFireworkStar(w, stack, exp)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		}
-		if server.IsBundleItem(stack.ResolvedID()) {
-			if bundleItems := server.GetSlotBundleContents(h.session, slot); len(bundleItems) > 0 {
-				server.EncodeSlotWithBundleContents(w, stack, bundleItems)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		}
-		if id := stack.ResolvedID(); server.IsBannerItem(id) || id == "minecraft:shield" {
-			pats := server.GetSlotBannerPatterns(h.session, slot)
-			baseCol := server.GetSlotShieldBaseColor(h.session, slot)
-			if !pats.IsEmpty() || baseCol != "" {
-				server.EncodeSlotWithBannerPatterns(w, stack, pats, baseCol)
-				return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-			}
-		}
-		meta := server.GetSlotItemMeta(h.session, slot)
-		trim, hasTrim := server.GetSlotArmorTrim(h.session, slot)
-		if !meta.IsEmpty() || hasTrim {
-			server.WriteSlotWithArmorTrim(w, stack, meta, trim)
-			return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
-		}
+	if h.srv != nil && h.session != nil && !stack.IsEmpty() {
+		h.srv.WritePlayerInventorySlot(w, h.session, slot)
+	} else {
+		writeItemStack(w, stack)
 	}
-	writeItemStack(w, stack)
 	return h.conn.SendWriter(protocol.PlayContainerSetSlot, w)
 }
 
@@ -1685,7 +1601,7 @@ func (h *handler) handleContainerClick(pkt protocol.Packet) error {
 		return err
 	}
 	if h.srv != nil && h.session != nil {
-		if err := h.srv.HandleContainerClickWithState(h.session, click.ContainerID, click.StateID, int(click.Slot), click.Button, click.Mode); err != nil {
+		if err := h.srv.HandleContainerClickPacket(h.session, click); err != nil {
 			return err
 		}
 		h.syncHotbarFromSession()

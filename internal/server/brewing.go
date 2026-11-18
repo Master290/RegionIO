@@ -1947,7 +1947,7 @@ func (s *Server) encodeBrewingStandContainerContent(
 		writeContainerItemStack(w, st)
 	}
 	if IsPotionOrTippedArrowItem(carried) && session != nil {
-		EncodeSlotWithPotionContents(w, carried, GetCarriedPotionType(session))
+		EncodeSlotWithPotionContents(w, carried, getCarriedPotionTypeForStack(session, carried))
 	} else {
 		writeContainerItemStack(w, carried)
 	}
@@ -2006,7 +2006,7 @@ func (s *Server) HandleBrewingStandClick(session *PlayerSession, click Container
 				dropCount = 1
 			}
 			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
-			droppedPotion := GetCarriedPotionType(session)
+			droppedPotion := getCarriedPotionTypeForStack(session, tr.carried)
 			rem := tr.carried.Count - dropCount
 			if rem <= 0 {
 				tr.carried = world.ItemStack{}
@@ -2062,7 +2062,7 @@ func (s *Server) applyBrewingStandClickLocked(
 	for i := 0; i < 9; i++ {
 		slotPotions[32+i] = GetSlotPotionType(session, 36+i)
 	}
-	carriedPotion := GetCarriedPotionType(session)
+	carriedPotion := getCarriedPotionTypeForStack(session, tr.carried)
 
 	switch mode {
 	case ContainerInputPickup:

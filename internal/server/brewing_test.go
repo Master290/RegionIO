@@ -952,15 +952,15 @@ func TestPotionContentsComponentCodecAndTippedArrowCraftingPlayPath(t *testing.T
 		}
 	}
 
-	// Shift-click (QuickMove) crafting output slot 0 -> crafts 8x tipped_arrow into hotbar slot 36.
+	// Shift-click (QuickMove) crafting output slot 0 -> crafts 8x tipped_arrow into hotbar slot 44 (reverse-order moveItemStackTo).
 	if err := srv.HandleContainerClick(sess, cid, 0, 0, ContainerInputQuickMove); err != nil {
 		t.Fatalf("QuickMove craft tipped_arrow: %v", err)
 	}
-	craftedSlot := sess.InventorySlot(36)
+	craftedSlot := sess.InventorySlot(44)
 	if craftedSlot.ResolvedID() != "minecraft:tipped_arrow" || craftedSlot.Count != 8 {
-		t.Fatalf("expected 8x minecraft:tipped_arrow in slot 36, got %+v", craftedSlot)
+		t.Fatalf("expected 8x minecraft:tipped_arrow in slot 44, got %+v", craftedSlot)
 	}
-	if gotPot := GetSlotPotionType(sess, 36); gotPot != PotionPoison {
+	if gotPot := GetSlotPotionType(sess, 44); gotPot != PotionPoison {
 		t.Fatalf("crafted tipped_arrow potion type = %q, want %q", gotPot, PotionPoison)
 	}
 	_ = srv.CloseContainer(sess, cid, true)
@@ -984,7 +984,7 @@ func TestPotionContentsComponentCodecAndTippedArrowCraftingPlayPath(t *testing.T
 	if picked := srv.TryPickupItems(sess); picked != 1 {
 		t.Fatalf("TryPickupItems picked %d, want 1", picked)
 	}
-	if gotPot := GetSlotPotionType(sess, 37); gotPot != PotionSlowFalling {
+	if gotPot := GetSlotPotionType(sess, 36); gotPot != PotionSlowFalling {
 		t.Fatalf("picked up potion type = %q, want %q", gotPot, PotionSlowFalling)
 	}
 

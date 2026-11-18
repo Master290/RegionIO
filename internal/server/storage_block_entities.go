@@ -776,6 +776,115 @@ func (s *Server) GetChestSlotMeta(dim string, x, y, z, slot int) (ItemMeta, stri
 	return meta, pot, comp
 }
 
+func (s *Server) getStorageSlotMetaAndComponents(dim string, x, y, z, slot int) (world.ItemStack, ItemMeta, ArmorTrim, string, *[ChestSlotCount]world.ItemStack, *nbt.Compound) {
+	if s == nil || slot < 0 || slot >= ChestSlotCount {
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, "", nil, nil
+	}
+	normDim := normalizeStorageDim(dim)
+	ss := s.storageState()
+	ss.mu.Lock()
+	s.ensureChunkStorageLoadedLocked(ss, normDim, int32(x>>4), int32(z>>4))
+	be := ss.blocks[storageBlockKey{dim: normDim, x: x, y: y, z: z}]
+	if be == nil {
+		ss.mu.Unlock()
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, "", nil, nil
+	}
+	st := be.Slots[slot]
+	if st.IsEmpty() {
+		ss.mu.Unlock()
+		return world.ItemStack{}, ItemMeta{}, ArmorTrim{}, "", nil, nil
+	}
+	meta := be.SlotMeta[slot].Clone()
+	pot := be.SlotPotions[slot]
+	var sh *[ChestSlotCount]world.ItemStack
+	if be.SlotShulker[slot] != nil {
+		arr := *be.SlotShulker[slot]
+		sh = &arr
+	}
+	comp := world.CloneNBTCompound(be.SlotComponents[slot])
+	ss.mu.Unlock()
+	var trim ArmorTrim
+	if comp != nil {
+		if tag, ok := comp.Get("minecraft:trim"); ok {
+			if tc, ok2 := tag.(*nbt.Compound); ok2 && tc != nil {
+				if tr, ok3 := ArmorTrimFromNBT(tc); ok3 {
+					trim = tr
+				}
+			}
+		}
+	}
+	return st, meta, trim, pot, sh, comp
+}
+
+func (s *Server) setStorageSlotMetaAndComponents(dim string, x, y, z, slot int, stack world.ItemStack, meta ItemMeta, trim ArmorTrim, potionType string, shulker *[ChestSlotCount]world.ItemStack, rawComp *nbt.Compound) bool {
+	if s == nil || slot < 0 || slot >= ChestSlotCount {
+		return false
+	}
+	normDim := normalizeStorageDim(dim)
+	ss := s.storageState()
+	ss.mu.Lock()
+	s.ensureChunkStorageLoadedLocked(ss, normDim, int32(x>>4), int32(z>>4))
+	key := storageBlockKey{dim: normDim, x: x, y: y, z: z}
+	be := ss.blocks[key]
+	if be == nil && (stack.IsEmpty() || stack.Count <= 0) {
+		ss.mu.Unlock()
+		return true
+	}
+	if be == nil {
+		be = s.getOrCreateStorageLocked(ss, normDim, x, y, z, "")
+	}
+	_ = s.unpackStorageLootTableLocked(be)
+	if stack.IsEmpty() || stack.Count <= 0 {
+		be.Slots[slot] = world.ItemStack{}
+		be.SlotMeta[slot] = ItemMeta{}
+		be.SlotPotions[slot] = ""
+		be.SlotShulker[slot] = nil
+		be.SlotComponents[slot] = nil
+	} else {
+		if stack.ItemID <= 0 && stack.ID != "" {
+			stack = world.NewNamedItemStack(stack.ID, stack.Count)
+		} else {
+			stack = world.NewItemStack(stack.ResolvedItemID(), stack.Count)
+		}
+		be.Slots[slot] = stack
+		be.SlotMeta[slot] = meta.Clone()
+		be.SlotPotions[slot] = potionType
+		if shulker != nil {
+			arr := *shulker
+			be.SlotShulker[slot] = &arr
+		} else {
+			be.SlotShulker[slot] = nil
+		}
+		var nextComp *nbt.Compound
+		if rawComp != nil {
+			cloned := world.CloneNBTCompound(rawComp)
+			for _, k := range cloned.Keys() {
+				if !trim.IsValid() && k == "minecraft:trim" {
+					continue
+				}
+				if v, ok := cloned.Get(k); ok {
+					if nextComp == nil {
+						nextComp = nbt.NewCompound()
+					}
+					nextComp.Set(k, v)
+				}
+			}
+		}
+		if trim.IsValid() {
+			if tc := ArmorTrimToNBT(trim); tc != nil {
+				if nextComp == nil {
+					nextComp = nbt.NewCompound()
+				}
+				nextComp.Set("minecraft:trim", tc)
+			}
+		}
+		be.SlotComponents[slot] = nextComp
+	}
+	ss.mu.Unlock()
+	s.notifyStorageComparators(normDim, x, y, z)
+	return true
+}
+
 // DropChestContentsInDim removes the chest or barrel block entity at (dim, x, y, z),
 // closes any open screens viewing it, drops all non-empty items (unpacking `LootTable`
 // first if needed, matching vanilla `Containers.dropContents`), and updates comparators.
@@ -1653,12 +1762,15 @@ func (s *Server) OpenShulkerBox(session *PlayerSession, x, y, z int) (int32, err
 
 	_ = s.CloseContainer(session, 0, false)
 
-	title := "Shulker Box"
+	titleComp := TranslatableComponent("container.shulkerBox")
 	if be, ok := s.StorageBlockEntityAt(dim, x, y, z); ok && be != nil && be.CustomName != "" {
-		title = be.CustomName
+		titleComp = TextComponent(be.CustomName)
 	}
 
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
 	cid := tr.nextWindow
@@ -1670,7 +1782,7 @@ func (s *Server) OpenShulkerBox(session *PlayerSession, x, y, z int) (int32, err
 		BlockY:      y,
 		BlockZ:      z,
 	}
-	carried := tr.carried
+	carriedData := getCarriedSlotDataLocked(session, tr)
 	tr.mu.Unlock()
 
 	// Accessing ChestSlotsInDim unpacks LootTable if present.
@@ -1678,14 +1790,15 @@ func (s *Server) OpenShulkerBox(session *PlayerSession, x, y, z int) (int32, err
 	s.updateContainerViewerState(dim, x, y, z)
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeShulkerBox, title)); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreenComponent(cid, MenuTypeShulkerBox, titleComp)); err != nil {
 			return cid, err
 		}
-		slots := s.buildChestMenuSlotsInDim(session, dim, x, y, z)
+		slotData := s.buildChestMenuSlotDataInDim(session, dim, x, y, z)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slotData, carriedData)); err != nil {
 			return cid, err
 		}
+		setTrackerRemoteSnapshot(tr, cid, slotData, carriedData)
 	}
 	return cid, nil
 }

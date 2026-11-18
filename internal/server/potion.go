@@ -739,10 +739,8 @@ func SetSlotPotionType(session *PlayerSession, slot int, potionID string) {
 	tr.mu.Unlock()
 }
 
-// GetCarriedPotionType returns the canonical potion ID for the potion or
-// tipped_arrow on the player's cursor.
-func GetCarriedPotionType(session *PlayerSession) string {
-	if session == nil || !IsPotionOrTippedArrowItem(session.CarriedItem()) {
+func getCarriedPotionTypeForStack(session *PlayerSession, carried world.ItemStack) string {
+	if session == nil || !IsPotionOrTippedArrowItem(carried) {
 		return ""
 	}
 	tr := getPotionMetaTracker(session)
@@ -753,6 +751,15 @@ func GetCarriedPotionType(session *PlayerSession) string {
 		return PotionWater
 	}
 	return canonicalPotionID(raw)
+}
+
+// GetCarriedPotionType returns the canonical potion ID for the potion or
+// tipped_arrow on the player's cursor.
+func GetCarriedPotionType(session *PlayerSession) string {
+	if session == nil {
+		return ""
+	}
+	return getCarriedPotionTypeForStack(session, session.CarriedItem())
 }
 
 // SetCarriedPotionType sets the canonical potion ID for the potion on the

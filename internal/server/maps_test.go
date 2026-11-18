@@ -850,16 +850,16 @@ func TestChestLootExplorerMapHydrationAndPickup(t *testing.T) {
 		t.Fatalf("expected hydrated buried treasure map data for mapID %d, got %+v", chestMapID, btData)
 	}
 
-	// Shift-click chest slot 0 into player's hotbar slot 36.
+	// Shift-click chest slot 0 into player's hotbar slot 44 (reverse-order moveItemStackTo).
 	if err := srv.HandleContainerClick(session, cid, 0, 0, ContainerInputQuickMove); err != nil {
 		t.Fatalf("HandleContainerClick chest slot 0 QuickMove: %v", err)
 	}
-	if session.InventorySlot(36).ResolvedID() != FilledMapItemID {
-		t.Fatalf("expected filled_map moved to player hotbar slot 36, got %+v", session.InventorySlot(36))
+	if session.InventorySlot(44).ResolvedID() != FilledMapItemID {
+		t.Fatalf("expected filled_map moved to player hotbar slot 44, got %+v", session.InventorySlot(44))
 	}
-	invMapID, ok := GetSlotMapID(session, 36)
+	invMapID, ok := GetSlotMapID(session, 44)
 	if !ok || invMapID != chestMapID {
-		t.Fatalf("expected player slot 36 mapID = %d, got (%d, %v)", chestMapID, invMapID, ok)
+		t.Fatalf("expected player slot 44 mapID = %d, got (%d, %v)", chestMapID, invMapID, ok)
 	}
 }
 

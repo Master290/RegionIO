@@ -469,8 +469,8 @@ func TestPlayContainerPacketsOpenClickAndClose(t *testing.T) {
 	sendClick(1, 0, server.ContainerInputPickup)
 	sendClick(0, 0, server.ContainerInputQuickMove)
 
-	if got := session.InventorySlot(world.HotbarContainerOffset); got.ResolvedID() != "minecraft:oak_planks" || got.Count != 4 {
-		t.Fatalf("hotbar slot 0 after crafting_table craft = %+v, want 4x minecraft:oak_planks", got)
+	if got := session.InventorySlot(world.HotbarContainerOffset + 8); got.ResolvedID() != "minecraft:oak_planks" || got.Count != 4 {
+		t.Fatalf("hotbar slot 8 after crafting_table craft = %+v, want 4x minecraft:oak_planks", got)
 	}
 
 	// 3. Send PlayContainerCloseSB.

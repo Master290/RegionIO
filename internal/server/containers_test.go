@@ -176,8 +176,8 @@ func TestChestOpenClickQuickMoveAndClose(t *testing.T) {
 	if !srv.ChestSlots(cx, cy, cz)[1].IsEmpty() {
 		t.Fatalf("expected chest slot 1 to be empty after quick move")
 	}
-	if got := session.InventorySlot(world.HotbarContainerOffset); got.Count != 8 {
-		t.Fatalf("hotbar slot 0 count after quick move = %d, want 8", got.Count)
+	if got := session.InventorySlot(world.HotbarContainerOffset + 8); got.Count != 8 {
+		t.Fatalf("hotbar slot 8 count after quick move = %d, want 8", got.Count)
 	}
 
 	if err := srv.CloseContainer(session, cid, true); err != nil {
@@ -280,12 +280,12 @@ func TestPlayerInventory2x2Crafting(t *testing.T) {
 		t.Fatalf("2x2 result slot 0 = %+v, want 4x minecraft:oak_planks", got)
 	}
 
-	// Shift-click result slot 0 (QuickMove) to craft 4x oak_planks directly into hotbar slot 0.
+	// Shift-click result slot 0 (QuickMove) to craft 4x oak_planks directly into hotbar slot 8 (reverse-order moveItemStackTo).
 	if err := srv.HandleContainerClick(session, 0, 0, 0, ContainerInputQuickMove); err != nil {
 		t.Fatal(err)
 	}
-	if got := session.InventorySlot(world.HotbarContainerOffset); got.ResolvedID() != "minecraft:oak_planks" || got.Count != 4 {
-		t.Fatalf("hotbar slot 0 after 2x2 quick craft = %+v, want 4x minecraft:oak_planks", got)
+	if got := session.InventorySlot(world.HotbarContainerOffset + 8); got.ResolvedID() != "minecraft:oak_planks" || got.Count != 4 {
+		t.Fatalf("hotbar slot 8 after 2x2 quick craft = %+v, want 4x minecraft:oak_planks", got)
 	}
 }
 

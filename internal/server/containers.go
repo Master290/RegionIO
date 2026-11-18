@@ -1,9 +1,15 @@
 package server
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
+	"math"
+	"math/rand"
+	"sort"
 	"strings"
 	"sync"
+	"unicode/utf16"
 
 	"regionio/internal/nbt"
 	"regionio/internal/protocol"
@@ -50,13 +56,63 @@ const (
 	FurnaceMenuSlotCount     = 39 // 3 furnace + 27 main inventory + 9 hotbar
 )
 
+// HashedPatchMap represents vanilla 26.1.2 `net.minecraft.network.HashedPatchMap`.
+type HashedPatchMap struct {
+	Added   map[int32]int32
+	Removed []int32
+}
+
+// HashedStack represents vanilla 26.1.2 `net.minecraft.network.HashedStack`.
+type HashedStack struct {
+	Present    bool
+	ItemID     int32
+	Count      int32
+	Components HashedPatchMap
+}
+
+// Matches reports whether h equals actual under RemoteSlot$Synchronized semantics.
+func (h HashedStack) Matches(actual HashedStack) bool {
+	if !h.Present || h.Count <= 0 || h.ItemID <= 0 {
+		return !actual.Present || actual.Count <= 0 || actual.ItemID <= 0
+	}
+	if !actual.Present || h.ItemID != actual.ItemID || h.Count != actual.Count {
+		return false
+	}
+	if len(h.Components.Added) != len(actual.Components.Added) {
+		return false
+	}
+	for k, v := range h.Components.Added {
+		if av, ok := actual.Components.Added[k]; !ok || av != v {
+			return false
+		}
+	}
+	if len(h.Components.Removed) != len(actual.Components.Removed) {
+		return false
+	}
+	if len(h.Components.Removed) > 0 {
+		remSet := make(map[int32]struct{}, len(actual.Components.Removed))
+		for _, id := range actual.Components.Removed {
+			remSet[id] = struct{}{}
+		}
+		for _, id := range h.Components.Removed {
+			if _, ok := remSet[id]; !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // ContainerClick holds the decoded fields of a serverbound container_click packet.
 type ContainerClick struct {
-	ContainerID int32
-	StateID     int32
-	Slot        int16
-	Button      int8
-	Mode        int32
+	ContainerID       int32
+	StateID           int32
+	Slot              int16
+	Button            int8
+	Mode              int32
+	ChangedSlots      map[int]HashedStack
+	Carried           HashedStack
+	HasWirePrediction bool
 }
 
 // OpenContainerState represents the currently open screen on a PlayerSession.
@@ -75,6 +131,7 @@ type OpenContainerState struct {
 	IsBarrel        bool
 	VehicleEntityID int32
 	Crafting        [CraftingGridSlotCount]world.ItemStack
+	CraftingSlots   [CraftingGridSlotCount]containerSlotData
 	CraftingStars   [CraftingGridSlotCount]FireworkExplosion
 	CraftingPotions [CraftingGridSlotCount]string
 	Result          world.ItemStack
@@ -108,17 +165,22 @@ const (
 )
 
 type playerContainerTracker struct {
-	mu            sync.Mutex
-	nextWindow    int32
-	carried       world.ItemStack
-	open          *OpenContainerState
-	invCraft      [4]world.ItemStack
-	invCraftStars [4]FireworkExplosion
-	invResult     world.ItemStack
-	enderChest    [ChestSlotCount]world.ItemStack
-	dragStatus    int8
-	dragType      int8
-	dragSlots     []int
+	syncMu            sync.Mutex // serializes outbound container state/slot sync per session; always acquire before mu
+	mu                sync.Mutex
+	nextWindow        int32
+	carried           world.ItemStack
+	open              *OpenContainerState
+	invCraft          [4]world.ItemStack
+	invCraftStars     [4]FireworkExplosion
+	invResult         world.ItemStack
+	enderChest        [ChestSlotCount]world.ItemStack
+	dragStatus        int8
+	dragType          int8
+	dragSlots         []int
+	remoteContainerID int32
+	remoteSlots       []HashedStack
+	remoteCarried     HashedStack
+	hasRemoteCarried  bool
 }
 
 var (
@@ -154,9 +216,8 @@ func (session *PlayerSession) OpenContainer() *OpenContainerState {
 		return nil
 	}
 	tr := getContainerTracker(session)
-	if tr.mu.TryLock() {
-		defer tr.mu.Unlock()
-	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	if tr.open == nil {
 		return nil
 	}
@@ -170,9 +231,8 @@ func (session *PlayerSession) CarriedItem() world.ItemStack {
 		return world.ItemStack{}
 	}
 	tr := getContainerTracker(session)
-	if tr.mu.TryLock() {
-		defer tr.mu.Unlock()
-	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	return tr.carried
 }
 
@@ -196,6 +256,8 @@ func (session *PlayerSession) SetCarriedItem(stack world.ItemStack) {
 		SetCarriedBundleContents(session, nil)
 		SetCarriedLodestoneTracker(session, LodestoneTracker{}, false)
 		SetCarriedShulkerBoxData(session, nil)
+		setCarriedFireworkStar(session, nil)
+		setCarriedFireworks(session, nil)
 	}
 }
 
@@ -241,9 +303,8 @@ func (session *PlayerSession) EnderChestSlots() [ChestSlotCount]world.ItemStack 
 		return [ChestSlotCount]world.ItemStack{}
 	}
 	tr := getContainerTracker(session)
-	if tr.mu.TryLock() {
-		defer tr.mu.Unlock()
-	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	return tr.enderChest
 }
 
@@ -253,9 +314,8 @@ func (session *PlayerSession) EnderChestSlot(slot int) world.ItemStack {
 		return world.ItemStack{}
 	}
 	tr := getContainerTracker(session)
-	if tr.mu.TryLock() {
-		defer tr.mu.Unlock()
-	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	return tr.enderChest[slot]
 }
 
@@ -265,9 +325,8 @@ func (session *PlayerSession) SetEnderChestSlot(slot int, stack world.ItemStack)
 		return false
 	}
 	tr := getContainerTracker(session)
-	if tr.mu.TryLock() {
-		defer tr.mu.Unlock()
-	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
 	if stack.IsEmpty() {
 		tr.enderChest[slot] = world.ItemStack{}
 	} else {
@@ -364,6 +423,37 @@ func EncodeOpenScreen(containerID, menuType int32, title string) []byte {
 	w.VarInt(menuType)
 	w.Raw(nbt.Marshal(nbt.String(title)))
 	return w.Bytes()
+}
+
+// EncodeOpenScreenComponent encodes a clientbound open_screen (0x3b) packet
+// body using a full vanilla ChatComponent title (e.g. TranslatableComponent("container.chest")).
+func EncodeOpenScreenComponent(containerID, menuType int32, title ChatComponent) []byte {
+	nbtBytes := title.MarshalNBT()
+	w := protocol.NewWriter(len(nbtBytes) + 16)
+	w.VarInt(containerID)
+	w.VarInt(menuType)
+	w.Raw(nbtBytes)
+	return w.Bytes()
+}
+
+// DecodeOpenScreen decodes a clientbound open_screen (0x3b) packet body.
+func DecodeOpenScreen(r *protocol.Reader) (containerID, menuType int32, title ChatComponent, err error) {
+	if r == nil {
+		return 0, 0, ChatComponent{}, errors.New("server: nil reader")
+	}
+	containerID, err = r.VarInt()
+	if err != nil {
+		return 0, 0, ChatComponent{}, err
+	}
+	menuType, err = r.VarInt()
+	if err != nil {
+		return 0, 0, ChatComponent{}, err
+	}
+	title, err = ReadChatComponentNBT(r)
+	if err != nil {
+		return 0, 0, ChatComponent{}, err
+	}
+	return containerID, menuType, title, nil
 }
 
 // EncodeContainerClose encodes a clientbound container_close (0x11) packet body.
@@ -471,62 +561,1097 @@ func DecodeContainerClickPacket(r *protocol.Reader) (ContainerClick, error) {
 		Mode:        mode,
 	}
 
-	// Drain trailing changedSlots and carriedItem HashedStacks if present.
 	if r.Remaining() > 0 {
+		click.HasWirePrediction = true
 		changedCount, err := r.VarInt()
 		if err != nil {
 			return click, err
 		}
-		for i := int32(0); i < changedCount && r.Remaining() > 0; i++ {
-			if _, err := r.Uint16(); err != nil {
-				return click, err
-			}
-			if err := skipHashedStack(r); err != nil {
-				return click, err
-			}
+		if changedCount < 0 || changedCount > 128 {
+			return click, errors.New("server: container_click changedSlots count out of range")
 		}
-		if r.Remaining() > 0 {
-			if err := skipHashedStack(r); err != nil {
+		if changedCount > 0 {
+			click.ChangedSlots = make(map[int]HashedStack, changedCount)
+		}
+		for i := int32(0); i < changedCount; i++ {
+			slRaw, err := r.Uint16()
+			if err != nil {
 				return click, err
 			}
+			hs, err := readHashedStack(r)
+			if err != nil {
+				return click, err
+			}
+			click.ChangedSlots[int(int16(slRaw))] = hs
 		}
+		carried, err := readHashedStack(r)
+		if err != nil {
+			return click, err
+		}
+		click.Carried = carried
 	}
 	return click, nil
 }
 
-func skipHashedStack(r *protocol.Reader) error {
+// EncodeContainerClickPacket encodes a protocol 775 serverbound container_click packet body.
+func EncodeContainerClickPacket(click ContainerClick) []byte {
+	w := protocol.NewWriter(64)
+	w.VarInt(click.ContainerID)
+	w.VarInt(click.StateID)
+	w.Uint16(uint16(click.Slot))
+	w.Byte(byte(click.Button))
+	w.VarInt(click.Mode)
+	slots := make([]int, 0, len(click.ChangedSlots))
+	for s := range click.ChangedSlots {
+		slots = append(slots, s)
+	}
+	sort.Ints(slots)
+	w.VarInt(int32(len(slots)))
+	for _, s := range slots {
+		w.Uint16(uint16(int16(s)))
+		writeHashedStack(w, click.ChangedSlots[s])
+	}
+	writeHashedStack(w, click.Carried)
+	return w.Bytes()
+}
+
+func readHashedStack(r *protocol.Reader) (HashedStack, error) {
 	present, err := r.Bool()
 	if err != nil || !present {
-		return err
+		return HashedStack{}, err
 	}
-	if _, err := r.VarInt(); err != nil { // item ID
-		return err
+	itemID, err := r.VarInt()
+	if err != nil {
+		return HashedStack{}, err
 	}
-	if _, err := r.VarInt(); err != nil { // count
-		return err
+	count, err := r.VarInt()
+	if err != nil {
+		return HashedStack{}, err
 	}
 	addedCount, err := r.VarInt()
 	if err != nil {
-		return err
+		return HashedStack{}, err
+	}
+	if addedCount < 0 || addedCount > 256 {
+		return HashedStack{}, errors.New("server: HashedPatchMap added count out of range")
+	}
+	var added map[int32]int32
+	if addedCount > 0 {
+		added = make(map[int32]int32, addedCount)
 	}
 	for i := int32(0); i < addedCount; i++ {
-		if _, err := r.VarInt(); err != nil { // component type ID
-			return err
+		compID, err := r.VarInt()
+		if err != nil {
+			return HashedStack{}, err
 		}
-		if _, err := r.Int32(); err != nil { // component CRC32C hash
-			return err
+		hashVal, err := r.Int32()
+		if err != nil {
+			return HashedStack{}, err
 		}
+		added[compID] = hashVal
 	}
 	removedCount, err := r.VarInt()
 	if err != nil {
-		return err
+		return HashedStack{}, err
+	}
+	if removedCount < 0 || removedCount > 256 {
+		return HashedStack{}, errors.New("server: HashedPatchMap removed count out of range")
+	}
+	var removed []int32
+	if removedCount > 0 {
+		removed = make([]int32, 0, removedCount)
 	}
 	for i := int32(0); i < removedCount; i++ {
-		if _, err := r.VarInt(); err != nil {
-			return err
+		compID, err := r.VarInt()
+		if err != nil {
+			return HashedStack{}, err
+		}
+		removed = append(removed, compID)
+	}
+	return HashedStack{
+		Present: present,
+		ItemID:  itemID,
+		Count:   count,
+		Components: HashedPatchMap{
+			Added:   added,
+			Removed: removed,
+		},
+	}, nil
+}
+
+func writeHashedStack(w *protocol.Writer, hs HashedStack) {
+	if !hs.Present || hs.Count <= 0 || hs.ItemID <= 0 {
+		w.Bool(false)
+		return
+	}
+	w.Bool(true)
+	w.VarInt(hs.ItemID)
+	w.VarInt(hs.Count)
+	keys := make([]int32, 0, len(hs.Components.Added))
+	for k := range hs.Components.Added {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	w.VarInt(int32(len(keys)))
+	for _, k := range keys {
+		w.VarInt(k)
+		w.Int32(hs.Components.Added[k])
+	}
+	w.VarInt(int32(len(hs.Components.Removed)))
+	for _, k := range hs.Components.Removed {
+		w.VarInt(k)
+	}
+}
+
+var containerCRC32CTable = crc32.MakeTable(crc32.Castagnoli)
+
+func hashOpsInt(v int32) uint32 {
+	var buf [5]byte
+	buf[0] = 8
+	binary.LittleEndian.PutUint32(buf[1:], uint32(v))
+	return crc32.Checksum(buf[:], containerCRC32CTable)
+}
+
+func hashOpsString(s string) uint32 {
+	units := utf16.Encode([]rune(s))
+	buf := make([]byte, 5+len(units)*2)
+	buf[0] = 12
+	binary.LittleEndian.PutUint32(buf[1:5], uint32(len(units)))
+	for i, u := range units {
+		binary.LittleEndian.PutUint16(buf[5+i*2:], u)
+	}
+	return crc32.Checksum(buf, containerCRC32CTable)
+}
+
+func hashOpsMap(entries [][2]uint32) uint32 {
+	if len(entries) == 0 {
+		return crc32.Checksum([]byte{2, 3}, containerCRC32CTable)
+	}
+	sorted := append([][2]uint32(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i][0] != sorted[j][0] {
+			return sorted[i][0] < sorted[j][0]
+		}
+		return sorted[i][1] < sorted[j][1]
+	})
+	buf := make([]byte, 2+len(sorted)*8)
+	buf[0] = 2
+	off := 1
+	for _, e := range sorted {
+		binary.LittleEndian.PutUint32(buf[off:], e[0])
+		binary.LittleEndian.PutUint32(buf[off+4:], e[1])
+		off += 8
+	}
+	buf[off] = 3
+	return crc32.Checksum(buf, containerCRC32CTable)
+}
+
+// containerSlotData bundles an ItemStack together with all associated 26.1.2
+// data components so slot moves, swaps, drops, packets, and HashedStack hashes
+// preserve components uniformly.
+type containerSlotData struct {
+	Stack       world.ItemStack
+	Meta        ItemMeta
+	Trim        ArmorTrim
+	Potion      string
+	MapID       int32
+	HasMap      bool
+	Shulker     *ShulkerBoxItemData
+	Bundle      []world.ItemStack
+	Horn        string
+	Writable    *WritableBookContent
+	Written     *WrittenBookContent
+	Fireworks   *FireworksComponent
+	Star        *FireworkExplosion
+	Lodestone   *LodestoneTracker
+	Banner      BannerPatternsComponent
+	ShieldColor string
+	RawComp     *nbt.Compound
+}
+
+func (d containerSlotData) IsEmpty() bool {
+	return d.Stack.IsEmpty() || d.Stack.Count <= 0 || d.Stack.ResolvedItemID() <= 0
+}
+
+func (d containerSlotData) MaxStackSize() int32 {
+	if d.IsEmpty() {
+		return MaxItemStackSize
+	}
+	return MaxStackSizeForBundleWeight(d.Stack.ResolvedID())
+}
+
+func (d containerSlotData) WithCount(count int32) containerSlotData {
+	if count <= 0 || d.IsEmpty() {
+		return containerSlotData{}
+	}
+	cp := d.Clone()
+	cp.Stack = world.NewItemStack(d.Stack.ResolvedItemID(), count)
+	return cp
+}
+
+func (d containerSlotData) Clone() containerSlotData {
+	cp := d
+	cp.Meta = d.Meta.Clone()
+	if d.Shulker != nil {
+		cp.Shulker = d.Shulker.Clone()
+	}
+	if len(d.Bundle) > 0 {
+		cp.Bundle = append([]world.ItemStack(nil), d.Bundle...)
+	}
+	if d.Writable != nil {
+		w := d.Writable.Clone()
+		cp.Writable = &w
+	}
+	if d.Written != nil {
+		w := d.Written.Clone()
+		cp.Written = &w
+	}
+	if d.Fireworks != nil {
+		f := d.Fireworks.Clone()
+		cp.Fireworks = &f
+	}
+	if d.Star != nil {
+		s := d.Star.Clone()
+		cp.Star = &s
+	}
+	if d.Lodestone != nil {
+		l := *d.Lodestone
+		cp.Lodestone = &l
+	}
+	if !d.Banner.IsEmpty() {
+		cp.Banner = d.Banner.Clone()
+	}
+	if d.RawComp != nil {
+		cp.RawComp = world.CloneNBTCompound(d.RawComp)
+	}
+	return cp
+}
+
+func (d containerSlotData) SameItemSameComponents(other containerSlotData) bool {
+	if d.IsEmpty() || other.IsEmpty() {
+		return false
+	}
+	if d.Stack.ResolvedItemID() != other.Stack.ResolvedItemID() {
+		return false
+	}
+	if d.Meta.Damage != other.Meta.Damage ||
+		d.Meta.CustomName != other.Meta.CustomName ||
+		d.Meta.RepairCost != other.Meta.RepairCost ||
+		!intMapEqual(d.Meta.Enchantments, other.Meta.Enchantments) ||
+		!intMapEqual(d.Meta.StoredEnchantments, other.Meta.StoredEnchantments) {
+		return false
+	}
+	if d.Trim != other.Trim || d.Potion != other.Potion || d.HasMap != other.HasMap || (d.HasMap && d.MapID != other.MapID) {
+		return false
+	}
+	if d.Horn != other.Horn || d.ShieldColor != other.ShieldColor {
+		return false
+	}
+	if (d.Shulker != nil) != (other.Shulker != nil) || len(d.Bundle) != len(other.Bundle) {
+		return false
+	}
+	if (d.Writable != nil) != (other.Writable != nil) || (d.Written != nil) != (other.Written != nil) {
+		return false
+	}
+	if (d.Fireworks != nil) != (other.Fireworks != nil) || (d.Star != nil) != (other.Star != nil) || (d.Lodestone != nil) != (other.Lodestone != nil) {
+		return false
+	}
+	if (d.Banner.IsEmpty()) != (other.Banner.IsEmpty()) {
+		return false
+	}
+	return d.ToHashedStack().WithCount1().Matches(other.ToHashedStack().WithCount1())
+}
+
+func (h HashedStack) WithCount1() HashedStack {
+	if !h.Present {
+		return h
+	}
+	h.Count = 1
+	return h
+}
+
+func intMapEqual(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
 		}
 	}
-	return nil
+	return true
+}
+
+func (d containerSlotData) effectiveEnchantments() ([]EnchantmentInstance, int32) {
+	if d.Stack.ResolvedID() == "minecraft:enchanted_book" && len(d.Meta.StoredEnchantments) > 0 {
+		out := make([]EnchantmentInstance, 0, len(d.Meta.StoredEnchantments))
+		for k, v := range d.Meta.StoredEnchantments {
+			if v > 0 {
+				out = append(out, EnchantmentInstance{ID: canonicalEnchantmentID(k), Level: v})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+		return out, DataComponentStoredEnchantmentsID
+	}
+	if d.Meta.HasEnchantments() {
+		compID := DataComponentEnchantmentsID
+		if d.Stack.ResolvedID() == "minecraft:enchanted_book" {
+			compID = DataComponentStoredEnchantmentsID
+		}
+		return d.Meta.SortedEnchantments(), compID
+	}
+	return nil, 0
+}
+
+func (d containerSlotData) ToHashedStack() HashedStack {
+	if d.IsEmpty() {
+		return HashedStack{}
+	}
+	added := make(map[int32]int32)
+	if d.Meta.Damage > 0 {
+		added[DataComponentDamageID] = int32(hashOpsInt(d.Meta.Damage))
+	}
+	if d.Meta.CustomName != "" {
+		added[DataComponentCustomNameID] = int32(hashOpsString(d.Meta.CustomName))
+	}
+	if sorted, enchCompID := d.effectiveEnchantments(); len(sorted) > 0 {
+		entries := make([][2]uint32, 0, len(sorted))
+		for _, inst := range sorted {
+			entries = append(entries, [2]uint32{hashOpsString(canonicalResourceName(inst.ID)), hashOpsInt(int32(inst.Level))})
+		}
+		added[enchCompID] = int32(hashOpsMap(entries))
+	}
+	if d.Meta.RepairCost > 0 {
+		added[DataComponentRepairCostID] = int32(hashOpsInt(d.Meta.RepairCost))
+	}
+	if d.Trim.IsValid() {
+		added[DataComponentTrim] = int32(hashOpsMap([][2]uint32{
+			{hashOpsString("material"), hashOpsString(canonicalResourceName(d.Trim.Material))},
+			{hashOpsString("pattern"), hashOpsString(canonicalResourceName(d.Trim.Pattern))},
+		}))
+	}
+	if d.Potion != "" && IsPotionOrTippedArrowItem(d.Stack) {
+		added[DataComponentPotionContents] = int32(hashOpsMap([][2]uint32{
+			{hashOpsString("potion"), hashOpsString(canonicalPotionID(d.Potion))},
+		}))
+	}
+	if d.HasMap && d.Stack.ResolvedID() == FilledMapItemID {
+		added[DataComponentMapID] = int32(hashOpsInt(d.MapID))
+	}
+	if len(added) == 0 {
+		added = nil
+	}
+	return HashedStack{
+		Present: true,
+		ItemID:  d.Stack.ResolvedItemID(),
+		Count:   d.Stack.Count,
+		Components: HashedPatchMap{
+			Added: added,
+		},
+	}
+}
+
+func (d containerSlotData) WriteProtocolSlot(w *protocol.Writer) {
+	if d.IsEmpty() {
+		w.VarInt(0)
+		return
+	}
+	id := d.Stack.ResolvedID()
+	if IsBundleItem(id) && len(d.Bundle) > 0 {
+		EncodeSlotWithBundleContents(w, d.Stack, d.Bundle)
+		return
+	}
+	if id == FireworkRocketItemID && d.Fireworks != nil {
+		EncodeSlotWithFireworks(w, d.Stack, *d.Fireworks)
+		return
+	}
+	if id == FireworkStarItemID && d.Star != nil {
+		EncodeSlotWithFireworkStar(w, d.Stack, *d.Star)
+		return
+	}
+	if id == CompassItemID && d.Lodestone != nil {
+		EncodeSlotWithLodestoneTracker(w, d.Stack, d.Lodestone)
+		return
+	}
+	if (id == WritableBookItemID && d.Writable != nil) || (id == WrittenBookItemID && d.Written != nil) {
+		EncodeSlotWithBookContent(w, d.Stack, d.Writable, d.Written)
+		return
+	}
+	if (IsBannerItem(id) || id == "minecraft:shield") && (!d.Banner.IsEmpty() || d.ShieldColor != "") {
+		EncodeSlotWithBannerPatterns(w, d.Stack, d.Banner, d.ShieldColor)
+		return
+	}
+
+	type rawComp struct {
+		id   int32
+		data []byte
+	}
+	var comps []rawComp
+	if d.Meta.Damage > 0 {
+		cw := protocol.NewWriter(4)
+		cw.VarInt(d.Meta.Damage)
+		comps = append(comps, rawComp{id: DataComponentDamageID, data: cw.Bytes()})
+	}
+	if d.Meta.CustomName != "" {
+		comps = append(comps, rawComp{id: DataComponentCustomNameID, data: TextComponent(d.Meta.CustomName).MarshalNBT()})
+	}
+	if sorted, enchCompID := d.effectiveEnchantments(); len(sorted) > 0 {
+		cw := protocol.NewWriter(4 + len(sorted)*4)
+		cw.VarInt(int32(len(sorted)))
+		for _, inst := range sorted {
+			def, ok := EnchantmentByID(inst.ID)
+			idx := int32(0)
+			if ok {
+				idx = int32(def.RegistryIndex)
+			}
+			cw.VarInt(idx)
+			cw.VarInt(int32(inst.Level))
+		}
+		comps = append(comps, rawComp{id: enchCompID, data: cw.Bytes()})
+	}
+	if d.Meta.RepairCost > 0 {
+		cw := protocol.NewWriter(4)
+		cw.VarInt(d.Meta.RepairCost)
+		comps = append(comps, rawComp{id: DataComponentRepairCostID, data: cw.Bytes()})
+	}
+	if d.HasMap && id == FilledMapItemID {
+		cw := protocol.NewWriter(4)
+		cw.VarInt(d.MapID)
+		comps = append(comps, rawComp{id: DataComponentMapID, data: cw.Bytes()})
+	}
+	if IsPotionOrTippedArrowItem(d.Stack) && d.Potion != "" {
+		cw := protocol.NewWriter(16)
+		EncodePotionContentsComponent(cw, PotionContentsComponent{PotionID: canonicalPotionID(d.Potion)})
+		comps = append(comps, rawComp{id: DataComponentPotionContents, data: cw.Bytes()})
+	}
+	if d.Trim.IsValid() {
+		if trimBytes, err := EncodeArmorTrimPayload(d.Trim); err == nil {
+			comps = append(comps, rawComp{id: DataComponentTrim, data: trimBytes})
+		}
+	}
+
+	w.VarInt(d.Stack.Count)
+	w.VarInt(d.Stack.ResolvedItemID())
+	w.VarInt(int32(len(comps)))
+	w.VarInt(0)
+	for _, c := range comps {
+		w.VarInt(c.id)
+		w.Raw(c.data)
+	}
+}
+
+func encodeContainerContentFromSlotData(containerID, stateID int32, slots []containerSlotData, carried containerSlotData) []byte {
+	w := protocol.NewWriter(32 + len(slots)*16)
+	w.VarInt(containerID)
+	w.VarInt(stateID)
+	w.VarInt(int32(len(slots)))
+	for _, sl := range slots {
+		sl.WriteProtocolSlot(w)
+	}
+	carried.WriteProtocolSlot(w)
+	return w.Bytes()
+}
+
+func encodeContainerSlotFromSlotData(containerID, stateID int32, slot int, d containerSlotData) []byte {
+	w := protocol.NewWriter(32)
+	w.VarInt(containerID)
+	w.VarInt(stateID)
+	w.Uint16(uint16(int16(slot)))
+	d.WriteProtocolSlot(w)
+	return w.Bytes()
+}
+
+func encodeSetCursorItemFromSlotData(d containerSlotData) []byte {
+	w := protocol.NewWriter(32)
+	d.WriteProtocolSlot(w)
+	return w.Bytes()
+}
+
+func (s *Server) getStorageSlotData(dim string, x, y, z, slot int) containerSlotData {
+	st, meta, trim, pot, sh, comp := s.getStorageSlotMetaAndComponents(dim, x, y, z, slot)
+	if st.IsEmpty() {
+		return containerSlotData{}
+	}
+	d := containerSlotData{
+		Stack:   st,
+		Meta:    meta,
+		Trim:    trim,
+		Potion:  pot,
+		RawComp: comp,
+	}
+	if sh != nil {
+		d.Shulker = &ShulkerBoxItemData{Slots: *sh}
+	}
+	if st.ResolvedID() == FilledMapItemID {
+		if id, ok := s.GetChestSlotMapID(x, y, z, slot); ok {
+			d.MapID = id
+			d.HasMap = true
+		}
+	}
+	return d
+}
+
+func (s *Server) setStorageSlotData(dim string, x, y, z, slot int, d containerSlotData) {
+	if d.IsEmpty() {
+		s.setStorageSlotMetaAndComponents(dim, x, y, z, slot, world.ItemStack{}, ItemMeta{}, ArmorTrim{}, "", nil, nil)
+		s.ClearChestSlotMapID(x, y, z, slot)
+		return
+	}
+	var sh *[ChestSlotCount]world.ItemStack
+	if d.Shulker != nil {
+		arr := d.Shulker.Slots
+		sh = &arr
+	}
+	s.setStorageSlotMetaAndComponents(dim, x, y, z, slot, d.Stack, d.Meta, d.Trim, d.Potion, sh, d.RawComp)
+	if d.Stack.ResolvedID() == FilledMapItemID && d.HasMap {
+		s.SetChestSlotMapID(x, y, z, slot, d.MapID)
+	} else {
+		s.ClearChestSlotMapID(x, y, z, slot)
+	}
+}
+
+func getPlayerSlotData(session *PlayerSession, slot int) containerSlotData {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return containerSlotData{}
+	}
+	st := session.InventorySlot(slot)
+	if st.IsEmpty() {
+		return containerSlotData{}
+	}
+	d := containerSlotData{
+		Stack:  st,
+		Meta:   GetSlotItemMeta(session, slot),
+		Potion: GetSlotPotionType(session, slot),
+		Horn:   GetSlotGoatHornInstrument(session, slot),
+	}
+	if tr, ok := GetSlotArmorTrim(session, slot); ok {
+		d.Trim = tr
+	}
+	if st.ResolvedID() == FilledMapItemID {
+		if mid, ok := GetSlotMapID(session, slot); ok {
+			d.MapID = mid
+			d.HasMap = true
+		}
+	}
+	if sh, ok := GetSlotShulkerBoxData(session, slot); ok && sh != nil {
+		d.Shulker = sh
+	}
+	if IsBundleItem(st.ResolvedID()) {
+		if items := GetSlotBundleContents(session, slot); len(items) > 0 {
+			d.Bundle = items
+		}
+	}
+	if st.ResolvedID() == WritableBookItemID {
+		if wb, ok := GetSlotWritableBook(session, slot); ok {
+			d.Writable = &wb
+		}
+	}
+	if st.ResolvedID() == WrittenBookItemID {
+		if wrb, ok := GetSlotWrittenBook(session, slot); ok {
+			d.Written = &wrb
+		}
+	}
+	if st.ResolvedID() == FireworkRocketItemID {
+		if fw, ok := GetSlotFireworks(session, slot); ok {
+			d.Fireworks = &fw
+		}
+	}
+	if st.ResolvedID() == FireworkStarItemID {
+		if exp, ok := GetSlotFireworkStar(session, slot); ok {
+			d.Star = &exp
+		}
+	}
+	if IsCompassItem(st) {
+		if lt, ok := GetSlotLodestoneTracker(session, slot); ok {
+			d.Lodestone = &lt
+		}
+	}
+	if id := st.ResolvedID(); IsBannerItem(id) || id == "minecraft:shield" {
+		d.Banner = GetSlotBannerPatterns(session, slot)
+		d.ShieldColor = GetSlotShieldBaseColor(session, slot)
+	}
+	return d
+}
+
+func setPlayerSlotData(session *PlayerSession, slot int, d containerSlotData) {
+	if session == nil || slot < 0 || slot >= world.PlayerInventorySlots {
+		return
+	}
+	if d.IsEmpty() {
+		session.SetInventorySlot(slot, world.ItemStack{})
+		SetSlotItemMeta(session, slot, ItemMeta{})
+		SetSlotArmorTrim(session, slot, ArmorTrim{})
+		SetSlotPotionType(session, slot, "")
+		ClearSlotMapID(session, slot)
+		ClearSlotShulkerBoxData(session, slot)
+		ClearSlotBundleContents(session, slot)
+		ClearSlotGoatHornInstrument(session, slot)
+		ClearSlotWritableBook(session, slot)
+		ClearSlotWrittenBook(session, slot)
+		ClearSlotFireworks(session, slot)
+		ClearSlotFireworkStar(session, slot)
+		ClearSlotLodestoneTracker(session, slot)
+		ClearSlotBannerMeta(session, slot)
+		return
+	}
+	id := d.Stack.ResolvedID()
+	session.SetInventorySlot(slot, world.NewItemStack(d.Stack.ResolvedItemID(), d.Stack.Count))
+	SetSlotItemMeta(session, slot, d.Meta)
+	if d.Trim.IsValid() {
+		SetSlotArmorTrim(session, slot, d.Trim)
+	} else {
+		ClearSlotArmorTrim(session, slot)
+	}
+	SetSlotPotionType(session, slot, d.Potion)
+	if d.HasMap && id == FilledMapItemID {
+		SetSlotMapID(session, slot, d.MapID)
+	} else {
+		ClearSlotMapID(session, slot)
+	}
+	if d.Shulker != nil && IsShulkerBoxItemOrBlock(id) {
+		SetSlotShulkerBoxData(session, slot, d.Shulker)
+	} else {
+		ClearSlotShulkerBoxData(session, slot)
+	}
+	if len(d.Bundle) > 0 && IsBundleItem(id) {
+		SetSlotBundleContents(session, slot, d.Bundle)
+	} else {
+		ClearSlotBundleContents(session, slot)
+	}
+	SetSlotGoatHornInstrument(session, slot, d.Horn)
+	if d.Writable != nil && id == WritableBookItemID {
+		SetSlotWritableBook(session, slot, *d.Writable)
+	} else {
+		ClearSlotWritableBook(session, slot)
+	}
+	if d.Written != nil && id == WrittenBookItemID {
+		SetSlotWrittenBook(session, slot, *d.Written)
+	} else {
+		ClearSlotWrittenBook(session, slot)
+	}
+	if d.Fireworks != nil && id == FireworkRocketItemID {
+		SetSlotFireworks(session, slot, *d.Fireworks)
+	} else {
+		ClearSlotFireworks(session, slot)
+	}
+	if d.Star != nil && id == FireworkStarItemID {
+		SetSlotFireworkStar(session, slot, *d.Star)
+	} else {
+		ClearSlotFireworkStar(session, slot)
+	}
+	if d.Lodestone != nil && IsCompassItem(d.Stack) {
+		SetSlotLodestoneTracker(session, slot, *d.Lodestone)
+	} else {
+		ClearSlotLodestoneTracker(session, slot)
+	}
+	if (!d.Banner.IsEmpty() || d.ShieldColor != "") && (IsBannerItem(id) || id == "minecraft:shield") {
+		SetSlotBannerPatterns(session, slot, d.Banner)
+		SetSlotShieldBaseColor(session, slot, d.ShieldColor)
+	} else {
+		ClearSlotBannerMeta(session, slot)
+	}
+}
+
+func getCarriedSlotDataLocked(session *PlayerSession, tr *playerContainerTracker) containerSlotData {
+	if session == nil || tr == nil || tr.carried.IsEmpty() {
+		return containerSlotData{}
+	}
+	d := containerSlotData{
+		Stack:  tr.carried,
+		Meta:   GetCarriedItemMeta(session),
+		Potion: getCarriedPotionTypeForStack(session, tr.carried),
+		Horn:   GetCarriedGoatHornInstrument(session),
+	}
+	if trm, ok := GetCarriedArmorTrim(session); ok {
+		d.Trim = trm
+	}
+	if mid, ok := GetCarriedMapID(session); ok && tr.carried.ResolvedID() == FilledMapItemID {
+		d.MapID = mid
+		d.HasMap = true
+	}
+	if sh, ok := GetCarriedShulkerBoxData(session); ok && sh != nil {
+		d.Shulker = sh
+	}
+	if IsBundleItem(tr.carried.ResolvedID()) {
+		d.Bundle = GetCarriedBundleContents(session)
+	}
+	if tr.carried.ResolvedID() == WritableBookItemID {
+		if wb, ok := GetCarriedWritableBook(session); ok {
+			d.Writable = &wb
+		}
+	}
+	if tr.carried.ResolvedID() == WrittenBookItemID {
+		if wrb, ok := GetCarriedWrittenBook(session); ok {
+			d.Written = &wrb
+		}
+	}
+	if tr.carried.ResolvedID() == FireworkRocketItemID {
+		if fw, ok := getCarriedFireworks(session); ok {
+			d.Fireworks = &fw
+		}
+	}
+	if tr.carried.ResolvedID() == FireworkStarItemID {
+		if exp, ok := getCarriedFireworkStar(session); ok {
+			d.Star = &exp
+		}
+	}
+	if IsCompassItem(tr.carried) {
+		if lt, ok := GetCarriedLodestoneTracker(session); ok {
+			d.Lodestone = &lt
+		}
+	}
+	return d
+}
+
+func setCarriedSlotDataLocked(session *PlayerSession, tr *playerContainerTracker, d containerSlotData) {
+	if session == nil || tr == nil {
+		return
+	}
+	if d.IsEmpty() {
+		tr.carried = world.ItemStack{}
+		SetCarriedItemMeta(session, ItemMeta{})
+		SetCarriedPotionType(session, "")
+		SetCarriedArmorTrim(session, ArmorTrim{})
+		SetCarriedMapID(session, 0, false)
+		SetCarriedWritableBook(session, WritableBookContent{}, false)
+		SetCarriedWrittenBook(session, WrittenBookContent{}, false)
+		SetCarriedGoatHornInstrument(session, "")
+		SetCarriedBundleContents(session, nil)
+		SetCarriedLodestoneTracker(session, LodestoneTracker{}, false)
+		SetCarriedShulkerBoxData(session, nil)
+		setCarriedFireworkStar(session, nil)
+		setCarriedFireworks(session, nil)
+		return
+	}
+	id := d.Stack.ResolvedID()
+	tr.carried = world.NewItemStack(d.Stack.ResolvedItemID(), d.Stack.Count)
+	SetCarriedItemMeta(session, d.Meta)
+	SetCarriedPotionType(session, d.Potion)
+	if d.Trim.IsValid() {
+		SetCarriedArmorTrim(session, d.Trim)
+	} else {
+		SetCarriedArmorTrim(session, ArmorTrim{})
+	}
+	SetCarriedMapID(session, d.MapID, d.HasMap && id == FilledMapItemID)
+	if d.Writable != nil && id == WritableBookItemID {
+		SetCarriedWritableBook(session, *d.Writable, true)
+	} else {
+		SetCarriedWritableBook(session, WritableBookContent{}, false)
+	}
+	if d.Written != nil && id == WrittenBookItemID {
+		SetCarriedWrittenBook(session, *d.Written, true)
+	} else {
+		SetCarriedWrittenBook(session, WrittenBookContent{}, false)
+	}
+	SetCarriedGoatHornInstrument(session, d.Horn)
+	if len(d.Bundle) > 0 && IsBundleItem(id) {
+		SetCarriedBundleContents(session, d.Bundle)
+	} else {
+		SetCarriedBundleContents(session, nil)
+	}
+	if d.Lodestone != nil && IsCompassItem(d.Stack) {
+		SetCarriedLodestoneTracker(session, *d.Lodestone, true)
+	} else {
+		SetCarriedLodestoneTracker(session, LodestoneTracker{}, false)
+	}
+	if d.Shulker != nil && IsShulkerBoxItemOrBlock(id) {
+		SetCarriedShulkerBoxData(session, d.Shulker)
+	} else {
+		SetCarriedShulkerBoxData(session, nil)
+	}
+	if d.Star != nil && id == FireworkStarItemID {
+		setCarriedFireworkStar(session, d.Star)
+	} else {
+		setCarriedFireworkStar(session, nil)
+	}
+	if d.Fireworks != nil && id == FireworkRocketItemID {
+		setCarriedFireworks(session, d.Fireworks)
+	} else {
+		setCarriedFireworks(session, nil)
+	}
+}
+
+func (s *Server) buildChestMenuSlotDataInDim(session *PlayerSession, dim string, x, y, z int) []containerSlotData {
+	slots := make([]containerSlotData, ChestMenuSlotCount)
+	for i := 0; i < ChestSlotCount; i++ {
+		slots[i] = s.getStorageSlotData(dim, x, y, z, i)
+	}
+	for i := 0; i < 27; i++ {
+		slots[27+i] = getPlayerSlotData(session, 9+i)
+	}
+	for i := 0; i < 9; i++ {
+		slots[54+i] = getPlayerSlotData(session, 36+i)
+	}
+	return slots
+}
+
+func (s *Server) buildDoubleChestMenuSlotDataInDim(session *PlayerSession, dim string, x1, y1, z1, x2, y2, z2 int) []containerSlotData {
+	slots := make([]containerSlotData, DoubleChestMenuSlotCount)
+	for i := 0; i < ChestSlotCount; i++ {
+		slots[i] = s.getStorageSlotData(dim, x1, y1, z1, i)
+		slots[ChestSlotCount+i] = s.getStorageSlotData(dim, x2, y2, z2, i)
+	}
+	for i := 0; i < 27; i++ {
+		slots[54+i] = getPlayerSlotData(session, 9+i)
+	}
+	for i := 0; i < 9; i++ {
+		slots[81+i] = getPlayerSlotData(session, 36+i)
+	}
+	return slots
+}
+
+func (s *Server) buildEnderChestMenuSlotData(session *PlayerSession, tr *playerContainerTracker) []containerSlotData {
+	slots := make([]containerSlotData, ChestMenuSlotCount)
+	for i := 0; i < ChestSlotCount; i++ {
+		if !tr.enderChest[i].IsEmpty() {
+			slots[i] = containerSlotData{Stack: tr.enderChest[i]}
+		}
+	}
+	for i := 0; i < 27; i++ {
+		slots[27+i] = getPlayerSlotData(session, 9+i)
+	}
+	for i := 0; i < 9; i++ {
+		slots[54+i] = getPlayerSlotData(session, 36+i)
+	}
+	return slots
+}
+
+func (s *Server) buildCraftingMenuSlotData(session *PlayerSession, open *OpenContainerState) []containerSlotData {
+	slots := make([]containerSlotData, CraftingMenuSlotCount)
+	if !open.Result.IsEmpty() {
+		d := containerSlotData{Stack: open.Result}
+		if IsPotionOrTippedArrowItem(open.Result) {
+			d.Potion = open.CraftingPotions[4]
+		}
+		if exp, ok := GetSlotFireworkStar(session, 0); ok && open.Result.ResolvedID() == FireworkStarItemID {
+			d.Star = &exp
+		}
+		if fw, ok := GetSlotFireworks(session, 0); ok && open.Result.ResolvedID() == FireworkRocketItemID {
+			d.Fireworks = &fw
+		}
+		slots[0] = d
+	}
+	for i := 0; i < CraftingGridSlotCount; i++ {
+		if !open.Crafting[i].IsEmpty() {
+			var d containerSlotData
+			if !open.CraftingSlots[i].IsEmpty() && open.CraftingSlots[i].Stack.ResolvedItemID() == open.Crafting[i].ResolvedItemID() {
+				d = open.CraftingSlots[i].WithCount(open.Crafting[i].Count)
+			} else {
+				d = containerSlotData{Stack: open.Crafting[i], Potion: open.CraftingPotions[i]}
+				if len(open.CraftingStars[i].Colors) > 0 || len(open.CraftingStars[i].FadeColors) > 0 {
+					stCopy := open.CraftingStars[i].Clone()
+					d.Star = &stCopy
+				}
+			}
+			slots[1+i] = d
+		}
+	}
+	for i := 0; i < 27; i++ {
+		slots[10+i] = getPlayerSlotData(session, 9+i)
+	}
+	for i := 0; i < 9; i++ {
+		slots[37+i] = getPlayerSlotData(session, 36+i)
+	}
+	return slots
+}
+
+func (s *Server) buildPlayerMenuSlotData(session *PlayerSession, tr *playerContainerTracker) []containerSlotData {
+	slots := make([]containerSlotData, world.PlayerInventorySlots)
+	for i := 0; i < world.PlayerInventorySlots; i++ {
+		slots[i] = getPlayerSlotData(session, i)
+	}
+	if !tr.invResult.IsEmpty() {
+		d := containerSlotData{Stack: tr.invResult}
+		if exp, ok := GetSlotFireworkStar(session, 0); ok && tr.invResult.ResolvedID() == FireworkStarItemID {
+			d.Star = &exp
+		}
+		if fw, ok := GetSlotFireworks(session, 0); ok && tr.invResult.ResolvedID() == FireworkRocketItemID {
+			d.Fireworks = &fw
+		}
+		slots[0] = d
+	}
+	for i := 0; i < 4; i++ {
+		if !tr.invCraft[i].IsEmpty() && slots[1+i].IsEmpty() {
+			slots[1+i] = containerSlotData{Stack: tr.invCraft[i]}
+			if len(tr.invCraftStars[i].Colors) > 0 || len(tr.invCraftStars[i].FadeColors) > 0 {
+				stCopy := tr.invCraftStars[i].Clone()
+				slots[1+i].Star = &stCopy
+			}
+		}
+	}
+	return slots
+}
+
+func (s *Server) buildActiveMenuSlotDataLocked(session *PlayerSession, tr *playerContainerTracker) (cid int32, slots []containerSlotData, carried containerSlotData, supported bool) {
+	if session == nil || tr == nil {
+		return 0, nil, containerSlotData{}, false
+	}
+	carried = getCarriedSlotDataLocked(session, tr)
+	if tr.open == nil {
+		return 0, s.buildPlayerMenuSlotData(session, tr), carried, true
+	}
+	open := tr.open
+	switch open.MenuType {
+	case MenuTypeGeneric9x3, MenuTypeShulkerBox:
+		if open.VehicleEntityID != 0 {
+			raw := s.buildVehicleChestMenuSlots(session, open.VehicleEntityID)
+			slots = make([]containerSlotData, len(raw))
+			for i, st := range raw {
+				slots[i] = containerSlotData{Stack: st}
+			}
+			return open.ContainerID, slots, carried, true
+		}
+		if open.IsEnderChest {
+			return open.ContainerID, s.buildEnderChestMenuSlotData(session, tr), carried, true
+		}
+		dim := open.Dimension
+		if dim == "" {
+			dim = session.Dimension()
+		}
+		return open.ContainerID, s.buildChestMenuSlotDataInDim(session, dim, open.BlockX, open.BlockY, open.BlockZ), carried, true
+	case MenuTypeGeneric9x6:
+		dim := open.Dimension
+		if dim == "" {
+			dim = session.Dimension()
+		}
+		return open.ContainerID, s.buildDoubleChestMenuSlotDataInDim(session, dim, open.BlockX, open.BlockY, open.BlockZ, open.PartnerX, open.PartnerY, open.PartnerZ), carried, true
+	case MenuTypeCrafting:
+		return open.ContainerID, s.buildCraftingMenuSlotData(session, open), carried, true
+	default:
+		return open.ContainerID, nil, carried, false
+	}
+}
+
+func setTrackerRemoteSnapshot(tr *playerContainerTracker, cid int32, slots []containerSlotData, carried containerSlotData) {
+	if tr == nil {
+		return
+	}
+	tr.remoteContainerID = cid
+	if cap(tr.remoteSlots) < len(slots) {
+		tr.remoteSlots = make([]HashedStack, len(slots))
+	} else {
+		tr.remoteSlots = tr.remoteSlots[:len(slots)]
+	}
+	for i, d := range slots {
+		tr.remoteSlots[i] = d.ToHashedStack()
+	}
+	tr.remoteCarried = carried.ToHashedStack()
+	tr.hasRemoteCarried = true
+}
+
+// InitPlayerInventoryRemoteState initializes remoteSlots/remoteCarried for container 0 after initial login content sync.
+func (s *Server) InitPlayerInventoryRemoteState(session *PlayerSession) {
+	if s == nil || session == nil {
+		return
+	}
+	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+	tr.mu.Lock()
+	if tr.open == nil {
+		slots := s.buildPlayerMenuSlotData(session, tr)
+		carried := getCarriedSlotDataLocked(session, tr)
+		setTrackerRemoteSnapshot(tr, 0, slots, carried)
+	}
+	tr.mu.Unlock()
+}
+
+// WritePlayerInventorySlot encodes player inventory slot including all 26.1.2 item components.
+func (s *Server) WritePlayerInventorySlot(w *protocol.Writer, session *PlayerSession, slot int) {
+	if s == nil || session == nil {
+		w.VarInt(0)
+		return
+	}
+	getPlayerSlotData(session, slot).WriteProtocolSlot(w)
+}
+
+// SpawnPlayerDroppedItem spawns a minecraft:item entity dropped by session matching
+// vanilla LivingEntity.createItemStackToDrop(stack, false, true):
+// pickupDelay = 40 ticks, spawned at eyeY - 0.3 with look-direction velocity vector,
+// and preserving all 26.1.2 item components on server tracking and broadcast packets.
+func (s *Server) SpawnPlayerDroppedItem(session *PlayerSession, d containerSlotData) (int32, *world.Entity) {
+	if s == nil || session == nil || s.entities == nil || d.IsEmpty() {
+		return 0, nil
+	}
+	itemID := d.Stack.ResolvedItemID()
+	if itemID <= 0 {
+		return 0, nil
+	}
+	snap := session.Snapshot()
+	dim := world.NormalizeDimension(snap.Dimension)
+	eyeHeight := 1.62
+	if session.IsSneaking() {
+		eyeHeight = 1.27
+	}
+	spawnX := snap.X
+	spawnY := snap.Y + eyeHeight - 0.3
+	spawnZ := snap.Z
+
+	pitchRad := float64(snap.Pitch) * (math.Pi / 180.0)
+	yawRad := float64(snap.Yaw) * (math.Pi / 180.0)
+	sinPitch, cosPitch := math.Sin(pitchRad), math.Cos(pitchRad)
+	sinYaw, cosYaw := math.Sin(yawRad), math.Cos(yawRad)
+	randAngle := rand.Float64() * 2.0 * math.Pi
+	randMag := 0.02 * rand.Float64()
+	vx := -sinYaw*cosPitch*0.3 + math.Cos(randAngle)*randMag
+	vy := -sinPitch*0.3 + 0.1 + (rand.Float64()-rand.Float64())*0.1
+	vz := cosYaw*cosPitch*0.3 + math.Sin(randAngle)*randMag
+
+	normalized := world.NewItemStack(itemID, d.Stack.Count)
+	typeID := ResolveEntityTypeID(world.ItemEntityTypeName)
+	if typeID < 0 {
+		typeID = 0
+	}
+	ent := world.NewItemEntity(spawnX, spawnY, spawnZ, normalized, typeID)
+	ent.Dimension = dim
+	ent.OnGround = false
+	ent.PickupDelay = 40
+	ent.VelocityX = int16(math.Round(vx * 8000.0))
+	ent.VelocityY = int16(math.Round(vy * 8000.0))
+	ent.VelocityZ = int16(math.Round(vz * 8000.0))
+	if ent.VelocityX == 0 && ent.VelocityY == 0 && ent.VelocityZ == 0 {
+		ent.VelocityY = 800
+	}
+
+	id := s.entities.Add(ent)
+	saved := s.entities.Get(id)
+	if saved == nil || id <= 0 {
+		return id, saved
+	}
+	if !d.Meta.IsEmpty() {
+		ft := s.fishingTracker()
+		ft.mu.Lock()
+		ft.droppedMeta[id] = d.Meta.Clone()
+		ft.mu.Unlock()
+	}
+	canonID := canonicalItemName(normalized.ResolvedID())
+	if d.Horn != "" && canonID == GoatHornItemID {
+		s.AssociateDroppedGoatHornEntity(id, d.Horn)
+	}
+	if d.HasMap && canonID == FilledMapItemID {
+		s.AssociateDroppedMapEntity(id, d.MapID)
+	}
+	if len(d.Bundle) > 0 && IsBundleItem(normalized.ResolvedID()) {
+		s.AssociateDroppedBundleEntity(id, d.Bundle)
+	}
+	if d.Potion != "" && IsPotionOrTippedArrowItem(normalized) {
+		s.AssociateDroppedPotionEntity(id, d.Potion)
+	}
+	if d.Shulker != nil && IsShulkerBoxItemOrBlock(normalized.ResolvedID()) {
+		s.AssociateDroppedShulkerBoxEntity(id, d.Shulker)
+	}
+
+	dw := protocol.NewWriter(32)
+	dw.VarInt(id)
+	dw.Byte(8)   // ItemEntity.DATA_ITEM accessor ID
+	dw.VarInt(7) // EntityDataSerializers.ITEM_STACK
+	d.WithCount(normalized.Count).WriteProtocolSlot(dw)
+	dw.Byte(0xFF)
+
+	pos := saved.ChunkPos()
+	s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlayAddEntity, encodeAddEntityPacket(nil, saved))
+	s.BroadcastDimensionChunk(dim, pos.X, pos.Z, protocol.PlaySetEntityData, dw.Bytes())
+	return id, saved
 }
 
 // InteractBlock checks whether the block at (x, y, z) is an interactive
@@ -875,20 +2000,23 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	_ = s.CloseContainer(session, 0, false)
 
 	menuType := MenuTypeGeneric9x3
-	title := "Chest"
+	titleComp := TranslatableComponent("container.chest")
 	if hasPartner {
 		menuType = MenuTypeGeneric9x6
-		title = "Large Chest"
+		titleComp = TranslatableComponent("container.chestDouble")
 		if be1, ok := s.StorageBlockEntityAt(dim, firstX, firstY, firstZ); ok && be1 != nil && be1.CustomName != "" {
-			title = be1.CustomName
+			titleComp = TextComponent(be1.CustomName)
 		} else if be2, ok := s.StorageBlockEntityAt(dim, secondX, secondY, secondZ); ok && be2 != nil && be2.CustomName != "" {
-			title = be2.CustomName
+			titleComp = TextComponent(be2.CustomName)
 		}
 	} else if be, ok := s.StorageBlockEntityAt(dim, firstX, firstY, firstZ); ok && be != nil && be.CustomName != "" {
-		title = be.CustomName
+		titleComp = TextComponent(be.CustomName)
 	}
 
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
 	cid := tr.nextWindow
@@ -904,7 +2032,7 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 		PartnerZ:    secondZ,
 		HasPartner:  hasPartner,
 	}
-	carried := tr.carried
+	carriedData := getCarriedSlotDataLocked(session, tr)
 	tr.mu.Unlock()
 
 	_ = s.ChestSlotsInDim(dim, firstX, firstY, firstZ)
@@ -918,21 +2046,29 @@ func (s *Server) OpenChest(session *PlayerSession, x, y, z int) (int32, error) {
 	s.updateContainerViewerState(dim, firstX, firstY, firstZ)
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, menuType, title)); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreenComponent(cid, menuType, titleComp)); err != nil {
 			return cid, err
 		}
-		var slots []world.ItemStack
+		var slotData []containerSlotData
 		if hasPartner {
-			slots = s.buildDoubleChestMenuSlotsInDim(session, dim, firstX, firstY, firstZ, secondX, secondY, secondZ)
+			slotData = s.buildDoubleChestMenuSlotDataInDim(session, dim, firstX, firstY, firstZ, secondX, secondY, secondZ)
 		} else {
-			slots = s.buildChestMenuSlotsInDim(session, dim, firstX, firstY, firstZ)
+			slotData = s.buildChestMenuSlotDataInDim(session, dim, firstX, firstY, firstZ)
 		}
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slotData, carriedData)); err != nil {
 			return cid, err
 		}
+		setTrackerRemoteSnapshot(tr, cid, slotData, carriedData)
 		if !hasPartner {
-			s.syncChestMapSlots(session, cid, firstX, firstY, firstZ)
+			for i := 0; i < ChestSlotCount; i++ {
+				if slotData[i].HasMap && slotData[i].Stack.ResolvedID() == FilledMapItemID {
+					if data, exists := s.GetMapData(slotData[i].MapID); exists && data != nil {
+						s.refreshMapDecorations(data)
+						_ = session.send(PlayMapItemDataCB, EncodeMapItemDataPacket(slotData[i].MapID, data.Scale, data.Locked, data.DecorationList(), data.FullMapColorPatch()))
+					}
+				}
+			}
 		}
 	}
 	return cid, nil
@@ -951,12 +2087,15 @@ func (s *Server) OpenBarrel(session *PlayerSession, x, y, z int) (int32, error) 
 	}
 	_ = s.CloseContainer(session, 0, false)
 
-	title := "Barrel"
+	titleComp := TranslatableComponent("container.barrel")
 	if be, ok := s.StorageBlockEntityAt(dim, x, y, z); ok && be != nil && be.CustomName != "" {
-		title = be.CustomName
+		titleComp = TextComponent(be.CustomName)
 	}
 
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
 	cid := tr.nextWindow
@@ -969,21 +2108,22 @@ func (s *Server) OpenBarrel(session *PlayerSession, x, y, z int) (int32, error) 
 		BlockZ:      z,
 		IsBarrel:    true,
 	}
-	carried := tr.carried
+	carriedData := getCarriedSlotDataLocked(session, tr)
 	tr.mu.Unlock()
 
 	_ = s.ChestSlotsInDim(dim, x, y, z)
 	s.updateContainerViewerState(dim, x, y, z)
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, title)); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreenComponent(cid, MenuTypeGeneric9x3, titleComp)); err != nil {
 			return cid, err
 		}
-		slots := s.buildChestMenuSlotsInDim(session, dim, x, y, z)
+		slotData := s.buildChestMenuSlotDataInDim(session, dim, x, y, z)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slotData, carriedData)); err != nil {
 			return cid, err
 		}
+		setTrackerRemoteSnapshot(tr, cid, slotData, carriedData)
 	}
 	return cid, nil
 }
@@ -1001,6 +2141,9 @@ func (s *Server) OpenEnderChest(session *PlayerSession, x, y, z int) (int32, err
 	_ = s.CloseContainer(session, 0, false)
 
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
 	cid := tr.nextWindow
@@ -1013,20 +2156,21 @@ func (s *Server) OpenEnderChest(session *PlayerSession, x, y, z int) (int32, err
 		BlockZ:       z,
 		IsEnderChest: true,
 	}
-	carried := tr.carried
+	carriedData := getCarriedSlotDataLocked(session, tr)
+	slotData := s.buildEnderChestMenuSlotData(session, tr)
 	tr.mu.Unlock()
 
 	s.updateContainerViewerState(dim, x, y, z)
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeGeneric9x3, "Ender Chest")); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreenComponent(cid, MenuTypeGeneric9x3, TranslatableComponent("container.enderchest"))); err != nil {
 			return cid, err
 		}
-		slots := s.buildEnderChestMenuSlots(session)
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slotData, carriedData)); err != nil {
 			return cid, err
 		}
+		setTrackerRemoteSnapshot(tr, cid, slotData, carriedData)
 	}
 	return cid, nil
 }
@@ -1038,30 +2182,37 @@ func (s *Server) OpenCraftingTable(session *PlayerSession, x, y, z int) (int32, 
 		return 0, errors.New("server: nil session")
 	}
 	_ = s.CloseContainer(session, 0, false)
+	dim := world.NormalizeDimension(session.Dimension())
 
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+
 	tr.mu.Lock()
 	tr.nextWindow = (tr.nextWindow % 100) + 1
 	cid := tr.nextWindow
-	tr.open = &OpenContainerState{
+	openState := &OpenContainerState{
 		ContainerID: cid,
 		MenuType:    MenuTypeCrafting,
+		Dimension:   dim,
 		BlockX:      x,
 		BlockY:      y,
 		BlockZ:      z,
 	}
-	carried := tr.carried
+	tr.open = openState
+	carriedData := getCarriedSlotDataLocked(session, tr)
+	slotData := s.buildCraftingMenuSlotData(session, openState)
 	tr.mu.Unlock()
 
 	if session.send != nil {
-		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreen(cid, MenuTypeCrafting, "Crafting")); err != nil {
+		if err := session.send(protocol.PlayOpenScreen, EncodeOpenScreenComponent(cid, MenuTypeCrafting, TranslatableComponent("container.crafting"))); err != nil {
 			return cid, err
 		}
-		slots := s.buildCraftingMenuSlots(session, [CraftingGridSlotCount]world.ItemStack{}, world.ItemStack{})
 		stateID := session.NextContainerStateID()
-		if err := session.send(protocol.PlayContainerSetContent, EncodeContainerContent(cid, stateID, slots, carried)); err != nil {
+		if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slotData, carriedData)); err != nil {
 			return cid, err
 		}
+		setTrackerRemoteSnapshot(tr, cid, slotData, carriedData)
 	}
 	return cid, nil
 }
@@ -1241,44 +2392,35 @@ func (s *Server) buildPlayerMenuSlots(session *PlayerSession, grid [4]world.Item
 // crafting slots), returning any crafting grid and cursor items to the player's
 // inventory (or dropping overflow in the world).
 func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notifyClient bool) error {
+	return s.closeContainerInternal(session, containerID, notifyClient, false)
+}
+
+func (s *Server) closeContainerInternal(session *PlayerSession, containerID int32, notifyClient, dropAllOnDisconnect bool) error {
 	if s == nil || session == nil {
 		return nil
 	}
 	s.CloseLecternIfOpen(session)
-	type returnEntry struct {
-		stack   world.ItemStack
-		meta    ItemMeta
-		potion  string
-		trim    ArmorTrim
-		shulker *ShulkerBoxItemData
-	}
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
 	tr.mu.Lock()
-	var returnItems []returnEntry
+	var returnItems []containerSlotData
 	if !tr.carried.IsEmpty() {
-		carriedTrim, _ := GetCarriedArmorTrim(session)
-		carriedShulker, _ := GetCarriedShulkerBoxData(session)
-		returnItems = append(returnItems, returnEntry{
-			stack:   tr.carried,
-			meta:    GetCarriedItemMeta(session),
-			potion:  GetCarriedPotionType(session),
-			trim:    carriedTrim,
-			shulker: carriedShulker,
-		})
-		tr.carried = world.ItemStack{}
-		SetCarriedItemMeta(session, ItemMeta{})
-		SetCarriedPotionType(session, "")
-		SetCarriedArmorTrim(session, ArmorTrim{})
-		SetCarriedShulkerBoxData(session, nil)
+		returnItems = append(returnItems, getCarriedSlotDataLocked(session, tr))
+		setCarriedSlotDataLocked(session, tr, containerSlotData{})
 	}
 	closedID := containerID
 	hadOpen := false
 	var closedX, closedY, closedZ int
+	var partnerX, partnerY, partnerZ int
+	var hasPartner bool
 	var closedDim string
 	if tr.open != nil && (containerID == 0 || containerID == tr.open.ContainerID) {
 		hadOpen = true
 		closedID = tr.open.ContainerID
 		closedX, closedY, closedZ = tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		partnerX, partnerY, partnerZ = tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
+		hasPartner = tr.open.HasPartner
 		closedDim = tr.open.Dimension
 		var smithingMetas [3]ItemMeta
 		var smithingTrims [3]ArmorTrim
@@ -1294,28 +2436,35 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		}
 		for i := range tr.open.Crafting {
 			if !tr.open.Crafting[i].IsEmpty() {
-				var cMeta ItemMeta
-				var cTrim ArmorTrim
-				if tr.open.MenuType == MenuTypeSmithing && i < 3 {
-					cMeta = smithingMetas[i].Clone()
-					cTrim = smithingTrims[i]
+				var entry containerSlotData
+				if tr.open.MenuType == MenuTypeCrafting && !tr.open.CraftingSlots[i].IsEmpty() &&
+					tr.open.CraftingSlots[i].Stack.ResolvedItemID() == tr.open.Crafting[i].ResolvedItemID() {
+					entry = tr.open.CraftingSlots[i].WithCount(tr.open.Crafting[i].Count)
+				} else {
+					entry = containerSlotData{
+						Stack:  tr.open.Crafting[i],
+						Potion: tr.open.CraftingPotions[i],
+					}
+					if tr.open.MenuType == MenuTypeSmithing && i < 3 {
+						entry.Meta = smithingMetas[i].Clone()
+						entry.Trim = smithingTrims[i]
+					}
+					if len(tr.open.CraftingStars[i].Colors) > 0 || len(tr.open.CraftingStars[i].FadeColors) > 0 {
+						cp := tr.open.CraftingStars[i].Clone()
+						entry.Star = &cp
+					}
 				}
-				returnItems = append(returnItems, returnEntry{
-					stack:  tr.open.Crafting[i],
-					meta:   cMeta,
-					potion: tr.open.CraftingPotions[i],
-					trim:   cTrim,
-				})
+				returnItems = append(returnItems, entry)
 			}
 		}
 		metaTr := getItemMetaTracker(session)
 		metaTr.mu.Lock()
 		for i := range tr.open.EnchantSlots {
 			if !tr.open.EnchantSlots[i].IsEmpty() {
-				returnItems = append(returnItems, returnEntry{
-					stack: tr.open.EnchantSlots[i],
-					meta:  metaTr.enchantMeta[i].Clone(),
-					trim:  metaTr.enchantTrim[i],
+				returnItems = append(returnItems, containerSlotData{
+					Stack: tr.open.EnchantSlots[i],
+					Meta:  metaTr.enchantMeta[i].Clone(),
+					Trim:  metaTr.enchantTrim[i],
 				})
 				metaTr.enchantMeta[i] = ItemMeta{}
 				metaTr.enchantTrim[i] = ArmorTrim{}
@@ -1323,10 +2472,10 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 		}
 		for i := range tr.open.CombinerInputs {
 			if !tr.open.CombinerInputs[i].IsEmpty() {
-				returnItems = append(returnItems, returnEntry{
-					stack: tr.open.CombinerInputs[i],
-					meta:  metaTr.combinerMeta[i].Clone(),
-					trim:  metaTr.combinerTrim[i],
+				returnItems = append(returnItems, containerSlotData{
+					Stack: tr.open.CombinerInputs[i],
+					Meta:  metaTr.combinerMeta[i].Clone(),
+					Trim:  metaTr.combinerTrim[i],
 				})
 				metaTr.combinerMeta[i] = ItemMeta{}
 				metaTr.combinerTrim[i] = ArmorTrim{}
@@ -1339,7 +2488,7 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	}
 	for i := range tr.invCraft {
 		if !tr.invCraft[i].IsEmpty() {
-			returnItems = append(returnItems, returnEntry{stack: tr.invCraft[i]})
+			returnItems = append(returnItems, containerSlotData{Stack: tr.invCraft[i]})
 			tr.invCraft[i] = world.ItemStack{}
 		}
 	}
@@ -1351,54 +2500,117 @@ func (s *Server) CloseContainer(session *PlayerSession, containerID int32, notif
 	for i := 1; i <= 4; i++ {
 		session.SetInventorySlot(i, world.ItemStack{})
 	}
+	tr.remoteContainerID = 0
+	tr.remoteSlots = nil
+	tr.hasRemoteCarried = false
 	tr.mu.Unlock()
+
+	for _, entry := range returnItems {
+		if entry.IsEmpty() {
+			continue
+		}
+		if dropAllOnDisconnect {
+			_, _ = s.SpawnPlayerDroppedItem(session, entry)
+			continue
+		}
+		if entry.Shulker == nil && entry.Potion == "" && !entry.HasMap && len(entry.Bundle) == 0 && entry.Horn == "" && entry.Writable == nil && entry.Written == nil && entry.Fireworks == nil && entry.Star == nil && entry.Lodestone == nil && entry.Banner.IsEmpty() && (!entry.Meta.IsEmpty() || entry.Trim.IsValid()) {
+			rem := returnStackWithMetaAndTrimToInventory(session, entry.Stack, entry.Meta, entry.Trim)
+			if rem > 0 {
+				_, _ = s.SpawnPlayerDroppedItem(session, entry.WithCount(rem))
+			}
+			continue
+		}
+		added, changedSlots := session.AddItemToInventory(entry.Stack)
+		if len(changedSlots) > 0 {
+			dst := changedSlots[0]
+			if !entry.Meta.IsEmpty() {
+				SetSlotItemMeta(session, dst, entry.Meta)
+			}
+			if entry.Potion != "" {
+				SetSlotPotionType(session, dst, entry.Potion)
+			}
+			if entry.Trim.IsValid() {
+				SetSlotArmorTrim(session, dst, entry.Trim)
+			}
+			if entry.Shulker != nil {
+				SetSlotShulkerBoxData(session, dst, entry.Shulker)
+			}
+			if entry.HasMap && entry.Stack.ResolvedID() == FilledMapItemID {
+				SetSlotMapID(session, dst, entry.MapID)
+			}
+			if len(entry.Bundle) > 0 && IsBundleItem(entry.Stack.ResolvedID()) {
+				SetSlotBundleContents(session, dst, entry.Bundle)
+			}
+			if entry.Horn != "" {
+				SetSlotGoatHornInstrument(session, dst, entry.Horn)
+			}
+			if entry.Writable != nil {
+				SetSlotWritableBook(session, dst, *entry.Writable)
+			}
+			if entry.Written != nil {
+				SetSlotWrittenBook(session, dst, *entry.Written)
+			}
+			if entry.Fireworks != nil {
+				SetSlotFireworks(session, dst, *entry.Fireworks)
+			}
+			if entry.Star != nil {
+				SetSlotFireworkStar(session, dst, *entry.Star)
+			}
+			if entry.Lodestone != nil {
+				SetSlotLodestoneTracker(session, dst, *entry.Lodestone)
+			}
+		}
+		if rem := entry.Stack.Count - added; rem > 0 {
+			_, _ = s.SpawnPlayerDroppedItem(session, entry.WithCount(rem))
+		}
+	}
 
 	if hadOpen {
 		if closedDim == "" {
 			closedDim = session.Dimension()
 		}
 		s.updateContainerViewerState(closedDim, closedX, closedY, closedZ)
+		if hasPartner {
+			s.updateContainerViewerState(closedDim, partnerX, partnerY, partnerZ)
+		}
 		s.EmitPlayerBlockVibration(session, GameEventContainerClose, closedDim, closedX, closedY, closedZ, "")
 	}
 
-	snap := session.Snapshot()
-	for _, entry := range returnItems {
-		st := entry.stack
-		if entry.shulker == nil && entry.potion == "" && (!entry.meta.IsEmpty() || entry.trim.IsValid()) {
-			rem := returnStackWithMetaAndTrimToInventory(session, st, entry.meta, entry.trim)
-			if rem > 0 {
-				s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
-			}
-			continue
-		}
-		added, changedSlots := session.AddItemToInventory(st)
-		if !entry.meta.IsEmpty() && len(changedSlots) > 0 {
-			SetSlotItemMeta(session, changedSlots[0], entry.meta)
-		}
-		if entry.potion != "" && len(changedSlots) > 0 {
-			SetSlotPotionType(session, changedSlots[0], entry.potion)
-		}
-		if entry.trim.IsValid() && len(changedSlots) > 0 {
-			SetSlotArmorTrim(session, changedSlots[0], entry.trim)
-		}
-		if entry.shulker != nil && len(changedSlots) > 0 {
-			SetSlotShulkerBoxData(session, changedSlots[0], entry.shulker)
-		}
-		if rem := st.Count - added; rem > 0 {
-			entID, _ := s.SpawnItemEntity(snap.X, snap.Y+0.25, snap.Z, world.NewItemStack(st.ResolvedItemID(), rem))
-			if entID > 0 && entry.shulker != nil && IsShulkerBoxItemOrBlock(st.ResolvedID()) {
-				s.AssociateDroppedShulkerBoxEntity(entID, entry.shulker)
-			}
-		}
-	}
-
-	if session.send != nil && (notifyClient || hadOpen || len(returnItems) > 0) {
+	if session.send != nil && (notifyClient || hadOpen || len(returnItems) > 0) && !dropAllOnDisconnect {
 		if notifyClient && closedID > 0 {
 			_ = session.send(protocol.PlayContainerClose, EncodeContainerClose(closedID))
 		}
-		_ = s.syncPlayerInventoryContainer(session)
+		_ = s.syncPlayerInventoryContainerLocked(session, tr)
 	}
 	return nil
+}
+
+// CloseCraftingTableViewersAt closes the open crafting table screen (and returns
+// grid + cursor items) for all sessions currently viewing the crafting_table at (dim, x, y, z).
+func (s *Server) CloseCraftingTableViewersAt(dim string, x, y, z int) {
+	if s == nil {
+		return
+	}
+	normDim := world.NormalizeDimension(dim)
+	s.playersMu.RLock()
+	sessions := make([]*PlayerSession, 0, len(s.players))
+	for _, sess := range s.players {
+		sessions = append(sessions, sess)
+	}
+	s.playersMu.RUnlock()
+	for _, sess := range sessions {
+		open := sess.OpenContainer()
+		if open == nil || open.MenuType != MenuTypeCrafting {
+			continue
+		}
+		openDim := world.NormalizeDimension(open.Dimension)
+		if open.Dimension == "" {
+			openDim = world.NormalizeDimension(sess.Dimension())
+		}
+		if openDim == normDim && open.BlockX == x && open.BlockY == y && open.BlockZ == z {
+			_ = s.CloseContainer(sess, open.ContainerID, true)
+		}
+	}
 }
 
 // HandleContainerClickWithState processes a slot click while checking whether the
@@ -1426,6 +2638,190 @@ func (s *Server) HandleContainerClickWithState(session *PlayerSession, container
 	return nil
 }
 
+// HandleContainerClickPacket processes a protocol 775 serverbound container_click
+// packet with HashedStack prediction verification and incremental/full remote state sync.
+func (s *Server) HandleContainerClickPacket(session *PlayerSession, click ContainerClick) error {
+	if s == nil || session == nil || session.IsDead() {
+		return nil
+	}
+	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
+	tr.mu.Lock()
+	if click.ContainerID != 0 && (tr.open == nil || tr.open.ContainerID != click.ContainerID) {
+		tr.mu.Unlock()
+		tr.syncMu.Unlock()
+		return nil
+	}
+	if click.ContainerID == 0 && tr.open != nil {
+		tr.mu.Unlock()
+		tr.syncMu.Unlock()
+		return s.HandleContainerClickWithState(session, click.ContainerID, click.StateID, int(click.Slot), click.Button, click.Mode)
+	}
+	_, _, _, supported := s.buildActiveMenuSlotDataLocked(session, tr)
+	if tr.open != nil && tr.open.VehicleEntityID != 0 {
+		supported = false
+	}
+	if !supported {
+		tr.mu.Unlock()
+		tr.syncMu.Unlock()
+		return s.HandleContainerClickWithState(session, click.ContainerID, click.StateID, int(click.Slot), click.Button, click.Mode)
+	}
+	if session.Snapshot().GameMode == GameModeSpectator {
+		tr.mu.Unlock()
+		err := s.syncActiveContainerLocked(session, tr)
+		tr.syncMu.Unlock()
+		return err
+	}
+
+	stateMismatch := click.StateID != session.ContainerStateID()
+	activeCID, preSlots, preCarried, _ := s.buildActiveMenuSlotDataLocked(session, tr)
+	if tr.remoteContainerID != activeCID || len(tr.remoteSlots) != len(preSlots) || !tr.hasRemoteCarried {
+		setTrackerRemoteSnapshot(tr, activeCID, preSlots, preCarried)
+	}
+
+	pendingDrop, mutated, sharedStorage, sharedDim, sharedX, sharedY, sharedZ := s.mutateSupportedClickLocked(session, tr, click.ContainerID, int(click.Slot), click.Button, click.Mode)
+	postCID, postSlots, postCarried, _ := s.buildActiveMenuSlotDataLocked(session, tr)
+
+	if click.HasWirePrediction {
+		for sl, hs := range click.ChangedSlots {
+			if sl >= 0 && sl < len(tr.remoteSlots) {
+				tr.remoteSlots[sl] = hs
+			}
+		}
+		tr.remoteCarried = click.Carried
+		tr.hasRemoteCarried = true
+	}
+	tr.mu.Unlock()
+
+	if !pendingDrop.IsEmpty() {
+		_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+		s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
+	}
+	if mutated {
+		s.TriggerInventoryChanged(session)
+		s.UnlockRecipesForInventory(session)
+	}
+
+	var sendErr error
+	if stateMismatch || !click.HasWirePrediction {
+		setTrackerRemoteSnapshot(tr, postCID, postSlots, postCarried)
+		if session.send != nil {
+			stateID := session.NextContainerStateID()
+			if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(postCID, stateID, postSlots, postCarried)); err != nil {
+				sendErr = err
+			}
+			if err := session.send(protocol.PlaySetCursorItem, encodeSetCursorItemFromSlotData(postCarried)); err != nil && sendErr == nil {
+				sendErr = err
+			}
+		}
+	} else {
+		for i := 0; i < len(postSlots); i++ {
+			actualHS := postSlots[i].ToHashedStack()
+			if i >= len(tr.remoteSlots) || !actualHS.Matches(tr.remoteSlots[i]) {
+				if session.send != nil {
+					stateID := session.NextContainerStateID()
+					if err := session.send(protocol.PlayContainerSetSlot, encodeContainerSlotFromSlotData(postCID, stateID, i, postSlots[i])); err != nil && sendErr == nil {
+						sendErr = err
+					}
+				}
+				if i < len(tr.remoteSlots) {
+					tr.remoteSlots[i] = actualHS
+				}
+			}
+		}
+		actualCarriedHS := postCarried.ToHashedStack()
+		if !tr.hasRemoteCarried || !actualCarriedHS.Matches(tr.remoteCarried) {
+			if session.send != nil {
+				if err := session.send(protocol.PlaySetCursorItem, encodeSetCursorItemFromSlotData(postCarried)); err != nil && sendErr == nil {
+					sendErr = err
+				}
+			}
+			tr.remoteCarried = actualCarriedHS
+			tr.hasRemoteCarried = true
+		}
+	}
+	tr.syncMu.Unlock()
+
+	if sharedStorage {
+		if err := s.syncOtherStorageViewers(session, sharedDim, sharedX, sharedY, sharedZ); err != nil && sendErr == nil {
+			sendErr = err
+		}
+	}
+	return sendErr
+}
+
+func (s *Server) mutateSupportedClickLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	containerID int32,
+	slot int,
+	button int8,
+	mode int32,
+) (pendingDrop containerSlotData, mutated bool, sharedStorage bool, sharedDim string, sharedX, sharedY, sharedZ int) {
+	if mode == ContainerInputQuickCraft {
+		var qcShared bool
+		mutated, sharedDim, sharedX, sharedY, sharedZ, qcShared = s.handleQuickCraftMutateLocked(session, tr, containerID, slot, button)
+		if qcShared && mutated {
+			sharedStorage = true
+		}
+		return containerSlotData{}, mutated, sharedStorage, sharedDim, sharedX, sharedY, sharedZ
+	}
+	if tr.dragStatus != 0 {
+		tr.dragStatus = 0
+		tr.dragType = 0
+		tr.dragSlots = nil
+	}
+
+	if slot == -999 && (mode == ContainerInputPickup || mode == ContainerInputThrow) {
+		carried := getCarriedSlotDataLocked(session, tr)
+		if !carried.IsEmpty() {
+			dropCount := carried.Stack.Count
+			if button == 1 {
+				dropCount = 1
+			}
+			pendingDrop = carried.WithCount(dropCount)
+			setCarriedSlotDataLocked(session, tr, carried.WithCount(carried.Stack.Count-dropCount))
+			mutated = true
+		}
+		return pendingDrop, mutated, false, "", 0, 0, 0
+	}
+
+	if containerID == 0 {
+		pendingDrop, mutated = s.applyPlayerInventoryClickDataLocked(session, tr, slot, button, mode)
+		return pendingDrop, mutated, false, "", 0, 0, 0
+	}
+	if tr.open == nil || tr.open.ContainerID != containerID {
+		return containerSlotData{}, false, false, "", 0, 0, 0
+	}
+	switch tr.open.MenuType {
+	case MenuTypeGeneric9x3, MenuTypeShulkerBox:
+		if tr.open.IsEnderChest {
+			pendingDrop, mutated = s.applyEnderChestClickDataLocked(session, tr, slot, button, mode)
+			return pendingDrop, mutated, false, "", 0, 0, 0
+		}
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		openDim := tr.open.Dimension
+		if openDim == "" {
+			openDim = session.Dimension()
+		}
+		pendingDrop, mutated = s.applyChestClickDataLocked(session, tr, bx, by, bz, slot, button, mode)
+		return pendingDrop, mutated, mutated, openDim, bx, by, bz
+	case MenuTypeGeneric9x6:
+		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+		px, py, pz := tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
+		openDim := tr.open.Dimension
+		if openDim == "" {
+			openDim = session.Dimension()
+		}
+		pendingDrop, mutated = s.applyDoubleChestClickDataLocked(session, tr, bx, by, bz, px, py, pz, slot, button, mode)
+		return pendingDrop, mutated, mutated, openDim, bx, by, bz
+	case MenuTypeCrafting:
+		pendingDrop, mutated = s.applyCraftingTableClickDataLocked(session, tr, slot, button, mode)
+		return pendingDrop, mutated, false, "", 0, 0, 0
+	}
+	return containerSlotData{}, false, false, "", 0, 0, 0
+}
+
 // HandleContainerClick processes a slot click on either the player's inventory
 // container (containerID == 0) or the currently open chest / crafting table
 // container, updating authoritative slot contents and synchronizing the client.
@@ -1450,53 +2846,17 @@ func (s *Server) HandleContainerClick(session *PlayerSession, containerID int32,
 
 	// Clicking outside the window (-999) with Pickup or Throw drops carried item(s).
 	if slot == -999 && (mode == ContainerInputPickup || mode == ContainerInputThrow) {
-		if !tr.carried.IsEmpty() {
-			dropCount := tr.carried.Count
+		carried := getCarriedSlotDataLocked(session, tr)
+		if !carried.IsEmpty() {
+			dropCount := carried.Stack.Count
 			if button == 1 {
 				dropCount = 1
 			}
-			dropStack := world.NewItemStack(tr.carried.ResolvedItemID(), dropCount)
-			carriedMapID, hasCarriedMap := GetCarriedMapID(session)
-			carriedHorn := GetCarriedGoatHornInstrument(session)
-			carriedBundle := GetCarriedBundleContents(session)
-			carriedPotion := GetCarriedPotionType(session)
-			carriedShulker, hasCarriedShulker := GetCarriedShulkerBoxData(session)
-			rem := tr.carried.Count - dropCount
-			if rem <= 0 {
-				tr.carried = world.ItemStack{}
-				SetCarriedItemMeta(session, ItemMeta{})
-				SetCarriedPotionType(session, "")
-				SetCarriedArmorTrim(session, ArmorTrim{})
-				SetCarriedMapID(session, 0, false)
-				SetCarriedWritableBook(session, WritableBookContent{}, false)
-				SetCarriedWrittenBook(session, WrittenBookContent{}, false)
-				SetCarriedGoatHornInstrument(session, "")
-				SetCarriedBundleContents(session, nil)
-				SetCarriedShulkerBoxData(session, nil)
-			} else {
-				tr.carried = world.NewItemStack(tr.carried.ResolvedItemID(), rem)
-			}
+			pendingDrop := carried.WithCount(dropCount)
+			setCarriedSlotDataLocked(session, tr, carried.WithCount(carried.Stack.Count-dropCount))
 			tr.mu.Unlock()
-			snap := session.Snapshot()
-			entID, _ := s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
-			if entID > 0 {
-				if hasCarriedMap && dropStack.ResolvedID() == FilledMapItemID {
-					s.AssociateDroppedMapEntity(entID, carriedMapID)
-				}
-				if carriedHorn != "" && dropStack.ResolvedID() == GoatHornItemID {
-					s.AssociateDroppedGoatHornEntity(entID, carriedHorn)
-				}
-				if len(carriedBundle) > 0 && IsBundleItem(dropStack.ResolvedID()) {
-					s.AssociateDroppedBundleEntity(entID, carriedBundle)
-				}
-				if carriedPotion != "" && IsPotionOrTippedArrowItem(dropStack) {
-					s.AssociateDroppedPotionEntity(entID, carriedPotion)
-				}
-				if hasCarriedShulker && IsShulkerBoxItemOrBlock(dropStack.ResolvedID()) {
-					s.AssociateDroppedShulkerBoxEntity(entID, carriedShulker)
-				}
-			}
-			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+			_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+			s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
 			return s.syncOpenContainer(session)
 		}
 		tr.mu.Unlock()
@@ -1723,9 +3083,9 @@ func (s *Server) totalVillagerOfferUses(entityID int32) int32 {
 	return total
 }
 
-func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContainerTracker, bx, by, bz, slot int, button int8, mode int32) {
+func (s *Server) applyChestClickDataLocked(session *PlayerSession, tr *playerContainerTracker, bx, by, bz, slot int, button int8, mode int32) (pendingDrop containerSlotData, mutated bool) {
 	if slot < 0 || slot >= ChestMenuSlotCount {
-		return
+		return containerSlotData{}, false
 	}
 	openDim := world.DimensionOverworld
 	isShulker := false
@@ -1740,169 +3100,90 @@ func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContain
 	if !isShulker {
 		s.HydrateChestExplorerMaps(bx, by, bz, "buried_treasure")
 	}
-	slots := s.buildChestMenuSlotsInDim(session, openDim, bx, by, bz)
-
-	var slotMapIDs [ChestMenuSlotCount]int32
-	var hasSlotMaps [ChestMenuSlotCount]bool
-	for i := 0; i < ChestSlotCount; i++ {
-		if id, ok := s.GetChestSlotMapID(bx, by, bz, i); ok && slots[i].ResolvedID() == FilledMapItemID {
-			slotMapIDs[i], hasSlotMaps[i] = id, true
-		}
-	}
-	for i := 0; i < 27; i++ {
-		if id, ok := GetSlotMapID(session, 9+i); ok && slots[27+i].ResolvedID() == FilledMapItemID {
-			slotMapIDs[27+i], hasSlotMaps[27+i] = id, true
-		}
-	}
-	for i := 0; i < 9; i++ {
-		if id, ok := GetSlotMapID(session, 36+i); ok && slots[54+i].ResolvedID() == FilledMapItemID {
-			slotMapIDs[54+i], hasSlotMaps[54+i] = id, true
-		}
-	}
-	carriedMapID, hasCarriedMap := GetCarriedMapID(session)
+	slots := s.buildChestMenuSlotDataInDim(session, openDim, bx, by, bz)
+	orig := append([]containerSlotData(nil), slots...)
+	carried := getCarriedSlotDataLocked(session, tr)
 
 	switch mode {
 	case ContainerInputPickup:
 		// ShulkerBoxSlot.mayPlace: prevent placing a shulker box inside a shulker box.
-		if isShulker && slot < ChestSlotCount && !tr.carried.IsEmpty() && IsShulkerBoxItemOrBlock(tr.carried.ResolvedID()) {
+		if isShulker && slot < ChestSlotCount && !carried.IsEmpty() && IsShulkerBoxItemOrBlock(carried.Stack.ResolvedID()) {
 			break
 		}
-		prevSlotEmpty := slots[slot].IsEmpty()
-		prevCarriedEmpty := tr.carried.IsEmpty()
-		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
-		if prevSlotEmpty && !slots[slot].IsEmpty() {
-			slotMapIDs[slot], hasSlotMaps[slot] = carriedMapID, hasCarriedMap
-			if tr.carried.IsEmpty() {
-				carriedMapID, hasCarriedMap = 0, false
-			}
-		} else if prevCarriedEmpty && !tr.carried.IsEmpty() {
-			carriedMapID, hasCarriedMap = slotMapIDs[slot], hasSlotMaps[slot]
-			if slots[slot].IsEmpty() {
-				slotMapIDs[slot], hasSlotMaps[slot] = 0, false
-			}
-		} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() {
-			slotMapIDs[slot], carriedMapID = carriedMapID, slotMapIDs[slot]
-			hasSlotMaps[slot], hasCarriedMap = hasCarriedMap, hasSlotMaps[slot]
-		}
+		slots[slot], carried = applyPickupSlotData(slots[slot], carried, button, MaxItemStackSize)
+		mutated = true
 	case ContainerInputQuickMove:
-		if slots[slot].ResolvedID() == FilledMapItemID && hasSlotMaps[slot] {
-			movedID := slotMapIDs[slot]
-			var ranges [][2]int
-			if slot < ChestSlotCount {
-				ranges = [][2]int{{54, 63}, {27, 54}}
-			} else {
-				ranges = [][2]int{{0, ChestSlotCount}}
-			}
-			for _, r := range ranges {
-				for dst := r[0]; dst < r[1]; dst++ {
-					if slots[dst].IsEmpty() {
-						slots[dst] = slots[slot]
-						slotMapIDs[dst], hasSlotMaps[dst] = movedID, true
-						slots[slot] = world.ItemStack{}
-						slotMapIDs[slot], hasSlotMaps[slot] = 0, false
-						break
-					}
-				}
-				if slots[slot].IsEmpty() {
-					break
-				}
-			}
-		} else if slot < ChestSlotCount {
-			// Chest -> Player inventory (prefer hotbar 54..62, then main 27..53)
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 63)
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 27, 54)
-		} else if !isShulker || !IsShulkerBoxItemOrBlock(slots[slot].ResolvedID()) {
-			// Player inventory -> Chest (0..26)
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, ChestSlotCount)
+		if slot < ChestSlotCount {
+			slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], ChestSlotCount, ChestMenuSlotCount, true, nil)
+		} else if !isShulker || !IsShulkerBoxItemOrBlock(slots[slot].Stack.ResolvedID()) {
+			slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], 0, ChestSlotCount, false, nil)
 		}
 	case ContainerInputSwap:
 		if button >= 0 && button < 9 {
 			hotbarIdx := 54 + int(button)
-			if isShulker && slot < ChestSlotCount && !slots[hotbarIdx].IsEmpty() && IsShulkerBoxItemOrBlock(slots[hotbarIdx].ResolvedID()) {
+			if isShulker && slot < ChestSlotCount && !slots[hotbarIdx].IsEmpty() && IsShulkerBoxItemOrBlock(slots[hotbarIdx].Stack.ResolvedID()) {
 				break
 			}
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
-			slotMapIDs[slot], slotMapIDs[hotbarIdx] = slotMapIDs[hotbarIdx], slotMapIDs[slot]
-			hasSlotMaps[slot], hasSlotMaps[hotbarIdx] = hasSlotMaps[hotbarIdx], hasSlotMaps[slot]
+			mutated = true
 		} else if button == 40 {
-			offStack := session.InventorySlot(OffHandContainerSlot)
-			if isShulker && slot < ChestSlotCount && !offStack.IsEmpty() && IsShulkerBoxItemOrBlock(offStack.ResolvedID()) {
+			offData := getPlayerSlotData(session, OffHandContainerSlot)
+			if isShulker && slot < ChestSlotCount && !offData.IsEmpty() && IsShulkerBoxItemOrBlock(offData.Stack.ResolvedID()) {
 				break
 			}
-			offMapID, hasOffMap := GetSlotMapID(session, OffHandContainerSlot)
-			slots[slot], offStack = offStack, slots[slot]
-			slotMapIDs[slot], offMapID = offMapID, slotMapIDs[slot]
-			hasSlotMaps[slot], hasOffMap = hasOffMap, hasSlotMaps[slot]
-			session.SetInventorySlot(OffHandContainerSlot, offStack)
-			if !offStack.IsEmpty() && offStack.ResolvedID() == FilledMapItemID && hasOffMap {
-				SetSlotMapID(session, OffHandContainerSlot, offMapID)
-			} else {
-				ClearSlotMapID(session, OffHandContainerSlot)
-			}
+			slots[slot], offData = offData, slots[slot]
+			setPlayerSlotData(session, OffHandContainerSlot, offData)
+			mutated = true
 		}
 	case ContainerInputClone:
-		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-			maxStack := int32(MaxItemStackSize)
-			if IsShulkerBoxItemOrBlock(slots[slot].ResolvedID()) {
-				maxStack = 1
-			}
-			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), maxStack)
-			if slots[slot].ResolvedID() == FilledMapItemID && hasSlotMaps[slot] {
-				carriedMapID, hasCarriedMap = slotMapIDs[slot], true
-			}
+		if session.Snapshot().GameMode == GameModeCreative && carried.IsEmpty() && !slots[slot].IsEmpty() {
+			carried = slots[slot].WithCount(slots[slot].MaxStackSize())
+			mutated = true
 		}
 	case ContainerInputThrow:
-		if !slots[slot].IsEmpty() {
+		if carried.IsEmpty() && !slots[slot].IsEmpty() {
 			dropCount := int32(1)
 			if button == 1 {
-				dropCount = slots[slot].Count
+				dropCount = slots[slot].Stack.Count
 			}
-			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
-			droppedMapID, hadMap := slotMapIDs[slot], hasSlotMaps[slot]
-			rem := slots[slot].Count - dropCount
-			if rem <= 0 {
-				slots[slot] = world.ItemStack{}
-				slotMapIDs[slot], hasSlotMaps[slot] = 0, false
-			} else {
-				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
-			}
-			snap := session.Snapshot()
-			entID, _ := s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
-			if dropStack.ResolvedID() == FilledMapItemID && hadMap && entID != 0 {
-				s.AssociateDroppedMapEntity(entID, droppedMapID)
-			}
-			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+			pendingDrop = slots[slot].WithCount(dropCount)
+			slots[slot] = slots[slot].WithCount(slots[slot].Stack.Count - dropCount)
+			mutated = true
 		}
 	case ContainerInputPickupAll:
-		applyPickupAllSlice(slots, &tr.carried, 0)
+		if !carried.IsEmpty() {
+			applyPickupAllSlotData(slots, &carried, 0, nil)
+			mutated = true
+		}
 	}
 
-	// Write back chest slots (0..26) and player inventory slots (27..62) along with mapID metadata.
 	for i := 0; i < ChestSlotCount; i++ {
-		s.SetChestSlotInDim(openDim, bx, by, bz, i, slots[i])
-		if !slots[i].IsEmpty() && slots[i].ResolvedID() == FilledMapItemID && hasSlotMaps[i] {
-			s.SetChestSlotMapID(bx, by, bz, i, slotMapIDs[i])
-		} else {
-			s.ClearChestSlotMapID(bx, by, bz, i)
+		if !slots[i].SameItemSameComponents(orig[i]) || slots[i].Stack.Count != orig[i].Stack.Count {
+			s.setStorageSlotData(openDim, bx, by, bz, i, slots[i])
 		}
 	}
 	for i := 0; i < 27; i++ {
-		session.SetInventorySlot(9+i, slots[27+i])
-		if !slots[27+i].IsEmpty() && slots[27+i].ResolvedID() == FilledMapItemID && hasSlotMaps[27+i] {
-			SetSlotMapID(session, 9+i, slotMapIDs[27+i])
-		} else {
-			ClearSlotMapID(session, 9+i)
+		idx := 27 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 9+i, slots[idx])
 		}
 	}
 	for i := 0; i < 9; i++ {
-		session.SetInventorySlot(36+i, slots[54+i])
-		if !slots[54+i].IsEmpty() && slots[54+i].ResolvedID() == FilledMapItemID && hasSlotMaps[54+i] {
-			SetSlotMapID(session, 36+i, slotMapIDs[54+i])
-		} else {
-			ClearSlotMapID(session, 36+i)
+		idx := 54 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 36+i, slots[idx])
 		}
 	}
-	SetCarriedMapID(session, carriedMapID, !tr.carried.IsEmpty() && tr.carried.ResolvedID() == FilledMapItemID && hasCarriedMap)
+	setCarriedSlotDataLocked(session, tr, carried)
+	return pendingDrop, mutated
+}
+
+func (s *Server) applyChestClickLocked(session *PlayerSession, tr *playerContainerTracker, bx, by, bz, slot int, button int8, mode int32) {
+	pendingDrop, _ := s.applyChestClickDataLocked(session, tr, bx, by, bz, slot, button, mode)
+	if !pendingDrop.IsEmpty() {
+		_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+		s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
+	}
 }
 
 // WearableArmorSlotForItem returns the player inventory armor slot index
@@ -2071,61 +3352,44 @@ func matchCraftingWithFireworks(
 	return world.ItemStack{}, nil, nil, false
 }
 
-func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) {
+func (s *Server) applyCraftingTableClickDataLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) (pendingDrop containerSlotData, mutated bool) {
 	if slot < 0 || slot >= CraftingMenuSlotCount || tr.open == nil {
-		return
+		return containerSlotData{}, false
 	}
-	slots := s.buildCraftingMenuSlots(session, tr.open.Crafting, tr.open.Result)
+	slots := s.buildCraftingMenuSlotData(session, tr.open)
+	orig := append([]containerSlotData(nil), slots...)
+	carried := getCarriedSlotDataLocked(session, tr)
+
+	gridStacks := make([]world.ItemStack, CraftingGridSlotCount)
 	gridStars := make([]FireworkExplosion, CraftingGridSlotCount)
-	var slotPotions [CraftingMenuSlotCount]string
 	for i := 0; i < CraftingGridSlotCount; i++ {
-		if len(tr.open.CraftingStars[i].Colors) > 0 || len(tr.open.CraftingStars[i].FadeColors) > 0 {
+		gridStacks[i] = slots[1+i].Stack
+		if slots[1+i].Star != nil {
+			gridStars[i] = slots[1+i].Star.Clone()
+		} else if len(tr.open.CraftingStars[i].Colors) > 0 || len(tr.open.CraftingStars[i].FadeColors) > 0 {
 			gridStars[i] = tr.open.CraftingStars[i].Clone()
-		} else if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
-			gridStars[i] = exp
-		}
-		if tr.open.CraftingPotions[i] != "" {
-			slotPotions[1+i] = tr.open.CraftingPotions[i]
-		} else if IsPotionOrTippedArrowItem(slots[1+i]) {
-			slotPotions[1+i] = GetSlotPotionType(session, 1+i)
 		}
 	}
-	for i := 0; i < 27; i++ {
-		slotPotions[10+i] = GetSlotPotionType(session, 9+i)
-	}
-	for i := 0; i < 9; i++ {
-		slotPotions[37+i] = GetSlotPotionType(session, 36+i)
-	}
-	carriedPotion := GetCarriedPotionType(session)
 
 	if slot == 0 {
 		// Crafting output slot.
-		_, matchedRec, _ := MatchCraftingGrid(slots[1:10], 3, 3)
-		_, tippedPotion, isTippedArrow := MatchTippedArrowRecipe(slots[1:10], slotPotions[1+4])
-		if isTippedArrow && mode == ContainerInputPickup && !tr.carried.IsEmpty() {
-			if tr.carried.ResolvedID() == "minecraft:tipped_arrow" && carriedPotion != "" && carriedPotion != tippedPotion {
-				return
+		_, matchedRec, _ := MatchCraftingGrid(gridStacks, 3, 3)
+		_, tippedPotion, isTippedArrow := MatchTippedArrowRecipe(gridStacks, slots[5].Potion)
+		if isTippedArrow && mode == ContainerInputPickup && !carried.IsEmpty() {
+			if carried.Stack.ResolvedID() == "minecraft:tipped_arrow" && carried.Potion != "" && carried.Potion != tippedPotion {
+				return containerSlotData{}, false
 			}
 		}
-		var prevInvCounts [CraftingMenuSlotCount]int32
-		for idx := 10; idx < 46; idx++ {
-			prevInvCounts[idx] = slots[idx].Count
-		}
-		if crafted := s.clickCraftingOutput(session, slots, 1, 9, 3, 3, 10, 46, gridStars, func(menuSlot int) int {
+		crafted := s.clickCraftingOutputData(session, slots, 1, 9, 3, 3, 10, 46, gridStars, func(menuSlot int) int {
 			return menuSlot - 1
-		}, &tr.carried, mode); !crafted.IsEmpty() {
+		}, &carried, mode, func(res containerSlotData) containerSlotData {
 			if isTippedArrow {
-				switch mode {
-				case ContainerInputPickup:
-					carriedPotion = tippedPotion
-				case ContainerInputQuickMove:
-					for idx := 10; idx < 46; idx++ {
-						if slots[idx].Count > prevInvCounts[idx] {
-							slotPotions[idx] = tippedPotion
-						}
-					}
-				}
+				res.Potion = tippedPotion
 			}
+			return res
+		})
+		if !crafted.IsEmpty() {
+			mutated = true
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 			recName := ""
@@ -2139,189 +3403,79 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 	} else {
 		switch mode {
 		case ContainerInputPickup:
-			prevSlotEmpty := slots[slot].IsEmpty()
-			prevCarriedEmpty := tr.carried.IsEmpty()
-			prevSlotID := slots[slot].ResolvedItemID()
-			prevCarriedID := tr.carried.ResolvedItemID()
-			var slotStar *FireworkExplosion
-			var slotFW *FireworksComponent
-			if slot >= 1 && slot <= 9 {
-				if len(gridStars[slot-1].Colors) > 0 || len(gridStars[slot-1].FadeColors) > 0 {
-					cp := gridStars[slot-1].Clone()
-					slotStar = &cp
-				}
-			} else if slot >= 10 && slot < 46 {
-				sessSlot := slot - 1
-				if exp, ok := GetSlotFireworkStar(session, sessSlot); ok {
-					slotStar = &exp
-				}
-				if fw, ok := GetSlotFireworks(session, sessSlot); ok && slots[slot].ResolvedID() == FireworkRocketItemID {
-					slotFW = &fw
-				}
-			}
-			var cStar *FireworkExplosion
-			if exp, ok := getCarriedFireworkStar(session); ok {
-				cStar = &exp
-			}
-			var cFW *FireworksComponent
-			if fw, ok := getCarriedFireworks(session); ok {
-				cFW = &fw
-			}
-
-			slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
-
-			if prevSlotEmpty && !slots[slot].IsEmpty() {
-				slotPotions[slot] = carriedPotion
-				if tr.carried.IsEmpty() {
-					carriedPotion = ""
-				}
-			} else if prevCarriedEmpty && !tr.carried.IsEmpty() {
-				carriedPotion = slotPotions[slot]
-				if slots[slot].IsEmpty() {
-					slotPotions[slot] = ""
-				}
-			} else if !slots[slot].IsEmpty() && !tr.carried.IsEmpty() && prevSlotID != prevCarriedID {
-				slotPotions[slot], carriedPotion = carriedPotion, slotPotions[slot]
-			} else if tr.carried.IsEmpty() {
-				carriedPotion = ""
-			}
-
-			var newSlotStar *FireworkExplosion
-			var newSlotFW *FireworksComponent
-			var newCStar *FireworkExplosion
-			var newCFW *FireworksComponent
-			switch {
-			case prevSlotEmpty && !slots[slot].IsEmpty():
-				newSlotStar, newSlotFW = cStar, cFW
-				if !tr.carried.IsEmpty() {
-					newCStar, newCFW = cStar, cFW
-				}
-			case prevCarriedEmpty && !tr.carried.IsEmpty():
-				newCStar, newCFW = slotStar, slotFW
-				if !slots[slot].IsEmpty() {
-					newSlotStar, newSlotFW = slotStar, slotFW
-				}
-			case !slots[slot].IsEmpty() && !tr.carried.IsEmpty():
-				if slots[slot].ResolvedItemID() == tr.carried.ResolvedItemID() {
-					newSlotStar, newSlotFW = slotStar, slotFW
-					newCStar, newCFW = cStar, cFW
-				} else {
-					newSlotStar, newSlotFW = cStar, cFW
-					newCStar, newCFW = slotStar, slotFW
-				}
-			}
-			if slot >= 1 && slot <= 9 {
-				if newSlotStar != nil {
-					tr.open.CraftingStars[slot-1] = newSlotStar.Clone()
-				} else {
-					tr.open.CraftingStars[slot-1] = FireworkExplosion{}
-				}
-			} else if slot >= 10 && slot < 46 {
-				sessSlot := slot - 1
-				if newSlotStar != nil && slots[slot].ResolvedID() == FireworkStarItemID {
-					SetSlotFireworkStar(session, sessSlot, *newSlotStar)
-				} else if slots[slot].IsEmpty() || slots[slot].ResolvedID() != FireworkStarItemID {
-					ClearSlotFireworkStar(session, sessSlot)
-				}
-				if newSlotFW != nil && slots[slot].ResolvedID() == FireworkRocketItemID {
-					SetSlotFireworks(session, sessSlot, *newSlotFW)
-				} else if slots[slot].IsEmpty() || slots[slot].ResolvedID() != FireworkRocketItemID {
-					ClearSlotFireworks(session, sessSlot)
-				}
-			}
-			setCarriedFireworkStar(session, newCStar)
-			setCarriedFireworks(session, newCFW)
-
+			slots[slot], carried = applyPickupSlotData(slots[slot], carried, button, MaxItemStackSize)
+			mutated = true
 		case ContainerInputQuickMove:
-			movedPotion := slotPotions[slot]
-			wasPotionItem := IsPotionOrTippedArrowItem(slots[slot])
-			var prevCounts [CraftingMenuSlotCount]int32
-			for idx := 0; idx < CraftingMenuSlotCount; idx++ {
-				prevCounts[idx] = slots[idx].Count
-			}
 			if slot >= 1 && slot <= 9 {
-				// Crafting grid -> player inventory
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 37, 46)
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 10, 37)
-			} else if slot >= 10 && slot < 37 {
-				// Main inventory -> hotbar
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 37, 46)
-			} else if slot >= 37 && slot < 46 {
-				// Hotbar -> main inventory
-				slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 10, 37)
-			}
-			if wasPotionItem {
-				for idx := 1; idx < CraftingMenuSlotCount; idx++ {
-					if idx != slot && slots[idx].Count > prevCounts[idx] {
-						slotPotions[idx] = movedPotion
+				slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], 10, 46, false, nil)
+			} else if slot >= 10 && slot < 46 {
+				var moved bool
+				slots[slot], moved = moveSlotDataSlice(slots, slots[slot], 1, 10, false, nil)
+				if !moved {
+					if slot < 37 {
+						slots[slot], moved = moveSlotDataSlice(slots, slots[slot], 37, 46, false, nil)
+					} else {
+						slots[slot], moved = moveSlotDataSlice(slots, slots[slot], 10, 37, false, nil)
 					}
 				}
-				if slots[slot].IsEmpty() {
-					slotPotions[slot] = ""
-				}
+				mutated = moved
 			}
 		case ContainerInputSwap:
 			if button >= 0 && button < 9 {
 				hotbarIdx := 37 + int(button)
 				slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
-				slotPotions[slot], slotPotions[hotbarIdx] = slotPotions[hotbarIdx], slotPotions[slot]
+				mutated = true
 			} else if button == 40 {
-				offStack := session.InventorySlot(OffHandContainerSlot)
-				offPotion := GetSlotPotionType(session, OffHandContainerSlot)
-				slots[slot], offStack = offStack, slots[slot]
-				slotPotions[slot], offPotion = offPotion, slotPotions[slot]
-				session.SetInventorySlot(OffHandContainerSlot, offStack)
-				SetSlotPotionType(session, OffHandContainerSlot, offPotion)
+				offData := getPlayerSlotData(session, OffHandContainerSlot)
+				slots[slot], offData = offData, slots[slot]
+				setPlayerSlotData(session, OffHandContainerSlot, offData)
+				mutated = true
 			}
 		case ContainerInputClone:
-			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-				tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
-				carriedPotion = slotPotions[slot]
+			if session.Snapshot().GameMode == GameModeCreative && carried.IsEmpty() && !slots[slot].IsEmpty() {
+				carried = slots[slot].WithCount(slots[slot].MaxStackSize())
+				mutated = true
 			}
 		case ContainerInputThrow:
-			if !slots[slot].IsEmpty() {
+			if carried.IsEmpty() && !slots[slot].IsEmpty() {
 				dropCount := int32(1)
 				if button == 1 {
-					dropCount = slots[slot].Count
+					dropCount = slots[slot].Stack.Count
 				}
-				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
-				droppedPotion := slotPotions[slot]
-				rem := slots[slot].Count - dropCount
-				if rem <= 0 {
-					slots[slot] = world.ItemStack{}
-					slotPotions[slot] = ""
-				} else {
-					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
-				}
-				snap := session.Snapshot()
-				entID, _ := s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
-				if entID > 0 && IsPotionOrTippedArrowItem(dropStack) && droppedPotion != "" {
-					s.AssociateDroppedPotionEntity(entID, droppedPotion)
-				}
-				s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+				pendingDrop = slots[slot].WithCount(dropCount)
+				slots[slot] = slots[slot].WithCount(slots[slot].Stack.Count - dropCount)
+				mutated = true
 			}
 		case ContainerInputPickupAll:
-			applyPickupAllSlice(slots, &tr.carried, 1)
+			if !carried.IsEmpty() {
+				applyPickupAllSlotData(slots, &carried, 1, nil)
+				mutated = true
+			}
 		}
 	}
 
-	// Write back crafting grid (1..9), recompute result (0), and write back player inventory (10..45).
+	// Write back crafting grid (1..9), recompute result (0), and write back changed player inventory slots (10..45).
+	newGrid := make([]world.ItemStack, CraftingGridSlotCount)
+	newStars := make([]FireworkExplosion, CraftingGridSlotCount)
 	for i := 0; i < CraftingGridSlotCount; i++ {
-		tr.open.Crafting[i] = slots[1+i]
-		if tr.open.Crafting[i].IsEmpty() || !IsPotionOrTippedArrowItem(tr.open.Crafting[i]) {
+		d := slots[1+i]
+		tr.open.CraftingSlots[i] = d.Clone()
+		tr.open.Crafting[i] = d.Stack
+		newGrid[i] = d.Stack
+		if d.IsEmpty() || !IsPotionOrTippedArrowItem(d.Stack) {
 			tr.open.CraftingPotions[i] = ""
 		} else {
-			tr.open.CraftingPotions[i] = slotPotions[1+i]
+			tr.open.CraftingPotions[i] = d.Potion
 		}
-		if tr.open.Crafting[i].IsEmpty() {
+		if d.Star != nil && d.Stack.ResolvedID() == FireworkStarItemID {
+			cp := d.Star.Clone()
+			tr.open.CraftingStars[i] = cp
+			newStars[i] = cp
+		} else {
 			tr.open.CraftingStars[i] = FireworkExplosion{}
-		} else if len(tr.open.CraftingStars[i].Colors) == 0 && len(tr.open.CraftingStars[i].FadeColors) == 0 {
-			if exp, ok := GetSlotFireworkStar(session, 1+i); ok {
-				tr.open.CraftingStars[i] = exp
-			}
 		}
 	}
-	if res, starExp, fwComp, ok := matchCraftingWithFireworks(tr.open.Crafting[:], 3, 3, tr.open.CraftingStars[:]); ok {
+	if res, starExp, fwComp, ok := matchCraftingWithFireworks(newGrid, 3, 3, newStars); ok {
 		tr.open.Result = res
 		if starExp != nil {
 			SetSlotFireworkStar(session, 0, *starExp)
@@ -2339,19 +3493,32 @@ func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playe
 		ClearSlotFireworks(session, 0)
 	}
 	for i := 0; i < 27; i++ {
-		session.SetInventorySlot(9+i, slots[10+i])
-		SetSlotPotionType(session, 9+i, slotPotions[10+i])
+		idx := 10 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 9+i, slots[idx])
+		}
 	}
 	for i := 0; i < 9; i++ {
-		session.SetInventorySlot(36+i, slots[37+i])
-		SetSlotPotionType(session, 36+i, slotPotions[37+i])
+		idx := 37 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 36+i, slots[idx])
+		}
 	}
-	SetCarriedPotionType(session, carriedPotion)
+	setCarriedSlotDataLocked(session, tr, carried)
+	return pendingDrop, mutated
 }
 
-func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) {
+func (s *Server) applyCraftingTableClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) {
+	pendingDrop, _ := s.applyCraftingTableClickDataLocked(session, tr, slot, button, mode)
+	if !pendingDrop.IsEmpty() {
+		_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+		s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
+	}
+}
+
+func (s *Server) applyPlayerInventoryClickDataLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) (pendingDrop containerSlotData, mutated bool) {
 	if slot < 0 || slot >= world.PlayerInventorySlots {
-		return
+		return containerSlotData{}, false
 	}
 	for i := 0; i < 4; i++ {
 		if tr.invCraft[i].IsEmpty() {
@@ -2383,6 +3550,7 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 		if crafted := s.clickCraftingOutput(session, slots, 1, 4, 2, 2, 9, 45, tr.invCraftStars[:], func(menuSlot int) int {
 			return menuSlot
 		}, &tr.carried, mode); !crafted.IsEmpty() {
+			mutated = true
 			s.RecordItemCrafted(session, crafted.ResolvedID(), crafted.Count)
 			s.TriggerRecipeCrafted(session, crafted)
 			recName := ""
@@ -2396,18 +3564,19 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 		switch mode {
 		case ContainerInputPickup:
 			if button == 1 && s.tryApplyBundlePickupClick(session, slot, slots, metas, &tr.carried) {
+				mutated = true
 				break
 			}
 			if isArmorSlot {
 				if HasBindingCurseOnSlot(session, slot) && !slots[slot].IsEmpty() {
-					return
+					return containerSlotData{}, false
 				}
 				if !tr.carried.IsEmpty() {
 					if targetSlot, ok := WearableArmorSlotForItem(tr.carried.ResolvedID()); !ok || targetSlot != slot {
-						return
+						return containerSlotData{}, false
 					}
 					if !slots[slot].IsEmpty() && tr.carried.Count > 1 {
-						return
+						return containerSlotData{}, false
 					}
 				}
 			}
@@ -2441,7 +3610,7 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			slotHorn := GetSlotGoatHornInstrument(session, slot)
 			carriedHorn := GetCarriedGoatHornInstrument(session)
 			slotPotion := GetSlotPotionType(session, slot)
-			carriedPotion := GetCarriedPotionType(session)
+			carriedPotion := getCarriedPotionTypeForStack(session, tr.carried)
 			slotWritable, hasSlotWritable := GetSlotWritableBook(session, slot)
 			carriedWritable, hasCarriedWritable := GetCarriedWritableBook(session)
 			slotWritten, hasSlotWritten := GetSlotWrittenBook(session, slot)
@@ -2577,12 +3746,13 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			setCarriedFireworks(session, newCFW)
 
 		case ContainerInputQuickMove:
+			mutated = true
 			if slot >= 1 && slot <= 4 {
 				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 36, 45)
 				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 9, 36)
 			} else if isArmorSlot {
 				if HasBindingCurseOnSlot(session, slot) {
-					return
+					return containerSlotData{}, false
 				}
 				movedTrim := trims[slot]
 				slots[slot], metas[slot] = mergeIntoSlotSliceWithMeta(slots, metas, slots[slot], metas[slot], 9, 36)
@@ -2638,11 +3808,11 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			if targetIdx >= 0 && targetIdx < world.PlayerInventorySlots {
 				if isArmorSlot {
 					if HasBindingCurseOnSlot(session, slot) {
-						return
+						return containerSlotData{}, false
 					}
 					if !slots[targetIdx].IsEmpty() {
 						if ws, ok := WearableArmorSlotForItem(slots[targetIdx].ResolvedID()); !ok || ws != slot || slots[targetIdx].Count > 1 {
-							return
+							return containerSlotData{}, false
 						}
 					}
 				}
@@ -2650,6 +3820,7 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 				metas[slot], metas[targetIdx] = metas[targetIdx], metas[slot]
 				trims[slot], trims[targetIdx] = trims[targetIdx], trims[slot]
 				swapPlayerSlotExtendedComponents(session, slot, targetIdx)
+				mutated = true
 			}
 		case ContainerInputClone:
 			if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
@@ -2675,57 +3846,47 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			}
 		case ContainerInputThrow:
 			if isArmorSlot && HasBindingCurseOnSlot(session, slot) {
-				return
+				return containerSlotData{}, false
 			}
-			if !slots[slot].IsEmpty() {
+			if tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
 				dropCount := int32(1)
 				if button == 1 {
 					dropCount = slots[slot].Count
 				}
-				dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
-				slotBundle := GetSlotBundleContents(session, slot)
-				slotHorn := GetSlotGoatHornInstrument(session, slot)
-				slotMapID, hasSlotMap := GetSlotMapID(session, slot)
+				fullSlot := getPlayerSlotData(session, slot)
+				fullSlot.Stack = slots[slot]
+				fullSlot.Meta = metas[slot].Clone()
+				fullSlot.Trim = trims[slot]
+				pendingDrop = fullSlot.WithCount(dropCount)
 				rem := slots[slot].Count - dropCount
 				if rem <= 0 {
 					slots[slot] = world.ItemStack{}
 					metas[slot] = ItemMeta{}
 					trims[slot] = ArmorTrim{}
-					ClearSlotBundleContents(session, slot)
-					ClearSlotGoatHornInstrument(session, slot)
-					ClearSlotMapID(session, slot)
+					setPlayerSlotData(session, slot, containerSlotData{})
 				} else {
 					slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
 				}
-				snap := session.Snapshot()
-				entID, _ := s.SpawnItemEntityInDimension(world.NormalizeDimension(snap.Dimension), snap.X, snap.Y+0.5, snap.Z, dropStack)
-				if entID > 0 {
-					if len(slotBundle) > 0 && IsBundleItem(dropStack.ResolvedID()) {
-						s.AssociateDroppedBundleEntity(entID, slotBundle)
-					}
-					if slotHorn != "" && dropStack.ResolvedID() == GoatHornItemID {
-						s.AssociateDroppedGoatHornEntity(entID, slotHorn)
-					}
-					if hasSlotMap && dropStack.ResolvedID() == FilledMapItemID {
-						s.AssociateDroppedMapEntity(entID, slotMapID)
-					}
-				}
-				s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+				mutated = true
 			}
 		case ContainerInputPickupAll:
-			if !tr.carried.IsEmpty() && GetCarriedItemMeta(session).IsEmpty() {
-				itemID := tr.carried.ResolvedItemID()
-				maxStack := MaxItemStackSize
-				if MaxItemDurability(tr.carried.ResolvedID()) > 0 || tr.carried.ResolvedID() == "minecraft:enchanted_book" {
-					maxStack = 1
-				}
+			if !tr.carried.IsEmpty() {
+				carriedData := getCarriedSlotDataLocked(session, tr)
+				maxStack := carriedData.MaxStackSize()
 				for pass := 0; pass < 2 && tr.carried.Count < maxStack; pass++ {
 					for i := 1; i < world.PlayerInventorySlots && tr.carried.Count < maxStack; i++ {
 						if i >= ArmorSlotHead && i <= ArmorSlotFeet && HasBindingCurseOnSlot(session, i) {
 							continue
 						}
 						st := slots[i]
-						if st.IsEmpty() || st.ResolvedItemID() != itemID || !metas[i].IsEmpty() {
+						if st.IsEmpty() {
+							continue
+						}
+						sd := getPlayerSlotData(session, i)
+						sd.Stack = st
+						sd.Meta = metas[i]
+						sd.Trim = trims[i]
+						if !sd.SameItemSameComponents(carriedData) {
 							continue
 						}
 						if pass == 0 && st.Count >= maxStack {
@@ -2736,18 +3897,24 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 						if take > space {
 							take = space
 						}
-						tr.carried = world.NewItemStack(itemID, tr.carried.Count+take)
+						tr.carried = world.NewItemStack(carriedData.Stack.ResolvedItemID(), tr.carried.Count+take)
+						carriedData = carriedData.WithCount(tr.carried.Count)
 						if st.Count-take <= 0 {
 							slots[i] = world.ItemStack{}
 							metas[i] = ItemMeta{}
 							trims[i] = ArmorTrim{}
+							setPlayerSlotData(session, i, containerSlotData{})
 						} else {
-							slots[i] = world.NewItemStack(itemID, st.Count-take)
+							slots[i] = world.NewItemStack(st.ResolvedItemID(), st.Count-take)
 						}
 					}
 				}
+				mutated = true
 			}
 		}
+	}
+	if mode == ContainerInputPickup || mode == ContainerInputClone {
+		mutated = true
 	}
 
 	for i := 0; i < 4; i++ {
@@ -2793,6 +3960,141 @@ func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *pla
 			}
 		}
 	}
+	return pendingDrop, mutated
+}
+
+func (s *Server) applyPlayerInventoryClickLocked(session *PlayerSession, tr *playerContainerTracker, slot int, button int8, mode int32) {
+	pendingDrop, _ := s.applyPlayerInventoryClickDataLocked(session, tr, slot, button, mode)
+	if !pendingDrop.IsEmpty() {
+		_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+		s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
+	}
+}
+
+func (s *Server) clickCraftingOutputData(
+	session *PlayerSession,
+	slots []containerSlotData,
+	gridStart, gridCount, width, height int,
+	invStart, invEnd int,
+	gridStars []FireworkExplosion,
+	menuSlotToSessionSlot func(menuSlot int) int,
+	carried *containerSlotData,
+	mode int32,
+	resultDecorator func(res containerSlotData) containerSlotData,
+) world.ItemStack {
+	grid := make([]world.ItemStack, gridCount)
+	for i := 0; i < gridCount; i++ {
+		grid[i] = slots[gridStart+i].Stack
+	}
+	var potSherds *[4]string
+	if width == 3 && height == 3 && len(grid) >= 9 {
+		if _, sh, matchedPot := MatchDecoratedPotRecipe(grid); matchedPot {
+			shCopy := sh
+			potSherds = &shCopy
+		}
+	}
+	res, starExp, fwComp, ok := matchCraftingWithFireworks(grid, width, height, gridStars)
+	if !ok || res.IsEmpty() {
+		return world.ItemStack{}
+	}
+	resID := res.ResolvedItemID()
+	if resID <= 0 {
+		return world.ItemStack{}
+	}
+
+	buildResultData := func(curRes world.ItemStack, curStar *FireworkExplosion, curFW *FireworksComponent) containerSlotData {
+		d := containerSlotData{Stack: curRes}
+		if curStar != nil {
+			cp := curStar.Clone()
+			d.Star = &cp
+		} else if curFW != nil {
+			cp := curFW.Clone()
+			d.Fireworks = &cp
+		}
+		if resultDecorator != nil {
+			d = resultDecorator(d)
+		}
+		return d
+	}
+
+	consumeGridOnce := func() {
+		for i := 0; i < gridCount; i++ {
+			cur := slots[gridStart+i]
+			if cur.IsEmpty() {
+				continue
+			}
+			slots[gridStart+i] = cur.WithCount(cur.Stack.Count - 1)
+		}
+	}
+
+	var crafted world.ItemStack
+	switch mode {
+	case ContainerInputPickup:
+		resData := buildResultData(res, starExp, fwComp)
+		resMax := resData.MaxStackSize()
+		if carried.IsEmpty() {
+			*carried = resData
+			consumeGridOnce()
+			crafted = res
+			if potSherds != nil {
+				s.SetLastCraftedDecoratedPotSherds(*potSherds)
+			}
+		} else if carried.SameItemSameComponents(resData) && carried.Stack.Count+res.Count <= resMax {
+			*carried = carried.WithCount(carried.Stack.Count + res.Count)
+			consumeGridOnce()
+			crafted = res
+			if potSherds != nil {
+				s.SetLastCraftedDecoratedPotSherds(*potSherds)
+			}
+		}
+	case ContainerInputQuickMove:
+		var totalCrafted int32
+		curGrid := make([]world.ItemStack, gridCount)
+		for iter := 0; iter < 64; iter++ {
+			for i := 0; i < gridCount; i++ {
+				curGrid[i] = slots[gridStart+i].Stack
+			}
+			var curPotSherds *[4]string
+			if width == 3 && height == 3 && gridCount >= 9 {
+				if _, sh, matchedPot := MatchDecoratedPotRecipe(curGrid); matchedPot {
+					shCopy := sh
+					curPotSherds = &shCopy
+				}
+			}
+			curRes, curStarExp, curFwComp, match := matchCraftingWithFireworks(curGrid, width, height, gridStars)
+			if !match || curRes.IsEmpty() || curRes.ResolvedItemID() != resID {
+				break
+			}
+			resData := buildResultData(curRes, curStarExp, curFwComp)
+			if !canFitSlotDataInSlice(slots, resData, invStart, invEnd) {
+				break
+			}
+			prevCounts := make([]int32, invEnd)
+			for idx := invStart; idx < invEnd; idx++ {
+				prevCounts[idx] = slots[idx].Stack.Count
+			}
+			rem, _ := moveSlotDataSlice(slots, resData, invStart, invEnd, true, nil)
+			if curPotSherds != nil {
+				s.SetLastCraftedDecoratedPotSherds(*curPotSherds)
+				if menuSlotToSessionSlot != nil {
+					for idx := invStart; idx < invEnd; idx++ {
+						if slots[idx].Stack.Count > prevCounts[idx] {
+							SetSlotDecoratedPotSherds(s, session, menuSlotToSessionSlot(idx), *curPotSherds)
+						}
+					}
+				}
+			}
+			consumeGridOnce()
+			totalCrafted += curRes.Count
+			if !rem.IsEmpty() {
+				break
+			}
+		}
+		if totalCrafted > 0 {
+			crafted = world.NewItemStack(resID, totalCrafted)
+		}
+	}
+	return crafted
 }
 
 func (s *Server) clickCraftingOutput(
@@ -2839,6 +4141,7 @@ func (s *Server) clickCraftingOutput(
 	var crafted world.ItemStack
 	switch mode {
 	case ContainerInputPickup:
+		resMax := (containerSlotData{Stack: res}).MaxStackSize()
 		if carried.IsEmpty() {
 			*carried = world.NewItemStack(resID, res.Count)
 			consumeGridOnce()
@@ -2853,7 +4156,7 @@ func (s *Server) clickCraftingOutput(
 				setCarriedFireworks(session, fwComp)
 				setCarriedFireworkStar(session, nil)
 			}
-		} else if carried.ResolvedItemID() == resID && carried.Count+res.Count <= MaxItemStackSize {
+		} else if carried.ResolvedItemID() == resID && carried.Count+res.Count <= resMax {
 			*carried = world.NewItemStack(resID, carried.Count+res.Count)
 			consumeGridOnce()
 			crafted = res
@@ -2889,10 +4192,43 @@ func (s *Server) clickCraftingOutput(
 			for idx := invStart; idx < invEnd; idx++ {
 				prevCounts[idx] = slots[idx].Count
 			}
-			// Prefer hotbar (last 9 slots of invStart..invEnd) then main inventory.
-			hotbarStart := invEnd - 9
-			rem := mergeIntoSlotSlice(slots, curRes, hotbarStart, invEnd)
-			rem = mergeIntoSlotSlice(slots, rem, invStart, hotbarStart)
+			// Match vanilla AbstractContainerMenu.moveItemStackTo(res, invStart, invEnd, true): fill right-to-left (hotbar 8..0 then main).
+			rem := curRes
+			itemMax := MaxStackSizeForBundleWeight(curRes.ResolvedID())
+			if curRes.Count <= itemMax && itemMax > 1 {
+				for idx := invEnd - 1; idx >= invStart && !rem.IsEmpty(); idx-- {
+					cur := slots[idx]
+					if cur.IsEmpty() || cur.ResolvedItemID() != resID || cur.Count >= itemMax {
+						continue
+					}
+					space := itemMax - cur.Count
+					take := rem.Count
+					if take > space {
+						take = space
+					}
+					slots[idx] = world.NewItemStack(resID, cur.Count+take)
+					if rem.Count-take <= 0 {
+						rem = world.ItemStack{}
+					} else {
+						rem = world.NewItemStack(resID, rem.Count-take)
+					}
+				}
+			}
+			for idx := invEnd - 1; idx >= invStart && !rem.IsEmpty(); idx-- {
+				if !slots[idx].IsEmpty() {
+					continue
+				}
+				take := rem.Count
+				if take > itemMax {
+					take = itemMax
+				}
+				slots[idx] = world.NewItemStack(resID, take)
+				if rem.Count-take <= 0 {
+					rem = world.ItemStack{}
+				} else {
+					rem = world.NewItemStack(resID, rem.Count-take)
+				}
+			}
 			if curPotSherds != nil {
 				s.SetLastCraftedDecoratedPotSherds(*curPotSherds)
 			}
@@ -3048,23 +4384,335 @@ func canFitInSlice(slots []world.ItemStack, stack world.ItemStack, start, end in
 	return needed <= 0
 }
 
+func moveSlotDataSlice(slots []containerSlotData, d containerSlotData, start, end int, reverse bool, slotMax func(slot int, item containerSlotData) int32) (containerSlotData, bool) {
+	if d.IsEmpty() || start >= end {
+		return d, false
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(slots) {
+		end = len(slots)
+	}
+	if start >= end {
+		return d, false
+	}
+	remaining := d.Stack.Count
+	moved := false
+	limitFor := func(i int) int32 {
+		lim := d.MaxStackSize()
+		if slotMax != nil {
+			if sm := slotMax(i, d); sm < lim {
+				lim = sm
+			}
+		}
+		return lim
+	}
+	stepMerge := func(i int) bool {
+		if remaining <= 0 {
+			return false
+		}
+		cur := slots[i]
+		lim := limitFor(i)
+		if cur.IsEmpty() || lim <= 1 || cur.Stack.Count >= lim || !cur.SameItemSameComponents(d) {
+			return true
+		}
+		space := lim - cur.Stack.Count
+		take := remaining
+		if take > space {
+			take = space
+		}
+		if take > 0 {
+			slots[i] = cur.WithCount(cur.Stack.Count + take)
+			remaining -= take
+			moved = true
+		}
+		return remaining > 0
+	}
+	if d.MaxStackSize() > 1 {
+		if reverse {
+			for i := end - 1; i >= start; i-- {
+				if !stepMerge(i) {
+					break
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if !stepMerge(i) {
+					break
+				}
+			}
+		}
+	}
+	stepEmpty := func(i int) bool {
+		if remaining <= 0 {
+			return false
+		}
+		if !slots[i].IsEmpty() {
+			return true
+		}
+		lim := limitFor(i)
+		if lim <= 0 {
+			return true
+		}
+		take := remaining
+		if take > lim {
+			take = lim
+		}
+		if take > 0 {
+			slots[i] = d.WithCount(take)
+			remaining -= take
+			moved = true
+		}
+		return remaining > 0
+	}
+	if remaining > 0 {
+		if reverse {
+			for i := end - 1; i >= start; i-- {
+				if !stepEmpty(i) {
+					break
+				}
+			}
+		} else {
+			for i := start; i < end; i++ {
+				if !stepEmpty(i) {
+					break
+				}
+			}
+		}
+	}
+	return d.WithCount(remaining), moved
+}
+
+func canFitSlotDataInSlice(slots []containerSlotData, d containerSlotData, start, end int) bool {
+	if d.IsEmpty() {
+		return true
+	}
+	needed := d.Stack.Count
+	lim := d.MaxStackSize()
+	for i := start; i < end && needed > 0; i++ {
+		cur := slots[i]
+		if cur.IsEmpty() {
+			needed -= lim
+		} else if cur.SameItemSameComponents(d) && cur.Stack.Count < lim {
+			needed -= lim - cur.Stack.Count
+		}
+	}
+	return needed <= 0
+}
+
+func applyPickupSlotData(slotData, carried containerSlotData, button int8, slotLimit int32) (newSlot, newCarried containerSlotData) {
+	if slotLimit <= 0 {
+		slotLimit = MaxItemStackSize
+	}
+	maxFor := func(d containerSlotData) int32 {
+		m := d.MaxStackSize()
+		if slotLimit < m {
+			m = slotLimit
+		}
+		if m < 1 {
+			m = 1
+		}
+		return m
+	}
+	if button == 1 {
+		if carried.IsEmpty() {
+			if slotData.IsEmpty() {
+				return slotData, carried
+			}
+			take := (slotData.Stack.Count + 1) / 2
+			leave := slotData.Stack.Count - take
+			return slotData.WithCount(leave), slotData.WithCount(take)
+		}
+		if slotData.IsEmpty() {
+			return carried.WithCount(1), carried.WithCount(carried.Stack.Count - 1)
+		}
+		if slotData.SameItemSameComponents(carried) {
+			maxStack := maxFor(slotData)
+			if slotData.Stack.Count < maxStack {
+				return slotData.WithCount(slotData.Stack.Count + 1), carried.WithCount(carried.Stack.Count - 1)
+			}
+			return slotData, carried
+		}
+		if carried.Stack.Count > slotLimit {
+			return slotData, carried
+		}
+		return carried, slotData
+	}
+
+	if carried.IsEmpty() {
+		return containerSlotData{}, slotData
+	}
+	if slotData.IsEmpty() {
+		if carried.Stack.Count > slotLimit {
+			return carried.WithCount(slotLimit), carried.WithCount(carried.Stack.Count - slotLimit)
+		}
+		return carried, containerSlotData{}
+	}
+	if slotData.SameItemSameComponents(carried) {
+		maxStack := maxFor(slotData)
+		space := maxStack - slotData.Stack.Count
+		if space <= 0 {
+			return slotData, carried
+		}
+		move := carried.Stack.Count
+		if move > space {
+			move = space
+		}
+		return slotData.WithCount(slotData.Stack.Count + move), carried.WithCount(carried.Stack.Count - move)
+	}
+	if carried.Stack.Count > slotLimit {
+		return slotData, carried
+	}
+	return carried, slotData
+}
+
+func applyPickupAllSlotData(slots []containerSlotData, carried *containerSlotData, minSlot int, skipSlot func(i int) bool) {
+	if carried == nil || carried.IsEmpty() {
+		return
+	}
+	maxStack := carried.MaxStackSize()
+	if carried.Stack.Count >= maxStack {
+		return
+	}
+	for pass := 0; pass < 2 && carried.Stack.Count < maxStack; pass++ {
+		for i := minSlot; i < len(slots) && carried.Stack.Count < maxStack; i++ {
+			if skipSlot != nil && skipSlot(i) {
+				continue
+			}
+			st := slots[i]
+			if st.IsEmpty() || !st.SameItemSameComponents(*carried) {
+				continue
+			}
+			if pass == 0 && st.Stack.Count >= maxStack {
+				continue
+			}
+			space := maxStack - carried.Stack.Count
+			take := st.Stack.Count
+			if take > space {
+				take = space
+			}
+			*carried = carried.WithCount(carried.Stack.Count + take)
+			slots[i] = st.WithCount(st.Stack.Count - take)
+		}
+	}
+}
+
+func distributeQuickCraftOnSlotData(slots []containerSlotData, carried *containerSlotData, dragSlots []int, dragType int8, slotMaxStack func(slot int, item containerSlotData) int32) {
+	if carried == nil || carried.IsEmpty() || len(dragSlots) == 0 {
+		return
+	}
+	origCarried := carried.Clone()
+	defaultMax := origCarried.MaxStackSize()
+	placePerSlot := QuickCraftPlaceCount(len(dragSlots), dragType, origCarried.Stack)
+	if placePerSlot <= 0 {
+		return
+	}
+	remaining := origCarried.Stack.Count
+	for _, sl := range dragSlots {
+		if sl < 0 || sl >= len(slots) {
+			continue
+		}
+		cur := slots[sl]
+		if !cur.IsEmpty() && !cur.SameItemSameComponents(origCarried) {
+			continue
+		}
+		maxForSlot := defaultMax
+		if slotMaxStack != nil {
+			if m := slotMaxStack(sl, origCarried); m < maxForSlot {
+				maxForSlot = m
+			}
+		}
+		curCount := int32(0)
+		if !cur.IsEmpty() {
+			curCount = cur.Stack.Count
+		}
+		if curCount >= maxForSlot {
+			continue
+		}
+		add := placePerSlot
+		if curCount+add > maxForSlot {
+			add = maxForSlot - curCount
+		}
+		if dragType != QuickCraftTypeClone {
+			if add > remaining {
+				add = remaining
+			}
+			remaining -= add
+		}
+		if add > 0 {
+			slots[sl] = origCarried.WithCount(curCount + add)
+		}
+	}
+	if dragType != QuickCraftTypeClone {
+		*carried = origCarried.WithCount(remaining)
+	}
+}
+
+func (s *Server) syncActiveContainerLocked(session *PlayerSession, tr *playerContainerTracker) error {
+	if s == nil || session == nil || tr == nil {
+		return nil
+	}
+	tr.mu.Lock()
+	cid, slots, carried, supported := s.buildActiveMenuSlotDataLocked(session, tr)
+	var openMenuType int32
+	var isEnderChest bool
+	var vehID int32
+	if tr.open != nil {
+		openMenuType = tr.open.MenuType
+		isEnderChest = tr.open.IsEnderChest
+		vehID = tr.open.VehicleEntityID
+	}
+	tr.mu.Unlock()
+	if !supported {
+		return nil
+	}
+	setTrackerRemoteSnapshot(tr, cid, slots, carried)
+	if session.send == nil {
+		return nil
+	}
+	stateID := session.NextContainerStateID()
+	if err := session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slots, carried)); err != nil {
+		return err
+	}
+	if openMenuType == MenuTypeGeneric9x3 && vehID == 0 && !isEnderChest {
+		for i := 0; i < ChestSlotCount && i < len(slots); i++ {
+			if slots[i].HasMap && slots[i].Stack.ResolvedID() == FilledMapItemID {
+				if data, exists := s.GetMapData(slots[i].MapID); exists && data != nil {
+					s.refreshMapDecorations(data)
+					_ = session.send(PlayMapItemDataCB, EncodeMapItemDataPacket(slots[i].MapID, data.Scale, data.Locked, data.DecorationList(), data.FullMapColorPatch()))
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	if session == nil || session.send == nil {
 		return nil
 	}
 	tr := getContainerTracker(session)
+	tr.syncMu.Lock()
 	tr.mu.Lock()
+	if tr.open == nil {
+		tr.mu.Unlock()
+		err := s.syncPlayerInventoryContainerLocked(session, tr)
+		tr.syncMu.Unlock()
+		return err
+	}
+	_, _, _, supported := s.buildActiveMenuSlotDataLocked(session, tr)
+	if supported {
+		tr.mu.Unlock()
+		err := s.syncActiveContainerLocked(session, tr)
+		tr.syncMu.Unlock()
+		return err
+	}
 	carried := tr.carried
-	var openCopy *OpenContainerState
-	if tr.open != nil {
-		cp := *tr.open
-		openCopy = &cp
-	}
+	cp := *tr.open
+	openCopy := &cp
 	tr.mu.Unlock()
-
-	if openCopy == nil {
-		return s.syncPlayerInventoryContainer(session)
-	}
+	tr.syncMu.Unlock()
 	var slots []world.ItemStack
 	var slotMetas []ItemMeta
 	var slotTrims []ArmorTrim
@@ -3218,153 +4866,207 @@ func (s *Server) syncOpenContainer(session *PlayerSession) error {
 	return nil
 }
 
+func (s *Server) syncPlayerInventoryContainerLocked(session *PlayerSession, tr *playerContainerTracker) error {
+	if s == nil || session == nil || tr == nil {
+		return nil
+	}
+	tr.mu.Lock()
+	slots := s.buildPlayerMenuSlotData(session, tr)
+	carried := getCarriedSlotDataLocked(session, tr)
+	tr.mu.Unlock()
+	setTrackerRemoteSnapshot(tr, 0, slots, carried)
+	if session.send == nil {
+		return nil
+	}
+	stateID := session.NextContainerStateID()
+	return session.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(0, stateID, slots, carried))
+}
+
 func (s *Server) syncPlayerInventoryContainer(session *PlayerSession) error {
-	if session == nil || session.send == nil {
+	if session == nil {
 		return nil
 	}
 	tr := getContainerTracker(session)
-	tr.mu.Lock()
-	carried := tr.carried
-	grid := tr.invCraft
-	res := tr.invResult
-	tr.mu.Unlock()
-
-	slots := s.buildPlayerMenuSlots(session, grid, res)
-	stateID := session.NextContainerStateID()
-	w := protocol.NewWriter(32 + len(slots)*12)
-	w.VarInt(0)
-	w.VarInt(stateID)
-	w.VarInt(int32(len(slots)))
-	for i, st := range slots {
-		if IsBundleItem(st.ResolvedID()) {
-			if items := GetSlotBundleContents(session, i); len(items) > 0 {
-				EncodeSlotWithBundleContents(w, st, items)
-				continue
-			}
-		}
-		if IsPotionOrTippedArrowItem(st) {
-			EncodeSlotWithPotionContents(w, st, GetSlotPotionType(session, i))
-			continue
-		}
-		switch st.ResolvedID() {
-		case FireworkRocketItemID:
-			if fw, ok := GetSlotFireworks(session, i); ok {
-				EncodeSlotWithFireworks(w, st, fw)
-				continue
-			}
-		case FireworkStarItemID:
-			if exp, ok := GetSlotFireworkStar(session, i); ok {
-				EncodeSlotWithFireworkStar(w, st, exp)
-				continue
-			}
-		case CompassItemID:
-			if lt, ok := GetSlotLodestoneTracker(session, i); ok {
-				EncodeSlotWithLodestoneTracker(w, st, &lt)
-				continue
-			}
-		case FilledMapItemID:
-			if mapID, ok := GetSlotMapID(session, i); ok {
-				EncodeSlotWithMapID(w, st, mapID, true)
-				continue
-			}
-		case WritableBookItemID, WrittenBookItemID:
-			if wb, hasWB := GetSlotWritableBook(session, i); hasWB {
-				EncodeSlotWithBookContent(w, st, &wb, nil)
-				continue
-			}
-			if wrb, hasWRB := GetSlotWrittenBook(session, i); hasWRB {
-				EncodeSlotWithBookContent(w, st, nil, &wrb)
-				continue
-			}
-		}
-		meta := GetSlotItemMeta(session, i)
-		trim, hasTrim := GetSlotArmorTrim(session, i)
-		if !meta.IsEmpty() || hasTrim {
-			WriteSlotWithArmorTrim(w, st, meta, trim)
-		} else {
-			writeContainerItemStack(w, st)
-		}
-	}
-	encodedCarried := false
-	if IsBundleItem(carried.ResolvedID()) {
-		if items := GetCarriedBundleContents(session); len(items) > 0 {
-			EncodeSlotWithBundleContents(w, carried, items)
-			encodedCarried = true
-		}
-	}
-	if !encodedCarried && IsPotionOrTippedArrowItem(carried) {
-		EncodeSlotWithPotionContents(w, carried, GetCarriedPotionType(session))
-		encodedCarried = true
-	}
-	if !encodedCarried {
-		switch carried.ResolvedID() {
-		case FireworkRocketItemID:
-			if fw, ok := getCarriedFireworks(session); ok {
-				EncodeSlotWithFireworks(w, carried, fw)
-				encodedCarried = true
-			}
-		case FireworkStarItemID:
-			if exp, ok := getCarriedFireworkStar(session); ok {
-				EncodeSlotWithFireworkStar(w, carried, exp)
-				encodedCarried = true
-			}
-		case CompassItemID:
-			if lt, ok := GetCarriedLodestoneTracker(session); ok {
-				EncodeSlotWithLodestoneTracker(w, carried, &lt)
-				encodedCarried = true
-			}
-		case FilledMapItemID:
-			if mapID, ok := GetCarriedMapID(session); ok {
-				EncodeSlotWithMapID(w, carried, mapID, true)
-				encodedCarried = true
-			}
-		case WritableBookItemID, WrittenBookItemID:
-			if wb, hasWB := GetCarriedWritableBook(session); hasWB {
-				EncodeSlotWithBookContent(w, carried, &wb, nil)
-				encodedCarried = true
-			} else if wrb, hasWRB := GetCarriedWrittenBook(session); hasWRB {
-				EncodeSlotWithBookContent(w, carried, nil, &wrb)
-				encodedCarried = true
-			}
-		}
-	}
-	if !encodedCarried {
-		carriedMeta := GetCarriedItemMeta(session)
-		carriedTrim, hasCarriedTrim := GetCarriedArmorTrim(session)
-		if !carriedMeta.IsEmpty() || hasCarriedTrim {
-			WriteSlotWithArmorTrim(w, carried, carriedMeta, carriedTrim)
-		} else {
-			writeContainerItemStack(w, carried)
-		}
-	}
-	return session.send(protocol.PlayContainerSetContent, w.Bytes())
+	tr.syncMu.Lock()
+	defer tr.syncMu.Unlock()
+	return s.syncPlayerInventoryContainerLocked(session, tr)
 }
 
-func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {
+func (s *Server) syncOtherStorageViewers(actor *PlayerSession, dim string, bx, by, bz int) error {
+	if s == nil {
+		return nil
+	}
+	normDim := world.NormalizeDimension(dim)
 	s.playersMu.RLock()
 	sessions := make([]*PlayerSession, 0, len(s.players))
 	for _, sess := range s.players {
-		sessions = append(sessions, sess)
+		if sess != nil && sess != actor && sess.send != nil {
+			sessions = append(sessions, sess)
+		}
 	}
 	s.playersMu.RUnlock()
 
 	var firstErr error
 	for _, sess := range sessions {
-		open := sess.OpenContainer()
-		if open != nil && !open.IsEnderChest &&
+		otherTr := getContainerTracker(sess)
+		otherTr.syncMu.Lock()
+		otherTr.mu.Lock()
+		open := otherTr.open
+		matches := open != nil && !open.IsEnderChest && open.VehicleEntityID == 0 &&
 			(open.MenuType == MenuTypeGeneric9x3 || open.MenuType == MenuTypeGeneric9x6 || open.MenuType == MenuTypeShulkerBox) &&
 			((open.BlockX == bx && open.BlockY == by && open.BlockZ == bz) ||
-				(open.HasPartner && open.PartnerX == bx && open.PartnerY == by && open.PartnerZ == bz)) {
-			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
-				firstErr = err
+				(open.HasPartner && open.PartnerX == bx && open.PartnerY == by && open.PartnerZ == bz))
+		if matches && normDim != "" {
+			otherDim := open.Dimension
+			if otherDim == "" {
+				otherDim = sess.Dimension()
 			}
-		} else if sess == actor {
-			if err := s.syncOpenContainer(sess); err != nil && firstErr == nil {
-				firstErr = err
+			if world.NormalizeDimension(otherDim) != normDim {
+				matches = false
 			}
 		}
+		if !matches {
+			otherTr.mu.Unlock()
+			otherTr.syncMu.Unlock()
+			continue
+		}
+		cid, slots, carried, supported := s.buildActiveMenuSlotDataLocked(sess, otherTr)
+		storageCount := ChestSlotCount
+		if open.MenuType == MenuTypeGeneric9x6 {
+			storageCount = DoubleChestSlotCount
+		}
+		otherTr.mu.Unlock()
+
+		if supported {
+			if otherTr.remoteContainerID != cid || len(otherTr.remoteSlots) != len(slots) {
+				setTrackerRemoteSnapshot(otherTr, cid, slots, carried)
+				stateID := sess.NextContainerStateID()
+				if err := sess.send(protocol.PlayContainerSetContent, encodeContainerContentFromSlotData(cid, stateID, slots, carried)); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			} else {
+				for i := 0; i < storageCount && i < len(slots); i++ {
+					actualHS := slots[i].ToHashedStack()
+					if !actualHS.Matches(otherTr.remoteSlots[i]) {
+						stateID := sess.NextContainerStateID()
+						if err := sess.send(protocol.PlayContainerSetSlot, encodeContainerSlotFromSlotData(cid, stateID, i, slots[i])); err != nil && firstErr == nil {
+							firstErr = err
+						}
+						otherTr.remoteSlots[i] = actualHS
+					}
+				}
+			}
+		}
+		otherTr.syncMu.Unlock()
 	}
 	return firstErr
+}
+
+func (s *Server) syncChestViewers(actor *PlayerSession, bx, by, bz int) error {
+	var firstErr error
+	dim := ""
+	if actor != nil {
+		if open := actor.OpenContainer(); open != nil && !open.IsEnderChest {
+			dim = open.Dimension
+		}
+		if dim == "" {
+			dim = actor.Dimension()
+		}
+		if err := s.syncOpenContainer(actor); err != nil {
+			firstErr = err
+		}
+	}
+	if err := s.syncOtherStorageViewers(actor, dim, bx, by, bz); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+func (s *Server) applyDoubleChestClickDataLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	x1, y1, z1, x2, y2, z2, slot int,
+	button int8,
+	mode int32,
+) (pendingDrop containerSlotData, mutated bool) {
+	if slot < 0 || slot >= DoubleChestMenuSlotCount {
+		return containerSlotData{}, false
+	}
+	openDim := world.DimensionOverworld
+	if tr.open != nil && tr.open.Dimension != "" {
+		openDim = tr.open.Dimension
+	} else if session != nil && session.Dimension() != "" {
+		openDim = session.Dimension()
+	}
+	slots := s.buildDoubleChestMenuSlotDataInDim(session, openDim, x1, y1, z1, x2, y2, z2)
+	orig := append([]containerSlotData(nil), slots...)
+	carried := getCarriedSlotDataLocked(session, tr)
+
+	switch mode {
+	case ContainerInputPickup:
+		slots[slot], carried = applyPickupSlotData(slots[slot], carried, button, MaxItemStackSize)
+		mutated = true
+	case ContainerInputQuickMove:
+		if slot < DoubleChestSlotCount {
+			slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], DoubleChestSlotCount, DoubleChestMenuSlotCount, true, nil)
+		} else {
+			slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], 0, DoubleChestSlotCount, false, nil)
+		}
+	case ContainerInputSwap:
+		if button >= 0 && button < 9 {
+			hotbarIdx := 81 + int(button)
+			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			mutated = true
+		} else if button == 40 {
+			offData := getPlayerSlotData(session, OffHandContainerSlot)
+			slots[slot], offData = offData, slots[slot]
+			setPlayerSlotData(session, OffHandContainerSlot, offData)
+			mutated = true
+		}
+	case ContainerInputClone:
+		if session.Snapshot().GameMode == GameModeCreative && carried.IsEmpty() && !slots[slot].IsEmpty() {
+			carried = slots[slot].WithCount(slots[slot].MaxStackSize())
+			mutated = true
+		}
+	case ContainerInputThrow:
+		if carried.IsEmpty() && !slots[slot].IsEmpty() {
+			dropCount := int32(1)
+			if button == 1 {
+				dropCount = slots[slot].Stack.Count
+			}
+			pendingDrop = slots[slot].WithCount(dropCount)
+			slots[slot] = slots[slot].WithCount(slots[slot].Stack.Count - dropCount)
+			mutated = true
+		}
+	case ContainerInputPickupAll:
+		if !carried.IsEmpty() {
+			applyPickupAllSlotData(slots, &carried, 0, nil)
+			mutated = true
+		}
+	}
+	for i := 0; i < ChestSlotCount; i++ {
+		if !slots[i].SameItemSameComponents(orig[i]) || slots[i].Stack.Count != orig[i].Stack.Count {
+			s.setStorageSlotData(openDim, x1, y1, z1, i, slots[i])
+		}
+		hi := ChestSlotCount + i
+		if !slots[hi].SameItemSameComponents(orig[hi]) || slots[hi].Stack.Count != orig[hi].Stack.Count {
+			s.setStorageSlotData(openDim, x2, y2, z2, i, slots[hi])
+		}
+	}
+	for i := 0; i < 27; i++ {
+		idx := 54 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 9+i, slots[idx])
+		}
+	}
+	for i := 0; i < 9; i++ {
+		idx := 81 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 36+i, slots[idx])
+		}
+	}
+	setCarriedSlotDataLocked(session, tr, carried)
+	return pendingDrop, mutated
 }
 
 func (s *Server) applyDoubleChestClickLocked(
@@ -3374,69 +5076,90 @@ func (s *Server) applyDoubleChestClickLocked(
 	button int8,
 	mode int32,
 ) {
-	if slot < 0 || slot >= DoubleChestMenuSlotCount {
-		return
+	pendingDrop, _ := s.applyDoubleChestClickDataLocked(session, tr, x1, y1, z1, x2, y2, z2, slot, button, mode)
+	if !pendingDrop.IsEmpty() {
+		_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+		s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
 	}
-	openDim := world.DimensionOverworld
-	if tr.open != nil && tr.open.Dimension != "" {
-		openDim = tr.open.Dimension
-	} else if session != nil && session.Dimension() != "" {
-		openDim = session.Dimension()
+}
+
+func (s *Server) applyEnderChestClickDataLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	slot int,
+	button int8,
+	mode int32,
+) (pendingDrop containerSlotData, mutated bool) {
+	if slot < 0 || slot >= ChestMenuSlotCount {
+		return containerSlotData{}, false
 	}
-	slots := s.buildDoubleChestMenuSlotsInDim(session, openDim, x1, y1, z1, x2, y2, z2)
+	slots := s.buildEnderChestMenuSlotData(session, tr)
+	orig := append([]containerSlotData(nil), slots...)
+	carried := getCarriedSlotDataLocked(session, tr)
+
 	switch mode {
 	case ContainerInputPickup:
-		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
+		slots[slot], carried = applyPickupSlotData(slots[slot], carried, button, MaxItemStackSize)
+		mutated = true
 	case ContainerInputQuickMove:
-		if slot < DoubleChestSlotCount {
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 81, 90)
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 81)
+		if slot < ChestSlotCount {
+			slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], ChestSlotCount, ChestMenuSlotCount, true, nil)
 		} else {
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, DoubleChestSlotCount)
+			slots[slot], mutated = moveSlotDataSlice(slots, slots[slot], 0, ChestSlotCount, false, nil)
 		}
 	case ContainerInputSwap:
 		if button >= 0 && button < 9 {
-			hotbarIdx := 81 + int(button)
+			hotbarIdx := 54 + int(button)
 			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
+			mutated = true
 		} else if button == 40 {
-			offStack := session.InventorySlot(OffHandContainerSlot)
-			slots[slot], offStack = offStack, slots[slot]
-			session.SetInventorySlot(OffHandContainerSlot, offStack)
+			offData := getPlayerSlotData(session, OffHandContainerSlot)
+			slots[slot], offData = offData, slots[slot]
+			setPlayerSlotData(session, OffHandContainerSlot, offData)
+			mutated = true
 		}
 	case ContainerInputClone:
-		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
+		if session.Snapshot().GameMode == GameModeCreative && carried.IsEmpty() && !slots[slot].IsEmpty() {
+			carried = slots[slot].WithCount(slots[slot].MaxStackSize())
+			mutated = true
 		}
 	case ContainerInputThrow:
-		if !slots[slot].IsEmpty() {
+		if carried.IsEmpty() && !slots[slot].IsEmpty() {
 			dropCount := int32(1)
 			if button == 1 {
-				dropCount = slots[slot].Count
+				dropCount = slots[slot].Stack.Count
 			}
-			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
-			rem := slots[slot].Count - dropCount
-			if rem <= 0 {
-				slots[slot] = world.ItemStack{}
-			} else {
-				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
-			}
-			snap := session.Snapshot()
-			_, _ = s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
-			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
+			pendingDrop = slots[slot].WithCount(dropCount)
+			slots[slot] = slots[slot].WithCount(slots[slot].Stack.Count - dropCount)
+			mutated = true
 		}
 	case ContainerInputPickupAll:
-		applyPickupAllSlice(slots, &tr.carried, 0)
+		if !carried.IsEmpty() {
+			applyPickupAllSlotData(slots, &carried, 0, nil)
+			mutated = true
+		}
 	}
 	for i := 0; i < ChestSlotCount; i++ {
-		s.SetChestSlotInDim(openDim, x1, y1, z1, i, slots[i])
-		s.SetChestSlotInDim(openDim, x2, y2, z2, i, slots[ChestSlotCount+i])
+		if slots[i].IsEmpty() {
+			tr.enderChest[i] = world.ItemStack{}
+		} else {
+			tr.enderChest[i] = world.NewItemStack(slots[i].Stack.ResolvedItemID(), slots[i].Stack.Count)
+		}
 	}
 	for i := 0; i < 27; i++ {
-		session.SetInventorySlot(9+i, slots[54+i])
+		idx := 27 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 9+i, slots[idx])
+		}
 	}
 	for i := 0; i < 9; i++ {
-		session.SetInventorySlot(36+i, slots[81+i])
+		idx := 54 + i
+		if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+			setPlayerSlotData(session, 36+i, slots[idx])
+		}
 	}
+	setCarriedSlotDataLocked(session, tr, carried)
+	return pendingDrop, mutated
 }
 
 func (s *Server) applyEnderChestClickLocked(
@@ -3446,70 +5169,10 @@ func (s *Server) applyEnderChestClickLocked(
 	button int8,
 	mode int32,
 ) {
-	if slot < 0 || slot >= ChestMenuSlotCount {
-		return
-	}
-	slots := make([]world.ItemStack, ChestMenuSlotCount)
-	copy(slots[0:27], tr.enderChest[:])
-	inv := session.Inventory()
-	copy(slots[27:54], inv[9:36])
-	copy(slots[54:63], inv[36:45])
-
-	switch mode {
-	case ContainerInputPickup:
-		slots[slot], tr.carried = applyPickupSlot(slots[slot], tr.carried, button)
-	case ContainerInputQuickMove:
-		if slot < ChestSlotCount {
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 54, 63)
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 27, 54)
-		} else {
-			slots[slot] = mergeIntoSlotSlice(slots, slots[slot], 0, ChestSlotCount)
-		}
-	case ContainerInputSwap:
-		if button >= 0 && button < 9 {
-			hotbarIdx := 54 + int(button)
-			slots[slot], slots[hotbarIdx] = slots[hotbarIdx], slots[slot]
-		} else if button == 40 {
-			offStack := session.InventorySlot(OffHandContainerSlot)
-			slots[slot], offStack = offStack, slots[slot]
-			session.SetInventorySlot(OffHandContainerSlot, offStack)
-		}
-	case ContainerInputClone:
-		if session.Snapshot().GameMode == GameModeCreative && tr.carried.IsEmpty() && !slots[slot].IsEmpty() {
-			tr.carried = world.NewItemStack(slots[slot].ResolvedItemID(), MaxItemStackSize)
-		}
-	case ContainerInputThrow:
-		if !slots[slot].IsEmpty() {
-			dropCount := int32(1)
-			if button == 1 {
-				dropCount = slots[slot].Count
-			}
-			dropStack := world.NewItemStack(slots[slot].ResolvedItemID(), dropCount)
-			rem := slots[slot].Count - dropCount
-			if rem <= 0 {
-				slots[slot] = world.ItemStack{}
-			} else {
-				slots[slot] = world.NewItemStack(slots[slot].ResolvedItemID(), rem)
-			}
-			snap := session.Snapshot()
-			_, _ = s.SpawnItemEntity(snap.X, snap.Y+0.5, snap.Z, dropStack)
-			s.RecordItemDropped(session, dropStack.ResolvedID(), dropStack.Count)
-		}
-	case ContainerInputPickupAll:
-		applyPickupAllSlice(slots, &tr.carried, 0)
-	}
-	for i := 0; i < ChestSlotCount; i++ {
-		if slots[i].IsEmpty() {
-			tr.enderChest[i] = world.ItemStack{}
-		} else {
-			tr.enderChest[i] = world.NewItemStack(slots[i].ResolvedItemID(), slots[i].Count)
-		}
-	}
-	for i := 0; i < 27; i++ {
-		session.SetInventorySlot(9+i, slots[27+i])
-	}
-	for i := 0; i < 9; i++ {
-		session.SetInventorySlot(36+i, slots[54+i])
+	pendingDrop, _ := s.applyEnderChestClickDataLocked(session, tr, slot, button, mode)
+	if !pendingDrop.IsEmpty() {
+		_, _ = s.SpawnPlayerDroppedItem(session, pendingDrop)
+		s.RecordItemDropped(session, pendingDrop.Stack.ResolvedID(), pendingDrop.Stack.Count)
 	}
 }
 
@@ -3541,7 +5204,7 @@ func (s *Server) applyBrewingStandContainerClickLocked(
 	for i := 0; i < 9; i++ {
 		slotPotions[32+i] = GetSlotPotionType(session, 36+i)
 	}
-	carriedPotion := GetCarriedPotionType(session)
+	carriedPotion := getCarriedPotionTypeForStack(session, tr.carried)
 
 	switch mode {
 	case ContainerInputPickup:
@@ -4553,7 +6216,7 @@ func MaxStackSizeForBundleWeight(itemID string) int32 {
 	if norm == "" {
 		return 64
 	}
-	if IsBundleItem(norm) || MaxItemDurability(norm) > 0 {
+	if IsBundleItem(norm) || IsShulkerBoxItemOrBlock(norm) || MaxItemDurability(norm) > 0 {
 		return 1
 	}
 	switch norm {
@@ -5239,7 +6902,13 @@ func isQuickCraftResultOrInvalidSlot(session *PlayerSession, tr *playerContainer
 	}
 }
 
-func (s *Server) handleQuickCraftClickLocked(session *PlayerSession, tr *playerContainerTracker, containerID int32, slot int, button int8) error {
+func (s *Server) handleQuickCraftMutateLocked(
+	session *PlayerSession,
+	tr *playerContainerTracker,
+	containerID int32,
+	slot int,
+	button int8,
+) (mutated bool, sharedDim string, sharedX, sharedY, sharedZ int, hasShared bool) {
 	oldStatus := tr.dragStatus
 	header := QuickcraftHeader(button)
 	dragType := QuickcraftType(button)
@@ -5255,8 +6924,7 @@ func (s *Server) handleQuickCraftClickLocked(session *PlayerSession, tr *playerC
 			tr.dragType = 0
 			tr.dragSlots = nil
 		}
-		tr.mu.Unlock()
-		return nil
+		return false, "", 0, 0, 0, false
 	}
 
 	if header == QuickCraftHeaderContinue {
@@ -5279,8 +6947,7 @@ func (s *Server) handleQuickCraftClickLocked(session *PlayerSession, tr *playerC
 			tr.dragType = 0
 			tr.dragSlots = nil
 		}
-		tr.mu.Unlock()
-		return nil
+		return false, "", 0, 0, 0, false
 	}
 
 	if header == QuickCraftHeaderEnd {
@@ -5291,34 +6958,101 @@ func (s *Server) handleQuickCraftClickLocked(session *PlayerSession, tr *playerC
 		tr.dragSlots = nil
 
 		if oldStatus != 1 || tr.carried.IsEmpty() || len(dragSlots) == 0 {
-			tr.mu.Unlock()
-			return s.syncOpenContainer(session)
+			return false, "", 0, 0, 0, false
 		}
 		if len(dragSlots) == 1 && finalType != QuickCraftTypeClone {
 			singleSlot := dragSlots[0]
-			tr.mu.Unlock()
-			return s.HandleContainerClick(session, containerID, singleSlot, finalType, ContainerInputPickup)
+			if containerID == 0 {
+				_, mutated = s.applyPlayerInventoryClickDataLocked(session, tr, singleSlot, finalType, ContainerInputPickup)
+				return mutated, "", 0, 0, 0, false
+			}
+			if tr.open != nil && tr.open.ContainerID == containerID {
+				switch tr.open.MenuType {
+				case MenuTypeGeneric9x3, MenuTypeShulkerBox:
+					if tr.open.IsEnderChest {
+						_, mutated = s.applyEnderChestClickDataLocked(session, tr, singleSlot, finalType, ContainerInputPickup)
+					} else if tr.open.VehicleEntityID == 0 {
+						bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+						dim := tr.open.Dimension
+						if dim == "" {
+							dim = session.Dimension()
+						}
+						_, mutated = s.applyChestClickDataLocked(session, tr, bx, by, bz, singleSlot, finalType, ContainerInputPickup)
+						return mutated, dim, bx, by, bz, mutated
+					}
+					return mutated, "", 0, 0, 0, false
+				case MenuTypeGeneric9x6:
+					bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
+					px, py, pz := tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
+					dim := tr.open.Dimension
+					if dim == "" {
+						dim = session.Dimension()
+					}
+					_, mutated = s.applyDoubleChestClickDataLocked(session, tr, bx, by, bz, px, py, pz, singleSlot, finalType, ContainerInputPickup)
+					return mutated, dim, bx, by, bz, mutated
+				case MenuTypeCrafting:
+					_, mutated = s.applyCraftingTableClickDataLocked(session, tr, singleSlot, finalType, ContainerInputPickup)
+					return mutated, "", 0, 0, 0, false
+				}
+			}
 		}
 		if finalType == QuickCraftTypeClone && gm != GameModeCreative {
-			tr.mu.Unlock()
-			return s.syncOpenContainer(session)
+			return false, "", 0, 0, 0, false
 		}
-
 		s.applyQuickCraftDistributeLocked(session, tr, containerID, dragSlots, finalType)
-		tr.mu.Unlock()
-		s.TriggerInventoryChanged(session)
-		s.UnlockRecipesForInventory(session)
-		if containerID == 0 {
-			return s.syncPlayerInventoryContainer(session)
+		if containerID != 0 && tr.open != nil && tr.open.ContainerID == containerID &&
+			tr.open.VehicleEntityID == 0 && !tr.open.IsEnderChest &&
+			(tr.open.MenuType == MenuTypeGeneric9x3 || tr.open.MenuType == MenuTypeGeneric9x6 || tr.open.MenuType == MenuTypeShulkerBox) {
+			dim := tr.open.Dimension
+			if dim == "" {
+				dim = session.Dimension()
+			}
+			return true, dim, tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ, true
 		}
-		return s.syncOpenContainer(session)
+		return true, "", 0, 0, 0, false
 	}
 
 	tr.dragStatus = 0
 	tr.dragType = 0
 	tr.dragSlots = nil
+	return false, "", 0, 0, 0, false
+}
+
+func (s *Server) handleQuickCraftClickLocked(session *PlayerSession, tr *playerContainerTracker, containerID int32, slot int, button int8) error {
+	header := QuickcraftHeader(button)
+	oldStatus := tr.dragStatus
+	if header == QuickCraftHeaderEnd && oldStatus == 1 && !tr.carried.IsEmpty() && len(tr.dragSlots) == 1 && tr.dragType != QuickCraftTypeClone && containerID != 0 {
+		// Delegate single-slot non-supported menus (furnace/etc.) via HandleContainerClick.
+		singleSlot := tr.dragSlots[0]
+		finalType := tr.dragType
+		isSupported := tr.open != nil && tr.open.ContainerID == containerID && tr.open.VehicleEntityID == 0 &&
+			(tr.open.MenuType == MenuTypeGeneric9x3 || tr.open.MenuType == MenuTypeShulkerBox || tr.open.MenuType == MenuTypeGeneric9x6 || tr.open.MenuType == MenuTypeCrafting)
+		if !isSupported {
+			tr.dragStatus = 0
+			tr.dragType = 0
+			tr.dragSlots = nil
+			tr.mu.Unlock()
+			return s.HandleContainerClick(session, containerID, singleSlot, finalType, ContainerInputPickup)
+		}
+	}
+
+	mutated, _, sharedX, sharedY, sharedZ, hasShared := s.handleQuickCraftMutateLocked(session, tr, containerID, slot, button)
 	tr.mu.Unlock()
-	return nil
+	if !mutated {
+		if header == QuickCraftHeaderEnd {
+			return s.syncOpenContainer(session)
+		}
+		return nil
+	}
+	s.TriggerInventoryChanged(session)
+	s.UnlockRecipesForInventory(session)
+	if containerID == 0 {
+		return s.syncPlayerInventoryContainer(session)
+	}
+	if hasShared {
+		return s.syncChestViewers(session, sharedX, sharedY, sharedZ)
+	}
+	return s.syncOpenContainer(session)
 }
 
 func distributeQuickCraftOnSlice(slots []world.ItemStack, carried *world.ItemStack, dragSlots []int, dragType int8, slotMaxStack func(slot int, defaultMax int32) int32) {
@@ -5382,39 +7116,51 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 				tr.invCraft[i] = session.InventorySlot(1 + i)
 			}
 		}
-		slots := s.buildPlayerMenuSlots(session, tr.invCraft, tr.invResult)
-		carriedMeta := GetCarriedItemMeta(session)
-		carriedTrim, _ := GetCarriedArmorTrim(session)
-		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, func(sl int, def int32) int32 {
+		slots := s.buildPlayerMenuSlotData(session, tr)
+		orig := append([]containerSlotData(nil), slots...)
+		carried := getCarriedSlotDataLocked(session, tr)
+		distributeQuickCraftOnSlotData(slots, &carried, dragSlots, dragType, func(sl int, item containerSlotData) int32 {
 			if sl >= ArmorSlotHead && sl <= ArmorSlotFeet {
 				return 1
 			}
-			return def
+			return item.MaxStackSize()
 		})
-		for _, sl := range dragSlots {
-			if sl >= 1 && sl < world.PlayerInventorySlots && !slots[sl].IsEmpty() {
-				SetSlotItemMeta(session, sl, carriedMeta.Clone())
-				if carriedTrim.IsValid() {
-					SetSlotArmorTrim(session, sl, carriedTrim)
-				}
+		for i := 0; i < 4; i++ {
+			tr.invCraft[i] = slots[1+i].Stack
+			if slots[1+i].Star != nil {
+				tr.invCraftStars[i] = slots[1+i].Star.Clone()
+			} else if slots[1+i].IsEmpty() {
+				tr.invCraftStars[i] = FireworkExplosion{}
 			}
 		}
-		if tr.carried.IsEmpty() {
-			SetCarriedItemMeta(session, ItemMeta{})
-			SetCarriedArmorTrim(session, ArmorTrim{})
-		}
-		for i := 0; i < 4; i++ {
-			tr.invCraft[i] = slots[1+i]
-		}
-		if res, _, _, ok := matchCraftingWithFireworks(tr.invCraft[:], 2, 2, tr.invCraftStars[:]); ok {
+		if res, starExp, fwComp, ok := matchCraftingWithFireworks(tr.invCraft[:], 2, 2, tr.invCraftStars[:]); ok {
 			tr.invResult = res
+			if starExp != nil {
+				SetSlotFireworkStar(session, 0, *starExp)
+				ClearSlotFireworks(session, 0)
+			} else if fwComp != nil {
+				SetSlotFireworks(session, 0, *fwComp)
+				ClearSlotFireworkStar(session, 0)
+			} else {
+				ClearSlotFireworkStar(session, 0)
+				ClearSlotFireworks(session, 0)
+			}
 		} else {
 			tr.invResult = world.ItemStack{}
+			ClearSlotFireworkStar(session, 0)
+			ClearSlotFireworks(session, 0)
 		}
-		slots[0] = tr.invResult
+		slots[0] = containerSlotData{Stack: tr.invResult}
 		for i := 0; i < world.PlayerInventorySlots; i++ {
-			session.SetInventorySlot(i, slots[i])
+			if i == 0 {
+				session.SetInventorySlot(0, tr.invResult)
+				continue
+			}
+			if !slots[i].SameItemSameComponents(orig[i]) || slots[i].Stack.Count != orig[i].Stack.Count {
+				setPlayerSlotData(session, i, slots[i])
+			}
 		}
+		setCarriedSlotDataLocked(session, tr, carried)
 		return
 	}
 
@@ -5439,17 +7185,26 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 			return
 		}
 		if tr.open.IsEnderChest {
-			slots := s.buildEnderChestMenuSlots(session)
-			distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+			slots := s.buildEnderChestMenuSlotData(session, tr)
+			orig := append([]containerSlotData(nil), slots...)
+			carried := getCarriedSlotDataLocked(session, tr)
+			distributeQuickCraftOnSlotData(slots, &carried, dragSlots, dragType, nil)
 			for i := 0; i < ChestSlotCount; i++ {
-				tr.enderChest[i] = slots[i]
+				tr.enderChest[i] = slots[i].Stack
 			}
 			for i := 0; i < 27; i++ {
-				session.SetInventorySlot(9+i, slots[27+i])
+				idx := 27 + i
+				if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+					setPlayerSlotData(session, 9+i, slots[idx])
+				}
 			}
 			for i := 0; i < 9; i++ {
-				session.SetInventorySlot(36+i, slots[54+i])
+				idx := 54 + i
+				if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+					setPlayerSlotData(session, 36+i, slots[idx])
+				}
 			}
+			setCarriedSlotDataLocked(session, tr, carried)
 			return
 		}
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
@@ -5457,17 +7212,28 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 		if openDim == "" && session != nil {
 			openDim = session.Dimension()
 		}
-		slots := s.buildChestMenuSlotsInDim(session, openDim, bx, by, bz)
-		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		slots := s.buildChestMenuSlotDataInDim(session, openDim, bx, by, bz)
+		orig := append([]containerSlotData(nil), slots...)
+		carried := getCarriedSlotDataLocked(session, tr)
+		distributeQuickCraftOnSlotData(slots, &carried, dragSlots, dragType, nil)
 		for i := 0; i < ChestSlotCount; i++ {
-			s.SetChestSlotInDim(openDim, bx, by, bz, i, slots[i])
+			if !slots[i].SameItemSameComponents(orig[i]) || slots[i].Stack.Count != orig[i].Stack.Count {
+				s.setStorageSlotData(openDim, bx, by, bz, i, slots[i])
+			}
 		}
 		for i := 0; i < 27; i++ {
-			session.SetInventorySlot(9+i, slots[27+i])
+			idx := 27 + i
+			if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+				setPlayerSlotData(session, 9+i, slots[idx])
+			}
 		}
 		for i := 0; i < 9; i++ {
-			session.SetInventorySlot(36+i, slots[54+i])
+			idx := 54 + i
+			if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+				setPlayerSlotData(session, 36+i, slots[idx])
+			}
 		}
+		setCarriedSlotDataLocked(session, tr, carried)
 	case MenuTypeGeneric9x6:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		px, py, pz := tr.open.PartnerX, tr.open.PartnerY, tr.open.PartnerZ
@@ -5475,35 +7241,87 @@ func (s *Server) applyQuickCraftDistributeLocked(session *PlayerSession, tr *pla
 		if openDim == "" && session != nil {
 			openDim = session.Dimension()
 		}
-		slots := s.buildDoubleChestMenuSlotsInDim(session, openDim, bx, by, bz, px, py, pz)
-		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		slots := s.buildDoubleChestMenuSlotDataInDim(session, openDim, bx, by, bz, px, py, pz)
+		orig := append([]containerSlotData(nil), slots...)
+		carried := getCarriedSlotDataLocked(session, tr)
+		distributeQuickCraftOnSlotData(slots, &carried, dragSlots, dragType, nil)
 		for i := 0; i < ChestSlotCount; i++ {
-			s.SetChestSlotInDim(openDim, bx, by, bz, i, slots[i])
-			s.SetChestSlotInDim(openDim, px, py, pz, i, slots[ChestSlotCount+i])
+			if !slots[i].SameItemSameComponents(orig[i]) || slots[i].Stack.Count != orig[i].Stack.Count {
+				s.setStorageSlotData(openDim, bx, by, bz, i, slots[i])
+			}
+			hi := ChestSlotCount + i
+			if !slots[hi].SameItemSameComponents(orig[hi]) || slots[hi].Stack.Count != orig[hi].Stack.Count {
+				s.setStorageSlotData(openDim, px, py, pz, i, slots[hi])
+			}
 		}
 		for i := 0; i < 27; i++ {
-			session.SetInventorySlot(9+i, slots[54+i])
+			idx := 54 + i
+			if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+				setPlayerSlotData(session, 9+i, slots[idx])
+			}
 		}
 		for i := 0; i < 9; i++ {
-			session.SetInventorySlot(36+i, slots[81+i])
+			idx := 81 + i
+			if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+				setPlayerSlotData(session, 36+i, slots[idx])
+			}
 		}
+		setCarriedSlotDataLocked(session, tr, carried)
 	case MenuTypeCrafting:
-		slots := s.buildCraftingMenuSlots(session, tr.open.Crafting, tr.open.Result)
-		distributeQuickCraftOnSlice(slots, &tr.carried, dragSlots, dragType, nil)
+		slots := s.buildCraftingMenuSlotData(session, tr.open)
+		orig := append([]containerSlotData(nil), slots...)
+		carried := getCarriedSlotDataLocked(session, tr)
+		distributeQuickCraftOnSlotData(slots, &carried, dragSlots, dragType, nil)
+		newGrid := make([]world.ItemStack, CraftingGridSlotCount)
+		newStars := make([]FireworkExplosion, CraftingGridSlotCount)
 		for i := 0; i < CraftingGridSlotCount; i++ {
-			tr.open.Crafting[i] = slots[1+i]
+			d := slots[1+i]
+			tr.open.CraftingSlots[i] = d.Clone()
+			tr.open.Crafting[i] = d.Stack
+			newGrid[i] = d.Stack
+			if d.IsEmpty() || !IsPotionOrTippedArrowItem(d.Stack) {
+				tr.open.CraftingPotions[i] = ""
+			} else {
+				tr.open.CraftingPotions[i] = d.Potion
+			}
+			if d.Star != nil && d.Stack.ResolvedID() == FireworkStarItemID {
+				cp := d.Star.Clone()
+				tr.open.CraftingStars[i] = cp
+				newStars[i] = cp
+			} else {
+				tr.open.CraftingStars[i] = FireworkExplosion{}
+			}
 		}
-		if res, _, _, ok := matchCraftingWithFireworks(tr.open.Crafting[:], 3, 3, tr.open.CraftingStars[:]); ok {
+		if res, starExp, fwComp, ok := matchCraftingWithFireworks(newGrid, 3, 3, newStars); ok {
 			tr.open.Result = res
+			if starExp != nil {
+				SetSlotFireworkStar(session, 0, *starExp)
+				ClearSlotFireworks(session, 0)
+			} else if fwComp != nil {
+				SetSlotFireworks(session, 0, *fwComp)
+				ClearSlotFireworkStar(session, 0)
+			} else {
+				ClearSlotFireworkStar(session, 0)
+				ClearSlotFireworks(session, 0)
+			}
 		} else {
 			tr.open.Result = world.ItemStack{}
+			ClearSlotFireworkStar(session, 0)
+			ClearSlotFireworks(session, 0)
 		}
 		for i := 0; i < 27; i++ {
-			session.SetInventorySlot(9+i, slots[10+i])
+			idx := 10 + i
+			if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+				setPlayerSlotData(session, 9+i, slots[idx])
+			}
 		}
 		for i := 0; i < 9; i++ {
-			session.SetInventorySlot(36+i, slots[37+i])
+			idx := 37 + i
+			if !slots[idx].SameItemSameComponents(orig[idx]) || slots[idx].Stack.Count != orig[idx].Stack.Count {
+				setPlayerSlotData(session, 36+i, slots[idx])
+			}
 		}
+		setCarriedSlotDataLocked(session, tr, carried)
 	case MenuTypeFurnace, MenuTypeBlastFurnace, MenuTypeSmoker:
 		bx, by, bz := tr.open.BlockX, tr.open.BlockY, tr.open.BlockZ
 		slots := s.buildFurnaceMenuSlots(session, bx, by, bz)

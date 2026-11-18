@@ -1146,7 +1146,7 @@ func (s *Server) UnregisterPlayer(session *PlayerSession) {
 	s.DespawnPlayerFishingBobber(session)
 	s.WakePlayerFromBed(session)
 	s.DismountPlayerVehicle(session)
-	_ = s.CloseContainer(session, 0, false)
+	_ = s.closeContainerInternal(session, 0, false, true)
 	removed := false
 	s.playersMu.Lock()
 	if current := s.players[session.Profile.UUID]; current == session {
@@ -2023,17 +2023,15 @@ func (session *PlayerSession) HeldItem() world.ItemStack {
 	return session.inventory[sel]
 }
 
-// NextContainerStateID increments and returns the container state sequence ID.
+// NextContainerStateID increments and returns the container state sequence ID
+// matching vanilla AbstractContainerMenu.incrementStateId ((stateId + 1) & 32767).
 func (session *PlayerSession) NextContainerStateID() int32 {
 	if session == nil {
 		return 1
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	session.containerStateID++
-	if session.containerStateID <= 0 {
-		session.containerStateID = 1
-	}
+	session.containerStateID = (session.containerStateID + 1) & 0x7fff
 	return session.containerStateID
 }
 
