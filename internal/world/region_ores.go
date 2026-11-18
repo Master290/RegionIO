@@ -21,7 +21,7 @@ func (r *decorationRegion) placeScheduledUndergroundOresStage(seed int64) error 
 		return err
 	}
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
-	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
+	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: r.genMinY(), Z: int(r.sourceZ) << 4}
 	magma, magmaOK := nameToStateID("minecraft:magma_block", nil)
 	for _, scheduled := range schedule {
 		placed, ok := set.Placed[scheduled.Name]
@@ -107,7 +107,7 @@ func (r *decorationRegion) placeScheduledOresFiltered(seed int64, biomeOrder []s
 		return err
 	}
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
-	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
+	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: r.genMinY(), Z: int(r.sourceZ) << 4}
 	for _, scheduled := range schedule {
 		if include != nil && !include[scheduled.Name] {
 			continue
@@ -155,8 +155,10 @@ func placeOreEllipsoidRegion(region *decorationRegion, random worldgen.RandomSou
 	}
 	var sphereBuf [64]oreSphere
 	spheres := buildOreSpheresInto(random, setup, sphereBuf[:0])
+	minY := region.minY()
+	maxYExcl := minY + region.worldHeight()
 	walkOreBlocks(spheres, func(x, y, z int) {
-		if y < MinY || y >= MinY+WorldHeight {
+		if y < minY || y >= maxYExcl {
 			return
 		}
 		current := region.getBlock(x, y, z)

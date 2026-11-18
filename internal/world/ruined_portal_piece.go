@@ -105,9 +105,13 @@ func placeRuinedPortalChunk(region *decorationRegion, stub *RuinedPortalStub, se
 	blocks []worldgen.TemplateBlockInfo, size [3]int, mirror string, pivot [3]int,
 	minX, minY, minZ, maxX, maxY, maxZ int) error {
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(chunkX), int(chunkZ))
-	portalIndex := worldgen.StructureIndexInStep("ruined_portal")
+	structKey := "ruined_portal"
+	if stub != nil && stub.StructureName != "" {
+		structKey = strings.TrimPrefix(stub.StructureName, "minecraft:")
+	}
+	portalIndex := worldgen.StructureIndexInStep(structKey)
 	portalStep := surfaceStructuresStep
-	if s, ok := worldgen.StructureStepOverride("ruined_portal"); ok {
+	if s, ok := worldgen.StructureStepOverride(structKey); ok {
 		portalStep = s
 	}
 	random.SetFeatureSeed(decorationSeed, portalIndex, portalStep)

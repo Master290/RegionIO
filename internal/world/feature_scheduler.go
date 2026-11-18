@@ -242,33 +242,7 @@ func (r *decorationRegion) isNetherRegion() bool {
 }
 
 func (r *decorationRegion) replayScheduledNetherWithSources(od *worldgen.OverworldDensity, seed int64, targetX, targetZ int32, sources []decorationSource) error {
-	if err := r.placeScheduledStructures(od, seed, targetX, targetZ); err != nil {
-		return fmt.Errorf("world: nether structure starts (%d,%d): %w", targetX, targetZ, err)
-	}
-	nreg := &netherRegion{
-		centerX:  targetX,
-		centerZ:  targetZ,
-		chunkMap: r.chunks,
-	}
-	biomeGrids := make(map[[2]int32]*[16][16]string, len(r.chunks))
-	for key, c := range r.chunks {
-		if c != nil {
-			biomeGrids[key] = extractNetherChunkBiomes(c, od)
-		}
-	}
-	for _, source := range sources {
-		if err := r.setSource(source.X, source.Z); err != nil {
-			return err
-		}
-		grid := biomeGrids[[2]int32{source.X, source.Z}]
-		if grid == nil {
-			if c := r.chunks[[2]int32{source.X, source.Z}]; c != nil {
-				grid = extractNetherChunkBiomes(c, od)
-			}
-		}
-		decorateNetherRegionSource(nreg, source.X, source.Z, seed, grid)
-	}
-	return nil
+	return r.replayNetherDecoration(od, seed, targetX, targetZ, sources)
 }
 
 // replayScheduledOresWithSources is replayScheduledOres with the source order supplied,

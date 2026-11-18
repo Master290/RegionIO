@@ -87,7 +87,13 @@ const dataVersion26 = 4790
 // LeavesBlock tick settlement, FallenTreeFeature.placeLogBlock
 // markAboveForPostProcessing on stumps and fallen logs, and position-aware
 // SampleStateAt forwarding in sampleOptionalStateProvider (vanilla 26.1.2).
-const generatorVersion = 64
+// Version 65: Nether biome decoration parity (crimson_forest, warped_forest,
+// basalt_deltas, soul_sand_valley): 5x5 FeatureSorter stage replay (2/4/7/9)
+// over a 7x7 terrain window, exact BlockPos.withinManhattan order,
+// count_on_every_layer, biased_to_bottom, block_match, single-string
+// valid_blocks, dimension height/fast_lava springs, nether_fossil beard_thin
+// and cross-chunk placement (vanilla 26.1.2).
+const generatorVersion = 65
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

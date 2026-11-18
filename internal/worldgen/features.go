@@ -128,6 +128,7 @@ type OreTarget struct {
 	Target struct {
 		PredicateType string `json:"predicate_type"`
 		Tag           string `json:"tag"`
+		Block         string `json:"block"`
 	} `json:"target"`
 }
 
@@ -472,6 +473,45 @@ type SpringFeatureConfig struct {
 	RockCount          int        `json:"rock_count"`
 	State              BlockState `json:"state"`
 	ValidBlocks        []string   `json:"valid_blocks"`
+}
+
+type ReplaceBlobsFeatureConfig struct {
+	Target BlockState
+	State  BlockState
+	Radius CountProvider
+}
+
+type DeltaFeatureConfig struct {
+	Contents BlockState
+	Rim      BlockState
+	Size     CountProvider
+	RimSize  CountProvider
+}
+
+type BasaltColumnsFeatureConfig struct {
+	Reach  CountProvider
+	Height CountProvider
+}
+
+type HugeFungusFeatureConfig struct {
+	ValidBaseBlock    BlockState
+	StemState         BlockState
+	HatState          BlockState
+	DecorState        BlockState
+	ReplaceableBlocks json.RawMessage
+	Planted           bool
+}
+
+type NetherForestVegetationConfig struct {
+	StateProvider StateProviderSpec
+	SpreadWidth   int
+	SpreadHeight  int
+}
+
+type TwistingVinesFeatureConfig struct {
+	SpreadWidth  int `json:"spread_width"`
+	SpreadHeight int `json:"spread_height"`
+	MaxHeight    int `json:"max_height"`
 }
 
 // TreeFeatureConfig mirrors TreeConfiguration, whose fields `javap -p` lists as
@@ -1085,12 +1125,14 @@ type PlacementContext struct {
 	MinY, Height   int
 	BiomeAllows    func(FeaturePosition) bool
 	HeightAt       func(string, int, int) int
+	FindOnGroundY  func(x, startY, z, targetLayer int) int
 	BlockPredicate func(json.RawMessage, FeaturePosition) (bool, error)
 }
 
 type CountProvider struct {
-	Min, Max int
-	Weighted []WeightedInt
+	Min, Max       int
+	Weighted       []WeightedInt
+	BiasedToBottom bool
 	// ClampedTo names the clamped provider's inner source (a plain
 	// provider), clamped to [Min, Max] after its draw.
 	ClampedTo *CountProvider
@@ -1133,6 +1175,13 @@ func (p CountProvider) Sample(r RandomSource) int {
 			}
 			roll -= entry.Weight
 		}
+	}
+	if p.BiasedToBottom {
+		if p.Max < p.Min {
+			return p.Min
+		}
+		first := int(r.NextIntN(int32(p.Max - p.Min + 1)))
+		return p.Min + int(r.NextIntN(int32(first+1)))
 	}
 	if p.Max <= p.Min {
 		return p.Min
@@ -1990,15 +2039,236 @@ func (s *FeatureSet) Spring(name string) (SpringFeatureConfig, error) {
 	if !ok || configured.Type != "minecraft:spring_feature" {
 		return SpringFeatureConfig{}, fmt.Errorf("worldgen: %s is not a spring feature", name)
 	}
-	var config SpringFeatureConfig
-	if err := json.Unmarshal(configured.Config, &config); err != nil {
+	var raw struct {
+		HoleCount          int             `json:"hole_count"`
+		RequiresBlockBelow bool            `json:"requires_block_below"`
+		RockCount          int             `json:"rock_count"`
+		State              BlockState      `json:"state"`
+		ValidBlocks        json.RawMessage `json:"valid_blocks"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
 		return SpringFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	var validBlocks []string
+	if err := json.Unmarshal(raw.ValidBlocks, &validBlocks); err != nil {
+		var single string
+		if err2 := json.Unmarshal(raw.ValidBlocks, &single); err2 != nil {
+			return SpringFeatureConfig{}, fmt.Errorf("worldgen: decode %s valid_blocks: %w", name, err)
+		}
+		validBlocks = []string{single}
+	}
+	config := SpringFeatureConfig{
+		HoleCount:          raw.HoleCount,
+		RequiresBlockBelow: raw.RequiresBlockBelow,
+		RockCount:          raw.RockCount,
+		State:              raw.State,
+		ValidBlocks:        validBlocks,
 	}
 	if config.State.Name == "" || len(config.ValidBlocks) == 0 || config.HoleCount < 0 || config.RockCount < 0 {
 		return SpringFeatureConfig{}, fmt.Errorf("worldgen: invalid spring config %s", name)
 	}
 	s.setCachedConfig("spring", name, config)
 	return config, nil
+}
+
+// ScatteredOre parses a minecraft:scattered_ore configured feature.
+func (s *FeatureSet) ScatteredOre(name string) (OreFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("scattered_ore", name); ok {
+		return v.(OreFeatureConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:scattered_ore" {
+		return OreFeatureConfig{}, fmt.Errorf("worldgen: %s is not a scattered ore feature", name)
+	}
+	var config OreFeatureConfig
+	if err := json.Unmarshal(configured.Config, &config); err != nil {
+		return OreFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if config.Size < 1 || len(config.Targets) == 0 {
+		return OreFeatureConfig{}, fmt.Errorf("worldgen: invalid scattered ore config %s", name)
+	}
+	s.setCachedConfig("scattered_ore", name, config)
+	return config, nil
+}
+
+// ReplaceBlobs parses a minecraft:netherrack_replace_blobs configured feature.
+func (s *FeatureSet) ReplaceBlobs(name string) (ReplaceBlobsFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("replace_blobs", name); ok {
+		return v.(ReplaceBlobsFeatureConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:netherrack_replace_blobs" {
+		return ReplaceBlobsFeatureConfig{}, fmt.Errorf("worldgen: %s is not a replace blobs feature", name)
+	}
+	var raw struct {
+		Target BlockState      `json:"target"`
+		State  BlockState      `json:"state"`
+		Radius json.RawMessage `json:"radius"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return ReplaceBlobsFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	radius, err := parseIntProvider(raw.Radius)
+	if err != nil {
+		return ReplaceBlobsFeatureConfig{}, fmt.Errorf("worldgen: %s radius: %w", name, err)
+	}
+	cfg := ReplaceBlobsFeatureConfig{
+		Target: raw.Target,
+		State:  raw.State,
+		Radius: radius,
+	}
+	s.setCachedConfig("replace_blobs", name, cfg)
+	return cfg, nil
+}
+
+// Delta parses a minecraft:delta_feature configured feature.
+func (s *FeatureSet) Delta(name string) (DeltaFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("delta", name); ok {
+		return v.(DeltaFeatureConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:delta_feature" {
+		return DeltaFeatureConfig{}, fmt.Errorf("worldgen: %s is not a delta feature", name)
+	}
+	var raw struct {
+		Contents BlockState      `json:"contents"`
+		Rim      BlockState      `json:"rim"`
+		Size     json.RawMessage `json:"size"`
+		RimSize  json.RawMessage `json:"rim_size"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return DeltaFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	size, err := parseIntProvider(raw.Size)
+	if err != nil {
+		return DeltaFeatureConfig{}, fmt.Errorf("worldgen: %s size: %w", name, err)
+	}
+	rimSize, err := parseIntProvider(raw.RimSize)
+	if err != nil {
+		return DeltaFeatureConfig{}, fmt.Errorf("worldgen: %s rim_size: %w", name, err)
+	}
+	cfg := DeltaFeatureConfig{
+		Contents: raw.Contents,
+		Rim:      raw.Rim,
+		Size:     size,
+		RimSize:  rimSize,
+	}
+	s.setCachedConfig("delta", name, cfg)
+	return cfg, nil
+}
+
+// BasaltColumns parses a minecraft:basalt_columns configured feature.
+func (s *FeatureSet) BasaltColumns(name string) (BasaltColumnsFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("basalt_columns", name); ok {
+		return v.(BasaltColumnsFeatureConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:basalt_columns" {
+		return BasaltColumnsFeatureConfig{}, fmt.Errorf("worldgen: %s is not a basalt columns feature", name)
+	}
+	var raw struct {
+		Reach  json.RawMessage `json:"reach"`
+		Height json.RawMessage `json:"height"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return BasaltColumnsFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	reach, err := parseIntProvider(raw.Reach)
+	if err != nil {
+		return BasaltColumnsFeatureConfig{}, fmt.Errorf("worldgen: %s reach: %w", name, err)
+	}
+	height, err := parseIntProvider(raw.Height)
+	if err != nil {
+		return BasaltColumnsFeatureConfig{}, fmt.Errorf("worldgen: %s height: %w", name, err)
+	}
+	cfg := BasaltColumnsFeatureConfig{
+		Reach:  reach,
+		Height: height,
+	}
+	s.setCachedConfig("basalt_columns", name, cfg)
+	return cfg, nil
+}
+
+// HugeFungus parses a minecraft:huge_fungus configured feature.
+func (s *FeatureSet) HugeFungus(name string) (HugeFungusFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("huge_fungus", name); ok {
+		return v.(HugeFungusFeatureConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:huge_fungus" {
+		return HugeFungusFeatureConfig{}, fmt.Errorf("worldgen: %s is not a huge fungus feature", name)
+	}
+	var raw struct {
+		ValidBaseBlock    BlockState      `json:"valid_base_block"`
+		StemState         BlockState      `json:"stem_state"`
+		HatState          BlockState      `json:"hat_state"`
+		DecorState        BlockState      `json:"decor_state"`
+		ReplaceableBlocks json.RawMessage `json:"replaceable_blocks"`
+		Planted           bool            `json:"planted"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return HugeFungusFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	cfg := HugeFungusFeatureConfig{
+		ValidBaseBlock:    raw.ValidBaseBlock,
+		StemState:         raw.StemState,
+		HatState:          raw.HatState,
+		DecorState:        raw.DecorState,
+		ReplaceableBlocks: raw.ReplaceableBlocks,
+		Planted:           raw.Planted,
+	}
+	s.setCachedConfig("huge_fungus", name, cfg)
+	return cfg, nil
+}
+
+// NetherForestVegetation parses a minecraft:nether_forest_vegetation configured feature.
+func (s *FeatureSet) NetherForestVegetation(name string) (NetherForestVegetationConfig, error) {
+	if v, ok := s.getCachedConfig("nether_forest_vegetation", name); ok {
+		return v.(NetherForestVegetationConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:nether_forest_vegetation" {
+		return NetherForestVegetationConfig{}, fmt.Errorf("worldgen: %s is not a nether forest vegetation feature", name)
+	}
+	var raw struct {
+		StateProvider json.RawMessage `json:"state_provider"`
+		SpreadWidth   int             `json:"spread_width"`
+		SpreadHeight  int             `json:"spread_height"`
+	}
+	if err := json.Unmarshal(configured.Config, &raw); err != nil {
+		return NetherForestVegetationConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	sp, err := s.StateProvider(raw.StateProvider)
+	if err != nil {
+		return NetherForestVegetationConfig{}, fmt.Errorf("worldgen: %s state_provider: %w", name, err)
+	}
+	cfg := NetherForestVegetationConfig{
+		StateProvider: sp,
+		SpreadWidth:   raw.SpreadWidth,
+		SpreadHeight:  raw.SpreadHeight,
+	}
+	s.setCachedConfig("nether_forest_vegetation", name, cfg)
+	return cfg, nil
+}
+
+// TwistingVines parses a minecraft:twisting_vines configured feature.
+func (s *FeatureSet) TwistingVines(name string) (TwistingVinesFeatureConfig, error) {
+	if v, ok := s.getCachedConfig("twisting_vines", name); ok {
+		return v.(TwistingVinesFeatureConfig), nil
+	}
+	configured, ok := s.LookupConfigured(name)
+	if !ok || configured.Type != "minecraft:twisting_vines" {
+		return TwistingVinesFeatureConfig{}, fmt.Errorf("worldgen: %s is not a twisting vines feature", name)
+	}
+	var cfg TwistingVinesFeatureConfig
+	if err := json.Unmarshal(configured.Config, &cfg); err != nil {
+		return TwistingVinesFeatureConfig{}, fmt.Errorf("worldgen: decode %s: %w", name, err)
+	}
+	if cfg.SpreadWidth < 1 || cfg.SpreadHeight < 1 || cfg.MaxHeight < 1 {
+		return TwistingVinesFeatureConfig{}, fmt.Errorf("worldgen: invalid twisting vines config %s", name)
+	}
+	s.setCachedConfig("twisting_vines", name, cfg)
+	return cfg, nil
 }
 
 // trunkPlacerSpec and foliagePlacerSpec are the field sets of every placer type,
@@ -3122,7 +3392,7 @@ func compilePlacementModifier(typ string, raw json.RawMessage) *parsedPlacementM
 			p.noiseFactor = value.Factor
 			p.noiseOffset = value.Offset
 		}
-	case "minecraft:count":
+	case "minecraft:count", "minecraft:count_on_every_layer":
 		var value struct {
 			Count json.RawMessage `json:"count"`
 		}
@@ -3288,6 +3558,41 @@ func applyPlacementModifiers(name string, modifiers []PlacementModifier, index i
 		}
 		for n := p.count.Sample(r); n > 0; n-- {
 			if err := applyPlacementModifiers(name, modifiers, index+1, position, r, context, visit); err != nil {
+				return err
+			}
+		}
+		return nil
+	case "minecraft:count_on_every_layer":
+		if !p.valid {
+			return p.err
+		}
+		if context.HeightAt == nil {
+			return fmt.Errorf("worldgen: %s count_on_every_layer requires HeightAt", name)
+		}
+		if context.FindOnGroundY == nil {
+			return fmt.Errorf("worldgen: %s count_on_every_layer requires FindOnGroundY", name)
+		}
+		// CountOnEveryLayerPlacement collects all ground layers into a Stream before
+		// running downstream modifiers (BiomeFilter) and the configured feature.
+		var positions []FeaturePosition
+		for targetLayer := 0; ; targetLayer++ {
+			foundOnLayer := false
+			for i := 0; i < p.count.Sample(r); i++ {
+				x := position.X + int(r.NextIntN(16))
+				z := position.Z + int(r.NextIntN(16))
+				topY := context.HeightAt("MOTION_BLOCKING", x, z)
+				y := context.FindOnGroundY(x, topY, z, targetLayer)
+				if y != math.MaxInt32 {
+					positions = append(positions, FeaturePosition{X: x, Y: y, Z: z})
+					foundOnLayer = true
+				}
+			}
+			if !foundOnLayer {
+				break
+			}
+		}
+		for _, pos := range positions {
+			if err := applyPlacementModifiers(name, modifiers, index+1, pos, r, context, visit); err != nil {
 				return err
 			}
 		}
@@ -3580,8 +3885,15 @@ func parseIntProvider(raw json.RawMessage) (CountProvider, error) {
 		Min  int    `json:"min_inclusive"`
 		Max  int    `json:"max_inclusive"`
 	}
-	if err := json.Unmarshal(raw, &uniform); err == nil && uniform.Type == "minecraft:uniform" {
-		return CountProvider{Min: uniform.Min, Max: uniform.Max}, nil
+	if err := json.Unmarshal(raw, &uniform); err == nil && (uniform.Type == "minecraft:uniform" || uniform.Type == "minecraft:biased_to_bottom") {
+		if uniform.Max < uniform.Min {
+			return CountProvider{}, fmt.Errorf("invalid %s provider %s", uniform.Type, raw)
+		}
+		return CountProvider{
+			Min:            uniform.Min,
+			Max:            uniform.Max,
+			BiasedToBottom: uniform.Type == "minecraft:biased_to_bottom",
+		}, nil
 	}
 	var weighted struct {
 		Type         string `json:"type"`

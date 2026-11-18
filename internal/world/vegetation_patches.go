@@ -743,8 +743,14 @@ func (r *decorationRegion) clearPreStageGlowLichen() {
 }
 
 func (r *decorationRegion) canVegetationSurvive(position worldgen.FeaturePosition, name string, set *worldgen.FeatureSet) bool {
-	if position.Y <= MinY {
+	if position.Y <= r.minY() {
 		return false
+	}
+	switch name {
+	case "minecraft:crimson_roots", "minecraft:warped_roots", "minecraft:nether_sprouts",
+		"minecraft:crimson_fungus", "minecraft:warped_fungus",
+		"minecraft:brown_mushroom", "minecraft:red_mushroom":
+		return r.simpleBlockCanSurvive(position, name, set)
 	}
 	below := r.getBlock(position.X, position.Y-1, position.Z)
 	if name == "minecraft:moss_carpet" || name == "minecraft:pale_moss_carpet" {

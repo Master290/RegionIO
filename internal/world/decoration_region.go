@@ -3,6 +3,7 @@ package world
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"regionio/internal/worldgen"
 )
@@ -161,8 +162,37 @@ func (r *decorationRegion) chunkAtBlock(x, z int) *Chunk {
 	return r.chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
 }
 
+func (r *decorationRegion) minY() int {
+	if r != nil && r.isNetherRegion() {
+		return netherMinY
+	}
+	return MinY
+}
+
+func (r *decorationRegion) worldHeight() int {
+	if r != nil && r.isNetherRegion() {
+		return NetherDimensionType.Height
+	}
+	return WorldHeight
+}
+
+func (r *decorationRegion) genMinY() int {
+	if r != nil && r.isNetherRegion() {
+		return netherMinY
+	}
+	return MinY
+}
+
+func (r *decorationRegion) genHeight() int {
+	if r != nil && r.isNetherRegion() {
+		return netherHeight
+	}
+	return WorldHeight
+}
+
 func (r *decorationRegion) getBlock(x, y, z int) uint16 {
-	if y < MinY || y >= MinY+WorldHeight {
+	minY := r.minY()
+	if y < minY || y >= minY+r.worldHeight() {
 		return StateAir
 	}
 	chunk := r.chunkAtBlock(x, z)
@@ -173,7 +203,8 @@ func (r *decorationRegion) getBlock(x, y, z int) uint16 {
 }
 
 func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
-	if y < MinY || y >= MinY+WorldHeight {
+	minY := r.minY()
+	if y < minY || y >= minY+r.worldHeight() {
 		return false
 	}
 	cx, cz := int32(x>>4), int32(z>>4)
@@ -201,7 +232,8 @@ func (r *decorationRegion) setBlock(x, y, z int, state uint16) bool {
 // (mineshaft pieces reach many chunks from their start), clipped by their
 // own chunk-box logic.
 func (r *decorationRegion) setBlockGlobal(x, y, z int, state uint16) bool {
-	if y < MinY || y >= MinY+WorldHeight {
+	minY := r.minY()
+	if y < minY || y >= minY+r.worldHeight() {
 		return false
 	}
 	chunk := r.chunks[[2]int32{int32(x >> 4), int32(z >> 4)}]
@@ -248,7 +280,7 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 	case "WORLD_SURFACE_WG", "OCEAN_FLOOR_WG":
 		frozen := r.worldgen[[2]int32{int32(x >> 4), int32(z >> 4)}]
 		if frozen == nil {
-			return MinY
+			return r.minY()
 		}
 		if kind == "WORLD_SURFACE_WG" {
 			return int(frozen.surface[(z&15)*16+(x&15)])
@@ -257,7 +289,7 @@ func (r *decorationRegion) heightAt(kind string, x, z int) int {
 	}
 	chunk := r.chunkAtBlock(x, z)
 	if chunk == nil {
-		return MinY
+		return r.minY()
 	}
 	minY := chunk.minY()
 	maxY := minY + chunk.worldHeight() - 1
@@ -388,6 +420,14 @@ func (r *decorationRegion) sourceBiomes() []string {
 	return names
 }
 
+var netherBiomeOrder = []string{
+	"minecraft:nether_wastes",
+	"minecraft:soul_sand_valley",
+	"minecraft:crimson_forest",
+	"minecraft:warped_forest",
+	"minecraft:basalt_deltas",
+}
+
 func (r *decorationRegion) scheduledFeatures(stage int) ([]worldgen.ScheduledFeature, error) {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
@@ -396,7 +436,11 @@ func (r *decorationRegion) scheduledFeatures(stage int) ([]worldgen.ScheduledFea
 	if err := r.ensureSourceNeighborhood(); err != nil {
 		return nil, err
 	}
-	return set.FeatureSchedule(possibleBiomeOrder(), r.sourceBiomes(), stage)
+	biomeOrder := possibleBiomeOrder()
+	if r.isNetherRegion() {
+		biomeOrder = netherBiomeOrder
+	}
+	return set.FeatureSchedule(biomeOrder, r.sourceBiomes(), stage)
 }
 
 func (r *decorationRegion) ensureSourceNeighborhood() error {
@@ -410,16 +454,38 @@ func (r *decorationRegion) ensureSourceNeighborhood() error {
 	return nil
 }
 
+func isCountLayerEmpty(state uint16) bool {
+	return isAirState(state) || blockNameEquals(state, "minecraft:water") || isLavaState(state)
+}
+
+func (r *decorationRegion) findOnGroundYPosition(x, startY, z, targetLayer int) int {
+	found := 0
+	above := r.getBlock(x, startY, z)
+	minYPlus1 := r.genMinY() + 1
+	for y := startY; y >= minYPlus1; y-- {
+		below := r.getBlock(x, y-1, z)
+		if !isCountLayerEmpty(below) && isCountLayerEmpty(above) && !blockNameEquals(below, "minecraft:bedrock") {
+			if found == targetLayer {
+				return y
+			}
+			found++
+		}
+		above = below
+	}
+	return math.MaxInt32
+}
+
 func (r *decorationRegion) placementContext(biomeAllows func(worldgen.FeaturePosition) bool) worldgen.PlacementContext {
 	set, err := worldgen.LoadFeatureSet()
 	if err != nil {
 		panic("world: loading feature datapack: " + err.Error())
 	}
 	return worldgen.PlacementContext{
-		MinY:        MinY,
-		Height:      WorldHeight,
-		BiomeAllows: biomeAllows,
-		HeightAt:    r.heightAt,
+		MinY:          r.genMinY(),
+		Height:        r.genHeight(),
+		BiomeAllows:   biomeAllows,
+		HeightAt:      r.heightAt,
+		FindOnGroundY: r.findOnGroundYPosition,
 		BlockPredicate: func(predicate json.RawMessage, position worldgen.FeaturePosition) (bool, error) {
 			return r.testBlockPredicate(set, predicate, position)
 		},
@@ -434,7 +500,11 @@ func abs32(value int32) int32 {
 }
 
 func (r *decorationRegion) markForPostProcessing(x, y, z int) {
-	if r == nil || y < MinY || y >= MinY+WorldHeight || r.chunkAtBlock(x, z) == nil {
+	if r == nil {
+		return
+	}
+	minY := r.minY()
+	if y < minY || y >= minY+r.worldHeight() || r.chunkAtBlock(x, z) == nil {
 		return
 	}
 	if r.postProcessSeen == nil {
@@ -452,9 +522,11 @@ func (r *decorationRegion) markForPostProcessing(x, y, z int) {
 // to two blocks above (x, y, z), stopping as soon as an air block is reached,
 // and marks each occupied cell for post-processing.
 func (r *decorationRegion) markAboveForPostProcessing(x, y, z int) {
+	minY := r.minY()
+	maxY := minY + r.worldHeight()
 	for dy := 1; dy <= 2; dy++ {
 		ay := y + dy
-		if ay < MinY || ay >= MinY+WorldHeight {
+		if ay < minY || ay >= maxY {
 			return
 		}
 		if isAirState(r.getBlock(x, ay, z)) {
@@ -536,10 +608,11 @@ func (r *decorationRegion) runPostProcessing(set *worldgen.FeatureSet) {
 			if set != nil && !snowLayerCanSurviveOn(r.getBlock(x, y-1, z), set) {
 				r.setBlockGlobal(x, y, z, StateAir)
 			}
-		case canHoldBubbleColumn(cur) && y > MinY:
+		case canHoldBubbleColumn(cur) && y > r.minY():
 			want := desiredBubbleColumnStateForBelow(r.getBlock(x, y-1, z))
 			if cur != want {
-				for ay := y; ay < MinY+WorldHeight; ay++ {
+				maxY := r.minY() + r.worldHeight()
+				for ay := y; ay < maxY; ay++ {
 					if !canHoldBubbleColumn(r.getBlock(x, ay, z)) {
 						break
 					}

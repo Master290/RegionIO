@@ -20,6 +20,7 @@ type oreTargetCacheKey struct {
 	set        *worldgen.FeatureSet
 	size       int
 	firstState string
+	firstPred  string
 	targetLen  int
 }
 
@@ -127,6 +128,7 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 		set:        set,
 		size:       config.Size,
 		firstState: config.Targets[0].State.Name,
+		firstPred:  config.Targets[0].Target.PredicateType + ":" + config.Targets[0].Target.Tag + ":" + config.Targets[0].Target.Block,
 		targetLen:  len(config.Targets),
 	}
 	oreTargetCacheMu.RLock()
@@ -139,10 +141,20 @@ func resolveOreTargets(set *worldgen.FeatureSet, config worldgen.OreFeatureConfi
 	targets := make([]resolvedOreTarget, 0, len(config.Targets))
 	for _, target := range config.Targets {
 		state, ok := nameToStateID(target.State.Name, nil)
-		if !ok || target.Target.PredicateType != "minecraft:tag_match" {
+		if !ok {
 			return nil, false
 		}
-		replaceables := tagStateIDs(set, target.Target.Tag)
+		var replaceables map[uint16]bool
+		switch target.Target.PredicateType {
+		case "minecraft:tag_match":
+			replaceables = tagStateIDs(set, target.Target.Tag)
+		case "minecraft:block_match":
+			if target.Target.Block != "" {
+				replaceables = blockSetStateIDs(set, []string{target.Target.Block})
+			}
+		default:
+			return nil, false
+		}
 		if len(replaceables) == 0 {
 			return nil, false
 		}

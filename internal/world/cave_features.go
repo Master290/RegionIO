@@ -293,8 +293,10 @@ func patchVegetationPosition(ground [3]int, direction int, waterlogged bool) wor
 // block's canSurvive; the cave set needs small_dripleaf (clay/moss below or
 // a water source in the cell itself) on top of the shared supports tag.
 func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePosition, name string, set *worldgen.FeatureSet) bool {
+	minY := r.minY()
+	maxYExcl := minY + r.worldHeight()
 	if name == "minecraft:small_dripleaf" {
-		if position.Y <= MinY {
+		if position.Y <= minY {
 			return false
 		}
 		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
@@ -308,41 +310,89 @@ func (r *decorationRegion) simpleBlockCanSurvive(position worldgen.FeaturePositi
 			flattenBlockTagContains(set, "minecraft:supports_vegetation", below.Name)
 	}
 	if name == "minecraft:spore_blossom" {
-		if position.Y >= MinY+WorldHeight-1 {
+		if position.Y >= maxYExcl-1 {
 			return false
 		}
 		above := r.getBlock(position.X, position.Y+1, position.Z)
 		return fullSolidState(above) && !isWaterState(r.getBlock(position.X, position.Y, position.Z))
 	}
 	if name == "minecraft:brown_mushroom" || name == "minecraft:red_mushroom" {
-		if position.Y <= MinY {
+		if position.Y <= minY {
+			return false
+		}
+		belowID := r.getBlock(position.X, position.Y-1, position.Z)
+		below, ok := stateByID(belowID)
+		if !ok {
+			return false
+		}
+		if flattenBlockTagContains(set, "minecraft:overrides_mushroom_light_requirement", below.Name) {
+			return true
+		}
+		// In the Nether (no skylight, pre-light FEATURES step), raw brightness is 0 < 13,
+		// so MushroomBlock.canSurvive falls back to mayPlaceOn -> below.isSolidRender().
+		if r.isNetherRegion() {
+			return isFaceSturdy(belowID)
+		}
+		return false
+	}
+	if name == "minecraft:fire" {
+		if position.Y <= minY {
+			return false
+		}
+		return isFaceSturdy(r.getBlock(position.X, position.Y-1, position.Z))
+	}
+	if name == "minecraft:soul_fire" {
+		if position.Y <= minY {
 			return false
 		}
 		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
-		return ok && flattenBlockTagContains(set, "minecraft:overrides_mushroom_light_requirement", below.Name)
+		return ok && flattenBlockTagContains(set, "minecraft:soul_fire_base_blocks", below.Name)
+	}
+	if name == "minecraft:crimson_roots" || name == "minecraft:warped_roots" ||
+		name == "minecraft:nether_sprouts" || name == "minecraft:crimson_fungus" ||
+		name == "minecraft:warped_fungus" {
+		if position.Y <= minY {
+			return false
+		}
+		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
+		if !ok {
+			return false
+		}
+		switch name {
+		case "minecraft:crimson_roots":
+			return flattenBlockTagContains(set, "minecraft:supports_crimson_roots", below.Name)
+		case "minecraft:warped_roots":
+			return flattenBlockTagContains(set, "minecraft:supports_warped_roots", below.Name)
+		case "minecraft:nether_sprouts":
+			return flattenBlockTagContains(set, "minecraft:supports_nether_sprouts", below.Name)
+		case "minecraft:crimson_fungus":
+			return flattenBlockTagContains(set, "minecraft:supports_crimson_fungus", below.Name)
+		case "minecraft:warped_fungus":
+			return flattenBlockTagContains(set, "minecraft:supports_warped_fungus", below.Name)
+		}
 	}
 	if name == "minecraft:leaf_litter" {
-		if position.Y <= MinY {
+		if position.Y <= minY {
 			return false
 		}
 		return isFaceSturdy(r.getBlock(position.X, position.Y-1, position.Z))
 	}
 	if name == "minecraft:dead_bush" || name == "minecraft:short_dry_grass" || name == "minecraft:tall_dry_grass" {
-		if position.Y <= MinY {
+		if position.Y <= minY {
 			return false
 		}
 		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
 		return ok && flattenBlockTagContains(set, "minecraft:supports_dry_vegetation", below.Name)
 	}
 	if name == "minecraft:azalea" || name == "minecraft:flowering_azalea" {
-		if position.Y <= MinY {
+		if position.Y <= minY {
 			return false
 		}
 		below, ok := stateByID(r.getBlock(position.X, position.Y-1, position.Z))
 		return ok && flattenBlockTagContains(set, "minecraft:supports_azalea", below.Name)
 	}
 	if name == "minecraft:lily_pad" {
-		if position.Y <= MinY {
+		if position.Y <= minY {
 			return false
 		}
 		at := r.getBlock(position.X, position.Y, position.Z)

@@ -104,17 +104,17 @@ func TestThreeSeedsThreeDimensionsChunkHashes(t *testing.T) {
 	golden := map[int64]dimHashRecord{
 		12345: {
 			owHash:     0x3e5cbdddf8f7bb78,
-			netherHash: 0x0f64cc8cffc6e943,
+			netherHash: 0x865de03c31f37ffe,
 			endHash:    0x254e853d69aec5a7,
 		},
 		4242: {
 			owHash:     0xb4863dca2d9e2297,
-			netherHash: 0x3b28d2511e85d50d,
+			netherHash: 0x88157ea6c7fd4572,
 			endHash:    0xd89c29997f90299a,
 		},
 		987654321: {
 			owHash:     0xa109ee630f63f90c,
-			netherHash: 0x6b26a2c82dd0d673,
+			netherHash: 0x29e3a1af5d4993d4,
 			endHash:    0x13a7090db6345330,
 		},
 	}

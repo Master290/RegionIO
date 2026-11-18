@@ -179,7 +179,7 @@ func netherGeneratorInputs(seed int64) (*worldgen.OverworldDensity, *worldgen.Ca
 	return od, carver, sets
 }
 
-const maxNetherTerrainCacheEntries = 128
+const maxNetherTerrainCacheEntries = 512
 
 type netherTerrainCache struct {
 	mu      sync.RWMutex
@@ -192,9 +192,9 @@ func newNetherTerrainCache() *netherTerrainCache {
 	}
 }
 
-func (tc *netherTerrainCache) getOrGenerate(od *worldgen.OverworldDensity, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
+func (tc *netherTerrainCache) getOrGenerate(od *worldgen.OverworldDensity, carver *worldgen.Carver, sets *worldgen.StructureSets, seed int64, cx, cz int32) baseTerrain {
 	if tc == nil {
-		return generateNetherBaseTerrain(od, carver, seed, cx, cz)
+		return generateNetherBaseTerrainWithSets(od, carver, sets, seed, cx, cz)
 	}
 	key := [2]int32{cx, cz}
 	tc.mu.RLock()
@@ -204,7 +204,7 @@ func (tc *netherTerrainCache) getOrGenerate(od *worldgen.OverworldDensity, carve
 	}
 	tc.mu.RUnlock()
 
-	built := generateNetherBaseTerrain(od, carver, seed, cx, cz)
+	built := generateNetherBaseTerrainWithSets(od, carver, sets, seed, cx, cz)
 
 	tc.mu.Lock()
 	if existing, ok := tc.entries[key]; ok {
@@ -219,7 +219,7 @@ func (tc *netherTerrainCache) getOrGenerate(od *worldgen.OverworldDensity, carve
 	return built
 }
 
-func (tc *netherTerrainCache) prewarmWindow(od *worldgen.OverworldDensity, carver *worldgen.Carver, seed int64, centerX, centerZ, radius int32) {
+func (tc *netherTerrainCache) prewarmWindow(od *worldgen.OverworldDensity, carver *worldgen.Carver, sets *worldgen.StructureSets, seed int64, centerX, centerZ, radius int32) {
 	if tc == nil {
 		return
 	}
@@ -238,7 +238,7 @@ func (tc *netherTerrainCache) prewarmWindow(od *worldgen.OverworldDensity, carve
 		return
 	}
 	if len(missing) == 1 {
-		tc.getOrGenerate(od, carver, seed, missing[0][0], missing[0][1])
+		tc.getOrGenerate(od, carver, sets, seed, missing[0][0], missing[0][1])
 		return
 	}
 	workers := min(len(missing), GeneratorWorkers())
@@ -253,7 +253,7 @@ func (tc *netherTerrainCache) prewarmWindow(od *worldgen.OverworldDensity, carve
 				if i >= len(missing) {
 					return
 				}
-				tc.getOrGenerate(od, carver, seed, missing[i][0], missing[i][1])
+				tc.getOrGenerate(od, carver, sets, seed, missing[i][0], missing[i][1])
 			}
 		}()
 	}
@@ -270,7 +270,7 @@ func NewNetherGenerators(seed int64) (Generator, BatchGenerator) {
 		return generateNetherChunkWithCache(od, carver, sets, tc, seed, cx, cz)
 	}
 	batch := func(targetX, targetZ int32) (map[[2]int32]*Chunk, error) {
-		tc.prewarmWindow(od, carver, seed, targetX, targetZ, 2)
+		tc.prewarmWindow(od, carver, sets, seed, targetX, targetZ, 4)
 		return buildParallel3x3Batch(targetX, targetZ, gen), nil
 	}
 	return gen, batch
@@ -288,56 +288,54 @@ func generateNetherChunk(od *worldgen.OverworldDensity, carver *worldgen.Carver,
 
 func generateNetherChunkWithCache(od *worldgen.OverworldDensity, carver *worldgen.Carver, sets *worldgen.StructureSets, tc *netherTerrainCache, seed int64, cx, cz int32) *Chunk {
 	if tc != nil {
-		tc.prewarmWindow(od, carver, seed, cx, cz, 1)
+		tc.prewarmWindow(od, carver, sets, seed, cx, cz, 3)
 	}
-	reg := &netherRegion{
-		centerX: cx,
-		centerZ: cz,
-	}
-	decChunks := make([]*Chunk, 0, 9)
+	decChunks := make([]*Chunk, 0, 49)
 	if tc == nil {
+		var grid [7][7]*Chunk
+		workers := min(49, GeneratorWorkers())
+		var idx atomic.Int32
 		var wg sync.WaitGroup
-		wg.Add(9)
-		for ix := 0; ix < 3; ix++ {
-			for iz := 0; iz < 3; iz++ {
-				sx, sz := cx+int32(ix-1), cz+int32(iz-1)
-				go func(ix, iz int, sx, sz int32) {
-					defer wg.Done()
-					bt := generateNetherBaseTerrain(od, carver, seed, sx, sz)
-					reg.chunks[ix][iz] = bt.c
-					reg.biomes[ix][iz] = bt.biomeName
-				}(ix, iz, sx, sz)
-			}
+		wg.Add(workers)
+		for w := 0; w < workers; w++ {
+			go func() {
+				defer wg.Done()
+				for {
+					i := int(idx.Add(1) - 1)
+					if i >= 49 {
+						return
+					}
+					dx, dz := i/7, i%7
+					sx, sz := cx+int32(dx-3), cz+int32(dz-3)
+					grid[dx][dz] = generateNetherBaseTerrainWithSets(od, carver, sets, seed, sx, sz).c
+				}
+			}()
 		}
 		wg.Wait()
-		for ix := 0; ix < 3; ix++ {
-			for iz := 0; iz < 3; iz++ {
-				decChunks = append(decChunks, reg.chunks[ix][iz])
+		for dx := 0; dx < 7; dx++ {
+			for dz := 0; dz < 7; dz++ {
+				decChunks = append(decChunks, grid[dx][dz])
 			}
 		}
 	} else {
-		for ix := 0; ix < 3; ix++ {
-			for iz := 0; iz < 3; iz++ {
-				sx, sz := cx+int32(ix-1), cz+int32(iz-1)
-				bt := tc.getOrGenerate(od, carver, seed, sx, sz)
-				cloned := terrainClone(bt.c)
-				reg.chunks[ix][iz] = cloned
-				reg.biomes[ix][iz] = bt.biomeName
-				decChunks = append(decChunks, cloned)
+		for dx := -3; dx <= 3; dx++ {
+			for dz := -3; dz <= 3; dz++ {
+				sx, sz := cx+int32(dx), cz+int32(dz)
+				bt := tc.getOrGenerate(od, carver, sets, seed, sx, sz)
+				decChunks = append(decChunks, terrainClone(bt.c))
 			}
 		}
 	}
 
 	if decReg, err := newDecorationRegion(decChunks); err == nil {
-		PlaceNetherStructuresInRegion(decReg, od, sets, seed, cx, cz)
-	}
-	for ix := 0; ix < 3; ix++ {
-		for iz := 0; iz < 3; iz++ {
-			sx, sz := cx+int32(ix-1), cz+int32(iz-1)
-			decorateNetherRegionSource(reg, sx, sz, seed, reg.biomes[ix][iz])
+		if err := decReg.replayScheduledNetherWithSources(od, seed, cx, cz, nil); err != nil {
+			panic(err)
+		}
+		if center := decReg.chunks[[2]int32{cx, cz}]; center != nil {
+			return center
 		}
 	}
-	return reg.chunks[1][1]
+	return decChunks[24]
 }
 
 var netherColumnsPool = sync.Pool{
@@ -364,10 +362,105 @@ func releaseNetherCornerGrids(grids []netherCornerGrid) {
 	}
 }
 
+func buildNetherChunkBeardifier(od *worldgen.OverworldDensity, sets *worldgen.StructureSets, seed int64, cx, cz int32) *chunkBeardifier {
+	if od == nil || sets == nil {
+		return nil
+	}
+	chunkMinX := int(cx) * 16
+	chunkMinZ := int(cz) * 16
+	closeBox := msBox{
+		minX: chunkMinX - 12,
+		minY: -1 << 20,
+		minZ: chunkMinZ - 12,
+		maxX: chunkMinX + 15 + 12,
+		maxY: 1 << 20,
+		maxZ: chunkMinZ + 15 + 12,
+	}
+
+	var rigids []beardifierRigid
+	var affected msBox
+	hasAffected := false
+	includeBox := func(b msBox) {
+		if !hasAffected {
+			affected = b
+			hasAffected = true
+		} else {
+			affected = msEncapsulate(affected, b)
+		}
+	}
+
+	for sx := cx - 2; sx <= cx+2; sx++ {
+		for sz := cz - 2; sz <= cz+2; sz++ {
+			stub := NetherFossilGenerationPoint(od, sets, seed, sx, sz)
+			if stub == nil || !msBoxesIntersect(stub.Box, closeBox) {
+				continue
+			}
+			rigids = append(rigids, beardifierRigid{
+				box:              stub.Box,
+				groundLevelDelta: 0,
+				adaptation:       "beard_thin",
+			})
+			includeBox(stub.Box)
+		}
+	}
+
+	if def := sets.Structures["minecraft:bastion_remnant"]; def != nil && def.TerrainAdaptation != "" && def.TerrainAdaptation != "none" {
+		for sx := cx - 6; sx <= cx+6; sx++ {
+			for sz := cz - 6; sz <= cz+6; sz++ {
+				stub, ok := FindStructureSetStart(od, sets, "minecraft:nether_complexes", seed, sx, sz)
+				if !ok || stub == nil || stub.StructureName != "minecraft:bastion_remnant" {
+					continue
+				}
+				jStart, cached := getCachedJigsawStart(seed, "minecraft:nether_complexes", sx, sz)
+				if !cached {
+					var err error
+					jStart, err = BuildJigsawStart(od, sets, def, seed, sx, sz, nil)
+					if err != nil {
+						jStart = nil
+					}
+					putCachedJigsawStart(seed, "minecraft:nether_complexes", sx, sz, jStart)
+				}
+				if jStart == nil || !msBoxesIntersect(jStart.Box, closeBox) {
+					continue
+				}
+				for _, p := range jStart.Pieces {
+					if p.Element.Projection == "rigid" && msBoxesIntersect(p.Box, closeBox) {
+						rigids = append(rigids, beardifierRigid{
+							box:              p.Box,
+							groundLevelDelta: p.GroundLevelDelta,
+							adaptation:       def.TerrainAdaptation,
+						})
+						includeBox(p.Box)
+					}
+				}
+			}
+		}
+	}
+
+	if !hasAffected {
+		return nil
+	}
+	affected.minX -= 24
+	affected.minY -= 24
+	affected.minZ -= 24
+	affected.maxX += 24
+	affected.maxY += 24
+	affected.maxZ += 24
+	return &chunkBeardifier{
+		affectedBox: affected,
+		rigids:      rigids,
+	}
+}
+
 // generateNetherBaseTerrain builds the noise, surface, and carved base terrain
 // for Nether chunk (cx, cz).
 func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.Carver, seed int64, cx, cz int32) baseTerrain {
+	return generateNetherBaseTerrainWithSets(od, carver, nil, seed, cx, cz)
+}
+
+func generateNetherBaseTerrainWithSets(od *worldgen.OverworldDensity, carver *worldgen.Carver, sets *worldgen.StructureSets, seed int64, cx, cz int32) baseTerrain {
 	baseX, baseZ := int(cx)*16, int(cz)*16
+	beard := buildNetherChunkBeardifier(od, sets, seed, cx, cz)
 
 	grids := acquireNetherCornerGrids(len(od.Interpolated))
 	defer releaseNetherCornerGrids(grids)
@@ -432,7 +525,7 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 			}
 			for lz := 0; lz < 16; lz++ {
 				surfTop[lx][lz], worldSurface[lx][lz] =
-					fillNetherColumn(od, grids, interp, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
+					fillNetherColumn(od, grids, interp, beard, &columns[lx][lz], baseX+lx, baseZ+lz, lx, lz)
 			}
 		}(lx)
 	}
@@ -489,7 +582,7 @@ func generateNetherBaseTerrain(od *worldgen.OverworldDensity, carver *worldgen.C
 	}
 }
 
-func fillNetherColumn(od *worldgen.OverworldDensity, grids []netherCornerGrid, interp []float64, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int) {
+func fillNetherColumn(od *worldgen.OverworldDensity, grids []netherCornerGrid, interp []float64, beard *chunkBeardifier, out *[WorldHeight]uint16, wx, wz, lx, lz int) (top, worldSurface int) {
 	cx0 := lx / netherCellWidth
 	cz0 := lz / netherCellWidth
 	fx := float64(lx%netherCellWidth) / netherCellWidth
@@ -509,6 +602,9 @@ func fillNetherColumn(od *worldgen.OverworldDensity, grids []netherCornerGrid, i
 		}
 		ctx := worldgen.FunctionContext{X: float64(wx), Y: float64(y), Z: float64(wz)}.WithInterp(interp)
 		density := od.Final.Compute(ctx)
+		if beard != nil {
+			density += beard.compute(wx, y, wz)
+		}
 		var state uint16
 		var solid bool
 		if density > 0 {
@@ -981,30 +1077,20 @@ func deltaIsClear(reg *netherRegion, x, y, z int, contents uint16) bool {
 func withinManhattan(ox, oy, oz, maxX, maxY, maxZ int, fn func(x, y, z, dist int) bool) {
 	maxDist := maxX + maxY + maxZ
 	for dist := 0; dist <= maxDist; dist++ {
-		limX := min(dist, maxX)
-		for dx := 0; dx <= limX; dx++ {
-			limY := min(dist-dx, maxY)
-			for dy := 0; dy <= limY; dy++ {
-				dz := dist - dx - dy
+		limX := min(maxX, dist)
+		for dx := -limX; dx <= limX; dx++ {
+			limY := min(maxY, dist-abs(dx))
+			for dy := -limY; dy <= limY; dy++ {
+				dz := dist - abs(dx) - abs(dy)
 				if dz > maxZ {
 					continue
 				}
-				for sx := 1; sx >= -1; sx -= 2 {
-					if sx == -1 && dx == 0 {
-						continue
-					}
-					for sy := 1; sy >= -1; sy -= 2 {
-						if sy == -1 && dy == 0 {
-							continue
-						}
-						for sz := 1; sz >= -1; sz -= 2 {
-							if sz == -1 && dz == 0 {
-								continue
-							}
-							if !fn(ox+sx*dx, oy+sy*dy, oz+sz*dz, dist) {
-								return
-							}
-						}
+				if !fn(ox+dx, oy+dy, oz+dz, dist) {
+					return
+				}
+				if dz != 0 {
+					if !fn(ox+dx, oy+dy, oz-dz, dist) {
+						return
 					}
 				}
 			}
@@ -1018,7 +1104,7 @@ func PlaceBasaltColumns(c *Chunk, x, y, z int, r worldgen.RandomSource, reachMin
 }
 
 func placeBasaltColumnsRegion(reg *netherRegion, x, y, z int, r worldgen.RandomSource, reachMin, reachMax, heightMin, heightMax int) bool {
-	const seaLevel = NetherLavaSeaLevel
+	seaLevel := NetherDimensionType.SeaLevel
 	if !basaltCanPlaceAt(reg, seaLevel, x, y, z) {
 		return false
 	}

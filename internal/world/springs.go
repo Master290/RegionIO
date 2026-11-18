@@ -32,7 +32,7 @@ func (r *decorationRegion) placeScheduledSprings(seed int64) error {
 		return err
 	}
 	random, decorationSeed := worldgen.DecorationRandom(seed, int(r.sourceX), int(r.sourceZ))
-	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: MinY, Z: int(r.sourceZ) << 4}
+	origin := worldgen.FeaturePosition{X: int(r.sourceX) << 4, Y: r.genMinY(), Z: int(r.sourceZ) << 4}
 	for _, scheduled := range schedule {
 		placed, ok := set.Placed[scheduled.Name]
 		if !ok {
@@ -52,7 +52,7 @@ func (r *decorationRegion) placeScheduledSprings(seed int64) error {
 		}
 		random.SetFeatureSeed(decorationSeed, scheduled.Index, fluidsStage)
 		if scheduled.Name == "minecraft:spring_lava" || scheduled.Name == "minecraft:spring_lava_frozen" {
-			if err := r.forEachVeryBiasedSpringPosition(set, scheduled.Name, random, origin, func(position worldgen.FeaturePosition) error {
+			if err := r.forEachVeryBiasedSpringPosition(set, scheduled.Name, fluidsStage, random, origin, func(position worldgen.FeaturePosition) error {
 				return r.placeSpring(set, position, config)
 			}); err != nil {
 				return err
@@ -80,13 +80,13 @@ func (r *decorationRegion) placeScheduledSprings(seed int64) error {
 //	int v5 = Mth.nextInt(random, lo + inner, hi);
 //	int v6 = Mth.nextInt(random, lo, v5 - 1);
 //	return Mth.nextInt(random, lo, v6 - 1 + inner);
-func (r *decorationRegion) forEachVeryBiasedSpringPosition(set *worldgen.FeatureSet, scheduledName string, random worldgen.RandomSource, origin worldgen.FeaturePosition, visit func(worldgen.FeaturePosition) error) error {
+func (r *decorationRegion) forEachVeryBiasedSpringPosition(set *worldgen.FeatureSet, scheduledName string, stage int, random worldgen.RandomSource, origin worldgen.FeaturePosition, visit func(worldgen.FeaturePosition) error) error {
 	const (
 		count = 20
 		inner = 8
-		lo    = MinY
-		hi    = MinY + WorldHeight - 1 - 8
 	)
+	lo := r.genMinY()
+	hi := lo + r.genHeight() - 1 - inner
 	for i := 0; i < count; i++ {
 		x := origin.X + int(random.NextIntN(16))
 		z := origin.Z + int(random.NextIntN(16))
@@ -94,7 +94,7 @@ func (r *decorationRegion) forEachVeryBiasedSpringPosition(set *worldgen.Feature
 		v6 := springMthNextInt(random, lo, v5-1)
 		y := springMthNextInt(random, lo, v6-1+inner)
 		pos := worldgen.FeaturePosition{X: x, Y: y, Z: z}
-		if !r.biomeAllowsFeature(set, scheduledName, fluidsStage, pos) {
+		if !r.biomeAllowsFeature(set, scheduledName, stage, pos) {
 			continue
 		}
 		if err := visit(pos); err != nil {
@@ -248,6 +248,16 @@ func (r *decorationRegion) finishSpringSourcePass() {
 	delete(regionSprings, r)
 	regionSpringsMu.Unlock()
 	r.tickScheduledSprings(springs)
+}
+
+func (r *decorationRegion) flushScheduledSprings() {
+	regionSpringsMu.Lock()
+	q := regionSprings[r]
+	delete(regionSprings, r)
+	regionSpringsMu.Unlock()
+	if q != nil && len(q.springs) > 0 {
+		r.tickScheduledSprings(q.springs)
+	}
 }
 
 // springStateID resolves a SpringConfiguration fluid state to its legacy block state.
@@ -418,22 +428,31 @@ func canBeReplacedWithFluid(target fluidState, incoming fluidKind, down bool) bo
 	}
 }
 
-func fluidDropOff(kind fluidKind) int {
+func fluidDropOff(kind fluidKind, fastLava bool) int {
 	if kind == fluidLava {
+		if fastLava {
+			return 1
+		}
 		return 2
 	}
 	return 1
 }
 
-func fluidSlopeFindDistance(kind fluidKind) int {
+func fluidSlopeFindDistance(kind fluidKind, fastLava bool) int {
 	if kind == fluidLava {
+		if fastLava {
+			return 4
+		}
 		return 2
 	}
 	return 4
 }
 
-func fluidTickDelay(kind fluidKind) int {
+func fluidTickDelay(kind fluidKind, fastLava bool) int {
 	if kind == fluidLava {
+		if fastLava {
+			return 10
+		}
 		return 30
 	}
 	return 5
@@ -488,6 +507,9 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 		return
 	}
 	initSpringFluidTables()
+	minY := r.minY()
+	maxY := minY + r.worldHeight()
+	fastLava := r.isNetherRegion()
 
 	var (
 		pq       fluidTickQueue
@@ -495,7 +517,7 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 		now      int64
 		nextSeq  int64
 		schedule = func(x, y, z int, kind fluidKind, delay int) {
-			if kind == fluidNone || y < MinY || y >= MinY+WorldHeight || r.chunkAtBlock(x, z) == nil {
+			if kind == fluidNone || y < minY || y >= maxY || r.chunkAtBlock(x, z) == nil {
 				return
 			}
 			key := fluidTickKey{x: x, y: y, z: z, kind: kind}
@@ -530,7 +552,7 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 		// i.e. {UP, NORTH, SOUTH, WEST, EAST}.
 		for _, off := range [5][3]int{{0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}} {
 			nx, ny, nz := x+off[0], y+off[1], z+off[2]
-			if ny < MinY || ny >= MinY+WorldHeight || r.chunkAtBlock(nx, nz) == nil {
+			if ny < minY || ny >= maxY || r.chunkAtBlock(nx, nz) == nil {
 				continue
 			}
 			if fluidStateOfBlock(r.getBlock(nx, ny, nz)).kind == fluidWater {
@@ -552,7 +574,7 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 		}
 		if (isBlockNamed(prev, "minecraft:cave_vines") || isBlockNamed(prev, "minecraft:cave_vines_plant")) &&
 			!isBlockNamed(state, "minecraft:cave_vines") && !isBlockNamed(state, "minecraft:cave_vines_plant") &&
-			y+1 < MinY+WorldHeight {
+			y+1 < maxY {
 			above := r.getBlock(x, y+1, z)
 			if isBlockNamed(above, "minecraft:cave_vines_plant") {
 				berries := "false"
@@ -570,19 +592,19 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 		if isSpringFluidBlockState(state) {
 			if shouldSpreadLiquid(x, y, z) {
 				fs := fluidStateOfBlock(r.getBlock(x, y, z))
-				schedule(x, y, z, fs.kind, fluidTickDelay(fs.kind))
+				schedule(x, y, z, fs.kind, fluidTickDelay(fs.kind, fastLava))
 			}
 		}
 		for _, off := range [6][3]int{{0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}, {-1, 0, 0}, {1, 0, 0}} {
 			nx, ny, nz := x+off[0], y+off[1], z+off[2]
-			if ny < MinY || ny >= MinY+WorldHeight || r.chunkAtBlock(nx, nz) == nil {
+			if ny < minY || ny >= maxY || r.chunkAtBlock(nx, nz) == nil {
 				continue
 			}
 			nb := r.getBlock(nx, ny, nz)
 			if isSpringFluidBlockState(nb) {
 				if shouldSpreadLiquid(nx, ny, nz) {
 					nf := fluidStateOfBlock(r.getBlock(nx, ny, nz))
-					schedule(nx, ny, nz, nf.kind, fluidTickDelay(nf.kind))
+					schedule(nx, ny, nz, nf.kind, fluidTickDelay(nf.kind, fastLava))
 				}
 			}
 		}
@@ -600,7 +622,7 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 			continue
 		}
 		if !fs.isSource {
-			newFs := r.getNewLiquid(fs.kind, item.x, item.y, item.z)
+			newFs := r.getNewLiquid(fs.kind, item.x, item.y, item.z, fastLava)
 			if newFs.kind == fluidNone {
 				setAndNotify(item.x, item.y, item.z, StateAir)
 				continue
@@ -610,11 +632,13 @@ func (r *decorationRegion) tickScheduledSprings(springs [][3]int) {
 				setAndNotify(item.x, item.y, item.z, legacyBlockState(fs))
 			}
 		}
-		r.spreadFluid(item.x, item.y, item.z, fs, setAndNotify)
+		r.spreadFluid(item.x, item.y, item.z, fs, fastLava, setAndNotify)
 	}
 }
 
-func (r *decorationRegion) getNewLiquid(kind fluidKind, x, y, z int) fluidState {
+func (r *decorationRegion) getNewLiquid(kind fluidKind, x, y, z int, fastLava bool) fluidState {
+	minY := r.minY()
+	maxY := minY + r.worldHeight()
 	highest := 0
 	sources := 0
 	for _, d := range horizontalFluidDirs {
@@ -637,21 +661,21 @@ func (r *decorationRegion) getNewLiquid(kind fluidKind, x, y, z int) fluidState 
 			highest = nf.amount
 		}
 	}
-	if kind == fluidWater && sources >= 2 && y > MinY {
+	if kind == fluidWater && sources >= 2 && y > minY {
 		belowBlock := r.getBlock(x, y-1, z)
 		belowFluid := fluidStateOfBlock(belowBlock)
 		if isSolidState(belowBlock) || (belowFluid.kind == kind && belowFluid.isSource) {
 			return fluidState{kind: kind, isSource: true, amount: 8}
 		}
 	}
-	if y+1 < MinY+WorldHeight {
+	if y+1 < maxY {
 		upBlock := r.getBlock(x, y+1, z)
 		upFluid := fluidStateOfBlock(upBlock)
 		if upFluid.kind == kind && (isSpringFluidBlockState(upBlock) || stateFlags(upBlock)&flagBlocksMotion == 0) {
 			return fluidState{kind: kind, isSource: false, amount: 8, falling: true}
 		}
 	}
-	newAmount := highest - fluidDropOff(kind)
+	newAmount := highest - fluidDropOff(kind, fastLava)
 	if newAmount <= 0 {
 		return fluidState{}
 	}
@@ -659,7 +683,8 @@ func (r *decorationRegion) getNewLiquid(kind fluidKind, x, y, z int) fluidState 
 }
 
 func (r *decorationRegion) canMaybePassThroughFluid(kind fluidKind, toX, toY, toZ int, toBlock uint16, toFluid fluidState) bool {
-	if toY < MinY || toY >= MinY+WorldHeight || r.chunkAtBlock(toX, toZ) == nil {
+	minY := r.minY()
+	if toY < minY || toY >= minY+r.worldHeight() || r.chunkAtBlock(toX, toZ) == nil {
 		return false
 	}
 	if toFluid.kind == kind && toFluid.isSource {
@@ -669,7 +694,7 @@ func (r *decorationRegion) canMaybePassThroughFluid(kind fluidKind, toX, toY, to
 }
 
 func (r *decorationRegion) isWaterHole(kind fluidKind, x, y, z int, belowBlock uint16) bool {
-	if y-1 < MinY || r.chunkAtBlock(x, z) == nil {
+	if y-1 < r.minY() || r.chunkAtBlock(x, z) == nil {
 		return false
 	}
 	belowFluid := fluidStateOfBlock(belowBlock)
@@ -679,9 +704,9 @@ func (r *decorationRegion) isWaterHole(kind fluidKind, x, y, z int, belowBlock u
 	return canHoldFluidState(belowBlock)
 }
 
-func (r *decorationRegion) getSlopeDistance(kind fluidKind, x, y, z, step, excludedDir int) int {
+func (r *decorationRegion) getSlopeDistance(kind fluidKind, x, y, z, step, excludedDir int, fastLava bool) int {
 	minDist := 1000
-	maxSteps := fluidSlopeFindDistance(kind)
+	maxSteps := fluidSlopeFindDistance(kind, fastLava)
 	for dirIdx, d := range horizontalFluidDirs {
 		if dirIdx == excludedDir {
 			continue
@@ -700,7 +725,7 @@ func (r *decorationRegion) getSlopeDistance(kind fluidKind, x, y, z, step, exclu
 		}
 		if step < maxSteps {
 			oppositeDir := (dirIdx + 2) & 3
-			if dist := r.getSlopeDistance(kind, nx, y, nz, step+1, oppositeDir); dist < minDist {
+			if dist := r.getSlopeDistance(kind, nx, y, nz, step+1, oppositeDir, fastLava); dist < minDist {
 				minDist = dist
 			}
 		}
@@ -723,33 +748,33 @@ func (r *decorationRegion) sourceNeighborCount(kind fluidKind, x, y, z int) int 
 	return count
 }
 
-func (r *decorationRegion) spreadFluid(x, y, z int, fs fluidState, setAndNotify func(x, y, z int, state uint16)) {
+func (r *decorationRegion) spreadFluid(x, y, z int, fs fluidState, fastLava bool, setAndNotify func(x, y, z int, state uint16)) {
 	if fs.kind == fluidNone {
 		return
 	}
 	belowY := y - 1
-	if belowY >= MinY {
+	if belowY >= r.minY() {
 		belowBlock := r.getBlock(x, belowY, z)
 		belowFluid := fluidStateOfBlock(belowBlock)
 		if r.canMaybePassThroughFluid(fs.kind, x, belowY, z, belowBlock, belowFluid) &&
-			!(fs.kind == fluidLava && belowFluid.kind == fluidWater && fs.amount <= fluidDropOff(fluidLava)) {
-			newBelow := r.getNewLiquid(fs.kind, x, belowY, z)
+			!(fs.kind == fluidLava && belowFluid.kind == fluidWater && fs.amount <= fluidDropOff(fluidLava, fastLava)) {
+			newBelow := r.getNewLiquid(fs.kind, x, belowY, z, fastLava)
 			if newBelow.kind != fluidNone && canBeReplacedWithFluid(belowFluid, newBelow.kind, true) {
 				r.spreadFluidTo(fs.kind, x, belowY, z, belowBlock, true, newBelow, setAndNotify)
 				if r.sourceNeighborCount(fs.kind, x, y, z) >= 3 {
-					r.spreadFluidToSides(x, y, z, fs, setAndNotify)
+					r.spreadFluidToSides(x, y, z, fs, fastLava, setAndNotify)
 				}
 				return
 			}
 		}
 		if fs.isSource || !r.isWaterHole(fs.kind, x, y, z, belowBlock) {
-			r.spreadFluidToSides(x, y, z, fs, setAndNotify)
+			r.spreadFluidToSides(x, y, z, fs, fastLava, setAndNotify)
 		}
 	}
 }
 
-func (r *decorationRegion) spreadFluidToSides(x, y, z int, fs fluidState, setAndNotify func(x, y, z int, state uint16)) {
-	newAmount := fs.amount - fluidDropOff(fs.kind)
+func (r *decorationRegion) spreadFluidToSides(x, y, z int, fs fluidState, fastLava bool, setAndNotify func(x, y, z int, state uint16)) {
+	newAmount := fs.amount - fluidDropOff(fs.kind, fastLava)
 	if fs.falling {
 		newAmount = 7
 	}
@@ -769,14 +794,14 @@ func (r *decorationRegion) spreadFluidToSides(x, y, z int, fs fluidState, setAnd
 		if !r.canMaybePassThroughFluid(fs.kind, nx, y, nz, nBlock, nFluid) {
 			continue
 		}
-		newFluid := r.getNewLiquid(fs.kind, nx, y, nz)
+		newFluid := r.getNewLiquid(fs.kind, nx, y, nz, fastLava)
 		if newFluid.kind == fluidNone {
 			continue
 		}
 		dist := 0
 		if !r.isWaterHole(fs.kind, nx, y, nz, r.getBlock(nx, y-1, nz)) {
 			oppositeDir := (dirIdx + 2) & 3
-			dist = r.getSlopeDistance(fs.kind, nx, y, nz, 1, oppositeDir)
+			dist = r.getSlopeDistance(fs.kind, nx, y, nz, 1, oppositeDir, fastLava)
 		}
 		if dist < minDist {
 			spreadDirs = [4]bool{}

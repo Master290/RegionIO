@@ -204,6 +204,33 @@ func netherNoiseColumn(od *worldgen.OverworldDensity, x, z int) [128]uint16 {
 // PlaceNetherFossil places a NetherFossilPiece into chunk c (if its bounding box
 // intersects chunk (cx, cz)), including the 26.1.2 placeDriedGhast post-step.
 func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int32) int {
+	if c == nil {
+		return 0
+	}
+	return placeNetherFossilWithAccess(c, stub, seed, cx, cz,
+		func(x, y, z int) uint16 { return c.GetBlock(x&15, y, z&15) },
+		func(x, y, z int, st uint16) { c.SetBlock(x&15, y, z&15, st) },
+	)
+}
+
+// PlaceNetherFossilInRegion places the portion of stub intersecting chunk
+// (cx, cz) into a decorationRegion via setBlockGlobal, preserving boundary
+// chunk structure records and post-processing marks.
+func PlaceNetherFossilInRegion(r *decorationRegion, stub *NetherFossilStub, seed int64, cx, cz int32) int {
+	if r == nil {
+		return 0
+	}
+	c := r.chunks[[2]int32{cx, cz}]
+	if c == nil {
+		return 0
+	}
+	return placeNetherFossilWithAccess(c, stub, seed, cx, cz,
+		func(x, y, z int) uint16 { return r.getBlock(x, y, z) },
+		func(x, y, z int, st uint16) { r.setBlockGlobal(x, y, z, st) },
+	)
+}
+
+func placeNetherFossilWithAccess(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int32, getBlock func(x, y, z int) uint16, setBlock func(x, y, z int, state uint16)) int {
 	if c == nil || stub == nil {
 		return 0
 	}
@@ -227,7 +254,7 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 			continue
 		}
 		st := rotateTemplateState(b.State, stub.Rotation)
-		c.SetBlock(wx&15, wy, wz&15, st)
+		setBlock(wx, wy, wz, st)
 		placed++
 	}
 
@@ -240,7 +267,7 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 		gx := stub.Box.minX + int(ghastRand.NextIntN(int32(stub.Box.xSpan())))
 		gy := stub.Box.minY
 		gz := stub.Box.minZ + int(ghastRand.NextIntN(int32(stub.Box.zSpan())))
-		if chunkBox.isInside(gx, gy, gz) && isNetherAir(c.GetBlock(gx&15, gy, gz&15)) {
+		if chunkBox.isInside(gx, gy, gz) && isNetherAir(getBlock(gx, gy, gz)) {
 			facing := "north"
 			switch ghastRand.NextIntN(4) {
 			case 1:
@@ -251,7 +278,7 @@ func PlaceNetherFossil(c *Chunk, stub *NetherFossilStub, seed int64, cx, cz int3
 				facing = "west"
 			}
 			if ghastState, ok := nameToStateID("minecraft:dried_ghast", map[string]string{"facing": facing, "hydration": "0", "waterlogged": "false"}); ok {
-				c.SetBlock(gx&15, gy, gz&15, ghastState)
+				setBlock(gx, gy, gz, ghastState)
 				placed++
 			}
 		}

@@ -215,7 +215,7 @@ func (r *decorationRegion) evalBlockPredicate(set *worldgen.FeatureSet, p *compi
 		// non-cubes (vines, lichen) present no sturdy face in vanilla.
 		return fullSolidState(r.getBlock(position.X, position.Y, position.Z)), nil
 	case "minecraft:inside_world_bounds":
-		return position.Y >= MinY && position.Y < MinY+WorldHeight, nil
+		return position.Y >= r.minY() && position.Y < r.minY()+r.worldHeight(), nil
 	case "minecraft:matching_blocks":
 		state, ok := stateByID(r.getBlock(position.X, position.Y, position.Z))
 		if !ok {

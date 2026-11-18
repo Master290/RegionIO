@@ -320,8 +320,17 @@ func TestNetherHeightmapsBiomesAndDeterminism(t *testing.T) {
 	// 1. Verify ParityHeightmaps() and decorationRegion heightAt / getBiome bounds.
 	hm := c1.ParityHeightmaps()
 	for idx := 0; idx < 256; idx++ {
-		if hm[0][idx] != NetherRoofY || hm[1][idx] != NetherRoofY || hm[2][idx] != NetherRoofY {
-			t.Fatalf("Nether heightmaps at idx %d = (%d, %d, %d), want 127", idx, hm[0][idx], hm[1][idx], hm[2][idx])
+		wantSurface := int16(NetherRoofY)
+		if roofAbove := c1.GetBlock(idx&15, NetherRoofY+1, idx>>4); roofAbove != StateAir {
+			name := BlockName(roofAbove)
+			if name != "minecraft:brown_mushroom" && name != "minecraft:red_mushroom" {
+				t.Fatalf("unexpected block above Nether roof at idx %d: %s", idx, name)
+			}
+			wantSurface = NetherRoofY + 1
+		}
+		if hm[0][idx] != wantSurface || hm[1][idx] != NetherRoofY || hm[2][idx] != NetherRoofY {
+			t.Fatalf("Nether heightmaps at idx %d = (%d, %d, %d), want (%d, %d, %d)",
+				idx, hm[0][idx], hm[1][idx], hm[2][idx], wantSurface, NetherRoofY, NetherRoofY)
 		}
 	}
 	reg, err := newDecorationRegion([]*Chunk{c1})
