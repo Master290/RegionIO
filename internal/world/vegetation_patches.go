@@ -1712,3 +1712,48 @@ func exactJavaHashSetOrder(positions [][3]int) [][3]int {
 	}
 	return out
 }
+
+func (m *javaHashMap) isEmpty() bool {
+	return m.size == 0
+}
+
+func (m *javaHashMap) popFirst() ([3]int, bool) {
+	if m.size == 0 {
+		return [3]int{}, false
+	}
+	for i, b := range m.tab {
+		if b == nil {
+			continue
+		}
+		pos := b.pos
+		m.size--
+		if !b.isTree {
+			m.tab[i] = b.next
+			return pos, true
+		}
+		plain := untreeify(b.next)
+		count := 0
+		for p := plain; p != nil; p = p.next {
+			count++
+		}
+		if count <= 6 {
+			m.tab[i] = plain
+		} else {
+			var hd, tl *hmNode
+			for p := plain; p != nil; p = p.next {
+				node := &hmNode{hash: p.hash, pos: p.pos, isTree: true}
+				if tl == nil {
+					hd = node
+				} else {
+					node.prev = tl
+					tl.next = node
+				}
+				tl = node
+			}
+			m.tab[i] = hd
+			m.treeify(hd)
+		}
+		return pos, true
+	}
+	return [3]int{}, false
+}

@@ -80,7 +80,14 @@ const dataVersion26 = 4790
 // UnderwaterMagmaFeature betweenClosedStream Z-Y-X order, Blocks::postProcessAbove
 // bubble-column propagation for magma_block/soul_sand, and NoiseChunk$FlatCache
 // quart-alignment in Aquifer.isDeepDarkRegion (vanilla 26.1.2).
-const generatorVersion = 63
+// Version 64: Flower forest, meadow, old growth taiga, and old growth birch
+// generation parity: BeehiveDecorator SPAWN_DIRECTIONS {EAST, SOUTH, WEST}
+// candidate order before shufflePositions, TreeFeature.updateLeaves
+// HashSet<BlockPos> relaxation with StructureTemplate.updateShapeAtEdge exterior
+// LeavesBlock tick settlement, FallenTreeFeature.placeLogBlock
+// markAboveForPostProcessing on stumps and fallen logs, and position-aware
+// SampleStateAt forwarding in sampleOptionalStateProvider (vanilla 26.1.2).
+const generatorVersion = 64
 
 // generatorVersionTag is the NBT key holding generatorVersion. It is namespaced
 // because it is ours, not part of the vanilla chunk format.

@@ -506,8 +506,9 @@ func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worl
 		return err
 	}
 	r.setBlock(origin.X, origin.Y, origin.Z, stumpState)
+	r.markAboveForPostProcessing(origin.X, origin.Y, origin.Z)
 	placedLogs := []treePlacement{{x: origin.X, y: origin.Y, z: origin.Z, isLog: true}}
-	tp := &treePlacer{r: r, set: set, random: random}
+	tp := &treePlacer{r: r, set: set, random: random, isFallenTree: true}
 	defer func() {
 		tp.placements = placedLogs
 		settled := tp.applyLeafDistance()
@@ -577,6 +578,7 @@ func (r *decorationRegion) placeFallenTree(set *worldgen.FeatureSet, random worl
 			}
 		}
 		r.setBlock(px, py, pz, state)
+		r.markAboveForPostProcessing(px, py, pz)
 		rawLogs = append(rawLogs, [3]int{px, py, pz})
 		placedLogs = append(placedLogs, treePlacement{x: px, y: py, z: pz, isLog: true})
 	}

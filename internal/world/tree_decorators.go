@@ -312,13 +312,13 @@ func (d *treeDecoration) placeBeehive(probability float32) error {
 		height = minInt(d.logs[0].y+1+int(random.NextIntN(3)), d.logs[len(d.logs)-1].y)
 	}
 	var candidates []treePlacement
-	// SPAWN_DIRECTIONS is the horizontal plane without NORTH, which is the opposite of
-	// the SOUTH these nests face.
+	// SPAWN_DIRECTIONS is Direction.Plane.HORIZONTAL ({NORTH, EAST, SOUTH, WEST})
+	// filtered to exclude WORLDGEN_FACING.getOpposite() (NORTH): {EAST, SOUTH, WEST}.
 	for _, log := range d.logs {
 		if log.y != height {
 			continue
 		}
-		for _, step := range [][2]int{{0, 1}, {-1, 0}, {1, 0}} {
+		for _, step := range [][2]int{{1, 0}, {0, 1}, {-1, 0}} {
 			candidates = append(candidates, treePlacement{x: log.x + step[0], y: log.y, z: log.z + step[1]})
 		}
 	}

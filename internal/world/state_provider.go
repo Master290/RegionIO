@@ -60,7 +60,7 @@ func (r *decorationRegion) sampleOptionalStateProvider(set *worldgen.FeatureSet,
 		}
 		return 0, false, nil
 	default:
-		state, ok := spec.SampleState(random)
+		state, ok := spec.SampleStateAt(random, position)
 		if !ok {
 			return 0, false, fmt.Errorf("world: state provider %q produced no state", spec.Type)
 		}

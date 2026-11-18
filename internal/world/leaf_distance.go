@@ -11,176 +11,25 @@ import (
 // pos3 is one region cell.
 type pos3 struct{ x, y, z int }
 
-// leaf_distance.go gives the leaves a tree placed their distance property.
+// leaf_distance.go settles the distance property of tree leaves and propagates
+// boundary shape ticks following TreeFeature.updateLeaves and
+// StructureTemplate.updateShapeAtEdge in vanilla 26.1.2.
 //
-// A leaf's distance is not chosen by the foliage placer: LeavesBlock writes 7 in its
-// state definition and the block works out the real value afterwards. getDistanceAt is
-// 0 for a log, the stored distance for another leaf, and 7 for anything else; a leaf's
-// own value is min(7, 1 + that over the six axis neighbours), and when it would change
-// the block schedules a one-tick recompute rather than writing anything itself.
-//
-// Which is why this is a fixpoint and not a pass at placement time. A vanilla region that
-// has just been generated is a world whose queued leaf ticks have already run by the
-// time anybody looks at it - the capture is taken after the server has ticked - so the
-// saved values are the settled ones, and reproducing them means iterating until nothing
-// moves rather than asking once. Reading a single pass would give every leaf the distance
-// its earlier neighbours happened to have, which for the canopies of a spruce chain is
-// the difference between matching 23 of 194 cells and matching the rest.
+// Inside a tree's bounding box, TreeFeature.updateLeaves pops positions from
+// seven HashSet<BlockPos> buckets ordered by Java's HashMap table/chain layout.
+// Leaves start at distance=7; when a leaf at distance k=1 is popped before an
+// adjacent distance-1 neighbor, that un-filled neighbor is also added to bucket 2
+// and overwritten with distance=2 because updateLeaves does not re-check shape.isFull
+// on pop. Afterward StructureTemplate.updateShapeAtEdge only schedules 1-tick
+// LeavesBlock.tick updates across faces crossing the shape boundary, so interior
+// leaves only re-settle if an exterior tick wave propagates a distance change inward.
 
-// applyLeafDistance settles the distance property of every leaf this tree wrote
-// and returns the settled distance map so TreeFeature.updateShapeAtEdge can
-// identify leaves within distance 1..6.
-func (t *treePlacer) applyLeafDistance() map[pos3]int {
-	leaves := map[pos3]bool{}
-	logs := map[pos3]bool{}
-	for _, p := range t.placements {
-		if p.isRoot {
-			continue
-		}
-		c := pos3{p.x, p.y, p.z}
-		if !p.isLog {
-			// The recorded leaf is the cell FoliagePlacer wrote; whether the block
-			// there is still a leaf is a question for the world, because tryPlaceLeaf
-			// records positions it asked for and the world answered.
-			if t.isLeafState(t.stateAt(p.x, p.y, p.z)) {
-				leaves[c] = true
-			}
-			continue
-		}
-		if t.isLogState(t.stateAt(p.x, p.y, p.z)) {
-			logs[c] = true
-		}
-	}
-	// Also expand to existing neighbor leaves touching this tree's leaves or logs,
-	// so that a newly grown trunk or canopy propagates lower distance into them.
-	existing := map[pos3]bool{}
-	for c := range leaves {
-		for _, n := range t.leafNeighbours(c) {
-			if !leaves[n] && t.isLeafState(t.stateAt(n.x, n.y, n.z)) {
-				existing[n] = true
-			}
-		}
-	}
-	for c := range logs {
-		for _, n := range t.leafNeighbours(c) {
-			if !leaves[n] && t.isLeafState(t.stateAt(n.x, n.y, n.z)) {
-				existing[n] = true
-			}
-		}
-	}
-	for n := range existing {
-		leaves[n] = true
-	}
-	if len(leaves) == 0 {
-		return nil
-	}
-
-	distance := map[pos3]int{}
-	frontier := make([]pos3, 0, len(leaves))
-	for c := range leaves {
-		if existing[c] {
-			distance[c] = t.leafStoredDistance(c)
-		} else {
-			distance[c] = 7
-		}
-		for _, n := range t.leafNeighbours(c) {
-			if logs[n] || t.isLogState(t.stateAt(n.x, n.y, n.z)) {
-				distance[c] = 1
-			}
-		}
-	}
-	for c := range leaves {
-		frontier = append(frontier, c)
-	}
-	// Relax until stable, expanding into existing world leaves whenever a newly
-	// placed log or leaf strictly reduces their stored distance (up to distance 6).
-	for pass := 0; pass < 8; pass++ {
-		changed := false
-		limit := len(frontier)
-		for i := 0; i < limit; i++ {
-			c := frontier[i]
-			best := distance[c]
-			for _, n := range t.leafNeighbours(c) {
-				if d, ok := t.neighbourLeafDistance(n, logs, distance); ok && d+1 < best {
-					best = d + 1
-				}
-			}
-			if best > 7 {
-				best = 7
-			}
-			if best != distance[c] {
-				distance[c] = best
-				changed = true
-			}
-			if best < 6 {
-				for _, n := range t.leafNeighbours(c) {
-					if leaves[n] || !t.isLeafState(t.stateAt(n.x, n.y, n.z)) {
-						continue
-					}
-					if best+1 < t.leafStoredDistance(n) {
-						leaves[n] = true
-						existing[n] = true
-						distance[n] = best + 1
-						frontier = append(frontier, n)
-						changed = true
-					}
-				}
-			}
-		}
-		if !changed {
-			break
-		}
-	}
-	for c, d := range distance {
-		state := t.stateAt(c.x, c.y, c.z)
-		name, ok := stateByID(state)
-		if !ok {
-			continue
-		}
-		merged := map[string]string{}
-		for key, value := range name.Properties {
-			merged[key] = value
-		}
-		merged["distance"] = fmt.Sprint(d)
-		updated, ok := nameToStateID(name.Name, merged)
-		if !ok {
-			continue
-		}
-		if updated != state {
-			t.r.setBlock(c.x, c.y, c.z, updated)
-		}
-	}
-	return distance
-}
-
-var treeEdgeDirs = [6]struct {
-	name     string
-	opposite string
-	dx       int
-	dy       int
-	dz       int
-}{
-	{"down", "up", 0, -1, 0},
-	{"up", "down", 0, 1, 0},
-	{"north", "south", 0, 0, -1},
-	{"south", "north", 0, 0, 1},
-	{"west", "east", -1, 0, 0},
-	{"east", "west", 1, 0, 0},
-}
-
-// updateShapeAtEdge ports TreeFeature.lambda$place$4 ->
-// StructureTemplate.updateShapeAtEdge: notifies block shapes along the exterior
-// boundary of (roots U decorations U logs U leaves[distance<=6]) so overwritten
-// double plants / pale_moss_carpet toppers clean up and adjacent wall faces update.
-func (t *treePlacer) updateShapeAtEdge(settledLeaves map[pos3]int) {
+func (t *treePlacer) placementBounds() (minX, maxX, minY, maxY, minZ, maxZ int, ok bool) {
 	if len(t.placements) == 0 && len(t.decorations) == 0 {
-		return
+		return 0, 0, 0, 0, 0, 0, false
 	}
-	minX, maxX := 0, 0
-	minY, maxY := 0, 0
-	minZ, maxZ := 0, 0
 	hasBounds := false
-	expandBox := func(c pos3) {
+	expand := func(c pos3) {
 		if !hasBounds {
 			minX, maxX = c.x, c.x
 			minY, maxY = c.y, c.y
@@ -207,6 +56,228 @@ func (t *treePlacer) updateShapeAtEdge(settledLeaves map[pos3]int) {
 			maxZ = c.z
 		}
 	}
+	for _, p := range t.placements {
+		expand(pos3{p.x, p.y, p.z})
+	}
+	for _, c := range t.decorations {
+		expand(c)
+	}
+	return minX, maxX, minY, maxY, minZ, maxZ, hasBounds
+}
+
+// applyLeafDistance ports TreeFeature.updateLeaves and the resulting
+// StructureTemplate.updateShapeAtEdge LeavesBlock tick waves, returning the
+// distance map for leaves filled during updateLeaves so updateShapeAtEdge can
+// construct the exact shape boundary.
+func (t *treePlacer) applyLeafDistance() map[pos3]int {
+	minX, maxX, minY, maxY, minZ, maxZ, hasBounds := t.placementBounds()
+	if !hasBounds {
+		return nil
+	}
+	inBox := func(c pos3) bool {
+		return c.x >= minX && c.x <= maxX && c.y >= minY && c.y <= maxY && c.z >= minZ && c.z <= maxZ
+	}
+
+	filled := make(map[pos3]bool, len(t.placements)+len(t.decorations))
+	if t.isFallenTree {
+		for _, p := range t.placements {
+			if p.isLog || p.isRoot {
+				c := pos3{p.x, p.y, p.z}
+				if inBox(c) {
+					filled[c] = true
+				}
+			}
+		}
+		for _, c := range t.decorations {
+			if inBox(c) {
+				filled[c] = true
+			}
+		}
+		t.settleEdgeLeafTicks(filled)
+		return nil
+	}
+
+	updateLeavesDist := t.runTreeUpdateLeaves(inBox, filled)
+	t.settleEdgeLeafTicks(filled)
+	return updateLeavesDist
+}
+
+// runTreeUpdateLeaves executes TreeFeature.updateLeaves inside the tree's
+// bounding box, recording filled cells into filled and returning distances
+// written for leaves within [1..6].
+func (t *treePlacer) runTreeUpdateLeaves(inBox func(pos3) bool, filled map[pos3]bool) map[pos3]int {
+	var logsSet javaHashMap
+	for _, p := range t.placements {
+		if p.isRoot {
+			c := pos3{p.x, p.y, p.z}
+			if inBox(c) {
+				filled[c] = true
+			}
+			continue
+		}
+		if p.isLog {
+			logsSet.add([3]int{p.x, p.y, p.z})
+		}
+	}
+	for _, c := range t.decorations {
+		if inBox(c) {
+			filled[c] = true
+		}
+	}
+
+	var lists [7]javaHashMap
+	for _, b := range logsSet.tab {
+		for e := b; e != nil; e = e.next {
+			lists[0].add(e.pos)
+		}
+	}
+
+	distance := make(map[pos3]int)
+	k := 0
+	for {
+		for k < 7 && lists[k].isEmpty() {
+			k++
+		}
+		if k >= 7 {
+			break
+		}
+		raw, ok := lists[k].popFirst()
+		if !ok {
+			break
+		}
+		pos := pos3{raw[0], raw[1], raw[2]}
+		if !inBox(pos) {
+			continue
+		}
+		if k != 0 {
+			t.writeLeafDistance(pos, k)
+			distance[pos] = k
+		}
+		filled[pos] = true
+		for _, dir := range treeEdgeDirs {
+			nb := pos3{pos.x + dir.dx, pos.y + dir.dy, pos.z + dir.dz}
+			if !inBox(nb) || filled[nb] {
+				continue
+			}
+			opt, hasDist := t.optionalDistanceAt(nb)
+			if !hasDist {
+				continue
+			}
+			newDist := min(opt, k+1)
+			if newDist < 7 {
+				lists[newDist].add([3]int{nb.x, nb.y, nb.z})
+				if newDist < k {
+					k = newDist
+				}
+			}
+		}
+	}
+	return distance
+}
+
+// settleEdgeLeafTicks replays the LeavesBlock.updateShape -> tick wave
+// triggered along the boundary between filled and exterior blocks by
+// StructureTemplate.updateShapeAtEdge (and FallenTreeFeature.placeLogBlock).
+func (t *treePlacer) settleEdgeLeafTicks(filled map[pos3]bool) {
+	if len(filled) == 0 {
+		return
+	}
+	order := make([]pos3, 0, len(filled))
+	for c := range filled {
+		order = append(order, c)
+	}
+	sortPos3Order(order)
+
+	var queue []pos3
+	queued := make(map[pos3]bool)
+	maybeSchedule := func(leaf pos3, neighborDist int) {
+		if queued[leaf] || !t.isLeafState(t.stateAt(leaf.x, leaf.y, leaf.z)) {
+			return
+		}
+		nextDist := neighborDist + 1
+		if nextDist == 1 && t.leafStoredDistance(leaf) == 1 {
+			return
+		}
+		queued[leaf] = true
+		queue = append(queue, leaf)
+	}
+
+	for _, posA := range order {
+		for _, dir := range treeEdgeDirs {
+			posB := pos3{posA.x + dir.dx, posA.y + dir.dy, posA.z + dir.dz}
+			if filled[posB] {
+				continue
+			}
+			maybeSchedule(posA, t.distanceAtOrSeven(posB))
+			maybeSchedule(posB, t.distanceAtOrSeven(posA))
+		}
+	}
+
+	for tick := 0; tick < 32 && len(queue) > 0; tick++ {
+		batch := queue
+		queue = nil
+		clear(queued)
+		for _, p := range batch {
+			if !t.isLeafState(t.stateAt(p.x, p.y, p.z)) {
+				continue
+			}
+			best := 7
+			for _, dir := range treeEdgeDirs {
+				d := t.distanceAtOrSeven(pos3{p.x + dir.dx, p.y + dir.dy, p.z + dir.dz}) + 1
+				if d < best {
+					best = d
+				}
+			}
+			if best == t.leafStoredDistance(p) {
+				continue
+			}
+			if !t.writeLeafDistance(p, best) {
+				continue
+			}
+			for _, dir := range treeEdgeDirs {
+				nb := pos3{p.x + dir.dx, p.y + dir.dy, p.z + dir.dz}
+				maybeSchedule(nb, best)
+			}
+		}
+	}
+}
+
+func sortPos3Order(items []pos3) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].x != items[j].x {
+			return items[i].x < items[j].x
+		}
+		if items[i].y != items[j].y {
+			return items[i].y < items[j].y
+		}
+		return items[i].z < items[j].z
+	})
+}
+
+var treeEdgeDirs = [6]struct {
+	name     string
+	opposite string
+	dx       int
+	dy       int
+	dz       int
+}{
+	{"down", "up", 0, -1, 0},
+	{"up", "down", 0, 1, 0},
+	{"north", "south", 0, 0, -1},
+	{"south", "north", 0, 0, 1},
+	{"west", "east", -1, 0, 0},
+	{"east", "west", 1, 0, 0},
+}
+
+// updateShapeAtEdge ports TreeFeature.lambda$place$4 ->
+// StructureTemplate.updateShapeAtEdge: notifies block shapes along the exterior
+// boundary of (roots U decorations U logs U leaves[distance<=6]) so overwritten
+// double plants / pale_moss_carpet toppers clean up and adjacent wall faces update.
+func (t *treePlacer) updateShapeAtEdge(settledLeaves map[pos3]int) {
+	minX, maxX, minY, maxY, minZ, maxZ, hasBounds := t.placementBounds()
+	if !hasBounds {
+		return
+	}
 
 	inside := make(map[pos3]bool, len(t.placements)+len(t.decorations))
 	insideOrder := make([]pos3, 0, len(t.placements)+len(t.decorations))
@@ -219,13 +290,11 @@ func (t *treePlacer) updateShapeAtEdge(settledLeaves map[pos3]int) {
 	}
 	for _, p := range t.placements {
 		c := pos3{p.x, p.y, p.z}
-		expandBox(c)
 		if p.isRoot || p.isLog {
 			addInside(c)
 		}
 	}
 	for _, c := range t.decorations {
-		expandBox(c)
 		addInside(c)
 	}
 	for c, dist := range settledLeaves {
@@ -236,15 +305,7 @@ func (t *treePlacer) updateShapeAtEdge(settledLeaves map[pos3]int) {
 			addInside(c)
 		}
 	}
-	sort.Slice(insideOrder, func(i, j int) bool {
-		if insideOrder[i].x != insideOrder[j].x {
-			return insideOrder[i].x < insideOrder[j].x
-		}
-		if insideOrder[i].y != insideOrder[j].y {
-			return insideOrder[i].y < insideOrder[j].y
-		}
-		return insideOrder[i].z < insideOrder[j].z
-	})
+	sortPos3Order(insideOrder)
 	for _, posA := range insideOrder {
 		for _, dir := range treeEdgeDirs {
 			posB := pos3{posA.x + dir.dx, posA.y + dir.dy, posA.z + dir.dz}
@@ -305,42 +366,47 @@ func (r *decorationRegion) treeEdgeUpdatedState(set *worldgen.FeatureSet, pos po
 	}
 }
 
-// leafNeighbours is Direction.values(): the six axis neighbours, not the twenty-six a
-// Chebyshev radius would suggest. The distance spreads one per face, so a leaf diagonally
-// touching a log is two away, which is what the saved captures show.
-func (t *treePlacer) leafNeighbours(c pos3) []pos3 {
-	return []pos3{
-		{c.x - 1, c.y, c.z}, {c.x + 1, c.y, c.z},
-		{c.x, c.y - 1, c.z}, {c.x, c.y + 1, c.z},
-		{c.x, c.y, c.z - 1}, {c.x, c.y, c.z + 1},
-	}
-}
-
-// neighbourLeafDistance is LeavesBlock.getOptionalDistanceAt: a log answers 0, a leaf
-// answers the distance it currently holds, and anything else answers nothing at all -
-// which getDistanceAt then reads as 7, and 7 + 1 clamps back to 7, so an ordinary block
-// can never bring a leaf's distance below 7.
-func (t *treePlacer) neighbourLeafDistance(c pos3, logs map[pos3]bool, distance map[pos3]int) (int, bool) {
-	if logs[c] {
-		return 0, true
-	}
-	if d, ok := distance[c]; ok {
-		return d, true
-	}
+// optionalDistanceAt mirrors LeavesBlock.getOptionalDistanceAt: logs (via
+// #prevents_nearby_leaf_decay == #logs) return 0, leaves return their stored
+// distance property, and all other blocks return false.
+func (t *treePlacer) optionalDistanceAt(c pos3) (int, bool) {
 	state := t.stateAt(c.x, c.y, c.z)
 	if t.isLogState(state) {
 		return 0, true
 	}
 	if t.isLeafState(state) {
-		name, ok := stateByID(state)
-		if ok {
-			var stored int
-			if _, err := fmt.Sscanf(name.Properties["distance"], "%d", &stored); err == nil {
+		if name, ok := stateByID(state); ok {
+			if stored, err := strconv.Atoi(name.Properties["distance"]); err == nil {
 				return stored, true
 			}
 		}
 	}
 	return 0, false
+}
+
+func (t *treePlacer) distanceAtOrSeven(c pos3) int {
+	if d, ok := t.optionalDistanceAt(c); ok {
+		return d
+	}
+	return 7
+}
+
+func (t *treePlacer) writeLeafDistance(c pos3, d int) bool {
+	state := t.stateAt(c.x, c.y, c.z)
+	name, ok := stateByID(state)
+	if !ok || !flattenBlockTagContains(t.set, "minecraft:leaves", name.Name) {
+		return false
+	}
+	merged := make(map[string]string, len(name.Properties))
+	for key, value := range name.Properties {
+		merged[key] = value
+	}
+	merged["distance"] = fmt.Sprint(d)
+	updated, ok := nameToStateID(name.Name, merged)
+	if !ok || updated == state {
+		return false
+	}
+	return t.r.setBlock(c.x, c.y, c.z, updated)
 }
 
 func (t *treePlacer) isLeafState(id uint16) bool {
@@ -358,8 +424,7 @@ func (t *treePlacer) leafStoredDistance(c pos3) int {
 	if t.isLeafState(state) {
 		name, ok := stateByID(state)
 		if ok {
-			var stored int
-			if _, err := fmt.Sscanf(name.Properties["distance"], "%d", &stored); err == nil {
+			if stored, err := strconv.Atoi(name.Properties["distance"]); err == nil {
 				return stored
 			}
 		}

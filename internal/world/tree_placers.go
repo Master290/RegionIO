@@ -75,6 +75,7 @@ type treePlacer struct {
 	placements    []treePlacement
 	decorations   []pos3
 	leafPositions map[[3]int]bool
+	isFallenTree  bool
 
 	// trunkHeight, foliageHeight and foliageRadius are sampled in that order by
 	// TreeFeature.doPlace; the per-attachment offset comes after them, drawn once
