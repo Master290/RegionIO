@@ -1230,15 +1230,7 @@ func canSupportWitherRose(belowState uint16) bool {
 	if belowState == world.StateAir {
 		return false
 	}
-	switch canonicalResourceName(world.BlockName(belowState)) {
-	case "minecraft:grass_block", "minecraft:dirt", "minecraft:coarse_dirt",
-		"minecraft:podzol", "minecraft:rooted_dirt", "minecraft:mycelium",
-		"minecraft:moss_block", "minecraft:mud", "minecraft:Farmland", "minecraft:farmland",
-		"minecraft:netherrack", "minecraft:soul_sand", "minecraft:soul_soil":
-		return true
-	default:
-		return false
-	}
+	return CanPlaceWitherRoseOn(world.BlockName(belowState))
 }
 
 // ============================================================================
@@ -1308,29 +1300,47 @@ func RollStrayDeathLoot(rng *rand.Rand, killedByPlayer bool) []world.ItemStack {
 	return out
 }
 
-// RollWitherSkeletonDeathLoot rolls the vanilla 26.1.2 death loot for
-// `minecraft:wither_skeleton`:
-//   - `1..2` `minecraft:bone`
-//   - `0..1` `minecraft:coal`
-//   - `1x minecraft:wither_skeleton_skull` (`2.5% + 1% * lootingLevel`, or `100%` if `killedByChargedCreeper`)
+// RollWitherSkeletonDeathLoot rolls the vanilla 26.1.2 `entities/wither_skeleton.json`
+// death loot assuming a player kill (`killedByPlayer = true`).
 func RollWitherSkeletonDeathLoot(rng *rand.Rand, lootingLevel int, killedByChargedCreeper bool) []world.ItemStack {
-	var out []world.ItemStack
-	bones := int32(1)
-	coal := int32(1)
-	if rng != nil {
-		bones = int32(1 + rng.Intn(2))
-		coal = int32(rng.Intn(2))
+	return RollWitherSkeletonDeathLootWithPlayer(rng, lootingLevel, true, killedByChargedCreeper)
+}
+
+// RollWitherSkeletonDeathLootWithPlayer rolls the exact vanilla 26.1.2
+// `entities/wither_skeleton.json` loot table:
+//   - Pool 1 (`minecraft:coal`): `uniform(-1, 1)` + `enchanted_count_increase(0..1 * looting)`
+//   - Pool 2 (`minecraft:bone`): `uniform(0, 2)` + `enchanted_count_increase(0..1 * looting)`
+//   - Pool 3 (`minecraft:wither_skeleton_skull`): `100%` if `killedByChargedCreeper`,
+//     else requires `killedByPlayer` with chance `0.025 + 0.01 * lootingLevel`
+func RollWitherSkeletonDeathLootWithPlayer(rng *rand.Rand, lootingLevel int, killedByPlayer, killedByChargedCreeper bool) []world.ItemStack {
+	if lootingLevel < 0 {
+		lootingLevel = 0
 	}
-	if s1 := world.NewNamedItemStack("minecraft:bone", bones); !s1.IsEmpty() {
-		out = append(out, s1)
+	var out []world.ItemStack
+	coal := int32(1)
+	bones := int32(1)
+	if rng != nil {
+		coal = int32(rng.Intn(3) - 1) // uniform(-1, 1)
+		if lootingLevel > 0 {
+			coal += int32(math.Round(rng.Float64() * float64(lootingLevel)))
+		}
+		bones = int32(rng.Intn(3)) // uniform(0, 2)
+		if lootingLevel > 0 {
+			bones += int32(math.Round(rng.Float64() * float64(lootingLevel)))
+		}
 	}
 	if coal > 0 {
 		if s2 := world.NewNamedItemStack(ItemCoal, coal); !s2.IsEmpty() {
 			out = append(out, s2)
 		}
 	}
+	if bones > 0 {
+		if s1 := world.NewNamedItemStack("minecraft:bone", bones); !s1.IsEmpty() {
+			out = append(out, s1)
+		}
+	}
 	skullDrop := killedByChargedCreeper
-	if !skullDrop {
+	if !skullDrop && killedByPlayer {
 		chance := float32(0.025) + float32(lootingLevel)*0.01
 		if rng != nil && rng.Float32() < chance {
 			skullDrop = true
@@ -1462,11 +1472,12 @@ func (s *Server) OnSilverfishDamaged(entityID int32) bool {
 }
 
 // WakeNearbyInfestedBlocks implements vanilla `SilverfishWakeUpFriendsGoal`:
-// searches up to `21x11x21` (`dx, dz in -10..10`, `dy in -5..5`) around `(cx, cy, cz)`
-// in `dimension` for `world.IsInfestedBlock`, breaks them to `StateAir`, and
-// spawns reinforcement `minecraft:silverfish` at each woken infested block!
+// searches up to `21x11x21` (`dx, dz` expanding `0, ±1, ..., ±10`, `dy` expanding `0, ±1, ..., ±5`)
+// around `(cx, cy, cz)` in `dimension` for `world.IsInfestedBlock`:
+//   - If `mobGriefing` is true: breaks the infested block to `StateAir` and spawns a `minecraft:silverfish`.
+//   - If `mobGriefing` is false: reverts the infested block to its host stone state (`HostBlockForInfested`).
 func (s *Server) WakeNearbyInfestedBlocks(dimension string, cx, cy, cz, maxToWake int) (spawnedIDs []int32) {
-	if s == nil || !s.CreeperBlockGriefing() {
+	if s == nil {
 		return nil
 	}
 	normDim := world.NormalizeDimension(dimension)
@@ -1474,27 +1485,42 @@ func (s *Server) WakeNearbyInfestedBlocks(dimension string, cx, cy, cz, maxToWak
 	if cache == nil {
 		return nil
 	}
+	canGrief := s.MobGriefing() && s.CreeperBlockGriefing()
 	if maxToWake <= 0 {
 		maxToWake = 8
 	}
-	for dy := -SilverfishWakeVerticalRadius; dy <= SilverfishWakeVerticalRadius; dy++ {
+	yOffsets := silverfishWakeOffsets2612(SilverfishWakeVerticalRadius)
+	xzOffsets := silverfishWakeOffsets2612(SilverfishWakeHorizontalRadius)
+	reverted := 0
+	for _, dy := range yOffsets {
 		by := cy + dy
 		if by < world.MinY || by >= world.MinY+world.WorldHeight {
 			continue
 		}
-		for dx := -SilverfishWakeHorizontalRadius; dx <= SilverfishWakeHorizontalRadius; dx++ {
-			for dz := -SilverfishWakeHorizontalRadius; dz <= SilverfishWakeHorizontalRadius; dz++ {
+		for _, dx := range xzOffsets {
+			for _, dz := range xzOffsets {
 				bx, bz := cx+dx, cz+dz
 				blk := cache.GetBlock(bx, by, bz)
 				if !world.IsInfestedBlock(blk) {
 					continue
 				}
-				cache.SetBlock(bx, by, bz, world.StateAir)
-				s.broadcastMobBlockUpdate(normDim, bx, by, bz, world.StateAir)
-				if id, err := s.SpawnSilverfish(normDim, float64(bx)+0.5, float64(by), float64(bz)+0.5); err == nil && id > 0 {
-					spawnedIDs = append(spawnedIDs, id)
-					if len(spawnedIDs) >= maxToWake {
-						return spawnedIDs
+				if canGrief {
+					cache.SetBlock(bx, by, bz, world.StateAir)
+					s.broadcastMobBlockUpdate(normDim, bx, by, bz, world.StateAir)
+					if id, err := s.SpawnSilverfish(normDim, float64(bx)+0.5, float64(by), float64(bz)+0.5); err == nil && id > 0 {
+						spawnedIDs = append(spawnedIDs, id)
+						if len(spawnedIDs) >= maxToWake {
+							return spawnedIDs
+						}
+					}
+				} else {
+					if hostSt, ok := world.HostBlockForInfested(blk); ok && hostSt != world.StateAir {
+						cache.SetBlock(bx, by, bz, hostSt)
+						s.broadcastMobBlockUpdate(normDim, bx, by, bz, hostSt)
+						reverted++
+						if reverted >= maxToWake {
+							return spawnedIDs
+						}
 					}
 				}
 			}
@@ -1509,7 +1535,7 @@ func (s *Server) WakeNearbyInfestedBlocks(dimension string, cx, cy, cz, maxToWak
 // enabled, replaces the host block with its `minecraft:infested_*` state and
 // despawns the silverfish!
 func (s *Server) TrySilverfishInfestBlock(silverfishID int32, bx, by, bz int) (infestedState uint16, merged bool) {
-	if s == nil || s.entities == nil || !s.CreeperBlockGriefing() {
+	if s == nil || s.entities == nil || !s.MobGriefing() || !s.CreeperBlockGriefing() {
 		return world.StateAir, false
 	}
 	ent := s.entities.Get(silverfishID)
@@ -1739,20 +1765,49 @@ func (s *Server) tickHostileUndeadCombat(ent *world.Entity, norm string, rng *ra
 		}
 
 	case MobTypeWitherSkeleton:
-		if horizDist > ZombieAttackStopDist {
-			nx := ent.X + (dx/horizDist)*0.17
-			nz := ent.Z + (dz/horizDist)*0.17
-			s.entities.Update(ent.ID, func(e *world.Entity) {
-				e.X, e.Z, e.Yaw, e.HeadYaw = nx, nz, yaw, yaw
-			})
-		}
-		if horizDist <= 2.0 && math.Abs(dy) <= 2.4 && cd <= 0 {
-			mgr.mu.Lock()
-			if st := mgr.undead[ent.ID]; st != nil {
-				st.AttackCooldown = ZombieAttackCooldownTicks
+		feetY := int(math.Floor(ent.Y + 0.01))
+		if s.IsSkeletonHoldingBow(ent.ID) {
+			if horizDist > SkeletonIdealStopDist {
+				candX := ent.X + (dx/horizDist)*SkeletonChaseSpeed
+				candZ := ent.Z + (dz/horizDist)*SkeletonChaseSpeed
+				if nx, ny, nz, ok := tryApplyHorizontalStepSized2612(cache, ent.X, feetY, ent.Z, candX, candZ, WitherSkeletonWidth2612, WitherSkeletonHeight2612); ok {
+					s.entities.Update(ent.ID, func(e *world.Entity) {
+						e.X, e.Y, e.Z, e.Yaw, e.HeadYaw = nx, float64(ny), nz, yaw, yaw
+					})
+					ent.X, ent.Y, ent.Z = nx, float64(ny), nz
+				}
 			}
-			mgr.mu.Unlock()
-			s.WitherSkeletonMeleeAttackPlayer(ent.ID, target)
+			if dist3D <= SkeletonBowRange && cd <= 0 &&
+				hasColliderLineOfSight2612(cache, ent.X, ent.Y+WitherSkeletonEyeHeight2612, ent.Z, tSnap.X, tSnap.Y+1.62, tSnap.Z) {
+				mgr.mu.Lock()
+				if st := mgr.undead[ent.ID]; st != nil {
+					st.AttackCooldown = SkeletonAttackIntervalForDifficulty(MobTypeWitherSkeleton, s.Difficulty())
+				}
+				mgr.mu.Unlock()
+				s.ShootWitherSkeletonBowArrowAtPlayer(ent.ID, ent.X, ent.Y, ent.Z, target)
+			}
+		} else {
+			if horizDist > ZombieAttackStopDist {
+				candX := ent.X + (dx/horizDist)*0.17
+				candZ := ent.Z + (dz/horizDist)*0.17
+				if nx, ny, nz, ok := tryApplyHorizontalStepSized2612(cache, ent.X, feetY, ent.Z, candX, candZ, WitherSkeletonWidth2612, WitherSkeletonHeight2612); ok {
+					s.entities.Update(ent.ID, func(e *world.Entity) {
+						e.X, e.Y, e.Z, e.Yaw, e.HeadYaw = nx, float64(ny), nz, yaw, yaw
+					})
+					ent.X, ent.Y, ent.Z = nx, float64(ny), nz
+				}
+			}
+			dxNow := tSnap.X - ent.X
+			dyNow := tSnap.Y - ent.Y
+			dzNow := tSnap.Z - ent.Z
+			if math.Hypot(dxNow, dzNow) <= 2.0 && math.Abs(dyNow) <= 2.4 && cd <= 0 {
+				mgr.mu.Lock()
+				if st := mgr.undead[ent.ID]; st != nil {
+					st.AttackCooldown = ZombieAttackCooldownTicks
+				}
+				mgr.mu.Unlock()
+				s.WitherSkeletonMeleeAttackPlayer(ent.ID, target)
+			}
 		}
 	}
 }
@@ -1786,6 +1841,8 @@ func (s *Server) tickSingleSilverfish(silverfishID int32, rng *rand.Rand) {
 		}
 	}
 	cd := st.AttackCooldown
+	callHelpLeft := st.CallForHelpTicks
+	mergeCD := st.MergeCooldown
 	mgr.mu.Unlock()
 
 	if wakeNow {
@@ -1814,6 +1871,27 @@ func (s *Server) tickSingleSilverfish(silverfishID int32, rng *rand.Rand) {
 			}
 			mgr.mu.Unlock()
 			s.AttackPlayerFromMob(silverfishID, MobTypeSilverfish, ent.X, ent.Z, target, SilverfishAttackDamage)
+		}
+		return
+	}
+
+	// `SilverfishMergeWithStoneGoal` (`26.1.2.jar` lines 2950..3082):
+	// When `target == null`, not alerted (`!wakeNow && callHelpLeft == 0`), `mobGriefing == true`,
+	// and `random.nextInt(10) == 0`, picks a random `Direction` from `BlockPos.containing(X, Y + 0.5, Z)`
+	// and merges into any compatible host stone/brick/deepslate block!
+	if !wakeNow && callHelpLeft == 0 && mergeCD == 0 && s.MobGriefing() && s.CreeperBlockGriefing() {
+		roll := 0
+		dirIdx := 0
+		if rng != nil {
+			roll = rng.Intn(SilverfishMergeRandomDenom2612)
+			dirIdx = rng.Intn(len(silverfishSixDirections2612))
+		}
+		if roll == 0 {
+			dir := silverfishSixDirections2612[dirIdx]
+			bx := int(math.Floor(ent.X)) + dir[0]
+			by := int(math.Floor(ent.Y+0.5)) + dir[1]
+			bz := int(math.Floor(ent.Z)) + dir[2]
+			_, _ = s.TrySilverfishInfestBlock(silverfishID, bx, by, bz)
 		}
 	}
 }

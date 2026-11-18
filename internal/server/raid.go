@@ -1600,6 +1600,9 @@ func (s *Server) SpawnNextRaidWave(raidID int32) (spawnedIDs []int32, err error)
 	originY := s.findRaidSpawnY(int(math.Floor(originX)), int(math.Floor(centerY)), int(math.Floor(originZ)))
 
 	var totalHP float32
+	ravagerOrdinal := 0
+	normalGroups := RaidWaveCountForDifficulty(DifficultyNormal)
+	hardGroups := RaidWaveCountForDifficulty(DifficultyHard)
 	for i, m := range members {
 		offsetX := float64((i%3)-1) * 1.5
 		offsetZ := float64((i/3)-1) * 1.5
@@ -1613,6 +1616,32 @@ func (s *Server) SpawnNextRaidWave(raidID int32) (spawnedIDs []int32, err error)
 		}
 		spawnedIDs = append(spawnedIDs, id)
 		totalHP += RaiderMaxHealth(m.TypeName)
+
+		// Vanilla `Raid.spawnGroup` (`26.1.2.jar`):
+		//   - Wave == Normal groups (Wave 5): Ravager spawns with a Pillager rider.
+		//   - Wave >= Hard groups (Wave 7+): 1st Ravager has an Evoker rider; subsequent Ravagers have Vindicator riders.
+		if canonicalResourceName(m.TypeName) == MobTypeRavager {
+			s.ensureIllagerOrRaiderState(id, MobTypeRavager, false)
+			var riderType string
+			if nextWave == normalGroups {
+				riderType = MobTypePillager
+			} else if nextWave >= hardGroups {
+				if ravagerOrdinal == 0 {
+					riderType = MobTypeEvoker
+				} else {
+					riderType = MobTypeVindicator
+				}
+			}
+			ravagerOrdinal++
+			if riderType != "" {
+				if riderID, rErr := s.SpawnRaiderMob(sx, sy+RavagerPassengerOffsetY2612, sz, riderType, false, raidID, nextWave); rErr == nil && riderID > 0 {
+					s.ensureIllagerOrRaiderState(riderID, riderType, false)
+					s.MountIllagerOnRavager(id, riderID)
+					spawnedIDs = append(spawnedIDs, riderID)
+					totalHP += RaiderMaxHealth(riderType)
+				}
+			}
+		}
 	}
 
 	rm.mu.Lock()
@@ -2243,6 +2272,10 @@ func (s *Server) stepRaidRaidersAI(raidID int32, dim string, centerX, centerY, c
 			attackPlayer = pt.session
 		}
 
+		if rs.TypeName == MobTypeRavager && s.IsRavagerEntityImmobile2612(rs.EntityID) {
+			continue
+		}
+
 		feetY := int(math.Floor(ent.Y + 0.01))
 		stopDist := 1.4
 		if rs.TypeName == MobTypePillager || rs.TypeName == MobTypeEvoker || rs.TypeName == MobTypeWitch {
@@ -2285,6 +2318,20 @@ func (s *Server) stepRaidRaidersAI(raidID int32, dim string, centerX, centerY, c
 		}
 
 		if canAttack && attackPlayer != nil {
+			if rs.TypeName == MobTypeRavager {
+				s.ensureIllagerOrRaiderState(rs.EntityID, MobTypeRavager, false)
+				im := s.illagerManager()
+				im.mu.Lock()
+				if rst := im.ravagers[rs.EntityID]; rst != nil {
+					rst.AttackTicks = RavagerAttackTickDuration2612
+				}
+				im.mu.Unlock()
+				cp := ent.ChunkPos()
+				s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, protocol.PlayEntityEvent,
+					EncodeEntityEventPacket(rs.EntityID, EntityEventRavagerAttack))
+				s.BroadcastDimensionChunk(ent.EffectiveDimension(), cp.X, cp.Z, PlaySoundPacketID,
+					EncodeSoundPacket(SoundRavagerAttack, SoundSourceHostile, nx, ny, nz, 1.0, 1.0, 0))
+			}
 			s.AttackPlayerFromMob(rs.EntityID, rs.TypeName, nx, nz, attackPlayer, RaiderBaseAttackDamage(rs.TypeName))
 		}
 	}

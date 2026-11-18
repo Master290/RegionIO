@@ -279,6 +279,7 @@ type WitchBehaviorState struct {
 // roar state, and mounted illager rider.
 type RavagerBehaviorState struct {
 	EntityID       int32
+	AttackTicks    int
 	StunnedTicks   int
 	RoarTicks      int
 	RiderEntityID  int32
@@ -1668,9 +1669,13 @@ func (s *Server) MountIllagerOnRavager(ravagerID, riderID int32) bool {
 
 	s.entities.Update(riderID, func(e *world.Entity) {
 		e.X = ravEnt.X
-		e.Y = ravEnt.Y + 2.1
+		e.Y = ravEnt.Y + RavagerPassengerOffsetY2612
 		e.Z = ravEnt.Z
 	})
+	_, _ = s.MountEntityOnVehicle(riderID, ravagerID)
+	cp := ravEnt.ChunkPos()
+	s.BroadcastDimensionChunk(ravEnt.EffectiveDimension(), cp.X, cp.Z, protocol.PlaySetPassengers,
+		EncodeSetPassengersPacket(ravagerID, []int32{riderID}))
 	return true
 }
 
@@ -1720,34 +1725,50 @@ func (s *Server) PerformRavagerRoar(ravagerID int32) (hitCount int) {
 	mgr.mu.Lock()
 	if st := mgr.ravagers[ravagerID]; st != nil {
 		st.StunnedTicks = 0
-		st.RoarTicks = 20
+		if st.RoarTicks <= 0 {
+			st.RoarTicks = RavagerRoarShockwaveTick2612
+		}
 	}
 	mgr.mu.Unlock()
 
 	dim := ent.EffectiveDimension()
 	cp := ent.ChunkPos()
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
-		EncodeSoundPacket(SoundRavagerRoar, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.5, 1.0, 0))
+		EncodeSoundPacket(SoundRavagerRoar, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
 	s.BroadcastDimensionChunk(dim, cp.X, cp.Z, protocol.PlayEntityEvent,
 		EncodeEntityEventPacket(ravagerID, EntityEventRavagerRoar))
+	s.EmitVibration(VibrationEvent{
+		Dimension:      dim,
+		Type:           GameEventEntityAction,
+		X:              ent.X,
+		Y:              ent.Y,
+		Z:              ent.Z,
+		SourceEntityID: ravagerID,
+	})
 
-	maxDistSq := RavagerRoarRange * RavagerRoarRange
+	// Ravager.roar() scans `this.getBoundingBox().inflate(4.0D)` (`halfW = 0.975 + 4.0 = 4.975`, `Y in [Y-4.0, Y+6.2]`).
+	ravHalfW := RavagerHitboxWidth2612*0.5 + RavagerRoarRange
+	ravMinY := ent.Y - RavagerRoarRange
+	ravMaxY := ent.Y + RavagerHitboxHeight2612 + RavagerRoarRange
+	mobGriefing := s.MobGriefing()
+
 	for _, p := range s.onlinePlayersSnapshot() {
 		if p == nil || p.IsDead() {
 			continue
 		}
 		snap := p.Snapshot()
-		if world.NormalizeDimension(snap.Dimension) != dim || snap.GameMode == GameModeCreative || snap.GameMode == GameModeSpectator {
+		if world.NormalizeDimension(snap.Dimension) != dim || snap.GameMode == GameModeSpectator {
 			continue
 		}
-		dx := snap.X - ent.X
-		dy := snap.Y - ent.Y
-		dz := snap.Z - ent.Z
-		if dx*dx+dy*dy+dz*dz <= maxDistSq {
-			s.DamagePlayerWithArmor(p, RavagerRoarDamage, "mob")
-			vx, vy, vz := ComputeKnockback(ent.X, ent.Z, ent.Yaw, snap.X, snap.Z, RavagerRoarKnockback)
+		if math.Abs(snap.X-ent.X) <= ravHalfW+0.3 && math.Abs(snap.Z-ent.Z) <= ravHalfW+0.3 &&
+			snap.Y+1.8 >= ravMinY && snap.Y <= ravMaxY {
+			if snap.GameMode != GameModeCreative {
+				scaled := ScaleDamageByDifficulty(RavagerRoarDamage, s.Difficulty())
+				s.DamagePlayerWithArmor(p, scaled, "mob")
+			}
+			vx, vy, vz := ComputeRavagerStrongKnockback2612(ent.X, ent.Z, snap.X, snap.Z)
 			if p.send != nil {
-				_ = p.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(p.EntityID, vx, vy+0.25, vz))
+				_ = p.send(protocol.PlaySetEntityMotion, EncodeSetEntityMotionPacket(p.EntityID, vx, vy, vz))
 			}
 			hitCount++
 		}
@@ -1759,14 +1780,48 @@ func (s *Server) PerformRavagerRoar(ravagerID int32) (hitCount int) {
 		if other.ID == ravagerID || other.EffectiveDimension() != dim || other.IsItem() || other.IsExperienceOrb() {
 			continue
 		}
-		if IsIllagerOrRaiderFamily(other.TypeName) {
+		otherNorm := canonicalResourceName(other.TypeName)
+		if otherNorm == MobTypeRavager {
 			continue
 		}
-		dx := other.X - ent.X
-		dy := other.Y - ent.Y
-		dz := other.Z - ent.Z
-		if dx*dx+dy*dy+dz*dz <= maxDistSq {
-			s.applyDamageToMob(other, RavagerRoarDamage, nil, RavagerRoarKnockback, false, false)
+		if !mobGriefing && otherNorm == "minecraft:armor_stand" {
+			continue
+		}
+		if math.Abs(other.X-ent.X) <= ravHalfW+0.4 && math.Abs(other.Z-ent.Z) <= ravHalfW+0.4 &&
+			other.Y+1.8 >= ravMinY && other.Y <= ravMaxY {
+			// Ravager.roar(): `if (!(livingEntity instanceof AbstractIllager)) { hurtServer(mobAttack, 6.0F); }`
+			if !IsIllagerMob(otherNorm) {
+				s.applyDamageToMob(other, RavagerRoarDamage, nil, 0, false, false)
+			}
+			// `strongKnockback` applies to all matched non-Ravager entities (including AbstractIllager)!
+			if curEnt := s.entities.Get(other.ID); curEnt != nil {
+				vx, vy, vz := ComputeRavagerStrongKnockback2612(ent.X, ent.Z, curEnt.X, curEnt.Z)
+				kbRes := ResolveMobKnockbackResistance2612(s, curEnt)
+				scale := 1.0 - kbRes
+				if scale < 0 {
+					scale = 0
+				}
+				vx *= scale
+				vz *= scale
+				nx, ny, nz := curEnt.X+vx*0.25, curEnt.Y, curEnt.Z+vz*0.25
+				if cache := s.DimensionChunks(dim); cache != nil {
+					feetY := int(math.Floor(curEnt.Y + 0.01))
+					if sx, sy, sz, ok := tryApplyHorizontalStep(cache, curEnt.X, feetY, curEnt.Z, nx, nz); ok {
+						nx, ny, nz = sx, float64(sy), sz
+					} else {
+						nx, nz = curEnt.X, curEnt.Z
+					}
+				}
+				s.entities.Update(other.ID, func(e *world.Entity) {
+					e.X, e.Y, e.Z = nx, ny, nz
+					e.VelocityX = clampVelocityShort(vx)
+					e.VelocityY = clampVelocityShort(vy)
+					e.VelocityZ = clampVelocityShort(vz)
+				})
+				ocp := curEnt.ChunkPos()
+				s.BroadcastDimensionChunk(dim, ocp.X, ocp.Z, protocol.PlaySetEntityMotion,
+					EncodeSetEntityMotionPacket(other.ID, vx, vy, vz))
+			}
 			hitCount++
 		}
 	}
@@ -1774,19 +1829,16 @@ func (s *Server) PerformRavagerRoar(ravagerID int32) (hitCount int) {
 }
 
 // IsRavagerBreakableBlock reports whether `blockState` is a block that a
-// moving Ravager destroys when `mobGriefing` is enabled (all `*_leaves`, crops,
-// stems, bamboo, sweet berry bushes, and chorus flowers).
+// moving Ravager destroys when `mobGriefing` is enabled (all `#minecraft:leaves`
+// per `Ravager.aiStep`, plus crops, stems, bamboo, sweet berry bushes, and chorus flowers).
 func IsRavagerBreakableBlock(blockState uint16) bool {
 	if blockState == world.StateAir {
 		return false
 	}
-	if world.IsChorusFlowerBlock(blockState) {
+	if IsRavagerLeafBlock2612(blockState) || world.IsChorusFlowerBlock(blockState) {
 		return true
 	}
 	name := canonicalResourceName(world.BlockName(blockState))
-	if strings.HasSuffix(name, "_leaves") {
-		return true
-	}
 	switch name {
 	case "minecraft:wheat", "minecraft:carrots", "minecraft:potatoes", "minecraft:beetroots",
 		"minecraft:melon_stem", "minecraft:attached_melon_stem",
@@ -1799,11 +1851,11 @@ func IsRavagerBreakableBlock(blockState uint16) bool {
 }
 
 // RavagerDestroyBlocksAround checks blocks intersecting Ravager `ravagerID`'s
-// bounding box (`width=1.95, height=2.2`) and breaks any `IsRavagerBreakableBlock`
-// blocks when `mobGriefing` (`s.CreeperBlockGriefing()`) is enabled, invoking
-// `RavagerBlockBreakHook` (if registered by C) or `cache.BreakBlockWithUpdates`.
+// `getBoundingBox().inflate(0.2D)` (`width=1.95 -> ±1.175`, `height=2.2 -> [-0.2, +2.4]`)
+// and breaks any `IsRavagerBreakableBlock` blocks when BOTH `s.MobGriefing()` and
+// `s.CreeperBlockGriefing()` are enabled (`Ravager.aiStep` in `26.1.2.jar`).
 func (s *Server) RavagerDestroyBlocksAround(ravagerID int32) (brokenBlocks [][3]int) {
-	if s == nil || s.entities == nil || !s.CreeperBlockGriefing() {
+	if s == nil || s.entities == nil || !s.MobGriefing() || !s.CreeperBlockGriefing() {
 		return nil
 	}
 	ent := s.entities.Get(ravagerID)
@@ -1820,13 +1872,15 @@ func (s *Server) RavagerDestroyBlocksAround(ravagerID int32) (brokenBlocks [][3]
 	hook := mgr.ravagerBreakHook
 	mgr.mu.RUnlock()
 
-	minX := int(math.Floor(ent.X - 1.0))
-	maxX := int(math.Floor(ent.X + 1.0))
-	minY := int(math.Floor(ent.Y))
-	maxY := int(math.Floor(ent.Y + 2.2))
-	minZ := int(math.Floor(ent.Z - 1.0))
-	maxZ := int(math.Floor(ent.Z + 1.0))
+	halfW := RavagerHitboxWidth2612*0.5 + RavagerLeavesInflate2612 // 0.975 + 0.2 = 1.175
+	minX := int(math.Floor(ent.X - halfW))
+	maxX := int(math.Floor(ent.X + halfW))
+	minY := int(math.Floor(ent.Y - RavagerLeavesInflate2612))
+	maxY := int(math.Floor(ent.Y + RavagerHitboxHeight2612 + RavagerLeavesInflate2612))
+	minZ := int(math.Floor(ent.Z - halfW))
+	maxZ := int(math.Floor(ent.Z + halfW))
 
+	tileDrops := s.DoTileDrops()
 	for by := minY; by <= maxY; by++ {
 		if by < world.MinY || by >= world.MinY+world.WorldHeight {
 			continue
@@ -1840,6 +1894,11 @@ func (s *Server) RavagerDestroyBlocksAround(ravagerID int32) (brokenBlocks [][3]
 				if hook != nil && hook(dim, bx, by, bz, blk) {
 					brokenBlocks = append(brokenBlocks, [3]int{bx, by, bz})
 					continue
+				}
+				if tileDrops {
+					if drop, ok := world.BlockDropItem(blk); ok && !drop.IsEmpty() {
+						_, _ = s.SpawnItemEntityInDimension(dim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, drop)
+					}
 				}
 				_, res := cache.BreakBlockWithUpdates(bx, by, bz)
 				for _, ch := range res.Changes {
@@ -2363,38 +2422,68 @@ func (s *Server) tickRavagers() {
 			mgr.mu.Unlock()
 			continue
 		}
+		// Exact `Ravager.aiStep()` tick order (`26.1.2.jar` lines 2119..2164):
+		//  1) if `roarTick > 0`: `--roarTick`; if `roarTick == 10`: `roar()`.
+		//  2) if `attackTick > 0`: `--attackTick`.
+		//  3) if `stunnedTick > 0`: `--stunnedTick`; if `stunnedTick == 0`: playSound(RAVAGER_ROAR) and `roarTick = 20`.
 		mgr.mu.Lock()
 		st := mgr.ravagers[id]
 		if st == nil {
 			mgr.mu.Unlock()
 			continue
 		}
+		wasImmobile := IsRavagerImmobile2612(*st)
+		var triggerRoarShockwave, playRoarStartSound bool
 		if st.RoarTicks > 0 {
 			st.RoarTicks--
+			if st.RoarTicks == RavagerRoarShockwaveTick2612 {
+				triggerRoarShockwave = true
+			}
 		}
-		var triggerRoar bool
+		if st.AttackTicks > 0 {
+			st.AttackTicks--
+		}
+		if st.AttackCooldown > 0 {
+			st.AttackCooldown--
+		}
 		if st.StunnedTicks > 0 {
 			st.StunnedTicks--
 			if st.StunnedTicks == 0 {
-				triggerRoar = true
+				st.RoarTicks = RavagerRoarTotalTicks2612
+				playRoarStartSound = true
 			}
 		}
+		isImmobile := wasImmobile || IsRavagerImmobile2612(*st)
 		riderID := st.RiderEntityID
 		mgr.mu.Unlock()
 
-		if triggerRoar {
+		dim := ent.EffectiveDimension()
+		cp := ent.ChunkPos()
+		if playRoarStartSound {
+			s.BroadcastDimensionChunk(dim, cp.X, cp.Z, PlaySoundPacketID,
+				EncodeSoundPacket(SoundRavagerRoar, SoundSourceHostile, ent.X, ent.Y, ent.Z, 1.0, 1.0, 0))
+		}
+		if triggerRoarShockwave {
 			s.PerformRavagerRoar(id)
 		}
 		if riderID > 0 {
-			if riderEnt := s.entities.Get(riderID); riderEnt != nil {
+			if riderEnt := s.entities.Get(riderID); riderEnt != nil && s.MobHealth(riderID) > 0 {
 				s.entities.Update(riderID, func(e *world.Entity) {
 					e.X = ent.X
-					e.Y = ent.Y + 2.1
+					e.Y = ent.Y + RavagerPassengerOffsetY2612
 					e.Z = ent.Z
 				})
+			} else {
+				mgr.mu.Lock()
+				if cur := mgr.ravagers[id]; cur != nil && cur.RiderEntityID == riderID {
+					cur.RiderEntityID = 0
+				}
+				mgr.mu.Unlock()
 			}
 		}
-		_ = s.RavagerDestroyBlocksAround(id)
+		if !isImmobile {
+			_ = s.RavagerDestroyBlocksAround(id)
+		}
 	}
 }
 

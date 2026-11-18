@@ -120,6 +120,7 @@ type WitherState struct {
 	ShootCooldownMain  int
 	ShootCooldownLeft  int
 	ShootCooldownRight int
+	NextHeadUpdate     [2]int
 	IdleHeadUpdates    [2]int
 	TickCounter        int
 	BossBarUUID        [16]byte
@@ -144,14 +145,15 @@ func (w WitherState) IsPowered() bool {
 
 // WitherSkullProjectile holds the state of an in-flight minecraft:wither_skull projectile.
 type WitherSkullProjectile struct {
-	EntityID      int32
-	OwnerEntityID int32
-	Dimension     string
-	X, Y, Z       float64
-	VX, VY, VZ    float64
-	Yaw, Pitch    float32
-	Dangerous     bool
-	AgeTicks      int
+	EntityID          int32
+	OwnerEntityID     int32
+	Dimension         string
+	X, Y, Z           float64
+	VX, VY, VZ        float64
+	AccelerationPower float64
+	Yaw, Pitch        float32
+	Dangerous         bool
+	AgeTicks          int
 }
 
 type serverWitherManager struct {
@@ -370,7 +372,12 @@ func (s *Server) SpawnWither(dimension string, x, y, z float64, startCharging bo
 		false, // playBossMusic
 		false, // createWorldFog
 	)
-	s.UpdateRuntimeBossBarHealth(bar.UUID, initHealth, DefaultWitherMaxHealth)
+	if startCharging {
+		// WitherBoss.makeInvulnerable(): bossEvent.setProgress(0.0F).
+		s.UpdateRuntimeBossBarHealth(bar.UUID, 0, DefaultWitherMaxHealth)
+	} else {
+		s.UpdateRuntimeBossBarHealth(bar.UUID, initHealth, DefaultWitherMaxHealth)
+	}
 	s.SyncRuntimeBossBarPlayersInRange(bar.UUID, normDim, x, y, z, WitherBossBarRange)
 
 	st := &WitherState{
@@ -560,7 +567,7 @@ func IsWitherDestroyableBlock(blockName string, allowStrongBlocks bool) bool {
 		"minecraft:end_portal", "minecraft:end_portal_frame", "minecraft:end_gateway",
 		"minecraft:command_block", "minecraft:repeating_command_block", "minecraft:chain_command_block",
 		"minecraft:structure_block", "minecraft:jigsaw", "minecraft:moving_piston",
-		"minecraft:reinforced_deepslate":
+		"minecraft:reinforced_deepslate", "minecraft:test_block", "minecraft:test_instance_block":
 		return false
 	case "minecraft:obsidian", "minecraft:crying_obsidian", "minecraft:respawn_anchor",
 		"minecraft:ancient_debris", "minecraft:netherite_block", "minecraft:enchanting_table",
@@ -584,6 +591,28 @@ func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float6
 	normDim := world.NormalizeDimension(dimension)
 	canGrief := s.MobGriefing() && s.CreeperBlockGriefing()
 
+	type preWitherVictim struct {
+		id       int32
+		typeName string
+		x, y, z  float64
+	}
+	var preMobs []preWitherVictim
+	if s.entities != nil {
+		maxDiam := radius*2.0 + 2.0
+		for _, m := range s.entities.AppendAll(nil) {
+			if m.ID == sourceEntityID || m.IsItem() || m.IsExperienceOrb() || m.EffectiveDimension() != normDim {
+				continue
+			}
+			if !IsValidWitherTargetMob(m.TypeName) || s.MobHealth(m.ID) <= 0 {
+				continue
+			}
+			dx, dy, dz := m.X-x, m.Y-y, m.Z-z
+			if dx*dx+dy*dy+dz*dz <= maxDiam*maxDiam {
+				preMobs = append(preMobs, preWitherVictim{id: m.ID, typeName: m.TypeName, x: m.X, y: m.Y, z: m.Z})
+			}
+		}
+	}
+
 	res := s.DetonateExplosion(ExplosionOptions{
 		Dimension:      normDim,
 		X:              x,
@@ -600,6 +629,7 @@ func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float6
 
 	cache := s.DimensionChunks(normDim)
 	if breakStrongBlocks && cache != nil && canGrief {
+		tileDrops := s.DoTileDrops()
 		rInt := int(math.Ceil(radius))
 		if rInt > 5 {
 			rInt = 5
@@ -623,14 +653,38 @@ func (s *Server) TriggerWitherExplosion(dimension string, x, y, z, radius float6
 					}
 					bx, bz := bx0+dx, bz0+dz
 					st := cache.GetBlock(bx, by, bz)
-					if st == world.StateAir || IsChestBlock(st) || IsFurnaceBlock(st) {
+					if st == world.StateAir {
 						continue
 					}
 					if !IsWitherDestroyableBlock(world.BlockName(st), breakStrongBlocks) {
 						continue
 					}
+					for _, cDrop := range s.collectAndClearBlockEntityDrops(normDim, bx, by, bz, st) {
+						if !cDrop.IsEmpty() {
+							_, _ = s.SpawnItemEntityInDimension(normDim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, cDrop)
+						}
+					}
+					if tileDrops {
+						if drop, ok := world.BlockDropItem(st); ok && !drop.IsEmpty() {
+							_, _ = s.SpawnItemEntityInDimension(normDim, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, drop)
+						}
+					}
 					cache.SetBlock(bx, by, bz, world.StateAir)
+					s.broadcastMobBlockUpdate(normDim, bx, by, bz, world.StateAir)
 				}
+			}
+		}
+	}
+
+	if s.entities != nil {
+		for _, pm := range preMobs {
+			if s.MobHealth(pm.id) <= 0 {
+				s.entities.Remove(pm.id)
+				mcpX := int32(int64(math.Floor(pm.x)) >> 4)
+				mcpZ := int32(int64(math.Floor(pm.z)) >> 4)
+				s.BroadcastDimensionChunk(normDim, mcpX, mcpZ, protocol.PlayRemoveEntities,
+					encodeRemoveEntitiesPacket(nil, []int32{pm.id}))
+				s.OnMobKilledByWither(normDim, pm.x, pm.y, pm.z)
 			}
 		}
 	}
@@ -657,9 +711,9 @@ func (s *Server) ShootWitherSkull(witherID int32, headIndex int, targetX, target
 	if dist < 1e-4 {
 		dx, dy, dz, dist = 0, 0, 1, 1
 	}
-	vx := (dx / dist) * WitherSkullSpeed
-	vy := (dy / dist) * WitherSkullSpeed
-	vz := (dz / dist) * WitherSkullSpeed
+	vx := (dx / dist) * WitherSkullInitialSpeed2612
+	vy := (dy / dist) * WitherSkullInitialSpeed2612
+	vz := (dz / dist) * WitherSkullInitialSpeed2612
 	yaw := yawToward(dx, dz)
 	pitch := float32(-math.Atan2(dy, math.Hypot(dx, dz)) * (180.0 / math.Pi))
 
@@ -684,18 +738,19 @@ func (s *Server) ShootWitherSkull(witherID int32, headIndex int, targetX, target
 	})
 
 	proj := &WitherSkullProjectile{
-		EntityID:      skullID,
-		OwnerEntityID: witherID,
-		Dimension:     st.Dimension,
-		X:             headX,
-		Y:             headY,
-		Z:             headZ,
-		VX:            vx,
-		VY:            vy,
-		VZ:            vz,
-		Yaw:           yaw,
-		Pitch:         pitch,
-		Dangerous:     dangerous,
+		EntityID:          skullID,
+		OwnerEntityID:     witherID,
+		Dimension:         st.Dimension,
+		X:                 headX,
+		Y:                 headY,
+		Z:                 headZ,
+		VX:                vx,
+		VY:                vy,
+		VZ:                vz,
+		AccelerationPower: WitherSkullAccelerationPower2612,
+		Yaw:               yaw,
+		Pitch:             pitch,
+		Dangerous:         dangerous,
 	}
 	mgr := s.witherManager()
 	mgr.mu.Lock()
@@ -755,7 +810,11 @@ func (s *Server) DamageWither(entityID int32, damage float32, attacker *PlayerSe
 	}
 
 	st.Health -= damage
-	st.DestroyBlocksTicks = WitherBlockBreakTicks
+	if st.DestroyBlocksTicks <= 0 {
+		st.DestroyBlocksTicks = WitherBlockBreakTicks
+	}
+	st.IdleHeadUpdates[0] += 3
+	st.IdleHeadUpdates[1] += 3
 	if attacker != nil && attacker.EntityID != 0 {
 		st.TargetEntityIDs[0] = attacker.EntityID
 	}
@@ -939,7 +998,7 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 	if st.InvulnerableTicks > 0 {
 		nextInv := st.InvulnerableTicks - 1
 		st.InvulnerableTicks = nextInv
-		if nextInv%10 == 0 {
+		if st.TickCounter%10 == 0 {
 			st.Health += 10.0
 			if st.Health > st.MaxHealth {
 				st.Health = st.MaxHealth
@@ -949,7 +1008,13 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 		mgr.mu.Unlock()
 
 		s.SetMobHealth(entityID, snap.Health)
-		s.UpdateRuntimeBossBarHealth(snap.BossBarUUID, snap.Health, snap.MaxHealth)
+		chargeProgress := float32(1.0) - float32(nextInv)/float32(WitherInvulnerableTicks)
+		if chargeProgress < 0 {
+			chargeProgress = 0
+		} else if chargeProgress > 1 {
+			chargeProgress = 1
+		}
+		s.UpdateRuntimeBossBarHealth(snap.BossBarUUID, chargeProgress*snap.MaxHealth, snap.MaxHealth)
 		s.SyncRuntimeBossBarPlayersInRange(snap.BossBarUUID, snap.Dimension, snap.X, snap.Y, snap.Z, WitherBossBarRange)
 
 		cx := int32(int64(math.Floor(snap.X)) >> 4)
@@ -958,8 +1023,9 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 			EncodeWitherEntityDataPacket(entityID, snap.Health, snap.TargetEntityIDs[0], snap.TargetEntityIDs[1], snap.TargetEntityIDs[2], snap.InvulnerableTicks))
 
 		if nextInv <= 0 {
-			// Charging complete: trigger radius-7 explosion and play global wither spawn sound!
-			s.TriggerWitherExplosion(snap.Dimension, snap.X, snap.Y+1.5, snap.Z, WitherSpawnExplosionRadius, true, entityID)
+			// Charging complete: trigger radius-7 explosion at eye height and play global wither spawn sound!
+			s.UpdateRuntimeBossBarHealth(snap.BossBarUUID, snap.Health, snap.MaxHealth)
+			s.TriggerWitherExplosion(snap.Dimension, snap.X, snap.Y+WitherEyeHeight2612, snap.Z, WitherSpawnExplosionRadius, false, entityID)
 			s.BroadcastDimensionChunk(snap.Dimension, cx, cz, PlaySoundPacketID,
 				EncodeSoundPacket("minecraft:entity.wither.spawn", SoundSourceHostile, snap.X, snap.Y, snap.Z, 10.0, 1.0, 0))
 		}
@@ -974,29 +1040,47 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 		}
 	}
 
-	// Find nearest valid player target in the Wither's dimension.
-	target := s.findNearestWitherTarget(st.Dimension, st.X, st.Y, st.Z, WitherAggroRange)
-	var targetChanged bool
-	if target != nil {
-		if st.TargetEntityIDs[0] != target.EntityID {
-			st.TargetEntityIDs[0] = target.EntityID
-			targetChanged = true
+	// Primary target (head 0): nearest survival/adventure player OR nearest non-undead mob (`FindNearestWitherMobTarget`).
+	targetPlayer := s.findNearestWitherTarget(st.Dimension, st.X, st.Y, st.Z, WitherAggroRange)
+	var targetMob *world.Entity
+	var hasPrimaryTarget bool
+	var primID int32
+	var primX, primY, primZ, primAimY float64
+	if targetPlayer != nil && !targetPlayer.IsDead() {
+		tSnap := targetPlayer.Snapshot()
+		hasPrimaryTarget = true
+		primID = targetPlayer.EntityID
+		primX, primY, primZ = tSnap.X, tSnap.Y, tSnap.Z
+		primAimY = tSnap.Y + 0.81
+	} else {
+		targetMob = s.FindNearestWitherMobTarget(st.Dimension, st.X, st.Y, st.Z, WitherAggroRange, entityID)
+		if targetMob != nil {
+			hasPrimaryTarget = true
+			primID = targetMob.ID
+			primX, primY, primZ = targetMob.X, targetMob.Y, targetMob.Z
+			primAimY = targetMob.Y + 0.7
 		}
-	} else if st.TargetEntityIDs[0] != 0 {
-		st.TargetEntityIDs[0] = 0
+	}
+
+	var targetChanged bool
+	if st.TargetEntityIDs[0] != primID {
+		st.TargetEntityIDs[0] = primID
 		targetChanged = true
 	}
 
 	nextX, nextY, nextZ := st.X, st.Y, st.Z
 	nextYaw := st.Yaw
-	var shootTarget *PlayerSession
-	var shootMain, shootLeft, shootRight, shootBlue bool
 
-	if target != nil {
-		tSnap := target.Snapshot()
-		desiredY := tSnap.Y
+	type scheduledSkullShot struct {
+		headIndex int
+		tx, ty, tz float64
+		dangerous  bool
+	}
+	var shots []scheduledSkullShot
+
+	if hasPrimaryTarget {
+		desiredY := primY
 		if !st.IsPowered() {
-			// Phase 1: hover ~5 blocks above the target.
 			desiredY += WitherHoverHeightOffset
 		}
 		dy := desiredY - st.Y
@@ -1010,13 +1094,12 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 			nextY += stepY
 		}
 
-		dx := tSnap.X - st.X
-		dz := tSnap.Z - st.Z
+		dx := primX - st.X
+		dz := primZ - st.Z
 		horizDist := math.Hypot(dx, dz)
 		if horizDist > 1e-3 {
 			nextYaw = yawToward(dx, dz)
 		}
-		// Keep ~2..9 blocks horizontal distance in Phase 1, or close in during Phase 2.
 		stopDist := 6.0
 		if st.IsPowered() {
 			stopDist = 2.0
@@ -1031,25 +1114,110 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 		}
 
 		st.ShootCooldownMain--
-		if st.ShootCooldownMain <= 0 {
+		distSq := dx*dx + (primY-st.Y)*(primY-st.Y) + dz*dz
+		if st.ShootCooldownMain <= 0 && distSq <= 400.0 {
 			st.ShootCooldownMain = WitherMainHeadShootCooldown
-			shootMain = true
-			shootTarget = target
-			if rng != nil && rng.Float32() < 0.10 {
-				shootBlue = true
+			blue := rng != nil && rng.Float32() < WitherCenterBlueSkullChance2612
+			shots = append(shots, scheduledSkullShot{
+				headIndex: 0,
+				tx:        primX,
+				ty:        primAimY,
+				tz:        primZ,
+				dangerous: blue,
+			})
+		}
+	}
+
+	// Side heads (head = 1, 2 -> array index 0, 1) matching `WitherBoss.customServerAiStep` (`26.1.2.jar` lines 630..835):
+	diff := s.Difficulty()
+	randInt := func(n int) int {
+		if rng != nil {
+			return rng.Intn(n)
+		}
+		return 0
+	}
+	randSpan := func(half float64) float64 {
+		if rng != nil {
+			return (rng.Float64()*2.0 - 1.0) * half
+		}
+		return half * 0.5
+	}
+	resolveHeadTarget := func(tid int32) (tx, ty, tz float64, ok bool) {
+		if tid <= 0 {
+			return 0, 0, 0, false
+		}
+		for _, p := range s.onlinePlayersSnapshot() {
+			if p != nil && !p.IsDead() && p.EntityID == tid {
+				ps := p.Snapshot()
+				if world.NormalizeDimension(ps.Dimension) == st.Dimension &&
+					(ps.GameMode == GameModeSurvival || ps.GameMode == GameModeAdventure) && ps.Health > 0 {
+					dx, dy, dz := ps.X-st.X, ps.Y-st.Y, ps.Z-st.Z
+					if dx*dx+dy*dy+dz*dz <= WitherSideHeadMaxRangeSq2612 {
+						return ps.X, ps.Y + 0.81, ps.Z, true
+					}
+				}
+				return 0, 0, 0, false
 			}
 		}
-		st.ShootCooldownLeft--
-		if st.ShootCooldownLeft <= 0 {
-			st.ShootCooldownLeft = WitherSideHeadShootCooldown
-			shootLeft = true
-			shootTarget = target
+		if mEnt := s.entities.Get(tid); mEnt != nil && mEnt.EffectiveDimension() == st.Dimension &&
+			IsValidWitherTargetMob(mEnt.TypeName) && s.MobHealth(tid) > 0 {
+			dx, dy, dz := mEnt.X-st.X, mEnt.Y-st.Y, mEnt.Z-st.Z
+			if dx*dx+dy*dy+dz*dz <= WitherSideHeadMaxRangeSq2612 {
+				return mEnt.X, mEnt.Y + 0.7, mEnt.Z, true
+			}
 		}
-		st.ShootCooldownRight--
-		if st.ShootCooldownRight <= 0 {
-			st.ShootCooldownRight = WitherSideHeadShootCooldown
-			shootRight = true
-			shootTarget = target
+		return 0, 0, 0, false
+	}
+
+	for head := 1; head <= 2; head++ {
+		idx := head - 1
+		if st.TickCounter < st.NextHeadUpdate[idx] {
+			continue
+		}
+		st.NextHeadUpdate[idx] = st.TickCounter + 10 + randInt(10)
+		if diff == DifficultyNormal || diff == DifficultyHard {
+			prevIdle := st.IdleHeadUpdates[idx]
+			st.IdleHeadUpdates[idx]++
+			if prevIdle > WitherIdleBlueSkullThreshold {
+				shots = append(shots, scheduledSkullShot{
+					headIndex: head,
+					tx:        st.X + randSpan(10.0),
+					ty:        st.Y + randSpan(5.0),
+					tz:        st.Z + randSpan(10.0),
+					dangerous: true,
+				})
+				st.IdleHeadUpdates[idx] = 0
+				continue
+			}
+		}
+
+		altID := st.TargetEntityIDs[head]
+		if altID > 0 {
+			if tx, ty, tz, valid := resolveHeadTarget(altID); valid {
+				shots = append(shots, scheduledSkullShot{
+					headIndex: head,
+					tx:        tx,
+					ty:        ty,
+					tz:        tz,
+					dangerous: false,
+				})
+				st.NextHeadUpdate[idx] = st.TickCounter + 40 + randInt(20)
+				st.IdleHeadUpdates[idx] = 0
+			} else {
+				st.TargetEntityIDs[head] = 0
+				targetChanged = true
+			}
+		} else {
+			var newAlt int32
+			if hasPrimaryTarget {
+				newAlt = primID
+			} else if altMob := s.FindNearestWitherMobTarget(st.Dimension, st.X, st.Y, st.Z, 20.0, entityID); altMob != nil {
+				newAlt = altMob.ID
+			}
+			if newAlt > 0 && st.TargetEntityIDs[head] != newAlt {
+				st.TargetEntityIDs[head] = newAlt
+				targetChanged = true
+			}
 		}
 	}
 
@@ -1084,21 +1252,12 @@ func (s *Server) tickSingleWither(entityID int32, rng *rand.Rand) {
 			EncodeWitherEntityDataPacket(entityID, snap.Health, snap.TargetEntityIDs[0], snap.TargetEntityIDs[1], snap.TargetEntityIDs[2], snap.InvulnerableTicks))
 	}
 
-	if breakBlocksNow && s.CreeperBlockGriefing() {
+	if breakBlocksNow && s.MobGriefing() && s.CreeperBlockGriefing() {
 		s.breakBlocksAroundWither(snap)
 	}
 
-	if shootTarget != nil && !shootTarget.IsDead() {
-		tSnap := shootTarget.Snapshot()
-		if shootMain {
-			s.ShootWitherSkull(entityID, 0, tSnap.X, tSnap.Y+1.0, tSnap.Z, shootBlue)
-		}
-		if shootLeft {
-			s.ShootWitherSkull(entityID, 1, tSnap.X, tSnap.Y+1.0, tSnap.Z, false)
-		}
-		if shootRight {
-			s.ShootWitherSkull(entityID, 2, tSnap.X, tSnap.Y+1.0, tSnap.Z, false)
-		}
+	for _, shot := range shots {
+		s.ShootWitherSkull(entityID, shot.headIndex, shot.tx, shot.ty, shot.tz, shot.dangerous)
 	}
 }
 
@@ -1107,6 +1266,7 @@ func (s *Server) breakBlocksAroundWither(st WitherState) {
 	if cache == nil {
 		return
 	}
+	tileDrops := s.DoTileDrops()
 	bx0 := int(math.Floor(st.X))
 	by0 := int(math.Floor(st.Y))
 	bz0 := int(math.Floor(st.Z))
@@ -1120,13 +1280,24 @@ func (s *Server) breakBlocksAroundWither(st WitherState) {
 			for dz := -1; dz <= 1; dz++ {
 				bx, bz := bx0+dx, bz0+dz
 				blk := cache.GetBlock(bx, by, bz)
-				if blk == world.StateAir || IsChestBlock(blk) || IsFurnaceBlock(blk) {
+				if blk == world.StateAir {
 					continue
 				}
 				if !IsWitherDestroyableBlock(world.BlockName(blk), true) {
 					continue
 				}
+				for _, cDrop := range s.collectAndClearBlockEntityDrops(st.Dimension, bx, by, bz, blk) {
+					if !cDrop.IsEmpty() {
+						_, _ = s.SpawnItemEntityInDimension(st.Dimension, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, cDrop)
+					}
+				}
+				if tileDrops {
+					if drop, ok := world.BlockDropItem(blk); ok && !drop.IsEmpty() {
+						_, _ = s.SpawnItemEntityInDimension(st.Dimension, float64(bx)+0.5, float64(by)+0.5, float64(bz)+0.5, drop)
+					}
+				}
 				cache.SetBlock(bx, by, bz, world.StateAir)
+				s.broadcastMobBlockUpdate(st.Dimension, bx, by, bz, world.StateAir)
 				brokeAny = true
 			}
 		}
@@ -1147,7 +1318,29 @@ func (s *Server) tickSingleWitherSkull(skullID int32) {
 		mgr.mu.Unlock()
 		return
 	}
+	dim := sk.Dimension
+	curX, curY, curZ := sk.X, sk.Y, sk.Z
+	mgr.mu.Unlock()
+
+	inWater := false
+	if cache := s.DimensionChunks(dim); cache != nil {
+		by := int(math.Floor(curY))
+		if by >= world.MinY && by < world.MinY+world.WorldHeight {
+			blk := cache.GetBlock(int(math.Floor(curX)), by, int(math.Floor(curZ)))
+			if blk == world.StateWater || world.BlockName(blk) == "minecraft:water" {
+				inWater = true
+			}
+		}
+	}
+
+	mgr.mu.Lock()
+	sk, ok = mgr.skulls[skullID]
+	if !ok || sk == nil {
+		mgr.mu.Unlock()
+		return
+	}
 	sk.AgeTicks++
+	sk.VX, sk.VY, sk.VZ = StepWitherSkullInertia2612(sk.VX, sk.VY, sk.VZ, sk.AccelerationPower, sk.Dangerous, inWater)
 	sk.X += sk.VX
 	sk.Y += sk.VY
 	sk.Z += sk.VZ
@@ -1227,8 +1420,13 @@ func (s *Server) impactWitherSkull(sk WitherSkullProjectile, directHitPlayer *Pl
 	s.removeWitherSkull(sk.EntityID, sk.Dimension, sk.X, sk.Z)
 
 	if directHitPlayer != nil && !directHitPlayer.IsDead() {
-		scaled := ScaleDamageByDifficulty(WitherSkullDirectDamage, s.Difficulty())
-		dealt := s.DamagePlayerWithArmor(directHitPlayer, scaled, "wither_skull")
+		var dealt float32
+		if sk.OwnerEntityID > 0 {
+			scaled := ScaleDamageByDifficulty(WitherSkullDirectDamage, s.Difficulty())
+			dealt = s.DamagePlayerWithArmor(directHitPlayer, scaled, "wither_skull")
+		} else {
+			dealt = s.DamagePlayerWithArmor(directHitPlayer, WitherSkullOwnerlessMagicDmg2612, "magic")
+		}
 		if dealt > 0 {
 			// Direct hit heals the firing Wither by +5.0 HP (vanilla WitherSkull.onHitEntity).
 			if sk.OwnerEntityID > 0 {

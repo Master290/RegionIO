@@ -1434,6 +1434,9 @@ func (s *Server) AttackPlayerFromMob(mobID int32, mobType string, mobX, mobZ flo
 			attackerItem = "minecraft:iron_axe"
 		}
 		if blocked, _ := s.TryBlockDamageWithShield(target, scaled, mobX, mobZ, true, attackerItem, false, 0); blocked {
+			if canonicalResourceName(mobType) == MobTypeRavager && mobID > 0 {
+				s.OnRavagerBlockedByShieldFromPlayer2612(mobID, target, nil)
+			}
 			return 0
 		}
 	}
@@ -2152,10 +2155,21 @@ func (s *Server) applyDamageToMobInternal(
 		SourceEntityID: target.ID,
 	})
 
-	if !wasBaby {
-		drops := MobLootDrops(target.TypeName, nil)
+	if !wasBaby && s.DoMobLoot() {
+		var drops []world.ItemStack
+		if canonicalResourceName(target.TypeName) == MobTypeWitherSkeleton {
+			lootingLvl := 0
+			if attacker != nil {
+				lootingLvl = EnchantmentLootingLevel(attacker.HeldItemMeta())
+			}
+			gameTime, _ := s.WorldTime()
+			lootRng := rand.New(rand.NewSource(int64(target.ID)*1103515245 + gameTime + rand.Int63n(1<<20)))
+			drops = RollWitherSkeletonDeathLootWithPlayer(lootRng, lootingLvl, attacker != nil, false)
+		} else {
+			drops = MobLootDrops(target.TypeName, nil)
+		}
 		for _, drop := range drops {
-			s.SpawnItemEntity(target.X, target.Y+0.25, target.Z, drop)
+			s.SpawnItemEntityInDimension(dim, deathX, deathY+0.25, deathZ, drop)
 		}
 	}
 	if attacker != nil {

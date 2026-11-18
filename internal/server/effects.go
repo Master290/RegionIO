@@ -1189,6 +1189,13 @@ func (s *Server) ApplyEntityEffectScaled(entityID int32, inst StatusEffectInstan
 		inst.Amplifier = 0
 	}
 
+	if IsBossImmuneToStatusEffect(ent.TypeName, def.ID) {
+		return false
+	}
+	if def.ID == EffectWither && canonicalResourceName(ent.TypeName) == MobTypeWitherSkeleton {
+		return false
+	}
+
 	undead := IsUndeadEntityType(ent.TypeName)
 
 	switch def.ID {

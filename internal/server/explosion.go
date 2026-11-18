@@ -367,6 +367,9 @@ func (s *Server) DetonateExplosion(opts ExplosionOptions) ExplosionResult {
 			if ok, upd := cache.BreakBlockWithUpdates(pos.X, pos.Y, pos.Z); ok {
 				result.DestroyedBlocks = append(result.DestroyedBlocks, pos)
 				appendUpdate(upd)
+				if world.IsInfestedBlock(st) && tileDrops && s.Difficulty() != DifficultyPeaceful {
+					_, _ = s.OnInfestedBlockBroken(dim, pos.X, pos.Y, pos.Z, st, false)
+				}
 			}
 		}
 
@@ -599,6 +602,16 @@ func (s *Server) applyExplosionEntityEffects(dim string, cache *world.Cache, opt
 			}
 			impact, baseDmg := world.ComputeExplosionImpactAndDamage(opts.X, opts.Y, opts.Z, opts.Radius, box, exposure)
 			if impact <= 0 || baseDmg <= 0 {
+				continue
+			}
+
+			if canonicalResourceName(ent.TypeName) == MobTypeWither {
+				if canonicalResourceName(opts.SourceMobType) != MobTypeWither {
+					dealt, _ := s.DamageWither(ent.ID, baseDmg, opts.Activator, false)
+					if dealt > 0 {
+						result.MobsDamaged++
+					}
+				}
 				continue
 			}
 

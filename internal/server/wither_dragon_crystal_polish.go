@@ -617,15 +617,16 @@ func (s *Server) FindNearestWitherMobTarget(dim string, x, y, z, maxRange float6
 	return best
 }
 
-// CanPlaceWitherRoseOn reports whether groundBlockName can support a
-// `minecraft:wither_rose` block in vanilla 26.1.2.
+// CanPlaceWitherRoseOn reports whether groundBlockName is in `#minecraft:supports_wither_rose`
+// in vanilla 26.1.2 (`#supports_vegetation` + `netherrack` + `soul_sand` + `soul_soil`).
 func CanPlaceWitherRoseOn(groundBlockName string) bool {
 	switch canonicalResourceName(groundBlockName) {
-	case "minecraft:grass_block", "minecraft:dirt", "minecraft:coarse_dirt",
-		"minecraft:podzol", "minecraft:mycelium", "minecraft:farmland",
-		"minecraft:mud", "minecraft:rooted_dirt", "minecraft:moss_block",
-		"minecraft:pale_moss_block", "minecraft:netherrack",
-		"minecraft:soul_sand", "minecraft:soul_soil", "minecraft:end_stone":
+	case "minecraft:grass_block", "minecraft:podzol", "minecraft:mycelium",
+		"minecraft:dirt", "minecraft:coarse_dirt", "minecraft:rooted_dirt",
+		"minecraft:farmland",
+		"minecraft:mud", "minecraft:muddy_mangrove_roots",
+		"minecraft:moss_block", "minecraft:pale_moss_block",
+		"minecraft:netherrack", "minecraft:soul_sand", "minecraft:soul_soil":
 		return true
 	default:
 		return false

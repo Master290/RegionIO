@@ -830,8 +830,11 @@ func isColumnPassableForSize2612(chunks *world.Cache, x, feetY, z int, width, he
 	if !isPassableBlock(chunks.GetBlock(x, feetY, z)) {
 		return false
 	}
-	if height > 1.0 && !isPassableBlock(chunks.GetBlock(x, feetY+1, z)) {
-		return false
+	blocksTall := int(math.Ceil(height - 1e-4))
+	for dy := 1; dy < blocksTall; dy++ {
+		if !isPassableBlock(chunks.GetBlock(x, feetY+dy, z)) {
+			return false
+		}
 	}
 	// Entities wider than 1.0 block (e.g. Spider width = 1.4) cannot squeeze through a 1-block-wide
 	// gap pinched by solid walls on both opposite sides along X or along Z.
@@ -874,9 +877,9 @@ func resolveStepYSized2612(chunks *world.Cache, fromX, fromY, fromZ, toX, toZ, m
 		return 0, false
 	}
 	stepBlock := chunks.GetBlock(toX, fromY, toZ)
-	headClearY := fromY + 1
-	if height > 1.0 {
-		headClearY = fromY + 2
+	headClearY := fromY + int(math.Ceil(height-1e-4))
+	if headClearY < fromY+1 {
+		headClearY = fromY + 1
 	}
 	if isSolidGroundBlock(stepBlock) {
 		if isPassableBlock(chunks.GetBlock(fromX, headClearY, fromZ)) &&

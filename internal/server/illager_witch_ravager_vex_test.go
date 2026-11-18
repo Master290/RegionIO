@@ -273,7 +273,7 @@ func TestRavagerShieldStunRoarAndBlockDestructionAndChorusProjectile(t *testing.
 	}
 
 	hpBeforeRoar := defender.Snapshot().Health
-	for i := 0; i < RavagerStunDurationTicks+1; i++ {
+	for i := 0; i < RavagerStunDurationTicks+RavagerRoarShockwaveTick2612; i++ {
 		s.TickIllagersWitchesRavagersAndVexes(rng)
 	}
 	if defender.Snapshot().Health >= hpBeforeRoar {
